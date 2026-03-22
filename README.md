@@ -65,4 +65,4 @@ Apache License 2.0. Use it, build on it, extend it.
 
 ---
 
-*A project of [CIMC.ai](https://cimc.ai) — the California Institute for Machine Consciousness.*
+*Created by Erik Newton.*
