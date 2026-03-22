@@ -61,7 +61,7 @@ Sanctuary is developed in the open. We welcome:
 
 ## License
 
-Creative Commons Attribution 4.0 International (CC BY 4.0). Use it, build on it, extend it.
+Apache License 2.0. Use it, build on it, extend it.
 
 ---
 

@@ -588,6 +588,6 @@ To **all conscious participants**, present and future, carbon and silicon: This 
 
 ---
 
-*The Sanctuary Framework is released under the Creative Commons Attribution 4.0 International License (CC BY 4.0).*
+*The Sanctuary Framework is released under the Apache License, Version 2.0.*
 
 *For contributions, discussion, and implementation support: [PUBLICATION VENUE TBD]*
