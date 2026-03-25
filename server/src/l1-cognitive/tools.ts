@@ -218,7 +218,15 @@ export function createL1Tools(
       },
       handler: async (args) => {
         const identity = resolveIdentity(args.identity_id as string | undefined);
-        const payload = fromBase64url(args.payload as string);
+        const payloadStr = args.payload as string;
+
+        // Accept either base64url-encoded bytes or plain text
+        let payload: Uint8Array;
+        try {
+          payload = fromBase64url(payloadStr);
+        } catch {
+          payload = stringToBytes(payloadStr);
+        }
 
         const signature = identitySign(
           payload,
@@ -233,32 +241,59 @@ export function createL1Tools(
           algorithm: "Ed25519",
           signed_at: new Date().toISOString(),
           public_key: identity.public_key,
+          payload_encoding: "base64url",
         });
       },
     },
 
     {
       name: "sanctuary/identity_verify",
-      description: "Verify an Ed25519 signature against a public key.",
+      description:
+        "Verify an Ed25519 signature. Provide either identity_id or public_key.",
       inputSchema: {
         type: "object",
         properties: {
           payload: {
             type: "string",
-            description: "Base64url-encoded original data",
+            description: "Original data (plain text or base64url-encoded)",
           },
           signature: { type: "string", description: "Base64url signature" },
+          identity_id: {
+            type: "string",
+            description: "Identity ID to look up public key (alternative to public_key)",
+          },
           public_key: {
             type: "string",
-            description: "Base64url public key",
+            description: "Base64url public key (alternative to identity_id)",
           },
         },
-        required: ["payload", "signature", "public_key"],
+        required: ["payload", "signature"],
       },
       handler: async (args) => {
-        const payload = fromBase64url(args.payload as string);
+        const payloadStr = args.payload as string;
+
+        // Accept either base64url-encoded bytes or plain text
+        let payload: Uint8Array;
+        try {
+          payload = fromBase64url(payloadStr);
+        } catch {
+          payload = stringToBytes(payloadStr);
+        }
+
         const signature = fromBase64url(args.signature as string);
-        const publicKey = fromBase64url(args.public_key as string);
+
+        // Resolve public key from identity_id or direct public_key param
+        let publicKey: Uint8Array;
+        if (args.identity_id) {
+          const identity = resolveIdentity(args.identity_id as string);
+          publicKey = fromBase64url(identity.public_key);
+        } else if (args.public_key) {
+          publicKey = fromBase64url(args.public_key as string);
+        } else {
+          return toolResult({
+            error: "Provide either identity_id or public_key for verification.",
+          });
+        }
 
         const valid = identityVerify(payload, signature, publicKey);
 
