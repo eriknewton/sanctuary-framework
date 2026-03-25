@@ -291,6 +291,312 @@ declare class AuditLog {
 }
 
 /**
+ * Sanctuary MCP Server — L3 Selective Disclosure: Commitment Schemes
+ *
+ * Cryptographic commitments allow an agent to commit to a value
+ * without revealing it, then later prove what was committed.
+ *
+ * This is the MVS approach to selective disclosure — simpler than
+ * full ZK proofs but still cryptographically sound. The commitment
+ * is SHA-256(value || blinding_factor), which is:
+ * - Hiding: the commitment reveals nothing about the value
+ * - Binding: the committer cannot change the value after committing
+ *
+ * Security invariants:
+ * - Blinding factors are cryptographically random (32 bytes)
+ * - Commitments are stored encrypted under L1 sovereignty
+ * - Revealed values are verified via constant-time comparison
+ */
+
+/** A cryptographic commitment */
+interface Commitment {
+    /** The commitment hash: SHA-256(value || blinding_factor) as base64url */
+    commitment: string;
+    /** The blinding factor (must be stored securely for later reveal) */
+    blinding_factor: string;
+    /** When the commitment was created */
+    committed_at: string;
+}
+/** Stored commitment metadata (encrypted at rest) */
+interface StoredCommitment {
+    commitment: string;
+    blinding_factor: string;
+    value: string;
+    committed_at: string;
+    revealed: boolean;
+    revealed_at?: string;
+}
+/**
+ * Commitment store — manages commitments encrypted under L1 sovereignty.
+ */
+declare class CommitmentStore {
+    private storage;
+    private encryptionKey;
+    constructor(storage: StorageBackend, masterKey: Uint8Array);
+    /**
+     * Store a commitment (encrypted) for later reference.
+     */
+    store(commitment: Commitment, value: string): Promise<string>;
+    /**
+     * Retrieve a stored commitment by ID.
+     */
+    get(id: string): Promise<StoredCommitment | null>;
+    /**
+     * Mark a commitment as revealed.
+     */
+    markRevealed(id: string): Promise<void>;
+}
+
+/**
+ * Sanctuary MCP Server — L3 Selective Disclosure: Disclosure Policies
+ *
+ * Disclosure policies define what an agent will and will not disclose
+ * in different interaction contexts. Policies are evaluated against
+ * incoming disclosure requests to produce per-field decisions.
+ *
+ * This is the agent's "privacy preferences" layer — it codifies the
+ * human principal's intent about what information can flow where.
+ *
+ * Security invariants:
+ * - Policies are stored encrypted under L1 sovereignty
+ * - Default action is always "withhold" unless explicitly overridden
+ * - Policy evaluation is deterministic (same request → same decision)
+ */
+
+/** A single disclosure rule within a policy */
+interface DisclosureRule {
+    /** Interaction context this rule applies to */
+    context: string;
+    /** Fields/claims the agent MAY disclose */
+    disclose: string[];
+    /** Fields/claims the agent MUST NOT disclose */
+    withhold: string[];
+    /** Fields that require proof rather than plain disclosure */
+    proof_required: string[];
+}
+/** A complete disclosure policy */
+interface DisclosurePolicy {
+    policy_id: string;
+    policy_name: string;
+    rules: DisclosureRule[];
+    default_action: "withhold" | "ask-principal";
+    identity_id?: string;
+    created_at: string;
+    updated_at: string;
+}
+/**
+ * Policy store — manages disclosure policies encrypted under L1 sovereignty.
+ */
+declare class PolicyStore {
+    private storage;
+    private encryptionKey;
+    private policies;
+    constructor(storage: StorageBackend, masterKey: Uint8Array);
+    /**
+     * Create and store a new disclosure policy.
+     */
+    create(policyName: string, rules: DisclosureRule[], defaultAction: "withhold" | "ask-principal", identityId?: string): Promise<DisclosurePolicy>;
+    /**
+     * Get a policy by ID.
+     */
+    get(policyId: string): Promise<DisclosurePolicy | null>;
+    /**
+     * List all policies.
+     */
+    list(): Promise<DisclosurePolicy[]>;
+    /**
+     * Load all persisted policies into memory.
+     */
+    private loadAll;
+    private persist;
+}
+
+/**
+ * Sanctuary MCP Server — Ed25519 Identity Management
+ *
+ * Sovereign identity based on Ed25519 keypairs.
+ * Private keys are always encrypted at rest — never stored in plaintext.
+ *
+ * Security invariants:
+ * - Private keys never appear in any MCP tool response
+ * - Private keys are encrypted with identity-specific keys derived from the master key
+ * - Key rotation produces a signed rotation event (verifiable chain)
+ */
+
+/** Public identity information (safe to share) */
+interface PublicIdentity {
+    identity_id: string;
+    label: string;
+    public_key: string;
+    did: string;
+    created_at: string;
+    key_type: "ed25519";
+    key_protection: "passphrase" | "hardware-key" | "recovery-key";
+}
+/** Stored identity (private key is encrypted) */
+interface StoredIdentity extends PublicIdentity {
+    encrypted_private_key: EncryptedPayload;
+    /** Previous public keys (for rotation chain verification) */
+    rotation_history: Array<{
+        old_public_key: string;
+        new_public_key: string;
+        rotation_event: string;
+        rotated_at: string;
+    }>;
+}
+
+/**
+ * Sanctuary MCP Server — L4 Verifiable Reputation: Reputation Store
+ *
+ * Records interaction outcomes as signed attestations, queries aggregated
+ * reputation data, and supports export/import for cross-platform portability.
+ *
+ * Attestation format is EAS-compatible (Ethereum Attestation Service) to
+ * enable future on-chain anchoring without requiring blockchain for MVS.
+ *
+ * Security invariants:
+ * - All attestations are signed by the recording identity
+ * - Attestations are stored encrypted under L1 sovereignty
+ * - Reputation queries return aggregates, never raw interaction data
+ * - Export bundles include all signatures for independent verification
+ * - Import verifies every signature before accepting attestations
+ */
+
+/** Interaction outcome for recording */
+interface InteractionOutcome {
+    type: "transaction" | "negotiation" | "service" | "dispute" | "custom";
+    result: "completed" | "partial" | "failed" | "disputed";
+    metrics?: Record<string, number>;
+}
+/** A signed attestation of an interaction */
+interface Attestation {
+    attestation_id: string;
+    schema: "sanctuary-interaction-v1";
+    data: {
+        interaction_id: string;
+        participant_did: string;
+        counterparty_did: string;
+        outcome_type: string;
+        outcome_result: string;
+        metrics: Record<string, number>;
+        context: string;
+        timestamp: string;
+    };
+    signature: string;
+    signer: string;
+}
+/** Stored attestation (encrypted at rest) */
+interface StoredAttestation {
+    attestation: Attestation;
+    counterparty_attestation?: string;
+    counterparty_confirmed: boolean;
+    recorded_at: string;
+}
+/** Aggregated metric statistics */
+interface MetricAggregate {
+    mean: number;
+    median: number;
+    min: number;
+    max: number;
+    count: number;
+}
+/** Reputation query result */
+interface ReputationSummary {
+    total_interactions: number;
+    completed: number;
+    partial: number;
+    failed: number;
+    disputed: number;
+    contexts: string[];
+    time_range: {
+        start: string;
+        end: string;
+    };
+    aggregate_metrics: Record<string, MetricAggregate>;
+}
+/** Portable reputation bundle */
+interface ReputationBundle {
+    version: "SANCTUARY_REP_V1";
+    attestations: Attestation[];
+    exported_at: string;
+    exporter_did: string;
+    bundle_signature: string;
+}
+/** Escrow for trust bootstrapping */
+interface Escrow {
+    escrow_id: string;
+    transaction_terms: string;
+    terms_hash: string;
+    collateral_amount?: number;
+    counterparty_did: string;
+    creator_did: string;
+    created_at: string;
+    expires_at: string;
+    status: "pending" | "active" | "released" | "disputed" | "expired";
+}
+/** Principal guarantee for a new agent */
+interface Guarantee {
+    guarantee_id: string;
+    principal_did: string;
+    agent_did: string;
+    scope: string;
+    max_liability?: number;
+    valid_until: string;
+    certificate: string;
+    created_at: string;
+}
+declare class ReputationStore {
+    private storage;
+    private encryptionKey;
+    constructor(storage: StorageBackend, masterKey: Uint8Array);
+    /**
+     * Record an interaction outcome as a signed attestation.
+     */
+    record(interactionId: string, counterpartyDid: string, outcome: InteractionOutcome, context: string, identity: StoredIdentity, identityEncryptionKey: Uint8Array, counterpartyAttestation?: string): Promise<StoredAttestation>;
+    /**
+     * Query reputation data with filtering.
+     * Returns aggregates only — not raw interaction data.
+     */
+    query(options: {
+        context?: string;
+        time_range?: {
+            start: string;
+            end: string;
+        };
+        metrics?: string[];
+        counterparty_did?: string;
+    }): Promise<ReputationSummary>;
+    /**
+     * Export attestations as a portable reputation bundle.
+     */
+    exportBundle(identity: StoredIdentity, identityEncryptionKey: Uint8Array, context?: string): Promise<ReputationBundle>;
+    /**
+     * Import attestations from a reputation bundle.
+     * Verifies signatures if requested (default: true).
+     *
+     * @param publicKeys - Map of DID → public key bytes for signature verification
+     */
+    importBundle(bundle: ReputationBundle, verifySignatures: boolean, publicKeys: Map<string, Uint8Array>): Promise<{
+        imported: number;
+        invalid: number;
+        contexts: string[];
+    }>;
+    /**
+     * Create an escrow for trust bootstrapping.
+     */
+    createEscrow(transactionTerms: string, counterpartyDid: string, timeoutSeconds: number, creatorDid: string, collateralAmount?: number): Promise<Escrow>;
+    /**
+     * Get an escrow by ID.
+     */
+    getEscrow(escrowId: string): Promise<Escrow | null>;
+    /**
+     * Create a principal's guarantee for a new agent.
+     */
+    createGuarantee(principalIdentity: StoredIdentity, agentDid: string, scope: string, durationSeconds: number, identityEncryptionKey: Uint8Array, maxLiability?: number): Promise<Guarantee>;
+    private loadAll;
+}
+
+/**
  * Sanctuary MCP Server — In-Memory Storage Backend
  *
  * Used for testing. Implements the same interface as filesystem storage
@@ -358,4 +664,4 @@ declare function createSanctuaryServer(options?: {
     storage?: StorageBackend;
 }): Promise<SanctuaryServer>;
 
-export { AuditLog, FilesystemStorage, MemoryStorage, type SanctuaryConfig, type SanctuaryServer, StateStore, createSanctuaryServer, loadConfig };
+export { AuditLog, CommitmentStore, FilesystemStorage, MemoryStorage, PolicyStore, ReputationStore, type SanctuaryConfig, type SanctuaryServer, StateStore, createSanctuaryServer, loadConfig };

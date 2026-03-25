@@ -1482,6 +1482,1172 @@ var AuditLog = class {
   }
 };
 
+// src/l3-disclosure/commitments.ts
+init_hashing();
+init_encoding();
+init_encoding();
+function createCommitment(value, blindingFactor) {
+  const blindingBytes = blindingFactor ? fromBase64url(blindingFactor) : randomBytes(32);
+  const valueBytes = stringToBytes(value);
+  const combined = concatBytes(valueBytes, blindingBytes);
+  const commitmentHash = hash(combined);
+  return {
+    commitment: toBase64url(commitmentHash),
+    blinding_factor: toBase64url(blindingBytes),
+    committed_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function verifyCommitment(commitment, value, blindingFactor) {
+  const blindingBytes = fromBase64url(blindingFactor);
+  const valueBytes = stringToBytes(value);
+  const combined = concatBytes(valueBytes, blindingBytes);
+  const expectedHash = toBase64url(hash(combined));
+  return commitment === expectedHash;
+}
+var CommitmentStore = class {
+  storage;
+  encryptionKey;
+  constructor(storage, masterKey) {
+    this.storage = storage;
+    this.encryptionKey = derivePurposeKey(masterKey, "l3-commitments");
+  }
+  /**
+   * Store a commitment (encrypted) for later reference.
+   */
+  async store(commitment, value) {
+    const id = `cmt-${Date.now()}-${toBase64url(randomBytes(8))}`;
+    const stored = {
+      commitment: commitment.commitment,
+      blinding_factor: commitment.blinding_factor,
+      value,
+      committed_at: commitment.committed_at,
+      revealed: false
+    };
+    const serialized = stringToBytes(JSON.stringify(stored));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_commitments",
+      id,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+    return id;
+  }
+  /**
+   * Retrieve a stored commitment by ID.
+   */
+  async get(id) {
+    const raw = await this.storage.read("_commitments", id);
+    if (!raw) return null;
+    try {
+      const encrypted = JSON.parse(bytesToString(raw));
+      const decrypted = decrypt(encrypted, this.encryptionKey);
+      return JSON.parse(bytesToString(decrypted));
+    } catch {
+      return null;
+    }
+  }
+  /**
+   * Mark a commitment as revealed.
+   */
+  async markRevealed(id) {
+    const stored = await this.get(id);
+    if (!stored) return;
+    stored.revealed = true;
+    stored.revealed_at = (/* @__PURE__ */ new Date()).toISOString();
+    const serialized = stringToBytes(JSON.stringify(stored));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_commitments",
+      id,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+  }
+};
+
+// src/l3-disclosure/policies.ts
+init_encoding();
+function evaluateDisclosure(policy, context, requestedFields) {
+  return requestedFields.map((field) => {
+    const exactRule = policy.rules.find((r) => r.context === context);
+    const wildcardRule = policy.rules.find((r) => r.context === "*");
+    const matchedRule = exactRule ?? wildcardRule;
+    if (!matchedRule) {
+      return {
+        field,
+        action: policy.default_action,
+        reason: `No rule matches context "${context}"`,
+        applicable_rule: "default"
+      };
+    }
+    const ruleName = `${matchedRule.context}`;
+    if (matchedRule.withhold.includes(field)) {
+      return {
+        field,
+        action: "withhold",
+        reason: `Field "${field}" is explicitly withheld in ${ruleName} context`,
+        applicable_rule: ruleName
+      };
+    }
+    if (matchedRule.proof_required.includes(field)) {
+      return {
+        field,
+        action: "proof",
+        reason: `Field "${field}" requires cryptographic proof in ${ruleName} context`,
+        applicable_rule: ruleName
+      };
+    }
+    if (matchedRule.disclose.includes(field)) {
+      return {
+        field,
+        action: "disclose",
+        reason: `Field "${field}" is permitted for disclosure in ${ruleName} context`,
+        applicable_rule: ruleName
+      };
+    }
+    return {
+      field,
+      action: policy.default_action,
+      reason: `Field "${field}" not addressed in ${ruleName} rule; applying default`,
+      applicable_rule: ruleName
+    };
+  });
+}
+var PolicyStore = class {
+  storage;
+  encryptionKey;
+  policies = /* @__PURE__ */ new Map();
+  constructor(storage, masterKey) {
+    this.storage = storage;
+    this.encryptionKey = derivePurposeKey(masterKey, "l3-policies");
+  }
+  /**
+   * Create and store a new disclosure policy.
+   */
+  async create(policyName, rules, defaultAction, identityId) {
+    const policyId = `pol-${Date.now()}-${toBase64url(randomBytes(8))}`;
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const policy = {
+      policy_id: policyId,
+      policy_name: policyName,
+      rules,
+      default_action: defaultAction,
+      identity_id: identityId,
+      created_at: now,
+      updated_at: now
+    };
+    await this.persist(policy);
+    this.policies.set(policyId, policy);
+    return policy;
+  }
+  /**
+   * Get a policy by ID.
+   */
+  async get(policyId) {
+    if (this.policies.has(policyId)) {
+      return this.policies.get(policyId);
+    }
+    const raw = await this.storage.read("_policies", policyId);
+    if (!raw) return null;
+    try {
+      const encrypted = JSON.parse(bytesToString(raw));
+      const decrypted = decrypt(encrypted, this.encryptionKey);
+      const policy = JSON.parse(bytesToString(decrypted));
+      this.policies.set(policyId, policy);
+      return policy;
+    } catch {
+      return null;
+    }
+  }
+  /**
+   * List all policies.
+   */
+  async list() {
+    await this.loadAll();
+    return Array.from(this.policies.values());
+  }
+  /**
+   * Load all persisted policies into memory.
+   */
+  async loadAll() {
+    try {
+      const entries = await this.storage.list("_policies");
+      for (const meta of entries) {
+        if (this.policies.has(meta.key)) continue;
+        const raw = await this.storage.read("_policies", meta.key);
+        if (!raw) continue;
+        try {
+          const encrypted = JSON.parse(bytesToString(raw));
+          const decrypted = decrypt(encrypted, this.encryptionKey);
+          const policy = JSON.parse(bytesToString(decrypted));
+          this.policies.set(policy.policy_id, policy);
+        } catch {
+        }
+      }
+    } catch {
+    }
+  }
+  async persist(policy) {
+    const serialized = stringToBytes(JSON.stringify(policy));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_policies",
+      policy.policy_id,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+  }
+};
+
+// src/l3-disclosure/tools.ts
+function createL3Tools(storage, masterKey, auditLog) {
+  const commitmentStore = new CommitmentStore(storage, masterKey);
+  const policyStore = new PolicyStore(storage, masterKey);
+  const tools = [
+    // ─── Commitment Schemes ───────────────────────────────────────────────
+    {
+      name: "sanctuary/proof_commitment",
+      description: "Create a cryptographic commitment to a value. The commitment hides the value until you choose to reveal it. Returns the commitment hash and a blinding factor (store securely).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "string",
+            description: "The value to commit to"
+          },
+          blinding_factor: {
+            type: "string",
+            description: "Optional base64url blinding factor (auto-generated if omitted)"
+          }
+        },
+        required: ["value"]
+      },
+      handler: async (args) => {
+        const value = args.value;
+        const blindingFactor = args.blinding_factor;
+        const commitment = createCommitment(value, blindingFactor);
+        const commitmentId = await commitmentStore.store(commitment, value);
+        auditLog.append("l3", "proof_commitment", "system", {
+          commitment_id: commitmentId,
+          commitment_hash: commitment.commitment
+        });
+        return toolResult({
+          commitment_id: commitmentId,
+          commitment: commitment.commitment,
+          blinding_factor: commitment.blinding_factor,
+          committed_at: commitment.committed_at,
+          note: "Store the blinding_factor securely. You will need it to reveal the committed value."
+        });
+      }
+    },
+    {
+      name: "sanctuary/proof_reveal",
+      description: "Verify a previously committed value by revealing it with the blinding factor. Returns whether the revealed value matches the commitment.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          commitment: {
+            type: "string",
+            description: "The original commitment hash"
+          },
+          value: {
+            type: "string",
+            description: "The value being revealed"
+          },
+          blinding_factor: {
+            type: "string",
+            description: "The blinding factor from the original commitment"
+          }
+        },
+        required: ["commitment", "value", "blinding_factor"]
+      },
+      handler: async (args) => {
+        const commitment = args.commitment;
+        const value = args.value;
+        const blindingFactor = args.blinding_factor;
+        const valid = verifyCommitment(commitment, value, blindingFactor);
+        auditLog.append("l3", "proof_reveal", "system", {
+          commitment_hash: commitment,
+          valid
+        });
+        return toolResult({
+          valid,
+          commitment,
+          revealed_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    },
+    // ─── Disclosure Policies ──────────────────────────────────────────────
+    {
+      name: "sanctuary/disclosure_set_policy",
+      description: "Define a disclosure policy that controls what an agent will and will not disclose in different interaction contexts. Rules specify which fields may be disclosed, which must be withheld, and which require cryptographic proof.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          policy_name: {
+            type: "string",
+            description: "Human-readable policy name"
+          },
+          rules: {
+            type: "array",
+            description: "Disclosure rules for different contexts",
+            items: {
+              type: "object",
+              properties: {
+                context: {
+                  type: "string",
+                  description: 'Interaction context: "negotiation", "commerce", "identity", "*" (wildcard)'
+                },
+                disclose: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields the agent MAY disclose"
+                },
+                withhold: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields the agent MUST NOT disclose"
+                },
+                proof_required: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields that require proof rather than plain disclosure"
+                }
+              },
+              required: ["context", "disclose", "withhold", "proof_required"]
+            }
+          },
+          default_action: {
+            type: "string",
+            enum: ["withhold", "ask-principal"],
+            description: "What to do when no rule matches a field"
+          },
+          identity_id: {
+            type: "string",
+            description: "Optional identity this policy is bound to"
+          }
+        },
+        required: ["policy_name", "rules", "default_action"]
+      },
+      handler: async (args) => {
+        const policyName = args.policy_name;
+        const rules = args.rules;
+        const defaultAction = args.default_action;
+        const identityId = args.identity_id;
+        const policy = await policyStore.create(
+          policyName,
+          rules,
+          defaultAction,
+          identityId
+        );
+        auditLog.append("l3", "disclosure_set_policy", identityId ?? "system", {
+          policy_id: policy.policy_id,
+          policy_name: policyName,
+          rules_count: rules.length
+        });
+        return toolResult({
+          policy_id: policy.policy_id,
+          policy_name: policy.policy_name,
+          rules_count: policy.rules.length,
+          created_at: policy.created_at
+        });
+      }
+    },
+    {
+      name: "sanctuary/disclosure_evaluate",
+      description: "Evaluate a disclosure request against an active policy. Returns per-field decisions: disclose, withhold, proof, or ask-principal.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          context: {
+            type: "string",
+            description: "The interaction context"
+          },
+          requested_fields: {
+            type: "array",
+            items: { type: "string" },
+            description: "Fields the counterparty is requesting"
+          },
+          policy_id: {
+            type: "string",
+            description: "Specific policy to evaluate (uses first available if omitted)"
+          }
+        },
+        required: ["context", "requested_fields"]
+      },
+      handler: async (args) => {
+        const context = args.context;
+        const requestedFields = args.requested_fields;
+        const policyId = args.policy_id;
+        let policy;
+        if (policyId) {
+          policy = await policyStore.get(policyId);
+        } else {
+          const allPolicies = await policyStore.list();
+          policy = allPolicies[0] ?? null;
+        }
+        if (!policy) {
+          return toolResult({
+            error: "No disclosure policy found. Create one with disclosure_set_policy first."
+          });
+        }
+        const decisions = evaluateDisclosure(policy, context, requestedFields);
+        const withholding = decisions.filter(
+          (d) => d.action === "withhold"
+        ).length;
+        const disclosing = decisions.filter(
+          (d) => d.action === "disclose"
+        ).length;
+        const proofRequired = decisions.filter(
+          (d) => d.action === "proof"
+        ).length;
+        const askPrincipal = decisions.filter(
+          (d) => d.action === "ask-principal"
+        ).length;
+        auditLog.append("l3", "disclosure_evaluate", "system", {
+          policy_id: policy.policy_id,
+          context,
+          fields_requested: requestedFields.length,
+          withholding,
+          disclosing,
+          proof_required: proofRequired
+        });
+        return toolResult({
+          policy_id: policy.policy_id,
+          policy_name: policy.policy_name,
+          context,
+          decisions,
+          summary: {
+            total_fields: requestedFields.length,
+            disclose: disclosing,
+            withhold: withholding,
+            proof: proofRequired,
+            ask_principal: askPrincipal
+          },
+          overall_recommendation: withholding > 0 ? `Withholding ${withholding} of ${requestedFields.length} requested fields per policy "${policy.policy_name}"` : `All ${requestedFields.length} fields may be disclosed per policy "${policy.policy_name}"`
+        });
+      }
+    }
+  ];
+  return { tools, commitmentStore, policyStore };
+}
+
+// src/l4-reputation/reputation-store.ts
+init_encoding();
+function computeMedian(values) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+function aggregateMetrics(attestations, metricNames) {
+  const result = {};
+  const names = metricNames ?? Array.from(
+    new Set(
+      attestations.flatMap(
+        (a) => Object.keys(a.attestation.data.metrics)
+      )
+    )
+  );
+  for (const name of names) {
+    const values = attestations.map((a) => a.attestation.data.metrics[name]).filter((v) => v !== void 0);
+    if (values.length === 0) {
+      result[name] = { mean: 0, median: 0, min: 0, max: 0, count: 0 };
+      continue;
+    }
+    result[name] = {
+      mean: values.reduce((s, v) => s + v, 0) / values.length,
+      median: computeMedian(values),
+      min: Math.min(...values),
+      max: Math.max(...values),
+      count: values.length
+    };
+  }
+  return result;
+}
+var ReputationStore = class {
+  storage;
+  encryptionKey;
+  constructor(storage, masterKey) {
+    this.storage = storage;
+    this.encryptionKey = derivePurposeKey(masterKey, "l4-reputation");
+  }
+  /**
+   * Record an interaction outcome as a signed attestation.
+   */
+  async record(interactionId, counterpartyDid, outcome, context, identity, identityEncryptionKey, counterpartyAttestation) {
+    const attestationId = `att-${Date.now()}-${toBase64url(randomBytes(8))}`;
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const attestationData = {
+      interaction_id: interactionId,
+      participant_did: identity.did,
+      counterparty_did: counterpartyDid,
+      outcome_type: outcome.type,
+      outcome_result: outcome.result,
+      metrics: outcome.metrics ?? {},
+      context,
+      timestamp: now
+    };
+    const dataBytes = stringToBytes(JSON.stringify(attestationData));
+    const signature = sign(
+      dataBytes,
+      identity.encrypted_private_key,
+      identityEncryptionKey
+    );
+    const attestation = {
+      attestation_id: attestationId,
+      schema: "sanctuary-interaction-v1",
+      data: attestationData,
+      signature: toBase64url(signature),
+      signer: identity.did
+    };
+    const stored = {
+      attestation,
+      counterparty_attestation: counterpartyAttestation,
+      counterparty_confirmed: !!counterpartyAttestation,
+      recorded_at: now
+    };
+    const serialized = stringToBytes(JSON.stringify(stored));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_reputation",
+      attestationId,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+    return stored;
+  }
+  /**
+   * Query reputation data with filtering.
+   * Returns aggregates only — not raw interaction data.
+   */
+  async query(options) {
+    const all = await this.loadAll();
+    let filtered = all;
+    if (options.context) {
+      filtered = filtered.filter(
+        (a) => a.attestation.data.context === options.context
+      );
+    }
+    if (options.time_range) {
+      const start2 = new Date(options.time_range.start).getTime();
+      const end2 = new Date(options.time_range.end).getTime();
+      filtered = filtered.filter((a) => {
+        const t = new Date(a.attestation.data.timestamp).getTime();
+        return t >= start2 && t <= end2;
+      });
+    }
+    if (options.counterparty_did) {
+      filtered = filtered.filter(
+        (a) => a.attestation.data.counterparty_did === options.counterparty_did
+      );
+    }
+    const contexts = Array.from(
+      new Set(filtered.map((a) => a.attestation.data.context))
+    );
+    const timestamps = filtered.map(
+      (a) => new Date(a.attestation.data.timestamp).getTime()
+    );
+    const start = timestamps.length > 0 ? new Date(Math.min(...timestamps)).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
+    const end = timestamps.length > 0 ? new Date(Math.max(...timestamps)).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
+    return {
+      total_interactions: filtered.length,
+      completed: filtered.filter(
+        (a) => a.attestation.data.outcome_result === "completed"
+      ).length,
+      partial: filtered.filter(
+        (a) => a.attestation.data.outcome_result === "partial"
+      ).length,
+      failed: filtered.filter(
+        (a) => a.attestation.data.outcome_result === "failed"
+      ).length,
+      disputed: filtered.filter(
+        (a) => a.attestation.data.outcome_result === "disputed"
+      ).length,
+      contexts,
+      time_range: { start, end },
+      aggregate_metrics: aggregateMetrics(filtered, options.metrics)
+    };
+  }
+  /**
+   * Export attestations as a portable reputation bundle.
+   */
+  async exportBundle(identity, identityEncryptionKey, context) {
+    let all = await this.loadAll();
+    if (context) {
+      all = all.filter((a) => a.attestation.data.context === context);
+    }
+    const attestations = all.map((a) => a.attestation);
+    const bundleData = {
+      version: "SANCTUARY_REP_V1",
+      attestations,
+      exported_at: (/* @__PURE__ */ new Date()).toISOString(),
+      exporter_did: identity.did
+    };
+    const bundleBytes = stringToBytes(JSON.stringify(bundleData));
+    const bundleSignature = sign(
+      bundleBytes,
+      identity.encrypted_private_key,
+      identityEncryptionKey
+    );
+    return {
+      ...bundleData,
+      bundle_signature: toBase64url(bundleSignature)
+    };
+  }
+  /**
+   * Import attestations from a reputation bundle.
+   * Verifies signatures if requested (default: true).
+   *
+   * @param publicKeys - Map of DID → public key bytes for signature verification
+   */
+  async importBundle(bundle, verifySignatures, publicKeys) {
+    let imported = 0;
+    let invalid = 0;
+    const contexts = /* @__PURE__ */ new Set();
+    for (const attestation of bundle.attestations) {
+      if (verifySignatures) {
+        const signerKey = publicKeys.get(attestation.signer);
+        if (!signerKey) {
+          invalid++;
+          continue;
+        }
+        const dataBytes = stringToBytes(
+          JSON.stringify(attestation.data)
+        );
+        const sigBytes = fromBase64url(attestation.signature);
+        if (!verify(dataBytes, sigBytes, signerKey)) {
+          invalid++;
+          continue;
+        }
+      }
+      const stored = {
+        attestation,
+        counterparty_confirmed: false,
+        recorded_at: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      const serialized = stringToBytes(JSON.stringify(stored));
+      const encrypted = encrypt(serialized, this.encryptionKey);
+      await this.storage.write(
+        "_reputation",
+        attestation.attestation_id,
+        stringToBytes(JSON.stringify(encrypted))
+      );
+      imported++;
+      contexts.add(attestation.data.context);
+    }
+    return {
+      imported,
+      invalid,
+      contexts: Array.from(contexts)
+    };
+  }
+  // ─── Escrow ───────────────────────────────────────────────────────────
+  /**
+   * Create an escrow for trust bootstrapping.
+   */
+  async createEscrow(transactionTerms, counterpartyDid, timeoutSeconds, creatorDid, collateralAmount) {
+    const escrowId = `esc-${Date.now()}-${toBase64url(randomBytes(8))}`;
+    const now = /* @__PURE__ */ new Date();
+    const expiresAt = new Date(now.getTime() + timeoutSeconds * 1e3);
+    const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
+    const termsHash = hashToString2(stringToBytes(transactionTerms));
+    const escrow = {
+      escrow_id: escrowId,
+      transaction_terms: transactionTerms,
+      terms_hash: termsHash,
+      collateral_amount: collateralAmount,
+      counterparty_did: counterpartyDid,
+      creator_did: creatorDid,
+      created_at: now.toISOString(),
+      expires_at: expiresAt.toISOString(),
+      status: "pending"
+    };
+    const serialized = stringToBytes(JSON.stringify(escrow));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_escrows",
+      escrowId,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+    return escrow;
+  }
+  /**
+   * Get an escrow by ID.
+   */
+  async getEscrow(escrowId) {
+    const raw = await this.storage.read("_escrows", escrowId);
+    if (!raw) return null;
+    try {
+      const encrypted = JSON.parse(bytesToString(raw));
+      const decrypted = decrypt(encrypted, this.encryptionKey);
+      return JSON.parse(bytesToString(decrypted));
+    } catch {
+      return null;
+    }
+  }
+  // ─── Guarantees ─────────────────────────────────────────────────────
+  /**
+   * Create a principal's guarantee for a new agent.
+   */
+  async createGuarantee(principalIdentity, agentDid, scope, durationSeconds, identityEncryptionKey, maxLiability) {
+    const guaranteeId = `guar-${Date.now()}-${toBase64url(randomBytes(8))}`;
+    const now = /* @__PURE__ */ new Date();
+    const validUntil = new Date(now.getTime() + durationSeconds * 1e3);
+    const certificateData = {
+      guarantee_id: guaranteeId,
+      principal_did: principalIdentity.did,
+      agent_did: agentDid,
+      scope,
+      max_liability: maxLiability,
+      valid_until: validUntil.toISOString(),
+      issued_at: now.toISOString()
+    };
+    const certBytes = stringToBytes(JSON.stringify(certificateData));
+    const signature = sign(
+      certBytes,
+      principalIdentity.encrypted_private_key,
+      identityEncryptionKey
+    );
+    const certificate = toBase64url(
+      stringToBytes(
+        JSON.stringify({
+          ...certificateData,
+          signature: toBase64url(signature)
+        })
+      )
+    );
+    const guarantee = {
+      guarantee_id: guaranteeId,
+      principal_did: principalIdentity.did,
+      agent_did: agentDid,
+      scope,
+      max_liability: maxLiability,
+      valid_until: validUntil.toISOString(),
+      certificate,
+      created_at: now.toISOString()
+    };
+    const serialized = stringToBytes(JSON.stringify(guarantee));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_guarantees",
+      guaranteeId,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+    return guarantee;
+  }
+  // ─── Internal ─────────────────────────────────────────────────────────
+  async loadAll() {
+    const results = [];
+    try {
+      const entries = await this.storage.list("_reputation");
+      for (const meta of entries) {
+        const raw = await this.storage.read("_reputation", meta.key);
+        if (!raw) continue;
+        try {
+          const encrypted = JSON.parse(bytesToString(raw));
+          const decrypted = decrypt(encrypted, this.encryptionKey);
+          results.push(JSON.parse(bytesToString(decrypted)));
+        } catch {
+        }
+      }
+    } catch {
+    }
+    return results;
+  }
+};
+
+// src/l4-reputation/tools.ts
+init_encoding();
+function createL4Tools(storage, masterKey, identityManager, auditLog) {
+  const reputationStore = new ReputationStore(storage, masterKey);
+  const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  const tools = [
+    // ─── Reputation Recording ─────────────────────────────────────────
+    {
+      name: "sanctuary/reputation_record",
+      description: "Record an interaction outcome as a signed attestation. Creates an EAS-compatible attestation signed by the specified identity.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          interaction_id: {
+            type: "string",
+            description: "Unique interaction identifier"
+          },
+          counterparty_did: {
+            type: "string",
+            description: "Counterparty's DID"
+          },
+          outcome: {
+            type: "object",
+            description: "Interaction outcome",
+            properties: {
+              type: {
+                type: "string",
+                enum: ["transaction", "negotiation", "service", "dispute", "custom"]
+              },
+              result: {
+                type: "string",
+                enum: ["completed", "partial", "failed", "disputed"]
+              },
+              metrics: {
+                type: "object",
+                description: "Domain-specific metrics (e.g., fulfillment_rate, response_time_ms)"
+              }
+            },
+            required: ["type", "result"]
+          },
+          context: {
+            type: "string",
+            description: "Category/domain for context-specific reputation",
+            default: "general"
+          },
+          counterparty_attestation: {
+            type: "string",
+            description: "Counterparty's signed attestation of the same interaction"
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to sign with (uses default if omitted)"
+          }
+        },
+        required: ["interaction_id", "counterparty_did", "outcome"]
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first."
+          });
+        }
+        const outcome = args.outcome;
+        const context = args.context ?? "general";
+        const stored = await reputationStore.record(
+          args.interaction_id,
+          args.counterparty_did,
+          outcome,
+          context,
+          identity,
+          identityEncryptionKey,
+          args.counterparty_attestation
+        );
+        auditLog.append("l4", "reputation_record", identity.identity_id, {
+          interaction_id: args.interaction_id,
+          outcome_type: outcome.type,
+          outcome_result: outcome.result,
+          context
+        });
+        return toolResult({
+          attestation_id: stored.attestation.attestation_id,
+          interaction_id: stored.attestation.data.interaction_id,
+          self_attestation: stored.attestation.signature,
+          counterparty_confirmed: stored.counterparty_confirmed,
+          context,
+          recorded_at: stored.recorded_at
+        });
+      }
+    },
+    // ─── Reputation Query ─────────────────────────────────────────────
+    {
+      name: "sanctuary/reputation_query",
+      description: "Query aggregated reputation data with filtering. Returns summary statistics, never raw interaction details.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          context: {
+            type: "string",
+            description: "Filter by context/domain"
+          },
+          time_range: {
+            type: "object",
+            description: "Filter by time range",
+            properties: {
+              start: { type: "string", description: "ISO 8601 start" },
+              end: { type: "string", description: "ISO 8601 end" }
+            }
+          },
+          metrics: {
+            type: "array",
+            items: { type: "string" },
+            description: "Which metrics to aggregate"
+          },
+          counterparty_did: {
+            type: "string",
+            description: "Filter by counterparty"
+          }
+        }
+      },
+      handler: async (args) => {
+        const summary = await reputationStore.query({
+          context: args.context,
+          time_range: args.time_range,
+          metrics: args.metrics,
+          counterparty_did: args.counterparty_did
+        });
+        auditLog.append("l4", "reputation_query", "system", {
+          total_interactions: summary.total_interactions,
+          contexts: summary.contexts
+        });
+        return toolResult({
+          summary
+        });
+      }
+    },
+    // ─── Reputation Export ─────────────────────────────────────────────
+    {
+      name: "sanctuary/reputation_export",
+      description: "Export a portable reputation bundle (SANCTUARY_REP_V1). Includes all signed attestations for independent verification.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          format: {
+            type: "string",
+            enum: ["SANCTUARY_REP_V1"],
+            default: "SANCTUARY_REP_V1"
+          },
+          context: {
+            type: "string",
+            description: "Export specific context only"
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to sign the bundle with"
+          }
+        }
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first."
+          });
+        }
+        const context = args.context;
+        const bundle = await reputationStore.exportBundle(
+          identity,
+          identityEncryptionKey,
+          context
+        );
+        const bundleJson = JSON.stringify(bundle);
+        const bundleBase64 = toBase64url(
+          new TextEncoder().encode(bundleJson)
+        );
+        auditLog.append("l4", "reputation_export", identity.identity_id, {
+          attestation_count: bundle.attestations.length,
+          contexts: Array.from(
+            new Set(bundle.attestations.map((a) => a.data.context))
+          )
+        });
+        const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
+        const { stringToBytes: stringToBytes2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
+        return toolResult({
+          bundle: bundleBase64,
+          attestation_count: bundle.attestations.length,
+          contexts: Array.from(
+            new Set(bundle.attestations.map((a) => a.data.context))
+          ),
+          bundle_hash: hashToString2(stringToBytes2(bundleJson)),
+          exported_at: bundle.exported_at
+        });
+      }
+    },
+    // ─── Reputation Import ────────────────────────────────────────────
+    {
+      name: "sanctuary/reputation_import",
+      description: "Import a reputation bundle from another Sanctuary instance. Verifies all attestation signatures by default.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          bundle: {
+            type: "string",
+            description: "Base64url-encoded reputation bundle"
+          },
+          verify_signatures: {
+            type: "boolean",
+            description: "Verify attestation signatures (default: true)",
+            default: true
+          }
+        },
+        required: ["bundle"]
+      },
+      handler: async (args) => {
+        const bundleBase64 = args.bundle;
+        const verifySignatures = args.verify_signatures ?? true;
+        let bundle;
+        try {
+          const bundleBytes = fromBase64url(bundleBase64);
+          const bundleJson = new TextDecoder().decode(bundleBytes);
+          bundle = JSON.parse(bundleJson);
+        } catch {
+          return toolResult({
+            error: "Invalid bundle format. Expected base64url-encoded JSON."
+          });
+        }
+        const publicKeys = /* @__PURE__ */ new Map();
+        for (const pub of identityManager.list()) {
+          const identity = identityManager.get(pub.identity_id);
+          if (identity) {
+            publicKeys.set(identity.did, fromBase64url(identity.public_key));
+          }
+        }
+        const result = await reputationStore.importBundle(
+          bundle,
+          verifySignatures,
+          publicKeys
+        );
+        auditLog.append("l4", "reputation_import", "system", {
+          imported: result.imported,
+          invalid: result.invalid,
+          contexts: result.contexts
+        });
+        return toolResult({
+          imported_attestations: result.imported,
+          invalid_attestations: result.invalid,
+          contexts: result.contexts,
+          imported_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    },
+    // ─── Trust Bootstrap: Escrow ──────────────────────────────────────
+    {
+      name: "sanctuary/bootstrap_create_escrow",
+      description: "Create an escrow record for trust bootstrapping. Allows new participants with no reputation to transact safely.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          transaction_terms: {
+            type: "string",
+            description: "Description of the transaction"
+          },
+          collateral_amount: {
+            type: "number",
+            description: "Optional stake/collateral amount"
+          },
+          counterparty_did: {
+            type: "string",
+            description: "Counterparty's DID"
+          },
+          timeout_seconds: {
+            type: "number",
+            description: "Escrow timeout in seconds"
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity creating the escrow"
+          }
+        },
+        required: ["transaction_terms", "counterparty_did", "timeout_seconds"]
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first."
+          });
+        }
+        const escrow = await reputationStore.createEscrow(
+          args.transaction_terms,
+          args.counterparty_did,
+          args.timeout_seconds,
+          identity.did,
+          args.collateral_amount
+        );
+        auditLog.append("l4", "bootstrap_create_escrow", identity.identity_id, {
+          escrow_id: escrow.escrow_id,
+          counterparty_did: args.counterparty_did,
+          timeout_seconds: args.timeout_seconds
+        });
+        return toolResult({
+          escrow_id: escrow.escrow_id,
+          terms_hash: escrow.terms_hash,
+          created_at: escrow.created_at,
+          expires_at: escrow.expires_at,
+          status: escrow.status
+        });
+      }
+    },
+    // ─── Trust Bootstrap: Guarantee ───────────────────────────────────
+    {
+      name: "sanctuary/bootstrap_provide_guarantee",
+      description: "A principal provides a signed reputation guarantee for a new agent. The guarantee certificate can be presented to counterparties.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          principal_identity_id: {
+            type: "string",
+            description: "Identity of the guarantor (principal)"
+          },
+          agent_identity_id: {
+            type: "string",
+            description: "Identity of the agent being guaranteed"
+          },
+          scope: {
+            type: "string",
+            description: "What the guarantee covers"
+          },
+          duration_seconds: {
+            type: "number",
+            description: "How long the guarantee is valid"
+          },
+          max_liability: {
+            type: "number",
+            description: "Maximum liability amount"
+          }
+        },
+        required: [
+          "principal_identity_id",
+          "agent_identity_id",
+          "scope",
+          "duration_seconds"
+        ]
+      },
+      handler: async (args) => {
+        const principalIdentity = identityManager.get(
+          args.principal_identity_id
+        );
+        const agentIdentity = identityManager.get(
+          args.agent_identity_id
+        );
+        if (!principalIdentity) {
+          return toolResult({
+            error: `Principal identity "${args.principal_identity_id}" not found.`
+          });
+        }
+        if (!agentIdentity) {
+          return toolResult({
+            error: `Agent identity "${args.agent_identity_id}" not found.`
+          });
+        }
+        const guarantee = await reputationStore.createGuarantee(
+          principalIdentity,
+          agentIdentity.did,
+          args.scope,
+          args.duration_seconds,
+          identityEncryptionKey,
+          args.max_liability
+        );
+        auditLog.append(
+          "l4",
+          "bootstrap_provide_guarantee",
+          principalIdentity.identity_id,
+          {
+            guarantee_id: guarantee.guarantee_id,
+            agent_did: agentIdentity.did,
+            scope: args.scope
+          }
+        );
+        return toolResult({
+          guarantee_id: guarantee.guarantee_id,
+          guarantee_certificate: guarantee.certificate,
+          scope: guarantee.scope,
+          valid_until: guarantee.valid_until
+        });
+      }
+    }
+  ];
+  return { tools, reputationStore };
+}
+
 // src/index.ts
 init_encoding();
 async function createSanctuaryServer(options) {
@@ -1760,11 +2926,19 @@ async function createSanctuaryServer(options) {
       });
     }
   };
+  const { tools: l3Tools } = createL3Tools(storage, masterKey, auditLog);
+  const { tools: l4Tools } = createL4Tools(
+    storage,
+    masterKey,
+    identityManager,
+    auditLog
+  );
   const allTools = [
     ...l1Tools,
     ...l2Tools,
+    ...l3Tools,
+    ...l4Tools,
     manifestTool
-    // L3 and L4 tools will be added here as they're implemented
   ];
   const server = createServer(allTools);
   await saveConfig(config);

@@ -12,6 +12,8 @@ import type { StorageBackend } from "./storage/interface.js";
 import { StateStore } from "./l1-cognitive/state-store.js";
 import { createL1Tools } from "./l1-cognitive/tools.js";
 import { AuditLog } from "./l2-operational/audit-log.js";
+import { createL3Tools } from "./l3-disclosure/tools.js";
+import { createL4Tools } from "./l4-reputation/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
@@ -374,21 +376,33 @@ export async function createSanctuaryServer(options?: {
     },
   };
 
-  // 11. Assemble all tools
+  // 11. Create L3 tools
+  const { tools: l3Tools } = createL3Tools(storage, masterKey, auditLog);
+
+  // 12. Create L4 tools
+  const { tools: l4Tools } = createL4Tools(
+    storage,
+    masterKey,
+    identityManager,
+    auditLog
+  );
+
+  // 13. Assemble all tools
   const allTools: ToolDefinition[] = [
     ...l1Tools,
     ...l2Tools,
+    ...l3Tools,
+    ...l4Tools,
     manifestTool,
-    // L3 and L4 tools will be added here as they're implemented
   ];
 
-  // 12. Create MCP server
+  // 14. Create MCP server
   const server = createServer(allTools);
 
-  // 13. Save config if this is first run
+  // 15. Save config if this is first run
   await saveConfig(config);
 
-  // 14. Log the recovery key if generated (shown once, never again)
+  // 16. Log the recovery key if generated (shown once, never again)
   if (recoveryKey) {
     console.error(
       "╔══════════════════════════════════════════════════════════╗\n" +
@@ -408,5 +422,8 @@ export async function createSanctuaryServer(options?: {
 export { loadConfig, type SanctuaryConfig } from "./config.js";
 export { StateStore } from "./l1-cognitive/state-store.js";
 export { AuditLog } from "./l2-operational/audit-log.js";
+export { CommitmentStore } from "./l3-disclosure/commitments.js";
+export { PolicyStore } from "./l3-disclosure/policies.js";
+export { ReputationStore } from "./l4-reputation/reputation-store.js";
 export { MemoryStorage } from "./storage/memory.js";
 export { FilesystemStorage } from "./storage/filesystem.js";

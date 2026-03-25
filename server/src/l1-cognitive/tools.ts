@@ -28,7 +28,7 @@ import { bytesToString } from "../core/encoding.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 
 /** Manages all identities — provides storage and retrieval */
-class IdentityManager {
+export class IdentityManager {
   private storage: StorageBackend;
   private masterKey: Uint8Array;
   private identities = new Map<string, StoredIdentity>();
