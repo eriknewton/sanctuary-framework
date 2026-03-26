@@ -14,6 +14,11 @@ import { createL1Tools } from "./l1-cognitive/tools.js";
 import { AuditLog } from "./l2-operational/audit-log.js";
 import { createL3Tools } from "./l3-disclosure/tools.js";
 import { createL4Tools } from "./l4-reputation/tools.js";
+import { loadPrincipalPolicy } from "./principal-policy/loader.js";
+import { BaselineTracker } from "./principal-policy/baseline.js";
+import { StderrApprovalChannel } from "./principal-policy/approval-channel.js";
+import { ApprovalGate } from "./principal-policy/gate.js";
+import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
@@ -387,22 +392,41 @@ export async function createSanctuaryServer(options?: {
     auditLog
   );
 
-  // 13. Assemble all tools
+  // 13. Load Principal Policy and create approval gate
+  const policy = await loadPrincipalPolicy(config.storage_path);
+  const baseline = new BaselineTracker(storage, masterKey);
+  await baseline.load();
+
+  const approvalChannel = new StderrApprovalChannel(policy.approval_channel);
+  const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog);
+
+  // 14. Create Principal Policy tools (read-only)
+  const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
+
+  // 15. Assemble all tools
   const allTools: ToolDefinition[] = [
     ...l1Tools,
     ...l2Tools,
     ...l3Tools,
     ...l4Tools,
+    ...policyTools,
     manifestTool,
   ];
 
-  // 14. Create MCP server
-  const server = createServer(allTools);
+  // 16. Create MCP server with approval gate
+  const server = createServer(allTools, { gate });
 
-  // 15. Save config if this is first run
+  // 17. Save config if this is first run
   await saveConfig(config);
 
-  // 16. Log the recovery key if generated (shown once, never again)
+  // 18. Register baseline save on process exit
+  const saveBaseline = () => {
+    baseline.save().catch(() => {});
+  };
+  process.on("SIGINT", saveBaseline);
+  process.on("SIGTERM", saveBaseline);
+
+  // 19. Log the recovery key if generated (shown once, never again)
   if (recoveryKey) {
     console.error(
       "╔══════════════════════════════════════════════════════════╗\n" +
@@ -427,3 +451,12 @@ export { PolicyStore } from "./l3-disclosure/policies.js";
 export { ReputationStore } from "./l4-reputation/reputation-store.js";
 export { MemoryStorage } from "./storage/memory.js";
 export { FilesystemStorage } from "./storage/filesystem.js";
+export { ApprovalGate } from "./principal-policy/gate.js";
+export { BaselineTracker } from "./principal-policy/baseline.js";
+export { loadPrincipalPolicy } from "./principal-policy/loader.js";
+export type { PrincipalPolicy, GateResult } from "./principal-policy/types.js";
+export {
+  StderrApprovalChannel,
+  CallbackApprovalChannel,
+  AutoApproveChannel,
+} from "./principal-policy/approval-channel.js";

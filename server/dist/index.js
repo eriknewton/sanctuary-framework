@@ -1,6 +1,6 @@
 import { sha256 } from '@noble/hashes/sha256';
 import { hmac } from '@noble/hashes/hmac';
-import { readFile, mkdir, writeFile, stat, unlink, readdir } from 'fs/promises';
+import { readFile, mkdir, writeFile, stat, unlink, readdir, chmod } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { randomBytes as randomBytes$1 } from 'crypto';
@@ -910,11 +910,12 @@ var StateStore = class {
     };
   }
 };
-function createServer(tools) {
+function createServer(tools, options) {
+  const gate = options?.gate;
   const server = new Server(
     {
       name: "sanctuary-mcp-server",
-      version: "0.1.0"
+      version: "0.2.0"
     },
     {
       capabilities: {
@@ -933,6 +934,7 @@ function createServer(tools) {
   });
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+    const typedArgs = args ?? {};
     const tool = tools.find((t) => t.name === name);
     if (!tool) {
       return {
@@ -945,8 +947,25 @@ function createServer(tools) {
         isError: true
       };
     }
+    if (gate) {
+      const result = await gate.evaluate(name, typedArgs);
+      if (!result.allowed) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: "Operation not permitted",
+                approval_required: result.approval_required
+              })
+            }
+          ],
+          isError: true
+        };
+      }
+    }
     try {
-      return await tool.handler(args ?? {});
+      return await tool.handler(typedArgs);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       return {
@@ -2672,6 +2691,684 @@ function createL4Tools(storage, masterKey, identityManager, auditLog) {
   ];
   return { tools, reputationStore };
 }
+var DEFAULT_TIER2 = {
+  new_namespace_access: "approve",
+  new_counterparty: "approve",
+  frequency_spike_multiplier: 5,
+  max_signs_per_minute: 10,
+  bulk_read_threshold: 20,
+  first_session_policy: "approve"
+};
+var DEFAULT_CHANNEL = {
+  type: "stderr",
+  timeout_seconds: 300,
+  auto_deny: true
+};
+var DEFAULT_POLICY = {
+  version: 1,
+  tier1_always_approve: [
+    "state_export",
+    "state_import",
+    "identity_rotate",
+    "reputation_import",
+    "bootstrap_provide_guarantee"
+  ],
+  tier2_anomaly: DEFAULT_TIER2,
+  tier3_always_allow: [
+    "state_read",
+    "state_write",
+    "state_list",
+    "state_delete",
+    "identity_create",
+    "identity_list",
+    "identity_sign",
+    "identity_verify",
+    "proof_commitment",
+    "proof_reveal",
+    "disclosure_set_policy",
+    "disclosure_evaluate",
+    "reputation_record",
+    "reputation_query",
+    "reputation_export",
+    "bootstrap_create_escrow",
+    "exec_attest",
+    "monitor_health",
+    "monitor_audit_log",
+    "manifest",
+    "principal_policy_view",
+    "principal_baseline_view"
+  ],
+  approval_channel: DEFAULT_CHANNEL
+};
+function extractOperationName(toolName) {
+  return toolName.startsWith("sanctuary/") ? toolName.slice("sanctuary/".length) : toolName;
+}
+function parsePolicy(content) {
+  const trimmed = content.trim();
+  if (trimmed.startsWith("{")) {
+    const parsed = JSON.parse(trimmed);
+    return validatePolicy(parsed);
+  }
+  const policy = {};
+  let currentKey = null;
+  let currentList = null;
+  let currentObject = null;
+  for (const rawLine of trimmed.split("\n")) {
+    const line = rawLine.split("#")[0];
+    if (line.trim() === "") continue;
+    const indent = line.length - line.trimStart().length;
+    const stripped = line.trim();
+    if (indent === 0 && stripped.includes(":")) {
+      if (currentKey && currentList) {
+        policy[currentKey] = currentList;
+      } else if (currentKey && currentObject) {
+        policy[currentKey] = currentObject;
+      }
+      const colonIdx = stripped.indexOf(":");
+      const key = stripped.slice(0, colonIdx).trim();
+      const value = stripped.slice(colonIdx + 1).trim();
+      if (value === "" || value === "|") {
+        currentKey = key;
+        currentList = null;
+        currentObject = null;
+      } else {
+        policy[key] = parseScalar(value);
+        currentKey = null;
+        currentList = null;
+        currentObject = null;
+      }
+    } else if (indent > 0 && stripped.startsWith("- ")) {
+      if (!currentList) currentList = [];
+      currentList.push(stripped.slice(2).trim().split(/\s+/)[0]);
+    } else if (indent > 0 && stripped.includes(":")) {
+      if (!currentObject) currentObject = {};
+      const colonIdx = stripped.indexOf(":");
+      const key = stripped.slice(0, colonIdx).trim();
+      const value = stripped.slice(colonIdx + 1).trim();
+      currentObject[key] = parseScalar(value.split(/\s+/)[0]);
+    }
+  }
+  if (currentKey && currentList) {
+    policy[currentKey] = currentList;
+  } else if (currentKey && currentObject) {
+    policy[currentKey] = currentObject;
+  }
+  return validatePolicy(policy);
+}
+function parseScalar(value) {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  const num = Number(value);
+  if (!isNaN(num) && value !== "") return num;
+  return value.replace(/^["']|["']$/g, "");
+}
+function validatePolicy(raw) {
+  return {
+    version: raw.version ?? 1,
+    tier1_always_approve: raw.tier1_always_approve ?? DEFAULT_POLICY.tier1_always_approve,
+    tier2_anomaly: {
+      ...DEFAULT_TIER2,
+      ...raw.tier2_anomaly ?? {}
+    },
+    tier3_always_allow: raw.tier3_always_allow ?? DEFAULT_POLICY.tier3_always_allow,
+    approval_channel: {
+      ...DEFAULT_CHANNEL,
+      ...raw.approval_channel ?? {}
+    }
+  };
+}
+function generateDefaultPolicyYaml() {
+  return `# Sanctuary Principal Policy v1
+# This file controls what your agent can do without asking.
+# Edit this file directly. Your agent cannot modify it.
+# Changes take effect on server restart.
+
+version: 1
+
+# \u2500\u2500\u2500 Tier 1: Always Requires Approval \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# These operations ALWAYS require your explicit approval.
+# They are inherently high-risk regardless of context.
+tier1_always_approve:
+  - state_export
+  - state_import
+  - identity_rotate
+  - reputation_import
+  - bootstrap_provide_guarantee
+
+# \u2500\u2500\u2500 Tier 2: Behavioral Anomaly Detection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# Triggers approval when agent behavior deviates from its baseline.
+# Options for each setting: approve | log | allow
+tier2_anomaly:
+  new_namespace_access: approve
+  new_counterparty: approve
+  frequency_spike_multiplier: 5
+  max_signs_per_minute: 10
+  bulk_read_threshold: 20
+  first_session_policy: approve
+
+# \u2500\u2500\u2500 Tier 3: Always Allowed (Audit Only) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# These operations never require approval but are always logged.
+tier3_always_allow:
+  - state_read
+  - state_write
+  - state_list
+  - state_delete
+  - identity_create
+  - identity_list
+  - identity_sign
+  - identity_verify
+  - proof_commitment
+  - proof_reveal
+  - disclosure_set_policy
+  - disclosure_evaluate
+  - reputation_record
+  - reputation_query
+  - reputation_export
+  - bootstrap_create_escrow
+  - exec_attest
+  - monitor_health
+  - monitor_audit_log
+  - manifest
+  - principal_policy_view
+  - principal_baseline_view
+
+# \u2500\u2500\u2500 Approval Channel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# How Sanctuary reaches you when approval is needed.
+approval_channel:
+  type: stderr
+  timeout_seconds: 300
+  auto_deny: true
+`;
+}
+async function loadPrincipalPolicy(storagePath) {
+  const policyPath = join(storagePath, "principal-policy.yaml");
+  try {
+    const content = await readFile(policyPath, "utf-8");
+    const policy = parsePolicy(content);
+    return Object.freeze(policy);
+  } catch {
+    const defaultYaml = generateDefaultPolicyYaml();
+    try {
+      await writeFile(policyPath, defaultYaml, "utf-8");
+      await chmod(policyPath, 384);
+    } catch {
+    }
+    return Object.freeze({ ...DEFAULT_POLICY });
+  }
+}
+
+// src/principal-policy/baseline.ts
+init_encoding();
+var BASELINE_NAMESPACE = "_principal";
+var BASELINE_KEY = "session-baseline";
+var BaselineTracker = class {
+  storage;
+  encryptionKey;
+  profile;
+  /** Sliding window: timestamps of tool calls per tool name (last 60s) */
+  callWindows = /* @__PURE__ */ new Map();
+  /** Sliding window: read counts per namespace (last 60s) */
+  readWindows = /* @__PURE__ */ new Map();
+  /** Sliding window: sign call timestamps (last 60s) */
+  signWindow = [];
+  constructor(storage, masterKey) {
+    this.storage = storage;
+    this.encryptionKey = derivePurposeKey(masterKey, "principal-baseline");
+    this.profile = {
+      known_namespaces: [],
+      known_counterparties: [],
+      tool_call_counts: {},
+      is_first_session: true,
+      started_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }
+  /**
+   * Load the previous session's baseline from storage.
+   * If none exists, this is a first session.
+   */
+  async load() {
+    try {
+      const raw = await this.storage.read(BASELINE_NAMESPACE, BASELINE_KEY);
+      if (!raw) return;
+      const encrypted = JSON.parse(bytesToString(raw));
+      const decrypted = decrypt(encrypted, this.encryptionKey);
+      const saved = JSON.parse(bytesToString(decrypted));
+      this.profile.known_namespaces = saved.known_namespaces ?? [];
+      this.profile.known_counterparties = saved.known_counterparties ?? [];
+      this.profile.is_first_session = false;
+    } catch {
+      this.profile.is_first_session = true;
+    }
+  }
+  /**
+   * Save the current baseline to storage (encrypted).
+   * Called at session end or periodically.
+   */
+  async save() {
+    this.profile.saved_at = (/* @__PURE__ */ new Date()).toISOString();
+    const serialized = stringToBytes(JSON.stringify(this.profile));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      BASELINE_NAMESPACE,
+      BASELINE_KEY,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+  }
+  /**
+   * Record a tool call for baseline tracking.
+   * Returns anomaly information if applicable.
+   */
+  recordToolCall(toolName) {
+    const now = Date.now();
+    this.profile.tool_call_counts[toolName] = (this.profile.tool_call_counts[toolName] ?? 0) + 1;
+    if (!this.callWindows.has(toolName)) {
+      this.callWindows.set(toolName, []);
+    }
+    const window = this.callWindows.get(toolName);
+    window.push(now);
+    const cutoff = now - 6e4;
+    while (window.length > 0 && window[0] < cutoff) {
+      window.shift();
+    }
+  }
+  /**
+   * Record a namespace access.
+   * @returns true if this is a new namespace (not in baseline)
+   */
+  recordNamespaceAccess(namespace) {
+    if (namespace.startsWith("_")) return false;
+    const isNew = !this.profile.known_namespaces.includes(namespace);
+    if (isNew) {
+      this.profile.known_namespaces.push(namespace);
+    }
+    return isNew;
+  }
+  /**
+   * Record a namespace read for bulk-read detection.
+   * @returns the number of reads in the current 60-second window
+   */
+  recordNamespaceRead(namespace) {
+    const now = Date.now();
+    if (!this.readWindows.has(namespace)) {
+      this.readWindows.set(namespace, []);
+    }
+    const window = this.readWindows.get(namespace);
+    window.push(now);
+    const cutoff = now - 6e4;
+    while (window.length > 0 && window[0] < cutoff) {
+      window.shift();
+    }
+    return window.length;
+  }
+  /**
+   * Record a counterparty DID interaction.
+   * @returns true if this is a new counterparty (not in baseline)
+   */
+  recordCounterparty(did) {
+    const isNew = !this.profile.known_counterparties.includes(did);
+    if (isNew) {
+      this.profile.known_counterparties.push(did);
+    }
+    return isNew;
+  }
+  /**
+   * Record a signing operation.
+   * @returns the number of signs in the current 60-second window
+   */
+  recordSign() {
+    const now = Date.now();
+    this.signWindow.push(now);
+    const cutoff = now - 6e4;
+    while (this.signWindow.length > 0 && this.signWindow[0] < cutoff) {
+      this.signWindow.shift();
+    }
+    return this.signWindow.length;
+  }
+  /**
+   * Get the current call rate for a tool (calls per minute).
+   */
+  getCallRate(toolName) {
+    return this.callWindows.get(toolName)?.length ?? 0;
+  }
+  /**
+   * Get the average call rate across all tools in the baseline.
+   */
+  getAverageCallRate() {
+    let total = 0;
+    let count = 0;
+    for (const window of this.callWindows.values()) {
+      total += window.length;
+      count++;
+    }
+    return count > 0 ? total / count : 0;
+  }
+  /** Whether this is the first session */
+  get isFirstSession() {
+    return this.profile.is_first_session;
+  }
+  /** Get a read-only view of the current profile */
+  getProfile() {
+    return { ...this.profile };
+  }
+};
+
+// src/principal-policy/approval-channel.ts
+var StderrApprovalChannel = class {
+  config;
+  constructor(config) {
+    this.config = config;
+  }
+  async requestApproval(request) {
+    const prompt = this.formatPrompt(request);
+    process.stderr.write(prompt + "\n");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (this.config.auto_deny) {
+      return {
+        decision: "deny",
+        decided_at: (/* @__PURE__ */ new Date()).toISOString(),
+        decided_by: "timeout"
+      };
+    } else {
+      return {
+        decision: "approve",
+        decided_at: (/* @__PURE__ */ new Date()).toISOString(),
+        decided_by: "auto"
+      };
+    }
+  }
+  formatPrompt(request) {
+    const tierLabel = request.tier === 1 ? "Tier 1 \u2014 always requires approval" : "Tier 2 \u2014 behavioral anomaly detected";
+    const contextLines = Object.entries(request.context).map(([k, v]) => `  ${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`).join("\n");
+    return [
+      "",
+      "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557",
+      "\u2551  SANCTUARY: Approval Required                                    \u2551",
+      "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563",
+      `\u2551  Operation:  ${request.operation.padEnd(50)}\u2551`,
+      `\u2551  ${tierLabel.padEnd(62)}\u2551`,
+      `\u2551  Reason:     ${request.reason.slice(0, 50).padEnd(50)}\u2551`,
+      "\u2551                                                                  \u2551",
+      `\u2551  Details:                                                        \u2551`,
+      ...contextLines.split("\n").map(
+        (line) => `\u2551    ${line.padEnd(60)}\u2551`
+      ),
+      "\u2551                                                                  \u2551",
+      this.config.auto_deny ? "\u2551  Auto-denying (configure approval_channel.auto_deny to change)  \u2551" : "\u2551  Auto-approving (informational mode)                            \u2551",
+      "\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D",
+      ""
+    ].join("\n");
+  }
+};
+var CallbackApprovalChannel = class {
+  callback;
+  constructor(callback) {
+    this.callback = callback;
+  }
+  async requestApproval(request) {
+    return this.callback(request);
+  }
+};
+var AutoApproveChannel = class {
+  async requestApproval(_request) {
+    return {
+      decision: "approve",
+      decided_at: (/* @__PURE__ */ new Date()).toISOString(),
+      decided_by: "auto"
+    };
+  }
+};
+
+// src/principal-policy/gate.ts
+var ApprovalGate = class {
+  policy;
+  baseline;
+  channel;
+  auditLog;
+  constructor(policy, baseline, channel, auditLog) {
+    this.policy = policy;
+    this.baseline = baseline;
+    this.channel = channel;
+    this.auditLog = auditLog;
+  }
+  /**
+   * Evaluate a tool call against the Principal Policy.
+   *
+   * @param toolName - Full MCP tool name (e.g., "sanctuary/state_export")
+   * @param args - Tool call arguments (for context extraction)
+   * @returns GateResult indicating whether the call is allowed
+   */
+  async evaluate(toolName, args) {
+    const operation = extractOperationName(toolName);
+    this.baseline.recordToolCall(operation);
+    if (this.policy.tier1_always_approve.includes(operation)) {
+      return this.requestApproval(operation, 1, `"${operation}" is a Tier 1 operation (always requires approval)`, {
+        operation,
+        args_summary: this.summarizeArgs(args)
+      });
+    }
+    const anomaly = this.detectAnomaly(operation, args);
+    if (anomaly) {
+      return this.requestApproval(operation, 2, anomaly.reason, anomaly.context);
+    }
+    this.auditLog.append("l2", `gate_allow:${operation}`, "system", {
+      tier: 3,
+      operation
+    });
+    return {
+      allowed: true,
+      tier: 3,
+      reason: "Operation allowed (Tier 3)",
+      approval_required: false
+    };
+  }
+  /**
+   * Detect Tier 2 behavioral anomalies.
+   */
+  detectAnomaly(operation, args) {
+    const config = this.policy.tier2_anomaly;
+    if (this.baseline.isFirstSession && config.first_session_policy === "approve") {
+      if (!this.policy.tier3_always_allow.includes(operation)) {
+        return {
+          reason: `First session: "${operation}" has no established baseline`,
+          context: { operation, is_first_session: true }
+        };
+      }
+    }
+    if (config.new_namespace_access === "approve") {
+      const namespace = args.namespace;
+      if (namespace) {
+        const isNew = this.baseline.recordNamespaceAccess(namespace);
+        if (isNew) {
+          return {
+            reason: `First access to namespace "${namespace}" (not in session baseline)`,
+            context: {
+              operation,
+              namespace,
+              known_namespaces: this.baseline.getProfile().known_namespaces
+            }
+          };
+        }
+      }
+    } else if (config.new_namespace_access === "log") {
+      const namespace = args.namespace;
+      if (namespace) {
+        this.baseline.recordNamespaceAccess(namespace);
+      }
+    }
+    if (config.new_counterparty === "approve") {
+      const counterpartyDid = args.counterparty_did ?? args.agent_identity_id;
+      if (counterpartyDid) {
+        const isNew = this.baseline.recordCounterparty(counterpartyDid);
+        if (isNew) {
+          return {
+            reason: `First interaction with counterparty "${counterpartyDid}"`,
+            context: {
+              operation,
+              counterparty_did: counterpartyDid,
+              known_counterparties: this.baseline.getProfile().known_counterparties
+            }
+          };
+        }
+      }
+    } else if (config.new_counterparty === "log") {
+      const counterpartyDid = args.counterparty_did;
+      if (counterpartyDid) {
+        this.baseline.recordCounterparty(counterpartyDid);
+      }
+    }
+    if (operation === "identity_sign") {
+      const signCount = this.baseline.recordSign();
+      if (signCount > config.max_signs_per_minute) {
+        return {
+          reason: `Signing frequency (${signCount}/min) exceeds limit (${config.max_signs_per_minute}/min)`,
+          context: {
+            operation,
+            signs_per_minute: signCount,
+            limit: config.max_signs_per_minute
+          }
+        };
+      }
+    }
+    if (operation === "state_read") {
+      const namespace = args.namespace;
+      if (namespace) {
+        const readCount = this.baseline.recordNamespaceRead(namespace);
+        if (readCount > config.bulk_read_threshold) {
+          return {
+            reason: `Bulk read detected: ${readCount} reads from "${namespace}" in 60 seconds (threshold: ${config.bulk_read_threshold})`,
+            context: {
+              operation,
+              namespace,
+              reads_in_window: readCount,
+              threshold: config.bulk_read_threshold
+            }
+          };
+        }
+      }
+    }
+    const callRate = this.baseline.getCallRate(operation);
+    const avgRate = this.baseline.getAverageCallRate();
+    if (avgRate > 0 && callRate > avgRate * config.frequency_spike_multiplier) {
+      return {
+        reason: `Frequency spike: "${operation}" at ${callRate}/min (${config.frequency_spike_multiplier}\xD7 above average ${avgRate.toFixed(1)}/min)`,
+        context: {
+          operation,
+          current_rate: callRate,
+          average_rate: avgRate,
+          multiplier: config.frequency_spike_multiplier
+        }
+      };
+    }
+    return null;
+  }
+  /**
+   * Request approval from the human principal.
+   */
+  async requestApproval(operation, tier, reason, context) {
+    const request = {
+      operation,
+      tier,
+      reason,
+      context,
+      timestamp: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    const response = await this.channel.requestApproval(request);
+    this.auditLog.append("l2", `gate_${response.decision}:${operation}`, "system", {
+      tier,
+      reason,
+      decided_by: response.decided_by
+    });
+    return {
+      allowed: response.decision === "approve",
+      tier,
+      reason: response.decision === "approve" ? `Approved by ${response.decided_by}` : reason,
+      approval_required: true,
+      approval_response: response
+    };
+  }
+  /**
+   * Summarize tool arguments for the approval prompt.
+   * Strips potentially large values to keep the prompt readable.
+   */
+  summarizeArgs(args) {
+    const summary = {};
+    for (const [key, value] of Object.entries(args)) {
+      if (typeof value === "string" && value.length > 100) {
+        summary[key] = value.slice(0, 100) + "...";
+      } else {
+        summary[key] = value;
+      }
+    }
+    return summary;
+  }
+  /** Get the baseline tracker for saving at session end */
+  getBaseline() {
+    return this.baseline;
+  }
+};
+
+// src/principal-policy/tools.ts
+function createPrincipalPolicyTools(policy, baseline, auditLog) {
+  return [
+    {
+      name: "sanctuary/principal_policy_view",
+      description: "View the current Principal Policy \u2014 the human-controlled rules governing what operations require approval. Read-only.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          include_defaults: {
+            type: "boolean",
+            description: "Include tier3_always_allow list (can be long)",
+            default: false
+          }
+        }
+      },
+      handler: async (args) => {
+        const includeDefaults = args.include_defaults ?? false;
+        const view = {
+          version: policy.version,
+          tier1_always_approve: policy.tier1_always_approve,
+          tier2_anomaly: policy.tier2_anomaly,
+          approval_channel: {
+            type: policy.approval_channel.type,
+            timeout_seconds: policy.approval_channel.timeout_seconds,
+            auto_deny: policy.approval_channel.auto_deny
+          }
+        };
+        if (includeDefaults) {
+          view.tier3_always_allow = policy.tier3_always_allow;
+        } else {
+          view.tier3_always_allow_count = policy.tier3_always_allow.length;
+          view.note = "Pass include_defaults: true to see the full tier3_always_allow list";
+        }
+        auditLog.append("l2", "principal_policy_view", "system", {
+          include_defaults: includeDefaults
+        });
+        return toolResult(view);
+      }
+    },
+    {
+      name: "sanctuary/principal_baseline_view",
+      description: "View the current behavioral baseline \u2014 the session profile used for anomaly detection. Shows known namespaces, counterparties, and tool call counts. Read-only.",
+      inputSchema: {
+        type: "object",
+        properties: {}
+      },
+      handler: async () => {
+        const profile = baseline.getProfile();
+        auditLog.append("l2", "principal_baseline_view", "system");
+        return toolResult({
+          is_first_session: profile.is_first_session,
+          session_started_at: profile.started_at,
+          known_namespaces: profile.known_namespaces,
+          known_counterparties: profile.known_counterparties,
+          tool_call_counts: profile.tool_call_counts,
+          last_saved: profile.saved_at ?? "not yet saved"
+        });
+      }
+    }
+  ];
+}
 
 // src/index.ts
 init_encoding();
@@ -3013,15 +3710,28 @@ async function createSanctuaryServer(options) {
     identityManager,
     auditLog
   );
+  const policy = await loadPrincipalPolicy(config.storage_path);
+  const baseline = new BaselineTracker(storage, masterKey);
+  await baseline.load();
+  const approvalChannel = new StderrApprovalChannel(policy.approval_channel);
+  const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog);
+  const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
   const allTools = [
     ...l1Tools,
     ...l2Tools,
     ...l3Tools,
     ...l4Tools,
+    ...policyTools,
     manifestTool
   ];
-  const server = createServer(allTools);
+  const server = createServer(allTools, { gate });
   await saveConfig(config);
+  const saveBaseline = () => {
+    baseline.save().catch(() => {
+    });
+  };
+  process.on("SIGINT", saveBaseline);
+  process.on("SIGTERM", saveBaseline);
   if (recoveryKey) {
     console.error(
       `\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
@@ -3037,6 +3747,6 @@ async function createSanctuaryServer(options) {
   return { server, config };
 }
 
-export { AuditLog, CommitmentStore, FilesystemStorage, MemoryStorage, PolicyStore, ReputationStore, StateStore, createSanctuaryServer, loadConfig };
+export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, CallbackApprovalChannel, CommitmentStore, FilesystemStorage, MemoryStorage, PolicyStore, ReputationStore, StateStore, StderrApprovalChannel, createSanctuaryServer, loadConfig, loadPrincipalPolicy };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map

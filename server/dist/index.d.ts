@@ -642,6 +642,280 @@ declare class FilesystemStorage implements StorageBackend {
 }
 
 /**
+ * Sanctuary MCP Server — Principal Policy Types
+ *
+ * Type definitions for the Principal Policy system.
+ * The Principal Policy is the human-controlled, agent-immutable
+ * configuration that gates operations through approval tiers.
+ */
+/** Tier 2 anomaly action: what to do when an anomaly is detected */
+type AnomalyAction = "approve" | "log" | "allow";
+/** Tier 2 anomaly detection configuration */
+interface Tier2Config {
+    /** Action when agent accesses a namespace it hasn't used before */
+    new_namespace_access: AnomalyAction;
+    /** Action when agent interacts with an unknown counterparty DID */
+    new_counterparty: AnomalyAction;
+    /** Tool call frequency multiplier that triggers anomaly */
+    frequency_spike_multiplier: number;
+    /** Maximum signing operations per minute before triggering */
+    max_signs_per_minute: number;
+    /** Reading more than N keys in a namespace within 60 seconds */
+    bulk_read_threshold: number;
+    /** Policy for first session when no baseline exists */
+    first_session_policy: AnomalyAction;
+}
+/** Approval channel configuration */
+interface ApprovalChannelConfig {
+    type: "stderr" | "webhook" | "callback";
+    timeout_seconds: number;
+    auto_deny: boolean;
+    webhook_url?: string;
+    webhook_secret?: string;
+}
+/** Complete Principal Policy */
+interface PrincipalPolicy {
+    version: number;
+    /** Operations that always require human approval */
+    tier1_always_approve: string[];
+    /** Behavioral anomaly detection configuration */
+    tier2_anomaly: Tier2Config;
+    /** Operations that never require approval (audit only) */
+    tier3_always_allow: string[];
+    /** How approval requests reach the human */
+    approval_channel: ApprovalChannelConfig;
+}
+/** Approval request sent to the human */
+interface ApprovalRequest {
+    operation: string;
+    tier: 1 | 2;
+    reason: string;
+    context: Record<string, unknown>;
+    timestamp: string;
+}
+/** Approval response from the human */
+interface ApprovalResponse {
+    decision: "approve" | "deny";
+    decided_at: string;
+    decided_by: "human" | "timeout" | "auto";
+}
+/** Result of the approval gate evaluation */
+interface GateResult {
+    allowed: boolean;
+    tier: 1 | 2 | 3;
+    reason: string;
+    approval_required: boolean;
+    approval_response?: ApprovalResponse;
+}
+/** Behavioral baseline for anomaly detection */
+interface SessionProfile {
+    /** Namespaces accessed (read or write) */
+    known_namespaces: string[];
+    /** Counterparty DIDs seen in reputation operations */
+    known_counterparties: string[];
+    /** Tool call counts per tool name (lifetime in session) */
+    tool_call_counts: Record<string, number>;
+    /** Whether this is the first session (no prior baseline) */
+    is_first_session: boolean;
+    /** Session start time */
+    started_at: string;
+    /** When the baseline was last saved */
+    saved_at?: string;
+}
+
+/**
+ * Sanctuary MCP Server — Approval Channel
+ *
+ * Out-of-band communication with the human principal for operation approval.
+ * The default channel uses stderr (outside MCP's stdin/stdout protocol),
+ * ensuring the agent cannot intercept or forge approval responses.
+ *
+ * Security invariant:
+ * - Approval prompts go through a channel the agent cannot access.
+ * - Timeouts result in denial by default (fail closed).
+ */
+
+/** Abstract approval channel interface */
+interface ApprovalChannel {
+    requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
+}
+/**
+ * Stderr approval channel — writes prompts to stderr, waits for response.
+ *
+ * In the MCP stdio model:
+ * - stdin/stdout carry the MCP protocol (JSON-RPC)
+ * - stderr is available for out-of-band human communication
+ *
+ * Since many harnesses do not support interactive stdin during tool calls,
+ * this channel uses a timeout-based model: the prompt is displayed, and
+ * if no response is received within the timeout, the default action applies.
+ *
+ * For MVS, the channel auto-resolves based on the auto_deny setting.
+ * Interactive stdin reading is deferred to a future version with harness support.
+ */
+declare class StderrApprovalChannel implements ApprovalChannel {
+    private config;
+    constructor(config: ApprovalChannelConfig);
+    requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
+    private formatPrompt;
+}
+/**
+ * Programmatic approval channel — for testing and API integration.
+ */
+declare class CallbackApprovalChannel implements ApprovalChannel {
+    private callback;
+    constructor(callback: (request: ApprovalRequest) => Promise<ApprovalResponse>);
+    requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
+}
+/**
+ * Auto-approve channel — for testing. Approves everything.
+ */
+declare class AutoApproveChannel implements ApprovalChannel {
+    requestApproval(_request: ApprovalRequest): Promise<ApprovalResponse>;
+}
+
+/**
+ * Sanctuary MCP Server — Behavioral Baseline Tracker
+ *
+ * Tracks the agent's behavioral profile during a session and persists
+ * it for cross-session anomaly detection. The baseline defines "normal"
+ * so that deviations can trigger Tier 2 approval.
+ *
+ * Security invariants:
+ * - Baseline is stored encrypted under L1 sovereignty
+ * - Baseline changes are audit-logged
+ * - Baseline is integrity-verified via L1 Merkle tree
+ * - No MCP tool can directly modify the baseline
+ */
+
+declare class BaselineTracker {
+    private storage;
+    private encryptionKey;
+    private profile;
+    /** Sliding window: timestamps of tool calls per tool name (last 60s) */
+    private callWindows;
+    /** Sliding window: read counts per namespace (last 60s) */
+    private readWindows;
+    /** Sliding window: sign call timestamps (last 60s) */
+    private signWindow;
+    constructor(storage: StorageBackend, masterKey: Uint8Array);
+    /**
+     * Load the previous session's baseline from storage.
+     * If none exists, this is a first session.
+     */
+    load(): Promise<void>;
+    /**
+     * Save the current baseline to storage (encrypted).
+     * Called at session end or periodically.
+     */
+    save(): Promise<void>;
+    /**
+     * Record a tool call for baseline tracking.
+     * Returns anomaly information if applicable.
+     */
+    recordToolCall(toolName: string): void;
+    /**
+     * Record a namespace access.
+     * @returns true if this is a new namespace (not in baseline)
+     */
+    recordNamespaceAccess(namespace: string): boolean;
+    /**
+     * Record a namespace read for bulk-read detection.
+     * @returns the number of reads in the current 60-second window
+     */
+    recordNamespaceRead(namespace: string): number;
+    /**
+     * Record a counterparty DID interaction.
+     * @returns true if this is a new counterparty (not in baseline)
+     */
+    recordCounterparty(did: string): boolean;
+    /**
+     * Record a signing operation.
+     * @returns the number of signs in the current 60-second window
+     */
+    recordSign(): number;
+    /**
+     * Get the current call rate for a tool (calls per minute).
+     */
+    getCallRate(toolName: string): number;
+    /**
+     * Get the average call rate across all tools in the baseline.
+     */
+    getAverageCallRate(): number;
+    /** Whether this is the first session */
+    get isFirstSession(): boolean;
+    /** Get a read-only view of the current profile */
+    getProfile(): SessionProfile;
+}
+
+/**
+ * Sanctuary MCP Server — Approval Gate
+ *
+ * The three-tier approval gate sits between the MCP router and tool handlers.
+ * Every tool call passes through the gate before execution.
+ *
+ * Evaluation order:
+ * 1. Tier 1: Is this operation in the always-approve list? → Request approval.
+ * 2. Tier 2: Does this call represent a behavioral anomaly? → Request approval.
+ * 3. Tier 3 / default: Allow with audit logging.
+ *
+ * Security invariants:
+ * - The gate cannot be bypassed — it wraps every tool handler.
+ * - Denial responses do not reveal policy details to the agent.
+ * - All gate decisions (approve, deny, allow) are audit-logged.
+ */
+
+declare class ApprovalGate {
+    private policy;
+    private baseline;
+    private channel;
+    private auditLog;
+    constructor(policy: PrincipalPolicy, baseline: BaselineTracker, channel: ApprovalChannel, auditLog: AuditLog);
+    /**
+     * Evaluate a tool call against the Principal Policy.
+     *
+     * @param toolName - Full MCP tool name (e.g., "sanctuary/state_export")
+     * @param args - Tool call arguments (for context extraction)
+     * @returns GateResult indicating whether the call is allowed
+     */
+    evaluate(toolName: string, args: Record<string, unknown>): Promise<GateResult>;
+    /**
+     * Detect Tier 2 behavioral anomalies.
+     */
+    private detectAnomaly;
+    /**
+     * Request approval from the human principal.
+     */
+    private requestApproval;
+    /**
+     * Summarize tool arguments for the approval prompt.
+     * Strips potentially large values to keep the prompt readable.
+     */
+    private summarizeArgs;
+    /** Get the baseline tracker for saving at session end */
+    getBaseline(): BaselineTracker;
+}
+
+/**
+ * Sanctuary MCP Server — Principal Policy Loader
+ *
+ * Loads the Principal Policy from a YAML file at server startup.
+ * The policy is immutable at runtime — no MCP tool can modify it.
+ *
+ * Security invariant:
+ * - The policy is loaded ONCE at startup and frozen.
+ * - No code path exists to modify the policy during a session.
+ * - If no policy file exists, a sensible default is generated and saved.
+ */
+
+/**
+ * Load the Principal Policy from disk.
+ * If no policy file exists, generate the default and save it.
+ * The returned policy is frozen — immutable at runtime.
+ */
+declare function loadPrincipalPolicy(storagePath: string): Promise<PrincipalPolicy>;
+
+/**
  * Sanctuary MCP Server — Main Entry Point
  *
  * Initializes and exports the Sanctuary MCP server.
@@ -664,4 +938,4 @@ declare function createSanctuaryServer(options?: {
     storage?: StorageBackend;
 }): Promise<SanctuaryServer>;
 
-export { AuditLog, CommitmentStore, FilesystemStorage, MemoryStorage, PolicyStore, ReputationStore, type SanctuaryConfig, type SanctuaryServer, StateStore, createSanctuaryServer, loadConfig };
+export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, CallbackApprovalChannel, CommitmentStore, FilesystemStorage, type GateResult, MemoryStorage, PolicyStore, type PrincipalPolicy, ReputationStore, type SanctuaryConfig, type SanctuaryServer, StateStore, StderrApprovalChannel, createSanctuaryServer, loadConfig, loadPrincipalPolicy };

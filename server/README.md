@@ -8,7 +8,7 @@ Sanctuary gives agents (and their human principals) encrypted state, sovereign i
 
 **L1 Cognitive Sovereignty** — All agent state is encrypted at rest with AES-256-GCM. Keys are participant-held. Identity is Ed25519-based with DID support. Merkle tree integrity verification prevents tampering and rollback.
 
-**L2 Operational Isolation** — Environment attestation, health monitoring, and an encrypted audit log of all sovereignty operations.
+**L2 Operational Isolation** — Environment attestation, health monitoring, encrypted audit log, and **Principal Policy** — a human-controlled, agent-immutable approval system that defends against prompt injection by gating high-risk operations.
 
 **L3 Selective Disclosure** — Cryptographic commitments let an agent prove a claim without revealing it. Disclosure policies define what information flows where, evaluated per-field against context-specific rules.
 
@@ -85,6 +85,8 @@ Once connected, your agent has access to these tools:
 | `sanctuary/exec_attest` | Environment attestation with sovereignty assessment |
 | `sanctuary/monitor_health` | Sanctuary Health Report (all four layers) |
 | `sanctuary/monitor_audit_log` | Query the sovereignty audit log |
+| `sanctuary/principal_policy_view` | View the current Principal Policy (read-only) |
+| `sanctuary/principal_baseline_view` | View the behavioral baseline profile (read-only) |
 
 ### L3 — Selective Disclosure
 | Tool | Description |
@@ -119,6 +121,22 @@ Environment variables:
 | `SANCTUARY_STORAGE_PATH` | Storage directory path | `~/.sanctuary` |
 | `SANCTUARY_TRANSPORT` | Transport mode (`stdio` or `http`) | `stdio` |
 
+## Principal Policy (prompt injection defense)
+
+The Principal Policy is the human-controlled, agent-immutable configuration that gates operations through a three-tier approval system. It sits between the MCP router and every tool handler — no tool call can bypass it.
+
+**Tier 1 — Always requires approval:** High-risk operations like `state_export`, `state_import`, `identity_rotate`, and `reputation_import` always require explicit human approval before execution.
+
+**Tier 2 — Behavioral anomaly detection:** The system tracks a behavioral baseline (namespaces accessed, counterparties seen, signing frequency, read patterns). Deviations trigger approval — a compromised agent accessing unfamiliar data or signing at unusual rates is caught automatically.
+
+**Tier 3 — Always allowed (audit only):** Standard read/write/sign operations pass through without interruption, but every operation is audit-logged.
+
+The policy file lives at `~/.sanctuary/principal-policy.yaml`. It is loaded once at startup and frozen — no MCP tool can modify it. The agent cannot see the policy rules in denial responses (preventing attacker learning). Approval requests flow through stderr (outside the MCP protocol), so the agent cannot intercept or forge approvals.
+
+On first session, non-Tier-3 operations require approval (no baseline exists yet). As the system learns normal patterns, approval fatigue decreases — you only get asked about genuinely unusual behavior.
+
+See [`rfcs/RFC-0002-principal-policy-operational-approval.md`](../rfcs/RFC-0002-principal-policy-operational-approval.md) for the complete specification.
+
 ## Security model
 
 - AES-256-GCM authenticated encryption with unique 12-byte IVs (NIST SP 800-38D)
@@ -129,6 +147,9 @@ Environment variables:
 - 3-pass secure deletion (random overwrite before unlink)
 - Private keys never appear in any MCP tool response
 - Monotonic version numbers prevent state rollback
+- Principal Policy gates every tool call (three-tier approval)
+- Behavioral baseline detects anomalous agent behavior
+- Approval channel (stderr) is outside MCP protocol — agent cannot intercept
 
 ## Development
 
@@ -167,7 +188,14 @@ src/
 ├── l4-reputation/         # L4: Reputation + bootstrap
 │   ├── reputation-store.ts # Signed attestations, escrow, guarantees
 │   └── tools.ts           # MCP tool definitions
-├── router.ts              # MCP SDK tool router
+├── principal-policy/      # Principal Policy (prompt injection defense)
+│   ├── types.ts           # Policy, gate, baseline type definitions
+│   ├── loader.ts          # YAML/JSON policy parser + defaults
+│   ├── baseline.ts        # Behavioral baseline tracker (encrypted)
+│   ├── approval-channel.ts # Stderr + callback approval channels
+│   ├── gate.ts            # Three-tier approval gate
+│   └── tools.ts           # Read-only policy/baseline MCP tools
+├── router.ts              # MCP SDK tool router (with gate integration)
 ├── config.ts              # Configuration management
 ├── index.ts               # Server factory
 └── cli.ts                 # CLI entry point
@@ -175,7 +203,7 @@ src/
 
 ## Specification
 
-See [`rfcs/RFC-0001-sanctuary-mcp-server.md`](../rfcs/RFC-0001-sanctuary-mcp-server.md) for the complete technical specification.
+See [`rfcs/RFC-0001-sanctuary-mcp-server.md`](../rfcs/RFC-0001-sanctuary-mcp-server.md) for the core specification and [`rfcs/RFC-0002-principal-policy-operational-approval.md`](../rfcs/RFC-0002-principal-policy-operational-approval.md) for the Principal Policy specification.
 
 ## License
 
