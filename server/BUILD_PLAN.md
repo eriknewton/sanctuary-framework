@@ -1,7 +1,7 @@
 # Sanctuary MCP Server — Build Plan
 
-**Spec:** `rfcs/RFC-0001-sanctuary-mcp-server.md`
-**Target:** MVS v0.1.0
+**Specs:** `rfcs/RFC-0001-sanctuary-mcp-server.md`, `rfcs/RFC-0002-principal-policy-operational-approval.md`
+**Target:** MVS v0.2.0
 **Language:** TypeScript
 **Test framework:** Vitest
 **Build tool:** tsup
@@ -63,6 +63,8 @@ The foundation. Everything else depends on this.
 - `secure-deletion.test.ts` — After delete, verify file overwritten before unlink
 - `signature-verification.test.ts` — Inject unsigned .enc file, verify read rejects
 
+**STATUS: COMPLETE** — All steps delivered. 11 L1 tools, 4 security test suites. TypeScript compiles clean.
+
 ---
 
 ## Phase 1b: L2 + L3 + L4 (Sessions 3-4)
@@ -98,6 +100,8 @@ Builds on L1 foundation. Each layer is simpler than L1.
 ### Step 12: SIM manifest
 - `sanctuary/manifest` — Generate full Sanctuary Interface Manifest from current config and capabilities
 
+**STATUS: COMPLETE** — L2 (audit log, attestation, health), L3 (commitments, policies), L4 (reputation, export/import, escrow, guarantees), SIM manifest. 32 tests across 3 test files.
+
 ---
 
 ## Phase 1c: Integration + Hardening (Session 5)
@@ -113,6 +117,75 @@ Builds on L1 foundation. Each layer is simpler than L1.
 - npm package metadata
 - CLI entry point (`npx @sanctuary-framework/mcp-server`)
 - First-run initialization flow
+
+**STATUS: COMPLETE** — Full sovereignty flow test (RFC 10.1 acceptance), multi-identity isolation, reputation portability round-trip, README with 26 tools documented. 7 integration tests.
+
+---
+
+## Phase 2: Principal Policy & Operational Approval (Session 6)
+
+Prompt injection defense. Human-in-the-loop approval gating for high-risk operations.
+
+**Spec:** `rfcs/RFC-0002-principal-policy-operational-approval.md`
+
+### Step 15: Principal Policy types and loader
+- `src/principal-policy/types.ts` — PrincipalPolicy, Tier2Config, ApprovalChannelConfig, ApprovalRequest, ApprovalResponse, GateResult, SessionProfile
+- `src/principal-policy/loader.ts` — YAML/JSON policy parser, default policy generation, `loadPrincipalPolicy()` returns frozen (immutable) policy
+- Default policy file generated at `{storage_path}/principal-policy.yaml` with 0o600 permissions
+
+### Step 16: Behavioral baseline tracker
+- `src/principal-policy/baseline.ts` — Sliding-window tracking for tool calls, namespace reads, signing frequency, counterparty interactions
+- Encrypted cross-session persistence (learns over time)
+- Internal namespaces (prefixed with "_") excluded from anomaly detection
+
+### Step 17: Approval channels
+- `src/principal-policy/approval-channel.ts` — StderrApprovalChannel (default, auto-deny after timeout), CallbackApprovalChannel (testing/API), AutoApproveChannel (testing)
+- Stderr channel writes outside MCP stdin/stdout protocol — agent cannot intercept
+
+### Step 18: Three-tier approval gate
+- `src/principal-policy/gate.ts` — ApprovalGate with `evaluate()` method
+- Tier 1: Always requires approval (state_export, identity_rotate, reputation_import, etc.)
+- Tier 2: Behavioral anomaly detection (new namespace, new counterparty, sign frequency, bulk reads, frequency spikes)
+- Tier 3: Always allowed with audit logging
+- Denial responses deliberately omit policy details (prevents attacker learning)
+- All decisions audit-logged
+
+### Step 19: MCP tools and server integration
+- `src/principal-policy/tools.ts` — `principal_policy_view` and `principal_baseline_view` (read-only)
+- `src/router.ts` — Gate wraps every tool call; denied calls return generic "Operation not permitted"
+- `src/index.ts` — Initializes policy → baseline → channel → gate; baseline saved on SIGINT/SIGTERM
+
+### Step 20: Tests
+- `test/principal-policy/policy-loader.test.ts` — 10 tests: YAML/JSON parsing, defaults, extractOperationName
+- `test/principal-policy/baseline.test.ts` — 16 tests: first session, tracking, encryption, persistence
+- `test/principal-policy/approval-gate.test.ts` — 12 tests: three tiers, anomaly detection, security properties
+
+**STATUS: COMPLETE** — RFC-0002 written. 6 source files, 3 test files. 38 new tests. 88 total tests passing, 13 test files. Build clean. Pushed to GitHub 2026-03-26.
+
+---
+
+## Phase 3: Ship & Harden (Not yet started)
+
+Candidates for next work, in rough priority order:
+
+### Option A: Gate integration test (hardening)
+- End-to-end test: prompt injection scenario where agent tries state_export → gets blocked → tries unfamiliar namespace → baseline catches it
+- Acceptance test for RFC-0002
+
+### Option B: npm publish pipeline
+- Make `npx @sanctuary-framework/mcp-server` actually work
+- Package metadata, CLI entry point, first-run UX
+- This is the "ship something normal humans can use" path
+
+### Option C: MCP-to-MCP federation
+- Agent-to-agent sovereignty negotiation
+- SIM exchange, mutual attestation, reputation trust evaluation
+- Requires two Sanctuary instances communicating
+
+### Option D: ZK proof upgrade for L3
+- Replace commitment-only proofs with actual ZK proofs
+- RISC Zero or SP1 integration
+- Most technically complex; deferred in RFC-0001
 
 ---
 
