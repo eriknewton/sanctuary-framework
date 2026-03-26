@@ -259,17 +259,14 @@ export function createL4Tools(
             type: "string",
             description: "Base64url-encoded reputation bundle",
           },
-          verify_signatures: {
-            type: "boolean",
-            description: "Verify attestation signatures (default: true)",
-            default: true,
-          },
         },
         required: ["bundle"],
       },
       handler: async (args) => {
         const bundleBase64 = args.bundle as string;
-        const verifySignatures = (args.verify_signatures as boolean) ?? true;
+        // Signature verification is always enforced — no caller override.
+        // Allowing callers to skip verification was a prompt-injection footgun.
+        const verifySignatures = true;
 
         let bundle;
         try {

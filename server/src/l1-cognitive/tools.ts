@@ -27,6 +27,36 @@ import { encrypt, decrypt } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 
+/**
+ * Reserved namespace prefixes — used by internal subsystems.
+ * Agent-facing state tools MUST reject writes/deletes/imports to these namespaces.
+ * Reads are allowed (transparency), but mutations are firewalled.
+ */
+const RESERVED_NAMESPACE_PREFIXES = [
+  "_identities",
+  "_policies",
+  "_audit",
+  "_meta",
+  "_principal",
+  "_commitments",
+  "_reputation",
+  "_escrow",
+  "_guarantees",
+] as const;
+
+/**
+ * Check whether a namespace is reserved for internal use.
+ * Returns the matching reserved prefix, or null if the namespace is safe.
+ */
+function getReservedNamespaceViolation(namespace: string): string | null {
+  for (const prefix of RESERVED_NAMESPACE_PREFIXES) {
+    if (namespace === prefix || namespace.startsWith(prefix + "/")) {
+      return prefix;
+    }
+  }
+  return null;
+}
+
 /** Manages all identities — provides storage and retrieval */
 export class IdentityManager {
   private storage: StorageBackend;
@@ -375,6 +405,15 @@ export function createL1Tools(
         required: ["namespace", "key", "value"],
       },
       handler: async (args) => {
+        // Namespace firewall: reject writes to reserved internal namespaces
+        const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Choose a different namespace.`,
+          });
+        }
+
         const identity = resolveIdentity(args.identity_id as string | undefined);
         const metadata = args.metadata as {
           content_type?: string;
@@ -486,6 +525,15 @@ export function createL1Tools(
         required: ["namespace", "key"],
       },
       handler: async (args) => {
+        // Namespace firewall: reject deletes from reserved internal namespaces
+        const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot delete from reserved namespaces.`,
+          });
+        }
+
         const result = await stateStore.delete(
           args.namespace as string,
           args.key as string

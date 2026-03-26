@@ -37,6 +37,22 @@ import {
 } from "../core/encoding.js";
 import type { EncryptedPayload as EncPayload } from "../core/encryption.js";
 
+/**
+ * Reserved namespace prefixes — used by internal subsystems.
+ * Imported bundles MUST NOT write to these namespaces.
+ */
+const RESERVED_NAMESPACE_PREFIXES = [
+  "_identities",
+  "_policies",
+  "_audit",
+  "_meta",
+  "_principal",
+  "_commitments",
+  "_reputation",
+  "_escrow",
+  "_guarantees",
+] as const;
+
 /** On-disk format for an encrypted state entry */
 export interface StateEntry {
   /** Format version */
@@ -507,6 +523,13 @@ export class StateStore {
     for (const [ns, entries] of Object.entries(
       bundle.data as Record<string, Array<{ key: string; entry: StateEntry }>>
     )) {
+      // Namespace firewall: skip reserved namespaces during import
+      if (RESERVED_NAMESPACE_PREFIXES.some(
+        (prefix) => ns === prefix || ns.startsWith(prefix + "/")
+      )) {
+        skippedKeys += (entries as Array<{ key: string; entry: StateEntry }>).length;
+        continue;
+      }
       namespaces.push(ns);
 
       for (const { key, entry } of entries) {

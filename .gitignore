@@ -3,6 +3,12 @@
 *.swo
 *~
 
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+
 # Internal documents
 SANCTUARY_PROJECT_CONTEXT.md
 rfcs/DRAFT-*

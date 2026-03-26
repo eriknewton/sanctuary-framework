@@ -220,11 +220,27 @@ describe("Full Sovereignty Flow", () => {
       label: "instance-b-identity",
     });
 
-    // Import the bundle (without signature verification since Instance B
-    // doesn't know Instance A's keys — this is the "trust on first import" path)
+    // For cross-instance import with signature verification, Instance B
+    // must know Instance A's public key. In production this happens via
+    // federation or explicit key exchange. Here we simulate it by
+    // registering A's public identity in B's identity manager.
+    for (const aPub of idMgrA.list()) {
+      await idMgrB.save({
+        identity_id: aPub.identity_id,
+        label: aPub.label + "-imported",
+        public_key: aPub.public_key,
+        did: aPub.did,
+        created_at: aPub.created_at,
+        key_type: aPub.key_type,
+        key_protection: "recovery-key",
+        encrypted_private_key: { ct: "", iv: "", tag: "" },
+      } as any);
+    }
+
+    // Import the bundle — signature verification is always enforced.
+    // Instance B can verify because we registered A's public key above.
     const importResult = await callTool(allToolsB, "sanctuary/reputation_import", {
       bundle: exportResult.bundle,
-      verify_signatures: false,
     });
     expect(importResult.imported_attestations).toBe(2);
     expect(importResult.invalid_attestations).toBe(0);
