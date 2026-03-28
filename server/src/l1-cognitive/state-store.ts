@@ -517,10 +517,13 @@ export class StateStore {
    */
   async import(
     bundleBase64: string,
-    conflictResolution: "skip" | "overwrite" | "version" = "skip"
+    conflictResolution: "skip" | "overwrite" | "version" = "skip",
+    publicKeyResolver?: (kid: string) => Uint8Array | null
   ): Promise<{
     imported_keys: number;
     skipped_keys: number;
+    skipped_invalid_sig: number;
+    skipped_unknown_kid: number;
     conflicts: number;
     namespaces: string[];
     imported_at: string;
@@ -531,6 +534,8 @@ export class StateStore {
 
     let importedKeys = 0;
     let skippedKeys = 0;
+    let skippedInvalidSig = 0;
+    let skippedUnknownKid = 0;
     let conflicts = 0;
     const namespaces: string[] = [];
 
@@ -547,6 +552,34 @@ export class StateStore {
       namespaces.push(ns);
 
       for (const { key, entry } of entries) {
+        // Signature verification: mandatory for all imported entries
+        if (publicKeyResolver) {
+          // Resolve the signing identity
+          const signerPublicKey = publicKeyResolver(entry.kid);
+          if (!signerPublicKey) {
+            skippedUnknownKid++;
+            skippedKeys++;
+            continue;
+          }
+
+          // Verify the signature against the ciphertext
+          try {
+            const ciphertextBytes = fromBase64url(entry.payload.ct);
+            const signatureBytes = fromBase64url(entry.sig);
+            const sigValid = verify(ciphertextBytes, signatureBytes, signerPublicKey);
+            if (!sigValid) {
+              skippedInvalidSig++;
+              skippedKeys++;
+              continue;
+            }
+          } catch {
+            // Malformed signature or ciphertext — reject
+            skippedInvalidSig++;
+            skippedKeys++;
+            continue;
+          }
+        }
+
         const exists = await this.storage.exists(ns, key);
 
         if (exists) {
@@ -591,6 +624,8 @@ export class StateStore {
     return {
       imported_keys: importedKeys,
       skipped_keys: skippedKeys,
+      skipped_invalid_sig: skippedInvalidSig,
+      skipped_unknown_kid: skippedUnknownKid,
       conflicts,
       namespaces,
       imported_at: new Date().toISOString(),

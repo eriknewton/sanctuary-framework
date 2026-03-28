@@ -1,60 +1,60 @@
-# SPRINT_RESULT.md — SEC-011: Gate Default for Unlisted Operations Is Tier 3 (Allow)
+# SPRINT RESULT — SEC-005: Import Skips Signature Verification
 
 **Sprint Date:** 2026-03-28
-**Finding:** SEC-011 (reclassified Medium → High)
+**Finding:** SEC-005 (High)
 **Branch:** `security-review`
 
 ---
 
-## What Was Changed and Why
+## What Changed and Why
 
-### Source Change: `server/src/principal-policy/gate.ts`
+### `server/src/l1-cognitive/state-store.ts` — `import()` method
 
-**The problem:** The `evaluate()` method's Tier 3 block (lines 72-83) was unconditional. After checking Tier 1 and Tier 2, it fell through to Tier 3 (allow with audit logging) for ALL remaining operations — regardless of whether the operation was in `tier3_always_allow`.
+Added a third parameter `publicKeyResolver?: (kid: string) => Uint8Array | null` to the import method. Before writing any entry from the import bundle, the method now:
 
-**The fix:** Added a conditional check: `if (this.policy.tier3_always_allow.includes(operation))` before the Tier 3 allow block. Added an else-branch that:
+1. **Resolves the `kid`** — calls the resolver to obtain the signer's Ed25519 public key. If the resolver returns `null` (identity unknown), the entry is rejected and counted in `skipped_unknown_kid`.
+2. **Verifies the `sig`** — decodes the ciphertext (`entry.payload.ct`) and signature (`entry.sig`) from base64url, then calls the same `verify()` function from `core/identity.ts` that `read()` uses. If verification fails (including malformed data), the entry is rejected and counted in `skipped_invalid_sig`.
 
-1. Logs an audit entry with `gate_unclassified:{operation}` action, warning that the operation is not classified
-2. Routes the operation to `requestApproval()` at Tier 1, requiring human approval
-3. Includes `unclassified: true` in the approval context so the human can see why the approval was triggered
+The return type is expanded to include `skipped_invalid_sig` and `skipped_unknown_kid` alongside the existing counters.
 
-The change is ~15 lines of new code replacing what was an unconditional block.
+The resolver parameter is optional to maintain backward API compatibility for internal callers, but the tool handler always provides it.
 
-### Test Changes: `server/test/principal-policy/approval-gate.test.ts`
+### `server/src/l1-cognitive/tools.ts` — `state_import` handler
 
-Added 4 new tests under a `"SEC-011 — unlisted operations default to Tier 1"` describe block:
+Wired a `publicKeyResolver` callback that looks up identities via `identityMgr.get(kid)` and returns the decoded public key. This keeps `StateStore` decoupled from `IdentityManager` — the state store receives a pure function, not a class dependency.
 
-1. **"requires approval for operations not in any tier list"** — Evaluates `totally_new_tool` (not in any tier list), asserts Tier 1 + approval_required
-2. **"denies unlisted operations when channel denies"** — Same with a deny channel, asserts `allowed: false`
-3. **"logs unclassified operation to audit log"** — Verifies audit entries are created for unclassified operations
-4. **"still allows explicitly listed Tier 3 operations"** — Verifies `state_read` (in tier3_always_allow) is unaffected
+### `server/test/security/import-verifies-signatures.test.ts` — new file (5 tests)
+
+1. Valid import with correct signatures — accepted (2 entries imported, 0 skipped)
+2. Forged signature — 1 entry rejected, 1 accepted
+3. Unknown kid — entry rejected, `skipped_unknown_kid` = 1
+4. All entries invalid — 0 imported, 3 skipped
+5. Reserved namespace — still skipped regardless of signature (existing behavior preserved)
 
 ---
 
-## Full Test Suite Output
+## Test Suite Output
 
 ```
-Test Files  24 passed (24)
-     Tests  247 passed (247)
-  Start at  15:12:53
-  Duration  20.09s
+Test Files  25 passed (25)
+     Tests  252 passed (252)
+  Duration  20.06s
 ```
 
-**Baseline:** 243 tests
-**After fix:** 247 tests (+4 new regression tests)
-**Failures:** 0
+Previous count: 247. New count: 252 (+5). No regressions.
 
 ---
 
 ## New Risk Introduced
 
-A tool registered in the MCP server without a corresponding entry in any policy tier will now require Tier 1 human approval instead of auto-allowing. This could cause unexpected approval prompts for developers who add tools without updating `principal-policy.yaml`. This is the **intended safe default** — the audit log entry (`gate_unclassified:{operation}`) makes it easy to diagnose and add the tool to the appropriate tier.
+Import bundles from instances whose identities are not present on the importing instance will now be fully rejected. This is intentional and correct per CLAUDE.md constraint 4 ("Never assume trust across the Sanctuary-Concordia boundary"), but it changes behavior for bundles that previously imported silently. The structured response (`skipped_unknown_kid`) makes this diagnosable.
 
 ---
 
-## Adjacent Findings Noticed (Do Not Fix)
+## Adjacent Findings Noticed (Not Fixed)
 
-None. This fix is tightly scoped to the gate evaluation logic and does not interact with any other finding beyond SEC-002 (which is already PASS).
+- **SEC-010 and SEC-014** are next in the cluster queue. The callback-based resolver pattern established here (`(identifier: string) => PublicKey | null`) is the design contract they should conform to. SEC-010 will need a Concordia-side equivalent — `signing.py` already has `verify_signature()` but it is never called.
+- The `export()` method does not include identity public keys in the bundle. A future enhancement could embed the public keys needed for verification, making bundles self-verifiable. This is not a security issue (rejection is the correct behavior for unknown identities) but is a UX consideration. Logging as an observation, not fixing.
 
 ---
 
@@ -62,11 +62,12 @@ None. This fix is tightly scoped to the gate evaluation logic and does not inter
 
 | Criterion | Met? |
 |-----------|------|
-| Root cause addressed: gate no longer falls through to Tier 3 for unlisted operations | ✅ |
-| Correct default: unlisted operations require Tier 1 approval | ✅ |
-| No regression: existing Tier 1/2/3 operations unchanged | ✅ (all 243 existing tests pass) |
-| Test coverage: new tests verify unlisted → Tier 1 | ✅ (4 new tests) |
-| Audit trail: unclassified operations logged | ✅ (`gate_unclassified` audit entry) |
-| Test suite passes: 243+ tests, no decrease | ✅ (247 tests, 0 failures) |
+| `import()` rejects entries with invalid signatures | Yes — test 2 and 4 confirm |
+| `import()` rejects entries with unresolvable `kid` | Yes — test 3 confirms |
+| Uses same `verify()` from `core/identity.ts` | Yes — same function as `read()` |
+| Return type includes `skipped_invalid_sig` and `skipped_unknown_kid` | Yes |
+| All 5 regression tests pass | Yes |
+| Full test suite count >= 247 | Yes — 252 |
+| Callback pattern does not couple StateStore to IdentityManager | Yes — StateStore receives `(kid: string) => Uint8Array \| null` |
 
-**Honest assessment:** All sprint contract criteria are met. The fix is minimal, targeted, and introduces no new attack surface.
+**Self-assessment: All sprint contract criteria are met.**

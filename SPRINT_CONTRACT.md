@@ -1,90 +1,94 @@
-# SPRINT_CONTRACT.md — SEC-011: Gate Default for Unlisted Operations Is Tier 3 (Allow)
+# SPRINT CONTRACT — SEC-005: Import Skips Signature Verification
 
 **Sprint Date:** 2026-03-28
-**Finding:** SEC-011 (reclassified Medium → High)
+**Finding:** SEC-005 (High)
 **Branch:** `security-review`
-**Remediation Plan Reference:** HP-12
+**Cluster:** First of three (SEC-005, SEC-010, SEC-014) — this sprint establishes the verification architecture.
 
 ---
 
 ## Architecture Decision
 
-### a) Root Cause — Not the Symptom
+### a) Root cause — not the symptom
 
-In `server/src/principal-policy/gate.ts:72-83`, the `evaluate()` method has a three-step evaluation:
+The `import()` method in `state-store.ts:518-598` writes each `StateEntry` directly to storage without verifying the Ed25519 signature (`sig` field) against the public key of the claimed signer (`kid` field). The root cause is that the import path has no concept of identity resolution — it receives entries with `kid` and `sig` fields but never looks up the corresponding public key to verify. This is not a missing call to an existing verification path; it is a missing *capability*: the `StateStore.import()` method has no access to identity data and no mechanism to resolve a `kid` to a public key.
 
-1. Check if operation is in `tier1_always_approve` → request approval
-2. Check if operation triggers a Tier 2 anomaly → request approval
-3. **Fall through unconditionally to Tier 3 (allow with audit logging)**
+### b) Smallest change that closes the vulnerability
 
-Step 3 is the bug. It does not verify that the operation is actually in the `tier3_always_allow` list. Any operation that is not in `tier1_always_approve` and does not trigger a Tier 2 anomaly is auto-allowed — **even if it appears in no tier list at all**.
+Add a `publicKeyResolver` callback parameter to `StateStore.import()` that maps a `kid` (identity ID) to its public key (`Uint8Array | null`). For each entry in the import bundle:
 
-This means a newly registered MCP tool that is not classified in any policy tier will silently auto-allow without human approval. This is a bypass vector for the entire approval architecture: the SEC-002 fix hardened timeout behavior, but SEC-011 lets unlisted operations bypass the gate entirely.
+1. Resolve `kid` via the callback. If the identity is unknown (returns `null`), reject the entry.
+2. Verify the `sig` against the entry's `payload.ct` (ciphertext) using the resolved public key — the same verification logic already used in `StateStore.read()` at line 297-307.
+3. If verification fails, reject the entry.
+4. Track rejection counts in the response: `skipped_invalid_sig` and `skipped_unknown_kid`.
 
-### b) Smallest Change That Closes the Vulnerability
+The callback pattern is the correct architectural choice because:
+- It avoids coupling `StateStore` to `IdentityManager` (the state store currently knows nothing about identities).
+- It establishes a **verification interface** that SEC-010 (session state machine) and SEC-014 (attestation verification) can conform to — both will need the same pattern of "resolve identity, verify signature" without coupling their modules to identity storage.
+- The `IdentityManager.get()` method already returns `StoredIdentity | undefined`, which includes `public_key` (base64url). The tool handler wires the callback.
 
-Add a conditional check at gate.ts line 72: before the Tier 3 allow block, verify that the operation is in the `tier3_always_allow` list. If the operation is NOT in any tier list, default to **Tier 1 (require approval)** and log an audit entry indicating the operation is unclassified.
+### c) Interactions with other findings
 
-This is a ~10-line change to the conditional logic in `evaluate()`.
+**SEC-010** (session state machine never verifies signatures) and **SEC-014** (attestation signature verification is optional) form a cluster with SEC-005. This sprint establishes the verification pattern:
+- Signature verification is **mandatory, not optional**.
+- The verifier receives a key-resolver function, not a pre-loaded key map.
+- Entries with unresolvable identities are **rejected, not accepted with a warning**.
+- The response includes structured rejection counts so callers can distinguish "clean import" from "partially rejected import".
 
-### c) Interaction with Other Findings
+SEC-010 and SEC-014 are in Concordia (Python), but the design principle — mandatory verification with structured rejection — must carry forward.
 
-- **SEC-002 (Critical, PASS):** SEC-002 hardened the approval gate so timeouts always deny. SEC-011's fix routes unlisted operations through the same approval gate, so unlisted operations will now be properly denied on timeout. The two fixes are complementary — SEC-002 ensures the gate denies safely, SEC-011 ensures unlisted operations actually reach the gate.
-- **No other finding dependencies.**
+### d) New risk introduced
 
-### d) New Risk Introduced
-
-A tool added to the MCP server without a corresponding entry in the Principal Policy will now require Tier 1 approval instead of auto-allowing. This is a **correct fail-safe** — the disruption (unexpected approval prompt) is vastly preferable to the alternative (unguarded sensitive operation). Developers must update the policy file when adding tools. The audit log entry for unlisted operations makes this easy to diagnose.
+- An import bundle created by an instance with identities not present on the importing instance will have all entries rejected. This is the **correct** behavior (CLAUDE.md constraint 4: "Never assume trust across the Sanctuary-Concordia boundary"), but it changes the behavior for bundles that previously imported successfully. The import response now includes `skipped_unknown_kid` so the caller can diagnose this.
+- No risk of breaking existing write/read paths — those are not modified.
 
 ---
 
 ## Fix Specification
 
-### Exact Fix
+### Files to modify
 
-In `server/src/principal-policy/gate.ts`, in the `evaluate()` method, replace the unconditional Tier 3 fall-through (lines 72-83) with:
+1. **`server/src/l1-cognitive/state-store.ts`** — `import()` method (lines 518-598)
+   - Add `publicKeyResolver` parameter: `(kid: string) => Uint8Array | null`
+   - Add signature verification loop before writing each entry
+   - Expand return type to include `skipped_invalid_sig` and `skipped_unknown_kid`
 
-1. Check if the operation is in `this.policy.tier3_always_allow`
-2. If YES → current Tier 3 behavior (allow with audit logging)
-3. If NO → treat as unlisted/unclassified: default to Tier 1 (request approval), with a reason indicating the operation is not classified in any policy tier
+2. **`server/src/l1-cognitive/tools.ts`** — `state_import` handler (lines 614-619)
+   - Wire `publicKeyResolver` callback using `identityMgr.get()` to resolve `kid` to public key
 
-### Files to Modify
+### Behavior before
 
-| File | Lines | Change |
-|------|-------|--------|
-| `server/src/principal-policy/gate.ts` | 72-83 | Add `tier3_always_allow.includes(operation)` check; add else-branch for unlisted operations that defaults to Tier 1 |
-| `server/test/principal-policy/approval-gate.test.ts` | new tests | Add regression test: unlisted operation defaults to Tier 1 |
+Import accepts any `StateEntry` from a non-reserved namespace regardless of `sig` validity or `kid` existence. An entry with a forged signature or a nonexistent `kid` is written to storage.
 
-### Behavior Before and After
+### Behavior after
 
-| Scenario | Before | After |
-|----------|--------|-------|
-| Operation in `tier1_always_approve` | Tier 1 (require approval) | Tier 1 (require approval) — **unchanged** |
-| Operation triggers Tier 2 anomaly | Tier 2 (require approval) | Tier 2 (require approval) — **unchanged** |
-| Operation in `tier3_always_allow` | Tier 3 (allow) | Tier 3 (allow) — **unchanged** |
-| Operation NOT in any tier list | Tier 3 (allow) ← **BUG** | Tier 1 (require approval) ← **FIXED** |
+Import verifies every entry before writing:
+- If `kid` does not resolve to a known identity, the entry is skipped and counted in `skipped_unknown_kid`.
+- If `sig` does not verify against the ciphertext using the resolved public key, the entry is skipped and counted in `skipped_invalid_sig`.
+- Only entries passing both checks are written to storage.
+- The response includes `{ imported_keys, skipped_keys, skipped_invalid_sig, skipped_unknown_kid, conflicts, namespaces, imported_at }`.
 
-### Regression Test
+### Regression tests
 
-Tests added to `server/test/principal-policy/approval-gate.test.ts`:
+New file: `server/test/security/import-verifies-signatures.test.ts`
 
-1. **Unlisted operation defaults to Tier 1 (require approval).** Create a policy with explicit tier lists. Evaluate an operation name NOT in any list (e.g., `"totally_new_tool"`). Assert: `result.tier === 1`, `result.approval_required === true`.
+Tests:
+1. **Valid import succeeds** — export a bundle, re-import it, all entries accepted.
+2. **Forged signature rejected** — create a bundle, tamper with one entry's `sig`, import rejects that entry, others succeed.
+3. **Unknown kid rejected** — create a bundle with a `kid` that doesn't exist on the importing instance, entry is rejected.
+4. **All entries invalid** — import a bundle where every entry has a bad signature, result shows 0 imported, N skipped.
+5. **Reserved namespace still skipped** — entries in `_identities` namespace are still skipped (existing behavior preserved).
 
-2. **Unlisted operation is denied when channel denies.** Same setup with a deny channel. Assert: `result.allowed === false`.
+### Prompt injection
 
-3. **Unlisted operation generates audit log entry.** Verify the audit log records the unclassified operation event.
+The import path accepts a base64url-encoded JSON bundle. The bundle contents are parsed as JSON and written as `StateEntry` objects — they do not reach any model prompt. No prompt injection surface.
 
-4. **Existing Tier 3 operations still auto-allow.** Verify that operations in `tier3_always_allow` are unaffected by the change.
+### Definition of done (evaluator criteria)
 
-### Definition of Done (Evaluator Criteria)
-
-1. **Root cause addressed:** The gate no longer falls through to Tier 3 for operations not in `tier3_always_allow`
-2. **Correct default:** Unlisted operations require Tier 1 approval
-3. **No regression:** All existing Tier 1, Tier 2, and Tier 3 operations behave identically to before
-4. **Test coverage:** New tests specifically verify unlisted operation → Tier 1 default
-5. **Audit trail:** Unlisted operations generate an audit log entry indicating the operation is unclassified
-6. **Test suite passes:** 243+ tests pass (baseline: 243), no test count decrease
-
-### Prompt Injection Surface
-
-This fix does not touch any input/output path that handles user-controlled text. The operation name is derived from the MCP tool registration (developer-controlled, not agent-controlled). The `extractOperationName()` function strips the `sanctuary/` prefix — this is a static string operation, not a user-input surface. No prompt injection concern.
+1. The `import()` method rejects entries with invalid signatures (forged or absent).
+2. The `import()` method rejects entries with unresolvable `kid` values.
+3. The verification uses the same `verify()` function from `core/identity.ts` that `read()` uses.
+4. The return type includes `skipped_invalid_sig` and `skipped_unknown_kid` counts.
+5. All 5 regression tests pass.
+6. Full test suite count >= 247 (no decrease).
+7. The callback-based resolver pattern does not couple `StateStore` to `IdentityManager`.
