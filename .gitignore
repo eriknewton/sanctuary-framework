@@ -12,3 +12,4 @@ dist/
 # Internal documents
 SANCTUARY_PROJECT_CONTEXT.md
 rfcs/DRAFT-*
+server/node_modules/
