@@ -612,10 +612,18 @@ export function createL1Tools(
         required: ["bundle"],
       },
       handler: async (args) => {
+        // Wire public key resolver for signature verification (SEC-005)
+        const publicKeyResolver = (kid: string): Uint8Array | null => {
+          const identity = identityMgr.get(kid);
+          if (!identity) return null;
+          return fromBase64url(identity.public_key);
+        };
+
         const result = await stateStore.import(
           args.bundle as string,
           (args.conflict_resolution as "skip" | "overwrite" | "version") ??
-            "skip"
+            "skip",
+          publicKeyResolver
         );
 
         auditLog?.append("l1", "state_import", "principal", {
