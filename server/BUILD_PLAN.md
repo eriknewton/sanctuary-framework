@@ -164,18 +164,50 @@ Prompt injection defense. Human-in-the-loop approval gating for high-risk operat
 
 ---
 
-## Phase 3: Ship & Harden (Not yet started)
+## Phase 3A: Adoption Infrastructure (Session 7)
 
-Candidates for next work, in rough priority order:
+Building the adoption surface: npm publish, machine-readable SHR, sovereignty handshake, Cowork plugin.
+
+### Step 21: npm publish pipeline
+- `prepublishOnly` script: typecheck → test → build
+- Version alignment: `config.ts` → `package.json` both at `0.2.0`
+- LICENSE file in `server/` (Apache-2.0, copied from root)
+- `npm pack` produces clean tarball: dist/, README.md, LICENSE only
+- `npx @sanctuary-framework/mcp-server` works end-to-end
+
+### Step 22: Machine-readable SHR (Sovereignty Health Report)
+- `src/shr/types.ts` — SHR type definitions, canonical serialization
+- `src/shr/generator.ts` — Generate signed SHR from server state
+- `src/shr/verifier.ts` — Verify counterparty SHR (signature, expiry, schema, sovereignty assessment)
+- `src/shr/tools.ts` — `sanctuary/shr_generate`, `sanctuary/shr_verify` MCP tools
+- `test/shr/shr.test.ts` — 11 tests: generation, layer completeness, degradations, validity window, error handling, verification, tamper detection, expiry detection, sovereignty assessment, canonical determinism
+
+### Step 23: Sovereignty Handshake Protocol
+- `src/handshake/types.ts` — Handshake type definitions (challenge, response, completion, result, session)
+- `src/handshake/protocol.ts` — Core protocol: initiate, respond, complete, verify-completion
+- `src/handshake/tools.ts` — `sanctuary/handshake_initiate`, `sanctuary/handshake_respond`, `sanctuary/handshake_complete`, `sanctuary/handshake_status` MCP tools
+- `test/handshake/handshake.test.ts` — 8 tests: full round-trip, tampered SHR, tampered nonce signatures, tampered completion, protocol version rejection, missing identity, sovereignty assessment
+
+### Step 24: Cowork Plugin Packaging
+- `plugin/.claude-plugin/plugin.json` — Plugin manifest
+- `plugin/.mcp.json` — MCP server configuration (npx launch)
+- `plugin/skills/sanctuary/SKILL.md` — Skill definition with all 32 tools documented
+- `plugin/README.md` — Plugin documentation
+
+**STATUS: COMPLETE** — 6 new source files, 2 new test files. 19 new tests. 107 total tests passing, 15 test files. 32 MCP tools (6 new: shr_generate, shr_verify, handshake_initiate, handshake_respond, handshake_complete, handshake_status). Cowork plugin packaged.
+
+---
+
+## Phase 3B: Remaining Hardening (Not yet started)
 
 ### Option A: Gate integration test (hardening)
 - End-to-end test: prompt injection scenario where agent tries state_export → gets blocked → tries unfamiliar namespace → baseline catches it
 - Acceptance test for RFC-0002
 
-### Option B: npm publish pipeline
-- Make `npx @sanctuary-framework/mcp-server` actually work
-- Package metadata, CLI entry point, first-run UX
-- This is the "ship something normal humans can use" path
+### Option B: Sovereignty-gated reputation tiers
+- Attestations from verified agents weighted higher
+- Tier metadata in attestation schema
+- Depends on sovereignty handshake (now complete)
 
 ### Option C: MCP-to-MCP federation
 - Agent-to-agent sovereignty negotiation

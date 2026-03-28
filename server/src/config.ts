@@ -50,7 +50,7 @@ export interface SanctuaryConfig {
 /** Default configuration */
 export function defaultConfig(): SanctuaryConfig {
   return {
-    version: "0.1.0",
+    version: "0.2.0",
     storage_path: join(homedir(), ".sanctuary"),
     state: {
       encryption: "aes-256-gcm",

@@ -21,6 +21,8 @@ import { ApprovalGate } from "./principal-policy/gate.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
+import { createSHRTools } from "./shr/tools.js";
+import { createHandshakeTools } from "./handshake/tools.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
@@ -403,30 +405,48 @@ export async function createSanctuaryServer(options?: {
   // 14. Create Principal Policy tools (read-only)
   const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
 
-  // 15. Assemble all tools
+  // 15. Create SHR tools (machine-readable sovereignty health report)
+  const { tools: shrTools } = createSHRTools(
+    config,
+    identityManager,
+    masterKey,
+    auditLog
+  );
+
+  // 16. Create Handshake tools (sovereignty handshake protocol)
+  const { tools: handshakeTools } = createHandshakeTools(
+    config,
+    identityManager,
+    masterKey,
+    auditLog
+  );
+
+  // 17. Assemble all tools
   const allTools: ToolDefinition[] = [
     ...l1Tools,
     ...l2Tools,
     ...l3Tools,
     ...l4Tools,
     ...policyTools,
+    ...shrTools,
+    ...handshakeTools,
     manifestTool,
   ];
 
-  // 16. Create MCP server with approval gate
+  // 18. Create MCP server with approval gate
   const server = createServer(allTools, { gate });
 
-  // 17. Save config if this is first run
+  // 19. Save config if this is first run
   await saveConfig(config);
 
-  // 18. Register baseline save on process exit
+  // 20. Register baseline save on process exit
   const saveBaseline = () => {
     baseline.save().catch(() => {});
   };
   process.on("SIGINT", saveBaseline);
   process.on("SIGTERM", saveBaseline);
 
-  // 19. Log the recovery key if generated (shown once, never again)
+  // 21. Log the recovery key if generated (shown once, never again)
   if (recoveryKey) {
     console.error(
       "╔══════════════════════════════════════════════════════════╗\n" +
@@ -460,3 +480,18 @@ export {
   CallbackApprovalChannel,
   AutoApproveChannel,
 } from "./principal-policy/approval-channel.js";
+export { generateSHR } from "./shr/generator.js";
+export { verifySHR } from "./shr/verifier.js";
+export type { SignedSHR, SHRBody, SHRVerificationResult } from "./shr/types.js";
+export {
+  initiateHandshake,
+  respondToHandshake,
+  completeHandshake,
+  verifyCompletion,
+} from "./handshake/protocol.js";
+export type {
+  HandshakeChallenge,
+  HandshakeResponse,
+  HandshakeCompletion,
+  HandshakeResult,
+} from "./handshake/types.js";
