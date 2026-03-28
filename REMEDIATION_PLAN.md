@@ -255,6 +255,18 @@ Description: Because Concordia has no lockfile, the exact version of `cryptograp
 **Effort:** Small (< 2 hrs)
 **Dependencies:** None.
 
+### HP-16: Gate `concordia_relay_transcript` Behind Caller Authentication
+**Finding:** SEC-007 evaluator condition 2 (pre-existing gap, logged during SEC-007 closure)
+**Remediation:** `concordia_relay_transcript` exposes full session transcripts to unauthenticated callers — any caller can read any relay session content without a token. Add `auth_token` and `agent_id` parameters to `tool_relay_transcript` in `concordia/mcp_server.py`. Validate that the caller is a participant in the relay session (initiator or responder) before returning transcript content. Reject unauthenticated requests with the standard `_auth_error` response.
+**Effort:** Small (< 2 hrs)
+**Dependencies:** Requires SEC-007 authentication infrastructure (already merged).
+
+### HP-17: Gate `concordia_relay_conclude` Behind Caller Authentication
+**Finding:** SEC-007 evaluator condition 2 (pre-existing gap, logged during SEC-007 closure)
+**Remediation:** `concordia_relay_conclude` allows any unauthenticated caller to terminate any relay session — no token required. Add `auth_token` and `agent_id` parameters to `tool_relay_conclude` in `concordia/mcp_server.py`. Validate that the caller is a participant in the relay session before allowing session termination. Reject unauthenticated requests with the standard `_auth_error` response.
+**Effort:** Small (< 2 hrs)
+**Dependencies:** Requires SEC-007 authentication infrastructure (already merged).
+
 ---
 
 ## SECTION 3: SYSTEMIC PATTERNS
