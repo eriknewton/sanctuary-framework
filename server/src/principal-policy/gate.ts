@@ -69,18 +69,36 @@ export class ApprovalGate {
       return this.requestApproval(operation, 2, anomaly.reason, anomaly.context);
     }
 
-    // ── Tier 3: Allow with audit logging ──────────────────────────────
-    this.auditLog.append("l2", `gate_allow:${operation}`, "system", {
-      tier: 3,
+    // ── Tier 3: Allow with audit logging (only for explicitly listed operations)
+    if (this.policy.tier3_always_allow.includes(operation)) {
+      this.auditLog.append("l2", `gate_allow:${operation}`, "system", {
+        tier: 3,
+        operation,
+      });
+
+      return {
+        allowed: true,
+        tier: 3,
+        reason: "Operation allowed (Tier 3)",
+        approval_required: false,
+      };
+    }
+
+    // ── Unlisted operation: default to Tier 1 (require approval) ─────
+    // SEC-011: Operations not classified in any tier must not auto-allow.
+    // Safe default is to require human approval.
+    this.auditLog.append("l2", `gate_unclassified:${operation}`, "system", {
+      tier: 1,
       operation,
+      warning: "Operation is not classified in any policy tier — defaulting to Tier 1 (require approval)",
     });
 
-    return {
-      allowed: true,
-      tier: 3,
-      reason: "Operation allowed (Tier 3)",
-      approval_required: false,
-    };
+    return this.requestApproval(
+      operation,
+      1,
+      `"${operation}" is not classified in any policy tier — requires approval (SEC-011 safe default)`,
+      { operation, unclassified: true }
+    );
   }
 
   /**

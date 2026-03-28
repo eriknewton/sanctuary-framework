@@ -221,6 +221,79 @@ describe("Approval Gate", () => {
     });
   });
 
+  describe("SEC-011 — unlisted operations default to Tier 1", () => {
+    it("requires approval for operations not in any tier list", async () => {
+      const policy = createTestPolicy();
+      const channel = new AutoApproveChannel();
+      // Not first session
+      await baseline.save();
+      const baseline2 = new BaselineTracker(storage, masterKey);
+      await baseline2.load();
+
+      const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
+
+      // "totally_new_tool" is not in tier1, tier3, or any list
+      const result = await gate.evaluate("sanctuary/totally_new_tool", {});
+
+      expect(result.tier).toBe(1);
+      expect(result.approval_required).toBe(true);
+      expect(result.allowed).toBe(true); // AutoApprove approves
+    });
+
+    it("denies unlisted operations when channel denies", async () => {
+      const policy = createTestPolicy();
+      const channel = new CallbackApprovalChannel(async () => ({
+        decision: "deny",
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      }));
+      // Not first session
+      await baseline.save();
+      const baseline2 = new BaselineTracker(storage, masterKey);
+      await baseline2.load();
+
+      const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
+
+      const result = await gate.evaluate("sanctuary/totally_new_tool", {});
+
+      expect(result.tier).toBe(1);
+      expect(result.approval_required).toBe(true);
+      expect(result.allowed).toBe(false);
+    });
+
+    it("logs unclassified operation to audit log", async () => {
+      const policy = createTestPolicy();
+      const channel = new AutoApproveChannel();
+      await baseline.save();
+      const baseline2 = new BaselineTracker(storage, masterKey);
+      await baseline2.load();
+
+      const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
+
+      await gate.evaluate("sanctuary/unregistered_dangerous_op", {});
+
+      // Audit log should have entries: one for unclassified warning, one for gate decision
+      expect(auditLog.size).toBeGreaterThanOrEqual(2);
+    });
+
+    it("still allows explicitly listed Tier 3 operations", async () => {
+      const policy = createTestPolicy();
+      await baseline.save();
+      const baseline2 = new BaselineTracker(storage, masterKey);
+      await baseline2.load();
+
+      const channel = new AutoApproveChannel();
+      const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
+
+      // state_read is in tier3_always_allow
+      const result = await gate.evaluate("sanctuary/state_read", {});
+
+      expect(result.tier).toBe(3);
+      expect(result.allowed).toBe(true);
+      expect(result.approval_required).toBe(false);
+    });
+  });
+
   describe("security properties", () => {
     it("denial responses do not reveal tier1 operation list", async () => {
       const policy = createTestPolicy();
