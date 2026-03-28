@@ -916,6 +916,272 @@ declare class ApprovalGate {
 declare function loadPrincipalPolicy(storagePath: string): Promise<PrincipalPolicy>;
 
 /**
+ * Sanctuary MCP Server — L1 Cognitive Sovereignty: Tool Definitions
+ *
+ * MCP tool wrappers for StateStore and IdentityRoot operations.
+ * These tools are the public API that agents interact with.
+ */
+
+/** Manages all identities — provides storage and retrieval */
+declare class IdentityManager {
+    private storage;
+    private masterKey;
+    private identities;
+    private primaryIdentityId;
+    constructor(storage: StorageBackend, masterKey: Uint8Array);
+    private get encryptionKey();
+    /** Load identities from storage on startup */
+    load(): Promise<void>;
+    /** Save an identity to storage */
+    save(identity: StoredIdentity): Promise<void>;
+    get(id: string): StoredIdentity | undefined;
+    getDefault(): StoredIdentity | undefined;
+    list(): PublicIdentity[];
+}
+
+/**
+ * Sanctuary MCP Server — Sovereignty Health Report (SHR) Types
+ *
+ * Machine-readable, signed, versioned sovereignty capability advertisement.
+ * An agent presents its SHR to counterparties to prove its sovereignty posture.
+ * The SHR is signed by one of the instance's Ed25519 identities and can be
+ * independently verified by any party without trusting the presenter.
+ *
+ * SHR version: 1.0
+ */
+type LayerStatus = "active" | "degraded" | "inactive";
+type DegradationSeverity = "info" | "warning" | "critical";
+type DegradationCode = "NO_TEE" | "PROCESS_ISOLATION_ONLY" | "COMMITMENT_ONLY" | "NO_ZK_PROOFS" | "SELF_REPORTED_ATTESTATION" | "NO_SELECTIVE_DISCLOSURE" | "BASIC_SYBIL_ONLY";
+interface SHRLayerL1 {
+    status: LayerStatus;
+    encryption: string;
+    key_custody: "self" | "delegated" | "platform";
+    integrity: string;
+    identity_type: string;
+    state_portable: boolean;
+}
+interface SHRLayerL2 {
+    status: LayerStatus;
+    isolation_type: string;
+    attestation_available: boolean;
+}
+interface SHRLayerL3 {
+    status: LayerStatus;
+    proof_system: string;
+    selective_disclosure: boolean;
+}
+interface SHRLayerL4 {
+    status: LayerStatus;
+    reputation_mode: string;
+    attestation_format: string;
+    reputation_portable: boolean;
+}
+interface SHRDegradation {
+    layer: "l1" | "l2" | "l3" | "l4";
+    code: DegradationCode;
+    severity: DegradationSeverity;
+    description: string;
+    mitigation?: string;
+}
+interface SHRCapabilities {
+    handshake: boolean;
+    shr_exchange: boolean;
+    reputation_verify: boolean;
+    encrypted_channel: boolean;
+}
+/**
+ * The SHR body — the content that gets signed.
+ * Canonical form: JSON with sorted keys, no whitespace.
+ */
+interface SHRBody {
+    shr_version: "1.0";
+    instance_id: string;
+    generated_at: string;
+    expires_at: string;
+    layers: {
+        l1: SHRLayerL1;
+        l2: SHRLayerL2;
+        l3: SHRLayerL3;
+        l4: SHRLayerL4;
+    };
+    capabilities: SHRCapabilities;
+    degradations: SHRDegradation[];
+}
+/**
+ * The complete signed SHR — body + signature envelope.
+ */
+interface SignedSHR {
+    body: SHRBody;
+    signed_by: string;
+    signature: string;
+}
+interface SHRVerificationResult {
+    valid: boolean;
+    errors: string[];
+    warnings: string[];
+    sovereignty_level: "full" | "degraded" | "minimal";
+    counterparty_id: string;
+    expires_at: string;
+}
+
+/**
+ * Sanctuary MCP Server — SHR Generator
+ *
+ * Generates a Sovereignty Health Report from current server state,
+ * signs it with a specified identity, and returns the complete signed SHR.
+ */
+
+interface SHRGeneratorOptions {
+    config: SanctuaryConfig;
+    identityManager: IdentityManager;
+    masterKey: Uint8Array;
+    /** Override validity window (milliseconds). Default: 1 hour. */
+    validityMs?: number;
+}
+/**
+ * Generate and sign a Sovereignty Health Report.
+ *
+ * @param identityId - Which identity to sign with (defaults to primary)
+ * @param opts - Generator dependencies
+ * @returns The signed SHR, or an error string
+ */
+declare function generateSHR(identityId: string | undefined, opts: SHRGeneratorOptions): SignedSHR | string;
+
+/**
+ * Sanctuary MCP Server — SHR Verifier
+ *
+ * Verifies a counterparty's Sovereignty Health Report:
+ * - Signature validity (Ed25519 over canonical body)
+ * - Temporal validity (not expired)
+ * - Schema completeness
+ * - Sovereignty level assessment
+ */
+
+/**
+ * Verify a signed SHR.
+ *
+ * @param shr - The signed SHR to verify
+ * @param now - Optional override for current time (for testing)
+ * @returns Verification result with validity, errors, warnings, and sovereignty assessment
+ */
+declare function verifySHR(shr: SignedSHR, now?: Date): SHRVerificationResult;
+
+/**
+ * Sanctuary MCP Server — Sovereignty Handshake Types
+ *
+ * The sovereignty handshake is a mutual verification protocol between
+ * two Sanctuary instances. Each party presents its SHR and proves
+ * liveness via nonce challenge-response.
+ *
+ * Protocol:
+ *   A → B: HandshakeChallenge (A's SHR + nonce)
+ *   B → A: HandshakeResponse (B's SHR + B's nonce + signature over A's nonce)
+ *   A → B: HandshakeCompletion (signature over B's nonce)
+ *   Result: Both hold a HandshakeResult with verified counterparty status
+ */
+
+/** Trust tier derived from sovereignty handshake */
+type TrustTier = "verified-sovereign" | "verified-degraded" | "unverified";
+/** Sovereignty level from SHR assessment */
+type SovereigntyLevel = "full" | "degraded" | "minimal" | "unverified";
+/**
+ * Step 1: Initiator sends challenge
+ */
+interface HandshakeChallenge {
+    protocol_version: "1.0";
+    shr: SignedSHR;
+    nonce: string;
+    initiated_at: string;
+}
+/**
+ * Step 2: Responder sends response
+ */
+interface HandshakeResponse {
+    protocol_version: "1.0";
+    shr: SignedSHR;
+    responder_nonce: string;
+    initiator_nonce_signature: string;
+    responded_at: string;
+}
+/**
+ * Step 3: Initiator sends completion
+ */
+interface HandshakeCompletion {
+    protocol_version: "1.0";
+    responder_nonce_signature: string;
+    completed_at: string;
+}
+/**
+ * Final result: both parties hold this after a successful handshake
+ */
+interface HandshakeResult {
+    counterparty_id: string;
+    counterparty_shr: SignedSHR;
+    verified: boolean;
+    sovereignty_level: SovereigntyLevel;
+    trust_tier: TrustTier;
+    completed_at: string;
+    expires_at: string;
+    errors: string[];
+}
+/**
+ * In-progress handshake state (stored on initiator side)
+ */
+interface HandshakeSession {
+    session_id: string;
+    role: "initiator" | "responder";
+    state: "initiated" | "responded" | "completed" | "failed";
+    our_nonce: string;
+    their_nonce?: string;
+    our_shr: SignedSHR;
+    their_shr?: SignedSHR;
+    initiated_at: string;
+    result?: HandshakeResult;
+}
+
+/**
+ * Sanctuary MCP Server — Sovereignty Handshake Protocol
+ *
+ * Core handshake logic: initiate, respond, complete.
+ * Nonce-based challenge-response prevents replay attacks.
+ * SHR signatures are verified at each step.
+ */
+
+/**
+ * Step 1: Initiate a handshake.
+ * Generates a challenge containing our SHR and a nonce.
+ */
+declare function initiateHandshake(ourSHR: SignedSHR): {
+    challenge: HandshakeChallenge;
+    session: HandshakeSession;
+};
+/**
+ * Step 2: Respond to a handshake challenge.
+ * Verifies the initiator's SHR, signs their nonce, generates our nonce.
+ */
+declare function respondToHandshake(challenge: HandshakeChallenge, ourSHR: SignedSHR, identityManager: IdentityManager, masterKey: Uint8Array, identityId?: string): {
+    response: HandshakeResponse;
+    session: HandshakeSession;
+} | {
+    error: string;
+};
+/**
+ * Step 3: Complete the handshake (initiator side).
+ * Verifies the responder's SHR and nonce signature, signs responder's nonce.
+ */
+declare function completeHandshake(response: HandshakeResponse, session: HandshakeSession, identityManager: IdentityManager, masterKey: Uint8Array, identityId?: string): {
+    completion: HandshakeCompletion;
+    result: HandshakeResult;
+} | {
+    error: string;
+};
+/**
+ * Step 4: Verify completion (responder side).
+ * Verifies the initiator signed our nonce correctly.
+ */
+declare function verifyCompletion(completion: HandshakeCompletion, session: HandshakeSession): HandshakeResult;
+
+/**
  * Sanctuary MCP Server — Main Entry Point
  *
  * Initializes and exports the Sanctuary MCP server.
@@ -938,4 +1204,4 @@ declare function createSanctuaryServer(options?: {
     storage?: StorageBackend;
 }): Promise<SanctuaryServer>;
 
-export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, CallbackApprovalChannel, CommitmentStore, FilesystemStorage, type GateResult, MemoryStorage, PolicyStore, type PrincipalPolicy, ReputationStore, type SanctuaryConfig, type SanctuaryServer, StateStore, StderrApprovalChannel, createSanctuaryServer, loadConfig, loadPrincipalPolicy };
+export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, CallbackApprovalChannel, CommitmentStore, FilesystemStorage, type GateResult, type HandshakeChallenge, type HandshakeCompletion, type HandshakeResponse, type HandshakeResult, MemoryStorage, PolicyStore, type PrincipalPolicy, ReputationStore, type SHRBody, type SHRVerificationResult, type SanctuaryConfig, type SanctuaryServer, type SignedSHR, StateStore, StderrApprovalChannel, completeHandshake, createSanctuaryServer, generateSHR, initiateHandshake, loadConfig, loadPrincipalPolicy, respondToHandshake, verifyCompletion, verifySHR };

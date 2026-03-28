@@ -201,7 +201,7 @@ var init_hashing = __esm({
 });
 function defaultConfig() {
   return {
-    version: "0.1.0",
+    version: "0.2.0",
     storage_path: join(homedir(), ".sanctuary"),
     state: {
       encryption: "aes-256-gcm",
@@ -591,6 +591,17 @@ function derivePurposeKey(masterKey, purpose) {
 
 // src/l1-cognitive/state-store.ts
 init_encoding();
+var RESERVED_NAMESPACE_PREFIXES = [
+  "_identities",
+  "_policies",
+  "_audit",
+  "_meta",
+  "_principal",
+  "_commitments",
+  "_reputation",
+  "_escrow",
+  "_guarantees"
+];
 var StateStore = class {
   storage;
   masterKey;
@@ -867,6 +878,12 @@ var StateStore = class {
     for (const [ns, entries] of Object.entries(
       bundle.data
     )) {
+      if (RESERVED_NAMESPACE_PREFIXES.some(
+        (prefix) => ns === prefix || ns.startsWith(prefix + "/")
+      )) {
+        skippedKeys += entries.length;
+        continue;
+      }
       namespaces.push(ns);
       for (const { key, entry } of entries) {
         const exists = await this.storage.exists(ns, key);
@@ -910,6 +927,83 @@ var StateStore = class {
     };
   }
 };
+var MAX_STRING_BYTES = 1048576;
+var MAX_BUNDLE_BYTES = 5242880;
+var BUNDLE_FIELDS = /* @__PURE__ */ new Set(["bundle"]);
+function validateArgs(args, schema) {
+  const errors = [];
+  const properties = schema.properties ?? {};
+  const required = schema.required ?? [];
+  for (const field of required) {
+    if (args[field] === void 0 || args[field] === null) {
+      errors.push({ field, message: `Required field "${field}" is missing` });
+    }
+  }
+  const knownFields = new Set(Object.keys(properties));
+  for (const field of Object.keys(args)) {
+    if (!knownFields.has(field)) {
+      errors.push({ field, message: `Unknown field "${field}"` });
+    }
+  }
+  for (const [field, value] of Object.entries(args)) {
+    if (value === void 0 || value === null) continue;
+    const propSchema = properties[field];
+    if (!propSchema) continue;
+    const typeError = checkType(field, value, propSchema);
+    if (typeError) {
+      errors.push(typeError);
+      continue;
+    }
+    if (typeof value === "string") {
+      const maxBytes = BUNDLE_FIELDS.has(field) ? MAX_BUNDLE_BYTES : MAX_STRING_BYTES;
+      const byteLength = new TextEncoder().encode(value).length;
+      if (byteLength > maxBytes) {
+        errors.push({
+          field,
+          message: `Field "${field}" exceeds maximum size (${byteLength} bytes > ${maxBytes} bytes)`
+        });
+      }
+    }
+    if (propSchema.enum && !propSchema.enum.includes(value)) {
+      errors.push({
+        field,
+        message: `Field "${field}" must be one of: ${propSchema.enum.join(", ")}`
+      });
+    }
+  }
+  return errors;
+}
+function checkType(field, value, schema) {
+  if (!schema.type) return null;
+  switch (schema.type) {
+    case "string":
+      if (typeof value !== "string") {
+        return { field, message: `Expected string for "${field}", got ${typeof value}` };
+      }
+      break;
+    case "number":
+      if (typeof value !== "number") {
+        return { field, message: `Expected number for "${field}", got ${typeof value}` };
+      }
+      break;
+    case "boolean":
+      if (typeof value !== "boolean") {
+        return { field, message: `Expected boolean for "${field}", got ${typeof value}` };
+      }
+      break;
+    case "object":
+      if (typeof value !== "object" || Array.isArray(value)) {
+        return { field, message: `Expected object for "${field}", got ${typeof value}` };
+      }
+      break;
+    case "array":
+      if (!Array.isArray(value)) {
+        return { field, message: `Expected array for "${field}", got ${typeof value}` };
+      }
+      break;
+  }
+  return null;
+}
 function createServer(tools, options) {
   const gate = options?.gate;
   const server = new Server(
@@ -942,6 +1036,22 @@ function createServer(tools, options) {
           {
             type: "text",
             text: JSON.stringify({ error: `Unknown tool: ${name}` })
+          }
+        ],
+        isError: true
+      };
+    }
+    const validationErrors = validateArgs(typedArgs, tool.inputSchema);
+    if (validationErrors.length > 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: "validation_failed",
+              message: "Tool arguments failed schema validation",
+              violations: validationErrors
+            })
           }
         ],
         isError: true
@@ -990,6 +1100,25 @@ function toolResult(data) {
 // src/l1-cognitive/tools.ts
 init_encoding();
 init_encoding();
+var RESERVED_NAMESPACE_PREFIXES2 = [
+  "_identities",
+  "_policies",
+  "_audit",
+  "_meta",
+  "_principal",
+  "_commitments",
+  "_reputation",
+  "_escrow",
+  "_guarantees"
+];
+function getReservedNamespaceViolation(namespace) {
+  for (const prefix of RESERVED_NAMESPACE_PREFIXES2) {
+    if (namespace === prefix || namespace.startsWith(prefix + "/")) {
+      return prefix;
+    }
+  }
+  return null;
+}
 var IdentityManager = class {
   storage;
   masterKey;
@@ -1275,6 +1404,13 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
         required: ["namespace", "key", "value"]
       },
       handler: async (args) => {
+        const reservedViolation = getReservedNamespaceViolation(args.namespace);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Choose a different namespace.`
+          });
+        }
         const identity = resolveIdentity(args.identity_id);
         const metadata = args.metadata;
         const result = await stateStore.write(
@@ -1369,6 +1505,13 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
         required: ["namespace", "key"]
       },
       handler: async (args) => {
+        const reservedViolation = getReservedNamespaceViolation(args.namespace);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot delete from reserved namespaces.`
+          });
+        }
         const result = await stateStore.delete(
           args.namespace,
           args.key
@@ -2504,18 +2647,13 @@ function createL4Tools(storage, masterKey, identityManager, auditLog) {
           bundle: {
             type: "string",
             description: "Base64url-encoded reputation bundle"
-          },
-          verify_signatures: {
-            type: "boolean",
-            description: "Verify attestation signatures (default: true)",
-            default: true
           }
         },
         required: ["bundle"]
       },
       handler: async (args) => {
         const bundleBase64 = args.bundle;
-        const verifySignatures = args.verify_signatures ?? true;
+        const verifySignatures = true;
         let bundle;
         try {
           const bundleBytes = fromBase64url(bundleBase64);
@@ -3370,6 +3508,604 @@ function createPrincipalPolicyTools(policy, baseline, auditLog) {
   ];
 }
 
+// src/shr/types.ts
+function deepSortKeys(obj) {
+  if (obj === null || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(deepSortKeys);
+  const sorted = {};
+  for (const key of Object.keys(obj).sort()) {
+    sorted[key] = deepSortKeys(obj[key]);
+  }
+  return sorted;
+}
+function canonicalizeForSigning(body) {
+  return JSON.stringify(deepSortKeys(body));
+}
+
+// src/shr/generator.ts
+init_encoding();
+var DEFAULT_VALIDITY_MS = 60 * 60 * 1e3;
+function generateSHR(identityId, opts) {
+  const { config, identityManager, masterKey, validityMs } = opts;
+  const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+  if (!identity) {
+    return "No identity available for signing. Create an identity first.";
+  }
+  const now = /* @__PURE__ */ new Date();
+  const expiresAt = new Date(now.getTime() + (validityMs ?? DEFAULT_VALIDITY_MS));
+  const degradations = [];
+  if (config.execution.environment === "local-process") {
+    degradations.push({
+      layer: "l2",
+      code: "PROCESS_ISOLATION_ONLY",
+      severity: "warning",
+      description: "Process-level isolation only (no TEE)",
+      mitigation: "TEE support planned for v0.3.0"
+    });
+    degradations.push({
+      layer: "l2",
+      code: "SELF_REPORTED_ATTESTATION",
+      severity: "warning",
+      description: "Attestation is self-reported (no hardware root of trust)",
+      mitigation: "TEE attestation planned for v0.3.0"
+    });
+  }
+  if (config.disclosure.proof_system === "commitment-only") {
+    degradations.push({
+      layer: "l3",
+      code: "COMMITMENT_ONLY",
+      severity: "info",
+      description: "Commitment schemes only (no ZK proofs)",
+      mitigation: "ZK proof support planned for future release"
+    });
+  }
+  const body = {
+    shr_version: "1.0",
+    instance_id: identity.identity_id,
+    generated_at: now.toISOString(),
+    expires_at: expiresAt.toISOString(),
+    layers: {
+      l1: {
+        status: "active",
+        encryption: config.state.encryption,
+        key_custody: "self",
+        integrity: config.state.integrity,
+        identity_type: config.state.identity_provider,
+        state_portable: true
+      },
+      l2: {
+        status: config.execution.environment === "local-process" ? "degraded" : "active",
+        isolation_type: config.execution.environment,
+        attestation_available: config.execution.attestation
+      },
+      l3: {
+        status: config.disclosure.proof_system === "commitment-only" ? "degraded" : "active",
+        proof_system: config.disclosure.proof_system,
+        selective_disclosure: config.disclosure.proof_system !== "commitment-only"
+      },
+      l4: {
+        status: "active",
+        reputation_mode: config.reputation.mode,
+        attestation_format: config.reputation.attestation_format,
+        reputation_portable: true
+      }
+    },
+    capabilities: {
+      handshake: true,
+      shr_exchange: true,
+      reputation_verify: true,
+      encrypted_channel: false
+      // Not yet implemented
+    },
+    degradations
+  };
+  const canonical = canonicalizeForSigning(body);
+  const payload = stringToBytes(canonical);
+  const encryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  const signatureBytes = sign(
+    payload,
+    identity.encrypted_private_key,
+    encryptionKey
+  );
+  return {
+    body,
+    signed_by: identity.public_key,
+    signature: toBase64url(signatureBytes)
+  };
+}
+
+// src/shr/verifier.ts
+init_encoding();
+function verifySHR(shr, now) {
+  const errors = [];
+  const warnings = [];
+  const currentTime = now ?? /* @__PURE__ */ new Date();
+  if (!shr.body || !shr.signed_by || !shr.signature) {
+    errors.push("Missing required SHR fields (body, signed_by, or signature)");
+    return {
+      valid: false,
+      errors,
+      warnings,
+      sovereignty_level: "minimal",
+      counterparty_id: shr.body?.instance_id ?? "unknown",
+      expires_at: shr.body?.expires_at ?? "unknown"
+    };
+  }
+  if (shr.body.shr_version !== "1.0") {
+    errors.push(`Unsupported SHR version: ${shr.body.shr_version}`);
+  }
+  const expiresAt = new Date(shr.body.expires_at);
+  if (isNaN(expiresAt.getTime())) {
+    errors.push("Invalid expires_at timestamp");
+  } else if (currentTime > expiresAt) {
+    errors.push(`SHR expired at ${shr.body.expires_at}`);
+  }
+  const generatedAt = new Date(shr.body.generated_at);
+  if (isNaN(generatedAt.getTime())) {
+    errors.push("Invalid generated_at timestamp");
+  } else if (generatedAt > currentTime) {
+    warnings.push("SHR generated_at is in the future \u2014 clock skew detected");
+  }
+  try {
+    const publicKey = fromBase64url(shr.signed_by);
+    const signatureBytes = fromBase64url(shr.signature);
+    const canonical = canonicalizeForSigning(shr.body);
+    const payload = stringToBytes(canonical);
+    const signatureValid = verify(payload, signatureBytes, publicKey);
+    if (!signatureValid) {
+      errors.push("Invalid signature \u2014 SHR may have been tampered with");
+    }
+  } catch (e) {
+    errors.push(`Signature verification failed: ${e.message}`);
+  }
+  const { layers } = shr.body;
+  if (!layers.l1 || !layers.l2 || !layers.l3 || !layers.l4) {
+    errors.push("Missing one or more layer definitions");
+  }
+  const sovereigntyLevel = assessSovereigntyLevel(shr.body);
+  for (const d of shr.body.degradations ?? []) {
+    if (d.severity === "critical") {
+      warnings.push(`Critical degradation in ${d.layer}: ${d.description}`);
+    }
+  }
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+    sovereignty_level: sovereigntyLevel,
+    counterparty_id: shr.body.instance_id,
+    expires_at: shr.body.expires_at
+  };
+}
+function assessSovereigntyLevel(body) {
+  const { l1, l2, l3, l4 } = body.layers;
+  if (l1.status === "active" && l2.status === "active" && l3.status === "active" && l4.status === "active") {
+    return "full";
+  }
+  if (l1.status !== "active") {
+    return "minimal";
+  }
+  if (l4.status === "active" || l4.status === "degraded") {
+    return "degraded";
+  }
+  return "minimal";
+}
+
+// src/shr/tools.ts
+function createSHRTools(config, identityManager, masterKey, auditLog) {
+  const generatorOpts = {
+    config,
+    identityManager,
+    masterKey
+  };
+  const tools = [
+    {
+      name: "sanctuary/shr_generate",
+      description: "Generate a signed Sovereignty Health Report (SHR) \u2014 a machine-readable, cryptographically signed advertisement of this instance's sovereignty posture. Present this to counterparties to prove your sovereignty capabilities.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          identity_id: {
+            type: "string",
+            description: "Identity to sign the SHR with. Defaults to primary identity."
+          },
+          validity_minutes: {
+            type: "number",
+            description: "How long the SHR is valid (minutes). Default: 60."
+          }
+        }
+      },
+      handler: async (args) => {
+        const validityMs = args.validity_minutes ? args.validity_minutes * 60 * 1e3 : void 0;
+        const result = generateSHR(args.identity_id, {
+          ...generatorOpts,
+          validityMs
+        });
+        if (typeof result === "string") {
+          return toolResult({ error: result });
+        }
+        auditLog.append("l2", "shr_generate", result.body.instance_id);
+        return toolResult(result);
+      }
+    },
+    {
+      name: "sanctuary/shr_verify",
+      description: "Verify a counterparty's Sovereignty Health Report (SHR). Checks signature validity, temporal validity, and assesses sovereignty level.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          shr: {
+            type: "object",
+            description: "The signed SHR to verify (full SignedSHR object)."
+          }
+        },
+        required: ["shr"]
+      },
+      handler: async (args) => {
+        const shr = args.shr;
+        const result = verifySHR(shr);
+        auditLog.append(
+          "l2",
+          "shr_verify",
+          result.counterparty_id,
+          void 0,
+          result.valid ? "success" : "failure"
+        );
+        return toolResult(result);
+      }
+    }
+  ];
+  return { tools };
+}
+
+// src/handshake/protocol.ts
+init_encoding();
+function generateNonce() {
+  return toBase64url(randomBytes(32));
+}
+function initiateHandshake(ourSHR) {
+  const nonce = generateNonce();
+  const sessionId = toBase64url(randomBytes(16));
+  const challenge = {
+    protocol_version: "1.0",
+    shr: ourSHR,
+    nonce,
+    initiated_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  const session = {
+    session_id: sessionId,
+    role: "initiator",
+    state: "initiated",
+    our_nonce: nonce,
+    our_shr: ourSHR,
+    initiated_at: challenge.initiated_at
+  };
+  return { challenge, session };
+}
+function respondToHandshake(challenge, ourSHR, identityManager, masterKey, identityId) {
+  if (challenge.protocol_version !== "1.0") {
+    return { error: `Unsupported protocol version: ${challenge.protocol_version}` };
+  }
+  const shrResult = verifySHR(challenge.shr);
+  if (!shrResult.valid) {
+    return { error: `Initiator SHR verification failed: ${shrResult.errors.join(", ")}` };
+  }
+  const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+  if (!identity) {
+    return { error: "No identity available for signing" };
+  }
+  const encryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  const nonceBytes = stringToBytes(challenge.nonce);
+  const nonceSignature = sign(
+    nonceBytes,
+    identity.encrypted_private_key,
+    encryptionKey
+  );
+  const responderNonce = generateNonce();
+  const response = {
+    protocol_version: "1.0",
+    shr: ourSHR,
+    responder_nonce: responderNonce,
+    initiator_nonce_signature: toBase64url(nonceSignature),
+    responded_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  const session = {
+    session_id: toBase64url(randomBytes(16)),
+    role: "responder",
+    state: "responded",
+    our_nonce: responderNonce,
+    their_nonce: challenge.nonce,
+    our_shr: ourSHR,
+    their_shr: challenge.shr,
+    initiated_at: challenge.initiated_at
+  };
+  return { response, session };
+}
+function completeHandshake(response, session, identityManager, masterKey, identityId) {
+  if (response.protocol_version !== "1.0") {
+    return { error: `Unsupported protocol version: ${response.protocol_version}` };
+  }
+  const shrResult = verifySHR(response.shr);
+  if (!shrResult.valid) {
+    return { error: `Responder SHR verification failed: ${shrResult.errors.join(", ")}` };
+  }
+  const responderPublicKey = fromBase64url(response.shr.signed_by);
+  const ourNonceBytes = stringToBytes(session.our_nonce);
+  const nonceSignatureBytes = fromBase64url(response.initiator_nonce_signature);
+  const nonceSignatureValid = verify(
+    ourNonceBytes,
+    nonceSignatureBytes,
+    responderPublicKey
+  );
+  if (!nonceSignatureValid) {
+    return { error: "Responder's nonce signature is invalid \u2014 possible replay or MITM" };
+  }
+  const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+  if (!identity) {
+    return { error: "No identity available for signing" };
+  }
+  const encryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  const responderNonceBytes = stringToBytes(response.responder_nonce);
+  const responderNonceSignature = sign(
+    responderNonceBytes,
+    identity.encrypted_private_key,
+    encryptionKey
+  );
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const completion = {
+    protocol_version: "1.0",
+    responder_nonce_signature: toBase64url(responderNonceSignature),
+    completed_at: now
+  };
+  const sovereigntyLevel = shrResult.sovereignty_level;
+  const trustTier = deriveTrustTier(sovereigntyLevel);
+  const result = {
+    counterparty_id: shrResult.counterparty_id,
+    counterparty_shr: response.shr,
+    verified: true,
+    sovereignty_level: sovereigntyLevel,
+    trust_tier: trustTier,
+    completed_at: now,
+    expires_at: shrResult.expires_at,
+    errors: []
+  };
+  return { completion, result };
+}
+function verifyCompletion(completion, session) {
+  const errors = [];
+  if (!session.their_shr) {
+    return {
+      counterparty_id: "unknown",
+      counterparty_shr: session.our_shr,
+      // placeholder
+      verified: false,
+      sovereignty_level: "unverified",
+      trust_tier: "unverified",
+      completed_at: completion.completed_at,
+      expires_at: (/* @__PURE__ */ new Date()).toISOString(),
+      errors: ["No initiator SHR in session state"]
+    };
+  }
+  const initiatorPublicKey = fromBase64url(session.their_shr.signed_by);
+  const ourNonceBytes = stringToBytes(session.our_nonce);
+  const nonceSignatureBytes = fromBase64url(completion.responder_nonce_signature);
+  const nonceSignatureValid = verify(
+    ourNonceBytes,
+    nonceSignatureBytes,
+    initiatorPublicKey
+  );
+  if (!nonceSignatureValid) {
+    errors.push("Initiator's nonce signature is invalid \u2014 possible replay or MITM");
+  }
+  const shrResult = verifySHR(session.their_shr);
+  if (!shrResult.valid) {
+    errors.push(...shrResult.errors);
+  }
+  const verified = errors.length === 0;
+  const sovereigntyLevel = verified ? shrResult.sovereignty_level : "unverified";
+  return {
+    counterparty_id: session.their_shr.body.instance_id,
+    counterparty_shr: session.their_shr,
+    verified,
+    sovereignty_level: sovereigntyLevel,
+    trust_tier: deriveTrustTier(sovereigntyLevel),
+    completed_at: completion.completed_at,
+    expires_at: session.their_shr.body.expires_at,
+    errors
+  };
+}
+function deriveTrustTier(level) {
+  switch (level) {
+    case "full":
+      return "verified-sovereign";
+    case "degraded":
+      return "verified-degraded";
+    default:
+      return "unverified";
+  }
+}
+
+// src/handshake/tools.ts
+function createHandshakeTools(config, identityManager, masterKey, auditLog) {
+  const sessions = /* @__PURE__ */ new Map();
+  const shrOpts = {
+    config,
+    identityManager,
+    masterKey
+  };
+  const tools = [
+    {
+      name: "sanctuary/handshake_initiate",
+      description: "Initiate a sovereignty handshake with a counterparty. Generates a challenge containing this instance's signed SHR and a cryptographic nonce. Send the returned challenge to the counterparty.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          identity_id: {
+            type: "string",
+            description: "Identity to use for the handshake. Defaults to primary identity."
+          }
+        }
+      },
+      handler: async (args) => {
+        const shr = generateSHR(args.identity_id, shrOpts);
+        if (typeof shr === "string") {
+          return toolResult({ error: shr });
+        }
+        const { challenge, session } = initiateHandshake(shr);
+        sessions.set(session.session_id, session);
+        auditLog.append("l4", "handshake_initiate", shr.body.instance_id);
+        return toolResult({
+          session_id: session.session_id,
+          challenge,
+          instructions: "Send the 'challenge' object to the counterparty's sanctuary/handshake_respond tool. When you receive their response, pass it to sanctuary/handshake_complete with this session_id."
+        });
+      }
+    },
+    {
+      name: "sanctuary/handshake_respond",
+      description: "Respond to an incoming sovereignty handshake challenge. Verifies the initiator's SHR, signs their nonce, and returns our SHR with a counter-nonce.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          challenge: {
+            type: "object",
+            description: "The HandshakeChallenge received from the initiator."
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to use for the response. Defaults to primary identity."
+          }
+        },
+        required: ["challenge"]
+      },
+      handler: async (args) => {
+        const challenge = args.challenge;
+        const shr = generateSHR(args.identity_id, shrOpts);
+        if (typeof shr === "string") {
+          return toolResult({ error: shr });
+        }
+        const result = respondToHandshake(
+          challenge,
+          shr,
+          identityManager,
+          masterKey,
+          args.identity_id
+        );
+        if ("error" in result) {
+          auditLog.append("l4", "handshake_respond", shr.body.instance_id, void 0, "failure");
+          return toolResult({ error: result.error });
+        }
+        sessions.set(result.session.session_id, result.session);
+        auditLog.append("l4", "handshake_respond", shr.body.instance_id);
+        return toolResult({
+          session_id: result.session.session_id,
+          response: result.response,
+          instructions: "Send the 'response' object back to the initiator. When you receive their completion, pass it to sanctuary/handshake_status with this session_id."
+        });
+      }
+    },
+    {
+      name: "sanctuary/handshake_complete",
+      description: "Complete a sovereignty handshake (initiator side). Verifies the responder's SHR and nonce signature, signs their nonce, and produces the final result.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session_id: {
+            type: "string",
+            description: "Session ID from handshake_initiate."
+          },
+          response: {
+            type: "object",
+            description: "The HandshakeResponse received from the responder."
+          }
+        },
+        required: ["session_id", "response"]
+      },
+      handler: async (args) => {
+        const sessionId = args.session_id;
+        const response = args.response;
+        const session = sessions.get(sessionId);
+        if (!session) {
+          return toolResult({ error: `No handshake session found: ${sessionId}` });
+        }
+        if (session.state !== "initiated") {
+          return toolResult({
+            error: `Session is in state '${session.state}', expected 'initiated'`
+          });
+        }
+        const result = completeHandshake(
+          response,
+          session,
+          identityManager,
+          masterKey
+        );
+        if ("error" in result) {
+          session.state = "failed";
+          auditLog.append("l4", "handshake_complete", session.our_shr.body.instance_id, void 0, "failure");
+          return toolResult({ error: result.error });
+        }
+        session.state = "completed";
+        session.their_shr = response.shr;
+        session.their_nonce = response.responder_nonce;
+        session.result = result.result;
+        auditLog.append("l4", "handshake_complete", session.our_shr.body.instance_id);
+        return toolResult({
+          completion: result.completion,
+          result: result.result,
+          instructions: "Send the 'completion' object to the responder so they can verify the handshake. The 'result' object contains the verified counterparty status and trust tier."
+        });
+      }
+    },
+    {
+      name: "sanctuary/handshake_status",
+      description: "Check the status of a handshake session, or verify a completion message (responder side).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session_id: {
+            type: "string",
+            description: "Session ID to check."
+          },
+          completion: {
+            type: "object",
+            description: "Optional: HandshakeCompletion from the initiator (responder-side verification)."
+          }
+        },
+        required: ["session_id"]
+      },
+      handler: async (args) => {
+        const sessionId = args.session_id;
+        const completion = args.completion;
+        const session = sessions.get(sessionId);
+        if (!session) {
+          return toolResult({ error: `No handshake session found: ${sessionId}` });
+        }
+        if (completion && session.role === "responder" && session.state === "responded") {
+          const result = verifyCompletion(completion, session);
+          session.state = result.verified ? "completed" : "failed";
+          session.result = result;
+          auditLog.append(
+            "l4",
+            "handshake_verify_completion",
+            session.our_shr.body.instance_id,
+            void 0,
+            result.verified ? "success" : "failure"
+          );
+          return toolResult({ result });
+        }
+        return toolResult({
+          session_id: session.session_id,
+          role: session.role,
+          state: session.state,
+          initiated_at: session.initiated_at,
+          result: session.result ?? null
+        });
+      }
+    }
+  ];
+  return { tools };
+}
+
 // src/index.ts
 init_encoding();
 
@@ -3716,12 +4452,26 @@ async function createSanctuaryServer(options) {
   const approvalChannel = new StderrApprovalChannel(policy.approval_channel);
   const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog);
   const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
+  const { tools: shrTools } = createSHRTools(
+    config,
+    identityManager,
+    masterKey,
+    auditLog
+  );
+  const { tools: handshakeTools } = createHandshakeTools(
+    config,
+    identityManager,
+    masterKey,
+    auditLog
+  );
   const allTools = [
     ...l1Tools,
     ...l2Tools,
     ...l3Tools,
     ...l4Tools,
     ...policyTools,
+    ...shrTools,
+    ...handshakeTools,
     manifestTool
   ];
   const server = createServer(allTools, { gate });
@@ -3747,6 +4497,6 @@ async function createSanctuaryServer(options) {
   return { server, config };
 }
 
-export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, CallbackApprovalChannel, CommitmentStore, FilesystemStorage, MemoryStorage, PolicyStore, ReputationStore, StateStore, StderrApprovalChannel, createSanctuaryServer, loadConfig, loadPrincipalPolicy };
+export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, CallbackApprovalChannel, CommitmentStore, FilesystemStorage, MemoryStorage, PolicyStore, ReputationStore, StateStore, StderrApprovalChannel, completeHandshake, createSanctuaryServer, generateSHR, initiateHandshake, loadConfig, loadPrincipalPolicy, respondToHandshake, verifyCompletion, verifySHR };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map
