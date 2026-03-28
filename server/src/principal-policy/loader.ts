@@ -38,6 +38,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
   tier1_always_approve: [
     "state_export",
     "state_import",
+    "state_delete",
     "identity_rotate",
     "reputation_import",
     "bootstrap_provide_guarantee",
@@ -47,7 +48,6 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "state_read",
     "state_write",
     "state_list",
-    "state_delete",
     "identity_create",
     "identity_list",
     "identity_sign",
@@ -222,6 +222,7 @@ version: 1
 tier1_always_approve:
   - state_export
   - state_import
+  - state_delete
   - identity_rotate
   - reputation_import
   - bootstrap_provide_guarantee
@@ -243,7 +244,6 @@ tier3_always_allow:
   - state_read
   - state_write
   - state_list
-  - state_delete
   - identity_create
   - identity_list
   - identity_sign
