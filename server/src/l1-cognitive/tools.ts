@@ -29,8 +29,9 @@ import type { AuditLog } from "../l2-operational/audit-log.js";
 
 /**
  * Reserved namespace prefixes — used by internal subsystems.
- * Agent-facing state tools MUST reject writes/deletes/imports to these namespaces.
- * Reads are allowed (transparency), but mutations are firewalled.
+ * Agent-facing state tools MUST reject reads, writes, deletes, lists, and
+ * imports to these namespaces. Internal subsystems access the StateStore
+ * directly, bypassing these tool-level checks.
  */
 const RESERVED_NAMESPACE_PREFIXES = [
   "_identities",
@@ -42,6 +43,10 @@ const RESERVED_NAMESPACE_PREFIXES = [
   "_reputation",
   "_escrow",
   "_guarantees",
+  "_bridge",
+  "_federation",
+  "_handshake",
+  "_shr",
 ] as const;
 
 /**
@@ -459,6 +464,15 @@ export function createL1Tools(
         required: ["namespace", "key"],
       },
       handler: async (args) => {
+        // Namespace firewall: reject reads from reserved internal namespaces
+        const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot read from reserved namespaces.`,
+          });
+        }
+
         const result = await stateStore.read(
           args.namespace as string,
           args.key as string,
@@ -499,6 +513,15 @@ export function createL1Tools(
         required: ["namespace"],
       },
       handler: async (args) => {
+        // Namespace firewall: reject listing of reserved internal namespaces
+        const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot list reserved namespaces.`,
+          });
+        }
+
         const result = await stateStore.list(
           args.namespace as string,
           args.prefix as string | undefined,

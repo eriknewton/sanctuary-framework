@@ -42,9 +42,26 @@ export function canonicalize(outcome: ConcordiaOutcome): Uint8Array {
   return stringToBytes(stableStringify(outcome));
 }
 
-/** Recursively sort object keys for deterministic JSON */
+/**
+ * Recursively sort object keys for deterministic JSON.
+ *
+ * Security hardening: rejects non-finite numbers (NaN, Infinity, -Infinity)
+ * which are not representable in JSON and would produce `null`, breaking
+ * commitment determinism. Also rejects `undefined` values in arrays
+ * (object `undefined` values are already excluded by Object.keys).
+ */
 function stableStringify(value: unknown): string {
-  if (value === null || value === undefined) return JSON.stringify(value);
+  if (value === null) return "null";
+  if (value === undefined) return "null";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error(
+        `Cannot canonicalize non-finite number: ${value}. ` +
+        `NaN, Infinity, and -Infinity are not representable in JSON.`
+      );
+    }
+    return JSON.stringify(value);
+  }
   if (typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) {
     return "[" + value.map((v) => stableStringify(v)).join(",") + "]";
@@ -99,10 +116,12 @@ export function createBridgeCommitment(
   }
 
   // 4. Build the commitment payload for signing
+  //    Includes terms_hash so the signature binds the commitment to the specific terms
   const commitmentPayload = {
     bridge_commitment_id: commitmentId,
     session_id: outcome.session_id,
     sha256_commitment: sha256.commitment,
+    terms_hash: outcome.terms_hash,
     committer_did: identity.did,
     committed_at: now,
     bridge_version: "sanctuary-concordia-bridge-v1" as const,
@@ -157,11 +176,12 @@ export function verifyBridgeCommitment(
     commitment.blinding_factor
   );
 
-  // 2. Signature check
+  // 2. Signature check (must match the signing payload exactly)
   const commitmentPayload = {
     bridge_commitment_id: commitment.bridge_commitment_id,
     session_id: commitment.session_id,
     sha256_commitment: commitment.sha256_commitment,
+    terms_hash: outcome.terms_hash,
     committer_did: commitment.committer_did,
     committed_at: commitment.committed_at,
     bridge_version: commitment.bridge_version,

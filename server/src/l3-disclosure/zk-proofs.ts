@@ -348,7 +348,7 @@ export function createRangeProof(
   // Sum proof: show that sum(2^i * C_i) - min*G has blinding factor = b
   // sum(2^i * bit_b_i) should equal b (mod ORDER)
   const sumBlinding = bitBlindings.reduce(
-    (acc, bi, i) => mod(acc + mod(BigInt(1 << i)) * bi),
+    (acc, bi, i) => mod(acc + mod(BigInt(1) << BigInt(i)) * bi),
     0n
   );
   // The difference in blinding: b - sumBlinding
@@ -404,7 +404,7 @@ export function verifyRangeProof(proof: ZKRangeProof): boolean {
     let reconstructed = RistrettoPoint.ZERO;
     for (let i = 0; i < numBits; i++) {
       const C_i = RistrettoPoint.fromHex(fromBase64url(proof.bit_commitments[i]!));
-      const weight = mod(BigInt(1 << i));
+      const weight = mod(BigInt(1) << BigInt(i));
       reconstructed = reconstructed.add(safeMultiply(C_i, weight));
     }
 

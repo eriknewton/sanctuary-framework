@@ -116,11 +116,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
       this.httpServer.listen(this.config.port, this.config.host, () => {
         if (this.authToken) {
+          // Show only a hint of the token in stderr to avoid log exposure
+          const hint = this.authToken.slice(0, 4) + "..." + this.authToken.slice(-4);
           process.stderr.write(
-            `\n  Sanctuary Principal Dashboard: ${baseUrl}/?token=${this.authToken}\n`
+            `\n  Sanctuary Principal Dashboard: ${baseUrl}\n`
           );
           process.stderr.write(
-            `  Auth token: ${this.authToken}\n\n`
+            `  Auth required (token: ${hint}). Pass ?token=<TOKEN> or Authorization: Bearer <TOKEN>.\n\n`
           );
         } else {
           process.stderr.write(
@@ -249,8 +251,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const method = req.method ?? "GET";
 
-    // CORS headers
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    // CORS headers — restrict to same-origin; the dashboard is served by this server
+    const origin = req.headers.origin;
+    const protocol = this.useTLS ? "https" : "http";
+    const selfOrigin = `${protocol}://${this.config.host}:${this.config.port}`;
+    if (origin === selfOrigin) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+    }
+    // When no origin header (same-origin requests), no CORS header needed
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 

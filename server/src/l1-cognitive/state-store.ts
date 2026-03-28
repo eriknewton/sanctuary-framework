@@ -51,7 +51,21 @@ const RESERVED_NAMESPACE_PREFIXES = [
   "_reputation",
   "_escrow",
   "_guarantees",
+  "_bridge",
+  "_federation",
+  "_handshake",
+  "_shr",
 ] as const;
+
+/**
+ * Check whether a namespace is reserved (internal subsystem use only).
+ * External callers MUST NOT read, write, list, or import these namespaces.
+ */
+export function isReservedNamespace(namespace: string): boolean {
+  return RESERVED_NAMESPACE_PREFIXES.some(
+    (prefix) => namespace === prefix || namespace.startsWith(prefix + "/")
+  );
+}
 
 /** On-disk format for an encrypted state entry */
 export interface StateEntry {

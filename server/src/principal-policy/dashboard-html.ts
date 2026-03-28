@@ -12,6 +12,7 @@
 export function generateDashboardHTML(options: {
   timeoutSeconds: number;
   serverVersion: string;
+  /** @deprecated Auth token is now read from URL query at runtime, not embedded in HTML */
   authToken?: string;
 }): string {
   return `<!DOCTYPE html>
@@ -309,7 +310,8 @@ export function generateDashboardHTML(options: {
 <script>
 (function() {
   const TIMEOUT = ${options.timeoutSeconds};
-  const AUTH_TOKEN = ${options.authToken ? `'${options.authToken}'` : "null"};
+  // Read auth token from URL query param at runtime (never embedded in HTML source)
+  const AUTH_TOKEN = new URLSearchParams(window.location.search).get('token');
   const pending = new Map();
   let auditCount = 0;
 
