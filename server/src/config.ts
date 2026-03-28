@@ -45,12 +45,18 @@ export interface SanctuaryConfig {
 
   transport: "stdio" | "http";
   http_port: number;
+
+  dashboard: {
+    enabled: boolean;
+    port: number;
+    host: string;
+  };
 }
 
 /** Default configuration */
 export function defaultConfig(): SanctuaryConfig {
   return {
-    version: "0.2.0",
+    version: "0.3.0",
     storage_path: join(homedir(), ".sanctuary"),
     state: {
       encryption: "aes-256-gcm",
@@ -80,6 +86,11 @@ export function defaultConfig(): SanctuaryConfig {
     },
     transport: "stdio",
     http_port: 3500,
+    dashboard: {
+      enabled: false,
+      port: 3501,
+      host: "127.0.0.1",
+    },
   };
 }
 
@@ -100,6 +111,15 @@ export async function loadConfig(
   }
   if (process.env.SANCTUARY_HTTP_PORT) {
     config.http_port = parseInt(process.env.SANCTUARY_HTTP_PORT, 10);
+  }
+  if (process.env.SANCTUARY_DASHBOARD_ENABLED === "true") {
+    config.dashboard.enabled = true;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_PORT) {
+    config.dashboard.port = parseInt(process.env.SANCTUARY_DASHBOARD_PORT, 10);
+  }
+  if (process.env.SANCTUARY_DASHBOARD_HOST) {
+    config.dashboard.host = process.env.SANCTUARY_DASHBOARD_HOST;
   }
 
   // Override from config file

@@ -17,6 +17,7 @@ import { createL4Tools } from "./l4-reputation/tools.js";
 import { loadPrincipalPolicy } from "./principal-policy/loader.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
 import { StderrApprovalChannel } from "./principal-policy/approval-channel.js";
+import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
 import { ApprovalGate } from "./principal-policy/gate.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
@@ -424,7 +425,24 @@ export async function createSanctuaryServer(options?: {
   const baseline = new BaselineTracker(storage, masterKey);
   await baseline.load();
 
-  const approvalChannel = new StderrApprovalChannel(policy.approval_channel);
+  // Choose approval channel: dashboard (interactive web UI) or stderr (auto-deny)
+  let approvalChannel: StderrApprovalChannel | DashboardApprovalChannel;
+  let dashboard: DashboardApprovalChannel | undefined;
+
+  if (config.dashboard.enabled) {
+    dashboard = new DashboardApprovalChannel({
+      port: config.dashboard.port,
+      host: config.dashboard.host,
+      timeout_seconds: policy.approval_channel.timeout_seconds,
+      auto_deny: policy.approval_channel.auto_deny,
+    });
+    dashboard.setDependencies({ policy, baseline, auditLog });
+    await dashboard.start();
+    approvalChannel = dashboard;
+  } else {
+    approvalChannel = new StderrApprovalChannel(policy.approval_channel);
+  }
+
   const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog);
 
   // 16. Create Principal Policy tools (read-only)
@@ -516,6 +534,8 @@ export {
   CallbackApprovalChannel,
   AutoApproveChannel,
 } from "./principal-policy/approval-channel.js";
+export { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
+export type { DashboardConfig } from "./principal-policy/dashboard.js";
 export { generateSHR } from "./shr/generator.js";
 export { verifySHR } from "./shr/verifier.js";
 export type { SignedSHR, SHRBody, SHRVerificationResult } from "./shr/types.js";

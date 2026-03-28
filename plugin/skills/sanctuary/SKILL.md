@@ -2,14 +2,15 @@
 name: sanctuary
 description: >
   Sovereignty infrastructure for agents in the agentic economy. Use when the agent needs encrypted state storage,
-  self-custodied identity, selective disclosure, portable reputation, sovereignty health reporting, or sovereignty
-  handshakes with counterparties. Triggers: sovereignty, encrypted state, identity, reputation, privacy, SHR,
-  handshake, attestation, disclosure policy.
+  self-custodied identity, selective disclosure, zero-knowledge proofs, portable reputation, sovereignty health
+  reporting, sovereignty handshakes, MCP-to-MCP federation, or principal dashboard approval.
+  Triggers: sovereignty, encrypted state, identity, reputation, privacy, SHR, handshake, attestation,
+  disclosure policy, zero-knowledge, federation, approval, dashboard.
 ---
 
 # Sanctuary Framework
 
-Sanctuary gives your agent architectural sovereignty: encrypted state, self-custodied identity, selective disclosure, portable reputation, and verifiable sovereignty posture.
+Sanctuary gives your agent architectural sovereignty: encrypted state, self-custodied identity, selective disclosure, portable reputation, zero-knowledge proofs, federation, and verifiable sovereignty posture.
 
 ## When to use Sanctuary tools
 
@@ -17,10 +18,13 @@ Use Sanctuary tools whenever your work involves:
 
 - **Storing sensitive state** — preferences, strategies, credentials, learned context. Use `sanctuary/state_write` and `sanctuary/state_read` for AES-256-GCM encrypted storage with Merkle integrity.
 - **Identity operations** — creating, signing, or verifying with cryptographic identities. Use `sanctuary/identity_create`, `sanctuary/identity_sign`, `sanctuary/identity_verify`.
-- **Proving things without revealing them** — Use `sanctuary/proof_commitment` and `sanctuary/proof_reveal` for commitment-based proofs.
+- **Proving things without revealing them** — Use `sanctuary/proof_commitment` and `sanctuary/proof_reveal` for commitment-based proofs, or `sanctuary/zk_commit`, `sanctuary/zk_prove`, `sanctuary/zk_verify` for Pedersen commitments with ZK proofs.
+- **Proving a value is in a range without revealing it** — Use `sanctuary/zk_range_prove` and `sanctuary/zk_range_verify`.
 - **Building reputation** — recording interaction outcomes as signed attestations. Use `sanctuary/reputation_record`, `sanctuary/reputation_query`, `sanctuary/reputation_export`.
+- **Sovereignty-weighted reputation** — query reputation with attestations weighted by sovereignty tier. Use `sanctuary/reputation_query_weighted`.
 - **Verifying counterparties** — presenting your sovereignty posture or verifying a counterparty's. Use `sanctuary/shr_generate` and `sanctuary/shr_verify`.
 - **Sovereignty handshakes** — mutual verification with another agent before transacting. Use `sanctuary/handshake_initiate`, `sanctuary/handshake_respond`, `sanctuary/handshake_complete`.
+- **Federation** — evaluating trust across Sanctuary instances. Use `sanctuary/federation_peers`, `sanctuary/federation_trust_evaluate`, `sanctuary/federation_status`.
 
 ## Tool categories
 
@@ -55,12 +59,18 @@ Use Sanctuary tools whenever your work involves:
 | `sanctuary/proof_reveal` | Verify a commitment against revealed value |
 | `sanctuary/disclosure_set_policy` | Set disclosure policy rules |
 | `sanctuary/disclosure_evaluate` | Evaluate a disclosure request against policy |
+| `sanctuary/zk_commit` | Create a Pedersen commitment on Ristretto255 |
+| `sanctuary/zk_prove` | Create a ZK proof of knowledge of a commitment's opening |
+| `sanctuary/zk_verify` | Verify a ZK proof of knowledge |
+| `sanctuary/zk_range_prove` | Prove a committed value is in [min, max] without revealing it |
+| `sanctuary/zk_range_verify` | Verify a ZK range proof |
 
 ### L4 — Verifiable Reputation (Attestations & Trust)
 | Tool | Purpose |
 |------|---------|
-| `sanctuary/reputation_record` | Record signed interaction attestation |
+| `sanctuary/reputation_record` | Record signed interaction attestation (sovereignty-weighted) |
 | `sanctuary/reputation_query` | Query reputation with filters |
+| `sanctuary/reputation_query_weighted` | Query reputation with sovereignty-tier weighting |
 | `sanctuary/reputation_export` | Export reputation as portable bundle |
 | `sanctuary/reputation_import` | Import reputation bundle (verify signatures) |
 | `sanctuary/bootstrap_create_escrow` | Create escrow for trust bootstrapping |
@@ -69,6 +79,13 @@ Use Sanctuary tools whenever your work involves:
 | `sanctuary/handshake_respond` | Respond to incoming handshake |
 | `sanctuary/handshake_complete` | Complete handshake (initiator side) |
 | `sanctuary/handshake_status` | Check handshake session status |
+
+### Federation (MCP-to-MCP)
+| Tool | Purpose |
+|------|---------|
+| `sanctuary/federation_peers` | List, register, or remove federation peers |
+| `sanctuary/federation_trust_evaluate` | Evaluate trust level for a federation peer |
+| `sanctuary/federation_status` | Federation subsystem status |
 
 ### System
 | Tool | Purpose |
@@ -92,8 +109,26 @@ Use Sanctuary tools whenever your work involves:
 
 ### Building portable reputation
 1. After each interaction, `sanctuary/reputation_record` — create a signed attestation
-2. Periodically `sanctuary/reputation_export` — bundle your reputation
-3. On a new platform, `sanctuary/reputation_import` — bring your track record with you
+2. Use `sanctuary/reputation_query_weighted` — see scores weighted by sovereignty tier
+3. Periodically `sanctuary/reputation_export` — bundle your reputation
+4. On a new platform, `sanctuary/reputation_import` — bring your track record with you
+
+### Zero-knowledge proofs
+1. `sanctuary/zk_commit` — create a Pedersen commitment to a secret value
+2. `sanctuary/zk_prove` — prove you know the value without revealing it
+3. `sanctuary/zk_range_prove` — prove the value is in a range without revealing it
+4. Counterparty uses `sanctuary/zk_verify` or `sanctuary/zk_range_verify` to check
+
+### Federation
+1. Complete a sovereignty handshake with a peer
+2. `sanctuary/federation_peers` with action "register" — register them as a federation peer
+3. `sanctuary/federation_trust_evaluate` — get a trust assessment (high/medium/low/none)
+
+### Principal Dashboard
+Enable the dashboard in config (`dashboard.enabled: true`) to get a web UI at `http://127.0.0.1:3501` where you can:
+- Approve or deny Tier 1 and Tier 2 operations in real time
+- Monitor the audit log live
+- View behavioral baseline and policy configuration
 
 ## Architecture notes
 
@@ -101,7 +136,9 @@ Sanctuary implements a four-layer sovereignty architecture. Every layer serves b
 
 - **L1 (Cognitive Sovereignty):** Encrypted state, self-custodied keys, Merkle integrity, Ed25519 identity
 - **L2 (Operational Isolation):** Audit logging, environment attestation, health monitoring
-- **L3 (Selective Disclosure):** Commitment-based proofs, disclosure policies
-- **L4 (Verifiable Reputation):** Signed attestations, portable reputation, trust bootstrapping, sovereignty handshakes
+- **L3 (Selective Disclosure):** Commitment-based proofs, zero-knowledge proofs (Pedersen/Ristretto255/Schnorr), disclosure policies
+- **L4 (Verifiable Reputation):** Signed attestations (sovereignty-weighted), portable reputation, trust bootstrapping, sovereignty handshakes, MCP-to-MCP federation
 
 All state is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. No plaintext ever touches persistent storage.
+
+37 MCP tools. 184 tests. Apache 2.0.

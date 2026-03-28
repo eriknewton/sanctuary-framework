@@ -198,26 +198,69 @@ Building the adoption surface: npm publish, machine-readable SHR, sovereignty ha
 
 ---
 
-## Phase 3B: Remaining Hardening (Not yet started)
+## Phase 3B: Hardening & Advanced Cryptography (Session 8)
 
-### Option A: Gate integration test (hardening)
-- End-to-end test: prompt injection scenario where agent tries state_export → gets blocked → tries unfamiliar namespace → baseline catches it
-- Acceptance test for RFC-0002
+All four Phase 3B items shipped in a single session.
 
-### Option B: Sovereignty-gated reputation tiers
-- Attestations from verified agents weighted higher
-- Tier metadata in attestation schema
-- Depends on sovereignty handshake (now complete)
+### Step 25: Sovereignty-gated reputation tiers
+- `src/l4-reputation/tiers.ts` — SovereigntyTier type ("verified-sovereign" | "verified-degraded" | "self-attested" | "unverified"), TIER_WEIGHTS (1.0, 0.8, 0.5, 0.2), resolveTier(), computeWeightedScore(), tierDistribution()
+- Automatic tier resolution from handshake results wired into reputation_record
+- `sanctuary/reputation_query_weighted` MCP tool
+- `test/l4/tiers.test.ts` — 15 tests
 
-### Option C: MCP-to-MCP federation
-- Agent-to-agent sovereignty negotiation
-- SIM exchange, mutual attestation, reputation trust evaluation
-- Requires two Sanctuary instances communicating
+### Step 26: Gate integration test (prompt injection defense)
+- `test/integration/gate-integration.test.ts` — 14 tests
+- Tier 1 blocks (state_export, reputation_import, identity_rotate, bootstrap_provide_guarantee)
+- Tier 2 anomaly catches (new namespace, new counterparty, signing frequency spike)
+- Tier 3 allows (state_read, reputation_query, monitor_health, Phase 3A/3B tools)
+- Full attack sequence simulation, approval flow test
 
-### Option D: ZK proof upgrade for L3
-- Replace commitment-only proofs with actual ZK proofs
-- RISC Zero or SP1 integration
-- Most technically complex; deferred in RFC-0001
+### Step 27: MCP-to-MCP federation
+- `src/federation/types.ts` — FederationPeer, PeerTrustEvaluation, etc.
+- `src/federation/registry.ts` — FederationRegistry: handshake-gated peer entry, multi-factor trust evaluation (sovereignty tier + handshake currency + reputation + mutual attestation count), auto-deactivation of expired peers
+- `src/federation/tools.ts` — `sanctuary/federation_peers`, `sanctuary/federation_trust_evaluate`, `sanctuary/federation_status`
+- `test/federation/federation.test.ts` — 18 tests
+
+### Step 28: ZK proof upgrade for L3
+- `src/l3-disclosure/zk-proofs.ts` — Pedersen commitments on Ristretto255 (C = v*G + b*H), Schnorr proofs of knowledge via Fiat-Shamir, bit-decomposition range proofs with CDS OR-proofs
+- `src/l3-disclosure/tools.ts` — 5 new MCP tools: `sanctuary/zk_commit`, `sanctuary/zk_prove`, `sanctuary/zk_verify`, `sanctuary/zk_range_prove`, `sanctuary/zk_range_verify`
+- `test/l3/zk-proofs.test.ts` — 16 tests
+
+**STATUS: COMPLETE** — 4 modules, 8 new source files, 4 new test files. 63 new tests. 170 total tests passing, 19 test files. 37 MCP tools (5 new ZK + 3 federation + 1 weighted reputation). Pushed to GitHub 2026-03-27. CI green.
+
+---
+
+## Phase 3C: Principal Dashboard (Session 9)
+
+Human-facing web UI for the approval gate system. Replaces stderr-only auto-deny with an interactive browser-based dashboard.
+
+### Step 29: Dashboard approval channel
+- `src/principal-policy/dashboard.ts` — DashboardApprovalChannel (implements ApprovalChannel), local HTTP server (Node built-in `http` module, no external deps), SSE for real-time push, pending request queue with promise-based blocking
+- `src/principal-policy/dashboard-html.ts` — Embedded single-page HTML/CSS/JS (dark theme, responsive, no build step, no CDN)
+
+### Step 30: Dashboard HTTP routes
+- `GET /` — Serves embedded dashboard HTML
+- `GET /events` — SSE stream (init, pending-request, request-resolved, audit-entry, baseline-update)
+- `GET /api/status` — Policy, baseline, pending count
+- `GET /api/pending` — List pending approval requests
+- `POST /api/approve/:id` — Approve a request (resolves blocking promise)
+- `POST /api/deny/:id` — Deny a request (resolves blocking promise)
+- `GET /api/audit-log` — Recent audit entries
+
+### Step 31: Dashboard integration
+- `src/config.ts` — `dashboard: { enabled, port, host }` with env var support
+- `src/index.ts` — Conditional channel: DashboardApprovalChannel (when enabled) or StderrApprovalChannel (default)
+- Localhost-only binding (127.0.0.1), no authentication needed (OS-level access)
+
+### Step 32: Dashboard tests
+- `test/principal-policy/dashboard.test.ts` — 14 tests: HTTP server, approval flow (approve, deny, timeout, concurrent requests), SSE, auto-approve mode, cleanup
+
+### Step 33: Version bump and plugin update
+- Version 0.3.0 across package.json, config.ts, router.ts
+- Plugin SKILL.md updated with all 37 tools
+- CI workflow: Node 22 + 24
+
+**STATUS: COMPLETE** — 2 new source files, 1 new test file. 14 new tests. 184 total tests passing, 20 test files. 37 MCP tools.
 
 ---
 
@@ -226,3 +269,14 @@ Building the adoption surface: npm publish, machine-readable SHR, sovereignty ha
 > An agent running in Claude Code can connect to the Sanctuary MCP Server, create an identity, write encrypted state, record interactions, export its reputation, and import it into a different harness — with zero plaintext leakage at any point.
 
 All security tests MUST pass. All conformance tests for MVS-level claims MUST pass.
+
+---
+
+## Future Work
+
+- **npm publish 0.3.0** — Ship Phase 3B/3C to npm registry
+- **Concordia bridge** — Optional integration between Sanctuary (sovereignty) and Concordia (negotiation)
+- **TEE support** — L2 isolation upgrade from process-level to hardware TEE
+- **KERI identity** — L1 identity upgrade from Ed25519-only to KERI key management
+- **Dashboard authentication** — Token-based auth for non-localhost deployments
+- **Webhook approval channel** — Approve/deny via external webhook for automation
