@@ -518,7 +518,7 @@ export class StateStore {
   async import(
     bundleBase64: string,
     conflictResolution: "skip" | "overwrite" | "version" = "skip",
-    publicKeyResolver?: (kid: string) => Uint8Array | null
+    publicKeyResolver: (kid: string) => Uint8Array | null
   ): Promise<{
     imported_keys: number;
     skipped_keys: number;
@@ -553,31 +553,29 @@ export class StateStore {
 
       for (const { key, entry } of entries) {
         // Signature verification: mandatory for all imported entries
-        if (publicKeyResolver) {
-          // Resolve the signing identity
-          const signerPublicKey = publicKeyResolver(entry.kid);
-          if (!signerPublicKey) {
-            skippedUnknownKid++;
-            skippedKeys++;
-            continue;
-          }
+        // Resolve the signing identity
+        const signerPublicKey = publicKeyResolver(entry.kid);
+        if (!signerPublicKey) {
+          skippedUnknownKid++;
+          skippedKeys++;
+          continue;
+        }
 
-          // Verify the signature against the ciphertext
-          try {
-            const ciphertextBytes = fromBase64url(entry.payload.ct);
-            const signatureBytes = fromBase64url(entry.sig);
-            const sigValid = verify(ciphertextBytes, signatureBytes, signerPublicKey);
-            if (!sigValid) {
-              skippedInvalidSig++;
-              skippedKeys++;
-              continue;
-            }
-          } catch {
-            // Malformed signature or ciphertext — reject
+        // Verify the signature against the ciphertext
+        try {
+          const ciphertextBytes = fromBase64url(entry.payload.ct);
+          const signatureBytes = fromBase64url(entry.sig);
+          const sigValid = verify(ciphertextBytes, signatureBytes, signerPublicKey);
+          if (!sigValid) {
             skippedInvalidSig++;
             skippedKeys++;
             continue;
           }
+        } catch {
+          // Malformed signature or ciphertext — reject
+          skippedInvalidSig++;
+          skippedKeys++;
+          continue;
         }
 
         const exists = await this.storage.exists(ns, key);
