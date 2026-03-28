@@ -123,6 +123,13 @@ Once connected, your agent has access to these tools:
 | `sanctuary/federation_trust_evaluate` | Evaluate trust level for a federation peer |
 | `sanctuary/federation_status` | Federation subsystem status |
 
+### Concordia Bridge
+| Tool | Description |
+|------|-------------|
+| `sanctuary/bridge_commit` | Bind a Concordia negotiation outcome to a Sanctuary L3 commitment |
+| `sanctuary/bridge_verify` | Verify a bridge commitment against a revealed outcome |
+| `sanctuary/bridge_attest` | Record a negotiation as an L4 reputation attestation |
+
 ### Meta
 | Tool | Description |
 |------|-------------|
@@ -221,6 +228,10 @@ src/
 ├── shr/                   # Machine-readable sovereignty health reports
 ├── handshake/             # Sovereignty handshake protocol
 ├── federation/            # MCP-to-MCP federation registry
+├── bridge/                # Concordia bridge (negotiation → sovereignty)
+│   ├── types.ts           # Interface contract (ConcordiaOutcome, BridgeCommitment)
+│   ├── bridge.ts          # Core: canonicalize, commit, verify
+│   └── tools.ts           # MCP tools + BridgeStore
 ├── principal-policy/      # Principal Policy (prompt injection defense)
 │   ├── types.ts           # Policy, gate, baseline type definitions
 │   ├── loader.ts          # YAML/JSON policy parser + defaults

@@ -26,6 +26,7 @@ import { toolResult } from "./router.js";
 import { createSHRTools } from "./shr/tools.js";
 import { createHandshakeTools } from "./handshake/tools.js";
 import { createFederationTools } from "./federation/tools.js";
+import { createBridgeTools } from "./bridge/tools.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
@@ -421,6 +422,15 @@ export async function createSanctuaryServer(options?: {
     handshakeResults
   );
 
+  // 14c. Create Bridge tools (Concordia integration)
+  const { tools: bridgeTools } = createBridgeTools(
+    storage,
+    masterKey,
+    identityManager,
+    auditLog,
+    handshakeResults
+  );
+
   // 15. Load Principal Policy and create approval gate
   const policy = await loadPrincipalPolicy(config.storage_path);
   const baseline = new BaselineTracker(storage, masterKey);
@@ -479,6 +489,7 @@ export async function createSanctuaryServer(options?: {
     ...shrTools,
     ...handshakeTools,
     ...federationTools,
+    ...bridgeTools,
     manifestTool,
   ];
 
@@ -574,3 +585,15 @@ export type {
   HandshakeCompletion,
   HandshakeResult,
 } from "./handshake/types.js";
+export {
+  createBridgeCommitment,
+  verifyBridgeCommitment,
+  canonicalize,
+} from "./bridge/bridge.js";
+export type {
+  ConcordiaOutcome,
+  BridgeCommitment,
+  BridgeVerificationResult,
+  BridgeAttestationRequest,
+  BridgeAttestationResult,
+} from "./bridge/types.js";

@@ -311,9 +311,34 @@ All security tests MUST pass. All conformance tests for MVS-level claims MUST pa
 
 ---
 
+## Phase 4: Concordia Bridge (Session 10)
+
+Sanctuary-side bridge hooks for Concordia negotiation protocol integration. Non-dependent: Sanctuary works without Concordia. These tools define the contract Concordia implements against.
+
+### Step 40: Bridge types and interface contract
+- `src/bridge/types.ts` — `ConcordiaOutcome` (the data Concordia sends on accept), `BridgeCommitment` (SHA-256 + optional Pedersen + Ed25519 signature), `BridgeVerificationResult` (per-check detail), `BridgeAttestationRequest`/`BridgeAttestationResult` (L4 reputation linking)
+- Bridge version: `sanctuary-concordia-bridge-v1`
+
+### Step 41: Bridge core module
+- `src/bridge/bridge.ts` — `canonicalize()` (deterministic JSON serialization with sorted keys), `createBridgeCommitment()` (SHA-256 commitment + optional Pedersen on round count + Ed25519 signature), `verifyBridgeCommitment()` (5-check verification: SHA-256, signature, session ID, terms hash, Pedersen)
+- No new cryptographic primitives — delegates to existing L3 commitment/ZK and L1 identity layers
+
+### Step 42: Bridge MCP tools and storage
+- `src/bridge/tools.ts` — `sanctuary/bridge_commit` (bind negotiation outcome to L3 commitment), `sanctuary/bridge_verify` (verify commitment against revealed outcome), `sanctuary/bridge_attest` (link negotiation to L4 reputation with sovereignty-tier weighting)
+- `BridgeStore` class: encrypted-at-rest persistence in `_bridge` namespace
+- Tier resolution via existing handshake results for automatic sovereignty weighting
+
+### Step 43: Bridge tests
+- `test/bridge/bridge.test.ts` — 17 tests: canonical serialization determinism (3), commitment creation (4), verification (7), commitment structure (3)
+- Covers: tampered terms, tampered session ID, wrong public key, tampered rounds (Pedersen), mismatched terms hash
+
+**STATUS: COMPLETE** — 3 new source files, 1 new test file. 17 new tests. 227 total tests passing, 22 test files. 40 MCP tools (3 new: bridge_commit, bridge_verify, bridge_attest).
+
+---
+
 ## Future Work
 
-- **npm publish 0.3.0** — Ship Phases 3B-3E to npm registry
-- **Concordia bridge** — Optional integration between Sanctuary (sovereignty) and Concordia (negotiation)
+- **npm publish 0.3.0** — Ship Phases 3B-4 to npm registry
+- **Concordia MCP server** — Full Concordia negotiation protocol implementation (propose, counter, accept, reject, commit, session_status)
 - **TEE support** — L2 isolation upgrade from process-level to hardware TEE
 - **KERI identity** — L1 identity upgrade from Ed25519-only to KERI key management

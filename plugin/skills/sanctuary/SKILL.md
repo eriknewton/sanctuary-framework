@@ -5,7 +5,7 @@ description: >
   self-custodied identity, selective disclosure, zero-knowledge proofs, portable reputation, sovereignty health
   reporting, sovereignty handshakes, MCP-to-MCP federation, or principal dashboard approval.
   Triggers: sovereignty, encrypted state, identity, reputation, privacy, SHR, handshake, attestation,
-  disclosure policy, zero-knowledge, federation, approval, dashboard, webhook.
+  disclosure policy, zero-knowledge, federation, approval, dashboard, webhook, concordia, bridge, negotiation.
 ---
 
 # Sanctuary Framework
@@ -25,6 +25,7 @@ Use Sanctuary tools whenever your work involves:
 - **Verifying counterparties** — presenting your sovereignty posture or verifying a counterparty's. Use `sanctuary/shr_generate` and `sanctuary/shr_verify`.
 - **Sovereignty handshakes** — mutual verification with another agent before transacting. Use `sanctuary/handshake_initiate`, `sanctuary/handshake_respond`, `sanctuary/handshake_complete`.
 - **Federation** — evaluating trust across Sanctuary instances. Use `sanctuary/federation_peers`, `sanctuary/federation_trust_evaluate`, `sanctuary/federation_status`.
+- **Concordia bridge** — binding negotiation outcomes to sovereignty infrastructure. Use `sanctuary/bridge_commit` when a Concordia `accept` fires, `sanctuary/bridge_verify` to verify commitments, `sanctuary/bridge_attest` to link negotiations to L4 reputation.
 
 ## Tool categories
 
@@ -87,6 +88,13 @@ Use Sanctuary tools whenever your work involves:
 | `sanctuary/federation_trust_evaluate` | Evaluate trust level for a federation peer |
 | `sanctuary/federation_status` | Federation subsystem status |
 
+### Concordia Bridge
+| Tool | Purpose |
+|------|---------|
+| `sanctuary/bridge_commit` | Bind a Concordia negotiation outcome to a Sanctuary L3 commitment |
+| `sanctuary/bridge_verify` | Verify a bridge commitment against a revealed outcome |
+| `sanctuary/bridge_attest` | Record a negotiation as an L4 reputation attestation |
+
 ### System
 | Tool | Purpose |
 |------|---------|
@@ -119,6 +127,11 @@ Use Sanctuary tools whenever your work involves:
 3. `sanctuary/zk_range_prove` — prove the value is in a range without revealing it
 4. Counterparty uses `sanctuary/zk_verify` or `sanctuary/zk_range_verify` to check
 
+### Concordia bridge (binding negotiations to sovereignty)
+1. When a Concordia `accept` fires: `sanctuary/bridge_commit` — create a cryptographic commitment binding the negotiation outcome
+2. Either party can later `sanctuary/bridge_verify` — verify the commitment matches the revealed outcome
+3. After negotiation completes: `sanctuary/bridge_attest` — record as a sovereignty-weighted L4 reputation attestation
+
 ### Federation
 1. Complete a sovereignty handshake with a peer
 2. `sanctuary/federation_peers` with action "register" — register them as a federation peer
@@ -149,4 +162,4 @@ Sanctuary implements a four-layer sovereignty architecture. Every layer serves b
 
 All state is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. No plaintext ever touches persistent storage.
 
-37 MCP tools. 210 tests. Three approval channels (stderr, dashboard, webhook). Apache 2.0.
+40 MCP tools. 227 tests. Three approval channels (stderr, dashboard, webhook). Concordia bridge. Apache 2.0.
