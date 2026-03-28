@@ -37,6 +37,29 @@ interface SanctuaryConfig {
     };
     transport: "stdio" | "http";
     http_port: number;
+    dashboard: {
+        enabled: boolean;
+        port: number;
+        host: string;
+        /** Bearer token for dashboard auth. If "auto", one is generated at startup. */
+        auth_token?: string;
+        /** TLS cert/key paths for HTTPS dashboard. */
+        tls?: {
+            cert_path: string;
+            key_path: string;
+        };
+    };
+    webhook: {
+        enabled: boolean;
+        /** URL to POST approval requests to */
+        url: string;
+        /** Shared secret for HMAC-SHA256 signatures */
+        secret: string;
+        /** Port for callback listener (receives approval responses) */
+        callback_port: number;
+        /** Host for callback listener */
+        callback_host: string;
+    };
 }
 /**
  * Load configuration from file, falling back to defaults.
@@ -348,6 +371,150 @@ declare class CommitmentStore {
 }
 
 /**
+ * Sanctuary MCP Server — L3 Selective Disclosure: Zero-Knowledge Proofs
+ *
+ * Upgrades the commitment-only L3 to support real zero-knowledge proofs.
+ * Uses Ristretto255 (prime-order curve group, no cofactor issues) for:
+ *
+ *   1. Pedersen commitments: C = v*G + b*H (computationally hiding, perfectly binding)
+ *   2. ZK proof of knowledge: Schnorr sigma protocol via Fiat-Shamir
+ *   3. ZK range proofs: Prove value ∈ [min, max] without revealing it
+ *
+ * Ristretto255 is available via @noble/curves/ed25519, which we already depend on.
+ * This is genuine zero-knowledge — proofs reveal nothing beyond the stated property.
+ *
+ * Architecture note:
+ * The existing commitment scheme (SHA-256 based) remains available for backward
+ * compatibility. The ZK proofs operate on a separate Pedersen commitment system
+ * that provides algebraic structure for proper ZK properties.
+ *
+ * Security invariants:
+ * - Generator H is derived via hash-to-curve (nothing-up-my-sleeve)
+ * - Blinding factors are cryptographically random (32 bytes)
+ * - Fiat-Shamir challenges use domain-separated hashing
+ * - Range proofs use a bit-decomposition approach (sound but logarithmic size)
+ */
+/** A Pedersen commitment: C = v*G + b*H */
+interface PedersenCommitment {
+    /** The commitment point (encoded as base64url) */
+    commitment: string;
+    /** The blinding factor b (base64url, 32 bytes) — keep secret */
+    blinding_factor: string;
+    /** When the commitment was created */
+    committed_at: string;
+}
+/** A non-interactive ZK proof of knowledge of a commitment's opening */
+interface ZKProofOfKnowledge {
+    /** Proof type identifier */
+    type: "schnorr-pedersen-ristretto255";
+    /** The commitment this proof is for */
+    commitment: string;
+    /** Announcement point R (base64url) */
+    announcement: string;
+    /** Response scalar s_v (base64url) */
+    response_v: string;
+    /** Response scalar s_b (base64url) */
+    response_b: string;
+    /** Proof generated at */
+    generated_at: string;
+}
+/** A ZK range proof: proves value ∈ [min, max] */
+interface ZKRangeProof {
+    /** Proof type identifier */
+    type: "range-pedersen-ristretto255";
+    /** The commitment this proof is for */
+    commitment: string;
+    /** Minimum value (inclusive) */
+    min: number;
+    /** Maximum value (inclusive) */
+    max: number;
+    /** Bit commitments for the shifted value (v - min) */
+    bit_commitments: string[];
+    /** Proofs that each bit commitment is 0 or 1 */
+    bit_proofs: Array<{
+        announcement_0: string;
+        announcement_1: string;
+        challenge_0: string;
+        challenge_1: string;
+        response_0: string;
+        response_1: string;
+    }>;
+    /** Sum proof: bit commitments sum to the value commitment */
+    sum_proof: {
+        announcement: string;
+        response: string;
+    };
+    /** Proof generated at */
+    generated_at: string;
+}
+/**
+ * Create a Pedersen commitment to a numeric value.
+ *
+ * C = v*G + b*H
+ *
+ * Properties:
+ * - Computationally hiding (under discrete log assumption)
+ * - Perfectly binding (information-theoretic)
+ * - Homomorphic: C(v1) + C(v2) = C(v1+v2) with adjusted blinding
+ *
+ * @param value - The value to commit to (integer)
+ * @returns The commitment and blinding factor
+ */
+declare function createPedersenCommitment(value: number): PedersenCommitment;
+/**
+ * Verify a Pedersen commitment against a revealed value and blinding factor.
+ *
+ * Recomputes C' = v*G + b*H and checks C' == C.
+ */
+declare function verifyPedersenCommitment(commitment: string, value: number, blindingFactor: string): boolean;
+/**
+ * Create a non-interactive ZK proof that you know the opening (v, b)
+ * of a Pedersen commitment C = v*G + b*H.
+ *
+ * Schnorr sigma protocol with Fiat-Shamir transform:
+ *   1. Pick random r_v, r_b
+ *   2. Compute R = r_v*G + r_b*H (announcement)
+ *   3. Compute e = H_FS(C || R) (challenge via Fiat-Shamir)
+ *   4. Compute s_v = r_v + e*v, s_b = r_b + e*b (responses)
+ *   5. Proof = (R, s_v, s_b)
+ *
+ * Zero-knowledge: the transcript (R, e, s_v, s_b) can be simulated
+ * without knowing (v, b), so it reveals nothing.
+ *
+ * @param value - The committed value
+ * @param blindingFactor - The blinding factor (base64url)
+ * @param commitment - The commitment (base64url)
+ */
+declare function createProofOfKnowledge(value: number, blindingFactor: string, commitment: string): ZKProofOfKnowledge;
+/**
+ * Verify a ZK proof of knowledge of a commitment's opening.
+ *
+ * Check: s_v*G + s_b*H == R + e*C
+ */
+declare function verifyProofOfKnowledge(proof: ZKProofOfKnowledge): boolean;
+/**
+ * Create a ZK range proof: prove value ∈ [min, max] without revealing value.
+ *
+ * Approach: bit-decomposition of (value - min) into n bits where 2^n > max - min.
+ * Each bit gets a Pedersen commitment and a proof it's 0 or 1.
+ * A sum proof shows the bit commitments reconstruct the original commitment
+ * (shifted by min).
+ *
+ * @param value - The committed value
+ * @param blindingFactor - The blinding factor (base64url)
+ * @param commitment - The commitment (base64url)
+ * @param min - Minimum value (inclusive)
+ * @param max - Maximum value (inclusive)
+ */
+declare function createRangeProof(value: number, blindingFactor: string, commitment: string, min: number, max: number): ZKRangeProof | {
+    error: string;
+};
+/**
+ * Verify a ZK range proof.
+ */
+declare function verifyRangeProof(proof: ZKRangeProof): boolean;
+
+/**
  * Sanctuary MCP Server — L3 Selective Disclosure: Disclosure Policies
  *
  * Disclosure policies define what an agent will and will not disclose
@@ -446,6 +613,225 @@ interface StoredIdentity extends PublicIdentity {
 }
 
 /**
+ * Sanctuary MCP Server — Sovereignty Health Report (SHR) Types
+ *
+ * Machine-readable, signed, versioned sovereignty capability advertisement.
+ * An agent presents its SHR to counterparties to prove its sovereignty posture.
+ * The SHR is signed by one of the instance's Ed25519 identities and can be
+ * independently verified by any party without trusting the presenter.
+ *
+ * SHR version: 1.0
+ */
+type LayerStatus = "active" | "degraded" | "inactive";
+type DegradationSeverity = "info" | "warning" | "critical";
+type DegradationCode = "NO_TEE" | "PROCESS_ISOLATION_ONLY" | "COMMITMENT_ONLY" | "NO_ZK_PROOFS" | "SELF_REPORTED_ATTESTATION" | "NO_SELECTIVE_DISCLOSURE" | "BASIC_SYBIL_ONLY";
+interface SHRLayerL1 {
+    status: LayerStatus;
+    encryption: string;
+    key_custody: "self" | "delegated" | "platform";
+    integrity: string;
+    identity_type: string;
+    state_portable: boolean;
+}
+interface SHRLayerL2 {
+    status: LayerStatus;
+    isolation_type: string;
+    attestation_available: boolean;
+}
+interface SHRLayerL3 {
+    status: LayerStatus;
+    proof_system: string;
+    selective_disclosure: boolean;
+}
+interface SHRLayerL4 {
+    status: LayerStatus;
+    reputation_mode: string;
+    attestation_format: string;
+    reputation_portable: boolean;
+}
+interface SHRDegradation {
+    layer: "l1" | "l2" | "l3" | "l4";
+    code: DegradationCode;
+    severity: DegradationSeverity;
+    description: string;
+    mitigation?: string;
+}
+interface SHRCapabilities {
+    handshake: boolean;
+    shr_exchange: boolean;
+    reputation_verify: boolean;
+    encrypted_channel: boolean;
+}
+/**
+ * The SHR body — the content that gets signed.
+ * Canonical form: JSON with sorted keys, no whitespace.
+ */
+interface SHRBody {
+    shr_version: "1.0";
+    instance_id: string;
+    generated_at: string;
+    expires_at: string;
+    layers: {
+        l1: SHRLayerL1;
+        l2: SHRLayerL2;
+        l3: SHRLayerL3;
+        l4: SHRLayerL4;
+    };
+    capabilities: SHRCapabilities;
+    degradations: SHRDegradation[];
+}
+/**
+ * The complete signed SHR — body + signature envelope.
+ */
+interface SignedSHR {
+    body: SHRBody;
+    signed_by: string;
+    signature: string;
+}
+interface SHRVerificationResult {
+    valid: boolean;
+    errors: string[];
+    warnings: string[];
+    sovereignty_level: "full" | "degraded" | "minimal";
+    counterparty_id: string;
+    expires_at: string;
+}
+
+/**
+ * Sanctuary MCP Server — Sovereignty Handshake Types
+ *
+ * The sovereignty handshake is a mutual verification protocol between
+ * two Sanctuary instances. Each party presents its SHR and proves
+ * liveness via nonce challenge-response.
+ *
+ * Protocol:
+ *   A → B: HandshakeChallenge (A's SHR + nonce)
+ *   B → A: HandshakeResponse (B's SHR + B's nonce + signature over A's nonce)
+ *   A → B: HandshakeCompletion (signature over B's nonce)
+ *   Result: Both hold a HandshakeResult with verified counterparty status
+ */
+
+/** Trust tier derived from sovereignty handshake */
+type TrustTier = "verified-sovereign" | "verified-degraded" | "unverified";
+/** Sovereignty level from SHR assessment */
+type SovereigntyLevel = "full" | "degraded" | "minimal" | "unverified";
+/**
+ * Step 1: Initiator sends challenge
+ */
+interface HandshakeChallenge {
+    protocol_version: "1.0";
+    shr: SignedSHR;
+    nonce: string;
+    initiated_at: string;
+}
+/**
+ * Step 2: Responder sends response
+ */
+interface HandshakeResponse {
+    protocol_version: "1.0";
+    shr: SignedSHR;
+    responder_nonce: string;
+    initiator_nonce_signature: string;
+    responded_at: string;
+}
+/**
+ * Step 3: Initiator sends completion
+ */
+interface HandshakeCompletion {
+    protocol_version: "1.0";
+    responder_nonce_signature: string;
+    completed_at: string;
+}
+/**
+ * Final result: both parties hold this after a successful handshake
+ */
+interface HandshakeResult {
+    counterparty_id: string;
+    counterparty_shr: SignedSHR;
+    verified: boolean;
+    sovereignty_level: SovereigntyLevel;
+    trust_tier: TrustTier;
+    completed_at: string;
+    expires_at: string;
+    errors: string[];
+}
+/**
+ * In-progress handshake state (stored on initiator side)
+ */
+interface HandshakeSession {
+    session_id: string;
+    role: "initiator" | "responder";
+    state: "initiated" | "responded" | "completed" | "failed";
+    our_nonce: string;
+    their_nonce?: string;
+    our_shr: SignedSHR;
+    their_shr?: SignedSHR;
+    initiated_at: string;
+    result?: HandshakeResult;
+}
+
+/**
+ * Sanctuary MCP Server — Sovereignty-Gated Reputation Tiers
+ *
+ * Attestations carry a sovereignty_tier field reflecting the signer's
+ * sovereignty posture at the time of recording. When querying or evaluating
+ * reputation, attestations from verified-sovereign agents carry more weight
+ * than those from unverified agents.
+ *
+ * Tier hierarchy (descending credibility):
+ *   1. "verified-sovereign"  — signer completed a handshake with full sovereignty
+ *   2. "verified-degraded"   — signer completed a handshake with degraded sovereignty
+ *   3. "self-attested"       — signer has a Sanctuary identity but no handshake verification
+ *   4. "unverified"          — no Sanctuary identity or sovereignty proof
+ *
+ * Weight multipliers are applied during reputation scoring. They are NOT
+ * gatekeeping — unverified attestations still count, just less.
+ */
+
+type SovereigntyTier = "verified-sovereign" | "verified-degraded" | "self-attested" | "unverified";
+/** Weight multipliers for each tier */
+declare const TIER_WEIGHTS: Record<SovereigntyTier, number>;
+/** Tier metadata embedded in attestations */
+interface TierMetadata {
+    sovereignty_tier: SovereigntyTier;
+    /** If verified, the handshake that established it */
+    handshake_completed_at?: string;
+    /** Counterparty ID from handshake (if applicable) */
+    verified_by?: string;
+}
+/**
+ * Resolve the sovereignty tier for a counterparty based on handshake history.
+ *
+ * @param counterpartyId - The counterparty's instance ID
+ * @param handshakeResults - Map of counterparty ID → most recent handshake result
+ * @param hasSanctuaryIdentity - Whether the counterparty has a known Sanctuary identity
+ * @returns TierMetadata for embedding in attestations
+ */
+declare function resolveTier(counterpartyId: string, handshakeResults: Map<string, HandshakeResult>, hasSanctuaryIdentity: boolean): TierMetadata;
+/** An attestation with its tier for weighted scoring */
+interface TieredAttestation {
+    /** The raw metric value */
+    value: number;
+    /** The sovereignty tier of the attestation signer */
+    tier: SovereigntyTier;
+}
+/**
+ * Compute a weighted reputation score from tiered attestations.
+ *
+ * Each attestation's contribution is multiplied by its tier weight.
+ * The result is normalized by total weight (not count), so adding
+ * low-tier attestations doesn't dilute high-tier ones.
+ *
+ * @param attestations - Array of value + tier pairs
+ * @returns Weighted score, or null if no attestations
+ */
+declare function computeWeightedScore(attestations: TieredAttestation[]): number | null;
+/**
+ * Compute a tier distribution summary for a set of attestations.
+ */
+declare function tierDistribution(tiers: SovereigntyTier[]): Record<SovereigntyTier, number>;
+
+/**
  * Sanctuary MCP Server — L4 Verifiable Reputation: Reputation Store
  *
  * Records interaction outcomes as signed attestations, queries aggregated
@@ -481,6 +867,8 @@ interface Attestation {
         metrics: Record<string, number>;
         context: string;
         timestamp: string;
+        /** Sovereignty tier of the signer at time of recording */
+        sovereignty_tier?: SovereigntyTier;
     };
     signature: string;
     signer: string;
@@ -552,7 +940,7 @@ declare class ReputationStore {
     /**
      * Record an interaction outcome as a signed attestation.
      */
-    record(interactionId: string, counterpartyDid: string, outcome: InteractionOutcome, context: string, identity: StoredIdentity, identityEncryptionKey: Uint8Array, counterpartyAttestation?: string): Promise<StoredAttestation>;
+    record(interactionId: string, counterpartyDid: string, outcome: InteractionOutcome, context: string, identity: StoredIdentity, identityEncryptionKey: Uint8Array, counterpartyAttestation?: string, sovereigntyTier?: SovereigntyTier): Promise<StoredAttestation>;
     /**
      * Query reputation data with filtering.
      * Returns aggregates only — not raw interaction data.
@@ -593,7 +981,137 @@ declare class ReputationStore {
      * Create a principal's guarantee for a new agent.
      */
     createGuarantee(principalIdentity: StoredIdentity, agentDid: string, scope: string, durationSeconds: number, identityEncryptionKey: Uint8Array, maxLiability?: number): Promise<Guarantee>;
+    /**
+     * Load attestations for tier-weighted scoring.
+     * Applies basic context/counterparty filtering, returns full StoredAttestations
+     * so callers can access sovereignty_tier from attestation data.
+     */
+    loadAllForTierScoring(options?: {
+        context?: string;
+        counterparty_did?: string;
+    }): Promise<StoredAttestation[]>;
     private loadAll;
+}
+
+/**
+ * Sanctuary MCP Server — Federation Types
+ *
+ * MCP-to-MCP federation enables two Sanctuary instances to:
+ *   1. Discover each other's capabilities (SIM exchange)
+ *   2. Establish mutual trust (sovereignty handshake)
+ *   3. Exchange signed reputation attestations
+ *   4. Evaluate trust for cross-instance interactions
+ *
+ * Federation operates as a protocol layer atop the handshake:
+ *   Handshake establishes trust → Federation uses that trust for ongoing operations.
+ *
+ * Key constraint: Federation MUST respect each party's sovereignty.
+ * Neither party can compel the other to share data they haven't disclosed
+ * via their disclosure policy.
+ */
+
+/** A known federation peer */
+interface FederationPeer {
+    /** The peer's instance ID (from their SHR) */
+    peer_id: string;
+    /** The peer's DID (identity) */
+    peer_did: string;
+    /** When this peer was first seen */
+    first_seen: string;
+    /** When last handshake completed */
+    last_handshake: string;
+    /** Current trust tier from most recent handshake */
+    trust_tier: SovereigntyTier;
+    /** Handshake result (for tier resolution) */
+    handshake_result: HandshakeResult;
+    /** Peer's advertised capabilities (from their SIM) */
+    capabilities: FederationCapabilities;
+    /** Whether we have a valid (non-expired) handshake */
+    active: boolean;
+}
+/** Capabilities a peer advertises for federation */
+interface FederationCapabilities {
+    /** Whether the peer supports reputation exchange */
+    reputation_exchange: boolean;
+    /** Whether the peer supports mutual attestation */
+    mutual_attestation: boolean;
+    /** Whether the peer supports encrypted channels */
+    encrypted_channel: boolean;
+    /** Supported attestation formats */
+    attestation_formats: string[];
+}
+/** Trust evaluation result for a federation peer */
+interface PeerTrustEvaluation {
+    peer_id: string;
+    /** Current sovereignty tier (from handshake) */
+    sovereignty_tier: SovereigntyTier;
+    /** Whether handshake is current (not expired) */
+    handshake_current: boolean;
+    /** Reputation summary (if available) */
+    reputation_score?: number;
+    /** How many mutual attestations we share */
+    mutual_attestation_count: number;
+    /** Overall trust assessment */
+    trust_level: "high" | "medium" | "low" | "none";
+    /** Reasoning for the assessment */
+    factors: string[];
+    /** Evaluated at */
+    evaluated_at: string;
+}
+
+/**
+ * Sanctuary MCP Server — Federation Peer Registry
+ *
+ * Manages known federation peers. Peers are discovered through handshakes
+ * and tracked for ongoing federation operations.
+ *
+ * The registry is the source of truth for:
+ * - Who we've federated with
+ * - Current trust status of each peer
+ * - Peer capabilities (what operations they support)
+ *
+ * Security invariants:
+ * - Peers are ONLY added through completed handshakes (not self-registration)
+ * - Trust tiers degrade automatically when handshakes expire
+ * - Peer data is stored encrypted under L1 sovereignty
+ */
+
+declare class FederationRegistry {
+    private peers;
+    /**
+     * Register or update a peer from a completed handshake.
+     * This is the ONLY way peers enter the registry.
+     */
+    registerFromHandshake(result: HandshakeResult, peerDid: string, capabilities?: Partial<FederationCapabilities>): FederationPeer;
+    /**
+     * Get a peer by instance ID.
+     * Automatically updates active status based on handshake expiry.
+     */
+    getPeer(peerId: string): FederationPeer | null;
+    /**
+     * List all known peers, optionally filtered by status.
+     */
+    listPeers(filter?: {
+        active_only?: boolean;
+    }): FederationPeer[];
+    /**
+     * Evaluate trust for a federation peer.
+     *
+     * Trust assessment considers:
+     * - Handshake status (current vs expired)
+     * - Sovereignty tier (verified-sovereign vs degraded vs unverified)
+     * - Reputation data (if available)
+     * - Mutual attestation history
+     */
+    evaluateTrust(peerId: string, mutualAttestationCount?: number, reputationScore?: number): PeerTrustEvaluation;
+    /**
+     * Remove a peer from the registry.
+     */
+    removePeer(peerId: string): boolean;
+    /**
+     * Get the handshake results map (for tier resolution integration).
+     */
+    getHandshakeResults(): Map<string, HandshakeResult>;
 }
 
 /**
@@ -916,6 +1434,197 @@ declare class ApprovalGate {
 declare function loadPrincipalPolicy(storagePath: string): Promise<PrincipalPolicy>;
 
 /**
+ * Sanctuary MCP Server — Principal Dashboard
+ *
+ * HTTP-based approval channel that serves a real-time web dashboard
+ * for human principals to approve/deny agent operations.
+ *
+ * Architecture:
+ * - Node.js built-in `http`/`https` modules (no Express or external deps)
+ * - SSE (Server-Sent Events) for real-time push to browser
+ * - Pending approval requests block the MCP tool call via Promise
+ * - Human clicks approve/deny in browser → POST /api/approve/:id → Promise resolves
+ * - Timeout fallback: auto-deny (or auto-approve) if no response
+ *
+ * Security invariants:
+ * - Binds to 127.0.0.1 by default (localhost only)
+ * - Optional bearer token authentication for non-localhost deployments
+ * - Optional TLS (HTTPS) via cert/key paths
+ * - All decisions are audit-logged
+ * - Agent cannot access the dashboard (it runs outside MCP stdin/stdout)
+ */
+
+interface DashboardConfig {
+    port: number;
+    host: string;
+    timeout_seconds: number;
+    auto_deny: boolean;
+    /** Bearer token for API authentication. If omitted, auth is disabled. */
+    auth_token?: string;
+    /** TLS configuration for HTTPS. If omitted, plain HTTP is used. */
+    tls?: {
+        cert_path: string;
+        key_path: string;
+    };
+}
+declare class DashboardApprovalChannel implements ApprovalChannel {
+    private config;
+    private pending;
+    private sseClients;
+    private httpServer;
+    private policy;
+    private baseline;
+    private auditLog;
+    private dashboardHTML;
+    private authToken;
+    private useTLS;
+    constructor(config: DashboardConfig);
+    /**
+     * Inject dependencies after construction.
+     * Called from index.ts after all components are initialized.
+     */
+    setDependencies(deps: {
+        policy: PrincipalPolicy;
+        baseline: BaselineTracker;
+        auditLog: AuditLog;
+    }): void;
+    /**
+     * Start the HTTP(S) server for the dashboard.
+     */
+    start(): Promise<void>;
+    /**
+     * Stop the HTTP server and clean up.
+     */
+    stop(): Promise<void>;
+    /**
+     * Request approval from the human via the dashboard.
+     * Blocks until the human approves/denies or timeout occurs.
+     */
+    requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
+    /**
+     * Verify bearer token authentication.
+     * Checks Authorization header first, falls back to ?token= query param.
+     * Returns true if auth passes, false if blocked (response already sent).
+     */
+    private checkAuth;
+    private handleRequest;
+    private serveDashboard;
+    private handleSSE;
+    private handleStatus;
+    private handlePendingList;
+    private handleAuditLog;
+    private handleDecision;
+    private broadcastSSE;
+    /**
+     * Broadcast an audit entry to connected dashboards.
+     * Called externally when audit events happen.
+     */
+    broadcastAuditEntry(entry: {
+        timestamp: string;
+        layer: string;
+        operation: string;
+        identity_id: string;
+    }): void;
+    /**
+     * Broadcast a baseline update to connected dashboards.
+     * Called externally after baseline changes.
+     */
+    broadcastBaselineUpdate(): void;
+    /** Get the number of pending requests */
+    get pendingCount(): number;
+    /** Get the number of connected SSE clients */
+    get clientCount(): number;
+}
+
+/**
+ * Sanctuary MCP Server — Webhook Approval Channel
+ *
+ * Sends approval requests to an external webhook URL and listens for
+ * callback responses. Enables integration with Slack, Discord, PagerDuty,
+ * or any HTTP-based approval workflow.
+ *
+ * Architecture:
+ * - Outbound: POST approval request to configured webhook_url
+ * - Inbound: HTTP callback server listens for POST /webhook/respond/:id
+ * - HMAC-SHA256 signatures on both outbound and inbound payloads
+ * - Timeout fallback: auto-deny (or auto-approve) if no callback received
+ *
+ * Security invariants:
+ * - All outbound payloads signed with HMAC-SHA256 (webhook_secret)
+ * - All inbound callbacks verified with same HMAC-SHA256 signature
+ * - Callback server binds to configurable host (default 127.0.0.1)
+ * - Replay protection via request ID + pending map (can't approve twice)
+ * - All decisions are audit-logged
+ */
+
+interface WebhookConfig {
+    /** URL to POST approval requests to */
+    webhook_url: string;
+    /** Shared secret for HMAC-SHA256 signatures */
+    webhook_secret: string;
+    /** Port for the callback listener */
+    callback_port: number;
+    /** Host for the callback listener (default: 127.0.0.1) */
+    callback_host: string;
+    /** Seconds to wait for a callback before timeout */
+    timeout_seconds: number;
+    /** Whether to deny (true) or approve (false) on timeout */
+    auto_deny: boolean;
+}
+/** Outbound webhook payload */
+interface WebhookPayload {
+    /** Unique request ID */
+    request_id: string;
+    /** The approval request details */
+    operation: string;
+    tier: 1 | 2;
+    reason: string;
+    context: Record<string, unknown>;
+    timestamp: string;
+    /** URL to POST the response back to */
+    callback_url: string;
+    /** Seconds until auto-resolution */
+    timeout_seconds: number;
+}
+/** Inbound callback payload */
+interface WebhookCallbackPayload {
+    /** The request ID being responded to */
+    request_id: string;
+    /** The decision */
+    decision: "approve" | "deny";
+}
+/**
+ * Generate HMAC-SHA256 signature for a payload.
+ */
+declare function signPayload(body: string, secret: string): string;
+/**
+ * Verify HMAC-SHA256 signature. Uses timing-safe comparison.
+ */
+declare function verifySignature(body: string, signature: string, secret: string): boolean;
+declare class WebhookApprovalChannel implements ApprovalChannel {
+    private config;
+    private pending;
+    private callbackServer;
+    constructor(config: WebhookConfig);
+    /**
+     * Start the callback listener server.
+     */
+    start(): Promise<void>;
+    /**
+     * Stop the callback server and clean up pending requests.
+     */
+    stop(): Promise<void>;
+    /**
+     * Request approval by POSTing to the webhook and waiting for a callback.
+     */
+    requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
+    private sendWebhook;
+    private handleCallback;
+    /** Get the number of pending requests */
+    get pendingCount(): number;
+}
+
+/**
  * Sanctuary MCP Server — L1 Cognitive Sovereignty: Tool Definitions
  *
  * MCP tool wrappers for StateStore and IdentityRoot operations.
@@ -937,91 +1646,6 @@ declare class IdentityManager {
     get(id: string): StoredIdentity | undefined;
     getDefault(): StoredIdentity | undefined;
     list(): PublicIdentity[];
-}
-
-/**
- * Sanctuary MCP Server — Sovereignty Health Report (SHR) Types
- *
- * Machine-readable, signed, versioned sovereignty capability advertisement.
- * An agent presents its SHR to counterparties to prove its sovereignty posture.
- * The SHR is signed by one of the instance's Ed25519 identities and can be
- * independently verified by any party without trusting the presenter.
- *
- * SHR version: 1.0
- */
-type LayerStatus = "active" | "degraded" | "inactive";
-type DegradationSeverity = "info" | "warning" | "critical";
-type DegradationCode = "NO_TEE" | "PROCESS_ISOLATION_ONLY" | "COMMITMENT_ONLY" | "NO_ZK_PROOFS" | "SELF_REPORTED_ATTESTATION" | "NO_SELECTIVE_DISCLOSURE" | "BASIC_SYBIL_ONLY";
-interface SHRLayerL1 {
-    status: LayerStatus;
-    encryption: string;
-    key_custody: "self" | "delegated" | "platform";
-    integrity: string;
-    identity_type: string;
-    state_portable: boolean;
-}
-interface SHRLayerL2 {
-    status: LayerStatus;
-    isolation_type: string;
-    attestation_available: boolean;
-}
-interface SHRLayerL3 {
-    status: LayerStatus;
-    proof_system: string;
-    selective_disclosure: boolean;
-}
-interface SHRLayerL4 {
-    status: LayerStatus;
-    reputation_mode: string;
-    attestation_format: string;
-    reputation_portable: boolean;
-}
-interface SHRDegradation {
-    layer: "l1" | "l2" | "l3" | "l4";
-    code: DegradationCode;
-    severity: DegradationSeverity;
-    description: string;
-    mitigation?: string;
-}
-interface SHRCapabilities {
-    handshake: boolean;
-    shr_exchange: boolean;
-    reputation_verify: boolean;
-    encrypted_channel: boolean;
-}
-/**
- * The SHR body — the content that gets signed.
- * Canonical form: JSON with sorted keys, no whitespace.
- */
-interface SHRBody {
-    shr_version: "1.0";
-    instance_id: string;
-    generated_at: string;
-    expires_at: string;
-    layers: {
-        l1: SHRLayerL1;
-        l2: SHRLayerL2;
-        l3: SHRLayerL3;
-        l4: SHRLayerL4;
-    };
-    capabilities: SHRCapabilities;
-    degradations: SHRDegradation[];
-}
-/**
- * The complete signed SHR — body + signature envelope.
- */
-interface SignedSHR {
-    body: SHRBody;
-    signed_by: string;
-    signature: string;
-}
-interface SHRVerificationResult {
-    valid: boolean;
-    errors: string[];
-    warnings: string[];
-    sovereignty_level: "full" | "degraded" | "minimal";
-    counterparty_id: string;
-    expires_at: string;
 }
 
 /**
@@ -1067,79 +1691,6 @@ declare function generateSHR(identityId: string | undefined, opts: SHRGeneratorO
 declare function verifySHR(shr: SignedSHR, now?: Date): SHRVerificationResult;
 
 /**
- * Sanctuary MCP Server — Sovereignty Handshake Types
- *
- * The sovereignty handshake is a mutual verification protocol between
- * two Sanctuary instances. Each party presents its SHR and proves
- * liveness via nonce challenge-response.
- *
- * Protocol:
- *   A → B: HandshakeChallenge (A's SHR + nonce)
- *   B → A: HandshakeResponse (B's SHR + B's nonce + signature over A's nonce)
- *   A → B: HandshakeCompletion (signature over B's nonce)
- *   Result: Both hold a HandshakeResult with verified counterparty status
- */
-
-/** Trust tier derived from sovereignty handshake */
-type TrustTier = "verified-sovereign" | "verified-degraded" | "unverified";
-/** Sovereignty level from SHR assessment */
-type SovereigntyLevel = "full" | "degraded" | "minimal" | "unverified";
-/**
- * Step 1: Initiator sends challenge
- */
-interface HandshakeChallenge {
-    protocol_version: "1.0";
-    shr: SignedSHR;
-    nonce: string;
-    initiated_at: string;
-}
-/**
- * Step 2: Responder sends response
- */
-interface HandshakeResponse {
-    protocol_version: "1.0";
-    shr: SignedSHR;
-    responder_nonce: string;
-    initiator_nonce_signature: string;
-    responded_at: string;
-}
-/**
- * Step 3: Initiator sends completion
- */
-interface HandshakeCompletion {
-    protocol_version: "1.0";
-    responder_nonce_signature: string;
-    completed_at: string;
-}
-/**
- * Final result: both parties hold this after a successful handshake
- */
-interface HandshakeResult {
-    counterparty_id: string;
-    counterparty_shr: SignedSHR;
-    verified: boolean;
-    sovereignty_level: SovereigntyLevel;
-    trust_tier: TrustTier;
-    completed_at: string;
-    expires_at: string;
-    errors: string[];
-}
-/**
- * In-progress handshake state (stored on initiator side)
- */
-interface HandshakeSession {
-    session_id: string;
-    role: "initiator" | "responder";
-    state: "initiated" | "responded" | "completed" | "failed";
-    our_nonce: string;
-    their_nonce?: string;
-    our_shr: SignedSHR;
-    their_shr?: SignedSHR;
-    initiated_at: string;
-    result?: HandshakeResult;
-}
-
-/**
  * Sanctuary MCP Server — Sovereignty Handshake Protocol
  *
  * Core handshake logic: initiate, respond, complete.
@@ -1182,6 +1733,188 @@ declare function completeHandshake(response: HandshakeResponse, session: Handsha
 declare function verifyCompletion(completion: HandshakeCompletion, session: HandshakeSession): HandshakeResult;
 
 /**
+ * Sanctuary MCP Server — Concordia Bridge: Type Definitions
+ *
+ * Defines the interface contract between the Concordia negotiation protocol
+ * and Sanctuary's sovereignty infrastructure. This is the Sanctuary side of
+ * the bridge — when Concordia is present, its `accept` can trigger a
+ * Sanctuary commitment for cryptographic binding. When Concordia is absent,
+ * these types and tools still function independently.
+ *
+ * Design principle: the bridge is additive, never required. Sanctuary and
+ * Concordia remain non-dependent. These types define the contract Concordia
+ * implements against, not a dependency Sanctuary requires.
+ */
+
+/**
+ * Concordia negotiation outcome — the data Concordia sends when an
+ * `accept` triggers a Sanctuary commitment.
+ *
+ * This type is defined by Sanctuary (the receiver) to specify the
+ * contract Concordia must fulfill. Field names align with Concordia's
+ * protocol semantics.
+ */
+interface ConcordiaOutcome {
+    /** Concordia session identifier */
+    session_id: string;
+    /** Protocol version (e.g., "concordia-v1") */
+    protocol_version: string;
+    /** DID of the party who proposed the accepted terms */
+    proposer_did: string;
+    /** DID of the party who accepted */
+    acceptor_did: string;
+    /** The accepted terms — opaque to Sanctuary, meaningful to Concordia */
+    terms: Record<string, unknown>;
+    /** SHA-256 hash of the canonical terms serialization (computed by Concordia) */
+    terms_hash: string;
+    /** Number of rounds in the negotiation (propose/counter cycles) */
+    rounds: number;
+    /** ISO 8601 timestamp when accept was issued */
+    accepted_at: string;
+    /** Optional: Concordia session receipt (signed transcript) */
+    session_receipt?: string;
+}
+/**
+ * A Sanctuary commitment binding a Concordia negotiation outcome.
+ *
+ * This is the cryptographic anchor: a SHA-256 commitment over the
+ * canonical serialization of the ConcordiaOutcome, plus a Pedersen
+ * commitment if ZK proofs are needed (e.g., proving negotiation
+ * took ≤ N rounds without revealing exact count).
+ */
+interface BridgeCommitment {
+    /** Unique bridge commitment identifier */
+    bridge_commitment_id: string;
+    /** The Concordia session this commitment binds */
+    session_id: string;
+    /** SHA-256 commitment: hash(canonical_outcome || blinding_factor) */
+    sha256_commitment: string;
+    /** Blinding factor for the SHA-256 commitment (base64url) */
+    blinding_factor: string;
+    /** DID of the Sanctuary identity that created this commitment */
+    committer_did: string;
+    /** Ed25519 signature over the commitment by the committer */
+    signature: string;
+    /** Optional: Pedersen commitment over the round count (for ZK range proofs) */
+    pedersen_commitment?: {
+        commitment: string;
+        blinding_factor: string;
+    };
+    /** ISO 8601 timestamp */
+    committed_at: string;
+    /** Protocol metadata */
+    bridge_version: "sanctuary-concordia-bridge-v1";
+}
+/** Result of verifying a bridge commitment against a revealed outcome */
+interface BridgeVerificationResult {
+    /** Whether the commitment matches the revealed outcome */
+    valid: boolean;
+    /** Which checks passed/failed */
+    checks: {
+        sha256_match: boolean;
+        signature_valid: boolean;
+        session_id_match: boolean;
+        terms_hash_match: boolean;
+        pedersen_match?: boolean;
+    };
+    /** The commitment that was verified */
+    bridge_commitment_id: string;
+    /** ISO 8601 timestamp of verification */
+    verified_at: string;
+}
+/**
+ * A bridge attestation links a Concordia negotiation to Sanctuary's
+ * L4 reputation system. When a negotiation completes successfully,
+ * both the commitment (L3) and the reputation attestation (L4) are
+ * recorded — the commitment proves the terms were agreed, the
+ * attestation feeds the sovereignty-weighted reputation score.
+ */
+interface BridgeAttestationRequest {
+    /** The bridge commitment ID that anchors this attestation */
+    bridge_commitment_id: string;
+    /** Concordia session ID */
+    session_id: string;
+    /** DID of the counterparty in the negotiation */
+    counterparty_did: string;
+    /** Negotiation outcome for reputation scoring */
+    outcome_result: "completed" | "partial" | "failed" | "disputed";
+    /** Optional metrics (e.g., rounds, response_time_ms, terms_complexity) */
+    metrics?: Record<string, number>;
+    /** Identity to sign the attestation (uses default if omitted) */
+    identity_id?: string;
+}
+/** Result of creating a bridge attestation */
+interface BridgeAttestationResult {
+    /** The L4 attestation ID created */
+    attestation_id: string;
+    /** The bridge commitment ID that anchors it */
+    bridge_commitment_id: string;
+    /** Concordia session ID */
+    session_id: string;
+    /** Sovereignty tier applied to the attestation */
+    sovereignty_tier: SovereigntyTier;
+    /** ISO 8601 timestamp */
+    attested_at: string;
+}
+
+/**
+ * Sanctuary MCP Server — Concordia Bridge: Core Module
+ *
+ * Implements the Sanctuary side of the Concordia bridge:
+ * 1. bridge_commit — Create a cryptographic commitment binding a negotiation outcome
+ * 2. bridge_verify — Verify a commitment against a revealed outcome
+ * 3. bridge_attest — Link a negotiation to L4 reputation via the commitment
+ *
+ * The bridge composes L3 (selective disclosure) and L4 (verifiable reputation)
+ * to serve negotiation-specific needs. It introduces no new cryptographic
+ * primitives — everything delegates to the existing L3 commitment/ZK layer
+ * and L4 reputation store.
+ *
+ * Non-dependency principle: this module can be used without Concordia
+ * running. Any system that provides a ConcordiaOutcome-shaped object
+ * can create bridge commitments. Concordia is the expected caller, but
+ * the interface is protocol-agnostic.
+ */
+
+/**
+ * Produce a canonical byte representation of a ConcordiaOutcome.
+ * Sorts all keys recursively to ensure determinism.
+ */
+declare function canonicalize(outcome: ConcordiaOutcome): Uint8Array;
+/**
+ * Create a cryptographic commitment binding a Concordia negotiation outcome
+ * to Sanctuary's L3 proof layer.
+ *
+ * Creates:
+ * 1. A SHA-256 commitment over the canonical outcome (always)
+ * 2. A Pedersen commitment over the round count (optional, for ZK range proofs)
+ * 3. An Ed25519 signature over the commitment by the committer's identity
+ *
+ * @param outcome - The Concordia negotiation outcome to bind
+ * @param identity - The Sanctuary identity creating the commitment
+ * @param identityEncryptionKey - Key to decrypt the identity's private key
+ * @param includePedersen - Whether to create a Pedersen commitment on round count
+ * @returns The bridge commitment
+ */
+declare function createBridgeCommitment(outcome: ConcordiaOutcome, identity: StoredIdentity, identityEncryptionKey: Uint8Array, includePedersen?: boolean): BridgeCommitment;
+/**
+ * Verify a bridge commitment against a revealed Concordia outcome.
+ *
+ * Checks:
+ * 1. SHA-256 commitment matches the canonical outcome + blinding factor
+ * 2. Ed25519 signature is valid for the committer's public key
+ * 3. Session IDs match
+ * 4. Terms hash matches (Concordia's own hash of the terms)
+ * 5. Pedersen commitment matches round count (if present)
+ *
+ * @param commitment - The bridge commitment to verify
+ * @param outcome - The revealed Concordia outcome
+ * @param committerPublicKey - The committer's Ed25519 public key
+ * @returns Verification result with per-check detail
+ */
+declare function verifyBridgeCommitment(commitment: BridgeCommitment, outcome: ConcordiaOutcome, committerPublicKey: Uint8Array): BridgeVerificationResult;
+
+/**
  * Sanctuary MCP Server — Main Entry Point
  *
  * Initializes and exports the Sanctuary MCP server.
@@ -1204,4 +1937,4 @@ declare function createSanctuaryServer(options?: {
     storage?: StorageBackend;
 }): Promise<SanctuaryServer>;
 
-export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, CallbackApprovalChannel, CommitmentStore, FilesystemStorage, type GateResult, type HandshakeChallenge, type HandshakeCompletion, type HandshakeResponse, type HandshakeResult, MemoryStorage, PolicyStore, type PrincipalPolicy, ReputationStore, type SHRBody, type SHRVerificationResult, type SanctuaryConfig, type SanctuaryServer, type SignedSHR, StateStore, StderrApprovalChannel, completeHandshake, createSanctuaryServer, generateSHR, initiateHandshake, loadConfig, loadPrincipalPolicy, respondToHandshake, verifyCompletion, verifySHR };
+export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, type BridgeAttestationRequest, type BridgeAttestationResult, type BridgeCommitment, type BridgeVerificationResult, CallbackApprovalChannel, CommitmentStore, type ConcordiaOutcome, DashboardApprovalChannel, type DashboardConfig, type FederationCapabilities, type FederationPeer, FederationRegistry, FilesystemStorage, type GateResult, type HandshakeChallenge, type HandshakeCompletion, type HandshakeResponse, type HandshakeResult, MemoryStorage, type PedersenCommitment, type PeerTrustEvaluation, PolicyStore, type PrincipalPolicy, ReputationStore, type SHRBody, type SHRVerificationResult, type SanctuaryConfig, type SanctuaryServer, type SignedSHR, type SovereigntyTier, StateStore, StderrApprovalChannel, TIER_WEIGHTS, type TierMetadata, type TieredAttestation, WebhookApprovalChannel, type WebhookCallbackPayload, type WebhookConfig, type WebhookPayload, type ZKProofOfKnowledge, type ZKRangeProof, canonicalize, completeHandshake, computeWeightedScore, createBridgeCommitment, createPedersenCommitment, createProofOfKnowledge, createRangeProof, createSanctuaryServer, generateSHR, initiateHandshake, loadConfig, loadPrincipalPolicy, resolveTier, respondToHandshake, signPayload, tierDistribution, verifyBridgeCommitment, verifyCompletion, verifyPedersenCommitment, verifyProofOfKnowledge, verifyRangeProof, verifySHR, verifySignature };
