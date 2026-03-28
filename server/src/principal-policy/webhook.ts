@@ -41,8 +41,8 @@ export interface WebhookConfig {
   callback_host: string;
   /** Seconds to wait for a callback before timeout */
   timeout_seconds: number;
-  /** Whether to deny (true) or approve (false) on timeout */
-  auto_deny: boolean;
+  /** SEC-002: auto_deny is always true. Field retained for interface compat but ignored. */
+  auto_deny?: boolean;
 }
 
 interface PendingWebhookRequest {
@@ -176,7 +176,8 @@ export class WebhookApprovalChannel implements ApprovalChannel {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         const response: ApprovalResponse = {
-          decision: this.config.auto_deny ? "deny" : "approve",
+          // SEC-002: Timeout ALWAYS denies. No configuration can change this.
+          decision: "deny",
           decided_at: new Date().toISOString(),
           decided_by: "timeout",
         };

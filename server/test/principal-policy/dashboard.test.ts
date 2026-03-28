@@ -164,9 +164,9 @@ describe("Principal Dashboard", () => {
     });
   });
 
-  // ── Auto-approve mode ────────────────────────────────────────────────
+  // ── SEC-002: auto_deny false is ignored ─────────────────────────────
 
-  describe("Auto-approve mode", () => {
+  describe("SEC-002: auto_deny false is ignored", () => {
     let approvalDashboard: DashboardApprovalChannel;
     let approvePort: number;
 
@@ -176,7 +176,7 @@ describe("Principal Dashboard", () => {
         port: approvePort,
         host: "127.0.0.1",
         timeout_seconds: 1,
-        auto_deny: false, // auto-approve on timeout
+        auto_deny: false, // SEC-002: this is now ignored
       });
       await approvalDashboard.start();
     });
@@ -185,7 +185,7 @@ describe("Principal Dashboard", () => {
       await approvalDashboard.stop();
     });
 
-    it("auto-approves on timeout when auto_deny is false", async () => {
+    it("denies on timeout even when auto_deny is false (SEC-002)", async () => {
       const request: ApprovalRequest = {
         operation: "state_export",
         tier: 1,
@@ -194,7 +194,7 @@ describe("Principal Dashboard", () => {
         timestamp: new Date().toISOString(),
       };
       const response = await approvalDashboard.requestApproval(request);
-      expect(response.decision).toBe("approve");
+      expect(response.decision).toBe("deny");
       expect(response.decided_by).toBe("timeout");
     }, 5000);
   });

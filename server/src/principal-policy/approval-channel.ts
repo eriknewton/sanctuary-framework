@@ -56,19 +56,13 @@ export class StderrApprovalChannel implements ApprovalChannel {
     // Auto-allow means the prompt is informational (log mode).
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    if (this.config.auto_deny) {
-      return {
-        decision: "deny",
-        decided_at: new Date().toISOString(),
-        decided_by: "timeout",
-      };
-    } else {
-      return {
-        decision: "approve",
-        decided_at: new Date().toISOString(),
-        decided_by: "auto",
-      };
-    }
+    // SEC-002: Timeout ALWAYS denies. No configuration can change this.
+    // This is a hard security invariant — see CLAUDE.md §"WHAT THESE TOOLS MUST NEVER DO" #5.
+    return {
+      decision: "deny",
+      decided_at: new Date().toISOString(),
+      decided_by: "timeout",
+    };
   }
 
   private formatPrompt(request: ApprovalRequest): string {
@@ -95,9 +89,7 @@ export class StderrApprovalChannel implements ApprovalChannel {
         (line) => `║    ${line.padEnd(60)}║`
       ),
       "║                                                                  ║",
-      this.config.auto_deny
-        ? "║  Auto-denying (configure approval_channel.auto_deny to change)  ║"
-        : "║  Auto-approving (informational mode)                            ║",
+      "║  Auto-denying on timeout (hardcoded — not configurable)          ║",
       "╚══════════════════════════════════════════════════════════════════╝",
       "",
     ].join("\n");

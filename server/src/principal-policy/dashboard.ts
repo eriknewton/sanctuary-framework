@@ -35,7 +35,8 @@ export interface DashboardConfig {
   port: number;
   host: string;
   timeout_seconds: number;
-  auto_deny: boolean;
+  /** SEC-002: auto_deny is always true. Field retained for interface compat but ignored. */
+  auto_deny?: boolean;
   /** Bearer token for API authentication. If omitted, auth is disabled. */
   auth_token?: string;
   /** TLS configuration for HTTPS. If omitted, plain HTTP is used. */
@@ -181,7 +182,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         const response: ApprovalResponse = {
-          decision: this.config.auto_deny ? "deny" : "approve",
+          // SEC-002: Timeout ALWAYS denies. No configuration can change this.
+          decision: "deny",
           decided_at: new Date().toISOString(),
           decided_by: "timeout",
         };
@@ -329,7 +331,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         approval_channel: {
           type: this.policy.approval_channel.type,
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
-          auto_deny: this.policy.approval_channel.auto_deny,
+          auto_deny: true, // SEC-002: hardcoded, not configurable
         },
       };
     }
@@ -374,7 +376,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         approval_channel: {
           type: this.policy.approval_channel.type,
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
-          auto_deny: this.policy.approval_channel.auto_deny,
+          auto_deny: true, // SEC-002: hardcoded, not configurable
         },
       };
     }

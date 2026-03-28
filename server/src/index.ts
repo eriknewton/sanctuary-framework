@@ -452,7 +452,7 @@ export async function createSanctuaryServer(options?: {
       port: config.dashboard.port,
       host: config.dashboard.host,
       timeout_seconds: policy.approval_channel.timeout_seconds,
-      auto_deny: policy.approval_channel.auto_deny,
+      // SEC-002: auto_deny removed — timeout always denies
       auth_token: authToken,
       tls: config.dashboard.tls,
     });
@@ -466,7 +466,7 @@ export async function createSanctuaryServer(options?: {
       callback_port: config.webhook.callback_port,
       callback_host: config.webhook.callback_host,
       timeout_seconds: policy.approval_channel.timeout_seconds,
-      auto_deny: policy.approval_channel.auto_deny,
+      // SEC-002: auto_deny removed — timeout always denies
     });
     await webhook.start();
     approvalChannel = webhook;
