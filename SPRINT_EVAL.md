@@ -625,3 +625,19 @@ No other files touched. ✓
 ### Condition for Upgrade to PASS
 
 **One condition:** Make `publicKeyResolver` a required parameter in `StateStore.import()`. Remove the `?` from line 521 and remove the `if (publicKeyResolver)` guard at line 556. If backward compatibility is needed for test helpers or internal use, callers that intentionally skip verification should pass an explicit no-op resolver (e.g., `() => null`) — making the bypass visible and intentional rather than silent. This aligns the API with the sprint contract's "mandatory, not optional" requirement and with CLAUDE.md constraint 5 ("Never silently degrade to a less-secure behavior on error").
+
+### Follow-Up: Condition Resolved — Upgraded to PASS
+
+**Re-check Date:** 2026-03-28
+**Condition Fix Commit:** `94a8567`
+
+All four sub-conditions verified:
+
+1. **(a) `?` removed from parameter declaration:** `state-store.ts:521` declares `publicKeyResolver: (kid: string) => Uint8Array | null` — no optional marker. TypeScript will reject any caller that omits the argument at compile time. ✓
+2. **(b) `if (publicKeyResolver)` guard removed:** Line 557 calls `publicKeyResolver(entry.kid)` unconditionally — no existence check wrapping the verification block. Verification executes for every entry on every import. ✓
+3. **(c) All callers pass the resolver:** The single production caller (`tools.ts:622-626`) passes `publicKeyResolver`. All 5 test callers in `import-verifies-signatures.test.ts` pass a resolver. No caller omits it. ✓
+4. **(d) No code path where import succeeds without verification:** Every entry in the `for` loop at line 554 must pass both `publicKeyResolver` resolution (line 557) and `verify()` (line 568) before reaching the write path at line 581. Entries failing either check are rejected via `continue`. The reserved-namespace skip (line 546) rejects entries — it does not import them. There is no path from entry to storage that bypasses signature verification. ✓
+
+Full test suite: **252/252 pass** (25 files, 19.90s). No regressions.
+
+**Grade: PASS** — condition fully closed. SEC-005 upgraded from CONDITIONAL PASS to PASS.
