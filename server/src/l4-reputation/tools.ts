@@ -11,17 +11,29 @@ import { ReputationStore, type InteractionOutcome } from "./reputation-store.js"
 import type { IdentityManager } from "../l1-cognitive/tools.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { HandshakeResult } from "../handshake/types.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
+import {
+  resolveTier,
+  computeWeightedScore,
+  tierDistribution,
+  TIER_WEIGHTS,
+  type TieredAttestation,
+  type SovereigntyTier,
+} from "./tiers.js";
 
 export function createL4Tools(
   storage: StorageBackend,
   masterKey: Uint8Array,
   identityManager: IdentityManager,
-  auditLog: AuditLog
+  auditLog: AuditLog,
+  handshakeResults?: Map<string, HandshakeResult>
 ): { tools: ToolDefinition[]; reputationStore: ReputationStore } {
   const reputationStore = new ReputationStore(storage, masterKey);
   const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  // Default to empty map if no handshake results provided
+  const hsResults = handshakeResults ?? new Map<string, HandshakeResult>();
 
   const tools: ToolDefinition[] = [
     // ─── Reputation Recording ─────────────────────────────────────────
@@ -92,14 +104,22 @@ export function createL4Tools(
         const outcome = args.outcome as InteractionOutcome;
         const context = (args.context as string) ?? "general";
 
+        // Resolve sovereignty tier for the counterparty
+        const counterpartyDid = args.counterparty_did as string;
+        const hasSanctuaryIdentity = identityManager.list().some(
+          (id) => identityManager.get(id.identity_id)?.did === counterpartyDid
+        );
+        const tierMeta = resolveTier(counterpartyDid, hsResults, hasSanctuaryIdentity);
+
         const stored = await reputationStore.record(
           args.interaction_id as string,
-          args.counterparty_did as string,
+          counterpartyDid,
           outcome,
           context,
           identity,
           identityEncryptionKey,
-          args.counterparty_attestation as string | undefined
+          args.counterparty_attestation as string | undefined,
+          tierMeta.sovereignty_tier
         );
 
         auditLog.append("l4", "reputation_record", identity.identity_id, {
@@ -107,6 +127,7 @@ export function createL4Tools(
           outcome_type: outcome.type,
           outcome_result: outcome.result,
           context,
+          sovereignty_tier: tierMeta.sovereignty_tier,
         });
 
         return toolResult({
@@ -114,6 +135,7 @@ export function createL4Tools(
           interaction_id: stored.attestation.data.interaction_id,
           self_attestation: stored.attestation.signature,
           counterparty_confirmed: stored.counterparty_confirmed,
+          sovereignty_tier: tierMeta.sovereignty_tier,
           context,
           recorded_at: stored.recorded_at,
         });
@@ -305,6 +327,81 @@ export function createL4Tools(
           invalid_attestations: result.invalid,
           contexts: result.contexts,
           imported_at: new Date().toISOString(),
+        });
+      },
+    },
+
+    // ─── Sovereignty-Weighted Query ──────────────────────────────────
+
+    {
+      name: "sanctuary/reputation_query_weighted",
+      description:
+        "Query reputation with sovereignty-weighted scoring. " +
+        "Attestations from verified-sovereign agents carry full weight (1.0); " +
+        "unverified attestations carry reduced weight (0.2). " +
+        "Returns both the weighted score and tier distribution.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          metric: {
+            type: "string",
+            description: "Which metric to compute the weighted score for",
+          },
+          context: {
+            type: "string",
+            description: "Filter by context/domain",
+          },
+          counterparty_did: {
+            type: "string",
+            description: "Filter by counterparty",
+          },
+        },
+        required: ["metric"],
+      },
+      handler: async (args) => {
+        const summary = await reputationStore.query({
+          context: args.context as string | undefined,
+          counterparty_did: args.counterparty_did as string | undefined,
+        });
+
+        // Get the raw attestations for tier-aware scoring
+        // We use the internal loadAllForTierScoring method
+        const allAttestations = await reputationStore.loadAllForTierScoring({
+          context: args.context as string | undefined,
+          counterparty_did: args.counterparty_did as string | undefined,
+        });
+
+        const metric = args.metric as string;
+
+        // Build tiered attestations for scoring
+        const tieredAttestations: TieredAttestation[] = allAttestations
+          .filter((a) => a.attestation.data.metrics[metric] !== undefined)
+          .map((a) => ({
+            value: a.attestation.data.metrics[metric]!,
+            tier: (a.attestation.data.sovereignty_tier ?? "unverified") as SovereigntyTier,
+          }));
+
+        const weightedScore = computeWeightedScore(tieredAttestations);
+
+        // Compute tier distribution
+        const tiers = allAttestations.map(
+          (a) => (a.attestation.data.sovereignty_tier ?? "unverified") as SovereigntyTier
+        );
+        const dist = tierDistribution(tiers);
+
+        auditLog.append("l4", "reputation_query_weighted", "system", {
+          metric,
+          attestation_count: tieredAttestations.length,
+          weighted_score: weightedScore,
+        });
+
+        return toolResult({
+          metric,
+          weighted_score: weightedScore,
+          attestation_count: tieredAttestations.length,
+          tier_distribution: dist,
+          tier_weights: TIER_WEIGHTS,
+          unweighted_summary: summary,
         });
       },
     },

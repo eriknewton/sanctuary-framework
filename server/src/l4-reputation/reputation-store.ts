@@ -27,6 +27,7 @@ import {
 import { randomBytes } from "../core/random.js";
 import { sign, verify } from "../core/identity.js";
 import type { StoredIdentity } from "../core/identity.js";
+import type { SovereigntyTier } from "./tiers.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -50,6 +51,8 @@ export interface Attestation {
     metrics: Record<string, number>;
     context: string;
     timestamp: string;
+    /** Sovereignty tier of the signer at time of recording */
+    sovereignty_tier?: SovereigntyTier;
   };
   signature: string;
   signer: string;
@@ -191,13 +194,14 @@ export class ReputationStore {
     context: string,
     identity: StoredIdentity,
     identityEncryptionKey: Uint8Array,
-    counterpartyAttestation?: string
+    counterpartyAttestation?: string,
+    sovereigntyTier?: SovereigntyTier
   ): Promise<StoredAttestation> {
     const attestationId = `att-${Date.now()}-${toBase64url(randomBytes(8))}`;
     const now = new Date().toISOString();
 
     // Build the attestation data
-    const attestationData = {
+    const attestationData: Attestation["data"] = {
       interaction_id: interactionId,
       participant_did: identity.did,
       counterparty_did: counterpartyDid,
@@ -206,6 +210,7 @@ export class ReputationStore {
       metrics: outcome.metrics ?? {},
       context,
       timestamp: now,
+      sovereignty_tier: sovereigntyTier,
     };
 
     // Sign the attestation data
@@ -530,6 +535,31 @@ export class ReputationStore {
     );
 
     return guarantee;
+  }
+
+  // ─── Tier-Aware Access ───────────────────────────────────────────────
+
+  /**
+   * Load attestations for tier-weighted scoring.
+   * Applies basic context/counterparty filtering, returns full StoredAttestations
+   * so callers can access sovereignty_tier from attestation data.
+   */
+  async loadAllForTierScoring(options?: {
+    context?: string;
+    counterparty_did?: string;
+  }): Promise<StoredAttestation[]> {
+    let all = await this.loadAll();
+
+    if (options?.context) {
+      all = all.filter((a) => a.attestation.data.context === options.context);
+    }
+    if (options?.counterparty_did) {
+      all = all.filter(
+        (a) => a.attestation.data.counterparty_did === options.counterparty_did
+      );
+    }
+
+    return all;
   }
 
   // ─── Internal ─────────────────────────────────────────────────────────

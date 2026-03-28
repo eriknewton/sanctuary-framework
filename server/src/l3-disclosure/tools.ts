@@ -18,6 +18,14 @@ import {
 } from "./policies.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
+import {
+  createPedersenCommitment,
+  verifyPedersenCommitment,
+  createProofOfKnowledge,
+  verifyProofOfKnowledge,
+  createRangeProof,
+  verifyRangeProof,
+} from "./zk-proofs.js";
 
 export function createL3Tools(
   storage: StorageBackend,
@@ -289,6 +297,225 @@ export function createL3Tools(
             withholding > 0
               ? `Withholding ${withholding} of ${requestedFields.length} requested fields per policy "${policy.policy_name}"`
               : `All ${requestedFields.length} fields may be disclosed per policy "${policy.policy_name}"`,
+        });
+      },
+    },
+
+    // ─── ZK Proof Tools ───────────────────────────────────────────────────
+
+    {
+      name: "sanctuary/zk_commit",
+      description:
+        "Create a Pedersen commitment to a numeric value on Ristretto255. " +
+        "Unlike SHA-256 commitments, Pedersen commitments support zero-knowledge proofs: " +
+        "you can prove properties about the committed value without revealing it.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "number",
+            description: "The integer value to commit to",
+          },
+        },
+        required: ["value"],
+      },
+      handler: async (args) => {
+        const value = args.value as number;
+
+        if (!Number.isInteger(value)) {
+          return toolResult({ error: "Value must be an integer." });
+        }
+
+        const commitment = createPedersenCommitment(value);
+
+        auditLog.append("l3", "zk_commit", "system", {
+          commitment_hash: commitment.commitment.slice(0, 16) + "...",
+        });
+
+        return toolResult({
+          commitment: commitment.commitment,
+          blinding_factor: commitment.blinding_factor,
+          committed_at: commitment.committed_at,
+          proof_system: "pedersen-ristretto255",
+          note: "Store the blinding_factor securely. Use zk_prove to create proofs about this commitment.",
+        });
+      },
+    },
+
+    {
+      name: "sanctuary/zk_prove",
+      description:
+        "Create a zero-knowledge proof of knowledge for a Pedersen commitment. " +
+        "Proves you know the value and blinding factor without revealing either. " +
+        "Uses a Schnorr sigma protocol with Fiat-Shamir transform.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "number",
+            description: "The committed value (integer)",
+          },
+          blinding_factor: {
+            type: "string",
+            description: "The blinding factor from zk_commit (base64url)",
+          },
+          commitment: {
+            type: "string",
+            description: "The Pedersen commitment (base64url)",
+          },
+        },
+        required: ["value", "blinding_factor", "commitment"],
+      },
+      handler: async (args) => {
+        const value = args.value as number;
+        const blindingFactor = args.blinding_factor as string;
+        const commitment = args.commitment as string;
+
+        // Verify the commitment first
+        if (!verifyPedersenCommitment(commitment, value, blindingFactor)) {
+          return toolResult({
+            error: "The provided value and blinding factor do not match the commitment.",
+          });
+        }
+
+        const proof = createProofOfKnowledge(value, blindingFactor, commitment);
+
+        auditLog.append("l3", "zk_prove", "system", {
+          proof_type: proof.type,
+          commitment: commitment.slice(0, 16) + "...",
+        });
+
+        return toolResult({
+          proof,
+          note: "This proof demonstrates knowledge of the commitment opening without revealing the value.",
+        });
+      },
+    },
+
+    {
+      name: "sanctuary/zk_verify",
+      description:
+        "Verify a zero-knowledge proof of knowledge for a Pedersen commitment. " +
+        "Checks that the prover knows the commitment's opening without learning anything.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          proof: {
+            type: "object",
+            description: "The ZK proof object from zk_prove",
+          },
+        },
+        required: ["proof"],
+      },
+      handler: async (args) => {
+        const proof = args.proof as Parameters<typeof verifyProofOfKnowledge>[0];
+
+        const valid = verifyProofOfKnowledge(proof);
+
+        auditLog.append("l3", "zk_verify", "system", {
+          proof_type: proof.type,
+          valid,
+        });
+
+        return toolResult({
+          valid,
+          proof_type: proof.type,
+          commitment: proof.commitment,
+          verified_at: new Date().toISOString(),
+        });
+      },
+    },
+
+    {
+      name: "sanctuary/zk_range_prove",
+      description:
+        "Create a zero-knowledge range proof: prove that a committed value is " +
+        "within [min, max] without revealing the exact value. " +
+        "Uses bit-decomposition with OR-proofs on Ristretto255.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "number",
+            description: "The committed value (integer)",
+          },
+          blinding_factor: {
+            type: "string",
+            description: "The blinding factor from zk_commit (base64url)",
+          },
+          commitment: {
+            type: "string",
+            description: "The Pedersen commitment (base64url)",
+          },
+          min: {
+            type: "number",
+            description: "Minimum of the range (inclusive)",
+          },
+          max: {
+            type: "number",
+            description: "Maximum of the range (inclusive)",
+          },
+        },
+        required: ["value", "blinding_factor", "commitment", "min", "max"],
+      },
+      handler: async (args) => {
+        const value = args.value as number;
+        const blindingFactor = args.blinding_factor as string;
+        const commitment = args.commitment as string;
+        const min = args.min as number;
+        const max = args.max as number;
+
+        const proof = createRangeProof(value, blindingFactor, commitment, min, max);
+
+        if ("error" in proof) {
+          return toolResult({ error: proof.error });
+        }
+
+        auditLog.append("l3", "zk_range_prove", "system", {
+          proof_type: proof.type,
+          range: `[${min}, ${max}]`,
+          bits: proof.bit_commitments.length,
+        });
+
+        return toolResult({
+          proof,
+          note: `This proof demonstrates the committed value is in [${min}, ${max}] without revealing it.`,
+        });
+      },
+    },
+
+    {
+      name: "sanctuary/zk_range_verify",
+      description:
+        "Verify a zero-knowledge range proof — confirms a committed value " +
+        "is within the claimed range without learning the value.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          proof: {
+            type: "object",
+            description: "The range proof object from zk_range_prove",
+          },
+        },
+        required: ["proof"],
+      },
+      handler: async (args) => {
+        const proof = args.proof as Parameters<typeof verifyRangeProof>[0];
+
+        const valid = verifyRangeProof(proof);
+
+        auditLog.append("l3", "zk_range_verify", "system", {
+          proof_type: proof.type,
+          valid,
+          range: `[${proof.min}, ${proof.max}]`,
+        });
+
+        return toolResult({
+          valid,
+          proof_type: proof.type,
+          range: { min: proof.min, max: proof.max },
+          commitment: proof.commitment,
+          verified_at: new Date().toISOString(),
         });
       },
     },

@@ -23,6 +23,7 @@ import { createServer, type ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
 import { createSHRTools } from "./shr/tools.js";
 import { createHandshakeTools } from "./handshake/tools.js";
+import { createFederationTools } from "./federation/tools.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
@@ -386,26 +387,7 @@ export async function createSanctuaryServer(options?: {
   // 11. Create L3 tools
   const { tools: l3Tools } = createL3Tools(storage, masterKey, auditLog);
 
-  // 12. Create L4 tools
-  const { tools: l4Tools } = createL4Tools(
-    storage,
-    masterKey,
-    identityManager,
-    auditLog
-  );
-
-  // 13. Load Principal Policy and create approval gate
-  const policy = await loadPrincipalPolicy(config.storage_path);
-  const baseline = new BaselineTracker(storage, masterKey);
-  await baseline.load();
-
-  const approvalChannel = new StderrApprovalChannel(policy.approval_channel);
-  const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog);
-
-  // 14. Create Principal Policy tools (read-only)
-  const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
-
-  // 15. Create SHR tools (machine-readable sovereignty health report)
+  // 12. Create SHR tools (machine-readable sovereignty health report)
   const { tools: shrTools } = createSHRTools(
     config,
     identityManager,
@@ -413,13 +395,40 @@ export async function createSanctuaryServer(options?: {
     auditLog
   );
 
-  // 16. Create Handshake tools (sovereignty handshake protocol)
-  const { tools: handshakeTools } = createHandshakeTools(
+  // 13. Create Handshake tools (sovereignty handshake protocol)
+  // Must be created before L4 so handshakeResults can feed tier resolution
+  const { tools: handshakeTools, handshakeResults } = createHandshakeTools(
     config,
     identityManager,
     masterKey,
     auditLog
   );
+
+  // 14. Create L4 tools (reputation with sovereignty-gated tiers)
+  const { tools: l4Tools } = createL4Tools(
+    storage,
+    masterKey,
+    identityManager,
+    auditLog,
+    handshakeResults
+  );
+
+  // 14b. Create Federation tools (MCP-to-MCP)
+  const { tools: federationTools } = createFederationTools(
+    auditLog,
+    handshakeResults
+  );
+
+  // 15. Load Principal Policy and create approval gate
+  const policy = await loadPrincipalPolicy(config.storage_path);
+  const baseline = new BaselineTracker(storage, masterKey);
+  await baseline.load();
+
+  const approvalChannel = new StderrApprovalChannel(policy.approval_channel);
+  const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog);
+
+  // 16. Create Principal Policy tools (read-only)
+  const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
 
   // 17. Assemble all tools
   const allTools: ToolDefinition[] = [
@@ -430,6 +439,7 @@ export async function createSanctuaryServer(options?: {
     ...policyTools,
     ...shrTools,
     ...handshakeTools,
+    ...federationTools,
     manifestTool,
   ];
 
@@ -467,8 +477,34 @@ export { loadConfig, type SanctuaryConfig } from "./config.js";
 export { StateStore } from "./l1-cognitive/state-store.js";
 export { AuditLog } from "./l2-operational/audit-log.js";
 export { CommitmentStore } from "./l3-disclosure/commitments.js";
+export {
+  createPedersenCommitment,
+  verifyPedersenCommitment,
+  createProofOfKnowledge,
+  verifyProofOfKnowledge,
+  createRangeProof,
+  verifyRangeProof,
+} from "./l3-disclosure/zk-proofs.js";
+export type {
+  PedersenCommitment,
+  ZKProofOfKnowledge,
+  ZKRangeProof,
+} from "./l3-disclosure/zk-proofs.js";
 export { PolicyStore } from "./l3-disclosure/policies.js";
 export { ReputationStore } from "./l4-reputation/reputation-store.js";
+export {
+  resolveTier,
+  computeWeightedScore,
+  tierDistribution,
+  TIER_WEIGHTS,
+} from "./l4-reputation/tiers.js";
+export type { SovereigntyTier, TierMetadata, TieredAttestation } from "./l4-reputation/tiers.js";
+export { FederationRegistry } from "./federation/registry.js";
+export type {
+  FederationPeer,
+  FederationCapabilities,
+  PeerTrustEvaluation,
+} from "./federation/types.js";
 export { MemoryStorage } from "./storage/memory.js";
 export { FilesystemStorage } from "./storage/filesystem.js";
 export { ApprovalGate } from "./principal-policy/gate.js";

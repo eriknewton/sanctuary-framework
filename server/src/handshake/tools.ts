@@ -25,6 +25,7 @@ import type {
   HandshakeChallenge,
   HandshakeResponse,
   HandshakeCompletion,
+  HandshakeResult,
   HandshakeSession,
 } from "./types.js";
 
@@ -33,9 +34,11 @@ export function createHandshakeTools(
   identityManager: IdentityManager,
   masterKey: Uint8Array,
   auditLog: AuditLog
-): { tools: ToolDefinition[] } {
+): { tools: ToolDefinition[]; handshakeResults: Map<string, HandshakeResult> } {
   // In-memory session store (per server instance lifetime)
   const sessions = new Map<string, HandshakeSession>();
+  // Completed handshake results indexed by counterparty ID — shared with L4 tier resolution
+  const handshakeResults = new Map<string, HandshakeResult>();
 
   const shrOpts: SHRGeneratorOptions = {
     config,
@@ -189,6 +192,9 @@ export function createHandshakeTools(
         session.their_nonce = response.responder_nonce;
         session.result = result.result;
 
+        // Store completed result for tier resolution
+        handshakeResults.set(result.result.counterparty_id, result.result);
+
         auditLog.append("l4", "handshake_complete", session.our_shr.body.instance_id);
 
         return toolResult({
@@ -235,6 +241,11 @@ export function createHandshakeTools(
           session.state = result.verified ? "completed" : "failed";
           session.result = result;
 
+          // Store completed result for tier resolution
+          if (result.verified) {
+            handshakeResults.set(result.counterparty_id, result);
+          }
+
           auditLog.append(
             "l4",
             "handshake_verify_completion",
@@ -258,5 +269,5 @@ export function createHandshakeTools(
     },
   ];
 
-  return { tools };
+  return { tools, handshakeResults };
 }

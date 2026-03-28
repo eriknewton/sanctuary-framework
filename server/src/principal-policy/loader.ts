@@ -65,6 +65,21 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "manifest",
     "principal_policy_view",
     "principal_baseline_view",
+    "shr_generate",
+    "shr_verify",
+    "handshake_initiate",
+    "handshake_respond",
+    "handshake_complete",
+    "handshake_status",
+    "reputation_query_weighted",
+    "federation_peers",
+    "federation_trust_evaluate",
+    "federation_status",
+    "zk_commit",
+    "zk_prove",
+    "zk_verify",
+    "zk_range_prove",
+    "zk_range_verify",
   ],
   approval_channel: DEFAULT_CHANNEL,
 };
@@ -240,6 +255,21 @@ tier3_always_allow:
   - manifest
   - principal_policy_view
   - principal_baseline_view
+  - shr_generate
+  - shr_verify
+  - handshake_initiate
+  - handshake_respond
+  - handshake_complete
+  - handshake_status
+  - reputation_query_weighted
+  - federation_peers
+  - federation_trust_evaluate
+  - federation_status
+  - zk_commit
+  - zk_prove
+  - zk_verify
+  - zk_range_prove
+  - zk_range_verify
 
 # ─── Approval Channel ────────────────────────────────────────────────────
 # How Sanctuary reaches you when approval is needed.
