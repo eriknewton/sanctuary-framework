@@ -261,6 +261,146 @@ describe("Principal Dashboard", () => {
     });
   });
 
+  // ── Authentication ──────────────────────────────────────────────────
+
+  describe("Authentication", () => {
+    const AUTH_TOKEN = "test-secret-token-12345";
+    let authDashboard: DashboardApprovalChannel;
+    let authPort: number;
+
+    beforeEach(async () => {
+      authPort = randomPort();
+      authDashboard = new DashboardApprovalChannel({
+        port: authPort,
+        host: "127.0.0.1",
+        timeout_seconds: 2,
+        auto_deny: true,
+        auth_token: AUTH_TOKEN,
+      });
+      await authDashboard.start();
+    });
+
+    afterEach(async () => {
+      await authDashboard.stop();
+    });
+
+    it("rejects requests without auth token", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/status`);
+      expect(res.status).toBe(401);
+      const data = await res.json();
+      expect(data.error).toContain("Unauthorized");
+    });
+
+    it("rejects requests with wrong bearer token", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/status`, {
+        headers: { Authorization: "Bearer wrong-token" },
+      });
+      expect(res.status).toBe(401);
+    });
+
+    it("accepts requests with correct bearer token in header", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/status`, {
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.pending_count).toBe(0);
+    });
+
+    it("accepts requests with correct token in query parameter", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/status?token=${AUTH_TOKEN}`);
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.pending_count).toBe(0);
+    });
+
+    it("serves dashboard HTML with correct query token", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/?token=${AUTH_TOKEN}`);
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain("Sanctuary");
+      expect(text).toContain("Principal Dashboard");
+    });
+
+    it("rejects dashboard HTML without token", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/`);
+      expect(res.status).toBe(401);
+    });
+
+    it("allows OPTIONS requests without auth (CORS preflight)", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/status`, {
+        method: "OPTIONS",
+      });
+      expect(res.status).toBe(204);
+    });
+
+    it("auth protects approve/deny endpoints", async () => {
+      // Start a pending request
+      const request: ApprovalRequest = {
+        operation: "state_export",
+        tier: 1,
+        reason: "Test",
+        context: {},
+        timestamp: new Date().toISOString(),
+      };
+      const approvalPromise = authDashboard.requestApproval(request);
+
+      // Get the pending ID (with auth)
+      const listRes = await fetch(`http://127.0.0.1:${authPort}/api/pending`, {
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      const pending = await listRes.json();
+      expect(pending).toHaveLength(1);
+
+      // Try to approve without auth — should fail
+      const noAuthRes = await fetch(
+        `http://127.0.0.1:${authPort}/api/approve/${pending[0].id}`,
+        { method: "POST" }
+      );
+      expect(noAuthRes.status).toBe(401);
+
+      // Approve with auth — should succeed
+      const authRes = await fetch(
+        `http://127.0.0.1:${authPort}/api/approve/${pending[0].id}`,
+        { method: "POST", headers: { Authorization: `Bearer ${AUTH_TOKEN}` } }
+      );
+      expect(authRes.status).toBe(200);
+
+      const response = await approvalPromise;
+      expect(response.decision).toBe("approve");
+      expect(response.decided_by).toBe("human");
+    });
+
+    it("SSE requires auth via query param", async () => {
+      // Without token — should be 401
+      const noAuth = await fetch(`http://127.0.0.1:${authPort}/events`);
+      expect(noAuth.status).toBe(401);
+
+      // With token — should connect
+      const withAuth = await fetch(`http://127.0.0.1:${authPort}/events?token=${AUTH_TOKEN}`);
+      expect(withAuth.status).toBe(200);
+      expect(withAuth.headers.get("content-type")).toBe("text/event-stream");
+
+      const reader = withAuth.body!.getReader();
+      const decoder = new TextDecoder();
+      const { value } = await reader.read();
+      const text = decoder.decode(value);
+      expect(text).toContain("event: init");
+
+      reader.cancel();
+    });
+  });
+
+  // ── No-auth mode (backward compatibility) ──────────────────────────
+
+  describe("No-auth mode", () => {
+    it("allows all requests when auth_token is not configured", async () => {
+      // The default dashboard in beforeEach has no auth_token
+      const res = await fetch(`http://127.0.0.1:${port}/api/status`);
+      expect(res.status).toBe(200);
+    });
+  });
+
   // ── Cleanup ──────────────────────────────────────────────────────────
 
   describe("Cleanup", () => {

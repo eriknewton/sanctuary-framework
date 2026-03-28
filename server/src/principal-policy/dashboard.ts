@@ -5,7 +5,7 @@
  * for human principals to approve/deny agent operations.
  *
  * Architecture:
- * - Node.js built-in `http` module (no Express or external deps)
+ * - Node.js built-in `http`/`https` modules (no Express or external deps)
  * - SSE (Server-Sent Events) for real-time push to browser
  * - Pending approval requests block the MCP tool call via Promise
  * - Human clicks approve/deny in browser → POST /api/approve/:id → Promise resolves
@@ -13,12 +13,15 @@
  *
  * Security invariants:
  * - Binds to 127.0.0.1 by default (localhost only)
- * - No authentication needed (protected by OS-level access)
+ * - Optional bearer token authentication for non-localhost deployments
+ * - Optional TLS (HTTPS) via cert/key paths
  * - All decisions are audit-logged
  * - Agent cannot access the dashboard (it runs outside MCP stdin/stdout)
  */
 
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import type { ApprovalChannel } from "./approval-channel.js";
 import type { ApprovalRequest, ApprovalResponse, PrincipalPolicy } from "./types.js";
@@ -33,6 +36,13 @@ export interface DashboardConfig {
   host: string;
   timeout_seconds: number;
   auto_deny: boolean;
+  /** Bearer token for API authentication. If omitted, auth is disabled. */
+  auth_token?: string;
+  /** TLS configuration for HTTPS. If omitted, plain HTTP is used. */
+  tls?: {
+    cert_path: string;
+    key_path: string;
+  };
 }
 
 interface PendingRequest {
@@ -56,12 +66,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private baseline: BaselineTracker | null = null;
   private auditLog: AuditLog | null = null;
   private dashboardHTML: string;
+  private authToken: string | undefined;
+  private useTLS: boolean;
 
   constructor(config: DashboardConfig) {
     this.config = config;
+    this.authToken = config.auth_token;
+    this.useTLS = !!(config.tls?.cert_path && config.tls?.key_path);
     this.dashboardHTML = generateDashboardHTML({
       timeoutSeconds: config.timeout_seconds,
       serverVersion: "0.3.0",
+      authToken: this.authToken,
     });
   }
 
@@ -80,15 +95,38 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
-   * Start the HTTP server for the dashboard.
+   * Start the HTTP(S) server for the dashboard.
    */
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.httpServer = createHttpServer((req, res) => this.handleRequest(req, res));
+      const handler = (req: IncomingMessage, res: ServerResponse) => this.handleRequest(req, res);
+
+      if (this.useTLS && this.config.tls) {
+        const tlsOpts = {
+          cert: readFileSync(this.config.tls.cert_path),
+          key: readFileSync(this.config.tls.key_path),
+        };
+        this.httpServer = createHttpsServer(tlsOpts, handler);
+      } else {
+        this.httpServer = createHttpServer(handler);
+      }
+
+      const protocol = this.useTLS ? "https" : "http";
+      const baseUrl = `${protocol}://${this.config.host}:${this.config.port}`;
+
       this.httpServer.listen(this.config.port, this.config.host, () => {
-        process.stderr.write(
-          `\n  Sanctuary Principal Dashboard: http://${this.config.host}:${this.config.port}\n\n`
-        );
+        if (this.authToken) {
+          process.stderr.write(
+            `\n  Sanctuary Principal Dashboard: ${baseUrl}/?token=${this.authToken}\n`
+          );
+          process.stderr.write(
+            `  Auth token: ${this.authToken}\n\n`
+          );
+        } else {
+          process.stderr.write(
+            `\n  Sanctuary Principal Dashboard: ${baseUrl}\n\n`
+          );
+        }
         resolve();
       });
       this.httpServer.on("error", reject);
@@ -175,22 +213,55 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     });
   }
 
+  // ── Authentication ──────────────────────────────────────────────────
+
+  /**
+   * Verify bearer token authentication.
+   * Checks Authorization header first, falls back to ?token= query param.
+   * Returns true if auth passes, false if blocked (response already sent).
+   */
+  private checkAuth(req: IncomingMessage, url: URL, res: ServerResponse): boolean {
+    if (!this.authToken) return true; // Auth disabled
+
+    // Check Authorization: Bearer <token> header
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      const parts = authHeader.split(" ");
+      if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
+        return true;
+      }
+    }
+
+    // Check ?token= query parameter (needed for browser page load and EventSource)
+    const queryToken = url.searchParams.get("token");
+    if (queryToken === this.authToken) {
+      return true;
+    }
+
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Unauthorized — valid bearer token required" }));
+    return false;
+  }
+
   // ── HTTP Request Handler ────────────────────────────────────────────
 
   private handleRequest(req: IncomingMessage, res: ServerResponse): void {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const method = req.method ?? "GET";
 
-    // CORS headers for localhost
+    // CORS headers
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
     if (method === "OPTIONS") {
       res.writeHead(204);
       res.end();
       return;
     }
+
+    // Authenticate all non-OPTIONS requests
+    if (!this.checkAuth(req, url, res)) return;
 
     try {
       if (method === "GET" && url.pathname === "/") {

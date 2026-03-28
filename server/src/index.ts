@@ -430,11 +430,20 @@ export async function createSanctuaryServer(options?: {
   let dashboard: DashboardApprovalChannel | undefined;
 
   if (config.dashboard.enabled) {
+    // Resolve auth token: "auto" generates a random 32-byte hex token
+    let authToken = config.dashboard.auth_token;
+    if (authToken === "auto") {
+      const { randomBytes: rb } = await import("node:crypto");
+      authToken = rb(32).toString("hex");
+    }
+
     dashboard = new DashboardApprovalChannel({
       port: config.dashboard.port,
       host: config.dashboard.host,
       timeout_seconds: policy.approval_channel.timeout_seconds,
       auto_deny: policy.approval_channel.auto_deny,
+      auth_token: authToken,
+      tls: config.dashboard.tls,
     });
     dashboard.setDependencies({ policy, baseline, auditLog });
     await dashboard.start();

@@ -12,6 +12,7 @@
 export function generateDashboardHTML(options: {
   timeoutSeconds: number;
   serverVersion: string;
+  authToken?: string;
 }): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -308,8 +309,21 @@ export function generateDashboardHTML(options: {
 <script>
 (function() {
   const TIMEOUT = ${options.timeoutSeconds};
+  const AUTH_TOKEN = ${options.authToken ? `'${options.authToken}'` : "null"};
   const pending = new Map();
   let auditCount = 0;
+
+  // Auth helpers
+  function authHeaders() {
+    const h = { 'Content-Type': 'application/json' };
+    if (AUTH_TOKEN) h['Authorization'] = 'Bearer ' + AUTH_TOKEN;
+    return h;
+  }
+  function authQuery(url) {
+    if (!AUTH_TOKEN) return url;
+    const sep = url.includes('?') ? '&' : '?';
+    return url + sep + 'token=' + AUTH_TOKEN;
+  }
 
   // Tab switching
   document.querySelectorAll('.tab').forEach(tab => {
@@ -324,7 +338,7 @@ export function generateDashboardHTML(options: {
   // SSE Connection
   let evtSource;
   function connect() {
-    evtSource = new EventSource('/events');
+    evtSource = new EventSource(authQuery('/events'));
     evtSource.onopen = () => {
       document.getElementById('statusDot').classList.remove('disconnected');
       document.getElementById('statusText').textContent = 'Connected';
@@ -435,12 +449,12 @@ export function generateDashboardHTML(options: {
 
   // Approve / Deny handlers (global scope)
   window.handleApprove = function(id) {
-    fetch('/api/approve/' + id, { method: 'POST' }).then(() => {
+    fetch('/api/approve/' + id, { method: 'POST', headers: authHeaders() }).then(() => {
       removePendingRequest(id);
     });
   };
   window.handleDeny = function(id) {
-    fetch('/api/deny/' + id, { method: 'POST' }).then(() => {
+    fetch('/api/deny/' + id, { method: 'POST', headers: authHeaders() }).then(() => {
       removePendingRequest(id);
     });
   };
@@ -514,7 +528,7 @@ export function generateDashboardHTML(options: {
 
   // Init
   connect();
-  fetch('/api/status').then(r => r.json()).then(data => {
+  fetch('/api/status', { headers: authHeaders() }).then(r => r.json()).then(data => {
     if (data.baseline) updateBaseline(data.baseline);
     if (data.policy) updatePolicy(data.policy);
   }).catch(() => {});

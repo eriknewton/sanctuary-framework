@@ -50,6 +50,13 @@ export interface SanctuaryConfig {
     enabled: boolean;
     port: number;
     host: string;
+    /** Bearer token for dashboard auth. If "auto", one is generated at startup. */
+    auth_token?: string;
+    /** TLS cert/key paths for HTTPS dashboard. */
+    tls?: {
+      cert_path: string;
+      key_path: string;
+    };
   };
 }
 
@@ -120,6 +127,15 @@ export async function loadConfig(
   }
   if (process.env.SANCTUARY_DASHBOARD_HOST) {
     config.dashboard.host = process.env.SANCTUARY_DASHBOARD_HOST;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN) {
+    config.dashboard.auth_token = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_TLS_CERT && process.env.SANCTUARY_DASHBOARD_TLS_KEY) {
+    config.dashboard.tls = {
+      cert_path: process.env.SANCTUARY_DASHBOARD_TLS_CERT,
+      key_path: process.env.SANCTUARY_DASHBOARD_TLS_KEY,
+    };
   }
 
   // Override from config file

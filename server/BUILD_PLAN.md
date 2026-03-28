@@ -264,6 +264,27 @@ Human-facing web UI for the approval gate system. Replaces stderr-only auto-deny
 
 ---
 
+## Phase 3D: Dashboard Authentication (Steps 34-36)
+
+Adds bearer token authentication and TLS support to the Principal Dashboard, enabling secure non-localhost deployments.
+
+### Step 34: Dashboard auth layer
+- `src/principal-policy/dashboard.ts` — `checkAuth()` method: Bearer token via Authorization header or `?token=` query param fallback (needed for browser page load and EventSource). `DashboardConfig` extended with `auth_token?` and `tls?` fields.
+- `src/principal-policy/dashboard-html.ts` — `authHeaders()` and `authQuery()` helpers embedded in JavaScript. All `fetch()` calls send Authorization header; EventSource connects via `?token=` query param.
+- CORS `Access-Control-Allow-Headers` updated to include `Authorization`.
+
+### Step 35: TLS and config wiring
+- `src/principal-policy/dashboard.ts` — Conditional `node:https` server creation when TLS cert/key paths provided. Startup message shows `https://` URL and auth token.
+- `src/config.ts` — `dashboard.auth_token?` and `dashboard.tls?` fields added. Env vars: `SANCTUARY_DASHBOARD_AUTH_TOKEN`, `SANCTUARY_DASHBOARD_TLS_CERT`, `SANCTUARY_DASHBOARD_TLS_KEY`.
+- `src/index.ts` — `auth_token: "auto"` auto-generates a 32-byte hex token via `crypto.randomBytes()`.
+
+### Step 36: Auth tests
+- `test/principal-policy/dashboard.test.ts` — 10 new auth tests: reject without token, reject wrong token, accept correct Bearer header, accept correct query param, protect dashboard HTML, protect approve/deny endpoints, CORS preflight bypass, SSE auth, and no-auth backward compatibility.
+
+**STATUS: COMPLETE** — 0 new files, 4 modified. 10 new tests. 194 total tests passing, 20 test files. 37 MCP tools.
+
+---
+
 ## Validation Criteria (from RFC Section 10.1)
 
 > An agent running in Claude Code can connect to the Sanctuary MCP Server, create an identity, write encrypted state, record interactions, export its reputation, and import it into a different harness — with zero plaintext leakage at any point.
@@ -274,9 +295,8 @@ All security tests MUST pass. All conformance tests for MVS-level claims MUST pa
 
 ## Future Work
 
-- **npm publish 0.3.0** — Ship Phase 3B/3C to npm registry
+- **npm publish 0.3.0** — Ship Phases 3B-3D to npm registry
+- **Webhook approval channel** — Approve/deny via external webhook (Slack, Discord, custom HTTP)
 - **Concordia bridge** — Optional integration between Sanctuary (sovereignty) and Concordia (negotiation)
 - **TEE support** — L2 isolation upgrade from process-level to hardware TEE
 - **KERI identity** — L1 identity upgrade from Ed25519-only to KERI key management
-- **Dashboard authentication** — Token-based auth for non-localhost deployments
-- **Webhook approval channel** — Approve/deny via external webhook for automation
