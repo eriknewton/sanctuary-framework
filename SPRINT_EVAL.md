@@ -537,3 +537,91 @@ All six evaluation criteria are satisfied:
 - The reason string at gate.ts:99 includes `"(SEC-011 safe default)"` — this internal finding reference is fine in audit logs and approval prompts but should not leak into MCP responses. Verified that the MCP router uses generic denial messages, so this is not currently exposed to the agent. However, if future changes reflect `GateResult.reason` to the agent, this string would need sanitizing.
 - Test 3 (`"logs unclassified operation to audit log"`) asserts `auditLog.size >= 2` rather than checking the specific `gate_unclassified` action string in the audit entries. A stronger test would verify the specific action string exists. The current assertion is sufficient but could pass even if the log format changed.
 - The gate.ts file header comment (line 10) still reads "Tier 3 / default: Allow with audit logging" — this is now inaccurate since the default for unlisted operations is Tier 1 deny. Should be updated to reflect the four-branch evaluation.
+
+---
+
+## SEC-005 — Import Does Not Verify Ed25519 Signatures on Imported State Entries
+
+**Sprint Date:** 2026-03-28
+**Evaluator Date:** 2026-03-28
+**Fix Commit:** `d2fd381`
+**Grade: CONDITIONAL PASS**
+
+### 1. Root Cause Verification
+
+The `import()` method in `state-store.ts:518-630` now contains a signature verification block (lines 556-581) that runs before any entry is written to storage. For each entry:
+
+- The `kid` is resolved via `publicKeyResolver`. If the resolver returns `null`, the entry is rejected (`skippedUnknownKid++`, `continue`).
+- The `sig` is verified against `entry.payload.ct` using the resolved public key via the same `verify()` function from `core/identity.ts` that `read()` uses. If verification fails or throws, the entry is rejected (`skippedInvalidSig++`, `continue`).
+- Only entries passing both checks reach the write path at line 613.
+
+**Issue found:** The `publicKeyResolver` parameter is declared **optional** (`publicKeyResolver?: (kid: string) => Uint8Array | null` at line 521). Line 556 guards the entire verification block with `if (publicKeyResolver)`. If no resolver is provided, all entries bypass verification entirely — identical to the pre-fix behavior. The sprint contract states: "Signature verification is **mandatory, not optional**." The sprint result acknowledges this: "The resolver parameter is optional to maintain backward API compatibility for internal callers, but the tool handler always provides it."
+
+The single production caller (`tools.ts:622`) does always provide the resolver, so the MCP-facing attack vector described in SEC-005 is closed. However, the `StateStore` API itself does not enforce mandatory verification — any future direct caller of `import()` that omits the resolver silently bypasses the fix.
+
+**Verdict:** The production path is secure. The API contract is not. This is the basis for CONDITIONAL PASS.
+
+### 2. Resolver Pattern
+
+- **(a) Required parameter?** No. The parameter is optional (`?`). The tool handler always provides it, but the type signature does not enforce it. **Condition for PASS: remove the `?` from `publicKeyResolver` to make it a required parameter.**
+- **(b) Null return → rejection?** Yes. Line 559-563: `if (!signerPublicKey)` → `skippedUnknownKid++; skippedKeys++; continue;`. This is a hard rejection, not a warning.
+- **(c) Decoupling from IdentityManager?** Yes. `state-store.ts` has zero imports from or references to `IdentityManager`. The resolver is a pure function `(kid: string) => Uint8Array | null` — the coupling lives entirely in the tool handler's wiring at `tools.ts:616-620`. This is genuine decoupling.
+
+### 3. Rejection Counts
+
+The rejection paths are mutually exclusive:
+
+- If `kid` resolution returns `null` → `skippedUnknownKid++`, `skippedKeys++`, `continue` (line 560-562). The `skippedInvalidSig` counter is never reached.
+- If `sig` verification fails → `skippedInvalidSig++`, `skippedKeys++`, `continue` (lines 570-574 or 577-579). The `skippedUnknownKid` counter is not touched.
+- If verification passes → neither counter is incremented.
+
+Every rejected entry increments exactly one specific counter. No entry can increment both. No rejected entry can increment neither. `skippedKeys` is incremented for every rejection, serving as a total. Correct.
+
+**Oracle attack surface:** The `skipped_unknown_kid` and `skipped_invalid_sig` counts do distinguish between "identity not found" and "identity found but signature invalid." An attacker could craft bundles with entries referencing different `kid` values and observe which get `skipped_unknown_kid` vs `skipped_invalid_sig` to probe which identities exist on the instance. However, import is a Tier 1 operation requiring out-of-band human approval for every invocation. A human approver would need to approve each probing attempt. The attack is theoretically possible but practically infeasible under the existing approval gate. **No action required**, but the observation is noted.
+
+### 4. Regression Tests
+
+`server/test/security/import-verifies-signatures.test.ts` — 5 tests, 222 lines:
+
+| # | Test | What it verifies |
+|---|------|-----------------|
+| 1 | Valid import with correct signatures | 2 entries imported, 0 skipped — valid signatures accepted |
+| 2 | Forged signature rejected | 1 accepted, 1 rejected (`skipped_invalid_sig: 1`) — mixed batch with correct counts |
+| 3 | Unknown kid rejected | 0 imported, `skipped_unknown_kid: 1` — unknown identity rejected |
+| 4 | All entries invalid (bad signatures) | 0 imported, 3 skipped — full batch rejection |
+| 5 | Reserved namespace still skipped | Existing behavior preserved regardless of signature status |
+
+Coverage assessment:
+- **(a) Valid signature accepted:** Test 1. ✓
+- **(b) Invalid signature rejected:** Tests 2, 4. ✓
+- **(c) Unknown kid rejected:** Test 3. ✓
+- **(d) Mixed batch with correct counts:** Test 2 (1 good + 1 tampered). ✓
+
+All 5 tests pass. Full suite: 252/252. No regressions. Previous count was 247, net +5.
+
+### 5. Cluster Contract
+
+The sprint contract (SPRINT_CONTRACT.md) defines the verification pattern for SEC-010 and SEC-014:
+
+- Callback signature: `(identifier: string) => PublicKey | null`
+- Verification is mandatory, not optional.
+- Null return from resolver → rejection, not warning.
+- Response includes structured rejection counts.
+
+This is self-contained and clear. A future implementer working on SEC-010 or SEC-014 can follow this pattern without reading the SEC-005 implementation. The sprint result reinforces this in the "Adjacent Findings Noticed" section, explicitly naming the Concordia-side equivalent (`signing.py` has `verify_signature()` but never calls it).
+
+### 6. Scope
+
+Commit `d2fd381` touches exactly 5 files:
+
+1. `server/src/l1-cognitive/state-store.ts` — verification logic added to `import()`
+2. `server/src/l1-cognitive/tools.ts` — resolver callback wired in handler
+3. `server/test/security/import-verifies-signatures.test.ts` — new test file (5 tests)
+4. `SPRINT_CONTRACT.md` — contract for this sprint
+5. `SPRINT_RESULT.md` — result documentation
+
+No other files touched. ✓
+
+### Condition for Upgrade to PASS
+
+**One condition:** Make `publicKeyResolver` a required parameter in `StateStore.import()`. Remove the `?` from line 521 and remove the `if (publicKeyResolver)` guard at line 556. If backward compatibility is needed for test helpers or internal use, callers that intentionally skip verification should pass an explicit no-op resolver (e.g., `() => null`) — making the bypass visible and intentional rather than silent. This aligns the API with the sprint contract's "mandatory, not optional" requirement and with CLAUDE.md constraint 5 ("Never silently degrade to a less-secure behavior on error").
