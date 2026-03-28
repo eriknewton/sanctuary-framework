@@ -24,7 +24,7 @@ import { generateRandomKey } from "../../src/core/random.js";
 function createTestPolicy(overrides?: Partial<PrincipalPolicy>): PrincipalPolicy {
   return {
     version: 1,
-    tier1_always_approve: ["state_export", "identity_rotate"],
+    tier1_always_approve: ["state_export", "state_delete", "identity_rotate"],
     tier2_anomaly: {
       new_namespace_access: "approve",
       new_counterparty: "approve",
@@ -34,7 +34,7 @@ function createTestPolicy(overrides?: Partial<PrincipalPolicy>): PrincipalPolicy
       first_session_policy: "approve",
     },
     tier3_always_allow: [
-      "state_read", "state_write", "state_list", "state_delete",
+      "state_read", "state_write", "state_list",
       "identity_create", "identity_list", "identity_sign", "identity_verify",
       "monitor_health", "principal_policy_view", "principal_baseline_view",
     ],

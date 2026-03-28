@@ -1,9 +1,10 @@
-# SPRINT_CONTRACT.md — SEC-002: Flip Approval Gate Default to Deny
+# SPRINT_CONTRACT.md — SEC-001: Require Explicit Approval for state_delete
 
 **Date:** 2026-03-28
-**Finding:** SEC-002 — Webhook Auto-Approve on Timeout Is Configurable and Inverts the Security Model
+**Finding:** SEC-001 — Secure Deletion Is Tier 3 (Auto-Allow): Agent Can Irreversibly Destroy All User State Without Confirmation
 **Branch:** `security-review`
 **Severity:** Critical
+**Predecessor:** SEC-002 (already fixed in commit `7f68d5a`; approval gate now unconditionally denies on timeout)
 
 ---
 
@@ -11,102 +12,90 @@
 
 ### Source Files
 
-1. **`server/src/principal-policy/types.ts` line 32** — Remove `auto_deny: boolean` from `ApprovalChannelConfig` interface.
-2. **`server/src/principal-policy/loader.ts` line 31** — Remove `auto_deny: true` from `DEFAULT_CHANNEL`. Remove `auto_deny: true` from generated YAML (line 279).
-3. **`server/src/principal-policy/loader.ts` lines 194-197** — In `validatePolicy()`, strip any user-supplied `auto_deny` from parsed policy so it cannot override the hardcoded behavior.
-4. **`server/src/principal-policy/approval-channel.ts` lines 59-71** — Remove the `if (this.config.auto_deny)` branch. Hardcode timeout resolution to `"deny"`. Update format prompt (lines 98-100) to remove mention of configurable `auto_deny`.
-5. **`server/src/principal-policy/webhook.ts` line 45** — Remove `auto_deny: boolean` from `WebhookConfig`. Line 179: hardcode timeout decision to `"deny"`.
-6. **`server/src/principal-policy/dashboard.ts` line 38** — Remove `auto_deny: boolean` from `DashboardConfig`. Line 184: hardcode timeout decision to `"deny"`. Lines 332, 377: remove `auto_deny` from SSE init and status responses (or report it as always-true).
-7. **`server/src/principal-policy/tools.ts` line 51** — Remove `auto_deny` from policy view response (or report it as hardcoded `true`).
-8. **`server/src/index.ts` lines 455, 469** — Remove `auto_deny: policy.approval_channel.auto_deny` from channel constructor calls.
+1. **`server/src/principal-policy/loader.ts` line 50** — Remove `"state_delete"` from the `tier3_always_allow` array (line 50 of `DEFAULT_POLICY`).
+2. **`server/src/principal-policy/loader.ts` line 38-44** — Add `"state_delete"` to the `tier1_always_approve` array in `DEFAULT_POLICY`.
+3. **`server/src/principal-policy/loader.ts` line 246** — Remove `state_delete` from the Tier 3 section of the generated default YAML, and add it to the Tier 1 section.
 
 ### Test Files
 
-9. **`server/test/principal-policy/webhook.test.ts` line 393** — Remove or rewrite the `auto_deny: false` test. The test at line 403 ("auto-approves on timeout when auto_deny is false") must be replaced with a test asserting that timeout ALWAYS denies.
-10. **`server/test/principal-policy/dashboard.test.ts` line 179** — Same: remove `auto_deny: false` test block. Replace with test asserting timeout always denies.
-11. **`server/test/principal-policy/policy-loader.test.ts` lines 40, 54, 99, 110** — Tests that parse `auto_deny: false` from YAML/JSON must be updated. The parser should either ignore the field or reject it. Tests must reflect that `auto_deny` is always effectively `true`.
-12. **New file: `server/test/security/sec-002-auto-deny-hardcoded.test.ts`** — Regression test (see below).
+4. **`server/test/principal-policy/approval-gate.test.ts` line 37** — Remove `"state_delete"` from the `tier3_always_allow` array in the `createTestPolicy()` helper. The test policy must reflect the production policy change to avoid test/production divergence.
+5. **New file: `server/test/security/sec-001-state-delete-requires-approval.test.ts`** — Regression test (see below).
 
 ---
 
 ## BEHAVIOR BEFORE THE FIX
 
-When `auto_deny: false` is set in the Principal Policy YAML (or passed programmatically), all three approval channels — stderr, webhook, and dashboard — resolve timed-out approval requests with `decision: "approve"`. This means:
+When an agent calls `state_delete` (registered as `sanctuary/state_delete` in `server/src/l1-cognitive/tools.ts:537`):
 
-- **Tier 1 operations** (state_export, state_import, identity_rotate, reputation_import) that require human approval are **auto-approved** if the human does not respond within the timeout window.
-- **Tier 2 operations** flagged as anomalous are **auto-approved** on timeout.
-- An attacker who makes the approval channel unreachable (DoS on webhook endpoint, network partition to dashboard) causes **all gated operations to auto-approve**.
-- The stderr channel auto-resolves after 100ms with no human interaction possible — with `auto_deny: false`, every Tier 1 operation silently auto-approves in 100ms.
+1. The MCP router passes the call to `ApprovalGate.evaluate()`.
+2. The gate checks `tier1_always_approve` — `state_delete` is NOT listed. Skips Tier 1.
+3. The gate checks Tier 2 anomaly detection — `state_delete` IS in `tier3_always_allow` (line 50 of `loader.ts`), so the first-session check at `gate.ts:98` passes it through.
+4. The gate falls through to Tier 3 (line 72-83 of `gate.ts`): **auto-allow with audit logging only**.
+5. The handler in `tools.ts:550-572` executes the deletion immediately. The `stateStore.delete()` call at `tools.ts:560` performs a 3-pass random overwrite (via `filesystem.ts:69-102`) before unlinking the file. This is irreversible.
 
-The vulnerable code paths are:
+**Result:** A compromised or prompt-injected agent can call `state_list` to enumerate all namespaces/keys, then call `state_delete` on every entry. All encrypted state — identities, commitments, reputation, audit history — is irreversibly destroyed with zero human confirmation.
 
-- `approval-channel.ts:65-70`: `else { return { decision: "approve" ... } }`
-- `webhook.ts:179`: `decision: this.config.auto_deny ? "deny" : "approve"`
-- `dashboard.ts:184`: `decision: this.config.auto_deny ? "deny" : "approve"`
+The Tier 2 frequency spike detector might eventually fire after multiple rapid calls, but: (a) by that time significant data is already destroyed, and (b) on the first session (where no baseline exists), the frequency spike check has no reference point for `state_delete` because it is in the Tier 3 list and bypasses the first-session gate at `gate.ts:96-98`.
 
 ---
 
 ## BEHAVIOR AFTER THE FIX
 
-All three approval channels **always deny on timeout**, regardless of configuration. The `auto_deny` field is removed from the config interfaces and the policy schema. If a user's existing policy YAML contains `auto_deny: false`, the parser silently ignores it (the field has no effect). No configuration option exists to make timeout resolve to "approve."
+When an agent calls `state_delete`:
 
-Specifically:
+1. The MCP router passes the call to `ApprovalGate.evaluate()`.
+2. The gate checks `tier1_always_approve` — `state_delete` IS listed. **Tier 1 match.**
+3. The gate calls `this.requestApproval(operation, 1, ...)` which sends an approval request through the configured approval channel (stderr, webhook, or dashboard).
+4. **If the human approves:** The gate returns `{ allowed: true, tier: 1, approval_required: true }` and the deletion proceeds.
+5. **If the human denies or the channel times out:** The gate returns `{ allowed: false, tier: 1 }`. The deletion does NOT execute. Per SEC-002 (already fixed), timeout **always** results in denial — there is no `auto_deny: false` escape hatch.
 
-- `approval-channel.ts`: Timeout always returns `{ decision: "deny", decided_by: "timeout" }`.
-- `webhook.ts`: Timeout always returns `{ decision: "deny", decided_by: "timeout" }`.
-- `dashboard.ts`: Timeout always returns `{ decision: "deny", decided_by: "timeout" }`.
-- `types.ts`: `auto_deny` removed from `ApprovalChannelConfig`.
-- `loader.ts`: `auto_deny` removed from defaults, generated YAML, and `validatePolicy` output.
-- Policy view tools and dashboard SSE/status endpoints report `auto_deny: true` (hardcoded) or omit the field.
+**Result:** Every `state_delete` call — whether normal unlink or 3-pass secure overwrite — requires explicit human approval before execution. A compromised agent cannot destroy any state without the human principal authorizing each deletion.
 
-If a deployment genuinely requires auto-approve behavior (which should be extraordinary and dangerous), this sprint does NOT provide that escape hatch. Per the REMEDIATION_PLAN, a future sprint could add a `SANCTUARY_DANGEROUSLY_AUTO_APPROVE=true` environment variable with a startup warning. That is out of scope for this fix.
+---
+
+## WHY TIER 1 (NOT JUST REMOVING AUTO_ALLOW)
+
+The REMEDIATION_PLAN (CP-01) suggests either moving `state_delete` to Tier 1 or splitting into `state_delete` (Tier 3) and `state_secure_delete` (Tier 1). This sprint chooses **moving the entire `state_delete` operation to Tier 1** for the following reasons:
+
+1. **Even non-secure deletion is destructive.** The current `state_delete` handler in `tools.ts:550-572` always calls `stateStore.delete()`, which always performs the 3-pass secure overwrite (per `filesystem.ts:77-87`). There is no "soft delete" mode — every deletion is irreversible. Moving only a `secure_delete: true` variant to Tier 1 would be meaningless because the tool always does secure deletion.
+
+2. **Splitting the tool is a larger change.** Creating a new `state_secure_delete` tool would require: a new MCP tool registration, new handler, schema changes, router changes, and updates to the tool manifest. That is out of scope for a minimal security fix.
+
+3. **Consistency with the security model.** CLAUDE.md states: "Never execute an irreversible operation without a confirmation gate." Deletion of encrypted state is irreversible. Tier 1 is the correct classification.
+
+4. **The `state_delete` tool description already says "Securely delete"** (tools.ts:538-540). The tool was always intended to perform secure deletion.
+
+---
+
+## INTERACTION WITH SEC-002 FIX
+
+The SEC-002 fix (commit `7f68d5a`) hardcoded all approval channels to deny on timeout. This means:
+
+- **Stderr channel:** Auto-denies after 100ms. `state_delete` will be denied unless a real interactive channel is configured.
+- **Webhook channel:** Denies on timeout. If the webhook endpoint is unreachable, `state_delete` is denied.
+- **Dashboard channel:** Denies on timeout. If the human doesn't respond, `state_delete` is denied.
+
+The SEC-001 fix is fully consistent with SEC-002: moving `state_delete` to Tier 1 means the SEC-002 hardened timeout behavior protects it. There is no configuration that can cause `state_delete` to auto-approve on timeout.
 
 ---
 
 ## REGRESSION TEST
 
-**File:** `server/test/security/sec-002-auto-deny-hardcoded.test.ts`
+**File:** `server/test/security/sec-001-state-delete-requires-approval.test.ts`
 
-**What input triggers the vulnerable path:**
-Constructing each of the three channel types (StderrApprovalChannel, WebhookApprovalChannel, DashboardApprovalChannel) and submitting a Tier 1 approval request with a short timeout. Before the fix, if `auto_deny: false` was passed, the timeout would resolve to "approve."
+**What the test asserts:**
 
-**What the test asserts (post-fix):**
+1. **state_delete is classified as Tier 1 in DEFAULT_POLICY.** `DEFAULT_POLICY.tier1_always_approve` includes `"state_delete"`. `DEFAULT_POLICY.tier3_always_allow` does NOT include `"state_delete"`.
 
-1. StderrApprovalChannel always returns `decision: "deny"` on timeout — no `auto_deny` config option exists.
-2. WebhookApprovalChannel always returns `decision: "deny"` on timeout — no `auto_deny` config option exists.
-3. DashboardApprovalChannel always returns `decision: "deny"` on timeout — no `auto_deny` config option exists.
-4. `parsePolicy()` with `auto_deny: false` in input produces a policy where timeout behavior is still deny (the field is ignored/stripped).
-5. The `DEFAULT_POLICY` does not contain an `auto_deny` field (or if it does for backward compat, it is always `true`).
+2. **state_delete requires approval through the gate.** Construct an `ApprovalGate` with a `CallbackApprovalChannel` that records requests and denies. Call `gate.evaluate("sanctuary/state_delete", { namespace: "test", key: "test" })`. Assert: `result.tier === 1`, `result.approval_required === true`, `result.allowed === false`.
 
----
+3. **state_delete is allowed when the human approves.** Construct an `ApprovalGate` with an `AutoApproveChannel`. Call `gate.evaluate("sanctuary/state_delete", ...)`. Assert: `result.tier === 1`, `result.approval_required === true`, `result.allowed === true`.
 
-## CALLERS THAT RELY ON CURRENT PERMISSIVE DEFAULT
+4. **state_delete is denied on channel timeout.** Construct an `ApprovalGate` with a `StderrApprovalChannel` (which auto-denies after 100ms). Call `gate.evaluate("sanctuary/state_delete", ...)`. Assert: `result.allowed === false`, `result.approval_required === true`.
 
-### Test code (will be updated in this sprint):
+5. **state_delete is not in tier3_always_allow.** Verify that the parsed default policy YAML does not list `state_delete` in the Tier 3 array.
 
-- `webhook.test.ts` line 393: Creates a WebhookApprovalChannel with `auto_deny: false` and asserts `decision: "approve"` on timeout. **This test will be removed and replaced.**
-- `dashboard.test.ts` line 179: Same pattern. **Will be removed and replaced.**
-- `policy-loader.test.ts` lines 40, 54, 99, 110: Parse policies with `auto_deny: false` and assert it is preserved. **Will be updated to assert the field is ignored.**
-
-### Production code:
-
-- `index.ts` lines 455, 469: Pass `policy.approval_channel.auto_deny` to channel constructors. Since the default is `true`, this already produces deny behavior in default deployments. After the fix, this line is removed because the config interfaces no longer accept `auto_deny`.
-- `tools.ts` line 51: Reports `auto_deny` in the policy view. Will be updated to report hardcoded `true` or omit.
-- `dashboard.ts` lines 332, 377: Reports `auto_deny` in SSE init and status API. Will be updated similarly.
-
-### No production caller relies on `auto_deny: false` for correct operation.
-
-The default policy has always been `auto_deny: true`. The `false` option existed as a configurable escape hatch. No internal code path sets it to `false` — it could only be set by a user editing their policy YAML. Removing the option does not break any default deployment.
-
----
-
-## PROMPT INJECTION SURFACE
-
-This fix touches the approval gate — a security-critical path that processes the `operation` name and `context` object from tool calls. The fix does NOT change what data flows through the gate; it only changes the timeout resolution. The `operation` and `context` fields in `ApprovalRequest` are populated by `router.ts` from the MCP tool call, which is agent-controlled input.
-
-However, this fix does not introduce any new agent input processing. The change is strictly: remove a conditional branch (`auto_deny ? "deny" : "approve"`) and replace it with an unconditional `"deny"`. No new string parsing, no new data flow, no new trust boundary crossed.
-
-**Assessment: This fix does not expand the prompt injection surface.**
+6. **Generated default YAML lists state_delete in Tier 1.** Parse the generated default YAML and verify `state_delete` appears in `tier1_always_approve`.
 
 ---
 
@@ -114,14 +103,20 @@ However, this fix does not introduce any new agent input processing. The change 
 
 The evaluator will grade this sprint PASS if and only if ALL of the following hold:
 
-1. **No channel can auto-approve on timeout.** Constructing any approval channel (stderr, webhook, dashboard) and letting a request time out MUST produce `decision: "deny"`. There must be no configuration option, environment variable, or code path that produces `decision: "approve"` on timeout.
+1. **`state_delete` is in `tier1_always_approve` in `DEFAULT_POLICY`.** The constant in `loader.ts` must include `"state_delete"` in the Tier 1 array.
 
-2. **The `auto_deny` config option is inert or removed.** Parsing a policy YAML/JSON with `auto_deny: false` must NOT cause any channel to auto-approve. The field is either stripped by the parser or the config interfaces no longer accept it.
+2. **`state_delete` is NOT in `tier3_always_allow` in `DEFAULT_POLICY`.** The constant in `loader.ts` must not include `"state_delete"` in the Tier 3 array.
 
-3. **Regression test exists and passes.** `server/test/security/sec-002-auto-deny-hardcoded.test.ts` contains tests for all three channels and the policy parser, asserting deny-on-timeout is unconditional.
+3. **The generated default YAML reflects the change.** `state_delete` appears in the Tier 1 section, not the Tier 3 section.
 
-4. **Full test suite passes.** 227 tests were passing before this sprint. After the fix, the count must be >= 227 (may increase due to new regression tests). Zero failures.
+4. **The approval gate classifies `state_delete` as Tier 1.** When `gate.evaluate("sanctuary/state_delete", ...)` is called, the result has `tier: 1` and `approval_required: true`.
 
-5. **No silent caller breakage.** Every caller of `auto_deny` in source and test files has been audited and updated. No test passes by accident due to the field being silently ignored.
+5. **Denial on timeout is confirmed.** With the SEC-002 hardened channels, a timed-out `state_delete` approval request results in `allowed: false`.
 
-6. **Backward compatibility for existing policy files.** A policy YAML containing `auto_deny: false` does not cause a parse error or crash. The field is silently ignored (safe default wins).
+6. **Regression test exists and passes.** `server/test/security/sec-001-state-delete-requires-approval.test.ts` contains tests covering criteria 1-5.
+
+7. **No other tool's tier classification is changed.** Only `state_delete` moves. All other tools remain in their current tier.
+
+8. **Full test suite passes.** 236 tests were passing before this sprint. After the fix, the count must be >= 236 (may increase due to new regression tests). Zero failures.
+
+9. **The approval-gate test helper `createTestPolicy()` is updated.** `state_delete` must not appear in `tier3_always_allow` in the test helper, preventing test/production divergence.
