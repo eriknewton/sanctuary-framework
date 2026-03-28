@@ -333,3 +333,207 @@ All five evaluation criteria are satisfied:
 - `reputation_export` is in Tier 3. It is a read-only export and does not destroy data, so Tier 3 is defensible. However, `state_export` (also a read-only export) is Tier 1. This asymmetry may deserve review — if the concern is data exfiltration rather than destruction, both exports should arguably be at the same tier. This is outside the scope of SEC-001 but worth noting.
 - The SPRINT_RESULT correctly identifies that existing policy YAML files from pre-fix deployments will still have `state_delete` in Tier 3. Users must manually update or regenerate their policy file. There is no migration mechanism. This is acceptable for a security fix but should be documented in release notes.
 - SEC-011 (unlisted operations default to Tier 3) remains open and is the inverse of SEC-001. The safe default should be deny, not allow.
+
+---
+---
+
+# SPRINT_EVAL.md — SEC-011: Independent QA Evaluation
+
+**Date:** 2026-03-28
+**Evaluator posture:** Skeptical QA — did not write this code, does not trust self-assessment.
+**Finding:** SEC-011 — Sanctuary Gate Default for Unlisted Operations Is Tier 3 (Allow)
+**Commit:** `4a72000`
+**Branch:** `security-review`
+
+---
+
+## 1. ROOT CAUSE
+
+**Question:** Does the fix address the root cause — the missing tier membership check that allows unlisted operations to fall through to Tier 3 auto-allow — or does it patch a symptom?
+
+**Verdict: PASS.**
+
+I read `gate.ts` and traced the execution path for an operation that exists in no tier list (e.g., `totally_new_tool`).
+
+**Pre-fix code** (from `git diff 4a72000^..4a72000`): After Tier 1 (line 59) and Tier 2 (line 68) checks, the code fell through unconditionally to a Tier 3 block that called `this.auditLog.append("l2", "gate_allow:${operation}", ...)` and returned `{ allowed: true, tier: 3, approval_required: false }`. There was no `if (this.policy.tier3_always_allow.includes(operation))` guard. Any operation not matched by Tier 1 or Tier 2 was auto-allowed.
+
+**Post-fix code** (gate.ts:72-101): The evaluation now has four explicit branches:
+
+1. **Line 59:** `if (this.policy.tier1_always_approve.includes(operation))` → Tier 1 approval. Unchanged.
+2. **Line 67-70:** Tier 2 anomaly detection → approval. Unchanged.
+3. **Line 73:** `if (this.policy.tier3_always_allow.includes(operation))` → Tier 3 allow with audit log. **New guard added.**
+4. **Lines 87-101:** Else branch — unlisted/unclassified → audit log `gate_unclassified:{operation}`, then `requestApproval(operation, 1, ...)` routing to **Tier 1**.
+
+I confirmed the `includes()` check at line 73 uses `Array.prototype.includes()`, which performs strict equality (`===`) comparison. An operation name like `totally_new_tool` that does not appear in the `tier3_always_allow` array will fail this check and fall through to the else branch at line 87.
+
+The else branch at line 96 calls `this.requestApproval(operation, 1, ...)` — the second argument `1` is the tier parameter (typed as `1 | 2` per the method signature at line 231). This routes to the configured approval channel at Tier 1.
+
+**This is a root-cause fix.** The vulnerability was the missing membership check; the fix adds the membership check. No symptom-level workaround.
+
+---
+
+## 2. AUDIT LOG
+
+**Question:** Is the `gate_unclassified` log entry written before the Tier 1 routing — not after, not conditionally? Can an attacker suppress it by manipulating the operation name?
+
+**Verdict: PASS.**
+
+Lines 90-94 of gate.ts:
+
+```typescript
+this.auditLog.append("l2", `gate_unclassified:${operation}`, "system", {
+  tier: 1,
+  operation,
+  warning: "Operation is not classified in any policy tier — defaulting to Tier 1 (require approval)",
+});
+```
+
+Lines 96-101:
+
+```typescript
+return this.requestApproval(
+  operation,
+  1,
+  `"${operation}" is not classified in any policy tier — requires approval (SEC-011 safe default)`,
+  { operation, unclassified: true }
+);
+```
+
+The `auditLog.append()` call at line 90 executes **before** the `requestApproval()` call at line 96. There is no conditional between them — no `if`, no `try/catch` that could skip the log, no early return. The audit entry is written unconditionally for every unclassified operation before the approval request is dispatched.
+
+**Can an attacker suppress the log by manipulating the operation name?** The operation name is derived from `extractOperationName(toolName)` at line 53 (called at the top of `evaluate()`). I read `loader.ts:92-96`: `extractOperationName` strips the `sanctuary/` prefix via `toolName.slice("sanctuary/".length)` or returns the raw `toolName`. This is a deterministic string operation. The operation name flows from the MCP router's tool registration — it is developer-controlled at registration time, not agent-controlled at call time. An agent calls `sanctuary/foo`; the operation name becomes `foo`. There is no path for the agent to inject a different operation name that would skip the audit log.
+
+**Edge case:** If the operation name contained special characters or was extremely long, the audit log would still be written — `auditLog.append()` takes the string as-is. There is no validation that could reject it before logging. The log entry is unconditional.
+
+---
+
+## 3. REGRESSION TESTS
+
+**Question:** Are 4 new tests present? Does at least one explicitly test an unlisted operation → Tier 1? Would these tests fail against the pre-fix code?
+
+**Verdict: PASS.**
+
+Four tests exist in the `"SEC-011 — unlisted operations default to Tier 1"` describe block (lines 224-295 of `approval-gate.test.ts`):
+
+**Test 1** (line 225): `"requires approval for operations not in any tier list"` — Evaluates `sanctuary/totally_new_tool` with a non-first-session baseline. Asserts `result.tier === 1` and `result.approval_required === true`. **Pre-fix:** `totally_new_tool` would fall through to the unconditional Tier 3 block, returning `tier: 3, approval_required: false`. Both assertions would fail. **Would fail against pre-fix: YES.**
+
+**Test 2** (line 243): `"denies unlisted operations when channel denies"` — Same operation with a `CallbackApprovalChannel` that returns `decision: "deny"`. Asserts `result.tier === 1`, `result.approval_required === true`, `result.allowed === false`. **Pre-fix:** The operation would auto-allow at Tier 3 without ever reaching the channel. `result.allowed` would be `true`, `result.tier` would be `3`. All three assertions would fail. **Would fail against pre-fix: YES.**
+
+**Test 3** (line 264): `"logs unclassified operation to audit log"` — Evaluates `sanctuary/unregistered_dangerous_op`. Asserts `auditLog.size >= 2` (one for the `gate_unclassified` entry, one for the `gate_approve` from `requestApproval`). **Pre-fix:** The operation would hit the Tier 3 block, which writes only one audit entry (`gate_allow`). There would be no `gate_unclassified` entry. The audit log would have size 1, failing the `>= 2` assertion. **Would fail against pre-fix: YES** (marginal — depends on baseline audit entries, but the pre-fix Tier 3 block writes exactly 1 entry vs. the post-fix unclassified path which writes 2).
+
+**Test 4** (line 279): `"still allows explicitly listed Tier 3 operations"` — Evaluates `sanctuary/state_read` (in `tier3_always_allow`). Asserts `result.tier === 3`, `result.allowed === true`, `result.approval_required === false`. **Pre-fix:** This test would PASS against pre-fix code too — `state_read` was always in `tier3_always_allow`. This is a non-regression test, confirming the fix doesn't break existing Tier 3 behavior. **Would fail against pre-fix: NO (this is intentional — it's a stability test).**
+
+**Summary:** 3 of 4 tests would genuinely fail against pre-fix code. Test 4 is a stability/non-regression test. This is adequate coverage.
+
+---
+
+## 4. SEC-002 INTERACTION
+
+**Question:** Does an unclassified operation that times out result in denial, not approval?
+
+**Verdict: PASS.**
+
+The unclassified operation path (gate.ts:96-101) calls `this.requestApproval(operation, 1, ...)`. The `requestApproval` method (gate.ts:229-261) delegates to `this.channel.requestApproval(request)` at line 243.
+
+I verified all three production channels:
+
+- **StderrApprovalChannel** (approval-channel.ts:59-65): Unconditionally returns `{ decision: "deny", decided_by: "timeout" }`. SEC-002 hardened — no `auto_deny` conditional. Comment at line 59: "SEC-002: Timeout ALWAYS denies. No configuration can change this."
+
+- **WebhookApprovalChannel** (confirmed in SEC-002 eval above): Timeout callback unconditionally sets `decision: "deny"`.
+
+- **DashboardApprovalChannel** (confirmed in SEC-002 eval above): Timeout callback unconditionally sets `decision: "deny"`.
+
+After the channel returns a deny, `requestApproval` at line 253 evaluates `response.decision === "approve"` → `false`, returning `{ allowed: false, ... }`.
+
+The test policy in `approval-gate.test.ts` line 44 sets `auto_deny: true` in the approval channel config, and the SEC-011 test 2 explicitly uses a deny channel to confirm the end-to-end denial. While no SEC-011 test uses `StderrApprovalChannel` directly (which would be the production timeout path), the SEC-002 regression tests already cover that all channels deny on timeout. The combination is sound: SEC-011 routes unclassified → `requestApproval(tier 1)` → SEC-002 ensures timeout → deny.
+
+**The two fixes are complementary.** SEC-002 ensures the gate denies on timeout. SEC-011 ensures unclassified operations reach the gate. Together, an unclassified operation that times out is denied.
+
+---
+
+## 5. SCOPE
+
+**Question:** Does commit `4a72000` touch exactly 4 files?
+
+**Verdict: PASS.**
+
+`git show --stat 4a72000` output:
+
+```
+ SPRINT_CONTRACT.md                                 | 138
+ SPRINT_RESULT.md                                   | 124
+ server/src/principal-policy/gate.ts                |  36
+ server/test/principal-policy/approval-gate.test.ts |  73
+ 4 files changed, 193 insertions(+), 178 deletions(-)
+```
+
+Exactly 4 files: `gate.ts`, `approval-gate.test.ts`, `SPRINT_CONTRACT.md`, `SPRINT_RESULT.md`. No other files touched.
+
+---
+
+## 6. NEW RISK
+
+### 6a. Can `tier3_always_allow.includes()` be bypassed by a partial match?
+
+**Verdict: PASS — no bypass possible.**
+
+`Array.prototype.includes()` in JavaScript/TypeScript uses the SameValueZero algorithm, which for strings is equivalent to strict equality (`===`). It does not perform substring matching, prefix matching, or regex matching. An operation name like `state_rea` (partial match of `state_read`) would not match `"state_read"` in the array. An operation name like `state_read_all` would not match either. Only the exact string `"state_read"` matches the entry `"state_read"`.
+
+The `extractOperationName` function (loader.ts:92-96) strips only the `sanctuary/` prefix. It does not normalize, lowercase, trim, or otherwise transform the operation name. The MCP SDK routes tool calls by exact tool name match, so the operation name reaching the gate is always the exact registered tool name minus the prefix.
+
+**No partial match bypass is possible.**
+
+### 6b. Does the `gate_unclassified` audit log entry expose sensitive classification logic?
+
+**Verdict: PASS with minor observation.**
+
+The audit log entry (gate.ts:90-94) contains:
+
+```typescript
+{
+  tier: 1,
+  operation,
+  warning: "Operation is not classified in any policy tier — defaulting to Tier 1 (require approval)",
+}
+```
+
+The `operation` field reveals the name of the unclassified operation — this is the tool name the agent already knows (it called it). The `warning` message reveals that the operation is "not classified in any policy tier." This confirms to an observer that the operation is unlisted, but this information is already implicit in the fact that the operation triggered a Tier 1 approval prompt with the reason string `"is not classified in any policy tier"` (gate.ts:99).
+
+**What this does NOT reveal:** The audit log entry does not list the contents of `tier1_always_approve`, `tier3_always_allow`, or any other tier list. It does not reveal which operations ARE classified. It does not reveal the Tier 2 anomaly detection thresholds. An attacker reading this log entry learns only that their specific operation is unlisted — not what IS listed.
+
+**CLAUDE.md §"WHAT THESE TOOLS MUST NEVER DO" #7** states: "Denial responses never reveal policy rules." The denial reason in the `GateResult` (gate.ts:99) says the operation "is not classified in any policy tier" — this reveals the operation's classification status (unlisted) but does not reveal any policy rules (which operations are in which tier, what the anomaly thresholds are). This is consistent with the existing Tier 1 and Tier 2 reason strings, which also name the triggering operation without revealing the full policy.
+
+**Minor observation (non-blocking):** The audit log `warning` field and the `requestApproval` reason string both include the phrase "SEC-011 safe default" (gate.ts:99). This is an internal reference that could be visible to an agent if the approval prompt is reflected back through the MCP response. However, the `requestApproval` method (gate.ts:229-261) returns a `GateResult` with the reason field, and the MCP router wraps denied operations in a generic denial message that does not include the reason (per CLAUDE.md §12: "Denial messages are generic"). The SEC-011 reference in the reason string would only appear in the audit log and the approval channel prompt (stderr/dashboard/webhook), not in the MCP response to the agent.
+
+---
+
+## 7. FULL TEST SUITE
+
+**Independent run:**
+
+```
+ Test Files  24 passed (24)
+      Tests  247 passed (247)
+   Duration  20.10s
+```
+
+247/247 pass. Zero failures. Baseline was 243 (post-SEC-001/SEC-002). +4 new SEC-011 tests = 247. Confirmed.
+
+---
+
+## GRADE: PASS
+
+All six evaluation criteria are satisfied:
+
+1. **Root cause addressed:** The unconditional Tier 3 fall-through is replaced with an explicit `tier3_always_allow.includes()` guard. Unlisted operations now route to Tier 1 approval. Verified by reading the diff and tracing the execution path.
+2. **Audit log correct:** `gate_unclassified` entry is written unconditionally before `requestApproval()` — no conditional, no try/catch, no way to suppress. Operation name is developer-controlled, not agent-controlled.
+3. **Regression tests valid:** 4 tests added, 3 would genuinely fail against pre-fix code, 1 is a stability test. At least one test (Test 1) explicitly sends `totally_new_tool` and asserts Tier 1 routing.
+4. **SEC-002 interaction sound:** Unclassified operations route through `requestApproval(tier 1)`, which delegates to the approval channel. All three production channels unconditionally deny on timeout (SEC-002 hardening). An unclassified operation that times out is denied.
+5. **Scope exact:** 4 files changed — `gate.ts`, `approval-gate.test.ts`, `SPRINT_CONTRACT.md`, `SPRINT_RESULT.md`. No other files.
+6. **No new bypass risk:** `Array.prototype.includes()` uses strict equality — no partial match bypass. Audit log entry reveals only that the specific operation is unlisted, not the contents of any tier list.
+
+**Non-blocking observations for follow-up:**
+
+- The reason string at gate.ts:99 includes `"(SEC-011 safe default)"` — this internal finding reference is fine in audit logs and approval prompts but should not leak into MCP responses. Verified that the MCP router uses generic denial messages, so this is not currently exposed to the agent. However, if future changes reflect `GateResult.reason` to the agent, this string would need sanitizing.
+- Test 3 (`"logs unclassified operation to audit log"`) asserts `auditLog.size >= 2` rather than checking the specific `gate_unclassified` action string in the audit entries. A stronger test would verify the specific action string exists. The current assertion is sufficient but could pass even if the log format changed.
+- The gate.ts file header comment (line 10) still reads "Tier 3 / default: Allow with audit logging" — this is now inaccurate since the default for unlisted operations is Tier 1 deny. Should be updated to reflect the four-branch evaluation.
