@@ -5,7 +5,7 @@ description: >
   self-custodied identity, selective disclosure, zero-knowledge proofs, portable reputation, sovereignty health
   reporting, sovereignty handshakes, MCP-to-MCP federation, or principal dashboard approval.
   Triggers: sovereignty, encrypted state, identity, reputation, privacy, SHR, handshake, attestation,
-  disclosure policy, zero-knowledge, federation, approval, dashboard.
+  disclosure policy, zero-knowledge, federation, approval, dashboard, webhook.
 ---
 
 # Sanctuary Framework
@@ -129,6 +129,14 @@ Enable the dashboard in config (`dashboard.enabled: true`) to get a web UI at `h
 - Approve or deny Tier 1 and Tier 2 operations in real time
 - Monitor the audit log live
 - View behavioral baseline and policy configuration
+- Optionally secure with bearer token auth (`dashboard.auth_token: "auto"`) and TLS
+
+### Webhook Approval Channel
+Enable webhook approvals (`webhook.enabled: true`, `webhook.url`, `webhook.secret`) to route approval requests to external systems (Slack, Discord, PagerDuty, custom HTTP endpoints):
+1. Sanctuary POSTs approval requests with HMAC-SHA256 signatures to your webhook URL
+2. Your system receives the request with a `callback_url` for responding
+3. POST back `{ "request_id": "...", "decision": "approve" }` with matching HMAC signature
+4. Health check available at the callback server's `/health` endpoint
 
 ## Architecture notes
 
@@ -141,4 +149,4 @@ Sanctuary implements a four-layer sovereignty architecture. Every layer serves b
 
 All state is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. No plaintext ever touches persistent storage.
 
-37 MCP tools. 184 tests. Apache 2.0.
+37 MCP tools. 210 tests. Three approval channels (stderr, dashboard, webhook). Apache 2.0.

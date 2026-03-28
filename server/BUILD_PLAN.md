@@ -285,6 +285,24 @@ Adds bearer token authentication and TLS support to the Principal Dashboard, ena
 
 ---
 
+## Phase 3E: Webhook Approval Channel (Steps 37-39)
+
+External webhook-based approval: POST requests to any HTTP endpoint (Slack, Discord, PagerDuty, custom), receive callbacks with HMAC-SHA256 signature verification.
+
+### Step 37: WebhookApprovalChannel implementation
+- `src/principal-policy/webhook.ts` (new) — `WebhookApprovalChannel` implementing `ApprovalChannel` interface. Outbound POST with HMAC-SHA256 signed payload (`X-Sanctuary-Signature` header). Inbound callback server at `/webhook/respond/:id` with signature verification, request ID validation, constant-time comparison. `WebhookConfig`, `WebhookPayload`, `WebhookCallbackPayload` types exported. Health endpoint at `/health`.
+
+### Step 38: Config and wiring
+- `src/config.ts` — `webhook: { enabled, url, secret, callback_port, callback_host }` with env vars: `SANCTUARY_WEBHOOK_ENABLED`, `SANCTUARY_WEBHOOK_URL`, `SANCTUARY_WEBHOOK_SECRET`, `SANCTUARY_WEBHOOK_CALLBACK_PORT`, `SANCTUARY_WEBHOOK_CALLBACK_HOST`.
+- `src/index.ts` — Three-way channel selection: dashboard > webhook > stderr. Webhook activated when `webhook.enabled && webhook.url && webhook.secret`. Exports: `WebhookApprovalChannel`, `signPayload`, `verifySignature`, types.
+
+### Step 39: Webhook tests
+- `test/principal-policy/webhook.test.ts` (new) — 16 tests: HMAC signatures (4), outbound delivery (4), inbound callback handling (5), auto-approve mode (1), cleanup (1), health endpoint (1). Mock webhook receiver for end-to-end flow testing.
+
+**STATUS: COMPLETE** — 1 new source file, 1 new test file. 16 new tests. 210 total tests passing, 21 test files. 37 MCP tools.
+
+---
+
 ## Validation Criteria (from RFC Section 10.1)
 
 > An agent running in Claude Code can connect to the Sanctuary MCP Server, create an identity, write encrypted state, record interactions, export its reputation, and import it into a different harness — with zero plaintext leakage at any point.
@@ -295,8 +313,7 @@ All security tests MUST pass. All conformance tests for MVS-level claims MUST pa
 
 ## Future Work
 
-- **npm publish 0.3.0** — Ship Phases 3B-3D to npm registry
-- **Webhook approval channel** — Approve/deny via external webhook (Slack, Discord, custom HTTP)
+- **npm publish 0.3.0** — Ship Phases 3B-3E to npm registry
 - **Concordia bridge** — Optional integration between Sanctuary (sovereignty) and Concordia (negotiation)
 - **TEE support** — L2 isolation upgrade from process-level to hardware TEE
 - **KERI identity** — L1 identity upgrade from Ed25519-only to KERI key management

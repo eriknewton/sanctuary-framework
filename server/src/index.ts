@@ -18,6 +18,7 @@ import { loadPrincipalPolicy } from "./principal-policy/loader.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
 import { StderrApprovalChannel } from "./principal-policy/approval-channel.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
+import { WebhookApprovalChannel } from "./principal-policy/webhook.js";
 import { ApprovalGate } from "./principal-policy/gate.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
@@ -425,8 +426,8 @@ export async function createSanctuaryServer(options?: {
   const baseline = new BaselineTracker(storage, masterKey);
   await baseline.load();
 
-  // Choose approval channel: dashboard (interactive web UI) or stderr (auto-deny)
-  let approvalChannel: StderrApprovalChannel | DashboardApprovalChannel;
+  // Choose approval channel: dashboard (web UI), webhook (external), or stderr (auto-deny)
+  let approvalChannel: StderrApprovalChannel | DashboardApprovalChannel | WebhookApprovalChannel;
   let dashboard: DashboardApprovalChannel | undefined;
 
   if (config.dashboard.enabled) {
@@ -448,6 +449,17 @@ export async function createSanctuaryServer(options?: {
     dashboard.setDependencies({ policy, baseline, auditLog });
     await dashboard.start();
     approvalChannel = dashboard;
+  } else if (config.webhook.enabled && config.webhook.url && config.webhook.secret) {
+    const webhook = new WebhookApprovalChannel({
+      webhook_url: config.webhook.url,
+      webhook_secret: config.webhook.secret,
+      callback_port: config.webhook.callback_port,
+      callback_host: config.webhook.callback_host,
+      timeout_seconds: policy.approval_channel.timeout_seconds,
+      auto_deny: policy.approval_channel.auto_deny,
+    });
+    await webhook.start();
+    approvalChannel = webhook;
   } else {
     approvalChannel = new StderrApprovalChannel(policy.approval_channel);
   }
@@ -545,6 +557,8 @@ export {
 } from "./principal-policy/approval-channel.js";
 export { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
 export type { DashboardConfig } from "./principal-policy/dashboard.js";
+export { WebhookApprovalChannel, signPayload, verifySignature } from "./principal-policy/webhook.js";
+export type { WebhookConfig, WebhookPayload, WebhookCallbackPayload } from "./principal-policy/webhook.js";
 export { generateSHR } from "./shr/generator.js";
 export { verifySHR } from "./shr/verifier.js";
 export type { SignedSHR, SHRBody, SHRVerificationResult } from "./shr/types.js";

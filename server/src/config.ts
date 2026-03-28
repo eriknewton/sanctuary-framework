@@ -58,6 +58,18 @@ export interface SanctuaryConfig {
       key_path: string;
     };
   };
+
+  webhook: {
+    enabled: boolean;
+    /** URL to POST approval requests to */
+    url: string;
+    /** Shared secret for HMAC-SHA256 signatures */
+    secret: string;
+    /** Port for callback listener (receives approval responses) */
+    callback_port: number;
+    /** Host for callback listener */
+    callback_host: string;
+  };
 }
 
 /** Default configuration */
@@ -98,6 +110,13 @@ export function defaultConfig(): SanctuaryConfig {
       port: 3501,
       host: "127.0.0.1",
     },
+    webhook: {
+      enabled: false,
+      url: "",
+      secret: "",
+      callback_port: 3502,
+      callback_host: "127.0.0.1",
+    },
   };
 }
 
@@ -136,6 +155,21 @@ export async function loadConfig(
       cert_path: process.env.SANCTUARY_DASHBOARD_TLS_CERT,
       key_path: process.env.SANCTUARY_DASHBOARD_TLS_KEY,
     };
+  }
+  if (process.env.SANCTUARY_WEBHOOK_ENABLED === "true") {
+    config.webhook.enabled = true;
+  }
+  if (process.env.SANCTUARY_WEBHOOK_URL) {
+    config.webhook.url = process.env.SANCTUARY_WEBHOOK_URL;
+  }
+  if (process.env.SANCTUARY_WEBHOOK_SECRET) {
+    config.webhook.secret = process.env.SANCTUARY_WEBHOOK_SECRET;
+  }
+  if (process.env.SANCTUARY_WEBHOOK_CALLBACK_PORT) {
+    config.webhook.callback_port = parseInt(process.env.SANCTUARY_WEBHOOK_CALLBACK_PORT, 10);
+  }
+  if (process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST) {
+    config.webhook.callback_host = process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST;
   }
 
   // Override from config file
