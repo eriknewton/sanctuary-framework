@@ -27,9 +27,9 @@
     "start": "node dist/cli.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:security": "vitest run --dir test/security",
-    "test:integration": "vitest run --dir test/integration",
-    "test:conformance": "vitest run --dir test/conformance",
+    "test:security": "vitest run test/security",
+    "test:integration": "vitest run test/integration",
+    "test:conformance": "vitest run test/conformance",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
     "clean": "rm -rf dist",
@@ -49,7 +49,7 @@
     "vitest": "^3.0.0"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "license": "Apache-2.0",
   "repository": {
