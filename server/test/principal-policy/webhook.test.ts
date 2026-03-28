@@ -369,9 +369,9 @@ describe("Webhook Approval Channel", () => {
     });
   });
 
-  // ── Auto-approve mode ─────────────────────────────────────────────
+  // ── SEC-002: auto_deny: false no longer auto-approves ────────────
 
-  describe("Auto-approve mode", () => {
+  describe("SEC-002: auto_deny false is ignored", () => {
     let webhook: WebhookApprovalChannel;
     let receiver: ReturnType<typeof createMockReceiver>;
     let receiverPort: number;
@@ -390,7 +390,7 @@ describe("Webhook Approval Channel", () => {
         callback_port: callbackPort,
         callback_host: "127.0.0.1",
         timeout_seconds: 1,
-        auto_deny: false, // auto-approve on timeout
+        auto_deny: false, // SEC-002: this is now ignored
       });
       await webhook.start();
     });
@@ -400,7 +400,7 @@ describe("Webhook Approval Channel", () => {
       await receiver.stop();
     });
 
-    it("auto-approves on timeout when auto_deny is false", async () => {
+    it("denies on timeout even when auto_deny is false (SEC-002)", async () => {
       const request: ApprovalRequest = {
         operation: "state_export",
         tier: 1,
@@ -409,7 +409,7 @@ describe("Webhook Approval Channel", () => {
         timestamp: new Date().toISOString(),
       };
       const response = await webhook.requestApproval(request);
-      expect(response.decision).toBe("approve");
+      expect(response.decision).toBe("deny");
       expect(response.decided_by).toBe("timeout");
     }, 5000);
   });
