@@ -10,9 +10,9 @@ Sanctuary gives agents (and their human principals) encrypted state, sovereign i
 
 **L2 Operational Isolation** — Environment attestation, health monitoring, encrypted audit log, and **Principal Policy** — a human-controlled, agent-immutable approval system that defends against prompt injection by gating high-risk operations.
 
-**L3 Selective Disclosure** — Cryptographic commitments let an agent prove a claim without revealing it. Disclosure policies define what information flows where, evaluated per-field against context-specific rules.
+**L3 Selective Disclosure** — SHA-256 commitments, Pedersen commitments on Ristretto255, zero-knowledge proofs of knowledge (Schnorr/Fiat-Shamir), and ZK range proofs (bit-decomposition with CDS OR-proofs). Disclosure policies define what information flows where.
 
-**L4 Verifiable Reputation** — Signed attestations of interaction outcomes (EAS-compatible). Queryable aggregates. Export/import for cross-platform portability. Trust bootstrapping via escrow and principal guarantees.
+**L4 Verifiable Reputation** — Signed attestations (EAS-compatible) with sovereignty-gated tiers. Weighted scoring based on counterparty sovereignty posture. Export/import for cross-platform portability. Trust bootstrapping via escrow and principal guarantees. Sovereignty handshakes and MCP-to-MCP federation.
 
 ## Quick start
 
@@ -91,25 +91,44 @@ Once connected, your agent has access to these tools:
 ### L3 — Selective Disclosure
 | Tool | Description |
 |------|-------------|
-| `sanctuary/proof_commitment` | Create a cryptographic commitment to a value |
+| `sanctuary/proof_commitment` | Create a SHA-256 cryptographic commitment |
 | `sanctuary/proof_reveal` | Verify a commitment against revealed value |
 | `sanctuary/disclosure_set_policy` | Define disclosure rules for different contexts |
 | `sanctuary/disclosure_evaluate` | Evaluate a disclosure request against policy |
+| `sanctuary/zk_commit` | Create a Pedersen commitment on Ristretto255 |
+| `sanctuary/zk_prove` | ZK proof of knowledge of a commitment's opening |
+| `sanctuary/zk_verify` | Verify a ZK proof of knowledge |
+| `sanctuary/zk_range_prove` | Prove a value is in [min, max] without revealing it |
+| `sanctuary/zk_range_verify` | Verify a ZK range proof |
 
 ### L4 — Verifiable Reputation
 | Tool | Description |
 |------|-------------|
-| `sanctuary/reputation_record` | Record signed interaction attestation |
+| `sanctuary/reputation_record` | Record signed interaction attestation (sovereignty-weighted) |
 | `sanctuary/reputation_query` | Query aggregated reputation data |
+| `sanctuary/reputation_query_weighted` | Query with sovereignty-tier weighting |
 | `sanctuary/reputation_export` | Export portable reputation bundle |
 | `sanctuary/reputation_import` | Import bundle with signature verification |
 | `sanctuary/bootstrap_create_escrow` | Create escrow for trust bootstrapping |
 | `sanctuary/bootstrap_provide_guarantee` | Principal signs guarantee for agent |
+| `sanctuary/handshake_initiate` | Start a sovereignty handshake |
+| `sanctuary/handshake_respond` | Respond to incoming handshake |
+| `sanctuary/handshake_complete` | Complete handshake (initiator side) |
+| `sanctuary/handshake_status` | Check handshake session status |
+
+### Federation (MCP-to-MCP)
+| Tool | Description |
+|------|-------------|
+| `sanctuary/federation_peers` | List, register, or remove federation peers |
+| `sanctuary/federation_trust_evaluate` | Evaluate trust level for a federation peer |
+| `sanctuary/federation_status` | Federation subsystem status |
 
 ### Meta
 | Tool | Description |
 |------|-------------|
 | `sanctuary/manifest` | Sanctuary Interface Manifest (SIM) — machine-readable capabilities |
+| `sanctuary/shr_generate` | Generate signed, machine-readable sovereignty health report |
+| `sanctuary/shr_verify` | Verify a counterparty's SHR |
 
 ## Configuration
 
@@ -120,6 +139,15 @@ Environment variables:
 | `SANCTUARY_PASSPHRASE` | Passphrase for master key derivation | _(none — uses recovery key)_ |
 | `SANCTUARY_STORAGE_PATH` | Storage directory path | `~/.sanctuary` |
 | `SANCTUARY_TRANSPORT` | Transport mode (`stdio` or `http`) | `stdio` |
+| `SANCTUARY_DASHBOARD_ENABLED` | Enable web dashboard (`true`/`false`) | `false` |
+| `SANCTUARY_DASHBOARD_PORT` | Dashboard port | `3501` |
+| `SANCTUARY_DASHBOARD_AUTH_TOKEN` | Bearer token (`"auto"` to generate) | — |
+| `SANCTUARY_DASHBOARD_TLS_CERT` | TLS certificate path | — |
+| `SANCTUARY_DASHBOARD_TLS_KEY` | TLS private key path | — |
+| `SANCTUARY_WEBHOOK_ENABLED` | Enable webhook approvals | `false` |
+| `SANCTUARY_WEBHOOK_URL` | Webhook target URL | — |
+| `SANCTUARY_WEBHOOK_SECRET` | HMAC-SHA256 shared secret | — |
+| `SANCTUARY_WEBHOOK_CALLBACK_PORT` | Callback listener port | `3502` |
 
 ## Principal Policy (prompt injection defense)
 
@@ -131,7 +159,7 @@ The Principal Policy is the human-controlled, agent-immutable configuration that
 
 **Tier 3 — Always allowed (audit only):** Standard read/write/sign operations pass through without interruption, but every operation is audit-logged.
 
-The policy file lives at `~/.sanctuary/principal-policy.yaml`. It is loaded once at startup and frozen — no MCP tool can modify it. The agent cannot see the policy rules in denial responses (preventing attacker learning). Approval requests flow through stderr (outside the MCP protocol), so the agent cannot intercept or forge approvals.
+The policy file lives at `~/.sanctuary/principal-policy.yaml`. It is loaded once at startup and frozen — no MCP tool can modify it. The agent cannot see the policy rules in denial responses (preventing attacker learning). Approval requests flow through out-of-band channels the agent cannot access. Three channels are available: **stderr** (default, auto-deny), **dashboard** (browser-based web UI with real-time SSE, optional bearer token auth and TLS), and **webhook** (POST to external endpoints like Slack or Discord with HMAC-SHA256 signatures).
 
 On first session, non-Tier-3 operations require approval (no baseline exists yet). As the system learns normal patterns, approval fatigue decreases — you only get asked about genuinely unusual behavior.
 
@@ -181,18 +209,26 @@ src/
 │   └── tools.ts           # MCP tool definitions
 ├── l2-operational/        # L2: Attestation + monitoring
 │   └── audit-log.ts       # Encrypted append-only audit log
-├── l3-disclosure/         # L3: Commitments + policies
+├── l3-disclosure/         # L3: Commitments + ZK proofs + policies
 │   ├── commitments.ts     # SHA-256 commitment schemes
+│   ├── zk-proofs.ts       # Pedersen/Ristretto255, Schnorr proofs, range proofs
 │   ├── policies.ts        # Disclosure policy engine
 │   └── tools.ts           # MCP tool definitions
-├── l4-reputation/         # L4: Reputation + bootstrap
+├── l4-reputation/         # L4: Reputation + bootstrap + tiers
 │   ├── reputation-store.ts # Signed attestations, escrow, guarantees
+│   ├── tiers.ts           # Sovereignty-gated reputation tiers
 │   └── tools.ts           # MCP tool definitions
+├── shr/                   # Machine-readable sovereignty health reports
+├── handshake/             # Sovereignty handshake protocol
+├── federation/            # MCP-to-MCP federation registry
 ├── principal-policy/      # Principal Policy (prompt injection defense)
 │   ├── types.ts           # Policy, gate, baseline type definitions
 │   ├── loader.ts          # YAML/JSON policy parser + defaults
 │   ├── baseline.ts        # Behavioral baseline tracker (encrypted)
 │   ├── approval-channel.ts # Stderr + callback approval channels
+│   ├── dashboard.ts       # Browser-based approval UI (SSE, auth, TLS)
+│   ├── dashboard-html.ts  # Embedded HTML/CSS/JS template
+│   ├── webhook.ts         # External webhook approval (HMAC-SHA256)
 │   ├── gate.ts            # Three-tier approval gate
 │   └── tools.ts           # Read-only policy/baseline MCP tools
 ├── router.ts              # MCP SDK tool router (with gate integration)
