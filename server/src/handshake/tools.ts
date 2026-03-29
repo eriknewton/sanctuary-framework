@@ -258,11 +258,7 @@ export function createHandshakeTools(
             result.verified ? "success" : "failure"
           );
 
-          return toolResult({
-            result,
-            // SEC-ADD-03: Tag response — contains counterparty SHR and verification result
-            _content_trust: "external",
-          });
+          return toolResult({ result });
         }
 
         // Otherwise just return session status
@@ -272,8 +268,6 @@ export function createHandshakeTools(
           state: session.state,
           initiated_at: session.initiated_at,
           result: session.result ?? null,
-          // SEC-ADD-03: Tag response — may contain counterparty data from prior handshake
-          _content_trust: "external",
         });
       },
     },
