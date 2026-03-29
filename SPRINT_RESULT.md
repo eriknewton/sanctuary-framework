@@ -1,7 +1,7 @@
-# SPRINT RESULT — SEC-019: Config Silently Accepts Unimplemented Features
+# SPRINT RESULT — SEC-020: Recovery Key Path Regenerates Master Key on Restart
 
 **Sprint Date:** 2026-03-28
-**Finding:** SEC-019 (High)
+**Finding:** SEC-020 (High — Critical data-loss impact)
 **Branch:** `security-review`
 **Implementer:** Claude (sprint session)
 
@@ -11,55 +11,68 @@
 
 ### Changes
 
-**`server/src/config.ts`:**
-- Added `validateConfig()` function (exported) that checks three config fields against whitelists of implemented values:
-  - `state.key_protection`: allows `"passphrase"`, `"none"` — rejects `"hardware-key"`
-  - `execution.environment`: allows `"local-process"`, `"docker"` — rejects `"tee"`
-  - `disclosure.proof_system`: allows `"commitment-only"` — rejects `"groth16"`, `"plonk"`
-- Collects all violations into a single error message (does not fail on first violation)
-- Error messages name the specific field, the invalid value, and the implemented alternatives
-- Called from `loadConfig()` after merging file config into defaults
-- Validation errors are re-thrown through the catch block (file-not-found errors still fall back to defaults)
+**`server/src/index.ts` (lines 98-124, recovery key branch):**
 
-**`server/test/security/reject-unimplemented-features.test.ts`** (new file):
-- 13 regression tests covering:
-  - 4 tests for each unimplemented value (groth16, plonk, hardware-key, tee) — verifies throw with descriptive error
-  - 1 test for multiple unimplemented features in a single config — verifies all are reported
-  - 5 tests for implemented values (commitment-only, passphrase, none, local-process, docker) — verifies acceptance
-  - 1 test for default config with no overrides — verifies normal operation
-  - 2 unit tests for `validateConfig()` directly
+The entire `else` branch (no passphrase path) was rewritten:
+
+1. **Existing installation (recovery-key-hash found):**
+   - Reads `SANCTUARY_RECOVERY_KEY` from `process.env`
+   - If missing: throws descriptive error listing both credential options (`SANCTUARY_PASSPHRASE` or `SANCTUARY_RECOVERY_KEY`)
+   - Decodes recovery key from base64url with format and length validation
+   - Hashes the decoded key via `hashToString()` (SHA-256 → base64url)
+   - Compares against stored hash using `constantTimeEqual()` on the hash bytes
+   - If mismatch: throws error stating the recovery key is incorrect
+   - If match: sets `masterKey = recoveryKeyBytes` (the recovery key IS the master key)
+   - Does NOT set `recoveryKey` (no first-run banner displayed)
+
+2. **First run (no recovery-key-hash):**
+   - Added safety net: checks `_meta` for orphaned `key-params` entries
+   - If key-params exist without a recovery-key-hash: throws error (corrupted/incomplete installation)
+   - Otherwise: proceeds with existing first-run behavior (generate key, store hash, display banner)
+
+**`server/test/security/sec-020-recovery-key-restart.test.ts` (new file):**
+- 9 regression tests covering:
+  - First run generates and stores recovery key hash
+  - Subsequent run with correct recovery key succeeds (verifies data encrypted in run 1 is decryptable after recovery)
+  - Subsequent run without any credentials fails with descriptive error
+  - Subsequent run with incorrect recovery key fails
+  - Invalid base64url encoding rejected
+  - Incorrect key length rejected
+  - Orphaned key-params without recovery-key-hash triggers safety net
+  - Passphrase path unaffected (non-regression)
+  - Constant-time hash comparison unit test
 
 ### Why
 
-The root cause was that `loadConfig()` had no semantic validation. TypeScript union types defined the valid values but were erased at runtime. Any JSON value from a config file was merged in without checking implementedness. This allowed users to configure `proof_system: "groth16"` and believe they had SNARK proofs, when the system silently operated in commitment-only mode.
+The root cause was a `TODO` at line 107 that was never completed. When `_meta/recovery-key-hash` existed (indicating prior encrypted data), the code called `generateRandomKey()` — creating a fresh master key that couldn't decrypt any prior state. Every restart silently orphaned all existing data.
 
-This violates CLAUDE.md constraint #5: "Never silently degrade to a less-secure behavior on error."
+This violates CLAUDE.md constraint #5 ("Never silently degrade to a less-secure behavior on error") and the sovereignty property that encrypted state must remain accessible to its owner.
 
 ---
 
 ## Test Suite Output
 
 ```
-Test Files  28 passed (28)
-     Tests  278 passed (278)
-  Duration  20.13s
+Test Files  29 passed (29)
+     Tests  287 passed (287)
+  Duration  20.06s
 ```
 
-Test count: 265 → 278 (+13 new regression tests)
+Test count: 278 → 287 (+9 new regression tests)
 
 ---
 
 ## New Risk Introduced
 
-None significant. Users with unimplemented values in their config will now get a startup error instead of silent operation. This is the intended behavior — converting a silent security misrepresentation into an explicit, actionable failure.
+1. **Environment variable exposure:** The `SANCTUARY_RECOVERY_KEY` env var carries the master key in base64url form. This is the same risk class as the existing `SANCTUARY_PASSPHRASE` env var — both are readable via `/proc/PID/environ` by a process owner. Acceptable trade-off for a server that already accepts its primary credential via environment variable.
 
-The only edge case: a user who had `proof_system: "groth16"` in their config but never noticed (because the system silently ignored it) will now need to change it to `"commitment-only"`. The error message tells them exactly what to do.
+2. **Breaking change for broken deployments:** Users who were unknowingly restarting in recovery-key mode without credentials will now get an error instead of a silently-broken server. This is the correct behavior — the previous behavior was destroying their data.
 
 ---
 
 ## Adjacent Findings Noticed
 
-None. This fix is isolated to the config parser and does not touch any other security surface.
+None. This fix is isolated to the key initialization path in `createSanctuaryServer()` and does not touch any other security surface.
 
 ---
 
@@ -67,11 +80,11 @@ None. This fix is isolated to the config parser and does not touch any other sec
 
 | Criterion | Met? |
 |-----------|------|
-| `loadConfig()` rejects all three unimplemented feature values | ✅ |
-| Error messages name the specific feature and its current value | ✅ |
-| All implemented values accepted without error | ✅ |
-| Default config (no file) continues to work | ✅ |
-| Regression tests cover all unimplemented and implemented values | ✅ (13 tests) |
-| Full test suite passes with count >= 265 | ✅ (278 tests) |
+| Code path at index.ts:104-109 no longer calls `generateRandomKey()` when existing data present | ✅ |
+| Recovery key hash verified with constant-time comparison | ✅ (`constantTimeEqual` on hash bytes) |
+| Error messages clearly explain what the user must do | ✅ (lists both credential options) |
+| All 5+ regression tests pass | ✅ (9 tests) |
+| Full test suite count does not decrease from 278 | ✅ (287 tests, +9) |
+| Data written under one master key is readable after restart with correct recovery key | ✅ (test 2 verifies encrypt/decrypt roundtrip) |
 
 All sprint contract criteria are met.
