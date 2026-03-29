@@ -899,3 +899,160 @@ None. The fix is clean, minimal, and precisely scoped. No new concerns raised.
 ## Grade: PASS
 
 All six verification criteria met. The `setTimeout` is deleted (not reduced or moved). The channel denies synchronously with zero async gap. `decided_by` uses a valid, well-typed value that downstream code handles correctly. The SEC-002 invariant is preserved and strictly strengthened. Webhook and dashboard channels are completely untouched. The 4 new regression tests cover all required properties. The 2 updated existing tests preserve their original invariants. The commit scope is exactly as expected with no unexpected files. Full suite 265/265.
+
+---
+---
+
+# SPRINT_EVAL.md — SEC-019: Independent QA Evaluation
+
+**Date:** 2026-03-28
+**Evaluator posture:** Skeptical QA — did not write this code, does not trust self-assessment.
+**Finding:** SEC-019 — Config Silently Accepts Unimplemented Security Features
+**Commit:** `0633836`
+**Branch:** `security-review`
+
+---
+
+## 1. ROOT CAUSE
+
+**Question:** Does the fix reject unimplemented config values at load time — before any component initializes with a false assumption — or does it warn after initialization?
+
+**Verdict: PASS.**
+
+In `config.ts`, `loadConfig()` follows this sequence:
+
+1. `deepMerge(config, fileConfig)` at line 182 produces the merged config.
+2. `validateConfig(merged)` at line 183 runs validation.
+3. `return merged` at line 184 only executes if validation passes.
+
+The `validateConfig()` function (lines 212-253) throws an `Error` if any unimplemented value is found. This throw happens before the config object is returned to any caller. No component can initialize with a config containing unimplemented values because `loadConfig()` never returns one.
+
+In the catch block (lines 185-192), validation errors are re-thrown: the check `err.message.includes("unimplemented features")` at line 187 ensures validation errors propagate while file-not-found errors fall back to defaults. This means a caller wrapping `loadConfig()` in try/catch cannot silently swallow a validation error unless they explicitly ignore errors containing "unimplemented features" — which would require deliberate intent.
+
+The default config path (line 191) returns defaults without calling `validateConfig()`. This is safe because `defaultConfig()` returns `key_protection: "none"`, `environment: "local-process"`, and `proof_system: "commitment-only"` — all implemented values. Confirmed by the test "validateConfig passes for default config" (test line 157-159).
+
+---
+
+## 2. WHITELIST COMPLETENESS
+
+**Question:** Are the rejected values genuinely unimplemented, and are there other config fields with unimplemented values not covered?
+
+**Verdict: PASS, with one non-blocking observation.**
+
+**(a) Are the rejected values genuinely unimplemented?**
+
+- `"hardware-key"`: Searched `server/src/` for any implementation. Found only type annotations in `identity.ts:27`, `identity.ts:102`, `tools.ts:145`, and `index.ts:65` — all declaring the union type. No FIDO2, WebAuthn, or hardware security module code exists anywhere in the codebase. CLAUDE.md §"Intended but unverified" #19 confirms: "planned for v0.3.0, config option exists, implementation not yet present." Correctly rejected.
+
+- `"tee"`: Searched `server/src/`. All references are diagnostic: `shr/generator.ts:65` says "Process-level isolation only (no TEE)", `shr/generator.ts:66` says "TEE support planned for v0.3.0", `index.ts:164` echoes the same. No TEE integration, remote attestation, or enclave code exists. CLAUDE.md §"Intended but unverified" #20 confirms. Correctly rejected.
+
+- `"groth16"` and `"plonk"`: Searched `server/src/`. Zero results outside `config.ts`. No SNARK circuit definitions, no trusted setup, no proof generation or verification code. CLAUDE.md §"Intended but unverified" #21 confirms: "Config accepts these as proof_system options, but only commitment-only is implemented." Correctly rejected.
+
+**(b) Are there other config fields with unimplemented values?**
+
+I examined the full `SanctuaryConfig` interface. Two fields warrant mention:
+
+- `disclosure.default_policy` accepts `"withhold-all"` in addition to `"minimum-necessary"`. Searching the codebase for `withhold-all`, `default_policy`, or `minimum-necessary` outside config.ts returns zero results. Neither value is read by any code. This means neither policy is enforced — but unlike the three validated fields, neither claims to provide a specific cryptographic capability. The security impact is lower: a user setting `"withhold-all"` gets the same behavior as `"minimum-necessary"` (neither is enforced), rather than believing they have hardware key protection they don't have.
+
+- `reputation.mode` accepts `"service-mediated"`. References in `shr/generator.ts:118` and `index.ts:272,364` pass the value through as a label, but no code branches on it to implement service-mediated reputation differently from self-custodied.
+
+These are not security-critical misrepresentations in the way groth16/plonk/hardware-key/tee are, so their omission from the SEC-019 fix is defensible. Logged as a non-blocking observation for future consideration.
+
+---
+
+## 3. ERROR COLLECTION
+
+**Question:** Does the fix collect all violations into a single error, and is the error descriptive and non-swallowable?
+
+**Verdict: PASS.**
+
+**(a) All three fields are always checked regardless of earlier failures.**
+
+The `validateConfig()` function (lines 212-253) uses three independent `if` blocks at lines 218, 229, and 240. Each pushes to the `errors` array without returning early. If all three fields are invalid, all three are checked and all three error messages are collected.
+
+**(b) Error messages are descriptive enough for a user to understand what to change.**
+
+Each error message includes: the full config path (e.g., `state.key_protection`), the invalid value in quotes, the list of implemented alternatives, and an explanation of why the unimplemented value is dangerous ("would silently degrade security"). The outer error message prefixes with "Sanctuary configuration references unimplemented features:" followed by all violations joined by newlines.
+
+**(c) The error cannot be silently swallowed.**
+
+The catch block in `loadConfig()` (lines 186-189) re-throws any error whose message includes "unimplemented features". Only file-not-found errors are swallowed. A caller that wraps `loadConfig()` in try/catch would receive the validation error as a thrown exception — standard error propagation.
+
+One minor note: the re-throw mechanism relies on string matching (`err.message.includes("unimplemented features")`). A future refactor that changes the error message wording could break this. A custom error class would be more robust, but this is a code quality concern, not a security gap.
+
+---
+
+## 4. DEFAULT CONFIG
+
+**Question:** Does default config (no file) continue to work?
+
+**Verdict: PASS.**
+
+`defaultConfig()` returns:
+- `state.key_protection: "none"` — in whitelist `["passphrase", "none"]`
+- `execution.environment: "local-process"` — in whitelist `["local-process", "docker"]`
+- `disclosure.proof_system: "commitment-only"` — in whitelist `["commitment-only"]`
+
+All three pass validation. When no config file exists, `loadConfig()` catches the file-not-found error and returns the default config at line 191, bypassing validation entirely (safe because defaults are hardcoded and always valid).
+
+Test coverage: "accepts default config (no overrides)" (test line 149-153) loads from a non-existent path and confirms no throw. "validateConfig passes for default config" (test line 157-159) directly validates the default config object.
+
+---
+
+## 5. REGRESSION TESTS
+
+**Question:** Does `reject-unimplemented-features.test.ts` adequately test the fix?
+
+**Verdict: PASS.**
+
+The test file contains 13 tests in one describe block:
+
+**(a) Each unimplemented value individually rejected:**
+- `"groth16"` (line 42-52): verifies throw matches `/unimplemented/i`, `/disclosure\.proof_system/`, `/groth16/`
+- `"plonk"` (line 54-61): verifies throw matches `/unimplemented/i`, `/plonk/`
+- `"hardware-key"` (line 65-75): verifies throw matches `/unimplemented/i`, `/state\.key_protection/`, `/hardware-key/`
+- `"tee"` (line 79-89): verifies throw matches `/unimplemented/i`, `/execution\.environment/`, `/tee/`
+
+**(b) Multiple violations produce a single combined error:**
+- Test at line 93-115: sets all three fields to unimplemented values, verifies the single thrown error contains all three values (`/hardware-key/`, `/tee/`, `/groth16/`).
+
+**(c) Valid/default values pass:**
+- `"commitment-only"` (line 119-123)
+- `"passphrase"` (line 125-129)
+- `"none"` (line 131-135)
+- `"local-process"` (line 137-141)
+- `"docker"` (line 143-147)
+- Default config with no overrides (line 149-153)
+- `validateConfig` direct unit tests (lines 157-165)
+
+**Full suite: 278/278 passed.** Confirmed by running `npx vitest run` — output shows "Test Files 28 passed (28), Tests 278 passed (278)". Count increased from 265 to 278 (+13 new tests).
+
+---
+
+## 6. SCOPE
+
+**Question:** Does commit `0633836` touch exactly 4 files?
+
+**Verdict: PASS.**
+
+`git show --stat 0633836` confirms exactly 4 files changed:
+
+1. `server/src/config.ts` — added `validateConfig()` function and call from `loadConfig()`
+2. `server/test/security/reject-unimplemented-features.test.ts` — new file, 166 lines
+3. `SPRINT_CONTRACT.md` — sprint contract for SEC-019
+4. `SPRINT_RESULT.md` — sprint result for SEC-019
+
+No unexpected files. No changes to router, gate, storage, or any other subsystem.
+
+---
+
+## Observations (Non-Blocking)
+
+1. **Unimplemented-but-unchecked config values:** `disclosure.default_policy: "withhold-all"` is accepted by the type system but never read by any code. `reputation.mode: "service-mediated"` is passed through as a label but triggers no behavioral change. Neither represents a false security promise at the level of groth16/hardware-key/tee, but they are dead config options. Consider adding validation or removing from the union type in a future cleanup sprint.
+
+2. **Error re-throw uses string matching:** The catch block in `loadConfig()` detects validation errors by checking `err.message.includes("unimplemented features")`. A custom error class (e.g., `ConfigValidationError`) would be more robust against message wording changes. Non-blocking because the current implementation works correctly.
+
+---
+
+## Grade: PASS
+
+All six verification criteria met. `validateConfig()` is called before the config is returned to any caller, preventing initialization with unimplemented features. The three validated fields are genuinely unimplemented — confirmed by codebase search. Error collection checks all fields independently and produces descriptive, combined error messages. Default config passes validation. 13 regression tests cover all unimplemented values, all implemented values, combined errors, and default config. Commit scope is exactly 4 files. Full suite 278/278.
