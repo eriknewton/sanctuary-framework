@@ -1,7 +1,7 @@
-# SPRINT CONTRACT — SEC-016: Stderr Approval Channel Auto-Resolves in 100ms
+# SPRINT CONTRACT — SEC-019: Config Silently Accepts Unimplemented Features
 
 **Sprint Date:** 2026-03-28
-**Finding:** SEC-016 (High)
+**Finding:** SEC-019 (High)
 **Branch:** `security-review`
 **Implementer:** Claude (sprint session)
 
@@ -11,38 +11,27 @@
 
 ### a) Root Cause
 
-The `StderrApprovalChannel.requestApproval()` method (approval-channel.ts:45-66) uses a 100ms `setTimeout` before returning its response. This creates two problems:
+The root cause is that `loadConfig()` in `server/src/config.ts` performs no semantic validation after merging the config file into defaults. The TypeScript type `SanctuaryConfig` defines union types that include unimplemented values (`"groth16" | "plonk"` for `proof_system`, `"hardware-key"` for `key_protection`, `"tee"` for `environment`), but the type system is erased at runtime. The `deepMerge` function accepts any JSON values from the config file without checking whether the resulting config references features the codebase actually implements.
 
-1. **The 100ms delay serves no purpose.** The channel never reads any input — the setTimeout is cosmetic. It creates the illusion of waiting for a response that can never arrive. In the MCP stdio transport model, stdin is consumed by the MCP JSON-RPC protocol and is not available for interactive human input.
-
-2. **The timing window is a latent risk.** While SEC-002 hardened the return value to always be `"deny"`, the 100ms async gap between the stderr write and the resolution is unnecessary attack surface. Any future code that races against this Promise (e.g., a concurrent channel fallback, a middleware that interprets "no response yet" as approval) has a 100ms window to exploit. The webhook and dashboard channels have legitimate timeout windows because they are waiting for real human input. The stderr channel is waiting for nothing.
-
-The root cause is: **the stderr channel was implemented as a timeout-based channel mimicking the webhook/dashboard pattern, but it has no input mechanism to justify a timeout.**
+The symptom is silent degradation: a user sets `proof_system: "groth16"` and the code paths check `=== "commitment-only"` — when that check is false, they proceed as if a real ZK system is available, but the actual proof operations still produce commitment-only results. The user believes they have SNARK proofs; they do not.
 
 ### b) Smallest Change That Closes the Vulnerability
 
-Remove the `setTimeout` entirely. The stderr channel should:
-- Write the informational prompt to stderr (preserved — the human still sees what's happening)
-- Return `decision: "deny"` immediately and synchronously (no async gap)
-- Document clearly in the prompt text and code comments that this is a non-interactive channel
+Add a `validateConfig()` function called at the end of `loadConfig()` that checks the three unimplemented feature fields and throws a clear error if any unimplemented value is specified. The implemented (allowed) values are:
 
-This is Option B from REMEDIATION_PLAN.md HP-11: remove the fake timeout, always deny, document the limitation. Option A (reading stdin) is infeasible because stdin is consumed by MCP protocol.
+- `state.key_protection`: `"passphrase"` and `"none"` (implemented). `"hardware-key"` is NOT implemented.
+- `execution.environment`: `"local-process"` and `"docker"` (implemented). `"tee"` is NOT implemented.
+- `disclosure.proof_system`: `"commitment-only"` (implemented). `"groth16"` and `"plonk"` are NOT implemented.
+
+The error message must clearly state which feature is not implemented, preventing silent fallback.
 
 ### c) Interaction with Other Findings
 
-**SEC-002 (Critical, PASS):** SEC-002 hardened all three approval channels so that timeout always results in denial. The SEC-002 fix for the stderr channel changed the return value from `this.config.auto_deny ? "deny" : "approve"` to a hardcoded `"deny"`. This sprint completes the hardening by eliminating the timing window itself. After this fix, the stderr channel has zero async gap — it denies synchronously. This is strictly stronger than SEC-002's invariant ("timeout always denies") because there is no timeout to exploit at all.
-
-**SEC-019 (pending):** No interaction. Config validation is a separate concern.
-
-**SEC-012 (PASS):** No interaction. Dashboard auth token is a separate channel.
+None. SEC-019 has no dependencies per REMEDIATION_PLAN.md.
 
 ### d) New Risk Introduced
 
-Minimal. The behavioral change is:
-- Before: deny after 100ms async delay
-- After: deny immediately (synchronous)
-
-Any code depending on the 100ms delay for stderr flushing would be affected, but `process.stderr.write()` is synchronous in Node.js — it does not need an async flush window. The prompt is displayed before the denial is returned regardless.
+Minimal. Users who previously had unimplemented values in their config will now get an error at startup instead of silent operation. This is the intended behavior — it converts a silent security misrepresentation into an explicit failure. The error message will guide users to the correct implemented value.
 
 ---
 
@@ -50,44 +39,45 @@ Any code depending on the 100ms delay for stderr flushing would be affected, but
 
 ### Fix Chosen
 
-Remove the 100ms `setTimeout` from `StderrApprovalChannel.requestApproval()`. Replace with synchronous deny-on-call. Update the prompt text to explicitly state this is a non-interactive channel. Update code comments to document the SEC-002 and SEC-016 invariants. Change `decided_by` from `"timeout"` to `"stderr:non-interactive"` to distinguish from legitimate timeouts in webhook/dashboard channels.
+Add a `validateConfig()` function in `config.ts` that is called at the end of `loadConfig()` (after merging defaults with file/env overrides). This function checks the three affected fields against a whitelist of implemented values and throws a descriptive `Error` if any unimplemented value is found.
+
+This is preferred over removing the unimplemented values from the TypeScript union types because: (1) the type union documents the roadmap intent, and (2) the runtime check catches config file values that bypass TypeScript entirely (raw JSON).
 
 ### Files Modified
 
 | File | Change |
 |------|--------|
-| `server/src/principal-policy/approval-channel.ts:45-66` | Remove setTimeout, return deny synchronously, update prompt text, update decided_by |
-| `server/test/security/sec-016-stderr-always-denies.test.ts` | New: regression tests for SEC-016 |
+| `server/src/config.ts` | Add `validateConfig()` function; call from `loadConfig()` |
+| `server/test/security/reject-unimplemented-features.test.ts` | New: regression tests for SEC-019 |
 
 ### Behavior Before and After
 
-**Before:**
-- `requestApproval()` writes prompt to stderr
-- Waits 100ms via `setTimeout`
-- Returns `{ decision: "deny", decided_by: "timeout" }` after 100ms
+**Before:** `loadConfig()` with `{ disclosure: { proof_system: "groth16" } }` returns a config object silently. The system starts and operates as if it has SNARK proof support, but all proof operations produce commitment-only results.
 
-**After:**
-- `requestApproval()` writes prompt to stderr
-- Returns `{ decision: "deny", decided_by: "stderr:non-interactive" }` immediately (no async delay)
-- Prompt text includes: "Non-interactive channel — operation denied automatically"
+**After:** `loadConfig()` with `{ disclosure: { proof_system: "groth16" } }` throws: `Unimplemented config value: disclosure.proof_system = "groth16". Only "commitment-only" is currently implemented. Using an unimplemented proof system would silently degrade security.`
+
+Same pattern for `key_protection: "hardware-key"` and `environment: "tee"`.
 
 ### Regression Tests
 
-1. **stderr channel always denies Tier 1 operations** — create a StderrApprovalChannel, call requestApproval with a Tier 1 operation, assert decision is "deny" and decided_by is "stderr:non-interactive".
-2. **stderr channel denies immediately (no timing window)** — measure the wall-clock time of requestApproval, assert it completes in <10ms (no 100ms delay).
-3. **stderr channel ignores auto_deny config** — create a channel with `auto_deny: false`, confirm it still denies (SEC-002 interaction).
-4. **stderr channel denies Tier 2 operations identically** — same as test 1 but with tier 2.
+1. `loadConfig` with `proof_system: "groth16"` throws with descriptive error
+2. `loadConfig` with `proof_system: "plonk"` throws with descriptive error
+3. `loadConfig` with `key_protection: "hardware-key"` throws with descriptive error
+4. `loadConfig` with `environment: "tee"` throws with descriptive error
+5. `loadConfig` with all implemented values (`"commitment-only"`, `"passphrase"`, `"local-process"`) succeeds
+6. `loadConfig` with default config (no overrides) succeeds
+7. `loadConfig` with multiple unimplemented features reports all of them
 
 ### Definition of Done
 
 The evaluator will verify:
-1. The `setTimeout` / `100ms` delay is completely removed from the stderr channel
-2. The channel returns deny synchronously with no async gap
-3. `decided_by` clearly identifies the decision as a non-interactive channel denial (not a "timeout")
-4. The SEC-002 invariant is preserved: no configuration can cause the stderr channel to approve
-5. All 4 regression tests pass
-6. Full test suite count >= 261 (no decrease)
+1. `loadConfig()` rejects all three unimplemented feature values with clear error messages
+2. Error messages name the specific unimplemented feature and its current value
+3. All implemented values continue to be accepted without error
+4. Default config (no file) continues to work
+5. Regression tests cover all unimplemented values and all implemented values
+6. Full test suite passes with count >= 265
 
 ### Prompt Injection Assessment
 
-This fix does not touch any input/output path that processes user-controlled or agent-controlled text. The stderr channel writes a formatted prompt string constructed from system-internal `ApprovalRequest` fields (operation name, tier, reason). These fields originate from the gate evaluation logic, not from external input. No prompt injection surface is introduced or modified.
+This fix does not touch any input/output path that reaches a model prompt. Config values come from a local JSON file or environment variables, not from agent-controlled input. No prompt injection concern.
