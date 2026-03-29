@@ -40,10 +40,8 @@ export interface ApprovalChannel {
  * - For interactive approval, use the dashboard or webhook channel.
  */
 export class StderrApprovalChannel implements ApprovalChannel {
-  private config: ApprovalChannelConfig;
 
-  constructor(config: ApprovalChannelConfig) {
-    this.config = config;
+  constructor(_config: ApprovalChannelConfig) {
   }
 
   async requestApproval(request: ApprovalRequest): Promise<ApprovalResponse> {
