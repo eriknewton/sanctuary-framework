@@ -1568,3 +1568,37 @@ Already evaluated in SEC-003 sprint eval. Contains SEC-ADD-03 changes (4 files: 
 1. Encoding bypass in sanitization is safe under standard MCP JSON transport assumption. Document this assumption.
 2. `reputation_query_weighted` in Sanctuary should be reviewed for tagging consistency with `reputation_query`.
 3. SEC-ADD-04 remains open in hardening queue — tracked correctly.
+
+---
+
+## SEC-ADDENDUM Follow-Up: Condition Resolution
+
+**Re-check Date:** 2026-03-28
+**Evaluator Posture:** Targeted re-check of three CONDITIONAL PASS conditions only
+
+### CONDITION 1 — Delimiter injection (Concordia): **PASS**
+
+`_sanitize_string()` (mcp_server.py line 128) now calls `.replace("[EXTERNAL_DATA]", "").replace("[/EXTERNAL_DATA]", "")` after control-char stripping and before length enforcement. This runs before `_wrap_external()` adds delimiters, so attacker strings cannot break out of the `[EXTERNAL_DATA]...[/EXTERNAL_DATA]` block. Regression test `test_delimiter_injection_stripped_before_wrapping` in `tests/test_prompt_injection.py` (class `TestDelimiterInjection`) asserts that a malicious string containing `[/EXTERNAL_DATA]` is stripped, the wrapped result has exactly one opening and one closing delimiter, and no breakout is possible. Concordia suite: **518/518 passed**.
+
+### CONDITION 2 — Missing Sanctuary tags: **PASS**
+
+All four tools confirmed tagged with `_content_trust: "external"`:
+- `handshake_status` — handshake/tools.ts (status query response)
+- `federation_peers` — federation/tools.ts (peer list response)
+- `federation_trust_evaluate` — federation/tools.ts (trust evaluation response)
+- `reputation_query_weighted` — l4-reputation/tools.ts (weighted query response)
+
+One regression test per tool in `server/test/security/prompt-injection-tagging.test.ts`: `handshake_status result includes _content_trust: external`, `federation_peers list result includes _content_trust: external`, `federation_trust_evaluate result includes _content_trust: external`, `reputation_query_weighted result includes _content_trust: external`. `reputation_query_weighted` reviewed and confirmed as returning counterparty attestation data — correctly tagged.
+
+### CONDITION 3 — Sanctuary test coverage: **PASS**
+
+Regression tests exist for all three originally-tagged-but-untested tools:
+- `handshake_respond result includes _content_trust: external` — exercises tool handler via `callTool`, asserts `response._content_trust === "external"`
+- `handshake_complete result includes _content_trust: external` — full handshake protocol flow through tool handler, asserts `completeResult._content_trust === "external"`
+- `reputation_query result includes _content_trust: external` — exercises L4 tool handler, asserts `result._content_trust === "external"`
+
+Sanctuary suite: **310/310 passed**.
+
+### Overall Grade: **PASS**
+
+All three conditions resolved. SEC-ADDENDUM moves from CONDITIONAL PASS to unconditional PASS.
