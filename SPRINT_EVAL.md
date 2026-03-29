@@ -1056,3 +1056,127 @@ No unexpected files. No changes to router, gate, storage, or any other subsystem
 ## Grade: PASS
 
 All six verification criteria met. `validateConfig()` is called before the config is returned to any caller, preventing initialization with unimplemented features. The three validated fields are genuinely unimplemented — confirmed by codebase search. Error collection checks all fields independently and produces descriptive, combined error messages. Default config passes validation. 13 regression tests cover all unimplemented values, all implemented values, combined errors, and default config. Commit scope is exactly 4 files. Full suite 278/278.
+
+---
+---
+
+# SPRINT_EVAL.md — SEC-020: Independent QA Evaluation
+
+**Date:** 2026-03-28
+**Evaluator posture:** Skeptical QA — did not write this code, does not trust self-assessment.
+**Finding:** SEC-020 — Recovery Key Path Regenerates Master Key on Every Restart
+**Commit:** `d44997d`
+**Branch:** `security-review`
+
+---
+
+## 1. ROOT CAUSE
+
+**Question:** Does the fix eliminate the `generateRandomKey()` call from the recovery path entirely? Is there any remaining code path where a new random key is generated when existing encrypted data is present?
+
+**Verdict: PASS.**
+
+I read `server/src/index.ts` lines 98-182 directly. The `else` branch (no passphrase) now has two sub-branches:
+
+**When `_meta/recovery-key-hash` exists (lines 109-158):** The code reads `SANCTUARY_RECOVERY_KEY` from `process.env`, decodes from base64url, validates length (32 bytes), hashes via `hashToString()`, compares against the stored hash using `constantTimeEqual()`, and sets `masterKey = recoveryKeyBytes`. There is no call to `generateRandomKey()` anywhere in this path. Three `throw new Error()` gates prevent fallthrough: missing env var (line 113), format/length failures (lines 129, 135), and hash mismatch (line 148).
+
+**When `_meta/recovery-key-hash` does not exist (lines 159-181):** Before calling `generateRandomKey()`, the code checks for orphaned `key-params` in `_meta` (line 162). If found, it throws — refusing to start. Only if no `key-params` exist (genuine first run) does `generateRandomKey()` execute at line 172.
+
+The `generateRandomKey()` call at line 172 is the only one in the entire `else` branch, and it is guarded by the absence of both `recovery-key-hash` and `key-params`. No code path generates a new key when existing encrypted data is present.
+
+---
+
+## 2. KEY VERIFICATION
+
+**Question:** Is the comparison genuinely constant-time? Does a wrong key cause server refusal? Does the hash comparison use the same algorithm as the original hash?
+
+**Verdict: PASS.**
+
+**(a) Constant-time comparison:** `constantTimeEqual()` in `server/src/core/encoding.ts:62-68` uses the standard XOR-accumulate pattern: `diff |= a[i] ^ b[i]` in a loop over all bytes, returning `diff === 0`. The `===` comparison is on an integer (the accumulated diff), not on the hash strings — this is correct. The early return on `a.length !== b.length` is acceptable because both inputs are always SHA-256 hashes encoded to base64url string bytes — they are always the same length. This is not `===` or `==` on the hash strings themselves.
+
+**(b) Wrong key causes refusal:** Line 148-153 throws `"Recovery key does not match the stored key hash"` on mismatch. This is an unhandled throw that propagates up to `createSanctuaryServer()` and prevents the server from starting. There is no catch block, no fallback, no silent key generation.
+
+**(c) Same algorithm:** Both the original hash (line 175, first run: `hashToString(masterKey)`) and the verification hash (line 142, recovery: `hashToString(recoveryKeyBytes)`) use the same `hashToString()` function from `server/src/core/hashing.ts`, which computes SHA-256 and encodes as base64url. Same function, same parameters, same algorithm.
+
+---
+
+## 3. ENVIRONMENT VARIABLE SECURITY
+
+**Question:** Is the key logged? Is the env var cleared after use? Do error messages reveal hash or key material?
+
+**Verdict: PASS (with minor observation).**
+
+**(a) No logging of key material:** I searched for `console.log`, `console.warn`, `console.error`, and `console.info` combined with `recovery` or `SANCTUARY_RECOVERY` in `index.ts`. Zero matches. The `envRecoveryKey` variable is read, decoded, hashed, and compared — it never appears in any log statement or error message string. Error messages reference the env var *name* (`SANCTUARY_RECOVERY_KEY`) but never its *value*.
+
+**(b) Env var not cleared after use:** `process.env.SANCTUARY_RECOVERY_KEY` is not deleted after the key is extracted. This is consistent with the existing treatment of `SANCTUARY_PASSPHRASE` (also not cleared). The SPRINT_CONTRACT acknowledged this as an accepted risk: "This is the same risk class as `SANCTUARY_PASSPHRASE`." Non-blocking — parity with existing behavior.
+
+**(c) No hash or key material in error messages:** All four error paths (missing env var at line 113, invalid base64url at line 129, wrong length at line 135, hash mismatch at line 148) contain only instructional text. None include `storedHash`, `existingHash`, `keyHash`, `providedHash`, `recoveryKeyBytes`, or `envRecoveryKey` in the error strings. Verified by searching all `throw new Error` strings in lines 98-182.
+
+---
+
+## 4. ORPHANED METADATA
+
+**Question:** Does the corrupted-metadata path also refuse to start rather than generating a new key?
+
+**Verdict: PASS.**
+
+Lines 160-169: When `_meta/recovery-key-hash` is absent (first-run branch), the code lists `_meta` entries and checks for `key-params`. If `key-params` exists without a `recovery-key-hash`, line 164 throws: `"Found existing key derivation parameters but no recovery key hash. This indicates a corrupted or incomplete installation."` This is a hard throw — no fallback, no key generation. The `generateRandomKey()` call at line 172 is only reachable if the `hasKeyParams` check passes (no orphaned metadata).
+
+No code path silently overwrites existing key material.
+
+---
+
+## 5. REGRESSION TESTS
+
+**Question:** Do the 9 tests cover the required scenarios? Does the full suite pass at 287/287?
+
+**Verdict: PASS.**
+
+Located at `server/test/security/sec-020-recovery-key-restart.test.ts` (242 lines, 9 `it()` blocks). Coverage:
+
+| # | Test | Required Scenario |
+|---|------|-------------------|
+| 1 | first run generates a recovery key and stores its hash | Fresh start |
+| 2 | subsequent run with correct recovery key succeeds and preserves key material | (a) correct key restores access |
+| 3 | subsequent run without credentials fails with descriptive error | (c) missing key refuses start |
+| 4 | subsequent run with incorrect recovery key fails | (b) wrong key refuses start |
+| 5 | rejects recovery key with invalid base64url encoding | Input validation |
+| 6 | rejects recovery key with incorrect length | Input validation |
+| 7 | first run with orphaned key-params fails | Orphaned metadata safety net |
+| 8 | passphrase path is not affected | Non-regression |
+| 9 | recovery key verification uses constant-time hash comparison | Crypto mechanism unit test |
+
+All four required scenarios (a-d from the task) are covered: test 2 covers (a), test 4 covers (b), test 3 covers (c), test 1 covers (d). Additional tests for input validation and non-regression round out the suite.
+
+**Full suite result:** 287/287 passed, 29 test files, 20.00s duration. Confirmed by running `npx vitest run` directly.
+
+---
+
+## 6. SCOPE
+
+**Question:** Does commit `d44997d` touch only the expected files?
+
+**Verdict: PASS.**
+
+`git show --stat d44997d` reports exactly 4 files:
+
+- `SPRINT_CONTRACT.md` — expected
+- `SPRINT_RESULT.md` — expected
+- `server/src/index.ts` — expected (the fix)
+- `server/test/security/sec-020-recovery-key-restart.test.ts` — expected (new test file)
+
+No unexpected files. 400 insertions, 79 deletions.
+
+---
+
+## Observations (Non-Blocking)
+
+1. **Environment variable not cleared from memory:** `process.env.SANCTUARY_RECOVERY_KEY` persists in the Node.js process after use. This is the same pattern as `SANCTUARY_PASSPHRASE` and is accepted risk per the sprint contract. A future hardening sprint could zero both env vars after extraction — but this is defense-in-depth, not a blocking issue.
+
+2. **`constantTimeEqual` early return on length mismatch:** The function returns `false` immediately when `a.length !== b.length`. In this usage, both inputs are always the same length (base64url-encoded SHA-256 hash → string bytes), so the early return is unreachable during normal operation. Not a vulnerability in this context, but worth noting for any future reuse of the function with variable-length inputs.
+
+---
+
+## Grade: PASS
+
+All six verification criteria met. The `generateRandomKey()` call is eliminated from all code paths where existing encrypted data is present. Recovery key verification uses genuine constant-time comparison via XOR-accumulate, not `===` on hash strings. Wrong or missing credentials cause hard startup failure with descriptive errors that reveal no key material. The orphaned-metadata safety net catches corrupted installations and refuses to start. 9 regression tests cover all required scenarios plus input validation and non-regression. Commit scope is exactly 4 expected files. Full suite 287/287.
