@@ -399,6 +399,36 @@ Description: Because Concordia has no lockfile, the exact version of `cryptograp
 **Remediation:** This cannot be fully solved at the MCP server level — it requires cooperation from the agent harness. However, the MCP servers should: (1) Add a `_data_provenance` field to all tool responses that contain counterparty-controlled data, indicating which fields are external. Example: `{ _data_provenance: { "terms": "counterparty", "session_id": "system" } }`. (2) Add string length limits to all Concordia text fields (negotiation terms, offer content, reasoning) — 10KB max per field. (3) Document in CLAUDE.md and in tool descriptions which response fields may contain adversarial content. (4) Strip Unicode control characters (U+0000-U+001F, U+007F-U+009F, U+200B-U+200F, U+2028-U+2029, U+202A-U+202E, U+FEFF) from all string inputs before processing.
 **Effort:** Medium (2-8 hrs) across both codebases.
 
+### H-16: Add Auth Gate to `relay_status`
+**Finding:** HP-16+HP-17 evaluator observation (Low)
+**Remediation:** In `concordia/mcp_server.py`, require a valid `auth_token` on the `concordia_relay_status` tool. The tool currently returns session details including participant IDs to any caller. After CP-05 auth is in place, validate the token and confirm the caller is a participant in the requested session before returning status.
+**Effort:** Small (< 2 hrs) after CP-05.
+
+### H-17: Add Auth Gate to `relay_archive`
+**Finding:** HP-16+HP-17 evaluator observation (Low)
+**Remediation:** In `concordia/mcp_server.py`, require a valid `auth_token` on the `concordia_relay_archive` tool. This tool is mutating (freezes a concluded session) and should not be callable by unauthenticated parties. Validate the token and confirm the caller is a session participant before allowing the archive operation.
+**Effort:** Small (< 2 hrs) after CP-05.
+
+### H-18: Add Auth Gate to `relay_list_archives`
+**Finding:** HP-16+HP-17 evaluator observation (Low)
+**Remediation:** In `concordia/mcp_server.py`, require a valid `auth_token` on the `concordia_relay_list_archives` tool. The tool accepts an optional `agent_id` filter without validation, allowing any caller to enumerate archived sessions. Validate the token and scope results to sessions the authenticated caller participated in.
+**Effort:** Small (< 2 hrs) after CP-05.
+
+### H-19: Add Auth Gate to `sanctuary_bridge_configure`
+**Finding:** HP-16+HP-17 evaluator observation (Medium)
+**Remediation:** In `concordia/mcp_server.py`, require a valid `auth_token` on the `concordia_sanctuary_bridge_configure` tool. This tool configures bridge parameters and should be restricted to authenticated session participants. Validate the token before allowing configuration changes.
+**Effort:** Small (< 2 hrs) after CP-05.
+
+### H-20: Add Auth Gate to `sanctuary_bridge_commit`
+**Finding:** HP-16+HP-17 evaluator observation (Medium)
+**Remediation:** In `concordia/mcp_server.py`, require a valid `auth_token` on the `concordia_sanctuary_bridge_commit` tool. The tool generates commitment payloads including agreed terms with no auth check — any caller who knows the session ID can trigger commitment generation. Validate the token and confirm the caller is a session participant.
+**Effort:** Small (< 2 hrs) after CP-05.
+
+### H-21: Add Auth Gate to `sanctuary_bridge_attest`
+**Finding:** HP-16+HP-17 evaluator observation (Medium)
+**Remediation:** In `concordia/mcp_server.py`, require a valid `auth_token` on the `concordia_sanctuary_bridge_attest` tool. The tool accepts arbitrary attestation dicts with no auth check, allowing unauthenticated attestation injection. Validate the token and confirm the caller is a session participant before accepting attestations.
+**Effort:** Small (< 2 hrs) after CP-05.
+
 ---
 
 ## SECTION 5: REGRESSION TESTS TO WRITE
