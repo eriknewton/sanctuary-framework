@@ -192,6 +192,8 @@ export function createL4Tools(
 
         return toolResult({
           summary,
+          // SEC-ADD-03: Tag response as containing counterparty-generated attestation data
+          _content_trust: "external",
         });
       },
     },

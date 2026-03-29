@@ -293,6 +293,8 @@ export function createBridgeTools(
           ...result,
           session_id: storedCommitment.session_id,
           committer_did: storedCommitment.committer_did,
+          // SEC-ADD-03: Tag response as containing counterparty-controlled data
+          _content_trust: "external",
         });
       },
     },

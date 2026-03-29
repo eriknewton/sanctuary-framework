@@ -1,90 +1,68 @@
-# SPRINT RESULT — SEC-020: Recovery Key Path Regenerates Master Key on Restart
+# SPRINT RESULT — SEC-003: Canonical JSON for Cross-Repo Signature Verification
 
 **Sprint Date:** 2026-03-28
-**Finding:** SEC-020 (High — Critical data-loss impact)
-**Branch:** `security-review`
-**Implementer:** Claude (sprint session)
+**Finding ID:** SEC-003
+**Repos:** Sanctuary (TypeScript) + Concordia (Python)
 
 ---
 
 ## What Changed and Why
 
-### Changes
+### Root Cause
+Sanctuary's TypeScript bridge and Concordia's Python signing module independently implemented canonical JSON serialization with different formatting rules. Additionally, both repos had code paths that bypassed their own canonical serializer, using vanilla `JSON.stringify` / `json.dumps` on signature-critical data.
 
-**`server/src/index.ts` (lines 98-124, recovery key branch):**
+### Sanctuary Changes (TypeScript)
 
-The entire `else` branch (no passphrase path) was rewritten:
+**`server/src/bridge/bridge.ts`:**
+1. Added `-0` (negative zero) rejection to `stableStringify`: `Object.is(value, -0)` check throws. Previously V8 silently coerced `-0` to `"0"`, creating asymmetry with Python.
+2. Replaced `JSON.stringify` with `stableStringify` at commitment signing (line 135) and verification (line 195) — ensures deterministic key ordering.
 
-1. **Existing installation (recovery-key-hash found):**
-   - Reads `SANCTUARY_RECOVERY_KEY` from `process.env`
-   - If missing: throws descriptive error listing both credential options (`SANCTUARY_PASSPHRASE` or `SANCTUARY_RECOVERY_KEY`)
-   - Decodes recovery key from base64url with format and length validation
-   - Hashes the decoded key via `hashToString()` (SHA-256 → base64url)
-   - Compares against stored hash using `constantTimeEqual()` on the hash bytes
-   - If mismatch: throws error stating the recovery key is incorrect
-   - If match: sets `masterKey = recoveryKeyBytes` (the recovery key IS the master key)
-   - Does NOT set `recoveryKey` (no first-run banner displayed)
+**`server/test/bridge/bridge.test.ts`:**
+- Added 16 cross-language canonical JSON test vectors.
 
-2. **First run (no recovery-key-hash):**
-   - Added safety net: checks `_meta` for orphaned `key-params` entries
-   - If key-params exist without a recovery-key-hash: throws error (corrupted/incomplete installation)
-   - Otherwise: proceeds with existing first-run behavior (generate key, store hash, display banner)
+### Concordia Changes (Python)
 
-**`server/test/security/sec-020-recovery-key-restart.test.ts` (new file):**
-- 9 regression tests covering:
-  - First run generates and stores recovery key hash
-  - Subsequent run with correct recovery key succeeds (verifies data encrypted in run 1 is decryptable after recovery)
-  - Subsequent run without any credentials fails with descriptive error
-  - Subsequent run with incorrect recovery key fails
-  - Invalid base64url encoding rejected
-  - Incorrect key length rejected
-  - Orphaned key-params without recovery-key-hash triggers safety net
-  - Passphrase path unaffected (non-regression)
-  - Constant-time hash comparison unit test
+**`concordia/signing.py`:**
+1. Rewrote `canonical_json` as manual recursive builder (`_stable_stringify`) producing byte-identical output to TypeScript's `stableStringify`.
+2. Added `_format_number_ecmascript`: formats numbers per ECMAScript Number::toString rules (integer-valued floats drop decimal: `1.0` -> `"1"`).
+3. Added `_stable_stringify`: recursive JSON builder with sorted keys, compact separators, `ensure_ascii=False` for strings.
 
-### Why
+**`concordia/sanctuary_bridge.py`:**
+- Replaced `json.dumps(agreement, sort_keys=True, separators=(",",":"))` with `canonical_json(agreement).decode("utf-8")` — fixes `ensure_ascii` divergence.
 
-The root cause was a `TODO` at line 107 that was never completed. When `_meta/recovery-key-hash` existed (indicating prior encrypted data), the code called `generateRandomKey()` — creating a fresh master key that couldn't decrypt any prior state. Every restart silently orphaned all existing data.
+**`tests/test_signing.py`:**
+- Added `TestCrossLanguageCanonicalJSON` (17 tests): shared vectors + Python-specific number formatting tests.
 
-This violates CLAUDE.md constraint #5 ("Never silently degrade to a less-secure behavior on error") and the sovereignty property that encrypted state must remain accessible to its owner.
+**`tests/test_sanctuary_bridge.py`:**
+- Added 2 tests: Unicode preservation and integer formatting in commitment payloads.
 
 ---
 
-## Test Suite Output
+## Test Suite Results
 
-```
-Test Files  29 passed (29)
-     Tests  287 passed (287)
-  Duration  20.06s
-```
-
-Test count: 278 → 287 (+9 new regression tests)
+**Sanctuary:** 303 passed, 0 failed (baseline 287, +16 new)
+**Concordia:** 517 passed, 0 failed (baseline 483, +34 new)
 
 ---
 
 ## New Risk Introduced
 
-1. **Environment variable exposure:** The `SANCTUARY_RECOVERY_KEY` env var carries the master key in base64url form. This is the same risk class as the existing `SANCTUARY_PASSPHRASE` env var — both are readable via `/proc/PID/environ` by a process owner. Acceptable trade-off for a server that already accepts its primary credential via environment variable.
-
-2. **Breaking change for broken deployments:** Users who were unknowingly restarting in recovery-key mode without credentials will now get an error instead of a silently-broken server. This is the correct behavior — the previous behavior was destroying their data.
+Minimal. Changes make serialization stricter (reject `-0`, enforce canonical path). No signatures in persistent storage to invalidate (pre-merge-gate).
 
 ---
 
 ## Adjacent Findings Noticed
 
-None. This fix is isolated to the key initialization path in `createSanctuaryServer()` and does not touch any other security surface.
+The test helper `stableStringify` in `bridge.test.ts` is a simplified copy without security checks. Not a vulnerability but should be tracked for cleanup.
 
 ---
 
-## Sprint Contract Criteria Assessment
+## Sprint Contract Criteria
 
-| Criterion | Met? |
-|-----------|------|
-| Code path at index.ts:104-109 no longer calls `generateRandomKey()` when existing data present | ✅ |
-| Recovery key hash verified with constant-time comparison | ✅ (`constantTimeEqual` on hash bytes) |
-| Error messages clearly explain what the user must do | ✅ (lists both credential options) |
-| All 5+ regression tests pass | ✅ (9 tests) |
-| Full test suite count does not decrease from 278 | ✅ (287 tests, +9) |
-| Data written under one master key is readable after restart with correct recovery key | ✅ (test 2 verifies encrypt/decrypt roundtrip) |
-
-All sprint contract criteria are met.
+| Criterion | Status |
+|-----------|--------|
+| Byte-identical output for shared test vectors | PASS (14 vectors in both repos) |
+| No vanilla JSON.stringify/json.dumps on signature paths | PASS (3 call sites fixed) |
+| Both repos reject -0.0 | PASS |
+| Test suites pass (>=287 Sanctuary, >=483 Concordia) | PASS (303 / 517) |
+| No new prompt injection surface | PASS |

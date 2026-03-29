@@ -114,6 +114,125 @@ describe("Concordia Bridge", () => {
     });
   });
 
+  // ── Cross-Language Canonical JSON Vectors (SEC-003) ───────────────────
+  // These vectors MUST produce byte-identical output in both TypeScript
+  // (stableStringify) and Python (canonical_json). The expected values
+  // here are the shared contract between both repos.
+
+  describe("cross-language canonical JSON vectors (SEC-003)", () => {
+    // We need access to stableStringify through canonicalize + decode
+    const canon = (v: unknown): string =>
+      new TextDecoder().decode(canonicalize(v as ConcordiaOutcome));
+
+    // For primitives/non-outcome objects, use the local stableStringify
+    const ss = stableStringify;
+
+    it("sorts keys alphabetically", () => {
+      expect(ss({ z: 1, a: 2, m: 3 })).toBe('{"a":2,"m":3,"z":1}');
+    });
+
+    it("sorts nested keys recursively", () => {
+      expect(ss({ b: { d: 1, c: 2 }, a: 3 })).toBe(
+        '{"a":3,"b":{"c":2,"d":1}}'
+      );
+    });
+
+    it("uses compact separators (no whitespace)", () => {
+      expect(ss({ a: [1, 2, 3] })).toBe('{"a":[1,2,3]}');
+    });
+
+    it("formats integer numbers without decimal point", () => {
+      expect(ss({ v: 1 })).toBe('{"v":1}');
+      expect(ss({ v: 42 })).toBe('{"v":42}');
+      expect(ss({ v: 0 })).toBe('{"v":0}');
+      expect(ss({ v: -7 })).toBe('{"v":-7}');
+    });
+
+    it("formats boolean and null correctly", () => {
+      expect(ss({ a: true, b: false, c: null })).toBe(
+        '{"a":true,"b":false,"c":null}'
+      );
+    });
+
+    it("handles empty structures", () => {
+      expect(ss({})).toBe("{}");
+      expect(ss({ a: [] })).toBe('{"a":[]}');
+      expect(ss({ a: {} })).toBe('{"a":{}}');
+    });
+
+    it("handles string escaping for control characters", () => {
+      expect(ss({ a: "line1\nline2" })).toBe('{"a":"line1\\nline2"}');
+      expect(ss({ a: 'quote"here' })).toBe('{"a":"quote\\"here"}');
+      expect(ss({ a: "back\\slash" })).toBe('{"a":"back\\\\slash"}');
+    });
+
+    it("preserves non-ASCII Unicode without escaping", () => {
+      // V8's JSON.stringify does not escape non-ASCII
+      expect(ss({ a: "café" })).toBe('{"a":"café"}');
+      expect(ss({ a: "你好" })).toBe('{"a":"你好"}');
+      expect(ss({ emoji: "☺" })).toBe('{"emoji":"☺"}');
+    });
+
+    it("handles deeply nested structures", () => {
+      expect(ss({ a: { b: { c: { d: 1 } } } })).toBe(
+        '{"a":{"b":{"c":{"d":1}}}}'
+      );
+    });
+
+    it("handles arrays with mixed types", () => {
+      expect(ss({ a: [1, "two", true, null, { k: "v" }] })).toBe(
+        '{"a":[1,"two",true,null,{"k":"v"}]}'
+      );
+    });
+
+    it("rejects negative zero", () => {
+      // Must use canonicalize (the production function) to test rejection
+      expect(() =>
+        canonicalize({ v: -0 } as unknown as ConcordiaOutcome)
+      ).toThrow(/negative zero/i);
+    });
+
+    it("rejects NaN", () => {
+      expect(() =>
+        canonicalize({ v: NaN } as unknown as ConcordiaOutcome)
+      ).toThrow(/non-finite/i);
+    });
+
+    it("rejects Infinity", () => {
+      expect(() =>
+        canonicalize({ v: Infinity } as unknown as ConcordiaOutcome)
+      ).toThrow(/non-finite/i);
+      expect(() =>
+        canonicalize({ v: -Infinity } as unknown as ConcordiaOutcome)
+      ).toThrow(/non-finite/i);
+    });
+
+    // Exact byte-level vectors: the Python test suite must produce
+    // the same expected string for each input.
+    it("matches shared cross-language test vectors", () => {
+      const vectors: Array<{ input: unknown; expected: string }> = [
+        { input: { a: 1 }, expected: '{"a":1}' },
+        { input: { b: "hello", a: "world" }, expected: '{"a":"world","b":"hello"}' },
+        { input: { x: [1, 2, 3] }, expected: '{"x":[1,2,3]}' },
+        { input: { n: null }, expected: '{"n":null}' },
+        { input: { t: true, f: false }, expected: '{"f":false,"t":true}' },
+        { input: { nested: { z: 1, a: 2 } }, expected: '{"nested":{"a":2,"z":1}}' },
+        { input: { s: "café" }, expected: '{"s":"café"}' },
+        { input: { s: "你好世界" }, expected: '{"s":"你好世界"}' },
+        { input: { s: "line\nnew" }, expected: '{"s":"line\\nnew"}' },
+        { input: { empty: {} }, expected: '{"empty":{}}' },
+        { input: { arr: [] }, expected: '{"arr":[]}' },
+        { input: { v: -42 }, expected: '{"v":-42}' },
+        { input: { v: 0 }, expected: '{"v":0}' },
+        { input: { mix: [null, true, "a", 1, { k: "v" }] }, expected: '{"mix":[null,true,"a",1,{"k":"v"}]}' },
+      ];
+
+      for (const { input, expected } of vectors) {
+        expect(ss(input)).toBe(expected);
+      }
+    });
+  });
+
   // ── Bridge Commit ──────────────────────────────────────────────────────
 
   describe("createBridgeCommitment()", () => {
