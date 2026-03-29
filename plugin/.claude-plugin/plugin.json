@@ -1,0 +1,19 @@
+{
+  "name": "sanctuary-framework",
+  "version": "0.2.0",
+  "description": "Sovereignty infrastructure for the agentic economy. Gives your agent encrypted state, self-custodied identity, selective disclosure, portable reputation, and sovereignty verification.",
+  "author": {
+    "name": "CIMC.ai",
+    "homepage": "https://github.com/eriknewton/sanctuary-framework"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "sovereignty",
+    "encryption",
+    "identity",
+    "reputation",
+    "privacy",
+    "mcp",
+    "agent"
+  ]
+}
