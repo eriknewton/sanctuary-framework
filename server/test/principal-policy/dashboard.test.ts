@@ -307,15 +307,34 @@ describe("Principal Dashboard", () => {
       expect(data.pending_count).toBe(0);
     });
 
-    it("accepts requests with correct token in query parameter", async () => {
+    it("rejects long-lived token in query parameter (SEC-012)", async () => {
+      // SEC-012: The long-lived auth token must NOT be accepted via URL query string.
+      // Before the SEC-012 fix, this returned 200. Now it must return 401.
       const res = await fetch(`http://127.0.0.1:${authPort}/api/status?token=${AUTH_TOKEN}`);
+      expect(res.status).toBe(401);
+    });
+
+    it("accepts session token in query parameter (SEC-012)", async () => {
+      // SEC-012: Exchange the long-lived token for a short-lived session
+      const exchangeRes = await fetch(`http://127.0.0.1:${authPort}/auth/session`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(exchangeRes.status).toBe(200);
+      const { session_id } = await exchangeRes.json();
+
+      // Use the session token in the URL — this is the safe replacement
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/status?session=${session_id}`);
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.pending_count).toBe(0);
     });
 
-    it("serves dashboard HTML with correct query token", async () => {
-      const res = await fetch(`http://127.0.0.1:${authPort}/?token=${AUTH_TOKEN}`);
+    it("serves dashboard HTML with bearer header (SEC-012)", async () => {
+      // SEC-012: Dashboard is accessed via Authorization header, not ?token= in URL
+      const res = await fetch(`http://127.0.0.1:${authPort}/`, {
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
       expect(res.status).toBe(200);
       const text = await res.text();
       expect(text).toContain("Sanctuary");
@@ -371,17 +390,28 @@ describe("Principal Dashboard", () => {
       expect(response.decided_by).toBe("human");
     });
 
-    it("SSE requires auth via query param", async () => {
-      // Without token — should be 401
+    it("SSE requires auth via session query param (SEC-012)", async () => {
+      // Without any auth — should be 401
       const noAuth = await fetch(`http://127.0.0.1:${authPort}/events`);
       expect(noAuth.status).toBe(401);
 
-      // With token — should connect
-      const withAuth = await fetch(`http://127.0.0.1:${authPort}/events?token=${AUTH_TOKEN}`);
-      expect(withAuth.status).toBe(200);
-      expect(withAuth.headers.get("content-type")).toBe("text/event-stream");
+      // With long-lived token in URL — should be 401 (SEC-012 fix)
+      const tokenInUrl = await fetch(`http://127.0.0.1:${authPort}/events?token=${AUTH_TOKEN}`);
+      expect(tokenInUrl.status).toBe(401);
 
-      const reader = withAuth.body!.getReader();
+      // Exchange token for session first
+      const exchangeRes = await fetch(`http://127.0.0.1:${authPort}/auth/session`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      const { session_id } = await exchangeRes.json();
+
+      // With session — should connect
+      const withSession = await fetch(`http://127.0.0.1:${authPort}/events?session=${session_id}`);
+      expect(withSession.status).toBe(200);
+      expect(withSession.headers.get("content-type")).toBe("text/event-stream");
+
+      const reader = withSession.body!.getReader();
       const decoder = new TextDecoder();
       const { value } = await reader.read();
       const text = decoder.decode(value);

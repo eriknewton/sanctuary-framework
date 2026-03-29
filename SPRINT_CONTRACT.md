@@ -1,9 +1,8 @@
-# SPRINT CONTRACT — SEC-005: Import Skips Signature Verification
+# SPRINT CONTRACT — SEC-012: Dashboard Auth Token in URL Query Strings
 
 **Sprint Date:** 2026-03-28
-**Finding:** SEC-005 (High)
+**Finding:** SEC-012 (reclassified Medium → High)
 **Branch:** `security-review`
-**Cluster:** First of three (SEC-005, SEC-010, SEC-014) — this sprint establishes the verification architecture.
 
 ---
 
@@ -11,36 +10,25 @@
 
 ### a) Root cause — not the symptom
 
-The `import()` method in `state-store.ts:518-598` writes each `StateEntry` directly to storage without verifying the Ed25519 signature (`sig` field) against the public key of the claimed signer (`kid` field). The root cause is that the import path has no concept of identity resolution — it receives entries with `kid` and `sig` fields but never looks up the corresponding public key to verify. This is not a missing call to an existing verification path; it is a missing *capability*: the `StateStore.import()` method has no access to identity data and no mechanism to resolve a `kid` to a public key.
+The `checkAuth()` method in `server/src/principal-policy/dashboard.ts` (lines 227–248) accepts the bearer auth token via `?token=<TOKEN>` query parameter. This exists because the browser's SSE `EventSource` API does not support custom headers — the only way to authenticate the SSE connection was to pass the token in the URL.
+
+The root cause is **using the long-lived auth token directly in URLs** rather than exchanging it for a short-lived session credential via a header-authenticated endpoint.
 
 ### b) Smallest change that closes the vulnerability
 
-Add a `publicKeyResolver` callback parameter to `StateStore.import()` that maps a `kid` (identity ID) to its public key (`Uint8Array | null`). For each entry in the import bundle:
+1. **Add a session exchange endpoint** (`POST /auth/session`): accepts `Authorization: Bearer <TOKEN>` header, validates it, returns a short-lived (5-minute) random session ID.
+2. **Replace query-string token acceptance** in `checkAuth()`: remove `?token=` support for the long-lived auth token. Instead, accept `?session=<SESSION_ID>` for page loads and SSE connections, validated against the server-side session store.
+3. **Update dashboard HTML**: on page load, exchange the token (passed via JS, never in URL) for a session via `POST /auth/session`, then use the session ID for SSE connections and API calls that need URL-based auth.
+4. **Update startup message**: no longer suggest `?token=` — instead guide user to use Authorization header or the dashboard session flow.
 
-1. Resolve `kid` via the callback. If the identity is unknown (returns `null`), reject the entry.
-2. Verify the `sig` against the entry's `payload.ct` (ciphertext) using the resolved public key — the same verification logic already used in `StateStore.read()` at line 297-307.
-3. If verification fails, reject the entry.
-4. Track rejection counts in the response: `skipped_invalid_sig` and `skipped_unknown_kid`.
+### c) Interaction with other findings
 
-The callback pattern is the correct architectural choice because:
-- It avoids coupling `StateStore` to `IdentityManager` (the state store currently knows nothing about identities).
-- It establishes a **verification interface** that SEC-010 (session state machine) and SEC-014 (attestation verification) can conform to — both will need the same pattern of "resolve identity, verify signature" without coupling their modules to identity storage.
-- The `IdentityManager.get()` method already returns `StoredIdentity | undefined`, which includes `public_key` (base64url). The tool handler wires the callback.
-
-### c) Interactions with other findings
-
-**SEC-010** (session state machine never verifies signatures) and **SEC-014** (attestation signature verification is optional) form a cluster with SEC-005. This sprint establishes the verification pattern:
-- Signature verification is **mandatory, not optional**.
-- The verifier receives a key-resolver function, not a pre-loaded key map.
-- Entries with unresolvable identities are **rejected, not accepted with a warning**.
-- The response includes structured rejection counts so callers can distinguish "clean import" from "partially rejected import".
-
-SEC-010 and SEC-014 are in Concordia (Python), but the design principle — mandatory verification with structured rejection — must carry forward.
+None. SEC-002 (auto_deny hardcoded) is orthogonal — it addresses timeout behavior, not token transport. No other finding touches the dashboard auth flow.
 
 ### d) New risk introduced
 
-- An import bundle created by an instance with identities not present on the importing instance will have all entries rejected. This is the **correct** behavior (CLAUDE.md constraint 4: "Never assume trust across the Sanctuary-Concordia boundary"), but it changes the behavior for bundles that previously imported successfully. The import response now includes `skipped_unknown_kid` so the caller can diagnose this.
-- No risk of breaking existing write/read paths — those are not modified.
+- **Server-side session state**: sessions are stored in a `Map` with automatic TTL expiry (5 minutes). Map is bounded to 1000 entries. Risk is minimal — sessions are ephemeral, in-memory only, and cleaned up on expiry or server stop.
+- **Session fixation**: mitigated by generating cryptographically random 32-byte session IDs and binding them to creation time with strict TTL.
 
 ---
 
@@ -48,47 +36,47 @@ SEC-010 and SEC-014 are in Concordia (Python), but the design principle — mand
 
 ### Files to modify
 
-1. **`server/src/l1-cognitive/state-store.ts`** — `import()` method (lines 518-598)
-   - Add `publicKeyResolver` parameter: `(kid: string) => Uint8Array | null`
-   - Add signature verification loop before writing each entry
-   - Expand return type to include `skipped_invalid_sig` and `skipped_unknown_kid`
-
-2. **`server/src/l1-cognitive/tools.ts`** — `state_import` handler (lines 614-619)
-   - Wire `publicKeyResolver` callback using `identityMgr.get()` to resolve `kid` to public key
+1. `server/src/principal-policy/dashboard.ts` — core auth changes: add session store, session exchange endpoint, modify checkAuth
+2. `server/src/principal-policy/dashboard-html.ts` — client-side session exchange flow
 
 ### Behavior before
 
-Import accepts any `StateEntry` from a non-reserved namespace regardless of `sig` validity or `kid` existence. An entry with a forged signature or a nonexistent `kid` is written to storage.
+- `checkAuth()` accepts long-lived auth token via `?token=<TOKEN>` query parameter
+- SSE connections use `EventSource(url + '?token=TOKEN')`
+- Dashboard page loads with `?token=TOKEN` in browser URL bar
+- Token appears in: server logs, browser history, proxy logs, Referer headers
 
 ### Behavior after
 
-Import verifies every entry before writing:
-- If `kid` does not resolve to a known identity, the entry is skipped and counted in `skipped_unknown_kid`.
-- If `sig` does not verify against the ciphertext using the resolved public key, the entry is skipped and counted in `skipped_invalid_sig`.
-- Only entries passing both checks are written to storage.
-- The response includes `{ imported_keys, skipped_keys, skipped_invalid_sig, skipped_unknown_kid, conflicts, namespaces, imported_at }`.
+- `checkAuth()` rejects long-lived tokens in query strings
+- New `POST /auth/session` endpoint: header-authenticated, returns `{ session_id }` (random 32 bytes hex, 5-min TTL)
+- `checkAuth()` accepts `?session=<SESSION_ID>` for routes that need URL-based auth (SSE `/events` and initial page load)
+- SSE connections use `EventSource('/events?session=SESSION_ID')`
+- API calls (approve/deny, status) use `Authorization: Bearer <TOKEN>` header — no URL tokens
+- Long-lived token never appears in any URL
+- Session tokens are short-lived, rotate on each exchange, and auto-expire
 
-### Regression tests
+### Regression test
 
-New file: `server/test/security/import-verifies-signatures.test.ts`
+File: `server/test/security/dashboard-no-query-token.test.ts`
 
 Tests:
-1. **Valid import succeeds** — export a bundle, re-import it, all entries accepted.
-2. **Forged signature rejected** — create a bundle, tamper with one entry's `sig`, import rejects that entry, others succeed.
-3. **Unknown kid rejected** — create a bundle with a `kid` that doesn't exist on the importing instance, entry is rejected.
-4. **All entries invalid** — import a bundle where every entry has a bad signature, result shows 0 imported, N skipped.
-5. **Reserved namespace still skipped** — entries in `_identities` namespace are still skipped (existing behavior preserved).
+1. **Long-lived token in query string is rejected (401)** — `GET /?token=<AUTH_TOKEN>` returns 401
+2. **Long-lived token in Authorization header is accepted** — `GET /` with `Authorization: Bearer <TOKEN>` returns 200
+3. **Session exchange works** — `POST /auth/session` with bearer token returns session_id
+4. **Session token in query string is accepted** — `GET /events?session=<SESSION_ID>` returns 200
+5. **Expired session is rejected** — after TTL, session_id returns 401
+6. **Invalid session is rejected** — random session_id returns 401
 
-### Prompt injection
+### Definition of Done
 
-The import path accepts a base64url-encoded JSON bundle. The bundle contents are parsed as JSON and written as `StateEntry` objects — they do not reach any model prompt. No prompt injection surface.
+1. `checkAuth()` no longer accepts `?token=` query parameter for the long-lived auth token
+2. `/auth/session` endpoint exists and returns short-lived session IDs
+3. SSE and page loads work via session tokens only
+4. All 6 regression tests pass
+5. Full test suite count ≥ 252 (current baseline)
+6. No prompt injection surface introduced (this fix does not modify any input/output path that reaches a model prompt)
 
-### Definition of done (evaluator criteria)
+### Prompt injection assessment
 
-1. The `import()` method rejects entries with invalid signatures (forged or absent).
-2. The `import()` method rejects entries with unresolvable `kid` values.
-3. The verification uses the same `verify()` function from `core/identity.ts` that `read()` uses.
-4. The return type includes `skipped_invalid_sig` and `skipped_unknown_kid` counts.
-5. All 5 regression tests pass.
-6. Full test suite count >= 247 (no decrease).
-7. The callback-based resolver pattern does not couple `StateStore` to `IdentityManager`.
+This fix does not touch any input/output path that reaches a model prompt. The dashboard is a human-facing web UI that communicates only with the approval gate. No user-controlled text from the dashboard reaches any AI model context.
