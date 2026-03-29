@@ -769,3 +769,133 @@ Confirmed via `git show --stat 91b2740`: 6 files changed, 492 insertions, 126 de
 ## Grade: PASS
 
 All six verification criteria met. The fix correctly eliminates the long-lived auth token from all URL surfaces, introduces a sound session exchange mechanism with server-side TTL enforcement, and includes comprehensive regression tests. The session store introduces minimal new attack surface with appropriate bounds (1000-entry cap, 5-minute TTL, periodic cleanup). No regressions in the full test suite (261/261).
+
+---
+---
+
+# SPRINT_EVAL.md — SEC-016: Independent QA Evaluation
+
+**Date:** 2026-03-28
+**Evaluator posture:** Skeptical QA — did not write this code, does not trust self-assessment.
+**Finding:** SEC-016 — Stderr Approval Channel Auto-Resolves After 100ms Without Human Input
+**Commit:** `6c0516e`
+**Branch:** `security-review`
+
+---
+
+## 1. ROOT CAUSE
+
+**Question:** Does the fix eliminate the 100ms timing window entirely, or just shorten it?
+
+**Verdict: PASS.**
+
+Inspected `StderrApprovalChannel.requestApproval()` in `approval-channel.ts:49-64`. The method is:
+
+1. Write informational prompt to stderr via `process.stderr.write()` (synchronous in Node.js)
+2. Return `{ decision: "deny", decided_at: ..., decided_by: "stderr:non-interactive" }` immediately
+
+There is no `setTimeout`. There is no `await`. There is no `new Promise`. The 100ms delay is not reduced or moved — it is deleted. The channel denies synchronously after the stderr write. The timing window is eliminated, not shortened.
+
+---
+
+## 2. SEC-002 INTERACTION
+
+**Question:** Does SEC-016 weaken SEC-002's invariant ("timeout on any approval channel always results in denial") in any edge case?
+
+**Verdict: PASS.**
+
+The commit does not modify `webhook.ts` or `dashboard.ts` — confirmed via `git show --stat 6c0516e` which lists exactly 7 files, neither of which is a webhook or dashboard source file. Additionally, `git show 6c0516e -- server/src/principal-policy/webhook.ts server/src/principal-policy/dashboard.ts` returned empty output.
+
+The SEC-002 regression tests for webhook and dashboard channels are unchanged in behavior. Webhook tests still assert `decided_by: "timeout"` and `decision: "deny"` on timeout. Dashboard tests same. The stderr-specific SEC-002 tests were updated to assert `decided_by: "stderr:non-interactive"` instead of `"timeout"` — this is correct because the channel no longer times out; it denies immediately. The invariant "denial is unconditional regardless of config" is preserved and strengthened.
+
+The two changes are strictly additive: SEC-002 guarantees timeout = deny across all channels; SEC-016 eliminates the timeout entirely for the one channel that never needed it.
+
+---
+
+## 3. DECIDED_BY SEMANTICS
+
+**Question:** Is `"stderr:non-interactive"` a valid value, and does downstream code handle it correctly?
+
+**Verdict: PASS.**
+
+(a) **Type validity:** `types.ts:69` defines `decided_by: "human" | "timeout" | "auto" | "stderr:non-interactive"`. The value is explicitly in the union. TypeScript will enforce this at compile time.
+
+(b) **Downstream handling:** Searched all `decided_by` references in `server/src/`. Two downstream consumers:
+
+- `gate.ts:249` — passes `decided_by` through to the audit log as a metadata field. No pattern matching, no conditional. Any string value works.
+- `gate.ts:256` — uses `decided_by` in a template literal: `Approved by ${response.decided_by}`. This only executes when `decision === "approve"`, which never happens for the stderr channel. Even if it did, the string interpolation handles any value.
+
+No code performs `if (decided_by === "timeout")` or switches on the value. The new value cannot cause a silent failure or default-to-allow.
+
+---
+
+## 4. EXISTING TEST UPDATES
+
+**Question:** Were the 2 updated tests weakened to match new output, or do they still test the same invariants?
+
+**Verdict: PASS.**
+
+**SEC-002 tests (`sec-002-auto-deny-hardcoded.test.ts`):**
+- Test "denies immediately with default config": Still creates a `StderrApprovalChannel`, calls `requestApproval`, asserts `decision === "deny"`. Changed assertion from `decided_by === "timeout"` to `decided_by === "stderr:non-interactive"`. The denial invariant is preserved. The `decided_by` change is correct — the channel no longer times out.
+- Test "denies immediately even if auto_deny is explicitly set to false": Same structure. Still passes `auto_deny: false`, still asserts denial. The SEC-002 invariant (no config can cause approval) holds.
+
+**SEC-001 tests (`sec-001-state-delete-requires-approval.test.ts`):**
+- Test "gate denies state_delete on stderr channel": Updated comment to reference SEC-016. Removed `timeout_seconds: 0.1` (unnecessary since there's no timeout). Still asserts `allowed === false`, `approval_required === true`, `tier === 1`. The invariant (state_delete requires Tier 1 approval and is denied on stderr) is unchanged.
+
+No assertion was weakened. No invariant was relaxed.
+
+---
+
+## 5. REGRESSION TESTS
+
+**Question:** Does `sec-016-stderr-always-denies.test.ts` test the required behaviors?
+
+**Verdict: PASS.**
+
+4 tests in the file:
+
+1. **"always denies Tier 1 operations with decided_by stderr:non-interactive"** — Creates channel, calls `requestApproval` with Tier 1 request, asserts `decision === "deny"` and `decided_by === "stderr:non-interactive"`. ✅ Tests unconditional denial.
+
+2. **"denies immediately with no timing window (< 10ms, not 100ms)"** — Measures `performance.now()` before and after `requestApproval`, asserts elapsed < 10ms. ✅ Tests synchronous denial (the old 100ms setTimeout would fail this).
+
+3. **"ignores auto_deny: false config (SEC-002 interaction)"** — Creates channel with `auto_deny: false`, asserts denial. ✅ Tests SEC-002 interaction.
+
+4. **"denies Tier 2 operations identically"** — Same as test 1 but with Tier 2 request. ✅ Tests operation-type independence.
+
+All three required properties are covered: (a) synchronous with no delay, (b) `decided_by` is `"stderr:non-interactive"`, (c) unconditional regardless of operation type (Tier 1 and Tier 2 both tested) and config (`auto_deny: false` tested).
+
+**Full suite:** 265/265 pass. Confirmed independently by running `npx vitest run`.
+
+---
+
+## 6. SCOPE
+
+**Question:** Does commit `6c0516e` touch only the expected files?
+
+**Verdict: PASS.**
+
+`git show --stat 6c0516e` lists exactly 7 files:
+
+| File | Expected? | Change |
+|------|-----------|--------|
+| `server/src/principal-policy/approval-channel.ts` | ✅ Yes | StderrApprovalChannel source — core fix |
+| `server/src/principal-policy/types.ts` | ✅ Yes | ApprovalResponse type union |
+| `server/test/security/sec-016-stderr-always-denies.test.ts` | ✅ Yes | New regression tests |
+| `server/test/security/sec-002-auto-deny-hardcoded.test.ts` | ✅ Yes | Updated existing tests |
+| `server/test/security/sec-001-state-delete-requires-approval.test.ts` | ✅ Yes | Updated existing tests |
+| `SPRINT_CONTRACT.md` | ✅ Yes | Sprint documentation |
+| `SPRINT_RESULT.md` | ✅ Yes | Sprint documentation |
+
+No unexpected files. No changes to webhook, dashboard, gate, loader, or any other module.
+
+---
+
+## Observations (Non-Blocking)
+
+None. The fix is clean, minimal, and precisely scoped. No new concerns raised.
+
+---
+
+## Grade: PASS
+
+All six verification criteria met. The `setTimeout` is deleted (not reduced or moved). The channel denies synchronously with zero async gap. `decided_by` uses a valid, well-typed value that downstream code handles correctly. The SEC-002 invariant is preserved and strictly strengthened. Webhook and dashboard channels are completely untouched. The 4 new regression tests cover all required properties. The 2 updated existing tests preserve their original invariants. The commit scope is exactly as expected with no unexpected files. Full suite 265/265.
