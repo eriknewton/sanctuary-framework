@@ -1,91 +1,102 @@
-# SPRINT CONTRACT — SEC-020: Recovery Key Path Regenerates Master Key on Restart
+# SPRINT_CONTRACT.md — SEC-003: Canonical JSON Divergence (Cross-Repo)
 
 **Sprint Date:** 2026-03-28
-**Finding:** SEC-020 (High — Critical data-loss impact)
-**Branch:** `security-review`
-**Implementer:** Claude (sprint session)
+**Finding ID:** SEC-003
+**Repos:** Sanctuary (TypeScript) + Concordia (Python)
+**Scope:** Coordinated fix — both repos must produce byte-identical canonical JSON
 
 ---
 
-## Step 2 — Architecture Decision
+## Step 1 — Pre-Implementation Analysis
 
-### a) Root Cause
+### a) What is the exact divergence?
 
-The root cause is an incomplete implementation at `server/src/index.ts:104-109`. When the recovery key path detects an existing `recovery-key-hash` in `_meta` storage (indicating a prior installation with encrypted data), the code falls through to `generateRandomKey()` instead of requiring the user to supply the original recovery key. A `TODO` comment at line 107 explicitly acknowledges this gap.
+Five concrete divergence points between TypeScript (`stableStringify` in `server/src/bridge/bridge.ts:53-73`) and Python (`canonical_json` in `concordia/signing.py:70-80`):
 
-The consequence is catastrophic: every restart without a passphrase silently generates a new master key. All previously encrypted state — identities, commitments, reputation, audit logs — becomes permanently unreadable because the new key derives different namespace keys via HKDF. The old data remains on disk as unreachable ciphertext.
+**1. Number formatting (HIGH risk):**
+- TypeScript uses V8's `JSON.stringify(value)` following ECMAScript `Number.prototype.toString()`:
+  - Integer-valued floats: `1.0` → `"1"`
+  - Decimal notation up to 10^21: `1e20` → `"100000000000000000000"`
+  - Exponential from 10^21: `1e21` → `"1e+21"`
+- Python uses `json.dumps` default float formatting:
+  - Preserves decimal: `1.0` → `"1.0"`
+  - Scientific notation earlier: `1e20` → `"1e+20"`
+- **Same numeric value → different bytes → different hash**
 
-### b) Smallest Change That Closes the Vulnerability
+**2. Unicode handling (HIGH risk):**
+- TypeScript's `JSON.stringify()`: does NOT escape non-ASCII (raw UTF-8)
+- Python's `canonical_json` uses `ensure_ascii=False`: matches TypeScript
+- **BUT** `sanctuary_bridge.py:113` uses vanilla `json.dumps()` WITHOUT `ensure_ascii=False` (defaults to `True`): escapes all non-ASCII as `\uXXXX`
+- **`"café"` → TS: `"café"`, Python bridge: `"caf\u00e9"` → different bytes**
 
-Three changes to the recovery key branch in `index.ts`:
+**3. Negative zero (MEDIUM risk):**
+- Python: explicitly rejects `-0.0`
+- TypeScript: does NOT check for `-0`. V8 produces `"0"`, silently coercing.
+- **Asymmetric validation**
 
-1. **When existing recovery-key-hash is found:** Read the recovery key from `SANCTUARY_RECOVERY_KEY` environment variable. If not provided, throw an error explaining the two options (set `SANCTUARY_PASSPHRASE` or `SANCTUARY_RECOVERY_KEY`). Never generate a new random key when existing encrypted data is present.
+**4. Inconsistent use of canonical functions (HIGH risk):**
+- `bridge.ts:131` uses `JSON.stringify(commitmentPayload)` for signing — NOT `stableStringify`
+- `bridge.ts:189` uses `JSON.stringify(commitmentPayload)` for verification — NOT `stableStringify`
+- `sanctuary_bridge.py:113` uses `json.dumps()` — NOT `canonical_json`
+- **Key ordering depends on insertion order, not sort**
 
-2. **Verify the recovery key:** Decode from base64url, hash, and compare against the stored hash using constant-time comparison. If the hash doesn't match, throw an error. If it matches, use the decoded bytes as the master key (the recovery key IS the base64url-encoded master key, matching first-run behavior).
+**5. undefined vs None:**
+- TypeScript maps `undefined` → `"null"` explicitly
+- Python has no `undefined`; `None` → `null`
+- Not a practical cross-repo divergence, but a spec gap
 
-3. **Safety net:** Before generating a fresh master key on first run (no existing hash), verify no encrypted data already exists under the storage path. If encrypted data exists but no recovery-key-hash is found, abort — this indicates corrupted metadata.
+### b) Source of truth for canonical format
 
-### c) Interactions with Other Findings
+**Both repos conform to a shared internal spec inspired by RFC 8785, using ECMAScript number formatting as the authoritative format.**
 
-None. This fix is self-contained within the key initialization path. It does not touch the approval gate (SEC-001/002), signature verification (SEC-005/010/014), config validation (SEC-019), or any Concordia code.
+TypeScript already follows ECMAScript natively. Python must align. This is the smallest total change.
 
-### d) New Risk Introduced
+**Canonical format:**
+- Keys: sorted alphabetically (lexicographic by code points)
+- Separators: `","` and `":"` (no whitespace)
+- Strings: UTF-8, `ensure_ascii=False`, standard JSON escaping for control chars/quote/backslash
+- Numbers: ECMAScript `Number.prototype.toString()` rules
+- Rejected: `NaN`, `Infinity`, `-Infinity`, `-0.0`
+- Encoding: UTF-8
 
-- If the `SANCTUARY_RECOVERY_KEY` environment variable is set in a shell profile or process manager config, it could be exposed via `/proc/PID/environ` or process listing. This is the same risk class as `SANCTUARY_PASSPHRASE` and is an acceptable trade-off for a server that already reads its passphrase from an env var.
-- Users who previously relied on the (broken) behavior of silently regenerating keys will now get a startup error. This is the correct behavior — the previous behavior was silently destroying their data.
+### c) Migration impact
+
+**Zero.** Both repos are on `security-review`. Merge gate has not passed. No production deployment, no existing signatures in storage.
 
 ---
 
-## Step 3 — Sprint Contract
+## Fix Specification
 
-### Fix Chosen
-
-Modify the recovery key branch in `createSanctuaryServer()` at `server/src/index.ts` lines 98-124 to:
-
-1. When `_meta/recovery-key-hash` exists: require `SANCTUARY_RECOVERY_KEY` from environment, verify against stored hash, derive master key from it
-2. When `_meta/recovery-key-hash` does not exist (first run): check for orphaned encrypted data as a safety net before proceeding with key generation
-
-### Files Modified
+### Files to modify — Sanctuary (TypeScript)
 
 | File | Change |
 |------|--------|
-| `server/src/index.ts` | Lines 98-124: Replace recovery key branch with verify-and-recover logic |
-| `server/test/security/sec-020-recovery-key-restart.test.ts` | New: regression tests for SEC-020 |
+| `server/src/bridge/bridge.ts:57` | Add `-0` detection: `if (Object.is(value, -0)) throw` |
+| `server/src/bridge/bridge.ts:131` | Replace `JSON.stringify(commitmentPayload)` with `stableStringify(commitmentPayload)` |
+| `server/src/bridge/bridge.ts:189` | Replace `JSON.stringify(commitmentPayload)` with `stableStringify(commitmentPayload)` |
+| `server/test/bridge/bridge.test.ts` | Add canonical JSON cross-language test vectors |
 
-### Behavior Before and After
+### Files to modify — Concordia (Python)
 
-**Before:** Server starts without passphrase when `_meta/recovery-key-hash` exists → generates new random master key → all prior encrypted state silently inaccessible → displays new recovery key as if first run.
+| File | Change |
+|------|--------|
+| `concordia/signing.py` | Rewrite `canonical_json` as manual recursive builder with `_stable_stringify` + `_format_number_ecmascript` |
+| `concordia/sanctuary_bridge.py:113` | Replace `json.dumps(agreement, ...)` with `canonical_json(agreement).decode("utf-8")` |
+| `tests/test_signing.py` | Add canonical JSON cross-language test vectors |
+| `tests/test_sanctuary_bridge.py` | Add test that bridge commitment uses canonical_json |
 
-**After:** Server starts without passphrase when `_meta/recovery-key-hash` exists → reads `SANCTUARY_RECOVERY_KEY` from env → verifies against stored hash (constant-time) → if valid, uses as master key (all prior state accessible) → if missing or invalid, throws descriptive error and refuses to start.
+### Behavior before → after
 
-### What Happens to Existing Encrypted State If Key Changes
+| Scenario | Before | After |
+|----------|--------|-------|
+| `{a: 1.0}` | TS: `{"a":1}`, PY: `{"a":1.0}` | Both: `{"a":1}` |
+| Bridge signing payload | Vanilla `JSON.stringify` (unsorted) | `stableStringify` (sorted) |
+| Bridge commitment value | `json.dumps` (ASCII-escaped) | `canonical_json` (raw UTF-8) |
+| `-0` input | TS accepts, PY rejects | Both reject |
 
-This fix ensures the key **never** changes on restart. The recovery path now recovers the original key (verified by hash) rather than replacing it. No migration path is needed because:
-- The recovery key IS the master key (base64url-encoded). Recovering it restores the exact same key bytes.
-- All HKDF-derived namespace keys are deterministic from the master key, so all existing encrypted state remains readable.
-
-### Migration Path
-
-No data migration is required. The fix is purely in the startup path. Existing deployments that have been restarting without credentials have already lost access to their original data (the old master key is gone). This fix prevents future occurrences. Users who saved their first-run recovery key can now use it via `SANCTUARY_RECOVERY_KEY` to start the server correctly.
-
-### Regression Tests
-
-1. **First run generates and stores recovery key hash** — Start without passphrase, verify `_meta/recovery-key-hash` written, recovery key returned
-2. **Subsequent run with correct recovery key succeeds** — Write data in run 1, restart with `SANCTUARY_RECOVERY_KEY`, verify data readable
-3. **Subsequent run without any credentials fails** — `_meta/recovery-key-hash` exists, no env vars set → throws error
-4. **Subsequent run with incorrect recovery key fails** — Wrong `SANCTUARY_RECOVERY_KEY` → throws with "incorrect" message
-5. **First run with orphaned encrypted data fails** — Pre-populate storage with data but no recovery-key-hash → throws safety net error
-
-### Definition of Done
-
-The evaluator will verify:
-1. The code path at `index.ts:104-109` no longer calls `generateRandomKey()` when existing encrypted data is present
-2. The recovery key hash is verified with constant-time comparison
-3. Error messages clearly explain what the user must do
-4. All 5 regression tests pass
-5. Full test suite count does not decrease from 278
-6. Data written under one master key is readable after restart with the correct recovery key
-
-### Prompt Injection Assessment
-
-This fix does not touch any input/output path that reaches a model prompt. The `SANCTUARY_RECOVERY_KEY` is read from the process environment, not from MCP tool arguments. No prompt injection surface is introduced.
+### Definition of done (evaluator criteria)
+1. Both `stableStringify` and `canonical_json` produce byte-identical output for all shared test vectors
+2. No vanilla `JSON.stringify` or `json.dumps` on any signature/hash path
+3. Both repos reject `-0.0`
+4. Full test suites pass: ≥287 Sanctuary, ≥483 Concordia
+5. No new prompt injection surface
