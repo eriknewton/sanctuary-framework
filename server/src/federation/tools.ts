@@ -76,8 +76,6 @@ export function createFederationTools(
                 capabilities: p.capabilities,
               })),
               total: peers.length,
-              // SEC-ADD-03: Tag response — contains counterparty peer metadata
-              _content_trust: "external",
             });
           }
 
@@ -188,11 +186,7 @@ export function createFederationTools(
           sovereignty_tier: evaluation.sovereignty_tier,
         });
 
-        return toolResult({
-          ...evaluation,
-          // SEC-ADD-03: Tag response — derived from counterparty HandshakeResult
-          _content_trust: "external",
-        });
+        return toolResult(evaluation);
       },
     },
 

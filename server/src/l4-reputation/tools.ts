@@ -404,8 +404,6 @@ export function createL4Tools(
           tier_distribution: dist,
           tier_weights: TIER_WEIGHTS,
           unweighted_summary: summary,
-          // SEC-ADD-03: Tag response — weighted scores derived from counterparty attestations
-          _content_trust: "external",
         });
       },
     },
