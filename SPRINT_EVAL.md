@@ -641,3 +641,131 @@ All four sub-conditions verified:
 Full test suite: **252/252 pass** (25 files, 19.90s). No regressions.
 
 **Grade: PASS** — condition fully closed. SEC-005 upgraded from CONDITIONAL PASS to PASS.
+
+---
+---
+
+# SPRINT_EVAL.md — SEC-012: Independent QA Evaluation
+
+**Date:** 2026-03-28
+**Evaluator posture:** Skeptical QA — did not write this code, does not trust self-assessment.
+**Finding:** SEC-012 — Dashboard Authentication Token Passed in Query String
+**Commit:** `91b2740`
+**Branch:** `security-review`
+
+---
+
+## 1. ROOT CAUSE
+
+**Question:** Does the fix eliminate the long-lived auth token from all URL surfaces — not just the primary entry point but every endpoint, redirect, and client-side navigation path?
+
+**Verdict: PASS.**
+
+I read `dashboard.ts` end-to-end (636 lines). The `checkAuth()` method (lines 257–282) has exactly three auth paths:
+
+1. `Authorization: Bearer <TOKEN>` header — accepts the long-lived token. ✓ (header-only, never in URL)
+2. `?session=<SESSION_ID>` query parameter — accepts short-lived session IDs only. ✓ (not the long-lived token)
+3. Everything else → 401 rejection.
+
+There is no remaining code path that reads `?token=` from the URL. I searched all files under `server/src/` for `?token=`, `token=.*URL`, and `query.*token` patterns — every match is a comment referencing the old behavior or the SEC-012 fix. No functional code reads a token from query parameters.
+
+On the client side (`dashboard-html.ts`), the `authHeaders()` function puts the token in the `Authorization` header for API calls (approve/deny, status). The `sessionQuery()` function appends only the session ID to URLs. The `exchangeSession()` function POSTs to `/auth/session` with the token in the header. The SSE `EventSource` connection at line 364 uses `sessionQuery('/events')` — session ID only. The init block (lines 553–565) strips any legacy `?token=` from the browser URL bar via `history.replaceState`.
+
+No code path puts the long-lived token in a URL.
+
+---
+
+## 2. SESSION EXCHANGE SECURITY
+
+**(a) Cryptographic randomness of session ID:**
+
+**PASS.** `createSession()` at line 303: `randomBytes(32).toString("hex")` — 256 bits from Node's CSPRNG. The session ID is not derived from or predictable from the auth token. The `DashboardSession` interface (lines 64–68) stores only `id`, `created_at`, `expires_at` — no reference to the original token.
+
+**(b) 5-minute TTL enforced server-side:**
+
+**PASS.** `SESSION_TTL_MS = 5 * 60 * 1000` at line 70. `createSession()` sets `expires_at: now + SESSION_TTL_MS` (line 308). `validateSession()` at line 319 checks `Date.now() > session.expires_at` — this is a server-side wall-clock check. The client-side refresh at 80% TTL (line 342 of dashboard-html.ts) is a convenience optimization, not a security enforcement point.
+
+**(c) Expired sessions are rejected, not extended:**
+
+**PASS.** `validateSession()` lines 319–322: when `Date.now() > session.expires_at`, the session is deleted from the map and the method returns `false`. There is no renewal, extension, or grace period. The `cleanupSessions()` timer (every 60s, line 98) also sweeps expired entries, but the primary enforcement is at validation time.
+
+**(d) Exchange endpoint probing protection:**
+
+**OBSERVATION (not blocking).** There is no explicit rate limiting on `POST /auth/session`. However, this endpoint does not introduce a new probing vector: every endpoint on the dashboard server already returns 401 for invalid Bearer tokens via `checkAuth()`. The exchange endpoint's 401 response reveals no additional information beyond what a GET to `/` would reveal. Rate limiting on the dashboard server is a pre-existing gap, not introduced by this fix.
+
+---
+
+## 3. LONG-LIVED TOKEN REJECTION
+
+**Question:** Is sending `?token=<AUTH_TOKEN>` an active rejection (explicit error) or a silent failure?
+
+**Verdict: PASS.**
+
+Sending `GET /?token=<AUTH_TOKEN>` (without an Authorization header) causes `checkAuth()` to:
+1. Check Authorization header — absent → skip.
+2. Check `?session=` — absent → skip.
+3. Return 401 with body `{"error":"Unauthorized — use Authorization: Bearer header or a valid session"}`.
+
+The attacker receives an explicit 401 status code and a descriptive error message. This is not a silent failure. The test at line 48–57 of `dashboard-no-query-token.test.ts` confirms this: `expect(res.status).toBe(401)` and `expect(body.error).toBeDefined()`.
+
+Note: the rejection is generic (same 401 as any unauthenticated request) rather than a targeted "token-in-URL is forbidden" message. This is acceptable — a targeted message would actually leak information about the auth mechanism to an attacker.
+
+---
+
+## 4. REGRESSION TESTS
+
+**File:** `server/test/security/dashboard-no-query-token.test.ts` (172 lines, 8 tests)
+
+| Required test | Covered by | Verified |
+|--------------|-----------|----------|
+| Token in URL query parameter is actively rejected | Test 1 (lines 48–57): `GET /?token=TOKEN` → 401 | ✅ |
+| Valid session exchange via Bearer header succeeds | Test 3 (lines 73–87): `POST /auth/session` → 200, session_id is 64 hex chars | ✅ |
+| Expired session ID is rejected | Test 5 (lines 111–138): white-box expiry via `sessions.get().expires_at = past` → 401 | ✅ |
+| Session ID cannot be reused after expiry | Test 5: after expiry, `validateSession` deletes the session (line 320–321 of dashboard.ts) and returns 401 — session is gone, not just expired-but-present | ✅ |
+
+Additional coverage: Test 2 (header auth works), Test 4 (session in URL works), Test 6 (invalid session rejected), Test 7 (wrong token on exchange rejected), Test 8 (missing header on exchange rejected).
+
+**Full suite: 261/261 pass** (26 files, 19.85s). No regressions.
+
+---
+
+## 5. SCOPE
+
+**Commit `91b2740` touches exactly 6 files:**
+
+1. `server/src/principal-policy/dashboard.ts` — core auth changes ✓
+2. `server/src/principal-policy/dashboard-html.ts` — client-side session flow ✓
+3. `server/test/principal-policy/dashboard.test.ts` — updated existing tests ✓
+4. `server/test/security/dashboard-no-query-token.test.ts` — new regression tests ✓
+5. `SPRINT_CONTRACT.md` ✓
+6. `SPRINT_RESULT.md` ✓
+
+Confirmed via `git show --stat 91b2740`: 6 files changed, 492 insertions, 126 deletions. No unexpected files touched.
+
+---
+
+## 6. NEW RISK ASSESSMENT
+
+**(a) Auth token not logged in success or error paths:**
+
+**PASS.** I searched `dashboard.ts` for `console.log`, `console.error`, and `process.stderr.write.*token` patterns. Zero matches. The only stderr output mentioning the token is the startup hint (lines 136–144) which prints only the first and last 4 characters — this is pre-existing behavior, not introduced by this fix. The `handleSessionExchange` method (lines 408–437) returns only the session ID and expiry on success, and generic error messages on failure. The auth token is never included in any response body or log output.
+
+**(b) Session store does not persist beyond TTL:**
+
+**PASS.** Sessions are stored in an in-memory `Map` (line 85). `cleanupSessions()` runs every 60 seconds (line 98) and deletes expired entries. `validateSession()` deletes expired entries at access time (line 320–321). `stop()` calls `this.sessions.clear()` (line 179). No disk persistence, no serialization, no external storage.
+
+**(c) Session ID cannot recover the original token:**
+
+**PASS.** The `DashboardSession` interface (lines 64–68) has three fields: `id`, `created_at`, `expires_at`. The original auth token is not stored in the session record. There is no API endpoint that returns the auth token. The `createSession()` method generates a fresh random ID — it is a one-way exchange with no back-reference.
+
+---
+
+## EVALUATOR PARKING LOT
+
+- **No rate limiting on dashboard endpoints (pre-existing).** The dashboard server has no rate limiting on any endpoint, including `POST /auth/session`. While this is not introduced by SEC-012, it means an attacker with network access to the dashboard could attempt brute-force token discovery. The 127.0.0.1 default bind mitigates this for most deployments. Not blocking for this evaluation — logged as a pre-existing observation.
+
+---
+
+## Grade: PASS
+
+All six verification criteria met. The fix correctly eliminates the long-lived auth token from all URL surfaces, introduces a sound session exchange mechanism with server-side TTL enforcement, and includes comprehensive regression tests. The session store introduces minimal new attack surface with appropriate bounds (1000-entry cap, 5-minute TTL, periodic cleanup). No regressions in the full test suite (261/261).
