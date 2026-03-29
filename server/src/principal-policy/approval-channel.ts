@@ -22,18 +22,22 @@ export interface ApprovalChannel {
 }
 
 /**
- * Stderr approval channel — writes prompts to stderr, waits for response.
+ * Stderr approval channel — non-interactive informational channel.
  *
  * In the MCP stdio model:
  * - stdin/stdout carry the MCP protocol (JSON-RPC)
  * - stderr is available for out-of-band human communication
  *
- * Since many harnesses do not support interactive stdin during tool calls,
- * this channel uses a timeout-based model: the prompt is displayed, and
- * if no response is received within the timeout, the default action applies.
+ * Because stdin is consumed by the MCP JSON-RPC transport, this channel
+ * CANNOT read interactive human input. It is strictly informational:
+ * the prompt is displayed so the human sees what is happening, and the
+ * operation is denied immediately.
  *
- * For MVS, the channel auto-resolves based on the auto_deny setting.
- * Interactive stdin reading is deferred to a future version with harness support.
+ * SEC-002 + SEC-016 invariants:
+ * - This channel ALWAYS denies. No configuration can change this.
+ * - There is no timeout or async delay — denial is synchronous.
+ * - The `auto_deny` config field is ignored (SEC-002).
+ * - For interactive approval, use the dashboard or webhook channel.
  */
 export class StderrApprovalChannel implements ApprovalChannel {
   private config: ApprovalChannelConfig;
@@ -43,25 +47,20 @@ export class StderrApprovalChannel implements ApprovalChannel {
   }
 
   async requestApproval(request: ApprovalRequest): Promise<ApprovalResponse> {
-    // Format and emit the approval prompt
+    // Format and emit the informational prompt
     const prompt = this.formatPrompt(request);
     process.stderr.write(prompt + "\n");
 
-    // For MVS: auto-resolve after a brief pause to ensure stderr is flushed.
-    // Full interactive approval (reading stdin) requires harness support
-    // that most MCP hosts don't yet provide.
+    // SEC-016: No setTimeout, no async delay, no timing window.
+    // The stderr channel cannot read human input (stdin is used by MCP protocol).
+    // Deny immediately. This is strictly stronger than SEC-002's "timeout always
+    // denies" invariant — there is no timeout to exploit at all.
     //
-    // The prompt is still displayed — the human sees what's happening.
-    // Auto-deny means unapproved operations fail safely.
-    // Auto-allow means the prompt is informational (log mode).
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
-    // SEC-002: Timeout ALWAYS denies. No configuration can change this.
-    // This is a hard security invariant — see CLAUDE.md §"WHAT THESE TOOLS MUST NEVER DO" #5.
+    // SEC-002: No configuration (including auto_deny: false) can change this.
     return {
       decision: "deny",
       decided_at: new Date().toISOString(),
-      decided_by: "timeout",
+      decided_by: "stderr:non-interactive",
     };
   }
 
@@ -78,7 +77,7 @@ export class StderrApprovalChannel implements ApprovalChannel {
     return [
       "",
       "╔══════════════════════════════════════════════════════════════════╗",
-      "║  SANCTUARY: Approval Required                                    ║",
+      "║  SANCTUARY: Operation Denied (non-interactive channel)           ║",
       "╠══════════════════════════════════════════════════════════════════╣",
       `║  Operation:  ${request.operation.padEnd(50)}║`,
       `║  ${tierLabel.padEnd(62)}║`,
@@ -89,7 +88,8 @@ export class StderrApprovalChannel implements ApprovalChannel {
         (line) => `║    ${line.padEnd(60)}║`
       ),
       "║                                                                  ║",
-      "║  Auto-denying on timeout (hardcoded — not configurable)          ║",
+      "║  Denied: stderr channel cannot accept input (SEC-016)            ║",
+      "║  Use dashboard or webhook channel for interactive approval.      ║",
       "╚══════════════════════════════════════════════════════════════════╝",
       "",
     ].join("\n");

@@ -1,86 +1,88 @@
-# SPRINT RESULT — SEC-012: Dashboard Auth Token in URL Query Strings
+# SPRINT RESULT — SEC-016: Stderr Approval Channel Auto-Resolves in 100ms
 
 **Sprint Date:** 2026-03-28
-**Finding:** SEC-012 (reclassified Medium → High)
+**Finding:** SEC-016 (High)
 **Branch:** `security-review`
 
 ---
 
 ## What Changed and Why
 
-### Root cause addressed
+### 1. Removed 100ms setTimeout from StderrApprovalChannel (approval-channel.ts)
 
-The `checkAuth()` method in `dashboard.ts` accepted the long-lived dashboard auth token via `?token=<TOKEN>` URL query parameter. This token — the highest-privilege credential in the system (it can approve/deny Tier 1 operations like state export and identity rotation) — was exposed in server logs, browser history, proxy logs, and HTTP Referer headers. The `EventSource` SSE API's inability to set custom headers was the original justification, but the correct solution is a session exchange, not raw token exposure.
+**Root cause:** The stderr channel used `await new Promise((resolve) => setTimeout(resolve, 100))` to create a 100ms async delay before returning its denial. This delay served no purpose — the channel has no input mechanism (stdin is consumed by MCP protocol). The delay created a timing window that was a latent risk for future code that might race against the Promise.
 
-### Changes made
+**Fix:** Removed the setTimeout entirely. The channel now returns `{ decision: "deny" }` synchronously after writing the informational prompt to stderr. Changed `decided_by` from `"timeout"` to `"stderr:non-interactive"` to distinguish from legitimate timeouts in the webhook/dashboard channels.
 
-**`server/src/principal-policy/dashboard.ts`:**
-- Added `DashboardSession` interface and server-side session store (`Map<string, DashboardSession>`) with 5-minute TTL and 1000-entry cap
-- Added `POST /auth/session` endpoint: authenticates via `Authorization: Bearer` header only, returns a short-lived session ID (32 random bytes, hex-encoded)
-- Modified `checkAuth()`: removed `?token=` query parameter acceptance; added `?session=` query parameter acceptance for short-lived sessions
-- Added `createSession()`, `validateSession()`, and `cleanupSessions()` methods
-- Added periodic session cleanup timer (60s interval)
-- Updated `stop()` to clean up session state and timer
-- Updated startup message to no longer suggest `?token=` usage
+### 2. Updated prompt text (approval-channel.ts)
 
-**`server/src/principal-policy/dashboard-html.ts`:**
-- Replaced `authQuery()` (which put token in URLs) with `sessionQuery()` (uses session ID)
-- Added `exchangeSession()` function: POSTs to `/auth/session` with Authorization header, stores session ID
-- SSE connection now uses `?session=SESSION_ID` instead of `?token=TOKEN`
-- Added session auto-refresh at 80% of TTL
-- Added URL cleanup to strip legacy `?token=` from browser URL bar
+The prompt header changed from "Approval Required" to "Operation Denied (non-interactive channel)" and the footer now reads "Denied: stderr channel cannot accept input (SEC-016)" with guidance to use dashboard or webhook for interactive approval.
 
-**`server/test/principal-policy/dashboard.test.ts`:**
-- Updated 3 existing tests to verify the new behavior:
-  - "accepts requests with correct token in query parameter" → now verifies token-in-URL is **rejected** (401) and session-in-URL is accepted
-  - "serves dashboard HTML with correct query token" → now uses Authorization header
-  - "SSE requires auth via query param" → now verifies token-in-URL is rejected and session-in-URL works
+### 3. Updated ApprovalResponse type (types.ts)
 
-**`server/test/security/dashboard-no-query-token.test.ts`** (new file, 8 tests):
-1. Long-lived token in `?token=` query string is rejected (401)
-2. Long-lived token in Authorization header is accepted (200)
-3. Session exchange via `POST /auth/session` works
-4. Session token in `?session=` query string is accepted
-5. Expired session is rejected (401)
-6. Invalid/random session is rejected (401)
-7. Session exchange with wrong auth token is rejected (401)
-8. Session exchange without Authorization header is rejected (401)
+Added `"stderr:non-interactive"` to the `decided_by` union type.
+
+### 4. Updated SEC-002 regression tests (sec-002-auto-deny-hardcoded.test.ts)
+
+The two StderrApprovalChannel tests now assert `decided_by === "stderr:non-interactive"` instead of `"timeout"`. Test names and comments updated to reflect SEC-016 invariant.
+
+### 5. Updated SEC-001 integration test (sec-001-state-delete-requires-approval.test.ts)
+
+Updated comment and test name to reference SEC-016. Removed the `timeout_seconds: 0.1` hack (no longer needed since there's no timeout).
+
+### 6. New regression test file (sec-016-stderr-always-denies.test.ts)
+
+4 new tests:
+- `always denies Tier 1 operations with decided_by stderr:non-interactive`
+- `denies immediately with no timing window (< 10ms, not 100ms)`
+- `ignores auto_deny: false config (SEC-002 interaction)`
+- `denies Tier 2 operations identically`
 
 ---
 
 ## Test Suite Output
 
 ```
-Test Files  26 passed (26)
-     Tests  261 passed (261)
+Test Files  27 passed (27)
+     Tests  265 passed (265)
+  Start at  17:43:39
+  Duration  19.89s
 ```
 
-Test count: 252 → 261 (net +9: 8 new SEC-012 regression tests + 1 additional assertion in updated existing test)
+Test count: 261 → 265 (+4 new SEC-016 regression tests)
+
+---
+
+## SEC-002 Interaction Analysis
+
+SEC-002 established the invariant: "timeout on any approval channel ALWAYS results in denial." This sprint strengthens that invariant for the stderr channel specifically:
+
+- **Before SEC-016:** The stderr channel honored SEC-002 by returning `deny` after a 100ms timeout. The timing window existed but the outcome was safe.
+- **After SEC-016:** The stderr channel has no timeout at all. It denies synchronously. This is strictly stronger — there is no async gap to exploit, no timeout to race against, no timing window whatsoever.
+
+The webhook and dashboard channels are unchanged — they still use legitimate timeouts (configurable via `timeout_seconds`) because they wait for real human input. Only the stderr channel's fake timeout was removed.
 
 ---
 
 ## New Risk Introduced
 
-- **Server-side session state**: sessions are stored in an in-memory `Map` with 5-minute TTL and 1000-entry cap. Periodic cleanup runs every 60 seconds. The session store is cleared on server stop. Risk is minimal — sessions are ephemeral and bounded.
-- **Session token in URLs**: the session token does appear in URLs (via `?session=`), but it is short-lived (5 minutes) and cryptographically random (32 bytes). Even if logged, the window for exploitation is small and each session is bound to the server instance.
+None identified. The behavioral change (deny after 100ms → deny immediately) is strictly more restrictive. No code in the codebase depends on the 100ms delay.
 
 ---
 
 ## Adjacent Findings Noticed
 
-None. The dashboard auth flow is self-contained and does not interact with other security-relevant code paths.
+None. The stderr channel implementation is self-contained. The fix touches only the approval-channel.ts source file, the types.ts type definition, and existing/new test files.
 
 ---
 
-## Sprint Contract Criteria Assessment
+## Self-Assessment
 
-| Criterion | Met? |
-|-----------|------|
-| `checkAuth()` no longer accepts `?token=` for long-lived auth token | ✅ Yes |
-| `/auth/session` endpoint exists and returns short-lived session IDs | ✅ Yes |
-| SSE and page loads work via session tokens only | ✅ Yes |
-| All 8 regression tests pass (contract specified 6, delivered 8) | ✅ Yes |
-| Full test suite count ≥ 252 | ✅ Yes (261) |
-| No prompt injection surface introduced | ✅ Yes |
+All sprint contract criteria are met:
 
-**Self-assessment: All sprint contract criteria are met.**
+1. ✅ The `setTimeout` / 100ms delay is completely removed
+2. ✅ The channel returns deny synchronously with no async gap
+3. ✅ `decided_by` is `"stderr:non-interactive"` (not `"timeout"`)
+4. ✅ SEC-002 invariant preserved: no config can cause approval
+5. ✅ All 4 regression tests pass
+6. ✅ Test count 265 ≥ 261 (no decrease, +4 net new)

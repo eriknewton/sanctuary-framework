@@ -58,26 +58,29 @@ describe("SEC-002: Approval gate timeout always denies", () => {
   // ── Stderr Channel ──────────────────────────────────────────────────
 
   describe("StderrApprovalChannel", () => {
-    it("denies on timeout with default config", async () => {
+    it("denies immediately with default config (SEC-016: no timeout delay)", async () => {
       const channel = new StderrApprovalChannel({
         type: "stderr",
         timeout_seconds: 1,
       });
       const response = await channel.requestApproval(TIER_1_REQUEST);
       expect(response.decision).toBe("deny");
-      expect(response.decided_by).toBe("timeout");
+      // SEC-016: decided_by is now "stderr:non-interactive" (not "timeout")
+      // because the channel never waits — it denies synchronously.
+      expect(response.decided_by).toBe("stderr:non-interactive");
     });
 
-    it("denies on timeout even if auto_deny is explicitly set to false", async () => {
+    it("denies immediately even if auto_deny is explicitly set to false", async () => {
       // Before SEC-002 fix, this would have returned "approve"
+      // SEC-016 strengthens: no timeout delay at all
       const channel = new StderrApprovalChannel({
         type: "stderr",
         timeout_seconds: 1,
-        auto_deny: false, // This must be ignored
+        auto_deny: false, // This must be ignored (SEC-002)
       });
       const response = await channel.requestApproval(TIER_1_REQUEST);
       expect(response.decision).toBe("deny");
-      expect(response.decided_by).toBe("timeout");
+      expect(response.decided_by).toBe("stderr:non-interactive");
     });
   });
 

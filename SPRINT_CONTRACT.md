@@ -1,82 +1,93 @@
-# SPRINT CONTRACT — SEC-012: Dashboard Auth Token in URL Query Strings
+# SPRINT CONTRACT — SEC-016: Stderr Approval Channel Auto-Resolves in 100ms
 
 **Sprint Date:** 2026-03-28
-**Finding:** SEC-012 (reclassified Medium → High)
+**Finding:** SEC-016 (High)
 **Branch:** `security-review`
+**Implementer:** Claude (sprint session)
 
 ---
 
-## Architecture Decision
+## Step 2 — Architecture Decision
 
-### a) Root cause — not the symptom
+### a) Root Cause
 
-The `checkAuth()` method in `server/src/principal-policy/dashboard.ts` (lines 227–248) accepts the bearer auth token via `?token=<TOKEN>` query parameter. This exists because the browser's SSE `EventSource` API does not support custom headers — the only way to authenticate the SSE connection was to pass the token in the URL.
+The `StderrApprovalChannel.requestApproval()` method (approval-channel.ts:45-66) uses a 100ms `setTimeout` before returning its response. This creates two problems:
 
-The root cause is **using the long-lived auth token directly in URLs** rather than exchanging it for a short-lived session credential via a header-authenticated endpoint.
+1. **The 100ms delay serves no purpose.** The channel never reads any input — the setTimeout is cosmetic. It creates the illusion of waiting for a response that can never arrive. In the MCP stdio transport model, stdin is consumed by the MCP JSON-RPC protocol and is not available for interactive human input.
 
-### b) Smallest change that closes the vulnerability
+2. **The timing window is a latent risk.** While SEC-002 hardened the return value to always be `"deny"`, the 100ms async gap between the stderr write and the resolution is unnecessary attack surface. Any future code that races against this Promise (e.g., a concurrent channel fallback, a middleware that interprets "no response yet" as approval) has a 100ms window to exploit. The webhook and dashboard channels have legitimate timeout windows because they are waiting for real human input. The stderr channel is waiting for nothing.
 
-1. **Add a session exchange endpoint** (`POST /auth/session`): accepts `Authorization: Bearer <TOKEN>` header, validates it, returns a short-lived (5-minute) random session ID.
-2. **Replace query-string token acceptance** in `checkAuth()`: remove `?token=` support for the long-lived auth token. Instead, accept `?session=<SESSION_ID>` for page loads and SSE connections, validated against the server-side session store.
-3. **Update dashboard HTML**: on page load, exchange the token (passed via JS, never in URL) for a session via `POST /auth/session`, then use the session ID for SSE connections and API calls that need URL-based auth.
-4. **Update startup message**: no longer suggest `?token=` — instead guide user to use Authorization header or the dashboard session flow.
+The root cause is: **the stderr channel was implemented as a timeout-based channel mimicking the webhook/dashboard pattern, but it has no input mechanism to justify a timeout.**
 
-### c) Interaction with other findings
+### b) Smallest Change That Closes the Vulnerability
 
-None. SEC-002 (auto_deny hardcoded) is orthogonal — it addresses timeout behavior, not token transport. No other finding touches the dashboard auth flow.
+Remove the `setTimeout` entirely. The stderr channel should:
+- Write the informational prompt to stderr (preserved — the human still sees what's happening)
+- Return `decision: "deny"` immediately and synchronously (no async gap)
+- Document clearly in the prompt text and code comments that this is a non-interactive channel
 
-### d) New risk introduced
+This is Option B from REMEDIATION_PLAN.md HP-11: remove the fake timeout, always deny, document the limitation. Option A (reading stdin) is infeasible because stdin is consumed by MCP protocol.
 
-- **Server-side session state**: sessions are stored in a `Map` with automatic TTL expiry (5 minutes). Map is bounded to 1000 entries. Risk is minimal — sessions are ephemeral, in-memory only, and cleaned up on expiry or server stop.
-- **Session fixation**: mitigated by generating cryptographically random 32-byte session IDs and binding them to creation time with strict TTL.
+### c) Interaction with Other Findings
+
+**SEC-002 (Critical, PASS):** SEC-002 hardened all three approval channels so that timeout always results in denial. The SEC-002 fix for the stderr channel changed the return value from `this.config.auto_deny ? "deny" : "approve"` to a hardcoded `"deny"`. This sprint completes the hardening by eliminating the timing window itself. After this fix, the stderr channel has zero async gap — it denies synchronously. This is strictly stronger than SEC-002's invariant ("timeout always denies") because there is no timeout to exploit at all.
+
+**SEC-019 (pending):** No interaction. Config validation is a separate concern.
+
+**SEC-012 (PASS):** No interaction. Dashboard auth token is a separate channel.
+
+### d) New Risk Introduced
+
+Minimal. The behavioral change is:
+- Before: deny after 100ms async delay
+- After: deny immediately (synchronous)
+
+Any code depending on the 100ms delay for stderr flushing would be affected, but `process.stderr.write()` is synchronous in Node.js — it does not need an async flush window. The prompt is displayed before the denial is returned regardless.
 
 ---
 
-## Fix Specification
+## Step 3 — Sprint Contract
 
-### Files to modify
+### Fix Chosen
 
-1. `server/src/principal-policy/dashboard.ts` — core auth changes: add session store, session exchange endpoint, modify checkAuth
-2. `server/src/principal-policy/dashboard-html.ts` — client-side session exchange flow
+Remove the 100ms `setTimeout` from `StderrApprovalChannel.requestApproval()`. Replace with synchronous deny-on-call. Update the prompt text to explicitly state this is a non-interactive channel. Update code comments to document the SEC-002 and SEC-016 invariants. Change `decided_by` from `"timeout"` to `"stderr:non-interactive"` to distinguish from legitimate timeouts in webhook/dashboard channels.
 
-### Behavior before
+### Files Modified
 
-- `checkAuth()` accepts long-lived auth token via `?token=<TOKEN>` query parameter
-- SSE connections use `EventSource(url + '?token=TOKEN')`
-- Dashboard page loads with `?token=TOKEN` in browser URL bar
-- Token appears in: server logs, browser history, proxy logs, Referer headers
+| File | Change |
+|------|--------|
+| `server/src/principal-policy/approval-channel.ts:45-66` | Remove setTimeout, return deny synchronously, update prompt text, update decided_by |
+| `server/test/security/sec-016-stderr-always-denies.test.ts` | New: regression tests for SEC-016 |
 
-### Behavior after
+### Behavior Before and After
 
-- `checkAuth()` rejects long-lived tokens in query strings
-- New `POST /auth/session` endpoint: header-authenticated, returns `{ session_id }` (random 32 bytes hex, 5-min TTL)
-- `checkAuth()` accepts `?session=<SESSION_ID>` for routes that need URL-based auth (SSE `/events` and initial page load)
-- SSE connections use `EventSource('/events?session=SESSION_ID')`
-- API calls (approve/deny, status) use `Authorization: Bearer <TOKEN>` header — no URL tokens
-- Long-lived token never appears in any URL
-- Session tokens are short-lived, rotate on each exchange, and auto-expire
+**Before:**
+- `requestApproval()` writes prompt to stderr
+- Waits 100ms via `setTimeout`
+- Returns `{ decision: "deny", decided_by: "timeout" }` after 100ms
 
-### Regression test
+**After:**
+- `requestApproval()` writes prompt to stderr
+- Returns `{ decision: "deny", decided_by: "stderr:non-interactive" }` immediately (no async delay)
+- Prompt text includes: "Non-interactive channel — operation denied automatically"
 
-File: `server/test/security/dashboard-no-query-token.test.ts`
+### Regression Tests
 
-Tests:
-1. **Long-lived token in query string is rejected (401)** — `GET /?token=<AUTH_TOKEN>` returns 401
-2. **Long-lived token in Authorization header is accepted** — `GET /` with `Authorization: Bearer <TOKEN>` returns 200
-3. **Session exchange works** — `POST /auth/session` with bearer token returns session_id
-4. **Session token in query string is accepted** — `GET /events?session=<SESSION_ID>` returns 200
-5. **Expired session is rejected** — after TTL, session_id returns 401
-6. **Invalid session is rejected** — random session_id returns 401
+1. **stderr channel always denies Tier 1 operations** — create a StderrApprovalChannel, call requestApproval with a Tier 1 operation, assert decision is "deny" and decided_by is "stderr:non-interactive".
+2. **stderr channel denies immediately (no timing window)** — measure the wall-clock time of requestApproval, assert it completes in <10ms (no 100ms delay).
+3. **stderr channel ignores auto_deny config** — create a channel with `auto_deny: false`, confirm it still denies (SEC-002 interaction).
+4. **stderr channel denies Tier 2 operations identically** — same as test 1 but with tier 2.
 
 ### Definition of Done
 
-1. `checkAuth()` no longer accepts `?token=` query parameter for the long-lived auth token
-2. `/auth/session` endpoint exists and returns short-lived session IDs
-3. SSE and page loads work via session tokens only
-4. All 6 regression tests pass
-5. Full test suite count ≥ 252 (current baseline)
-6. No prompt injection surface introduced (this fix does not modify any input/output path that reaches a model prompt)
+The evaluator will verify:
+1. The `setTimeout` / `100ms` delay is completely removed from the stderr channel
+2. The channel returns deny synchronously with no async gap
+3. `decided_by` clearly identifies the decision as a non-interactive channel denial (not a "timeout")
+4. The SEC-002 invariant is preserved: no configuration can cause the stderr channel to approve
+5. All 4 regression tests pass
+6. Full test suite count >= 261 (no decrease)
 
-### Prompt injection assessment
+### Prompt Injection Assessment
 
-This fix does not touch any input/output path that reaches a model prompt. The dashboard is a human-facing web UI that communicates only with the approval gate. No user-controlled text from the dashboard reaches any AI model context.
+This fix does not touch any input/output path that processes user-controlled or agent-controlled text. The stderr channel writes a formatted prompt string constructed from system-internal `ApprovalRequest` fields (operation name, tier, reason). These fields originate from the gate evaluation logic, not from external input. No prompt injection surface is introduced or modified.

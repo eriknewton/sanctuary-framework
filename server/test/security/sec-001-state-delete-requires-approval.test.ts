@@ -90,12 +90,12 @@ describe("SEC-001: state_delete requires explicit human approval", () => {
     expect(result.allowed).toBe(true);
   });
 
-  it("gate denies state_delete on stderr channel timeout (SEC-002 integration)", async () => {
-    // The stderr channel auto-denies after 100ms (SEC-002 hardened).
-    // state_delete as Tier 1 must be denied on timeout.
+  it("gate denies state_delete on stderr channel (SEC-002 + SEC-016 integration)", async () => {
+    // The stderr channel denies immediately (SEC-016: no timeout delay).
+    // state_delete as Tier 1 must be denied.
     const channel = new StderrApprovalChannel({
       type: "stderr",
-      timeout_seconds: 0.1, // 100ms
+      timeout_seconds: 1,
     });
     const gate = new ApprovalGate(DEFAULT_POLICY, baseline, channel, auditLog);
 
