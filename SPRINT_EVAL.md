@@ -1351,3 +1351,9 @@ Actual: 6 files.
 **To reach unconditional PASS:** Acknowledge that SEC-ADD-03's fix commit is `82f3321` and log it in COWORK_CONTEXT.md as sharing a commit with SEC-003. No code changes required — the fix is functionally correct. This is a bookkeeping condition only.
 
 All five divergence points are addressed. Canonical format implementation is correct. All three vulnerable call sites are fixed with no residual vanilla serialization on signature paths. Test vectors cover the identified divergence points with byte-identical assertions. Migration impact is zero (verified). Test suites pass at 303/303 and 517/517.
+
+---
+
+## Condition Closure
+
+Condition resolved: SEC-ADD-03 prompt injection tagging changes are bundled in fix commit `82f3321`. Changes are non-destructive and do not affect SEC-003 correctness. SEC-ADD-03 fix commit is logged as `82f3321` (shared). Sprint discipline violation noted in RETROSPECTIVES.md.
