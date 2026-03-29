@@ -29,7 +29,13 @@ export interface Tier2Config {
 export interface ApprovalChannelConfig {
   type: "stderr" | "webhook" | "callback";
   timeout_seconds: number;
-  auto_deny: boolean;
+  /**
+   * SEC-002: auto_deny is hardcoded to true and not configurable.
+   * Timeout on any approval channel ALWAYS results in denial.
+   * This field is retained for backward compatibility with existing
+   * policy files but is ignored — timeout always denies.
+   */
+  auto_deny?: boolean;
   webhook_url?: string;
   webhook_secret?: string;
 }
@@ -60,7 +66,7 @@ export interface ApprovalRequest {
 export interface ApprovalResponse {
   decision: "approve" | "deny";
   decided_at: string;
-  decided_by: "human" | "timeout" | "auto";
+  decided_by: "human" | "timeout" | "auto" | "stderr:non-interactive";
 }
 
 /** Result of the approval gate evaluation */

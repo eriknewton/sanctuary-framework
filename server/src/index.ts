@@ -96,24 +96,82 @@ export async function createSanctuaryServer(options?: {
       );
     }
   } else {
-    // Recovery key path: generate random master key
+    // Recovery key path
     keyProtection = "recovery-key";
 
-    // Check if we already have a stored (encrypted) master key reference
-    const existing = await storage.read("_meta", "recovery-key-hash");
-    if (existing) {
-      // Existing installation — we need the recovery key to proceed
-      // For now, generate a new key (first-run scenario)
-      // TODO: prompt for recovery key on subsequent runs
-      masterKey = generateRandomKey();
-      recoveryKey = toBase64url(masterKey);
+    const { hashToString } = await import("./core/hashing.js");
+    const { stringToBytes, bytesToString } = await import("./core/encoding.js");
+    const { fromBase64url } = await import("./core/encoding.js");
+    const { constantTimeEqual } = await import("./core/encoding.js");
+
+    // Check if we already have a stored recovery key hash (existing installation)
+    const existingHash = await storage.read("_meta", "recovery-key-hash");
+    if (existingHash) {
+      // Existing installation — require the recovery key to proceed
+      const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
+      if (!envRecoveryKey) {
+        throw new Error(
+          "Sanctuary: Existing encrypted data found but no credentials provided.\n" +
+          "This installation was previously set up with a recovery key.\n\n" +
+          "To start the server, provide one of:\n" +
+          "  - SANCTUARY_PASSPHRASE (if you later configured a passphrase)\n" +
+          "  - SANCTUARY_RECOVERY_KEY (the recovery key shown at first run)\n\n" +
+          "Without the correct credentials, encrypted state cannot be accessed.\n" +
+          "Refusing to start to prevent silent data loss."
+        );
+      }
+
+      // Decode and verify the recovery key against the stored hash
+      let recoveryKeyBytes: Uint8Array;
+      try {
+        recoveryKeyBytes = fromBase64url(envRecoveryKey);
+      } catch {
+        throw new Error(
+          "Sanctuary: SANCTUARY_RECOVERY_KEY is not valid base64url. " +
+          "The recovery key should be the exact string shown at first run."
+        );
+      }
+
+      if (recoveryKeyBytes.length !== 32) {
+        throw new Error(
+          "Sanctuary: SANCTUARY_RECOVERY_KEY has incorrect length. " +
+          "The recovery key should be the exact string shown at first run."
+        );
+      }
+
+      const providedHash = hashToString(recoveryKeyBytes);
+      const storedHash = bytesToString(existingHash);
+
+      // Constant-time comparison to prevent timing attacks on the hash
+      const providedHashBytes = stringToBytes(providedHash);
+      const storedHashBytes = stringToBytes(storedHash);
+      if (!constantTimeEqual(providedHashBytes, storedHashBytes)) {
+        throw new Error(
+          "Sanctuary: Recovery key does not match the stored key hash.\n" +
+          "The recovery key provided via SANCTUARY_RECOVERY_KEY is incorrect.\n" +
+          "Use the exact recovery key that was displayed at first run."
+        );
+      }
+
+      // Recovery key verified — use it as the master key
+      masterKey = recoveryKeyBytes;
+      // Do NOT set recoveryKey — this is not a first run, no banner should display
     } else {
+      // First run — but check for orphaned encrypted data as a safety net
+      const existingNamespaces = await storage.list("_meta");
+      const hasKeyParams = existingNamespaces.some(e => e.key === "key-params");
+      if (hasKeyParams) {
+        throw new Error(
+          "Sanctuary: Found existing key derivation parameters but no recovery key hash.\n" +
+          "This indicates a corrupted or incomplete installation.\n" +
+          "If you previously used a passphrase, set SANCTUARY_PASSPHRASE to start."
+        );
+      }
+
+      // Genuine first run: generate random master key and store its hash
       masterKey = generateRandomKey();
       recoveryKey = toBase64url(masterKey);
 
-      // Store a hash of the recovery key so we can verify it later
-      const { hashToString } = await import("./core/hashing.js");
-      const { stringToBytes } = await import("./core/encoding.js");
       const keyHash = hashToString(masterKey);
       await storage.write(
         "_meta",
@@ -452,7 +510,7 @@ export async function createSanctuaryServer(options?: {
       port: config.dashboard.port,
       host: config.dashboard.host,
       timeout_seconds: policy.approval_channel.timeout_seconds,
-      auto_deny: policy.approval_channel.auto_deny,
+      // SEC-002: auto_deny removed — timeout always denies
       auth_token: authToken,
       tls: config.dashboard.tls,
     });
@@ -466,7 +524,7 @@ export async function createSanctuaryServer(options?: {
       callback_port: config.webhook.callback_port,
       callback_host: config.webhook.callback_host,
       timeout_seconds: policy.approval_channel.timeout_seconds,
-      auto_deny: policy.approval_channel.auto_deny,
+      // SEC-002: auto_deny removed — timeout always denies
     });
     await webhook.start();
     approvalChannel = webhook;

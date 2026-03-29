@@ -28,7 +28,8 @@ const DEFAULT_TIER2: Tier2Config = {
 const DEFAULT_CHANNEL: ApprovalChannelConfig = {
   type: "stderr",
   timeout_seconds: 300,
-  auto_deny: true,
+  // SEC-002: auto_deny is not configurable. Timeout always denies.
+  // Field omitted intentionally — all channels hardcode deny on timeout.
 };
 
 /** Default Principal Policy — provides meaningful protection without configuration */
@@ -37,6 +38,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
   tier1_always_approve: [
     "state_export",
     "state_import",
+    "state_delete",
     "identity_rotate",
     "reputation_import",
     "bootstrap_provide_guarantee",
@@ -46,7 +48,6 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "state_read",
     "state_write",
     "state_list",
-    "state_delete",
     "identity_create",
     "identity_list",
     "identity_sign",
@@ -191,10 +192,16 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
     } as Tier2Config,
     tier3_always_allow:
       (raw.tier3_always_allow as string[]) ?? DEFAULT_POLICY.tier3_always_allow,
-    approval_channel: {
-      ...DEFAULT_CHANNEL,
-      ...((raw.approval_channel as Record<string, unknown>) ?? {}),
-    } as ApprovalChannelConfig,
+    approval_channel: (() => {
+      const merged = {
+        ...DEFAULT_CHANNEL,
+        ...((raw.approval_channel as Record<string, unknown>) ?? {}),
+      } as ApprovalChannelConfig;
+      // SEC-002: Strip auto_deny from user-supplied policy.
+      // Timeout always denies — this is not configurable.
+      delete merged.auto_deny;
+      return merged;
+    })(),
   };
 }
 
@@ -215,6 +222,7 @@ version: 1
 tier1_always_approve:
   - state_export
   - state_import
+  - state_delete
   - identity_rotate
   - reputation_import
   - bootstrap_provide_guarantee
@@ -236,7 +244,6 @@ tier3_always_allow:
   - state_read
   - state_write
   - state_list
-  - state_delete
   - identity_create
   - identity_list
   - identity_sign
@@ -273,10 +280,10 @@ tier3_always_allow:
 
 # ─── Approval Channel ────────────────────────────────────────────────────
 # How Sanctuary reaches you when approval is needed.
+# NOTE: Timeout always results in denial. This is not configurable (SEC-002).
 approval_channel:
   type: stderr
   timeout_seconds: 300
-  auto_deny: true
 `;
 }
 

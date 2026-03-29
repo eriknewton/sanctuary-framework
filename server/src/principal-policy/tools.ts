@@ -48,7 +48,7 @@ export function createPrincipalPolicyTools(
           approval_channel: {
             type: policy.approval_channel.type,
             timeout_seconds: policy.approval_channel.timeout_seconds,
-            auto_deny: policy.approval_channel.auto_deny,
+            auto_deny: true, // SEC-002: hardcoded, not configurable
           },
         };
 

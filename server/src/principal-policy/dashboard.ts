@@ -35,7 +35,8 @@ export interface DashboardConfig {
   port: number;
   host: string;
   timeout_seconds: number;
-  auto_deny: boolean;
+  /** SEC-002: auto_deny is always true. Field retained for interface compat but ignored. */
+  auto_deny?: boolean;
   /** Bearer token for API authentication. If omitted, auth is disabled. */
   auth_token?: string;
   /** TLS configuration for HTTPS. If omitted, plain HTTP is used. */
@@ -57,6 +58,18 @@ type SSEClient = ServerResponse;
 
 // ── Dashboard Approval Channel ──────────────────────────────────────────
 
+// ── Session Store ────────────────────────────────────────────────────
+// Short-lived sessions replace the long-lived auth token in URLs (SEC-012).
+
+interface DashboardSession {
+  id: string;
+  created_at: number;
+  expires_at: number;
+}
+
+const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_SESSIONS = 1000;
+
 export class DashboardApprovalChannel implements ApprovalChannel {
   private config: DashboardConfig;
   private pending: Map<string, PendingRequest> = new Map();
@@ -68,6 +81,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private dashboardHTML: string;
   private authToken: string | undefined;
   private useTLS: boolean;
+  /** SEC-012: Short-lived session store. Sessions replace URL query tokens. */
+  private sessions: Map<string, DashboardSession> = new Map();
+  private sessionCleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: DashboardConfig) {
     this.config = config;
@@ -78,6 +94,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       serverVersion: "0.3.0",
       authToken: this.authToken,
     });
+    // SEC-012: Periodic cleanup of expired sessions (every 60s)
+    this.sessionCleanupTimer = setInterval(() => this.cleanupSessions(), 60_000);
   }
 
   /**
@@ -121,8 +139,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           process.stderr.write(
             `\n  Sanctuary Principal Dashboard: ${baseUrl}\n`
           );
+          // SEC-012: Never suggest putting the token in the URL
           process.stderr.write(
-            `  Auth required (token: ${hint}). Pass ?token=<TOKEN> or Authorization: Bearer <TOKEN>.\n\n`
+            `  Auth required (token: ${hint}). Use Authorization: Bearer <TOKEN> header.\n\n`
           );
         } else {
           process.stderr.write(
@@ -156,6 +175,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
     this.sseClients.clear();
 
+    // SEC-012: Clean up session state
+    this.sessions.clear();
+    if (this.sessionCleanupTimer) {
+      clearInterval(this.sessionCleanupTimer);
+      this.sessionCleanupTimer = null;
+    }
+
     // Close HTTP server
     if (this.httpServer) {
       return new Promise((resolve) => {
@@ -181,7 +207,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         const response: ApprovalResponse = {
-          decision: this.config.auto_deny ? "deny" : "approve",
+          // SEC-002: Timeout ALWAYS denies. No configuration can change this.
+          decision: "deny",
           decided_at: new Date().toISOString(),
           decided_by: "timeout",
         };
@@ -219,13 +246,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   /**
    * Verify bearer token authentication.
-   * Checks Authorization header first, falls back to ?token= query param.
+   *
+   * SEC-012: The long-lived auth token is ONLY accepted via the Authorization
+   * header — never in URL query strings. For SSE and page loads that cannot
+   * set headers, a short-lived session token (obtained via POST /auth/session)
+   * is accepted via ?session= query parameter.
+   *
    * Returns true if auth passes, false if blocked (response already sent).
    */
   private checkAuth(req: IncomingMessage, url: URL, res: ServerResponse): boolean {
     if (!this.authToken) return true; // Auth disabled
 
-    // Check Authorization: Bearer <token> header
+    // Check Authorization: Bearer <token> header (primary auth method)
     const authHeader = req.headers.authorization;
     if (authHeader) {
       const parts = authHeader.split(" ");
@@ -234,15 +266,73 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       }
     }
 
-    // Check ?token= query parameter (needed for browser page load and EventSource)
-    const queryToken = url.searchParams.get("token");
-    if (queryToken === this.authToken) {
+    // SEC-012: Check ?session= query parameter for short-lived session tokens
+    // This replaces the old ?token= query parameter that exposed the long-lived token
+    const sessionId = url.searchParams.get("session");
+    if (sessionId && this.validateSession(sessionId)) {
       return true;
     }
 
+    // SEC-012: Long-lived token in ?token= query parameter is explicitly REJECTED.
+    // This was the vulnerability — tokens in URLs leak to logs, history, and Referer headers.
+
     res.writeHead(401, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Unauthorized — valid bearer token required" }));
+    res.end(JSON.stringify({ error: "Unauthorized — use Authorization: Bearer header or a valid session" }));
     return false;
+  }
+
+  // ── Session Management (SEC-012) ──────────────────────────────────
+
+  /**
+   * Create a short-lived session by exchanging the long-lived auth token
+   * (provided in the Authorization header) for a session ID.
+   */
+  private createSession(): string {
+    // Enforce max sessions to prevent memory exhaustion
+    if (this.sessions.size >= MAX_SESSIONS) {
+      this.cleanupSessions();
+      // If still at limit after cleanup, evict the oldest session
+      if (this.sessions.size >= MAX_SESSIONS) {
+        const oldest = [...this.sessions.entries()].sort(
+          (a, b) => a[1].created_at - b[1].created_at
+        )[0];
+        if (oldest) this.sessions.delete(oldest[0]);
+      }
+    }
+
+    const id = randomBytes(32).toString("hex");
+    const now = Date.now();
+    this.sessions.set(id, {
+      id,
+      created_at: now,
+      expires_at: now + SESSION_TTL_MS,
+    });
+    return id;
+  }
+
+  /**
+   * Validate a session ID — must exist and not be expired.
+   */
+  private validateSession(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    if (Date.now() > session.expires_at) {
+      this.sessions.delete(sessionId);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Remove all expired sessions.
+   */
+  private cleanupSessions(): void {
+    const now = Date.now();
+    for (const [id, session] of this.sessions) {
+      if (now > session.expires_at) {
+        this.sessions.delete(id);
+      }
+    }
   }
 
   // ── HTTP Request Handler ────────────────────────────────────────────
@@ -272,6 +362,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (!this.checkAuth(req, url, res)) return;
 
     try {
+      // SEC-012: Session exchange endpoint — must be authenticated via header
+      if (method === "POST" && url.pathname === "/auth/session") {
+        this.handleSessionExchange(req, res);
+        return;
+      }
+
       if (method === "GET" && url.pathname === "/") {
         this.serveDashboard(res);
       } else if (method === "GET" && url.pathname === "/events") {
@@ -299,6 +395,46 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   // ── Route Handlers ──────────────────────────────────────────────────
+
+  /**
+   * SEC-012: Exchange a long-lived auth token (in Authorization header)
+   * for a short-lived session ID. The session ID can be used in URL
+   * query parameters without exposing the long-lived credential.
+   *
+   * This endpoint performs its OWN auth check (header-only) because it
+   * must reject query-parameter tokens and is called before the
+   * normal checkAuth flow.
+   */
+  private handleSessionExchange(req: IncomingMessage, res: ServerResponse): void {
+    if (!this.authToken) {
+      // Auth disabled — sessions not needed
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ session_id: "no-auth" }));
+      return;
+    }
+
+    // Only accept the long-lived token via Authorization header — NEVER from URL
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Authorization header required" }));
+      return;
+    }
+
+    const parts = authHeader.split(" ");
+    if (parts.length !== 2 || parts[0] !== "Bearer" || parts[1] !== this.authToken) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid bearer token" }));
+      return;
+    }
+
+    const sessionId = this.createSession();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      session_id: sessionId,
+      expires_in_seconds: SESSION_TTL_MS / 1000,
+    }));
+  }
 
   private serveDashboard(res: ServerResponse): void {
     res.writeHead(200, {
@@ -329,7 +465,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         approval_channel: {
           type: this.policy.approval_channel.type,
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
-          auto_deny: this.policy.approval_channel.auto_deny,
+          auto_deny: true, // SEC-002: hardcoded, not configurable
         },
       };
     }
@@ -374,7 +510,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         approval_channel: {
           type: this.policy.approval_channel.type,
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
-          auto_deny: this.policy.approval_channel.auto_deny,
+          auto_deny: true, // SEC-002: hardcoded, not configurable
         },
       };
     }

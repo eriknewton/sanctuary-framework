@@ -51,7 +51,8 @@ approval_channel:
       expect(policy.tier3_always_allow).toEqual(["state_read", "state_write"]);
       expect(policy.approval_channel.type).toBe("stderr");
       expect(policy.approval_channel.timeout_seconds).toBe(120);
-      expect(policy.approval_channel.auto_deny).toBe(false);
+      // SEC-002: auto_deny is stripped by the parser — always undefined
+      expect(policy.approval_channel.auto_deny).toBeUndefined();
     });
 
     it("handles comments in YAML", () => {
@@ -81,8 +82,8 @@ tier1_always_approve:
       expect(policy.tier2_anomaly.max_signs_per_minute).toBe(10);
       // Tier 3 should have defaults
       expect(policy.tier3_always_allow).toEqual(DEFAULT_POLICY.tier3_always_allow);
-      // Channel should have defaults
-      expect(policy.approval_channel.auto_deny).toBe(true);
+      // SEC-002: auto_deny is stripped — always undefined
+      expect(policy.approval_channel.auto_deny).toBeUndefined();
     });
   });
 
@@ -107,7 +108,8 @@ tier1_always_approve:
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(8);
       // Defaults filled in
       expect(policy.tier2_anomaly.max_signs_per_minute).toBe(10);
-      expect(policy.approval_channel.auto_deny).toBe(false);
+      // SEC-002: auto_deny is stripped by the parser — always undefined
+      expect(policy.approval_channel.auto_deny).toBeUndefined();
     });
   });
 
@@ -126,8 +128,9 @@ tier1_always_approve:
       expect(DEFAULT_POLICY.tier3_always_allow).toContain("monitor_health");
     });
 
-    it("defaults to auto_deny", () => {
-      expect(DEFAULT_POLICY.approval_channel.auto_deny).toBe(true);
+    it("does not include auto_deny (SEC-002: hardcoded deny)", () => {
+      // SEC-002: auto_deny is no longer in the default policy
+      expect(DEFAULT_POLICY.approval_channel.auto_deny).toBeUndefined();
     });
   });
 

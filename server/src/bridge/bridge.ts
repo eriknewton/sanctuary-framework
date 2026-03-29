@@ -60,6 +60,12 @@ function stableStringify(value: unknown): string {
         `NaN, Infinity, and -Infinity are not representable in JSON.`
       );
     }
+    if (Object.is(value, -0)) {
+      throw new Error(
+        "Cannot canonicalize negative zero (-0). " +
+        "Use 0 instead for deterministic cross-language serialization."
+      );
+    }
     return JSON.stringify(value);
   }
   if (typeof value !== "object") return JSON.stringify(value);
@@ -128,7 +134,9 @@ export function createBridgeCommitment(
   };
 
   // 5. Sign the commitment with the identity's Ed25519 key
-  const payloadBytes = stringToBytes(JSON.stringify(commitmentPayload));
+  //    Uses stableStringify (not JSON.stringify) for deterministic key ordering
+  //    across languages — required for cross-repo signature verification (SEC-003).
+  const payloadBytes = stringToBytes(stableStringify(commitmentPayload));
   const signature = sign(payloadBytes, identity.encrypted_private_key, identityEncryptionKey);
 
   return {
@@ -177,6 +185,8 @@ export function verifyBridgeCommitment(
   );
 
   // 2. Signature check (must match the signing payload exactly)
+  //    Uses stableStringify (not JSON.stringify) for deterministic key ordering
+  //    across languages — required for cross-repo signature verification (SEC-003).
   const commitmentPayload = {
     bridge_commitment_id: commitment.bridge_commitment_id,
     session_id: commitment.session_id,
@@ -186,7 +196,7 @@ export function verifyBridgeCommitment(
     committed_at: commitment.committed_at,
     bridge_version: commitment.bridge_version,
   };
-  const payloadBytes = stringToBytes(JSON.stringify(commitmentPayload));
+  const payloadBytes = stringToBytes(stableStringify(commitmentPayload));
   const sigBytes = fromBase64url(commitment.signature);
   const signatureValid = verify(payloadBytes, sigBytes, committerPublicKey);
 

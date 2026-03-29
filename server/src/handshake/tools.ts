@@ -137,6 +137,8 @@ export function createHandshakeTools(
           instructions:
             "Send the 'response' object back to the initiator. " +
             "When you receive their completion, pass it to sanctuary/handshake_status with this session_id.",
+          // SEC-ADD-03: Tag response — contains SHR data that will be sent to counterparty
+          _content_trust: "external",
         });
       },
     },
@@ -203,6 +205,8 @@ export function createHandshakeTools(
           instructions:
             "Send the 'completion' object to the responder so they can verify the handshake. " +
             "The 'result' object contains the verified counterparty status and trust tier.",
+          // SEC-ADD-03: Tag response as containing counterparty-controlled SHR data
+          _content_trust: "external",
         });
       },
     },

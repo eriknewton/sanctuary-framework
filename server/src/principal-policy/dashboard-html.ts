@@ -12,7 +12,7 @@
 export function generateDashboardHTML(options: {
   timeoutSeconds: number;
   serverVersion: string;
-  /** @deprecated Auth token is now read from URL query at runtime, not embedded in HTML */
+  /** Auth token — used only in Authorization headers, never in URLs (SEC-012) */
   authToken?: string;
 }): string {
   return `<!DOCTYPE html>
@@ -310,21 +310,38 @@ export function generateDashboardHTML(options: {
 <script>
 (function() {
   const TIMEOUT = ${options.timeoutSeconds};
-  // Read auth token from URL query param at runtime (never embedded in HTML source)
-  const AUTH_TOKEN = new URLSearchParams(window.location.search).get('token');
+  // SEC-012: Auth token is passed via Authorization header only — never in URLs.
+  // The token is provided by the server at generation time (embedded for initial auth).
+  const AUTH_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : 'null'};
+  let SESSION_ID = null; // Short-lived session for SSE and URL-based requests
   const pending = new Map();
   let auditCount = 0;
 
-  // Auth helpers
+  // Auth helpers — SEC-012: token goes in header, session goes in URL
   function authHeaders() {
     const h = { 'Content-Type': 'application/json' };
     if (AUTH_TOKEN) h['Authorization'] = 'Bearer ' + AUTH_TOKEN;
     return h;
   }
-  function authQuery(url) {
-    if (!AUTH_TOKEN) return url;
+  function sessionQuery(url) {
+    if (!SESSION_ID) return url;
     const sep = url.includes('?') ? '&' : '?';
-    return url + sep + 'token=' + AUTH_TOKEN;
+    return url + sep + 'session=' + SESSION_ID;
+  }
+
+  // SEC-012: Exchange the long-lived token for a short-lived session
+  async function exchangeSession() {
+    if (!AUTH_TOKEN) return;
+    try {
+      const resp = await fetch('/auth/session', { method: 'POST', headers: authHeaders() });
+      if (resp.ok) {
+        const data = await resp.json();
+        SESSION_ID = data.session_id;
+        // Refresh session before expiry (at 80% of TTL)
+        const refreshMs = (data.expires_in_seconds || 300) * 800;
+        setTimeout(async () => { await exchangeSession(); reconnectSSE(); }, refreshMs);
+      }
+    } catch(e) { /* will retry on next connect */ }
   }
 
   // Tab switching
@@ -337,10 +354,14 @@ export function generateDashboardHTML(options: {
     });
   });
 
-  // SSE Connection
+  // SSE Connection — SEC-012: uses short-lived session token in URL, not auth token
   let evtSource;
+  function reconnectSSE() {
+    if (evtSource) { evtSource.close(); }
+    connect();
+  }
   function connect() {
-    evtSource = new EventSource(authQuery('/events'));
+    evtSource = new EventSource(sessionQuery('/events'));
     evtSource.onopen = () => {
       document.getElementById('statusDot').classList.remove('disconnected');
       document.getElementById('statusText').textContent = 'Connected';
@@ -528,12 +549,20 @@ export function generateDashboardHTML(options: {
     return d.innerHTML;
   }
 
-  // Init
-  connect();
-  fetch('/api/status', { headers: authHeaders() }).then(r => r.json()).then(data => {
-    if (data.baseline) updateBaseline(data.baseline);
-    if (data.policy) updatePolicy(data.policy);
-  }).catch(() => {});
+  // Init — SEC-012: exchange token for session before connecting SSE
+  (async function init() {
+    await exchangeSession();
+    // Clean token from URL if present (legacy bookmarks)
+    if (window.location.search.includes('token=')) {
+      const clean = window.location.pathname;
+      window.history.replaceState({}, '', clean);
+    }
+    connect();
+    fetch('/api/status', { headers: authHeaders() }).then(r => r.json()).then(data => {
+      if (data.baseline) updateBaseline(data.baseline);
+      if (data.policy) updatePolicy(data.policy);
+    }).catch(() => {});
+  })();
 })();
 </script>
 </body>
