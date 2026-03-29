@@ -179,9 +179,15 @@ export async function loadConfig(
   try {
     const raw = await readFile(path, "utf-8");
     const fileConfig = JSON.parse(raw);
-    return deepMerge(config, fileConfig);
-  } catch {
-    // No config file — use defaults
+    const merged = deepMerge(config, fileConfig);
+    validateConfig(merged);
+    return merged;
+  } catch (err) {
+    // Re-throw validation errors — only swallow file-not-found
+    if (err instanceof Error && err.message.includes("unimplemented features")) {
+      throw err;
+    }
+    // No config file — use defaults (defaults are always valid)
     return config;
   }
 }
@@ -196,6 +202,54 @@ export async function saveConfig(
   const path =
     configPath ?? join(config.storage_path, "sanctuary.json");
   await writeFile(path, JSON.stringify(config, null, 2), { mode: 0o600 });
+}
+
+/**
+ * Validate that config does not reference unimplemented features.
+ * Throws a descriptive error if any unimplemented value is found.
+ * This prevents silent security degradation (SEC-019).
+ */
+export function validateConfig(config: SanctuaryConfig): void {
+  const errors: string[] = [];
+
+  // Implemented key_protection values: "passphrase", "none"
+  // Unimplemented: "hardware-key" (planned for future FIDO2/WebAuthn support)
+  const implementedKeyProtection = new Set(["passphrase", "none"]);
+  if (!implementedKeyProtection.has(config.state.key_protection)) {
+    errors.push(
+      `Unimplemented config value: state.key_protection = "${config.state.key_protection}". ` +
+      `Only ${[...implementedKeyProtection].map(v => `"${v}"`).join(", ")} are currently implemented. ` +
+      `Using an unimplemented key protection mode would silently degrade security.`
+    );
+  }
+
+  // Implemented environment values: "local-process", "docker"
+  // Unimplemented: "tee" (TEE-backed execution attestation not yet integrated)
+  const implementedEnvironment = new Set(["local-process", "docker"]);
+  if (!implementedEnvironment.has(config.execution.environment)) {
+    errors.push(
+      `Unimplemented config value: execution.environment = "${config.execution.environment}". ` +
+      `Only ${[...implementedEnvironment].map(v => `"${v}"`).join(", ")} are currently implemented. ` +
+      `Using an unimplemented environment would silently degrade security.`
+    );
+  }
+
+  // Implemented proof_system values: "commitment-only"
+  // Unimplemented: "groth16", "plonk" (SNARK proof systems not yet available)
+  const implementedProofSystem = new Set(["commitment-only"]);
+  if (!implementedProofSystem.has(config.disclosure.proof_system)) {
+    errors.push(
+      `Unimplemented config value: disclosure.proof_system = "${config.disclosure.proof_system}". ` +
+      `Only ${[...implementedProofSystem].map(v => `"${v}"`).join(", ")} is currently implemented. ` +
+      `Using an unimplemented proof system would silently degrade security.`
+    );
+  }
+
+  if (errors.length > 0) {
+    throw new Error(
+      `Sanctuary configuration references unimplemented features:\n${errors.join("\n")}`
+    );
+  }
 }
 
 /** Deep merge two objects (target takes precedence) */

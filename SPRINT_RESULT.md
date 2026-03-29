@@ -1,88 +1,77 @@
-# SPRINT RESULT — SEC-016: Stderr Approval Channel Auto-Resolves in 100ms
+# SPRINT RESULT — SEC-019: Config Silently Accepts Unimplemented Features
 
 **Sprint Date:** 2026-03-28
-**Finding:** SEC-016 (High)
+**Finding:** SEC-019 (High)
 **Branch:** `security-review`
+**Implementer:** Claude (sprint session)
 
 ---
 
 ## What Changed and Why
 
-### 1. Removed 100ms setTimeout from StderrApprovalChannel (approval-channel.ts)
+### Changes
 
-**Root cause:** The stderr channel used `await new Promise((resolve) => setTimeout(resolve, 100))` to create a 100ms async delay before returning its denial. This delay served no purpose — the channel has no input mechanism (stdin is consumed by MCP protocol). The delay created a timing window that was a latent risk for future code that might race against the Promise.
+**`server/src/config.ts`:**
+- Added `validateConfig()` function (exported) that checks three config fields against whitelists of implemented values:
+  - `state.key_protection`: allows `"passphrase"`, `"none"` — rejects `"hardware-key"`
+  - `execution.environment`: allows `"local-process"`, `"docker"` — rejects `"tee"`
+  - `disclosure.proof_system`: allows `"commitment-only"` — rejects `"groth16"`, `"plonk"`
+- Collects all violations into a single error message (does not fail on first violation)
+- Error messages name the specific field, the invalid value, and the implemented alternatives
+- Called from `loadConfig()` after merging file config into defaults
+- Validation errors are re-thrown through the catch block (file-not-found errors still fall back to defaults)
 
-**Fix:** Removed the setTimeout entirely. The channel now returns `{ decision: "deny" }` synchronously after writing the informational prompt to stderr. Changed `decided_by` from `"timeout"` to `"stderr:non-interactive"` to distinguish from legitimate timeouts in the webhook/dashboard channels.
+**`server/test/security/reject-unimplemented-features.test.ts`** (new file):
+- 13 regression tests covering:
+  - 4 tests for each unimplemented value (groth16, plonk, hardware-key, tee) — verifies throw with descriptive error
+  - 1 test for multiple unimplemented features in a single config — verifies all are reported
+  - 5 tests for implemented values (commitment-only, passphrase, none, local-process, docker) — verifies acceptance
+  - 1 test for default config with no overrides — verifies normal operation
+  - 2 unit tests for `validateConfig()` directly
 
-### 2. Updated prompt text (approval-channel.ts)
+### Why
 
-The prompt header changed from "Approval Required" to "Operation Denied (non-interactive channel)" and the footer now reads "Denied: stderr channel cannot accept input (SEC-016)" with guidance to use dashboard or webhook for interactive approval.
+The root cause was that `loadConfig()` had no semantic validation. TypeScript union types defined the valid values but were erased at runtime. Any JSON value from a config file was merged in without checking implementedness. This allowed users to configure `proof_system: "groth16"` and believe they had SNARK proofs, when the system silently operated in commitment-only mode.
 
-### 3. Updated ApprovalResponse type (types.ts)
-
-Added `"stderr:non-interactive"` to the `decided_by` union type.
-
-### 4. Updated SEC-002 regression tests (sec-002-auto-deny-hardcoded.test.ts)
-
-The two StderrApprovalChannel tests now assert `decided_by === "stderr:non-interactive"` instead of `"timeout"`. Test names and comments updated to reflect SEC-016 invariant.
-
-### 5. Updated SEC-001 integration test (sec-001-state-delete-requires-approval.test.ts)
-
-Updated comment and test name to reference SEC-016. Removed the `timeout_seconds: 0.1` hack (no longer needed since there's no timeout).
-
-### 6. New regression test file (sec-016-stderr-always-denies.test.ts)
-
-4 new tests:
-- `always denies Tier 1 operations with decided_by stderr:non-interactive`
-- `denies immediately with no timing window (< 10ms, not 100ms)`
-- `ignores auto_deny: false config (SEC-002 interaction)`
-- `denies Tier 2 operations identically`
+This violates CLAUDE.md constraint #5: "Never silently degrade to a less-secure behavior on error."
 
 ---
 
 ## Test Suite Output
 
 ```
-Test Files  27 passed (27)
-     Tests  265 passed (265)
-  Start at  17:43:39
-  Duration  19.89s
+Test Files  28 passed (28)
+     Tests  278 passed (278)
+  Duration  20.13s
 ```
 
-Test count: 261 → 265 (+4 new SEC-016 regression tests)
-
----
-
-## SEC-002 Interaction Analysis
-
-SEC-002 established the invariant: "timeout on any approval channel ALWAYS results in denial." This sprint strengthens that invariant for the stderr channel specifically:
-
-- **Before SEC-016:** The stderr channel honored SEC-002 by returning `deny` after a 100ms timeout. The timing window existed but the outcome was safe.
-- **After SEC-016:** The stderr channel has no timeout at all. It denies synchronously. This is strictly stronger — there is no async gap to exploit, no timeout to race against, no timing window whatsoever.
-
-The webhook and dashboard channels are unchanged — they still use legitimate timeouts (configurable via `timeout_seconds`) because they wait for real human input. Only the stderr channel's fake timeout was removed.
+Test count: 265 → 278 (+13 new regression tests)
 
 ---
 
 ## New Risk Introduced
 
-None identified. The behavioral change (deny after 100ms → deny immediately) is strictly more restrictive. No code in the codebase depends on the 100ms delay.
+None significant. Users with unimplemented values in their config will now get a startup error instead of silent operation. This is the intended behavior — converting a silent security misrepresentation into an explicit, actionable failure.
+
+The only edge case: a user who had `proof_system: "groth16"` in their config but never noticed (because the system silently ignored it) will now need to change it to `"commitment-only"`. The error message tells them exactly what to do.
 
 ---
 
 ## Adjacent Findings Noticed
 
-None. The stderr channel implementation is self-contained. The fix touches only the approval-channel.ts source file, the types.ts type definition, and existing/new test files.
+None. This fix is isolated to the config parser and does not touch any other security surface.
 
 ---
 
-## Self-Assessment
+## Sprint Contract Criteria Assessment
 
-All sprint contract criteria are met:
+| Criterion | Met? |
+|-----------|------|
+| `loadConfig()` rejects all three unimplemented feature values | ✅ |
+| Error messages name the specific feature and its current value | ✅ |
+| All implemented values accepted without error | ✅ |
+| Default config (no file) continues to work | ✅ |
+| Regression tests cover all unimplemented and implemented values | ✅ (13 tests) |
+| Full test suite passes with count >= 265 | ✅ (278 tests) |
 
-1. ✅ The `setTimeout` / 100ms delay is completely removed
-2. ✅ The channel returns deny synchronously with no async gap
-3. ✅ `decided_by` is `"stderr:non-interactive"` (not `"timeout"`)
-4. ✅ SEC-002 invariant preserved: no config can cause approval
-5. ✅ All 4 regression tests pass
-6. ✅ Test count 265 ≥ 261 (no decrease, +4 net new)
+All sprint contract criteria are met.
