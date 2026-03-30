@@ -27,6 +27,7 @@ import { createSHRTools } from "./shr/tools.js";
 import { createHandshakeTools } from "./handshake/tools.js";
 import { createFederationTools } from "./federation/tools.js";
 import { createBridgeTools } from "./bridge/tools.js";
+import { createAuditTools } from "./audit/tools.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
@@ -489,6 +490,9 @@ export async function createSanctuaryServer(options?: {
     handshakeResults
   );
 
+  // 14d. Create Sovereignty Audit tools (read-only diagnostic)
+  const { tools: auditTools } = createAuditTools(config);
+
   // 15. Load Principal Policy and create approval gate
   const policy = await loadPrincipalPolicy(config.storage_path);
   const baseline = new BaselineTracker(storage, masterKey);
@@ -548,6 +552,7 @@ export async function createSanctuaryServer(options?: {
     ...handshakeTools,
     ...federationTools,
     ...bridgeTools,
+    ...auditTools,
     manifestTool,
   ];
 
