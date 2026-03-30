@@ -1,7 +1,7 @@
 {
   "name": "sanctuary-framework",
-  "version": "0.2.0",
-  "description": "Sovereignty infrastructure for the agentic economy. Gives your agent encrypted state, self-custodied identity, selective disclosure, portable reputation, and sovereignty verification.",
+  "version": "0.3.0",
+  "description": "Sovereignty infrastructure for the agentic economy. Gives your agent encrypted state, self-custodied identity, selective disclosure, portable reputation, and sovereignty verification — including a sovereignty audit tool that detects gaps in OpenClaw and other agent harnesses.",
   "author": {
     "name": "CIMC.ai",
     "homepage": "https://github.com/eriknewton/sanctuary-framework"
@@ -14,6 +14,9 @@
     "reputation",
     "privacy",
     "mcp",
-    "agent"
+    "agent",
+    "openclaw",
+    "audit",
+    "zero-knowledge"
   ]
 }

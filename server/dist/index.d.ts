@@ -255,9 +255,11 @@ declare class StateStore {
     /**
      * Import a previously exported state bundle.
      */
-    import(bundleBase64: string, conflictResolution?: "skip" | "overwrite" | "version"): Promise<{
+    import(bundleBase64: string, conflictResolution: "skip" | "overwrite" | "version" | undefined, publicKeyResolver: (kid: string) => Uint8Array | null): Promise<{
         imported_keys: number;
         skipped_keys: number;
+        skipped_invalid_sig: number;
+        skipped_unknown_kid: number;
         conflicts: number;
         namespaces: string[];
         imported_at: string;
@@ -1187,7 +1189,13 @@ interface Tier2Config {
 interface ApprovalChannelConfig {
     type: "stderr" | "webhook" | "callback";
     timeout_seconds: number;
-    auto_deny: boolean;
+    /**
+     * SEC-002: auto_deny is hardcoded to true and not configurable.
+     * Timeout on any approval channel ALWAYS results in denial.
+     * This field is retained for backward compatibility with existing
+     * policy files but is ignored — timeout always denies.
+     */
+    auto_deny?: boolean;
     webhook_url?: string;
     webhook_secret?: string;
 }
@@ -1215,7 +1223,7 @@ interface ApprovalRequest {
 interface ApprovalResponse {
     decision: "approve" | "deny";
     decided_at: string;
-    decided_by: "human" | "timeout" | "auto";
+    decided_by: "human" | "timeout" | "auto" | "stderr:non-interactive";
 }
 /** Result of the approval gate evaluation */
 interface GateResult {
@@ -1258,22 +1266,25 @@ interface ApprovalChannel {
     requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
 }
 /**
- * Stderr approval channel — writes prompts to stderr, waits for response.
+ * Stderr approval channel — non-interactive informational channel.
  *
  * In the MCP stdio model:
  * - stdin/stdout carry the MCP protocol (JSON-RPC)
  * - stderr is available for out-of-band human communication
  *
- * Since many harnesses do not support interactive stdin during tool calls,
- * this channel uses a timeout-based model: the prompt is displayed, and
- * if no response is received within the timeout, the default action applies.
+ * Because stdin is consumed by the MCP JSON-RPC transport, this channel
+ * CANNOT read interactive human input. It is strictly informational:
+ * the prompt is displayed so the human sees what is happening, and the
+ * operation is denied immediately.
  *
- * For MVS, the channel auto-resolves based on the auto_deny setting.
- * Interactive stdin reading is deferred to a future version with harness support.
+ * SEC-002 + SEC-016 invariants:
+ * - This channel ALWAYS denies. No configuration can change this.
+ * - There is no timeout or async delay — denial is synchronous.
+ * - The `auto_deny` config field is ignored (SEC-002).
+ * - For interactive approval, use the dashboard or webhook channel.
  */
 declare class StderrApprovalChannel implements ApprovalChannel {
-    private config;
-    constructor(config: ApprovalChannelConfig);
+    constructor(_config: ApprovalChannelConfig);
     requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
     private formatPrompt;
 }
@@ -1458,7 +1469,8 @@ interface DashboardConfig {
     port: number;
     host: string;
     timeout_seconds: number;
-    auto_deny: boolean;
+    /** SEC-002: auto_deny is always true. Field retained for interface compat but ignored. */
+    auto_deny?: boolean;
     /** Bearer token for API authentication. If omitted, auth is disabled. */
     auth_token?: string;
     /** TLS configuration for HTTPS. If omitted, plain HTTP is used. */
@@ -1478,6 +1490,9 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
     private dashboardHTML;
     private authToken;
     private useTLS;
+    /** SEC-012: Short-lived session store. Sessions replace URL query tokens. */
+    private sessions;
+    private sessionCleanupTimer;
     constructor(config: DashboardConfig);
     /**
      * Inject dependencies after construction.
@@ -1503,11 +1518,39 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
     requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
     /**
      * Verify bearer token authentication.
-     * Checks Authorization header first, falls back to ?token= query param.
+     *
+     * SEC-012: The long-lived auth token is ONLY accepted via the Authorization
+     * header — never in URL query strings. For SSE and page loads that cannot
+     * set headers, a short-lived session token (obtained via POST /auth/session)
+     * is accepted via ?session= query parameter.
+     *
      * Returns true if auth passes, false if blocked (response already sent).
      */
     private checkAuth;
+    /**
+     * Create a short-lived session by exchanging the long-lived auth token
+     * (provided in the Authorization header) for a session ID.
+     */
+    private createSession;
+    /**
+     * Validate a session ID — must exist and not be expired.
+     */
+    private validateSession;
+    /**
+     * Remove all expired sessions.
+     */
+    private cleanupSessions;
     private handleRequest;
+    /**
+     * SEC-012: Exchange a long-lived auth token (in Authorization header)
+     * for a short-lived session ID. The session ID can be used in URL
+     * query parameters without exposing the long-lived credential.
+     *
+     * This endpoint performs its OWN auth check (header-only) because it
+     * must reject query-parameter tokens and is called before the
+     * normal checkAuth flow.
+     */
+    private handleSessionExchange;
     private serveDashboard;
     private handleSSE;
     private handleStatus;
@@ -1568,8 +1611,8 @@ interface WebhookConfig {
     callback_host: string;
     /** Seconds to wait for a callback before timeout */
     timeout_seconds: number;
-    /** Whether to deny (true) or approve (false) on timeout */
-    auto_deny: boolean;
+    /** SEC-002: auto_deny is always true. Field retained for interface compat but ignored. */
+    auto_deny?: boolean;
 }
 /** Outbound webhook payload */
 interface WebhookPayload {

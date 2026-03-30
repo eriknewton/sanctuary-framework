@@ -2,7 +2,7 @@
 import { sha256 } from '@noble/hashes/sha256';
 import { hmac } from '@noble/hashes/hmac';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { mkdir, readFile, writeFile, stat, unlink, readdir, chmod } from 'fs/promises';
+import { mkdir, readFile, writeFile, stat, unlink, readdir, chmod, access } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { randomBytes as randomBytes$1, createHmac } from 'crypto';
@@ -298,14 +298,46 @@ async function loadConfig(configPath) {
   try {
     const raw = await readFile(path, "utf-8");
     const fileConfig = JSON.parse(raw);
-    return deepMerge(config, fileConfig);
-  } catch {
+    const merged = deepMerge(config, fileConfig);
+    validateConfig(merged);
+    return merged;
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("unimplemented features")) {
+      throw err;
+    }
     return config;
   }
 }
 async function saveConfig(config, configPath) {
   const path = join(config.storage_path, "sanctuary.json");
   await writeFile(path, JSON.stringify(config, null, 2), { mode: 384 });
+}
+function validateConfig(config) {
+  const errors = [];
+  const implementedKeyProtection = /* @__PURE__ */ new Set(["passphrase", "none"]);
+  if (!implementedKeyProtection.has(config.state.key_protection)) {
+    errors.push(
+      `Unimplemented config value: state.key_protection = "${config.state.key_protection}". Only ${[...implementedKeyProtection].map((v) => `"${v}"`).join(", ")} are currently implemented. Using an unimplemented key protection mode would silently degrade security.`
+    );
+  }
+  const implementedEnvironment = /* @__PURE__ */ new Set(["local-process", "docker"]);
+  if (!implementedEnvironment.has(config.execution.environment)) {
+    errors.push(
+      `Unimplemented config value: execution.environment = "${config.execution.environment}". Only ${[...implementedEnvironment].map((v) => `"${v}"`).join(", ")} are currently implemented. Using an unimplemented environment would silently degrade security.`
+    );
+  }
+  const implementedProofSystem = /* @__PURE__ */ new Set(["commitment-only"]);
+  if (!implementedProofSystem.has(config.disclosure.proof_system)) {
+    errors.push(
+      `Unimplemented config value: disclosure.proof_system = "${config.disclosure.proof_system}". Only ${[...implementedProofSystem].map((v) => `"${v}"`).join(", ")} is currently implemented. Using an unimplemented proof system would silently degrade security.`
+    );
+  }
+  if (errors.length > 0) {
+    throw new Error(
+      `Sanctuary configuration references unimplemented features:
+${errors.join("\n")}`
+    );
+  }
 }
 function deepMerge(base, override) {
   const result = { ...base };
@@ -921,12 +953,14 @@ var StateStore = class {
   /**
    * Import a previously exported state bundle.
    */
-  async import(bundleBase64, conflictResolution = "skip") {
+  async import(bundleBase64, conflictResolution = "skip", publicKeyResolver) {
     const bundleBytes = fromBase64url(bundleBase64);
     const bundleJson = bytesToString(bundleBytes);
     const bundle = JSON.parse(bundleJson);
     let importedKeys = 0;
     let skippedKeys = 0;
+    let skippedInvalidSig = 0;
+    let skippedUnknownKid = 0;
     let conflicts = 0;
     const namespaces = [];
     for (const [ns, entries] of Object.entries(
@@ -940,6 +974,26 @@ var StateStore = class {
       }
       namespaces.push(ns);
       for (const { key, entry } of entries) {
+        const signerPublicKey = publicKeyResolver(entry.kid);
+        if (!signerPublicKey) {
+          skippedUnknownKid++;
+          skippedKeys++;
+          continue;
+        }
+        try {
+          const ciphertextBytes = fromBase64url(entry.payload.ct);
+          const signatureBytes = fromBase64url(entry.sig);
+          const sigValid = verify(ciphertextBytes, signatureBytes, signerPublicKey);
+          if (!sigValid) {
+            skippedInvalidSig++;
+            skippedKeys++;
+            continue;
+          }
+        } catch {
+          skippedInvalidSig++;
+          skippedKeys++;
+          continue;
+        }
         const exists = await this.storage.exists(ns, key);
         if (exists) {
           conflicts++;
@@ -975,6 +1029,8 @@ var StateStore = class {
     return {
       imported_keys: importedKeys,
       skipped_keys: skippedKeys,
+      skipped_invalid_sig: skippedInvalidSig,
+      skipped_unknown_kid: skippedUnknownKid,
       conflicts,
       namespaces,
       imported_at: (/* @__PURE__ */ new Date()).toISOString()
@@ -1632,9 +1688,15 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
         required: ["bundle"]
       },
       handler: async (args) => {
+        const publicKeyResolver = (kid) => {
+          const identity = identityMgr.get(kid);
+          if (!identity) return null;
+          return fromBase64url(identity.public_key);
+        };
         const result = await stateStore.import(
           args.bundle,
-          args.conflict_resolution ?? "skip"
+          args.conflict_resolution ?? "skip",
+          publicKeyResolver
         );
         auditLog?.append("l1", "state_import", "principal", {
           imported_keys: result.imported_keys
@@ -3176,7 +3238,9 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
           contexts: summary.contexts
         });
         return toolResult({
-          summary
+          summary,
+          // SEC-ADD-03: Tag response as containing counterparty-generated attestation data
+          _content_trust: "external"
         });
       }
     },
@@ -3497,14 +3561,16 @@ var DEFAULT_TIER2 = {
 };
 var DEFAULT_CHANNEL = {
   type: "stderr",
-  timeout_seconds: 300,
-  auto_deny: true
+  timeout_seconds: 300
+  // SEC-002: auto_deny is not configurable. Timeout always denies.
+  // Field omitted intentionally — all channels hardcode deny on timeout.
 };
 var DEFAULT_POLICY = {
   version: 1,
   tier1_always_approve: [
     "state_export",
     "state_import",
+    "state_delete",
     "identity_rotate",
     "reputation_import",
     "bootstrap_provide_guarantee"
@@ -3514,7 +3580,6 @@ var DEFAULT_POLICY = {
     "state_read",
     "state_write",
     "state_list",
-    "state_delete",
     "identity_create",
     "identity_list",
     "identity_sign",
@@ -3622,10 +3687,14 @@ function validatePolicy(raw) {
       ...raw.tier2_anomaly ?? {}
     },
     tier3_always_allow: raw.tier3_always_allow ?? DEFAULT_POLICY.tier3_always_allow,
-    approval_channel: {
-      ...DEFAULT_CHANNEL,
-      ...raw.approval_channel ?? {}
-    }
+    approval_channel: (() => {
+      const merged = {
+        ...DEFAULT_CHANNEL,
+        ...raw.approval_channel ?? {}
+      };
+      delete merged.auto_deny;
+      return merged;
+    })()
   };
 }
 function generateDefaultPolicyYaml() {
@@ -3642,6 +3711,7 @@ version: 1
 tier1_always_approve:
   - state_export
   - state_import
+  - state_delete
   - identity_rotate
   - reputation_import
   - bootstrap_provide_guarantee
@@ -3663,7 +3733,6 @@ tier3_always_allow:
   - state_read
   - state_write
   - state_list
-  - state_delete
   - identity_create
   - identity_list
   - identity_sign
@@ -3700,10 +3769,10 @@ tier3_always_allow:
 
 # \u2500\u2500\u2500 Approval Channel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # How Sanctuary reaches you when approval is needed.
+# NOTE: Timeout always results in denial. This is not configurable (SEC-002).
 approval_channel:
   type: stderr
   timeout_seconds: 300
-  auto_deny: true
 `;
 }
 async function loadPrincipalPolicy(storagePath) {
@@ -3880,27 +3949,16 @@ var BaselineTracker = class {
 
 // src/principal-policy/approval-channel.ts
 var StderrApprovalChannel = class {
-  config;
-  constructor(config) {
-    this.config = config;
+  constructor(_config) {
   }
   async requestApproval(request) {
     const prompt = this.formatPrompt(request);
     process.stderr.write(prompt + "\n");
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    if (this.config.auto_deny) {
-      return {
-        decision: "deny",
-        decided_at: (/* @__PURE__ */ new Date()).toISOString(),
-        decided_by: "timeout"
-      };
-    } else {
-      return {
-        decision: "approve",
-        decided_at: (/* @__PURE__ */ new Date()).toISOString(),
-        decided_by: "auto"
-      };
-    }
+    return {
+      decision: "deny",
+      decided_at: (/* @__PURE__ */ new Date()).toISOString(),
+      decided_by: "stderr:non-interactive"
+    };
   }
   formatPrompt(request) {
     const tierLabel = request.tier === 1 ? "Tier 1 \u2014 always requires approval" : "Tier 2 \u2014 behavioral anomaly detected";
@@ -3908,7 +3966,7 @@ var StderrApprovalChannel = class {
     return [
       "",
       "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557",
-      "\u2551  SANCTUARY: Approval Required                                    \u2551",
+      "\u2551  SANCTUARY: Operation Denied (non-interactive channel)           \u2551",
       "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563",
       `\u2551  Operation:  ${request.operation.padEnd(50)}\u2551`,
       `\u2551  ${tierLabel.padEnd(62)}\u2551`,
@@ -3919,7 +3977,8 @@ var StderrApprovalChannel = class {
         (line) => `\u2551    ${line.padEnd(60)}\u2551`
       ),
       "\u2551                                                                  \u2551",
-      this.config.auto_deny ? "\u2551  Auto-denying (configure approval_channel.auto_deny to change)  \u2551" : "\u2551  Auto-approving (informational mode)                            \u2551",
+      "\u2551  Denied: stderr channel cannot accept input (SEC-016)            \u2551",
+      "\u2551  Use dashboard or webhook channel for interactive approval.      \u2551",
       "\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D",
       ""
     ].join("\n");
@@ -4223,21 +4282,38 @@ function generateDashboardHTML(options) {
 <script>
 (function() {
   const TIMEOUT = ${options.timeoutSeconds};
-  // Read auth token from URL query param at runtime (never embedded in HTML source)
-  const AUTH_TOKEN = new URLSearchParams(window.location.search).get('token');
+  // SEC-012: Auth token is passed via Authorization header only \u2014 never in URLs.
+  // The token is provided by the server at generation time (embedded for initial auth).
+  const AUTH_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : "null"};
+  let SESSION_ID = null; // Short-lived session for SSE and URL-based requests
   const pending = new Map();
   let auditCount = 0;
 
-  // Auth helpers
+  // Auth helpers \u2014 SEC-012: token goes in header, session goes in URL
   function authHeaders() {
     const h = { 'Content-Type': 'application/json' };
     if (AUTH_TOKEN) h['Authorization'] = 'Bearer ' + AUTH_TOKEN;
     return h;
   }
-  function authQuery(url) {
-    if (!AUTH_TOKEN) return url;
+  function sessionQuery(url) {
+    if (!SESSION_ID) return url;
     const sep = url.includes('?') ? '&' : '?';
-    return url + sep + 'token=' + AUTH_TOKEN;
+    return url + sep + 'session=' + SESSION_ID;
+  }
+
+  // SEC-012: Exchange the long-lived token for a short-lived session
+  async function exchangeSession() {
+    if (!AUTH_TOKEN) return;
+    try {
+      const resp = await fetch('/auth/session', { method: 'POST', headers: authHeaders() });
+      if (resp.ok) {
+        const data = await resp.json();
+        SESSION_ID = data.session_id;
+        // Refresh session before expiry (at 80% of TTL)
+        const refreshMs = (data.expires_in_seconds || 300) * 800;
+        setTimeout(async () => { await exchangeSession(); reconnectSSE(); }, refreshMs);
+      }
+    } catch(e) { /* will retry on next connect */ }
   }
 
   // Tab switching
@@ -4250,10 +4326,14 @@ function generateDashboardHTML(options) {
     });
   });
 
-  // SSE Connection
+  // SSE Connection \u2014 SEC-012: uses short-lived session token in URL, not auth token
   let evtSource;
+  function reconnectSSE() {
+    if (evtSource) { evtSource.close(); }
+    connect();
+  }
   function connect() {
-    evtSource = new EventSource(authQuery('/events'));
+    evtSource = new EventSource(sessionQuery('/events'));
     evtSource.onopen = () => {
       document.getElementById('statusDot').classList.remove('disconnected');
       document.getElementById('statusText').textContent = 'Connected';
@@ -4441,12 +4521,20 @@ function generateDashboardHTML(options) {
     return d.innerHTML;
   }
 
-  // Init
-  connect();
-  fetch('/api/status', { headers: authHeaders() }).then(r => r.json()).then(data => {
-    if (data.baseline) updateBaseline(data.baseline);
-    if (data.policy) updatePolicy(data.policy);
-  }).catch(() => {});
+  // Init \u2014 SEC-012: exchange token for session before connecting SSE
+  (async function init() {
+    await exchangeSession();
+    // Clean token from URL if present (legacy bookmarks)
+    if (window.location.search.includes('token=')) {
+      const clean = window.location.pathname;
+      window.history.replaceState({}, '', clean);
+    }
+    connect();
+    fetch('/api/status', { headers: authHeaders() }).then(r => r.json()).then(data => {
+      if (data.baseline) updateBaseline(data.baseline);
+      if (data.policy) updatePolicy(data.policy);
+    }).catch(() => {});
+  })();
 })();
 </script>
 </body>
@@ -4454,6 +4542,8 @@ function generateDashboardHTML(options) {
 }
 
 // src/principal-policy/dashboard.ts
+var SESSION_TTL_MS = 5 * 60 * 1e3;
+var MAX_SESSIONS = 1e3;
 var DashboardApprovalChannel = class {
   config;
   pending = /* @__PURE__ */ new Map();
@@ -4465,6 +4555,9 @@ var DashboardApprovalChannel = class {
   dashboardHTML;
   authToken;
   useTLS;
+  /** SEC-012: Short-lived session store. Sessions replace URL query tokens. */
+  sessions = /* @__PURE__ */ new Map();
+  sessionCleanupTimer = null;
   constructor(config) {
     this.config = config;
     this.authToken = config.auth_token;
@@ -4474,6 +4567,7 @@ var DashboardApprovalChannel = class {
       serverVersion: "0.3.0",
       authToken: this.authToken
     });
+    this.sessionCleanupTimer = setInterval(() => this.cleanupSessions(), 6e4);
   }
   /**
    * Inject dependencies after construction.
@@ -4510,7 +4604,7 @@ var DashboardApprovalChannel = class {
 `
           );
           process.stderr.write(
-            `  Auth required (token: ${hint}). Pass ?token=<TOKEN> or Authorization: Bearer <TOKEN>.
+            `  Auth required (token: ${hint}). Use Authorization: Bearer <TOKEN> header.
 
 `
           );
@@ -4544,6 +4638,11 @@ var DashboardApprovalChannel = class {
       client.end();
     }
     this.sseClients.clear();
+    this.sessions.clear();
+    if (this.sessionCleanupTimer) {
+      clearInterval(this.sessionCleanupTimer);
+      this.sessionCleanupTimer = null;
+    }
     if (this.httpServer) {
       return new Promise((resolve) => {
         this.httpServer.close(() => resolve());
@@ -4564,7 +4663,8 @@ var DashboardApprovalChannel = class {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         const response = {
-          decision: this.config.auto_deny ? "deny" : "approve",
+          // SEC-002: Timeout ALWAYS denies. No configuration can change this.
+          decision: "deny",
           decided_at: (/* @__PURE__ */ new Date()).toISOString(),
           decided_by: "timeout"
         };
@@ -4596,7 +4696,12 @@ var DashboardApprovalChannel = class {
   // ── Authentication ──────────────────────────────────────────────────
   /**
    * Verify bearer token authentication.
-   * Checks Authorization header first, falls back to ?token= query param.
+   *
+   * SEC-012: The long-lived auth token is ONLY accepted via the Authorization
+   * header — never in URL query strings. For SSE and page loads that cannot
+   * set headers, a short-lived session token (obtained via POST /auth/session)
+   * is accepted via ?session= query parameter.
+   *
    * Returns true if auth passes, false if blocked (response already sent).
    */
   checkAuth(req, url, res) {
@@ -4608,13 +4713,60 @@ var DashboardApprovalChannel = class {
         return true;
       }
     }
-    const queryToken = url.searchParams.get("token");
-    if (queryToken === this.authToken) {
+    const sessionId = url.searchParams.get("session");
+    if (sessionId && this.validateSession(sessionId)) {
       return true;
     }
     res.writeHead(401, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Unauthorized \u2014 valid bearer token required" }));
+    res.end(JSON.stringify({ error: "Unauthorized \u2014 use Authorization: Bearer header or a valid session" }));
     return false;
+  }
+  // ── Session Management (SEC-012) ──────────────────────────────────
+  /**
+   * Create a short-lived session by exchanging the long-lived auth token
+   * (provided in the Authorization header) for a session ID.
+   */
+  createSession() {
+    if (this.sessions.size >= MAX_SESSIONS) {
+      this.cleanupSessions();
+      if (this.sessions.size >= MAX_SESSIONS) {
+        const oldest = [...this.sessions.entries()].sort(
+          (a, b) => a[1].created_at - b[1].created_at
+        )[0];
+        if (oldest) this.sessions.delete(oldest[0]);
+      }
+    }
+    const id = randomBytes$1(32).toString("hex");
+    const now = Date.now();
+    this.sessions.set(id, {
+      id,
+      created_at: now,
+      expires_at: now + SESSION_TTL_MS
+    });
+    return id;
+  }
+  /**
+   * Validate a session ID — must exist and not be expired.
+   */
+  validateSession(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    if (Date.now() > session.expires_at) {
+      this.sessions.delete(sessionId);
+      return false;
+    }
+    return true;
+  }
+  /**
+   * Remove all expired sessions.
+   */
+  cleanupSessions() {
+    const now = Date.now();
+    for (const [id, session] of this.sessions) {
+      if (now > session.expires_at) {
+        this.sessions.delete(id);
+      }
+    }
   }
   // ── HTTP Request Handler ────────────────────────────────────────────
   handleRequest(req, res) {
@@ -4635,6 +4787,10 @@ var DashboardApprovalChannel = class {
     }
     if (!this.checkAuth(req, url, res)) return;
     try {
+      if (method === "POST" && url.pathname === "/auth/session") {
+        this.handleSessionExchange(req, res);
+        return;
+      }
       if (method === "GET" && url.pathname === "/") {
         this.serveDashboard(res);
       } else if (method === "GET" && url.pathname === "/events") {
@@ -4661,6 +4817,40 @@ var DashboardApprovalChannel = class {
     }
   }
   // ── Route Handlers ──────────────────────────────────────────────────
+  /**
+   * SEC-012: Exchange a long-lived auth token (in Authorization header)
+   * for a short-lived session ID. The session ID can be used in URL
+   * query parameters without exposing the long-lived credential.
+   *
+   * This endpoint performs its OWN auth check (header-only) because it
+   * must reject query-parameter tokens and is called before the
+   * normal checkAuth flow.
+   */
+  handleSessionExchange(req, res) {
+    if (!this.authToken) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ session_id: "no-auth" }));
+      return;
+    }
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Authorization header required" }));
+      return;
+    }
+    const parts = authHeader.split(" ");
+    if (parts.length !== 2 || parts[0] !== "Bearer" || parts[1] !== this.authToken) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid bearer token" }));
+      return;
+    }
+    const sessionId = this.createSession();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      session_id: sessionId,
+      expires_in_seconds: SESSION_TTL_MS / 1e3
+    }));
+  }
   serveDashboard(res) {
     res.writeHead(200, {
       "Content-Type": "text/html; charset=utf-8",
@@ -4686,7 +4876,8 @@ var DashboardApprovalChannel = class {
         approval_channel: {
           type: this.policy.approval_channel.type,
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
-          auto_deny: this.policy.approval_channel.auto_deny
+          auto_deny: true
+          // SEC-002: hardcoded, not configurable
         }
       };
     }
@@ -4727,7 +4918,8 @@ data: ${JSON.stringify(initData)}
         approval_channel: {
           type: this.policy.approval_channel.type,
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
-          auto_deny: this.policy.approval_channel.auto_deny
+          auto_deny: true
+          // SEC-002: hardcoded, not configurable
         }
       };
     }
@@ -4900,7 +5092,8 @@ var WebhookApprovalChannel = class {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         const response = {
-          decision: this.config.auto_deny ? "deny" : "approve",
+          // SEC-002: Timeout ALWAYS denies. No configuration can change this.
+          decision: "deny",
           decided_at: (/* @__PURE__ */ new Date()).toISOString(),
           decided_by: "timeout"
         };
@@ -5088,16 +5281,29 @@ var ApprovalGate = class {
     if (anomaly) {
       return this.requestApproval(operation, 2, anomaly.reason, anomaly.context);
     }
-    this.auditLog.append("l2", `gate_allow:${operation}`, "system", {
-      tier: 3,
-      operation
+    if (this.policy.tier3_always_allow.includes(operation)) {
+      this.auditLog.append("l2", `gate_allow:${operation}`, "system", {
+        tier: 3,
+        operation
+      });
+      return {
+        allowed: true,
+        tier: 3,
+        reason: "Operation allowed (Tier 3)",
+        approval_required: false
+      };
+    }
+    this.auditLog.append("l2", `gate_unclassified:${operation}`, "system", {
+      tier: 1,
+      operation,
+      warning: "Operation is not classified in any policy tier \u2014 defaulting to Tier 1 (require approval)"
     });
-    return {
-      allowed: true,
-      tier: 3,
-      reason: "Operation allowed (Tier 3)",
-      approval_required: false
-    };
+    return this.requestApproval(
+      operation,
+      1,
+      `"${operation}" is not classified in any policy tier \u2014 requires approval (SEC-011 safe default)`,
+      { operation, unclassified: true }
+    );
   }
   /**
    * Detect Tier 2 behavioral anomalies.
@@ -5270,7 +5476,8 @@ function createPrincipalPolicyTools(policy, baseline, auditLog) {
           approval_channel: {
             type: policy.approval_channel.type,
             timeout_seconds: policy.approval_channel.timeout_seconds,
-            auto_deny: policy.approval_channel.auto_deny
+            auto_deny: true
+            // SEC-002: hardcoded, not configurable
           }
         };
         if (includeDefaults) {
@@ -5801,7 +6008,9 @@ function createHandshakeTools(config, identityManager, masterKey, auditLog) {
         return toolResult({
           session_id: result.session.session_id,
           response: result.response,
-          instructions: "Send the 'response' object back to the initiator. When you receive their completion, pass it to sanctuary/handshake_status with this session_id."
+          instructions: "Send the 'response' object back to the initiator. When you receive their completion, pass it to sanctuary/handshake_status with this session_id.",
+          // SEC-ADD-03: Tag response — contains SHR data that will be sent to counterparty
+          _content_trust: "external"
         });
       }
     },
@@ -5854,7 +6063,9 @@ function createHandshakeTools(config, identityManager, masterKey, auditLog) {
         return toolResult({
           completion: result.completion,
           result: result.result,
-          instructions: "Send the 'completion' object to the responder so they can verify the handshake. The 'result' object contains the verified counterparty status and trust tier."
+          instructions: "Send the 'completion' object to the responder so they can verify the handshake. The 'result' object contains the verified counterparty status and trust tier.",
+          // SEC-ADD-03: Tag response as containing counterparty-controlled SHR data
+          _content_trust: "external"
         });
       }
     },
@@ -6287,6 +6498,11 @@ function stableStringify(value) {
         `Cannot canonicalize non-finite number: ${value}. NaN, Infinity, and -Infinity are not representable in JSON.`
       );
     }
+    if (Object.is(value, -0)) {
+      throw new Error(
+        "Cannot canonicalize negative zero (-0). Use 0 instead for deterministic cross-language serialization."
+      );
+    }
     return JSON.stringify(value);
   }
   if (typeof value !== "object") return JSON.stringify(value);
@@ -6321,7 +6537,7 @@ function createBridgeCommitment(outcome, identity, identityEncryptionKey, includ
     committed_at: now,
     bridge_version: "sanctuary-concordia-bridge-v1"
   };
-  const payloadBytes = stringToBytes(JSON.stringify(commitmentPayload));
+  const payloadBytes = stringToBytes(stableStringify(commitmentPayload));
   const signature = sign(payloadBytes, identity.encrypted_private_key, identityEncryptionKey);
   return {
     bridge_commitment_id: commitmentId,
@@ -6352,7 +6568,7 @@ function verifyBridgeCommitment(commitment, outcome, committerPublicKey) {
     committed_at: commitment.committed_at,
     bridge_version: commitment.bridge_version
   };
-  const payloadBytes = stringToBytes(JSON.stringify(commitmentPayload));
+  const payloadBytes = stringToBytes(stableStringify(commitmentPayload));
   const sigBytes = fromBase64url(commitment.signature);
   const signatureValid = verify(payloadBytes, sigBytes, committerPublicKey);
   const sessionIdMatch = commitment.session_id === outcome.session_id;
@@ -6579,7 +6795,9 @@ function createBridgeTools(storage, masterKey, identityManager, auditLog, handsh
         return toolResult({
           ...result,
           session_id: storedCommitment.session_id,
-          committer_did: storedCommitment.committer_did
+          committer_did: storedCommitment.committer_did,
+          // SEC-ADD-03: Tag response as containing counterparty-controlled data
+          _content_trust: "external"
         });
       }
     },
@@ -6673,6 +6891,668 @@ function createBridgeTools(storage, masterKey, identityManager, auditLog, handsh
   ];
   return { tools };
 }
+function lenientJsonParse(raw) {
+  let cleaned = raw.replace(/\/\/[^\n]*/g, "");
+  cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, "");
+  cleaned = cleaned.replace(/,\s*([\]}])/g, "$1");
+  return JSON.parse(cleaned);
+}
+async function fileExists(path) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function safeReadFile(path) {
+  try {
+    return await readFile(path, "utf-8");
+  } catch {
+    return null;
+  }
+}
+async function detectEnvironment(config, deepScan) {
+  const fingerprint = {
+    sanctuary_installed: true,
+    // We're running inside Sanctuary
+    sanctuary_version: config.version,
+    openclaw_detected: false,
+    openclaw_version: null,
+    openclaw_config: null,
+    node_version: process.version,
+    platform: `${process.platform}-${process.arch}`
+  };
+  if (!deepScan) {
+    return fingerprint;
+  }
+  const home = homedir();
+  const openclawConfigPath = join(home, ".openclaw", "openclaw.json");
+  const openclawEnvPath = join(home, ".openclaw", ".env");
+  const openclawMemoryPath = join(home, ".openclaw", "workspace", "MEMORY.md");
+  const openclawMemoryDir = join(home, ".openclaw", "workspace", "memory");
+  const configExists = await fileExists(openclawConfigPath);
+  const envExists = await fileExists(openclawEnvPath);
+  const memoryExists = await fileExists(openclawMemoryPath);
+  const memoryDirExists = await fileExists(openclawMemoryDir);
+  if (configExists || memoryExists || memoryDirExists) {
+    fingerprint.openclaw_detected = true;
+    fingerprint.openclaw_config = await auditOpenClawConfig(
+      openclawConfigPath,
+      openclawEnvPath,
+      openclawMemoryPath,
+      configExists,
+      envExists,
+      memoryExists
+    );
+  }
+  return fingerprint;
+}
+async function auditOpenClawConfig(configPath, envPath, _memoryPath, configExists, envExists, memoryExists) {
+  const audit = {
+    config_path: configExists ? configPath : null,
+    require_approval_enabled: false,
+    sandbox_policy_active: false,
+    sandbox_allow_list: [],
+    sandbox_deny_list: [],
+    memory_encrypted: false,
+    // Stock OpenClaw never encrypts memory
+    env_file_exposed: false,
+    gateway_token_set: false,
+    dm_pairing_enabled: false,
+    mcp_bridge_active: false
+  };
+  if (configExists) {
+    const raw = await safeReadFile(configPath);
+    if (raw) {
+      try {
+        const parsed = lenientJsonParse(raw);
+        const hooks = parsed.hooks;
+        if (hooks) {
+          const beforeToolCall = hooks.before_tool_call;
+          if (beforeToolCall) {
+            const hookStr = JSON.stringify(beforeToolCall);
+            audit.require_approval_enabled = hookStr.includes("requireApproval");
+          }
+        }
+        const tools = parsed.tools;
+        if (tools) {
+          const sandbox = tools.sandbox;
+          if (sandbox) {
+            const sandboxTools = sandbox.tools;
+            if (sandboxTools) {
+              audit.sandbox_policy_active = true;
+              if (Array.isArray(sandboxTools.allow)) {
+                audit.sandbox_allow_list = sandboxTools.allow.filter(
+                  (item) => typeof item === "string"
+                );
+              }
+              if (Array.isArray(sandboxTools.alsoAllow)) {
+                audit.sandbox_allow_list = [
+                  ...audit.sandbox_allow_list,
+                  ...sandboxTools.alsoAllow.filter(
+                    (item) => typeof item === "string"
+                  )
+                ];
+              }
+              if (Array.isArray(sandboxTools.deny)) {
+                audit.sandbox_deny_list = sandboxTools.deny.filter(
+                  (item) => typeof item === "string"
+                );
+              }
+            }
+          }
+        }
+        const mcpServers = parsed.mcpServers;
+        if (mcpServers && Object.keys(mcpServers).length > 0) {
+          audit.mcp_bridge_active = true;
+        }
+      } catch {
+      }
+    }
+  }
+  if (envExists) {
+    const envContent = await safeReadFile(envPath);
+    if (envContent) {
+      const secretPatterns = [
+        /[A-Z_]*API_KEY\s*=/,
+        /[A-Z_]*TOKEN\s*=/,
+        /[A-Z_]*SECRET\s*=/,
+        /[A-Z_]*PASSWORD\s*=/,
+        /[A-Z_]*PRIVATE_KEY\s*=/
+      ];
+      audit.env_file_exposed = secretPatterns.some((p) => p.test(envContent));
+      audit.gateway_token_set = /OPENCLAW_GATEWAY_TOKEN\s*=/.test(envContent);
+    }
+  }
+  if (memoryExists) {
+    audit.memory_encrypted = false;
+  }
+  return audit;
+}
+
+// src/audit/analyzer.ts
+var L1_ENCRYPTION_AT_REST = 10;
+var L1_IDENTITY_CRYPTOGRAPHIC = 10;
+var L1_INTEGRITY_VERIFICATION = 8;
+var L1_STATE_PORTABLE = 7;
+var L2_THREE_TIER_GATE = 10;
+var L2_BINARY_GATE = 3;
+var L2_ANOMALY_DETECTION = 7;
+var L2_ENCRYPTED_AUDIT = 5;
+var L2_TOOL_SANDBOXING = 3;
+var L3_COMMITMENT_SCHEME = 8;
+var L3_ZK_PROOFS = 7;
+var L3_DISCLOSURE_POLICIES = 5;
+var L4_PORTABLE_REPUTATION = 6;
+var L4_SIGNED_ATTESTATIONS = 6;
+var L4_SYBIL_DETECTION = 4;
+var L4_SOVEREIGNTY_GATED = 4;
+var SEVERITY_ORDER = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3
+};
+function analyzeSovereignty(env, config) {
+  const l1 = assessL1(env, config);
+  const l2 = assessL2(env);
+  const l3 = assessL3(env);
+  const l4 = assessL4(env);
+  const l1Score = scoreL1(l1);
+  const l2Score = scoreL2(l2);
+  const l3Score = scoreL3(l3);
+  const l4Score = scoreL4(l4);
+  const overallScore = l1Score + l2Score + l3Score + l4Score;
+  const sovereigntyLevel = overallScore >= 80 ? "full" : overallScore >= 50 ? "partial" : overallScore >= 20 ? "minimal" : "none";
+  const gaps = generateGaps(env, l1, l2, l3, l4);
+  gaps.sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
+  const recommendations = generateRecommendations(env, l1, l2, l3, l4);
+  return {
+    version: "1.0",
+    audited_at: (/* @__PURE__ */ new Date()).toISOString(),
+    environment: env,
+    layers: {
+      l1_cognitive: l1,
+      l2_operational: l2,
+      l3_selective_disclosure: l3,
+      l4_reputation: l4
+    },
+    overall_score: overallScore,
+    sovereignty_level: sovereigntyLevel,
+    gaps,
+    recommendations
+  };
+}
+function assessL1(env, config) {
+  const findings = [];
+  const sanctuaryActive = env.sanctuary_installed;
+  const encryptionAtRest = sanctuaryActive;
+  const keyCustody = sanctuaryActive ? "self" : "none";
+  const integrityVerification = sanctuaryActive;
+  const identityCryptographic = sanctuaryActive;
+  const statePortable = sanctuaryActive;
+  if (sanctuaryActive) {
+    findings.push("AES-256-GCM encryption active for all state");
+    findings.push(`Key derivation: ${config.state.key_derivation}`);
+    findings.push(`Identity provider: ${config.state.identity_provider}`);
+    findings.push("Merkle integrity verification enabled");
+    findings.push("State export/import available");
+  }
+  if (env.openclaw_detected && env.openclaw_config) {
+    if (!env.openclaw_config.memory_encrypted) {
+      findings.push("OpenClaw agent memory (MEMORY.md, daily notes) stored in plaintext");
+    }
+    if (env.openclaw_config.env_file_exposed) {
+      findings.push("OpenClaw .env file contains plaintext API keys/tokens");
+    }
+  }
+  const status = encryptionAtRest && identityCryptographic ? "active" : encryptionAtRest || identityCryptographic ? "partial" : "inactive";
+  return {
+    status,
+    encryption_at_rest: encryptionAtRest,
+    key_custody: keyCustody,
+    integrity_verification: integrityVerification,
+    identity_cryptographic: identityCryptographic,
+    state_portable: statePortable,
+    findings
+  };
+}
+function assessL2(env, _config) {
+  const findings = [];
+  const sanctuaryActive = env.sanctuary_installed;
+  let approvalGate = "none";
+  let behavioralAnomalyDetection = false;
+  let auditTrailEncrypted = false;
+  let auditTrailExists = false;
+  let toolSandboxing = "none";
+  if (sanctuaryActive) {
+    approvalGate = "three-tier";
+    behavioralAnomalyDetection = true;
+    auditTrailEncrypted = true;
+    auditTrailExists = true;
+    findings.push("Three-tier Principal Policy gate active");
+    findings.push("Behavioral anomaly detection (BaselineTracker) enabled");
+    findings.push("Encrypted audit trail active");
+  }
+  if (env.openclaw_detected && env.openclaw_config) {
+    if (env.openclaw_config.require_approval_enabled) {
+      if (!sanctuaryActive) {
+        approvalGate = "binary";
+      }
+      findings.push("OpenClaw requireApproval hook enabled (binary approve/deny)");
+    }
+    if (env.openclaw_config.sandbox_policy_active) {
+      if (!sanctuaryActive) {
+        toolSandboxing = "basic";
+      }
+      findings.push(
+        `OpenClaw sandbox policy active (${env.openclaw_config.sandbox_allow_list.length} allowed, ${env.openclaw_config.sandbox_deny_list.length} denied)`
+      );
+    }
+  }
+  const status = approvalGate === "three-tier" && auditTrailEncrypted ? "active" : approvalGate !== "none" || auditTrailExists ? "partial" : "inactive";
+  return {
+    status,
+    approval_gate: approvalGate,
+    behavioral_anomaly_detection: behavioralAnomalyDetection,
+    audit_trail_encrypted: auditTrailEncrypted,
+    audit_trail_exists: auditTrailExists,
+    tool_sandboxing: sanctuaryActive ? "policy-enforced" : toolSandboxing,
+    findings
+  };
+}
+function assessL3(env, _config) {
+  const findings = [];
+  const sanctuaryActive = env.sanctuary_installed;
+  let commitmentScheme = "none";
+  let zkProofs = false;
+  let selectiveDisclosurePolicy = false;
+  if (sanctuaryActive) {
+    commitmentScheme = "pedersen+sha256";
+    zkProofs = true;
+    selectiveDisclosurePolicy = true;
+    findings.push("SHA-256 + Pedersen commitment schemes active");
+    findings.push("Schnorr ZK proofs and range proofs available");
+    findings.push("Selective disclosure policies configurable");
+  }
+  const status = commitmentScheme === "pedersen+sha256" && zkProofs ? "active" : commitmentScheme !== "none" ? "partial" : "inactive";
+  return {
+    status,
+    commitment_scheme: commitmentScheme,
+    zero_knowledge_proofs: zkProofs,
+    selective_disclosure_policy: selectiveDisclosurePolicy,
+    findings
+  };
+}
+function assessL4(env, _config) {
+  const findings = [];
+  const sanctuaryActive = env.sanctuary_installed;
+  const reputationPortable = sanctuaryActive;
+  const reputationSigned = sanctuaryActive;
+  const sybilDetection = sanctuaryActive;
+  const sovereigntyGated = sanctuaryActive;
+  if (sanctuaryActive) {
+    findings.push("Signed EAS-compatible attestations active");
+    findings.push("Reputation export/import available");
+    findings.push("Sybil detection heuristics enabled");
+    findings.push("Sovereignty-gated reputation tiers active");
+  } else {
+    findings.push("No portable reputation system detected");
+  }
+  const status = reputationPortable && reputationSigned && sovereigntyGated ? "active" : reputationPortable || reputationSigned ? "partial" : "inactive";
+  return {
+    status,
+    reputation_portable: reputationPortable,
+    reputation_signed: reputationSigned,
+    reputation_sybil_detection: sybilDetection,
+    sovereignty_gated_tiers: sovereigntyGated,
+    findings
+  };
+}
+function scoreL1(l1) {
+  let score = 0;
+  if (l1.encryption_at_rest) score += L1_ENCRYPTION_AT_REST;
+  if (l1.identity_cryptographic) score += L1_IDENTITY_CRYPTOGRAPHIC;
+  if (l1.integrity_verification) score += L1_INTEGRITY_VERIFICATION;
+  if (l1.state_portable) score += L1_STATE_PORTABLE;
+  return score;
+}
+function scoreL2(l2) {
+  let score = 0;
+  if (l2.approval_gate === "three-tier") score += L2_THREE_TIER_GATE;
+  else if (l2.approval_gate === "binary") score += L2_BINARY_GATE;
+  if (l2.behavioral_anomaly_detection) score += L2_ANOMALY_DETECTION;
+  if (l2.audit_trail_encrypted) score += L2_ENCRYPTED_AUDIT;
+  if (l2.tool_sandboxing === "policy-enforced") score += L2_TOOL_SANDBOXING;
+  else if (l2.tool_sandboxing === "basic") score += 1;
+  return score;
+}
+function scoreL3(l3) {
+  let score = 0;
+  if (l3.commitment_scheme === "pedersen+sha256") score += L3_COMMITMENT_SCHEME;
+  else if (l3.commitment_scheme === "sha256-only") score += 4;
+  if (l3.zero_knowledge_proofs) score += L3_ZK_PROOFS;
+  if (l3.selective_disclosure_policy) score += L3_DISCLOSURE_POLICIES;
+  return score;
+}
+function scoreL4(l4) {
+  let score = 0;
+  if (l4.reputation_portable) score += L4_PORTABLE_REPUTATION;
+  if (l4.reputation_signed) score += L4_SIGNED_ATTESTATIONS;
+  if (l4.reputation_sybil_detection) score += L4_SYBIL_DETECTION;
+  if (l4.sovereignty_gated_tiers) score += L4_SOVEREIGNTY_GATED;
+  return score;
+}
+function generateGaps(env, l1, l2, l3, l4) {
+  const gaps = [];
+  const oc = env.openclaw_config;
+  if (oc && !oc.memory_encrypted) {
+    gaps.push({
+      id: "GAP-L1-001",
+      layer: "L1",
+      severity: "critical",
+      title: "Agent memory stored in plaintext",
+      description: "Your agent's memory (MEMORY.md, daily notes, SQLite index) is stored in plaintext at ~/.openclaw/workspace/. Any process with file access can read your agent's full context \u2014 preferences, decisions, conversation history.",
+      openclaw_relevance: "Stock OpenClaw stores all agent memory in plaintext files. There is no built-in encryption for agent state.",
+      sanctuary_solution: "Sanctuary encrypts all state at rest with AES-256-GCM using a key derived from Argon2id, making state opaque to any process that doesn't hold the master key. Use sanctuary/state_write to migrate sensitive state to the encrypted store."
+    });
+  }
+  if (oc && oc.env_file_exposed) {
+    gaps.push({
+      id: "GAP-L1-002",
+      layer: "L1",
+      severity: "critical",
+      title: "Plaintext API keys in .env file",
+      description: "Your .env file contains plaintext API keys and tokens. These secrets are readable by any process with filesystem access.",
+      openclaw_relevance: "OpenClaw stores API keys (LLM providers, gateway tokens) in a plaintext .env file.",
+      sanctuary_solution: "Sanctuary's encrypted state store can hold secrets under the same AES-256-GCM envelope as all other state, tied to your self-custodied identity. Use sanctuary/state_write with namespace 'secrets'."
+    });
+  }
+  if (!l1.identity_cryptographic) {
+    gaps.push({
+      id: "GAP-L1-003",
+      layer: "L1",
+      severity: "critical",
+      title: "No cryptographic agent identity",
+      description: "Your agent has no cryptographic identity. It cannot prove it is who it claims to be to any counterparty, sign messages, or participate in sovereignty handshakes.",
+      openclaw_relevance: env.openclaw_detected ? "OpenClaw has no cryptographic agent identity. Agent identity is implicit (tied to the process/session), not cryptographically verifiable." : null,
+      sanctuary_solution: "Sanctuary provides Ed25519 self-custodied identity with key rotation and delegation. Use sanctuary/identity_create to establish your cryptographic identity."
+    });
+  }
+  if (l2.approval_gate === "binary" && !l2.behavioral_anomaly_detection) {
+    gaps.push({
+      id: "GAP-L2-001",
+      layer: "L2",
+      severity: "high",
+      title: "Binary approval gate (no anomaly detection)",
+      description: "Your approval gate provides binary approve/deny gating without behavioral anomaly detection. Routine operations require the same manual approval as sensitive ones.",
+      openclaw_relevance: env.openclaw_detected ? "OpenClaw's requireApproval hook provides binary approve/deny gating. Sanctuary's three-tier Principal Policy adds behavioral anomaly detection (auto-escalation when agent behavior deviates from baseline), encrypted audit trails, and graduated approval tiers \u2014 so routine operations auto-proceed while sensitive operations require explicit consent." : null,
+      sanctuary_solution: "Sanctuary's three-tier Principal Policy gate auto-allows routine operations (Tier 3), escalates anomalous behavior (Tier 2), and always requires human approval for irreversible operations (Tier 1). Use sanctuary/principal_policy_view to inspect."
+    });
+  } else if (l2.approval_gate === "none") {
+    gaps.push({
+      id: "GAP-L2-001",
+      layer: "L2",
+      severity: "critical",
+      title: "No approval gate",
+      description: "No approval gate is configured. All tool calls execute without oversight.",
+      openclaw_relevance: null,
+      sanctuary_solution: "Sanctuary's Principal Policy evaluates every tool call before execution. Enable it to get three-tier approval gating with behavioral anomaly detection."
+    });
+  }
+  if (l2.tool_sandboxing === "basic") {
+    gaps.push({
+      id: "GAP-L2-002",
+      layer: "L2",
+      severity: "medium",
+      title: "Basic tool sandboxing (no cryptographic attestation)",
+      description: "Your tool sandbox enforces allow/deny lists but provides no cryptographic attestation of execution context.",
+      openclaw_relevance: env.openclaw_detected ? "OpenClaw's sandbox tool policy (tools.sandbox.tools) enforces allow/deny lists. Sanctuary adds cryptographic attestation of execution context \u2014 a verifiable proof that an operation ran within policy, not just that a policy was configured." : null,
+      sanctuary_solution: "Sanctuary provides cryptographic execution attestation via sanctuary/exec_attest and policy-enforced sandboxing with encrypted audit trails."
+    });
+  }
+  if (!l2.audit_trail_exists) {
+    gaps.push({
+      id: "GAP-L2-003",
+      layer: "L2",
+      severity: "high",
+      title: "No audit trail",
+      description: "No audit trail exists for tool call history. There is no record of what operations were executed, when, or by whom.",
+      openclaw_relevance: null,
+      sanctuary_solution: "Sanctuary maintains an encrypted audit log of all operations, queryable via sanctuary/monitor_audit_log."
+    });
+  }
+  if (l3.commitment_scheme === "none") {
+    gaps.push({
+      id: "GAP-L3-001",
+      layer: "L3",
+      severity: "high",
+      title: "No selective disclosure capability",
+      description: "Your agent has no way to prove facts about its state without revealing the state itself. Every disclosure is all-or-nothing.",
+      openclaw_relevance: env.openclaw_detected ? "OpenClaw has no selective disclosure mechanism. When your agent shares information, it shares everything or nothing \u2014 there is no way to prove a claim without revealing the underlying data." : null,
+      sanctuary_solution: "Sanctuary's L3 provides SHA-256 + Pedersen commitments and Schnorr zero-knowledge proofs. Your agent can prove it has a valid credential, sufficient reputation, or a completed transaction without exposing the underlying data. Use sanctuary/zk_commit and sanctuary/zk_prove."
+    });
+  }
+  if (!l4.reputation_portable) {
+    gaps.push({
+      id: "GAP-L4-001",
+      layer: "L4",
+      severity: "high",
+      title: "No portable reputation",
+      description: "Your agent's reputation is platform-locked. If you move to a different harness or platform, your track record doesn't follow.",
+      openclaw_relevance: env.openclaw_detected ? "OpenClaw has no reputation system. Your agent's track record exists only in conversation history, which is not structured, signed, or portable." : null,
+      sanctuary_solution: "Sanctuary's L4 provides signed EAS-compatible attestations that are self-custodied, portable, and cryptographically verifiable. Your reputation is yours, not your platform's. Use sanctuary/reputation_record to start building portable reputation."
+    });
+  }
+  return gaps;
+}
+function generateRecommendations(env, l1, l2, l3, l4) {
+  const recs = [];
+  if (!l1.identity_cryptographic) {
+    recs.push({
+      priority: 1,
+      action: "Create a cryptographic identity \u2014 your agent's foundation for all sovereignty operations",
+      tool: "sanctuary/identity_create",
+      effort: "immediate",
+      impact: "critical"
+    });
+  }
+  if (!l1.encryption_at_rest || env.openclaw_config && !env.openclaw_config.memory_encrypted) {
+    recs.push({
+      priority: 2,
+      action: "Migrate plaintext agent state to Sanctuary's encrypted store",
+      tool: "sanctuary/state_write",
+      effort: "minutes",
+      impact: "critical"
+    });
+  }
+  recs.push({
+    priority: 3,
+    action: "Generate a Sovereignty Health Report to present to counterparties",
+    tool: "sanctuary/shr_generate",
+    effort: "immediate",
+    impact: "high"
+  });
+  if (l2.approval_gate !== "three-tier") {
+    recs.push({
+      priority: 4,
+      action: "Enable the three-tier Principal Policy gate for graduated approval",
+      tool: "sanctuary/principal_policy_view",
+      effort: "minutes",
+      impact: "high"
+    });
+  }
+  if (!l4.reputation_signed) {
+    recs.push({
+      priority: 5,
+      action: "Start recording reputation attestations from completed interactions",
+      tool: "sanctuary/reputation_record",
+      effort: "minutes",
+      impact: "medium"
+    });
+  }
+  if (!l3.selective_disclosure_policy) {
+    recs.push({
+      priority: 6,
+      action: "Configure selective disclosure policies for data sharing",
+      tool: "sanctuary/disclosure_set_policy",
+      effort: "hours",
+      impact: "medium"
+    });
+  }
+  return recs;
+}
+function formatAuditReport(result) {
+  const { environment: env, layers, overall_score, sovereignty_level, gaps, recommendations } = result;
+  const scoreBar = formatScoreBar(overall_score);
+  const levelLabel = sovereignty_level.toUpperCase();
+  let report = "";
+  report += "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n";
+  report += "  SOVEREIGNTY AUDIT REPORT\n";
+  report += `  Generated: ${result.audited_at}
+`;
+  report += "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n";
+  report += "\n";
+  report += `  Overall Score: ${overall_score} / 100  ${scoreBar}  ${levelLabel}
+`;
+  report += "\n";
+  report += "  Environment:\n";
+  report += `  \u2022 Sanctuary v${env.sanctuary_version ?? "?"} ${padDots("Sanctuary v" + (env.sanctuary_version ?? "?"))} ${env.sanctuary_installed ? "\u2713 installed" : "\u2717 not found"}
+`;
+  if (env.openclaw_detected) {
+    report += `  \u2022 OpenClaw ${padDots("OpenClaw")} \u2713 detected
+`;
+    if (env.openclaw_config) {
+      report += `  \u2022 OpenClaw requireApproval ${padDots("OpenClaw requireApproval")} ${env.openclaw_config.require_approval_enabled ? "\u2713 enabled" : "\u2717 disabled"}
+`;
+      report += `  \u2022 OpenClaw sandbox policy ${padDots("OpenClaw sandbox policy")} ${env.openclaw_config.sandbox_policy_active ? "\u2713 active" : "\u2717 inactive"}
+`;
+    }
+  }
+  report += "\n";
+  const l1Score = scoreL1(layers.l1_cognitive);
+  const l2Score = scoreL2(layers.l2_operational);
+  const l3Score = scoreL3(layers.l3_selective_disclosure);
+  const l4Score = scoreL4(layers.l4_reputation);
+  report += "  Layer Assessment:\n";
+  report += "  \u250C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n";
+  report += "  \u2502 Layer                       \u2502 Status   \u2502 Score \u2502\n";
+  report += "  \u251C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\n";
+  report += `  \u2502 L1 Cognitive Sovereignty    \u2502 ${padStatus(layers.l1_cognitive.status)} \u2502 ${padScore(l1Score, 35)} \u2502
+`;
+  report += `  \u2502 L2 Operational Isolation    \u2502 ${padStatus(layers.l2_operational.status)} \u2502 ${padScore(l2Score, 25)} \u2502
+`;
+  report += `  \u2502 L3 Selective Disclosure     \u2502 ${padStatus(layers.l3_selective_disclosure.status)} \u2502 ${padScore(l3Score, 20)} \u2502
+`;
+  report += `  \u2502 L4 Verifiable Reputation    \u2502 ${padStatus(layers.l4_reputation.status)} \u2502 ${padScore(l4Score, 20)} \u2502
+`;
+  report += "  \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n";
+  report += "\n";
+  if (gaps.length > 0) {
+    report += `  \u26A0 ${gaps.length} SOVEREIGNTY GAP${gaps.length !== 1 ? "S" : ""} FOUND
+`;
+    report += "\n";
+    for (const gap of gaps) {
+      const severityLabel = `[${gap.severity.toUpperCase()}]`;
+      report += `  ${severityLabel} ${gap.id}: ${gap.title}
+`;
+      const descLines = wordWrap(gap.description, 66);
+      for (const line of descLines) {
+        report += `  ${line}
+`;
+      }
+      report += `  \u2192 Fix: ${gap.sanctuary_solution.split(".")[0]}.
+`;
+      if (gap.openclaw_relevance) {
+        report += `  \u2192 OpenClaw context: ${gap.openclaw_relevance.split(".")[0]}.
+`;
+      }
+      report += "\n";
+    }
+  } else {
+    report += "  \u2713 NO SOVEREIGNTY GAPS FOUND\n";
+    report += "\n";
+  }
+  if (recommendations.length > 0) {
+    report += "  RECOMMENDED NEXT STEPS (in order):\n";
+    for (const rec of recommendations) {
+      const effortLabel = rec.effort === "immediate" ? "immediate" : rec.effort === "minutes" ? "5 min" : "30 min";
+      report += `  ${rec.priority}. [${effortLabel}] ${rec.action}`;
+      if (rec.tool) {
+        report += `: ${rec.tool}`;
+      }
+      report += "\n";
+    }
+    report += "\n";
+  }
+  report += "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n";
+  return report;
+}
+function formatScoreBar(score) {
+  const filled = Math.round(score / 10);
+  return "[" + "\u25A0".repeat(filled) + "\u2591".repeat(10 - filled) + "]";
+}
+function padDots(label) {
+  const totalWidth = 30;
+  const dotsNeeded = Math.max(2, totalWidth - label.length - 4);
+  return ".".repeat(dotsNeeded);
+}
+function padStatus(status) {
+  const label = status.toUpperCase();
+  return label + " ".repeat(Math.max(0, 8 - label.length));
+}
+function padScore(score, max) {
+  const text = `${score}/${max}`;
+  return " ".repeat(Math.max(0, 5 - text.length)) + text;
+}
+function wordWrap(text, maxWidth) {
+  const words = text.split(" ");
+  const lines = [];
+  let current = "";
+  for (const word of words) {
+    if (current.length + word.length + 1 > maxWidth && current.length > 0) {
+      lines.push(current);
+      current = word;
+    } else {
+      current = current.length > 0 ? current + " " + word : word;
+    }
+  }
+  if (current.length > 0) lines.push(current);
+  return lines;
+}
+
+// src/audit/tools.ts
+function createAuditTools(config) {
+  const tools = [
+    {
+      name: "sanctuary/sovereignty_audit",
+      description: "Audit your agent's sovereignty posture. Inspects the local environment for encryption, identity, approval gates, selective disclosure, and reputation \u2014 including OpenClaw-specific configurations. Returns a scored gap analysis with prioritized recommendations.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          deep_scan: {
+            type: "boolean",
+            description: "If true (default), also scans for OpenClaw config, .env files, and memory files. Set to false for a Sanctuary-only assessment."
+          }
+        }
+      },
+      handler: async (args) => {
+        const deepScan = args.deep_scan !== false;
+        const env = await detectEnvironment(config, deepScan);
+        const result = analyzeSovereignty(env, config);
+        const report = formatAuditReport(result);
+        return {
+          content: [
+            { type: "text", text: report },
+            { type: "text", text: JSON.stringify(result, null, 2) }
+          ]
+        };
+      }
+    }
+  ];
+  return { tools };
+}
 
 // src/index.ts
 init_encoding();
@@ -6709,15 +7589,51 @@ async function createSanctuaryServer(options) {
     }
   } else {
     keyProtection = "recovery-key";
-    const existing = await storage.read("_meta", "recovery-key-hash");
-    if (existing) {
-      masterKey = generateRandomKey();
-      recoveryKey = toBase64url(masterKey);
+    const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
+    const { stringToBytes: stringToBytes2, bytesToString: bytesToString2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
+    const { fromBase64url: fromBase64url2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
+    const { constantTimeEqual: constantTimeEqual2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
+    const existingHash = await storage.read("_meta", "recovery-key-hash");
+    if (existingHash) {
+      const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
+      if (!envRecoveryKey) {
+        throw new Error(
+          "Sanctuary: Existing encrypted data found but no credentials provided.\nThis installation was previously set up with a recovery key.\n\nTo start the server, provide one of:\n  - SANCTUARY_PASSPHRASE (if you later configured a passphrase)\n  - SANCTUARY_RECOVERY_KEY (the recovery key shown at first run)\n\nWithout the correct credentials, encrypted state cannot be accessed.\nRefusing to start to prevent silent data loss."
+        );
+      }
+      let recoveryKeyBytes;
+      try {
+        recoveryKeyBytes = fromBase64url2(envRecoveryKey);
+      } catch {
+        throw new Error(
+          "Sanctuary: SANCTUARY_RECOVERY_KEY is not valid base64url. The recovery key should be the exact string shown at first run."
+        );
+      }
+      if (recoveryKeyBytes.length !== 32) {
+        throw new Error(
+          "Sanctuary: SANCTUARY_RECOVERY_KEY has incorrect length. The recovery key should be the exact string shown at first run."
+        );
+      }
+      const providedHash = hashToString2(recoveryKeyBytes);
+      const storedHash = bytesToString2(existingHash);
+      const providedHashBytes = stringToBytes2(providedHash);
+      const storedHashBytes = stringToBytes2(storedHash);
+      if (!constantTimeEqual2(providedHashBytes, storedHashBytes)) {
+        throw new Error(
+          "Sanctuary: Recovery key does not match the stored key hash.\nThe recovery key provided via SANCTUARY_RECOVERY_KEY is incorrect.\nUse the exact recovery key that was displayed at first run."
+        );
+      }
+      masterKey = recoveryKeyBytes;
     } else {
+      const existingNamespaces = await storage.list("_meta");
+      const hasKeyParams = existingNamespaces.some((e) => e.key === "key-params");
+      if (hasKeyParams) {
+        throw new Error(
+          "Sanctuary: Found existing key derivation parameters but no recovery key hash.\nThis indicates a corrupted or incomplete installation.\nIf you previously used a passphrase, set SANCTUARY_PASSPHRASE to start."
+        );
+      }
       masterKey = generateRandomKey();
       recoveryKey = toBase64url(masterKey);
-      const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
-      const { stringToBytes: stringToBytes2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
       const keyHash = hashToString2(masterKey);
       await storage.write(
         "_meta",
@@ -6983,6 +7899,7 @@ async function createSanctuaryServer(options) {
     auditLog,
     handshakeResults
   );
+  const { tools: auditTools } = createAuditTools(config);
   const policy = await loadPrincipalPolicy(config.storage_path);
   const baseline = new BaselineTracker(storage, masterKey);
   await baseline.load();
@@ -6998,7 +7915,7 @@ async function createSanctuaryServer(options) {
       port: config.dashboard.port,
       host: config.dashboard.host,
       timeout_seconds: policy.approval_channel.timeout_seconds,
-      auto_deny: policy.approval_channel.auto_deny,
+      // SEC-002: auto_deny removed — timeout always denies
       auth_token: authToken,
       tls: config.dashboard.tls
     });
@@ -7011,8 +7928,8 @@ async function createSanctuaryServer(options) {
       webhook_secret: config.webhook.secret,
       callback_port: config.webhook.callback_port,
       callback_host: config.webhook.callback_host,
-      timeout_seconds: policy.approval_channel.timeout_seconds,
-      auto_deny: policy.approval_channel.auto_deny
+      timeout_seconds: policy.approval_channel.timeout_seconds
+      // SEC-002: auto_deny removed — timeout always denies
     });
     await webhook.start();
     approvalChannel = webhook;
@@ -7031,6 +7948,7 @@ async function createSanctuaryServer(options) {
     ...handshakeTools,
     ...federationTools,
     ...bridgeTools,
+    ...auditTools,
     manifestTool
   ];
   const server = createServer(allTools, { gate });
