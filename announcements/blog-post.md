@@ -82,4 +82,4 @@ The specification, the reference implementation, and the contribution process wi
 
 ---
 
-*Erik Newton is a California attorney and co-founder of CIMC.ai (California Institute for Machine Consciousness). The Sanctuary Framework is an independent open-source project. Contact: eriknewton@gmail.com · GitHub: github.com/eriknewton/sanctuary-framework*
+*Erik Newton is a California attorney and the creator of the Sanctuary Framework. Contact: eriknewton@gmail.com · GitHub: github.com/eriknewton/sanctuary-framework*

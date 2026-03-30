@@ -33,4 +33,4 @@ GitHub: github.com/eriknewton/sanctuary-framework
 
 —
 Erik Newton
-Co-founder, CIMC.ai (California Institute for Machine Consciousness)
+eriknewton.com

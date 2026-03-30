@@ -3,7 +3,7 @@
   "version": "0.3.0",
   "description": "Sovereignty infrastructure for the agentic economy. Gives your agent encrypted state, self-custodied identity, selective disclosure, portable reputation, and sovereignty verification — including a sovereignty audit tool that detects gaps in OpenClaw and other agent harnesses.",
   "author": {
-    "name": "CIMC.ai",
+    "name": "Erik Newton",
     "homepage": "https://github.com/eriknewton/sanctuary-framework"
   },
   "license": "Apache-2.0",
