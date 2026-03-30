@@ -1,0 +1,25 @@
+title: Sanctuary Protocol
+description: Sovereignty infrastructure for agents
+url: "https://sanctuaryprotocol.ai"
+baseurl: ""
+
+# Build settings
+markdown: kramdown
+theme: null
+plugins:
+  - jekyll-seo-tag
+
+# Exclude from build
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - README.md
+
+# Defaults
+defaults:
+  - scope:
+      path: "_posts"
+      type: "posts"
+    values:
+      layout: "post"
+      author: "Erik Newton"
