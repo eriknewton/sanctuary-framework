@@ -26,6 +26,52 @@ Human sovereignty and agent sovereignty are not separate problems. They require 
 
 This means Sanctuary is *immediately useful* for protecting humans in today's agentic economy. If conscious machines never manifest, the framework loses nothing. If they do, the infrastructure is already in place.
 
+## Installation
+
+```bash
+npx @sanctuary-framework/mcp-server
+```
+
+Or install globally to avoid npx startup overhead:
+
+```bash
+npm install -g @sanctuary-framework/mcp-server
+```
+
+Requires Node.js 22+.
+
+### MCP Configuration
+
+**Claude Code:**
+
+```bash
+claude mcp add sanctuary -- npx @sanctuary-framework/mcp-server
+```
+
+**OpenClaw:**
+
+```bash
+openclaw mcp set sanctuary '{"command":"npx","args":["@sanctuary-framework/mcp-server"],"env":{"SANCTUARY_PASSPHRASE":"your-passphrase-here"}}'
+```
+
+Generate a secure passphrase before first launch:
+
+```bash
+openssl rand -base64 32
+```
+
+Store this passphrase securely — it derives the encryption keys for all L1 state. If lost, encrypted state cannot be recovered.
+
+### Run a Sovereignty Audit
+
+Once installed, audit your current agent setup:
+
+```
+sanctuary/sovereignty_audit
+```
+
+The audit scores your environment (0–100) across all four sovereignty layers, detects OpenClaw configurations, identifies gaps, and provides prioritized recommendations.
+
 ## Documentation
 
 - **[Full Specification](sanctuary_framework.md)** — the complete four-layer standard (~40 pages)
