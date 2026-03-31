@@ -100,6 +100,16 @@ export const INCIDENT_META_INBOX: IncidentClass = {
     "autonomously after context window compaction silently stripped the safety instruction.",
 };
 
+const INCIDENT_CLAUDE_CODE_LEAK: IncidentClass = {
+  id: "CLAUDE-CODE-LEAK-2026",
+  name: "Claude Code source leak: 512K lines exposed via npm source map",
+  date: "2026-03-31",
+  description:
+    "Anthropic accidentally shipped a 59.8 MB source map in npm package v2.1.88, exposing " +
+    "the full Claude Code TypeScript source — 1,900 files, internal model codenames, " +
+    "unreleased features, OAuth flows, and multi-agent coordination logic.",
+};
+
 /**
  * Analyze sovereignty posture and produce a full audit result.
  */
@@ -542,6 +552,7 @@ function generateGaps(
       sanctuary_solution:
         "Sanctuary maintains an encrypted audit log of all operations, queryable via " +
         "sanctuary/monitor_audit_log.",
+      incident_class: INCIDENT_CLAUDE_CODE_LEAK,
     });
   }
 
