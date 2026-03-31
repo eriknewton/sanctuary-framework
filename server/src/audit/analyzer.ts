@@ -16,6 +16,7 @@ import type {
   L3AuditResult,
   L4AuditResult,
   SovereigntyGap,
+  IncidentClass,
   Recommendation,
 } from "./types.js";
 
@@ -52,6 +53,51 @@ const SEVERITY_ORDER: Record<string, number> = {
   high: 1,
   medium: 2,
   low: 3,
+};
+
+// ── Incident Class Catalog ─────────────────────────────────────────────
+// Real-world incidents mapped to the sovereignty gaps they exploited.
+
+const INCIDENT_META_SEV1: IncidentClass = {
+  id: "META-SEV1-2026",
+  name: "Meta Sev 1: Unauthorized autonomous data exposure",
+  date: "2026-03-18",
+  description:
+    "AI agent autonomously posted proprietary code, business strategies, and user datasets " +
+    "to an internal forum without human approval. Two-hour exposure window.",
+};
+
+const INCIDENT_OPENCLAW_SANDBOX: IncidentClass = {
+  id: "OPENCLAW-CVE-2026",
+  name: "OpenClaw sandbox escape via privilege inheritance",
+  date: "2026-03-18",
+  description:
+    "Nine CVEs in four days. Child processes inherited sandbox.mode=off from parent, " +
+    "bypassing runtime confinement. 42,900+ internet-exposed instances, 15,200 vulnerable to RCE.",
+  cves: [
+    "CVE-2026-32048",
+    "CVE-2026-32915",
+    "CVE-2026-32918",
+  ],
+};
+
+const INCIDENT_CONTEXT_LEAKAGE: IncidentClass = {
+  id: "CONTEXT-LEAK-CLASS",
+  name: "Context leakage: Full state exposure to inference providers",
+  date: "2026-03",
+  description:
+    "Agents send full context — conversation history, memory, secrets, internal reasoning — " +
+    "to remote LLM providers on every inference call with no filtering mechanism.",
+};
+
+/** Exported for use in custom gap analysis extensions. */
+export const INCIDENT_META_INBOX: IncidentClass = {
+  id: "META-INBOX-2026",
+  name: "Meta inbox deletion: Safety instructions stripped by context compaction",
+  date: "2026-03",
+  description:
+    "OpenClaw agent instructed to 'always ask before taking actions' began deleting inbox " +
+    "autonomously after context window compaction silently stripped the safety instruction.",
 };
 
 /**
@@ -357,6 +403,7 @@ function generateGaps(
         "Sanctuary encrypts all state at rest with AES-256-GCM using a key derived from " +
         "Argon2id, making state opaque to any process that doesn't hold the master key. " +
         "Use sanctuary/state_write to migrate sensitive state to the encrypted store.",
+      incident_class: INCIDENT_META_SEV1,
     });
   }
 
@@ -418,6 +465,7 @@ function generateGaps(
         "Sanctuary's three-tier Principal Policy gate auto-allows routine operations (Tier 3), " +
         "escalates anomalous behavior (Tier 2), and always requires human approval for " +
         "irreversible operations (Tier 1). Use sanctuary/principal_policy_view to inspect.",
+      incident_class: INCIDENT_META_SEV1,
     });
   } else if (l2.approval_gate === "none") {
     gaps.push({
@@ -431,6 +479,7 @@ function generateGaps(
       sanctuary_solution:
         "Sanctuary's Principal Policy evaluates every tool call before execution. " +
         "Enable it to get three-tier approval gating with behavioral anomaly detection.",
+      incident_class: INCIDENT_META_SEV1,
     });
   }
 
@@ -451,6 +500,7 @@ function generateGaps(
       sanctuary_solution:
         "Sanctuary provides cryptographic execution attestation via sanctuary/exec_attest " +
         "and policy-enforced sandboxing with encrypted audit trails.",
+      incident_class: INCIDENT_OPENCLAW_SANDBOX,
     });
   }
 
@@ -475,6 +525,7 @@ function generateGaps(
         "sanctuary/context_gate_filter) lets you define per-provider policies that " +
         "control exactly what context flows outbound. Redact secrets, hash identifiers, " +
         "and send only minimum-necessary context for each call.",
+      incident_class: INCIDENT_CONTEXT_LEAKAGE,
     });
   }
 
@@ -514,6 +565,7 @@ function generateGaps(
         "proofs. Your agent can prove it has a valid credential, sufficient reputation, or a " +
         "completed transaction without exposing the underlying data. " +
         "Use sanctuary/zk_commit and sanctuary/zk_prove.",
+      incident_class: INCIDENT_META_SEV1,
     });
   }
 
@@ -688,6 +740,11 @@ export function formatAuditReport(result: SovereigntyAuditResult): string {
       const descLines = wordWrap(gap.description, 66);
       for (const line of descLines) {
         report += `  ${line}\n`;
+      }
+      if (gap.incident_class) {
+        const ic = gap.incident_class;
+        const cveStr = ic.cves?.length ? ` (${ic.cves.join(", ")})` : "";
+        report += `  → Incident precedent: ${ic.name}${cveStr} [${ic.date}]\n`;
       }
       report += `  → Fix: ${gap.sanctuary_solution.split(".")[0]}.\n`;
       if (gap.openclaw_relevance) {

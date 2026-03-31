@@ -98,6 +98,21 @@ export interface SovereigntyGap {
   description: string;
   openclaw_relevance: string | null;
   sanctuary_solution: string;
+  /** Real-world incident class this gap maps to, if applicable. */
+  incident_class?: IncidentClass | null;
+}
+
+export interface IncidentClass {
+  /** Short identifier, e.g., "META-SEV1-2026" */
+  id: string;
+  /** Human-readable incident name */
+  name: string;
+  /** When the incident occurred */
+  date: string;
+  /** Brief description of what happened */
+  description: string;
+  /** CVE identifiers, if applicable */
+  cves?: string[];
 }
 
 export interface Recommendation {

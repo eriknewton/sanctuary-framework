@@ -285,6 +285,112 @@ describe("Sovereignty Audit", () => {
     });
   });
 
+  describe("Incident Class Mapping", () => {
+    it("maps plaintext memory gap to Meta Sev 1 incident", () => {
+      const env = makeFingerprint({
+        sanctuary_installed: true,
+        openclaw_detected: true,
+        openclaw_config: makeOpenClawConfig({
+          memory_encrypted: false,
+        }),
+      });
+
+      const result = analyzeSovereignty(env, config);
+      const memGap = result.gaps.find((g) => g.id === "GAP-L1-001");
+      expect(memGap).toBeDefined();
+      expect(memGap!.incident_class).toBeDefined();
+      expect(memGap!.incident_class!.id).toBe("META-SEV1-2026");
+      expect(memGap!.incident_class!.date).toBe("2026-03-18");
+    });
+
+    it("maps no-approval-gate gap to Meta Sev 1 incident", () => {
+      const env = makeFingerprint({
+        sanctuary_installed: false,
+        sanctuary_version: null,
+        openclaw_detected: false,
+        openclaw_config: null,
+      });
+
+      const result = analyzeSovereignty(env, config);
+      const gateGap = result.gaps.find((g) => g.id === "GAP-L2-001");
+      expect(gateGap).toBeDefined();
+      expect(gateGap!.incident_class).toBeDefined();
+      expect(gateGap!.incident_class!.id).toBe("META-SEV1-2026");
+    });
+
+    it("maps basic-sandbox gap to OpenClaw CVE incident", () => {
+      const env = makeFingerprint({
+        sanctuary_installed: false,
+        sanctuary_version: null,
+        openclaw_detected: true,
+        openclaw_config: makeOpenClawConfig({
+          sandbox_policy_active: true,
+          sandbox_allow_list: ["read"],
+          sandbox_deny_list: ["delete"],
+        }),
+      });
+
+      const result = analyzeSovereignty(env, config);
+      const sandboxGap = result.gaps.find((g) => g.id === "GAP-L2-002");
+      expect(sandboxGap).toBeDefined();
+      expect(sandboxGap!.incident_class).toBeDefined();
+      expect(sandboxGap!.incident_class!.id).toBe("OPENCLAW-CVE-2026");
+      expect(sandboxGap!.incident_class!.cves).toContain("CVE-2026-32048");
+    });
+
+    it("maps no-context-gating gap to context leakage incident", () => {
+      const env = makeFingerprint({
+        sanctuary_installed: false,
+        sanctuary_version: null,
+        openclaw_detected: true,
+        openclaw_config: makeOpenClawConfig(),
+      });
+
+      const result = analyzeSovereignty(env, config);
+      const ctxGap = result.gaps.find((g) => g.id === "GAP-L2-003");
+      expect(ctxGap).toBeDefined();
+      expect(ctxGap!.incident_class).toBeDefined();
+      expect(ctxGap!.incident_class!.id).toBe("CONTEXT-LEAK-CLASS");
+    });
+
+    it("maps no-selective-disclosure gap to Meta Sev 1 incident", () => {
+      const env = makeFingerprint({
+        sanctuary_installed: false,
+        sanctuary_version: null,
+        openclaw_detected: false,
+        openclaw_config: null,
+      });
+
+      const result = analyzeSovereignty(env, config);
+      const discGap = result.gaps.find((g) => g.id === "GAP-L3-001");
+      expect(discGap).toBeDefined();
+      expect(discGap!.incident_class).toBeDefined();
+      expect(discGap!.incident_class!.id).toBe("META-SEV1-2026");
+    });
+
+    it("renders incident class in formatted report", () => {
+      const env = makeFingerprint({
+        sanctuary_installed: false,
+        sanctuary_version: null,
+        openclaw_detected: true,
+        openclaw_config: makeOpenClawConfig({
+          memory_encrypted: false,
+        }),
+      });
+
+      const result = analyzeSovereignty(env, config);
+      const report = formatAuditReport(result);
+      expect(report).toContain("Incident precedent:");
+      expect(report).toContain("Meta Sev 1");
+    });
+
+    it("does not include incident class for full Sanctuary (no gaps)", () => {
+      const env = makeFingerprint();
+      const result = analyzeSovereignty(env, config);
+      expect(result.gaps).toHaveLength(0);
+    });
+  });
+
   describe("Graceful OpenClaw Absence", () => {
     it("works cleanly when OpenClaw is not installed", () => {
       const env = makeFingerprint({
