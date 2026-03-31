@@ -19,6 +19,7 @@ import {
   evaluateField,
   filterContext,
   ContextGatePolicyStore,
+  MAX_CONTEXT_FIELDS,
   type ContextGatePolicy,
   type ContextGateRule,
 } from "../../src/l2-operational/context-gate.js";
@@ -495,6 +496,38 @@ describe("L2 Context Gating", () => {
       const store2 = new ContextGatePolicyStore(storage, masterKey2);
       const retrieved = await store2.get(policy.policy_id);
       expect(retrieved).toBeNull(); // Should fail to decrypt
+    });
+  });
+
+  // ── SEC-027 regression: size limits ─────────────────────────────────
+
+  describe("size limits", () => {
+    it("rejects context objects exceeding MAX_CONTEXT_FIELDS", () => {
+      const policy = makePolicy([
+        { provider: "*", allow: ["task"], redact: [], hash: [], summarize: [] },
+      ]);
+
+      const largeContext: Record<string, unknown> = {};
+      for (let i = 0; i < MAX_CONTEXT_FIELDS + 1; i++) {
+        largeContext[`field_${i}`] = "value";
+      }
+
+      expect(() => filterContext(policy, "inference", largeContext)).toThrow(
+        /exceeding limit/
+      );
+    });
+
+    it("accepts context objects at the limit", () => {
+      const policy = makePolicy([
+        { provider: "*", allow: ["*"], redact: [], hash: [], summarize: [] },
+      ]);
+
+      const context: Record<string, unknown> = {};
+      for (let i = 0; i < MAX_CONTEXT_FIELDS; i++) {
+        context[`field_${i}`] = "value";
+      }
+
+      expect(() => filterContext(policy, "inference", context)).not.toThrow();
     });
   });
 

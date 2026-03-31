@@ -108,6 +108,17 @@ export interface ContextFilterResult {
   filtered_at: string;
 }
 
+// ── Size Limits ─────────────────────────────────────────────────────────
+
+/** Maximum number of top-level fields in a context object */
+export const MAX_CONTEXT_FIELDS = 1000;
+
+/** Maximum number of rules in a policy */
+export const MAX_POLICY_RULES = 50;
+
+/** Maximum number of patterns in a single rule array (allow, redact, hash, summarize) */
+export const MAX_PATTERNS_PER_ARRAY = 500;
+
 // ── Policy Evaluation ───────────────────────────────────────────────────
 
 /**
@@ -193,6 +204,11 @@ export function filterContext(
   context: Record<string, unknown>
 ): ContextFilterResult {
   const fields = Object.keys(context);
+  if (fields.length > MAX_CONTEXT_FIELDS) {
+    throw new Error(
+      `Context object has ${fields.length} fields, exceeding limit of ${MAX_CONTEXT_FIELDS}`
+    );
+  }
   const decisions: FieldFilterResult[] = [];
   let allowed = 0;
   let redacted = 0;

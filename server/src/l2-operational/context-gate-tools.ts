@@ -22,6 +22,9 @@ import type { StorageBackend } from "../storage/interface.js";
 import {
   ContextGatePolicyStore,
   filterContext,
+  MAX_POLICY_RULES,
+  MAX_PATTERNS_PER_ARRAY,
+  MAX_CONTEXT_FIELDS,
   type ContextGateRule,
   type ProviderCategory,
 } from "./context-gate.js";
@@ -133,14 +136,42 @@ export function createContextGateTools(
         const defaultAction = (args.default_action as "redact" | "deny") ?? "redact";
         const identityId = args.identity_id as string | undefined;
 
+        // Validate rule count
+        if (!Array.isArray(rawRules)) {
+          return toolResult({ error: "invalid_rules", message: "rules must be an array" });
+        }
+        if (rawRules.length > MAX_POLICY_RULES) {
+          return toolResult({
+            error: "too_many_rules",
+            message: `Policy has ${rawRules.length} rules, exceeding limit of ${MAX_POLICY_RULES}`,
+          });
+        }
+
         // Validate and normalize rules
-        const rules: ContextGateRule[] = rawRules.map((r) => ({
-          provider: (r.provider as ProviderCategory | "*") ?? "*",
-          allow: (r.allow as string[]) ?? [],
-          redact: (r.redact as string[]) ?? [],
-          hash: (r.hash as string[]) ?? [],
-          summarize: (r.summarize as string[]) ?? [],
-        }));
+        const rules: ContextGateRule[] = [];
+        for (const r of rawRules) {
+          const allow = Array.isArray(r.allow) ? (r.allow as string[]) : [];
+          const redact = Array.isArray(r.redact) ? (r.redact as string[]) : [];
+          const hash = Array.isArray(r.hash) ? (r.hash as string[]) : [];
+          const summarize = Array.isArray(r.summarize) ? (r.summarize as string[]) : [];
+
+          for (const [name, arr] of [["allow", allow], ["redact", redact], ["hash", hash], ["summarize", summarize]] as const) {
+            if (arr.length > MAX_PATTERNS_PER_ARRAY) {
+              return toolResult({
+                error: "too_many_patterns",
+                message: `Rule ${name} array has ${arr.length} patterns, exceeding limit of ${MAX_PATTERNS_PER_ARRAY}`,
+              });
+            }
+          }
+
+          rules.push({
+            provider: (r.provider as ProviderCategory | "*") ?? "*",
+            allow,
+            redact,
+            hash,
+            summarize,
+          });
+        }
 
         const policy = await policyStore.create(
           policyName,
@@ -271,6 +302,15 @@ export function createContextGateTools(
         const context = args.context as Record<string, unknown>;
         const provider = (args.provider as string) ?? "inference";
 
+        // Validate context size
+        const contextKeys = Object.keys(context);
+        if (contextKeys.length > MAX_CONTEXT_FIELDS) {
+          return toolResult({
+            error: "context_too_large",
+            message: `Context has ${contextKeys.length} fields, exceeding limit of ${MAX_CONTEXT_FIELDS}`,
+          });
+        }
+
         const recommendation = recommendPolicy(context, provider);
 
         auditLog.append("l2", "context_gate_recommend", "system", {
@@ -335,6 +375,15 @@ export function createContextGateTools(
         const policyId = args.policy_id as string;
         const provider = args.provider as ProviderCategory | string;
         const context = args.context as Record<string, unknown>;
+
+        // Validate context size
+        const contextKeys = Object.keys(context);
+        if (contextKeys.length > MAX_CONTEXT_FIELDS) {
+          return toolResult({
+            error: "context_too_large",
+            message: `Context has ${contextKeys.length} fields, exceeding limit of ${MAX_CONTEXT_FIELDS}`,
+          });
+        }
 
         const policy = await policyStore.get(policyId);
         if (!policy) {
