@@ -2,11 +2,15 @@
 
 This file is a briefing for every Claude Code session that touches these codebases. Read it before making any changes.
 
+### Attribution Rule (MANDATORY)
+
+**No public-facing document, README, blog post, plugin manifest, package metadata, or software artifact may reference or attribute CIMC as author or creator of Sanctuary or Concordia.** Erik Newton is the sole author. CIMC may be mentioned in internal/biographical context only.
+
 ---
 
 ## WHAT THESE TOOLS ARE
 
-**Sanctuary** is a TypeScript MCP server (~10,400 lines, 40 tools) that gives AI agents four layers of cryptographic sovereignty — without requiring changes to the host agent harness. It ships as an npm package (`@sanctuary-framework/mcp-server`), Docker image, and Claude Code plugin. Version 0.3.0.
+**Sanctuary** is a TypeScript MCP server (~11,000 lines, 46 tools) that gives AI agents four layers of cryptographic sovereignty — without requiring changes to the host agent harness. It ships as an npm package (`@sanctuary-framework/mcp-server`), Docker image, and Claude Code plugin. Version 0.3.1.
 
 What it concretely does:
 
@@ -15,7 +19,7 @@ What it concretely does:
 - **L3 — Selective Disclosure.** SHA-256 commitments with random blinding factors, Pedersen commitments on Ristretto255, Schnorr proofs, and bit-decomposition range proofs — allowing an agent to prove claims about its data without revealing the underlying values.
 - **L4 — Verifiable Reputation.** Signed attestations in EAS-compatible format, stored encrypted under L1. Sovereignty-gated tiers weight attestations from verified-sovereign agents higher. Escrow mechanism for trust bootstrapping. Reputation bundles are exportable and portable across instances.
 
-Additional subsystems: Sovereignty Health Report (SHR) generation and verification; sovereignty handshake protocol (nonce challenge-response + SHR exchange between two agents); federation registry for MCP-to-MCP peer discovery; and the Concordia bridge module.
+Additional subsystems: Sovereignty Health Report (SHR) generation and verification; sovereignty handshake protocol (nonce challenge-response + SHR exchange between two agents); federation registry for MCP-to-MCP peer discovery; Concordia bridge module; and the sovereignty audit tool (environment fingerprinting, OpenClaw-aware gap analysis, scored posture assessment with prioritized recommendations).
 
 **Concordia** is a Python SDK and MCP server (~5,000 lines, 50+ tools exposed via FastMCP) implementing a structured multi-attribute negotiation protocol for autonomous agents. Version 0.1.0-draft.
 
@@ -202,4 +206,68 @@ These are testable assertions. Each should be verifiable by inspection or automa
 
 ## REVIEW CONTEXT
 
-This codebase is currently under a structured security and sovereignty review. Review artifacts (REVIEW_MAP.md, SECURITY_AUDIT.md, BUG_REPORT.md, REMEDIATION_PLAN.md, SPRINT_CONTRACT.md, SPRINT_RESULT.md, SPRINT_EVAL.md) will appear in the working directory as the review progresses. During the review period: do not refactor code outside of explicit sprint sessions, do not add new dependencies without noting them in REVIEW_MAP.md, and do not mark any finding as resolved without a corresponding SPRINT_EVAL.md showing PASS status.
+The structured security review completed 2026-03-28 with all Critical and High findings resolved. Review artifacts (REVIEW_MAP.md, SECURITY_AUDIT.md, BUG_REPORT.md, REMEDIATION_PLAN.md, SPRINT_CONTRACT.md, SPRINT_RESULT.md, SPRINT_EVAL.md) are in the working directory.
+
+Post-review work completed 2026-03-29: Sovereignty Audit Tool (`server/src/audit/`) — environment fingerprinting with OpenClaw-specific detection, four-layer gap analysis with deterministic scoring (0–100), and human-readable report generation. Plugin upgraded to v0.3.0 with Quick Start onboarding, OpenClaw Users section, and workflow-organized tool documentation. 315 tests passing across 31 test files. 46 MCP tools.
+
+Published to npm as v0.3.1 on 2026-03-30. Security-review branch merged and deleted.
+
+---
+
+## DELTA — 2026-03-31 — L2 Context Gating
+
+### Subsystem Summary
+
+Context gating is a new L2 (Operational Isolation) subsystem that controls what agent context flows to remote providers (LLM inference APIs, tool APIs, logging services, analytics). It enforces "minimum-necessary context" at the execution boundary — before any outbound call, the agent filters its context through a policy that classifies each top-level field as allow, redact, hash, summarize, or deny.
+
+**New source files:**
+- `server/src/l2-operational/context-gate.ts` — Core types, `evaluateField()`, `filterContext()`, pattern matching, encrypted policy store (`ContextGatePolicyStore`)
+- `server/src/l2-operational/context-gate-tools.ts` — 5 MCP tool definitions
+- `server/src/l2-operational/context-gate-templates.ts` — 4 starter templates + template registry
+- `server/src/l2-operational/context-gate-recommend.ts` — Heuristic recommendation engine with word-boundary matching
+
+**New test files:**
+- `server/test/l2/context-gate.test.ts` — 26 tests for core module
+- `server/test/l2/context-gate-templates.test.ts` — 47 tests for templates and recommendation engine
+
+**Modified files:**
+- `server/src/index.ts` — imports + registration of context gate tools
+- `server/src/principal-policy/loader.ts` — 5 context gate operations added to Tier 3
+- `server/src/audit/types.ts` — `context_gating: boolean` field added to L2AuditResult
+- `server/src/audit/analyzer.ts` — scoring rebalance (L2 now 25 pts with 4 for context gating) + gap analysis for missing context gating
+
+### New Trust Boundaries
+
+| Boundary | Direction | Data | Enforcement |
+|----------|-----------|------|-------------|
+| Agent input → context_gate_set_policy | Inbound | Policy definitions (rules, patterns, provider categories) | Type casting, no deep validation |
+| Agent input → context_gate_filter | Inbound | Arbitrary context objects + policy ID + provider string | Policy lookup, per-field pattern matching |
+| Agent input → context_gate_recommend | Inbound | Arbitrary context objects for heuristic analysis | Field name classification, no content inspection |
+| Context objects → pattern matcher → filtered output | Internal | Context field names evaluated against allow/redact/hash/summarize lists | Priority: redact > hash > summarize > allow > default |
+| Filtered output → audit trail | Internal | SHA-256 hashes of original and filtered content | Hash computed via `hashToString(stringToBytes(JSON.stringify(...)))` |
+
+### New Encrypted Storage
+
+Policy store uses AES-256-GCM with HKDF domain separation key `"l2-context-gate"` derived from the master key. Policies are stored under the `_context_gate_policies` namespace (underscore-prefixed = reserved, protected from L1 tools). Each policy is individually encrypted and addressable by policy ID.
+
+### New Entry Points (5 MCP Tools)
+
+1. `sanctuary/context_gate_set_policy` — Create a context-gating policy with per-provider rules
+2. `sanctuary/context_gate_apply_template` — Apply a starter template (inference-minimal, inference-standard, logging-strict, tool-api-scoped)
+3. `sanctuary/context_gate_recommend` — Analyze a sample context object and recommend a policy via heuristics
+4. `sanctuary/context_gate_filter` — Filter context through a policy before outbound calls
+5. `sanctuary/context_gate_list_policies` — List all configured policies
+
+All 5 tools are classified as Tier 3 (auto-allow with audit logging) in the default Principal Policy.
+
+### Threat Model Additions
+
+1. **Malicious field naming to bypass patterns.** The pattern matcher in `matchesPattern()` supports exact match, prefix wildcard (`secret_*`), and suffix wildcard (`*_pii`). An attacker controlling field names could use case variations (e.g., `API_KEY` vs `api_key`), unicode homoglyphs, or nested object structures to evade redaction rules. The enforcement-path pattern matcher must be case-insensitive.
+
+2. **Policy manipulation.** Policies are encrypted at rest but all 5 context gate tools are Tier 3 (auto-allow). A compromised agent can create permissive policies, apply them, and filter context through them to exfiltrate data via allowed fields. The policy store does not enforce identity binding — any caller can read/use any policy regardless of the `identity_id` field.
+
+3. **Denial of service via large context objects.** The `filter` and `recommend` tools accept arbitrary context objects without size limits. A context with millions of keys would cause O(n×m) pattern matching (n fields × m patterns per rule). No cap on rule array sizes in `set_policy`.
+
+4. **Pattern matching edge cases.** Only top-level keys are evaluated — nested objects within an allowed field pass through unexamined. Patterns only support prefix and suffix wildcards, not infix. Empty patterns or malformed patterns are not validated.
+
+5. **Template correctness.** The logging-strict template uses `redact: ["*"]` (wildcard redact) which takes absolute priority over its own `allow` list, making the allow list dead code. The template description claims metadata passes through, but in practice everything is redacted.
