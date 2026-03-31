@@ -15,3 +15,5 @@ rfcs/DRAFT-*
 server/node_modules/
 __pycache__/
 review/
+DELTA_REVIEW_REPORT.md
+REVIEW_MAP.md
