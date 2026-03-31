@@ -254,3 +254,92 @@ The **cross-codebase canonical serialization divergence** (SEC-003) is a correct
 **SEC-019** (silent acceptance of unimplemented features) is particularly insidious because it causes the system to misrepresent its own security posture — a deployer who believes they have hardware key protection and ZK proofs has neither.
 
 For the QA engineer reading this next: focus first on SEC-001 (can be tested with a script that calls state_list then state_delete in a loop), SEC-007 (connect two MCP clients to the same Concordia server and demonstrate cross-agent impersonation), and SEC-020 (start Sanctuary without a passphrase, write data, restart, observe data loss). These three are the highest-severity, lowest-effort-to-verify findings.
+
+---
+
+## DELTA AUDIT — 2026-03-31 — L2 Context Gating
+
+**Delta Scope:** Commit range `9c1e202..HEAD` (10 files). New feature: L2 Context Gating — 5 MCP tools, 4 templates, heuristic recommendation engine, encrypted policy store.
+**Auditor Posture:** Same adversarial stance as initial audit. Assumes attacker has full knowledge of CLAUDE.md, REVIEW_MAP.md, and all source code.
+
+---
+
+### SEC-025 — Pattern Matching Is Case-Sensitive: Field Name Case Variation Bypasses Redaction
+
+**Severity:** High
+**File:** `server/src/l2-operational/context-gate.ts:280-288`
+**Description:** The `matchesPattern()` function used for policy enforcement performs case-sensitive string matching. Pattern `"api_key"` matches field `"api_key"` but NOT `"API_KEY"`, `"Api_Key"`, or `"API_key"`. The recommendation engine (`context-gate-recommend.ts:194`) correctly normalizes to lowercase before matching, but the enforcement path does not. This creates a gap: the recommendation engine would flag `"API_KEY"` as "redact" but the policy enforcer would pass it through as "default action" (which is redact for default_action: "redact", but "allow" if a wildcard allow rule exists, or "deny" for default_action: "deny" which blocks the entire request rather than just redacting the field).
+**Attack Scenario:** An agent or compromised harness renames context fields to use uppercase or mixed case (e.g., `API_KEY` instead of `api_key`, `Secret_Token` instead of `secret_token`). These fields bypass explicit redact patterns while containing the same sensitive data. The default action (redact) catches most cases, but if the policy has any wildcard allow rules (e.g., `allow: ["*_data"]`), the attacker's `Secret_Data` field would match the allow pattern and pass through.
+**Sovereignty Violation:** The context gating module's stated invariant is "Redact rules take absolute priority" — but only when the field name matches the pattern's exact case.
+
+---
+
+### SEC-026 — Logging-Strict Template Allow List Is Dead Code: Wildcard Redact Overrides All Allow Rules
+
+**Severity:** High
+**File:** `server/src/l2-operational/context-gate-templates.ts:216-247`
+**Description:** The `logging-strict` template defines both `allow: ["operation", "operation_name", "tool_name", "timestamp", ...]` and `redact: ["*"]`. Since `evaluateField()` checks redact patterns before allow patterns (context-gate.ts:142-148), and `"*"` matches every field name, every field is redacted — including those explicitly listed in `allow`. The `allow` array is entirely dead code. The template description says "Only operation names and timestamps pass through" and the `use_when` field says "usage metrics without content exposure" — but no metrics pass through either. The test at `context-gate-templates.test.ts:194-202` explicitly validates this incorrect behavior ("redacts everything for logging provider (redact * overrides allow)").
+**Attack Scenario:** This is a correctness defect rather than an exploit. A user applies the `logging-strict` template expecting operation metadata to reach their logging service. Nothing reaches the service. The user either (a) gives up on context gating, thinking it's too restrictive, or (b) creates a more permissive custom policy, potentially over-allowing. Either outcome degrades the feature's usability and may lead to less secure configurations.
+**Note:** The same structural issue exists in the `analytics` rule within logging-strict (lines 233-247).
+
+---
+
+### SEC-027 — No Size Limits on Context Objects or Policy Rule Arrays
+
+**Severity:** Medium
+**File:** `server/src/l2-operational/context-gate-tools.ts:130-143, 334-347`, `server/src/l2-operational/context-gate.ts:190-268`
+**Description:** The `context_gate_filter` tool accepts an arbitrary `context` object without validating the number of keys. The `context_gate_set_policy` tool accepts a `rules` array without validating the number of rules, and each rule's `allow`, `redact`, `hash`, and `summarize` arrays are unbounded. The `filterContext()` function iterates over all keys (O(n)) and for each key evaluates against all patterns in the matched rule (O(m) per action type), yielding O(n × m) work. A context object with 100,000 keys and a rule with 10,000 redact patterns would cause significant CPU load.
+**Attack Scenario:** A compromised agent sends a `context_gate_filter` call with a context object containing 1,000,000 keys, each with a long field name. The server spends significant CPU time iterating over keys and evaluating patterns. Alternatively, the agent creates a policy with 100,000 patterns in the redact list, then filters a moderate context through it. Both achieve denial of service on the Sanctuary MCP server.
+**Mitigation:** Router-level schema validation (`router.ts`) has `MAX_STRING_BYTES` (1MB for strings) but no caps on object key count or array length.
+
+---
+
+### SEC-028 — Context Filter Only Evaluates Top-Level Keys: Nested Sensitive Data Passes Through Unexamined
+
+**Severity:** Medium
+**File:** `server/src/l2-operational/context-gate.ts:190-268`
+**Description:** `filterContext()` uses `Object.keys(context)` to get only top-level keys for evaluation. If a field like `task` is allowed and contains a nested object `{description: "...", api_key: "sk-123", memory: "user preferences"}`, the entire nested object passes through unchanged. The tool description says "Each top-level key is evaluated against the policy" which is accurate, but the security implication is not surfaced: redact patterns like `"api_key"` and `"memory"` will NOT catch instances nested inside allowed fields.
+**Attack Scenario:** An agent restructures its context to nest sensitive fields inside an allowed field name. For example: `{task: {description: "summarize", api_key: "sk-ant-xxx", memory: "full agent memory"}}`. The `task` key matches an allow pattern, so the entire nested object including `api_key` and `memory` passes through to the remote provider.
+**Note:** This is inherent to the flat-key design. A recursive evaluator would be more secure but would change the API contract. The minimum fix is to warn users in tool responses and documentation.
+
+---
+
+### SEC-029 — Policy Store Does Not Enforce Identity Binding on Retrieval
+
+**Severity:** Low
+**File:** `server/src/l2-operational/context-gate.ts:336-353`
+**Description:** When creating a policy, an optional `identity_id` can be specified to bind the policy to a specific identity. However, `ContextGatePolicyStore.get()` and `list()` return policies regardless of identity binding. Any caller who knows (or guesses) a policy ID can retrieve and use any policy, including ones bound to a different identity. Policy IDs include a timestamp and 8 random bytes (`cg-{timestamp}-{random}`), providing ~64 bits of entropy, making blind guessing impractical. However, `list()` returns all policies including their IDs, so any caller can enumerate all policies.
+**Attack Scenario:** Agent A creates a permissive policy for development use, bound to identity A. Agent B (sharing the same Sanctuary instance) calls `context_gate_list_policies` to discover the policy ID, then uses it with `context_gate_filter` to apply Agent A's permissive policy. Low severity because a shared Sanctuary instance already implies a shared trust boundary.
+
+---
+
+### SEC-030 — No Validation of Provider Category or Rule Array Contents in set_policy
+
+**Severity:** Low
+**File:** `server/src/l2-operational/context-gate-tools.ts:130-143`
+**Description:** The `set_policy` handler casts `rawRules` elements without validating that `provider` is a valid `ProviderCategory`, that `allow`/`redact`/`hash`/`summarize` contain only strings, or that patterns are well-formed. Passing `provider: 123` or `allow: [null, {}, []]` results in a policy with non-string values in pattern arrays. The `matchesPattern()` function would then call `.endsWith()` or `.startsWith()` on non-string values, causing runtime errors during `filterContext()`. The `hash` and `summarize` arrays default to `[]` via `?? []`, but `allow` and `redact` also use `?? []` which only applies when the value is `null`/`undefined`, not when it's a non-array type.
+**Attack Scenario:** Agent creates a policy with `rules: [{provider: "inference", allow: "not-an-array", redact: []}]`. The allow value is cast as `string[]` but is actually a string. When `filterContext` is called, `matchesPattern()` iterates over the string's characters instead of array elements, causing incorrect pattern matching. Low severity because the broken policy would likely deny/redact rather than allow.
+
+---
+
+## DELTA SYSTEMIC PATTERNS — 2026-03-31
+
+### Pattern 1: Enforcement/Recommendation Divergence
+
+The recommendation engine (`context-gate-recommend.ts`) and the policy enforcement engine (`context-gate.ts`) implement pattern matching with different algorithms. The recommendation engine normalizes to lowercase and uses word-boundary containment matching. The enforcement engine is case-sensitive and uses prefix/suffix wildcard matching. These are fundamentally different matching strategies operating on the same semantic concept (field name classification). A field classified as "redact" by the recommendation engine may not be redacted by the enforcement engine, and vice versa. This divergence should be documented or eliminated.
+
+### Pattern 2: Flat-Key Design Limitation
+
+The context gating system operates on a flat key-value model — only top-level keys are evaluated. Modern agent contexts are often deeply nested (e.g., `tool_results.web_search.snippets[0].content`). The system provides strong security for flat contexts but no protection for nested data within allowed fields. This is a design trade-off that should be clearly communicated to users.
+
+### Pattern 3: Tier 3 Classification for All Context Gate Tools
+
+All 5 context gate tools are Tier 3 (auto-allow). This means a compromised agent can: (1) list all policies, (2) create a maximally permissive policy, (3) filter context through it, and (4) receive a "safe to send" response for everything. The context gating is advisory — the agent is trusted to respect the filter decisions. If the agent is compromised, context gating provides no protection. This is consistent with the broader Sanctuary design (the agent is trusted for Tier 3 operations) but worth noting for users who expect context gating to enforce data boundaries against a malicious agent.
+
+### Pattern 4: Prior Findings Unaffected
+
+The modifications to `index.ts`, `loader.ts`, `analyzer.ts`, and `types.ts` are additive — they register new tools, add Tier 3 entries, and extend audit scoring. None of these changes affect the prior findings (SEC-001 through SEC-024) or their remediations. Specifically:
+- `loader.ts`: The 5 new Tier 3 entries are correctly placed (context gate tools are read/configure operations, appropriate for Tier 3). No Tier 1 operations were moved. The SEC-002 remediation (auto_deny removal) is still intact.
+- `index.ts`: Context gate tools are wired through the same gate as all other tools. No bypass path.
+- `analyzer.ts`: Scoring rebalance (L2 now 25 pts max instead of 21) correctly reflects the new capability. GAP-L2-003 is well-defined.
+- `types.ts`: New boolean field, no security impact.
