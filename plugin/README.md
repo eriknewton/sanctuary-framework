@@ -15,6 +15,7 @@ Gives your agent encrypted state storage, self-custodied cryptographic identity,
 - **`sanctuary/zk_commit` / `zk_prove`** — Pedersen commitments and Schnorr zero-knowledge proofs.
 - **`sanctuary/reputation_record`** — Build portable, signed reputation attestations.
 - **`sanctuary/handshake_initiate`** — Sovereignty handshake protocol for mutual verification.
+- **`sanctuary/context_gate_filter`** — Filter agent context before sending to LLM providers, redacting secrets, PII, and internal state.
 
 ## Installation
 
@@ -50,7 +51,7 @@ Then run `sanctuary/sovereignty_audit` to see what Sanctuary adds on top of your
 
 ## Tools provided
 
-46 MCP tools across four sovereignty layers, sovereignty audit, federation, Concordia bridge, and system tools. See the skill documentation for the complete list.
+51 MCP tools across four sovereignty layers, sovereignty audit, context gating, federation, Concordia bridge, and system tools. See the skill documentation for the complete list.
 
 ## License
 

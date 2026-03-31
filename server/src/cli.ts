@@ -14,6 +14,7 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createSanctuaryServer } from "./index.js";
+import { checkForUpdate } from "./update-check.js";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
@@ -46,6 +47,9 @@ async function main(): Promise<void> {
     console.error(`Sanctuary MCP Server v${config.version} running (stdio)`);
     console.error(`Storage: ${config.storage_path}`);
     console.error("Tools: all registered");
+
+    // Non-blocking update check — fire and forget
+    checkForUpdate(PKG_VERSION);
   } else {
     // HTTP transport — future implementation
     console.error("HTTP transport not yet implemented. Use stdio.");
@@ -77,6 +81,7 @@ Environment variables:
   SANCTUARY_WEBHOOK_ENABLED         "true" to enable webhook approvals
   SANCTUARY_WEBHOOK_URL             Webhook target URL
   SANCTUARY_WEBHOOK_SECRET          HMAC-SHA256 shared secret
+  SANCTUARY_NO_UPDATE_CHECK         "1" to disable startup update check
 
 For more info: https://github.com/eriknewton/sanctuary-framework
 `);

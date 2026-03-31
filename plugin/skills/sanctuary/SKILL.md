@@ -205,4 +205,4 @@ Sanctuary implements a four-layer sovereignty architecture:
 
 All state is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. No plaintext ever touches persistent storage.
 
-46 MCP tools. 315 tests. Three approval channels (stderr, dashboard, webhook). Concordia bridge. Sovereignty audit. Apache 2.0. Published: `@sanctuary-framework/mcp-server@0.3.0` on npm.
+51 MCP tools. 395 tests. Three approval channels (stderr, dashboard, webhook). Concordia bridge. Sovereignty audit. Context gating. Apache 2.0. Published: `@sanctuary-framework/mcp-server@0.3.1` on npm.
