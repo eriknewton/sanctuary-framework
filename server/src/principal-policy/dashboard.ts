@@ -23,6 +23,10 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { createServer as createHttpsServer } from "node:https";
 import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = require("../../package.json");
 import type { ApprovalChannel } from "./approval-channel.js";
 import type { ApprovalRequest, ApprovalResponse, PrincipalPolicy } from "./types.js";
 import type { BaselineTracker } from "./baseline.js";
@@ -70,6 +74,20 @@ interface DashboardSession {
 const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_SESSIONS = 1000;
 
+// ── Rate Limiting ───────────────────────────────────────────────────
+// Sliding-window rate limiting per remote address.
+// Decision endpoints (approve/deny) have a tighter limit than general API.
+
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1-minute window
+const RATE_LIMIT_GENERAL = 120;       // max general API requests per window
+const RATE_LIMIT_DECISIONS = 20;      // max approve/deny decisions per window
+const MAX_RATE_LIMIT_ENTRIES = 10_000; // cap the tracking map to prevent memory exhaustion
+
+interface RateLimitEntry {
+  general: number[];   // timestamps of general requests
+  decisions: number[]; // timestamps of decision requests
+}
+
 export class DashboardApprovalChannel implements ApprovalChannel {
   private config: DashboardConfig;
   private pending: Map<string, PendingRequest> = new Map();
@@ -84,6 +102,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   /** SEC-012: Short-lived session store. Sessions replace URL query tokens. */
   private sessions: Map<string, DashboardSession> = new Map();
   private sessionCleanupTimer: ReturnType<typeof setInterval> | null = null;
+  /** Rate limiting: per-IP request tracking */
+  private rateLimits: Map<string, RateLimitEntry> = new Map();
 
   constructor(config: DashboardConfig) {
     this.config = config;
@@ -91,7 +111,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.useTLS = !!(config.tls?.cert_path && config.tls?.key_path);
     this.dashboardHTML = generateDashboardHTML({
       timeoutSeconds: config.timeout_seconds,
-      serverVersion: "0.3.0",
+      serverVersion: PKG_VERSION,
       authToken: this.authToken,
     });
     // SEC-012: Periodic cleanup of expired sessions (every 60s)
@@ -181,6 +201,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       clearInterval(this.sessionCleanupTimer);
       this.sessionCleanupTimer = null;
     }
+
+    // Clean up rate limit tracking
+    this.rateLimits.clear();
 
     // Close HTTP server
     if (this.httpServer) {
@@ -335,6 +358,80 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
   }
 
+  // ── Rate Limiting ─────────────────────────────────────────────────
+
+  /**
+   * Get the remote address from a request, normalizing IPv6-mapped IPv4.
+   */
+  private getRemoteAddr(req: IncomingMessage): string {
+    const addr = req.socket.remoteAddress ?? "unknown";
+    // Normalize ::ffff:127.0.0.1 → 127.0.0.1
+    return addr.startsWith("::ffff:") ? addr.slice(7) : addr;
+  }
+
+  /**
+   * Check rate limit for a request. Returns true if allowed, false if rate-limited.
+   * When rate-limited, sends a 429 response.
+   */
+  private checkRateLimit(
+    req: IncomingMessage,
+    res: ServerResponse,
+    type: "general" | "decisions"
+  ): boolean {
+    const addr = this.getRemoteAddr(req);
+    const now = Date.now();
+    const windowStart = now - RATE_LIMIT_WINDOW_MS;
+
+    // Get or create entry for this address
+    let entry = this.rateLimits.get(addr);
+    if (!entry) {
+      // Cap the tracking map to prevent memory exhaustion
+      if (this.rateLimits.size >= MAX_RATE_LIMIT_ENTRIES) {
+        this.pruneRateLimits(now);
+      }
+      entry = { general: [], decisions: [] };
+      this.rateLimits.set(addr, entry);
+    }
+
+    // Prune old timestamps from the window
+    entry.general = entry.general.filter(t => t > windowStart);
+    entry.decisions = entry.decisions.filter(t => t > windowStart);
+
+    const limit = type === "decisions" ? RATE_LIMIT_DECISIONS : RATE_LIMIT_GENERAL;
+    const timestamps = entry[type];
+
+    if (timestamps.length >= limit) {
+      const retryAfter = Math.ceil((timestamps[0]! + RATE_LIMIT_WINDOW_MS - now) / 1000);
+      res.writeHead(429, {
+        "Content-Type": "application/json",
+        "Retry-After": String(Math.max(1, retryAfter)),
+      });
+      res.end(JSON.stringify({
+        error: "Rate limit exceeded",
+        retry_after_seconds: Math.max(1, retryAfter),
+      }));
+      return false;
+    }
+
+    timestamps.push(now);
+    return true;
+  }
+
+  /**
+   * Remove stale entries from the rate limit map.
+   */
+  private pruneRateLimits(now: number): void {
+    const windowStart = now - RATE_LIMIT_WINDOW_MS;
+    for (const [addr, entry] of this.rateLimits) {
+      const hasRecent =
+        entry.general.some(t => t > windowStart) ||
+        entry.decisions.some(t => t > windowStart);
+      if (!hasRecent) {
+        this.rateLimits.delete(addr);
+      }
+    }
+  }
+
   // ── HTTP Request Handler ────────────────────────────────────────────
 
   private handleRequest(req: IncomingMessage, res: ServerResponse): void {
@@ -361,6 +458,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // Authenticate all non-OPTIONS requests
     if (!this.checkAuth(req, url, res)) return;
 
+    // Rate limiting: apply general limit to all authenticated requests
+    if (!this.checkRateLimit(req, res, "general")) return;
+
     try {
       // SEC-012: Session exchange endpoint — must be authenticated via header
       if (method === "POST" && url.pathname === "/auth/session") {
@@ -379,9 +479,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       } else if (method === "GET" && url.pathname === "/api/audit-log") {
         this.handleAuditLog(url, res);
       } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
+        // Decision endpoints get an additional tighter rate limit
+        if (!this.checkRateLimit(req, res, "decisions")) return;
         const id = url.pathname.slice("/api/approve/".length);
         this.handleDecision(id, "approve", res);
       } else if (method === "POST" && url.pathname.startsWith("/api/deny/")) {
+        // Decision endpoints get an additional tighter rate limit
+        if (!this.checkRateLimit(req, res, "decisions")) return;
         const id = url.pathname.slice("/api/deny/".length);
         this.handleDecision(id, "deny", res);
       } else {

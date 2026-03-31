@@ -284,7 +284,7 @@ export async function createSanctuaryServer(options?: {
           layer: "l2",
           description: "Process-level isolation only (no TEE)",
           severity: "warning",
-          mitigation: "TEE support planned for v0.3.0",
+          mitigation: "TEE support planned for a future release",
         });
 
         if (config.disclosure.proof_system === "commitment-only") {
@@ -437,7 +437,7 @@ export async function createSanctuaryServer(options?: {
         },
         limitations: [
           "L1 identity uses ed25519 only; KERI support planned for v0.2.0",
-          "L2 isolation is process-level only; TEE support planned for v0.3.0",
+          "L2 isolation is process-level only; TEE support planned for a future release",
           "L3 uses commitment schemes only; ZK proofs planned for v0.2.0",
           "L4 Sybil resistance is escrow-based only",
           "Spec license: CC-BY-4.0 | Code license: Apache-2.0",

@@ -63,14 +63,14 @@ export function generateSHR(
       code: "PROCESS_ISOLATION_ONLY" as DegradationCode,
       severity: "warning",
       description: "Process-level isolation only (no TEE)",
-      mitigation: "TEE support planned for v0.3.0",
+      mitigation: "TEE support planned for a future release",
     });
     degradations.push({
       layer: "l2",
       code: "SELF_REPORTED_ATTESTATION" as DegradationCode,
       severity: "warning",
       description: "Attestation is self-reported (no hardware root of trust)",
-      mitigation: "TEE attestation planned for v0.3.0",
+      mitigation: "TEE attestation planned for a future release",
     });
   }
 

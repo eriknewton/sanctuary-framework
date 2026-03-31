@@ -7,6 +7,10 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = require("../package.json");
 
 export interface SanctuaryConfig {
   version: string;
@@ -75,7 +79,7 @@ export interface SanctuaryConfig {
 /** Default configuration */
 export function defaultConfig(): SanctuaryConfig {
   return {
-    version: "0.3.0",
+    version: PKG_VERSION,
     storage_path: join(homedir(), ".sanctuary"),
     state: {
       encryption: "aes-256-gcm",
@@ -242,6 +246,28 @@ export function validateConfig(config: SanctuaryConfig): void {
       `Unimplemented config value: disclosure.proof_system = "${config.disclosure.proof_system}". ` +
       `Only ${[...implementedProofSystem].map(v => `"${v}"`).join(", ")} is currently implemented. ` +
       `Using an unimplemented proof system would silently degrade security.`
+    );
+  }
+
+  // Implemented disclosure.default_policy values: "minimum-necessary"
+  // Unimplemented: "withhold-all" (global withhold policy not yet implemented)
+  const implementedDisclosurePolicy = new Set(["minimum-necessary"]);
+  if (!implementedDisclosurePolicy.has(config.disclosure.default_policy)) {
+    errors.push(
+      `Unimplemented config value: disclosure.default_policy = "${config.disclosure.default_policy}". ` +
+      `Only ${[...implementedDisclosurePolicy].map(v => `"${v}"`).join(", ")} is currently implemented. ` +
+      `Using an unimplemented disclosure policy would silently skip disclosure controls.`
+    );
+  }
+
+  // Implemented reputation.mode values: "self-custodied"
+  // Unimplemented: "service-mediated" (third-party reputation service not yet integrated)
+  const implementedReputationMode = new Set(["self-custodied"]);
+  if (!implementedReputationMode.has(config.reputation.mode)) {
+    errors.push(
+      `Unimplemented config value: reputation.mode = "${config.reputation.mode}". ` +
+      `Only ${[...implementedReputationMode].map(v => `"${v}"`).join(", ")} is currently implemented. ` +
+      `Using an unimplemented reputation mode would silently skip reputation verification.`
     );
   }
 

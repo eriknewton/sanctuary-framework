@@ -431,6 +431,69 @@ describe("Principal Dashboard", () => {
     });
   });
 
+  // ── Rate Limiting ────────────────────────────────────────────────────
+
+  describe("Rate Limiting", () => {
+    it("returns 429 when general rate limit is exceeded", async () => {
+      // Send 121 requests rapidly (limit is 120 per minute)
+      const results: number[] = [];
+      for (let i = 0; i < 125; i++) {
+        const res = await fetch(`http://127.0.0.1:${port}/api/status`);
+        results.push(res.status);
+        if (res.status === 429) break;
+      }
+      expect(results).toContain(429);
+    });
+
+    it("returns Retry-After header on 429 response", async () => {
+      // Exhaust the general rate limit
+      for (let i = 0; i < 121; i++) {
+        const res = await fetch(`http://127.0.0.1:${port}/api/status`);
+        if (res.status === 429) {
+          expect(res.headers.get("retry-after")).toBeTruthy();
+          const body = await res.json();
+          expect(body.error).toContain("Rate limit");
+          expect(body.retry_after_seconds).toBeGreaterThan(0);
+          return;
+        }
+      }
+      // If we get here, rate limiting didn't kick in
+      expect.fail("Expected 429 response but never received one");
+    });
+
+    it("rate-limits decision endpoints more tightly", async () => {
+      // Create many pending requests
+      const promises: Promise<unknown>[] = [];
+      for (let i = 0; i < 25; i++) {
+        promises.push(
+          dashboard.requestApproval({
+            operation: "state_export",
+            tier: 1,
+            reason: "Rate limit test",
+            context: {},
+            timestamp: new Date().toISOString(),
+          })
+        );
+      }
+
+      // Get the pending IDs
+      const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
+      const pending = await listRes.json();
+      expect(pending.length).toBeGreaterThan(20);
+
+      // Try to approve them all rapidly (limit is 20 per minute)
+      const results: number[] = [];
+      for (const p of pending) {
+        const res = await fetch(
+          `http://127.0.0.1:${port}/api/approve/${p.id}`,
+          { method: "POST" }
+        );
+        results.push(res.status);
+      }
+      expect(results).toContain(429);
+    });
+  });
+
   // ── Cleanup ──────────────────────────────────────────────────────────
 
   describe("Cleanup", () => {

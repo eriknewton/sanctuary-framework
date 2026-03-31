@@ -41,6 +41,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "state_delete",
     "identity_rotate",
     "reputation_import",
+    "reputation_export",
     "bootstrap_provide_guarantee",
   ],
   tier2_anomaly: DEFAULT_TIER2,
@@ -58,7 +59,6 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "disclosure_evaluate",
     "reputation_record",
     "reputation_query",
-    "reputation_export",
     "bootstrap_create_escrow",
     "exec_attest",
     "monitor_health",
@@ -225,6 +225,7 @@ tier1_always_approve:
   - state_delete
   - identity_rotate
   - reputation_import
+  - reputation_export
   - bootstrap_provide_guarantee
 
 # ─── Tier 2: Behavioral Anomaly Detection ────────────────────────────────
@@ -254,7 +255,6 @@ tier3_always_allow:
   - disclosure_evaluate
   - reputation_record
   - reputation_query
-  - reputation_export
   - bootstrap_create_escrow
   - exec_attest
   - monitor_health

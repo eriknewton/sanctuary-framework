@@ -88,6 +88,46 @@ describe("SEC-019: Reject unimplemented config features", () => {
     ).rejects.toThrow(/tee/);
   });
 
+  // --- Unimplemented disclosure.default_policy values ---
+
+  it("rejects disclosure.default_policy: withhold-all", async () => {
+    await expect(
+      writeConfigAndLoad({ disclosure: { default_policy: "withhold-all" } })
+    ).rejects.toThrow(/unimplemented/i);
+    await expect(
+      writeConfigAndLoad({ disclosure: { default_policy: "withhold-all" } })
+    ).rejects.toThrow(/disclosure\.default_policy/);
+    await expect(
+      writeConfigAndLoad({ disclosure: { default_policy: "withhold-all" } })
+    ).rejects.toThrow(/withhold-all/);
+  });
+
+  it("accepts disclosure.default_policy: minimum-necessary", async () => {
+    await expect(
+      writeConfigAndLoad({ disclosure: { default_policy: "minimum-necessary" } })
+    ).resolves.not.toThrow();
+  });
+
+  // --- Unimplemented reputation.mode values ---
+
+  it("rejects reputation.mode: service-mediated", async () => {
+    await expect(
+      writeConfigAndLoad({ reputation: { mode: "service-mediated" } })
+    ).rejects.toThrow(/unimplemented/i);
+    await expect(
+      writeConfigAndLoad({ reputation: { mode: "service-mediated" } })
+    ).rejects.toThrow(/reputation\.mode/);
+    await expect(
+      writeConfigAndLoad({ reputation: { mode: "service-mediated" } })
+    ).rejects.toThrow(/service-mediated/);
+  });
+
+  it("accepts reputation.mode: self-custodied", async () => {
+    await expect(
+      writeConfigAndLoad({ reputation: { mode: "self-custodied" } })
+    ).resolves.not.toThrow();
+  });
+
   // --- Multiple unimplemented features in a single config ---
 
   it("reports all unimplemented features when multiple are present", async () => {

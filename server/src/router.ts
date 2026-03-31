@@ -14,7 +14,11 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { createRequire } from "node:module";
 import type { ApprovalGate } from "./principal-policy/gate.js";
+
+const require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = require("../package.json");
 
 /** Tool handler function signature */
 export type ToolHandler = (
@@ -180,7 +184,7 @@ export function createServer(
   const server = new Server(
     {
       name: "sanctuary-mcp-server",
-      version: "0.3.0",
+      version: PKG_VERSION,
     },
     {
       capabilities: {

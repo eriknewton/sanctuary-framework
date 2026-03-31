@@ -14,6 +14,10 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createSanctuaryServer } from "./index.js";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = require("../package.json");
 
 async function main(): Promise<void> {
   // Parse CLI flags
@@ -29,7 +33,7 @@ async function main(): Promise<void> {
       printHelp();
       process.exit(0);
     } else if (args[i] === "--version" || args[i] === "-v") {
-      console.log("@sanctuary-framework/mcp-server 0.3.0");
+      console.log(`@sanctuary-framework/mcp-server ${PKG_VERSION}`);
       process.exit(0);
     }
   }
@@ -51,7 +55,7 @@ async function main(): Promise<void> {
 
 function printHelp(): void {
   console.log(`
-@sanctuary-framework/mcp-server v0.3.0
+@sanctuary-framework/mcp-server v${PKG_VERSION}
 
 Sovereignty infrastructure for agents in the agentic economy.
 
