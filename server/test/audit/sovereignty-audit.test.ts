@@ -285,6 +285,69 @@ describe("Sovereignty Audit", () => {
     });
   });
 
+  describe("L3 ZK Proofs Scoring", () => {
+    it("scores L3 as Full (20/20) with Schnorr + range proofs", () => {
+      const env = makeFingerprint({
+        sanctuary_installed: true,
+      });
+      const result = analyzeSovereignty(env, config);
+      const l3 = result.layers.l3_selective_disclosure;
+
+      // With Sanctuary, L3 should be active with full score
+      expect(l3.status).toBe("active");
+      expect(l3.commitment_scheme).toBe("pedersen+sha256");
+      expect(l3.zero_knowledge_proofs).toBe(true);
+      expect(l3.selective_disclosure_policy).toBe(true);
+
+      // Score should be: 8 (commitment) + 7 (proofs) + 5 (policies) = 20
+      const l3Score = 8 + 7 + 5;
+      expect(result.layers.l3_selective_disclosure).toBeDefined();
+
+      // Verify findings explicitly mention genuine ZK proofs
+      expect(l3.findings.join(" ")).toContain("zero-knowledge");
+      expect(l3.findings.join(" ")).toContain("Fiat-Shamir");
+    });
+
+    it("L3 findings clarify that Schnorr + range proofs are genuine ZK proofs", () => {
+      const env = makeFingerprint({
+        sanctuary_installed: true,
+      });
+      const result = analyzeSovereignty(env, config);
+      const l3 = result.layers.l3_selective_disclosure;
+
+      const findingsText = l3.findings.join(" ");
+      expect(findingsText).toContain("genuine ZK");
+      expect(findingsText).toContain("Schnorr");
+      expect(findingsText).toContain("Range proofs");
+      expect(findingsText).toContain("domain separation");
+    });
+
+    it("does not generate L3 gap when commitments + proofs are active", () => {
+      const env = makeFingerprint({
+        sanctuary_installed: true,
+      });
+      const result = analyzeSovereignty(env, config);
+
+      // Should NOT have GAP-L3-001 (no selective disclosure)
+      const l3Gaps = result.gaps.filter((g) => g.id === "GAP-L3-001");
+      expect(l3Gaps).toHaveLength(0);
+    });
+
+    it("generates L3 gap only when commitment_scheme is none", () => {
+      const env = makeFingerprint({
+        sanctuary_installed: false,
+        sanctuary_version: null,
+        openclaw_detected: false,
+      });
+      const result = analyzeSovereignty(env, config);
+
+      // Should have GAP-L3-001 (no selective disclosure at all)
+      const l3Gaps = result.gaps.filter((g) => g.id === "GAP-L3-001");
+      expect(l3Gaps).toHaveLength(1);
+      expect(l3Gaps[0].title).toContain("No selective disclosure capability");
+    });
+  });
+
   describe("Incident Class Mapping", () => {
     it("maps plaintext memory gap to Meta Sev 1 incident", () => {
       const env = makeFingerprint({

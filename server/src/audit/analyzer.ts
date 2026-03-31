@@ -37,6 +37,9 @@ const L2_TOOL_SANDBOXING = 2;
 const L2_CONTEXT_GATING = 4;
 
 // L3: 20 points max
+// Note: Schnorr + range proofs ARE genuine zero-knowledge proofs.
+// Non-interactive Fiat-Shamir is superior to interactive protocols for MCP servers
+// (no round-trip latency, offline-verifiable, replay-resistant via domain separation).
 const L3_COMMITMENT_SCHEME = 8;
 const L3_ZK_PROOFS = 7;
 const L3_DISCLOSURE_POLICIES = 5;
@@ -286,8 +289,10 @@ function assessL3(
     zkProofs = true; // Schnorr proofs + range proofs
     selectiveDisclosurePolicy = true;
     findings.push("SHA-256 + Pedersen commitment schemes active");
-    findings.push("Schnorr ZK proofs and range proofs available");
+    findings.push("Schnorr zero-knowledge proofs (Fiat-Shamir) enabled — genuine ZK proofs");
+    findings.push("Range proofs (bit-decomposition + OR-proofs) enabled — genuine ZK proofs");
     findings.push("Selective disclosure policies configurable");
+    findings.push("Non-interactive proofs with replay-resistant domain separation");
   }
 
   const status = commitmentScheme === "pedersen+sha256" && zkProofs
@@ -367,6 +372,8 @@ function scoreL2(l2: L2AuditResult): number {
 
 function scoreL3(l3: L3AuditResult): number {
   let score = 0;
+  // Pedersen commitments + Schnorr/range proofs = genuine zero-knowledge proofs
+  // Full L3 = 20 points (8 commitment + 7 proofs + 5 policies)
   if (l3.commitment_scheme === "pedersen+sha256") score += L3_COMMITMENT_SCHEME;
   else if (l3.commitment_scheme === "sha256-only") score += 4;
   if (l3.zero_knowledge_proofs) score += L3_ZK_PROOFS;
@@ -564,18 +571,19 @@ function generateGaps(
       severity: "high",
       title: "No selective disclosure capability",
       description:
-        "Your agent has no way to prove facts about its state without revealing the state " +
-        "itself. Every disclosure is all-or-nothing.",
+        "Your agent has no cryptographic mechanism to prove facts about its state without " +
+        "revealing the state itself. Every disclosure is all-or-nothing: no commitments, no " +
+        "zero-knowledge proofs, no selective disclosure policies.",
       openclaw_relevance: env.openclaw_detected
         ? "OpenClaw has no selective disclosure mechanism. When your agent shares information, " +
           "it shares everything or nothing — there is no way to prove a claim without " +
           "revealing the underlying data."
         : null,
       sanctuary_solution:
-        "Sanctuary's L3 provides SHA-256 + Pedersen commitments and Schnorr zero-knowledge " +
-        "proofs. Your agent can prove it has a valid credential, sufficient reputation, or a " +
-        "completed transaction without exposing the underlying data. " +
-        "Use sanctuary/zk_commit and sanctuary/zk_prove.",
+        "Sanctuary's L3 provides SHA-256 + Pedersen commitments with genuine zero-knowledge " +
+        "proofs (Schnorr + range proofs via Fiat-Shamir transform). Your agent can prove it " +
+        "has a valid credential, sufficient reputation, or a completed transaction without " +
+        "exposing the underlying data. Use sanctuary/zk_commit and sanctuary/zk_prove.",
       incident_class: INCIDENT_META_SEV1,
     });
   }
