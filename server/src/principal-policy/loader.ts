@@ -81,6 +81,11 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "zk_verify",
     "zk_range_prove",
     "zk_range_verify",
+    "context_gate_set_policy",
+    "context_gate_apply_template",
+    "context_gate_recommend",
+    "context_gate_filter",
+    "context_gate_list_policies",
   ],
   approval_channel: DEFAULT_CHANNEL,
 };
@@ -277,6 +282,11 @@ tier3_always_allow:
   - zk_verify
   - zk_range_prove
   - zk_range_verify
+  - context_gate_set_policy
+  - context_gate_apply_template
+  - context_gate_recommend
+  - context_gate_filter
+  - context_gate_list_policies
 
 # ─── Approval Channel ────────────────────────────────────────────────────
 # How Sanctuary reaches you when approval is needed.

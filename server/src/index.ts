@@ -28,6 +28,7 @@ import { createHandshakeTools } from "./handshake/tools.js";
 import { createFederationTools } from "./federation/tools.js";
 import { createBridgeTools } from "./bridge/tools.js";
 import { createAuditTools } from "./audit/tools.js";
+import { createContextGateTools } from "./l2-operational/context-gate-tools.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
@@ -493,6 +494,13 @@ export async function createSanctuaryServer(options?: {
   // 14d. Create Sovereignty Audit tools (read-only diagnostic)
   const { tools: auditTools } = createAuditTools(config);
 
+  // 14e. Create Context Gating tools (L2 outbound context control)
+  const { tools: contextGateTools } = createContextGateTools(
+    storage,
+    masterKey,
+    auditLog
+  );
+
   // 15. Load Principal Policy and create approval gate
   const policy = await loadPrincipalPolicy(config.storage_path);
   const baseline = new BaselineTracker(storage, masterKey);
@@ -553,6 +561,7 @@ export async function createSanctuaryServer(options?: {
     ...federationTools,
     ...bridgeTools,
     ...auditTools,
+    ...contextGateTools,
     manifestTool,
   ];
 
@@ -618,6 +627,33 @@ export type {
   FederationCapabilities,
   PeerTrustEvaluation,
 } from "./federation/types.js";
+export { ContextGatePolicyStore } from "./l2-operational/context-gate.js";
+export {
+  TEMPLATES as CONTEXT_GATE_TEMPLATES,
+  getTemplate,
+  listTemplateIds,
+} from "./l2-operational/context-gate-templates.js";
+export type { ContextGateTemplate } from "./l2-operational/context-gate-templates.js";
+export {
+  classifyField,
+  recommendPolicy,
+} from "./l2-operational/context-gate-recommend.js";
+export type {
+  FieldClassification,
+  PolicyRecommendation,
+} from "./l2-operational/context-gate-recommend.js";
+export {
+  evaluateField,
+  filterContext,
+} from "./l2-operational/context-gate.js";
+export type {
+  ContextGatePolicy,
+  ContextGateRule,
+  ContextFilterResult,
+  FieldFilterResult,
+  ProviderCategory,
+  ContextAction,
+} from "./l2-operational/context-gate.js";
 export { MemoryStorage } from "./storage/memory.js";
 export { FilesystemStorage } from "./storage/filesystem.js";
 export { ApprovalGate } from "./principal-policy/gate.js";

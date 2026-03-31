@@ -30,9 +30,10 @@ const L1_STATE_PORTABLE = 7;
 // L2: 25 points max
 const L2_THREE_TIER_GATE = 10;
 const L2_BINARY_GATE = 3;
-const L2_ANOMALY_DETECTION = 7;
-const L2_ENCRYPTED_AUDIT = 5;
-const L2_TOOL_SANDBOXING = 3;
+const L2_ANOMALY_DETECTION = 5;
+const L2_ENCRYPTED_AUDIT = 4;
+const L2_TOOL_SANDBOXING = 2;
+const L2_CONTEXT_GATING = 4;
 
 // L3: 20 points max
 const L3_COMMITMENT_SCHEME = 8;
@@ -163,15 +164,18 @@ function assessL2(
   let auditTrailEncrypted = false;
   let auditTrailExists = false;
   let toolSandboxing: "policy-enforced" | "basic" | "none" = "none";
+  let contextGating = false;
 
   if (sanctuaryActive) {
     approvalGate = "three-tier";
     behavioralAnomalyDetection = true;
     auditTrailEncrypted = true;
     auditTrailExists = true;
+    contextGating = true;
     findings.push("Three-tier Principal Policy gate active");
     findings.push("Behavioral anomaly detection (BaselineTracker) enabled");
     findings.push("Encrypted audit trail active");
+    findings.push("Context gating available (sanctuary/context_gate_set_policy)");
   }
 
   if (env.openclaw_detected && env.openclaw_config) {
@@ -205,6 +209,7 @@ function assessL2(
     audit_trail_encrypted: auditTrailEncrypted,
     audit_trail_exists: auditTrailExists,
     tool_sandboxing: sanctuaryActive ? "policy-enforced" : toolSandboxing,
+    context_gating: contextGating,
     findings,
   };
 }
@@ -300,6 +305,7 @@ function scoreL2(l2: L2AuditResult): number {
   if (l2.audit_trail_encrypted) score += L2_ENCRYPTED_AUDIT;
   if (l2.tool_sandboxing === "policy-enforced") score += L2_TOOL_SANDBOXING;
   else if (l2.tool_sandboxing === "basic") score += 1;
+  if (l2.context_gating) score += L2_CONTEXT_GATING;
   return score;
 }
 
@@ -448,9 +454,33 @@ function generateGaps(
     });
   }
 
-  if (!l2.audit_trail_exists) {
+  if (!l2.context_gating) {
     gaps.push({
       id: "GAP-L2-003",
+      layer: "L2",
+      severity: "high",
+      title: "No context gating for outbound inference calls",
+      description:
+        "Your agent sends its full context — conversation history, memory, preferences, " +
+        "internal reasoning — to remote LLM providers on every inference call. There is " +
+        "no mechanism to filter what leaves the sovereignty boundary. The provider sees " +
+        "everything the agent knows.",
+      openclaw_relevance: env.openclaw_detected
+        ? "OpenClaw sends full agent context (including MEMORY.md, tool results, and " +
+          "conversation history) to the configured LLM provider with every API call. " +
+          "There is no built-in context filtering."
+        : null,
+      sanctuary_solution:
+        "Sanctuary's context gating (sanctuary/context_gate_set_policy + " +
+        "sanctuary/context_gate_filter) lets you define per-provider policies that " +
+        "control exactly what context flows outbound. Redact secrets, hash identifiers, " +
+        "and send only minimum-necessary context for each call.",
+    });
+  }
+
+  if (!l2.audit_trail_exists) {
+    gaps.push({
+      id: "GAP-L2-004",
       layer: "L2",
       severity: "high",
       title: "No audit trail",
@@ -560,9 +590,19 @@ function generateRecommendations(
     });
   }
 
-  if (!l4.reputation_signed) {
+  if (!l2.context_gating) {
     recs.push({
       priority: 5,
+      action: "Configure context gating to control what flows to LLM providers",
+      tool: "sanctuary/context_gate_set_policy",
+      effort: "minutes",
+      impact: "high",
+    });
+  }
+
+  if (!l4.reputation_signed) {
+    recs.push({
+      priority: 6,
       action: "Start recording reputation attestations from completed interactions",
       tool: "sanctuary/reputation_record",
       effort: "minutes",
@@ -572,7 +612,7 @@ function generateRecommendations(
 
   if (!l3.selective_disclosure_policy) {
     recs.push({
-      priority: 6,
+      priority: 7,
       action: "Configure selective disclosure policies for data sharing",
       tool: "sanctuary/disclosure_set_policy",
       effort: "hours",
@@ -629,6 +669,9 @@ export function formatAuditReport(result: SovereigntyAuditResult): string {
   report += "  ├─────────────────────────────┼──────────┼───────┤\n";
   report += `  │ L1 Cognitive Sovereignty    │ ${padStatus(layers.l1_cognitive.status)} │ ${padScore(l1Score, 35)} │\n`;
   report += `  │ L2 Operational Isolation    │ ${padStatus(layers.l2_operational.status)} │ ${padScore(l2Score, 25)} │\n`;
+  if (layers.l2_operational.context_gating) {
+    report += `  │   └ Context Gating          │ ACTIVE   │       │\n`;
+  }
   report += `  │ L3 Selective Disclosure     │ ${padStatus(layers.l3_selective_disclosure.status)} │ ${padScore(l3Score, 20)} │\n`;
   report += `  │ L4 Verifiable Reputation    │ ${padStatus(layers.l4_reputation.status)} │ ${padScore(l4Score, 20)} │\n`;
   report += "  └─────────────────────────────┴──────────┴───────┘\n";
