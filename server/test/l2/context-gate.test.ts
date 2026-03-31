@@ -270,6 +270,29 @@ describe("L2 Context Gating", () => {
       expect(evaluateField(policy, "inference", "task_description").action).toBe("allow");
       expect(evaluateField(policy, "inference", "task_description_extra").action).not.toBe("allow");
     });
+
+    // SEC-025 regression: case-insensitive pattern matching
+    it("matches patterns case-insensitively", () => {
+      const policy = makePolicy([
+        {
+          provider: "*",
+          allow: ["task_description"],
+          redact: ["api_key", "secret_*"],
+          hash: [],
+          summarize: [],
+        },
+      ]);
+
+      // Uppercase variations must be redacted
+      expect(evaluateField(policy, "inference", "API_KEY").action).toBe("redact");
+      expect(evaluateField(policy, "inference", "Api_Key").action).toBe("redact");
+      expect(evaluateField(policy, "inference", "SECRET_TOKEN").action).toBe("redact");
+      expect(evaluateField(policy, "inference", "Secret_Data").action).toBe("redact");
+
+      // Allow also case-insensitive
+      expect(evaluateField(policy, "inference", "TASK_DESCRIPTION").action).toBe("allow");
+      expect(evaluateField(policy, "inference", "Task_Description").action).toBe("allow");
+    });
   });
 
   // ── filterContext ──────────────────────────────────────────────────

@@ -278,11 +278,13 @@ export function filterContext(
  * - Full wildcard: "*" matches everything
  */
 function matchesPattern(field: string, patterns: string[]): boolean {
+  const normalizedField = field.toLowerCase();
   for (const pattern of patterns) {
     if (pattern === "*") return true;
-    if (pattern === field) return true;
-    if (pattern.endsWith("*") && field.startsWith(pattern.slice(0, -1))) return true;
-    if (pattern.startsWith("*") && field.endsWith(pattern.slice(1))) return true;
+    const normalizedPattern = pattern.toLowerCase();
+    if (normalizedPattern === normalizedField) return true;
+    if (normalizedPattern.endsWith("*") && normalizedField.startsWith(normalizedPattern.slice(0, -1))) return true;
+    if (normalizedPattern.startsWith("*") && normalizedField.endsWith(normalizedPattern.slice(1))) return true;
   }
   return false;
 }
