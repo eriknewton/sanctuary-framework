@@ -191,23 +191,55 @@ describe("L2 Context Gating Templates", () => {
   describe("logging-strict template", () => {
     const policy = policyFromTemplate(LOGGING_STRICT);
 
-    it("redacts everything for logging provider (redact * overrides allow)", () => {
+    it("allows operation metadata for logging provider", () => {
       const context = {
-        task_description: "Some task",
-        api_key: "secret",
-        user_data: "private",
+        operation: "state_write",
+        timestamp: "2026-03-31T00:00:00Z",
+        duration_ms: 42,
+        status: "success",
       };
-      // The wildcard redact rule catches everything
+      const result = filterContext(policy, "logging", context);
+      expect(result.fields_allowed).toBe(4);
+      expect(result.fields_redacted).toBe(0);
+    });
+
+    it("redacts secrets and PII for logging provider", () => {
+      const context = {
+        api_key: "secret",
+        email: "user@example.com",
+        memory: "agent state",
+      };
       const result = filterContext(policy, "logging", context);
       expect(result.fields_redacted).toBe(3);
     });
 
-    it("redacts everything for analytics provider", () => {
+    it("redacts unknown fields for logging provider via default action", () => {
+      const context = {
+        operation: "state_write",
+        unknown_field: "private data",
+      };
+      const result = filterContext(policy, "logging", context);
+      expect(result.fields_allowed).toBe(1);
+      expect(result.fields_redacted).toBe(1);
+    });
+
+    it("allows operation metadata for analytics provider", () => {
       const context = {
         event_type: "page_view",
+        timestamp: "2026-03-31T00:00:00Z",
+      };
+      const result = filterContext(policy, "analytics", context);
+      expect(result.fields_allowed).toBe(2);
+    });
+
+    it("redacts sensitive fields for analytics provider", () => {
+      const context = {
+        event_type: "page_view",
+        password: "secret123",
         user_data: "private",
       };
       const result = filterContext(policy, "analytics", context);
+      expect(result.fields_allowed).toBe(1);
       expect(result.fields_redacted).toBe(2);
     });
   });
