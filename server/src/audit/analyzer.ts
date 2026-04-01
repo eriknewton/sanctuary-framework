@@ -28,13 +28,14 @@ const L1_IDENTITY_CRYPTOGRAPHIC = 10;
 const L1_INTEGRITY_VERIFICATION = 8;
 const L1_STATE_PORTABLE = 7;
 
-// L2: 25 points max
+// L2: 30 points max (increased from 25 to accommodate hardening)
 const L2_THREE_TIER_GATE = 10;
 const L2_BINARY_GATE = 3;
 const L2_ANOMALY_DETECTION = 5;
 const L2_ENCRYPTED_AUDIT = 4;
 const L2_TOOL_SANDBOXING = 2;
 const L2_CONTEXT_GATING = 4;
+const L2_PROCESS_HARDENING = 5;
 
 // L3: 20 points max
 // Note: Schnorr + range proofs ARE genuine zero-knowledge proofs.
@@ -224,6 +225,7 @@ function assessL2(
   let auditTrailExists = false;
   let toolSandboxing: "policy-enforced" | "basic" | "none" = "none";
   let contextGating = false;
+  let processIsolationHardening: "full" | "hardened" | "basic" | "none" = "none";
 
   if (sanctuaryActive) {
     approvalGate = "three-tier";
@@ -255,6 +257,11 @@ function assessL2(
     }
   }
 
+  // L2 hardening is optional and can be verified via tools at runtime
+  // This assessment assumes default "none"; actual hardening is measured
+  // by the l2_hardening_status and l2_verify_isolation tools
+  processIsolationHardening = "none";
+
   const status = approvalGate === "three-tier" && auditTrailEncrypted
     ? "active"
     : approvalGate !== "none" || auditTrailExists
@@ -269,6 +276,7 @@ function assessL2(
     audit_trail_exists: auditTrailExists,
     tool_sandboxing: sanctuaryActive ? "policy-enforced" : toolSandboxing,
     context_gating: contextGating,
+    process_isolation_hardening: processIsolationHardening,
     findings,
   };
 }
@@ -367,6 +375,9 @@ function scoreL2(l2: L2AuditResult): number {
   if (l2.tool_sandboxing === "policy-enforced") score += L2_TOOL_SANDBOXING;
   else if (l2.tool_sandboxing === "basic") score += 1;
   if (l2.context_gating) score += L2_CONTEXT_GATING;
+  // Software-based process hardening without TEE
+  if (l2.process_isolation_hardening === "hardened") score += L2_PROCESS_HARDENING;
+  else if (l2.process_isolation_hardening === "basic") score += 2;
   return score;
 }
 

@@ -12,6 +12,7 @@ import type { AuditLog } from "../l2-operational/audit-log.js";
 import { generateSHR, type SHRGeneratorOptions } from "./generator.js";
 import { verifySHR } from "./verifier.js";
 import type { SignedSHR } from "./types.js";
+import { transformSHRForGateway, transformSHRGeneric } from "./gateway-adapter.js";
 
 export function createSHRTools(
   config: SanctuaryConfig,
@@ -94,6 +95,69 @@ export function createSHRTools(
         );
 
         return toolResult(result);
+      },
+    },
+
+    {
+      name: "sanctuary/shr_gateway_export",
+      description:
+        "Export this instance's Sovereignty Health Report formatted for " +
+        "Ping Identity's Agent Gateway or other identity providers. " +
+        "Transforms the SHR into an authorization context with sovereignty scores, " +
+        "capability flags, and recommended access constraints.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          format: {
+            type: "string",
+            enum: ["ping", "generic"],
+            description:
+              "Output format: 'ping' (Ping Identity Gateway format) or 'generic' (format-agnostic). Default: 'ping'.",
+          },
+          identity_id: {
+            type: "string",
+            description:
+              "Identity to sign the SHR with. Defaults to primary identity.",
+          },
+          validity_minutes: {
+            type: "number",
+            description: "How long the SHR is valid (minutes). Default: 60.",
+          },
+        },
+      },
+      handler: async (args) => {
+        const format = (args.format as string) || "ping";
+        const validityMs = args.validity_minutes
+          ? (args.validity_minutes as number) * 60 * 1000
+          : undefined;
+
+        // Generate a fresh SHR
+        const shrResult = generateSHR(args.identity_id as string | undefined, {
+          ...generatorOpts,
+          validityMs,
+        });
+
+        if (typeof shrResult === "string") {
+          return toolResult({ error: shrResult });
+        }
+
+        // Transform for the requested format
+        let context;
+        if (format === "generic") {
+          context = transformSHRGeneric(shrResult);
+        } else {
+          context = transformSHRForGateway(shrResult);
+        }
+
+        auditLog.append(
+          "l2",
+          "shr_gateway_export",
+          shrResult.body.instance_id,
+          undefined,
+          "success"
+        );
+
+        return toolResult(context);
       },
     },
   ];

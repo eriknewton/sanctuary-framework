@@ -68,6 +68,7 @@ export interface L2AuditResult {
   audit_trail_exists: boolean;
   tool_sandboxing: "policy-enforced" | "basic" | "none";
   context_gating: boolean;
+  process_isolation_hardening?: "full" | "hardened" | "basic" | "none";
   findings: string[];
 }
 

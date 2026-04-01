@@ -43,6 +43,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "reputation_import",
     "reputation_export",
     "bootstrap_provide_guarantee",
+    "decommission_certificate",
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [
@@ -86,6 +87,8 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "context_gate_recommend",
     "context_gate_filter",
     "context_gate_list_policies",
+    "l2_hardening_status",
+    "l2_verify_isolation",
   ],
   approval_channel: DEFAULT_CHANNEL,
 };

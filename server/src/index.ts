@@ -29,6 +29,7 @@ import { createFederationTools } from "./federation/tools.js";
 import { createBridgeTools } from "./bridge/tools.js";
 import { createAuditTools } from "./audit/tools.js";
 import { createContextGateTools } from "./l2-operational/context-gate-tools.js";
+import { createL2HardeningTools } from "./l2-operational/hardening-tools.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
@@ -468,7 +469,7 @@ export async function createSanctuaryServer(options?: {
   );
 
   // 14. Create L4 tools (reputation with sovereignty-gated tiers)
-  const { tools: l4Tools } = createL4Tools(
+  const { tools: l4Tools, reputationStore } = createL4Tools(
     storage,
     masterKey,
     identityManager,
@@ -500,6 +501,9 @@ export async function createSanctuaryServer(options?: {
     masterKey,
     auditLog
   );
+
+  // 14f. Create L2 Process Hardening tools
+  const hardeningTools = createL2HardeningTools(config.storage_path, auditLog);
 
   // 15. Load Principal Policy and create approval gate
   const policy = await loadPrincipalPolicy(config.storage_path);
@@ -562,6 +566,7 @@ export async function createSanctuaryServer(options?: {
     ...bridgeTools,
     ...auditTools,
     ...contextGateTools,
+    ...hardeningTools,
     manifestTool,
   ];
 
