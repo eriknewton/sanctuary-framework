@@ -87,6 +87,11 @@ export function generateSHR(
   // Build the SHR body
   const body: SHRBody = {
     shr_version: "1.0",
+    implementation: {
+      sanctuary_version: config.version,
+      node_version: process.versions.node,
+      generated_by: "sanctuary-mcp-server",
+    },
     instance_id: identity.identity_id,
     generated_at: now.toISOString(),
     expires_at: expiresAt.toISOString(),

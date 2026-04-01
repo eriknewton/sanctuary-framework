@@ -15,6 +15,11 @@ import type { SignedSHR } from "../../src/shr/types.js";
 const mockSHR: SignedSHR = {
   body: {
     shr_version: "1.0",
+    implementation: {
+      sanctuary_version: "0.4.0",
+      node_version: "20.0.0",
+      generated_by: "sanctuary-mcp-server",
+    },
     instance_id: "peer-1",
     generated_at: new Date().toISOString(),
     expires_at: new Date(Date.now() + 3600000).toISOString(),

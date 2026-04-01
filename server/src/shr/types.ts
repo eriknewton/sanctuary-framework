@@ -73,6 +73,11 @@ export interface SHRCapabilities {
  */
 export interface SHRBody {
   shr_version: "1.0";
+  implementation: {
+    sanctuary_version: string;
+    node_version: string;
+    generated_by: string;  // "sanctuary-mcp-server"
+  };
   instance_id: string;
   generated_at: string;
   expires_at: string;
