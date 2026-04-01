@@ -51,7 +51,7 @@ Then run `sanctuary/sovereignty_audit` to see what Sanctuary adds on top of your
 
 ## Tools provided
 
-51 MCP tools across four sovereignty layers, sovereignty audit, context gating, federation, Concordia bridge, and system tools. See the skill documentation for the complete list.
+54 MCP tools across four sovereignty layers, sovereignty audit, context gating, L2 hardening, gateway export, federation, Concordia bridge, and system tools. See the skill documentation for the complete list.
 
 ## License
 

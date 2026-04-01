@@ -4,7 +4,7 @@ Use Sanctuary's sovereignty infrastructure with CrewAI agents.
 
 ## Overview
 
-CrewAI has native MCP support — no custom adapter required. Sanctuary's 51 MCP tools become CrewAI tools through the built-in `mcps` field or the `crewai-adapters` package.
+CrewAI has native MCP support — no custom adapter required. Sanctuary's 54 MCP tools become CrewAI tools through the built-in `mcps` field or the `crewai-adapters` package.
 
 What you get: encrypted state, cryptographic identity, selective disclosure, verifiable reputation, and context gating for any CrewAI agent — without changing your agent code.
 

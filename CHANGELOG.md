@@ -46,7 +46,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - `reputation_export` moved from Tier 3 to Tier 1.
 - Version dynamically read from package.json (resolves issue #6).
 - Validation added for `withhold-all` and `service-mediated` config values (resolves issue #4).
-- Tool surface increased from 46 to 56 tools.
+- Tool surface increased from 46 to 54 tools.
 
 ### Fixed
 
@@ -130,8 +130,8 @@ See `docs/MIGRATION_v0.3_to_v0.4.md` for detailed upgrade instructions.
 - Ed25519 identity management (key generation, recovery, rotation)
 - Encrypted state operations (AES-256-GCM)
 - Reputation system with tier-based verification (Unverified, Self-Attested, Verified-Degraded, Verified-Full)
-- MCP tool schema with 56 tools across all layers
-- Comprehensive test suite (482+ tests)
+- MCP tool schema with 54 tools across all layers
+- Comprehensive test suite (484 tests)
 - Apache-2.0 license for code, CC-BY-4.0 for spec
 
 ---

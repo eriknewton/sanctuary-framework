@@ -66,7 +66,7 @@ Refer to the host's documentation for gateway restart. The key is that the MCP c
 
 ### 3. Verify the tool surface
 
-After restarting, verify that all 56 tools are available:
+After restarting, verify that all 54 tools are available:
 
 ```bash
 # List all Sanctuary tools (requires MCP host running)
@@ -157,7 +157,7 @@ If you also run Concordia Protocol alongside Sanctuary, you can enable the bridg
 
 **Root cause:** The Sanctuary MCP server isn't registered. This tool has **not been removed** — it's a gateway registration issue (same as "only 4 tools" above).
 
-**Solution:** Follow the steps in "I can only see 4 Sanctuary tools" above. Once the gateway sees all 56 tools, `shr_generate` will work.
+**Solution:** Follow the steps in "I can only see 4 Sanctuary tools" above. Once the gateway sees all 54 tools, `shr_generate` will work.
 
 ### Issue: "Bridge authentication fails"
 
