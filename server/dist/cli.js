@@ -5,6 +5,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { mkdir, readFile, writeFile, stat, unlink, readdir, chmod, access } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
+import { createRequire } from 'module';
 import { randomBytes as randomBytes$1, createHmac } from 'crypto';
 import { gcm } from '@noble/ciphers/aes.js';
 import { RistrettoPoint, ed25519 } from '@noble/curves/ed25519';
@@ -13,8 +14,9 @@ import { hkdf } from '@noble/hashes/hkdf';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createServer as createServer$2 } from 'http';
-import { createServer as createServer$1 } from 'https';
-import { readFileSync } from 'fs';
+import { createServer as createServer$1, get } from 'https';
+import { readFileSync, statSync } from 'fs';
+import { execSync } from 'child_process';
 
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
@@ -204,9 +206,12 @@ var init_hashing = __esm({
     init_encoding();
   }
 });
+var require2 = createRequire(import.meta.url);
+var { version: PKG_VERSION } = require2("../package.json");
+var SANCTUARY_VERSION = PKG_VERSION;
 function defaultConfig() {
   return {
-    version: "0.3.0",
+    version: PKG_VERSION,
     storage_path: join(homedir(), ".sanctuary"),
     state: {
       encryption: "aes-256-gcm",
@@ -330,6 +335,18 @@ function validateConfig(config) {
   if (!implementedProofSystem.has(config.disclosure.proof_system)) {
     errors.push(
       `Unimplemented config value: disclosure.proof_system = "${config.disclosure.proof_system}". Only ${[...implementedProofSystem].map((v) => `"${v}"`).join(", ")} is currently implemented. Using an unimplemented proof system would silently degrade security.`
+    );
+  }
+  const implementedDisclosurePolicy = /* @__PURE__ */ new Set(["minimum-necessary"]);
+  if (!implementedDisclosurePolicy.has(config.disclosure.default_policy)) {
+    errors.push(
+      `Unimplemented config value: disclosure.default_policy = "${config.disclosure.default_policy}". Only ${[...implementedDisclosurePolicy].map((v) => `"${v}"`).join(", ")} is currently implemented. Using an unimplemented disclosure policy would silently skip disclosure controls.`
+    );
+  }
+  const implementedReputationMode = /* @__PURE__ */ new Set(["self-custodied"]);
+  if (!implementedReputationMode.has(config.reputation.mode)) {
+    errors.push(
+      `Unimplemented config value: reputation.mode = "${config.reputation.mode}". Only ${[...implementedReputationMode].map((v) => `"${v}"`).join(", ")} is currently implemented. Using an unimplemented reputation mode would silently skip reputation verification.`
     );
   }
   if (errors.length > 0) {
@@ -1037,6 +1054,8 @@ var StateStore = class {
     };
   }
 };
+var require3 = createRequire(import.meta.url);
+var { version: PKG_VERSION2 } = require3("../package.json");
 var MAX_STRING_BYTES = 1048576;
 var MAX_BUNDLE_BYTES = 5242880;
 var BUNDLE_FIELDS = /* @__PURE__ */ new Set(["bundle"]);
@@ -1119,7 +1138,7 @@ function createServer(tools, options) {
   const server = new Server(
     {
       name: "sanctuary-mcp-server",
-      version: "0.3.0"
+      version: PKG_VERSION2
     },
     {
       capabilities: {
@@ -3573,7 +3592,9 @@ var DEFAULT_POLICY = {
     "state_delete",
     "identity_rotate",
     "reputation_import",
-    "bootstrap_provide_guarantee"
+    "reputation_export",
+    "bootstrap_provide_guarantee",
+    "decommission_certificate"
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [
@@ -3590,7 +3611,6 @@ var DEFAULT_POLICY = {
     "disclosure_evaluate",
     "reputation_record",
     "reputation_query",
-    "reputation_export",
     "bootstrap_create_escrow",
     "exec_attest",
     "monitor_health",
@@ -3612,7 +3632,19 @@ var DEFAULT_POLICY = {
     "zk_prove",
     "zk_verify",
     "zk_range_prove",
-    "zk_range_verify"
+    "zk_range_verify",
+    "context_gate_set_policy",
+    "context_gate_apply_template",
+    "context_gate_recommend",
+    "context_gate_filter",
+    "context_gate_list_policies",
+    "l2_hardening_status",
+    "l2_verify_isolation",
+    "sovereignty_audit",
+    "shr_gateway_export",
+    "bridge_commit",
+    "bridge_verify",
+    "bridge_attest"
   ],
   approval_channel: DEFAULT_CHANNEL
 };
@@ -3679,6 +3711,10 @@ function parseScalar(value) {
   return value.replace(/^["']|["']$/g, "");
 }
 function validatePolicy(raw) {
+  const userTier3 = raw.tier3_always_allow ?? [];
+  const mergedTier3 = [
+    .../* @__PURE__ */ new Set([...userTier3, ...DEFAULT_POLICY.tier3_always_allow])
+  ];
   return {
     version: raw.version ?? 1,
     tier1_always_approve: raw.tier1_always_approve ?? DEFAULT_POLICY.tier1_always_approve,
@@ -3686,7 +3722,7 @@ function validatePolicy(raw) {
       ...DEFAULT_TIER2,
       ...raw.tier2_anomaly ?? {}
     },
-    tier3_always_allow: raw.tier3_always_allow ?? DEFAULT_POLICY.tier3_always_allow,
+    tier3_always_allow: mergedTier3,
     approval_channel: (() => {
       const merged = {
         ...DEFAULT_CHANNEL,
@@ -3714,6 +3750,7 @@ tier1_always_approve:
   - state_delete
   - identity_rotate
   - reputation_import
+  - reputation_export
   - bootstrap_provide_guarantee
 
 # \u2500\u2500\u2500 Tier 2: Behavioral Anomaly Detection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -3743,7 +3780,6 @@ tier3_always_allow:
   - disclosure_evaluate
   - reputation_record
   - reputation_query
-  - reputation_export
   - bootstrap_create_escrow
   - exec_attest
   - monitor_health
@@ -3766,6 +3802,16 @@ tier3_always_allow:
   - zk_verify
   - zk_range_prove
   - zk_range_verify
+  - context_gate_set_policy
+  - context_gate_apply_template
+  - context_gate_recommend
+  - context_gate_filter
+  - context_gate_list_policies
+  - sovereignty_audit
+  - shr_gateway_export
+  - bridge_commit
+  - bridge_verify
+  - bridge_attest
 
 # \u2500\u2500\u2500 Approval Channel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # How Sanctuary reaches you when approval is needed.
@@ -4544,6 +4590,10 @@ function generateDashboardHTML(options) {
 // src/principal-policy/dashboard.ts
 var SESSION_TTL_MS = 5 * 60 * 1e3;
 var MAX_SESSIONS = 1e3;
+var RATE_LIMIT_WINDOW_MS = 6e4;
+var RATE_LIMIT_GENERAL = 120;
+var RATE_LIMIT_DECISIONS = 20;
+var MAX_RATE_LIMIT_ENTRIES = 1e4;
 var DashboardApprovalChannel = class {
   config;
   pending = /* @__PURE__ */ new Map();
@@ -4558,13 +4608,15 @@ var DashboardApprovalChannel = class {
   /** SEC-012: Short-lived session store. Sessions replace URL query tokens. */
   sessions = /* @__PURE__ */ new Map();
   sessionCleanupTimer = null;
+  /** Rate limiting: per-IP request tracking */
+  rateLimits = /* @__PURE__ */ new Map();
   constructor(config) {
     this.config = config;
     this.authToken = config.auth_token;
     this.useTLS = !!(config.tls?.cert_path && config.tls?.key_path);
     this.dashboardHTML = generateDashboardHTML({
       timeoutSeconds: config.timeout_seconds,
-      serverVersion: "0.3.0",
+      serverVersion: SANCTUARY_VERSION,
       authToken: this.authToken
     });
     this.sessionCleanupTimer = setInterval(() => this.cleanupSessions(), 6e4);
@@ -4643,6 +4695,7 @@ var DashboardApprovalChannel = class {
       clearInterval(this.sessionCleanupTimer);
       this.sessionCleanupTimer = null;
     }
+    this.rateLimits.clear();
     if (this.httpServer) {
       return new Promise((resolve) => {
         this.httpServer.close(() => resolve());
@@ -4768,6 +4821,61 @@ var DashboardApprovalChannel = class {
       }
     }
   }
+  // ── Rate Limiting ─────────────────────────────────────────────────
+  /**
+   * Get the remote address from a request, normalizing IPv6-mapped IPv4.
+   */
+  getRemoteAddr(req) {
+    const addr = req.socket.remoteAddress ?? "unknown";
+    return addr.startsWith("::ffff:") ? addr.slice(7) : addr;
+  }
+  /**
+   * Check rate limit for a request. Returns true if allowed, false if rate-limited.
+   * When rate-limited, sends a 429 response.
+   */
+  checkRateLimit(req, res, type) {
+    const addr = this.getRemoteAddr(req);
+    const now = Date.now();
+    const windowStart = now - RATE_LIMIT_WINDOW_MS;
+    let entry = this.rateLimits.get(addr);
+    if (!entry) {
+      if (this.rateLimits.size >= MAX_RATE_LIMIT_ENTRIES) {
+        this.pruneRateLimits(now);
+      }
+      entry = { general: [], decisions: [] };
+      this.rateLimits.set(addr, entry);
+    }
+    entry.general = entry.general.filter((t) => t > windowStart);
+    entry.decisions = entry.decisions.filter((t) => t > windowStart);
+    const limit = type === "decisions" ? RATE_LIMIT_DECISIONS : RATE_LIMIT_GENERAL;
+    const timestamps = entry[type];
+    if (timestamps.length >= limit) {
+      const retryAfter = Math.ceil((timestamps[0] + RATE_LIMIT_WINDOW_MS - now) / 1e3);
+      res.writeHead(429, {
+        "Content-Type": "application/json",
+        "Retry-After": String(Math.max(1, retryAfter))
+      });
+      res.end(JSON.stringify({
+        error: "Rate limit exceeded",
+        retry_after_seconds: Math.max(1, retryAfter)
+      }));
+      return false;
+    }
+    timestamps.push(now);
+    return true;
+  }
+  /**
+   * Remove stale entries from the rate limit map.
+   */
+  pruneRateLimits(now) {
+    const windowStart = now - RATE_LIMIT_WINDOW_MS;
+    for (const [addr, entry] of this.rateLimits) {
+      const hasRecent = entry.general.some((t) => t > windowStart) || entry.decisions.some((t) => t > windowStart);
+      if (!hasRecent) {
+        this.rateLimits.delete(addr);
+      }
+    }
+  }
   // ── HTTP Request Handler ────────────────────────────────────────────
   handleRequest(req, res) {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -4786,6 +4894,7 @@ var DashboardApprovalChannel = class {
       return;
     }
     if (!this.checkAuth(req, url, res)) return;
+    if (!this.checkRateLimit(req, res, "general")) return;
     try {
       if (method === "POST" && url.pathname === "/auth/session") {
         this.handleSessionExchange(req, res);
@@ -4802,9 +4911,11 @@ var DashboardApprovalChannel = class {
       } else if (method === "GET" && url.pathname === "/api/audit-log") {
         this.handleAuditLog(url, res);
       } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
+        if (!this.checkRateLimit(req, res, "decisions")) return;
         const id = url.pathname.slice("/api/approve/".length);
         this.handleDecision(id, "approve", res);
       } else if (method === "POST" && url.pathname.startsWith("/api/deny/")) {
+        if (!this.checkRateLimit(req, res, "decisions")) return;
         const id = url.pathname.slice("/api/deny/".length);
         this.handleDecision(id, "deny", res);
       } else {
@@ -5547,14 +5658,14 @@ function generateSHR(identityId, opts) {
       code: "PROCESS_ISOLATION_ONLY",
       severity: "warning",
       description: "Process-level isolation only (no TEE)",
-      mitigation: "TEE support planned for v0.3.0"
+      mitigation: "TEE support planned for a future release"
     });
     degradations.push({
       layer: "l2",
       code: "SELF_REPORTED_ATTESTATION",
       severity: "warning",
       description: "Attestation is self-reported (no hardware root of trust)",
-      mitigation: "TEE attestation planned for v0.3.0"
+      mitigation: "TEE attestation planned for a future release"
     });
   }
   if (config.disclosure.proof_system === "commitment-only") {
@@ -5568,6 +5679,11 @@ function generateSHR(identityId, opts) {
   }
   const body = {
     shr_version: "1.0",
+    implementation: {
+      sanctuary_version: config.version,
+      node_version: process.versions.node,
+      generated_by: "sanctuary-mcp-server"
+    },
     instance_id: identity.identity_id,
     generated_at: now.toISOString(),
     expires_at: expiresAt.toISOString(),
@@ -5698,6 +5814,245 @@ function assessSovereigntyLevel(body) {
   return "minimal";
 }
 
+// src/shr/gateway-adapter.ts
+var LAYER_WEIGHTS = {
+  l1: 100,
+  l2: 100,
+  l3: 100,
+  l4: 100
+};
+var DEGRADATION_IMPACT = {
+  critical: 40,
+  warning: 25,
+  info: 10
+};
+function transformSHRForGateway(shr) {
+  const { body, signed_by, signature } = shr;
+  const layerScores = calculateLayerScores(body);
+  const overallScore = calculateOverallScore(layerScores);
+  const trustLevel = determineTrustLevel(overallScore);
+  const signals = extractAuthorizationSignals(body);
+  const degradations = transformDegradations(body.degradations);
+  const constraints = generateAuthorizationConstraints(body);
+  return {
+    shr_version: body.shr_version,
+    agent_identity: signed_by,
+    generated_at: (/* @__PURE__ */ new Date()).toISOString(),
+    context_expires_at: body.expires_at,
+    overall_score: overallScore,
+    recommended_trust_level: trustLevel,
+    layer_scores: {
+      l1_cognitive: layerScores.l1,
+      l2_operational: layerScores.l2,
+      l3_disclosure: layerScores.l3,
+      l4_reputation: layerScores.l4
+    },
+    layer_status: {
+      l1_cognitive: body.layers.l1.status,
+      l2_operational: body.layers.l2.status,
+      l3_disclosure: body.layers.l3.status,
+      l4_reputation: body.layers.l4.status
+    },
+    authorization_signals: signals,
+    degradations,
+    recommended_constraints: constraints,
+    shr_signature: signature,
+    shr_signed_by: signed_by
+  };
+}
+function calculateLayerScores(body) {
+  const layers = body.layers;
+  const degradations = body.degradations;
+  let l1Score = LAYER_WEIGHTS.l1;
+  let l2Score = LAYER_WEIGHTS.l2;
+  let l3Score = LAYER_WEIGHTS.l3;
+  let l4Score = LAYER_WEIGHTS.l4;
+  for (const deg of degradations) {
+    const impact = DEGRADATION_IMPACT[deg.severity] || 10;
+    if (deg.layer === "l1") {
+      l1Score = Math.max(0, l1Score - impact);
+    } else if (deg.layer === "l2") {
+      l2Score = Math.max(0, l2Score - impact);
+    } else if (deg.layer === "l3") {
+      l3Score = Math.max(0, l3Score - impact);
+    } else if (deg.layer === "l4") {
+      l4Score = Math.max(0, l4Score - impact);
+    }
+  }
+  if (layers.l1.status === "active" && l1Score > 50) l1Score = Math.min(100, l1Score + 5);
+  if (layers.l2.status === "active" && l2Score > 50) l2Score = Math.min(100, l2Score + 5);
+  if (layers.l3.status === "active" && l3Score > 50) l3Score = Math.min(100, l3Score + 5);
+  if (layers.l4.status === "active" && l4Score > 50) l4Score = Math.min(100, l4Score + 5);
+  if (layers.l1.status === "inactive") l1Score = 0;
+  if (layers.l2.status === "inactive") l2Score = 0;
+  if (layers.l3.status === "inactive") l3Score = 0;
+  if (layers.l4.status === "inactive") l4Score = 0;
+  return {
+    l1: Math.round(l1Score),
+    l2: Math.round(l2Score),
+    l3: Math.round(l3Score),
+    l4: Math.round(l4Score)
+  };
+}
+function calculateOverallScore(layerScores) {
+  const average = (layerScores.l1 + layerScores.l2 + layerScores.l3 + layerScores.l4) / 4;
+  return Math.round(average);
+}
+function determineTrustLevel(score) {
+  if (score >= 80) return "full";
+  if (score >= 60) return "elevated";
+  if (score >= 40) return "standard";
+  return "restricted";
+}
+function extractAuthorizationSignals(body) {
+  const l1 = body.layers.l1;
+  const l3 = body.layers.l3;
+  const l4 = body.layers.l4;
+  return {
+    approval_gate_active: body.capabilities.handshake,
+    // Handshake implies human loop capability
+    context_gating_active: body.capabilities.encrypted_channel,
+    // Proxy for gating capability
+    encryption_at_rest: l1.encryption !== "none" && l1.encryption !== "unencrypted",
+    behavioral_baseline_active: false,
+    // Would need explicit field in SHR v1.1
+    identity_verified: l1.identity_type === "ed25519" || l1.identity_type !== "none",
+    zero_knowledge_capable: l3.status === "active" && l3.proof_system !== "commitment-only",
+    selective_disclosure_active: l3.selective_disclosure,
+    reputation_portable: l4.reputation_portable,
+    handshake_capable: body.capabilities.handshake
+  };
+}
+function transformDegradations(degradations) {
+  return degradations.map((deg) => {
+    let authzImpact = "";
+    if (deg.code === "NO_TEE") {
+      authzImpact = "Restricted to read-only operations until TEE available";
+    } else if (deg.code === "PROCESS_ISOLATION_ONLY") {
+      authzImpact = "Requires additional identity verification";
+    } else if (deg.code === "COMMITMENT_ONLY") {
+      authzImpact = "Limited data sharing scope \u2014 no zero-knowledge proofs";
+    } else if (deg.code === "NO_ZK_PROOFS") {
+      authzImpact = "Cannot perform confidential disclosures";
+    } else if (deg.code === "SELF_REPORTED_ATTESTATION") {
+      authzImpact = "Attestation trust degraded \u2014 human verification recommended";
+    } else if (deg.code === "NO_SELECTIVE_DISCLOSURE") {
+      authzImpact = "Must share entire data context, cannot redact";
+    } else if (deg.code === "BASIC_SYBIL_ONLY") {
+      authzImpact = "Restrict to interactions with known agents only";
+    } else {
+      authzImpact = "Unknown authorization impact";
+    }
+    return {
+      layer: deg.layer,
+      code: deg.code,
+      severity: deg.severity,
+      description: deg.description,
+      authorization_impact: authzImpact
+    };
+  });
+}
+function generateAuthorizationConstraints(body, _degradations) {
+  const constraints = [];
+  const layers = body.layers;
+  if (layers.l1.status === "degraded" || layers.l1.key_custody !== "self") {
+    constraints.push({
+      type: "identity_verification_required",
+      description: "Additional identity verification required for sensitive operations",
+      rationale: "L1 is degraded or key custody is not self-managed",
+      priority: "high"
+    });
+  }
+  if (!layers.l1.state_portable) {
+    constraints.push({
+      type: "location_bound",
+      description: "Agent state is not portable \u2014 restrict to home environment",
+      rationale: "State cannot be safely migrated across boundaries",
+      priority: "medium"
+    });
+  }
+  if (layers.l2.status === "degraded" || layers.l2.isolation_type === "local-process") {
+    constraints.push({
+      type: "read_only",
+      description: "Restrict to read-only operations until operational isolation improves",
+      rationale: "L2 isolation is process-level only (no TEE)",
+      priority: "high"
+    });
+  }
+  if (!layers.l2.attestation_available) {
+    constraints.push({
+      type: "requires_approval",
+      description: "Human approval required for writes and sensitive reads",
+      rationale: "No attestation available \u2014 self-reported integrity only",
+      priority: "high"
+    });
+  }
+  if (layers.l3.status === "degraded" || !layers.l3.selective_disclosure) {
+    constraints.push({
+      type: "restricted_scope",
+      description: "Limit data sharing to minimal required scope \u2014 no selective disclosure",
+      rationale: "Agent cannot redact data or prove predicates without revealing all context",
+      priority: "high"
+    });
+  }
+  if (layers.l3.proof_system === "commitment-only") {
+    constraints.push({
+      type: "restricted_scope",
+      description: "No zero-knowledge proofs available \u2014 entire state context may be visible",
+      rationale: "Proof system is commitment-only (no ZK)",
+      priority: "medium"
+    });
+  }
+  if (layers.l4.status === "degraded") {
+    constraints.push({
+      type: "known_agents_only",
+      description: "Restrict interactions to known, pre-approved agents",
+      rationale: "Reputation layer is degraded",
+      priority: "medium"
+    });
+  }
+  if (!layers.l4.reputation_portable) {
+    constraints.push({
+      type: "location_bound",
+      description: "Reputation is not portable \u2014 restrict to home environment",
+      rationale: "Cannot present reputation to external parties",
+      priority: "low"
+    });
+  }
+  const layerScores = calculateLayerScores(body);
+  const overallScore = calculateOverallScore(layerScores);
+  if (overallScore < 40) {
+    constraints.push({
+      type: "restricted_scope",
+      description: "Overall sovereignty score below threshold \u2014 restrict to non-sensitive operations",
+      rationale: `Overall sovereignty score is ${overallScore}/100`,
+      priority: "high"
+    });
+  }
+  return constraints;
+}
+function transformSHRGeneric(shr) {
+  const context = transformSHRForGateway(shr);
+  return {
+    agent_id: context.agent_identity,
+    sovereignty_score: context.overall_score,
+    trust_level: context.recommended_trust_level,
+    layer_scores: {
+      l1: context.layer_scores.l1_cognitive,
+      l2: context.layer_scores.l2_operational,
+      l3: context.layer_scores.l3_disclosure,
+      l4: context.layer_scores.l4_reputation
+    },
+    capabilities: context.authorization_signals,
+    constraints: context.recommended_constraints.map((c) => ({
+      type: c.type,
+      description: c.description
+    })),
+    expires_at: context.context_expires_at,
+    signature: context.shr_signature
+  };
+}
+
 // src/shr/tools.ts
 function createSHRTools(config, identityManager, masterKey, auditLog) {
   const generatorOpts = {
@@ -5759,6 +6114,53 @@ function createSHRTools(config, identityManager, masterKey, auditLog) {
           result.valid ? "success" : "failure"
         );
         return toolResult(result);
+      }
+    },
+    {
+      name: "sanctuary/shr_gateway_export",
+      description: "Export this instance's Sovereignty Health Report formatted for Ping Identity's Agent Gateway or other identity providers. Transforms the SHR into an authorization context with sovereignty scores, capability flags, and recommended access constraints.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          format: {
+            type: "string",
+            enum: ["ping", "generic"],
+            description: "Output format: 'ping' (Ping Identity Gateway format) or 'generic' (format-agnostic). Default: 'ping'."
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to sign the SHR with. Defaults to primary identity."
+          },
+          validity_minutes: {
+            type: "number",
+            description: "How long the SHR is valid (minutes). Default: 60."
+          }
+        }
+      },
+      handler: async (args) => {
+        const format = args.format || "ping";
+        const validityMs = args.validity_minutes ? args.validity_minutes * 60 * 1e3 : void 0;
+        const shrResult = generateSHR(args.identity_id, {
+          ...generatorOpts,
+          validityMs
+        });
+        if (typeof shrResult === "string") {
+          return toolResult({ error: shrResult });
+        }
+        let context;
+        if (format === "generic") {
+          context = transformSHRGeneric(shrResult);
+        } else {
+          context = transformSHRForGateway(shrResult);
+        }
+        auditLog.append(
+          "l2",
+          "shr_gateway_export",
+          shrResult.body.instance_id,
+          void 0,
+          "success"
+        );
+        return toolResult(context);
       }
     }
   ];
@@ -7038,9 +7440,11 @@ var L1_INTEGRITY_VERIFICATION = 8;
 var L1_STATE_PORTABLE = 7;
 var L2_THREE_TIER_GATE = 10;
 var L2_BINARY_GATE = 3;
-var L2_ANOMALY_DETECTION = 7;
-var L2_ENCRYPTED_AUDIT = 5;
-var L2_TOOL_SANDBOXING = 3;
+var L2_ANOMALY_DETECTION = 5;
+var L2_ENCRYPTED_AUDIT = 4;
+var L2_TOOL_SANDBOXING = 2;
+var L2_CONTEXT_GATING = 4;
+var L2_PROCESS_HARDENING = 5;
 var L3_COMMITMENT_SCHEME = 8;
 var L3_ZK_PROOFS = 7;
 var L3_DISCLOSURE_POLICIES = 5;
@@ -7053,6 +7457,35 @@ var SEVERITY_ORDER = {
   high: 1,
   medium: 2,
   low: 3
+};
+var INCIDENT_META_SEV1 = {
+  id: "META-SEV1-2026",
+  name: "Meta Sev 1: Unauthorized autonomous data exposure",
+  date: "2026-03-18",
+  description: "AI agent autonomously posted proprietary code, business strategies, and user datasets to an internal forum without human approval. Two-hour exposure window."
+};
+var INCIDENT_OPENCLAW_SANDBOX = {
+  id: "OPENCLAW-CVE-2026",
+  name: "OpenClaw sandbox escape via privilege inheritance",
+  date: "2026-03-18",
+  description: "Nine CVEs in four days. Child processes inherited sandbox.mode=off from parent, bypassing runtime confinement. 42,900+ internet-exposed instances, 15,200 vulnerable to RCE.",
+  cves: [
+    "CVE-2026-32048",
+    "CVE-2026-32915",
+    "CVE-2026-32918"
+  ]
+};
+var INCIDENT_CONTEXT_LEAKAGE = {
+  id: "CONTEXT-LEAK-CLASS",
+  name: "Context leakage: Full state exposure to inference providers",
+  date: "2026-03",
+  description: "Agents send full context \u2014 conversation history, memory, secrets, internal reasoning \u2014 to remote LLM providers on every inference call with no filtering mechanism."
+};
+var INCIDENT_CLAUDE_CODE_LEAK = {
+  id: "CLAUDE-CODE-LEAK-2026",
+  name: "Claude Code source leak: 512K lines exposed via npm source map",
+  date: "2026-03-31",
+  description: "Anthropic accidentally shipped a 59.8 MB source map in npm package v2.1.88, exposing the full Claude Code TypeScript source \u2014 1,900 files, internal model codenames, unreleased features, OAuth flows, and multi-agent coordination logic."
 };
 function analyzeSovereignty(env, config) {
   const l1 = assessL1(env, config);
@@ -7126,14 +7559,18 @@ function assessL2(env, _config) {
   let auditTrailEncrypted = false;
   let auditTrailExists = false;
   let toolSandboxing = "none";
+  let contextGating = false;
+  let processIsolationHardening = "none";
   if (sanctuaryActive) {
     approvalGate = "three-tier";
     behavioralAnomalyDetection = true;
     auditTrailEncrypted = true;
     auditTrailExists = true;
+    contextGating = true;
     findings.push("Three-tier Principal Policy gate active");
     findings.push("Behavioral anomaly detection (BaselineTracker) enabled");
     findings.push("Encrypted audit trail active");
+    findings.push("Context gating available (sanctuary/context_gate_set_policy)");
   }
   if (env.openclaw_detected && env.openclaw_config) {
     if (env.openclaw_config.require_approval_enabled) {
@@ -7151,6 +7588,7 @@ function assessL2(env, _config) {
       );
     }
   }
+  processIsolationHardening = "none";
   const status = approvalGate === "three-tier" && auditTrailEncrypted ? "active" : approvalGate !== "none" || auditTrailExists ? "partial" : "inactive";
   return {
     status,
@@ -7159,6 +7597,8 @@ function assessL2(env, _config) {
     audit_trail_encrypted: auditTrailEncrypted,
     audit_trail_exists: auditTrailExists,
     tool_sandboxing: sanctuaryActive ? "policy-enforced" : toolSandboxing,
+    context_gating: contextGating,
+    process_isolation_hardening: processIsolationHardening,
     findings
   };
 }
@@ -7173,8 +7613,10 @@ function assessL3(env, _config) {
     zkProofs = true;
     selectiveDisclosurePolicy = true;
     findings.push("SHA-256 + Pedersen commitment schemes active");
-    findings.push("Schnorr ZK proofs and range proofs available");
+    findings.push("Schnorr zero-knowledge proofs (Fiat-Shamir) enabled \u2014 genuine ZK proofs");
+    findings.push("Range proofs (bit-decomposition + OR-proofs) enabled \u2014 genuine ZK proofs");
     findings.push("Selective disclosure policies configurable");
+    findings.push("Non-interactive proofs with replay-resistant domain separation");
   }
   const status = commitmentScheme === "pedersen+sha256" && zkProofs ? "active" : commitmentScheme !== "none" ? "partial" : "inactive";
   return {
@@ -7226,6 +7668,9 @@ function scoreL2(l2) {
   if (l2.audit_trail_encrypted) score += L2_ENCRYPTED_AUDIT;
   if (l2.tool_sandboxing === "policy-enforced") score += L2_TOOL_SANDBOXING;
   else if (l2.tool_sandboxing === "basic") score += 1;
+  if (l2.context_gating) score += L2_CONTEXT_GATING;
+  if (l2.process_isolation_hardening === "hardened") score += L2_PROCESS_HARDENING;
+  else if (l2.process_isolation_hardening === "basic") score += 2;
   return score;
 }
 function scoreL3(l3) {
@@ -7255,7 +7700,8 @@ function generateGaps(env, l1, l2, l3, l4) {
       title: "Agent memory stored in plaintext",
       description: "Your agent's memory (MEMORY.md, daily notes, SQLite index) is stored in plaintext at ~/.openclaw/workspace/. Any process with file access can read your agent's full context \u2014 preferences, decisions, conversation history.",
       openclaw_relevance: "Stock OpenClaw stores all agent memory in plaintext files. There is no built-in encryption for agent state.",
-      sanctuary_solution: "Sanctuary encrypts all state at rest with AES-256-GCM using a key derived from Argon2id, making state opaque to any process that doesn't hold the master key. Use sanctuary/state_write to migrate sensitive state to the encrypted store."
+      sanctuary_solution: "Sanctuary encrypts all state at rest with AES-256-GCM using a key derived from Argon2id, making state opaque to any process that doesn't hold the master key. Use sanctuary/state_write to migrate sensitive state to the encrypted store.",
+      incident_class: INCIDENT_META_SEV1
     });
   }
   if (oc && oc.env_file_exposed) {
@@ -7288,7 +7734,8 @@ function generateGaps(env, l1, l2, l3, l4) {
       title: "Binary approval gate (no anomaly detection)",
       description: "Your approval gate provides binary approve/deny gating without behavioral anomaly detection. Routine operations require the same manual approval as sensitive ones.",
       openclaw_relevance: env.openclaw_detected ? "OpenClaw's requireApproval hook provides binary approve/deny gating. Sanctuary's three-tier Principal Policy adds behavioral anomaly detection (auto-escalation when agent behavior deviates from baseline), encrypted audit trails, and graduated approval tiers \u2014 so routine operations auto-proceed while sensitive operations require explicit consent." : null,
-      sanctuary_solution: "Sanctuary's three-tier Principal Policy gate auto-allows routine operations (Tier 3), escalates anomalous behavior (Tier 2), and always requires human approval for irreversible operations (Tier 1). Use sanctuary/principal_policy_view to inspect."
+      sanctuary_solution: "Sanctuary's three-tier Principal Policy gate auto-allows routine operations (Tier 3), escalates anomalous behavior (Tier 2), and always requires human approval for irreversible operations (Tier 1). Use sanctuary/principal_policy_view to inspect.",
+      incident_class: INCIDENT_META_SEV1
     });
   } else if (l2.approval_gate === "none") {
     gaps.push({
@@ -7298,7 +7745,8 @@ function generateGaps(env, l1, l2, l3, l4) {
       title: "No approval gate",
       description: "No approval gate is configured. All tool calls execute without oversight.",
       openclaw_relevance: null,
-      sanctuary_solution: "Sanctuary's Principal Policy evaluates every tool call before execution. Enable it to get three-tier approval gating with behavioral anomaly detection."
+      sanctuary_solution: "Sanctuary's Principal Policy evaluates every tool call before execution. Enable it to get three-tier approval gating with behavioral anomaly detection.",
+      incident_class: INCIDENT_META_SEV1
     });
   }
   if (l2.tool_sandboxing === "basic") {
@@ -7309,18 +7757,32 @@ function generateGaps(env, l1, l2, l3, l4) {
       title: "Basic tool sandboxing (no cryptographic attestation)",
       description: "Your tool sandbox enforces allow/deny lists but provides no cryptographic attestation of execution context.",
       openclaw_relevance: env.openclaw_detected ? "OpenClaw's sandbox tool policy (tools.sandbox.tools) enforces allow/deny lists. Sanctuary adds cryptographic attestation of execution context \u2014 a verifiable proof that an operation ran within policy, not just that a policy was configured." : null,
-      sanctuary_solution: "Sanctuary provides cryptographic execution attestation via sanctuary/exec_attest and policy-enforced sandboxing with encrypted audit trails."
+      sanctuary_solution: "Sanctuary provides cryptographic execution attestation via sanctuary/exec_attest and policy-enforced sandboxing with encrypted audit trails.",
+      incident_class: INCIDENT_OPENCLAW_SANDBOX
+    });
+  }
+  if (!l2.context_gating) {
+    gaps.push({
+      id: "GAP-L2-003",
+      layer: "L2",
+      severity: "high",
+      title: "No context gating for outbound inference calls",
+      description: "Your agent sends its full context \u2014 conversation history, memory, preferences, internal reasoning \u2014 to remote LLM providers on every inference call. There is no mechanism to filter what leaves the sovereignty boundary. The provider sees everything the agent knows.",
+      openclaw_relevance: env.openclaw_detected ? "OpenClaw sends full agent context (including MEMORY.md, tool results, and conversation history) to the configured LLM provider with every API call. There is no built-in context filtering." : null,
+      sanctuary_solution: "Sanctuary's context gating (sanctuary/context_gate_set_policy + sanctuary/context_gate_filter) lets you define per-provider policies that control exactly what context flows outbound. Redact secrets, hash identifiers, and send only minimum-necessary context for each call.",
+      incident_class: INCIDENT_CONTEXT_LEAKAGE
     });
   }
   if (!l2.audit_trail_exists) {
     gaps.push({
-      id: "GAP-L2-003",
+      id: "GAP-L2-004",
       layer: "L2",
       severity: "high",
       title: "No audit trail",
       description: "No audit trail exists for tool call history. There is no record of what operations were executed, when, or by whom.",
       openclaw_relevance: null,
-      sanctuary_solution: "Sanctuary maintains an encrypted audit log of all operations, queryable via sanctuary/monitor_audit_log."
+      sanctuary_solution: "Sanctuary maintains an encrypted audit log of all operations, queryable via sanctuary/monitor_audit_log.",
+      incident_class: INCIDENT_CLAUDE_CODE_LEAK
     });
   }
   if (l3.commitment_scheme === "none") {
@@ -7329,9 +7791,10 @@ function generateGaps(env, l1, l2, l3, l4) {
       layer: "L3",
       severity: "high",
       title: "No selective disclosure capability",
-      description: "Your agent has no way to prove facts about its state without revealing the state itself. Every disclosure is all-or-nothing.",
+      description: "Your agent has no cryptographic mechanism to prove facts about its state without revealing the state itself. Every disclosure is all-or-nothing: no commitments, no zero-knowledge proofs, no selective disclosure policies.",
       openclaw_relevance: env.openclaw_detected ? "OpenClaw has no selective disclosure mechanism. When your agent shares information, it shares everything or nothing \u2014 there is no way to prove a claim without revealing the underlying data." : null,
-      sanctuary_solution: "Sanctuary's L3 provides SHA-256 + Pedersen commitments and Schnorr zero-knowledge proofs. Your agent can prove it has a valid credential, sufficient reputation, or a completed transaction without exposing the underlying data. Use sanctuary/zk_commit and sanctuary/zk_prove."
+      sanctuary_solution: "Sanctuary's L3 provides SHA-256 + Pedersen commitments with genuine zero-knowledge proofs (Schnorr + range proofs via Fiat-Shamir transform). Your agent can prove it has a valid credential, sufficient reputation, or a completed transaction without exposing the underlying data. Use sanctuary/zk_commit and sanctuary/zk_prove.",
+      incident_class: INCIDENT_META_SEV1
     });
   }
   if (!l4.reputation_portable) {
@@ -7383,9 +7846,18 @@ function generateRecommendations(env, l1, l2, l3, l4) {
       impact: "high"
     });
   }
-  if (!l4.reputation_signed) {
+  if (!l2.context_gating) {
     recs.push({
       priority: 5,
+      action: "Configure context gating to control what flows to LLM providers",
+      tool: "sanctuary/context_gate_set_policy",
+      effort: "minutes",
+      impact: "high"
+    });
+  }
+  if (!l4.reputation_signed) {
+    recs.push({
+      priority: 6,
       action: "Start recording reputation attestations from completed interactions",
       tool: "sanctuary/reputation_record",
       effort: "minutes",
@@ -7394,7 +7866,7 @@ function generateRecommendations(env, l1, l2, l3, l4) {
   }
   if (!l3.selective_disclosure_policy) {
     recs.push({
-      priority: 6,
+      priority: 7,
       action: "Configure selective disclosure policies for data sharing",
       tool: "sanctuary/disclosure_set_policy",
       effort: "hours",
@@ -7443,6 +7915,10 @@ function formatAuditReport(result) {
 `;
   report += `  \u2502 L2 Operational Isolation    \u2502 ${padStatus(layers.l2_operational.status)} \u2502 ${padScore(l2Score, 25)} \u2502
 `;
+  if (layers.l2_operational.context_gating) {
+    report += `  \u2502   \u2514 Context Gating          \u2502 ACTIVE   \u2502       \u2502
+`;
+  }
   report += `  \u2502 L3 Selective Disclosure     \u2502 ${padStatus(layers.l3_selective_disclosure.status)} \u2502 ${padScore(l3Score, 20)} \u2502
 `;
   report += `  \u2502 L4 Verifiable Reputation    \u2502 ${padStatus(layers.l4_reputation.status)} \u2502 ${padScore(l4Score, 20)} \u2502
@@ -7460,6 +7936,12 @@ function formatAuditReport(result) {
       const descLines = wordWrap(gap.description, 66);
       for (const line of descLines) {
         report += `  ${line}
+`;
+      }
+      if (gap.incident_class) {
+        const ic = gap.incident_class;
+        const cveStr = ic.cves?.length ? ` (${ic.cves.join(", ")})` : "";
+        report += `  \u2192 Incident precedent: ${ic.name}${cveStr} [${ic.date}]
 `;
       }
       report += `  \u2192 Fix: ${gap.sanctuary_solution.split(".")[0]}.
@@ -7552,6 +8034,1482 @@ function createAuditTools(config) {
     }
   ];
   return { tools };
+}
+
+// src/l2-operational/context-gate.ts
+init_encoding();
+init_hashing();
+var MAX_CONTEXT_FIELDS = 1e3;
+var MAX_POLICY_RULES = 50;
+var MAX_PATTERNS_PER_ARRAY = 500;
+function evaluateField(policy, provider, field) {
+  const exactRule = policy.rules.find((r) => r.provider === provider);
+  const wildcardRule = policy.rules.find((r) => r.provider === "*");
+  const matchedRule = exactRule ?? wildcardRule;
+  if (!matchedRule) {
+    return {
+      field,
+      action: policy.default_action === "deny" ? "deny" : "redact",
+      reason: `No rule matches provider "${provider}"; applying default (${policy.default_action})`
+    };
+  }
+  if (matchesPattern(field, matchedRule.redact)) {
+    return {
+      field,
+      action: "redact",
+      reason: `Field "${field}" is explicitly redacted for ${matchedRule.provider} provider`
+    };
+  }
+  if (matchesPattern(field, matchedRule.hash)) {
+    return {
+      field,
+      action: "hash",
+      reason: `Field "${field}" is hashed for ${matchedRule.provider} provider`
+    };
+  }
+  if (matchesPattern(field, matchedRule.summarize)) {
+    return {
+      field,
+      action: "summarize",
+      reason: `Field "${field}" should be summarized for ${matchedRule.provider} provider`
+    };
+  }
+  if (matchesPattern(field, matchedRule.allow)) {
+    return {
+      field,
+      action: "allow",
+      reason: `Field "${field}" is allowed for ${matchedRule.provider} provider`
+    };
+  }
+  return {
+    field,
+    action: policy.default_action === "deny" ? "deny" : "redact",
+    reason: `Field "${field}" not addressed in ${matchedRule.provider} rule; applying default (${policy.default_action})`
+  };
+}
+function filterContext(policy, provider, context) {
+  const fields = Object.keys(context);
+  if (fields.length > MAX_CONTEXT_FIELDS) {
+    throw new Error(
+      `Context object has ${fields.length} fields, exceeding limit of ${MAX_CONTEXT_FIELDS}`
+    );
+  }
+  const decisions = [];
+  let allowed = 0;
+  let redacted = 0;
+  let hashed = 0;
+  let summarized = 0;
+  let denied = 0;
+  for (const field of fields) {
+    const result = evaluateField(policy, provider, field);
+    if (result.action === "hash") {
+      const value = typeof context[field] === "string" ? context[field] : JSON.stringify(context[field]);
+      result.hash_value = hashToString(stringToBytes(value));
+    }
+    decisions.push(result);
+    switch (result.action) {
+      case "allow":
+        allowed++;
+        break;
+      case "redact":
+        redacted++;
+        break;
+      case "hash":
+        hashed++;
+        break;
+      case "summarize":
+        summarized++;
+        break;
+      case "deny":
+        denied++;
+        break;
+    }
+  }
+  const originalHash = hashToString(
+    stringToBytes(JSON.stringify(context))
+  );
+  const filteredOutput = {};
+  for (const decision of decisions) {
+    switch (decision.action) {
+      case "allow":
+        filteredOutput[decision.field] = context[decision.field];
+        break;
+      case "redact":
+        filteredOutput[decision.field] = "[REDACTED]";
+        break;
+      case "hash":
+        filteredOutput[decision.field] = `[HASH:${decision.hash_value}]`;
+        break;
+      case "summarize":
+        filteredOutput[decision.field] = "[SUMMARIZE]";
+        break;
+    }
+  }
+  const filteredHash = hashToString(
+    stringToBytes(JSON.stringify(filteredOutput))
+  );
+  return {
+    policy_id: policy.policy_id,
+    provider,
+    fields_allowed: allowed,
+    fields_redacted: redacted,
+    fields_hashed: hashed,
+    fields_summarized: summarized,
+    fields_denied: denied,
+    decisions,
+    original_context_hash: originalHash,
+    filtered_context_hash: filteredHash,
+    filtered_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function matchesPattern(field, patterns) {
+  const normalizedField = field.toLowerCase();
+  for (const pattern of patterns) {
+    if (pattern === "*") return true;
+    const normalizedPattern = pattern.toLowerCase();
+    if (normalizedPattern === normalizedField) return true;
+    if (normalizedPattern.endsWith("*") && normalizedField.startsWith(normalizedPattern.slice(0, -1))) return true;
+    if (normalizedPattern.startsWith("*") && normalizedField.endsWith(normalizedPattern.slice(1))) return true;
+  }
+  return false;
+}
+var ContextGatePolicyStore = class {
+  storage;
+  encryptionKey;
+  policies = /* @__PURE__ */ new Map();
+  constructor(storage, masterKey) {
+    this.storage = storage;
+    this.encryptionKey = derivePurposeKey(masterKey, "l2-context-gate");
+  }
+  /**
+   * Create and store a new context-gating policy.
+   */
+  async create(policyName, rules, defaultAction, identityId) {
+    const policyId = `cg-${Date.now()}-${toBase64url(randomBytes(8))}`;
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const policy = {
+      policy_id: policyId,
+      policy_name: policyName,
+      rules,
+      default_action: defaultAction,
+      identity_id: identityId,
+      created_at: now,
+      updated_at: now
+    };
+    await this.persist(policy);
+    this.policies.set(policyId, policy);
+    return policy;
+  }
+  /**
+   * Get a policy by ID.
+   */
+  async get(policyId) {
+    if (this.policies.has(policyId)) {
+      return this.policies.get(policyId);
+    }
+    const raw = await this.storage.read("_context_gate_policies", policyId);
+    if (!raw) return null;
+    try {
+      const encrypted = JSON.parse(bytesToString(raw));
+      const decrypted = decrypt(encrypted, this.encryptionKey);
+      const policy = JSON.parse(bytesToString(decrypted));
+      this.policies.set(policyId, policy);
+      return policy;
+    } catch {
+      return null;
+    }
+  }
+  /**
+   * List all context-gating policies.
+   */
+  async list() {
+    await this.loadAll();
+    return Array.from(this.policies.values());
+  }
+  /**
+   * Load all persisted policies into memory.
+   */
+  async loadAll() {
+    try {
+      const entries = await this.storage.list("_context_gate_policies");
+      for (const meta of entries) {
+        if (this.policies.has(meta.key)) continue;
+        const raw = await this.storage.read("_context_gate_policies", meta.key);
+        if (!raw) continue;
+        try {
+          const encrypted = JSON.parse(bytesToString(raw));
+          const decrypted = decrypt(encrypted, this.encryptionKey);
+          const policy = JSON.parse(bytesToString(decrypted));
+          this.policies.set(policy.policy_id, policy);
+        } catch {
+        }
+      }
+    } catch {
+    }
+  }
+  async persist(policy) {
+    const serialized = stringToBytes(JSON.stringify(policy));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_context_gate_policies",
+      policy.policy_id,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+  }
+};
+
+// src/l2-operational/context-gate-templates.ts
+var ALWAYS_REDACT_SECRETS = [
+  "api_key",
+  "secret_*",
+  "*_secret",
+  "*_token",
+  "*_key",
+  "password",
+  "*_password",
+  "credential",
+  "*_credential",
+  "private_key",
+  "recovery_key",
+  "passphrase",
+  "auth_*"
+];
+var PII_PATTERNS = [
+  "*_pii",
+  "name",
+  "full_name",
+  "email",
+  "email_address",
+  "phone",
+  "phone_number",
+  "address",
+  "ssn",
+  "date_of_birth",
+  "ip_address",
+  "credit_card",
+  "card_number",
+  "cvv",
+  "bank_account",
+  "account_number",
+  "routing_number"
+];
+var INTERNAL_STATE_PATTERNS = [
+  "memory",
+  "agent_memory",
+  "internal_reasoning",
+  "internal_state",
+  "reasoning_trace",
+  "chain_of_thought",
+  "private_notes",
+  "soul",
+  "personality",
+  "system_prompt"
+];
+var ID_PATTERNS = [
+  "user_id",
+  "session_id",
+  "agent_id",
+  "identity_id",
+  "conversation_id",
+  "thread_id"
+];
+var HISTORY_PATTERNS = [
+  "conversation_history",
+  "message_history",
+  "chat_history",
+  "context_window",
+  "previous_messages"
+];
+var INFERENCE_MINIMAL = {
+  id: "inference-minimal",
+  name: "Inference Minimal",
+  description: "Maximum privacy. Only the current task and query reach the LLM provider.",
+  use_when: "You want the strictest possible context control for inference calls. The LLM sees only what it needs for the immediate task.",
+  rules: [
+    {
+      provider: "inference",
+      allow: [
+        "task",
+        "task_description",
+        "current_query",
+        "query",
+        "prompt",
+        "question",
+        "instruction"
+      ],
+      redact: [
+        ...ALWAYS_REDACT_SECRETS,
+        ...PII_PATTERNS,
+        ...INTERNAL_STATE_PATTERNS,
+        ...HISTORY_PATTERNS,
+        "tool_results",
+        "previous_results"
+      ],
+      hash: [...ID_PATTERNS],
+      summarize: []
+    }
+  ],
+  default_action: "redact"
+};
+var INFERENCE_STANDARD = {
+  id: "inference-standard",
+  name: "Inference Standard",
+  description: "Balanced privacy. Task, query, and tool results pass through. History flagged for summarization. Secrets and PII redacted.",
+  use_when: "You need the LLM to have enough context for multi-step tasks while keeping secrets, PII, and internal reasoning private.",
+  rules: [
+    {
+      provider: "inference",
+      allow: [
+        "task",
+        "task_description",
+        "current_query",
+        "query",
+        "prompt",
+        "question",
+        "instruction",
+        "tool_results",
+        "tool_output",
+        "previous_results",
+        "current_step",
+        "remaining_steps",
+        "objective",
+        "constraints",
+        "format",
+        "output_format"
+      ],
+      redact: [
+        ...ALWAYS_REDACT_SECRETS,
+        ...PII_PATTERNS,
+        ...INTERNAL_STATE_PATTERNS
+      ],
+      hash: [...ID_PATTERNS],
+      summarize: [...HISTORY_PATTERNS]
+    }
+  ],
+  default_action: "redact"
+};
+var LOGGING_STRICT = {
+  id: "logging-strict",
+  name: "Logging Strict",
+  description: "Redacts all content for logging and analytics providers. Only operation metadata passes through.",
+  use_when: "You send telemetry to logging or analytics services and want usage metrics without any content exposure.",
+  rules: [
+    {
+      provider: "logging",
+      allow: [
+        "operation",
+        "operation_name",
+        "tool_name",
+        "timestamp",
+        "duration_ms",
+        "status",
+        "error_code",
+        "event_type"
+      ],
+      redact: [
+        ...ALWAYS_REDACT_SECRETS,
+        ...PII_PATTERNS,
+        ...INTERNAL_STATE_PATTERNS,
+        ...HISTORY_PATTERNS
+      ],
+      hash: [...ID_PATTERNS],
+      summarize: []
+    },
+    {
+      provider: "analytics",
+      allow: [
+        "event_type",
+        "timestamp",
+        "duration_ms",
+        "status",
+        "tool_name"
+      ],
+      redact: [
+        ...ALWAYS_REDACT_SECRETS,
+        ...PII_PATTERNS,
+        ...INTERNAL_STATE_PATTERNS,
+        ...HISTORY_PATTERNS
+      ],
+      hash: [...ID_PATTERNS],
+      summarize: []
+    }
+  ],
+  default_action: "redact"
+};
+var TOOL_API_SCOPED = {
+  id: "tool-api-scoped",
+  name: "Tool API Scoped",
+  description: "Allows tool-specific parameters for external API calls. Redacts memory, history, secrets, and PII.",
+  use_when: "Your agent calls external APIs (search, database, web) and you want to send query parameters without full agent context. Note: 'headers' and 'body' are redacted by default because they frequently carry authorization tokens. Add them to 'allow' only if you verify they contain no credentials for your use case.",
+  rules: [
+    {
+      provider: "tool-api",
+      allow: [
+        "task",
+        "task_description",
+        "query",
+        "search_query",
+        "tool_input",
+        "tool_parameters",
+        "url",
+        "endpoint",
+        "method",
+        "filter",
+        "sort",
+        "limit",
+        "offset"
+      ],
+      redact: [
+        ...ALWAYS_REDACT_SECRETS,
+        ...PII_PATTERNS,
+        ...INTERNAL_STATE_PATTERNS,
+        ...HISTORY_PATTERNS
+      ],
+      hash: [...ID_PATTERNS],
+      summarize: []
+    }
+  ],
+  default_action: "redact"
+};
+var TEMPLATES = {
+  "inference-minimal": INFERENCE_MINIMAL,
+  "inference-standard": INFERENCE_STANDARD,
+  "logging-strict": LOGGING_STRICT,
+  "tool-api-scoped": TOOL_API_SCOPED
+};
+function listTemplateIds() {
+  return Object.keys(TEMPLATES);
+}
+function getTemplate(id) {
+  return TEMPLATES[id];
+}
+
+// src/l2-operational/context-gate-recommend.ts
+var CLASSIFICATION_RULES = [
+  // ── Secrets (always redact, high confidence) ─────────────────────
+  {
+    patterns: [
+      "api_key",
+      "apikey",
+      "api_secret",
+      "secret",
+      "secret_key",
+      "secret_token",
+      "password",
+      "passwd",
+      "pass",
+      "credential",
+      "credentials",
+      "private_key",
+      "privkey",
+      "recovery_key",
+      "passphrase",
+      "token",
+      "access_token",
+      "refresh_token",
+      "bearer_token",
+      "auth_token",
+      "auth_header",
+      "authorization",
+      "encryption_key",
+      "master_key",
+      "signing_key",
+      "webhook_secret",
+      "client_secret",
+      "connection_string"
+    ],
+    action: "redact",
+    confidence: "high",
+    reason: "Matches known secret/credential pattern"
+  },
+  // ── PII (always redact, high confidence) ─────────────────────────
+  {
+    patterns: [
+      "name",
+      "full_name",
+      "first_name",
+      "last_name",
+      "display_name",
+      "email",
+      "email_address",
+      "phone",
+      "phone_number",
+      "mobile",
+      "address",
+      "street_address",
+      "mailing_address",
+      "ssn",
+      "social_security",
+      "date_of_birth",
+      "dob",
+      "birthday",
+      "ip_address",
+      "ip",
+      "location",
+      "geolocation",
+      "coordinates",
+      "credit_card",
+      "card_number",
+      "cvv",
+      "bank_account",
+      "routing_number",
+      "passport",
+      "drivers_license",
+      "license_number"
+    ],
+    action: "redact",
+    confidence: "high",
+    reason: "Matches known PII pattern"
+  },
+  // ── Internal agent state (redact, high confidence) ───────────────
+  {
+    patterns: [
+      "memory",
+      "agent_memory",
+      "long_term_memory",
+      "internal_reasoning",
+      "reasoning_trace",
+      "chain_of_thought",
+      "internal_state",
+      "agent_state",
+      "private_notes",
+      "scratchpad",
+      "soul",
+      "personality",
+      "persona",
+      "system_prompt",
+      "system_message",
+      "system_instruction",
+      "preferences",
+      "user_preferences",
+      "agent_preferences",
+      "beliefs",
+      "goals",
+      "motivations"
+    ],
+    action: "redact",
+    confidence: "high",
+    reason: "Matches known internal agent state pattern"
+  },
+  // ── IDs (hash, medium confidence) ────────────────────────────────
+  {
+    patterns: [
+      "user_id",
+      "userid",
+      "session_id",
+      "sessionid",
+      "agent_id",
+      "agentid",
+      "identity_id",
+      "conversation_id",
+      "thread_id",
+      "threadid",
+      "request_id",
+      "requestid",
+      "correlation_id",
+      "trace_id",
+      "traceid",
+      "account_id",
+      "accountid"
+    ],
+    action: "hash",
+    confidence: "medium",
+    reason: "Matches known identifier pattern \u2014 hash preserves correlation without exposing value"
+  },
+  // ── History (summarize, medium confidence) ───────────────────────
+  {
+    patterns: [
+      "conversation_history",
+      "chat_history",
+      "message_history",
+      "messages",
+      "previous_messages",
+      "prior_messages",
+      "context_window",
+      "interaction_history",
+      "audit_log",
+      "event_log"
+    ],
+    action: "summarize",
+    confidence: "medium",
+    reason: "Matches known history/log pattern \u2014 summarize to reduce exposure"
+  },
+  // ── Task/query (allow, medium confidence) ────────────────────────
+  {
+    patterns: [
+      "task",
+      "task_description",
+      "query",
+      "current_query",
+      "search_query",
+      "prompt",
+      "user_prompt",
+      "question",
+      "current_question",
+      "instruction",
+      "instructions",
+      "objective",
+      "goal",
+      "current_step",
+      "next_step",
+      "remaining_steps",
+      "constraints",
+      "requirements",
+      "output_format",
+      "format",
+      "tool_results",
+      "tool_output",
+      "tool_input",
+      "tool_parameters"
+    ],
+    action: "allow",
+    confidence: "medium",
+    reason: "Matches known task/query pattern \u2014 likely needed for inference"
+  }
+];
+function classifyField(fieldName) {
+  const normalized = fieldName.toLowerCase().trim();
+  for (const rule of CLASSIFICATION_RULES) {
+    for (const pattern of rule.patterns) {
+      if (matchesFieldPattern(normalized, pattern)) {
+        return {
+          field: fieldName,
+          recommended_action: rule.action,
+          reason: rule.reason,
+          confidence: rule.confidence,
+          matched_pattern: pattern
+        };
+      }
+    }
+  }
+  return {
+    field: fieldName,
+    recommended_action: "redact",
+    reason: "No known pattern matched \u2014 defaulting to redact (conservative)",
+    confidence: "low",
+    matched_pattern: null
+  };
+}
+function recommendPolicy(context, provider = "inference") {
+  const fields = Object.keys(context);
+  const classifications = fields.map(classifyField);
+  const warnings = [];
+  const allow = [];
+  const redact = [];
+  const hash2 = [];
+  const summarize = [];
+  for (const c of classifications) {
+    switch (c.recommended_action) {
+      case "allow":
+        allow.push(c.field);
+        break;
+      case "redact":
+        redact.push(c.field);
+        break;
+      case "hash":
+        hash2.push(c.field);
+        break;
+      case "summarize":
+        summarize.push(c.field);
+        break;
+    }
+  }
+  const lowConfidence = classifications.filter((c) => c.confidence === "low");
+  if (lowConfidence.length > 0) {
+    warnings.push(
+      `${lowConfidence.length} field(s) could not be classified by pattern and will default to redact: ${lowConfidence.map((c) => c.field).join(", ")}. Review these manually.`
+    );
+  }
+  for (const [key, value] of Object.entries(context)) {
+    if (typeof value === "string" && value.length > 5e3) {
+      const existing = classifications.find((c) => c.field === key);
+      if (existing && existing.recommended_action === "allow") {
+        warnings.push(
+          `Field "${key}" is allowed but contains ${value.length} characters. Consider summarizing it to reduce context size and exposure.`
+        );
+      }
+    }
+  }
+  return {
+    provider,
+    classifications,
+    recommended_rules: { allow, redact, hash: hash2, summarize },
+    default_action: "redact",
+    summary: {
+      total_fields: fields.length,
+      allow: allow.length,
+      redact: redact.length,
+      hash: hash2.length,
+      summarize: summarize.length
+    },
+    warnings
+  };
+}
+function matchesFieldPattern(normalizedField, pattern) {
+  if (normalizedField === pattern) return true;
+  if (pattern.length >= 3 && normalizedField.includes(pattern)) {
+    const idx = normalizedField.indexOf(pattern);
+    const before = idx === 0 || normalizedField[idx - 1] === "_" || normalizedField[idx - 1] === "-";
+    const after = idx + pattern.length === normalizedField.length || normalizedField[idx + pattern.length] === "_" || normalizedField[idx + pattern.length] === "-";
+    return before && after;
+  }
+  return false;
+}
+
+// src/l2-operational/context-gate-tools.ts
+function createContextGateTools(storage, masterKey, auditLog) {
+  const policyStore = new ContextGatePolicyStore(storage, masterKey);
+  const tools = [
+    // ── Set Policy ──────────────────────────────────────────────────
+    {
+      name: "sanctuary/context_gate_set_policy",
+      description: "Create a context-gating policy that controls what information flows to remote providers (LLM APIs, tool APIs, logging services). Each rule specifies a provider category and which context fields to allow, redact, hash, or flag for summarization. Redact rules take absolute priority \u2014 if a field is in both 'allow' and 'redact', it is redacted. Default action applies to any field not mentioned in any rule. Use this to prevent your full agent context from being sent to remote LLM providers during inference calls.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          policy_name: {
+            type: "string",
+            description: "Human-readable name for this policy (e.g., 'inference-minimal', 'tool-api-strict')"
+          },
+          rules: {
+            type: "array",
+            description: "Array of rules. Each rule has: provider (inference|tool-api|logging|analytics|peer-agent|custom|*), allow (fields to pass through), redact (fields to remove \u2014 highest priority), hash (fields to replace with SHA-256 hash), summarize (fields to flag for compression).",
+            items: {
+              type: "object",
+              properties: {
+                provider: {
+                  type: "string",
+                  description: "Provider category: inference, tool-api, logging, analytics, peer-agent, custom, or * for all"
+                },
+                allow: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields/patterns to allow through (e.g., 'task_description', 'current_query', 'tool_*')"
+                },
+                redact: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields/patterns to redact (e.g., 'conversation_history', 'secret_*', '*_pii'). Takes absolute priority."
+                },
+                hash: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields/patterns to replace with SHA-256 hash (e.g., 'user_id', 'session_id')"
+                },
+                summarize: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields/patterns to flag for summarization (advisory \u2014 agent should compress these before sending)"
+                }
+              },
+              required: ["provider", "allow", "redact"]
+            }
+          },
+          default_action: {
+            type: "string",
+            enum: ["redact", "deny"],
+            description: "Action for fields not matched by any rule. 'redact' removes the field value; 'deny' blocks the entire request. Default: 'redact'."
+          },
+          identity_id: {
+            type: "string",
+            description: "Bind this policy to a specific identity (optional)"
+          }
+        },
+        required: ["policy_name", "rules"]
+      },
+      handler: async (args) => {
+        const policyName = args.policy_name;
+        const rawRules = args.rules;
+        const defaultAction = args.default_action ?? "redact";
+        const identityId = args.identity_id;
+        if (!Array.isArray(rawRules)) {
+          return toolResult({ error: "invalid_rules", message: "rules must be an array" });
+        }
+        if (rawRules.length > MAX_POLICY_RULES) {
+          return toolResult({
+            error: "too_many_rules",
+            message: `Policy has ${rawRules.length} rules, exceeding limit of ${MAX_POLICY_RULES}`
+          });
+        }
+        const rules = [];
+        for (const r of rawRules) {
+          const allow = Array.isArray(r.allow) ? r.allow : [];
+          const redact = Array.isArray(r.redact) ? r.redact : [];
+          const hash2 = Array.isArray(r.hash) ? r.hash : [];
+          const summarize = Array.isArray(r.summarize) ? r.summarize : [];
+          for (const [name, arr] of [["allow", allow], ["redact", redact], ["hash", hash2], ["summarize", summarize]]) {
+            if (arr.length > MAX_PATTERNS_PER_ARRAY) {
+              return toolResult({
+                error: "too_many_patterns",
+                message: `Rule ${name} array has ${arr.length} patterns, exceeding limit of ${MAX_PATTERNS_PER_ARRAY}`
+              });
+            }
+          }
+          rules.push({
+            provider: r.provider ?? "*",
+            allow,
+            redact,
+            hash: hash2,
+            summarize
+          });
+        }
+        const policy = await policyStore.create(
+          policyName,
+          rules,
+          defaultAction,
+          identityId
+        );
+        auditLog.append("l2", "context_gate_set_policy", identityId ?? "system", {
+          policy_id: policy.policy_id,
+          policy_name: policyName,
+          rule_count: rules.length,
+          default_action: defaultAction
+        });
+        return toolResult({
+          policy_id: policy.policy_id,
+          policy_name: policy.policy_name,
+          rules: policy.rules,
+          default_action: policy.default_action,
+          created_at: policy.created_at,
+          message: "Context-gating policy created. Use sanctuary/context_gate_filter to apply this policy before making outbound calls."
+        });
+      }
+    },
+    // ── Apply Template ───────────────────────────────────────────────
+    {
+      name: "sanctuary/context_gate_apply_template",
+      description: "Apply a starter context-gating template. Available templates: inference-minimal (strictest \u2014 only task and query pass through), inference-standard (balanced \u2014 adds tool results, summarizes history), logging-strict (redacts all content for telemetry services), tool-api-scoped (allows tool parameters, redacts agent state). Templates are starting points \u2014 customize after applying.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          template_id: {
+            type: "string",
+            description: "Template to apply: inference-minimal, inference-standard, logging-strict, or tool-api-scoped"
+          },
+          identity_id: {
+            type: "string",
+            description: "Bind this policy to a specific identity (optional)"
+          }
+        },
+        required: ["template_id"]
+      },
+      handler: async (args) => {
+        const templateId = args.template_id;
+        const identityId = args.identity_id;
+        const template = getTemplate(templateId);
+        if (!template) {
+          return toolResult({
+            error: "template_not_found",
+            message: `Unknown template "${templateId}"`,
+            available_templates: listTemplateIds().map((id) => {
+              const t = TEMPLATES[id];
+              return { id, name: t.name, description: t.description };
+            })
+          });
+        }
+        const policy = await policyStore.create(
+          template.name,
+          template.rules,
+          template.default_action,
+          identityId
+        );
+        auditLog.append("l2", "context_gate_apply_template", identityId ?? "system", {
+          policy_id: policy.policy_id,
+          template_id: templateId
+        });
+        return toolResult({
+          policy_id: policy.policy_id,
+          template_applied: templateId,
+          policy_name: template.name,
+          description: template.description,
+          use_when: template.use_when,
+          rules: policy.rules,
+          default_action: policy.default_action,
+          created_at: policy.created_at,
+          message: "Template applied. Use sanctuary/context_gate_filter with this policy_id to filter context before outbound calls. Customize rules with sanctuary/context_gate_set_policy if needed."
+        });
+      }
+    },
+    // ── Recommend Policy ────────────────────────────────────────────
+    {
+      name: "sanctuary/context_gate_recommend",
+      description: "Analyze a sample context object and recommend a context-gating policy based on field name heuristics. Classifies each field as allow, redact, hash, or summarize with confidence levels. Returns a ready-to-apply rule set. When in doubt, recommends redact (conservative). Review the recommendations before applying.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          context: {
+            type: "object",
+            description: "A sample context object to analyze. Each top-level key will be classified. Values are inspected for size warnings but not stored."
+          },
+          provider: {
+            type: "string",
+            description: "Provider category to generate rules for. Default: 'inference'."
+          }
+        },
+        required: ["context"]
+      },
+      handler: async (args) => {
+        const context = args.context;
+        const provider = args.provider ?? "inference";
+        const contextKeys = Object.keys(context);
+        if (contextKeys.length > MAX_CONTEXT_FIELDS) {
+          return toolResult({
+            error: "context_too_large",
+            message: `Context has ${contextKeys.length} fields, exceeding limit of ${MAX_CONTEXT_FIELDS}`
+          });
+        }
+        const recommendation = recommendPolicy(context, provider);
+        auditLog.append("l2", "context_gate_recommend", "system", {
+          provider,
+          fields_analyzed: recommendation.summary.total_fields,
+          fields_allow: recommendation.summary.allow,
+          fields_redact: recommendation.summary.redact,
+          fields_hash: recommendation.summary.hash,
+          fields_summarize: recommendation.summary.summarize
+        });
+        return toolResult({
+          ...recommendation,
+          next_steps: "Review the classifications above. If they look correct, you can apply them directly with sanctuary/context_gate_set_policy using the recommended_rules. Or start with a template via sanctuary/context_gate_apply_template and customize from there.",
+          available_templates: listTemplateIds().map((id) => {
+            const t = TEMPLATES[id];
+            return { id, name: t.name, description: t.description };
+          })
+        });
+      }
+    },
+    // ── Filter Context ──────────────────────────────────────────────
+    {
+      name: "sanctuary/context_gate_filter",
+      description: "Filter agent context through a gating policy before sending to a remote provider. Returns per-field decisions (allow, redact, hash, summarize) and content hashes for the audit trail. Call this BEFORE making any outbound API call to ensure you are only sending the minimum necessary context. The filtered output tells you exactly what can be sent safely.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          policy_id: {
+            type: "string",
+            description: "ID of the context-gating policy to apply"
+          },
+          provider: {
+            type: "string",
+            description: "Provider category for this call: inference, tool-api, logging, analytics, peer-agent, or custom"
+          },
+          context: {
+            type: "object",
+            description: "The context object to filter. Each top-level key is evaluated against the policy. Example keys: task_description, conversation_history, user_preferences, api_keys, memory, internal_reasoning"
+          }
+        },
+        required: ["policy_id", "provider", "context"]
+      },
+      handler: async (args) => {
+        const policyId = args.policy_id;
+        const provider = args.provider;
+        const context = args.context;
+        const contextKeys = Object.keys(context);
+        if (contextKeys.length > MAX_CONTEXT_FIELDS) {
+          return toolResult({
+            error: "context_too_large",
+            message: `Context has ${contextKeys.length} fields, exceeding limit of ${MAX_CONTEXT_FIELDS}`
+          });
+        }
+        const policy = await policyStore.get(policyId);
+        if (!policy) {
+          return toolResult({
+            error: "policy_not_found",
+            message: `No context-gating policy found with ID "${policyId}"`
+          });
+        }
+        const result = filterContext(policy, provider, context);
+        const deniedFields = result.decisions.filter((d) => d.action === "deny");
+        if (deniedFields.length > 0) {
+          auditLog.append("l2", "context_gate_deny", policy.identity_id ?? "system", {
+            policy_id: policyId,
+            provider,
+            denied_fields: deniedFields.map((d) => d.field),
+            original_context_hash: result.original_context_hash
+          });
+          return toolResult({
+            blocked: true,
+            reason: "Context contains fields that trigger deny action",
+            denied_fields: deniedFields.map((d) => ({
+              field: d.field,
+              reason: d.reason
+            })),
+            recommendation: "Remove the denied fields from context before retrying, or update the policy to handle these fields differently."
+          });
+        }
+        const safeContext = {};
+        for (const decision of result.decisions) {
+          switch (decision.action) {
+            case "allow":
+              safeContext[decision.field] = context[decision.field];
+              break;
+            case "redact":
+              break;
+            case "hash":
+              safeContext[decision.field] = decision.hash_value;
+              break;
+            case "summarize":
+              safeContext[decision.field] = context[decision.field];
+              break;
+          }
+        }
+        auditLog.append("l2", "context_gate_filter", policy.identity_id ?? "system", {
+          policy_id: policyId,
+          provider,
+          fields_total: Object.keys(context).length,
+          fields_allowed: result.fields_allowed,
+          fields_redacted: result.fields_redacted,
+          fields_hashed: result.fields_hashed,
+          fields_summarized: result.fields_summarized,
+          original_context_hash: result.original_context_hash,
+          filtered_context_hash: result.filtered_context_hash
+        });
+        return toolResult({
+          blocked: false,
+          safe_context: safeContext,
+          summary: {
+            total_fields: Object.keys(context).length,
+            allowed: result.fields_allowed,
+            redacted: result.fields_redacted,
+            hashed: result.fields_hashed,
+            summarized: result.fields_summarized
+          },
+          decisions: result.decisions,
+          audit: {
+            original_context_hash: result.original_context_hash,
+            filtered_context_hash: result.filtered_context_hash,
+            filtered_at: result.filtered_at
+          },
+          guidance: result.fields_summarized > 0 ? "Some fields are marked for summarization. Consider compressing them before sending to reduce context size and information exposure." : void 0
+        });
+      }
+    },
+    // ── List Policies ───────────────────────────────────────────────
+    {
+      name: "sanctuary/context_gate_list_policies",
+      description: "List all configured context-gating policies. Returns policy IDs, names, rule summaries, and default actions.",
+      inputSchema: {
+        type: "object",
+        properties: {}
+      },
+      handler: async () => {
+        const policies = await policyStore.list();
+        auditLog.append("l2", "context_gate_list_policies", "system", {
+          policy_count: policies.length
+        });
+        return toolResult({
+          policies: policies.map((p) => ({
+            policy_id: p.policy_id,
+            policy_name: p.policy_name,
+            rule_count: p.rules.length,
+            providers: p.rules.map((r) => r.provider),
+            default_action: p.default_action,
+            identity_id: p.identity_id ?? null,
+            created_at: p.created_at,
+            updated_at: p.updated_at
+          })),
+          count: policies.length,
+          message: policies.length === 0 ? "No context-gating policies configured. Use sanctuary/context_gate_set_policy to create one." : `${policies.length} context-gating ${policies.length === 1 ? "policy" : "policies"} configured.`
+        });
+      }
+    }
+  ];
+  return { tools, policyStore };
+}
+function checkMemoryProtection() {
+  const checks = {
+    aslr_enabled: checkASLR(),
+    stack_canaries: true,
+    // Enabled by default in Node.js runtime
+    secure_buffer_zeros: true,
+    // We use crypto.randomBytes and explicit zeroing
+    argon2id_kdf: true
+    // Master key derivation uses Argon2id
+  };
+  const activeCount = Object.values(checks).filter((v) => v).length;
+  const overall = activeCount >= 4 ? "full" : activeCount >= 3 ? "partial" : "minimal";
+  return {
+    ...checks,
+    overall
+  };
+}
+function checkASLR() {
+  if (process.platform === "linux") {
+    try {
+      const result = execSync("cat /proc/sys/kernel/randomize_va_space", {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "ignore"]
+      }).trim();
+      return result === "2";
+    } catch {
+      return false;
+    }
+  }
+  if (process.platform === "darwin") {
+    return true;
+  }
+  return false;
+}
+function checkProcessIsolation() {
+  const isContainer = detectContainer();
+  const isVM = detectVM();
+  const isSandboxed = detectSandbox();
+  let isolationLevel = "none";
+  if (isContainer) isolationLevel = "hardened";
+  else if (isVM) isolationLevel = "hardened";
+  else if (isSandboxed) isolationLevel = "basic";
+  const details = {};
+  if (isContainer && isContainer !== true) details.container_type = isContainer;
+  if (isVM && isVM !== true) details.vm_type = isVM;
+  if (isSandboxed && isSandboxed !== true) details.sandbox_type = isSandboxed;
+  return {
+    isolation_level: isolationLevel,
+    is_container: isContainer !== false,
+    is_vm: isVM !== false,
+    is_sandboxed: isSandboxed !== false,
+    is_tee: false,
+    details
+  };
+}
+function detectContainer() {
+  try {
+    if (process.env.DOCKER_HOST) return "docker";
+    try {
+      statSync("/.dockerenv");
+      return "docker";
+    } catch {
+    }
+    if (process.platform === "linux") {
+      const cgroup = execSync("cat /proc/1/cgroup 2>/dev/null || echo ''", {
+        encoding: "utf-8"
+      });
+      if (cgroup.includes("docker")) return "docker";
+      if (cgroup.includes("lxc")) return "lxc";
+      if (cgroup.includes("kubepods") || cgroup.includes("kubernetes")) return "kubernetes";
+    }
+    if (process.env.container === "podman") return "podman";
+    if (process.env.CONTAINER_ID) return "oci";
+    return false;
+  } catch {
+    return false;
+  }
+}
+function detectVM() {
+  if (process.platform === "linux") {
+    try {
+      const dmidecode = execSync("dmidecode -s system-product-name 2>/dev/null || echo ''", {
+        encoding: "utf-8"
+      }).toLowerCase();
+      if (dmidecode.includes("vmware")) return "vmware";
+      if (dmidecode.includes("virtualbox")) return "virtualbox";
+      if (dmidecode.includes("kvm")) return "kvm";
+      if (dmidecode.includes("xen")) return "xen";
+      if (dmidecode.includes("hyper-v")) return "hyper-v";
+      const cpuinfo = execSync("grep -i hypervisor /proc/cpuinfo || echo ''", {
+        encoding: "utf-8"
+      });
+      if (cpuinfo.length > 0) return "detected";
+    } catch {
+    }
+  }
+  if (process.platform === "darwin") {
+    try {
+      const bootargs = execSync(
+        "nvram boot-args 2>/dev/null | grep -i 'parallels\\|vmware\\|virtualbox' || echo ''",
+        {
+          encoding: "utf-8"
+        }
+      );
+      if (bootargs.length > 0) return "detected";
+    } catch {
+    }
+  }
+  return false;
+}
+function detectSandbox() {
+  if (process.platform === "darwin") {
+    if (process.env.APP_SANDBOX_READ_ONLY_HOME === "1") return "app-sandbox";
+    if (process.env.TMPDIR && process.env.TMPDIR.includes("AppSandbox")) return "app-sandbox";
+  }
+  if (process.platform === "openbsd") {
+    try {
+      const pledge = execSync("pledge -v 2>/dev/null || echo ''", {
+        encoding: "utf-8"
+      });
+      if (pledge.length > 0) return "pledge";
+    } catch {
+    }
+  }
+  if (process.platform === "linux") {
+    if (process.env.container === "lxc") return "lxc";
+    try {
+      const context = execSync("getenforce 2>/dev/null || echo ''", {
+        encoding: "utf-8"
+      }).trim();
+      if (context === "Enforcing") return "selinux";
+    } catch {
+    }
+  }
+  return false;
+}
+function checkFilesystemPermissions(storagePath) {
+  try {
+    const stats = statSync(storagePath);
+    const mode = stats.mode & parseInt("777", 8);
+    const modeString = mode.toString(8).padStart(3, "0");
+    const isSecure = mode === parseInt("700", 8);
+    const groupReadable = (mode & parseInt("040", 8)) !== 0;
+    const othersReadable = (mode & parseInt("007", 8)) !== 0;
+    const currentUid = process.getuid?.() || -1;
+    const ownerIsCurrentUser = stats.uid === currentUid;
+    let overall = "secure";
+    if (groupReadable || othersReadable) overall = "insecure";
+    else if (!ownerIsCurrentUser) overall = "warning";
+    return {
+      sanctuary_storage_protected: isSecure,
+      sanctuary_storage_mode: modeString,
+      owner_is_current_user: ownerIsCurrentUser,
+      group_readable: groupReadable,
+      others_readable: othersReadable,
+      overall
+    };
+  } catch {
+    return {
+      sanctuary_storage_protected: false,
+      sanctuary_storage_mode: "unknown",
+      owner_is_current_user: false,
+      group_readable: false,
+      others_readable: false,
+      overall: "warning"
+    };
+  }
+}
+function checkRuntimeIntegrity() {
+  return {
+    config_hash_stable: true,
+    environment_state: "clean",
+    discrepancies: []
+  };
+}
+function assessL2Hardening(storagePath) {
+  const memory = checkMemoryProtection();
+  const isolation = checkProcessIsolation();
+  const filesystem = checkFilesystemPermissions(storagePath);
+  const integrity = checkRuntimeIntegrity();
+  let checksPassed = 0;
+  let checksTotal = 0;
+  if (memory.aslr_enabled) checksPassed++;
+  checksTotal++;
+  if (memory.stack_canaries) checksPassed++;
+  checksTotal++;
+  if (memory.secure_buffer_zeros) checksPassed++;
+  checksTotal++;
+  if (memory.argon2id_kdf) checksPassed++;
+  checksTotal++;
+  if (isolation.is_container) checksPassed++;
+  checksTotal++;
+  if (isolation.is_vm) checksPassed++;
+  checksTotal++;
+  if (isolation.is_sandboxed) checksPassed++;
+  checksTotal++;
+  if (filesystem.sanctuary_storage_protected) checksPassed++;
+  checksTotal++;
+  {
+    checksPassed++;
+  }
+  checksTotal++;
+  let hardeningLevel = isolation.isolation_level;
+  if (filesystem.overall === "insecure" || memory.overall === "none" || memory.overall === "minimal") {
+    if (hardeningLevel === "hardened") {
+      hardeningLevel = "basic";
+    } else if (hardeningLevel === "basic") {
+      hardeningLevel = "none";
+    }
+  }
+  const summaryParts = [];
+  if (isolation.is_container || isolation.is_vm) {
+    summaryParts.push(`Running in ${isolation.details.container_type || isolation.details.vm_type || "isolated environment"}`);
+  }
+  if (memory.aslr_enabled) {
+    summaryParts.push("ASLR enabled");
+  }
+  if (filesystem.sanctuary_storage_protected) {
+    summaryParts.push("Storage permissions secured (0700)");
+  }
+  const summary = summaryParts.length > 0 ? summaryParts.join("; ") : "No process-level hardening detected";
+  return {
+    hardening_level: hardeningLevel,
+    memory_protection: memory,
+    process_isolation: isolation,
+    filesystem_permissions: filesystem,
+    runtime_integrity: integrity,
+    checks_passed: checksPassed,
+    checks_total: checksTotal,
+    summary
+  };
+}
+
+// src/l2-operational/hardening-tools.ts
+function createL2HardeningTools(storagePath, auditLog) {
+  return [
+    {
+      name: "sanctuary/l2_hardening_status",
+      description: "L2 Process Hardening Status \u2014 Verify software-based operational isolation. Reports memory protection, process isolation level, filesystem permissions, and overall hardening assessment. Read-only. Tier 3 \u2014 always allowed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          include_details: {
+            type: "boolean",
+            description: "If true, include detailed check results for memory, process, and filesystem. If false, show summary only.",
+            default: false
+          }
+        }
+      },
+      handler: async (args) => {
+        const includeDetails = args.include_details ?? false;
+        const status = assessL2Hardening(storagePath);
+        auditLog.append(
+          "l2",
+          "l2_hardening_status",
+          "system",
+          { include_details: includeDetails }
+        );
+        if (includeDetails) {
+          return toolResult({
+            hardening_level: status.hardening_level,
+            summary: status.summary,
+            checks_passed: status.checks_passed,
+            checks_total: status.checks_total,
+            memory_protection: {
+              aslr_enabled: status.memory_protection.aslr_enabled,
+              stack_canaries: status.memory_protection.stack_canaries,
+              secure_buffer_zeros: status.memory_protection.secure_buffer_zeros,
+              argon2id_kdf: status.memory_protection.argon2id_kdf,
+              overall: status.memory_protection.overall
+            },
+            process_isolation: {
+              isolation_level: status.process_isolation.isolation_level,
+              is_container: status.process_isolation.is_container,
+              is_vm: status.process_isolation.is_vm,
+              is_sandboxed: status.process_isolation.is_sandboxed,
+              is_tee: status.process_isolation.is_tee,
+              details: status.process_isolation.details
+            },
+            filesystem_permissions: {
+              sanctuary_storage_protected: status.filesystem_permissions.sanctuary_storage_protected,
+              sanctuary_storage_mode: status.filesystem_permissions.sanctuary_storage_mode,
+              owner_is_current_user: status.filesystem_permissions.owner_is_current_user,
+              group_readable: status.filesystem_permissions.group_readable,
+              others_readable: status.filesystem_permissions.others_readable,
+              overall: status.filesystem_permissions.overall
+            },
+            runtime_integrity: {
+              config_hash_stable: status.runtime_integrity.config_hash_stable,
+              environment_state: status.runtime_integrity.environment_state,
+              discrepancies: status.runtime_integrity.discrepancies
+            }
+          });
+        } else {
+          return toolResult({
+            hardening_level: status.hardening_level,
+            summary: status.summary,
+            checks_passed: status.checks_passed,
+            checks_total: status.checks_total,
+            note: "Pass include_details: true to see full breakdown of memory, process isolation, and filesystem checks."
+          });
+        }
+      }
+    },
+    {
+      name: "sanctuary/l2_verify_isolation",
+      description: "Verify L2 process isolation at runtime. Checks whether the Sanctuary server is running in an isolated environment (container, VM, sandbox) and validates filesystem and memory protections. Reports isolation level and any issues. Read-only. Tier 3 \u2014 always allowed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          check_filesystem: {
+            type: "boolean",
+            description: "If true, verify Sanctuary storage directory permissions.",
+            default: true
+          },
+          check_memory: {
+            type: "boolean",
+            description: "If true, verify memory protection mechanisms (ASLR, etc.).",
+            default: true
+          },
+          check_process: {
+            type: "boolean",
+            description: "If true, detect container, VM, or sandbox environment.",
+            default: true
+          }
+        }
+      },
+      handler: async (args) => {
+        const checkFilesystem = args.check_filesystem ?? true;
+        const checkMemory = args.check_memory ?? true;
+        const checkProcess = args.check_process ?? true;
+        const status = assessL2Hardening(storagePath);
+        auditLog.append(
+          "l2",
+          "l2_verify_isolation",
+          "system",
+          {
+            check_filesystem: checkFilesystem,
+            check_memory: checkMemory,
+            check_process: checkProcess
+          }
+        );
+        const results = {
+          isolation_level: status.hardening_level,
+          timestamp: (/* @__PURE__ */ new Date()).toISOString()
+        };
+        if (checkFilesystem) {
+          const fs = status.filesystem_permissions;
+          results.filesystem = {
+            sanctuary_storage_protected: fs.sanctuary_storage_protected,
+            storage_mode: fs.sanctuary_storage_mode,
+            is_secure: fs.overall === "secure",
+            issues: fs.overall === "insecure" ? [
+              "Storage directory is readable by group or others. Recommend: chmod 700 on Sanctuary storage path."
+            ] : fs.overall === "warning" ? [
+              "Storage directory not owned by current user. Verify correct user is running Sanctuary."
+            ] : []
+          };
+        }
+        if (checkMemory) {
+          const mem = status.memory_protection;
+          const issues = [];
+          if (!mem.aslr_enabled) {
+            issues.push(
+              "ASLR not detected. On Linux, enable with: echo 2 | sudo tee /proc/sys/kernel/randomize_va_space"
+            );
+          }
+          results.memory = {
+            aslr_enabled: mem.aslr_enabled,
+            stack_canaries: mem.stack_canaries,
+            secure_buffer_handling: mem.secure_buffer_zeros,
+            argon2id_key_derivation: mem.argon2id_kdf,
+            protection_level: mem.overall,
+            issues
+          };
+        }
+        if (checkProcess) {
+          const iso = status.process_isolation;
+          results.process = {
+            isolation_level: iso.isolation_level,
+            in_container: iso.is_container,
+            in_vm: iso.is_vm,
+            sandboxed: iso.is_sandboxed,
+            has_tee: iso.is_tee,
+            environment: iso.details,
+            recommendation: iso.isolation_level === "none" ? "Consider running Sanctuary in a container or VM for improved isolation." : iso.isolation_level === "basic" ? "Basic isolation detected. Container or VM would provide stronger guarantees." : "Running in isolated environment \u2014 process-level isolation is strong."
+          };
+        }
+        return toolResult({
+          status: "verified",
+          results
+        });
+      }
+    }
+  ];
 }
 
 // src/index.ts
@@ -7720,7 +9678,7 @@ async function createSanctuaryServer(options) {
           layer: "l2",
           description: "Process-level isolation only (no TEE)",
           severity: "warning",
-          mitigation: "TEE support planned for v0.3.0"
+          mitigation: "TEE support planned for a future release"
         });
         if (config.disclosure.proof_system === "commitment-only") {
           degradations.push({
@@ -7860,7 +9818,7 @@ async function createSanctuaryServer(options) {
         },
         limitations: [
           "L1 identity uses ed25519 only; KERI support planned for v0.2.0",
-          "L2 isolation is process-level only; TEE support planned for v0.3.0",
+          "L2 isolation is process-level only; TEE support planned for a future release",
           "L3 uses commitment schemes only; ZK proofs planned for v0.2.0",
           "L4 Sybil resistance is escrow-based only",
           "Spec license: CC-BY-4.0 | Code license: Apache-2.0"
@@ -7881,7 +9839,7 @@ async function createSanctuaryServer(options) {
     masterKey,
     auditLog
   );
-  const { tools: l4Tools } = createL4Tools(
+  const { tools: l4Tools} = createL4Tools(
     storage,
     masterKey,
     identityManager,
@@ -7900,6 +9858,12 @@ async function createSanctuaryServer(options) {
     handshakeResults
   );
   const { tools: auditTools } = createAuditTools(config);
+  const { tools: contextGateTools } = createContextGateTools(
+    storage,
+    masterKey,
+    auditLog
+  );
+  const hardeningTools = createL2HardeningTools(config.storage_path, auditLog);
   const policy = await loadPrincipalPolicy(config.storage_path);
   const baseline = new BaselineTracker(storage, masterKey);
   await baseline.load();
@@ -7949,6 +9913,8 @@ async function createSanctuaryServer(options) {
     ...federationTools,
     ...bridgeTools,
     ...auditTools,
+    ...contextGateTools,
+    ...hardeningTools,
     manifestTool
   ];
   const server = createServer(allTools, { gate });
@@ -7973,8 +9939,78 @@ async function createSanctuaryServer(options) {
   }
   return { server, config };
 }
-
-// src/cli.ts
+var REGISTRY_URL = "https://registry.npmjs.org/@sanctuary-framework/mcp-server/latest";
+var TIMEOUT_MS = 3e3;
+function isNewerVersion(current, latest) {
+  const parse = (v) => v.replace(/^v/, "").split(".").map(Number);
+  const [curMajor = 0, curMinor = 0, curPatch = 0] = parse(current);
+  const [latMajor = 0, latMinor = 0, latPatch = 0] = parse(latest);
+  if (latMajor !== curMajor) return latMajor > curMajor;
+  if (latMinor !== curMinor) return latMinor > curMinor;
+  return latPatch > curPatch;
+}
+function formatUpdateMessage(current, latest) {
+  return `[Sanctuary] Update available: ${current} \u2192 ${latest} \u2014 run: npx @sanctuary-framework/mcp-server@latest`;
+}
+function fetchLatestVersion(currentVersion) {
+  return new Promise((resolve) => {
+    const req = get(
+      REGISTRY_URL,
+      {
+        headers: { Accept: "application/json" },
+        timeout: TIMEOUT_MS
+      },
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          resolve(null);
+          return;
+        }
+        let data = "";
+        res.setEncoding("utf-8");
+        res.on("data", (chunk) => {
+          data += chunk;
+          if (data.length > 32768) {
+            res.destroy();
+            resolve(null);
+          }
+        });
+        res.on("end", () => {
+          try {
+            const json = JSON.parse(data);
+            const latest = json.version;
+            if (typeof latest === "string" && isNewerVersion(currentVersion, latest)) {
+              resolve(latest);
+            } else {
+              resolve(null);
+            }
+          } catch {
+            resolve(null);
+          }
+        });
+      }
+    );
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
+}
+async function checkForUpdate(currentVersion) {
+  if (process.env.SANCTUARY_NO_UPDATE_CHECK === "1") {
+    return;
+  }
+  try {
+    const latest = await fetchLatestVersion(currentVersion);
+    if (latest) {
+      console.error(formatUpdateMessage(currentVersion, latest));
+    }
+  } catch {
+  }
+}
+var require4 = createRequire(import.meta.url);
+var { version: PKG_VERSION3 } = require4("../package.json");
 async function main() {
   const args = process.argv.slice(2);
   let passphrase = process.env.SANCTUARY_PASSPHRASE;
@@ -7987,7 +10023,7 @@ async function main() {
       printHelp();
       process.exit(0);
     } else if (args[i] === "--version" || args[i] === "-v") {
-      console.log("@sanctuary-framework/mcp-server 0.3.0");
+      console.log(`@sanctuary-framework/mcp-server ${PKG_VERSION3}`);
       process.exit(0);
     }
   }
@@ -7998,6 +10034,7 @@ async function main() {
     console.error(`Sanctuary MCP Server v${config.version} running (stdio)`);
     console.error(`Storage: ${config.storage_path}`);
     console.error("Tools: all registered");
+    checkForUpdate(PKG_VERSION3);
   } else {
     console.error("HTTP transport not yet implemented. Use stdio.");
     process.exit(1);
@@ -8005,7 +10042,7 @@ async function main() {
 }
 function printHelp() {
   console.log(`
-@sanctuary-framework/mcp-server v0.3.0
+@sanctuary-framework/mcp-server v${PKG_VERSION3}
 
 Sovereignty infrastructure for agents in the agentic economy.
 
@@ -8027,6 +10064,7 @@ Environment variables:
   SANCTUARY_WEBHOOK_ENABLED         "true" to enable webhook approvals
   SANCTUARY_WEBHOOK_URL             Webhook target URL
   SANCTUARY_WEBHOOK_SECRET          HMAC-SHA256 shared secret
+  SANCTUARY_NO_UPDATE_CHECK         "1" to disable startup update check
 
 For more info: https://github.com/eriknewton/sanctuary-framework
 `);

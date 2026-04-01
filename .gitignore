@@ -8,6 +8,7 @@ node_modules/
 
 # Build artifacts
 dist/
+server/tsup.config.bundled_*.mjs
 
 # Internal documents
 SANCTUARY_PROJECT_CONTEXT.md

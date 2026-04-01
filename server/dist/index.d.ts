@@ -1,10 +1,5 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 
-/**
- * Sanctuary MCP Server — Configuration
- *
- * Loads and validates server configuration from file or environment variables.
- */
 interface SanctuaryConfig {
     version: string;
     storage_path: string;
@@ -670,6 +665,11 @@ interface SHRCapabilities {
  */
 interface SHRBody {
     shr_version: "1.0";
+    implementation: {
+        sanctuary_version: string;
+        node_version: string;
+        generated_by: string;
+    };
     instance_id: string;
     generated_at: string;
     expires_at: string;
@@ -1117,6 +1117,252 @@ declare class FederationRegistry {
 }
 
 /**
+ * Sanctuary MCP Server — L2 Operational Isolation: Context Gating
+ *
+ * Context gating controls what information leaves the sovereignty boundary
+ * when an agent makes outbound calls — especially inference calls to remote
+ * LLM providers. This is the "minimum-necessary context" enforcement layer.
+ *
+ * The problem: When an agent sends a request to a remote LLM provider (Claude,
+ * GPT, etc.), most harnesses send the agent's full context — conversation
+ * history, memory, tool results, preferences, internal reasoning. The agent
+ * has no control over what the provider sees.
+ *
+ * Context gating lets the agent define:
+ * - Provider categories (inference, tool-api, logging, analytics, etc.)
+ * - What fields/categories of context may flow to each provider type
+ * - What must always be redacted (secrets, internal reasoning, PII, etc.)
+ * - What requires transformation (hashing, summarizing, anonymizing)
+ *
+ * This sits in L2 (Operational Isolation) because it controls information
+ * flow at the execution boundary. L3 (Selective Disclosure) handles agent-
+ * to-agent trust negotiation with cryptographic proofs; context gating
+ * handles agent-to-infrastructure information flow.
+ *
+ * Security invariants:
+ * - Redact rules take absolute priority (like withhold in L3)
+ * - Policies are stored encrypted under L1 sovereignty
+ * - Every filter operation is audit-logged with a content hash
+ *   (what was sent, what was redacted — without storing the content itself)
+ * - Default policy: redact everything not explicitly allowed
+ */
+
+/** Provider categories that context may flow to */
+type ProviderCategory = "inference" | "tool-api" | "logging" | "analytics" | "peer-agent" | "custom";
+/** Actions that can be taken on a context field */
+type ContextAction = "allow" | "redact" | "hash" | "summarize" | "deny";
+/** A rule within a context-gating policy */
+interface ContextGateRule {
+    /** Provider category this rule applies to */
+    provider: ProviderCategory | "*";
+    /** Fields/patterns that may pass through */
+    allow: string[];
+    /** Fields/patterns that must be redacted (highest priority) */
+    redact: string[];
+    /** Fields/patterns that should be hashed */
+    hash: string[];
+    /** Fields/patterns that should be summarized (advisory) */
+    summarize: string[];
+}
+/** A complete context-gating policy */
+interface ContextGatePolicy {
+    policy_id: string;
+    policy_name: string;
+    rules: ContextGateRule[];
+    /** Default action when no rule matches a field */
+    default_action: "redact" | "deny";
+    /** Identity this policy is bound to (optional) */
+    identity_id?: string;
+    created_at: string;
+    updated_at: string;
+}
+/** Result of filtering a single field */
+interface FieldFilterResult {
+    field: string;
+    action: ContextAction;
+    reason: string;
+    /** If action is "hash", contains the hash */
+    hash_value?: string;
+}
+/** Result of a full context filter operation */
+interface ContextFilterResult {
+    policy_id: string;
+    provider: ProviderCategory | string;
+    fields_allowed: number;
+    fields_redacted: number;
+    fields_hashed: number;
+    fields_summarized: number;
+    fields_denied: number;
+    decisions: FieldFilterResult[];
+    /** SHA-256 hash of the original context (for audit trail) */
+    original_context_hash: string;
+    /** SHA-256 hash of the filtered output (for audit trail) */
+    filtered_context_hash: string;
+    filtered_at: string;
+}
+/**
+ * Evaluate a context field against a policy for a given provider.
+ *
+ * Priority order (same as L3 disclosure):
+ * 1. Redact (blocks — highest priority)
+ * 2. Deny (blocks entire request)
+ * 3. Hash (transforms)
+ * 4. Summarize (advisory transform)
+ * 5. Allow (passes through)
+ * 6. Default action
+ */
+declare function evaluateField(policy: ContextGatePolicy, provider: ProviderCategory | string, field: string): FieldFilterResult;
+/**
+ * Filter a full context object against a policy for a given provider.
+ * Returns per-field decisions and content hashes for the audit trail.
+ */
+declare function filterContext(policy: ContextGatePolicy, provider: ProviderCategory | string, context: Record<string, unknown>): ContextFilterResult;
+/**
+ * Context gate policy store — encrypted under L1 sovereignty.
+ */
+declare class ContextGatePolicyStore {
+    private storage;
+    private encryptionKey;
+    private policies;
+    constructor(storage: StorageBackend, masterKey: Uint8Array);
+    /**
+     * Create and store a new context-gating policy.
+     */
+    create(policyName: string, rules: ContextGateRule[], defaultAction: "redact" | "deny", identityId?: string): Promise<ContextGatePolicy>;
+    /**
+     * Get a policy by ID.
+     */
+    get(policyId: string): Promise<ContextGatePolicy | null>;
+    /**
+     * List all context-gating policies.
+     */
+    list(): Promise<ContextGatePolicy[]>;
+    /**
+     * Load all persisted policies into memory.
+     */
+    private loadAll;
+    private persist;
+}
+
+/**
+ * Sanctuary MCP Server — L2 Context Gating: Starter Policy Templates
+ *
+ * Pre-built policies for common use cases. These are starting points —
+ * users should customize them for their specific context structure.
+ *
+ * Templates:
+ *
+ *   inference-minimal
+ *     Only the current task and query reach the LLM. Everything else
+ *     is redacted. Secrets, PII, memory, reasoning, and history are
+ *     all blocked. IDs are hashed. Maximum privacy, minimum context.
+ *
+ *   inference-standard
+ *     Task, query, and tool results pass through. Conversation history
+ *     is flagged for summarization (compress before sending). Secrets,
+ *     PII, and internal reasoning are redacted. IDs are hashed.
+ *     Balanced: the LLM has enough context to be useful without seeing
+ *     everything the agent knows.
+ *
+ *   logging-strict
+ *     Redacts everything for logging/analytics providers. Only
+ *     operation names and timestamps pass through. Use this for
+ *     telemetry services where you want usage metrics without
+ *     content exposure.
+ *
+ *   tool-api-scoped
+ *     Allows tool-specific parameters and the current task, redacts
+ *     memory, history, secrets, and PII. Hashes IDs. For outbound
+ *     calls to external APIs (search, database, etc.) where you need
+ *     to send query parameters but not your agent's full state.
+ */
+
+/** A template definition ready to be applied via the policy store */
+interface ContextGateTemplate {
+    /** Machine-readable template ID */
+    id: string;
+    /** Human-readable name */
+    name: string;
+    /** One-line description */
+    description: string;
+    /** When to use this template */
+    use_when: string;
+    /** The rules that make up this template */
+    rules: ContextGateRule[];
+    /** Default action for unmatched fields */
+    default_action: "redact" | "deny";
+}
+/** All available templates, keyed by ID */
+declare const TEMPLATES: Record<string, ContextGateTemplate>;
+/** List all available template IDs */
+declare function listTemplateIds(): string[];
+/** Get a template by ID (returns undefined if not found) */
+declare function getTemplate(id: string): ContextGateTemplate | undefined;
+
+/**
+ * Sanctuary MCP Server — L2 Context Gating: Policy Recommendation Engine
+ *
+ * Analyzes a sample context object and recommends a context-gating policy
+ * based on field name heuristics. The agent (or human) can then review,
+ * adjust, and apply the recommendation.
+ *
+ * This is deliberately conservative: when in doubt, it recommends redact.
+ * A false redaction is a usability issue; a false allow is a privacy leak.
+ *
+ * Classification heuristics:
+ * - Known secret patterns → redact (highest confidence)
+ * - Known PII patterns → redact (high confidence)
+ * - Known internal state patterns → redact (high confidence)
+ * - Known ID patterns → hash (medium confidence)
+ * - Known history patterns → summarize (medium confidence)
+ * - Known task/query patterns → allow (medium confidence)
+ * - Everything else → redact (conservative default)
+ *
+ * WARNING: Fields like 'tool_results' and 'tool_output' are classified as
+ * "allow" (medium confidence) but may contain sensitive data from external
+ * API responses, including auth tokens, user data, or PII. Always review
+ * recommendations before applying — the heuristic classifies by field NAME,
+ * not field CONTENT.
+ */
+/** Classification result for a single field */
+interface FieldClassification {
+    field: string;
+    recommended_action: "allow" | "redact" | "hash" | "summarize";
+    reason: string;
+    confidence: "high" | "medium" | "low";
+    /** Pattern that matched, if any */
+    matched_pattern: string | null;
+}
+/** Full recommendation result */
+interface PolicyRecommendation {
+    provider: string;
+    classifications: FieldClassification[];
+    recommended_rules: {
+        allow: string[];
+        redact: string[];
+        hash: string[];
+        summarize: string[];
+    };
+    default_action: "redact";
+    summary: {
+        total_fields: number;
+        allow: number;
+        redact: number;
+        hash: number;
+        summarize: number;
+    };
+    warnings: string[];
+}
+/**
+ * Classify a single field name and return a recommendation.
+ */
+declare function classifyField(fieldName: string): FieldClassification;
+/**
+ * Analyze a full context object and recommend a policy.
+ */
+declare function recommendPolicy(context: Record<string, unknown>, provider?: string): PolicyRecommendation;
+
+/**
  * Sanctuary MCP Server — In-Memory Storage Backend
  *
  * Used for testing. Implements the same interface as filesystem storage
@@ -1493,6 +1739,8 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
     /** SEC-012: Short-lived session store. Sessions replace URL query tokens. */
     private sessions;
     private sessionCleanupTimer;
+    /** Rate limiting: per-IP request tracking */
+    private rateLimits;
     constructor(config: DashboardConfig);
     /**
      * Inject dependencies after construction.
@@ -1540,6 +1788,19 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
      * Remove all expired sessions.
      */
     private cleanupSessions;
+    /**
+     * Get the remote address from a request, normalizing IPv6-mapped IPv4.
+     */
+    private getRemoteAddr;
+    /**
+     * Check rate limit for a request. Returns true if allowed, false if rate-limited.
+     * When rate-limited, sends a 429 response.
+     */
+    private checkRateLimit;
+    /**
+     * Remove stale entries from the rate limit map.
+     */
+    private pruneRateLimits;
     private handleRequest;
     /**
      * SEC-012: Exchange a long-lived auth token (in Authorization header)
@@ -1980,4 +2241,4 @@ declare function createSanctuaryServer(options?: {
     storage?: StorageBackend;
 }): Promise<SanctuaryServer>;
 
-export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, type BridgeAttestationRequest, type BridgeAttestationResult, type BridgeCommitment, type BridgeVerificationResult, CallbackApprovalChannel, CommitmentStore, type ConcordiaOutcome, DashboardApprovalChannel, type DashboardConfig, type FederationCapabilities, type FederationPeer, FederationRegistry, FilesystemStorage, type GateResult, type HandshakeChallenge, type HandshakeCompletion, type HandshakeResponse, type HandshakeResult, MemoryStorage, type PedersenCommitment, type PeerTrustEvaluation, PolicyStore, type PrincipalPolicy, ReputationStore, type SHRBody, type SHRVerificationResult, type SanctuaryConfig, type SanctuaryServer, type SignedSHR, type SovereigntyTier, StateStore, StderrApprovalChannel, TIER_WEIGHTS, type TierMetadata, type TieredAttestation, WebhookApprovalChannel, type WebhookCallbackPayload, type WebhookConfig, type WebhookPayload, type ZKProofOfKnowledge, type ZKRangeProof, canonicalize, completeHandshake, computeWeightedScore, createBridgeCommitment, createPedersenCommitment, createProofOfKnowledge, createRangeProof, createSanctuaryServer, generateSHR, initiateHandshake, loadConfig, loadPrincipalPolicy, resolveTier, respondToHandshake, signPayload, tierDistribution, verifyBridgeCommitment, verifyCompletion, verifyPedersenCommitment, verifyProofOfKnowledge, verifyRangeProof, verifySHR, verifySignature };
+export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, type BridgeAttestationRequest, type BridgeAttestationResult, type BridgeCommitment, type BridgeVerificationResult, TEMPLATES as CONTEXT_GATE_TEMPLATES, CallbackApprovalChannel, CommitmentStore, type ConcordiaOutcome, type ContextAction, type ContextFilterResult, type ContextGatePolicy, ContextGatePolicyStore, type ContextGateRule, type ContextGateTemplate, DashboardApprovalChannel, type DashboardConfig, type FederationCapabilities, type FederationPeer, FederationRegistry, type FieldClassification, type FieldFilterResult, FilesystemStorage, type GateResult, type HandshakeChallenge, type HandshakeCompletion, type HandshakeResponse, type HandshakeResult, MemoryStorage, type PedersenCommitment, type PeerTrustEvaluation, type PolicyRecommendation, PolicyStore, type PrincipalPolicy, type ProviderCategory, ReputationStore, type SHRBody, type SHRVerificationResult, type SanctuaryConfig, type SanctuaryServer, type SignedSHR, type SovereigntyTier, StateStore, StderrApprovalChannel, TIER_WEIGHTS, type TierMetadata, type TieredAttestation, WebhookApprovalChannel, type WebhookCallbackPayload, type WebhookConfig, type WebhookPayload, type ZKProofOfKnowledge, type ZKRangeProof, canonicalize, classifyField, completeHandshake, computeWeightedScore, createBridgeCommitment, createPedersenCommitment, createProofOfKnowledge, createRangeProof, createSanctuaryServer, evaluateField, filterContext, generateSHR, getTemplate, initiateHandshake, listTemplateIds, loadConfig, loadPrincipalPolicy, recommendPolicy, resolveTier, respondToHandshake, signPayload, tierDistribution, verifyBridgeCommitment, verifyCompletion, verifyPedersenCommitment, verifyProofOfKnowledge, verifyRangeProof, verifySHR, verifySignature };
