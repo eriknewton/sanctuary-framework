@@ -8,7 +8,6 @@
  */
 
 import {
-  toBase64url,
   fromBase64url,
   stringToBytes,
 } from "../core/encoding.js";

@@ -469,7 +469,7 @@ export async function createSanctuaryServer(options?: {
   );
 
   // 14. Create L4 tools (reputation with sovereignty-gated tiers)
-  const { tools: l4Tools, reputationStore } = createL4Tools(
+  const { tools: l4Tools, reputationStore: _reputationStore } = createL4Tools(
     storage,
     masterKey,
     identityManager,

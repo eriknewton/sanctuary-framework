@@ -289,7 +289,6 @@ function determineTrustLevel(
  */
 function extractAuthorizationSignals(body: SHRBody): PingAuthorizationContext["authorization_signals"] {
   const l1 = body.layers.l1;
-  const l2 = body.layers.l2;
   const l3 = body.layers.l3;
   const l4 = body.layers.l4;
 
@@ -347,7 +346,7 @@ function transformDegradations(degradations: SHRDegradation[]): GatewayDegradati
  */
 function generateAuthorizationConstraints(
   body: SHRBody,
-  degradations: GatewayDegradation[]
+  _degradations: GatewayDegradation[]
 ): AuthorizationConstraint[] {
   const constraints: AuthorizationConstraint[] = [];
   const layers = body.layers;

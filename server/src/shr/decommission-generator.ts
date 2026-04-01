@@ -45,7 +45,6 @@ export async function generateDecommissionCertificate(
   opts: DecommissionGeneratorOptions
 ): Promise<SignedDecommissionCertificate | string> {
   const {
-    stateStore,
     identityManager,
     storage,
     reputationStore,
@@ -71,7 +70,7 @@ export async function generateDecommissionCertificate(
   let stateCheckDetails = "";
   try {
     // List all namespaces
-    const allNamespaces = await storage.list("_meta");
+    await storage.list("_meta");
     // The storage.list() method returns entries in the _meta namespace
     // We need to check if there are any non-reserved user namespaces
     // Since we can't easily list all namespaces from storage interface,
@@ -123,7 +122,7 @@ export async function generateDecommissionCertificate(
   try {
     if (reputationStore) {
       // Try to query reputation — should be empty
-      const query = await reputationStore.query();
+      const query = await reputationStore.query({});
       if (query.total_interactions > 0) {
         reputationCheckPassed = false;
         reputationCheckDetails = `Found ${query.total_interactions} active attestations. All must be revoked.`;
@@ -169,9 +168,7 @@ export async function generateDecommissionCertificate(
     certificate_issued_at: now.toISOString(),
     zero_state_checks: checks,
     all_checks_passed: allChecksPassed,
-    decommissioned_key_hash: toBase64url(
-      hashToString(stringToBytes(signingIdentity.public_key)).slice(0, 32)
-    ),
+    decommissioned_key_hash: hashToString(stringToBytes(signingIdentity.public_key)).slice(0, 32),
     private_key_zeroed: true, // Assumed true if the signing identity is still accessible
     decommissioning_reason: "Agent decommissioned via principal policy",
   };
