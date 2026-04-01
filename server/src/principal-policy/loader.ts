@@ -89,6 +89,11 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "context_gate_list_policies",
     "l2_hardening_status",
     "l2_verify_isolation",
+    "sovereignty_audit",
+    "shr_gateway_export",
+    "bridge_commit",
+    "bridge_verify",
+    "bridge_attest",
   ],
   approval_channel: DEFAULT_CHANNEL,
 };
@@ -290,6 +295,11 @@ tier3_always_allow:
   - context_gate_recommend
   - context_gate_filter
   - context_gate_list_policies
+  - sovereignty_audit
+  - shr_gateway_export
+  - bridge_commit
+  - bridge_verify
+  - bridge_attest
 
 # ─── Approval Channel ────────────────────────────────────────────────────
 # How Sanctuary reaches you when approval is needed.

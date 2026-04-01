@@ -23,10 +23,7 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { createServer as createHttpsServer } from "node:https";
 import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { createRequire } from "node:module";
-
-const require = createRequire(import.meta.url);
-const { version: PKG_VERSION } = require("../../package.json");
+import { SANCTUARY_VERSION as PKG_VERSION } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import type { ApprovalRequest, ApprovalResponse, PrincipalPolicy } from "./types.js";
 import type { BaselineTracker } from "./baseline.js";

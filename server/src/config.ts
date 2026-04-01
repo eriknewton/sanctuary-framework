@@ -12,6 +12,9 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
 
+/** Package version, exported for use by other modules (avoids duplicate require paths). */
+export const SANCTUARY_VERSION = PKG_VERSION;
+
 export interface SanctuaryConfig {
   version: string;
   storage_path: string;
