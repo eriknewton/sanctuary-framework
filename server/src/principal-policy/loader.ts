@@ -195,6 +195,14 @@ function parseScalar(value: string): string | number | boolean {
 }
 
 function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
+  // Merge tier3: user's list + any new defaults added in later versions.
+  // This ensures upgrades automatically include new read-only tools
+  // without requiring operators to manually edit their policy file.
+  const userTier3 = (raw.tier3_always_allow as string[]) ?? [];
+  const mergedTier3 = [
+    ...new Set([...userTier3, ...DEFAULT_POLICY.tier3_always_allow]),
+  ];
+
   return {
     version: (raw.version as number) ?? 1,
     tier1_always_approve:
@@ -203,8 +211,7 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
       ...DEFAULT_TIER2,
       ...((raw.tier2_anomaly as Record<string, unknown>) ?? {}),
     } as Tier2Config,
-    tier3_always_allow:
-      (raw.tier3_always_allow as string[]) ?? DEFAULT_POLICY.tier3_always_allow,
+    tier3_always_allow: mergedTier3,
     approval_channel: (() => {
       const merged = {
         ...DEFAULT_CHANNEL,

@@ -48,7 +48,13 @@ approval_channel:
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(3);
       expect(policy.tier2_anomaly.max_signs_per_minute).toBe(5);
       expect(policy.tier2_anomaly.bulk_read_threshold).toBe(10);
-      expect(policy.tier3_always_allow).toEqual(["state_read", "state_write"]);
+      // User's tier3 entries are preserved, and defaults are merged in
+      expect(policy.tier3_always_allow).toContain("state_read");
+      expect(policy.tier3_always_allow).toContain("state_write");
+      // Defaults merged from DEFAULT_POLICY (upgrade-safe)
+      expect(policy.tier3_always_allow).toContain("sovereignty_audit");
+      expect(policy.tier3_always_allow).toContain("shr_generate");
+      expect(policy.tier3_always_allow).toContain("monitor_health");
       expect(policy.approval_channel.type).toBe("stderr");
       expect(policy.approval_channel.timeout_seconds).toBe(120);
       // SEC-002: auto_deny is stripped by the parser — always undefined

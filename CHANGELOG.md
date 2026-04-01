@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-04-01
+
+### Fixed
+
+- **sovereignty_audit blocked on existing installations** — The v0.4.1 fix added `sovereignty_audit` to `DEFAULT_POLICY.tier3_always_allow`, but existing installations already had a `principal-policy.yaml` on disk from v0.3.1 that was loaded instead. The policy loader now **merges** default tier3 entries into user policy files, so new read-only tools from upgrades are automatically permitted without requiring operators to edit their policy file. This is upgrade-safe: user customizations are preserved and defaults are additive.
+
 ## [0.4.1] - 2026-04-01
 
 ### Fixed
