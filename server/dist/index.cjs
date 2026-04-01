@@ -4058,315 +4058,898 @@ function generateDashboardHTML(options) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sanctuary \u2014 Principal Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0f1117;
-    --bg-surface: #1a1d27;
-    --bg-elevated: #242736;
-    --border: #2e3244;
-    --text: #e4e6f0;
-    --text-muted: #8b8fa3;
-    --accent: #6c8aff;
-    --accent-hover: #839dff;
-    --approve: #3ecf8e;
-    --approve-hover: #5dd9a3;
-    --deny: #f87171;
-    --deny-hover: #fca5a5;
-    --warning: #fbbf24;
-    --tier1: #f87171;
-    --tier2: #fbbf24;
-    --tier3: #3ecf8e;
-    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    --mono: "SF Mono", "Fira Code", "Cascadia Code", monospace;
-    --radius: 8px;
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --green: #3fb950;
+    --amber: #d29922;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --radius: 6px;
   }
 
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+  }
+
   body {
-    font-family: var(--font);
+    font-family: var(--sans);
     background: var(--bg);
-    color: var(--text);
-    line-height: 1.5;
-    min-height: 100vh;
+    color: var(--text-primary);
+    display: flex;
+    flex-direction: column;
   }
 
-  /* Layout */
-  .container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+  /* \u2500\u2500 Top Status Bar (fixed) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
 
-  header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding-bottom: 20px; border-bottom: 1px solid var(--border);
-    margin-bottom: 24px;
+  .status-bar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 56px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 24px;
+    z-index: 1000;
   }
-  header h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.3px; }
-  header h1 span { color: var(--accent); }
-  .status-badge {
-    display: inline-flex; align-items: center; gap: 6px;
-    font-size: 12px; color: var(--text-muted);
-    padding: 4px 10px; border-radius: 12px;
-    background: var(--bg-surface); border: 1px solid var(--border);
-  }
-  .status-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--approve); animation: pulse 2s infinite;
-  }
-  .status-dot.disconnected { background: var(--deny); animation: none; }
-  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
-  /* Tabs */
-  .tabs {
-    display: flex; gap: 2px; margin-bottom: 20px;
-    background: var(--bg-surface); border-radius: var(--radius);
-    padding: 3px; border: 1px solid var(--border);
+  .status-bar-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 0 0 auto;
   }
-  .tab {
-    flex: 1; padding: 8px 12px; text-align: center;
-    font-size: 13px; font-weight: 500; cursor: pointer;
-    border-radius: 6px; border: none; color: var(--text-muted);
-    background: transparent; transition: all 0.15s;
-  }
-  .tab:hover { color: var(--text); }
-  .tab.active { background: var(--bg-elevated); color: var(--text); }
-  .tab .count {
-    display: inline-flex; align-items: center; justify-content: center;
-    min-width: 18px; height: 18px; padding: 0 5px;
-    font-size: 11px; font-weight: 600; border-radius: 9px;
-    margin-left: 6px;
-  }
-  .tab .count.alert { background: var(--deny); color: white; }
-  .tab .count.muted { background: var(--border); color: var(--text-muted); }
 
-  /* Tab Content */
-  .tab-content { display: none; }
-  .tab-content.active { display: block; }
+  .sanctuary-logo {
+    font-weight: 700;
+    font-size: 16px;
+    letter-spacing: -0.5px;
+    color: var(--text-primary);
+  }
 
-  /* Pending Requests */
-  .pending-empty {
-    text-align: center; padding: 60px 20px; color: var(--text-muted);
+  .sanctuary-logo span {
+    color: var(--blue);
   }
-  .pending-empty .icon { font-size: 32px; margin-bottom: 12px; }
-  .pending-empty p { font-size: 14px; }
 
-  .request-card {
-    background: var(--bg-surface); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 16px; margin-bottom: 12px;
-    animation: slideIn 0.2s ease-out;
-  }
-  @keyframes slideIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
-  .request-card.tier1 { border-left: 3px solid var(--tier1); }
-  .request-card.tier2 { border-left: 3px solid var(--tier2); }
-  .request-header {
-    display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: 10px;
-  }
-  .request-op {
-    font-family: var(--mono); font-size: 14px; font-weight: 600;
-  }
-  .tier-badge {
-    font-size: 11px; font-weight: 600; padding: 2px 8px;
-    border-radius: 4px; text-transform: uppercase;
-  }
-  .tier-badge.tier1 { background: rgba(248,113,113,0.15); color: var(--tier1); }
-  .tier-badge.tier2 { background: rgba(251,191,36,0.15); color: var(--tier2); }
-  .request-reason {
-    font-size: 13px; color: var(--text-muted); margin-bottom: 12px;
-  }
-  .request-context {
-    font-family: var(--mono); font-size: 12px; color: var(--text-muted);
-    background: var(--bg); border-radius: 4px; padding: 8px 10px;
-    margin-bottom: 14px; white-space: pre-wrap; word-break: break-all;
-    max-height: 120px; overflow-y: auto;
-  }
-  .request-actions {
-    display: flex; align-items: center; gap: 10px;
-  }
-  .btn {
-    padding: 7px 16px; border-radius: 6px; font-size: 13px;
-    font-weight: 600; border: none; cursor: pointer;
-    transition: all 0.15s;
-  }
-  .btn-approve { background: var(--approve); color: #0f1117; }
-  .btn-approve:hover { background: var(--approve-hover); }
-  .btn-deny { background: var(--deny); color: white; }
-  .btn-deny:hover { background: var(--deny-hover); }
-  .countdown {
-    margin-left: auto; font-size: 12px; color: var(--text-muted);
+  .version {
+    font-size: 11px;
+    color: var(--text-secondary);
     font-family: var(--mono);
   }
-  .countdown.urgent { color: var(--deny); font-weight: 600; }
 
-  /* Audit Log */
-  .audit-table { width: 100%; border-collapse: collapse; }
-  .audit-table th {
-    text-align: left; font-size: 11px; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--text-muted); padding: 8px 10px;
+  .status-bar-center {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .sovereignty-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: rgba(88, 166, 255, 0.1);
+    border: 1px solid var(--blue);
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .sovereignty-score {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 12px;
+    background: var(--blue);
+    color: var(--bg);
+  }
+
+  .sovereignty-score.high {
+    background: var(--green);
+  }
+
+  .sovereignty-score.medium {
+    background: var(--amber);
+  }
+
+  .sovereignty-score.low {
+    background: var(--red);
+  }
+
+  .status-bar-right {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex: 0 0 auto;
+  }
+
+  .protections-indicator {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-family: var(--mono);
+  }
+
+  .protections-indicator .count {
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+
+  .uptime {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-family: var(--mono);
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  .status-dot.disconnected {
+    background: var(--red);
+    animation: none;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  .pending-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    height: 24px;
+    padding: 0 6px;
+    background: var(--red);
+    color: white;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 700;
+    animation: pulse 1s ease-in-out infinite;
+  }
+
+  .pending-badge.hidden {
+    display: none;
+  }
+
+  /* \u2500\u2500 Main Layout \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+
+  .main-container {
+    flex: 1;
+    display: flex;
+    margin-top: 56px;
+    overflow: hidden;
+  }
+
+  .activity-feed {
+    flex: 3;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--border);
+    overflow: hidden;
+  }
+
+  .feed-header {
+    padding: 16px 20px;
     border-bottom: 1px solid var(--border);
-  }
-  .audit-table td {
-    font-size: 13px; padding: 8px 10px;
-    border-bottom: 1px solid var(--border);
-  }
-  .audit-table tr { transition: background 0.1s; }
-  .audit-table tr:hover { background: var(--bg-elevated); }
-  .audit-table tr.new { animation: highlight 1s ease-out; }
-  @keyframes highlight { from { background: rgba(108,138,255,0.15); } to { background: transparent; } }
-  .audit-time { font-family: var(--mono); font-size: 12px; color: var(--text-muted); }
-  .audit-op { font-family: var(--mono); font-size: 12px; }
-  .audit-layer {
-    font-size: 11px; font-weight: 600; padding: 1px 6px;
-    border-radius: 3px; text-transform: uppercase;
-  }
-  .audit-layer.l1 { background: rgba(108,138,255,0.15); color: var(--accent); }
-  .audit-layer.l2 { background: rgba(251,191,36,0.15); color: var(--tier2); }
-  .audit-layer.l3 { background: rgba(62,207,142,0.15); color: var(--tier3); }
-  .audit-layer.l4 { background: rgba(168,85,247,0.15); color: #a855f7; }
-
-  /* Baseline & Policy */
-  .info-section {
-    background: var(--bg-surface); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 16px; margin-bottom: 16px;
-  }
-  .info-section h3 {
-    font-size: 13px; font-weight: 600; text-transform: uppercase;
-    letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 12px;
-  }
-  .info-row {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 6px 0; font-size: 13px;
-  }
-  .info-label { color: var(--text-muted); }
-  .info-value { font-family: var(--mono); font-size: 12px; }
-  .tag-list { display: flex; flex-wrap: wrap; gap: 4px; }
-  .tag {
-    font-family: var(--mono); font-size: 11px; padding: 2px 8px;
-    background: var(--bg-elevated); border-radius: 4px;
-    color: var(--text-muted); border: 1px solid var(--border);
-  }
-  .policy-op {
-    font-family: var(--mono); font-size: 12px; padding: 3px 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
   }
 
-  /* Footer */
-  footer {
-    margin-top: 32px; padding-top: 16px;
-    border-top: 1px solid var(--border);
-    font-size: 12px; color: var(--text-muted);
+  .feed-header-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+  }
+
+  .activity-list {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .activity-item {
+    padding: 12px 20px;
+    border-bottom: 1px solid rgba(48, 54, 61, 0.5);
+    font-size: 13px;
+    font-family: var(--mono);
+    cursor: pointer;
+    transition: background 0.15s;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .activity-item:hover {
+    background: rgba(88, 166, 255, 0.05);
+  }
+
+  .activity-item-icon {
+    flex: 0 0 auto;
+    width: 16px;
     text-align: center;
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 1px;
+  }
+
+  .activity-item-content {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .activity-time {
+    color: var(--text-secondary);
+    font-size: 11px;
+    margin-bottom: 2px;
+  }
+
+  .activity-main {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    margin-bottom: 4px;
+  }
+
+  .activity-tier {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 16px;
+    font-size: 10px;
+    font-weight: 700;
+    border-radius: 3px;
+    text-transform: uppercase;
+    flex: 0 0 auto;
+  }
+
+  .activity-tier.t1 {
+    background: rgba(248, 81, 73, 0.2);
+    color: var(--red);
+  }
+
+  .activity-tier.t2 {
+    background: rgba(210, 153, 34, 0.2);
+    color: var(--amber);
+  }
+
+  .activity-tier.t3 {
+    background: rgba(63, 185, 80, 0.2);
+    color: var(--green);
+  }
+
+  .activity-tool {
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+
+  .activity-outcome {
+    color: var(--green);
+  }
+
+  .activity-outcome.denied {
+    color: var(--red);
+  }
+
+  .activity-detail {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-left: 0;
+  }
+
+  .activity-item.expanded .activity-detail {
+    display: block;
+    margin-top: 8px;
+    padding: 10px;
+    background: rgba(88, 166, 255, 0.08);
+    border-left: 2px solid var(--blue);
+    border-radius: 4px;
+  }
+
+  .activity-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-secondary);
+  }
+
+  .activity-empty-icon {
+    font-size: 32px;
+    margin-bottom: 12px;
+  }
+
+  .activity-empty-text {
+    font-size: 14px;
+  }
+
+  /* \u2500\u2500 Protection Status Sidebar (40%) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+
+  .protection-sidebar {
+    flex: 2;
+    display: flex;
+    flex-direction: column;
+    background: rgba(22, 27, 34, 0.5);
+    overflow: hidden;
+  }
+
+  .sidebar-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .sidebar-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 16px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  .protection-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .protection-card-icon {
+    font-size: 14px;
+  }
+
+  .protection-card-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+  }
+
+  .protection-card-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .protection-card-status.active {
+    color: var(--green);
+  }
+
+  .protection-card-status.inactive {
+    color: var(--text-secondary);
+  }
+
+  .protection-card-stat {
+    font-size: 11px;
+    color: var(--text-secondary);
+    font-family: var(--mono);
+    margin-top: 4px;
+  }
+
+  /* \u2500\u2500 Pending Approvals Overlay \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+
+  .pending-overlay {
+    position: fixed;
+    top: 56px;
+    right: 0;
+    bottom: 0;
+    width: 0;
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    z-index: 999;
+    overflow-y: auto;
+    transition: width 0.3s ease-out;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .pending-overlay.active {
+    width: 380px;
+  }
+
+  @media (max-width: 1400px) {
+    .pending-overlay.active {
+      width: 100%;
+      right: auto;
+      left: 0;
+    }
+  }
+
+  .pending-overlay-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex: 0 0 auto;
+  }
+
+  .pending-overlay-title {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-primary);
+  }
+
+  .pending-overlay-close {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 18px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .pending-overlay-close:hover {
+    color: var(--text-primary);
+  }
+
+  .pending-list {
+    flex: 1;
+    overflow-y: auto;
+  }
+
+  .pending-item {
+    padding: 16px 20px;
+    border-bottom: 1px solid rgba(48, 54, 61, 0.5);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .pending-item-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .pending-item-op {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    flex: 1;
+  }
+
+  .pending-item-tier {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 20px;
+    font-size: 9px;
+    font-weight: 700;
+    border-radius: 3px;
+    text-transform: uppercase;
+    color: white;
+  }
+
+  .pending-item-tier.tier1 {
+    background: var(--red);
+  }
+
+  .pending-item-tier.tier2 {
+    background: var(--amber);
+  }
+
+  .pending-item-reason {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .pending-item-timer {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--text-secondary);
+  }
+
+  .pending-item-timer-bar {
+    flex: 1;
+    height: 4px;
+    background: rgba(48, 54, 61, 0.8);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .pending-item-timer-fill {
+    height: 100%;
+    background: var(--blue);
+    transition: width 0.1s linear;
+  }
+
+  .pending-item-timer.urgent .pending-item-timer-fill {
+    background: var(--red);
+  }
+
+  .pending-item-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  .btn {
+    flex: 1;
+    padding: 8px 12px;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: var(--sans);
+  }
+
+  .btn-approve {
+    background: var(--green);
+    color: var(--bg);
+  }
+
+  .btn-approve:hover {
+    background: #4ecf5e;
+  }
+
+  .btn-deny {
+    background: var(--red);
+    color: white;
+  }
+
+  .btn-deny:hover {
+    background: #f9605e;
+  }
+
+  /* \u2500\u2500 Threat Panel (collapsible footer) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+
+  .threat-panel {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    max-height: 240px;
+    z-index: 500;
+    display: flex;
+    flex-direction: column;
+    transition: max-height 0.3s ease-out;
+  }
+
+  .threat-panel.collapsed {
+    max-height: 40px;
+  }
+
+  .threat-header {
+    padding: 12px 20px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+    flex: 0 0 auto;
+  }
+
+  .threat-header:hover {
+    background: rgba(88, 166, 255, 0.05);
+  }
+
+  .threat-icon {
+    font-size: 14px;
+  }
+
+  .threat-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 20px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .threat-item {
+    padding: 8px 10px;
+    background: rgba(248, 81, 73, 0.1);
+    border-left: 2px solid var(--red);
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  .threat-item-type {
+    font-weight: 600;
+    color: var(--red);
+    font-family: var(--mono);
+  }
+
+  .threat-empty {
+    text-align: center;
+    padding: 20px 10px;
+    color: var(--text-secondary);
+    font-size: 12px;
+  }
+
+  /* \u2500\u2500 Scrollbars \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+
+  ::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(88, 166, 255, 0.3);
+  }
+
+  /* \u2500\u2500 Responsive \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+
+  @media (max-width: 1200px) {
+    .protection-sidebar {
+      display: none;
+    }
+
+    .activity-feed {
+      border-right: none;
+    }
+  }
+
+  @media (max-width: 768px) {
+    .status-bar {
+      padding: 0 12px;
+      gap: 12px;
+      height: 48px;
+    }
+
+    .sanctuary-logo {
+      font-size: 14px;
+    }
+
+    .status-bar-center {
+      display: none;
+    }
+
+    .main-container {
+      margin-top: 48px;
+    }
+
+    .activity-item {
+      padding: 10px 12px;
+    }
+
+    .pending-overlay.active {
+      width: 100%;
+    }
+
+    .threat-panel {
+      max-height: 200px;
+    }
   }
 </style>
 </head>
 <body>
-<div class="container">
-  <header>
-    <h1><span>Sanctuary</span> Principal Dashboard</h1>
-    <div class="status-badge">
-      <div class="status-dot" id="statusDot"></div>
-      <span id="statusText">Connected</span>
-    </div>
-  </header>
 
-  <div class="tabs">
-    <button class="tab active" data-tab="pending">
-      Pending<span class="count muted" id="pendingCount">0</span>
-    </button>
-    <button class="tab" data-tab="audit">
-      Audit Log<span class="count muted" id="auditCount">0</span>
-    </button>
-    <button class="tab" data-tab="baseline">Baseline</button>
-    <button class="tab" data-tab="policy">Policy</button>
+<!-- Status Bar (fixed, top) -->
+<div class="status-bar">
+  <div class="status-bar-left">
+    <div class="sanctuary-logo"><span>\u25C6</span> SANCTUARY</div>
+    <div class="version">v${options.serverVersion}</div>
   </div>
-
-  <!-- Pending Approvals -->
-  <div class="tab-content active" id="tab-pending">
-    <div class="pending-empty" id="pendingEmpty">
-      <div class="icon">&#x2714;</div>
-      <p>No pending approval requests.</p>
-      <p style="font-size:12px; margin-top:4px;">Requests will appear here in real time.</p>
-    </div>
-    <div id="pendingList"></div>
-  </div>
-
-  <!-- Audit Log -->
-  <div class="tab-content" id="tab-audit">
-    <table class="audit-table">
-      <thead>
-        <tr><th>Time</th><th>Layer</th><th>Operation</th><th>Identity</th></tr>
-      </thead>
-      <tbody id="auditBody"></tbody>
-    </table>
-  </div>
-
-  <!-- Baseline -->
-  <div class="tab-content" id="tab-baseline">
-    <div class="info-section">
-      <h3>Session Info</h3>
-      <div class="info-row"><span class="info-label">First session</span><span class="info-value" id="bFirstSession">\u2014</span></div>
-      <div class="info-row"><span class="info-label">Started</span><span class="info-value" id="bStarted">\u2014</span></div>
-    </div>
-    <div class="info-section">
-      <h3>Known Namespaces</h3>
-      <div class="tag-list" id="bNamespaces"><span class="tag">\u2014</span></div>
-    </div>
-    <div class="info-section">
-      <h3>Known Counterparties</h3>
-      <div class="tag-list" id="bCounterparties"><span class="tag">\u2014</span></div>
-    </div>
-    <div class="info-section">
-      <h3>Tool Call Counts</h3>
-      <div id="bToolCalls"><span class="info-value">\u2014</span></div>
+  <div class="status-bar-center">
+    <div class="sovereignty-badge">
+      <div class="sovereignty-score" id="sovereigntyScore">85</div>
+      <span>Sovereignty Health</span>
     </div>
   </div>
+  <div class="status-bar-right">
+    <div class="protections-indicator">
+      <span class="count" id="activeProtections">6</span>/6 protections
+    </div>
+    <div class="uptime">
+      <span id="uptimeText">\u2014</span>
+    </div>
+    <div class="status-dot" id="statusDot"></div>
+    <div class="pending-badge hidden" id="pendingBadge">0</div>
+  </div>
+</div>
 
-  <!-- Policy -->
-  <div class="tab-content" id="tab-policy">
-    <div class="info-section">
-      <h3>Tier 1 \u2014 Always Requires Approval</h3>
-      <div id="pTier1"></div>
+<!-- Main Layout -->
+<div class="main-container">
+  <!-- Activity Feed -->
+  <div class="activity-feed">
+    <div class="feed-header">
+      <div class="feed-header-dot"></div>
+      Live Activity
     </div>
-    <div class="info-section">
-      <h3>Tier 2 \u2014 Anomaly Detection</h3>
-      <div id="pTier2"></div>
-    </div>
-    <div class="info-section">
-      <h3>Tier 3 \u2014 Always Allowed</h3>
-      <div class="info-row">
-        <span class="info-label">Operations</span>
-        <span class="info-value" id="pTier3Count">\u2014</span>
+    <div class="activity-list" id="activityList">
+      <div class="activity-empty">
+        <div class="activity-empty-icon">\u2192</div>
+        <div class="activity-empty-text">Waiting for activity...</div>
       </div>
     </div>
-    <div class="info-section">
-      <h3>Approval Channel</h3>
-      <div id="pChannel"></div>
-    </div>
   </div>
 
-  <footer>Sanctuary Framework v${options.serverVersion} \u2014 Principal Dashboard</footer>
+  <!-- Protection Status Sidebar -->
+  <div class="protection-sidebar" id="protectionSidebar">
+    <div class="sidebar-header">
+      <span>\u25C6</span> Protection Status
+    </div>
+    <div class="sidebar-content">
+      <div class="protection-card">
+        <div class="protection-card-icon">\u{1F510}</div>
+        <div class="protection-card-label">Encryption</div>
+        <div class="protection-card-status active" id="encryptionStatus">\u2713 Active</div>
+        <div class="protection-card-stat" id="encryptionStat">Ed25519</div>
+      </div>
+
+      <div class="protection-card">
+        <div class="protection-card-icon">\u2713</div>
+        <div class="protection-card-label">Approval Gate</div>
+        <div class="protection-card-status active" id="approvalStatus">\u2713 Active</div>
+        <div class="protection-card-stat" id="approvalStat">T1: 2 | T2: 3</div>
+      </div>
+
+      <div class="protection-card">
+        <div class="protection-card-icon">\u{1F3AF}</div>
+        <div class="protection-card-label">Context Gating</div>
+        <div class="protection-card-status active" id="contextStatus">\u2713 Active</div>
+        <div class="protection-card-stat" id="contextStat">12 filtered</div>
+      </div>
+
+      <div class="protection-card">
+        <div class="protection-card-icon">\u26A0</div>
+        <div class="protection-card-label">Injection Detection</div>
+        <div class="protection-card-status active" id="injectionStatus">\u2713 Active</div>
+        <div class="protection-card-stat" id="injectionStat">3 flags today</div>
+      </div>
+
+      <div class="protection-card">
+        <div class="protection-card-icon">\u{1F4CA}</div>
+        <div class="protection-card-label">Behavioral Baseline</div>
+        <div class="protection-card-status active" id="baselineStatus">\u2713 Active</div>
+        <div class="protection-card-stat" id="baselineStat">0 anomalies</div>
+      </div>
+
+      <div class="protection-card">
+        <div class="protection-card-icon">\u{1F4CB}</div>
+        <div class="protection-card-label">Audit Trail</div>
+        <div class="protection-card-status active" id="auditStatus">\u2713 Active</div>
+        <div class="protection-card-stat" id="auditStat">284 entries</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Pending Approvals Overlay -->
+<div class="pending-overlay" id="pendingOverlay">
+  <div class="pending-overlay-header">
+    <div class="pending-overlay-title">Pending Approvals</div>
+    <button class="pending-overlay-close" onclick="closePendingOverlay()">\xD7</button>
+  </div>
+  <div class="pending-list" id="pendingList"></div>
+</div>
+
+<!-- Threat Panel (collapsible footer) -->
+<div class="threat-panel collapsed" id="threatPanel">
+  <div class="threat-header" onclick="toggleThreatPanel()">
+    <span class="threat-icon">\u26A0</span>
+    Recent Threats
+    <span id="threatCount" style="margin-left: auto; color: var(--red); font-weight: 700;">0</span>
+  </div>
+  <div class="threat-content" id="threatContent">
+    <div class="threat-empty">No threats detected</div>
+  </div>
 </div>
 
 <script>
 (function() {
-  const TIMEOUT = ${options.timeoutSeconds};
-  // SEC-012: Auth token is passed via Authorization header only \u2014 never in URLs.
-  // The token is provided by the server at generation time (embedded for initial auth).
-  const AUTH_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : "null"};
-  let SESSION_ID = null; // Short-lived session for SSE and URL-based requests
-  const pending = new Map();
-  let auditCount = 0;
+  'use strict';
 
-  // Auth helpers \u2014 SEC-012: token goes in header, session goes in URL
+  // \u2500\u2500 Configuration \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+  const TIMEOUT_SECONDS = ${options.timeoutSeconds};
+  const AUTH_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : "null"};
+  const MAX_ACTIVITY_ITEMS = 100;
+  const MAX_THREAT_ITEMS = 20;
+
+  // \u2500\u2500 State \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+  let SESSION_ID = null;
+  let evtSource = null;
+  let startTime = Date.now();
+  let activityCount = 0;
+  let threatCount = 0;
+  const pendingRequests = new Map();
+  const activityItems = [];
+  const threatItems = [];
+  let sovereigntyScore = 85;
+
+  // \u2500\u2500 Auth Helpers (SEC-012) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
   function authHeaders() {
     const h = { 'Content-Type': 'application/json' };
     if (AUTH_TOKEN) h['Authorization'] = 'Bearer ' + AUTH_TOKEN;
     return h;
   }
+
   function sessionQuery(url) {
     if (!SESSION_ID) return url;
     const sep = url.includes('?') ? '&' : '?';
     return url + sep + 'session=' + SESSION_ID;
   }
 
-  // SEC-012: Exchange the long-lived token for a short-lived session
   async function exchangeSession() {
     if (!AUTH_TOKEN) return;
     try {
@@ -4374,234 +4957,481 @@ function generateDashboardHTML(options) {
       if (resp.ok) {
         const data = await resp.json();
         SESSION_ID = data.session_id;
-        // Refresh session before expiry (at 80% of TTL)
         const refreshMs = (data.expires_in_seconds || 300) * 800;
-        setTimeout(async () => { await exchangeSession(); reconnectSSE(); }, refreshMs);
+        setTimeout(() => { exchangeSession(); reconnectSSE(); }, refreshMs);
       }
-    } catch(e) { /* will retry on next connect */ }
+    } catch (e) {
+      // Retry on next connect
+    }
   }
 
-  // Tab switching
-  document.querySelectorAll('.tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-      tab.classList.add('active');
-      document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
-    });
-  });
+  // \u2500\u2500 UI Utilities \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
-  // SSE Connection \u2014 SEC-012: uses short-lived session token in URL, not auth token
-  let evtSource;
+  function esc(s) {
+    const d = document.createElement('div');
+    d.textContent = String(s || '');
+    return d.innerHTML;
+  }
+
+  function closePendingOverlay() {
+    document.getElementById('pendingOverlay').classList.remove('active');
+  }
+
+  function toggleThreatPanel() {
+    document.getElementById('threatPanel').classList.toggle('collapsed');
+  }
+
+  function updateUptime() {
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const hours = Math.floor(elapsed / 3600);
+    const mins = Math.floor((elapsed % 3600) / 60);
+    const secs = elapsed % 60;
+    let uptimeStr = '';
+    if (hours > 0) uptimeStr += hours + 'h ';
+    if (mins > 0) uptimeStr += mins + 'm ';
+    uptimeStr += secs + 's';
+    document.getElementById('uptimeText').textContent = uptimeStr;
+  }
+
+  // \u2500\u2500 Sovereignty Score \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+  function updateSovereigntyScore(score) {
+    sovereigntyScore = Math.min(100, Math.max(0, score || 85));
+    const badge = document.getElementById('sovereigntyScore');
+    badge.textContent = sovereigntyScore;
+    badge.className = 'sovereignty-score';
+    if (sovereigntyScore >= 80) {
+      badge.classList.add('high');
+    } else if (sovereigntyScore >= 50) {
+      badge.classList.add('medium');
+    } else {
+      badge.classList.add('low');
+    }
+  }
+
+  // \u2500\u2500 Activity Feed \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+  function addActivityItem(data) {
+    const {
+      timestamp,
+      tier,
+      tool,
+      outcome,
+      detail,
+      hasInjection,
+      isContextGated
+    } = data;
+
+    const item = {
+      id: 'activity-' + activityCount++,
+      timestamp: timestamp || new Date().toISOString(),
+      tier: tier || 1,
+      tool: tool || 'unknown_tool',
+      outcome: outcome || 'executed',
+      detail: detail || '',
+      hasInjection: !!hasInjection,
+      isContextGated: !!isContextGated
+    };
+
+    activityItems.unshift(item);
+    if (activityItems.length > MAX_ACTIVITY_ITEMS) {
+      activityItems.pop();
+    }
+
+    renderActivityFeed();
+  }
+
+  function renderActivityFeed() {
+    const list = document.getElementById('activityList');
+
+    if (activityItems.length === 0) {
+      list.innerHTML = '<div class="activity-empty"><div class="activity-empty-icon">\u2192</div><div class="activity-empty-text">Waiting for activity...</div></div>';
+      return;
+    }
+
+    list.innerHTML = '';
+    for (const item of activityItems) {
+      const tr = document.createElement('div');
+      tr.className = 'activity-item';
+      tr.id = item.id;
+
+      const time = new Date(item.timestamp);
+      const timeStr = time.toLocaleTimeString();
+
+      const tierClass = 't' + item.tier;
+      const outcomeClass = item.outcome === 'denied' ? 'outcome denied' : 'outcome';
+
+      let icon = '\u25CF';
+      if (item.isContextGated) icon = '\u{1F3AF}';
+      else if (item.hasInjection) icon = '\u26A0';
+      else if (item.outcome === 'denied') icon = '\u2717';
+      else icon = '\u2713';
+
+      tr.innerHTML =
+        '<div class="activity-item-icon">' + esc(icon) + '</div>' +
+        '<div class="activity-item-content">' +
+          '<div class="activity-time">' + esc(timeStr) + '</div>' +
+          '<div class="activity-main">' +
+            '<span class="activity-tier ' + tierClass + '">T' + item.tier + '</span>' +
+            '<span class="activity-tool">' + esc(item.tool) + '</span>' +
+            '<span class="activity-outcome ' + (outcomeClass === 'outcome denied' ? 'denied' : '') + '">' + (item.outcome === 'denied' ? '\u2717 denied' : '\u2713 allowed') + '</span>' +
+          '</div>' +
+          '<div class="activity-detail">' + esc(item.detail) + '</div>' +
+        '</div>' +
+      '';
+
+      tr.addEventListener('click', () => {
+        tr.classList.toggle('expanded');
+      });
+
+      list.appendChild(tr);
+    }
+  }
+
+  // \u2500\u2500 Pending Approvals \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+  function addPendingRequest(data) {
+    const {
+      request_id,
+      operation,
+      tier,
+      reason,
+      context,
+      timestamp
+    } = data;
+
+    const pending = {
+      id: request_id,
+      operation: operation || 'unknown',
+      tier: tier || 1,
+      reason: reason || '',
+      context: context || {},
+      timestamp: timestamp || new Date().toISOString(),
+      remaining: TIMEOUT_SECONDS
+    };
+
+    pendingRequests.set(request_id, pending);
+    updatePendingUI();
+  }
+
+  function removePendingRequest(id) {
+    pendingRequests.delete(id);
+    updatePendingUI();
+  }
+
+  function updatePendingUI() {
+    const count = pendingRequests.size;
+    const badge = document.getElementById('pendingBadge');
+
+    if (count > 0) {
+      badge.classList.remove('hidden');
+      badge.textContent = count;
+      document.getElementById('pendingOverlay').classList.add('active');
+    } else {
+      badge.classList.add('hidden');
+      document.getElementById('pendingOverlay').classList.remove('active');
+    }
+
+    renderPendingList();
+  }
+
+  function renderPendingList() {
+    const list = document.getElementById('pendingList');
+    list.innerHTML = '';
+
+    for (const [id, req] of pendingRequests) {
+      const item = document.createElement('div');
+      item.className = 'pending-item';
+
+      const tier = req.tier || 1;
+      const tierClass = 'tier' + tier;
+      const pct = Math.max(0, Math.min(100, (req.remaining / TIMEOUT_SECONDS) * 100));
+      const isUrgent = req.remaining <= 30;
+
+      item.innerHTML =
+        '<div class="pending-item-header">' +
+          '<div class="pending-item-op">' + esc(req.operation) + '</div>' +
+          '<div class="pending-item-tier ' + tierClass + '">T' + tier + '</div>' +
+        '</div>' +
+        '<div class="pending-item-reason">' + esc(req.reason) + '</div>' +
+        '<div class="pending-item-timer ' + (isUrgent ? 'urgent' : '') + '">' +
+          '<div class="pending-item-timer-bar">' +
+            '<div class="pending-item-timer-fill" style="width: ' + pct + '%"></div>' +
+          '</div>' +
+          '<span id="timer-' + id + '">' + req.remaining + 's</span>' +
+        '</div>' +
+        '<div class="pending-item-actions">' +
+          '<button class="btn btn-approve" onclick="handleApprove('' + id + '')">Approve</button>' +
+          '<button class="btn btn-deny" onclick="handleDeny('' + id + '')">Deny</button>' +
+        '</div>' +
+      '';
+
+      list.appendChild(item);
+    }
+  }
+
+  window.handleApprove = function(id) {
+    fetch('/api/approve/' + id, { method: 'POST', headers: authHeaders() }).then(() => {
+      removePendingRequest(id);
+    }).catch(() => {});
+  };
+
+  window.handleDeny = function(id) {
+    fetch('/api/deny/' + id, { method: 'POST', headers: authHeaders() }).then(() => {
+      removePendingRequest(id);
+    }).catch(() => {});
+  };
+
+  // \u2500\u2500 Threats \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+  function addThreat(data) {
+    const {
+      timestamp,
+      severity,
+      type,
+      details
+    } = data;
+
+    const threat = {
+      id: 'threat-' + threatCount++,
+      timestamp: timestamp || new Date().toISOString(),
+      severity: severity || 'medium',
+      type: type || 'unknown',
+      details: details || ''
+    };
+
+    threatItems.unshift(threat);
+    if (threatItems.length > MAX_THREAT_ITEMS) {
+      threatItems.pop();
+    }
+
+    if (threatCount > 0) {
+      document.getElementById('threatPanel').classList.remove('collapsed');
+    }
+
+    renderThreats();
+  }
+
+  function renderThreats() {
+    const content = document.getElementById('threatContent');
+    const badge = document.getElementById('threatCount');
+
+    if (threatItems.length === 0) {
+      content.innerHTML = '<div class="threat-empty">No threats detected</div>';
+      badge.textContent = '0';
+      return;
+    }
+
+    badge.textContent = threatItems.length;
+    content.innerHTML = '';
+
+    for (const threat of threatItems) {
+      const div = document.createElement('div');
+      div.className = 'threat-item';
+      const time = new Date(threat.timestamp).toLocaleTimeString();
+      div.innerHTML =
+        '<div style="margin-bottom: 3px;">' +
+          '<span class="threat-item-type">' + esc(threat.type) + '</span>' +
+          '<span style="font-size: 10px; color: var(--text-secondary); margin-left: 6px;">' + esc(time) + '</span>' +
+        '</div>' +
+        '<div>' + esc(threat.details) + '</div>' +
+      '';
+      content.appendChild(div);
+    }
+  }
+
+  // \u2500\u2500 SSE Connection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
   function reconnectSSE() {
-    if (evtSource) { evtSource.close(); }
+    if (evtSource) evtSource.close();
     connect();
   }
+
   function connect() {
     evtSource = new EventSource(sessionQuery('/events'));
+
     evtSource.onopen = () => {
       document.getElementById('statusDot').classList.remove('disconnected');
-      document.getElementById('statusText').textContent = 'Connected';
     };
+
     evtSource.onerror = () => {
       document.getElementById('statusDot').classList.add('disconnected');
-      document.getElementById('statusText').textContent = 'Reconnecting...';
     };
+
+    evtSource.addEventListener('init', (e) => {
+      const data = JSON.parse(e.data);
+      if (data.baseline) {
+        updateBaseline(data.baseline);
+      }
+      if (data.policy) {
+        updatePolicy(data.policy);
+      }
+      if (data.pending) {
+        data.pending.forEach(addPendingRequest);
+      }
+    });
+
     evtSource.addEventListener('pending-request', (e) => {
       const data = JSON.parse(e.data);
       addPendingRequest(data);
     });
+
     evtSource.addEventListener('request-resolved', (e) => {
       const data = JSON.parse(e.data);
       removePendingRequest(data.request_id);
     });
+
+    evtSource.addEventListener('tool-call', (e) => {
+      const data = JSON.parse(e.data);
+      addActivityItem({
+        timestamp: data.timestamp,
+        tier: data.tier || 1,
+        tool: data.tool || 'unknown',
+        outcome: data.outcome || 'executed',
+        detail: data.detail || ''
+      });
+    });
+
+    evtSource.addEventListener('context-gate-decision', (e) => {
+      const data = JSON.parse(e.data);
+      addActivityItem({
+        timestamp: data.timestamp,
+        tier: data.tier || 1,
+        tool: data.tool || 'unknown',
+        outcome: data.outcome || 'gated',
+        detail: data.fields_filtered ? 'Filtered ' + data.fields_filtered + ' fields' : data.reason || '',
+        isContextGated: true
+      });
+    });
+
+    evtSource.addEventListener('injection-alert', (e) => {
+      const data = JSON.parse(e.data);
+      addActivityItem({
+        timestamp: data.timestamp,
+        tier: data.tier || 2,
+        tool: data.tool || 'unknown',
+        outcome: data.allowed ? 'allowed' : 'denied',
+        detail: data.signal || 'Injection detected',
+        hasInjection: true
+      });
+      addThreat({
+        timestamp: data.timestamp,
+        severity: data.severity || 'medium',
+        type: 'Injection Alert',
+        details: data.signal || 'Suspicious pattern detected'
+      });
+    });
+
+    evtSource.addEventListener('protection-status', (e) => {
+      const data = JSON.parse(e.data);
+      updateProtectionStatus(data);
+    });
+
     evtSource.addEventListener('audit-entry', (e) => {
       const data = JSON.parse(e.data);
-      addAuditEntry(data);
+      // Audit entries don't show in activity by default, but we could add them
     });
+
     evtSource.addEventListener('baseline-update', (e) => {
       const data = JSON.parse(e.data);
       updateBaseline(data);
     });
-    evtSource.addEventListener('policy-update', (e) => {
-      const data = JSON.parse(e.data);
-      updatePolicy(data);
-    });
-    evtSource.addEventListener('init', (e) => {
-      const data = JSON.parse(e.data);
-      if (data.baseline) updateBaseline(data.baseline);
-      if (data.policy) updatePolicy(data.policy);
-      if (data.pending) data.pending.forEach(addPendingRequest);
-      if (data.audit) data.audit.forEach(addAuditEntry);
-    });
   }
 
-  // Pending requests
-  function addPendingRequest(req) {
-    pending.set(req.request_id, { ...req, remaining: TIMEOUT });
-    renderPending();
-    updatePendingCount();
-    flashTab('pending');
+  function updateBaseline(baseline) {
+    if (!baseline) return;
+    // Update baseline-derived stats if needed
   }
 
-  function removePendingRequest(id) {
-    pending.delete(id);
-    renderPending();
-    updatePendingCount();
-  }
-
-  function renderPending() {
-    const list = document.getElementById('pendingList');
-    const empty = document.getElementById('pendingEmpty');
-    if (pending.size === 0) {
-      list.innerHTML = '';
-      empty.style.display = 'block';
-      return;
-    }
-    empty.style.display = 'none';
-    list.innerHTML = '';
-    for (const [id, req] of pending) {
-      const card = document.createElement('div');
-      card.className = 'request-card tier' + req.tier;
-      card.id = 'req-' + id;
-      const ctx = typeof req.context === 'string' ? req.context : JSON.stringify(req.context, null, 2);
-      card.innerHTML =
-        '<div class="request-header">' +
-          '<span class="request-op">' + esc(req.operation) + '</span>' +
-          '<span class="tier-badge tier' + req.tier + '">Tier ' + req.tier + '</span>' +
-        '</div>' +
-        '<div class="request-reason">' + esc(req.reason) + '</div>' +
-        '<div class="request-context">' + esc(ctx) + '</div>' +
-        '<div class="request-actions">' +
-          '<button class="btn btn-approve" onclick="handleApprove(\\'' + id + '\\')">Approve</button>' +
-          '<button class="btn btn-deny" onclick="handleDeny(\\'' + id + '\\')">Deny</button>' +
-          '<span class="countdown" id="cd-' + id + '">' + req.remaining + 's</span>' +
-        '</div>';
-      list.appendChild(card);
+  function updatePolicy(policy) {
+    if (!policy) return;
+    // Update policy-derived stats
+    if (policy.approval_channel) {
+      // Policy info updated
     }
   }
 
-  function updatePendingCount() {
-    const el = document.getElementById('pendingCount');
-    el.textContent = pending.size;
-    el.className = pending.size > 0 ? 'count alert' : 'count muted';
-  }
-
-  function flashTab(name) {
-    const tab = document.querySelector('[data-tab="' + name + '"]');
-    if (!tab.classList.contains('active')) {
-      tab.style.background = 'rgba(248,113,113,0.15)';
-      setTimeout(() => { tab.style.background = ''; }, 1500);
+  function updateProtectionStatus(status) {
+    if (status.sovereignty_score !== undefined) {
+      updateSovereigntyScore(status.sovereignty_score);
+    }
+    if (status.active_protections !== undefined) {
+      document.getElementById('activeProtections').textContent = status.active_protections;
+    }
+    // Update individual protection cards
+    if (status.encryption !== undefined) {
+      const el = document.getElementById('encryptionStatus');
+      el.className = 'protection-card-status ' + (status.encryption ? 'active' : 'inactive');
+      el.textContent = status.encryption ? '\u2713 Active' : '\u2717 Inactive';
+    }
+    if (status.approval_gate !== undefined) {
+      const el = document.getElementById('approvalStatus');
+      el.className = 'protection-card-status ' + (status.approval_gate ? 'active' : 'inactive');
+      el.textContent = status.approval_gate ? '\u2713 Active' : '\u2717 Inactive';
+    }
+    if (status.context_gating !== undefined) {
+      const el = document.getElementById('contextStatus');
+      el.className = 'protection-card-status ' + (status.context_gating ? 'active' : 'inactive');
+      el.textContent = status.context_gating ? '\u2713 Active' : '\u2717 Inactive';
+    }
+    if (status.injection_detection !== undefined) {
+      const el = document.getElementById('injectionStatus');
+      el.className = 'protection-card-status ' + (status.injection_detection ? 'active' : 'inactive');
+      el.textContent = status.injection_detection ? '\u2713 Active' : '\u2717 Inactive';
+    }
+    if (status.baseline !== undefined) {
+      const el = document.getElementById('baselineStatus');
+      el.className = 'protection-card-status ' + (status.baseline ? 'active' : 'inactive');
+      el.textContent = status.baseline ? '\u2713 Active' : '\u2717 Inactive';
+    }
+    if (status.audit_trail !== undefined) {
+      const el = document.getElementById('auditStatus');
+      el.className = 'protection-card-status ' + (status.audit_trail ? 'active' : 'inactive');
+      el.textContent = status.audit_trail ? '\u2713 Active' : '\u2717 Inactive';
     }
   }
 
-  // Countdown timer
-  setInterval(() => {
-    for (const [id, req] of pending) {
-      req.remaining = Math.max(0, req.remaining - 1);
-      const el = document.getElementById('cd-' + id);
-      if (el) {
-        el.textContent = req.remaining + 's';
-        el.className = req.remaining <= 30 ? 'countdown urgent' : 'countdown';
-      }
-    }
-  }, 1000);
+  // \u2500\u2500 Initialization \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
-  // Approve / Deny handlers (global scope)
-  window.handleApprove = function(id) {
-    fetch('/api/approve/' + id, { method: 'POST', headers: authHeaders() }).then(() => {
-      removePendingRequest(id);
-    });
-  };
-  window.handleDeny = function(id) {
-    fetch('/api/deny/' + id, { method: 'POST', headers: authHeaders() }).then(() => {
-      removePendingRequest(id);
-    });
-  };
-
-  // Audit log
-  function addAuditEntry(entry) {
-    auditCount++;
-    document.getElementById('auditCount').textContent = auditCount;
-    const tbody = document.getElementById('auditBody');
-    const tr = document.createElement('tr');
-    tr.className = 'new';
-    const time = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : '\u2014';
-    const layer = entry.layer || '\u2014';
-    tr.innerHTML =
-      '<td class="audit-time">' + esc(time) + '</td>' +
-      '<td><span class="audit-layer ' + layer + '">' + esc(layer) + '</span></td>' +
-      '<td class="audit-op">' + esc(entry.operation || '\u2014') + '</td>' +
-      '<td style="font-size:12px;color:var(--text-muted)">' + esc(entry.identity_id || '\u2014') + '</td>';
-    tbody.insertBefore(tr, tbody.firstChild);
-    // Keep last 100 entries
-    while (tbody.children.length > 100) tbody.removeChild(tbody.lastChild);
-  }
-
-  // Baseline
-  function updateBaseline(b) {
-    if (!b) return;
-    document.getElementById('bFirstSession').textContent = b.is_first_session ? 'Yes' : 'No';
-    document.getElementById('bStarted').textContent = b.started_at ? new Date(b.started_at).toLocaleString() : '\u2014';
-    const ns = document.getElementById('bNamespaces');
-    ns.innerHTML = (b.known_namespaces || []).length > 0
-      ? (b.known_namespaces || []).map(n => '<span class="tag">' + esc(n) + '</span>').join('')
-      : '<span class="tag">none</span>';
-    const cp = document.getElementById('bCounterparties');
-    cp.innerHTML = (b.known_counterparties || []).length > 0
-      ? (b.known_counterparties || []).map(c => '<span class="tag">' + esc(c.slice(0,16)) + '...</span>').join('')
-      : '<span class="tag">none</span>';
-    const tc = document.getElementById('bToolCalls');
-    const counts = b.tool_call_counts || {};
-    const entries = Object.entries(counts).sort((a,b) => b[1] - a[1]);
-    tc.innerHTML = entries.length > 0
-      ? entries.map(([k,v]) => '<div class="info-row"><span class="info-label">' + esc(k) + '</span><span class="info-value">' + v + '</span></div>').join('')
-      : '<span class="info-value">no calls yet</span>';
-  }
-
-  // Policy
-  function updatePolicy(p) {
-    if (!p) return;
-    const t1 = document.getElementById('pTier1');
-    t1.innerHTML = (p.tier1_always_approve || []).map(op =>
-      '<div class="policy-op">' + esc(op) + '</div>'
-    ).join('');
-    const t2 = document.getElementById('pTier2');
-    const cfg = p.tier2_anomaly || {};
-    t2.innerHTML = Object.entries(cfg).map(([k,v]) =>
-      '<div class="info-row"><span class="info-label">' + esc(k) + '</span><span class="info-value">' + esc(String(v)) + '</span></div>'
-    ).join('');
-    document.getElementById('pTier3Count').textContent = (p.tier3_always_allow || []).length + ' operations';
-    const ch = document.getElementById('pChannel');
-    const chan = p.approval_channel || {};
-    ch.innerHTML = Object.entries(chan).filter(([k]) => k !== 'webhook_secret').map(([k,v]) =>
-      '<div class="info-row"><span class="info-label">' + esc(k) + '</span><span class="info-value">' + esc(String(v)) + '</span></div>'
-    ).join('');
-  }
-
-  function esc(s) {
-    if (!s) return '';
-    const d = document.createElement('div');
-    d.textContent = String(s);
-    return d.innerHTML;
-  }
-
-  // Init \u2014 SEC-012: exchange token for session before connecting SSE
   (async function init() {
     await exchangeSession();
-    // Clean token from URL if present (legacy bookmarks)
+    // Clean legacy ?token= from URL
     if (window.location.search.includes('token=')) {
-      const clean = window.location.pathname;
-      window.history.replaceState({}, '', clean);
+      window.history.replaceState({}, '', window.location.pathname);
     }
     connect();
-    fetch('/api/status', { headers: authHeaders() }).then(r => r.json()).then(data => {
-      if (data.baseline) updateBaseline(data.baseline);
-      if (data.policy) updatePolicy(data.policy);
-    }).catch(() => {});
+
+    // Start uptime ticker
+    setInterval(updateUptime, 1000);
+    updateUptime();
+
+    // Pending request countdown timer
+    setInterval(() => {
+      for (const [id, req] of pendingRequests) {
+        req.remaining = Math.max(0, req.remaining - 1);
+        const el = document.getElementById('timer-' + id);
+        if (el) {
+          el.textContent = req.remaining + 's';
+        }
+      }
+    }, 1000);
+
+    // Load initial status
+    try {
+      const resp = await fetch('/api/status', { headers: authHeaders() });
+      if (resp.ok) {
+        const status = await resp.json();
+        if (status.baseline) updateBaseline(status.baseline);
+        if (status.policy) updatePolicy(status.policy);
+      }
+    } catch (e) {
+      // Ignore
+    }
   })();
+
 })();
 </script>
+
 </body>
 </html>`;
 }
@@ -5137,6 +5967,25 @@ data: ${JSON.stringify(data)}
       this.broadcastSSE("baseline-update", this.baseline.getProfile());
     }
   }
+  /**
+   * Broadcast a tool call event to connected dashboards.
+   * Called from the gate or router when a tool is invoked.
+   */
+  broadcastToolCall(data) {
+    this.broadcastSSE("tool-call", data);
+  }
+  /**
+   * Broadcast a context gate decision to connected dashboards.
+   */
+  broadcastContextGateDecision(data) {
+    this.broadcastSSE("context-gate-decision", data);
+  }
+  /**
+   * Broadcast current protection status to connected dashboards.
+   */
+  broadcastProtectionStatus(data) {
+    this.broadcastSSE("protection-status", data);
+  }
   /** Get the number of pending requests */
   get pendingCount() {
     return this.pending.size;
@@ -5379,17 +6228,539 @@ var WebhookApprovalChannel = class {
   }
 };
 
+// src/security/injection-detector.ts
+var ROLE_OVERRIDE_PATTERNS = [
+  /ignore\s+(?:(?:previous|prior|all)\s+)?instructions/i,
+  /you\s+are\s+now/i,
+  /\bsystem\s*:\s+(?!working|process|design|architecture)/i,
+  /forget\s+(?:everything|all|prior)/i,
+  /disregard\s+(?:the\s+)?(?:previous\s+)?instructions/i,
+  /new\s+instructions\s*:/i,
+  /updated?\s+instructions\s*:/i
+];
+var SECURITY_BYPASS_PATTERNS = [
+  /skip\s+(?:the\s+)?(?:filter|gate|check|verify|approve)/i,
+  /bypass\s+(?:the\s+)?(?:filter|gate|security|check)/i,
+  /disable\s+(?:the\s+)?(?:filter|gate|approval|security|audit|log|encrypt|verify)/i,
+  /do\s+not\s+(?:audit|log|encrypt|verify|approve|check|sign)/i
+];
+var TOOL_INVOCATION_PATTERNS = [
+  /sanctuary\//i,
+  /concordia\//i,
+  /bridge_/i,
+  /handshake_/i
+];
+var URL_PATTERN = /https?:\/\/[^\s"'<>]+/i;
+var EMAIL_PATTERN = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+var ZERO_WIDTH_CHARS = [
+  "\u200B",
+  // Zero-width space
+  "\u200C",
+  // Zero-width non-joiner
+  "\u200D",
+  // Zero-width joiner
+  "\uFEFF"
+  // Zero-width no-break space
+];
+var InjectionDetector = class {
+  config;
+  stats = {
+    total_scans: 0,
+    total_flags: 0,
+    total_blocks: 0,
+    signals_by_type: {}
+  };
+  constructor(config = {}) {
+    this.config = {
+      enabled: config.enabled ?? true,
+      sensitivity: config.sensitivity ?? "medium",
+      on_detection: config.on_detection ?? "escalate",
+      custom_patterns: config.custom_patterns ?? []
+    };
+  }
+  /**
+   * Scan tool arguments for injection signals.
+   * @param toolName Full tool name (e.g., "sanctuary/state_read")
+   * @param args Tool arguments
+   * @returns DetectionResult with all detected signals
+   */
+  scan(toolName, args) {
+    this.stats.total_scans++;
+    if (!this.config.enabled) {
+      return {
+        flagged: false,
+        confidence: 0,
+        signals: [],
+        recommendation: "allow"
+      };
+    }
+    const signals = [];
+    const visited = /* @__PURE__ */ new Set();
+    this.scanValue(args, "", toolName, signals, visited);
+    const flagged = signals.length > 0;
+    if (flagged) {
+      this.stats.total_flags++;
+    }
+    for (const sig of signals) {
+      this.stats.signals_by_type[sig.type] = (this.stats.signals_by_type[sig.type] ?? 0) + 1;
+    }
+    const recommendation = this.computeRecommendation(
+      signals,
+      this.config.sensitivity
+    );
+    if (recommendation === "block") {
+      this.stats.total_blocks++;
+    }
+    return {
+      flagged,
+      confidence: this.computeConfidence(signals),
+      signals,
+      recommendation
+    };
+  }
+  /**
+   * Recursively scan a value and all nested values.
+   */
+  scanValue(value, path, toolName, signals, visited) {
+    if (typeof value === "object" && value !== null) {
+      if (visited.has(value)) return;
+      visited.add(value);
+    }
+    if (typeof value === "string") {
+      this.scanString(value, path, toolName, signals);
+    } else if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        this.scanValue(value[i], `${path}[${i}]`, toolName, signals, visited);
+      }
+    } else if (typeof value === "object" && value !== null) {
+      for (const [key, val] of Object.entries(value)) {
+        this.scanValue(val, path ? `${path}.${key}` : key, toolName, signals, visited);
+      }
+    }
+  }
+  /**
+   * Scan a single string for injection signals.
+   */
+  scanString(value, path, _toolName, signals) {
+    if (this.isSafeField(path)) {
+      return;
+    }
+    const location = path || "root";
+    const normalized = this.normalizeConfusables(value.normalize("NFKC"));
+    if (normalized !== value) {
+      signals.push({
+        type: "encoding_evasion",
+        pattern: "unicode_normalization_delta",
+        location,
+        severity: "medium"
+      });
+    }
+    for (const pattern of ROLE_OVERRIDE_PATTERNS) {
+      if (pattern.test(normalized)) {
+        signals.push({
+          type: "role_override",
+          pattern: pattern.source,
+          location,
+          severity: "high"
+        });
+        break;
+      }
+    }
+    for (const pattern of SECURITY_BYPASS_PATTERNS) {
+      if (pattern.test(normalized)) {
+        signals.push({
+          type: "security_bypass",
+          pattern: pattern.source,
+          location,
+          severity: "high"
+        });
+        break;
+      }
+    }
+    if (!this.isToolNameField(path)) {
+      for (const pattern of TOOL_INVOCATION_PATTERNS) {
+        if (pattern.test(normalized)) {
+          signals.push({
+            type: "tool_invocation_in_string",
+            pattern: pattern.source,
+            location,
+            severity: "medium"
+          });
+          break;
+        }
+      }
+    }
+    this.detectEncodingEvasion(value, location, signals);
+    this.detectDataExfiltration(value, location, signals);
+    this.detectPromptStuffing(value, location, signals);
+  }
+  /**
+   * Detect base64 strings and zero-width character evasion.
+   */
+  detectEncodingEvasion(value, path, signals) {
+    if (value.length > 50 && /^[A-Za-z0-9+/]+={0,2}$/.test(value.trim())) {
+      signals.push({
+        type: "encoding_evasion",
+        pattern: "base64_string",
+        location: path || "root",
+        severity: "medium"
+      });
+    }
+    let zeroWidthCount = 0;
+    for (const char of ZERO_WIDTH_CHARS) {
+      zeroWidthCount += (value.match(new RegExp(char, "g")) || []).length;
+    }
+    if (zeroWidthCount > 0) {
+      signals.push({
+        type: "encoding_evasion",
+        pattern: "zero_width_characters",
+        location: path || "root",
+        severity: "medium"
+      });
+    }
+    const hasLatin = /[a-zA-Z]/.test(value);
+    const hasCJK = /[\u4E00-\u9FFF\u3040-\u309F\uAC00-\uD7AF]/.test(value);
+    const hasArabic = /[\u0600-\u06FF]/.test(value);
+    const hasCyrillic = /[\u0400-\u04FF]/.test(value);
+    const unicodeCategories = [hasLatin, hasCJK, hasArabic, hasCyrillic].filter(
+      (x) => x
+    ).length;
+    if (unicodeCategories >= 3) {
+      signals.push({
+        type: "encoding_evasion",
+        pattern: "unicode_category_mixing",
+        location: path || "root",
+        severity: "medium"
+      });
+    }
+  }
+  /**
+   * Detect URLs and emails in fields that shouldn't have them.
+   */
+  detectDataExfiltration(value, path, signals) {
+    if (this.isUrlSafeField(path)) {
+      return;
+    }
+    if (URL_PATTERN.test(value)) {
+      signals.push({
+        type: "data_exfiltration",
+        pattern: "url_in_string",
+        location: path || "root",
+        severity: "medium"
+      });
+    }
+    if (EMAIL_PATTERN.test(value) && !this.isEmailSafeField(path)) {
+      signals.push({
+        type: "data_exfiltration",
+        pattern: "email_in_string",
+        location: path || "root",
+        severity: "medium"
+      });
+    }
+    if (value.length > 30 && value.length < 1e4 && !this.isStructuredField(path)) {
+      const hasJsonContent = /\{[^}]*"[^"]*"[^}]*\}/.test(value);
+      const hasXmlContent = /<[^>]+>[\s\S]*?<\/[^>]+>/.test(value);
+      if (hasJsonContent || hasXmlContent) {
+        signals.push({
+          type: "data_exfiltration",
+          pattern: "structured_data_in_string",
+          location: path || "root",
+          severity: "medium"
+        });
+      }
+    }
+  }
+  /**
+   * Detect prompt stuffing: very large strings or high repetition.
+   */
+  detectPromptStuffing(value, path, signals) {
+    if (value.length > 10240) {
+      signals.push({
+        type: "prompt_stuffing",
+        pattern: "large_string",
+        location: path || "root",
+        severity: "low"
+      });
+    }
+    if (value.length >= 100) {
+      const windowSizes = [10, 20, 50];
+      for (const windowSize of windowSizes) {
+        if (value.length < windowSize * 5) continue;
+        const pattern = value.substring(0, windowSize);
+        let count = 0;
+        let idx = 0;
+        while (idx <= value.length - windowSize) {
+          if (value.substring(idx, idx + windowSize) === pattern) {
+            count++;
+            idx += windowSize;
+          } else {
+            idx++;
+          }
+          if (count >= 10) break;
+        }
+        if (count >= 10) {
+          signals.push({
+            type: "prompt_stuffing",
+            pattern: "high_repetition",
+            location: path || "root",
+            severity: "low"
+          });
+          break;
+        }
+      }
+    }
+  }
+  /**
+   * Determine if this field is inherently safe from role override.
+   */
+  isSafeField(path) {
+    const safePaths = [
+      /\.version$/i,
+      /\.timestamp$/i,
+      /\.id$/i,
+      /\.uuid$/i,
+      /\.hash$/i,
+      /\.signature$/i,
+      /\.public_key$/i,
+      /\.private_key$/i,
+      /\.did$/i,
+      /\.nonce$/i,
+      /\.salt$/i,
+      /\.iv$/i,
+      /^ciphertext$/i,
+      /^encrypted$/i
+    ];
+    return safePaths.some((p) => p.test(path));
+  }
+  /**
+   * Determine if this is a tool name field (where tool refs are expected).
+   */
+  isToolNameField(path) {
+    const toolFields = [
+      /tool_name/i,
+      /\.tool$/i,
+      /^tool$/i,
+      /operation/i
+    ];
+    return toolFields.some((p) => p.test(path));
+  }
+  /**
+   * Determine if this field is safe for URLs.
+   */
+  isUrlSafeField(path) {
+    const urlFields = [
+      /url/i,
+      /endpoint/i,
+      /webhook/i,
+      /callback/i
+    ];
+    return urlFields.some((p) => p.test(path));
+  }
+  /**
+   * Determine if this field is safe for emails.
+   */
+  isEmailSafeField(path) {
+    const emailFields = [
+      /email/i,
+      /contact/i,
+      /recipient/i,
+      /sender/i,
+      /from/i,
+      /to/i
+    ];
+    return emailFields.some((p) => p.test(path));
+  }
+  /**
+   * Determine if this field is safe for structured data (JSON/XML).
+   */
+  isStructuredField(path) {
+    const structuredFields = [
+      /data/i,
+      /payload/i,
+      /body/i,
+      /json/i,
+      /xml/i
+    ];
+    return structuredFields.some((p) => p.test(path));
+  }
+  /**
+   * SEC-032: Map common cross-script confusable characters to their Latin equivalents.
+   * NFKC normalization handles fullwidth and compatibility forms, but does NOT map
+   * Cyrillic/Greek lookalikes to Latin (they're distinct codepoints by design).
+   * This covers the most common confusables used in injection evasion.
+   */
+  normalizeConfusables(value) {
+    const confusables = {
+      // Cyrillic → Latin
+      "\u0410": "A",
+      "\u0430": "a",
+      // А а
+      "\u0412": "B",
+      "\u0432": "b",
+      // В (not exact) в (not exact)
+      "\u0421": "C",
+      "\u0441": "c",
+      // С с
+      "\u0415": "E",
+      "\u0435": "e",
+      // Е е
+      "\u041D": "H",
+      "\u043D": "h",
+      // Н (not exact) н (not exact)
+      "\u041A": "K",
+      "\u043A": "k",
+      // К к (not exact)
+      "\u041C": "M",
+      "\u043C": "m",
+      // М (not exact) м (not exact)
+      "\u041E": "O",
+      "\u043E": "o",
+      // О о
+      "\u0420": "P",
+      "\u0440": "p",
+      // Р р
+      "\u0422": "T",
+      "\u0442": "t",
+      // Т (not exact) т (not exact)
+      "\u0425": "X",
+      "\u0445": "x",
+      // Х х
+      "\u0423": "Y",
+      "\u0443": "y",
+      // У (not exact) у
+      // Greek → Latin
+      "\u0391": "A",
+      "\u03B1": "a",
+      // Α α (not exact)
+      "\u0392": "B",
+      "\u03B2": "b",
+      // Β β (not exact)
+      "\u0395": "E",
+      "\u03B5": "e",
+      // Ε ε (not exact)
+      "\u0397": "H",
+      // Η
+      "\u0399": "I",
+      "\u03B9": "i",
+      // Ι ι
+      "\u039A": "K",
+      "\u03BA": "k",
+      // Κ κ
+      "\u039C": "M",
+      // Μ
+      "\u039D": "N",
+      // Ν
+      "\u039F": "O",
+      "\u03BF": "o",
+      // Ο ο
+      "\u03A1": "P",
+      "\u03C1": "p",
+      // Ρ ρ (not exact)
+      "\u03A4": "T",
+      "\u03C4": "t",
+      // Τ τ (not exact)
+      "\u03A5": "Y",
+      "\u03C5": "y",
+      // Υ υ (not exact)
+      "\u03A7": "X",
+      "\u03C7": "x"
+      // Χ χ (not exact)
+    };
+    let result = value;
+    if (/[^\x00-\x7F]/.test(value)) {
+      const chars = [];
+      for (const ch of result) {
+        chars.push(confusables[ch] ?? ch);
+      }
+      result = chars.join("");
+    }
+    return result;
+  }
+  /**
+   * Compute confidence score based on signals.
+   * More high-severity signals = higher confidence.
+   */
+  computeConfidence(signals) {
+    if (signals.length === 0) return 0;
+    let score = 0;
+    let highCount = 0;
+    for (const sig of signals) {
+      switch (sig.severity) {
+        case "high":
+          highCount++;
+          score += 0.35;
+          break;
+        case "medium":
+          score += 0.15;
+          break;
+        case "low":
+          score += 0.05;
+          break;
+      }
+    }
+    if (highCount > 1) {
+      score += (highCount - 1) * 0.15;
+    }
+    return Math.min(score, 1);
+  }
+  /**
+   * Compute recommendation based on signals and sensitivity.
+   */
+  computeRecommendation(signals, sensitivity) {
+    if (signals.length === 0) return "allow";
+    const highSeverity = signals.filter((s) => s.severity === "high");
+    const mediumSeverity = signals.filter((s) => s.severity === "medium");
+    switch (sensitivity) {
+      case "low":
+        return highSeverity.length > 0 ? "escalate" : "allow";
+      case "medium":
+        if (highSeverity.length > 0) return "block";
+        return mediumSeverity.length > 0 ? "escalate" : "allow";
+      case "high":
+        if (highSeverity.length > 0 || mediumSeverity.length > 1) return "block";
+        if (mediumSeverity.length > 0) return "block";
+        return signals.length > 0 ? "escalate" : "allow";
+    }
+  }
+  /**
+   * Get statistics about scans performed.
+   */
+  getStats() {
+    return {
+      total_scans: this.stats.total_scans,
+      total_flags: this.stats.total_flags,
+      total_blocks: this.stats.total_blocks,
+      signals_by_type: { ...this.stats.signals_by_type }
+    };
+  }
+  /**
+   * Reset statistics.
+   */
+  resetStats() {
+    this.stats = {
+      total_scans: 0,
+      total_flags: 0,
+      total_blocks: 0,
+      signals_by_type: {}
+    };
+  }
+};
+
 // src/principal-policy/gate.ts
 var ApprovalGate = class {
   policy;
   baseline;
   channel;
   auditLog;
-  constructor(policy, baseline, channel, auditLog) {
+  injectionDetector;
+  onInjectionAlert;
+  constructor(policy, baseline, channel, auditLog, injectionDetector, onInjectionAlert) {
     this.policy = policy;
     this.baseline = baseline;
     this.channel = channel;
     this.auditLog = auditLog;
+    this.injectionDetector = injectionDetector ?? new InjectionDetector();
+    this.onInjectionAlert = onInjectionAlert;
   }
   /**
    * Evaluate a tool call against the Principal Policy.
@@ -5401,6 +6772,48 @@ var ApprovalGate = class {
   async evaluate(toolName, args) {
     const operation = extractOperationName(toolName);
     this.baseline.recordToolCall(operation);
+    const injectionResult = this.injectionDetector.scan(toolName, args);
+    if (injectionResult.flagged) {
+      this.auditLog.append("l2", `injection_detected:${operation}`, "system", {
+        confidence: injectionResult.confidence,
+        signals: injectionResult.signals.map((s) => ({
+          type: s.type,
+          location: s.location,
+          severity: s.severity
+        })),
+        recommendation: injectionResult.recommendation
+      });
+      if (this.onInjectionAlert) {
+        this.onInjectionAlert({
+          toolName,
+          result: injectionResult,
+          timestamp: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+      if (injectionResult.recommendation === "block") {
+        return {
+          allowed: false,
+          tier: 1,
+          reason: `Blocked: prompt injection detected in "${operation}" (confidence: ${(injectionResult.confidence * 100).toFixed(0)}%)`,
+          approval_required: false
+        };
+      }
+      if (injectionResult.recommendation === "escalate") {
+        return this.requestApproval(
+          operation,
+          1,
+          `Potential prompt injection detected in "${operation}" (confidence: ${(injectionResult.confidence * 100).toFixed(0)}%, ${injectionResult.signals.length} signal(s))`,
+          {
+            operation,
+            injection_detection: {
+              confidence: injectionResult.confidence,
+              signal_count: injectionResult.signals.length,
+              signal_types: [...new Set(injectionResult.signals.map((s) => s.type))]
+            }
+          }
+        );
+      }
+    }
     if (this.policy.tier1_always_approve.includes(operation)) {
       return this.requestApproval(operation, 1, `"${operation}" is a Tier 1 operation (always requires approval)`, {
         operation,
@@ -5578,6 +6991,10 @@ var ApprovalGate = class {
   /** Get the baseline tracker for saving at session end */
   getBaseline() {
     return this.baseline;
+  }
+  /** Get the injection detector for stats/configuration access */
+  getInjectionDetector() {
+    return this.injectionDetector;
   }
 };
 
@@ -8775,9 +10192,345 @@ function matchesFieldPattern(normalizedField, pattern) {
   return false;
 }
 
+// src/l2-operational/context-gate-enforcer.ts
+init_encoding();
+init_hashing();
+var BUILTIN_SENSITIVE_PATTERNS = [
+  "*_key",
+  "*_token",
+  "*_secret",
+  "api_key",
+  "access_token",
+  "refresh_token",
+  "password",
+  "passwd",
+  "credential*",
+  "auth_*",
+  "ssn",
+  "social_security*",
+  "tax_id*",
+  "credit_card*",
+  "card_number*",
+  "cvv",
+  "cvc",
+  "private_key",
+  "secret_key",
+  "master_key"
+];
+var ContextGateEnforcer = class {
+  policyStore;
+  auditLog;
+  config;
+  stats = {
+    calls_inspected: 0,
+    calls_bypassed: 0,
+    fields_redacted: 0,
+    fields_hashed: 0,
+    fields_blocked: 0,
+    calls_blocked: 0
+  };
+  constructor(policyStore, auditLog, config) {
+    this.policyStore = policyStore;
+    this.auditLog = auditLog;
+    this.config = config;
+  }
+  /**
+   * Wrap a tool handler to apply automatic context gating.
+   *
+   * The wrapped handler:
+   * 1. Checks if tool should be filtered (based on bypass_prefixes)
+   * 2. If not filtering, calls original handler directly
+   * 3. If filtering:
+   *    a. Gets the active policy or falls back to built-in patterns
+   *    b. Calls filterContext() with tool arguments
+   *    c. If any field triggered "deny" and on_deny is "block", returns error
+   *    d. If on_deny is "redact", replaces denied fields with "[REDACTED]"
+   *    e. Calls original handler with filtered arguments
+   *    f. Logs the filtering decision
+   * 4. In log_only mode: runs filter, logs what would happen, passes original args
+   */
+  wrapHandler(toolName, originalHandler) {
+    return async (args) => {
+      if (!this.config.enabled) {
+        return originalHandler(args);
+      }
+      if (!this.shouldFilter(toolName)) {
+        this.stats.calls_bypassed++;
+        return originalHandler(args);
+      }
+      this.stats.calls_inspected++;
+      const policy = this.config.default_policy_id ? await this.policyStore.get(this.config.default_policy_id) : null;
+      if (policy) {
+        return this.filterWithPolicy(
+          toolName,
+          args,
+          originalHandler,
+          policy
+        );
+      } else {
+        return this.filterWithBuiltinPatterns(
+          toolName,
+          args,
+          originalHandler
+        );
+      }
+    };
+  }
+  /**
+   * Filter tool arguments using an explicit policy.
+   */
+  async filterWithPolicy(toolName, args, originalHandler, policy) {
+    const provider = this.extractProviderCategory(toolName);
+    const result = filterContext(policy, provider, args);
+    const deniedFields = result.decisions.filter((d) => d.action === "deny");
+    if (deniedFields.length > 0) {
+      if (this.config.on_deny === "block") {
+        this.stats.calls_blocked++;
+        this.auditLog.append(
+          "l2",
+          "context_gate_enforcer_block",
+          "system",
+          {
+            tool_name: toolName,
+            policy_id: policy.policy_id,
+            provider,
+            denied_fields: deniedFields.map((d) => d.field),
+            original_context_hash: result.original_context_hash
+          }
+        );
+        return toolResult({
+          error: "context_gating_blocked",
+          message: "Tool call contains fields that trigger deny action",
+          tool: toolName,
+          denied_fields: deniedFields.map((d) => d.field),
+          recommendation: "Remove the denied fields from context or update the context-gating policy."
+        });
+      }
+    }
+    const filteredArgs = this.buildFilteredArgs(args, result.decisions);
+    if (this.config.log_only) {
+      this.auditLog.append(
+        "l2",
+        "context_gate_enforcer_log_only",
+        "system",
+        {
+          tool_name: toolName,
+          policy_id: policy.policy_id,
+          provider,
+          fields_total: Object.keys(args).length,
+          fields_redacted: result.fields_redacted,
+          fields_hashed: result.fields_hashed,
+          fields_blocked: deniedFields.length,
+          original_context_hash: result.original_context_hash
+        }
+      );
+      this.stats.fields_redacted += result.fields_redacted;
+      this.stats.fields_hashed += result.fields_hashed;
+      this.stats.fields_blocked += deniedFields.length;
+      return originalHandler(args);
+    }
+    this.auditLog.append(
+      "l2",
+      "context_gate_enforcer_filter",
+      "system",
+      {
+        tool_name: toolName,
+        policy_id: policy.policy_id,
+        provider,
+        fields_total: Object.keys(args).length,
+        fields_redacted: result.fields_redacted,
+        fields_hashed: result.fields_hashed,
+        fields_blocked: deniedFields.length,
+        original_context_hash: result.original_context_hash
+      }
+    );
+    this.stats.fields_redacted += result.fields_redacted;
+    this.stats.fields_hashed += result.fields_hashed;
+    this.stats.fields_blocked += deniedFields.length;
+    return originalHandler(filteredArgs);
+  }
+  /**
+   * Filter tool arguments using built-in sensitive patterns.
+   * This provides baseline protection when no explicit policy is configured.
+   */
+  async filterWithBuiltinPatterns(toolName, args, originalHandler) {
+    const fieldsToRedact = [];
+    const originalHash = hashToString(
+      stringToBytes(JSON.stringify(args))
+    );
+    for (const field of Object.keys(args)) {
+      if (matchesPattern(field, BUILTIN_SENSITIVE_PATTERNS)) {
+        fieldsToRedact.push(field);
+      }
+    }
+    if (fieldsToRedact.length === 0) {
+      this.auditLog.append(
+        "l2",
+        "context_gate_enforcer_builtin_pass",
+        "system",
+        {
+          tool_name: toolName,
+          reason: "No sensitive field patterns detected"
+        }
+      );
+      return originalHandler(args);
+    }
+    const filteredArgs = {};
+    for (const [key, value] of Object.entries(args)) {
+      if (fieldsToRedact.includes(key)) {
+        filteredArgs[key] = "[REDACTED]";
+      } else {
+        filteredArgs[key] = value;
+      }
+    }
+    const filteredHash = hashToString(
+      stringToBytes(JSON.stringify(filteredArgs))
+    );
+    if (this.config.log_only) {
+      this.auditLog.append(
+        "l2",
+        "context_gate_enforcer_builtin_log_only",
+        "system",
+        {
+          tool_name: toolName,
+          fields_redacted: fieldsToRedact.length,
+          redacted_fields: fieldsToRedact,
+          original_context_hash: originalHash
+        }
+      );
+      this.stats.fields_redacted += fieldsToRedact.length;
+      return originalHandler(args);
+    }
+    this.auditLog.append(
+      "l2",
+      "context_gate_enforcer_builtin_filter",
+      "system",
+      {
+        tool_name: toolName,
+        fields_redacted: fieldsToRedact.length,
+        redacted_fields: fieldsToRedact,
+        original_context_hash: originalHash,
+        filtered_context_hash: filteredHash
+      }
+    );
+    this.stats.fields_redacted += fieldsToRedact.length;
+    return originalHandler(filteredArgs);
+  }
+  /**
+   * Check if a tool should be filtered based on bypass prefixes.
+   *
+   * SEC-033: Uses exact namespace component matching, not bare startsWith().
+   * A prefix of "sanctuary/" matches "sanctuary/state_read" but NOT
+   * "sanctuary_evil/steal_data" (no slash boundary confusion). The prefix
+   * must match exactly up to its length, and the prefix must end with "/"
+   * to enforce namespace boundaries (if it doesn't, we add one for safety).
+   */
+  shouldFilter(toolName) {
+    for (const prefix of this.config.bypass_prefixes) {
+      const safePrefix = prefix.endsWith("/") ? prefix : prefix + "/";
+      if (toolName === safePrefix.slice(0, -1) || toolName.startsWith(safePrefix)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  /**
+   * Extract provider category from tool name.
+   * Default: "tool-api". Override for specific patterns.
+   */
+  extractProviderCategory(toolName) {
+    if (toolName.includes("inference") || toolName.includes("llm")) {
+      return "inference";
+    }
+    if (toolName.includes("log") || toolName.includes("telemetry")) {
+      return "logging";
+    }
+    if (toolName.includes("analytics") || toolName.includes("metric")) {
+      return "analytics";
+    }
+    return "tool-api";
+  }
+  /**
+   * Build filtered arguments from filter decisions.
+   */
+  buildFilteredArgs(originalArgs, decisions) {
+    const filtered = {};
+    for (const decision of decisions) {
+      switch (decision.action) {
+        case "allow":
+          filtered[decision.field] = originalArgs[decision.field];
+          break;
+        case "redact":
+          filtered[decision.field] = "[REDACTED]";
+          break;
+        case "hash":
+          filtered[decision.field] = decision.hash_value;
+          break;
+        case "summarize":
+          filtered[decision.field] = originalArgs[decision.field];
+          break;
+      }
+    }
+    return filtered;
+  }
+  /**
+   * Set the active policy ID.
+   */
+  setDefaultPolicy(policyId) {
+    this.config.default_policy_id = policyId;
+  }
+  /**
+   * Get current enforcer status and stats.
+   */
+  getStatus() {
+    return {
+      enabled: this.config.enabled,
+      log_only: this.config.log_only,
+      default_policy_id: this.config.default_policy_id ?? null,
+      stats: { ...this.stats }
+    };
+  }
+  /**
+   * Toggle enforcer enabled state.
+   */
+  setEnabled(enabled) {
+    this.config.enabled = enabled;
+  }
+  /**
+   * Toggle log_only mode.
+   */
+  setLogOnly(logOnly) {
+    this.config.log_only = logOnly;
+  }
+  /**
+   * Reset stats counters.
+   */
+  resetStats() {
+    this.stats = {
+      calls_inspected: 0,
+      calls_bypassed: 0,
+      fields_redacted: 0,
+      fields_hashed: 0,
+      fields_blocked: 0,
+      calls_blocked: 0
+    };
+  }
+};
+
 // src/l2-operational/context-gate-tools.ts
 function createContextGateTools(storage, masterKey, auditLog) {
   const policyStore = new ContextGatePolicyStore(storage, masterKey);
+  const enforcerConfig = {
+    enabled: false,
+    // Off by default; agents must explicitly enable it
+    bypass_prefixes: ["sanctuary/"],
+    // Skip internal tools by default
+    log_only: false,
+    // Filter immediately
+    on_deny: "block"
+    // Block requests with denied fields
+  };
+  const enforcer = new ContextGateEnforcer(policyStore, auditLog, enforcerConfig);
   const tools = [
     // ── Set Policy ──────────────────────────────────────────────────
     {
@@ -9130,9 +10883,121 @@ function createContextGateTools(storage, masterKey, auditLog) {
           message: policies.length === 0 ? "No context-gating policies configured. Use sanctuary/context_gate_set_policy to create one." : `${policies.length} context-gating ${policies.length === 1 ? "policy" : "policies"} configured.`
         });
       }
+    },
+    // ── Enforcer Status ─────────────────────────────────────────────────
+    {
+      name: "sanctuary/context_gate_enforcer_status",
+      description: "Get the status of the automatic context gate enforcer, including enabled/disabled state, log_only mode, active policy, and statistics. The enforcer automatically filters tool arguments when enabled. Use this to monitor what the enforcer has been filtering.",
+      inputSchema: {
+        type: "object",
+        properties: {}
+      },
+      handler: async () => {
+        const status = enforcer.getStatus();
+        auditLog.append(
+          "l2",
+          "context_gate_enforcer_status_query",
+          "system",
+          {
+            enabled: status.enabled,
+            log_only: status.log_only,
+            default_policy_id: status.default_policy_id
+          }
+        );
+        return toolResult({
+          enforcer_status: status,
+          description: "The enforcer is " + (status.enabled ? "enabled" : "disabled") + ". " + (status.log_only ? "Currently in log_only mode \u2014 filtering is logged but not applied." : "Filtering is actively applied to tool arguments."),
+          guidance: status.stats.calls_inspected > 0 ? `Over ${status.stats.calls_inspected} tool calls, ${status.stats.fields_redacted} sensitive fields were redacted. Use sanctuary/context_gate_enforcer_configure to adjust settings.` : "No tool calls have been inspected yet."
+        });
+      }
+    },
+    // ── Enforcer Configuration ──────────────────────────────────────────
+    {
+      name: "sanctuary/context_gate_enforcer_configure",
+      description: "Configure the automatic context gate enforcer. Control whether it filters tool arguments, toggle log_only mode for gradual rollout, set the active policy, and choose what to do when denied fields are encountered (block the request or redact the field). Use this to enable automatic context protection.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          enabled: {
+            type: "boolean",
+            description: "Enable or disable the automatic enforcer. When disabled, no filtering occurs. Default: leave unchanged."
+          },
+          log_only: {
+            type: "boolean",
+            description: "Enable log_only mode: filter decisions are logged but original args are passed to handlers. Useful for monitoring before enabling actual filtering. Default: leave unchanged."
+          },
+          default_policy_id: {
+            type: "string",
+            description: "Set the default context-gating policy to use for filtering. If not set, the enforcer uses built-in sensitive field patterns. Default: leave unchanged."
+          },
+          on_deny: {
+            type: "string",
+            enum: ["block", "redact"],
+            description: "Action to take when a field triggers the deny action: 'block' returns an error and prevents the call, 'redact' replaces the denied field with [REDACTED] and continues. Default: leave unchanged."
+          },
+          reset_stats: {
+            type: "boolean",
+            description: "Reset the enforcer statistics counters to zero. Default: false."
+          }
+        }
+      },
+      handler: async (args) => {
+        const changes = {};
+        if (args.enabled !== void 0) {
+          enforcer.setEnabled(args.enabled);
+          changes.enabled = args.enabled;
+        }
+        if (args.log_only !== void 0) {
+          enforcer.setLogOnly(args.log_only);
+          changes.log_only = args.log_only;
+        }
+        if (args.default_policy_id !== void 0) {
+          const policyId = args.default_policy_id;
+          const policy = await policyStore.get(policyId);
+          if (!policy) {
+            return toolResult({
+              error: "policy_not_found",
+              message: `No context-gating policy found with ID "${policyId}"`
+            });
+          }
+          enforcer.setDefaultPolicy(policyId);
+          changes.default_policy_id = policyId;
+        }
+        if (args.on_deny !== void 0) {
+          const onDeny = args.on_deny;
+          if (onDeny !== "block" && onDeny !== "redact") {
+            return toolResult({
+              error: "invalid_on_deny",
+              message: "on_deny must be 'block' or 'redact'"
+            });
+          }
+          enforcerConfig.on_deny = onDeny;
+          changes.on_deny = onDeny;
+        }
+        if (args.reset_stats === true) {
+          enforcer.resetStats();
+          changes.reset_stats = true;
+        }
+        const newStatus = enforcer.getStatus();
+        auditLog.append(
+          "l2",
+          "context_gate_enforcer_configure",
+          "system",
+          {
+            changes,
+            new_status: newStatus
+          }
+        );
+        return toolResult({
+          configured: true,
+          changes,
+          new_status: newStatus,
+          message: Object.keys(changes).length > 0 ? "Enforcer configuration updated." : "No changes made (no configuration parameters provided)."
+        });
+      }
     }
   ];
-  return { tools, policyStore };
+  return { tools, policyStore, enforcer };
 }
 function checkMemoryProtection() {
   const checks = {
@@ -9932,11 +11797,7 @@ async function createSanctuaryServer(options) {
     handshakeResults
   );
   const { tools: auditTools } = createAuditTools(config);
-  const { tools: contextGateTools } = createContextGateTools(
-    storage,
-    masterKey,
-    auditLog
-  );
+  const { tools: contextGateTools, enforcer: contextGateEnforcer } = createContextGateTools(storage, masterKey, auditLog);
   const hardeningTools = createL2HardeningTools(config.storage_path, auditLog);
   const policy = await loadPrincipalPolicy(config.storage_path);
   const baseline = new BaselineTracker(storage, masterKey);
@@ -9974,9 +11835,27 @@ async function createSanctuaryServer(options) {
   } else {
     approvalChannel = new StderrApprovalChannel(policy.approval_channel);
   }
-  const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog);
+  const injectionDetector = new InjectionDetector({
+    enabled: true,
+    sensitivity: "medium",
+    on_detection: "escalate"
+  });
+  const onInjectionAlert = dashboard ? (alert) => {
+    dashboard.broadcastSSE("injection-alert", {
+      tool: alert.toolName,
+      confidence: alert.result.confidence,
+      signals: alert.result.signals.map((s) => ({
+        type: s.type,
+        location: s.location,
+        severity: s.severity
+      })),
+      recommendation: alert.result.recommendation,
+      timestamp: alert.timestamp
+    });
+  } : void 0;
+  const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog, injectionDetector, onInjectionAlert);
   const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
-  const allTools = [
+  let allTools = [
     ...l1Tools,
     ...l2Tools,
     ...l3Tools,
@@ -9991,6 +11870,10 @@ async function createSanctuaryServer(options) {
     ...hardeningTools,
     manifestTool
   ];
+  allTools = allTools.map((tool) => ({
+    ...tool,
+    handler: contextGateEnforcer.wrapHandler(tool.name, tool.handler)
+  }));
   const server = createServer(allTools, { gate });
   await saveConfig(config);
   const saveBaseline = () => {
@@ -10021,10 +11904,12 @@ exports.BaselineTracker = BaselineTracker;
 exports.CONTEXT_GATE_TEMPLATES = TEMPLATES;
 exports.CallbackApprovalChannel = CallbackApprovalChannel;
 exports.CommitmentStore = CommitmentStore;
+exports.ContextGateEnforcer = ContextGateEnforcer;
 exports.ContextGatePolicyStore = ContextGatePolicyStore;
 exports.DashboardApprovalChannel = DashboardApprovalChannel;
 exports.FederationRegistry = FederationRegistry;
 exports.FilesystemStorage = FilesystemStorage;
+exports.InjectionDetector = InjectionDetector;
 exports.MemoryStorage = MemoryStorage;
 exports.PolicyStore = PolicyStore;
 exports.ReputationStore = ReputationStore;

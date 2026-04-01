@@ -1363,48 +1363,116 @@ declare function classifyField(fieldName: string): FieldClassification;
 declare function recommendPolicy(context: Record<string, unknown>, provider?: string): PolicyRecommendation;
 
 /**
- * Sanctuary MCP Server — In-Memory Storage Backend
+ * Sanctuary MCP Server — Prompt Injection Detection Layer
  *
- * Used for testing. Implements the same interface as filesystem storage
- * but stores everything in memory. Data does not persist across restarts.
- */
-
-declare class MemoryStorage implements StorageBackend {
-    private store;
-    private storageKey;
-    write(namespace: string, key: string, data: Uint8Array): Promise<void>;
-    read(namespace: string, key: string): Promise<Uint8Array | null>;
-    delete(namespace: string, key: string, _secureOverwrite?: boolean): Promise<boolean>;
-    list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]>;
-    exists(namespace: string, key: string): Promise<boolean>;
-    totalSize(): Promise<number>;
-    /** Clear all stored data (useful in tests) */
-    clear(): void;
-}
-
-/**
- * Sanctuary MCP Server — Filesystem Storage Backend
- *
- * Default storage backend using the local filesystem.
- * Files are stored as: {basePath}/{namespace}/{key}.enc
+ * Fast, zero-dependency detection of common prompt injection patterns.
+ * Scans tool arguments for role override, security bypass, encoding evasion,
+ * data exfiltration, and prompt stuffing signals.
  *
  * Security invariants:
- * - Secure deletion overwrites file content with random bytes before unlinking
- * - Directory creation uses restrictive permissions (0o700)
- * - File creation uses restrictive permissions (0o600)
+ * - Always returns a result, never throws
+ * - Typical scan completes in < 5ms
+ * - False positives minimized via field-aware scanning
+ * - Recursive scanning of nested objects/arrays
  */
-
-declare class FilesystemStorage implements StorageBackend {
-    private basePath;
-    constructor(basePath: string);
-    private entryPath;
-    private namespacePath;
-    write(namespace: string, key: string, data: Uint8Array): Promise<void>;
-    read(namespace: string, key: string): Promise<Uint8Array | null>;
-    delete(namespace: string, key: string, secureOverwrite?: boolean): Promise<boolean>;
-    list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]>;
-    exists(namespace: string, key: string): Promise<boolean>;
-    totalSize(): Promise<number>;
+interface InjectionDetectorConfig {
+    enabled: boolean;
+    sensitivity: "low" | "medium" | "high";
+    on_detection: "escalate" | "block" | "log";
+    custom_patterns?: string[];
+}
+interface InjectionSignal {
+    type: string;
+    pattern: string;
+    location: string;
+    severity: "low" | "medium" | "high";
+}
+interface DetectionResult {
+    flagged: boolean;
+    confidence: number;
+    signals: InjectionSignal[];
+    recommendation: "allow" | "escalate" | "block";
+}
+declare class InjectionDetector {
+    private config;
+    private stats;
+    constructor(config?: Partial<InjectionDetectorConfig>);
+    /**
+     * Scan tool arguments for injection signals.
+     * @param toolName Full tool name (e.g., "sanctuary/state_read")
+     * @param args Tool arguments
+     * @returns DetectionResult with all detected signals
+     */
+    scan(toolName: string, args: Record<string, unknown>): DetectionResult;
+    /**
+     * Recursively scan a value and all nested values.
+     */
+    private scanValue;
+    /**
+     * Scan a single string for injection signals.
+     */
+    private scanString;
+    /**
+     * Detect base64 strings and zero-width character evasion.
+     */
+    private detectEncodingEvasion;
+    /**
+     * Detect URLs and emails in fields that shouldn't have them.
+     */
+    private detectDataExfiltration;
+    /**
+     * Detect prompt stuffing: very large strings or high repetition.
+     */
+    private detectPromptStuffing;
+    /**
+     * Determine if this field is inherently safe from role override.
+     */
+    private isSafeField;
+    /**
+     * Determine if this is a tool name field (where tool refs are expected).
+     */
+    private isToolNameField;
+    /**
+     * Determine if this field is safe for URLs.
+     */
+    private isUrlSafeField;
+    /**
+     * Determine if this field is safe for emails.
+     */
+    private isEmailSafeField;
+    /**
+     * Determine if this field is safe for structured data (JSON/XML).
+     */
+    private isStructuredField;
+    /**
+     * SEC-032: Map common cross-script confusable characters to their Latin equivalents.
+     * NFKC normalization handles fullwidth and compatibility forms, but does NOT map
+     * Cyrillic/Greek lookalikes to Latin (they're distinct codepoints by design).
+     * This covers the most common confusables used in injection evasion.
+     */
+    private normalizeConfusables;
+    /**
+     * Compute confidence score based on signals.
+     * More high-severity signals = higher confidence.
+     */
+    private computeConfidence;
+    /**
+     * Compute recommendation based on signals and sensitivity.
+     */
+    private computeRecommendation;
+    /**
+     * Get statistics about scans performed.
+     */
+    getStats(): {
+        total_scans: number;
+        total_flags: number;
+        total_blocks: number;
+        signals_by_type: Record<string, number>;
+    };
+    /**
+     * Reset statistics.
+     */
+    resetStats(): void;
 }
 
 /**
@@ -1640,12 +1708,20 @@ declare class BaselineTracker {
  * - All gate decisions (approve, deny, allow) are audit-logged.
  */
 
+/** Callback invoked when an injection is detected, for dashboard broadcasting */
+type InjectionAlertCallback = (alert: {
+    toolName: string;
+    result: DetectionResult;
+    timestamp: string;
+}) => void;
 declare class ApprovalGate {
     private policy;
     private baseline;
     private channel;
     private auditLog;
-    constructor(policy: PrincipalPolicy, baseline: BaselineTracker, channel: ApprovalChannel, auditLog: AuditLog);
+    private injectionDetector;
+    private onInjectionAlert?;
+    constructor(policy: PrincipalPolicy, baseline: BaselineTracker, channel: ApprovalChannel, auditLog: AuditLog, injectionDetector?: InjectionDetector, onInjectionAlert?: InjectionAlertCallback);
     /**
      * Evaluate a tool call against the Principal Policy.
      *
@@ -1669,6 +1745,189 @@ declare class ApprovalGate {
     private summarizeArgs;
     /** Get the baseline tracker for saving at session end */
     getBaseline(): BaselineTracker;
+    /** Get the injection detector for stats/configuration access */
+    getInjectionDetector(): InjectionDetector;
+}
+
+/**
+ * Sanctuary MCP Server — Tool Router
+ *
+ * Routes sanctuary/* tool calls to their layer-specific handlers.
+ * Every tool call passes through schema validation and the ApprovalGate
+ * (if configured) before execution. Neither can be bypassed.
+ *
+ * This module is the abstraction boundary for MCP SDK version migration —
+ * if the SDK API changes, only this module needs updating.
+ */
+
+/** Tool handler function signature */
+type ToolHandler = (args: Record<string, unknown>) => Promise<{
+    content: Array<{
+        type: "text";
+        text: string;
+    }>;
+}>;
+
+/**
+ * Sanctuary MCP Server — L2 Context Gating: Automatic Enforcer
+ *
+ * The context gate enforcer wraps tool handlers to automatically filter
+ * their arguments before execution. Unlike context_gate_filter (which agents
+ * call voluntarily), the enforcer runs automatically on every tool call
+ * when enabled.
+ *
+ * This enforces minimum-necessary-context by default and makes bypassing
+ * context protection explicit (requires reconfiguration).
+ *
+ * Security invariants:
+ * - The enforcer wraps every tool handler when enabled
+ * - Filtering decisions are audit-logged
+ * - Default action on missing policy: fallback to built-in sensitive patterns
+ * - Denied fields block the entire request (with logged reason)
+ * - Redacted fields are stripped from tool arguments
+ * - log_only mode logs what would be filtered but passes original args
+ */
+
+interface EnforcerConfig {
+    /** Enable/disable automatic filtering (default: true) */
+    enabled: boolean;
+    /** Policy ID to use when no specific one is set */
+    default_policy_id?: string;
+    /** Tool name prefixes to skip filtering (e.g., ["sanctuary/"] to skip system tools) */
+    bypass_prefixes: string[];
+    /** Log but don't filter — for gradual rollout (default: false) */
+    log_only: boolean;
+    /** What to do when a field triggers deny action: "block" or "redact" */
+    on_deny: "block" | "redact";
+}
+interface EnforcerStatus {
+    enabled: boolean;
+    log_only: boolean;
+    default_policy_id: string | null;
+    stats: {
+        calls_inspected: number;
+        calls_bypassed: number;
+        fields_redacted: number;
+        fields_hashed: number;
+        fields_blocked: number;
+        calls_blocked: number;
+    };
+}
+declare class ContextGateEnforcer {
+    private policyStore;
+    private auditLog;
+    private config;
+    private stats;
+    constructor(policyStore: ContextGatePolicyStore, auditLog: AuditLog, config: EnforcerConfig);
+    /**
+     * Wrap a tool handler to apply automatic context gating.
+     *
+     * The wrapped handler:
+     * 1. Checks if tool should be filtered (based on bypass_prefixes)
+     * 2. If not filtering, calls original handler directly
+     * 3. If filtering:
+     *    a. Gets the active policy or falls back to built-in patterns
+     *    b. Calls filterContext() with tool arguments
+     *    c. If any field triggered "deny" and on_deny is "block", returns error
+     *    d. If on_deny is "redact", replaces denied fields with "[REDACTED]"
+     *    e. Calls original handler with filtered arguments
+     *    f. Logs the filtering decision
+     * 4. In log_only mode: runs filter, logs what would happen, passes original args
+     */
+    wrapHandler(toolName: string, originalHandler: ToolHandler): ToolHandler;
+    /**
+     * Filter tool arguments using an explicit policy.
+     */
+    private filterWithPolicy;
+    /**
+     * Filter tool arguments using built-in sensitive patterns.
+     * This provides baseline protection when no explicit policy is configured.
+     */
+    private filterWithBuiltinPatterns;
+    /**
+     * Check if a tool should be filtered based on bypass prefixes.
+     *
+     * SEC-033: Uses exact namespace component matching, not bare startsWith().
+     * A prefix of "sanctuary/" matches "sanctuary/state_read" but NOT
+     * "sanctuary_evil/steal_data" (no slash boundary confusion). The prefix
+     * must match exactly up to its length, and the prefix must end with "/"
+     * to enforce namespace boundaries (if it doesn't, we add one for safety).
+     */
+    shouldFilter(toolName: string): boolean;
+    /**
+     * Extract provider category from tool name.
+     * Default: "tool-api". Override for specific patterns.
+     */
+    private extractProviderCategory;
+    /**
+     * Build filtered arguments from filter decisions.
+     */
+    private buildFilteredArgs;
+    /**
+     * Set the active policy ID.
+     */
+    setDefaultPolicy(policyId: string): void;
+    /**
+     * Get current enforcer status and stats.
+     */
+    getStatus(): EnforcerStatus;
+    /**
+     * Toggle enforcer enabled state.
+     */
+    setEnabled(enabled: boolean): void;
+    /**
+     * Toggle log_only mode.
+     */
+    setLogOnly(logOnly: boolean): void;
+    /**
+     * Reset stats counters.
+     */
+    resetStats(): void;
+}
+
+/**
+ * Sanctuary MCP Server — In-Memory Storage Backend
+ *
+ * Used for testing. Implements the same interface as filesystem storage
+ * but stores everything in memory. Data does not persist across restarts.
+ */
+
+declare class MemoryStorage implements StorageBackend {
+    private store;
+    private storageKey;
+    write(namespace: string, key: string, data: Uint8Array): Promise<void>;
+    read(namespace: string, key: string): Promise<Uint8Array | null>;
+    delete(namespace: string, key: string, _secureOverwrite?: boolean): Promise<boolean>;
+    list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]>;
+    exists(namespace: string, key: string): Promise<boolean>;
+    totalSize(): Promise<number>;
+    /** Clear all stored data (useful in tests) */
+    clear(): void;
+}
+
+/**
+ * Sanctuary MCP Server — Filesystem Storage Backend
+ *
+ * Default storage backend using the local filesystem.
+ * Files are stored as: {basePath}/{namespace}/{key}.enc
+ *
+ * Security invariants:
+ * - Secure deletion overwrites file content with random bytes before unlinking
+ * - Directory creation uses restrictive permissions (0o700)
+ * - File creation uses restrictive permissions (0o600)
+ */
+
+declare class FilesystemStorage implements StorageBackend {
+    private basePath;
+    constructor(basePath: string);
+    private entryPath;
+    private namespacePath;
+    write(namespace: string, key: string, data: Uint8Array): Promise<void>;
+    read(namespace: string, key: string): Promise<Uint8Array | null>;
+    delete(namespace: string, key: string, secureOverwrite?: boolean): Promise<boolean>;
+    list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]>;
+    exists(namespace: string, key: string): Promise<boolean>;
+    totalSize(): Promise<number>;
 }
 
 /**
@@ -1818,7 +2077,7 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
     private handlePendingList;
     private handleAuditLog;
     private handleDecision;
-    private broadcastSSE;
+    broadcastSSE(event: string, data: unknown): void;
     /**
      * Broadcast an audit entry to connected dashboards.
      * Called externally when audit events happen.
@@ -1834,6 +2093,30 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
      * Called externally after baseline changes.
      */
     broadcastBaselineUpdate(): void;
+    /**
+     * Broadcast a tool call event to connected dashboards.
+     * Called from the gate or router when a tool is invoked.
+     */
+    broadcastToolCall(data: {
+        tool: string;
+        tier: number;
+        allowed: boolean;
+        timestamp: string;
+    }): void;
+    /**
+     * Broadcast a context gate decision to connected dashboards.
+     */
+    broadcastContextGateDecision(data: {
+        tool: string;
+        fields_filtered: number;
+        fields_total: number;
+        action: string;
+        timestamp: string;
+    }): void;
+    /**
+     * Broadcast current protection status to connected dashboards.
+     */
+    broadcastProtectionStatus(data: Record<string, unknown>): void;
     /** Get the number of pending requests */
     get pendingCount(): number;
     /** Get the number of connected SSE clients */
@@ -2241,4 +2524,4 @@ declare function createSanctuaryServer(options?: {
     storage?: StorageBackend;
 }): Promise<SanctuaryServer>;
 
-export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, type BridgeAttestationRequest, type BridgeAttestationResult, type BridgeCommitment, type BridgeVerificationResult, TEMPLATES as CONTEXT_GATE_TEMPLATES, CallbackApprovalChannel, CommitmentStore, type ConcordiaOutcome, type ContextAction, type ContextFilterResult, type ContextGatePolicy, ContextGatePolicyStore, type ContextGateRule, type ContextGateTemplate, DashboardApprovalChannel, type DashboardConfig, type FederationCapabilities, type FederationPeer, FederationRegistry, type FieldClassification, type FieldFilterResult, FilesystemStorage, type GateResult, type HandshakeChallenge, type HandshakeCompletion, type HandshakeResponse, type HandshakeResult, MemoryStorage, type PedersenCommitment, type PeerTrustEvaluation, type PolicyRecommendation, PolicyStore, type PrincipalPolicy, type ProviderCategory, ReputationStore, type SHRBody, type SHRVerificationResult, type SanctuaryConfig, type SanctuaryServer, type SignedSHR, type SovereigntyTier, StateStore, StderrApprovalChannel, TIER_WEIGHTS, type TierMetadata, type TieredAttestation, WebhookApprovalChannel, type WebhookCallbackPayload, type WebhookConfig, type WebhookPayload, type ZKProofOfKnowledge, type ZKRangeProof, canonicalize, classifyField, completeHandshake, computeWeightedScore, createBridgeCommitment, createPedersenCommitment, createProofOfKnowledge, createRangeProof, createSanctuaryServer, evaluateField, filterContext, generateSHR, getTemplate, initiateHandshake, listTemplateIds, loadConfig, loadPrincipalPolicy, recommendPolicy, resolveTier, respondToHandshake, signPayload, tierDistribution, verifyBridgeCommitment, verifyCompletion, verifyPedersenCommitment, verifyProofOfKnowledge, verifyRangeProof, verifySHR, verifySignature };
+export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, type BridgeAttestationRequest, type BridgeAttestationResult, type BridgeCommitment, type BridgeVerificationResult, TEMPLATES as CONTEXT_GATE_TEMPLATES, CallbackApprovalChannel, CommitmentStore, type ConcordiaOutcome, type ContextAction, type ContextFilterResult, ContextGateEnforcer, type ContextGatePolicy, ContextGatePolicyStore, type ContextGateRule, type ContextGateTemplate, DashboardApprovalChannel, type DashboardConfig, type DetectionResult, type EnforcerConfig, type FederationCapabilities, type FederationPeer, FederationRegistry, type FieldClassification, type FieldFilterResult, FilesystemStorage, type GateResult, type HandshakeChallenge, type HandshakeCompletion, type HandshakeResponse, type HandshakeResult, InjectionDetector, type InjectionDetectorConfig, type InjectionSignal, MemoryStorage, type PedersenCommitment, type PeerTrustEvaluation, type PolicyRecommendation, PolicyStore, type PrincipalPolicy, type ProviderCategory, ReputationStore, type SHRBody, type SHRVerificationResult, type SanctuaryConfig, type SanctuaryServer, type SignedSHR, type SovereigntyTier, StateStore, StderrApprovalChannel, TIER_WEIGHTS, type TierMetadata, type TieredAttestation, WebhookApprovalChannel, type WebhookCallbackPayload, type WebhookConfig, type WebhookPayload, type ZKProofOfKnowledge, type ZKRangeProof, canonicalize, classifyField, completeHandshake, computeWeightedScore, createBridgeCommitment, createPedersenCommitment, createProofOfKnowledge, createRangeProof, createSanctuaryServer, evaluateField, filterContext, generateSHR, getTemplate, initiateHandshake, listTemplateIds, loadConfig, loadPrincipalPolicy, recommendPolicy, resolveTier, respondToHandshake, signPayload, tierDistribution, verifyBridgeCommitment, verifyCompletion, verifyPedersenCommitment, verifyProofOfKnowledge, verifyRangeProof, verifySHR, verifySignature };
