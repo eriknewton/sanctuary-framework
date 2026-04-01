@@ -34,6 +34,10 @@ import {
   getTemplate,
 } from "./context-gate-templates.js";
 import { recommendPolicy } from "./context-gate-recommend.js";
+import {
+  ContextGateEnforcer,
+  type EnforcerConfig,
+} from "./context-gate-enforcer.js";
 
 /**
  * Create the context-gating MCP tools.
@@ -42,8 +46,21 @@ export function createContextGateTools(
   storage: StorageBackend,
   masterKey: Uint8Array,
   auditLog: AuditLog
-): { tools: ToolDefinition[]; policyStore: ContextGatePolicyStore } {
+): {
+  tools: ToolDefinition[];
+  policyStore: ContextGatePolicyStore;
+  enforcer: ContextGateEnforcer;
+} {
   const policyStore = new ContextGatePolicyStore(storage, masterKey);
+
+  // Create the automatic enforcer
+  const enforcerConfig: EnforcerConfig = {
+    enabled: false, // Off by default; agents must explicitly enable it
+    bypass_prefixes: ["sanctuary/"], // Skip internal tools by default
+    log_only: false, // Filter immediately
+    on_deny: "block", // Block requests with denied fields
+  };
+  const enforcer = new ContextGateEnforcer(policyStore, auditLog, enforcerConfig);
 
   const tools: ToolDefinition[] = [
     // ── Set Policy ──────────────────────────────────────────────────
@@ -512,7 +529,167 @@ export function createContextGateTools(
         });
       },
     },
+
+    // ── Enforcer Status ─────────────────────────────────────────────────
+    {
+      name: "sanctuary/context_gate_enforcer_status",
+      description:
+        "Get the status of the automatic context gate enforcer, including " +
+        "enabled/disabled state, log_only mode, active policy, and statistics. " +
+        "The enforcer automatically filters tool arguments when enabled. " +
+        "Use this to monitor what the enforcer has been filtering.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+      handler: async () => {
+        const status = enforcer.getStatus();
+
+        auditLog.append(
+          "l2",
+          "context_gate_enforcer_status_query",
+          "system",
+          {
+            enabled: status.enabled,
+            log_only: status.log_only,
+            default_policy_id: status.default_policy_id,
+          }
+        );
+
+        return toolResult({
+          enforcer_status: status,
+          description:
+            "The enforcer is " +
+            (status.enabled ? "enabled" : "disabled") +
+            ". " +
+            (status.log_only
+              ? "Currently in log_only mode — filtering is logged but not applied."
+              : "Filtering is actively applied to tool arguments."),
+          guidance:
+            status.stats.calls_inspected > 0
+              ? `Over ${status.stats.calls_inspected} tool calls, ` +
+                `${status.stats.fields_redacted} sensitive fields were redacted. ` +
+                `Use sanctuary/context_gate_enforcer_configure to adjust settings.`
+              : "No tool calls have been inspected yet.",
+        });
+      },
+    },
+
+    // ── Enforcer Configuration ──────────────────────────────────────────
+    {
+      name: "sanctuary/context_gate_enforcer_configure",
+      description:
+        "Configure the automatic context gate enforcer. Control whether it " +
+        "filters tool arguments, toggle log_only mode for gradual rollout, " +
+        "set the active policy, and choose what to do when denied fields are " +
+        "encountered (block the request or redact the field). " +
+        "Use this to enable automatic context protection.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          enabled: {
+            type: "boolean",
+            description:
+              "Enable or disable the automatic enforcer. When disabled, " +
+              "no filtering occurs. Default: leave unchanged.",
+          },
+          log_only: {
+            type: "boolean",
+            description:
+              "Enable log_only mode: filter decisions are logged but original " +
+              "args are passed to handlers. Useful for monitoring before " +
+              "enabling actual filtering. Default: leave unchanged.",
+          },
+          default_policy_id: {
+            type: "string",
+            description:
+              "Set the default context-gating policy to use for filtering. " +
+              "If not set, the enforcer uses built-in sensitive field patterns. " +
+              "Default: leave unchanged.",
+          },
+          on_deny: {
+            type: "string",
+            enum: ["block", "redact"],
+            description:
+              "Action to take when a field triggers the deny action: " +
+              "'block' returns an error and prevents the call, " +
+              "'redact' replaces the denied field with [REDACTED] and continues. " +
+              "Default: leave unchanged.",
+          },
+          reset_stats: {
+            type: "boolean",
+            description:
+              "Reset the enforcer statistics counters to zero. Default: false.",
+          },
+        },
+      },
+      handler: async (args) => {
+        const changes: Record<string, unknown> = {};
+
+        if (args.enabled !== undefined) {
+          enforcer.setEnabled(args.enabled as boolean);
+          changes.enabled = args.enabled;
+        }
+
+        if (args.log_only !== undefined) {
+          enforcer.setLogOnly(args.log_only as boolean);
+          changes.log_only = args.log_only;
+        }
+
+        if (args.default_policy_id !== undefined) {
+          const policyId = args.default_policy_id as string;
+          const policy = await policyStore.get(policyId);
+          if (!policy) {
+            return toolResult({
+              error: "policy_not_found",
+              message: `No context-gating policy found with ID "${policyId}"`,
+            });
+          }
+          enforcer.setDefaultPolicy(policyId);
+          changes.default_policy_id = policyId;
+        }
+
+        if (args.on_deny !== undefined) {
+          const onDeny = args.on_deny as "block" | "redact";
+          if (onDeny !== "block" && onDeny !== "redact") {
+            return toolResult({
+              error: "invalid_on_deny",
+              message: "on_deny must be 'block' or 'redact'",
+            });
+          }
+          enforcerConfig.on_deny = onDeny;
+          changes.on_deny = onDeny;
+        }
+
+        if (args.reset_stats === true) {
+          enforcer.resetStats();
+          changes.reset_stats = true;
+        }
+
+        const newStatus = enforcer.getStatus();
+
+        auditLog.append(
+          "l2",
+          "context_gate_enforcer_configure",
+          "system",
+          {
+            changes,
+            new_status: newStatus,
+          }
+        );
+
+        return toolResult({
+          configured: true,
+          changes,
+          new_status: newStatus,
+          message:
+            Object.keys(changes).length > 0
+              ? "Enforcer configuration updated."
+              : "No changes made (no configuration parameters provided).",
+        });
+      },
+    },
   ];
 
-  return { tools, policyStore };
+  return { tools, policyStore, enforcer };
 }

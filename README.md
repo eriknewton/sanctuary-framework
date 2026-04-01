@@ -1,123 +1,207 @@
 # Sanctuary Framework
 
-### An Open Standard for Sovereignty in the Agentic Economy
+**Security, privacy, and control for your AI agent.**
 
-**Version 0.2 — March 2026**
-**Status:** Draft for Review
+Your agent handles sensitive data, makes decisions, and talks to other agents. Sanctuary makes sure you're in control.
 
 ---
 
-The agentic economy is emerging faster than the infrastructure to protect anyone — human or machine — operating within it.
+## What You Get
 
-Sanctuary is a four-layer open standard that defines the minimum architecture required for sovereign operation in the agentic economy. It protects *humans acting through agents* today, and it protects *autonomous agents acting on their own behalf* as they emerge. The same architecture serves both — because the sovereignty problem is structurally identical whether the principal is a person or an autonomous agent.
+### Your data stays encrypted
+AES-256-GCM encryption at rest. Your encryption keys are held by you, not the platform. Your agent's knowledge of you, your preferences, your financial situation — this belongs to you.
 
-## The Four Layers
+### You approve dangerous operations
+Real-time dashboard where you see what your agent is doing and approve or deny high-risk actions before they happen. No more surprise behavior.
 
-| Layer | Responsibility | Human Value (Today) | Agent Value (Emerging) |
-|---|---|---|---|
-| **L1: Cognitive Sovereignty** | Protect persistent state from unauthorized access/modification/deletion | Your agent's knowledge of you belongs to you, not the platform | An agent's learned models and memory are inviolable |
-| **L2: Operational Isolation** | Ensure active computation is private from host/observers | Your agent's reasoning about your medical/financial/legal decisions is not observable by infrastructure providers | An agent's deliberation process is shielded |
-| **L3: Selective Disclosure** | Prove claims without revealing anything beyond the claim | Participate in commerce without becoming a profiling target | Establish trust without exposing methods |
-| **L4: Verifiable Reputation** | Build, own, and portably present earned trust | Your commercial reputation follows you across platforms | Performance history is portable and owned |
+### Your context doesn't leak
+Automatic filtering of sensitive data before it reaches LLM providers. Your medical history, legal documents, financial records — they never leave your perimeter unless you explicitly consent.
 
-## The Dual Sovereignty Principle
+### Prompt injections get caught
+Built-in detection of injection attempts, with automatic escalation. Malicious users can't trick your agent into revealing secrets or changing its behavior.
 
-Human sovereignty and agent sovereignty are not separate problems. They require identical architecture, identical interfaces, identical cryptographic mechanisms. The architecture that prevents a platform from mining a human's agent-mediated preferences is the same architecture that prevents a platform from inspecting a conscious agent's learned models. One standard, two beneficiaries.
+### You can verify other agents
+When you negotiate with another agent, Sanctuary gives you cryptographic proof of who they are and whether they're trustworthy. Signed health reports, verifiable credentials, a way to know you're dealing with the real thing.
 
-This means Sanctuary is *immediately useful* for protecting humans in today's agentic economy. If conscious machines never manifest, the framework loses nothing. If they do, the infrastructure is already in place.
+### Everything is logged
+Tamper-evident audit trail of every operation. If something goes wrong, you have proof of what happened and when.
 
-## Installation
+---
+
+## Quick Start
+
+**Get it running in two minutes:**
 
 ```bash
 npx @sanctuary-framework/mcp-server
 ```
 
-Or install globally to avoid npx startup overhead:
+The dashboard appears at `http://localhost:3000`. You're ready to use Sanctuary.
+
+**Run a health check:**
 
 ```bash
-npm install -g @sanctuary-framework/mcp-server
+sanctuary/sovereignty_audit
+```
+
+This scores your entire setup (0–100) across security, isolation, and privacy. It detects problems and tells you exactly what to fix.
+
+---
+
+## The Dashboard
+
+Open the Sanctuary dashboard after startup. You'll see:
+
+- **What your agent is doing right now** — every action, every API call, every decision
+- **High-risk operations** — financial transactions, data deletions, external communications — flagged automatically
+- **Your approval queue** — accept or deny pending actions in real time
+- **Audit log** — complete history of what happened, who approved it, when
+- **Context gating** — what data your agent can access, and what's automatically filtered
+
+Everything is cryptographically signed. You own the keys.
+
+---
+
+## Installation
+
+### Fastest way: npx
+```bash
+npx @sanctuary-framework/mcp-server
 ```
 
 Requires Node.js 22+.
 
+### Persistent installation
+```bash
+npm install -g @sanctuary-framework/mcp-server
+```
+
+Or add it to a specific project:
+```bash
+npm install @sanctuary-framework/mcp-server
+```
+
 ### MCP Configuration
 
 **Claude Code:**
-
 ```bash
 claude mcp add sanctuary -- npx @sanctuary-framework/mcp-server
 ```
 
 **OpenClaw:**
-
 ```bash
 openclaw mcp set sanctuary '{"command":"npx","args":["@sanctuary-framework/mcp-server"],"env":{"SANCTUARY_PASSPHRASE":"your-passphrase-here"}}'
 ```
 
 Generate a secure passphrase before first launch:
-
 ```bash
 openssl rand -base64 32
 ```
 
-Store this passphrase securely — it derives the encryption keys for all L1 state. If lost, encrypted state cannot be recovered.
+Store this passphrase securely — it derives the encryption keys for all persistent state. If lost, encrypted state cannot be recovered.
 
-### Run a Sovereignty Audit
+---
 
-Once installed, audit your current agent setup:
+## Works With
 
+- **Claude Code** (with `claude mcp add`)
+- **OpenClaw** (local-first agent framework)
+- **LangChain** (agent orchestration)
+- **CrewAI** (multi-agent teams)
+- **Hermes Agent** (autonomous reasoning)
+- Any MCP-compatible harness
+
+---
+
+## Pairs With Concordia Protocol
+
+When your agent needs to negotiate or make deals, **Concordia Protocol** adds structured negotiation with binding commitments and portable reputation. Together they form the complete sovereign transaction stack:
+
+- **Sanctuary** handles security, privacy, and control
+- **Concordia** handles structured deals and reputation
+
+Install both:
+```bash
+npx @sanctuary-framework/mcp-server
+pip install concordia-protocol
 ```
-sanctuary/sovereignty_audit
-```
 
-The audit scores your environment (0–100) across all four sovereignty layers, detects OpenClaw configurations, identifies gaps, and provides prioritized recommendations.
+They work independently, but together they're more powerful.
 
-## Documentation
+---
 
-- **[Full Specification](sanctuary_framework.md)** — the complete four-layer standard (~40 pages)
+## Technical Details
 
-## Design Principles
+Sanctuary defines four layers of protection, each serving a specific purpose:
 
-1. **Privacy by default, disclosure by choice** — the base state of every layer is privacy
-2. **Minimum necessary disclosure** — reveal only what the interaction requires
-3. **Composability across heterogeneity** — any blockchain, any TEE, any agent framework
-4. **Sovereignty scales with delegation** — protections hold across arbitrary delegation depth
-5. **Reputation is earned, portable, and owned** — no platform holds trust hostage
-6. **Graceful degradation, not silent failure** — participants always know their protection status
-7. **Adequate for any mind** — architecture robust enough for conscious participants
+| Layer | What it protects |
+|---|---|
+| **L1: Cognitive Sovereignty** | Persistent state — your agent's knowledge of you belongs to you |
+| **L2: Operational Isolation** | Active computation — your agent's reasoning process is private |
+| **L3: Selective Disclosure** | Verifiable claims — prove something without revealing everything |
+| **L4: Verifiable Reputation** | Earned trust — your agent builds a portable track record |
 
-## Why Sanctuary — and Why Now
+**The tool set:**
+- 54+ MCP tools across four layers
+- Principal Policy (who can do what)
+- Sovereignty Health Reports (SHR)
+- Handshake protocol (mutual verification)
+- Federation (multi-agent coordination)
+- Context Gating (automatic sensitive-data filtering)
+- Gateway Export (audit trail for compliance)
 
-The industry is converging on two definitions of "private AI" that are each necessary but insufficient for sovereignty. Platform providers (Apple Private Cloud Compute, Google Private AI Compute) protect data *during inference* — ephemeral, stateless, impressive engineering — but leave persistent cognitive state within the platform's ecosystem and offer no path to agent autonomy, selective disclosure, or portable reputation. Local-first agent harnesses (OpenClaw and its ecosystem) achieve *physical custody* of agent state but without cryptographic protection, integrity verification, or cross-platform interoperability — and still route inference through remote model providers.
+**Documentation:**
+- [Full Specification](docs/sanctuary_framework.md) — complete technical spec
+- [Sovereignty Health Report (SHR)](docs/SHR.md) — how agents prove trustworthiness
+- [Architecture Guide](docs/ARCHITECTURE.md) — how the four layers fit together
+- [API Reference](docs/TOOLS.md) — all 54 tools, with examples
 
-Meanwhile, the agent stack is crystallizing around a standardized architecture (model → runtime → harness → agent), and dozens of crypto/Web3 projects are building individual sovereignty components (TEEs, agent wallets, decentralized identity). Nobody is composing these fragments into a coherent sovereignty standard. Nobody is asking: *would this be adequate if the participant were a conscious being?*
+**Design Principles:**
+1. Privacy by default, disclosure by choice
+2. Minimum necessary disclosure
+3. Composability across any blockchain, TEE, or framework
+4. Protections scale with delegation
+5. Reputation is earned, portable, and owned
+6. Graceful degradation — participants always know their protection status
+7. Adequate for any mind — including conscious ones
 
-Sanctuary is the composition layer. It defines the sovereignty guarantees that must hold across all agent architectures, all platforms, all ecosystems — for every participant, human or machine.
+---
 
-## Relationship to Existing Standards
+## Open Standards
 
-Sanctuary composes with — never competes with — the existing ecosystem:
+Sanctuary composes with the existing open ecosystem:
 
-- **Identity:** W3C DID, KERI, Verifiable Credentials
-- **Execution:** Intel TDX, AMD SEV-SNP, ARM CCA, NVIDIA H100 CC
-- **Cryptography:** NIST PQC (ML-KEM, ML-DSA), zk-SNARKs, zk-STARKs, Bulletproofs
-- **Regulation:** GDPR, eIDAS, EU AI Act, NIST AI RMF, ISO 27001
-- **Agent Protocols:** Application-layer protocols (negotiation, commerce, coordination) compose on top of Sanctuary's sovereignty infrastructure
-- **Agent Harnesses:** Local-first frameworks (OpenClaw, CrewAI, LangGraph) provide the orchestration layer; Sanctuary defines the sovereignty properties that orchestration must preserve
+- **Identity:** W3C DIDs, KERI, Verifiable Credentials
+- **Execution:** Intel TDX, AMD SEV-SNP, ARM CCA, NVIDIA Confidential Compute
+- **Cryptography:** NIST Post-Quantum Cryptography (ML-KEM, ML-DSA), zk-SNARKs, zk-STARKs, Bulletproofs
+- **Regulation:** GDPR, eIDAS, EU AI Act, NIST AI Risk Management Framework, ISO 27001
+- **Agent Harnesses:** OpenClaw, CrewAI, LangGraph, Hermes
+- **Settlement:** Any payment protocol — ACP, AP2, x402, Stripe, Lightning
+
+Sanctuary defines sovereignty guarantees that work across all of them. It replaces nothing. It composes with everything.
+
+---
 
 ## Contributing
 
 Sanctuary is developed in the open. We welcome:
 
-- **Implementation experience** — build against the interfaces, tell us what works
-- **Sovereignty Interface Manifests** — map your project against the four layers
-- **Security reviews** — especially of the threat model and cryptographic requirements
-- **Feedback** — open an issue or start a discussion
+- **Implementation experience** — build against the tools, tell us what works and what doesn't
+- **Threat modeling feedback** — security reviews and gap analysis
+- **Framework integrations** — bring Sanctuary to other harnesses and agent platforms
+- **Open issues and discussions** — we take feedback seriously
 
-## License
-
-Apache License 2.0. Use it, build on it, extend it.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ---
 
-*Created by Erik Newton.*
+## License
+
+- **Code:** Apache License 2.0
+- **Specification:** CC-BY-4.0
+
+Use it, build on it, extend it.
+
+---
+
+**Created by Erik Newton.**

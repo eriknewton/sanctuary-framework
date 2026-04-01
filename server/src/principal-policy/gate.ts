@@ -20,23 +20,37 @@ import type { ApprovalChannel } from "./approval-channel.js";
 import { BaselineTracker } from "./baseline.js";
 import { extractOperationName } from "./loader.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
+import { InjectionDetector, type DetectionResult } from "../security/injection-detector.js";
+
+/** Callback invoked when an injection is detected, for dashboard broadcasting */
+export type InjectionAlertCallback = (alert: {
+  toolName: string;
+  result: DetectionResult;
+  timestamp: string;
+}) => void;
 
 export class ApprovalGate {
   private policy: PrincipalPolicy;
   private baseline: BaselineTracker;
   private channel: ApprovalChannel;
   private auditLog: AuditLog;
+  private injectionDetector: InjectionDetector;
+  private onInjectionAlert?: InjectionAlertCallback;
 
   constructor(
     policy: PrincipalPolicy,
     baseline: BaselineTracker,
     channel: ApprovalChannel,
-    auditLog: AuditLog
+    auditLog: AuditLog,
+    injectionDetector?: InjectionDetector,
+    onInjectionAlert?: InjectionAlertCallback
   ) {
     this.policy = policy;
     this.baseline = baseline;
     this.channel = channel;
     this.auditLog = auditLog;
+    this.injectionDetector = injectionDetector ?? new InjectionDetector();
+    this.onInjectionAlert = onInjectionAlert;
   }
 
   /**
@@ -54,6 +68,54 @@ export class ApprovalGate {
 
     // Record the tool call in the baseline tracker
     this.baseline.recordToolCall(operation);
+
+    // ── Pre-check: Prompt injection detection ────────────────────────
+    const injectionResult = this.injectionDetector.scan(toolName, args);
+    if (injectionResult.flagged) {
+      this.auditLog.append("l2", `injection_detected:${operation}`, "system", {
+        confidence: injectionResult.confidence,
+        signals: injectionResult.signals.map(s => ({
+          type: s.type,
+          location: s.location,
+          severity: s.severity,
+        })),
+        recommendation: injectionResult.recommendation,
+      });
+
+      // Notify dashboard if callback is registered
+      if (this.onInjectionAlert) {
+        this.onInjectionAlert({
+          toolName,
+          result: injectionResult,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      if (injectionResult.recommendation === "block") {
+        return {
+          allowed: false,
+          tier: 1,
+          reason: `Blocked: prompt injection detected in "${operation}" (confidence: ${(injectionResult.confidence * 100).toFixed(0)}%)`,
+          approval_required: false,
+        };
+      }
+
+      if (injectionResult.recommendation === "escalate") {
+        return this.requestApproval(
+          operation,
+          1,
+          `Potential prompt injection detected in "${operation}" (confidence: ${(injectionResult.confidence * 100).toFixed(0)}%, ${injectionResult.signals.length} signal(s))`,
+          {
+            operation,
+            injection_detection: {
+              confidence: injectionResult.confidence,
+              signal_count: injectionResult.signals.length,
+              signal_types: [...new Set(injectionResult.signals.map(s => s.type))],
+            },
+          }
+        );
+      }
+    }
 
     // ── Tier 1: Always requires approval ──────────────────────────────
     if (this.policy.tier1_always_approve.includes(operation)) {
@@ -279,5 +341,10 @@ export class ApprovalGate {
   /** Get the baseline tracker for saving at session end */
   getBaseline(): BaselineTracker {
     return this.baseline;
+  }
+
+  /** Get the injection detector for stats/configuration access */
+  getInjectionDetector(): InjectionDetector {
+    return this.injectionDetector;
   }
 }

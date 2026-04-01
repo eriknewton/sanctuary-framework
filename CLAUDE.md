@@ -208,9 +208,9 @@ These are testable assertions. Each should be verifiable by inspection or automa
 
 The structured security review completed 2026-03-28 with all Critical and High findings resolved. Review artifacts (REVIEW_MAP.md, SECURITY_AUDIT.md, BUG_REPORT.md, REMEDIATION_PLAN.md, SPRINT_CONTRACT.md, SPRINT_RESULT.md, SPRINT_EVAL.md) are in the working directory.
 
-Post-review work completed 2026-03-29: Sovereignty Audit Tool (`server/src/audit/`) — environment fingerprinting with OpenClaw-specific detection, four-layer gap analysis with deterministic scoring (0–100), and human-readable report generation. Plugin upgraded to v0.3.0 with Quick Start onboarding, OpenClaw Users section, and workflow-organized tool documentation. 315 tests passing across 31 test files. 46 MCP tools.
+Post-review work completed 2026-03-29: Sovereignty Audit Tool (`server/src/audit/`) — environment fingerprinting with OpenClaw-specific detection, four-layer gap analysis with deterministic scoring (0–100), and human-readable report generation. Published to npm as v0.3.1 on 2026-03-30.
 
-Published to npm as v0.3.1 on 2026-03-30. Security-review branch merged and deleted.
+**Current version: v0.4.2** (published 2026-04-01). 54 MCP tools, 484 tests, 38 test files. Patch releases v0.4.1 (dashboard.ts packaging fix) and v0.4.2 (policy merge for upgrade-safe tier3) resolved field-reported bugs from Mac Mini deployment.
 
 ---
 

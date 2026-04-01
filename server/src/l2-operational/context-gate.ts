@@ -293,7 +293,7 @@ export function filterContext(
  * - Wildcard suffix: "*_pii" matches "name_pii", "email_pii"
  * - Full wildcard: "*" matches everything
  */
-function matchesPattern(field: string, patterns: string[]): boolean {
+export function matchesPattern(field: string, patterns: string[]): boolean {
   const normalizedField = field.toLowerCase();
   for (const pattern of patterns) {
     if (pattern === "*") return true;

@@ -30,6 +30,7 @@ import { createBridgeTools } from "./bridge/tools.js";
 import { createAuditTools } from "./audit/tools.js";
 import { createContextGateTools } from "./l2-operational/context-gate-tools.js";
 import { createL2HardeningTools } from "./l2-operational/hardening-tools.js";
+import { InjectionDetector } from "./security/injection-detector.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
@@ -496,11 +497,8 @@ export async function createSanctuaryServer(options?: {
   const { tools: auditTools } = createAuditTools(config);
 
   // 14e. Create Context Gating tools (L2 outbound context control)
-  const { tools: contextGateTools } = createContextGateTools(
-    storage,
-    masterKey,
-    auditLog
-  );
+  const { tools: contextGateTools, enforcer: contextGateEnforcer } =
+    createContextGateTools(storage, masterKey, auditLog);
 
   // 14f. Create L2 Process Hardening tools
   const hardeningTools = createL2HardeningTools(config.storage_path, auditLog);
@@ -548,13 +546,37 @@ export async function createSanctuaryServer(options?: {
     approvalChannel = new StderrApprovalChannel(policy.approval_channel);
   }
 
-  const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog);
+  // 15b. Create injection detector
+  const injectionDetector = new InjectionDetector({
+    enabled: true,
+    sensitivity: "medium",
+    on_detection: "escalate",
+  });
+
+  // Wire injection alerts to dashboard SSE if dashboard is active
+  const onInjectionAlert = dashboard
+    ? (alert: { toolName: string; result: import("./security/injection-detector.js").DetectionResult; timestamp: string }) => {
+        dashboard!.broadcastSSE("injection-alert", {
+          tool: alert.toolName,
+          confidence: alert.result.confidence,
+          signals: alert.result.signals.map(s => ({
+            type: s.type,
+            location: s.location,
+            severity: s.severity,
+          })),
+          recommendation: alert.result.recommendation,
+          timestamp: alert.timestamp,
+        });
+      }
+    : undefined;
+
+  const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog, injectionDetector, onInjectionAlert);
 
   // 16. Create Principal Policy tools (read-only)
   const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
 
   // 17. Assemble all tools
-  const allTools: ToolDefinition[] = [
+  let allTools: ToolDefinition[] = [
     ...l1Tools,
     ...l2Tools,
     ...l3Tools,
@@ -569,6 +591,12 @@ export async function createSanctuaryServer(options?: {
     ...hardeningTools,
     manifestTool,
   ];
+
+  // 17a. Wrap all tool handlers with context gate enforcer
+  allTools = allTools.map((tool) => ({
+    ...tool,
+    handler: contextGateEnforcer.wrapHandler(tool.name, tool.handler),
+  }));
 
   // 18. Create MCP server with approval gate
   const server = createServer(allTools, { gate });
@@ -659,6 +687,14 @@ export type {
   ProviderCategory,
   ContextAction,
 } from "./l2-operational/context-gate.js";
+export { InjectionDetector } from "./security/injection-detector.js";
+export type {
+  InjectionDetectorConfig,
+  DetectionResult,
+  InjectionSignal,
+} from "./security/injection-detector.js";
+export { ContextGateEnforcer } from "./l2-operational/context-gate-enforcer.js";
+export type { EnforcerConfig } from "./l2-operational/context-gate-enforcer.js";
 export { MemoryStorage } from "./storage/memory.js";
 export { FilesystemStorage } from "./storage/filesystem.js";
 export { ApprovalGate } from "./principal-policy/gate.js";

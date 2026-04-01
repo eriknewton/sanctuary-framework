@@ -690,7 +690,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   // ── SSE Broadcasting ────────────────────────────────────────────────
 
-  private broadcastSSE(event: string, data: unknown): void {
+  broadcastSSE(event: string, data: unknown): void {
     const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const client of this.sseClients) {
       try {
@@ -722,6 +722,39 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (this.baseline) {
       this.broadcastSSE("baseline-update", this.baseline.getProfile());
     }
+  }
+
+  /**
+   * Broadcast a tool call event to connected dashboards.
+   * Called from the gate or router when a tool is invoked.
+   */
+  broadcastToolCall(data: {
+    tool: string;
+    tier: number;
+    allowed: boolean;
+    timestamp: string;
+  }): void {
+    this.broadcastSSE("tool-call", data);
+  }
+
+  /**
+   * Broadcast a context gate decision to connected dashboards.
+   */
+  broadcastContextGateDecision(data: {
+    tool: string;
+    fields_filtered: number;
+    fields_total: number;
+    action: string;
+    timestamp: string;
+  }): void {
+    this.broadcastSSE("context-gate-decision", data);
+  }
+
+  /**
+   * Broadcast current protection status to connected dashboards.
+   */
+  broadcastProtectionStatus(data: Record<string, unknown>): void {
+    this.broadcastSSE("protection-status", data);
   }
 
   /** Get the number of pending requests */

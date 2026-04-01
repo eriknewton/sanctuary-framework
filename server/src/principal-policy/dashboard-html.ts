@@ -4,6 +4,15 @@
  * Embedded single-page HTML/CSS/JS for the Principal Dashboard.
  * No build step, no external dependencies, no CDN imports.
  * Served as a single HTML document by the DashboardApprovalChannel.
+ *
+ * Design: Dark, minimal, terminal-feel (Grafana dark mode aesthetic)
+ * Architecture:
+ * - Top status bar (fixed, always visible)
+ * - Main content area: live activity feed (60%) + protection status sidebar (40%)
+ * - Pending approvals: overlay panel that slides in from right when needed
+ * - Threat panel: collapsible footer section
+ * - SSE for real-time updates
+ * - SEC-012: Auth via Authorization header + short-lived sessions
  */
 
 /**
@@ -21,315 +30,898 @@ export function generateDashboardHTML(options: {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sanctuary — Principal Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0f1117;
-    --bg-surface: #1a1d27;
-    --bg-elevated: #242736;
-    --border: #2e3244;
-    --text: #e4e6f0;
-    --text-muted: #8b8fa3;
-    --accent: #6c8aff;
-    --accent-hover: #839dff;
-    --approve: #3ecf8e;
-    --approve-hover: #5dd9a3;
-    --deny: #f87171;
-    --deny-hover: #fca5a5;
-    --warning: #fbbf24;
-    --tier1: #f87171;
-    --tier2: #fbbf24;
-    --tier3: #3ecf8e;
-    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    --mono: "SF Mono", "Fira Code", "Cascadia Code", monospace;
-    --radius: 8px;
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --green: #3fb950;
+    --amber: #d29922;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --radius: 6px;
   }
 
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+  }
+
   body {
-    font-family: var(--font);
+    font-family: var(--sans);
     background: var(--bg);
-    color: var(--text);
-    line-height: 1.5;
-    min-height: 100vh;
+    color: var(--text-primary);
+    display: flex;
+    flex-direction: column;
   }
 
-  /* Layout */
-  .container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+  /* ── Top Status Bar (fixed) ─────────────────────────────────────── */
 
-  header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding-bottom: 20px; border-bottom: 1px solid var(--border);
-    margin-bottom: 24px;
+  .status-bar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 56px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 24px;
+    z-index: 1000;
   }
-  header h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.3px; }
-  header h1 span { color: var(--accent); }
-  .status-badge {
-    display: inline-flex; align-items: center; gap: 6px;
-    font-size: 12px; color: var(--text-muted);
-    padding: 4px 10px; border-radius: 12px;
-    background: var(--bg-surface); border: 1px solid var(--border);
-  }
-  .status-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--approve); animation: pulse 2s infinite;
-  }
-  .status-dot.disconnected { background: var(--deny); animation: none; }
-  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
-  /* Tabs */
-  .tabs {
-    display: flex; gap: 2px; margin-bottom: 20px;
-    background: var(--bg-surface); border-radius: var(--radius);
-    padding: 3px; border: 1px solid var(--border);
+  .status-bar-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 0 0 auto;
   }
-  .tab {
-    flex: 1; padding: 8px 12px; text-align: center;
-    font-size: 13px; font-weight: 500; cursor: pointer;
-    border-radius: 6px; border: none; color: var(--text-muted);
-    background: transparent; transition: all 0.15s;
-  }
-  .tab:hover { color: var(--text); }
-  .tab.active { background: var(--bg-elevated); color: var(--text); }
-  .tab .count {
-    display: inline-flex; align-items: center; justify-content: center;
-    min-width: 18px; height: 18px; padding: 0 5px;
-    font-size: 11px; font-weight: 600; border-radius: 9px;
-    margin-left: 6px;
-  }
-  .tab .count.alert { background: var(--deny); color: white; }
-  .tab .count.muted { background: var(--border); color: var(--text-muted); }
 
-  /* Tab Content */
-  .tab-content { display: none; }
-  .tab-content.active { display: block; }
+  .sanctuary-logo {
+    font-weight: 700;
+    font-size: 16px;
+    letter-spacing: -0.5px;
+    color: var(--text-primary);
+  }
 
-  /* Pending Requests */
-  .pending-empty {
-    text-align: center; padding: 60px 20px; color: var(--text-muted);
+  .sanctuary-logo span {
+    color: var(--blue);
   }
-  .pending-empty .icon { font-size: 32px; margin-bottom: 12px; }
-  .pending-empty p { font-size: 14px; }
 
-  .request-card {
-    background: var(--bg-surface); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 16px; margin-bottom: 12px;
-    animation: slideIn 0.2s ease-out;
-  }
-  @keyframes slideIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
-  .request-card.tier1 { border-left: 3px solid var(--tier1); }
-  .request-card.tier2 { border-left: 3px solid var(--tier2); }
-  .request-header {
-    display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: 10px;
-  }
-  .request-op {
-    font-family: var(--mono); font-size: 14px; font-weight: 600;
-  }
-  .tier-badge {
-    font-size: 11px; font-weight: 600; padding: 2px 8px;
-    border-radius: 4px; text-transform: uppercase;
-  }
-  .tier-badge.tier1 { background: rgba(248,113,113,0.15); color: var(--tier1); }
-  .tier-badge.tier2 { background: rgba(251,191,36,0.15); color: var(--tier2); }
-  .request-reason {
-    font-size: 13px; color: var(--text-muted); margin-bottom: 12px;
-  }
-  .request-context {
-    font-family: var(--mono); font-size: 12px; color: var(--text-muted);
-    background: var(--bg); border-radius: 4px; padding: 8px 10px;
-    margin-bottom: 14px; white-space: pre-wrap; word-break: break-all;
-    max-height: 120px; overflow-y: auto;
-  }
-  .request-actions {
-    display: flex; align-items: center; gap: 10px;
-  }
-  .btn {
-    padding: 7px 16px; border-radius: 6px; font-size: 13px;
-    font-weight: 600; border: none; cursor: pointer;
-    transition: all 0.15s;
-  }
-  .btn-approve { background: var(--approve); color: #0f1117; }
-  .btn-approve:hover { background: var(--approve-hover); }
-  .btn-deny { background: var(--deny); color: white; }
-  .btn-deny:hover { background: var(--deny-hover); }
-  .countdown {
-    margin-left: auto; font-size: 12px; color: var(--text-muted);
+  .version {
+    font-size: 11px;
+    color: var(--text-secondary);
     font-family: var(--mono);
   }
-  .countdown.urgent { color: var(--deny); font-weight: 600; }
 
-  /* Audit Log */
-  .audit-table { width: 100%; border-collapse: collapse; }
-  .audit-table th {
-    text-align: left; font-size: 11px; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--text-muted); padding: 8px 10px;
+  .status-bar-center {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .sovereignty-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: rgba(88, 166, 255, 0.1);
+    border: 1px solid var(--blue);
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .sovereignty-score {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 12px;
+    background: var(--blue);
+    color: var(--bg);
+  }
+
+  .sovereignty-score.high {
+    background: var(--green);
+  }
+
+  .sovereignty-score.medium {
+    background: var(--amber);
+  }
+
+  .sovereignty-score.low {
+    background: var(--red);
+  }
+
+  .status-bar-right {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex: 0 0 auto;
+  }
+
+  .protections-indicator {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-family: var(--mono);
+  }
+
+  .protections-indicator .count {
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+
+  .uptime {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-family: var(--mono);
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  .status-dot.disconnected {
+    background: var(--red);
+    animation: none;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  .pending-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    height: 24px;
+    padding: 0 6px;
+    background: var(--red);
+    color: white;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 700;
+    animation: pulse 1s ease-in-out infinite;
+  }
+
+  .pending-badge.hidden {
+    display: none;
+  }
+
+  /* ── Main Layout ────────────────────────────────────────────────── */
+
+  .main-container {
+    flex: 1;
+    display: flex;
+    margin-top: 56px;
+    overflow: hidden;
+  }
+
+  .activity-feed {
+    flex: 3;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--border);
+    overflow: hidden;
+  }
+
+  .feed-header {
+    padding: 16px 20px;
     border-bottom: 1px solid var(--border);
-  }
-  .audit-table td {
-    font-size: 13px; padding: 8px 10px;
-    border-bottom: 1px solid var(--border);
-  }
-  .audit-table tr { transition: background 0.1s; }
-  .audit-table tr:hover { background: var(--bg-elevated); }
-  .audit-table tr.new { animation: highlight 1s ease-out; }
-  @keyframes highlight { from { background: rgba(108,138,255,0.15); } to { background: transparent; } }
-  .audit-time { font-family: var(--mono); font-size: 12px; color: var(--text-muted); }
-  .audit-op { font-family: var(--mono); font-size: 12px; }
-  .audit-layer {
-    font-size: 11px; font-weight: 600; padding: 1px 6px;
-    border-radius: 3px; text-transform: uppercase;
-  }
-  .audit-layer.l1 { background: rgba(108,138,255,0.15); color: var(--accent); }
-  .audit-layer.l2 { background: rgba(251,191,36,0.15); color: var(--tier2); }
-  .audit-layer.l3 { background: rgba(62,207,142,0.15); color: var(--tier3); }
-  .audit-layer.l4 { background: rgba(168,85,247,0.15); color: #a855f7; }
-
-  /* Baseline & Policy */
-  .info-section {
-    background: var(--bg-surface); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 16px; margin-bottom: 16px;
-  }
-  .info-section h3 {
-    font-size: 13px; font-weight: 600; text-transform: uppercase;
-    letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 12px;
-  }
-  .info-row {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 6px 0; font-size: 13px;
-  }
-  .info-label { color: var(--text-muted); }
-  .info-value { font-family: var(--mono); font-size: 12px; }
-  .tag-list { display: flex; flex-wrap: wrap; gap: 4px; }
-  .tag {
-    font-family: var(--mono); font-size: 11px; padding: 2px 8px;
-    background: var(--bg-elevated); border-radius: 4px;
-    color: var(--text-muted); border: 1px solid var(--border);
-  }
-  .policy-op {
-    font-family: var(--mono); font-size: 12px; padding: 3px 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
   }
 
-  /* Footer */
-  footer {
-    margin-top: 32px; padding-top: 16px;
-    border-top: 1px solid var(--border);
-    font-size: 12px; color: var(--text-muted);
+  .feed-header-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+  }
+
+  .activity-list {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .activity-item {
+    padding: 12px 20px;
+    border-bottom: 1px solid rgba(48, 54, 61, 0.5);
+    font-size: 13px;
+    font-family: var(--mono);
+    cursor: pointer;
+    transition: background 0.15s;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .activity-item:hover {
+    background: rgba(88, 166, 255, 0.05);
+  }
+
+  .activity-item-icon {
+    flex: 0 0 auto;
+    width: 16px;
     text-align: center;
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 1px;
+  }
+
+  .activity-item-content {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .activity-time {
+    color: var(--text-secondary);
+    font-size: 11px;
+    margin-bottom: 2px;
+  }
+
+  .activity-main {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    margin-bottom: 4px;
+  }
+
+  .activity-tier {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 16px;
+    font-size: 10px;
+    font-weight: 700;
+    border-radius: 3px;
+    text-transform: uppercase;
+    flex: 0 0 auto;
+  }
+
+  .activity-tier.t1 {
+    background: rgba(248, 81, 73, 0.2);
+    color: var(--red);
+  }
+
+  .activity-tier.t2 {
+    background: rgba(210, 153, 34, 0.2);
+    color: var(--amber);
+  }
+
+  .activity-tier.t3 {
+    background: rgba(63, 185, 80, 0.2);
+    color: var(--green);
+  }
+
+  .activity-tool {
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+
+  .activity-outcome {
+    color: var(--green);
+  }
+
+  .activity-outcome.denied {
+    color: var(--red);
+  }
+
+  .activity-detail {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-left: 0;
+  }
+
+  .activity-item.expanded .activity-detail {
+    display: block;
+    margin-top: 8px;
+    padding: 10px;
+    background: rgba(88, 166, 255, 0.08);
+    border-left: 2px solid var(--blue);
+    border-radius: 4px;
+  }
+
+  .activity-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-secondary);
+  }
+
+  .activity-empty-icon {
+    font-size: 32px;
+    margin-bottom: 12px;
+  }
+
+  .activity-empty-text {
+    font-size: 14px;
+  }
+
+  /* ── Protection Status Sidebar (40%) ────────────────────────────── */
+
+  .protection-sidebar {
+    flex: 2;
+    display: flex;
+    flex-direction: column;
+    background: rgba(22, 27, 34, 0.5);
+    overflow: hidden;
+  }
+
+  .sidebar-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .sidebar-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 16px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  .protection-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .protection-card-icon {
+    font-size: 14px;
+  }
+
+  .protection-card-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+  }
+
+  .protection-card-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .protection-card-status.active {
+    color: var(--green);
+  }
+
+  .protection-card-status.inactive {
+    color: var(--text-secondary);
+  }
+
+  .protection-card-stat {
+    font-size: 11px;
+    color: var(--text-secondary);
+    font-family: var(--mono);
+    margin-top: 4px;
+  }
+
+  /* ── Pending Approvals Overlay ──────────────────────────────────── */
+
+  .pending-overlay {
+    position: fixed;
+    top: 56px;
+    right: 0;
+    bottom: 0;
+    width: 0;
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    z-index: 999;
+    overflow-y: auto;
+    transition: width 0.3s ease-out;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .pending-overlay.active {
+    width: 380px;
+  }
+
+  @media (max-width: 1400px) {
+    .pending-overlay.active {
+      width: 100%;
+      right: auto;
+      left: 0;
+    }
+  }
+
+  .pending-overlay-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex: 0 0 auto;
+  }
+
+  .pending-overlay-title {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-primary);
+  }
+
+  .pending-overlay-close {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 18px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .pending-overlay-close:hover {
+    color: var(--text-primary);
+  }
+
+  .pending-list {
+    flex: 1;
+    overflow-y: auto;
+  }
+
+  .pending-item {
+    padding: 16px 20px;
+    border-bottom: 1px solid rgba(48, 54, 61, 0.5);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .pending-item-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .pending-item-op {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    flex: 1;
+  }
+
+  .pending-item-tier {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 20px;
+    font-size: 9px;
+    font-weight: 700;
+    border-radius: 3px;
+    text-transform: uppercase;
+    color: white;
+  }
+
+  .pending-item-tier.tier1 {
+    background: var(--red);
+  }
+
+  .pending-item-tier.tier2 {
+    background: var(--amber);
+  }
+
+  .pending-item-reason {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .pending-item-timer {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--text-secondary);
+  }
+
+  .pending-item-timer-bar {
+    flex: 1;
+    height: 4px;
+    background: rgba(48, 54, 61, 0.8);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .pending-item-timer-fill {
+    height: 100%;
+    background: var(--blue);
+    transition: width 0.1s linear;
+  }
+
+  .pending-item-timer.urgent .pending-item-timer-fill {
+    background: var(--red);
+  }
+
+  .pending-item-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  .btn {
+    flex: 1;
+    padding: 8px 12px;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: var(--sans);
+  }
+
+  .btn-approve {
+    background: var(--green);
+    color: var(--bg);
+  }
+
+  .btn-approve:hover {
+    background: #4ecf5e;
+  }
+
+  .btn-deny {
+    background: var(--red);
+    color: white;
+  }
+
+  .btn-deny:hover {
+    background: #f9605e;
+  }
+
+  /* ── Threat Panel (collapsible footer) ──────────────────────────── */
+
+  .threat-panel {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    max-height: 240px;
+    z-index: 500;
+    display: flex;
+    flex-direction: column;
+    transition: max-height 0.3s ease-out;
+  }
+
+  .threat-panel.collapsed {
+    max-height: 40px;
+  }
+
+  .threat-header {
+    padding: 12px 20px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+    flex: 0 0 auto;
+  }
+
+  .threat-header:hover {
+    background: rgba(88, 166, 255, 0.05);
+  }
+
+  .threat-icon {
+    font-size: 14px;
+  }
+
+  .threat-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 20px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .threat-item {
+    padding: 8px 10px;
+    background: rgba(248, 81, 73, 0.1);
+    border-left: 2px solid var(--red);
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  .threat-item-type {
+    font-weight: 600;
+    color: var(--red);
+    font-family: var(--mono);
+  }
+
+  .threat-empty {
+    text-align: center;
+    padding: 20px 10px;
+    color: var(--text-secondary);
+    font-size: 12px;
+  }
+
+  /* ── Scrollbars ────────────────────────────────────────────────── */
+
+  ::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(88, 166, 255, 0.3);
+  }
+
+  /* ── Responsive ────────────────────────────────────────────────── */
+
+  @media (max-width: 1200px) {
+    .protection-sidebar {
+      display: none;
+    }
+
+    .activity-feed {
+      border-right: none;
+    }
+  }
+
+  @media (max-width: 768px) {
+    .status-bar {
+      padding: 0 12px;
+      gap: 12px;
+      height: 48px;
+    }
+
+    .sanctuary-logo {
+      font-size: 14px;
+    }
+
+    .status-bar-center {
+      display: none;
+    }
+
+    .main-container {
+      margin-top: 48px;
+    }
+
+    .activity-item {
+      padding: 10px 12px;
+    }
+
+    .pending-overlay.active {
+      width: 100%;
+    }
+
+    .threat-panel {
+      max-height: 200px;
+    }
   }
 </style>
 </head>
 <body>
-<div class="container">
-  <header>
-    <h1><span>Sanctuary</span> Principal Dashboard</h1>
-    <div class="status-badge">
-      <div class="status-dot" id="statusDot"></div>
-      <span id="statusText">Connected</span>
-    </div>
-  </header>
 
-  <div class="tabs">
-    <button class="tab active" data-tab="pending">
-      Pending<span class="count muted" id="pendingCount">0</span>
-    </button>
-    <button class="tab" data-tab="audit">
-      Audit Log<span class="count muted" id="auditCount">0</span>
-    </button>
-    <button class="tab" data-tab="baseline">Baseline</button>
-    <button class="tab" data-tab="policy">Policy</button>
+<!-- Status Bar (fixed, top) -->
+<div class="status-bar">
+  <div class="status-bar-left">
+    <div class="sanctuary-logo"><span>◆</span> SANCTUARY</div>
+    <div class="version">v${options.serverVersion}</div>
   </div>
-
-  <!-- Pending Approvals -->
-  <div class="tab-content active" id="tab-pending">
-    <div class="pending-empty" id="pendingEmpty">
-      <div class="icon">&#x2714;</div>
-      <p>No pending approval requests.</p>
-      <p style="font-size:12px; margin-top:4px;">Requests will appear here in real time.</p>
-    </div>
-    <div id="pendingList"></div>
-  </div>
-
-  <!-- Audit Log -->
-  <div class="tab-content" id="tab-audit">
-    <table class="audit-table">
-      <thead>
-        <tr><th>Time</th><th>Layer</th><th>Operation</th><th>Identity</th></tr>
-      </thead>
-      <tbody id="auditBody"></tbody>
-    </table>
-  </div>
-
-  <!-- Baseline -->
-  <div class="tab-content" id="tab-baseline">
-    <div class="info-section">
-      <h3>Session Info</h3>
-      <div class="info-row"><span class="info-label">First session</span><span class="info-value" id="bFirstSession">—</span></div>
-      <div class="info-row"><span class="info-label">Started</span><span class="info-value" id="bStarted">—</span></div>
-    </div>
-    <div class="info-section">
-      <h3>Known Namespaces</h3>
-      <div class="tag-list" id="bNamespaces"><span class="tag">—</span></div>
-    </div>
-    <div class="info-section">
-      <h3>Known Counterparties</h3>
-      <div class="tag-list" id="bCounterparties"><span class="tag">—</span></div>
-    </div>
-    <div class="info-section">
-      <h3>Tool Call Counts</h3>
-      <div id="bToolCalls"><span class="info-value">—</span></div>
+  <div class="status-bar-center">
+    <div class="sovereignty-badge">
+      <div class="sovereignty-score" id="sovereigntyScore">85</div>
+      <span>Sovereignty Health</span>
     </div>
   </div>
+  <div class="status-bar-right">
+    <div class="protections-indicator">
+      <span class="count" id="activeProtections">6</span>/6 protections
+    </div>
+    <div class="uptime">
+      <span id="uptimeText">—</span>
+    </div>
+    <div class="status-dot" id="statusDot"></div>
+    <div class="pending-badge hidden" id="pendingBadge">0</div>
+  </div>
+</div>
 
-  <!-- Policy -->
-  <div class="tab-content" id="tab-policy">
-    <div class="info-section">
-      <h3>Tier 1 — Always Requires Approval</h3>
-      <div id="pTier1"></div>
+<!-- Main Layout -->
+<div class="main-container">
+  <!-- Activity Feed -->
+  <div class="activity-feed">
+    <div class="feed-header">
+      <div class="feed-header-dot"></div>
+      Live Activity
     </div>
-    <div class="info-section">
-      <h3>Tier 2 — Anomaly Detection</h3>
-      <div id="pTier2"></div>
-    </div>
-    <div class="info-section">
-      <h3>Tier 3 — Always Allowed</h3>
-      <div class="info-row">
-        <span class="info-label">Operations</span>
-        <span class="info-value" id="pTier3Count">—</span>
+    <div class="activity-list" id="activityList">
+      <div class="activity-empty">
+        <div class="activity-empty-icon">→</div>
+        <div class="activity-empty-text">Waiting for activity...</div>
       </div>
     </div>
-    <div class="info-section">
-      <h3>Approval Channel</h3>
-      <div id="pChannel"></div>
-    </div>
   </div>
 
-  <footer>Sanctuary Framework v${options.serverVersion} — Principal Dashboard</footer>
+  <!-- Protection Status Sidebar -->
+  <div class="protection-sidebar" id="protectionSidebar">
+    <div class="sidebar-header">
+      <span>◆</span> Protection Status
+    </div>
+    <div class="sidebar-content">
+      <div class="protection-card">
+        <div class="protection-card-icon">🔐</div>
+        <div class="protection-card-label">Encryption</div>
+        <div class="protection-card-status active" id="encryptionStatus">✓ Active</div>
+        <div class="protection-card-stat" id="encryptionStat">Ed25519</div>
+      </div>
+
+      <div class="protection-card">
+        <div class="protection-card-icon">✓</div>
+        <div class="protection-card-label">Approval Gate</div>
+        <div class="protection-card-status active" id="approvalStatus">✓ Active</div>
+        <div class="protection-card-stat" id="approvalStat">T1: 2 | T2: 3</div>
+      </div>
+
+      <div class="protection-card">
+        <div class="protection-card-icon">🎯</div>
+        <div class="protection-card-label">Context Gating</div>
+        <div class="protection-card-status active" id="contextStatus">✓ Active</div>
+        <div class="protection-card-stat" id="contextStat">12 filtered</div>
+      </div>
+
+      <div class="protection-card">
+        <div class="protection-card-icon">⚠</div>
+        <div class="protection-card-label">Injection Detection</div>
+        <div class="protection-card-status active" id="injectionStatus">✓ Active</div>
+        <div class="protection-card-stat" id="injectionStat">3 flags today</div>
+      </div>
+
+      <div class="protection-card">
+        <div class="protection-card-icon">📊</div>
+        <div class="protection-card-label">Behavioral Baseline</div>
+        <div class="protection-card-status active" id="baselineStatus">✓ Active</div>
+        <div class="protection-card-stat" id="baselineStat">0 anomalies</div>
+      </div>
+
+      <div class="protection-card">
+        <div class="protection-card-icon">📋</div>
+        <div class="protection-card-label">Audit Trail</div>
+        <div class="protection-card-status active" id="auditStatus">✓ Active</div>
+        <div class="protection-card-stat" id="auditStat">284 entries</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Pending Approvals Overlay -->
+<div class="pending-overlay" id="pendingOverlay">
+  <div class="pending-overlay-header">
+    <div class="pending-overlay-title">Pending Approvals</div>
+    <button class="pending-overlay-close" onclick="closePendingOverlay()">×</button>
+  </div>
+  <div class="pending-list" id="pendingList"></div>
+</div>
+
+<!-- Threat Panel (collapsible footer) -->
+<div class="threat-panel collapsed" id="threatPanel">
+  <div class="threat-header" onclick="toggleThreatPanel()">
+    <span class="threat-icon">⚠</span>
+    Recent Threats
+    <span id="threatCount" style="margin-left: auto; color: var(--red); font-weight: 700;">0</span>
+  </div>
+  <div class="threat-content" id="threatContent">
+    <div class="threat-empty">No threats detected</div>
+  </div>
 </div>
 
 <script>
 (function() {
-  const TIMEOUT = ${options.timeoutSeconds};
-  // SEC-012: Auth token is passed via Authorization header only — never in URLs.
-  // The token is provided by the server at generation time (embedded for initial auth).
-  const AUTH_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : 'null'};
-  let SESSION_ID = null; // Short-lived session for SSE and URL-based requests
-  const pending = new Map();
-  let auditCount = 0;
+  'use strict';
 
-  // Auth helpers — SEC-012: token goes in header, session goes in URL
+  // ── Configuration ────────────────────────────────────────────────
+
+  const TIMEOUT_SECONDS = ${options.timeoutSeconds};
+  const AUTH_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : 'null'};
+  const MAX_ACTIVITY_ITEMS = 100;
+  const MAX_THREAT_ITEMS = 20;
+
+  // ── State ────────────────────────────────────────────────────────
+
+  let SESSION_ID = null;
+  let evtSource = null;
+  let startTime = Date.now();
+  let activityCount = 0;
+  let threatCount = 0;
+  const pendingRequests = new Map();
+  const activityItems = [];
+  const threatItems = [];
+  let sovereigntyScore = 85;
+
+  // ── Auth Helpers (SEC-012) ───────────────────────────────────────
+
   function authHeaders() {
     const h = { 'Content-Type': 'application/json' };
     if (AUTH_TOKEN) h['Authorization'] = 'Bearer ' + AUTH_TOKEN;
     return h;
   }
+
   function sessionQuery(url) {
     if (!SESSION_ID) return url;
     const sep = url.includes('?') ? '&' : '?';
     return url + sep + 'session=' + SESSION_ID;
   }
 
-  // SEC-012: Exchange the long-lived token for a short-lived session
   async function exchangeSession() {
     if (!AUTH_TOKEN) return;
     try {
@@ -337,234 +929,482 @@ export function generateDashboardHTML(options: {
       if (resp.ok) {
         const data = await resp.json();
         SESSION_ID = data.session_id;
-        // Refresh session before expiry (at 80% of TTL)
         const refreshMs = (data.expires_in_seconds || 300) * 800;
-        setTimeout(async () => { await exchangeSession(); reconnectSSE(); }, refreshMs);
+        setTimeout(() => { exchangeSession(); reconnectSSE(); }, refreshMs);
       }
-    } catch(e) { /* will retry on next connect */ }
+    } catch (e) {
+      // Retry on next connect
+    }
   }
 
-  // Tab switching
-  document.querySelectorAll('.tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-      tab.classList.add('active');
-      document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
-    });
-  });
+  // ── UI Utilities ─────────────────────────────────────────────────
 
-  // SSE Connection — SEC-012: uses short-lived session token in URL, not auth token
-  let evtSource;
+  function esc(s) {
+    const d = document.createElement('div');
+    d.textContent = String(s || '');
+    return d.innerHTML;
+  }
+
+  function closePendingOverlay() {
+    document.getElementById('pendingOverlay').classList.remove('active');
+  }
+
+  function toggleThreatPanel() {
+    document.getElementById('threatPanel').classList.toggle('collapsed');
+  }
+
+  function updateUptime() {
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const hours = Math.floor(elapsed / 3600);
+    const mins = Math.floor((elapsed % 3600) / 60);
+    const secs = elapsed % 60;
+    let uptimeStr = '';
+    if (hours > 0) uptimeStr += hours + 'h ';
+    if (mins > 0) uptimeStr += mins + 'm ';
+    uptimeStr += secs + 's';
+    document.getElementById('uptimeText').textContent = uptimeStr;
+  }
+
+  // ── Sovereignty Score ────────────────────────────────────────────
+
+  function updateSovereigntyScore(score) {
+    sovereigntyScore = Math.min(100, Math.max(0, score || 85));
+    const badge = document.getElementById('sovereigntyScore');
+    badge.textContent = sovereigntyScore;
+    badge.className = 'sovereignty-score';
+    if (sovereigntyScore >= 80) {
+      badge.classList.add('high');
+    } else if (sovereigntyScore >= 50) {
+      badge.classList.add('medium');
+    } else {
+      badge.classList.add('low');
+    }
+  }
+
+  // ── Activity Feed ────────────────────────────────────────────────
+
+  function addActivityItem(data) {
+    const {
+      timestamp,
+      tier,
+      tool,
+      outcome,
+      detail,
+      hasInjection,
+      isContextGated
+    } = data;
+
+    const item = {
+      id: 'activity-' + activityCount++,
+      timestamp: timestamp || new Date().toISOString(),
+      tier: tier || 1,
+      tool: tool || 'unknown_tool',
+      outcome: outcome || 'executed',
+      detail: detail || '',
+      hasInjection: !!hasInjection,
+      isContextGated: !!isContextGated
+    };
+
+    activityItems.unshift(item);
+    if (activityItems.length > MAX_ACTIVITY_ITEMS) {
+      activityItems.pop();
+    }
+
+    renderActivityFeed();
+  }
+
+  function renderActivityFeed() {
+    const list = document.getElementById('activityList');
+
+    if (activityItems.length === 0) {
+      list.innerHTML = '<div class="activity-empty"><div class="activity-empty-icon">→</div><div class="activity-empty-text">Waiting for activity...</div></div>';
+      return;
+    }
+
+    list.innerHTML = '';
+    for (const item of activityItems) {
+      const tr = document.createElement('div');
+      tr.className = 'activity-item';
+      tr.id = item.id;
+
+      const time = new Date(item.timestamp);
+      const timeStr = time.toLocaleTimeString();
+
+      const tierClass = 't' + item.tier;
+      const outcomeClass = item.outcome === 'denied' ? 'outcome denied' : 'outcome';
+
+      let icon = '●';
+      if (item.isContextGated) icon = '🎯';
+      else if (item.hasInjection) icon = '⚠';
+      else if (item.outcome === 'denied') icon = '✗';
+      else icon = '✓';
+
+      tr.innerHTML =
+        '<div class="activity-item-icon">' + esc(icon) + '</div>' +
+        '<div class="activity-item-content">' +
+          '<div class="activity-time">' + esc(timeStr) + '</div>' +
+          '<div class="activity-main">' +
+            '<span class="activity-tier ' + tierClass + '">T' + item.tier + '</span>' +
+            '<span class="activity-tool">' + esc(item.tool) + '</span>' +
+            '<span class="activity-outcome ' + (outcomeClass === 'outcome denied' ? 'denied' : '') + '">' + (item.outcome === 'denied' ? '✗ denied' : '✓ allowed') + '</span>' +
+          '</div>' +
+          '<div class="activity-detail">' + esc(item.detail) + '</div>' +
+        '</div>' +
+      '';
+
+      tr.addEventListener('click', () => {
+        tr.classList.toggle('expanded');
+      });
+
+      list.appendChild(tr);
+    }
+  }
+
+  // ── Pending Approvals ────────────────────────────────────────────
+
+  function addPendingRequest(data) {
+    const {
+      request_id,
+      operation,
+      tier,
+      reason,
+      context,
+      timestamp
+    } = data;
+
+    const pending = {
+      id: request_id,
+      operation: operation || 'unknown',
+      tier: tier || 1,
+      reason: reason || '',
+      context: context || {},
+      timestamp: timestamp || new Date().toISOString(),
+      remaining: TIMEOUT_SECONDS
+    };
+
+    pendingRequests.set(request_id, pending);
+    updatePendingUI();
+  }
+
+  function removePendingRequest(id) {
+    pendingRequests.delete(id);
+    updatePendingUI();
+  }
+
+  function updatePendingUI() {
+    const count = pendingRequests.size;
+    const badge = document.getElementById('pendingBadge');
+
+    if (count > 0) {
+      badge.classList.remove('hidden');
+      badge.textContent = count;
+      document.getElementById('pendingOverlay').classList.add('active');
+    } else {
+      badge.classList.add('hidden');
+      document.getElementById('pendingOverlay').classList.remove('active');
+    }
+
+    renderPendingList();
+  }
+
+  function renderPendingList() {
+    const list = document.getElementById('pendingList');
+    list.innerHTML = '';
+
+    for (const [id, req] of pendingRequests) {
+      const item = document.createElement('div');
+      item.className = 'pending-item';
+
+      const tier = req.tier || 1;
+      const tierClass = 'tier' + tier;
+      const pct = Math.max(0, Math.min(100, (req.remaining / TIMEOUT_SECONDS) * 100));
+      const isUrgent = req.remaining <= 30;
+
+      item.innerHTML =
+        '<div class="pending-item-header">' +
+          '<div class="pending-item-op">' + esc(req.operation) + '</div>' +
+          '<div class="pending-item-tier ' + tierClass + '">T' + tier + '</div>' +
+        '</div>' +
+        '<div class="pending-item-reason">' + esc(req.reason) + '</div>' +
+        '<div class="pending-item-timer ' + (isUrgent ? 'urgent' : '') + '">' +
+          '<div class="pending-item-timer-bar">' +
+            '<div class="pending-item-timer-fill" style="width: ' + pct + '%"></div>' +
+          '</div>' +
+          '<span id="timer-' + id + '">' + req.remaining + 's</span>' +
+        '</div>' +
+        '<div class="pending-item-actions">' +
+          '<button class="btn btn-approve" onclick="handleApprove(\'' + id + '\')">Approve</button>' +
+          '<button class="btn btn-deny" onclick="handleDeny(\'' + id + '\')">Deny</button>' +
+        '</div>' +
+      '';
+
+      list.appendChild(item);
+    }
+  }
+
+  window.handleApprove = function(id) {
+    fetch('/api/approve/' + id, { method: 'POST', headers: authHeaders() }).then(() => {
+      removePendingRequest(id);
+    }).catch(() => {});
+  };
+
+  window.handleDeny = function(id) {
+    fetch('/api/deny/' + id, { method: 'POST', headers: authHeaders() }).then(() => {
+      removePendingRequest(id);
+    }).catch(() => {});
+  };
+
+  // ── Threats ──────────────────────────────────────────────────────
+
+  function addThreat(data) {
+    const {
+      timestamp,
+      severity,
+      type,
+      details
+    } = data;
+
+    const threat = {
+      id: 'threat-' + threatCount++,
+      timestamp: timestamp || new Date().toISOString(),
+      severity: severity || 'medium',
+      type: type || 'unknown',
+      details: details || ''
+    };
+
+    threatItems.unshift(threat);
+    if (threatItems.length > MAX_THREAT_ITEMS) {
+      threatItems.pop();
+    }
+
+    if (threatCount > 0) {
+      document.getElementById('threatPanel').classList.remove('collapsed');
+    }
+
+    renderThreats();
+  }
+
+  function renderThreats() {
+    const content = document.getElementById('threatContent');
+    const badge = document.getElementById('threatCount');
+
+    if (threatItems.length === 0) {
+      content.innerHTML = '<div class="threat-empty">No threats detected</div>';
+      badge.textContent = '0';
+      return;
+    }
+
+    badge.textContent = threatItems.length;
+    content.innerHTML = '';
+
+    for (const threat of threatItems) {
+      const div = document.createElement('div');
+      div.className = 'threat-item';
+      const time = new Date(threat.timestamp).toLocaleTimeString();
+      div.innerHTML =
+        '<div style="margin-bottom: 3px;">' +
+          '<span class="threat-item-type">' + esc(threat.type) + '</span>' +
+          '<span style="font-size: 10px; color: var(--text-secondary); margin-left: 6px;">' + esc(time) + '</span>' +
+        '</div>' +
+        '<div>' + esc(threat.details) + '</div>' +
+      '';
+      content.appendChild(div);
+    }
+  }
+
+  // ── SSE Connection ───────────────────────────────────────────────
+
   function reconnectSSE() {
-    if (evtSource) { evtSource.close(); }
+    if (evtSource) evtSource.close();
     connect();
   }
+
   function connect() {
     evtSource = new EventSource(sessionQuery('/events'));
+
     evtSource.onopen = () => {
       document.getElementById('statusDot').classList.remove('disconnected');
-      document.getElementById('statusText').textContent = 'Connected';
     };
+
     evtSource.onerror = () => {
       document.getElementById('statusDot').classList.add('disconnected');
-      document.getElementById('statusText').textContent = 'Reconnecting...';
     };
+
+    evtSource.addEventListener('init', (e) => {
+      const data = JSON.parse(e.data);
+      if (data.baseline) {
+        updateBaseline(data.baseline);
+      }
+      if (data.policy) {
+        updatePolicy(data.policy);
+      }
+      if (data.pending) {
+        data.pending.forEach(addPendingRequest);
+      }
+    });
+
     evtSource.addEventListener('pending-request', (e) => {
       const data = JSON.parse(e.data);
       addPendingRequest(data);
     });
+
     evtSource.addEventListener('request-resolved', (e) => {
       const data = JSON.parse(e.data);
       removePendingRequest(data.request_id);
     });
+
+    evtSource.addEventListener('tool-call', (e) => {
+      const data = JSON.parse(e.data);
+      addActivityItem({
+        timestamp: data.timestamp,
+        tier: data.tier || 1,
+        tool: data.tool || 'unknown',
+        outcome: data.outcome || 'executed',
+        detail: data.detail || ''
+      });
+    });
+
+    evtSource.addEventListener('context-gate-decision', (e) => {
+      const data = JSON.parse(e.data);
+      addActivityItem({
+        timestamp: data.timestamp,
+        tier: data.tier || 1,
+        tool: data.tool || 'unknown',
+        outcome: data.outcome || 'gated',
+        detail: data.fields_filtered ? 'Filtered ' + data.fields_filtered + ' fields' : data.reason || '',
+        isContextGated: true
+      });
+    });
+
+    evtSource.addEventListener('injection-alert', (e) => {
+      const data = JSON.parse(e.data);
+      addActivityItem({
+        timestamp: data.timestamp,
+        tier: data.tier || 2,
+        tool: data.tool || 'unknown',
+        outcome: data.allowed ? 'allowed' : 'denied',
+        detail: data.signal || 'Injection detected',
+        hasInjection: true
+      });
+      addThreat({
+        timestamp: data.timestamp,
+        severity: data.severity || 'medium',
+        type: 'Injection Alert',
+        details: data.signal || 'Suspicious pattern detected'
+      });
+    });
+
+    evtSource.addEventListener('protection-status', (e) => {
+      const data = JSON.parse(e.data);
+      updateProtectionStatus(data);
+    });
+
     evtSource.addEventListener('audit-entry', (e) => {
       const data = JSON.parse(e.data);
-      addAuditEntry(data);
+      // Audit entries don't show in activity by default, but we could add them
     });
+
     evtSource.addEventListener('baseline-update', (e) => {
       const data = JSON.parse(e.data);
       updateBaseline(data);
     });
-    evtSource.addEventListener('policy-update', (e) => {
-      const data = JSON.parse(e.data);
-      updatePolicy(data);
-    });
-    evtSource.addEventListener('init', (e) => {
-      const data = JSON.parse(e.data);
-      if (data.baseline) updateBaseline(data.baseline);
-      if (data.policy) updatePolicy(data.policy);
-      if (data.pending) data.pending.forEach(addPendingRequest);
-      if (data.audit) data.audit.forEach(addAuditEntry);
-    });
   }
 
-  // Pending requests
-  function addPendingRequest(req) {
-    pending.set(req.request_id, { ...req, remaining: TIMEOUT });
-    renderPending();
-    updatePendingCount();
-    flashTab('pending');
+  function updateBaseline(baseline) {
+    if (!baseline) return;
+    // Update baseline-derived stats if needed
   }
 
-  function removePendingRequest(id) {
-    pending.delete(id);
-    renderPending();
-    updatePendingCount();
-  }
-
-  function renderPending() {
-    const list = document.getElementById('pendingList');
-    const empty = document.getElementById('pendingEmpty');
-    if (pending.size === 0) {
-      list.innerHTML = '';
-      empty.style.display = 'block';
-      return;
-    }
-    empty.style.display = 'none';
-    list.innerHTML = '';
-    for (const [id, req] of pending) {
-      const card = document.createElement('div');
-      card.className = 'request-card tier' + req.tier;
-      card.id = 'req-' + id;
-      const ctx = typeof req.context === 'string' ? req.context : JSON.stringify(req.context, null, 2);
-      card.innerHTML =
-        '<div class="request-header">' +
-          '<span class="request-op">' + esc(req.operation) + '</span>' +
-          '<span class="tier-badge tier' + req.tier + '">Tier ' + req.tier + '</span>' +
-        '</div>' +
-        '<div class="request-reason">' + esc(req.reason) + '</div>' +
-        '<div class="request-context">' + esc(ctx) + '</div>' +
-        '<div class="request-actions">' +
-          '<button class="btn btn-approve" onclick="handleApprove(\\'' + id + '\\')">Approve</button>' +
-          '<button class="btn btn-deny" onclick="handleDeny(\\'' + id + '\\')">Deny</button>' +
-          '<span class="countdown" id="cd-' + id + '">' + req.remaining + 's</span>' +
-        '</div>';
-      list.appendChild(card);
+  function updatePolicy(policy) {
+    if (!policy) return;
+    // Update policy-derived stats
+    if (policy.approval_channel) {
+      // Policy info updated
     }
   }
 
-  function updatePendingCount() {
-    const el = document.getElementById('pendingCount');
-    el.textContent = pending.size;
-    el.className = pending.size > 0 ? 'count alert' : 'count muted';
-  }
-
-  function flashTab(name) {
-    const tab = document.querySelector('[data-tab="' + name + '"]');
-    if (!tab.classList.contains('active')) {
-      tab.style.background = 'rgba(248,113,113,0.15)';
-      setTimeout(() => { tab.style.background = ''; }, 1500);
+  function updateProtectionStatus(status) {
+    if (status.sovereignty_score !== undefined) {
+      updateSovereigntyScore(status.sovereignty_score);
+    }
+    if (status.active_protections !== undefined) {
+      document.getElementById('activeProtections').textContent = status.active_protections;
+    }
+    // Update individual protection cards
+    if (status.encryption !== undefined) {
+      const el = document.getElementById('encryptionStatus');
+      el.className = 'protection-card-status ' + (status.encryption ? 'active' : 'inactive');
+      el.textContent = status.encryption ? '✓ Active' : '✗ Inactive';
+    }
+    if (status.approval_gate !== undefined) {
+      const el = document.getElementById('approvalStatus');
+      el.className = 'protection-card-status ' + (status.approval_gate ? 'active' : 'inactive');
+      el.textContent = status.approval_gate ? '✓ Active' : '✗ Inactive';
+    }
+    if (status.context_gating !== undefined) {
+      const el = document.getElementById('contextStatus');
+      el.className = 'protection-card-status ' + (status.context_gating ? 'active' : 'inactive');
+      el.textContent = status.context_gating ? '✓ Active' : '✗ Inactive';
+    }
+    if (status.injection_detection !== undefined) {
+      const el = document.getElementById('injectionStatus');
+      el.className = 'protection-card-status ' + (status.injection_detection ? 'active' : 'inactive');
+      el.textContent = status.injection_detection ? '✓ Active' : '✗ Inactive';
+    }
+    if (status.baseline !== undefined) {
+      const el = document.getElementById('baselineStatus');
+      el.className = 'protection-card-status ' + (status.baseline ? 'active' : 'inactive');
+      el.textContent = status.baseline ? '✓ Active' : '✗ Inactive';
+    }
+    if (status.audit_trail !== undefined) {
+      const el = document.getElementById('auditStatus');
+      el.className = 'protection-card-status ' + (status.audit_trail ? 'active' : 'inactive');
+      el.textContent = status.audit_trail ? '✓ Active' : '✗ Inactive';
     }
   }
 
-  // Countdown timer
-  setInterval(() => {
-    for (const [id, req] of pending) {
-      req.remaining = Math.max(0, req.remaining - 1);
-      const el = document.getElementById('cd-' + id);
-      if (el) {
-        el.textContent = req.remaining + 's';
-        el.className = req.remaining <= 30 ? 'countdown urgent' : 'countdown';
-      }
-    }
-  }, 1000);
+  // ── Initialization ───────────────────────────────────────────────
 
-  // Approve / Deny handlers (global scope)
-  window.handleApprove = function(id) {
-    fetch('/api/approve/' + id, { method: 'POST', headers: authHeaders() }).then(() => {
-      removePendingRequest(id);
-    });
-  };
-  window.handleDeny = function(id) {
-    fetch('/api/deny/' + id, { method: 'POST', headers: authHeaders() }).then(() => {
-      removePendingRequest(id);
-    });
-  };
-
-  // Audit log
-  function addAuditEntry(entry) {
-    auditCount++;
-    document.getElementById('auditCount').textContent = auditCount;
-    const tbody = document.getElementById('auditBody');
-    const tr = document.createElement('tr');
-    tr.className = 'new';
-    const time = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : '—';
-    const layer = entry.layer || '—';
-    tr.innerHTML =
-      '<td class="audit-time">' + esc(time) + '</td>' +
-      '<td><span class="audit-layer ' + layer + '">' + esc(layer) + '</span></td>' +
-      '<td class="audit-op">' + esc(entry.operation || '—') + '</td>' +
-      '<td style="font-size:12px;color:var(--text-muted)">' + esc(entry.identity_id || '—') + '</td>';
-    tbody.insertBefore(tr, tbody.firstChild);
-    // Keep last 100 entries
-    while (tbody.children.length > 100) tbody.removeChild(tbody.lastChild);
-  }
-
-  // Baseline
-  function updateBaseline(b) {
-    if (!b) return;
-    document.getElementById('bFirstSession').textContent = b.is_first_session ? 'Yes' : 'No';
-    document.getElementById('bStarted').textContent = b.started_at ? new Date(b.started_at).toLocaleString() : '—';
-    const ns = document.getElementById('bNamespaces');
-    ns.innerHTML = (b.known_namespaces || []).length > 0
-      ? (b.known_namespaces || []).map(n => '<span class="tag">' + esc(n) + '</span>').join('')
-      : '<span class="tag">none</span>';
-    const cp = document.getElementById('bCounterparties');
-    cp.innerHTML = (b.known_counterparties || []).length > 0
-      ? (b.known_counterparties || []).map(c => '<span class="tag">' + esc(c.slice(0,16)) + '...</span>').join('')
-      : '<span class="tag">none</span>';
-    const tc = document.getElementById('bToolCalls');
-    const counts = b.tool_call_counts || {};
-    const entries = Object.entries(counts).sort((a,b) => b[1] - a[1]);
-    tc.innerHTML = entries.length > 0
-      ? entries.map(([k,v]) => '<div class="info-row"><span class="info-label">' + esc(k) + '</span><span class="info-value">' + v + '</span></div>').join('')
-      : '<span class="info-value">no calls yet</span>';
-  }
-
-  // Policy
-  function updatePolicy(p) {
-    if (!p) return;
-    const t1 = document.getElementById('pTier1');
-    t1.innerHTML = (p.tier1_always_approve || []).map(op =>
-      '<div class="policy-op">' + esc(op) + '</div>'
-    ).join('');
-    const t2 = document.getElementById('pTier2');
-    const cfg = p.tier2_anomaly || {};
-    t2.innerHTML = Object.entries(cfg).map(([k,v]) =>
-      '<div class="info-row"><span class="info-label">' + esc(k) + '</span><span class="info-value">' + esc(String(v)) + '</span></div>'
-    ).join('');
-    document.getElementById('pTier3Count').textContent = (p.tier3_always_allow || []).length + ' operations';
-    const ch = document.getElementById('pChannel');
-    const chan = p.approval_channel || {};
-    ch.innerHTML = Object.entries(chan).filter(([k]) => k !== 'webhook_secret').map(([k,v]) =>
-      '<div class="info-row"><span class="info-label">' + esc(k) + '</span><span class="info-value">' + esc(String(v)) + '</span></div>'
-    ).join('');
-  }
-
-  function esc(s) {
-    if (!s) return '';
-    const d = document.createElement('div');
-    d.textContent = String(s);
-    return d.innerHTML;
-  }
-
-  // Init — SEC-012: exchange token for session before connecting SSE
   (async function init() {
     await exchangeSession();
-    // Clean token from URL if present (legacy bookmarks)
+    // Clean legacy ?token= from URL
     if (window.location.search.includes('token=')) {
-      const clean = window.location.pathname;
-      window.history.replaceState({}, '', clean);
+      window.history.replaceState({}, '', window.location.pathname);
     }
     connect();
-    fetch('/api/status', { headers: authHeaders() }).then(r => r.json()).then(data => {
-      if (data.baseline) updateBaseline(data.baseline);
-      if (data.policy) updatePolicy(data.policy);
-    }).catch(() => {});
+
+    // Start uptime ticker
+    setInterval(updateUptime, 1000);
+    updateUptime();
+
+    // Pending request countdown timer
+    setInterval(() => {
+      for (const [id, req] of pendingRequests) {
+        req.remaining = Math.max(0, req.remaining - 1);
+        const el = document.getElementById('timer-' + id);
+        if (el) {
+          el.textContent = req.remaining + 's';
+        }
+      }
+    }, 1000);
+
+    // Load initial status
+    try {
+      const resp = await fetch('/api/status', { headers: authHeaders() });
+      if (resp.ok) {
+        const status = await resp.json();
+        if (status.baseline) updateBaseline(status.baseline);
+        if (status.policy) updatePolicy(status.policy);
+      }
+    } catch (e) {
+      // Ignore
+    }
   })();
+
 })();
 </script>
+
 </body>
 </html>`;
 }
+
