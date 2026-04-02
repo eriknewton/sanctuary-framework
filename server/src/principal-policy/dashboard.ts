@@ -33,7 +33,7 @@ import type { BaselineTracker } from "./baseline.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 import type { IdentityManager } from "../l1-cognitive/tools.js";
 import type { HandshakeResult } from "../handshake/types.js";
-import type { SignedSHR } from "../shr/types.js";
+// SignedSHR type available via shr/types if needed in future
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
 import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
 
@@ -106,7 +106,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private identityManager: IdentityManager | null = null;
   private handshakeResults: Map<string, HandshakeResult> | null = null;
   private shrOpts: SHRGeneratorOptions | null = null;
-  private sanctuaryConfig: SanctuaryConfig | null = null;
+  private _sanctuaryConfig: SanctuaryConfig | null = null;
   private dashboardHTML: string;
   private loginHTML: string;
   private authToken: string | undefined;
@@ -155,7 +155,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (deps.identityManager) this.identityManager = deps.identityManager;
     if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
     if (deps.shrOpts) this.shrOpts = deps.shrOpts;
-    if (deps.sanctuaryConfig) this.sanctuaryConfig = deps.sanctuaryConfig;
+    if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
   }
 
   /**
@@ -850,6 +850,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       },
       degradations: shr.body.degradations,
       capabilities: shr.body.capabilities,
+      config_loaded: this._sanctuaryConfig != null,
     }));
   }
 
@@ -868,7 +869,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       created_at: id.created_at,
       key_type: id.key_type,
       key_protection: id.key_protection,
-      rotation_count: id.rotation_history?.length ?? 0,
+      rotation_count: (id as any).rotation_history?.length ?? 0,
     }));
 
     const primary = this.identityManager.getDefault();

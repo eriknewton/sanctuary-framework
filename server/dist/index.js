@@ -6092,7 +6092,7 @@ var DashboardApprovalChannel = class {
   identityManager = null;
   handshakeResults = null;
   shrOpts = null;
-  sanctuaryConfig = null;
+  _sanctuaryConfig = null;
   dashboardHTML;
   loginHTML;
   authToken;
@@ -6129,7 +6129,7 @@ var DashboardApprovalChannel = class {
     if (deps.identityManager) this.identityManager = deps.identityManager;
     if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
     if (deps.shrOpts) this.shrOpts = deps.shrOpts;
-    if (deps.sanctuaryConfig) this.sanctuaryConfig = deps.sanctuaryConfig;
+    if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
   }
   /**
    * Start the HTTP(S) server for the dashboard.
@@ -6690,7 +6690,8 @@ data: ${JSON.stringify(initData)}
         l4: { status: layers.l4.status, detail: layers.l4.attestation_format, reputation_portable: layers.l4.reputation_portable }
       },
       degradations: shr.body.degradations,
-      capabilities: shr.body.capabilities
+      capabilities: shr.body.capabilities,
+      config_loaded: this._sanctuaryConfig != null
     }));
   }
   handleIdentity(res) {
