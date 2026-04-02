@@ -178,8 +178,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         process.stderr.write(`\n`);
 
         // Auto-open in default browser (default: true for localhost)
+        // Skip in test environments to avoid spawning browsers during CI/test runs
+        const isTest = !!(process.env.VITEST || process.env.NODE_ENV === "test" || process.env.CI);
         const isLocalhost = this.config.host === "127.0.0.1" || this.config.host === "localhost" || this.config.host === "::1";
-        const shouldAutoOpen = this.config.auto_open ?? isLocalhost;
+        const shouldAutoOpen = !isTest && (this.config.auto_open ?? isLocalhost);
         if (shouldAutoOpen) {
           this.openInBrowser(sessionUrl);
         }
