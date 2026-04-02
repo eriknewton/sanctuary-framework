@@ -2,7 +2,7 @@ import { sha256 } from '@noble/hashes/sha256';
 import { hmac } from '@noble/hashes/hmac';
 import { readFile, mkdir, writeFile, stat, unlink, readdir, chmod, access } from 'fs/promises';
 import { join } from 'path';
-import { homedir } from 'os';
+import { platform, homedir } from 'os';
 import { createRequire } from 'module';
 import { randomBytes as randomBytes$1, createHmac } from 'crypto';
 import { gcm } from '@noble/ciphers/aes.js';
@@ -14,7 +14,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { createServer as createServer$2 } from 'http';
 import { createServer as createServer$1 } from 'https';
 import { readFileSync, statSync } from 'fs';
-import { execSync } from 'child_process';
+import { exec, execSync } from 'child_process';
 
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
@@ -289,6 +289,12 @@ async function loadConfig(configPath) {
   }
   if (process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN) {
     config.dashboard.auth_token = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_AUTO_OPEN === "true") {
+    config.dashboard.auto_open = true;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_AUTO_OPEN === "false") {
+    config.dashboard.auto_open = false;
   }
   if (process.env.SANCTUARY_DASHBOARD_TLS_CERT && process.env.SANCTUARY_DASHBOARD_TLS_KEY) {
     config.dashboard.tls = {
@@ -5712,26 +5718,25 @@ var DashboardApprovalChannel = class {
       const protocol = this.useTLS ? "https" : "http";
       const baseUrl = `${protocol}://${this.config.host}:${this.config.port}`;
       this.httpServer.listen(this.config.port, this.config.host, () => {
+        const sessionUrl = this.authToken ? this.createSessionUrl() : baseUrl;
         process.stderr.write(
           `
   Sanctuary Principal Dashboard: ${baseUrl}
 `
         );
         if (this.authToken) {
-          const sessionUrl = this.createSessionUrl();
-          process.stderr.write(
-            `  Quick open: ${sessionUrl}
-`
-          );
           const hint = this.authToken.slice(0, 4) + "..." + this.authToken.slice(-4);
           process.stderr.write(
             `  Auth token: ${hint}
-
 `
           );
-        } else {
-          process.stderr.write(`
+        }
+        process.stderr.write(`
 `);
+        const isLocalhost = this.config.host === "127.0.0.1" || this.config.host === "localhost" || this.config.host === "::1";
+        const shouldAutoOpen = this.config.auto_open ?? isLocalhost;
+        if (shouldAutoOpen) {
+          this.openInBrowser(sessionUrl);
         }
         resolve();
       });
@@ -6262,6 +6267,31 @@ data: ${JSON.stringify(data)}
    */
   broadcastProtectionStatus(data) {
     this.broadcastSSE("protection-status", data);
+  }
+  /**
+   * Open a URL in the system's default browser.
+   * Cross-platform: macOS (open), Linux (xdg-open), Windows (start).
+   * Fails silently — dashboard still works via terminal URL.
+   */
+  openInBrowser(url) {
+    const os = platform();
+    let cmd;
+    if (os === "darwin") {
+      cmd = `open "${url}"`;
+    } else if (os === "win32") {
+      cmd = `start "" "${url}"`;
+    } else {
+      cmd = `xdg-open "${url}"`;
+    }
+    exec(cmd, (err) => {
+      if (err) {
+        process.stderr.write(
+          `  (Could not auto-open browser. Open the URL above manually.)
+
+`
+        );
+      }
+    });
   }
   /**
    * Create a pre-authenticated URL for the dashboard.
@@ -12109,7 +12139,8 @@ async function createSanctuaryServer(options) {
       timeout_seconds: policy.approval_channel.timeout_seconds,
       // SEC-002: auto_deny removed — timeout always denies
       auth_token: authToken,
-      tls: config.dashboard.tls
+      tls: config.dashboard.tls,
+      auto_open: config.dashboard.auto_open
     });
     dashboard.setDependencies({ policy, baseline, auditLog });
     await dashboard.start();

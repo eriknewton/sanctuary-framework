@@ -38,6 +38,8 @@ interface SanctuaryConfig {
         host: string;
         /** Bearer token for dashboard auth. If "auto", one is generated at startup. */
         auth_token?: string;
+        /** Auto-open dashboard in default browser on startup. Default: true for localhost. */
+        auto_open?: boolean;
         /** TLS cert/key paths for HTTPS dashboard. */
         tls?: {
             cert_path: string;
@@ -1986,6 +1988,8 @@ interface DashboardConfig {
         cert_path: string;
         key_path: string;
     };
+    /** Auto-open the dashboard in the default browser on startup. Default: true for localhost. */
+    auto_open?: boolean;
 }
 declare class DashboardApprovalChannel implements ApprovalChannel {
     private config;
@@ -2133,6 +2137,12 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
      * Broadcast current protection status to connected dashboards.
      */
     broadcastProtectionStatus(data: Record<string, unknown>): void;
+    /**
+     * Open a URL in the system's default browser.
+     * Cross-platform: macOS (open), Linux (xdg-open), Windows (start).
+     * Fails silently — dashboard still works via terminal URL.
+     */
+    private openInBrowser;
     /**
      * Create a pre-authenticated URL for the dashboard.
      * Used by the sanctuary_dashboard_open tool and at startup.
