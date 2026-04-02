@@ -575,6 +575,36 @@ export async function createSanctuaryServer(options?: {
   // 16. Create Principal Policy tools (read-only)
   const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
 
+  // 16b. Dashboard open tool — generates a pre-authenticated URL
+  const dashboardTools: ToolDefinition[] = [];
+  if (dashboard) {
+    dashboardTools.push({
+      name: "sanctuary/dashboard_open",
+      description:
+        "Generate a one-click URL to open the Principal Dashboard in a browser. " +
+        "Returns a pre-authenticated link — no manual token entry needed.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+      handler: async () => {
+        const url = dashboard!.createSessionUrl();
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                dashboard_url: url,
+                base_url: dashboard!.getBaseUrl(),
+                note: "Click the dashboard_url to open the Principal Dashboard. The session is pre-authenticated.",
+              }, null, 2),
+            },
+          ],
+        };
+      },
+    });
+  }
+
   // 17. Assemble all tools
   let allTools: ToolDefinition[] = [
     ...l1Tools,
@@ -589,6 +619,7 @@ export async function createSanctuaryServer(options?: {
     ...auditTools,
     ...contextGateTools,
     ...hardeningTools,
+    ...dashboardTools,
     manifestTool,
   ];
 

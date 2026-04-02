@@ -28,7 +28,7 @@ import type { ApprovalChannel } from "./approval-channel.js";
 import type { ApprovalRequest, ApprovalResponse, PrincipalPolicy } from "./types.js";
 import type { BaselineTracker } from "./baseline.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
-import { generateDashboardHTML } from "./dashboard-html.js";
+import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -68,7 +68,8 @@ interface DashboardSession {
   expires_at: number;
 }
 
-const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const SESSION_TTL_REMOTE_MS = 5 * 60 * 1000;  // 5 minutes for remote/TLS
+const SESSION_TTL_LOCAL_MS = 24 * 60 * 60 * 1000; // 24 hours for localhost
 const MAX_SESSIONS = 1000;
 
 // ── Rate Limiting ───────────────────────────────────────────────────
@@ -94,8 +95,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private baseline: BaselineTracker | null = null;
   private auditLog: AuditLog | null = null;
   private dashboardHTML: string;
+  private loginHTML: string;
   private authToken: string | undefined;
   private useTLS: boolean;
+  /** Session TTL: longer for localhost, shorter for remote */
+  private sessionTTLMs: number;
   /** SEC-012: Short-lived session store. Sessions replace URL query tokens. */
   private sessions: Map<string, DashboardSession> = new Map();
   private sessionCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -106,11 +110,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.config = config;
     this.authToken = config.auth_token;
     this.useTLS = !!(config.tls?.cert_path && config.tls?.key_path);
+    // Localhost gets 24h sessions; remote/TLS gets 5min
+    const isLocalhost = config.host === "127.0.0.1" || config.host === "localhost" || config.host === "::1";
+    this.sessionTTLMs = isLocalhost ? SESSION_TTL_LOCAL_MS : SESSION_TTL_REMOTE_MS;
     this.dashboardHTML = generateDashboardHTML({
       timeoutSeconds: config.timeout_seconds,
       serverVersion: PKG_VERSION,
       authToken: this.authToken,
     });
+    this.loginHTML = generateLoginHTML({ serverVersion: PKG_VERSION });
     // SEC-012: Periodic cleanup of expired sessions (every 60s)
     this.sessionCleanupTimer = setInterval(() => this.cleanupSessions(), 60_000);
   }
@@ -150,20 +158,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       const baseUrl = `${protocol}://${this.config.host}:${this.config.port}`;
 
       this.httpServer.listen(this.config.port, this.config.host, () => {
+        // Print dashboard URL — always include a clickable pre-authenticated link
+        process.stderr.write(
+          `\n  Sanctuary Principal Dashboard: ${baseUrl}\n`
+        );
         if (this.authToken) {
-          // Show only a hint of the token in stderr to avoid log exposure
+          // Generate a pre-authenticated one-click URL for terminal users
+          const sessionUrl = this.createSessionUrl();
+          process.stderr.write(
+            `  Quick open: ${sessionUrl}\n`
+          );
           const hint = this.authToken.slice(0, 4) + "..." + this.authToken.slice(-4);
           process.stderr.write(
-            `\n  Sanctuary Principal Dashboard: ${baseUrl}\n`
-          );
-          // SEC-012: Never suggest putting the token in the URL
-          process.stderr.write(
-            `  Auth required (token: ${hint}). Use Authorization: Bearer <TOKEN> header.\n\n`
+            `  Auth token: ${hint}\n\n`
           );
         } else {
-          process.stderr.write(
-            `\n  Sanctuary Principal Dashboard: ${baseUrl}\n\n`
-          );
+          process.stderr.write(`\n`);
         }
         resolve();
       });
@@ -293,12 +303,59 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return true;
     }
 
+    // Check sanctuary_session cookie (set by login page flow)
+    const cookieSession = this.parseCookie(req, "sanctuary_session");
+    if (cookieSession && this.validateSession(cookieSession)) {
+      return true;
+    }
+
     // SEC-012: Long-lived token in ?token= query parameter is explicitly REJECTED.
     // This was the vulnerability — tokens in URLs leak to logs, history, and Referer headers.
 
+    // For GET / requests from browsers, serve login page instead of JSON 401
+    // (checked in handleRequest before checkAuth is called for this path)
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Unauthorized — use Authorization: Bearer header or a valid session" }));
     return false;
+  }
+
+  /**
+   * Check if a request is authenticated WITHOUT sending a response.
+   * Used to decide between login page vs dashboard for GET /.
+   */
+  private isAuthenticated(req: IncomingMessage, url: URL): boolean {
+    if (!this.authToken) return true;
+
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      const parts = authHeader.split(" ");
+      if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
+        return true;
+      }
+    }
+
+    const sessionId = url.searchParams.get("session");
+    if (sessionId && this.validateSession(sessionId)) return true;
+
+    const cookieSession = this.parseCookie(req, "sanctuary_session");
+    if (cookieSession && this.validateSession(cookieSession)) return true;
+
+    return false;
+  }
+
+  /**
+   * Parse a specific cookie value from the request.
+   */
+  private parseCookie(req: IncomingMessage, name: string): string | null {
+    const header = req.headers.cookie;
+    if (!header) return null;
+    for (const part of header.split(";")) {
+      const [key, ...rest] = part.split("=");
+      if (key?.trim() === name) {
+        return rest.join("=").trim();
+      }
+    }
+    return null;
   }
 
   // ── Session Management (SEC-012) ──────────────────────────────────
@@ -325,7 +382,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.sessions.set(id, {
       id,
       created_at: now,
-      expires_at: now + SESSION_TTL_MS,
+      expires_at: now + this.sessionTTLMs,
     });
     return id;
   }
@@ -452,19 +509,34 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
 
-    // Authenticate all non-OPTIONS requests
+    // SEC-012: Session exchange does its own auth (header-only) — let it through before checkAuth
+    if (method === "POST" && url.pathname === "/auth/session") {
+      if (!this.checkRateLimit(req, res, "general")) return;
+      try {
+        this.handleSessionExchange(req, res);
+      } catch {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      }
+      return;
+    }
+
+    // For GET /: serve login page if not authenticated (instead of JSON 401)
+    if (method === "GET" && url.pathname === "/" && this.authToken) {
+      if (!this.isAuthenticated(req, url)) {
+        if (!this.checkRateLimit(req, res, "general")) return;
+        this.serveLoginPage(res);
+        return;
+      }
+    }
+
+    // Authenticate all other non-OPTIONS requests
     if (!this.checkAuth(req, url, res)) return;
 
     // Rate limiting: apply general limit to all authenticated requests
     if (!this.checkRateLimit(req, res, "general")) return;
 
     try {
-      // SEC-012: Session exchange endpoint — must be authenticated via header
-      if (method === "POST" && url.pathname === "/auth/session") {
-        this.handleSessionExchange(req, res);
-        return;
-      }
-
       if (method === "GET" && url.pathname === "/") {
         this.serveDashboard(res);
       } else if (method === "GET" && url.pathname === "/events") {
@@ -530,11 +602,23 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     const sessionId = this.createSession();
-    res.writeHead(200, { "Content-Type": "application/json" });
+    const ttlSeconds = Math.floor(this.sessionTTLMs / 1000);
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Set-Cookie": `sanctuary_session=${sessionId}; Path=/; SameSite=Strict; Max-Age=${ttlSeconds}`,
+    });
     res.end(JSON.stringify({
       session_id: sessionId,
-      expires_in_seconds: SESSION_TTL_MS / 1000,
+      expires_in_seconds: ttlSeconds,
     }));
+  }
+
+  private serveLoginPage(res: ServerResponse): void {
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache, no-store",
+    });
+    res.end(this.loginHTML);
   }
 
   private serveDashboard(res: ServerResponse): void {
@@ -755,6 +839,24 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   broadcastProtectionStatus(data: Record<string, unknown>): void {
     this.broadcastSSE("protection-status", data);
+  }
+
+  /**
+   * Create a pre-authenticated URL for the dashboard.
+   * Used by the sanctuary_dashboard_open tool and at startup.
+   */
+  createSessionUrl(): string {
+    const sessionId = this.createSession();
+    const protocol = this.useTLS ? "https" : "http";
+    return `${protocol}://${this.config.host}:${this.config.port}/?session=${sessionId}`;
+  }
+
+  /**
+   * Get the base URL for the dashboard.
+   */
+  getBaseUrl(): string {
+    const protocol = this.useTLS ? "https" : "http";
+    return `${protocol}://${this.config.host}:${this.config.port}`;
   }
 
   /** Get the number of pending requests */

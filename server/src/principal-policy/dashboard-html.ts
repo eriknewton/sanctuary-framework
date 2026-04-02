@@ -16,6 +16,188 @@
  */
 
 /**
+ * Generate the login page HTML for unauthenticated browser access.
+ * Provides a clean token input form that exchanges the token for a session cookie.
+ */
+export function generateLoginHTML(options: {
+  serverVersion: string;
+}): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sanctuary — Login</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --green: #3fb950;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --radius: 6px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; }
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .login-container {
+    width: 100%;
+    max-width: 400px;
+    padding: 40px 32px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+  .login-logo {
+    text-align: center;
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    margin-bottom: 8px;
+  }
+  .login-logo span { color: var(--blue); }
+  .login-version {
+    text-align: center;
+    font-size: 11px;
+    color: var(--text-secondary);
+    font-family: var(--mono);
+    margin-bottom: 32px;
+  }
+  .login-label {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+  }
+  .login-input {
+    width: 100%;
+    padding: 10px 14px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-family: var(--mono);
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .login-input:focus { border-color: var(--blue); }
+  .login-input::placeholder { color: var(--text-secondary); opacity: 0.5; }
+  .login-btn {
+    width: 100%;
+    margin-top: 20px;
+    padding: 10px;
+    background: var(--blue);
+    color: var(--bg);
+    border: none;
+    border-radius: var(--radius);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+    font-family: var(--sans);
+  }
+  .login-btn:hover { opacity: 0.9; }
+  .login-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .login-error {
+    margin-top: 16px;
+    padding: 10px 14px;
+    background: rgba(248, 81, 73, 0.1);
+    border: 1px solid var(--red);
+    border-radius: var(--radius);
+    font-size: 12px;
+    color: var(--red);
+    display: none;
+  }
+  .login-hint {
+    margin-top: 24px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+  .login-hint code {
+    font-family: var(--mono);
+    background: var(--bg);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 10px;
+  }
+</style>
+</head>
+<body>
+<div class="login-container">
+  <div class="login-logo"><span>&#9670;</span> SANCTUARY</div>
+  <div class="login-version">Principal Dashboard v${options.serverVersion}</div>
+  <form id="loginForm" onsubmit="return handleLogin(event)">
+    <label class="login-label" for="tokenInput">Dashboard Auth Token</label>
+    <input class="login-input" type="password" id="tokenInput"
+           placeholder="Enter your auth token" autocomplete="off" autofocus required>
+    <button class="login-btn" type="submit" id="loginBtn">Open Dashboard</button>
+  </form>
+  <div class="login-error" id="loginError"></div>
+  <div class="login-hint">
+    Your token is set via <code>SANCTUARY_DASHBOARD_AUTH_TOKEN</code> environment variable,
+    or check your server's startup output.
+  </div>
+</div>
+<script>
+async function handleLogin(e) {
+  e.preventDefault();
+  var btn = document.getElementById('loginBtn');
+  var errEl = document.getElementById('loginError');
+  var token = document.getElementById('tokenInput').value.trim();
+  if (!token) return false;
+  btn.disabled = true;
+  btn.textContent = 'Authenticating...';
+  errEl.style.display = 'none';
+  try {
+    var resp = await fetch('/auth/session', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (!resp.ok) {
+      var data = await resp.json().catch(function() { return {}; });
+      throw new Error(data.error || 'Authentication failed');
+    }
+    var result = await resp.json();
+    // Store token in sessionStorage for auto-renewal inside the dashboard
+    try { sessionStorage.setItem('sanctuary_token', token); } catch(_) {}
+    // Set session cookie
+    var maxAge = result.expires_in_seconds || 300;
+    document.cookie = 'sanctuary_session=' + result.session_id +
+      '; path=/; SameSite=Strict; max-age=' + maxAge;
+    // Reload to enter the dashboard
+    window.location.reload();
+  } catch (err) {
+    errEl.textContent = err.message || 'Authentication failed. Check your token.';
+    errEl.style.display = 'block';
+    btn.disabled = false;
+    btn.textContent = 'Open Dashboard';
+  }
+  return false;
+}
+</script>
+</body>
+</html>`;
+}
+
+/**
  * Generate the dashboard HTML with the given configuration.
  */
 export function generateDashboardHTML(options: {
@@ -892,7 +1074,9 @@ export function generateDashboardHTML(options: {
   // ── Configuration ────────────────────────────────────────────────
 
   const TIMEOUT_SECONDS = ${options.timeoutSeconds};
-  const AUTH_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : 'null'};
+  // AUTH_TOKEN: embedded token (for direct session access) or from sessionStorage (login page flow)
+  const EMBEDDED_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : 'null'};
+  const AUTH_TOKEN = EMBEDDED_TOKEN || (function() { try { return sessionStorage.getItem('sanctuary_token'); } catch(_) { return null; } })();
   const MAX_ACTIVITY_ITEMS = 100;
   const MAX_THREAT_ITEMS = 20;
 
@@ -907,6 +1091,7 @@ export function generateDashboardHTML(options: {
   const activityItems = [];
   const threatItems = [];
   let sovereigntyScore = 85;
+  let sessionRenewalTimer = null;
 
   // ── Auth Helpers (SEC-012) ───────────────────────────────────────
 
@@ -922,6 +1107,11 @@ export function generateDashboardHTML(options: {
     return url + sep + 'session=' + SESSION_ID;
   }
 
+  function setCookie(sessionId, maxAge) {
+    document.cookie = 'sanctuary_session=' + sessionId +
+      '; path=/; SameSite=Strict; max-age=' + maxAge;
+  }
+
   async function exchangeSession() {
     if (!AUTH_TOKEN) return;
     try {
@@ -929,12 +1119,33 @@ export function generateDashboardHTML(options: {
       if (resp.ok) {
         const data = await resp.json();
         SESSION_ID = data.session_id;
-        const refreshMs = (data.expires_in_seconds || 300) * 800;
-        setTimeout(() => { exchangeSession(); reconnectSSE(); }, refreshMs);
+        var ttl = data.expires_in_seconds || 300;
+        // Update cookie with new session
+        setCookie(SESSION_ID, ttl);
+        // Schedule renewal at 80% of TTL
+        if (sessionRenewalTimer) clearTimeout(sessionRenewalTimer);
+        sessionRenewalTimer = setTimeout(function() {
+          exchangeSession().then(function() { reconnectSSE(); });
+        }, ttl * 800);
+      } else if (resp.status === 401) {
+        // Token invalid or expired — show non-destructive re-login overlay
+        showSessionExpired();
       }
     } catch (e) {
-      // Retry on next connect
+      // Network error — retry in 30s
+      if (sessionRenewalTimer) clearTimeout(sessionRenewalTimer);
+      sessionRenewalTimer = setTimeout(function() {
+        exchangeSession().then(function() { reconnectSSE(); });
+      }, 30000);
     }
+  }
+
+  function showSessionExpired() {
+    // Clear stored token
+    try { sessionStorage.removeItem('sanctuary_token'); } catch(_) {}
+    // Redirect to login page
+    document.cookie = 'sanctuary_session=; path=/; max-age=0';
+    window.location.reload();
   }
 
   // ── UI Utilities ─────────────────────────────────────────────────

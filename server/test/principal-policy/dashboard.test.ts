@@ -341,9 +341,15 @@ describe("Principal Dashboard", () => {
       expect(text).toContain("Principal Dashboard");
     });
 
-    it("rejects dashboard HTML without token", async () => {
+    it("serves login page instead of dashboard when unauthenticated", async () => {
       const res = await fetch(`http://127.0.0.1:${authPort}/`);
-      expect(res.status).toBe(401);
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      // Should be the login page, not the full dashboard
+      expect(body).toContain("login");
+      expect(body).toContain("Auth Token");
+      // Dashboard content should NOT be present
+      expect(body).not.toContain("Live Activity");
     });
 
     it("allows OPTIONS requests without auth (CORS preflight)", async () => {

@@ -49,11 +49,15 @@ describe("SEC-012: Dashboard auth token never in URL query string", () => {
     await createDashboard();
 
     // This is exactly the pattern that SEC-012 forbids: token in URL
+    // GET / without valid auth serves the login page (200), NOT the dashboard
     const res = await fetch(`${baseUrl}/?token=${AUTH_TOKEN}`);
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(200);
 
-    const body = await res.json();
-    expect(body.error).toBeDefined();
+    const body = await res.text();
+    // Login page should be served, not the full dashboard
+    expect(body).toContain("login");
+    // Dashboard-specific content should NOT be present
+    expect(body).not.toContain("Live Activity");
   });
 
   // ── Test 2: Long-lived token in Authorization header is accepted ────
