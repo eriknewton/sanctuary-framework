@@ -4042,6 +4042,181 @@ var StderrApprovalChannel = class {
 };
 
 // src/principal-policy/dashboard-html.ts
+function generateLoginHTML(options) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sanctuary \u2014 Login</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --green: #3fb950;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --radius: 6px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; }
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .login-container {
+    width: 100%;
+    max-width: 400px;
+    padding: 40px 32px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+  .login-logo {
+    text-align: center;
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    margin-bottom: 8px;
+  }
+  .login-logo span { color: var(--blue); }
+  .login-version {
+    text-align: center;
+    font-size: 11px;
+    color: var(--text-secondary);
+    font-family: var(--mono);
+    margin-bottom: 32px;
+  }
+  .login-label {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+  }
+  .login-input {
+    width: 100%;
+    padding: 10px 14px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-family: var(--mono);
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .login-input:focus { border-color: var(--blue); }
+  .login-input::placeholder { color: var(--text-secondary); opacity: 0.5; }
+  .login-btn {
+    width: 100%;
+    margin-top: 20px;
+    padding: 10px;
+    background: var(--blue);
+    color: var(--bg);
+    border: none;
+    border-radius: var(--radius);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+    font-family: var(--sans);
+  }
+  .login-btn:hover { opacity: 0.9; }
+  .login-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .login-error {
+    margin-top: 16px;
+    padding: 10px 14px;
+    background: rgba(248, 81, 73, 0.1);
+    border: 1px solid var(--red);
+    border-radius: var(--radius);
+    font-size: 12px;
+    color: var(--red);
+    display: none;
+  }
+  .login-hint {
+    margin-top: 24px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+  .login-hint code {
+    font-family: var(--mono);
+    background: var(--bg);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 10px;
+  }
+</style>
+</head>
+<body>
+<div class="login-container">
+  <div class="login-logo"><span>&#9670;</span> SANCTUARY</div>
+  <div class="login-version">Principal Dashboard v${options.serverVersion}</div>
+  <form id="loginForm" onsubmit="return handleLogin(event)">
+    <label class="login-label" for="tokenInput">Dashboard Auth Token</label>
+    <input class="login-input" type="password" id="tokenInput"
+           placeholder="Enter your auth token" autocomplete="off" autofocus required>
+    <button class="login-btn" type="submit" id="loginBtn">Open Dashboard</button>
+  </form>
+  <div class="login-error" id="loginError"></div>
+  <div class="login-hint">
+    Your token is set via <code>SANCTUARY_DASHBOARD_AUTH_TOKEN</code> environment variable,
+    or check your server's startup output.
+  </div>
+</div>
+<script>
+async function handleLogin(e) {
+  e.preventDefault();
+  var btn = document.getElementById('loginBtn');
+  var errEl = document.getElementById('loginError');
+  var token = document.getElementById('tokenInput').value.trim();
+  if (!token) return false;
+  btn.disabled = true;
+  btn.textContent = 'Authenticating...';
+  errEl.style.display = 'none';
+  try {
+    var resp = await fetch('/auth/session', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (!resp.ok) {
+      var data = await resp.json().catch(function() { return {}; });
+      throw new Error(data.error || 'Authentication failed');
+    }
+    var result = await resp.json();
+    // Store token in sessionStorage for auto-renewal inside the dashboard
+    try { sessionStorage.setItem('sanctuary_token', token); } catch(_) {}
+    // Set session cookie
+    var maxAge = result.expires_in_seconds || 300;
+    document.cookie = 'sanctuary_session=' + result.session_id +
+      '; path=/; SameSite=Strict; max-age=' + maxAge;
+    // Reload to enter the dashboard
+    window.location.reload();
+  } catch (err) {
+    errEl.textContent = err.message || 'Authentication failed. Check your token.';
+    errEl.style.display = 'block';
+    btn.disabled = false;
+    btn.textContent = 'Open Dashboard';
+  }
+  return false;
+}
+</script>
+</body>
+</html>`;
+}
 function generateDashboardHTML(options) {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -4911,7 +5086,9 @@ function generateDashboardHTML(options) {
   // \u2500\u2500 Configuration \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
   const TIMEOUT_SECONDS = ${options.timeoutSeconds};
-  const AUTH_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : "null"};
+  // AUTH_TOKEN: embedded token (for direct session access) or from sessionStorage (login page flow)
+  const EMBEDDED_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : "null"};
+  const AUTH_TOKEN = EMBEDDED_TOKEN || (function() { try { return sessionStorage.getItem('sanctuary_token'); } catch(_) { return null; } })();
   const MAX_ACTIVITY_ITEMS = 100;
   const MAX_THREAT_ITEMS = 20;
 
@@ -4926,6 +5103,7 @@ function generateDashboardHTML(options) {
   const activityItems = [];
   const threatItems = [];
   let sovereigntyScore = 85;
+  let sessionRenewalTimer = null;
 
   // \u2500\u2500 Auth Helpers (SEC-012) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
@@ -4941,6 +5119,11 @@ function generateDashboardHTML(options) {
     return url + sep + 'session=' + SESSION_ID;
   }
 
+  function setCookie(sessionId, maxAge) {
+    document.cookie = 'sanctuary_session=' + sessionId +
+      '; path=/; SameSite=Strict; max-age=' + maxAge;
+  }
+
   async function exchangeSession() {
     if (!AUTH_TOKEN) return;
     try {
@@ -4948,12 +5131,33 @@ function generateDashboardHTML(options) {
       if (resp.ok) {
         const data = await resp.json();
         SESSION_ID = data.session_id;
-        const refreshMs = (data.expires_in_seconds || 300) * 800;
-        setTimeout(() => { exchangeSession(); reconnectSSE(); }, refreshMs);
+        var ttl = data.expires_in_seconds || 300;
+        // Update cookie with new session
+        setCookie(SESSION_ID, ttl);
+        // Schedule renewal at 80% of TTL
+        if (sessionRenewalTimer) clearTimeout(sessionRenewalTimer);
+        sessionRenewalTimer = setTimeout(function() {
+          exchangeSession().then(function() { reconnectSSE(); });
+        }, ttl * 800);
+      } else if (resp.status === 401) {
+        // Token invalid or expired \u2014 show non-destructive re-login overlay
+        showSessionExpired();
       }
     } catch (e) {
-      // Retry on next connect
+      // Network error \u2014 retry in 30s
+      if (sessionRenewalTimer) clearTimeout(sessionRenewalTimer);
+      sessionRenewalTimer = setTimeout(function() {
+        exchangeSession().then(function() { reconnectSSE(); });
+      }, 30000);
     }
+  }
+
+  function showSessionExpired() {
+    // Clear stored token
+    try { sessionStorage.removeItem('sanctuary_token'); } catch(_) {}
+    // Redirect to login page
+    document.cookie = 'sanctuary_session=; path=/; max-age=0';
+    window.location.reload();
   }
 
   // \u2500\u2500 UI Utilities \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -5428,7 +5632,8 @@ function generateDashboardHTML(options) {
 }
 
 // src/principal-policy/dashboard.ts
-var SESSION_TTL_MS = 5 * 60 * 1e3;
+var SESSION_TTL_REMOTE_MS = 5 * 60 * 1e3;
+var SESSION_TTL_LOCAL_MS = 24 * 60 * 60 * 1e3;
 var MAX_SESSIONS = 1e3;
 var RATE_LIMIT_WINDOW_MS = 6e4;
 var RATE_LIMIT_GENERAL = 120;
@@ -5443,8 +5648,11 @@ var DashboardApprovalChannel = class {
   baseline = null;
   auditLog = null;
   dashboardHTML;
+  loginHTML;
   authToken;
   useTLS;
+  /** Session TTL: longer for localhost, shorter for remote */
+  sessionTTLMs;
   /** SEC-012: Short-lived session store. Sessions replace URL query tokens. */
   sessions = /* @__PURE__ */ new Map();
   sessionCleanupTimer = null;
@@ -5454,11 +5662,14 @@ var DashboardApprovalChannel = class {
     this.config = config;
     this.authToken = config.auth_token;
     this.useTLS = !!(config.tls?.cert_path && config.tls?.key_path);
+    const isLocalhost = config.host === "127.0.0.1" || config.host === "localhost" || config.host === "::1";
+    this.sessionTTLMs = isLocalhost ? SESSION_TTL_LOCAL_MS : SESSION_TTL_REMOTE_MS;
     this.dashboardHTML = generateDashboardHTML({
       timeoutSeconds: config.timeout_seconds,
       serverVersion: SANCTUARY_VERSION,
       authToken: this.authToken
     });
+    this.loginHTML = generateLoginHTML({ serverVersion: SANCTUARY_VERSION });
     this.sessionCleanupTimer = setInterval(() => this.cleanupSessions(), 6e4);
   }
   /**
@@ -5488,25 +5699,26 @@ var DashboardApprovalChannel = class {
       const protocol = this.useTLS ? "https" : "http";
       const baseUrl = `${protocol}://${this.config.host}:${this.config.port}`;
       this.httpServer.listen(this.config.port, this.config.host, () => {
-        if (this.authToken) {
-          const hint = this.authToken.slice(0, 4) + "..." + this.authToken.slice(-4);
-          process.stderr.write(
-            `
+        process.stderr.write(
+          `
   Sanctuary Principal Dashboard: ${baseUrl}
 `
-          );
+        );
+        if (this.authToken) {
+          const sessionUrl = this.createSessionUrl();
           process.stderr.write(
-            `  Auth required (token: ${hint}). Use Authorization: Bearer <TOKEN> header.
+            `  Quick open: ${sessionUrl}
+`
+          );
+          const hint = this.authToken.slice(0, 4) + "..." + this.authToken.slice(-4);
+          process.stderr.write(
+            `  Auth token: ${hint}
 
 `
           );
         } else {
-          process.stderr.write(
-            `
-  Sanctuary Principal Dashboard: ${baseUrl}
-
-`
-          );
+          process.stderr.write(`
+`);
         }
         resolve();
       });
@@ -5610,9 +5822,46 @@ var DashboardApprovalChannel = class {
     if (sessionId && this.validateSession(sessionId)) {
       return true;
     }
+    const cookieSession = this.parseCookie(req, "sanctuary_session");
+    if (cookieSession && this.validateSession(cookieSession)) {
+      return true;
+    }
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Unauthorized \u2014 use Authorization: Bearer header or a valid session" }));
     return false;
+  }
+  /**
+   * Check if a request is authenticated WITHOUT sending a response.
+   * Used to decide between login page vs dashboard for GET /.
+   */
+  isAuthenticated(req, url) {
+    if (!this.authToken) return true;
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      const parts = authHeader.split(" ");
+      if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
+        return true;
+      }
+    }
+    const sessionId = url.searchParams.get("session");
+    if (sessionId && this.validateSession(sessionId)) return true;
+    const cookieSession = this.parseCookie(req, "sanctuary_session");
+    if (cookieSession && this.validateSession(cookieSession)) return true;
+    return false;
+  }
+  /**
+   * Parse a specific cookie value from the request.
+   */
+  parseCookie(req, name) {
+    const header = req.headers.cookie;
+    if (!header) return null;
+    for (const part of header.split(";")) {
+      const [key, ...rest] = part.split("=");
+      if (key?.trim() === name) {
+        return rest.join("=").trim();
+      }
+    }
+    return null;
   }
   // ── Session Management (SEC-012) ──────────────────────────────────
   /**
@@ -5634,7 +5883,7 @@ var DashboardApprovalChannel = class {
     this.sessions.set(id, {
       id,
       created_at: now,
-      expires_at: now + SESSION_TTL_MS
+      expires_at: now + this.sessionTTLMs
     });
     return id;
   }
@@ -5733,13 +5982,26 @@ var DashboardApprovalChannel = class {
       res.end();
       return;
     }
+    if (method === "POST" && url.pathname === "/auth/session") {
+      if (!this.checkRateLimit(req, res, "general")) return;
+      try {
+        this.handleSessionExchange(req, res);
+      } catch {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      }
+      return;
+    }
+    if (method === "GET" && url.pathname === "/" && this.authToken) {
+      if (!this.isAuthenticated(req, url)) {
+        if (!this.checkRateLimit(req, res, "general")) return;
+        this.serveLoginPage(res);
+        return;
+      }
+    }
     if (!this.checkAuth(req, url, res)) return;
     if (!this.checkRateLimit(req, res, "general")) return;
     try {
-      if (method === "POST" && url.pathname === "/auth/session") {
-        this.handleSessionExchange(req, res);
-        return;
-      }
       if (method === "GET" && url.pathname === "/") {
         this.serveDashboard(res);
       } else if (method === "GET" && url.pathname === "/events") {
@@ -5796,11 +6058,22 @@ var DashboardApprovalChannel = class {
       return;
     }
     const sessionId = this.createSession();
-    res.writeHead(200, { "Content-Type": "application/json" });
+    const ttlSeconds = Math.floor(this.sessionTTLMs / 1e3);
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Set-Cookie": `sanctuary_session=${sessionId}; Path=/; SameSite=Strict; Max-Age=${ttlSeconds}`
+    });
     res.end(JSON.stringify({
       session_id: sessionId,
-      expires_in_seconds: SESSION_TTL_MS / 1e3
+      expires_in_seconds: ttlSeconds
     }));
+  }
+  serveLoginPage(res) {
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache, no-store"
+    });
+    res.end(this.loginHTML);
   }
   serveDashboard(res) {
     res.writeHead(200, {
@@ -5976,6 +6249,22 @@ data: ${JSON.stringify(data)}
    */
   broadcastProtectionStatus(data) {
     this.broadcastSSE("protection-status", data);
+  }
+  /**
+   * Create a pre-authenticated URL for the dashboard.
+   * Used by the sanctuary_dashboard_open tool and at startup.
+   */
+  createSessionUrl() {
+    const sessionId = this.createSession();
+    const protocol = this.useTLS ? "https" : "http";
+    return `${protocol}://${this.config.host}:${this.config.port}/?session=${sessionId}`;
+  }
+  /**
+   * Get the base URL for the dashboard.
+   */
+  getBaseUrl() {
+    const protocol = this.useTLS ? "https" : "http";
+    return `${protocol}://${this.config.host}:${this.config.port}`;
   }
   /** Get the number of pending requests */
   get pendingCount() {
@@ -11791,6 +12080,32 @@ async function createSanctuaryServer(options) {
   } : void 0;
   const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog, injectionDetector, onInjectionAlert);
   const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
+  const dashboardTools = [];
+  if (dashboard) {
+    dashboardTools.push({
+      name: "sanctuary/dashboard_open",
+      description: "Generate a one-click URL to open the Principal Dashboard in a browser. Returns a pre-authenticated link \u2014 no manual token entry needed.",
+      inputSchema: {
+        type: "object",
+        properties: {}
+      },
+      handler: async () => {
+        const url = dashboard.createSessionUrl();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                dashboard_url: url,
+                base_url: dashboard.getBaseUrl(),
+                note: "Click the dashboard_url to open the Principal Dashboard. The session is pre-authenticated."
+              }, null, 2)
+            }
+          ]
+        };
+      }
+    });
+  }
   let allTools = [
     ...l1Tools,
     ...l2Tools,
@@ -11804,6 +12119,7 @@ async function createSanctuaryServer(options) {
     ...auditTools,
     ...contextGateTools,
     ...hardeningTools,
+    ...dashboardTools,
     manifestTool
   ];
   allTools = allTools.map((tool) => ({

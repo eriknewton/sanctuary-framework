@@ -1996,8 +1996,11 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
     private baseline;
     private auditLog;
     private dashboardHTML;
+    private loginHTML;
     private authToken;
     private useTLS;
+    /** Session TTL: longer for localhost, shorter for remote */
+    private sessionTTLMs;
     /** SEC-012: Short-lived session store. Sessions replace URL query tokens. */
     private sessions;
     private sessionCleanupTimer;
@@ -2038,6 +2041,15 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
      */
     private checkAuth;
     /**
+     * Check if a request is authenticated WITHOUT sending a response.
+     * Used to decide between login page vs dashboard for GET /.
+     */
+    private isAuthenticated;
+    /**
+     * Parse a specific cookie value from the request.
+     */
+    private parseCookie;
+    /**
      * Create a short-lived session by exchanging the long-lived auth token
      * (provided in the Authorization header) for a session ID.
      */
@@ -2074,6 +2086,7 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
      * normal checkAuth flow.
      */
     private handleSessionExchange;
+    private serveLoginPage;
     private serveDashboard;
     private handleSSE;
     private handleStatus;
@@ -2120,6 +2133,15 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
      * Broadcast current protection status to connected dashboards.
      */
     broadcastProtectionStatus(data: Record<string, unknown>): void;
+    /**
+     * Create a pre-authenticated URL for the dashboard.
+     * Used by the sanctuary_dashboard_open tool and at startup.
+     */
+    createSessionUrl(): string;
+    /**
+     * Get the base URL for the dashboard.
+     */
+    getBaseUrl(): string;
     /** Get the number of pending requests */
     get pendingCount(): number;
     /** Get the number of connected SSE clients */
