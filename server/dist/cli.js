@@ -867,6 +867,8 @@ tier3_always_allow:
   - handshake_respond
   - handshake_complete
   - handshake_status
+  - handshake_exchange
+  - handshake_verify_attestation
   - reputation_query_weighted
   - federation_peers
   - federation_trust_evaluate
@@ -968,6 +970,8 @@ var init_loader = __esm({
         "handshake_respond",
         "handshake_complete",
         "handshake_status",
+        "handshake_exchange",
+        "handshake_verify_attestation",
         "reputation_query_weighted",
         "federation_peers",
         "federation_trust_evaluate",
@@ -8284,6 +8288,155 @@ function deriveTrustTier(level) {
   }
 }
 
+// src/handshake/attestation.ts
+init_encoding();
+init_key_derivation();
+init_encoding();
+var ATTESTATION_VERSION = "1.0";
+function deriveTrustTier2(level) {
+  switch (level) {
+    case "full":
+      return "verified-sovereign";
+    case "degraded":
+      return "verified-degraded";
+    default:
+      return "unverified";
+  }
+}
+function generateAttestation(opts) {
+  const {
+    attesterSHR,
+    subjectSHR,
+    verificationResult,
+    mutual = false,
+    identityManager,
+    masterKey,
+    identityId
+  } = opts;
+  const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+  if (!identity) {
+    return { error: "No identity available for signing attestation" };
+  }
+  const now = /* @__PURE__ */ new Date();
+  const attesterExpiry = new Date(attesterSHR.body.expires_at);
+  const subjectExpiry = new Date(subjectSHR.body.expires_at);
+  const earliestExpiry = attesterExpiry < subjectExpiry ? attesterExpiry : subjectExpiry;
+  const sovereigntyLevel = verificationResult.valid ? verificationResult.sovereignty_level : "unverified";
+  const body = {
+    attestation_version: ATTESTATION_VERSION,
+    attester_id: attesterSHR.body.instance_id,
+    subject_id: subjectSHR.body.instance_id,
+    attester_shr: attesterSHR,
+    subject_shr: subjectSHR,
+    verification: {
+      subject_shr_valid: verificationResult.valid,
+      subject_sovereignty_level: sovereigntyLevel,
+      subject_trust_tier: deriveTrustTier2(sovereigntyLevel),
+      mutual,
+      errors: verificationResult.errors,
+      warnings: verificationResult.warnings
+    },
+    attested_at: now.toISOString(),
+    expires_at: earliestExpiry.toISOString()
+  };
+  const canonical = JSON.stringify(deepSortKeys(body));
+  const payload = stringToBytes(canonical);
+  const encryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  const signatureBytes = sign(
+    payload,
+    identity.encrypted_private_key,
+    encryptionKey
+  );
+  const summary = generateSummary(body);
+  return {
+    body,
+    signed_by: identity.public_key,
+    signature: toBase64url(signatureBytes),
+    summary
+  };
+}
+function layerLine(label, status) {
+  const icon = status === "active" ? "\u2713" : status === "degraded" ? "~" : "x";
+  return `  ${icon} ${label}: ${status}`;
+}
+function generateSummary(body) {
+  const v = body.verification;
+  const sLayers = body.subject_shr.body.layers;
+  const aLayers = body.attester_shr.body.layers;
+  const tierLabel = v.subject_trust_tier === "verified-sovereign" ? "Verified Sovereign" : v.subject_trust_tier === "verified-degraded" ? "Verified (Degraded)" : "Unverified";
+  const lines = [
+    `--- Sovereignty Attestation ---`,
+    ``,
+    `Attester: ${body.attester_id.slice(0, 16)}...`,
+    `Subject:  ${body.subject_id.slice(0, 16)}...`,
+    `Result:   ${tierLabel}`,
+    ``,
+    `Subject Sovereignty Posture:`,
+    layerLine("L1 Cognitive Sovereignty", sLayers.l1.status),
+    layerLine("L2 Operational Isolation", sLayers.l2.status),
+    layerLine("L3 Selective Disclosure", sLayers.l3.status),
+    layerLine("L4 Verifiable Reputation", sLayers.l4.status),
+    ``,
+    `Attester Sovereignty Posture:`,
+    layerLine("L1 Cognitive Sovereignty", aLayers.l1.status),
+    layerLine("L2 Operational Isolation", aLayers.l2.status),
+    layerLine("L3 Selective Disclosure", aLayers.l3.status),
+    layerLine("L4 Verifiable Reputation", aLayers.l4.status),
+    ``,
+    `Mutual: ${v.mutual ? "Yes" : "One-sided"}`,
+    `Attested: ${body.attested_at}`,
+    `Expires:  ${body.expires_at}`,
+    `Signature: ${body.attestation_version} / Ed25519`
+  ];
+  if (v.warnings.length > 0) {
+    lines.push(``, `Warnings: ${v.warnings.join("; ")}`);
+  }
+  if (v.errors.length > 0) {
+    lines.push(``, `Errors: ${v.errors.join("; ")}`);
+  }
+  lines.push(``, `--- Verify: compare signed_by against attester's known public key ---`);
+  return lines.join("\n");
+}
+function verifyAttestation(attestation, now) {
+  const errors = [];
+  const currentTime = /* @__PURE__ */ new Date();
+  if (attestation.body.attestation_version !== ATTESTATION_VERSION) {
+    errors.push(
+      `Unsupported attestation version: ${attestation.body.attestation_version}`
+    );
+  }
+  if (!attestation.body.attester_id || !attestation.body.subject_id) {
+    errors.push("Missing attester_id or subject_id");
+  }
+  if (!attestation.body.attester_shr || !attestation.body.subject_shr) {
+    errors.push("Missing attester or subject SHR");
+  }
+  const expired = new Date(attestation.body.expires_at) <= currentTime;
+  if (expired) {
+    errors.push("Attestation has expired");
+  }
+  try {
+    const publicKey = fromBase64url(attestation.signed_by);
+    const canonical = JSON.stringify(deepSortKeys(attestation.body));
+    const payload = stringToBytes(canonical);
+    const signatureBytes = fromBase64url(attestation.signature);
+    const signatureValid = verify(payload, signatureBytes, publicKey);
+    if (!signatureValid) {
+      errors.push("Attestation signature is invalid");
+    }
+  } catch (e) {
+    errors.push(`Signature verification error: ${e.message}`);
+  }
+  return {
+    valid: errors.length === 0,
+    errors,
+    attester_id: attestation.body.attester_id ?? "unknown",
+    subject_id: attestation.body.subject_id ?? "unknown",
+    trust_tier: errors.length === 0 ? attestation.body.verification.subject_trust_tier : "unverified",
+    expired
+  };
+}
+
 // src/handshake/tools.ts
 function createHandshakeTools(config, identityManager, masterKey, auditLog) {
   const sessions = /* @__PURE__ */ new Map();
@@ -8467,6 +8620,103 @@ function createHandshakeTools(config, identityManager, masterKey, auditLog) {
           state: session.state,
           initiated_at: session.initiated_at,
           result: session.result ?? null
+        });
+      }
+    },
+    // ─── Streamlined Exchange ─────────────────────────────────────────
+    {
+      name: "sanctuary/handshake_exchange",
+      description: "One-shot sovereignty exchange. Accepts a counterparty's signed SHR, verifies it, generates our SHR, and produces a signed attestation artifact \u2014 all in a single call. Returns a shareable attestation with human-readable summary. Use this instead of the 4-step handshake protocol when you want a quick, portable sovereignty verification (e.g., for social posting or async exchanges).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          counterparty_shr: {
+            type: "object",
+            description: "The counterparty's signed SHR (SignedSHR object with body, signed_by, signature)."
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to use for the exchange. Defaults to primary identity."
+          }
+        },
+        required: ["counterparty_shr"]
+      },
+      handler: async (args) => {
+        const counterpartySHR = args.counterparty_shr;
+        const ourSHR = generateSHR(args.identity_id, shrOpts);
+        if (typeof ourSHR === "string") {
+          return toolResult({ error: ourSHR });
+        }
+        const verificationResult = verifySHR(counterpartySHR);
+        const attestation = generateAttestation({
+          attesterSHR: ourSHR,
+          subjectSHR: counterpartySHR,
+          verificationResult,
+          mutual: false,
+          identityManager,
+          masterKey,
+          identityId: args.identity_id
+        });
+        if ("error" in attestation) {
+          auditLog.append("l4", "handshake_exchange", ourSHR.body.instance_id, void 0, "failure");
+          return toolResult({ error: attestation.error });
+        }
+        if (verificationResult.valid) {
+          const sovereigntyLevel = verificationResult.sovereignty_level;
+          const trustTier = sovereigntyLevel === "full" ? "verified-sovereign" : sovereigntyLevel === "degraded" ? "verified-degraded" : "unverified";
+          handshakeResults.set(verificationResult.counterparty_id, {
+            counterparty_id: verificationResult.counterparty_id,
+            counterparty_shr: counterpartySHR,
+            verified: true,
+            sovereignty_level: sovereigntyLevel,
+            trust_tier: trustTier,
+            completed_at: (/* @__PURE__ */ new Date()).toISOString(),
+            expires_at: verificationResult.expires_at,
+            errors: []
+          });
+        }
+        auditLog.append("l4", "handshake_exchange", ourSHR.body.instance_id);
+        return toolResult({
+          attestation,
+          our_shr: ourSHR,
+          verification: {
+            counterparty_valid: verificationResult.valid,
+            counterparty_sovereignty: verificationResult.sovereignty_level,
+            counterparty_id: verificationResult.counterparty_id,
+            errors: verificationResult.errors,
+            warnings: verificationResult.warnings
+          },
+          instructions: "The 'attestation' object is a signed, portable sovereignty verification artifact. Share it with the counterparty or post attestation.summary publicly. The counterparty can verify the attestation signature using your public key. Our SHR is included so the counterparty can perform their own verification of us.",
+          _content_trust: "external"
+        });
+      }
+    },
+    {
+      name: "sanctuary/handshake_verify_attestation",
+      description: "Verify a signed attestation artifact from another agent. Checks the Ed25519 signature, temporal validity, and structural integrity.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          attestation: {
+            type: "object",
+            description: "The SignedAttestation object to verify (body, signed_by, signature, summary)."
+          }
+        },
+        required: ["attestation"]
+      },
+      handler: async (args) => {
+        const attestation = args.attestation;
+        const result = verifyAttestation(attestation);
+        auditLog.append(
+          "l4",
+          "handshake_verify_attestation",
+          result.attester_id,
+          void 0,
+          result.valid ? "success" : "failure"
+        );
+        return toolResult({
+          ...result,
+          _content_trust: "external"
         });
       }
     }

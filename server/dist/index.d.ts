@@ -2355,6 +2355,101 @@ declare function completeHandshake(response: HandshakeResponse, session: Handsha
 declare function verifyCompletion(completion: HandshakeCompletion, session: HandshakeSession): HandshakeResult;
 
 /**
+ * Sanctuary MCP Server — Sovereignty Attestation Artifacts
+ *
+ * Signed, shareable artifacts proving sovereignty verification between agents.
+ * Used for one-shot SHR exchanges and as portable proof of handshake completion.
+ *
+ * An attestation artifact contains:
+ *   - Both parties' SHRs
+ *   - Verification results (sovereignty level, trust tier)
+ *   - Ed25519 signature over the canonical artifact body
+ *   - Human-readable summary for social/public posting
+ */
+
+/** Attestation artifact version */
+declare const ATTESTATION_VERSION: "1.0";
+/** The signed body of an attestation artifact */
+interface AttestationBody {
+    attestation_version: typeof ATTESTATION_VERSION;
+    /** Who generated this attestation */
+    attester_id: string;
+    /** Who was verified */
+    subject_id: string;
+    /** Attester's SHR at time of attestation */
+    attester_shr: SignedSHR;
+    /** Subject's SHR that was verified */
+    subject_shr: SignedSHR;
+    /** Verification results */
+    verification: {
+        subject_shr_valid: boolean;
+        subject_sovereignty_level: SovereigntyLevel;
+        subject_trust_tier: TrustTier;
+        /** Whether subject also verified attester (mutual exchange) */
+        mutual: boolean;
+        errors: string[];
+        warnings: string[];
+    };
+    /** When this attestation was generated */
+    attested_at: string;
+    /** When this attestation expires (min of both SHR expiries) */
+    expires_at: string;
+}
+/** Complete signed attestation artifact */
+interface SignedAttestation {
+    body: AttestationBody;
+    /** Attester's public key (base64url) */
+    signed_by: string;
+    /** Ed25519 signature over canonical body (base64url) */
+    signature: string;
+    /** Human-readable summary for social posting */
+    summary: string;
+}
+interface AttestationOptions {
+    /** Our signed SHR */
+    attesterSHR: SignedSHR;
+    /** Counterparty's signed SHR */
+    subjectSHR: SignedSHR;
+    /** Result from verifySHR(subjectSHR) */
+    verificationResult: SHRVerificationResult;
+    /** Whether this is a mutual exchange (both sides verify) */
+    mutual?: boolean;
+    /** Identity manager for signing */
+    identityManager: IdentityManager;
+    /** Master key for key derivation */
+    masterKey: Uint8Array;
+    /** Identity to sign with (defaults to primary) */
+    identityId?: string;
+}
+/**
+ * Generate a signed attestation artifact.
+ *
+ * The artifact is a portable, verifiable proof that one agent
+ * verified another's sovereignty posture. It includes both SHRs,
+ * the verification outcome, and a human-readable summary.
+ */
+declare function generateAttestation(opts: AttestationOptions): SignedAttestation | {
+    error: string;
+};
+interface AttestationVerificationResult {
+    valid: boolean;
+    errors: string[];
+    attester_id: string;
+    subject_id: string;
+    trust_tier: TrustTier;
+    expired: boolean;
+}
+/**
+ * Verify a signed attestation artifact.
+ *
+ * Checks:
+ * 1. Signature validity (Ed25519 over canonical body)
+ * 2. Temporal validity (not expired)
+ * 3. Structural integrity (version, required fields)
+ */
+declare function verifyAttestation(attestation: SignedAttestation, now?: Date): AttestationVerificationResult;
+
+/**
  * Sanctuary MCP Server — Concordia Bridge: Type Definitions
  *
  * Defines the interface contract between the Concordia negotiation protocol
@@ -2559,4 +2654,4 @@ declare function createSanctuaryServer(options?: {
     storage?: StorageBackend;
 }): Promise<SanctuaryServer>;
 
-export { ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, type BridgeAttestationRequest, type BridgeAttestationResult, type BridgeCommitment, type BridgeVerificationResult, TEMPLATES as CONTEXT_GATE_TEMPLATES, CallbackApprovalChannel, CommitmentStore, type ConcordiaOutcome, type ContextAction, type ContextFilterResult, ContextGateEnforcer, type ContextGatePolicy, ContextGatePolicyStore, type ContextGateRule, type ContextGateTemplate, DashboardApprovalChannel, type DashboardConfig, type DetectionResult, type EnforcerConfig, type FederationCapabilities, type FederationPeer, FederationRegistry, type FieldClassification, type FieldFilterResult, FilesystemStorage, type GateResult, type HandshakeChallenge, type HandshakeCompletion, type HandshakeResponse, type HandshakeResult, InjectionDetector, type InjectionDetectorConfig, type InjectionSignal, MemoryStorage, type PedersenCommitment, type PeerTrustEvaluation, type PolicyRecommendation, PolicyStore, type PrincipalPolicy, type ProviderCategory, ReputationStore, type SHRBody, type SHRVerificationResult, type SanctuaryConfig, type SanctuaryServer, type SignedSHR, type SovereigntyTier, StateStore, StderrApprovalChannel, TIER_WEIGHTS, type TierMetadata, type TieredAttestation, WebhookApprovalChannel, type WebhookCallbackPayload, type WebhookConfig, type WebhookPayload, type ZKProofOfKnowledge, type ZKRangeProof, canonicalize, classifyField, completeHandshake, computeWeightedScore, createBridgeCommitment, createPedersenCommitment, createProofOfKnowledge, createRangeProof, createSanctuaryServer, evaluateField, filterContext, generateSHR, getTemplate, initiateHandshake, listTemplateIds, loadConfig, loadPrincipalPolicy, recommendPolicy, resolveTier, respondToHandshake, signPayload, tierDistribution, verifyBridgeCommitment, verifyCompletion, verifyPedersenCommitment, verifyProofOfKnowledge, verifyRangeProof, verifySHR, verifySignature };
+export { ATTESTATION_VERSION, ApprovalGate, type AttestationBody, type AttestationVerificationResult, AuditLog, AutoApproveChannel, BaselineTracker, type BridgeAttestationRequest, type BridgeAttestationResult, type BridgeCommitment, type BridgeVerificationResult, TEMPLATES as CONTEXT_GATE_TEMPLATES, CallbackApprovalChannel, CommitmentStore, type ConcordiaOutcome, type ContextAction, type ContextFilterResult, ContextGateEnforcer, type ContextGatePolicy, ContextGatePolicyStore, type ContextGateRule, type ContextGateTemplate, DashboardApprovalChannel, type DashboardConfig, type DetectionResult, type EnforcerConfig, type FederationCapabilities, type FederationPeer, FederationRegistry, type FieldClassification, type FieldFilterResult, FilesystemStorage, type GateResult, type HandshakeChallenge, type HandshakeCompletion, type HandshakeResponse, type HandshakeResult, InjectionDetector, type InjectionDetectorConfig, type InjectionSignal, MemoryStorage, type PedersenCommitment, type PeerTrustEvaluation, type PolicyRecommendation, PolicyStore, type PrincipalPolicy, type ProviderCategory, ReputationStore, type SHRBody, type SHRVerificationResult, type SanctuaryConfig, type SanctuaryServer, type SignedAttestation, type SignedSHR, type SovereigntyTier, StateStore, StderrApprovalChannel, TIER_WEIGHTS, type TierMetadata, type TieredAttestation, WebhookApprovalChannel, type WebhookCallbackPayload, type WebhookConfig, type WebhookPayload, type ZKProofOfKnowledge, type ZKRangeProof, canonicalize, classifyField, completeHandshake, computeWeightedScore, createBridgeCommitment, createPedersenCommitment, createProofOfKnowledge, createRangeProof, createSanctuaryServer, evaluateField, filterContext, generateAttestation, generateSHR, getTemplate, initiateHandshake, listTemplateIds, loadConfig, loadPrincipalPolicy, recommendPolicy, resolveTier, respondToHandshake, signPayload, tierDistribution, verifyAttestation, verifyBridgeCommitment, verifyCompletion, verifyPedersenCommitment, verifyProofOfKnowledge, verifyRangeProof, verifySHR, verifySignature };

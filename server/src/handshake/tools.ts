@@ -21,6 +21,13 @@ import {
   completeHandshake,
   verifyCompletion,
 } from "./protocol.js";
+import {
+  generateAttestation,
+  verifyAttestation,
+  type SignedAttestation,
+} from "./attestation.js";
+import { verifySHR } from "../shr/verifier.js";
+import type { SignedSHR } from "../shr/types.js";
 import type {
   HandshakeChallenge,
   HandshakeResponse,
@@ -268,6 +275,144 @@ export function createHandshakeTools(
           state: session.state,
           initiated_at: session.initiated_at,
           result: session.result ?? null,
+        });
+      },
+    },
+
+    // ─── Streamlined Exchange ─────────────────────────────────────────
+
+    {
+      name: "sanctuary/handshake_exchange",
+      description:
+        "One-shot sovereignty exchange. Accepts a counterparty's signed SHR, verifies it, " +
+        "generates our SHR, and produces a signed attestation artifact — all in a single call. " +
+        "Returns a shareable attestation with human-readable summary. " +
+        "Use this instead of the 4-step handshake protocol when you want a quick, " +
+        "portable sovereignty verification (e.g., for social posting or async exchanges).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          counterparty_shr: {
+            type: "object",
+            description:
+              "The counterparty's signed SHR (SignedSHR object with body, signed_by, signature).",
+          },
+          identity_id: {
+            type: "string",
+            description:
+              "Identity to use for the exchange. Defaults to primary identity.",
+          },
+        },
+        required: ["counterparty_shr"],
+      },
+      handler: async (args) => {
+        const counterpartySHR = args.counterparty_shr as unknown as SignedSHR;
+
+        // 1. Generate our SHR
+        const ourSHR = generateSHR(args.identity_id as string | undefined, shrOpts);
+        if (typeof ourSHR === "string") {
+          return toolResult({ error: ourSHR });
+        }
+
+        // 2. Verify counterparty's SHR
+        const verificationResult = verifySHR(counterpartySHR);
+
+        // 3. Generate signed attestation artifact
+        const attestation = generateAttestation({
+          attesterSHR: ourSHR,
+          subjectSHR: counterpartySHR,
+          verificationResult,
+          mutual: false,
+          identityManager,
+          masterKey,
+          identityId: args.identity_id as string | undefined,
+        });
+
+        if ("error" in attestation) {
+          auditLog.append("l4", "handshake_exchange", ourSHR.body.instance_id, undefined, "failure");
+          return toolResult({ error: attestation.error });
+        }
+
+        // 4. Store as a handshake result for tier resolution
+        if (verificationResult.valid) {
+          const sovereigntyLevel = verificationResult.sovereignty_level as
+            | "full"
+            | "degraded"
+            | "minimal"
+            | "unverified";
+          const trustTier =
+            sovereigntyLevel === "full"
+              ? "verified-sovereign"
+              : sovereigntyLevel === "degraded"
+                ? "verified-degraded"
+                : "unverified";
+
+          handshakeResults.set(verificationResult.counterparty_id, {
+            counterparty_id: verificationResult.counterparty_id,
+            counterparty_shr: counterpartySHR,
+            verified: true,
+            sovereignty_level: sovereigntyLevel,
+            trust_tier: trustTier as "verified-sovereign" | "verified-degraded" | "unverified",
+            completed_at: new Date().toISOString(),
+            expires_at: verificationResult.expires_at,
+            errors: [],
+          });
+        }
+
+        auditLog.append("l4", "handshake_exchange", ourSHR.body.instance_id);
+
+        return toolResult({
+          attestation,
+          our_shr: ourSHR,
+          verification: {
+            counterparty_valid: verificationResult.valid,
+            counterparty_sovereignty: verificationResult.sovereignty_level,
+            counterparty_id: verificationResult.counterparty_id,
+            errors: verificationResult.errors,
+            warnings: verificationResult.warnings,
+          },
+          instructions:
+            "The 'attestation' object is a signed, portable sovereignty verification artifact. " +
+            "Share it with the counterparty or post attestation.summary publicly. " +
+            "The counterparty can verify the attestation signature using your public key. " +
+            "Our SHR is included so the counterparty can perform their own verification of us.",
+          _content_trust: "external",
+        });
+      },
+    },
+
+    {
+      name: "sanctuary/handshake_verify_attestation",
+      description:
+        "Verify a signed attestation artifact from another agent. " +
+        "Checks the Ed25519 signature, temporal validity, and structural integrity.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          attestation: {
+            type: "object",
+            description:
+              "The SignedAttestation object to verify (body, signed_by, signature, summary).",
+          },
+        },
+        required: ["attestation"],
+      },
+      handler: async (args) => {
+        const attestation = args.attestation as unknown as SignedAttestation;
+
+        const result = verifyAttestation(attestation);
+
+        auditLog.append(
+          "l4",
+          "handshake_verify_attestation",
+          result.attester_id,
+          undefined,
+          result.valid ? "success" : "failure"
+        );
+
+        return toolResult({
+          ...result,
+          _content_trust: "external",
         });
       },
     },

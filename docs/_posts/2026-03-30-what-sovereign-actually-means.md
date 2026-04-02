@@ -80,4 +80,4 @@ Because sovereign doesn't mean local. And it doesn't mean autonomous. It means a
 
 ---
 
-*Erik Newton is the creator of [Sanctuary Framework](https://sanctuaryprotocol.ai) and [Concordia Protocol](https://github.com/eriknewton/concordia-protocol). He builds sovereignty and negotiation infrastructure for the agentic economy.*
+*Erik Newton is the author of Sanctuary Framework and Concordia Protocol — open infrastructure for the agentic economy. He is a licensed California attorney and the cofounder of CIMC.ai*

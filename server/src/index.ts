@@ -743,6 +743,16 @@ export type {
   HandshakeResult,
 } from "./handshake/types.js";
 export {
+  generateAttestation,
+  verifyAttestation,
+  ATTESTATION_VERSION,
+} from "./handshake/attestation.js";
+export type {
+  SignedAttestation,
+  AttestationBody,
+  AttestationVerificationResult,
+} from "./handshake/attestation.js";
+export {
   createBridgeCommitment,
   verifyBridgeCommitment,
   canonicalize,
