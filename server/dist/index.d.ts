@@ -58,6 +58,9 @@ interface SanctuaryConfig {
 }
 /**
  * Load configuration from file, falling back to defaults.
+ *
+ * Precedence (highest wins): CLI flags > env vars > config file > defaults
+ * This matches the standard config precedence pattern used by most tools.
  */
 declare function loadConfig(configPath?: string): Promise<SanctuaryConfig>;
 

@@ -256,7 +256,18 @@ function defaultConfig() {
   };
 }
 async function loadConfig(configPath) {
-  const config = defaultConfig();
+  let config = defaultConfig();
+  const storagePath = process.env.SANCTUARY_STORAGE_PATH ?? config.storage_path;
+  const path = configPath ?? join(storagePath, "sanctuary.json");
+  try {
+    const raw = await readFile(path, "utf-8");
+    const fileConfig = JSON.parse(raw);
+    config = deepMerge(config, fileConfig);
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("unimplemented features")) {
+      throw err;
+    }
+  }
   if (process.env.SANCTUARY_STORAGE_PATH) {
     config.storage_path = process.env.SANCTUARY_STORAGE_PATH;
   }
@@ -268,6 +279,9 @@ async function loadConfig(configPath) {
   }
   if (process.env.SANCTUARY_DASHBOARD_ENABLED === "true") {
     config.dashboard.enabled = true;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_ENABLED === "false") {
+    config.dashboard.enabled = false;
   }
   if (process.env.SANCTUARY_DASHBOARD_PORT) {
     config.dashboard.port = parseInt(process.env.SANCTUARY_DASHBOARD_PORT, 10);
@@ -287,6 +301,9 @@ async function loadConfig(configPath) {
   if (process.env.SANCTUARY_WEBHOOK_ENABLED === "true") {
     config.webhook.enabled = true;
   }
+  if (process.env.SANCTUARY_WEBHOOK_ENABLED === "false") {
+    config.webhook.enabled = false;
+  }
   if (process.env.SANCTUARY_WEBHOOK_URL) {
     config.webhook.url = process.env.SANCTUARY_WEBHOOK_URL;
   }
@@ -299,19 +316,9 @@ async function loadConfig(configPath) {
   if (process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST) {
     config.webhook.callback_host = process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST;
   }
-  const path = configPath ?? join(config.storage_path, "sanctuary.json");
-  try {
-    const raw = await readFile(path, "utf-8");
-    const fileConfig = JSON.parse(raw);
-    const merged = deepMerge(config, fileConfig);
-    validateConfig(merged);
-    return merged;
-  } catch (err) {
-    if (err instanceof Error && err.message.includes("unimplemented features")) {
-      throw err;
-    }
-    return config;
-  }
+  config.version = PKG_VERSION;
+  validateConfig(config);
+  return config;
 }
 async function saveConfig(config, configPath) {
   const path = join(config.storage_path, "sanctuary.json");
