@@ -39,7 +39,7 @@ export interface SanctuaryConfig {
   };
 
   disclosure: {
-    proof_system: "groth16" | "plonk" | "commitment-only";
+    proof_system: "groth16" | "plonk" | "schnorr-pedersen" | "commitment-only";
     default_policy: "minimum-necessary" | "withhold-all";
   };
 
@@ -103,7 +103,7 @@ export function defaultConfig(): SanctuaryConfig {
       },
     },
     disclosure: {
-      proof_system: "commitment-only",
+      proof_system: "schnorr-pedersen",
       default_policy: "minimum-necessary",
     },
     reputation: {
@@ -262,9 +262,10 @@ export function validateConfig(config: SanctuaryConfig): void {
     );
   }
 
-  // Implemented proof_system values: "commitment-only"
+  // Implemented proof_system values: "schnorr-pedersen" (Schnorr proofs + Pedersen commitments + range proofs — genuine ZK)
+  // Also accepts "commitment-only" (legacy alias, equivalent to schnorr-pedersen)
   // Unimplemented: "groth16", "plonk" (SNARK proof systems not yet available)
-  const implementedProofSystem = new Set(["commitment-only"]);
+  const implementedProofSystem = new Set(["schnorr-pedersen", "commitment-only"]);
   if (!implementedProofSystem.has(config.disclosure.proof_system)) {
     errors.push(
       `Unimplemented config value: disclosure.proof_system = "${config.disclosure.proof_system}". ` +

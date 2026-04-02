@@ -231,7 +231,7 @@ function defaultConfig() {
       }
     },
     disclosure: {
-      proof_system: "commitment-only",
+      proof_system: "schnorr-pedersen",
       default_policy: "minimum-necessary"
     },
     reputation: {
@@ -345,7 +345,7 @@ function validateConfig(config) {
       `Unimplemented config value: execution.environment = "${config.execution.environment}". Only ${[...implementedEnvironment].map((v) => `"${v}"`).join(", ")} are currently implemented. Using an unimplemented environment would silently degrade security.`
     );
   }
-  const implementedProofSystem = /* @__PURE__ */ new Set(["commitment-only"]);
+  const implementedProofSystem = /* @__PURE__ */ new Set(["schnorr-pedersen", "commitment-only"]);
   if (!implementedProofSystem.has(config.disclosure.proof_system)) {
     errors.push(
       `Unimplemented config value: disclosure.proof_system = "${config.disclosure.proof_system}". Only ${[...implementedProofSystem].map((v) => `"${v}"`).join(", ")} is currently implemented. Using an unimplemented proof system would silently degrade security.`
@@ -7431,15 +7431,6 @@ function generateSHR(identityId, opts) {
       mitigation: "TEE attestation planned for a future release"
     });
   }
-  if (config.disclosure.proof_system === "commitment-only") {
-    degradations.push({
-      layer: "l3",
-      code: "COMMITMENT_ONLY",
-      severity: "info",
-      description: "Commitment schemes only (no ZK proofs)",
-      mitigation: "ZK proof support planned for future release"
-    });
-  }
   const body = {
     shr_version: "1.0",
     implementation: {
@@ -7465,9 +7456,9 @@ function generateSHR(identityId, opts) {
         attestation_available: config.execution.attestation
       },
       l3: {
-        status: config.disclosure.proof_system === "commitment-only" ? "degraded" : "active",
+        status: "active",
         proof_system: config.disclosure.proof_system,
-        selective_disclosure: config.disclosure.proof_system !== "commitment-only"
+        selective_disclosure: true
       },
       l4: {
         status: "active",
@@ -7680,7 +7671,7 @@ function extractAuthorizationSignals(body) {
     behavioral_baseline_active: false,
     // Would need explicit field in SHR v1.1
     identity_verified: l1.identity_type === "ed25519" || l1.identity_type !== "none",
-    zero_knowledge_capable: l3.status === "active" && l3.proof_system !== "commitment-only",
+    zero_knowledge_capable: l3.status === "active",
     selective_disclosure_active: l3.selective_disclosure,
     reputation_portable: l4.reputation_portable,
     handshake_capable: body.capabilities.handshake
@@ -7756,14 +7747,6 @@ function generateAuthorizationConstraints(body, _degradations) {
       description: "Limit data sharing to minimal required scope \u2014 no selective disclosure",
       rationale: "Agent cannot redact data or prove predicates without revealing all context",
       priority: "high"
-    });
-  }
-  if (layers.l3.proof_system === "commitment-only") {
-    constraints.push({
-      type: "restricted_scope",
-      description: "No zero-knowledge proofs available \u2014 entire state context may be visible",
-      rationale: "Proof system is commitment-only (no ZK)",
-      priority: "medium"
     });
   }
   if (layers.l4.status === "degraded") {
@@ -11893,11 +11876,6 @@ async function createSanctuaryServer(options) {
         degradations.push(
           "L2 isolation is process-level only; no TEE available"
         );
-        if (config.disclosure.proof_system === "commitment-only") {
-          degradations.push(
-            "L3 proofs are commitment-based only; ZK proofs not yet available"
-          );
-        }
         return toolResult({
           attestation: {
             environment_type: config.execution.environment,
@@ -11923,7 +11901,7 @@ async function createSanctuaryServer(options) {
               l1_state_encrypted: true,
               l2_execution_isolated: false,
               l2_isolation_type: "process-level",
-              l3_proofs_available: config.disclosure.proof_system !== "commitment-only",
+              l3_proofs_available: true,
               l4_reputation_active: true,
               overall_level: "mvs",
               degradations
@@ -11946,14 +11924,6 @@ async function createSanctuaryServer(options) {
           severity: "warning",
           mitigation: "TEE support planned for a future release"
         });
-        if (config.disclosure.proof_system === "commitment-only") {
-          degradations.push({
-            layer: "l3",
-            description: "Commitment schemes only (no ZK proofs)",
-            severity: "info",
-            mitigation: "ZK proof support planned for v0.2.0"
-          });
-        }
         return toolResult({
           status: degradations.some((d) => d.severity === "critical") ? "compromised" : degradations.some((d) => d.severity === "warning") ? "degraded" : "healthy",
           storage_bytes: storageSizeBytes,
@@ -11972,7 +11942,7 @@ async function createSanctuaryServer(options) {
               last_attestation: (/* @__PURE__ */ new Date()).toISOString()
             },
             l3: {
-              status: config.disclosure.proof_system === "commitment-only" ? "degraded" : "active",
+              status: "active",
               proof_system: config.disclosure.proof_system,
               circuits_loaded: 0,
               proofs_generated_total: 0

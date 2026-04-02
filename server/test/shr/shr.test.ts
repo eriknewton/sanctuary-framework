@@ -95,14 +95,16 @@ describe("Sovereignty Health Report (SHR)", () => {
         masterKey,
       }) as SignedSHR;
 
-      // MVS has no TEE and commitment-only proofs
+      // MVS has L2 degraded (no TEE) but L3 is active (Schnorr + Pedersen = genuine ZK)
       expect(shr.body.layers.l2.status).toBe("degraded");
-      expect(shr.body.layers.l3.status).toBe("degraded");
+      expect(shr.body.layers.l3.status).toBe("active");
+      expect(shr.body.layers.l3.selective_disclosure).toBe(true);
       expect(shr.body.degradations.length).toBeGreaterThan(0);
 
       const codes = shr.body.degradations.map((d) => d.code);
       expect(codes).toContain("PROCESS_ISOLATION_ONLY");
-      expect(codes).toContain("COMMITMENT_ONLY");
+      // COMMITMENT_ONLY is no longer a degradation — Schnorr proofs are genuine ZK
+      expect(codes).not.toContain("COMMITMENT_ONLY");
     });
 
     it("respects custom validity window", () => {

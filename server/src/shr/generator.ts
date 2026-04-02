@@ -74,15 +74,9 @@ export function generateSHR(
     });
   }
 
-  if (config.disclosure.proof_system === "commitment-only") {
-    degradations.push({
-      layer: "l3",
-      code: "COMMITMENT_ONLY" as DegradationCode,
-      severity: "info",
-      description: "Commitment schemes only (no ZK proofs)",
-      mitigation: "ZK proof support planned for future release",
-    });
-  }
+  // Note: L3 is NOT degraded. Sanctuary's Schnorr proofs + Pedersen commitments +
+  // range proofs are genuine zero-knowledge proofs. The "commitment-only" label was
+  // a categorization error — these ARE ZK proofs with selective disclosure capability.
 
   // Build the SHR body
   const body: SHRBody = {
@@ -112,11 +106,9 @@ export function generateSHR(
         attestation_available: config.execution.attestation,
       },
       l3: {
-        status: config.disclosure.proof_system === "commitment-only"
-          ? "degraded"
-          : "active",
+        status: "active",
         proof_system: config.disclosure.proof_system,
-        selective_disclosure: config.disclosure.proof_system !== "commitment-only",
+        selective_disclosure: true,
       },
       l4: {
         status: "active",

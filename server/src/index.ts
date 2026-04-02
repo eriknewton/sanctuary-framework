@@ -226,12 +226,8 @@ export async function createSanctuaryServer(options?: {
           "L2 isolation is process-level only; no TEE available"
         );
 
-        // L3 is commitment-only in MVS
-        if (config.disclosure.proof_system === "commitment-only") {
-          degradations.push(
-            "L3 proofs are commitment-based only; ZK proofs not yet available"
-          );
-        }
+        // L3: Schnorr proofs + Pedersen commitments + range proofs are genuine ZK.
+        // No L3 degradation — selective disclosure is fully operational.
 
         return toolResult({
           attestation: {
@@ -257,8 +253,7 @@ export async function createSanctuaryServer(options?: {
               l1_state_encrypted: true,
               l2_execution_isolated: false,
               l2_isolation_type: "process-level",
-              l3_proofs_available:
-                config.disclosure.proof_system !== "commitment-only",
+              l3_proofs_available: true,
               l4_reputation_active: true,
               overall_level: "mvs",
               degradations,
@@ -290,14 +285,7 @@ export async function createSanctuaryServer(options?: {
           mitigation: "TEE support planned for a future release",
         });
 
-        if (config.disclosure.proof_system === "commitment-only") {
-          degradations.push({
-            layer: "l3",
-            description: "Commitment schemes only (no ZK proofs)",
-            severity: "info",
-            mitigation: "ZK proof support planned for v0.2.0",
-          });
-        }
+        // L3: No degradation. Schnorr + Pedersen + range proofs are genuine ZK.
 
         return toolResult({
           status: degradations.some((d) => d.severity === "critical")
@@ -321,10 +309,7 @@ export async function createSanctuaryServer(options?: {
               last_attestation: new Date().toISOString(),
             },
             l3: {
-              status:
-                config.disclosure.proof_system === "commitment-only"
-                  ? "degraded"
-                  : "active",
+              status: "active",
               proof_system: config.disclosure.proof_system,
               circuits_loaded: 0,
               proofs_generated_total: 0,

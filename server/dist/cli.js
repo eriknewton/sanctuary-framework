@@ -1,22 +1,22 @@
 #!/usr/bin/env node
-import { sha256 } from '@noble/hashes/sha256';
-import { hmac } from '@noble/hashes/hmac';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { mkdir, readFile, writeFile, stat, unlink, readdir, chmod, access } from 'fs/promises';
+import { mkdir, readFile, writeFile, chmod, access, stat, unlink, readdir } from 'fs/promises';
 import { join } from 'path';
-import { platform, homedir } from 'os';
+import { homedir, platform } from 'os';
 import { createRequire } from 'module';
 import { randomBytes as randomBytes$1, createHmac } from 'crypto';
 import { gcm } from '@noble/ciphers/aes.js';
-import { RistrettoPoint, ed25519 } from '@noble/curves/ed25519';
+import { sha256 } from '@noble/hashes/sha256';
+import { hmac } from '@noble/hashes/hmac';
 import { argon2id } from 'hash-wasm';
 import { hkdf } from '@noble/hashes/hkdf';
+import { createServer as createServer$1 } from 'http';
+import { get, createServer as createServer$2 } from 'https';
+import { statSync, readFileSync } from 'fs';
+import { execSync, exec } from 'child_process';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { RistrettoPoint, ed25519 } from '@noble/curves/ed25519';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { createServer as createServer$2 } from 'http';
-import { createServer as createServer$1, get } from 'https';
-import { readFileSync, statSync } from 'fs';
-import { exec, execSync } from 'child_process';
 
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
@@ -27,6 +27,321 @@ var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, { get: all[name], enumerable: true });
 };
+function defaultConfig() {
+  return {
+    version: PKG_VERSION,
+    storage_path: join(homedir(), ".sanctuary"),
+    state: {
+      encryption: "aes-256-gcm",
+      key_protection: "none",
+      key_derivation: "argon2id",
+      integrity: "merkle-sha256",
+      identity_provider: "ed25519"
+    },
+    execution: {
+      environment: "local-process",
+      attestation: true,
+      resource_limits: {
+        max_memory_mb: 512,
+        max_storage_mb: 1024,
+        max_cpu_percent: 50
+      }
+    },
+    disclosure: {
+      proof_system: "schnorr-pedersen",
+      default_policy: "minimum-necessary"
+    },
+    reputation: {
+      mode: "self-custodied",
+      attestation_format: "eas-compatible",
+      export_format: "SANCTUARY_REP_V1",
+      service_endpoints: []
+    },
+    transport: "stdio",
+    http_port: 3500,
+    dashboard: {
+      enabled: false,
+      port: 3501,
+      host: "127.0.0.1"
+    },
+    webhook: {
+      enabled: false,
+      url: "",
+      secret: "",
+      callback_port: 3502,
+      callback_host: "127.0.0.1"
+    }
+  };
+}
+async function loadConfig(configPath) {
+  let config = defaultConfig();
+  const storagePath = process.env.SANCTUARY_STORAGE_PATH ?? config.storage_path;
+  const path = configPath ?? join(storagePath, "sanctuary.json");
+  try {
+    const raw = await readFile(path, "utf-8");
+    const fileConfig = JSON.parse(raw);
+    config = deepMerge(config, fileConfig);
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("unimplemented features")) {
+      throw err;
+    }
+  }
+  if (process.env.SANCTUARY_STORAGE_PATH) {
+    config.storage_path = process.env.SANCTUARY_STORAGE_PATH;
+  }
+  if (process.env.SANCTUARY_TRANSPORT) {
+    config.transport = process.env.SANCTUARY_TRANSPORT;
+  }
+  if (process.env.SANCTUARY_HTTP_PORT) {
+    config.http_port = parseInt(process.env.SANCTUARY_HTTP_PORT, 10);
+  }
+  if (process.env.SANCTUARY_DASHBOARD_ENABLED === "true") {
+    config.dashboard.enabled = true;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_ENABLED === "false") {
+    config.dashboard.enabled = false;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_PORT) {
+    config.dashboard.port = parseInt(process.env.SANCTUARY_DASHBOARD_PORT, 10);
+  }
+  if (process.env.SANCTUARY_DASHBOARD_HOST) {
+    config.dashboard.host = process.env.SANCTUARY_DASHBOARD_HOST;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN) {
+    config.dashboard.auth_token = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_AUTO_OPEN === "true") {
+    config.dashboard.auto_open = true;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_AUTO_OPEN === "false") {
+    config.dashboard.auto_open = false;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_TLS_CERT && process.env.SANCTUARY_DASHBOARD_TLS_KEY) {
+    config.dashboard.tls = {
+      cert_path: process.env.SANCTUARY_DASHBOARD_TLS_CERT,
+      key_path: process.env.SANCTUARY_DASHBOARD_TLS_KEY
+    };
+  }
+  if (process.env.SANCTUARY_WEBHOOK_ENABLED === "true") {
+    config.webhook.enabled = true;
+  }
+  if (process.env.SANCTUARY_WEBHOOK_ENABLED === "false") {
+    config.webhook.enabled = false;
+  }
+  if (process.env.SANCTUARY_WEBHOOK_URL) {
+    config.webhook.url = process.env.SANCTUARY_WEBHOOK_URL;
+  }
+  if (process.env.SANCTUARY_WEBHOOK_SECRET) {
+    config.webhook.secret = process.env.SANCTUARY_WEBHOOK_SECRET;
+  }
+  if (process.env.SANCTUARY_WEBHOOK_CALLBACK_PORT) {
+    config.webhook.callback_port = parseInt(process.env.SANCTUARY_WEBHOOK_CALLBACK_PORT, 10);
+  }
+  if (process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST) {
+    config.webhook.callback_host = process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST;
+  }
+  config.version = PKG_VERSION;
+  validateConfig(config);
+  return config;
+}
+async function saveConfig(config, configPath) {
+  const path = join(config.storage_path, "sanctuary.json");
+  await writeFile(path, JSON.stringify(config, null, 2), { mode: 384 });
+}
+function validateConfig(config) {
+  const errors = [];
+  const implementedKeyProtection = /* @__PURE__ */ new Set(["passphrase", "none"]);
+  if (!implementedKeyProtection.has(config.state.key_protection)) {
+    errors.push(
+      `Unimplemented config value: state.key_protection = "${config.state.key_protection}". Only ${[...implementedKeyProtection].map((v) => `"${v}"`).join(", ")} are currently implemented. Using an unimplemented key protection mode would silently degrade security.`
+    );
+  }
+  const implementedEnvironment = /* @__PURE__ */ new Set(["local-process", "docker"]);
+  if (!implementedEnvironment.has(config.execution.environment)) {
+    errors.push(
+      `Unimplemented config value: execution.environment = "${config.execution.environment}". Only ${[...implementedEnvironment].map((v) => `"${v}"`).join(", ")} are currently implemented. Using an unimplemented environment would silently degrade security.`
+    );
+  }
+  const implementedProofSystem = /* @__PURE__ */ new Set(["schnorr-pedersen", "commitment-only"]);
+  if (!implementedProofSystem.has(config.disclosure.proof_system)) {
+    errors.push(
+      `Unimplemented config value: disclosure.proof_system = "${config.disclosure.proof_system}". Only ${[...implementedProofSystem].map((v) => `"${v}"`).join(", ")} is currently implemented. Using an unimplemented proof system would silently degrade security.`
+    );
+  }
+  const implementedDisclosurePolicy = /* @__PURE__ */ new Set(["minimum-necessary"]);
+  if (!implementedDisclosurePolicy.has(config.disclosure.default_policy)) {
+    errors.push(
+      `Unimplemented config value: disclosure.default_policy = "${config.disclosure.default_policy}". Only ${[...implementedDisclosurePolicy].map((v) => `"${v}"`).join(", ")} is currently implemented. Using an unimplemented disclosure policy would silently skip disclosure controls.`
+    );
+  }
+  const implementedReputationMode = /* @__PURE__ */ new Set(["self-custodied"]);
+  if (!implementedReputationMode.has(config.reputation.mode)) {
+    errors.push(
+      `Unimplemented config value: reputation.mode = "${config.reputation.mode}". Only ${[...implementedReputationMode].map((v) => `"${v}"`).join(", ")} is currently implemented. Using an unimplemented reputation mode would silently skip reputation verification.`
+    );
+  }
+  if (errors.length > 0) {
+    throw new Error(
+      `Sanctuary configuration references unimplemented features:
+${errors.join("\n")}`
+    );
+  }
+}
+function deepMerge(base, override) {
+  const result = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    if (value !== null && typeof value === "object" && !Array.isArray(value) && typeof result[key] === "object" && result[key] !== null) {
+      result[key] = deepMerge(
+        result[key],
+        value
+      );
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+var require2, PKG_VERSION, SANCTUARY_VERSION;
+var init_config = __esm({
+  "src/config.ts"() {
+    require2 = createRequire(import.meta.url);
+    ({ version: PKG_VERSION } = require2("../package.json"));
+    SANCTUARY_VERSION = PKG_VERSION;
+  }
+});
+function randomBytes(length) {
+  if (length <= 0) {
+    throw new RangeError("Length must be positive");
+  }
+  const buf = randomBytes$1(length);
+  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+}
+function generateIV() {
+  return randomBytes(12);
+}
+function generateSalt() {
+  return randomBytes(32);
+}
+function generateRandomKey() {
+  return randomBytes(32);
+}
+var init_random = __esm({
+  "src/core/random.ts"() {
+  }
+});
+var FilesystemStorage;
+var init_filesystem = __esm({
+  "src/storage/filesystem.ts"() {
+    init_random();
+    FilesystemStorage = class {
+      basePath;
+      constructor(basePath) {
+        this.basePath = basePath;
+      }
+      entryPath(namespace, key) {
+        const safeNamespace = namespace.replace(/[^a-zA-Z0-9_-]/g, "_");
+        const safeKey = key.replace(/[^a-zA-Z0-9_.-]/g, "_");
+        return join(this.basePath, safeNamespace, `${safeKey}.enc`);
+      }
+      namespacePath(namespace) {
+        const safeNamespace = namespace.replace(/[^a-zA-Z0-9_-]/g, "_");
+        return join(this.basePath, safeNamespace);
+      }
+      async write(namespace, key, data) {
+        const dirPath = this.namespacePath(namespace);
+        const filePath = this.entryPath(namespace, key);
+        await mkdir(dirPath, { recursive: true, mode: 448 });
+        await writeFile(filePath, data, { mode: 384 });
+      }
+      async read(namespace, key) {
+        const filePath = this.entryPath(namespace, key);
+        try {
+          const buf = await readFile(filePath);
+          return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+        } catch (err) {
+          if (err instanceof Error && "code" in err && err.code === "ENOENT") {
+            return null;
+          }
+          throw err;
+        }
+      }
+      async delete(namespace, key, secureOverwrite = true) {
+        const filePath = this.entryPath(namespace, key);
+        try {
+          if (secureOverwrite) {
+            const fileStat = await stat(filePath);
+            const size = fileStat.size;
+            for (let pass = 0; pass < 3; pass++) {
+              const randomData = randomBytes(size);
+              await writeFile(filePath, randomData, { mode: 384 });
+            }
+          }
+          await unlink(filePath);
+          return true;
+        } catch (err) {
+          if (err instanceof Error && "code" in err && err.code === "ENOENT") {
+            return false;
+          }
+          throw err;
+        }
+      }
+      async list(namespace, prefix) {
+        const dirPath = this.namespacePath(namespace);
+        try {
+          const files = await readdir(dirPath);
+          const entries = [];
+          for (const file of files) {
+            if (!file.endsWith(".enc")) continue;
+            const key = file.slice(0, -4);
+            if (prefix && !key.startsWith(prefix)) continue;
+            const filePath = join(dirPath, file);
+            const fileStat = await stat(filePath);
+            entries.push({
+              key,
+              namespace,
+              size_bytes: fileStat.size,
+              modified_at: fileStat.mtime.toISOString()
+            });
+          }
+          return entries.sort((a, b) => a.key.localeCompare(b.key));
+        } catch (err) {
+          if (err instanceof Error && "code" in err && err.code === "ENOENT") {
+            return [];
+          }
+          throw err;
+        }
+      }
+      async exists(namespace, key) {
+        const filePath = this.entryPath(namespace, key);
+        try {
+          await stat(filePath);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+      async totalSize() {
+        let total = 0;
+        try {
+          const namespaces = await readdir(this.basePath);
+          for (const ns of namespaces) {
+            const nsPath = join(this.basePath, ns);
+            const nsStat = await stat(nsPath);
+            if (!nsStat.isDirectory()) continue;
+            const files = await readdir(nsPath);
+            for (const file of files) {
+              const filePath = join(nsPath, file);
+              const fileStat = await stat(filePath);
+              total += fileStat.size;
+            }
+          }
+        } catch {
+        }
+        return total;
+      }
+    };
+  }
+});
 
 // src/core/encoding.ts
 var encoding_exports = {};
@@ -76,6 +391,42 @@ function constantTimeEqual(a, b) {
 }
 var init_encoding = __esm({
   "src/core/encoding.ts"() {
+  }
+});
+function encrypt(plaintext, key, aad) {
+  if (key.length !== 32) {
+    throw new Error("Key must be exactly 32 bytes (256 bits)");
+  }
+  const iv = generateIV();
+  const cipher = gcm(key, iv, aad);
+  const ciphertext = cipher.encrypt(plaintext);
+  return {
+    v: 1,
+    alg: "aes-256-gcm",
+    iv: toBase64url(iv),
+    ct: toBase64url(ciphertext),
+    ts: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function decrypt(payload, key, aad) {
+  if (key.length !== 32) {
+    throw new Error("Key must be exactly 32 bytes (256 bits)");
+  }
+  if (payload.v !== 1) {
+    throw new Error(`Unsupported payload version: ${payload.v}`);
+  }
+  if (payload.alg !== "aes-256-gcm") {
+    throw new Error(`Unsupported algorithm: ${payload.alg}`);
+  }
+  const iv = fromBase64url(payload.iv);
+  const ciphertext = fromBase64url(payload.ct);
+  const cipher = gcm(key, iv, aad);
+  return cipher.decrypt(ciphertext);
+}
+var init_encryption = __esm({
+  "src/core/encryption.ts"() {
+    init_random();
+    init_encoding();
   }
 });
 
@@ -206,448 +557,6 @@ var init_hashing = __esm({
     init_encoding();
   }
 });
-var require2 = createRequire(import.meta.url);
-var { version: PKG_VERSION } = require2("../package.json");
-var SANCTUARY_VERSION = PKG_VERSION;
-function defaultConfig() {
-  return {
-    version: PKG_VERSION,
-    storage_path: join(homedir(), ".sanctuary"),
-    state: {
-      encryption: "aes-256-gcm",
-      key_protection: "none",
-      key_derivation: "argon2id",
-      integrity: "merkle-sha256",
-      identity_provider: "ed25519"
-    },
-    execution: {
-      environment: "local-process",
-      attestation: true,
-      resource_limits: {
-        max_memory_mb: 512,
-        max_storage_mb: 1024,
-        max_cpu_percent: 50
-      }
-    },
-    disclosure: {
-      proof_system: "commitment-only",
-      default_policy: "minimum-necessary"
-    },
-    reputation: {
-      mode: "self-custodied",
-      attestation_format: "eas-compatible",
-      export_format: "SANCTUARY_REP_V1",
-      service_endpoints: []
-    },
-    transport: "stdio",
-    http_port: 3500,
-    dashboard: {
-      enabled: false,
-      port: 3501,
-      host: "127.0.0.1"
-    },
-    webhook: {
-      enabled: false,
-      url: "",
-      secret: "",
-      callback_port: 3502,
-      callback_host: "127.0.0.1"
-    }
-  };
-}
-async function loadConfig(configPath) {
-  let config = defaultConfig();
-  const storagePath = process.env.SANCTUARY_STORAGE_PATH ?? config.storage_path;
-  const path = configPath ?? join(storagePath, "sanctuary.json");
-  try {
-    const raw = await readFile(path, "utf-8");
-    const fileConfig = JSON.parse(raw);
-    config = deepMerge(config, fileConfig);
-  } catch (err) {
-    if (err instanceof Error && err.message.includes("unimplemented features")) {
-      throw err;
-    }
-  }
-  if (process.env.SANCTUARY_STORAGE_PATH) {
-    config.storage_path = process.env.SANCTUARY_STORAGE_PATH;
-  }
-  if (process.env.SANCTUARY_TRANSPORT) {
-    config.transport = process.env.SANCTUARY_TRANSPORT;
-  }
-  if (process.env.SANCTUARY_HTTP_PORT) {
-    config.http_port = parseInt(process.env.SANCTUARY_HTTP_PORT, 10);
-  }
-  if (process.env.SANCTUARY_DASHBOARD_ENABLED === "true") {
-    config.dashboard.enabled = true;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_ENABLED === "false") {
-    config.dashboard.enabled = false;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_PORT) {
-    config.dashboard.port = parseInt(process.env.SANCTUARY_DASHBOARD_PORT, 10);
-  }
-  if (process.env.SANCTUARY_DASHBOARD_HOST) {
-    config.dashboard.host = process.env.SANCTUARY_DASHBOARD_HOST;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN) {
-    config.dashboard.auth_token = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_AUTO_OPEN === "true") {
-    config.dashboard.auto_open = true;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_AUTO_OPEN === "false") {
-    config.dashboard.auto_open = false;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_TLS_CERT && process.env.SANCTUARY_DASHBOARD_TLS_KEY) {
-    config.dashboard.tls = {
-      cert_path: process.env.SANCTUARY_DASHBOARD_TLS_CERT,
-      key_path: process.env.SANCTUARY_DASHBOARD_TLS_KEY
-    };
-  }
-  if (process.env.SANCTUARY_WEBHOOK_ENABLED === "true") {
-    config.webhook.enabled = true;
-  }
-  if (process.env.SANCTUARY_WEBHOOK_ENABLED === "false") {
-    config.webhook.enabled = false;
-  }
-  if (process.env.SANCTUARY_WEBHOOK_URL) {
-    config.webhook.url = process.env.SANCTUARY_WEBHOOK_URL;
-  }
-  if (process.env.SANCTUARY_WEBHOOK_SECRET) {
-    config.webhook.secret = process.env.SANCTUARY_WEBHOOK_SECRET;
-  }
-  if (process.env.SANCTUARY_WEBHOOK_CALLBACK_PORT) {
-    config.webhook.callback_port = parseInt(process.env.SANCTUARY_WEBHOOK_CALLBACK_PORT, 10);
-  }
-  if (process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST) {
-    config.webhook.callback_host = process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST;
-  }
-  config.version = PKG_VERSION;
-  validateConfig(config);
-  return config;
-}
-async function saveConfig(config, configPath) {
-  const path = join(config.storage_path, "sanctuary.json");
-  await writeFile(path, JSON.stringify(config, null, 2), { mode: 384 });
-}
-function validateConfig(config) {
-  const errors = [];
-  const implementedKeyProtection = /* @__PURE__ */ new Set(["passphrase", "none"]);
-  if (!implementedKeyProtection.has(config.state.key_protection)) {
-    errors.push(
-      `Unimplemented config value: state.key_protection = "${config.state.key_protection}". Only ${[...implementedKeyProtection].map((v) => `"${v}"`).join(", ")} are currently implemented. Using an unimplemented key protection mode would silently degrade security.`
-    );
-  }
-  const implementedEnvironment = /* @__PURE__ */ new Set(["local-process", "docker"]);
-  if (!implementedEnvironment.has(config.execution.environment)) {
-    errors.push(
-      `Unimplemented config value: execution.environment = "${config.execution.environment}". Only ${[...implementedEnvironment].map((v) => `"${v}"`).join(", ")} are currently implemented. Using an unimplemented environment would silently degrade security.`
-    );
-  }
-  const implementedProofSystem = /* @__PURE__ */ new Set(["commitment-only"]);
-  if (!implementedProofSystem.has(config.disclosure.proof_system)) {
-    errors.push(
-      `Unimplemented config value: disclosure.proof_system = "${config.disclosure.proof_system}". Only ${[...implementedProofSystem].map((v) => `"${v}"`).join(", ")} is currently implemented. Using an unimplemented proof system would silently degrade security.`
-    );
-  }
-  const implementedDisclosurePolicy = /* @__PURE__ */ new Set(["minimum-necessary"]);
-  if (!implementedDisclosurePolicy.has(config.disclosure.default_policy)) {
-    errors.push(
-      `Unimplemented config value: disclosure.default_policy = "${config.disclosure.default_policy}". Only ${[...implementedDisclosurePolicy].map((v) => `"${v}"`).join(", ")} is currently implemented. Using an unimplemented disclosure policy would silently skip disclosure controls.`
-    );
-  }
-  const implementedReputationMode = /* @__PURE__ */ new Set(["self-custodied"]);
-  if (!implementedReputationMode.has(config.reputation.mode)) {
-    errors.push(
-      `Unimplemented config value: reputation.mode = "${config.reputation.mode}". Only ${[...implementedReputationMode].map((v) => `"${v}"`).join(", ")} is currently implemented. Using an unimplemented reputation mode would silently skip reputation verification.`
-    );
-  }
-  if (errors.length > 0) {
-    throw new Error(
-      `Sanctuary configuration references unimplemented features:
-${errors.join("\n")}`
-    );
-  }
-}
-function deepMerge(base, override) {
-  const result = { ...base };
-  for (const [key, value] of Object.entries(override)) {
-    if (value !== null && typeof value === "object" && !Array.isArray(value) && typeof result[key] === "object" && result[key] !== null) {
-      result[key] = deepMerge(
-        result[key],
-        value
-      );
-    } else {
-      result[key] = value;
-    }
-  }
-  return result;
-}
-function randomBytes(length) {
-  if (length <= 0) {
-    throw new RangeError("Length must be positive");
-  }
-  const buf = randomBytes$1(length);
-  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-}
-function generateIV() {
-  return randomBytes(12);
-}
-function generateSalt() {
-  return randomBytes(32);
-}
-function generateRandomKey() {
-  return randomBytes(32);
-}
-
-// src/storage/filesystem.ts
-var FilesystemStorage = class {
-  basePath;
-  constructor(basePath) {
-    this.basePath = basePath;
-  }
-  entryPath(namespace, key) {
-    const safeNamespace = namespace.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const safeKey = key.replace(/[^a-zA-Z0-9_.-]/g, "_");
-    return join(this.basePath, safeNamespace, `${safeKey}.enc`);
-  }
-  namespacePath(namespace) {
-    const safeNamespace = namespace.replace(/[^a-zA-Z0-9_-]/g, "_");
-    return join(this.basePath, safeNamespace);
-  }
-  async write(namespace, key, data) {
-    const dirPath = this.namespacePath(namespace);
-    const filePath = this.entryPath(namespace, key);
-    await mkdir(dirPath, { recursive: true, mode: 448 });
-    await writeFile(filePath, data, { mode: 384 });
-  }
-  async read(namespace, key) {
-    const filePath = this.entryPath(namespace, key);
-    try {
-      const buf = await readFile(filePath);
-      return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-    } catch (err) {
-      if (err instanceof Error && "code" in err && err.code === "ENOENT") {
-        return null;
-      }
-      throw err;
-    }
-  }
-  async delete(namespace, key, secureOverwrite = true) {
-    const filePath = this.entryPath(namespace, key);
-    try {
-      if (secureOverwrite) {
-        const fileStat = await stat(filePath);
-        const size = fileStat.size;
-        for (let pass = 0; pass < 3; pass++) {
-          const randomData = randomBytes(size);
-          await writeFile(filePath, randomData, { mode: 384 });
-        }
-      }
-      await unlink(filePath);
-      return true;
-    } catch (err) {
-      if (err instanceof Error && "code" in err && err.code === "ENOENT") {
-        return false;
-      }
-      throw err;
-    }
-  }
-  async list(namespace, prefix) {
-    const dirPath = this.namespacePath(namespace);
-    try {
-      const files = await readdir(dirPath);
-      const entries = [];
-      for (const file of files) {
-        if (!file.endsWith(".enc")) continue;
-        const key = file.slice(0, -4);
-        if (prefix && !key.startsWith(prefix)) continue;
-        const filePath = join(dirPath, file);
-        const fileStat = await stat(filePath);
-        entries.push({
-          key,
-          namespace,
-          size_bytes: fileStat.size,
-          modified_at: fileStat.mtime.toISOString()
-        });
-      }
-      return entries.sort((a, b) => a.key.localeCompare(b.key));
-    } catch (err) {
-      if (err instanceof Error && "code" in err && err.code === "ENOENT") {
-        return [];
-      }
-      throw err;
-    }
-  }
-  async exists(namespace, key) {
-    const filePath = this.entryPath(namespace, key);
-    try {
-      await stat(filePath);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  async totalSize() {
-    let total = 0;
-    try {
-      const namespaces = await readdir(this.basePath);
-      for (const ns of namespaces) {
-        const nsPath = join(this.basePath, ns);
-        const nsStat = await stat(nsPath);
-        if (!nsStat.isDirectory()) continue;
-        const files = await readdir(nsPath);
-        for (const file of files) {
-          const filePath = join(nsPath, file);
-          const fileStat = await stat(filePath);
-          total += fileStat.size;
-        }
-      }
-    } catch {
-    }
-    return total;
-  }
-};
-init_encoding();
-function encrypt(plaintext, key, aad) {
-  if (key.length !== 32) {
-    throw new Error("Key must be exactly 32 bytes (256 bits)");
-  }
-  const iv = generateIV();
-  const cipher = gcm(key, iv, aad);
-  const ciphertext = cipher.encrypt(plaintext);
-  return {
-    v: 1,
-    alg: "aes-256-gcm",
-    iv: toBase64url(iv),
-    ct: toBase64url(ciphertext),
-    ts: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-function decrypt(payload, key, aad) {
-  if (key.length !== 32) {
-    throw new Error("Key must be exactly 32 bytes (256 bits)");
-  }
-  if (payload.v !== 1) {
-    throw new Error(`Unsupported payload version: ${payload.v}`);
-  }
-  if (payload.alg !== "aes-256-gcm") {
-    throw new Error(`Unsupported algorithm: ${payload.alg}`);
-  }
-  const iv = fromBase64url(payload.iv);
-  const ciphertext = fromBase64url(payload.ct);
-  const cipher = gcm(key, iv, aad);
-  return cipher.decrypt(ciphertext);
-}
-
-// src/l1-cognitive/state-store.ts
-init_hashing();
-
-// src/core/identity.ts
-init_encoding();
-init_hashing();
-function generateKeypair() {
-  const privateKey = randomBytes(32);
-  const publicKey = ed25519.getPublicKey(privateKey);
-  return { publicKey, privateKey };
-}
-function publicKeyToDid(publicKey) {
-  const multicodec = new Uint8Array([237, 1, ...publicKey]);
-  return `did:key:z${toBase64url(multicodec)}`;
-}
-function generateIdentityId(publicKey) {
-  const keyHash = hash(publicKey);
-  return Array.from(keyHash.slice(0, 16)).map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-function createIdentity(label, encryptionKey, keyProtection) {
-  const { publicKey, privateKey } = generateKeypair();
-  const identityId = generateIdentityId(publicKey);
-  const did = publicKeyToDid(publicKey);
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const encryptedPrivateKey = encrypt(privateKey, encryptionKey);
-  privateKey.fill(0);
-  const publicIdentity = {
-    identity_id: identityId,
-    label,
-    public_key: toBase64url(publicKey),
-    did,
-    created_at: now,
-    key_type: "ed25519",
-    key_protection: keyProtection
-  };
-  const storedIdentity = {
-    ...publicIdentity,
-    encrypted_private_key: encryptedPrivateKey,
-    rotation_history: []
-  };
-  return { publicIdentity, storedIdentity };
-}
-function sign(payload, encryptedPrivateKey, encryptionKey) {
-  const privateKey = decrypt(encryptedPrivateKey, encryptionKey);
-  try {
-    return ed25519.sign(payload, privateKey);
-  } finally {
-    privateKey.fill(0);
-  }
-}
-function verify(payload, signature, publicKey) {
-  try {
-    return ed25519.verify(signature, payload, publicKey);
-  } catch {
-    return false;
-  }
-}
-function rotateKeys(storedIdentity, encryptionKey, reason) {
-  const { publicKey: newPublicKey, privateKey: newPrivateKey } = generateKeypair();
-  const newIdentityDid = publicKeyToDid(newPublicKey);
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const eventData = JSON.stringify({
-    old_public_key: storedIdentity.public_key,
-    new_public_key: toBase64url(newPublicKey),
-    identity_id: storedIdentity.identity_id,
-    reason,
-    rotated_at: now
-  });
-  const eventBytes = new TextEncoder().encode(eventData);
-  const signature = sign(
-    eventBytes,
-    storedIdentity.encrypted_private_key,
-    encryptionKey
-  );
-  const rotationEvent = {
-    old_public_key: storedIdentity.public_key,
-    new_public_key: toBase64url(newPublicKey),
-    identity_id: storedIdentity.identity_id,
-    reason,
-    rotated_at: now,
-    signature: toBase64url(signature)
-  };
-  const encryptedNewPrivateKey = encrypt(newPrivateKey, encryptionKey);
-  newPrivateKey.fill(0);
-  const updatedIdentity = {
-    ...storedIdentity,
-    public_key: toBase64url(newPublicKey),
-    did: newIdentityDid,
-    encrypted_private_key: encryptedNewPrivateKey,
-    rotation_history: [
-      ...storedIdentity.rotation_history,
-      {
-        old_public_key: storedIdentity.public_key,
-        new_public_key: toBase64url(newPublicKey),
-        rotation_event: toBase64url(
-          new TextEncoder().encode(JSON.stringify(rotationEvent))
-        ),
-        rotated_at: now
-      }
-    ]
-  };
-  return { updatedIdentity, rotationEvent };
-}
-init_encoding();
-var ARGON2_MEMORY_COST = 65536;
-var ARGON2_TIME_COST = 3;
-var ARGON2_PARALLELISM = 4;
-var ARGON2_HASH_LENGTH = 32;
 async function deriveMasterKey(passphrase, existingParams) {
   const salt = existingParams ? fromBase64url(existingParams.salt) : generateSalt();
   const params = existingParams ?? {
@@ -700,2967 +609,119 @@ function derivePurposeKey(masterKey, purpose) {
     32
   );
 }
-
-// src/l1-cognitive/state-store.ts
-init_encoding();
-var RESERVED_NAMESPACE_PREFIXES = [
-  "_identities",
-  "_policies",
-  "_audit",
-  "_meta",
-  "_principal",
-  "_commitments",
-  "_reputation",
-  "_escrow",
-  "_guarantees",
-  "_bridge",
-  "_federation",
-  "_handshake",
-  "_shr"
-];
-var StateStore = class {
-  storage;
-  masterKey;
-  // Cache of version numbers per namespace/key for anti-rollback
-  versionCache = /* @__PURE__ */ new Map();
-  // Cache of content hashes per namespace for Merkle tree computation
-  contentHashes = /* @__PURE__ */ new Map();
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.masterKey = masterKey;
+var ARGON2_MEMORY_COST, ARGON2_TIME_COST, ARGON2_PARALLELISM, ARGON2_HASH_LENGTH;
+var init_key_derivation = __esm({
+  "src/core/key-derivation.ts"() {
+    init_random();
+    init_encoding();
+    ARGON2_MEMORY_COST = 65536;
+    ARGON2_TIME_COST = 3;
+    ARGON2_PARALLELISM = 4;
+    ARGON2_HASH_LENGTH = 32;
   }
-  versionKey(namespace, key) {
-    return `${namespace}/${key}`;
-  }
-  /**
-   * Get or initialize the content hash map for a namespace.
-   */
-  async getNamespaceHashes(namespace) {
-    if (this.contentHashes.has(namespace)) {
-      return this.contentHashes.get(namespace);
-    }
-    const entries = await this.storage.list(namespace);
-    const hashMap = /* @__PURE__ */ new Map();
-    for (const entry of entries) {
-      const raw = await this.storage.read(namespace, entry.key);
-      if (raw) {
-        try {
-          const stateEntry = JSON.parse(bytesToString(raw));
-          hashMap.set(entry.key, stateEntry.integrity_hash);
-          this.versionCache.set(
-            this.versionKey(namespace, entry.key),
-            stateEntry.ver
-          );
-        } catch {
-        }
-      }
-    }
-    this.contentHashes.set(namespace, hashMap);
-    return hashMap;
-  }
-  /**
-   * Write encrypted state.
-   *
-   * @param namespace - Logical grouping
-   * @param key - State key
-   * @param value - Plaintext value (will be encrypted)
-   * @param identityId - Identity performing the write
-   * @param encryptedPrivateKey - Identity's encrypted private key (for signing)
-   * @param identityEncryptionKey - Key to decrypt the identity's private key
-   * @param options - Optional metadata
-   */
-  async write(namespace, key, value, identityId, encryptedPrivateKey, identityEncryptionKey, options = {}) {
-    const namespaceKey = deriveNamespaceKey(this.masterKey, namespace);
-    const plaintext = stringToBytes(value);
-    const integrityHash = hashToString(plaintext);
-    const payload = encrypt(plaintext, namespaceKey);
-    const vk = this.versionKey(namespace, key);
-    const currentVersion = this.versionCache.get(vk) ?? 0;
-    const newVersion = currentVersion + 1;
-    const ciphertextBytes = fromBase64url(payload.ct);
-    const signature = sign(
-      ciphertextBytes,
-      encryptedPrivateKey,
-      identityEncryptionKey
-    );
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const stateEntry = {
-      v: 1,
-      payload,
-      ver: newVersion,
-      sig: toBase64url(signature),
-      kid: identityId,
-      integrity_hash: integrityHash,
-      metadata: {
-        content_type: options.content_type,
-        ttl_seconds: options.ttl_seconds,
-        tags: options.tags,
-        written_at: now
-      }
-    };
-    const serialized = stringToBytes(JSON.stringify(stateEntry));
-    await this.storage.write(namespace, key, serialized);
-    this.versionCache.set(vk, newVersion);
-    const nsHashes = await this.getNamespaceHashes(namespace);
-    nsHashes.set(key, integrityHash);
-    const merkleRoot = computeMerkleRoot(nsHashes);
-    return {
-      key,
-      namespace,
-      version: newVersion,
-      merkle_root: merkleRoot,
-      written_at: now,
-      size_bytes: serialized.length,
-      integrity_hash: integrityHash
-    };
-  }
-  /**
-   * Read and decrypt state.
-   *
-   * @param namespace - Logical grouping
-   * @param key - State key
-   * @param signerPublicKey - Expected signer's public key (for signature verification)
-   * @param verifyIntegrity - Whether to verify Merkle proof (default: true)
-   */
-  async read(namespace, key, signerPublicKey, verifyIntegrity = true) {
-    const raw = await this.storage.read(namespace, key);
-    if (!raw) return null;
-    let stateEntry;
-    try {
-      stateEntry = JSON.parse(bytesToString(raw));
-    } catch {
-      throw new Error(`Corrupted state entry: ${namespace}/${key}`);
-    }
-    if (stateEntry.v !== 1) {
-      throw new Error(`Unsupported state entry version: ${stateEntry.v}`);
-    }
-    const vk = this.versionKey(namespace, key);
-    const cachedVersion = this.versionCache.get(vk);
-    if (cachedVersion !== void 0 && stateEntry.ver < cachedVersion) {
-      throw new Error(
-        `Rollback detected for ${namespace}/${key}: found version ${stateEntry.ver}, expected >= ${cachedVersion}`
-      );
-    }
-    if (signerPublicKey) {
-      const ciphertextBytes = fromBase64url(stateEntry.payload.ct);
-      const signatureBytes = fromBase64url(stateEntry.sig);
-      const sigValid = verify(ciphertextBytes, signatureBytes, signerPublicKey);
-      if (!sigValid) {
-        throw new Error(
-          `Signature verification failed for ${namespace}/${key}`
-        );
-      }
-    }
-    const namespaceKey = deriveNamespaceKey(this.masterKey, namespace);
-    const plaintext = decrypt(stateEntry.payload, namespaceKey);
-    const value = bytesToString(plaintext);
-    const computedHash = hashToString(plaintext);
-    if (computedHash !== stateEntry.integrity_hash) {
-      throw new Error(
-        `Integrity hash mismatch for ${namespace}/${key}: computed ${computedHash}, stored ${stateEntry.integrity_hash}`
-      );
-    }
-    let merkleProofPath = [];
-    let integrityVerified = true;
-    if (verifyIntegrity) {
-      const nsHashes = await this.getNamespaceHashes(namespace);
-      const proof = generateMerkleProof(nsHashes, key);
-      if (proof) {
-        integrityVerified = verifyMerkleProof(proof);
-        merkleProofPath = proof.path.map(
-          (step) => `${step.position}:${step.hash}`
-        );
-      }
-    }
-    this.versionCache.set(vk, stateEntry.ver);
-    return {
-      key,
-      namespace,
-      value,
-      version: stateEntry.ver,
-      integrity_verified: integrityVerified,
-      merkle_proof: merkleProofPath,
-      written_at: stateEntry.metadata.written_at,
-      written_by: stateEntry.kid
-    };
-  }
-  /**
-   * List keys in a namespace (metadata only — no decryption).
-   */
-  async list(namespace, prefix, tags, limit = 100, offset = 0) {
-    const storageEntries = await this.storage.list(namespace, prefix);
-    const result = [];
-    for (const entry of storageEntries) {
-      const raw = await this.storage.read(namespace, entry.key);
-      if (!raw) continue;
-      try {
-        const stateEntry = JSON.parse(bytesToString(raw));
-        if (tags && tags.length > 0) {
-          const entryTags = stateEntry.metadata.tags ?? [];
-          const hasMatchingTag = tags.some((t) => entryTags.includes(t));
-          if (!hasMatchingTag) continue;
-        }
-        result.push({
-          key: entry.key,
-          version: stateEntry.ver,
-          size_bytes: entry.size_bytes,
-          written_at: stateEntry.metadata.written_at,
-          tags: stateEntry.metadata.tags ?? []
-        });
-      } catch {
-      }
-    }
-    const nsHashes = await this.getNamespaceHashes(namespace);
-    const merkleRoot = computeMerkleRoot(nsHashes);
-    return {
-      keys: result.slice(offset, offset + limit),
-      total: result.length,
-      merkle_root: merkleRoot
-    };
-  }
-  /**
-   * Securely delete state (overwrite with random bytes before removal).
-   */
-  async delete(namespace, key) {
-    const deleted = await this.storage.delete(namespace, key, true);
-    const vk = this.versionKey(namespace, key);
-    this.versionCache.delete(vk);
-    const nsHashes = await this.getNamespaceHashes(namespace);
-    nsHashes.delete(key);
-    const merkleRoot = computeMerkleRoot(nsHashes);
-    return {
-      deleted,
-      key,
-      namespace,
-      new_merkle_root: merkleRoot,
-      deleted_at: (/* @__PURE__ */ new Date()).toISOString()
-    };
-  }
-  /**
-   * Export all state for a namespace as an encrypted bundle.
-   */
-  async export(namespace) {
-    const namespacesToExport = [];
-    if (namespace) {
-      namespacesToExport.push(namespace);
-    } else {
-      for (const ns of this.contentHashes.keys()) {
-        namespacesToExport.push(ns);
-      }
-    }
-    const exportData = {};
-    let totalKeys = 0;
-    for (const ns of namespacesToExport) {
-      const entries = await this.storage.list(ns);
-      exportData[ns] = [];
-      for (const entry of entries) {
-        const raw = await this.storage.read(ns, entry.key);
-        if (!raw) continue;
-        try {
-          const stateEntry = JSON.parse(bytesToString(raw));
-          exportData[ns].push({ key: entry.key, entry: stateEntry });
-          totalKeys++;
-        } catch {
-        }
-      }
-    }
-    const bundleJson = JSON.stringify({
-      sanctuary_export_version: 1,
-      exported_at: (/* @__PURE__ */ new Date()).toISOString(),
-      namespaces: namespacesToExport,
-      data: exportData
-    });
-    const bundleBytes = stringToBytes(bundleJson);
-    const bundleHash = hashToString(bundleBytes);
-    return {
-      bundle: toBase64url(bundleBytes),
-      namespaces: namespacesToExport,
-      total_keys: totalKeys,
-      bundle_hash: bundleHash,
-      exported_at: (/* @__PURE__ */ new Date()).toISOString()
-    };
-  }
-  /**
-   * Import a previously exported state bundle.
-   */
-  async import(bundleBase64, conflictResolution = "skip", publicKeyResolver) {
-    const bundleBytes = fromBase64url(bundleBase64);
-    const bundleJson = bytesToString(bundleBytes);
-    const bundle = JSON.parse(bundleJson);
-    let importedKeys = 0;
-    let skippedKeys = 0;
-    let skippedInvalidSig = 0;
-    let skippedUnknownKid = 0;
-    let conflicts = 0;
-    const namespaces = [];
-    for (const [ns, entries] of Object.entries(
-      bundle.data
-    )) {
-      if (RESERVED_NAMESPACE_PREFIXES.some(
-        (prefix) => ns === prefix || ns.startsWith(prefix + "/")
-      )) {
-        skippedKeys += entries.length;
-        continue;
-      }
-      namespaces.push(ns);
-      for (const { key, entry } of entries) {
-        const signerPublicKey = publicKeyResolver(entry.kid);
-        if (!signerPublicKey) {
-          skippedUnknownKid++;
-          skippedKeys++;
-          continue;
-        }
-        try {
-          const ciphertextBytes = fromBase64url(entry.payload.ct);
-          const signatureBytes = fromBase64url(entry.sig);
-          const sigValid = verify(ciphertextBytes, signatureBytes, signerPublicKey);
-          if (!sigValid) {
-            skippedInvalidSig++;
-            skippedKeys++;
-            continue;
-          }
-        } catch {
-          skippedInvalidSig++;
-          skippedKeys++;
-          continue;
-        }
-        const exists = await this.storage.exists(ns, key);
-        if (exists) {
-          conflicts++;
-          if (conflictResolution === "skip") {
-            skippedKeys++;
-            continue;
-          }
-          if (conflictResolution === "version") {
-            const raw = await this.storage.read(ns, key);
-            if (raw) {
-              try {
-                const existingEntry = JSON.parse(
-                  bytesToString(raw)
-                );
-                if (entry.ver <= existingEntry.ver) {
-                  skippedKeys++;
-                  continue;
-                }
-              } catch {
-              }
-            }
-          }
-        }
-        const serialized = stringToBytes(JSON.stringify(entry));
-        await this.storage.write(ns, key, serialized);
-        importedKeys++;
-        const vk = this.versionKey(ns, key);
-        this.versionCache.set(vk, entry.ver);
-        const nsHashes = await this.getNamespaceHashes(ns);
-        nsHashes.set(key, entry.integrity_hash);
-      }
-    }
-    return {
-      imported_keys: importedKeys,
-      skipped_keys: skippedKeys,
-      skipped_invalid_sig: skippedInvalidSig,
-      skipped_unknown_kid: skippedUnknownKid,
-      conflicts,
-      namespaces,
-      imported_at: (/* @__PURE__ */ new Date()).toISOString()
-    };
-  }
-};
-var require3 = createRequire(import.meta.url);
-var { version: PKG_VERSION2 } = require3("../package.json");
-var MAX_STRING_BYTES = 1048576;
-var MAX_BUNDLE_BYTES = 5242880;
-var BUNDLE_FIELDS = /* @__PURE__ */ new Set(["bundle"]);
-function validateArgs(args, schema) {
-  const errors = [];
-  const properties = schema.properties ?? {};
-  const required = schema.required ?? [];
-  for (const field of required) {
-    if (args[field] === void 0 || args[field] === null) {
-      errors.push({ field, message: `Required field "${field}" is missing` });
-    }
-  }
-  const knownFields = new Set(Object.keys(properties));
-  for (const field of Object.keys(args)) {
-    if (!knownFields.has(field)) {
-      errors.push({ field, message: `Unknown field "${field}"` });
-    }
-  }
-  for (const [field, value] of Object.entries(args)) {
-    if (value === void 0 || value === null) continue;
-    const propSchema = properties[field];
-    if (!propSchema) continue;
-    const typeError = checkType(field, value, propSchema);
-    if (typeError) {
-      errors.push(typeError);
-      continue;
-    }
-    if (typeof value === "string") {
-      const maxBytes = BUNDLE_FIELDS.has(field) ? MAX_BUNDLE_BYTES : MAX_STRING_BYTES;
-      const byteLength = new TextEncoder().encode(value).length;
-      if (byteLength > maxBytes) {
-        errors.push({
-          field,
-          message: `Field "${field}" exceeds maximum size (${byteLength} bytes > ${maxBytes} bytes)`
-        });
-      }
-    }
-    if (propSchema.enum && !propSchema.enum.includes(value)) {
-      errors.push({
-        field,
-        message: `Field "${field}" must be one of: ${propSchema.enum.join(", ")}`
-      });
-    }
-  }
-  return errors;
-}
-function checkType(field, value, schema) {
-  if (!schema.type) return null;
-  switch (schema.type) {
-    case "string":
-      if (typeof value !== "string") {
-        return { field, message: `Expected string for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "number":
-      if (typeof value !== "number") {
-        return { field, message: `Expected number for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "boolean":
-      if (typeof value !== "boolean") {
-        return { field, message: `Expected boolean for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "object":
-      if (typeof value !== "object" || Array.isArray(value)) {
-        return { field, message: `Expected object for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "array":
-      if (!Array.isArray(value)) {
-        return { field, message: `Expected array for "${field}", got ${typeof value}` };
-      }
-      break;
-  }
-  return null;
-}
-function createServer(tools, options) {
-  const gate = options?.gate;
-  const server = new Server(
-    {
-      name: "sanctuary-mcp-server",
-      version: PKG_VERSION2
-    },
-    {
-      capabilities: {
-        tools: {}
-      }
-    }
-  );
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return {
-      tools: tools.map((t) => ({
-        name: t.name,
-        description: t.description,
-        inputSchema: t.inputSchema
-      }))
-    };
-  });
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
-    const typedArgs = args ?? {};
-    const tool = tools.find((t) => t.name === name);
-    if (!tool) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: `Unknown tool: ${name}` })
-          }
-        ],
-        isError: true
-      };
-    }
-    const validationErrors = validateArgs(typedArgs, tool.inputSchema);
-    if (validationErrors.length > 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: "validation_failed",
-              message: "Tool arguments failed schema validation",
-              violations: validationErrors
-            })
-          }
-        ],
-        isError: true
-      };
-    }
-    if (gate) {
-      const result = await gate.evaluate(name, typedArgs);
-      if (!result.allowed) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                error: "Operation not permitted",
-                approval_required: result.approval_required
-              })
-            }
-          ],
-          isError: true
-        };
-      }
-    }
-    try {
-      return await tool.handler(typedArgs);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown error";
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: message })
-          }
-        ],
-        isError: true
-      };
-    }
-  });
-  return server;
-}
-function toolResult(data) {
-  return {
-    content: [{ type: "text", text: JSON.stringify(data, null, 2) }]
-  };
-}
-
-// src/l1-cognitive/tools.ts
-init_encoding();
-init_encoding();
-var RESERVED_NAMESPACE_PREFIXES2 = [
-  "_identities",
-  "_policies",
-  "_audit",
-  "_meta",
-  "_principal",
-  "_commitments",
-  "_reputation",
-  "_escrow",
-  "_guarantees",
-  "_bridge",
-  "_federation",
-  "_handshake",
-  "_shr"
-];
-function getReservedNamespaceViolation(namespace) {
-  for (const prefix of RESERVED_NAMESPACE_PREFIXES2) {
-    if (namespace === prefix || namespace.startsWith(prefix + "/")) {
-      return prefix;
-    }
-  }
-  return null;
-}
-var IdentityManager = class {
-  storage;
-  masterKey;
-  identities = /* @__PURE__ */ new Map();
-  primaryIdentityId = null;
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.masterKey = masterKey;
-  }
-  get encryptionKey() {
-    return derivePurposeKey(this.masterKey, "identity-encryption");
-  }
-  /** Load identities from storage on startup */
-  async load() {
-    const entries = await this.storage.list("_identities");
-    for (const entry of entries) {
-      const raw = await this.storage.read("_identities", entry.key);
-      if (!raw) continue;
-      try {
-        const encrypted = JSON.parse(bytesToString(raw));
-        const decrypted = decrypt(encrypted, this.encryptionKey);
-        const identity = JSON.parse(bytesToString(decrypted));
-        this.identities.set(identity.identity_id, identity);
-        if (!this.primaryIdentityId) {
-          this.primaryIdentityId = identity.identity_id;
-        }
-      } catch {
-      }
-    }
-  }
-  /** Save an identity to storage */
-  async save(identity) {
-    const serialized = stringToBytes(JSON.stringify(identity));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_identities",
-      identity.identity_id,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-    this.identities.set(identity.identity_id, identity);
-    if (!this.primaryIdentityId) {
-      this.primaryIdentityId = identity.identity_id;
-    }
-  }
-  get(id) {
-    return this.identities.get(id);
-  }
-  getDefault() {
-    if (!this.primaryIdentityId) return void 0;
-    return this.identities.get(this.primaryIdentityId);
-  }
-  list() {
-    return Array.from(this.identities.values()).map((si) => ({
-      identity_id: si.identity_id,
-      label: si.label,
-      public_key: si.public_key,
-      did: si.did,
-      created_at: si.created_at,
-      key_type: si.key_type,
-      key_protection: si.key_protection
-    }));
-  }
-};
-function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) {
-  const identityMgr = new IdentityManager(storage, masterKey);
-  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
-  function resolveIdentity(identityId) {
-    const id = identityId ? identityMgr.get(identityId) : identityMgr.getDefault();
-    if (!id) {
-      throw new Error(
-        identityId ? `Identity not found: ${identityId}` : "No default identity. Create one with sanctuary/identity_create."
-      );
-    }
-    return id;
-  }
-  const tools = [
-    // ── Identity Tools ──────────────────────────────────────────────────
-    {
-      name: "sanctuary/identity_create",
-      description: "Create a new sovereign identity (Ed25519 keypair). The private key is encrypted and never exposed.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          label: {
-            type: "string",
-            description: 'Human-readable label (e.g., "my-agent")'
-          }
-        },
-        required: ["label"]
-      },
-      handler: async (args) => {
-        const label = args.label;
-        const { publicIdentity, storedIdentity } = createIdentity(
-          label,
-          identityEncKey,
-          keyProtection
-        );
-        await identityMgr.save(storedIdentity);
-        auditLog?.append("l1", "identity_create", publicIdentity.identity_id, {
-          label
-        });
-        return toolResult({
-          identity_id: publicIdentity.identity_id,
-          public_key: publicIdentity.public_key,
-          did: publicIdentity.did,
-          created_at: publicIdentity.created_at,
-          key_type: publicIdentity.key_type,
-          key_protection: publicIdentity.key_protection,
-          backed_up: false
-        });
-      }
-    },
-    {
-      name: "sanctuary/identity_list",
-      description: "List all managed sovereign identities.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          filter: {
-            type: "object",
-            properties: {
-              label: { type: "string" }
-            }
-          }
-        }
-      },
-      handler: async (args) => {
-        let identities = identityMgr.list();
-        const filter = args.filter;
-        if (filter?.label) {
-          identities = identities.filter(
-            (i) => i.label.includes(filter.label)
-          );
-        }
-        return toolResult({ identities });
-      }
-    },
-    {
-      name: "sanctuary/identity_sign",
-      description: "Sign data with a managed identity. The private key is decrypted in memory only during signing.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          identity_id: { type: "string" },
-          payload: {
-            type: "string",
-            description: "Base64url-encoded data to sign"
-          }
-        },
-        required: ["payload"]
-      },
-      handler: async (args) => {
-        const identity = resolveIdentity(args.identity_id);
-        const payloadStr = args.payload;
-        let payload;
-        try {
-          payload = fromBase64url(payloadStr);
-        } catch {
-          payload = stringToBytes(payloadStr);
-        }
-        const signature = sign(
-          payload,
-          identity.encrypted_private_key,
-          identityEncKey
-        );
-        auditLog?.append("l1", "identity_sign", identity.identity_id);
-        return toolResult({
-          signature: toBase64url(signature),
-          algorithm: "Ed25519",
-          signed_at: (/* @__PURE__ */ new Date()).toISOString(),
-          public_key: identity.public_key,
-          payload_encoding: "base64url"
-        });
-      }
-    },
-    {
-      name: "sanctuary/identity_verify",
-      description: "Verify an Ed25519 signature. Provide either identity_id or public_key.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          payload: {
-            type: "string",
-            description: "Original data (plain text or base64url-encoded)"
-          },
-          signature: { type: "string", description: "Base64url signature" },
-          identity_id: {
-            type: "string",
-            description: "Identity ID to look up public key (alternative to public_key)"
-          },
-          public_key: {
-            type: "string",
-            description: "Base64url public key (alternative to identity_id)"
-          }
-        },
-        required: ["payload", "signature"]
-      },
-      handler: async (args) => {
-        const payloadStr = args.payload;
-        let payload;
-        try {
-          payload = fromBase64url(payloadStr);
-        } catch {
-          payload = stringToBytes(payloadStr);
-        }
-        const signature = fromBase64url(args.signature);
-        let publicKey;
-        if (args.identity_id) {
-          const identity = resolveIdentity(args.identity_id);
-          publicKey = fromBase64url(identity.public_key);
-        } else if (args.public_key) {
-          publicKey = fromBase64url(args.public_key);
-        } else {
-          return toolResult({
-            error: "Provide either identity_id or public_key for verification."
-          });
-        }
-        const valid = verify(payload, signature, publicKey);
-        return toolResult({
-          valid,
-          verified_at: (/* @__PURE__ */ new Date()).toISOString()
-        });
-      }
-    },
-    {
-      name: "sanctuary/identity_rotate",
-      description: "Rotate keys for an identity. Generates a new keypair and signs a rotation event with the old key for verifiable chain.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          identity_id: { type: "string" },
-          reason: { type: "string" }
-        },
-        required: ["identity_id"]
-      },
-      handler: async (args) => {
-        const identity = resolveIdentity(args.identity_id);
-        const reason = args.reason ?? "Key rotation";
-        const { updatedIdentity, rotationEvent } = rotateKeys(
-          identity,
-          identityEncKey,
-          reason
-        );
-        await identityMgr.save(updatedIdentity);
-        auditLog?.append("l1", "identity_rotate", identity.identity_id, {
-          reason
-        });
-        return toolResult({
-          identity_id: updatedIdentity.identity_id,
-          old_public_key: rotationEvent.old_public_key,
-          new_public_key: rotationEvent.new_public_key,
-          new_did: updatedIdentity.did,
-          rotated_at: rotationEvent.rotated_at
-        });
-      }
-    },
-    // ── State Tools ─────────────────────────────────────────────────────
-    {
-      name: "sanctuary/state_write",
-      description: "Write encrypted state to the sovereign store. Value is encrypted with a namespace-specific key. The write is signed by the active identity.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          namespace: {
-            type: "string",
-            description: 'Logical grouping (e.g., "memory", "config")'
-          },
-          key: { type: "string", description: "State key within namespace" },
-          value: {
-            type: "string",
-            description: "Plaintext value (encrypted before storage)"
-          },
-          metadata: {
-            type: "object",
-            properties: {
-              content_type: { type: "string" },
-              ttl_seconds: { type: "number" },
-              tags: { type: "array", items: { type: "string" } }
-            }
-          },
-          identity_id: { type: "string" }
-        },
-        required: ["namespace", "key", "value"]
-      },
-      handler: async (args) => {
-        const reservedViolation = getReservedNamespaceViolation(args.namespace);
-        if (reservedViolation) {
-          return toolResult({
-            error: "namespace_reserved",
-            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Choose a different namespace.`
-          });
-        }
-        const identity = resolveIdentity(args.identity_id);
-        const metadata = args.metadata;
-        const result = await stateStore.write(
-          args.namespace,
-          args.key,
-          args.value,
-          identity.identity_id,
-          identity.encrypted_private_key,
-          identityEncKey,
-          {
-            content_type: metadata?.content_type,
-            ttl_seconds: metadata?.ttl_seconds,
-            tags: metadata?.tags
-          }
-        );
-        auditLog?.append("l1", "state_write", identity.identity_id, {
-          namespace: args.namespace,
-          key: args.key
-        });
-        return toolResult(result);
-      }
-    },
-    {
-      name: "sanctuary/state_read",
-      description: "Read and decrypt state from the sovereign store. Verifies integrity via Merkle proof and signature.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          namespace: { type: "string" },
-          key: { type: "string" },
-          verify_integrity: { type: "boolean", default: true }
-        },
-        required: ["namespace", "key"]
-      },
-      handler: async (args) => {
-        const reservedViolation = getReservedNamespaceViolation(args.namespace);
-        if (reservedViolation) {
-          return toolResult({
-            error: "namespace_reserved",
-            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot read from reserved namespaces.`
-          });
-        }
-        const result = await stateStore.read(
-          args.namespace,
-          args.key,
-          void 0,
-          // Skip signature verification for now (would need writer's pubkey)
-          args.verify_integrity ?? true
-        );
-        if (!result) {
-          return toolResult({
-            error: "not_found",
-            namespace: args.namespace,
-            key: args.key
-          });
-        }
-        auditLog?.append("l1", "state_read", result.written_by, {
-          namespace: args.namespace,
-          key: args.key
-        });
-        return toolResult(result);
-      }
-    },
-    {
-      name: "sanctuary/state_list",
-      description: "List keys in a namespace (metadata only \u2014 no decryption).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          namespace: { type: "string" },
-          prefix: { type: "string" },
-          tags: { type: "array", items: { type: "string" } },
-          limit: { type: "number", default: 100 },
-          offset: { type: "number", default: 0 }
-        },
-        required: ["namespace"]
-      },
-      handler: async (args) => {
-        const reservedViolation = getReservedNamespaceViolation(args.namespace);
-        if (reservedViolation) {
-          return toolResult({
-            error: "namespace_reserved",
-            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot list reserved namespaces.`
-          });
-        }
-        const result = await stateStore.list(
-          args.namespace,
-          args.prefix,
-          args.tags,
-          args.limit ?? 100,
-          args.offset ?? 0
-        );
-        return toolResult(result);
-      }
-    },
-    {
-      name: "sanctuary/state_delete",
-      description: "Securely delete state. Overwrites file with random bytes before removal (right to deletion, S1.6).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          namespace: { type: "string" },
-          key: { type: "string" },
-          reason: { type: "string" }
-        },
-        required: ["namespace", "key"]
-      },
-      handler: async (args) => {
-        const reservedViolation = getReservedNamespaceViolation(args.namespace);
-        if (reservedViolation) {
-          return toolResult({
-            error: "namespace_reserved",
-            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot delete from reserved namespaces.`
-          });
-        }
-        const result = await stateStore.delete(
-          args.namespace,
-          args.key
-        );
-        auditLog?.append("l1", "state_delete", "principal", {
-          namespace: args.namespace,
-          key: args.key,
-          reason: args.reason
-        });
-        return toolResult(result);
-      }
-    },
-    {
-      name: "sanctuary/state_export",
-      description: "Export state as an encrypted, portable bundle for migration.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          namespace: { type: "string" },
-          format: { type: "string", default: "sanctuary-v1" }
-        }
-      },
-      handler: async (args) => {
-        const result = await stateStore.export(
-          args.namespace
-        );
-        auditLog?.append("l1", "state_export", "principal", {
-          namespaces: result.namespaces
-        });
-        return toolResult(result);
-      }
-    },
-    {
-      name: "sanctuary/state_import",
-      description: "Import a previously exported state bundle.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          bundle: { type: "string", description: "Base64url-encoded bundle" },
-          conflict_resolution: {
-            type: "string",
-            enum: ["skip", "overwrite", "version"],
-            default: "skip"
-          }
-        },
-        required: ["bundle"]
-      },
-      handler: async (args) => {
-        const publicKeyResolver = (kid) => {
-          const identity = identityMgr.get(kid);
-          if (!identity) return null;
-          return fromBase64url(identity.public_key);
-        };
-        const result = await stateStore.import(
-          args.bundle,
-          args.conflict_resolution ?? "skip",
-          publicKeyResolver
-        );
-        auditLog?.append("l1", "state_import", "principal", {
-          imported_keys: result.imported_keys
-        });
-        return toolResult(result);
-      }
-    }
-  ];
-  return { tools, identityManager: identityMgr };
-}
+});
 
 // src/l2-operational/audit-log.ts
-init_encoding();
-var AuditLog = class {
-  storage;
-  encryptionKey;
-  entries = [];
-  counter = 0;
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.encryptionKey = derivePurposeKey(masterKey, "audit-log");
-  }
-  /**
-   * Append an audit entry.
-   */
-  append(layer, operation, identityId, details, result = "success") {
-    const entry = {
-      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-      layer,
-      operation,
-      identity_id: identityId,
-      result,
-      details
-    };
-    this.entries.push(entry);
-    this.persistEntry(entry).catch(() => {
-    });
-  }
-  async persistEntry(entry) {
-    const key = `${Date.now()}-${this.counter++}`;
-    const serialized = stringToBytes(JSON.stringify(entry));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_audit",
-      key,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-  }
-  /**
-   * Query the audit log with filtering.
-   */
-  async query(options) {
-    await this.loadPersistedEntries();
-    let filtered = this.entries;
-    if (options.since) {
-      const sinceDate = new Date(options.since);
-      filtered = filtered.filter(
-        (e) => new Date(e.timestamp) >= sinceDate
-      );
-    }
-    if (options.layer) {
-      filtered = filtered.filter((e) => e.layer === options.layer);
-    }
-    if (options.operation_type) {
-      filtered = filtered.filter(
-        (e) => e.operation === options.operation_type
-      );
-    }
-    const total = filtered.length;
-    const limit = options.limit ?? 50;
-    const entries = filtered.slice(-limit);
-    return { entries, total };
-  }
-  async loadPersistedEntries() {
-    try {
-      const storedEntries = await this.storage.list("_audit");
-      for (const meta of storedEntries) {
-        const raw = await this.storage.read("_audit", meta.key);
-        if (!raw) continue;
-        try {
-          const encrypted = JSON.parse(bytesToString(raw));
-          const decrypted = decrypt(encrypted, this.encryptionKey);
-          const entry = JSON.parse(bytesToString(decrypted));
-          const isDuplicate = this.entries.some(
-            (e) => e.timestamp === entry.timestamp && e.operation === entry.operation && e.identity_id === entry.identity_id
+var AuditLog;
+var init_audit_log = __esm({
+  "src/l2-operational/audit-log.ts"() {
+    init_encryption();
+    init_key_derivation();
+    init_encoding();
+    AuditLog = class {
+      storage;
+      encryptionKey;
+      entries = [];
+      counter = 0;
+      constructor(storage, masterKey) {
+        this.storage = storage;
+        this.encryptionKey = derivePurposeKey(masterKey, "audit-log");
+      }
+      /**
+       * Append an audit entry.
+       */
+      append(layer, operation, identityId, details, result = "success") {
+        const entry = {
+          timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+          layer,
+          operation,
+          identity_id: identityId,
+          result,
+          details
+        };
+        this.entries.push(entry);
+        this.persistEntry(entry).catch(() => {
+        });
+      }
+      async persistEntry(entry) {
+        const key = `${Date.now()}-${this.counter++}`;
+        const serialized = stringToBytes(JSON.stringify(entry));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          "_audit",
+          key,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+      }
+      /**
+       * Query the audit log with filtering.
+       */
+      async query(options) {
+        await this.loadPersistedEntries();
+        let filtered = this.entries;
+        if (options.since) {
+          const sinceDate = new Date(options.since);
+          filtered = filtered.filter(
+            (e) => new Date(e.timestamp) >= sinceDate
           );
-          if (!isDuplicate) {
-            this.entries.push(entry);
-          }
-        } catch {
         }
+        if (options.layer) {
+          filtered = filtered.filter((e) => e.layer === options.layer);
+        }
+        if (options.operation_type) {
+          filtered = filtered.filter(
+            (e) => e.operation === options.operation_type
+          );
+        }
+        const total = filtered.length;
+        const limit = options.limit ?? 50;
+        const entries = filtered.slice(-limit);
+        return { entries, total };
       }
-      this.entries.sort(
-        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-      );
-    } catch {
-    }
-  }
-  /**
-   * Get total number of entries.
-   */
-  get size() {
-    return this.entries.length;
-  }
-};
-
-// src/l3-disclosure/commitments.ts
-init_hashing();
-init_encoding();
-init_encoding();
-function createCommitment(value, blindingFactor) {
-  const blindingBytes = blindingFactor ? fromBase64url(blindingFactor) : randomBytes(32);
-  const valueBytes = stringToBytes(value);
-  const combined = concatBytes(valueBytes, blindingBytes);
-  const commitmentHash = hash(combined);
-  return {
-    commitment: toBase64url(commitmentHash),
-    blinding_factor: toBase64url(blindingBytes),
-    committed_at: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-function verifyCommitment(commitment, value, blindingFactor) {
-  const blindingBytes = fromBase64url(blindingFactor);
-  const valueBytes = stringToBytes(value);
-  const combined = concatBytes(valueBytes, blindingBytes);
-  const expectedHash = toBase64url(hash(combined));
-  return commitment === expectedHash;
-}
-var CommitmentStore = class {
-  storage;
-  encryptionKey;
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.encryptionKey = derivePurposeKey(masterKey, "l3-commitments");
-  }
-  /**
-   * Store a commitment (encrypted) for later reference.
-   */
-  async store(commitment, value) {
-    const id = `cmt-${Date.now()}-${toBase64url(randomBytes(8))}`;
-    const stored = {
-      commitment: commitment.commitment,
-      blinding_factor: commitment.blinding_factor,
-      value,
-      committed_at: commitment.committed_at,
-      revealed: false
-    };
-    const serialized = stringToBytes(JSON.stringify(stored));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_commitments",
-      id,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-    return id;
-  }
-  /**
-   * Retrieve a stored commitment by ID.
-   */
-  async get(id) {
-    const raw = await this.storage.read("_commitments", id);
-    if (!raw) return null;
-    try {
-      const encrypted = JSON.parse(bytesToString(raw));
-      const decrypted = decrypt(encrypted, this.encryptionKey);
-      return JSON.parse(bytesToString(decrypted));
-    } catch {
-      return null;
-    }
-  }
-  /**
-   * Mark a commitment as revealed.
-   */
-  async markRevealed(id) {
-    const stored = await this.get(id);
-    if (!stored) return;
-    stored.revealed = true;
-    stored.revealed_at = (/* @__PURE__ */ new Date()).toISOString();
-    const serialized = stringToBytes(JSON.stringify(stored));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_commitments",
-      id,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-  }
-};
-
-// src/l3-disclosure/policies.ts
-init_encoding();
-function evaluateDisclosure(policy, context, requestedFields) {
-  return requestedFields.map((field) => {
-    const exactRule = policy.rules.find((r) => r.context === context);
-    const wildcardRule = policy.rules.find((r) => r.context === "*");
-    const matchedRule = exactRule ?? wildcardRule;
-    if (!matchedRule) {
-      return {
-        field,
-        action: policy.default_action,
-        reason: `No rule matches context "${context}"`,
-        applicable_rule: "default"
-      };
-    }
-    const ruleName = `${matchedRule.context}`;
-    if (matchedRule.withhold.includes(field)) {
-      return {
-        field,
-        action: "withhold",
-        reason: `Field "${field}" is explicitly withheld in ${ruleName} context`,
-        applicable_rule: ruleName
-      };
-    }
-    if (matchedRule.proof_required.includes(field)) {
-      return {
-        field,
-        action: "proof",
-        reason: `Field "${field}" requires cryptographic proof in ${ruleName} context`,
-        applicable_rule: ruleName
-      };
-    }
-    if (matchedRule.disclose.includes(field)) {
-      return {
-        field,
-        action: "disclose",
-        reason: `Field "${field}" is permitted for disclosure in ${ruleName} context`,
-        applicable_rule: ruleName
-      };
-    }
-    return {
-      field,
-      action: policy.default_action,
-      reason: `Field "${field}" not addressed in ${ruleName} rule; applying default`,
-      applicable_rule: ruleName
-    };
-  });
-}
-var PolicyStore = class {
-  storage;
-  encryptionKey;
-  policies = /* @__PURE__ */ new Map();
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.encryptionKey = derivePurposeKey(masterKey, "l3-policies");
-  }
-  /**
-   * Create and store a new disclosure policy.
-   */
-  async create(policyName, rules, defaultAction, identityId) {
-    const policyId = `pol-${Date.now()}-${toBase64url(randomBytes(8))}`;
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const policy = {
-      policy_id: policyId,
-      policy_name: policyName,
-      rules,
-      default_action: defaultAction,
-      identity_id: identityId,
-      created_at: now,
-      updated_at: now
-    };
-    await this.persist(policy);
-    this.policies.set(policyId, policy);
-    return policy;
-  }
-  /**
-   * Get a policy by ID.
-   */
-  async get(policyId) {
-    if (this.policies.has(policyId)) {
-      return this.policies.get(policyId);
-    }
-    const raw = await this.storage.read("_policies", policyId);
-    if (!raw) return null;
-    try {
-      const encrypted = JSON.parse(bytesToString(raw));
-      const decrypted = decrypt(encrypted, this.encryptionKey);
-      const policy = JSON.parse(bytesToString(decrypted));
-      this.policies.set(policyId, policy);
-      return policy;
-    } catch {
-      return null;
-    }
-  }
-  /**
-   * List all policies.
-   */
-  async list() {
-    await this.loadAll();
-    return Array.from(this.policies.values());
-  }
-  /**
-   * Load all persisted policies into memory.
-   */
-  async loadAll() {
-    try {
-      const entries = await this.storage.list("_policies");
-      for (const meta of entries) {
-        if (this.policies.has(meta.key)) continue;
-        const raw = await this.storage.read("_policies", meta.key);
-        if (!raw) continue;
+      async loadPersistedEntries() {
         try {
-          const encrypted = JSON.parse(bytesToString(raw));
-          const decrypted = decrypt(encrypted, this.encryptionKey);
-          const policy = JSON.parse(bytesToString(decrypted));
-          this.policies.set(policy.policy_id, policy);
-        } catch {
-        }
-      }
-    } catch {
-    }
-  }
-  async persist(policy) {
-    const serialized = stringToBytes(JSON.stringify(policy));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_policies",
-      policy.policy_id,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-  }
-};
-init_encoding();
-var G = RistrettoPoint.BASE;
-var H_INPUT = concatBytes(
-  sha256(stringToBytes("sanctuary-pedersen-generator-H-v1-a")),
-  sha256(stringToBytes("sanctuary-pedersen-generator-H-v1-b"))
-);
-var H = RistrettoPoint.hashToCurve(H_INPUT);
-function bigintToBytes(n) {
-  const hex = n.toString(16).padStart(64, "0");
-  const bytes = new Uint8Array(32);
-  for (let i = 0; i < 32; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
-function bytesToBigint(bytes) {
-  let hex = "";
-  for (const b of bytes) {
-    hex += b.toString(16).padStart(2, "0");
-  }
-  return BigInt("0x" + hex);
-}
-var ORDER = BigInt("7237005577332262213973186563042994240857116359379907606001950938285454250989");
-function mod(n) {
-  return (n % ORDER + ORDER) % ORDER;
-}
-function safeMultiply(point, scalar) {
-  const s = mod(scalar);
-  if (s === 0n) return RistrettoPoint.ZERO;
-  return point.multiply(s);
-}
-function randomScalar() {
-  const bytes = randomBytes(64);
-  return mod(bytesToBigint(bytes));
-}
-function fiatShamirChallenge(domain, ...points) {
-  const domainBytes = stringToBytes(domain);
-  const combined = concatBytes(domainBytes, ...points);
-  const hash2 = sha256(combined);
-  return mod(bytesToBigint(hash2));
-}
-function createPedersenCommitment(value) {
-  const v = mod(BigInt(value));
-  const b = randomScalar();
-  const C = safeMultiply(G, v).add(safeMultiply(H, b));
-  return {
-    commitment: toBase64url(C.toRawBytes()),
-    blinding_factor: toBase64url(bigintToBytes(b)),
-    committed_at: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-function verifyPedersenCommitment(commitment, value, blindingFactor) {
-  try {
-    const C = RistrettoPoint.fromHex(fromBase64url(commitment));
-    const v = mod(BigInt(value));
-    const b = bytesToBigint(fromBase64url(blindingFactor));
-    const expected = safeMultiply(G, v).add(safeMultiply(H, b));
-    return C.equals(expected);
-  } catch {
-    return false;
-  }
-}
-function createProofOfKnowledge(value, blindingFactor, commitment) {
-  const v = mod(BigInt(value));
-  const b = bytesToBigint(fromBase64url(blindingFactor));
-  const r_v = randomScalar();
-  const r_b = randomScalar();
-  const R = safeMultiply(G, r_v).add(safeMultiply(H, r_b));
-  const C_bytes = fromBase64url(commitment);
-  const R_bytes = R.toRawBytes();
-  const e = fiatShamirChallenge("sanctuary-zk-pok-v1", C_bytes, R_bytes);
-  const s_v = mod(r_v + e * v);
-  const s_b = mod(r_b + e * b);
-  return {
-    type: "schnorr-pedersen-ristretto255",
-    commitment,
-    announcement: toBase64url(R_bytes),
-    response_v: toBase64url(bigintToBytes(s_v)),
-    response_b: toBase64url(bigintToBytes(s_b)),
-    generated_at: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-function verifyProofOfKnowledge(proof) {
-  try {
-    const C = RistrettoPoint.fromHex(fromBase64url(proof.commitment));
-    const R = RistrettoPoint.fromHex(fromBase64url(proof.announcement));
-    const s_v = bytesToBigint(fromBase64url(proof.response_v));
-    const s_b = bytesToBigint(fromBase64url(proof.response_b));
-    const e = fiatShamirChallenge(
-      "sanctuary-zk-pok-v1",
-      fromBase64url(proof.commitment),
-      fromBase64url(proof.announcement)
-    );
-    const lhs = safeMultiply(G, s_v).add(safeMultiply(H, s_b));
-    const rhs = R.add(safeMultiply(C, e));
-    return lhs.equals(rhs);
-  } catch {
-    return false;
-  }
-}
-function createRangeProof(value, blindingFactor, commitment, min, max) {
-  if (value < min || value > max) {
-    return { error: `Value ${value} is not in range [${min}, ${max}]` };
-  }
-  const range = max - min;
-  const numBits = Math.ceil(Math.log2(range + 1));
-  const shifted = value - min;
-  const b = bytesToBigint(fromBase64url(blindingFactor));
-  const bits = [];
-  for (let i = 0; i < numBits; i++) {
-    bits.push(shifted >> i & 1);
-  }
-  const bitBlindings = [];
-  const bitCommitments = [];
-  const bitProofs = [];
-  for (let i = 0; i < numBits; i++) {
-    const bit_b = randomScalar();
-    bitBlindings.push(bit_b);
-    const C_i = safeMultiply(G, mod(BigInt(bits[i]))).add(safeMultiply(H, bit_b));
-    bitCommitments.push(toBase64url(C_i.toRawBytes()));
-    const bitProof = createBitProof(bits[i], bit_b, C_i);
-    bitProofs.push(bitProof);
-  }
-  const sumBlinding = bitBlindings.reduce(
-    (acc, bi, i) => mod(acc + mod(BigInt(1) << BigInt(i)) * bi),
-    0n
-  );
-  const blindingDiff = mod(b - sumBlinding);
-  const r_sum = randomScalar();
-  const R_sum = safeMultiply(H, r_sum);
-  const e_sum = fiatShamirChallenge(
-    "sanctuary-zk-range-sum-v1",
-    fromBase64url(commitment),
-    R_sum.toRawBytes()
-  );
-  const s_sum = mod(r_sum + e_sum * blindingDiff);
-  return {
-    type: "range-pedersen-ristretto255",
-    commitment,
-    min,
-    max,
-    bit_commitments: bitCommitments,
-    bit_proofs: bitProofs,
-    sum_proof: {
-      announcement: toBase64url(R_sum.toRawBytes()),
-      response: toBase64url(bigintToBytes(s_sum))
-    },
-    generated_at: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-function verifyRangeProof(proof) {
-  try {
-    const C = RistrettoPoint.fromHex(fromBase64url(proof.commitment));
-    const range = proof.max - proof.min;
-    const numBits = Math.ceil(Math.log2(range + 1));
-    if (proof.bit_commitments.length !== numBits) return false;
-    if (proof.bit_proofs.length !== numBits) return false;
-    for (let i = 0; i < numBits; i++) {
-      const C_i = RistrettoPoint.fromHex(fromBase64url(proof.bit_commitments[i]));
-      if (!verifyBitProof(proof.bit_proofs[i], C_i)) {
-        return false;
-      }
-    }
-    let reconstructed = RistrettoPoint.ZERO;
-    for (let i = 0; i < numBits; i++) {
-      const C_i = RistrettoPoint.fromHex(fromBase64url(proof.bit_commitments[i]));
-      const weight = mod(BigInt(1) << BigInt(i));
-      reconstructed = reconstructed.add(safeMultiply(C_i, weight));
-    }
-    const diff = C.subtract(safeMultiply(G, mod(BigInt(proof.min)))).subtract(reconstructed);
-    const R_sum = RistrettoPoint.fromHex(fromBase64url(proof.sum_proof.announcement));
-    const s_sum = bytesToBigint(fromBase64url(proof.sum_proof.response));
-    const e_sum = fiatShamirChallenge(
-      "sanctuary-zk-range-sum-v1",
-      fromBase64url(proof.commitment),
-      fromBase64url(proof.sum_proof.announcement)
-    );
-    const lhs = safeMultiply(H, s_sum);
-    const rhs = R_sum.add(safeMultiply(diff, e_sum));
-    return lhs.equals(rhs);
-  } catch {
-    return false;
-  }
-}
-function createBitProof(bit, blinding, commitment) {
-  const C_bytes = commitment.toRawBytes();
-  if (bit === 0) {
-    const C_minus_G = commitment.subtract(G);
-    const e_1 = randomScalar();
-    const s_1 = randomScalar();
-    const R_1 = safeMultiply(H, s_1).subtract(safeMultiply(C_minus_G, e_1));
-    const r_0 = randomScalar();
-    const R_0 = safeMultiply(H, r_0);
-    const e = fiatShamirChallenge(
-      "sanctuary-zk-bit-v1",
-      C_bytes,
-      R_0.toRawBytes(),
-      R_1.toRawBytes()
-    );
-    const e_0 = mod(e - e_1);
-    const s_0 = mod(r_0 + e_0 * blinding);
-    return {
-      announcement_0: toBase64url(R_0.toRawBytes()),
-      announcement_1: toBase64url(R_1.toRawBytes()),
-      challenge_0: toBase64url(bigintToBytes(e_0)),
-      challenge_1: toBase64url(bigintToBytes(e_1)),
-      response_0: toBase64url(bigintToBytes(s_0)),
-      response_1: toBase64url(bigintToBytes(s_1))
-    };
-  } else {
-    const e_0 = randomScalar();
-    const s_0 = randomScalar();
-    const R_0 = safeMultiply(H, s_0).subtract(safeMultiply(commitment, e_0));
-    const r_1 = randomScalar();
-    const R_1 = safeMultiply(H, r_1);
-    const e = fiatShamirChallenge(
-      "sanctuary-zk-bit-v1",
-      C_bytes,
-      R_0.toRawBytes(),
-      R_1.toRawBytes()
-    );
-    const e_1 = mod(e - e_0);
-    const s_1 = mod(r_1 + e_1 * blinding);
-    return {
-      announcement_0: toBase64url(R_0.toRawBytes()),
-      announcement_1: toBase64url(R_1.toRawBytes()),
-      challenge_0: toBase64url(bigintToBytes(e_0)),
-      challenge_1: toBase64url(bigintToBytes(e_1)),
-      response_0: toBase64url(bigintToBytes(s_0)),
-      response_1: toBase64url(bigintToBytes(s_1))
-    };
-  }
-}
-function verifyBitProof(proof, commitment) {
-  try {
-    const C_bytes = commitment.toRawBytes();
-    const R_0 = RistrettoPoint.fromHex(fromBase64url(proof.announcement_0));
-    const R_1 = RistrettoPoint.fromHex(fromBase64url(proof.announcement_1));
-    const e_0 = bytesToBigint(fromBase64url(proof.challenge_0));
-    const e_1 = bytesToBigint(fromBase64url(proof.challenge_1));
-    const s_0 = bytesToBigint(fromBase64url(proof.response_0));
-    const s_1 = bytesToBigint(fromBase64url(proof.response_1));
-    const e = fiatShamirChallenge(
-      "sanctuary-zk-bit-v1",
-      C_bytes,
-      R_0.toRawBytes(),
-      R_1.toRawBytes()
-    );
-    if (mod(e_0 + e_1) !== e) return false;
-    const lhs_0 = safeMultiply(H, s_0);
-    const rhs_0 = R_0.add(safeMultiply(commitment, e_0));
-    if (!lhs_0.equals(rhs_0)) return false;
-    const C_minus_G = commitment.subtract(G);
-    const lhs_1 = safeMultiply(H, s_1);
-    const rhs_1 = R_1.add(safeMultiply(C_minus_G, e_1));
-    if (!lhs_1.equals(rhs_1)) return false;
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// src/l3-disclosure/tools.ts
-function createL3Tools(storage, masterKey, auditLog) {
-  const commitmentStore = new CommitmentStore(storage, masterKey);
-  const policyStore = new PolicyStore(storage, masterKey);
-  const tools = [
-    // ─── Commitment Schemes ───────────────────────────────────────────────
-    {
-      name: "sanctuary/proof_commitment",
-      description: "Create a cryptographic commitment to a value. The commitment hides the value until you choose to reveal it. Returns the commitment hash and a blinding factor (store securely).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          value: {
-            type: "string",
-            description: "The value to commit to"
-          },
-          blinding_factor: {
-            type: "string",
-            description: "Optional base64url blinding factor (auto-generated if omitted)"
-          }
-        },
-        required: ["value"]
-      },
-      handler: async (args) => {
-        const value = args.value;
-        const blindingFactor = args.blinding_factor;
-        const commitment = createCommitment(value, blindingFactor);
-        const commitmentId = await commitmentStore.store(commitment, value);
-        auditLog.append("l3", "proof_commitment", "system", {
-          commitment_id: commitmentId,
-          commitment_hash: commitment.commitment
-        });
-        return toolResult({
-          commitment_id: commitmentId,
-          commitment: commitment.commitment,
-          blinding_factor: commitment.blinding_factor,
-          committed_at: commitment.committed_at,
-          note: "Store the blinding_factor securely. You will need it to reveal the committed value."
-        });
-      }
-    },
-    {
-      name: "sanctuary/proof_reveal",
-      description: "Verify a previously committed value by revealing it with the blinding factor. Returns whether the revealed value matches the commitment.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          commitment: {
-            type: "string",
-            description: "The original commitment hash"
-          },
-          value: {
-            type: "string",
-            description: "The value being revealed"
-          },
-          blinding_factor: {
-            type: "string",
-            description: "The blinding factor from the original commitment"
-          }
-        },
-        required: ["commitment", "value", "blinding_factor"]
-      },
-      handler: async (args) => {
-        const commitment = args.commitment;
-        const value = args.value;
-        const blindingFactor = args.blinding_factor;
-        const valid = verifyCommitment(commitment, value, blindingFactor);
-        auditLog.append("l3", "proof_reveal", "system", {
-          commitment_hash: commitment,
-          valid
-        });
-        return toolResult({
-          valid,
-          commitment,
-          revealed_at: (/* @__PURE__ */ new Date()).toISOString()
-        });
-      }
-    },
-    // ─── Disclosure Policies ──────────────────────────────────────────────
-    {
-      name: "sanctuary/disclosure_set_policy",
-      description: "Define a disclosure policy that controls what an agent will and will not disclose in different interaction contexts. Rules specify which fields may be disclosed, which must be withheld, and which require cryptographic proof.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          policy_name: {
-            type: "string",
-            description: "Human-readable policy name"
-          },
-          rules: {
-            type: "array",
-            description: "Disclosure rules for different contexts",
-            items: {
-              type: "object",
-              properties: {
-                context: {
-                  type: "string",
-                  description: 'Interaction context: "negotiation", "commerce", "identity", "*" (wildcard)'
-                },
-                disclose: {
-                  type: "array",
-                  items: { type: "string" },
-                  description: "Fields the agent MAY disclose"
-                },
-                withhold: {
-                  type: "array",
-                  items: { type: "string" },
-                  description: "Fields the agent MUST NOT disclose"
-                },
-                proof_required: {
-                  type: "array",
-                  items: { type: "string" },
-                  description: "Fields that require proof rather than plain disclosure"
-                }
-              },
-              required: ["context", "disclose", "withhold", "proof_required"]
-            }
-          },
-          default_action: {
-            type: "string",
-            enum: ["withhold", "ask-principal"],
-            description: "What to do when no rule matches a field"
-          },
-          identity_id: {
-            type: "string",
-            description: "Optional identity this policy is bound to"
-          }
-        },
-        required: ["policy_name", "rules", "default_action"]
-      },
-      handler: async (args) => {
-        const policyName = args.policy_name;
-        const rules = args.rules;
-        const defaultAction = args.default_action;
-        const identityId = args.identity_id;
-        const policy = await policyStore.create(
-          policyName,
-          rules,
-          defaultAction,
-          identityId
-        );
-        auditLog.append("l3", "disclosure_set_policy", identityId ?? "system", {
-          policy_id: policy.policy_id,
-          policy_name: policyName,
-          rules_count: rules.length
-        });
-        return toolResult({
-          policy_id: policy.policy_id,
-          policy_name: policy.policy_name,
-          rules_count: policy.rules.length,
-          created_at: policy.created_at
-        });
-      }
-    },
-    {
-      name: "sanctuary/disclosure_evaluate",
-      description: "Evaluate a disclosure request against an active policy. Returns per-field decisions: disclose, withhold, proof, or ask-principal.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          context: {
-            type: "string",
-            description: "The interaction context"
-          },
-          requested_fields: {
-            type: "array",
-            items: { type: "string" },
-            description: "Fields the counterparty is requesting"
-          },
-          policy_id: {
-            type: "string",
-            description: "Specific policy to evaluate (uses first available if omitted)"
-          }
-        },
-        required: ["context", "requested_fields"]
-      },
-      handler: async (args) => {
-        const context = args.context;
-        const requestedFields = args.requested_fields;
-        const policyId = args.policy_id;
-        let policy;
-        if (policyId) {
-          policy = await policyStore.get(policyId);
-        } else {
-          const allPolicies = await policyStore.list();
-          policy = allPolicies[0] ?? null;
-        }
-        if (!policy) {
-          return toolResult({
-            error: "No disclosure policy found. Create one with disclosure_set_policy first."
-          });
-        }
-        const decisions = evaluateDisclosure(policy, context, requestedFields);
-        const withholding = decisions.filter(
-          (d) => d.action === "withhold"
-        ).length;
-        const disclosing = decisions.filter(
-          (d) => d.action === "disclose"
-        ).length;
-        const proofRequired = decisions.filter(
-          (d) => d.action === "proof"
-        ).length;
-        const askPrincipal = decisions.filter(
-          (d) => d.action === "ask-principal"
-        ).length;
-        auditLog.append("l3", "disclosure_evaluate", "system", {
-          policy_id: policy.policy_id,
-          context,
-          fields_requested: requestedFields.length,
-          withholding,
-          disclosing,
-          proof_required: proofRequired
-        });
-        return toolResult({
-          policy_id: policy.policy_id,
-          policy_name: policy.policy_name,
-          context,
-          decisions,
-          summary: {
-            total_fields: requestedFields.length,
-            disclose: disclosing,
-            withhold: withholding,
-            proof: proofRequired,
-            ask_principal: askPrincipal
-          },
-          overall_recommendation: withholding > 0 ? `Withholding ${withholding} of ${requestedFields.length} requested fields per policy "${policy.policy_name}"` : `All ${requestedFields.length} fields may be disclosed per policy "${policy.policy_name}"`
-        });
-      }
-    },
-    // ─── ZK Proof Tools ───────────────────────────────────────────────────
-    {
-      name: "sanctuary/zk_commit",
-      description: "Create a Pedersen commitment to a numeric value on Ristretto255. Unlike SHA-256 commitments, Pedersen commitments support zero-knowledge proofs: you can prove properties about the committed value without revealing it.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          value: {
-            type: "number",
-            description: "The integer value to commit to"
-          }
-        },
-        required: ["value"]
-      },
-      handler: async (args) => {
-        const value = args.value;
-        if (!Number.isInteger(value)) {
-          return toolResult({ error: "Value must be an integer." });
-        }
-        const commitment = createPedersenCommitment(value);
-        auditLog.append("l3", "zk_commit", "system", {
-          commitment_hash: commitment.commitment.slice(0, 16) + "..."
-        });
-        return toolResult({
-          commitment: commitment.commitment,
-          blinding_factor: commitment.blinding_factor,
-          committed_at: commitment.committed_at,
-          proof_system: "pedersen-ristretto255",
-          note: "Store the blinding_factor securely. Use zk_prove to create proofs about this commitment."
-        });
-      }
-    },
-    {
-      name: "sanctuary/zk_prove",
-      description: "Create a zero-knowledge proof of knowledge for a Pedersen commitment. Proves you know the value and blinding factor without revealing either. Uses a Schnorr sigma protocol with Fiat-Shamir transform.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          value: {
-            type: "number",
-            description: "The committed value (integer)"
-          },
-          blinding_factor: {
-            type: "string",
-            description: "The blinding factor from zk_commit (base64url)"
-          },
-          commitment: {
-            type: "string",
-            description: "The Pedersen commitment (base64url)"
-          }
-        },
-        required: ["value", "blinding_factor", "commitment"]
-      },
-      handler: async (args) => {
-        const value = args.value;
-        const blindingFactor = args.blinding_factor;
-        const commitment = args.commitment;
-        if (!verifyPedersenCommitment(commitment, value, blindingFactor)) {
-          return toolResult({
-            error: "The provided value and blinding factor do not match the commitment."
-          });
-        }
-        const proof = createProofOfKnowledge(value, blindingFactor, commitment);
-        auditLog.append("l3", "zk_prove", "system", {
-          proof_type: proof.type,
-          commitment: commitment.slice(0, 16) + "..."
-        });
-        return toolResult({
-          proof,
-          note: "This proof demonstrates knowledge of the commitment opening without revealing the value."
-        });
-      }
-    },
-    {
-      name: "sanctuary/zk_verify",
-      description: "Verify a zero-knowledge proof of knowledge for a Pedersen commitment. Checks that the prover knows the commitment's opening without learning anything.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          proof: {
-            type: "object",
-            description: "The ZK proof object from zk_prove"
-          }
-        },
-        required: ["proof"]
-      },
-      handler: async (args) => {
-        const proof = args.proof;
-        const valid = verifyProofOfKnowledge(proof);
-        auditLog.append("l3", "zk_verify", "system", {
-          proof_type: proof.type,
-          valid
-        });
-        return toolResult({
-          valid,
-          proof_type: proof.type,
-          commitment: proof.commitment,
-          verified_at: (/* @__PURE__ */ new Date()).toISOString()
-        });
-      }
-    },
-    {
-      name: "sanctuary/zk_range_prove",
-      description: "Create a zero-knowledge range proof: prove that a committed value is within [min, max] without revealing the exact value. Uses bit-decomposition with OR-proofs on Ristretto255.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          value: {
-            type: "number",
-            description: "The committed value (integer)"
-          },
-          blinding_factor: {
-            type: "string",
-            description: "The blinding factor from zk_commit (base64url)"
-          },
-          commitment: {
-            type: "string",
-            description: "The Pedersen commitment (base64url)"
-          },
-          min: {
-            type: "number",
-            description: "Minimum of the range (inclusive)"
-          },
-          max: {
-            type: "number",
-            description: "Maximum of the range (inclusive)"
-          }
-        },
-        required: ["value", "blinding_factor", "commitment", "min", "max"]
-      },
-      handler: async (args) => {
-        const value = args.value;
-        const blindingFactor = args.blinding_factor;
-        const commitment = args.commitment;
-        const min = args.min;
-        const max = args.max;
-        const proof = createRangeProof(value, blindingFactor, commitment, min, max);
-        if ("error" in proof) {
-          return toolResult({ error: proof.error });
-        }
-        auditLog.append("l3", "zk_range_prove", "system", {
-          proof_type: proof.type,
-          range: `[${min}, ${max}]`,
-          bits: proof.bit_commitments.length
-        });
-        return toolResult({
-          proof,
-          note: `This proof demonstrates the committed value is in [${min}, ${max}] without revealing it.`
-        });
-      }
-    },
-    {
-      name: "sanctuary/zk_range_verify",
-      description: "Verify a zero-knowledge range proof \u2014 confirms a committed value is within the claimed range without learning the value.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          proof: {
-            type: "object",
-            description: "The range proof object from zk_range_prove"
-          }
-        },
-        required: ["proof"]
-      },
-      handler: async (args) => {
-        const proof = args.proof;
-        const valid = verifyRangeProof(proof);
-        auditLog.append("l3", "zk_range_verify", "system", {
-          proof_type: proof.type,
-          valid,
-          range: `[${proof.min}, ${proof.max}]`
-        });
-        return toolResult({
-          valid,
-          proof_type: proof.type,
-          range: { min: proof.min, max: proof.max },
-          commitment: proof.commitment,
-          verified_at: (/* @__PURE__ */ new Date()).toISOString()
-        });
-      }
-    }
-  ];
-  return { tools, commitmentStore, policyStore };
-}
-
-// src/l4-reputation/reputation-store.ts
-init_encoding();
-function computeMedian(values) {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-function aggregateMetrics(attestations, metricNames) {
-  const result = {};
-  const names = metricNames ?? Array.from(
-    new Set(
-      attestations.flatMap(
-        (a) => Object.keys(a.attestation.data.metrics)
-      )
-    )
-  );
-  for (const name of names) {
-    const values = attestations.map((a) => a.attestation.data.metrics[name]).filter((v) => v !== void 0);
-    if (values.length === 0) {
-      result[name] = { mean: 0, median: 0, min: 0, max: 0, count: 0 };
-      continue;
-    }
-    result[name] = {
-      mean: values.reduce((s, v) => s + v, 0) / values.length,
-      median: computeMedian(values),
-      min: Math.min(...values),
-      max: Math.max(...values),
-      count: values.length
-    };
-  }
-  return result;
-}
-var ReputationStore = class {
-  storage;
-  encryptionKey;
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.encryptionKey = derivePurposeKey(masterKey, "l4-reputation");
-  }
-  /**
-   * Record an interaction outcome as a signed attestation.
-   */
-  async record(interactionId, counterpartyDid, outcome, context, identity, identityEncryptionKey, counterpartyAttestation, sovereigntyTier) {
-    const attestationId = `att-${Date.now()}-${toBase64url(randomBytes(8))}`;
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const attestationData = {
-      interaction_id: interactionId,
-      participant_did: identity.did,
-      counterparty_did: counterpartyDid,
-      outcome_type: outcome.type,
-      outcome_result: outcome.result,
-      metrics: outcome.metrics ?? {},
-      context,
-      timestamp: now,
-      sovereignty_tier: sovereigntyTier
-    };
-    const dataBytes = stringToBytes(JSON.stringify(attestationData));
-    const signature = sign(
-      dataBytes,
-      identity.encrypted_private_key,
-      identityEncryptionKey
-    );
-    const attestation = {
-      attestation_id: attestationId,
-      schema: "sanctuary-interaction-v1",
-      data: attestationData,
-      signature: toBase64url(signature),
-      signer: identity.did
-    };
-    const stored = {
-      attestation,
-      counterparty_attestation: counterpartyAttestation,
-      counterparty_confirmed: !!counterpartyAttestation,
-      recorded_at: now
-    };
-    const serialized = stringToBytes(JSON.stringify(stored));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_reputation",
-      attestationId,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-    return stored;
-  }
-  /**
-   * Query reputation data with filtering.
-   * Returns aggregates only — not raw interaction data.
-   */
-  async query(options) {
-    const all = await this.loadAll();
-    let filtered = all;
-    if (options.context) {
-      filtered = filtered.filter(
-        (a) => a.attestation.data.context === options.context
-      );
-    }
-    if (options.time_range) {
-      const start2 = new Date(options.time_range.start).getTime();
-      const end2 = new Date(options.time_range.end).getTime();
-      filtered = filtered.filter((a) => {
-        const t = new Date(a.attestation.data.timestamp).getTime();
-        return t >= start2 && t <= end2;
-      });
-    }
-    if (options.counterparty_did) {
-      filtered = filtered.filter(
-        (a) => a.attestation.data.counterparty_did === options.counterparty_did
-      );
-    }
-    const contexts = Array.from(
-      new Set(filtered.map((a) => a.attestation.data.context))
-    );
-    const timestamps = filtered.map(
-      (a) => new Date(a.attestation.data.timestamp).getTime()
-    );
-    const start = timestamps.length > 0 ? new Date(Math.min(...timestamps)).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
-    const end = timestamps.length > 0 ? new Date(Math.max(...timestamps)).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
-    return {
-      total_interactions: filtered.length,
-      completed: filtered.filter(
-        (a) => a.attestation.data.outcome_result === "completed"
-      ).length,
-      partial: filtered.filter(
-        (a) => a.attestation.data.outcome_result === "partial"
-      ).length,
-      failed: filtered.filter(
-        (a) => a.attestation.data.outcome_result === "failed"
-      ).length,
-      disputed: filtered.filter(
-        (a) => a.attestation.data.outcome_result === "disputed"
-      ).length,
-      contexts,
-      time_range: { start, end },
-      aggregate_metrics: aggregateMetrics(filtered, options.metrics)
-    };
-  }
-  /**
-   * Export attestations as a portable reputation bundle.
-   */
-  async exportBundle(identity, identityEncryptionKey, context) {
-    let all = await this.loadAll();
-    if (context) {
-      all = all.filter((a) => a.attestation.data.context === context);
-    }
-    const attestations = all.map((a) => a.attestation);
-    const bundleData = {
-      version: "SANCTUARY_REP_V1",
-      attestations,
-      exported_at: (/* @__PURE__ */ new Date()).toISOString(),
-      exporter_did: identity.did
-    };
-    const bundleBytes = stringToBytes(JSON.stringify(bundleData));
-    const bundleSignature = sign(
-      bundleBytes,
-      identity.encrypted_private_key,
-      identityEncryptionKey
-    );
-    return {
-      ...bundleData,
-      bundle_signature: toBase64url(bundleSignature)
-    };
-  }
-  /**
-   * Import attestations from a reputation bundle.
-   * Verifies signatures if requested (default: true).
-   *
-   * @param publicKeys - Map of DID → public key bytes for signature verification
-   */
-  async importBundle(bundle, verifySignatures, publicKeys) {
-    let imported = 0;
-    let invalid = 0;
-    const contexts = /* @__PURE__ */ new Set();
-    for (const attestation of bundle.attestations) {
-      if (verifySignatures) {
-        const signerKey = publicKeys.get(attestation.signer);
-        if (!signerKey) {
-          invalid++;
-          continue;
-        }
-        const dataBytes = stringToBytes(
-          JSON.stringify(attestation.data)
-        );
-        const sigBytes = fromBase64url(attestation.signature);
-        if (!verify(dataBytes, sigBytes, signerKey)) {
-          invalid++;
-          continue;
-        }
-      }
-      const stored = {
-        attestation,
-        counterparty_confirmed: false,
-        recorded_at: (/* @__PURE__ */ new Date()).toISOString()
-      };
-      const serialized = stringToBytes(JSON.stringify(stored));
-      const encrypted = encrypt(serialized, this.encryptionKey);
-      await this.storage.write(
-        "_reputation",
-        attestation.attestation_id,
-        stringToBytes(JSON.stringify(encrypted))
-      );
-      imported++;
-      contexts.add(attestation.data.context);
-    }
-    return {
-      imported,
-      invalid,
-      contexts: Array.from(contexts)
-    };
-  }
-  // ─── Escrow ───────────────────────────────────────────────────────────
-  /**
-   * Create an escrow for trust bootstrapping.
-   */
-  async createEscrow(transactionTerms, counterpartyDid, timeoutSeconds, creatorDid, collateralAmount) {
-    const escrowId = `esc-${Date.now()}-${toBase64url(randomBytes(8))}`;
-    const now = /* @__PURE__ */ new Date();
-    const expiresAt = new Date(now.getTime() + timeoutSeconds * 1e3);
-    const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
-    const termsHash = hashToString2(stringToBytes(transactionTerms));
-    const escrow = {
-      escrow_id: escrowId,
-      transaction_terms: transactionTerms,
-      terms_hash: termsHash,
-      collateral_amount: collateralAmount,
-      counterparty_did: counterpartyDid,
-      creator_did: creatorDid,
-      created_at: now.toISOString(),
-      expires_at: expiresAt.toISOString(),
-      status: "pending"
-    };
-    const serialized = stringToBytes(JSON.stringify(escrow));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_escrows",
-      escrowId,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-    return escrow;
-  }
-  /**
-   * Get an escrow by ID.
-   */
-  async getEscrow(escrowId) {
-    const raw = await this.storage.read("_escrows", escrowId);
-    if (!raw) return null;
-    try {
-      const encrypted = JSON.parse(bytesToString(raw));
-      const decrypted = decrypt(encrypted, this.encryptionKey);
-      return JSON.parse(bytesToString(decrypted));
-    } catch {
-      return null;
-    }
-  }
-  // ─── Guarantees ─────────────────────────────────────────────────────
-  /**
-   * Create a principal's guarantee for a new agent.
-   */
-  async createGuarantee(principalIdentity, agentDid, scope, durationSeconds, identityEncryptionKey, maxLiability) {
-    const guaranteeId = `guar-${Date.now()}-${toBase64url(randomBytes(8))}`;
-    const now = /* @__PURE__ */ new Date();
-    const validUntil = new Date(now.getTime() + durationSeconds * 1e3);
-    const certificateData = {
-      guarantee_id: guaranteeId,
-      principal_did: principalIdentity.did,
-      agent_did: agentDid,
-      scope,
-      max_liability: maxLiability,
-      valid_until: validUntil.toISOString(),
-      issued_at: now.toISOString()
-    };
-    const certBytes = stringToBytes(JSON.stringify(certificateData));
-    const signature = sign(
-      certBytes,
-      principalIdentity.encrypted_private_key,
-      identityEncryptionKey
-    );
-    const certificate = toBase64url(
-      stringToBytes(
-        JSON.stringify({
-          ...certificateData,
-          signature: toBase64url(signature)
-        })
-      )
-    );
-    const guarantee = {
-      guarantee_id: guaranteeId,
-      principal_did: principalIdentity.did,
-      agent_did: agentDid,
-      scope,
-      max_liability: maxLiability,
-      valid_until: validUntil.toISOString(),
-      certificate,
-      created_at: now.toISOString()
-    };
-    const serialized = stringToBytes(JSON.stringify(guarantee));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_guarantees",
-      guaranteeId,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-    return guarantee;
-  }
-  // ─── Tier-Aware Access ───────────────────────────────────────────────
-  /**
-   * Load attestations for tier-weighted scoring.
-   * Applies basic context/counterparty filtering, returns full StoredAttestations
-   * so callers can access sovereignty_tier from attestation data.
-   */
-  async loadAllForTierScoring(options) {
-    let all = await this.loadAll();
-    if (options?.context) {
-      all = all.filter((a) => a.attestation.data.context === options.context);
-    }
-    if (options?.counterparty_did) {
-      all = all.filter(
-        (a) => a.attestation.data.counterparty_did === options.counterparty_did
-      );
-    }
-    return all;
-  }
-  // ─── Internal ─────────────────────────────────────────────────────────
-  async loadAll() {
-    const results = [];
-    try {
-      const entries = await this.storage.list("_reputation");
-      for (const meta of entries) {
-        const raw = await this.storage.read("_reputation", meta.key);
-        if (!raw) continue;
-        try {
-          const encrypted = JSON.parse(bytesToString(raw));
-          const decrypted = decrypt(encrypted, this.encryptionKey);
-          results.push(JSON.parse(bytesToString(decrypted)));
-        } catch {
-        }
-      }
-    } catch {
-    }
-    return results;
-  }
-};
-
-// src/l4-reputation/tools.ts
-init_encoding();
-
-// src/l4-reputation/tiers.ts
-var TIER_WEIGHTS = {
-  "verified-sovereign": 1,
-  "verified-degraded": 0.8,
-  "self-attested": 0.5,
-  "unverified": 0.2
-};
-function resolveTier(counterpartyId, handshakeResults, hasSanctuaryIdentity) {
-  const handshake = handshakeResults.get(counterpartyId);
-  if (handshake && handshake.verified) {
-    const expiresAt = new Date(handshake.expires_at);
-    if (expiresAt > /* @__PURE__ */ new Date()) {
-      return {
-        sovereignty_tier: handshake.trust_tier,
-        handshake_completed_at: handshake.completed_at,
-        verified_by: handshake.counterparty_id
-      };
-    }
-  }
-  if (hasSanctuaryIdentity) {
-    return { sovereignty_tier: "self-attested" };
-  }
-  return { sovereignty_tier: "unverified" };
-}
-function trustTierToSovereigntyTier(trustTier) {
-  switch (trustTier) {
-    case "verified-sovereign":
-      return "verified-sovereign";
-    case "verified-degraded":
-      return "verified-degraded";
-    default:
-      return "unverified";
-  }
-}
-function computeWeightedScore(attestations) {
-  if (attestations.length === 0) return null;
-  let weightedSum = 0;
-  let totalWeight = 0;
-  for (const a of attestations) {
-    const weight = TIER_WEIGHTS[a.tier];
-    weightedSum += a.value * weight;
-    totalWeight += weight;
-  }
-  return totalWeight > 0 ? weightedSum / totalWeight : null;
-}
-function tierDistribution(tiers) {
-  const dist = {
-    "verified-sovereign": 0,
-    "verified-degraded": 0,
-    "self-attested": 0,
-    "unverified": 0
-  };
-  for (const tier of tiers) {
-    dist[tier]++;
-  }
-  return dist;
-}
-
-// src/l4-reputation/tools.ts
-function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeResults) {
-  const reputationStore = new ReputationStore(storage, masterKey);
-  const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
-  const hsResults = handshakeResults ?? /* @__PURE__ */ new Map();
-  const tools = [
-    // ─── Reputation Recording ─────────────────────────────────────────
-    {
-      name: "sanctuary/reputation_record",
-      description: "Record an interaction outcome as a signed attestation. Creates an EAS-compatible attestation signed by the specified identity.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          interaction_id: {
-            type: "string",
-            description: "Unique interaction identifier"
-          },
-          counterparty_did: {
-            type: "string",
-            description: "Counterparty's DID"
-          },
-          outcome: {
-            type: "object",
-            description: "Interaction outcome",
-            properties: {
-              type: {
-                type: "string",
-                enum: ["transaction", "negotiation", "service", "dispute", "custom"]
-              },
-              result: {
-                type: "string",
-                enum: ["completed", "partial", "failed", "disputed"]
-              },
-              metrics: {
-                type: "object",
-                description: "Domain-specific metrics (e.g., fulfillment_rate, response_time_ms)"
+          const storedEntries = await this.storage.list("_audit");
+          for (const meta of storedEntries) {
+            const raw = await this.storage.read("_audit", meta.key);
+            if (!raw) continue;
+            try {
+              const encrypted = JSON.parse(bytesToString(raw));
+              const decrypted = decrypt(encrypted, this.encryptionKey);
+              const entry = JSON.parse(bytesToString(decrypted));
+              const isDuplicate = this.entries.some(
+                (e) => e.timestamp === entry.timestamp && e.operation === entry.operation && e.identity_id === entry.identity_id
+              );
+              if (!isDuplicate) {
+                this.entries.push(entry);
               }
-            },
-            required: ["type", "result"]
-          },
-          context: {
-            type: "string",
-            description: "Category/domain for context-specific reputation",
-            default: "general"
-          },
-          counterparty_attestation: {
-            type: "string",
-            description: "Counterparty's signed attestation of the same interaction"
-          },
-          identity_id: {
-            type: "string",
-            description: "Identity to sign with (uses default if omitted)"
-          }
-        },
-        required: ["interaction_id", "counterparty_did", "outcome"]
-      },
-      handler: async (args) => {
-        const identityId = args.identity_id;
-        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
-        if (!identity) {
-          return toolResult({
-            error: "No identity found. Create one with identity_create first."
-          });
-        }
-        const outcome = args.outcome;
-        const context = args.context ?? "general";
-        const counterpartyDid = args.counterparty_did;
-        const hasSanctuaryIdentity = identityManager.list().some(
-          (id) => identityManager.get(id.identity_id)?.did === counterpartyDid
-        );
-        const tierMeta = resolveTier(counterpartyDid, hsResults, hasSanctuaryIdentity);
-        const stored = await reputationStore.record(
-          args.interaction_id,
-          counterpartyDid,
-          outcome,
-          context,
-          identity,
-          identityEncryptionKey,
-          args.counterparty_attestation,
-          tierMeta.sovereignty_tier
-        );
-        auditLog.append("l4", "reputation_record", identity.identity_id, {
-          interaction_id: args.interaction_id,
-          outcome_type: outcome.type,
-          outcome_result: outcome.result,
-          context,
-          sovereignty_tier: tierMeta.sovereignty_tier
-        });
-        return toolResult({
-          attestation_id: stored.attestation.attestation_id,
-          interaction_id: stored.attestation.data.interaction_id,
-          self_attestation: stored.attestation.signature,
-          counterparty_confirmed: stored.counterparty_confirmed,
-          sovereignty_tier: tierMeta.sovereignty_tier,
-          context,
-          recorded_at: stored.recorded_at
-        });
-      }
-    },
-    // ─── Reputation Query ─────────────────────────────────────────────
-    {
-      name: "sanctuary/reputation_query",
-      description: "Query aggregated reputation data with filtering. Returns summary statistics, never raw interaction details.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          context: {
-            type: "string",
-            description: "Filter by context/domain"
-          },
-          time_range: {
-            type: "object",
-            description: "Filter by time range",
-            properties: {
-              start: { type: "string", description: "ISO 8601 start" },
-              end: { type: "string", description: "ISO 8601 end" }
+            } catch {
             }
-          },
-          metrics: {
-            type: "array",
-            items: { type: "string" },
-            description: "Which metrics to aggregate"
-          },
-          counterparty_did: {
-            type: "string",
-            description: "Filter by counterparty"
           }
-        }
-      },
-      handler: async (args) => {
-        const summary = await reputationStore.query({
-          context: args.context,
-          time_range: args.time_range,
-          metrics: args.metrics,
-          counterparty_did: args.counterparty_did
-        });
-        auditLog.append("l4", "reputation_query", "system", {
-          total_interactions: summary.total_interactions,
-          contexts: summary.contexts
-        });
-        return toolResult({
-          summary,
-          // SEC-ADD-03: Tag response as containing counterparty-generated attestation data
-          _content_trust: "external"
-        });
-      }
-    },
-    // ─── Reputation Export ─────────────────────────────────────────────
-    {
-      name: "sanctuary/reputation_export",
-      description: "Export a portable reputation bundle (SANCTUARY_REP_V1). Includes all signed attestations for independent verification.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          format: {
-            type: "string",
-            enum: ["SANCTUARY_REP_V1"],
-            default: "SANCTUARY_REP_V1"
-          },
-          context: {
-            type: "string",
-            description: "Export specific context only"
-          },
-          identity_id: {
-            type: "string",
-            description: "Identity to sign the bundle with"
-          }
-        }
-      },
-      handler: async (args) => {
-        const identityId = args.identity_id;
-        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
-        if (!identity) {
-          return toolResult({
-            error: "No identity found. Create one with identity_create first."
-          });
-        }
-        const context = args.context;
-        const bundle = await reputationStore.exportBundle(
-          identity,
-          identityEncryptionKey,
-          context
-        );
-        const bundleJson = JSON.stringify(bundle);
-        const bundleBase64 = toBase64url(
-          new TextEncoder().encode(bundleJson)
-        );
-        auditLog.append("l4", "reputation_export", identity.identity_id, {
-          attestation_count: bundle.attestations.length,
-          contexts: Array.from(
-            new Set(bundle.attestations.map((a) => a.data.context))
-          )
-        });
-        const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
-        const { stringToBytes: stringToBytes2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
-        return toolResult({
-          bundle: bundleBase64,
-          attestation_count: bundle.attestations.length,
-          contexts: Array.from(
-            new Set(bundle.attestations.map((a) => a.data.context))
-          ),
-          bundle_hash: hashToString2(stringToBytes2(bundleJson)),
-          exported_at: bundle.exported_at
-        });
-      }
-    },
-    // ─── Reputation Import ────────────────────────────────────────────
-    {
-      name: "sanctuary/reputation_import",
-      description: "Import a reputation bundle from another Sanctuary instance. Verifies all attestation signatures by default.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          bundle: {
-            type: "string",
-            description: "Base64url-encoded reputation bundle"
-          }
-        },
-        required: ["bundle"]
-      },
-      handler: async (args) => {
-        const bundleBase64 = args.bundle;
-        const verifySignatures = true;
-        let bundle;
-        try {
-          const bundleBytes = fromBase64url(bundleBase64);
-          const bundleJson = new TextDecoder().decode(bundleBytes);
-          bundle = JSON.parse(bundleJson);
+          this.entries.sort(
+            (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+          );
         } catch {
-          return toolResult({
-            error: "Invalid bundle format. Expected base64url-encoded JSON."
-          });
         }
-        const publicKeys = /* @__PURE__ */ new Map();
-        for (const pub of identityManager.list()) {
-          const identity = identityManager.get(pub.identity_id);
-          if (identity) {
-            publicKeys.set(identity.did, fromBase64url(identity.public_key));
-          }
-        }
-        const result = await reputationStore.importBundle(
-          bundle,
-          verifySignatures,
-          publicKeys
-        );
-        auditLog.append("l4", "reputation_import", "system", {
-          imported: result.imported,
-          invalid: result.invalid,
-          contexts: result.contexts
-        });
-        return toolResult({
-          imported_attestations: result.imported,
-          invalid_attestations: result.invalid,
-          contexts: result.contexts,
-          imported_at: (/* @__PURE__ */ new Date()).toISOString()
-        });
       }
-    },
-    // ─── Sovereignty-Weighted Query ──────────────────────────────────
-    {
-      name: "sanctuary/reputation_query_weighted",
-      description: "Query reputation with sovereignty-weighted scoring. Attestations from verified-sovereign agents carry full weight (1.0); unverified attestations carry reduced weight (0.2). Returns both the weighted score and tier distribution.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          metric: {
-            type: "string",
-            description: "Which metric to compute the weighted score for"
-          },
-          context: {
-            type: "string",
-            description: "Filter by context/domain"
-          },
-          counterparty_did: {
-            type: "string",
-            description: "Filter by counterparty"
-          }
-        },
-        required: ["metric"]
-      },
-      handler: async (args) => {
-        const summary = await reputationStore.query({
-          context: args.context,
-          counterparty_did: args.counterparty_did
-        });
-        const allAttestations = await reputationStore.loadAllForTierScoring({
-          context: args.context,
-          counterparty_did: args.counterparty_did
-        });
-        const metric = args.metric;
-        const tieredAttestations = allAttestations.filter((a) => a.attestation.data.metrics[metric] !== void 0).map((a) => ({
-          value: a.attestation.data.metrics[metric],
-          tier: a.attestation.data.sovereignty_tier ?? "unverified"
-        }));
-        const weightedScore = computeWeightedScore(tieredAttestations);
-        const tiers = allAttestations.map(
-          (a) => a.attestation.data.sovereignty_tier ?? "unverified"
-        );
-        const dist = tierDistribution(tiers);
-        auditLog.append("l4", "reputation_query_weighted", "system", {
-          metric,
-          attestation_count: tieredAttestations.length,
-          weighted_score: weightedScore
-        });
-        return toolResult({
-          metric,
-          weighted_score: weightedScore,
-          attestation_count: tieredAttestations.length,
-          tier_distribution: dist,
-          tier_weights: TIER_WEIGHTS,
-          unweighted_summary: summary
-        });
+      /**
+       * Get total number of entries.
+       */
+      get size() {
+        return this.entries.length;
       }
-    },
-    // ─── Trust Bootstrap: Escrow ──────────────────────────────────────
-    {
-      name: "sanctuary/bootstrap_create_escrow",
-      description: "Create an escrow record for trust bootstrapping. Allows new participants with no reputation to transact safely.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          transaction_terms: {
-            type: "string",
-            description: "Description of the transaction"
-          },
-          collateral_amount: {
-            type: "number",
-            description: "Optional stake/collateral amount"
-          },
-          counterparty_did: {
-            type: "string",
-            description: "Counterparty's DID"
-          },
-          timeout_seconds: {
-            type: "number",
-            description: "Escrow timeout in seconds"
-          },
-          identity_id: {
-            type: "string",
-            description: "Identity creating the escrow"
-          }
-        },
-        required: ["transaction_terms", "counterparty_did", "timeout_seconds"]
-      },
-      handler: async (args) => {
-        const identityId = args.identity_id;
-        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
-        if (!identity) {
-          return toolResult({
-            error: "No identity found. Create one with identity_create first."
-          });
-        }
-        const escrow = await reputationStore.createEscrow(
-          args.transaction_terms,
-          args.counterparty_did,
-          args.timeout_seconds,
-          identity.did,
-          args.collateral_amount
-        );
-        auditLog.append("l4", "bootstrap_create_escrow", identity.identity_id, {
-          escrow_id: escrow.escrow_id,
-          counterparty_did: args.counterparty_did,
-          timeout_seconds: args.timeout_seconds
-        });
-        return toolResult({
-          escrow_id: escrow.escrow_id,
-          terms_hash: escrow.terms_hash,
-          created_at: escrow.created_at,
-          expires_at: escrow.expires_at,
-          status: escrow.status
-        });
-      }
-    },
-    // ─── Trust Bootstrap: Guarantee ───────────────────────────────────
-    {
-      name: "sanctuary/bootstrap_provide_guarantee",
-      description: "A principal provides a signed reputation guarantee for a new agent. The guarantee certificate can be presented to counterparties.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          principal_identity_id: {
-            type: "string",
-            description: "Identity of the guarantor (principal)"
-          },
-          agent_identity_id: {
-            type: "string",
-            description: "Identity of the agent being guaranteed"
-          },
-          scope: {
-            type: "string",
-            description: "What the guarantee covers"
-          },
-          duration_seconds: {
-            type: "number",
-            description: "How long the guarantee is valid"
-          },
-          max_liability: {
-            type: "number",
-            description: "Maximum liability amount"
-          }
-        },
-        required: [
-          "principal_identity_id",
-          "agent_identity_id",
-          "scope",
-          "duration_seconds"
-        ]
-      },
-      handler: async (args) => {
-        const principalIdentity = identityManager.get(
-          args.principal_identity_id
-        );
-        const agentIdentity = identityManager.get(
-          args.agent_identity_id
-        );
-        if (!principalIdentity) {
-          return toolResult({
-            error: `Principal identity "${args.principal_identity_id}" not found.`
-          });
-        }
-        if (!agentIdentity) {
-          return toolResult({
-            error: `Agent identity "${args.agent_identity_id}" not found.`
-          });
-        }
-        const guarantee = await reputationStore.createGuarantee(
-          principalIdentity,
-          agentIdentity.did,
-          args.scope,
-          args.duration_seconds,
-          identityEncryptionKey,
-          args.max_liability
-        );
-        auditLog.append(
-          "l4",
-          "bootstrap_provide_guarantee",
-          principalIdentity.identity_id,
-          {
-            guarantee_id: guarantee.guarantee_id,
-            agent_did: agentIdentity.did,
-            scope: args.scope
-          }
-        );
-        return toolResult({
-          guarantee_id: guarantee.guarantee_id,
-          guarantee_certificate: guarantee.certificate,
-          scope: guarantee.scope,
-          valid_until: guarantee.valid_until
-        });
-      }
-    }
-  ];
-  return { tools, reputationStore };
-}
-var DEFAULT_TIER2 = {
-  new_namespace_access: "approve",
-  new_counterparty: "approve",
-  frequency_spike_multiplier: 5,
-  max_signs_per_minute: 10,
-  bulk_read_threshold: 20,
-  first_session_policy: "approve"
-};
-var DEFAULT_CHANNEL = {
-  type: "stderr",
-  timeout_seconds: 300
-  // SEC-002: auto_deny is not configurable. Timeout always denies.
-  // Field omitted intentionally — all channels hardcode deny on timeout.
-};
-var DEFAULT_POLICY = {
-  version: 1,
-  tier1_always_approve: [
-    "state_export",
-    "state_import",
-    "state_delete",
-    "identity_rotate",
-    "reputation_import",
-    "reputation_export",
-    "bootstrap_provide_guarantee",
-    "decommission_certificate"
-  ],
-  tier2_anomaly: DEFAULT_TIER2,
-  tier3_always_allow: [
-    "state_read",
-    "state_write",
-    "state_list",
-    "identity_create",
-    "identity_list",
-    "identity_sign",
-    "identity_verify",
-    "proof_commitment",
-    "proof_reveal",
-    "disclosure_set_policy",
-    "disclosure_evaluate",
-    "reputation_record",
-    "reputation_query",
-    "bootstrap_create_escrow",
-    "exec_attest",
-    "monitor_health",
-    "monitor_audit_log",
-    "manifest",
-    "principal_policy_view",
-    "principal_baseline_view",
-    "shr_generate",
-    "shr_verify",
-    "handshake_initiate",
-    "handshake_respond",
-    "handshake_complete",
-    "handshake_status",
-    "reputation_query_weighted",
-    "federation_peers",
-    "federation_trust_evaluate",
-    "federation_status",
-    "zk_commit",
-    "zk_prove",
-    "zk_verify",
-    "zk_range_prove",
-    "zk_range_verify",
-    "context_gate_set_policy",
-    "context_gate_apply_template",
-    "context_gate_recommend",
-    "context_gate_filter",
-    "context_gate_list_policies",
-    "l2_hardening_status",
-    "l2_verify_isolation",
-    "sovereignty_audit",
-    "shr_gateway_export",
-    "bridge_commit",
-    "bridge_verify",
-    "bridge_attest"
-  ],
-  approval_channel: DEFAULT_CHANNEL
-};
+    };
+  }
+});
 function extractOperationName(toolName) {
   return toolName.startsWith("sanctuary/") ? toolName.slice("sanctuary/".length) : toolName;
 }
@@ -3850,199 +911,251 @@ async function loadPrincipalPolicy(storagePath) {
     return Object.freeze({ ...DEFAULT_POLICY });
   }
 }
+var DEFAULT_TIER2, DEFAULT_CHANNEL, DEFAULT_POLICY;
+var init_loader = __esm({
+  "src/principal-policy/loader.ts"() {
+    DEFAULT_TIER2 = {
+      new_namespace_access: "approve",
+      new_counterparty: "approve",
+      frequency_spike_multiplier: 5,
+      max_signs_per_minute: 10,
+      bulk_read_threshold: 20,
+      first_session_policy: "approve"
+    };
+    DEFAULT_CHANNEL = {
+      type: "stderr",
+      timeout_seconds: 300
+      // SEC-002: auto_deny is not configurable. Timeout always denies.
+      // Field omitted intentionally — all channels hardcode deny on timeout.
+    };
+    DEFAULT_POLICY = {
+      version: 1,
+      tier1_always_approve: [
+        "state_export",
+        "state_import",
+        "state_delete",
+        "identity_rotate",
+        "reputation_import",
+        "reputation_export",
+        "bootstrap_provide_guarantee",
+        "decommission_certificate"
+      ],
+      tier2_anomaly: DEFAULT_TIER2,
+      tier3_always_allow: [
+        "state_read",
+        "state_write",
+        "state_list",
+        "identity_create",
+        "identity_list",
+        "identity_sign",
+        "identity_verify",
+        "proof_commitment",
+        "proof_reveal",
+        "disclosure_set_policy",
+        "disclosure_evaluate",
+        "reputation_record",
+        "reputation_query",
+        "bootstrap_create_escrow",
+        "exec_attest",
+        "monitor_health",
+        "monitor_audit_log",
+        "manifest",
+        "principal_policy_view",
+        "principal_baseline_view",
+        "shr_generate",
+        "shr_verify",
+        "handshake_initiate",
+        "handshake_respond",
+        "handshake_complete",
+        "handshake_status",
+        "reputation_query_weighted",
+        "federation_peers",
+        "federation_trust_evaluate",
+        "federation_status",
+        "zk_commit",
+        "zk_prove",
+        "zk_verify",
+        "zk_range_prove",
+        "zk_range_verify",
+        "context_gate_set_policy",
+        "context_gate_apply_template",
+        "context_gate_recommend",
+        "context_gate_filter",
+        "context_gate_list_policies",
+        "l2_hardening_status",
+        "l2_verify_isolation",
+        "sovereignty_audit",
+        "shr_gateway_export",
+        "bridge_commit",
+        "bridge_verify",
+        "bridge_attest"
+      ],
+      approval_channel: DEFAULT_CHANNEL
+    };
+  }
+});
 
 // src/principal-policy/baseline.ts
-init_encoding();
-var BASELINE_NAMESPACE = "_principal";
-var BASELINE_KEY = "session-baseline";
-var BaselineTracker = class {
-  storage;
-  encryptionKey;
-  profile;
-  /** Sliding window: timestamps of tool calls per tool name (last 60s) */
-  callWindows = /* @__PURE__ */ new Map();
-  /** Sliding window: read counts per namespace (last 60s) */
-  readWindows = /* @__PURE__ */ new Map();
-  /** Sliding window: sign call timestamps (last 60s) */
-  signWindow = [];
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.encryptionKey = derivePurposeKey(masterKey, "principal-baseline");
-    this.profile = {
-      known_namespaces: [],
-      known_counterparties: [],
-      tool_call_counts: {},
-      is_first_session: true,
-      started_at: (/* @__PURE__ */ new Date()).toISOString()
+var BASELINE_NAMESPACE, BASELINE_KEY, BaselineTracker;
+var init_baseline = __esm({
+  "src/principal-policy/baseline.ts"() {
+    init_encryption();
+    init_key_derivation();
+    init_encoding();
+    BASELINE_NAMESPACE = "_principal";
+    BASELINE_KEY = "session-baseline";
+    BaselineTracker = class {
+      storage;
+      encryptionKey;
+      profile;
+      /** Sliding window: timestamps of tool calls per tool name (last 60s) */
+      callWindows = /* @__PURE__ */ new Map();
+      /** Sliding window: read counts per namespace (last 60s) */
+      readWindows = /* @__PURE__ */ new Map();
+      /** Sliding window: sign call timestamps (last 60s) */
+      signWindow = [];
+      constructor(storage, masterKey) {
+        this.storage = storage;
+        this.encryptionKey = derivePurposeKey(masterKey, "principal-baseline");
+        this.profile = {
+          known_namespaces: [],
+          known_counterparties: [],
+          tool_call_counts: {},
+          is_first_session: true,
+          started_at: (/* @__PURE__ */ new Date()).toISOString()
+        };
+      }
+      /**
+       * Load the previous session's baseline from storage.
+       * If none exists, this is a first session.
+       */
+      async load() {
+        try {
+          const raw = await this.storage.read(BASELINE_NAMESPACE, BASELINE_KEY);
+          if (!raw) return;
+          const encrypted = JSON.parse(bytesToString(raw));
+          const decrypted = decrypt(encrypted, this.encryptionKey);
+          const saved = JSON.parse(bytesToString(decrypted));
+          this.profile.known_namespaces = saved.known_namespaces ?? [];
+          this.profile.known_counterparties = saved.known_counterparties ?? [];
+          this.profile.is_first_session = false;
+        } catch {
+          this.profile.is_first_session = true;
+        }
+      }
+      /**
+       * Save the current baseline to storage (encrypted).
+       * Called at session end or periodically.
+       */
+      async save() {
+        this.profile.saved_at = (/* @__PURE__ */ new Date()).toISOString();
+        const serialized = stringToBytes(JSON.stringify(this.profile));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          BASELINE_NAMESPACE,
+          BASELINE_KEY,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+      }
+      /**
+       * Record a tool call for baseline tracking.
+       * Returns anomaly information if applicable.
+       */
+      recordToolCall(toolName) {
+        const now = Date.now();
+        this.profile.tool_call_counts[toolName] = (this.profile.tool_call_counts[toolName] ?? 0) + 1;
+        if (!this.callWindows.has(toolName)) {
+          this.callWindows.set(toolName, []);
+        }
+        const window = this.callWindows.get(toolName);
+        window.push(now);
+        const cutoff = now - 6e4;
+        while (window.length > 0 && window[0] < cutoff) {
+          window.shift();
+        }
+      }
+      /**
+       * Record a namespace access.
+       * @returns true if this is a new namespace (not in baseline)
+       */
+      recordNamespaceAccess(namespace) {
+        if (namespace.startsWith("_")) return false;
+        const isNew = !this.profile.known_namespaces.includes(namespace);
+        if (isNew) {
+          this.profile.known_namespaces.push(namespace);
+        }
+        return isNew;
+      }
+      /**
+       * Record a namespace read for bulk-read detection.
+       * @returns the number of reads in the current 60-second window
+       */
+      recordNamespaceRead(namespace) {
+        const now = Date.now();
+        if (!this.readWindows.has(namespace)) {
+          this.readWindows.set(namespace, []);
+        }
+        const window = this.readWindows.get(namespace);
+        window.push(now);
+        const cutoff = now - 6e4;
+        while (window.length > 0 && window[0] < cutoff) {
+          window.shift();
+        }
+        return window.length;
+      }
+      /**
+       * Record a counterparty DID interaction.
+       * @returns true if this is a new counterparty (not in baseline)
+       */
+      recordCounterparty(did) {
+        const isNew = !this.profile.known_counterparties.includes(did);
+        if (isNew) {
+          this.profile.known_counterparties.push(did);
+        }
+        return isNew;
+      }
+      /**
+       * Record a signing operation.
+       * @returns the number of signs in the current 60-second window
+       */
+      recordSign() {
+        const now = Date.now();
+        this.signWindow.push(now);
+        const cutoff = now - 6e4;
+        while (this.signWindow.length > 0 && this.signWindow[0] < cutoff) {
+          this.signWindow.shift();
+        }
+        return this.signWindow.length;
+      }
+      /**
+       * Get the current call rate for a tool (calls per minute).
+       */
+      getCallRate(toolName) {
+        return this.callWindows.get(toolName)?.length ?? 0;
+      }
+      /**
+       * Get the average call rate across all tools in the baseline.
+       */
+      getAverageCallRate() {
+        let total = 0;
+        let count = 0;
+        for (const window of this.callWindows.values()) {
+          total += window.length;
+          count++;
+        }
+        return count > 0 ? total / count : 0;
+      }
+      /** Whether this is the first session */
+      get isFirstSession() {
+        return this.profile.is_first_session;
+      }
+      /** Get a read-only view of the current profile */
+      getProfile() {
+        return { ...this.profile };
+      }
     };
   }
-  /**
-   * Load the previous session's baseline from storage.
-   * If none exists, this is a first session.
-   */
-  async load() {
-    try {
-      const raw = await this.storage.read(BASELINE_NAMESPACE, BASELINE_KEY);
-      if (!raw) return;
-      const encrypted = JSON.parse(bytesToString(raw));
-      const decrypted = decrypt(encrypted, this.encryptionKey);
-      const saved = JSON.parse(bytesToString(decrypted));
-      this.profile.known_namespaces = saved.known_namespaces ?? [];
-      this.profile.known_counterparties = saved.known_counterparties ?? [];
-      this.profile.is_first_session = false;
-    } catch {
-      this.profile.is_first_session = true;
-    }
-  }
-  /**
-   * Save the current baseline to storage (encrypted).
-   * Called at session end or periodically.
-   */
-  async save() {
-    this.profile.saved_at = (/* @__PURE__ */ new Date()).toISOString();
-    const serialized = stringToBytes(JSON.stringify(this.profile));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      BASELINE_NAMESPACE,
-      BASELINE_KEY,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-  }
-  /**
-   * Record a tool call for baseline tracking.
-   * Returns anomaly information if applicable.
-   */
-  recordToolCall(toolName) {
-    const now = Date.now();
-    this.profile.tool_call_counts[toolName] = (this.profile.tool_call_counts[toolName] ?? 0) + 1;
-    if (!this.callWindows.has(toolName)) {
-      this.callWindows.set(toolName, []);
-    }
-    const window = this.callWindows.get(toolName);
-    window.push(now);
-    const cutoff = now - 6e4;
-    while (window.length > 0 && window[0] < cutoff) {
-      window.shift();
-    }
-  }
-  /**
-   * Record a namespace access.
-   * @returns true if this is a new namespace (not in baseline)
-   */
-  recordNamespaceAccess(namespace) {
-    if (namespace.startsWith("_")) return false;
-    const isNew = !this.profile.known_namespaces.includes(namespace);
-    if (isNew) {
-      this.profile.known_namespaces.push(namespace);
-    }
-    return isNew;
-  }
-  /**
-   * Record a namespace read for bulk-read detection.
-   * @returns the number of reads in the current 60-second window
-   */
-  recordNamespaceRead(namespace) {
-    const now = Date.now();
-    if (!this.readWindows.has(namespace)) {
-      this.readWindows.set(namespace, []);
-    }
-    const window = this.readWindows.get(namespace);
-    window.push(now);
-    const cutoff = now - 6e4;
-    while (window.length > 0 && window[0] < cutoff) {
-      window.shift();
-    }
-    return window.length;
-  }
-  /**
-   * Record a counterparty DID interaction.
-   * @returns true if this is a new counterparty (not in baseline)
-   */
-  recordCounterparty(did) {
-    const isNew = !this.profile.known_counterparties.includes(did);
-    if (isNew) {
-      this.profile.known_counterparties.push(did);
-    }
-    return isNew;
-  }
-  /**
-   * Record a signing operation.
-   * @returns the number of signs in the current 60-second window
-   */
-  recordSign() {
-    const now = Date.now();
-    this.signWindow.push(now);
-    const cutoff = now - 6e4;
-    while (this.signWindow.length > 0 && this.signWindow[0] < cutoff) {
-      this.signWindow.shift();
-    }
-    return this.signWindow.length;
-  }
-  /**
-   * Get the current call rate for a tool (calls per minute).
-   */
-  getCallRate(toolName) {
-    return this.callWindows.get(toolName)?.length ?? 0;
-  }
-  /**
-   * Get the average call rate across all tools in the baseline.
-   */
-  getAverageCallRate() {
-    let total = 0;
-    let count = 0;
-    for (const window of this.callWindows.values()) {
-      total += window.length;
-      count++;
-    }
-    return count > 0 ? total / count : 0;
-  }
-  /** Whether this is the first session */
-  get isFirstSession() {
-    return this.profile.is_first_session;
-  }
-  /** Get a read-only view of the current profile */
-  getProfile() {
-    return { ...this.profile };
-  }
-};
-
-// src/principal-policy/approval-channel.ts
-var StderrApprovalChannel = class {
-  constructor(_config) {
-  }
-  async requestApproval(request) {
-    const prompt = this.formatPrompt(request);
-    process.stderr.write(prompt + "\n");
-    return {
-      decision: "deny",
-      decided_at: (/* @__PURE__ */ new Date()).toISOString(),
-      decided_by: "stderr:non-interactive"
-    };
-  }
-  formatPrompt(request) {
-    const tierLabel = request.tier === 1 ? "Tier 1 \u2014 always requires approval" : "Tier 2 \u2014 behavioral anomaly detected";
-    const contextLines = Object.entries(request.context).map(([k, v]) => `  ${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`).join("\n");
-    return [
-      "",
-      "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557",
-      "\u2551  SANCTUARY: Operation Denied (non-interactive channel)           \u2551",
-      "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563",
-      `\u2551  Operation:  ${request.operation.padEnd(50)}\u2551`,
-      `\u2551  ${tierLabel.padEnd(62)}\u2551`,
-      `\u2551  Reason:     ${request.reason.slice(0, 50).padEnd(50)}\u2551`,
-      "\u2551                                                                  \u2551",
-      `\u2551  Details:                                                        \u2551`,
-      ...contextLines.split("\n").map(
-        (line) => `\u2551    ${line.padEnd(60)}\u2551`
-      ),
-      "\u2551                                                                  \u2551",
-      "\u2551  Denied: stderr channel cannot accept input (SEC-016)            \u2551",
-      "\u2551  Use dashboard or webhook channel for interactive approval.      \u2551",
-      "\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D",
-      ""
-    ].join("\n");
-  }
-};
+});
 
 // src/principal-policy/dashboard-html.ts
 function generateLoginHTML(options) {
@@ -5633,676 +2746,3780 @@ function generateDashboardHTML(options) {
 </body>
 </html>`;
 }
-
-// src/principal-policy/dashboard.ts
-var SESSION_TTL_REMOTE_MS = 5 * 60 * 1e3;
-var SESSION_TTL_LOCAL_MS = 24 * 60 * 60 * 1e3;
-var MAX_SESSIONS = 1e3;
-var RATE_LIMIT_WINDOW_MS = 6e4;
-var RATE_LIMIT_GENERAL = 120;
-var RATE_LIMIT_DECISIONS = 20;
-var MAX_RATE_LIMIT_ENTRIES = 1e4;
-var DashboardApprovalChannel = class {
-  config;
-  pending = /* @__PURE__ */ new Map();
-  sseClients = /* @__PURE__ */ new Set();
-  httpServer = null;
-  policy = null;
-  baseline = null;
-  auditLog = null;
-  dashboardHTML;
-  loginHTML;
-  authToken;
-  useTLS;
-  /** Session TTL: longer for localhost, shorter for remote */
-  sessionTTLMs;
-  /** SEC-012: Short-lived session store. Sessions replace URL query tokens. */
-  sessions = /* @__PURE__ */ new Map();
-  sessionCleanupTimer = null;
-  /** Rate limiting: per-IP request tracking */
-  rateLimits = /* @__PURE__ */ new Map();
-  constructor(config) {
-    this.config = config;
-    this.authToken = config.auth_token;
-    this.useTLS = !!(config.tls?.cert_path && config.tls?.key_path);
-    const isLocalhost = config.host === "127.0.0.1" || config.host === "localhost" || config.host === "::1";
-    this.sessionTTLMs = isLocalhost ? SESSION_TTL_LOCAL_MS : SESSION_TTL_REMOTE_MS;
-    this.dashboardHTML = generateDashboardHTML({
-      timeoutSeconds: config.timeout_seconds,
-      serverVersion: SANCTUARY_VERSION,
-      authToken: this.authToken
-    });
-    this.loginHTML = generateLoginHTML({ serverVersion: SANCTUARY_VERSION });
-    this.sessionCleanupTimer = setInterval(() => this.cleanupSessions(), 6e4);
+var init_dashboard_html = __esm({
+  "src/principal-policy/dashboard-html.ts"() {
   }
-  /**
-   * Inject dependencies after construction.
-   * Called from index.ts after all components are initialized.
-   */
-  setDependencies(deps) {
-    this.policy = deps.policy;
-    this.baseline = deps.baseline;
-    this.auditLog = deps.auditLog;
-  }
-  /**
-   * Start the HTTP(S) server for the dashboard.
-   */
-  async start() {
-    return new Promise((resolve, reject) => {
-      const handler = (req, res) => this.handleRequest(req, res);
-      if (this.useTLS && this.config.tls) {
-        const tlsOpts = {
-          cert: readFileSync(this.config.tls.cert_path),
-          key: readFileSync(this.config.tls.key_path)
-        };
-        this.httpServer = createServer$1(tlsOpts, handler);
-      } else {
-        this.httpServer = createServer$2(handler);
+});
+var SESSION_TTL_REMOTE_MS, SESSION_TTL_LOCAL_MS, MAX_SESSIONS, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_GENERAL, RATE_LIMIT_DECISIONS, MAX_RATE_LIMIT_ENTRIES, DashboardApprovalChannel;
+var init_dashboard = __esm({
+  "src/principal-policy/dashboard.ts"() {
+    init_config();
+    init_dashboard_html();
+    SESSION_TTL_REMOTE_MS = 5 * 60 * 1e3;
+    SESSION_TTL_LOCAL_MS = 24 * 60 * 60 * 1e3;
+    MAX_SESSIONS = 1e3;
+    RATE_LIMIT_WINDOW_MS = 6e4;
+    RATE_LIMIT_GENERAL = 120;
+    RATE_LIMIT_DECISIONS = 20;
+    MAX_RATE_LIMIT_ENTRIES = 1e4;
+    DashboardApprovalChannel = class {
+      config;
+      pending = /* @__PURE__ */ new Map();
+      sseClients = /* @__PURE__ */ new Set();
+      httpServer = null;
+      policy = null;
+      baseline = null;
+      auditLog = null;
+      dashboardHTML;
+      loginHTML;
+      authToken;
+      useTLS;
+      /** Session TTL: longer for localhost, shorter for remote */
+      sessionTTLMs;
+      /** SEC-012: Short-lived session store. Sessions replace URL query tokens. */
+      sessions = /* @__PURE__ */ new Map();
+      sessionCleanupTimer = null;
+      /** Rate limiting: per-IP request tracking */
+      rateLimits = /* @__PURE__ */ new Map();
+      constructor(config) {
+        this.config = config;
+        this.authToken = config.auth_token;
+        this.useTLS = !!(config.tls?.cert_path && config.tls?.key_path);
+        const isLocalhost = config.host === "127.0.0.1" || config.host === "localhost" || config.host === "::1";
+        this.sessionTTLMs = isLocalhost ? SESSION_TTL_LOCAL_MS : SESSION_TTL_REMOTE_MS;
+        this.dashboardHTML = generateDashboardHTML({
+          timeoutSeconds: config.timeout_seconds,
+          serverVersion: SANCTUARY_VERSION,
+          authToken: this.authToken
+        });
+        this.loginHTML = generateLoginHTML({ serverVersion: SANCTUARY_VERSION });
+        this.sessionCleanupTimer = setInterval(() => this.cleanupSessions(), 6e4);
       }
-      const protocol = this.useTLS ? "https" : "http";
-      const baseUrl = `${protocol}://${this.config.host}:${this.config.port}`;
-      this.httpServer.listen(this.config.port, this.config.host, () => {
-        const sessionUrl = this.authToken ? this.createSessionUrl() : baseUrl;
-        process.stderr.write(
-          `
+      /**
+       * Inject dependencies after construction.
+       * Called from index.ts after all components are initialized.
+       */
+      setDependencies(deps) {
+        this.policy = deps.policy;
+        this.baseline = deps.baseline;
+        this.auditLog = deps.auditLog;
+      }
+      /**
+       * Start the HTTP(S) server for the dashboard.
+       */
+      async start() {
+        return new Promise((resolve, reject) => {
+          const handler = (req, res) => this.handleRequest(req, res);
+          if (this.useTLS && this.config.tls) {
+            const tlsOpts = {
+              cert: readFileSync(this.config.tls.cert_path),
+              key: readFileSync(this.config.tls.key_path)
+            };
+            this.httpServer = createServer$2(tlsOpts, handler);
+          } else {
+            this.httpServer = createServer$1(handler);
+          }
+          const protocol = this.useTLS ? "https" : "http";
+          const baseUrl = `${protocol}://${this.config.host}:${this.config.port}`;
+          this.httpServer.listen(this.config.port, this.config.host, () => {
+            const sessionUrl = this.authToken ? this.createSessionUrl() : baseUrl;
+            process.stderr.write(
+              `
   Sanctuary Principal Dashboard: ${baseUrl}
 `
-        );
-        if (this.authToken) {
-          const hint = this.authToken.slice(0, 4) + "..." + this.authToken.slice(-4);
-          process.stderr.write(
-            `  Auth token: ${hint}
+            );
+            if (this.authToken) {
+              const hint = this.authToken.slice(0, 4) + "..." + this.authToken.slice(-4);
+              process.stderr.write(
+                `  Auth token: ${hint}
 `
-          );
-        }
-        process.stderr.write(`
+              );
+            }
+            process.stderr.write(`
 `);
-        const isTest = !!(process.env.VITEST || process.env.NODE_ENV === "test" || process.env.CI);
-        const isLocalhost = this.config.host === "127.0.0.1" || this.config.host === "localhost" || this.config.host === "::1";
-        const shouldAutoOpen = !isTest && (this.config.auto_open ?? isLocalhost);
-        if (shouldAutoOpen) {
-          this.openInBrowser(sessionUrl);
-        }
-        resolve();
-      });
-      this.httpServer.on("error", reject);
-    });
-  }
-  /**
-   * Stop the HTTP server and clean up.
-   */
-  async stop() {
-    for (const [, pending] of this.pending) {
-      clearTimeout(pending.timer);
-      pending.resolve({
-        decision: "deny",
-        decided_at: (/* @__PURE__ */ new Date()).toISOString(),
-        decided_by: "auto"
-      });
-    }
-    this.pending.clear();
-    for (const client of this.sseClients) {
-      client.end();
-    }
-    this.sseClients.clear();
-    this.sessions.clear();
-    if (this.sessionCleanupTimer) {
-      clearInterval(this.sessionCleanupTimer);
-      this.sessionCleanupTimer = null;
-    }
-    this.rateLimits.clear();
-    if (this.httpServer) {
-      return new Promise((resolve) => {
-        this.httpServer.close(() => resolve());
-      });
-    }
-  }
-  /**
-   * Request approval from the human via the dashboard.
-   * Blocks until the human approves/denies or timeout occurs.
-   */
-  async requestApproval(request) {
-    const id = randomBytes$1(8).toString("hex");
-    process.stderr.write(
-      `[Sanctuary] Approval required: ${request.operation} (Tier ${request.tier}) \u2014 open dashboard to respond
-`
-    );
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        const response = {
-          // SEC-002: Timeout ALWAYS denies. No configuration can change this.
-          decision: "deny",
-          decided_at: (/* @__PURE__ */ new Date()).toISOString(),
-          decided_by: "timeout"
-        };
-        this.broadcastSSE("request-resolved", {
-          request_id: id,
-          decision: response.decision,
-          decided_by: "timeout"
+            const isTest = !!(process.env.VITEST || process.env.NODE_ENV === "test" || process.env.CI);
+            const isLocalhost = this.config.host === "127.0.0.1" || this.config.host === "localhost" || this.config.host === "::1";
+            const shouldAutoOpen = !isTest && (this.config.auto_open ?? isLocalhost);
+            if (shouldAutoOpen) {
+              this.openInBrowser(sessionUrl);
+            }
+            resolve();
+          });
+          this.httpServer.on("error", reject);
         });
-        resolve(response);
-      }, this.config.timeout_seconds * 1e3);
-      const pending = {
-        id,
-        request,
-        resolve,
-        timer,
-        created_at: (/* @__PURE__ */ new Date()).toISOString()
-      };
-      this.pending.set(id, pending);
-      this.broadcastSSE("pending-request", {
-        request_id: id,
-        operation: request.operation,
-        tier: request.tier,
-        reason: request.reason,
-        context: request.context,
-        timestamp: request.timestamp
-      });
-    });
-  }
-  // ── Authentication ──────────────────────────────────────────────────
-  /**
-   * Verify bearer token authentication.
-   *
-   * SEC-012: The long-lived auth token is ONLY accepted via the Authorization
-   * header — never in URL query strings. For SSE and page loads that cannot
-   * set headers, a short-lived session token (obtained via POST /auth/session)
-   * is accepted via ?session= query parameter.
-   *
-   * Returns true if auth passes, false if blocked (response already sent).
-   */
-  checkAuth(req, url, res) {
-    if (!this.authToken) return true;
-    const authHeader = req.headers.authorization;
-    if (authHeader) {
-      const parts = authHeader.split(" ");
-      if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
-        return true;
       }
-    }
-    const sessionId = url.searchParams.get("session");
-    if (sessionId && this.validateSession(sessionId)) {
-      return true;
-    }
-    const cookieSession = this.parseCookie(req, "sanctuary_session");
-    if (cookieSession && this.validateSession(cookieSession)) {
-      return true;
-    }
-    res.writeHead(401, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Unauthorized \u2014 use Authorization: Bearer header or a valid session" }));
-    return false;
-  }
-  /**
-   * Check if a request is authenticated WITHOUT sending a response.
-   * Used to decide between login page vs dashboard for GET /.
-   */
-  isAuthenticated(req, url) {
-    if (!this.authToken) return true;
-    const authHeader = req.headers.authorization;
-    if (authHeader) {
-      const parts = authHeader.split(" ");
-      if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
-        return true;
-      }
-    }
-    const sessionId = url.searchParams.get("session");
-    if (sessionId && this.validateSession(sessionId)) return true;
-    const cookieSession = this.parseCookie(req, "sanctuary_session");
-    if (cookieSession && this.validateSession(cookieSession)) return true;
-    return false;
-  }
-  /**
-   * Parse a specific cookie value from the request.
-   */
-  parseCookie(req, name) {
-    const header = req.headers.cookie;
-    if (!header) return null;
-    for (const part of header.split(";")) {
-      const [key, ...rest] = part.split("=");
-      if (key?.trim() === name) {
-        return rest.join("=").trim();
-      }
-    }
-    return null;
-  }
-  // ── Session Management (SEC-012) ──────────────────────────────────
-  /**
-   * Create a short-lived session by exchanging the long-lived auth token
-   * (provided in the Authorization header) for a session ID.
-   */
-  createSession() {
-    if (this.sessions.size >= MAX_SESSIONS) {
-      this.cleanupSessions();
-      if (this.sessions.size >= MAX_SESSIONS) {
-        const oldest = [...this.sessions.entries()].sort(
-          (a, b) => a[1].created_at - b[1].created_at
-        )[0];
-        if (oldest) this.sessions.delete(oldest[0]);
-      }
-    }
-    const id = randomBytes$1(32).toString("hex");
-    const now = Date.now();
-    this.sessions.set(id, {
-      id,
-      created_at: now,
-      expires_at: now + this.sessionTTLMs
-    });
-    return id;
-  }
-  /**
-   * Validate a session ID — must exist and not be expired.
-   */
-  validateSession(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session) return false;
-    if (Date.now() > session.expires_at) {
-      this.sessions.delete(sessionId);
-      return false;
-    }
-    return true;
-  }
-  /**
-   * Remove all expired sessions.
-   */
-  cleanupSessions() {
-    const now = Date.now();
-    for (const [id, session] of this.sessions) {
-      if (now > session.expires_at) {
-        this.sessions.delete(id);
-      }
-    }
-  }
-  // ── Rate Limiting ─────────────────────────────────────────────────
-  /**
-   * Get the remote address from a request, normalizing IPv6-mapped IPv4.
-   */
-  getRemoteAddr(req) {
-    const addr = req.socket.remoteAddress ?? "unknown";
-    return addr.startsWith("::ffff:") ? addr.slice(7) : addr;
-  }
-  /**
-   * Check rate limit for a request. Returns true if allowed, false if rate-limited.
-   * When rate-limited, sends a 429 response.
-   */
-  checkRateLimit(req, res, type) {
-    const addr = this.getRemoteAddr(req);
-    const now = Date.now();
-    const windowStart = now - RATE_LIMIT_WINDOW_MS;
-    let entry = this.rateLimits.get(addr);
-    if (!entry) {
-      if (this.rateLimits.size >= MAX_RATE_LIMIT_ENTRIES) {
-        this.pruneRateLimits(now);
-      }
-      entry = { general: [], decisions: [] };
-      this.rateLimits.set(addr, entry);
-    }
-    entry.general = entry.general.filter((t) => t > windowStart);
-    entry.decisions = entry.decisions.filter((t) => t > windowStart);
-    const limit = type === "decisions" ? RATE_LIMIT_DECISIONS : RATE_LIMIT_GENERAL;
-    const timestamps = entry[type];
-    if (timestamps.length >= limit) {
-      const retryAfter = Math.ceil((timestamps[0] + RATE_LIMIT_WINDOW_MS - now) / 1e3);
-      res.writeHead(429, {
-        "Content-Type": "application/json",
-        "Retry-After": String(Math.max(1, retryAfter))
-      });
-      res.end(JSON.stringify({
-        error: "Rate limit exceeded",
-        retry_after_seconds: Math.max(1, retryAfter)
-      }));
-      return false;
-    }
-    timestamps.push(now);
-    return true;
-  }
-  /**
-   * Remove stale entries from the rate limit map.
-   */
-  pruneRateLimits(now) {
-    const windowStart = now - RATE_LIMIT_WINDOW_MS;
-    for (const [addr, entry] of this.rateLimits) {
-      const hasRecent = entry.general.some((t) => t > windowStart) || entry.decisions.some((t) => t > windowStart);
-      if (!hasRecent) {
-        this.rateLimits.delete(addr);
-      }
-    }
-  }
-  // ── HTTP Request Handler ────────────────────────────────────────────
-  handleRequest(req, res) {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-    const method = req.method ?? "GET";
-    const origin = req.headers.origin;
-    const protocol = this.useTLS ? "https" : "http";
-    const selfOrigin = `${protocol}://${this.config.host}:${this.config.port}`;
-    if (origin === selfOrigin) {
-      res.setHeader("Access-Control-Allow-Origin", origin);
-    }
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    if (method === "OPTIONS") {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-    if (method === "POST" && url.pathname === "/auth/session") {
-      if (!this.checkRateLimit(req, res, "general")) return;
-      try {
-        this.handleSessionExchange(req, res);
-      } catch {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Internal server error" }));
-      }
-      return;
-    }
-    if (method === "GET" && url.pathname === "/" && this.authToken) {
-      if (!this.isAuthenticated(req, url)) {
-        if (!this.checkRateLimit(req, res, "general")) return;
-        this.serveLoginPage(res);
-        return;
-      }
-    }
-    if (!this.checkAuth(req, url, res)) return;
-    if (!this.checkRateLimit(req, res, "general")) return;
-    try {
-      if (method === "GET" && url.pathname === "/") {
-        this.serveDashboard(res);
-      } else if (method === "GET" && url.pathname === "/events") {
-        this.handleSSE(req, res);
-      } else if (method === "GET" && url.pathname === "/api/status") {
-        this.handleStatus(res);
-      } else if (method === "GET" && url.pathname === "/api/pending") {
-        this.handlePendingList(res);
-      } else if (method === "GET" && url.pathname === "/api/audit-log") {
-        this.handleAuditLog(url, res);
-      } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
-        if (!this.checkRateLimit(req, res, "decisions")) return;
-        const id = url.pathname.slice("/api/approve/".length);
-        this.handleDecision(id, "approve", res);
-      } else if (method === "POST" && url.pathname.startsWith("/api/deny/")) {
-        if (!this.checkRateLimit(req, res, "decisions")) return;
-        const id = url.pathname.slice("/api/deny/".length);
-        this.handleDecision(id, "deny", res);
-      } else {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Not found" }));
-      }
-    } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Internal server error" }));
-    }
-  }
-  // ── Route Handlers ──────────────────────────────────────────────────
-  /**
-   * SEC-012: Exchange a long-lived auth token (in Authorization header)
-   * for a short-lived session ID. The session ID can be used in URL
-   * query parameters without exposing the long-lived credential.
-   *
-   * This endpoint performs its OWN auth check (header-only) because it
-   * must reject query-parameter tokens and is called before the
-   * normal checkAuth flow.
-   */
-  handleSessionExchange(req, res) {
-    if (!this.authToken) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ session_id: "no-auth" }));
-      return;
-    }
-    const authHeader = req.headers.authorization;
-    if (!authHeader) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Authorization header required" }));
-      return;
-    }
-    const parts = authHeader.split(" ");
-    if (parts.length !== 2 || parts[0] !== "Bearer" || parts[1] !== this.authToken) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Invalid bearer token" }));
-      return;
-    }
-    const sessionId = this.createSession();
-    const ttlSeconds = Math.floor(this.sessionTTLMs / 1e3);
-    res.writeHead(200, {
-      "Content-Type": "application/json",
-      "Set-Cookie": `sanctuary_session=${sessionId}; Path=/; SameSite=Strict; Max-Age=${ttlSeconds}`
-    });
-    res.end(JSON.stringify({
-      session_id: sessionId,
-      expires_in_seconds: ttlSeconds
-    }));
-  }
-  serveLoginPage(res) {
-    res.writeHead(200, {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-cache, no-store"
-    });
-    res.end(this.loginHTML);
-  }
-  serveDashboard(res) {
-    res.writeHead(200, {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-cache"
-    });
-    res.end(this.dashboardHTML);
-  }
-  handleSSE(req, res) {
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive"
-    });
-    const initData = {};
-    if (this.baseline) {
-      initData.baseline = this.baseline.getProfile();
-    }
-    if (this.policy) {
-      initData.policy = {
-        tier1_always_approve: this.policy.tier1_always_approve,
-        tier2_anomaly: this.policy.tier2_anomaly,
-        tier3_always_allow: this.policy.tier3_always_allow,
-        approval_channel: {
-          type: this.policy.approval_channel.type,
-          timeout_seconds: this.policy.approval_channel.timeout_seconds,
-          auto_deny: true
-          // SEC-002: hardcoded, not configurable
+      /**
+       * Stop the HTTP server and clean up.
+       */
+      async stop() {
+        for (const [, pending] of this.pending) {
+          clearTimeout(pending.timer);
+          pending.resolve({
+            decision: "deny",
+            decided_at: (/* @__PURE__ */ new Date()).toISOString(),
+            decided_by: "auto"
+          });
         }
-      };
-    }
-    const pendingList = Array.from(this.pending.values()).map((p) => ({
-      request_id: p.id,
-      operation: p.request.operation,
-      tier: p.request.tier,
-      reason: p.request.reason,
-      context: p.request.context,
-      timestamp: p.request.timestamp
-    }));
-    if (pendingList.length > 0) {
-      initData.pending = pendingList;
-    }
-    res.write(`event: init
+        this.pending.clear();
+        for (const client of this.sseClients) {
+          client.end();
+        }
+        this.sseClients.clear();
+        this.sessions.clear();
+        if (this.sessionCleanupTimer) {
+          clearInterval(this.sessionCleanupTimer);
+          this.sessionCleanupTimer = null;
+        }
+        this.rateLimits.clear();
+        if (this.httpServer) {
+          return new Promise((resolve) => {
+            this.httpServer.close(() => resolve());
+          });
+        }
+      }
+      /**
+       * Request approval from the human via the dashboard.
+       * Blocks until the human approves/denies or timeout occurs.
+       */
+      async requestApproval(request) {
+        const id = randomBytes$1(8).toString("hex");
+        process.stderr.write(
+          `[Sanctuary] Approval required: ${request.operation} (Tier ${request.tier}) \u2014 open dashboard to respond
+`
+        );
+        return new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            this.pending.delete(id);
+            const response = {
+              // SEC-002: Timeout ALWAYS denies. No configuration can change this.
+              decision: "deny",
+              decided_at: (/* @__PURE__ */ new Date()).toISOString(),
+              decided_by: "timeout"
+            };
+            this.broadcastSSE("request-resolved", {
+              request_id: id,
+              decision: response.decision,
+              decided_by: "timeout"
+            });
+            resolve(response);
+          }, this.config.timeout_seconds * 1e3);
+          const pending = {
+            id,
+            request,
+            resolve,
+            timer,
+            created_at: (/* @__PURE__ */ new Date()).toISOString()
+          };
+          this.pending.set(id, pending);
+          this.broadcastSSE("pending-request", {
+            request_id: id,
+            operation: request.operation,
+            tier: request.tier,
+            reason: request.reason,
+            context: request.context,
+            timestamp: request.timestamp
+          });
+        });
+      }
+      // ── Authentication ──────────────────────────────────────────────────
+      /**
+       * Verify bearer token authentication.
+       *
+       * SEC-012: The long-lived auth token is ONLY accepted via the Authorization
+       * header — never in URL query strings. For SSE and page loads that cannot
+       * set headers, a short-lived session token (obtained via POST /auth/session)
+       * is accepted via ?session= query parameter.
+       *
+       * Returns true if auth passes, false if blocked (response already sent).
+       */
+      checkAuth(req, url, res) {
+        if (!this.authToken) return true;
+        const authHeader = req.headers.authorization;
+        if (authHeader) {
+          const parts = authHeader.split(" ");
+          if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
+            return true;
+          }
+        }
+        const sessionId = url.searchParams.get("session");
+        if (sessionId && this.validateSession(sessionId)) {
+          return true;
+        }
+        const cookieSession = this.parseCookie(req, "sanctuary_session");
+        if (cookieSession && this.validateSession(cookieSession)) {
+          return true;
+        }
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized \u2014 use Authorization: Bearer header or a valid session" }));
+        return false;
+      }
+      /**
+       * Check if a request is authenticated WITHOUT sending a response.
+       * Used to decide between login page vs dashboard for GET /.
+       */
+      isAuthenticated(req, url) {
+        if (!this.authToken) return true;
+        const authHeader = req.headers.authorization;
+        if (authHeader) {
+          const parts = authHeader.split(" ");
+          if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
+            return true;
+          }
+        }
+        const sessionId = url.searchParams.get("session");
+        if (sessionId && this.validateSession(sessionId)) return true;
+        const cookieSession = this.parseCookie(req, "sanctuary_session");
+        if (cookieSession && this.validateSession(cookieSession)) return true;
+        return false;
+      }
+      /**
+       * Parse a specific cookie value from the request.
+       */
+      parseCookie(req, name) {
+        const header = req.headers.cookie;
+        if (!header) return null;
+        for (const part of header.split(";")) {
+          const [key, ...rest] = part.split("=");
+          if (key?.trim() === name) {
+            return rest.join("=").trim();
+          }
+        }
+        return null;
+      }
+      // ── Session Management (SEC-012) ──────────────────────────────────
+      /**
+       * Create a short-lived session by exchanging the long-lived auth token
+       * (provided in the Authorization header) for a session ID.
+       */
+      createSession() {
+        if (this.sessions.size >= MAX_SESSIONS) {
+          this.cleanupSessions();
+          if (this.sessions.size >= MAX_SESSIONS) {
+            const oldest = [...this.sessions.entries()].sort(
+              (a, b) => a[1].created_at - b[1].created_at
+            )[0];
+            if (oldest) this.sessions.delete(oldest[0]);
+          }
+        }
+        const id = randomBytes$1(32).toString("hex");
+        const now = Date.now();
+        this.sessions.set(id, {
+          id,
+          created_at: now,
+          expires_at: now + this.sessionTTLMs
+        });
+        return id;
+      }
+      /**
+       * Validate a session ID — must exist and not be expired.
+       */
+      validateSession(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return false;
+        if (Date.now() > session.expires_at) {
+          this.sessions.delete(sessionId);
+          return false;
+        }
+        return true;
+      }
+      /**
+       * Remove all expired sessions.
+       */
+      cleanupSessions() {
+        const now = Date.now();
+        for (const [id, session] of this.sessions) {
+          if (now > session.expires_at) {
+            this.sessions.delete(id);
+          }
+        }
+      }
+      // ── Rate Limiting ─────────────────────────────────────────────────
+      /**
+       * Get the remote address from a request, normalizing IPv6-mapped IPv4.
+       */
+      getRemoteAddr(req) {
+        const addr = req.socket.remoteAddress ?? "unknown";
+        return addr.startsWith("::ffff:") ? addr.slice(7) : addr;
+      }
+      /**
+       * Check rate limit for a request. Returns true if allowed, false if rate-limited.
+       * When rate-limited, sends a 429 response.
+       */
+      checkRateLimit(req, res, type) {
+        const addr = this.getRemoteAddr(req);
+        const now = Date.now();
+        const windowStart = now - RATE_LIMIT_WINDOW_MS;
+        let entry = this.rateLimits.get(addr);
+        if (!entry) {
+          if (this.rateLimits.size >= MAX_RATE_LIMIT_ENTRIES) {
+            this.pruneRateLimits(now);
+          }
+          entry = { general: [], decisions: [] };
+          this.rateLimits.set(addr, entry);
+        }
+        entry.general = entry.general.filter((t) => t > windowStart);
+        entry.decisions = entry.decisions.filter((t) => t > windowStart);
+        const limit = type === "decisions" ? RATE_LIMIT_DECISIONS : RATE_LIMIT_GENERAL;
+        const timestamps = entry[type];
+        if (timestamps.length >= limit) {
+          const retryAfter = Math.ceil((timestamps[0] + RATE_LIMIT_WINDOW_MS - now) / 1e3);
+          res.writeHead(429, {
+            "Content-Type": "application/json",
+            "Retry-After": String(Math.max(1, retryAfter))
+          });
+          res.end(JSON.stringify({
+            error: "Rate limit exceeded",
+            retry_after_seconds: Math.max(1, retryAfter)
+          }));
+          return false;
+        }
+        timestamps.push(now);
+        return true;
+      }
+      /**
+       * Remove stale entries from the rate limit map.
+       */
+      pruneRateLimits(now) {
+        const windowStart = now - RATE_LIMIT_WINDOW_MS;
+        for (const [addr, entry] of this.rateLimits) {
+          const hasRecent = entry.general.some((t) => t > windowStart) || entry.decisions.some((t) => t > windowStart);
+          if (!hasRecent) {
+            this.rateLimits.delete(addr);
+          }
+        }
+      }
+      // ── HTTP Request Handler ────────────────────────────────────────────
+      handleRequest(req, res) {
+        const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+        const method = req.method ?? "GET";
+        const origin = req.headers.origin;
+        const protocol = this.useTLS ? "https" : "http";
+        const selfOrigin = `${protocol}://${this.config.host}:${this.config.port}`;
+        if (origin === selfOrigin) {
+          res.setHeader("Access-Control-Allow-Origin", origin);
+        }
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        if (method === "OPTIONS") {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+        if (method === "POST" && url.pathname === "/auth/session") {
+          if (!this.checkRateLimit(req, res, "general")) return;
+          try {
+            this.handleSessionExchange(req, res);
+          } catch {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+          return;
+        }
+        if (method === "GET" && url.pathname === "/" && this.authToken) {
+          if (!this.isAuthenticated(req, url)) {
+            if (!this.checkRateLimit(req, res, "general")) return;
+            this.serveLoginPage(res);
+            return;
+          }
+        }
+        if (!this.checkAuth(req, url, res)) return;
+        if (!this.checkRateLimit(req, res, "general")) return;
+        try {
+          if (method === "GET" && url.pathname === "/") {
+            this.serveDashboard(res);
+          } else if (method === "GET" && url.pathname === "/events") {
+            this.handleSSE(req, res);
+          } else if (method === "GET" && url.pathname === "/api/status") {
+            this.handleStatus(res);
+          } else if (method === "GET" && url.pathname === "/api/pending") {
+            this.handlePendingList(res);
+          } else if (method === "GET" && url.pathname === "/api/audit-log") {
+            this.handleAuditLog(url, res);
+          } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
+            if (!this.checkRateLimit(req, res, "decisions")) return;
+            const id = url.pathname.slice("/api/approve/".length);
+            this.handleDecision(id, "approve", res);
+          } else if (method === "POST" && url.pathname.startsWith("/api/deny/")) {
+            if (!this.checkRateLimit(req, res, "decisions")) return;
+            const id = url.pathname.slice("/api/deny/".length);
+            this.handleDecision(id, "deny", res);
+          } else {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Not found" }));
+          }
+        } catch (err) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      }
+      // ── Route Handlers ──────────────────────────────────────────────────
+      /**
+       * SEC-012: Exchange a long-lived auth token (in Authorization header)
+       * for a short-lived session ID. The session ID can be used in URL
+       * query parameters without exposing the long-lived credential.
+       *
+       * This endpoint performs its OWN auth check (header-only) because it
+       * must reject query-parameter tokens and is called before the
+       * normal checkAuth flow.
+       */
+      handleSessionExchange(req, res) {
+        if (!this.authToken) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ session_id: "no-auth" }));
+          return;
+        }
+        const authHeader = req.headers.authorization;
+        if (!authHeader) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Authorization header required" }));
+          return;
+        }
+        const parts = authHeader.split(" ");
+        if (parts.length !== 2 || parts[0] !== "Bearer" || parts[1] !== this.authToken) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid bearer token" }));
+          return;
+        }
+        const sessionId = this.createSession();
+        const ttlSeconds = Math.floor(this.sessionTTLMs / 1e3);
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Set-Cookie": `sanctuary_session=${sessionId}; Path=/; SameSite=Strict; Max-Age=${ttlSeconds}`
+        });
+        res.end(JSON.stringify({
+          session_id: sessionId,
+          expires_in_seconds: ttlSeconds
+        }));
+      }
+      serveLoginPage(res) {
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-cache, no-store"
+        });
+        res.end(this.loginHTML);
+      }
+      serveDashboard(res) {
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-cache"
+        });
+        res.end(this.dashboardHTML);
+      }
+      handleSSE(req, res) {
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive"
+        });
+        const initData = {};
+        if (this.baseline) {
+          initData.baseline = this.baseline.getProfile();
+        }
+        if (this.policy) {
+          initData.policy = {
+            tier1_always_approve: this.policy.tier1_always_approve,
+            tier2_anomaly: this.policy.tier2_anomaly,
+            tier3_always_allow: this.policy.tier3_always_allow,
+            approval_channel: {
+              type: this.policy.approval_channel.type,
+              timeout_seconds: this.policy.approval_channel.timeout_seconds,
+              auto_deny: true
+              // SEC-002: hardcoded, not configurable
+            }
+          };
+        }
+        const pendingList = Array.from(this.pending.values()).map((p) => ({
+          request_id: p.id,
+          operation: p.request.operation,
+          tier: p.request.tier,
+          reason: p.request.reason,
+          context: p.request.context,
+          timestamp: p.request.timestamp
+        }));
+        if (pendingList.length > 0) {
+          initData.pending = pendingList;
+        }
+        res.write(`event: init
 data: ${JSON.stringify(initData)}
 
 `);
-    this.sseClients.add(res);
-    req.on("close", () => {
-      this.sseClients.delete(res);
-    });
-  }
-  handleStatus(res) {
-    const status = {
-      pending_count: this.pending.size,
-      connected_clients: this.sseClients.size
-    };
-    if (this.baseline) {
-      status.baseline = this.baseline.getProfile();
-    }
-    if (this.policy) {
-      status.policy = {
-        version: this.policy.version,
-        tier1_always_approve: this.policy.tier1_always_approve,
-        tier2_anomaly: this.policy.tier2_anomaly,
-        tier3_always_allow: this.policy.tier3_always_allow,
-        approval_channel: {
-          type: this.policy.approval_channel.type,
-          timeout_seconds: this.policy.approval_channel.timeout_seconds,
-          auto_deny: true
-          // SEC-002: hardcoded, not configurable
+        this.sseClients.add(res);
+        req.on("close", () => {
+          this.sseClients.delete(res);
+        });
+      }
+      handleStatus(res) {
+        const status = {
+          pending_count: this.pending.size,
+          connected_clients: this.sseClients.size
+        };
+        if (this.baseline) {
+          status.baseline = this.baseline.getProfile();
         }
-      };
-    }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(status));
-  }
-  handlePendingList(res) {
-    const list = Array.from(this.pending.values()).map((p) => ({
-      id: p.id,
-      operation: p.request.operation,
-      tier: p.request.tier,
-      reason: p.request.reason,
-      context: p.request.context,
-      timestamp: p.request.timestamp,
-      created_at: p.created_at
-    }));
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(list));
-  }
-  handleAuditLog(url, res) {
-    const limit = parseInt(url.searchParams.get("limit") ?? "50", 10);
-    if (this.auditLog) {
-      this.auditLog.query({ limit }).then((entries) => {
+        if (this.policy) {
+          status.policy = {
+            version: this.policy.version,
+            tier1_always_approve: this.policy.tier1_always_approve,
+            tier2_anomaly: this.policy.tier2_anomaly,
+            tier3_always_allow: this.policy.tier3_always_allow,
+            approval_channel: {
+              type: this.policy.approval_channel.type,
+              timeout_seconds: this.policy.approval_channel.timeout_seconds,
+              auto_deny: true
+              // SEC-002: hardcoded, not configurable
+            }
+          };
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(entries));
-      }).catch(() => {
+        res.end(JSON.stringify(status));
+      }
+      handlePendingList(res) {
+        const list = Array.from(this.pending.values()).map((p) => ({
+          id: p.id,
+          operation: p.request.operation,
+          tier: p.request.tier,
+          reason: p.request.reason,
+          context: p.request.context,
+          timestamp: p.request.timestamp,
+          created_at: p.created_at
+        }));
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify([]));
-      });
-    } else {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify([]));
-    }
-  }
-  handleDecision(id, decision, res) {
-    const pending = this.pending.get(id);
-    if (!pending) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Request not found or already resolved" }));
-      return;
-    }
-    clearTimeout(pending.timer);
-    this.pending.delete(id);
-    const response = {
-      decision,
-      decided_at: (/* @__PURE__ */ new Date()).toISOString(),
-      decided_by: "human"
-    };
-    this.broadcastSSE("request-resolved", {
-      request_id: id,
-      decision,
-      decided_by: "human"
-    });
-    pending.resolve(response);
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ success: true, decision }));
-  }
-  // ── SSE Broadcasting ────────────────────────────────────────────────
-  broadcastSSE(event, data) {
-    const message = `event: ${event}
+        res.end(JSON.stringify(list));
+      }
+      handleAuditLog(url, res) {
+        const limit = parseInt(url.searchParams.get("limit") ?? "50", 10);
+        if (this.auditLog) {
+          this.auditLog.query({ limit }).then((entries) => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(entries));
+          }).catch(() => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify([]));
+          });
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify([]));
+        }
+      }
+      handleDecision(id, decision, res) {
+        const pending = this.pending.get(id);
+        if (!pending) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Request not found or already resolved" }));
+          return;
+        }
+        clearTimeout(pending.timer);
+        this.pending.delete(id);
+        const response = {
+          decision,
+          decided_at: (/* @__PURE__ */ new Date()).toISOString(),
+          decided_by: "human"
+        };
+        this.broadcastSSE("request-resolved", {
+          request_id: id,
+          decision,
+          decided_by: "human"
+        });
+        pending.resolve(response);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, decision }));
+      }
+      // ── SSE Broadcasting ────────────────────────────────────────────────
+      broadcastSSE(event, data) {
+        const message = `event: ${event}
 data: ${JSON.stringify(data)}
 
 `;
-    for (const client of this.sseClients) {
-      try {
-        client.write(message);
-      } catch {
-        this.sseClients.delete(client);
+        for (const client of this.sseClients) {
+          try {
+            client.write(message);
+          } catch {
+            this.sseClients.delete(client);
+          }
+        }
       }
-    }
-  }
-  /**
-   * Broadcast an audit entry to connected dashboards.
-   * Called externally when audit events happen.
-   */
-  broadcastAuditEntry(entry) {
-    this.broadcastSSE("audit-entry", entry);
-  }
-  /**
-   * Broadcast a baseline update to connected dashboards.
-   * Called externally after baseline changes.
-   */
-  broadcastBaselineUpdate() {
-    if (this.baseline) {
-      this.broadcastSSE("baseline-update", this.baseline.getProfile());
-    }
-  }
-  /**
-   * Broadcast a tool call event to connected dashboards.
-   * Called from the gate or router when a tool is invoked.
-   */
-  broadcastToolCall(data) {
-    this.broadcastSSE("tool-call", data);
-  }
-  /**
-   * Broadcast a context gate decision to connected dashboards.
-   */
-  broadcastContextGateDecision(data) {
-    this.broadcastSSE("context-gate-decision", data);
-  }
-  /**
-   * Broadcast current protection status to connected dashboards.
-   */
-  broadcastProtectionStatus(data) {
-    this.broadcastSSE("protection-status", data);
-  }
-  /**
-   * Open a URL in the system's default browser.
-   * Cross-platform: macOS (open), Linux (xdg-open), Windows (start).
-   * Fails silently — dashboard still works via terminal URL.
-   */
-  openInBrowser(url) {
-    const os = platform();
-    let cmd;
-    if (os === "darwin") {
-      cmd = `open "${url}"`;
-    } else if (os === "win32") {
-      cmd = `start "" "${url}"`;
-    } else {
-      cmd = `xdg-open "${url}"`;
-    }
-    exec(cmd, (err) => {
-      if (err) {
-        process.stderr.write(
-          `  (Could not auto-open browser. Open the URL above manually.)
+      /**
+       * Broadcast an audit entry to connected dashboards.
+       * Called externally when audit events happen.
+       */
+      broadcastAuditEntry(entry) {
+        this.broadcastSSE("audit-entry", entry);
+      }
+      /**
+       * Broadcast a baseline update to connected dashboards.
+       * Called externally after baseline changes.
+       */
+      broadcastBaselineUpdate() {
+        if (this.baseline) {
+          this.broadcastSSE("baseline-update", this.baseline.getProfile());
+        }
+      }
+      /**
+       * Broadcast a tool call event to connected dashboards.
+       * Called from the gate or router when a tool is invoked.
+       */
+      broadcastToolCall(data) {
+        this.broadcastSSE("tool-call", data);
+      }
+      /**
+       * Broadcast a context gate decision to connected dashboards.
+       */
+      broadcastContextGateDecision(data) {
+        this.broadcastSSE("context-gate-decision", data);
+      }
+      /**
+       * Broadcast current protection status to connected dashboards.
+       */
+      broadcastProtectionStatus(data) {
+        this.broadcastSSE("protection-status", data);
+      }
+      /**
+       * Open a URL in the system's default browser.
+       * Cross-platform: macOS (open), Linux (xdg-open), Windows (start).
+       * Fails silently — dashboard still works via terminal URL.
+       */
+      openInBrowser(url) {
+        const os = platform();
+        let cmd;
+        if (os === "darwin") {
+          cmd = `open "${url}"`;
+        } else if (os === "win32") {
+          cmd = `start "" "${url}"`;
+        } else {
+          cmd = `xdg-open "${url}"`;
+        }
+        exec(cmd, (err) => {
+          if (err) {
+            process.stderr.write(
+              `  (Could not auto-open browser. Open the URL above manually.)
 
 `
+            );
+          }
+        });
+      }
+      /**
+       * Create a pre-authenticated URL for the dashboard.
+       * Used by the sanctuary_dashboard_open tool and at startup.
+       */
+      createSessionUrl() {
+        const sessionId = this.createSession();
+        const protocol = this.useTLS ? "https" : "http";
+        return `${protocol}://${this.config.host}:${this.config.port}/?session=${sessionId}`;
+      }
+      /**
+       * Get the base URL for the dashboard.
+       */
+      getBaseUrl() {
+        const protocol = this.useTLS ? "https" : "http";
+        return `${protocol}://${this.config.host}:${this.config.port}`;
+      }
+      /** Get the number of pending requests */
+      get pendingCount() {
+        return this.pending.size;
+      }
+      /** Get the number of connected SSE clients */
+      get clientCount() {
+        return this.sseClients.size;
+      }
+    };
+  }
+});
+
+// src/dashboard-standalone.ts
+var dashboard_standalone_exports = {};
+__export(dashboard_standalone_exports, {
+  startStandaloneDashboard: () => startStandaloneDashboard
+});
+async function startStandaloneDashboard(options = {}) {
+  process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
+  const config = await loadConfig(options.configPath);
+  await mkdir(config.storage_path, { recursive: true, mode: 448 });
+  const storage = new FilesystemStorage(`${config.storage_path}/state`);
+  let masterKey;
+  const passphrase = options.passphrase ?? process.env.SANCTUARY_PASSPHRASE;
+  if (passphrase) {
+    let existingParams;
+    try {
+      const raw = await storage.read("_meta", "key-params");
+      if (raw) {
+        const { bytesToString: bytesToString2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
+        existingParams = JSON.parse(bytesToString2(raw));
+      }
+    } catch {
+    }
+    const result = await deriveMasterKey(passphrase, existingParams);
+    masterKey = result.key;
+  } else {
+    const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
+    const { stringToBytes: stringToBytes2, bytesToString: bytesToString2, fromBase64url: fromBase64url2, constantTimeEqual: constantTimeEqual2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
+    const existingHash = await storage.read("_meta", "recovery-key-hash");
+    if (existingHash) {
+      const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
+      if (!envRecoveryKey) {
+        throw new Error(
+          "Sanctuary Dashboard: Existing encrypted data found but no credentials provided.\nProvide SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY to start the dashboard.\nThe dashboard needs the same credentials as the MCP server to read encrypted data."
         );
       }
+      let recoveryKeyBytes;
+      try {
+        recoveryKeyBytes = fromBase64url2(envRecoveryKey);
+      } catch {
+        throw new Error(
+          "Sanctuary Dashboard: SANCTUARY_RECOVERY_KEY is not valid base64url."
+        );
+      }
+      if (recoveryKeyBytes.length !== 32) {
+        throw new Error(
+          "Sanctuary Dashboard: SANCTUARY_RECOVERY_KEY has incorrect length."
+        );
+      }
+      const providedHash = hashToString2(recoveryKeyBytes);
+      const storedHash = bytesToString2(existingHash);
+      const providedHashBytes = stringToBytes2(providedHash);
+      const storedHashBytes = stringToBytes2(storedHash);
+      if (!constantTimeEqual2(providedHashBytes, storedHashBytes)) {
+        throw new Error(
+          "Sanctuary Dashboard: Recovery key does not match. Use the exact recovery key from first run."
+        );
+      }
+      masterKey = recoveryKeyBytes;
+    } else {
+      const existingNamespaces = await storage.list("_meta");
+      const hasKeyParams = existingNamespaces.some((e) => e.key === "key-params");
+      if (hasKeyParams) {
+        throw new Error(
+          "Sanctuary Dashboard: Existing encrypted data found (passphrase-protected).\nProvide SANCTUARY_PASSPHRASE to start the dashboard.\nThe dashboard needs the same credentials as the MCP server to read encrypted data."
+        );
+      }
+      console.error(
+        "Warning: No existing Sanctuary data found. The standalone dashboard\nis typically started after the MCP server has been run at least once.\nGenerating a new master key for this installation.\n"
+      );
+      masterKey = generateRandomKey();
+      const recoveryKey = toBase64url(masterKey);
+      const keyHash = hashToString2(masterKey);
+      await storage.write("_meta", "recovery-key-hash", stringToBytes2(keyHash));
+      console.error(
+        `\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+\u2551  SANCTUARY: First Run \u2014 Recovery Key Generated          \u2551
+\u2551                                                          \u2551
+\u2551  Recovery Key: ${recoveryKey.slice(0, 20)}...             \u2551
+\u2551                                                          \u2551
+\u2551  SAVE THIS KEY. It will not be shown again.              \u2551
+\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D
+`
+      );
+    }
+  }
+  const auditLog = new AuditLog(storage, masterKey);
+  const policy = await loadPrincipalPolicy(config.storage_path);
+  const baseline = new BaselineTracker(storage, masterKey);
+  await baseline.load();
+  const dashboardPort = options.port ?? config.dashboard.port;
+  const dashboardHost = options.host ?? config.dashboard.host;
+  let authToken = config.dashboard.auth_token;
+  if (authToken === "auto") {
+    const { randomBytes: randomBytes4 } = await import('crypto');
+    authToken = randomBytes4(32).toString("hex");
+  }
+  const dashboard = new DashboardApprovalChannel({
+    port: dashboardPort,
+    host: dashboardHost,
+    timeout_seconds: policy.approval_channel.timeout_seconds,
+    auth_token: authToken,
+    tls: config.dashboard.tls,
+    auto_open: config.dashboard.auto_open ?? true
+    // Default to auto-open in standalone mode
+  });
+  dashboard.setDependencies({ policy, baseline, auditLog });
+  await dashboard.start();
+  console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
+  console.error(`Storage: ${config.storage_path}`);
+  console.error(`Listening: http://${dashboardHost}:${dashboardPort}`);
+  const saveBaseline = () => {
+    baseline.save().catch(() => {
     });
+  };
+  process.on("SIGINT", saveBaseline);
+  process.on("SIGTERM", saveBaseline);
+  return dashboard;
+}
+var init_dashboard_standalone = __esm({
+  "src/dashboard-standalone.ts"() {
+    init_config();
+    init_filesystem();
+    init_audit_log();
+    init_loader();
+    init_baseline();
+    init_dashboard();
+    init_key_derivation();
+    init_random();
+    init_encoding();
+  }
+});
+
+// src/index.ts
+init_config();
+init_filesystem();
+
+// src/l1-cognitive/state-store.ts
+init_encryption();
+init_hashing();
+
+// src/core/identity.ts
+init_encoding();
+init_encryption();
+init_hashing();
+init_random();
+function generateKeypair() {
+  const privateKey = randomBytes(32);
+  const publicKey = ed25519.getPublicKey(privateKey);
+  return { publicKey, privateKey };
+}
+function publicKeyToDid(publicKey) {
+  const multicodec = new Uint8Array([237, 1, ...publicKey]);
+  return `did:key:z${toBase64url(multicodec)}`;
+}
+function generateIdentityId(publicKey) {
+  const keyHash = hash(publicKey);
+  return Array.from(keyHash.slice(0, 16)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function createIdentity(label, encryptionKey, keyProtection) {
+  const { publicKey, privateKey } = generateKeypair();
+  const identityId = generateIdentityId(publicKey);
+  const did = publicKeyToDid(publicKey);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const encryptedPrivateKey = encrypt(privateKey, encryptionKey);
+  privateKey.fill(0);
+  const publicIdentity = {
+    identity_id: identityId,
+    label,
+    public_key: toBase64url(publicKey),
+    did,
+    created_at: now,
+    key_type: "ed25519",
+    key_protection: keyProtection
+  };
+  const storedIdentity = {
+    ...publicIdentity,
+    encrypted_private_key: encryptedPrivateKey,
+    rotation_history: []
+  };
+  return { publicIdentity, storedIdentity };
+}
+function sign(payload, encryptedPrivateKey, encryptionKey) {
+  const privateKey = decrypt(encryptedPrivateKey, encryptionKey);
+  try {
+    return ed25519.sign(payload, privateKey);
+  } finally {
+    privateKey.fill(0);
+  }
+}
+function verify(payload, signature, publicKey) {
+  try {
+    return ed25519.verify(signature, payload, publicKey);
+  } catch {
+    return false;
+  }
+}
+function rotateKeys(storedIdentity, encryptionKey, reason) {
+  const { publicKey: newPublicKey, privateKey: newPrivateKey } = generateKeypair();
+  const newIdentityDid = publicKeyToDid(newPublicKey);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const eventData = JSON.stringify({
+    old_public_key: storedIdentity.public_key,
+    new_public_key: toBase64url(newPublicKey),
+    identity_id: storedIdentity.identity_id,
+    reason,
+    rotated_at: now
+  });
+  const eventBytes = new TextEncoder().encode(eventData);
+  const signature = sign(
+    eventBytes,
+    storedIdentity.encrypted_private_key,
+    encryptionKey
+  );
+  const rotationEvent = {
+    old_public_key: storedIdentity.public_key,
+    new_public_key: toBase64url(newPublicKey),
+    identity_id: storedIdentity.identity_id,
+    reason,
+    rotated_at: now,
+    signature: toBase64url(signature)
+  };
+  const encryptedNewPrivateKey = encrypt(newPrivateKey, encryptionKey);
+  newPrivateKey.fill(0);
+  const updatedIdentity = {
+    ...storedIdentity,
+    public_key: toBase64url(newPublicKey),
+    did: newIdentityDid,
+    encrypted_private_key: encryptedNewPrivateKey,
+    rotation_history: [
+      ...storedIdentity.rotation_history,
+      {
+        old_public_key: storedIdentity.public_key,
+        new_public_key: toBase64url(newPublicKey),
+        rotation_event: toBase64url(
+          new TextEncoder().encode(JSON.stringify(rotationEvent))
+        ),
+        rotated_at: now
+      }
+    ]
+  };
+  return { updatedIdentity, rotationEvent };
+}
+
+// src/l1-cognitive/state-store.ts
+init_key_derivation();
+init_encoding();
+var RESERVED_NAMESPACE_PREFIXES = [
+  "_identities",
+  "_policies",
+  "_audit",
+  "_meta",
+  "_principal",
+  "_commitments",
+  "_reputation",
+  "_escrow",
+  "_guarantees",
+  "_bridge",
+  "_federation",
+  "_handshake",
+  "_shr"
+];
+var StateStore = class {
+  storage;
+  masterKey;
+  // Cache of version numbers per namespace/key for anti-rollback
+  versionCache = /* @__PURE__ */ new Map();
+  // Cache of content hashes per namespace for Merkle tree computation
+  contentHashes = /* @__PURE__ */ new Map();
+  constructor(storage, masterKey) {
+    this.storage = storage;
+    this.masterKey = masterKey;
+  }
+  versionKey(namespace, key) {
+    return `${namespace}/${key}`;
   }
   /**
-   * Create a pre-authenticated URL for the dashboard.
-   * Used by the sanctuary_dashboard_open tool and at startup.
+   * Get or initialize the content hash map for a namespace.
    */
-  createSessionUrl() {
-    const sessionId = this.createSession();
-    const protocol = this.useTLS ? "https" : "http";
-    return `${protocol}://${this.config.host}:${this.config.port}/?session=${sessionId}`;
+  async getNamespaceHashes(namespace) {
+    if (this.contentHashes.has(namespace)) {
+      return this.contentHashes.get(namespace);
+    }
+    const entries = await this.storage.list(namespace);
+    const hashMap = /* @__PURE__ */ new Map();
+    for (const entry of entries) {
+      const raw = await this.storage.read(namespace, entry.key);
+      if (raw) {
+        try {
+          const stateEntry = JSON.parse(bytesToString(raw));
+          hashMap.set(entry.key, stateEntry.integrity_hash);
+          this.versionCache.set(
+            this.versionKey(namespace, entry.key),
+            stateEntry.ver
+          );
+        } catch {
+        }
+      }
+    }
+    this.contentHashes.set(namespace, hashMap);
+    return hashMap;
   }
   /**
-   * Get the base URL for the dashboard.
+   * Write encrypted state.
+   *
+   * @param namespace - Logical grouping
+   * @param key - State key
+   * @param value - Plaintext value (will be encrypted)
+   * @param identityId - Identity performing the write
+   * @param encryptedPrivateKey - Identity's encrypted private key (for signing)
+   * @param identityEncryptionKey - Key to decrypt the identity's private key
+   * @param options - Optional metadata
    */
-  getBaseUrl() {
-    const protocol = this.useTLS ? "https" : "http";
-    return `${protocol}://${this.config.host}:${this.config.port}`;
+  async write(namespace, key, value, identityId, encryptedPrivateKey, identityEncryptionKey, options = {}) {
+    const namespaceKey = deriveNamespaceKey(this.masterKey, namespace);
+    const plaintext = stringToBytes(value);
+    const integrityHash = hashToString(plaintext);
+    const payload = encrypt(plaintext, namespaceKey);
+    const vk = this.versionKey(namespace, key);
+    const currentVersion = this.versionCache.get(vk) ?? 0;
+    const newVersion = currentVersion + 1;
+    const ciphertextBytes = fromBase64url(payload.ct);
+    const signature = sign(
+      ciphertextBytes,
+      encryptedPrivateKey,
+      identityEncryptionKey
+    );
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const stateEntry = {
+      v: 1,
+      payload,
+      ver: newVersion,
+      sig: toBase64url(signature),
+      kid: identityId,
+      integrity_hash: integrityHash,
+      metadata: {
+        content_type: options.content_type,
+        ttl_seconds: options.ttl_seconds,
+        tags: options.tags,
+        written_at: now
+      }
+    };
+    const serialized = stringToBytes(JSON.stringify(stateEntry));
+    await this.storage.write(namespace, key, serialized);
+    this.versionCache.set(vk, newVersion);
+    const nsHashes = await this.getNamespaceHashes(namespace);
+    nsHashes.set(key, integrityHash);
+    const merkleRoot = computeMerkleRoot(nsHashes);
+    return {
+      key,
+      namespace,
+      version: newVersion,
+      merkle_root: merkleRoot,
+      written_at: now,
+      size_bytes: serialized.length,
+      integrity_hash: integrityHash
+    };
   }
-  /** Get the number of pending requests */
-  get pendingCount() {
-    return this.pending.size;
+  /**
+   * Read and decrypt state.
+   *
+   * @param namespace - Logical grouping
+   * @param key - State key
+   * @param signerPublicKey - Expected signer's public key (for signature verification)
+   * @param verifyIntegrity - Whether to verify Merkle proof (default: true)
+   */
+  async read(namespace, key, signerPublicKey, verifyIntegrity = true) {
+    const raw = await this.storage.read(namespace, key);
+    if (!raw) return null;
+    let stateEntry;
+    try {
+      stateEntry = JSON.parse(bytesToString(raw));
+    } catch {
+      throw new Error(`Corrupted state entry: ${namespace}/${key}`);
+    }
+    if (stateEntry.v !== 1) {
+      throw new Error(`Unsupported state entry version: ${stateEntry.v}`);
+    }
+    const vk = this.versionKey(namespace, key);
+    const cachedVersion = this.versionCache.get(vk);
+    if (cachedVersion !== void 0 && stateEntry.ver < cachedVersion) {
+      throw new Error(
+        `Rollback detected for ${namespace}/${key}: found version ${stateEntry.ver}, expected >= ${cachedVersion}`
+      );
+    }
+    if (signerPublicKey) {
+      const ciphertextBytes = fromBase64url(stateEntry.payload.ct);
+      const signatureBytes = fromBase64url(stateEntry.sig);
+      const sigValid = verify(ciphertextBytes, signatureBytes, signerPublicKey);
+      if (!sigValid) {
+        throw new Error(
+          `Signature verification failed for ${namespace}/${key}`
+        );
+      }
+    }
+    const namespaceKey = deriveNamespaceKey(this.masterKey, namespace);
+    const plaintext = decrypt(stateEntry.payload, namespaceKey);
+    const value = bytesToString(plaintext);
+    const computedHash = hashToString(plaintext);
+    if (computedHash !== stateEntry.integrity_hash) {
+      throw new Error(
+        `Integrity hash mismatch for ${namespace}/${key}: computed ${computedHash}, stored ${stateEntry.integrity_hash}`
+      );
+    }
+    let merkleProofPath = [];
+    let integrityVerified = true;
+    if (verifyIntegrity) {
+      const nsHashes = await this.getNamespaceHashes(namespace);
+      const proof = generateMerkleProof(nsHashes, key);
+      if (proof) {
+        integrityVerified = verifyMerkleProof(proof);
+        merkleProofPath = proof.path.map(
+          (step) => `${step.position}:${step.hash}`
+        );
+      }
+    }
+    this.versionCache.set(vk, stateEntry.ver);
+    return {
+      key,
+      namespace,
+      value,
+      version: stateEntry.ver,
+      integrity_verified: integrityVerified,
+      merkle_proof: merkleProofPath,
+      written_at: stateEntry.metadata.written_at,
+      written_by: stateEntry.kid
+    };
   }
-  /** Get the number of connected SSE clients */
-  get clientCount() {
-    return this.sseClients.size;
+  /**
+   * List keys in a namespace (metadata only — no decryption).
+   */
+  async list(namespace, prefix, tags, limit = 100, offset = 0) {
+    const storageEntries = await this.storage.list(namespace, prefix);
+    const result = [];
+    for (const entry of storageEntries) {
+      const raw = await this.storage.read(namespace, entry.key);
+      if (!raw) continue;
+      try {
+        const stateEntry = JSON.parse(bytesToString(raw));
+        if (tags && tags.length > 0) {
+          const entryTags = stateEntry.metadata.tags ?? [];
+          const hasMatchingTag = tags.some((t) => entryTags.includes(t));
+          if (!hasMatchingTag) continue;
+        }
+        result.push({
+          key: entry.key,
+          version: stateEntry.ver,
+          size_bytes: entry.size_bytes,
+          written_at: stateEntry.metadata.written_at,
+          tags: stateEntry.metadata.tags ?? []
+        });
+      } catch {
+      }
+    }
+    const nsHashes = await this.getNamespaceHashes(namespace);
+    const merkleRoot = computeMerkleRoot(nsHashes);
+    return {
+      keys: result.slice(offset, offset + limit),
+      total: result.length,
+      merkle_root: merkleRoot
+    };
+  }
+  /**
+   * Securely delete state (overwrite with random bytes before removal).
+   */
+  async delete(namespace, key) {
+    const deleted = await this.storage.delete(namespace, key, true);
+    const vk = this.versionKey(namespace, key);
+    this.versionCache.delete(vk);
+    const nsHashes = await this.getNamespaceHashes(namespace);
+    nsHashes.delete(key);
+    const merkleRoot = computeMerkleRoot(nsHashes);
+    return {
+      deleted,
+      key,
+      namespace,
+      new_merkle_root: merkleRoot,
+      deleted_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }
+  /**
+   * Export all state for a namespace as an encrypted bundle.
+   */
+  async export(namespace) {
+    const namespacesToExport = [];
+    if (namespace) {
+      namespacesToExport.push(namespace);
+    } else {
+      for (const ns of this.contentHashes.keys()) {
+        namespacesToExport.push(ns);
+      }
+    }
+    const exportData = {};
+    let totalKeys = 0;
+    for (const ns of namespacesToExport) {
+      const entries = await this.storage.list(ns);
+      exportData[ns] = [];
+      for (const entry of entries) {
+        const raw = await this.storage.read(ns, entry.key);
+        if (!raw) continue;
+        try {
+          const stateEntry = JSON.parse(bytesToString(raw));
+          exportData[ns].push({ key: entry.key, entry: stateEntry });
+          totalKeys++;
+        } catch {
+        }
+      }
+    }
+    const bundleJson = JSON.stringify({
+      sanctuary_export_version: 1,
+      exported_at: (/* @__PURE__ */ new Date()).toISOString(),
+      namespaces: namespacesToExport,
+      data: exportData
+    });
+    const bundleBytes = stringToBytes(bundleJson);
+    const bundleHash = hashToString(bundleBytes);
+    return {
+      bundle: toBase64url(bundleBytes),
+      namespaces: namespacesToExport,
+      total_keys: totalKeys,
+      bundle_hash: bundleHash,
+      exported_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }
+  /**
+   * Import a previously exported state bundle.
+   */
+  async import(bundleBase64, conflictResolution = "skip", publicKeyResolver) {
+    const bundleBytes = fromBase64url(bundleBase64);
+    const bundleJson = bytesToString(bundleBytes);
+    const bundle = JSON.parse(bundleJson);
+    let importedKeys = 0;
+    let skippedKeys = 0;
+    let skippedInvalidSig = 0;
+    let skippedUnknownKid = 0;
+    let conflicts = 0;
+    const namespaces = [];
+    for (const [ns, entries] of Object.entries(
+      bundle.data
+    )) {
+      if (RESERVED_NAMESPACE_PREFIXES.some(
+        (prefix) => ns === prefix || ns.startsWith(prefix + "/")
+      )) {
+        skippedKeys += entries.length;
+        continue;
+      }
+      namespaces.push(ns);
+      for (const { key, entry } of entries) {
+        const signerPublicKey = publicKeyResolver(entry.kid);
+        if (!signerPublicKey) {
+          skippedUnknownKid++;
+          skippedKeys++;
+          continue;
+        }
+        try {
+          const ciphertextBytes = fromBase64url(entry.payload.ct);
+          const signatureBytes = fromBase64url(entry.sig);
+          const sigValid = verify(ciphertextBytes, signatureBytes, signerPublicKey);
+          if (!sigValid) {
+            skippedInvalidSig++;
+            skippedKeys++;
+            continue;
+          }
+        } catch {
+          skippedInvalidSig++;
+          skippedKeys++;
+          continue;
+        }
+        const exists = await this.storage.exists(ns, key);
+        if (exists) {
+          conflicts++;
+          if (conflictResolution === "skip") {
+            skippedKeys++;
+            continue;
+          }
+          if (conflictResolution === "version") {
+            const raw = await this.storage.read(ns, key);
+            if (raw) {
+              try {
+                const existingEntry = JSON.parse(
+                  bytesToString(raw)
+                );
+                if (entry.ver <= existingEntry.ver) {
+                  skippedKeys++;
+                  continue;
+                }
+              } catch {
+              }
+            }
+          }
+        }
+        const serialized = stringToBytes(JSON.stringify(entry));
+        await this.storage.write(ns, key, serialized);
+        importedKeys++;
+        const vk = this.versionKey(ns, key);
+        this.versionCache.set(vk, entry.ver);
+        const nsHashes = await this.getNamespaceHashes(ns);
+        nsHashes.set(key, entry.integrity_hash);
+      }
+    }
+    return {
+      imported_keys: importedKeys,
+      skipped_keys: skippedKeys,
+      skipped_invalid_sig: skippedInvalidSig,
+      skipped_unknown_kid: skippedUnknownKid,
+      conflicts,
+      namespaces,
+      imported_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
   }
 };
+var require3 = createRequire(import.meta.url);
+var { version: PKG_VERSION2 } = require3("../package.json");
+var MAX_STRING_BYTES = 1048576;
+var MAX_BUNDLE_BYTES = 5242880;
+var BUNDLE_FIELDS = /* @__PURE__ */ new Set(["bundle"]);
+function validateArgs(args, schema) {
+  const errors = [];
+  const properties = schema.properties ?? {};
+  const required = schema.required ?? [];
+  for (const field of required) {
+    if (args[field] === void 0 || args[field] === null) {
+      errors.push({ field, message: `Required field "${field}" is missing` });
+    }
+  }
+  const knownFields = new Set(Object.keys(properties));
+  for (const field of Object.keys(args)) {
+    if (!knownFields.has(field)) {
+      errors.push({ field, message: `Unknown field "${field}"` });
+    }
+  }
+  for (const [field, value] of Object.entries(args)) {
+    if (value === void 0 || value === null) continue;
+    const propSchema = properties[field];
+    if (!propSchema) continue;
+    const typeError = checkType(field, value, propSchema);
+    if (typeError) {
+      errors.push(typeError);
+      continue;
+    }
+    if (typeof value === "string") {
+      const maxBytes = BUNDLE_FIELDS.has(field) ? MAX_BUNDLE_BYTES : MAX_STRING_BYTES;
+      const byteLength = new TextEncoder().encode(value).length;
+      if (byteLength > maxBytes) {
+        errors.push({
+          field,
+          message: `Field "${field}" exceeds maximum size (${byteLength} bytes > ${maxBytes} bytes)`
+        });
+      }
+    }
+    if (propSchema.enum && !propSchema.enum.includes(value)) {
+      errors.push({
+        field,
+        message: `Field "${field}" must be one of: ${propSchema.enum.join(", ")}`
+      });
+    }
+  }
+  return errors;
+}
+function checkType(field, value, schema) {
+  if (!schema.type) return null;
+  switch (schema.type) {
+    case "string":
+      if (typeof value !== "string") {
+        return { field, message: `Expected string for "${field}", got ${typeof value}` };
+      }
+      break;
+    case "number":
+      if (typeof value !== "number") {
+        return { field, message: `Expected number for "${field}", got ${typeof value}` };
+      }
+      break;
+    case "boolean":
+      if (typeof value !== "boolean") {
+        return { field, message: `Expected boolean for "${field}", got ${typeof value}` };
+      }
+      break;
+    case "object":
+      if (typeof value !== "object" || Array.isArray(value)) {
+        return { field, message: `Expected object for "${field}", got ${typeof value}` };
+      }
+      break;
+    case "array":
+      if (!Array.isArray(value)) {
+        return { field, message: `Expected array for "${field}", got ${typeof value}` };
+      }
+      break;
+  }
+  return null;
+}
+function createServer(tools, options) {
+  const gate = options?.gate;
+  const server = new Server(
+    {
+      name: "sanctuary-mcp-server",
+      version: PKG_VERSION2
+    },
+    {
+      capabilities: {
+        tools: {}
+      }
+    }
+  );
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    return {
+      tools: tools.map((t) => ({
+        name: t.name,
+        description: t.description,
+        inputSchema: t.inputSchema
+      }))
+    };
+  });
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const typedArgs = args ?? {};
+    const tool = tools.find((t) => t.name === name);
+    if (!tool) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: `Unknown tool: ${name}` })
+          }
+        ],
+        isError: true
+      };
+    }
+    const validationErrors = validateArgs(typedArgs, tool.inputSchema);
+    if (validationErrors.length > 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: "validation_failed",
+              message: "Tool arguments failed schema validation",
+              violations: validationErrors
+            })
+          }
+        ],
+        isError: true
+      };
+    }
+    if (gate) {
+      const result = await gate.evaluate(name, typedArgs);
+      if (!result.allowed) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: "Operation not permitted",
+                approval_required: result.approval_required
+              })
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+    try {
+      return await tool.handler(typedArgs);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: message })
+          }
+        ],
+        isError: true
+      };
+    }
+  });
+  return server;
+}
+function toolResult(data) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(data, null, 2) }]
+  };
+}
+
+// src/l1-cognitive/tools.ts
+init_key_derivation();
+init_encoding();
+init_encryption();
+init_encoding();
+var RESERVED_NAMESPACE_PREFIXES2 = [
+  "_identities",
+  "_policies",
+  "_audit",
+  "_meta",
+  "_principal",
+  "_commitments",
+  "_reputation",
+  "_escrow",
+  "_guarantees",
+  "_bridge",
+  "_federation",
+  "_handshake",
+  "_shr"
+];
+function getReservedNamespaceViolation(namespace) {
+  for (const prefix of RESERVED_NAMESPACE_PREFIXES2) {
+    if (namespace === prefix || namespace.startsWith(prefix + "/")) {
+      return prefix;
+    }
+  }
+  return null;
+}
+var IdentityManager = class {
+  storage;
+  masterKey;
+  identities = /* @__PURE__ */ new Map();
+  primaryIdentityId = null;
+  constructor(storage, masterKey) {
+    this.storage = storage;
+    this.masterKey = masterKey;
+  }
+  get encryptionKey() {
+    return derivePurposeKey(this.masterKey, "identity-encryption");
+  }
+  /** Load identities from storage on startup */
+  async load() {
+    const entries = await this.storage.list("_identities");
+    for (const entry of entries) {
+      const raw = await this.storage.read("_identities", entry.key);
+      if (!raw) continue;
+      try {
+        const encrypted = JSON.parse(bytesToString(raw));
+        const decrypted = decrypt(encrypted, this.encryptionKey);
+        const identity = JSON.parse(bytesToString(decrypted));
+        this.identities.set(identity.identity_id, identity);
+        if (!this.primaryIdentityId) {
+          this.primaryIdentityId = identity.identity_id;
+        }
+      } catch {
+      }
+    }
+  }
+  /** Save an identity to storage */
+  async save(identity) {
+    const serialized = stringToBytes(JSON.stringify(identity));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_identities",
+      identity.identity_id,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+    this.identities.set(identity.identity_id, identity);
+    if (!this.primaryIdentityId) {
+      this.primaryIdentityId = identity.identity_id;
+    }
+  }
+  get(id) {
+    return this.identities.get(id);
+  }
+  getDefault() {
+    if (!this.primaryIdentityId) return void 0;
+    return this.identities.get(this.primaryIdentityId);
+  }
+  list() {
+    return Array.from(this.identities.values()).map((si) => ({
+      identity_id: si.identity_id,
+      label: si.label,
+      public_key: si.public_key,
+      did: si.did,
+      created_at: si.created_at,
+      key_type: si.key_type,
+      key_protection: si.key_protection
+    }));
+  }
+};
+function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) {
+  const identityMgr = new IdentityManager(storage, masterKey);
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  function resolveIdentity(identityId) {
+    const id = identityId ? identityMgr.get(identityId) : identityMgr.getDefault();
+    if (!id) {
+      throw new Error(
+        identityId ? `Identity not found: ${identityId}` : "No default identity. Create one with sanctuary/identity_create."
+      );
+    }
+    return id;
+  }
+  const tools = [
+    // ── Identity Tools ──────────────────────────────────────────────────
+    {
+      name: "sanctuary/identity_create",
+      description: "Create a new sovereign identity (Ed25519 keypair). The private key is encrypted and never exposed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          label: {
+            type: "string",
+            description: 'Human-readable label (e.g., "my-agent")'
+          }
+        },
+        required: ["label"]
+      },
+      handler: async (args) => {
+        const label = args.label;
+        const { publicIdentity, storedIdentity } = createIdentity(
+          label,
+          identityEncKey,
+          keyProtection
+        );
+        await identityMgr.save(storedIdentity);
+        auditLog?.append("l1", "identity_create", publicIdentity.identity_id, {
+          label
+        });
+        return toolResult({
+          identity_id: publicIdentity.identity_id,
+          public_key: publicIdentity.public_key,
+          did: publicIdentity.did,
+          created_at: publicIdentity.created_at,
+          key_type: publicIdentity.key_type,
+          key_protection: publicIdentity.key_protection,
+          backed_up: false
+        });
+      }
+    },
+    {
+      name: "sanctuary/identity_list",
+      description: "List all managed sovereign identities.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          filter: {
+            type: "object",
+            properties: {
+              label: { type: "string" }
+            }
+          }
+        }
+      },
+      handler: async (args) => {
+        let identities = identityMgr.list();
+        const filter = args.filter;
+        if (filter?.label) {
+          identities = identities.filter(
+            (i) => i.label.includes(filter.label)
+          );
+        }
+        return toolResult({ identities });
+      }
+    },
+    {
+      name: "sanctuary/identity_sign",
+      description: "Sign data with a managed identity. The private key is decrypted in memory only during signing.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          identity_id: { type: "string" },
+          payload: {
+            type: "string",
+            description: "Base64url-encoded data to sign"
+          }
+        },
+        required: ["payload"]
+      },
+      handler: async (args) => {
+        const identity = resolveIdentity(args.identity_id);
+        const payloadStr = args.payload;
+        let payload;
+        try {
+          payload = fromBase64url(payloadStr);
+        } catch {
+          payload = stringToBytes(payloadStr);
+        }
+        const signature = sign(
+          payload,
+          identity.encrypted_private_key,
+          identityEncKey
+        );
+        auditLog?.append("l1", "identity_sign", identity.identity_id);
+        return toolResult({
+          signature: toBase64url(signature),
+          algorithm: "Ed25519",
+          signed_at: (/* @__PURE__ */ new Date()).toISOString(),
+          public_key: identity.public_key,
+          payload_encoding: "base64url"
+        });
+      }
+    },
+    {
+      name: "sanctuary/identity_verify",
+      description: "Verify an Ed25519 signature. Provide either identity_id or public_key.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          payload: {
+            type: "string",
+            description: "Original data (plain text or base64url-encoded)"
+          },
+          signature: { type: "string", description: "Base64url signature" },
+          identity_id: {
+            type: "string",
+            description: "Identity ID to look up public key (alternative to public_key)"
+          },
+          public_key: {
+            type: "string",
+            description: "Base64url public key (alternative to identity_id)"
+          }
+        },
+        required: ["payload", "signature"]
+      },
+      handler: async (args) => {
+        const payloadStr = args.payload;
+        let payload;
+        try {
+          payload = fromBase64url(payloadStr);
+        } catch {
+          payload = stringToBytes(payloadStr);
+        }
+        const signature = fromBase64url(args.signature);
+        let publicKey;
+        if (args.identity_id) {
+          const identity = resolveIdentity(args.identity_id);
+          publicKey = fromBase64url(identity.public_key);
+        } else if (args.public_key) {
+          publicKey = fromBase64url(args.public_key);
+        } else {
+          return toolResult({
+            error: "Provide either identity_id or public_key for verification."
+          });
+        }
+        const valid = verify(payload, signature, publicKey);
+        return toolResult({
+          valid,
+          verified_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    },
+    {
+      name: "sanctuary/identity_rotate",
+      description: "Rotate keys for an identity. Generates a new keypair and signs a rotation event with the old key for verifiable chain.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          identity_id: { type: "string" },
+          reason: { type: "string" }
+        },
+        required: ["identity_id"]
+      },
+      handler: async (args) => {
+        const identity = resolveIdentity(args.identity_id);
+        const reason = args.reason ?? "Key rotation";
+        const { updatedIdentity, rotationEvent } = rotateKeys(
+          identity,
+          identityEncKey,
+          reason
+        );
+        await identityMgr.save(updatedIdentity);
+        auditLog?.append("l1", "identity_rotate", identity.identity_id, {
+          reason
+        });
+        return toolResult({
+          identity_id: updatedIdentity.identity_id,
+          old_public_key: rotationEvent.old_public_key,
+          new_public_key: rotationEvent.new_public_key,
+          new_did: updatedIdentity.did,
+          rotated_at: rotationEvent.rotated_at
+        });
+      }
+    },
+    // ── State Tools ─────────────────────────────────────────────────────
+    {
+      name: "sanctuary/state_write",
+      description: "Write encrypted state to the sovereign store. Value is encrypted with a namespace-specific key. The write is signed by the active identity.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: {
+            type: "string",
+            description: 'Logical grouping (e.g., "memory", "config")'
+          },
+          key: { type: "string", description: "State key within namespace" },
+          value: {
+            type: "string",
+            description: "Plaintext value (encrypted before storage)"
+          },
+          metadata: {
+            type: "object",
+            properties: {
+              content_type: { type: "string" },
+              ttl_seconds: { type: "number" },
+              tags: { type: "array", items: { type: "string" } }
+            }
+          },
+          identity_id: { type: "string" }
+        },
+        required: ["namespace", "key", "value"]
+      },
+      handler: async (args) => {
+        const reservedViolation = getReservedNamespaceViolation(args.namespace);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Choose a different namespace.`
+          });
+        }
+        const identity = resolveIdentity(args.identity_id);
+        const metadata = args.metadata;
+        const result = await stateStore.write(
+          args.namespace,
+          args.key,
+          args.value,
+          identity.identity_id,
+          identity.encrypted_private_key,
+          identityEncKey,
+          {
+            content_type: metadata?.content_type,
+            ttl_seconds: metadata?.ttl_seconds,
+            tags: metadata?.tags
+          }
+        );
+        auditLog?.append("l1", "state_write", identity.identity_id, {
+          namespace: args.namespace,
+          key: args.key
+        });
+        return toolResult(result);
+      }
+    },
+    {
+      name: "sanctuary/state_read",
+      description: "Read and decrypt state from the sovereign store. Verifies integrity via Merkle proof and signature.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: { type: "string" },
+          key: { type: "string" },
+          verify_integrity: { type: "boolean", default: true }
+        },
+        required: ["namespace", "key"]
+      },
+      handler: async (args) => {
+        const reservedViolation = getReservedNamespaceViolation(args.namespace);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot read from reserved namespaces.`
+          });
+        }
+        const result = await stateStore.read(
+          args.namespace,
+          args.key,
+          void 0,
+          // Skip signature verification for now (would need writer's pubkey)
+          args.verify_integrity ?? true
+        );
+        if (!result) {
+          return toolResult({
+            error: "not_found",
+            namespace: args.namespace,
+            key: args.key
+          });
+        }
+        auditLog?.append("l1", "state_read", result.written_by, {
+          namespace: args.namespace,
+          key: args.key
+        });
+        return toolResult(result);
+      }
+    },
+    {
+      name: "sanctuary/state_list",
+      description: "List keys in a namespace (metadata only \u2014 no decryption).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: { type: "string" },
+          prefix: { type: "string" },
+          tags: { type: "array", items: { type: "string" } },
+          limit: { type: "number", default: 100 },
+          offset: { type: "number", default: 0 }
+        },
+        required: ["namespace"]
+      },
+      handler: async (args) => {
+        const reservedViolation = getReservedNamespaceViolation(args.namespace);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot list reserved namespaces.`
+          });
+        }
+        const result = await stateStore.list(
+          args.namespace,
+          args.prefix,
+          args.tags,
+          args.limit ?? 100,
+          args.offset ?? 0
+        );
+        return toolResult(result);
+      }
+    },
+    {
+      name: "sanctuary/state_delete",
+      description: "Securely delete state. Overwrites file with random bytes before removal (right to deletion, S1.6).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: { type: "string" },
+          key: { type: "string" },
+          reason: { type: "string" }
+        },
+        required: ["namespace", "key"]
+      },
+      handler: async (args) => {
+        const reservedViolation = getReservedNamespaceViolation(args.namespace);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot delete from reserved namespaces.`
+          });
+        }
+        const result = await stateStore.delete(
+          args.namespace,
+          args.key
+        );
+        auditLog?.append("l1", "state_delete", "principal", {
+          namespace: args.namespace,
+          key: args.key,
+          reason: args.reason
+        });
+        return toolResult(result);
+      }
+    },
+    {
+      name: "sanctuary/state_export",
+      description: "Export state as an encrypted, portable bundle for migration.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: { type: "string" },
+          format: { type: "string", default: "sanctuary-v1" }
+        }
+      },
+      handler: async (args) => {
+        const result = await stateStore.export(
+          args.namespace
+        );
+        auditLog?.append("l1", "state_export", "principal", {
+          namespaces: result.namespaces
+        });
+        return toolResult(result);
+      }
+    },
+    {
+      name: "sanctuary/state_import",
+      description: "Import a previously exported state bundle.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          bundle: { type: "string", description: "Base64url-encoded bundle" },
+          conflict_resolution: {
+            type: "string",
+            enum: ["skip", "overwrite", "version"],
+            default: "skip"
+          }
+        },
+        required: ["bundle"]
+      },
+      handler: async (args) => {
+        const publicKeyResolver = (kid) => {
+          const identity = identityMgr.get(kid);
+          if (!identity) return null;
+          return fromBase64url(identity.public_key);
+        };
+        const result = await stateStore.import(
+          args.bundle,
+          args.conflict_resolution ?? "skip",
+          publicKeyResolver
+        );
+        auditLog?.append("l1", "state_import", "principal", {
+          imported_keys: result.imported_keys
+        });
+        return toolResult(result);
+      }
+    }
+  ];
+  return { tools, identityManager: identityMgr };
+}
+
+// src/index.ts
+init_audit_log();
+
+// src/l3-disclosure/commitments.ts
+init_hashing();
+init_encoding();
+init_random();
+init_encryption();
+init_key_derivation();
+init_encoding();
+function createCommitment(value, blindingFactor) {
+  const blindingBytes = blindingFactor ? fromBase64url(blindingFactor) : randomBytes(32);
+  const valueBytes = stringToBytes(value);
+  const combined = concatBytes(valueBytes, blindingBytes);
+  const commitmentHash = hash(combined);
+  return {
+    commitment: toBase64url(commitmentHash),
+    blinding_factor: toBase64url(blindingBytes),
+    committed_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function verifyCommitment(commitment, value, blindingFactor) {
+  const blindingBytes = fromBase64url(blindingFactor);
+  const valueBytes = stringToBytes(value);
+  const combined = concatBytes(valueBytes, blindingBytes);
+  const expectedHash = toBase64url(hash(combined));
+  return commitment === expectedHash;
+}
+var CommitmentStore = class {
+  storage;
+  encryptionKey;
+  constructor(storage, masterKey) {
+    this.storage = storage;
+    this.encryptionKey = derivePurposeKey(masterKey, "l3-commitments");
+  }
+  /**
+   * Store a commitment (encrypted) for later reference.
+   */
+  async store(commitment, value) {
+    const id = `cmt-${Date.now()}-${toBase64url(randomBytes(8))}`;
+    const stored = {
+      commitment: commitment.commitment,
+      blinding_factor: commitment.blinding_factor,
+      value,
+      committed_at: commitment.committed_at,
+      revealed: false
+    };
+    const serialized = stringToBytes(JSON.stringify(stored));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_commitments",
+      id,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+    return id;
+  }
+  /**
+   * Retrieve a stored commitment by ID.
+   */
+  async get(id) {
+    const raw = await this.storage.read("_commitments", id);
+    if (!raw) return null;
+    try {
+      const encrypted = JSON.parse(bytesToString(raw));
+      const decrypted = decrypt(encrypted, this.encryptionKey);
+      return JSON.parse(bytesToString(decrypted));
+    } catch {
+      return null;
+    }
+  }
+  /**
+   * Mark a commitment as revealed.
+   */
+  async markRevealed(id) {
+    const stored = await this.get(id);
+    if (!stored) return;
+    stored.revealed = true;
+    stored.revealed_at = (/* @__PURE__ */ new Date()).toISOString();
+    const serialized = stringToBytes(JSON.stringify(stored));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_commitments",
+      id,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+  }
+};
+
+// src/l3-disclosure/policies.ts
+init_encryption();
+init_key_derivation();
+init_encoding();
+init_random();
+function evaluateDisclosure(policy, context, requestedFields) {
+  return requestedFields.map((field) => {
+    const exactRule = policy.rules.find((r) => r.context === context);
+    const wildcardRule = policy.rules.find((r) => r.context === "*");
+    const matchedRule = exactRule ?? wildcardRule;
+    if (!matchedRule) {
+      return {
+        field,
+        action: policy.default_action,
+        reason: `No rule matches context "${context}"`,
+        applicable_rule: "default"
+      };
+    }
+    const ruleName = `${matchedRule.context}`;
+    if (matchedRule.withhold.includes(field)) {
+      return {
+        field,
+        action: "withhold",
+        reason: `Field "${field}" is explicitly withheld in ${ruleName} context`,
+        applicable_rule: ruleName
+      };
+    }
+    if (matchedRule.proof_required.includes(field)) {
+      return {
+        field,
+        action: "proof",
+        reason: `Field "${field}" requires cryptographic proof in ${ruleName} context`,
+        applicable_rule: ruleName
+      };
+    }
+    if (matchedRule.disclose.includes(field)) {
+      return {
+        field,
+        action: "disclose",
+        reason: `Field "${field}" is permitted for disclosure in ${ruleName} context`,
+        applicable_rule: ruleName
+      };
+    }
+    return {
+      field,
+      action: policy.default_action,
+      reason: `Field "${field}" not addressed in ${ruleName} rule; applying default`,
+      applicable_rule: ruleName
+    };
+  });
+}
+var PolicyStore = class {
+  storage;
+  encryptionKey;
+  policies = /* @__PURE__ */ new Map();
+  constructor(storage, masterKey) {
+    this.storage = storage;
+    this.encryptionKey = derivePurposeKey(masterKey, "l3-policies");
+  }
+  /**
+   * Create and store a new disclosure policy.
+   */
+  async create(policyName, rules, defaultAction, identityId) {
+    const policyId = `pol-${Date.now()}-${toBase64url(randomBytes(8))}`;
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const policy = {
+      policy_id: policyId,
+      policy_name: policyName,
+      rules,
+      default_action: defaultAction,
+      identity_id: identityId,
+      created_at: now,
+      updated_at: now
+    };
+    await this.persist(policy);
+    this.policies.set(policyId, policy);
+    return policy;
+  }
+  /**
+   * Get a policy by ID.
+   */
+  async get(policyId) {
+    if (this.policies.has(policyId)) {
+      return this.policies.get(policyId);
+    }
+    const raw = await this.storage.read("_policies", policyId);
+    if (!raw) return null;
+    try {
+      const encrypted = JSON.parse(bytesToString(raw));
+      const decrypted = decrypt(encrypted, this.encryptionKey);
+      const policy = JSON.parse(bytesToString(decrypted));
+      this.policies.set(policyId, policy);
+      return policy;
+    } catch {
+      return null;
+    }
+  }
+  /**
+   * List all policies.
+   */
+  async list() {
+    await this.loadAll();
+    return Array.from(this.policies.values());
+  }
+  /**
+   * Load all persisted policies into memory.
+   */
+  async loadAll() {
+    try {
+      const entries = await this.storage.list("_policies");
+      for (const meta of entries) {
+        if (this.policies.has(meta.key)) continue;
+        const raw = await this.storage.read("_policies", meta.key);
+        if (!raw) continue;
+        try {
+          const encrypted = JSON.parse(bytesToString(raw));
+          const decrypted = decrypt(encrypted, this.encryptionKey);
+          const policy = JSON.parse(bytesToString(decrypted));
+          this.policies.set(policy.policy_id, policy);
+        } catch {
+        }
+      }
+    } catch {
+    }
+  }
+  async persist(policy) {
+    const serialized = stringToBytes(JSON.stringify(policy));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_policies",
+      policy.policy_id,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+  }
+};
+
+// src/l3-disclosure/zk-proofs.ts
+init_random();
+init_encoding();
+var G = RistrettoPoint.BASE;
+var H_INPUT = concatBytes(
+  sha256(stringToBytes("sanctuary-pedersen-generator-H-v1-a")),
+  sha256(stringToBytes("sanctuary-pedersen-generator-H-v1-b"))
+);
+var H = RistrettoPoint.hashToCurve(H_INPUT);
+function bigintToBytes(n) {
+  const hex = n.toString(16).padStart(64, "0");
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+function bytesToBigint(bytes) {
+  let hex = "";
+  for (const b of bytes) {
+    hex += b.toString(16).padStart(2, "0");
+  }
+  return BigInt("0x" + hex);
+}
+var ORDER = BigInt("7237005577332262213973186563042994240857116359379907606001950938285454250989");
+function mod(n) {
+  return (n % ORDER + ORDER) % ORDER;
+}
+function safeMultiply(point, scalar) {
+  const s = mod(scalar);
+  if (s === 0n) return RistrettoPoint.ZERO;
+  return point.multiply(s);
+}
+function randomScalar() {
+  const bytes = randomBytes(64);
+  return mod(bytesToBigint(bytes));
+}
+function fiatShamirChallenge(domain, ...points) {
+  const domainBytes = stringToBytes(domain);
+  const combined = concatBytes(domainBytes, ...points);
+  const hash2 = sha256(combined);
+  return mod(bytesToBigint(hash2));
+}
+function createPedersenCommitment(value) {
+  const v = mod(BigInt(value));
+  const b = randomScalar();
+  const C = safeMultiply(G, v).add(safeMultiply(H, b));
+  return {
+    commitment: toBase64url(C.toRawBytes()),
+    blinding_factor: toBase64url(bigintToBytes(b)),
+    committed_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function verifyPedersenCommitment(commitment, value, blindingFactor) {
+  try {
+    const C = RistrettoPoint.fromHex(fromBase64url(commitment));
+    const v = mod(BigInt(value));
+    const b = bytesToBigint(fromBase64url(blindingFactor));
+    const expected = safeMultiply(G, v).add(safeMultiply(H, b));
+    return C.equals(expected);
+  } catch {
+    return false;
+  }
+}
+function createProofOfKnowledge(value, blindingFactor, commitment) {
+  const v = mod(BigInt(value));
+  const b = bytesToBigint(fromBase64url(blindingFactor));
+  const r_v = randomScalar();
+  const r_b = randomScalar();
+  const R = safeMultiply(G, r_v).add(safeMultiply(H, r_b));
+  const C_bytes = fromBase64url(commitment);
+  const R_bytes = R.toRawBytes();
+  const e = fiatShamirChallenge("sanctuary-zk-pok-v1", C_bytes, R_bytes);
+  const s_v = mod(r_v + e * v);
+  const s_b = mod(r_b + e * b);
+  return {
+    type: "schnorr-pedersen-ristretto255",
+    commitment,
+    announcement: toBase64url(R_bytes),
+    response_v: toBase64url(bigintToBytes(s_v)),
+    response_b: toBase64url(bigintToBytes(s_b)),
+    generated_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function verifyProofOfKnowledge(proof) {
+  try {
+    const C = RistrettoPoint.fromHex(fromBase64url(proof.commitment));
+    const R = RistrettoPoint.fromHex(fromBase64url(proof.announcement));
+    const s_v = bytesToBigint(fromBase64url(proof.response_v));
+    const s_b = bytesToBigint(fromBase64url(proof.response_b));
+    const e = fiatShamirChallenge(
+      "sanctuary-zk-pok-v1",
+      fromBase64url(proof.commitment),
+      fromBase64url(proof.announcement)
+    );
+    const lhs = safeMultiply(G, s_v).add(safeMultiply(H, s_b));
+    const rhs = R.add(safeMultiply(C, e));
+    return lhs.equals(rhs);
+  } catch {
+    return false;
+  }
+}
+function createRangeProof(value, blindingFactor, commitment, min, max) {
+  if (value < min || value > max) {
+    return { error: `Value ${value} is not in range [${min}, ${max}]` };
+  }
+  const range = max - min;
+  const numBits = Math.ceil(Math.log2(range + 1));
+  const shifted = value - min;
+  const b = bytesToBigint(fromBase64url(blindingFactor));
+  const bits = [];
+  for (let i = 0; i < numBits; i++) {
+    bits.push(shifted >> i & 1);
+  }
+  const bitBlindings = [];
+  const bitCommitments = [];
+  const bitProofs = [];
+  for (let i = 0; i < numBits; i++) {
+    const bit_b = randomScalar();
+    bitBlindings.push(bit_b);
+    const C_i = safeMultiply(G, mod(BigInt(bits[i]))).add(safeMultiply(H, bit_b));
+    bitCommitments.push(toBase64url(C_i.toRawBytes()));
+    const bitProof = createBitProof(bits[i], bit_b, C_i);
+    bitProofs.push(bitProof);
+  }
+  const sumBlinding = bitBlindings.reduce(
+    (acc, bi, i) => mod(acc + mod(BigInt(1) << BigInt(i)) * bi),
+    0n
+  );
+  const blindingDiff = mod(b - sumBlinding);
+  const r_sum = randomScalar();
+  const R_sum = safeMultiply(H, r_sum);
+  const e_sum = fiatShamirChallenge(
+    "sanctuary-zk-range-sum-v1",
+    fromBase64url(commitment),
+    R_sum.toRawBytes()
+  );
+  const s_sum = mod(r_sum + e_sum * blindingDiff);
+  return {
+    type: "range-pedersen-ristretto255",
+    commitment,
+    min,
+    max,
+    bit_commitments: bitCommitments,
+    bit_proofs: bitProofs,
+    sum_proof: {
+      announcement: toBase64url(R_sum.toRawBytes()),
+      response: toBase64url(bigintToBytes(s_sum))
+    },
+    generated_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function verifyRangeProof(proof) {
+  try {
+    const C = RistrettoPoint.fromHex(fromBase64url(proof.commitment));
+    const range = proof.max - proof.min;
+    const numBits = Math.ceil(Math.log2(range + 1));
+    if (proof.bit_commitments.length !== numBits) return false;
+    if (proof.bit_proofs.length !== numBits) return false;
+    for (let i = 0; i < numBits; i++) {
+      const C_i = RistrettoPoint.fromHex(fromBase64url(proof.bit_commitments[i]));
+      if (!verifyBitProof(proof.bit_proofs[i], C_i)) {
+        return false;
+      }
+    }
+    let reconstructed = RistrettoPoint.ZERO;
+    for (let i = 0; i < numBits; i++) {
+      const C_i = RistrettoPoint.fromHex(fromBase64url(proof.bit_commitments[i]));
+      const weight = mod(BigInt(1) << BigInt(i));
+      reconstructed = reconstructed.add(safeMultiply(C_i, weight));
+    }
+    const diff = C.subtract(safeMultiply(G, mod(BigInt(proof.min)))).subtract(reconstructed);
+    const R_sum = RistrettoPoint.fromHex(fromBase64url(proof.sum_proof.announcement));
+    const s_sum = bytesToBigint(fromBase64url(proof.sum_proof.response));
+    const e_sum = fiatShamirChallenge(
+      "sanctuary-zk-range-sum-v1",
+      fromBase64url(proof.commitment),
+      fromBase64url(proof.sum_proof.announcement)
+    );
+    const lhs = safeMultiply(H, s_sum);
+    const rhs = R_sum.add(safeMultiply(diff, e_sum));
+    return lhs.equals(rhs);
+  } catch {
+    return false;
+  }
+}
+function createBitProof(bit, blinding, commitment) {
+  const C_bytes = commitment.toRawBytes();
+  if (bit === 0) {
+    const C_minus_G = commitment.subtract(G);
+    const e_1 = randomScalar();
+    const s_1 = randomScalar();
+    const R_1 = safeMultiply(H, s_1).subtract(safeMultiply(C_minus_G, e_1));
+    const r_0 = randomScalar();
+    const R_0 = safeMultiply(H, r_0);
+    const e = fiatShamirChallenge(
+      "sanctuary-zk-bit-v1",
+      C_bytes,
+      R_0.toRawBytes(),
+      R_1.toRawBytes()
+    );
+    const e_0 = mod(e - e_1);
+    const s_0 = mod(r_0 + e_0 * blinding);
+    return {
+      announcement_0: toBase64url(R_0.toRawBytes()),
+      announcement_1: toBase64url(R_1.toRawBytes()),
+      challenge_0: toBase64url(bigintToBytes(e_0)),
+      challenge_1: toBase64url(bigintToBytes(e_1)),
+      response_0: toBase64url(bigintToBytes(s_0)),
+      response_1: toBase64url(bigintToBytes(s_1))
+    };
+  } else {
+    const e_0 = randomScalar();
+    const s_0 = randomScalar();
+    const R_0 = safeMultiply(H, s_0).subtract(safeMultiply(commitment, e_0));
+    const r_1 = randomScalar();
+    const R_1 = safeMultiply(H, r_1);
+    const e = fiatShamirChallenge(
+      "sanctuary-zk-bit-v1",
+      C_bytes,
+      R_0.toRawBytes(),
+      R_1.toRawBytes()
+    );
+    const e_1 = mod(e - e_0);
+    const s_1 = mod(r_1 + e_1 * blinding);
+    return {
+      announcement_0: toBase64url(R_0.toRawBytes()),
+      announcement_1: toBase64url(R_1.toRawBytes()),
+      challenge_0: toBase64url(bigintToBytes(e_0)),
+      challenge_1: toBase64url(bigintToBytes(e_1)),
+      response_0: toBase64url(bigintToBytes(s_0)),
+      response_1: toBase64url(bigintToBytes(s_1))
+    };
+  }
+}
+function verifyBitProof(proof, commitment) {
+  try {
+    const C_bytes = commitment.toRawBytes();
+    const R_0 = RistrettoPoint.fromHex(fromBase64url(proof.announcement_0));
+    const R_1 = RistrettoPoint.fromHex(fromBase64url(proof.announcement_1));
+    const e_0 = bytesToBigint(fromBase64url(proof.challenge_0));
+    const e_1 = bytesToBigint(fromBase64url(proof.challenge_1));
+    const s_0 = bytesToBigint(fromBase64url(proof.response_0));
+    const s_1 = bytesToBigint(fromBase64url(proof.response_1));
+    const e = fiatShamirChallenge(
+      "sanctuary-zk-bit-v1",
+      C_bytes,
+      R_0.toRawBytes(),
+      R_1.toRawBytes()
+    );
+    if (mod(e_0 + e_1) !== e) return false;
+    const lhs_0 = safeMultiply(H, s_0);
+    const rhs_0 = R_0.add(safeMultiply(commitment, e_0));
+    if (!lhs_0.equals(rhs_0)) return false;
+    const C_minus_G = commitment.subtract(G);
+    const lhs_1 = safeMultiply(H, s_1);
+    const rhs_1 = R_1.add(safeMultiply(C_minus_G, e_1));
+    if (!lhs_1.equals(rhs_1)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// src/l3-disclosure/tools.ts
+function createL3Tools(storage, masterKey, auditLog) {
+  const commitmentStore = new CommitmentStore(storage, masterKey);
+  const policyStore = new PolicyStore(storage, masterKey);
+  const tools = [
+    // ─── Commitment Schemes ───────────────────────────────────────────────
+    {
+      name: "sanctuary/proof_commitment",
+      description: "Create a cryptographic commitment to a value. The commitment hides the value until you choose to reveal it. Returns the commitment hash and a blinding factor (store securely).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "string",
+            description: "The value to commit to"
+          },
+          blinding_factor: {
+            type: "string",
+            description: "Optional base64url blinding factor (auto-generated if omitted)"
+          }
+        },
+        required: ["value"]
+      },
+      handler: async (args) => {
+        const value = args.value;
+        const blindingFactor = args.blinding_factor;
+        const commitment = createCommitment(value, blindingFactor);
+        const commitmentId = await commitmentStore.store(commitment, value);
+        auditLog.append("l3", "proof_commitment", "system", {
+          commitment_id: commitmentId,
+          commitment_hash: commitment.commitment
+        });
+        return toolResult({
+          commitment_id: commitmentId,
+          commitment: commitment.commitment,
+          blinding_factor: commitment.blinding_factor,
+          committed_at: commitment.committed_at,
+          note: "Store the blinding_factor securely. You will need it to reveal the committed value."
+        });
+      }
+    },
+    {
+      name: "sanctuary/proof_reveal",
+      description: "Verify a previously committed value by revealing it with the blinding factor. Returns whether the revealed value matches the commitment.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          commitment: {
+            type: "string",
+            description: "The original commitment hash"
+          },
+          value: {
+            type: "string",
+            description: "The value being revealed"
+          },
+          blinding_factor: {
+            type: "string",
+            description: "The blinding factor from the original commitment"
+          }
+        },
+        required: ["commitment", "value", "blinding_factor"]
+      },
+      handler: async (args) => {
+        const commitment = args.commitment;
+        const value = args.value;
+        const blindingFactor = args.blinding_factor;
+        const valid = verifyCommitment(commitment, value, blindingFactor);
+        auditLog.append("l3", "proof_reveal", "system", {
+          commitment_hash: commitment,
+          valid
+        });
+        return toolResult({
+          valid,
+          commitment,
+          revealed_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    },
+    // ─── Disclosure Policies ──────────────────────────────────────────────
+    {
+      name: "sanctuary/disclosure_set_policy",
+      description: "Define a disclosure policy that controls what an agent will and will not disclose in different interaction contexts. Rules specify which fields may be disclosed, which must be withheld, and which require cryptographic proof.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          policy_name: {
+            type: "string",
+            description: "Human-readable policy name"
+          },
+          rules: {
+            type: "array",
+            description: "Disclosure rules for different contexts",
+            items: {
+              type: "object",
+              properties: {
+                context: {
+                  type: "string",
+                  description: 'Interaction context: "negotiation", "commerce", "identity", "*" (wildcard)'
+                },
+                disclose: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields the agent MAY disclose"
+                },
+                withhold: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields the agent MUST NOT disclose"
+                },
+                proof_required: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields that require proof rather than plain disclosure"
+                }
+              },
+              required: ["context", "disclose", "withhold", "proof_required"]
+            }
+          },
+          default_action: {
+            type: "string",
+            enum: ["withhold", "ask-principal"],
+            description: "What to do when no rule matches a field"
+          },
+          identity_id: {
+            type: "string",
+            description: "Optional identity this policy is bound to"
+          }
+        },
+        required: ["policy_name", "rules", "default_action"]
+      },
+      handler: async (args) => {
+        const policyName = args.policy_name;
+        const rules = args.rules;
+        const defaultAction = args.default_action;
+        const identityId = args.identity_id;
+        const policy = await policyStore.create(
+          policyName,
+          rules,
+          defaultAction,
+          identityId
+        );
+        auditLog.append("l3", "disclosure_set_policy", identityId ?? "system", {
+          policy_id: policy.policy_id,
+          policy_name: policyName,
+          rules_count: rules.length
+        });
+        return toolResult({
+          policy_id: policy.policy_id,
+          policy_name: policy.policy_name,
+          rules_count: policy.rules.length,
+          created_at: policy.created_at
+        });
+      }
+    },
+    {
+      name: "sanctuary/disclosure_evaluate",
+      description: "Evaluate a disclosure request against an active policy. Returns per-field decisions: disclose, withhold, proof, or ask-principal.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          context: {
+            type: "string",
+            description: "The interaction context"
+          },
+          requested_fields: {
+            type: "array",
+            items: { type: "string" },
+            description: "Fields the counterparty is requesting"
+          },
+          policy_id: {
+            type: "string",
+            description: "Specific policy to evaluate (uses first available if omitted)"
+          }
+        },
+        required: ["context", "requested_fields"]
+      },
+      handler: async (args) => {
+        const context = args.context;
+        const requestedFields = args.requested_fields;
+        const policyId = args.policy_id;
+        let policy;
+        if (policyId) {
+          policy = await policyStore.get(policyId);
+        } else {
+          const allPolicies = await policyStore.list();
+          policy = allPolicies[0] ?? null;
+        }
+        if (!policy) {
+          return toolResult({
+            error: "No disclosure policy found. Create one with disclosure_set_policy first."
+          });
+        }
+        const decisions = evaluateDisclosure(policy, context, requestedFields);
+        const withholding = decisions.filter(
+          (d) => d.action === "withhold"
+        ).length;
+        const disclosing = decisions.filter(
+          (d) => d.action === "disclose"
+        ).length;
+        const proofRequired = decisions.filter(
+          (d) => d.action === "proof"
+        ).length;
+        const askPrincipal = decisions.filter(
+          (d) => d.action === "ask-principal"
+        ).length;
+        auditLog.append("l3", "disclosure_evaluate", "system", {
+          policy_id: policy.policy_id,
+          context,
+          fields_requested: requestedFields.length,
+          withholding,
+          disclosing,
+          proof_required: proofRequired
+        });
+        return toolResult({
+          policy_id: policy.policy_id,
+          policy_name: policy.policy_name,
+          context,
+          decisions,
+          summary: {
+            total_fields: requestedFields.length,
+            disclose: disclosing,
+            withhold: withholding,
+            proof: proofRequired,
+            ask_principal: askPrincipal
+          },
+          overall_recommendation: withholding > 0 ? `Withholding ${withholding} of ${requestedFields.length} requested fields per policy "${policy.policy_name}"` : `All ${requestedFields.length} fields may be disclosed per policy "${policy.policy_name}"`
+        });
+      }
+    },
+    // ─── ZK Proof Tools ───────────────────────────────────────────────────
+    {
+      name: "sanctuary/zk_commit",
+      description: "Create a Pedersen commitment to a numeric value on Ristretto255. Unlike SHA-256 commitments, Pedersen commitments support zero-knowledge proofs: you can prove properties about the committed value without revealing it.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "number",
+            description: "The integer value to commit to"
+          }
+        },
+        required: ["value"]
+      },
+      handler: async (args) => {
+        const value = args.value;
+        if (!Number.isInteger(value)) {
+          return toolResult({ error: "Value must be an integer." });
+        }
+        const commitment = createPedersenCommitment(value);
+        auditLog.append("l3", "zk_commit", "system", {
+          commitment_hash: commitment.commitment.slice(0, 16) + "..."
+        });
+        return toolResult({
+          commitment: commitment.commitment,
+          blinding_factor: commitment.blinding_factor,
+          committed_at: commitment.committed_at,
+          proof_system: "pedersen-ristretto255",
+          note: "Store the blinding_factor securely. Use zk_prove to create proofs about this commitment."
+        });
+      }
+    },
+    {
+      name: "sanctuary/zk_prove",
+      description: "Create a zero-knowledge proof of knowledge for a Pedersen commitment. Proves you know the value and blinding factor without revealing either. Uses a Schnorr sigma protocol with Fiat-Shamir transform.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "number",
+            description: "The committed value (integer)"
+          },
+          blinding_factor: {
+            type: "string",
+            description: "The blinding factor from zk_commit (base64url)"
+          },
+          commitment: {
+            type: "string",
+            description: "The Pedersen commitment (base64url)"
+          }
+        },
+        required: ["value", "blinding_factor", "commitment"]
+      },
+      handler: async (args) => {
+        const value = args.value;
+        const blindingFactor = args.blinding_factor;
+        const commitment = args.commitment;
+        if (!verifyPedersenCommitment(commitment, value, blindingFactor)) {
+          return toolResult({
+            error: "The provided value and blinding factor do not match the commitment."
+          });
+        }
+        const proof = createProofOfKnowledge(value, blindingFactor, commitment);
+        auditLog.append("l3", "zk_prove", "system", {
+          proof_type: proof.type,
+          commitment: commitment.slice(0, 16) + "..."
+        });
+        return toolResult({
+          proof,
+          note: "This proof demonstrates knowledge of the commitment opening without revealing the value."
+        });
+      }
+    },
+    {
+      name: "sanctuary/zk_verify",
+      description: "Verify a zero-knowledge proof of knowledge for a Pedersen commitment. Checks that the prover knows the commitment's opening without learning anything.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          proof: {
+            type: "object",
+            description: "The ZK proof object from zk_prove"
+          }
+        },
+        required: ["proof"]
+      },
+      handler: async (args) => {
+        const proof = args.proof;
+        const valid = verifyProofOfKnowledge(proof);
+        auditLog.append("l3", "zk_verify", "system", {
+          proof_type: proof.type,
+          valid
+        });
+        return toolResult({
+          valid,
+          proof_type: proof.type,
+          commitment: proof.commitment,
+          verified_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    },
+    {
+      name: "sanctuary/zk_range_prove",
+      description: "Create a zero-knowledge range proof: prove that a committed value is within [min, max] without revealing the exact value. Uses bit-decomposition with OR-proofs on Ristretto255.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "number",
+            description: "The committed value (integer)"
+          },
+          blinding_factor: {
+            type: "string",
+            description: "The blinding factor from zk_commit (base64url)"
+          },
+          commitment: {
+            type: "string",
+            description: "The Pedersen commitment (base64url)"
+          },
+          min: {
+            type: "number",
+            description: "Minimum of the range (inclusive)"
+          },
+          max: {
+            type: "number",
+            description: "Maximum of the range (inclusive)"
+          }
+        },
+        required: ["value", "blinding_factor", "commitment", "min", "max"]
+      },
+      handler: async (args) => {
+        const value = args.value;
+        const blindingFactor = args.blinding_factor;
+        const commitment = args.commitment;
+        const min = args.min;
+        const max = args.max;
+        const proof = createRangeProof(value, blindingFactor, commitment, min, max);
+        if ("error" in proof) {
+          return toolResult({ error: proof.error });
+        }
+        auditLog.append("l3", "zk_range_prove", "system", {
+          proof_type: proof.type,
+          range: `[${min}, ${max}]`,
+          bits: proof.bit_commitments.length
+        });
+        return toolResult({
+          proof,
+          note: `This proof demonstrates the committed value is in [${min}, ${max}] without revealing it.`
+        });
+      }
+    },
+    {
+      name: "sanctuary/zk_range_verify",
+      description: "Verify a zero-knowledge range proof \u2014 confirms a committed value is within the claimed range without learning the value.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          proof: {
+            type: "object",
+            description: "The range proof object from zk_range_prove"
+          }
+        },
+        required: ["proof"]
+      },
+      handler: async (args) => {
+        const proof = args.proof;
+        const valid = verifyRangeProof(proof);
+        auditLog.append("l3", "zk_range_verify", "system", {
+          proof_type: proof.type,
+          valid,
+          range: `[${proof.min}, ${proof.max}]`
+        });
+        return toolResult({
+          valid,
+          proof_type: proof.type,
+          range: { min: proof.min, max: proof.max },
+          commitment: proof.commitment,
+          verified_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    }
+  ];
+  return { tools, commitmentStore, policyStore };
+}
+
+// src/l4-reputation/reputation-store.ts
+init_encryption();
+init_key_derivation();
+init_encoding();
+init_random();
+function computeMedian(values) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+function aggregateMetrics(attestations, metricNames) {
+  const result = {};
+  const names = metricNames ?? Array.from(
+    new Set(
+      attestations.flatMap(
+        (a) => Object.keys(a.attestation.data.metrics)
+      )
+    )
+  );
+  for (const name of names) {
+    const values = attestations.map((a) => a.attestation.data.metrics[name]).filter((v) => v !== void 0);
+    if (values.length === 0) {
+      result[name] = { mean: 0, median: 0, min: 0, max: 0, count: 0 };
+      continue;
+    }
+    result[name] = {
+      mean: values.reduce((s, v) => s + v, 0) / values.length,
+      median: computeMedian(values),
+      min: Math.min(...values),
+      max: Math.max(...values),
+      count: values.length
+    };
+  }
+  return result;
+}
+var ReputationStore = class {
+  storage;
+  encryptionKey;
+  constructor(storage, masterKey) {
+    this.storage = storage;
+    this.encryptionKey = derivePurposeKey(masterKey, "l4-reputation");
+  }
+  /**
+   * Record an interaction outcome as a signed attestation.
+   */
+  async record(interactionId, counterpartyDid, outcome, context, identity, identityEncryptionKey, counterpartyAttestation, sovereigntyTier) {
+    const attestationId = `att-${Date.now()}-${toBase64url(randomBytes(8))}`;
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const attestationData = {
+      interaction_id: interactionId,
+      participant_did: identity.did,
+      counterparty_did: counterpartyDid,
+      outcome_type: outcome.type,
+      outcome_result: outcome.result,
+      metrics: outcome.metrics ?? {},
+      context,
+      timestamp: now,
+      sovereignty_tier: sovereigntyTier
+    };
+    const dataBytes = stringToBytes(JSON.stringify(attestationData));
+    const signature = sign(
+      dataBytes,
+      identity.encrypted_private_key,
+      identityEncryptionKey
+    );
+    const attestation = {
+      attestation_id: attestationId,
+      schema: "sanctuary-interaction-v1",
+      data: attestationData,
+      signature: toBase64url(signature),
+      signer: identity.did
+    };
+    const stored = {
+      attestation,
+      counterparty_attestation: counterpartyAttestation,
+      counterparty_confirmed: !!counterpartyAttestation,
+      recorded_at: now
+    };
+    const serialized = stringToBytes(JSON.stringify(stored));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_reputation",
+      attestationId,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+    return stored;
+  }
+  /**
+   * Query reputation data with filtering.
+   * Returns aggregates only — not raw interaction data.
+   */
+  async query(options) {
+    const all = await this.loadAll();
+    let filtered = all;
+    if (options.context) {
+      filtered = filtered.filter(
+        (a) => a.attestation.data.context === options.context
+      );
+    }
+    if (options.time_range) {
+      const start2 = new Date(options.time_range.start).getTime();
+      const end2 = new Date(options.time_range.end).getTime();
+      filtered = filtered.filter((a) => {
+        const t = new Date(a.attestation.data.timestamp).getTime();
+        return t >= start2 && t <= end2;
+      });
+    }
+    if (options.counterparty_did) {
+      filtered = filtered.filter(
+        (a) => a.attestation.data.counterparty_did === options.counterparty_did
+      );
+    }
+    const contexts = Array.from(
+      new Set(filtered.map((a) => a.attestation.data.context))
+    );
+    const timestamps = filtered.map(
+      (a) => new Date(a.attestation.data.timestamp).getTime()
+    );
+    const start = timestamps.length > 0 ? new Date(Math.min(...timestamps)).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
+    const end = timestamps.length > 0 ? new Date(Math.max(...timestamps)).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
+    return {
+      total_interactions: filtered.length,
+      completed: filtered.filter(
+        (a) => a.attestation.data.outcome_result === "completed"
+      ).length,
+      partial: filtered.filter(
+        (a) => a.attestation.data.outcome_result === "partial"
+      ).length,
+      failed: filtered.filter(
+        (a) => a.attestation.data.outcome_result === "failed"
+      ).length,
+      disputed: filtered.filter(
+        (a) => a.attestation.data.outcome_result === "disputed"
+      ).length,
+      contexts,
+      time_range: { start, end },
+      aggregate_metrics: aggregateMetrics(filtered, options.metrics)
+    };
+  }
+  /**
+   * Export attestations as a portable reputation bundle.
+   */
+  async exportBundle(identity, identityEncryptionKey, context) {
+    let all = await this.loadAll();
+    if (context) {
+      all = all.filter((a) => a.attestation.data.context === context);
+    }
+    const attestations = all.map((a) => a.attestation);
+    const bundleData = {
+      version: "SANCTUARY_REP_V1",
+      attestations,
+      exported_at: (/* @__PURE__ */ new Date()).toISOString(),
+      exporter_did: identity.did
+    };
+    const bundleBytes = stringToBytes(JSON.stringify(bundleData));
+    const bundleSignature = sign(
+      bundleBytes,
+      identity.encrypted_private_key,
+      identityEncryptionKey
+    );
+    return {
+      ...bundleData,
+      bundle_signature: toBase64url(bundleSignature)
+    };
+  }
+  /**
+   * Import attestations from a reputation bundle.
+   * Verifies signatures if requested (default: true).
+   *
+   * @param publicKeys - Map of DID → public key bytes for signature verification
+   */
+  async importBundle(bundle, verifySignatures, publicKeys) {
+    let imported = 0;
+    let invalid = 0;
+    const contexts = /* @__PURE__ */ new Set();
+    for (const attestation of bundle.attestations) {
+      if (verifySignatures) {
+        const signerKey = publicKeys.get(attestation.signer);
+        if (!signerKey) {
+          invalid++;
+          continue;
+        }
+        const dataBytes = stringToBytes(
+          JSON.stringify(attestation.data)
+        );
+        const sigBytes = fromBase64url(attestation.signature);
+        if (!verify(dataBytes, sigBytes, signerKey)) {
+          invalid++;
+          continue;
+        }
+      }
+      const stored = {
+        attestation,
+        counterparty_confirmed: false,
+        recorded_at: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      const serialized = stringToBytes(JSON.stringify(stored));
+      const encrypted = encrypt(serialized, this.encryptionKey);
+      await this.storage.write(
+        "_reputation",
+        attestation.attestation_id,
+        stringToBytes(JSON.stringify(encrypted))
+      );
+      imported++;
+      contexts.add(attestation.data.context);
+    }
+    return {
+      imported,
+      invalid,
+      contexts: Array.from(contexts)
+    };
+  }
+  // ─── Escrow ───────────────────────────────────────────────────────────
+  /**
+   * Create an escrow for trust bootstrapping.
+   */
+  async createEscrow(transactionTerms, counterpartyDid, timeoutSeconds, creatorDid, collateralAmount) {
+    const escrowId = `esc-${Date.now()}-${toBase64url(randomBytes(8))}`;
+    const now = /* @__PURE__ */ new Date();
+    const expiresAt = new Date(now.getTime() + timeoutSeconds * 1e3);
+    const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
+    const termsHash = hashToString2(stringToBytes(transactionTerms));
+    const escrow = {
+      escrow_id: escrowId,
+      transaction_terms: transactionTerms,
+      terms_hash: termsHash,
+      collateral_amount: collateralAmount,
+      counterparty_did: counterpartyDid,
+      creator_did: creatorDid,
+      created_at: now.toISOString(),
+      expires_at: expiresAt.toISOString(),
+      status: "pending"
+    };
+    const serialized = stringToBytes(JSON.stringify(escrow));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_escrows",
+      escrowId,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+    return escrow;
+  }
+  /**
+   * Get an escrow by ID.
+   */
+  async getEscrow(escrowId) {
+    const raw = await this.storage.read("_escrows", escrowId);
+    if (!raw) return null;
+    try {
+      const encrypted = JSON.parse(bytesToString(raw));
+      const decrypted = decrypt(encrypted, this.encryptionKey);
+      return JSON.parse(bytesToString(decrypted));
+    } catch {
+      return null;
+    }
+  }
+  // ─── Guarantees ─────────────────────────────────────────────────────
+  /**
+   * Create a principal's guarantee for a new agent.
+   */
+  async createGuarantee(principalIdentity, agentDid, scope, durationSeconds, identityEncryptionKey, maxLiability) {
+    const guaranteeId = `guar-${Date.now()}-${toBase64url(randomBytes(8))}`;
+    const now = /* @__PURE__ */ new Date();
+    const validUntil = new Date(now.getTime() + durationSeconds * 1e3);
+    const certificateData = {
+      guarantee_id: guaranteeId,
+      principal_did: principalIdentity.did,
+      agent_did: agentDid,
+      scope,
+      max_liability: maxLiability,
+      valid_until: validUntil.toISOString(),
+      issued_at: now.toISOString()
+    };
+    const certBytes = stringToBytes(JSON.stringify(certificateData));
+    const signature = sign(
+      certBytes,
+      principalIdentity.encrypted_private_key,
+      identityEncryptionKey
+    );
+    const certificate = toBase64url(
+      stringToBytes(
+        JSON.stringify({
+          ...certificateData,
+          signature: toBase64url(signature)
+        })
+      )
+    );
+    const guarantee = {
+      guarantee_id: guaranteeId,
+      principal_did: principalIdentity.did,
+      agent_did: agentDid,
+      scope,
+      max_liability: maxLiability,
+      valid_until: validUntil.toISOString(),
+      certificate,
+      created_at: now.toISOString()
+    };
+    const serialized = stringToBytes(JSON.stringify(guarantee));
+    const encrypted = encrypt(serialized, this.encryptionKey);
+    await this.storage.write(
+      "_guarantees",
+      guaranteeId,
+      stringToBytes(JSON.stringify(encrypted))
+    );
+    return guarantee;
+  }
+  // ─── Tier-Aware Access ───────────────────────────────────────────────
+  /**
+   * Load attestations for tier-weighted scoring.
+   * Applies basic context/counterparty filtering, returns full StoredAttestations
+   * so callers can access sovereignty_tier from attestation data.
+   */
+  async loadAllForTierScoring(options) {
+    let all = await this.loadAll();
+    if (options?.context) {
+      all = all.filter((a) => a.attestation.data.context === options.context);
+    }
+    if (options?.counterparty_did) {
+      all = all.filter(
+        (a) => a.attestation.data.counterparty_did === options.counterparty_did
+      );
+    }
+    return all;
+  }
+  // ─── Internal ─────────────────────────────────────────────────────────
+  async loadAll() {
+    const results = [];
+    try {
+      const entries = await this.storage.list("_reputation");
+      for (const meta of entries) {
+        const raw = await this.storage.read("_reputation", meta.key);
+        if (!raw) continue;
+        try {
+          const encrypted = JSON.parse(bytesToString(raw));
+          const decrypted = decrypt(encrypted, this.encryptionKey);
+          results.push(JSON.parse(bytesToString(decrypted)));
+        } catch {
+        }
+      }
+    } catch {
+    }
+    return results;
+  }
+};
+
+// src/l4-reputation/tools.ts
+init_key_derivation();
+init_encoding();
+
+// src/l4-reputation/tiers.ts
+var TIER_WEIGHTS = {
+  "verified-sovereign": 1,
+  "verified-degraded": 0.8,
+  "self-attested": 0.5,
+  "unverified": 0.2
+};
+function resolveTier(counterpartyId, handshakeResults, hasSanctuaryIdentity) {
+  const handshake = handshakeResults.get(counterpartyId);
+  if (handshake && handshake.verified) {
+    const expiresAt = new Date(handshake.expires_at);
+    if (expiresAt > /* @__PURE__ */ new Date()) {
+      return {
+        sovereignty_tier: handshake.trust_tier,
+        handshake_completed_at: handshake.completed_at,
+        verified_by: handshake.counterparty_id
+      };
+    }
+  }
+  if (hasSanctuaryIdentity) {
+    return { sovereignty_tier: "self-attested" };
+  }
+  return { sovereignty_tier: "unverified" };
+}
+function trustTierToSovereigntyTier(trustTier) {
+  switch (trustTier) {
+    case "verified-sovereign":
+      return "verified-sovereign";
+    case "verified-degraded":
+      return "verified-degraded";
+    default:
+      return "unverified";
+  }
+}
+function computeWeightedScore(attestations) {
+  if (attestations.length === 0) return null;
+  let weightedSum = 0;
+  let totalWeight = 0;
+  for (const a of attestations) {
+    const weight = TIER_WEIGHTS[a.tier];
+    weightedSum += a.value * weight;
+    totalWeight += weight;
+  }
+  return totalWeight > 0 ? weightedSum / totalWeight : null;
+}
+function tierDistribution(tiers) {
+  const dist = {
+    "verified-sovereign": 0,
+    "verified-degraded": 0,
+    "self-attested": 0,
+    "unverified": 0
+  };
+  for (const tier of tiers) {
+    dist[tier]++;
+  }
+  return dist;
+}
+
+// src/l4-reputation/tools.ts
+function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeResults) {
+  const reputationStore = new ReputationStore(storage, masterKey);
+  const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  const hsResults = handshakeResults ?? /* @__PURE__ */ new Map();
+  const tools = [
+    // ─── Reputation Recording ─────────────────────────────────────────
+    {
+      name: "sanctuary/reputation_record",
+      description: "Record an interaction outcome as a signed attestation. Creates an EAS-compatible attestation signed by the specified identity.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          interaction_id: {
+            type: "string",
+            description: "Unique interaction identifier"
+          },
+          counterparty_did: {
+            type: "string",
+            description: "Counterparty's DID"
+          },
+          outcome: {
+            type: "object",
+            description: "Interaction outcome",
+            properties: {
+              type: {
+                type: "string",
+                enum: ["transaction", "negotiation", "service", "dispute", "custom"]
+              },
+              result: {
+                type: "string",
+                enum: ["completed", "partial", "failed", "disputed"]
+              },
+              metrics: {
+                type: "object",
+                description: "Domain-specific metrics (e.g., fulfillment_rate, response_time_ms)"
+              }
+            },
+            required: ["type", "result"]
+          },
+          context: {
+            type: "string",
+            description: "Category/domain for context-specific reputation",
+            default: "general"
+          },
+          counterparty_attestation: {
+            type: "string",
+            description: "Counterparty's signed attestation of the same interaction"
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to sign with (uses default if omitted)"
+          }
+        },
+        required: ["interaction_id", "counterparty_did", "outcome"]
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first."
+          });
+        }
+        const outcome = args.outcome;
+        const context = args.context ?? "general";
+        const counterpartyDid = args.counterparty_did;
+        const hasSanctuaryIdentity = identityManager.list().some(
+          (id) => identityManager.get(id.identity_id)?.did === counterpartyDid
+        );
+        const tierMeta = resolveTier(counterpartyDid, hsResults, hasSanctuaryIdentity);
+        const stored = await reputationStore.record(
+          args.interaction_id,
+          counterpartyDid,
+          outcome,
+          context,
+          identity,
+          identityEncryptionKey,
+          args.counterparty_attestation,
+          tierMeta.sovereignty_tier
+        );
+        auditLog.append("l4", "reputation_record", identity.identity_id, {
+          interaction_id: args.interaction_id,
+          outcome_type: outcome.type,
+          outcome_result: outcome.result,
+          context,
+          sovereignty_tier: tierMeta.sovereignty_tier
+        });
+        return toolResult({
+          attestation_id: stored.attestation.attestation_id,
+          interaction_id: stored.attestation.data.interaction_id,
+          self_attestation: stored.attestation.signature,
+          counterparty_confirmed: stored.counterparty_confirmed,
+          sovereignty_tier: tierMeta.sovereignty_tier,
+          context,
+          recorded_at: stored.recorded_at
+        });
+      }
+    },
+    // ─── Reputation Query ─────────────────────────────────────────────
+    {
+      name: "sanctuary/reputation_query",
+      description: "Query aggregated reputation data with filtering. Returns summary statistics, never raw interaction details.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          context: {
+            type: "string",
+            description: "Filter by context/domain"
+          },
+          time_range: {
+            type: "object",
+            description: "Filter by time range",
+            properties: {
+              start: { type: "string", description: "ISO 8601 start" },
+              end: { type: "string", description: "ISO 8601 end" }
+            }
+          },
+          metrics: {
+            type: "array",
+            items: { type: "string" },
+            description: "Which metrics to aggregate"
+          },
+          counterparty_did: {
+            type: "string",
+            description: "Filter by counterparty"
+          }
+        }
+      },
+      handler: async (args) => {
+        const summary = await reputationStore.query({
+          context: args.context,
+          time_range: args.time_range,
+          metrics: args.metrics,
+          counterparty_did: args.counterparty_did
+        });
+        auditLog.append("l4", "reputation_query", "system", {
+          total_interactions: summary.total_interactions,
+          contexts: summary.contexts
+        });
+        return toolResult({
+          summary,
+          // SEC-ADD-03: Tag response as containing counterparty-generated attestation data
+          _content_trust: "external"
+        });
+      }
+    },
+    // ─── Reputation Export ─────────────────────────────────────────────
+    {
+      name: "sanctuary/reputation_export",
+      description: "Export a portable reputation bundle (SANCTUARY_REP_V1). Includes all signed attestations for independent verification.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          format: {
+            type: "string",
+            enum: ["SANCTUARY_REP_V1"],
+            default: "SANCTUARY_REP_V1"
+          },
+          context: {
+            type: "string",
+            description: "Export specific context only"
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to sign the bundle with"
+          }
+        }
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first."
+          });
+        }
+        const context = args.context;
+        const bundle = await reputationStore.exportBundle(
+          identity,
+          identityEncryptionKey,
+          context
+        );
+        const bundleJson = JSON.stringify(bundle);
+        const bundleBase64 = toBase64url(
+          new TextEncoder().encode(bundleJson)
+        );
+        auditLog.append("l4", "reputation_export", identity.identity_id, {
+          attestation_count: bundle.attestations.length,
+          contexts: Array.from(
+            new Set(bundle.attestations.map((a) => a.data.context))
+          )
+        });
+        const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
+        const { stringToBytes: stringToBytes2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
+        return toolResult({
+          bundle: bundleBase64,
+          attestation_count: bundle.attestations.length,
+          contexts: Array.from(
+            new Set(bundle.attestations.map((a) => a.data.context))
+          ),
+          bundle_hash: hashToString2(stringToBytes2(bundleJson)),
+          exported_at: bundle.exported_at
+        });
+      }
+    },
+    // ─── Reputation Import ────────────────────────────────────────────
+    {
+      name: "sanctuary/reputation_import",
+      description: "Import a reputation bundle from another Sanctuary instance. Verifies all attestation signatures by default.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          bundle: {
+            type: "string",
+            description: "Base64url-encoded reputation bundle"
+          }
+        },
+        required: ["bundle"]
+      },
+      handler: async (args) => {
+        const bundleBase64 = args.bundle;
+        const verifySignatures = true;
+        let bundle;
+        try {
+          const bundleBytes = fromBase64url(bundleBase64);
+          const bundleJson = new TextDecoder().decode(bundleBytes);
+          bundle = JSON.parse(bundleJson);
+        } catch {
+          return toolResult({
+            error: "Invalid bundle format. Expected base64url-encoded JSON."
+          });
+        }
+        const publicKeys = /* @__PURE__ */ new Map();
+        for (const pub of identityManager.list()) {
+          const identity = identityManager.get(pub.identity_id);
+          if (identity) {
+            publicKeys.set(identity.did, fromBase64url(identity.public_key));
+          }
+        }
+        const result = await reputationStore.importBundle(
+          bundle,
+          verifySignatures,
+          publicKeys
+        );
+        auditLog.append("l4", "reputation_import", "system", {
+          imported: result.imported,
+          invalid: result.invalid,
+          contexts: result.contexts
+        });
+        return toolResult({
+          imported_attestations: result.imported,
+          invalid_attestations: result.invalid,
+          contexts: result.contexts,
+          imported_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    },
+    // ─── Sovereignty-Weighted Query ──────────────────────────────────
+    {
+      name: "sanctuary/reputation_query_weighted",
+      description: "Query reputation with sovereignty-weighted scoring. Attestations from verified-sovereign agents carry full weight (1.0); unverified attestations carry reduced weight (0.2). Returns both the weighted score and tier distribution.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          metric: {
+            type: "string",
+            description: "Which metric to compute the weighted score for"
+          },
+          context: {
+            type: "string",
+            description: "Filter by context/domain"
+          },
+          counterparty_did: {
+            type: "string",
+            description: "Filter by counterparty"
+          }
+        },
+        required: ["metric"]
+      },
+      handler: async (args) => {
+        const summary = await reputationStore.query({
+          context: args.context,
+          counterparty_did: args.counterparty_did
+        });
+        const allAttestations = await reputationStore.loadAllForTierScoring({
+          context: args.context,
+          counterparty_did: args.counterparty_did
+        });
+        const metric = args.metric;
+        const tieredAttestations = allAttestations.filter((a) => a.attestation.data.metrics[metric] !== void 0).map((a) => ({
+          value: a.attestation.data.metrics[metric],
+          tier: a.attestation.data.sovereignty_tier ?? "unverified"
+        }));
+        const weightedScore = computeWeightedScore(tieredAttestations);
+        const tiers = allAttestations.map(
+          (a) => a.attestation.data.sovereignty_tier ?? "unverified"
+        );
+        const dist = tierDistribution(tiers);
+        auditLog.append("l4", "reputation_query_weighted", "system", {
+          metric,
+          attestation_count: tieredAttestations.length,
+          weighted_score: weightedScore
+        });
+        return toolResult({
+          metric,
+          weighted_score: weightedScore,
+          attestation_count: tieredAttestations.length,
+          tier_distribution: dist,
+          tier_weights: TIER_WEIGHTS,
+          unweighted_summary: summary
+        });
+      }
+    },
+    // ─── Trust Bootstrap: Escrow ──────────────────────────────────────
+    {
+      name: "sanctuary/bootstrap_create_escrow",
+      description: "Create an escrow record for trust bootstrapping. Allows new participants with no reputation to transact safely.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          transaction_terms: {
+            type: "string",
+            description: "Description of the transaction"
+          },
+          collateral_amount: {
+            type: "number",
+            description: "Optional stake/collateral amount"
+          },
+          counterparty_did: {
+            type: "string",
+            description: "Counterparty's DID"
+          },
+          timeout_seconds: {
+            type: "number",
+            description: "Escrow timeout in seconds"
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity creating the escrow"
+          }
+        },
+        required: ["transaction_terms", "counterparty_did", "timeout_seconds"]
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first."
+          });
+        }
+        const escrow = await reputationStore.createEscrow(
+          args.transaction_terms,
+          args.counterparty_did,
+          args.timeout_seconds,
+          identity.did,
+          args.collateral_amount
+        );
+        auditLog.append("l4", "bootstrap_create_escrow", identity.identity_id, {
+          escrow_id: escrow.escrow_id,
+          counterparty_did: args.counterparty_did,
+          timeout_seconds: args.timeout_seconds
+        });
+        return toolResult({
+          escrow_id: escrow.escrow_id,
+          terms_hash: escrow.terms_hash,
+          created_at: escrow.created_at,
+          expires_at: escrow.expires_at,
+          status: escrow.status
+        });
+      }
+    },
+    // ─── Trust Bootstrap: Guarantee ───────────────────────────────────
+    {
+      name: "sanctuary/bootstrap_provide_guarantee",
+      description: "A principal provides a signed reputation guarantee for a new agent. The guarantee certificate can be presented to counterparties.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          principal_identity_id: {
+            type: "string",
+            description: "Identity of the guarantor (principal)"
+          },
+          agent_identity_id: {
+            type: "string",
+            description: "Identity of the agent being guaranteed"
+          },
+          scope: {
+            type: "string",
+            description: "What the guarantee covers"
+          },
+          duration_seconds: {
+            type: "number",
+            description: "How long the guarantee is valid"
+          },
+          max_liability: {
+            type: "number",
+            description: "Maximum liability amount"
+          }
+        },
+        required: [
+          "principal_identity_id",
+          "agent_identity_id",
+          "scope",
+          "duration_seconds"
+        ]
+      },
+      handler: async (args) => {
+        const principalIdentity = identityManager.get(
+          args.principal_identity_id
+        );
+        const agentIdentity = identityManager.get(
+          args.agent_identity_id
+        );
+        if (!principalIdentity) {
+          return toolResult({
+            error: `Principal identity "${args.principal_identity_id}" not found.`
+          });
+        }
+        if (!agentIdentity) {
+          return toolResult({
+            error: `Agent identity "${args.agent_identity_id}" not found.`
+          });
+        }
+        const guarantee = await reputationStore.createGuarantee(
+          principalIdentity,
+          agentIdentity.did,
+          args.scope,
+          args.duration_seconds,
+          identityEncryptionKey,
+          args.max_liability
+        );
+        auditLog.append(
+          "l4",
+          "bootstrap_provide_guarantee",
+          principalIdentity.identity_id,
+          {
+            guarantee_id: guarantee.guarantee_id,
+            agent_did: agentIdentity.did,
+            scope: args.scope
+          }
+        );
+        return toolResult({
+          guarantee_id: guarantee.guarantee_id,
+          guarantee_certificate: guarantee.certificate,
+          scope: guarantee.scope,
+          valid_until: guarantee.valid_until
+        });
+      }
+    }
+  ];
+  return { tools, reputationStore };
+}
+
+// src/index.ts
+init_loader();
+init_baseline();
+
+// src/principal-policy/approval-channel.ts
+var StderrApprovalChannel = class {
+  constructor(_config) {
+  }
+  async requestApproval(request) {
+    const prompt = this.formatPrompt(request);
+    process.stderr.write(prompt + "\n");
+    return {
+      decision: "deny",
+      decided_at: (/* @__PURE__ */ new Date()).toISOString(),
+      decided_by: "stderr:non-interactive"
+    };
+  }
+  formatPrompt(request) {
+    const tierLabel = request.tier === 1 ? "Tier 1 \u2014 always requires approval" : "Tier 2 \u2014 behavioral anomaly detected";
+    const contextLines = Object.entries(request.context).map(([k, v]) => `  ${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`).join("\n");
+    return [
+      "",
+      "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557",
+      "\u2551  SANCTUARY: Operation Denied (non-interactive channel)           \u2551",
+      "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563",
+      `\u2551  Operation:  ${request.operation.padEnd(50)}\u2551`,
+      `\u2551  ${tierLabel.padEnd(62)}\u2551`,
+      `\u2551  Reason:     ${request.reason.slice(0, 50).padEnd(50)}\u2551`,
+      "\u2551                                                                  \u2551",
+      `\u2551  Details:                                                        \u2551`,
+      ...contextLines.split("\n").map(
+        (line) => `\u2551    ${line.padEnd(60)}\u2551`
+      ),
+      "\u2551                                                                  \u2551",
+      "\u2551  Denied: stderr channel cannot accept input (SEC-016)            \u2551",
+      "\u2551  Use dashboard or webhook channel for interactive approval.      \u2551",
+      "\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D",
+      ""
+    ].join("\n");
+  }
+};
+
+// src/index.ts
+init_dashboard();
 function signPayload(body, secret) {
   return createHmac("sha256", secret).update(body).digest("hex");
 }
@@ -6327,7 +6544,7 @@ var WebhookApprovalChannel = class {
    */
   async start() {
     return new Promise((resolve, reject) => {
-      this.callbackServer = createServer$2(
+      this.callbackServer = createServer$1(
         (req, res) => this.handleCallback(req, res)
       );
       this.callbackServer.listen(
@@ -6535,6 +6752,9 @@ var WebhookApprovalChannel = class {
     return this.pending.size;
   }
 };
+
+// src/principal-policy/gate.ts
+init_loader();
 
 // src/security/injection-detector.ts
 var ROLE_OVERRIDE_PATTERNS = [
@@ -7386,6 +7606,7 @@ function canonicalizeForSigning(body) {
 
 // src/shr/generator.ts
 init_encoding();
+init_key_derivation();
 var DEFAULT_VALIDITY_MS = 60 * 60 * 1e3;
 function generateSHR(identityId, opts) {
   const { config, identityManager, masterKey, validityMs } = opts;
@@ -7410,15 +7631,6 @@ function generateSHR(identityId, opts) {
       severity: "warning",
       description: "Attestation is self-reported (no hardware root of trust)",
       mitigation: "TEE attestation planned for a future release"
-    });
-  }
-  if (config.disclosure.proof_system === "commitment-only") {
-    degradations.push({
-      layer: "l3",
-      code: "COMMITMENT_ONLY",
-      severity: "info",
-      description: "Commitment schemes only (no ZK proofs)",
-      mitigation: "ZK proof support planned for future release"
     });
   }
   const body = {
@@ -7446,9 +7658,9 @@ function generateSHR(identityId, opts) {
         attestation_available: config.execution.attestation
       },
       l3: {
-        status: config.disclosure.proof_system === "commitment-only" ? "degraded" : "active",
+        status: "active",
         proof_system: config.disclosure.proof_system,
-        selective_disclosure: config.disclosure.proof_system !== "commitment-only"
+        selective_disclosure: true
       },
       l4: {
         status: "active",
@@ -7661,7 +7873,7 @@ function extractAuthorizationSignals(body) {
     behavioral_baseline_active: false,
     // Would need explicit field in SHR v1.1
     identity_verified: l1.identity_type === "ed25519" || l1.identity_type !== "none",
-    zero_knowledge_capable: l3.status === "active" && l3.proof_system !== "commitment-only",
+    zero_knowledge_capable: l3.status === "active",
     selective_disclosure_active: l3.selective_disclosure,
     reputation_portable: l4.reputation_portable,
     handshake_capable: body.capabilities.handshake
@@ -7737,14 +7949,6 @@ function generateAuthorizationConstraints(body, _degradations) {
       description: "Limit data sharing to minimal required scope \u2014 no selective disclosure",
       rationale: "Agent cannot redact data or prove predicates without revealing all context",
       priority: "high"
-    });
-  }
-  if (layers.l3.proof_system === "commitment-only") {
-    constraints.push({
-      type: "restricted_scope",
-      description: "No zero-knowledge proofs available \u2014 entire state context may be visible",
-      rationale: "Proof system is commitment-only (no ZK)",
-      priority: "medium"
     });
   }
   if (layers.l4.status === "degraded") {
@@ -7913,6 +8117,8 @@ function createSHRTools(config, identityManager, masterKey, auditLog) {
 
 // src/handshake/protocol.ts
 init_encoding();
+init_random();
+init_key_derivation();
 function generateNonce() {
   return toBase64url(randomBytes(32));
 }
@@ -8626,11 +8832,14 @@ function createFederationTools(auditLog, handshakeResults) {
 }
 
 // src/bridge/tools.ts
+init_key_derivation();
 init_encoding();
+init_encryption();
 init_encoding();
 
 // src/bridge/bridge.ts
 init_encoding();
+init_random();
 init_hashing();
 function canonicalize(outcome) {
   return stringToBytes(stableStringify(outcome));
@@ -9781,7 +9990,10 @@ function createAuditTools(config) {
 }
 
 // src/l2-operational/context-gate.ts
+init_encryption();
+init_key_derivation();
 init_encoding();
+init_random();
 init_hashing();
 var MAX_CONTEXT_FIELDS = 1e3;
 var MAX_POLICY_RULES = 50;
@@ -11705,7 +11917,15 @@ function createL2HardeningTools(storagePath, auditLog) {
 }
 
 // src/index.ts
+init_key_derivation();
+init_random();
 init_encoding();
+init_config();
+init_audit_log();
+init_filesystem();
+init_baseline();
+init_loader();
+init_dashboard();
 async function createSanctuaryServer(options) {
   const config = await loadConfig(options?.configPath);
   await mkdir(config.storage_path, { recursive: true, mode: 448 });
@@ -11819,11 +12039,6 @@ async function createSanctuaryServer(options) {
         degradations.push(
           "L2 isolation is process-level only; no TEE available"
         );
-        if (config.disclosure.proof_system === "commitment-only") {
-          degradations.push(
-            "L3 proofs are commitment-based only; ZK proofs not yet available"
-          );
-        }
         return toolResult({
           attestation: {
             environment_type: config.execution.environment,
@@ -11849,7 +12064,7 @@ async function createSanctuaryServer(options) {
               l1_state_encrypted: true,
               l2_execution_isolated: false,
               l2_isolation_type: "process-level",
-              l3_proofs_available: config.disclosure.proof_system !== "commitment-only",
+              l3_proofs_available: true,
               l4_reputation_active: true,
               overall_level: "mvs",
               degradations
@@ -11872,14 +12087,6 @@ async function createSanctuaryServer(options) {
           severity: "warning",
           mitigation: "TEE support planned for a future release"
         });
-        if (config.disclosure.proof_system === "commitment-only") {
-          degradations.push({
-            layer: "l3",
-            description: "Commitment schemes only (no ZK proofs)",
-            severity: "info",
-            mitigation: "ZK proof support planned for v0.2.0"
-          });
-        }
         return toolResult({
           status: degradations.some((d) => d.severity === "critical") ? "compromised" : degradations.some((d) => d.severity === "warning") ? "degraded" : "healthy",
           storage_bytes: storageSizeBytes,
@@ -11898,7 +12105,7 @@ async function createSanctuaryServer(options) {
               last_attestation: (/* @__PURE__ */ new Date()).toISOString()
             },
             l3: {
-              status: config.disclosure.proof_system === "commitment-only" ? "degraded" : "active",
+              status: "active",
               proof_system: config.disclosure.proof_system,
               circuits_loaded: 0,
               proofs_generated_total: 0
@@ -12252,6 +12459,10 @@ var { version: PKG_VERSION3 } = require4("../package.json");
 async function main() {
   const args = process.argv.slice(2);
   let passphrase = process.env.SANCTUARY_PASSPHRASE;
+  if (args[0] === "dashboard") {
+    await runStandaloneDashboard(args.slice(1));
+    return;
+  }
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dashboard") {
       process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
@@ -12278,6 +12489,38 @@ async function main() {
     process.exit(1);
   }
 }
+async function runStandaloneDashboard(args) {
+  let passphrase = process.env.SANCTUARY_PASSPHRASE;
+  let port;
+  let host;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--passphrase" && args[i + 1]) {
+      passphrase = args[++i];
+    } else if (args[i] === "--port" && args[i + 1]) {
+      port = parseInt(args[++i], 10);
+    } else if (args[i] === "--host" && args[i + 1]) {
+      host = args[++i];
+    } else if (args[i] === "--help" || args[i] === "-h") {
+      printDashboardHelp();
+      process.exit(0);
+    }
+  }
+  const { startStandaloneDashboard: startStandaloneDashboard2 } = await Promise.resolve().then(() => (init_dashboard_standalone(), dashboard_standalone_exports));
+  await startStandaloneDashboard2({
+    passphrase,
+    port,
+    host
+  });
+  console.error(`
+Sanctuary Dashboard running (standalone mode). Press Ctrl+C to stop.
+`);
+  const shutdown = () => {
+    console.error("\nShutting down Sanctuary Dashboard...");
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
 function printHelp() {
   console.log(`
 @sanctuary-framework/mcp-server v${PKG_VERSION3}
@@ -12285,13 +12528,19 @@ function printHelp() {
 Sovereignty infrastructure for agents in the agentic economy.
 
 Usage:
-  sanctuary-mcp-server [options]
+  sanctuary-mcp-server [options]          # MCP server (stdio)
+  sanctuary-mcp-server dashboard [opts]   # Standalone dashboard
 
 Options:
   --dashboard          Enable the Principal Dashboard (web UI)
   --passphrase <pass>  Derive encryption key from passphrase
   --help, -h           Show this help
   --version, -v        Show version
+
+Subcommands:
+  dashboard            Start the dashboard as a standalone HTTP server.
+                       Reads from the same storage as the MCP server.
+                       Use "sanctuary-mcp-server dashboard --help" for options.
 
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
@@ -12305,6 +12554,47 @@ Environment variables:
   SANCTUARY_NO_UPDATE_CHECK         "1" to disable startup update check
 
 For more info: https://github.com/eriknewton/sanctuary-framework
+`);
+}
+function printDashboardHelp() {
+  console.log(`
+@sanctuary-framework/mcp-server v${PKG_VERSION3} \u2014 Standalone Dashboard
+
+Start the Principal Dashboard as a persistent HTTP server without running
+the MCP server. Use this when the MCP server runs via stdio (e.g., OpenClaw)
+and the dashboard needs to stay alive independently.
+
+Usage:
+  sanctuary-mcp-server dashboard [options]
+
+Options:
+  --port <port>        Dashboard port (default: from config or 3501)
+  --host <host>        Bind address (default: 127.0.0.1)
+  --passphrase <pass>  Derive encryption key from passphrase
+  --help, -h           Show this help
+
+Environment variables:
+  SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
+  SANCTUARY_PASSPHRASE              Key derivation passphrase
+  SANCTUARY_RECOVERY_KEY            Recovery key for existing installations
+  SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
+  SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"
+
+Note: In standalone mode, the dashboard shows audit log history and policy
+status. Live SSE events (tool calls, injection alerts) are only available
+when the dashboard runs alongside the MCP server (--dashboard flag).
+
+Examples:
+  # Start with default settings
+  sanctuary-mcp-server dashboard
+
+  # Start on a custom port
+  sanctuary-mcp-server dashboard --port 8080
+
+  # Start with passphrase
+  sanctuary-mcp-server dashboard --passphrase "my secret"
+
+  # macOS launchd: add to ~/Library/LaunchAgents/ for auto-start
 `);
 }
 main().catch((err) => {

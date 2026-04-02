@@ -26,7 +26,7 @@ const mockSHR: SignedSHR = {
     layers: {
       l1: { status: "active", encryption: "aes-256-gcm", key_custody: "self", integrity: "merkle-sha256", identity_type: "ed25519", state_portable: true },
       l2: { status: "degraded", isolation_type: "local-process", attestation_available: true },
-      l3: { status: "degraded", proof_system: "commitment-only", selective_disclosure: false },
+      l3: { status: "active", proof_system: "schnorr-pedersen", selective_disclosure: true },
       l4: { status: "active", reputation_mode: "self-custodied", attestation_format: "eas-compatible", reputation_portable: true },
     },
     capabilities: { handshake: true, shr_exchange: true, reputation_verify: true, encrypted_channel: false },

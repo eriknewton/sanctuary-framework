@@ -251,33 +251,24 @@ describe("Ping Identity Gateway Adapter", () => {
       expect(hasL2Constraint).toBe(true);
     });
 
-    it("with commitment-only proof system, applies L3 degradations", () => {
-      const degradedConfig = {
-        ...config,
-        disclosure: {
-          ...config.disclosure,
-          proof_system: "commitment-only",
-        },
-      };
-
+    it("with schnorr-pedersen proof system, L3 is active (genuine ZK)", () => {
       const shr = generateSHR(undefined, {
-        config: degradedConfig,
+        config,
         identityManager: identityManager as any,
         masterKey,
       }) as SignedSHR;
 
       const context = transformSHRForGateway(shr);
 
-      // L3 should be degraded
-      expect(context.layer_status.l3_disclosure).toBe("degraded");
-      expect(context.layer_scores.l3_disclosure).toBeLessThan(100);
+      // L3 should be active — Schnorr + Pedersen + range proofs are genuine ZK
+      expect(context.layer_status.l3_disclosure).toBe("active");
+      expect(context.layer_scores.l3_disclosure).toBe(100);
 
-      // Should have constraints related to L3 degradation
+      // Should NOT have constraints related to L3 degradation
       const hasL3Constraint = context.recommended_constraints.some((c) =>
-        c.description.toLowerCase().includes("selective disclosure") ||
-        c.description.toLowerCase().includes("data sharing")
+        c.description.toLowerCase().includes("no zero-knowledge")
       );
-      expect(hasL3Constraint).toBe(true);
+      expect(hasL3Constraint).toBe(false);
     });
   });
 

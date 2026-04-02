@@ -299,7 +299,7 @@ function extractAuthorizationSignals(body: SHRBody): PingAuthorizationContext["a
     encryption_at_rest: l1.encryption !== "none" && l1.encryption !== "unencrypted",
     behavioral_baseline_active: false, // Would need explicit field in SHR v1.1
     identity_verified: l1.identity_type === "ed25519" || l1.identity_type !== "none",
-    zero_knowledge_capable: l3.status === "active" && l3.proof_system !== "commitment-only",
+    zero_knowledge_capable: l3.status === "active",
     selective_disclosure_active: l3.selective_disclosure,
     reputation_portable: l4.reputation_portable,
     handshake_capable: body.capabilities.handshake,
@@ -399,14 +399,8 @@ function generateAuthorizationConstraints(
     });
   }
 
-  if (layers.l3.proof_system === "commitment-only") {
-    constraints.push({
-      type: "restricted_scope",
-      description: "No zero-knowledge proofs available — entire state context may be visible",
-      rationale: "Proof system is commitment-only (no ZK)",
-      priority: "medium",
-    });
-  }
+  // Note: "schnorr-pedersen" (and legacy "commitment-only") both provide genuine ZK proofs.
+  // No additional constraint needed for the proof system.
 
   // L4 (Reputation) constraints
   if (layers.l4.status === "degraded") {

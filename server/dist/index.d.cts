@@ -21,7 +21,7 @@ interface SanctuaryConfig {
         };
     };
     disclosure: {
-        proof_system: "groth16" | "plonk" | "commitment-only";
+        proof_system: "groth16" | "plonk" | "schnorr-pedersen" | "commitment-only";
         default_policy: "minimum-necessary" | "withhold-all";
     };
     reputation: {

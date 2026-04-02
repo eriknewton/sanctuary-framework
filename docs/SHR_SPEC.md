@@ -146,11 +146,11 @@ Describes the agent's ability to prove claims without full revelation.
 
 | Field | Description |
 |-------|-------------|
-| `status` | "active" = ZK proofs available; "degraded" = commitments only; "inactive" = no disclosure capability |
-| `proof_system` | System in use. Values: "commitment-only" (Pedersen + Schnorr), "groth16", "plonk", "none" |
+| `status` | "active" = ZK proofs available; "degraded" = proof system present but limited; "inactive" = no disclosure capability |
+| `proof_system` | System in use. Values: "schnorr-pedersen" (Schnorr + Pedersen + range proofs — genuine ZK), "groth16", "plonk", "none". Legacy value "commitment-only" is accepted as an alias for "schnorr-pedersen". |
 | `selective_disclosure` | Whether the agent can produce zero-knowledge proofs of specific claims |
 
-Note: The reference implementation currently supports "commitment-only" (Pedersen commitments on Ristretto255, Schnorr proofs of knowledge, and bit-decomposition range proofs). SNARK-based systems (Groth16, PLONK) are specified but not yet implemented.
+Note: The reference implementation uses "schnorr-pedersen" — Pedersen commitments on Ristretto255, Schnorr proofs of knowledge, and bit-decomposition range proofs. These are genuine zero-knowledge proofs with selective disclosure capability. L3 status is "active" with this proof system. SNARK-based systems (Groth16, PLONK) are specified for future implementation but are not required for full L3 status.
 
 ### 3.5 Layer 4: Verifiable Reputation
 
