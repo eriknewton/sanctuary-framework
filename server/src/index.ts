@@ -527,6 +527,7 @@ export async function createSanctuaryServer(options?: {
       // SEC-002: auto_deny removed — timeout always denies
       auth_token: authToken,
       tls: config.dashboard.tls,
+      auto_open: config.dashboard.auto_open,
     });
     dashboard.setDependencies({ policy, baseline, auditLog });
     await dashboard.start();

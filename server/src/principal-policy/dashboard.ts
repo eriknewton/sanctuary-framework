@@ -23,6 +23,8 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { createServer as createHttpsServer } from "node:https";
 import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { exec } from "node:child_process";
+import { platform } from "node:os";
 import { SANCTUARY_VERSION as PKG_VERSION } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import type { ApprovalRequest, ApprovalResponse, PrincipalPolicy } from "./types.js";
@@ -45,6 +47,8 @@ export interface DashboardConfig {
     cert_path: string;
     key_path: string;
   };
+  /** Auto-open the dashboard in the default browser on startup. Default: true for localhost. */
+  auto_open?: boolean;
 }
 
 interface PendingRequest {
@@ -158,23 +162,28 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       const baseUrl = `${protocol}://${this.config.host}:${this.config.port}`;
 
       this.httpServer.listen(this.config.port, this.config.host, () => {
-        // Print dashboard URL — always include a clickable pre-authenticated link
+        // Generate a pre-authenticated one-click URL
+        const sessionUrl = this.authToken ? this.createSessionUrl() : baseUrl;
+
+        // Print dashboard URL
         process.stderr.write(
           `\n  Sanctuary Principal Dashboard: ${baseUrl}\n`
         );
         if (this.authToken) {
-          // Generate a pre-authenticated one-click URL for terminal users
-          const sessionUrl = this.createSessionUrl();
-          process.stderr.write(
-            `  Quick open: ${sessionUrl}\n`
-          );
           const hint = this.authToken.slice(0, 4) + "..." + this.authToken.slice(-4);
           process.stderr.write(
-            `  Auth token: ${hint}\n\n`
+            `  Auth token: ${hint}\n`
           );
-        } else {
-          process.stderr.write(`\n`);
         }
+        process.stderr.write(`\n`);
+
+        // Auto-open in default browser (default: true for localhost)
+        const isLocalhost = this.config.host === "127.0.0.1" || this.config.host === "localhost" || this.config.host === "::1";
+        const shouldAutoOpen = this.config.auto_open ?? isLocalhost;
+        if (shouldAutoOpen) {
+          this.openInBrowser(sessionUrl);
+        }
+
         resolve();
       });
       this.httpServer.on("error", reject);
@@ -839,6 +848,30 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   broadcastProtectionStatus(data: Record<string, unknown>): void {
     this.broadcastSSE("protection-status", data);
+  }
+
+  /**
+   * Open a URL in the system's default browser.
+   * Cross-platform: macOS (open), Linux (xdg-open), Windows (start).
+   * Fails silently — dashboard still works via terminal URL.
+   */
+  private openInBrowser(url: string): void {
+    const os = platform();
+    let cmd: string;
+    if (os === "darwin") {
+      cmd = `open "${url}"`;
+    } else if (os === "win32") {
+      cmd = `start "" "${url}"`;
+    } else {
+      cmd = `xdg-open "${url}"`;
+    }
+    exec(cmd, (err) => {
+      if (err) {
+        process.stderr.write(
+          `  (Could not auto-open browser. Open the URL above manually.)\n\n`
+        );
+      }
+    });
   }
 
   /**

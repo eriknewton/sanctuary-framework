@@ -59,6 +59,8 @@ export interface SanctuaryConfig {
     host: string;
     /** Bearer token for dashboard auth. If "auto", one is generated at startup. */
     auth_token?: string;
+    /** Auto-open dashboard in default browser on startup. Default: true for localhost. */
+    auto_open?: boolean;
     /** TLS cert/key paths for HTTPS dashboard. */
     tls?: {
       cert_path: string;
@@ -178,6 +180,12 @@ export async function loadConfig(
   }
   if (process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN) {
     config.dashboard.auth_token = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_AUTO_OPEN === "true") {
+    config.dashboard.auto_open = true;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_AUTO_OPEN === "false") {
+    config.dashboard.auto_open = false;
   }
   if (process.env.SANCTUARY_DASHBOARD_TLS_CERT && process.env.SANCTUARY_DASHBOARD_TLS_KEY) {
     config.dashboard.tls = {
