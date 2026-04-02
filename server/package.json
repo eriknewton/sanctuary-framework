@@ -1,6 +1,6 @@
 {
   "name": "@sanctuary-framework/mcp-server",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "description": "Sanctuary Framework MCP Server — sovereignty infrastructure for agent harnesses",
   "type": "module",
   "main": "dist/index.cjs",

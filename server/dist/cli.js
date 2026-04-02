@@ -7,6 +7,7 @@ import { randomBytes as randomBytes$1, createHmac } from 'crypto';
 import { gcm } from '@noble/ciphers/aes.js';
 import { sha256 } from '@noble/hashes/sha256';
 import { hmac } from '@noble/hashes/hmac';
+import { RistrettoPoint, ed25519 } from '@noble/curves/ed25519';
 import { argon2id } from 'hash-wasm';
 import { hkdf } from '@noble/hashes/hkdf';
 import { createServer as createServer$1 } from 'http';
@@ -14,7 +15,6 @@ import { get, createServer as createServer$2 } from 'https';
 import { statSync, readFileSync } from 'fs';
 import { execSync, exec } from 'child_process';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { RistrettoPoint, ed25519 } from '@noble/curves/ed25519';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
@@ -555,6 +555,111 @@ function computeMerkleRoot(entries) {
 var init_hashing = __esm({
   "src/core/hashing.ts"() {
     init_encoding();
+  }
+});
+function generateKeypair() {
+  const privateKey = randomBytes(32);
+  const publicKey = ed25519.getPublicKey(privateKey);
+  return { publicKey, privateKey };
+}
+function publicKeyToDid(publicKey) {
+  const multicodec = new Uint8Array([237, 1, ...publicKey]);
+  return `did:key:z${toBase64url(multicodec)}`;
+}
+function generateIdentityId(publicKey) {
+  const keyHash = hash(publicKey);
+  return Array.from(keyHash.slice(0, 16)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function createIdentity(label, encryptionKey, keyProtection) {
+  const { publicKey, privateKey } = generateKeypair();
+  const identityId = generateIdentityId(publicKey);
+  const did = publicKeyToDid(publicKey);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const encryptedPrivateKey = encrypt(privateKey, encryptionKey);
+  privateKey.fill(0);
+  const publicIdentity = {
+    identity_id: identityId,
+    label,
+    public_key: toBase64url(publicKey),
+    did,
+    created_at: now,
+    key_type: "ed25519",
+    key_protection: keyProtection
+  };
+  const storedIdentity = {
+    ...publicIdentity,
+    encrypted_private_key: encryptedPrivateKey,
+    rotation_history: []
+  };
+  return { publicIdentity, storedIdentity };
+}
+function sign(payload, encryptedPrivateKey, encryptionKey) {
+  const privateKey = decrypt(encryptedPrivateKey, encryptionKey);
+  try {
+    return ed25519.sign(payload, privateKey);
+  } finally {
+    privateKey.fill(0);
+  }
+}
+function verify(payload, signature, publicKey) {
+  try {
+    return ed25519.verify(signature, payload, publicKey);
+  } catch {
+    return false;
+  }
+}
+function rotateKeys(storedIdentity, encryptionKey, reason) {
+  const { publicKey: newPublicKey, privateKey: newPrivateKey } = generateKeypair();
+  const newIdentityDid = publicKeyToDid(newPublicKey);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const eventData = JSON.stringify({
+    old_public_key: storedIdentity.public_key,
+    new_public_key: toBase64url(newPublicKey),
+    identity_id: storedIdentity.identity_id,
+    reason,
+    rotated_at: now
+  });
+  const eventBytes = new TextEncoder().encode(eventData);
+  const signature = sign(
+    eventBytes,
+    storedIdentity.encrypted_private_key,
+    encryptionKey
+  );
+  const rotationEvent = {
+    old_public_key: storedIdentity.public_key,
+    new_public_key: toBase64url(newPublicKey),
+    identity_id: storedIdentity.identity_id,
+    reason,
+    rotated_at: now,
+    signature: toBase64url(signature)
+  };
+  const encryptedNewPrivateKey = encrypt(newPrivateKey, encryptionKey);
+  newPrivateKey.fill(0);
+  const updatedIdentity = {
+    ...storedIdentity,
+    public_key: toBase64url(newPublicKey),
+    did: newIdentityDid,
+    encrypted_private_key: encryptedNewPrivateKey,
+    rotation_history: [
+      ...storedIdentity.rotation_history,
+      {
+        old_public_key: storedIdentity.public_key,
+        new_public_key: toBase64url(newPublicKey),
+        rotation_event: toBase64url(
+          new TextEncoder().encode(JSON.stringify(rotationEvent))
+        ),
+        rotated_at: now
+      }
+    ]
+  };
+  return { updatedIdentity, rotationEvent };
+}
+var init_identity = __esm({
+  "src/core/identity.ts"() {
+    init_encoding();
+    init_encryption();
+    init_hashing();
+    init_random();
   }
 });
 async function deriveMasterKey(passphrase, existingParams) {
@@ -1161,179 +1266,374 @@ var init_baseline = __esm({
   }
 });
 
+// src/shr/types.ts
+function deepSortKeys(obj) {
+  if (obj === null || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(deepSortKeys);
+  const sorted = {};
+  for (const key of Object.keys(obj).sort()) {
+    sorted[key] = deepSortKeys(obj[key]);
+  }
+  return sorted;
+}
+function canonicalizeForSigning(body) {
+  return JSON.stringify(deepSortKeys(body));
+}
+var init_types = __esm({
+  "src/shr/types.ts"() {
+  }
+});
+
+// src/shr/generator.ts
+function generateSHR(identityId, opts) {
+  const { config, identityManager, masterKey, validityMs } = opts;
+  const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+  if (!identity) {
+    return "No identity available for signing. Create an identity first.";
+  }
+  const now = /* @__PURE__ */ new Date();
+  const expiresAt = new Date(now.getTime() + (validityMs ?? DEFAULT_VALIDITY_MS));
+  const degradations = [];
+  if (config.execution.environment === "local-process") {
+    degradations.push({
+      layer: "l2",
+      code: "PROCESS_ISOLATION_ONLY",
+      severity: "warning",
+      description: "Process-level isolation only (no TEE)",
+      mitigation: "TEE support planned for a future release"
+    });
+    degradations.push({
+      layer: "l2",
+      code: "SELF_REPORTED_ATTESTATION",
+      severity: "warning",
+      description: "Attestation is self-reported (no hardware root of trust)",
+      mitigation: "TEE attestation planned for a future release"
+    });
+  }
+  const body = {
+    shr_version: "1.0",
+    implementation: {
+      sanctuary_version: config.version,
+      node_version: process.versions.node,
+      generated_by: "sanctuary-mcp-server"
+    },
+    instance_id: identity.identity_id,
+    generated_at: now.toISOString(),
+    expires_at: expiresAt.toISOString(),
+    layers: {
+      l1: {
+        status: "active",
+        encryption: config.state.encryption,
+        key_custody: "self",
+        integrity: config.state.integrity,
+        identity_type: config.state.identity_provider,
+        state_portable: true
+      },
+      l2: {
+        status: config.execution.environment === "local-process" ? "degraded" : "active",
+        isolation_type: config.execution.environment,
+        attestation_available: config.execution.attestation
+      },
+      l3: {
+        status: "active",
+        proof_system: config.disclosure.proof_system,
+        selective_disclosure: true
+      },
+      l4: {
+        status: "active",
+        reputation_mode: config.reputation.mode,
+        attestation_format: config.reputation.attestation_format,
+        reputation_portable: true
+      }
+    },
+    capabilities: {
+      handshake: true,
+      shr_exchange: true,
+      reputation_verify: true,
+      encrypted_channel: false
+      // Not yet implemented
+    },
+    degradations
+  };
+  const canonical = canonicalizeForSigning(body);
+  const payload = stringToBytes(canonical);
+  const encryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  const signatureBytes = sign(
+    payload,
+    identity.encrypted_private_key,
+    encryptionKey
+  );
+  return {
+    body,
+    signed_by: identity.public_key,
+    signature: toBase64url(signatureBytes)
+  };
+}
+var DEFAULT_VALIDITY_MS;
+var init_generator = __esm({
+  "src/shr/generator.ts"() {
+    init_types();
+    init_identity();
+    init_encoding();
+    init_key_derivation();
+    DEFAULT_VALIDITY_MS = 60 * 60 * 1e3;
+  }
+});
+
 // src/principal-policy/dashboard-html.ts
 function generateLoginHTML(options) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sanctuary \u2014 Login</title>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg: #0d1117;
-    --surface: #161b22;
-    --border: #30363d;
-    --text-primary: #e6edf3;
-    --text-secondary: #8b949e;
-    --green: #3fb950;
-    --red: #f85149;
-    --blue: #58a6ff;
-    --mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
-    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    --radius: 6px;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { width: 100%; height: 100%; }
-  body {
-    font-family: var(--sans);
-    background: var(--bg);
-    color: var(--text-primary);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .login-container {
-    width: 100%;
-    max-width: 400px;
-    padding: 40px 32px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-  }
-  .login-logo {
-    text-align: center;
-    font-size: 20px;
-    font-weight: 700;
-    letter-spacing: -0.5px;
-    margin-bottom: 8px;
-  }
-  .login-logo span { color: var(--blue); }
-  .login-version {
-    text-align: center;
-    font-size: 11px;
-    color: var(--text-secondary);
-    font-family: var(--mono);
-    margin-bottom: 32px;
-  }
-  .login-label {
-    display: block;
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--text-secondary);
-    margin-bottom: 8px;
-  }
-  .login-input {
-    width: 100%;
-    padding: 10px 14px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    color: var(--text-primary);
-    font-family: var(--mono);
-    font-size: 14px;
-    outline: none;
-    transition: border-color 0.15s;
-  }
-  .login-input:focus { border-color: var(--blue); }
-  .login-input::placeholder { color: var(--text-secondary); opacity: 0.5; }
-  .login-btn {
-    width: 100%;
-    margin-top: 20px;
-    padding: 10px;
-    background: var(--blue);
-    color: var(--bg);
-    border: none;
-    border-radius: var(--radius);
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: opacity 0.15s;
-    font-family: var(--sans);
-  }
-  .login-btn:hover { opacity: 0.9; }
-  .login-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .login-error {
-    margin-top: 16px;
-    padding: 10px 14px;
-    background: rgba(248, 81, 73, 0.1);
-    border: 1px solid var(--red);
-    border-radius: var(--radius);
-    font-size: 12px;
-    color: var(--red);
-    display: none;
-  }
-  .login-hint {
-    margin-top: 24px;
-    padding-top: 16px;
-    border-top: 1px solid var(--border);
-    font-size: 11px;
-    color: var(--text-secondary);
-    line-height: 1.5;
-  }
-  .login-hint code {
-    font-family: var(--mono);
-    background: var(--bg);
-    padding: 1px 4px;
-    border-radius: 3px;
-    font-size: 10px;
-  }
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sanctuary \u2014 Principal Dashboard</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text-primary: #e6edf3;
+      --text-secondary: #8b949e;
+      --green: #3fb950;
+      --amber: #d29922;
+      --red: #f85149;
+      --blue: #58a6ff;
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background-color: var(--bg);
+      color: var(--text-primary);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .login-container {
+      width: 100%;
+      max-width: 400px;
+      padding: 20px;
+    }
+
+    .login-card {
+      background-color: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 40px 32px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    }
+
+    .login-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 32px;
+    }
+
+    .logo {
+      font-size: 24px;
+      font-weight: 700;
+      color: var(--blue);
+    }
+
+    .logo-text {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .logo-text .title {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.5px;
+    }
+
+    .logo-text .version {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+
+    .form-group {
+      margin-bottom: 24px;
+    }
+
+    label {
+      display: block;
+      font-size: 14px;
+      font-weight: 500;
+      margin-bottom: 8px;
+      color: var(--text-primary);
+    }
+
+    input[type="text"],
+    input[type="password"] {
+      width: 100%;
+      padding: 10px 12px;
+      background-color: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-primary);
+      font-size: 14px;
+      font-family: 'JetBrains Mono', monospace;
+      transition: border-color 0.2s;
+    }
+
+    input[type="text"]:focus,
+    input[type="password"]:focus {
+      outline: none;
+      border-color: var(--blue);
+      box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.1);
+    }
+
+    .error-message {
+      display: none;
+      background-color: rgba(248, 81, 73, 0.1);
+      border: 1px solid var(--red);
+      color: #ff9999;
+      padding: 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      margin-bottom: 20px;
+    }
+
+    .error-message.show {
+      display: block;
+    }
+
+    button {
+      width: 100%;
+      padding: 10px 16px;
+      background-color: var(--blue);
+      color: var(--bg);
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background-color 0.2s;
+    }
+
+    button:hover {
+      background-color: #79c0ff;
+    }
+
+    button:active {
+      background-color: #4184e4;
+    }
+
+    button:disabled {
+      background-color: var(--text-secondary);
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+
+    .info-text {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 16px;
+      text-align: center;
+    }
+  </style>
 </head>
 <body>
-<div class="login-container">
-  <div class="login-logo"><span>&#9670;</span> SANCTUARY</div>
-  <div class="login-version">Principal Dashboard v${options.serverVersion}</div>
-  <form id="loginForm" onsubmit="return handleLogin(event)">
-    <label class="login-label" for="tokenInput">Dashboard Auth Token</label>
-    <input class="login-input" type="password" id="tokenInput"
-           placeholder="Enter your auth token" autocomplete="off" autofocus required>
-    <button class="login-btn" type="submit" id="loginBtn">Open Dashboard</button>
-  </form>
-  <div class="login-error" id="loginError"></div>
-  <div class="login-hint">
-    Your token is set via <code>SANCTUARY_DASHBOARD_AUTH_TOKEN</code> environment variable,
-    or check your server's startup output.
+  <div class="login-container">
+    <div class="login-card">
+      <div class="login-header">
+        <div class="logo">\u25C6</div>
+        <div class="logo-text">
+          <div class="title">SANCTUARY</div>
+          <div class="version">v${options.serverVersion}</div>
+        </div>
+      </div>
+
+      <div id="error-message" class="error-message"></div>
+
+      <form id="login-form">
+        <div class="form-group">
+          <label for="auth-token">Auth Token</label>
+          <input
+            type="text"
+            id="auth-token"
+            name="token"
+            placeholder="Paste your session token..."
+            autocomplete="off"
+            spellcheck="false"
+            required
+          />
+        </div>
+
+        <button type="submit" id="login-button">Open Dashboard</button>
+      </form>
+
+      <div class="info-text">
+        Session tokens expire after 1 hour of inactivity
+      </div>
+    </div>
   </div>
-</div>
-<script>
-async function handleLogin(e) {
-  e.preventDefault();
-  var btn = document.getElementById('loginBtn');
-  var errEl = document.getElementById('loginError');
-  var token = document.getElementById('tokenInput').value.trim();
-  if (!token) return false;
-  btn.disabled = true;
-  btn.textContent = 'Authenticating...';
-  errEl.style.display = 'none';
-  try {
-    var resp = await fetch('/auth/session', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + token }
+
+  <script>
+    const loginForm = document.getElementById('login-form');
+    const authTokenInput = document.getElementById('auth-token');
+    const errorMessage = document.getElementById('error-message');
+    const loginButton = document.getElementById('login-button');
+
+    loginForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const token = authTokenInput.value.trim();
+
+      if (!token) {
+        showError('Token is required');
+        return;
+      }
+
+      loginButton.disabled = true;
+      loginButton.textContent = 'Verifying...';
+      errorMessage.classList.remove('show');
+
+      try {
+        const response = await fetch('/auth/session', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + token,
+          },
+          body: JSON.stringify({ token }),
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          sessionStorage.setItem('authToken', token);
+          window.location.href = '/dashboard';
+        } else if (response.status === 401) {
+          showError('Invalid token. Please check and try again.');
+        } else {
+          showError('Authentication failed. Please try again.');
+        }
+      } catch (err) {
+        showError('Connection error. Please check your network.');
+      } finally {
+        loginButton.disabled = false;
+        loginButton.textContent = 'Open Dashboard';
+      }
     });
-    if (!resp.ok) {
-      var data = await resp.json().catch(function() { return {}; });
-      throw new Error(data.error || 'Authentication failed');
+
+    function showError(message) {
+      errorMessage.textContent = message;
+      errorMessage.classList.add('show');
     }
-    var result = await resp.json();
-    // Store token in sessionStorage for auto-renewal inside the dashboard
-    try { sessionStorage.setItem('sanctuary_token', token); } catch(_) {}
-    // Set session cookie
-    var maxAge = result.expires_in_seconds || 300;
-    document.cookie = 'sanctuary_session=' + result.session_id +
-      '; path=/; SameSite=Strict; max-age=' + maxAge;
-    // Reload to enter the dashboard
-    window.location.reload();
-  } catch (err) {
-    errEl.textContent = err.message || 'Authentication failed. Check your token.';
-    errEl.style.display = 'block';
-    btn.disabled = false;
-    btn.textContent = 'Open Dashboard';
-  }
-  return false;
-}
-</script>
+
+    authTokenInput.addEventListener('input', () => {
+      errorMessage.classList.remove('show');
+    });
+  </script>
 </body>
 </html>`;
 }
@@ -1341,1412 +1641,1648 @@ function generateDashboardHTML(options) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sanctuary \u2014 Principal Dashboard</title>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg: #0d1117;
-    --surface: #161b22;
-    --border: #30363d;
-    --text-primary: #e6edf3;
-    --text-secondary: #8b949e;
-    --green: #3fb950;
-    --amber: #d29922;
-    --red: #f85149;
-    --blue: #58a6ff;
-    --mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
-    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    --radius: 6px;
-  }
-
-  * {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-  }
-
-  html, body {
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-  }
-
-  body {
-    font-family: var(--sans);
-    background: var(--bg);
-    color: var(--text-primary);
-    display: flex;
-    flex-direction: column;
-  }
-
-  /* \u2500\u2500 Top Status Bar (fixed) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
-
-  .status-bar {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 56px;
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    padding: 0 20px;
-    gap: 24px;
-    z-index: 1000;
-  }
-
-  .status-bar-left {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    flex: 0 0 auto;
-  }
-
-  .sanctuary-logo {
-    font-weight: 700;
-    font-size: 16px;
-    letter-spacing: -0.5px;
-    color: var(--text-primary);
-  }
-
-  .sanctuary-logo span {
-    color: var(--blue);
-  }
-
-  .version {
-    font-size: 11px;
-    color: var(--text-secondary);
-    font-family: var(--mono);
-  }
-
-  .status-bar-center {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .sovereignty-badge {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 12px;
-    background: rgba(88, 166, 255, 0.1);
-    border: 1px solid var(--blue);
-    border-radius: 20px;
-    font-size: 13px;
-    font-weight: 600;
-  }
-
-  .sovereignty-score {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    font-family: var(--mono);
-    font-weight: 700;
-    font-size: 12px;
-    background: var(--blue);
-    color: var(--bg);
-  }
-
-  .sovereignty-score.high {
-    background: var(--green);
-  }
-
-  .sovereignty-score.medium {
-    background: var(--amber);
-  }
-
-  .sovereignty-score.low {
-    background: var(--red);
-  }
-
-  .status-bar-right {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    flex: 0 0 auto;
-  }
-
-  .protections-indicator {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: var(--text-secondary);
-    font-family: var(--mono);
-  }
-
-  .protections-indicator .count {
-    color: var(--text-primary);
-    font-weight: 600;
-  }
-
-  .uptime {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: var(--text-secondary);
-    font-family: var(--mono);
-  }
-
-  .status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--green);
-    animation: pulse 2s ease-in-out infinite;
-  }
-
-  .status-dot.disconnected {
-    background: var(--red);
-    animation: none;
-  }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
-  }
-
-  .pending-badge {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 24px;
-    height: 24px;
-    padding: 0 6px;
-    background: var(--red);
-    color: white;
-    border-radius: 12px;
-    font-size: 11px;
-    font-weight: 700;
-    animation: pulse 1s ease-in-out infinite;
-  }
-
-  .pending-badge.hidden {
-    display: none;
-  }
-
-  /* \u2500\u2500 Main Layout \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
-
-  .main-container {
-    flex: 1;
-    display: flex;
-    margin-top: 56px;
-    overflow: hidden;
-  }
-
-  .activity-feed {
-    flex: 3;
-    display: flex;
-    flex-direction: column;
-    border-right: 1px solid var(--border);
-    overflow: hidden;
-  }
-
-  .feed-header {
-    padding: 16px 20px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-secondary);
-  }
-
-  .feed-header-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--green);
-  }
-
-  .activity-list {
-    flex: 1;
-    overflow-y: auto;
-    overflow-x: hidden;
-  }
-
-  .activity-item {
-    padding: 12px 20px;
-    border-bottom: 1px solid rgba(48, 54, 61, 0.5);
-    font-size: 13px;
-    font-family: var(--mono);
-    cursor: pointer;
-    transition: background 0.15s;
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-  }
-
-  .activity-item:hover {
-    background: rgba(88, 166, 255, 0.05);
-  }
-
-  .activity-item-icon {
-    flex: 0 0 auto;
-    width: 16px;
-    text-align: center;
-    font-size: 12px;
-    color: var(--text-secondary);
-    margin-top: 1px;
-  }
-
-  .activity-item-content {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .activity-time {
-    color: var(--text-secondary);
-    font-size: 11px;
-    margin-bottom: 2px;
-  }
-
-  .activity-main {
-    display: flex;
-    gap: 8px;
-    align-items: baseline;
-    margin-bottom: 4px;
-  }
-
-  .activity-tier {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 16px;
-    font-size: 10px;
-    font-weight: 700;
-    border-radius: 3px;
-    text-transform: uppercase;
-    flex: 0 0 auto;
-  }
-
-  .activity-tier.t1 {
-    background: rgba(248, 81, 73, 0.2);
-    color: var(--red);
-  }
-
-  .activity-tier.t2 {
-    background: rgba(210, 153, 34, 0.2);
-    color: var(--amber);
-  }
-
-  .activity-tier.t3 {
-    background: rgba(63, 185, 80, 0.2);
-    color: var(--green);
-  }
-
-  .activity-tool {
-    color: var(--text-primary);
-    font-weight: 600;
-  }
-
-  .activity-outcome {
-    color: var(--green);
-  }
-
-  .activity-outcome.denied {
-    color: var(--red);
-  }
-
-  .activity-detail {
-    font-size: 12px;
-    color: var(--text-secondary);
-    margin-left: 0;
-  }
-
-  .activity-item.expanded .activity-detail {
-    display: block;
-    margin-top: 8px;
-    padding: 10px;
-    background: rgba(88, 166, 255, 0.08);
-    border-left: 2px solid var(--blue);
-    border-radius: 4px;
-  }
-
-  .activity-empty {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    height: 100%;
-    color: var(--text-secondary);
-  }
-
-  .activity-empty-icon {
-    font-size: 32px;
-    margin-bottom: 12px;
-  }
-
-  .activity-empty-text {
-    font-size: 14px;
-  }
-
-  /* \u2500\u2500 Protection Status Sidebar (40%) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
-
-  .protection-sidebar {
-    flex: 2;
-    display: flex;
-    flex-direction: column;
-    background: rgba(22, 27, 34, 0.5);
-    overflow: hidden;
-  }
-
-  .sidebar-header {
-    padding: 16px 20px;
-    border-bottom: 1px solid var(--border);
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-secondary);
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .sidebar-content {
-    flex: 1;
-    overflow-y: auto;
-    padding: 16px 16px;
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-  }
-
-  .protection-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .protection-card-icon {
-    font-size: 14px;
-  }
-
-  .protection-card-label {
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-secondary);
-  }
-
-  .protection-card-status {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    font-weight: 600;
-  }
-
-  .protection-card-status.active {
-    color: var(--green);
-  }
-
-  .protection-card-status.inactive {
-    color: var(--text-secondary);
-  }
-
-  .protection-card-stat {
-    font-size: 11px;
-    color: var(--text-secondary);
-    font-family: var(--mono);
-    margin-top: 4px;
-  }
-
-  /* \u2500\u2500 Pending Approvals Overlay \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
-
-  .pending-overlay {
-    position: fixed;
-    top: 56px;
-    right: 0;
-    bottom: 0;
-    width: 0;
-    background: var(--surface);
-    border-left: 1px solid var(--border);
-    z-index: 999;
-    overflow-y: auto;
-    transition: width 0.3s ease-out;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .pending-overlay.active {
-    width: 380px;
-  }
-
-  @media (max-width: 1400px) {
-    .pending-overlay.active {
-      width: 100%;
-      right: auto;
-      left: 0;
-    }
-  }
-
-  .pending-overlay-header {
-    padding: 16px 20px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex: 0 0 auto;
-  }
-
-  .pending-overlay-title {
-    font-size: 13px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-primary);
-  }
-
-  .pending-overlay-close {
-    background: none;
-    border: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    font-size: 18px;
-    padding: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .pending-overlay-close:hover {
-    color: var(--text-primary);
-  }
-
-  .pending-list {
-    flex: 1;
-    overflow-y: auto;
-  }
-
-  .pending-item {
-    padding: 16px 20px;
-    border-bottom: 1px solid rgba(48, 54, 61, 0.5);
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .pending-item-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .pending-item-op {
-    font-family: var(--mono);
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text-primary);
-    flex: 1;
-  }
-
-  .pending-item-tier {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 20px;
-    font-size: 9px;
-    font-weight: 700;
-    border-radius: 3px;
-    text-transform: uppercase;
-    color: white;
-  }
-
-  .pending-item-tier.tier1 {
-    background: var(--red);
-  }
-
-  .pending-item-tier.tier2 {
-    background: var(--amber);
-  }
-
-  .pending-item-reason {
-    font-size: 12px;
-    color: var(--text-secondary);
-  }
-
-  .pending-item-timer {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 11px;
-    font-family: var(--mono);
-    color: var(--text-secondary);
-  }
-
-  .pending-item-timer-bar {
-    flex: 1;
-    height: 4px;
-    background: rgba(48, 54, 61, 0.8);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-
-  .pending-item-timer-fill {
-    height: 100%;
-    background: var(--blue);
-    transition: width 0.1s linear;
-  }
-
-  .pending-item-timer.urgent .pending-item-timer-fill {
-    background: var(--red);
-  }
-
-  .pending-item-actions {
-    display: flex;
-    gap: 8px;
-  }
-
-  .btn {
-    flex: 1;
-    padding: 8px 12px;
-    border: none;
-    border-radius: var(--radius);
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.15s;
-    font-family: var(--sans);
-  }
-
-  .btn-approve {
-    background: var(--green);
-    color: var(--bg);
-  }
-
-  .btn-approve:hover {
-    background: #4ecf5e;
-  }
-
-  .btn-deny {
-    background: var(--red);
-    color: white;
-  }
-
-  .btn-deny:hover {
-    background: #f9605e;
-  }
-
-  /* \u2500\u2500 Threat Panel (collapsible footer) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
-
-  .threat-panel {
-    position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    background: var(--surface);
-    border-top: 1px solid var(--border);
-    max-height: 240px;
-    z-index: 500;
-    display: flex;
-    flex-direction: column;
-    transition: max-height 0.3s ease-out;
-  }
-
-  .threat-panel.collapsed {
-    max-height: 40px;
-  }
-
-  .threat-header {
-    padding: 12px 20px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-secondary);
-    flex: 0 0 auto;
-  }
-
-  .threat-header:hover {
-    background: rgba(88, 166, 255, 0.05);
-  }
-
-  .threat-icon {
-    font-size: 14px;
-  }
-
-  .threat-content {
-    flex: 1;
-    overflow-y: auto;
-    padding: 0 20px 12px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .threat-item {
-    padding: 8px 10px;
-    background: rgba(248, 81, 73, 0.1);
-    border-left: 2px solid var(--red);
-    border-radius: 4px;
-    font-size: 11px;
-    color: var(--text-secondary);
-  }
-
-  .threat-item-type {
-    font-weight: 600;
-    color: var(--red);
-    font-family: var(--mono);
-  }
-
-  .threat-empty {
-    text-align: center;
-    padding: 20px 10px;
-    color: var(--text-secondary);
-    font-size: 12px;
-  }
-
-  /* \u2500\u2500 Scrollbars \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
-
-  ::-webkit-scrollbar {
-    width: 6px;
-  }
-
-  ::-webkit-scrollbar-track {
-    background: transparent;
-  }
-
-  ::-webkit-scrollbar-thumb {
-    background: var(--border);
-    border-radius: 3px;
-  }
-
-  ::-webkit-scrollbar-thumb:hover {
-    background: rgba(88, 166, 255, 0.3);
-  }
-
-  /* \u2500\u2500 Responsive \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
-
-  @media (max-width: 1200px) {
-    .protection-sidebar {
-      display: none;
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sanctuary \u2014 Principal Dashboard</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text-primary: #e6edf3;
+      --text-secondary: #8b949e;
+      --green: #3fb950;
+      --amber: #d29922;
+      --red: #f85149;
+      --blue: #58a6ff;
+      --success: #3fb950;
+      --warning: #d29922;
+      --error: #f85149;
+      --muted: #21262d;
     }
 
-    .activity-feed {
-      border-right: none;
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
     }
-  }
 
-  @media (max-width: 768px) {
+    html, body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background-color: var(--bg);
+      color: var(--text-primary);
+      height: 100%;
+      overflow: hidden;
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Status Bar */
     .status-bar {
-      padding: 0 12px;
-      gap: 12px;
-      height: 48px;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 56px;
+      background-color: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 24px;
+      gap: 24px;
+      z-index: 100;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
     }
 
-    .sanctuary-logo {
-      font-size: 14px;
+    .status-bar-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex: 0 0 auto;
+    }
+
+    .logo-icon {
+      font-size: 20px;
+      color: var(--blue);
+      font-weight: 700;
+    }
+
+    .logo-info {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .logo-title {
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1;
+      color: var(--text-primary);
+    }
+
+    .logo-version {
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-top: 2px;
     }
 
     .status-bar-center {
+      flex: 1;
+      display: flex;
+      justify-content: center;
+    }
+
+    .sovereignty-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      background-color: rgba(63, 185, 80, 0.1);
+      border: 1px solid rgba(63, 185, 80, 0.3);
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .sovereignty-badge.degraded {
+      background-color: rgba(210, 153, 34, 0.1);
+      border-color: rgba(210, 153, 34, 0.3);
+    }
+
+    .sovereignty-badge.inactive {
+      background-color: rgba(248, 81, 73, 0.1);
+      border-color: rgba(248, 81, 73, 0.3);
+    }
+
+    .sovereignty-score {
+      font-weight: 700;
+      color: var(--green);
+    }
+
+    .sovereignty-badge.degraded .sovereignty-score {
+      color: var(--amber);
+    }
+
+    .sovereignty-badge.inactive .sovereignty-score {
+      color: var(--red);
+    }
+
+    .status-bar-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex: 0 0 auto;
+    }
+
+    .status-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .status-item strong {
+      color: var(--text-primary);
+      font-weight: 500;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: var(--green);
+    }
+
+    .status-dot.disconnected {
+      background-color: var(--red);
+    }
+
+    .pending-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      background-color: var(--blue);
+      color: var(--bg);
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    /* Main Content */
+    .main-content {
+      flex: 1;
+      margin-top: 56px;
+      overflow-y: auto;
+      padding: 24px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 20px;
+    }
+
+    /* Row 1: Sovereignty Layers */
+    .sovereignty-layers {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+    }
+
+    .layer-card {
+      background-color: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .layer-card.degraded {
+      border-color: var(--amber);
+      background-color: rgba(210, 153, 34, 0.05);
+    }
+
+    .layer-card.inactive {
+      border-color: var(--red);
+      background-color: rgba(248, 81, 73, 0.05);
+    }
+
+    .layer-name {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .layer-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .layer-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      background-color: rgba(63, 185, 80, 0.15);
+      color: var(--green);
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      width: fit-content;
+    }
+
+    .layer-card.degraded .layer-status {
+      background-color: rgba(210, 153, 34, 0.15);
+      color: var(--amber);
+    }
+
+    .layer-card.inactive .layer-status {
+      background-color: rgba(248, 81, 73, 0.15);
+      color: var(--red);
+    }
+
+    .layer-detail {
+      font-size: 12px;
+      color: var(--text-secondary);
+      font-family: 'JetBrains Mono', monospace;
+      padding: 8px;
+      background-color: var(--bg);
+      border-radius: 4px;
+      border-left: 2px solid var(--blue);
+    }
+
+    /* Row 2: Info Cards */
+    .info-cards {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    .info-card {
+      background-color: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+    }
+
+    .card-header {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 16px;
+    }
+
+    .card-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+      font-size: 13px;
+    }
+
+    .card-row:last-child {
+      margin-bottom: 0;
+    }
+
+    .card-label {
+      color: var(--text-secondary);
+    }
+
+    .card-value {
+      color: var(--text-primary);
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 500;
+    }
+
+    .identity-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 6px;
+      background-color: rgba(88, 166, 255, 0.15);
+      color: var(--blue);
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    .trust-tier-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 6px;
+      background-color: rgba(63, 185, 80, 0.15);
+      color: var(--green);
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+
+    .truncated {
+      max-width: 200px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Row 3: SHR & Activity */
+    .main-panels {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      min-height: 400px;
+    }
+
+    .panel {
+      background-color: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .panel-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .panel-action {
+      background: none;
+      border: none;
+      color: var(--blue);
+      cursor: pointer;
+      font-size: 12px;
+      padding: 0;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+
+    .panel-action:hover {
+      color: #79c0ff;
+    }
+
+    .panel-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+    }
+
+    /* SHR Viewer */
+    .shr-json {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      color: var(--text-secondary);
+    }
+
+    .shr-section {
+      margin-bottom: 12px;
+    }
+
+    .shr-section-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      color: var(--text-primary);
+      padding: 8px;
+      background-color: var(--bg);
+      border-radius: 4px;
+      user-select: none;
+    }
+
+    .shr-section-header:hover {
+      background-color: var(--muted);
+    }
+
+    .shr-toggle {
+      width: 16px;
+      height: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      transition: transform 0.2s;
+    }
+
+    .shr-section.collapsed .shr-toggle {
+      transform: rotate(-90deg);
+    }
+
+    .shr-section-content {
+      padding: 8px 16px;
+      background-color: rgba(0, 0, 0, 0.2);
+      border-radius: 4px;
+      margin-top: 4px;
+    }
+
+    .shr-section.collapsed .shr-section-content {
       display: none;
     }
 
-    .main-container {
-      margin-top: 48px;
+    .shr-item {
+      display: flex;
+      margin-bottom: 4px;
+    }
+
+    .shr-key {
+      color: var(--blue);
+      margin-right: 8px;
+      min-width: 120px;
+    }
+
+    .shr-value {
+      color: var(--green);
+      word-break: break-all;
+    }
+
+    /* Activity Feed */
+    .activity-feed {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
     }
 
     .activity-item {
-      padding: 10px 12px;
+      padding: 12px;
+      background-color: var(--bg);
+      border-left: 2px solid var(--border);
+      border-radius: 4px;
+      font-size: 12px;
     }
 
-    .pending-overlay.active {
-      width: 100%;
+    .activity-item.tool-call {
+      border-left-color: var(--blue);
     }
 
+    .activity-item.context-gate {
+      border-left-color: var(--amber);
+    }
+
+    .activity-item.injection {
+      border-left-color: var(--red);
+    }
+
+    .activity-item.protection {
+      border-left-color: var(--green);
+    }
+
+    .activity-type {
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      font-size: 11px;
+      letter-spacing: 0.5px;
+    }
+
+    .activity-content {
+      color: var(--text-secondary);
+      font-family: 'JetBrains Mono', monospace;
+      margin-bottom: 4px;
+      word-break: break-all;
+    }
+
+    .activity-time {
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+
+    .empty-state {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: var(--text-secondary);
+      font-size: 13px;
+    }
+
+    /* Row 4: Handshake History */
+    .handshake-table {
+      background-color: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .table-header {
+      display: grid;
+      grid-template-columns: 2fr 1fr 1fr 1fr 1.5fr 1.5fr;
+      gap: 16px;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      background-color: var(--bg);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .table-rows {
+      max-height: 300px;
+      overflow-y: auto;
+    }
+
+    .table-row {
+      display: grid;
+      grid-template-columns: 2fr 1fr 1fr 1fr 1.5fr 1.5fr;
+      gap: 16px;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      align-items: center;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background-color 0.2s;
+    }
+
+    .table-row:hover {
+      background-color: var(--bg);
+    }
+
+    .table-row:last-child {
+      border-bottom: none;
+    }
+
+    .table-cell {
+      color: var(--text-secondary);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .table-cell.strong {
+      color: var(--text-primary);
+      font-weight: 500;
+    }
+
+    .table-empty {
+      padding: 40px 20px;
+      text-align: center;
+      color: var(--text-secondary);
+      font-size: 13px;
+    }
+
+    /* Pending Overlay */
+    .pending-overlay {
+      position: fixed;
+      top: 0;
+      right: -400px;
+      width: 400px;
+      height: 100vh;
+      background-color: var(--surface);
+      border-left: 1px solid var(--border);
+      box-shadow: -2px 0 8px rgba(0, 0, 0, 0.3);
+      z-index: 200;
+      transition: right 0.3s ease;
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+    }
+
+    .pending-overlay.show {
+      right: 0;
+    }
+
+    .pending-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .pending-items {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+    }
+
+    .pending-item {
+      background-color: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 16px;
+      margin-bottom: 12px;
+    }
+
+    .pending-title {
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+      word-break: break-word;
+    }
+
+    .pending-countdown {
+      font-size: 12px;
+      color: var(--amber);
+      margin-bottom: 12px;
+      font-weight: 500;
+    }
+
+    .pending-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .pending-btn {
+      flex: 1;
+      padding: 8px 12px;
+      border: none;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background-color 0.2s;
+    }
+
+    .pending-approve {
+      background-color: var(--green);
+      color: var(--bg);
+    }
+
+    .pending-approve:hover {
+      background-color: #3fa040;
+    }
+
+    .pending-deny {
+      background-color: var(--red);
+      color: var(--bg);
+    }
+
+    .pending-deny:hover {
+      background-color: #e03c3c;
+    }
+
+    /* Threat Panel */
     .threat-panel {
-      max-height: 200px;
+      background-color: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-top: 20px;
+      overflow: hidden;
     }
-  }
-</style>
+
+    .threat-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .threat-title {
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .threat-toggle {
+      font-size: 10px;
+      color: var(--text-secondary);
+      transition: transform 0.2s;
+    }
+
+    .threat-panel.collapsed .threat-toggle {
+      transform: rotate(-90deg);
+    }
+
+    .threat-content {
+      padding: 16px 20px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+
+    .threat-panel.collapsed .threat-content {
+      display: none;
+    }
+
+    .threat-alert {
+      background-color: rgba(248, 81, 73, 0.1);
+      border: 1px solid var(--red);
+      border-radius: 4px;
+      padding: 12px;
+      margin-bottom: 8px;
+      font-size: 12px;
+    }
+
+    .threat-alert:last-child {
+      margin-bottom: 0;
+    }
+
+    .threat-type {
+      font-weight: 600;
+      color: var(--red);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      font-size: 10px;
+      letter-spacing: 0.5px;
+    }
+
+    .threat-message {
+      color: var(--text-secondary);
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background-color: transparent;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background-color: var(--border);
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background-color: var(--text-secondary);
+    }
+
+    /* Responsive */
+    @media (max-width: 1400px) {
+      .sovereignty-layers {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .main-panels {
+        grid-template-columns: 1fr;
+      }
+
+      .pending-overlay {
+        width: 100%;
+        right: -100%;
+      }
+    }
+
+    @media (max-width: 768px) {
+      .status-bar {
+        flex-wrap: wrap;
+        height: auto;
+        padding: 12px;
+        gap: 12px;
+      }
+
+      .status-bar-center {
+        order: 3;
+        flex-basis: 100%;
+      }
+
+      .main-content {
+        margin-top: auto;
+      }
+
+      .info-cards {
+        grid-template-columns: 1fr;
+      }
+
+      .table-header,
+      .table-row {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
 </head>
 <body>
+  <!-- Status Bar -->
+  <div class="status-bar">
+    <div class="status-bar-left">
+      <div class="logo-icon">\u25C6</div>
+      <div class="logo-info">
+        <div class="logo-title">SANCTUARY</div>
+        <div class="logo-version">v${options.serverVersion}</div>
+      </div>
+    </div>
 
-<!-- Status Bar (fixed, top) -->
-<div class="status-bar">
-  <div class="status-bar-left">
-    <div class="sanctuary-logo"><span>\u25C6</span> SANCTUARY</div>
-    <div class="version">v${options.serverVersion}</div>
-  </div>
-  <div class="status-bar-center">
-    <div class="sovereignty-badge">
-      <div class="sovereignty-score" id="sovereigntyScore">85</div>
-      <span>Sovereignty Health</span>
+    <div class="status-bar-center">
+      <div id="sovereignty-badge" class="sovereignty-badge">
+        <span>Sovereignty Health:</span>
+        <span class="sovereignty-score" id="sovereignty-score">\u2014</span>
+        <span>/ 100</span>
+      </div>
     </div>
-  </div>
-  <div class="status-bar-right">
-    <div class="protections-indicator">
-      <span class="count" id="activeProtections">6</span>/6 protections
-    </div>
-    <div class="uptime">
-      <span id="uptimeText">\u2014</span>
-    </div>
-    <div class="status-dot" id="statusDot"></div>
-    <div class="pending-badge hidden" id="pendingBadge">0</div>
-  </div>
-</div>
 
-<!-- Main Layout -->
-<div class="main-container">
-  <!-- Activity Feed -->
-  <div class="activity-feed">
-    <div class="feed-header">
-      <div class="feed-header-dot"></div>
-      Live Activity
-    </div>
-    <div class="activity-list" id="activityList">
-      <div class="activity-empty">
-        <div class="activity-empty-icon">\u2192</div>
-        <div class="activity-empty-text">Waiting for activity...</div>
+    <div class="status-bar-right">
+      <div class="status-item">
+        <strong id="protections-count">\u2014</strong>
+        <span>Protections</span>
+      </div>
+      <div class="status-item">
+        <strong id="uptime-value">\u2014</strong>
+        <span>Uptime</span>
+      </div>
+      <div class="status-dot" id="connection-status"></div>
+      <div id="pending-item-badge" class="pending-badge" style="display: none;">
+        <span>\u23F3</span>
+        <span id="pending-count">0</span>
       </div>
     </div>
   </div>
 
-  <!-- Protection Status Sidebar -->
-  <div class="protection-sidebar" id="protectionSidebar">
-    <div class="sidebar-header">
-      <span>\u25C6</span> Protection Status
+  <!-- Main Content -->
+  <div class="main-content">
+    <div class="grid">
+      <!-- Row 1: Sovereignty Layers -->
+      <div class="sovereignty-layers" id="sovereignty-layers">
+        <div class="layer-card" data-layer="l1">
+          <div class="layer-name">Layer 1</div>
+          <div class="layer-title">Cognitive Sovereignty</div>
+          <div class="layer-status"><span>\u25CF</span> <span id="l1-status">\u2014</span></div>
+          <div class="layer-detail" id="l1-detail">Loading...</div>
+        </div>
+        <div class="layer-card" data-layer="l2">
+          <div class="layer-name">Layer 2</div>
+          <div class="layer-title">Operational Isolation</div>
+          <div class="layer-status"><span>\u25CF</span> <span id="l2-status">\u2014</span></div>
+          <div class="layer-detail" id="l2-detail">Loading...</div>
+        </div>
+        <div class="layer-card" data-layer="l3">
+          <div class="layer-name">Layer 3</div>
+          <div class="layer-title">Selective Disclosure</div>
+          <div class="layer-status"><span>\u25CF</span> <span id="l3-status">\u2014</span></div>
+          <div class="layer-detail" id="l3-detail">Loading...</div>
+        </div>
+        <div class="layer-card" data-layer="l4">
+          <div class="layer-name">Layer 4</div>
+          <div class="layer-title">Verifiable Reputation</div>
+          <div class="layer-status"><span>\u25CF</span> <span id="l4-status">\u2014</span></div>
+          <div class="layer-detail" id="l4-detail">Loading...</div>
+        </div>
+      </div>
+
+      <!-- Row 2: Info Cards -->
+      <div class="info-cards">
+        <div class="info-card">
+          <div class="card-header">Identity</div>
+          <div class="card-row">
+            <span class="card-label">Primary</span>
+            <span class="card-value" id="identity-label">\u2014</span>
+          </div>
+          <div class="card-row">
+            <span class="card-label">DID</span>
+            <span class="card-value truncated" id="identity-did" title="">\u2014</span>
+          </div>
+          <div class="card-row">
+            <span class="card-label">Public Key</span>
+            <span class="card-value truncated" id="identity-pubkey" title="">\u2014</span>
+          </div>
+          <div class="card-row">
+            <span class="card-label">Type</span>
+            <span class="identity-badge">Ed25519</span>
+          </div>
+          <div class="card-row">
+            <span class="card-label">Created</span>
+            <span class="card-value" id="identity-created">\u2014</span>
+          </div>
+          <div class="card-row">
+            <span class="card-label">Identities</span>
+            <span class="card-value" id="identity-count">\u2014</span>
+          </div>
+        </div>
+
+        <div class="info-card">
+          <div class="card-header">Handshakes</div>
+          <div class="card-row">
+            <span class="card-label">Total</span>
+            <span class="card-value" id="handshake-count">\u2014</span>
+          </div>
+          <div class="card-row">
+            <span class="card-label">Latest Peer</span>
+            <span class="card-value truncated" id="handshake-latest">\u2014</span>
+          </div>
+          <div class="card-row">
+            <span class="card-label">Trust Tier</span>
+            <span class="trust-tier-badge" id="handshake-tier">Unverified</span>
+          </div>
+          <div class="card-row">
+            <span class="card-label">Timestamp</span>
+            <span class="card-value" id="handshake-time">\u2014</span>
+          </div>
+        </div>
+
+        <div class="info-card">
+          <div class="card-header">Reputation</div>
+          <div class="card-row">
+            <span class="card-label">Weighted Score</span>
+            <span class="card-value" id="reputation-score">\u2014</span>
+          </div>
+          <div class="card-row">
+            <span class="card-label">Attestations</span>
+            <span class="card-value" id="reputation-attestations">\u2014</span>
+          </div>
+          <div class="card-row">
+            <span class="card-label">Verified Sovereign</span>
+            <span class="card-value" id="reputation-verified">\u2014</span>
+          </div>
+          <div class="card-row">
+            <span class="card-label">Verified Degraded</span>
+            <span class="card-value" id="reputation-degraded">\u2014</span>
+          </div>
+          <div class="card-row">
+            <span class="card-label">Unverified</span>
+            <span class="card-value" id="reputation-unverified">\u2014</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Row 3: SHR & Activity -->
+      <div class="main-panels">
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">Sovereignty Health Report</div>
+            <button class="panel-action" id="copy-shr-btn">Copy JSON</button>
+          </div>
+          <div class="panel-content">
+            <div class="shr-json" id="shr-viewer">
+              <div class="empty-state">Loading SHR...</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">Activity Feed</div>
+          </div>
+          <div class="panel-content">
+            <div id="activity-feed" class="activity-feed">
+              <div class="empty-state">Waiting for activity...</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Row 4: Handshake History -->
+      <div class="handshake-table">
+        <div class="table-header">
+          <div>Counterparty</div>
+          <div>Trust Tier</div>
+          <div>Sovereignty</div>
+          <div>Verified</div>
+          <div>Completed</div>
+          <div>Expires</div>
+        </div>
+        <div class="table-rows" id="handshake-table">
+          <div class="table-empty">No handshakes completed yet</div>
+        </div>
+      </div>
+
+      <!-- Threat Panel -->
+      <div class="threat-panel collapsed">
+        <div class="threat-header">
+          <div class="threat-title">Security Threats</div>
+          <div class="threat-toggle">\u25B6</div>
+        </div>
+        <div class="threat-content" id="threat-alerts">
+          <div class="empty-state">No threats detected</div>
+        </div>
+      </div>
     </div>
-    <div class="sidebar-content">
-      <div class="protection-card">
-        <div class="protection-card-icon">\u{1F510}</div>
-        <div class="protection-card-label">Encryption</div>
-        <div class="protection-card-status active" id="encryptionStatus">\u2713 Active</div>
-        <div class="protection-card-stat" id="encryptionStat">Ed25519</div>
-      </div>
-
-      <div class="protection-card">
-        <div class="protection-card-icon">\u2713</div>
-        <div class="protection-card-label">Approval Gate</div>
-        <div class="protection-card-status active" id="approvalStatus">\u2713 Active</div>
-        <div class="protection-card-stat" id="approvalStat">T1: 2 | T2: 3</div>
-      </div>
-
-      <div class="protection-card">
-        <div class="protection-card-icon">\u{1F3AF}</div>
-        <div class="protection-card-label">Context Gating</div>
-        <div class="protection-card-status active" id="contextStatus">\u2713 Active</div>
-        <div class="protection-card-stat" id="contextStat">12 filtered</div>
-      </div>
-
-      <div class="protection-card">
-        <div class="protection-card-icon">\u26A0</div>
-        <div class="protection-card-label">Injection Detection</div>
-        <div class="protection-card-status active" id="injectionStatus">\u2713 Active</div>
-        <div class="protection-card-stat" id="injectionStat">3 flags today</div>
-      </div>
-
-      <div class="protection-card">
-        <div class="protection-card-icon">\u{1F4CA}</div>
-        <div class="protection-card-label">Behavioral Baseline</div>
-        <div class="protection-card-status active" id="baselineStatus">\u2713 Active</div>
-        <div class="protection-card-stat" id="baselineStat">0 anomalies</div>
-      </div>
-
-      <div class="protection-card">
-        <div class="protection-card-icon">\u{1F4CB}</div>
-        <div class="protection-card-label">Audit Trail</div>
-        <div class="protection-card-status active" id="auditStatus">\u2713 Active</div>
-        <div class="protection-card-stat" id="auditStat">284 entries</div>
-      </div>
-    </div>
   </div>
-</div>
 
-<!-- Pending Approvals Overlay -->
-<div class="pending-overlay" id="pendingOverlay">
-  <div class="pending-overlay-header">
-    <div class="pending-overlay-title">Pending Approvals</div>
-    <button class="pending-overlay-close" onclick="closePendingOverlay()">\xD7</button>
+  <!-- Pending Overlay -->
+  <div class="pending-overlay" id="pending-overlay">
+    <div class="pending-header">Pending Approvals</div>
+    <div class="pending-items" id="pending-items"></div>
   </div>
-  <div class="pending-list" id="pendingList"></div>
-</div>
 
-<!-- Threat Panel (collapsible footer) -->
-<div class="threat-panel collapsed" id="threatPanel">
-  <div class="threat-header" onclick="toggleThreatPanel()">
-    <span class="threat-icon">\u26A0</span>
-    Recent Threats
-    <span id="threatCount" style="margin-left: auto; color: var(--red); font-weight: 700;">0</span>
-  </div>
-  <div class="threat-content" id="threatContent">
-    <div class="threat-empty">No threats detected</div>
-  </div>
-</div>
+  <script>
+    // Constants
+    const AUTH_TOKEN = '${options.authToken || ""}' || sessionStorage.getItem('authToken') || '';
+    const TIMEOUT_SECONDS = ${options.timeoutSeconds};
+    const API_BASE = '';
 
-<script>
-(function() {
-  'use strict';
-
-  // \u2500\u2500 Configuration \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
-  const TIMEOUT_SECONDS = ${options.timeoutSeconds};
-  // AUTH_TOKEN: embedded token (for direct session access) or from sessionStorage (login page flow)
-  const EMBEDDED_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : "null"};
-  const AUTH_TOKEN = EMBEDDED_TOKEN || (function() { try { return sessionStorage.getItem('sanctuary_token'); } catch(_) { return null; } })();
-  const MAX_ACTIVITY_ITEMS = 100;
-  const MAX_THREAT_ITEMS = 20;
-
-  // \u2500\u2500 State \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
-  let SESSION_ID = null;
-  let evtSource = null;
-  let startTime = Date.now();
-  let activityCount = 0;
-  let threatCount = 0;
-  const pendingRequests = new Map();
-  const activityItems = [];
-  const threatItems = [];
-  let sovereigntyScore = 85;
-  let sessionRenewalTimer = null;
-
-  // \u2500\u2500 Auth Helpers (SEC-012) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
-  function authHeaders() {
-    const h = { 'Content-Type': 'application/json' };
-    if (AUTH_TOKEN) h['Authorization'] = 'Bearer ' + AUTH_TOKEN;
-    return h;
-  }
-
-  function sessionQuery(url) {
-    if (!SESSION_ID) return url;
-    const sep = url.includes('?') ? '&' : '?';
-    return url + sep + 'session=' + SESSION_ID;
-  }
-
-  function setCookie(sessionId, maxAge) {
-    document.cookie = 'sanctuary_session=' + sessionId +
-      '; path=/; SameSite=Strict; max-age=' + maxAge;
-  }
-
-  async function exchangeSession() {
-    if (!AUTH_TOKEN) return;
-    try {
-      const resp = await fetch('/auth/session', { method: 'POST', headers: authHeaders() });
-      if (resp.ok) {
-        const data = await resp.json();
-        SESSION_ID = data.session_id;
-        var ttl = data.expires_in_seconds || 300;
-        // Update cookie with new session
-        setCookie(SESSION_ID, ttl);
-        // Schedule renewal at 80% of TTL
-        if (sessionRenewalTimer) clearTimeout(sessionRenewalTimer);
-        sessionRenewalTimer = setTimeout(function() {
-          exchangeSession().then(function() { reconnectSSE(); });
-        }, ttl * 800);
-      } else if (resp.status === 401) {
-        // Token invalid or expired \u2014 show non-destructive re-login overlay
-        showSessionExpired();
-      }
-    } catch (e) {
-      // Network error \u2014 retry in 30s
-      if (sessionRenewalTimer) clearTimeout(sessionRenewalTimer);
-      sessionRenewalTimer = setTimeout(function() {
-        exchangeSession().then(function() { reconnectSSE(); });
-      }, 30000);
-    }
-  }
-
-  function showSessionExpired() {
-    // Clear stored token
-    try { sessionStorage.removeItem('sanctuary_token'); } catch(_) {}
-    // Redirect to login page
-    document.cookie = 'sanctuary_session=; path=/; max-age=0';
-    window.location.reload();
-  }
-
-  // \u2500\u2500 UI Utilities \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
-  function esc(s) {
-    const d = document.createElement('div');
-    d.textContent = String(s || '');
-    return d.innerHTML;
-  }
-
-  function closePendingOverlay() {
-    document.getElementById('pendingOverlay').classList.remove('active');
-  }
-
-  function toggleThreatPanel() {
-    document.getElementById('threatPanel').classList.toggle('collapsed');
-  }
-
-  function updateUptime() {
-    const elapsed = Math.floor((Date.now() - startTime) / 1000);
-    const hours = Math.floor(elapsed / 3600);
-    const mins = Math.floor((elapsed % 3600) / 60);
-    const secs = elapsed % 60;
-    let uptimeStr = '';
-    if (hours > 0) uptimeStr += hours + 'h ';
-    if (mins > 0) uptimeStr += mins + 'm ';
-    uptimeStr += secs + 's';
-    document.getElementById('uptimeText').textContent = uptimeStr;
-  }
-
-  // \u2500\u2500 Sovereignty Score \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
-  function updateSovereigntyScore(score) {
-    sovereigntyScore = Math.min(100, Math.max(0, score || 85));
-    const badge = document.getElementById('sovereigntyScore');
-    badge.textContent = sovereigntyScore;
-    badge.className = 'sovereignty-score';
-    if (sovereigntyScore >= 80) {
-      badge.classList.add('high');
-    } else if (sovereigntyScore >= 50) {
-      badge.classList.add('medium');
-    } else {
-      badge.classList.add('low');
-    }
-  }
-
-  // \u2500\u2500 Activity Feed \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
-  function addActivityItem(data) {
-    const {
-      timestamp,
-      tier,
-      tool,
-      outcome,
-      detail,
-      hasInjection,
-      isContextGated
-    } = data;
-
-    const item = {
-      id: 'activity-' + activityCount++,
-      timestamp: timestamp || new Date().toISOString(),
-      tier: tier || 1,
-      tool: tool || 'unknown_tool',
-      outcome: outcome || 'executed',
-      detail: detail || '',
-      hasInjection: !!hasInjection,
-      isContextGated: !!isContextGated
+    // State
+    let apiState = {
+      sovereignty: null,
+      identity: null,
+      handshakes: [],
+      shr: null,
+      status: null,
     };
 
-    activityItems.unshift(item);
-    if (activityItems.length > MAX_ACTIVITY_ITEMS) {
-      activityItems.pop();
-    }
+    let pendingRequests = new Map();
+    let activityLog = [];
+    const maxActivityItems = 50;
 
-    renderActivityFeed();
-  }
-
-  function renderActivityFeed() {
-    const list = document.getElementById('activityList');
-
-    if (activityItems.length === 0) {
-      list.innerHTML = '<div class="activity-empty"><div class="activity-empty-icon">\u2192</div><div class="activity-empty-text">Waiting for activity...</div></div>';
-      return;
-    }
-
-    list.innerHTML = '';
-    for (const item of activityItems) {
-      const tr = document.createElement('div');
-      tr.className = 'activity-item';
-      tr.id = item.id;
-
-      const time = new Date(item.timestamp);
-      const timeStr = time.toLocaleTimeString();
-
-      const tierClass = 't' + item.tier;
-      const outcomeClass = item.outcome === 'denied' ? 'outcome denied' : 'outcome';
-
-      let icon = '\u25CF';
-      if (item.isContextGated) icon = '\u{1F3AF}';
-      else if (item.hasInjection) icon = '\u26A0';
-      else if (item.outcome === 'denied') icon = '\u2717';
-      else icon = '\u2713';
-
-      tr.innerHTML =
-        '<div class="activity-item-icon">' + esc(icon) + '</div>' +
-        '<div class="activity-item-content">' +
-          '<div class="activity-time">' + esc(timeStr) + '</div>' +
-          '<div class="activity-main">' +
-            '<span class="activity-tier ' + tierClass + '">T' + item.tier + '</span>' +
-            '<span class="activity-tool">' + esc(item.tool) + '</span>' +
-            '<span class="activity-outcome ' + (outcomeClass === 'outcome denied' ? 'denied' : '') + '">' + (item.outcome === 'denied' ? '\u2717 denied' : '\u2713 allowed') + '</span>' +
-          '</div>' +
-          '<div class="activity-detail">' + esc(item.detail) + '</div>' +
-        '</div>' +
-      '';
-
-      tr.addEventListener('click', () => {
-        tr.classList.toggle('expanded');
-      });
-
-      list.appendChild(tr);
-    }
-  }
-
-  // \u2500\u2500 Pending Approvals \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
-  function addPendingRequest(data) {
-    const {
-      request_id,
-      operation,
-      tier,
-      reason,
-      context,
-      timestamp
-    } = data;
-
-    const pending = {
-      id: request_id,
-      operation: operation || 'unknown',
-      tier: tier || 1,
-      reason: reason || '',
-      context: context || {},
-      timestamp: timestamp || new Date().toISOString(),
-      remaining: TIMEOUT_SECONDS
-    };
-
-    pendingRequests.set(request_id, pending);
-    updatePendingUI();
-  }
-
-  function removePendingRequest(id) {
-    pendingRequests.delete(id);
-    updatePendingUI();
-  }
-
-  function updatePendingUI() {
-    const count = pendingRequests.size;
-    const badge = document.getElementById('pendingBadge');
-
-    if (count > 0) {
-      badge.classList.remove('hidden');
-      badge.textContent = count;
-      document.getElementById('pendingOverlay').classList.add('active');
-    } else {
-      badge.classList.add('hidden');
-      document.getElementById('pendingOverlay').classList.remove('active');
-    }
-
-    renderPendingList();
-  }
-
-  function renderPendingList() {
-    const list = document.getElementById('pendingList');
-    list.innerHTML = '';
-
-    for (const [id, req] of pendingRequests) {
-      const item = document.createElement('div');
-      item.className = 'pending-item';
-
-      const tier = req.tier || 1;
-      const tierClass = 'tier' + tier;
-      const pct = Math.max(0, Math.min(100, (req.remaining / TIMEOUT_SECONDS) * 100));
-      const isUrgent = req.remaining <= 30;
-
-      item.innerHTML =
-        '<div class="pending-item-header">' +
-          '<div class="pending-item-op">' + esc(req.operation) + '</div>' +
-          '<div class="pending-item-tier ' + tierClass + '">T' + tier + '</div>' +
-        '</div>' +
-        '<div class="pending-item-reason">' + esc(req.reason) + '</div>' +
-        '<div class="pending-item-timer ' + (isUrgent ? 'urgent' : '') + '">' +
-          '<div class="pending-item-timer-bar">' +
-            '<div class="pending-item-timer-fill" style="width: ' + pct + '%"></div>' +
-          '</div>' +
-          '<span id="timer-' + id + '">' + req.remaining + 's</span>' +
-        '</div>' +
-        '<div class="pending-item-actions">' +
-          '<button class="btn btn-approve" onclick="handleApprove('' + id + '')">Approve</button>' +
-          '<button class="btn btn-deny" onclick="handleDeny('' + id + '')">Deny</button>' +
-        '</div>' +
-      '';
-
-      list.appendChild(item);
-    }
-  }
-
-  window.handleApprove = function(id) {
-    fetch('/api/approve/' + id, { method: 'POST', headers: authHeaders() }).then(() => {
-      removePendingRequest(id);
-    }).catch(() => {});
-  };
-
-  window.handleDeny = function(id) {
-    fetch('/api/deny/' + id, { method: 'POST', headers: authHeaders() }).then(() => {
-      removePendingRequest(id);
-    }).catch(() => {});
-  };
-
-  // \u2500\u2500 Threats \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
-  function addThreat(data) {
-    const {
-      timestamp,
-      severity,
-      type,
-      details
-    } = data;
-
-    const threat = {
-      id: 'threat-' + threatCount++,
-      timestamp: timestamp || new Date().toISOString(),
-      severity: severity || 'medium',
-      type: type || 'unknown',
-      details: details || ''
-    };
-
-    threatItems.unshift(threat);
-    if (threatItems.length > MAX_THREAT_ITEMS) {
-      threatItems.pop();
-    }
-
-    if (threatCount > 0) {
-      document.getElementById('threatPanel').classList.remove('collapsed');
-    }
-
-    renderThreats();
-  }
-
-  function renderThreats() {
-    const content = document.getElementById('threatContent');
-    const badge = document.getElementById('threatCount');
-
-    if (threatItems.length === 0) {
-      content.innerHTML = '<div class="threat-empty">No threats detected</div>';
-      badge.textContent = '0';
-      return;
-    }
-
-    badge.textContent = threatItems.length;
-    content.innerHTML = '';
-
-    for (const threat of threatItems) {
+    // Helpers
+    function esc(text) {
+      if (!text) return '';
       const div = document.createElement('div');
-      div.className = 'threat-item';
-      const time = new Date(threat.timestamp).toLocaleTimeString();
-      div.innerHTML =
-        '<div style="margin-bottom: 3px;">' +
-          '<span class="threat-item-type">' + esc(threat.type) + '</span>' +
-          '<span style="font-size: 10px; color: var(--text-secondary); margin-left: 6px;">' + esc(time) + '</span>' +
-        '</div>' +
-        '<div>' + esc(threat.details) + '</div>' +
-      '';
-      content.appendChild(div);
+      div.textContent = text;
+      return div.innerHTML;
     }
-  }
 
-  // \u2500\u2500 SSE Connection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
-  function reconnectSSE() {
-    if (evtSource) evtSource.close();
-    connect();
-  }
-
-  function connect() {
-    evtSource = new EventSource(sessionQuery('/events'));
-
-    evtSource.onopen = () => {
-      document.getElementById('statusDot').classList.remove('disconnected');
-    };
-
-    evtSource.onerror = () => {
-      document.getElementById('statusDot').classList.add('disconnected');
-    };
-
-    evtSource.addEventListener('init', (e) => {
-      const data = JSON.parse(e.data);
-      if (data.baseline) {
-        updateBaseline(data.baseline);
-      }
-      if (data.policy) {
-        updatePolicy(data.policy);
-      }
-      if (data.pending) {
-        data.pending.forEach(addPendingRequest);
-      }
-    });
-
-    evtSource.addEventListener('pending-request', (e) => {
-      const data = JSON.parse(e.data);
-      addPendingRequest(data);
-    });
-
-    evtSource.addEventListener('request-resolved', (e) => {
-      const data = JSON.parse(e.data);
-      removePendingRequest(data.request_id);
-    });
-
-    evtSource.addEventListener('tool-call', (e) => {
-      const data = JSON.parse(e.data);
-      addActivityItem({
-        timestamp: data.timestamp,
-        tier: data.tier || 1,
-        tool: data.tool || 'unknown',
-        outcome: data.outcome || 'executed',
-        detail: data.detail || ''
+    function formatTime(isoString) {
+      if (!isoString) return '\u2014';
+      const date = new Date(isoString);
+      return date.toLocaleString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
       });
-    });
-
-    evtSource.addEventListener('context-gate-decision', (e) => {
-      const data = JSON.parse(e.data);
-      addActivityItem({
-        timestamp: data.timestamp,
-        tier: data.tier || 1,
-        tool: data.tool || 'unknown',
-        outcome: data.outcome || 'gated',
-        detail: data.fields_filtered ? 'Filtered ' + data.fields_filtered + ' fields' : data.reason || '',
-        isContextGated: true
-      });
-    });
-
-    evtSource.addEventListener('injection-alert', (e) => {
-      const data = JSON.parse(e.data);
-      addActivityItem({
-        timestamp: data.timestamp,
-        tier: data.tier || 2,
-        tool: data.tool || 'unknown',
-        outcome: data.allowed ? 'allowed' : 'denied',
-        detail: data.signal || 'Injection detected',
-        hasInjection: true
-      });
-      addThreat({
-        timestamp: data.timestamp,
-        severity: data.severity || 'medium',
-        type: 'Injection Alert',
-        details: data.signal || 'Suspicious pattern detected'
-      });
-    });
-
-    evtSource.addEventListener('protection-status', (e) => {
-      const data = JSON.parse(e.data);
-      updateProtectionStatus(data);
-    });
-
-    evtSource.addEventListener('audit-entry', (e) => {
-      const data = JSON.parse(e.data);
-      // Audit entries don't show in activity by default, but we could add them
-    });
-
-    evtSource.addEventListener('baseline-update', (e) => {
-      const data = JSON.parse(e.data);
-      updateBaseline(data);
-    });
-  }
-
-  function updateBaseline(baseline) {
-    if (!baseline) return;
-    // Update baseline-derived stats if needed
-  }
-
-  function updatePolicy(policy) {
-    if (!policy) return;
-    // Update policy-derived stats
-    if (policy.approval_channel) {
-      // Policy info updated
     }
-  }
 
-  function updateProtectionStatus(status) {
-    if (status.sovereignty_score !== undefined) {
-      updateSovereigntyScore(status.sovereignty_score);
+    function truncate(str, len = 16) {
+      if (!str) return '\u2014';
+      if (str.length <= len) return str;
+      return str.slice(0, len) + '...';
     }
-    if (status.active_protections !== undefined) {
-      document.getElementById('activeProtections').textContent = status.active_protections;
-    }
-    // Update individual protection cards
-    if (status.encryption !== undefined) {
-      const el = document.getElementById('encryptionStatus');
-      el.className = 'protection-card-status ' + (status.encryption ? 'active' : 'inactive');
-      el.textContent = status.encryption ? '\u2713 Active' : '\u2717 Inactive';
-    }
-    if (status.approval_gate !== undefined) {
-      const el = document.getElementById('approvalStatus');
-      el.className = 'protection-card-status ' + (status.approval_gate ? 'active' : 'inactive');
-      el.textContent = status.approval_gate ? '\u2713 Active' : '\u2717 Inactive';
-    }
-    if (status.context_gating !== undefined) {
-      const el = document.getElementById('contextStatus');
-      el.className = 'protection-card-status ' + (status.context_gating ? 'active' : 'inactive');
-      el.textContent = status.context_gating ? '\u2713 Active' : '\u2717 Inactive';
-    }
-    if (status.injection_detection !== undefined) {
-      const el = document.getElementById('injectionStatus');
-      el.className = 'protection-card-status ' + (status.injection_detection ? 'active' : 'inactive');
-      el.textContent = status.injection_detection ? '\u2713 Active' : '\u2717 Inactive';
-    }
-    if (status.baseline !== undefined) {
-      const el = document.getElementById('baselineStatus');
-      el.className = 'protection-card-status ' + (status.baseline ? 'active' : 'inactive');
-      el.textContent = status.baseline ? '\u2713 Active' : '\u2717 Inactive';
-    }
-    if (status.audit_trail !== undefined) {
-      const el = document.getElementById('auditStatus');
-      el.className = 'protection-card-status ' + (status.audit_trail ? 'active' : 'inactive');
-      el.textContent = status.audit_trail ? '\u2713 Active' : '\u2717 Inactive';
-    }
-  }
 
-  // \u2500\u2500 Initialization \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    function calculateSovereigntyScore(shr) {
+      if (!shr || !shr.layers) return 0;
+      const layers = shr.layers;
+      let score = 100;
 
-  (async function init() {
-    await exchangeSession();
-    // Clean legacy ?token= from URL
-    if (window.location.search.includes('token=')) {
-      window.history.replaceState({}, '', window.location.pathname);
+      if (layers.l1?.status === 'degraded') score -= 20;
+      if (layers.l1?.status === 'inactive') score -= 35;
+      if (layers.l2?.status === 'degraded') score -= 15;
+      if (layers.l2?.status === 'inactive') score -= 25;
+      if (layers.l3?.status === 'degraded') score -= 15;
+      if (layers.l3?.status === 'inactive') score -= 25;
+      if (layers.l4?.status === 'degraded') score -= 10;
+      if (layers.l4?.status === 'inactive') score -= 20;
+
+      return Math.max(0, Math.min(100, score));
     }
-    connect();
 
-    // Start uptime ticker
-    setInterval(updateUptime, 1000);
-    updateUptime();
+    async function fetchAPI(endpoint) {
+      try {
+        const response = await fetch(API_BASE + endpoint, {
+          headers: {
+            'Authorization': 'Bearer ' + AUTH_TOKEN,
+          },
+        });
 
-    // Pending request countdown timer
-    setInterval(() => {
-      for (const [id, req] of pendingRequests) {
-        req.remaining = Math.max(0, req.remaining - 1);
-        const el = document.getElementById('timer-' + id);
-        if (el) {
-          el.textContent = req.remaining + 's';
+        if (response.status === 401) {
+          redirectToLogin();
+          return null;
         }
-      }
-    }, 1000);
 
-    // Load initial status
-    try {
-      const resp = await fetch('/api/status', { headers: authHeaders() });
-      if (resp.ok) {
-        const status = await resp.json();
-        if (status.baseline) updateBaseline(status.baseline);
-        if (status.policy) updatePolicy(status.policy);
+        if (!response.ok) {
+          console.error('API Error:', response.status);
+          return null;
+        }
+
+        return await response.json();
+      } catch (err) {
+        console.error('Fetch error:', err);
+        return null;
       }
-    } catch (e) {
-      // Ignore
     }
-  })();
 
-})();
-</script>
+    function redirectToLogin() {
+      sessionStorage.removeItem('authToken');
+      window.location.href = '/';
+    }
 
+    // API Updates
+    async function updateSovereignty() {
+      const data = await fetchAPI('/api/sovereignty');
+      if (!data) return;
+
+      apiState.sovereignty = data;
+
+      const score = calculateSovereigntyScore(data.shr);
+      const badge = document.getElementById('sovereignty-badge');
+      const scoreEl = document.getElementById('sovereignty-score');
+
+      scoreEl.textContent = score;
+
+      badge.classList.remove('degraded', 'inactive');
+      if (score < 70) badge.classList.add('degraded');
+      if (score < 40) badge.classList.add('inactive');
+
+      updateLayerCards(data.shr);
+    }
+
+    function updateLayerCards(shr) {
+      if (!shr || !shr.layers) return;
+
+      const layers = shr.layers;
+
+      updateLayerCard('l1', layers.l1, layers.l1?.encryption || 'AES-256-GCM');
+      updateLayerCard('l2', layers.l2, layers.l2?.isolation_type || 'Process-level');
+      updateLayerCard('l3', layers.l3, layers.l3?.proof_system || 'Schnorr-Pedersen');
+      updateLayerCard('l4', layers.l4, layers.l4?.reputation_mode || 'Weighted');
+    }
+
+    function updateLayerCard(layer, layerData, detail) {
+      if (!layerData) return;
+
+      const card = document.querySelector(\`[data-layer="\${layer}"]\`);
+      if (!card) return;
+
+      const status = layerData.status || 'inactive';
+      card.classList.remove('degraded', 'inactive');
+
+      if (status === 'degraded') {
+        card.classList.add('degraded');
+      } else if (status === 'inactive') {
+        card.classList.add('inactive');
+      }
+
+      document.getElementById(\`\${layer}-status\`).textContent = status.toUpperCase();
+      document.getElementById(\`\${layer}-detail\`).textContent = detail;
+    }
+
+    async function updateIdentity() {
+      const data = await fetchAPI('/api/identity');
+      if (!data) return;
+
+      apiState.identity = data;
+
+      const primary = data.primary || {};
+      document.getElementById('identity-label').textContent = primary.label || '\u2014';
+      document.getElementById('identity-did').textContent = truncate(primary.did, 24);
+      document.getElementById('identity-did').title = primary.did || '';
+      document.getElementById('identity-pubkey').textContent = truncate(primary.publicKey, 24);
+      document.getElementById('identity-pubkey').title = primary.publicKey || '';
+      document.getElementById('identity-created').textContent = formatTime(primary.createdAt);
+      document.getElementById('identity-count').textContent = data.identities?.length || '\u2014';
+    }
+
+    async function updateHandshakes() {
+      const data = await fetchAPI('/api/handshakes');
+      if (!data) return;
+
+      apiState.handshakes = data.handshakes || [];
+
+      document.getElementById('handshake-count').textContent = data.handshakes?.length || '0';
+
+      if (data.handshakes && data.handshakes.length > 0) {
+        const latest = data.handshakes[0];
+        document.getElementById('handshake-latest').textContent = truncate(latest.counterpartyId, 20);
+        document.getElementById('handshake-latest').title = latest.counterpartyId || '';
+        document.getElementById('handshake-tier').textContent = (latest.trustTier || 'Unverified').toUpperCase();
+        document.getElementById('handshake-time').textContent = formatTime(latest.completedAt);
+      } else {
+        document.getElementById('handshake-latest').textContent = '\u2014';
+        document.getElementById('handshake-tier').textContent = 'Unverified';
+        document.getElementById('handshake-time').textContent = '\u2014';
+      }
+
+      updateHandshakeTable(data.handshakes || []);
+    }
+
+    function updateHandshakeTable(handshakes) {
+      const table = document.getElementById('handshake-table');
+
+      if (!handshakes || handshakes.length === 0) {
+        table.innerHTML = '<div class="table-empty">No handshakes completed yet</div>';
+        return;
+      }
+
+      table.innerHTML = handshakes
+        .map(
+          (hs) => \`
+        <div class="table-row">
+          <div class="table-cell strong">\${esc(truncate(hs.counterpartyId, 24))}</div>
+          <div class="table-cell">\${esc(hs.trustTier || 'Unverified')}</div>
+          <div class="table-cell">\${esc(hs.sovereigntyLevel || '\u2014')}</div>
+          <div class="table-cell">\${hs.verified ? 'Yes' : 'No'}</div>
+          <div class="table-cell">\${formatTime(hs.completedAt)}</div>
+          <div class="table-cell">\${formatTime(hs.expiresAt)}</div>
+        </div>
+      \`
+        )
+        .join('');
+    }
+
+    async function updateSHR() {
+      const data = await fetchAPI('/api/shr');
+      if (!data) return;
+
+      apiState.shr = data;
+      renderSHRViewer(data);
+    }
+
+    function renderSHRViewer(shr) {
+      const viewer = document.getElementById('shr-viewer');
+
+      if (!shr) {
+        viewer.innerHTML = '<div class="empty-state">No SHR available</div>';
+        return;
+      }
+
+      let html = '';
+
+      // Implementation
+      html += \`
+        <div class="shr-section">
+          <div class="shr-section-header">
+            <div class="shr-toggle">\u25BC</div>
+            <div>Implementation</div>
+          </div>
+          <div class="shr-section-content">
+            <div class="shr-item">
+              <div class="shr-key">sanctuary_version:</div>
+              <div class="shr-value">\${esc(shr.implementation?.sanctuary_version || '\u2014')}</div>
+            </div>
+            <div class="shr-item">
+              <div class="shr-key">node_version:</div>
+              <div class="shr-value">\${esc(shr.implementation?.node_version || '\u2014')}</div>
+            </div>
+            <div class="shr-item">
+              <div class="shr-key">generated_by:</div>
+              <div class="shr-value">\${esc(shr.implementation?.generated_by || '\u2014')}</div>
+            </div>
+          </div>
+        </div>
+      \`;
+
+      // Metadata
+      html += \`
+        <div class="shr-section">
+          <div class="shr-section-header">
+            <div class="shr-toggle">\u25BC</div>
+            <div>Metadata</div>
+          </div>
+          <div class="shr-section-content">
+            <div class="shr-item">
+              <div class="shr-key">instance_id:</div>
+              <div class="shr-value">\${esc(truncate(shr.instance_id, 20))}</div>
+            </div>
+            <div class="shr-item">
+              <div class="shr-key">generated_at:</div>
+              <div class="shr-value">\${formatTime(shr.generated_at)}</div>
+            </div>
+            <div class="shr-item">
+              <div class="shr-key">expires_at:</div>
+              <div class="shr-value">\${formatTime(shr.expires_at)}</div>
+            </div>
+          </div>
+        </div>
+      \`;
+
+      // Layers
+      if (shr.layers) {
+        html += \`<div class="shr-section">
+          <div class="shr-section-header">
+            <div class="shr-toggle">\u25BC</div>
+            <div>Layers</div>
+          </div>
+          <div class="shr-section-content">
+        \`;
+
+        for (const [key, layer] of Object.entries(shr.layers)) {
+          html += \`
+            <div style="margin-bottom: 12px;">
+              <div style="color: var(--blue); font-weight: 600; margin-bottom: 4px;">\${esc(key)}</div>
+              <div style="padding-left: 12px;">
+          \`;
+
+          for (const [lkey, lvalue] of Object.entries(layer || {})) {
+            const displayValue =
+              typeof lvalue === 'boolean'
+                ? lvalue
+                  ? 'true'
+                  : 'false'
+                : esc(String(lvalue));
+            html += \`
+              <div class="shr-item">
+                <div class="shr-key">\${esc(lkey)}:</div>
+                <div class="shr-value">\${displayValue}</div>
+              </div>
+            \`;
+          }
+
+          html += \`
+              </div>
+            </div>
+          \`;
+        }
+
+        html += \`
+          </div>
+        </div>
+        \`;
+      }
+
+      // Capabilities
+      if (shr.capabilities) {
+        html += \`
+          <div class="shr-section">
+            <div class="shr-section-header">
+              <div class="shr-toggle">\u25BC</div>
+              <div>Capabilities</div>
+            </div>
+            <div class="shr-section-content">
+        \`;
+
+        for (const [key, value] of Object.entries(shr.capabilities)) {
+          const displayValue = value ? 'true' : 'false';
+          html += \`
+            <div class="shr-item">
+              <div class="shr-key">\${esc(key)}:</div>
+              <div class="shr-value">\${displayValue}</div>
+            </div>
+          \`;
+        }
+
+        html += \`
+            </div>
+          </div>
+        \`;
+      }
+
+      // Signature
+      html += \`
+        <div class="shr-section">
+          <div class="shr-section-header">
+            <div class="shr-toggle">\u25BC</div>
+            <div>Signature</div>
+          </div>
+          <div class="shr-section-content">
+            <div class="shr-item">
+              <div class="shr-key">signed_by:</div>
+              <div class="shr-value">\${esc(truncate(shr.signed_by, 20))}</div>
+            </div>
+            <div class="shr-item">
+              <div class="shr-key">signature:</div>
+              <div class="shr-value">\${esc(truncate(shr.signature, 32))}</div>
+            </div>
+          </div>
+        </div>
+      \`;
+
+      viewer.innerHTML = html;
+
+      // Add collapse functionality
+      document.querySelectorAll('.shr-section-header').forEach((header) => {
+        header.addEventListener('click', () => {
+          header.closest('.shr-section').classList.toggle('collapsed');
+        });
+      });
+    }
+
+    async function updateStatus() {
+      const data = await fetchAPI('/api/status');
+      if (!data) return;
+
+      apiState.status = data;
+
+      document.getElementById('protections-count').textContent = data.protectionsCount || '0';
+      document.getElementById('uptime-value').textContent = formatUptime(data.uptime);
+
+      const connectionStatus = document.getElementById('connection-status');
+      connectionStatus.classList.toggle('disconnected', !data.connected);
+    }
+
+    function formatUptime(seconds) {
+      if (!seconds) return '\u2014';
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      if (hours > 0) return \`\${hours}h \${minutes}m\`;
+      return \`\${minutes}m\`;
+    }
+
+    // SSE Setup
+    function setupSSE() {
+      const eventSource = new EventSource(API_BASE + '/api/events', {
+        headers: {
+          'Authorization': 'Bearer ' + AUTH_TOKEN,
+        },
+      });
+
+      eventSource.addEventListener('init', (e) => {
+        console.log('Connected to SSE');
+      });
+
+      eventSource.addEventListener('sovereignty-update', () => {
+        updateSovereignty();
+      });
+
+      eventSource.addEventListener('handshake-update', () => {
+        updateHandshakes();
+      });
+
+      eventSource.addEventListener('tool-call', (e) => {
+        const data = JSON.parse(e.data);
+        addActivityItem({
+          type: 'tool-call',
+          title: 'Tool Call',
+          content: data.toolName,
+          timestamp: new Date().toISOString(),
+        });
+      });
+
+      eventSource.addEventListener('context-gate-decision', (e) => {
+        const data = JSON.parse(e.data);
+        addActivityItem({
+          type: 'context-gate',
+          title: 'Context Gate',
+          content: data.decision,
+          timestamp: new Date().toISOString(),
+        });
+      });
+
+      eventSource.addEventListener('injection-alert', (e) => {
+        const data = JSON.parse(e.data);
+        addActivityItem({
+          type: 'injection',
+          title: 'Injection Alert',
+          content: data.pattern,
+          timestamp: new Date().toISOString(),
+        });
+        addThreatAlert(data);
+      });
+
+      eventSource.addEventListener('pending-request', (e) => {
+        const data = JSON.parse(e.data);
+        addPendingRequest(data);
+      });
+
+      eventSource.addEventListener('request-resolved', (e) => {
+        const data = JSON.parse(e.data);
+        removePendingRequest(data.requestId);
+      });
+
+      eventSource.onerror = () => {
+        console.error('SSE error');
+        setTimeout(setupSSE, 5000);
+      };
+    }
+
+    // Activity Feed
+    function addActivityItem(item) {
+      activityLog.unshift(item);
+      if (activityLog.length > maxActivityItems) {
+        activityLog.pop();
+      }
+
+      const feed = document.getElementById('activity-feed');
+      const html = \`
+        <div class="activity-item \${item.type}">
+          <div class="activity-type">\${esc(item.title)}</div>
+          <div class="activity-content">\${esc(item.content)}</div>
+          <div class="activity-time">\${formatTime(item.timestamp)}</div>
+        </div>
+      \`;
+
+      if (feed.querySelector('.empty-state')) {
+        feed.innerHTML = '';
+      }
+
+      feed.insertAdjacentHTML('afterbegin', html);
+
+      if (feed.children.length > maxActivityItems) {
+        feed.lastChild.remove();
+      }
+    }
+
+    // Pending Requests
+    function addPendingRequest(request) {
+      pendingRequests.set(request.requestId, {
+        id: request.requestId,
+        title: request.title,
+        details: request.details,
+        expiresAt: new Date(Date.now() + TIMEOUT_SECONDS * 1000),
+      });
+
+      updatePendingDisplay();
+    }
+
+    function removePendingRequest(requestId) {
+      pendingRequests.delete(requestId);
+      updatePendingDisplay();
+    }
+
+    function updatePendingDisplay() {
+      const badge = document.getElementById('pending-item-badge');
+      const count = pendingRequests.size;
+
+      if (count > 0) {
+        document.getElementById('pending-count').textContent = count;
+        badge.style.display = 'flex';
+      } else {
+        badge.style.display = 'none';
+      }
+
+      const overlay = document.getElementById('pending-overlay');
+      const items = document.getElementById('pending-items');
+
+      if (count === 0) {
+        items.innerHTML = '';
+        overlay.classList.remove('show');
+        return;
+      }
+
+      let html = '';
+      for (const req of pendingRequests.values()) {
+        const remaining = Math.max(0, Math.floor((req.expiresAt - Date.now()) / 1000));
+        html += \`
+          <div class="pending-item">
+            <div class="pending-title">\${esc(req.title)}</div>
+            <div class="pending-countdown">Expires in \${remaining}s</div>
+            <div class="pending-actions">
+              <button class="pending-btn pending-approve" data-id="\${req.id}">Approve</button>
+              <button class="pending-btn pending-deny" data-id="\${req.id}">Deny</button>
+            </div>
+          </div>
+        \`;
+      }
+
+      items.innerHTML = html;
+
+      document.querySelectorAll('.pending-approve').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = btn.getAttribute('data-id');
+          await fetchAPI(\`/api/approve/\${id}\`);
+        });
+      });
+
+      document.querySelectorAll('.pending-deny').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = btn.getAttribute('data-id');
+          await fetchAPI(\`/api/deny/\${id}\`);
+        });
+      });
+    }
+
+    // Threat Panel
+    function addThreatAlert(alert) {
+      const panel = document.querySelector('.threat-panel');
+      const content = document.getElementById('threat-alerts');
+
+      if (content.querySelector('.empty-state')) {
+        content.innerHTML = '';
+      }
+
+      panel.classList.remove('collapsed');
+
+      const html = \`
+        <div class="threat-alert">
+          <div class="threat-type">\${esc(alert.type || 'Injection Alert')}</div>
+          <div class="threat-message">\${esc(alert.message || alert.pattern || '\u2014')}</div>
+        </div>
+      \`;
+
+      content.insertAdjacentHTML('afterbegin', html);
+
+      const alerts = content.querySelectorAll('.threat-alert');
+      if (alerts.length > 10) {
+        alerts[alerts.length - 1].remove();
+      }
+    }
+
+    // Threat Panel Toggle
+    document.querySelector('.threat-header').addEventListener('click', () => {
+      document.querySelector('.threat-panel').classList.toggle('collapsed');
+    });
+
+    // SHR Copy Button
+    document.getElementById('copy-shr-btn').addEventListener('click', async () => {
+      if (!apiState.shr) return;
+
+      const json = JSON.stringify(apiState.shr, null, 2);
+      try {
+        await navigator.clipboard.writeText(json);
+        const btn = document.getElementById('copy-shr-btn');
+        const original = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => {
+          btn.textContent = original;
+        }, 2000);
+      } catch (err) {
+        console.error('Copy failed:', err);
+      }
+    });
+
+    // Pending Overlay Toggle
+    document.getElementById('pending-item-badge').addEventListener('click', () => {
+      document.getElementById('pending-overlay').classList.toggle('show');
+    });
+
+    // Initialize
+    async function initialize() {
+      if (!AUTH_TOKEN) {
+        redirectToLogin();
+        return;
+      }
+
+      // Initial data fetch
+      await Promise.all([
+        updateSovereignty(),
+        updateIdentity(),
+        updateHandshakes(),
+        updateSHR(),
+        updateStatus(),
+      ]);
+
+      // Setup SSE for real-time updates
+      setupSSE();
+
+      // Refresh status periodically
+      setInterval(updateStatus, 30000);
+    }
+
+    // Start
+    initialize();
+  </script>
 </body>
 </html>`;
 }
@@ -2758,6 +3294,7 @@ var SESSION_TTL_REMOTE_MS, SESSION_TTL_LOCAL_MS, MAX_SESSIONS, RATE_LIMIT_WINDOW
 var init_dashboard = __esm({
   "src/principal-policy/dashboard.ts"() {
     init_config();
+    init_generator();
     init_dashboard_html();
     SESSION_TTL_REMOTE_MS = 5 * 60 * 1e3;
     SESSION_TTL_LOCAL_MS = 24 * 60 * 60 * 1e3;
@@ -2774,6 +3311,10 @@ var init_dashboard = __esm({
       policy = null;
       baseline = null;
       auditLog = null;
+      identityManager = null;
+      handshakeResults = null;
+      shrOpts = null;
+      sanctuaryConfig = null;
       dashboardHTML;
       loginHTML;
       authToken;
@@ -2807,6 +3348,10 @@ var init_dashboard = __esm({
         this.policy = deps.policy;
         this.baseline = deps.baseline;
         this.auditLog = deps.auditLog;
+        if (deps.identityManager) this.identityManager = deps.identityManager;
+        if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
+        if (deps.shrOpts) this.shrOpts = deps.shrOpts;
+        if (deps.sanctuaryConfig) this.sanctuaryConfig = deps.sanctuaryConfig;
       }
       /**
        * Start the HTTP(S) server for the dashboard.
@@ -3139,6 +3684,14 @@ var init_dashboard = __esm({
             this.handlePendingList(res);
           } else if (method === "GET" && url.pathname === "/api/audit-log") {
             this.handleAuditLog(url, res);
+          } else if (method === "GET" && url.pathname === "/api/sovereignty") {
+            this.handleSovereignty(res);
+          } else if (method === "GET" && url.pathname === "/api/identity") {
+            this.handleIdentity(res);
+          } else if (method === "GET" && url.pathname === "/api/handshakes") {
+            this.handleHandshakes(res);
+          } else if (method === "GET" && url.pathname === "/api/shr") {
+            this.handleSHR(res);
           } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
             if (!this.checkRateLimit(req, res, "decisions")) return;
             const id = url.pathname.slice("/api/approve/".length);
@@ -3327,6 +3880,106 @@ data: ${JSON.stringify(initData)}
         pending.resolve(response);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: true, decision }));
+      }
+      // ── Sovereignty Data Routes ─────────────────────────────────────────
+      handleSovereignty(res) {
+        if (!this.shrOpts) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "SHR generator not available" }));
+          return;
+        }
+        const shr = generateSHR(void 0, this.shrOpts);
+        if (typeof shr === "string") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: shr }));
+          return;
+        }
+        const layers = shr.body.layers;
+        let score = 0;
+        for (const layer of [layers.l1, layers.l2, layers.l3, layers.l4]) {
+          if (layer.status === "active") score += 25;
+          else if (layer.status === "degraded") score += 15;
+        }
+        const overallLevel = score === 100 ? "full" : score >= 65 ? "degraded" : score >= 25 ? "minimal" : "unverified";
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          score,
+          overall_level: overallLevel,
+          layers: {
+            l1: { status: layers.l1.status, detail: layers.l1.encryption, key_custody: layers.l1.key_custody },
+            l2: { status: layers.l2.status, detail: layers.l2.isolation_type, attestation: layers.l2.attestation_available },
+            l3: { status: layers.l3.status, detail: layers.l3.proof_system, selective_disclosure: layers.l3.selective_disclosure },
+            l4: { status: layers.l4.status, detail: layers.l4.attestation_format, reputation_portable: layers.l4.reputation_portable }
+          },
+          degradations: shr.body.degradations,
+          capabilities: shr.body.capabilities
+        }));
+      }
+      handleIdentity(res) {
+        if (!this.identityManager) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ identities: [], count: 0 }));
+          return;
+        }
+        const identities = this.identityManager.list().map((id) => ({
+          identity_id: id.identity_id,
+          label: id.label,
+          public_key: id.public_key,
+          did: id.did,
+          created_at: id.created_at,
+          key_type: id.key_type,
+          key_protection: id.key_protection,
+          rotation_count: id.rotation_history?.length ?? 0
+        }));
+        const primary = this.identityManager.getDefault();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          identities,
+          count: identities.length,
+          primary_id: primary?.identity_id ?? null
+        }));
+      }
+      handleHandshakes(res) {
+        if (!this.handshakeResults) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ handshakes: [], count: 0 }));
+          return;
+        }
+        const handshakes = Array.from(this.handshakeResults.values()).map((h) => ({
+          counterparty_id: h.counterparty_id,
+          verified: h.verified,
+          sovereignty_level: h.sovereignty_level,
+          trust_tier: h.trust_tier,
+          completed_at: h.completed_at,
+          expires_at: h.expires_at,
+          errors: h.errors
+        }));
+        handshakes.sort((a, b) => new Date(b.completed_at).getTime() - new Date(a.completed_at).getTime());
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          handshakes,
+          count: handshakes.length,
+          tier_distribution: {
+            verified_sovereign: handshakes.filter((h) => h.trust_tier === "verified-sovereign").length,
+            verified_degraded: handshakes.filter((h) => h.trust_tier === "verified-degraded").length,
+            unverified: handshakes.filter((h) => h.trust_tier === "unverified").length
+          }
+        }));
+      }
+      handleSHR(res) {
+        if (!this.shrOpts) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "SHR generator not available" }));
+          return;
+        }
+        const shr = generateSHR(void 0, this.shrOpts);
+        if (typeof shr === "string") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: shr }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(shr));
       }
       // ── SSE Broadcasting ────────────────────────────────────────────────
       broadcastSSE(event, data) {
@@ -3569,111 +4222,7 @@ init_filesystem();
 // src/l1-cognitive/state-store.ts
 init_encryption();
 init_hashing();
-
-// src/core/identity.ts
-init_encoding();
-init_encryption();
-init_hashing();
-init_random();
-function generateKeypair() {
-  const privateKey = randomBytes(32);
-  const publicKey = ed25519.getPublicKey(privateKey);
-  return { publicKey, privateKey };
-}
-function publicKeyToDid(publicKey) {
-  const multicodec = new Uint8Array([237, 1, ...publicKey]);
-  return `did:key:z${toBase64url(multicodec)}`;
-}
-function generateIdentityId(publicKey) {
-  const keyHash = hash(publicKey);
-  return Array.from(keyHash.slice(0, 16)).map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-function createIdentity(label, encryptionKey, keyProtection) {
-  const { publicKey, privateKey } = generateKeypair();
-  const identityId = generateIdentityId(publicKey);
-  const did = publicKeyToDid(publicKey);
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const encryptedPrivateKey = encrypt(privateKey, encryptionKey);
-  privateKey.fill(0);
-  const publicIdentity = {
-    identity_id: identityId,
-    label,
-    public_key: toBase64url(publicKey),
-    did,
-    created_at: now,
-    key_type: "ed25519",
-    key_protection: keyProtection
-  };
-  const storedIdentity = {
-    ...publicIdentity,
-    encrypted_private_key: encryptedPrivateKey,
-    rotation_history: []
-  };
-  return { publicIdentity, storedIdentity };
-}
-function sign(payload, encryptedPrivateKey, encryptionKey) {
-  const privateKey = decrypt(encryptedPrivateKey, encryptionKey);
-  try {
-    return ed25519.sign(payload, privateKey);
-  } finally {
-    privateKey.fill(0);
-  }
-}
-function verify(payload, signature, publicKey) {
-  try {
-    return ed25519.verify(signature, payload, publicKey);
-  } catch {
-    return false;
-  }
-}
-function rotateKeys(storedIdentity, encryptionKey, reason) {
-  const { publicKey: newPublicKey, privateKey: newPrivateKey } = generateKeypair();
-  const newIdentityDid = publicKeyToDid(newPublicKey);
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const eventData = JSON.stringify({
-    old_public_key: storedIdentity.public_key,
-    new_public_key: toBase64url(newPublicKey),
-    identity_id: storedIdentity.identity_id,
-    reason,
-    rotated_at: now
-  });
-  const eventBytes = new TextEncoder().encode(eventData);
-  const signature = sign(
-    eventBytes,
-    storedIdentity.encrypted_private_key,
-    encryptionKey
-  );
-  const rotationEvent = {
-    old_public_key: storedIdentity.public_key,
-    new_public_key: toBase64url(newPublicKey),
-    identity_id: storedIdentity.identity_id,
-    reason,
-    rotated_at: now,
-    signature: toBase64url(signature)
-  };
-  const encryptedNewPrivateKey = encrypt(newPrivateKey, encryptionKey);
-  newPrivateKey.fill(0);
-  const updatedIdentity = {
-    ...storedIdentity,
-    public_key: toBase64url(newPublicKey),
-    did: newIdentityDid,
-    encrypted_private_key: encryptedNewPrivateKey,
-    rotation_history: [
-      ...storedIdentity.rotation_history,
-      {
-        old_public_key: storedIdentity.public_key,
-        new_public_key: toBase64url(newPublicKey),
-        rotation_event: toBase64url(
-          new TextEncoder().encode(JSON.stringify(rotationEvent))
-        ),
-        rotated_at: now
-      }
-    ]
-  };
-  return { updatedIdentity, rotationEvent };
-}
-
-// src/l1-cognitive/state-store.ts
+init_identity();
 init_key_derivation();
 init_encoding();
 var RESERVED_NAMESPACE_PREFIXES = [
@@ -4213,6 +4762,7 @@ function toolResult(data) {
 }
 
 // src/l1-cognitive/tools.ts
+init_identity();
 init_key_derivation();
 init_encoding();
 init_encryption();
@@ -5622,6 +6172,7 @@ init_encryption();
 init_key_derivation();
 init_encoding();
 init_random();
+init_identity();
 function computeMedian(values) {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
@@ -7594,110 +8145,12 @@ function createPrincipalPolicyTools(policy, baseline, auditLog) {
   ];
 }
 
-// src/shr/types.ts
-function deepSortKeys(obj) {
-  if (obj === null || typeof obj !== "object") return obj;
-  if (Array.isArray(obj)) return obj.map(deepSortKeys);
-  const sorted = {};
-  for (const key of Object.keys(obj).sort()) {
-    sorted[key] = deepSortKeys(obj[key]);
-  }
-  return sorted;
-}
-function canonicalizeForSigning(body) {
-  return JSON.stringify(deepSortKeys(body));
-}
-
-// src/shr/generator.ts
-init_encoding();
-init_key_derivation();
-var DEFAULT_VALIDITY_MS = 60 * 60 * 1e3;
-function generateSHR(identityId, opts) {
-  const { config, identityManager, masterKey, validityMs } = opts;
-  const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
-  if (!identity) {
-    return "No identity available for signing. Create an identity first.";
-  }
-  const now = /* @__PURE__ */ new Date();
-  const expiresAt = new Date(now.getTime() + (validityMs ?? DEFAULT_VALIDITY_MS));
-  const degradations = [];
-  if (config.execution.environment === "local-process") {
-    degradations.push({
-      layer: "l2",
-      code: "PROCESS_ISOLATION_ONLY",
-      severity: "warning",
-      description: "Process-level isolation only (no TEE)",
-      mitigation: "TEE support planned for a future release"
-    });
-    degradations.push({
-      layer: "l2",
-      code: "SELF_REPORTED_ATTESTATION",
-      severity: "warning",
-      description: "Attestation is self-reported (no hardware root of trust)",
-      mitigation: "TEE attestation planned for a future release"
-    });
-  }
-  const body = {
-    shr_version: "1.0",
-    implementation: {
-      sanctuary_version: config.version,
-      node_version: process.versions.node,
-      generated_by: "sanctuary-mcp-server"
-    },
-    instance_id: identity.identity_id,
-    generated_at: now.toISOString(),
-    expires_at: expiresAt.toISOString(),
-    layers: {
-      l1: {
-        status: "active",
-        encryption: config.state.encryption,
-        key_custody: "self",
-        integrity: config.state.integrity,
-        identity_type: config.state.identity_provider,
-        state_portable: true
-      },
-      l2: {
-        status: config.execution.environment === "local-process" ? "degraded" : "active",
-        isolation_type: config.execution.environment,
-        attestation_available: config.execution.attestation
-      },
-      l3: {
-        status: "active",
-        proof_system: config.disclosure.proof_system,
-        selective_disclosure: true
-      },
-      l4: {
-        status: "active",
-        reputation_mode: config.reputation.mode,
-        attestation_format: config.reputation.attestation_format,
-        reputation_portable: true
-      }
-    },
-    capabilities: {
-      handshake: true,
-      shr_exchange: true,
-      reputation_verify: true,
-      encrypted_channel: false
-      // Not yet implemented
-    },
-    degradations
-  };
-  const canonical = canonicalizeForSigning(body);
-  const payload = stringToBytes(canonical);
-  const encryptionKey = derivePurposeKey(masterKey, "identity-encryption");
-  const signatureBytes = sign(
-    payload,
-    identity.encrypted_private_key,
-    encryptionKey
-  );
-  return {
-    body,
-    signed_by: identity.public_key,
-    signature: toBase64url(signatureBytes)
-  };
-}
+// src/shr/tools.ts
+init_generator();
 
 // src/shr/verifier.ts
+init_types();
+init_identity();
 init_encoding();
 function verifySHR(shr, now) {
   const errors = [];
@@ -8119,7 +8572,11 @@ function createSHRTools(config, identityManager, masterKey, auditLog) {
   return { tools };
 }
 
+// src/handshake/tools.ts
+init_generator();
+
 // src/handshake/protocol.ts
+init_identity();
 init_encoding();
 init_random();
 init_key_derivation();
@@ -8289,8 +8746,11 @@ function deriveTrustTier(level) {
 }
 
 // src/handshake/attestation.ts
+init_types();
+init_identity();
 init_encoding();
 init_key_derivation();
+init_identity();
 init_encoding();
 var ATTESTATION_VERSION = "1.0";
 function deriveTrustTier2(level) {
@@ -9088,6 +9548,7 @@ init_encryption();
 init_encoding();
 
 // src/bridge/bridge.ts
+init_identity();
 init_encoding();
 init_random();
 init_hashing();
@@ -12176,6 +12637,7 @@ init_filesystem();
 init_baseline();
 init_loader();
 init_dashboard();
+init_generator();
 async function createSanctuaryServer(options) {
   const config = await loadConfig(options?.configPath);
   await mkdir(config.storage_path, { recursive: true, mode: 448 });
@@ -12529,7 +12991,15 @@ async function createSanctuaryServer(options) {
       tls: config.dashboard.tls,
       auto_open: config.dashboard.auto_open
     });
-    dashboard.setDependencies({ policy, baseline, auditLog });
+    dashboard.setDependencies({
+      policy,
+      baseline,
+      auditLog,
+      identityManager,
+      handshakeResults,
+      shrOpts: { config, identityManager, masterKey },
+      sanctuaryConfig: config
+    });
     await dashboard.start();
     approvalChannel = dashboard;
   } else if (config.webhook.enabled && config.webhook.url && config.webhook.secret) {

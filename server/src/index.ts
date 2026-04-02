@@ -514,7 +514,15 @@ export async function createSanctuaryServer(options?: {
       tls: config.dashboard.tls,
       auto_open: config.dashboard.auto_open,
     });
-    dashboard.setDependencies({ policy, baseline, auditLog });
+    dashboard.setDependencies({
+      policy,
+      baseline,
+      auditLog,
+      identityManager,
+      handshakeResults,
+      shrOpts: { config, identityManager, masterKey },
+      sanctuaryConfig: config,
+    });
     await dashboard.start();
     approvalChannel = dashboard;
   } else if (config.webhook.enabled && config.webhook.url && config.webhook.secret) {
@@ -747,6 +755,7 @@ export {
   verifyAttestation,
   ATTESTATION_VERSION,
 } from "./handshake/attestation.js";
+export type { SHRGeneratorOptions } from "./shr/generator.js";
 export type {
   SignedAttestation,
   AttestationBody,

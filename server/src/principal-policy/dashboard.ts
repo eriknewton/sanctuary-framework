@@ -26,10 +26,15 @@ import { randomBytes } from "node:crypto";
 import { exec } from "node:child_process";
 import { platform } from "node:os";
 import { SANCTUARY_VERSION as PKG_VERSION } from "../config.js";
+import type { SanctuaryConfig } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import type { ApprovalRequest, ApprovalResponse, PrincipalPolicy } from "./types.js";
 import type { BaselineTracker } from "./baseline.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { HandshakeResult } from "../handshake/types.js";
+import type { SignedSHR } from "../shr/types.js";
+import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
 import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
@@ -98,6 +103,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private policy: PrincipalPolicy | null = null;
   private baseline: BaselineTracker | null = null;
   private auditLog: AuditLog | null = null;
+  private identityManager: IdentityManager | null = null;
+  private handshakeResults: Map<string, HandshakeResult> | null = null;
+  private shrOpts: SHRGeneratorOptions | null = null;
+  private sanctuaryConfig: SanctuaryConfig | null = null;
   private dashboardHTML: string;
   private loginHTML: string;
   private authToken: string | undefined;
@@ -135,10 +144,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     policy: PrincipalPolicy;
     baseline: BaselineTracker;
     auditLog: AuditLog;
+    identityManager?: IdentityManager;
+    handshakeResults?: Map<string, HandshakeResult>;
+    shrOpts?: SHRGeneratorOptions;
+    sanctuaryConfig?: SanctuaryConfig;
   }): void {
     this.policy = deps.policy;
     this.baseline = deps.baseline;
     this.auditLog = deps.auditLog;
+    if (deps.identityManager) this.identityManager = deps.identityManager;
+    if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
+    if (deps.shrOpts) this.shrOpts = deps.shrOpts;
+    if (deps.sanctuaryConfig) this.sanctuaryConfig = deps.sanctuaryConfig;
   }
 
   /**
@@ -558,6 +575,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         this.handlePendingList(res);
       } else if (method === "GET" && url.pathname === "/api/audit-log") {
         this.handleAuditLog(url, res);
+      } else if (method === "GET" && url.pathname === "/api/sovereignty") {
+        this.handleSovereignty(res);
+      } else if (method === "GET" && url.pathname === "/api/identity") {
+        this.handleIdentity(res);
+      } else if (method === "GET" && url.pathname === "/api/handshakes") {
+        this.handleHandshakes(res);
+      } else if (method === "GET" && url.pathname === "/api/shr") {
+        this.handleSHR(res);
       } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
         // Decision endpoints get an additional tighter rate limit
         if (!this.checkRateLimit(req, res, "decisions")) return;
@@ -781,6 +806,129 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ success: true, decision }));
+  }
+
+  // ── Sovereignty Data Routes ─────────────────────────────────────────
+
+  private handleSovereignty(res: ServerResponse): void {
+    if (!this.shrOpts) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "SHR generator not available" }));
+      return;
+    }
+
+    const shr = generateSHR(undefined, this.shrOpts);
+    if (typeof shr === "string") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: shr }));
+      return;
+    }
+
+    const layers = shr.body.layers;
+    // Compute sovereignty score: 25 points per layer, deductions for degraded/inactive
+    let score = 0;
+    for (const layer of [layers.l1, layers.l2, layers.l3, layers.l4]) {
+      if (layer.status === "active") score += 25;
+      else if (layer.status === "degraded") score += 15;
+      // inactive = 0
+    }
+
+    const overallLevel = score === 100 ? "full"
+      : score >= 65 ? "degraded"
+      : score >= 25 ? "minimal"
+      : "unverified";
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      score,
+      overall_level: overallLevel,
+      layers: {
+        l1: { status: layers.l1.status, detail: layers.l1.encryption, key_custody: layers.l1.key_custody },
+        l2: { status: layers.l2.status, detail: layers.l2.isolation_type, attestation: layers.l2.attestation_available },
+        l3: { status: layers.l3.status, detail: layers.l3.proof_system, selective_disclosure: layers.l3.selective_disclosure },
+        l4: { status: layers.l4.status, detail: layers.l4.attestation_format, reputation_portable: layers.l4.reputation_portable },
+      },
+      degradations: shr.body.degradations,
+      capabilities: shr.body.capabilities,
+    }));
+  }
+
+  private handleIdentity(res: ServerResponse): void {
+    if (!this.identityManager) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ identities: [], count: 0 }));
+      return;
+    }
+
+    const identities = this.identityManager.list().map(id => ({
+      identity_id: id.identity_id,
+      label: id.label,
+      public_key: id.public_key,
+      did: id.did,
+      created_at: id.created_at,
+      key_type: id.key_type,
+      key_protection: id.key_protection,
+      rotation_count: id.rotation_history?.length ?? 0,
+    }));
+
+    const primary = this.identityManager.getDefault();
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      identities,
+      count: identities.length,
+      primary_id: primary?.identity_id ?? null,
+    }));
+  }
+
+  private handleHandshakes(res: ServerResponse): void {
+    if (!this.handshakeResults) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ handshakes: [], count: 0 }));
+      return;
+    }
+
+    const handshakes = Array.from(this.handshakeResults.values()).map(h => ({
+      counterparty_id: h.counterparty_id,
+      verified: h.verified,
+      sovereignty_level: h.sovereignty_level,
+      trust_tier: h.trust_tier,
+      completed_at: h.completed_at,
+      expires_at: h.expires_at,
+      errors: h.errors,
+    }));
+
+    // Sort by completed_at descending (most recent first)
+    handshakes.sort((a, b) => new Date(b.completed_at).getTime() - new Date(a.completed_at).getTime());
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      handshakes,
+      count: handshakes.length,
+      tier_distribution: {
+        verified_sovereign: handshakes.filter(h => h.trust_tier === "verified-sovereign").length,
+        verified_degraded: handshakes.filter(h => h.trust_tier === "verified-degraded").length,
+        unverified: handshakes.filter(h => h.trust_tier === "unverified").length,
+      },
+    }));
+  }
+
+  private handleSHR(res: ServerResponse): void {
+    if (!this.shrOpts) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "SHR generator not available" }));
+      return;
+    }
+
+    const shr = generateSHR(undefined, this.shrOpts);
+    if (typeof shr === "string") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: shr }));
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(shr));
   }
 
   // ── SSE Broadcasting ────────────────────────────────────────────────
