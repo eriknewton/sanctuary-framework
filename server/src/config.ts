@@ -129,13 +129,32 @@ export function defaultConfig(): SanctuaryConfig {
 
 /**
  * Load configuration from file, falling back to defaults.
+ *
+ * Precedence (highest wins): CLI flags > env vars > config file > defaults
+ * This matches the standard config precedence pattern used by most tools.
  */
 export async function loadConfig(
   configPath?: string
 ): Promise<SanctuaryConfig> {
-  const config = defaultConfig();
+  let config = defaultConfig();
 
-  // Override from environment
+  // Phase 1: Merge config file on top of defaults
+  const storagePath = process.env.SANCTUARY_STORAGE_PATH ?? config.storage_path;
+  const path = configPath ?? join(storagePath, "sanctuary.json");
+
+  try {
+    const raw = await readFile(path, "utf-8");
+    const fileConfig = JSON.parse(raw);
+    config = deepMerge(config, fileConfig);
+  } catch (err) {
+    // Re-throw validation errors — only swallow file-not-found
+    if (err instanceof Error && err.message.includes("unimplemented features")) {
+      throw err;
+    }
+    // No config file — continue with defaults
+  }
+
+  // Phase 2: Apply env var overrides ON TOP of file config (env always wins)
   if (process.env.SANCTUARY_STORAGE_PATH) {
     config.storage_path = process.env.SANCTUARY_STORAGE_PATH;
   }
@@ -147,6 +166,9 @@ export async function loadConfig(
   }
   if (process.env.SANCTUARY_DASHBOARD_ENABLED === "true") {
     config.dashboard.enabled = true;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_ENABLED === "false") {
+    config.dashboard.enabled = false;
   }
   if (process.env.SANCTUARY_DASHBOARD_PORT) {
     config.dashboard.port = parseInt(process.env.SANCTUARY_DASHBOARD_PORT, 10);
@@ -166,6 +188,9 @@ export async function loadConfig(
   if (process.env.SANCTUARY_WEBHOOK_ENABLED === "true") {
     config.webhook.enabled = true;
   }
+  if (process.env.SANCTUARY_WEBHOOK_ENABLED === "false") {
+    config.webhook.enabled = false;
+  }
   if (process.env.SANCTUARY_WEBHOOK_URL) {
     config.webhook.url = process.env.SANCTUARY_WEBHOOK_URL;
   }
@@ -179,24 +204,12 @@ export async function loadConfig(
     config.webhook.callback_host = process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST;
   }
 
-  // Override from config file
-  const path =
-    configPath ?? join(config.storage_path, "sanctuary.json");
+  // Phase 3: Always stamp the running version from package.json (Bug 2 fix —
+  // sanctuary.json may store a stale version from first run)
+  config.version = PKG_VERSION;
 
-  try {
-    const raw = await readFile(path, "utf-8");
-    const fileConfig = JSON.parse(raw);
-    const merged = deepMerge(config, fileConfig);
-    validateConfig(merged);
-    return merged;
-  } catch (err) {
-    // Re-throw validation errors — only swallow file-not-found
-    if (err instanceof Error && err.message.includes("unimplemented features")) {
-      throw err;
-    }
-    // No config file — use defaults (defaults are always valid)
-    return config;
-  }
+  validateConfig(config);
+  return config;
 }
 
 /**
