@@ -37,6 +37,16 @@ export interface SHRLayerL2 {
   status: LayerStatus;
   isolation_type: string;
   attestation_available: boolean;
+  /** Model provenance: what inference model(s) power this agent */
+  model_provenance?: {
+    model_id: string;
+    model_name: string;
+    provider: string;
+    open_weights: boolean;
+    open_source: boolean;
+    local_inference: boolean;
+    weights_hash?: string;
+  };
 }
 
 export interface SHRLayerL3 {

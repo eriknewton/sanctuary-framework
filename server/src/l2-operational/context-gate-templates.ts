@@ -299,6 +299,69 @@ export const TOOL_API_SCOPED: ContextGateTemplate = {
   default_action: "redact",
 };
 
+/**
+ * Remote Inference Sanitization template
+ *
+ * Inspired by Vitalik Buterin's "Secure LLM" blog post (April 2026):
+ * When a local agent needs to call out to a remote/cloud LLM for tasks
+ * beyond local capability (complex coding, deep research, etc.), this
+ * template provides maximum privacy by stripping all identity, financial,
+ * and personal data before passing queries to external models.
+ *
+ * This is the "2-of-2 sovereignty" model: local agent maintains full
+ * control over what the remote model sees.
+ */
+export const REMOTE_INFERENCE_SANITIZE: ContextGateTemplate = {
+  id: "remote-inference-sanitize",
+  name: "Remote Inference Sanitization",
+  description:
+    "Maximum privacy for remote/cloud LLM calls. Strips all identity, " +
+    "financial, location, and personal data before passing queries to " +
+    "external models. Inspired by Vitalik Buterin's 2-of-2 sovereignty model.",
+  use_when:
+    "Your local agent needs to call a remote LLM for tasks beyond local " +
+    "model capability (complex coding, deep research) and you want to " +
+    "minimize data leakage to the remote provider. The remote model gets " +
+    "only the task, query, format requirements, and stripped code context.",
+  rules: [
+    {
+      provider: "inference",
+      allow: [
+        "task",
+        "task_description",
+        "current_query",
+        "query",
+        "prompt",
+        "question",
+        "instruction",
+        "output_format",
+        "format",
+        "language",
+        "code_context",      // Stripped code snippets for coding tasks
+        "error_message",     // For debugging help
+      ],
+      redact: [
+        ...ALWAYS_REDACT_SECRETS,
+        ...PII_PATTERNS,
+        ...INTERNAL_STATE_PATTERNS,
+        ...HISTORY_PATTERNS,
+        "tool_results",
+        "previous_results",
+        // Additional redactions for remote inference
+        "model_data",
+        "agent_state",
+        "runtime_config",
+        "capabilities",
+        "tool_list",
+      ],
+      // Deny patterns — these must NEVER reach the remote model, not even redacted
+      hash: [],
+      summarize: [],
+    },
+  ],
+  default_action: "deny",
+};
+
 // ── Template Registry ───────────────────────────────────────────────────
 
 /** All available templates, keyed by ID */
@@ -307,6 +370,7 @@ export const TEMPLATES: Record<string, ContextGateTemplate> = {
   "inference-standard": INFERENCE_STANDARD,
   "logging-strict": LOGGING_STRICT,
   "tool-api-scoped": TOOL_API_SCOPED,
+  "remote-inference-sanitize": REMOTE_INFERENCE_SANITIZE,
 };
 
 /** List all available template IDs */

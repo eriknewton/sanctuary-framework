@@ -47,13 +47,14 @@ describe("L2 Context Gating Templates", () => {
   // ── Template Registry ─────────────────────────────────────────────
 
   describe("template registry", () => {
-    it("lists all four templates", () => {
+    it("lists all five templates", () => {
       const ids = listTemplateIds();
       expect(ids).toContain("inference-minimal");
       expect(ids).toContain("inference-standard");
       expect(ids).toContain("logging-strict");
       expect(ids).toContain("tool-api-scoped");
-      expect(ids).toHaveLength(4);
+      expect(ids).toContain("remote-inference-sanitize");
+      expect(ids).toHaveLength(5);
     });
 
     it("retrieves templates by ID", () => {

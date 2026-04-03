@@ -701,6 +701,14 @@ export type {
   PolicyRecommendation,
 } from "./l2-operational/context-gate-recommend.js";
 export {
+  InMemoryModelProvenanceStore,
+  MODEL_PRESETS,
+} from "./l2-operational/model-provenance.js";
+export type {
+  ModelProvenance,
+  ModelProvenanceStore,
+} from "./l2-operational/model-provenance.js";
+export {
   evaluateField,
   filterContext,
 } from "./l2-operational/context-gate.js";
