@@ -343,3 +343,85 @@ The modifications to `index.ts`, `loader.ts`, `analyzer.ts`, and `types.ts` are 
 - `index.ts`: Context gate tools are wired through the same gate as all other tools. No bypass path.
 - `analyzer.ts`: Scoring rebalance (L2 now 25 pts max instead of 21) correctly reflects the new capability. GAP-L2-003 is well-defined.
 - `types.ts`: New boolean field, no security impact.
+
+---
+
+## DELTA AUDIT — 2026-04-03 — v0.5.8→v0.5.11
+
+**Delta Scope:** Commit range `6535adc..HEAD` (53 commits, 32 changed source files — ~48% of codebase). Major additions: standalone dashboard, injection detector, context gate enforcer, handshake attestation artifacts, model provenance, decommissioning certificates, gateway adapter, L2 hardening, Verascore reputation_publish, update checker.
+**Auditor Posture:** Same adversarial stance. Assumes attacker has full codebase knowledge.
+**Test Baseline:** 653 tests, 45 test files.
+
+---
+
+### SEC-036 — reputation_publish Signs With Derived Key But Publishes Identity Public Key
+
+**Severity:** High
+**File:** `server/src/l4-reputation/tools.ts:659-679`
+**Description:** The `reputation_publish` tool derives a signing key via `derivePurposeKey(masterKey, "verascore-publish")` (line 665), constructs an Ed25519 private key from those bytes (lines 666-672), and signs the payload. However, it includes `identity.public_key` in the request body (line 687) — this is the agent's identity public key, NOT the public key corresponding to the derived signing key. The Verascore API (or any verifier) cannot verify the signature because the public key doesn't match the private key that produced the signature.
+**Attack Scenario:** An attacker who intercepts or modifies the payload in transit can alter the `data` field, and the Verascore API has no way to detect tampering because the included public key was never the signing key. This creates a false assurance of integrity — the response says `signed_by: identity.did` suggesting cryptographic binding, but the binding is broken. Additionally, on signing failure (line 677-679), the tool falls back to a placeholder all-zeros signature (`toBase64url(new Uint8Array(64))`) and still publishes, silently sending unverified data.
+**Sovereignty Violation:** Contradicts CLAUDE.md §"WHAT THESE TOOLS MUST NEVER DO" #5: "Never silently degrade to a less-secure behavior on error." The placeholder signature is exactly this.
+
+---
+
+### SEC-037 — reputation_publish Allows Outbound HTTP to User-Controlled URL
+
+**Severity:** Medium
+**File:** `server/src/l4-reputation/tools.ts:622, 693`
+**Description:** The `verascore_url` parameter defaults to `"https://verascore.ai"` but accepts any string value (line 622). The tool makes an HTTP POST to `${veracoreUrl}/api/publish` (line 693) with a JSON body containing the agent's public key and signed data. This creates a server-side request forgery (SSRF) surface — a compromised agent or prompt injection can direct the POST to arbitrary internal or external endpoints.
+**Mitigation:** The tool is not listed in any policy tier, so per the SEC-011 fix it defaults to Tier 1 (requires human approval). The human would see `verascore_url` in the approval context. However, the tool description says "Publish sovereignty data to Verascore (verascore.ai)" — a human approving based on the description might not notice a non-default URL in the args summary.
+**Attack Scenario:** Agent sets `verascore_url` to `http://169.254.169.254` (AWS metadata endpoint) or an internal service URL. The POST request reaches the internal endpoint with the agent's public key and payload data. While the response is returned to the agent (not the attacker), the POST itself could trigger side effects on internal services.
+
+---
+
+### SEC-038 — Long-Lived Auth Token Embedded in Dashboard HTML Source
+
+**Severity:** Medium
+**File:** `server/src/principal-policy/dashboard-html.ts:1298`
+**Description:** The long-lived auth token is embedded directly in the dashboard JavaScript as a template literal: `const AUTH_TOKEN = '${options.authToken || ''}'`. This means every authenticated page load includes the full auth token in the HTML source. SEC-012 moved the token out of URL query parameters (preventing log/history leaks), but the token is now in the page source where it is accessible to: (1) any JavaScript running in the page context (browser extensions, XSS), (2) browser developer tools, (3) page cache/history for the HTML body. A user who authenticates via a short-lived session token receives the long-lived auth token in the page, effectively escalating a session to a permanent credential.
+**Mitigation:** Dashboard binds to localhost by default. The HTML is only served to already-authenticated users.
+**Attack Scenario:** A browser extension with page-read permissions reads the dashboard HTML and extracts the auth token. The extension can now approve/deny any Tier 1 operation (state export, identity rotation) via the dashboard API, even after the user closes their browser tab.
+
+---
+
+### SEC-039 — reputation_publish Not Classified in Policy Tiers
+
+**Severity:** Low
+**File:** `server/src/principal-policy/loader.ts`
+**Description:** The `reputation_publish` tool is not explicitly listed in `tier1_always_approve` or `tier3_always_allow`. Per the SEC-011 fix, it correctly defaults to Tier 1 (requires human approval), which is the safe behavior. However, this is accidental safety — the tool was added without a deliberate policy classification decision. The same is true for `dashboard_open`, which is a URL-generation tool that doesn't need Tier 1 gating but currently requires approval.
+**Recommendation:** Add `reputation_publish` to `tier1_always_approve` (explicit) and `dashboard_open` to `tier3_always_allow` (it only generates a URL).
+
+---
+
+### SEC-040 — Injection Detector Safe-Field Bypass for Private Key Paths
+
+**Severity:** Low
+**File:** `server/src/security/injection-detector.ts:437-438`
+**Description:** The `isSafeField()` method skips scanning for fields matching `/\.private_key$/i` and `/^encrypted$/i`. An attacker could embed injection payloads in a field named `private_key` or `encrypted`, and the detector would skip it entirely. While these fields legitimately contain non-instruction data (cryptographic material), they could be used as injection vectors if an attacker crafts a tool call with a `private_key` argument containing prompt injection text. The field name match is broad (regex) and matches any path ending in `private_key`.
+**Mitigation:** Low severity because tool schemas enforce specific fields — an attacker would need a tool that accepts a field named `private_key` as free-text input, which no current tool does.
+
+---
+
+## DELTA SYSTEMIC PATTERNS — 2026-04-03
+
+### Pattern 1: New Outbound Network Surfaces
+
+Two new outbound HTTP surfaces were added in this delta:
+- `update-check.ts`: GET to npm registry (hardcoded URL, capped response, fire-and-forget) — well-contained
+- `reputation_publish`: POST to user-controlled URL with agent identity data — SSRF risk (SEC-037)
+
+The update check is well-designed (hardcoded URL, 3s timeout, 32KB cap, silently fails). The reputation_publish is the opposite — it accepts arbitrary URLs and sends identity data.
+
+### Pattern 2: Prior Fixes Hold
+
+All prior Critical and High fixes verified intact:
+- **SEC-001** (state_delete → Tier 1): `state_delete` remains in `tier1_always_approve`. ✅
+- **SEC-002** (auto_deny always true): `auto_deny` deleted from policy in loader.ts:224. Dashboard timeout always denies (dashboard.ts:278). ✅
+- **SEC-011** (default deny): Unlisted ops default to Tier 1 in gate.ts:149-163. ✅
+- **SEC-012** (token in URL): Sessions replace URL tokens. Long-lived token only via Authorization header. ✅ (partially undermined by SEC-038)
+- **SEC-019** (unimplemented features): config.ts validates and throws on unimplemented values. ✅
+- **SEC-020** (recovery key): index.ts properly requires recovery key for existing installations. ✅
+
+### Pattern 3: Policy Tier Coverage Gap
+
+New tools added without explicit policy classification: `reputation_publish`, `dashboard_open`, `model_provenance_declare` (if ever exposed). These default to Tier 1 per SEC-011, which is safe but not deliberate. Policy tier decisions should be part of the tool registration checklist.
