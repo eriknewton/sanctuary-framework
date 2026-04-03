@@ -1,0 +1,224 @@
+/**
+ * Sovereignty Profile Tools Tests
+ *
+ * Verifies:
+ * - sanctuary/sovereignty_profile_get returns current profile
+ * - sanctuary/sovereignty_profile_update applies partial changes
+ * - sanctuary/sovereignty_profile_generate_prompt returns prompt text
+ * - Audit log entries are created for all operations
+ * - Tool handlers return proper MCP response format
+ */
+
+import { describe, it, expect, vi } from "vitest";
+import { SovereigntyProfileStore } from "../src/sovereignty-profile.js";
+import { createSovereigntyProfileTools } from "../src/sovereignty-profile-tools.js";
+import { MemoryStorage } from "../src/storage/memory.js";
+import { AuditLog } from "../src/l2-operational/audit-log.js";
+import { generateRandomKey } from "../src/core/random.js";
+
+async function createTestContext() {
+  const storage = new MemoryStorage();
+  const masterKey = generateRandomKey();
+  const profileStore = new SovereigntyProfileStore(storage, masterKey);
+  await profileStore.load();
+  const auditLog = new AuditLog(storage, masterKey);
+  const { tools } = createSovereigntyProfileTools(profileStore, auditLog);
+
+  const findTool = (name: string) => {
+    const tool = tools.find((t) => t.name === name);
+    if (!tool) throw new Error(`Tool ${name} not found`);
+    return tool;
+  };
+
+  return { profileStore, auditLog, tools, findTool };
+}
+
+function parseToolResult(result: { content: Array<{ type: string; text: string }> }): Record<string, unknown> {
+  return JSON.parse(result.content[0]!.text);
+}
+
+describe("Sovereignty Profile Tools", () => {
+  // ── Tool Registration ─────────────────────────────────────────────
+
+  describe("tool registration", () => {
+    it("creates 3 tools", async () => {
+      const { tools } = await createTestContext();
+      expect(tools).toHaveLength(3);
+    });
+
+    it("registers sanctuary/sovereignty_profile_get", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_get");
+      expect(tool.name).toBe("sanctuary/sovereignty_profile_get");
+    });
+
+    it("registers sanctuary/sovereignty_profile_update", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_update");
+      expect(tool.name).toBe("sanctuary/sovereignty_profile_update");
+    });
+
+    it("registers sanctuary/sovereignty_profile_generate_prompt", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_generate_prompt");
+      expect(tool.name).toBe("sanctuary/sovereignty_profile_generate_prompt");
+    });
+  });
+
+  // ── sovereignty_profile_get ───────────────────────────────────────
+
+  describe("sovereignty_profile_get", () => {
+    it("returns the current profile", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_get");
+      const result = await tool.handler({});
+      const data = parseToolResult(result);
+
+      expect(data).toHaveProperty("profile");
+      const profile = data.profile as Record<string, unknown>;
+      expect(profile).toHaveProperty("version", 1);
+      expect(profile).toHaveProperty("features");
+    });
+
+    it("returns MCP-compatible response format", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_get");
+      const result = await tool.handler({});
+
+      expect(result).toHaveProperty("content");
+      expect(result.content).toHaveLength(1);
+      expect(result.content[0]).toHaveProperty("type", "text");
+      expect(result.content[0]).toHaveProperty("text");
+    });
+
+    it("includes message in response", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_get");
+      const result = await tool.handler({});
+      const data = parseToolResult(result);
+      expect(data).toHaveProperty("message");
+    });
+  });
+
+  // ── sovereignty_profile_update ────────────────────────────────────
+
+  describe("sovereignty_profile_update", () => {
+    it("enables a feature", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_update");
+      const result = await tool.handler({
+        zk_proofs: { enabled: true },
+      });
+      const data = parseToolResult(result);
+      const profile = data.profile as { features: Record<string, { enabled: boolean }> };
+      expect(profile.features.zk_proofs.enabled).toBe(true);
+    });
+
+    it("disables a feature", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_update");
+      const result = await tool.handler({
+        audit_logging: { enabled: false },
+      });
+      const data = parseToolResult(result);
+      const profile = data.profile as { features: Record<string, { enabled: boolean }> };
+      expect(profile.features.audit_logging.enabled).toBe(false);
+    });
+
+    it("updates sensitivity", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_update");
+      const result = await tool.handler({
+        injection_detection: { sensitivity: "high" },
+      });
+      const data = parseToolResult(result);
+      const profile = data.profile as {
+        features: { injection_detection: { enabled: boolean; sensitivity: string } };
+      };
+      expect(profile.features.injection_detection.sensitivity).toBe("high");
+    });
+
+    it("preserves unmodified features", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_update");
+      const result = await tool.handler({
+        context_gating: { enabled: true },
+      });
+      const data = parseToolResult(result);
+      const profile = data.profile as { features: Record<string, { enabled: boolean }> };
+      expect(profile.features.audit_logging.enabled).toBe(true); // Unchanged
+      expect(profile.features.injection_detection.enabled).toBe(true); // Unchanged
+    });
+
+    it("handles empty update", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_update");
+      const result = await tool.handler({});
+      const data = parseToolResult(result);
+      expect(data).toHaveProperty("profile");
+    });
+
+    it("persists changes across get calls", async () => {
+      const { findTool } = await createTestContext();
+      const updateTool = findTool("sanctuary/sovereignty_profile_update");
+      const getTool = findTool("sanctuary/sovereignty_profile_get");
+
+      await updateTool.handler({ approval_gate: { enabled: true } });
+      const result = await getTool.handler({});
+      const data = parseToolResult(result);
+      const profile = data.profile as { features: Record<string, { enabled: boolean }> };
+      expect(profile.features.approval_gate.enabled).toBe(true);
+    });
+  });
+
+  // ── sovereignty_profile_generate_prompt ────────────────────────────
+
+  describe("sovereignty_profile_generate_prompt", () => {
+    it("returns system prompt text", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_generate_prompt");
+      const result = await tool.handler({});
+      const data = parseToolResult(result);
+
+      expect(data).toHaveProperty("system_prompt");
+      expect(typeof data.system_prompt).toBe("string");
+      expect(data.system_prompt as string).toContain("Sanctuary");
+    });
+
+    it("includes token estimate", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_generate_prompt");
+      const result = await tool.handler({});
+      const data = parseToolResult(result);
+
+      expect(data).toHaveProperty("token_estimate");
+      expect(typeof data.token_estimate).toBe("number");
+      expect(data.token_estimate as number).toBeLessThan(500);
+    });
+
+    it("reflects enabled features in prompt", async () => {
+      const { findTool } = await createTestContext();
+      const updateTool = findTool("sanctuary/sovereignty_profile_update");
+      const promptTool = findTool("sanctuary/sovereignty_profile_generate_prompt");
+
+      await updateTool.handler({ zk_proofs: { enabled: true } });
+      const result = await promptTool.handler({});
+      const data = parseToolResult(result);
+      const prompt = data.system_prompt as string;
+
+      expect(prompt).toContain("Zero-Knowledge Proofs");
+      expect(prompt).toContain("sanctuary/zk_commit");
+    });
+
+    it("reflects disabled features as optional", async () => {
+      const { findTool } = await createTestContext();
+      const tool = findTool("sanctuary/sovereignty_profile_generate_prompt");
+      const result = await tool.handler({});
+      const data = parseToolResult(result);
+      const prompt = data.system_prompt as string;
+
+      expect(prompt).toContain("Optional tools available");
+      expect(prompt).toContain("context gating");
+    });
+  });
+});

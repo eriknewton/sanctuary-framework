@@ -938,6 +938,133 @@ export function generateDashboardHTML(options: {
       background-color: #e03c3c;
     }
 
+    /* Sovereignty Profile Panel */
+    .profile-panel {
+      background-color: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+    }
+
+    .profile-panel .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .profile-panel .panel-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .profile-cards {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .profile-card {
+      background-color: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .profile-card-name {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .profile-card-desc {
+      font-size: 11px;
+      color: var(--text-secondary);
+      line-height: 1.4;
+    }
+
+    .profile-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      width: fit-content;
+    }
+
+    .profile-badge.enabled {
+      background-color: rgba(63, 185, 80, 0.15);
+      color: var(--green);
+    }
+
+    .profile-badge.disabled {
+      background-color: rgba(139, 148, 158, 0.15);
+      color: var(--text-secondary);
+    }
+
+    .prompt-section {
+      margin-top: 12px;
+    }
+
+    .prompt-textarea {
+      width: 100%;
+      min-height: 120px;
+      background-color: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-primary);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      padding: 12px;
+      resize: vertical;
+      margin-top: 8px;
+    }
+
+    .prompt-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .prompt-btn {
+      padding: 6px 12px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background-color: var(--surface);
+      color: var(--text-primary);
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .prompt-btn:hover {
+      background-color: var(--muted);
+    }
+
+    .prompt-btn.primary {
+      background-color: var(--blue);
+      color: var(--bg);
+      border-color: var(--blue);
+    }
+
+    @media (max-width: 900px) {
+      .profile-cards {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (max-width: 500px) {
+      .profile-cards {
+        grid-template-columns: 1fr;
+      }
+    }
+
     /* Threat Panel */
     .threat-panel {
       background-color: var(--surface);
@@ -1276,6 +1403,48 @@ export function generateDashboardHTML(options: {
         </div>
       </div>
 
+      <!-- Sovereignty Profile Panel -->
+      <div class="profile-panel" id="sovereignty-profile-panel">
+        <div class="panel-header">
+          <div class="panel-title">Sovereignty Profile</div>
+          <span class="card-value" id="profile-updated-at" style="font-size: 11px; color: var(--text-secondary);">—</span>
+        </div>
+        <div class="profile-cards" id="profile-cards">
+          <div class="profile-card" data-feature="audit_logging">
+            <div class="profile-card-name">Audit Logging</div>
+            <div class="profile-badge disabled" id="badge-audit_logging">OFF</div>
+            <div class="profile-card-desc">Encrypted audit trail of all tool calls</div>
+          </div>
+          <div class="profile-card" data-feature="injection_detection">
+            <div class="profile-card-name">Injection Detection</div>
+            <div class="profile-badge disabled" id="badge-injection_detection">OFF</div>
+            <div class="profile-card-desc">Scans tool arguments for prompt injection</div>
+          </div>
+          <div class="profile-card" data-feature="context_gating">
+            <div class="profile-card-name">Context Gating</div>
+            <div class="profile-badge disabled" id="badge-context_gating">OFF</div>
+            <div class="profile-card-desc">Controls context flow to remote providers</div>
+          </div>
+          <div class="profile-card" data-feature="approval_gate">
+            <div class="profile-card-name">Approval Gates</div>
+            <div class="profile-badge disabled" id="badge-approval_gate">OFF</div>
+            <div class="profile-card-desc">Human approval for high-risk operations</div>
+          </div>
+          <div class="profile-card" data-feature="zk_proofs">
+            <div class="profile-card-name">ZK Proofs</div>
+            <div class="profile-badge disabled" id="badge-zk_proofs">OFF</div>
+            <div class="profile-card-desc">Prove claims without revealing data</div>
+          </div>
+        </div>
+        <div class="prompt-section">
+          <div class="prompt-actions">
+            <button class="prompt-btn primary" id="generate-prompt-btn">Generate System Prompt</button>
+            <button class="prompt-btn" id="copy-prompt-btn" style="display:none;">Copy</button>
+          </div>
+          <textarea class="prompt-textarea" id="system-prompt-output" readonly style="display:none;" placeholder="Click 'Generate System Prompt' to create an agent instruction snippet..."></textarea>
+        </div>
+      </div>
+
       <!-- Threat Panel -->
       <div class="threat-panel collapsed">
         <div class="threat-header">
@@ -1310,6 +1479,7 @@ export function generateDashboardHTML(options: {
       handshakes: [],
       shr: null,
       status: null,
+      systemPrompt: null,
     };
 
     let pendingRequests = new Map();
@@ -1762,6 +1932,10 @@ export function generateDashboardHTML(options: {
         removePendingRequest(data.requestId);
       });
 
+      eventSource.addEventListener('sovereignty-profile-update', () => {
+        updateSovereigntyProfile();
+      });
+
       eventSource.onerror = () => {
         console.error('SSE error');
         setTimeout(setupSSE, 5000);
@@ -1918,6 +2092,58 @@ export function generateDashboardHTML(options: {
       document.getElementById('pending-overlay').classList.toggle('show');
     });
 
+    // Sovereignty Profile
+    async function updateSovereigntyProfile() {
+      try {
+        const data = await fetchAPI('/api/sovereignty-profile');
+        if (data && data.profile) {
+          const features = data.profile.features;
+          for (const [key, value] of Object.entries(features)) {
+            const badge = document.getElementById('badge-' + key);
+            if (badge) {
+              const enabled = value && value.enabled;
+              badge.textContent = enabled ? 'ON' : 'OFF';
+              badge.className = 'profile-badge ' + (enabled ? 'enabled' : 'disabled');
+            }
+          }
+          const updatedEl = document.getElementById('profile-updated-at');
+          if (updatedEl && data.profile.updated_at) {
+            updatedEl.textContent = 'Updated: ' + new Date(data.profile.updated_at).toLocaleString();
+          }
+          // Cache the prompt
+          if (data.system_prompt) {
+            apiState.systemPrompt = data.system_prompt;
+          }
+        }
+      } catch (e) {
+        // Profile not available
+      }
+    }
+
+    document.getElementById('generate-prompt-btn').addEventListener('click', async () => {
+      const data = await fetchAPI('/api/sovereignty-profile');
+      if (data && data.system_prompt) {
+        const textarea = document.getElementById('system-prompt-output');
+        const copyBtn = document.getElementById('copy-prompt-btn');
+        textarea.value = data.system_prompt;
+        textarea.style.display = 'block';
+        copyBtn.style.display = 'inline-flex';
+      }
+    });
+
+    document.getElementById('copy-prompt-btn').addEventListener('click', async () => {
+      const textarea = document.getElementById('system-prompt-output');
+      try {
+        await navigator.clipboard.writeText(textarea.value);
+        const btn = document.getElementById('copy-prompt-btn');
+        const original = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = original; }, 2000);
+      } catch (err) {
+        console.error('Copy failed:', err);
+      }
+    });
+
     // Initialize
     async function initialize() {
       if (!AUTH_TOKEN) {
@@ -1932,6 +2158,7 @@ export function generateDashboardHTML(options: {
         updateHandshakes(),
         updateSHR(),
         updateStatus(),
+        updateSovereigntyProfile(),
       ]);
 
       // Setup SSE for real-time updates

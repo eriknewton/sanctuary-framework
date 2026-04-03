@@ -30,6 +30,8 @@ import { createBridgeTools } from "./bridge/tools.js";
 import { createAuditTools } from "./audit/tools.js";
 import { createContextGateTools } from "./l2-operational/context-gate-tools.js";
 import { createL2HardeningTools } from "./l2-operational/hardening-tools.js";
+import { SovereigntyProfileStore } from "./sovereignty-profile.js";
+import { createSovereigntyProfileTools } from "./sovereignty-profile-tools.js";
 import { InjectionDetector } from "./security/injection-detector.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
@@ -510,6 +512,11 @@ export async function createSanctuaryServer(options?: {
   // 14f. Create L2 Process Hardening tools
   const hardeningTools = createL2HardeningTools(config.storage_path, auditLog);
 
+  // 14g. Initialize Sovereignty Profile store and create tools
+  const profileStore = new SovereigntyProfileStore(storage, masterKey);
+  await profileStore.load();
+  const { tools: profileTools } = createSovereigntyProfileTools(profileStore, auditLog);
+
   // 15. Load Principal Policy and create approval gate
   const policy = await loadPrincipalPolicy(config.storage_path);
   const baseline = new BaselineTracker(storage, masterKey);
@@ -544,6 +551,7 @@ export async function createSanctuaryServer(options?: {
       handshakeResults,
       shrOpts: { config, identityManager, masterKey },
       sanctuaryConfig: config,
+      profileStore,
     });
     await dashboard.start();
     approvalChannel = dashboard;
@@ -635,6 +643,7 @@ export async function createSanctuaryServer(options?: {
     ...auditTools,
     ...contextGateTools,
     ...hardeningTools,
+    ...profileTools,
     ...dashboardTools,
     manifestTool,
   ];
@@ -750,6 +759,9 @@ export type {
 } from "./security/injection-detector.js";
 export { ContextGateEnforcer } from "./l2-operational/context-gate-enforcer.js";
 export type { EnforcerConfig } from "./l2-operational/context-gate-enforcer.js";
+export { SovereigntyProfileStore, createDefaultProfile } from "./sovereignty-profile.js";
+export type { SovereigntyProfile, SovereigntyProfileUpdate } from "./sovereignty-profile.js";
+export { generateSystemPrompt } from "./system-prompt-generator.js";
 export { MemoryStorage } from "./storage/memory.js";
 export { FilesystemStorage } from "./storage/filesystem.js";
 export { ApprovalGate } from "./principal-policy/gate.js";

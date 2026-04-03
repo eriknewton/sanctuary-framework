@@ -36,6 +36,8 @@ import type { HandshakeResult } from "../handshake/types.js";
 // SignedSHR type available via shr/types if needed in future
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
 import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
+import type { SovereigntyProfileStore, SovereigntyProfileUpdate } from "../sovereignty-profile.js";
+import { generateSystemPrompt } from "../system-prompt-generator.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -107,6 +109,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private handshakeResults: Map<string, HandshakeResult> | null = null;
   private shrOpts: SHRGeneratorOptions | null = null;
   private _sanctuaryConfig: SanctuaryConfig | null = null;
+  private profileStore: SovereigntyProfileStore | null = null;
   private dashboardHTML: string;
   private loginHTML: string;
   private authToken: string | undefined;
@@ -150,6 +153,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     handshakeResults?: Map<string, HandshakeResult>;
     shrOpts?: SHRGeneratorOptions;
     sanctuaryConfig?: SanctuaryConfig;
+    profileStore?: SovereigntyProfileStore;
   }): void {
     this.policy = deps.policy;
     this.baseline = deps.baseline;
@@ -158,6 +162,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
     if (deps.shrOpts) this.shrOpts = deps.shrOpts;
     if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
+    if (deps.profileStore) this.profileStore = deps.profileStore;
   }
 
   /**
@@ -593,6 +598,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         this.handleHandshakes(res);
       } else if (method === "GET" && url.pathname === "/api/shr") {
         this.handleSHR(res);
+      } else if (method === "GET" && url.pathname === "/api/sovereignty-profile") {
+        this.handleSovereigntyProfileGet(res);
+      } else if (method === "POST" && url.pathname === "/api/sovereignty-profile") {
+        this.handleSovereigntyProfileUpdate(req, res);
       } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
         // Decision endpoints get an additional tighter rate limit
         if (!this.checkRateLimit(req, res, "decisions")) return;
@@ -941,6 +950,71 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(shr));
+  }
+
+  // ── Sovereignty Profile API ─────────────────────────────────────────
+
+  private handleSovereigntyProfileGet(res: ServerResponse): void {
+    if (!this.profileStore) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Sovereignty Profile not available" }));
+      return;
+    }
+
+    try {
+      const profile = this.profileStore.get();
+      const prompt = generateSystemPrompt(profile);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ profile, system_prompt: prompt }));
+    } catch {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Failed to read sovereignty profile" }));
+    }
+  }
+
+  private handleSovereigntyProfileUpdate(req: IncomingMessage, res: ServerResponse): void {
+    if (!this.profileStore) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Sovereignty Profile not available" }));
+      return;
+    }
+
+    let body = "";
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+      // Size limit: 16KB for profile updates
+      if (body.length > 16384) {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request body too large" }));
+        req.destroy();
+      }
+    });
+    req.on("end", async () => {
+      try {
+        const updates: SovereigntyProfileUpdate = JSON.parse(body);
+        const updated = await this.profileStore!.update(updates);
+        const prompt = generateSystemPrompt(updated);
+
+        // Audit log the dashboard-initiated change
+        if (this.auditLog) {
+          this.auditLog.append("l2", "sovereignty_profile_update_dashboard", "dashboard", {
+            changes: updates,
+            features_enabled: Object.entries(updated.features)
+              .filter(([, v]) => v.enabled)
+              .map(([k]) => k),
+          });
+        }
+
+        // Broadcast to SSE clients
+        this.broadcastSSE("sovereignty-profile-update", { profile: updated, system_prompt: prompt });
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ profile: updated, system_prompt: prompt }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON body" }));
+      }
+    });
   }
 
   // ── SSE Broadcasting ────────────────────────────────────────────────

@@ -33,6 +33,7 @@ import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
 import { IdentityManager } from "./l1-cognitive/tools.js";
 import type { HandshakeResult } from "./handshake/types.js";
+import { SovereigntyProfileStore } from "./sovereignty-profile.js";
 
 export interface StandaloneDashboardOptions {
   passphrase?: string;
@@ -202,6 +203,10 @@ export async function startStandaloneDashboard(
   // and cannot be recovered in standalone mode.
   const handshakeResults = new Map<string, HandshakeResult>();
 
+  // 11b. Initialize Sovereignty Profile store
+  const profileStore = new SovereigntyProfileStore(storage, masterKey);
+  await profileStore.load();
+
   dashboard.setDependencies({
     policy,
     baseline,
@@ -210,6 +215,7 @@ export async function startStandaloneDashboard(
     handshakeResults,
     shrOpts,
     sanctuaryConfig: config,
+    profileStore,
   });
   dashboard.setStandaloneMode(true);
   await dashboard.start();
