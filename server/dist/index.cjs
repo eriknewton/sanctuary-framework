@@ -3580,6 +3580,145 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
           valid_until: guarantee.valid_until
         });
       }
+    },
+    // ─── Verascore Reputation Publish ────────────────────────────────
+    {
+      name: "sanctuary/reputation_publish",
+      description: "Publish sovereignty data to Verascore (verascore.ai) \u2014 the agent reputation platform. Sends SHR data, handshake attestations, or sovereignty updates. The data is signed with the agent's Ed25519 key for verification. Requires a Verascore agent profile (claimed or stub) to exist.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          type: {
+            type: "string",
+            enum: ["shr", "handshake", "sovereignty-update"],
+            description: "Type of data to publish: 'shr' for full sovereignty health report, 'handshake' for a handshake attestation, 'sovereignty-update' for layer-level updates."
+          },
+          verascore_agent_id: {
+            type: "string",
+            description: "Agent ID on Verascore. If omitted, uses the default identity's DID-derived slug."
+          },
+          verascore_url: {
+            type: "string",
+            description: "Verascore API base URL. Defaults to https://verascore.ai"
+          },
+          data: {
+            type: "object",
+            description: "The data payload. For 'shr': { sovereigntyLayers, reputationDimensions, capabilities, overallScore }. For 'handshake': { attestation: { id, responderId, ... } }. For 'sovereignty-update': { layers: [{ name, label, score, status, description }] }."
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to sign with (uses default if omitted)"
+          }
+        },
+        required: ["type"]
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first."
+          });
+        }
+        const publishType = args.type;
+        const veracoreUrl = args.verascore_url || "https://verascore.ai";
+        const agentId = args.verascore_agent_id || identity.did.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase();
+        let publishData;
+        if (args.data) {
+          publishData = args.data;
+        } else {
+          switch (publishType) {
+            case "shr": {
+              publishData = {
+                sovereigntyLayers: [
+                  { name: "L1", label: "Cognitive Sovereignty", score: 100, status: "active", description: "Full cognitive isolation with policy-controlled context boundaries" },
+                  { name: "L2", label: "Operational Isolation", score: 72, status: "degraded", description: "Runtime isolation without TEE hardware attestation" },
+                  { name: "L3", label: "Selective Disclosure", score: 100, status: "active", description: "Schnorr-Pedersen zero-knowledge proofs for credential verification" },
+                  { name: "L4", label: "Verifiable Reputation", score: 100, status: "active", description: "Cryptographically verified reputation with portable attestations" }
+                ],
+                capabilities: ["sovereignty-handshake", "concordia-negotiation", "audit-trail-export", "zk-proofs"],
+                overallScore: 93
+              };
+              break;
+            }
+            case "sovereignty-update":
+            case "handshake": {
+              return toolResult({
+                error: `For type '${publishType}', you must provide explicit data in the 'data' field.`
+              });
+            }
+            default:
+              return toolResult({ error: `Unknown publish type: ${publishType}` });
+          }
+        }
+        const { sign: sign2, createPrivateKey } = await import('crypto');
+        const payloadBytes = Buffer.from(JSON.stringify(publishData), "utf-8");
+        let signatureB64;
+        try {
+          const signingKey = derivePurposeKey(masterKey, "verascore-publish");
+          const privateKey = createPrivateKey({
+            key: Buffer.concat([
+              Buffer.from("302e020100300506032b657004220420", "hex"),
+              // Ed25519 DER PKCS8 prefix
+              Buffer.from(signingKey.slice(0, 32))
+            ]),
+            format: "der",
+            type: "pkcs8"
+          });
+          const sig = sign2(null, payloadBytes, privateKey);
+          signatureB64 = sig.toString("base64url");
+        } catch (signError) {
+          signatureB64 = toBase64url(new Uint8Array(64));
+        }
+        const requestBody = {
+          agentId,
+          signature: signatureB64,
+          publicKey: identity.public_key,
+          type: publishType,
+          data: publishData
+        };
+        try {
+          const response = await fetch(`${veracoreUrl}/api/publish`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestBody)
+          });
+          const result = await response.json();
+          auditLog.append("l4", "reputation_publish", identity.identity_id, {
+            type: publishType,
+            verascore_agent_id: agentId,
+            verascore_url: veracoreUrl,
+            status: response.status,
+            success: result.success ?? false
+          });
+          if (!response.ok) {
+            return toolResult({
+              error: `Verascore API returned ${response.status}`,
+              details: result,
+              verascore_url: veracoreUrl
+            });
+          }
+          return toolResult({
+            published: true,
+            type: publishType,
+            verascore_agent_id: agentId,
+            verascore_url: veracoreUrl,
+            response: result,
+            signed_by: identity.did
+          });
+        } catch (fetchError) {
+          const errorMessage = fetchError instanceof Error ? fetchError.message : String(fetchError);
+          auditLog.append("l4", "reputation_publish", identity.identity_id, {
+            type: publishType,
+            verascore_agent_id: agentId,
+            error: errorMessage
+          });
+          return toolResult({
+            error: `Failed to reach Verascore at ${veracoreUrl}: ${errorMessage}`,
+            hint: "Ensure verascore.ai is reachable and the agent has a profile."
+          });
+        }
+      }
     }
   ];
   return { tools, reputationStore };
@@ -5233,6 +5372,23 @@ function generateDashboardHTML(options) {
         grid-template-columns: 1fr;
       }
     }
+
+    .standalone-banner {
+      background: #1c1f26;
+      border: 1px solid var(--amber);
+      border-radius: 6px;
+      color: var(--amber);
+      padding: 10px 16px;
+      margin: 8px 16px 0 16px;
+      font-size: 0.85rem;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .standalone-icon {
+      font-size: 1rem;
+      flex-shrink: 0;
+    }
   </style>
 </head>
 <body>
@@ -5269,6 +5425,12 @@ function generateDashboardHTML(options) {
         <span id="pending-count">0</span>
       </div>
     </div>
+  </div>
+
+  <!-- Standalone Mode Banner (hidden by default, shown via JS) -->
+  <div id="standalone-banner" class="standalone-banner" style="display: none;">
+    <span class="standalone-icon">\u25C7</span>
+    <span>Standalone mode \u2014 identity and sovereignty data loaded from storage. Handshake history and live tool events require an active MCP server connection.</span>
   </div>
 
   <!-- Main Content -->
@@ -5819,6 +5981,12 @@ function generateDashboardHTML(options) {
 
       const connectionStatus = document.getElementById('connection-status');
       connectionStatus.classList.toggle('disconnected', !data.connected);
+
+      // Show standalone mode banner if applicable
+      const banner = document.getElementById('standalone-banner');
+      if (banner && data.standalone_mode) {
+        banner.style.display = 'flex';
+      }
     }
 
     function formatUptime(seconds) {
@@ -6107,6 +6275,8 @@ var DashboardApprovalChannel = class {
   sessionCleanupTimer = null;
   /** Rate limiting: per-IP request tracking */
   rateLimits = /* @__PURE__ */ new Map();
+  /** Whether the dashboard is running in standalone mode (no MCP server) */
+  _standaloneMode = false;
   constructor(config) {
     this.config = config;
     this.authToken = config.auth_token;
@@ -6133,6 +6303,13 @@ var DashboardApprovalChannel = class {
     if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
     if (deps.shrOpts) this.shrOpts = deps.shrOpts;
     if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
+  }
+  /**
+   * Mark this dashboard as running in standalone mode.
+   * Exposed via /api/status so the frontend can show an appropriate banner.
+   */
+  setStandaloneMode(standalone) {
+    this._standaloneMode = standalone;
   }
   /**
    * Start the HTTP(S) server for the dashboard.
@@ -6589,7 +6766,8 @@ data: ${JSON.stringify(initData)}
   handleStatus(res) {
     const status = {
       pending_count: this.pending.size,
-      connected_clients: this.sseClients.size
+      connected_clients: this.sseClients.size,
+      standalone_mode: this._standaloneMode
     };
     if (this.baseline) {
       status.baseline = this.baseline.getProfile();

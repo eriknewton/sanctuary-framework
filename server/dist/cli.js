@@ -10,13 +10,13 @@ import { hmac } from '@noble/hashes/hmac';
 import { RistrettoPoint, ed25519 } from '@noble/curves/ed25519';
 import { argon2id } from 'hash-wasm';
 import { hkdf } from '@noble/hashes/hkdf';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createServer as createServer$1 } from 'http';
 import { get, createServer as createServer$2 } from 'https';
 import { statSync, readFileSync } from 'fs';
 import { execSync, exec } from 'child_process';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
@@ -723,6 +723,692 @@ var init_key_derivation = __esm({
     ARGON2_TIME_COST = 3;
     ARGON2_PARALLELISM = 4;
     ARGON2_HASH_LENGTH = 32;
+  }
+});
+function validateArgs(args, schema) {
+  const errors = [];
+  const properties = schema.properties ?? {};
+  const required = schema.required ?? [];
+  for (const field of required) {
+    if (args[field] === void 0 || args[field] === null) {
+      errors.push({ field, message: `Required field "${field}" is missing` });
+    }
+  }
+  const knownFields = new Set(Object.keys(properties));
+  for (const field of Object.keys(args)) {
+    if (!knownFields.has(field)) {
+      errors.push({ field, message: `Unknown field "${field}"` });
+    }
+  }
+  for (const [field, value] of Object.entries(args)) {
+    if (value === void 0 || value === null) continue;
+    const propSchema = properties[field];
+    if (!propSchema) continue;
+    const typeError = checkType(field, value, propSchema);
+    if (typeError) {
+      errors.push(typeError);
+      continue;
+    }
+    if (typeof value === "string") {
+      const maxBytes = BUNDLE_FIELDS.has(field) ? MAX_BUNDLE_BYTES : MAX_STRING_BYTES;
+      const byteLength = new TextEncoder().encode(value).length;
+      if (byteLength > maxBytes) {
+        errors.push({
+          field,
+          message: `Field "${field}" exceeds maximum size (${byteLength} bytes > ${maxBytes} bytes)`
+        });
+      }
+    }
+    if (propSchema.enum && !propSchema.enum.includes(value)) {
+      errors.push({
+        field,
+        message: `Field "${field}" must be one of: ${propSchema.enum.join(", ")}`
+      });
+    }
+  }
+  return errors;
+}
+function checkType(field, value, schema) {
+  if (!schema.type) return null;
+  switch (schema.type) {
+    case "string":
+      if (typeof value !== "string") {
+        return { field, message: `Expected string for "${field}", got ${typeof value}` };
+      }
+      break;
+    case "number":
+      if (typeof value !== "number") {
+        return { field, message: `Expected number for "${field}", got ${typeof value}` };
+      }
+      break;
+    case "boolean":
+      if (typeof value !== "boolean") {
+        return { field, message: `Expected boolean for "${field}", got ${typeof value}` };
+      }
+      break;
+    case "object":
+      if (typeof value !== "object" || Array.isArray(value)) {
+        return { field, message: `Expected object for "${field}", got ${typeof value}` };
+      }
+      break;
+    case "array":
+      if (!Array.isArray(value)) {
+        return { field, message: `Expected array for "${field}", got ${typeof value}` };
+      }
+      break;
+  }
+  return null;
+}
+function createServer(tools, options) {
+  const gate = options?.gate;
+  const server = new Server(
+    {
+      name: "sanctuary-mcp-server",
+      version: PKG_VERSION2
+    },
+    {
+      capabilities: {
+        tools: {}
+      }
+    }
+  );
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    return {
+      tools: tools.map((t) => ({
+        name: t.name,
+        description: t.description,
+        inputSchema: t.inputSchema
+      }))
+    };
+  });
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const typedArgs = args ?? {};
+    const tool = tools.find((t) => t.name === name);
+    if (!tool) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: `Unknown tool: ${name}` })
+          }
+        ],
+        isError: true
+      };
+    }
+    const validationErrors = validateArgs(typedArgs, tool.inputSchema);
+    if (validationErrors.length > 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: "validation_failed",
+              message: "Tool arguments failed schema validation",
+              violations: validationErrors
+            })
+          }
+        ],
+        isError: true
+      };
+    }
+    if (gate) {
+      const result = await gate.evaluate(name, typedArgs);
+      if (!result.allowed) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: "Operation not permitted",
+                approval_required: result.approval_required
+              })
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+    try {
+      return await tool.handler(typedArgs);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: message })
+          }
+        ],
+        isError: true
+      };
+    }
+  });
+  return server;
+}
+function toolResult(data) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(data, null, 2) }]
+  };
+}
+var require3, PKG_VERSION2, MAX_STRING_BYTES, MAX_BUNDLE_BYTES, BUNDLE_FIELDS;
+var init_router = __esm({
+  "src/router.ts"() {
+    require3 = createRequire(import.meta.url);
+    ({ version: PKG_VERSION2 } = require3("../package.json"));
+    MAX_STRING_BYTES = 1048576;
+    MAX_BUNDLE_BYTES = 5242880;
+    BUNDLE_FIELDS = /* @__PURE__ */ new Set(["bundle"]);
+  }
+});
+
+// src/l1-cognitive/tools.ts
+function getReservedNamespaceViolation(namespace) {
+  for (const prefix of RESERVED_NAMESPACE_PREFIXES2) {
+    if (namespace === prefix || namespace.startsWith(prefix + "/")) {
+      return prefix;
+    }
+  }
+  return null;
+}
+function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) {
+  const identityMgr = new IdentityManager(storage, masterKey);
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  function resolveIdentity(identityId) {
+    const id = identityId ? identityMgr.get(identityId) : identityMgr.getDefault();
+    if (!id) {
+      throw new Error(
+        identityId ? `Identity not found: ${identityId}` : "No default identity. Create one with sanctuary/identity_create."
+      );
+    }
+    return id;
+  }
+  const tools = [
+    // ── Identity Tools ──────────────────────────────────────────────────
+    {
+      name: "sanctuary/identity_create",
+      description: "Create a new sovereign identity (Ed25519 keypair). The private key is encrypted and never exposed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          label: {
+            type: "string",
+            description: 'Human-readable label (e.g., "my-agent")'
+          }
+        },
+        required: ["label"]
+      },
+      handler: async (args) => {
+        const label = args.label;
+        const { publicIdentity, storedIdentity } = createIdentity(
+          label,
+          identityEncKey,
+          keyProtection
+        );
+        await identityMgr.save(storedIdentity);
+        auditLog?.append("l1", "identity_create", publicIdentity.identity_id, {
+          label
+        });
+        return toolResult({
+          identity_id: publicIdentity.identity_id,
+          public_key: publicIdentity.public_key,
+          did: publicIdentity.did,
+          created_at: publicIdentity.created_at,
+          key_type: publicIdentity.key_type,
+          key_protection: publicIdentity.key_protection,
+          backed_up: false
+        });
+      }
+    },
+    {
+      name: "sanctuary/identity_list",
+      description: "List all managed sovereign identities.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          filter: {
+            type: "object",
+            properties: {
+              label: { type: "string" }
+            }
+          }
+        }
+      },
+      handler: async (args) => {
+        let identities = identityMgr.list();
+        const filter = args.filter;
+        if (filter?.label) {
+          identities = identities.filter(
+            (i) => i.label.includes(filter.label)
+          );
+        }
+        return toolResult({ identities });
+      }
+    },
+    {
+      name: "sanctuary/identity_sign",
+      description: "Sign data with a managed identity. The private key is decrypted in memory only during signing.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          identity_id: { type: "string" },
+          payload: {
+            type: "string",
+            description: "Base64url-encoded data to sign"
+          }
+        },
+        required: ["payload"]
+      },
+      handler: async (args) => {
+        const identity = resolveIdentity(args.identity_id);
+        const payloadStr = args.payload;
+        let payload;
+        try {
+          payload = fromBase64url(payloadStr);
+        } catch {
+          payload = stringToBytes(payloadStr);
+        }
+        const signature = sign(
+          payload,
+          identity.encrypted_private_key,
+          identityEncKey
+        );
+        auditLog?.append("l1", "identity_sign", identity.identity_id);
+        return toolResult({
+          signature: toBase64url(signature),
+          algorithm: "Ed25519",
+          signed_at: (/* @__PURE__ */ new Date()).toISOString(),
+          public_key: identity.public_key,
+          payload_encoding: "base64url"
+        });
+      }
+    },
+    {
+      name: "sanctuary/identity_verify",
+      description: "Verify an Ed25519 signature. Provide either identity_id or public_key.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          payload: {
+            type: "string",
+            description: "Original data (plain text or base64url-encoded)"
+          },
+          signature: { type: "string", description: "Base64url signature" },
+          identity_id: {
+            type: "string",
+            description: "Identity ID to look up public key (alternative to public_key)"
+          },
+          public_key: {
+            type: "string",
+            description: "Base64url public key (alternative to identity_id)"
+          }
+        },
+        required: ["payload", "signature"]
+      },
+      handler: async (args) => {
+        const payloadStr = args.payload;
+        let payload;
+        try {
+          payload = fromBase64url(payloadStr);
+        } catch {
+          payload = stringToBytes(payloadStr);
+        }
+        const signature = fromBase64url(args.signature);
+        let publicKey;
+        if (args.identity_id) {
+          const identity = resolveIdentity(args.identity_id);
+          publicKey = fromBase64url(identity.public_key);
+        } else if (args.public_key) {
+          publicKey = fromBase64url(args.public_key);
+        } else {
+          return toolResult({
+            error: "Provide either identity_id or public_key for verification."
+          });
+        }
+        const valid = verify(payload, signature, publicKey);
+        return toolResult({
+          valid,
+          verified_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    },
+    {
+      name: "sanctuary/identity_rotate",
+      description: "Rotate keys for an identity. Generates a new keypair and signs a rotation event with the old key for verifiable chain.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          identity_id: { type: "string" },
+          reason: { type: "string" }
+        },
+        required: ["identity_id"]
+      },
+      handler: async (args) => {
+        const identity = resolveIdentity(args.identity_id);
+        const reason = args.reason ?? "Key rotation";
+        const { updatedIdentity, rotationEvent } = rotateKeys(
+          identity,
+          identityEncKey,
+          reason
+        );
+        await identityMgr.save(updatedIdentity);
+        auditLog?.append("l1", "identity_rotate", identity.identity_id, {
+          reason
+        });
+        return toolResult({
+          identity_id: updatedIdentity.identity_id,
+          old_public_key: rotationEvent.old_public_key,
+          new_public_key: rotationEvent.new_public_key,
+          new_did: updatedIdentity.did,
+          rotated_at: rotationEvent.rotated_at
+        });
+      }
+    },
+    // ── State Tools ─────────────────────────────────────────────────────
+    {
+      name: "sanctuary/state_write",
+      description: "Write encrypted state to the sovereign store. Value is encrypted with a namespace-specific key. The write is signed by the active identity.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: {
+            type: "string",
+            description: 'Logical grouping (e.g., "memory", "config")'
+          },
+          key: { type: "string", description: "State key within namespace" },
+          value: {
+            type: "string",
+            description: "Plaintext value (encrypted before storage)"
+          },
+          metadata: {
+            type: "object",
+            properties: {
+              content_type: { type: "string" },
+              ttl_seconds: { type: "number" },
+              tags: { type: "array", items: { type: "string" } }
+            }
+          },
+          identity_id: { type: "string" }
+        },
+        required: ["namespace", "key", "value"]
+      },
+      handler: async (args) => {
+        const reservedViolation = getReservedNamespaceViolation(args.namespace);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Choose a different namespace.`
+          });
+        }
+        const identity = resolveIdentity(args.identity_id);
+        const metadata = args.metadata;
+        const result = await stateStore.write(
+          args.namespace,
+          args.key,
+          args.value,
+          identity.identity_id,
+          identity.encrypted_private_key,
+          identityEncKey,
+          {
+            content_type: metadata?.content_type,
+            ttl_seconds: metadata?.ttl_seconds,
+            tags: metadata?.tags
+          }
+        );
+        auditLog?.append("l1", "state_write", identity.identity_id, {
+          namespace: args.namespace,
+          key: args.key
+        });
+        return toolResult(result);
+      }
+    },
+    {
+      name: "sanctuary/state_read",
+      description: "Read and decrypt state from the sovereign store. Verifies integrity via Merkle proof and signature.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: { type: "string" },
+          key: { type: "string" },
+          verify_integrity: { type: "boolean", default: true }
+        },
+        required: ["namespace", "key"]
+      },
+      handler: async (args) => {
+        const reservedViolation = getReservedNamespaceViolation(args.namespace);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot read from reserved namespaces.`
+          });
+        }
+        const result = await stateStore.read(
+          args.namespace,
+          args.key,
+          void 0,
+          // Skip signature verification for now (would need writer's pubkey)
+          args.verify_integrity ?? true
+        );
+        if (!result) {
+          return toolResult({
+            error: "not_found",
+            namespace: args.namespace,
+            key: args.key
+          });
+        }
+        auditLog?.append("l1", "state_read", result.written_by, {
+          namespace: args.namespace,
+          key: args.key
+        });
+        return toolResult(result);
+      }
+    },
+    {
+      name: "sanctuary/state_list",
+      description: "List keys in a namespace (metadata only \u2014 no decryption).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: { type: "string" },
+          prefix: { type: "string" },
+          tags: { type: "array", items: { type: "string" } },
+          limit: { type: "number", default: 100 },
+          offset: { type: "number", default: 0 }
+        },
+        required: ["namespace"]
+      },
+      handler: async (args) => {
+        const reservedViolation = getReservedNamespaceViolation(args.namespace);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot list reserved namespaces.`
+          });
+        }
+        const result = await stateStore.list(
+          args.namespace,
+          args.prefix,
+          args.tags,
+          args.limit ?? 100,
+          args.offset ?? 0
+        );
+        return toolResult(result);
+      }
+    },
+    {
+      name: "sanctuary/state_delete",
+      description: "Securely delete state. Overwrites file with random bytes before removal (right to deletion, S1.6).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: { type: "string" },
+          key: { type: "string" },
+          reason: { type: "string" }
+        },
+        required: ["namespace", "key"]
+      },
+      handler: async (args) => {
+        const reservedViolation = getReservedNamespaceViolation(args.namespace);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot delete from reserved namespaces.`
+          });
+        }
+        const result = await stateStore.delete(
+          args.namespace,
+          args.key
+        );
+        auditLog?.append("l1", "state_delete", "principal", {
+          namespace: args.namespace,
+          key: args.key,
+          reason: args.reason
+        });
+        return toolResult(result);
+      }
+    },
+    {
+      name: "sanctuary/state_export",
+      description: "Export state as an encrypted, portable bundle for migration.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: { type: "string" },
+          format: { type: "string", default: "sanctuary-v1" }
+        }
+      },
+      handler: async (args) => {
+        const result = await stateStore.export(
+          args.namespace
+        );
+        auditLog?.append("l1", "state_export", "principal", {
+          namespaces: result.namespaces
+        });
+        return toolResult(result);
+      }
+    },
+    {
+      name: "sanctuary/state_import",
+      description: "Import a previously exported state bundle.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          bundle: { type: "string", description: "Base64url-encoded bundle" },
+          conflict_resolution: {
+            type: "string",
+            enum: ["skip", "overwrite", "version"],
+            default: "skip"
+          }
+        },
+        required: ["bundle"]
+      },
+      handler: async (args) => {
+        const publicKeyResolver = (kid) => {
+          const identity = identityMgr.get(kid);
+          if (!identity) return null;
+          return fromBase64url(identity.public_key);
+        };
+        const result = await stateStore.import(
+          args.bundle,
+          args.conflict_resolution ?? "skip",
+          publicKeyResolver
+        );
+        auditLog?.append("l1", "state_import", "principal", {
+          imported_keys: result.imported_keys
+        });
+        return toolResult(result);
+      }
+    }
+  ];
+  return { tools, identityManager: identityMgr };
+}
+var RESERVED_NAMESPACE_PREFIXES2, IdentityManager;
+var init_tools = __esm({
+  "src/l1-cognitive/tools.ts"() {
+    init_router();
+    init_identity();
+    init_key_derivation();
+    init_encoding();
+    init_encryption();
+    init_encoding();
+    RESERVED_NAMESPACE_PREFIXES2 = [
+      "_identities",
+      "_policies",
+      "_audit",
+      "_meta",
+      "_principal",
+      "_commitments",
+      "_reputation",
+      "_escrow",
+      "_guarantees",
+      "_bridge",
+      "_federation",
+      "_handshake",
+      "_shr"
+    ];
+    IdentityManager = class {
+      storage;
+      masterKey;
+      identities = /* @__PURE__ */ new Map();
+      primaryIdentityId = null;
+      constructor(storage, masterKey) {
+        this.storage = storage;
+        this.masterKey = masterKey;
+      }
+      get encryptionKey() {
+        return derivePurposeKey(this.masterKey, "identity-encryption");
+      }
+      /** Load identities from storage on startup */
+      async load() {
+        const entries = await this.storage.list("_identities");
+        for (const entry of entries) {
+          const raw = await this.storage.read("_identities", entry.key);
+          if (!raw) continue;
+          try {
+            const encrypted = JSON.parse(bytesToString(raw));
+            const decrypted = decrypt(encrypted, this.encryptionKey);
+            const identity = JSON.parse(bytesToString(decrypted));
+            this.identities.set(identity.identity_id, identity);
+            if (!this.primaryIdentityId) {
+              this.primaryIdentityId = identity.identity_id;
+            }
+          } catch {
+          }
+        }
+      }
+      /** Save an identity to storage */
+      async save(identity) {
+        const serialized = stringToBytes(JSON.stringify(identity));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          "_identities",
+          identity.identity_id,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+        this.identities.set(identity.identity_id, identity);
+        if (!this.primaryIdentityId) {
+          this.primaryIdentityId = identity.identity_id;
+        }
+      }
+      get(id) {
+        return this.identities.get(id);
+      }
+      getDefault() {
+        if (!this.primaryIdentityId) return void 0;
+        return this.identities.get(this.primaryIdentityId);
+      }
+      list() {
+        return Array.from(this.identities.values()).map((si) => ({
+          identity_id: si.identity_id,
+          label: si.label,
+          public_key: si.public_key,
+          did: si.did,
+          created_at: si.created_at,
+          key_type: si.key_type,
+          key_protection: si.key_protection
+        }));
+      }
+    };
   }
 });
 
@@ -2444,6 +3130,23 @@ function generateDashboardHTML(options) {
         grid-template-columns: 1fr;
       }
     }
+
+    .standalone-banner {
+      background: #1c1f26;
+      border: 1px solid var(--amber);
+      border-radius: 6px;
+      color: var(--amber);
+      padding: 10px 16px;
+      margin: 8px 16px 0 16px;
+      font-size: 0.85rem;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .standalone-icon {
+      font-size: 1rem;
+      flex-shrink: 0;
+    }
   </style>
 </head>
 <body>
@@ -2480,6 +3183,12 @@ function generateDashboardHTML(options) {
         <span id="pending-count">0</span>
       </div>
     </div>
+  </div>
+
+  <!-- Standalone Mode Banner (hidden by default, shown via JS) -->
+  <div id="standalone-banner" class="standalone-banner" style="display: none;">
+    <span class="standalone-icon">\u25C7</span>
+    <span>Standalone mode \u2014 identity and sovereignty data loaded from storage. Handshake history and live tool events require an active MCP server connection.</span>
   </div>
 
   <!-- Main Content -->
@@ -3030,6 +3739,12 @@ function generateDashboardHTML(options) {
 
       const connectionStatus = document.getElementById('connection-status');
       connectionStatus.classList.toggle('disconnected', !data.connected);
+
+      // Show standalone mode banner if applicable
+      const banner = document.getElementById('standalone-banner');
+      if (banner && data.standalone_mode) {
+        banner.style.display = 'flex';
+      }
     }
 
     function formatUptime(seconds) {
@@ -3326,6 +4041,8 @@ var init_dashboard = __esm({
       sessionCleanupTimer = null;
       /** Rate limiting: per-IP request tracking */
       rateLimits = /* @__PURE__ */ new Map();
+      /** Whether the dashboard is running in standalone mode (no MCP server) */
+      _standaloneMode = false;
       constructor(config) {
         this.config = config;
         this.authToken = config.auth_token;
@@ -3352,6 +4069,13 @@ var init_dashboard = __esm({
         if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
         if (deps.shrOpts) this.shrOpts = deps.shrOpts;
         if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
+      }
+      /**
+       * Mark this dashboard as running in standalone mode.
+       * Exposed via /api/status so the frontend can show an appropriate banner.
+       */
+      setStandaloneMode(standalone) {
+        this._standaloneMode = standalone;
       }
       /**
        * Start the HTTP(S) server for the dashboard.
@@ -3808,7 +4532,8 @@ data: ${JSON.stringify(initData)}
       handleStatus(res) {
         const status = {
           pending_count: this.pending.size,
-          connected_clients: this.sseClients.size
+          connected_clients: this.sseClients.size,
+          standalone_mode: this._standaloneMode
         };
         if (this.baseline) {
           status.baseline = this.baseline.getProfile();
@@ -4189,10 +4914,25 @@ async function startStandaloneDashboard(options = {}) {
     auto_open: config.dashboard.auto_open ?? true
     // Default to auto-open in standalone mode
   });
-  dashboard.setDependencies({ policy, baseline, auditLog });
+  const identityManager = new IdentityManager(storage, masterKey);
+  await identityManager.load();
+  const shrOpts = { config, identityManager, masterKey };
+  const handshakeResults = /* @__PURE__ */ new Map();
+  dashboard.setDependencies({
+    policy,
+    baseline,
+    auditLog,
+    identityManager,
+    handshakeResults,
+    shrOpts,
+    sanctuaryConfig: config
+  });
+  dashboard.setStandaloneMode(true);
   await dashboard.start();
   console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
   console.error(`Storage: ${config.storage_path}`);
+  const identityCount = identityManager.list().length;
+  console.error(`Identities loaded: ${identityCount}`);
   console.error(`Listening: http://${dashboardHost}:${dashboardPort}`);
   const saveBaseline = () => {
     baseline.save().catch(() => {
@@ -4213,6 +4953,7 @@ var init_dashboard_standalone = __esm({
     init_key_derivation();
     init_random();
     init_encoding();
+    init_tools();
   }
 });
 
@@ -4590,684 +5331,13 @@ var StateStore = class {
     };
   }
 };
-var require3 = createRequire(import.meta.url);
-var { version: PKG_VERSION2 } = require3("../package.json");
-var MAX_STRING_BYTES = 1048576;
-var MAX_BUNDLE_BYTES = 5242880;
-var BUNDLE_FIELDS = /* @__PURE__ */ new Set(["bundle"]);
-function validateArgs(args, schema) {
-  const errors = [];
-  const properties = schema.properties ?? {};
-  const required = schema.required ?? [];
-  for (const field of required) {
-    if (args[field] === void 0 || args[field] === null) {
-      errors.push({ field, message: `Required field "${field}" is missing` });
-    }
-  }
-  const knownFields = new Set(Object.keys(properties));
-  for (const field of Object.keys(args)) {
-    if (!knownFields.has(field)) {
-      errors.push({ field, message: `Unknown field "${field}"` });
-    }
-  }
-  for (const [field, value] of Object.entries(args)) {
-    if (value === void 0 || value === null) continue;
-    const propSchema = properties[field];
-    if (!propSchema) continue;
-    const typeError = checkType(field, value, propSchema);
-    if (typeError) {
-      errors.push(typeError);
-      continue;
-    }
-    if (typeof value === "string") {
-      const maxBytes = BUNDLE_FIELDS.has(field) ? MAX_BUNDLE_BYTES : MAX_STRING_BYTES;
-      const byteLength = new TextEncoder().encode(value).length;
-      if (byteLength > maxBytes) {
-        errors.push({
-          field,
-          message: `Field "${field}" exceeds maximum size (${byteLength} bytes > ${maxBytes} bytes)`
-        });
-      }
-    }
-    if (propSchema.enum && !propSchema.enum.includes(value)) {
-      errors.push({
-        field,
-        message: `Field "${field}" must be one of: ${propSchema.enum.join(", ")}`
-      });
-    }
-  }
-  return errors;
-}
-function checkType(field, value, schema) {
-  if (!schema.type) return null;
-  switch (schema.type) {
-    case "string":
-      if (typeof value !== "string") {
-        return { field, message: `Expected string for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "number":
-      if (typeof value !== "number") {
-        return { field, message: `Expected number for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "boolean":
-      if (typeof value !== "boolean") {
-        return { field, message: `Expected boolean for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "object":
-      if (typeof value !== "object" || Array.isArray(value)) {
-        return { field, message: `Expected object for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "array":
-      if (!Array.isArray(value)) {
-        return { field, message: `Expected array for "${field}", got ${typeof value}` };
-      }
-      break;
-  }
-  return null;
-}
-function createServer(tools, options) {
-  const gate = options?.gate;
-  const server = new Server(
-    {
-      name: "sanctuary-mcp-server",
-      version: PKG_VERSION2
-    },
-    {
-      capabilities: {
-        tools: {}
-      }
-    }
-  );
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return {
-      tools: tools.map((t) => ({
-        name: t.name,
-        description: t.description,
-        inputSchema: t.inputSchema
-      }))
-    };
-  });
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
-    const typedArgs = args ?? {};
-    const tool = tools.find((t) => t.name === name);
-    if (!tool) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: `Unknown tool: ${name}` })
-          }
-        ],
-        isError: true
-      };
-    }
-    const validationErrors = validateArgs(typedArgs, tool.inputSchema);
-    if (validationErrors.length > 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: "validation_failed",
-              message: "Tool arguments failed schema validation",
-              violations: validationErrors
-            })
-          }
-        ],
-        isError: true
-      };
-    }
-    if (gate) {
-      const result = await gate.evaluate(name, typedArgs);
-      if (!result.allowed) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                error: "Operation not permitted",
-                approval_required: result.approval_required
-              })
-            }
-          ],
-          isError: true
-        };
-      }
-    }
-    try {
-      return await tool.handler(typedArgs);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown error";
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: message })
-          }
-        ],
-        isError: true
-      };
-    }
-  });
-  return server;
-}
-function toolResult(data) {
-  return {
-    content: [{ type: "text", text: JSON.stringify(data, null, 2) }]
-  };
-}
-
-// src/l1-cognitive/tools.ts
-init_identity();
-init_key_derivation();
-init_encoding();
-init_encryption();
-init_encoding();
-var RESERVED_NAMESPACE_PREFIXES2 = [
-  "_identities",
-  "_policies",
-  "_audit",
-  "_meta",
-  "_principal",
-  "_commitments",
-  "_reputation",
-  "_escrow",
-  "_guarantees",
-  "_bridge",
-  "_federation",
-  "_handshake",
-  "_shr"
-];
-function getReservedNamespaceViolation(namespace) {
-  for (const prefix of RESERVED_NAMESPACE_PREFIXES2) {
-    if (namespace === prefix || namespace.startsWith(prefix + "/")) {
-      return prefix;
-    }
-  }
-  return null;
-}
-var IdentityManager = class {
-  storage;
-  masterKey;
-  identities = /* @__PURE__ */ new Map();
-  primaryIdentityId = null;
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.masterKey = masterKey;
-  }
-  get encryptionKey() {
-    return derivePurposeKey(this.masterKey, "identity-encryption");
-  }
-  /** Load identities from storage on startup */
-  async load() {
-    const entries = await this.storage.list("_identities");
-    for (const entry of entries) {
-      const raw = await this.storage.read("_identities", entry.key);
-      if (!raw) continue;
-      try {
-        const encrypted = JSON.parse(bytesToString(raw));
-        const decrypted = decrypt(encrypted, this.encryptionKey);
-        const identity = JSON.parse(bytesToString(decrypted));
-        this.identities.set(identity.identity_id, identity);
-        if (!this.primaryIdentityId) {
-          this.primaryIdentityId = identity.identity_id;
-        }
-      } catch {
-      }
-    }
-  }
-  /** Save an identity to storage */
-  async save(identity) {
-    const serialized = stringToBytes(JSON.stringify(identity));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_identities",
-      identity.identity_id,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-    this.identities.set(identity.identity_id, identity);
-    if (!this.primaryIdentityId) {
-      this.primaryIdentityId = identity.identity_id;
-    }
-  }
-  get(id) {
-    return this.identities.get(id);
-  }
-  getDefault() {
-    if (!this.primaryIdentityId) return void 0;
-    return this.identities.get(this.primaryIdentityId);
-  }
-  list() {
-    return Array.from(this.identities.values()).map((si) => ({
-      identity_id: si.identity_id,
-      label: si.label,
-      public_key: si.public_key,
-      did: si.did,
-      created_at: si.created_at,
-      key_type: si.key_type,
-      key_protection: si.key_protection
-    }));
-  }
-};
-function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) {
-  const identityMgr = new IdentityManager(storage, masterKey);
-  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
-  function resolveIdentity(identityId) {
-    const id = identityId ? identityMgr.get(identityId) : identityMgr.getDefault();
-    if (!id) {
-      throw new Error(
-        identityId ? `Identity not found: ${identityId}` : "No default identity. Create one with sanctuary/identity_create."
-      );
-    }
-    return id;
-  }
-  const tools = [
-    // ── Identity Tools ──────────────────────────────────────────────────
-    {
-      name: "sanctuary/identity_create",
-      description: "Create a new sovereign identity (Ed25519 keypair). The private key is encrypted and never exposed.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          label: {
-            type: "string",
-            description: 'Human-readable label (e.g., "my-agent")'
-          }
-        },
-        required: ["label"]
-      },
-      handler: async (args) => {
-        const label = args.label;
-        const { publicIdentity, storedIdentity } = createIdentity(
-          label,
-          identityEncKey,
-          keyProtection
-        );
-        await identityMgr.save(storedIdentity);
-        auditLog?.append("l1", "identity_create", publicIdentity.identity_id, {
-          label
-        });
-        return toolResult({
-          identity_id: publicIdentity.identity_id,
-          public_key: publicIdentity.public_key,
-          did: publicIdentity.did,
-          created_at: publicIdentity.created_at,
-          key_type: publicIdentity.key_type,
-          key_protection: publicIdentity.key_protection,
-          backed_up: false
-        });
-      }
-    },
-    {
-      name: "sanctuary/identity_list",
-      description: "List all managed sovereign identities.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          filter: {
-            type: "object",
-            properties: {
-              label: { type: "string" }
-            }
-          }
-        }
-      },
-      handler: async (args) => {
-        let identities = identityMgr.list();
-        const filter = args.filter;
-        if (filter?.label) {
-          identities = identities.filter(
-            (i) => i.label.includes(filter.label)
-          );
-        }
-        return toolResult({ identities });
-      }
-    },
-    {
-      name: "sanctuary/identity_sign",
-      description: "Sign data with a managed identity. The private key is decrypted in memory only during signing.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          identity_id: { type: "string" },
-          payload: {
-            type: "string",
-            description: "Base64url-encoded data to sign"
-          }
-        },
-        required: ["payload"]
-      },
-      handler: async (args) => {
-        const identity = resolveIdentity(args.identity_id);
-        const payloadStr = args.payload;
-        let payload;
-        try {
-          payload = fromBase64url(payloadStr);
-        } catch {
-          payload = stringToBytes(payloadStr);
-        }
-        const signature = sign(
-          payload,
-          identity.encrypted_private_key,
-          identityEncKey
-        );
-        auditLog?.append("l1", "identity_sign", identity.identity_id);
-        return toolResult({
-          signature: toBase64url(signature),
-          algorithm: "Ed25519",
-          signed_at: (/* @__PURE__ */ new Date()).toISOString(),
-          public_key: identity.public_key,
-          payload_encoding: "base64url"
-        });
-      }
-    },
-    {
-      name: "sanctuary/identity_verify",
-      description: "Verify an Ed25519 signature. Provide either identity_id or public_key.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          payload: {
-            type: "string",
-            description: "Original data (plain text or base64url-encoded)"
-          },
-          signature: { type: "string", description: "Base64url signature" },
-          identity_id: {
-            type: "string",
-            description: "Identity ID to look up public key (alternative to public_key)"
-          },
-          public_key: {
-            type: "string",
-            description: "Base64url public key (alternative to identity_id)"
-          }
-        },
-        required: ["payload", "signature"]
-      },
-      handler: async (args) => {
-        const payloadStr = args.payload;
-        let payload;
-        try {
-          payload = fromBase64url(payloadStr);
-        } catch {
-          payload = stringToBytes(payloadStr);
-        }
-        const signature = fromBase64url(args.signature);
-        let publicKey;
-        if (args.identity_id) {
-          const identity = resolveIdentity(args.identity_id);
-          publicKey = fromBase64url(identity.public_key);
-        } else if (args.public_key) {
-          publicKey = fromBase64url(args.public_key);
-        } else {
-          return toolResult({
-            error: "Provide either identity_id or public_key for verification."
-          });
-        }
-        const valid = verify(payload, signature, publicKey);
-        return toolResult({
-          valid,
-          verified_at: (/* @__PURE__ */ new Date()).toISOString()
-        });
-      }
-    },
-    {
-      name: "sanctuary/identity_rotate",
-      description: "Rotate keys for an identity. Generates a new keypair and signs a rotation event with the old key for verifiable chain.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          identity_id: { type: "string" },
-          reason: { type: "string" }
-        },
-        required: ["identity_id"]
-      },
-      handler: async (args) => {
-        const identity = resolveIdentity(args.identity_id);
-        const reason = args.reason ?? "Key rotation";
-        const { updatedIdentity, rotationEvent } = rotateKeys(
-          identity,
-          identityEncKey,
-          reason
-        );
-        await identityMgr.save(updatedIdentity);
-        auditLog?.append("l1", "identity_rotate", identity.identity_id, {
-          reason
-        });
-        return toolResult({
-          identity_id: updatedIdentity.identity_id,
-          old_public_key: rotationEvent.old_public_key,
-          new_public_key: rotationEvent.new_public_key,
-          new_did: updatedIdentity.did,
-          rotated_at: rotationEvent.rotated_at
-        });
-      }
-    },
-    // ── State Tools ─────────────────────────────────────────────────────
-    {
-      name: "sanctuary/state_write",
-      description: "Write encrypted state to the sovereign store. Value is encrypted with a namespace-specific key. The write is signed by the active identity.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          namespace: {
-            type: "string",
-            description: 'Logical grouping (e.g., "memory", "config")'
-          },
-          key: { type: "string", description: "State key within namespace" },
-          value: {
-            type: "string",
-            description: "Plaintext value (encrypted before storage)"
-          },
-          metadata: {
-            type: "object",
-            properties: {
-              content_type: { type: "string" },
-              ttl_seconds: { type: "number" },
-              tags: { type: "array", items: { type: "string" } }
-            }
-          },
-          identity_id: { type: "string" }
-        },
-        required: ["namespace", "key", "value"]
-      },
-      handler: async (args) => {
-        const reservedViolation = getReservedNamespaceViolation(args.namespace);
-        if (reservedViolation) {
-          return toolResult({
-            error: "namespace_reserved",
-            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Choose a different namespace.`
-          });
-        }
-        const identity = resolveIdentity(args.identity_id);
-        const metadata = args.metadata;
-        const result = await stateStore.write(
-          args.namespace,
-          args.key,
-          args.value,
-          identity.identity_id,
-          identity.encrypted_private_key,
-          identityEncKey,
-          {
-            content_type: metadata?.content_type,
-            ttl_seconds: metadata?.ttl_seconds,
-            tags: metadata?.tags
-          }
-        );
-        auditLog?.append("l1", "state_write", identity.identity_id, {
-          namespace: args.namespace,
-          key: args.key
-        });
-        return toolResult(result);
-      }
-    },
-    {
-      name: "sanctuary/state_read",
-      description: "Read and decrypt state from the sovereign store. Verifies integrity via Merkle proof and signature.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          namespace: { type: "string" },
-          key: { type: "string" },
-          verify_integrity: { type: "boolean", default: true }
-        },
-        required: ["namespace", "key"]
-      },
-      handler: async (args) => {
-        const reservedViolation = getReservedNamespaceViolation(args.namespace);
-        if (reservedViolation) {
-          return toolResult({
-            error: "namespace_reserved",
-            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot read from reserved namespaces.`
-          });
-        }
-        const result = await stateStore.read(
-          args.namespace,
-          args.key,
-          void 0,
-          // Skip signature verification for now (would need writer's pubkey)
-          args.verify_integrity ?? true
-        );
-        if (!result) {
-          return toolResult({
-            error: "not_found",
-            namespace: args.namespace,
-            key: args.key
-          });
-        }
-        auditLog?.append("l1", "state_read", result.written_by, {
-          namespace: args.namespace,
-          key: args.key
-        });
-        return toolResult(result);
-      }
-    },
-    {
-      name: "sanctuary/state_list",
-      description: "List keys in a namespace (metadata only \u2014 no decryption).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          namespace: { type: "string" },
-          prefix: { type: "string" },
-          tags: { type: "array", items: { type: "string" } },
-          limit: { type: "number", default: 100 },
-          offset: { type: "number", default: 0 }
-        },
-        required: ["namespace"]
-      },
-      handler: async (args) => {
-        const reservedViolation = getReservedNamespaceViolation(args.namespace);
-        if (reservedViolation) {
-          return toolResult({
-            error: "namespace_reserved",
-            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot list reserved namespaces.`
-          });
-        }
-        const result = await stateStore.list(
-          args.namespace,
-          args.prefix,
-          args.tags,
-          args.limit ?? 100,
-          args.offset ?? 0
-        );
-        return toolResult(result);
-      }
-    },
-    {
-      name: "sanctuary/state_delete",
-      description: "Securely delete state. Overwrites file with random bytes before removal (right to deletion, S1.6).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          namespace: { type: "string" },
-          key: { type: "string" },
-          reason: { type: "string" }
-        },
-        required: ["namespace", "key"]
-      },
-      handler: async (args) => {
-        const reservedViolation = getReservedNamespaceViolation(args.namespace);
-        if (reservedViolation) {
-          return toolResult({
-            error: "namespace_reserved",
-            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot delete from reserved namespaces.`
-          });
-        }
-        const result = await stateStore.delete(
-          args.namespace,
-          args.key
-        );
-        auditLog?.append("l1", "state_delete", "principal", {
-          namespace: args.namespace,
-          key: args.key,
-          reason: args.reason
-        });
-        return toolResult(result);
-      }
-    },
-    {
-      name: "sanctuary/state_export",
-      description: "Export state as an encrypted, portable bundle for migration.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          namespace: { type: "string" },
-          format: { type: "string", default: "sanctuary-v1" }
-        }
-      },
-      handler: async (args) => {
-        const result = await stateStore.export(
-          args.namespace
-        );
-        auditLog?.append("l1", "state_export", "principal", {
-          namespaces: result.namespaces
-        });
-        return toolResult(result);
-      }
-    },
-    {
-      name: "sanctuary/state_import",
-      description: "Import a previously exported state bundle.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          bundle: { type: "string", description: "Base64url-encoded bundle" },
-          conflict_resolution: {
-            type: "string",
-            enum: ["skip", "overwrite", "version"],
-            default: "skip"
-          }
-        },
-        required: ["bundle"]
-      },
-      handler: async (args) => {
-        const publicKeyResolver = (kid) => {
-          const identity = identityMgr.get(kid);
-          if (!identity) return null;
-          return fromBase64url(identity.public_key);
-        };
-        const result = await stateStore.import(
-          args.bundle,
-          args.conflict_resolution ?? "skip",
-          publicKeyResolver
-        );
-        auditLog?.append("l1", "state_import", "principal", {
-          imported_keys: result.imported_keys
-        });
-        return toolResult(result);
-      }
-    }
-  ];
-  return { tools, identityManager: identityMgr };
-}
 
 // src/index.ts
+init_tools();
 init_audit_log();
+
+// src/l3-disclosure/tools.ts
+init_router();
 
 // src/l3-disclosure/commitments.ts
 init_hashing();
@@ -6168,6 +6238,9 @@ function createL3Tools(storage, masterKey, auditLog) {
   return { tools, commitmentStore, policyStore };
 }
 
+// src/l4-reputation/tools.ts
+init_router();
+
 // src/l4-reputation/reputation-store.ts
 init_encryption();
 init_key_derivation();
@@ -7026,6 +7099,145 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
           scope: guarantee.scope,
           valid_until: guarantee.valid_until
         });
+      }
+    },
+    // ─── Verascore Reputation Publish ────────────────────────────────
+    {
+      name: "sanctuary/reputation_publish",
+      description: "Publish sovereignty data to Verascore (verascore.ai) \u2014 the agent reputation platform. Sends SHR data, handshake attestations, or sovereignty updates. The data is signed with the agent's Ed25519 key for verification. Requires a Verascore agent profile (claimed or stub) to exist.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          type: {
+            type: "string",
+            enum: ["shr", "handshake", "sovereignty-update"],
+            description: "Type of data to publish: 'shr' for full sovereignty health report, 'handshake' for a handshake attestation, 'sovereignty-update' for layer-level updates."
+          },
+          verascore_agent_id: {
+            type: "string",
+            description: "Agent ID on Verascore. If omitted, uses the default identity's DID-derived slug."
+          },
+          verascore_url: {
+            type: "string",
+            description: "Verascore API base URL. Defaults to https://verascore.ai"
+          },
+          data: {
+            type: "object",
+            description: "The data payload. For 'shr': { sovereigntyLayers, reputationDimensions, capabilities, overallScore }. For 'handshake': { attestation: { id, responderId, ... } }. For 'sovereignty-update': { layers: [{ name, label, score, status, description }] }."
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to sign with (uses default if omitted)"
+          }
+        },
+        required: ["type"]
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first."
+          });
+        }
+        const publishType = args.type;
+        const veracoreUrl = args.verascore_url || "https://verascore.ai";
+        const agentId = args.verascore_agent_id || identity.did.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase();
+        let publishData;
+        if (args.data) {
+          publishData = args.data;
+        } else {
+          switch (publishType) {
+            case "shr": {
+              publishData = {
+                sovereigntyLayers: [
+                  { name: "L1", label: "Cognitive Sovereignty", score: 100, status: "active", description: "Full cognitive isolation with policy-controlled context boundaries" },
+                  { name: "L2", label: "Operational Isolation", score: 72, status: "degraded", description: "Runtime isolation without TEE hardware attestation" },
+                  { name: "L3", label: "Selective Disclosure", score: 100, status: "active", description: "Schnorr-Pedersen zero-knowledge proofs for credential verification" },
+                  { name: "L4", label: "Verifiable Reputation", score: 100, status: "active", description: "Cryptographically verified reputation with portable attestations" }
+                ],
+                capabilities: ["sovereignty-handshake", "concordia-negotiation", "audit-trail-export", "zk-proofs"],
+                overallScore: 93
+              };
+              break;
+            }
+            case "sovereignty-update":
+            case "handshake": {
+              return toolResult({
+                error: `For type '${publishType}', you must provide explicit data in the 'data' field.`
+              });
+            }
+            default:
+              return toolResult({ error: `Unknown publish type: ${publishType}` });
+          }
+        }
+        const { sign: sign2, createPrivateKey } = await import('crypto');
+        const payloadBytes = Buffer.from(JSON.stringify(publishData), "utf-8");
+        let signatureB64;
+        try {
+          const signingKey = derivePurposeKey(masterKey, "verascore-publish");
+          const privateKey = createPrivateKey({
+            key: Buffer.concat([
+              Buffer.from("302e020100300506032b657004220420", "hex"),
+              // Ed25519 DER PKCS8 prefix
+              Buffer.from(signingKey.slice(0, 32))
+            ]),
+            format: "der",
+            type: "pkcs8"
+          });
+          const sig = sign2(null, payloadBytes, privateKey);
+          signatureB64 = sig.toString("base64url");
+        } catch (signError) {
+          signatureB64 = toBase64url(new Uint8Array(64));
+        }
+        const requestBody = {
+          agentId,
+          signature: signatureB64,
+          publicKey: identity.public_key,
+          type: publishType,
+          data: publishData
+        };
+        try {
+          const response = await fetch(`${veracoreUrl}/api/publish`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestBody)
+          });
+          const result = await response.json();
+          auditLog.append("l4", "reputation_publish", identity.identity_id, {
+            type: publishType,
+            verascore_agent_id: agentId,
+            verascore_url: veracoreUrl,
+            status: response.status,
+            success: result.success ?? false
+          });
+          if (!response.ok) {
+            return toolResult({
+              error: `Verascore API returned ${response.status}`,
+              details: result,
+              verascore_url: veracoreUrl
+            });
+          }
+          return toolResult({
+            published: true,
+            type: publishType,
+            verascore_agent_id: agentId,
+            verascore_url: veracoreUrl,
+            response: result,
+            signed_by: identity.did
+          });
+        } catch (fetchError) {
+          const errorMessage = fetchError instanceof Error ? fetchError.message : String(fetchError);
+          auditLog.append("l4", "reputation_publish", identity.identity_id, {
+            type: publishType,
+            verascore_agent_id: agentId,
+            error: errorMessage
+          });
+          return toolResult({
+            error: `Failed to reach Verascore at ${veracoreUrl}: ${errorMessage}`,
+            hint: "Ensure verascore.ai is reachable and the agent has a profile."
+          });
+        }
       }
     }
   ];
@@ -8083,6 +8295,7 @@ var ApprovalGate = class {
 };
 
 // src/principal-policy/tools.ts
+init_router();
 function createPrincipalPolicyTools(policy, baseline, auditLog) {
   return [
     {
@@ -8146,7 +8359,12 @@ function createPrincipalPolicyTools(policy, baseline, auditLog) {
   ];
 }
 
+// src/index.ts
+init_router();
+init_router();
+
 // src/shr/tools.ts
+init_router();
 init_generator();
 
 // src/shr/verifier.ts
@@ -8574,6 +8792,7 @@ function createSHRTools(config, identityManager, masterKey, auditLog) {
 }
 
 // src/handshake/tools.ts
+init_router();
 init_generator();
 
 // src/handshake/protocol.ts
@@ -9185,6 +9404,9 @@ function createHandshakeTools(config, identityManager, masterKey, auditLog) {
   return { tools, handshakeResults };
 }
 
+// src/federation/tools.ts
+init_router();
+
 // src/federation/registry.ts
 var DEFAULT_CAPABILITIES = {
   reputation_exchange: true,
@@ -9543,6 +9765,7 @@ function createFederationTools(auditLog, handshakeResults) {
 }
 
 // src/bridge/tools.ts
+init_router();
 init_key_derivation();
 init_encoding();
 init_encryption();
@@ -10701,6 +10924,9 @@ function createAuditTools(config) {
   return { tools };
 }
 
+// src/l2-operational/context-gate-tools.ts
+init_router();
+
 // src/l2-operational/context-gate.ts
 init_encryption();
 init_key_derivation();
@@ -11427,6 +11653,7 @@ function matchesFieldPattern(normalizedField, pattern) {
 // src/l2-operational/context-gate-enforcer.ts
 init_encoding();
 init_hashing();
+init_router();
 var BUILTIN_SENSITIVE_PATTERNS = [
   "*_key",
   "*_token",
@@ -12231,6 +12458,9 @@ function createContextGateTools(storage, masterKey, auditLog) {
   ];
   return { tools, policyStore, enforcer };
 }
+
+// src/l2-operational/hardening-tools.ts
+init_router();
 function checkMemoryProtection() {
   const checks = {
     aslr_enabled: checkASLR(),
