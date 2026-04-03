@@ -201,7 +201,29 @@ export async function createSanctuaryServer(options?: {
   );
 
   // 8. Load existing identities
-  await identityManager.load();
+  const loadResult = await identityManager.load();
+
+  // 8a. Warn loudly if encrypted identity files exist but none could be decrypted
+  if (loadResult.total > 0 && loadResult.loaded === 0) {
+    console.error(
+      "\n╔══════════════════════════════════════════════════════════════╗\n" +
+      "║  ⚠  WARNING: Encrypted identities found but NONE loaded     ║\n" +
+      "╠══════════════════════════════════════════════════════════════╣\n" +
+      `║  ${loadResult.total} encrypted identity file(s) found on disk              ║\n` +
+      "║  0 could be decrypted with the current master key            ║\n" +
+      "║                                                              ║\n" +
+      "║  This usually means SANCTUARY_PASSPHRASE is missing or       ║\n" +
+      "║  incorrect. The server will start but with NO identity data. ║\n" +
+      "║                                                              ║\n" +
+      "║  To fix: set SANCTUARY_PASSPHRASE to the passphrase used     ║\n" +
+      "║  when this Sanctuary instance was first configured.          ║\n" +
+      "╚══════════════════════════════════════════════════════════════╝\n"
+    );
+  } else if (loadResult.failed > 0) {
+    console.error(
+      `Warning: ${loadResult.failed} of ${loadResult.total} identity files could not be decrypted (possibly corrupted).`
+    );
+  }
 
   // 9. Create L2 monitoring tools
   const l2Tools: ToolDefinition[] = [

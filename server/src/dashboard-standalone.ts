@@ -193,7 +193,7 @@ export async function startStandaloneDashboard(
 
   // 9. Initialize IdentityManager (reads existing identities from encrypted storage)
   const identityManager = new IdentityManager(storage, masterKey);
-  await identityManager.load();
+  const loadResult = await identityManager.load();
 
   // 10. Construct SHR generator options (enables /api/sovereignty and /api/shr)
   const shrOpts = { config, identityManager, masterKey };
@@ -216,9 +216,31 @@ export async function startStandaloneDashboard(
 
   console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
   console.error(`Storage: ${config.storage_path}`);
-  const identityCount = identityManager.list().length;
-  console.error(`Identities loaded: ${identityCount}`);
+  console.error(`Identities loaded: ${loadResult.loaded}`);
   console.error(`Listening: http://${dashboardHost}:${dashboardPort}`);
+
+  // 9a. Warn loudly if encrypted identity files exist but none could be decrypted
+  if (loadResult.total > 0 && loadResult.loaded === 0) {
+    console.error(
+      "\n╔══════════════════════════════════════════════════════════════╗\n" +
+      "║  ⚠  WARNING: Encrypted identities found but NONE loaded     ║\n" +
+      "╠══════════════════════════════════════════════════════════════╣\n" +
+      `║  ${loadResult.total} encrypted identity file(s) found on disk              ║\n` +
+      "║  0 could be decrypted with the current master key            ║\n" +
+      "║                                                              ║\n" +
+      "║  This usually means SANCTUARY_PASSPHRASE is missing or       ║\n" +
+      "║  incorrect. The dashboard will show empty panels.            ║\n" +
+      "║                                                              ║\n" +
+      "║  To fix: restart with the correct SANCTUARY_PASSPHRASE:      ║\n" +
+      "║    SANCTUARY_PASSPHRASE=<your-passphrase> npx \\              ║\n" +
+      "║      @sanctuary-framework/mcp-server dashboard               ║\n" +
+      "╚══════════════════════════════════════════════════════════════╝\n"
+    );
+  } else if (loadResult.failed > 0) {
+    console.error(
+      `Warning: ${loadResult.failed} of ${loadResult.total} identity files could not be decrypted (possibly corrupted).`
+    );
+  }
 
   // 12. Save baseline on exit
   const saveBaseline = () => {

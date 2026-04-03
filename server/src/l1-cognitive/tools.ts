@@ -78,9 +78,13 @@ export class IdentityManager {
     return derivePurposeKey(this.masterKey, "identity-encryption");
   }
 
-  /** Load identities from storage on startup */
-  async load(): Promise<void> {
+  /** Load identities from storage on startup.
+   *  Returns { total: number of encrypted files found, loaded: number successfully decrypted }.
+   *  A mismatch (total > 0, loaded === 0) indicates a wrong master key / missing passphrase.
+   */
+  async load(): Promise<{ total: number; loaded: number; failed: number }> {
     const entries = await this.storage.list("_identities");
+    let failed = 0;
     for (const entry of entries) {
       const raw = await this.storage.read("_identities", entry.key);
       if (!raw) continue;
@@ -93,9 +97,10 @@ export class IdentityManager {
           this.primaryIdentityId = identity.identity_id;
         }
       } catch {
-        // Skip corrupted identities
+        failed++;
       }
     }
+    return { total: entries.length, loaded: this.identities.size, failed };
   }
 
   /** Save an identity to storage */

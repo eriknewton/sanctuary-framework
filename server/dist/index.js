@@ -5690,11 +5690,12 @@ function generateDashboardHTML(options) {
     // API Updates
     async function updateSovereignty() {
       const data = await fetchAPI('/api/sovereignty');
-      if (!data) return;
+      if (!data || data.error) return;
 
       apiState.sovereignty = data;
 
-      const score = calculateSovereigntyScore(data.shr);
+      // API returns { score, overall_level, layers: { l1, l2, l3, l4 }, ... }
+      const score = data.score ?? 0;
       const badge = document.getElementById('sovereignty-badge');
       const scoreEl = document.getElementById('sovereignty-score');
 
@@ -5704,18 +5705,18 @@ function generateDashboardHTML(options) {
       if (score < 70) badge.classList.add('degraded');
       if (score < 40) badge.classList.add('inactive');
 
-      updateLayerCards(data.shr);
+      updateLayerCards(data);
     }
 
-    function updateLayerCards(shr) {
-      if (!shr || !shr.layers) return;
+    function updateLayerCards(data) {
+      if (!data || !data.layers) return;
 
-      const layers = shr.layers;
+      const layers = data.layers;
 
-      updateLayerCard('l1', layers.l1, layers.l1?.encryption || 'AES-256-GCM');
-      updateLayerCard('l2', layers.l2, layers.l2?.isolation_type || 'Process-level');
-      updateLayerCard('l3', layers.l3, layers.l3?.proof_system || 'Schnorr-Pedersen');
-      updateLayerCard('l4', layers.l4, layers.l4?.reputation_mode || 'Weighted');
+      updateLayerCard('l1', layers.l1, layers.l1?.detail || 'AES-256-GCM');
+      updateLayerCard('l2', layers.l2, layers.l2?.detail || 'Process-level');
+      updateLayerCard('l3', layers.l3, layers.l3?.detail || 'Schnorr-Pedersen');
+      updateLayerCard('l4', layers.l4, layers.l4?.detail || 'Weighted');
     }
 
     function updateLayerCard(layer, layerData, detail) {
@@ -5743,14 +5744,16 @@ function generateDashboardHTML(options) {
 
       apiState.identity = data;
 
-      const primary = data.primary || {};
+      // API returns { identities: [...], count, primary_id }
+      // Find the primary identity from the array
+      const primary = (data.identities || []).find(id => id.identity_id === data.primary_id) || {};
       document.getElementById('identity-label').textContent = primary.label || '\u2014';
       document.getElementById('identity-did').textContent = truncate(primary.did, 24);
       document.getElementById('identity-did').title = primary.did || '';
-      document.getElementById('identity-pubkey').textContent = truncate(primary.publicKey, 24);
-      document.getElementById('identity-pubkey').title = primary.publicKey || '';
-      document.getElementById('identity-created').textContent = formatTime(primary.createdAt);
-      document.getElementById('identity-count').textContent = data.identities?.length || '\u2014';
+      document.getElementById('identity-pubkey').textContent = truncate(primary.public_key, 24);
+      document.getElementById('identity-pubkey').title = primary.public_key || '';
+      document.getElementById('identity-created').textContent = formatTime(primary.created_at);
+      document.getElementById('identity-count').textContent = data.count || '\u2014';
     }
 
     async function updateHandshakes() {
@@ -5759,14 +5762,14 @@ function generateDashboardHTML(options) {
 
       apiState.handshakes = data.handshakes || [];
 
-      document.getElementById('handshake-count').textContent = data.handshakes?.length || '0';
+      document.getElementById('handshake-count').textContent = data.count || '0';
 
       if (data.handshakes && data.handshakes.length > 0) {
         const latest = data.handshakes[0];
-        document.getElementById('handshake-latest').textContent = truncate(latest.counterpartyId, 20);
-        document.getElementById('handshake-latest').title = latest.counterpartyId || '';
-        document.getElementById('handshake-tier').textContent = (latest.trustTier || 'Unverified').toUpperCase();
-        document.getElementById('handshake-time').textContent = formatTime(latest.completedAt);
+        document.getElementById('handshake-latest').textContent = truncate(latest.counterparty_id, 20);
+        document.getElementById('handshake-latest').title = latest.counterparty_id || '';
+        document.getElementById('handshake-tier').textContent = (latest.trust_tier || 'Unverified').toUpperCase();
+        document.getElementById('handshake-time').textContent = formatTime(latest.completed_at);
       } else {
         document.getElementById('handshake-latest').textContent = '\u2014';
         document.getElementById('handshake-tier').textContent = 'Unverified';
@@ -5788,12 +5791,12 @@ function generateDashboardHTML(options) {
         .map(
           (hs) => \`
         <div class="table-row">
-          <div class="table-cell strong">\${esc(truncate(hs.counterpartyId, 24))}</div>
-          <div class="table-cell">\${esc(hs.trustTier || 'Unverified')}</div>
-          <div class="table-cell">\${esc(hs.sovereigntyLevel || '\u2014')}</div>
+          <div class="table-cell strong">\${esc(truncate(hs.counterparty_id, 24))}</div>
+          <div class="table-cell">\${esc(hs.trust_tier || 'Unverified')}</div>
+          <div class="table-cell">\${esc(hs.sovereignty_level || '\u2014')}</div>
           <div class="table-cell">\${hs.verified ? 'Yes' : 'No'}</div>
-          <div class="table-cell">\${formatTime(hs.completedAt)}</div>
-          <div class="table-cell">\${formatTime(hs.expiresAt)}</div>
+          <div class="table-cell">\${formatTime(hs.completed_at)}</div>
+          <div class="table-cell">\${formatTime(hs.expires_at)}</div>
         </div>
       \`
         )
@@ -5811,10 +5814,13 @@ function generateDashboardHTML(options) {
     function renderSHRViewer(shr) {
       const viewer = document.getElementById('shr-viewer');
 
-      if (!shr) {
+      if (!shr || shr.error) {
         viewer.innerHTML = '<div class="empty-state">No SHR available</div>';
         return;
       }
+
+      // SignedSHR shape: { body: { implementation, instance_id, layers, ... }, signed_by, signature }
+      const body = shr.body || shr;
 
       let html = '';
 
@@ -5828,15 +5834,15 @@ function generateDashboardHTML(options) {
           <div class="shr-section-content">
             <div class="shr-item">
               <div class="shr-key">sanctuary_version:</div>
-              <div class="shr-value">\${esc(shr.implementation?.sanctuary_version || '\u2014')}</div>
+              <div class="shr-value">\${esc(body.implementation?.sanctuary_version || '\u2014')}</div>
             </div>
             <div class="shr-item">
               <div class="shr-key">node_version:</div>
-              <div class="shr-value">\${esc(shr.implementation?.node_version || '\u2014')}</div>
+              <div class="shr-value">\${esc(body.implementation?.node_version || '\u2014')}</div>
             </div>
             <div class="shr-item">
               <div class="shr-key">generated_by:</div>
-              <div class="shr-value">\${esc(shr.implementation?.generated_by || '\u2014')}</div>
+              <div class="shr-value">\${esc(body.implementation?.generated_by || '\u2014')}</div>
             </div>
           </div>
         </div>
@@ -5852,22 +5858,22 @@ function generateDashboardHTML(options) {
           <div class="shr-section-content">
             <div class="shr-item">
               <div class="shr-key">instance_id:</div>
-              <div class="shr-value">\${esc(truncate(shr.instance_id, 20))}</div>
+              <div class="shr-value">\${esc(truncate(body.instance_id, 20))}</div>
             </div>
             <div class="shr-item">
               <div class="shr-key">generated_at:</div>
-              <div class="shr-value">\${formatTime(shr.generated_at)}</div>
+              <div class="shr-value">\${formatTime(body.generated_at)}</div>
             </div>
             <div class="shr-item">
               <div class="shr-key">expires_at:</div>
-              <div class="shr-value">\${formatTime(shr.expires_at)}</div>
+              <div class="shr-value">\${formatTime(body.expires_at)}</div>
             </div>
           </div>
         </div>
       \`;
 
       // Layers
-      if (shr.layers) {
+      if (body.layers) {
         html += \`<div class="shr-section">
           <div class="shr-section-header">
             <div class="shr-toggle">\u25BC</div>
@@ -5876,7 +5882,7 @@ function generateDashboardHTML(options) {
           <div class="shr-section-content">
         \`;
 
-        for (const [key, layer] of Object.entries(shr.layers)) {
+        for (const [key, layer] of Object.entries(body.layers)) {
           html += \`
             <div style="margin-bottom: 12px;">
               <div style="color: var(--blue); font-weight: 600; margin-bottom: 4px;">\${esc(key)}</div>
@@ -11075,11 +11081,57 @@ var TOOL_API_SCOPED = {
   ],
   default_action: "redact"
 };
+var REMOTE_INFERENCE_SANITIZE = {
+  id: "remote-inference-sanitize",
+  name: "Remote Inference Sanitization",
+  description: "Maximum privacy for remote/cloud LLM calls. Strips all identity, financial, location, and personal data before passing queries to external models. Inspired by Vitalik Buterin's 2-of-2 sovereignty model.",
+  use_when: "Your local agent needs to call a remote LLM for tasks beyond local model capability (complex coding, deep research) and you want to minimize data leakage to the remote provider. The remote model gets only the task, query, format requirements, and stripped code context.",
+  rules: [
+    {
+      provider: "inference",
+      allow: [
+        "task",
+        "task_description",
+        "current_query",
+        "query",
+        "prompt",
+        "question",
+        "instruction",
+        "output_format",
+        "format",
+        "language",
+        "code_context",
+        // Stripped code snippets for coding tasks
+        "error_message"
+        // For debugging help
+      ],
+      redact: [
+        ...ALWAYS_REDACT_SECRETS,
+        ...PII_PATTERNS,
+        ...INTERNAL_STATE_PATTERNS,
+        ...HISTORY_PATTERNS,
+        "tool_results",
+        "previous_results",
+        // Additional redactions for remote inference
+        "model_data",
+        "agent_state",
+        "runtime_config",
+        "capabilities",
+        "tool_list"
+      ],
+      // Deny patterns — these must NEVER reach the remote model, not even redacted
+      hash: [],
+      summarize: []
+    }
+  ],
+  default_action: "deny"
+};
 var TEMPLATES = {
   "inference-minimal": INFERENCE_MINIMAL,
   "inference-standard": INFERENCE_STANDARD,
   "logging-strict": LOGGING_STRICT,
-  "tool-api-scoped": TOOL_API_SCOPED
+  "tool-api-scoped": TOOL_API_SCOPED,
+  "remote-inference-sanitize": REMOTE_INFERENCE_SANITIZE
 };
 function listTemplateIds() {
   return Object.keys(TEMPLATES);
@@ -12567,6 +12619,101 @@ function createL2HardeningTools(storagePath, auditLog) {
 // src/index.ts
 init_encoding();
 
+// src/l2-operational/model-provenance.ts
+var InMemoryModelProvenanceStore = class {
+  models = /* @__PURE__ */ new Map();
+  primaryModelId = null;
+  declare(provenance) {
+    if (!provenance.model_id) {
+      throw new Error("ModelProvenance requires a model_id");
+    }
+    if (!provenance.model_name) {
+      throw new Error("ModelProvenance requires a model_name");
+    }
+    if (!provenance.provider) {
+      throw new Error("ModelProvenance requires a provider");
+    }
+    this.models.set(provenance.model_id, provenance);
+    if (this.primaryModelId === null) {
+      this.primaryModelId = provenance.model_id;
+    }
+  }
+  get(model_id) {
+    return this.models.get(model_id);
+  }
+  list() {
+    return Array.from(this.models.values());
+  }
+  primary() {
+    if (!this.primaryModelId) return void 0;
+    return this.models.get(this.primaryModelId);
+  }
+  setPrimary(model_id) {
+    if (!this.models.has(model_id)) {
+      throw new Error(`Model ${model_id} not found in store`);
+    }
+    this.primaryModelId = model_id;
+  }
+};
+var MODEL_PRESETS = {
+  /**
+   * Claude Opus 4 via Anthropic API (cloud inference, closed weights/source)
+   */
+  claudeOpus4: () => ({
+    model_id: "claude-opus-4",
+    model_name: "Claude Opus 4",
+    model_version: "4.0",
+    provider: "Anthropic",
+    license: "proprietary",
+    open_weights: false,
+    open_source: false,
+    local_inference: false,
+    declared_at: (/* @__PURE__ */ new Date()).toISOString()
+  }),
+  /**
+   * Qwen 3.5 via local inference (open weights, proprietary training)
+   */
+  qwen35Local: () => ({
+    model_id: "qwen-3.5-35b",
+    model_name: "Qwen 3.5 35B",
+    model_version: "3.5",
+    provider: "Alibaba Cloud",
+    license: "Apache-2.0",
+    open_weights: true,
+    open_source: false,
+    local_inference: true,
+    declared_at: (/* @__PURE__ */ new Date()).toISOString()
+  }),
+  /**
+   * Llama 3.3 70B via local inference (open weights and code)
+   */
+  llama33Local: () => ({
+    model_id: "llama-3.3-70b-instruct",
+    model_name: "Llama 3.3 70B Instruct",
+    model_version: "3.3",
+    provider: "Meta",
+    license: "Apache-2.0",
+    open_weights: true,
+    open_source: true,
+    local_inference: true,
+    declared_at: (/* @__PURE__ */ new Date()).toISOString()
+  }),
+  /**
+   * Mistral 7B (open weights, open code, local inference)
+   */
+  mistral7bLocal: () => ({
+    model_id: "mistral-7b-instruct",
+    model_name: "Mistral 7B Instruct",
+    model_version: "7",
+    provider: "Mistral AI",
+    license: "Apache-2.0",
+    open_weights: true,
+    open_source: true,
+    local_inference: true,
+    declared_at: (/* @__PURE__ */ new Date()).toISOString()
+  })
+};
+
 // src/storage/memory.ts
 var MemoryStorage = class {
   store = /* @__PURE__ */ new Map();
@@ -13088,6 +13235,6 @@ async function createSanctuaryServer(options) {
   return { server, config };
 }
 
-export { ATTESTATION_VERSION, ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, TEMPLATES as CONTEXT_GATE_TEMPLATES, CallbackApprovalChannel, CommitmentStore, ContextGateEnforcer, ContextGatePolicyStore, DashboardApprovalChannel, FederationRegistry, FilesystemStorage, InjectionDetector, MemoryStorage, PolicyStore, ReputationStore, StateStore, StderrApprovalChannel, TIER_WEIGHTS, WebhookApprovalChannel, canonicalize, classifyField, completeHandshake, computeWeightedScore, createBridgeCommitment, createPedersenCommitment, createProofOfKnowledge, createRangeProof, createSanctuaryServer, evaluateField, filterContext, generateAttestation, generateSHR, getTemplate, initiateHandshake, listTemplateIds, loadConfig, loadPrincipalPolicy, recommendPolicy, resolveTier, respondToHandshake, signPayload, tierDistribution, verifyAttestation, verifyBridgeCommitment, verifyCompletion, verifyPedersenCommitment, verifyProofOfKnowledge, verifyRangeProof, verifySHR, verifySignature };
+export { ATTESTATION_VERSION, ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, TEMPLATES as CONTEXT_GATE_TEMPLATES, CallbackApprovalChannel, CommitmentStore, ContextGateEnforcer, ContextGatePolicyStore, DashboardApprovalChannel, FederationRegistry, FilesystemStorage, InMemoryModelProvenanceStore, InjectionDetector, MODEL_PRESETS, MemoryStorage, PolicyStore, ReputationStore, StateStore, StderrApprovalChannel, TIER_WEIGHTS, WebhookApprovalChannel, canonicalize, classifyField, completeHandshake, computeWeightedScore, createBridgeCommitment, createPedersenCommitment, createProofOfKnowledge, createRangeProof, createSanctuaryServer, evaluateField, filterContext, generateAttestation, generateSHR, getTemplate, initiateHandshake, listTemplateIds, loadConfig, loadPrincipalPolicy, recommendPolicy, resolveTier, respondToHandshake, signPayload, tierDistribution, verifyAttestation, verifyBridgeCommitment, verifyCompletion, verifyPedersenCommitment, verifyProofOfKnowledge, verifyRangeProof, verifySHR, verifySignature };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map
