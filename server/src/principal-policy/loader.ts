@@ -44,6 +44,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "reputation_export",
     "bootstrap_provide_guarantee",
     "decommission_certificate",
+    "reputation_publish", // SEC-039: Explicit Tier 1 — sends data to external API
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [
@@ -96,6 +97,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "bridge_commit",
     "bridge_verify",
     "bridge_attest",
+    "dashboard_open", // SEC-039: Explicit Tier 3 — only generates a URL
   ],
   approval_channel: DEFAULT_CHANNEL,
 };
@@ -249,6 +251,7 @@ tier1_always_approve:
   - reputation_import
   - reputation_export
   - bootstrap_provide_guarantee
+  - reputation_publish
 
 # ─── Tier 2: Behavioral Anomaly Detection ────────────────────────────────
 # Triggers approval when agent behavior deviates from its baseline.
@@ -311,6 +314,7 @@ tier3_always_allow:
   - bridge_commit
   - bridge_verify
   - bridge_attest
+  - dashboard_open
 
 # ─── Approval Channel ────────────────────────────────────────────────────
 # How Sanctuary reaches you when approval is needed.

@@ -258,7 +258,9 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
 export function generateDashboardHTML(options: {
   timeoutSeconds: number;
   serverVersion: string;
-  authToken?: string;
+  // SEC-038: authToken removed from HTML generation — no longer embedded in page source.
+  // The client uses sessionStorage (set during login flow) for API authentication.
+  authToken?: string; // Retained for interface compat but NOT embedded in output.
 }): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1295,7 +1297,9 @@ export function generateDashboardHTML(options: {
 
   <script>
     // Constants
-    const AUTH_TOKEN = '${options.authToken || ''}' || sessionStorage.getItem('authToken') || '';
+    // SEC-038: Do NOT embed the long-lived auth token in page source.
+    // Use only the session token stored in sessionStorage by the login flow.
+    const AUTH_TOKEN = sessionStorage.getItem('authToken') || '';
     const TIMEOUT_SECONDS = ${options.timeoutSeconds};
     const API_BASE = '';
 
