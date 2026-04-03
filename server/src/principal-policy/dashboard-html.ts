@@ -1066,6 +1066,23 @@ export function generateDashboardHTML(options: {
         grid-template-columns: 1fr;
       }
     }
+
+    .standalone-banner {
+      background: #1c1f26;
+      border: 1px solid var(--amber);
+      border-radius: 6px;
+      color: var(--amber);
+      padding: 10px 16px;
+      margin: 8px 16px 0 16px;
+      font-size: 0.85rem;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .standalone-icon {
+      font-size: 1rem;
+      flex-shrink: 0;
+    }
   </style>
 </head>
 <body>
@@ -1102,6 +1119,12 @@ export function generateDashboardHTML(options: {
         <span id="pending-count">0</span>
       </div>
     </div>
+  </div>
+
+  <!-- Standalone Mode Banner (hidden by default, shown via JS) -->
+  <div id="standalone-banner" class="standalone-banner" style="display: none;">
+    <span class="standalone-icon">◇</span>
+    <span>Standalone mode — identity and sovereignty data loaded from storage. Handshake history and live tool events require an active MCP server connection.</span>
   </div>
 
   <!-- Main Content -->
@@ -1652,6 +1675,12 @@ export function generateDashboardHTML(options: {
 
       const connectionStatus = document.getElementById('connection-status');
       connectionStatus.classList.toggle('disconnected', !data.connected);
+
+      // Show standalone mode banner if applicable
+      const banner = document.getElementById('standalone-banner');
+      if (banner && data.standalone_mode) {
+        banner.style.display = 'flex';
+      }
     }
 
     function formatUptime(seconds) {

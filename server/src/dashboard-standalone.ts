@@ -31,6 +31,8 @@ import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
+import { IdentityManager } from "./l1-cognitive/tools.js";
+import type { HandshakeResult } from "./handshake/types.js";
 
 export interface StandaloneDashboardOptions {
   passphrase?: string;
@@ -189,14 +191,36 @@ export async function startStandaloneDashboard(
     auto_open: config.dashboard.auto_open ?? true, // Default to auto-open in standalone mode
   });
 
-  dashboard.setDependencies({ policy, baseline, auditLog });
+  // 9. Initialize IdentityManager (reads existing identities from encrypted storage)
+  const identityManager = new IdentityManager(storage, masterKey);
+  await identityManager.load();
+
+  // 10. Construct SHR generator options (enables /api/sovereignty and /api/shr)
+  const shrOpts = { config, identityManager, masterKey };
+
+  // 11. Empty handshake results — handshakes are in-memory per MCP session
+  // and cannot be recovered in standalone mode.
+  const handshakeResults = new Map<string, HandshakeResult>();
+
+  dashboard.setDependencies({
+    policy,
+    baseline,
+    auditLog,
+    identityManager,
+    handshakeResults,
+    shrOpts,
+    sanctuaryConfig: config,
+  });
+  dashboard.setStandaloneMode(true);
   await dashboard.start();
 
   console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
   console.error(`Storage: ${config.storage_path}`);
+  const identityCount = identityManager.list().length;
+  console.error(`Identities loaded: ${identityCount}`);
   console.error(`Listening: http://${dashboardHost}:${dashboardPort}`);
 
-  // 9. Save baseline on exit
+  // 12. Save baseline on exit
   const saveBaseline = () => {
     baseline.save().catch(() => {});
   };

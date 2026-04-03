@@ -118,6 +118,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private sessionCleanupTimer: ReturnType<typeof setInterval> | null = null;
   /** Rate limiting: per-IP request tracking */
   private rateLimits: Map<string, RateLimitEntry> = new Map();
+  /** Whether the dashboard is running in standalone mode (no MCP server) */
+  private _standaloneMode = false;
 
   constructor(config: DashboardConfig) {
     this.config = config;
@@ -156,6 +158,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
     if (deps.shrOpts) this.shrOpts = deps.shrOpts;
     if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
+  }
+
+  /**
+   * Mark this dashboard as running in standalone mode.
+   * Exposed via /api/status so the frontend can show an appropriate banner.
+   */
+  setStandaloneMode(standalone: boolean): void {
+    this._standaloneMode = standalone;
   }
 
   /**
@@ -717,6 +727,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const status: Record<string, unknown> = {
       pending_count: this.pending.size,
       connected_clients: this.sseClients.size,
+      standalone_mode: this._standaloneMode,
     };
 
     if (this.baseline) {
