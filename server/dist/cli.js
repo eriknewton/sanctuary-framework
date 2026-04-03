@@ -557,6 +557,18 @@ var init_hashing = __esm({
     init_encoding();
   }
 });
+
+// src/core/identity.ts
+var identity_exports = {};
+__export(identity_exports, {
+  createIdentity: () => createIdentity,
+  generateIdentityId: () => generateIdentityId,
+  generateKeypair: () => generateKeypair,
+  publicKeyToDid: () => publicKeyToDid,
+  rotateKeys: () => rotateKeys,
+  sign: () => sign,
+  verify: () => verify
+});
 function generateKeypair() {
   const privateKey = randomBytes(32);
   const publicKey = ed25519.getPublicKey(privateKey);
@@ -1358,9 +1370,13 @@ var init_tools = __esm({
       get encryptionKey() {
         return derivePurposeKey(this.masterKey, "identity-encryption");
       }
-      /** Load identities from storage on startup */
+      /** Load identities from storage on startup.
+       *  Returns { total: number of encrypted files found, loaded: number successfully decrypted }.
+       *  A mismatch (total > 0, loaded === 0) indicates a wrong master key / missing passphrase.
+       */
       async load() {
         const entries = await this.storage.list("_identities");
+        let failed = 0;
         for (const entry of entries) {
           const raw = await this.storage.read("_identities", entry.key);
           if (!raw) continue;
@@ -1373,8 +1389,10 @@ var init_tools = __esm({
               this.primaryIdentityId = identity.identity_id;
             }
           } catch {
+            failed++;
           }
         }
+        return { total: entries.length, loaded: this.identities.size, failed };
       }
       /** Save an identity to storage */
       async save(identity) {
@@ -1617,6 +1635,7 @@ tier1_always_approve:
   - reputation_import
   - reputation_export
   - bootstrap_provide_guarantee
+  - reputation_publish
 
 # \u2500\u2500\u2500 Tier 2: Behavioral Anomaly Detection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # Triggers approval when agent behavior deviates from its baseline.
@@ -1679,6 +1698,7 @@ tier3_always_allow:
   - bridge_commit
   - bridge_verify
   - bridge_attest
+  - dashboard_open
 
 # \u2500\u2500\u2500 Approval Channel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # How Sanctuary reaches you when approval is needed.
@@ -1731,7 +1751,9 @@ var init_loader = __esm({
         "reputation_import",
         "reputation_export",
         "bootstrap_provide_guarantee",
-        "decommission_certificate"
+        "decommission_certificate",
+        "reputation_publish"
+        // SEC-039: Explicit Tier 1 — sends data to external API
       ],
       tier2_anomaly: DEFAULT_TIER2,
       tier3_always_allow: [
@@ -1783,7 +1805,9 @@ var init_loader = __esm({
         "shr_gateway_export",
         "bridge_commit",
         "bridge_verify",
-        "bridge_attest"
+        "bridge_attest",
+        "dashboard_open"
+        // SEC-039: Explicit Tier 3 — only generates a URL
       ],
       approval_channel: DEFAULT_CHANNEL
     };
@@ -3359,7 +3383,9 @@ function generateDashboardHTML(options) {
 
   <script>
     // Constants
-    const AUTH_TOKEN = '${options.authToken || ""}' || sessionStorage.getItem('authToken') || '';
+    // SEC-038: Do NOT embed the long-lived auth token in page source.
+    // Use only the session token stored in sessionStorage by the login flow.
+    const AUTH_TOKEN = sessionStorage.getItem('authToken') || '';
     const TIMEOUT_SECONDS = ${options.timeoutSeconds};
     const API_BASE = '';
 
@@ -4921,7 +4947,7 @@ async function startStandaloneDashboard(options = {}) {
     // Default to auto-open in standalone mode
   });
   const identityManager = new IdentityManager(storage, masterKey);
-  await identityManager.load();
+  const loadResult = await identityManager.load();
   const shrOpts = { config, identityManager, masterKey };
   const handshakeResults = /* @__PURE__ */ new Map();
   dashboard.setDependencies({
@@ -4937,9 +4963,31 @@ async function startStandaloneDashboard(options = {}) {
   await dashboard.start();
   console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
   console.error(`Storage: ${config.storage_path}`);
-  const identityCount = identityManager.list().length;
-  console.error(`Identities loaded: ${identityCount}`);
+  console.error(`Identities loaded: ${loadResult.loaded}`);
   console.error(`Listening: http://${dashboardHost}:${dashboardPort}`);
+  if (loadResult.total > 0 && loadResult.loaded === 0) {
+    console.error(
+      `
+\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+\u2551  \u26A0  WARNING: Encrypted identities found but NONE loaded     \u2551
+\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
+\u2551  ${loadResult.total} encrypted identity file(s) found on disk              \u2551
+\u2551  0 could be decrypted with the current master key            \u2551
+\u2551                                                              \u2551
+\u2551  This usually means SANCTUARY_PASSPHRASE is missing or       \u2551
+\u2551  incorrect. The dashboard will show empty panels.            \u2551
+\u2551                                                              \u2551
+\u2551  To fix: restart with the correct SANCTUARY_PASSPHRASE:      \u2551
+\u2551    SANCTUARY_PASSPHRASE=<your-passphrase> npx \\              \u2551
+\u2551      @sanctuary-framework/mcp-server dashboard               \u2551
+\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D
+`
+    );
+  } else if (loadResult.failed > 0) {
+    console.error(
+      `Warning: ${loadResult.failed} of ${loadResult.total} identity files could not be decrypted (possibly corrupted).`
+    );
+  }
   const saveBaseline = () => {
     baseline.save().catch(() => {
     });
@@ -7148,6 +7196,24 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
         }
         const publishType = args.type;
         const veracoreUrl = args.verascore_url || "https://verascore.ai";
+        const ALLOWED_VERASCORE_HOSTS = ["verascore.ai", "www.verascore.ai", "api.verascore.ai"];
+        try {
+          const parsed = new URL(veracoreUrl);
+          if (parsed.protocol !== "https:") {
+            return toolResult({
+              error: `verascore_url must use HTTPS. Got: ${parsed.protocol}`
+            });
+          }
+          if (!ALLOWED_VERASCORE_HOSTS.includes(parsed.hostname)) {
+            return toolResult({
+              error: `verascore_url must point to a known Verascore domain (${ALLOWED_VERASCORE_HOSTS.join(", ")}). Got: ${parsed.hostname}`
+            });
+          }
+        } catch {
+          return toolResult({
+            error: `verascore_url is not a valid URL: ${veracoreUrl}`
+          });
+        }
         const agentId = args.verascore_agent_id || identity.did.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase();
         let publishData;
         if (args.data) {
@@ -7177,24 +7243,21 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
               return toolResult({ error: `Unknown publish type: ${publishType}` });
           }
         }
-        const { sign: sign2, createPrivateKey } = await import('crypto');
-        const payloadBytes = Buffer.from(JSON.stringify(publishData), "utf-8");
+        const { sign: identitySign } = await Promise.resolve().then(() => (init_identity(), identity_exports));
+        const payloadBytes = new TextEncoder().encode(JSON.stringify(publishData));
         let signatureB64;
         try {
-          const signingKey = derivePurposeKey(masterKey, "verascore-publish");
-          const privateKey = createPrivateKey({
-            key: Buffer.concat([
-              Buffer.from("302e020100300506032b657004220420", "hex"),
-              // Ed25519 DER PKCS8 prefix
-              Buffer.from(signingKey.slice(0, 32))
-            ]),
-            format: "der",
-            type: "pkcs8"
-          });
-          const sig = sign2(null, payloadBytes, privateKey);
-          signatureB64 = sig.toString("base64url");
+          const signingBytes = identitySign(
+            payloadBytes,
+            identity.encrypted_private_key,
+            identityEncryptionKey
+          );
+          signatureB64 = toBase64url(signingBytes);
         } catch (signError) {
-          signatureB64 = toBase64url(new Uint8Array(64));
+          return toolResult({
+            error: "Failed to sign publish payload. Identity key may be corrupted.",
+            details: signError instanceof Error ? signError.message : String(signError)
+          });
         }
         const requestBody = {
           agentId,
@@ -13016,7 +13079,29 @@ async function createSanctuaryServer(options) {
     keyProtection,
     auditLog
   );
-  await identityManager.load();
+  const loadResult = await identityManager.load();
+  if (loadResult.total > 0 && loadResult.loaded === 0) {
+    console.error(
+      `
+\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+\u2551  \u26A0  WARNING: Encrypted identities found but NONE loaded     \u2551
+\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
+\u2551  ${loadResult.total} encrypted identity file(s) found on disk              \u2551
+\u2551  0 could be decrypted with the current master key            \u2551
+\u2551                                                              \u2551
+\u2551  This usually means SANCTUARY_PASSPHRASE is missing or       \u2551
+\u2551  incorrect. The server will start but with NO identity data. \u2551
+\u2551                                                              \u2551
+\u2551  To fix: set SANCTUARY_PASSPHRASE to the passphrase used     \u2551
+\u2551  when this Sanctuary instance was first configured.          \u2551
+\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D
+`
+    );
+  } else if (loadResult.failed > 0) {
+    console.error(
+      `Warning: ${loadResult.failed} of ${loadResult.total} identity files could not be decrypted (possibly corrupted).`
+    );
+  }
   const l2Tools = [
     {
       name: "sanctuary/exec_attest",

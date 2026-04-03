@@ -1,12 +1,12 @@
+import { randomBytes as randomBytes$1, createHmac } from 'crypto';
+import { gcm } from '@noble/ciphers/aes.js';
 import { sha256 } from '@noble/hashes/sha256';
 import { hmac } from '@noble/hashes/hmac';
+import { RistrettoPoint, ed25519 } from '@noble/curves/ed25519';
 import { readFile, mkdir, writeFile, stat, unlink, readdir, chmod, access } from 'fs/promises';
 import { join } from 'path';
 import { platform, homedir } from 'os';
 import { createRequire } from 'module';
-import { randomBytes as randomBytes$1, createHmac } from 'crypto';
-import { gcm } from '@noble/ciphers/aes.js';
-import { RistrettoPoint, ed25519 } from '@noble/curves/ed25519';
 import { argon2id } from 'hash-wasm';
 import { hkdf } from '@noble/hashes/hkdf';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -25,6 +25,26 @@ var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, { get: all[name], enumerable: true });
 };
+function randomBytes(length) {
+  if (length <= 0) {
+    throw new RangeError("Length must be positive");
+  }
+  const buf = randomBytes$1(length);
+  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+}
+function generateIV() {
+  return randomBytes(12);
+}
+function generateSalt() {
+  return randomBytes(32);
+}
+function generateRandomKey() {
+  return randomBytes(32);
+}
+var init_random = __esm({
+  "src/core/random.ts"() {
+  }
+});
 
 // src/core/encoding.ts
 var encoding_exports = {};
@@ -74,6 +94,42 @@ function constantTimeEqual(a, b) {
 }
 var init_encoding = __esm({
   "src/core/encoding.ts"() {
+  }
+});
+function encrypt(plaintext, key, aad) {
+  if (key.length !== 32) {
+    throw new Error("Key must be exactly 32 bytes (256 bits)");
+  }
+  const iv = generateIV();
+  const cipher = gcm(key, iv, aad);
+  const ciphertext = cipher.encrypt(plaintext);
+  return {
+    v: 1,
+    alg: "aes-256-gcm",
+    iv: toBase64url(iv),
+    ct: toBase64url(ciphertext),
+    ts: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function decrypt(payload, key, aad) {
+  if (key.length !== 32) {
+    throw new Error("Key must be exactly 32 bytes (256 bits)");
+  }
+  if (payload.v !== 1) {
+    throw new Error(`Unsupported payload version: ${payload.v}`);
+  }
+  if (payload.alg !== "aes-256-gcm") {
+    throw new Error(`Unsupported algorithm: ${payload.alg}`);
+  }
+  const iv = fromBase64url(payload.iv);
+  const ciphertext = fromBase64url(payload.ct);
+  const cipher = gcm(key, iv, aad);
+  return cipher.decrypt(ciphertext);
+}
+var init_encryption = __esm({
+  "src/core/encryption.ts"() {
+    init_random();
+    init_encoding();
   }
 });
 
@@ -202,6 +258,123 @@ function computeMerkleRoot(entries) {
 var init_hashing = __esm({
   "src/core/hashing.ts"() {
     init_encoding();
+  }
+});
+
+// src/core/identity.ts
+var identity_exports = {};
+__export(identity_exports, {
+  createIdentity: () => createIdentity,
+  generateIdentityId: () => generateIdentityId,
+  generateKeypair: () => generateKeypair,
+  publicKeyToDid: () => publicKeyToDid,
+  rotateKeys: () => rotateKeys,
+  sign: () => sign,
+  verify: () => verify
+});
+function generateKeypair() {
+  const privateKey = randomBytes(32);
+  const publicKey = ed25519.getPublicKey(privateKey);
+  return { publicKey, privateKey };
+}
+function publicKeyToDid(publicKey) {
+  const multicodec = new Uint8Array([237, 1, ...publicKey]);
+  return `did:key:z${toBase64url(multicodec)}`;
+}
+function generateIdentityId(publicKey) {
+  const keyHash = hash(publicKey);
+  return Array.from(keyHash.slice(0, 16)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function createIdentity(label, encryptionKey, keyProtection) {
+  const { publicKey, privateKey } = generateKeypair();
+  const identityId = generateIdentityId(publicKey);
+  const did = publicKeyToDid(publicKey);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const encryptedPrivateKey = encrypt(privateKey, encryptionKey);
+  privateKey.fill(0);
+  const publicIdentity = {
+    identity_id: identityId,
+    label,
+    public_key: toBase64url(publicKey),
+    did,
+    created_at: now,
+    key_type: "ed25519",
+    key_protection: keyProtection
+  };
+  const storedIdentity = {
+    ...publicIdentity,
+    encrypted_private_key: encryptedPrivateKey,
+    rotation_history: []
+  };
+  return { publicIdentity, storedIdentity };
+}
+function sign(payload, encryptedPrivateKey, encryptionKey) {
+  const privateKey = decrypt(encryptedPrivateKey, encryptionKey);
+  try {
+    return ed25519.sign(payload, privateKey);
+  } finally {
+    privateKey.fill(0);
+  }
+}
+function verify(payload, signature, publicKey) {
+  try {
+    return ed25519.verify(signature, payload, publicKey);
+  } catch {
+    return false;
+  }
+}
+function rotateKeys(storedIdentity, encryptionKey, reason) {
+  const { publicKey: newPublicKey, privateKey: newPrivateKey } = generateKeypair();
+  const newIdentityDid = publicKeyToDid(newPublicKey);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const eventData = JSON.stringify({
+    old_public_key: storedIdentity.public_key,
+    new_public_key: toBase64url(newPublicKey),
+    identity_id: storedIdentity.identity_id,
+    reason,
+    rotated_at: now
+  });
+  const eventBytes = new TextEncoder().encode(eventData);
+  const signature = sign(
+    eventBytes,
+    storedIdentity.encrypted_private_key,
+    encryptionKey
+  );
+  const rotationEvent = {
+    old_public_key: storedIdentity.public_key,
+    new_public_key: toBase64url(newPublicKey),
+    identity_id: storedIdentity.identity_id,
+    reason,
+    rotated_at: now,
+    signature: toBase64url(signature)
+  };
+  const encryptedNewPrivateKey = encrypt(newPrivateKey, encryptionKey);
+  newPrivateKey.fill(0);
+  const updatedIdentity = {
+    ...storedIdentity,
+    public_key: toBase64url(newPublicKey),
+    did: newIdentityDid,
+    encrypted_private_key: encryptedNewPrivateKey,
+    rotation_history: [
+      ...storedIdentity.rotation_history,
+      {
+        old_public_key: storedIdentity.public_key,
+        new_public_key: toBase64url(newPublicKey),
+        rotation_event: toBase64url(
+          new TextEncoder().encode(JSON.stringify(rotationEvent))
+        ),
+        rotated_at: now
+      }
+    ]
+  };
+  return { updatedIdentity, rotationEvent };
+}
+var init_identity = __esm({
+  "src/core/identity.ts"() {
+    init_encoding();
+    init_encryption();
+    init_hashing();
+    init_random();
   }
 });
 var require2 = createRequire(import.meta.url);
@@ -381,24 +554,9 @@ function deepMerge(base, override) {
   }
   return result;
 }
-function randomBytes(length) {
-  if (length <= 0) {
-    throw new RangeError("Length must be positive");
-  }
-  const buf = randomBytes$1(length);
-  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-}
-function generateIV() {
-  return randomBytes(12);
-}
-function generateSalt() {
-  return randomBytes(32);
-}
-function generateRandomKey() {
-  return randomBytes(32);
-}
 
 // src/storage/filesystem.ts
+init_random();
 var FilesystemStorage = class {
   basePath;
   constructor(basePath) {
@@ -506,141 +664,14 @@ var FilesystemStorage = class {
     return total;
   }
 };
-init_encoding();
-function encrypt(plaintext, key, aad) {
-  if (key.length !== 32) {
-    throw new Error("Key must be exactly 32 bytes (256 bits)");
-  }
-  const iv = generateIV();
-  const cipher = gcm(key, iv, aad);
-  const ciphertext = cipher.encrypt(plaintext);
-  return {
-    v: 1,
-    alg: "aes-256-gcm",
-    iv: toBase64url(iv),
-    ct: toBase64url(ciphertext),
-    ts: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-function decrypt(payload, key, aad) {
-  if (key.length !== 32) {
-    throw new Error("Key must be exactly 32 bytes (256 bits)");
-  }
-  if (payload.v !== 1) {
-    throw new Error(`Unsupported payload version: ${payload.v}`);
-  }
-  if (payload.alg !== "aes-256-gcm") {
-    throw new Error(`Unsupported algorithm: ${payload.alg}`);
-  }
-  const iv = fromBase64url(payload.iv);
-  const ciphertext = fromBase64url(payload.ct);
-  const cipher = gcm(key, iv, aad);
-  return cipher.decrypt(ciphertext);
-}
 
 // src/l1-cognitive/state-store.ts
+init_encryption();
 init_hashing();
+init_identity();
 
-// src/core/identity.ts
-init_encoding();
-init_hashing();
-function generateKeypair() {
-  const privateKey = randomBytes(32);
-  const publicKey = ed25519.getPublicKey(privateKey);
-  return { publicKey, privateKey };
-}
-function publicKeyToDid(publicKey) {
-  const multicodec = new Uint8Array([237, 1, ...publicKey]);
-  return `did:key:z${toBase64url(multicodec)}`;
-}
-function generateIdentityId(publicKey) {
-  const keyHash = hash(publicKey);
-  return Array.from(keyHash.slice(0, 16)).map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-function createIdentity(label, encryptionKey, keyProtection) {
-  const { publicKey, privateKey } = generateKeypair();
-  const identityId = generateIdentityId(publicKey);
-  const did = publicKeyToDid(publicKey);
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const encryptedPrivateKey = encrypt(privateKey, encryptionKey);
-  privateKey.fill(0);
-  const publicIdentity = {
-    identity_id: identityId,
-    label,
-    public_key: toBase64url(publicKey),
-    did,
-    created_at: now,
-    key_type: "ed25519",
-    key_protection: keyProtection
-  };
-  const storedIdentity = {
-    ...publicIdentity,
-    encrypted_private_key: encryptedPrivateKey,
-    rotation_history: []
-  };
-  return { publicIdentity, storedIdentity };
-}
-function sign(payload, encryptedPrivateKey, encryptionKey) {
-  const privateKey = decrypt(encryptedPrivateKey, encryptionKey);
-  try {
-    return ed25519.sign(payload, privateKey);
-  } finally {
-    privateKey.fill(0);
-  }
-}
-function verify(payload, signature, publicKey) {
-  try {
-    return ed25519.verify(signature, payload, publicKey);
-  } catch {
-    return false;
-  }
-}
-function rotateKeys(storedIdentity, encryptionKey, reason) {
-  const { publicKey: newPublicKey, privateKey: newPrivateKey } = generateKeypair();
-  const newIdentityDid = publicKeyToDid(newPublicKey);
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const eventData = JSON.stringify({
-    old_public_key: storedIdentity.public_key,
-    new_public_key: toBase64url(newPublicKey),
-    identity_id: storedIdentity.identity_id,
-    reason,
-    rotated_at: now
-  });
-  const eventBytes = new TextEncoder().encode(eventData);
-  const signature = sign(
-    eventBytes,
-    storedIdentity.encrypted_private_key,
-    encryptionKey
-  );
-  const rotationEvent = {
-    old_public_key: storedIdentity.public_key,
-    new_public_key: toBase64url(newPublicKey),
-    identity_id: storedIdentity.identity_id,
-    reason,
-    rotated_at: now,
-    signature: toBase64url(signature)
-  };
-  const encryptedNewPrivateKey = encrypt(newPrivateKey, encryptionKey);
-  newPrivateKey.fill(0);
-  const updatedIdentity = {
-    ...storedIdentity,
-    public_key: toBase64url(newPublicKey),
-    did: newIdentityDid,
-    encrypted_private_key: encryptedNewPrivateKey,
-    rotation_history: [
-      ...storedIdentity.rotation_history,
-      {
-        old_public_key: storedIdentity.public_key,
-        new_public_key: toBase64url(newPublicKey),
-        rotation_event: toBase64url(
-          new TextEncoder().encode(JSON.stringify(rotationEvent))
-        ),
-        rotated_at: now
-      }
-    ]
-  };
-  return { updatedIdentity, rotationEvent };
-}
+// src/core/key-derivation.ts
+init_random();
 init_encoding();
 var ARGON2_MEMORY_COST = 65536;
 var ARGON2_TIME_COST = 3;
@@ -1238,7 +1269,9 @@ function toolResult(data) {
 }
 
 // src/l1-cognitive/tools.ts
+init_identity();
 init_encoding();
+init_encryption();
 init_encoding();
 var RESERVED_NAMESPACE_PREFIXES2 = [
   "_identities",
@@ -1275,9 +1308,13 @@ var IdentityManager = class {
   get encryptionKey() {
     return derivePurposeKey(this.masterKey, "identity-encryption");
   }
-  /** Load identities from storage on startup */
+  /** Load identities from storage on startup.
+   *  Returns { total: number of encrypted files found, loaded: number successfully decrypted }.
+   *  A mismatch (total > 0, loaded === 0) indicates a wrong master key / missing passphrase.
+   */
   async load() {
     const entries = await this.storage.list("_identities");
+    let failed = 0;
     for (const entry of entries) {
       const raw = await this.storage.read("_identities", entry.key);
       if (!raw) continue;
@@ -1290,8 +1327,10 @@ var IdentityManager = class {
           this.primaryIdentityId = identity.identity_id;
         }
       } catch {
+        failed++;
       }
     }
+    return { total: entries.length, loaded: this.identities.size, failed };
   }
   /** Save an identity to storage */
   async save(identity) {
@@ -1739,6 +1778,7 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
 }
 
 // src/l2-operational/audit-log.ts
+init_encryption();
 init_encoding();
 var AuditLog = class {
   storage;
@@ -1836,6 +1876,8 @@ var AuditLog = class {
 // src/l3-disclosure/commitments.ts
 init_hashing();
 init_encoding();
+init_random();
+init_encryption();
 init_encoding();
 function createCommitment(value, blindingFactor) {
   const blindingBytes = blindingFactor ? fromBase64url(blindingFactor) : randomBytes(32);
@@ -1916,7 +1958,9 @@ var CommitmentStore = class {
 };
 
 // src/l3-disclosure/policies.ts
+init_encryption();
 init_encoding();
+init_random();
 function evaluateDisclosure(policy, context, requestedFields) {
   return requestedFields.map((field) => {
     const exactRule = policy.rules.find((r) => r.context === context);
@@ -2047,6 +2091,9 @@ var PolicyStore = class {
     );
   }
 };
+
+// src/l3-disclosure/zk-proofs.ts
+init_random();
 init_encoding();
 var G = RistrettoPoint.BASE;
 var H_INPUT = concatBytes(
@@ -2724,7 +2771,10 @@ function createL3Tools(storage, masterKey, auditLog) {
 }
 
 // src/l4-reputation/reputation-store.ts
+init_encryption();
 init_encoding();
+init_random();
+init_identity();
 function computeMedian(values) {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
@@ -3619,6 +3669,24 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
         }
         const publishType = args.type;
         const veracoreUrl = args.verascore_url || "https://verascore.ai";
+        const ALLOWED_VERASCORE_HOSTS = ["verascore.ai", "www.verascore.ai", "api.verascore.ai"];
+        try {
+          const parsed = new URL(veracoreUrl);
+          if (parsed.protocol !== "https:") {
+            return toolResult({
+              error: `verascore_url must use HTTPS. Got: ${parsed.protocol}`
+            });
+          }
+          if (!ALLOWED_VERASCORE_HOSTS.includes(parsed.hostname)) {
+            return toolResult({
+              error: `verascore_url must point to a known Verascore domain (${ALLOWED_VERASCORE_HOSTS.join(", ")}). Got: ${parsed.hostname}`
+            });
+          }
+        } catch {
+          return toolResult({
+            error: `verascore_url is not a valid URL: ${veracoreUrl}`
+          });
+        }
         const agentId = args.verascore_agent_id || identity.did.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase();
         let publishData;
         if (args.data) {
@@ -3648,24 +3716,21 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
               return toolResult({ error: `Unknown publish type: ${publishType}` });
           }
         }
-        const { sign: sign2, createPrivateKey } = await import('crypto');
-        const payloadBytes = Buffer.from(JSON.stringify(publishData), "utf-8");
+        const { sign: identitySign } = await Promise.resolve().then(() => (init_identity(), identity_exports));
+        const payloadBytes = new TextEncoder().encode(JSON.stringify(publishData));
         let signatureB64;
         try {
-          const signingKey = derivePurposeKey(masterKey, "verascore-publish");
-          const privateKey = createPrivateKey({
-            key: Buffer.concat([
-              Buffer.from("302e020100300506032b657004220420", "hex"),
-              // Ed25519 DER PKCS8 prefix
-              Buffer.from(signingKey.slice(0, 32))
-            ]),
-            format: "der",
-            type: "pkcs8"
-          });
-          const sig = sign2(null, payloadBytes, privateKey);
-          signatureB64 = sig.toString("base64url");
+          const signingBytes = identitySign(
+            payloadBytes,
+            identity.encrypted_private_key,
+            identityEncryptionKey
+          );
+          signatureB64 = toBase64url(signingBytes);
         } catch (signError) {
-          signatureB64 = toBase64url(new Uint8Array(64));
+          return toolResult({
+            error: "Failed to sign publish payload. Identity key may be corrupted.",
+            details: signError instanceof Error ? signError.message : String(signError)
+          });
         }
         const requestBody = {
           agentId,
@@ -3744,7 +3809,9 @@ var DEFAULT_POLICY = {
     "reputation_import",
     "reputation_export",
     "bootstrap_provide_guarantee",
-    "decommission_certificate"
+    "decommission_certificate",
+    "reputation_publish"
+    // SEC-039: Explicit Tier 1 — sends data to external API
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [
@@ -3796,7 +3863,9 @@ var DEFAULT_POLICY = {
     "shr_gateway_export",
     "bridge_commit",
     "bridge_verify",
-    "bridge_attest"
+    "bridge_attest",
+    "dashboard_open"
+    // SEC-039: Explicit Tier 3 — only generates a URL
   ],
   approval_channel: DEFAULT_CHANNEL
 };
@@ -3904,6 +3973,7 @@ tier1_always_approve:
   - reputation_import
   - reputation_export
   - bootstrap_provide_guarantee
+  - reputation_publish
 
 # \u2500\u2500\u2500 Tier 2: Behavioral Anomaly Detection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # Triggers approval when agent behavior deviates from its baseline.
@@ -3966,6 +4036,7 @@ tier3_always_allow:
   - bridge_commit
   - bridge_verify
   - bridge_attest
+  - dashboard_open
 
 # \u2500\u2500\u2500 Approval Channel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # How Sanctuary reaches you when approval is needed.
@@ -3993,6 +4064,7 @@ async function loadPrincipalPolicy(storagePath) {
 }
 
 // src/principal-policy/baseline.ts
+init_encryption();
 init_encoding();
 var BASELINE_NAMESPACE = "_principal";
 var BASELINE_KEY = "session-baseline";
@@ -4218,6 +4290,7 @@ function canonicalizeForSigning(body) {
 }
 
 // src/shr/generator.ts
+init_identity();
 init_encoding();
 var DEFAULT_VALIDITY_MS = 60 * 60 * 1e3;
 function generateSHR(identityId, opts) {
@@ -5598,7 +5671,9 @@ function generateDashboardHTML(options) {
 
   <script>
     // Constants
-    const AUTH_TOKEN = '${options.authToken || ""}' || sessionStorage.getItem('authToken') || '';
+    // SEC-038: Do NOT embed the long-lived auth token in page source.
+    // Use only the session token stored in sessionStorage by the login flow.
+    const AUTH_TOKEN = sessionStorage.getItem('authToken') || '';
     const TIMEOUT_SECONDS = ${options.timeoutSeconds};
     const API_BASE = '';
 
@@ -8111,6 +8186,7 @@ function createPrincipalPolicyTools(policy, baseline, auditLog) {
 }
 
 // src/shr/verifier.ts
+init_identity();
 init_encoding();
 function verifySHR(shr, now) {
   const errors = [];
@@ -8533,7 +8609,9 @@ function createSHRTools(config, identityManager, masterKey, auditLog) {
 }
 
 // src/handshake/protocol.ts
+init_identity();
 init_encoding();
+init_random();
 function generateNonce() {
   return toBase64url(randomBytes(32));
 }
@@ -8700,7 +8778,9 @@ function deriveTrustTier(level) {
 }
 
 // src/handshake/attestation.ts
+init_identity();
 init_encoding();
+init_identity();
 init_encoding();
 var ATTESTATION_VERSION = "1.0";
 function deriveTrustTier2(level) {
@@ -9493,10 +9573,13 @@ function createFederationTools(auditLog, handshakeResults) {
 
 // src/bridge/tools.ts
 init_encoding();
+init_encryption();
 init_encoding();
 
 // src/bridge/bridge.ts
+init_identity();
 init_encoding();
+init_random();
 init_hashing();
 function canonicalize(outcome) {
   return stringToBytes(stableStringify(outcome));
@@ -10647,7 +10730,9 @@ function createAuditTools(config) {
 }
 
 // src/l2-operational/context-gate.ts
+init_encryption();
 init_encoding();
+init_random();
 init_hashing();
 var MAX_CONTEXT_FIELDS = 1e3;
 var MAX_POLICY_RULES = 50;
@@ -12617,6 +12702,7 @@ function createL2HardeningTools(storagePath, auditLog) {
 }
 
 // src/index.ts
+init_random();
 init_encoding();
 
 // src/l2-operational/model-provenance.ts
@@ -12863,7 +12949,29 @@ async function createSanctuaryServer(options) {
     keyProtection,
     auditLog
   );
-  await identityManager.load();
+  const loadResult = await identityManager.load();
+  if (loadResult.total > 0 && loadResult.loaded === 0) {
+    console.error(
+      `
+\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+\u2551  \u26A0  WARNING: Encrypted identities found but NONE loaded     \u2551
+\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
+\u2551  ${loadResult.total} encrypted identity file(s) found on disk              \u2551
+\u2551  0 could be decrypted with the current master key            \u2551
+\u2551                                                              \u2551
+\u2551  This usually means SANCTUARY_PASSPHRASE is missing or       \u2551
+\u2551  incorrect. The server will start but with NO identity data. \u2551
+\u2551                                                              \u2551
+\u2551  To fix: set SANCTUARY_PASSPHRASE to the passphrase used     \u2551
+\u2551  when this Sanctuary instance was first configured.          \u2551
+\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D
+`
+    );
+  } else if (loadResult.failed > 0) {
+    console.error(
+      `Warning: ${loadResult.failed} of ${loadResult.total} identity files could not be decrypted (possibly corrupted).`
+    );
+  }
   const l2Tools = [
     {
       name: "sanctuary/exec_attest",
