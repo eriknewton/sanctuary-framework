@@ -132,36 +132,58 @@ export class SovereigntyProfileStore {
 
     if (updates.audit_logging !== undefined) {
       if (updates.audit_logging.enabled !== undefined) {
+        if (typeof updates.audit_logging.enabled !== "boolean") {
+          throw new Error("audit_logging.enabled must be a boolean");
+        }
         features.audit_logging.enabled = updates.audit_logging.enabled;
       }
     }
 
     if (updates.injection_detection !== undefined) {
       if (updates.injection_detection.enabled !== undefined) {
+        if (typeof updates.injection_detection.enabled !== "boolean") {
+          throw new Error("injection_detection.enabled must be a boolean");
+        }
         features.injection_detection.enabled = updates.injection_detection.enabled;
       }
       if (updates.injection_detection.sensitivity !== undefined) {
+        const valid = ["low", "medium", "high"];
+        if (!valid.includes(updates.injection_detection.sensitivity)) {
+          throw new Error("injection_detection.sensitivity must be low, medium, or high");
+        }
         features.injection_detection.sensitivity = updates.injection_detection.sensitivity;
       }
     }
 
     if (updates.context_gating !== undefined) {
       if (updates.context_gating.enabled !== undefined) {
+        if (typeof updates.context_gating.enabled !== "boolean") {
+          throw new Error("context_gating.enabled must be a boolean");
+        }
         features.context_gating.enabled = updates.context_gating.enabled;
       }
       if (updates.context_gating.policy_id !== undefined) {
+        if (typeof updates.context_gating.policy_id !== "string" || updates.context_gating.policy_id.length > 256) {
+          throw new Error("context_gating.policy_id must be a string of 256 characters or fewer");
+        }
         features.context_gating.policy_id = updates.context_gating.policy_id;
       }
     }
 
     if (updates.approval_gate !== undefined) {
       if (updates.approval_gate.enabled !== undefined) {
+        if (typeof updates.approval_gate.enabled !== "boolean") {
+          throw new Error("approval_gate.enabled must be a boolean");
+        }
         features.approval_gate.enabled = updates.approval_gate.enabled;
       }
     }
 
     if (updates.zk_proofs !== undefined) {
       if (updates.zk_proofs.enabled !== undefined) {
+        if (typeof updates.zk_proofs.enabled !== "boolean") {
+          throw new Error("zk_proofs.enabled must be a boolean");
+        }
         features.zk_proofs.enabled = updates.zk_proofs.enabled;
       }
     }

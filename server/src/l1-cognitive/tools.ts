@@ -47,6 +47,8 @@ const RESERVED_NAMESPACE_PREFIXES = [
   "_federation",
   "_handshake",
   "_shr",
+  "_sovereignty_profile",
+  "_context_gate_policies",
 ] as const;
 
 /**

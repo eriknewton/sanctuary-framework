@@ -260,4 +260,67 @@ describe("SovereigntyProfileStore", () => {
       expect(updated.features.audit_logging.enabled).toBe(true); // Default
     });
   });
+
+  // ── Input Validation (SEC-042) ────────────────────────────────────
+
+  describe("input validation", () => {
+    it("rejects non-boolean enabled value", async () => {
+      const { store } = createStore();
+      await store.load();
+      await expect(
+        store.update({ audit_logging: { enabled: "yes" as unknown as boolean } })
+      ).rejects.toThrow("must be a boolean");
+    });
+
+    it("rejects invalid sensitivity value", async () => {
+      const { store } = createStore();
+      await store.load();
+      await expect(
+        store.update({
+          injection_detection: { sensitivity: "INVALID" as "low" | "medium" | "high" },
+        })
+      ).rejects.toThrow("must be low, medium, or high");
+    });
+
+    it("rejects policy_id exceeding 256 characters", async () => {
+      const { store } = createStore();
+      await store.load();
+      await expect(
+        store.update({
+          context_gating: { policy_id: "x".repeat(257) },
+        })
+      ).rejects.toThrow("256 characters or fewer");
+    });
+
+    it("rejects non-string policy_id", async () => {
+      const { store } = createStore();
+      await store.load();
+      await expect(
+        store.update({
+          context_gating: { policy_id: 12345 as unknown as string },
+        })
+      ).rejects.toThrow("must be a string");
+    });
+
+    it("accepts valid sensitivity values", async () => {
+      const { store } = createStore();
+      await store.load();
+      for (const s of ["low", "medium", "high"] as const) {
+        const updated = await store.update({
+          injection_detection: { sensitivity: s },
+        });
+        expect(updated.features.injection_detection.sensitivity).toBe(s);
+      }
+    });
+
+    it("accepts policy_id at 256 character limit", async () => {
+      const { store } = createStore();
+      await store.load();
+      const id = "x".repeat(256);
+      const updated = await store.update({
+        context_gating: { policy_id: id },
+      });
+      expect(updated.features.context_gating.policy_id).toBe(id);
+    });
+  });
 });

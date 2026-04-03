@@ -980,16 +980,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     let body = "";
+    let destroyed = false;
     req.on("data", (chunk: Buffer) => {
       body += chunk.toString();
       // Size limit: 16KB for profile updates
       if (body.length > 16384) {
+        destroyed = true;
         res.writeHead(413, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Request body too large" }));
         req.destroy();
       }
     });
     req.on("end", async () => {
+      if (destroyed) return;
       try {
         const updates: SovereigntyProfileUpdate = JSON.parse(body);
         const updated = await this.profileStore!.update(updates);
