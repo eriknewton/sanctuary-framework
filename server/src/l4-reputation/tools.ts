@@ -620,6 +620,28 @@ export function createL4Tools(
 
         const publishType = args.type as string;
         const veracoreUrl = (args.verascore_url as string) || "https://verascore.ai";
+
+        // SEC-037: Validate verascore_url to prevent SSRF.
+        // Only allow HTTPS URLs to known Verascore domains.
+        const ALLOWED_VERASCORE_HOSTS = ["verascore.ai", "www.verascore.ai", "api.verascore.ai"];
+        try {
+          const parsed = new URL(veracoreUrl);
+          if (parsed.protocol !== "https:") {
+            return toolResult({
+              error: `verascore_url must use HTTPS. Got: ${parsed.protocol}`,
+            });
+          }
+          if (!ALLOWED_VERASCORE_HOSTS.includes(parsed.hostname)) {
+            return toolResult({
+              error: `verascore_url must point to a known Verascore domain (${ALLOWED_VERASCORE_HOSTS.join(", ")}). Got: ${parsed.hostname}`,
+            });
+          }
+        } catch {
+          return toolResult({
+            error: `verascore_url is not a valid URL: ${veracoreUrl}`,
+          });
+        }
+
         const agentId = (args.verascore_agent_id as string) || identity.did.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase();
 
         // Build the payload based on type
@@ -655,28 +677,28 @@ export function createL4Tools(
           }
         }
 
-        // Sign the payload
-        const { sign, createPrivateKey } = await import("crypto");
-        const payloadBytes = Buffer.from(JSON.stringify(publishData), "utf-8");
+        // SEC-036: Sign the payload with the identity's actual Ed25519 key.
+        // Previously used a derived key that didn't match the published public key,
+        // making verification impossible. Now signs with the identity's private key
+        // (same key used for SHR signing, attestations, etc.).
+        const { sign: identitySign } = await import("../core/identity.js");
+        const payloadBytes = new TextEncoder().encode(JSON.stringify(publishData));
 
         let signatureB64: string;
         try {
-          // Derive a signing key for Verascore publishing
-          const signingKey = derivePurposeKey(masterKey, "verascore-publish");
-          const privateKey = createPrivateKey({
-            key: Buffer.concat([
-              Buffer.from("302e020100300506032b657004220420", "hex"), // Ed25519 DER PKCS8 prefix
-              Buffer.from(signingKey.slice(0, 32)),
-            ]),
-            format: "der",
-            type: "pkcs8",
-          });
-          const sig = sign(null, payloadBytes, privateKey);
-          signatureB64 = sig.toString("base64url");
+          const signingBytes = identitySign(
+            payloadBytes,
+            identity.encrypted_private_key,
+            identityEncryptionKey,
+          );
+          signatureB64 = toBase64url(signingBytes);
         } catch (signError) {
-          // Fallback: use a placeholder signature when key derivation context doesn't support signing
-          // This allows the tool to work in testing/demo mode
-          signatureB64 = toBase64url(new Uint8Array(64));
+          // SEC-036: Do NOT fall back to a placeholder signature.
+          // If signing fails, the operation must fail — not silently degrade.
+          return toolResult({
+            error: "Failed to sign publish payload. Identity key may be corrupted.",
+            details: signError instanceof Error ? signError.message : String(signError),
+          });
         }
 
         // Build the request
