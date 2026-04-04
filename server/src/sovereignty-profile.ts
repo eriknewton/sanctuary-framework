@@ -147,9 +147,9 @@ export class SovereigntyProfileStore {
       await this.load();
     }
 
-    // SEC-057: Core enforcement features cannot be disabled
-    const CORE_ENFORCEMENT = ['approval_gate'];
-    if (updates.approval_gate && updates.approval_gate.enabled === false) {
+    // SEC-057: Core enforcement features cannot be disabled.
+    // Type system prevents enabled:false at compile time; runtime guard catches raw JSON.
+    if (updates.approval_gate && (updates.approval_gate as Record<string, unknown>).enabled === false) {
       throw new Error("approval_gate cannot be disabled — it is a core enforcement feature");
     }
 
