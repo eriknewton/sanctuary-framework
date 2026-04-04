@@ -6,9 +6,11 @@ layout: null
 <html class="dark" lang="en"><head>
 <meta charset="utf-8"/>
 <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
-<title>Sanctuary Framework — Sovereignty Infrastructure for Agents</title>
-<meta name="description" content="Security, privacy, and control for AI agents. Four layers of cryptographic sovereignty delivered as a single MCP server. Open source. Live."/>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&amp;family=Inter:wght@300;400;500;600&amp;family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<title>Sanctuary — Sovereignty Infrastructure for Agents</title>
+<meta name="description" content="Sanctuary gives AI agents encrypted state, self-custodied identity, human-in-the-loop approval gates, and verifiable reputation — without changing the host harness." />
+<link href="https://fonts.googleapis.com" rel="preconnect"/>
+<link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&amp;family=Space+Grotesk:wght@400;500;600;700&amp;display=swap" rel="stylesheet"/>
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
 <script id="tailwind-config">
@@ -17,57 +19,57 @@ layout: null
         theme: {
           extend: {
             "colors": {
-                    "primary-container": "#8a99ff",
-                    "on-primary": "#001a91",
-                    "surface": "#0c0e14",
-                    "outline": "#74757d",
-                    "surface-container-highest": "#23262e",
-                    "on-secondary-fixed": "#490090",
-                    "inverse-primary": "#3b50d3",
-                    "primary-dim": "#5367ea",
-                    "error-dim": "#d73357",
-                    "on-tertiary": "#003b52",
-                    "on-tertiary-container": "#003044",
-                    "on-primary-container": "#001272",
-                    "tertiary-fixed": "#37bcf7",
+                    "tertiary": "#47c4ff",
+                    "tertiary-container": "#2db7f2",
+                    "surface-dim": "#0c0e14",
+                    "on-primary-fixed": "#000000",
+                    "error-container": "#a70138",
                     "on-error": "#490013",
-                    "surface-tint": "#9ca8ff",
-                    "on-secondary-fixed-variant": "#6b23c0",
-                    "secondary-fixed-dim": "#d5b6ff",
+                    "on-surface": "#e5e5ed",
                     "surface-bright": "#292c35",
-                    "surface-container-low": "#11131a",
+                    "inverse-surface": "#faf8ff",
+                    "secondary-fixed-dim": "#d5b6ff",
+                    "on-secondary-fixed-variant": "#6b23c0",
+                    "tertiary-dim": "#05a9e3",
+                    "on-surface-variant": "#aaaab3",
+                    "secondary-container": "#610fb6",
+                    "outline-variant": "#46484f",
+                    "on-primary-container": "#001272",
+                    "surface-container-highest": "#23262e",
+                    "inverse-primary": "#3b50d3",
+                    "surface-tint": "#9ca8ff",
+                    "primary-fixed-dim": "#788aff",
+                    "on-tertiary": "#003b52",
                     "primary": "#9ca8ff",
+                    "error-dim": "#d73357",
+                    "primary-container": "#8a99ff",
+                    "surface-container-high": "#1d1f27",
                     "background": "#0c0e14",
                     "on-tertiary-fixed": "#001a27",
-                    "tertiary": "#47c4ff",
-                    "secondary-fixed": "#e0c7ff",
-                    "surface-variant": "#23262e",
-                    "on-primary-fixed": "#000000",
-                    "primary-fixed": "#8a99ff",
-                    "on-surface": "#e5e5ed",
-                    "surface-container-lowest": "#000000",
-                    "surface-container-high": "#1d1f27",
-                    "surface-container": "#171921",
-                    "on-secondary-container": "#dfc6ff",
+                    "surface": "#0c0e14",
+                    "tertiary-fixed": "#37bcf7",
+                    "tertiary-fixed-dim": "#1bafe9",
+                    "outline": "#74757d",
                     "on-error-container": "#ffb2b9",
-                    "primary-fixed-dim": "#788aff",
                     "inverse-on-surface": "#53555c",
-                    "inverse-surface": "#faf8ff",
-                    "on-tertiary-fixed-variant": "#003e56",
-                    "on-background": "#e5e5ed",
-                    "on-surface-variant": "#aaaab3",
-                    "tertiary-container": "#2db7f2",
-                    "tertiary-dim": "#05a9e3",
-                    "secondary-container": "#610fb6",
-                    "surface-dim": "#0c0e14",
-                    "error-container": "#a70138",
-                    "outline-variant": "#46484f",
-                    "on-secondary": "#2f0060",
-                    "error": "#ff6e84",
+                    "surface-variant": "#23262e",
+                    "on-primary": "#001a91",
                     "secondary": "#b885ff",
+                    "on-secondary-fixed": "#490090",
+                    "on-tertiary-fixed-variant": "#003e56",
+                    "surface-container-lowest": "#000000",
+                    "on-secondary-container": "#dfc6ff",
+                    "on-secondary": "#2f0060",
+                    "on-tertiary-container": "#003044",
+                    "surface-container-low": "#11131a",
+                    "primary-dim": "#5367ea",
+                    "error": "#ff6e84",
+                    "secondary-fixed": "#e0c7ff",
                     "secondary-dim": "#9150e7",
-                    "on-primary-fixed-variant": "#00188b",
-                    "tertiary-fixed-dim": "#1bafe9"
+                    "on-background": "#e5e5ed",
+                    "primary-fixed": "#8a99ff",
+                    "surface-container": "#171921",
+                    "on-primary-fixed-variant": "#00188b"
             },
             "borderRadius": {
                     "DEFAULT": "0.125rem",
@@ -76,9 +78,15 @@ layout: null
                     "full": "0.75rem"
             },
             "fontFamily": {
-                    "headline": ["Space Grotesk"],
-                    "body": ["Inter"],
-                    "label": ["Inter"]
+                    "headline": [
+                            "Space Grotesk"
+                    ],
+                    "body": [
+                            "Inter"
+                    ],
+                    "label": [
+                            "Inter"
+                    ]
             }
           },
         },
@@ -88,169 +96,256 @@ layout: null
         .material-symbols-outlined {
             font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
         }
+        body {
+            background-color: #0c0e14;
+            color: #e5e5ed;
+            font-family: 'Inter', sans-serif;
+            overflow-x: hidden;
+        }
+        .ethereal-glow {
+            background: radial-gradient(circle at 50% 50%, rgba(156, 168, 255, 0.08) 0%, rgba(12, 14, 20, 0) 70%);
+        }
         .glass-panel {
-            background: rgba(23, 25, 33, 0.7);
+            background: rgba(23, 25, 33, 0.6);
             backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+        }
+        .text-gradient {
+            background: linear-gradient(135deg, #e5e5ed 0%, #9ca8ff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .text-glow {
+            text-shadow: 0 0 30px rgba(156, 168, 255, 0.3);
+        }
+        .globe-mask-full {
+            mask-image: linear-gradient(to bottom, transparent 0%, black 20%, black 80%, transparent 100%);
+            -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 20%, black 80%, transparent 100%);
         }
     </style>
 </head>
-<body class="bg-surface text-on-surface font-body selection:bg-primary-container selection:text-on-primary-container">
-<!-- Top Navigation Shell -->
-<nav class="fixed top-0 w-full z-50 bg-slate-950/70 backdrop-blur-xl shadow-[0_0_40px_rgba(156,168,255,0.05)]">
-<div class="flex justify-between items-center max-w-7xl mx-auto px-8 h-20">
-<div class="text-2xl font-bold tracking-tighter text-[#e5e5ed] font-['Space_Grotesk']">SANCTUARY</div>
-<div class="hidden md:flex items-center gap-10">
-<a class="text-[#e5e5ed]/60 hover:text-[#e5e5ed] transition-colors font-['Space_Grotesk'] tracking-tight" href="#layers">Layers</a>
-<a class="text-[#e5e5ed]/60 hover:text-[#e5e5ed] transition-colors font-['Space_Grotesk'] tracking-tight" href="#install">Install</a>
-<a class="text-[#e5e5ed]/60 hover:text-[#e5e5ed] transition-colors font-['Space_Grotesk'] tracking-tight" href="/blog">Blog</a>
-<a class="text-[#e5e5ed]/60 hover:text-[#e5e5ed] transition-colors font-['Space_Grotesk'] tracking-tight" href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
+<body class="selection:bg-primary/30 selection:text-primary">
+<!-- TopNavBar Shell -->
+<nav class="fixed top-0 w-full z-50 bg-slate-950/70 backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.5)]">
+<div class="flex justify-between items-center px-8 py-6 max-w-[1440px] mx-auto w-full font-['Space_Grotesk'] tracking-tight">
+<div class="text-2xl font-bold tracking-tighter text-[#e5e5ed]">
+                Sanctuary
+            </div>
+<!-- Desktop Links -->
+<div class="hidden md:flex gap-10 items-center">
+<a class="text-[#9ca8ff] font-semibold transition-colors duration-300" href="#layers">Architecture</a>
+<a class="text-[#e5e5ed]/60 hover:text-[#b885ff] transition-colors duration-300" href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
+<a class="text-[#e5e5ed]/60 hover:text-[#b885ff] transition-colors duration-300" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a>
+<a class="text-[#e5e5ed]/60 hover:text-[#b885ff] transition-colors duration-300" href="https://eriknewton.substack.com">Blog</a>
 </div>
-<a href="https://github.com/eriknewton/sanctuary-framework" class="bg-gradient-to-br from-primary-dim to-primary text-on-primary-fixed font-semibold px-6 py-2.5 rounded-xl hover:opacity-80 transition-all duration-300 scale-95 active:scale-90 font-['Space_Grotesk'] no-underline">
-                View on GitHub
-            </a>
+<div class="flex items-center gap-6">
+<a href="https://github.com/eriknewton/sanctuary-framework" class="bg-gradient-to-br from-primary-dim to-primary text-on-primary-fixed font-bold px-6 py-2.5 rounded-xl scale-95 active:scale-90 transition-transform inline-block no-underline">
+                    Get Started
+                </a>
+</div>
 </div>
 </nav>
-<main class="pt-20">
+<main class="relative">
 <!-- Hero Section -->
-<section class="relative min-h-[921px] flex flex-col items-center justify-center overflow-hidden px-8">
-<div class="absolute inset-0 z-0 overflow-hidden pointer-events-none">
-<div class="absolute top-1/4 left-1/4 w-[500px] h-[500px] bg-primary/10 rounded-full blur-[120px]"></div>
-<div class="absolute bottom-1/4 right-1/4 w-[400px] h-[400px] bg-secondary/10 rounded-full blur-[120px]"></div>
-</div>
-<div class="relative z-10 max-w-5xl w-full text-center">
-<div class="inline-flex items-center gap-2 px-3 py-1 mb-8 rounded-full bg-surface-container border border-outline-variant/20 text-primary text-xs font-medium tracking-widest uppercase">
-<span class="material-symbols-outlined text-[14px]">verified_user</span>
-                    v0.5.11 — Open Source &amp; Live
-                </div>
-<h1 class="font-headline text-5xl md:text-7xl lg:text-8xl font-bold tracking-tight text-on-surface mb-8 leading-[1.1]">
-                    Sovereignty infrastructure <br/> <span class="text-primary-dim">for agents</span>
+<section class="relative pt-48 pb-0 px-8 overflow-hidden pt-32">
+<div class="max-w-[1440px] mx-auto relative z-10">
+<div class="flex flex-col items-center text-center max-w-4xl mx-auto">
+<span class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-surface-container border border-outline-variant/10 text-primary font-label text-xs tracking-widest uppercase mb-8">
+<span class="w-2 h-2 rounded-full bg-primary animate-pulse"></span>
+                        Open Source &middot; Apache 2.0
+                    </span>
+<div class="relative z-30 mb-2">
+<h1 class="font-headline text-5xl md:text-6xl lg:text-7xl font-bold tracking-tighter text-[#e5e5ed] mb-8 leading-[1.1] text-glow">
+                            Sovereignty infrastructure <br/> <span class="text-gradient">for agents</span>
 </h1>
-<p class="font-body text-on-surface-variant text-lg md:text-xl max-w-2xl mx-auto mb-12 leading-relaxed">
-                    Security, privacy, and control for AI agents and the humans who run them. Four layers of cryptographic sovereignty — from encrypted memory to verifiable reputation — delivered as a single MCP server.
-                </p>
-<div class="flex flex-col sm:flex-row items-center justify-center gap-6">
-<a href="#install" class="w-full sm:w-auto px-8 py-4 bg-gradient-to-br from-primary-dim to-primary text-on-primary-fixed font-bold rounded-xl text-lg shadow-[0_0_30px_rgba(156,168,255,0.2)] hover:scale-[1.02] transition-all text-center no-underline">
-                        Get Started
-                    </a>
-<a href="https://github.com/eriknewton/sanctuary-framework" class="w-full sm:w-auto px-8 py-4 border border-outline-variant/30 text-primary font-bold rounded-xl text-lg hover:bg-primary/5 transition-all text-center no-underline">
-                        View Source
-                    </a>
+<p class="font-body text-lg md:text-xl text-on-surface-variant max-w-2xl mx-auto leading-relaxed">
+                            Encrypted state. Self-custodied identity. Human-in-the-loop approval gates. Verifiable reputation. One MCP server. No changes to your agent harness.
+                        </p>
+</div>
+</div>
+<!-- Immersive Visualization (Globe) -->
+<div class="relative w-full flex items-center justify-center overflow-visible -mt-24 -mb-24">
+<!-- Soft Edge Fades using layered gradients to blend into background -->
+<div class="absolute inset-x-0 top-0 h-40 bg-gradient-to-b from-[#0c0e14] to-transparent z-20 pointer-events-none"></div>
+<div class="absolute inset-x-0 bottom-0 h-40 bg-gradient-to-t from-[#0c0e14] to-transparent z-20 pointer-events-none"></div>
+<div class="absolute inset-0 ethereal-glow scale-150"></div>
+<!-- Core Globe Image with Soft Fading Edges -->
+<div class="relative z-10 w-full max-w-[1200px] globe-mask-full">
+<img class="w-full h-auto object-contain opacity-90 transition-opacity duration-1000" alt="Glowing teal wireframe globe representing Sanctuary's sovereign infrastructure" src="images/globe.png"/>
+</div>
 </div>
 </div>
 </section>
-<!-- Four Layers Section (Bento Grid) -->
-<section id="layers" class="max-w-7xl mx-auto px-8 py-32">
-<div class="flex flex-col md:flex-row justify-between items-end mb-20 gap-8">
-<div class="max-w-2xl">
-<h2 class="font-headline text-4xl md:text-5xl font-bold text-on-surface mb-6">The Four Layers</h2>
+<!-- The Four Layers Section -->
+<section id="layers" class="px-8 relative pt-32">
+<div class="max-w-[1440px] mx-auto">
+<div class="flex flex-col items-center text-center max-w-3xl mx-auto mb-24">
+<h2 class="font-headline text-4xl font-bold tracking-tight mb-6">The Four Layers of Sanctuary</h2>
 <p class="text-on-surface-variant text-lg leading-relaxed">
-                        Four cryptographic layers that separate concerns and compose into a complete sovereignty stack. Each layer solves a distinct problem. Together they give any agent — or any human acting through an agent — verifiable security from memory to reputation.
-                    </p>
+                            A vertical sovereignty stack. Each layer isolates a distinct concern — from encrypted memory to portable reputation — so agents and the humans behind them stay in control.
+                        </p>
 </div>
-<div class="text-right">
-<span class="font-headline text-primary font-bold text-6xl opacity-20">01-04</span>
-</div>
-</div>
-<div class="grid grid-cols-1 md:grid-cols-12 gap-6">
-<!-- L1 Card -->
-<div class="md:col-span-7 group relative bg-surface-container-low rounded-3xl p-10 overflow-hidden border border-transparent hover:border-primary/20 transition-all">
-<div class="absolute top-0 right-0 p-8 opacity-5 font-headline text-8xl font-bold">L1</div>
-<div class="relative z-10">
-<div class="w-14 h-14 bg-primary/10 rounded-2xl flex items-center justify-center text-primary mb-8">
-<span class="material-symbols-outlined text-3xl">lock</span>
+<!-- Bento Grid for Layers -->
+<div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+<!-- L1 — Cognitive Sovereignty -->
+<div class="md:col-span-1 p-8 rounded-[2rem] bg-surface-container border border-white/5 hover:bg-surface-container-high transition-all group flex flex-col justify-between h-[450px]">
+<div>
+<div class="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-primary mb-12">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">security</span>
 </div>
 <h3 class="font-headline text-2xl font-bold mb-4">Cognitive Sovereignty</h3>
-<p class="text-on-surface-variant leading-relaxed mb-6">Everything the agent knows is encrypted at rest. AES-256-GCM with unique IVs per write, namespace-isolated derived keys via HKDF, and Merkle integrity verification. No plaintext on disk. Ever.</p>
-<ul class="space-y-3 text-sm text-on-surface/70">
-<li class="flex items-center gap-2"><span class="w-1.5 h-1.5 rounded-full bg-primary"></span> AES-256-GCM encryption at rest</li>
-<li class="flex items-center gap-2"><span class="w-1.5 h-1.5 rounded-full bg-primary"></span> Merkle proof integrity verification</li>
-</ul>
+<p class="text-on-surface-variant text-sm leading-relaxed">
+                                All agent state encrypted at rest with AES-256-GCM. Ed25519 self-custodied identity. Your agent's memory and keys belong to you — always.
+                            </p>
 </div>
+<div class="text-xs font-mono text-primary/40 uppercase tracking-widest">Layer 01</div>
 </div>
-<!-- L2 Card -->
-<div class="md:col-span-5 group relative bg-surface-container rounded-3xl p-10 overflow-hidden border border-transparent hover:border-secondary/20 transition-all">
-<div class="absolute top-0 right-0 p-8 opacity-5 font-headline text-8xl font-bold text-secondary">L2</div>
-<div class="relative z-10">
-<div class="w-14 h-14 bg-secondary/10 rounded-2xl flex items-center justify-center text-secondary mb-8">
-<span class="material-symbols-outlined text-3xl">security</span>
+<!-- L2 — Operational Isolation -->
+<div class="md:col-span-1 p-8 rounded-[2rem] bg-surface-container border border-white/5 hover:bg-surface-container-high transition-all group flex flex-col justify-between h-[450px]">
+<div>
+<div class="w-12 h-12 rounded-xl bg-secondary/10 flex items-center justify-center text-secondary mb-12">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">enhanced_encryption</span>
 </div>
 <h3 class="font-headline text-2xl font-bold mb-4">Operational Isolation</h3>
-<p class="text-on-surface-variant leading-relaxed">A three-tier Principal Policy gate evaluates every tool call before execution. Human-in-the-loop confirmation for high-stakes operations, behavioral anomaly detection, and context gating that controls what flows to remote providers.</p>
+<p class="text-on-surface-variant text-sm leading-relaxed">
+                                Three-tier approval gate on every tool call. Dangerous operations require human confirmation. Anomaly detection flags unexpected behavior. Full audit trail.
+                            </p>
 </div>
+<div class="text-xs font-mono text-secondary/40 uppercase tracking-widest">Layer 02</div>
 </div>
-<!-- L3 Card -->
-<div class="md:col-span-5 group relative bg-surface-container rounded-3xl p-10 overflow-hidden border border-transparent hover:border-tertiary/20 transition-all">
-<div class="absolute top-0 right-0 p-8 opacity-5 font-headline text-8xl font-bold text-tertiary">L3</div>
-<div class="relative z-10">
-<div class="w-14 h-14 bg-tertiary/10 rounded-2xl flex items-center justify-center text-tertiary mb-8">
-<span class="material-symbols-outlined text-3xl">visibility_off</span>
+<!-- L3 — Selective Disclosure -->
+<div class="md:col-span-1 p-8 rounded-[2rem] bg-surface-container border border-white/5 hover:bg-surface-container-high transition-all group flex flex-col justify-between h-[450px]">
+<div>
+<div class="w-12 h-12 rounded-xl bg-tertiary/10 flex items-center justify-center text-tertiary mb-12">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">hub</span>
 </div>
 <h3 class="font-headline text-2xl font-bold mb-4">Selective Disclosure</h3>
-<p class="text-on-surface-variant leading-relaxed">Prove claims without revealing the underlying data. Schnorr signatures, Pedersen commitments, and range proofs on Ristretto255 — genuine zero-knowledge cryptography built on audited primitives.</p>
+<p class="text-on-surface-variant text-sm leading-relaxed">
+                                Prove claims without revealing data. Pedersen commitments, Schnorr proofs, and range proofs built on audited cryptographic primitives.
+                            </p>
 </div>
+<div class="text-xs font-mono text-tertiary/40 uppercase tracking-widest">Layer 03</div>
 </div>
-<!-- L4 Card -->
-<div class="md:col-span-7 group relative bg-surface-container-high rounded-3xl p-10 overflow-hidden border border-transparent hover:border-primary-container/20 transition-all">
-<div class="absolute top-0 right-0 p-8 opacity-5 font-headline text-8xl font-bold text-primary-container">L4</div>
-<div class="relative z-10">
-<div class="w-14 h-14 bg-primary-container/10 rounded-2xl flex items-center justify-center text-primary-container mb-8">
-<span class="material-symbols-outlined text-3xl">verified</span>
+<!-- L4 — Verifiable Reputation -->
+<div class="md:col-span-1 p-8 rounded-[2rem] bg-surface-container border border-white/5 hover:bg-surface-container-high transition-all group flex flex-col justify-between h-[450px]">
+<div>
+<div class="w-12 h-12 rounded-xl bg-on-surface/10 flex items-center justify-center text-on-surface mb-12">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">verified</span>
 </div>
 <h3 class="font-headline text-2xl font-bold mb-4">Verifiable Reputation</h3>
-<p class="text-on-surface-variant leading-relaxed mb-6">Signed attestations in EAS-compatible format, sovereignty-gated trust tiers, and portable reputation bundles. Agents prove their track record cryptographically — no central authority required.</p>
-<div class="flex gap-4">
-<span class="px-3 py-1 bg-surface-container-lowest rounded-lg border border-outline-variant/10 text-xs text-on-surface-variant font-mono">62 MCP Tools</span>
-<span class="px-3 py-1 bg-surface-container-lowest rounded-lg border border-outline-variant/10 text-xs text-on-surface-variant font-mono">653 Tests</span>
+<p class="text-on-surface-variant text-sm leading-relaxed">
+                                Signed attestations, sovereignty-gated trust tiers, and portable reputation bundles. Trust is earned, cryptographically verified, and never platform-locked.
+                            </p>
+</div>
+<div class="text-xs font-mono text-on-surface/40 uppercase tracking-widest">Layer 04</div>
+</div>
+</div>
+</div>
+</section>
+<!-- Technical Deep Dive (Editorial Style) -->
+<section class="py-32 px-8 bg-surface-container-low">
+<div class="max-w-[1440px] mx-auto grid grid-cols-1 lg:grid-cols-2 gap-32 items-center">
+<div class="relative">
+<div class="absolute -top-12 -left-12 w-64 h-64 bg-primary/20 rounded-full blur-[100px]"></div>
+<img class="rounded-[2.5rem] relative z-10 shadow-2xl" alt="Server infrastructure with violet lighting" src="images/editorial.png"/>
+<div class="absolute -bottom-8 -right-8 p-8 glass-panel rounded-3xl border border-white/10 z-20 max-w-xs">
+<p class="font-mono text-sm text-primary/80 leading-relaxed">npx @sanctuary-framework/mcp-server</p>
+<p class="mt-2 text-on-surface-variant text-sm leading-relaxed">One command. 62 MCP tools. Full sovereignty stack running locally.</p>
+</div>
+</div>
+<div class="flex flex-col gap-10">
+<h2 class="font-headline text-5xl font-bold leading-tight">Built for the people <br/><span class="text-secondary">who build agents</span></h2>
+<div class="space-y-8">
+<div class="flex gap-6">
+<div class="text-primary pt-1">
+<span class="material-symbols-outlined">terminal</span>
+</div>
+<div>
+<h4 class="font-headline text-xl font-semibold mb-2">Standard MCP Server</h4>
+<p class="text-on-surface-variant leading-relaxed">Works with Claude, OpenClaw, LM Studio, and any MCP-compatible harness. No fork needed — just connect and go.</p>
+</div>
+</div>
+<div class="flex gap-6">
+<div class="text-primary pt-1">
+<span class="material-symbols-outlined">dashboard</span>
+</div>
+<div>
+<h4 class="font-headline text-xl font-semibold mb-2">Real-Time Dashboard</h4>
+<p class="text-on-surface-variant leading-relaxed">Browser-based control surface for approving operations, monitoring sovereignty health, and configuring enforcement — all in real time via SSE.</p>
+</div>
+</div>
+<div class="flex gap-6">
+<div class="text-primary pt-1">
+<span class="material-symbols-outlined">handshake</span>
+</div>
+<div>
+<h4 class="font-headline text-xl font-semibold mb-2">Agent-to-Agent Trust</h4>
+<p class="text-on-surface-variant leading-relaxed">Sovereignty handshake protocol for mutual verification. Agents prove their security posture to each other before transacting.</p>
+</div>
 </div>
 </div>
 </div>
 </div>
 </section>
-<!-- Code Block Section -->
-<section id="install" class="max-w-7xl mx-auto px-8 py-32">
-<div class="bg-surface-container-low rounded-[2rem] p-1 md:p-2 border border-outline-variant/10">
-<div class="bg-surface-container-lowest rounded-[1.8rem] overflow-hidden">
-<div class="flex items-center justify-between px-8 py-4 border-b border-outline-variant/5 bg-surface-container-low/50">
-<div class="flex gap-2">
-<div class="w-3 h-3 rounded-full bg-error/30"></div>
-<div class="w-3 h-3 rounded-full bg-secondary/30"></div>
-<div class="w-3 h-3 rounded-full bg-primary/30"></div>
-</div>
-<span class="text-xs font-mono text-on-surface-variant tracking-widest uppercase">Bash Terminal</span>
-<span class="material-symbols-outlined text-sm text-on-surface-variant cursor-pointer hover:text-primary">content_copy</span>
-</div>
-<div class="p-10 md:p-16">
-<div class="max-w-2xl">
-<h4 class="font-headline text-3xl font-bold mb-6">One Command. Full Sovereignty.</h4>
-<p class="text-on-surface-variant mb-10 leading-relaxed">Start your sovereign MCP server with a single command. Sanctuary generates your Ed25519 identity, encrypts your state, and activates the approval gate — no configuration required.</p>
-</div>
-<div class="p-6 bg-surface-container-high rounded-2xl border border-outline-variant/10 flex items-center gap-4">
-<span class="text-primary font-mono select-none">$</span>
-<code class="font-mono text-lg md:text-xl text-primary-fixed leading-none">npx @sanctuary-framework/mcp-server</code>
-</div>
-<div class="mt-12 flex flex-wrap gap-8 opacity-40 grayscale hover:grayscale-0 transition-all">
-<div class="flex items-center gap-2 font-headline font-bold text-xl"><span class="material-symbols-outlined">api</span> MCP Protocol</div>
-<div class="flex items-center gap-2 font-headline font-bold text-xl"><span class="material-symbols-outlined">memory</span> TypeScript</div>
-<div class="flex items-center gap-2 font-headline font-bold text-xl"><span class="material-symbols-outlined">verified_user</span> Ed25519</div>
-<div class="flex items-center gap-2 font-headline font-bold text-xl"><span class="material-symbols-outlined">lock</span> AES-256-GCM</div>
-</div>
+<!-- Final CTA -->
+<section class="py-16 px-8">
+<div class="max-w-[1440px] mx-auto rounded-[3rem] bg-gradient-to-br p-12 md:p-20 text-center relative overflow-hidden bg-[#0c0e14] border border-white/5">
+<div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/carbon-fibre.png')] opacity-5"></div>
+<div class="relative z-10 max-w-3xl mx-auto">
+<h2 class="font-headline text-3xl md:text-5xl font-bold mb-6 md:mb-8 leading-tight">Give your agent sovereignty in one command</h2>
+<p class="text-on-surface-variant text-lg mb-10">Open source. Runs locally. No platform dependency. No blockchain required.</p>
+<div class="flex flex-col md:flex-row justify-center gap-6">
+<a href="https://github.com/eriknewton/sanctuary-framework" class="bg-primary text-on-primary-fixed px-12 py-5 rounded-full font-bold hover:brightness-110 transition-all no-underline inline-block">View on GitHub</a>
+<a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server" class="border border-outline px-12 py-5 rounded-full font-bold hover:bg-white/5 transition-all no-underline inline-block">Install from npm</a>
 </div>
 </div>
 </div>
 </section>
 </main>
 <!-- Footer Shell -->
-<footer class="w-full py-16 mt-32 bg-[#0c0e14]">
-<div class="flex flex-col md:flex-row justify-between items-center max-w-7xl mx-auto px-8 gap-8">
-<div class="flex flex-col gap-4">
-<div class="text-lg font-bold text-[#e5e5ed] font-['Space_Grotesk']">SANCTUARY</div>
-<p class="text-[#e5e5ed]/40 text-sm font-['Inter']">&copy; 2026 Erik Newton. Apache-2.0 (code) / CC-BY-4.0 (spec).</p>
+<footer class="bg-[#0c0e14] w-full py-16 px-8 border-t border-white/5">
+<div class="flex flex-col md:flex-row justify-between items-start gap-12 max-w-[1440px] mx-auto font-['Inter'] text-sm tracking-wide">
+<div class="max-w-xs">
+<div class="text-lg font-bold text-[#e5e5ed] mb-6">Sanctuary</div>
+<p class="text-[#e5e5ed]/40 leading-relaxed mb-8">
+                    Sovereignty infrastructure for AI agents. Security, privacy, and control — without changing your harness.
+                </p>
+<div class="flex gap-4">
+<a href="https://github.com/eriknewton" class="w-8 h-8 rounded-lg bg-surface-container flex items-center justify-center text-on-surface-variant hover:text-primary transition-colors cursor-pointer">
+<span class="material-symbols-outlined text-sm">code</span>
+</a>
+<a href="https://eriknewton.substack.com" class="w-8 h-8 rounded-lg bg-surface-container flex items-center justify-center text-on-surface-variant hover:text-primary transition-colors cursor-pointer">
+<span class="material-symbols-outlined text-sm">article</span>
+</a>
 </div>
-<div class="flex flex-wrap justify-center gap-8">
-<a class="text-[#e5e5ed]/40 hover:text-[#9ca8ff] transition-colors text-sm font-['Inter'] tracking-wide hover:underline decoration-[#9ca8ff]/30" href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
-<a class="text-[#e5e5ed]/40 hover:text-[#9ca8ff] transition-colors text-sm font-['Inter'] tracking-wide hover:underline decoration-[#9ca8ff]/30" href="/blog">Blog</a>
-<a class="text-[#e5e5ed]/40 hover:text-[#9ca8ff] transition-colors text-sm font-['Inter'] tracking-wide hover:underline decoration-[#9ca8ff]/30" href="https://x.com/eriknewton">X / Twitter</a>
-<a class="text-[#e5e5ed]/40 hover:text-[#9ca8ff] transition-colors text-sm font-['Inter'] tracking-wide hover:underline decoration-[#9ca8ff]/30" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a>
+</div>
+<div class="grid grid-cols-2 md:grid-cols-3 gap-16">
+<div class="flex flex-col gap-4">
+<span class="text-[#e5e5ed] font-semibold mb-2">Project</span>
+<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
+<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm Package</a>
+<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://github.com/eriknewton/sanctuary-framework/blob/main/README.md">Documentation</a>
+</div>
+<div class="flex flex-col gap-4">
+<span class="text-[#e5e5ed] font-semibold mb-2">Ecosystem</span>
+<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://pypi.org/project/concordia-protocol/">Concordia Protocol</a>
+<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://eriknewton.substack.com">Blog</a>
+<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://github.com/eriknewton/sanctuary-framework/blob/main/CHANGELOG.md">Changelog</a>
+</div>
+<div class="flex flex-col gap-4">
+<span class="text-[#e5e5ed] font-semibold mb-2">Author</span>
+<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://github.com/eriknewton">Erik Newton</a>
+<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://cimc.ai">CIMC.ai</a>
+</div>
+</div>
+</div>
+<div class="max-w-[1440px] mx-auto mt-16 pt-8 border-t border-white/5 flex flex-col md:flex-row justify-between items-center gap-6">
+<div class="text-[#e5e5ed]/40 text-xs">
+                © 2026 Erik Newton. Apache-2.0 (code) / CC-BY-4.0 (spec).
+            </div>
+<div class="flex items-center gap-2">
+<span class="w-2 h-2 rounded-full bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]"></span>
+<span class="text-[10px] uppercase tracking-widest text-[#e5e5ed]/60 font-mono">v0.5.14 Published on npm</span>
 </div>
 </div>
 </footer>
