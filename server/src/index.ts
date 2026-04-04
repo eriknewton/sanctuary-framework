@@ -33,6 +33,10 @@ import { createL2HardeningTools } from "./l2-operational/hardening-tools.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
 import { createSovereigntyProfileTools } from "./sovereignty-profile-tools.js";
 import { InjectionDetector } from "./security/injection-detector.js";
+import { ClientManager } from "./proxy/client-manager.js";
+import { ProxyRouter } from "./proxy/proxy-router.js";
+import { CallGovernor } from "./l2-operational/call-governor.js";
+import { createGovernorTools } from "./l2-operational/governor-tools.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
@@ -648,26 +652,118 @@ export async function createSanctuaryServer(options?: {
     manifestTool,
   ];
 
-  // 17a. Wrap all tool handlers with context gate enforcer
+  // 17a. Initialize proxy layer for upstream MCP servers (if configured)
+  let clientManager: ClientManager | undefined;
+  let proxyRouter: ProxyRouter | undefined;
+  const governor = new CallGovernor();
+
+  // 17a. Create governor tools
+  const { tools: governorTools } = createGovernorTools(governor, auditLog);
+  allTools.push(...governorTools);
+
+  const profile = profileStore.get();
+  if (profile.upstream_servers && profile.upstream_servers.length > 0) {
+    const enabledServers = profile.upstream_servers.filter(s => s.enabled);
+    if (enabledServers.length > 0) {
+      clientManager = new ClientManager({
+        onStateChange: (serverName, state, toolCount, error) => {
+          // Broadcast status to dashboard if available
+          if (dashboard) {
+            dashboard.broadcastSSE("proxy-server-status", {
+              server: serverName,
+              state,
+              tool_count: toolCount,
+              error,
+              timestamp: new Date().toISOString(),
+            });
+          }
+          // Log state changes
+          auditLog.append("l2", `proxy_server_${state}`, "system", {
+            server: serverName,
+            tool_count: toolCount,
+            error,
+          });
+        },
+      });
+
+      proxyRouter = new ProxyRouter(
+        clientManager,
+        injectionDetector,
+        auditLog,
+        {
+          contextGateFilter: async (_toolName, args) => {
+            // Use the context gate enforcer if context gating is active
+            const activeProfile = profileStore.get();
+            if (activeProfile.features.context_gating.enabled) {
+              // For proxy calls, we pass through the enforcer's filtering
+              // The enforcer wraps the handler, but for proxy we need pre-call filtering
+              return args; // Context gate wrapping handles this via the handler wrapper below
+            }
+            return args;
+          },
+          governor,
+        }
+      );
+
+      // Start connecting to upstream servers (non-blocking)
+      clientManager.configure(enabledServers).catch(err => {
+        console.error(`[Sanctuary] Failed to configure upstream servers: ${err instanceof Error ? err.message : "unknown error"}`);
+      });
+
+      // Wait briefly for initial connections to establish, then discover tools
+      // Use a short delay to allow connections to complete before tool registration
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // Register discovered upstream tools as proxy/* tools
+      const proxiedTools = proxyRouter.getProxiedTools();
+      if (proxiedTools.length > 0) {
+        allTools.push(...proxiedTools);
+      }
+
+      // Wire client manager to dashboard for SSE status updates
+      if (dashboard) {
+        dashboard.setDependencies({
+          policy,
+          baseline,
+          auditLog,
+          clientManager,
+        });
+      }
+    }
+  }
+
+  // 17b. Wrap all tool handlers with context gate enforcer
   allTools = allTools.map((tool) => ({
     ...tool,
     handler: contextGateEnforcer.wrapHandler(tool.name, tool.handler),
   }));
 
-  // 18. Create MCP server with approval gate
+  // 18. Wire proxy tier resolver into the approval gate
+  if (proxyRouter) {
+    gate.setProxyTierResolver((toolName: string) => {
+      const parsed = ProxyRouter.parseProxyToolName(toolName);
+      if (!parsed) return null;
+      return proxyRouter!.getTierForTool(parsed.serverName, parsed.toolName);
+    });
+  }
+
+  // 19. Create MCP server with approval gate (proxy tools are included in allTools)
   const server = createServer(allTools, { gate });
 
-  // 19. Save config if this is first run
+  // 20. Save config if this is first run
   await saveConfig(config);
 
-  // 20. Register baseline save on process exit
-  const saveBaseline = () => {
+  // 21. Register baseline save and proxy shutdown on process exit
+  const cleanup = () => {
     baseline.save().catch(() => {});
+    if (clientManager) {
+      clientManager.shutdown().catch(() => {});
+    }
   };
-  process.on("SIGINT", saveBaseline);
-  process.on("SIGTERM", saveBaseline);
+  process.on("SIGINT", cleanup);
+  process.on("SIGTERM", cleanup);
 
-  // 21. Log the recovery key if generated (shown once, never again)
+  // 22. Log the recovery key if generated (shown once, never again)
   if (recoveryKey) {
     console.error(
       "╔══════════════════════════════════════════════════════════╗\n" +
@@ -760,7 +856,11 @@ export type {
 export { ContextGateEnforcer } from "./l2-operational/context-gate-enforcer.js";
 export type { EnforcerConfig } from "./l2-operational/context-gate-enforcer.js";
 export { SovereigntyProfileStore, createDefaultProfile } from "./sovereignty-profile.js";
-export type { SovereigntyProfile, SovereigntyProfileUpdate } from "./sovereignty-profile.js";
+export type { SovereigntyProfile, SovereigntyProfileUpdate, UpstreamServer } from "./sovereignty-profile.js";
+export { ClientManager } from "./proxy/client-manager.js";
+export type { ConnectionState, UpstreamConnection, UpstreamTool } from "./proxy/client-manager.js";
+export { ProxyRouter } from "./proxy/proxy-router.js";
+export type { ProxyRouterOptions } from "./proxy/proxy-router.js";
 export { generateSystemPrompt } from "./system-prompt-generator.js";
 export { MemoryStorage } from "./storage/memory.js";
 export { FilesystemStorage } from "./storage/filesystem.js";
