@@ -229,7 +229,20 @@ export class ProxyRouter {
         return this.normalizeResponse(result);
       } catch (err) {
         const latencyMs = Date.now() - start;
-        const errorMessage = err instanceof Error ? err.message : "Unknown upstream error";
+        const rawErrorMessage = err instanceof Error ? err.message : "Unknown upstream error";
+
+        // SEC-050: Sanitize upstream error messages to prevent info disclosure
+        const sanitizeError = (msg: string): string => {
+          // Truncate to 200 chars
+          let safe = msg.substring(0, 200);
+          // Remove file paths
+          safe = safe.replace(/\/[^\s]+/g, '[path-redacted]');
+          // Remove connection strings
+          safe = safe.replace(/(?:mongodb|postgres|mysql|redis):\/\/[^\s]+/g, '[connection-redacted]');
+          return safe;
+        };
+
+        const errorMessage = sanitizeError(rawErrorMessage);
 
         // Audit log the failure
         this.auditLog.append("l2", `proxy_call:${proxyName}`, "system", {
@@ -241,7 +254,7 @@ export class ProxyRouter {
           latency_ms: latencyMs,
         }, "failure");
 
-        // Pass upstream errors through to the agent
+        // Pass upstream errors through to the agent (sanitized)
         return {
           content: [{
             type: "text" as const,
@@ -290,14 +303,36 @@ export class ProxyRouter {
   private normalizeResponse(
     result: { content: Array<{ type: string; text?: string; [key: string]: unknown }> }
   ): { content: Array<{ type: "text"; text: string }> } {
+    // SEC-046: Validate response size before processing
+    const MAX_RESPONSE_SIZE = 1_000_000; // 1MB
+    const MAX_TEXT_BLOCK_SIZE = 100_000; // 100KB per text block
+
+    const responseStr = JSON.stringify(result);
+    if (responseStr.length > MAX_RESPONSE_SIZE) {
+      return toolResult({
+        error: "upstream_response_too_large",
+        max_bytes: MAX_RESPONSE_SIZE,
+      });
+    }
+
     if (!result.content || !Array.isArray(result.content)) {
       return toolResult({ upstream_response: result });
     }
 
-    // Pass through text content directly
+    // Pass through text content directly, with truncation if needed
     const textContent = result.content
       .filter(c => c.type === "text" && typeof c.text === "string")
-      .map(c => ({ type: "text" as const, text: c.text! }));
+      .map(c => {
+        // SEC-046: Truncate text blocks to 100KB
+        const text = c.text!;
+        if (text.length > MAX_TEXT_BLOCK_SIZE) {
+          return {
+            type: "text" as const,
+            text: text.substring(0, MAX_TEXT_BLOCK_SIZE) + "\n[response truncated]",
+          };
+        }
+        return { type: "text" as const, text };
+      });
 
     if (textContent.length > 0) {
       return { content: textContent };

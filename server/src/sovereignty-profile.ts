@@ -43,7 +43,9 @@ export interface SovereigntyProfile {
     audit_logging: { enabled: boolean };
     injection_detection: { enabled: boolean; sensitivity?: "low" | "medium" | "high" };
     context_gating: { enabled: boolean; policy_id?: string };
-    approval_gate: { enabled: boolean };
+    // SEC-057: approval_gate is NOT a toggleable feature — it is core enforcement.
+    // The approval gate is always active. This field is read-only and always true.
+    approval_gate: { enabled: true };
     zk_proofs: { enabled: boolean };
   };
   upstream_servers?: UpstreamServer[];
@@ -55,7 +57,8 @@ export interface SovereigntyProfileUpdate {
   audit_logging?: { enabled?: boolean };
   injection_detection?: { enabled?: boolean; sensitivity?: "low" | "medium" | "high" };
   context_gating?: { enabled?: boolean; policy_id?: string };
-  approval_gate?: { enabled?: boolean };
+  // SEC-057: approval_gate cannot be disabled — omit or pass enabled: true only
+  approval_gate?: { enabled?: true };
   zk_proofs?: { enabled?: boolean };
   upstream_servers?: UpstreamServer[];
 }
@@ -75,7 +78,7 @@ export function createDefaultProfile(): SovereigntyProfile {
       audit_logging: { enabled: true },
       injection_detection: { enabled: true },
       context_gating: { enabled: false },
-      approval_gate: { enabled: false },
+      approval_gate: { enabled: true }, // SEC-057: always enabled — core enforcement
       zk_proofs: { enabled: false },
     },
     updated_at: new Date().toISOString(),
@@ -142,6 +145,12 @@ export class SovereigntyProfileStore {
   async update(updates: SovereigntyProfileUpdate): Promise<SovereigntyProfile> {
     if (!this.profile) {
       await this.load();
+    }
+
+    // SEC-057: Core enforcement features cannot be disabled
+    const CORE_ENFORCEMENT = ['approval_gate'];
+    if (updates.approval_gate && updates.approval_gate.enabled === false) {
+      throw new Error("approval_gate cannot be disabled — it is a core enforcement feature");
     }
 
     const features = this.profile!.features;

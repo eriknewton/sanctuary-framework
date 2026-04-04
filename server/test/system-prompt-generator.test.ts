@@ -52,7 +52,8 @@ describe("generateSystemPrompt", () => {
       expect(prompt).toContain("Optional tools available but not currently enabled");
       expect(prompt).toContain("context gating");
       expect(prompt).toContain("zero-knowledge proofs");
-      expect(prompt).toContain("approval gates");
+      // SEC-057: approval_gate is always enabled (core enforcement), so it won't appear in disabled list
+      expect(prompt).toContain("Approval Gates");
     });
   });
 

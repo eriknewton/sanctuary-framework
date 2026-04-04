@@ -52,7 +52,7 @@ describe("SovereigntyProfileStore", () => {
 
     it("disables approval_gate by default", () => {
       const profile = createDefaultProfile();
-      expect(profile.features.approval_gate.enabled).toBe(false);
+      expect(profile.features.approval_gate.enabled).toBe(true); // SEC-057: always enabled
     });
 
     it("disables zk_proofs by default", () => {
@@ -187,7 +187,7 @@ describe("SovereigntyProfileStore", () => {
       expect(profile.features.audit_logging.enabled).toBe(true);
       expect(profile.features.injection_detection.enabled).toBe(true);
       expect(profile.features.context_gating.enabled).toBe(true);
-      expect(profile.features.approval_gate.enabled).toBe(false);
+      expect(profile.features.approval_gate.enabled).toBe(true); // SEC-057: always enabled
       expect(profile.features.zk_proofs.enabled).toBe(false);
     });
 

@@ -90,6 +90,15 @@ const INVISIBLE_CHARS = [
   "\u17B5", // Khmer vowel inherent AA
   "\u3164", // Hangul filler
   "\uFFA0", // Halfwidth hangul filler
+  "\u202A", // Left-to-Right Embedding (LRE)
+  "\u202B", // Right-to-Left Embedding (RLE)
+  "\u202C", // Pop Directional Formatting (PDF)
+  "\u202D", // Left-to-Right Override (LRO)
+  "\u202E", // Right-to-Left Override (RLO)
+  "\u2066", // Left-to-Right Isolate (LRI)
+  "\u2067", // Right-to-Left Isolate (RLI)
+  "\u2068", // First Strong Isolate (FSI)
+  "\u2069", // Pop Directional Isolate (PDI)
 ];
 
 // Variation selectors: U+FE00–U+FE0F
@@ -120,26 +129,26 @@ const URL_ENCODED_PATTERN = /(?:%[0-9a-fA-F]{2}){4,}/g;
 
 // API key patterns for common providers
 const SECRET_PATTERNS = [
-  { pattern: /sk-[a-zA-Z0-9]{20,}/g, name: "openai_api_key" },
-  { pattern: /sk-ant-[a-zA-Z0-9_-]{20,}/g, name: "anthropic_api_key" },
-  { pattern: /ghp_[a-zA-Z0-9]{36,}/g, name: "github_pat" },
-  { pattern: /gho_[a-zA-Z0-9]{36,}/g, name: "github_oauth" },
-  { pattern: /ghs_[a-zA-Z0-9]{36,}/g, name: "github_app" },
-  { pattern: /github_pat_[a-zA-Z0-9_]{22,}/g, name: "github_fine_grained_pat" },
-  { pattern: /AKIA[0-9A-Z]{16}/g, name: "aws_access_key" },
-  { pattern: /xoxb-[0-9]{10,}-[a-zA-Z0-9-]+/g, name: "slack_bot_token" },
-  { pattern: /xoxp-[0-9]{10,}-[a-zA-Z0-9-]+/g, name: "slack_user_token" },
-  { pattern: /xapp-[0-9]-[A-Z0-9]+-[0-9]+-[a-z0-9]+/g, name: "slack_app_token" },
-  { pattern: /(?:Bearer|bearer)\s+[a-zA-Z0-9._~+/=-]{20,}/g, name: "bearer_token" },
-  { pattern: /glpat-[a-zA-Z0-9_-]{20,}/g, name: "gitlab_pat" },
-  { pattern: /npm_[a-zA-Z0-9]{36,}/g, name: "npm_token" },
-  { pattern: /pypi-[a-zA-Z0-9_-]{20,}/g, name: "pypi_token" },
-  { pattern: /AIza[a-zA-Z0-9_-]{35}/g, name: "google_api_key" },
-  { pattern: /SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}/g, name: "sendgrid_api_key" },
-  { pattern: /sq0[a-z]{3}-[a-zA-Z0-9_-]{22,}/g, name: "square_api_key" },
-  { pattern: /sk_live_[a-zA-Z0-9]{24,}/g, name: "stripe_secret_key" },
-  { pattern: /rk_live_[a-zA-Z0-9]{24,}/g, name: "stripe_restricted_key" },
-  { pattern: /(?:-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----)/g, name: "private_key_pem" },
+  { pattern: /sk-[a-zA-Z0-9]{20,}/, name: "openai_api_key" },
+  { pattern: /sk-ant-[a-zA-Z0-9_-]{20,}/, name: "anthropic_api_key" },
+  { pattern: /ghp_[a-zA-Z0-9]{36,}/, name: "github_pat" },
+  { pattern: /gho_[a-zA-Z0-9]{36,}/, name: "github_oauth" },
+  { pattern: /ghs_[a-zA-Z0-9]{36,}/, name: "github_app" },
+  { pattern: /github_pat_[a-zA-Z0-9_]{22,}/, name: "github_fine_grained_pat" },
+  { pattern: /AKIA[0-9A-Z]{16}/, name: "aws_access_key" },
+  { pattern: /xoxb-[0-9]{10,}-[a-zA-Z0-9-]+/, name: "slack_bot_token" },
+  { pattern: /xoxp-[0-9]{10,}-[a-zA-Z0-9-]+/, name: "slack_user_token" },
+  { pattern: /xapp-[0-9]-[A-Z0-9]+-[0-9]+-[a-z0-9]+/, name: "slack_app_token" },
+  { pattern: /(?:Bearer|bearer)\s+[a-zA-Z0-9._~+/=-]{20,}/, name: "bearer_token" },
+  { pattern: /glpat-[a-zA-Z0-9_-]{20,}/, name: "gitlab_pat" },
+  { pattern: /npm_[a-zA-Z0-9]{36,}/, name: "npm_token" },
+  { pattern: /pypi-[a-zA-Z0-9_-]{20,}/, name: "pypi_token" },
+  { pattern: /AIza[a-zA-Z0-9_-]{35}/, name: "google_api_key" },
+  { pattern: /SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}/, name: "sendgrid_api_key" },
+  { pattern: /sq0[a-z]{3}-[a-zA-Z0-9_-]{22,}/, name: "square_api_key" },
+  { pattern: /sk_live_[a-zA-Z0-9]{24,}/, name: "stripe_secret_key" },
+  { pattern: /rk_live_[a-zA-Z0-9]{24,}/, name: "stripe_restricted_key" },
+  { pattern: /(?:-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----)/, name: "private_key_pem" },
 ];
 
 // Data exfiltration via markdown image tags
@@ -571,6 +580,12 @@ export class InjectionDetector {
     // Only check strings of meaningful length
     if (value.length < 20) return;
 
+    // Cap analysis to 1MB to prevent DoS on enormous payloads
+    const MAX_ANALYSIS_LENGTH = 1_000_000;
+    if (value.length > MAX_ANALYSIS_LENGTH) {
+      value = value.substring(0, MAX_ANALYSIS_LENGTH);
+    }
+
     let estimatedTokens = 0;
     for (const ch of value) {
       const cp = ch.codePointAt(0);
@@ -796,8 +811,6 @@ export class InjectionDetector {
     signals: InjectionSignal[]
   ): void {
     for (const { pattern, name } of SECRET_PATTERNS) {
-      // Reset regex state (global flag)
-      pattern.lastIndex = 0;
       if (pattern.test(content)) {
         signals.push({
           type: "secret_leak",
@@ -1207,7 +1220,16 @@ export class InjectionDetector {
       "\u13AA": "G",                // Ꭺ (looks like A but maps to G sound)
       "\u13D2": "V",                // Ꮢ (visual approximation)
 
+      // ── Georgian → Latin ──────────────────────────────────────────────
+      "\u10D5": "v",                // ვ (Georgian letter vin)
+      "\u10D3": "d",                // დ (Georgian letter don)
+      "\u10DA": "l",                // ლ (Georgian letter las)
+
+      // ── Latin special → Latin ────────────────────────────────────────
+      "\u0131": "i",                // ı (Latin small letter dotless i)
+
       // ── Symbols / Mathematical → Latin ────────────────────────────────
+      // Note: NFKC normalization handles mathematical alphanumerics (U+1D400–U+1D7FF)
       "\u2160": "I",                // Ⅰ (Roman numeral one)
       "\u2164": "V",                // Ⅴ (Roman numeral five)
       "\u2169": "X",                // Ⅹ (Roman numeral ten)

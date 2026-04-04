@@ -101,7 +101,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "bridge_attest",
     "dashboard_open", // SEC-039: Explicit Tier 3 — only generates a URL
     "sovereignty_profile_get",
-    "sovereignty_profile_generate_prompt",
+    "sovereignty_profile_generate_prompt", // Agent needs its own config to generate system prompt
     "governor_status",
   ],
   approval_channel: DEFAULT_CHANNEL,
@@ -327,7 +327,6 @@ tier3_always_allow:
   - bridge_attest
   - dashboard_open
   - sovereignty_profile_get
-  - sovereignty_profile_generate_prompt
   - governor_status
 
 # ─── Approval Channel ────────────────────────────────────────────────────

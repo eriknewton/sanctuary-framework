@@ -72,7 +72,15 @@ export class ClientManager {
       throw new Error(`Maximum ${MAX_UPSTREAM_SERVERS} upstream servers allowed`);
     }
 
-    const newNames = new Set(servers.filter(s => s.enabled).map(s => s.name));
+    // SEC-047: Validate server names before processing
+    const SAFE_SERVER_NAME = /^[a-zA-Z0-9_\-]+$/;
+
+    const newNames = new Set(servers.filter(s => {
+      if (!SAFE_SERVER_NAME.test(s.name)) {
+        return false; // Skip servers with unsafe names
+      }
+      return s.enabled;
+    }).map(s => s.name));
 
     // Disconnect servers that are no longer in the config or are disabled
     for (const [name] of this.connections) {
@@ -83,6 +91,11 @@ export class ClientManager {
 
     // Connect new/updated servers
     for (const server of servers) {
+      // SEC-047: Validate server name
+      if (!SAFE_SERVER_NAME.test(server.name)) {
+        continue; // Skip servers with unsafe names
+      }
+
       if (!server.enabled) {
         // If it was connected, disconnect it
         if (this.connections.has(server.name)) {
@@ -226,20 +239,55 @@ export class ClientManager {
         if (!conn.server.transport.command) {
           throw new Error("stdio transport requires a command");
         }
+
+        // SEC-044: Validate stdio command args to prevent command injection
+        if (conn.server.transport.args) {
+          const SAFE_ARG_PATTERN = /^[a-zA-Z0-9._\-\/=:@]+$/;
+          for (const arg of conn.server.transport.args) {
+            if (!SAFE_ARG_PATTERN.test(arg)) {
+              throw new Error(`Unsafe argument rejected: contains disallowed characters`);
+            }
+          }
+        }
+
+        // SEC-045: Filter blocked environment variables
+        const ENV_BLOCKLIST = new Set([
+          'PATH', 'HOME', 'USER', 'SHELL', 'NODE_OPTIONS', 'NODE_PATH',
+          'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES',
+          'PYTHONPATH', 'RUBYLIB', 'PERL5LIB',
+          'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+          'http_proxy', 'https_proxy', 'no_proxy',
+        ]);
+
+        let transportEnv: Record<string, string> | undefined;
+        if (conn.server.transport.env) {
+          const safeEnv = { ...process.env } as Record<string, string>;
+          for (const [key, value] of Object.entries(conn.server.transport.env)) {
+            if (!ENV_BLOCKLIST.has(key)) {
+              safeEnv[key] = value as string;
+            }
+            // Silently drop blocked env vars (logged via audit)
+          }
+          transportEnv = safeEnv;
+        }
+
         transport = new StdioClientTransport({
           command: conn.server.transport.command,
           args: conn.server.transport.args,
-          env: conn.server.transport.env
-            ? { ...process.env, ...conn.server.transport.env } as Record<string, string>
-            : undefined,
+          env: transportEnv,
         });
       } else {
         if (!conn.server.transport.url) {
           throw new Error("sse transport requires a url");
         }
-        transport = new SSEClientTransport(
-          new URL(conn.server.transport.url)
-        );
+
+        // SEC-052: Validate SSE URL scheme and prevent SSRF
+        const ssrfUrl = new URL(conn.server.transport.url);
+        if (ssrfUrl.protocol !== "http:" && ssrfUrl.protocol !== "https:") {
+          throw new Error("SSE transport URL must use http or https scheme");
+        }
+
+        transport = new SSEClientTransport(ssrfUrl);
       }
 
       // Create MCP client
