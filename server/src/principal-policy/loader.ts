@@ -46,6 +46,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "decommission_certificate",
     "reputation_publish", // SEC-039: Explicit Tier 1 — sends data to external API
     "sovereignty_profile_update", // Changes enforcement behavior — always requires approval
+    "governor_reset", // Clears all runtime governance state — always requires approval
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [
@@ -101,6 +102,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "dashboard_open", // SEC-039: Explicit Tier 3 — only generates a URL
     "sovereignty_profile_get",
     "sovereignty_profile_generate_prompt",
+    "governor_status",
   ],
   approval_channel: DEFAULT_CHANNEL,
 };
@@ -108,8 +110,12 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
 /**
  * Extract the operation name from a full MCP tool name.
  * "sanctuary/state_export" → "state_export"
+ * "proxy/github/repos_list" → "proxy/github/repos_list" (proxy names pass through)
  */
 export function extractOperationName(toolName: string): string {
+  if (toolName.startsWith("proxy/")) {
+    return toolName; // Proxy tools keep their full name for tier resolution
+  }
   return toolName.startsWith("sanctuary/")
     ? toolName.slice("sanctuary/".length)
     : toolName;
@@ -256,6 +262,7 @@ tier1_always_approve:
   - bootstrap_provide_guarantee
   - reputation_publish
   - sovereignty_profile_update
+  - governor_reset
 
 # ─── Tier 2: Behavioral Anomaly Detection ────────────────────────────────
 # Triggers approval when agent behavior deviates from its baseline.
@@ -321,6 +328,7 @@ tier3_always_allow:
   - dashboard_open
   - sovereignty_profile_get
   - sovereignty_profile_generate_prompt
+  - governor_status
 
 # ─── Approval Channel ────────────────────────────────────────────────────
 # How Sanctuary reaches you when approval is needed.

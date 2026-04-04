@@ -29,6 +29,9 @@ export type InjectionAlertCallback = (alert: {
   timestamp: string;
 }) => void;
 
+/** Resolver for proxy tool tiers — provided by the ProxyRouter */
+export type ProxyTierResolver = (toolName: string) => (1 | 2 | 3) | null;
+
 export class ApprovalGate {
   private policy: PrincipalPolicy;
   private baseline: BaselineTracker;
@@ -36,6 +39,7 @@ export class ApprovalGate {
   private auditLog: AuditLog;
   private injectionDetector: InjectionDetector;
   private onInjectionAlert?: InjectionAlertCallback;
+  private proxyTierResolver?: ProxyTierResolver;
 
   constructor(
     policy: PrincipalPolicy,
@@ -51,6 +55,13 @@ export class ApprovalGate {
     this.auditLog = auditLog;
     this.injectionDetector = injectionDetector ?? new InjectionDetector();
     this.onInjectionAlert = onInjectionAlert;
+  }
+
+  /**
+   * Set the proxy tier resolver. Called after the proxy router is initialized.
+   */
+  setProxyTierResolver(resolver: ProxyTierResolver): void {
+    this.proxyTierResolver = resolver;
   }
 
   /**
@@ -114,6 +125,45 @@ export class ApprovalGate {
             },
           }
         );
+      }
+    }
+
+    // ── Proxy tools: tier determined by proxy router ─────────────────
+    if (toolName.startsWith("proxy/") && this.proxyTierResolver) {
+      const proxyTier = this.proxyTierResolver(toolName);
+      if (proxyTier !== null) {
+        if (proxyTier === 1) {
+          return this.requestApproval(operation, 1, `Proxy tool "${toolName}" is configured as Tier 1 (always requires approval)`, {
+            operation: toolName,
+            proxy: true,
+            args_summary: this.summarizeArgs(args),
+          });
+        }
+
+        if (proxyTier === 2) {
+          // Check for anomalies specific to proxy calls
+          const anomaly = this.detectAnomaly(operation, args);
+          if (anomaly) {
+            return this.requestApproval(operation, 2, `Proxy: ${anomaly.reason}`, {
+              ...anomaly.context,
+              proxy: true,
+            });
+          }
+        }
+
+        // Tier 2 with no anomaly or Tier 3: allow with audit logging
+        this.auditLog.append("l2", `gate_allow_proxy:${toolName}`, "system", {
+          tier: proxyTier,
+          operation: toolName,
+          proxy: true,
+        });
+
+        return {
+          allowed: true,
+          tier: proxyTier,
+          reason: `Proxy operation allowed (Tier ${proxyTier})`,
+          approval_required: false,
+        };
       }
     }
 

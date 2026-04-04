@@ -36,8 +36,9 @@ import type { HandshakeResult } from "../handshake/types.js";
 // SignedSHR type available via shr/types if needed in future
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
 import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
-import type { SovereigntyProfileStore, SovereigntyProfileUpdate } from "../sovereignty-profile.js";
+import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer } from "../sovereignty-profile.js";
 import { generateSystemPrompt } from "../system-prompt-generator.js";
+import type { ClientManager } from "../proxy/client-manager.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -110,6 +111,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private shrOpts: SHRGeneratorOptions | null = null;
   private _sanctuaryConfig: SanctuaryConfig | null = null;
   private profileStore: SovereigntyProfileStore | null = null;
+  private clientManager: ClientManager | null = null;
   private dashboardHTML: string;
   private loginHTML: string;
   private authToken: string | undefined;
@@ -154,6 +156,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     shrOpts?: SHRGeneratorOptions;
     sanctuaryConfig?: SanctuaryConfig;
     profileStore?: SovereigntyProfileStore;
+    clientManager?: ClientManager;
   }): void {
     this.policy = deps.policy;
     this.baseline = deps.baseline;
@@ -163,6 +166,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (deps.shrOpts) this.shrOpts = deps.shrOpts;
     if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
     if (deps.profileStore) this.profileStore = deps.profileStore;
+    if (deps.clientManager) this.clientManager = deps.clientManager;
   }
 
   /**
@@ -602,6 +606,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         this.handleSovereigntyProfileGet(res);
       } else if (method === "POST" && url.pathname === "/api/sovereignty-profile") {
         this.handleSovereigntyProfileUpdate(req, res);
+      } else if (method === "GET" && url.pathname === "/api/proxy/servers") {
+        this.handleProxyServers(res);
+      } else if (method === "POST" && url.pathname === "/api/proxy/servers") {
+        this.handleProxyServersUpdate(req, res);
       } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
         // Decision endpoints get an additional tighter rate limit
         if (!this.checkRateLimit(req, res, "decisions")) return;
@@ -1016,6 +1024,102 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       } catch {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Invalid JSON body" }));
+      }
+    });
+  }
+
+  // ── Proxy Server Handlers ───────────────────────────────────────────
+
+  /**
+   * GET /api/proxy/servers — list upstream proxy servers and their status.
+   */
+  private handleProxyServers(res: ServerResponse): void {
+    const profile = this.profileStore?.get();
+    const upstreamServers = profile?.upstream_servers ?? [];
+    const clientStatus = this.clientManager?.getStatus() ?? [];
+
+    // Merge config with live status
+    const servers = upstreamServers.map(server => {
+      const status = clientStatus.find(s => s.name === server.name);
+      return {
+        name: server.name,
+        transport_type: server.transport.type,
+        enabled: server.enabled,
+        default_tier: server.default_tier,
+        state: status?.state ?? "disconnected",
+        tool_count: status?.tool_count ?? 0,
+        error: status?.error,
+        tool_overrides: server.tool_overrides ?? {},
+      };
+    });
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ servers }));
+  }
+
+  /**
+   * POST /api/proxy/servers — update upstream server configuration.
+   * This is a dashboard action (human-initiated), so it's allowed with audit logging
+   * rather than requiring Tier 1 approval.
+   */
+  private handleProxyServersUpdate(req: IncomingMessage, res: ServerResponse): void {
+    if (!this.profileStore) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Profile store not available" }));
+      return;
+    }
+
+    let body = "";
+    let destroyed = false;
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+      if (body.length > 16384) {
+        destroyed = true;
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request body too large" }));
+        req.destroy();
+      }
+    });
+    req.on("end", async () => {
+      if (destroyed) return;
+      try {
+        const { upstream_servers } = JSON.parse(body) as { upstream_servers: UpstreamServer[] };
+
+        // Update profile with new server config
+        const updated = await this.profileStore!.update({ upstream_servers });
+
+        // Audit log the dashboard-initiated change
+        if (this.auditLog) {
+          this.auditLog.append("l2", "proxy_servers_update_dashboard", "dashboard", {
+            server_count: upstream_servers.length,
+            servers: upstream_servers.map(s => ({
+              name: s.name,
+              type: s.transport.type,
+              enabled: s.enabled,
+              tier: s.default_tier,
+            })),
+          });
+        }
+
+        // Reconfigure client manager if available
+        if (this.clientManager && updated.upstream_servers) {
+          this.clientManager.configure(updated.upstream_servers).catch(() => {
+            // Connection errors handled by client manager
+          });
+        }
+
+        // Broadcast to SSE clients
+        this.broadcastSSE("proxy-servers-update", {
+          servers: updated.upstream_servers ?? [],
+          timestamp: new Date().toISOString(),
+        });
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ upstream_servers: updated.upstream_servers ?? [] }));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Invalid request";
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: message }));
       }
     });
   }

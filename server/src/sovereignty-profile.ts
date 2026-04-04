@@ -23,6 +23,20 @@ import { stringToBytes, bytesToString } from "./core/encoding.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
+export interface UpstreamServer {
+  name: string;           // Human-readable name (e.g., "filesystem", "github")
+  transport: {
+    type: "stdio" | "sse";
+    command?: string;     // For stdio: the command to run
+    args?: string[];      // For stdio: command arguments
+    url?: string;         // For SSE: the server URL
+    env?: Record<string, string>; // Environment variables to pass
+  };
+  enabled: boolean;
+  default_tier: 1 | 2 | 3;  // Default tier for all tools from this server
+  tool_overrides?: Record<string, { tier: 1 | 2 | 3 }>; // Per-tool tier overrides
+}
+
 export interface SovereigntyProfile {
   version: 1;
   features: {
@@ -32,6 +46,7 @@ export interface SovereigntyProfile {
     approval_gate: { enabled: boolean };
     zk_proofs: { enabled: boolean };
   };
+  upstream_servers?: UpstreamServer[];
   updated_at: string; // ISO 8601
 }
 
@@ -42,6 +57,7 @@ export interface SovereigntyProfileUpdate {
   context_gating?: { enabled?: boolean; policy_id?: string };
   approval_gate?: { enabled?: boolean };
   zk_proofs?: { enabled?: boolean };
+  upstream_servers?: UpstreamServer[];
 }
 
 // ── Constants ───────────────────────────────────────────────────────────
@@ -186,6 +202,51 @@ export class SovereigntyProfileStore {
         }
         features.zk_proofs.enabled = updates.zk_proofs.enabled;
       }
+    }
+
+    if (updates.upstream_servers !== undefined) {
+      if (!Array.isArray(updates.upstream_servers)) {
+        throw new Error("upstream_servers must be an array");
+      }
+      // Validate each server entry
+      for (const server of updates.upstream_servers) {
+        if (!server.name || typeof server.name !== "string") {
+          throw new Error("Each upstream server must have a name");
+        }
+        if (server.name.length > 128) {
+          throw new Error("Upstream server name must be 128 characters or fewer");
+        }
+        // Validate name is safe for use in tool namespaces (alphanumeric, hyphens, underscores)
+        if (!/^[a-zA-Z0-9_-]+$/.test(server.name)) {
+          throw new Error("Upstream server name must contain only alphanumeric characters, hyphens, and underscores");
+        }
+        if (!server.transport || typeof server.transport !== "object") {
+          throw new Error("Each upstream server must have a transport configuration");
+        }
+        if (server.transport.type !== "stdio" && server.transport.type !== "sse") {
+          throw new Error("Transport type must be 'stdio' or 'sse'");
+        }
+        if (server.transport.type === "stdio" && !server.transport.command) {
+          throw new Error("stdio transport requires a command");
+        }
+        if (server.transport.type === "sse" && !server.transport.url) {
+          throw new Error("sse transport requires a url");
+        }
+        if (typeof server.enabled !== "boolean") {
+          throw new Error("Each upstream server must have enabled as a boolean");
+        }
+        if (![1, 2, 3].includes(server.default_tier)) {
+          throw new Error("default_tier must be 1, 2, or 3");
+        }
+        if (server.tool_overrides) {
+          for (const [, override] of Object.entries(server.tool_overrides)) {
+            if (![1, 2, 3].includes(override.tier)) {
+              throw new Error("tool_overrides tier must be 1, 2, or 3");
+            }
+          }
+        }
+      }
+      this.profile!.upstream_servers = updates.upstream_servers;
     }
 
     this.profile!.updated_at = new Date().toISOString();

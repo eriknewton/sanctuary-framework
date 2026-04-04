@@ -974,6 +974,17 @@ export function generateDashboardHTML(options: {
       display: flex;
       flex-direction: column;
       gap: 8px;
+      transition: border-color 0.2s;
+    }
+
+    .profile-card.active {
+      border-color: var(--green);
+    }
+
+    .profile-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
     }
 
     .profile-card-name {
@@ -986,6 +997,53 @@ export function generateDashboardHTML(options: {
       font-size: 11px;
       color: var(--text-secondary);
       line-height: 1.4;
+    }
+
+    /* Toggle switch */
+    .toggle-switch {
+      position: relative;
+      width: 36px;
+      height: 20px;
+      flex-shrink: 0;
+    }
+
+    .toggle-switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .toggle-slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: var(--border);
+      border-radius: 10px;
+      transition: background-color 0.2s;
+    }
+
+    .toggle-slider::before {
+      content: "";
+      position: absolute;
+      height: 14px;
+      width: 14px;
+      left: 3px;
+      bottom: 3px;
+      background-color: var(--text-secondary);
+      border-radius: 50%;
+      transition: transform 0.2s, background-color 0.2s;
+    }
+
+    .toggle-switch input:checked + .toggle-slider {
+      background-color: rgba(63, 185, 80, 0.3);
+    }
+
+    .toggle-switch input:checked + .toggle-slider::before {
+      transform: translateX(16px);
+      background-color: var(--green);
     }
 
     .profile-badge {
@@ -1009,22 +1067,159 @@ export function generateDashboardHTML(options: {
       color: var(--text-secondary);
     }
 
-    .prompt-section {
-      margin-top: 12px;
+    .profile-card-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 4px;
     }
 
-    .prompt-textarea {
-      width: 100%;
-      min-height: 120px;
+    .config-btn {
+      padding: 3px 8px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background-color: transparent;
+      color: var(--text-secondary);
+      font-size: 10px;
+      cursor: pointer;
+      transition: color 0.2s, border-color 0.2s;
+    }
+
+    .config-btn:hover {
+      color: var(--blue);
+      border-color: var(--blue);
+    }
+
+    /* Configuration panels */
+    .config-panel {
+      display: none;
+      margin-top: 8px;
+      padding: 10px;
+      background-color: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-size: 11px;
+    }
+
+    .config-panel.open {
+      display: block;
+    }
+
+    .config-panel-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+    }
+
+    .config-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+
+    .config-label {
+      font-size: 11px;
+      color: var(--text-secondary);
+      min-width: 80px;
+    }
+
+    .config-select, .config-input {
+      background-color: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-primary);
+      font-size: 11px;
+      padding: 4px 8px;
+    }
+
+    .config-info {
+      font-size: 11px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    .sensitivity-slider {
+      display: flex;
+      gap: 4px;
+    }
+
+    .sensitivity-option {
+      padding: 3px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background-color: transparent;
+      color: var(--text-secondary);
+      font-size: 10px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .sensitivity-option.selected {
+      background-color: rgba(88, 166, 255, 0.15);
+      color: var(--blue);
+      border-color: var(--blue);
+    }
+
+    .sensitivity-option:hover:not(.selected) {
+      border-color: var(--text-secondary);
+    }
+
+    /* Prompt section */
+    .prompt-section {
+      margin-top: 16px;
+    }
+
+    .prompt-display {
+      position: relative;
       background-color: var(--bg);
       border: 1px solid var(--border);
       border-radius: 6px;
+      margin-top: 8px;
+      display: none;
+    }
+
+    .prompt-display.visible {
+      display: block;
+    }
+
+    .prompt-display-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .prompt-token-count {
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+
+    .prompt-copy-btn {
+      padding: 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background-color: var(--surface);
       color: var(--text-primary);
+      font-size: 11px;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+
+    .prompt-copy-btn:hover {
+      border-color: var(--blue);
+    }
+
+    .prompt-content {
+      max-height: 300px;
+      overflow-y: auto;
+      padding: 12px;
       font-family: 'JetBrains Mono', monospace;
       font-size: 12px;
-      padding: 12px;
-      resize: vertical;
-      margin-top: 8px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      color: var(--text-primary);
     }
 
     .prompt-actions {
@@ -1411,37 +1606,173 @@ export function generateDashboardHTML(options: {
         </div>
         <div class="profile-cards" id="profile-cards">
           <div class="profile-card" data-feature="audit_logging">
-            <div class="profile-card-name">Audit Logging</div>
+            <div class="profile-card-header">
+              <div class="profile-card-name">Audit Logging</div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-audit_logging" data-feature="audit_logging">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
             <div class="profile-badge disabled" id="badge-audit_logging">OFF</div>
             <div class="profile-card-desc">Encrypted audit trail of all tool calls</div>
+            <div class="profile-card-actions">
+              <button class="config-btn" data-config="audit_logging">Configure</button>
+            </div>
+            <div class="config-panel" id="config-audit_logging">
+              <div class="config-info">Audit logging is always-on when enabled. All tool calls, gate decisions, and profile changes are recorded to an encrypted audit trail. No additional configuration needed.</div>
+            </div>
           </div>
           <div class="profile-card" data-feature="injection_detection">
-            <div class="profile-card-name">Injection Detection</div>
+            <div class="profile-card-header">
+              <div class="profile-card-name">Injection Detection</div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-injection_detection" data-feature="injection_detection">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
             <div class="profile-badge disabled" id="badge-injection_detection">OFF</div>
             <div class="profile-card-desc">Scans tool arguments for prompt injection</div>
+            <div class="profile-card-actions">
+              <button class="config-btn" data-config="injection_detection">Configure</button>
+            </div>
+            <div class="config-panel" id="config-injection_detection">
+              <div class="config-panel-title">Sensitivity</div>
+              <div class="sensitivity-slider">
+                <button class="sensitivity-option" data-sensitivity="low">Low</button>
+                <button class="sensitivity-option selected" data-sensitivity="medium">Medium</button>
+                <button class="sensitivity-option" data-sensitivity="high">High</button>
+              </div>
+            </div>
           </div>
           <div class="profile-card" data-feature="context_gating">
-            <div class="profile-card-name">Context Gating</div>
+            <div class="profile-card-header">
+              <div class="profile-card-name">Context Gating</div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-context_gating" data-feature="context_gating">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
             <div class="profile-badge disabled" id="badge-context_gating">OFF</div>
             <div class="profile-card-desc">Controls context flow to remote providers</div>
+            <div class="profile-card-actions">
+              <button class="config-btn" data-config="context_gating">Configure</button>
+            </div>
+            <div class="config-panel" id="config-context_gating">
+              <div class="config-panel-title">Active Policy</div>
+              <div class="config-row">
+                <span class="config-label">Policy ID:</span>
+                <select class="config-select" id="config-context-policy">
+                  <option value="">None selected</option>
+                </select>
+              </div>
+              <div class="config-info" style="margin-top: 6px;">Use MCP tool <code style="color: var(--blue);">sanctuary/context_gate_set_policy</code> or <code style="color: var(--blue);">sanctuary/context_gate_apply_template</code> to create policies.</div>
+            </div>
           </div>
           <div class="profile-card" data-feature="approval_gate">
-            <div class="profile-card-name">Approval Gates</div>
+            <div class="profile-card-header">
+              <div class="profile-card-name">Approval Gates</div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-approval_gate" data-feature="approval_gate">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
             <div class="profile-badge disabled" id="badge-approval_gate">OFF</div>
             <div class="profile-card-desc">Human approval for high-risk operations</div>
+            <div class="profile-card-actions">
+              <button class="config-btn" data-config="approval_gate">Configure</button>
+            </div>
+            <div class="config-panel" id="config-approval_gate">
+              <div class="config-panel-title">Tier Assignments</div>
+              <div class="config-info">
+                <strong style="color: var(--red);">Tier 1 (always approve):</strong> export, import, key rotation, deletion<br>
+                <strong style="color: var(--amber);">Tier 2 (approve on anomaly):</strong> new namespaces, unfamiliar counterparties, frequency spikes<br>
+                <strong style="color: var(--green);">Tier 3 (auto-allow):</strong> standard operations, queries, reads
+              </div>
+            </div>
           </div>
           <div class="profile-card" data-feature="zk_proofs">
-            <div class="profile-card-name">ZK Proofs</div>
+            <div class="profile-card-header">
+              <div class="profile-card-name">ZK Proofs</div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-zk_proofs" data-feature="zk_proofs">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
             <div class="profile-badge disabled" id="badge-zk_proofs">OFF</div>
             <div class="profile-card-desc">Prove claims without revealing data</div>
+            <div class="profile-card-actions">
+              <button class="config-btn" data-config="zk_proofs">Configure</button>
+            </div>
+            <div class="config-panel" id="config-zk_proofs">
+              <div class="config-info">Zero-knowledge proofs use Pedersen commitments on Ristretto255 and Schnorr proofs. No additional configuration needed. Available tools: <code style="color: var(--blue);">sanctuary/zk_commit</code>, <code style="color: var(--blue);">sanctuary/zk_prove</code>, <code style="color: var(--blue);">sanctuary/zk_range_prove</code>.</div>
+            </div>
           </div>
         </div>
         <div class="prompt-section">
           <div class="prompt-actions">
             <button class="prompt-btn primary" id="generate-prompt-btn">Generate System Prompt</button>
-            <button class="prompt-btn" id="copy-prompt-btn" style="display:none;">Copy</button>
           </div>
-          <textarea class="prompt-textarea" id="system-prompt-output" readonly style="display:none;" placeholder="Click 'Generate System Prompt' to create an agent instruction snippet..."></textarea>
+          <div class="prompt-display" id="prompt-display">
+            <div class="prompt-display-header">
+              <span class="prompt-token-count" id="prompt-token-count"></span>
+              <button class="prompt-copy-btn" id="copy-prompt-btn">Copy to Clipboard</button>
+            </div>
+            <div class="prompt-content" id="system-prompt-output"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Upstream Servers Panel -->
+      <div class="profile-panel" id="proxy-servers-panel">
+        <div class="panel-header">
+          <div class="panel-title">Upstream Servers</div>
+          <button class="panel-action" id="add-proxy-server-btn">+ Add Server</button>
+        </div>
+        <div id="proxy-servers-list">
+          <div class="empty-state">No upstream servers configured</div>
+        </div>
+
+        <!-- Add Server Form (hidden by default) -->
+        <div id="add-server-form" style="display: none; padding: 16px; border-top: 1px solid var(--border);">
+          <div style="margin-bottom: 12px;">
+            <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Server Name</label>
+            <input type="text" id="new-server-name" placeholder="e.g., filesystem" style="width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 13px;">
+          </div>
+          <div style="margin-bottom: 12px;">
+            <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Transport Type</label>
+            <select id="new-server-transport" style="width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 13px;">
+              <option value="stdio">stdio</option>
+              <option value="sse">SSE</option>
+            </select>
+          </div>
+          <div id="stdio-fields">
+            <div style="margin-bottom: 12px;">
+              <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Command</label>
+              <input type="text" id="new-server-command" placeholder="e.g., npx -y @modelcontextprotocol/server-filesystem" style="width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 13px;">
+            </div>
+            <div style="margin-bottom: 12px;">
+              <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Arguments (comma-separated)</label>
+              <input type="text" id="new-server-args" placeholder="e.g., /Users/me/allowed-dir" style="width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 13px;">
+            </div>
+          </div>
+          <div id="sse-fields" style="display: none;">
+            <div style="margin-bottom: 12px;">
+              <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Server URL</label>
+              <input type="text" id="new-server-url" placeholder="e.g., http://localhost:3001/sse" style="width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 13px;">
+            </div>
+          </div>
+          <div style="margin-bottom: 12px;">
+            <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Default Tier</label>
+            <select id="new-server-tier" style="width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 13px;">
+              <option value="1">Tier 1 (Always approve)</option>
+              <option value="2" selected>Tier 2 (Anomaly detection)</option>
+              <option value="3">Tier 3 (Always allow)</option>
+            </select>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button id="save-server-btn" style="flex: 1; padding: 8px; background: var(--green); color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px;">Save</button>
+            <button id="cancel-server-btn" style="flex: 1; padding: 8px; background: var(--surface); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 13px;">Cancel</button>
+          </div>
         </div>
       </div>
 
@@ -1932,8 +2263,34 @@ export function generateDashboardHTML(options: {
         removePendingRequest(data.requestId);
       });
 
-      eventSource.addEventListener('sovereignty-profile-update', () => {
-        updateSovereigntyProfile();
+      eventSource.addEventListener('sovereignty-profile-update', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data.profile) {
+            applyProfileToUI(data.profile);
+          }
+          if (data.system_prompt) {
+            apiState.systemPrompt = data.system_prompt;
+            updatePromptDisplay(data.system_prompt);
+          }
+        } catch (err) {
+          // Fallback to full refresh
+          updateSovereigntyProfile();
+        }
+      });
+
+      eventSource.addEventListener('proxy-server-status', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          updateProxyServerStatus(data.server, data.state, data.tool_count, data.error);
+        } catch (err) {
+          // Fallback to full refresh
+          loadProxyServers();
+        }
+      });
+
+      eventSource.addEventListener('proxy-servers-update', () => {
+        loadProxyServers();
       });
 
       eventSource.onerror = () => {
@@ -2093,26 +2450,16 @@ export function generateDashboardHTML(options: {
     });
 
     // Sovereignty Profile
+    let profileToggleLock = false;
+
     async function updateSovereigntyProfile() {
       try {
         const data = await fetchAPI('/api/sovereignty-profile');
         if (data && data.profile) {
-          const features = data.profile.features;
-          for (const [key, value] of Object.entries(features)) {
-            const badge = document.getElementById('badge-' + key);
-            if (badge) {
-              const enabled = value && value.enabled;
-              badge.textContent = enabled ? 'ON' : 'OFF';
-              badge.className = 'profile-badge ' + (enabled ? 'enabled' : 'disabled');
-            }
-          }
-          const updatedEl = document.getElementById('profile-updated-at');
-          if (updatedEl && data.profile.updated_at) {
-            updatedEl.textContent = 'Updated: ' + new Date(data.profile.updated_at).toLocaleString();
-          }
-          // Cache the prompt
+          applyProfileToUI(data.profile);
           if (data.system_prompt) {
             apiState.systemPrompt = data.system_prompt;
+            updatePromptDisplay(data.system_prompt);
           }
         }
       } catch (e) {
@@ -2120,21 +2467,213 @@ export function generateDashboardHTML(options: {
       }
     }
 
-    document.getElementById('generate-prompt-btn').addEventListener('click', async () => {
-      const data = await fetchAPI('/api/sovereignty-profile');
-      if (data && data.system_prompt) {
-        const textarea = document.getElementById('system-prompt-output');
-        const copyBtn = document.getElementById('copy-prompt-btn');
-        textarea.value = data.system_prompt;
-        textarea.style.display = 'block';
-        copyBtn.style.display = 'inline-flex';
+    function applyProfileToUI(profile) {
+      const features = profile.features;
+      for (const [key, value] of Object.entries(features)) {
+        const enabled = value && value.enabled;
+
+        // Update badge
+        const badge = document.getElementById('badge-' + key);
+        if (badge) {
+          badge.textContent = enabled ? 'ON' : 'OFF';
+          badge.className = 'profile-badge ' + (enabled ? 'enabled' : 'disabled');
+        }
+
+        // Update toggle (without triggering change event)
+        const toggle = document.getElementById('toggle-' + key);
+        if (toggle && toggle.checked !== enabled) {
+          profileToggleLock = true;
+          toggle.checked = enabled;
+          profileToggleLock = false;
+        }
+
+        // Update card active state
+        const card = document.querySelector('[data-feature="' + key + '"]');
+        if (card) {
+          card.classList.toggle('active', enabled);
+        }
+
+        // Feature-specific config UI updates
+        if (key === 'injection_detection' && value.sensitivity) {
+          document.querySelectorAll('#config-injection_detection .sensitivity-option').forEach(function(btn) {
+            btn.classList.toggle('selected', btn.getAttribute('data-sensitivity') === value.sensitivity);
+          });
+        }
+
+        if (key === 'context_gating' && value.policy_id) {
+          const sel = document.getElementById('config-context-policy');
+          if (sel) {
+            // Add the policy as an option if not present
+            let found = false;
+            for (let i = 0; i < sel.options.length; i++) {
+              if (sel.options[i].value === value.policy_id) { found = true; break; }
+            }
+            if (!found) {
+              const opt = document.createElement('option');
+              opt.value = value.policy_id;
+              opt.textContent = value.policy_id;
+              sel.appendChild(opt);
+            }
+            sel.value = value.policy_id;
+          }
+        }
+      }
+
+      const updatedEl = document.getElementById('profile-updated-at');
+      if (updatedEl && profile.updated_at) {
+        updatedEl.textContent = 'Updated: ' + new Date(profile.updated_at).toLocaleString();
+      }
+    }
+
+    function updatePromptDisplay(promptText) {
+      const display = document.getElementById('prompt-display');
+      const content = document.getElementById('system-prompt-output');
+      const tokenCount = document.getElementById('prompt-token-count');
+      if (!display || !content) return;
+
+      if (promptText) {
+        content.textContent = promptText;
+        // Rough token estimate: word count * 1.3
+        const words = promptText.split(/\\s+/).filter(function(w) { return w.length > 0; }).length;
+        const tokens = Math.round(words * 1.3);
+        tokenCount.textContent = '~' + tokens + ' tokens';
+        display.classList.add('visible');
+      }
+    }
+
+    // Toggle handlers
+    async function handleToggle(feature, enabled) {
+      if (profileToggleLock) return;
+      const payload = {};
+      payload[feature] = { enabled: enabled };
+
+      try {
+        const response = await fetch(API_BASE + '/api/sovereignty-profile', {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + AUTH_TOKEN,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+
+        if (response.status === 401) {
+          redirectToLogin();
+          return;
+        }
+
+        if (response.ok) {
+          const data = await response.json();
+          if (data.profile) {
+            applyProfileToUI(data.profile);
+          }
+          if (data.system_prompt) {
+            apiState.systemPrompt = data.system_prompt;
+            updatePromptDisplay(data.system_prompt);
+          }
+        } else {
+          // Revert toggle on failure
+          const toggle = document.getElementById('toggle-' + feature);
+          if (toggle) {
+            profileToggleLock = true;
+            toggle.checked = !enabled;
+            profileToggleLock = false;
+          }
+        }
+      } catch (err) {
+        console.error('Toggle update failed:', err);
+        // Revert toggle
+        const toggle = document.getElementById('toggle-' + feature);
+        if (toggle) {
+          profileToggleLock = true;
+          toggle.checked = !enabled;
+          profileToggleLock = false;
+        }
+      }
+    }
+
+    // Wire up toggle switches
+    document.querySelectorAll('.toggle-switch input').forEach(function(toggle) {
+      toggle.addEventListener('change', function() {
+        const feature = this.getAttribute('data-feature');
+        handleToggle(feature, this.checked);
+      });
+    });
+
+    // Wire up configure buttons
+    document.querySelectorAll('.config-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const feature = this.getAttribute('data-config');
+        const panel = document.getElementById('config-' + feature);
+        if (panel) {
+          panel.classList.toggle('open');
+          this.textContent = panel.classList.contains('open') ? 'Close' : 'Configure';
+        }
+      });
+    });
+
+    // Injection sensitivity handler
+    document.querySelectorAll('#config-injection_detection .sensitivity-option').forEach(function(btn) {
+      btn.addEventListener('click', async function() {
+        const sensitivity = this.getAttribute('data-sensitivity');
+        const response = await fetch(API_BASE + '/api/sovereignty-profile', {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + AUTH_TOKEN,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ injection_detection: { sensitivity: sensitivity } }),
+        });
+        if (response.ok) {
+          document.querySelectorAll('#config-injection_detection .sensitivity-option').forEach(function(b) {
+            b.classList.toggle('selected', b.getAttribute('data-sensitivity') === sensitivity);
+          });
+          const data = await response.json();
+          if (data.profile) applyProfileToUI(data.profile);
+          if (data.system_prompt) {
+            apiState.systemPrompt = data.system_prompt;
+            updatePromptDisplay(data.system_prompt);
+          }
+        }
+      });
+    });
+
+    // Context gating policy selector handler
+    document.getElementById('config-context-policy').addEventListener('change', async function() {
+      const policyId = this.value;
+      const response = await fetch(API_BASE + '/api/sovereignty-profile', {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + AUTH_TOKEN,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ context_gating: { policy_id: policyId } }),
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.profile) applyProfileToUI(data.profile);
+        if (data.system_prompt) {
+          apiState.systemPrompt = data.system_prompt;
+          updatePromptDisplay(data.system_prompt);
+        }
       }
     });
 
+    // Generate prompt button
+    document.getElementById('generate-prompt-btn').addEventListener('click', async () => {
+      const data = await fetchAPI('/api/sovereignty-profile');
+      if (data && data.system_prompt) {
+        apiState.systemPrompt = data.system_prompt;
+        updatePromptDisplay(data.system_prompt);
+      }
+    });
+
+    // Copy prompt button
     document.getElementById('copy-prompt-btn').addEventListener('click', async () => {
-      const textarea = document.getElementById('system-prompt-output');
+      const content = document.getElementById('system-prompt-output');
+      if (!content || !content.textContent) return;
       try {
-        await navigator.clipboard.writeText(textarea.value);
+        await navigator.clipboard.writeText(content.textContent);
         const btn = document.getElementById('copy-prompt-btn');
         const original = btn.textContent;
         btn.textContent = 'Copied!';
@@ -2143,6 +2682,219 @@ export function generateDashboardHTML(options: {
         console.error('Copy failed:', err);
       }
     });
+
+    // ── Proxy Server Management ─────────────────────────────────────
+
+    let proxyServers = [];
+
+    async function loadProxyServers() {
+      try {
+        const resp = await fetch(API_BASE + '/api/proxy/servers', {
+          headers: { 'Authorization': 'Bearer ' + AUTH_TOKEN },
+        });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        proxyServers = data.servers || [];
+        renderProxyServers();
+      } catch (err) {
+        // Proxy endpoint may not be available
+      }
+    }
+
+    function renderProxyServers() {
+      const container = document.getElementById('proxy-servers-list');
+      if (!container) return;
+
+      if (proxyServers.length === 0) {
+        container.innerHTML = '<div class="empty-state">No upstream servers configured</div>';
+        return;
+      }
+
+      container.innerHTML = proxyServers.map(server => {
+        const stateColor = server.state === 'connected' ? 'var(--green)' :
+                          server.state === 'connecting' ? 'var(--amber)' : 'var(--red)';
+        const stateLabel = server.state || 'disconnected';
+        const tierLabel = 'Tier ' + server.default_tier;
+
+        return \`
+          <div class="proxy-server-card" data-server="\${esc(server.name)}" style="padding: 12px 16px; border-bottom: 1px solid var(--border);">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="color: \${stateColor}; font-size: 10px;">\\u25CF</span>
+                <span style="font-weight: 600; font-size: 14px;">\${esc(server.name)}</span>
+                <span style="font-size: 11px; color: var(--text-secondary); background: var(--bg); padding: 2px 6px; border-radius: 3px;">\${esc(server.transport_type)}</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="font-size: 11px; color: var(--text-secondary);">\${server.tool_count} tools</span>
+                <span style="font-size: 11px; color: var(--blue); background: rgba(88,166,255,0.1); padding: 2px 6px; border-radius: 3px;">\${tierLabel}</span>
+                <button class="proxy-remove-btn" data-server="\${esc(server.name)}" style="background: none; border: none; color: var(--red); cursor: pointer; font-size: 14px; padding: 2px 6px;" title="Remove server">\\u00D7</button>
+              </div>
+            </div>
+            <div style="font-size: 11px; color: var(--text-secondary);">
+              Status: <span style="color: \${stateColor}">\${esc(stateLabel)}</span>
+              \${server.error ? '<span style="color: var(--red);"> — ' + esc(server.error) + '</span>' : ''}
+            </div>
+            <div class="proxy-tools-expand" style="margin-top: 8px; display: none;">
+              <div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 4px;">Discovered Tools:</div>
+              <div class="proxy-tools-list" style="font-size: 11px; font-family: monospace; color: var(--text-primary); max-height: 150px; overflow-y: auto;"></div>
+            </div>
+          </div>
+        \`;
+      }).join('');
+
+      // Attach remove handlers
+      container.querySelectorAll('.proxy-remove-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          const serverName = e.target.dataset.server;
+          removeProxyServer(serverName);
+        });
+      });
+
+      // Attach expand/collapse on card click
+      container.querySelectorAll('.proxy-server-card').forEach(card => {
+        card.style.cursor = 'pointer';
+        card.addEventListener('click', (e) => {
+          if (e.target.classList.contains('proxy-remove-btn')) return;
+          const expand = card.querySelector('.proxy-tools-expand');
+          if (expand) {
+            expand.style.display = expand.style.display === 'none' ? 'block' : 'none';
+          }
+        });
+      });
+    }
+
+    function updateProxyServerStatus(serverName, state, toolCount, error) {
+      const server = proxyServers.find(s => s.name === serverName);
+      if (server) {
+        server.state = state;
+        server.tool_count = toolCount;
+        server.error = error;
+        renderProxyServers();
+      }
+    }
+
+    async function addProxyServer(serverConfig) {
+      const current = [...proxyServers];
+      // Check for duplicate
+      if (current.find(s => s.name === serverConfig.name)) {
+        alert('A server with that name already exists');
+        return;
+      }
+      current.push(serverConfig);
+
+      try {
+        const resp = await fetch(API_BASE + '/api/proxy/servers', {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + AUTH_TOKEN,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ upstream_servers: current }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json();
+          alert('Failed to add server: ' + (err.error || 'Unknown error'));
+          return;
+        }
+        await loadProxyServers();
+      } catch (err) {
+        alert('Failed to add server: ' + err.message);
+      }
+    }
+
+    async function removeProxyServer(serverName) {
+      if (!confirm('Remove upstream server "' + serverName + '"?')) return;
+
+      const updated = proxyServers.filter(s => s.name !== serverName);
+
+      try {
+        const resp = await fetch(API_BASE + '/api/proxy/servers', {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + AUTH_TOKEN,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ upstream_servers: updated }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json();
+          alert('Failed to remove server: ' + (err.error || 'Unknown error'));
+          return;
+        }
+        await loadProxyServers();
+      } catch (err) {
+        alert('Failed to remove server: ' + err.message);
+      }
+    }
+
+    // Add Server form handlers
+    (function setupProxyForm() {
+      const addBtn = document.getElementById('add-proxy-server-btn');
+      const form = document.getElementById('add-server-form');
+      const saveBtn = document.getElementById('save-server-btn');
+      const cancelBtn = document.getElementById('cancel-server-btn');
+      const transportSelect = document.getElementById('new-server-transport');
+      const stdioFields = document.getElementById('stdio-fields');
+      const sseFields = document.getElementById('sse-fields');
+
+      if (!addBtn || !form) return;
+
+      addBtn.addEventListener('click', () => {
+        form.style.display = form.style.display === 'none' ? 'block' : 'none';
+      });
+
+      cancelBtn.addEventListener('click', () => {
+        form.style.display = 'none';
+      });
+
+      transportSelect.addEventListener('change', () => {
+        if (transportSelect.value === 'stdio') {
+          stdioFields.style.display = 'block';
+          sseFields.style.display = 'none';
+        } else {
+          stdioFields.style.display = 'none';
+          sseFields.style.display = 'block';
+        }
+      });
+
+      saveBtn.addEventListener('click', () => {
+        const name = document.getElementById('new-server-name').value.trim();
+        const type = transportSelect.value;
+        const tier = parseInt(document.getElementById('new-server-tier').value, 10);
+
+        if (!name) { alert('Server name is required'); return; }
+        if (!/^[a-zA-Z0-9_-]+$/.test(name)) { alert('Name must contain only letters, numbers, hyphens, and underscores'); return; }
+
+        const transport = { type };
+        if (type === 'stdio') {
+          const command = document.getElementById('new-server-command').value.trim();
+          if (!command) { alert('Command is required for stdio transport'); return; }
+          transport.command = command;
+          const argsStr = document.getElementById('new-server-args').value.trim();
+          if (argsStr) {
+            transport.args = argsStr.split(',').map(s => s.trim()).filter(Boolean);
+          }
+        } else {
+          const url = document.getElementById('new-server-url').value.trim();
+          if (!url) { alert('URL is required for SSE transport'); return; }
+          transport.url = url;
+        }
+
+        addProxyServer({
+          name,
+          transport,
+          enabled: true,
+          default_tier: tier,
+        });
+
+        // Reset form
+        form.style.display = 'none';
+        document.getElementById('new-server-name').value = '';
+        document.getElementById('new-server-command').value = '';
+        document.getElementById('new-server-args').value = '';
+        document.getElementById('new-server-url').value = '';
+      });
+    })();
 
     // Initialize
     async function initialize() {
@@ -2159,6 +2911,7 @@ export function generateDashboardHTML(options: {
         updateSHR(),
         updateStatus(),
         updateSovereigntyProfile(),
+        loadProxyServers(),
       ]);
 
       // Setup SSE for real-time updates
