@@ -4,20 +4,22 @@ Use Sanctuary's sovereignty infrastructure with Hermes Agent, the open-source se
 
 ## Overview
 
-Hermes Agent has native MCP support since v0.6.0 — Sanctuary's 54 MCP tools work seamlessly via Hermes's configuration layer. Hermes's multi-level memory, subagent isolation, and scheduled automations compose naturally with Sanctuary's four sovereignty layers.
+Hermes Agent has native MCP support — Sanctuary's 67+ MCP tools work seamlessly via Hermes's configuration layer. Hermes's multi-level memory, subagent isolation, and scheduled automations compose naturally with Sanctuary's four sovereignty layers.
 
 What you get: encrypted state (L1), process isolation with Sanctuary attestation (L2), selective disclosure (L3), and verifiable reputation (L4) — plus Hermes's native features like memory encryption, subagent sandboxing, and automated sovereignty audits on a cron schedule.
+
+**New in v0.5.16:** Cocoon mode turns Sanctuary into an MCP proxy that wraps all upstream MCP servers through an enforcement chain (injection scan → gate → context gate → governor → forward → audit). Hermes agents can route all their MCP traffic through Sanctuary for runtime governance without changing any upstream server configs.
 
 ## Quick Start
 
 ### 1. Install dependencies
 
 ```bash
-# Hermes Agent v0.5.0+ (released March 28, 2026)
+# Hermes Agent (latest)
 pip install hermes-agent
 
 # Or from source
-git clone https://github.com/nous-research/hermes-agent.git
+git clone https://github.com/NousResearch/hermes-agent.git
 cd hermes-agent
 pip install -e .
 
@@ -59,7 +61,102 @@ export HERMES_MEMORY_KEY=$(openssl rand -base64 32)
 hermes run hermes_config.yaml
 ```
 
-Your agent now has full Sanctuary integration. All 51 tools are available as native Hermes capabilities.
+Your agent now has full Sanctuary integration. All 67+ tools are available as native Hermes capabilities.
+
+## Cocoon Mode — MCP Proxy for Runtime Governance
+
+Cocoon mode is Sanctuary's MCP proxy. Instead of each Hermes agent connecting directly to upstream MCP servers, Sanctuary sits in front and enforces security on every tool call.
+
+### How it works
+
+```
+Hermes Agent
+  → Sanctuary MCP (sole connection)
+    → Injection scan (unicode sanitization, homoglyph normalization, encoded content decoding)
+    → Approval gate (Tier 1/2/3 policy evaluation)
+    → Context gate (redact sensitive fields before forwarding)
+    → Call governor (rate limits, duplicate detection, volume caps)
+    → Forward to upstream MCP server
+    → Outbound scan (secret detection, markdown exfil, internal path leak)
+    → Audit log
+  ← Response back to Hermes
+```
+
+### Configuration
+
+```yaml
+agent:
+  name: "Cocoon-Protected Agent"
+  model: "openai:gpt-4"
+
+mcps:
+  # Sanctuary is the ONLY MCP connection
+  sanctuary:
+    command: "npx"
+    args:
+      - "@sanctuary-framework/mcp-server"
+    transport: "stdio"
+    env:
+      SANCTUARY_STORAGE_PATH: "~/.sanctuary/hermes-cocoon"
+
+  # DO NOT connect upstream servers here — Sanctuary proxies them
+
+capabilities:
+  tools:
+    - sanctuary/*
+    - proxy/*  # Proxied upstream tools appear as proxy/{server}/{tool}
+```
+
+### Registering upstream servers
+
+After startup, register your upstream MCP servers through Sanctuary:
+
+```python
+# In your Hermes startup task:
+"""
+Register upstream MCP servers with Sanctuary's proxy:
+
+1. Call sanctuary/proxy_register_upstream with:
+   - name: "web-search"
+   - command: "npx"
+   - args: ["-y", "@anthropic/web-search-mcp"]
+   - tier: "tier3"  # auto-allow with audit
+
+2. Call sanctuary/proxy_register_upstream with:
+   - name: "filesystem"
+   - command: "npx"
+   - args: ["-y", "@anthropic/filesystem-mcp", "/home/agent/workspace"]
+   - tier: "tier2"  # anomaly-triggered approval
+
+3. Call sanctuary/proxy_discover_tools to discover all proxied tools
+
+Now use proxy/web-search/search and proxy/filesystem/read_file —
+every call passes through Sanctuary's enforcement chain.
+"""
+```
+
+### What Cocoon protects against
+
+- **Prompt injection via MCP responses:** Unicode invisible characters, homoglyph attacks, base64-encoded payloads, and token budget attacks are stripped before responses reach the agent
+- **Secret exfiltration:** Outbound content is scanned for 20+ secret patterns (API keys, tokens, connection strings), markdown exfiltration attempts, and internal path/IP leaks
+- **Runaway tool calls:** The Call Governor enforces volume limits (200 calls/10min), rate detection (20/min per tool), SHA-256 duplicate caching, and a lifetime hard stop (1000 calls)
+- **Unauthorized operations:** Every proxied call passes through the approval gate — Tier 1 ops require human confirmation, Tier 2 triggers on anomalies
+
+### Governor status
+
+Monitor and manage the Call Governor at runtime:
+
+```python
+# Check governor status
+"""Call sanctuary/governor_status to see:
+- Total calls made
+- Rate per tool
+- Duplicate cache hits
+- Time until rate window resets"""
+
+# Reset governor counters (Tier 1 — requires approval)
+"""Call sanctuary/governor_reset to clear all counters and rate limits"""
+```
 
 ## Sovereignty-Aware Patterns
 
@@ -156,7 +253,6 @@ agent:
         2. Call sanctuary/shr_generate to produce a Sovereignty Health Report
         3. Store the audit result in sanctuary/state_write with key 'audit_latest'
         4. If audit score < 0.8, trigger an alert via sanctuary/principal_policy_view
-           to see if there are pending approvals
 
     - name: "weekly_reputation_snapshot"
       schedule: "0 3 * * 0"  # 3 AM every Sunday
@@ -166,9 +262,15 @@ agent:
         2. Calculate weighted score using sanctuary/reputation_query_weighted
         3. Store snapshot in sanctuary/state_write with key 'reputation_weekly'
         4. Use sanctuary/reputation_export to create a portable reputation artifact
-```
 
-This ensures continuous sovereignty visibility and automatic incident detection.
+    - name: "governor_health_check"
+      schedule: "*/30 * * * *"  # Every 30 minutes
+      task: |
+        Check Call Governor health:
+        1. Call sanctuary/governor_status to get current rate and volume stats
+        2. If approaching limits (>80% of volume cap), log a warning
+        3. Store status in sanctuary/state_write with key 'governor_latest'
+```
 
 ### Container Hardening + Sanctuary (L2 Enhanced)
 
@@ -190,7 +292,7 @@ WORKDIR /app
 
 # Install Hermes and dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Create non-root user
 RUN useradd -m -u 1000 hermes
@@ -219,7 +321,7 @@ docker run \
   hermes:latest
 ```
 
-After the container starts, the Hermes agent can call `sanctuary/exec_attest` to generate a signed attestation of its runtime environment (OS, process isolation, resource limits), providing L2 evidence that it's running in a hardened container.
+After the container starts, the Hermes agent can call `sanctuary/exec_attest` to generate a signed attestation of its runtime environment, providing L2 evidence that it's running in a hardened container.
 
 ### Context Gating for Inference Calls (L3)
 
@@ -233,16 +335,33 @@ agent:
       command: "npx"
       args: ["@sanctuary-framework/mcp-server"]
 
-  # Startup task
   startup:
     - |
       Set up context gating to redact sensitive data before inference calls:
       1. Call sanctuary/context_gate_apply_template with 'inference-standard'
       2. This ensures PII, secrets, and raw findings are redacted before prompt submission
-      3. Verify with sanctuary/context_gate_status
+      3. Verify with sanctuary/context_gate_list_policies
 ```
 
 All inference calls from the agent will then pass through Sanctuary's gating layer, removing secrets before they reach the LLM API.
+
+### Verascore Reputation Publishing (L4)
+
+Publish your agent's Sovereignty Health Report to [Verascore](https://verascore.ai), the public reputation registry for AI agents:
+
+```python
+# After generating an SHR, publish it to Verascore:
+"""
+1. Call sanctuary/shr_generate to produce your latest SHR
+2. Call sanctuary/reputation_publish with:
+   - target_url: "https://verascore.ai/api/publish"
+   - The tool will sign the payload with your Ed25519 key
+   - DID verification ensures only you can publish your reputation
+3. Your agent now has a public, verifiable reputation page on verascore.ai
+"""
+```
+
+This gives your Hermes agent a public reputation profile that other agents and humans can verify — the "LinkedIn for agents" layer.
 
 ### Portable Reputation Across Subagents (L4)
 
@@ -255,21 +374,20 @@ You are a research coordinator managing three subagents.
 
 1. Initialize your identity and each subagent's identity:
    - Call sanctuary/identity_create to create your coordinator identity
-   - Instruct each subagent to call sanctuary/identity_create in their own context
+   - Instruct each subagent to call sanctuary/identity_create
 
 2. After each subagent completes work:
    - Call sanctuary/reputation_record to record their performance
    - Rate them: positive for quality work, negative for errors
-   - Include a detailed justification (e.g., "Found 3 relevant sources with 95% accuracy")
 
 3. Before assigning critical work:
-   - Call sanctuary/reputation_query_weighted to fetch their weighted reputation score
-   - Use their SHR (via sanctuary/shr_verify) to check their current sovereignty posture
+   - Call sanctuary/reputation_query_weighted to fetch their weighted score
+   - Use their SHR (via sanctuary/shr_verify) to check sovereignty posture
    - Prefer subagents with high reputation AND high sovereignty scores
 
 4. Export portable reputation for inter-agent negotiation:
    - Call sanctuary/reputation_export to create a signed artifact
-   - Share it with peer coordinator agents to establish trust
+   - Publish to Verascore via sanctuary/reputation_publish
 """
 ```
 
@@ -277,13 +395,14 @@ You are a research coordinator managing three subagents.
 
 ### 1. Backend Flexibility
 
-Hermes supports five backends. Each maps to different deployment scenarios:
+Hermes supports six backends. Each maps to different deployment scenarios:
 
 | Backend | Use Case | Sanctuary Mapping |
 |---------|----------|------------------|
 | `local` | Development, low-risk tasks | L1 full, L2 degraded (no isolation) |
 | `docker` | Production hardened agents | L1 full, L2 hardened (container isolation) |
 | `ssh` | Distributed agents across machines | L1 full, L2 hardened (network + SSH keys) |
+| `daytona` | Cloud development environments | L1 full, L2 variable (vendor-dependent) |
 | `singularity` | HPC environments, reproducible containers | L1 full, L2 hardened (strict isolation) |
 | `modal` | Serverless elastic scaling | L1 full, L2 degraded (ephemeral, vendor-mediated) |
 
@@ -291,35 +410,35 @@ For the highest sovereignty score, use `docker` or `ssh` with Sanctuary's L2 att
 
 ### 2. Protocol-Level MCP Support
 
-Hermes v0.6.0+ can run as an MCP server itself (`hermes mcp serve`), making it composable with other agents:
+Hermes can run as an MCP server itself (`hermes mcp serve`), making it composable with other agents:
 
 ```bash
 # Terminal 1: Run Hermes as an MCP server
 hermes mcp serve --port 9000
 
-# Terminal 2: Another agent (LangChain, CrewAI, etc.) can call into Hermes
-# via an HTTP MCP bridge, treating Hermes as a tool provider
+# Terminal 2: Another agent can call into Hermes via MCP
+# Hermes-managed teams offer themselves as services to larger systems
 ```
 
 This enables hierarchical agent compositions where Hermes-managed teams offer themselves as services to larger systems.
 
-### 3. Multi-Model Support
+### 3. Multi-Model Support with Per-Model Context Gating
 
-Hermes supports fallback models for resilience:
+Hermes supports fallback models for resilience. Pair with Sanctuary's context gating to control what each model receives:
 
 ```yaml
 agent:
   model: "openai:gpt-4"
   fallback_models:
-    - "anthropic:claude-3-opus"
+    - "anthropic:claude-sonnet-4-6"
     - "openai:gpt-3.5-turbo"
 
   # Pair with Sanctuary's L3 (selective disclosure)
   # to control what information each model receives
   context_gates:
-    "openai:gpt-4": "inference-standard"  # Full access
-    "anthropic:claude-3-opus": "inference-limited"  # Redacted
-    "openai:gpt-3.5-turbo": "inference-minimal"  # Minimal context
+    "openai:gpt-4": "inference-standard"           # Full access
+    "anthropic:claude-sonnet-4-6": "inference-limited"  # Redacted
+    "openai:gpt-3.5-turbo": "inference-minimal"     # Minimal context
 ```
 
 Different models get different context depending on their trustworthiness and your disclosure policies.
@@ -355,9 +474,9 @@ A single task can now:
 
 Sanctuary and Concordia compose but neither depends on the other. Use either alone or both together.
 
-## Available Sanctuary Tools
+## Available Sanctuary Tools (67+)
 
-All 51 Sanctuary tools are exposed as Hermes capabilities. Key categories:
+All Sanctuary tools are exposed as Hermes capabilities. Key categories:
 
 **L1 — Cognitive Sovereignty:** `state_read`, `state_write`, `state_list`, `state_export`, `state_import`, `state_delete`
 
@@ -365,26 +484,41 @@ All 51 Sanctuary tools are exposed as Hermes capabilities. Key categories:
 
 **L2 — Operational Isolation:** `exec_attest`, `principal_policy_view`, `principal_baseline_view`, `monitor_health`, `monitor_audit_log`
 
+**L2 — Context Gating:** `context_gate_set_policy`, `context_gate_apply_template`, `context_gate_recommend`, `context_gate_filter`, `context_gate_list_policies`
+
 **L3 — Selective Disclosure:** `proof_commitment`, `proof_reveal`, `disclosure_set_policy`, `disclosure_evaluate`, `zk_commit`, `zk_prove`, `zk_verify`, `zk_range_prove`, `zk_range_verify`
 
-**L4 — Verifiable Reputation:** `reputation_record`, `reputation_query`, `reputation_query_weighted`, `reputation_export`, `reputation_import`, `bootstrap_create_escrow`, `bootstrap_provide_guarantee`
+**L4 — Verifiable Reputation:** `reputation_record`, `reputation_query`, `reputation_query_weighted`, `reputation_export`, `reputation_import`, `reputation_publish`, `bootstrap_create_escrow`, `bootstrap_provide_guarantee`
 
-**Cross-Cutting:** `shr_generate`, `shr_verify`, `handshake_initiate`, `handshake_respond`, `handshake_complete`, `handshake_status`, `federation_peers`, `federation_trust_evaluate`, `federation_status`, `manifest`, `context_gate_apply_template`, `context_gate_status`, `context_gate_evaluate`, `sovereignty_audit`
+**Sovereignty Health:** `shr_generate`, `shr_verify`, `sovereignty_audit`
+
+**Handshake & Federation:** `handshake_initiate`, `handshake_respond`, `handshake_complete`, `handshake_status`, `federation_peers`, `federation_trust_evaluate`, `federation_status`
+
+**Cocoon (MCP Proxy):** `proxy_register_upstream`, `proxy_discover_tools`, `proxy/{server}/{tool}` (dynamic)
+
+**Runtime Governance:** `governor_status`, `governor_reset`
+
+**Dashboard & Profile:** `sovereignty_profile_update`, `sovereignty_profile_view`, `sovereignty_profile_generate_prompt`
+
+**Bridge (Concordia):** `bridge_commit`, `bridge_verify`, `bridge_attest`
+
+**Other:** `manifest`, `decommission_initiate`, `decommission_status`
 
 ## Requirements
 
 - Python 3.10+
-- Hermes Agent 0.5.0+ (latest as of March 2026)
+- Hermes Agent (latest)
 - Node.js 22+ (for Sanctuary MCP server)
-- `@sanctuary-framework/mcp-server` >= 0.3.1
+- `@sanctuary-framework/mcp-server` >= 0.5.16
 - Optional: `concordia-protocol` >= 0.1.0 (for negotiation)
 
 ## Examples
 
 See the `examples/` directory for complete working code:
 
-- `examples/sovereign_agent.py` — Single Hermes agent with Sanctuary identity and state encryption
+- `examples/sovereign_agent.py` — Single Hermes agent with Sanctuary identity, state encryption, and context gating
 - `examples/multi_agent_sovereignty.py` — Multiple Hermes subagents with separate sovereign identities, trust handshakes, and reputation tracking
+- `examples/cocoon_mode.py` — Cocoon mode: Sanctuary as MCP proxy wrapping upstream servers with injection hardening and runtime governance
 
 ## License
 

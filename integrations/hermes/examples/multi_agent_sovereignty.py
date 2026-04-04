@@ -7,6 +7,8 @@ Demonstrates a Hermes coordinator managing three isolated subagents, where:
   - Subagents perform specialized work (research, review, attestation)
   - The coordinator establishes trust via sovereignty handshakes (L4)
   - Reputation is tracked and verifiable across the network (L4)
+  - Reputation is published to Verascore for public verification (L4)
+  - All operations are governed by the Call Governor
   - All operations are auditable (L2 audit log)
 
 This pattern enables:
@@ -14,10 +16,12 @@ This pattern enables:
   - Portable reputation for inter-agent trust
   - Signed attestations that persist across sessions
   - Credential-less negotiation (identity + reputation only)
+  - Public reputation profiles on verascore.ai
 
 Requirements:
     pip install hermes-agent concordia-protocol
     Node.js 22+ (for Sanctuary MCP server)
+    @sanctuary-framework/mcp-server >= 0.5.16
 
 Usage:
     export HERMES_MEMORY_KEY=$(openssl rand -base64 32)
@@ -84,7 +88,8 @@ def make_coordinator_config() -> dict:
                 "You manage three specialized subagents, each with their own "
                 "cryptographic identity and encrypted state. Your role is to "
                 "route work, establish trust via handshakes, track reputation, "
-                "and produce final reports signed by your identity."
+                "monitor governance via the Call Governor, and produce final "
+                "reports signed by your identity."
             ),
             "model": "openai:gpt-4",
 
@@ -141,12 +146,14 @@ async def main():
     print("=" * 80)
     print()
     print("This demonstration shows:")
-    print("  • One coordinator agent managing three isolated subagents")
-    print("  • Each agent has its own sovereign identity (Ed25519 keypair)")
-    print("  • Each agent has encrypted state isolation (separate storage)")
-    print("  • Trust established via Sanctuary handshakes (L4)")
-    print("  • Reputation tracking and verification (L4)")
-    print("  • Portable, signed attestations across agents")
+    print("  - One coordinator agent managing three isolated subagents")
+    print("  - Each agent has its own sovereign identity (Ed25519 keypair)")
+    print("  - Each agent has encrypted state isolation (separate storage)")
+    print("  - Trust established via Sanctuary handshakes (L4)")
+    print("  - Reputation tracking and verification (L4)")
+    print("  - Verascore reputation publishing (L4)")
+    print("  - Call Governor monitoring for all agents")
+    print("  - Portable, signed attestations across agents")
     print()
 
     # Create configs for all agents
@@ -182,6 +189,8 @@ async def main():
         ),
     )
 
+    # ── PHASE 1: IDENTITY SETUP ──────────────────────────────────────────
+
     print("=" * 80)
     print("PHASE 1: IDENTITY SETUP")
     print("=" * 80)
@@ -195,7 +204,8 @@ async def main():
 1. Call sanctuary/identity_create to generate your Ed25519 keypair
 2. Store your identity details in sanctuary/state_write with key 'coordinator_identity'
 3. Generate a Sovereignty Health Report using sanctuary/shr_generate
-4. Report your public key and SHR summary"""
+4. Check sanctuary/governor_status to confirm governance is active
+5. Report your public key, SHR summary, and governor state"""
 
     coordinator_result = await coordinator.run_task(
         {
@@ -208,60 +218,35 @@ async def main():
     print()
 
     # Initialize subagents
-    print("Initializing researcher subagent...")
-    researcher = HermesAgent.from_config(researcher_config)
-    researcher_result = await researcher.run_task(
-        {
-            "name": "identity_setup",
-            "description": "Set up researcher identity",
-            "prompt": """Create your researcher identity:
+    for agent_name, config in [
+        ("researcher", researcher_config),
+        ("reviewer", reviewer_config),
+        ("synthesizer", synthesizer_config),
+    ]:
+        print(f"Initializing {agent_name} subagent...")
+        agent = HermesAgent.from_config(config)
+        result = await agent.run_task(
+            {
+                "name": "identity_setup",
+                "description": f"Set up {agent_name} identity",
+                "prompt": f"""Create your {agent_name} identity:
 1. Call sanctuary/identity_create to generate your Ed25519 keypair
 2. Store your identity in sanctuary/state_write with key 'identity'
 3. Generate your initial SHR using sanctuary/shr_generate
-4. Report your public key""",
-        }
-    )
-    print(researcher_result)
-    print()
+4. Check sanctuary/governor_status to confirm governance is active
+5. Report your public key and governor state""",
+            }
+        )
+        print(result)
+        print()
 
-    print("Initializing reviewer subagent...")
-    reviewer = HermesAgent.from_config(reviewer_config)
-    reviewer_result = await reviewer.run_task(
-        {
-            "name": "identity_setup",
-            "description": "Set up reviewer identity",
-            "prompt": """Create your reviewer identity:
-1. Call sanctuary/identity_create to generate your Ed25519 keypair
-2. Store your identity in sanctuary/state_write with key 'identity'
-3. Generate your initial SHR using sanctuary/shr_generate
-4. Report your public key""",
-        }
-    )
-    print(reviewer_result)
-    print()
-
-    print("Initializing synthesizer subagent...")
-    synthesizer = HermesAgent.from_config(synthesizer_config)
-    synthesizer_result = await synthesizer.run_task(
-        {
-            "name": "identity_setup",
-            "description": "Set up synthesizer identity",
-            "prompt": """Create your synthesizer identity:
-1. Call sanctuary/identity_create to generate your Ed25519 keypair
-2. Store your identity in sanctuary/state_write with key 'identity'
-3. Generate your initial SHR using sanctuary/shr_generate
-4. Report your public key""",
-        }
-    )
-    print(synthesizer_result)
-    print()
+    # ── PHASE 2: TRUST ESTABLISHMENT ─────────────────────────────────────
 
     print("=" * 80)
     print("PHASE 2: TRUST ESTABLISHMENT (Sovereignty Handshakes)")
     print("=" * 80)
     print()
 
-    # Coordinator initiates handshakes with each subagent
     print("Coordinator initiating sovereignty handshakes with subagents...")
     print()
 
@@ -286,24 +271,16 @@ async def main():
     print("Subagents responding to coordinator handshakes...")
     print()
 
-    researcher_respond = """The coordinator has initiated a handshake.
-1. Call sanctuary/handshake_respond to accept the coordinator's trust proposal
-2. Send your current SHR as evidence of your sovereignty posture
-3. Store the handshake response in state_write with key 'handshake_coordinator'
-4. Report acceptance and your SHR"""
+    # Initialize agents for handshake responses
+    researcher = HermesAgent.from_config(researcher_config)
+    reviewer = HermesAgent.from_config(reviewer_config)
+    synthesizer = HermesAgent.from_config(synthesizer_config)
 
-    researcher_hs = await researcher.run_task(
-        {
-            "name": "respond_handshake",
-            "description": "Respond to coordinator handshake",
-            "prompt": researcher_respond,
-        }
-    )
-    print("Researcher response:", researcher_hs)
-    print()
-
-    # Repeat for reviewer and synthesizer
-    for agent_name, agent in [("Reviewer", reviewer), ("Synthesizer", synthesizer)]:
+    for agent_name, agent in [
+        ("Researcher", researcher),
+        ("Reviewer", reviewer),
+        ("Synthesizer", synthesizer),
+    ]:
         hs_response = await agent.run_task(
             {
                 "name": "respond_handshake",
@@ -317,6 +294,8 @@ async def main():
         )
         print(f"{agent_name} response:", hs_response)
         print()
+
+    # ── PHASE 3: WORK ASSIGNMENT & EXECUTION ─────────────────────────────
 
     print("=" * 80)
     print("PHASE 3: WORK ASSIGNMENT & EXECUTION")
@@ -332,8 +311,9 @@ async def main():
    - The development (2-3 sentences)
    - Why it matters for agent sovereignty
    - Timestamp of your analysis
-4. Run sanctuary/sovereignty_audit to verify you maintained security while researching
-5. Report all three findings and your audit score"""
+4. Run sanctuary/sovereignty_audit to verify you maintained security
+5. Check sanctuary/governor_status to see your call volume
+6. Report all three findings, your audit score, and governor stats"""
 
     researcher_work_result = await researcher.run_task(
         {
@@ -353,7 +333,8 @@ async def main():
    - Completeness (does it fully support the claim?)
    - Insight (does it add new understanding?)
 2. Assign a quality score (1-10) for each finding
-3. Record a reputation attestation for the researcher using sanctuary/reputation_record:
+3. Record a reputation attestation for the researcher using
+   sanctuary/reputation_record:
    - Include your overall assessment
    - Note specific findings that were excellent or weak
    - Rate the researcher's work quality (positive or negative)
@@ -377,8 +358,8 @@ async def main():
 2. Identify patterns, themes, and strategic implications
 3. Create a synthetic narrative that combines the findings
 4. Store your synthesis in state_write with key 'synthesis_strategic_insights'
-5. Use sanctuary/zk_commit to create a zero-knowledge commitment to your insights
-   (proves you have insight without revealing it yet)
+5. Use sanctuary/zk_commit to create a zero-knowledge commitment to your
+   insights (proves you have insight without revealing it yet)
 6. Report your synthesis and the commitment hash"""
 
     synthesizer_work_result = await synthesizer.run_task(
@@ -391,53 +372,67 @@ async def main():
     print(synthesizer_work_result)
     print()
 
+    # ── PHASE 4: REPUTATION AGGREGATION & VERASCORE PUBLISH ──────────────
+
     print("=" * 80)
-    print("PHASE 4: REPUTATION AGGREGATION & FINAL REPORT")
+    print("PHASE 4: REPUTATION AGGREGATION & VERASCORE PUBLISH")
     print("=" * 80)
     print()
 
-    # Coordinator aggregates results and records final reputation
     coordinator_final = """Aggregate the work from your three subagents:
+
 1. Query reputation records for all three using sanctuary/reputation_query
 2. Calculate weighted reputation scores using sanctuary/reputation_query_weighted
-3. Record a final positive reputation attestation for each subagent reflecting
-   the quality of their work
+3. Record a final positive reputation attestation for each subagent
 4. Export portable reputation for each using sanctuary/reputation_export
 5. Create a final team SHR using sanctuary/shr_generate
-6. Run sanctuary/sovereignty_audit for your final posture
-7. Store the team report in state_write with key 'final_team_report'
-8. Report:
-   - Each subagent's reputation score
-   - Team SHR
-   - Your final audit score
-   - Exportable reputation artifacts for each agent"""
+6. Publish team reputation to Verascore using sanctuary/reputation_publish:
+   - target_url: "https://verascore.ai/api/publish"
+   - This signs the payload with your Ed25519 key and publishes
+     your team's reputation to the public registry
+7. Run sanctuary/sovereignty_audit for your final posture
+8. Check sanctuary/governor_status for final governance stats
+9. Store the team report in state_write with key 'final_team_report'
+
+Report:
+  - Each subagent's reputation score
+  - Team SHR
+  - Verascore publish result
+  - Your final audit score
+  - Governor stats (total calls, rate, duplicates)"""
 
     coordinator_final_result = await coordinator.run_task(
         {
             "name": "final_aggregation",
-            "description": "Aggregate results and final report",
+            "description": "Aggregate results, publish to Verascore",
             "prompt": coordinator_final,
         }
     )
     print(coordinator_final_result)
     print()
 
+    # ── SUMMARY ──────────────────────────────────────────────────────────
+
     print("=" * 80)
     print("DEMONSTRATION COMPLETE")
     print("=" * 80)
     print()
     print("All agents maintained full sovereignty throughout:")
-    print("  • Each agent held its own cryptographic identity")
-    print("  • Each agent's state was encrypted and isolated")
-    print("  • Trust was established via signed handshakes (L4)")
-    print("  • Reputation was tracked in portable, verifiable form (L4)")
-    print("  • All operations are auditable in each agent's log (L2)")
+    print("  - Each agent held its own cryptographic identity")
+    print("  - Each agent's state was encrypted and isolated")
+    print("  - Trust was established via signed handshakes (L4)")
+    print("  - Reputation was tracked in portable, verifiable form (L4)")
+    print("  - Reputation published to verascore.ai for public verification")
+    print("  - Call Governor tracked all tool usage across agents")
+    print("  - All operations are auditable in each agent's log (L2)")
     print()
     print("Storage paths:")
     print(f"  Coordinator: {Path.home() / '.sanctuary' / 'hermes-coordinator'}")
     print(f"  Researcher:  {Path.home() / '.sanctuary' / 'hermes-researcher'}")
     print(f"  Reviewer:    {Path.home() / '.sanctuary' / 'hermes-reviewer'}")
     print(f"  Synthesizer: {Path.home() / '.sanctuary' / 'hermes-synthesizer'}")
+    print()
+    print("Public reputation: https://verascore.ai")
     print()
 
 
