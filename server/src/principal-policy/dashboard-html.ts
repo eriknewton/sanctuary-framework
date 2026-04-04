@@ -228,7 +228,7 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
         if (response.ok) {
           const data = await response.json();
           sessionStorage.setItem('authToken', token);
-          window.location.href = '/dashboard';
+          window.location.href = '/'; // Dashboard is served at root path
         } else if (response.status === 401) {
           showError('Invalid token. Please check and try again.');
         } else {
@@ -258,9 +258,8 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
 export function generateDashboardHTML(options: {
   timeoutSeconds: number;
   serverVersion: string;
-  // SEC-038: authToken removed from HTML generation — no longer embedded in page source.
+  // SEC-056: authToken parameter removed entirely from function signature.
   // The client uses sessionStorage (set during login flow) for API authentication.
-  authToken?: string; // Retained for interface compat but NOT embedded in output.
 }): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -2308,7 +2307,7 @@ export function generateDashboardHTML(options: {
 
       const feed = document.getElementById('activity-feed');
       const html = \`
-        <div class="activity-item \${item.type}">
+        <div class="activity-item \${esc(item.type)}">
           <div class="activity-type">\${esc(item.title)}</div>
           <div class="activity-content">\${esc(item.content)}</div>
           <div class="activity-time">\${formatTime(item.timestamp)}</div>

@@ -223,7 +223,21 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
         resolve();
       });
-      this.httpServer.on("error", reject);
+      this.httpServer.on("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "EADDRINUSE") {
+          const port = this.config.port;
+          process.stderr.write(
+            `\n  ╔══════════════════════════════════════════════════════════════╗\n` +
+            `  ║  Port ${port} is already in use.                              ║\n` +
+            `  ║                                                              ║\n` +
+            `  ║  Another Sanctuary Dashboard may still be running.           ║\n` +
+            `  ║  To fix: lsof -ti:${port} | xargs kill                        ║\n` +
+            `  ║  Then restart the dashboard.                                 ║\n` +
+            `  ╚══════════════════════════════════════════════════════════════╝\n\n`
+          );
+        }
+        reject(err);
+      });
     });
   }
 
@@ -583,7 +597,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (!this.checkRateLimit(req, res, "general")) return;
 
     try {
-      if (method === "GET" && url.pathname === "/") {
+      if (method === "GET" && (url.pathname === "/" || url.pathname === "/dashboard")) {
         this.serveDashboard(res);
       } else if (method === "GET" && url.pathname === "/events") {
         this.handleSSE(req, res);
