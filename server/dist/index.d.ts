@@ -1,4 +1,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 
 interface SanctuaryConfig {
     version: string;
@@ -1488,11 +1491,15 @@ declare const MODEL_PRESETS: {
  * Scans tool arguments for role override, security bypass, encoding evasion,
  * data exfiltration, and prompt stuffing signals.
  *
+ * SEC-034/SEC-035: Enhanced with Unicode sanitization pre-pass, decoded content
+ * re-scanning, token budget analysis, and outbound content scanning.
+ *
  * Security invariants:
  * - Always returns a result, never throws
  * - Typical scan completes in < 5ms
  * - False positives minimized via field-aware scanning
  * - Recursive scanning of nested objects/arrays
+ * - Outbound scanning catches secret leaks and injection artifact survival
  */
 interface InjectionDetectorConfig {
     enabled: boolean;
@@ -1524,6 +1531,14 @@ declare class InjectionDetector {
      */
     scan(toolName: string, args: Record<string, unknown>): DetectionResult;
     /**
+     * SEC-035: Scan outbound content for secret leaks, data exfiltration,
+     * internal path exposure, and injection artifact survival.
+     *
+     * @param content The outbound content string to scan
+     * @returns DetectionResult with outbound-specific signal types
+     */
+    scanOutbound(content: string): DetectionResult;
+    /**
      * Recursively scan a value and all nested values.
      */
     private scanValue;
@@ -1532,7 +1547,82 @@ declare class InjectionDetector {
      */
     private scanString;
     /**
-     * Detect base64 strings and zero-width character evasion.
+     * Count invisible Unicode characters in a string.
+     * Includes zero-width chars, soft hyphens, directional marks,
+     * variation selectors, and other invisible categories.
+     */
+    private countInvisibleChars;
+    /**
+     * Strip invisible characters from a string for clean pattern matching.
+     * Returns a new string with all invisible chars removed.
+     */
+    private stripInvisibleChars;
+    /**
+     * SEC-034: Token budget attack detection.
+     * Some Unicode sequences expand dramatically during tokenization (e.g., CJK
+     * ideographs, combining characters, emoji sequences). If the estimated token
+     * cost per character is anomalously high, this may be a wallet-drain payload.
+     *
+     * Heuristic: count chars that typically tokenize into multiple tokens.
+     * If the ratio of estimated tokens to char count exceeds 3x, flag it.
+     */
+    private detectTokenBudgetAttack;
+    /**
+     * Detect encoded content (base64, hex, HTML entities, URL encoding),
+     * decode it, and re-scan the decoded content through injection patterns.
+     * If the decoded content contains injection patterns, flag as encoding_evasion.
+     */
+    private detectEncodedPayloads;
+    /**
+     * Check if a string contains any injection patterns (role override or security bypass).
+     */
+    private containsInjectionPatterns;
+    /**
+     * Safely decode a base64 string. Returns null if it's not valid base64
+     * or doesn't decode to a meaningful string.
+     */
+    private safeBase64Decode;
+    /**
+     * Safely decode a hex string. Returns null on failure.
+     */
+    private safeHexDecode;
+    /**
+     * Decode HTML numeric entities (&#xHH; and &#DDD;) in a string.
+     */
+    private decodeHtmlEntities;
+    /**
+     * Safely decode a URL-encoded string. Returns null on failure.
+     */
+    private safeUrlDecode;
+    /**
+     * Heuristic: does this look like readable text (vs. binary garbage)?
+     * Checks that most characters are printable ASCII or common Unicode.
+     */
+    private looksLikeText;
+    /**
+     * Detect API keys and secrets in outbound content.
+     */
+    private detectSecretPatterns;
+    /**
+     * Detect data exfiltration via markdown images with data-carrying query params.
+     */
+    private detectOutboundExfiltration;
+    /**
+     * Detect internal filesystem path leaks in outbound content.
+     */
+    private detectInternalPathLeaks;
+    /**
+     * Detect private IP addresses and localhost references in outbound content.
+     */
+    private detectPrivateNetworkLeaks;
+    /**
+     * Detect role markers / prompt template artifacts in outbound content.
+     * These should never appear in agent output — their presence indicates
+     * injection artifact survival.
+     */
+    private detectOutputRoleMarkers;
+    /**
+     * Detect base64 strings, base64url, and zero-width character evasion.
      */
     private detectEncodingEvasion;
     /**
@@ -1564,10 +1654,13 @@ declare class InjectionDetector {
      */
     private isStructuredField;
     /**
-     * SEC-032: Map common cross-script confusable characters to their Latin equivalents.
-     * NFKC normalization handles fullwidth and compatibility forms, but does NOT map
-     * Cyrillic/Greek lookalikes to Latin (they're distinct codepoints by design).
-     * This covers the most common confusables used in injection evasion.
+     * SEC-032/SEC-034: Map common cross-script confusable characters to their
+     * Latin equivalents. NFKC normalization handles fullwidth and compatibility
+     * forms, but does NOT map Cyrillic/Greek/Armenian/Georgian lookalikes to
+     * Latin (they're distinct codepoints by design).
+     *
+     * Extended to 50+ confusable pairs covering Cyrillic, Greek, Armenian,
+     * Georgian, Cherokee, and mathematical/symbol lookalikes.
      */
     private normalizeConfusables;
     /**
@@ -1833,6 +1926,8 @@ type InjectionAlertCallback = (alert: {
     result: DetectionResult;
     timestamp: string;
 }) => void;
+/** Resolver for proxy tool tiers — provided by the ProxyRouter */
+type ProxyTierResolver = (toolName: string) => (1 | 2 | 3) | null;
 declare class ApprovalGate {
     private policy;
     private baseline;
@@ -1840,7 +1935,12 @@ declare class ApprovalGate {
     private auditLog;
     private injectionDetector;
     private onInjectionAlert?;
+    private proxyTierResolver?;
     constructor(policy: PrincipalPolicy, baseline: BaselineTracker, channel: ApprovalChannel, auditLog: AuditLog, injectionDetector?: InjectionDetector, onInjectionAlert?: InjectionAlertCallback);
+    /**
+     * Set the proxy tier resolver. Called after the proxy router is initialized.
+     */
+    setProxyTierResolver(resolver: ProxyTierResolver): void;
     /**
      * Evaluate a tool call against the Principal Policy.
      *
@@ -1886,6 +1986,13 @@ type ToolHandler = (args: Record<string, unknown>) => Promise<{
         text: string;
     }>;
 }>;
+/** Tool definition for registration */
+interface ToolDefinition {
+    name: string;
+    description: string;
+    inputSchema: Record<string, unknown>;
+    handler: ToolHandler;
+}
 
 /**
  * Sanctuary MCP Server — L2 Context Gating: Automatic Enforcer
@@ -2003,6 +2110,426 @@ declare class ContextGateEnforcer {
      */
     resetStats(): void;
 }
+
+/**
+ * Sanctuary MCP Server — Sovereignty Profile
+ *
+ * Encrypted store for the sovereignty profile configuration.
+ * Controls which Sanctuary features are active and how they behave.
+ *
+ * The profile is stored encrypted in a reserved namespace (_sovereignty_profile)
+ * using AES-256-GCM with HKDF domain separation, following the same pattern
+ * as ContextGatePolicyStore.
+ *
+ * Security invariants:
+ * - Profile is stored in a reserved namespace (underscore-prefixed)
+ * - L1 state tools cannot read or write reserved namespaces
+ * - Profile changes only come through dedicated profile tools (Tier 1)
+ *   or the dashboard
+ * - All changes are audit-logged
+ */
+
+interface UpstreamServer {
+    name: string;
+    transport: {
+        type: "stdio" | "sse";
+        command?: string;
+        args?: string[];
+        url?: string;
+        env?: Record<string, string>;
+    };
+    enabled: boolean;
+    default_tier: 1 | 2 | 3;
+    tool_overrides?: Record<string, {
+        tier: 1 | 2 | 3;
+    }>;
+}
+interface SovereigntyProfile {
+    version: 1;
+    features: {
+        audit_logging: {
+            enabled: boolean;
+        };
+        injection_detection: {
+            enabled: boolean;
+            sensitivity?: "low" | "medium" | "high";
+        };
+        context_gating: {
+            enabled: boolean;
+            policy_id?: string;
+        };
+        approval_gate: {
+            enabled: true;
+        };
+        zk_proofs: {
+            enabled: boolean;
+        };
+    };
+    upstream_servers?: UpstreamServer[];
+    updated_at: string;
+}
+/** Partial feature update — all fields optional */
+interface SovereigntyProfileUpdate {
+    audit_logging?: {
+        enabled?: boolean;
+    };
+    injection_detection?: {
+        enabled?: boolean;
+        sensitivity?: "low" | "medium" | "high";
+    };
+    context_gating?: {
+        enabled?: boolean;
+        policy_id?: string;
+    };
+    approval_gate?: {
+        enabled?: true;
+    };
+    zk_proofs?: {
+        enabled?: boolean;
+    };
+    upstream_servers?: UpstreamServer[];
+}
+declare function createDefaultProfile(): SovereigntyProfile;
+/**
+ * Sovereignty profile store — encrypted under L1 sovereignty.
+ *
+ * Stores the active sovereignty profile in a reserved namespace.
+ * On first load, creates the default profile automatically.
+ */
+declare class SovereigntyProfileStore {
+    private storage;
+    private encryptionKey;
+    private profile;
+    constructor(storage: StorageBackend, masterKey: Uint8Array);
+    /**
+     * Load the active sovereignty profile from encrypted storage.
+     * Creates the default profile on first run.
+     */
+    load(): Promise<SovereigntyProfile>;
+    /**
+     * Get the current profile. Must call load() first.
+     */
+    get(): SovereigntyProfile;
+    /**
+     * Apply a partial update to the profile.
+     * Returns the updated profile.
+     */
+    update(updates: SovereigntyProfileUpdate): Promise<SovereigntyProfile>;
+    /**
+     * Persist the current profile to encrypted storage.
+     */
+    private persist;
+}
+
+/**
+ * Sanctuary MCP Server — Proxy Client Manager
+ *
+ * Manages MCP client connections to upstream servers. Handles connection
+ * lifecycle, reconnection with exponential backoff, and tool discovery.
+ *
+ * Security invariants:
+ * - Upstream servers are configured via the sovereignty profile (Tier 1 gated)
+ * - Connection failures do not block Sanctuary startup
+ * - Tool discovery is re-run on every successful reconnection
+ * - Environment variables for upstream transports are passed through, not stored in logs
+ */
+
+type ConnectionState = "disconnected" | "connecting" | "connected" | "error";
+interface UpstreamTool {
+    name: string;
+    description: string;
+    inputSchema: Record<string, unknown>;
+}
+interface UpstreamConnection {
+    server: UpstreamServer;
+    client: Client | null;
+    transport: StdioClientTransport | SSEClientTransport | null;
+    state: ConnectionState;
+    tools: UpstreamTool[];
+    error?: string;
+    retryCount: number;
+    retryTimer?: ReturnType<typeof setTimeout>;
+}
+/** Callback for state changes */
+type ConnectionStateCallback = (serverName: string, state: ConnectionState, toolCount: number, error?: string) => void;
+declare class ClientManager {
+    private connections;
+    private onStateChange?;
+    private shutdownRequested;
+    constructor(options?: {
+        onStateChange?: ConnectionStateCallback;
+    });
+    /**
+     * Configure upstream servers. Disconnects removed servers, connects new ones.
+     * Non-blocking — connection failures are handled asynchronously.
+     */
+    configure(servers: UpstreamServer[]): Promise<void>;
+    /**
+     * Get all discovered tools across all connected upstream servers.
+     */
+    getAllTools(): Map<string, UpstreamTool[]>;
+    /**
+     * Get connection status for all configured servers.
+     */
+    getStatus(): Array<{
+        name: string;
+        state: ConnectionState;
+        transport_type: string;
+        tool_count: number;
+        error?: string;
+    }>;
+    /**
+     * Get the upstream server config by name.
+     */
+    getServerConfig(name: string): UpstreamServer | undefined;
+    /**
+     * Call a tool on an upstream server.
+     */
+    callTool(serverName: string, toolName: string, args: Record<string, unknown>): Promise<{
+        content: Array<{
+            type: string;
+            text?: string;
+            [key: string]: unknown;
+        }>;
+    }>;
+    /**
+     * Shut down all connections cleanly.
+     */
+    shutdown(): Promise<void>;
+    /**
+     * Connect to an upstream server (non-blocking).
+     * Spawns connection attempt in background — does not throw.
+     */
+    private connectServer;
+    /**
+     * Perform the actual connection to an upstream server.
+     */
+    private doConnect;
+    /**
+     * Discover tools from a connected upstream server.
+     */
+    private discoverTools;
+    /**
+     * Schedule a reconnection attempt with exponential backoff.
+     */
+    private scheduleRetry;
+    /**
+     * Disconnect a specific upstream server.
+     */
+    private disconnectServer;
+    /**
+     * Notify listener of state change.
+     */
+    private notifyStateChange;
+}
+
+/**
+ * Sanctuary MCP Server — L2 Operational Isolation: Call Governor
+ *
+ * Runtime governance for proxied tool calls. Wraps the proxy forwarding
+ * path with four enforcement mechanisms:
+ *
+ * 1. Volume limit — sliding-window cap on total tool calls
+ * 2. Rate detection — per-tool call frequency check (loop detection)
+ * 3. Duplicate detection — SHA-256 hash of tool+args, cache recent results
+ * 4. Lifetime counter — hard stop after N total calls per session
+ *
+ * All state is in-memory. Resets on server restart.
+ *
+ * Security invariants:
+ * - Governor cannot be bypassed — it sits in the enforcement chain
+ * - Lifetime limit is a hard stop (requires reset or restart)
+ * - Rate escalation triggers Tier 2 human approval
+ * - Duplicate cache uses cryptographic hashing (SHA-256)
+ */
+interface GovernorConfig {
+    /** Total calls allowed in the sliding volume window (default: 200) */
+    volume_limit: number;
+    /** Volume window size in milliseconds (default: 600000 = 10 min) */
+    volume_window_ms: number;
+    /** Per-tool calls allowed in the rate window before escalation (default: 20) */
+    rate_limit: number;
+    /** Rate window size in milliseconds (default: 60000 = 1 min) */
+    rate_window_ms: number;
+    /** Duplicate cache TTL in milliseconds (default: 60000 = 1 min) */
+    duplicate_ttl_ms: number;
+    /** Total calls before hard stop for the session (default: 1000) */
+    lifetime_limit: number;
+    /** Per-server config overrides keyed by server name */
+    per_server_overrides?: Record<string, Partial<GovernorConfig>>;
+}
+interface GovernorCheckResult {
+    /** Whether the call is allowed to proceed */
+    allowed: boolean;
+    /** Reason the call was blocked or flagged */
+    reason?: "volume_exceeded" | "rate_exceeded" | "lifetime_exceeded" | "duplicate_cached";
+    /** If duplicate, the cached response */
+    cached_result?: unknown;
+    /** If true, escalate to Tier 2 (human approval required) */
+    escalate?: boolean;
+}
+interface GovernorStatus {
+    /** Current call count in the volume window */
+    volume_current: number;
+    /** Volume limit from config */
+    volume_limit: number;
+    /** Total calls this session */
+    lifetime_current: number;
+    /** Lifetime limit from config */
+    lifetime_limit: number;
+    /** Per-tool call count in the current rate window */
+    rate_by_tool: Record<string, number>;
+    /** Number of entries in the duplicate cache */
+    duplicate_cache_size: number;
+    /** Whether the governor has been hard-stopped */
+    hard_stopped: boolean;
+}
+declare class CallGovernor {
+    private config;
+    /** Sliding window of all call timestamps for volume tracking */
+    private volumeWindow;
+    /** Per-tool sliding window of call timestamps for rate tracking */
+    private rateWindows;
+    /** Duplicate cache: SHA-256(server+tool+args) -> cached result + expiry */
+    private duplicateCache;
+    /** Total calls this session */
+    private lifetimeCount;
+    /** Hard stop flag — set when lifetime limit is reached */
+    private hardStopped;
+    constructor(config?: Partial<GovernorConfig>);
+    /**
+     * Check if a call is allowed and apply governance.
+     *
+     * Evaluation order:
+     * 1. Lifetime limit (hard stop — not recoverable without reset)
+     * 2. Volume limit (sliding window)
+     * 3. Rate limit per tool (escalates to Tier 2)
+     * 4. Duplicate detection (returns cached result)
+     */
+    check(serverName: string, toolName: string, args: Record<string, unknown>): GovernorCheckResult;
+    /**
+     * Record a successful call result for duplicate caching.
+     */
+    recordResult(serverName: string, toolName: string, args: Record<string, unknown>, result: unknown): void;
+    /**
+     * Get current governor status for dashboard display.
+     */
+    getStatus(): GovernorStatus;
+    /**
+     * Reset all counters (Tier 1 — requires approval).
+     * Clears volume window, rate windows, duplicate cache,
+     * lifetime counter, and hard stop flag.
+     */
+    reset(): void;
+    /**
+     * Get the effective config for a given server, merging per-server overrides.
+     */
+    private getEffectiveConfig;
+    /**
+     * Compute a SHA-256 hash of server + tool + canonical args.
+     * Used for duplicate detection.
+     */
+    private computeCallHash;
+    /**
+     * Deterministic JSON serialization with sorted keys.
+     */
+    private stableStringify;
+    /**
+     * Prune volume window entries older than the window size.
+     * Uses shift() from the front — timestamps are appended in order.
+     */
+    private pruneVolumeWindow;
+    /**
+     * Prune a per-tool rate window.
+     */
+    private pruneRateWindow;
+    /**
+     * Prune expired entries from the duplicate cache.
+     * Amortized O(1) — only prunes when cache exceeds a size threshold.
+     */
+    private pruneDuplicateCache;
+}
+
+/**
+ * Sanctuary MCP Server — Proxy Router
+ *
+ * Routes proxied tool calls through the full Sanctuary enforcement chain:
+ * injection detection, approval gate evaluation, context gating, and audit logging.
+ *
+ * Upstream tools are registered under the namespace `proxy/{server_name}/{tool_name}`.
+ * This ensures no collision with native `sanctuary/*` tools and makes the provenance
+ * of every tool call explicit.
+ *
+ * Security invariants:
+ * - Every proxied call passes through injection scan + gate + audit (no bypass path)
+ * - Denied calls return a generic denial message (same as native Sanctuary denials)
+ * - Upstream errors are passed through to the agent unmodified
+ * - Native sanctuary/* tools are never affected by the proxy layer
+ */
+
+interface ProxyRouterOptions {
+    /** Optional callback when the context gate should filter arguments */
+    contextGateFilter?: (toolName: string, args: Record<string, unknown>) => Promise<Record<string, unknown>>;
+    /** Optional call governor for runtime governance */
+    governor?: CallGovernor;
+}
+declare class ProxyRouter {
+    private clientManager;
+    private injectionDetector;
+    private auditLog;
+    private options;
+    constructor(clientManager: ClientManager, injectionDetector: InjectionDetector, auditLog: AuditLog, options?: ProxyRouterOptions);
+    /**
+     * Convert all discovered upstream tools to Sanctuary ToolDefinitions.
+     * Each tool is registered as `proxy/{server_name}/{tool_name}`.
+     */
+    getProxiedTools(): ToolDefinition[];
+    /**
+     * Determine the tier for a proxied tool call.
+     * Checks tool_overrides first, then falls back to default_tier.
+     */
+    getTierForTool(serverName: string, toolName: string): 1 | 2 | 3;
+    /**
+     * Parse a proxy tool name into server name and tool name.
+     * Returns null if the name doesn't match the proxy namespace.
+     */
+    static parseProxyToolName(fullName: string): {
+        serverName: string;
+        toolName: string;
+    } | null;
+    /**
+     * Create a handler for a specific proxied tool.
+     * The handler runs the full enforcement chain before forwarding.
+     */
+    private createHandler;
+    /**
+     * Call an upstream tool with a timeout.
+     */
+    private callWithTimeout;
+    /**
+     * Normalize an upstream response to the standard Sanctuary response format.
+     */
+    private normalizeResponse;
+}
+
+/**
+ * Sanctuary MCP Server — System Prompt Generator
+ *
+ * Pure function that takes a SovereigntyProfile and generates a system
+ * prompt snippet instructing the agent on which Sanctuary features are
+ * active and how to use them.
+ *
+ * The prompt is generic (not harness-specific) and intended to be pasted
+ * into any agent's system configuration.
+ */
+
+/**
+ * Generate a system prompt snippet from the active sovereignty profile.
+ *
+ * The output is a copy-pasteable text block that instructs the agent on
+ * which Sanctuary features are active and how to interact with them.
+ */
+declare function generateSystemPrompt(profile: SovereigntyProfile): string;
 
 /**
  * Sanctuary MCP Server — In-Memory Storage Backend
@@ -2171,6 +2698,8 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
     private handshakeResults;
     private shrOpts;
     private _sanctuaryConfig;
+    private profileStore;
+    private clientManager;
     private dashboardHTML;
     private loginHTML;
     private authToken;
@@ -2197,6 +2726,8 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
         handshakeResults?: Map<string, HandshakeResult>;
         shrOpts?: SHRGeneratorOptions;
         sanctuaryConfig?: SanctuaryConfig;
+        profileStore?: SovereigntyProfileStore;
+        clientManager?: ClientManager;
     }): void;
     /**
      * Mark this dashboard as running in standalone mode.
@@ -2284,6 +2815,18 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
     private handleIdentity;
     private handleHandshakes;
     private handleSHR;
+    private handleSovereigntyProfileGet;
+    private handleSovereigntyProfileUpdate;
+    /**
+     * GET /api/proxy/servers — list upstream proxy servers and their status.
+     */
+    private handleProxyServers;
+    /**
+     * POST /api/proxy/servers — update upstream server configuration.
+     * This is a dashboard action (human-initiated), so it's allowed with audit logging
+     * rather than requiring Tier 1 approval.
+     */
+    private handleProxyServersUpdate;
     broadcastSSE(event: string, data: unknown): void;
     /**
      * Broadcast an audit entry to connected dashboards.
@@ -2794,4 +3337,4 @@ declare function createSanctuaryServer(options?: {
     storage?: StorageBackend;
 }): Promise<SanctuaryServer>;
 
-export { ATTESTATION_VERSION, ApprovalGate, type AttestationBody, type AttestationVerificationResult, AuditLog, AutoApproveChannel, BaselineTracker, type BridgeAttestationRequest, type BridgeAttestationResult, type BridgeCommitment, type BridgeVerificationResult, TEMPLATES as CONTEXT_GATE_TEMPLATES, CallbackApprovalChannel, CommitmentStore, type ConcordiaOutcome, type ContextAction, type ContextFilterResult, ContextGateEnforcer, type ContextGatePolicy, ContextGatePolicyStore, type ContextGateRule, type ContextGateTemplate, DashboardApprovalChannel, type DashboardConfig, type DetectionResult, type EnforcerConfig, type FederationCapabilities, type FederationPeer, FederationRegistry, type FieldClassification, type FieldFilterResult, FilesystemStorage, type GateResult, type HandshakeChallenge, type HandshakeCompletion, type HandshakeResponse, type HandshakeResult, InMemoryModelProvenanceStore, InjectionDetector, type InjectionDetectorConfig, type InjectionSignal, MODEL_PRESETS, MemoryStorage, type ModelProvenance, type ModelProvenanceStore, type PedersenCommitment, type PeerTrustEvaluation, type PolicyRecommendation, PolicyStore, type PrincipalPolicy, type ProviderCategory, ReputationStore, type SHRBody, type SHRGeneratorOptions, type SHRVerificationResult, type SanctuaryConfig, type SanctuaryServer, type SignedAttestation, type SignedSHR, type SovereigntyTier, StateStore, StderrApprovalChannel, TIER_WEIGHTS, type TierMetadata, type TieredAttestation, WebhookApprovalChannel, type WebhookCallbackPayload, type WebhookConfig, type WebhookPayload, type ZKProofOfKnowledge, type ZKRangeProof, canonicalize, classifyField, completeHandshake, computeWeightedScore, createBridgeCommitment, createPedersenCommitment, createProofOfKnowledge, createRangeProof, createSanctuaryServer, evaluateField, filterContext, generateAttestation, generateSHR, getTemplate, initiateHandshake, listTemplateIds, loadConfig, loadPrincipalPolicy, recommendPolicy, resolveTier, respondToHandshake, signPayload, tierDistribution, verifyAttestation, verifyBridgeCommitment, verifyCompletion, verifyPedersenCommitment, verifyProofOfKnowledge, verifyRangeProof, verifySHR, verifySignature };
+export { ATTESTATION_VERSION, ApprovalGate, type AttestationBody, type AttestationVerificationResult, AuditLog, AutoApproveChannel, BaselineTracker, type BridgeAttestationRequest, type BridgeAttestationResult, type BridgeCommitment, type BridgeVerificationResult, TEMPLATES as CONTEXT_GATE_TEMPLATES, CallbackApprovalChannel, ClientManager, CommitmentStore, type ConcordiaOutcome, type ConnectionState, type ContextAction, type ContextFilterResult, ContextGateEnforcer, type ContextGatePolicy, ContextGatePolicyStore, type ContextGateRule, type ContextGateTemplate, DashboardApprovalChannel, type DashboardConfig, type DetectionResult, type EnforcerConfig, type FederationCapabilities, type FederationPeer, FederationRegistry, type FieldClassification, type FieldFilterResult, FilesystemStorage, type GateResult, type HandshakeChallenge, type HandshakeCompletion, type HandshakeResponse, type HandshakeResult, InMemoryModelProvenanceStore, InjectionDetector, type InjectionDetectorConfig, type InjectionSignal, MODEL_PRESETS, MemoryStorage, type ModelProvenance, type ModelProvenanceStore, type PedersenCommitment, type PeerTrustEvaluation, type PolicyRecommendation, PolicyStore, type PrincipalPolicy, type ProviderCategory, ProxyRouter, type ProxyRouterOptions, ReputationStore, type SHRBody, type SHRGeneratorOptions, type SHRVerificationResult, type SanctuaryConfig, type SanctuaryServer, type SignedAttestation, type SignedSHR, type SovereigntyProfile, SovereigntyProfileStore, type SovereigntyProfileUpdate, type SovereigntyTier, StateStore, StderrApprovalChannel, TIER_WEIGHTS, type TierMetadata, type TieredAttestation, type UpstreamConnection, type UpstreamServer, type UpstreamTool, WebhookApprovalChannel, type WebhookCallbackPayload, type WebhookConfig, type WebhookPayload, type ZKProofOfKnowledge, type ZKRangeProof, canonicalize, classifyField, completeHandshake, computeWeightedScore, createBridgeCommitment, createDefaultProfile, createPedersenCommitment, createProofOfKnowledge, createRangeProof, createSanctuaryServer, evaluateField, filterContext, generateAttestation, generateSHR, generateSystemPrompt, getTemplate, initiateHandshake, listTemplateIds, loadConfig, loadPrincipalPolicy, recommendPolicy, resolveTier, respondToHandshake, signPayload, tierDistribution, verifyAttestation, verifyBridgeCommitment, verifyCompletion, verifyPedersenCommitment, verifyProofOfKnowledge, verifyRangeProof, verifySHR, verifySignature };

@@ -136,7 +136,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.dashboardHTML = generateDashboardHTML({
       timeoutSeconds: config.timeout_seconds,
       serverVersion: PKG_VERSION,
-      authToken: this.authToken,
     });
     this.loginHTML = generateLoginHTML({ serverVersion: PKG_VERSION });
     // SEC-012: Periodic cleanup of expired sessions (every 60s)

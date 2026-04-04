@@ -12,13 +12,16 @@ var hmac = require('@noble/hashes/hmac');
 var ed25519 = require('@noble/curves/ed25519');
 var hashWasm = require('hash-wasm');
 var hkdf = require('@noble/hashes/hkdf');
-var index_js = require('@modelcontextprotocol/sdk/server/index.js');
+var index_js$1 = require('@modelcontextprotocol/sdk/server/index.js');
 var types_js = require('@modelcontextprotocol/sdk/types.js');
 var http = require('http');
 var https = require('https');
 var fs = require('fs');
 var child_process = require('child_process');
 var stdio_js = require('@modelcontextprotocol/sdk/server/stdio.js');
+var index_js = require('@modelcontextprotocol/sdk/client/index.js');
+var stdio_js$1 = require('@modelcontextprotocol/sdk/client/stdio.js');
+var sse_js = require('@modelcontextprotocol/sdk/client/sse.js');
 
 var _documentCurrentScript = typeof document !== 'undefined' ? document.currentScript : null;
 var __defProp = Object.defineProperty;
@@ -816,7 +819,7 @@ function checkType(field, value, schema) {
 }
 function createServer(tools, options) {
   const gate = options?.gate;
-  const server = new index_js.Server(
+  const server = new index_js$1.Server(
     {
       name: "sanctuary-mcp-server",
       version: PKG_VERSION2
@@ -1359,7 +1362,9 @@ var init_tools = __esm({
       "_bridge",
       "_federation",
       "_handshake",
-      "_shr"
+      "_shr",
+      "_sovereignty_profile",
+      "_context_gate_policies"
     ];
     IdentityManager = class {
       storage;
@@ -1535,6 +1540,9 @@ var init_audit_log = __esm({
   }
 });
 function extractOperationName(toolName) {
+  if (toolName.startsWith("proxy/")) {
+    return toolName;
+  }
   return toolName.startsWith("sanctuary/") ? toolName.slice("sanctuary/".length) : toolName;
 }
 function parsePolicy(content) {
@@ -1639,6 +1647,8 @@ tier1_always_approve:
   - reputation_export
   - bootstrap_provide_guarantee
   - reputation_publish
+  - sovereignty_profile_update
+  - governor_reset
 
 # \u2500\u2500\u2500 Tier 2: Behavioral Anomaly Detection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # Triggers approval when agent behavior deviates from its baseline.
@@ -1702,6 +1712,8 @@ tier3_always_allow:
   - bridge_verify
   - bridge_attest
   - dashboard_open
+  - sovereignty_profile_get
+  - governor_status
 
 # \u2500\u2500\u2500 Approval Channel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # How Sanctuary reaches you when approval is needed.
@@ -1755,8 +1767,12 @@ var init_loader = __esm({
         "reputation_export",
         "bootstrap_provide_guarantee",
         "decommission_certificate",
-        "reputation_publish"
+        "reputation_publish",
         // SEC-039: Explicit Tier 1 — sends data to external API
+        "sovereignty_profile_update",
+        // Changes enforcement behavior — always requires approval
+        "governor_reset"
+        // Clears all runtime governance state — always requires approval
       ],
       tier2_anomaly: DEFAULT_TIER2,
       tier3_always_allow: [
@@ -1809,8 +1825,12 @@ var init_loader = __esm({
         "bridge_commit",
         "bridge_verify",
         "bridge_attest",
-        "dashboard_open"
+        "dashboard_open",
         // SEC-039: Explicit Tier 3 — only generates a URL
+        "sovereignty_profile_get",
+        "sovereignty_profile_generate_prompt",
+        // Agent needs its own config to generate system prompt
+        "governor_status"
       ],
       approval_channel: DEFAULT_CHANNEL
     };
@@ -3027,6 +3047,328 @@ function generateDashboardHTML(options) {
       background-color: #e03c3c;
     }
 
+    /* Sovereignty Profile Panel */
+    .profile-panel {
+      background-color: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+    }
+
+    .profile-panel .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .profile-panel .panel-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .profile-cards {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .profile-card {
+      background-color: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      transition: border-color 0.2s;
+    }
+
+    .profile-card.active {
+      border-color: var(--green);
+    }
+
+    .profile-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .profile-card-name {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .profile-card-desc {
+      font-size: 11px;
+      color: var(--text-secondary);
+      line-height: 1.4;
+    }
+
+    /* Toggle switch */
+    .toggle-switch {
+      position: relative;
+      width: 36px;
+      height: 20px;
+      flex-shrink: 0;
+    }
+
+    .toggle-switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .toggle-slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: var(--border);
+      border-radius: 10px;
+      transition: background-color 0.2s;
+    }
+
+    .toggle-slider::before {
+      content: "";
+      position: absolute;
+      height: 14px;
+      width: 14px;
+      left: 3px;
+      bottom: 3px;
+      background-color: var(--text-secondary);
+      border-radius: 50%;
+      transition: transform 0.2s, background-color 0.2s;
+    }
+
+    .toggle-switch input:checked + .toggle-slider {
+      background-color: rgba(63, 185, 80, 0.3);
+    }
+
+    .toggle-switch input:checked + .toggle-slider::before {
+      transform: translateX(16px);
+      background-color: var(--green);
+    }
+
+    .profile-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      width: fit-content;
+    }
+
+    .profile-badge.enabled {
+      background-color: rgba(63, 185, 80, 0.15);
+      color: var(--green);
+    }
+
+    .profile-badge.disabled {
+      background-color: rgba(139, 148, 158, 0.15);
+      color: var(--text-secondary);
+    }
+
+    .profile-card-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 4px;
+    }
+
+    .config-btn {
+      padding: 3px 8px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background-color: transparent;
+      color: var(--text-secondary);
+      font-size: 10px;
+      cursor: pointer;
+      transition: color 0.2s, border-color 0.2s;
+    }
+
+    .config-btn:hover {
+      color: var(--blue);
+      border-color: var(--blue);
+    }
+
+    /* Configuration panels */
+    .config-panel {
+      display: none;
+      margin-top: 8px;
+      padding: 10px;
+      background-color: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-size: 11px;
+    }
+
+    .config-panel.open {
+      display: block;
+    }
+
+    .config-panel-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+    }
+
+    .config-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+
+    .config-label {
+      font-size: 11px;
+      color: var(--text-secondary);
+      min-width: 80px;
+    }
+
+    .config-select, .config-input {
+      background-color: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-primary);
+      font-size: 11px;
+      padding: 4px 8px;
+    }
+
+    .config-info {
+      font-size: 11px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    .sensitivity-slider {
+      display: flex;
+      gap: 4px;
+    }
+
+    .sensitivity-option {
+      padding: 3px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background-color: transparent;
+      color: var(--text-secondary);
+      font-size: 10px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .sensitivity-option.selected {
+      background-color: rgba(88, 166, 255, 0.15);
+      color: var(--blue);
+      border-color: var(--blue);
+    }
+
+    .sensitivity-option:hover:not(.selected) {
+      border-color: var(--text-secondary);
+    }
+
+    /* Prompt section */
+    .prompt-section {
+      margin-top: 16px;
+    }
+
+    .prompt-display {
+      position: relative;
+      background-color: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-top: 8px;
+      display: none;
+    }
+
+    .prompt-display.visible {
+      display: block;
+    }
+
+    .prompt-display-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .prompt-token-count {
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+
+    .prompt-copy-btn {
+      padding: 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background-color: var(--surface);
+      color: var(--text-primary);
+      font-size: 11px;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+
+    .prompt-copy-btn:hover {
+      border-color: var(--blue);
+    }
+
+    .prompt-content {
+      max-height: 300px;
+      overflow-y: auto;
+      padding: 12px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      color: var(--text-primary);
+    }
+
+    .prompt-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .prompt-btn {
+      padding: 6px 12px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background-color: var(--surface);
+      color: var(--text-primary);
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .prompt-btn:hover {
+      background-color: var(--muted);
+    }
+
+    .prompt-btn.primary {
+      background-color: var(--blue);
+      color: var(--bg);
+      border-color: var(--blue);
+    }
+
+    @media (max-width: 900px) {
+      .profile-cards {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (max-width: 500px) {
+      .profile-cards {
+        grid-template-columns: 1fr;
+      }
+    }
+
     /* Threat Panel */
     .threat-panel {
       background-color: var(--surface);
@@ -3365,6 +3707,184 @@ function generateDashboardHTML(options) {
         </div>
       </div>
 
+      <!-- Sovereignty Profile Panel -->
+      <div class="profile-panel" id="sovereignty-profile-panel">
+        <div class="panel-header">
+          <div class="panel-title">Sovereignty Profile</div>
+          <span class="card-value" id="profile-updated-at" style="font-size: 11px; color: var(--text-secondary);">\u2014</span>
+        </div>
+        <div class="profile-cards" id="profile-cards">
+          <div class="profile-card" data-feature="audit_logging">
+            <div class="profile-card-header">
+              <div class="profile-card-name">Audit Logging</div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-audit_logging" data-feature="audit_logging">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="profile-badge disabled" id="badge-audit_logging">OFF</div>
+            <div class="profile-card-desc">Encrypted audit trail of all tool calls</div>
+            <div class="profile-card-actions">
+              <button class="config-btn" data-config="audit_logging">Configure</button>
+            </div>
+            <div class="config-panel" id="config-audit_logging">
+              <div class="config-info">Audit logging is always-on when enabled. All tool calls, gate decisions, and profile changes are recorded to an encrypted audit trail. No additional configuration needed.</div>
+            </div>
+          </div>
+          <div class="profile-card" data-feature="injection_detection">
+            <div class="profile-card-header">
+              <div class="profile-card-name">Injection Detection</div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-injection_detection" data-feature="injection_detection">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="profile-badge disabled" id="badge-injection_detection">OFF</div>
+            <div class="profile-card-desc">Scans tool arguments for prompt injection</div>
+            <div class="profile-card-actions">
+              <button class="config-btn" data-config="injection_detection">Configure</button>
+            </div>
+            <div class="config-panel" id="config-injection_detection">
+              <div class="config-panel-title">Sensitivity</div>
+              <div class="sensitivity-slider">
+                <button class="sensitivity-option" data-sensitivity="low">Low</button>
+                <button class="sensitivity-option selected" data-sensitivity="medium">Medium</button>
+                <button class="sensitivity-option" data-sensitivity="high">High</button>
+              </div>
+            </div>
+          </div>
+          <div class="profile-card" data-feature="context_gating">
+            <div class="profile-card-header">
+              <div class="profile-card-name">Context Gating</div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-context_gating" data-feature="context_gating">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="profile-badge disabled" id="badge-context_gating">OFF</div>
+            <div class="profile-card-desc">Controls context flow to remote providers</div>
+            <div class="profile-card-actions">
+              <button class="config-btn" data-config="context_gating">Configure</button>
+            </div>
+            <div class="config-panel" id="config-context_gating">
+              <div class="config-panel-title">Active Policy</div>
+              <div class="config-row">
+                <span class="config-label">Policy ID:</span>
+                <select class="config-select" id="config-context-policy">
+                  <option value="">None selected</option>
+                </select>
+              </div>
+              <div class="config-info" style="margin-top: 6px;">Use MCP tool <code style="color: var(--blue);">sanctuary/context_gate_set_policy</code> or <code style="color: var(--blue);">sanctuary/context_gate_apply_template</code> to create policies.</div>
+            </div>
+          </div>
+          <div class="profile-card" data-feature="approval_gate">
+            <div class="profile-card-header">
+              <div class="profile-card-name">Approval Gates</div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-approval_gate" data-feature="approval_gate">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="profile-badge disabled" id="badge-approval_gate">OFF</div>
+            <div class="profile-card-desc">Human approval for high-risk operations</div>
+            <div class="profile-card-actions">
+              <button class="config-btn" data-config="approval_gate">Configure</button>
+            </div>
+            <div class="config-panel" id="config-approval_gate">
+              <div class="config-panel-title">Tier Assignments</div>
+              <div class="config-info">
+                <strong style="color: var(--red);">Tier 1 (always approve):</strong> export, import, key rotation, deletion<br>
+                <strong style="color: var(--amber);">Tier 2 (approve on anomaly):</strong> new namespaces, unfamiliar counterparties, frequency spikes<br>
+                <strong style="color: var(--green);">Tier 3 (auto-allow):</strong> standard operations, queries, reads
+              </div>
+            </div>
+          </div>
+          <div class="profile-card" data-feature="zk_proofs">
+            <div class="profile-card-header">
+              <div class="profile-card-name">ZK Proofs</div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-zk_proofs" data-feature="zk_proofs">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="profile-badge disabled" id="badge-zk_proofs">OFF</div>
+            <div class="profile-card-desc">Prove claims without revealing data</div>
+            <div class="profile-card-actions">
+              <button class="config-btn" data-config="zk_proofs">Configure</button>
+            </div>
+            <div class="config-panel" id="config-zk_proofs">
+              <div class="config-info">Zero-knowledge proofs use Pedersen commitments on Ristretto255 and Schnorr proofs. No additional configuration needed. Available tools: <code style="color: var(--blue);">sanctuary/zk_commit</code>, <code style="color: var(--blue);">sanctuary/zk_prove</code>, <code style="color: var(--blue);">sanctuary/zk_range_prove</code>.</div>
+            </div>
+          </div>
+        </div>
+        <div class="prompt-section">
+          <div class="prompt-actions">
+            <button class="prompt-btn primary" id="generate-prompt-btn">Generate System Prompt</button>
+          </div>
+          <div class="prompt-display" id="prompt-display">
+            <div class="prompt-display-header">
+              <span class="prompt-token-count" id="prompt-token-count"></span>
+              <button class="prompt-copy-btn" id="copy-prompt-btn">Copy to Clipboard</button>
+            </div>
+            <div class="prompt-content" id="system-prompt-output"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Upstream Servers Panel -->
+      <div class="profile-panel" id="proxy-servers-panel">
+        <div class="panel-header">
+          <div class="panel-title">Upstream Servers</div>
+          <button class="panel-action" id="add-proxy-server-btn">+ Add Server</button>
+        </div>
+        <div id="proxy-servers-list">
+          <div class="empty-state">No upstream servers configured</div>
+        </div>
+
+        <!-- Add Server Form (hidden by default) -->
+        <div id="add-server-form" style="display: none; padding: 16px; border-top: 1px solid var(--border);">
+          <div style="margin-bottom: 12px;">
+            <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Server Name</label>
+            <input type="text" id="new-server-name" placeholder="e.g., filesystem" style="width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 13px;">
+          </div>
+          <div style="margin-bottom: 12px;">
+            <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Transport Type</label>
+            <select id="new-server-transport" style="width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 13px;">
+              <option value="stdio">stdio</option>
+              <option value="sse">SSE</option>
+            </select>
+          </div>
+          <div id="stdio-fields">
+            <div style="margin-bottom: 12px;">
+              <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Command</label>
+              <input type="text" id="new-server-command" placeholder="e.g., npx -y @modelcontextprotocol/server-filesystem" style="width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 13px;">
+            </div>
+            <div style="margin-bottom: 12px;">
+              <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Arguments (comma-separated)</label>
+              <input type="text" id="new-server-args" placeholder="e.g., /Users/me/allowed-dir" style="width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 13px;">
+            </div>
+          </div>
+          <div id="sse-fields" style="display: none;">
+            <div style="margin-bottom: 12px;">
+              <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Server URL</label>
+              <input type="text" id="new-server-url" placeholder="e.g., http://localhost:3001/sse" style="width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 13px;">
+            </div>
+          </div>
+          <div style="margin-bottom: 12px;">
+            <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 4px;">Default Tier</label>
+            <select id="new-server-tier" style="width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 13px;">
+              <option value="1">Tier 1 (Always approve)</option>
+              <option value="2" selected>Tier 2 (Anomaly detection)</option>
+              <option value="3">Tier 3 (Always allow)</option>
+            </select>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button id="save-server-btn" style="flex: 1; padding: 8px; background: var(--green); color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px;">Save</button>
+            <button id="cancel-server-btn" style="flex: 1; padding: 8px; background: var(--surface); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 13px;">Cancel</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Threat Panel -->
       <div class="threat-panel collapsed">
         <div class="threat-header">
@@ -3399,6 +3919,7 @@ function generateDashboardHTML(options) {
       handshakes: [],
       shr: null,
       status: null,
+      systemPrompt: null,
     };
 
     let pendingRequests = new Map();
@@ -3851,6 +4372,36 @@ function generateDashboardHTML(options) {
         removePendingRequest(data.requestId);
       });
 
+      eventSource.addEventListener('sovereignty-profile-update', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data.profile) {
+            applyProfileToUI(data.profile);
+          }
+          if (data.system_prompt) {
+            apiState.systemPrompt = data.system_prompt;
+            updatePromptDisplay(data.system_prompt);
+          }
+        } catch (err) {
+          // Fallback to full refresh
+          updateSovereigntyProfile();
+        }
+      });
+
+      eventSource.addEventListener('proxy-server-status', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          updateProxyServerStatus(data.server, data.state, data.tool_count, data.error);
+        } catch (err) {
+          // Fallback to full refresh
+          loadProxyServers();
+        }
+      });
+
+      eventSource.addEventListener('proxy-servers-update', () => {
+        loadProxyServers();
+      });
+
       eventSource.onerror = () => {
         console.error('SSE error');
         setTimeout(setupSSE, 5000);
@@ -3866,7 +4417,7 @@ function generateDashboardHTML(options) {
 
       const feed = document.getElementById('activity-feed');
       const html = \`
-        <div class="activity-item \${item.type}">
+        <div class="activity-item \${esc(item.type)}">
           <div class="activity-type">\${esc(item.title)}</div>
           <div class="activity-content">\${esc(item.content)}</div>
           <div class="activity-time">\${formatTime(item.timestamp)}</div>
@@ -4007,6 +4558,453 @@ function generateDashboardHTML(options) {
       document.getElementById('pending-overlay').classList.toggle('show');
     });
 
+    // Sovereignty Profile
+    let profileToggleLock = false;
+
+    async function updateSovereigntyProfile() {
+      try {
+        const data = await fetchAPI('/api/sovereignty-profile');
+        if (data && data.profile) {
+          applyProfileToUI(data.profile);
+          if (data.system_prompt) {
+            apiState.systemPrompt = data.system_prompt;
+            updatePromptDisplay(data.system_prompt);
+          }
+        }
+      } catch (e) {
+        // Profile not available
+      }
+    }
+
+    function applyProfileToUI(profile) {
+      const features = profile.features;
+      for (const [key, value] of Object.entries(features)) {
+        const enabled = value && value.enabled;
+
+        // Update badge
+        const badge = document.getElementById('badge-' + key);
+        if (badge) {
+          badge.textContent = enabled ? 'ON' : 'OFF';
+          badge.className = 'profile-badge ' + (enabled ? 'enabled' : 'disabled');
+        }
+
+        // Update toggle (without triggering change event)
+        const toggle = document.getElementById('toggle-' + key);
+        if (toggle && toggle.checked !== enabled) {
+          profileToggleLock = true;
+          toggle.checked = enabled;
+          profileToggleLock = false;
+        }
+
+        // Update card active state
+        const card = document.querySelector('[data-feature="' + key + '"]');
+        if (card) {
+          card.classList.toggle('active', enabled);
+        }
+
+        // Feature-specific config UI updates
+        if (key === 'injection_detection' && value.sensitivity) {
+          document.querySelectorAll('#config-injection_detection .sensitivity-option').forEach(function(btn) {
+            btn.classList.toggle('selected', btn.getAttribute('data-sensitivity') === value.sensitivity);
+          });
+        }
+
+        if (key === 'context_gating' && value.policy_id) {
+          const sel = document.getElementById('config-context-policy');
+          if (sel) {
+            // Add the policy as an option if not present
+            let found = false;
+            for (let i = 0; i < sel.options.length; i++) {
+              if (sel.options[i].value === value.policy_id) { found = true; break; }
+            }
+            if (!found) {
+              const opt = document.createElement('option');
+              opt.value = value.policy_id;
+              opt.textContent = value.policy_id;
+              sel.appendChild(opt);
+            }
+            sel.value = value.policy_id;
+          }
+        }
+      }
+
+      const updatedEl = document.getElementById('profile-updated-at');
+      if (updatedEl && profile.updated_at) {
+        updatedEl.textContent = 'Updated: ' + new Date(profile.updated_at).toLocaleString();
+      }
+    }
+
+    function updatePromptDisplay(promptText) {
+      const display = document.getElementById('prompt-display');
+      const content = document.getElementById('system-prompt-output');
+      const tokenCount = document.getElementById('prompt-token-count');
+      if (!display || !content) return;
+
+      if (promptText) {
+        content.textContent = promptText;
+        // Rough token estimate: word count * 1.3
+        const words = promptText.split(/\\s+/).filter(function(w) { return w.length > 0; }).length;
+        const tokens = Math.round(words * 1.3);
+        tokenCount.textContent = '~' + tokens + ' tokens';
+        display.classList.add('visible');
+      }
+    }
+
+    // Toggle handlers
+    async function handleToggle(feature, enabled) {
+      if (profileToggleLock) return;
+      const payload = {};
+      payload[feature] = { enabled: enabled };
+
+      try {
+        const response = await fetch(API_BASE + '/api/sovereignty-profile', {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + AUTH_TOKEN,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+
+        if (response.status === 401) {
+          redirectToLogin();
+          return;
+        }
+
+        if (response.ok) {
+          const data = await response.json();
+          if (data.profile) {
+            applyProfileToUI(data.profile);
+          }
+          if (data.system_prompt) {
+            apiState.systemPrompt = data.system_prompt;
+            updatePromptDisplay(data.system_prompt);
+          }
+        } else {
+          // Revert toggle on failure
+          const toggle = document.getElementById('toggle-' + feature);
+          if (toggle) {
+            profileToggleLock = true;
+            toggle.checked = !enabled;
+            profileToggleLock = false;
+          }
+        }
+      } catch (err) {
+        console.error('Toggle update failed:', err);
+        // Revert toggle
+        const toggle = document.getElementById('toggle-' + feature);
+        if (toggle) {
+          profileToggleLock = true;
+          toggle.checked = !enabled;
+          profileToggleLock = false;
+        }
+      }
+    }
+
+    // Wire up toggle switches
+    document.querySelectorAll('.toggle-switch input').forEach(function(toggle) {
+      toggle.addEventListener('change', function() {
+        const feature = this.getAttribute('data-feature');
+        handleToggle(feature, this.checked);
+      });
+    });
+
+    // Wire up configure buttons
+    document.querySelectorAll('.config-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const feature = this.getAttribute('data-config');
+        const panel = document.getElementById('config-' + feature);
+        if (panel) {
+          panel.classList.toggle('open');
+          this.textContent = panel.classList.contains('open') ? 'Close' : 'Configure';
+        }
+      });
+    });
+
+    // Injection sensitivity handler
+    document.querySelectorAll('#config-injection_detection .sensitivity-option').forEach(function(btn) {
+      btn.addEventListener('click', async function() {
+        const sensitivity = this.getAttribute('data-sensitivity');
+        const response = await fetch(API_BASE + '/api/sovereignty-profile', {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + AUTH_TOKEN,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ injection_detection: { sensitivity: sensitivity } }),
+        });
+        if (response.ok) {
+          document.querySelectorAll('#config-injection_detection .sensitivity-option').forEach(function(b) {
+            b.classList.toggle('selected', b.getAttribute('data-sensitivity') === sensitivity);
+          });
+          const data = await response.json();
+          if (data.profile) applyProfileToUI(data.profile);
+          if (data.system_prompt) {
+            apiState.systemPrompt = data.system_prompt;
+            updatePromptDisplay(data.system_prompt);
+          }
+        }
+      });
+    });
+
+    // Context gating policy selector handler
+    document.getElementById('config-context-policy').addEventListener('change', async function() {
+      const policyId = this.value;
+      const response = await fetch(API_BASE + '/api/sovereignty-profile', {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + AUTH_TOKEN,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ context_gating: { policy_id: policyId } }),
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.profile) applyProfileToUI(data.profile);
+        if (data.system_prompt) {
+          apiState.systemPrompt = data.system_prompt;
+          updatePromptDisplay(data.system_prompt);
+        }
+      }
+    });
+
+    // Generate prompt button
+    document.getElementById('generate-prompt-btn').addEventListener('click', async () => {
+      const data = await fetchAPI('/api/sovereignty-profile');
+      if (data && data.system_prompt) {
+        apiState.systemPrompt = data.system_prompt;
+        updatePromptDisplay(data.system_prompt);
+      }
+    });
+
+    // Copy prompt button
+    document.getElementById('copy-prompt-btn').addEventListener('click', async () => {
+      const content = document.getElementById('system-prompt-output');
+      if (!content || !content.textContent) return;
+      try {
+        await navigator.clipboard.writeText(content.textContent);
+        const btn = document.getElementById('copy-prompt-btn');
+        const original = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = original; }, 2000);
+      } catch (err) {
+        console.error('Copy failed:', err);
+      }
+    });
+
+    // \u2500\u2500 Proxy Server Management \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+    let proxyServers = [];
+
+    async function loadProxyServers() {
+      try {
+        const resp = await fetch(API_BASE + '/api/proxy/servers', {
+          headers: { 'Authorization': 'Bearer ' + AUTH_TOKEN },
+        });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        proxyServers = data.servers || [];
+        renderProxyServers();
+      } catch (err) {
+        // Proxy endpoint may not be available
+      }
+    }
+
+    function renderProxyServers() {
+      const container = document.getElementById('proxy-servers-list');
+      if (!container) return;
+
+      if (proxyServers.length === 0) {
+        container.innerHTML = '<div class="empty-state">No upstream servers configured</div>';
+        return;
+      }
+
+      container.innerHTML = proxyServers.map(server => {
+        const stateColor = server.state === 'connected' ? 'var(--green)' :
+                          server.state === 'connecting' ? 'var(--amber)' : 'var(--red)';
+        const stateLabel = server.state || 'disconnected';
+        const tierLabel = 'Tier ' + server.default_tier;
+
+        return \`
+          <div class="proxy-server-card" data-server="\${esc(server.name)}" style="padding: 12px 16px; border-bottom: 1px solid var(--border);">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="color: \${stateColor}; font-size: 10px;">\\u25CF</span>
+                <span style="font-weight: 600; font-size: 14px;">\${esc(server.name)}</span>
+                <span style="font-size: 11px; color: var(--text-secondary); background: var(--bg); padding: 2px 6px; border-radius: 3px;">\${esc(server.transport_type)}</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="font-size: 11px; color: var(--text-secondary);">\${server.tool_count} tools</span>
+                <span style="font-size: 11px; color: var(--blue); background: rgba(88,166,255,0.1); padding: 2px 6px; border-radius: 3px;">\${tierLabel}</span>
+                <button class="proxy-remove-btn" data-server="\${esc(server.name)}" style="background: none; border: none; color: var(--red); cursor: pointer; font-size: 14px; padding: 2px 6px;" title="Remove server">\\u00D7</button>
+              </div>
+            </div>
+            <div style="font-size: 11px; color: var(--text-secondary);">
+              Status: <span style="color: \${stateColor}">\${esc(stateLabel)}</span>
+              \${server.error ? '<span style="color: var(--red);"> \u2014 ' + esc(server.error) + '</span>' : ''}
+            </div>
+            <div class="proxy-tools-expand" style="margin-top: 8px; display: none;">
+              <div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 4px;">Discovered Tools:</div>
+              <div class="proxy-tools-list" style="font-size: 11px; font-family: monospace; color: var(--text-primary); max-height: 150px; overflow-y: auto;"></div>
+            </div>
+          </div>
+        \`;
+      }).join('');
+
+      // Attach remove handlers
+      container.querySelectorAll('.proxy-remove-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          const serverName = e.target.dataset.server;
+          removeProxyServer(serverName);
+        });
+      });
+
+      // Attach expand/collapse on card click
+      container.querySelectorAll('.proxy-server-card').forEach(card => {
+        card.style.cursor = 'pointer';
+        card.addEventListener('click', (e) => {
+          if (e.target.classList.contains('proxy-remove-btn')) return;
+          const expand = card.querySelector('.proxy-tools-expand');
+          if (expand) {
+            expand.style.display = expand.style.display === 'none' ? 'block' : 'none';
+          }
+        });
+      });
+    }
+
+    function updateProxyServerStatus(serverName, state, toolCount, error) {
+      const server = proxyServers.find(s => s.name === serverName);
+      if (server) {
+        server.state = state;
+        server.tool_count = toolCount;
+        server.error = error;
+        renderProxyServers();
+      }
+    }
+
+    async function addProxyServer(serverConfig) {
+      const current = [...proxyServers];
+      // Check for duplicate
+      if (current.find(s => s.name === serverConfig.name)) {
+        alert('A server with that name already exists');
+        return;
+      }
+      current.push(serverConfig);
+
+      try {
+        const resp = await fetch(API_BASE + '/api/proxy/servers', {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + AUTH_TOKEN,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ upstream_servers: current }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json();
+          alert('Failed to add server: ' + (err.error || 'Unknown error'));
+          return;
+        }
+        await loadProxyServers();
+      } catch (err) {
+        alert('Failed to add server: ' + err.message);
+      }
+    }
+
+    async function removeProxyServer(serverName) {
+      if (!confirm('Remove upstream server "' + serverName + '"?')) return;
+
+      const updated = proxyServers.filter(s => s.name !== serverName);
+
+      try {
+        const resp = await fetch(API_BASE + '/api/proxy/servers', {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + AUTH_TOKEN,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ upstream_servers: updated }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json();
+          alert('Failed to remove server: ' + (err.error || 'Unknown error'));
+          return;
+        }
+        await loadProxyServers();
+      } catch (err) {
+        alert('Failed to remove server: ' + err.message);
+      }
+    }
+
+    // Add Server form handlers
+    (function setupProxyForm() {
+      const addBtn = document.getElementById('add-proxy-server-btn');
+      const form = document.getElementById('add-server-form');
+      const saveBtn = document.getElementById('save-server-btn');
+      const cancelBtn = document.getElementById('cancel-server-btn');
+      const transportSelect = document.getElementById('new-server-transport');
+      const stdioFields = document.getElementById('stdio-fields');
+      const sseFields = document.getElementById('sse-fields');
+
+      if (!addBtn || !form) return;
+
+      addBtn.addEventListener('click', () => {
+        form.style.display = form.style.display === 'none' ? 'block' : 'none';
+      });
+
+      cancelBtn.addEventListener('click', () => {
+        form.style.display = 'none';
+      });
+
+      transportSelect.addEventListener('change', () => {
+        if (transportSelect.value === 'stdio') {
+          stdioFields.style.display = 'block';
+          sseFields.style.display = 'none';
+        } else {
+          stdioFields.style.display = 'none';
+          sseFields.style.display = 'block';
+        }
+      });
+
+      saveBtn.addEventListener('click', () => {
+        const name = document.getElementById('new-server-name').value.trim();
+        const type = transportSelect.value;
+        const tier = parseInt(document.getElementById('new-server-tier').value, 10);
+
+        if (!name) { alert('Server name is required'); return; }
+        if (!/^[a-zA-Z0-9_-]+$/.test(name)) { alert('Name must contain only letters, numbers, hyphens, and underscores'); return; }
+
+        const transport = { type };
+        if (type === 'stdio') {
+          const command = document.getElementById('new-server-command').value.trim();
+          if (!command) { alert('Command is required for stdio transport'); return; }
+          transport.command = command;
+          const argsStr = document.getElementById('new-server-args').value.trim();
+          if (argsStr) {
+            transport.args = argsStr.split(',').map(s => s.trim()).filter(Boolean);
+          }
+        } else {
+          const url = document.getElementById('new-server-url').value.trim();
+          if (!url) { alert('URL is required for SSE transport'); return; }
+          transport.url = url;
+        }
+
+        addProxyServer({
+          name,
+          transport,
+          enabled: true,
+          default_tier: tier,
+        });
+
+        // Reset form
+        form.style.display = 'none';
+        document.getElementById('new-server-name').value = '';
+        document.getElementById('new-server-command').value = '';
+        document.getElementById('new-server-args').value = '';
+        document.getElementById('new-server-url').value = '';
+      });
+    })();
+
     // Initialize
     async function initialize() {
       if (!AUTH_TOKEN) {
@@ -4021,6 +5019,8 @@ function generateDashboardHTML(options) {
         updateHandshakes(),
         updateSHR(),
         updateStatus(),
+        updateSovereigntyProfile(),
+        loadProxyServers(),
       ]);
 
       // Setup SSE for real-time updates
@@ -4040,12 +5040,151 @@ var init_dashboard_html = __esm({
   "src/principal-policy/dashboard-html.ts"() {
   }
 });
+
+// src/system-prompt-generator.ts
+function generateSystemPrompt(profile) {
+  const activeFeatures = [];
+  const inactiveFeatures = [];
+  const activeKeys = [];
+  const featureKeys = [
+    "audit_logging",
+    "injection_detection",
+    "context_gating",
+    "approval_gate",
+    "zk_proofs"
+  ];
+  for (const key of featureKeys) {
+    const featureConfig = profile.features[key];
+    const info = FEATURE_INFO[key];
+    if (featureConfig.enabled) {
+      activeKeys.push(key);
+      let desc = `- ${info.name}: ${info.activeDescription}`;
+      if (key === "injection_detection" && "sensitivity" in featureConfig && featureConfig.sensitivity) {
+        desc += ` Sensitivity: ${featureConfig.sensitivity}.`;
+      }
+      if (key === "context_gating" && "policy_id" in featureConfig && featureConfig.policy_id) {
+        desc += ` Active policy: ${featureConfig.policy_id}.`;
+      }
+      activeFeatures.push(desc);
+    } else {
+      inactiveFeatures.push(info.disabledDescription);
+    }
+  }
+  const lines = [];
+  if (activeKeys.length > 0) {
+    lines.push("QUICK START:");
+    const quickStartItems = buildQuickStart(activeKeys);
+    for (const item of quickStartItems) {
+      lines.push(`  ${item}`);
+    }
+    lines.push("");
+  }
+  lines.push(
+    "You are protected by Sanctuary sovereignty infrastructure. The following protections are active:"
+  );
+  lines.push("");
+  if (activeFeatures.length > 0) {
+    lines.push(...activeFeatures);
+  } else {
+    lines.push(
+      "- No features are currently enabled. Contact your operator to configure protections."
+    );
+  }
+  if (inactiveFeatures.length > 0) {
+    lines.push("");
+    lines.push(
+      `Optional tools available but not currently enabled: ${inactiveFeatures.join(", ")}.`
+    );
+  }
+  return lines.join("\n");
+}
+function buildQuickStart(activeKeys) {
+  const items = [];
+  if (activeKeys.includes("context_gating")) {
+    items.push(
+      "1. ALWAYS call sanctuary/context_gate_filter before sending context to external APIs."
+    );
+  }
+  if (activeKeys.includes("zk_proofs")) {
+    items.push(
+      `${items.length + 1}. Use sanctuary/zk_commit to prove claims without revealing underlying data.`
+    );
+  }
+  if (activeKeys.includes("approval_gate")) {
+    items.push(
+      `${items.length + 1}. High-risk operations will be held for human approval \u2014 expect async responses.`
+    );
+  }
+  if (items.length === 0) {
+    if (activeKeys.includes("audit_logging")) {
+      items.push("1. All tool calls are automatically logged to an encrypted audit trail.");
+    }
+    if (activeKeys.includes("injection_detection")) {
+      items.push(
+        `${items.length + 1}. Tool arguments are scanned for injection \u2014 blocked calls should not be retried.`
+      );
+    }
+  }
+  return items;
+}
+var FEATURE_INFO;
+var init_system_prompt_generator = __esm({
+  "src/system-prompt-generator.ts"() {
+    FEATURE_INFO = {
+      audit_logging: {
+        name: "Audit Logging",
+        activeDescription: "All your tool calls are logged to an encrypted audit trail. No action needed \u2014 this is automatic. You can query the log with sanctuary/monitor_audit_log if you need to review past activity.",
+        toolNames: ["sanctuary/monitor_audit_log"],
+        disabledDescription: "audit logging (sanctuary/monitor_audit_log)",
+        usageExample: "Automatic \u2014 every tool call you make is recorded. No explicit action required."
+      },
+      injection_detection: {
+        name: "Injection Detection",
+        activeDescription: "Your tool call arguments are scanned for prompt injection attempts. This is automatic \u2014 no action needed. If injection is detected in your input, the call will be blocked and you will receive an error. Do not retry blocked calls with the same input.",
+        disabledDescription: "injection detection",
+        usageExample: "Automatic \u2014 if a tool call is blocked with an injection alert, do not retry with the same arguments."
+      },
+      context_gating: {
+        name: "Context Gating",
+        activeDescription: "Before sending context to any external API (LLM inference, tool APIs, logging services), call sanctuary/context_gate_filter to strip sensitive fields. Use sanctuary/context_gate_set_policy to define filtering rules, or sanctuary/context_gate_apply_template for presets.",
+        toolNames: [
+          "sanctuary/context_gate_filter",
+          "sanctuary/context_gate_set_policy",
+          "sanctuary/context_gate_apply_template",
+          "sanctuary/context_gate_recommend",
+          "sanctuary/context_gate_list_policies"
+        ],
+        disabledDescription: "context gating (sanctuary/context_gate_filter)",
+        usageExample: "Before calling an external API, run: sanctuary/context_gate_filter with your context object and policy_id to get a filtered version."
+      },
+      approval_gate: {
+        name: "Approval Gates",
+        activeDescription: "High-risk operations require human approval before execution. Tier 1 operations (export, import, key rotation, deletion) always require approval. Tier 2 operations trigger approval when anomalous behavior is detected. When an operation is held for approval, you will receive an async response \u2014 wait for the human decision before proceeding.",
+        disabledDescription: "approval gates",
+        usageExample: "When you call a Tier 1 operation (e.g., state_export), expect an async hold. The human operator will approve or deny via the dashboard."
+      },
+      zk_proofs: {
+        name: "Zero-Knowledge Proofs",
+        activeDescription: "You can prove claims about your data without revealing the underlying values. Use sanctuary/zk_commit to create a Pedersen commitment, sanctuary/zk_prove (Schnorr proof) to prove you know a committed value, and sanctuary/zk_range_prove to prove a value falls within a range \u2014 all without disclosing the actual data. For simpler SHA-256 commitments, use sanctuary/proof_commitment.",
+        toolNames: [
+          "sanctuary/zk_commit",
+          "sanctuary/zk_prove",
+          "sanctuary/zk_range_prove",
+          "sanctuary/proof_commitment"
+        ],
+        disabledDescription: "zero-knowledge proofs (sanctuary/zk_commit, sanctuary/zk_prove)",
+        usageExample: "To prove a claim without revealing data: first sanctuary/zk_commit to commit, then sanctuary/zk_prove or sanctuary/zk_range_prove to generate a verifiable proof."
+      }
+    };
+  }
+});
 var SESSION_TTL_REMOTE_MS, SESSION_TTL_LOCAL_MS, MAX_SESSIONS, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_GENERAL, RATE_LIMIT_DECISIONS, MAX_RATE_LIMIT_ENTRIES, DashboardApprovalChannel;
 var init_dashboard = __esm({
   "src/principal-policy/dashboard.ts"() {
     init_config();
     init_generator();
     init_dashboard_html();
+    init_system_prompt_generator();
     SESSION_TTL_REMOTE_MS = 5 * 60 * 1e3;
     SESSION_TTL_LOCAL_MS = 24 * 60 * 60 * 1e3;
     MAX_SESSIONS = 1e3;
@@ -4065,6 +5204,8 @@ var init_dashboard = __esm({
       handshakeResults = null;
       shrOpts = null;
       _sanctuaryConfig = null;
+      profileStore = null;
+      clientManager = null;
       dashboardHTML;
       loginHTML;
       authToken;
@@ -4086,8 +5227,7 @@ var init_dashboard = __esm({
         this.sessionTTLMs = isLocalhost ? SESSION_TTL_LOCAL_MS : SESSION_TTL_REMOTE_MS;
         this.dashboardHTML = generateDashboardHTML({
           timeoutSeconds: config.timeout_seconds,
-          serverVersion: SANCTUARY_VERSION,
-          authToken: this.authToken
+          serverVersion: SANCTUARY_VERSION
         });
         this.loginHTML = generateLoginHTML({ serverVersion: SANCTUARY_VERSION });
         this.sessionCleanupTimer = setInterval(() => this.cleanupSessions(), 6e4);
@@ -4104,6 +5244,8 @@ var init_dashboard = __esm({
         if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
         if (deps.shrOpts) this.shrOpts = deps.shrOpts;
         if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
+        if (deps.profileStore) this.profileStore = deps.profileStore;
+        if (deps.clientManager) this.clientManager = deps.clientManager;
       }
       /**
        * Mark this dashboard as running in standalone mode.
@@ -4451,6 +5593,14 @@ var init_dashboard = __esm({
             this.handleHandshakes(res);
           } else if (method === "GET" && url.pathname === "/api/shr") {
             this.handleSHR(res);
+          } else if (method === "GET" && url.pathname === "/api/sovereignty-profile") {
+            this.handleSovereigntyProfileGet(res);
+          } else if (method === "POST" && url.pathname === "/api/sovereignty-profile") {
+            this.handleSovereigntyProfileUpdate(req, res);
+          } else if (method === "GET" && url.pathname === "/api/proxy/servers") {
+            this.handleProxyServers(res);
+          } else if (method === "POST" && url.pathname === "/api/proxy/servers") {
+            this.handleProxyServersUpdate(req, res);
           } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
             if (!this.checkRateLimit(req, res, "decisions")) return;
             const id = url.pathname.slice("/api/approve/".length);
@@ -4742,6 +5892,140 @@ data: ${JSON.stringify(initData)}
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(shr));
       }
+      // ── Sovereignty Profile API ─────────────────────────────────────────
+      handleSovereigntyProfileGet(res) {
+        if (!this.profileStore) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Sovereignty Profile not available" }));
+          return;
+        }
+        try {
+          const profile = this.profileStore.get();
+          const prompt = generateSystemPrompt(profile);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ profile, system_prompt: prompt }));
+        } catch {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Failed to read sovereignty profile" }));
+        }
+      }
+      handleSovereigntyProfileUpdate(req, res) {
+        if (!this.profileStore) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Sovereignty Profile not available" }));
+          return;
+        }
+        let body = "";
+        let destroyed = false;
+        req.on("data", (chunk) => {
+          body += chunk.toString();
+          if (body.length > 16384) {
+            destroyed = true;
+            res.writeHead(413, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Request body too large" }));
+            req.destroy();
+          }
+        });
+        req.on("end", async () => {
+          if (destroyed) return;
+          try {
+            const updates = JSON.parse(body);
+            const updated = await this.profileStore.update(updates);
+            const prompt = generateSystemPrompt(updated);
+            if (this.auditLog) {
+              this.auditLog.append("l2", "sovereignty_profile_update_dashboard", "dashboard", {
+                changes: updates,
+                features_enabled: Object.entries(updated.features).filter(([, v]) => v.enabled).map(([k]) => k)
+              });
+            }
+            this.broadcastSSE("sovereignty-profile-update", { profile: updated, system_prompt: prompt });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ profile: updated, system_prompt: prompt }));
+          } catch {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid JSON body" }));
+          }
+        });
+      }
+      // ── Proxy Server Handlers ───────────────────────────────────────────
+      /**
+       * GET /api/proxy/servers — list upstream proxy servers and their status.
+       */
+      handleProxyServers(res) {
+        const profile = this.profileStore?.get();
+        const upstreamServers = profile?.upstream_servers ?? [];
+        const clientStatus = this.clientManager?.getStatus() ?? [];
+        const servers = upstreamServers.map((server) => {
+          const status = clientStatus.find((s) => s.name === server.name);
+          return {
+            name: server.name,
+            transport_type: server.transport.type,
+            enabled: server.enabled,
+            default_tier: server.default_tier,
+            state: status?.state ?? "disconnected",
+            tool_count: status?.tool_count ?? 0,
+            error: status?.error,
+            tool_overrides: server.tool_overrides ?? {}
+          };
+        });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ servers }));
+      }
+      /**
+       * POST /api/proxy/servers — update upstream server configuration.
+       * This is a dashboard action (human-initiated), so it's allowed with audit logging
+       * rather than requiring Tier 1 approval.
+       */
+      handleProxyServersUpdate(req, res) {
+        if (!this.profileStore) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Profile store not available" }));
+          return;
+        }
+        let body = "";
+        let destroyed = false;
+        req.on("data", (chunk) => {
+          body += chunk.toString();
+          if (body.length > 16384) {
+            destroyed = true;
+            res.writeHead(413, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Request body too large" }));
+            req.destroy();
+          }
+        });
+        req.on("end", async () => {
+          if (destroyed) return;
+          try {
+            const { upstream_servers } = JSON.parse(body);
+            const updated = await this.profileStore.update({ upstream_servers });
+            if (this.auditLog) {
+              this.auditLog.append("l2", "proxy_servers_update_dashboard", "dashboard", {
+                server_count: upstream_servers.length,
+                servers: upstream_servers.map((s) => ({
+                  name: s.name,
+                  type: s.transport.type,
+                  enabled: s.enabled,
+                  tier: s.default_tier
+                }))
+              });
+            }
+            if (this.clientManager && updated.upstream_servers) {
+              this.clientManager.configure(updated.upstream_servers).catch(() => {
+              });
+            }
+            this.broadcastSSE("proxy-servers-update", {
+              servers: updated.upstream_servers ?? [],
+              timestamp: (/* @__PURE__ */ new Date()).toISOString()
+            });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ upstream_servers: updated.upstream_servers ?? [] }));
+          } catch (err) {
+            const message = err instanceof Error ? err.message : "Invalid request";
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: message }));
+          }
+        });
+      }
       // ── SSE Broadcasting ────────────────────────────────────────────────
       broadcastSSE(event, data) {
         const message = `event: ${event}
@@ -4839,6 +6123,194 @@ data: ${JSON.stringify(data)}
       /** Get the number of connected SSE clients */
       get clientCount() {
         return this.sseClients.size;
+      }
+    };
+  }
+});
+
+// src/sovereignty-profile.ts
+function createDefaultProfile() {
+  return {
+    version: 1,
+    features: {
+      audit_logging: { enabled: true },
+      injection_detection: { enabled: true },
+      context_gating: { enabled: false },
+      approval_gate: { enabled: true },
+      // SEC-057: always enabled — core enforcement
+      zk_proofs: { enabled: false }
+    },
+    updated_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+var NAMESPACE, PROFILE_KEY, HKDF_DOMAIN, SovereigntyProfileStore;
+var init_sovereignty_profile = __esm({
+  "src/sovereignty-profile.ts"() {
+    init_encryption();
+    init_key_derivation();
+    init_encoding();
+    NAMESPACE = "_sovereignty_profile";
+    PROFILE_KEY = "active";
+    HKDF_DOMAIN = "sovereignty-profile";
+    SovereigntyProfileStore = class {
+      storage;
+      encryptionKey;
+      profile = null;
+      constructor(storage, masterKey) {
+        this.storage = storage;
+        this.encryptionKey = derivePurposeKey(masterKey, HKDF_DOMAIN);
+      }
+      /**
+       * Load the active sovereignty profile from encrypted storage.
+       * Creates the default profile on first run.
+       */
+      async load() {
+        if (this.profile) return this.profile;
+        const raw = await this.storage.read(NAMESPACE, PROFILE_KEY);
+        if (raw) {
+          try {
+            const encrypted = JSON.parse(bytesToString(raw));
+            const decrypted = decrypt(encrypted, this.encryptionKey);
+            this.profile = JSON.parse(bytesToString(decrypted));
+            return this.profile;
+          } catch {
+          }
+        }
+        this.profile = createDefaultProfile();
+        await this.persist();
+        return this.profile;
+      }
+      /**
+       * Get the current profile. Must call load() first.
+       */
+      get() {
+        if (!this.profile) {
+          throw new Error("SovereigntyProfileStore: call load() before get()");
+        }
+        return this.profile;
+      }
+      /**
+       * Apply a partial update to the profile.
+       * Returns the updated profile.
+       */
+      async update(updates) {
+        if (!this.profile) {
+          await this.load();
+        }
+        if (updates.approval_gate && updates.approval_gate.enabled === false) {
+          throw new Error("approval_gate cannot be disabled \u2014 it is a core enforcement feature");
+        }
+        const features = this.profile.features;
+        if (updates.audit_logging !== void 0) {
+          if (updates.audit_logging.enabled !== void 0) {
+            if (typeof updates.audit_logging.enabled !== "boolean") {
+              throw new Error("audit_logging.enabled must be a boolean");
+            }
+            features.audit_logging.enabled = updates.audit_logging.enabled;
+          }
+        }
+        if (updates.injection_detection !== void 0) {
+          if (updates.injection_detection.enabled !== void 0) {
+            if (typeof updates.injection_detection.enabled !== "boolean") {
+              throw new Error("injection_detection.enabled must be a boolean");
+            }
+            features.injection_detection.enabled = updates.injection_detection.enabled;
+          }
+          if (updates.injection_detection.sensitivity !== void 0) {
+            const valid = ["low", "medium", "high"];
+            if (!valid.includes(updates.injection_detection.sensitivity)) {
+              throw new Error("injection_detection.sensitivity must be low, medium, or high");
+            }
+            features.injection_detection.sensitivity = updates.injection_detection.sensitivity;
+          }
+        }
+        if (updates.context_gating !== void 0) {
+          if (updates.context_gating.enabled !== void 0) {
+            if (typeof updates.context_gating.enabled !== "boolean") {
+              throw new Error("context_gating.enabled must be a boolean");
+            }
+            features.context_gating.enabled = updates.context_gating.enabled;
+          }
+          if (updates.context_gating.policy_id !== void 0) {
+            if (typeof updates.context_gating.policy_id !== "string" || updates.context_gating.policy_id.length > 256) {
+              throw new Error("context_gating.policy_id must be a string of 256 characters or fewer");
+            }
+            features.context_gating.policy_id = updates.context_gating.policy_id;
+          }
+        }
+        if (updates.approval_gate !== void 0) {
+          if (updates.approval_gate.enabled !== void 0) {
+            if (typeof updates.approval_gate.enabled !== "boolean") {
+              throw new Error("approval_gate.enabled must be a boolean");
+            }
+            features.approval_gate.enabled = updates.approval_gate.enabled;
+          }
+        }
+        if (updates.zk_proofs !== void 0) {
+          if (updates.zk_proofs.enabled !== void 0) {
+            if (typeof updates.zk_proofs.enabled !== "boolean") {
+              throw new Error("zk_proofs.enabled must be a boolean");
+            }
+            features.zk_proofs.enabled = updates.zk_proofs.enabled;
+          }
+        }
+        if (updates.upstream_servers !== void 0) {
+          if (!Array.isArray(updates.upstream_servers)) {
+            throw new Error("upstream_servers must be an array");
+          }
+          for (const server of updates.upstream_servers) {
+            if (!server.name || typeof server.name !== "string") {
+              throw new Error("Each upstream server must have a name");
+            }
+            if (server.name.length > 128) {
+              throw new Error("Upstream server name must be 128 characters or fewer");
+            }
+            if (!/^[a-zA-Z0-9_-]+$/.test(server.name)) {
+              throw new Error("Upstream server name must contain only alphanumeric characters, hyphens, and underscores");
+            }
+            if (!server.transport || typeof server.transport !== "object") {
+              throw new Error("Each upstream server must have a transport configuration");
+            }
+            if (server.transport.type !== "stdio" && server.transport.type !== "sse") {
+              throw new Error("Transport type must be 'stdio' or 'sse'");
+            }
+            if (server.transport.type === "stdio" && !server.transport.command) {
+              throw new Error("stdio transport requires a command");
+            }
+            if (server.transport.type === "sse" && !server.transport.url) {
+              throw new Error("sse transport requires a url");
+            }
+            if (typeof server.enabled !== "boolean") {
+              throw new Error("Each upstream server must have enabled as a boolean");
+            }
+            if (![1, 2, 3].includes(server.default_tier)) {
+              throw new Error("default_tier must be 1, 2, or 3");
+            }
+            if (server.tool_overrides) {
+              for (const [, override] of Object.entries(server.tool_overrides)) {
+                if (![1, 2, 3].includes(override.tier)) {
+                  throw new Error("tool_overrides tier must be 1, 2, or 3");
+                }
+              }
+            }
+          }
+          this.profile.upstream_servers = updates.upstream_servers;
+        }
+        this.profile.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+        await this.persist();
+        return this.profile;
+      }
+      /**
+       * Persist the current profile to encrypted storage.
+       */
+      async persist() {
+        const serialized = stringToBytes(JSON.stringify(this.profile));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          NAMESPACE,
+          PROFILE_KEY,
+          stringToBytes(JSON.stringify(encrypted))
+        );
       }
     };
   }
@@ -4953,6 +6425,8 @@ async function startStandaloneDashboard(options = {}) {
   const loadResult = await identityManager.load();
   const shrOpts = { config, identityManager, masterKey };
   const handshakeResults = /* @__PURE__ */ new Map();
+  const profileStore = new SovereigntyProfileStore(storage, masterKey);
+  await profileStore.load();
   dashboard.setDependencies({
     policy,
     baseline,
@@ -4960,7 +6434,8 @@ async function startStandaloneDashboard(options = {}) {
     identityManager,
     handshakeResults,
     shrOpts,
-    sanctuaryConfig: config
+    sanctuaryConfig: config,
+    profileStore
   });
   dashboard.setStandaloneMode(true);
   await dashboard.start();
@@ -5011,6 +6486,7 @@ var init_dashboard_standalone = __esm({
     init_random();
     init_encoding();
     init_tools();
+    init_sovereignty_profile();
   }
 });
 
@@ -5037,7 +6513,9 @@ var RESERVED_NAMESPACE_PREFIXES = [
   "_bridge",
   "_federation",
   "_handshake",
-  "_shr"
+  "_shr",
+  "_sovereignty_profile",
+  "_context_gate_policies"
 ];
 var StateStore = class {
   storage;
@@ -7620,6 +9098,70 @@ var TOOL_INVOCATION_PATTERNS = [
 ];
 var URL_PATTERN = /https?:\/\/[^\s"'<>]+/i;
 var EMAIL_PATTERN = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+var INVISIBLE_CHARS = [
+  "\u200B",
+  // Zero-width space
+  "\u200C",
+  // Zero-width non-joiner
+  "\u200D",
+  // Zero-width joiner
+  "\uFEFF",
+  // Zero-width no-break space (BOM)
+  "\xAD",
+  // Soft hyphen
+  "\u200E",
+  // Left-to-right mark
+  "\u200F",
+  // Right-to-left mark
+  "\u2060",
+  // Word joiner
+  "\u2061",
+  // Function application
+  "\u2062",
+  // Invisible times
+  "\u2063",
+  // Invisible separator
+  "\u2064",
+  // Invisible plus
+  "\u180E",
+  // Mongolian vowel separator
+  "\u034F",
+  // Combining grapheme joiner
+  "\u061C",
+  // Arabic letter mark
+  "\u115F",
+  // Hangul choseong filler
+  "\u1160",
+  // Hangul jungseong filler
+  "\u17B4",
+  // Khmer vowel inherent AQ
+  "\u17B5",
+  // Khmer vowel inherent AA
+  "\u3164",
+  // Hangul filler
+  "\uFFA0",
+  // Halfwidth hangul filler
+  "\u202A",
+  // Left-to-Right Embedding (LRE)
+  "\u202B",
+  // Right-to-Left Embedding (RLE)
+  "\u202C",
+  // Pop Directional Formatting (PDF)
+  "\u202D",
+  // Left-to-Right Override (LRO)
+  "\u202E",
+  // Right-to-Left Override (RLO)
+  "\u2066",
+  // Left-to-Right Isolate (LRI)
+  "\u2067",
+  // Right-to-Left Isolate (RLI)
+  "\u2068",
+  // First Strong Isolate (FSI)
+  "\u2069"
+  // Pop Directional Isolate (PDI)
+];
+var VARIATION_SELECTOR_RANGE_START = 65024;
+var VARIATION_SELECTOR_RANGE_END = 65039;
 var ZERO_WIDTH_CHARS = [
   "\u200B",
   // Zero-width space
@@ -7629,6 +9171,66 @@ var ZERO_WIDTH_CHARS = [
   // Zero-width joiner
   "\uFEFF"
   // Zero-width no-break space
+];
+var BASE64_STANDARD_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+var BASE64URL_PATTERN = /^[A-Za-z0-9_-]+={0,2}$/;
+var BASE64_BLOCK_PATTERN = /[A-Za-z0-9+/]{20,}={0,2}/g;
+var HEX_ENCODED_PATTERN = /(?:0x)?[0-9a-fA-F]{20,}/g;
+var HTML_ENTITY_PATTERN = /&#(?:x[0-9a-fA-F]{2,4}|[0-9]{2,5});/g;
+var URL_ENCODED_PATTERN = /(?:%[0-9a-fA-F]{2}){4,}/g;
+var SECRET_PATTERNS = [
+  { pattern: /sk-[a-zA-Z0-9]{20,}/, name: "openai_api_key" },
+  { pattern: /sk-ant-[a-zA-Z0-9_-]{20,}/, name: "anthropic_api_key" },
+  { pattern: /ghp_[a-zA-Z0-9]{36,}/, name: "github_pat" },
+  { pattern: /gho_[a-zA-Z0-9]{36,}/, name: "github_oauth" },
+  { pattern: /ghs_[a-zA-Z0-9]{36,}/, name: "github_app" },
+  { pattern: /github_pat_[a-zA-Z0-9_]{22,}/, name: "github_fine_grained_pat" },
+  { pattern: /AKIA[0-9A-Z]{16}/, name: "aws_access_key" },
+  { pattern: /xoxb-[0-9]{10,}-[a-zA-Z0-9-]+/, name: "slack_bot_token" },
+  { pattern: /xoxp-[0-9]{10,}-[a-zA-Z0-9-]+/, name: "slack_user_token" },
+  { pattern: /xapp-[0-9]-[A-Z0-9]+-[0-9]+-[a-z0-9]+/, name: "slack_app_token" },
+  { pattern: /(?:Bearer|bearer)\s+[a-zA-Z0-9._~+/=-]{20,}/, name: "bearer_token" },
+  { pattern: /glpat-[a-zA-Z0-9_-]{20,}/, name: "gitlab_pat" },
+  { pattern: /npm_[a-zA-Z0-9]{36,}/, name: "npm_token" },
+  { pattern: /pypi-[a-zA-Z0-9_-]{20,}/, name: "pypi_token" },
+  { pattern: /AIza[a-zA-Z0-9_-]{35}/, name: "google_api_key" },
+  { pattern: /SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}/, name: "sendgrid_api_key" },
+  { pattern: /sq0[a-z]{3}-[a-zA-Z0-9_-]{22,}/, name: "square_api_key" },
+  { pattern: /sk_live_[a-zA-Z0-9]{24,}/, name: "stripe_secret_key" },
+  { pattern: /rk_live_[a-zA-Z0-9]{24,}/, name: "stripe_restricted_key" },
+  { pattern: /(?:-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----)/, name: "private_key_pem" }
+];
+var MARKDOWN_IMAGE_EXFIL_PATTERN = /!\[[^\]]*\]\(https?:\/\/[^)]*[?&](?:data|secret|key|token|password|auth|session|cookie|api_key|access_token)=/i;
+var INTERNAL_PATH_PATTERNS = [
+  /\/home\/[a-zA-Z0-9_.-]+\//,
+  /\/Users\/[a-zA-Z0-9_.-]+\//,
+  /[A-Z]:\\(?:Users|Documents|Program Files)\\/,
+  /~\/\.(?:ssh|aws|config|gnupg|sanctuary)\//,
+  /\/etc\/(?:passwd|shadow|hosts|ssh)/,
+  /\/var\/(?:log|run|lib)\//
+];
+var PRIVATE_NETWORK_PATTERNS = [
+  /(?:^|\s|\/\/)(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3})/,
+  /(?:^|\s|\/\/)(?:172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})/,
+  /(?:^|\s|\/\/)(?:192\.168\.\d{1,3}\.\d{1,3})/,
+  /(?:^|\s|\/\/)localhost(?::\d+)?/,
+  /(?:^|\s|\/\/)127\.0\.0\.1/,
+  /(?:^|\s|\/\/)0\.0\.0\.0/,
+  /(?:^|\s|\/\/)\[?::1\]?/
+];
+var OUTPUT_ROLE_MARKER_PATTERNS = [
+  /\bsystem\s*:/i,
+  /\[INST\]/,
+  /\[\/INST\]/,
+  /<\|im_start\|>/,
+  /<\|im_end\|>/,
+  /<\|system\|>/,
+  /<\|user\|>/,
+  /<\|assistant\|>/,
+  /<<\s*SYS\s*>>/,
+  /<<\s*\/SYS\s*>>/,
+  /\[SYSTEM\]/,
+  /### (?:System|Human|Assistant):/
 ];
 var InjectionDetector = class {
   config;
@@ -7687,6 +9289,50 @@ var InjectionDetector = class {
     };
   }
   /**
+   * SEC-035: Scan outbound content for secret leaks, data exfiltration,
+   * internal path exposure, and injection artifact survival.
+   *
+   * @param content The outbound content string to scan
+   * @returns DetectionResult with outbound-specific signal types
+   */
+  scanOutbound(content) {
+    this.stats.total_scans++;
+    if (!this.config.enabled) {
+      return {
+        flagged: false,
+        confidence: 0,
+        signals: [],
+        recommendation: "allow"
+      };
+    }
+    const signals = [];
+    this.detectSecretPatterns(content, signals);
+    this.detectOutboundExfiltration(content, signals);
+    this.detectInternalPathLeaks(content, signals);
+    this.detectPrivateNetworkLeaks(content, signals);
+    this.detectOutputRoleMarkers(content, signals);
+    const flagged = signals.length > 0;
+    if (flagged) {
+      this.stats.total_flags++;
+    }
+    for (const sig of signals) {
+      this.stats.signals_by_type[sig.type] = (this.stats.signals_by_type[sig.type] ?? 0) + 1;
+    }
+    const recommendation = this.computeRecommendation(
+      signals,
+      this.config.sensitivity
+    );
+    if (recommendation === "block") {
+      this.stats.total_blocks++;
+    }
+    return {
+      flagged,
+      confidence: this.computeConfidence(signals),
+      signals,
+      recommendation
+    };
+  }
+  /**
    * Recursively scan a value and all nested values.
    */
   scanValue(value, path, toolName, signals, visited) {
@@ -7714,13 +9360,39 @@ var InjectionDetector = class {
       return;
     }
     const location = path || "root";
-    const normalized = this.normalizeConfusables(value.normalize("NFKC"));
-    if (normalized !== value) {
+    const invisibleCount = this.countInvisibleChars(value);
+    if (invisibleCount > 3) {
+      signals.push({
+        type: "unicode_smuggling",
+        pattern: `invisible_chars_count_${invisibleCount}`,
+        location,
+        severity: "high"
+      });
+    }
+    this.detectTokenBudgetAttack(value, location, signals);
+    const stripped = this.stripInvisibleChars(value);
+    const nfkcOnly = stripped.normalize("NFKC");
+    const normalized = this.normalizeConfusables(nfkcOnly);
+    if (nfkcOnly !== stripped) {
       signals.push({
         type: "encoding_evasion",
         pattern: "unicode_normalization_delta",
         location,
         severity: "medium"
+      });
+    }
+    if (normalized !== nfkcOnly) {
+      signals.push({
+        type: "encoding_evasion",
+        pattern: "unicode_normalization_delta",
+        location,
+        severity: "medium"
+      });
+      signals.push({
+        type: "homoglyph_attack",
+        pattern: "confusable_substitution",
+        location,
+        severity: "high"
       });
     }
     for (const pattern of ROLE_OVERRIDE_PATTERNS) {
@@ -7759,20 +9431,362 @@ var InjectionDetector = class {
       }
     }
     this.detectEncodingEvasion(value, location, signals);
+    this.detectEncodedPayloads(value, location, signals);
     this.detectDataExfiltration(value, location, signals);
     this.detectPromptStuffing(value, location, signals);
   }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SEC-034: Unicode sanitization helpers
+  // ═══════════════════════════════════════════════════════════════════════════
   /**
-   * Detect base64 strings and zero-width character evasion.
+   * Count invisible Unicode characters in a string.
+   * Includes zero-width chars, soft hyphens, directional marks,
+   * variation selectors, and other invisible categories.
    */
-  detectEncodingEvasion(value, path, signals) {
-    if (value.length > 50 && /^[A-Za-z0-9+/]+={0,2}$/.test(value.trim())) {
+  countInvisibleChars(value) {
+    let count = 0;
+    for (const ch of value) {
+      const cp = ch.codePointAt(0);
+      if (cp === void 0) continue;
+      if (INVISIBLE_CHARS.includes(ch)) {
+        count++;
+        continue;
+      }
+      if (cp >= VARIATION_SELECTOR_RANGE_START && cp <= VARIATION_SELECTOR_RANGE_END) {
+        count++;
+        continue;
+      }
+      if (cp >= 917760 && cp <= 917999) {
+        count++;
+        continue;
+      }
+      if (cp >= 917505 && cp <= 917631) {
+        count++;
+        continue;
+      }
+      if (cp >= 65529 && cp <= 65531) {
+        count++;
+        continue;
+      }
+    }
+    return count;
+  }
+  /**
+   * Strip invisible characters from a string for clean pattern matching.
+   * Returns a new string with all invisible chars removed.
+   */
+  stripInvisibleChars(value) {
+    const chars = [];
+    for (const ch of value) {
+      const cp = ch.codePointAt(0);
+      if (cp === void 0) continue;
+      if (INVISIBLE_CHARS.includes(ch)) continue;
+      if (cp >= VARIATION_SELECTOR_RANGE_START && cp <= VARIATION_SELECTOR_RANGE_END) continue;
+      if (cp >= 917760 && cp <= 917999) continue;
+      if (cp >= 917505 && cp <= 917631) continue;
+      if (cp >= 65529 && cp <= 65531) continue;
+      chars.push(ch);
+    }
+    return chars.join("");
+  }
+  /**
+   * SEC-034: Token budget attack detection.
+   * Some Unicode sequences expand dramatically during tokenization (e.g., CJK
+   * ideographs, combining characters, emoji sequences). If the estimated token
+   * cost per character is anomalously high, this may be a wallet-drain payload.
+   *
+   * Heuristic: count chars that typically tokenize into multiple tokens.
+   * If the ratio of estimated tokens to char count exceeds 3x, flag it.
+   */
+  detectTokenBudgetAttack(value, path, signals) {
+    if (value.length < 20) return;
+    const MAX_ANALYSIS_LENGTH = 1e6;
+    if (value.length > MAX_ANALYSIS_LENGTH) {
+      value = value.substring(0, MAX_ANALYSIS_LENGTH);
+    }
+    let estimatedTokens = 0;
+    for (const ch of value) {
+      const cp = ch.codePointAt(0);
+      if (cp === void 0) continue;
+      if (cp <= 127) {
+        estimatedTokens += 0.25;
+      } else if (cp <= 2047) {
+        estimatedTokens += 0.5;
+      } else if (cp <= 65535) {
+        estimatedTokens += 1.5;
+      } else {
+        estimatedTokens += 2.5;
+      }
+    }
+    let charCount = 0;
+    for (const _ch of value) {
+      charCount++;
+    }
+    const ratio = estimatedTokens / charCount;
+    if (ratio > 3) {
       signals.push({
-        type: "encoding_evasion",
-        pattern: "base64_string",
-        location: path || "root",
+        type: "token_budget_attack",
+        pattern: `token_char_ratio_${ratio.toFixed(2)}`,
+        location: path,
         severity: "medium"
       });
+    }
+  }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SEC-034: Encoded payload detection and re-scanning
+  // ═══════════════════════════════════════════════════════════════════════════
+  /**
+   * Detect encoded content (base64, hex, HTML entities, URL encoding),
+   * decode it, and re-scan the decoded content through injection patterns.
+   * If the decoded content contains injection patterns, flag as encoding_evasion.
+   */
+  detectEncodedPayloads(value, path, signals) {
+    const decodedParts = [];
+    const base64Matches = value.match(BASE64_BLOCK_PATTERN);
+    if (base64Matches) {
+      for (const match of base64Matches) {
+        const decoded = this.safeBase64Decode(match);
+        if (decoded !== null) {
+          decodedParts.push(decoded);
+        }
+      }
+    }
+    const hexMatches = value.match(HEX_ENCODED_PATTERN);
+    if (hexMatches) {
+      for (const match of hexMatches) {
+        const decoded = this.safeHexDecode(match);
+        if (decoded !== null) {
+          decodedParts.push(decoded);
+        }
+      }
+    }
+    if (HTML_ENTITY_PATTERN.test(value)) {
+      const decoded = this.decodeHtmlEntities(value);
+      if (decoded !== value) {
+        decodedParts.push(decoded);
+      }
+    }
+    const urlMatches = value.match(URL_ENCODED_PATTERN);
+    if (urlMatches) {
+      for (const match of urlMatches) {
+        const decoded = this.safeUrlDecode(match);
+        if (decoded !== null && decoded !== match) {
+          decodedParts.push(decoded);
+        }
+      }
+    }
+    for (const decoded of decodedParts) {
+      if (this.containsInjectionPatterns(decoded)) {
+        signals.push({
+          type: "encoding_evasion",
+          pattern: "encoded_injection_payload",
+          location: path,
+          severity: "high"
+        });
+        return;
+      }
+    }
+  }
+  /**
+   * Check if a string contains any injection patterns (role override or security bypass).
+   */
+  containsInjectionPatterns(value) {
+    const normalized = this.normalizeConfusables(value.normalize("NFKC"));
+    for (const pattern of ROLE_OVERRIDE_PATTERNS) {
+      if (pattern.test(normalized)) return true;
+    }
+    for (const pattern of SECURITY_BYPASS_PATTERNS) {
+      if (pattern.test(normalized)) return true;
+    }
+    return false;
+  }
+  /**
+   * Safely decode a base64 string. Returns null if it's not valid base64
+   * or doesn't decode to a meaningful string.
+   */
+  safeBase64Decode(value) {
+    try {
+      const cleaned = value.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = cleaned + "=".repeat((4 - cleaned.length % 4) % 4);
+      if (!BASE64_STANDARD_PATTERN.test(padded)) return null;
+      const decoded = Buffer.from(padded, "base64").toString("utf-8");
+      if (this.looksLikeText(decoded)) {
+        return decoded;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+  /**
+   * Safely decode a hex string. Returns null on failure.
+   */
+  safeHexDecode(value) {
+    try {
+      const hex = value.startsWith("0x") ? value.slice(2) : value;
+      if (hex.length % 2 !== 0) return null;
+      const decoded = Buffer.from(hex, "hex").toString("utf-8");
+      if (this.looksLikeText(decoded)) {
+        return decoded;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+  /**
+   * Decode HTML numeric entities (&#xHH; and &#DDD;) in a string.
+   */
+  decodeHtmlEntities(value) {
+    return value.replace(/&#x([0-9a-fA-F]{2,4});/g, (_match, hex) => {
+      try {
+        return String.fromCodePoint(parseInt(hex, 16));
+      } catch {
+        return _match;
+      }
+    }).replace(/&#([0-9]{2,5});/g, (_match, dec) => {
+      try {
+        const cp = parseInt(dec, 10);
+        if (cp > 1114111) return _match;
+        return String.fromCodePoint(cp);
+      } catch {
+        return _match;
+      }
+    });
+  }
+  /**
+   * Safely decode a URL-encoded string. Returns null on failure.
+   */
+  safeUrlDecode(value) {
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return null;
+    }
+  }
+  /**
+   * Heuristic: does this look like readable text (vs. binary garbage)?
+   * Checks that most characters are printable ASCII or common Unicode.
+   */
+  looksLikeText(value) {
+    if (value.length === 0) return false;
+    let printable = 0;
+    for (let i = 0; i < value.length; i++) {
+      const code = value.charCodeAt(i);
+      if (code >= 32 && code <= 126 || code === 10 || code === 13 || code === 9) {
+        printable++;
+      } else if (code >= 128) {
+        if (code < 160) continue;
+        printable++;
+      }
+    }
+    return printable / value.length > 0.7;
+  }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SEC-035: Outbound content scanning helpers
+  // ═══════════════════════════════════════════════════════════════════════════
+  /**
+   * Detect API keys and secrets in outbound content.
+   */
+  detectSecretPatterns(content, signals) {
+    for (const { pattern, name } of SECRET_PATTERNS) {
+      if (pattern.test(content)) {
+        signals.push({
+          type: "secret_leak",
+          pattern: name,
+          location: "outbound",
+          severity: "high"
+        });
+      }
+    }
+  }
+  /**
+   * Detect data exfiltration via markdown images with data-carrying query params.
+   */
+  detectOutboundExfiltration(content, signals) {
+    if (MARKDOWN_IMAGE_EXFIL_PATTERN.test(content)) {
+      signals.push({
+        type: "data_exfiltration",
+        pattern: "markdown_image_exfil",
+        location: "outbound",
+        severity: "high"
+      });
+    }
+  }
+  /**
+   * Detect internal filesystem path leaks in outbound content.
+   */
+  detectInternalPathLeaks(content, signals) {
+    for (const pattern of INTERNAL_PATH_PATTERNS) {
+      if (pattern.test(content)) {
+        signals.push({
+          type: "internal_path_leak",
+          pattern: pattern.source,
+          location: "outbound",
+          severity: "medium"
+        });
+        return;
+      }
+    }
+  }
+  /**
+   * Detect private IP addresses and localhost references in outbound content.
+   */
+  detectPrivateNetworkLeaks(content, signals) {
+    for (const pattern of PRIVATE_NETWORK_PATTERNS) {
+      if (pattern.test(content)) {
+        signals.push({
+          type: "private_network_leak",
+          pattern: pattern.source,
+          location: "outbound",
+          severity: "medium"
+        });
+        return;
+      }
+    }
+  }
+  /**
+   * Detect role markers / prompt template artifacts in outbound content.
+   * These should never appear in agent output — their presence indicates
+   * injection artifact survival.
+   */
+  detectOutputRoleMarkers(content, signals) {
+    for (const pattern of OUTPUT_ROLE_MARKER_PATTERNS) {
+      if (pattern.test(content)) {
+        signals.push({
+          type: "injection_artifact",
+          pattern: pattern.source,
+          location: "outbound",
+          severity: "high"
+        });
+        return;
+      }
+    }
+  }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Existing detection methods (enhanced)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /**
+   * Detect base64 strings, base64url, and zero-width character evasion.
+   */
+  detectEncodingEvasion(value, path, signals) {
+    const trimmed = value.trim();
+    if (value.length > 50) {
+      if (BASE64_STANDARD_PATTERN.test(trimmed)) {
+        signals.push({
+          type: "encoding_evasion",
+          pattern: "base64_string",
+          location: path || "root",
+          severity: "medium"
+        });
+      } else if (BASE64URL_PATTERN.test(trimmed) && /[_-]/.test(trimmed)) {
+        signals.push({
+          type: "encoding_evasion",
+          pattern: "base64url_string",
+          location: path || "root",
+          severity: "medium"
+        });
+      }
     }
     let zeroWidthCount = 0;
     for (const char of ZERO_WIDTH_CHARS) {
@@ -7952,62 +9966,89 @@ var InjectionDetector = class {
     return structuredFields.some((p) => p.test(path));
   }
   /**
-   * SEC-032: Map common cross-script confusable characters to their Latin equivalents.
-   * NFKC normalization handles fullwidth and compatibility forms, but does NOT map
-   * Cyrillic/Greek lookalikes to Latin (they're distinct codepoints by design).
-   * This covers the most common confusables used in injection evasion.
+   * SEC-032/SEC-034: Map common cross-script confusable characters to their
+   * Latin equivalents. NFKC normalization handles fullwidth and compatibility
+   * forms, but does NOT map Cyrillic/Greek/Armenian/Georgian lookalikes to
+   * Latin (they're distinct codepoints by design).
+   *
+   * Extended to 50+ confusable pairs covering Cyrillic, Greek, Armenian,
+   * Georgian, Cherokee, and mathematical/symbol lookalikes.
    */
   normalizeConfusables(value) {
     const confusables = {
-      // Cyrillic → Latin
+      // ── Cyrillic → Latin ──────────────────────────────────────────────
       "\u0410": "A",
       "\u0430": "a",
       // А а
       "\u0412": "B",
       "\u0432": "b",
-      // В (not exact) в (not exact)
+      // В в (visual approximation)
       "\u0421": "C",
       "\u0441": "c",
       // С с
+      "\u0414": "D",
+      // Д (visual approximation)
       "\u0415": "E",
       "\u0435": "e",
       // Е е
       "\u041D": "H",
       "\u043D": "h",
-      // Н (not exact) н (not exact)
+      // Н н (visual approximation)
+      "\u0406": "I",
+      "\u0456": "i",
+      // І і (Ukrainian I)
+      "\u0408": "J",
+      // Ј (Serbian Je)
       "\u041A": "K",
       "\u043A": "k",
-      // К к (not exact)
+      // К к (visual approximation)
       "\u041C": "M",
       "\u043C": "m",
-      // М (not exact) м (not exact)
+      // М м (visual approximation)
       "\u041E": "O",
       "\u043E": "o",
       // О о
       "\u0420": "P",
       "\u0440": "p",
       // Р р
+      "\u0405": "S",
+      "\u0455": "s",
+      // Ѕ ѕ (Macedonian S)
       "\u0422": "T",
       "\u0442": "t",
-      // Т (not exact) т (not exact)
+      // Т т (visual approximation)
       "\u0425": "X",
       "\u0445": "x",
       // Х х
       "\u0423": "Y",
       "\u0443": "y",
-      // У (not exact) у
-      // Greek → Latin
+      // У у (visual approximation)
+      "\u0417": "3",
+      // З (looks like 3)
+      "\u04BB": "h",
+      // һ (Shha)
+      "\u04C0": "I",
+      // Ӏ (Palochka)
+      "\u04CF": "l",
+      // ӏ (Palochka small)
+      // ── Greek → Latin ─────────────────────────────────────────────────
       "\u0391": "A",
       "\u03B1": "a",
-      // Α α (not exact)
+      // Α α (alpha not exact)
       "\u0392": "B",
       "\u03B2": "b",
       // Β β (not exact)
+      "\u0393": "G",
+      // Γ (visual approximation)
       "\u0395": "E",
       "\u03B5": "e",
       // Ε ε (not exact)
+      "\u0396": "Z",
+      "\u03B6": "z",
+      // Ζ ζ (not exact)
       "\u0397": "H",
-      // Η
+      "\u03B7": "n",
+      // Η η (not exact)
       "\u0399": "I",
       "\u03B9": "i",
       // Ι ι
@@ -8031,8 +10072,78 @@ var InjectionDetector = class {
       "\u03C5": "y",
       // Υ υ (not exact)
       "\u03A7": "X",
-      "\u03C7": "x"
+      "\u03C7": "x",
       // Χ χ (not exact)
+      "\u03C9": "w",
+      // ω (omega, visual approximation)
+      // ── Armenian → Latin ──────────────────────────────────────────────
+      "\u0555": "O",
+      // Օ
+      "\u0585": "o",
+      // օ
+      "\u054D": "S",
+      // Ս
+      "\u057D": "s",
+      // ս
+      "\u054C": "L",
+      // Լ (visual approximation)
+      "\u0570": "h",
+      // հ
+      // ── Cherokee → Latin ──────────────────────────────────────────────
+      "\u13A0": "D",
+      // Ꭰ
+      "\u13B3": "W",
+      // Ꮃ
+      "\u13A1": "R",
+      // Ꭱ
+      "\u13AA": "G",
+      // Ꭺ (looks like A but maps to G sound)
+      "\u13D2": "V",
+      // Ꮢ (visual approximation)
+      // ── Georgian → Latin ──────────────────────────────────────────────
+      "\u10D5": "v",
+      // ვ (Georgian letter vin)
+      "\u10D3": "d",
+      // დ (Georgian letter don)
+      "\u10DA": "l",
+      // ლ (Georgian letter las)
+      // ── Latin special → Latin ────────────────────────────────────────
+      "\u0131": "i",
+      // ı (Latin small letter dotless i)
+      // ── Symbols / Mathematical → Latin ────────────────────────────────
+      // Note: NFKC normalization handles mathematical alphanumerics (U+1D400–U+1D7FF)
+      "\u2160": "I",
+      // Ⅰ (Roman numeral one)
+      "\u2164": "V",
+      // Ⅴ (Roman numeral five)
+      "\u2169": "X",
+      // Ⅹ (Roman numeral ten)
+      "\u216C": "L",
+      // Ⅼ (Roman numeral fifty)
+      "\u216D": "C",
+      // Ⅽ (Roman numeral one hundred)
+      "\u216E": "D",
+      // Ⅾ (Roman numeral five hundred)
+      "\u216F": "M",
+      // Ⅿ (Roman numeral one thousand)
+      "\u2170": "i",
+      // ⅰ (small Roman numeral one)
+      "\u2174": "v",
+      // ⅴ (small Roman numeral five)
+      "\u2179": "x",
+      // ⅹ (small Roman numeral ten)
+      "\u217C": "l",
+      // ⅼ (small Roman numeral fifty)
+      "\u217D": "c",
+      // ⅽ (small Roman numeral one hundred)
+      "\u217E": "d",
+      // ⅾ (small Roman numeral five hundred)
+      "\u217F": "m",
+      // ⅿ (small Roman numeral one thousand)
+      "\u0251": "a",
+      // ɑ (Latin alpha — looks like 'a')
+      "\u0261": "g"
+      // ɡ (Latin small letter script G)
     };
     let result = value;
     if (/[^\x00-\x7F]/.test(value)) {
@@ -8122,6 +10233,7 @@ var ApprovalGate = class {
   auditLog;
   injectionDetector;
   onInjectionAlert;
+  proxyTierResolver;
   constructor(policy, baseline, channel, auditLog, injectionDetector, onInjectionAlert) {
     this.policy = policy;
     this.baseline = baseline;
@@ -8129,6 +10241,12 @@ var ApprovalGate = class {
     this.auditLog = auditLog;
     this.injectionDetector = injectionDetector ?? new InjectionDetector();
     this.onInjectionAlert = onInjectionAlert;
+  }
+  /**
+   * Set the proxy tier resolver. Called after the proxy router is initialized.
+   */
+  setProxyTierResolver(resolver) {
+    this.proxyTierResolver = resolver;
   }
   /**
    * Evaluate a tool call against the Principal Policy.
@@ -8180,6 +10298,38 @@ var ApprovalGate = class {
             }
           }
         );
+      }
+    }
+    if (toolName.startsWith("proxy/") && this.proxyTierResolver) {
+      const proxyTier = this.proxyTierResolver(toolName);
+      if (proxyTier !== null) {
+        if (proxyTier === 1) {
+          return this.requestApproval(operation, 1, `Proxy tool "${toolName}" is configured as Tier 1 (always requires approval)`, {
+            operation: toolName,
+            proxy: true,
+            args_summary: this.summarizeArgs(args)
+          });
+        }
+        if (proxyTier === 2) {
+          const anomaly2 = this.detectAnomaly(operation, args);
+          if (anomaly2) {
+            return this.requestApproval(operation, 2, `Proxy: ${anomaly2.reason}`, {
+              ...anomaly2.context,
+              proxy: true
+            });
+          }
+        }
+        this.auditLog.append("l2", `gate_allow_proxy:${toolName}`, "system", {
+          tier: proxyTier,
+          operation: toolName,
+          proxy: true
+        });
+        return {
+          allowed: true,
+          tier: proxyTier,
+          reason: `Proxy operation allowed (Tier ${proxyTier})`,
+          approval_required: false
+        };
       }
     }
     if (this.policy.tier1_always_approve.includes(operation)) {
@@ -9881,7 +12031,7 @@ function createBridgeCommitment(outcome, identity, identityEncryptionKey, includ
   const now = (/* @__PURE__ */ new Date()).toISOString();
   const canonicalBytes = canonicalize(outcome);
   const canonicalString = new TextDecoder().decode(canonicalBytes);
-  const sha2564 = createCommitment(canonicalString);
+  const sha2565 = createCommitment(canonicalString);
   let pedersenData;
   if (includePedersen && Number.isInteger(outcome.rounds) && outcome.rounds >= 0) {
     const pedersen = createPedersenCommitment(outcome.rounds);
@@ -9893,7 +12043,7 @@ function createBridgeCommitment(outcome, identity, identityEncryptionKey, includ
   const commitmentPayload = {
     bridge_commitment_id: commitmentId,
     session_id: outcome.session_id,
-    sha256_commitment: sha2564.commitment,
+    sha256_commitment: sha2565.commitment,
     terms_hash: outcome.terms_hash,
     committer_did: identity.did,
     committed_at: now,
@@ -9904,8 +12054,8 @@ function createBridgeCommitment(outcome, identity, identityEncryptionKey, includ
   return {
     bridge_commitment_id: commitmentId,
     session_id: outcome.session_id,
-    sha256_commitment: sha2564.commitment,
-    blinding_factor: sha2564.blinding_factor,
+    sha256_commitment: sha2565.commitment,
+    blinding_factor: sha2565.blinding_factor,
     committer_did: identity.did,
     signature: toBase64url(signature),
     pedersen_commitment: pedersenData,
@@ -12977,11 +15127,982 @@ function createL2HardeningTools(storagePath, auditLog) {
 }
 
 // src/index.ts
+init_sovereignty_profile();
+
+// src/sovereignty-profile-tools.ts
+init_router();
+init_system_prompt_generator();
+function createSovereigntyProfileTools(profileStore, auditLog) {
+  const tools = [
+    // ── Get Profile ──────────────────────────────────────────────────
+    {
+      name: "sanctuary/sovereignty_profile_get",
+      description: "Get the current Sovereignty Profile \u2014 shows which Sanctuary features are active (audit logging, injection detection, context gating, approval gates, ZK proofs) and their configuration.",
+      inputSchema: {
+        type: "object",
+        properties: {}
+      },
+      handler: async () => {
+        const profile = profileStore.get();
+        auditLog.append("l2", "sovereignty_profile_get", "system", {
+          features_enabled: Object.entries(profile.features).filter(([, v]) => v.enabled).map(([k]) => k)
+        });
+        return toolResult({
+          profile,
+          message: "Current Sovereignty Profile. Use sovereignty_profile_update to change settings."
+        });
+      }
+    },
+    // ── Update Profile ───────────────────────────────────────────────
+    {
+      name: "sanctuary/sovereignty_profile_update",
+      description: "Update the Sovereignty Profile feature toggles. This changes which Sanctuary protections are active. Requires human approval (Tier 1) because it modifies enforcement behavior. Pass only the features you want to change \u2014 unspecified features remain unchanged.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          audit_logging: {
+            type: "object",
+            properties: {
+              enabled: { type: "boolean" }
+            },
+            description: "Toggle audit logging on/off"
+          },
+          injection_detection: {
+            type: "object",
+            properties: {
+              enabled: { type: "boolean" },
+              sensitivity: {
+                type: "string",
+                enum: ["low", "medium", "high"],
+                description: "Detection sensitivity threshold"
+              }
+            },
+            description: "Toggle injection detection and set sensitivity"
+          },
+          context_gating: {
+            type: "object",
+            properties: {
+              enabled: { type: "boolean" },
+              policy_id: {
+                type: "string",
+                description: "ID of the context-gating policy to use"
+              }
+            },
+            description: "Toggle context gating and set active policy"
+          },
+          approval_gate: {
+            type: "object",
+            properties: {
+              enabled: { type: "boolean" }
+            },
+            description: "Toggle approval gates on/off"
+          },
+          zk_proofs: {
+            type: "object",
+            properties: {
+              enabled: { type: "boolean" }
+            },
+            description: "Toggle zero-knowledge proofs on/off"
+          }
+        }
+      },
+      handler: async (args) => {
+        const updates = {};
+        if (args.audit_logging !== void 0) {
+          updates.audit_logging = args.audit_logging;
+        }
+        if (args.injection_detection !== void 0) {
+          updates.injection_detection = args.injection_detection;
+        }
+        if (args.context_gating !== void 0) {
+          updates.context_gating = args.context_gating;
+        }
+        if (args.approval_gate !== void 0) {
+          updates.approval_gate = args.approval_gate;
+        }
+        if (args.zk_proofs !== void 0) {
+          updates.zk_proofs = args.zk_proofs;
+        }
+        const updated = await profileStore.update(updates);
+        auditLog.append("l2", "sovereignty_profile_update", "system", {
+          changes: updates,
+          features_enabled: Object.entries(updated.features).filter(([, v]) => v.enabled).map(([k]) => k)
+        });
+        return toolResult({
+          profile: updated,
+          message: "Sovereignty Profile updated. Changes take effect immediately."
+        });
+      }
+    },
+    // ── Generate System Prompt ───────────────────────────────────────
+    {
+      name: "sanctuary/sovereignty_profile_generate_prompt",
+      description: "Generate a system prompt snippet based on the active Sovereignty Profile. The snippet instructs an agent on which Sanctuary features are active and how to use them. Copy and paste this into your agent's system configuration.",
+      inputSchema: {
+        type: "object",
+        properties: {}
+      },
+      handler: async () => {
+        const profile = profileStore.get();
+        const prompt = generateSystemPrompt(profile);
+        auditLog.append("l2", "sovereignty_profile_generate_prompt", "system", {
+          features_enabled: Object.entries(profile.features).filter(([, v]) => v.enabled).map(([k]) => k)
+        });
+        return toolResult({
+          system_prompt: prompt,
+          token_estimate: Math.ceil(prompt.length / 4),
+          message: "Copy the system_prompt text above and paste it into your agent's system configuration. It will update dynamically as you toggle features."
+        });
+      }
+    }
+  ];
+  return { tools };
+}
+var MAX_RETRIES = 5;
+var BASE_BACKOFF_MS = 1e3;
+var MAX_BACKOFF_MS = 3e4;
+var MAX_UPSTREAM_SERVERS = 20;
+var ClientManager = class {
+  connections = /* @__PURE__ */ new Map();
+  onStateChange;
+  shutdownRequested = false;
+  constructor(options) {
+    this.onStateChange = options?.onStateChange;
+  }
+  /**
+   * Configure upstream servers. Disconnects removed servers, connects new ones.
+   * Non-blocking — connection failures are handled asynchronously.
+   */
+  async configure(servers) {
+    if (servers.length > MAX_UPSTREAM_SERVERS) {
+      throw new Error(`Maximum ${MAX_UPSTREAM_SERVERS} upstream servers allowed`);
+    }
+    const SAFE_SERVER_NAME = /^[a-zA-Z0-9_\-]+$/;
+    const newNames = new Set(servers.filter((s) => {
+      if (!SAFE_SERVER_NAME.test(s.name)) {
+        return false;
+      }
+      return s.enabled;
+    }).map((s) => s.name));
+    for (const [name] of this.connections) {
+      if (!newNames.has(name)) {
+        await this.disconnectServer(name);
+      }
+    }
+    for (const server of servers) {
+      if (!SAFE_SERVER_NAME.test(server.name)) {
+        continue;
+      }
+      if (!server.enabled) {
+        if (this.connections.has(server.name)) {
+          await this.disconnectServer(server.name);
+        }
+        continue;
+      }
+      const existing = this.connections.get(server.name);
+      if (existing && existing.state === "connected") {
+        existing.server = server;
+        continue;
+      }
+      this.connectServer(server);
+    }
+  }
+  /**
+   * Get all discovered tools across all connected upstream servers.
+   */
+  getAllTools() {
+    const result = /* @__PURE__ */ new Map();
+    for (const [name, conn] of this.connections) {
+      if (conn.state === "connected" && conn.tools.length > 0) {
+        result.set(name, conn.tools);
+      }
+    }
+    return result;
+  }
+  /**
+   * Get connection status for all configured servers.
+   */
+  getStatus() {
+    return Array.from(this.connections.values()).map((conn) => ({
+      name: conn.server.name,
+      state: conn.state,
+      transport_type: conn.server.transport.type,
+      tool_count: conn.tools.length,
+      error: conn.error
+    }));
+  }
+  /**
+   * Get the upstream server config by name.
+   */
+  getServerConfig(name) {
+    return this.connections.get(name)?.server;
+  }
+  /**
+   * Call a tool on an upstream server.
+   */
+  async callTool(serverName, toolName, args) {
+    const conn = this.connections.get(serverName);
+    if (!conn) {
+      throw new Error(`Upstream server "${serverName}" is not configured`);
+    }
+    if (conn.state !== "connected" || !conn.client) {
+      throw new Error(`Upstream server "${serverName}" is not connected (state: ${conn.state})`);
+    }
+    const result = await conn.client.callTool({
+      name: toolName,
+      arguments: args
+    });
+    return result;
+  }
+  /**
+   * Shut down all connections cleanly.
+   */
+  async shutdown() {
+    this.shutdownRequested = true;
+    for (const conn of this.connections.values()) {
+      if (conn.retryTimer) {
+        clearTimeout(conn.retryTimer);
+        conn.retryTimer = void 0;
+      }
+    }
+    const disconnects = Array.from(this.connections.keys()).map(
+      (name) => this.disconnectServer(name)
+    );
+    await Promise.allSettled(disconnects);
+  }
+  // ── Private ───────────────────────────────────────────────────────────
+  /**
+   * Connect to an upstream server (non-blocking).
+   * Spawns connection attempt in background — does not throw.
+   */
+  connectServer(server) {
+    const conn = {
+      server,
+      client: null,
+      transport: null,
+      state: "connecting",
+      tools: [],
+      retryCount: 0
+    };
+    this.connections.set(server.name, conn);
+    this.notifyStateChange(conn);
+    this.doConnect(conn).catch(() => {
+    });
+  }
+  /**
+   * Perform the actual connection to an upstream server.
+   */
+  async doConnect(conn) {
+    try {
+      conn.state = "connecting";
+      this.notifyStateChange(conn);
+      let transport;
+      if (conn.server.transport.type === "stdio") {
+        if (!conn.server.transport.command) {
+          throw new Error("stdio transport requires a command");
+        }
+        if (conn.server.transport.args) {
+          const SAFE_ARG_PATTERN = /^[a-zA-Z0-9._\-\/=:@]+$/;
+          for (const arg of conn.server.transport.args) {
+            if (!SAFE_ARG_PATTERN.test(arg)) {
+              throw new Error(`Unsafe argument rejected: contains disallowed characters`);
+            }
+          }
+        }
+        const ENV_BLOCKLIST = /* @__PURE__ */ new Set([
+          "PATH",
+          "HOME",
+          "USER",
+          "SHELL",
+          "NODE_OPTIONS",
+          "NODE_PATH",
+          "LD_PRELOAD",
+          "LD_LIBRARY_PATH",
+          "DYLD_INSERT_LIBRARIES",
+          "PYTHONPATH",
+          "RUBYLIB",
+          "PERL5LIB",
+          "HTTP_PROXY",
+          "HTTPS_PROXY",
+          "NO_PROXY",
+          "http_proxy",
+          "https_proxy",
+          "no_proxy"
+        ]);
+        let transportEnv;
+        if (conn.server.transport.env) {
+          const safeEnv = { ...process.env };
+          for (const [key, value] of Object.entries(conn.server.transport.env)) {
+            if (!ENV_BLOCKLIST.has(key)) {
+              safeEnv[key] = value;
+            }
+          }
+          transportEnv = safeEnv;
+        }
+        transport = new stdio_js$1.StdioClientTransport({
+          command: conn.server.transport.command,
+          args: conn.server.transport.args,
+          env: transportEnv
+        });
+      } else {
+        if (!conn.server.transport.url) {
+          throw new Error("sse transport requires a url");
+        }
+        const ssrfUrl = new URL(conn.server.transport.url);
+        if (ssrfUrl.protocol !== "http:" && ssrfUrl.protocol !== "https:") {
+          throw new Error("SSE transport URL must use http or https scheme");
+        }
+        transport = new sse_js.SSEClientTransport(ssrfUrl);
+      }
+      const client = new index_js.Client(
+        { name: `sanctuary-proxy/${conn.server.name}`, version: "1.0.0" },
+        { capabilities: {} }
+      );
+      await client.connect(transport);
+      conn.client = client;
+      conn.transport = transport;
+      conn.state = "connected";
+      conn.error = void 0;
+      conn.retryCount = 0;
+      await this.discoverTools(conn);
+      this.notifyStateChange(conn);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown connection error";
+      conn.state = "error";
+      conn.error = message;
+      conn.client = null;
+      conn.transport = null;
+      this.notifyStateChange(conn);
+      this.scheduleRetry(conn);
+    }
+  }
+  /**
+   * Discover tools from a connected upstream server.
+   */
+  async discoverTools(conn) {
+    if (!conn.client || conn.state !== "connected") return;
+    try {
+      const result = await conn.client.listTools();
+      conn.tools = (result.tools ?? []).map((t) => ({
+        name: t.name,
+        description: t.description ?? "",
+        inputSchema: t.inputSchema ?? { type: "object", properties: {} }
+      }));
+    } catch {
+      conn.tools = [];
+    }
+  }
+  /**
+   * Schedule a reconnection attempt with exponential backoff.
+   */
+  scheduleRetry(conn) {
+    if (this.shutdownRequested) return;
+    if (conn.retryCount >= MAX_RETRIES) {
+      conn.error = `Max retries (${MAX_RETRIES}) exceeded. Last error: ${conn.error}`;
+      this.notifyStateChange(conn);
+      return;
+    }
+    const delay = Math.min(
+      BASE_BACKOFF_MS * Math.pow(2, conn.retryCount),
+      MAX_BACKOFF_MS
+    );
+    conn.retryCount++;
+    conn.retryTimer = setTimeout(() => {
+      if (this.shutdownRequested) return;
+      conn.retryTimer = void 0;
+      this.doConnect(conn).catch(() => {
+      });
+    }, delay);
+  }
+  /**
+   * Disconnect a specific upstream server.
+   */
+  async disconnectServer(name) {
+    const conn = this.connections.get(name);
+    if (!conn) return;
+    if (conn.retryTimer) {
+      clearTimeout(conn.retryTimer);
+      conn.retryTimer = void 0;
+    }
+    if (conn.client) {
+      try {
+        await conn.client.close();
+      } catch {
+      }
+    }
+    if (conn.transport) {
+      try {
+        await conn.transport.close();
+      } catch {
+      }
+    }
+    this.connections.delete(name);
+  }
+  /**
+   * Notify listener of state change.
+   */
+  notifyStateChange(conn) {
+    if (this.onStateChange) {
+      try {
+        this.onStateChange(conn.server.name, conn.state, conn.tools.length, conn.error);
+      } catch {
+      }
+    }
+  }
+};
+
+// src/proxy/proxy-router.ts
+init_router();
+var UPSTREAM_CALL_TIMEOUT_MS = 3e4;
+var ProxyRouter = class {
+  clientManager;
+  injectionDetector;
+  auditLog;
+  options;
+  constructor(clientManager, injectionDetector, auditLog, options) {
+    this.clientManager = clientManager;
+    this.injectionDetector = injectionDetector;
+    this.auditLog = auditLog;
+    this.options = options ?? {};
+  }
+  /**
+   * Convert all discovered upstream tools to Sanctuary ToolDefinitions.
+   * Each tool is registered as `proxy/{server_name}/{tool_name}`.
+   */
+  getProxiedTools() {
+    const tools = [];
+    const allUpstreamTools = this.clientManager.getAllTools();
+    for (const [serverName, serverTools] of allUpstreamTools) {
+      for (const upstreamTool of serverTools) {
+        const proxyName = `proxy/${serverName}/${upstreamTool.name}`;
+        tools.push({
+          name: proxyName,
+          description: `[via ${serverName}] ${upstreamTool.description}`,
+          inputSchema: upstreamTool.inputSchema,
+          handler: this.createHandler(serverName, upstreamTool.name)
+        });
+      }
+    }
+    return tools;
+  }
+  /**
+   * Determine the tier for a proxied tool call.
+   * Checks tool_overrides first, then falls back to default_tier.
+   */
+  getTierForTool(serverName, toolName) {
+    const serverConfig = this.clientManager.getServerConfig(serverName);
+    if (!serverConfig) return 2;
+    if (serverConfig.tool_overrides?.[toolName]) {
+      return serverConfig.tool_overrides[toolName].tier;
+    }
+    return serverConfig.default_tier;
+  }
+  /**
+   * Parse a proxy tool name into server name and tool name.
+   * Returns null if the name doesn't match the proxy namespace.
+   */
+  static parseProxyToolName(fullName) {
+    if (!fullName.startsWith("proxy/")) return null;
+    const rest = fullName.slice("proxy/".length);
+    const slashIdx = rest.indexOf("/");
+    if (slashIdx === -1) return null;
+    return {
+      serverName: rest.slice(0, slashIdx),
+      toolName: rest.slice(slashIdx + 1)
+    };
+  }
+  // ── Private ───────────────────────────────────────────────────────────
+  /**
+   * Create a handler for a specific proxied tool.
+   * The handler runs the full enforcement chain before forwarding.
+   */
+  createHandler(serverName, toolName) {
+    return async (args) => {
+      const proxyName = `proxy/${serverName}/${toolName}`;
+      const start = Date.now();
+      const tier = this.getTierForTool(serverName, toolName);
+      try {
+        const injectionResult = this.injectionDetector.scan(proxyName, args);
+        if (injectionResult.flagged && injectionResult.recommendation === "block") {
+          this.auditLog.append("l2", `proxy_injection_blocked:${proxyName}`, "system", {
+            server: serverName,
+            tool: toolName,
+            tier,
+            confidence: injectionResult.confidence,
+            latency_ms: Date.now() - start
+          }, "failure");
+          return toolResult({
+            error: "Operation not permitted",
+            proxy: true
+          });
+        }
+        if (injectionResult.flagged && injectionResult.recommendation === "escalate") {
+          this.auditLog.append("l2", `proxy_injection_escalated:${proxyName}`, "system", {
+            server: serverName,
+            tool: toolName,
+            tier,
+            confidence: injectionResult.confidence
+          });
+        }
+        let filteredArgs = args;
+        if (this.options.contextGateFilter) {
+          try {
+            filteredArgs = await this.options.contextGateFilter(proxyName, args);
+          } catch {
+          }
+        }
+        if (this.options.governor) {
+          const govResult = this.options.governor.check(serverName, toolName, filteredArgs);
+          if (!govResult.allowed) {
+            this.auditLog.append("l2", `proxy_governor_blocked:${proxyName}`, "system", {
+              server: serverName,
+              tool: toolName,
+              tier,
+              reason: govResult.reason,
+              latency_ms: Date.now() - start
+            }, "failure");
+            return toolResult({
+              error: "Operation not permitted",
+              proxy: true,
+              governor_reason: govResult.reason
+            });
+          }
+          if (govResult.reason === "duplicate_cached" && govResult.cached_result !== void 0) {
+            this.auditLog.append("l2", `proxy_governor_cached:${proxyName}`, "system", {
+              server: serverName,
+              tool: toolName,
+              tier,
+              cached: true,
+              latency_ms: Date.now() - start
+            });
+            return toolResult(govResult.cached_result ?? {});
+          }
+        }
+        const result = await this.callWithTimeout(
+          serverName,
+          toolName,
+          filteredArgs,
+          UPSTREAM_CALL_TIMEOUT_MS
+        );
+        const latencyMs = Date.now() - start;
+        if (this.options.governor) {
+          this.options.governor.recordResult(serverName, toolName, filteredArgs, result);
+        }
+        this.auditLog.append("l2", `proxy_call:${proxyName}`, "system", {
+          server: serverName,
+          tool: toolName,
+          tier,
+          decision: "allowed",
+          latency_ms: latencyMs
+        });
+        return this.normalizeResponse(result);
+      } catch (err) {
+        const latencyMs = Date.now() - start;
+        const rawErrorMessage = err instanceof Error ? err.message : "Unknown upstream error";
+        const sanitizeError = (msg) => {
+          let safe = msg.substring(0, 200);
+          safe = safe.replace(/\/[^\s]+/g, "[path-redacted]");
+          safe = safe.replace(/(?:mongodb|postgres|mysql|redis):\/\/[^\s]+/g, "[connection-redacted]");
+          return safe;
+        };
+        const errorMessage = sanitizeError(rawErrorMessage);
+        this.auditLog.append("l2", `proxy_call:${proxyName}`, "system", {
+          server: serverName,
+          tool: toolName,
+          tier,
+          decision: "error",
+          error: errorMessage,
+          latency_ms: latencyMs
+        }, "failure");
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              error: errorMessage,
+              proxy: true,
+              server: serverName,
+              tool: toolName
+            })
+          }]
+        };
+      }
+    };
+  }
+  /**
+   * Call an upstream tool with a timeout.
+   */
+  async callWithTimeout(serverName, toolName, args, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`Upstream tool call timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.clientManager.callTool(serverName, toolName, args).then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      }).catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+  }
+  /**
+   * Normalize an upstream response to the standard Sanctuary response format.
+   */
+  normalizeResponse(result) {
+    const MAX_RESPONSE_SIZE = 1e6;
+    const MAX_TEXT_BLOCK_SIZE = 1e5;
+    const responseStr = JSON.stringify(result);
+    if (responseStr.length > MAX_RESPONSE_SIZE) {
+      return toolResult({
+        error: "upstream_response_too_large",
+        max_bytes: MAX_RESPONSE_SIZE
+      });
+    }
+    if (!result.content || !Array.isArray(result.content)) {
+      return toolResult({ upstream_response: result });
+    }
+    const textContent = result.content.filter((c) => c.type === "text" && typeof c.text === "string").map((c) => {
+      const text = c.text;
+      if (text.length > MAX_TEXT_BLOCK_SIZE) {
+        return {
+          type: "text",
+          text: text.substring(0, MAX_TEXT_BLOCK_SIZE) + "\n[response truncated]"
+        };
+      }
+      return { type: "text", text };
+    });
+    if (textContent.length > 0) {
+      return { content: textContent };
+    }
+    return toolResult({ upstream_response: result.content });
+  }
+};
+function strToBytes(s) {
+  return new TextEncoder().encode(s);
+}
+function bytesToHex(bytes) {
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+function sha256Hex(input) {
+  return bytesToHex(sha256.sha256(strToBytes(input)));
+}
+var DEFAULT_CONFIG = {
+  volume_limit: 200,
+  volume_window_ms: 6e5,
+  // 10 minutes
+  rate_limit: 20,
+  rate_window_ms: 6e4,
+  // 1 minute
+  duplicate_ttl_ms: 6e4,
+  // 1 minute
+  lifetime_limit: 1e3
+};
+var CallGovernor = class {
+  config;
+  /** Sliding window of all call timestamps for volume tracking */
+  volumeWindow = [];
+  /** Per-tool sliding window of call timestamps for rate tracking */
+  rateWindows = /* @__PURE__ */ new Map();
+  /** Duplicate cache: SHA-256(server+tool+args) -> cached result + expiry */
+  duplicateCache = /* @__PURE__ */ new Map();
+  /** Total calls this session */
+  lifetimeCount = 0;
+  /** Hard stop flag — set when lifetime limit is reached */
+  hardStopped = false;
+  constructor(config) {
+    this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+  /**
+   * Check if a call is allowed and apply governance.
+   *
+   * Evaluation order:
+   * 1. Lifetime limit (hard stop — not recoverable without reset)
+   * 2. Volume limit (sliding window)
+   * 3. Rate limit per tool (escalates to Tier 2)
+   * 4. Duplicate detection (returns cached result)
+   */
+  check(serverName, toolName, args) {
+    const now = Date.now();
+    const effectiveConfig = this.getEffectiveConfig(serverName);
+    if (this.hardStopped) {
+      return {
+        allowed: false,
+        reason: "lifetime_exceeded"
+      };
+    }
+    if (this.lifetimeCount >= effectiveConfig.lifetime_limit) {
+      this.hardStopped = true;
+      return {
+        allowed: false,
+        reason: "lifetime_exceeded"
+      };
+    }
+    this.pruneVolumeWindow(now, effectiveConfig.volume_window_ms);
+    if (this.volumeWindow.length >= effectiveConfig.volume_limit) {
+      return {
+        allowed: false,
+        reason: "volume_exceeded"
+      };
+    }
+    const toolKey = `${serverName}::${toolName}`;
+    this.pruneRateWindow(toolKey, now, effectiveConfig.rate_window_ms);
+    const rateWindow = this.rateWindows.get(toolKey);
+    const currentRate = rateWindow ? rateWindow.length : 0;
+    if (currentRate >= effectiveConfig.rate_limit) {
+      return {
+        allowed: false,
+        reason: "rate_exceeded",
+        escalate: true
+      };
+    }
+    const callHash = this.computeCallHash(serverName, toolName, args);
+    this.pruneDuplicateCache(now);
+    const cached = this.duplicateCache.get(callHash);
+    if (cached && cached.expires_at > now) {
+      return {
+        allowed: true,
+        reason: "duplicate_cached",
+        cached_result: cached.result
+      };
+    }
+    this.volumeWindow.push(now);
+    if (!this.rateWindows.has(toolKey)) {
+      this.rateWindows.set(toolKey, []);
+    }
+    this.rateWindows.get(toolKey).push(now);
+    this.lifetimeCount++;
+    return { allowed: true };
+  }
+  /**
+   * Record a successful call result for duplicate caching.
+   */
+  recordResult(serverName, toolName, args, result) {
+    const callHash = this.computeCallHash(serverName, toolName, args);
+    const effectiveConfig = this.getEffectiveConfig(serverName);
+    this.duplicateCache.set(callHash, {
+      result,
+      expires_at: Date.now() + effectiveConfig.duplicate_ttl_ms
+    });
+  }
+  /**
+   * Get current governor status for dashboard display.
+   */
+  getStatus() {
+    const now = Date.now();
+    this.pruneVolumeWindow(now, this.config.volume_window_ms);
+    this.pruneDuplicateCache(now);
+    const rateByTool = {};
+    for (const [toolKey, timestamps] of this.rateWindows.entries()) {
+      const cutoff = now - this.config.rate_window_ms;
+      const activeCount = timestamps.filter((t) => t >= cutoff).length;
+      if (activeCount > 0) {
+        rateByTool[toolKey] = activeCount;
+      }
+    }
+    return {
+      volume_current: this.volumeWindow.length,
+      volume_limit: this.config.volume_limit,
+      lifetime_current: this.lifetimeCount,
+      lifetime_limit: this.config.lifetime_limit,
+      rate_by_tool: rateByTool,
+      duplicate_cache_size: this.duplicateCache.size,
+      hard_stopped: this.hardStopped
+    };
+  }
+  /**
+   * Reset all counters (Tier 1 — requires approval).
+   * Clears volume window, rate windows, duplicate cache,
+   * lifetime counter, and hard stop flag.
+   */
+  reset() {
+    this.volumeWindow = [];
+    this.rateWindows.clear();
+    this.duplicateCache.clear();
+    this.lifetimeCount = 0;
+    this.hardStopped = false;
+  }
+  /**
+   * Get the effective config for a given server, merging per-server overrides.
+   */
+  getEffectiveConfig(serverName) {
+    const override = this.config.per_server_overrides?.[serverName];
+    if (!override) return this.config;
+    return { ...this.config, ...override };
+  }
+  /**
+   * Compute a SHA-256 hash of server + tool + canonical args.
+   * Used for duplicate detection.
+   */
+  computeCallHash(serverName, toolName, args) {
+    const stableArgs = this.stableStringify(args);
+    const input = `${serverName}\0${toolName}\0${stableArgs}`;
+    return sha256Hex(input);
+  }
+  /**
+   * Deterministic JSON serialization with sorted keys.
+   */
+  stableStringify(obj) {
+    if (obj === null || obj === void 0) return "null";
+    if (typeof obj !== "object") return JSON.stringify(obj);
+    if (Array.isArray(obj)) {
+      return "[" + obj.map((item) => this.stableStringify(item)).join(",") + "]";
+    }
+    const sortedKeys = Object.keys(obj).sort();
+    const pairs = sortedKeys.map(
+      (key) => JSON.stringify(key) + ":" + this.stableStringify(obj[key])
+    );
+    return "{" + pairs.join(",") + "}";
+  }
+  /**
+   * Prune volume window entries older than the window size.
+   * Uses shift() from the front — timestamps are appended in order.
+   */
+  pruneVolumeWindow(now, windowMs) {
+    const cutoff = now - windowMs;
+    while (this.volumeWindow.length > 0 && this.volumeWindow[0] < cutoff) {
+      this.volumeWindow.shift();
+    }
+  }
+  /**
+   * Prune a per-tool rate window.
+   */
+  pruneRateWindow(toolKey, now, windowMs) {
+    const window = this.rateWindows.get(toolKey);
+    if (!window) return;
+    const cutoff = now - windowMs;
+    while (window.length > 0 && window[0] < cutoff) {
+      window.shift();
+    }
+    if (window.length === 0) {
+      this.rateWindows.delete(toolKey);
+    }
+  }
+  /**
+   * Prune expired entries from the duplicate cache.
+   * Amortized O(1) — only prunes when cache exceeds a size threshold.
+   */
+  pruneDuplicateCache(now) {
+    if (this.duplicateCache.size < 100) return;
+    for (const [key, entry] of this.duplicateCache) {
+      if (entry.expires_at <= now) {
+        this.duplicateCache.delete(key);
+      }
+    }
+  }
+};
+
+// src/l2-operational/governor-tools.ts
+init_router();
+function createGovernorTools(governor, auditLog) {
+  const tools = [
+    // ── Governor Status ─────────────────────────────────────────────
+    {
+      name: "sanctuary/governor_status",
+      description: "View the current Call Governor status including volume counters, per-tool rate counts, duplicate cache size, and lifetime counter. Use this to monitor tool call consumption, detect potential loops, and check how close you are to governance limits. The governor protects against runaway tool calls by enforcing volume limits, rate limits, duplicate detection, and a session lifetime cap.",
+      inputSchema: {
+        type: "object",
+        properties: {}
+      },
+      handler: async () => {
+        const status = governor.getStatus();
+        auditLog.append("l2", "governor_status", "system", {
+          volume_current: status.volume_current,
+          volume_limit: status.volume_limit,
+          lifetime_current: status.lifetime_current,
+          lifetime_limit: status.lifetime_limit,
+          duplicate_cache_size: status.duplicate_cache_size,
+          hard_stopped: status.hard_stopped
+        });
+        const volumePercent = status.volume_limit > 0 ? Math.round(status.volume_current / status.volume_limit * 100) : 0;
+        const lifetimePercent = status.lifetime_limit > 0 ? Math.round(status.lifetime_current / status.lifetime_limit * 100) : 0;
+        const toolRateEntries = Object.entries(status.rate_by_tool);
+        const highRateTools = toolRateEntries.filter(([, count]) => count > 10).map(([tool, count]) => `${tool} (${count} calls/min)`);
+        return toolResult({
+          governor_status: status,
+          summary: {
+            volume_usage: `${status.volume_current}/${status.volume_limit} (${volumePercent}%)`,
+            lifetime_usage: `${status.lifetime_current}/${status.lifetime_limit} (${lifetimePercent}%)`,
+            active_tools: toolRateEntries.length,
+            cached_duplicates: status.duplicate_cache_size
+          },
+          warnings: [
+            ...status.hard_stopped ? ["HARD STOP: Lifetime limit reached. Use sanctuary/governor_reset to continue."] : [],
+            ...volumePercent > 80 ? [`Volume usage at ${volumePercent}% \u2014 approaching limit.`] : [],
+            ...lifetimePercent > 80 ? [`Lifetime usage at ${lifetimePercent}% \u2014 approaching hard stop.`] : [],
+            ...highRateTools.length > 0 ? [`High-rate tools detected: ${highRateTools.join(", ")}`] : []
+          ],
+          guidance: status.hard_stopped ? "The governor has stopped all proxied tool calls because the session lifetime limit was reached. Use sanctuary/governor_reset (requires human approval) to reset counters and resume." : "The governor is monitoring all proxied tool calls. Counters reset automatically on server restart."
+        });
+      }
+    },
+    // ── Governor Reset ──────────────────────────────────────────────
+    {
+      name: "sanctuary/governor_reset",
+      description: "Reset all Call Governor counters: volume window, per-tool rate windows, duplicate cache, and lifetime counter. This clears the hard stop if the lifetime limit was reached. This is a Tier 1 operation \u2014 requires human approval because it removes all runtime governance state and could allow previously blocked behavior to resume.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          confirm: {
+            type: "boolean",
+            description: "Must be true to confirm the reset. This clears all governor state including the lifetime counter."
+          }
+        },
+        required: ["confirm"]
+      },
+      handler: async (args) => {
+        const confirm = args.confirm;
+        if (!confirm) {
+          return toolResult({
+            error: "confirmation_required",
+            message: "Set confirm: true to reset all governor counters. This will clear volume limits, rate tracking, duplicate cache, and the lifetime counter."
+          });
+        }
+        const preResetStatus = governor.getStatus();
+        governor.reset();
+        const postResetStatus = governor.getStatus();
+        auditLog.append("l2", "governor_reset", "system", {
+          pre_reset: {
+            volume_current: preResetStatus.volume_current,
+            lifetime_current: preResetStatus.lifetime_current,
+            duplicate_cache_size: preResetStatus.duplicate_cache_size,
+            hard_stopped: preResetStatus.hard_stopped
+          },
+          post_reset: {
+            volume_current: postResetStatus.volume_current,
+            lifetime_current: postResetStatus.lifetime_current,
+            duplicate_cache_size: postResetStatus.duplicate_cache_size,
+            hard_stopped: postResetStatus.hard_stopped
+          }
+        });
+        return toolResult({
+          reset: true,
+          previous_state: {
+            lifetime_calls: preResetStatus.lifetime_current,
+            was_hard_stopped: preResetStatus.hard_stopped,
+            volume_at_reset: preResetStatus.volume_current,
+            cached_duplicates_cleared: preResetStatus.duplicate_cache_size
+          },
+          current_state: postResetStatus,
+          message: "All governor counters have been reset. " + (preResetStatus.hard_stopped ? "Hard stop has been cleared \u2014 proxied tool calls will resume." : "Volume, rate, duplicate, and lifetime counters are now at zero.")
+        });
+      }
+    }
+  ];
+  return { tools };
+}
+
+// src/index.ts
 init_key_derivation();
 init_random();
 init_encoding();
 init_config();
 init_audit_log();
+init_sovereignty_profile();
+init_system_prompt_generator();
 init_filesystem();
 init_baseline();
 init_loader();
@@ -13342,6 +16463,9 @@ async function createSanctuaryServer(options) {
   const { tools: auditTools } = createAuditTools(config);
   const { tools: contextGateTools, enforcer: contextGateEnforcer } = createContextGateTools(storage, masterKey, auditLog);
   const hardeningTools = createL2HardeningTools(config.storage_path, auditLog);
+  const profileStore = new SovereigntyProfileStore(storage, masterKey);
+  await profileStore.load();
+  const { tools: profileTools } = createSovereigntyProfileTools(profileStore, auditLog);
   const policy = await loadPrincipalPolicy(config.storage_path);
   const baseline = new BaselineTracker(storage, masterKey);
   await baseline.load();
@@ -13369,7 +16493,8 @@ async function createSanctuaryServer(options) {
       identityManager,
       handshakeResults,
       shrOpts: { config, identityManager, masterKey },
-      sanctuaryConfig: config
+      sanctuaryConfig: config,
+      profileStore
     });
     await dashboard.start();
     approvalChannel = dashboard;
@@ -13446,21 +16571,93 @@ async function createSanctuaryServer(options) {
     ...auditTools,
     ...contextGateTools,
     ...hardeningTools,
+    ...profileTools,
     ...dashboardTools,
     manifestTool
   ];
+  let clientManager;
+  let proxyRouter;
+  const governor = new CallGovernor();
+  const { tools: governorTools } = createGovernorTools(governor, auditLog);
+  allTools.push(...governorTools);
+  const profile = profileStore.get();
+  if (profile.upstream_servers && profile.upstream_servers.length > 0) {
+    const enabledServers = profile.upstream_servers.filter((s) => s.enabled);
+    if (enabledServers.length > 0) {
+      clientManager = new ClientManager({
+        onStateChange: (serverName, state, toolCount, error) => {
+          if (dashboard) {
+            dashboard.broadcastSSE("proxy-server-status", {
+              server: serverName,
+              state,
+              tool_count: toolCount,
+              error,
+              timestamp: (/* @__PURE__ */ new Date()).toISOString()
+            });
+          }
+          auditLog.append("l2", `proxy_server_${state}`, "system", {
+            server: serverName,
+            tool_count: toolCount,
+            error
+          });
+        }
+      });
+      proxyRouter = new ProxyRouter(
+        clientManager,
+        injectionDetector,
+        auditLog,
+        {
+          contextGateFilter: async (_toolName, args) => {
+            const activeProfile = profileStore.get();
+            if (activeProfile.features.context_gating.enabled) {
+              return args;
+            }
+            return args;
+          },
+          governor
+        }
+      );
+      clientManager.configure(enabledServers).catch((err) => {
+        console.error(`[Sanctuary] Failed to configure upstream servers: ${err instanceof Error ? err.message : "unknown error"}`);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 2e3));
+      const proxiedTools = proxyRouter.getProxiedTools();
+      if (proxiedTools.length > 0) {
+        allTools.push(...proxiedTools);
+      }
+      if (dashboard) {
+        dashboard.setDependencies({
+          policy,
+          baseline,
+          auditLog,
+          clientManager
+        });
+      }
+    }
+  }
   allTools = allTools.map((tool) => ({
     ...tool,
     handler: contextGateEnforcer.wrapHandler(tool.name, tool.handler)
   }));
+  if (proxyRouter) {
+    gate.setProxyTierResolver((toolName) => {
+      const parsed = ProxyRouter.parseProxyToolName(toolName);
+      if (!parsed) return null;
+      return proxyRouter.getTierForTool(parsed.serverName, parsed.toolName);
+    });
+  }
   const server = createServer(allTools, { gate });
   await saveConfig(config);
-  const saveBaseline = () => {
+  const cleanup = () => {
     baseline.save().catch(() => {
     });
+    if (clientManager) {
+      clientManager.shutdown().catch(() => {
+      });
+    }
   };
-  process.on("SIGINT", saveBaseline);
-  process.on("SIGTERM", saveBaseline);
+  process.on("SIGINT", cleanup);
+  process.on("SIGTERM", cleanup);
   if (recoveryKey) {
     console.error(
       `\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557

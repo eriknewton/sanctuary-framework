@@ -127,7 +127,7 @@ export function createSovereigntyProfileTools(
           };
         }
         if (args.approval_gate !== undefined) {
-          updates.approval_gate = args.approval_gate as { enabled?: boolean };
+          updates.approval_gate = args.approval_gate as { enabled?: true };
         }
         if (args.zk_proofs !== undefined) {
           updates.zk_proofs = args.zk_proofs as { enabled?: boolean };
