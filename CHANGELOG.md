@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-04-04 — Security remediation pass
+
+### Security
+
+- **DELTA-01 — domain separation in `sanctuary_sign_challenge`.** Tool now
+  requires a `purpose` argument and signs
+  `"sanctuary-sign-challenge-v1" || 0x00 || purpose || 0x00 || nonce`
+  instead of raw nonce bytes. Raw-nonce signatures no longer verify;
+  cross-purpose signatures do not verify. Prevents signature replay
+  across verifiers.
+- **DELTA-05 — handshake auto-publish now signs its payload.** The
+  outbound Verascore envelope carries body.signature (Ed25519 over
+  JSON.stringify(data)) plus body.publicKey so /api/publish can
+  verify it end-to-end.
+- **DELTA-04 — handshake auto-publish defaults to false.** When
+  enabled, the published envelope strips counterparty-identifying
+  fields (counterparty_signed_by → "redacted") until explicit consent
+  is wired through.
+- **DELTA-08 — `sanctuary_link_to_human` redacts target email.** Tool
+  response now returns only `***@domain`; a compromised agent cannot
+  read back which address it emailed.
+- **DELTA-17 — principal-policy tier alignment test.** New test
+  asserts that sanctuary_bootstrap/export_identity_bundle are Tier 1,
+  link_to_human/sign_challenge are Tier 2 (anomaly-gated), and
+  policy_status is Tier 3 — guards against future drift.
+
 ## [0.6.0] - 2026-04-04
 
 ### Added
