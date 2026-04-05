@@ -212,13 +212,16 @@ describe("sanctuary meta-tools", () => {
   });
 
   describe("sanctuary_link_to_human", () => {
-    it("POSTs to /api/auth/request and returns ok", async () => {
+    it("POSTs to /api/auth/request and returns ok with redacted email", async () => {
       const { allTools } = setup();
       const result = await callTool(allTools, "sanctuary/sanctuary_link_to_human", {
         email: "human@example.com",
       });
       expect(result.ok).toBe(true);
       expect((result.message as string)).toContain("email");
+      // DELTA-08: email is redacted in the response
+      expect(result.email_redacted).toBe("***@example.com");
+      expect(JSON.stringify(result)).not.toContain("human@example.com");
       expect(fetchSpy).toHaveBeenCalled();
       const call = fetchSpy.mock.calls[0]!;
       expect((call[0] as string)).toContain("/api/auth/request");

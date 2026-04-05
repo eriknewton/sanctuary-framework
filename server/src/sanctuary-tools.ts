@@ -421,13 +421,15 @@ export function createSanctuaryTools(
             email_domain: email.split("@")[1] ?? null,
           });
 
+          // DELTA-08: redact target email from tool response so a
+          // compromised agent cannot read back the email it sent to.
           return toolResult({
             ok: response.ok,
             message:
               "Check your email for a login link. After logging in, visit " +
               "verascore.ai to claim this agent's DID.",
+            email_redacted: `***@${email.split("@")[1] ?? "***"}`,
             verascore_status: response.status,
-            verascore_response: result,
           });
         } catch (err) {
           return toolResult({
