@@ -1,0 +1,47 @@
+{
+  "name": "@sanctuary-framework/quickstart",
+  "version": "0.1.0",
+  "description": "Zero-friction agent onboarding for Sanctuary Framework. Generate an Ed25519 identity and publish a sovereign agent profile to Verascore in under 60 seconds.",
+  "type": "module",
+  "bin": {
+    "sanctuary-quickstart": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "prepublishOnly": "npm run build",
+    "test": "node --test dist/*.test.js || echo 'no tests'",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "sanctuary",
+    "sovereignty",
+    "agent",
+    "ed25519",
+    "did",
+    "verascore",
+    "mcp"
+  ],
+  "author": "Erik Newton",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eriknewton/sanctuary-framework.git",
+    "directory": "quickstart"
+  },
+  "homepage": "https://github.com/eriknewton/sanctuary-framework#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

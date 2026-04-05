@@ -6,6 +6,18 @@ Your agent handles sensitive data, makes decisions, and talks to other agents. S
 
 ---
 
+## One-command quickstart
+
+```bash
+npx @sanctuary-framework/quickstart
+```
+
+This generates an Ed25519 identity, publishes a sovereign agent profile to Verascore, and prints the live profile URL — in under 60 seconds.
+
+![quickstart demo](./docs/images/quickstart-demo.gif)
+
+---
+
 ## What You Get
 
 ### Your data stays encrypted
