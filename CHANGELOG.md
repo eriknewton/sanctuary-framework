@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-04
+
+### Added
+
+- **Quickstart package** (`@sanctuary-framework/quickstart@0.1.0`) — zero-dep
+  `npx` CLI that generates an Ed25519 identity, writes `~/.sanctuary/quickstart-identity.json`
+  (0600), and publishes a self-attested SHR to Verascore in under 60 seconds.
+  E2E tested against a local node:http mock.
+- **5 new MCP tools** (brings total to 72+):
+  - `sanctuary/bootstrap` — one-shot setup (identity + bundle + quickstart JSON)
+  - `sanctuary/policy_status` — report current Principal Policy state
+  - `sanctuary/export_identity_bundle` — portable identity export
+  - `sanctuary/link_to_human` — bind an agent identity to a human principal
+  - `sanctuary/sign_challenge` — sign a Verascore claim nonce with the agent key
+- **Post-handshake auto-publish hook** — `handshake_respond` POSTs a handshake
+  attestation envelope to Verascore `/api/publish` after a successful response.
+  Gated by `config.verascore.auto_publish_handshakes` (default true). HTTPS-only.
+  Failures are audit-logged but non-blocking.
+- **Docs** — `server/docs/OWASP.md` (OWASP LLM Top-10 mapping) and
+  `server/docs/DID.md` (did:key method and identity bundle format).
+- Integration test `server/test/integration/auto-publish-handshake.test.ts`
+  exercising auto-publish against a real local HTTP mock.
+
+### Changed
+
+- Server version bumped to `0.6.0`.
+
 ## [0.4.2] - 2026-04-01
 
 ### Fixed
