@@ -444,10 +444,14 @@ export function createSanctuaryTools(
     {
       name: "sanctuary/sanctuary_sign_challenge",
       description:
-        "Sign an arbitrary nonce / challenge string with the agent's Ed25519 " +
-        "key. Intended for the human-initiated DID claim flow: the human " +
-        "fetches a nonce from Verascore, asks the agent to sign it, then " +
-        "submits the signature back to Verascore to prove control of the DID.",
+        "Sign a domain-separated nonce with the agent's Ed25519 key. " +
+        "Used in DID-ownership proof flows. The signed message is constructed as: " +
+        "'sanctuary-sign-challenge-v1\\x00' + purpose + '\\x00' + nonce. " +
+        "The verifier MUST reconstruct the same domain-prefixed message before " +
+        "calling Ed25519 verify — a raw-nonce signature is NOT valid for this tool. " +
+        "The `purpose` field binds the signature to a specific use case (e.g. " +
+        "'verascore-claim') so a signature produced for one purpose cannot be " +
+        "replayed against a different verifier.",
       inputSchema: {
         type: "object",
         properties: {
@@ -455,20 +459,41 @@ export function createSanctuaryTools(
             type: "string",
             description: "The nonce / challenge string to sign.",
           },
+          purpose: {
+            type: "string",
+            description:
+              "Domain-separation tag identifying what the signature will be used for " +
+              "(e.g. 'verascore-claim'). Required. Max 128 chars, printable ASCII only.",
+          },
           identity_id: {
             type: "string",
             description: "Identity to sign with (defaults to primary).",
           },
         },
-        required: ["nonce"],
+        required: ["nonce", "purpose"],
       },
       handler: async (args) => {
         const nonce = args.nonce as string;
+        const purpose = args.purpose as string;
         if (!nonce || nonce.length === 0) {
           return toolResult({ error: "nonce must be a non-empty string." });
         }
         if (nonce.length > 4096) {
           return toolResult({ error: "nonce exceeds maximum length (4096)." });
+        }
+        if (typeof purpose !== "string" || purpose.length === 0) {
+          return toolResult({
+            error: "purpose is required (domain-separation tag, e.g. 'verascore-claim').",
+          });
+        }
+        if (purpose.length > 128) {
+          return toolResult({ error: "purpose exceeds maximum length (128)." });
+        }
+        // Printable ASCII only; no NUL bytes (NUL is our separator).
+        if (!/^[\x20-\x7E]+$/.test(purpose)) {
+          return toolResult({
+            error: "purpose must be printable ASCII only (no NUL, no non-ASCII).",
+          });
         }
 
         const identityId = args.identity_id as string | undefined;
@@ -481,11 +506,28 @@ export function createSanctuaryTools(
           });
         }
 
-        const nonceBytes = new TextEncoder().encode(nonce);
+        // Construct the domain-separated message:
+        //   "sanctuary-sign-challenge-v1" || 0x00 || purpose || 0x00 || nonce
+        const domainTag = "sanctuary-sign-challenge-v1";
+        const enc = new TextEncoder();
+        const tagBytes = enc.encode(domainTag);
+        const purposeBytes = enc.encode(purpose);
+        const nonceBytes = enc.encode(nonce);
+        const sep = new Uint8Array([0x00]);
+        const message = new Uint8Array(
+          tagBytes.length + 1 + purposeBytes.length + 1 + nonceBytes.length
+        );
+        let offset = 0;
+        message.set(tagBytes, offset); offset += tagBytes.length;
+        message.set(sep, offset); offset += 1;
+        message.set(purposeBytes, offset); offset += purposeBytes.length;
+        message.set(sep, offset); offset += 1;
+        message.set(nonceBytes, offset);
+
         let sigB64: string;
         try {
           const sig = identitySign(
-            nonceBytes,
+            message,
             identity.encrypted_private_key,
             identityEncKey
           );
@@ -500,6 +542,7 @@ export function createSanctuaryTools(
         auditLog.append("l1", "sanctuary_sign_challenge", identity.identity_id, {
           did: identity.did,
           nonce_len: nonce.length,
+          purpose,
         });
 
         return toolResult({
@@ -507,6 +550,8 @@ export function createSanctuaryTools(
           did: identity.did,
           public_key: identity.public_key,
           signed_by: identity.did,
+          domain_tag: domainTag,
+          purpose,
         });
       },
     },

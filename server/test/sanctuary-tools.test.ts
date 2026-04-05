@@ -246,28 +246,80 @@ describe("sanctuary meta-tools", () => {
   });
 
   describe("sanctuary_sign_challenge", () => {
-    it("signs a nonce and the signature verifies with the identity public key", async () => {
+    function domainMessage(purpose: string, nonce: string): Uint8Array {
+      const enc = new TextEncoder();
+      const tag = enc.encode("sanctuary-sign-challenge-v1");
+      const p = enc.encode(purpose);
+      const n = enc.encode(nonce);
+      const sep = new Uint8Array([0x00]);
+      const out = new Uint8Array(tag.length + 1 + p.length + 1 + n.length);
+      let o = 0;
+      out.set(tag, o); o += tag.length;
+      out.set(sep, o); o += 1;
+      out.set(p, o); o += p.length;
+      out.set(sep, o); o += 1;
+      out.set(n, o);
+      return out;
+    }
+
+    it("signs a domain-separated nonce and verifies against the reconstructed message", async () => {
       const { allTools, identityManager } = setup();
       await callTool(allTools, "sanctuary/identity_create", { label: "sign-test" });
 
       const nonce = "challenge-nonce-xyz-12345";
+      const purpose = "verascore-claim";
       const result = await callTool(allTools, "sanctuary/sanctuary_sign_challenge", {
         nonce,
+        purpose,
       });
 
       expect(result.signature).toBeDefined();
       expect(result.did).toBeDefined();
       expect(result.public_key).toBeDefined();
+      expect(result.domain_tag).toBe("sanctuary-sign-challenge-v1");
+      expect(result.purpose).toBe(purpose);
 
       const sig = fromBase64url(result.signature as string);
       const pub = fromBase64url(result.public_key as string);
-      const payload = new TextEncoder().encode(nonce);
-      const valid = ed25519.verify(sig, payload, pub);
-      expect(valid).toBe(true);
+
+      // Raw-nonce signature must NOT verify (regression guard for pre-DELTA-01 behavior).
+      const rawPayload = new TextEncoder().encode(nonce);
+      expect(ed25519.verify(sig, rawPayload, pub)).toBe(false);
+
+      // Domain-separated message MUST verify.
+      const dsPayload = domainMessage(purpose, nonce);
+      expect(ed25519.verify(sig, dsPayload, pub)).toBe(true);
 
       // Matches the primary identity
       const ids = identityManager.list();
       expect(result.did).toBe(ids[0]!.did);
+    });
+
+    it("signatures for different purposes do not cross-verify", async () => {
+      const { allTools } = setup();
+      await callTool(allTools, "sanctuary/identity_create", { label: "sign-test-2" });
+      const nonce = "same-nonce-diff-purpose";
+      const a = await callTool(allTools, "sanctuary/sanctuary_sign_challenge", {
+        nonce,
+        purpose: "verascore-claim",
+      });
+      const pub = fromBase64url(a.public_key as string);
+      const sigA = fromBase64url(a.signature as string);
+      // A signature produced for purpose='verascore-claim' must NOT verify
+      // against the reconstructed message for purpose='other-service'.
+      const otherMessage = domainMessage("other-service", nonce);
+      expect(ed25519.verify(sigA, otherMessage, pub)).toBe(false);
+    });
+
+    it("rejects missing purpose", async () => {
+      const { allTools } = setup();
+      await callTool(allTools, "sanctuary/identity_create", { label: "t" });
+      const result = await callTool(
+        allTools,
+        "sanctuary/sanctuary_sign_challenge",
+        { nonce: "abc" }
+      );
+      expect(result.error).toBeDefined();
     });
 
     it("rejects empty nonces", async () => {
@@ -276,7 +328,7 @@ describe("sanctuary meta-tools", () => {
       const result = await callTool(
         allTools,
         "sanctuary/sanctuary_sign_challenge",
-        { nonce: "" }
+        { nonce: "", purpose: "verascore-claim" }
       );
       expect(result.error).toBeDefined();
     });
@@ -287,7 +339,18 @@ describe("sanctuary meta-tools", () => {
       const result = await callTool(
         allTools,
         "sanctuary/sanctuary_sign_challenge",
-        { nonce: "x".repeat(5000) }
+        { nonce: "x".repeat(5000), purpose: "verascore-claim" }
+      );
+      expect(result.error).toBeDefined();
+    });
+
+    it("rejects purposes with non-ASCII characters", async () => {
+      const { allTools } = setup();
+      await callTool(allTools, "sanctuary/identity_create", { label: "t" });
+      const result = await callTool(
+        allTools,
+        "sanctuary/sanctuary_sign_challenge",
+        { nonce: "abc", purpose: "ver\u0000score" }
       );
       expect(result.error).toBeDefined();
     });
