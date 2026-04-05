@@ -195,6 +195,19 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ---
 
+## Interop note — agent DIDs
+
+Sanctuary identifies agents with a `did:key`-style DID derived from the
+agent's Ed25519 public key. The encoding uses **base64url** under the
+`z` multibase prefix rather than base58btc, which is a deliberate
+departure from the W3C `did:key` specification. If you need to verify a
+signature against a Sanctuary DID or transcode to strict `did:key`
+form, see [`docs/DID_ENCODING.md`](docs/DID_ENCODING.md) — it includes
+the exact byte layout, JavaScript and Python decoder snippets, and a
+round-trip verification test.
+
+---
+
 ## License
 
 - **Code:** Apache License 2.0

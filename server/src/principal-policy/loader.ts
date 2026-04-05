@@ -44,9 +44,10 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "reputation_export",
     "bootstrap_provide_guarantee",
     "decommission_certificate",
-    "reputation_publish", // SEC-039: Explicit Tier 1 — sends data to external API
     "sovereignty_profile_update", // Changes enforcement behavior — always requires approval
     "governor_reset", // Clears all runtime governance state — always requires approval
+    "sanctuary_bootstrap", // Creates new Ed25519 identity + publishes — always requires approval
+    "sanctuary_export_identity_bundle", // Exports portable identity — always requires approval
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [
@@ -103,6 +104,8 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sovereignty_profile_get",
     "sovereignty_profile_generate_prompt", // Agent needs its own config to generate system prompt
     "governor_status",
+    "reputation_publish", // Auto-allow: publishing sovereignty data to Verascore is routine
+    "sanctuary_policy_status", // Read-only policy summary
   ],
   approval_channel: DEFAULT_CHANNEL,
 };
@@ -260,9 +263,10 @@ tier1_always_approve:
   - reputation_import
   - reputation_export
   - bootstrap_provide_guarantee
-  - reputation_publish
   - sovereignty_profile_update
   - governor_reset
+  - sanctuary_bootstrap
+  - sanctuary_export_identity_bundle
 
 # ─── Tier 2: Behavioral Anomaly Detection ────────────────────────────────
 # Triggers approval when agent behavior deviates from its baseline.
@@ -328,6 +332,10 @@ tier3_always_allow:
   - dashboard_open
   - sovereignty_profile_get
   - governor_status
+  - reputation_publish
+  - sanctuary_policy_status
+  - sanctuary_link_to_human
+  - sanctuary_sign_challenge
 
 # ─── Approval Channel ────────────────────────────────────────────────────
 # How Sanctuary reaches you when approval is needed.

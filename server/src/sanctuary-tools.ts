@@ -1,0 +1,516 @@
+/**
+ * Sanctuary MCP Server — Bootstrap, Policy, Identity, and Human-Link Tools
+ *
+ * A collection of convenience tools that glue together existing Sanctuary
+ * subsystems (identity, SHR, Verascore publishing, principal policy):
+ *
+ *   sanctuary/sanctuary_bootstrap              (Tier 1)
+ *   sanctuary/sanctuary_policy_status          (Tier 3)
+ *   sanctuary/sanctuary_export_identity_bundle (Tier 1)
+ *   sanctuary/sanctuary_link_to_human          (Tier 2, auto-allowed + anomaly-gated)
+ *   sanctuary/sanctuary_sign_challenge         (Tier 2, auto-allowed + anomaly-gated)
+ */
+
+import type { ToolDefinition } from "./router.js";
+import { toolResult } from "./router.js";
+import type { IdentityManager } from "./l1-cognitive/tools.js";
+import type { AuditLog } from "./l2-operational/audit-log.js";
+import type { PrincipalPolicy } from "./principal-policy/types.js";
+import type { SanctuaryConfig } from "./config.js";
+import { sign as identitySign } from "./core/identity.js";
+import { derivePurposeKey } from "./core/key-derivation.js";
+import { toBase64url } from "./core/encoding.js";
+import { createIdentity } from "./core/identity.js";
+import { generateSHR } from "./shr/generator.js";
+
+export interface SanctuaryToolsOptions {
+  config: SanctuaryConfig;
+  identityManager: IdentityManager;
+  masterKey: Uint8Array;
+  auditLog: AuditLog;
+  policy: PrincipalPolicy;
+  keyProtection: "passphrase" | "hardware-key" | "recovery-key";
+}
+
+/**
+ * Validate a Verascore URL (HTTPS-only; must match configured host or a
+ * known verascore.ai subdomain). Prevents SSRF.
+ */
+function validateVerascoreUrl(
+  urlStr: string,
+  configuredUrl: string
+): { ok: true } | { ok: false; error: string } {
+  const allowed = new Set([
+    "verascore.ai",
+    "www.verascore.ai",
+    "api.verascore.ai",
+  ]);
+  try {
+    allowed.add(new URL(configuredUrl).hostname);
+  } catch {
+    // ignore
+  }
+  try {
+    const parsed = new URL(urlStr);
+    if (parsed.protocol !== "https:") {
+      return { ok: false, error: `Verascore URL must use HTTPS. Got: ${parsed.protocol}` };
+    }
+    if (!allowed.has(parsed.hostname)) {
+      return {
+        ok: false,
+        error: `Verascore URL must point to a known Verascore host (${[...allowed].join(", ")}). Got: ${parsed.hostname}`,
+      };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: `Invalid Verascore URL: ${urlStr}` };
+  }
+}
+
+export function createSanctuaryTools(
+  opts: SanctuaryToolsOptions
+): { tools: ToolDefinition[] } {
+  const { config, identityManager, masterKey, auditLog, policy, keyProtection } = opts;
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+
+  const tools: ToolDefinition[] = [
+    // ─── sanctuary_bootstrap ───────────────────────────────────────────
+    {
+      name: "sanctuary/sanctuary_bootstrap",
+      description:
+        "One-shot bootstrap for a new sovereign agent identity. " +
+        "Generates an Ed25519 keypair, stores the encrypted identity, " +
+        "constructs a Sovereignty Health Report (SHR), and publishes it to Verascore. " +
+        "Returns { did, profileUrl, tier } for the newly-minted agent.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          label: {
+            type: "string",
+            description: "Human-readable label for the new identity (default: 'sovereign-agent')",
+          },
+          verascore_url: {
+            type: "string",
+            description: "Verascore base URL. Defaults to server config / SANCTUARY_VERASCORE_URL.",
+          },
+          publish: {
+            type: "boolean",
+            description: "Whether to publish the SHR to Verascore. Defaults to true.",
+          },
+        },
+      },
+      handler: async (args) => {
+        const label = (args.label as string) || "sovereign-agent";
+        const publish = args.publish === undefined ? true : Boolean(args.publish);
+        const verascoreUrl =
+          (args.verascore_url as string) || config.verascore.url || "https://verascore.ai";
+
+        // 1. Generate + persist new identity
+        const { publicIdentity, storedIdentity } = createIdentity(
+          label,
+          identityEncKey,
+          keyProtection
+        );
+        await identityManager.save(storedIdentity);
+
+        auditLog.append("l1", "sanctuary_bootstrap:identity_create", publicIdentity.identity_id, {
+          label,
+          did: publicIdentity.did,
+        });
+
+        // 2. Generate SHR for the new identity
+        const shr = generateSHR(publicIdentity.identity_id, {
+          config,
+          identityManager,
+          masterKey,
+        });
+        if (typeof shr === "string") {
+          return toolResult({
+            error: `Identity created but SHR generation failed: ${shr}`,
+            did: publicIdentity.did,
+            identity_id: publicIdentity.identity_id,
+          });
+        }
+
+        // 3. Optionally publish to Verascore
+        const agentSlug = publicIdentity.did
+          .replace(/[^a-zA-Z0-9-]/g, "-")
+          .toLowerCase();
+        const profileUrl = `${verascoreUrl.replace(/\/$/, "")}/agent/${publicIdentity.did}`;
+
+        if (!publish || !config.verascore.auto_publish_to_verascore) {
+          auditLog.append("l4", "sanctuary_bootstrap", publicIdentity.identity_id, {
+            did: publicIdentity.did,
+            published: false,
+          });
+          return toolResult({
+            did: publicIdentity.did,
+            identity_id: publicIdentity.identity_id,
+            profileUrl,
+            tier: "self-attested",
+            published: false,
+          });
+        }
+
+        // Validate Verascore URL
+        const urlCheck = validateVerascoreUrl(verascoreUrl, config.verascore.url);
+        if (!urlCheck.ok) {
+          return toolResult({
+            error: urlCheck.error,
+            did: publicIdentity.did,
+            identity_id: publicIdentity.identity_id,
+          });
+        }
+
+        // Build + sign payload
+        const publishData = {
+          sovereigntyLayers: shr.body.layers,
+          capabilities: shr.body.capabilities,
+          degradations: shr.body.degradations,
+          did: publicIdentity.did,
+          label,
+        };
+        const payloadBytes = new TextEncoder().encode(JSON.stringify(publishData));
+
+        let signatureB64: string;
+        try {
+          const sigBytes = identitySign(
+            payloadBytes,
+            storedIdentity.encrypted_private_key,
+            identityEncKey
+          );
+          signatureB64 = toBase64url(sigBytes);
+        } catch (err) {
+          return toolResult({
+            error: "Failed to sign bootstrap payload",
+            details: err instanceof Error ? err.message : String(err),
+            did: publicIdentity.did,
+          });
+        }
+
+        const body = {
+          agentId: agentSlug,
+          signature: signatureB64,
+          publicKey: publicIdentity.public_key,
+          type: "shr",
+          data: publishData,
+        };
+
+        try {
+          const response = await fetch(`${verascoreUrl.replace(/\/$/, "")}/api/publish`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const result = (await response.json().catch(() => ({}))) as Record<
+            string,
+            unknown
+          >;
+
+          auditLog.append("l4", "sanctuary_bootstrap", publicIdentity.identity_id, {
+            did: publicIdentity.did,
+            verascore_url: verascoreUrl,
+            status: response.status,
+            published: response.ok,
+          });
+
+          return toolResult({
+            did: publicIdentity.did,
+            identity_id: publicIdentity.identity_id,
+            profileUrl,
+            tier: "self-attested",
+            published: response.ok,
+            verascore_status: response.status,
+            verascore_response: result,
+          });
+        } catch (err) {
+          auditLog.append("l4", "sanctuary_bootstrap", publicIdentity.identity_id, {
+            did: publicIdentity.did,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return toolResult({
+            did: publicIdentity.did,
+            identity_id: publicIdentity.identity_id,
+            profileUrl,
+            tier: "self-attested",
+            published: false,
+            warning: `Identity created but Verascore publish failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          });
+        }
+      },
+    },
+
+    // ─── sanctuary_policy_status ───────────────────────────────────────
+    {
+      name: "sanctuary/sanctuary_policy_status",
+      description:
+        "Return a summary of the active Principal Policy: which operations " +
+        "require approval (Tier 1), which are subject to anomaly detection " +
+        "(Tier 2), and which auto-allow with audit (Tier 3).",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+      handler: async () => {
+        const tier1 = [...policy.tier1_always_approve].sort();
+        const tier3 = [...policy.tier3_always_allow].sort();
+        // Tier 2 is anomaly-gated: any operation not in tier1/tier3 effectively
+        // sits here, but the gate architecture keys Tier 2 off baseline
+        // anomaly detection rather than a named list. We surface the current
+        // anomaly configuration so callers can reason about it.
+        const tier2Config = policy.tier2_anomaly;
+
+        auditLog.append("l2", "sanctuary_policy_status", "system", {
+          tier1_count: tier1.length,
+          tier3_count: tier3.length,
+        });
+
+        return toolResult({
+          tier1,
+          tier2: [] as string[],
+          tier3,
+          tier2_anomaly_config: tier2Config,
+          counts: {
+            tier1: tier1.length,
+            tier2: 0,
+            tier3: tier3.length,
+          },
+          note:
+            "Tier 2 is not a named list in Sanctuary — it is behavioral anomaly " +
+            "detection applied to all operations. See tier2_anomaly_config.",
+        });
+      },
+    },
+
+    // ─── sanctuary_export_identity_bundle ──────────────────────────────
+    {
+      name: "sanctuary/sanctuary_export_identity_bundle",
+      description:
+        "Export a signed, portable identity bundle: { publicKey, did, shr, attestations }. " +
+        "The bundle is signed with the identity's Ed25519 key so a recipient can verify " +
+        "authenticity against the public key. Private keys are never included.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          identity_id: {
+            type: "string",
+            description: "Identity to export (defaults to primary identity).",
+          },
+          attestations: {
+            type: "array",
+            items: { type: "object" },
+            description: "Optional list of attestation objects to include in the bundle.",
+          },
+        },
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id as string | undefined;
+        const identity = identityId
+          ? identityManager.get(identityId)
+          : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first.",
+          });
+        }
+
+        const shr = generateSHR(identity.identity_id, {
+          config,
+          identityManager,
+          masterKey,
+        });
+
+        const attestations = (args.attestations as unknown[] | undefined) ?? [];
+
+        const body = {
+          format: "SANCTUARY_IDENTITY_BUNDLE_V1" as const,
+          publicKey: identity.public_key,
+          did: identity.did,
+          identity_id: identity.identity_id,
+          label: identity.label,
+          key_type: identity.key_type,
+          shr: typeof shr === "string" ? null : shr,
+          attestations,
+          exported_at: new Date().toISOString(),
+        };
+
+        const bodyBytes = new TextEncoder().encode(JSON.stringify(body));
+        let signatureB64: string;
+        try {
+          const sigBytes = identitySign(
+            bodyBytes,
+            identity.encrypted_private_key,
+            identityEncKey
+          );
+          signatureB64 = toBase64url(sigBytes);
+        } catch (err) {
+          return toolResult({
+            error: "Failed to sign identity bundle.",
+            details: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        auditLog.append("l1", "sanctuary_export_identity_bundle", identity.identity_id, {
+          did: identity.did,
+          attestation_count: attestations.length,
+        });
+
+        return toolResult({
+          bundle: body,
+          signature: signatureB64,
+          signed_by: identity.did,
+        });
+      },
+    },
+
+    // ─── sanctuary_link_to_human ───────────────────────────────────────
+    {
+      name: "sanctuary/sanctuary_link_to_human",
+      description:
+        "Trigger a Verascore magic-link login flow so a human principal can " +
+        "authenticate and subsequently claim this agent's DID. The email is " +
+        "sent by Verascore to the supplied address. This tool only initiates " +
+        "the flow — it does not directly bind the DID.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          email: {
+            type: "string",
+            description: "Email address of the human to link this agent to.",
+          },
+          verascore_url: {
+            type: "string",
+            description: "Verascore base URL. Defaults to server config.",
+          },
+        },
+        required: ["email"],
+      },
+      handler: async (args) => {
+        const email = args.email as string;
+        const verascoreUrl =
+          (args.verascore_url as string) || config.verascore.url || "https://verascore.ai";
+
+        const urlCheck = validateVerascoreUrl(verascoreUrl, config.verascore.url);
+        if (!urlCheck.ok) {
+          return toolResult({ ok: false, error: urlCheck.error });
+        }
+
+        // Basic email shape validation (defense-in-depth — Verascore validates too)
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+          return toolResult({ ok: false, error: "Invalid email format." });
+        }
+
+        try {
+          const response = await fetch(`${verascoreUrl.replace(/\/$/, "")}/api/auth/request`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email }),
+          });
+
+          const result = (await response.json().catch(() => ({}))) as Record<
+            string,
+            unknown
+          >;
+
+          auditLog.append("l4", "sanctuary_link_to_human", "system", {
+            verascore_url: verascoreUrl,
+            status: response.status,
+            // Do not log the email to the audit trail — keep it local.
+            email_domain: email.split("@")[1] ?? null,
+          });
+
+          return toolResult({
+            ok: response.ok,
+            message:
+              "Check your email for a login link. After logging in, visit " +
+              "verascore.ai to claim this agent's DID.",
+            verascore_status: response.status,
+            verascore_response: result,
+          });
+        } catch (err) {
+          return toolResult({
+            ok: false,
+            error: `Failed to reach Verascore at ${verascoreUrl}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          });
+        }
+      },
+    },
+
+    // ─── sanctuary_sign_challenge ──────────────────────────────────────
+    {
+      name: "sanctuary/sanctuary_sign_challenge",
+      description:
+        "Sign an arbitrary nonce / challenge string with the agent's Ed25519 " +
+        "key. Intended for the human-initiated DID claim flow: the human " +
+        "fetches a nonce from Verascore, asks the agent to sign it, then " +
+        "submits the signature back to Verascore to prove control of the DID.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          nonce: {
+            type: "string",
+            description: "The nonce / challenge string to sign.",
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to sign with (defaults to primary).",
+          },
+        },
+        required: ["nonce"],
+      },
+      handler: async (args) => {
+        const nonce = args.nonce as string;
+        if (!nonce || nonce.length === 0) {
+          return toolResult({ error: "nonce must be a non-empty string." });
+        }
+        if (nonce.length > 4096) {
+          return toolResult({ error: "nonce exceeds maximum length (4096)." });
+        }
+
+        const identityId = args.identity_id as string | undefined;
+        const identity = identityId
+          ? identityManager.get(identityId)
+          : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first.",
+          });
+        }
+
+        const nonceBytes = new TextEncoder().encode(nonce);
+        let sigB64: string;
+        try {
+          const sig = identitySign(
+            nonceBytes,
+            identity.encrypted_private_key,
+            identityEncKey
+          );
+          sigB64 = toBase64url(sig);
+        } catch (err) {
+          return toolResult({
+            error: "Failed to sign nonce.",
+            details: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        auditLog.append("l1", "sanctuary_sign_challenge", identity.identity_id, {
+          did: identity.did,
+          nonce_len: nonce.length,
+        });
+
+        return toolResult({
+          signature: sigB64,
+          did: identity.did,
+          public_key: identity.public_key,
+          signed_by: identity.did,
+        });
+      },
+    },
+  ];
+
+  return { tools };
+}

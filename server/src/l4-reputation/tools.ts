@@ -28,7 +28,8 @@ export function createL4Tools(
   masterKey: Uint8Array,
   identityManager: IdentityManager,
   auditLog: AuditLog,
-  handshakeResults?: Map<string, HandshakeResult>
+  handshakeResults?: Map<string, HandshakeResult>,
+  verascoreUrl?: string
 ): { tools: ToolDefinition[]; reputationStore: ReputationStore } {
   const reputationStore = new ReputationStore(storage, masterKey);
   const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
@@ -619,11 +620,23 @@ export function createL4Tools(
         }
 
         const publishType = args.type as string;
-        const veracoreUrl = (args.verascore_url as string) || "https://verascore.ai";
+        const configuredVerascoreUrl = verascoreUrl || "https://verascore.ai";
+        const veracoreUrl = (args.verascore_url as string) || configuredVerascoreUrl;
 
         // SEC-037: Validate verascore_url to prevent SSRF.
-        // Only allow HTTPS URLs to known Verascore domains.
-        const ALLOWED_VERASCORE_HOSTS = ["verascore.ai", "www.verascore.ai", "api.verascore.ai"];
+        // Only allow HTTPS URLs to known Verascore domains OR the configured host.
+        const ALLOWED_VERASCORE_HOSTS = new Set([
+          "verascore.ai",
+          "www.verascore.ai",
+          "api.verascore.ai",
+        ]);
+        // Also allow the host from the server-configured URL (supports staging/dev).
+        try {
+          const configuredHost = new URL(configuredVerascoreUrl).hostname;
+          ALLOWED_VERASCORE_HOSTS.add(configuredHost);
+        } catch {
+          // Ignore: configuredVerascoreUrl may be malformed; defaults still apply.
+        }
         try {
           const parsed = new URL(veracoreUrl);
           if (parsed.protocol !== "https:") {
@@ -631,9 +644,9 @@ export function createL4Tools(
               error: `verascore_url must use HTTPS. Got: ${parsed.protocol}`,
             });
           }
-          if (!ALLOWED_VERASCORE_HOSTS.includes(parsed.hostname)) {
+          if (!ALLOWED_VERASCORE_HOSTS.has(parsed.hostname)) {
             return toolResult({
-              error: `verascore_url must point to a known Verascore domain (${ALLOWED_VERASCORE_HOSTS.join(", ")}). Got: ${parsed.hostname}`,
+              error: `verascore_url must point to a known Verascore domain (${[...ALLOWED_VERASCORE_HOSTS].join(", ")}). Got: ${parsed.hostname}`,
             });
           }
         } catch {

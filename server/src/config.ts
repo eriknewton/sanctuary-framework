@@ -79,6 +79,16 @@ export interface SanctuaryConfig {
     /** Host for callback listener */
     callback_host: string;
   };
+
+  /** Verascore integration (agent reputation surface) */
+  verascore: {
+    /** Base URL of the Verascore deployment. */
+    url: string;
+    /** Whether to auto-publish handshake attestations to Verascore. */
+    auto_publish_to_verascore: boolean;
+    /** Whether to auto-publish on successful handshake_respond calls. */
+    auto_publish_handshakes: boolean;
+  };
 }
 
 /** Default configuration */
@@ -125,6 +135,11 @@ export function defaultConfig(): SanctuaryConfig {
       secret: "",
       callback_port: 3502,
       callback_host: "127.0.0.1",
+    },
+    verascore: {
+      url: "https://verascore.ai",
+      auto_publish_to_verascore: true,
+      auto_publish_handshakes: true,
     },
   };
 }
@@ -210,6 +225,21 @@ export async function loadConfig(
   }
   if (process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST) {
     config.webhook.callback_host = process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST;
+  }
+  if (process.env.SANCTUARY_VERASCORE_URL) {
+    config.verascore.url = process.env.SANCTUARY_VERASCORE_URL;
+  }
+  if (process.env.SANCTUARY_AUTO_PUBLISH_TO_VERASCORE === "true") {
+    config.verascore.auto_publish_to_verascore = true;
+  }
+  if (process.env.SANCTUARY_AUTO_PUBLISH_TO_VERASCORE === "false") {
+    config.verascore.auto_publish_to_verascore = false;
+  }
+  if (process.env.SANCTUARY_AUTO_PUBLISH_HANDSHAKES === "true") {
+    config.verascore.auto_publish_handshakes = true;
+  }
+  if (process.env.SANCTUARY_AUTO_PUBLISH_HANDSHAKES === "false") {
+    config.verascore.auto_publish_handshakes = false;
   }
 
   // Phase 3: Always stamp the running version from package.json (Bug 2 fix —

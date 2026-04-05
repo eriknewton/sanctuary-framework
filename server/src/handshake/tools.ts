@@ -36,12 +36,22 @@ import type {
   HandshakeSession,
 } from "./types.js";
 
+export interface HandshakeToolsOptions {
+  /** If true, auto-publishes handshake attestations to Verascore after handshake_respond. */
+  autoPublishHandshakes?: boolean;
+  /** Verascore base URL to publish to. */
+  verascoreUrl?: string;
+}
+
 export function createHandshakeTools(
   config: SanctuaryConfig,
   identityManager: IdentityManager,
   masterKey: Uint8Array,
-  auditLog: AuditLog
+  auditLog: AuditLog,
+  options?: HandshakeToolsOptions
 ): { tools: ToolDefinition[]; handshakeResults: Map<string, HandshakeResult> } {
+  const autoPublishHandshakes = options?.autoPublishHandshakes ?? true;
+  const verascoreUrl = options?.verascoreUrl ?? "https://verascore.ai";
   // In-memory session store (per server instance lifetime)
   const sessions = new Map<string, HandshakeSession>();
   // Completed handshake results indexed by counterparty ID — shared with L4 tier resolution
@@ -138,12 +148,77 @@ export function createHandshakeTools(
 
         auditLog.append("l4", "handshake_respond", shr.body.instance_id);
 
+        // Auto-publish handshake attestation to Verascore (configurable).
+        // This is a best-effort, non-blocking surface: failures are audit-logged
+        // but do not break the handshake response.
+        let autoPublishResult:
+          | { attempted: boolean; ok?: boolean; status?: number; error?: string }
+          | undefined;
+        if (autoPublishHandshakes) {
+          autoPublishResult = { attempted: true };
+          try {
+            // Only publish against https verascore hosts.
+            const parsed = new URL(verascoreUrl);
+            if (parsed.protocol !== "https:") {
+              autoPublishResult.error = `verascore URL must use HTTPS (got ${parsed.protocol})`;
+            } else {
+              const initiatorId =
+                (challenge as { initiator_nonce?: string; shr?: { signed_by?: string } })
+                  ?.shr?.signed_by ?? "unknown";
+              const attestationPayload = {
+                type: "handshake" as const,
+                our_shr_signed_by: shr.signed_by,
+                counterparty_signed_by: initiatorId,
+                session_id: result.session.session_id,
+                responded_at: new Date().toISOString(),
+              };
+              const resp = await fetch(
+                `${verascoreUrl.replace(/\/$/, "")}/api/publish`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    agentId: shr.body.instance_id,
+                    publicKey: shr.signed_by,
+                    type: "handshake",
+                    data: attestationPayload,
+                  }),
+                }
+              );
+              autoPublishResult.ok = resp.ok;
+              autoPublishResult.status = resp.status;
+              auditLog.append(
+                "l4",
+                "handshake_auto_publish",
+                shr.body.instance_id,
+                {
+                  verascore_url: verascoreUrl,
+                  status: resp.status,
+                  ok: resp.ok,
+                },
+                resp.ok ? "success" : "failure"
+              );
+            }
+          } catch (err) {
+            autoPublishResult.error =
+              err instanceof Error ? err.message : String(err);
+            auditLog.append(
+              "l4",
+              "handshake_auto_publish",
+              shr.body.instance_id,
+              { verascore_url: verascoreUrl, error: autoPublishResult.error },
+              "failure"
+            );
+          }
+        }
+
         return toolResult({
           session_id: result.session.session_id,
           response: result.response,
           instructions:
             "Send the 'response' object back to the initiator. " +
             "When you receive their completion, pass it to sanctuary/handshake_status with this session_id.",
+          auto_publish: autoPublishResult,
           // SEC-ADD-03: Tag response — contains SHR data that will be sent to counterparty
           _content_trust: "external",
         });

@@ -37,6 +37,7 @@ import { ClientManager } from "./proxy/client-manager.js";
 import { ProxyRouter } from "./proxy/proxy-router.js";
 import { CallGovernor } from "./l2-operational/call-governor.js";
 import { createGovernorTools } from "./l2-operational/governor-tools.js";
+import { createSanctuaryTools } from "./sanctuary-tools.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
@@ -479,7 +480,11 @@ export async function createSanctuaryServer(options?: {
     config,
     identityManager,
     masterKey,
-    auditLog
+    auditLog,
+    {
+      autoPublishHandshakes: config.verascore.auto_publish_handshakes,
+      verascoreUrl: config.verascore.url,
+    }
   );
 
   // 14. Create L4 tools (reputation with sovereignty-gated tiers)
@@ -488,7 +493,8 @@ export async function createSanctuaryServer(options?: {
     masterKey,
     identityManager,
     auditLog,
-    handshakeResults
+    handshakeResults,
+    config.verascore.url
   );
 
   // 14b. Create Federation tools (MCP-to-MCP)
@@ -603,6 +609,16 @@ export async function createSanctuaryServer(options?: {
   // 16. Create Principal Policy tools (read-only)
   const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
 
+  // 16a. Create Sanctuary bootstrap + identity + policy-status tools
+  const { tools: sanctuaryMetaTools } = createSanctuaryTools({
+    config,
+    identityManager,
+    masterKey,
+    auditLog,
+    policy,
+    keyProtection,
+  });
+
   // 16b. Dashboard open tool — generates a pre-authenticated URL
   const dashboardTools: ToolDefinition[] = [];
   if (dashboard) {
@@ -649,6 +665,7 @@ export async function createSanctuaryServer(options?: {
     ...hardeningTools,
     ...profileTools,
     ...dashboardTools,
+    ...sanctuaryMetaTools,
     manifestTool,
   ];
 

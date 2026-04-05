@@ -14,13 +14,16 @@ import { describe, it, expect } from "vitest";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 
 describe("SEC-036/037/039: reputation_publish security", () => {
-  // SEC-039: Tier classification
-  it("reputation_publish is explicitly classified as Tier 1", () => {
-    expect(DEFAULT_POLICY.tier1_always_approve).toContain("reputation_publish");
+  // Phase D: reputation_publish was moved to Tier 3 (auto-allow with audit).
+  // Publishing SHR data to Verascore is a routine, low-sensitivity surface —
+  // the SSRF allowlist + Ed25519 signature + identity-owned keys provide
+  // the security properties without requiring human approval each call.
+  it("reputation_publish is classified as Tier 3 (auto-allow with audit)", () => {
+    expect(DEFAULT_POLICY.tier3_always_allow).toContain("reputation_publish");
   });
 
-  it("reputation_publish is NOT in Tier 3", () => {
-    expect(DEFAULT_POLICY.tier3_always_allow).not.toContain("reputation_publish");
+  it("reputation_publish is NOT in Tier 1", () => {
+    expect(DEFAULT_POLICY.tier1_always_approve).not.toContain("reputation_publish");
   });
 
   // SEC-039: dashboard_open classification
