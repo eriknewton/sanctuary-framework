@@ -15,6 +15,9 @@ import type { SanctuaryConfig } from "../config.js";
 import type { IdentityManager } from "../l1-cognitive/tools.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
+import { sign as identitySign } from "../core/identity.js";
+import { derivePurposeKey } from "../core/key-derivation.js";
+import { toBase64url } from "../core/encoding.js";
 import {
   initiateHandshake,
   respondToHandshake,
@@ -50,8 +53,9 @@ export function createHandshakeTools(
   auditLog: AuditLog,
   options?: HandshakeToolsOptions
 ): { tools: ToolDefinition[]; handshakeResults: Map<string, HandshakeResult> } {
-  const autoPublishHandshakes = options?.autoPublishHandshakes ?? true;
+  const autoPublishHandshakes = options?.autoPublishHandshakes ?? false;
   const verascoreUrl = options?.verascoreUrl ?? "https://verascore.ai";
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
   // In-memory session store (per server instance lifetime)
   const sessions = new Map<string, HandshakeSession>();
   // Completed handshake results indexed by counterparty ID — shared with L4 tier resolution
@@ -162,42 +166,69 @@ export function createHandshakeTools(
             if (parsed.protocol !== "https:") {
               autoPublishResult.error = `verascore URL must use HTTPS (got ${parsed.protocol})`;
             } else {
-              const initiatorId =
-                (challenge as { initiator_nonce?: string; shr?: { signed_by?: string } })
-                  ?.shr?.signed_by ?? "unknown";
+              // DELTA-04: privacy. Without mutual explicit consent, strip
+              // initiator-identifying fields from the published envelope.
+              // We publish only the responder's own identity + opaque session id.
               const attestationPayload = {
                 type: "handshake" as const,
                 our_shr_signed_by: shr.signed_by,
-                counterparty_signed_by: initiatorId,
+                counterparty_signed_by: "redacted" as const,
                 session_id: result.session.session_id,
                 responded_at: new Date().toISOString(),
               };
-              const resp = await fetch(
-                `${verascoreUrl.replace(/\/$/, "")}/api/publish`,
-                {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    agentId: shr.body.instance_id,
-                    publicKey: shr.signed_by,
-                    type: "handshake",
-                    data: attestationPayload,
-                  }),
-                }
-              );
-              autoPublishResult.ok = resp.ok;
-              autoPublishResult.status = resp.status;
-              auditLog.append(
-                "l4",
-                "handshake_auto_publish",
-                shr.body.instance_id,
-                {
-                  verascore_url: verascoreUrl,
-                  status: resp.status,
-                  ok: resp.ok,
-                },
-                resp.ok ? "success" : "failure"
-              );
+
+              // DELTA-05: sign the publish payload with the responder's Ed25519
+              // identity key so Verascore can verify it end-to-end.
+              const responderIdentity = identityManager.get(shr.body.instance_id);
+              if (!responderIdentity) {
+                autoPublishResult.error =
+                  `responder identity ${shr.body.instance_id} not found; skipping auto-publish`;
+                auditLog.append(
+                  "l4",
+                  "handshake_auto_publish",
+                  shr.body.instance_id,
+                  { error: autoPublishResult.error },
+                  "failure"
+                );
+              } else {
+                const payloadBytes = new TextEncoder().encode(
+                  JSON.stringify(attestationPayload)
+                );
+                const sigBytes = identitySign(
+                  payloadBytes,
+                  responderIdentity.encrypted_private_key,
+                  identityEncKey
+                );
+                const signatureB64 = toBase64url(sigBytes);
+
+                const resp = await fetch(
+                  `${verascoreUrl.replace(/\/$/, "")}/api/publish`,
+                  {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      agentId: shr.body.instance_id,
+                      publicKey: shr.signed_by,
+                      signature: signatureB64,
+                      type: "handshake",
+                      data: attestationPayload,
+                    }),
+                  }
+                );
+                autoPublishResult.ok = resp.ok;
+                autoPublishResult.status = resp.status;
+                auditLog.append(
+                  "l4",
+                  "handshake_auto_publish",
+                  shr.body.instance_id,
+                  {
+                    verascore_url: verascoreUrl,
+                    status: resp.status,
+                    ok: resp.ok,
+                  },
+                  resp.ok ? "success" : "failure"
+                );
+              }
             }
           } catch (err) {
             autoPublishResult.error =

@@ -85,7 +85,7 @@ describe("Handshake auto-publish hook", () => {
     return challenge;
   }
 
-  it("auto-publishes when autoPublishHandshakes=true", async () => {
+  it("auto-publishes when autoPublishHandshakes=true and signs the envelope", async () => {
     const { tools } = await buildResponder(true);
     const challenge = await buildChallenge();
 
@@ -105,6 +105,21 @@ describe("Handshake auto-publish hook", () => {
     const body = JSON.parse((call[1] as { body: string }).body);
     expect(body.type).toBe("handshake");
     expect(body.agentId).toBeDefined();
+    // DELTA-05: envelope MUST be signed
+    expect(typeof body.signature).toBe("string");
+    expect(body.signature.length).toBeGreaterThan(0);
+    expect(typeof body.publicKey).toBe("string");
+
+    // DELTA-05: verify the signature against JSON.stringify(data) + publicKey
+    const { ed25519 } = await import("@noble/curves/ed25519");
+    const { fromBase64url } = await import("../../src/core/encoding.js");
+    const sig = fromBase64url(body.signature);
+    const pub = fromBase64url(body.publicKey);
+    const msg = new TextEncoder().encode(JSON.stringify(body.data));
+    expect(ed25519.verify(sig, msg, pub)).toBe(true);
+
+    // DELTA-04: counterparty-identifying fields are redacted by default.
+    expect(body.data.counterparty_signed_by).toBe("redacted");
   });
 
   it("does NOT publish when autoPublishHandshakes=false", async () => {

@@ -139,7 +139,8 @@ export function defaultConfig(): SanctuaryConfig {
     verascore: {
       url: "https://verascore.ai",
       auto_publish_to_verascore: true,
-      auto_publish_handshakes: true,
+      // DELTA-04: default OFF for privacy. Enable explicitly per deployment.
+      auto_publish_handshakes: false,
     },
   };
 }
