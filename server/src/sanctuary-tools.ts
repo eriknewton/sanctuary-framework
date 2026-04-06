@@ -409,10 +409,7 @@ export function createSanctuaryTools(
             body: JSON.stringify({ email }),
           });
 
-          const result = (await response.json().catch(() => ({}))) as Record<
-            string,
-            unknown
-          >;
+          await response.json().catch(() => ({}));
 
           auditLog.append("l4", "sanctuary_link_to_human", "system", {
             verascore_url: verascoreUrl,

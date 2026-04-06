@@ -60,6 +60,15 @@ interface SanctuaryConfig {
         /** Host for callback listener */
         callback_host: string;
     };
+    /** Verascore integration (agent reputation surface) */
+    verascore: {
+        /** Base URL of the Verascore deployment. */
+        url: string;
+        /** Whether to auto-publish handshake attestations to Verascore. */
+        auto_publish_to_verascore: boolean;
+        /** Whether to auto-publish on successful handshake_respond calls. */
+        auto_publish_handshakes: boolean;
+    };
 }
 /**
  * Load configuration from file, falling back to defaults.

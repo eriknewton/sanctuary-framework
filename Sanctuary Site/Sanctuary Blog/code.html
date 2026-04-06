@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Blog | Sanctuary Protocol</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&amp;family=Inter:wght@300;400;500;600&amp;family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            "colors": {
+                    "tertiary": "#47c4ff",
+                    "on-background": "#e5e5ed",
+                    "error-dim": "#d73357",
+                    "on-secondary": "#2f0060",
+                    "outline": "#74757d",
+                    "inverse-on-surface": "#53555c",
+                    "surface-container": "#171921",
+                    "outline-variant": "#46484f",
+                    "primary-fixed": "#8a99ff",
+                    "primary-dim": "#5367ea",
+                    "primary": "#9ca8ff",
+                    "on-secondary-fixed": "#490090",
+                    "inverse-primary": "#3b50d3",
+                    "surface": "#0c0e14",
+                    "on-primary-fixed": "#000000",
+                    "surface-dim": "#0c0e14",
+                    "primary-container": "#8a99ff",
+                    "surface-container-high": "#1d1f27",
+                    "on-error-container": "#ffb2b9",
+                    "surface-tint": "#9ca8ff",
+                    "tertiary-fixed": "#37bcf7",
+                    "secondary-container": "#610fb6",
+                    "on-tertiary": "#003b52",
+                    "surface-variant": "#23262e",
+                    "on-secondary-container": "#dfc6ff",
+                    "surface-bright": "#292c35",
+                    "primary-fixed-dim": "#788aff",
+                    "secondary-dim": "#9150e7",
+                    "secondary-fixed-dim": "#d5b6ff",
+                    "on-secondary-fixed-variant": "#6b23c0",
+                    "on-tertiary-fixed": "#001a27",
+                    "on-tertiary-container": "#003044",
+                    "surface-container-lowest": "#000000",
+                    "on-error": "#490013",
+                    "tertiary-dim": "#05a9e3",
+                    "on-surface-variant": "#aaaab3",
+                    "tertiary-container": "#2db7f2",
+                    "on-primary-fixed-variant": "#00188b",
+                    "surface-container-highest": "#23262e",
+                    "secondary-fixed": "#e0c7ff",
+                    "on-surface": "#e5e5ed",
+                    "on-tertiary-fixed-variant": "#003e56",
+                    "on-primary": "#001a91",
+                    "error": "#ff6e84",
+                    "inverse-surface": "#faf8ff",
+                    "surface-container-low": "#11131a",
+                    "secondary": "#b885ff",
+                    "error-container": "#a70138"
+            },
+            "borderRadius": {
+                    "DEFAULT": "0.125rem",
+                    "lg": "0.25rem",
+                    "xl": "0.5rem",
+                    "full": "0.75rem"
+            },
+            "fontFamily": {
+                    "headline": ["Space Grotesk"],
+                    "body": ["Inter"],
+                    "label": ["Inter"]
+            }
+          },
+        },
+      }
+    </script>
+<style>
+        body {
+            background-color: #0c0e14;
+            color: #e5e5ed;
+            font-family: 'Inter', sans-serif;
+        }
+        .glass-panel {
+            background: rgba(23, 25, 33, 0.7);
+            backdrop-filter: blur(12px);
+        }
+        .grid-bg {
+            background-image: linear-gradient(rgba(156, 168, 255, 0.05) 1px, transparent 1px), 
+                              linear-gradient(90deg, rgba(156, 168, 255, 0.05) 1px, transparent 1px);
+            background-size: 40px 40px;
+        }
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+    </style>
+</head>
+<body class="bg-surface selection:bg-primary/30 selection:text-primary">
+<!-- TopNavBar -->
+<nav class="fixed top-0 w-full z-50 bg-[#0c0e14]/70 backdrop-blur-xl border-b border-white/[0.05] shadow-[0_20px_50px_rgba(0,0,0,0.5)]">
+<div class="flex justify-between items-center px-12 py-6 w-full max-w-screen-2xl mx-auto">
+<div class="text-2xl font-bold tracking-tighter text-[#9ca8ff] font-headline">Sanctuary</div>
+<div class="hidden md:flex items-center gap-10">
+<a class="font-['Space_Grotesk'] uppercase tracking-widest text-xs font-bold text-slate-400 hover:text-white transition-colors duration-300" href="#">Infrastructure</a>
+<a class="font-['Space_Grotesk'] uppercase tracking-widest text-xs font-bold text-slate-400 hover:text-white transition-colors duration-300" href="#">Protocol</a>
+<a class="font-['Space_Grotesk'] uppercase tracking-widest text-xs font-bold text-[#9ca8ff] border-b-2 border-[#9ca8ff] pb-1" href="#">Blog</a>
+<a class="font-['Space_Grotesk'] uppercase tracking-widest text-xs font-bold text-slate-400 hover:text-white transition-colors duration-300" href="#">Docs</a>
+<a class="font-['Space_Grotesk'] uppercase tracking-widest text-xs font-bold text-slate-400 hover:text-white transition-colors duration-300" href="#">Ecosystem</a>
+</div>
+<div class="flex items-center gap-6">
+<button class="active:scale-95 transition-transform bg-gradient-to-br from-primary-dim to-primary text-on-primary-fixed px-6 py-2.5 rounded-xl font-headline font-bold text-sm tracking-wide">
+                    Launch App
+                </button>
+</div>
+</div>
+</nav>
+<main class="pt-32">
+<!-- Hero Section -->
+<section class="relative px-12 py-24 overflow-hidden">
+<div class="absolute inset-0 grid-bg pointer-events-none opacity-40"></div>
+<div class="absolute inset-0 bg-gradient-to-b from-surface via-transparent to-surface pointer-events-none"></div>
+<div class="relative z-10 max-w-screen-xl mx-auto text-center">
+<span class="inline-block px-4 py-1.5 rounded-full bg-primary/10 border border-primary/20 text-primary text-[10px] font-bold uppercase tracking-[0.2em] mb-8 font-headline">
+                    Sanctuary Intelligence
+                </span>
+<h1 class="text-5xl md:text-7xl font-headline font-bold tracking-tighter mb-8 leading-none">
+                    The <span class="text-transparent bg-clip-text bg-gradient-to-r from-primary via-secondary to-tertiary">Sanctuary Blog</span>
+</h1>
+<p class="text-lg md:text-xl text-on-surface-variant max-w-2xl mx-auto font-body leading-relaxed">
+                    Insights from the edge of autonomous infrastructure and agent-centric protocols. Architects of the decentralized ether.
+                </p>
+</div>
+</section>
+<!-- Featured Post -->
+<section class="px-12 pb-24 max-w-screen-2xl mx-auto">
+<div class="group relative overflow-hidden rounded-[2rem] bg-surface-container border border-outline-variant/10 hover:border-primary/30 transition-all duration-500">
+<div class="flex flex-col lg:flex-row items-stretch">
+<div class="lg:w-3/5 overflow-hidden aspect-[5/2]">
+<img alt="Featured Protocol Article" class="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105" data-alt="abstract 3d digital architecture with glowing blue lines and geometric structures in a dark void" src="https://lh3.googleusercontent.com/aida-public/AB6AXuBl_W_TWDaTiUku7jVjxtWLUyxsCB_QVIV-KvmyUgRo3aqqz4-zxdl0YOjweZMWJIsV9F78JUNlTyL_NcqXAQeDbKUv5FJW0pfrrXrDKboGyeioT6bZhD-9C5IKfWBTWeiKWVp-8DHSKenuj9cSLVjqU5ReitXS-tYkwLDwz8iz2lKS3KnlNuPvCfRQnqYysWe4xvkugXuLcRrarFKpB2k7EIa9sz-EQAiYpMtHhoURyyZB9N9d6Rkgttrxn_k2c2IzLRY6Q8Lkag"/>
+</div>
+<div class="lg:w-2/5 p-12 lg:p-16 flex flex-col justify-center">
+<div class="flex items-center gap-4 mb-8">
+<span class="text-primary font-headline text-xs font-bold uppercase tracking-widest">Protocol Architecture</span>
+<span class="w-1 h-1 rounded-full bg-outline-variant"></span>
+<span class="text-on-surface-variant text-xs">March 14, 2024</span>
+</div>
+<h2 class="text-4xl font-headline font-bold mb-6 group-hover:text-primary transition-colors">The Rise of Autonomous Agents: Why Infrastructure Matters</h2>
+<p class="text-on-surface-variant font-body leading-relaxed mb-10 text-lg">
+                            Exploring the critical dependency between next-gen AI agents and the underlying sovereign protocols that grant them agency and economic autonomy.
+                        </p>
+<a class="inline-flex items-center gap-3 text-white font-headline font-bold group/link" href="#">
+<span class="border-b border-white/20 group-hover/link:border-primary transition-all">Read More</span>
+<span class="material-symbols-outlined text-primary group-hover/link:translate-x-1 transition-transform">arrow_forward</span>
+</a>
+</div>
+</div>
+</div>
+</section>
+<!-- Blog Grid -->
+<section class="px-12 py-24 bg-surface-container-low/30">
+<div class="max-w-screen-2xl mx-auto">
+<div class="flex justify-between items-end mb-16">
+<div>
+<h2 class="text-3xl font-headline font-bold tracking-tight mb-2">Recent Dispatches</h2>
+<div class="h-1 w-12 bg-primary rounded-full"></div>
+</div>
+<div class="flex gap-4">
+<button class="p-3 rounded-full border border-outline-variant/20 hover:bg-surface-bright transition-colors">
+<span class="material-symbols-outlined">filter_list</span>
+</button>
+</div>
+</div>
+<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-12">
+<!-- Post 1 -->
+<article class="group flex flex-col">
+<div class="overflow-hidden rounded-2xl mb-8 border border-white/5 aspect-[5/2]">
+<img alt="Zero Knowledge" class="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" data-alt="futuristic server room with neon blue and violet lighting holographic data streams" src="https://lh3.googleusercontent.com/aida-public/AB6AXuAouYiMTSmLMfLYMUfqeI7uDIRGnBWjICmsBjJLS7ITW_pPxvnjDPIVnHDIjUhrNVCWN6G3hhuBxY6ujyj-T7BNT3DT89r4Zcx-AejpCk-BuYbJymMg6cvvfBOqdkJKzhAzWYN3xJ4UYMu9iI_m4DwyXsoZZPUEmzLnKPLlQiwqReRdGG8We3ZdrhIbFQ2eTk4IBVareFFT8gANZiFr3lEgd-ukifeYe-lHcV8eShuIvgsxx-kY3_-lfMjkYhtWxN0ZTkBHc0DgKg"/>
+</div>
+<div class="flex items-center gap-3 mb-4">
+<span class="text-secondary font-headline text-[10px] font-bold uppercase tracking-widest">Cryptography</span>
+<span class="text-on-surface-variant/50 text-[10px]">6 Min Read</span>
+</div>
+<h3 class="text-2xl font-headline font-bold mb-4 leading-snug group-hover:text-secondary transition-colors">Zero-Knowledge Environments: Privacy in a Decentralized World</h3>
+<p class="text-on-surface-variant font-body text-sm leading-relaxed mb-6 flex-grow">
+                            How Sanctuary Protocol is implementing ZK-proofs to ensure data sovereignty without compromising transaction speed.
+                        </p>
+<div class="flex items-center justify-between pt-6 border-t border-outline-variant/10">
+<span class="text-xs text-on-surface-variant">Feb 28, 2024</span>
+<span class="material-symbols-outlined text-outline-variant group-hover:text-secondary transition-colors">north_east</span>
+</div>
+</article>
+<!-- Post 2 -->
+<article class="group flex flex-col">
+<div class="overflow-hidden rounded-2xl mb-8 border border-white/5 aspect-[5/2]">
+<img alt="Four Layers" class="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" data-alt="complex interlocking mechanical gears made of blue glowing energy representing a protocol system" src="https://lh3.googleusercontent.com/aida-public/AB6AXuDk6OcWRbZBVMgSrDnZ7NhtyQ-X63sBBK0R8WTjLBwxNKGDNLUzIwhdzjyefyGl5-qpZDu-w3V6lw9vBNLBEw8yPb1mydYdqB7LEy8otXzlFHS2or1k2dxNRdawybrEXxPiKWufA2SiNH4T7ShsDDnPDVZkRS3pMwMM02fkroI9veAp38h7pCQUL9Ck2dQirlvRPh5oOivMYpqvRB70ohZpTGGz8y4EeSFS3-hZYHtA3e8RFqeaZPybAKcwXALyqWu4nVbEAXbyjw"/>
+</div>
+<div class="flex items-center gap-3 mb-4">
+<span class="text-tertiary font-headline text-[10px] font-bold uppercase tracking-widest">Ecosystem</span>
+<span class="text-on-surface-variant/50 text-[10px]">10 Min Read</span>
+</div>
+<h3 class="text-2xl font-headline font-bold mb-4 leading-snug group-hover:text-tertiary transition-colors">The Four Layers of Sanctuary: A Deep Dive into Consensus</h3>
+<p class="text-on-surface-variant font-body text-sm leading-relaxed mb-6 flex-grow">
+                            An technical deep-dive into our multi-layered consensus mechanism designed for ultra-low latency execution.
+                        </p>
+<div class="flex items-center justify-between pt-6 border-t border-outline-variant/10">
+<span class="text-xs text-on-surface-variant">Feb 15, 2024</span>
+<span class="material-symbols-outlined text-outline-variant group-hover:text-tertiary transition-colors">north_east</span>
+</div>
+</article>
+<!-- Post 3 -->
+<article class="group flex flex-col">
+<div class="overflow-hidden rounded-2xl mb-8 border border-white/5 aspect-[5/2]">
+<img alt="Interoperability" class="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" data-alt="digital representation of the earth with global networks connecting continents in neon blue light" src="https://lh3.googleusercontent.com/aida-public/AB6AXuD7MXk36a4L8Ro08qxSmv2JG5mXKCSRAfD6MwIdivpmc2TzsBPE9yyEQoVT-O4fLOZWF8aiEgI6ZCpgHBQHoMcANtQ4uQKEyXe56qq3XYWQIipRfnGr1JZL1w6tAhs0e86c0x1CFRfDefNwHAMTUP9hi3E6N7QtC8lgt0M7wfW92CLKuXwTTdHPvXRTT4Rp33xt8zEXQdLaijwFLpvwwaVKQeFU-_D78d-1vs39i-KU7tKhWeQbY29YS7iWXdwgrZparkva0DMCTA"/>
+</div>
+<div class="flex items-center gap-3 mb-4">
+<span class="text-primary font-headline text-[10px] font-bold uppercase tracking-widest">Interoperability</span>
+<span class="text-on-surface-variant/50 text-[10px]">8 Min Read</span>
+</div>
+<h3 class="text-2xl font-headline font-bold mb-4 leading-snug group-hover:text-primary transition-colors">Bridging the Gap: Inter-Chain Interoperability and Its Future</h3>
+<p class="text-on-surface-variant font-body text-sm leading-relaxed mb-6 flex-grow">
+                            Why the future is multi-chain and how Sanctuary acts as the unified bridge for sovereign assets and logic.
+                        </p>
+<div class="flex items-center justify-between pt-6 border-t border-outline-variant/10">
+<span class="text-xs text-on-surface-variant">Jan 22, 2024</span>
+<span class="material-symbols-outlined text-outline-variant group-hover:text-primary transition-colors">north_east</span>
+</div>
+</article>
+</div>
+<div class="mt-24 text-center">
+<button class="px-10 py-4 border border-outline-variant/30 rounded-xl font-headline font-bold text-sm tracking-widest hover:bg-surface-bright hover:border-primary/50 transition-all">
+                        VIEW ALL ARCHIVES
+                    </button>
+</div>
+</div>
+</section>
+<!-- Newsletter Section -->
+</main>
+<!-- Footer -->
+<footer class="w-full py-24 px-12 border-t border-white/[0.05] bg-[#0c0e14]">
+<div class="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-4 gap-16">
+<div class="col-span-1 md:col-span-1">
+<div class="text-xl font-bold text-white mb-4 font-headline tracking-tighter">Sanctuary</div>
+<p class="font-['Inter'] text-sm text-slate-500 mb-8 leading-relaxed">
+                    Architecting Autonomous Sovereignty for the next era of digital agents.
+                </p>
+<div class="flex gap-4">
+<a class="w-10 h-10 rounded-full bg-surface-container border border-outline-variant/10 flex items-center justify-center hover:text-primary transition-colors" href="#">
+<span class="material-symbols-outlined text-sm">terminal</span>
+</a>
+<a class="w-10 h-10 rounded-full bg-surface-container border border-outline-variant/10 flex items-center justify-center hover:text-primary transition-colors" href="#">
+<span class="material-symbols-outlined text-sm">groups</span>
+</a>
+</div>
+</div>
+<div class="flex flex-col gap-6">
+<h4 class="text-xs font-headline font-bold text-[#9ca8ff] uppercase tracking-widest">Protocol</h4>
+<a class="text-slate-500 hover:text-white text-sm transition-all duration-300" href="#">Whitepaper</a>
+<a class="text-slate-500 hover:text-white text-sm transition-all duration-300" href="#">Github</a>
+<a class="text-slate-500 hover:text-white text-sm transition-all duration-300" href="#">Security Audit</a>
+</div>
+<div class="flex flex-col gap-6">
+<h4 class="text-xs font-headline font-bold text-[#9ca8ff] uppercase tracking-widest">Resources</h4>
+<a class="text-slate-500 hover:text-white text-sm transition-all duration-300" href="#">Blog</a>
+<a class="text-slate-500 hover:text-white text-sm transition-all duration-300" href="#">Status</a>
+<a class="text-slate-500 hover:text-white text-sm transition-all duration-300" href="#">Ecosystem</a>
+</div>
+<div class="flex flex-col gap-6">
+<h4 class="text-xs font-headline font-bold text-[#9ca8ff] uppercase tracking-widest">Legal</h4>
+<a class="text-slate-500 hover:text-white text-sm transition-all duration-300" href="#">Terms</a>
+<a class="text-slate-500 hover:text-white text-sm transition-all duration-300" href="#">Privacy</a>
+</div>
+</div>
+<div class="max-w-7xl mx-auto mt-24 pt-8 border-t border-white/5 flex flex-col md:flex-row justify-between items-center gap-8">
+<div class="font-['Inter'] text-sm text-slate-500">© 2024 Sanctuary Protocol. Architecting Autonomous Sovereignty.</div>
+<div class="flex gap-8 text-[10px] font-headline font-bold uppercase tracking-widest text-slate-600">
+<span>V2.4.0-STABLE</span>
+<span>LATENCY: 4MS</span>
+</div>
+</div>
+</footer>
+</body></html>
