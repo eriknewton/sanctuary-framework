@@ -3,6 +3,14 @@
 *.swo
 *~
 
+# Environment files (secrets)
+.env
+.env.*
+!.env.example
+
+# Security reports
+.gstack/
+
 # Dependencies
 node_modules/
 

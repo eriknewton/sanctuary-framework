@@ -334,8 +334,6 @@ tier3_always_allow:
   - governor_status
   - reputation_publish
   - sanctuary_policy_status
-  - sanctuary_link_to_human
-  - sanctuary_sign_challenge
 
 # ─── Approval Channel ────────────────────────────────────────────────────
 # How Sanctuary reaches you when approval is needed.
