@@ -719,6 +719,12 @@ export async function createSanctuaryServer(options?: {
             return args;
           },
           governor,
+          onProxyCall: (data) => {
+            // Broadcast proxy call events to the dashboard Fortress View feed
+            if (dashboard) {
+              dashboard.broadcastProxyCall(data);
+            }
+          },
         }
       );
 
@@ -745,6 +751,8 @@ export async function createSanctuaryServer(options?: {
           auditLog,
           clientManager,
         });
+        // Enable Fortress View (Cocoon mode) when upstream servers are configured
+        dashboard.enableFortressView(enabledServers.length);
       }
     }
   }

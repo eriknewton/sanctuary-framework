@@ -36,6 +36,7 @@ import type { HandshakeResult } from "../handshake/types.js";
 // SignedSHR type available via shr/types if needed in future
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
 import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
+import { generateFortressViewHTML } from "../cocoon/fortress-view.js";
 import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer } from "../sovereignty-profile.js";
 import { generateSystemPrompt } from "../system-prompt-generator.js";
 import type { ClientManager } from "../proxy/client-manager.js";
@@ -113,6 +114,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private profileStore: SovereigntyProfileStore | null = null;
   private clientManager: ClientManager | null = null;
   private dashboardHTML: string;
+  private fortressHTML: string | null = null;
   private loginHTML: string;
   private authToken: string | undefined;
   private useTLS: boolean;
@@ -597,8 +599,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (!this.checkRateLimit(req, res, "general")) return;
 
     try {
-      if (method === "GET" && (url.pathname === "/" || url.pathname === "/dashboard")) {
-        this.serveDashboard(res);
+      if (method === "GET" && url.pathname === "/fortress") {
+        this.serveFortressView(res);
+      } else if (method === "GET" && (url.pathname === "/" || url.pathname === "/dashboard")) {
+        // Serve Fortress View as default if available (Cocoon mode), else standard dashboard
+        if (this.fortressHTML) {
+          this.serveFortressView(res);
+        } else {
+          this.serveDashboard(res);
+        }
       } else if (method === "GET" && url.pathname === "/events") {
         this.handleSSE(req, res);
       } else if (method === "GET" && url.pathname === "/api/status") {
@@ -703,6 +712,46 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       "Cache-Control": "no-cache",
     });
     res.end(this.dashboardHTML);
+  }
+
+  private serveFortressView(res: ServerResponse): void {
+    if (!this.fortressHTML) {
+      // Fallback to standard dashboard
+      this.serveDashboard(res);
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache",
+    });
+    res.end(this.fortressHTML);
+  }
+
+  /**
+   * Enable Fortress View (Cocoon mode) with the given upstream server count.
+   * Once enabled, the root path `/` serves the Fortress View instead of the
+   * standard dashboard. The standard dashboard remains available at `/dashboard`.
+   */
+  enableFortressView(upstreamServerCount: number): void {
+    this.fortressHTML = generateFortressViewHTML({
+      serverVersion: PKG_VERSION,
+      authToken: this.authToken,
+      upstreamServerCount,
+    });
+  }
+
+  /**
+   * Broadcast a proxy call event to connected dashboards (Fortress View feed).
+   */
+  broadcastProxyCall(data: {
+    tool: string;
+    server: string;
+    decision: string;
+    reason?: string;
+    tier?: number;
+    timestamp: string;
+  }): void {
+    this.broadcastSSE("proxy-call", data);
   }
 
   private handleSSE(req: IncomingMessage, res: ServerResponse): void {

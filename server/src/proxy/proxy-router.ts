@@ -32,6 +32,15 @@ export interface ProxyRouterOptions {
   ) => Promise<Record<string, unknown>>;
   /** Optional call governor for runtime governance */
   governor?: CallGovernor;
+  /** Optional callback after each proxy call decision (for dashboard feed) */
+  onProxyCall?: (data: {
+    tool: string;
+    server: string;
+    decision: string;
+    reason?: string;
+    tier?: number;
+    timestamp: string;
+  }) => void;
 }
 
 // ── Constants ───────────────────────────────────────────────────────────
@@ -140,6 +149,7 @@ export class ProxyRouter {
             latency_ms: Date.now() - start,
           }, "failure");
 
+          this.notifyProxyCall(proxyName, serverName, "blocked", "injection_detected", tier);
           return toolResult({
             error: "Operation not permitted",
             proxy: true,
@@ -180,6 +190,7 @@ export class ProxyRouter {
               latency_ms: Date.now() - start,
             }, "failure");
 
+            this.notifyProxyCall(proxyName, serverName, "blocked", govResult.reason, tier);
             return toolResult({
               error: "Operation not permitted",
               proxy: true,
@@ -225,6 +236,8 @@ export class ProxyRouter {
           latency_ms: latencyMs,
         });
 
+        this.notifyProxyCall(proxyName, serverName, "allowed", undefined, tier);
+
         // Return the upstream response, coerced to standard text format
         return this.normalizeResponse(result);
       } catch (err) {
@@ -254,6 +267,8 @@ export class ProxyRouter {
           latency_ms: latencyMs,
         }, "failure");
 
+        this.notifyProxyCall(proxyName, serverName, "error", errorMessage, tier);
+
         // Pass upstream errors through to the agent (sanitized)
         return {
           content: [{
@@ -268,6 +283,32 @@ export class ProxyRouter {
         };
       }
     };
+  }
+
+  /**
+   * Notify the onProxyCall callback if configured.
+   */
+  private notifyProxyCall(
+    tool: string,
+    server: string,
+    decision: string,
+    reason?: string,
+    tier?: number
+  ): void {
+    if (this.options.onProxyCall) {
+      try {
+        this.options.onProxyCall({
+          tool,
+          server,
+          decision,
+          reason,
+          tier,
+          timestamp: new Date().toISOString(),
+        });
+      } catch {
+        // Callback errors must not propagate
+      }
+    }
   }
 
   /**
