@@ -32,6 +32,13 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "cocoon") {
+    const { parseCocoonArgs, runCocoon } = await import("./cocoon/cli.js");
+    const cocoonOpts = parseCocoonArgs(args.slice(1));
+    await runCocoon(cocoonOpts);
+    return;
+  }
+
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dashboard") {
       process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
@@ -129,6 +136,7 @@ Sovereignty infrastructure for agents in the agentic economy.
 Usage:
   sanctuary-mcp-server [options]          # MCP server (stdio)
   sanctuary-mcp-server dashboard [opts]   # Standalone dashboard
+  sanctuary-mcp-server cocoon [opts]      # Wrap agent in Cocoon protection
 
 Options:
   --dashboard          Enable the Principal Dashboard (web UI)
@@ -140,6 +148,10 @@ Subcommands:
   dashboard            Start the dashboard as a standalone HTTP server.
                        Reads from the same storage as the MCP server.
                        Use "sanctuary-mcp-server dashboard --help" for options.
+
+  cocoon               Wrap an existing agent in Sanctuary's enforcement chain.
+                       One command to protect any MCP-compatible agent.
+                       Use "sanctuary-mcp-server cocoon --help" for options.
 
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
