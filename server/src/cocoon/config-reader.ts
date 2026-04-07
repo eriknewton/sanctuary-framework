@@ -42,7 +42,9 @@ export interface AgentConfig {
 
 const PLATFORM_PATHS: Record<AgentPlatform, string[]> = {
   "openclaw": [
+    join(homedir(), ".openclaw", "openclaw.json"),
     join(homedir(), ".openclaw", "config.json"),
+    join(homedir(), "Library", "Application Support", "OpenClaw", "openclaw.json"),
     join(homedir(), "Library", "Application Support", "OpenClaw", "config.json"),
   ],
   "claude-code": [
@@ -175,13 +177,27 @@ function extractServers(config: unknown, platform: AgentPlatform): MCPServerEntr
   const servers: MCPServerEntry[] = [];
   const obj = config as Record<string, unknown>;
 
-  // OpenClaw format: { mcpServers: { name: { command, args, env } } }
+  // OpenClaw format: either { mcp: { servers: { name: {...} } } } (nested)
+  // or { mcpServers: { name: {...} } } (flat, used by some versions / shim configs)
   if (platform === "openclaw" || platform === "generic") {
-    const mcpServers = obj.mcpServers as Record<string, unknown> | undefined;
-    if (mcpServers && typeof mcpServers === "object") {
-      for (const [name, serverConfig] of Object.entries(mcpServers)) {
+    // Try nested format first: mcp.servers
+    const mcp = obj.mcp as Record<string, unknown> | undefined;
+    const nestedServers = mcp?.servers as Record<string, unknown> | undefined;
+    if (nestedServers && typeof nestedServers === "object") {
+      for (const [name, serverConfig] of Object.entries(nestedServers)) {
         const entry = parseServerEntry(name, serverConfig);
         if (entry) servers.push(entry);
+      }
+    }
+
+    // Fall back to flat format: mcpServers
+    if (servers.length === 0) {
+      const mcpServers = obj.mcpServers as Record<string, unknown> | undefined;
+      if (mcpServers && typeof mcpServers === "object") {
+        for (const [name, serverConfig] of Object.entries(mcpServers)) {
+          const entry = parseServerEntry(name, serverConfig);
+          if (entry) servers.push(entry);
+        }
       }
     }
   }
@@ -262,20 +278,44 @@ function extractEnv(env: unknown): Record<string, string> | undefined {
 export async function rewriteConfigForCocoon(
   agentConfig: AgentConfig,
   sanctuaryCommand: string,
-  sanctuaryArgs: string[]
+  sanctuaryArgs: string[],
+  sanctuaryEnv?: Record<string, string>
 ): Promise<string> {
   const raw = agentConfig.rawConfig as Record<string, unknown>;
 
-  // Create new config with only Sanctuary as the MCP server
-  const rewritten = {
-    ...raw,
-    mcpServers: {
-      sanctuary: {
-        command: sanctuaryCommand,
-        args: sanctuaryArgs,
-      },
-    },
+  const sanctuaryEntry: Record<string, unknown> = {
+    command: sanctuaryCommand,
+    args: sanctuaryArgs,
   };
+  if (sanctuaryEnv && Object.keys(sanctuaryEnv).length > 0) {
+    sanctuaryEntry.env = sanctuaryEnv;
+  }
+
+  let rewritten: Record<string, unknown>;
+
+  if (agentConfig.platform === "openclaw") {
+    // OpenClaw uses nested mcp.servers format — preserve it
+    const existingMcp = (raw.mcp as Record<string, unknown>) ?? {};
+    rewritten = {
+      ...raw,
+      mcp: {
+        ...existingMcp,
+        servers: {
+          sanctuary: sanctuaryEntry,
+        },
+      },
+    };
+    // Remove flat mcpServers if it existed (from a shim)
+    delete rewritten.mcpServers;
+  } else {
+    // Claude Code / Cursor / generic use flat mcpServers
+    rewritten = {
+      ...raw,
+      mcpServers: {
+        sanctuary: sanctuaryEntry,
+      },
+    };
+  }
 
   await writeFile(agentConfig.configPath, JSON.stringify(rewritten, null, 2), { mode: 0o600 });
   return agentConfig.configPath;

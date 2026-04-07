@@ -140,23 +140,29 @@ export async function runCocoon(options: CocoonOptions): Promise<void> {
 
   console.error(`\n  Original config backed up to: ${backupPath}`);
 
-  // Rewrite agent config to route through Sanctuary
+  // Rewrite agent config to route through Sanctuary.
+  // IMPORTANT: Do NOT pass --dashboard here. When the agent harness (OpenClaw, etc.)
+  // launches Sanctuary as a stdio subprocess, --dashboard opens an HTTP listener
+  // that can interfere with stdio communication. Instead, the dashboard runs as
+  // a separate standalone process (see below).
   await rewriteConfigForCocoon(
     agentConfig,
     "npx",
     [
       "@sanctuary-framework/mcp-server",
-      "--dashboard",
       ...(options.passphrase ? ["--passphrase", options.passphrase] : []),
     ]
   );
 
   console.error(`  Agent config rewritten to route through Sanctuary`);
 
+  // Start the dashboard as a standalone process that reads from the same ~/.sanctuary/ storage.
+  // This avoids the stdio + HTTP conflict that occurs when --dashboard is passed as a subprocess arg.
   const dashboardPort = options.port ?? 3501;
   console.error(`\n  Your agent is now protected.`);
-  console.error(`  Dashboard: http://localhost:${dashboardPort}`);
   console.error(`  All tool calls are being logged and scanned.`);
+  console.error(`\n  To view the dashboard, run in a separate terminal:`);
+  console.error(`    npx @sanctuary-framework/mcp-server dashboard --port ${dashboardPort}`);
   console.error(`\n  To restore: npx @sanctuary-framework/cocoon --unwrap\n`);
 }
 
