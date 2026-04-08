@@ -9,7 +9,7 @@
  */
 
 import { readFile, writeFile, mkdir, copyFile, access } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
 import { homedir } from "node:os";
 
 // ── Types ───────────────────────────────────────────────────────────

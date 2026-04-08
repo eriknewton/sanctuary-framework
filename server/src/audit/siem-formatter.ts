@@ -8,7 +8,7 @@
  * Used by the audit_export_siem tool to export events to Splunk, Datadog, and other SIEMs.
  */
 
-import type { AuditEntry } from "./audit-log.js";
+import type { AuditEntry } from "../l2-operational/audit-log.js";
 
 // ── Gate Decision Type ──────────────────────────────────────────────────
 
@@ -201,7 +201,6 @@ export interface OCSFObject {
 export function formatAsOCSF(entry: AuditEntry): OCSFObject {
   const decision = parseGateDecision(entry.details);
   const tier = parseTier(entry.details);
-  const sessionId = parseSessionId(entry.details);
   const agentDid = parseAgentDid(entry.details);
 
   const timestamp = new Date(entry.timestamp).getTime();

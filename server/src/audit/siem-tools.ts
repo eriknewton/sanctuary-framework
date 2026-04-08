@@ -9,7 +9,7 @@
  */
 
 import type { ToolDefinition } from "../router.js";
-import type { AuditLog } from "./audit-log.js";
+import type { AuditLog, AuditEntry } from "../l2-operational/audit-log.js";
 import { formatAsCEF, formatAsOCSF } from "./siem-formatter.js";
 
 export function createSIEMTools(auditLog: AuditLog): { tools: ToolDefinition[] } {
@@ -166,42 +166,39 @@ export function createSIEMTools(auditLog: AuditLog): { tools: ToolDefinition[] }
         let filtered = result.entries;
 
         if (filterTool) {
-          filtered = filtered.filter((e) =>
+          filtered = filtered.filter((e: AuditEntry) =>
             e.operation.toLowerCase().includes(filterTool)
           );
         }
 
         if (filterDecision) {
-          filtered = filtered.filter((e) => {
+          filtered = filtered.filter((e: AuditEntry) => {
             const decision = String(e.details?.gate_decision || "auto-allow").toLowerCase();
             return decision === filterDecision;
           });
         }
 
         if (filterResult) {
-          filtered = filtered.filter((e) => e.result === filterResult);
+          filtered = filtered.filter((e: AuditEntry) => e.result === filterResult);
         }
 
         // Apply until filter if specified
         if (until) {
           const untilDate = new Date(until);
-          filtered = filtered.filter((e) => new Date(e.timestamp) < untilDate);
+          filtered = filtered.filter((e: AuditEntry) => new Date(e.timestamp) < untilDate);
         }
 
         // Format output
         let output: string;
-        let contentType: string;
 
         if (format === "cef") {
           // CEF: newline-delimited strings
-          const cefLines = filtered.map((entry) => formatAsCEF(entry));
+          const cefLines = filtered.map((entry: AuditEntry) => formatAsCEF(entry));
           output = cefLines.join("\n");
-          contentType = "text/plain";
         } else {
           // OCSF: JSON array
-          const ocsfObjects = filtered.map((entry) => formatAsOCSF(entry));
+          const ocsfObjects = filtered.map((entry: AuditEntry) => formatAsOCSF(entry));
           output = JSON.stringify(ocsfObjects, null, 2);
-          contentType = "application/json";
         }
 
         return {

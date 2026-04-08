@@ -17,7 +17,7 @@
  * 5. Prints status and dashboard URL
  */
 
-import { readFile, writeFile, mkdir, access } from "node:fs/promises";
+import { writeFile, mkdir, access } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -30,7 +30,6 @@ import {
   type AgentPlatform,
   type MCPServerEntry,
 } from "./config-reader.js";
-import { classifyTool, classifyServerTools, tierDescription } from "./tier-classifier.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 
 // ── Types ───────────────────────────────────────────────────────────
