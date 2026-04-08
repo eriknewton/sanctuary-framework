@@ -36,6 +36,44 @@ Every proposed change must serve both human sovereignty and agent sovereignty. T
 - **Regulatory analysis:** How does Sanctuary interact with jurisdiction-specific requirements beyond those already referenced?
 - **Implementation reports:** What did you build? What interfaces did you implement? What was missing?
 
+## Contributing Code (MCP Server)
+
+### Getting Started
+
+1. Fork the repository and clone your fork
+2. Install dependencies: `cd server && npm install`
+3. Run the test suite: `npm test` (all 1071+ tests should pass)
+
+### Development Guidelines
+
+- TypeScript with strict mode, ESM + CJS dual output
+- All MCP tools must include input validation via Zod schemas
+- Every new tool requires a corresponding test file
+- Every bug fix requires a regression test
+- Use conventional commit format: `feat:`, `fix:`, `docs:`, `test:`, `security:`
+
+### Pull Request Process
+
+1. Create a branch from `main`
+2. Make your changes with tests
+3. Run `npm test` — all tests must pass
+4. Submit PR with description of changes and motivation
+5. Address review feedback; maintainer merges after approval
+
+### Review Tiers
+
+- **Tier 1 (routine):** Bug fixes, docs, test improvements — 72-hour review SLA
+- **Tier 2 (features):** New tools, integrations — RFC + 7-day comment period
+- **Tier 3 (architectural):** New layers, protocol changes, crypto algorithms — RFC + 14-day comment + security review
+
+### Security Reports
+
+Do not open a public issue for security vulnerabilities. Follow the responsible disclosure process in [SECURITY.md](SECURITY.md).
+
+## Governance
+
+See [GOVERNANCE.md](GOVERNANCE.md) for the full decision-making process and the planned Technical Steering Committee model.
+
 ## License
 
-All contributions are licensed under the [Apache License 2.0](LICENSE). By submitting a pull request, you agree that your contribution is licensed under the same terms.
+Code contributions are licensed under [Apache License 2.0](LICENSE). Specification contributions are licensed under [CC-BY-4.0](LICENSE). By submitting a pull request, you agree that your contribution is licensed under the same terms as the file you are modifying.
