@@ -294,13 +294,15 @@ export async function rewriteConfigForCocoon(
   let rewritten: Record<string, unknown>;
 
   if (agentConfig.platform === "openclaw") {
-    // OpenClaw uses nested mcp.servers format — preserve it
+    // OpenClaw uses nested mcp.servers format — preserve existing servers
     const existingMcp = (raw.mcp as Record<string, unknown>) ?? {};
+    const existingServers = (existingMcp.servers as Record<string, unknown>) ?? {};
     rewritten = {
       ...raw,
       mcp: {
         ...existingMcp,
         servers: {
+          ...existingServers,
           sanctuary: sanctuaryEntry,
         },
       },
@@ -308,10 +310,12 @@ export async function rewriteConfigForCocoon(
     // Remove flat mcpServers if it existed (from a shim)
     delete rewritten.mcpServers;
   } else {
-    // Claude Code / Cursor / generic use flat mcpServers
+    // Claude Code / Cursor / generic use flat mcpServers — preserve existing servers
+    const existingServers = (raw.mcpServers as Record<string, unknown>) ?? {};
     rewritten = {
       ...raw,
       mcpServers: {
+        ...existingServers,
         sanctuary: sanctuaryEntry,
       },
     };

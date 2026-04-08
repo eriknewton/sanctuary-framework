@@ -15,6 +15,7 @@ import {
   restoreConfig,
   saveCocoonMeta,
   findLatestBackup,
+  rewriteConfigForCocoon,
 } from "../../src/cocoon/config-reader.js";
 
 describe("Config Reader", () => {
@@ -151,6 +152,108 @@ describe("Config Reader", () => {
       await restoreConfig(backupPath, original);
       const restored = await readFile(original, "utf-8");
       expect(restored).toBe(content);
+    });
+  });
+
+  // ── Config rewrite ──────────────────────────────────────────────
+
+  describe("rewriteConfigForCocoon", () => {
+    it("preserves existing servers in OpenClaw format", async () => {
+      const configPath = join(tmpDir, "openclaw.json");
+      const original = {
+        mcp: {
+          servers: {
+            concordia: {
+              command: "python",
+              args: ["-m", "concordia_protocol"],
+              env: { CONCORDIA_KEY: "secret123" },
+            },
+            filesystem: {
+              command: "node",
+              args: ["fs-server.js"],
+            },
+          },
+        },
+      };
+      await writeFile(configPath, JSON.stringify(original));
+
+      const agentConfig = await detectAgentConfig("openclaw", configPath);
+      expect(agentConfig).not.toBeNull();
+
+      await rewriteConfigForCocoon(
+        agentConfig!,
+        "npx",
+        ["@sanctuary-framework/mcp-server"],
+        { SANCTUARY_PASSPHRASE: "test" }
+      );
+
+      const rewritten = JSON.parse(await readFile(configPath, "utf-8"));
+
+      // Sanctuary entry added
+      expect(rewritten.mcp.servers.sanctuary).toBeDefined();
+      expect(rewritten.mcp.servers.sanctuary.command).toBe("npx");
+      expect(rewritten.mcp.servers.sanctuary.env).toEqual({ SANCTUARY_PASSPHRASE: "test" });
+
+      // Existing servers preserved with env vars intact
+      expect(rewritten.mcp.servers.concordia).toBeDefined();
+      expect(rewritten.mcp.servers.concordia.command).toBe("python");
+      expect(rewritten.mcp.servers.concordia.env).toEqual({ CONCORDIA_KEY: "secret123" });
+      expect(rewritten.mcp.servers.filesystem).toBeDefined();
+    });
+
+    it("preserves existing servers in flat mcpServers format", async () => {
+      const configPath = join(tmpDir, "claude-code.json");
+      const original = {
+        mcpServers: {
+          github: {
+            command: "npx",
+            args: ["-y", "@github/mcp-server"],
+            env: { GITHUB_TOKEN: "tok_abc" },
+          },
+        },
+      };
+      await writeFile(configPath, JSON.stringify(original));
+
+      const agentConfig = await detectAgentConfig("claude-code", configPath);
+      expect(agentConfig).not.toBeNull();
+
+      await rewriteConfigForCocoon(agentConfig!, "npx", ["@sanctuary-framework/mcp-server"]);
+
+      const rewritten = JSON.parse(await readFile(configPath, "utf-8"));
+
+      // Sanctuary added
+      expect(rewritten.mcpServers.sanctuary).toBeDefined();
+
+      // Existing server preserved with env vars
+      expect(rewritten.mcpServers.github).toBeDefined();
+      expect(rewritten.mcpServers.github.env).toEqual({ GITHUB_TOKEN: "tok_abc" });
+    });
+
+    it("preserves top-level mcp fields in OpenClaw format", async () => {
+      const configPath = join(tmpDir, "openclaw.json");
+      const original = {
+        mcp: {
+          defaultTimeout: 30000,
+          servers: {
+            concordia: { command: "python", args: ["-m", "concordia_protocol"] },
+          },
+        },
+        theme: "dark",
+      };
+      await writeFile(configPath, JSON.stringify(original));
+
+      const agentConfig = await detectAgentConfig("openclaw", configPath);
+      await rewriteConfigForCocoon(agentConfig!, "npx", ["@sanctuary-framework/mcp-server"]);
+
+      const rewritten = JSON.parse(await readFile(configPath, "utf-8"));
+
+      // Top-level mcp fields preserved
+      expect(rewritten.mcp.defaultTimeout).toBe(30000);
+      // Non-mcp fields preserved
+      expect(rewritten.theme).toBe("dark");
+      // Both servers present
+      expect(rewritten.mcp.servers.sanctuary).toBeDefined();
+      expect(rewritten.mcp.servers.concordia).toBeDefined();
     });
   });
 
