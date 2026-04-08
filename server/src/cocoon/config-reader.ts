@@ -283,12 +283,32 @@ export async function rewriteConfigForCocoon(
 ): Promise<string> {
   const raw = agentConfig.rawConfig as Record<string, unknown>;
 
+  // Resolve existing servers so we can preserve env vars from the original
+  // sanctuary entry when no explicit sanctuaryEnv is provided.
+  let existingServers: Record<string, unknown> = {};
+  if (agentConfig.platform === "openclaw") {
+    const existingMcp = (raw.mcp as Record<string, unknown>) ?? {};
+    existingServers = (existingMcp.servers as Record<string, unknown>) ?? {};
+  } else {
+    existingServers = (raw.mcpServers as Record<string, unknown>) ?? {};
+  }
+
+  // If no explicit env was passed, inherit env vars from the existing sanctuary entry
+  let resolvedEnv: Record<string, string> | undefined = sanctuaryEnv;
+  if (!resolvedEnv) {
+    const existingSanctuary = existingServers.sanctuary as Record<string, unknown> | undefined;
+    if (existingSanctuary?.env && typeof existingSanctuary.env === "object") {
+      const extracted = extractEnv(existingSanctuary.env);
+      if (extracted) resolvedEnv = extracted;
+    }
+  }
+
   const sanctuaryEntry: Record<string, unknown> = {
     command: sanctuaryCommand,
     args: sanctuaryArgs,
   };
-  if (sanctuaryEnv && Object.keys(sanctuaryEnv).length > 0) {
-    sanctuaryEntry.env = sanctuaryEnv;
+  if (resolvedEnv && Object.keys(resolvedEnv).length > 0) {
+    sanctuaryEntry.env = resolvedEnv;
   }
 
   let rewritten: Record<string, unknown>;
@@ -296,7 +316,6 @@ export async function rewriteConfigForCocoon(
   if (agentConfig.platform === "openclaw") {
     // OpenClaw uses nested mcp.servers format — preserve existing servers
     const existingMcp = (raw.mcp as Record<string, unknown>) ?? {};
-    const existingServers = (existingMcp.servers as Record<string, unknown>) ?? {};
     rewritten = {
       ...raw,
       mcp: {
@@ -311,7 +330,6 @@ export async function rewriteConfigForCocoon(
     delete rewritten.mcpServers;
   } else {
     // Claude Code / Cursor / generic use flat mcpServers — preserve existing servers
-    const existingServers = (raw.mcpServers as Record<string, unknown>) ?? {};
     rewritten = {
       ...raw,
       mcpServers: {

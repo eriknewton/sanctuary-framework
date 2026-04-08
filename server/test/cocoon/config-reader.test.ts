@@ -229,6 +229,93 @@ describe("Config Reader", () => {
       expect(rewritten.mcpServers.github.env).toEqual({ GITHUB_TOKEN: "tok_abc" });
     });
 
+    it("inherits sanctuary env vars when none explicitly provided", async () => {
+      const configPath = join(tmpDir, "openclaw.json");
+      const original = {
+        mcp: {
+          servers: {
+            sanctuary: {
+              command: "npx",
+              args: ["@sanctuary-framework/mcp-server"],
+              env: {
+                SANCTUARY_PASSPHRASE: "my-secret",
+                SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok_abc",
+                SANCTUARY_DASHBOARD_ENABLED: "true",
+              },
+            },
+            concordia: {
+              command: "python",
+              args: ["-m", "concordia_protocol"],
+              env: { CONCORDIA_KEY: "ckey123" },
+            },
+          },
+        },
+      };
+      await writeFile(configPath, JSON.stringify(original));
+
+      const agentConfig = await detectAgentConfig("openclaw", configPath);
+      expect(agentConfig).not.toBeNull();
+
+      // Call WITHOUT sanctuaryEnv — should inherit from existing config
+      await rewriteConfigForCocoon(
+        agentConfig!,
+        "npx",
+        ["@sanctuary-framework/mcp-server", "--passphrase", "my-secret"]
+      );
+
+      const rewritten = JSON.parse(await readFile(configPath, "utf-8"));
+
+      // Sanctuary env vars inherited from original
+      expect(rewritten.mcp.servers.sanctuary.env).toEqual({
+        SANCTUARY_PASSPHRASE: "my-secret",
+        SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok_abc",
+        SANCTUARY_DASHBOARD_ENABLED: "true",
+      });
+
+      // Sanctuary command/args updated to new values
+      expect(rewritten.mcp.servers.sanctuary.command).toBe("npx");
+      expect(rewritten.mcp.servers.sanctuary.args).toContain("--passphrase");
+
+      // Other servers still preserved with their env vars
+      expect(rewritten.mcp.servers.concordia.env).toEqual({ CONCORDIA_KEY: "ckey123" });
+    });
+
+    it("explicit sanctuaryEnv overrides inherited env vars", async () => {
+      const configPath = join(tmpDir, "openclaw.json");
+      const original = {
+        mcp: {
+          servers: {
+            sanctuary: {
+              command: "npx",
+              args: ["@sanctuary-framework/mcp-server"],
+              env: {
+                SANCTUARY_PASSPHRASE: "old-secret",
+                SANCTUARY_DASHBOARD_ENABLED: "true",
+              },
+            },
+          },
+        },
+      };
+      await writeFile(configPath, JSON.stringify(original));
+
+      const agentConfig = await detectAgentConfig("openclaw", configPath);
+
+      // Call WITH explicit sanctuaryEnv — should override, not inherit
+      await rewriteConfigForCocoon(
+        agentConfig!,
+        "npx",
+        ["@sanctuary-framework/mcp-server"],
+        { SANCTUARY_PASSPHRASE: "new-secret" }
+      );
+
+      const rewritten = JSON.parse(await readFile(configPath, "utf-8"));
+
+      // Only the explicitly passed env vars, not the old ones
+      expect(rewritten.mcp.servers.sanctuary.env).toEqual({
+        SANCTUARY_PASSPHRASE: "new-secret",
+      });
+    });
+
     it("preserves top-level mcp fields in OpenClaw format", async () => {
       const configPath = join(tmpDir, "openclaw.json");
       const original = {
