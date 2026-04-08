@@ -62,7 +62,7 @@ describe("SEC-001: state_delete requires explicit human approval", () => {
     });
     const gate = new ApprovalGate(DEFAULT_POLICY, baseline, channel, auditLog);
 
-    const result = await gate.evaluate("sanctuary/state_delete", {
+    const result = await gate.evaluate("state_delete", {
       namespace: "user-data",
       key: "important-state",
     });
@@ -80,7 +80,7 @@ describe("SEC-001: state_delete requires explicit human approval", () => {
     const channel = new AutoApproveChannel();
     const gate = new ApprovalGate(DEFAULT_POLICY, baseline, channel, auditLog);
 
-    const result = await gate.evaluate("sanctuary/state_delete", {
+    const result = await gate.evaluate("state_delete", {
       namespace: "user-data",
       key: "some-key",
     });
@@ -99,7 +99,7 @@ describe("SEC-001: state_delete requires explicit human approval", () => {
     });
     const gate = new ApprovalGate(DEFAULT_POLICY, baseline, channel, auditLog);
 
-    const result = await gate.evaluate("sanctuary/state_delete", {
+    const result = await gate.evaluate("state_delete", {
       namespace: "user-data",
       key: "critical-key",
     });
@@ -145,7 +145,7 @@ describe("SEC-001: state_delete requires explicit human approval", () => {
     }));
     const gate = new ApprovalGate(customPolicy, baseline, channel, auditLog);
 
-    return gate.evaluate("sanctuary/state_delete", {
+    return gate.evaluate("state_delete", {
       namespace: "test",
       key: "test",
     }).then((result) => {

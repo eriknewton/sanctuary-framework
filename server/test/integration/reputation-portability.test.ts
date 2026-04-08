@@ -56,11 +56,11 @@ describe("Reputation Portability", () => {
     // Instance A: create identity and record reputation
     const instA = await createInstance();
 
-    const identity = await callTool(instA.tools, "sanctuary/identity_create", {
+    const identity = await callTool(instA.tools, "identity_create", {
       label: "portable-agent",
     });
 
-    await callTool(instA.tools, "sanctuary/reputation_record", {
+    await callTool(instA.tools, "reputation_record", {
       interaction_id: "txn-port-001",
       counterparty_did: "did:key:cp1",
       outcome: { type: "transaction", result: "completed", metrics: { score: 95 } },
@@ -68,7 +68,7 @@ describe("Reputation Portability", () => {
       identity_id: identity.identity_id,
     });
 
-    const exported = await callTool(instA.tools, "sanctuary/reputation_export", {
+    const exported = await callTool(instA.tools, "reputation_export", {
       identity_id: identity.identity_id,
     });
 
@@ -79,7 +79,7 @@ describe("Reputation Portability", () => {
     const sourceIdentity = instA.identityManager.get(identity.identity_id as string)!;
     await instB.identityManager.save(sourceIdentity);
 
-    const imported = await callTool(instB.tools, "sanctuary/reputation_import", {
+    const imported = await callTool(instB.tools, "reputation_import", {
       bundle: exported.bundle,
       verify_signatures: true,
     });
@@ -88,7 +88,7 @@ describe("Reputation Portability", () => {
     expect(imported.invalid_attestations).toBe(0);
 
     // Verify imported data
-    const query = await callTool(instB.tools, "sanctuary/reputation_query", {});
+    const query = await callTool(instB.tools, "reputation_query", {});
     const summary = query.summary as Record<string, unknown>;
     expect(summary.total_interactions).toBe(1);
     expect(summary.completed).toBe(1);
@@ -97,11 +97,11 @@ describe("Reputation Portability", () => {
   it("verified import rejects tampered attestations", async () => {
     const instA = await createInstance();
 
-    const identity = await callTool(instA.tools, "sanctuary/identity_create", {
+    const identity = await callTool(instA.tools, "identity_create", {
       label: "tamper-test",
     });
 
-    await callTool(instA.tools, "sanctuary/reputation_record", {
+    await callTool(instA.tools, "reputation_record", {
       interaction_id: "txn-tamper-001",
       counterparty_did: "did:key:cp1",
       outcome: { type: "transaction", result: "completed" },
@@ -109,7 +109,7 @@ describe("Reputation Portability", () => {
       identity_id: identity.identity_id,
     });
 
-    const exported = await callTool(instA.tools, "sanctuary/reputation_export", {
+    const exported = await callTool(instA.tools, "reputation_export", {
       identity_id: identity.identity_id,
     });
 
@@ -126,7 +126,7 @@ describe("Reputation Portability", () => {
     const sourceIdentity = instA.identityManager.get(identity.identity_id as string)!;
     await instB.identityManager.save(sourceIdentity);
 
-    const imported = await callTool(instB.tools, "sanctuary/reputation_import", {
+    const imported = await callTool(instB.tools, "reputation_import", {
       bundle: tamperedBundle,
       verify_signatures: true,
     });
@@ -139,19 +139,19 @@ describe("Reputation Portability", () => {
   it("context-filtered export only includes matching attestations", async () => {
     const inst = await createInstance();
 
-    const identity = await callTool(inst.tools, "sanctuary/identity_create", {
+    const identity = await callTool(inst.tools, "identity_create", {
       label: "filter-test",
     });
 
     // Record in two different contexts
-    await callTool(inst.tools, "sanctuary/reputation_record", {
+    await callTool(inst.tools, "reputation_record", {
       interaction_id: "txn-c1",
       counterparty_did: "did:key:cp",
       outcome: { type: "transaction", result: "completed" },
       context: "commerce",
       identity_id: identity.identity_id,
     });
-    await callTool(inst.tools, "sanctuary/reputation_record", {
+    await callTool(inst.tools, "reputation_record", {
       interaction_id: "txn-c2",
       counterparty_did: "did:key:cp",
       outcome: { type: "service", result: "completed" },
@@ -160,7 +160,7 @@ describe("Reputation Portability", () => {
     });
 
     // Export only commerce
-    const commerceExport = await callTool(inst.tools, "sanctuary/reputation_export", {
+    const commerceExport = await callTool(inst.tools, "reputation_export", {
       context: "commerce",
       identity_id: identity.identity_id,
     });
@@ -169,7 +169,7 @@ describe("Reputation Portability", () => {
     expect((commerceExport.contexts as string[])).not.toContain("support");
 
     // Export all
-    const allExport = await callTool(inst.tools, "sanctuary/reputation_export", {
+    const allExport = await callTool(inst.tools, "reputation_export", {
       identity_id: identity.identity_id,
     });
     expect(allExport.attestation_count).toBe(2);

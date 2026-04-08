@@ -18,7 +18,7 @@ export function createAuditTools(
 ): { tools: ToolDefinition[] } {
   const tools: ToolDefinition[] = [
     {
-      name: "sanctuary/sovereignty_audit",
+      name: "sovereignty_audit",
       description:
         "Audit your agent's sovereignty posture. Inspects the local environment for " +
         "encryption, identity, approval gates, selective disclosure, and reputation — " +

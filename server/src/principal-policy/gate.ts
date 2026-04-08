@@ -67,7 +67,7 @@ export class ApprovalGate {
   /**
    * Evaluate a tool call against the Principal Policy.
    *
-   * @param toolName - Full MCP tool name (e.g., "sanctuary/state_export")
+   * @param toolName - Full MCP tool name (e.g., "state_export")
    * @param args - Tool call arguments (for context extraction)
    * @returns GateResult indicating whether the call is allowed
    */

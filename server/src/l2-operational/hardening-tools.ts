@@ -16,7 +16,7 @@ export function createL2HardeningTools(
 ): ToolDefinition[] {
   return [
     {
-      name: "sanctuary/l2_hardening_status",
+      name: "l2_hardening_status",
       description:
         "L2 Process Hardening Status — Verify software-based operational isolation. " +
         "Reports memory protection, process isolation level, filesystem permissions, " +
@@ -95,7 +95,7 @@ export function createL2HardeningTools(
     },
 
     {
-      name: "sanctuary/l2_verify_isolation",
+      name: "l2_verify_isolation",
       description:
         "Verify L2 process isolation at runtime. Checks whether the Sanctuary server " +
         "is running in an isolated environment (container, VM, sandbox) and validates " +

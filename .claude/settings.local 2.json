@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm -f .git/HEAD.lock .git/index.lock)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(npm test:*)",
+      "Bash(npx tsc:*)",
+      "Bash(git push:*)",
+      "Bash(git merge:*)",
+      "Bash(npm view:*)",
+      "Bash(npm version:*)",
+      "Bash(npm run:*)",
+      "Bash(npm publish:*)",
+      "Bash(npx vitest:*)",
+      "Bash(git stash:*)",
+      "Bash(echo \"EXIT: $?\")"
+    ]
+  }
+}

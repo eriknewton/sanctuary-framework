@@ -197,7 +197,7 @@ describe("Sovereignty Audit", () => {
       }
 
       // First recommendation should always be identity creation
-      expect(result.recommendations[0].tool).toBe("sanctuary/identity_create");
+      expect(result.recommendations[0].tool).toBe("identity_create");
     });
   });
 

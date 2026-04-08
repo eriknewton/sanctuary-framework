@@ -94,7 +94,7 @@ describe("sanctuary meta-tools", () => {
     it("creates an identity, generates SHR, and attempts to publish", async () => {
       const { allTools } = setup();
 
-      const result = await callTool(allTools, "sanctuary/sanctuary_bootstrap", {
+      const result = await callTool(allTools, "sanctuary_bootstrap", {
         label: "test-bootstrap",
       });
 
@@ -111,7 +111,7 @@ describe("sanctuary meta-tools", () => {
 
     it("returns identity without publishing when publish=false", async () => {
       const { allTools } = setup();
-      const result = await callTool(allTools, "sanctuary/sanctuary_bootstrap", {
+      const result = await callTool(allTools, "sanctuary_bootstrap", {
         label: "no-publish",
         publish: false,
       });
@@ -121,7 +121,7 @@ describe("sanctuary meta-tools", () => {
 
     it("rejects non-HTTPS verascore URLs", async () => {
       const { allTools } = setup();
-      const result = await callTool(allTools, "sanctuary/sanctuary_bootstrap", {
+      const result = await callTool(allTools, "sanctuary_bootstrap", {
         label: "bad-url",
         verascore_url: "http://evil.example.com",
       });
@@ -133,7 +133,7 @@ describe("sanctuary meta-tools", () => {
   describe("sanctuary_policy_status", () => {
     it("returns tier1 and tier3 lists from the active policy", async () => {
       const { allTools } = setup();
-      const result = await callTool(allTools, "sanctuary/sanctuary_policy_status");
+      const result = await callTool(allTools, "sanctuary_policy_status");
 
       expect(Array.isArray(result.tier1)).toBe(true);
       expect(Array.isArray(result.tier3)).toBe(true);
@@ -149,7 +149,7 @@ describe("sanctuary meta-tools", () => {
 
     it("includes Tier 2 anomaly configuration", async () => {
       const { allTools } = setup();
-      const result = await callTool(allTools, "sanctuary/sanctuary_policy_status");
+      const result = await callTool(allTools, "sanctuary_policy_status");
       expect(result.tier2_anomaly_config).toBeDefined();
       const t2 = result.tier2_anomaly_config as Record<string, unknown>;
       expect(t2.new_counterparty).toBeDefined();
@@ -160,13 +160,13 @@ describe("sanctuary meta-tools", () => {
     it("exports a signed identity bundle", async () => {
       const { allTools, identityManager } = setup();
       // Create an identity first
-      await callTool(allTools, "sanctuary/identity_create", { label: "bundle-test" });
+      await callTool(allTools, "identity_create", { label: "bundle-test" });
       const ids = identityManager.list();
       expect(ids.length).toBeGreaterThan(0);
 
       const result = await callTool(
         allTools,
-        "sanctuary/sanctuary_export_identity_bundle",
+        "sanctuary_export_identity_bundle",
         {}
       );
       expect(result.bundle).toBeDefined();
@@ -181,10 +181,10 @@ describe("sanctuary meta-tools", () => {
 
     it("bundle signature verifies against the included public key", async () => {
       const { allTools } = setup();
-      await callTool(allTools, "sanctuary/identity_create", { label: "verify-test" });
+      await callTool(allTools, "identity_create", { label: "verify-test" });
       const result = await callTool(
         allTools,
-        "sanctuary/sanctuary_export_identity_bundle",
+        "sanctuary_export_identity_bundle",
         { attestations: [{ id: "att-1" }] }
       );
 
@@ -204,7 +204,7 @@ describe("sanctuary meta-tools", () => {
       const { allTools } = setup();
       const result = await callTool(
         allTools,
-        "sanctuary/sanctuary_export_identity_bundle",
+        "sanctuary_export_identity_bundle",
         {}
       );
       expect(result.error).toBeDefined();
@@ -214,7 +214,7 @@ describe("sanctuary meta-tools", () => {
   describe("sanctuary_link_to_human", () => {
     it("POSTs to /api/auth/request and returns ok with redacted email", async () => {
       const { allTools } = setup();
-      const result = await callTool(allTools, "sanctuary/sanctuary_link_to_human", {
+      const result = await callTool(allTools, "sanctuary_link_to_human", {
         email: "human@example.com",
       });
       expect(result.ok).toBe(true);
@@ -231,7 +231,7 @@ describe("sanctuary meta-tools", () => {
 
     it("rejects invalid email formats", async () => {
       const { allTools } = setup();
-      const result = await callTool(allTools, "sanctuary/sanctuary_link_to_human", {
+      const result = await callTool(allTools, "sanctuary_link_to_human", {
         email: "not-an-email",
       });
       expect(result.ok).toBe(false);
@@ -240,7 +240,7 @@ describe("sanctuary meta-tools", () => {
 
     it("rejects non-HTTPS verascore URL", async () => {
       const { allTools } = setup();
-      const result = await callTool(allTools, "sanctuary/sanctuary_link_to_human", {
+      const result = await callTool(allTools, "sanctuary_link_to_human", {
         email: "human@example.com",
         verascore_url: "http://evil.example.com",
       });
@@ -267,11 +267,11 @@ describe("sanctuary meta-tools", () => {
 
     it("signs a domain-separated nonce and verifies against the reconstructed message", async () => {
       const { allTools, identityManager } = setup();
-      await callTool(allTools, "sanctuary/identity_create", { label: "sign-test" });
+      await callTool(allTools, "identity_create", { label: "sign-test" });
 
       const nonce = "challenge-nonce-xyz-12345";
       const purpose = "verascore-claim";
-      const result = await callTool(allTools, "sanctuary/sanctuary_sign_challenge", {
+      const result = await callTool(allTools, "sanctuary_sign_challenge", {
         nonce,
         purpose,
       });
@@ -300,9 +300,9 @@ describe("sanctuary meta-tools", () => {
 
     it("signatures for different purposes do not cross-verify", async () => {
       const { allTools } = setup();
-      await callTool(allTools, "sanctuary/identity_create", { label: "sign-test-2" });
+      await callTool(allTools, "identity_create", { label: "sign-test-2" });
       const nonce = "same-nonce-diff-purpose";
-      const a = await callTool(allTools, "sanctuary/sanctuary_sign_challenge", {
+      const a = await callTool(allTools, "sanctuary_sign_challenge", {
         nonce,
         purpose: "verascore-claim",
       });
@@ -316,10 +316,10 @@ describe("sanctuary meta-tools", () => {
 
     it("rejects missing purpose", async () => {
       const { allTools } = setup();
-      await callTool(allTools, "sanctuary/identity_create", { label: "t" });
+      await callTool(allTools, "identity_create", { label: "t" });
       const result = await callTool(
         allTools,
-        "sanctuary/sanctuary_sign_challenge",
+        "sanctuary_sign_challenge",
         { nonce: "abc" }
       );
       expect(result.error).toBeDefined();
@@ -327,10 +327,10 @@ describe("sanctuary meta-tools", () => {
 
     it("rejects empty nonces", async () => {
       const { allTools } = setup();
-      await callTool(allTools, "sanctuary/identity_create", { label: "t" });
+      await callTool(allTools, "identity_create", { label: "t" });
       const result = await callTool(
         allTools,
-        "sanctuary/sanctuary_sign_challenge",
+        "sanctuary_sign_challenge",
         { nonce: "", purpose: "verascore-claim" }
       );
       expect(result.error).toBeDefined();
@@ -338,10 +338,10 @@ describe("sanctuary meta-tools", () => {
 
     it("rejects over-long nonces", async () => {
       const { allTools } = setup();
-      await callTool(allTools, "sanctuary/identity_create", { label: "t" });
+      await callTool(allTools, "identity_create", { label: "t" });
       const result = await callTool(
         allTools,
-        "sanctuary/sanctuary_sign_challenge",
+        "sanctuary_sign_challenge",
         { nonce: "x".repeat(5000), purpose: "verascore-claim" }
       );
       expect(result.error).toBeDefined();
@@ -349,10 +349,10 @@ describe("sanctuary meta-tools", () => {
 
     it("rejects purposes with non-ASCII characters", async () => {
       const { allTools } = setup();
-      await callTool(allTools, "sanctuary/identity_create", { label: "t" });
+      await callTool(allTools, "identity_create", { label: "t" });
       const result = await callTool(
         allTools,
-        "sanctuary/sanctuary_sign_challenge",
+        "sanctuary_sign_challenge",
         { nonce: "abc", purpose: "ver\u0000score" }
       );
       expect(result.error).toBeDefined();

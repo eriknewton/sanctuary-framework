@@ -174,7 +174,7 @@ describe("ProxyRouter", () => {
     });
 
     it("returns null for non-proxy names", () => {
-      expect(ProxyRouter.parseProxyToolName("sanctuary/state_read")).toBeNull();
+      expect(ProxyRouter.parseProxyToolName("state_read")).toBeNull();
     });
 
     it("returns null for prefix-only name", () => {

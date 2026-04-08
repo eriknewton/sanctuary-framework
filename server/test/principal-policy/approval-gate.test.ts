@@ -66,7 +66,7 @@ describe("Approval Gate", () => {
       const channel = new AutoApproveChannel();
       const gate = new ApprovalGate(policy, baseline, channel, auditLog);
 
-      const result = await gate.evaluate("sanctuary/state_export", {});
+      const result = await gate.evaluate("state_export", {});
 
       expect(result.tier).toBe(1);
       expect(result.allowed).toBe(true); // AutoApprove always approves
@@ -82,7 +82,7 @@ describe("Approval Gate", () => {
       }));
       const gate = new ApprovalGate(policy, baseline, channel, auditLog);
 
-      const result = await gate.evaluate("sanctuary/state_export", {});
+      const result = await gate.evaluate("state_export", {});
 
       expect(result.tier).toBe(1);
       expect(result.allowed).toBe(false);
@@ -101,7 +101,7 @@ describe("Approval Gate", () => {
       const gate = new ApprovalGate(policy, baseline, channel, auditLog);
 
       // "reputation_record" is not in tier3_always_allow for this test policy
-      const result = await gate.evaluate("sanctuary/reputation_record", {});
+      const result = await gate.evaluate("reputation_record", {});
 
       expect(result.tier).toBe(2);
       expect(result.approval_required).toBe(true);
@@ -117,7 +117,7 @@ describe("Approval Gate", () => {
       const channel = new AutoApproveChannel();
       const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
 
-      const result = await gate.evaluate("sanctuary/state_read", {
+      const result = await gate.evaluate("state_read", {
         namespace: "brand-new-namespace",
       });
 
@@ -134,7 +134,7 @@ describe("Approval Gate", () => {
       const channel = new AutoApproveChannel();
       const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
 
-      const result = await gate.evaluate("sanctuary/reputation_record", {
+      const result = await gate.evaluate("reputation_record", {
         counterparty_did: "did:sanctuary:unknown-agent",
       });
 
@@ -154,10 +154,10 @@ describe("Approval Gate", () => {
       const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
 
       // Sign 4 times — exceeds max_signs_per_minute of 3
-      await gate.evaluate("sanctuary/identity_sign", { payload: "a" });
-      await gate.evaluate("sanctuary/identity_sign", { payload: "b" });
-      await gate.evaluate("sanctuary/identity_sign", { payload: "c" });
-      const result = await gate.evaluate("sanctuary/identity_sign", { payload: "d" });
+      await gate.evaluate("identity_sign", { payload: "a" });
+      await gate.evaluate("identity_sign", { payload: "b" });
+      await gate.evaluate("identity_sign", { payload: "c" });
+      const result = await gate.evaluate("identity_sign", { payload: "d" });
 
       expect(result.tier).toBe(2);
       expect(result.approval_required).toBe(true);
@@ -176,9 +176,9 @@ describe("Approval Gate", () => {
 
       // Read 6 times from same namespace — exceeds bulk_read_threshold of 5
       for (let i = 0; i < 5; i++) {
-        await gate.evaluate("sanctuary/state_read", { namespace: "target-ns" });
+        await gate.evaluate("state_read", { namespace: "target-ns" });
       }
-      const result = await gate.evaluate("sanctuary/state_read", { namespace: "target-ns" });
+      const result = await gate.evaluate("state_read", { namespace: "target-ns" });
 
       expect(result.tier).toBe(2);
       expect(result.approval_required).toBe(true);
@@ -197,7 +197,7 @@ describe("Approval Gate", () => {
       const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
 
       // state_read with no namespace arg → no anomaly
-      const result = await gate.evaluate("sanctuary/state_read", {});
+      const result = await gate.evaluate("state_read", {});
 
       expect(result.tier).toBe(3);
       expect(result.allowed).toBe(true);
@@ -213,7 +213,7 @@ describe("Approval Gate", () => {
       const channel = new AutoApproveChannel();
       const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
 
-      const result = await gate.evaluate("sanctuary/monitor_health", {});
+      const result = await gate.evaluate("monitor_health", {});
 
       expect(result.tier).toBe(3);
       expect(result.allowed).toBe(true);
@@ -233,7 +233,7 @@ describe("Approval Gate", () => {
       const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
 
       // "totally_new_tool" is not in tier1, tier3, or any list
-      const result = await gate.evaluate("sanctuary/totally_new_tool", {});
+      const result = await gate.evaluate("totally_new_tool", {});
 
       expect(result.tier).toBe(1);
       expect(result.approval_required).toBe(true);
@@ -254,7 +254,7 @@ describe("Approval Gate", () => {
 
       const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
 
-      const result = await gate.evaluate("sanctuary/totally_new_tool", {});
+      const result = await gate.evaluate("totally_new_tool", {});
 
       expect(result.tier).toBe(1);
       expect(result.approval_required).toBe(true);
@@ -270,7 +270,7 @@ describe("Approval Gate", () => {
 
       const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
 
-      await gate.evaluate("sanctuary/unregistered_dangerous_op", {});
+      await gate.evaluate("unregistered_dangerous_op", {});
 
       // Audit log should have entries: one for unclassified warning, one for gate decision
       expect(auditLog.size).toBeGreaterThanOrEqual(2);
@@ -286,7 +286,7 @@ describe("Approval Gate", () => {
       const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
 
       // state_read is in tier3_always_allow
-      const result = await gate.evaluate("sanctuary/state_read", {});
+      const result = await gate.evaluate("state_read", {});
 
       expect(result.tier).toBe(3);
       expect(result.allowed).toBe(true);
@@ -308,7 +308,7 @@ describe("Approval Gate", () => {
       });
       const gate = new ApprovalGate(policy, baseline, channel, auditLog);
 
-      const result = await gate.evaluate("sanctuary/state_export", {});
+      const result = await gate.evaluate("state_export", {});
 
       // The gate result reason should not list other tier1 operations
       expect(result.reason).not.toContain("identity_rotate");
@@ -325,9 +325,9 @@ describe("Approval Gate", () => {
       const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
 
       // Tier 1 → approve
-      await gate.evaluate("sanctuary/state_export", {});
+      await gate.evaluate("state_export", {});
       // Tier 3 → allow
-      await gate.evaluate("sanctuary/state_read", {});
+      await gate.evaluate("state_read", {});
 
       expect(auditLog.size).toBeGreaterThanOrEqual(2);
     });
@@ -338,7 +338,7 @@ describe("Approval Gate", () => {
       const gate = new ApprovalGate(policy, baseline, channel, auditLog);
 
       // "sanctuary/state_export" should match "state_export" in tier1
-      const result = await gate.evaluate("sanctuary/state_export", {});
+      const result = await gate.evaluate("state_export", {});
       expect(result.tier).toBe(1);
     });
   });

@@ -174,7 +174,7 @@ export function createL1Tools(
     // ── Identity Tools ──────────────────────────────────────────────────
 
     {
-      name: "sanctuary/identity_create",
+      name: "identity_create",
       description:
         "Create a new sovereign identity (Ed25519 keypair). " +
         "The private key is encrypted and never exposed.",
@@ -217,7 +217,7 @@ export function createL1Tools(
     },
 
     {
-      name: "sanctuary/identity_list",
+      name: "identity_list",
       description: "List all managed sovereign identities.",
       inputSchema: {
         type: "object",
@@ -243,7 +243,7 @@ export function createL1Tools(
     },
 
     {
-      name: "sanctuary/identity_sign",
+      name: "identity_sign",
       description:
         "Sign data with a managed identity. " +
         "The private key is decrypted in memory only during signing.",
@@ -289,7 +289,7 @@ export function createL1Tools(
     },
 
     {
-      name: "sanctuary/identity_verify",
+      name: "identity_verify",
       description:
         "Verify an Ed25519 signature. Provide either identity_id or public_key.",
       inputSchema: {
@@ -347,7 +347,7 @@ export function createL1Tools(
     },
 
     {
-      name: "sanctuary/identity_rotate",
+      name: "identity_rotate",
       description:
         "Rotate keys for an identity. Generates a new keypair and " +
         "signs a rotation event with the old key for verifiable chain.",
@@ -387,7 +387,7 @@ export function createL1Tools(
     // ── State Tools ─────────────────────────────────────────────────────
 
     {
-      name: "sanctuary/state_write",
+      name: "state_write",
       description:
         "Write encrypted state to the sovereign store. " +
         "Value is encrypted with a namespace-specific key. " +
@@ -457,7 +457,7 @@ export function createL1Tools(
     },
 
     {
-      name: "sanctuary/state_read",
+      name: "state_read",
       description:
         "Read and decrypt state from the sovereign store. " +
         "Verifies integrity via Merkle proof and signature.",
@@ -505,7 +505,7 @@ export function createL1Tools(
     },
 
     {
-      name: "sanctuary/state_list",
+      name: "state_list",
       description:
         "List keys in a namespace (metadata only — no decryption).",
       inputSchema: {
@@ -541,7 +541,7 @@ export function createL1Tools(
     },
 
     {
-      name: "sanctuary/state_delete",
+      name: "state_delete",
       description:
         "Securely delete state. Overwrites file with random bytes " +
         "before removal (right to deletion, S1.6).",
@@ -580,7 +580,7 @@ export function createL1Tools(
     },
 
     {
-      name: "sanctuary/state_export",
+      name: "state_export",
       description:
         "Export state as an encrypted, portable bundle for migration.",
       inputSchema: {
@@ -604,7 +604,7 @@ export function createL1Tools(
     },
 
     {
-      name: "sanctuary/state_import",
+      name: "state_import",
       description: "Import a previously exported state bundle.",
       inputSchema: {
         type: "object",

@@ -235,7 +235,7 @@ export async function createSanctuaryServer(options?: {
   // 9. Create L2 monitoring tools
   const l2Tools: ToolDefinition[] = [
     {
-      name: "sanctuary/exec_attest",
+      name: "exec_attest",
       description:
         "Generate an attestation of the current execution environment, " +
         "including sovereignty assessment and degradation report.",
@@ -294,7 +294,7 @@ export async function createSanctuaryServer(options?: {
     },
 
     {
-      name: "sanctuary/monitor_health",
+      name: "monitor_health",
       description:
         "Sanctuary Health Report (SHR) — standardized sovereignty status.",
       inputSchema: { type: "object", properties: {} },
@@ -357,7 +357,7 @@ export async function createSanctuaryServer(options?: {
     },
 
     {
-      name: "sanctuary/monitor_audit_log",
+      name: "monitor_audit_log",
       description: "Query the sovereignty audit log.",
       inputSchema: {
         type: "object",
@@ -385,7 +385,7 @@ export async function createSanctuaryServer(options?: {
 
   // 10. Create SIM manifest tool
   const manifestTool: ToolDefinition = {
-    name: "sanctuary/manifest",
+    name: "manifest",
     description:
       "Generate the Sanctuary Interface Manifest (SIM) — " +
       "a machine-readable declaration of this server's capabilities.",
@@ -623,7 +623,7 @@ export async function createSanctuaryServer(options?: {
   const dashboardTools: ToolDefinition[] = [];
   if (dashboard) {
     dashboardTools.push({
-      name: "sanctuary/dashboard_open",
+      name: "dashboard_open",
       description:
         "Generate a one-click URL to open the Principal Dashboard in a browser. " +
         "Returns a pre-authenticated link — no manual token entry needed.",

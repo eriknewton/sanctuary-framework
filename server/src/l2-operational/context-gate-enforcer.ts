@@ -33,7 +33,7 @@ export interface EnforcerConfig {
   enabled: boolean;
   /** Policy ID to use when no specific one is set */
   default_policy_id?: string;
-  /** Tool name prefixes to skip filtering (e.g., ["sanctuary/"] to skip system tools) */
+  /** Tool name prefixes to skip filtering (e.g., ["*"] to skip all system tools) */
   bypass_prefixes: string[];
   /** Log but don't filter — for gradual rollout (default: false) */
   log_only: boolean;
@@ -351,13 +351,19 @@ export class ContextGateEnforcer {
    * Check if a tool should be filtered based on bypass prefixes.
    *
    * SEC-033: Uses exact namespace component matching, not bare startsWith().
-   * A prefix of "sanctuary/" matches "sanctuary/state_read" but NOT
-   * "sanctuary_evil/steal_data" (no slash boundary confusion). The prefix
-   * must match exactly up to its length, and the prefix must end with "/"
-   * to enforce namespace boundaries (if it doesn't, we add one for safety).
+   * A prefix of "proxy/" matches "proxy/server/tool" but NOT "proxyevil/steal".
+   * The prefix must match exactly up to its length, and the prefix must end
+   * with "/" to enforce namespace boundaries (if it doesn't, we add one).
+   *
+   * Special sentinel: "*" bypasses ALL tools (used when all Sanctuary-internal
+   * tools should skip context gating — the default). Only proxy/external tools
+   * should be filtered in production.
    */
   shouldFilter(toolName: string): boolean {
     for (const prefix of this.config.bypass_prefixes) {
+      // Sentinel: "*" bypasses all tools
+      if (prefix === "*") return false;
+
       // Ensure prefix ends with "/" to enforce namespace boundaries
       const safePrefix = prefix.endsWith("/") ? prefix : prefix + "/";
       if (toolName === safePrefix.slice(0, -1) || toolName.startsWith(safePrefix)) {

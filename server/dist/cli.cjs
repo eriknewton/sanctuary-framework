@@ -965,7 +965,7 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
   const tools = [
     // ── Identity Tools ──────────────────────────────────────────────────
     {
-      name: "sanctuary/identity_create",
+      name: "identity_create",
       description: "Create a new sovereign identity (Ed25519 keypair). The private key is encrypted and never exposed.",
       inputSchema: {
         type: "object",
@@ -1000,7 +1000,7 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
       }
     },
     {
-      name: "sanctuary/identity_list",
+      name: "identity_list",
       description: "List all managed sovereign identities.",
       inputSchema: {
         type: "object",
@@ -1025,7 +1025,7 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
       }
     },
     {
-      name: "sanctuary/identity_sign",
+      name: "identity_sign",
       description: "Sign data with a managed identity. The private key is decrypted in memory only during signing.",
       inputSchema: {
         type: "object",
@@ -1063,7 +1063,7 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
       }
     },
     {
-      name: "sanctuary/identity_verify",
+      name: "identity_verify",
       description: "Verify an Ed25519 signature. Provide either identity_id or public_key.",
       inputSchema: {
         type: "object",
@@ -1112,7 +1112,7 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
       }
     },
     {
-      name: "sanctuary/identity_rotate",
+      name: "identity_rotate",
       description: "Rotate keys for an identity. Generates a new keypair and signs a rotation event with the old key for verifiable chain.",
       inputSchema: {
         type: "object",
@@ -1145,7 +1145,7 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
     },
     // ── State Tools ─────────────────────────────────────────────────────
     {
-      name: "sanctuary/state_write",
+      name: "state_write",
       description: "Write encrypted state to the sovereign store. Value is encrypted with a namespace-specific key. The write is signed by the active identity.",
       inputSchema: {
         type: "object",
@@ -1202,7 +1202,7 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
       }
     },
     {
-      name: "sanctuary/state_read",
+      name: "state_read",
       description: "Read and decrypt state from the sovereign store. Verifies integrity via Merkle proof and signature.",
       inputSchema: {
         type: "object",
@@ -1243,7 +1243,7 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
       }
     },
     {
-      name: "sanctuary/state_list",
+      name: "state_list",
       description: "List keys in a namespace (metadata only \u2014 no decryption).",
       inputSchema: {
         type: "object",
@@ -1275,7 +1275,7 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
       }
     },
     {
-      name: "sanctuary/state_delete",
+      name: "state_delete",
       description: "Securely delete state. Overwrites file with random bytes before removal (right to deletion, S1.6).",
       inputSchema: {
         type: "object",
@@ -1307,7 +1307,7 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
       }
     },
     {
-      name: "sanctuary/state_export",
+      name: "state_export",
       description: "Export state as an encrypted, portable bundle for migration.",
       inputSchema: {
         type: "object",
@@ -1327,7 +1327,7 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
       }
     },
     {
-      name: "sanctuary/state_import",
+      name: "state_import",
       description: "Import a previously exported state bundle.",
       inputSchema: {
         type: "object",
@@ -1738,8 +1738,6 @@ tier3_always_allow:
   - governor_status
   - reputation_publish
   - sanctuary_policy_status
-  - sanctuary_link_to_human
-  - sanctuary_sign_challenge
 
 # \u2500\u2500\u2500 Approval Channel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # How Sanctuary reaches you when approval is needed.
@@ -5073,6 +5071,807 @@ var init_dashboard_html = __esm({
   }
 });
 
+// src/cocoon/fortress-view.ts
+function generateFortressViewHTML(options) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sanctuary \u2014 Fortress View</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --surface-raised: #1c2128;
+      --border: #30363d;
+      --text-primary: #e6edf3;
+      --text-secondary: #8b949e;
+      --text-muted: #484f58;
+      --green: #3fb950;
+      --green-dim: #238636;
+      --amber: #d29922;
+      --amber-dim: #9e6a03;
+      --red: #f85149;
+      --red-dim: #da3633;
+      --blue: #58a6ff;
+      --blue-dim: #1f6feb;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background-color: var(--bg);
+      color: var(--text-primary);
+      min-height: 100vh;
+    }
+
+    /* \u2500\u2500 Header \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+    .fortress-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+
+    .fortress-brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .fortress-brand .shield {
+      font-size: 28px;
+      color: var(--blue);
+    }
+
+    .fortress-brand h1 {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.5px;
+    }
+
+    .fortress-brand .version {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .header-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .header-actions button {
+      padding: 6px 16px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text-primary);
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .header-actions button:hover {
+      background: var(--surface-raised);
+    }
+
+    .header-actions .pause-btn {
+      border-color: var(--red-dim);
+      color: var(--red);
+    }
+
+    .header-actions .pause-btn:hover {
+      background: rgba(248, 81, 73, 0.1);
+    }
+
+    .header-actions .pause-btn.paused {
+      background: var(--red-dim);
+      color: white;
+    }
+
+    /* \u2500\u2500 Tab bar \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+    .tab-bar {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      padding: 0 24px;
+    }
+
+    .tab-bar button {
+      padding: 10px 16px;
+      border: none;
+      background: none;
+      color: var(--text-secondary);
+      font-size: 14px;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all 0.15s;
+    }
+
+    .tab-bar button:hover {
+      color: var(--text-primary);
+    }
+
+    .tab-bar button.active {
+      color: var(--text-primary);
+      border-bottom-color: var(--blue);
+    }
+
+    /* \u2500\u2500 Content \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+    .fortress-content { padding: 24px; }
+
+    /* \u2500\u2500 Status Banner \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+    .status-banner {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 20px 24px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      margin-bottom: 24px;
+    }
+
+    .status-indicator {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+      flex-shrink: 0;
+    }
+
+    .status-indicator.green { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+    .status-indicator.amber { background: rgba(210, 153, 34, 0.15); color: var(--amber); }
+    .status-indicator.red { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+
+    .status-info h2 {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .status-info p {
+      font-size: 14px;
+      color: var(--text-secondary);
+    }
+
+    .status-stats {
+      display: flex;
+      gap: 24px;
+      margin-left: auto;
+    }
+
+    .stat {
+      text-align: center;
+    }
+
+    .stat .value {
+      font-size: 24px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stat .label {
+      font-size: 11px;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    /* \u2500\u2500 Two-column layout \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+    .fortress-grid {
+      display: grid;
+      grid-template-columns: 1fr 360px;
+      gap: 24px;
+    }
+
+    @media (max-width: 900px) {
+      .fortress-grid { grid-template-columns: 1fr; }
+    }
+
+    /* \u2500\u2500 Feed \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+    .feed-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .panel-header h3 {
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .feed-list {
+      max-height: 600px;
+      overflow-y: auto;
+      scroll-behavior: smooth;
+    }
+
+    .feed-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      transition: background 0.1s;
+    }
+
+    .feed-item:hover {
+      background: var(--surface-raised);
+    }
+
+    .feed-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-top: 5px;
+      flex-shrink: 0;
+    }
+
+    .feed-dot.green { background: var(--green); }
+    .feed-dot.amber { background: var(--amber); }
+    .feed-dot.red { background: var(--red); }
+
+    .feed-detail {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .feed-tool {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 12px;
+      color: var(--blue);
+      word-break: break-all;
+    }
+
+    .feed-decision {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+
+    .feed-time {
+      font-size: 11px;
+      color: var(--text-muted);
+      flex-shrink: 0;
+      white-space: nowrap;
+    }
+
+    .feed-empty {
+      padding: 40px 16px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+
+    /* \u2500\u2500 Alerts Panel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+    .alerts-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .alert-item {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .alert-item .alert-title {
+      font-size: 13px;
+      font-weight: 500;
+      margin-bottom: 4px;
+    }
+
+    .alert-item .alert-desc {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+    }
+
+    .alert-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .alert-actions button {
+      padding: 4px 12px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .approve-btn {
+      background: var(--green-dim);
+      color: white;
+      border-color: var(--green-dim) !important;
+    }
+
+    .approve-btn:hover { opacity: 0.9; }
+
+    .deny-btn {
+      background: none;
+      color: var(--red);
+      border-color: var(--red-dim) !important;
+    }
+
+    .deny-btn:hover {
+      background: rgba(248, 81, 73, 0.1);
+    }
+
+    .alerts-empty {
+      padding: 40px 16px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+
+    /* \u2500\u2500 Servers panel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+    .servers-panel {
+      margin-top: 16px;
+    }
+
+    .server-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+
+    .server-status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+
+    .server-status-dot.connected { background: var(--green); }
+    .server-status-dot.connecting { background: var(--amber); }
+    .server-status-dot.disconnected, .server-status-dot.error { background: var(--red); }
+
+    .server-name {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 12px;
+    }
+
+    .server-tier {
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <div class="fortress-header">
+    <div class="fortress-brand">
+      <div class="shield">&#x1F6E1;</div>
+      <div>
+        <h1>Sanctuary Cocoon</h1>
+        <div class="version">v${esc(options.serverVersion)}</div>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button class="pause-btn" id="pause-btn" title="Pause agent \u2014 requires approval for all operations">Pause Agent</button>
+      <button id="advanced-btn">Advanced</button>
+    </div>
+  </div>
+
+  <!-- Tab bar -->
+  <div class="tab-bar">
+    <button class="active" data-tab="fortress">Fortress</button>
+    <button data-tab="advanced">Advanced</button>
+  </div>
+
+  <!-- Fortress View -->
+  <div class="fortress-content" id="fortress-tab">
+    <!-- Status Banner -->
+    <div class="status-banner" id="status-banner">
+      <div class="status-indicator green" id="status-indicator">&#x2713;</div>
+      <div class="status-info">
+        <h2 id="status-title">Agent Protected</h2>
+        <p id="status-subtitle">${options.upstreamServerCount} server${options.upstreamServerCount !== 1 ? "s" : ""} monitored. All systems nominal.</p>
+      </div>
+      <div class="status-stats">
+        <div class="stat">
+          <div class="value" id="stat-total">0</div>
+          <div class="label">Calls</div>
+        </div>
+        <div class="stat">
+          <div class="value" id="stat-blocked">0</div>
+          <div class="label">Blocked</div>
+        </div>
+        <div class="stat">
+          <div class="value" id="stat-pending">0</div>
+          <div class="label">Pending</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Two-column layout -->
+    <div class="fortress-grid">
+      <!-- Live Feed -->
+      <div class="feed-panel">
+        <div class="panel-header">
+          <h3>Live Activity</h3>
+          <span style="font-size: 12px; color: var(--text-muted);" id="feed-count">0 events</span>
+        </div>
+        <div class="feed-list" id="feed-list">
+          <div class="feed-empty">Waiting for tool calls...</div>
+        </div>
+      </div>
+
+      <!-- Right column: Alerts + Servers -->
+      <div>
+        <!-- Alerts -->
+        <div class="alerts-panel">
+          <div class="panel-header">
+            <h3>Needs Attention</h3>
+            <span style="font-size: 12px; color: var(--text-muted);" id="alert-count">0</span>
+          </div>
+          <div id="alerts-list">
+            <div class="alerts-empty">No pending actions</div>
+          </div>
+        </div>
+
+        <!-- Servers -->
+        <div class="alerts-panel servers-panel">
+          <div class="panel-header">
+            <h3>Upstream Servers</h3>
+          </div>
+          <div id="servers-list">
+            <div class="alerts-empty">No servers configured</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // \u2500\u2500 State \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    const API_BASE = window.location.origin;
+    const SESSION_TOKEN = sessionStorage.getItem('sanctuary_session') || '';
+    const MAX_FEED_ITEMS = 50;
+
+    let feedItems = [];
+    let totalCalls = 0;
+    let blockedCalls = 0;
+    let pendingApprovals = [];
+    let upstreamServers = [];
+    let paused = false;
+
+    // \u2500\u2500 SSE Connection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    function connectSSE() {
+      const url = API_BASE + '/events' + (SESSION_TOKEN ? '?session=' + SESSION_TOKEN : '');
+      const eventSource = new EventSource(url);
+
+      eventSource.addEventListener('proxy-call', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          addFeedItem(data);
+        } catch {}
+      });
+
+      eventSource.addEventListener('proxy-server-status', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          updateServerStatus(data.server, data.state, data.tool_count, data.error);
+        } catch {}
+      });
+
+      eventSource.addEventListener('injection-alert', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          addFeedItem({
+            tool: data.tool_name || 'unknown',
+            server: 'detection',
+            decision: 'blocked',
+            reason: 'Injection detected: ' + (data.signals || []).join(', '),
+            timestamp: new Date().toISOString(),
+          });
+        } catch {}
+      });
+
+      eventSource.addEventListener('approval-request', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          addPendingApproval(data);
+        } catch {}
+      });
+
+      eventSource.addEventListener('approval-resolved', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          removePendingApproval(data.id);
+        } catch {}
+      });
+
+      eventSource.onerror = () => {
+        eventSource.close();
+        setTimeout(connectSSE, 3000);
+      };
+    }
+
+    // \u2500\u2500 Feed \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    function addFeedItem(data) {
+      totalCalls++;
+      if (data.decision === 'blocked' || data.decision === 'denied') {
+        blockedCalls++;
+      }
+
+      feedItems.unshift({
+        tool: data.tool || 'unknown',
+        server: data.server || '',
+        decision: data.decision || 'allowed',
+        reason: data.reason || '',
+        time: data.timestamp || new Date().toISOString(),
+      });
+
+      if (feedItems.length > MAX_FEED_ITEMS) {
+        feedItems = feedItems.slice(0, MAX_FEED_ITEMS);
+      }
+
+      renderFeed();
+      updateStats();
+      updateStatus();
+    }
+
+    function renderFeed() {
+      const container = document.getElementById('feed-list');
+      if (feedItems.length === 0) {
+        container.innerHTML = '<div class="feed-empty">Waiting for tool calls...</div>';
+        return;
+      }
+
+      container.innerHTML = feedItems.map(item => {
+        const dotColor = item.decision === 'allowed' ? 'green'
+          : item.decision === 'pending' ? 'amber' : 'red';
+        const decisionText = item.decision === 'allowed' ? 'Auto-allowed'
+          : item.decision === 'pending' ? 'Awaiting approval'
+          : item.decision === 'blocked' ? 'Blocked' : item.decision;
+        const timeStr = new Date(item.time).toLocaleTimeString();
+
+        return '<div class="feed-item">' +
+          '<div class="feed-dot ' + dotColor + '"></div>' +
+          '<div class="feed-detail">' +
+            '<div class="feed-tool">' + esc(item.tool) + '</div>' +
+            '<div class="feed-decision">' + esc(decisionText) +
+              (item.reason ? ' \u2014 ' + esc(item.reason) : '') + '</div>' +
+          '</div>' +
+          '<div class="feed-time">' + esc(timeStr) + '</div>' +
+        '</div>';
+      }).join('');
+
+      document.getElementById('feed-count').textContent = feedItems.length + ' events';
+    }
+
+    // \u2500\u2500 Alerts (Pending Approvals) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    function addPendingApproval(data) {
+      pendingApprovals.push(data);
+      renderAlerts();
+      updateStats();
+      updateStatus();
+    }
+
+    function removePendingApproval(id) {
+      pendingApprovals = pendingApprovals.filter(a => a.id !== id);
+      renderAlerts();
+      updateStats();
+      updateStatus();
+    }
+
+    function renderAlerts() {
+      const container = document.getElementById('alerts-list');
+      if (pendingApprovals.length === 0) {
+        container.innerHTML = '<div class="alerts-empty">No pending actions</div>';
+        document.getElementById('alert-count').textContent = '0';
+        return;
+      }
+
+      document.getElementById('alert-count').textContent = pendingApprovals.length.toString();
+
+      container.innerHTML = pendingApprovals.map(approval => {
+        return '<div class="alert-item">' +
+          '<div class="alert-title">Approval required: ' + esc(approval.operation || approval.tool_name || 'unknown') + '</div>' +
+          '<div class="alert-desc">' + esc(approval.reason || 'This operation requires your approval before it can proceed.') + '</div>' +
+          '<div class="alert-actions">' +
+            '<button class="approve-btn" onclick="handleApproval(\\'' + esc(approval.id) + '\\', true)">Approve</button>' +
+            '<button class="deny-btn" onclick="handleApproval(\\'' + esc(approval.id) + '\\', false)">Deny</button>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+    async function handleApproval(id, approved) {
+      const endpoint = approved ? '/api/approve/' : '/api/deny/';
+      try {
+        await fetch(API_BASE + endpoint + id, {
+          method: 'POST',
+          headers: SESSION_TOKEN ? { 'Authorization': 'Bearer ' + SESSION_TOKEN } : {},
+        });
+        removePendingApproval(id);
+      } catch (err) {
+        console.error('Approval action failed:', err);
+      }
+    }
+
+    // \u2500\u2500 Servers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    function updateServerStatus(serverName, state, toolCount, error) {
+      const existing = upstreamServers.find(s => s.name === serverName);
+      if (existing) {
+        existing.state = state;
+        existing.tool_count = toolCount;
+        existing.error = error;
+      } else {
+        upstreamServers.push({ name: serverName, state, tool_count: toolCount, error });
+      }
+      renderServers();
+      updateStatus();
+    }
+
+    function renderServers() {
+      const container = document.getElementById('servers-list');
+      if (upstreamServers.length === 0) {
+        container.innerHTML = '<div class="alerts-empty">No servers configured</div>';
+        return;
+      }
+
+      container.innerHTML = upstreamServers.map(server => {
+        const stateClass = server.state || 'disconnected';
+        const stateLabel = server.state === 'connected' ? 'Connected'
+          : server.state === 'connecting' ? 'Connecting...'
+          : server.state === 'error' ? 'Error' : 'Disconnected';
+
+        return '<div class="server-row">' +
+          '<div class="server-status-dot ' + stateClass + '"></div>' +
+          '<span class="server-name">' + esc(server.name) + '</span>' +
+          '<span class="server-tier">' + esc(stateLabel) +
+            (server.tool_count ? ' (' + server.tool_count + ' tools)' : '') + '</span>' +
+        '</div>';
+      }).join('');
+    }
+
+    // \u2500\u2500 Status Banner \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    function updateStats() {
+      document.getElementById('stat-total').textContent = totalCalls.toString();
+      document.getElementById('stat-blocked').textContent = blockedCalls.toString();
+      document.getElementById('stat-pending').textContent = pendingApprovals.length.toString();
+    }
+
+    function updateStatus() {
+      const indicator = document.getElementById('status-indicator');
+      const title = document.getElementById('status-title');
+      const subtitle = document.getElementById('status-subtitle');
+
+      const hasErrors = upstreamServers.some(s => s.state === 'error');
+      const hasPending = pendingApprovals.length > 0;
+      const hasBlocked = blockedCalls > 0;
+
+      if (paused) {
+        indicator.className = 'status-indicator red';
+        indicator.innerHTML = '&#x23F8;';
+        title.textContent = 'Agent Paused';
+        subtitle.textContent = 'All operations require approval. Click Resume to restore normal mode.';
+      } else if (hasErrors) {
+        indicator.className = 'status-indicator red';
+        indicator.innerHTML = '&#x26A0;';
+        title.textContent = 'Connection Issues';
+        subtitle.textContent = 'One or more upstream servers have errors.';
+      } else if (hasPending) {
+        indicator.className = 'status-indicator amber';
+        indicator.innerHTML = '&#x23F3;';
+        title.textContent = 'Action Required';
+        subtitle.textContent = pendingApprovals.length + ' operation' + (pendingApprovals.length > 1 ? 's' : '') + ' awaiting your approval.';
+      } else {
+        indicator.className = 'status-indicator green';
+        indicator.innerHTML = '&#x2713;';
+        title.textContent = 'Agent Protected';
+        const serverCount = upstreamServers.filter(s => s.state === 'connected').length || ${options.upstreamServerCount};
+        subtitle.textContent = serverCount + ' server' + (serverCount !== 1 ? 's' : '') + ' monitored. All systems nominal.';
+      }
+    }
+
+    // \u2500\u2500 Pause/Resume \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    document.getElementById('pause-btn').addEventListener('click', () => {
+      paused = !paused;
+      const btn = document.getElementById('pause-btn');
+      if (paused) {
+        btn.textContent = 'Resume Agent';
+        btn.classList.add('paused');
+      } else {
+        btn.textContent = 'Pause Agent';
+        btn.classList.remove('paused');
+      }
+      updateStatus();
+      // TODO: POST to /api/cocoon/pause to set all tiers to 1
+    });
+
+    // \u2500\u2500 Tab switching \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    document.getElementById('advanced-btn').addEventListener('click', () => {
+      window.location.href = '/dashboard?session=' + SESSION_TOKEN;
+    });
+
+    document.querySelectorAll('.tab-bar button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const tab = btn.dataset.tab;
+        if (tab === 'advanced') {
+          window.location.href = '/dashboard?session=' + SESSION_TOKEN;
+        }
+      });
+    });
+
+    // \u2500\u2500 Escape helper \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    function esc(str) {
+      if (!str) return '';
+      const d = document.createElement('div');
+      d.textContent = String(str);
+      return d.innerHTML;
+    }
+
+    // \u2500\u2500 Init \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    async function init() {
+      // Load initial server state
+      try {
+        const resp = await fetch(API_BASE + '/api/proxy/servers', {
+          headers: SESSION_TOKEN ? { 'Authorization': 'Bearer ' + SESSION_TOKEN } : {},
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          upstreamServers = data.servers || [];
+          renderServers();
+        }
+      } catch {}
+
+      // Load pending approvals
+      try {
+        const resp = await fetch(API_BASE + '/api/pending', {
+          headers: SESSION_TOKEN ? { 'Authorization': 'Bearer ' + SESSION_TOKEN } : {},
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          pendingApprovals = data.pending || [];
+          renderAlerts();
+          updateStats();
+        }
+      } catch {}
+
+      updateStatus();
+      connectSSE();
+    }
+
+    init();
+  </script>
+</body>
+</html>`;
+}
+function esc(str) {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+}
+var init_fortress_view = __esm({
+  "src/cocoon/fortress-view.ts"() {
+  }
+});
+
 // src/system-prompt-generator.ts
 function generateSystemPrompt(profile) {
   const activeFeatures = [];
@@ -5134,12 +5933,12 @@ function buildQuickStart(activeKeys) {
   const items = [];
   if (activeKeys.includes("context_gating")) {
     items.push(
-      "1. ALWAYS call sanctuary/context_gate_filter before sending context to external APIs."
+      "1. ALWAYS call context_gate_filter before sending context to external APIs."
     );
   }
   if (activeKeys.includes("zk_proofs")) {
     items.push(
-      `${items.length + 1}. Use sanctuary/zk_commit to prove claims without revealing underlying data.`
+      `${items.length + 1}. Use zk_commit to prove claims without revealing underlying data.`
     );
   }
   if (activeKeys.includes("approval_gate")) {
@@ -5165,9 +5964,9 @@ var init_system_prompt_generator = __esm({
     FEATURE_INFO = {
       audit_logging: {
         name: "Audit Logging",
-        activeDescription: "All your tool calls are logged to an encrypted audit trail. No action needed \u2014 this is automatic. You can query the log with sanctuary/monitor_audit_log if you need to review past activity.",
-        toolNames: ["sanctuary/monitor_audit_log"],
-        disabledDescription: "audit logging (sanctuary/monitor_audit_log)",
+        activeDescription: "All your tool calls are logged to an encrypted audit trail. No action needed \u2014 this is automatic. You can query the log with monitor_audit_log if you need to review past activity.",
+        toolNames: ["monitor_audit_log"],
+        disabledDescription: "audit logging (monitor_audit_log)",
         usageExample: "Automatic \u2014 every tool call you make is recorded. No explicit action required."
       },
       injection_detection: {
@@ -5178,16 +5977,16 @@ var init_system_prompt_generator = __esm({
       },
       context_gating: {
         name: "Context Gating",
-        activeDescription: "Before sending context to any external API (LLM inference, tool APIs, logging services), call sanctuary/context_gate_filter to strip sensitive fields. Use sanctuary/context_gate_set_policy to define filtering rules, or sanctuary/context_gate_apply_template for presets.",
+        activeDescription: "Before sending context to any external API (LLM inference, tool APIs, logging services), call context_gate_filter to strip sensitive fields. Use context_gate_set_policy to define filtering rules, or context_gate_apply_template for presets.",
         toolNames: [
-          "sanctuary/context_gate_filter",
-          "sanctuary/context_gate_set_policy",
-          "sanctuary/context_gate_apply_template",
-          "sanctuary/context_gate_recommend",
-          "sanctuary/context_gate_list_policies"
+          "context_gate_filter",
+          "context_gate_set_policy",
+          "context_gate_apply_template",
+          "context_gate_recommend",
+          "context_gate_list_policies"
         ],
-        disabledDescription: "context gating (sanctuary/context_gate_filter)",
-        usageExample: "Before calling an external API, run: sanctuary/context_gate_filter with your context object and policy_id to get a filtered version."
+        disabledDescription: "context gating (context_gate_filter)",
+        usageExample: "Before calling an external API, run: context_gate_filter with your context object and policy_id to get a filtered version."
       },
       approval_gate: {
         name: "Approval Gates",
@@ -5197,15 +5996,15 @@ var init_system_prompt_generator = __esm({
       },
       zk_proofs: {
         name: "Zero-Knowledge Proofs",
-        activeDescription: "You can prove claims about your data without revealing the underlying values. Use sanctuary/zk_commit to create a Pedersen commitment, sanctuary/zk_prove (Schnorr proof) to prove you know a committed value, and sanctuary/zk_range_prove to prove a value falls within a range \u2014 all without disclosing the actual data. For simpler SHA-256 commitments, use sanctuary/proof_commitment.",
+        activeDescription: "You can prove claims about your data without revealing the underlying values. Use zk_commit to create a Pedersen commitment, zk_prove (Schnorr proof) to prove you know a committed value, and zk_range_prove to prove a value falls within a range \u2014 all without disclosing the actual data. For simpler SHA-256 commitments, use proof_commitment.",
         toolNames: [
-          "sanctuary/zk_commit",
-          "sanctuary/zk_prove",
-          "sanctuary/zk_range_prove",
-          "sanctuary/proof_commitment"
+          "zk_commit",
+          "zk_prove",
+          "zk_range_prove",
+          "proof_commitment"
         ],
-        disabledDescription: "zero-knowledge proofs (sanctuary/zk_commit, sanctuary/zk_prove)",
-        usageExample: "To prove a claim without revealing data: first sanctuary/zk_commit to commit, then sanctuary/zk_prove or sanctuary/zk_range_prove to generate a verifiable proof."
+        disabledDescription: "zero-knowledge proofs (zk_commit, zk_prove)",
+        usageExample: "To prove a claim without revealing data: first zk_commit to commit, then zk_prove or zk_range_prove to generate a verifiable proof."
       }
     };
   }
@@ -5216,6 +6015,7 @@ var init_dashboard = __esm({
     init_config();
     init_generator();
     init_dashboard_html();
+    init_fortress_view();
     init_system_prompt_generator();
     SESSION_TTL_REMOTE_MS = 5 * 60 * 1e3;
     SESSION_TTL_LOCAL_MS = 24 * 60 * 60 * 1e3;
@@ -5239,6 +6039,7 @@ var init_dashboard = __esm({
       profileStore = null;
       clientManager = null;
       dashboardHTML;
+      fortressHTML = null;
       loginHTML;
       authToken;
       useTLS;
@@ -5624,8 +6425,14 @@ var init_dashboard = __esm({
         if (!this.checkAuth(req, url, res)) return;
         if (!this.checkRateLimit(req, res, "general")) return;
         try {
-          if (method === "GET" && (url.pathname === "/" || url.pathname === "/dashboard")) {
-            this.serveDashboard(res);
+          if (method === "GET" && url.pathname === "/fortress") {
+            this.serveFortressView(res);
+          } else if (method === "GET" && (url.pathname === "/" || url.pathname === "/dashboard")) {
+            if (this.fortressHTML) {
+              this.serveFortressView(res);
+            } else {
+              this.serveDashboard(res);
+            }
           } else if (method === "GET" && url.pathname === "/events") {
             this.handleSSE(req, res);
           } else if (method === "GET" && url.pathname === "/api/status") {
@@ -5719,6 +6526,35 @@ var init_dashboard = __esm({
           "Cache-Control": "no-cache"
         });
         res.end(this.dashboardHTML);
+      }
+      serveFortressView(res) {
+        if (!this.fortressHTML) {
+          this.serveDashboard(res);
+          return;
+        }
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-cache"
+        });
+        res.end(this.fortressHTML);
+      }
+      /**
+       * Enable Fortress View (Cocoon mode) with the given upstream server count.
+       * Once enabled, the root path `/` serves the Fortress View instead of the
+       * standard dashboard. The standard dashboard remains available at `/dashboard`.
+       */
+      enableFortressView(upstreamServerCount) {
+        this.fortressHTML = generateFortressViewHTML({
+          serverVersion: SANCTUARY_VERSION,
+          authToken: this.authToken,
+          upstreamServerCount
+        });
+      }
+      /**
+       * Broadcast a proxy call event to connected dashboards (Fortress View feed).
+       */
+      broadcastProxyCall(data) {
+        this.broadcastSSE("proxy-call", data);
       }
       handleSSE(req, res) {
         res.writeHead(200, {
@@ -6361,6 +7197,445 @@ var init_sovereignty_profile = __esm({
           stringToBytes(JSON.stringify(encrypted))
         );
       }
+    };
+  }
+});
+async function backupConfig(configPath) {
+  await promises.mkdir(BACKUP_DIR, { recursive: true, mode: 448 });
+  const timestamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+  const backupPath = path.join(BACKUP_DIR, `config-backup-${timestamp}.json`);
+  await promises.copyFile(configPath, backupPath);
+  return backupPath;
+}
+async function restoreConfig(backupPath, targetPath) {
+  await promises.copyFile(backupPath, targetPath);
+}
+async function findLatestBackup() {
+  const metaPath = path.join(BACKUP_DIR, "cocoon-meta.json");
+  try {
+    const raw = await promises.readFile(metaPath, "utf-8");
+    const meta = JSON.parse(raw);
+    return {
+      backupPath: meta.backupPath,
+      originalPath: meta.originalPath
+    };
+  } catch {
+    return null;
+  }
+}
+async function saveCocoonMeta(meta) {
+  await promises.mkdir(BACKUP_DIR, { recursive: true, mode: 448 });
+  const metaPath = path.join(BACKUP_DIR, "cocoon-meta.json");
+  await promises.writeFile(metaPath, JSON.stringify(meta, null, 2), { mode: 384 });
+}
+async function detectAgentConfig(platform2, configPath) {
+  if (configPath) {
+    return readConfigFile(configPath, platform2 ?? "generic");
+  }
+  if (platform2) {
+    const paths = PLATFORM_PATHS[platform2];
+    for (const path of paths) {
+      const config = await readConfigFile(path, platform2);
+      if (config) return config;
+    }
+    return null;
+  }
+  for (const [plat, paths] of Object.entries(PLATFORM_PATHS)) {
+    for (const path of paths) {
+      const config = await readConfigFile(path, plat);
+      if (config) return config;
+    }
+  }
+  return null;
+}
+async function readConfigFile(path, platform2) {
+  try {
+    await promises.access(path);
+  } catch {
+    return null;
+  }
+  try {
+    const raw = await promises.readFile(path, "utf-8");
+    const config = JSON.parse(raw);
+    const servers = extractServers(config, platform2);
+    return { platform: platform2, configPath: path, servers, rawConfig: config };
+  } catch {
+    return null;
+  }
+}
+function extractServers(config, platform2) {
+  if (!config || typeof config !== "object") return [];
+  const servers = [];
+  const obj = config;
+  if (platform2 === "openclaw" || platform2 === "generic") {
+    const mcp = obj.mcp;
+    const nestedServers = mcp?.servers;
+    if (nestedServers && typeof nestedServers === "object") {
+      for (const [name, serverConfig] of Object.entries(nestedServers)) {
+        const entry = parseServerEntry(name, serverConfig);
+        if (entry) servers.push(entry);
+      }
+    }
+    if (servers.length === 0) {
+      const mcpServers = obj.mcpServers;
+      if (mcpServers && typeof mcpServers === "object") {
+        for (const [name, serverConfig] of Object.entries(mcpServers)) {
+          const entry = parseServerEntry(name, serverConfig);
+          if (entry) servers.push(entry);
+        }
+      }
+    }
+  }
+  if (platform2 === "claude-code") {
+    const mcpServers = obj.mcpServers;
+    if (mcpServers && typeof mcpServers === "object") {
+      for (const [name, serverConfig] of Object.entries(mcpServers)) {
+        if (name.toLowerCase().includes("sanctuary")) continue;
+        const entry = parseServerEntry(name, serverConfig);
+        if (entry) servers.push(entry);
+      }
+    }
+  }
+  if (platform2 === "cursor") {
+    const mcpServers = obj.mcpServers;
+    if (mcpServers && typeof mcpServers === "object") {
+      for (const [name, serverConfig] of Object.entries(mcpServers)) {
+        if (name.toLowerCase().includes("sanctuary")) continue;
+        const entry = parseServerEntry(name, serverConfig);
+        if (entry) servers.push(entry);
+      }
+    }
+  }
+  return servers;
+}
+function parseServerEntry(name, config) {
+  if (!config || typeof config !== "object") return null;
+  const c = config;
+  const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "-").substring(0, 128);
+  if (!safeName) return null;
+  if (c.url && typeof c.url === "string") {
+    return {
+      name: safeName,
+      transport: "sse",
+      url: c.url,
+      env: extractEnv(c.env)
+    };
+  }
+  if (c.command && typeof c.command === "string") {
+    return {
+      name: safeName,
+      transport: "stdio",
+      command: c.command,
+      args: Array.isArray(c.args) ? c.args.filter((a) => typeof a === "string") : void 0,
+      env: extractEnv(c.env)
+    };
+  }
+  return null;
+}
+function extractEnv(env) {
+  if (!env || typeof env !== "object") return void 0;
+  const result = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v === "string") result[k] = v;
+  }
+  return Object.keys(result).length > 0 ? result : void 0;
+}
+async function rewriteConfigForCocoon(agentConfig, sanctuaryCommand, sanctuaryArgs, sanctuaryEnv) {
+  const raw = agentConfig.rawConfig;
+  let existingServers = {};
+  if (agentConfig.platform === "openclaw") {
+    const existingMcp = raw.mcp ?? {};
+    existingServers = existingMcp.servers ?? {};
+  } else {
+    existingServers = raw.mcpServers ?? {};
+  }
+  let resolvedEnv = sanctuaryEnv;
+  if (!resolvedEnv) {
+    const existingSanctuary = existingServers.sanctuary;
+    if (existingSanctuary?.env && typeof existingSanctuary.env === "object") {
+      const extracted = extractEnv(existingSanctuary.env);
+      if (extracted) resolvedEnv = extracted;
+    }
+  }
+  const sanctuaryEntry = {
+    command: sanctuaryCommand,
+    args: sanctuaryArgs
+  };
+  if (resolvedEnv && Object.keys(resolvedEnv).length > 0) {
+    sanctuaryEntry.env = resolvedEnv;
+  }
+  let rewritten;
+  if (agentConfig.platform === "openclaw") {
+    const existingMcp = raw.mcp ?? {};
+    rewritten = {
+      ...raw,
+      mcp: {
+        ...existingMcp,
+        servers: {
+          ...existingServers,
+          sanctuary: sanctuaryEntry
+        }
+      }
+    };
+    delete rewritten.mcpServers;
+  } else {
+    rewritten = {
+      ...raw,
+      mcpServers: {
+        ...existingServers,
+        sanctuary: sanctuaryEntry
+      }
+    };
+  }
+  await promises.writeFile(agentConfig.configPath, JSON.stringify(rewritten, null, 2), { mode: 384 });
+  return agentConfig.configPath;
+}
+var PLATFORM_PATHS, BACKUP_DIR;
+var init_config_reader = __esm({
+  "src/cocoon/config-reader.ts"() {
+    PLATFORM_PATHS = {
+      "openclaw": [
+        path.join(os.homedir(), ".openclaw", "openclaw.json"),
+        path.join(os.homedir(), ".openclaw", "config.json"),
+        path.join(os.homedir(), "Library", "Application Support", "OpenClaw", "openclaw.json"),
+        path.join(os.homedir(), "Library", "Application Support", "OpenClaw", "config.json")
+      ],
+      "claude-code": [
+        path.join(os.homedir(), ".claude", "settings.json"),
+        path.join(os.homedir(), ".config", "claude-code", "settings.json")
+      ],
+      "cursor": [
+        path.join(os.homedir(), ".cursor", "mcp.json")
+      ],
+      "generic": []
+    };
+    BACKUP_DIR = path.join(os.homedir(), ".sanctuary", "backup");
+  }
+});
+
+// src/cocoon/cli.ts
+var cli_exports = {};
+__export(cli_exports, {
+  COCOON_GOVERNOR_DEFAULTS: () => COCOON_GOVERNOR_DEFAULTS,
+  parseCocoonArgs: () => parseCocoonArgs,
+  runCocoon: () => runCocoon
+});
+async function runCocoon(options) {
+  if (options.unwrap) {
+    await unwrap();
+    return;
+  }
+  let platform2;
+  if (options.openclaw) platform2 = "openclaw";
+  else if (options.claudeCode) platform2 = "claude-code";
+  else if (options.cursor) platform2 = "cursor";
+  const agentConfig = await detectAgentConfig(platform2, options.wrap);
+  if (!agentConfig) {
+    if (platform2) {
+      console.error(`Could not find ${platform2} configuration. Check that the agent is installed.`);
+    } else if (options.wrap) {
+      console.error(`Could not read config file: ${options.wrap}`);
+    } else {
+      console.error("Could not auto-detect any agent configuration.");
+      console.error("Use --openclaw, --claude-code, --cursor, or --wrap /path/to/config.json");
+    }
+    process.exit(1);
+  }
+  if (agentConfig.servers.length === 0) {
+    console.error(`Found ${agentConfig.platform} config at ${agentConfig.configPath}, but no MCP servers configured.`);
+    process.exit(1);
+  }
+  console.error(`
+  Sanctuary Cocoon
+`);
+  console.error(`  Platform: ${agentConfig.platform}`);
+  console.error(`  Config: ${agentConfig.configPath}`);
+  console.error(`  MCP servers found: ${agentConfig.servers.length}
+`);
+  const upstreamServers = convertToUpstreamServers(agentConfig.servers);
+  for (const server of upstreamServers) {
+    const overrideCount = Object.keys(server.tool_overrides ?? {}).length;
+    console.error(`  \u2192 ${server.name} (${server.transport.type}) \u2014 default: Tier ${server.default_tier}`);
+    if (overrideCount > 0) {
+      console.error(`    ${overrideCount} tool-specific tier overrides`);
+    }
+  }
+  if (options.dryRun) {
+    console.error(`
+  Dry run \u2014 no changes made.
+`);
+    return;
+  }
+  const storagePath = path.join(os.homedir(), ".sanctuary");
+  await promises.mkdir(storagePath, { recursive: true, mode: 448 });
+  const profile = createCocoonProfile(upstreamServers);
+  const cocoonConfigPath = path.join(storagePath, "cocoon-profile.json");
+  await promises.writeFile(cocoonConfigPath, JSON.stringify(profile, null, 2), { mode: 384 });
+  const backupPath = await backupConfig(agentConfig.configPath);
+  await saveCocoonMeta({
+    backupPath,
+    originalPath: agentConfig.configPath,
+    platform: agentConfig.platform,
+    wrappedAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+  console.error(`
+  Original config backed up to: ${backupPath}`);
+  await rewriteConfigForCocoon(
+    agentConfig,
+    "npx",
+    [
+      "@sanctuary-framework/mcp-server",
+      ...options.passphrase ? ["--passphrase", options.passphrase] : []
+    ]
+  );
+  console.error(`  Agent config rewritten to route through Sanctuary`);
+  const dashboardPort = options.port ?? 3501;
+  console.error(`
+  Your agent is now protected.`);
+  console.error(`  All tool calls are being logged and scanned.`);
+  console.error(`
+  To view the dashboard, run in a separate terminal:`);
+  console.error(`    npx @sanctuary-framework/mcp-server dashboard --port ${dashboardPort}`);
+  console.error(`
+  To restore: npx @sanctuary-framework/cocoon --unwrap
+`);
+}
+async function unwrap() {
+  const meta = await findLatestBackup();
+  if (!meta) {
+    console.error("No Cocoon wrapping found to restore.");
+    console.error("Run --wrap or --openclaw first.");
+    process.exit(1);
+  }
+  try {
+    await promises.access(meta.backupPath);
+  } catch {
+    console.error(`Backup file not found: ${meta.backupPath}`);
+    process.exit(1);
+  }
+  await restoreConfig(meta.backupPath, meta.originalPath);
+  console.error(`
+  Sanctuary Cocoon \u2014 Unwrapped`);
+  console.error(`  Original config restored to: ${meta.originalPath}`);
+  console.error(`  Backup preserved at: ${meta.backupPath}
+`);
+}
+function convertToUpstreamServers(servers) {
+  return servers.map((server) => {
+    const upstream = {
+      name: server.name,
+      transport: server.transport === "sse" ? { type: "sse", url: server.url } : {
+        type: "stdio",
+        command: server.command,
+        ...server.args ? { args: server.args } : {},
+        ...server.env ? { env: server.env } : {}
+      },
+      enabled: true,
+      default_tier: 2
+    };
+    return upstream;
+  });
+}
+function createCocoonProfile(upstreamServers) {
+  return {
+    version: 1,
+    features: {
+      audit_logging: { enabled: true },
+      // Non-negotiable
+      injection_detection: { enabled: true },
+      // Non-negotiable
+      context_gating: { enabled: false },
+      // Can enable later
+      approval_gate: { enabled: true },
+      // Core enforcement — always ON
+      zk_proofs: { enabled: false }
+      // Not needed for Cocoon
+    },
+    upstream_servers: upstreamServers,
+    updated_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function parseCocoonArgs(argv) {
+  const options = {};
+  for (let i = 0; i < argv.length; i++) {
+    switch (argv[i]) {
+      case "--wrap":
+        options.wrap = argv[++i];
+        break;
+      case "--openclaw":
+        options.openclaw = true;
+        break;
+      case "--claude-code":
+        options.claudeCode = true;
+        break;
+      case "--cursor":
+        options.cursor = true;
+        break;
+      case "--unwrap":
+        options.unwrap = true;
+        break;
+      case "--passphrase":
+        options.passphrase = argv[++i];
+        break;
+      case "--port":
+        options.port = parseInt(argv[++i], 10);
+        break;
+      case "--dry-run":
+        options.dryRun = true;
+        break;
+      case "--help":
+      case "-h":
+        printCocoonHelp();
+        process.exit(0);
+    }
+  }
+  return options;
+}
+function printCocoonHelp() {
+  console.log(`
+  Sanctuary Cocoon \u2014 Wrap any agent in sovereignty protection
+
+  Usage:
+    npx @sanctuary-framework/cocoon --openclaw        # Wrap OpenClaw agent
+    npx @sanctuary-framework/cocoon --claude-code      # Wrap Claude Code
+    npx @sanctuary-framework/cocoon --cursor           # Wrap Cursor
+    npx @sanctuary-framework/cocoon --wrap config.json # Wrap generic MCP config
+    npx @sanctuary-framework/cocoon --unwrap           # Restore original config
+
+  Options:
+    --openclaw        Auto-detect and wrap OpenClaw agent
+    --claude-code     Auto-detect and wrap Claude Code
+    --cursor          Auto-detect and wrap Cursor
+    --wrap <path>     Wrap a specific MCP config file
+    --unwrap          Restore original config from backup
+    --passphrase <p>  Encryption passphrase
+    --port <port>     Dashboard port (default: 3501)
+    --dry-run         Show what would happen without making changes
+    --help, -h        Show this help
+
+  What happens:
+    1. Reads your agent's MCP server configuration
+    2. Backs up the original config to ~/.sanctuary/backup/
+    3. Rewrites the config so your agent routes through Sanctuary
+    4. All tool calls are logged, scanned for injection, and rate-limited
+    5. Dangerous operations require your approval via the dashboard
+
+  Rollback:
+    --unwrap restores the original config from backup.
+    Backups are preserved and never deleted.
+`);
+}
+var COCOON_GOVERNOR_DEFAULTS;
+var init_cli = __esm({
+  "src/cocoon/cli.ts"() {
+    init_config_reader();
+    COCOON_GOVERNOR_DEFAULTS = {
+      volume_limit: 200,
+      // 200 calls per 10-minute window
+      rate_limit_per_tool: 20,
+      // 20 calls/min per individual tool
+      lifetime_limit: 1e3
+      // 1000 total calls per session
     };
   }
 });
@@ -7415,7 +8690,7 @@ function createL3Tools(storage, masterKey, auditLog) {
   const tools = [
     // ─── Commitment Schemes ───────────────────────────────────────────────
     {
-      name: "sanctuary/proof_commitment",
+      name: "proof_commitment",
       description: "Create a cryptographic commitment to a value. The commitment hides the value until you choose to reveal it. Returns the commitment hash and a blinding factor (store securely).",
       inputSchema: {
         type: "object",
@@ -7450,7 +8725,7 @@ function createL3Tools(storage, masterKey, auditLog) {
       }
     },
     {
-      name: "sanctuary/proof_reveal",
+      name: "proof_reveal",
       description: "Verify a previously committed value by revealing it with the blinding factor. Returns whether the revealed value matches the commitment.",
       inputSchema: {
         type: "object",
@@ -7488,7 +8763,7 @@ function createL3Tools(storage, masterKey, auditLog) {
     },
     // ─── Disclosure Policies ──────────────────────────────────────────────
     {
-      name: "sanctuary/disclosure_set_policy",
+      name: "disclosure_set_policy",
       description: "Define a disclosure policy that controls what an agent will and will not disclose in different interaction contexts. Rules specify which fields may be disclosed, which must be withheld, and which require cryptographic proof.",
       inputSchema: {
         type: "object",
@@ -7563,7 +8838,7 @@ function createL3Tools(storage, masterKey, auditLog) {
       }
     },
     {
-      name: "sanctuary/disclosure_evaluate",
+      name: "disclosure_evaluate",
       description: "Evaluate a disclosure request against an active policy. Returns per-field decisions: disclose, withhold, proof, or ask-principal.",
       inputSchema: {
         type: "object",
@@ -7639,7 +8914,7 @@ function createL3Tools(storage, masterKey, auditLog) {
     },
     // ─── ZK Proof Tools ───────────────────────────────────────────────────
     {
-      name: "sanctuary/zk_commit",
+      name: "zk_commit",
       description: "Create a Pedersen commitment to a numeric value on Ristretto255. Unlike SHA-256 commitments, Pedersen commitments support zero-knowledge proofs: you can prove properties about the committed value without revealing it.",
       inputSchema: {
         type: "object",
@@ -7670,7 +8945,7 @@ function createL3Tools(storage, masterKey, auditLog) {
       }
     },
     {
-      name: "sanctuary/zk_prove",
+      name: "zk_prove",
       description: "Create a zero-knowledge proof of knowledge for a Pedersen commitment. Proves you know the value and blinding factor without revealing either. Uses a Schnorr sigma protocol with Fiat-Shamir transform.",
       inputSchema: {
         type: "object",
@@ -7711,7 +8986,7 @@ function createL3Tools(storage, masterKey, auditLog) {
       }
     },
     {
-      name: "sanctuary/zk_verify",
+      name: "zk_verify",
       description: "Verify a zero-knowledge proof of knowledge for a Pedersen commitment. Checks that the prover knows the commitment's opening without learning anything.",
       inputSchema: {
         type: "object",
@@ -7739,7 +9014,7 @@ function createL3Tools(storage, masterKey, auditLog) {
       }
     },
     {
-      name: "sanctuary/zk_range_prove",
+      name: "zk_range_prove",
       description: "Create a zero-knowledge range proof: prove that a committed value is within [min, max] without revealing the exact value. Uses bit-decomposition with OR-proofs on Ristretto255.",
       inputSchema: {
         type: "object",
@@ -7789,7 +9064,7 @@ function createL3Tools(storage, masterKey, auditLog) {
       }
     },
     {
-      name: "sanctuary/zk_range_verify",
+      name: "zk_range_verify",
       description: "Verify a zero-knowledge range proof \u2014 confirms a committed value is within the claimed range without learning the value.",
       inputSchema: {
         type: "object",
@@ -8242,7 +9517,7 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
   const tools = [
     // ─── Reputation Recording ─────────────────────────────────────────
     {
-      name: "sanctuary/reputation_record",
+      name: "reputation_record",
       description: "Record an interaction outcome as a signed attestation. Creates an EAS-compatible attestation signed by the specified identity.",
       inputSchema: {
         type: "object",
@@ -8335,7 +9610,7 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
     },
     // ─── Reputation Query ─────────────────────────────────────────────
     {
-      name: "sanctuary/reputation_query",
+      name: "reputation_query",
       description: "Query aggregated reputation data with filtering. Returns summary statistics, never raw interaction details.",
       inputSchema: {
         type: "object",
@@ -8383,7 +9658,7 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
     },
     // ─── Reputation Export ─────────────────────────────────────────────
     {
-      name: "sanctuary/reputation_export",
+      name: "reputation_export",
       description: "Export a portable reputation bundle (SANCTUARY_REP_V1). Includes all signed attestations for independent verification.",
       inputSchema: {
         type: "object",
@@ -8442,7 +9717,7 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
     },
     // ─── Reputation Import ────────────────────────────────────────────
     {
-      name: "sanctuary/reputation_import",
+      name: "reputation_import",
       description: "Import a reputation bundle from another Sanctuary instance. Verifies all attestation signatures by default.",
       inputSchema: {
         type: "object",
@@ -8494,7 +9769,7 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
     },
     // ─── Sovereignty-Weighted Query ──────────────────────────────────
     {
-      name: "sanctuary/reputation_query_weighted",
+      name: "reputation_query_weighted",
       description: "Query reputation with sovereignty-weighted scoring. Attestations from verified-sovereign agents carry full weight (1.0); unverified attestations carry reduced weight (0.2). Returns both the weighted score and tier distribution.",
       inputSchema: {
         type: "object",
@@ -8550,7 +9825,7 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
     },
     // ─── Trust Bootstrap: Escrow ──────────────────────────────────────
     {
-      name: "sanctuary/bootstrap_create_escrow",
+      name: "bootstrap_create_escrow",
       description: "Create an escrow record for trust bootstrapping. Allows new participants with no reputation to transact safely.",
       inputSchema: {
         type: "object",
@@ -8609,7 +9884,7 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
     },
     // ─── Trust Bootstrap: Guarantee ───────────────────────────────────
     {
-      name: "sanctuary/bootstrap_provide_guarantee",
+      name: "bootstrap_provide_guarantee",
       description: "A principal provides a signed reputation guarantee for a new agent. The guarantee certificate can be presented to counterparties.",
       inputSchema: {
         type: "object",
@@ -8687,7 +9962,7 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
     },
     // ─── Verascore Reputation Publish ────────────────────────────────
     {
-      name: "sanctuary/reputation_publish",
+      name: "reputation_publish",
       description: "Publish sovereignty data to Verascore (verascore.ai) \u2014 the agent reputation platform. Sends SHR data, handshake attestations, or sovereignty updates. The data is signed with the agent's Ed25519 key for verification. Requires a Verascore agent profile (claimed or stub) to exist.",
       inputSchema: {
         type: "object",
@@ -9309,7 +10584,7 @@ var InjectionDetector = class {
   }
   /**
    * Scan tool arguments for injection signals.
-   * @param toolName Full tool name (e.g., "sanctuary/state_read")
+   * @param toolName Full tool name (e.g., "state_read")
    * @param args Tool arguments
    * @returns DetectionResult with all detected signals
    */
@@ -10310,7 +11585,7 @@ var ApprovalGate = class {
   /**
    * Evaluate a tool call against the Principal Policy.
    *
-   * @param toolName - Full MCP tool name (e.g., "sanctuary/state_export")
+   * @param toolName - Full MCP tool name (e.g., "state_export")
    * @param args - Tool call arguments (for context extraction)
    * @returns GateResult indicating whether the call is allowed
    */
@@ -10580,7 +11855,7 @@ init_router();
 function createPrincipalPolicyTools(policy, baseline, auditLog) {
   return [
     {
-      name: "sanctuary/principal_policy_view",
+      name: "principal_policy_view",
       description: "View the current Principal Policy \u2014 the human-controlled rules governing what operations require approval. Read-only.",
       inputSchema: {
         type: "object",
@@ -10618,7 +11893,7 @@ function createPrincipalPolicyTools(policy, baseline, auditLog) {
       }
     },
     {
-      name: "sanctuary/principal_baseline_view",
+      name: "principal_baseline_view",
       description: "View the current behavioral baseline \u2014 the session profile used for anomaly detection. Shows known namespaces, counterparties, and tool call counts. Read-only.",
       inputSchema: {
         type: "object",
@@ -10967,7 +12242,7 @@ function createSHRTools(config, identityManager, masterKey, auditLog) {
   };
   const tools = [
     {
-      name: "sanctuary/shr_generate",
+      name: "shr_generate",
       description: "Generate a signed Sovereignty Health Report (SHR) \u2014 a machine-readable, cryptographically signed advertisement of this instance's sovereignty posture. Present this to counterparties to prove your sovereignty capabilities.",
       inputSchema: {
         type: "object",
@@ -10996,7 +12271,7 @@ function createSHRTools(config, identityManager, masterKey, auditLog) {
       }
     },
     {
-      name: "sanctuary/shr_verify",
+      name: "shr_verify",
       description: "Verify a counterparty's Sovereignty Health Report (SHR). Checks signature validity, temporal validity, and assesses sovereignty level.",
       inputSchema: {
         type: "object",
@@ -11022,7 +12297,7 @@ function createSHRTools(config, identityManager, masterKey, auditLog) {
       }
     },
     {
-      name: "sanctuary/shr_gateway_export",
+      name: "shr_gateway_export",
       description: "Export this instance's Sovereignty Health Report formatted for Ping Identity's Agent Gateway or other identity providers. Transforms the SHR into an authorization context with sovereignty scores, capability flags, and recommended access constraints.",
       inputSchema: {
         type: "object",
@@ -11415,7 +12690,7 @@ function createHandshakeTools(config, identityManager, masterKey, auditLog, opti
   };
   const tools = [
     {
-      name: "sanctuary/handshake_initiate",
+      name: "handshake_initiate",
       description: "Initiate a sovereignty handshake with a counterparty. Generates a challenge containing this instance's signed SHR and a cryptographic nonce. Send the returned challenge to the counterparty.",
       inputSchema: {
         type: "object",
@@ -11442,7 +12717,7 @@ function createHandshakeTools(config, identityManager, masterKey, auditLog, opti
       }
     },
     {
-      name: "sanctuary/handshake_respond",
+      name: "handshake_respond",
       description: "Respond to an incoming sovereignty handshake challenge. Verifies the initiator's SHR, signs their nonce, and returns our SHR with a counter-nonce.",
       inputSchema: {
         type: "object",
@@ -11563,7 +12838,7 @@ function createHandshakeTools(config, identityManager, masterKey, auditLog, opti
       }
     },
     {
-      name: "sanctuary/handshake_complete",
+      name: "handshake_complete",
       description: "Complete a sovereignty handshake (initiator side). Verifies the responder's SHR and nonce signature, signs their nonce, and produces the final result.",
       inputSchema: {
         type: "object",
@@ -11618,7 +12893,7 @@ function createHandshakeTools(config, identityManager, masterKey, auditLog, opti
       }
     },
     {
-      name: "sanctuary/handshake_status",
+      name: "handshake_status",
       description: "Check the status of a handshake session, or verify a completion message (responder side).",
       inputSchema: {
         type: "object",
@@ -11668,7 +12943,7 @@ function createHandshakeTools(config, identityManager, masterKey, auditLog, opti
     },
     // ─── Streamlined Exchange ─────────────────────────────────────────
     {
-      name: "sanctuary/handshake_exchange",
+      name: "handshake_exchange",
       description: "One-shot sovereignty exchange. Accepts a counterparty's signed SHR, verifies it, generates our SHR, and produces a signed attestation artifact \u2014 all in a single call. Returns a shareable attestation with human-readable summary. Use this instead of the 4-step handshake protocol when you want a quick, portable sovereignty verification (e.g., for social posting or async exchanges).",
       inputSchema: {
         type: "object",
@@ -11735,7 +13010,7 @@ function createHandshakeTools(config, identityManager, masterKey, auditLog, opti
       }
     },
     {
-      name: "sanctuary/handshake_verify_attestation",
+      name: "handshake_verify_attestation",
       description: "Verify a signed attestation artifact from another agent. Checks the Ed25519 signature, temporal validity, and structural integrity.",
       inputSchema: {
         type: "object",
@@ -11947,7 +13222,7 @@ function createFederationTools(auditLog, handshakeResults) {
   const tools = [
     // ─── Peer Management ──────────────────────────────────────────────
     {
-      name: "sanctuary/federation_peers",
+      name: "federation_peers",
       description: "List known federation peers, register a peer from a completed handshake, or remove a peer. Every peer MUST enter through a verified handshake \u2014 no self-registration allowed.",
       inputSchema: {
         type: "object",
@@ -12050,7 +13325,7 @@ function createFederationTools(auditLog, handshakeResults) {
     },
     // ─── Trust Evaluation ─────────────────────────────────────────────
     {
-      name: "sanctuary/federation_trust_evaluate",
+      name: "federation_trust_evaluate",
       description: "Evaluate the trust level of a federation peer. Considers handshake status, sovereignty tier, reputation score, and mutual attestation history. Returns a composite trust assessment.",
       inputSchema: {
         type: "object",
@@ -12085,7 +13360,7 @@ function createFederationTools(auditLog, handshakeResults) {
     },
     // ─── Federation Status ────────────────────────────────────────────
     {
-      name: "sanctuary/federation_status",
+      name: "federation_status",
       description: "Overview of federation state: total peers, active connections, trust distribution, and readiness for cross-instance operations.",
       inputSchema: {
         type: "object",
@@ -12298,7 +13573,7 @@ function createBridgeTools(storage, masterKey, identityManager, auditLog, handsh
   const tools = [
     // ─── bridge_commit ─────────────────────────────────────────────────
     {
-      name: "sanctuary/bridge_commit",
+      name: "bridge_commit",
       description: "Create a cryptographic commitment binding a Concordia negotiation outcome to Sanctuary's L3 proof layer. The commitment includes a SHA-256 hash of the canonical outcome (hiding + binding), an Ed25519 signature by the committer's identity, and an optional Pedersen commitment on the round count for zero-knowledge range proofs. This is the Sanctuary side of the Concordia bridge \u2014 call this when a Concordia `accept` fires.",
       inputSchema: {
         type: "object",
@@ -12400,7 +13675,7 @@ function createBridgeTools(storage, masterKey, identityManager, auditLog, handsh
     },
     // ─── bridge_verify ───────────────────────────────────────────────────
     {
-      name: "sanctuary/bridge_verify",
+      name: "bridge_verify",
       description: "Verify a bridge commitment against a revealed Concordia negotiation outcome. Checks SHA-256 commitment validity, Ed25519 signature, session ID match, terms hash integrity, and Pedersen commitment (if present). Use this to confirm that a counterparty's claimed negotiation outcome matches what was cryptographically committed.",
       inputSchema: {
         type: "object",
@@ -12456,7 +13731,7 @@ function createBridgeTools(storage, masterKey, identityManager, auditLog, handsh
     },
     // ─── bridge_attest ───────────────────────────────────────────────────
     {
-      name: "sanctuary/bridge_attest",
+      name: "bridge_attest",
       description: "Record a Concordia negotiation as a Sanctuary L4 reputation attestation, linked to a bridge commitment. This completes the bridge: the commitment (L3) proves the terms were agreed, and the attestation (L4) feeds the sovereignty-weighted reputation score. The attestation is automatically tagged with the counterparty's sovereignty tier from any completed handshake.",
       inputSchema: {
         type: "object",
@@ -13020,7 +14295,7 @@ function generateGaps(env, l1, l2, l3, l4) {
       title: "No context gating for outbound inference calls",
       description: "Your agent sends its full context \u2014 conversation history, memory, preferences, internal reasoning \u2014 to remote LLM providers on every inference call. There is no mechanism to filter what leaves the sovereignty boundary. The provider sees everything the agent knows.",
       openclaw_relevance: env.openclaw_detected ? "OpenClaw sends full agent context (including MEMORY.md, tool results, and conversation history) to the configured LLM provider with every API call. There is no built-in context filtering." : null,
-      sanctuary_solution: "Sanctuary's context gating (sanctuary/context_gate_set_policy + sanctuary/context_gate_filter) lets you define per-provider policies that control exactly what context flows outbound. Redact secrets, hash identifiers, and send only minimum-necessary context for each call.",
+      sanctuary_solution: "Sanctuary's context gating (sanctuary/context_gate_set_policy + context_gate_filter) lets you define per-provider policies that control exactly what context flows outbound. Redact secrets, hash identifiers, and send only minimum-necessary context for each call.",
       incident_class: INCIDENT_CONTEXT_LEAKAGE
     });
   }
@@ -13032,7 +14307,7 @@ function generateGaps(env, l1, l2, l3, l4) {
       title: "No audit trail",
       description: "No audit trail exists for tool call history. There is no record of what operations were executed, when, or by whom.",
       openclaw_relevance: null,
-      sanctuary_solution: "Sanctuary maintains an encrypted audit log of all operations, queryable via sanctuary/monitor_audit_log.",
+      sanctuary_solution: "Sanctuary maintains an encrypted audit log of all operations, queryable via monitor_audit_log.",
       incident_class: INCIDENT_CLAUDE_CODE_LEAK
     });
   }
@@ -13067,7 +14342,7 @@ function generateRecommendations(env, l1, l2, l3, l4) {
     recs.push({
       priority: 1,
       action: "Create a cryptographic identity \u2014 your agent's foundation for all sovereignty operations",
-      tool: "sanctuary/identity_create",
+      tool: "identity_create",
       effort: "immediate",
       impact: "critical"
     });
@@ -13076,7 +14351,7 @@ function generateRecommendations(env, l1, l2, l3, l4) {
     recs.push({
       priority: 2,
       action: "Migrate plaintext agent state to Sanctuary's encrypted store",
-      tool: "sanctuary/state_write",
+      tool: "state_write",
       effort: "minutes",
       impact: "critical"
     });
@@ -13084,7 +14359,7 @@ function generateRecommendations(env, l1, l2, l3, l4) {
   recs.push({
     priority: 3,
     action: "Generate a Sovereignty Health Report to present to counterparties",
-    tool: "sanctuary/shr_generate",
+    tool: "shr_generate",
     effort: "immediate",
     impact: "high"
   });
@@ -13092,7 +14367,7 @@ function generateRecommendations(env, l1, l2, l3, l4) {
     recs.push({
       priority: 4,
       action: "Enable the three-tier Principal Policy gate for graduated approval",
-      tool: "sanctuary/principal_policy_view",
+      tool: "principal_policy_view",
       effort: "minutes",
       impact: "high"
     });
@@ -13101,7 +14376,7 @@ function generateRecommendations(env, l1, l2, l3, l4) {
     recs.push({
       priority: 5,
       action: "Configure context gating to control what flows to LLM providers",
-      tool: "sanctuary/context_gate_set_policy",
+      tool: "context_gate_set_policy",
       effort: "minutes",
       impact: "high"
     });
@@ -13110,7 +14385,7 @@ function generateRecommendations(env, l1, l2, l3, l4) {
     recs.push({
       priority: 6,
       action: "Start recording reputation attestations from completed interactions",
-      tool: "sanctuary/reputation_record",
+      tool: "reputation_record",
       effort: "minutes",
       impact: "medium"
     });
@@ -13119,7 +14394,7 @@ function generateRecommendations(env, l1, l2, l3, l4) {
     recs.push({
       priority: 7,
       action: "Configure selective disclosure policies for data sharing",
-      tool: "sanctuary/disclosure_set_policy",
+      tool: "disclosure_set_policy",
       effort: "hours",
       impact: "medium"
     });
@@ -13259,7 +14534,7 @@ function wordWrap(text, maxWidth) {
 function createAuditTools(config) {
   const tools = [
     {
-      name: "sanctuary/sovereignty_audit",
+      name: "sovereignty_audit",
       description: "Audit your agent's sovereignty posture. Inspects the local environment for encryption, identity, approval gates, selective disclosure, and reputation \u2014 including OpenClaw-specific configurations. Returns a scored gap analysis with prioritized recommendations.",
       inputSchema: {
         type: "object",
@@ -14288,13 +15563,17 @@ var ContextGateEnforcer = class {
    * Check if a tool should be filtered based on bypass prefixes.
    *
    * SEC-033: Uses exact namespace component matching, not bare startsWith().
-   * A prefix of "sanctuary/" matches "sanctuary/state_read" but NOT
-   * "sanctuary_evil/steal_data" (no slash boundary confusion). The prefix
-   * must match exactly up to its length, and the prefix must end with "/"
-   * to enforce namespace boundaries (if it doesn't, we add one for safety).
+   * A prefix of "proxy/" matches "proxy/server/tool" but NOT "proxyevil/steal".
+   * The prefix must match exactly up to its length, and the prefix must end
+   * with "/" to enforce namespace boundaries (if it doesn't, we add one).
+   *
+   * Special sentinel: "*" bypasses ALL tools (used when all Sanctuary-internal
+   * tools should skip context gating — the default). Only proxy/external tools
+   * should be filtered in production.
    */
   shouldFilter(toolName) {
     for (const prefix of this.config.bypass_prefixes) {
+      if (prefix === "*") return false;
       const safePrefix = prefix.endsWith("/") ? prefix : prefix + "/";
       if (toolName === safePrefix.slice(0, -1) || toolName.startsWith(safePrefix)) {
         return false;
@@ -14391,8 +15670,8 @@ function createContextGateTools(storage, masterKey, auditLog) {
   const enforcerConfig = {
     enabled: false,
     // Off by default; agents must explicitly enable it
-    bypass_prefixes: ["sanctuary/"],
-    // Skip internal tools by default
+    bypass_prefixes: ["*"],
+    // Skip all Sanctuary-internal tools; only proxy/ tools get filtered
     log_only: false,
     // Filter immediately
     on_deny: "block"
@@ -14402,7 +15681,7 @@ function createContextGateTools(storage, masterKey, auditLog) {
   const tools = [
     // ── Set Policy ──────────────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_set_policy",
+      name: "context_gate_set_policy",
       description: "Create a context-gating policy that controls what information flows to remote providers (LLM APIs, tool APIs, logging services). Each rule specifies a provider category and which context fields to allow, redact, hash, or flag for summarization. Redact rules take absolute priority \u2014 if a field is in both 'allow' and 'redact', it is redacted. Default action applies to any field not mentioned in any rule. Use this to prevent your full agent context from being sent to remote LLM providers during inference calls.",
       inputSchema: {
         type: "object",
@@ -14511,13 +15790,13 @@ function createContextGateTools(storage, masterKey, auditLog) {
           rules: policy.rules,
           default_action: policy.default_action,
           created_at: policy.created_at,
-          message: "Context-gating policy created. Use sanctuary/context_gate_filter to apply this policy before making outbound calls."
+          message: "Context-gating policy created. Use context_gate_filter to apply this policy before making outbound calls."
         });
       }
     },
     // ── Apply Template ───────────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_apply_template",
+      name: "context_gate_apply_template",
       description: "Apply a starter context-gating template. Available templates: inference-minimal (strictest \u2014 only task and query pass through), inference-standard (balanced \u2014 adds tool results, summarizes history), logging-strict (redacts all content for telemetry services), tool-api-scoped (allows tool parameters, redacts agent state). Templates are starting points \u2014 customize after applying.",
       inputSchema: {
         type: "object",
@@ -14566,13 +15845,13 @@ function createContextGateTools(storage, masterKey, auditLog) {
           rules: policy.rules,
           default_action: policy.default_action,
           created_at: policy.created_at,
-          message: "Template applied. Use sanctuary/context_gate_filter with this policy_id to filter context before outbound calls. Customize rules with sanctuary/context_gate_set_policy if needed."
+          message: "Template applied. Use context_gate_filter with this policy_id to filter context before outbound calls. Customize rules with context_gate_set_policy if needed."
         });
       }
     },
     // ── Recommend Policy ────────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_recommend",
+      name: "context_gate_recommend",
       description: "Analyze a sample context object and recommend a context-gating policy based on field name heuristics. Classifies each field as allow, redact, hash, or summarize with confidence levels. Returns a ready-to-apply rule set. When in doubt, recommends redact (conservative). Review the recommendations before applying.",
       inputSchema: {
         type: "object",
@@ -14609,7 +15888,7 @@ function createContextGateTools(storage, masterKey, auditLog) {
         });
         return toolResult({
           ...recommendation,
-          next_steps: "Review the classifications above. If they look correct, you can apply them directly with sanctuary/context_gate_set_policy using the recommended_rules. Or start with a template via sanctuary/context_gate_apply_template and customize from there.",
+          next_steps: "Review the classifications above. If they look correct, you can apply them directly with context_gate_set_policy using the recommended_rules. Or start with a template via context_gate_apply_template and customize from there.",
           available_templates: listTemplateIds().map((id) => {
             const t = TEMPLATES[id];
             return { id, name: t.name, description: t.description };
@@ -14619,7 +15898,7 @@ function createContextGateTools(storage, masterKey, auditLog) {
     },
     // ── Filter Context ──────────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_filter",
+      name: "context_gate_filter",
       description: "Filter agent context through a gating policy before sending to a remote provider. Returns per-field decisions (allow, redact, hash, summarize) and content hashes for the audit trail. Call this BEFORE making any outbound API call to ensure you are only sending the minimum necessary context. The filtered output tells you exactly what can be sent safely.",
       inputSchema: {
         type: "object",
@@ -14725,7 +16004,7 @@ function createContextGateTools(storage, masterKey, auditLog) {
     },
     // ── List Policies ───────────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_list_policies",
+      name: "context_gate_list_policies",
       description: "List all configured context-gating policies. Returns policy IDs, names, rule summaries, and default actions.",
       inputSchema: {
         type: "object",
@@ -14748,13 +16027,13 @@ function createContextGateTools(storage, masterKey, auditLog) {
             updated_at: p.updated_at
           })),
           count: policies.length,
-          message: policies.length === 0 ? "No context-gating policies configured. Use sanctuary/context_gate_set_policy to create one." : `${policies.length} context-gating ${policies.length === 1 ? "policy" : "policies"} configured.`
+          message: policies.length === 0 ? "No context-gating policies configured. Use context_gate_set_policy to create one." : `${policies.length} context-gating ${policies.length === 1 ? "policy" : "policies"} configured.`
         });
       }
     },
     // ── Enforcer Status ─────────────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_enforcer_status",
+      name: "context_gate_enforcer_status",
       description: "Get the status of the automatic context gate enforcer, including enabled/disabled state, log_only mode, active policy, and statistics. The enforcer automatically filters tool arguments when enabled. Use this to monitor what the enforcer has been filtering.",
       inputSchema: {
         type: "object",
@@ -14775,13 +16054,13 @@ function createContextGateTools(storage, masterKey, auditLog) {
         return toolResult({
           enforcer_status: status,
           description: "The enforcer is " + (status.enabled ? "enabled" : "disabled") + ". " + (status.log_only ? "Currently in log_only mode \u2014 filtering is logged but not applied." : "Filtering is actively applied to tool arguments."),
-          guidance: status.stats.calls_inspected > 0 ? `Over ${status.stats.calls_inspected} tool calls, ${status.stats.fields_redacted} sensitive fields were redacted. Use sanctuary/context_gate_enforcer_configure to adjust settings.` : "No tool calls have been inspected yet."
+          guidance: status.stats.calls_inspected > 0 ? `Over ${status.stats.calls_inspected} tool calls, ${status.stats.fields_redacted} sensitive fields were redacted. Use context_gate_enforcer_configure to adjust settings.` : "No tool calls have been inspected yet."
         });
       }
     },
     // ── Enforcer Configuration ──────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_enforcer_configure",
+      name: "context_gate_enforcer_configure",
       description: "Configure the automatic context gate enforcer. Control whether it filters tool arguments, toggle log_only mode for gradual rollout, set the active policy, and choose what to do when denied fields are encountered (block the request or redact the field). Use this to enable automatic context protection.",
       inputSchema: {
         type: "object",
@@ -15107,7 +16386,7 @@ function assessL2Hardening(storagePath) {
 function createL2HardeningTools(storagePath, auditLog) {
   return [
     {
-      name: "sanctuary/l2_hardening_status",
+      name: "l2_hardening_status",
       description: "L2 Process Hardening Status \u2014 Verify software-based operational isolation. Reports memory protection, process isolation level, filesystem permissions, and overall hardening assessment. Read-only. Tier 3 \u2014 always allowed.",
       inputSchema: {
         type: "object",
@@ -15175,7 +16454,7 @@ function createL2HardeningTools(storagePath, auditLog) {
       }
     },
     {
-      name: "sanctuary/l2_verify_isolation",
+      name: "l2_verify_isolation",
       description: "Verify L2 process isolation at runtime. Checks whether the Sanctuary server is running in an isolated environment (container, VM, sandbox) and validates filesystem and memory protections. Reports isolation level and any issues. Read-only. Tier 3 \u2014 always allowed.",
       inputSchema: {
         type: "object",
@@ -15277,7 +16556,7 @@ function createSovereigntyProfileTools(profileStore, auditLog) {
   const tools = [
     // ── Get Profile ──────────────────────────────────────────────────
     {
-      name: "sanctuary/sovereignty_profile_get",
+      name: "sovereignty_profile_get",
       description: "Get the current Sovereignty Profile \u2014 shows which Sanctuary features are active (audit logging, injection detection, context gating, approval gates, ZK proofs) and their configuration.",
       inputSchema: {
         type: "object",
@@ -15296,7 +16575,7 @@ function createSovereigntyProfileTools(profileStore, auditLog) {
     },
     // ── Update Profile ───────────────────────────────────────────────
     {
-      name: "sanctuary/sovereignty_profile_update",
+      name: "sovereignty_profile_update",
       description: "Update the Sovereignty Profile feature toggles. This changes which Sanctuary protections are active. Requires human approval (Tier 1) because it modifies enforcement behavior. Pass only the features you want to change \u2014 unspecified features remain unchanged.",
       inputSchema: {
         type: "object",
@@ -15377,7 +16656,7 @@ function createSovereigntyProfileTools(profileStore, auditLog) {
     },
     // ── Generate System Prompt ───────────────────────────────────────
     {
-      name: "sanctuary/sovereignty_profile_generate_prompt",
+      name: "sovereignty_profile_generate_prompt",
       description: "Generate a system prompt snippet based on the active Sovereignty Profile. The snippet instructs an agent on which Sanctuary features are active and how to use them. Copy and paste this into your agent's system configuration.",
       inputSchema: {
         type: "object",
@@ -15772,6 +17051,7 @@ var ProxyRouter = class {
             confidence: injectionResult.confidence,
             latency_ms: Date.now() - start
           }, "failure");
+          this.notifyProxyCall(proxyName, serverName, "blocked", "injection_detected", tier);
           return toolResult({
             error: "Operation not permitted",
             proxy: true
@@ -15802,6 +17082,7 @@ var ProxyRouter = class {
               reason: govResult.reason,
               latency_ms: Date.now() - start
             }, "failure");
+            this.notifyProxyCall(proxyName, serverName, "blocked", govResult.reason, tier);
             return toolResult({
               error: "Operation not permitted",
               proxy: true,
@@ -15836,6 +17117,7 @@ var ProxyRouter = class {
           decision: "allowed",
           latency_ms: latencyMs
         });
+        this.notifyProxyCall(proxyName, serverName, "allowed", void 0, tier);
         return this.normalizeResponse(result);
       } catch (err) {
         const latencyMs = Date.now() - start;
@@ -15855,6 +17137,7 @@ var ProxyRouter = class {
           error: errorMessage,
           latency_ms: latencyMs
         }, "failure");
+        this.notifyProxyCall(proxyName, serverName, "error", errorMessage, tier);
         return {
           content: [{
             type: "text",
@@ -15868,6 +17151,24 @@ var ProxyRouter = class {
         };
       }
     };
+  }
+  /**
+   * Notify the onProxyCall callback if configured.
+   */
+  notifyProxyCall(tool, server, decision, reason, tier) {
+    if (this.options.onProxyCall) {
+      try {
+        this.options.onProxyCall({
+          tool,
+          server,
+          decision,
+          reason,
+          tier,
+          timestamp: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      } catch {
+      }
+    }
   }
   /**
    * Call an upstream tool with a timeout.
@@ -16142,7 +17443,7 @@ function createGovernorTools(governor, auditLog) {
   const tools = [
     // ── Governor Status ─────────────────────────────────────────────
     {
-      name: "sanctuary/governor_status",
+      name: "governor_status",
       description: "View the current Call Governor status including volume counters, per-tool rate counts, duplicate cache size, and lifetime counter. Use this to monitor tool call consumption, detect potential loops, and check how close you are to governance limits. The governor protects against runaway tool calls by enforcing volume limits, rate limits, duplicate detection, and a session lifetime cap.",
       inputSchema: {
         type: "object",
@@ -16182,7 +17483,7 @@ function createGovernorTools(governor, auditLog) {
     },
     // ── Governor Reset ──────────────────────────────────────────────
     {
-      name: "sanctuary/governor_reset",
+      name: "governor_reset",
       description: "Reset all Call Governor counters: volume window, per-tool rate windows, duplicate cache, and lifetime counter. This clears the hard stop if the lifetime limit was reached. This is a Tier 1 operation \u2014 requires human approval because it removes all runtime governance state and could allow previously blocked behavior to resume.",
       inputSchema: {
         type: "object",
@@ -16275,7 +17576,7 @@ function createSanctuaryTools(opts) {
   const tools = [
     // ─── sanctuary_bootstrap ───────────────────────────────────────────
     {
-      name: "sanctuary/sanctuary_bootstrap",
+      name: "sanctuary_bootstrap",
       description: "One-shot bootstrap for a new sovereign agent identity. Generates an Ed25519 keypair, stores the encrypted identity, constructs a Sovereignty Health Report (SHR), and publishes it to Verascore. Returns { did, profileUrl, tier } for the newly-minted agent.",
       inputSchema: {
         type: "object",
@@ -16413,7 +17714,7 @@ function createSanctuaryTools(opts) {
     },
     // ─── sanctuary_policy_status ───────────────────────────────────────
     {
-      name: "sanctuary/sanctuary_policy_status",
+      name: "sanctuary_policy_status",
       description: "Return a summary of the active Principal Policy: which operations require approval (Tier 1), which are subject to anomaly detection (Tier 2), and which auto-allow with audit (Tier 3).",
       inputSchema: {
         type: "object",
@@ -16443,7 +17744,7 @@ function createSanctuaryTools(opts) {
     },
     // ─── sanctuary_export_identity_bundle ──────────────────────────────
     {
-      name: "sanctuary/sanctuary_export_identity_bundle",
+      name: "sanctuary_export_identity_bundle",
       description: "Export a signed, portable identity bundle: { publicKey, did, shr, attestations }. The bundle is signed with the identity's Ed25519 key so a recipient can verify authenticity against the public key. Private keys are never included.",
       inputSchema: {
         type: "object",
@@ -16512,7 +17813,7 @@ function createSanctuaryTools(opts) {
     },
     // ─── sanctuary_link_to_human ───────────────────────────────────────
     {
-      name: "sanctuary/sanctuary_link_to_human",
+      name: "sanctuary_link_to_human",
       description: "Trigger a Verascore magic-link login flow so a human principal can authenticate and subsequently claim this agent's DID. The email is sent by Verascore to the supplied address. This tool only initiates the flow \u2014 it does not directly bind the DID.",
       inputSchema: {
         type: "object",
@@ -16567,7 +17868,7 @@ function createSanctuaryTools(opts) {
     },
     // ─── sanctuary_sign_challenge ──────────────────────────────────────
     {
-      name: "sanctuary/sanctuary_sign_challenge",
+      name: "sanctuary_sign_challenge",
       description: "Sign a domain-separated nonce with the agent's Ed25519 key. Used in DID-ownership proof flows. The signed message is constructed as: 'sanctuary-sign-challenge-v1\\x00' + purpose + '\\x00' + nonce. The verifier MUST reconstruct the same domain-prefixed message before calling Ed25519 verify \u2014 a raw-nonce signature is NOT valid for this tool. The `purpose` field binds the signature to a specific use case (e.g. 'verascore-claim') so a signature produced for one purpose cannot be replayed against a different verifier.",
       inputSchema: {
         type: "object",
@@ -16801,7 +18102,7 @@ async function createSanctuaryServer(options) {
   }
   const l2Tools = [
     {
-      name: "sanctuary/exec_attest",
+      name: "exec_attest",
       description: "Generate an attestation of the current execution environment, including sovereignty assessment and degradation report.",
       inputSchema: {
         type: "object",
@@ -16852,7 +18153,7 @@ async function createSanctuaryServer(options) {
       }
     },
     {
-      name: "sanctuary/monitor_health",
+      name: "monitor_health",
       description: "Sanctuary Health Report (SHR) \u2014 standardized sovereignty status.",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
@@ -16901,7 +18202,7 @@ async function createSanctuaryServer(options) {
       }
     },
     {
-      name: "sanctuary/monitor_audit_log",
+      name: "monitor_audit_log",
       description: "Query the sovereignty audit log.",
       inputSchema: {
         type: "object",
@@ -16927,7 +18228,7 @@ async function createSanctuaryServer(options) {
     }
   ];
   const manifestTool = {
-    name: "sanctuary/manifest",
+    name: "manifest",
     description: "Generate the Sanctuary Interface Manifest (SIM) \u2014 a machine-readable declaration of this server's capabilities.",
     inputSchema: { type: "object", properties: {} },
     handler: async () => {
@@ -17121,7 +18422,7 @@ async function createSanctuaryServer(options) {
   const dashboardTools = [];
   if (dashboard) {
     dashboardTools.push({
-      name: "sanctuary/dashboard_open",
+      name: "dashboard_open",
       description: "Generate a one-click URL to open the Principal Dashboard in a browser. Returns a pre-authenticated link \u2014 no manual token entry needed.",
       inputSchema: {
         type: "object",
@@ -17201,7 +18502,12 @@ async function createSanctuaryServer(options) {
             }
             return args;
           },
-          governor
+          governor,
+          onProxyCall: (data) => {
+            if (dashboard) {
+              dashboard.broadcastProxyCall(data);
+            }
+          }
         }
       );
       clientManager.configure(enabledServers).catch((err) => {
@@ -17219,6 +18525,7 @@ async function createSanctuaryServer(options) {
           auditLog,
           clientManager
         });
+        dashboard.enableFortressView(enabledServers.length);
       }
     }
   }
@@ -17338,6 +18645,12 @@ async function main() {
     await runStandaloneDashboard(args.slice(1));
     return;
   }
+  if (args[0] === "cocoon") {
+    const { parseCocoonArgs: parseCocoonArgs2, runCocoon: runCocoon2 } = await Promise.resolve().then(() => (init_cli(), cli_exports));
+    const cocoonOpts = parseCocoonArgs2(args.slice(1));
+    await runCocoon2(cocoonOpts);
+    return;
+  }
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dashboard") {
       process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
@@ -17405,6 +18718,7 @@ Sovereignty infrastructure for agents in the agentic economy.
 Usage:
   sanctuary-mcp-server [options]          # MCP server (stdio)
   sanctuary-mcp-server dashboard [opts]   # Standalone dashboard
+  sanctuary-mcp-server cocoon [opts]      # Wrap agent in Cocoon protection
 
 Options:
   --dashboard          Enable the Principal Dashboard (web UI)
@@ -17416,6 +18730,10 @@ Subcommands:
   dashboard            Start the dashboard as a standalone HTTP server.
                        Reads from the same storage as the MCP server.
                        Use "sanctuary-mcp-server dashboard --help" for options.
+
+  cocoon               Wrap an existing agent in Sanctuary's enforcement chain.
+                       One command to protect any MCP-compatible agent.
+                       Use "sanctuary-mcp-server cocoon --help" for options.
 
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)

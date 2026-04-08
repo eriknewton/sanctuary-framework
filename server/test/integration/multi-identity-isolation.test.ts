@@ -41,10 +41,10 @@ describe("Multi-Identity Isolation", () => {
     await identityManager.load();
 
     // Create two distinct identities
-    const alice = await callTool(tools, "sanctuary/identity_create", {
+    const alice = await callTool(tools, "identity_create", {
       label: "alice-agent",
     });
-    const bob = await callTool(tools, "sanctuary/identity_create", {
+    const bob = await callTool(tools, "identity_create", {
       label: "bob-agent",
     });
 
@@ -54,13 +54,13 @@ describe("Multi-Identity Isolation", () => {
     expect(alice.did).not.toBe(bob.did);
 
     // Alice signs a message
-    const aliceSig = await callTool(tools, "sanctuary/identity_sign", {
+    const aliceSig = await callTool(tools, "identity_sign", {
       identity_id: alice.identity_id,
       payload: "hello from alice",
     });
 
     // Verify with Alice's key: valid
-    const aliceVerify = await callTool(tools, "sanctuary/identity_verify", {
+    const aliceVerify = await callTool(tools, "identity_verify", {
       identity_id: alice.identity_id,
       payload: "hello from alice",
       signature: aliceSig.signature,
@@ -68,7 +68,7 @@ describe("Multi-Identity Isolation", () => {
     expect(aliceVerify.valid).toBe(true);
 
     // Verify with Bob's key: invalid (cross-identity rejection)
-    const bobVerify = await callTool(tools, "sanctuary/identity_verify", {
+    const bobVerify = await callTool(tools, "identity_verify", {
       identity_id: bob.identity_id,
       payload: "hello from alice",
       signature: aliceSig.signature,
@@ -89,15 +89,15 @@ describe("Multi-Identity Isolation", () => {
     const { tools: l4Tools } = createL4Tools(storage, masterKey, identityManager, auditLog);
     const allTools = [...l1Tools, ...l4Tools];
 
-    const agent1 = await callTool(allTools, "sanctuary/identity_create", {
+    const agent1 = await callTool(allTools, "identity_create", {
       label: "agent-1",
     });
-    const agent2 = await callTool(allTools, "sanctuary/identity_create", {
+    const agent2 = await callTool(allTools, "identity_create", {
       label: "agent-2",
     });
 
     // Agent 1 records a transaction
-    await callTool(allTools, "sanctuary/reputation_record", {
+    await callTool(allTools, "reputation_record", {
       interaction_id: "txn-001",
       counterparty_did: "did:key:external",
       outcome: { type: "transaction", result: "completed" },
@@ -106,7 +106,7 @@ describe("Multi-Identity Isolation", () => {
     });
 
     // Agent 2 records a different transaction
-    await callTool(allTools, "sanctuary/reputation_record", {
+    await callTool(allTools, "reputation_record", {
       interaction_id: "txn-002",
       counterparty_did: "did:key:external",
       outcome: { type: "service", result: "failed" },
@@ -115,7 +115,7 @@ describe("Multi-Identity Isolation", () => {
     });
 
     // Query all — both present
-    const all = await callTool(allTools, "sanctuary/reputation_query", {});
+    const all = await callTool(allTools, "reputation_query", {});
     const summary = all.summary as Record<string, unknown>;
     expect(summary.total_interactions).toBe(2);
     expect(summary.completed).toBe(1);
@@ -123,7 +123,7 @@ describe("Multi-Identity Isolation", () => {
 
     // Export with agent1's identity — all attestations included
     // (export includes all, signed by the export identity)
-    const exported = await callTool(allTools, "sanctuary/reputation_export", {
+    const exported = await callTool(allTools, "reputation_export", {
       format: "SANCTUARY_REP_V1",
       identity_id: agent1.identity_id,
     });
@@ -141,11 +141,11 @@ describe("Multi-Identity Isolation", () => {
     );
     await identityManager.load();
 
-    await callTool(tools, "sanctuary/identity_create", { label: "id-1" });
-    await callTool(tools, "sanctuary/identity_create", { label: "id-2" });
-    await callTool(tools, "sanctuary/identity_create", { label: "id-3" });
+    await callTool(tools, "identity_create", { label: "id-1" });
+    await callTool(tools, "identity_create", { label: "id-2" });
+    await callTool(tools, "identity_create", { label: "id-3" });
 
-    const list = await callTool(tools, "sanctuary/identity_list", {});
+    const list = await callTool(tools, "identity_list", {});
     const identities = list.identities as Array<Record<string, unknown>>;
     expect(identities).toHaveLength(3);
     const labels = identities.map((i) => i.label);

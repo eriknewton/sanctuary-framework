@@ -104,7 +104,7 @@ export function createBridgeTools(
     // ─── bridge_commit ─────────────────────────────────────────────────
 
     {
-      name: "sanctuary/bridge_commit",
+      name: "bridge_commit",
       description:
         "Create a cryptographic commitment binding a Concordia negotiation outcome " +
         "to Sanctuary's L3 proof layer. The commitment includes a SHA-256 hash of " +
@@ -226,7 +226,7 @@ export function createBridgeTools(
     // ─── bridge_verify ───────────────────────────────────────────────────
 
     {
-      name: "sanctuary/bridge_verify",
+      name: "bridge_verify",
       description:
         "Verify a bridge commitment against a revealed Concordia negotiation outcome. " +
         "Checks SHA-256 commitment validity, Ed25519 signature, session ID match, " +
@@ -302,7 +302,7 @@ export function createBridgeTools(
     // ─── bridge_attest ───────────────────────────────────────────────────
 
     {
-      name: "sanctuary/bridge_attest",
+      name: "bridge_attest",
       description:
         "Record a Concordia negotiation as a Sanctuary L4 reputation attestation, " +
         "linked to a bridge commitment. This completes the bridge: the commitment " +

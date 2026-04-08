@@ -39,7 +39,7 @@ export function createL3Tools(
     // ─── Commitment Schemes ───────────────────────────────────────────────
 
     {
-      name: "sanctuary/proof_commitment",
+      name: "proof_commitment",
       description:
         "Create a cryptographic commitment to a value. " +
         "The commitment hides the value until you choose to reveal it. " +
@@ -84,7 +84,7 @@ export function createL3Tools(
     },
 
     {
-      name: "sanctuary/proof_reveal",
+      name: "proof_reveal",
       description:
         "Verify a previously committed value by revealing it with the blinding factor. " +
         "Returns whether the revealed value matches the commitment.",
@@ -129,7 +129,7 @@ export function createL3Tools(
     // ─── Disclosure Policies ──────────────────────────────────────────────
 
     {
-      name: "sanctuary/disclosure_set_policy",
+      name: "disclosure_set_policy",
       description:
         "Define a disclosure policy that controls what an agent will and will not " +
         "disclose in different interaction contexts. Rules specify which fields may " +
@@ -215,7 +215,7 @@ export function createL3Tools(
     },
 
     {
-      name: "sanctuary/disclosure_evaluate",
+      name: "disclosure_evaluate",
       description:
         "Evaluate a disclosure request against an active policy. " +
         "Returns per-field decisions: disclose, withhold, proof, or ask-principal.",
@@ -304,7 +304,7 @@ export function createL3Tools(
     // ─── ZK Proof Tools ───────────────────────────────────────────────────
 
     {
-      name: "sanctuary/zk_commit",
+      name: "zk_commit",
       description:
         "Create a Pedersen commitment to a numeric value on Ristretto255. " +
         "Unlike SHA-256 commitments, Pedersen commitments support zero-knowledge proofs: " +
@@ -343,7 +343,7 @@ export function createL3Tools(
     },
 
     {
-      name: "sanctuary/zk_prove",
+      name: "zk_prove",
       description:
         "Create a zero-knowledge proof of knowledge for a Pedersen commitment. " +
         "Proves you know the value and blinding factor without revealing either. " +
@@ -393,7 +393,7 @@ export function createL3Tools(
     },
 
     {
-      name: "sanctuary/zk_verify",
+      name: "zk_verify",
       description:
         "Verify a zero-knowledge proof of knowledge for a Pedersen commitment. " +
         "Checks that the prover knows the commitment's opening without learning anything.",
@@ -427,7 +427,7 @@ export function createL3Tools(
     },
 
     {
-      name: "sanctuary/zk_range_prove",
+      name: "zk_range_prove",
       description:
         "Create a zero-knowledge range proof: prove that a committed value is " +
         "within [min, max] without revealing the exact value. " +
@@ -485,7 +485,7 @@ export function createL3Tools(
     },
 
     {
-      name: "sanctuary/zk_range_verify",
+      name: "zk_range_verify",
       description:
         "Verify a zero-knowledge range proof — confirms a committed value " +
         "is within the claimed range without learning the value.",

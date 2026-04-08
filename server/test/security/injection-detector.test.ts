@@ -195,7 +195,7 @@ describe("InjectionDetector", () => {
 
     it("does NOT flag tool refs in tool_name field", () => {
       const result = detector.scan("test/tool", {
-        tool_name: "sanctuary/state_read",
+        tool_name: "state_read",
       });
 
       expect(
@@ -205,7 +205,7 @@ describe("InjectionDetector", () => {
 
     it("does NOT flag tool refs in operation field", () => {
       const result = detector.scan("test/tool", {
-        operation: "sanctuary/identity_sign",
+        operation: "identity_sign",
       });
 
       expect(
@@ -623,8 +623,8 @@ describe("InjectionDetector", () => {
 
     it("allows tool refs in tool_name field", () => {
       const result = detector.scan("test/tool", {
-        tool_name: "sanctuary/state_read",
-        tool: "sanctuary/state_write",
+        tool_name: "state_read",
+        tool: "state_write",
         operation: "concordia/propose",
       });
 
@@ -651,7 +651,7 @@ describe("InjectionDetector", () => {
       };
 
       const start = performance.now();
-      detector.scan("sanctuary/state_write", args);
+      detector.scan("state_write", args);
       const elapsed = performance.now() - start;
 
       expect(elapsed).toBeLessThan(5);

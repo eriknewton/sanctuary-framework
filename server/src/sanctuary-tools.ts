@@ -76,7 +76,7 @@ export function createSanctuaryTools(
   const tools: ToolDefinition[] = [
     // ─── sanctuary_bootstrap ───────────────────────────────────────────
     {
-      name: "sanctuary/sanctuary_bootstrap",
+      name: "sanctuary_bootstrap",
       description:
         "One-shot bootstrap for a new sovereign agent identity. " +
         "Generates an Ed25519 keypair, stores the encrypted identity, " +
@@ -244,7 +244,7 @@ export function createSanctuaryTools(
 
     // ─── sanctuary_policy_status ───────────────────────────────────────
     {
-      name: "sanctuary/sanctuary_policy_status",
+      name: "sanctuary_policy_status",
       description:
         "Return a summary of the active Principal Policy: which operations " +
         "require approval (Tier 1), which are subject to anomaly detection " +
@@ -286,7 +286,7 @@ export function createSanctuaryTools(
 
     // ─── sanctuary_export_identity_bundle ──────────────────────────────
     {
-      name: "sanctuary/sanctuary_export_identity_bundle",
+      name: "sanctuary_export_identity_bundle",
       description:
         "Export a signed, portable identity bundle: { publicKey, did, shr, attestations }. " +
         "The bundle is signed with the identity's Ed25519 key so a recipient can verify " +
@@ -367,7 +367,7 @@ export function createSanctuaryTools(
 
     // ─── sanctuary_link_to_human ───────────────────────────────────────
     {
-      name: "sanctuary/sanctuary_link_to_human",
+      name: "sanctuary_link_to_human",
       description:
         "Trigger a Verascore magic-link login flow so a human principal can " +
         "authenticate and subsequently claim this agent's DID. The email is " +
@@ -441,7 +441,7 @@ export function createSanctuaryTools(
 
     // ─── sanctuary_sign_challenge ──────────────────────────────────────
     {
-      name: "sanctuary/sanctuary_sign_challenge",
+      name: "sanctuary_sign_challenge",
       description:
         "Sign a domain-separated nonce with the agent's Ed25519 key. " +
         "Used in DID-ownership proof flows. The signed message is constructed as: " +

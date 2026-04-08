@@ -25,7 +25,7 @@ export function createSovereigntyProfileTools(
   const tools: ToolDefinition[] = [
     // ── Get Profile ──────────────────────────────────────────────────
     {
-      name: "sanctuary/sovereignty_profile_get",
+      name: "sovereignty_profile_get",
       description:
         "Get the current Sovereignty Profile — shows which Sanctuary features " +
         "are active (audit logging, injection detection, context gating, " +
@@ -52,7 +52,7 @@ export function createSovereigntyProfileTools(
 
     // ── Update Profile ───────────────────────────────────────────────
     {
-      name: "sanctuary/sovereignty_profile_update",
+      name: "sovereignty_profile_update",
       description:
         "Update the Sovereignty Profile feature toggles. This changes which " +
         "Sanctuary protections are active. Requires human approval (Tier 1) " +
@@ -151,7 +151,7 @@ export function createSovereigntyProfileTools(
 
     // ── Generate System Prompt ───────────────────────────────────────
     {
-      name: "sanctuary/sovereignty_profile_generate_prompt",
+      name: "sovereignty_profile_generate_prompt",
       description:
         "Generate a system prompt snippet based on the active Sovereignty " +
         "Profile. The snippet instructs an agent on which Sanctuary features " +

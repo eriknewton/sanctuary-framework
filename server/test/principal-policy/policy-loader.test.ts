@@ -6,7 +6,7 @@
  * - JSON policy parsing
  * - Default policy generation when no file exists
  * - Policy validation with missing fields falls back to defaults
- * - extractOperationName strips "sanctuary/" prefix
+ * - extractOperationName strips "" prefix
  */
 
 import { describe, it, expect } from "vitest";
@@ -142,7 +142,7 @@ tier1_always_approve:
 
   describe("extractOperationName", () => {
     it("strips sanctuary/ prefix", () => {
-      expect(extractOperationName("sanctuary/state_export")).toBe("state_export");
+      expect(extractOperationName("state_export")).toBe("state_export");
     });
 
     it("returns bare name unchanged", () => {
@@ -150,7 +150,7 @@ tier1_always_approve:
     });
 
     it("handles nested slashes by stripping only sanctuary/", () => {
-      expect(extractOperationName("sanctuary/identity_sign")).toBe("identity_sign");
+      expect(extractOperationName("identity_sign")).toBe("identity_sign");
     });
   });
 });

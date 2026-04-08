@@ -26,9 +26,9 @@ const FEATURE_INFO: Record<string, FeaturePromptInfo> = {
   audit_logging: {
     name: "Audit Logging",
     activeDescription:
-      "All your tool calls are logged to an encrypted audit trail. No action needed — this is automatic. You can query the log with sanctuary/monitor_audit_log if you need to review past activity.",
-    toolNames: ["sanctuary/monitor_audit_log"],
-    disabledDescription: "audit logging (sanctuary/monitor_audit_log)",
+      "All your tool calls are logged to an encrypted audit trail. No action needed — this is automatic. You can query the log with monitor_audit_log if you need to review past activity.",
+    toolNames: ["monitor_audit_log"],
+    disabledDescription: "audit logging (monitor_audit_log)",
     usageExample:
       "Automatic — every tool call you make is recorded. No explicit action required.",
   },
@@ -43,17 +43,17 @@ const FEATURE_INFO: Record<string, FeaturePromptInfo> = {
   context_gating: {
     name: "Context Gating",
     activeDescription:
-      "Before sending context to any external API (LLM inference, tool APIs, logging services), call sanctuary/context_gate_filter to strip sensitive fields. Use sanctuary/context_gate_set_policy to define filtering rules, or sanctuary/context_gate_apply_template for presets.",
+      "Before sending context to any external API (LLM inference, tool APIs, logging services), call context_gate_filter to strip sensitive fields. Use context_gate_set_policy to define filtering rules, or context_gate_apply_template for presets.",
     toolNames: [
-      "sanctuary/context_gate_filter",
-      "sanctuary/context_gate_set_policy",
-      "sanctuary/context_gate_apply_template",
-      "sanctuary/context_gate_recommend",
-      "sanctuary/context_gate_list_policies",
+      "context_gate_filter",
+      "context_gate_set_policy",
+      "context_gate_apply_template",
+      "context_gate_recommend",
+      "context_gate_list_policies",
     ],
-    disabledDescription: "context gating (sanctuary/context_gate_filter)",
+    disabledDescription: "context gating (context_gate_filter)",
     usageExample:
-      "Before calling an external API, run: sanctuary/context_gate_filter with your context object and policy_id to get a filtered version.",
+      "Before calling an external API, run: context_gate_filter with your context object and policy_id to get a filtered version.",
   },
   approval_gate: {
     name: "Approval Gates",
@@ -66,17 +66,17 @@ const FEATURE_INFO: Record<string, FeaturePromptInfo> = {
   zk_proofs: {
     name: "Zero-Knowledge Proofs",
     activeDescription:
-      "You can prove claims about your data without revealing the underlying values. Use sanctuary/zk_commit to create a Pedersen commitment, sanctuary/zk_prove (Schnorr proof) to prove you know a committed value, and sanctuary/zk_range_prove to prove a value falls within a range — all without disclosing the actual data. For simpler SHA-256 commitments, use sanctuary/proof_commitment.",
+      "You can prove claims about your data without revealing the underlying values. Use zk_commit to create a Pedersen commitment, zk_prove (Schnorr proof) to prove you know a committed value, and zk_range_prove to prove a value falls within a range — all without disclosing the actual data. For simpler SHA-256 commitments, use proof_commitment.",
     toolNames: [
-      "sanctuary/zk_commit",
-      "sanctuary/zk_prove",
-      "sanctuary/zk_range_prove",
-      "sanctuary/proof_commitment",
+      "zk_commit",
+      "zk_prove",
+      "zk_range_prove",
+      "proof_commitment",
     ],
     disabledDescription:
-      "zero-knowledge proofs (sanctuary/zk_commit, sanctuary/zk_prove)",
+      "zero-knowledge proofs (zk_commit, zk_prove)",
     usageExample:
-      "To prove a claim without revealing data: first sanctuary/zk_commit to commit, then sanctuary/zk_prove or sanctuary/zk_range_prove to generate a verifiable proof.",
+      "To prove a claim without revealing data: first zk_commit to commit, then zk_prove or zk_range_prove to generate a verifiable proof.",
   },
 };
 
@@ -178,14 +178,14 @@ function buildQuickStart(activeKeys: string[]): string[] {
   // Context gating is highest-priority action item — requires explicit agent calls
   if (activeKeys.includes("context_gating")) {
     items.push(
-      "1. ALWAYS call sanctuary/context_gate_filter before sending context to external APIs."
+      "1. ALWAYS call context_gate_filter before sending context to external APIs."
     );
   }
 
   // ZK proofs — second most important active tool
   if (activeKeys.includes("zk_proofs")) {
     items.push(
-      `${items.length + 1}. Use sanctuary/zk_commit to prove claims without revealing underlying data.`
+      `${items.length + 1}. Use zk_commit to prove claims without revealing underlying data.`
     );
   }
 

@@ -130,7 +130,7 @@ describe("generateSystemPrompt", () => {
         context_gating: { enabled: true },
       });
       const prompt = generateSystemPrompt(profile);
-      expect(prompt).toContain("sanctuary/context_gate_filter");
+      expect(prompt).toContain("context_gate_filter");
     });
 
     it("zk proofs mentions commit and prove tools", () => {
@@ -138,8 +138,8 @@ describe("generateSystemPrompt", () => {
         zk_proofs: { enabled: true },
       });
       const prompt = generateSystemPrompt(profile);
-      expect(prompt).toContain("sanctuary/zk_commit");
-      expect(prompt).toContain("sanctuary/zk_prove");
+      expect(prompt).toContain("zk_commit");
+      expect(prompt).toContain("zk_prove");
     });
 
     it("approval gates describes tier system", () => {

@@ -85,12 +85,12 @@ describe("generateSystemPrompt — v2 (Enhanced)", () => {
 
     it("mentions all relevant tool names", () => {
       const prompt = generateSystemPrompt(allFeaturesOn());
-      expect(prompt).toContain("sanctuary/context_gate_filter");
-      expect(prompt).toContain("sanctuary/context_gate_set_policy");
-      expect(prompt).toContain("sanctuary/zk_commit");
-      expect(prompt).toContain("sanctuary/zk_prove");
-      expect(prompt).toContain("sanctuary/proof_commitment");
-      expect(prompt).toContain("sanctuary/monitor_audit_log");
+      expect(prompt).toContain("context_gate_filter");
+      expect(prompt).toContain("context_gate_set_policy");
+      expect(prompt).toContain("zk_commit");
+      expect(prompt).toContain("zk_prove");
+      expect(prompt).toContain("proof_commitment");
+      expect(prompt).toContain("monitor_audit_log");
     });
 
     it("does not include optional tools section when all enabled", () => {
@@ -104,18 +104,18 @@ describe("generateSystemPrompt — v2 (Enhanced)", () => {
   // ──────────────────────────────────────────────────────────────────────
 
   describe("Context gating enabled", () => {
-    it("mentions sanctuary/context_gate_filter tool", () => {
+    it("mentions context_gate_filter tool", () => {
       const prompt = generateSystemPrompt(
         makeProfile({ context_gating: { enabled: true } })
       );
-      expect(prompt).toContain("sanctuary/context_gate_filter");
+      expect(prompt).toContain("context_gate_filter");
     });
 
     it("Quick Start prioritizes context gating first", () => {
       const prompt = generateSystemPrompt(
         makeProfile({ context_gating: { enabled: true } })
       );
-      expect(prompt).toContain("ALWAYS call sanctuary/context_gate_filter");
+      expect(prompt).toContain("ALWAYS call context_gate_filter");
     });
 
     it("includes policy_id when set", () => {
@@ -134,15 +134,15 @@ describe("generateSystemPrompt — v2 (Enhanced)", () => {
       const prompt = generateSystemPrompt(
         makeProfile({ zk_proofs: { enabled: true } })
       );
-      expect(prompt).toContain("sanctuary/proof_commitment");
-      expect(prompt).toContain("sanctuary/zk_commit");
+      expect(prompt).toContain("proof_commitment");
+      expect(prompt).toContain("zk_commit");
     });
 
     it("mentions sanctuary/zk_range_prove", () => {
       const prompt = generateSystemPrompt(
         makeProfile({ zk_proofs: { enabled: true } })
       );
-      expect(prompt).toContain("sanctuary/zk_range_prove");
+      expect(prompt).toContain("zk_range_prove");
     });
   });
 
@@ -272,7 +272,7 @@ describe("generateSystemPrompt — v2 (Enhanced)", () => {
         "You are protected"
       )[0]!;
       // First numbered item should mention context_gate_filter
-      expect(quickStartSection).toContain("1. ALWAYS call sanctuary/context_gate_filter");
+      expect(quickStartSection).toContain("1. ALWAYS call context_gate_filter");
     });
   });
 });

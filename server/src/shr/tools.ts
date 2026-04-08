@@ -28,7 +28,7 @@ export function createSHRTools(
 
   const tools: ToolDefinition[] = [
     {
-      name: "sanctuary/shr_generate",
+      name: "shr_generate",
       description:
         "Generate a signed Sovereignty Health Report (SHR) — a machine-readable, " +
         "cryptographically signed advertisement of this instance's sovereignty posture. " +
@@ -68,7 +68,7 @@ export function createSHRTools(
     },
 
     {
-      name: "sanctuary/shr_verify",
+      name: "shr_verify",
       description:
         "Verify a counterparty's Sovereignty Health Report (SHR). " +
         "Checks signature validity, temporal validity, and assesses sovereignty level.",
@@ -99,7 +99,7 @@ export function createSHRTools(
     },
 
     {
-      name: "sanctuary/shr_gateway_export",
+      name: "shr_gateway_export",
       description:
         "Export this instance's Sovereignty Health Report formatted for " +
         "Ping Identity's Agent Gateway or other identity providers. " +

@@ -69,7 +69,7 @@ export function createHandshakeTools(
 
   const tools: ToolDefinition[] = [
     {
-      name: "sanctuary/handshake_initiate",
+      name: "handshake_initiate",
       description:
         "Initiate a sovereignty handshake with a counterparty. " +
         "Generates a challenge containing this instance's signed SHR and a cryptographic nonce. " +
@@ -107,7 +107,7 @@ export function createHandshakeTools(
     },
 
     {
-      name: "sanctuary/handshake_respond",
+      name: "handshake_respond",
       description:
         "Respond to an incoming sovereignty handshake challenge. " +
         "Verifies the initiator's SHR, signs their nonce, and returns our SHR with a counter-nonce.",
@@ -257,7 +257,7 @@ export function createHandshakeTools(
     },
 
     {
-      name: "sanctuary/handshake_complete",
+      name: "handshake_complete",
       description:
         "Complete a sovereignty handshake (initiator side). " +
         "Verifies the responder's SHR and nonce signature, signs their nonce, and produces the final result.",
@@ -325,7 +325,7 @@ export function createHandshakeTools(
     },
 
     {
-      name: "sanctuary/handshake_status",
+      name: "handshake_status",
       description:
         "Check the status of a handshake session, or verify a completion message (responder side).",
       inputSchema: {
@@ -388,7 +388,7 @@ export function createHandshakeTools(
     // ─── Streamlined Exchange ─────────────────────────────────────────
 
     {
-      name: "sanctuary/handshake_exchange",
+      name: "handshake_exchange",
       description:
         "One-shot sovereignty exchange. Accepts a counterparty's signed SHR, verifies it, " +
         "generates our SHR, and produces a signed attestation artifact — all in a single call. " +
@@ -488,7 +488,7 @@ export function createHandshakeTools(
     },
 
     {
-      name: "sanctuary/handshake_verify_attestation",
+      name: "handshake_verify_attestation",
       description:
         "Verify a signed attestation artifact from another agent. " +
         "Checks the Ed25519 signature, temporal validity, and structural integrity.",

@@ -24,7 +24,7 @@ export function createPrincipalPolicyTools(
 ): ToolDefinition[] {
   return [
     {
-      name: "sanctuary/principal_policy_view",
+      name: "principal_policy_view",
       description:
         "View the current Principal Policy — the human-controlled rules " +
         "governing what operations require approval. Read-only.",
@@ -69,7 +69,7 @@ export function createPrincipalPolicyTools(
     },
 
     {
-      name: "sanctuary/principal_baseline_view",
+      name: "principal_baseline_view",
       description:
         "View the current behavioral baseline — the session profile used " +
         "for anomaly detection. Shows known namespaces, counterparties, " +

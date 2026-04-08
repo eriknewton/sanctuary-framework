@@ -23,7 +23,7 @@ export function createGovernorTools(
   const tools: ToolDefinition[] = [
     // ── Governor Status ─────────────────────────────────────────────
     {
-      name: "sanctuary/governor_status",
+      name: "governor_status",
       description:
         "View the current Call Governor status including volume counters, " +
         "per-tool rate counts, duplicate cache size, and lifetime counter. " +
@@ -94,7 +94,7 @@ export function createGovernorTools(
 
     // ── Governor Reset ──────────────────────────────────────────────
     {
-      name: "sanctuary/governor_reset",
+      name: "governor_reset",
       description:
         "Reset all Call Governor counters: volume window, per-tool rate " +
         "windows, duplicate cache, and lifetime counter. This clears the " +

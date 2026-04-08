@@ -52,7 +52,7 @@ describe("Full Sovereignty Flow", () => {
     const allToolsA = [...l1Tools, ...l3Tools, ...l4Tools];
 
     // ── Step 1: L1 — Create Identity ───────────────────────────────────
-    const identity = await callTool(allToolsA, "sanctuary/identity_create", {
+    const identity = await callTool(allToolsA, "identity_create", {
       label: "test-agent-alpha",
     });
     expect(identity.identity_id).toBeTruthy();
@@ -61,7 +61,7 @@ describe("Full Sovereignty Flow", () => {
     const identityId = identity.identity_id as string;
 
     // ── Step 2: L1 — Write Encrypted State ─────────────────────────────
-    const writeResult = await callTool(allToolsA, "sanctuary/state_write", {
+    const writeResult = await callTool(allToolsA, "state_write", {
       namespace: "agent-memory",
       key: "preferences",
       value: JSON.stringify({
@@ -75,7 +75,7 @@ describe("Full Sovereignty Flow", () => {
     expect(writeResult.merkle_root).toBeTruthy();
 
     // ── Step 3: L1 — Read Back State (verify round-trip) ───────────────
-    const readResult = await callTool(allToolsA, "sanctuary/state_read", {
+    const readResult = await callTool(allToolsA, "state_read", {
       namespace: "agent-memory",
       key: "preferences",
     });
@@ -85,14 +85,14 @@ describe("Full Sovereignty Flow", () => {
     expect(parsedValue.max_transaction).toBe(5000);
 
     // ── Step 4: L1 — Sign Data ─────────────────────────────────────────
-    const signResult = await callTool(allToolsA, "sanctuary/identity_sign", {
+    const signResult = await callTool(allToolsA, "identity_sign", {
       identity_id: identityId,
       payload: "I authorize transaction XYZ-789",
     });
     expect(signResult.signature).toBeTruthy();
 
     // ── Step 5: L1 — Verify Signature ──────────────────────────────────
-    const verifyResult = await callTool(allToolsA, "sanctuary/identity_verify", {
+    const verifyResult = await callTool(allToolsA, "identity_verify", {
       identity_id: identityId,
       payload: "I authorize transaction XYZ-789",
       signature: signResult.signature,
@@ -100,14 +100,14 @@ describe("Full Sovereignty Flow", () => {
     expect(verifyResult.valid).toBe(true);
 
     // ── Step 6: L3 — Create Commitment ─────────────────────────────────
-    const commitment = await callTool(allToolsA, "sanctuary/proof_commitment", {
+    const commitment = await callTool(allToolsA, "proof_commitment", {
       value: "I am authorized for transactions up to $5,000",
     });
     expect(commitment.commitment).toBeTruthy();
     expect(commitment.blinding_factor).toBeTruthy();
 
     // ── Step 7: L3 — Reveal and Verify Commitment ──────────────────────
-    const reveal = await callTool(allToolsA, "sanctuary/proof_reveal", {
+    const reveal = await callTool(allToolsA, "proof_reveal", {
       commitment: commitment.commitment,
       value: "I am authorized for transactions up to $5,000",
       blinding_factor: commitment.blinding_factor,
@@ -115,7 +115,7 @@ describe("Full Sovereignty Flow", () => {
     expect(reveal.valid).toBe(true);
 
     // ── Step 8: L3 — Set Disclosure Policy ─────────────────────────────
-    const policy = await callTool(allToolsA, "sanctuary/disclosure_set_policy", {
+    const policy = await callTool(allToolsA, "disclosure_set_policy", {
       policy_name: "Commerce Negotiation Policy",
       rules: [
         {
@@ -136,7 +136,7 @@ describe("Full Sovereignty Flow", () => {
     expect(policy.policy_id).toBeTruthy();
 
     // ── Step 9: L3 — Evaluate Disclosure Request ───────────────────────
-    const disclosure = await callTool(allToolsA, "sanctuary/disclosure_evaluate", {
+    const disclosure = await callTool(allToolsA, "disclosure_evaluate", {
       context: "commerce",
       requested_fields: [
         "agent_name",
@@ -155,7 +155,7 @@ describe("Full Sovereignty Flow", () => {
     expect(decisions.find((d) => d.field === "unknown_field")!.action).toBe("withhold");
 
     // ── Step 10: L4 — Record Reputation ────────────────────────────────
-    const rep1 = await callTool(allToolsA, "sanctuary/reputation_record", {
+    const rep1 = await callTool(allToolsA, "reputation_record", {
       interaction_id: "txn-alpha-001",
       counterparty_did: "did:key:counterparty-beta",
       outcome: {
@@ -169,7 +169,7 @@ describe("Full Sovereignty Flow", () => {
     expect(rep1.attestation_id).toBeTruthy();
     expect(rep1.self_attestation).toBeTruthy();
 
-    const rep2 = await callTool(allToolsA, "sanctuary/reputation_record", {
+    const rep2 = await callTool(allToolsA, "reputation_record", {
       interaction_id: "txn-alpha-002",
       counterparty_did: "did:key:counterparty-gamma",
       outcome: {
@@ -183,7 +183,7 @@ describe("Full Sovereignty Flow", () => {
     expect(rep2.attestation_id).toBeTruthy();
 
     // ── Step 11: L4 — Query Reputation ─────────────────────────────────
-    const repQuery = await callTool(allToolsA, "sanctuary/reputation_query", {
+    const repQuery = await callTool(allToolsA, "reputation_query", {
       context: "commerce",
     });
     const summary = repQuery.summary as Record<string, unknown>;
@@ -194,7 +194,7 @@ describe("Full Sovereignty Flow", () => {
     expect(metrics.response_time_ms.mean).toBeCloseTo(825);
 
     // ── Step 12: L4 — Export Reputation ────────────────────────────────
-    const exportResult = await callTool(allToolsA, "sanctuary/reputation_export", {
+    const exportResult = await callTool(allToolsA, "reputation_export", {
       format: "SANCTUARY_REP_V1",
       identity_id: identityId,
     });
@@ -216,7 +216,7 @@ describe("Full Sovereignty Flow", () => {
     const allToolsB = [...l1ToolsB, ...l4ToolsB];
 
     // Create an identity in Instance B so we can work with it
-    await callTool(allToolsB, "sanctuary/identity_create", {
+    await callTool(allToolsB, "identity_create", {
       label: "instance-b-identity",
     });
 
@@ -239,14 +239,14 @@ describe("Full Sovereignty Flow", () => {
 
     // Import the bundle — signature verification is always enforced.
     // Instance B can verify because we registered A's public key above.
-    const importResult = await callTool(allToolsB, "sanctuary/reputation_import", {
+    const importResult = await callTool(allToolsB, "reputation_import", {
       bundle: exportResult.bundle,
     });
     expect(importResult.imported_attestations).toBe(2);
     expect(importResult.invalid_attestations).toBe(0);
 
     // Verify imported reputation is queryable in Instance B
-    const repQueryB = await callTool(allToolsB, "sanctuary/reputation_query", {});
+    const repQueryB = await callTool(allToolsB, "reputation_query", {});
     const summaryB = repQueryB.summary as Record<string, unknown>;
     expect(summaryB.total_interactions).toBe(2);
     expect(summaryB.completed).toBe(2);

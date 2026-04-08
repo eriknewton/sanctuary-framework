@@ -6,11 +6,11 @@
  * (LLM APIs, tool APIs, logging services) during outbound calls.
  *
  * Tools:
- * - sanctuary/context_gate_set_policy — Define a context-gating policy
- * - sanctuary/context_gate_apply_template — Apply a starter template
- * - sanctuary/context_gate_filter — Filter context through a policy
- * - sanctuary/context_gate_recommend — Analyze context and recommend a policy
- * - sanctuary/context_gate_list_policies — List all context-gating policies
+ * - context_gate_set_policy — Define a context-gating policy
+ * - context_gate_apply_template — Apply a starter template
+ * - context_gate_filter — Filter context through a policy
+ * - context_gate_recommend — Analyze context and recommend a policy
+ * - context_gate_list_policies — List all context-gating policies
  *
  * All operations are audit-logged. Policies are encrypted at rest.
  */
@@ -56,7 +56,7 @@ export function createContextGateTools(
   // Create the automatic enforcer
   const enforcerConfig: EnforcerConfig = {
     enabled: false, // Off by default; agents must explicitly enable it
-    bypass_prefixes: ["sanctuary/"], // Skip internal tools by default
+    bypass_prefixes: ["*"], // Skip all Sanctuary-internal tools; only proxy/ tools get filtered
     log_only: false, // Filter immediately
     on_deny: "block", // Block requests with denied fields
   };
@@ -65,7 +65,7 @@ export function createContextGateTools(
   const tools: ToolDefinition[] = [
     // ── Set Policy ──────────────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_set_policy",
+      name: "context_gate_set_policy",
       description:
         "Create a context-gating policy that controls what information flows to " +
         "remote providers (LLM APIs, tool APIs, logging services). " +
@@ -211,7 +211,7 @@ export function createContextGateTools(
           default_action: policy.default_action,
           created_at: policy.created_at,
           message:
-            "Context-gating policy created. Use sanctuary/context_gate_filter " +
+            "Context-gating policy created. Use context_gate_filter " +
             "to apply this policy before making outbound calls.",
         });
       },
@@ -219,7 +219,7 @@ export function createContextGateTools(
 
     // ── Apply Template ───────────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_apply_template",
+      name: "context_gate_apply_template",
       description:
         "Apply a starter context-gating template. Available templates: " +
         "inference-minimal (strictest — only task and query pass through), " +
@@ -281,16 +281,16 @@ export function createContextGateTools(
           default_action: policy.default_action,
           created_at: policy.created_at,
           message:
-            "Template applied. Use sanctuary/context_gate_filter with this " +
+            "Template applied. Use context_gate_filter with this " +
             "policy_id to filter context before outbound calls. " +
-            "Customize rules with sanctuary/context_gate_set_policy if needed.",
+            "Customize rules with context_gate_set_policy if needed.",
         });
       },
     },
 
     // ── Recommend Policy ────────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_recommend",
+      name: "context_gate_recommend",
       description:
         "Analyze a sample context object and recommend a context-gating " +
         "policy based on field name heuristics. Classifies each field as " +
@@ -343,9 +343,9 @@ export function createContextGateTools(
           ...recommendation,
           next_steps:
             "Review the classifications above. If they look correct, you can " +
-            "apply them directly with sanctuary/context_gate_set_policy using " +
+            "apply them directly with context_gate_set_policy using " +
             "the recommended_rules. Or start with a template via " +
-            "sanctuary/context_gate_apply_template and customize from there.",
+            "context_gate_apply_template and customize from there.",
           available_templates: listTemplateIds().map((id) => {
             const t = TEMPLATES[id]!;
             return { id, name: t.name, description: t.description };
@@ -356,7 +356,7 @@ export function createContextGateTools(
 
     // ── Filter Context ──────────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_filter",
+      name: "context_gate_filter",
       description:
         "Filter agent context through a gating policy before sending to a " +
         "remote provider. Returns per-field decisions (allow, redact, hash, " +
@@ -494,7 +494,7 @@ export function createContextGateTools(
 
     // ── List Policies ───────────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_list_policies",
+      name: "context_gate_list_policies",
       description:
         "List all configured context-gating policies. Returns policy IDs, " +
         "names, rule summaries, and default actions.",
@@ -524,7 +524,7 @@ export function createContextGateTools(
           message:
             policies.length === 0
               ? "No context-gating policies configured. Use " +
-                "sanctuary/context_gate_set_policy to create one."
+                "context_gate_set_policy to create one."
               : `${policies.length} context-gating ${policies.length === 1 ? "policy" : "policies"} configured.`,
         });
       },
@@ -532,7 +532,7 @@ export function createContextGateTools(
 
     // ── Enforcer Status ─────────────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_enforcer_status",
+      name: "context_gate_enforcer_status",
       description:
         "Get the status of the automatic context gate enforcer, including " +
         "enabled/disabled state, log_only mode, active policy, and statistics. " +
@@ -569,7 +569,7 @@ export function createContextGateTools(
             status.stats.calls_inspected > 0
               ? `Over ${status.stats.calls_inspected} tool calls, ` +
                 `${status.stats.fields_redacted} sensitive fields were redacted. ` +
-                `Use sanctuary/context_gate_enforcer_configure to adjust settings.`
+                `Use context_gate_enforcer_configure to adjust settings.`
               : "No tool calls have been inspected yet.",
         });
       },
@@ -577,7 +577,7 @@ export function createContextGateTools(
 
     // ── Enforcer Configuration ──────────────────────────────────────────
     {
-      name: "sanctuary/context_gate_enforcer_configure",
+      name: "context_gate_enforcer_configure",
       description:
         "Configure the automatic context gate enforcer. Control whether it " +
         "filters tool arguments, toggle log_only mode for gradual rollout, " +

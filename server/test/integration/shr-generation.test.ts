@@ -63,14 +63,14 @@ describe("SHR Generation Integration", () => {
     const allTools = [...l1Tools, ...shrTools];
 
     // ── Step 1: Create an identity ────────────────────────────────────
-    const identity = await callTool(allTools, "sanctuary/identity_create", {
+    const identity = await callTool(allTools, "identity_create", {
       label: "shr-test-identity",
     });
     expect(identity.identity_id).toBeDefined();
     expect(identity.public_key).toBeDefined();
 
     // ── Step 2: Generate SHR ──────────────────────────────────────────
-    const shr = await callTool(allTools, "sanctuary/shr_generate", {
+    const shr = await callTool(allTools, "shr_generate", {
       identity_id: identity.identity_id as string,
       validity_minutes: 60,
     });
@@ -108,14 +108,14 @@ describe("SHR Generation Integration", () => {
     expect(caps.reputation_verify).toBe(true);
 
     // ── Step 4: Verify signature ──────────────────────────────────────
-    const verification = await callTool(allTools, "sanctuary/shr_verify", {
+    const verification = await callTool(allTools, "shr_verify", {
       shr: shr,
     });
     expect(verification.valid).toBe(true);
     expect(verification.errors).toEqual([]);
 
     // ── Step 5: Gateway export ────────────────────────────────────────
-    const gatewayExport = await callTool(allTools, "sanctuary/shr_gateway_export", {
+    const gatewayExport = await callTool(allTools, "shr_gateway_export", {
       identity_id: identity.identity_id as string,
       format: "generic",
     });
@@ -140,9 +140,9 @@ describe("SHR Generation Integration", () => {
     const { tools } = createSHRTools(config, identityManager, masterKey, auditLog);
 
     const toolNames = tools.map((t) => t.name);
-    expect(toolNames).toContain("sanctuary/shr_generate");
-    expect(toolNames).toContain("sanctuary/shr_verify");
-    expect(toolNames).toContain("sanctuary/shr_gateway_export");
+    expect(toolNames).toContain("shr_generate");
+    expect(toolNames).toContain("shr_verify");
+    expect(toolNames).toContain("shr_gateway_export");
     expect(toolNames).toHaveLength(3);
   });
 });

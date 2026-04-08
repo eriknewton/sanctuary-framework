@@ -47,7 +47,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("wraps a handler to filter its arguments", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -79,10 +79,10 @@ describe("L2 Context Gate Enforcer", () => {
       expect(parsed.received_args.task).toBe("do something");
     });
 
-    it("bypasses sanctuary/ prefixed tools", async () => {
+    it("bypasses internal tools with wildcard sentinel", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: ["*"],
         log_only: false,
         on_deny: "block",
       };
@@ -96,7 +96,7 @@ describe("L2 Context Gate Enforcer", () => {
       };
 
       const wrappedHandler = enforcer.wrapHandler(
-        "sanctuary/internal_tool",
+        "internal_tool",
         originalHandler
       );
 
@@ -119,7 +119,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("passes through when disabled", async () => {
       const config: EnforcerConfig = {
         enabled: false,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -150,7 +150,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("catches api_key pattern", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -177,7 +177,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("catches *_token pattern", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -206,7 +206,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("catches password pattern", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -235,7 +235,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("catches credential* pattern", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -264,7 +264,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("catches private_key, secret_key patterns", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -296,7 +296,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("catches credit_card and cvv patterns", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -329,7 +329,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("catches PII patterns (ssn, tax_id)", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -366,7 +366,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("logs filtering decision but passes original args", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: true,
         on_deny: "block",
       };
@@ -405,7 +405,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("accumulates stats correctly", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: ["internal"],
         log_only: false,
         on_deny: "block",
       };
@@ -416,11 +416,11 @@ describe("L2 Context Gate Enforcer", () => {
         return toolResult({ args });
       };
 
-      // Call 1: bypass (sanctuary/ prefix)
-      const wrapped1 = enforcer.wrapHandler("sanctuary/tool", originalHandler);
+      // Call 1: bypass (internal/ prefix matches)
+      const wrapped1 = enforcer.wrapHandler("internal/tool", originalHandler);
       await wrapped1({ api_key: "secret" });
 
-      // Call 2: inspect and redact
+      // Call 2: inspect and redact (external/ prefix NOT bypassed)
       const wrapped2 = enforcer.wrapHandler("external/tool", originalHandler);
       await wrapped2({ api_key: "secret", task: "work" });
 
@@ -437,7 +437,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("can reset stats", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -485,7 +485,7 @@ describe("L2 Context Gate Enforcer", () => {
       const config: EnforcerConfig = {
         enabled: true,
         default_policy_id: policy.policy_id,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -521,7 +521,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("can toggle enabled state", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -549,7 +549,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("can toggle log_only mode", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -587,7 +587,7 @@ describe("L2 Context Gate Enforcer", () => {
 
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -625,7 +625,7 @@ describe("L2 Context Gate Enforcer", () => {
     it("passes through when no sensitive fields detected", async () => {
       const config: EnforcerConfig = {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: [""],
         log_only: false,
         on_deny: "block",
       };
@@ -659,42 +659,60 @@ describe("L2 Context Gate Enforcer", () => {
 
   // ── SEC-033: Bypass prefix namespace boundary ──────────────────────
   describe("SEC-033: Bypass prefix namespace safety", () => {
-    it("bypasses sanctuary/ tools (legitimate)", () => {
+    it("bypasses all tools with wildcard sentinel", () => {
       const enforcer = new ContextGateEnforcer(policyStore, auditLog, {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: ["*"],
         log_only: false,
         on_deny: "block",
       });
 
-      expect(enforcer.shouldFilter("sanctuary/state_read")).toBe(false);
-      expect(enforcer.shouldFilter("sanctuary/monitor_health")).toBe(false);
+      expect(enforcer.shouldFilter("state_read")).toBe(false);
+      expect(enforcer.shouldFilter("monitor_health")).toBe(false);
+      expect(enforcer.shouldFilter("proxy/server/tool")).toBe(false);
+    });
+
+    it("filters proxy tools when bypass is limited to specific prefix", () => {
+      const enforcer = new ContextGateEnforcer(policyStore, auditLog, {
+        enabled: true,
+        bypass_prefixes: ["internal"],
+        log_only: false,
+        on_deny: "block",
+      });
+
+      // internal/* tools are bypassed
+      expect(enforcer.shouldFilter("internal/state_read")).toBe(false);
+      // proxy/* and other tools are filtered
+      expect(enforcer.shouldFilter("proxy/server/tool")).toBe(true);
+      expect(enforcer.shouldFilter("external/steal")).toBe(true);
     });
 
     it("does NOT bypass tools with similar but different prefix", () => {
       const enforcer = new ContextGateEnforcer(policyStore, auditLog, {
         enabled: true,
-        bypass_prefixes: ["sanctuary/"],
+        bypass_prefixes: ["proxy"],
         log_only: false,
         on_deny: "block",
       });
 
-      // These should NOT be bypassed — they're not in the "sanctuary/" namespace
-      expect(enforcer.shouldFilter("sanctuary_evil/steal")).toBe(true);
-      expect(enforcer.shouldFilter("sanctuaryX/hack")).toBe(true);
+      // proxy/* tools are bypassed
+      expect(enforcer.shouldFilter("proxy/server/tool")).toBe(false);
+      // proxyevil/* should NOT be bypassed — namespace boundary
+      expect(enforcer.shouldFilter("proxyevil/steal")).toBe(true);
+      expect(enforcer.shouldFilter("proxyX/hack")).toBe(true);
     });
 
     it("enforces namespace boundary even without trailing slash in config", () => {
       const enforcer = new ContextGateEnforcer(policyStore, auditLog, {
         enabled: true,
-        bypass_prefixes: ["sanctuary"],  // No trailing slash
+        bypass_prefixes: ["proxy"],  // No trailing slash
         log_only: false,
         on_deny: "block",
       });
 
       // Should still be namespace-safe
-      expect(enforcer.shouldFilter("sanctuary/state_read")).toBe(false);
-      expect(enforcer.shouldFilter("sanctuary_evil/steal")).toBe(true);
+      expect(enforcer.shouldFilter("proxy/server/tool")).toBe(false);
+      expect(enforcer.shouldFilter("proxyevil/steal")).toBe(true);
     });
   });
 });

@@ -1534,7 +1534,7 @@ declare class InjectionDetector {
     constructor(config?: Partial<InjectionDetectorConfig>);
     /**
      * Scan tool arguments for injection signals.
-     * @param toolName Full tool name (e.g., "sanctuary/state_read")
+     * @param toolName Full tool name (e.g., "state_read")
      * @param args Tool arguments
      * @returns DetectionResult with all detected signals
      */
@@ -1953,7 +1953,7 @@ declare class ApprovalGate {
     /**
      * Evaluate a tool call against the Principal Policy.
      *
-     * @param toolName - Full MCP tool name (e.g., "sanctuary/state_export")
+     * @param toolName - Full MCP tool name (e.g., "state_export")
      * @param args - Tool call arguments (for context extraction)
      * @returns GateResult indicating whether the call is allowed
      */
@@ -2028,7 +2028,7 @@ interface EnforcerConfig {
     enabled: boolean;
     /** Policy ID to use when no specific one is set */
     default_policy_id?: string;
-    /** Tool name prefixes to skip filtering (e.g., ["sanctuary/"] to skip system tools) */
+    /** Tool name prefixes to skip filtering (e.g., ["*"] to skip all system tools) */
     bypass_prefixes: string[];
     /** Log but don't filter — for gradual rollout (default: false) */
     log_only: boolean;
@@ -2083,10 +2083,13 @@ declare class ContextGateEnforcer {
      * Check if a tool should be filtered based on bypass prefixes.
      *
      * SEC-033: Uses exact namespace component matching, not bare startsWith().
-     * A prefix of "sanctuary/" matches "sanctuary/state_read" but NOT
-     * "sanctuary_evil/steal_data" (no slash boundary confusion). The prefix
-     * must match exactly up to its length, and the prefix must end with "/"
-     * to enforce namespace boundaries (if it doesn't, we add one for safety).
+     * A prefix of "proxy/" matches "proxy/server/tool" but NOT "proxyevil/steal".
+     * The prefix must match exactly up to its length, and the prefix must end
+     * with "/" to enforce namespace boundaries (if it doesn't, we add one).
+     *
+     * Special sentinel: "*" bypasses ALL tools (used when all Sanctuary-internal
+     * tools should skip context gating — the default). Only proxy/external tools
+     * should be filtered in production.
      */
     shouldFilter(toolName: string): boolean;
     /**
@@ -2481,6 +2484,15 @@ interface ProxyRouterOptions {
     contextGateFilter?: (toolName: string, args: Record<string, unknown>) => Promise<Record<string, unknown>>;
     /** Optional call governor for runtime governance */
     governor?: CallGovernor;
+    /** Optional callback after each proxy call decision (for dashboard feed) */
+    onProxyCall?: (data: {
+        tool: string;
+        server: string;
+        decision: string;
+        reason?: string;
+        tier?: number;
+        timestamp: string;
+    }) => void;
 }
 declare class ProxyRouter {
     private clientManager;
@@ -2511,6 +2523,10 @@ declare class ProxyRouter {
      * The handler runs the full enforcement chain before forwarding.
      */
     private createHandler;
+    /**
+     * Notify the onProxyCall callback if configured.
+     */
+    private notifyProxyCall;
     /**
      * Call an upstream tool with a timeout.
      */
@@ -2710,6 +2726,7 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
     private profileStore;
     private clientManager;
     private dashboardHTML;
+    private fortressHTML;
     private loginHTML;
     private authToken;
     private useTLS;
@@ -2815,6 +2832,24 @@ declare class DashboardApprovalChannel implements ApprovalChannel {
     private handleSessionExchange;
     private serveLoginPage;
     private serveDashboard;
+    private serveFortressView;
+    /**
+     * Enable Fortress View (Cocoon mode) with the given upstream server count.
+     * Once enabled, the root path `/` serves the Fortress View instead of the
+     * standard dashboard. The standard dashboard remains available at `/dashboard`.
+     */
+    enableFortressView(upstreamServerCount: number): void;
+    /**
+     * Broadcast a proxy call event to connected dashboards (Fortress View feed).
+     */
+    broadcastProxyCall(data: {
+        tool: string;
+        server: string;
+        decision: string;
+        reason?: string;
+        tier?: number;
+        timestamp: string;
+    }): void;
     private handleSSE;
     private handleStatus;
     private handlePendingList;

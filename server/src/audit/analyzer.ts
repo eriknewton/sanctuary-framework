@@ -550,7 +550,7 @@ function generateGaps(
         : null,
       sanctuary_solution:
         "Sanctuary's context gating (sanctuary/context_gate_set_policy + " +
-        "sanctuary/context_gate_filter) lets you define per-provider policies that " +
+        "context_gate_filter) lets you define per-provider policies that " +
         "control exactly what context flows outbound. Redact secrets, hash identifiers, " +
         "and send only minimum-necessary context for each call.",
       incident_class: INCIDENT_CONTEXT_LEAKAGE,
@@ -569,7 +569,7 @@ function generateGaps(
       openclaw_relevance: null,
       sanctuary_solution:
         "Sanctuary maintains an encrypted audit log of all operations, queryable via " +
-        "sanctuary/monitor_audit_log.",
+        "monitor_audit_log.",
       incident_class: INCIDENT_CLAUDE_CODE_LEAK,
     });
   }
@@ -638,7 +638,7 @@ function generateRecommendations(
     recs.push({
       priority: 1,
       action: "Create a cryptographic identity — your agent's foundation for all sovereignty operations",
-      tool: "sanctuary/identity_create",
+      tool: "identity_create",
       effort: "immediate",
       impact: "critical",
     });
@@ -648,7 +648,7 @@ function generateRecommendations(
     recs.push({
       priority: 2,
       action: "Migrate plaintext agent state to Sanctuary's encrypted store",
-      tool: "sanctuary/state_write",
+      tool: "state_write",
       effort: "minutes",
       impact: "critical",
     });
@@ -657,7 +657,7 @@ function generateRecommendations(
   recs.push({
     priority: 3,
     action: "Generate a Sovereignty Health Report to present to counterparties",
-    tool: "sanctuary/shr_generate",
+    tool: "shr_generate",
     effort: "immediate",
     impact: "high",
   });
@@ -666,7 +666,7 @@ function generateRecommendations(
     recs.push({
       priority: 4,
       action: "Enable the three-tier Principal Policy gate for graduated approval",
-      tool: "sanctuary/principal_policy_view",
+      tool: "principal_policy_view",
       effort: "minutes",
       impact: "high",
     });
@@ -676,7 +676,7 @@ function generateRecommendations(
     recs.push({
       priority: 5,
       action: "Configure context gating to control what flows to LLM providers",
-      tool: "sanctuary/context_gate_set_policy",
+      tool: "context_gate_set_policy",
       effort: "minutes",
       impact: "high",
     });
@@ -686,7 +686,7 @@ function generateRecommendations(
     recs.push({
       priority: 6,
       action: "Start recording reputation attestations from completed interactions",
-      tool: "sanctuary/reputation_record",
+      tool: "reputation_record",
       effort: "minutes",
       impact: "medium",
     });
@@ -696,7 +696,7 @@ function generateRecommendations(
     recs.push({
       priority: 7,
       action: "Configure selective disclosure policies for data sharing",
-      tool: "sanctuary/disclosure_set_policy",
+      tool: "disclosure_set_policy",
       effort: "hours",
       impact: "medium",
     });

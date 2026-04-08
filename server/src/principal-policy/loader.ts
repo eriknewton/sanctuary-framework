@@ -112,13 +112,15 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
 
 /**
  * Extract the operation name from a full MCP tool name.
- * "sanctuary/state_export" → "state_export"
+ * "state_export" → "state_export" (Sanctuary tools already bare)
  * "proxy/github/repos_list" → "proxy/github/repos_list" (proxy names pass through)
+ * Legacy: "sanctuary/state_export" → "state_export" (backwards compat)
  */
 export function extractOperationName(toolName: string): string {
   if (toolName.startsWith("proxy/")) {
     return toolName; // Proxy tools keep their full name for tier resolution
   }
+  // Backwards compatibility: strip legacy sanctuary/ prefix if present
   return toolName.startsWith("sanctuary/")
     ? toolName.slice("sanctuary/".length)
     : toolName;

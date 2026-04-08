@@ -40,7 +40,7 @@ export function createL4Tools(
     // ─── Reputation Recording ─────────────────────────────────────────
 
     {
-      name: "sanctuary/reputation_record",
+      name: "reputation_record",
       description:
         "Record an interaction outcome as a signed attestation. " +
         "Creates an EAS-compatible attestation signed by the specified identity.",
@@ -146,7 +146,7 @@ export function createL4Tools(
     // ─── Reputation Query ─────────────────────────────────────────────
 
     {
-      name: "sanctuary/reputation_query",
+      name: "reputation_query",
       description:
         "Query aggregated reputation data with filtering. " +
         "Returns summary statistics, never raw interaction details.",
@@ -202,7 +202,7 @@ export function createL4Tools(
     // ─── Reputation Export ─────────────────────────────────────────────
 
     {
-      name: "sanctuary/reputation_export",
+      name: "reputation_export",
       description:
         "Export a portable reputation bundle (SANCTUARY_REP_V1). " +
         "Includes all signed attestations for independent verification.",
@@ -273,7 +273,7 @@ export function createL4Tools(
     // ─── Reputation Import ────────────────────────────────────────────
 
     {
-      name: "sanctuary/reputation_import",
+      name: "reputation_import",
       description:
         "Import a reputation bundle from another Sanctuary instance. " +
         "Verifies all attestation signatures by default.",
@@ -337,7 +337,7 @@ export function createL4Tools(
     // ─── Sovereignty-Weighted Query ──────────────────────────────────
 
     {
-      name: "sanctuary/reputation_query_weighted",
+      name: "reputation_query_weighted",
       description:
         "Query reputation with sovereignty-weighted scoring. " +
         "Attestations from verified-sovereign agents carry full weight (1.0); " +
@@ -412,7 +412,7 @@ export function createL4Tools(
     // ─── Trust Bootstrap: Escrow ──────────────────────────────────────
 
     {
-      name: "sanctuary/bootstrap_create_escrow",
+      name: "bootstrap_create_escrow",
       description:
         "Create an escrow record for trust bootstrapping. " +
         "Allows new participants with no reputation to transact safely.",
@@ -481,7 +481,7 @@ export function createL4Tools(
     // ─── Trust Bootstrap: Guarantee ───────────────────────────────────
 
     {
-      name: "sanctuary/bootstrap_provide_guarantee",
+      name: "bootstrap_provide_guarantee",
       description:
         "A principal provides a signed reputation guarantee for a new agent. " +
         "The guarantee certificate can be presented to counterparties.",
@@ -567,7 +567,7 @@ export function createL4Tools(
     // ─── Verascore Reputation Publish ────────────────────────────────
 
     {
-      name: "sanctuary/reputation_publish",
+      name: "reputation_publish",
       description:
         "Publish sovereignty data to Verascore (verascore.ai) — the agent reputation platform. " +
         "Sends SHR data, handshake attestations, or sovereignty updates. " +

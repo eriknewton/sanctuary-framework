@@ -32,7 +32,7 @@ The MCP ecosystem has 10,000+ servers indexed and 97M+ monthly SDK downloads. Sa
 Build a free MCP tool that audits an existing agent's security posture — checks for plaintext state, unsigned commitments, missing identity, unverified transactions. The output: "You have 4 sovereignty gaps. Here's what architectural sovereignty requires." This is the security-scanner-to-product pipeline that worked for npm audit, Snyk, and every AppSec company. Critically, it educates by showing the gap — it doesn't just advertise.
 
 **3. Reference Implementations for Popular Frameworks**
-Build thin Sanctuary adapters for LangChain, CrewAI, AutoGen, and the OpenAI Agents SDK. Developers building multi-agent systems hit the "how do my agents trust each other?" problem immediately. If the answer is `pip install sanctuary-langchain` or `npm install @sanctuary-framework/crewai`, they'll use it.
+Build thin Sanctuary adapters for LangChain, CrewAI, Microsoft Agent Framework (formerly AutoGen), and the OpenAI Agents SDK. Developers building multi-agent systems hit the "how do my agents trust each other?" problem immediately. If the answer is `pip install sanctuary-langchain` or `npm install @sanctuary-framework/crewai`, they'll use it.
 
 **4. npm Publish — Make `npx @sanctuary-framework/mcp-server` Work**
 The package metadata is ready. This is a precondition for everything else and should ship within days, not weeks.

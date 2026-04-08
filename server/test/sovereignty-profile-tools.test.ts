@@ -48,20 +48,20 @@ describe("Sovereignty Profile Tools", () => {
 
     it("registers sanctuary/sovereignty_profile_get", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_get");
-      expect(tool.name).toBe("sanctuary/sovereignty_profile_get");
+      const tool = findTool("sovereignty_profile_get");
+      expect(tool.name).toBe("sovereignty_profile_get");
     });
 
     it("registers sanctuary/sovereignty_profile_update", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_update");
-      expect(tool.name).toBe("sanctuary/sovereignty_profile_update");
+      const tool = findTool("sovereignty_profile_update");
+      expect(tool.name).toBe("sovereignty_profile_update");
     });
 
     it("registers sanctuary/sovereignty_profile_generate_prompt", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_generate_prompt");
-      expect(tool.name).toBe("sanctuary/sovereignty_profile_generate_prompt");
+      const tool = findTool("sovereignty_profile_generate_prompt");
+      expect(tool.name).toBe("sovereignty_profile_generate_prompt");
     });
   });
 
@@ -70,7 +70,7 @@ describe("Sovereignty Profile Tools", () => {
   describe("sovereignty_profile_get", () => {
     it("returns the current profile", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_get");
+      const tool = findTool("sovereignty_profile_get");
       const result = await tool.handler({});
       const data = parseToolResult(result);
 
@@ -82,7 +82,7 @@ describe("Sovereignty Profile Tools", () => {
 
     it("returns MCP-compatible response format", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_get");
+      const tool = findTool("sovereignty_profile_get");
       const result = await tool.handler({});
 
       expect(result).toHaveProperty("content");
@@ -93,7 +93,7 @@ describe("Sovereignty Profile Tools", () => {
 
     it("includes message in response", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_get");
+      const tool = findTool("sovereignty_profile_get");
       const result = await tool.handler({});
       const data = parseToolResult(result);
       expect(data).toHaveProperty("message");
@@ -105,7 +105,7 @@ describe("Sovereignty Profile Tools", () => {
   describe("sovereignty_profile_update", () => {
     it("enables a feature", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_update");
+      const tool = findTool("sovereignty_profile_update");
       const result = await tool.handler({
         zk_proofs: { enabled: true },
       });
@@ -116,7 +116,7 @@ describe("Sovereignty Profile Tools", () => {
 
     it("disables a feature", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_update");
+      const tool = findTool("sovereignty_profile_update");
       const result = await tool.handler({
         audit_logging: { enabled: false },
       });
@@ -127,7 +127,7 @@ describe("Sovereignty Profile Tools", () => {
 
     it("updates sensitivity", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_update");
+      const tool = findTool("sovereignty_profile_update");
       const result = await tool.handler({
         injection_detection: { sensitivity: "high" },
       });
@@ -140,7 +140,7 @@ describe("Sovereignty Profile Tools", () => {
 
     it("preserves unmodified features", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_update");
+      const tool = findTool("sovereignty_profile_update");
       const result = await tool.handler({
         context_gating: { enabled: true },
       });
@@ -152,7 +152,7 @@ describe("Sovereignty Profile Tools", () => {
 
     it("handles empty update", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_update");
+      const tool = findTool("sovereignty_profile_update");
       const result = await tool.handler({});
       const data = parseToolResult(result);
       expect(data).toHaveProperty("profile");
@@ -160,8 +160,8 @@ describe("Sovereignty Profile Tools", () => {
 
     it("persists changes across get calls", async () => {
       const { findTool } = await createTestContext();
-      const updateTool = findTool("sanctuary/sovereignty_profile_update");
-      const getTool = findTool("sanctuary/sovereignty_profile_get");
+      const updateTool = findTool("sovereignty_profile_update");
+      const getTool = findTool("sovereignty_profile_get");
 
       await updateTool.handler({ approval_gate: { enabled: true } });
       const result = await getTool.handler({});
@@ -176,7 +176,7 @@ describe("Sovereignty Profile Tools", () => {
   describe("sovereignty_profile_generate_prompt", () => {
     it("returns system prompt text", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_generate_prompt");
+      const tool = findTool("sovereignty_profile_generate_prompt");
       const result = await tool.handler({});
       const data = parseToolResult(result);
 
@@ -187,7 +187,7 @@ describe("Sovereignty Profile Tools", () => {
 
     it("includes token estimate", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_generate_prompt");
+      const tool = findTool("sovereignty_profile_generate_prompt");
       const result = await tool.handler({});
       const data = parseToolResult(result);
 
@@ -198,8 +198,8 @@ describe("Sovereignty Profile Tools", () => {
 
     it("reflects enabled features in prompt", async () => {
       const { findTool } = await createTestContext();
-      const updateTool = findTool("sanctuary/sovereignty_profile_update");
-      const promptTool = findTool("sanctuary/sovereignty_profile_generate_prompt");
+      const updateTool = findTool("sovereignty_profile_update");
+      const promptTool = findTool("sovereignty_profile_generate_prompt");
 
       await updateTool.handler({ zk_proofs: { enabled: true } });
       const result = await promptTool.handler({});
@@ -207,12 +207,12 @@ describe("Sovereignty Profile Tools", () => {
       const prompt = data.system_prompt as string;
 
       expect(prompt).toContain("Zero-Knowledge Proofs");
-      expect(prompt).toContain("sanctuary/zk_commit");
+      expect(prompt).toContain("zk_commit");
     });
 
     it("reflects disabled features as optional", async () => {
       const { findTool } = await createTestContext();
-      const tool = findTool("sanctuary/sovereignty_profile_generate_prompt");
+      const tool = findTool("sovereignty_profile_generate_prompt");
       const result = await tool.handler({});
       const data = parseToolResult(result);
       const prompt = data.system_prompt as string;

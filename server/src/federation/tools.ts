@@ -24,7 +24,7 @@ export function createFederationTools(
     // ─── Peer Management ──────────────────────────────────────────────
 
     {
-      name: "sanctuary/federation_peers",
+      name: "federation_peers",
       description:
         "List known federation peers, register a peer from a completed handshake, " +
         "or remove a peer. Every peer MUST enter through a verified handshake — " +
@@ -150,7 +150,7 @@ export function createFederationTools(
     // ─── Trust Evaluation ─────────────────────────────────────────────
 
     {
-      name: "sanctuary/federation_trust_evaluate",
+      name: "federation_trust_evaluate",
       description:
         "Evaluate the trust level of a federation peer. " +
         "Considers handshake status, sovereignty tier, reputation score, " +
@@ -193,7 +193,7 @@ export function createFederationTools(
     // ─── Federation Status ────────────────────────────────────────────
 
     {
-      name: "sanctuary/federation_status",
+      name: "federation_status",
       description:
         "Overview of federation state: total peers, active connections, " +
         "trust distribution, and readiness for cross-instance operations.",

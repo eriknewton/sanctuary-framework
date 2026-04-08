@@ -89,7 +89,7 @@ describe("Handshake auto-publish hook", () => {
     const { tools } = await buildResponder(true);
     const challenge = await buildChallenge();
 
-    const respondTool = tools.find((t) => t.name === "sanctuary/handshake_respond")!;
+    const respondTool = tools.find((t) => t.name === "handshake_respond")!;
     const result = await respondTool.handler({ challenge });
     const parsed = JSON.parse(result.content[0]!.text);
 
@@ -126,7 +126,7 @@ describe("Handshake auto-publish hook", () => {
     const { tools } = await buildResponder(false);
     const challenge = await buildChallenge();
 
-    const respondTool = tools.find((t) => t.name === "sanctuary/handshake_respond")!;
+    const respondTool = tools.find((t) => t.name === "handshake_respond")!;
     const result = await respondTool.handler({ challenge });
     const parsed = JSON.parse(result.content[0]!.text);
 
@@ -142,7 +142,7 @@ describe("Handshake auto-publish hook", () => {
     const { tools } = await buildResponder(true);
     const challenge = await buildChallenge();
 
-    const respondTool = tools.find((t) => t.name === "sanctuary/handshake_respond")!;
+    const respondTool = tools.find((t) => t.name === "handshake_respond")!;
     const result = await respondTool.handler({ challenge });
     const parsed = JSON.parse(result.content[0]!.text);
 

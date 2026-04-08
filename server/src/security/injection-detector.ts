@@ -211,7 +211,7 @@ export class InjectionDetector {
 
   /**
    * Scan tool arguments for injection signals.
-   * @param toolName Full tool name (e.g., "sanctuary/state_read")
+   * @param toolName Full tool name (e.g., "state_read")
    * @param args Tool arguments
    * @returns DetectionResult with all detected signals
    */

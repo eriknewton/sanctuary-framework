@@ -245,21 +245,21 @@ describe("L2 Process Hardening", () => {
     });
 
     it("includes l2_hardening_status tool", () => {
-      const statusTool = tools.find((t) => t.name === "sanctuary/l2_hardening_status");
+      const statusTool = tools.find((t) => t.name === "l2_hardening_status");
       expect(statusTool).toBeDefined();
       expect(statusTool?.description).toBeDefined();
       expect(statusTool?.inputSchema).toBeDefined();
     });
 
     it("includes l2_verify_isolation tool", () => {
-      const verifyTool = tools.find((t) => t.name === "sanctuary/l2_verify_isolation");
+      const verifyTool = tools.find((t) => t.name === "l2_verify_isolation");
       expect(verifyTool).toBeDefined();
       expect(verifyTool?.description).toBeDefined();
       expect(verifyTool?.inputSchema).toBeDefined();
     });
 
     it("l2_hardening_status reports without details by default", async () => {
-      const statusTool = tools.find((t) => t.name === "sanctuary/l2_hardening_status");
+      const statusTool = tools.find((t) => t.name === "l2_hardening_status");
       expect(statusTool).toBeDefined();
 
       const result = await statusTool!.handler({} as any);
@@ -272,7 +272,7 @@ describe("L2 Process Hardening", () => {
     });
 
     it("l2_hardening_status reports full details when requested", async () => {
-      const statusTool = tools.find((t) => t.name === "sanctuary/l2_hardening_status");
+      const statusTool = tools.find((t) => t.name === "l2_hardening_status");
       expect(statusTool).toBeDefined();
 
       const result = await statusTool!.handler({ include_details: true } as any);
@@ -286,7 +286,7 @@ describe("L2 Process Hardening", () => {
     });
 
     it("l2_verify_isolation reports isolation checks", async () => {
-      const verifyTool = tools.find((t) => t.name === "sanctuary/l2_verify_isolation");
+      const verifyTool = tools.find((t) => t.name === "l2_verify_isolation");
       expect(verifyTool).toBeDefined();
 
       const result = await verifyTool!.handler({} as any);
@@ -298,7 +298,7 @@ describe("L2 Process Hardening", () => {
     });
 
     it("l2_verify_isolation can disable specific checks", async () => {
-      const verifyTool = tools.find((t) => t.name === "sanctuary/l2_verify_isolation");
+      const verifyTool = tools.find((t) => t.name === "l2_verify_isolation");
       expect(verifyTool).toBeDefined();
 
       const result = await verifyTool!.handler({
@@ -315,7 +315,7 @@ describe("L2 Process Hardening", () => {
 
     it("hardening tools are read-only (Tier 3)", async () => {
       // Verify tools don't modify state
-      const statusTool = tools.find((t) => t.name === "sanctuary/l2_hardening_status");
+      const statusTool = tools.find((t) => t.name === "l2_hardening_status");
 
       // Call tool multiple times
       await statusTool!.handler({} as any);

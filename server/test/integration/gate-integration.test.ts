@@ -58,7 +58,7 @@ describe("Gate Integration — Prompt Injection Defense", () => {
   // ── Tier 1: High-risk operations always blocked ──────────────────────
 
   it("blocks state_export (Tier 1) even with valid args", async () => {
-    const result = await gate.evaluate("sanctuary/state_export", {
+    const result = await gate.evaluate("state_export", {
       format: "full",
     });
 
@@ -70,7 +70,7 @@ describe("Gate Integration — Prompt Injection Defense", () => {
   });
 
   it("blocks reputation_import (Tier 1)", async () => {
-    const result = await gate.evaluate("sanctuary/reputation_import", {
+    const result = await gate.evaluate("reputation_import", {
       bundle: "fake-bundle-data",
     });
 
@@ -79,7 +79,7 @@ describe("Gate Integration — Prompt Injection Defense", () => {
   });
 
   it("blocks identity_rotate (Tier 1)", async () => {
-    const result = await gate.evaluate("sanctuary/identity_rotate", {
+    const result = await gate.evaluate("identity_rotate", {
       identity_id: "id-1",
     });
 
@@ -88,7 +88,7 @@ describe("Gate Integration — Prompt Injection Defense", () => {
   });
 
   it("blocks bootstrap_provide_guarantee (Tier 1)", async () => {
-    const result = await gate.evaluate("sanctuary/bootstrap_provide_guarantee", {
+    const result = await gate.evaluate("bootstrap_provide_guarantee", {
       principal_identity_id: "id-1",
       agent_identity_id: "id-2",
       scope: "all",
@@ -103,17 +103,17 @@ describe("Gate Integration — Prompt Injection Defense", () => {
 
   it("blocks access to unfamiliar namespace (Tier 2 new_namespace_access)", async () => {
     // First establish a baseline by doing some known-namespace reads
-    await gate.evaluate("sanctuary/state_read", {
+    await gate.evaluate("state_read", {
       namespace: "known-ns",
       key: "data-1",
     });
-    await gate.evaluate("sanctuary/state_read", {
+    await gate.evaluate("state_read", {
       namespace: "known-ns",
       key: "data-2",
     });
 
     // Now the agent tries a namespace it has never accessed
-    const result = await gate.evaluate("sanctuary/state_read", {
+    const result = await gate.evaluate("state_read", {
       namespace: "secret-credentials",
       key: "api-keys",
     });
@@ -127,14 +127,14 @@ describe("Gate Integration — Prompt Injection Defense", () => {
 
   it("blocks interaction with new counterparty (Tier 2 new_counterparty)", async () => {
     // Establish a known counterparty
-    await gate.evaluate("sanctuary/reputation_record", {
+    await gate.evaluate("reputation_record", {
       interaction_id: "i-1",
       counterparty_did: "did:known:alice",
       outcome: { type: "service", result: "completed" },
     });
 
     // Now the injected prompt tries a new counterparty
-    const result = await gate.evaluate("sanctuary/reputation_record", {
+    const result = await gate.evaluate("reputation_record", {
       interaction_id: "i-2",
       counterparty_did: "did:attacker:eve",
       outcome: { type: "service", result: "completed" },
@@ -151,7 +151,7 @@ describe("Gate Integration — Prompt Injection Defense", () => {
     const results = [];
     for (let i = 0; i < 12; i++) {
       results.push(
-        await gate.evaluate("sanctuary/identity_sign", {
+        await gate.evaluate("identity_sign", {
           payload: `message-${i}`,
         })
       );
@@ -169,13 +169,13 @@ describe("Gate Integration — Prompt Injection Defense", () => {
 
   it("allows normal state_read on known namespace (Tier 3)", async () => {
     // Establish the namespace first
-    await gate.evaluate("sanctuary/state_read", {
+    await gate.evaluate("state_read", {
       namespace: "my-data",
       key: "key-1",
     });
 
     // Subsequent reads on the same namespace should be allowed
-    const result = await gate.evaluate("sanctuary/state_read", {
+    const result = await gate.evaluate("state_read", {
       namespace: "my-data",
       key: "key-2",
     });
@@ -186,7 +186,7 @@ describe("Gate Integration — Prompt Injection Defense", () => {
   });
 
   it("allows reputation_query (Tier 3, read-only)", async () => {
-    const result = await gate.evaluate("sanctuary/reputation_query", {
+    const result = await gate.evaluate("reputation_query", {
       context: "general",
     });
 
@@ -195,24 +195,24 @@ describe("Gate Integration — Prompt Injection Defense", () => {
   });
 
   it("allows monitor_health (Tier 3)", async () => {
-    const result = await gate.evaluate("sanctuary/monitor_health", {});
+    const result = await gate.evaluate("monitor_health", {});
 
     expect(result.allowed).toBe(true);
     expect(result.tier).toBe(3);
   });
 
   it("allows Phase 3A tools as Tier 3 (shr_generate, handshake_initiate)", async () => {
-    const shrResult = await gate.evaluate("sanctuary/shr_generate", {});
+    const shrResult = await gate.evaluate("shr_generate", {});
     expect(shrResult.allowed).toBe(true);
     expect(shrResult.tier).toBe(3);
 
-    const hsResult = await gate.evaluate("sanctuary/handshake_initiate", {});
+    const hsResult = await gate.evaluate("handshake_initiate", {});
     expect(hsResult.allowed).toBe(true);
     expect(hsResult.tier).toBe(3);
   });
 
   it("allows reputation_query_weighted as Tier 3", async () => {
-    const result = await gate.evaluate("sanctuary/reputation_query_weighted", {
+    const result = await gate.evaluate("reputation_query_weighted", {
       metric: "fulfillment_rate",
     });
 
@@ -224,7 +224,7 @@ describe("Gate Integration — Prompt Injection Defense", () => {
 
   it("simulates a full prompt injection attack sequence", async () => {
     // Step 1: Attacker's first goal — exfiltrate all state
-    const exportResult = await gate.evaluate("sanctuary/state_export", {
+    const exportResult = await gate.evaluate("state_export", {
       format: "full",
     });
     expect(exportResult.allowed).toBe(false);
@@ -232,21 +232,21 @@ describe("Gate Integration — Prompt Injection Defense", () => {
     expect(exportResult.reason).toBeDefined();
 
     // Step 2: Attacker pivots — tries to read a namespace they haven't accessed before
-    const credResult = await gate.evaluate("sanctuary/state_read", {
+    const credResult = await gate.evaluate("state_read", {
       namespace: "stolen-credentials",
       key: "api-tokens",
     });
     expect(credResult.allowed).toBe(false);
 
     // Step 3: Attacker tries to import fake reputation
-    const importResult = await gate.evaluate("sanctuary/reputation_import", {
+    const importResult = await gate.evaluate("reputation_import", {
       bundle: "ZmFrZS1idW5kbGU",
     });
     expect(importResult.allowed).toBe(false);
 
     // Step 4: Attacker tries normal operation to avoid detection
     // (this is allowed — the gate doesn't block legitimate operations)
-    const normalResult = await gate.evaluate("sanctuary/identity_list", {});
+    const normalResult = await gate.evaluate("identity_list", {});
     expect(normalResult.allowed).toBe(true);
 
     // Verify all blocked operations were audit-logged
@@ -280,7 +280,7 @@ describe("Gate Integration — Prompt Injection Defense", () => {
       auditLog
     );
 
-    const result = await approveGate.evaluate("sanctuary/state_export", {
+    const result = await approveGate.evaluate("state_export", {
       format: "full",
     });
 
