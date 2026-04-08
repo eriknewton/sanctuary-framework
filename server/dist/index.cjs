@@ -13740,7 +13740,6 @@ function gateToOCSFDisposition(decision) {
 function formatAsOCSF(entry) {
   const decision = parseGateDecision(entry.details);
   const tier = parseTier(entry.details);
-  parseSessionId(entry.details);
   const agentDid = parseAgentDid(entry.details);
   const timestamp = new Date(entry.timestamp).getTime();
   const statusId = gateToOCSFStatus(decision, entry.result);

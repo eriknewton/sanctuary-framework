@@ -96,6 +96,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "l2_hardening_status",
     "l2_verify_isolation",
     "sovereignty_audit",
+    "audit_export_siem",
     "shr_gateway_export",
     "bridge_commit",
     "bridge_verify",
@@ -327,6 +328,7 @@ tier3_always_allow:
   - context_gate_filter
   - context_gate_list_policies
   - sovereignty_audit
+  - audit_export_siem
   - shr_gateway_export
   - bridge_commit
   - bridge_verify

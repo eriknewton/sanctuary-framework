@@ -70,6 +70,7 @@ export class IdentityManager {
   private masterKey: Uint8Array;
   private identities = new Map<string, StoredIdentity>();
   private primaryIdentityId: string | null = null;
+  private metadataKey = "primary_identity_id";
 
   constructor(storage: StorageBackend, masterKey: Uint8Array) {
     this.storage = storage;
@@ -95,13 +96,34 @@ export class IdentityManager {
         const decrypted = decrypt(encrypted, this.encryptionKey);
         const identity: StoredIdentity = JSON.parse(bytesToString(decrypted));
         this.identities.set(identity.identity_id, identity);
-        if (!this.primaryIdentityId) {
-          this.primaryIdentityId = identity.identity_id;
-        }
       } catch {
         failed++;
       }
     }
+
+    // Load the primary identity ID from persistent storage
+    // This ensures the same identity is used as default on every restart
+    try {
+      const metaRaw = await this.storage.read("_meta", this.metadataKey);
+      if (metaRaw) {
+        const metaStr = bytesToString(metaRaw);
+        const primaryId = JSON.parse(metaStr) as string;
+        // Verify the stored primary ID still exists
+        if (this.identities.has(primaryId)) {
+          this.primaryIdentityId = primaryId;
+        } else {
+          // Stored primary ID was deleted; fall back to first loaded
+          this.primaryIdentityId = this.identities.keys().next().value || null;
+        }
+      } else {
+        // No primary ID stored yet; use first loaded identity
+        this.primaryIdentityId = this.identities.keys().next().value || null;
+      }
+    } catch {
+      // Metadata read failed; use first loaded identity
+      this.primaryIdentityId = this.identities.keys().next().value || null;
+    }
+
     return { total: entries.length, loaded: this.identities.size, failed };
   }
 
@@ -115,8 +137,32 @@ export class IdentityManager {
       stringToBytes(JSON.stringify(encrypted))
     );
     this.identities.set(identity.identity_id, identity);
+    // If this is the first identity, set it as primary
     if (!this.primaryIdentityId) {
       this.primaryIdentityId = identity.identity_id;
+      this.savePrimaryIdentityId();
+    }
+  }
+
+  /** Set which identity is the default/primary identity */
+  async setPrimary(identityId: string): Promise<boolean> {
+    if (!this.identities.has(identityId)) {
+      return false;
+    }
+    this.primaryIdentityId = identityId;
+    await this.savePrimaryIdentityId();
+    return true;
+  }
+
+  /** Persist the primary identity ID to storage */
+  private async savePrimaryIdentityId(): Promise<void> {
+    if (!this.primaryIdentityId) return;
+    try {
+      const serialized = stringToBytes(JSON.stringify(this.primaryIdentityId));
+      await this.storage.write("_meta", this.metadataKey, serialized);
+    } catch {
+      // Metadata write failed; continue without persistence
+      // The primary ID will revert to first-loaded on next startup
     }
   }
 
@@ -127,6 +173,10 @@ export class IdentityManager {
   getDefault(): StoredIdentity | undefined {
     if (!this.primaryIdentityId) return undefined;
     return this.identities.get(this.primaryIdentityId);
+  }
+
+  getPrimaryIdentityId(): string | null {
+    return this.primaryIdentityId;
   }
 
   list(): PublicIdentity[] {
@@ -380,6 +430,53 @@ export function createL1Tools(
           new_public_key: rotationEvent.new_public_key,
           new_did: updatedIdentity.did,
           rotated_at: rotationEvent.rotated_at,
+        });
+      },
+    },
+
+    {
+      name: "identity_set_primary",
+      description:
+        "Set which identity is the default/primary identity. " +
+        "This identity will be used by shr_generate, reputation_publish, and other tools " +
+        "when no explicit identity_id parameter is provided. " +
+        "The selection is persisted across server restarts.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          identity_id: {
+            type: "string",
+            description: "The identity ID to set as primary",
+          },
+        },
+        required: ["identity_id"],
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id as string;
+        const identity = identityMgr.get(identityId);
+
+        if (!identity) {
+          return toolResult({
+            error: `Identity "${identityId}" not found.`,
+          });
+        }
+
+        const success = await identityMgr.setPrimary(identityId);
+        if (!success) {
+          return toolResult({
+            error: `Failed to set primary identity to "${identityId}".`,
+          });
+        }
+
+        auditLog?.append("l1", "identity_set_primary", identityId, {
+          previous_primary: identityMgr.getPrimaryIdentityId(),
+        });
+
+        return toolResult({
+          primary_identity_id: identityId,
+          label: identity.label,
+          did: identity.did,
+          set_at: new Date().toISOString(),
         });
       },
     },

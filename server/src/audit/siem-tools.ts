@@ -4,8 +4,8 @@
  * Registers the audit_export_siem MCP tool that exports audit log entries
  * in standard SIEM formats (CEF and OCSF).
  *
- * Tier 2: May contain sensitive operation metadata and tool names.
- * Requires Principal Policy approval on Tier 1/2 gates.
+ * Tier 3: Auto-allow with audit logging (read-only operation).
+ * No approval required in non-interactive (stdio) mode.
  */
 
 import type { ToolDefinition } from "../router.js";
@@ -20,7 +20,7 @@ export function createSIEMTools(auditLog: AuditLog): { tools: ToolDefinition[] }
         "Export audit log events in SIEM-standard formats (CEF or OCSF) for ingestion into " +
         "Splunk, Datadog, QRadar, and other security information and event management (SIEM) platforms. " +
         "Encrypted audit entries are decrypted and formatted according to your chosen standard. " +
-        "Tier 2 — may contain sensitive operation metadata.",
+        "Tier 3 — auto-allow (read-only, audit logging only).",
       inputSchema: {
         type: "object",
         properties: {
