@@ -13654,6 +13654,303 @@ function createAuditTools(config) {
   return { tools };
 }
 
+// src/audit/siem-formatter.ts
+function parseGateDecision(details) {
+  if (!details || typeof details.gate_decision !== "string") {
+    return "auto-allow";
+  }
+  const decision = details.gate_decision.toLowerCase();
+  if (decision === "approve" || decision === "deny") {
+    return decision;
+  }
+  return "auto-allow";
+}
+function parseTier(details) {
+  if (!details || typeof details.tier !== "number") {
+    return 3;
+  }
+  return Math.max(1, Math.min(3, details.tier));
+}
+function parseSessionId(details) {
+  if (!details || typeof details.session_id !== "string") {
+    return "unknown";
+  }
+  return details.session_id;
+}
+function parseAgentDid(details) {
+  if (!details || typeof details.agent_did !== "string") {
+    return "unknown";
+  }
+  return details.agent_did;
+}
+function gateToCEFSeverity(decision, tier) {
+  if (decision === "deny") {
+    return 8;
+  }
+  if (decision === "approve") {
+    if (tier === 1) return 5;
+    if (tier === 2) return 3;
+  }
+  return 1;
+}
+function formatAsCEF(entry, options) {
+  const version = "0";
+  const vendor = "Sanctuary";
+  const product = "MCP-Server";
+  const productVersion = "0.7.0";
+  const decision = parseGateDecision(entry.details);
+  const tier = parseTier(entry.details);
+  const sessionId = parseSessionId(entry.details);
+  const agentDid = parseAgentDid(entry.details);
+  const severity = gateToCEFSeverity(decision, tier);
+  const signatureId = entry.operation.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const description = `Sanctuary ${entry.operation}`;
+  const extensions = [
+    `src=${agentDid}`,
+    `act=${entry.operation}`,
+    `outcome=${decision}`,
+    `tier=${tier}`,
+    `cs1=${sessionId}`,
+    `cs1Label=SessionId`,
+    `rt=${new Date(entry.timestamp).getTime()}`,
+    `layer=${entry.layer}`,
+    `result=${entry.result}`
+  ];
+  return `CEF:${version}|${vendor}|${product}|${productVersion}|${signatureId}|${description}|${severity}|${extensions.join(" ")}`;
+}
+function gateToOCSFStatus(decision, result) {
+  return decision === "deny" || result === "failure" ? 2 : 1;
+}
+function gateToCOCSFSeverity(decision, tier) {
+  if (decision === "deny") {
+    return 4;
+  }
+  if (decision === "approve") {
+    if (tier === 1) return 3;
+    if (tier === 2) return 2;
+  }
+  return 1;
+}
+function gateToOCSFDisposition(decision) {
+  return decision === "deny" ? 2 : 1;
+}
+function formatAsOCSF(entry) {
+  const decision = parseGateDecision(entry.details);
+  const tier = parseTier(entry.details);
+  parseSessionId(entry.details);
+  const agentDid = parseAgentDid(entry.details);
+  const timestamp = new Date(entry.timestamp).getTime();
+  const statusId = gateToOCSFStatus(decision, entry.result);
+  const severityId = gateToCOCSFSeverity(decision, tier);
+  const dispositionId = gateToOCSFDisposition(decision);
+  return {
+    class_uid: 3001,
+    class_name: "API Activity",
+    category_uid: 3,
+    category_name: "Application Activity",
+    severity_id: severityId,
+    time: timestamp,
+    activity_id: 1,
+    activity_name: "API Call",
+    actor: {
+      user: {
+        uid: agentDid
+      }
+    },
+    api: {
+      operation: entry.operation,
+      service: {
+        name: "sanctuary-mcp"
+      }
+    },
+    status_id: statusId,
+    disposition_id: dispositionId,
+    metadata: {
+      version: "1.3.0",
+      product: {
+        name: "Sanctuary Framework",
+        vendor_name: "Erik Newton",
+        version: "0.7.0"
+      }
+    }
+  };
+}
+
+// src/audit/siem-tools.ts
+function createSIEMTools(auditLog) {
+  const tools = [
+    {
+      name: "audit_export_siem",
+      description: "Export audit log events in SIEM-standard formats (CEF or OCSF) for ingestion into Splunk, Datadog, QRadar, and other security information and event management (SIEM) platforms. Encrypted audit entries are decrypted and formatted according to your chosen standard. Tier 2 \u2014 may contain sensitive operation metadata.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          format: {
+            type: "string",
+            enum: ["cef", "ocsf"],
+            description: 'Output format: "cef" (Common Event Format, newline-delimited) or "ocsf" (Open Cybersecurity Schema Framework, JSON array)'
+          },
+          since: {
+            type: "string",
+            description: "Optional ISO 8601 timestamp. Export only events on or after this time. Defaults to 24 hours ago."
+          },
+          until: {
+            type: "string",
+            description: "Optional ISO 8601 timestamp. Export only events before this time. Defaults to now."
+          },
+          limit: {
+            type: "number",
+            description: "Maximum number of events to export (default 100, max 1000). Set to 1000 for bulk exports to SIEMs."
+          },
+          filter_tool: {
+            type: "string",
+            description: 'Optional. Export only events from this tool name (e.g., "sovereignty_audit", "state_set"). Case-insensitive substring matching.'
+          },
+          filter_decision: {
+            type: "string",
+            enum: ["approve", "deny", "auto-allow"],
+            description: 'Optional. Export only events with this gate decision: "approve" (manual approval), "deny" (blocked), or "auto-allow" (Tier 3 auto-allowed).'
+          },
+          filter_layer: {
+            type: "string",
+            enum: ["l1", "l2", "l3", "l4"],
+            description: "Optional. Export only events from this sovereignty layer (L1=Cognitive, L2=Operational, L3=Disclosure, L4=Reputation)."
+          },
+          filter_result: {
+            type: "string",
+            enum: ["success", "failure"],
+            description: 'Optional. Export only events with this result: "success" or "failure".'
+          }
+        },
+        required: ["format"]
+      },
+      handler: async (args) => {
+        const format = String(args.format || "").toLowerCase();
+        if (format !== "cef" && format !== "ocsf") {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  error: "Invalid format. Must be 'cef' or 'ocsf'."
+                })
+              }
+            ]
+          };
+        }
+        let since;
+        if (args.since) {
+          since = String(args.since);
+          const sinceDate = new Date(since);
+          if (isNaN(sinceDate.getTime())) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    error: `Invalid 'since' timestamp: ${since}. Must be ISO 8601.`
+                  })
+                }
+              ]
+            };
+          }
+        } else {
+          const now = /* @__PURE__ */ new Date();
+          const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1e3);
+          since = oneDayAgo.toISOString();
+        }
+        let until;
+        if (args.until) {
+          until = String(args.until);
+          const untilDate = new Date(until);
+          if (isNaN(untilDate.getTime())) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    error: `Invalid 'until' timestamp: ${until}. Must be ISO 8601.`
+                  })
+                }
+              ]
+            };
+          }
+        }
+        let limit = 100;
+        if (typeof args.limit === "number") {
+          limit = Math.max(1, Math.min(1e3, args.limit));
+        }
+        const filterTool = args.filter_tool ? String(args.filter_tool).toLowerCase() : void 0;
+        const filterDecision = args.filter_decision ? String(args.filter_decision).toLowerCase() : void 0;
+        const filterLayer = args.filter_layer ? String(args.filter_layer).toLowerCase() : void 0;
+        const filterResult = args.filter_result ? String(args.filter_result).toLowerCase() : void 0;
+        const result = await auditLog.query({
+          since,
+          layer: filterLayer,
+          operation_type: void 0,
+          // Will filter after
+          limit
+        });
+        let filtered = result.entries;
+        if (filterTool) {
+          filtered = filtered.filter(
+            (e) => e.operation.toLowerCase().includes(filterTool)
+          );
+        }
+        if (filterDecision) {
+          filtered = filtered.filter((e) => {
+            const decision = String(e.details?.gate_decision || "auto-allow").toLowerCase();
+            return decision === filterDecision;
+          });
+        }
+        if (filterResult) {
+          filtered = filtered.filter((e) => e.result === filterResult);
+        }
+        if (until) {
+          const untilDate = new Date(until);
+          filtered = filtered.filter((e) => new Date(e.timestamp) < untilDate);
+        }
+        let output;
+        if (format === "cef") {
+          const cefLines = filtered.map((entry) => formatAsCEF(entry));
+          output = cefLines.join("\n");
+        } else {
+          const ocsfObjects = filtered.map((entry) => formatAsOCSF(entry));
+          output = JSON.stringify(ocsfObjects, null, 2);
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                format,
+                count: filtered.length,
+                total_available: result.total,
+                time_range: {
+                  since,
+                  until: until || (/* @__PURE__ */ new Date()).toISOString()
+                },
+                filters: {
+                  tool: filterTool,
+                  decision: filterDecision,
+                  layer: filterLayer,
+                  result: filterResult
+                },
+                note: format === "cef" ? `${filtered.length} CEF events (newline-delimited). Each line is a complete CEF event.` : `${filtered.length} OCSF objects in JSON array format.`
+              })
+            },
+            {
+              type: "text",
+              text: output
+            }
+          ]
+        };
+      }
+    }
+  ];
+  return { tools };
+}
+
 // src/l2-operational/context-gate.ts
 init_encryption();
 init_encoding();
@@ -17736,6 +18033,7 @@ async function createSanctuaryServer(options) {
     handshakeResults
   );
   const { tools: auditTools } = createAuditTools(config);
+  const { tools: siemTools } = createSIEMTools(auditLog);
   const { tools: contextGateTools, enforcer: contextGateEnforcer } = createContextGateTools(storage, masterKey, auditLog);
   const hardeningTools = createL2HardeningTools(config.storage_path, auditLog);
   const profileStore = new SovereigntyProfileStore(storage, masterKey);
@@ -17852,6 +18150,7 @@ async function createSanctuaryServer(options) {
     ...federationTools,
     ...bridgeTools,
     ...auditTools,
+    ...siemTools,
     ...contextGateTools,
     ...hardeningTools,
     ...profileTools,

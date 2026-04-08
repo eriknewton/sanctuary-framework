@@ -28,6 +28,7 @@ import { createHandshakeTools } from "./handshake/tools.js";
 import { createFederationTools } from "./federation/tools.js";
 import { createBridgeTools } from "./bridge/tools.js";
 import { createAuditTools } from "./audit/tools.js";
+import { createSIEMTools } from "./audit/siem-tools.js";
 import { createContextGateTools } from "./l2-operational/context-gate-tools.js";
 import { createL2HardeningTools } from "./l2-operational/hardening-tools.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
@@ -515,6 +516,9 @@ export async function createSanctuaryServer(options?: {
   // 14d. Create Sovereignty Audit tools (read-only diagnostic)
   const { tools: auditTools } = createAuditTools(config);
 
+  // 14d2. Create SIEM Export tools (Tier 2 — CEF and OCSF export)
+  const { tools: siemTools } = createSIEMTools(auditLog);
+
   // 14e. Create Context Gating tools (L2 outbound context control)
   const { tools: contextGateTools, enforcer: contextGateEnforcer } =
     createContextGateTools(storage, masterKey, auditLog);
@@ -661,6 +665,7 @@ export async function createSanctuaryServer(options?: {
     ...federationTools,
     ...bridgeTools,
     ...auditTools,
+    ...siemTools,
     ...contextGateTools,
     ...hardeningTools,
     ...profileTools,
