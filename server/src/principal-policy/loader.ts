@@ -107,6 +107,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "governor_status",
     "reputation_publish", // Auto-allow: publishing sovereignty data to Verascore is routine
     "sanctuary_policy_status", // Read-only policy summary
+    "identity_set_primary", // One-time set, persists via _meta storage — safe at Tier 3
   ],
   approval_channel: DEFAULT_CHANNEL,
 };
