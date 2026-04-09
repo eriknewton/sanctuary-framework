@@ -17,11 +17,11 @@
  * 5. Prints status and dashboard URL
  */
 
-import { writeFile, mkdir, access } from "node:fs/promises";
+import { writeFile, readFile, mkdir, access } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
-  detectAgentConfig,
+  detectAgentConfigWithDiagnostics,
   backupConfig,
   saveCocoonMeta,
   findLatestBackup,
@@ -29,6 +29,7 @@ import {
   rewriteConfigForCocoon,
   type AgentPlatform,
   type MCPServerEntry,
+  type DetectionResult,
 } from "./config-reader.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 
@@ -76,24 +77,58 @@ export async function runCocoon(options: CocoonOptions): Promise<void> {
   else if (options.claudeCode) platform = "claude-code";
   else if (options.cursor) platform = "cursor";
 
-  // Detect agent config
-  const agentConfig = await detectAgentConfig(platform, options.wrap);
+  // Detect agent config — with diagnostics for better error messages
+  const detection = await detectAgentConfigWithDiagnostics(platform, options.wrap);
+  const agentConfig = detection.config;
 
   if (!agentConfig) {
+    console.error(`\n  Sanctuary Cocoon — Configuration Not Found\n`);
+
     if (platform) {
-      console.error(`Could not find ${platform} configuration. Check that the agent is installed.`);
+      console.error(`  Could not find ${platform} configuration.`);
     } else if (options.wrap) {
-      console.error(`Could not read config file: ${options.wrap}`);
+      console.error(`  Could not read config file: ${options.wrap}`);
     } else {
-      console.error("Could not auto-detect any agent configuration.");
-      console.error("Use --openclaw, --claude-code, --cursor, or --wrap /path/to/config.json");
+      console.error("  Could not auto-detect any agent configuration.");
+      console.error("  Use --openclaw, --claude-code, --cursor, or --wrap /path/to/config.json");
     }
+
+    // Show paths that were checked
+    if (detection.pathsChecked.length > 0) {
+      console.error(`\n  Paths checked:`);
+      for (const p of detection.pathsChecked) {
+        console.error(`    ${p}`);
+      }
+    }
+
+    // Show specific errors (JSON parse failures, permission issues)
+    if (detection.errors.length > 0) {
+      console.error(`\n  Errors encountered:`);
+      for (const e of detection.errors) {
+        console.error(`    ${e.path}: ${e.error}`);
+      }
+    }
+
+    console.error("");
     process.exit(1);
   }
 
   if (agentConfig.servers.length === 0) {
-    console.error(`Found ${agentConfig.platform} config at ${agentConfig.configPath}, but no MCP servers configured.`);
+    console.error(`\n  Found ${agentConfig.platform} config at ${agentConfig.configPath},`);
+    console.error(`  but no MCP servers are configured in it.`);
+    console.error(`\n  Expected format: { "mcp": { "servers": { ... } } } (OpenClaw)`);
+    console.error(`                or { "mcpServers": { ... } } (Claude Code, Cursor)\n`);
     process.exit(1);
+  }
+
+  // ── Double-wrap detection ──────────────────────────────────────
+  const hasSanctuary = agentConfig.servers.some(
+    s => s.name.toLowerCase() === "sanctuary"
+  );
+  if (hasSanctuary) {
+    console.error(`\n  Warning: This agent already has a Sanctuary server configured.`);
+    console.error(`  Re-wrapping will update the existing Sanctuary entry.`);
+    console.error(`  Use --unwrap first if you want a clean wrap.\n`);
   }
 
   console.error(`\n  Sanctuary Cocoon\n`);
@@ -153,7 +188,13 @@ export async function runCocoon(options: CocoonOptions): Promise<void> {
     ]
   );
 
-  console.error(`  Agent config rewritten to route through Sanctuary`);
+  // ── Post-wrap verification ─────────────────────────────────────
+  const verifyOk = await verifyRewrittenConfig(agentConfig.configPath, backupPath);
+  if (!verifyOk) {
+    process.exit(1);
+  }
+
+  console.error(`  Agent config rewritten and verified.`);
 
   // Start the dashboard as a standalone process that reads from the same ~/.sanctuary/ storage.
   // This avoids the stdio + HTTP conflict that occurs when --dashboard is passed as a subprocess arg.
@@ -162,7 +203,71 @@ export async function runCocoon(options: CocoonOptions): Promise<void> {
   console.error(`  All tool calls are being logged and scanned.`);
   console.error(`\n  To view the dashboard, run in a separate terminal:`);
   console.error(`    npx @sanctuary-framework/mcp-server dashboard --port ${dashboardPort}`);
-  console.error(`\n  To restore: npx @sanctuary-framework/cocoon --unwrap\n`);
+  console.error(`\n  To restore: npx @sanctuary-framework/mcp-server cocoon --unwrap\n`);
+}
+
+// ── Post-Wrap Verification ──────────────────────────────────────────
+
+/**
+ * Verify the rewritten config is valid JSON, contains a sanctuary entry,
+ * and preserves original servers. On failure, auto-restores from backup.
+ */
+async function verifyRewrittenConfig(
+  configPath: string,
+  backupPath: string
+): Promise<boolean> {
+  try {
+    const raw = await readFile(configPath, "utf-8");
+
+    // Verify valid JSON
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      console.error(`\n  Verification FAILED: Rewritten config is not valid JSON.`);
+      console.error(`  Error: ${(err as Error).message}`);
+      await restoreFromBackup(configPath, backupPath);
+      return false;
+    }
+
+    // Verify sanctuary entry exists
+    const servers =
+      (parsed.mcp as Record<string, unknown>)?.servers as Record<string, unknown> ??
+      (parsed.mcpServers as Record<string, unknown>) ??
+      {};
+
+    if (!servers.sanctuary) {
+      console.error(`\n  Verification FAILED: No sanctuary entry in rewritten config.`);
+      await restoreFromBackup(configPath, backupPath);
+      return false;
+    }
+
+    // Verify sanctuary entry has a command
+    const sanctuaryEntry = servers.sanctuary as Record<string, unknown>;
+    if (!sanctuaryEntry.command || typeof sanctuaryEntry.command !== "string") {
+      console.error(`\n  Verification FAILED: Sanctuary entry has no command.`);
+      await restoreFromBackup(configPath, backupPath);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.error(`\n  Verification FAILED: ${(err as Error).message}`);
+    await restoreFromBackup(configPath, backupPath);
+    return false;
+  }
+}
+
+async function restoreFromBackup(configPath: string, backupPath: string): Promise<void> {
+  try {
+    await restoreConfig(backupPath, configPath);
+    console.error(`  Original config restored from backup.`);
+    console.error(`  Backup preserved at: ${backupPath}\n`);
+  } catch (restoreErr) {
+    console.error(`  CRITICAL: Could not restore backup from ${backupPath}`);
+    console.error(`  Error: ${(restoreErr as Error).message}`);
+    console.error(`  Manual recovery: copy ${backupPath} to ${configPath}\n`);
+  }
 }
 
 // ── Unwrap ──────────────────────────────────────────────────────────
@@ -278,11 +383,11 @@ function printCocoonHelp(): void {
   Sanctuary Cocoon — Wrap any agent in sovereignty protection
 
   Usage:
-    npx @sanctuary-framework/cocoon --openclaw        # Wrap OpenClaw agent
-    npx @sanctuary-framework/cocoon --claude-code      # Wrap Claude Code
-    npx @sanctuary-framework/cocoon --cursor           # Wrap Cursor
-    npx @sanctuary-framework/cocoon --wrap config.json # Wrap generic MCP config
-    npx @sanctuary-framework/cocoon --unwrap           # Restore original config
+    npx @sanctuary-framework/mcp-server cocoon --openclaw        # Wrap OpenClaw
+    npx @sanctuary-framework/mcp-server cocoon --claude-code      # Wrap Claude Code
+    npx @sanctuary-framework/mcp-server cocoon --cursor           # Wrap Cursor
+    npx @sanctuary-framework/mcp-server cocoon --wrap config.json # Wrap generic MCP config
+    npx @sanctuary-framework/mcp-server cocoon --unwrap           # Restore original config
 
   Options:
     --openclaw        Auto-detect and wrap OpenClaw agent
@@ -290,17 +395,27 @@ function printCocoonHelp(): void {
     --cursor          Auto-detect and wrap Cursor
     --wrap <path>     Wrap a specific MCP config file
     --unwrap          Restore original config from backup
-    --passphrase <p>  Encryption passphrase
+    --passphrase <p>  Encryption passphrase (prefer env var — see below)
     --port <port>     Dashboard port (default: 3501)
     --dry-run         Show what would happen without making changes
     --help, -h        Show this help
+
+  Passphrase:
+    Set the SANCTUARY_PASSPHRASE environment variable (recommended):
+
+      export SANCTUARY_PASSPHRASE=$(openssl rand -base64 32)
+      npx @sanctuary-framework/mcp-server cocoon --openclaw
+
+    The --passphrase flag also works but is visible in shell history and
+    process listings. Use the environment variable for production setups.
 
   What happens:
     1. Reads your agent's MCP server configuration
     2. Backs up the original config to ~/.sanctuary/backup/
     3. Rewrites the config so your agent routes through Sanctuary
-    4. All tool calls are logged, scanned for injection, and rate-limited
-    5. Dangerous operations require your approval via the dashboard
+    4. Verifies the rewritten config is valid before finishing
+    5. All tool calls are logged, scanned for injection, and rate-limited
+    6. Dangerous operations require your approval via the dashboard
 
   Rollback:
     --unwrap restores the original config from backup.

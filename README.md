@@ -125,6 +125,39 @@ Store this passphrase securely — it derives the encryption keys for all persis
 
 ---
 
+## Cocoon: Wrap Any Agent
+
+Already running an agent on OpenClaw, Claude Code, or Cursor? Cocoon wraps it in Sanctuary's enforcement chain with one command — no code changes required.
+
+```bash
+# Set a passphrase (once)
+export SANCTUARY_PASSPHRASE=$(openssl rand -base64 32)
+
+# Wrap your OpenClaw agent
+npx @sanctuary-framework/mcp-server cocoon --openclaw
+```
+
+What this does:
+
+1. Backs up your existing MCP config to `~/.sanctuary/backup/`
+2. Rewrites the config to route all tool calls through Sanctuary
+3. Every call is now logged, scanned for injection, and rate-limited
+4. Dangerous operations require your approval via the dashboard
+
+To see the dashboard:
+```bash
+npx @sanctuary-framework/mcp-server dashboard --port 3501
+```
+
+To restore your original config:
+```bash
+npx @sanctuary-framework/mcp-server cocoon --unwrap
+```
+
+Cocoon supports `--openclaw`, `--claude-code`, `--cursor`, and `--wrap <path>` for generic MCP configs. Use `--dry-run` to preview changes without modifying anything.
+
+---
+
 ## Pairs With Concordia Protocol
 
 When your agent needs to negotiate or make deals, **Concordia Protocol** adds structured negotiation with binding commitments and portable reputation. Together they form the complete sovereign transaction stack:

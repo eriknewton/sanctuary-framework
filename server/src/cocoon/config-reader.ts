@@ -114,36 +114,67 @@ export async function saveCocoonMeta(meta: {
 // ── Config Detection ────────────────────────────────────────────────
 
 /**
+ * Result from config detection — includes diagnostic info for error messages.
+ */
+export interface DetectionResult {
+  config: AgentConfig | null;
+  pathsChecked: string[];
+  errors: Array<{ path: string; error: string }>;
+}
+
+/**
  * Detect the agent platform and read its MCP server config.
+ * Returns diagnostics alongside the result for better error messages.
  */
 export async function detectAgentConfig(
   platform?: AgentPlatform,
   configPath?: string
 ): Promise<AgentConfig | null> {
+  const result = await detectAgentConfigWithDiagnostics(platform, configPath);
+  return result.config;
+}
+
+/**
+ * Detect with full diagnostics — used by CLI for informative errors.
+ */
+export async function detectAgentConfigWithDiagnostics(
+  platform?: AgentPlatform,
+  configPath?: string
+): Promise<DetectionResult> {
+  const pathsChecked: string[] = [];
+  const errors: Array<{ path: string; error: string }> = [];
+
   // If explicit path given, try to read it
   if (configPath) {
-    return readConfigFile(configPath, platform ?? "generic");
+    pathsChecked.push(configPath);
+    const { config, error } = await readConfigFileWithError(configPath, platform ?? "generic");
+    if (error) errors.push({ path: configPath, error });
+    return { config, pathsChecked, errors };
   }
 
   // If platform specified, check its known paths
   if (platform) {
     const paths = PLATFORM_PATHS[platform];
     for (const path of paths) {
-      const config = await readConfigFile(path, platform);
-      if (config) return config;
+      pathsChecked.push(path);
+      const { config, error } = await readConfigFileWithError(path, platform);
+      if (error) errors.push({ path, error });
+      if (config) return { config, pathsChecked, errors };
     }
-    return null;
+    return { config: null, pathsChecked, errors };
   }
 
   // Auto-detect: try each platform in order
   for (const [plat, paths] of Object.entries(PLATFORM_PATHS)) {
     for (const path of paths) {
-      const config = await readConfigFile(path, plat as AgentPlatform);
-      if (config) return config;
+      pathsChecked.push(path);
+      const { config, error } = await readConfigFileWithError(path, plat as AgentPlatform);
+      if (error) errors.push({ path, error });
+      if (config) return { config, pathsChecked, errors };
     }
   }
 
-  return null;
+  return { config: null, pathsChecked, errors };
 }
 
 // ── Config Parsing ──────────────────────────────────────────────────
@@ -152,20 +183,36 @@ async function readConfigFile(
   path: string,
   platform: AgentPlatform
 ): Promise<AgentConfig | null> {
+  const { config } = await readConfigFileWithError(path, platform);
+  return config;
+}
+
+async function readConfigFileWithError(
+  path: string,
+  platform: AgentPlatform
+): Promise<{ config: AgentConfig | null; error?: string }> {
   try {
     await access(path);
   } catch {
-    return null;
+    return { config: null }; // File doesn't exist — not an error, just not found
   }
 
+  let raw: string;
   try {
-    const raw = await readFile(path, "utf-8");
-    const config = JSON.parse(raw);
-    const servers = extractServers(config, platform);
-    return { platform, configPath: path, servers, rawConfig: config };
-  } catch {
-    return null;
+    raw = await readFile(path, "utf-8");
+  } catch (err) {
+    return { config: null, error: `Cannot read file: ${(err as Error).message}` };
   }
+
+  let config: unknown;
+  try {
+    config = JSON.parse(raw);
+  } catch (err) {
+    return { config: null, error: `Invalid JSON: ${(err as Error).message}` };
+  }
+
+  const servers = extractServers(config, platform);
+  return { config: { platform, configPath: path, servers, rawConfig: config } };
 }
 
 /**
