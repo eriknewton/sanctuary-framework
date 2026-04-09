@@ -39,6 +39,7 @@ import { ProxyRouter } from "./proxy/proxy-router.js";
 import { CallGovernor } from "./l2-operational/call-governor.js";
 import { createGovernorTools } from "./l2-operational/governor-tools.js";
 import { createSanctuaryTools } from "./sanctuary-tools.js";
+import { createMemoryAttestTools } from "./l1-cognitive/memory-attest.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
@@ -623,7 +624,14 @@ export async function createSanctuaryServer(options?: {
     keyProtection,
   });
 
-  // 16b. Dashboard open tool — generates a pre-authenticated URL
+  // 16b. Create memory attestation tools (L1 cognitive sovereignty)
+  const { tools: memoryAttestTools } = createMemoryAttestTools(
+    identityManager,
+    masterKey,
+    auditLog
+  );
+
+  // 16c. Dashboard open tool — generates a pre-authenticated URL
   const dashboardTools: ToolDefinition[] = [];
   if (dashboard) {
     dashboardTools.push({
@@ -671,6 +679,7 @@ export async function createSanctuaryServer(options?: {
     ...profileTools,
     ...dashboardTools,
     ...sanctuaryMetaTools,
+    ...memoryAttestTools,
     manifestTool,
   ];
 
