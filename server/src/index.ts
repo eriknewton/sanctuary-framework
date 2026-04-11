@@ -40,6 +40,7 @@ import { CallGovernor } from "./l2-operational/call-governor.js";
 import { createGovernorTools } from "./l2-operational/governor-tools.js";
 import { createSanctuaryTools } from "./sanctuary-tools.js";
 import { createMemoryAttestTools } from "./l1-cognitive/memory-attest.js";
+import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
@@ -631,6 +632,17 @@ export async function createSanctuaryServer(options?: {
     auditLog
   );
 
+  // 16b2. Create EU AI Act compliance bundle tools (Tier 3 auto-allow —
+  // read-only; emits Annex IV/Art. 12/13/14/15/26 artifacts signed by
+  // the primary identity)
+  const { tools: complianceTools } = createComplianceTools({
+    config,
+    identityManager,
+    masterKey,
+    auditLog,
+    policy,
+  });
+
   // 16c. Dashboard open tool — generates a pre-authenticated URL
   const dashboardTools: ToolDefinition[] = [];
   if (dashboard) {
@@ -680,6 +692,7 @@ export async function createSanctuaryServer(options?: {
     ...dashboardTools,
     ...sanctuaryMetaTools,
     ...memoryAttestTools,
+    ...complianceTools,
     manifestTool,
   ];
 
