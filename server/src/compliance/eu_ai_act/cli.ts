@@ -49,6 +49,7 @@ interface ComplianceCliOptions {
   periodEnd?: string;
   deploymentContext: DeploymentContext;
   passphrase?: string;
+  deltaFrom?: string;
 }
 
 function parseArgs(args: string[]): ComplianceCliOptions {
@@ -123,6 +124,10 @@ function parseArgs(args: string[]): ComplianceCliOptions {
         opts.passphrase = next;
         i++;
         break;
+      case "--delta-from":
+        opts.deltaFrom = next;
+        i++;
+        break;
       default:
         throw new Error(`Unknown flag: "${flag}"`);
     }
@@ -151,6 +156,8 @@ FLAGS
   --intended-purpose <s>   One-sentence description of the agent
   --vertical <name>        Vertical industry (finance, healthcare, hr, ...)
   --passphrase <pass>      Master key passphrase (or SANCTUARY_PASSPHRASE env)
+  --delta-from <path>      Prior bundle directory to diff against; adds
+                           08_delta.md to the output
   --help                   Print this help text
 
 OUTPUT
@@ -237,6 +244,7 @@ export async function runCompliance(args: string[]): Promise<void> {
     deployment_context: opts.deploymentContext,
     period_start: periodStart,
     period_end: periodEnd,
+    delta_from_bundle_path: opts.deltaFrom,
   };
 
   const bundle = await generateEuAiActBundle(input, {

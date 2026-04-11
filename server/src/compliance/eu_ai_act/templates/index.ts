@@ -34,3 +34,4 @@ export { RISK_MANAGEMENT_SUMMARY_TEMPLATE } from "./04_risk_management_summary.j
 export { HUMAN_OVERSIGHT_STATEMENT_TEMPLATE } from "./05_human_oversight_statement.js";
 export { CRYPTOGRAPHIC_ATTESTATIONS_TEMPLATE } from "./06_cryptographic_attestations.js";
 export { ANNEX_III_CLASSIFICATION_TEMPLATE } from "./07_annex_iii_classification.js";
+export { DELTA_TEMPLATE } from "./08_delta.js";

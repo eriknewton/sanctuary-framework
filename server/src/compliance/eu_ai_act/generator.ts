@@ -14,6 +14,8 @@
  * Regulation (EU) 2024/1689.
  */
 
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { sign } from "../../core/identity.js";
 import { derivePurposeKey } from "../../core/key-derivation.js";
 import { hash } from "../../core/hashing.js";
@@ -58,6 +60,7 @@ import {
   HUMAN_OVERSIGHT_STATEMENT_TEMPLATE,
   CRYPTOGRAPHIC_ATTESTATIONS_TEMPLATE,
   ANNEX_III_CLASSIFICATION_TEMPLATE,
+  DELTA_TEMPLATE,
   type TemplateContext,
 } from "./templates/index.js";
 
@@ -74,6 +77,8 @@ import type {
   BundleManifest,
   AuditPeriodSummary,
   ManifestRowSummary,
+  DeltaReport,
+  DeltaRowChange,
 } from "./types.js";
 
 // ── Generator dependencies ───────────────────────────────────────────
@@ -660,6 +665,246 @@ function buildManifest(
   };
 }
 
+// ── Delta computation ────────────────────────────────────────────────
+
+/**
+ * Attempt to load a prior bundle manifest from disk. Returns null
+ * and pushes a warning into the output array if the path is
+ * unreadable or the file is not a valid bundle manifest. Never
+ * throws — delta problems must never fail bundle generation.
+ */
+async function loadPriorBundleManifest(
+  bundlePath: string,
+  warnings: string[]
+): Promise<BundleManifest | null> {
+  try {
+    const manifestPath = join(bundlePath, "00_bundle_manifest.json");
+    const bytes = await readFile(manifestPath, "utf-8");
+    const parsed = JSON.parse(bytes) as BundleManifest;
+    if (
+      typeof parsed.bundle_version !== "string" ||
+      typeof parsed.regulation_version !== "string" ||
+      !Array.isArray(parsed.coverage_rows)
+    ) {
+      warnings.push(
+        `Prior bundle at ${bundlePath} is missing required manifest fields; delta skipped.`
+      );
+      return null;
+    }
+    return parsed;
+  } catch (e) {
+    warnings.push(
+      `Prior bundle at ${bundlePath} could not be read: ${(e as Error).message}. Delta skipped.`
+    );
+    return null;
+  }
+}
+
+/**
+ * Compute the structured delta between a prior and current
+ * manifest. Per Erik's Phase 2 spec, this focuses on four change
+ * categories: regulation_version bump, coverage flag changes,
+ * evidence_emitter array changes, and last_reviewed_date advances.
+ *
+ * The current manifest does not carry last_reviewed_date in
+ * ManifestRowSummary (it's only in the source matrix), so
+ * last_reviewed_date comparison uses the live matrix as the
+ * authoritative current state and compares to the prior manifest's
+ * coverage_rows entries if they carry the field. If the prior
+ * manifest does not expose last_reviewed_date per row, that field
+ * is omitted from the delta (no false positives).
+ */
+function computeDelta(
+  prior: BundleManifest,
+  current: BundleManifest,
+  priorBundlePath: string,
+  warnings: string[]
+): DeltaReport {
+  const priorRows = new Map(prior.coverage_rows.map((r) => [r.id, r]));
+  const currentRows = new Map(current.coverage_rows.map((r) => [r.id, r]));
+
+  const rows_added: string[] = [];
+  const rows_removed: string[] = [];
+  const rows_changed: DeltaRowChange[] = [];
+
+  for (const [id] of currentRows) {
+    if (!priorRows.has(id)) {
+      rows_added.push(id);
+    }
+  }
+  for (const [id] of priorRows) {
+    if (!currentRows.has(id)) {
+      rows_removed.push(id);
+    }
+  }
+
+  for (const [id, currentRow] of currentRows) {
+    const priorRow = priorRows.get(id);
+    if (!priorRow) continue;
+    const changes: DeltaRowChange["changes"] = {};
+    if (priorRow.coverage !== currentRow.coverage) {
+      changes.coverage = {
+        from: priorRow.coverage,
+        to: currentRow.coverage,
+      };
+    }
+    const priorEmitters = [...(priorRow.evidence_emitter || [])].sort();
+    const currentEmitters = [...(currentRow.evidence_emitter || [])].sort();
+    if (JSON.stringify(priorEmitters) !== JSON.stringify(currentEmitters)) {
+      changes.evidence_emitter = {
+        from: priorRow.evidence_emitter || [],
+        to: currentRow.evidence_emitter || [],
+      };
+    }
+    if (Object.keys(changes).length > 0) {
+      rows_changed.push({
+        row_id: id,
+        clause_id: currentRow.clause_id,
+        changes,
+      });
+    }
+  }
+
+  rows_added.sort();
+  rows_removed.sort();
+  rows_changed.sort((a, b) => a.row_id.localeCompare(b.row_id));
+
+  return {
+    prior_bundle_path: priorBundlePath,
+    prior_generated_at: prior.generated_at,
+    prior_signer_did: prior.signer.did,
+    prior_regulation_version: prior.regulation_version,
+    prior_matrix_version: prior.matrix_version,
+    current_generated_at: current.generated_at,
+    current_signer_did: current.signer.did,
+    current_regulation_version: current.regulation_version,
+    current_matrix_version: current.matrix_version,
+    regulation_version_changed:
+      prior.regulation_version !== current.regulation_version,
+    matrix_version_changed:
+      prior.matrix_version !== current.matrix_version,
+    rows_added,
+    rows_removed,
+    rows_changed,
+    warnings,
+  };
+}
+
+/**
+ * Format a DeltaReport's three row-change sections as Markdown
+ * blocks for embedding in the delta template.
+ */
+function formatDeltaSections(report: DeltaReport): {
+  rows_added_rendered: string;
+  rows_removed_rendered: string;
+  rows_changed_rendered: string;
+  warnings_rendered: string;
+  no_changes_note: string;
+} {
+  const added =
+    report.rows_added.length === 0
+      ? "_(none)_"
+      : report.rows_added.map((id) => `- \`${id}\``).join("\n");
+
+  const removed =
+    report.rows_removed.length === 0
+      ? "_(none)_"
+      : report.rows_removed.map((id) => `- \`${id}\``).join("\n");
+
+  const changed =
+    report.rows_changed.length === 0
+      ? "_(none)_"
+      : report.rows_changed
+          .map((rc) => {
+            const lines = [
+              `#### \`${rc.row_id}\` (${rc.clause_id})`,
+              "",
+            ];
+            if (rc.changes.coverage) {
+              lines.push(
+                `- **coverage:** \`${rc.changes.coverage.from}\` → \`${rc.changes.coverage.to}\``
+              );
+            }
+            if (rc.changes.evidence_emitter) {
+              lines.push(
+                `- **evidence_emitter from:** [${rc.changes.evidence_emitter.from.map((e) => `\`${e}\``).join(", ")}]`
+              );
+              lines.push(
+                `- **evidence_emitter to:** [${rc.changes.evidence_emitter.to.map((e) => `\`${e}\``).join(", ")}]`
+              );
+            }
+            if (rc.changes.last_reviewed_date) {
+              lines.push(
+                `- **last_reviewed_date:** ${rc.changes.last_reviewed_date.from} → ${rc.changes.last_reviewed_date.to}`
+              );
+            }
+            lines.push("");
+            return lines.join("\n");
+          })
+          .join("\n");
+
+  const warningsList =
+    report.warnings.length === 0
+      ? "_(none)_"
+      : report.warnings.map((w) => `- ${w}`).join("\n");
+
+  const hasAnyChanges =
+    report.regulation_version_changed ||
+    report.matrix_version_changed ||
+    report.rows_added.length > 0 ||
+    report.rows_removed.length > 0 ||
+    report.rows_changed.length > 0;
+
+  const noChangesNote = hasAnyChanges
+    ? ""
+    : "**No changes detected between prior and current bundle.** Both bundles reference the same regulation_version, the same matrix_version, and the same row set with identical coverage flags and evidence_emitter arrays. The only differences are the generation timestamps and the audit period activity captured in documents 02-05.\n\n";
+
+  return {
+    rows_added_rendered: added,
+    rows_removed_rendered: removed,
+    rows_changed_rendered: changed,
+    warnings_rendered: warningsList,
+    no_changes_note: noChangesNote,
+  };
+}
+
+function renderDelta(
+  baseContext: TemplateContext,
+  report: DeltaReport,
+  ds: DocSigner
+): BundleFile {
+  const sections = formatDeltaSections(report);
+  const context: TemplateContext = {
+    ...baseContext,
+    prior_bundle_path: report.prior_bundle_path,
+    prior_generated_at: report.prior_generated_at,
+    prior_signer_did: report.prior_signer_did,
+    prior_regulation_version: report.prior_regulation_version,
+    prior_matrix_version: report.prior_matrix_version,
+    current_generated_at: report.current_generated_at,
+    current_signer_did: report.current_signer_did,
+    current_regulation_version: report.current_regulation_version,
+    current_matrix_version: report.current_matrix_version,
+    regulation_version_changed: report.regulation_version_changed
+      ? "yes"
+      : "no",
+    matrix_version_changed: report.matrix_version_changed ? "yes" : "no",
+    rows_added_count: report.rows_added.length,
+    rows_removed_count: report.rows_removed.length,
+    rows_changed_count: report.rows_changed.length,
+    ...sections,
+    document_title: "Compliance Bundle Delta Report",
+    document_subtitle:
+      "Changes between the prior bundle and this bundle",
+  };
+  return finaliseDocument(
+    DELTA_TEMPLATE,
+    context,
+    "08_delta.md",
+    ds
+  );
+}
+
 // ── Top-level generator entry point ──────────────────────────────────
 
 /**
@@ -756,7 +1001,39 @@ export async function generateEuAiActBundle(
     ds
   );
 
-  const allFiles = [doc1, doc2, doc3, doc4, doc5, doc6, doc7];
+  let allFiles: BundleFile[] = [doc1, doc2, doc3, doc4, doc5, doc6, doc7];
+
+  // Optional doc 08 — delta report (only when delta_from_bundle_path
+  // is supplied AND the prior bundle loads cleanly). Delta problems
+  // never fail bundle generation: the bundle always lands locally,
+  // and delta is a best-effort enrichment layer.
+  if (input.delta_from_bundle_path) {
+    const deltaWarnings: string[] = [];
+    const priorManifest = await loadPriorBundleManifest(
+      input.delta_from_bundle_path,
+      deltaWarnings
+    );
+    if (priorManifest !== null) {
+      // Build a temporary "current" manifest snapshot for comparison.
+      // We need the coverage_rows and version fields; other fields
+      // are not compared by computeDelta.
+      const currentManifestSnapshot = buildManifest(
+        input,
+        generatedAt,
+        signer,
+        allFiles,
+        ds
+      );
+      const report = computeDelta(
+        priorManifest,
+        currentManifestSnapshot,
+        input.delta_from_bundle_path,
+        deltaWarnings
+      );
+      const doc8 = renderDelta(baseContext, report, ds);
+      allFiles = [...allFiles, doc8];
+    }
+  }
 
   // Final manifest covers all 6 files.
   const finalManifest = buildManifest(
@@ -866,6 +1143,17 @@ export function createComplianceTools(deps: GeneratorDeps): {
             description:
               "ISO 8601 timestamp — end of the reporting period.",
           },
+          delta_from_bundle_path: {
+            type: "string",
+            description:
+              "Optional filesystem path to a prior bundle directory. " +
+              "When supplied, the generator compares the current " +
+              "bundle to the prior one and emits an additional " +
+              "08_delta.md document summarising what changed " +
+              "(regulation_version, matrix_version, coverage rows " +
+              "added/removed/changed). Delta problems never fail " +
+              "bundle generation; the bundle always lands locally.",
+          },
         },
         required: [
           "agent_did",
@@ -882,6 +1170,10 @@ export function createComplianceTools(deps: GeneratorDeps): {
             {},
           period_start: String(args.period_start),
           period_end: String(args.period_end),
+          delta_from_bundle_path:
+            typeof args.delta_from_bundle_path === "string"
+              ? args.delta_from_bundle_path
+              : undefined,
         };
 
         const bundle = await generateEuAiActBundle(input, deps);

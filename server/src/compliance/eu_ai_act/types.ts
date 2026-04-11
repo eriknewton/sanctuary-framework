@@ -81,6 +81,61 @@ export interface ComplianceBundleInput {
    * set this.
    */
   generated_at_override?: string;
+  /**
+   * Optional filesystem path to a prior bundle directory. When
+   * supplied, the generator loads `{path}/00_bundle_manifest.json`,
+   * compares it to the current bundle, and emits an additional
+   * `08_delta.md` document summarising what changed. If the path is
+   * unreadable or not a valid bundle, delta generation is skipped
+   * with a warning in review_notes; bundle generation itself never
+   * fails because of a delta problem.
+   */
+  delta_from_bundle_path?: string;
+}
+
+// ── Delta report (Phase 2) ───────────────────────────────────────────
+
+/**
+ * One row whose coverage matrix entry changed between the prior
+ * and current bundle.
+ */
+export interface DeltaRowChange {
+  row_id: string;
+  clause_id: string;
+  changes: {
+    coverage?: { from: string; to: string };
+    evidence_emitter?: { from: string[]; to: string[] };
+    last_reviewed_date?: { from: string; to: string };
+  };
+}
+
+/**
+ * Structured delta between two bundles. Used by the delta template
+ * to render `08_delta.md`.
+ */
+export interface DeltaReport {
+  /** Path the prior bundle was loaded from. */
+  prior_bundle_path: string;
+  prior_generated_at: string;
+  prior_signer_did: string;
+  prior_regulation_version: string;
+  prior_matrix_version: string;
+  current_generated_at: string;
+  current_signer_did: string;
+  current_regulation_version: string;
+  current_matrix_version: string;
+  /** True iff prior.regulation_version !== current.regulation_version. */
+  regulation_version_changed: boolean;
+  /** True iff prior.matrix_version !== current.matrix_version. */
+  matrix_version_changed: boolean;
+  /** Rows present in current but not in prior. */
+  rows_added: string[];
+  /** Rows present in prior but not in current. */
+  rows_removed: string[];
+  /** Rows whose coverage, emitter list, or last_reviewed_date changed. */
+  rows_changed: DeltaRowChange[];
+  /** Non-fatal warnings encountered during delta generation. */
+  warnings: string[];
 }
 
 // ── Bundle output ────────────────────────────────────────────────────
