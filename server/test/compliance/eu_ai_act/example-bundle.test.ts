@@ -19,18 +19,25 @@
  * references any real entity.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
+import { ed25519 } from "@noble/curves/ed25519";
+import { gcm } from "@noble/ciphers/aes.js";
 import {
   COVERAGE_MATRIX_V1,
   coverageStats,
   type CoverageRow,
 } from "../../../src/compliance/eu_ai_act/coverage_matrix.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
-import { generateRandomKey } from "../../../src/core/random.js";
 import { derivePurposeKey } from "../../../src/core/key-derivation.js";
-import { createIdentity } from "../../../src/core/identity.js";
+import {
+  publicKeyToDid,
+  generateIdentityId,
+  type StoredIdentity,
+} from "../../../src/core/identity.js";
+import { toBase64url } from "../../../src/core/encoding.js";
+import type { EncryptedPayload } from "../../../src/core/encryption.js";
 import { AuditLog } from "../../../src/l2-operational/audit-log.js";
 import { IdentityManager } from "../../../src/l1-cognitive/tools.js";
 import { DEFAULT_POLICY } from "../../../src/principal-policy/loader.js";
@@ -43,11 +50,55 @@ import type { ComplianceBundleInput } from "../../../src/compliance/eu_ai_act/ty
 
 // Deterministic seed material: the example bundle should produce
 // the same signatures across regenerations so that the checked-in
-// files remain stable. We use fixed byte arrays rather than random
-// key generation.
+// files remain byte-stable.
 const FIXED_MASTER_KEY = new Uint8Array(32).fill(0x42);
-const FIXED_IDENTITY_SEED = "meridian-financial-holdings-example-fixture";
+const FIXED_PRIVATE_KEY = new Uint8Array(32);
+for (let i = 0; i < 32; i++) FIXED_PRIVATE_KEY[i] = (i * 7 + 13) & 0xff;
+const FIXED_IDENTITY_IV = new Uint8Array(12).fill(0x11);
 const FIXED_GENERATED_AT = "2026-04-10T12:00:00.000Z";
+const FIXED_CLOCK = new Date(FIXED_GENERATED_AT);
+
+/**
+ * Construct a fully deterministic StoredIdentity for the example
+ * bundle fixture. Bypasses `createIdentity` (which uses random key
+ * generation and random IV) and `encrypt` (which uses a random IV
+ * and Date.now timestamp) to keep every byte reproducible.
+ *
+ * NOT a production path — this helper is strictly for regenerable
+ * test fixtures and does not appear in any src/ module.
+ */
+function buildDeterministicIdentity(masterKey: Uint8Array): StoredIdentity {
+  const publicKey = ed25519.getPublicKey(FIXED_PRIVATE_KEY);
+  const identityId = generateIdentityId(publicKey);
+  const did = publicKeyToDid(publicKey);
+
+  // Encrypt the private key with a fixed IV so the stored form is
+  // reproducible. Calling @noble/ciphers' gcm directly avoids the
+  // random IV generation in core/encryption.ts encrypt().
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  const cipher = gcm(identityEncKey, FIXED_IDENTITY_IV);
+  const ciphertext = cipher.encrypt(FIXED_PRIVATE_KEY);
+
+  const encryptedPrivateKey: EncryptedPayload = {
+    v: 1,
+    alg: "aes-256-gcm",
+    iv: toBase64url(FIXED_IDENTITY_IV),
+    ct: toBase64url(ciphertext),
+    ts: FIXED_GENERATED_AT,
+  };
+
+  return {
+    identity_id: identityId,
+    label: "meridian-financial-holdings-example-fixture",
+    public_key: toBase64url(publicKey),
+    did,
+    created_at: FIXED_GENERATED_AT,
+    key_type: "ed25519",
+    key_protection: "passphrase",
+    encrypted_private_key: encryptedPrivateKey,
+    rotation_history: [],
+  };
+}
 
 /**
  * Seed the audit log with representative activity covering every
@@ -113,6 +164,22 @@ function seedAuditActivity(auditLog: AuditLog): void {
 describe("EU AI Act example bundle generator", () => {
   const shouldGenerate = process.env.GENERATE_EXAMPLE === "1";
 
+  beforeAll(() => {
+    // Freeze time so audit entry timestamps are deterministic.
+    // Without this, AuditLog.append writes `new Date().toISOString()`
+    // which varies across runs and breaks byte-stability.
+    if (shouldGenerate) {
+      vi.useFakeTimers();
+      vi.setSystemTime(FIXED_CLOCK);
+    }
+  });
+
+  afterAll(() => {
+    if (shouldGenerate) {
+      vi.useRealTimers();
+    }
+  });
+
   it.skipIf(!shouldGenerate)(
     "generates the Meridian Financial HR screening example bundle",
     async () => {
@@ -121,15 +188,12 @@ describe("EU AI Act example bundle generator", () => {
       const identityManager = new IdentityManager(storage, FIXED_MASTER_KEY);
       const auditLog = new AuditLog(storage, FIXED_MASTER_KEY);
 
-      const identityEncKey = derivePurposeKey(
-        FIXED_MASTER_KEY,
-        "identity-encryption"
-      );
-      const { storedIdentity } = createIdentity(
-        FIXED_IDENTITY_SEED,
-        identityEncKey,
-        "meridian-fixture-passphrase"
-      );
+      // Construct the deterministic primary identity and save it to
+      // the IdentityManager. The save path will re-encrypt for
+      // persistence with its own random IV, but generateEuAiActBundle
+      // reads the in-memory StoredIdentity (which is the deterministic
+      // one we constructed) via getDefault(), not the persisted form.
+      const storedIdentity = buildDeterministicIdentity(FIXED_MASTER_KEY);
       await identityManager.save(storedIdentity);
 
       seedAuditActivity(auditLog);

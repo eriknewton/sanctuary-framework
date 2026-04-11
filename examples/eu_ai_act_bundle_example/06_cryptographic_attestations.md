@@ -15,8 +15,8 @@
 | **Provider contact** | ai-compliance@meridian.example.com |
 | **Intended purpose** | Automated CV screening and candidate shortlisting for open requisitions |
 | **Annex III classification** | §4 employment, workers management, self-employment |
-| **Signer DID** | `did:key:z7QHBxxcLqomx211xvujOFroz7D5f8ytJN5MwIUimnwDVtA` |
-| **Signer public key (base64url)** | `wccXC6qJsdtdcb7ozha6M-w-X_MrSTeTMCFIpp8A1bQ` |
+| **Signer DID** | `did:key:z7QGcerokfUuai3m1bqsYJXTl-M2VQCiaH4laBp4AW1izyg` |
+| **Signer public key (base64url)** | `nHq6JH1Lmot5tW6rGCV05fjNlUAomh-JWgaeAFtYs8o` |
 
 ---
 
@@ -48,8 +48,8 @@ controls.
 
 | Field | Value |
 |---|---|
-| Signer DID | `did:key:z7QHBxxcLqomx211xvujOFroz7D5f8ytJN5MwIUimnwDVtA` |
-| Signer public key (base64url) | `wccXC6qJsdtdcb7ozha6M-w-X_MrSTeTMCFIpp8A1bQ` |
+| Signer DID | `did:key:z7QGcerokfUuai3m1bqsYJXTl-M2VQCiaH4laBp4AW1izyg` |
+| Signer public key (base64url) | `nHq6JH1Lmot5tW6rGCV05fjNlUAomh-JWgaeAFtYs8o` |
 | Signer key type | Ed25519 |
 | Signer role | Provider primary identity |
 | Key custody | Self-custodied (L1 Cognitive Sovereignty) |
@@ -71,11 +71,11 @@ the signature to confirm integrity.
 
 | Filename | SHA-256 | Signature (base64url) |
 |---|---|---|
-| `01_annex_iv_technical_documentation.md` | `300a30ec0e61aa4f751392888aa74c49955c1d45a337bb9e783288ee2ff151e4` | `hV5nmT4Cn76hJKvHPKW0ZQJYExWgvevZP8PuFaouPPO8XK2NbK5p9zfOKuoifW3z3T_QLV8iBbC3PQ24J2NpAw` |
-| `02_article_26_deployer_log.md` | `a6edecd066a4defb369047ff71817e52aeae9cfadd301b7e7c37ddbd2ba571d4` | `2W_Dm5x7rF2KM26Ci7KpxubahZf2Z0T200KM9XFLoJdGD4AZJtANtbj3f2zyWm60ez3gbovM-ByB6XyI_I0QAg` |
-| `03_article_12_automatic_logs.md` | `0e02428818c6d9da90e8affa747e75a3bf4a7d23245c93c7e5a674fbff3ae435` | `CYxi__K8QTrHUvv_x7a24lA4RkTuRPNQWYoLseEzmSjsIw0-iF8LsSZKGCRYFFRo7kaX6bAs842tsRYzgifWDg` |
-| `04_risk_management_summary.md` | `6b1fe36f65f86841f3756f308701994eb0a2526e9504cd3570bc23c3d2a2296b` | `RsLWHMDBYUXyQ4Dzbe2GxnmOHdEk6S6qDScsSJTNrpNDQr-VNHTkxFtXcF5sOGHhvc4ahTKsgudBGoMFePd-BQ` |
-| `05_human_oversight_statement.md` | `99bd4981a1d22cedf0bcc2e8db0ea41a0d70c51a8fdfdf430e15a3cf68616837` | `cu-wNWPfi_9uIkBQTJI2zN0h3VSHLHkt9qFO4_hheacG_MXl9kAPdhE2a-E-DXj6JdjGKrEDmbEClcXrzmnqAg` |
+| `01_annex_iv_technical_documentation.md` | `ec9b143a9170b8db77b02057068e82a4e853e98f887ccea1aa6a8836c1ad1a78` | `4b2mkQ4oIaZXzIWCi_eEukZgMYL0TMhe45626eS6xkJl_exi6WoVBrABKuHodPl1wG8I9qFbBtC203lSUpDQCg` |
+| `02_article_26_deployer_log.md` | `7b1a7749d8191824d80b7dd8994eaeb2771be02691613ebceb6e480b0f1f6876` | `I4gewvcHCxl0RfiBpDJvsNR5hCohpKAhFL9NLIgBxiRGWGaJuzxEsgXI0PJ52vEofNnbJG1w8D0Y6npG9wy7Ag` |
+| `03_article_12_automatic_logs.md` | `c021b50063f9ce6be84a948318abb319f2a05d7ac89f215393e7780e2156d505` | `M50xnj1rdc_1v811eJ083WkQIqLSxie9hs95XoDLUIUNazj5ILHwx__2ax5yngaO_R0ucyMtMWdSRIdD6-x4CA` |
+| `04_risk_management_summary.md` | `1166ece84cdcc3f97557a14d63fe58b896d5c1693113f314a26bcdf98521a7a7` | `cgpksI4K4fcWU2DVDaeFMtZvZPZKCoB_T4DfDorCwhyiPX-F71DjKCeo7nttQasG4WM5PCqvFFjr4xxPmft3Bg` |
+| `05_human_oversight_statement.md` | `2edf8d3d924239c573e49b0f5b3353c286105edbbb5be22fd17fd04f73937e4f` | `RlSapH4qfNdWTJfoccB2mJn1vaofepLpp-FRwSBNAQuZgEXkZXrqi6ip3byOGk4utdNirlqE4RGwc3nS05p8Dg` |
 
 ---
 
@@ -88,8 +88,8 @@ authenticity of the entire bundle in one check.
 
 | Field | Value |
 |---|---|
-| Manifest SHA-256 | `6944abc98aa774b5997de177fc84c30e5b72961769cdacd44d2b6887055dc156` |
-| Manifest signature (base64url) | `_8xKfe2OnterVhF5E2ntCFUopHiJKMwB2cmbi9KQunFs33alC59uUPxaUKtp26QnPT084Rp-uOKo4zsl4fwtCg` |
+| Manifest SHA-256 | `d2186f9e6b7207249355ac0dd6560c3aefb1fb1c3aa1928dc6be16d5579371db` |
+| Manifest signature (base64url) | `6K74O69SCW8y-9V6dWvWqjhGddeFQDZ7FLFzUIPNHqmbgjH7q1_zLQrpV_8yJDmxvmm_0JYwFqoRMSsc1KOqDA` |
 | Canonicalisation | Sorted keys, no whitespace (JSON canonical form) |
 
 ---
@@ -128,8 +128,8 @@ Regulation (EU) 2024/1689.
 ## Document Signature
 
 This document is cryptographically signed by the provider's primary
-Ed25519 identity (DID `did:key:z7QHBxxcLqomx211xvujOFroz7D5f8ytJN5MwIUimnwDVtA`, public key
-`wccXC6qJsdtdcb7ozha6M-w-X_MrSTeTMCFIpp8A1bQ`). The signature for this document is recorded
+Ed25519 identity (DID `did:key:z7QGcerokfUuai3m1bqsYJXTl-M2VQCiaH4laBp4AW1izyg`, public key
+`nHq6JH1Lmot5tW6rGCV05fjNlUAomh-JWgaeAFtYs8o`). The signature for this document is recorded
 in the bundle manifest `00_bundle_manifest.json` under the entry
 with this filename, alongside its SHA-256 digest.
 
@@ -152,7 +152,7 @@ legal counsel before filing or relying on this document for
 regulatory submissions, self-assessment, or CE marking procedures.
 
 The coverage claims in this document reflect the state of the
-Sanctuary Framework v0.7.0 runtime as of the
+Sanctuary Framework v0.8.0 runtime as of the
 generation timestamp above. The coverage matrix is versioned
 (`v1`) and aligned to the regulation text
 identified by `EU AI Act Regulation (EU) 2024/1689, as of 2026-04-10`; if the European Commission
@@ -163,4 +163,4 @@ regenerated against the updated matrix.
 ---
 
 *Generated by [Sanctuary Framework](https://github.com/eriknewton/sanctuary-framework)
-v0.7.0 · Author: Erik Newton · License: Apache-2.0*
+v0.8.0 · Author: Erik Newton · License: Apache-2.0*
