@@ -91,6 +91,51 @@ export interface ComplianceBundleInput {
    * fails because of a delta problem.
    */
   delta_from_bundle_path?: string;
+  /**
+   * Optional post-generation side effect: if true, POST the signed
+   * bundle manifest (NOT the full document bodies) to Verascore at
+   * the configured verascore_url using the same signed-publish path
+   * as `reputation_publish`. Bundle generation never depends on
+   * Verascore being online — if the publish fails for any reason,
+   * the bundle is still returned with a publish_result field
+   * reporting the failure. Defaults to false.
+   */
+  publish_to_verascore?: boolean;
+  /**
+   * Optional override for the Verascore base URL used when
+   * `publish_to_verascore` is true. Defaults to "https://verascore.ai".
+   * Must be HTTPS and must match one of the allowed Verascore hosts
+   * (verascore.ai, www.verascore.ai, api.verascore.ai).
+   */
+  verascore_url?: string;
+}
+
+// ── Verascore publish result (Phase 2) ───────────────────────────────
+
+/**
+ * Outcome of the optional Verascore publish side-effect. Always
+ * included in the bundle result when publish_to_verascore was true,
+ * regardless of whether the publish succeeded. Bundle generation
+ * never fails because of a publish error.
+ */
+export interface VerascorePublishResult {
+  /** Whether the publish was attempted at all. */
+  attempted: boolean;
+  /** Whether the publish succeeded. */
+  published: boolean;
+  /** HTTP status code from Verascore, if reached. */
+  status?: number;
+  /** Verascore agent ID the manifest was published under. */
+  verascore_agent_id?: string;
+  /** Verascore base URL used for the publish. */
+  verascore_url?: string;
+  /** Error message if the publish failed. */
+  error?: string;
+  /**
+   * SHA-256 hex of the canonical manifest bytes that were POSTed.
+   * Used so an auditor can cross-check which manifest was published.
+   */
+  published_manifest_sha256?: string;
 }
 
 // ── Delta report (Phase 2) ───────────────────────────────────────────
@@ -217,6 +262,12 @@ export interface BundleManifest {
 export interface ComplianceBundle {
   manifest: BundleManifest;
   files: BundleFile[];
+  /**
+   * Present iff `publish_to_verascore` was true in the input.
+   * Always reports the outcome — the bundle is returned in the
+   * same shape whether the publish succeeded or failed.
+   */
+  publish_result?: VerascorePublishResult;
 }
 
 // ── Audit-log slice (for Article 12 / Article 26 documents) ──────────

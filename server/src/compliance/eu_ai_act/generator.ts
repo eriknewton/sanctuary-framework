@@ -79,6 +79,7 @@ import type {
   ManifestRowSummary,
   DeltaReport,
   DeltaRowChange,
+  VerascorePublishResult,
 } from "./types.js";
 
 // ── Generator dependencies ───────────────────────────────────────────
@@ -905,6 +906,128 @@ function renderDelta(
   );
 }
 
+// ── Verascore publish hook ───────────────────────────────────────────
+
+/**
+ * Allowed Verascore hostnames for the SSRF allow-list. Matches the
+ * set used by `reputation_publish` in `src/l4-reputation/tools.ts`.
+ * Mirrored here rather than imported so the compliance generator
+ * does not couple to the reputation module's internals.
+ */
+const ALLOWED_VERASCORE_HOSTS = new Set([
+  "verascore.ai",
+  "www.verascore.ai",
+  "api.verascore.ai",
+]);
+
+/**
+ * Publish a signed bundle manifest to Verascore as a pure side-
+ * effect. Follows the same wire format and signing path used by
+ * `reputation_publish`:
+ *
+ *   - Allow-list SSRF check (HTTPS + known Verascore host)
+ *   - Canonical JSON of the manifest is signed with the provider's
+ *     primary Ed25519 identity via the existing core/identity.js
+ *     sign() primitive — no second signing pipeline
+ *   - POST { agentId, signature, publicKey, type, data } to
+ *     `${verascoreUrl}/api/publish` with type "eu-ai-act-bundle"
+ *   - Only the manifest is published; document bodies never leave
+ *     the local filesystem
+ *
+ * NON-DEPENDENCY PRINCIPLE: this function MUST NOT throw. Any
+ * error (URL validation, fetch failure, non-2xx response) is
+ * captured in the returned VerascorePublishResult and bundle
+ * generation proceeds unaffected. Sanctuary never requires
+ * Verascore to be online.
+ */
+async function publishBundleManifestToVerascore(
+  manifest: BundleManifest,
+  signer: StoredIdentity,
+  encryptionKey: Uint8Array,
+  verascoreUrl: string,
+  ds: DocSigner
+): Promise<VerascorePublishResult> {
+  const result: VerascorePublishResult = {
+    attempted: true,
+    published: false,
+    verascore_url: verascoreUrl,
+  };
+
+  // Validate URL shape + SSRF allow-list.
+  let parsed: URL;
+  try {
+    parsed = new URL(verascoreUrl);
+  } catch {
+    result.error = `Verascore URL is not a valid URL: ${verascoreUrl}`;
+    return result;
+  }
+  if (parsed.protocol !== "https:") {
+    result.error = `Verascore URL must use HTTPS (got ${parsed.protocol})`;
+    return result;
+  }
+  if (!ALLOWED_VERASCORE_HOSTS.has(parsed.hostname)) {
+    result.error = `Verascore URL must point to a known Verascore host (${[...ALLOWED_VERASCORE_HOSTS].join(", ")}). Got: ${parsed.hostname}`;
+    return result;
+  }
+
+  // Build canonical manifest bytes and sign them for the publish
+  // request body. The manifest already carries its own
+  // manifest_signature field (over canonical body with the signature
+  // stripped); Verascore's API additionally requires a signature
+  // over the outer request body, so we sign once more — same
+  // identity, same key, same sign() primitive.
+  const canonicalManifest = canonicalJSON(manifest);
+  const manifestBytes = stringToBytes(canonicalManifest);
+  const manifestSha256 = ds.sha256Hex(canonicalManifest);
+  result.published_manifest_sha256 = manifestSha256;
+
+  let requestSignatureB64: string;
+  try {
+    const sigBytes = sign(
+      manifestBytes,
+      signer.encrypted_private_key,
+      encryptionKey
+    );
+    requestSignatureB64 = toBase64url(sigBytes);
+  } catch (e) {
+    result.error = `Failed to sign Verascore publish payload: ${(e as Error).message}`;
+    return result;
+  }
+
+  // Derive a Verascore-slug agent ID from the manifest's agent DID
+  // using the same normalisation reputation_publish uses.
+  const agentId = manifest.agent_did
+    .replace(/[^a-zA-Z0-9-]/g, "-")
+    .toLowerCase();
+  result.verascore_agent_id = agentId;
+
+  const requestBody = {
+    agentId,
+    signature: requestSignatureB64,
+    publicKey: signer.public_key,
+    type: "eu-ai-act-bundle",
+    data: manifest,
+  };
+
+  try {
+    const response = await fetch(`${verascoreUrl}/api/publish`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+    result.status = response.status;
+    if (!response.ok) {
+      result.error = `Verascore API returned ${response.status}`;
+      return result;
+    }
+    result.published = true;
+    return result;
+  } catch (e) {
+    result.error = `Verascore fetch failed: ${(e as Error).message}`;
+    return result;
+  }
+}
+
 // ── Top-level generator entry point ──────────────────────────────────
 
 /**
@@ -1035,7 +1158,7 @@ export async function generateEuAiActBundle(
     }
   }
 
-  // Final manifest covers all 6 files.
+  // Final manifest covers all files (7 core + optional doc 08 delta).
   const finalManifest = buildManifest(
     input,
     generatedAt,
@@ -1044,9 +1167,31 @@ export async function generateEuAiActBundle(
     ds
   );
 
+  // Optional Verascore publish side-effect. Runs LAST so the bundle
+  // is already fully built and ready to return before we touch the
+  // network. If publish fails for any reason, the bundle is returned
+  // in the same shape with publish_result describing the failure.
+  // Sanctuary bundle generation NEVER depends on Verascore being
+  // online — this is the non-dependency principle in action.
+  let publishResult: VerascorePublishResult | undefined = undefined;
+  if (input.publish_to_verascore) {
+    const encryptionKey = derivePurposeKey(
+      deps.masterKey,
+      "identity-encryption"
+    );
+    publishResult = await publishBundleManifestToVerascore(
+      finalManifest,
+      signer,
+      encryptionKey,
+      input.verascore_url ?? "https://verascore.ai",
+      ds
+    );
+  }
+
   return {
     manifest: finalManifest,
     files: allFiles,
+    publish_result: publishResult,
   };
 }
 
@@ -1154,6 +1299,22 @@ export function createComplianceTools(deps: GeneratorDeps): {
               "added/removed/changed). Delta problems never fail " +
               "bundle generation; the bundle always lands locally.",
           },
+          publish_to_verascore: {
+            type: "boolean",
+            description:
+              "If true, POST the signed bundle MANIFEST (not the " +
+              "document bodies) to Verascore after the bundle is " +
+              "generated. Non-dependency principle: publish " +
+              "failure never fails bundle generation — the bundle " +
+              "is returned with a publish_result field describing " +
+              "the outcome. Defaults to false.",
+          },
+          verascore_url: {
+            type: "string",
+            description:
+              "Optional Verascore base URL (HTTPS, allow-listed " +
+              "hosts only). Defaults to https://verascore.ai.",
+          },
         },
         required: [
           "agent_did",
@@ -1173,6 +1334,11 @@ export function createComplianceTools(deps: GeneratorDeps): {
           delta_from_bundle_path:
             typeof args.delta_from_bundle_path === "string"
               ? args.delta_from_bundle_path
+              : undefined,
+          publish_to_verascore: args.publish_to_verascore === true,
+          verascore_url:
+            typeof args.verascore_url === "string"
+              ? args.verascore_url
               : undefined,
         };
 
@@ -1200,6 +1366,7 @@ export function createComplianceTools(deps: GeneratorDeps): {
           })),
           manifest_signature: bundle.manifest.manifest_signature,
           disclaimer: bundle.manifest.disclaimer,
+          publish_result: bundle.publish_result,
           _bundle_content: {
             manifest: bundle.manifest,
             files: bundle.files.map((f) => ({

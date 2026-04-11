@@ -50,6 +50,8 @@ interface ComplianceCliOptions {
   deploymentContext: DeploymentContext;
   passphrase?: string;
   deltaFrom?: string;
+  publishToVerascore?: boolean;
+  verascoreUrl?: string;
 }
 
 function parseArgs(args: string[]): ComplianceCliOptions {
@@ -128,6 +130,14 @@ function parseArgs(args: string[]): ComplianceCliOptions {
         opts.deltaFrom = next;
         i++;
         break;
+      case "--publish-to-verascore":
+        opts.publishToVerascore = true;
+        // no argument — this is a boolean flag
+        break;
+      case "--verascore-url":
+        opts.verascoreUrl = next;
+        i++;
+        break;
       default:
         throw new Error(`Unknown flag: "${flag}"`);
     }
@@ -158,6 +168,13 @@ FLAGS
   --passphrase <pass>      Master key passphrase (or SANCTUARY_PASSPHRASE env)
   --delta-from <path>      Prior bundle directory to diff against; adds
                            08_delta.md to the output
+  --publish-to-verascore   POST the signed manifest (not the document
+                           bodies) to Verascore as a post-generation
+                           side effect. Publish failure never fails the
+                           local bundle generation.
+  --verascore-url <url>    Override the Verascore base URL (HTTPS, must
+                           point to an allow-listed Verascore host).
+                           Defaults to https://verascore.ai.
   --help                   Print this help text
 
 OUTPUT
@@ -245,6 +262,8 @@ export async function runCompliance(args: string[]): Promise<void> {
     period_start: periodStart,
     period_end: periodEnd,
     delta_from_bundle_path: opts.deltaFrom,
+    publish_to_verascore: opts.publishToVerascore,
+    verascore_url: opts.verascoreUrl,
   };
 
   const bundle = await generateEuAiActBundle(input, {
@@ -317,6 +336,22 @@ export async function runCompliance(args: string[]): Promise<void> {
   console.error(
     "  Review each marker and replace with the relevant enterprise fact."
   );
+  console.error("");
+  if (bundle.publish_result) {
+    console.error("");
+    console.error("  Verascore publish:");
+    if (bundle.publish_result.published) {
+      console.error(
+        `    ✓ published to ${bundle.publish_result.verascore_url} as ${bundle.publish_result.verascore_agent_id}`
+      );
+    } else {
+      console.error(`    ✗ publish failed: ${bundle.publish_result.error}`);
+      console.error(
+        `    (bundle has been written to disk regardless — this is a pure side effect)`
+      );
+    }
+  }
+
   console.error("");
   console.error(
     "  NOT LEGAL ADVICE. Consult qualified legal counsel before filing."
