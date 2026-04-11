@@ -6,6 +6,98 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.8.0] - unreleased — EU AI Act Compliance Artifact Generator
+
+### Added
+
+- **EU AI Act Compliance Artifact Generator.** New Sanctuary subsystem
+  under `server/src/compliance/eu_ai_act/` that generates a signed
+  bundle of technical compliance documents from a live Sanctuary
+  runtime, aligned to Regulation (EU) 2024/1689.
+  - Coverage matrix v1 (`coverage_matrix.ts`) — 46 rows mapping
+    Sanctuary primitives to Annex IV §1–§9, Article 12, Article 13,
+    Article 14, Article 15, Article 19(1), and Article 26. Honest
+    coverage distribution: **5 full rows** (11%, machine-verifiable
+    with zero enterprise input), **24 partial rows** (52%, structured
+    evidence plus enterprise context), and **17 manual-only rows**
+    (37%, enterprise-authored). Every "full" row individually verified
+    against v0.7.0 source on 2026-04-10; see per-row `review_notes`
+    for verification findings and corrections applied.
+  - Six Markdown templates covering Annex IV technical documentation
+    (per Article 11), Article 26 deployer log, Article 12 automatic
+    record-keeping, risk management summary (Article 9), human
+    oversight statement (Article 14), and cryptographic attestations.
+    Each template uses verbatim regulation quotes with `[...]`
+    elisions and emits explicit `[MANUAL INPUT REQUIRED: hint]`
+    markers where the enterprise must supply business context.
+  - Hand-rolled minimal template engine (`templates/render.ts`, ~60
+    lines) with `{{ var }}` and `{{ var | hint }}` grammar. Zero new
+    runtime dependencies.
+  - Bundle generator (`generator.ts`) that walks the matrix, renders
+    each document, computes SHA-256 (lowercase hex for auditor
+    compatibility with `sha256sum`), and signs every file with the
+    provider's primary Ed25519 identity via the existing
+    `core/identity.ts` sign primitive. Canonical JSON signing for
+    the manifest.
+  - New MCP tool `compliance_generate_eu_ai_act_bundle` registered
+    under Tier 3 (auto-allow, read-only) in the default Principal
+    Policy.
+  - New CLI subcommand `sanctuary-mcp-server compliance eu-ai-act
+    <agent-did>` with flags for deployment context, reporting
+    period, and output directory.
+  - Example bundle under `examples/eu_ai_act_bundle_example/` — a
+    fictional Fortune 2000 enterprise deploying a high-risk Annex
+    III §4 HR screening agent. Byte-stable across regeneration via
+    the new `generated_at_override` input field. Verified end-to-end
+    with `shasum -a 256`; every digest matches the manifest exactly.
+  - Documentation at `docs/compliance/eu_ai_act_bundle.md` (usage
+    guide) and `docs/compliance/eu_ai_act_coverage_matrix_v1.md`
+    (auto-generated from the matrix TypeScript data).
+  - 81 new tests across render, coverage matrix schema invariants,
+    and end-to-end bundle generation (including signature
+    verification against the signer's public key).
+
+### Changed
+
+- **`SanctuaryServer` interface extended** with optional-usage
+  `identityManager`, `masterKey`, `auditLog`, and `policy` fields so
+  embedding callers (notably the compliance CLI subcommand) can
+  reuse the existing `createSanctuaryServer` path without
+  duplicating dependency wiring. Non-breaking for existing consumers
+  that only use `server` and `config`.
+
+### Fixed
+
+- **`principal-policy/loader.ts` closing `],` absorbed into line
+  comment.** A recent memory_attest commit had the closing bracket
+  of `tier3_always_allow` tucked onto the same line as a `//`
+  comment, absorbing it into the comment and leaving the array
+  unclosed. This silently broke esbuild parse for 10 test files,
+  dropping the baseline from 1113 to 1015 passing. Fixed in commit
+  `3bc5cc6`. Baseline restored to 1113; after the compliance
+  generator tests the new baseline is 1193+.
+
+- **Three pre-existing `TS6133` unused-import errors** in
+  `src/cocoon/cli.ts`, `src/cocoon/config-reader.ts`, and
+  `src/l1-cognitive/memory-attest.ts`. Removed during the session
+  that built the compliance generator, because the new
+  interim-stopgap test-baseline rule in `Sanctuary/CLAUDE.md`
+  requires a clean typecheck before every commit. Commit `d175b23`.
+
+### Documentation
+
+- **`Sanctuary/CLAUDE.md` commit discipline stopgap** (commit
+  `e99174f`). Every commit to Sanctuary main must run
+  `npm run typecheck && npm test` against a clean working tree
+  before staging; block the commit if either fails. Interim
+  instruction-layer defense until a pre-commit hook lands in a
+  follow-up session per `docs/audit/test-baseline-hardening-plan.md`.
+
+- **`docs/audit/` directory established** as the canonical home for
+  long-lived audit-class artifacts (postmortems, hardening plans,
+  incident reports). Inaugural artifacts: the commit `4ac95830`
+  postmortem and the test baseline hardening plan. Commit `eead299`.
+
 ## [0.6.1] - 2026-04-04 — Security remediation pass
 
 ### Security

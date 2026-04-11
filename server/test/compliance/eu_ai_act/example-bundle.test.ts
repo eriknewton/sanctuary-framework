@@ -22,6 +22,11 @@
 import { describe, it, expect } from "vitest";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
+import {
+  COVERAGE_MATRIX_V1,
+  coverageStats,
+  type CoverageRow,
+} from "../../../src/compliance/eu_ai_act/coverage_matrix.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { derivePurposeKey } from "../../../src/core/key-derivation.js";
@@ -285,9 +290,146 @@ echo "NOT LEGAL ADVICE. This bundle is a fictional example."
     }
   );
 
+  it.skipIf(!shouldGenerate)(
+    "generates docs/compliance/eu_ai_act_coverage_matrix_v1.md from the matrix data",
+    async () => {
+      const repoRoot = resolve(process.cwd(), "..");
+      const outputDir = join(repoRoot, "docs", "compliance");
+      await mkdir(outputDir, { recursive: true });
+      const md = renderCoverageMatrixMarkdown();
+      await writeFile(
+        join(outputDir, "eu_ai_act_coverage_matrix_v1.md"),
+        md,
+        "utf-8"
+      );
+      expect(md.length).toBeGreaterThan(0);
+    }
+  );
+
   it("example bundle placeholder — real generation is gated on GENERATE_EXAMPLE=1", () => {
     // This stub keeps the test file contributing ≥1 assertion in
     // the normal suite so its presence is tracked by the baseline.
     expect(shouldGenerate || !shouldGenerate).toBe(true);
   });
 });
+
+// ── Coverage matrix Markdown renderer ────────────────────────────────
+
+function badgeFor(coverage: CoverageRow["coverage"]): string {
+  switch (coverage) {
+    case "full":
+      return "**FULL**";
+    case "partial":
+      return "**PARTIAL**";
+    case "manual_only":
+      return "**MANUAL ONLY**";
+  }
+}
+
+function renderCoverageMatrixMarkdown(): string {
+  const m = COVERAGE_MATRIX_V1;
+  const stats = coverageStats(m);
+
+  const header = `---
+title: EU AI Act Coverage Matrix v1
+description: Row-by-row mapping from Sanctuary primitives to Regulation (EU) 2024/1689 requirements
+---
+
+# EU AI Act Coverage Matrix v1
+
+**Matrix version:** \`${m.matrix_version}\`
+**Regulation:** ${m.regulation_version}
+**OJ reference:** ${m.regulation.oj_reference}
+**Full enforcement date:** ${m.regulation.full_enforcement_date}
+**Aligned to text version:** ${m.regulation.aligned_to_text_version}
+**Last full review:** ${m.regulation.last_full_review}
+**Next review due:** ${m.regulation.next_review_due}
+
+---
+
+## Summary
+
+| Coverage | Rows | Share |
+|---|---|---|
+| **Full** (auto-emitted, machine-verifiable, zero enterprise input) | ${stats.full} | ${stats.full_pct}% |
+| **Partial** (structured evidence emitted; enterprise supplies business context) | ${stats.partial} | ${stats.partial_pct}% |
+| **Manual only** (Sanctuary has no visibility; enterprise authors in full) | ${stats.manual_only} | ${stats.manual_only_pct}% |
+| **Total** | ${stats.total_rows} | 100% |
+
+### The 5 full rows (load-bearing spine)
+
+Every "full" row was individually verified against v0.7.0 source on 2026-04-10. See per-row review_notes for verification findings and any corrections applied. If a claim of "full coverage" on any other row appears in a downstream document, the matrix has drifted and needs re-verification.
+
+${m.rows
+  .filter((r) => r.coverage === "full")
+  .map(
+    (r, i) =>
+      `${i + 1}. **${r.citation.instrument} ${r.citation.section}** — ${r.citation.title}`
+  )
+  .join("\n")}
+
+### Notes
+
+${m.notes.map((n) => `- ${n}`).join("\n")}
+
+---
+
+## Row-by-row mapping
+
+`;
+
+  const rowsBlocks = m.rows
+    .map((row) => {
+      const emitterList =
+        row.evidence_emitter.length === 0
+          ? "_(none — this row is manual_only)_"
+          : row.evidence_emitter.map((e) => `\`${e}\``).join(", ");
+      const carveout =
+        row.manual_carveout === null
+          ? "_(none — this row is fully auto-emitted)_"
+          : row.manual_carveout;
+      return `### ${row.citation.instrument} ${row.citation.section} — ${row.citation.title}
+
+- **Row ID:** \`${row.id}\`
+- **Clause ID:** \`${row.citation.clause_id}\`
+- **Coverage:** ${badgeFor(row.coverage)}
+- **Last reviewed:** ${row.last_reviewed_date} by ${row.last_reviewed_by}
+
+**Requirement (verbatim, with \`[...]\` elisions):**
+
+> ${row.requirement}
+
+**Evidence emitted by Sanctuary:**
+
+${row.evidence_emitted}
+
+**Evidence emitter tools:** ${emitterList}
+
+**Enterprise input required:**
+
+${carveout}
+
+**Review notes:**
+
+${row.review_notes}
+
+---
+
+`;
+    })
+    .join("");
+
+  const footer = `
+## Disclaimer
+
+**NOT LEGAL ADVICE.** This matrix is a technical mapping from Sanctuary primitives to Regulation (EU) 2024/1689 clause identifiers; it is not a legal interpretation of the EU AI Act and does not constitute a legal opinion. Consult qualified legal counsel before filing or relying on any compliance artifact generated from this matrix.
+
+---
+
+_Generated from \`server/src/compliance/eu_ai_act/coverage_matrix.ts\` via the \`GENERATE_EXAMPLE=1\` test pipeline. To regenerate: \`cd server && GENERATE_EXAMPLE=1 npm test -- example-bundle\`._
+
+_Sanctuary Framework · Author: Erik Newton · License: Apache-2.0_
+`;
+
+  return header + rowsBlocks + footer;
+}
