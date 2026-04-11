@@ -39,7 +39,11 @@ import {
   generateEuAiActBundle,
   type GeneratorDeps,
 } from "../../../src/compliance/eu_ai_act/generator.js";
-import { renderBundleToPdf } from "../../../src/compliance/eu_ai_act/pdf.js";
+import {
+  renderBundleToPdf,
+  assertFooterFits,
+  MIN_FOOTER_GUTTER,
+} from "../../../src/compliance/eu_ai_act/pdf.js";
 import type { ComplianceBundleInput } from "../../../src/compliance/eu_ai_act/types.js";
 
 // ── Fixture helpers (same deterministic setup as other tests) ────────
@@ -192,14 +196,40 @@ describe("renderBundleToPdf", () => {
     expect(full).toMatch(/Page 2 of \d+/);
   });
 
-  it("includes the manifest SHA-256 identifier prefix in the footer", async () => {
+  it("includes the manifest SHA-256 16-hex identifier prefix in the footer context", async () => {
     const deps = await buildFixture();
     const bundle = await generateEuAiActBundle(inputFor(), deps);
     const pdf = renderBundleToPdf(bundle);
     const full = new TextDecoder("latin1").decode(pdf);
-    // Footer uses the first file's sha256 prefix as the identifier
-    const firstSha = bundle.manifest.files[0]!.sha256.slice(0, 48);
-    expect(full).toContain(firstSha);
+    // Footer uses the first file's sha256 prefix as the identifier,
+    // truncated to 16 hex characters (64 bits) in the footer overlay
+    // fix. This is still collision-resistant for visual verification.
+    const firstSha = bundle.manifest.files[0]!.sha256;
+    const digestShort = firstSha.slice(0, 16);
+    // The footer context is specifically "SHA-256: <prefix>..." —
+    // we match on the exact wrapping string so we don't collide with
+    // the full 64-char digests that legitimately appear in the
+    // attestations document body table.
+    expect(full).toContain(`SHA-256: ${digestShort}...`);
+    // The pre-fix draft used a 48-char prefix followed by "..."
+    // inside the SAME footer wrapping. That specific wrapping MUST
+    // NOT appear anywhere in the content streams — it would
+    // re-introduce the overlay bug. (The raw 48-char substring
+    // legitimately appears inside the full 64-char digests rendered
+    // in the cryptographic attestations document body, so we only
+    // exclude the footer-wrapped form here.)
+    const oldLongPrefix = firstSha.slice(0, 48);
+    expect(full).not.toContain(`SHA-256: ${oldLongPrefix}...`);
+  });
+
+  it("uses a plain ASCII pipe separator in the footer (not middle-dot)", async () => {
+    const deps = await buildFixture();
+    const bundle = await generateEuAiActBundle(inputFor(), deps);
+    const pdf = renderBundleToPdf(bundle);
+    const full = new TextDecoder("latin1").decode(pdf);
+    // The footer was previously "... Bundle · Manifest SHA-256:" which
+    // the ASCII substitution table garbled. It is now a plain pipe.
+    expect(full).toContain("Bundle | Manifest SHA-256:");
   });
 
   it("includes the NOT LEGAL ADVICE disclaimer on the cover page", async () => {
@@ -245,6 +275,34 @@ describe("renderBundleToPdf", () => {
     // The /Pages tree itself matches /Type /Pages (not /Page\b), so
     // the count is exactly the number of page objects.
     expect(pageMatches.length).toBeGreaterThanOrEqual(10);
+  });
+
+  it("footer width guard allows the default left footer + realistic page label", () => {
+    // Current production left-footer length:
+    //   "Sanctuary EU AI Act Compliance Bundle | Manifest SHA-256: "
+    //   = 58 chars
+    //   + 16 hex prefix + "..." = 77 chars total
+    // Realistic page label for ≤999 pages: "Page 999 of 999" = 15 chars
+    expect(() => assertFooterFits(77, 15)).not.toThrow();
+  });
+
+  it("footer width guard throws with a recognisable error for pathological dimensions", () => {
+    // Pathological: simulate a left footer built from the old 48-hex
+    // digest prefix plus an extremely long bundle title, plus a
+    // ten-million-page label. This must trip the guard and emit the
+    // overflow error naming the offending widths.
+    const pathologicalLeftLen = 120;
+    const pathologicalRightLen = 30;
+    expect(() =>
+      assertFooterFits(pathologicalLeftLen, pathologicalRightLen)
+    ).toThrow(/PDF footer overflow/);
+    expect(() =>
+      assertFooterFits(pathologicalLeftLen, pathologicalRightLen)
+    ).toThrow(/available column width/);
+  });
+
+  it("MIN_FOOTER_GUTTER is at least 24pt (sanity check on the guard constant)", () => {
+    expect(MIN_FOOTER_GUTTER).toBeGreaterThanOrEqual(24);
   });
 
   it("output is valid latin1-encodable (no surrogate issues)", async () => {

@@ -66,6 +66,48 @@ const H3_LINE_HEIGHT = 15;
 // Footer font is smaller than body.
 const FOOTER_FONT_SIZE = 8;
 const FOOTER_CHAR_WIDTH = FOOTER_FONT_SIZE * 0.6;
+/**
+ * Minimum horizontal gap (in PDF points) between the left-aligned
+ * footer text and the right-aligned page label at the same baseline.
+ * If left-footer width + right-label width + this gutter exceeds the
+ * available column width, the PDF builder throws a clear error.
+ * This is a future-proofing guard so a longer bundle title, a longer
+ * regulation version string, or a longer page label cannot silently
+ * re-introduce the footer overlay bug fixed in the 16-hex patch.
+ */
+export const MIN_FOOTER_GUTTER = 24;
+
+/**
+ * Assert that a given left-footer length and right-label length fit
+ * at the same footer baseline with at least MIN_FOOTER_GUTTER between
+ * them. Throws a recognisable error if they do not.
+ *
+ * Exported so the footer-overlay regression test can invoke the
+ * guard directly with pathological dimensions — the normal bundle
+ * path slices the manifest digest to 16 hex characters and is
+ * unlikely to ever hit this check in practice, which is exactly why
+ * the guard exists as a future-proofing invariant.
+ */
+export function assertFooterFits(
+  leftFooterLength: number,
+  rightLabelLength: number
+): void {
+  const leftFooterWidth = leftFooterLength * FOOTER_CHAR_WIDTH;
+  const rightLabelWidth = rightLabelLength * FOOTER_CHAR_WIDTH;
+  const availableWidth = PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+  if (
+    leftFooterWidth + rightLabelWidth + MIN_FOOTER_GUTTER >
+    availableWidth
+  ) {
+    throw new Error(
+      `PDF footer overflow: left footer (${leftFooterWidth.toFixed(1)}pt) + ` +
+        `right label (${rightLabelWidth.toFixed(1)}pt) + ` +
+        `min gutter (${MIN_FOOTER_GUTTER}pt) > available column width ` +
+        `(${availableWidth}pt). Shorten the left footer or reduce the ` +
+        `digest prefix length in finaliseFooters().`
+    );
+  }
+}
 
 // Text region y-range for the body: from top margin down to the
 // footer reservation.
@@ -380,15 +422,38 @@ class PdfBuilder {
    * Render the footer on every page. Called just before serialisation.
    * Footer format:
    *
-   *   Sanctuary EU AI Act Compliance Bundle · Manifest SHA-256:
-   *   <first 48 chars of hex>...                    Page N of M
+   *   Sanctuary EU AI Act Compliance Bundle | Manifest SHA-256:
+   *   <first 16 chars of hex>...                    Page N of M
+   *
+   * The manifest digest is truncated to 16 hex chars (64 bits) — still
+   * collision-resistant for visual verification, and no one eyeballs
+   * 48+ hex characters. The middle-dot separator used in the Phase 2
+   * first draft was non-ASCII and got mangled by the ASCII
+   * substitution table, so it is replaced with a plain ASCII pipe.
+   *
+   * A width guard asserts that left-footer width + right-label width
+   * + MIN_FOOTER_GUTTER fits inside the available column width. If
+   * it does not, the builder throws a clear error naming the
+   * overflow — future-proofing against a longer bundle title or
+   * longer page-count label silently re-introducing the overlay.
    */
   private finaliseFooters(): void {
     const totalPages = this.pages.length;
-    const digestShort = this.manifestDigest.slice(0, 48) + "...";
+    const digestShort = this.manifestDigest.slice(0, 16) + "...";
     const leftFooter =
-      "Sanctuary EU AI Act Compliance Bundle · Manifest SHA-256: " +
+      "Sanctuary EU AI Act Compliance Bundle | Manifest SHA-256: " +
       digestShort;
+
+    // Width guard: compute the longest possible page label (i.e. the
+    // final page, which has the widest N-of-M number) and assert the
+    // worst-case layout fits with the minimum gutter. The guard is
+    // extracted as the exported `assertFooterFits` helper so the
+    // regression test can invoke it directly with pathological
+    // dimensions (the normal bundle path slices the manifest digest
+    // to 16 hex characters and cannot trip this check in practice).
+    const worstCasePageLabel = `Page ${totalPages} of ${totalPages}`;
+    assertFooterFits(leftFooter.length, worstCasePageLabel.length);
+
     for (const page of this.pages) {
       const pageLabel = `Page ${page.pageNumber} of ${totalPages}`;
       // Left-aligned footer

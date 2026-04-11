@@ -78,6 +78,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   valid "PDF document, version 1.4" and real PDF readers can open
   the example at `examples/eu_ai_act_bundle_example/bundle.pdf`.
 
+### Fixed — Phase 2
+
+- **PDF footer overlay — truncate digest to 16 hex, ASCII separator, width guard.** The Phase 2 Deliverable 4 footer drew the left "Sanctuary EU AI Act Compliance Bundle · Manifest SHA-256: <48 hex>..." string and the right "Page N of M" label at the same Y baseline, overlapping on Letter-sized pages. Fixed by (a) truncating the footer digest prefix from 48 to 16 hex characters (64 bits — still collision-resistant for visual verification), (b) replacing the `·` middle-dot separator with a plain ASCII pipe `|` so the character substitution table doesn't garble it, and (c) adding an `assertFooterFits` width guard + `MIN_FOOTER_GUTTER = 24pt` constant that throws a recognisable error if left-footer width + right-label width + gutter exceeds the available column width. The guard is exported so the regression test can invoke it directly with pathological dimensions. The example HR bundle regenerated under `GENERATE_EXAMPLE=1` remains byte-stable across runs; only `bundle.pdf` changed relative to the pre-fix state (Markdown and JSON files are untouched). +4 tests on the PDF writer.
+
 ### Changed — Phase 2
 
 - **Example bundle is now byte-stable across regenerations.** The
