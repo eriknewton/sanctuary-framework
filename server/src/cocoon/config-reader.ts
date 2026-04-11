@@ -179,14 +179,6 @@ export async function detectAgentConfigWithDiagnostics(
 
 // ── Config Parsing ──────────────────────────────────────────────────
 
-async function readConfigFile(
-  path: string,
-  platform: AgentPlatform
-): Promise<AgentConfig | null> {
-  const { config } = await readConfigFileWithError(path, platform);
-  return config;
-}
-
 async function readConfigFileWithError(
   path: string,
   platform: AgentPlatform

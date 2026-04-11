@@ -17,7 +17,7 @@ import type { IdentityManager } from "./tools.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 import { sign } from "../core/identity.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import { hash, hashToString } from "../core/hashing.js";
+import { hashToString } from "../core/hashing.js";
 import { stringToBytes, toBase64url } from "../core/encoding.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────

@@ -29,7 +29,6 @@ import {
   rewriteConfigForCocoon,
   type AgentPlatform,
   type MCPServerEntry,
-  type DetectionResult,
 } from "./config-reader.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 
