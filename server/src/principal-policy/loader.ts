@@ -108,7 +108,8 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "reputation_publish", // Auto-allow: publishing sovereignty data to Verascore is routine
     "sanctuary_policy_status", // Read-only policy summary
     "identity_set_primary", // One-time set, persists via _meta storage — safe at Tier 3
-    "memory_attest", // Read-only audit attestation — records that a memory op happened  ],
+    "memory_attest", // Read-only audit attestation — records that a memory op happened
+  ],
   approval_channel: DEFAULT_CHANNEL,
 };
 
