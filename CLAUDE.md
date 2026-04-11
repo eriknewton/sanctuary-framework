@@ -8,7 +8,7 @@ This file is a briefing for every Claude Code session that touches these codebas
 
 ### Commit discipline — interim test-baseline stopgap (MANDATORY)
 
-Every commit to Sanctuary main MUST run `npm run typecheck && npm test` against a clean working tree before staging; block the commit if either fails. This is the interim instruction-layer defense until the pre-commit hook lands in a follow-up session. See `review/test-baseline-hardening-plan.md` for the full three-layer hardening plan and `review/commit-4ac95830-postmortem.md` for the trigger incident.
+Every commit to Sanctuary main MUST run `npm run typecheck && npm test` against a clean working tree before staging; block the commit if either fails. This is the interim instruction-layer defense until the pre-commit hook lands in a follow-up session. See `docs/audit/test-baseline-hardening-plan.md` for the full three-layer hardening plan and `docs/audit/commit-4ac95830-postmortem.md` for the trigger incident.
 
 ---
 
