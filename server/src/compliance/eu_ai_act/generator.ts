@@ -57,8 +57,15 @@ import {
   RISK_MANAGEMENT_SUMMARY_TEMPLATE,
   HUMAN_OVERSIGHT_STATEMENT_TEMPLATE,
   CRYPTOGRAPHIC_ATTESTATIONS_TEMPLATE,
+  ANNEX_III_CLASSIFICATION_TEMPLATE,
   type TemplateContext,
 } from "./templates/index.js";
+
+import {
+  classifyAgentDescription,
+  type ClassificationResult,
+  type ClassificationMatch,
+} from "./annex_iii.js";
 
 import type {
   ComplianceBundleInput,
@@ -460,6 +467,73 @@ function renderRiskManagement(
   );
 }
 
+/**
+ * Format a ClassificationResult's candidate list as a Markdown
+ * block for embedding in the Annex III classification document.
+ */
+function formatClassificationCandidates(
+  result: ClassificationResult
+): string {
+  if (result.candidates.length === 0) {
+    return (
+      "_No candidate category cleared the minimum rule-based " +
+      "confidence threshold. This does **not** mean the agent is " +
+      "out of scope of the EU AI Act — the deployer must still " +
+      "review Annex III in full._"
+    );
+  }
+  return result.candidates
+    .map((c: ClassificationMatch, i: number) => {
+      const confPct = (c.rule_based_confidence * 100).toFixed(0);
+      const kwList =
+        c.matched_keywords.length === 0
+          ? "_(none)_"
+          : c.matched_keywords.map((k) => `\`${k}\``).join(", ");
+      return [
+        `#### Candidate ${i + 1}: ${c.citation} — ${c.title}`,
+        "",
+        `- **Category ID:** \`${c.category_id}\``,
+        `- **rule_based_confidence:** ${c.rule_based_confidence.toFixed(2)} (${confPct}%)`,
+        `- **Matched keywords:** ${kwList}`,
+        "",
+      ].join("\n");
+    })
+    .join("\n");
+}
+
+function renderAnnexIIIClassification(
+  baseContext: TemplateContext,
+  intendedPurpose: string,
+  ds: DocSigner
+): BundleFile {
+  const classification = intendedPurpose
+    ? classifyAgentDescription(intendedPurpose)
+    : null;
+
+  const context: TemplateContext = {
+    ...baseContext,
+    classified_intended_purpose:
+      intendedPurpose ||
+      "_(no intended purpose supplied in deployment_context; the classifier was not run)_",
+    candidates_rendered: classification
+      ? formatClassificationCandidates(classification)
+      : "_(classifier not run — no intended purpose supplied)_",
+    classifier_advisory: classification
+      ? classification.advisory
+      : "The classifier was not invoked because the deployment_context.intended_purpose field was empty. The enterprise must perform manual Annex III review.",
+    document_title: "Annex III Classification Candidates",
+    document_subtitle:
+      "Rule-based candidate classifications for Annex III of Regulation (EU) 2024/1689",
+  };
+
+  return finaliseDocument(
+    ANNEX_III_CLASSIFICATION_TEMPLATE,
+    context,
+    "07_annex_iii_classification.md",
+    ds
+  );
+}
+
 function renderHumanOversight(
   baseContext: TemplateContext,
   ds: DocSigner
@@ -632,6 +706,17 @@ export async function generateEuAiActBundle(
   const doc4 = renderRiskManagement(baseContext, ds);
   const doc5 = renderHumanOversight(baseContext, ds);
 
+  // Doc 07 (Annex III classification) is rendered separately from
+  // doc 06 (attestations) because it is a content document; doc 06
+  // is the integrity attestation document and attests to docs 1-5.
+  // Doc 07 is attested via the manifest only (the manifest covers
+  // all 7 files with SHA-256 + Ed25519 signatures).
+  const doc7 = renderAnnexIIIClassification(
+    baseContext,
+    input.deployment_context.intended_purpose ?? "",
+    ds
+  );
+
   // Build a partial manifest with docs 1-5 (and a placeholder for
   // doc 6) so we can compute its canonical hash and signature for
   // inclusion in doc 6.
@@ -671,7 +756,7 @@ export async function generateEuAiActBundle(
     ds
   );
 
-  const allFiles = [doc1, doc2, doc3, doc4, doc5, doc6];
+  const allFiles = [doc1, doc2, doc3, doc4, doc5, doc6, doc7];
 
   // Final manifest covers all 6 files.
   const finalManifest = buildManifest(
@@ -699,6 +784,42 @@ export function createComplianceTools(deps: GeneratorDeps): {
   tools: ToolDefinition[];
 } {
   const tools: ToolDefinition[] = [
+    {
+      name: "compliance_eu_ai_act_annex_iii_classify",
+      description:
+        "Classify a free-text agent description against the eight " +
+        "Annex III high-risk categories of Regulation (EU) 2024/1689. " +
+        "Returns zero or more candidate categories with a " +
+        "rule_based_confidence score (sum of matched keyword weights " +
+        "clamped to [0, 1]). This is a RULE-BASED classifier — NOT " +
+        "a machine-learning model, and NOT legal advice. Use the " +
+        "result to narrow the deployer's review. Tier 3 (read-only, " +
+        "auto-allow).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          description: {
+            type: "string",
+            description:
+              "Free-text description of what the agent does — its " +
+              "intended purpose, the users it serves, the decisions " +
+              "it makes, the data it processes.",
+          },
+        },
+        required: ["description"],
+      },
+      handler: async (args) => {
+        const description = String(args.description ?? "");
+        if (description.trim().length === 0) {
+          return toolResult({
+            error:
+              "description must be a non-empty string describing the agent's intended purpose",
+          });
+        }
+        const result = classifyAgentDescription(description);
+        return toolResult(result);
+      },
+    },
     {
       name: "compliance_generate_eu_ai_act_bundle",
       description:

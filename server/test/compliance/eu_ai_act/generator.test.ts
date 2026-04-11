@@ -209,15 +209,16 @@ describe("generateEuAiActBundle", () => {
     ).rejects.toThrow(/primary identity/i);
   });
 
-  it("produces a bundle with exactly 6 Markdown documents and a manifest", async () => {
+  it("produces a bundle with exactly 7 Markdown documents and a manifest", async () => {
     const bundle = await generateEuAiActBundle(highRiskHRInput(), fx.deps);
-    expect(bundle.files.length).toBe(6);
+    expect(bundle.files.length).toBe(7);
     expect(bundle.files[0]!.filename).toBe("01_annex_iv_technical_documentation.md");
     expect(bundle.files[1]!.filename).toBe("02_article_26_deployer_log.md");
     expect(bundle.files[2]!.filename).toBe("03_article_12_automatic_logs.md");
     expect(bundle.files[3]!.filename).toBe("04_risk_management_summary.md");
     expect(bundle.files[4]!.filename).toBe("05_human_oversight_statement.md");
     expect(bundle.files[5]!.filename).toBe("06_cryptographic_attestations.md");
+    expect(bundle.files[6]!.filename).toBe("07_annex_iii_classification.md");
     for (const f of bundle.files) {
       expect(f.content_type).toBe("text/markdown");
     }
@@ -348,27 +349,53 @@ describe("generateEuAiActBundle", () => {
     expect(chatAnnex).not.toEqual(internalAnnex);
   });
 
-  it("minimal-risk bundle still produces all 6 documents", async () => {
+  it("minimal-risk bundle still produces all 7 documents", async () => {
     const bundle = await generateEuAiActBundle(
       minimalRiskInternalInput(),
       fx.deps
     );
-    expect(bundle.files.length).toBe(6);
+    expect(bundle.files.length).toBe(7);
+  });
+
+  it("Annex III classification document reports no candidates for out-of-scope agents", async () => {
+    const bundle = await generateEuAiActBundle(
+      minimalRiskInternalInput(),
+      fx.deps
+    );
+    const doc7 = bundle.files.find((f) =>
+      f.filename.includes("annex_iii_classification")
+    )!;
+    expect(doc7).toBeDefined();
+    // Minimal-risk internal tool has "developer productivity assistant"
+    // as intended_purpose which should not match any Annex III category
+    expect(doc7.content).toContain("No candidate category cleared");
+  });
+
+  it("Annex III classification document reports §4(a) for HR screening agent", async () => {
+    const bundle = await generateEuAiActBundle(highRiskHRInput(), fx.deps);
+    const doc7 = bundle.files.find((f) =>
+      f.filename.includes("annex_iii_classification")
+    )!;
+    expect(doc7.content).toContain("Annex III §4(a)");
+    expect(doc7.content).toContain("employment");
   });
 });
 
 describe("createComplianceTools MCP factory", () => {
-  it("registers exactly one tool named compliance_generate_eu_ai_act_bundle", async () => {
+  it("registers the bundle generator tool", async () => {
     const fx = await buildFixture();
     const { tools } = createComplianceTools(fx.deps);
-    expect(tools.length).toBe(1);
-    expect(tools[0]!.name).toBe("compliance_generate_eu_ai_act_bundle");
+    const names = tools.map((t) => t.name);
+    expect(names).toContain("compliance_generate_eu_ai_act_bundle");
   });
 
   it("tool handler returns a bundle summary on success", async () => {
     const fx = await buildFixture();
     const { tools } = createComplianceTools(fx.deps);
-    const result = await tools[0]!.handler(
+    const bundleTool = tools.find(
+      (t) => t.name === "compliance_generate_eu_ai_act_bundle"
+    )!;
+    const result = await bundleTool.handler(
       highRiskHRInput() as unknown as Record<string, unknown>
     );
     const parsed = JSON.parse(
@@ -379,7 +406,7 @@ describe("createComplianceTools MCP factory", () => {
       coverage_summary: { total_rows: number; full: number };
     };
     expect(parsed.bundle_version).toBe("1.0");
-    expect(parsed.file_count).toBe(6);
+    expect(parsed.file_count).toBe(7);
     expect(parsed.coverage_summary.total_rows).toBe(46);
     expect(parsed.coverage_summary.full).toBe(5);
   });
@@ -387,12 +414,61 @@ describe("createComplianceTools MCP factory", () => {
   it("tool input schema requires the 4 expected fields", async () => {
     const fx = await buildFixture();
     const { tools } = createComplianceTools(fx.deps);
-    const required = (tools[0]!.inputSchema as { required: string[] }).required;
+    const bundleTool = tools.find(
+      (t) => t.name === "compliance_generate_eu_ai_act_bundle"
+    )!;
+    const required = (bundleTool.inputSchema as { required: string[] }).required;
     expect(required).toEqual([
       "agent_did",
       "deployment_context",
       "period_start",
       "period_end",
     ]);
+  });
+
+  it("also registers compliance_eu_ai_act_annex_iii_classify", async () => {
+    const fx = await buildFixture();
+    const { tools } = createComplianceTools(fx.deps);
+    expect(tools.length).toBe(2);
+    const classifyTool = tools.find(
+      (t) => t.name === "compliance_eu_ai_act_annex_iii_classify"
+    );
+    expect(classifyTool).toBeDefined();
+  });
+
+  it("classify tool returns candidates for an HR-screening description", async () => {
+    const fx = await buildFixture();
+    const { tools } = createComplianceTools(fx.deps);
+    const classifyTool = tools.find(
+      (t) => t.name === "compliance_eu_ai_act_annex_iii_classify"
+    )!;
+    const result = await classifyTool.handler({
+      description:
+        "CV screening and candidate shortlisting for open positions, analyzes job applications and evaluates candidates before human review",
+    });
+    const parsed = JSON.parse(
+      (result.content[0] as { text: string }).text
+    ) as {
+      candidates: Array<{ category_id: string; rule_based_confidence: number }>;
+      advisory: string;
+    };
+    expect(parsed.candidates.length).toBeGreaterThan(0);
+    const topMatch = parsed.candidates[0]!;
+    expect(topMatch.category_id).toBe("annex_iii_4_a_employment_recruitment");
+    expect(topMatch.rule_based_confidence).toBeGreaterThan(0.8);
+    expect(parsed.advisory).toContain("NOT legal advice");
+  });
+
+  it("classify tool returns an error for empty description", async () => {
+    const fx = await buildFixture();
+    const { tools } = createComplianceTools(fx.deps);
+    const classifyTool = tools.find(
+      (t) => t.name === "compliance_eu_ai_act_annex_iii_classify"
+    )!;
+    const result = await classifyTool.handler({ description: "" });
+    const parsed = JSON.parse(
+      (result.content[0] as { text: string }).text
+    ) as { error?: string };
+    expect(parsed.error).toBeDefined();
   });
 });

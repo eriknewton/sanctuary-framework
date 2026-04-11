@@ -33,3 +33,4 @@ export { ARTICLE_12_AUTOMATIC_LOGS_TEMPLATE } from "./03_article_12_automatic_lo
 export { RISK_MANAGEMENT_SUMMARY_TEMPLATE } from "./04_risk_management_summary.js";
 export { HUMAN_OVERSIGHT_STATEMENT_TEMPLATE } from "./05_human_oversight_statement.js";
 export { CRYPTOGRAPHIC_ATTESTATIONS_TEMPLATE } from "./06_cryptographic_attestations.js";
+export { ANNEX_III_CLASSIFICATION_TEMPLATE } from "./07_annex_iii_classification.js";

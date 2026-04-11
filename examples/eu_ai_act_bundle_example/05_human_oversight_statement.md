@@ -61,7 +61,7 @@ interruption requires additional controls outside Sanctuary.
 | On timeout | **deny** (SEC-002: `auto_deny` removed — timeout always denies) |
 | Tier 1 rule count (always require approval) | 12 |
 | Tier 2 anomaly rules | new_namespace_access: `approve`, new_counterparty: `approve`, frequency_spike_multiplier: 5, first_session_policy: `approve` |
-| Tier 3 auto-allow tool count | 59 |
+| Tier 3 auto-allow tool count | 60 |
 | Baseline tracker state | `loaded` |
 
 The full Principal Policy is machine-readable via

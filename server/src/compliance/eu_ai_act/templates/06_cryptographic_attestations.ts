@@ -60,9 +60,18 @@ verification.
 
 ## Bundle File Attestations
 
-Each file in the bundle is listed below with its SHA-256 digest and
-Ed25519 signature. Recompute the SHA-256 of any file and verify
-the signature to confirm integrity.
+Each file in the bundle rendered **before** this attestations
+document is listed below with its SHA-256 digest and Ed25519
+signature. Recompute the SHA-256 of any file and verify the
+signature to confirm integrity.
+
+**The complete signed bundle — including this attestations document
+and any content documents that follow it (such as
+\`07_annex_iii_classification.md\` if the bundle was generated with an
+intended purpose) — is authoritatively indexed in
+\`00_bundle_manifest.json\` with SHA-256 and Ed25519 signatures for
+every file.** Verification against the manifest is the canonical
+integrity check; the table below is a human-readable companion.
 
 {{ file_attestation_table }}
 

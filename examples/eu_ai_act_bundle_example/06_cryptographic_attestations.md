@@ -65,17 +65,26 @@ verification.
 
 ## Bundle File Attestations
 
-Each file in the bundle is listed below with its SHA-256 digest and
-Ed25519 signature. Recompute the SHA-256 of any file and verify
-the signature to confirm integrity.
+Each file in the bundle rendered **before** this attestations
+document is listed below with its SHA-256 digest and Ed25519
+signature. Recompute the SHA-256 of any file and verify the
+signature to confirm integrity.
+
+**The complete signed bundle — including this attestations document
+and any content documents that follow it (such as
+`07_annex_iii_classification.md` if the bundle was generated with an
+intended purpose) — is authoritatively indexed in
+`00_bundle_manifest.json` with SHA-256 and Ed25519 signatures for
+every file.** Verification against the manifest is the canonical
+integrity check; the table below is a human-readable companion.
 
 | Filename | SHA-256 | Signature (base64url) |
 |---|---|---|
 | `01_annex_iv_technical_documentation.md` | `ec9b143a9170b8db77b02057068e82a4e853e98f887ccea1aa6a8836c1ad1a78` | `4b2mkQ4oIaZXzIWCi_eEukZgMYL0TMhe45626eS6xkJl_exi6WoVBrABKuHodPl1wG8I9qFbBtC203lSUpDQCg` |
 | `02_article_26_deployer_log.md` | `7b1a7749d8191824d80b7dd8994eaeb2771be02691613ebceb6e480b0f1f6876` | `I4gewvcHCxl0RfiBpDJvsNR5hCohpKAhFL9NLIgBxiRGWGaJuzxEsgXI0PJ52vEofNnbJG1w8D0Y6npG9wy7Ag` |
 | `03_article_12_automatic_logs.md` | `c021b50063f9ce6be84a948318abb319f2a05d7ac89f215393e7780e2156d505` | `M50xnj1rdc_1v811eJ083WkQIqLSxie9hs95XoDLUIUNazj5ILHwx__2ax5yngaO_R0ucyMtMWdSRIdD6-x4CA` |
-| `04_risk_management_summary.md` | `1166ece84cdcc3f97557a14d63fe58b896d5c1693113f314a26bcdf98521a7a7` | `cgpksI4K4fcWU2DVDaeFMtZvZPZKCoB_T4DfDorCwhyiPX-F71DjKCeo7nttQasG4WM5PCqvFFjr4xxPmft3Bg` |
-| `05_human_oversight_statement.md` | `2edf8d3d924239c573e49b0f5b3353c286105edbbb5be22fd17fd04f73937e4f` | `RlSapH4qfNdWTJfoccB2mJn1vaofepLpp-FRwSBNAQuZgEXkZXrqi6ip3byOGk4utdNirlqE4RGwc3nS05p8Dg` |
+| `04_risk_management_summary.md` | `1923986a68b4a8bdf5e4869cbdc28b6f29b5f5b58814ab52ff112a5bd3cc7eec` | `xzQ-iSB1YEjaGm_TGuEOuQRsJ9zeKvwomU0pcc4fHz8BUIpcZCK7FIy8y9BnYD5tEnVvdXrzNShIhvbS4TJ5Aw` |
+| `05_human_oversight_statement.md` | `38268828171d6be992733e739fc2a208aabba2d203950e181a5786cbbf200c28` | `_vYx7a8tNNGWuY_20dbZz_3IpxSukyk4_r9ogw-YzsPkvy7ww4NRvBh7plsN8artuJGTtq07K6849nLpNUkbCg` |
 
 ---
 
@@ -88,8 +97,8 @@ authenticity of the entire bundle in one check.
 
 | Field | Value |
 |---|---|
-| Manifest SHA-256 | `d2186f9e6b7207249355ac0dd6560c3aefb1fb1c3aa1928dc6be16d5579371db` |
-| Manifest signature (base64url) | `6K74O69SCW8y-9V6dWvWqjhGddeFQDZ7FLFzUIPNHqmbgjH7q1_zLQrpV_8yJDmxvmm_0JYwFqoRMSsc1KOqDA` |
+| Manifest SHA-256 | `ca2a73e79938faea975c55d92669391a1e553e2a201f24c346f5791c48524847` |
+| Manifest signature (base64url) | `3xlmx03KdUR0pCUHMYN5AErj1X6VkOciQp-MHSRBXLlVuORzPDVJ09-lVr1ie_FH65G5DA9_POZ6CgIUk92nAw` |
 | Canonicalisation | Sorted keys, no whitespace (JSON canonical form) |
 
 ---

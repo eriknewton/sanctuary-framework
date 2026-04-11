@@ -110,6 +110,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "identity_set_primary", // One-time set, persists via _meta storage — safe at Tier 3
     "memory_attest", // Read-only audit attestation — records that a memory op happened
     "compliance_generate_eu_ai_act_bundle", // Read-only; emits signed compliance documents from existing state
+    "compliance_eu_ai_act_annex_iii_classify", // Read-only; rule-based Annex III classifier
   ],
   approval_channel: DEFAULT_CHANNEL,
 };
@@ -343,6 +344,7 @@ tier3_always_allow:
   - sanctuary_policy_status
   - memory_attest
   - compliance_generate_eu_ai_act_bundle
+  - compliance_eu_ai_act_annex_iii_classify
 # ─── Approval Channel ────────────────────────────────────────────────────
 # How Sanctuary reaches you when approval is needed.
 # NOTE: Timeout always results in denial. This is not configurable (SEC-002).

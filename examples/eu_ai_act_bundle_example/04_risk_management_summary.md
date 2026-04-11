@@ -61,7 +61,7 @@ Policy:
   defined. Baseline tracker at `principal_baseline_view` monitors
   new namespaces, new counterparties, and frequency spikes. First-
   session policy: `approve`.
-- **Tier 3 — Auto-allow with audit logging:** 59
+- **Tier 3 — Auto-allow with audit logging:** 60
   tools listed. These are read-only or low-risk operations that
   proceed without approval but are still captured in the audit log.
 
