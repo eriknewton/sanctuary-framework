@@ -46,6 +46,7 @@ import {
   generateEuAiActBundle,
   type GeneratorDeps,
 } from "../../../src/compliance/eu_ai_act/generator.js";
+import { renderBundleToPdf } from "../../../src/compliance/eu_ai_act/pdf.js";
 import type { ComplianceBundleInput } from "../../../src/compliance/eu_ai_act/types.js";
 
 // Deterministic seed material: the example bundle should produce
@@ -252,6 +253,12 @@ describe("EU AI Act example bundle generator", () => {
           "utf-8"
         );
       }
+
+      // Also write the hand-rolled PDF render alongside the
+      // Markdown bundle so the committed example includes a visual
+      // reference of what `--pdf` produces.
+      const pdfBytes = renderBundleToPdf(bundle);
+      await writeFile(join(outputDir, "bundle.pdf"), pdfBytes);
 
       // Write a README explaining what the example is.
       const readme = `# EU AI Act Compliance Bundle — Example

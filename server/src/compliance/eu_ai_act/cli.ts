@@ -33,6 +33,7 @@ import { join } from "node:path";
 import { createSanctuaryServer } from "../../index.js";
 import { generateEuAiActBundle } from "./generator.js";
 import { countManualInputMarkers } from "./templates/render.js";
+import { renderBundleToPdf } from "./pdf.js";
 import type {
   ComplianceBundleInput,
   DeploymentContext,
@@ -52,6 +53,7 @@ interface ComplianceCliOptions {
   deltaFrom?: string;
   publishToVerascore?: boolean;
   verascoreUrl?: string;
+  pdf?: boolean;
 }
 
 function parseArgs(args: string[]): ComplianceCliOptions {
@@ -138,6 +140,9 @@ function parseArgs(args: string[]): ComplianceCliOptions {
         opts.verascoreUrl = next;
         i++;
         break;
+      case "--pdf":
+        opts.pdf = true;
+        break;
       default:
         throw new Error(`Unknown flag: "${flag}"`);
     }
@@ -175,6 +180,12 @@ FLAGS
   --verascore-url <url>    Override the Verascore base URL (HTTPS, must
                            point to an allow-listed Verascore host).
                            Defaults to https://verascore.ai.
+  --pdf                    Also render the Markdown bundle to a single
+                           PDF file (bundle.pdf) in the output directory.
+                           Hand-rolled minimal PDF writer, zero new
+                           dependencies. NOT cryptographically signed;
+                           integrity verification remains with the
+                           Markdown files and 00_bundle_manifest.json.
   --help                   Print this help text
 
 OUTPUT
@@ -291,6 +302,16 @@ export async function runCompliance(args: string[]): Promise<void> {
     totalManualMarkers += countManualInputMarkers(file.content);
   }
 
+  // Optional PDF render (Phase 2 Deliverable 4). Hand-rolled minimal
+  // PDF writer — zero new dependencies. Renders the full bundle to
+  // a single PDF with cover page + per-document pages.
+  let pdfPath: string | undefined;
+  if (opts.pdf) {
+    pdfPath = join(outputDir, "bundle.pdf");
+    const pdfBytes = renderBundleToPdf(bundle);
+    await writeFile(pdfPath, pdfBytes);
+  }
+
   // Print summary to stderr so downstream pipelines can capture the
   // output directory path from stdout if desired.
   console.error("");
@@ -337,6 +358,11 @@ export async function runCompliance(args: string[]): Promise<void> {
     "  Review each marker and replace with the relevant enterprise fact."
   );
   console.error("");
+  if (pdfPath) {
+    console.error("");
+    console.error(`  PDF render:       ${pdfPath}`);
+  }
+
   if (bundle.publish_result) {
     console.error("");
     console.error("  Verascore publish:");
