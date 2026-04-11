@@ -73,6 +73,14 @@ export interface ComplianceBundleInput {
   period_start: string;
   /** ISO timestamp — end of reporting period. */
   period_end: string;
+  /**
+   * Optional override for the `generated_at` timestamp. Normally
+   * omitted, in which case the generator uses `new Date().toISOString()`.
+   * Used by example-bundle fixtures to produce byte-stable output
+   * across regenerations. Tests and production callers should not
+   * set this.
+   */
+  generated_at_override?: string;
 }
 
 // ── Bundle output ────────────────────────────────────────────────────

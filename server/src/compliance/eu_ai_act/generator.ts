@@ -614,7 +614,7 @@ export async function generateEuAiActBundle(
     input.period_end
   );
 
-  const generatedAt = new Date().toISOString();
+  const generatedAt = input.generated_at_override ?? new Date().toISOString();
 
   // Build the shared template context.
   const baseContext = buildCommonContext(

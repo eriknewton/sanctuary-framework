@@ -15,6 +15,8 @@ import { AuditLog } from "./l2-operational/audit-log.js";
 import { createL3Tools } from "./l3-disclosure/tools.js";
 import { createL4Tools } from "./l4-reputation/tools.js";
 import { loadPrincipalPolicy } from "./principal-policy/loader.js";
+import type { IdentityManager } from "./l1-cognitive/tools.js";
+import type { PrincipalPolicy } from "./principal-policy/types.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
 import { StderrApprovalChannel } from "./principal-policy/approval-channel.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
@@ -50,6 +52,16 @@ import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 export interface SanctuaryServer {
   server: Server;
   config: SanctuaryConfig;
+  /**
+   * Runtime dependencies exposed for embedding callers that need
+   * direct access to the Sanctuary substrate (e.g., the EU AI Act
+   * compliance CLI subcommand). Most callers only use `server` and
+   * `config`; these are optional-usage extras.
+   */
+  identityManager: IdentityManager;
+  masterKey: Uint8Array;
+  auditLog: AuditLog;
+  policy: PrincipalPolicy;
 }
 
 /**
@@ -829,7 +841,14 @@ export async function createSanctuaryServer(options?: {
     );
   }
 
-  return { server, config };
+  return {
+    server,
+    config,
+    identityManager,
+    masterKey,
+    auditLog,
+    policy,
+  };
 }
 
 export { loadConfig, type SanctuaryConfig } from "./config.js";

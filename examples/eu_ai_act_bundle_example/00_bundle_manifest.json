@@ -1,0 +1,472 @@
+{
+  "bundle_version": "1.0",
+  "matrix_version": "v1",
+  "regulation_version": "EU AI Act Regulation (EU) 2024/1689, as of 2026-04-10",
+  "generated_at": "2026-04-10T12:00:00.000Z",
+  "agent_did": "did:sanctuary:meridian-hr-screening-agent",
+  "period_start": "2026-04-01T00:00:00.000Z",
+  "period_end": "2026-04-30T23:59:59.999Z",
+  "deployment_context": {
+    "vertical": "human_resources",
+    "annex_iii_class": "§4 employment, workers management, self-employment",
+    "intended_purpose": "Automated CV screening and candidate shortlisting for open requisitions",
+    "provider_legal_name": "Meridian Financial Holdings, Inc.",
+    "provider_contact": "ai-compliance@meridian.example.com",
+    "deployer_is_public_authority": false,
+    "notes": "Fictional Fortune 2000 example deployment for illustration only. All names, DIDs, and business facts are invented."
+  },
+  "signer": {
+    "did": "did:key:z7QHBxxcLqomx211xvujOFroz7D5f8ytJN5MwIUimnwDVtA",
+    "public_key_base64url": "wccXC6qJsdtdcb7ozha6M-w-X_MrSTeTMCFIpp8A1bQ"
+  },
+  "files": [
+    {
+      "filename": "01_annex_iv_technical_documentation.md",
+      "content_type": "text/markdown",
+      "sha256": "300a30ec0e61aa4f751392888aa74c49955c1d45a337bb9e783288ee2ff151e4",
+      "signature": "hV5nmT4Cn76hJKvHPKW0ZQJYExWgvevZP8PuFaouPPO8XK2NbK5p9zfOKuoifW3z3T_QLV8iBbC3PQ24J2NpAw"
+    },
+    {
+      "filename": "02_article_26_deployer_log.md",
+      "content_type": "text/markdown",
+      "sha256": "a6edecd066a4defb369047ff71817e52aeae9cfadd301b7e7c37ddbd2ba571d4",
+      "signature": "2W_Dm5x7rF2KM26Ci7KpxubahZf2Z0T200KM9XFLoJdGD4AZJtANtbj3f2zyWm60ez3gbovM-ByB6XyI_I0QAg"
+    },
+    {
+      "filename": "03_article_12_automatic_logs.md",
+      "content_type": "text/markdown",
+      "sha256": "0e02428818c6d9da90e8affa747e75a3bf4a7d23245c93c7e5a674fbff3ae435",
+      "signature": "CYxi__K8QTrHUvv_x7a24lA4RkTuRPNQWYoLseEzmSjsIw0-iF8LsSZKGCRYFFRo7kaX6bAs842tsRYzgifWDg"
+    },
+    {
+      "filename": "04_risk_management_summary.md",
+      "content_type": "text/markdown",
+      "sha256": "6b1fe36f65f86841f3756f308701994eb0a2526e9504cd3570bc23c3d2a2296b",
+      "signature": "RsLWHMDBYUXyQ4Dzbe2GxnmOHdEk6S6qDScsSJTNrpNDQr-VNHTkxFtXcF5sOGHhvc4ahTKsgudBGoMFePd-BQ"
+    },
+    {
+      "filename": "05_human_oversight_statement.md",
+      "content_type": "text/markdown",
+      "sha256": "99bd4981a1d22cedf0bcc2e8db0ea41a0d70c51a8fdfdf430e15a3cf68616837",
+      "signature": "cu-wNWPfi_9uIkBQTJI2zN0h3VSHLHkt9qFO4_hheacG_MXl9kAPdhE2a-E-DXj6JdjGKrEDmbEClcXrzmnqAg"
+    },
+    {
+      "filename": "06_cryptographic_attestations.md",
+      "content_type": "text/markdown",
+      "sha256": "90473c347949319849c7f3c219a042cbb2bd39136b830a196219a2a76fecf7f6",
+      "signature": "mmi0pYyvYRvjmi1viyN_fXut0NHzJJZaYE32fT_L2MDlR0ZjrFWbRMW3GqHA1tfW6yxzfFNeQG7mF1mahDNNAw"
+    }
+  ],
+  "coverage_summary": {
+    "total_rows": 46,
+    "full": 5,
+    "partial": 24,
+    "manual_only": 17,
+    "full_pct": 11,
+    "partial_pct": 52,
+    "manual_only_pct": 37
+  },
+  "coverage_rows": [
+    {
+      "id": "annex_iv_1_a_general_description",
+      "clause_id": "annex-iv-1-a",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "identity_list",
+        "identity_set_primary",
+        "manifest",
+        "shr_generate"
+      ]
+    },
+    {
+      "id": "annex_iv_1_b_hardware_software_interaction",
+      "clause_id": "annex-iv-1-b",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "shr_generate",
+        "manifest",
+        "context_gate_list_policies"
+      ]
+    },
+    {
+      "id": "annex_iv_1_c_software_versions",
+      "clause_id": "annex-iv-1-c",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "manifest",
+        "shr_generate",
+        "monitor_health"
+      ]
+    },
+    {
+      "id": "annex_iv_1_d_forms_on_market",
+      "clause_id": "annex-iv-1-d",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "annex_iv_1_e_hardware_description",
+      "clause_id": "annex-iv-1-e",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "exec_attest",
+        "monitor_health",
+        "sovereignty_audit"
+      ]
+    },
+    {
+      "id": "annex_iv_1_f_instructions_of_use",
+      "clause_id": "annex-iv-1-f",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "annex_iv_2_a_development_methods",
+      "clause_id": "annex-iv-2-a",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "annex_iv_2_b_design_specifications",
+      "clause_id": "annex-iv-2-b",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "principal_policy_view",
+        "context_gate_list_policies",
+        "sovereignty_profile_get",
+        "manifest"
+      ]
+    },
+    {
+      "id": "annex_iv_2_c_system_architecture",
+      "clause_id": "annex-iv-2-c",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "shr_generate",
+        "manifest",
+        "sovereignty_audit",
+        "federation_status"
+      ]
+    },
+    {
+      "id": "annex_iv_2_d_data_requirements",
+      "clause_id": "annex-iv-2-d",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "annex_iv_2_e_human_oversight_assessment",
+      "clause_id": "annex-iv-2-e",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "principal_policy_view",
+        "sovereignty_audit",
+        "shr_generate",
+        "principal_baseline_view"
+      ]
+    },
+    {
+      "id": "annex_iv_2_f_predetermined_changes",
+      "clause_id": "annex-iv-2-f",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "annex_iv_2_g_validation_and_testing",
+      "clause_id": "annex-iv-2-g",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "monitor_audit_log",
+        "audit_export_siem",
+        "sovereignty_audit"
+      ]
+    },
+    {
+      "id": "annex_iv_2_h_cybersecurity",
+      "clause_id": "annex-iv-2-h",
+      "coverage": "full",
+      "evidence_emitter": [
+        "sovereignty_audit",
+        "shr_generate",
+        "manifest",
+        "principal_policy_view",
+        "context_gate_list_policies",
+        "context_gate_enforcer_status",
+        "exec_attest"
+      ]
+    },
+    {
+      "id": "annex_iv_3_monitoring_functioning_control",
+      "clause_id": "annex-iv-3",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "monitor_audit_log",
+        "audit_export_siem",
+        "monitor_health",
+        "context_gate_enforcer_status",
+        "principal_baseline_view"
+      ]
+    },
+    {
+      "id": "annex_iv_4_performance_metrics",
+      "clause_id": "annex-iv-4",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "annex_iv_5_risk_management",
+      "clause_id": "annex-iv-5",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "principal_policy_view",
+        "principal_baseline_view",
+        "sovereignty_audit",
+        "context_gate_list_policies"
+      ]
+    },
+    {
+      "id": "annex_iv_6_lifecycle_changes",
+      "clause_id": "annex-iv-6",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "monitor_audit_log",
+        "audit_export_siem",
+        "identity_list"
+      ]
+    },
+    {
+      "id": "annex_iv_7_standards_applied",
+      "clause_id": "annex-iv-7",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "annex_iv_8_eu_declaration_of_conformity",
+      "clause_id": "annex-iv-8",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "annex_iv_9_post_market_monitoring_plan",
+      "clause_id": "annex-iv-9",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "art_12_automatic_logging",
+      "clause_id": "art-12-1",
+      "coverage": "full",
+      "evidence_emitter": [
+        "monitor_audit_log",
+        "audit_export_siem"
+      ]
+    },
+    {
+      "id": "art_12_post_market_monitoring_support",
+      "clause_id": "art-12-2-a",
+      "coverage": "full",
+      "evidence_emitter": [
+        "audit_export_siem",
+        "monitor_audit_log"
+      ]
+    },
+    {
+      "id": "art_12_risk_management_support",
+      "clause_id": "art-12-2-b",
+      "coverage": "full",
+      "evidence_emitter": [
+        "monitor_audit_log",
+        "audit_export_siem",
+        "principal_baseline_view"
+      ]
+    },
+    {
+      "id": "art_12_log_content",
+      "clause_id": "art-12-3",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "monitor_audit_log",
+        "audit_export_siem",
+        "identity_list"
+      ]
+    },
+    {
+      "id": "art_12_retention",
+      "clause_id": "art-19-1",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "monitor_audit_log",
+        "audit_export_siem"
+      ]
+    },
+    {
+      "id": "art_13_3_a_provider_identity",
+      "clause_id": "art-13-3-a",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "identity_list",
+        "identity_set_primary",
+        "shr_generate"
+      ]
+    },
+    {
+      "id": "art_13_3_b_ii_capabilities_and_limitations",
+      "clause_id": "art-13-3-b-ii",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "shr_generate",
+        "manifest",
+        "sovereignty_audit"
+      ]
+    },
+    {
+      "id": "art_13_3_b_iv_output_interpretation",
+      "clause_id": "art-13-3-b-iv",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "shr_generate",
+        "monitor_audit_log",
+        "audit_export_siem",
+        "bridge_verify"
+      ]
+    },
+    {
+      "id": "art_14_interpret_outputs",
+      "clause_id": "art-14-4-a-c",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "shr_generate",
+        "principal_policy_view",
+        "manifest"
+      ]
+    },
+    {
+      "id": "art_14_intervene_interrupt",
+      "clause_id": "art-14-4-e",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "principal_policy_view",
+        "sovereignty_audit"
+      ]
+    },
+    {
+      "id": "art_14_decide_not_to_use",
+      "clause_id": "art-14-4-d",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "principal_policy_view"
+      ]
+    },
+    {
+      "id": "art_14_operator_training",
+      "clause_id": "art-14-4-chapeau",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "art_15_cybersecurity_appropriate",
+      "clause_id": "art-15-5",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "sovereignty_audit",
+        "shr_generate",
+        "principal_policy_view",
+        "context_gate_list_policies"
+      ]
+    },
+    {
+      "id": "art_15_resilience_alteration",
+      "clause_id": "art-15-5-resilience",
+      "coverage": "full",
+      "evidence_emitter": [
+        "sovereignty_audit",
+        "shr_generate",
+        "monitor_health",
+        "state_list",
+        "principal_policy_view",
+        "context_gate_enforcer_status"
+      ]
+    },
+    {
+      "id": "art_15_resilience_poisoning",
+      "clause_id": "art-15-5-poisoning",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "monitor_audit_log",
+        "audit_export_siem"
+      ]
+    },
+    {
+      "id": "art_15_accuracy_metrics",
+      "clause_id": "art-15-3",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "art_15_redundancy_failsafe",
+      "clause_id": "art-15-4",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "art_26_per_instructions",
+      "clause_id": "art-26-1",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "art_26_human_oversight_assigned",
+      "clause_id": "art-26-2",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "principal_policy_view"
+      ]
+    },
+    {
+      "id": "art_26_input_data_relevance",
+      "clause_id": "art-26-4",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "art_26_monitor_and_inform",
+      "clause_id": "art-26-5",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "monitor_audit_log",
+        "audit_export_siem",
+        "monitor_health",
+        "principal_baseline_view"
+      ]
+    },
+    {
+      "id": "art_26_retain_logs",
+      "clause_id": "art-26-6",
+      "coverage": "partial",
+      "evidence_emitter": [
+        "monitor_audit_log",
+        "audit_export_siem"
+      ]
+    },
+    {
+      "id": "art_26_workers_representatives",
+      "clause_id": "art-26-7",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "art_26_dpia",
+      "clause_id": "art-26-9",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    },
+    {
+      "id": "art_26_eu_database_registration",
+      "clause_id": "art-26-8",
+      "coverage": "manual_only",
+      "evidence_emitter": []
+    }
+  ],
+  "disclaimer": "This bundle is a technical compliance artifact generated by the Sanctuary Framework EU AI Act Compliance Artifact Generator. It is NOT legal advice and does not constitute a legal interpretation of Regulation (EU) 2024/1689. Consult qualified legal counsel before filing or relying on this bundle for regulatory submissions.",
+  "manifest_signature": "wrkgtXYm0FzgXP3sFtizBV3rEQLZYXBn7_JWMw9m0zwOc81b7j8OHUhn6g3Xjbz0VlVk9Mcpnd-QwiYHanMZCQ"
+}

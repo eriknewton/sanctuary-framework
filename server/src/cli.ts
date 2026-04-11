@@ -39,6 +39,14 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "compliance") {
+    const { runCompliance } = await import(
+      "./compliance/eu_ai_act/cli.js"
+    );
+    await runCompliance(args.slice(1));
+    return;
+  }
+
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dashboard") {
       process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
