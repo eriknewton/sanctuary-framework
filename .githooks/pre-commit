@@ -128,34 +128,72 @@ if [[ -z "$expected_files" || "$expected_files" == "0" ]]; then
   exit 1
 fi
 
-# Run the test suite and capture output. Use `|| true` so we can
-# distinguish "tests failed" from "subshell exited non-zero" — vitest
-# exits non-zero on failures, which we want to detect and report, but
-# we also need the output for transform-error parsing even if vitest
-# exits zero.
-test_output=$(cd server && npm test 2>&1 || true)
+# Run the test suite and capture BOTH output and exit code. Using
+# `set +e` around the assignment means the subshell's non-zero exit
+# does not abort this hook under `set -e` — we want to inspect the
+# captured output to classify the failure before deciding how to
+# report it.
+set +e
+test_output=$(cd server && npm test 2>&1)
+test_exit=$?
+set -e
 
-# ── Check 2a: transform / collection error substrings ──────────────
+# ── Check 2a: transform / collection failure classification ────────
 #
-# The 2026-04-10 incident was detected by substring matching on
-# vitest's error output. These patterns cover:
+# The 2026-04-10 incident (commit 4ac95830) was a parse error at
+# vitest's transform step that caused test files to drop silently.
+# The PRIMARY signal is vitest's exit code — if `npm test` returns
+# non-zero, the commit MUST be blocked regardless of any substring
+# parsing. The substring match then runs as a classifier to decide
+# whether to name the error as the specific 4ac95830 failure class
+# or as a generic test failure.
 #
-#   "transform error"            — vitest transform step failure
+# Patterns covered (case-insensitive):
+#
+#   "transform failed"           — vite:esbuild plugin message
+#                                  (e.g. "Transform failed with 1 error")
+#   "transform error"            — alternate vitest transform message
 #   "failed to parse"            — esbuild / swc parse error
 #   "failed to collect"          — vitest collection failure
 #   "failed to load source"      — vitest source-loading failure
 #   "cannot find module"         — missing import or dependency
+#   "Failed Suites"              — vitest summary header for
+#                                  suite-level failures (shown when
+#                                  a test file fails to register)
 #
-# Any occurrence triggers an immediate block, regardless of
-# passing-test count.
-if echo "$test_output" | grep -Eqi "(transform error|failed to parse|failed to collect|failed to load source|cannot find module)"; then
-  fail "TRANSFORM/COLLECTION ERROR DETECTED — commit blocked"
+# Any match in combination with non-zero exit classifies the failure
+# as a transform/collection error and points the reader at the
+# 4ac95830 postmortem. A non-zero exit WITHOUT a matching substring
+# is a generic test failure and is blocked with a simpler message.
+TRANSFORM_ERROR_PATTERNS='(transform failed|transform error|failed to parse|failed to collect|failed to load source|cannot find module|failed suites)'
+
+if (( test_exit != 0 )); then
+  if echo "$test_output" | grep -Eqi "$TRANSFORM_ERROR_PATTERNS"; then
+    fail "TRANSFORM/COLLECTION ERROR DETECTED — commit blocked"
+    printf '\n' >&2
+    echo "$test_output" | grep -Ei "$TRANSFORM_ERROR_PATTERNS" | head -20 >&2
+    printf '\n' >&2
+    fail "This is the specific failure class from commit 4ac95830:"
+    printf '[baseline-guard]   a parse/transform error causing test files to fail at\n' >&2
+    printf '[baseline-guard]   vitest collection time. See\n' >&2
+    printf '[baseline-guard]   docs/audit/commit-4ac95830-postmortem.md\n' >&2
+    exit 1
+  fi
+  fail "TEST SUITE FAILED (exit code $test_exit) — commit blocked"
   printf '\n' >&2
-  echo "$test_output" | grep -Ei "(transform error|failed to parse|failed to collect|failed to load|cannot find module)" | head -20 >&2
+  echo "$test_output" | tail -40 >&2
+  exit 1
+fi
+
+# Exit code was zero, but ALSO scan for transform-error substrings
+# as defense-in-depth. In theory a vitest version could report the
+# error without failing the run (unlikely but worth the extra line).
+if echo "$test_output" | grep -Eqi "$TRANSFORM_ERROR_PATTERNS"; then
+  fail "TRANSFORM/COLLECTION ERROR DETECTED (despite zero exit) — commit blocked"
   printf '\n' >&2
-  fail "This is the specific failure class from commit 4ac95830:"
-  printf '[baseline-guard]   a parse/transform error causing test files to silently\n' >&2
-  printf '[baseline-guard]   drop from the suite before vitest reports them.\n' >&2
+  echo "$test_output" | grep -Ei "$TRANSFORM_ERROR_PATTERNS" | head -20 >&2
+  printf '\n' >&2
+  fail "This is the specific failure class from commit 4ac95830."
   printf '[baseline-guard]   See docs/audit/commit-4ac95830-postmortem.md\n' >&2
   exit 1
 fi

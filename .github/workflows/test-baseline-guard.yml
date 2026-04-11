@@ -91,9 +91,29 @@ jobs:
 
       - name: Gate 2a — transform/collection error detection
         run: |
-          if grep -Eqi "(transform error|failed to parse|failed to collect|failed to load source|cannot find module)" /tmp/vitest-output.log; then
+          # Patterns match the vitest / vite:esbuild failure signatures
+          # for the commit 4ac95830 class. Case-insensitive.
+          #
+          #   "transform failed"      — vite:esbuild plugin
+          #                             ("Transform failed with N error")
+          #   "transform error"       — alternate vitest message
+          #   "failed to parse"       — esbuild / swc
+          #   "failed to collect"     — vitest collection failure
+          #   "failed to load source" — vitest source load
+          #   "cannot find module"    — missing import
+          #   "Failed Suites"         — vitest summary header for
+          #                             suite-level failures
+          #
+          # Note: if `npm test` already exited non-zero in the previous
+          # step, this step would not run (steps short-circuit on
+          # failure), so reaching this step means vitest exited zero.
+          # Still, we run this as defense-in-depth in case a future
+          # vitest version emits a transform error without failing
+          # the run.
+          PATTERNS='(transform failed|transform error|failed to parse|failed to collect|failed to load source|cannot find module|failed suites)'
+          if grep -Eqi "$PATTERNS" /tmp/vitest-output.log; then
             echo "::error::Transform/collection error detected in vitest output. This is the specific failure class from commit 4ac95830 (see docs/audit/commit-4ac95830-postmortem.md)."
-            grep -Ei "(transform error|failed to parse|failed to collect|failed to load|cannot find module)" /tmp/vitest-output.log | head -20
+            grep -Ei "$PATTERNS" /tmp/vitest-output.log | head -20
             exit 1
           fi
           echo "✓ No transform/collection errors detected."
