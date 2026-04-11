@@ -49,19 +49,17 @@ export const FOOTER_TEMPLATE = `
 ## Document Signature
 
 This document is cryptographically signed by the provider's primary
-Ed25519 identity. The signature covers the SHA-256 digest of the
-document content bytes.
+Ed25519 identity (DID \`{{ signer_did }}\`, public key
+\`{{ signer_pubkey }}\`). The signature for this document is recorded
+in the bundle manifest \`00_bundle_manifest.json\` under the entry
+with this filename, alongside its SHA-256 digest.
 
-| Field | Value |
-|---|---|
-| **Document SHA-256** | \`{{ doc_sha256 }}\` |
-| **Signer DID** | \`{{ signer_did }}\` |
-| **Signer public key** | \`{{ signer_pubkey }}\` |
-| **Signature (base64url)** | \`{{ doc_signature }}\` |
-
-Verification: recompute the SHA-256 of this document's content bytes
-and verify the signature against the signer's public key using
-Ed25519.
+**Verification procedure:** compute the SHA-256 of this file's raw
+byte content, compare it against the \`sha256\` field for this file
+in the bundle manifest, then verify the \`signature\` field against
+the SHA-256 using the signer's public key with Ed25519. A successful
+check proves this document was emitted by the named Sanctuary
+instance and has not been altered since generation.
 
 ---
 

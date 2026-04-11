@@ -16,8 +16,21 @@
 
 import { sign } from "../../core/identity.js";
 import { derivePurposeKey } from "../../core/key-derivation.js";
-import { hash, hashToString } from "../../core/hashing.js";
+import { hash } from "../../core/hashing.js";
 import { toBase64url, stringToBytes } from "../../core/encoding.js";
+
+/**
+ * Encode a byte array as a lowercase hexadecimal string. Used for
+ * the bundle manifest and file attestation table so auditors can
+ * verify with standard CLI tools like `sha256sum`.
+ */
+function bytesToHex(bytes: Uint8Array): string {
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i]!.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
 import type { SanctuaryConfig } from "../../config.js";
 import type { IdentityManager } from "../../l1-cognitive/tools.js";
 import type { AuditLog, AuditEntry } from "../../l2-operational/audit-log.js";
@@ -304,27 +317,20 @@ function makeSigner(
       const sig = sign(digest, signer.encrypted_private_key, encryptionKey);
       return toBase64url(sig);
     },
-    sha256Hex: (content: string) =>
-      hashToString(stringToBytes(content)),
+    sha256Hex: (content: string) => bytesToHex(hash(stringToBytes(content))),
   };
 }
 
 /**
- * Finalise a document: render its template twice — once without the
- * signature block (to compute the hash) and once with the signature
- * block filled in. The document's own signature covers the content
- * bytes of the first render pass (without the signature block), so
- * the signer can sign the content it actually authenticates.
+ * Finalise a document: render the template once, hash the rendered
+ * bytes with SHA-256, and sign the hash with the provider's primary
+ * Ed25519 identity. The document body itself does not contain the
+ * hash or signature — those live only in the bundle manifest and in
+ * the returned BundleFile.sha256 / BundleFile.signature fields.
  *
- * Implementation note: our template keeps the signature in the
- * footer. The footer template references {{ doc_sha256 }} and
- * {{ doc_signature }} which are filled by the second pass. For the
- * hash to be meaningful, we compute it over the rendered body with
- * placeholder values stripped. In practice, we render once with
- * empty signature fields, hash that, sign the hash, then do a final
- * render with the signature fields populated. The signature covers
- * the "empty-signature" rendering. Verification recomputes it the
- * same way.
+ * Verification is trivial: SHA-256(file.content) === file.sha256,
+ * and Ed25519.verify(file.signature, file.sha256, signer_pubkey).
+ * No special knowledge of Sanctuary internals is required.
  */
 function finaliseDocument(
   template: string,
@@ -332,32 +338,13 @@ function finaliseDocument(
   filename: string,
   ds: DocSigner
 ): BundleFile {
-  // Pass 1: render with placeholder signature fields (known to be empty).
-  // This is the canonical content that gets hashed and signed.
-  const contextForHash: TemplateContext = {
-    ...context,
-    doc_sha256: "",
-    doc_signature: "",
-  };
-  const canonicalContent = render(template, contextForHash);
-  const sha256Hex = ds.sha256Hex(canonicalContent);
-  const signature = ds.signContent(canonicalContent);
-
-  // Pass 2: render with the signature fields populated for the
-  // human-readable output. Note that the final rendered content
-  // differs from the canonical-hash content by exactly the values of
-  // doc_sha256 and doc_signature — this is documented in the
-  // cryptographic attestations document's verification procedure.
-  const contextForDisplay: TemplateContext = {
-    ...context,
-    doc_sha256: sha256Hex,
-    doc_signature: signature,
-  };
-  const displayContent = render(template, contextForDisplay);
+  const content = render(template, context);
+  const sha256Hex = ds.sha256Hex(content);
+  const signature = ds.signContent(content);
 
   return {
     filename,
-    content: displayContent,
+    content,
     content_type: "text/markdown",
     sha256: sha256Hex,
     signature,
