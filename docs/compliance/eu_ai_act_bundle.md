@@ -16,7 +16,7 @@ description: Generate signed Annex IV / Article 12-26 compliance artifacts from 
 
 ## What it does
 
-The EU AI Act Compliance Artifact Generator is a Sanctuary MCP tool (and matching CLI subcommand) that translates your agent's Sanctuary runtime state into a bundle of seven compliance documents:
+The EU AI Act Compliance Artifact Generator is a Sanctuary MCP tool (and matching CLI subcommand) that translates your agent's Sanctuary runtime state into a bundle of eight compliance documents (plus an optional ninth when delta mode is enabled):
 
 | File | Regulatory anchor |
 |---|---|
@@ -27,10 +27,56 @@ The EU AI Act Compliance Artifact Generator is a Sanctuary MCP tool (and matchin
 | `04_risk_management_summary.md` | Risk management per Article 9 + Annex IV §5 |
 | `05_human_oversight_statement.md` | Human oversight per Article 14 + Annex IV §2(e) |
 | `06_cryptographic_attestations.md` | Bundle integrity summary |
+| `07_annex_iii_classification.md` | Rule-based Annex III candidate classification (always included) |
+| `08_delta.md` | *(conditional)* Delta report against a prior bundle, when `--delta-from` is supplied |
+| `bundle.pdf` | *(conditional)* Hand-rolled PDF render of the Markdown bundle, when `--pdf` is supplied |
 
 The generator does **not** invent evidence. Every piece of auto-filled content is pulled from the live Sanctuary instance (SHR, audit log, Principal Policy, context gating, identity manager) and every claim is traceable to a specific MCP tool call that an auditor can reproduce independently.
 
 Fields that Sanctuary cannot know — the agent's intended purpose, the enterprise's legal name, the Annex III classification, training data lineage, operator training records, and so on — are left as explicit `[MANUAL INPUT REQUIRED: hint]` markers in the generated Markdown. The enterprise replaces these markers with their business facts before filing.
+
+## Phase 2 additions — classification, delta, publish, PDF
+
+Four optional capabilities extend the Phase 1 bundle generator. All four respect the non-dependency principle: none of them is required for bundle generation, and failure in any Phase 2 layer never prevents the core Markdown bundle from landing locally.
+
+### Annex III classification helper
+
+The generator ships with a rule-based Annex III classifier that reads the `deployment_context.intended_purpose` field and scores it against all eight Annex III high-risk categories (and their sub-points) of Regulation (EU) 2024/1689. Matching keywords come from a structured catalog in `server/src/compliance/eu_ai_act/annex_iii.ts` with coarse discrete weights (1.0 / 0.6 / 0.3), and candidates clearing a 0.4 minimum threshold are reported in document `07_annex_iii_classification.md` ordered by `rule_based_confidence` descending.
+
+**The confidence field is deliberately named `rule_based_confidence`, not `confidence` or `probability`**, so downstream consumers cannot mistake it for a machine-learning model prediction. The classifier is keyword-weighted, fully auditable against the catalog, and makes no claims of statistical calibration. An empty result does **not** mean the agent is out of scope of the EU AI Act — it means the keyword catalog found no clear match and the deployer must perform manual review.
+
+The classifier is also exposed as a standalone MCP tool:
+
+```
+Tool: compliance_eu_ai_act_annex_iii_classify
+Input: { description: string }
+Output: ClassificationResult
+```
+
+Useful when you want to score a candidate agent description without generating a full bundle.
+
+### Delta mode
+
+Supply `--delta-from <path>` on the CLI, or `delta_from_bundle_path` on the MCP tool, to compare the new bundle against a prior one on disk. The generator loads `{path}/00_bundle_manifest.json`, diffs the coverage rows, and emits `08_delta.md` summarising:
+
+- Whether `regulation_version` bumped (external regulation text change)
+- Whether `matrix_version` bumped (structural matrix change)
+- Which rows were added, removed, or changed
+- For changed rows: the specific `coverage` flag transition and `evidence_emitter[]` changes
+
+**Delta problems never fail bundle generation.** If the prior bundle path is unreachable, the manifest is malformed, or the file is missing entirely, the delta is skipped silently (with a warning logged to the audit trail) and the bundle lands locally as usual. This lets you run delta mode unconditionally in a rolling-compliance cron job without building a dependency on prior-bundle availability.
+
+### Verascore publish hook
+
+Supply `--publish-to-verascore` on the CLI, or `publish_to_verascore: true` on the MCP tool, to POST the signed manifest to Verascore as a post-generation side effect. This publishes only the manifest — the document bodies never leave the local filesystem. The publish uses the same wire format and signing path as the existing `reputation_publish` tool: allow-listed Verascore hosts only (HTTPS, `verascore.ai` / `www.verascore.ai` / `api.verascore.ai`), canonical JSON of the manifest signed with the provider's primary Ed25519 identity via the existing `core/identity.js` sign primitive.
+
+**Publish failure never fails bundle generation.** If the network is unreachable, Verascore returns a non-2xx status, or the URL fails SSRF validation, the publish outcome is captured in `publish_result` on the returned bundle and the bundle is returned in the same shape. Sanctuary never starts requiring Verascore to be online. This is the non-dependency principle applied to the publish layer.
+
+### PDF render
+
+Supply `--pdf` on the CLI to additionally render the Markdown bundle into a single `bundle.pdf` file in the output directory. The PDF is produced by a hand-rolled minimal PDF writer (zero new dependencies) using the Courier and Courier-Bold standard PDF Type1 fonts — no font embedding, no font metric tables, no Puppeteer/Chromium. The output is clean monospace typography with a cover page, per-document page breaks, and a footer on every page showing the manifest SHA-256 identifier prefix and page number.
+
+**The PDF is NOT cryptographically signed.** Integrity verification remains with the Markdown files and the JSON manifest. The PDF is a human-readable render of those already-signed artifacts. See `examples/eu_ai_act_bundle_example/bundle.pdf` for a visual reference.
 
 ## Honest coverage posture
 
@@ -64,7 +110,7 @@ See [`docs/compliance/eu_ai_act_coverage_matrix_v1.md`](./eu_ai_act_coverage_mat
 sanctuary-mcp-server compliance eu-ai-act <agent-did> [flags]
 ```
 
-Example:
+Example (full Phase 1 + Phase 2 workflow):
 
 ```bash
 sanctuary-mcp-server compliance eu-ai-act \
@@ -76,8 +122,13 @@ sanctuary-mcp-server compliance eu-ai-act \
   --vertical human_resources \
   --period-start 2026-04-01T00:00:00Z \
   --period-end 2026-04-30T23:59:59Z \
-  --output ./april-compliance-bundle
+  --output ./april-compliance-bundle \
+  --delta-from ./march-compliance-bundle \
+  --publish-to-verascore \
+  --pdf
 ```
+
+The `--delta-from` flag points at the previous month's bundle directory to produce a rolling delta report; `--publish-to-verascore` posts the signed manifest to Verascore as an attestation of bundle existence; `--pdf` writes a monospace PDF render alongside the Markdown files. All three are optional and can be omitted independently.
 
 The CLI will:
 

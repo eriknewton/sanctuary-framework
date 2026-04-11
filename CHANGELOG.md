@@ -8,7 +8,99 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.8.0] - unreleased — EU AI Act Compliance Artifact Generator
 
-### Added
+### Added — Phase 2
+
+- **Annex III classification helper (Deliverable 1).** New module
+  `server/src/compliance/eu_ai_act/annex_iii.ts` with a structured
+  catalog of all 8 Annex III high-risk categories (18 sub-points
+  total) under Regulation (EU) 2024/1689. Each category carries
+  verbatim regulation text with `[...]` elisions (same citation
+  discipline as `coverage_matrix.ts`) and a keyword catalog with
+  coarse discrete weights (1.0 / 0.6 / 0.3).
+
+  `classifyAgentDescription(text)` produces zero or more candidate
+  categories with a `rule_based_confidence` score (sum of matched
+  keyword weights clamped to `[0, 1]`). The confidence field is
+  deliberately named `rule_based_confidence` — not `confidence` or
+  `probability` — so downstream consumers cannot mistake the
+  classifier for a machine-learning model. Classifier is exposed
+  as a standalone MCP tool `compliance_eu_ai_act_annex_iii_classify`
+  (Tier 3) and also auto-included as bundle document 07
+  (`07_annex_iii_classification.md`).
+
+- **Delta mode (Deliverable 2).** Optional
+  `delta_from_bundle_path` parameter on
+  `compliance_generate_eu_ai_act_bundle`, plus `--delta-from <path>`
+  CLI flag. When supplied, the generator loads the prior bundle's
+  manifest, compares coverage rows, and emits `08_delta.md` listing
+  regulation_version changes, matrix_version changes, rows added,
+  rows removed, and rows changed (with explicit `from → to`
+  rendering for coverage flag and evidence_emitter changes). Doc 08
+  is itself hashed and Ed25519-signed into the final manifest.
+
+  Delta failure never fails bundle generation: unreadable path,
+  malformed manifest, missing files, and fetch errors are all
+  captured as warnings and the bundle lands locally unchanged.
+
+- **Verascore publish hook (Deliverable 3).** Optional
+  `publish_to_verascore: boolean` parameter on the bundle generator,
+  plus `--publish-to-verascore` and `--verascore-url` CLI flags.
+  When enabled, POSTs the signed manifest (not the document bodies)
+  to Verascore after the bundle is fully built. Reuses the exact
+  wire format, signing path, and SSRF allow-list of the existing
+  `reputation_publish` tool — no second signing pipeline, no new
+  cryptography.
+
+  **Non-dependency principle enforced at every layer:** HTTPS
+  required, hostname allow-list (verascore.ai, www.verascore.ai,
+  api.verascore.ai), validation failures short-circuit before
+  fetch, network errors and non-2xx responses captured in a
+  `publish_result` field. Sanctuary bundle generation NEVER
+  requires Verascore to be online; the publish is a pure side
+  effect at the very end of generation.
+
+- **PDF render (Deliverable 4).** Optional `--pdf` CLI flag that
+  writes a single `bundle.pdf` alongside the Markdown files using
+  a hand-rolled minimal PDF writer at
+  `server/src/compliance/eu_ai_act/pdf.ts`. **No new runtime
+  dependency.** The writer produces a valid PDF-1.4 byte stream
+  with a correct catalog, pages tree, content streams, and xref
+  table, using the Courier and Courier-Bold standard PDF Type1
+  fonts (no font embedding, no AFM metric tables). Output is clean
+  monospace typography with a cover page, per-document page breaks,
+  and a footer on every page showing the manifest SHA-256
+  identifier prefix and page numbering.
+
+  The PDF is explicitly NOT cryptographically signed — integrity
+  verification remains with the Markdown files and the JSON
+  manifest. The PDF is a human-readable render of those already-
+  signed artifacts. macOS `file(1)` confirms the output is a
+  valid "PDF document, version 1.4" and real PDF readers can open
+  the example at `examples/eu_ai_act_bundle_example/bundle.pdf`.
+
+### Changed — Phase 2
+
+- **Example bundle is now byte-stable across regenerations.** The
+  Phase 1 example fixture used real randomness in three places
+  (private key generation, encryption IV, timestamps), causing the
+  committed example files to drift from regenerated output. Phase 2
+  fixes this with a test-file-local `buildDeterministicIdentity()`
+  helper that uses a fixed 32-byte private key seed, a fixed IV
+  for AES-GCM, and `vi.useFakeTimers` + `vi.setSystemTime` to
+  freeze the clock during the example generation. No production
+  code changes — the fixture uses `@noble/curves/ed25519` and
+  `@noble/ciphers/aes.js` directly (both already dependencies).
+  Verified byte-stable across two consecutive `GENERATE_EXAMPLE=1`
+  runs.
+
+- **Bundle document count 6 → 7 (+1 optional).** Bundles now always
+  include `07_annex_iii_classification.md` as a content document;
+  `08_delta.md` is conditional on `delta_from_bundle_path`;
+  `bundle.pdf` is conditional on `--pdf`. The Phase 1 test
+  assertion "exactly 6 Markdown documents" is updated to "exactly
+  7 Markdown documents and a manifest" for the default bundle.
+
+### Added — Phase 1
 
 - **EU AI Act Compliance Artifact Generator.** New Sanctuary subsystem
   under `server/src/compliance/eu_ai_act/` that generates a signed
