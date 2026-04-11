@@ -1,0 +1,139 @@
+# Sanctuary Test Baseline Guard
+#
+# Copyright 2026 Erik Newton
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI mirror of the pre-commit hook at .githooks/pre-commit. Runs the
+# same two gates (typecheck + transform-error detection + baseline
+# check) on every PR and every push to main. This is the belt-and-
+# suspenders layer that catches:
+#
+#   - Contributors who ran `git commit --no-verify` locally
+#   - Contributors who never installed the hook (fresh clones,
+#     one-off environments)
+#   - Agents that commit via a pipeline that bypasses .git/hooks
+#   - Direct pushes to main from any environment
+#
+# The job is DELIBERATELY separate from the existing `test` matrix
+# in ci.yml so it can be named as a distinct required status check
+# in GitHub branch-protection rules. See
+# docs/audit/branch-protection-setup.md for the runbook.
+#
+# This job mirrors the pre-commit hook's logic (see
+# .githooks/pre-commit for the authoritative copy and the postmortem
+# at docs/audit/commit-4ac95830-postmortem.md for the specific
+# failure class it defends against).
+
+name: Test Baseline Guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-baseline-guard:
+    name: test-baseline-guard
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read test baseline floor
+        id: baseline
+        run: |
+          if [[ ! -f .test-baseline ]]; then
+            echo "::error::.test-baseline file missing at repo root. Create it with a single integer: the current passing count."
+            exit 1
+          fi
+          baseline=$(tr -d '[:space:]' < .test-baseline)
+          if ! [[ "$baseline" =~ ^[0-9]+$ ]]; then
+            echo "::error::.test-baseline must contain a single integer, got: '$baseline'"
+            exit 1
+          fi
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+          echo "Baseline floor: $baseline"
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: server
+        run: npm ci
+
+      # ── Gate 1: typecheck ──────────────────────────────────────────
+      - name: Gate 1 — typecheck
+        working-directory: server
+        run: npm run typecheck
+
+      # ── Gate 2: npm test + transform/collection error detection ───
+      #
+      # Captures vitest output in one invocation so all three checks
+      # (transform errors, silent file drop, baseline regression)
+      # parse the same run. If `npm test` exits non-zero the step
+      # fails immediately and the parsing checks below do not run —
+      # that is correct behaviour, a test failure is a commit-blocker
+      # regardless of the passing count.
+      - name: Gate 2 — run tests and capture output
+        id: run_tests
+        working-directory: server
+        run: |
+          set -o pipefail
+          # tee to both the GitHub Actions log and a file we parse
+          npm test 2>&1 | tee /tmp/vitest-output.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Gate 2a — transform/collection error detection
+        run: |
+          if grep -Eqi "(transform error|failed to parse|failed to collect|failed to load source|cannot find module)" /tmp/vitest-output.log; then
+            echo "::error::Transform/collection error detected in vitest output. This is the specific failure class from commit 4ac95830 (see docs/audit/commit-4ac95830-postmortem.md)."
+            grep -Ei "(transform error|failed to parse|failed to collect|failed to load|cannot find module)" /tmp/vitest-output.log | head -20
+            exit 1
+          fi
+          echo "✓ No transform/collection errors detected."
+
+      - name: Gate 2b — silent test file drop detection
+        run: |
+          expected_files=$(find server/test -name "*.test.ts" -not -path "*/node_modules/*" | wc -l | tr -d '[:space:]')
+          actual_total=$(grep -oE "Test Files[[:space:]]+.*\([0-9]+\)" /tmp/vitest-output.log | grep -oE "\([0-9]+\)" | tr -d '()' | tail -1)
+          if [[ -z "$actual_total" ]]; then
+            actual_total=$(grep -oE "Test Files[[:space:]]+[0-9]+ passed" /tmp/vitest-output.log | grep -oE "[0-9]+" | head -1)
+          fi
+          if [[ -z "$actual_total" ]]; then
+            echo "::error::Could not parse 'Test Files' count from vitest output."
+            tail -30 /tmp/vitest-output.log
+            exit 1
+          fi
+          echo "Files on disk:       $expected_files"
+          echo "Files vitest loaded: $actual_total"
+          if (( actual_total < expected_files )); then
+            echo "::error::Silent test file drop detected: $expected_files files on disk, $actual_total loaded by vitest. Missing $((expected_files - actual_total)) file(s). This is the exact failure class from commit 4ac95830 (see docs/audit/commit-4ac95830-postmortem.md)."
+            exit 1
+          fi
+          echo "✓ All $expected_files test files loaded by vitest."
+
+      - name: Gate 2c — passing count >= baseline
+        run: |
+          baseline="${{ steps.baseline.outputs.baseline }}"
+          passing=$(grep -oE "Tests[[:space:]]+[0-9]+ passed" /tmp/vitest-output.log | grep -oE "[0-9]+" | head -1)
+          if [[ -z "$passing" ]]; then
+            echo "::error::Could not parse passing-test count from vitest output."
+            tail -30 /tmp/vitest-output.log
+            exit 1
+          fi
+          echo "Baseline floor: $baseline"
+          echo "Passing tests:  $passing"
+          if (( passing < baseline )); then
+            echo "::error::Test baseline regression: baseline=$baseline, passing=$passing, missing $((baseline - passing)) tests. Fix the regression or update .test-baseline in a separate explicitly-scoped commit."
+            exit 1
+          fi
+          if (( passing > baseline )); then
+            echo "::warning::Passing count ($passing) exceeds baseline ($baseline). Update .test-baseline in a follow-up commit to lock in the new floor."
+          fi
+          echo "✓ Baseline guard passed."
