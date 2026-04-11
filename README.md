@@ -253,6 +253,27 @@ round-trip verification test.
 
 ---
 
+## Contributing
+
+If you're working on Sanctuary locally, install the pre-commit hook on first clone:
+
+```bash
+cd server
+npm install
+npm run install-hooks
+```
+
+`install-hooks` copies `.githooks/pre-commit` into `.git/hooks/pre-commit` and makes it executable. The hook runs two gates on every `git commit`:
+
+1. **Typecheck** — `npm run typecheck` must pass with zero TypeScript errors.
+2. **Test baseline guard** — `npm test` must pass; vitest output must not contain any transform/collection error; the number of test files vitest loaded must equal the number of `*.test.ts` files under `server/test/`; the passing-test count must be at least the integer in `.test-baseline` at repo root.
+
+The second gate defends against a specific failure class documented in [`docs/audit/commit-4ac95830-postmortem.md`](docs/audit/commit-4ac95830-postmortem.md): a parse/transform error silently dropping test files during vitest collection, causing the passing count to look lower without vitest reporting a hard failure.
+
+Total hook runtime: ~21 seconds on a modern Mac. Emergency bypass for exceptional commits: `SKIP_TEST_BASELINE=1 git commit ...` (the override is logged to `.test-baseline-overrides.log` for audit).
+
+The same two gates run in CI via [`.github/workflows/test-baseline-guard.yml`](.github/workflows/test-baseline-guard.yml) on every PR and push to main. See [`docs/audit/branch-protection-setup.md`](docs/audit/branch-protection-setup.md) for the branch-protection runbook that makes the CI check a hard merge gate.
+
 ## License
 
 - **Code:** Apache License 2.0

@@ -33,6 +33,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
     "clean": "rm -rf dist",
+    "install-hooks": "node -e \"const fs=require('node:fs'),p=require('node:path'); const root=p.resolve(__dirname,'..'); const src=p.join(root,'.githooks','pre-commit'); const dst=p.join(root,'.git','hooks','pre-commit'); if(!fs.existsSync(src)){console.error('Error: .githooks/pre-commit not found at '+src);process.exit(1)} if(!fs.existsSync(p.join(root,'.git'))){console.error('Error: '+root+' is not a git repository');process.exit(1)} fs.mkdirSync(p.dirname(dst),{recursive:true}); fs.copyFileSync(src,dst); fs.chmodSync(dst,0o755); console.log('Installed pre-commit hook: '+dst)\"",
     "prepublishOnly": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {

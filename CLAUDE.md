@@ -6,9 +6,17 @@ This file is a briefing for every Claude Code session that touches these codebas
 
 **No public-facing document, README, blog post, plugin manifest, package metadata, or software artifact may reference or attribute CIMC as author or creator of Sanctuary or Concordia.** Erik Newton is the sole author. CIMC may be mentioned in internal/biographical context only.
 
-### Commit discipline — interim test-baseline stopgap (MANDATORY)
+### Commit discipline — test baseline enforcement (MANDATORY)
 
-Every commit to Sanctuary main MUST run `npm run typecheck && npm test` against a clean working tree before staging; block the commit if either fails. This is the interim instruction-layer defense until the pre-commit hook lands in a follow-up session. See `docs/audit/test-baseline-hardening-plan.md` for the full three-layer hardening plan and `docs/audit/commit-4ac95830-postmortem.md` for the trigger incident.
+Every commit to Sanctuary main MUST run `npm run typecheck && npm test` against a clean working tree before staging; block the commit if either fails, if any transform/collection error appears in vitest output, or if the passing-test count drops below the integer in `.test-baseline` at repo root.
+
+**This rule is now backed by structural enforcement, not just instruction:**
+
+- **Pre-commit hook** at `.githooks/pre-commit` runs both gates locally on every `git commit`. Install once with `cd server && npm run install-hooks` (copies the hook into `.git/hooks/pre-commit`). The hook takes ~21 seconds on a modern Mac. Emergency bypass: `SKIP_TEST_BASELINE=1 git commit ...` (logged to `.test-baseline-overrides.log` for audit).
+- **CI check** at `.github/workflows/test-baseline-guard.yml` runs the same two gates on every PR and every push to main. This is the belt-and-suspenders layer for commits that bypass the local hook with `--no-verify` or from uninstalled environments. See `docs/audit/branch-protection-setup.md` for the Git branch-protection runbook required to make this check a hard merge gate.
+- **Written instruction (this block)** remains the human-facing contract. The structural layers make violations hard; this rule makes the intent explicit so a reviewer or auditor can cite it.
+
+See `docs/audit/test-baseline-hardening-plan.md` for the full three-layer hardening plan, `docs/audit/commit-4ac95830-postmortem.md` for the trigger incident, and `docs/audit/branch-protection-setup.md` for the GitHub branch-protection runbook.
 
 ---
 

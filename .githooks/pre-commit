@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+#
+# Sanctuary pre-commit hook — test baseline guard
+# Copyright 2026 Erik Newton
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defends against the specific failure class documented in
+# docs/audit/commit-4ac95830-postmortem.md: a parse / transform
+# error at vitest collection time silently dropping test files
+# from the suite, causing the passing count to look lower without
+# vitest reporting a hard failure.
+#
+# Two gates, both must pass. The commit is blocked if either fails.
+#
+#   Gate 1: typecheck
+#     Runs `npm run typecheck` in server/. Zero TypeScript errors
+#     required. This is the cheap gate and runs first so the
+#     expensive gate 2 never runs on a broken typecheck.
+#
+#   Gate 2: transform-error detection + test baseline check
+#     Runs `npm test` in server/ and parses vitest's output for
+#     three kinds of drift:
+#
+#       a. Transform / collection error substrings.
+#          Any occurrence of "transform error", "failed to parse",
+#          "failed to collect", "failed to load source", or
+#          "cannot find module" in the vitest output aborts the
+#          commit — these are the exact signatures of the
+#          commit 4ac95830 failure class.
+#
+#       b. Silent test file drop.
+#          Count .test.ts files under server/test/ and compare to
+#          vitest's reported "Test Files N passed (TOTAL)" count.
+#          If files on disk > files vitest attempted, some file
+#          failed to load before vitest registered it — the same
+#          failure shape as 4ac95830, hiding 98 tests for 26 hours.
+#
+#       c. Test baseline regression.
+#          If vitest's passing-test count falls below the integer
+#          in .test-baseline at repo root, the commit is blocked.
+#          If the passing count exceeds the baseline, the hook
+#          prints a warning reminding the author to bump
+#          .test-baseline in a follow-up commit.
+#
+# Runtime budget: < 60 seconds on a modern Mac. Typecheck is ~3s,
+# the test suite is ~20s, total well under the budget.
+#
+# Emergency override: set SKIP_TEST_BASELINE=1 to bypass the hook.
+# Use only for emergency commits; the override is logged with
+# timestamp and HEAD SHA to .test-baseline-overrides.log for audit.
+#
+# Installation:
+#   cd server && npm run install-hooks
+#
+# This hook is a shared script at .githooks/pre-commit; the install
+# script copies it to .git/hooks/pre-commit and chmods it executable.
+
+set -euo pipefail
+
+# ── Colour helpers (graceful fallback if TTY is not colour) ─────────
+if [[ -t 2 ]]; then
+  RED=$'\033[0;31m'
+  GREEN=$'\033[0;32m'
+  YELLOW=$'\033[0;33m'
+  BLUE=$'\033[0;34m'
+  NC=$'\033[0m'
+else
+  RED=""
+  GREEN=""
+  YELLOW=""
+  BLUE=""
+  NC=""
+fi
+
+log()  { printf '%s[baseline-guard]%s %s\n' "$BLUE" "$NC" "$1" >&2; }
+warn() { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$YELLOW" "$1" "$NC" >&2; }
+fail() { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$RED" "$1" "$NC" >&2; }
+ok()   { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$GREEN" "$1" "$NC" >&2; }
+
+# ── Emergency override ───────────────────────────────────────────────
+if [[ "${SKIP_TEST_BASELINE:-}" == "1" ]]; then
+  warn "SKIP_TEST_BASELINE=1 — emergency override active"
+  warn "This commit is being made without running the baseline guard."
+  warn "Override is logged to .test-baseline-overrides.log for audit."
+  timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  head_sha=$(git rev-parse HEAD 2>/dev/null || echo "pre-commit")
+  repo_root_for_log=$(git rev-parse --show-toplevel)
+  printf '%s  %s  skipped-by-env\n' "$timestamp" "$head_sha" \
+    >> "$repo_root_for_log/.test-baseline-overrides.log"
+  exit 0
+fi
+
+# Resolve repo root (allows hook to run from any subdirectory).
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+# ── Gate 1: typecheck ────────────────────────────────────────────────
+log "Gate 1/2: npm run typecheck"
+if ! (cd server && npm run typecheck --silent > /tmp/sanctuary-precommit-tsc.log 2>&1); then
+  fail "TYPECHECK FAILED — commit blocked"
+  tail -40 /tmp/sanctuary-precommit-tsc.log >&2
+  printf '\n' >&2
+  fail "Fix all TypeScript errors before committing."
+  printf '[baseline-guard] To override in an emergency: SKIP_TEST_BASELINE=1 git commit ...\n' >&2
+  exit 1
+fi
+ok "Gate 1/2: typecheck clean."
+
+# ── Gate 2: transform-error detection + test baseline ───────────────
+log "Gate 2/2: npm test + transform-error detection + baseline check"
+
+# Read the baseline integer from .test-baseline.
+if [[ ! -f .test-baseline ]]; then
+  fail ".test-baseline file missing at repo root"
+  printf '[baseline-guard]   Create it with a single integer: the current passing count.\n' >&2
+  exit 1
+fi
+baseline=$(tr -d '[:space:]' < .test-baseline)
+if ! [[ "$baseline" =~ ^[0-9]+$ ]]; then
+  fail ".test-baseline must contain a single integer, got: '$baseline'"
+  exit 1
+fi
+
+# Count test files on disk (expected).
+expected_files=$(find server/test -name "*.test.ts" -not -path "*/node_modules/*" 2>/dev/null | wc -l | tr -d '[:space:]')
+if [[ -z "$expected_files" || "$expected_files" == "0" ]]; then
+  fail "No test files found under server/test/ — something is wrong"
+  exit 1
+fi
+
+# Run the test suite and capture output. Use `|| true` so we can
+# distinguish "tests failed" from "subshell exited non-zero" — vitest
+# exits non-zero on failures, which we want to detect and report, but
+# we also need the output for transform-error parsing even if vitest
+# exits zero.
+test_output=$(cd server && npm test 2>&1 || true)
+
+# ── Check 2a: transform / collection error substrings ──────────────
+#
+# The 2026-04-10 incident was detected by substring matching on
+# vitest's error output. These patterns cover:
+#
+#   "transform error"            — vitest transform step failure
+#   "failed to parse"            — esbuild / swc parse error
+#   "failed to collect"          — vitest collection failure
+#   "failed to load source"      — vitest source-loading failure
+#   "cannot find module"         — missing import or dependency
+#
+# Any occurrence triggers an immediate block, regardless of
+# passing-test count.
+if echo "$test_output" | grep -Eqi "(transform error|failed to parse|failed to collect|failed to load source|cannot find module)"; then
+  fail "TRANSFORM/COLLECTION ERROR DETECTED — commit blocked"
+  printf '\n' >&2
+  echo "$test_output" | grep -Ei "(transform error|failed to parse|failed to collect|failed to load|cannot find module)" | head -20 >&2
+  printf '\n' >&2
+  fail "This is the specific failure class from commit 4ac95830:"
+  printf '[baseline-guard]   a parse/transform error causing test files to silently\n' >&2
+  printf '[baseline-guard]   drop from the suite before vitest reports them.\n' >&2
+  printf '[baseline-guard]   See docs/audit/commit-4ac95830-postmortem.md\n' >&2
+  exit 1
+fi
+
+# ── Check 2b: silent test file drop ─────────────────────────────────
+#
+# Parse vitest's "Test Files  N passed (TOTAL)" summary line. The
+# number inside parentheses is vitest's attempted-file count. If
+# files on disk exceed that count, some file(s) dropped silently
+# during collection — the exact failure class from 4ac95830.
+actual_total=$(echo "$test_output" | grep -oE "Test Files[[:space:]]+.*\([0-9]+\)" | grep -oE "\([0-9]+\)" | tr -d '()' | tail -1)
+if [[ -z "$actual_total" ]]; then
+  # Fallback for older vitest output shape.
+  actual_total=$(echo "$test_output" | grep -oE "Test Files[[:space:]]+[0-9]+ passed" | grep -oE "[0-9]+" | head -1)
+fi
+if [[ -z "$actual_total" ]]; then
+  fail "Could not parse 'Test Files' count from vitest output"
+  echo "$test_output" | tail -30 >&2
+  exit 1
+fi
+
+if (( actual_total < expected_files )); then
+  fail "SILENT TEST FILE DROP DETECTED — commit blocked"
+  printf '[baseline-guard]   Files on disk under server/test/: %s\n' "$expected_files" >&2
+  printf '[baseline-guard]   Files vitest reported:            %s\n' "$actual_total" >&2
+  printf '[baseline-guard]   Missing: %s test file(s).\n' "$((expected_files - actual_total))" >&2
+  printf '\n' >&2
+  fail "This is the specific failure class from commit 4ac95830."
+  printf '[baseline-guard]   See docs/audit/commit-4ac95830-postmortem.md\n' >&2
+  exit 1
+fi
+
+# ── Check 2c: passing count >= baseline ─────────────────────────────
+#
+# Parse "Tests  N passed" (the "| M skipped" suffix is ignored).
+passing=$(echo "$test_output" | grep -oE "Tests[[:space:]]+[0-9]+ passed" | grep -oE "[0-9]+" | head -1)
+if [[ -z "$passing" ]]; then
+  fail "Could not parse passing-test count from vitest output"
+  echo "$test_output" | tail -30 >&2
+  exit 1
+fi
+
+if (( passing < baseline )); then
+  fail "TEST BASELINE REGRESSION — commit blocked"
+  printf '[baseline-guard]   Baseline (.test-baseline): %s\n' "$baseline" >&2
+  printf '[baseline-guard]   Current passing count:     %s\n' "$passing" >&2
+  printf '[baseline-guard]   Regression: %s tests\n' "$((baseline - passing))" >&2
+  printf '\n' >&2
+  fail "Fix the regression, or update .test-baseline in a separate"
+  fail "explicitly-scoped commit explaining the bump."
+  exit 1
+fi
+
+if (( passing > baseline )); then
+  warn "Passing count ($passing) exceeds baseline ($baseline)."
+  warn "Update .test-baseline in a follow-up commit to lock in the new floor."
+fi
+
+ok "Gate 2/2: $actual_total test files loaded, $passing tests passed (baseline: $baseline)."
+ok "All baseline-guard checks passed. Commit allowed."
+exit 0
