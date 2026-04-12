@@ -4,9 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## v0.8.0 (unreleased — on main, not yet published to npm)
 
-## [0.8.0] - unreleased — EU AI Act Compliance Artifact Generator
+- EU AI Act compliance artifact generator (Annex III classifier, delta mode, Verascore publish hook, PDF writer)
+- `memory_attest` tool (Ed25519 signed content hash attestation)
+- Test baseline hardening (pre-commit hook, CI workflow, branch protection runbook)
+- SIEM export reclassified to Tier 3
+- `identity_set_primary` tool with persistent primary identity tracking
+
+## v0.7.0 (current on npm — `npm install @sanctuary-framework/mcp-server@0.7.0`)
+
+- Removed `sanctuary/` prefix from all 67 tool names (fixes OpenClaw double-mangling)
+- SIEM CEF/OCSF export (`audit_export_siem` tool)
+- Context gate `"*"` wildcard bypass
+- Cocoon CLI, config-reader, Fortress View, tier-classifier
+- 1071 tests passing
+
+---
+
+## [0.8.0] - unreleased — EU AI Act Compliance Artifact Generator (detailed)
 
 ### Added — Phase 2
 

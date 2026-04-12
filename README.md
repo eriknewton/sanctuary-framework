@@ -18,6 +18,13 @@ This generates an Ed25519 identity, publishes a sovereign agent profile to Veras
 
 ---
 
+## Requirements
+
+- Node.js >= 22.0.0
+- npm >= 10.0.0
+
+---
+
 ## What You Get
 
 ### Your data stays encrypted
@@ -53,7 +60,7 @@ The dashboard appears at `http://localhost:3000`. You're ready to use Sanctuary.
 **Run a health check:**
 
 ```bash
-sanctuary/sovereignty_audit
+sovereignty_audit
 ```
 
 This scores your entire setup (0–100) across security, isolation, and privacy. It detects problems and tells you exactly what to fix.
@@ -187,7 +194,7 @@ Sanctuary defines four layers of protection, each serving a specific purpose:
 | **L4: Verifiable Reputation** | Earned trust — your agent builds a portable track record |
 
 **The tool set:**
-- 54+ MCP tools across four layers
+- 67 MCP tools across four layers
 - Principal Policy (who can do what)
 - Sovereignty Health Reports (SHR)
 - Handshake protocol (mutual verification)
@@ -199,7 +206,7 @@ Sanctuary defines four layers of protection, each serving a specific purpose:
 - [Full Specification](docs/sanctuary_framework.md) — complete technical spec
 - [Sovereignty Health Report (SHR)](docs/SHR.md) — how agents prove trustworthiness
 - [Architecture Guide](docs/ARCHITECTURE.md) — how the four layers fit together
-- [API Reference](docs/TOOLS.md) — all 54 tools, with examples
+- [API Reference](docs/TOOLS.md) — all 67 tools, with examples
 
 **Design Principles:**
 1. Privacy by default, disclosure by choice
