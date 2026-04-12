@@ -4,6 +4,7 @@ title: "Your Brain Is Sovereign. Your Agent Isn't."
 date: 2026-04-02
 author: Erik Newton
 description: "You've never had to think about the sovereignty of your own mind. That's the point. Your skull is a four-layer sovereignty stack — and your AI agent has none of the same protections."
+image: /images/blog/your-brain-is-sovereign.png
 ---
 
 You've never had to think about the sovereignty of your own mind. That's the point.

@@ -4,6 +4,7 @@ title: "Concordia + A2A: The Agreement Layer the Protocol Stack Is Missing"
 date: 2026-03-31
 author: Erik Newton
 description: "MCP owns tools. A2A owns communication. ACP owns payment. Nobody owns negotiation. Concordia fills the agreement layer between communication and settlement."
+image: /images/blog/concordia-a2a-composition.png
 ---
 
 The agentic protocol stack is converging rapidly. As of March 2026, the layers are becoming clear:

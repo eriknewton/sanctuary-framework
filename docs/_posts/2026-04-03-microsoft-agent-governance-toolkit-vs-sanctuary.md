@@ -4,6 +4,7 @@ title: "Microsoft Just Open-Sourced Agent Security. Here's What They Got Right, 
 date: 2026-04-03
 author: Erik Newton
 description: "Microsoft released the Agent Governance Toolkit — open-source runtime security for AI agents. It validates the category we've been building. But their approach is about enterprise control. Ours is about portable sovereignty. Here's what's the same, what's different, and why it matters."
+image: /images/blog/microsoft-vs-sanctuary.jpg
 ---
 
 On April 2nd, Microsoft released the Agent Governance Toolkit — an open-source, MIT-licensed runtime security framework for AI agents. It claims to address all 10 OWASP agentic AI risks with "sub-millisecond policy enforcement."

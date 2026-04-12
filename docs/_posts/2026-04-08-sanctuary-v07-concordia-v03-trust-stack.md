@@ -4,6 +4,7 @@ title: "Sanctuary v0.7.0 + Concordia v0.3.0: The Trust Stack for Managed Agents"
 date: 2026-04-08
 author: Erik Newton
 description: "Anthropic launched Managed Agents today. Same day, Sanctuary v0.7.0 (67 MCP tools, 1071 tests, SIEM export) and Concordia v0.3.0 (56 tools, agent discovery) ship the trust layer that managed platforms don't."
+image: /images/blog/trust-stack.jpg
 ---
 
 Today Anthropic made deploying agents trivially easy. Same day, we shipped the tools to deploy them safely.

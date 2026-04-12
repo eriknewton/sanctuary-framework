@@ -4,6 +4,7 @@ title: "The Agent Security Crisis of Q1 2026"
 date: 2026-04-01
 author: Erik Newton
 description: "Five major incidents in three months reveal a pattern: the agent ecosystem is building fast and breaking things. Here's what went wrong and what it means."
+image: /images/blog/agent-security-crisis.png
 ---
 
 In Q1 2026, five separate agent security incidents hit the industry. They look different on the surface—different companies, different architectures, different failure modes. They share a common root cause.

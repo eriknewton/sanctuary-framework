@@ -4,6 +4,7 @@ title: "Know Your Agent: Why Trust Requires More Than Identity"
 date: 2026-04-10
 author: Erik Newton
 description: "KYA (Know Your Agent) is crystallizing as the industry standard. But most approaches only answer 'who is this agent?' Real trust requires a complete architecture."
+image: /images/blog/know-your-agent.png
 ---
 
 "Know Your Customer" changed banking. Now the industry is converging on "Know Your Agent."

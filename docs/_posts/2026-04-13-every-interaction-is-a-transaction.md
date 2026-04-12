@@ -3,6 +3,7 @@ title: "Every Interaction Is a Transaction"
 date: 2026-04-13
 description: "The agentic economy is missing its agreement layer. An open standard is filling the gap — and an ecosystem is forming around it."
 author: "Erik Newton"
+image: /images/blog/every-interaction-is-a-transaction.png
 ---
 
 # Every Interaction Is a Transaction

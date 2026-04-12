@@ -4,6 +4,7 @@ title: "From Vitalik's Sandbox to Sovereignty Infrastructure"
 date: 2026-04-03
 author: Erik Newton
 description: "Vitalik Buterin just published the most important essay on AI security written this year. Every pattern he hand-built is one we've already generalized. Here's what aligns, what's missing, and what we built today in response."
+image: /images/blog/vitalik-sandbox-to-sovereignty.jpg
 ---
 
 *How the patterns in "My self-sovereign / local / private / secure LLM setup" become composable architecture for every agent*
