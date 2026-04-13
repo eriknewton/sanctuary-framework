@@ -24,5 +24,8 @@ rfcs/DRAFT-*
 server/node_modules/
 __pycache__/
 review/
-DELTA_REVIEW_REPORT.md
 REVIEW_MAP.md
+
+# Strategy and social (internal, not for public repo)
+Sanctuary_Concordia_Viral_Strategy.md
+social_posts_*.md
