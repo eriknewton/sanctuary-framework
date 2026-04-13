@@ -119,6 +119,17 @@ describe("sanctuary meta-tools", () => {
       expect(fetchSpy).not.toHaveBeenCalled();
     });
 
+    it("includes passphrase backup warning in bootstrap response", async () => {
+      const { allTools } = setup();
+      const result = await callTool(allTools, "sanctuary_bootstrap", {
+        label: "warn-test",
+        publish: false,
+      });
+      expect(result.passphrase_warning).toBeDefined();
+      expect((result.passphrase_warning as string)).toContain("passphrase");
+      expect((result.passphrase_warning as string)).toContain("unrecoverable");
+    });
+
     it("rejects non-HTTPS verascore URLs", async () => {
       const { allTools } = setup();
       const result = await callTool(allTools, "sanctuary_bootstrap", {

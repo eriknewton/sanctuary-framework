@@ -1,0 +1,53 @@
+# Principal Policy: Persistent Agent
+# Optimized for always-on agents with latency constraints.
+# Auto-allows routine operations. Gates only destructive/external actions.
+#
+# Tier 1 (always require human approval):
+#   - state_export, state_import (data portability — irreversible if imported over existing)
+#   - identity_rotate (key rotation — old key destroyed)
+#   - state_delete with secure_delete (3-pass overwrite — unrecoverable)
+#   - reputation_import (external trust injection)
+#   - governor_reset (resets all rate limiting)
+#
+# Tier 2 (approval on anomaly):
+#   - reputation_record (new attestation — but only on anomaly)
+#   - federation_peers with action: register (new peer trust)
+#
+# Tier 3 (auto-allow with audit logging):
+#   - Everything else: state_read, state_write, state_list, identity_create,
+#     identity_sign, identity_verify, identity_list, identity_set_primary,
+#     all context_gate_* tools, all handshake_* tools, shr_generate, shr_verify,
+#     sovereignty_audit, all disclosure_* tools, all proof_* tools, all zk_* tools,
+#     reputation_query, reputation_query_weighted, reputation_publish,
+#     bootstrap_create_escrow, bootstrap_provide_guarantee,
+#     sanctuary_bootstrap, policy_status, export_identity_bundle,
+#     link_to_human, sign_challenge, l2_hardening_status, l2_verify_isolation,
+#     governor_status, context_gate_enforcer_status, context_gate_enforcer_configure,
+#     all bridge_* tools, all shr_* tools, federation_trust_evaluate, federation_status
+
+version: "1.0"
+name: "persistent-agent"
+description: "For always-on agents with latency constraints. Auto-allows routine ops."
+
+tiers:
+  tier1:
+    operations:
+      - state_export
+      - state_import
+      - identity_rotate
+      - governor_reset
+    rules:
+      - match: "state_delete"
+        condition: "params.secure_delete == true"
+      - match: "reputation_import"
+
+  tier2:
+    operations:
+      - reputation_record
+    rules:
+      - match: "federation_peers"
+        condition: "params.action == 'register'"
+
+  tier3:
+    default: allow
+    audit: true

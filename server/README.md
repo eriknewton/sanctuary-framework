@@ -156,6 +156,16 @@ Environment variables:
 | `SANCTUARY_WEBHOOK_SECRET` | HMAC-SHA256 shared secret | — |
 | `SANCTUARY_WEBHOOK_CALLBACK_PORT` | Callback listener port | `3502` |
 
+## Running Alongside Another MCP Server
+
+Sanctuary is designed to run as a parallel MCP server — it adds sovereignty infrastructure to your agent without replacing any of its existing tools. Both servers appear in the same session as independent tool providers.
+
+For the full setup guide (installation options, passphrase management, systemd units), see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
+For a reference MCP config, see [`docs/examples/parallel-mcp-config.json`](docs/examples/parallel-mcp-config.json).
+
+For always-on agents with latency constraints, use the `persistent-agent` Principal Policy template which auto-allows routine operations and only gates destructive actions. See [`src/principal-policy/templates/persistent-agent.yaml`](src/principal-policy/templates/persistent-agent.yaml).
+
 ## Principal Policy (prompt injection defense)
 
 The Principal Policy is the human-controlled, agent-immutable configuration that gates operations through a three-tier approval system. It sits between the MCP router and every tool handler — no tool call can bypass it.

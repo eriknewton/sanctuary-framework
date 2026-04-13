@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "your-agent-server": {
+      "command": "your-agent-command",
+      "args": ["--your-flags"],
+      "env": {}
+    },
+    "sanctuary": {
+      "command": "node",
+      "args": ["./node_modules/.bin/sanctuary-mcp-server"],
+      "env": {
+        "SANCTUARY_PASSPHRASE": "${SANCTUARY_PASSPHRASE}",
+        "SANCTUARY_DASHBOARD_ENABLED": "true"
+      }
+    }
+  }
+}

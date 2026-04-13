@@ -55,7 +55,7 @@ Tamper-evident audit trail of every operation. If something goes wrong, you have
 npx @sanctuary-framework/mcp-server
 ```
 
-The dashboard appears at `http://localhost:3000`. You're ready to use Sanctuary.
+The dashboard appears at `http://localhost:3501`. You're ready to use Sanctuary.
 
 **Run a health check:**
 

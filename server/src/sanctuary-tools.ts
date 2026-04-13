@@ -18,6 +18,11 @@ import type { AuditLog } from "./l2-operational/audit-log.js";
 import type { PrincipalPolicy } from "./principal-policy/types.js";
 import type { SanctuaryConfig } from "./config.js";
 import { sign as identitySign } from "./core/identity.js";
+
+const PASSPHRASE_BACKUP_WARNING =
+  "\u26a0\ufe0f  IMPORTANT: Your Sanctuary passphrase is the only way to decrypt your agent's state. " +
+  "If lost, all encrypted data is unrecoverable by design. Back up your passphrase now " +
+  "to a password manager, encrypted USB, or other secure location separate from this machine.";
 import { derivePurposeKey } from "./core/key-derivation.js";
 import { toBase64url } from "./core/encoding.js";
 import { createIdentity } from "./core/identity.js";
@@ -149,6 +154,7 @@ export function createSanctuaryTools(
             profileUrl,
             tier: "self-attested",
             published: false,
+            passphrase_warning: PASSPHRASE_BACKUP_WARNING,
           });
         }
 
@@ -222,6 +228,7 @@ export function createSanctuaryTools(
             published: response.ok,
             verascore_status: response.status,
             verascore_response: result,
+            passphrase_warning: PASSPHRASE_BACKUP_WARNING,
           });
         } catch (err) {
           auditLog.append("l4", "sanctuary_bootstrap", publicIdentity.identity_id, {
@@ -237,6 +244,7 @@ export function createSanctuaryTools(
             warning: `Identity created but Verascore publish failed: ${
               err instanceof Error ? err.message : String(err)
             }`,
+            passphrase_warning: PASSPHRASE_BACKUP_WARNING,
           });
         }
       },
