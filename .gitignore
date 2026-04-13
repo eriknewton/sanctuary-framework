@@ -26,6 +26,7 @@ __pycache__/
 review/
 REVIEW_MAP.md
 
-# Strategy and social (internal, not for public repo)
+# Internal build specs and strategy (not for public repo)
+docs/builds/
 Sanctuary_Concordia_Viral_Strategy.md
 social_posts_*.md
