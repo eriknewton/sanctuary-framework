@@ -4,9 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{ page.title }} | Sanctuary Protocol</title>
-  <meta name="description" content="{{ page.excerpt | strip_html | truncatewords: 50 }}">
+  <meta name="description" content="{{ page.description | default: page.excerpt | strip_html | truncatewords: 50 }}">
+  <meta name="author" content="Erik Newton">
+  <meta name="theme-color" content="#0b1326">
   <meta property="og:title" content="{{ page.title }}">
-  <meta property="og:description" content="{{ page.excerpt | strip_html | truncatewords: 50 }}">
+  <meta property="og:description" content="{{ page.description | default: page.excerpt | strip_html | truncatewords: 50 }}">
   <meta property="og:type" content="article">
   <meta property="og:url" content="{{ page.url | absolute_url }}">
   <meta property="article:author" content="Erik Newton">
@@ -16,48 +18,109 @@
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:image" content="{{ page.image | absolute_url }}">
   {% endif %}
-  <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap">
+
+  <link rel="stylesheet" href="{{ '/assets/css/site.css' | relative_url }}">
+
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23ddb7ff'/%3E%3Cstop offset='1' stop-color='%234fdbc8'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath fill='url(%23g)' d='M16 2 30 16 16 30 2 16z'/%3E%3C/svg%3E">
 </head>
 <body>
-  <nav class="site-nav">
-    <div class="nav-inner">
-      <a href="{{ '/' | relative_url }}" class="site-title">Sanctuary Protocol</a>
-      <div class="nav-links">
-        <a href="{{ '/' | relative_url }}">Home</a>
-        <a href="{{ '/blog' | relative_url }}">Blog</a>
-        <a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
-        <a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<nav class="nav" aria-label="Primary">
+  <div class="nav__inner">
+    <a class="nav__brand" href="{{ '/' | relative_url }}">
+      <span class="nav__brand-mark" aria-hidden="true"></span>
+      Sanctuary
+    </a>
+    <div class="nav__links">
+      <a href="{{ '/' | relative_url }}#layers">Architecture</a>
+      <a href="{{ '/' | relative_url }}#quickstart">Quickstart</a>
+      <a href="{{ '/blog/' | relative_url }}">Journal</a>
+      <a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
+    </div>
+    <div class="nav__actions">
+      <a class="btn btn--secondary btn--sm" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a>
+      <a class="btn btn--primary btn--sm" href="https://github.com/eriknewton/sanctuary-framework">Install</a>
+    </div>
+  </div>
+</nav>
+
+<main id="main">
+  <article class="section container">
+    <header class="post__header">
+      <span class="eyebrow">Journal · {{ page.date | date: "%B %-d, %Y" }}</span>
+      <h1>{{ page.title }}</h1>
+      <div class="post__meta">
+        <span>{{ page.author | default: "Erik Newton" }}</span>
+        <span>{{ page.date | date: "%Y-%m-%d" }}</span>
+      </div>
+    </header>
+
+    {% if page.image %}
+    <div class="container" style="max-width: 68ch; margin: 0 auto 2.5rem;">
+      <img src="{{ page.image | relative_url }}" alt="{{ page.title }}" style="width:100%; height:auto; border-radius: var(--radius-lg);">
+    </div>
+    {% endif %}
+
+    <div class="prose">
+      {{ content }}
+    </div>
+
+    <div class="post__footer">
+      <a class="btn btn--terminal" href="{{ '/blog/' | relative_url }}">Back to all posts</a>
+    </div>
+  </article>
+</main>
+
+<footer class="footer">
+  <div class="container">
+    <div class="footer__grid">
+      <div class="footer__brand">
+        <a class="nav__brand" href="{{ '/' | relative_url }}">
+          <span class="nav__brand-mark" aria-hidden="true"></span>
+          Sanctuary
+        </a>
+        <p>Sovereignty infrastructure for AI agents. Security, privacy, and portable reputation — without changing your harness.</p>
+      </div>
+      <div class="footer__col">
+        <h5>Project</h5>
+        <ul>
+          <li><a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a></li>
+          <li><a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a></li>
+          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/README.md">Docs</a></li>
+        </ul>
+      </div>
+      <div class="footer__col">
+        <h5>Architecture</h5>
+        <ul>
+          <li><a href="{{ '/' | relative_url }}#layers">Four layers</a></li>
+          <li><a href="{{ '/' | relative_url }}#harnesses">Harness support</a></li>
+          <li><a href="{{ '/blog/' | relative_url }}">Journal</a></li>
+        </ul>
+      </div>
+      <div class="footer__col">
+        <h5>Legal</h5>
+        <ul>
+          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/LICENSE">License</a></li>
+          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/CODE_OF_CONDUCT.md">Code of Conduct</a></li>
+          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/GOVERNANCE.md">Governance</a></li>
+        </ul>
       </div>
     </div>
-  </nav>
-
-  <main>
-    <article class="post">
-      <header class="post-header">
-        {% if page.image %}
-        <div class="post-hero">
-          <img src="{{ page.image | relative_url }}" alt="{{ page.title }}">
-        </div>
-        {% endif %}
-        <h1>{{ page.title }}</h1>
-        <div class="post-meta">
-          <span class="post-author">{{ page.author | default: "Erik Newton" }}</span>
-          <span class="post-date">{{ page.date | date: "%B %-d, %Y" }}</span>
-        </div>
-      </header>
-      <div class="post-content">
-        {{ content }}
+    <div class="footer__bottom">
+      <div>&copy; {{ 'now' | date: "%Y" }} Erik Newton. Apache-2.0 (code) / CC-BY-4.0 (specification).</div>
+      <div class="footer__status">
+        <span class="footer__status-dot" aria-hidden="true"></span>
+        <span>live on npm</span>
       </div>
-    </article>
-    <div class="post-footer">
-      <a href="{{ '/blog' | relative_url }}">&larr; All posts</a>
     </div>
-  </main>
+  </div>
+</footer>
 
-  <footer class="site-footer">
-    <div class="footer-inner">
-      <p>&copy; {{ 'now' | date: "%Y" }} Erik Newton. Sanctuary Framework is open source under Apache-2.0 (code) and CC-BY-4.0 (specification).</p>
-    </div>
-  </footer>
 </body>
 </html>
