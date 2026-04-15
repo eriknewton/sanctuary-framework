@@ -1,18 +1,26 @@
 ---
 layout: default
-title: Blog | Sanctuary Protocol
+title: Journal | Sanctuary Protocol
+description: Design decisions, security write-ups, and reasoning behind the Sanctuary sovereignty stack.
+permalink: /blog/
 ---
 
-<h1 style="font-family: var(--font-heading); font-size: 2rem; color: var(--color-heading); margin-bottom: 2rem;">Blog</h1>
+<div class="section__heading" style="max-width: 68ch; margin-left: auto; margin-right: auto;">
+  <span class="eyebrow">Journal</span>
+  <h1>Field notes from the sovereignty layer.</h1>
+  <p>Architecture decisions, security reviews, and the reasoning behind every layer in the Sanctuary stack.</p>
+</div>
 
 <ul class="post-list">
   {% for post in site.posts %}
   <li>
     <a href="{{ post.url | relative_url }}">
-      <h2>{{ post.title }}</h2>
       <span class="post-date">{{ post.date | date: "%B %-d, %Y" }}</span>
-      {% if post.excerpt %}
-      <p class="post-excerpt">{{ post.excerpt | strip_html | truncatewords: 40 }}</p>
+      <h2>{{ post.title }}</h2>
+      {% if post.description %}
+        <p class="post-excerpt">{{ post.description | strip_html | truncatewords: 40 }}</p>
+      {% elsif post.excerpt %}
+        <p class="post-excerpt">{{ post.excerpt | strip_html | truncatewords: 40 }}</p>
       {% endif %}
     </a>
   </li>

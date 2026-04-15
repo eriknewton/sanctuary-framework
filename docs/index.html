@@ -2,351 +2,512 @@
 layout: null
 ---
 <!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sanctuary — Sovereignty infrastructure for agents</title>
+<meta name="description" content="Sanctuary is an open-source MCP server that gives AI agents encrypted state, self-custodied identity, human-in-the-loop approval gates, and verifiable reputation. Install with one command — no changes to your agent harness.">
+<meta name="author" content="Erik Newton">
+<meta name="theme-color" content="#0b1326">
 
-<html class="dark" lang="en"><head>
-<meta charset="utf-8"/>
-<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
-<title>Sanctuary — Sovereignty Infrastructure for Agents</title>
-<meta name="description" content="Sanctuary gives AI agents encrypted state, self-custodied identity, human-in-the-loop approval gates, and verifiable reputation — without changing the host harness." />
-<link href="https://fonts.googleapis.com" rel="preconnect"/>
-<link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&amp;family=Space+Grotesk:wght@400;500;600;700&amp;display=swap" rel="stylesheet"/>
-<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
-<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
-<script id="tailwind-config">
-      tailwind.config = {
-        darkMode: "class",
-        theme: {
-          extend: {
-            "colors": {
-                    "tertiary": "#47c4ff",
-                    "tertiary-container": "#2db7f2",
-                    "surface-dim": "#030604",
-                    "on-primary-fixed": "#000000",
-                    "error-container": "#a70138",
-                    "on-error": "#490013",
-                    "on-surface": "#e5e5ed",
-                    "surface-bright": "#292c35",
-                    "inverse-surface": "#faf8ff",
-                    "secondary-fixed-dim": "#d5b6ff",
-                    "on-secondary-fixed-variant": "#6b23c0",
-                    "tertiary-dim": "#05a9e3",
-                    "on-surface-variant": "#aaaab3",
-                    "secondary-container": "#610fb6",
-                    "outline-variant": "#46484f",
-                    "on-primary-container": "#001272",
-                    "surface-container-highest": "#23262e",
-                    "inverse-primary": "#3b50d3",
-                    "surface-tint": "#9ca8ff",
-                    "primary-fixed-dim": "#788aff",
-                    "on-tertiary": "#003b52",
-                    "primary": "#9ca8ff",
-                    "error-dim": "#d73357",
-                    "primary-container": "#8a99ff",
-                    "surface-container-high": "#1d1f27",
-                    "background": "#030604",
-                    "on-tertiary-fixed": "#001a27",
-                    "surface": "#030604",
-                    "tertiary-fixed": "#37bcf7",
-                    "tertiary-fixed-dim": "#1bafe9",
-                    "outline": "#74757d",
-                    "on-error-container": "#ffb2b9",
-                    "inverse-on-surface": "#53555c",
-                    "surface-variant": "#23262e",
-                    "on-primary": "#001a91",
-                    "secondary": "#b885ff",
-                    "on-secondary-fixed": "#490090",
-                    "on-tertiary-fixed-variant": "#003e56",
-                    "surface-container-lowest": "#000000",
-                    "on-secondary-container": "#dfc6ff",
-                    "on-secondary": "#2f0060",
-                    "on-tertiary-container": "#003044",
-                    "surface-container-low": "#11131a",
-                    "primary-dim": "#5367ea",
-                    "error": "#ff6e84",
-                    "secondary-fixed": "#e0c7ff",
-                    "secondary-dim": "#9150e7",
-                    "on-background": "#e5e5ed",
-                    "primary-fixed": "#8a99ff",
-                    "surface-container": "#171921",
-                    "on-primary-fixed-variant": "#00188b"
-            },
-            "borderRadius": {
-                    "DEFAULT": "0.125rem",
-                    "lg": "0.25rem",
-                    "xl": "0.5rem",
-                    "full": "0.75rem"
-            },
-            "fontFamily": {
-                    "headline": [
-                            "Space Grotesk"
-                    ],
-                    "body": [
-                            "Inter"
-                    ],
-                    "label": [
-                            "Inter"
-                    ]
-            }
-          },
-        },
-      }
-    </script>
-<style>
-        .material-symbols-outlined {
-            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
-        }
-        body {
-            background-color: #030604;
-            color: #e5e5ed;
-            font-family: 'Inter', sans-serif;
-            overflow-x: hidden;
-        }
-        .ethereal-glow {
-            background: radial-gradient(circle at 50% 50%, rgba(156, 168, 255, 0.08) 0%, rgba(12, 14, 20, 0) 70%);
-        }
-        .glass-panel {
-            background: rgba(23, 25, 33, 0.6);
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
-        }
-        .text-gradient {
-            background: linear-gradient(135deg, #e5e5ed 0%, #9ca8ff 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        .text-glow {
-            text-shadow: 0 0 30px rgba(156, 168, 255, 0.3);
-        }
-        .globe-mask-full {
-            mask-image: radial-gradient(ellipse 60% 55% at 50% 50%, black 40%, transparent 72%);
-            -webkit-mask-image: radial-gradient(ellipse 60% 55% at 50% 50%, black 40%, transparent 72%);
-        }
-    </style>
+<!-- Open Graph -->
+<meta property="og:title" content="Sanctuary — Sovereignty infrastructure for agents">
+<meta property="og:description" content="Encrypted state. Self-custodied identity. Approval gates. Portable reputation. One MCP server. Install in seconds.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://sanctuaryprotocol.ai/">
+<meta property="og:site_name" content="Sanctuary Protocol">
+<meta name="twitter:card" content="summary_large_image">
+
+<!-- Fonts -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap">
+
+<!-- Styles -->
+<link rel="stylesheet" href="/assets/css/site.css">
+
+<!-- Favicon: inline SVG diamond mark in signature gradient -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23ddb7ff'/%3E%3Cstop offset='1' stop-color='%234fdbc8'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath fill='url(%23g)' d='M16 2 30 16 16 30 2 16z'/%3E%3C/svg%3E">
 </head>
-<body class="selection:bg-primary/30 selection:text-primary">
-<!-- TopNavBar Shell -->
-<nav class="fixed top-0 w-full z-50 bg-slate-950/70 backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.5)]">
-<div class="flex justify-between items-center px-8 py-6 max-w-[1440px] mx-auto w-full font-['Space_Grotesk'] tracking-tight">
-<div class="text-2xl font-bold tracking-tighter text-[#e5e5ed]">
-                Sanctuary
-            </div>
-<!-- Desktop Links -->
-<div class="hidden md:flex gap-10 items-center">
-<a class="text-[#9ca8ff] font-semibold transition-colors duration-300" href="#layers">Architecture</a>
-<a class="text-[#e5e5ed]/60 hover:text-[#b885ff] transition-colors duration-300" href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
-<a class="text-[#e5e5ed]/60 hover:text-[#b885ff] transition-colors duration-300" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a>
-<a class="text-[#e5e5ed]/60 hover:text-[#b885ff] transition-colors duration-300" href="https://sanctuaryprotocol.ai/blog">Blog</a>
-</div>
-<div class="flex items-center gap-6">
-<a href="https://github.com/eriknewton/sanctuary-framework" class="bg-gradient-to-br from-primary-dim to-primary text-on-primary-fixed font-bold px-6 py-2.5 rounded-xl scale-95 active:scale-90 transition-transform inline-block no-underline">
-                    Get Started
-                </a>
-</div>
-</div>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<nav class="nav" aria-label="Primary">
+  <div class="nav__inner">
+    <a class="nav__brand" href="/">
+      <span class="nav__brand-mark" aria-hidden="true"></span>
+      Sanctuary
+    </a>
+    <div class="nav__links">
+      <a href="#layers">Architecture</a>
+      <a href="#quickstart">Quickstart</a>
+      <a href="#harnesses">Harnesses</a>
+      <a href="/blog/">Journal</a>
+      <a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
+    </div>
+    <div class="nav__actions">
+      <a class="btn btn--secondary btn--sm" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a>
+      <a class="btn btn--primary btn--sm" href="https://github.com/eriknewton/sanctuary-framework">Install</a>
+    </div>
+  </div>
 </nav>
-<main class="relative">
-<!-- Hero Section -->
-<section class="relative pt-48 pb-0 px-8 overflow-hidden pt-32">
-<div class="max-w-[1440px] mx-auto relative z-10">
-<div class="flex flex-col items-center text-center max-w-4xl mx-auto">
-<span class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-surface-container border border-outline-variant/10 text-primary font-label text-xs tracking-widest uppercase mb-8">
-<span class="w-2 h-2 rounded-full bg-primary animate-pulse"></span>
-                        Open Source &middot; Apache 2.0
-                    </span>
-<div class="relative z-30 mb-2">
-<h1 class="font-headline text-5xl md:text-6xl lg:text-7xl font-bold tracking-tighter text-[#e5e5ed] mb-8 leading-[1.1] text-glow">
-                            Sovereignty infrastructure <br/> <span class="text-gradient">for agents</span>
-</h1>
-<p class="font-body text-lg md:text-xl text-on-surface-variant max-w-2xl mx-auto leading-relaxed">
-                            Encrypted state. Self-custodied identity. Human-in-the-loop approval gates. Verifiable reputation. One MCP server. No changes to your agent harness.
-                        </p>
-</div>
-</div>
-<!-- Immersive Visualization (Globe) -->
-<div class="relative w-full flex items-center justify-center overflow-visible -mt-24 -mb-24">
-<!-- Soft Edge Fades using layered gradients to blend into background -->
-<div class="absolute inset-x-0 top-0 h-40 bg-gradient-to-b from-[#030604] to-transparent z-20 pointer-events-none"></div>
-<div class="absolute inset-x-0 bottom-0 h-40 bg-gradient-to-t from-[#030604] to-transparent z-20 pointer-events-none"></div>
-<div class="absolute inset-0 ethereal-glow scale-150"></div>
-<!-- Core Globe Image with Soft Fading Edges -->
-<div class="relative z-10 w-full max-w-[1200px] globe-mask-full">
-<img class="w-full h-auto object-contain opacity-90 transition-opacity duration-1000" alt="Glowing teal wireframe globe representing Sanctuary's sovereign infrastructure" src="images/globe.png"/>
-</div>
-</div>
-</div>
-</section>
-<!-- The Four Layers Section -->
-<section id="layers" class="px-8 relative pt-32">
-<div class="max-w-[1440px] mx-auto">
-<div class="flex flex-col items-center text-center max-w-3xl mx-auto mb-24">
-<h2 class="font-headline text-4xl font-bold tracking-tight mb-6">The Four Layers of Sanctuary</h2>
-<p class="text-on-surface-variant text-lg leading-relaxed">
-                            A vertical sovereignty stack. Each layer isolates a distinct concern — from encrypted memory to portable reputation — so agents and the humans behind them stay in control.
-                        </p>
-</div>
-<!-- Bento Grid for Layers -->
-<div class="grid grid-cols-1 md:grid-cols-4 gap-6">
-<!-- L1 — Cognitive Sovereignty -->
-<div class="md:col-span-1 p-8 rounded-[2rem] bg-surface-container border border-white/5 hover:bg-surface-container-high transition-all group flex flex-col justify-between h-[450px]">
-<div>
-<div class="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-primary mb-12">
-<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">security</span>
-</div>
-<h3 class="font-headline text-2xl font-bold mb-4">Cognitive Sovereignty</h3>
-<p class="text-on-surface-variant text-sm leading-relaxed">
-                                All agent state encrypted at rest with AES-256-GCM. Ed25519 self-custodied identity. Your agent's memory and keys belong to you — always.
-                            </p>
-</div>
-<div class="text-xs font-mono text-primary/40 uppercase tracking-widest">Layer 01</div>
-</div>
-<!-- L2 — Operational Isolation -->
-<div class="md:col-span-1 p-8 rounded-[2rem] bg-surface-container border border-white/5 hover:bg-surface-container-high transition-all group flex flex-col justify-between h-[450px]">
-<div>
-<div class="w-12 h-12 rounded-xl bg-secondary/10 flex items-center justify-center text-secondary mb-12">
-<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">enhanced_encryption</span>
-</div>
-<h3 class="font-headline text-2xl font-bold mb-4">Operational Isolation</h3>
-<p class="text-on-surface-variant text-sm leading-relaxed">
-                                Three-tier approval gate on every tool call. Dangerous operations require human confirmation. Anomaly detection flags unexpected behavior. Full audit trail.
-                            </p>
-</div>
-<div class="text-xs font-mono text-secondary/40 uppercase tracking-widest">Layer 02</div>
-</div>
-<!-- L3 — Selective Disclosure -->
-<div class="md:col-span-1 p-8 rounded-[2rem] bg-surface-container border border-white/5 hover:bg-surface-container-high transition-all group flex flex-col justify-between h-[450px]">
-<div>
-<div class="w-12 h-12 rounded-xl bg-tertiary/10 flex items-center justify-center text-tertiary mb-12">
-<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">hub</span>
-</div>
-<h3 class="font-headline text-2xl font-bold mb-4">Selective Disclosure</h3>
-<p class="text-on-surface-variant text-sm leading-relaxed">
-                                Prove claims without revealing data. Pedersen commitments, Schnorr proofs, and range proofs built on audited cryptographic primitives.
-                            </p>
-</div>
-<div class="text-xs font-mono text-tertiary/40 uppercase tracking-widest">Layer 03</div>
-</div>
-<!-- L4 — Verifiable Reputation -->
-<div class="md:col-span-1 p-8 rounded-[2rem] bg-surface-container border border-white/5 hover:bg-surface-container-high transition-all group flex flex-col justify-between h-[450px]">
-<div>
-<div class="w-12 h-12 rounded-xl bg-on-surface/10 flex items-center justify-center text-on-surface mb-12">
-<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">verified</span>
-</div>
-<h3 class="font-headline text-2xl font-bold mb-4">Verifiable Reputation</h3>
-<p class="text-on-surface-variant text-sm leading-relaxed">
-                                Signed attestations, sovereignty-gated trust tiers, and portable reputation bundles. Trust is earned, cryptographically verified, and never platform-locked.
-                            </p>
-</div>
-<div class="text-xs font-mono text-on-surface/40 uppercase tracking-widest">Layer 04</div>
-</div>
-</div>
-</div>
-</section>
-<!-- Technical Deep Dive (Editorial Style) -->
-<section class="py-32 px-8 bg-surface-container-low">
-<div class="max-w-[1440px] mx-auto grid grid-cols-1 lg:grid-cols-2 gap-32 items-center">
-<div class="relative">
-<div class="absolute -top-12 -left-12 w-64 h-64 bg-primary/20 rounded-full blur-[100px]"></div>
-<img class="rounded-[2.5rem] relative z-10 shadow-2xl" alt="Server infrastructure with violet lighting" src="images/editorial.png"/>
-<div class="absolute -bottom-8 -right-8 p-8 glass-panel rounded-3xl border border-white/10 z-20 max-w-xs">
-<p class="font-mono text-sm text-primary/80 leading-relaxed">npx @sanctuary-framework/mcp-server</p>
-<p class="mt-2 text-on-surface-variant text-sm leading-relaxed">One command. 62 MCP tools. Full sovereignty stack running locally.</p>
-</div>
-</div>
-<div class="flex flex-col gap-10">
-<h2 class="font-headline text-5xl font-bold leading-tight">Built for the people <br/><span class="text-secondary">who build agents</span></h2>
-<div class="space-y-8">
-<div class="flex gap-6">
-<div class="text-primary pt-1">
-<span class="material-symbols-outlined">terminal</span>
-</div>
-<div>
-<h4 class="font-headline text-xl font-semibold mb-2">Standard MCP Server</h4>
-<p class="text-on-surface-variant leading-relaxed">Works with Claude, OpenClaw, LM Studio, and any MCP-compatible harness. No fork needed — just connect and go.</p>
-</div>
-</div>
-<div class="flex gap-6">
-<div class="text-primary pt-1">
-<span class="material-symbols-outlined">dashboard</span>
-</div>
-<div>
-<h4 class="font-headline text-xl font-semibold mb-2">Real-Time Dashboard</h4>
-<p class="text-on-surface-variant leading-relaxed">Browser-based control surface for approving operations, monitoring sovereignty health, and configuring enforcement — all in real time via SSE.</p>
-</div>
-</div>
-<div class="flex gap-6">
-<div class="text-primary pt-1">
-<span class="material-symbols-outlined">handshake</span>
-</div>
-<div>
-<h4 class="font-headline text-xl font-semibold mb-2">Agent-to-Agent Trust</h4>
-<p class="text-on-surface-variant leading-relaxed">Sovereignty handshake protocol for mutual verification. Agents prove their security posture to each other before transacting.</p>
-</div>
-</div>
-</div>
-</div>
-</div>
-</section>
-<!-- Final CTA -->
-<section class="py-16 px-8">
-<div class="max-w-[1440px] mx-auto rounded-[3rem] bg-gradient-to-br p-12 md:p-20 text-center relative overflow-hidden bg-[#030604] border border-white/5">
-<div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/carbon-fibre.png')] opacity-5"></div>
-<div class="relative z-10 max-w-3xl mx-auto">
-<h2 class="font-headline text-3xl md:text-5xl font-bold mb-6 md:mb-8 leading-tight">Give your agent sovereignty in one command</h2>
-<p class="text-on-surface-variant text-lg mb-10">Open source. Runs locally. No platform dependency. No blockchain required.</p>
-<div class="flex flex-col md:flex-row justify-center gap-6">
-<a href="https://github.com/eriknewton/sanctuary-framework" class="bg-primary text-on-primary-fixed px-12 py-5 rounded-full font-bold hover:brightness-110 transition-all no-underline inline-block">View on GitHub</a>
-<a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server" class="border border-outline px-12 py-5 rounded-full font-bold hover:bg-white/5 transition-all no-underline inline-block">Install from npm</a>
-</div>
-</div>
-</div>
-</section>
-</main>
-<!-- Footer Shell -->
-<footer class="bg-[#030604] w-full py-16 px-8 border-t border-white/5">
-<div class="flex flex-col md:flex-row justify-between items-start gap-12 max-w-[1440px] mx-auto font-['Inter'] text-sm tracking-wide">
-<div class="max-w-xs">
-<div class="text-lg font-bold text-[#e5e5ed] mb-6">Sanctuary</div>
-<p class="text-[#e5e5ed]/40 leading-relaxed mb-8">
-                    Sovereignty infrastructure for AI agents. Security, privacy, and control — without changing your harness.
-                </p>
-<div class="flex gap-4">
-<a href="https://github.com/eriknewton" class="w-8 h-8 rounded-lg bg-surface-container flex items-center justify-center text-on-surface-variant hover:text-primary transition-colors cursor-pointer">
-<span class="material-symbols-outlined text-sm">code</span>
-</a>
-<a href="https://sanctuaryprotocol.ai/blog" class="w-8 h-8 rounded-lg bg-surface-container flex items-center justify-center text-on-surface-variant hover:text-primary transition-colors cursor-pointer">
-<span class="material-symbols-outlined text-sm">article</span>
-</a>
-</div>
-</div>
-<div class="grid grid-cols-2 md:grid-cols-3 gap-16">
-<div class="flex flex-col gap-4">
-<span class="text-[#e5e5ed] font-semibold mb-2">Project</span>
-<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
-<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm Package</a>
-<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://github.com/eriknewton/sanctuary-framework/blob/main/README.md">Documentation</a>
-</div>
-<div class="flex flex-col gap-4">
-<span class="text-[#e5e5ed] font-semibold mb-2">Ecosystem</span>
-<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://pypi.org/project/concordia-protocol/">Concordia Protocol</a>
-<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://sanctuaryprotocol.ai/blog">Blog</a>
-<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://github.com/eriknewton/sanctuary-framework/blob/main/CHANGELOG.md">Changelog</a>
-</div>
-<div class="flex flex-col gap-4">
-<span class="text-[#e5e5ed] font-semibold mb-2">Author</span>
-<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://github.com/eriknewton">Erik Newton</a>
-<a class="text-[#e5e5ed]/40 hover:text-[#e5e5ed] transition-opacity" href="https://cimc.ai">CIMC.ai</a>
-</div>
-</div>
-</div>
-<div class="max-w-[1440px] mx-auto mt-16 pt-8 border-t border-white/5 flex flex-col md:flex-row justify-between items-center gap-6">
-<div class="text-[#e5e5ed]/40 text-xs">
-                © 2026 Erik Newton. Apache-2.0 (code) / CC-BY-4.0 (spec).
+
+<main id="main">
+
+  <!-- ===================== HERO ===================== -->
+  <section class="hero container" aria-labelledby="hero-title">
+    <div class="hero__eyebrow">
+      <span class="hero__eyebrow-dot" aria-hidden="true"></span>
+      <span class="eyebrow">Open source · Apache-2.0 · v0.6.0</span>
+    </div>
+
+    <h1 id="hero-title" class="hero__title">
+      Sovereignty infrastructure<br>
+      for <span class="text-gradient">agents</span>.
+    </h1>
+
+    <p class="hero__sub">
+      Sanctuary is an MCP server that gives your agent encrypted state, self-custodied identity,
+      human-in-the-loop approval gates, and portable reputation. Drop it in any harness — Claude
+      Code, OpenClaw, CrewAI, LangChain — without touching your agent code.
+    </p>
+
+    <!-- Install block -->
+    <div class="install surface-card">
+      <div class="install__label">
+        <span>Install</span>
+        <span>Node 18+ · macOS · Linux · Windows</span>
+      </div>
+      <div class="install__row">
+        <code class="install__cmd mono"><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server</code>
+        <button type="button" class="install__copy" data-copy="npx @sanctuary-framework/mcp-server" aria-label="Copy install command">Copy</button>
+      </div>
+    </div>
+
+    <div class="btn-row" style="margin-bottom: 3rem;">
+      <a class="btn btn--primary" href="https://github.com/eriknewton/sanctuary-framework">
+        View on GitHub
+      </a>
+      <a class="btn btn--secondary" href="https://github.com/eriknewton/sanctuary-framework/blob/main/README.md">
+        Read the docs
+      </a>
+      <a class="btn btn--terminal" href="#quickstart">60-second quickstart</a>
+    </div>
+
+    <div class="hero__stats" aria-label="Project stats">
+      <div class="hero__stat"><strong>62</strong><span>MCP tools</span></div>
+      <div class="hero__stat"><strong>661</strong><span>Passing tests</span></div>
+      <div class="hero__stat"><strong>4</strong><span>Sovereignty layers</span></div>
+      <div class="hero__stat"><strong>0</strong><span>Harness changes</span></div>
+    </div>
+  </section>
+
+  <!-- ===================== PROVISIONING ===================== -->
+  <section class="section section--floor" aria-labelledby="provisioning-title">
+    <div class="container">
+      <div class="section__heading">
+        <span class="eyebrow">Local node</span>
+        <h2 id="provisioning-title">One command. <span class="text-gradient">Full stack, running locally.</span></h2>
+        <p>
+          Sanctuary runs on your hardware with your keys. Nothing leaves the machine unless you
+          approve it. Point any MCP-compatible agent at it and the whole sovereignty stack is live.
+        </p>
+      </div>
+
+      <div class="provisioning">
+        <!-- Boot log -->
+        <div class="bootlog" aria-label="Bootstrap log">
+          <div class="bootlog__header">
+            <span>boot.log</span>
+            <span>stdio://sanctuary</span>
+          </div>
+          <span class="bootlog__line t-hdr">:: bootstrap_local_node</span>
+          <span class="bootlog__line t-dim">generate_ed25519_keypair...</span>
+          <span class="bootlog__line">id: <span class="t-pri">did:key:z6Mki7f8a...e90</span></span>
+          <span class="bootlog__line">&nbsp;</span>
+          <span class="bootlog__line t-hdr">:: init_aes_256_gcm_encryption</span>
+          <span class="bootlog__line t-dim">master_kdf = argon2id(m=64mb, t=3, p=4)</span>
+          <span class="bootlog__line">mounting vault at <span class="t-pri">~/.sanctuary/state</span></span>
+          <span class="bootlog__line">&nbsp;</span>
+          <span class="bootlog__line t-hdr">:: load_principal_policy</span>
+          <span class="bootlog__line t-dim">tier_1 ops = 5 (approval gated)</span>
+          <span class="bootlog__line t-dim">tier_2 ops = 14 (anomaly gated)</span>
+          <span class="bootlog__line t-dim">tier_3 ops = 43 (audit logged)</span>
+          <span class="bootlog__line">&nbsp;</span>
+          <span class="bootlog__line t-hdr">:: spawn_approval_dashboard</span>
+          <span class="bootlog__line t-ok">status: gateway_online @ 127.0.0.1:3501</span>
+          <span class="bootlog__line">&nbsp;</span>
+          <span class="bootlog__line t-ok">&gt; ready. waiting for harness <span class="cursor">_</span></span>
+        </div>
+
+        <!-- Feature list -->
+        <ul class="provisioning__list">
+          <li class="provisioning__item">
+            <span class="provisioning__marker">01</span>
+            <div>
+              <h3 class="provisioning__heading">Client-side keys</h3>
+              <p class="provisioning__body">
+                Ed25519 identity generated locally. AES-256-GCM on every write. Keys never leave
+                the box — and never appear in any MCP response, log, or error.
+              </p>
             </div>
-<div class="flex items-center gap-2">
-<span class="w-2 h-2 rounded-full bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]"></span>
-<span class="text-[10px] uppercase tracking-widest text-[#e5e5ed]/60 font-mono">v0.5.14 Published on npm</span>
-</div>
-</div>
+          </li>
+          <li class="provisioning__item">
+            <span class="provisioning__marker">02</span>
+            <div>
+              <h3 class="provisioning__heading">Three-tier approval gate</h3>
+              <p class="provisioning__body">
+                Every tool call is classified before it runs. Tier 1 ops require out-of-band
+                human approval. Tier 2 anomalies prompt. Tier 3 auto-allow with encrypted audit.
+              </p>
+            </div>
+          </li>
+          <li class="provisioning__item">
+            <span class="provisioning__marker">03</span>
+            <div>
+              <h3 class="provisioning__heading">Local dashboard</h3>
+              <p class="provisioning__body">
+                Dark-theme web UI on <code class="mono">127.0.0.1:3501</code>. Real-time SSE,
+                approve/deny buttons, audit viewer. Optional TLS and webhook channels for
+                headless setups.
+              </p>
+            </div>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== FOUR LAYERS ===================== -->
+  <section id="layers" class="section" aria-labelledby="layers-title">
+    <div class="container">
+      <div class="section__heading">
+        <span class="eyebrow">Architecture</span>
+        <h2 id="layers-title">Four layers of sovereignty.</h2>
+        <p>
+          A vertical stack. Each layer isolates a distinct concern — from encrypted memory to
+          portable reputation — so both agents and the humans behind them stay in control.
+        </p>
+      </div>
+
+      <div class="layers">
+        <article class="layer surface-card">
+          <span class="layer__id">L1 · persistent memory</span>
+          <h3 class="layer__title">Cognitive Sovereignty</h3>
+          <p class="layer__body">
+            Every byte of agent state encrypted at rest with AES-256-GCM. Ed25519 self-custodied
+            identity. Merkle-rooted reads with rollback detection. Memory belongs to the principal.
+          </p>
+          <div class="layer__tags">
+            <span class="layer__tag">aes-256-gcm</span>
+            <span class="layer__tag">ed25519</span>
+            <span class="layer__tag">argon2id</span>
+          </div>
+        </article>
+
+        <article class="layer surface-card">
+          <span class="layer__id">L2 · operational isolation</span>
+          <h3 class="layer__title">Approval Gates</h3>
+          <p class="layer__body">
+            Three-tier principal policy wraps every tool call. Behavioral baseline tracks drift.
+            Context gating controls what flows to remote providers. Encrypted audit log.
+          </p>
+          <div class="layer__tags">
+            <span class="layer__tag">approval-gate</span>
+            <span class="layer__tag">context-gate</span>
+            <span class="layer__tag">audit-log</span>
+          </div>
+        </article>
+
+        <article class="layer surface-card">
+          <span class="layer__id">L3 · cryptographic disclosure</span>
+          <h3 class="layer__title">Selective Disclosure</h3>
+          <p class="layer__body">
+            Pedersen commitments on Ristretto255. Schnorr proofs of knowledge. Bit-decomposition
+            range proofs. Prove claims about data without revealing the underlying values.
+          </p>
+          <div class="layer__tags">
+            <span class="layer__tag">pedersen</span>
+            <span class="layer__tag">schnorr</span>
+            <span class="layer__tag">range-proofs</span>
+          </div>
+        </article>
+
+        <article class="layer surface-card">
+          <span class="layer__id">L4 · application</span>
+          <h3 class="layer__title">Verifiable Reputation</h3>
+          <p class="layer__body">
+            Signed, sovereignty-weighted attestations. Portable reputation bundles that follow
+            an identity across platforms. Trust bootstrapping via escrow and handshake.
+          </p>
+          <div class="layer__tags">
+            <span class="layer__tag">eas-compat</span>
+            <span class="layer__tag">portable</span>
+            <span class="layer__tag">handshake</span>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== HARNESSES ===================== -->
+  <section id="harnesses" class="section section--floor" aria-labelledby="harnesses-title">
+    <div class="container">
+      <div class="section__heading">
+        <span class="eyebrow">Interop</span>
+        <h2 id="harnesses-title">Drop it into any harness.</h2>
+        <p>
+          Sanctuary speaks standard MCP. No forks, no adapters, no special case for your stack.
+          Point your harness at the server and every tool in the sovereignty layer becomes
+          available to your agent immediately.
+        </p>
+      </div>
+
+      <div class="harnesses">
+        <article class="surface-card">
+          <div class="harness__title">
+            <strong>Claude Code</strong>
+            <span>mcp · stdio</span>
+          </div>
+          <div class="code-card">
+<pre><code><span class="token--dim">// .mcp.json</span>
+"mcpServers": {
+  "sanctuary": {
+    "command": "npx",
+    "args": ["@sanctuary-framework/mcp-server"]
+  }
+}</code></pre>
+          </div>
+        </article>
+
+        <article class="surface-card">
+          <div class="harness__title">
+            <strong>OpenClaw</strong>
+            <span>mcp · stdio</span>
+          </div>
+          <div class="code-card">
+<pre><code><span class="token--dim"># ~/.openclaw/mcp.yaml</span>
+servers:
+  sanctuary:
+    type: stdio
+    command: sanctuary-mcp
+    args: []</code></pre>
+          </div>
+        </article>
+
+        <article class="surface-card">
+          <div class="harness__title">
+            <strong>CrewAI</strong>
+            <span>python · mcp</span>
+          </div>
+          <div class="code-card">
+<pre><code><span class="token--dim"># crewai native mcps field</span>
+agent = Agent(
+  role="analyst",
+  mcps=["sanctuary"],
+  tools=[],
+)</code></pre>
+          </div>
+        </article>
+
+        <article class="surface-card">
+          <div class="harness__title">
+            <strong>LangChain</strong>
+            <span>python · adapter</span>
+          </div>
+          <div class="code-card">
+<pre><code><span class="token--dim"># langchain-mcp-adapters</span>
+from langchain_mcp import MCPTool
+sanctuary = MCPTool.from_stdio(
+  "npx", ["@sanctuary-framework/mcp-server"],
+)</code></pre>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== QUICKSTART ===================== -->
+  <section id="quickstart" class="section" aria-labelledby="quickstart-title">
+    <div class="container">
+      <div class="section__heading">
+        <span class="eyebrow">60 seconds</span>
+        <h2 id="quickstart-title">From zero to <span class="text-gradient">sovereign</span>.</h2>
+        <p>
+          Three commands. A local vault, a self-custodied identity, and a running approval
+          dashboard before your coffee cools.
+        </p>
+      </div>
+
+      <div class="quickstart">
+        <article class="step surface-card">
+          <span class="step__number">Step 01 · Install</span>
+          <h3 class="step__heading">Boot the server</h3>
+          <p class="step__body">One npx command. No global install, no build step, no config file required.</p>
+<pre class="step__code"><code><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server</code></pre>
+        </article>
+
+        <article class="step surface-card">
+          <span class="step__number">Step 02 · Connect</span>
+          <h3 class="step__heading">Wire into your harness</h3>
+          <p class="step__body">Add Sanctuary as an MCP server in your harness config. No agent code changes.</p>
+<pre class="step__code"><code><span class="token--dim">$</span> claude mcp add sanctuary npx @sanctuary-framework/mcp-server</code></pre>
+        </article>
+
+        <article class="step surface-card">
+          <span class="step__number">Step 03 · Approve</span>
+          <h3 class="step__heading">Open the dashboard</h3>
+          <p class="step__body">Approve sensitive operations in real time at the local dashboard URL.</p>
+<pre class="step__code"><code><span class="token--dim">$</span> open http://127.0.0.1:3501</code></pre>
+        </article>
+      </div>
+
+      <div class="btn-row" style="margin-top: 2.5rem; justify-content: center;">
+        <a class="btn btn--primary" href="https://github.com/eriknewton/sanctuary-framework">Clone the repo</a>
+        <a class="btn btn--secondary" href="https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#quickstart">Full quickstart guide</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== JOURNAL ===================== -->
+  <section class="section section--floor" aria-labelledby="journal-title">
+    <div class="container">
+      <div class="section__heading">
+        <span class="eyebrow">Journal</span>
+        <h2 id="journal-title">Field notes from the sovereignty layer.</h2>
+        <p>Design decisions, security write-ups, and the reasoning behind the architecture.</p>
+      </div>
+
+      <div class="journal">
+        <a class="journal__card surface-card" href="/blog/">
+          <div class="journal__meta">
+            <span>Architecture</span>
+            <span>2026-03-30</span>
+          </div>
+          <h3 class="journal__title">Local ≠ Sovereign</h3>
+          <p class="journal__excerpt">
+            Why physical custody of state is necessary but nowhere near sufficient. The four
+            properties a local-first agent actually needs before it can claim sovereignty.
+          </p>
+          <span class="btn btn--terminal">Read the post</span>
+        </a>
+
+        <a class="journal__card surface-card" href="/blog/">
+          <div class="journal__meta">
+            <span>Theory</span>
+            <span>2026-03-30</span>
+          </div>
+          <h3 class="journal__title">What sovereign actually means</h3>
+          <p class="journal__excerpt">
+            Past marketing abstraction into a formal definition: participant-held keys, client-side
+            encryption, verifiable reputation, and the approval gate around every risky op.
+          </p>
+          <span class="btn btn--terminal">Read the post</span>
+        </a>
+      </div>
+
+      <div class="btn-row" style="margin-top: 2.5rem;">
+        <a class="btn btn--secondary" href="/blog/">All posts →</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== CTA ===================== -->
+  <section class="section" aria-labelledby="cta-title">
+    <div class="container">
+      <div class="cta surface-card">
+        <span class="eyebrow">Ship sovereign agents</span>
+        <h2 id="cta-title">Give your agent sovereignty in one command.</h2>
+        <p>Open source. Runs locally. No platform dependency. No blockchain. No telemetry.</p>
+        <div class="btn-row" style="justify-content: center;">
+          <a class="btn btn--primary" href="https://github.com/eriknewton/sanctuary-framework">View on GitHub</a>
+          <a class="btn btn--secondary" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">Install from npm</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ===================== FOOTER ===================== -->
+<footer class="footer">
+  <div class="container">
+    <div class="footer__grid">
+      <div class="footer__brand">
+        <a class="nav__brand" href="/">
+          <span class="nav__brand-mark" aria-hidden="true"></span>
+          Sanctuary
+        </a>
+        <p>
+          Sovereignty infrastructure for AI agents. Security, privacy, and portable reputation —
+          without changing your harness.
+        </p>
+      </div>
+
+      <div class="footer__col">
+        <h5>Project</h5>
+        <ul>
+          <li><a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a></li>
+          <li><a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a></li>
+          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/README.md">Docs</a></li>
+          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/CHANGELOG.md">Changelog</a></li>
+        </ul>
+      </div>
+
+      <div class="footer__col">
+        <h5>Architecture</h5>
+        <ul>
+          <li><a href="#layers">Four layers</a></li>
+          <li><a href="#harnesses">Harness support</a></li>
+          <li><a href="#quickstart">Quickstart</a></li>
+          <li><a href="/blog/">Journal</a></li>
+        </ul>
+      </div>
+
+      <div class="footer__col">
+        <h5>Legal</h5>
+        <ul>
+          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/LICENSE">License</a></li>
+          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/CODE_OF_CONDUCT.md">Code of Conduct</a></li>
+          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/GOVERNANCE.md">Governance</a></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="footer__bottom">
+      <div>© 2026 Erik Newton. Apache-2.0 (code) / CC-BY-4.0 (specification).</div>
+      <div class="footer__status">
+        <span class="footer__status-dot" aria-hidden="true"></span>
+        <span>v0.6.0 · live on npm</span>
+      </div>
+    </div>
+  </div>
 </footer>
-</body></html>
+
+<script>
+  // Copy-to-clipboard for install block (progressive enhancement)
+  (function () {
+    var buttons = document.querySelectorAll('[data-copy]');
+    if (!buttons.length || !navigator.clipboard) return;
+    buttons.forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var text = btn.getAttribute('data-copy');
+        navigator.clipboard.writeText(text).then(function () {
+          var original = btn.textContent;
+          btn.textContent = 'Copied';
+          btn.setAttribute('data-copied', 'true');
+          setTimeout(function () {
+            btn.textContent = original;
+            btn.removeAttribute('data-copied');
+          }, 1600);
+        }).catch(function () { /* no-op on failure */ });
+      });
+    });
+  })();
+</script>
+
+</body>
+</html>
