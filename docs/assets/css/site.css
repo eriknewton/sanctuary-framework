@@ -7,9 +7,9 @@
 /* ---------- Tokens ---------- */
 :root {
   /* Surface hierarchy (dark-only) */
-  --surface: #0b1326;                   /* L0 — The Void */
+  --surface: #040a1a;                   /* L0 — The Void (tuned to match screen.png target) */
   --surface-container-lowest: #060e20;  /* code blocks */
-  --surface-container-low: #131b2e;     /* L1 — Floor / sections */
+  --surface-container-low: rgba(19, 27, 46, 0.6); /* L1 — translucent so grid bleeds through */
   --surface-container: #171f33;         /* L2 — Cards */
   --surface-container-highest: #2d3449; /* L3 — Elevated */
   --surface-bright: #31394d;            /* Luminous glass */
@@ -60,9 +60,16 @@ html {
   text-size-adjust: 100%;
 }
 
-html,
-body {
+/* Grid lives on <html> so body's flex/overflow rules never clip it.
+   <html> is the viewport root; its painted background always fills
+   the visible area regardless of body sizing or scroll position. */
+html {
   background-color: var(--surface);
+  background-image:
+    linear-gradient(rgba(99, 155, 255, 0.07) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(99, 155, 255, 0.07) 1px, transparent 1px);
+  background-size: 48px 48px;
+  background-attachment: fixed;
   color: var(--on-surface-variant);
   font-family: var(--font-body);
   font-size: 16px;
@@ -71,13 +78,15 @@ body {
 }
 
 body {
+  background-color: transparent; /* let <html> grid bleed through */
+  min-height: 100vh;
   overflow-x: hidden;
   display: flex;
   flex-direction: column;
   font-weight: 400;
 }
 
-/* Subtle ambient luminance applied to the void */
+/* Second layer: quieted ambient luminance over the grid */
 body::before {
   content: '';
   position: fixed;
@@ -85,8 +94,8 @@ body::before {
   z-index: 0;
   pointer-events: none;
   background:
-    radial-gradient(ellipse 60% 40% at 15% 10%, rgba(221, 183, 255, 0.06), transparent 60%),
-    radial-gradient(ellipse 55% 35% at 85% 90%, rgba(79, 219, 200, 0.05), transparent 65%);
+    radial-gradient(ellipse 60% 40% at 15% 10%, rgba(221, 183, 255, 0.04), transparent 60%),
+    radial-gradient(ellipse 55% 35% at 85% 90%, rgba(79, 219, 200, 0.03), transparent 65%);
 }
 
 main,
