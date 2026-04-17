@@ -35,8 +35,8 @@ export interface DashboardHandle {
   publish: (event: StreamEvent) => void;
   /**
    * Push a fresh activity entry. Exposes a simple shortcut so callers
-   * (e.g. the Cocoon proxy) can report tool calls without constructing
-   * a StreamEvent themselves.
+   * (e.g. the Sanctuary proxy / upstream clients) can report tool calls
+   * without constructing a StreamEvent themselves.
    */
   publishActivity: (entry: ActivityEntry) => void;
   /** Push a new pending approval (already added by the approval channel). */
