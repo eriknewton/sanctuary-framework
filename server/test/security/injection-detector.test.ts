@@ -253,6 +253,18 @@ describe("InjectionDetector", () => {
       expect(evasionSignal?.pattern).toBe("zero_width_characters");
     });
 
+    it("detects all four zero-width char types in a single scan (audit #38)", () => {
+      const result = detector.scan("test/tool", {
+        text: "a\u200Bb\u200Cc\u200Dd\uFEFFe",
+      });
+      expect(result.flagged).toBe(true);
+      expect(
+        result.signals.some(
+          (s) => s.type === "encoding_evasion" && s.pattern === "zero_width_characters"
+        )
+      ).toBe(true);
+    });
+
     it("detects Unicode category mixing (3+ categories)", () => {
       // Latin + CJK + Arabic
       const result = detector.scan("test/tool", {

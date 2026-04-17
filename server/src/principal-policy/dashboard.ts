@@ -21,7 +21,7 @@
 
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { exec } from "node:child_process";
 import { platform } from "node:os";
@@ -182,23 +182,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * Start the HTTP(S) server for the dashboard.
    */
   async start(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const handler = (req: IncomingMessage, res: ServerResponse) => this.handleRequest(req, res);
+    const handler = (req: IncomingMessage, res: ServerResponse) => this.handleRequest(req, res);
 
-      if (this.useTLS && this.config.tls) {
-        const tlsOpts = {
-          cert: readFileSync(this.config.tls.cert_path),
-          key: readFileSync(this.config.tls.key_path),
-        };
-        this.httpServer = createHttpsServer(tlsOpts, handler);
-      } else {
-        this.httpServer = createHttpServer(handler);
-      }
+    let server;
+    if (this.useTLS && this.config.tls) {
+      const tlsOpts = {
+        cert: await readFile(this.config.tls.cert_path),
+        key: await readFile(this.config.tls.key_path),
+      };
+      server = createHttpsServer(tlsOpts, handler);
+    } else {
+      server = createHttpServer(handler);
+    }
+    this.httpServer = server;
+
+    return new Promise((resolve, reject) => {
 
       const protocol = this.useTLS ? "https" : "http";
       const baseUrl = `${protocol}://${this.config.host}:${this.config.port}`;
 
-      this.httpServer.listen(this.config.port, this.config.host, () => {
+      server.listen(this.config.port, this.config.host, () => {
         // Generate a pre-authenticated one-click URL
         const sessionUrl = this.authToken ? this.createSessionUrl() : baseUrl;
 
@@ -225,7 +228,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
         resolve();
       });
-      this.httpServer.on("error", (err: NodeJS.ErrnoException) => {
+      server.on("error", (err: NodeJS.ErrnoException) => {
         if (err.code === "EADDRINUSE") {
           const port = this.config.port;
           process.stderr.write(
