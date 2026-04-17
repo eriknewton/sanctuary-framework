@@ -336,4 +336,97 @@ describe("L4 Reputation Store", () => {
       }
     });
   });
+
+  // ─── v0.9.1: L4 evidence summary for SHR + dashboard ─────────────
+  describe("summarizeForSHR", () => {
+    it("returns zero counts on an empty store", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const summary = await store.summarizeForSHR();
+      expect(summary.attestation_count).toBe(0);
+      expect(summary.most_recent_attestation_at).toBeNull();
+      expect(summary.dispute_count).toBe(0);
+      expect(summary.context_breakdown).toEqual({});
+      expect(summary.tier_distribution["verified-sovereign"]).toBe(0);
+    });
+
+    it("counts attestations by tier and context, tracks the most recent", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "a1", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey,
+        undefined, "verified-sovereign"
+      );
+      await store.record(
+        "a2", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey,
+        undefined, "self-attested"
+      );
+      await store.record(
+        "a3", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "negotiation", identity, encryptionKey,
+        undefined, "unverified"
+      );
+
+      const summary = await store.summarizeForSHR();
+      expect(summary.attestation_count).toBe(3);
+      expect(summary.tier_distribution["verified-sovereign"]).toBe(1);
+      expect(summary.tier_distribution["self-attested"]).toBe(1);
+      expect(summary.tier_distribution["unverified"]).toBe(1);
+      expect(summary.context_breakdown["commerce"]).toBe(2);
+      expect(summary.context_breakdown["negotiation"]).toBe(1);
+      expect(summary.most_recent_attestation_at).toBeTruthy();
+    });
+
+    it("counts disputes from outcome_result === 'disputed'", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "ok", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey
+      );
+      await store.record(
+        "bad", "did:key:cp",
+        { type: "dispute", result: "disputed" },
+        "commerce", identity, encryptionKey
+      );
+
+      const summary = await store.summarizeForSHR();
+      expect(summary.dispute_count).toBe(1);
+      expect(summary.attestation_count).toBe(2);
+    });
+
+    it("filters by participant_did when provided", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "a1", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey
+      );
+
+      // Summary for a different DID should return zero counts
+      const foreign = await store.summarizeForSHR("did:key:someone-else");
+      expect(foreign.attestation_count).toBe(0);
+
+      // Summary for the actual participant returns the record
+      const self = await store.summarizeForSHR(identity.did);
+      expect(self.attestation_count).toBe(1);
+    });
+  });
 });
