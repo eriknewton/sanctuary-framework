@@ -15,6 +15,10 @@ import type { IdentityManager } from "../l1-cognitive/tools.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import type { BaselineTracker } from "../principal-policy/baseline.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";
+import type { L4Evidence } from "../shr/generator.js";
+import { deriveL4Degradations } from "../shr/generator.js";
+import type { SHRDegradation } from "../shr/types.js";
+import type { SovereigntyTier } from "../l4-reputation/tiers.js";
 
 export type LayerState = "full" | "degraded" | "compromised";
 export type OverallStatus = "healthy" | "degraded" | "compromised";
@@ -55,6 +59,14 @@ export interface L3Status {
   proofs_today: number;
 }
 
+/** A single L4 degradation surfaced to the dashboard widget. */
+export interface L4ActiveDegradation {
+  code: string;
+  severity: "info" | "warning" | "critical";
+  description: string;
+  mitigation?: string;
+}
+
 export interface L4Status {
   label: string;
   state: LayerState;
@@ -62,6 +74,27 @@ export interface L4Status {
   score: number | null;
   profile_url: string | null;
   claim_cta: string | null;
+  /**
+   * Evidence surfaced under the L4 tile so users can tell what underlies
+   * the reputation state. Null when no reputation store is wired in
+   * (standalone mode, some tests).
+   */
+  evidence?: {
+    attestation_count: number;
+    tier_distribution: Record<SovereigntyTier, number>;
+    most_recent_attestation_at: string | null;
+    dispute_count: number;
+    context_breakdown: Record<string, number>;
+    verascore_linked: boolean;
+  };
+  /**
+   * SHR-aligned L4 layer score (0-100) when evidence is available.
+   * Computed with the same scoring model the gateway adapter uses so
+   * counterparties and the dashboard agree on the number.
+   */
+  layer_score?: number;
+  /** Active L4 degradations rendered under the widget. */
+  active_degradations?: L4ActiveDegradation[];
 }
 
 export interface ActivityEntry {
@@ -126,6 +159,42 @@ export interface AggregatorSources {
   pendingApprovals?: PendingApproval[];
   reputation?: ReputationLookup;
   teeAvailable?: boolean;
+  /**
+   * Pre-computed L4 reputation evidence for the primary identity. When
+   * present the dashboard renders the evidence widget under the L4 tile
+   * and computes an SHR-aligned L4 layer score. Providers build this
+   * via `gatherL4Evidence` from `shr/tools.ts`.
+   */
+  l4Evidence?: L4Evidence;
+  /** Clock override for deterministic staleness rendering in tests. */
+  l4Now?: Date;
+}
+
+/**
+ * Severity → point impact for the SHR L4 layer score. Mirrors the
+ * gateway-adapter DEGRADATION_IMPACT table so the dashboard and the SHR
+ * gateway export agree on the number.
+ */
+const L4_DEGRADATION_IMPACT: Record<"critical" | "warning" | "info", number> = {
+  critical: 40,
+  warning: 25,
+  info: 10,
+};
+
+function computeL4LayerScore(
+  degradations: SHRDegradation[],
+  status: LayerState
+): number {
+  if (status === "compromised") return 0;
+  let score = 100;
+  for (const deg of degradations) {
+    score -= L4_DEGRADATION_IMPACT[deg.severity] ?? 10;
+  }
+  score = Math.max(0, score);
+  if (degradations.length === 0 && score > 50) {
+    score = Math.min(100, score + 5);
+  }
+  return Math.round(score);
 }
 
 const MAX_ACTIVITY = 50;
@@ -263,33 +332,96 @@ function buildL3(
 function buildL4(sources: AggregatorSources): L4Status {
   const rep = sources.reputation;
   const hasDid = !!sources.identityManager?.getDefault()?.did;
-  if (rep?.score != null) {
-    return {
-      label: "L4 Reputation",
-      state: "full",
-      headline: "Verascore attached",
-      score: rep.score,
-      profile_url: rep.profile_url,
-      claim_cta: null,
-    };
-  }
-  if (hasDid) {
-    return {
-      label: "L4 Reputation",
-      state: "degraded",
-      headline: "Claim your profile",
-      score: null,
-      profile_url: null,
-      claim_cta: "Claim your profile at verascore.ai",
-    };
-  }
+
+  // Evidence-derived fields — present when the caller wired in a
+  // reputation store. These do not replace the Verascore score; they
+  // complement it so the dashboard can honestly describe the underlying
+  // attestation state even when a Verascore score is attached.
+  const evidenceBlock = buildL4EvidenceBlock(sources);
+
+  const base: L4Status = rep?.score != null
+    ? {
+        label: "L4 Reputation",
+        state: "full",
+        headline: "Verascore attached",
+        score: rep.score,
+        profile_url: rep.profile_url,
+        claim_cta: null,
+      }
+    : hasDid
+      ? {
+          label: "L4 Reputation",
+          state: "degraded",
+          headline: "Claim your profile",
+          score: null,
+          profile_url: null,
+          claim_cta: "Claim your profile at verascore.ai",
+        }
+      : {
+          label: "L4 Reputation",
+          state: "degraded",
+          headline: "No identity claimed",
+          score: null,
+          profile_url: null,
+          claim_cta: "Claim your profile at verascore.ai",
+        };
+
+  if (!evidenceBlock) return base;
+
+  // Apply the evidence-aware overrides: if any L4 degradations fire and
+  // the tile is otherwise "full" (Verascore attached), downgrade the
+  // state so the widget reflects the full SHR truth.
+  const nextState: LayerState =
+    evidenceBlock.active_degradations.length > 0 && base.state === "full"
+      ? "degraded"
+      : base.state;
+  const nextHeadline =
+    nextState === base.state
+      ? base.headline
+      : "Attached, but evidence is degraded";
+
   return {
-    label: "L4 Reputation",
-    state: "degraded",
-    headline: "No identity claimed",
-    score: null,
-    profile_url: null,
-    claim_cta: "Claim your profile at verascore.ai",
+    ...base,
+    state: nextState,
+    headline: nextHeadline,
+    evidence: evidenceBlock.evidence,
+    layer_score: evidenceBlock.layer_score,
+    active_degradations: evidenceBlock.active_degradations,
+  };
+}
+
+interface L4EvidenceBlock {
+  evidence: NonNullable<L4Status["evidence"]>;
+  layer_score: number;
+  active_degradations: L4ActiveDegradation[];
+}
+
+function buildL4EvidenceBlock(
+  sources: AggregatorSources
+): L4EvidenceBlock | null {
+  const ev = sources.l4Evidence;
+  if (!ev) return null;
+
+  const degradations = deriveL4Degradations(ev, sources.l4Now ?? new Date());
+  const status: LayerState = degradations.length > 0 ? "degraded" : "full";
+  const layer_score = computeL4LayerScore(degradations, status);
+
+  return {
+    evidence: {
+      attestation_count: ev.attestation_count,
+      tier_distribution: ev.tier_distribution,
+      most_recent_attestation_at: ev.most_recent_attestation_at,
+      dispute_count: ev.dispute_count,
+      context_breakdown: ev.context_breakdown ?? {},
+      verascore_linked: ev.verascore_linked,
+    },
+    layer_score,
+    active_degradations: degradations.map((d) => ({
+      code: d.code,
+      severity: d.severity,
+      description: d.description,
+      ...(d.mitigation !== undefined ? { mitigation: d.mitigation } : {}),
+    })),
   };
 }
 

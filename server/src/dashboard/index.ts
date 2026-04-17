@@ -16,6 +16,7 @@ import type {
   PendingApproval,
   ReputationLookup,
 } from "./aggregator.js";
+import type { L4Evidence } from "../shr/generator.js";
 import {
   startDashboardServer,
   type DashboardHandle,
@@ -56,6 +57,13 @@ export interface StartDashboardOptions {
   initialActivity?: ActivityEntry[];
   /** Seed pending approvals. Runtime approvals arrive via publishApproval. */
   initialPendingApprovals?: PendingApproval[];
+  /**
+   * Pre-computed L4 reputation evidence. When provided the dashboard
+   * renders the L4 evidence widget (attestation count, tier distribution,
+   * disputes, freshness, active degradations). Typically supplied by the
+   * server after L4 tools are constructed.
+   */
+  l4Evidence?: L4Evidence;
 }
 
 /**
@@ -83,6 +91,7 @@ export async function startDashboard(
     ...(options.policy ? { policy: options.policy } : {}),
     ...(options.reputation ? { reputation: options.reputation } : {}),
     ...(options.teeAvailable != null ? { teeAvailable: options.teeAvailable } : {}),
+    ...(options.l4Evidence ? { l4Evidence: options.l4Evidence } : {}),
     activity,
     pendingApprovals: pending,
   };
