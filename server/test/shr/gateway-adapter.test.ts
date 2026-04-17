@@ -395,4 +395,126 @@ describe("Ping Identity Gateway Adapter", () => {
       }
     });
   });
+
+  // ─── v0.9.1: new L4 degradation codes surface correctly ──────────
+  describe("L4 degradation codes (v0.9.1)", () => {
+    function zeroTiers() {
+      return {
+        "verified-sovereign": 0,
+        "verified-degraded": 0,
+        "self-attested": 0,
+        "unverified": 0,
+      } as const;
+    }
+
+    it("transforms NO_REPUTATION_HISTORY into a gateway authorization impact", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+        l4Evidence: {
+          attestation_count: 0,
+          tier_distribution: { ...zeroTiers() },
+          most_recent_attestation_at: null,
+          dispute_count: 0,
+          context_breakdown: {},
+          verascore_linked: true,
+        },
+      }) as SignedSHR;
+
+      const context = transformSHRForGateway(shr);
+      const entry = context.degradations.find(
+        (d) => d.code === "NO_REPUTATION_HISTORY"
+      );
+      expect(entry).toBeDefined();
+      expect(entry?.authorization_impact).toMatch(/new counterparty|escrow/i);
+      expect(entry?.authorization_impact).not.toBe("Unknown authorization impact");
+    });
+
+    it("transforms each new L4 code without falling through to 'Unknown'", () => {
+      const now = new Date("2026-05-01T00:00:00Z");
+      const stale = new Date(
+        now.getTime() - 60 * 24 * 60 * 60 * 1000
+      ).toISOString();
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+        now,
+        l4Evidence: {
+          attestation_count: 5,
+          tier_distribution: {
+            "verified-sovereign": 0,
+            "verified-degraded": 0,
+            "self-attested": 4,
+            "unverified": 1,
+          },
+          most_recent_attestation_at: stale,
+          dispute_count: 2,
+          context_breakdown: { commerce: 5 },
+          verascore_linked: false,
+        },
+      }) as SignedSHR;
+
+      const context = transformSHRForGateway(shr);
+      const l4Entries = context.degradations.filter((d) => d.layer === "l4");
+
+      const codes = l4Entries.map((e) => e.code).sort();
+      expect(codes).toEqual(
+        [
+          "LOW_TIER_DOMINANCE",
+          "STALE_REPUTATION",
+          "DISPUTE_ON_RECORD",
+          "NO_VERASCORE_LINK",
+        ].sort()
+      );
+      for (const entry of l4Entries) {
+        expect(entry.authorization_impact).toBeTruthy();
+        expect(entry.authorization_impact).not.toBe(
+          "Unknown authorization impact"
+        );
+      }
+    });
+
+    it("subtracts DEGRADATION_IMPACT from the L4 layer score when L4 degradations fire", () => {
+      const healthyShr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+        l4Evidence: {
+          attestation_count: 10,
+          tier_distribution: {
+            "verified-sovereign": 10,
+            "verified-degraded": 0,
+            "self-attested": 0,
+            "unverified": 0,
+          },
+          most_recent_attestation_at: new Date().toISOString(),
+          dispute_count: 0,
+          context_breakdown: { commerce: 10 },
+          verascore_linked: true,
+        },
+      }) as SignedSHR;
+
+      const degradedShr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+        l4Evidence: {
+          attestation_count: 0,
+          tier_distribution: { ...zeroTiers() },
+          most_recent_attestation_at: null,
+          dispute_count: 0,
+          context_breakdown: {},
+          verascore_linked: false,
+        },
+      }) as SignedSHR;
+
+      const healthy = transformSHRForGateway(healthyShr);
+      const degraded = transformSHRForGateway(degradedShr);
+      expect(degraded.layer_scores.l4_reputation).toBeLessThan(
+        healthy.layer_scores.l4_reputation
+      );
+    });
+  });
 });
