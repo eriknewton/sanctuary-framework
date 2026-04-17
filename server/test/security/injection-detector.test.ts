@@ -865,8 +865,9 @@ describe("InjectionDetector", () => {
       const elapsed = Date.now() - start;
 
       // Must complete in bounded time, not hang (old regex version would take seconds)
-      // Threshold generous for CI/sandbox environments
-      expect(elapsed).toBeLessThan(500);
+      // Threshold: 2s. ReDoS would hang for tens of seconds; 2s is comfortable
+      // on shared CI runners while still catching pathological regex regression.
+      expect(elapsed).toBeLessThan(2000);
       expect(result.flagged).toBe(true);
       const types = result.signals.map(s => s.type);
       expect(types).toContain("prompt_stuffing");
