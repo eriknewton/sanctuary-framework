@@ -148,7 +148,11 @@ export function deepSortKeys(obj: unknown): unknown {
 
 /**
  * Canonical serialization suitable for signing.
+ *
+ * Accepts SHRBody or any structurally compatible body (e.g.
+ * DecommissionCertificateBody) — the underlying deepSortKeys
+ * operates on arbitrary objects.
  */
-export function canonicalizeForSigning(body: SHRBody): string {
+export function canonicalizeForSigning(body: object): string {
   return JSON.stringify(deepSortKeys(body));
 }

@@ -175,7 +175,7 @@ export async function generateDecommissionCertificate(
 
   // ── Canonical serialization and signing
   // Use the same canonicalization as SHR for consistency
-  const canonical = canonicalizeSHR(body as any); // Cast to SHRBody type for reuse
+  const canonical = canonicalizeSHR(body);
   const payload = stringToBytes(canonical);
 
   // Sign with the agent's private key

@@ -951,16 +951,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
 
-    const identities = this.identityManager.list().map(id => ({
-      identity_id: id.identity_id,
-      label: id.label,
-      public_key: id.public_key,
-      did: id.did,
-      created_at: id.created_at,
-      key_type: id.key_type,
-      key_protection: id.key_protection,
-      rotation_count: (id as any).rotation_history?.length ?? 0,
-    }));
+    const identities = this.identityManager.listWithRotationCount();
 
     const primary = this.identityManager.getDefault();
 
