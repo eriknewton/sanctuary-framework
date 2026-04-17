@@ -140,8 +140,7 @@ Already running an agent on OpenClaw, Claude Code, or Cursor? One command wraps 
 npx @sanctuary-framework/mcp-server wrap --openclaw
 ```
 
-<!-- TODO: coordinator will record and drop in docs/images/wrap-demo.gif -->
-![wrap demo](./docs/images/wrap-demo.gif)
+<!-- Demo gif planned — see docs/images/ after recording -->
 
 **Before (six steps):**
 
@@ -208,19 +207,19 @@ Sanctuary defines four layers of protection, each serving a specific purpose:
 | **L4: Verifiable Reputation** | Earned trust — your agent builds a portable track record |
 
 **The tool set:**
-- 67 MCP tools across four layers
+- 75 MCP tools across four layers
 - Principal Policy (who can do what)
 - Sovereignty Health Reports (SHR)
 - Handshake protocol (mutual verification)
 - Federation (multi-agent coordination)
 - Context Gating (automatic sensitive-data filtering)
 - Gateway Export (audit trail for compliance)
+- EU AI Act Compliance Generator
 
 **Documentation:**
-- [Full Specification](docs/sanctuary_framework.md) — complete technical spec
+- [CLAUDE.md](CLAUDE.md) — complete architecture, security invariants, and threat model
 - [Sovereignty Health Report (SHR)](docs/SHR.md) — how agents prove trustworthiness
-- [Architecture Guide](docs/ARCHITECTURE.md) — how the four layers fit together
-- [API Reference](docs/TOOLS.md) — all 67 tools, with examples
+- [Security Audit](docs/audit/) — structured review artifacts and remediation history
 
 **Design Principles:**
 1. Privacy by default, disclosure by choice
