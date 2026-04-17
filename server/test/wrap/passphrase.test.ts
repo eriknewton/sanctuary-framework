@@ -14,10 +14,28 @@ import { join } from "node:path";
 import {
   getOrCreatePassphrase,
   readStoredPassphrase,
+  persistUserProvidedPassphrase,
   generatePassphrase,
   fallbackFilePath,
+  PassphraseUnreadableError,
   type ExecResult,
 } from "../../src/cocoon/passphrase.js";
+
+/**
+ * Deterministic key deriver with a caller-chosen seed — used by the SEC-062
+ * tests to simulate a machine-key mismatch without touching real hostname /
+ * uid / username. Same seed = same key (readable); different seed = different
+ * key (unreadable by design).
+ */
+function makeDeterministicDeriver(seed: string): (home: string) => Uint8Array {
+  return (_home: string) => {
+    const bytes = new Uint8Array(32);
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = (seed.charCodeAt(i % seed.length) ^ (i * 31)) & 0xff;
+    }
+    return bytes;
+  };
+}
 
 type ExecCall = { cmd: string; args: string[]; input?: string };
 
@@ -171,5 +189,216 @@ describe("passphrase", () => {
     expect(read).not.toBeNull();
     expect(read!.value).toBe(created.value);
     expect(read!.source).toBe("fallback-file");
+  });
+});
+
+// ── SEC-062 regression: fallback file must distinguish NOT_FOUND from
+//    UNREADABLE and never silently regenerate over the latter. ────────────
+
+describe("passphrase — SEC-062 unreadable-file handling", () => {
+  let home: string;
+
+  beforeEach(async () => {
+    home = await mkdtemp(join(tmpdir(), "sanctuary-passphrase-sec062-"));
+  });
+
+  afterEach(async () => {
+    await rm(home, { recursive: true, force: true });
+  });
+
+  it("throws PassphraseUnreadableError when the fallback file exists but cannot be decrypted", async () => {
+    const { exec } = makeExec();
+    const originalDeriver = makeDeterministicDeriver("original-machine-key");
+    const migratedDeriver = makeDeterministicDeriver("migrated-machine-key");
+
+    // Seed the fallback file under the ORIGINAL deriver.
+    const first = await getOrCreatePassphrase({
+      home,
+      platformOverride: "linux",
+      exec,
+      deriveMachineKey: originalDeriver,
+    });
+    expect(first.source).toBe("generated");
+    const fallback = fallbackFilePath(home);
+    const originalBytes = await readFile(fallback);
+
+    // Now simulate a machine migration — same file, different deriver.
+    await expect(
+      getOrCreatePassphrase({
+        home,
+        platformOverride: "linux",
+        exec,
+        deriveMachineKey: migratedDeriver,
+      })
+    ).rejects.toThrow(PassphraseUnreadableError);
+
+    // Critical: the fallback file contents MUST NOT have been overwritten.
+    const afterBytes = await readFile(fallback);
+    expect(afterBytes.equals(originalBytes)).toBe(true);
+  });
+
+  it("readStoredPassphrase also throws on an unreadable fallback file", async () => {
+    const { exec } = makeExec();
+    const originalDeriver = makeDeterministicDeriver("original-machine-key");
+    const migratedDeriver = makeDeterministicDeriver("migrated-machine-key");
+
+    await getOrCreatePassphrase({
+      home,
+      platformOverride: "linux",
+      exec,
+      deriveMachineKey: originalDeriver,
+    });
+
+    await expect(
+      readStoredPassphrase({
+        home,
+        platformOverride: "linux",
+        exec,
+        deriveMachineKey: migratedDeriver,
+      })
+    ).rejects.toThrow(PassphraseUnreadableError);
+  });
+
+  it("generates fresh passphrase only when fallback file does not exist; a second call reads it back without regenerating", async () => {
+    const { exec } = makeExec();
+    const deriver = makeDeterministicDeriver("stable-machine-key");
+
+    const first = await getOrCreatePassphrase({
+      home,
+      platformOverride: "linux",
+      exec,
+      deriveMachineKey: deriver,
+    });
+    expect(first.source).toBe("generated");
+
+    const second = await getOrCreatePassphrase({
+      home,
+      platformOverride: "linux",
+      exec,
+      deriveMachineKey: deriver,
+    });
+    expect(second.source).toBe("fallback-file");
+    expect(second.value).toBe(first.value);
+  });
+
+  it("PassphraseUnreadableError message names the file path and lists recovery options", async () => {
+    const { exec } = makeExec();
+    const originalDeriver = makeDeterministicDeriver("original-machine-key");
+    const migratedDeriver = makeDeterministicDeriver("migrated-machine-key");
+
+    await getOrCreatePassphrase({
+      home,
+      platformOverride: "linux",
+      exec,
+      deriveMachineKey: originalDeriver,
+    });
+
+    try {
+      await getOrCreatePassphrase({
+        home,
+        platformOverride: "linux",
+        exec,
+        deriveMachineKey: migratedDeriver,
+      });
+      throw new Error("expected PassphraseUnreadableError");
+    } catch (err) {
+      expect(err).toBeInstanceOf(PassphraseUnreadableError);
+      const msg = (err as Error).message;
+      expect(msg).toContain(fallbackFilePath(home));
+      expect(msg).toContain("SANCTUARY_PASSPHRASE");
+      expect(msg.toLowerCase()).toContain("backup");
+    }
+  });
+
+  it("Keychain wins when it has a valid value even if the fallback file is unreadable (darwin)", async () => {
+    // Seed Keychain with a known value.
+    const { exec, stored } = makeExec();
+    stored.set("sanctuary:sanctuary-passphrase", "known-keychain-value");
+
+    // Write a fallback file with one deriver, then try to read with another —
+    // but since Keychain is populated, the fallback should never be touched.
+    const originalDeriver = makeDeterministicDeriver("original-machine-key");
+    const migratedDeriver = makeDeterministicDeriver("migrated-machine-key");
+
+    // Seed fallback file too (to exercise the "both present" branch).
+    await getOrCreatePassphrase({
+      home,
+      platformOverride: "linux",
+      exec,
+      deriveMachineKey: originalDeriver,
+    });
+
+    const result = await getOrCreatePassphrase({
+      home,
+      platformOverride: "darwin",
+      exec,
+      deriveMachineKey: migratedDeriver,
+    });
+    expect(result.source).toBe("keychain");
+    expect(result.value).toBe("known-keychain-value");
+  });
+});
+
+// ── persistUserProvidedPassphrase: one-time setter for --passphrase flag ───
+
+describe("persistUserProvidedPassphrase", () => {
+  let home: string;
+
+  beforeEach(async () => {
+    home = await mkdtemp(join(tmpdir(), "sanctuary-persist-"));
+  });
+
+  afterEach(async () => {
+    await rm(home, { recursive: true, force: true });
+  });
+
+  it("writes to Keychain on darwin and returns source=keychain", async () => {
+    const { exec, stored } = makeExec();
+    const result = await persistUserProvidedPassphrase("user-supplied-value", {
+      home,
+      platformOverride: "darwin",
+      exec,
+    });
+    expect(result.source).toBe("keychain");
+    expect(result.location).toBe("macOS Keychain");
+    expect(stored.get("sanctuary:sanctuary-passphrase")).toBe(
+      "user-supplied-value"
+    );
+  });
+
+  it("writes to fallback file on linux and returns source=fallback-file", async () => {
+    const { exec } = makeExec();
+    const result = await persistUserProvidedPassphrase("user-supplied-value", {
+      home,
+      platformOverride: "linux",
+      exec,
+    });
+    expect(result.source).toBe("fallback-file");
+    expect(result.location).toBe(fallbackFilePath(home));
+    // And the value round-trips through the store.
+    const readBack = await readStoredPassphrase({
+      home,
+      platformOverride: "linux",
+      exec,
+    });
+    expect(readBack?.value).toBe("user-supplied-value");
+  });
+
+  it("falls back to the file when Keychain write fails on darwin", async () => {
+    const exec = async (
+      cmd: string,
+      args: string[]
+    ): Promise<ExecResult> => {
+      if (cmd === "security" && args[0] === "add-generic-password") {
+        return { stdout: "", stderr: "keychain locked", code: 1 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    };
+    const result = await persistUserProvidedPassphrase("user-supplied-value", {
+      home,
+      platformOverride: "darwin",
+      exec,
+    });
+    expect(result.source).toBe("fallback-file");
   });
 });

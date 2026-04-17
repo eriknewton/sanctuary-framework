@@ -5,13 +5,18 @@
  * boot are covered by integration tests elsewhere.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   parseWrapArgs,
   parseCocoonArgs,
   formatWrapSuccess,
+  runWrap,
   COCOON_GOVERNOR_DEFAULTS,
   type DashboardStarter,
+  type RunWrapDeps,
 } from "../../src/cocoon/cli.js";
 
 describe("parseWrapArgs", () => {
@@ -224,5 +229,138 @@ describe("port fallback", () => {
     for (let p = 3501; p <= 3510; p++) busy.push(p);
     const { starter } = makeStarter(busy);
     await expect(startWithFallback(starter, 3501)).rejects.toThrow(/No free/);
+  });
+});
+
+// ── SEC-061 regression: --passphrase must never land in the rewritten config ─
+//
+// End-to-end-lite test: invoke `runWrap` against a temp config file and assert
+// that a user-supplied `--passphrase` value is never passed to the config
+// rewrite. See docs/audit/DELTA_REVIEW_V0.9.0_RC1.md SEC-061 / CLEAN-018.
+
+describe("runWrap — SEC-061 passphrase leak regression", () => {
+  let tempHome: string;
+  let originalHome: string | undefined;
+  let configPath: string;
+
+  function fakeDashboardStarter(): DashboardStarter {
+    return async (opts) => ({
+      url: `http://127.0.0.1:${opts.port}`,
+      port: opts.port,
+      host: "127.0.0.1",
+      stop: async () => {},
+      publish: () => {},
+      publishActivity: () => {},
+      publishApproval: () => {},
+    });
+  }
+
+  beforeEach(async () => {
+    tempHome = await mkdtemp(join(tmpdir(), "sanctuary-runwrap-"));
+    originalHome = process.env.HOME;
+    process.env.HOME = tempHome;
+    configPath = join(tempHome, "openclaw.json");
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        mcp: {
+          servers: {
+            demo: {
+              command: "node",
+              args: ["demo-server.js"],
+            },
+          },
+        },
+      }),
+      "utf-8"
+    );
+  });
+
+  afterEach(async () => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    await rm(tempHome, { recursive: true, force: true });
+  });
+
+  /**
+   * The rewrite spy both records the args it received AND writes a minimal
+   * post-rewrite file shape so the downstream verifyRewrittenConfig step
+   * (which reads configPath and expects `mcp.servers.sanctuary.command`)
+   * passes without coupling the test to the real rewrite implementation.
+   */
+  function makeRewriteSpy(): ReturnType<typeof vi.fn> {
+    return vi.fn(async (_agentConfig, command: string, args: string[]) => {
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          mcp: {
+            servers: {
+              sanctuary: { command, args },
+            },
+          },
+        }),
+        "utf-8"
+      );
+      return configPath;
+    });
+  }
+
+  it("does not write the user-supplied --passphrase into the rewritten agent config", async () => {
+    const rewriteSpy = makeRewriteSpy();
+    const persistSpy = vi.fn(async (_value: string) => ({
+      location: "macOS Keychain",
+      source: "keychain" as const,
+    }));
+    const openBrowser = vi.fn(async () => {});
+
+    const deps: RunWrapDeps = {
+      startDashboard: fakeDashboardStarter(),
+      openBrowser,
+      persistPassphrase: persistSpy,
+      rewriteConfig: rewriteSpy,
+    };
+
+    const sentinel = "CHECK-ME-NOT-IN-CONFIG-xxx";
+
+    await runWrap(
+      { wrap: configPath, passphrase: sentinel, noOpen: true },
+      deps
+    );
+
+    expect(rewriteSpy).toHaveBeenCalledTimes(1);
+    const rewriteArgs = rewriteSpy.mock.calls[0]?.[2] as string[];
+    expect(rewriteArgs).toEqual(["@sanctuary-framework/mcp-server"]);
+    expect(rewriteArgs.join(" ")).not.toContain(sentinel);
+    expect(rewriteArgs).not.toContain("--passphrase");
+
+    expect(persistSpy).toHaveBeenCalledTimes(1);
+    expect(persistSpy).toHaveBeenCalledWith(sentinel);
+
+    // The on-disk config must also not contain the sentinel anywhere.
+    const onDisk = await readFile(configPath, "utf-8");
+    expect(onDisk).not.toContain(sentinel);
+    expect(onDisk).not.toContain("--passphrase");
+  });
+
+  it("rewrites with a constant args list even when no --passphrase is supplied", async () => {
+    const rewriteSpy = makeRewriteSpy();
+    const resolveSpy = vi.fn(async () => ({
+      value: "random-generated-value",
+      location: "macOS Keychain",
+      source: "generated",
+    }));
+
+    await runWrap(
+      { wrap: configPath, noOpen: true },
+      {
+        startDashboard: fakeDashboardStarter(),
+        openBrowser: async () => {},
+        resolvePassphrase: resolveSpy,
+        rewriteConfig: rewriteSpy,
+      }
+    );
+
+    const rewriteArgs = rewriteSpy.mock.calls[0]?.[2] as string[];
+    expect(rewriteArgs).toEqual(["@sanctuary-framework/mcp-server"]);
   });
 });

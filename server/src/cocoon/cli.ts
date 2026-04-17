@@ -32,7 +32,11 @@ import {
   type AgentPlatform,
   type MCPServerEntry,
 } from "./config-reader.js";
-import { getOrCreatePassphrase } from "./passphrase.js";
+import {
+  getOrCreatePassphrase,
+  persistUserProvidedPassphrase,
+  PassphraseUnreadableError,
+} from "./passphrase.js";
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
 import { SANCTUARY_VERSION } from "../config.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
@@ -95,6 +99,18 @@ export interface RunWrapDeps {
   openBrowser?: (url: string) => Promise<void>;
   /** Override passphrase resolver (for tests). */
   resolvePassphrase?: () => Promise<{ value: string; location: string; source: string }>;
+  /**
+   * Override the persistence helper for a user-supplied `--passphrase` flag
+   * (for tests). Production callers leave this undefined.
+   */
+  persistPassphrase?: (
+    value: string
+  ) => Promise<{ location: string; source: "keychain" | "fallback-file" }>;
+  /**
+   * Override the config rewrite (for tests). Production callers leave this
+   * undefined.
+   */
+  rewriteConfig?: typeof rewriteConfigForCocoon;
 }
 
 export async function runWrap(
@@ -179,28 +195,58 @@ export async function runWrap(
   }
 
   // Resolve or generate passphrase.
-  let passphraseValue: string;
-  let passphraseLocation = "passphrase flag";
-  let passphraseSource = "flag";
+  //
+  // Invariant: the resolved passphrase never reaches argv or the rewritten
+  // agent config. User-supplied `--passphrase` is treated as a one-time
+  // setter — we persist it into Keychain/fallback and the launcher
+  // re-resolves it at runtime via the same path everyone else uses.
+  // See SEC-061 in docs/audit/DELTA_REVIEW_V0.9.0_RC1.md.
+  let passphraseLocation: string;
+  let passphraseSource: string;
   if (options.passphrase) {
-    passphraseValue = options.passphrase;
-  } else if (process.env.SANCTUARY_PASSPHRASE) {
-    passphraseValue = process.env.SANCTUARY_PASSPHRASE;
-    passphraseLocation = "SANCTUARY_PASSPHRASE";
-    passphraseSource = "env";
-  } else {
-    const resolve = deps.resolvePassphrase ?? (() => getOrCreatePassphrase());
-    const resolved = await resolve();
-    passphraseValue = resolved.value;
-    passphraseLocation = resolved.location;
-    passphraseSource = resolved.source;
-    if (resolved.source === "generated") {
+    try {
+      const persist =
+        deps.persistPassphrase ??
+        ((value: string) => persistUserProvidedPassphrase(value));
+      const persisted = await persist(options.passphrase);
+      passphraseLocation = persisted.location;
+      passphraseSource = persisted.source;
       console.error(
-        `\n  \u{1F510} Generated and stored passphrase (${resolved.location}).`
+        `\n  \u{1F510} Persisted user-supplied passphrase (${persisted.location}).`
       );
       console.error(
         `  Back up with: sanctuary export-passphrase`
       );
+    } catch (err) {
+      console.error(`\n  Sanctuary — Passphrase Persistence Failed`);
+      console.error(`  ${(err as Error).message}`);
+      console.error("");
+      process.exit(2);
+    }
+  } else if (process.env.SANCTUARY_PASSPHRASE) {
+    passphraseLocation = "SANCTUARY_PASSPHRASE";
+    passphraseSource = "env";
+  } else {
+    try {
+      const resolve = deps.resolvePassphrase ?? (() => getOrCreatePassphrase());
+      const resolved = await resolve();
+      passphraseLocation = resolved.location;
+      passphraseSource = resolved.source;
+      if (resolved.source === "generated") {
+        console.error(
+          `\n  \u{1F510} Generated and stored passphrase (${resolved.location}).`
+        );
+        console.error(
+          `  Back up with: sanctuary export-passphrase`
+        );
+      }
+    } catch (err) {
+      if (err instanceof PassphraseUnreadableError) {
+        console.error(`\n  Sanctuary — Passphrase Unreadable`);
+        console.error(`  ${err.message}\n`);
+        process.exit(2);
+      }
+      throw err;
     }
   }
 
@@ -222,13 +268,14 @@ export async function runWrap(
     wrappedAt: new Date().toISOString(),
   });
 
-  await rewriteConfigForCocoon(
+  // The args list is a constant — never inject `--passphrase`. The launcher
+  // re-resolves the stored passphrase at runtime from Keychain / fallback
+  // file / SANCTUARY_PASSPHRASE env var. See SEC-061.
+  const rewrite = deps.rewriteConfig ?? rewriteConfigForCocoon;
+  await rewrite(
     agentConfig,
     "npx",
-    [
-      "@sanctuary-framework/mcp-server",
-      ...(passphraseSource === "flag" ? ["--passphrase", passphraseValue] : []),
-    ]
+    ["@sanctuary-framework/mcp-server"]
   );
 
   const verifyOk = await verifyRewrittenConfig(

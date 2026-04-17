@@ -11,15 +11,7 @@
 
 import type { ProtectionSnapshot } from "./aggregator.js";
 
-/**
- * Hero copy options for Erik to pick on merge. Swap the value
- * of `HERO_COPY` to the chosen string. Keep this as a single
- * constant so it's a one-line change.
- *
- * Option 1: "Your agent is protected."
- * Option 2: "Sovereignty active."
- * Option 3: "Sanctuary engaged."
- */
+/** Hero copy. Change here if we ever A/B test. */
 export const HERO_COPY = "Your agent is protected.";
 
 export interface DashboardHTMLOptions {

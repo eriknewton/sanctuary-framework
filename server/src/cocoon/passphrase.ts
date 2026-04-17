@@ -47,7 +47,43 @@ export interface PassphraseOptions {
    * Tests inject a mock to avoid touching the real Keychain.
    */
   exec?: (cmd: string, args: string[], input?: string) => Promise<ExecResult>;
+  /**
+   * Override the machine-local key derivation (for tests that simulate
+   * host/user migration). Production callers leave this undefined.
+   */
+  deriveMachineKey?: (home: string) => Uint8Array;
 }
+
+/**
+ * Raised when the fallback passphrase file exists but cannot be decrypted.
+ * Never auto-regenerate in response — that would permanently destroy all
+ * state encrypted under the previous passphrase. Surface the error and let
+ * the user restore from backup, re-import via SANCTUARY_PASSPHRASE, or run
+ * a future `sanctuary reset-passphrase` subcommand (not yet implemented).
+ */
+export class PassphraseUnreadableError extends Error {
+  readonly path: string;
+  readonly reason: string;
+  constructor(path: string, reason: string) {
+    super(
+      `Sanctuary passphrase file at ${path} exists but could not be decrypted (${reason}).\n\n` +
+        `Your existing encrypted state cannot be recovered with a new passphrase. Options:\n` +
+        `  1. Restore ${path} from a backup.\n` +
+        `  2. Re-import the original passphrase via SANCTUARY_PASSPHRASE=<value> sanctuary wrap ...\n` +
+        `  3. Run \`sanctuary reset-passphrase\` (coming soon) to wipe state and start fresh.\n\n` +
+        `Refusing to regenerate the passphrase — that would permanently destroy the data encrypted under the previous key.`
+    );
+    this.name = "PassphraseUnreadableError";
+    this.path = path;
+    this.reason = reason;
+  }
+}
+
+/** Outcome of reading the fallback passphrase file. */
+type FallbackReadResult =
+  | { status: "ok"; value: string }
+  | { status: "not-found" }
+  | { status: "unreadable"; reason: string };
 
 export interface ExecResult {
   stdout: string;
@@ -59,6 +95,10 @@ export interface ExecResult {
 
 /**
  * Resolve the passphrase: read from Keychain/fallback, or generate + store.
+ *
+ * Throws {@link PassphraseUnreadableError} when Keychain is empty/unavailable
+ * AND the fallback file exists but cannot be decrypted. Never auto-regenerates
+ * in that case — see the error class for remediation steps.
  */
 export async function getOrCreatePassphrase(
   opts: PassphraseOptions = {}
@@ -66,6 +106,7 @@ export async function getOrCreatePassphrase(
   const home = opts.home ?? homedir();
   const plat = opts.platformOverride ?? platform();
   const exec = opts.exec ?? defaultExec;
+  const derive = opts.deriveMachineKey ?? deriveMachineKey;
 
   // 1. Try Keychain (macOS only).
   if (plat === "darwin") {
@@ -77,16 +118,19 @@ export async function getOrCreatePassphrase(
 
   // 2. Try fallback file.
   const fallback = fallbackFilePath(home);
-  const fromFile = await readFromFallbackFile(fallback, home);
-  if (fromFile) {
+  const fromFile = await readFromFallbackFile(fallback, home, derive);
+  if (fromFile.status === "ok") {
     return {
-      value: fromFile,
+      value: fromFile.value,
       source: "fallback-file",
       location: fallback,
     };
   }
+  if (fromFile.status === "unreadable") {
+    throw new PassphraseUnreadableError(fallback, fromFile.reason);
+  }
 
-  // 3. Generate and store.
+  // 3. Generate and store (only reachable when no prior passphrase exists).
   const value = generatePassphrase();
   if (plat === "darwin") {
     const ok = await writeToKeychain(value, exec);
@@ -95,13 +139,16 @@ export async function getOrCreatePassphrase(
     }
   }
 
-  await writeToFallbackFile(fallback, value, home);
+  await writeToFallbackFile(fallback, value, home, derive);
   return { value, source: "generated", location: fallback };
 }
 
 /**
  * Read the stored passphrase without generating a new one.
  * Used by the `export-passphrase` subcommand.
+ *
+ * Throws {@link PassphraseUnreadableError} when the fallback file exists but
+ * cannot be decrypted (same semantics as {@link getOrCreatePassphrase}).
  */
 export async function readStoredPassphrase(
   opts: PassphraseOptions = {}
@@ -109,6 +156,7 @@ export async function readStoredPassphrase(
   const home = opts.home ?? homedir();
   const plat = opts.platformOverride ?? platform();
   const exec = opts.exec ?? defaultExec;
+  const derive = opts.deriveMachineKey ?? deriveMachineKey;
 
   if (plat === "darwin") {
     const fromKc = await readFromKeychain(exec);
@@ -118,16 +166,58 @@ export async function readStoredPassphrase(
   }
 
   const fallback = fallbackFilePath(home);
-  const fromFile = await readFromFallbackFile(fallback, home);
-  if (fromFile) {
+  const fromFile = await readFromFallbackFile(fallback, home, derive);
+  if (fromFile.status === "ok") {
     return {
-      value: fromFile,
+      value: fromFile.value,
       source: "fallback-file",
       location: fallback,
     };
   }
+  if (fromFile.status === "unreadable") {
+    throw new PassphraseUnreadableError(fallback, fromFile.reason);
+  }
 
   return null;
+}
+
+/**
+ * Persist a user-supplied passphrase into Keychain (macOS) or the fallback
+ * file (all other platforms). Used by `sanctuary wrap --passphrase <value>`
+ * so the value never reaches argv or the rewritten agent config.
+ *
+ * Fails loudly if both storage paths are unavailable — per CLAUDE.md
+ * invariant 5 ("Never silently degrade to a less-secure behavior on error").
+ */
+export async function persistUserProvidedPassphrase(
+  value: string,
+  opts: PassphraseOptions = {}
+): Promise<{ location: string; source: "keychain" | "fallback-file" }> {
+  const home = opts.home ?? homedir();
+  const plat = opts.platformOverride ?? platform();
+  const exec = opts.exec ?? defaultExec;
+  const derive = opts.deriveMachineKey ?? deriveMachineKey;
+
+  if (plat === "darwin") {
+    const ok = await writeToKeychain(value, exec);
+    if (ok) {
+      return { location: "macOS Keychain", source: "keychain" };
+    }
+    // Keychain failed — try fallback file before giving up.
+  }
+
+  const fallback = fallbackFilePath(home);
+  try {
+    await writeToFallbackFile(fallback, value, home, derive);
+  } catch (err) {
+    throw new Error(
+      `Could not persist the provided passphrase to either Keychain or ${fallback}: ` +
+        `${(err as Error).message}. ` +
+        `Refusing to proceed — writing the passphrase into the rewritten agent config would ` +
+        `leak it as plaintext at rest and in process argv.`
+    );
+  }
+  return { location: fallback, source: "fallback-file" };
 }
 
 /** Generate a 32-byte base64-encoded passphrase. */
@@ -183,36 +273,43 @@ export function fallbackFilePath(home: string): string {
 
 async function readFromFallbackFile(
   path: string,
-  home: string
-): Promise<string | null> {
+  home: string,
+  derive: (home: string) => Uint8Array = deriveMachineKey
+): Promise<FallbackReadResult> {
   try {
     await access(path);
   } catch {
-    return null;
+    return { status: "not-found" };
   }
   try {
     const raw = await readFile(path);
-    if (raw.length < 13) return null;
+    if (raw.length < 13) {
+      return { status: "unreadable", reason: "file too short to contain a valid nonce + ciphertext" };
+    }
     const nonce = raw.subarray(0, 12);
     const ciphertext = raw.subarray(12);
-    const key = deriveMachineKey(home);
+    const key = derive(home);
     const cipher = gcm(key, nonce);
     const plain = cipher.decrypt(ciphertext);
-    return Buffer.from(plain).toString("utf-8");
-  } catch {
-    return null;
+    return { status: "ok", value: Buffer.from(plain).toString("utf-8") };
+  } catch (err) {
+    return {
+      status: "unreadable",
+      reason: (err as Error).message ?? "unknown decryption error",
+    };
   }
 }
 
 async function writeToFallbackFile(
   path: string,
   value: string,
-  home: string
+  home: string,
+  derive: (home: string) => Uint8Array = deriveMachineKey
 ): Promise<void> {
   const dir = join(home, ".sanctuary");
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const nonce = randomBytes(12);
-  const key = deriveMachineKey(home);
+  const key = derive(home);
   const cipher = gcm(key, nonce);
   const ciphertext = cipher.encrypt(Buffer.from(value, "utf-8"));
   const payload = Buffer.concat([nonce, Buffer.from(ciphertext)]);
