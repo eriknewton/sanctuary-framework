@@ -138,7 +138,7 @@ describe("getProtectionSnapshot", () => {
     expect(snap.agent.did_fingerprint).toMatch(/^.{6}….{6}$/);
   });
 
-  it("counts L3 proofs and injection blocks from today only", async () => {
+  it("counts proof-creation ops and injection blocks from today only", async () => {
     const today = new Date();
     today.setHours(12, 0, 0, 0);
     const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
@@ -147,7 +147,7 @@ describe("getProtectionSnapshot", () => {
       {
         timestamp: today.toISOString(),
         layer: "l3",
-        operation: "proof_generate",
+        operation: "zk_prove",
         identity_id: "id-1",
         result: "success",
       },
@@ -161,7 +161,7 @@ describe("getProtectionSnapshot", () => {
       {
         timestamp: yesterday.toISOString(),
         layer: "l3",
-        operation: "proof_generate",
+        operation: "zk_prove",
         identity_id: "id-1",
         result: "success",
       },
@@ -235,5 +235,158 @@ describe("getProtectionSnapshot", () => {
     );
     expect(snap.overall.light === "yellow" || snap.overall.light === "red").toBe(true);
     expect(snap.layers.l1.injection_blocked_today).toBeGreaterThanOrEqual(25);
+  });
+
+  // ── Counter filter tests (rc.4) ───────────────────────────────────
+
+  describe("vc_count filter", () => {
+    const today = new Date();
+    today.setHours(10, 0, 0, 0);
+
+    it("counts reputation_record as a VC-issuing op", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        identityManager: stubIdentityManager(stubIdentity()),
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l4", operation: "reputation_record", identity_id: "id-1", result: "success" },
+        ]),
+      }));
+      expect(snap.layers.l3.vc_count).toBe(1);
+    });
+
+    it("counts bootstrap_provide_guarantee as a VC-issuing op", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        identityManager: stubIdentityManager(stubIdentity()),
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l4", operation: "bootstrap_provide_guarantee", identity_id: "id-1", result: "success" },
+        ]),
+      }));
+      expect(snap.layers.l3.vc_count).toBe(1);
+    });
+
+    it("counts reputation_publish as a VC-issuing op", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        identityManager: stubIdentityManager(stubIdentity()),
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l4", operation: "reputation_publish", identity_id: "id-1", result: "success" },
+        ]),
+      }));
+      expect(snap.layers.l3.vc_count).toBe(1);
+    });
+
+    it("does NOT count reputation_query", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        identityManager: stubIdentityManager(stubIdentity()),
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l4", operation: "reputation_query", identity_id: "id-1", result: "success" },
+        ]),
+      }));
+      expect(snap.layers.l3.vc_count).toBe(0);
+    });
+
+    it("does NOT count reputation_export", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        identityManager: stubIdentityManager(stubIdentity()),
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l4", operation: "reputation_export", identity_id: "id-1", result: "success" },
+        ]),
+      }));
+      expect(snap.layers.l3.vc_count).toBe(0);
+    });
+  });
+
+  describe("countProofsToday filter", () => {
+    const today = new Date();
+    today.setHours(10, 0, 0, 0);
+
+    it("counts zk_prove", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        identityManager: stubIdentityManager(stubIdentity()),
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l3", operation: "zk_prove", identity_id: "id-1", result: "success" },
+        ]),
+      }));
+      expect(snap.layers.l3.proofs_today).toBe(1);
+    });
+
+    it("counts zk_range_prove", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        identityManager: stubIdentityManager(stubIdentity()),
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l3", operation: "zk_range_prove", identity_id: "id-1", result: "success" },
+        ]),
+      }));
+      expect(snap.layers.l3.proofs_today).toBe(1);
+    });
+
+    it("counts proof_commitment", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        identityManager: stubIdentityManager(stubIdentity()),
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l3", operation: "proof_commitment", identity_id: "id-1", result: "success" },
+        ]),
+      }));
+      expect(snap.layers.l3.proofs_today).toBe(1);
+    });
+
+    it("does NOT count zk_verify", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        identityManager: stubIdentityManager(stubIdentity()),
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l3", operation: "zk_verify", identity_id: "id-1", result: "success" },
+        ]),
+      }));
+      expect(snap.layers.l3.proofs_today).toBe(0);
+    });
+
+    it("does NOT count disclosure_evaluate", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        identityManager: stubIdentityManager(stubIdentity()),
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l3", operation: "disclosure_evaluate", identity_id: "id-1", result: "success" },
+        ]),
+      }));
+      expect(snap.layers.l3.proofs_today).toBe(0);
+    });
+  });
+
+  describe("countInjectionsToday filter", () => {
+    const today = new Date();
+    today.setHours(10, 0, 0, 0);
+
+    it("counts injection_detected:X ops", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l2", operation: "injection_detected:state_read", identity_id: "id-1", result: "failure" },
+        ]),
+      }));
+      expect(snap.layers.l1.injection_blocked_today).toBe(1);
+    });
+
+    it("counts proxy_injection_blocked:X ops", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l2", operation: "proxy_injection_blocked:test", identity_id: "id-1", result: "failure" },
+        ]),
+      }));
+      expect(snap.layers.l1.injection_blocked_today).toBe(1);
+    });
+
+    it("does NOT count a non-injection failure", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l1", operation: "state_read", identity_id: "id-1", result: "failure" },
+        ]),
+      }));
+      expect(snap.layers.l1.injection_blocked_today).toBe(0);
+    });
+
+    it("does NOT count a successful L2 op that does not contain injection/blocked", async () => {
+      const snap = await getProtectionSnapshot(baseSources({
+        auditLog: stubAuditLog([
+          { timestamp: today.toISOString(), layer: "l2", operation: "context_gate_filter", identity_id: "id-1", result: "success" },
+        ]),
+      }));
+      expect(snap.layers.l1.injection_blocked_today).toBe(0);
+    });
   });
 });
