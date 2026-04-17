@@ -33,6 +33,26 @@ export interface AuditLogConfig {
 const DEFAULT_MAX_TOTAL_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_MAX_ENTRIES = 100_000;
 
+/**
+ * Operation-name constants for the v0.10.0 Secret Broker (L3 Selective
+ * Disclosure layer). Kept here as a single source of truth so the broker
+ * and audit-query callers agree on string values. Additive only — the
+ * AuditEntry.operation field remains a free-form string.
+ */
+export const BROKER_OPS = {
+  SECRET_ADDED: "broker_secret_added",
+  SECRET_ROTATED: "broker_secret_rotated",
+  SECRET_DELETED: "broker_secret_deleted",
+  SECRET_GRANTED: "broker_secret_granted",
+  SECRET_REVOKED: "broker_secret_revoked",
+  SECRET_READ: "broker_secret_read",
+  TOKEN_ISSUED: "broker_token_issued",
+  TOKEN_DENIED: "broker_token_denied",
+  BACKEND_UNLOCKED: "broker_backend_unlocked",
+} as const;
+
+export type BrokerOp = (typeof BROKER_OPS)[keyof typeof BROKER_OPS];
+
 export class AuditLog {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
