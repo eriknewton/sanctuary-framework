@@ -290,11 +290,26 @@ export async function runWrap(
   // The args list is a constant — never inject `--passphrase`. The launcher
   // re-resolves the stored passphrase at runtime from Keychain / fallback
   // file / SANCTUARY_PASSPHRASE env var. See SEC-061.
+  // Build the env block for the sanctuary entry. These three vars are
+  // required for the dashboard and passphrase resolution to work after
+  // the config rewrite. Pull from process.env so they survive the rewrite.
+  const sanctuaryEnv: Record<string, string> = {};
+  if (process.env.SANCTUARY_PASSPHRASE) {
+    sanctuaryEnv.SANCTUARY_PASSPHRASE = process.env.SANCTUARY_PASSPHRASE;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN) {
+    sanctuaryEnv.SANCTUARY_DASHBOARD_AUTH_TOKEN = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_ENABLED) {
+    sanctuaryEnv.SANCTUARY_DASHBOARD_ENABLED = process.env.SANCTUARY_DASHBOARD_ENABLED;
+  }
+
   const rewrite = deps.rewriteConfig ?? rewriteConfigForCocoon;
   await rewrite(
     agentConfig,
     "npx",
-    ["@sanctuary-framework/mcp-server"]
+    ["@sanctuary-framework/mcp-server"],
+    Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined
   );
 
   const verifyOk = await verifyRewrittenConfig(

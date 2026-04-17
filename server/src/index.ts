@@ -6,6 +6,7 @@
  */
 
 import { mkdir } from "node:fs/promises";
+import { tightenStoragePermissions } from "./storage/permissions.js";
 import { loadConfig, saveConfig, type SanctuaryConfig } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
 import type { StorageBackend } from "./storage/interface.js";
@@ -78,8 +79,9 @@ export async function createSanctuaryServer(options?: {
   // 1. Load configuration
   const config = await loadConfig(options?.configPath);
 
-  // 2. Ensure storage directory exists
+  // 2. Ensure storage directory exists with correct permissions
   await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
+  await tightenStoragePermissions(config.storage_path);
 
   // 3. Initialize storage backend
   const storage = options?.storage ?? new FilesystemStorage(

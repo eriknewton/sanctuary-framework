@@ -145,13 +145,16 @@ function countInjectionsToday(audit: AuditEntry[]): number {
     const ts = new Date(e.timestamp).getTime();
     if (isNaN(ts) || ts < cutoff) return false;
     const op = (e.operation ?? "").toLowerCase();
-    return (
-      op.includes("injection") ||
-      op.includes("blocked") ||
-      e.result === "failure"
-    );
+    return op.includes("injection") || op.includes("blocked");
   }).length;
 }
+
+/** Proof-creation ops — update this allowlist when adding new ZK tools. */
+const PROOF_CREATION_OPS = new Set([
+  "zk_prove",
+  "zk_range_prove",
+  "proof_commitment",
+]);
 
 function countProofsToday(audit: AuditEntry[]): number {
   const startOfDay = new Date();
@@ -159,6 +162,7 @@ function countProofsToday(audit: AuditEntry[]): number {
   const cutoff = startOfDay.getTime();
   return audit.filter((e) => {
     if (e.layer !== "l3") return false;
+    if (!PROOF_CREATION_OPS.has(e.operation)) return false;
     const ts = new Date(e.timestamp).getTime();
     return !isNaN(ts) && ts >= cutoff;
   }).length;
@@ -234,9 +238,15 @@ function buildL3(
   sources: AggregatorSources,
   audit: AuditEntry[]
 ): L3Status {
+  /** L4 attestation-producing ops — update when adding new VC tools. */
+  const VC_ISSUING_OPS = new Set([
+    "reputation_record",
+    "bootstrap_provide_guarantee",
+    "reputation_publish",
+  ]);
   const didActive = !!sources.identityManager?.getDefault()?.did;
   const vcCount = audit.filter(
-    (e) => e.layer === "l4" && e.operation.toLowerCase().includes("attest")
+    (e) => e.layer === "l4" && VC_ISSUING_OPS.has(e.operation)
   ).length;
   return {
     label: "L3 Disclosure",
