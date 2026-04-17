@@ -17,7 +17,7 @@
  */
 
 import { hash } from "../core/hashing.js";
-import { toBase64url, fromBase64url, stringToBytes, concatBytes } from "../core/encoding.js";
+import { toBase64url, fromBase64url, stringToBytes, concatBytes, constantTimeEqual } from "../core/encoding.js";
 import { randomBytes } from "../core/random.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
@@ -90,8 +90,10 @@ export function verifyCommitment(
   const combined = concatBytes(valueBytes, blindingBytes);
   const expectedHash = toBase64url(hash(combined));
 
-  // Use string comparison (the hash output is already fixed-length)
-  return commitment === expectedHash;
+  // Constant-time comparison prevents timing attacks on commitment verification
+  const commitmentBytes = fromBase64url(commitment);
+  const expectedBytes = fromBase64url(expectedHash);
+  return constantTimeEqual(commitmentBytes, expectedBytes);
 }
 
 /**

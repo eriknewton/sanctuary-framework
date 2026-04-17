@@ -23,15 +23,30 @@ export interface AuditEntry {
   details?: Record<string, unknown>;
 }
 
+export interface AuditLogConfig {
+  /** Maximum total size of stored audit entries in bytes. Default: 100 MB. */
+  maxTotalSizeBytes?: number;
+  /** Maximum number of stored audit entry files to retain. Default: 100_000. */
+  maxEntries?: number;
+}
+
+const DEFAULT_MAX_TOTAL_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB
+const DEFAULT_MAX_ENTRIES = 100_000;
+
 export class AuditLog {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
   private entries: AuditEntry[] = [];
   private counter = 0;
+  private readonly maxTotalSizeBytes: number;
+  private readonly maxEntries: number;
+  private rotationInFlight = false;
 
-  constructor(storage: StorageBackend, masterKey: Uint8Array) {
+  constructor(storage: StorageBackend, masterKey: Uint8Array, config?: AuditLogConfig) {
     this.storage = storage;
     this.encryptionKey = derivePurposeKey(masterKey, "audit-log");
+    this.maxTotalSizeBytes = config?.maxTotalSizeBytes ?? DEFAULT_MAX_TOTAL_SIZE_BYTES;
+    this.maxEntries = config?.maxEntries ?? DEFAULT_MAX_ENTRIES;
   }
 
   /**
@@ -70,6 +85,51 @@ export class AuditLog {
       key,
       stringToBytes(JSON.stringify(encrypted))
     );
+
+    // Fire-and-forget rotation check after each persist
+    this.maybeRotate().catch(() => {
+      // Rotation failure is non-fatal
+    });
+  }
+
+  /**
+   * Prune oldest audit entries when storage exceeds configured limits.
+   * Entries are sorted by key (timestamp-based) so oldest are pruned first.
+   */
+  private async maybeRotate(): Promise<void> {
+    if (this.rotationInFlight) return;
+    this.rotationInFlight = true;
+    try {
+      const metas = await this.storage.list("_audit");
+      if (metas.length === 0) return;
+
+      // Sort by key ascending (oldest first — keys are timestamp-prefixed)
+      metas.sort((a, b) => a.key.localeCompare(b.key));
+
+      const totalSize = metas.reduce((sum, m) => sum + m.size_bytes, 0);
+      let toDelete = 0;
+
+      // Check entry count limit
+      if (metas.length > this.maxEntries) {
+        toDelete = metas.length - this.maxEntries;
+      }
+
+      // Check total size limit — prune until under budget
+      if (totalSize > this.maxTotalSizeBytes) {
+        let runningSize = totalSize;
+        for (let i = toDelete; i < metas.length && runningSize > this.maxTotalSizeBytes; i++) {
+          runningSize -= metas[i]!.size_bytes;
+          toDelete = i + 1;
+        }
+      }
+
+      // Delete oldest entries
+      for (let i = 0; i < toDelete; i++) {
+        await this.storage.delete("_audit", metas[i]!.key);
+      }
+    } finally {
+      this.rotationInFlight = false;
+    }
   }
 
   /**

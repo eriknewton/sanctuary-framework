@@ -342,6 +342,61 @@ describe("runWrap — SEC-061 passphrase leak regression", () => {
     expect(onDisk).not.toContain("--passphrase");
   });
 
+  it("emits fallback warning on linux (SEC-063)", async () => {
+    const rewriteSpy = makeRewriteSpy();
+    const resolveSpy = vi.fn(async () => ({
+      value: "random-generated-value",
+      location: join(tempHome, ".sanctuary", "passphrase.enc"),
+      source: "generated" as const,
+    }));
+
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await runWrap(
+        { wrap: configPath, noOpen: true },
+        {
+          startDashboard: fakeDashboardStarter(),
+          openBrowser: async () => {},
+          resolvePassphrase: resolveSpy,
+          rewriteConfig: rewriteSpy,
+        }
+      );
+
+      const allOutput = stderrSpy.mock.calls.map(c => c.join(" ")).join("\n");
+      expect(allOutput).toContain("Passphrase stored in encrypted fallback file");
+      expect(allOutput).toContain("sanctuary export-passphrase");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("does not emit fallback warning when Keychain succeeds", async () => {
+    const rewriteSpy = makeRewriteSpy();
+    const resolveSpy = vi.fn(async () => ({
+      value: "random-generated-value",
+      location: "macOS Keychain",
+      source: "generated" as const,
+    }));
+
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await runWrap(
+        { wrap: configPath, noOpen: true },
+        {
+          startDashboard: fakeDashboardStarter(),
+          openBrowser: async () => {},
+          resolvePassphrase: resolveSpy,
+          rewriteConfig: rewriteSpy,
+        }
+      );
+
+      const allOutput = stderrSpy.mock.calls.map(c => c.join(" ")).join("\n");
+      expect(allOutput).not.toContain("encrypted fallback file");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
   it("rewrites with a constant args list even when no --passphrase is supplied", async () => {
     const rewriteSpy = makeRewriteSpy();
     const resolveSpy = vi.fn(async () => ({
