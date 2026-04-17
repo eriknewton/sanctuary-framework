@@ -174,8 +174,20 @@ async function runExportPassphrase(args: string[]): Promise<void> {
     }
   }
 
-  const { readStoredPassphrase } = await import("./cocoon/passphrase.js");
-  const stored = await readStoredPassphrase();
+  const { readStoredPassphrase, PassphraseUnreadableError } = await import(
+    "./cocoon/passphrase.js"
+  );
+  let stored: Awaited<ReturnType<typeof readStoredPassphrase>> = null;
+  try {
+    stored = await readStoredPassphrase();
+  } catch (err) {
+    if (err instanceof PassphraseUnreadableError) {
+      console.error(`\n  Sanctuary — Passphrase Unreadable`);
+      console.error(`  ${err.message}\n`);
+      process.exit(2);
+    }
+    throw err;
+  }
   if (!stored) {
     console.error("No stored passphrase found. Run `sanctuary wrap` first.");
     process.exit(1);
@@ -229,6 +241,8 @@ Subcommands:
 
   export-passphrase    Print the stored passphrase to stdout after
                        confirmation. Use this to back up or migrate.
+
+  cocoon               (deprecated — use "wrap")
 
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
