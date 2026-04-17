@@ -97,7 +97,7 @@ The claim flow uses the same Ed25519 key to prove ownership — no password requ
 
 ## Upgrade path
 
-Once you have a profile, install the full Sanctuary MCP server to unlock 67+ tools across four sovereignty layers, the Concordia Bridge, Cocoon mode, and runtime governance:
+Once you have a profile, install the full Sanctuary MCP server to unlock 67+ tools across four sovereignty layers, the Concordia Bridge, one-command agent wrap, and runtime governance:
 
 ```bash
 npm install -g @sanctuary-framework/mcp-server

@@ -1,25 +1,25 @@
 #!/usr/bin/env node
-import { mkdir, readFile, writeFile, chmod, access, stat, unlink, readdir, copyFile } from 'fs/promises';
+import { mkdir, readFile, writeFile, chmod, stat, unlink, readdir, access, copyFile } from 'fs/promises';
 import { join } from 'path';
-import { homedir, platform } from 'os';
+import { homedir, platform, userInfo, hostname } from 'os';
 import { createRequire } from 'module';
 import { randomBytes as randomBytes$1, createHmac } from 'crypto';
 import { gcm } from '@noble/ciphers/aes.js';
 import { sha256 } from '@noble/hashes/sha256';
 import { hmac } from '@noble/hashes/hmac';
-import { RistrettoPoint, ed25519 } from '@noble/curves/ed25519';
+import { ed25519, RistrettoPoint } from '@noble/curves/ed25519';
 import { argon2id } from 'hash-wasm';
 import { hkdf } from '@noble/hashes/hkdf';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { createServer as createServer$1 } from 'http';
-import { get, createServer as createServer$2 } from 'https';
-import { statSync, readFileSync } from 'fs';
-import { execSync, exec } from 'child_process';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { createServer as createServer$2 } from 'http';
+import { get, createServer as createServer$1 } from 'https';
+import { readFileSync, statSync } from 'fs';
+import { exec, execSync, spawn } from 'child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
@@ -761,6 +761,384 @@ var init_key_derivation = __esm({
     ARGON2_HASH_LENGTH = 32;
   }
 });
+
+// src/l1-cognitive/state-store.ts
+var RESERVED_NAMESPACE_PREFIXES, StateStore;
+var init_state_store = __esm({
+  "src/l1-cognitive/state-store.ts"() {
+    init_encryption();
+    init_hashing();
+    init_identity();
+    init_key_derivation();
+    init_encoding();
+    RESERVED_NAMESPACE_PREFIXES = [
+      "_identities",
+      "_policies",
+      "_audit",
+      "_meta",
+      "_principal",
+      "_commitments",
+      "_reputation",
+      "_escrow",
+      "_guarantees",
+      "_bridge",
+      "_federation",
+      "_handshake",
+      "_shr",
+      "_sovereignty_profile",
+      "_context_gate_policies"
+    ];
+    StateStore = class {
+      storage;
+      masterKey;
+      // Cache of version numbers per namespace/key for anti-rollback
+      versionCache = /* @__PURE__ */ new Map();
+      // Cache of content hashes per namespace for Merkle tree computation
+      contentHashes = /* @__PURE__ */ new Map();
+      constructor(storage, masterKey) {
+        this.storage = storage;
+        this.masterKey = masterKey;
+      }
+      versionKey(namespace, key) {
+        return `${namespace}/${key}`;
+      }
+      /**
+       * Get or initialize the content hash map for a namespace.
+       */
+      async getNamespaceHashes(namespace) {
+        if (this.contentHashes.has(namespace)) {
+          return this.contentHashes.get(namespace);
+        }
+        const entries = await this.storage.list(namespace);
+        const hashMap = /* @__PURE__ */ new Map();
+        for (const entry of entries) {
+          const raw = await this.storage.read(namespace, entry.key);
+          if (raw) {
+            try {
+              const stateEntry = JSON.parse(bytesToString(raw));
+              hashMap.set(entry.key, stateEntry.integrity_hash);
+              this.versionCache.set(
+                this.versionKey(namespace, entry.key),
+                stateEntry.ver
+              );
+            } catch {
+            }
+          }
+        }
+        this.contentHashes.set(namespace, hashMap);
+        return hashMap;
+      }
+      /**
+       * Write encrypted state.
+       *
+       * @param namespace - Logical grouping
+       * @param key - State key
+       * @param value - Plaintext value (will be encrypted)
+       * @param identityId - Identity performing the write
+       * @param encryptedPrivateKey - Identity's encrypted private key (for signing)
+       * @param identityEncryptionKey - Key to decrypt the identity's private key
+       * @param options - Optional metadata
+       */
+      async write(namespace, key, value, identityId, encryptedPrivateKey, identityEncryptionKey, options = {}) {
+        const namespaceKey = deriveNamespaceKey(this.masterKey, namespace);
+        const plaintext = stringToBytes(value);
+        const integrityHash = hashToString(plaintext);
+        const payload = encrypt(plaintext, namespaceKey);
+        const vk = this.versionKey(namespace, key);
+        const currentVersion = this.versionCache.get(vk) ?? 0;
+        const newVersion = currentVersion + 1;
+        const ciphertextBytes = fromBase64url(payload.ct);
+        const signature = sign(
+          ciphertextBytes,
+          encryptedPrivateKey,
+          identityEncryptionKey
+        );
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const stateEntry = {
+          v: 1,
+          payload,
+          ver: newVersion,
+          sig: toBase64url(signature),
+          kid: identityId,
+          integrity_hash: integrityHash,
+          metadata: {
+            content_type: options.content_type,
+            ttl_seconds: options.ttl_seconds,
+            tags: options.tags,
+            written_at: now
+          }
+        };
+        const serialized = stringToBytes(JSON.stringify(stateEntry));
+        await this.storage.write(namespace, key, serialized);
+        this.versionCache.set(vk, newVersion);
+        const nsHashes = await this.getNamespaceHashes(namespace);
+        nsHashes.set(key, integrityHash);
+        const merkleRoot = computeMerkleRoot(nsHashes);
+        return {
+          key,
+          namespace,
+          version: newVersion,
+          merkle_root: merkleRoot,
+          written_at: now,
+          size_bytes: serialized.length,
+          integrity_hash: integrityHash
+        };
+      }
+      /**
+       * Read and decrypt state.
+       *
+       * @param namespace - Logical grouping
+       * @param key - State key
+       * @param signerPublicKey - Expected signer's public key (for signature verification)
+       * @param verifyIntegrity - Whether to verify Merkle proof (default: true)
+       */
+      async read(namespace, key, signerPublicKey, verifyIntegrity = true) {
+        const raw = await this.storage.read(namespace, key);
+        if (!raw) return null;
+        let stateEntry;
+        try {
+          stateEntry = JSON.parse(bytesToString(raw));
+        } catch {
+          throw new Error(`Corrupted state entry: ${namespace}/${key}`);
+        }
+        if (stateEntry.v !== 1) {
+          throw new Error(`Unsupported state entry version: ${stateEntry.v}`);
+        }
+        const vk = this.versionKey(namespace, key);
+        const cachedVersion = this.versionCache.get(vk);
+        if (cachedVersion !== void 0 && stateEntry.ver < cachedVersion) {
+          throw new Error(
+            `Rollback detected for ${namespace}/${key}: found version ${stateEntry.ver}, expected >= ${cachedVersion}`
+          );
+        }
+        if (signerPublicKey) {
+          const ciphertextBytes = fromBase64url(stateEntry.payload.ct);
+          const signatureBytes = fromBase64url(stateEntry.sig);
+          const sigValid = verify(ciphertextBytes, signatureBytes, signerPublicKey);
+          if (!sigValid) {
+            throw new Error(
+              `Signature verification failed for ${namespace}/${key}`
+            );
+          }
+        }
+        const namespaceKey = deriveNamespaceKey(this.masterKey, namespace);
+        const plaintext = decrypt(stateEntry.payload, namespaceKey);
+        const value = bytesToString(plaintext);
+        const computedHash = hashToString(plaintext);
+        if (computedHash !== stateEntry.integrity_hash) {
+          throw new Error(
+            `Integrity hash mismatch for ${namespace}/${key}: computed ${computedHash}, stored ${stateEntry.integrity_hash}`
+          );
+        }
+        let merkleProofPath = [];
+        let integrityVerified = true;
+        if (verifyIntegrity) {
+          const nsHashes = await this.getNamespaceHashes(namespace);
+          const proof = generateMerkleProof(nsHashes, key);
+          if (proof) {
+            integrityVerified = verifyMerkleProof(proof);
+            merkleProofPath = proof.path.map(
+              (step) => `${step.position}:${step.hash}`
+            );
+          }
+        }
+        this.versionCache.set(vk, stateEntry.ver);
+        return {
+          key,
+          namespace,
+          value,
+          version: stateEntry.ver,
+          integrity_verified: integrityVerified,
+          merkle_proof: merkleProofPath,
+          written_at: stateEntry.metadata.written_at,
+          written_by: stateEntry.kid
+        };
+      }
+      /**
+       * List keys in a namespace (metadata only — no decryption).
+       */
+      async list(namespace, prefix, tags, limit = 100, offset = 0) {
+        const storageEntries = await this.storage.list(namespace, prefix);
+        const result = [];
+        for (const entry of storageEntries) {
+          const raw = await this.storage.read(namespace, entry.key);
+          if (!raw) continue;
+          try {
+            const stateEntry = JSON.parse(bytesToString(raw));
+            if (tags && tags.length > 0) {
+              const entryTags = stateEntry.metadata.tags ?? [];
+              const hasMatchingTag = tags.some((t) => entryTags.includes(t));
+              if (!hasMatchingTag) continue;
+            }
+            result.push({
+              key: entry.key,
+              version: stateEntry.ver,
+              size_bytes: entry.size_bytes,
+              written_at: stateEntry.metadata.written_at,
+              tags: stateEntry.metadata.tags ?? []
+            });
+          } catch {
+          }
+        }
+        const nsHashes = await this.getNamespaceHashes(namespace);
+        const merkleRoot = computeMerkleRoot(nsHashes);
+        return {
+          keys: result.slice(offset, offset + limit),
+          total: result.length,
+          merkle_root: merkleRoot
+        };
+      }
+      /**
+       * Securely delete state (overwrite with random bytes before removal).
+       */
+      async delete(namespace, key) {
+        const deleted = await this.storage.delete(namespace, key, true);
+        const vk = this.versionKey(namespace, key);
+        this.versionCache.delete(vk);
+        const nsHashes = await this.getNamespaceHashes(namespace);
+        nsHashes.delete(key);
+        const merkleRoot = computeMerkleRoot(nsHashes);
+        return {
+          deleted,
+          key,
+          namespace,
+          new_merkle_root: merkleRoot,
+          deleted_at: (/* @__PURE__ */ new Date()).toISOString()
+        };
+      }
+      /**
+       * Export all state for a namespace as an encrypted bundle.
+       */
+      async export(namespace) {
+        const namespacesToExport = [];
+        if (namespace) {
+          namespacesToExport.push(namespace);
+        } else {
+          for (const ns of this.contentHashes.keys()) {
+            namespacesToExport.push(ns);
+          }
+        }
+        const exportData = {};
+        let totalKeys = 0;
+        for (const ns of namespacesToExport) {
+          const entries = await this.storage.list(ns);
+          exportData[ns] = [];
+          for (const entry of entries) {
+            const raw = await this.storage.read(ns, entry.key);
+            if (!raw) continue;
+            try {
+              const stateEntry = JSON.parse(bytesToString(raw));
+              exportData[ns].push({ key: entry.key, entry: stateEntry });
+              totalKeys++;
+            } catch {
+            }
+          }
+        }
+        const bundleJson = JSON.stringify({
+          sanctuary_export_version: 1,
+          exported_at: (/* @__PURE__ */ new Date()).toISOString(),
+          namespaces: namespacesToExport,
+          data: exportData
+        });
+        const bundleBytes = stringToBytes(bundleJson);
+        const bundleHash = hashToString(bundleBytes);
+        return {
+          bundle: toBase64url(bundleBytes),
+          namespaces: namespacesToExport,
+          total_keys: totalKeys,
+          bundle_hash: bundleHash,
+          exported_at: (/* @__PURE__ */ new Date()).toISOString()
+        };
+      }
+      /**
+       * Import a previously exported state bundle.
+       */
+      async import(bundleBase64, conflictResolution = "skip", publicKeyResolver) {
+        const bundleBytes = fromBase64url(bundleBase64);
+        const bundleJson = bytesToString(bundleBytes);
+        const bundle = JSON.parse(bundleJson);
+        let importedKeys = 0;
+        let skippedKeys = 0;
+        let skippedInvalidSig = 0;
+        let skippedUnknownKid = 0;
+        let conflicts = 0;
+        const namespaces = [];
+        for (const [ns, entries] of Object.entries(
+          bundle.data
+        )) {
+          if (RESERVED_NAMESPACE_PREFIXES.some(
+            (prefix) => ns === prefix || ns.startsWith(prefix + "/")
+          )) {
+            skippedKeys += entries.length;
+            continue;
+          }
+          namespaces.push(ns);
+          for (const { key, entry } of entries) {
+            const signerPublicKey = publicKeyResolver(entry.kid);
+            if (!signerPublicKey) {
+              skippedUnknownKid++;
+              skippedKeys++;
+              continue;
+            }
+            try {
+              const ciphertextBytes = fromBase64url(entry.payload.ct);
+              const signatureBytes = fromBase64url(entry.sig);
+              const sigValid = verify(ciphertextBytes, signatureBytes, signerPublicKey);
+              if (!sigValid) {
+                skippedInvalidSig++;
+                skippedKeys++;
+                continue;
+              }
+            } catch {
+              skippedInvalidSig++;
+              skippedKeys++;
+              continue;
+            }
+            const exists = await this.storage.exists(ns, key);
+            if (exists) {
+              conflicts++;
+              if (conflictResolution === "skip") {
+                skippedKeys++;
+                continue;
+              }
+              if (conflictResolution === "version") {
+                const raw = await this.storage.read(ns, key);
+                if (raw) {
+                  try {
+                    const existingEntry = JSON.parse(
+                      bytesToString(raw)
+                    );
+                    if (entry.ver <= existingEntry.ver) {
+                      skippedKeys++;
+                      continue;
+                    }
+                  } catch {
+                  }
+                }
+              }
+            }
+            const serialized = stringToBytes(JSON.stringify(entry));
+            await this.storage.write(ns, key, serialized);
+            importedKeys++;
+            const vk = this.versionKey(ns, key);
+            this.versionCache.set(vk, entry.ver);
+            const nsHashes = await this.getNamespaceHashes(ns);
+            nsHashes.set(key, entry.integrity_hash);
+          }
+        }
+        return {
+          imported_keys: importedKeys,
+          skipped_keys: skippedKeys,
+          skipped_invalid_sig: skippedInvalidSig,
+          skipped_unknown_kid: skippedUnknownKid,
+          conflicts,
+          namespaces,
+          imported_at: (/* @__PURE__ */ new Date()).toISOString()
+        };
+      }
+    };
+  }
+});
 function validateArgs(args, schema) {
   const errors = [];
   const properties = schema.properties ?? {};
@@ -1140,6 +1518,44 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
         });
       }
     },
+    {
+      name: "identity_set_primary",
+      description: "Set which identity is the default/primary identity. This identity will be used by shr_generate, reputation_publish, and other tools when no explicit identity_id parameter is provided. The selection is persisted across server restarts.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          identity_id: {
+            type: "string",
+            description: "The identity ID to set as primary"
+          }
+        },
+        required: ["identity_id"]
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityMgr.get(identityId);
+        if (!identity) {
+          return toolResult({
+            error: `Identity "${identityId}" not found.`
+          });
+        }
+        const success = await identityMgr.setPrimary(identityId);
+        if (!success) {
+          return toolResult({
+            error: `Failed to set primary identity to "${identityId}".`
+          });
+        }
+        auditLog?.append("l1", "identity_set_primary", identityId, {
+          previous_primary: identityMgr.getPrimaryIdentityId()
+        });
+        return toolResult({
+          primary_identity_id: identityId,
+          label: identity.label,
+          did: identity.did,
+          set_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    },
     // ── State Tools ─────────────────────────────────────────────────────
     {
       name: "state_write",
@@ -1389,6 +1805,7 @@ var init_tools = __esm({
       masterKey;
       identities = /* @__PURE__ */ new Map();
       primaryIdentityId = null;
+      metadataKey = "primary_identity_id";
       constructor(storage, masterKey) {
         this.storage = storage;
         this.masterKey = masterKey;
@@ -1411,12 +1828,25 @@ var init_tools = __esm({
             const decrypted = decrypt(encrypted, this.encryptionKey);
             const identity = JSON.parse(bytesToString(decrypted));
             this.identities.set(identity.identity_id, identity);
-            if (!this.primaryIdentityId) {
-              this.primaryIdentityId = identity.identity_id;
-            }
           } catch {
             failed++;
           }
+        }
+        try {
+          const metaRaw = await this.storage.read("_meta", this.metadataKey);
+          if (metaRaw) {
+            const metaStr = bytesToString(metaRaw);
+            const primaryId = JSON.parse(metaStr);
+            if (this.identities.has(primaryId)) {
+              this.primaryIdentityId = primaryId;
+            } else {
+              this.primaryIdentityId = this.identities.keys().next().value || null;
+            }
+          } else {
+            this.primaryIdentityId = this.identities.keys().next().value || null;
+          }
+        } catch {
+          this.primaryIdentityId = this.identities.keys().next().value || null;
         }
         return { total: entries.length, loaded: this.identities.size, failed };
       }
@@ -1432,6 +1862,25 @@ var init_tools = __esm({
         this.identities.set(identity.identity_id, identity);
         if (!this.primaryIdentityId) {
           this.primaryIdentityId = identity.identity_id;
+          this.savePrimaryIdentityId();
+        }
+      }
+      /** Set which identity is the default/primary identity */
+      async setPrimary(identityId) {
+        if (!this.identities.has(identityId)) {
+          return false;
+        }
+        this.primaryIdentityId = identityId;
+        await this.savePrimaryIdentityId();
+        return true;
+      }
+      /** Persist the primary identity ID to storage */
+      async savePrimaryIdentityId() {
+        if (!this.primaryIdentityId) return;
+        try {
+          const serialized = stringToBytes(JSON.stringify(this.primaryIdentityId));
+          await this.storage.write("_meta", this.metadataKey, serialized);
+        } catch {
         }
       }
       get(id) {
@@ -1440,6 +1889,9 @@ var init_tools = __esm({
       getDefault() {
         if (!this.primaryIdentityId) return void 0;
         return this.identities.get(this.primaryIdentityId);
+      }
+      getPrimaryIdentityId() {
+        return this.primaryIdentityId;
       }
       list() {
         return Array.from(this.identities.values()).map((si) => ({
@@ -1555,6 +2007,1969 @@ var init_audit_log = __esm({
         return this.entries.length;
       }
     };
+  }
+});
+
+// src/l3-disclosure/commitments.ts
+function createCommitment(value, blindingFactor) {
+  const blindingBytes = blindingFactor ? fromBase64url(blindingFactor) : randomBytes(32);
+  const valueBytes = stringToBytes(value);
+  const combined = concatBytes(valueBytes, blindingBytes);
+  const commitmentHash = hash(combined);
+  return {
+    commitment: toBase64url(commitmentHash),
+    blinding_factor: toBase64url(blindingBytes),
+    committed_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function verifyCommitment(commitment, value, blindingFactor) {
+  const blindingBytes = fromBase64url(blindingFactor);
+  const valueBytes = stringToBytes(value);
+  const combined = concatBytes(valueBytes, blindingBytes);
+  const expectedHash = toBase64url(hash(combined));
+  return commitment === expectedHash;
+}
+var CommitmentStore;
+var init_commitments = __esm({
+  "src/l3-disclosure/commitments.ts"() {
+    init_hashing();
+    init_encoding();
+    init_random();
+    init_encryption();
+    init_key_derivation();
+    init_encoding();
+    CommitmentStore = class {
+      storage;
+      encryptionKey;
+      constructor(storage, masterKey) {
+        this.storage = storage;
+        this.encryptionKey = derivePurposeKey(masterKey, "l3-commitments");
+      }
+      /**
+       * Store a commitment (encrypted) for later reference.
+       */
+      async store(commitment, value) {
+        const id = `cmt-${Date.now()}-${toBase64url(randomBytes(8))}`;
+        const stored = {
+          commitment: commitment.commitment,
+          blinding_factor: commitment.blinding_factor,
+          value,
+          committed_at: commitment.committed_at,
+          revealed: false
+        };
+        const serialized = stringToBytes(JSON.stringify(stored));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          "_commitments",
+          id,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+        return id;
+      }
+      /**
+       * Retrieve a stored commitment by ID.
+       */
+      async get(id) {
+        const raw = await this.storage.read("_commitments", id);
+        if (!raw) return null;
+        try {
+          const encrypted = JSON.parse(bytesToString(raw));
+          const decrypted = decrypt(encrypted, this.encryptionKey);
+          return JSON.parse(bytesToString(decrypted));
+        } catch {
+          return null;
+        }
+      }
+      /**
+       * Mark a commitment as revealed.
+       */
+      async markRevealed(id) {
+        const stored = await this.get(id);
+        if (!stored) return;
+        stored.revealed = true;
+        stored.revealed_at = (/* @__PURE__ */ new Date()).toISOString();
+        const serialized = stringToBytes(JSON.stringify(stored));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          "_commitments",
+          id,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+      }
+    };
+  }
+});
+
+// src/l3-disclosure/policies.ts
+function evaluateDisclosure(policy, context, requestedFields) {
+  return requestedFields.map((field) => {
+    const exactRule = policy.rules.find((r) => r.context === context);
+    const wildcardRule = policy.rules.find((r) => r.context === "*");
+    const matchedRule = exactRule ?? wildcardRule;
+    if (!matchedRule) {
+      return {
+        field,
+        action: policy.default_action,
+        reason: `No rule matches context "${context}"`,
+        applicable_rule: "default"
+      };
+    }
+    const ruleName = `${matchedRule.context}`;
+    if (matchedRule.withhold.includes(field)) {
+      return {
+        field,
+        action: "withhold",
+        reason: `Field "${field}" is explicitly withheld in ${ruleName} context`,
+        applicable_rule: ruleName
+      };
+    }
+    if (matchedRule.proof_required.includes(field)) {
+      return {
+        field,
+        action: "proof",
+        reason: `Field "${field}" requires cryptographic proof in ${ruleName} context`,
+        applicable_rule: ruleName
+      };
+    }
+    if (matchedRule.disclose.includes(field)) {
+      return {
+        field,
+        action: "disclose",
+        reason: `Field "${field}" is permitted for disclosure in ${ruleName} context`,
+        applicable_rule: ruleName
+      };
+    }
+    return {
+      field,
+      action: policy.default_action,
+      reason: `Field "${field}" not addressed in ${ruleName} rule; applying default`,
+      applicable_rule: ruleName
+    };
+  });
+}
+var PolicyStore;
+var init_policies = __esm({
+  "src/l3-disclosure/policies.ts"() {
+    init_encryption();
+    init_key_derivation();
+    init_encoding();
+    init_random();
+    PolicyStore = class {
+      storage;
+      encryptionKey;
+      policies = /* @__PURE__ */ new Map();
+      constructor(storage, masterKey) {
+        this.storage = storage;
+        this.encryptionKey = derivePurposeKey(masterKey, "l3-policies");
+      }
+      /**
+       * Create and store a new disclosure policy.
+       */
+      async create(policyName, rules, defaultAction, identityId) {
+        const policyId = `pol-${Date.now()}-${toBase64url(randomBytes(8))}`;
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const policy = {
+          policy_id: policyId,
+          policy_name: policyName,
+          rules,
+          default_action: defaultAction,
+          identity_id: identityId,
+          created_at: now,
+          updated_at: now
+        };
+        await this.persist(policy);
+        this.policies.set(policyId, policy);
+        return policy;
+      }
+      /**
+       * Get a policy by ID.
+       */
+      async get(policyId) {
+        if (this.policies.has(policyId)) {
+          return this.policies.get(policyId);
+        }
+        const raw = await this.storage.read("_policies", policyId);
+        if (!raw) return null;
+        try {
+          const encrypted = JSON.parse(bytesToString(raw));
+          const decrypted = decrypt(encrypted, this.encryptionKey);
+          const policy = JSON.parse(bytesToString(decrypted));
+          this.policies.set(policyId, policy);
+          return policy;
+        } catch {
+          return null;
+        }
+      }
+      /**
+       * List all policies.
+       */
+      async list() {
+        await this.loadAll();
+        return Array.from(this.policies.values());
+      }
+      /**
+       * Load all persisted policies into memory.
+       */
+      async loadAll() {
+        try {
+          const entries = await this.storage.list("_policies");
+          for (const meta of entries) {
+            if (this.policies.has(meta.key)) continue;
+            const raw = await this.storage.read("_policies", meta.key);
+            if (!raw) continue;
+            try {
+              const encrypted = JSON.parse(bytesToString(raw));
+              const decrypted = decrypt(encrypted, this.encryptionKey);
+              const policy = JSON.parse(bytesToString(decrypted));
+              this.policies.set(policy.policy_id, policy);
+            } catch {
+            }
+          }
+        } catch {
+        }
+      }
+      async persist(policy) {
+        const serialized = stringToBytes(JSON.stringify(policy));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          "_policies",
+          policy.policy_id,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+      }
+    };
+  }
+});
+function bigintToBytes(n) {
+  const hex = n.toString(16).padStart(64, "0");
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+function bytesToBigint(bytes) {
+  let hex = "";
+  for (const b of bytes) {
+    hex += b.toString(16).padStart(2, "0");
+  }
+  return BigInt("0x" + hex);
+}
+function mod(n) {
+  return (n % ORDER + ORDER) % ORDER;
+}
+function safeMultiply(point, scalar) {
+  const s = mod(scalar);
+  if (s === 0n) return RistrettoPoint.ZERO;
+  return point.multiply(s);
+}
+function randomScalar() {
+  const bytes = randomBytes(64);
+  return mod(bytesToBigint(bytes));
+}
+function fiatShamirChallenge(domain, ...points) {
+  const domainBytes = stringToBytes(domain);
+  const combined = concatBytes(domainBytes, ...points);
+  const hash2 = sha256(combined);
+  return mod(bytesToBigint(hash2));
+}
+function createPedersenCommitment(value) {
+  const v = mod(BigInt(value));
+  const b = randomScalar();
+  const C = safeMultiply(G, v).add(safeMultiply(H, b));
+  return {
+    commitment: toBase64url(C.toRawBytes()),
+    blinding_factor: toBase64url(bigintToBytes(b)),
+    committed_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function verifyPedersenCommitment(commitment, value, blindingFactor) {
+  try {
+    const C = RistrettoPoint.fromHex(fromBase64url(commitment));
+    const v = mod(BigInt(value));
+    const b = bytesToBigint(fromBase64url(blindingFactor));
+    const expected = safeMultiply(G, v).add(safeMultiply(H, b));
+    return C.equals(expected);
+  } catch {
+    return false;
+  }
+}
+function createProofOfKnowledge(value, blindingFactor, commitment) {
+  const v = mod(BigInt(value));
+  const b = bytesToBigint(fromBase64url(blindingFactor));
+  const r_v = randomScalar();
+  const r_b = randomScalar();
+  const R = safeMultiply(G, r_v).add(safeMultiply(H, r_b));
+  const C_bytes = fromBase64url(commitment);
+  const R_bytes = R.toRawBytes();
+  const e = fiatShamirChallenge("sanctuary-zk-pok-v1", C_bytes, R_bytes);
+  const s_v = mod(r_v + e * v);
+  const s_b = mod(r_b + e * b);
+  return {
+    type: "schnorr-pedersen-ristretto255",
+    commitment,
+    announcement: toBase64url(R_bytes),
+    response_v: toBase64url(bigintToBytes(s_v)),
+    response_b: toBase64url(bigintToBytes(s_b)),
+    generated_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function verifyProofOfKnowledge(proof) {
+  try {
+    const C = RistrettoPoint.fromHex(fromBase64url(proof.commitment));
+    const R = RistrettoPoint.fromHex(fromBase64url(proof.announcement));
+    const s_v = bytesToBigint(fromBase64url(proof.response_v));
+    const s_b = bytesToBigint(fromBase64url(proof.response_b));
+    const e = fiatShamirChallenge(
+      "sanctuary-zk-pok-v1",
+      fromBase64url(proof.commitment),
+      fromBase64url(proof.announcement)
+    );
+    const lhs = safeMultiply(G, s_v).add(safeMultiply(H, s_b));
+    const rhs = R.add(safeMultiply(C, e));
+    return lhs.equals(rhs);
+  } catch {
+    return false;
+  }
+}
+function createRangeProof(value, blindingFactor, commitment, min, max) {
+  if (value < min || value > max) {
+    return { error: `Value ${value} is not in range [${min}, ${max}]` };
+  }
+  const range = max - min;
+  const numBits = Math.ceil(Math.log2(range + 1));
+  const shifted = value - min;
+  const b = bytesToBigint(fromBase64url(blindingFactor));
+  const bits = [];
+  for (let i = 0; i < numBits; i++) {
+    bits.push(shifted >> i & 1);
+  }
+  const bitBlindings = [];
+  const bitCommitments = [];
+  const bitProofs = [];
+  for (let i = 0; i < numBits; i++) {
+    const bit_b = randomScalar();
+    bitBlindings.push(bit_b);
+    const C_i = safeMultiply(G, mod(BigInt(bits[i]))).add(safeMultiply(H, bit_b));
+    bitCommitments.push(toBase64url(C_i.toRawBytes()));
+    const bitProof = createBitProof(bits[i], bit_b, C_i);
+    bitProofs.push(bitProof);
+  }
+  const sumBlinding = bitBlindings.reduce(
+    (acc, bi, i) => mod(acc + mod(BigInt(1) << BigInt(i)) * bi),
+    0n
+  );
+  const blindingDiff = mod(b - sumBlinding);
+  const r_sum = randomScalar();
+  const R_sum = safeMultiply(H, r_sum);
+  const e_sum = fiatShamirChallenge(
+    "sanctuary-zk-range-sum-v1",
+    fromBase64url(commitment),
+    R_sum.toRawBytes()
+  );
+  const s_sum = mod(r_sum + e_sum * blindingDiff);
+  return {
+    type: "range-pedersen-ristretto255",
+    commitment,
+    min,
+    max,
+    bit_commitments: bitCommitments,
+    bit_proofs: bitProofs,
+    sum_proof: {
+      announcement: toBase64url(R_sum.toRawBytes()),
+      response: toBase64url(bigintToBytes(s_sum))
+    },
+    generated_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function verifyRangeProof(proof) {
+  try {
+    const C = RistrettoPoint.fromHex(fromBase64url(proof.commitment));
+    const range = proof.max - proof.min;
+    const numBits = Math.ceil(Math.log2(range + 1));
+    if (proof.bit_commitments.length !== numBits) return false;
+    if (proof.bit_proofs.length !== numBits) return false;
+    for (let i = 0; i < numBits; i++) {
+      const C_i = RistrettoPoint.fromHex(fromBase64url(proof.bit_commitments[i]));
+      if (!verifyBitProof(proof.bit_proofs[i], C_i)) {
+        return false;
+      }
+    }
+    let reconstructed = RistrettoPoint.ZERO;
+    for (let i = 0; i < numBits; i++) {
+      const C_i = RistrettoPoint.fromHex(fromBase64url(proof.bit_commitments[i]));
+      const weight = mod(BigInt(1) << BigInt(i));
+      reconstructed = reconstructed.add(safeMultiply(C_i, weight));
+    }
+    const diff = C.subtract(safeMultiply(G, mod(BigInt(proof.min)))).subtract(reconstructed);
+    const R_sum = RistrettoPoint.fromHex(fromBase64url(proof.sum_proof.announcement));
+    const s_sum = bytesToBigint(fromBase64url(proof.sum_proof.response));
+    const e_sum = fiatShamirChallenge(
+      "sanctuary-zk-range-sum-v1",
+      fromBase64url(proof.commitment),
+      fromBase64url(proof.sum_proof.announcement)
+    );
+    const lhs = safeMultiply(H, s_sum);
+    const rhs = R_sum.add(safeMultiply(diff, e_sum));
+    return lhs.equals(rhs);
+  } catch {
+    return false;
+  }
+}
+function createBitProof(bit, blinding, commitment) {
+  const C_bytes = commitment.toRawBytes();
+  if (bit === 0) {
+    const C_minus_G = commitment.subtract(G);
+    const e_1 = randomScalar();
+    const s_1 = randomScalar();
+    const R_1 = safeMultiply(H, s_1).subtract(safeMultiply(C_minus_G, e_1));
+    const r_0 = randomScalar();
+    const R_0 = safeMultiply(H, r_0);
+    const e = fiatShamirChallenge(
+      "sanctuary-zk-bit-v1",
+      C_bytes,
+      R_0.toRawBytes(),
+      R_1.toRawBytes()
+    );
+    const e_0 = mod(e - e_1);
+    const s_0 = mod(r_0 + e_0 * blinding);
+    return {
+      announcement_0: toBase64url(R_0.toRawBytes()),
+      announcement_1: toBase64url(R_1.toRawBytes()),
+      challenge_0: toBase64url(bigintToBytes(e_0)),
+      challenge_1: toBase64url(bigintToBytes(e_1)),
+      response_0: toBase64url(bigintToBytes(s_0)),
+      response_1: toBase64url(bigintToBytes(s_1))
+    };
+  } else {
+    const e_0 = randomScalar();
+    const s_0 = randomScalar();
+    const R_0 = safeMultiply(H, s_0).subtract(safeMultiply(commitment, e_0));
+    const r_1 = randomScalar();
+    const R_1 = safeMultiply(H, r_1);
+    const e = fiatShamirChallenge(
+      "sanctuary-zk-bit-v1",
+      C_bytes,
+      R_0.toRawBytes(),
+      R_1.toRawBytes()
+    );
+    const e_1 = mod(e - e_0);
+    const s_1 = mod(r_1 + e_1 * blinding);
+    return {
+      announcement_0: toBase64url(R_0.toRawBytes()),
+      announcement_1: toBase64url(R_1.toRawBytes()),
+      challenge_0: toBase64url(bigintToBytes(e_0)),
+      challenge_1: toBase64url(bigintToBytes(e_1)),
+      response_0: toBase64url(bigintToBytes(s_0)),
+      response_1: toBase64url(bigintToBytes(s_1))
+    };
+  }
+}
+function verifyBitProof(proof, commitment) {
+  try {
+    const C_bytes = commitment.toRawBytes();
+    const R_0 = RistrettoPoint.fromHex(fromBase64url(proof.announcement_0));
+    const R_1 = RistrettoPoint.fromHex(fromBase64url(proof.announcement_1));
+    const e_0 = bytesToBigint(fromBase64url(proof.challenge_0));
+    const e_1 = bytesToBigint(fromBase64url(proof.challenge_1));
+    const s_0 = bytesToBigint(fromBase64url(proof.response_0));
+    const s_1 = bytesToBigint(fromBase64url(proof.response_1));
+    const e = fiatShamirChallenge(
+      "sanctuary-zk-bit-v1",
+      C_bytes,
+      R_0.toRawBytes(),
+      R_1.toRawBytes()
+    );
+    if (mod(e_0 + e_1) !== e) return false;
+    const lhs_0 = safeMultiply(H, s_0);
+    const rhs_0 = R_0.add(safeMultiply(commitment, e_0));
+    if (!lhs_0.equals(rhs_0)) return false;
+    const C_minus_G = commitment.subtract(G);
+    const lhs_1 = safeMultiply(H, s_1);
+    const rhs_1 = R_1.add(safeMultiply(C_minus_G, e_1));
+    if (!lhs_1.equals(rhs_1)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+var G, H_INPUT, H, ORDER;
+var init_zk_proofs = __esm({
+  "src/l3-disclosure/zk-proofs.ts"() {
+    init_random();
+    init_encoding();
+    G = RistrettoPoint.BASE;
+    H_INPUT = concatBytes(
+      sha256(stringToBytes("sanctuary-pedersen-generator-H-v1-a")),
+      sha256(stringToBytes("sanctuary-pedersen-generator-H-v1-b"))
+    );
+    H = RistrettoPoint.hashToCurve(H_INPUT);
+    ORDER = BigInt("7237005577332262213973186563042994240857116359379907606001950938285454250989");
+  }
+});
+
+// src/l3-disclosure/tools.ts
+function createL3Tools(storage, masterKey, auditLog) {
+  const commitmentStore = new CommitmentStore(storage, masterKey);
+  const policyStore = new PolicyStore(storage, masterKey);
+  const tools = [
+    // ─── Commitment Schemes ───────────────────────────────────────────────
+    {
+      name: "proof_commitment",
+      description: "Create a cryptographic commitment to a value. The commitment hides the value until you choose to reveal it. Returns the commitment hash and a blinding factor (store securely).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "string",
+            description: "The value to commit to"
+          },
+          blinding_factor: {
+            type: "string",
+            description: "Optional base64url blinding factor (auto-generated if omitted)"
+          }
+        },
+        required: ["value"]
+      },
+      handler: async (args) => {
+        const value = args.value;
+        const blindingFactor = args.blinding_factor;
+        const commitment = createCommitment(value, blindingFactor);
+        const commitmentId = await commitmentStore.store(commitment, value);
+        auditLog.append("l3", "proof_commitment", "system", {
+          commitment_id: commitmentId,
+          commitment_hash: commitment.commitment
+        });
+        return toolResult({
+          commitment_id: commitmentId,
+          commitment: commitment.commitment,
+          blinding_factor: commitment.blinding_factor,
+          committed_at: commitment.committed_at,
+          note: "Store the blinding_factor securely. You will need it to reveal the committed value."
+        });
+      }
+    },
+    {
+      name: "proof_reveal",
+      description: "Verify a previously committed value by revealing it with the blinding factor. Returns whether the revealed value matches the commitment.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          commitment: {
+            type: "string",
+            description: "The original commitment hash"
+          },
+          value: {
+            type: "string",
+            description: "The value being revealed"
+          },
+          blinding_factor: {
+            type: "string",
+            description: "The blinding factor from the original commitment"
+          }
+        },
+        required: ["commitment", "value", "blinding_factor"]
+      },
+      handler: async (args) => {
+        const commitment = args.commitment;
+        const value = args.value;
+        const blindingFactor = args.blinding_factor;
+        const valid = verifyCommitment(commitment, value, blindingFactor);
+        auditLog.append("l3", "proof_reveal", "system", {
+          commitment_hash: commitment,
+          valid
+        });
+        return toolResult({
+          valid,
+          commitment,
+          revealed_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    },
+    // ─── Disclosure Policies ──────────────────────────────────────────────
+    {
+      name: "disclosure_set_policy",
+      description: "Define a disclosure policy that controls what an agent will and will not disclose in different interaction contexts. Rules specify which fields may be disclosed, which must be withheld, and which require cryptographic proof.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          policy_name: {
+            type: "string",
+            description: "Human-readable policy name"
+          },
+          rules: {
+            type: "array",
+            description: "Disclosure rules for different contexts",
+            items: {
+              type: "object",
+              properties: {
+                context: {
+                  type: "string",
+                  description: 'Interaction context: "negotiation", "commerce", "identity", "*" (wildcard)'
+                },
+                disclose: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields the agent MAY disclose"
+                },
+                withhold: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields the agent MUST NOT disclose"
+                },
+                proof_required: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Fields that require proof rather than plain disclosure"
+                }
+              },
+              required: ["context", "disclose", "withhold", "proof_required"]
+            }
+          },
+          default_action: {
+            type: "string",
+            enum: ["withhold", "ask-principal"],
+            description: "What to do when no rule matches a field"
+          },
+          identity_id: {
+            type: "string",
+            description: "Optional identity this policy is bound to"
+          }
+        },
+        required: ["policy_name", "rules", "default_action"]
+      },
+      handler: async (args) => {
+        const policyName = args.policy_name;
+        const rules = args.rules;
+        const defaultAction = args.default_action;
+        const identityId = args.identity_id;
+        const policy = await policyStore.create(
+          policyName,
+          rules,
+          defaultAction,
+          identityId
+        );
+        auditLog.append("l3", "disclosure_set_policy", identityId ?? "system", {
+          policy_id: policy.policy_id,
+          policy_name: policyName,
+          rules_count: rules.length
+        });
+        return toolResult({
+          policy_id: policy.policy_id,
+          policy_name: policy.policy_name,
+          rules_count: policy.rules.length,
+          created_at: policy.created_at
+        });
+      }
+    },
+    {
+      name: "disclosure_evaluate",
+      description: "Evaluate a disclosure request against an active policy. Returns per-field decisions: disclose, withhold, proof, or ask-principal.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          context: {
+            type: "string",
+            description: "The interaction context"
+          },
+          requested_fields: {
+            type: "array",
+            items: { type: "string" },
+            description: "Fields the counterparty is requesting"
+          },
+          policy_id: {
+            type: "string",
+            description: "Specific policy to evaluate (uses first available if omitted)"
+          }
+        },
+        required: ["context", "requested_fields"]
+      },
+      handler: async (args) => {
+        const context = args.context;
+        const requestedFields = args.requested_fields;
+        const policyId = args.policy_id;
+        let policy;
+        if (policyId) {
+          policy = await policyStore.get(policyId);
+        } else {
+          const allPolicies = await policyStore.list();
+          policy = allPolicies[0] ?? null;
+        }
+        if (!policy) {
+          return toolResult({
+            error: "No disclosure policy found. Create one with disclosure_set_policy first."
+          });
+        }
+        const decisions = evaluateDisclosure(policy, context, requestedFields);
+        const withholding = decisions.filter(
+          (d) => d.action === "withhold"
+        ).length;
+        const disclosing = decisions.filter(
+          (d) => d.action === "disclose"
+        ).length;
+        const proofRequired = decisions.filter(
+          (d) => d.action === "proof"
+        ).length;
+        const askPrincipal = decisions.filter(
+          (d) => d.action === "ask-principal"
+        ).length;
+        auditLog.append("l3", "disclosure_evaluate", "system", {
+          policy_id: policy.policy_id,
+          context,
+          fields_requested: requestedFields.length,
+          withholding,
+          disclosing,
+          proof_required: proofRequired
+        });
+        return toolResult({
+          policy_id: policy.policy_id,
+          policy_name: policy.policy_name,
+          context,
+          decisions,
+          summary: {
+            total_fields: requestedFields.length,
+            disclose: disclosing,
+            withhold: withholding,
+            proof: proofRequired,
+            ask_principal: askPrincipal
+          },
+          overall_recommendation: withholding > 0 ? `Withholding ${withholding} of ${requestedFields.length} requested fields per policy "${policy.policy_name}"` : `All ${requestedFields.length} fields may be disclosed per policy "${policy.policy_name}"`
+        });
+      }
+    },
+    // ─── ZK Proof Tools ───────────────────────────────────────────────────
+    {
+      name: "zk_commit",
+      description: "Create a Pedersen commitment to a numeric value on Ristretto255. Unlike SHA-256 commitments, Pedersen commitments support zero-knowledge proofs: you can prove properties about the committed value without revealing it.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "number",
+            description: "The integer value to commit to"
+          }
+        },
+        required: ["value"]
+      },
+      handler: async (args) => {
+        const value = args.value;
+        if (!Number.isInteger(value)) {
+          return toolResult({ error: "Value must be an integer." });
+        }
+        const commitment = createPedersenCommitment(value);
+        auditLog.append("l3", "zk_commit", "system", {
+          commitment_hash: commitment.commitment.slice(0, 16) + "..."
+        });
+        return toolResult({
+          commitment: commitment.commitment,
+          blinding_factor: commitment.blinding_factor,
+          committed_at: commitment.committed_at,
+          proof_system: "pedersen-ristretto255",
+          note: "Store the blinding_factor securely. Use zk_prove to create proofs about this commitment."
+        });
+      }
+    },
+    {
+      name: "zk_prove",
+      description: "Create a zero-knowledge proof of knowledge for a Pedersen commitment. Proves you know the value and blinding factor without revealing either. Uses a Schnorr sigma protocol with Fiat-Shamir transform.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "number",
+            description: "The committed value (integer)"
+          },
+          blinding_factor: {
+            type: "string",
+            description: "The blinding factor from zk_commit (base64url)"
+          },
+          commitment: {
+            type: "string",
+            description: "The Pedersen commitment (base64url)"
+          }
+        },
+        required: ["value", "blinding_factor", "commitment"]
+      },
+      handler: async (args) => {
+        const value = args.value;
+        const blindingFactor = args.blinding_factor;
+        const commitment = args.commitment;
+        if (!verifyPedersenCommitment(commitment, value, blindingFactor)) {
+          return toolResult({
+            error: "The provided value and blinding factor do not match the commitment."
+          });
+        }
+        const proof = createProofOfKnowledge(value, blindingFactor, commitment);
+        auditLog.append("l3", "zk_prove", "system", {
+          proof_type: proof.type,
+          commitment: commitment.slice(0, 16) + "..."
+        });
+        return toolResult({
+          proof,
+          note: "This proof demonstrates knowledge of the commitment opening without revealing the value."
+        });
+      }
+    },
+    {
+      name: "zk_verify",
+      description: "Verify a zero-knowledge proof of knowledge for a Pedersen commitment. Checks that the prover knows the commitment's opening without learning anything.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          proof: {
+            type: "object",
+            description: "The ZK proof object from zk_prove"
+          }
+        },
+        required: ["proof"]
+      },
+      handler: async (args) => {
+        const proof = args.proof;
+        const valid = verifyProofOfKnowledge(proof);
+        auditLog.append("l3", "zk_verify", "system", {
+          proof_type: proof.type,
+          valid
+        });
+        return toolResult({
+          valid,
+          proof_type: proof.type,
+          commitment: proof.commitment,
+          verified_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    },
+    {
+      name: "zk_range_prove",
+      description: "Create a zero-knowledge range proof: prove that a committed value is within [min, max] without revealing the exact value. Uses bit-decomposition with OR-proofs on Ristretto255.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {
+            type: "number",
+            description: "The committed value (integer)"
+          },
+          blinding_factor: {
+            type: "string",
+            description: "The blinding factor from zk_commit (base64url)"
+          },
+          commitment: {
+            type: "string",
+            description: "The Pedersen commitment (base64url)"
+          },
+          min: {
+            type: "number",
+            description: "Minimum of the range (inclusive)"
+          },
+          max: {
+            type: "number",
+            description: "Maximum of the range (inclusive)"
+          }
+        },
+        required: ["value", "blinding_factor", "commitment", "min", "max"]
+      },
+      handler: async (args) => {
+        const value = args.value;
+        const blindingFactor = args.blinding_factor;
+        const commitment = args.commitment;
+        const min = args.min;
+        const max = args.max;
+        const proof = createRangeProof(value, blindingFactor, commitment, min, max);
+        if ("error" in proof) {
+          return toolResult({ error: proof.error });
+        }
+        auditLog.append("l3", "zk_range_prove", "system", {
+          proof_type: proof.type,
+          range: `[${min}, ${max}]`,
+          bits: proof.bit_commitments.length
+        });
+        return toolResult({
+          proof,
+          note: `This proof demonstrates the committed value is in [${min}, ${max}] without revealing it.`
+        });
+      }
+    },
+    {
+      name: "zk_range_verify",
+      description: "Verify a zero-knowledge range proof \u2014 confirms a committed value is within the claimed range without learning the value.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          proof: {
+            type: "object",
+            description: "The range proof object from zk_range_prove"
+          }
+        },
+        required: ["proof"]
+      },
+      handler: async (args) => {
+        const proof = args.proof;
+        const valid = verifyRangeProof(proof);
+        auditLog.append("l3", "zk_range_verify", "system", {
+          proof_type: proof.type,
+          valid,
+          range: `[${proof.min}, ${proof.max}]`
+        });
+        return toolResult({
+          valid,
+          proof_type: proof.type,
+          range: { min: proof.min, max: proof.max },
+          commitment: proof.commitment,
+          verified_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    }
+  ];
+  return { tools, commitmentStore, policyStore };
+}
+var init_tools2 = __esm({
+  "src/l3-disclosure/tools.ts"() {
+    init_router();
+    init_commitments();
+    init_policies();
+    init_zk_proofs();
+  }
+});
+
+// src/l4-reputation/reputation-store.ts
+function computeMedian(values) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+function aggregateMetrics(attestations, metricNames) {
+  const result = {};
+  const names = metricNames ?? Array.from(
+    new Set(
+      attestations.flatMap(
+        (a) => Object.keys(a.attestation.data.metrics)
+      )
+    )
+  );
+  for (const name of names) {
+    const values = attestations.map((a) => a.attestation.data.metrics[name]).filter((v) => v !== void 0);
+    if (values.length === 0) {
+      result[name] = { mean: 0, median: 0, min: 0, max: 0, count: 0 };
+      continue;
+    }
+    result[name] = {
+      mean: values.reduce((s, v) => s + v, 0) / values.length,
+      median: computeMedian(values),
+      min: Math.min(...values),
+      max: Math.max(...values),
+      count: values.length
+    };
+  }
+  return result;
+}
+var ReputationStore;
+var init_reputation_store = __esm({
+  "src/l4-reputation/reputation-store.ts"() {
+    init_encryption();
+    init_key_derivation();
+    init_encoding();
+    init_random();
+    init_identity();
+    ReputationStore = class {
+      storage;
+      encryptionKey;
+      constructor(storage, masterKey) {
+        this.storage = storage;
+        this.encryptionKey = derivePurposeKey(masterKey, "l4-reputation");
+      }
+      /**
+       * Record an interaction outcome as a signed attestation.
+       */
+      async record(interactionId, counterpartyDid, outcome, context, identity, identityEncryptionKey, counterpartyAttestation, sovereigntyTier) {
+        const attestationId = `att-${Date.now()}-${toBase64url(randomBytes(8))}`;
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const attestationData = {
+          interaction_id: interactionId,
+          participant_did: identity.did,
+          counterparty_did: counterpartyDid,
+          outcome_type: outcome.type,
+          outcome_result: outcome.result,
+          metrics: outcome.metrics ?? {},
+          context,
+          timestamp: now,
+          sovereignty_tier: sovereigntyTier
+        };
+        const dataBytes = stringToBytes(JSON.stringify(attestationData));
+        const signature = sign(
+          dataBytes,
+          identity.encrypted_private_key,
+          identityEncryptionKey
+        );
+        const attestation = {
+          attestation_id: attestationId,
+          schema: "sanctuary-interaction-v1",
+          data: attestationData,
+          signature: toBase64url(signature),
+          signer: identity.did
+        };
+        const stored = {
+          attestation,
+          counterparty_attestation: counterpartyAttestation,
+          counterparty_confirmed: !!counterpartyAttestation,
+          recorded_at: now
+        };
+        const serialized = stringToBytes(JSON.stringify(stored));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          "_reputation",
+          attestationId,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+        return stored;
+      }
+      /**
+       * Query reputation data with filtering.
+       * Returns aggregates only — not raw interaction data.
+       */
+      async query(options) {
+        const all = await this.loadAll();
+        let filtered = all;
+        if (options.context) {
+          filtered = filtered.filter(
+            (a) => a.attestation.data.context === options.context
+          );
+        }
+        if (options.time_range) {
+          const start2 = new Date(options.time_range.start).getTime();
+          const end2 = new Date(options.time_range.end).getTime();
+          filtered = filtered.filter((a) => {
+            const t = new Date(a.attestation.data.timestamp).getTime();
+            return t >= start2 && t <= end2;
+          });
+        }
+        if (options.counterparty_did) {
+          filtered = filtered.filter(
+            (a) => a.attestation.data.counterparty_did === options.counterparty_did
+          );
+        }
+        const contexts = Array.from(
+          new Set(filtered.map((a) => a.attestation.data.context))
+        );
+        const timestamps = filtered.map(
+          (a) => new Date(a.attestation.data.timestamp).getTime()
+        );
+        const start = timestamps.length > 0 ? new Date(Math.min(...timestamps)).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
+        const end = timestamps.length > 0 ? new Date(Math.max(...timestamps)).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
+        return {
+          total_interactions: filtered.length,
+          completed: filtered.filter(
+            (a) => a.attestation.data.outcome_result === "completed"
+          ).length,
+          partial: filtered.filter(
+            (a) => a.attestation.data.outcome_result === "partial"
+          ).length,
+          failed: filtered.filter(
+            (a) => a.attestation.data.outcome_result === "failed"
+          ).length,
+          disputed: filtered.filter(
+            (a) => a.attestation.data.outcome_result === "disputed"
+          ).length,
+          contexts,
+          time_range: { start, end },
+          aggregate_metrics: aggregateMetrics(filtered, options.metrics)
+        };
+      }
+      /**
+       * Export attestations as a portable reputation bundle.
+       */
+      async exportBundle(identity, identityEncryptionKey, context) {
+        let all = await this.loadAll();
+        if (context) {
+          all = all.filter((a) => a.attestation.data.context === context);
+        }
+        const attestations = all.map((a) => a.attestation);
+        const bundleData = {
+          version: "SANCTUARY_REP_V1",
+          attestations,
+          exported_at: (/* @__PURE__ */ new Date()).toISOString(),
+          exporter_did: identity.did
+        };
+        const bundleBytes = stringToBytes(JSON.stringify(bundleData));
+        const bundleSignature = sign(
+          bundleBytes,
+          identity.encrypted_private_key,
+          identityEncryptionKey
+        );
+        return {
+          ...bundleData,
+          bundle_signature: toBase64url(bundleSignature)
+        };
+      }
+      /**
+       * Import attestations from a reputation bundle.
+       * Verifies signatures if requested (default: true).
+       *
+       * @param publicKeys - Map of DID → public key bytes for signature verification
+       */
+      async importBundle(bundle, verifySignatures, publicKeys) {
+        let imported = 0;
+        let invalid = 0;
+        const contexts = /* @__PURE__ */ new Set();
+        for (const attestation of bundle.attestations) {
+          if (verifySignatures) {
+            const signerKey = publicKeys.get(attestation.signer);
+            if (!signerKey) {
+              invalid++;
+              continue;
+            }
+            const dataBytes = stringToBytes(
+              JSON.stringify(attestation.data)
+            );
+            const sigBytes = fromBase64url(attestation.signature);
+            if (!verify(dataBytes, sigBytes, signerKey)) {
+              invalid++;
+              continue;
+            }
+          }
+          const stored = {
+            attestation,
+            counterparty_confirmed: false,
+            recorded_at: (/* @__PURE__ */ new Date()).toISOString()
+          };
+          const serialized = stringToBytes(JSON.stringify(stored));
+          const encrypted = encrypt(serialized, this.encryptionKey);
+          await this.storage.write(
+            "_reputation",
+            attestation.attestation_id,
+            stringToBytes(JSON.stringify(encrypted))
+          );
+          imported++;
+          contexts.add(attestation.data.context);
+        }
+        return {
+          imported,
+          invalid,
+          contexts: Array.from(contexts)
+        };
+      }
+      // ─── Escrow ───────────────────────────────────────────────────────────
+      /**
+       * Create an escrow for trust bootstrapping.
+       */
+      async createEscrow(transactionTerms, counterpartyDid, timeoutSeconds, creatorDid, collateralAmount) {
+        const escrowId = `esc-${Date.now()}-${toBase64url(randomBytes(8))}`;
+        const now = /* @__PURE__ */ new Date();
+        const expiresAt = new Date(now.getTime() + timeoutSeconds * 1e3);
+        const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
+        const termsHash = hashToString2(stringToBytes(transactionTerms));
+        const escrow = {
+          escrow_id: escrowId,
+          transaction_terms: transactionTerms,
+          terms_hash: termsHash,
+          collateral_amount: collateralAmount,
+          counterparty_did: counterpartyDid,
+          creator_did: creatorDid,
+          created_at: now.toISOString(),
+          expires_at: expiresAt.toISOString(),
+          status: "pending"
+        };
+        const serialized = stringToBytes(JSON.stringify(escrow));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          "_escrows",
+          escrowId,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+        return escrow;
+      }
+      /**
+       * Get an escrow by ID.
+       */
+      async getEscrow(escrowId) {
+        const raw = await this.storage.read("_escrows", escrowId);
+        if (!raw) return null;
+        try {
+          const encrypted = JSON.parse(bytesToString(raw));
+          const decrypted = decrypt(encrypted, this.encryptionKey);
+          return JSON.parse(bytesToString(decrypted));
+        } catch {
+          return null;
+        }
+      }
+      // ─── Guarantees ─────────────────────────────────────────────────────
+      /**
+       * Create a principal's guarantee for a new agent.
+       */
+      async createGuarantee(principalIdentity, agentDid, scope, durationSeconds, identityEncryptionKey, maxLiability) {
+        const guaranteeId = `guar-${Date.now()}-${toBase64url(randomBytes(8))}`;
+        const now = /* @__PURE__ */ new Date();
+        const validUntil = new Date(now.getTime() + durationSeconds * 1e3);
+        const certificateData = {
+          guarantee_id: guaranteeId,
+          principal_did: principalIdentity.did,
+          agent_did: agentDid,
+          scope,
+          max_liability: maxLiability,
+          valid_until: validUntil.toISOString(),
+          issued_at: now.toISOString()
+        };
+        const certBytes = stringToBytes(JSON.stringify(certificateData));
+        const signature = sign(
+          certBytes,
+          principalIdentity.encrypted_private_key,
+          identityEncryptionKey
+        );
+        const certificate = toBase64url(
+          stringToBytes(
+            JSON.stringify({
+              ...certificateData,
+              signature: toBase64url(signature)
+            })
+          )
+        );
+        const guarantee = {
+          guarantee_id: guaranteeId,
+          principal_did: principalIdentity.did,
+          agent_did: agentDid,
+          scope,
+          max_liability: maxLiability,
+          valid_until: validUntil.toISOString(),
+          certificate,
+          created_at: now.toISOString()
+        };
+        const serialized = stringToBytes(JSON.stringify(guarantee));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          "_guarantees",
+          guaranteeId,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+        return guarantee;
+      }
+      // ─── Tier-Aware Access ───────────────────────────────────────────────
+      /**
+       * Load attestations for tier-weighted scoring.
+       * Applies basic context/counterparty filtering, returns full StoredAttestations
+       * so callers can access sovereignty_tier from attestation data.
+       */
+      async loadAllForTierScoring(options) {
+        let all = await this.loadAll();
+        if (options?.context) {
+          all = all.filter((a) => a.attestation.data.context === options.context);
+        }
+        if (options?.counterparty_did) {
+          all = all.filter(
+            (a) => a.attestation.data.counterparty_did === options.counterparty_did
+          );
+        }
+        return all;
+      }
+      // ─── Internal ─────────────────────────────────────────────────────────
+      async loadAll() {
+        const results = [];
+        try {
+          const entries = await this.storage.list("_reputation");
+          for (const meta of entries) {
+            const raw = await this.storage.read("_reputation", meta.key);
+            if (!raw) continue;
+            try {
+              const encrypted = JSON.parse(bytesToString(raw));
+              const decrypted = decrypt(encrypted, this.encryptionKey);
+              results.push(JSON.parse(bytesToString(decrypted)));
+            } catch {
+            }
+          }
+        } catch {
+        }
+        return results;
+      }
+    };
+  }
+});
+
+// src/l4-reputation/tiers.ts
+function resolveTier(counterpartyId, handshakeResults, hasSanctuaryIdentity) {
+  const handshake = handshakeResults.get(counterpartyId);
+  if (handshake && handshake.verified) {
+    const expiresAt = new Date(handshake.expires_at);
+    if (expiresAt > /* @__PURE__ */ new Date()) {
+      return {
+        sovereignty_tier: handshake.trust_tier,
+        handshake_completed_at: handshake.completed_at,
+        verified_by: handshake.counterparty_id
+      };
+    }
+  }
+  if (hasSanctuaryIdentity) {
+    return { sovereignty_tier: "self-attested" };
+  }
+  return { sovereignty_tier: "unverified" };
+}
+function trustTierToSovereigntyTier(trustTier) {
+  switch (trustTier) {
+    case "verified-sovereign":
+      return "verified-sovereign";
+    case "verified-degraded":
+      return "verified-degraded";
+    default:
+      return "unverified";
+  }
+}
+function computeWeightedScore(attestations) {
+  if (attestations.length === 0) return null;
+  let weightedSum = 0;
+  let totalWeight = 0;
+  for (const a of attestations) {
+    const weight = TIER_WEIGHTS[a.tier];
+    weightedSum += a.value * weight;
+    totalWeight += weight;
+  }
+  return totalWeight > 0 ? weightedSum / totalWeight : null;
+}
+function tierDistribution(tiers) {
+  const dist = {
+    "verified-sovereign": 0,
+    "verified-degraded": 0,
+    "self-attested": 0,
+    "unverified": 0
+  };
+  for (const tier of tiers) {
+    dist[tier]++;
+  }
+  return dist;
+}
+var TIER_WEIGHTS;
+var init_tiers = __esm({
+  "src/l4-reputation/tiers.ts"() {
+    TIER_WEIGHTS = {
+      "verified-sovereign": 1,
+      "verified-degraded": 0.8,
+      "self-attested": 0.5,
+      "unverified": 0.2
+    };
+  }
+});
+
+// src/l4-reputation/tools.ts
+function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeResults, verascoreUrl) {
+  const reputationStore = new ReputationStore(storage, masterKey);
+  const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  const hsResults = handshakeResults ?? /* @__PURE__ */ new Map();
+  const tools = [
+    // ─── Reputation Recording ─────────────────────────────────────────
+    {
+      name: "reputation_record",
+      description: "Record an interaction outcome as a signed attestation. Creates an EAS-compatible attestation signed by the specified identity.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          interaction_id: {
+            type: "string",
+            description: "Unique interaction identifier"
+          },
+          counterparty_did: {
+            type: "string",
+            description: "Counterparty's DID"
+          },
+          outcome: {
+            type: "object",
+            description: "Interaction outcome",
+            properties: {
+              type: {
+                type: "string",
+                enum: ["transaction", "negotiation", "service", "dispute", "custom"]
+              },
+              result: {
+                type: "string",
+                enum: ["completed", "partial", "failed", "disputed"]
+              },
+              metrics: {
+                type: "object",
+                description: "Domain-specific metrics (e.g., fulfillment_rate, response_time_ms)"
+              }
+            },
+            required: ["type", "result"]
+          },
+          context: {
+            type: "string",
+            description: "Category/domain for context-specific reputation",
+            default: "general"
+          },
+          counterparty_attestation: {
+            type: "string",
+            description: "Counterparty's signed attestation of the same interaction"
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to sign with (uses default if omitted)"
+          }
+        },
+        required: ["interaction_id", "counterparty_did", "outcome"]
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first."
+          });
+        }
+        const outcome = args.outcome;
+        const context = args.context ?? "general";
+        const counterpartyDid = args.counterparty_did;
+        const hasSanctuaryIdentity = identityManager.list().some(
+          (id) => identityManager.get(id.identity_id)?.did === counterpartyDid
+        );
+        const tierMeta = resolveTier(counterpartyDid, hsResults, hasSanctuaryIdentity);
+        const stored = await reputationStore.record(
+          args.interaction_id,
+          counterpartyDid,
+          outcome,
+          context,
+          identity,
+          identityEncryptionKey,
+          args.counterparty_attestation,
+          tierMeta.sovereignty_tier
+        );
+        auditLog.append("l4", "reputation_record", identity.identity_id, {
+          interaction_id: args.interaction_id,
+          outcome_type: outcome.type,
+          outcome_result: outcome.result,
+          context,
+          sovereignty_tier: tierMeta.sovereignty_tier
+        });
+        return toolResult({
+          attestation_id: stored.attestation.attestation_id,
+          interaction_id: stored.attestation.data.interaction_id,
+          self_attestation: stored.attestation.signature,
+          counterparty_confirmed: stored.counterparty_confirmed,
+          sovereignty_tier: tierMeta.sovereignty_tier,
+          context,
+          recorded_at: stored.recorded_at
+        });
+      }
+    },
+    // ─── Reputation Query ─────────────────────────────────────────────
+    {
+      name: "reputation_query",
+      description: "Query aggregated reputation data with filtering. Returns summary statistics, never raw interaction details.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          context: {
+            type: "string",
+            description: "Filter by context/domain"
+          },
+          time_range: {
+            type: "object",
+            description: "Filter by time range",
+            properties: {
+              start: { type: "string", description: "ISO 8601 start" },
+              end: { type: "string", description: "ISO 8601 end" }
+            }
+          },
+          metrics: {
+            type: "array",
+            items: { type: "string" },
+            description: "Which metrics to aggregate"
+          },
+          counterparty_did: {
+            type: "string",
+            description: "Filter by counterparty"
+          }
+        }
+      },
+      handler: async (args) => {
+        const summary = await reputationStore.query({
+          context: args.context,
+          time_range: args.time_range,
+          metrics: args.metrics,
+          counterparty_did: args.counterparty_did
+        });
+        auditLog.append("l4", "reputation_query", "system", {
+          total_interactions: summary.total_interactions,
+          contexts: summary.contexts
+        });
+        return toolResult({
+          summary,
+          // SEC-ADD-03: Tag response as containing counterparty-generated attestation data
+          _content_trust: "external"
+        });
+      }
+    },
+    // ─── Reputation Export ─────────────────────────────────────────────
+    {
+      name: "reputation_export",
+      description: "Export a portable reputation bundle (SANCTUARY_REP_V1). Includes all signed attestations for independent verification.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          format: {
+            type: "string",
+            enum: ["SANCTUARY_REP_V1"],
+            default: "SANCTUARY_REP_V1"
+          },
+          context: {
+            type: "string",
+            description: "Export specific context only"
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to sign the bundle with"
+          }
+        }
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first."
+          });
+        }
+        const context = args.context;
+        const bundle = await reputationStore.exportBundle(
+          identity,
+          identityEncryptionKey,
+          context
+        );
+        const bundleJson = JSON.stringify(bundle);
+        const bundleBase64 = toBase64url(
+          new TextEncoder().encode(bundleJson)
+        );
+        auditLog.append("l4", "reputation_export", identity.identity_id, {
+          attestation_count: bundle.attestations.length,
+          contexts: Array.from(
+            new Set(bundle.attestations.map((a) => a.data.context))
+          )
+        });
+        const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
+        const { stringToBytes: stringToBytes2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
+        return toolResult({
+          bundle: bundleBase64,
+          attestation_count: bundle.attestations.length,
+          contexts: Array.from(
+            new Set(bundle.attestations.map((a) => a.data.context))
+          ),
+          bundle_hash: hashToString2(stringToBytes2(bundleJson)),
+          exported_at: bundle.exported_at
+        });
+      }
+    },
+    // ─── Reputation Import ────────────────────────────────────────────
+    {
+      name: "reputation_import",
+      description: "Import a reputation bundle from another Sanctuary instance. Verifies all attestation signatures by default.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          bundle: {
+            type: "string",
+            description: "Base64url-encoded reputation bundle"
+          }
+        },
+        required: ["bundle"]
+      },
+      handler: async (args) => {
+        const bundleBase64 = args.bundle;
+        const verifySignatures = true;
+        let bundle;
+        try {
+          const bundleBytes = fromBase64url(bundleBase64);
+          const bundleJson = new TextDecoder().decode(bundleBytes);
+          bundle = JSON.parse(bundleJson);
+        } catch {
+          return toolResult({
+            error: "Invalid bundle format. Expected base64url-encoded JSON."
+          });
+        }
+        const publicKeys = /* @__PURE__ */ new Map();
+        for (const pub of identityManager.list()) {
+          const identity = identityManager.get(pub.identity_id);
+          if (identity) {
+            publicKeys.set(identity.did, fromBase64url(identity.public_key));
+          }
+        }
+        const result = await reputationStore.importBundle(
+          bundle,
+          verifySignatures,
+          publicKeys
+        );
+        auditLog.append("l4", "reputation_import", "system", {
+          imported: result.imported,
+          invalid: result.invalid,
+          contexts: result.contexts
+        });
+        return toolResult({
+          imported_attestations: result.imported,
+          invalid_attestations: result.invalid,
+          contexts: result.contexts,
+          imported_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+    },
+    // ─── Sovereignty-Weighted Query ──────────────────────────────────
+    {
+      name: "reputation_query_weighted",
+      description: "Query reputation with sovereignty-weighted scoring. Attestations from verified-sovereign agents carry full weight (1.0); unverified attestations carry reduced weight (0.2). Returns both the weighted score and tier distribution.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          metric: {
+            type: "string",
+            description: "Which metric to compute the weighted score for"
+          },
+          context: {
+            type: "string",
+            description: "Filter by context/domain"
+          },
+          counterparty_did: {
+            type: "string",
+            description: "Filter by counterparty"
+          }
+        },
+        required: ["metric"]
+      },
+      handler: async (args) => {
+        const summary = await reputationStore.query({
+          context: args.context,
+          counterparty_did: args.counterparty_did
+        });
+        const allAttestations = await reputationStore.loadAllForTierScoring({
+          context: args.context,
+          counterparty_did: args.counterparty_did
+        });
+        const metric = args.metric;
+        const tieredAttestations = allAttestations.filter((a) => a.attestation.data.metrics[metric] !== void 0).map((a) => ({
+          value: a.attestation.data.metrics[metric],
+          tier: a.attestation.data.sovereignty_tier ?? "unverified"
+        }));
+        const weightedScore = computeWeightedScore(tieredAttestations);
+        const tiers = allAttestations.map(
+          (a) => a.attestation.data.sovereignty_tier ?? "unverified"
+        );
+        const dist = tierDistribution(tiers);
+        auditLog.append("l4", "reputation_query_weighted", "system", {
+          metric,
+          attestation_count: tieredAttestations.length,
+          weighted_score: weightedScore
+        });
+        return toolResult({
+          metric,
+          weighted_score: weightedScore,
+          attestation_count: tieredAttestations.length,
+          tier_distribution: dist,
+          tier_weights: TIER_WEIGHTS,
+          unweighted_summary: summary
+        });
+      }
+    },
+    // ─── Trust Bootstrap: Escrow ──────────────────────────────────────
+    {
+      name: "bootstrap_create_escrow",
+      description: "Create an escrow record for trust bootstrapping. Allows new participants with no reputation to transact safely.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          transaction_terms: {
+            type: "string",
+            description: "Description of the transaction"
+          },
+          collateral_amount: {
+            type: "number",
+            description: "Optional stake/collateral amount"
+          },
+          counterparty_did: {
+            type: "string",
+            description: "Counterparty's DID"
+          },
+          timeout_seconds: {
+            type: "number",
+            description: "Escrow timeout in seconds"
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity creating the escrow"
+          }
+        },
+        required: ["transaction_terms", "counterparty_did", "timeout_seconds"]
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first."
+          });
+        }
+        const escrow = await reputationStore.createEscrow(
+          args.transaction_terms,
+          args.counterparty_did,
+          args.timeout_seconds,
+          identity.did,
+          args.collateral_amount
+        );
+        auditLog.append("l4", "bootstrap_create_escrow", identity.identity_id, {
+          escrow_id: escrow.escrow_id,
+          counterparty_did: args.counterparty_did,
+          timeout_seconds: args.timeout_seconds
+        });
+        return toolResult({
+          escrow_id: escrow.escrow_id,
+          terms_hash: escrow.terms_hash,
+          created_at: escrow.created_at,
+          expires_at: escrow.expires_at,
+          status: escrow.status
+        });
+      }
+    },
+    // ─── Trust Bootstrap: Guarantee ───────────────────────────────────
+    {
+      name: "bootstrap_provide_guarantee",
+      description: "A principal provides a signed reputation guarantee for a new agent. The guarantee certificate can be presented to counterparties.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          principal_identity_id: {
+            type: "string",
+            description: "Identity of the guarantor (principal)"
+          },
+          agent_identity_id: {
+            type: "string",
+            description: "Identity of the agent being guaranteed"
+          },
+          scope: {
+            type: "string",
+            description: "What the guarantee covers"
+          },
+          duration_seconds: {
+            type: "number",
+            description: "How long the guarantee is valid"
+          },
+          max_liability: {
+            type: "number",
+            description: "Maximum liability amount"
+          }
+        },
+        required: [
+          "principal_identity_id",
+          "agent_identity_id",
+          "scope",
+          "duration_seconds"
+        ]
+      },
+      handler: async (args) => {
+        const principalIdentity = identityManager.get(
+          args.principal_identity_id
+        );
+        const agentIdentity = identityManager.get(
+          args.agent_identity_id
+        );
+        if (!principalIdentity) {
+          return toolResult({
+            error: `Principal identity "${args.principal_identity_id}" not found.`
+          });
+        }
+        if (!agentIdentity) {
+          return toolResult({
+            error: `Agent identity "${args.agent_identity_id}" not found.`
+          });
+        }
+        const guarantee = await reputationStore.createGuarantee(
+          principalIdentity,
+          agentIdentity.did,
+          args.scope,
+          args.duration_seconds,
+          identityEncryptionKey,
+          args.max_liability
+        );
+        auditLog.append(
+          "l4",
+          "bootstrap_provide_guarantee",
+          principalIdentity.identity_id,
+          {
+            guarantee_id: guarantee.guarantee_id,
+            agent_did: agentIdentity.did,
+            scope: args.scope
+          }
+        );
+        return toolResult({
+          guarantee_id: guarantee.guarantee_id,
+          guarantee_certificate: guarantee.certificate,
+          scope: guarantee.scope,
+          valid_until: guarantee.valid_until
+        });
+      }
+    },
+    // ─── Verascore Reputation Publish ────────────────────────────────
+    {
+      name: "reputation_publish",
+      description: "Publish sovereignty data to Verascore (verascore.ai) \u2014 the agent reputation platform. Sends SHR data, handshake attestations, or sovereignty updates. The data is signed with the agent's Ed25519 key for verification. Requires a Verascore agent profile (claimed or stub) to exist.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          type: {
+            type: "string",
+            enum: ["shr", "handshake", "sovereignty-update"],
+            description: "Type of data to publish: 'shr' for full sovereignty health report, 'handshake' for a handshake attestation, 'sovereignty-update' for layer-level updates."
+          },
+          verascore_agent_id: {
+            type: "string",
+            description: "Agent ID on Verascore. If omitted, uses the default identity's DID-derived slug."
+          },
+          verascore_url: {
+            type: "string",
+            description: "Verascore API base URL. Defaults to https://verascore.ai"
+          },
+          data: {
+            type: "object",
+            description: "The data payload. For 'shr': { sovereigntyLayers, reputationDimensions, capabilities, overallScore }. For 'handshake': { attestation: { id, responderId, ... } }. For 'sovereignty-update': { layers: [{ name, label, score, status, description }] }."
+          },
+          identity_id: {
+            type: "string",
+            description: "Identity to sign with (uses default if omitted)"
+          }
+        },
+        required: ["type"]
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: "No identity found. Create one with identity_create first."
+          });
+        }
+        const publishType = args.type;
+        const configuredVerascoreUrl = verascoreUrl || "https://verascore.ai";
+        const veracoreUrl = args.verascore_url || configuredVerascoreUrl;
+        const ALLOWED_VERASCORE_HOSTS2 = /* @__PURE__ */ new Set([
+          "verascore.ai",
+          "www.verascore.ai",
+          "api.verascore.ai"
+        ]);
+        try {
+          const configuredHost = new URL(configuredVerascoreUrl).hostname;
+          ALLOWED_VERASCORE_HOSTS2.add(configuredHost);
+        } catch {
+        }
+        try {
+          const parsed = new URL(veracoreUrl);
+          if (parsed.protocol !== "https:") {
+            return toolResult({
+              error: `verascore_url must use HTTPS. Got: ${parsed.protocol}`
+            });
+          }
+          if (!ALLOWED_VERASCORE_HOSTS2.has(parsed.hostname)) {
+            return toolResult({
+              error: `verascore_url must point to a known Verascore domain (${[...ALLOWED_VERASCORE_HOSTS2].join(", ")}). Got: ${parsed.hostname}`
+            });
+          }
+        } catch {
+          return toolResult({
+            error: `verascore_url is not a valid URL: ${veracoreUrl}`
+          });
+        }
+        const agentId = args.verascore_agent_id || identity.did.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase();
+        let publishData;
+        if (args.data) {
+          publishData = args.data;
+        } else {
+          switch (publishType) {
+            case "shr": {
+              publishData = {
+                sovereigntyLayers: [
+                  { name: "L1", label: "Cognitive Sovereignty", score: 100, status: "active", description: "Full cognitive isolation with policy-controlled context boundaries" },
+                  { name: "L2", label: "Operational Isolation", score: 72, status: "degraded", description: "Runtime isolation without TEE hardware attestation" },
+                  { name: "L3", label: "Selective Disclosure", score: 100, status: "active", description: "Schnorr-Pedersen zero-knowledge proofs for credential verification" },
+                  { name: "L4", label: "Verifiable Reputation", score: 100, status: "active", description: "Cryptographically verified reputation with portable attestations" }
+                ],
+                capabilities: ["sovereignty-handshake", "concordia-negotiation", "audit-trail-export", "zk-proofs"],
+                overallScore: 93
+              };
+              break;
+            }
+            case "sovereignty-update":
+            case "handshake": {
+              return toolResult({
+                error: `For type '${publishType}', you must provide explicit data in the 'data' field.`
+              });
+            }
+            default:
+              return toolResult({ error: `Unknown publish type: ${publishType}` });
+          }
+        }
+        const { sign: identitySign } = await Promise.resolve().then(() => (init_identity(), identity_exports));
+        const payloadBytes = new TextEncoder().encode(JSON.stringify(publishData));
+        let signatureB64;
+        try {
+          const signingBytes = identitySign(
+            payloadBytes,
+            identity.encrypted_private_key,
+            identityEncryptionKey
+          );
+          signatureB64 = toBase64url(signingBytes);
+        } catch (signError) {
+          return toolResult({
+            error: "Failed to sign publish payload. Identity key may be corrupted.",
+            details: signError instanceof Error ? signError.message : String(signError)
+          });
+        }
+        const requestBody = {
+          agentId,
+          signature: signatureB64,
+          publicKey: identity.public_key,
+          type: publishType,
+          data: publishData
+        };
+        try {
+          const response = await fetch(`${veracoreUrl}/api/publish`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestBody)
+          });
+          const result = await response.json();
+          auditLog.append("l4", "reputation_publish", identity.identity_id, {
+            type: publishType,
+            verascore_agent_id: agentId,
+            verascore_url: veracoreUrl,
+            status: response.status,
+            success: result.success ?? false
+          });
+          if (!response.ok) {
+            return toolResult({
+              error: `Verascore API returned ${response.status}`,
+              details: result,
+              verascore_url: veracoreUrl
+            });
+          }
+          return toolResult({
+            published: true,
+            type: publishType,
+            verascore_agent_id: agentId,
+            verascore_url: veracoreUrl,
+            response: result,
+            signed_by: identity.did
+          });
+        } catch (fetchError) {
+          const errorMessage = fetchError instanceof Error ? fetchError.message : String(fetchError);
+          auditLog.append("l4", "reputation_publish", identity.identity_id, {
+            type: publishType,
+            verascore_agent_id: agentId,
+            error: errorMessage
+          });
+          return toolResult({
+            error: `Failed to reach Verascore at ${veracoreUrl}: ${errorMessage}`,
+            hint: "Ensure verascore.ai is reachable and the agent has a profile."
+          });
+        }
+      }
+    }
+  ];
+  return { tools, reputationStore };
+}
+var init_tools3 = __esm({
+  "src/l4-reputation/tools.ts"() {
+    init_router();
+    init_reputation_store();
+    init_key_derivation();
+    init_encoding();
+    init_tiers();
   }
 });
 function extractOperationName(toolName) {
@@ -1726,6 +4141,7 @@ tier3_always_allow:
   - context_gate_filter
   - context_gate_list_policies
   - sovereignty_audit
+  - audit_export_siem
   - shr_gateway_export
   - bridge_commit
   - bridge_verify
@@ -1735,7 +4151,9 @@ tier3_always_allow:
   - governor_status
   - reputation_publish
   - sanctuary_policy_status
-
+  - memory_attest
+  - compliance_generate_eu_ai_act_bundle
+  - compliance_eu_ai_act_annex_iii_classify
 # \u2500\u2500\u2500 Approval Channel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # How Sanctuary reaches you when approval is needed.
 # NOTE: Timeout always results in denial. This is not configurable (SEC-002).
@@ -1844,6 +4262,7 @@ var init_loader = __esm({
         "l2_hardening_status",
         "l2_verify_isolation",
         "sovereignty_audit",
+        "audit_export_siem",
         "shr_gateway_export",
         "bridge_commit",
         "bridge_verify",
@@ -1856,8 +4275,16 @@ var init_loader = __esm({
         "governor_status",
         "reputation_publish",
         // Auto-allow: publishing sovereignty data to Verascore is routine
-        "sanctuary_policy_status"
+        "sanctuary_policy_status",
         // Read-only policy summary
+        "identity_set_primary",
+        // One-time set, persists via _meta storage — safe at Tier 3
+        "memory_attest",
+        // Read-only audit attestation — records that a memory op happened
+        "compliance_generate_eu_ai_act_bundle",
+        // Read-only; emits signed compliance documents from existing state
+        "compliance_eu_ai_act_annex_iii_classify"
+        // Read-only; rule-based Annex III classifier
       ],
       approval_channel: DEFAULT_CHANNEL
     };
@@ -2021,6 +4448,49 @@ var init_baseline = __esm({
       /** Get a read-only view of the current profile */
       getProfile() {
         return { ...this.profile };
+      }
+    };
+  }
+});
+
+// src/principal-policy/approval-channel.ts
+var StderrApprovalChannel;
+var init_approval_channel = __esm({
+  "src/principal-policy/approval-channel.ts"() {
+    StderrApprovalChannel = class {
+      constructor(_config) {
+      }
+      async requestApproval(request) {
+        const prompt = this.formatPrompt(request);
+        process.stderr.write(prompt + "\n");
+        return {
+          decision: "deny",
+          decided_at: (/* @__PURE__ */ new Date()).toISOString(),
+          decided_by: "stderr:non-interactive"
+        };
+      }
+      formatPrompt(request) {
+        const tierLabel = request.tier === 1 ? "Tier 1 \u2014 always requires approval" : "Tier 2 \u2014 behavioral anomaly detected";
+        const contextLines = Object.entries(request.context).map(([k, v]) => `  ${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`).join("\n");
+        return [
+          "",
+          "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557",
+          "\u2551  SANCTUARY: Operation Denied (non-interactive channel)           \u2551",
+          "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563",
+          `\u2551  Operation:  ${request.operation.padEnd(50)}\u2551`,
+          `\u2551  ${tierLabel.padEnd(62)}\u2551`,
+          `\u2551  Reason:     ${request.reason.slice(0, 50).padEnd(50)}\u2551`,
+          "\u2551                                                                  \u2551",
+          `\u2551  Details:                                                        \u2551`,
+          ...contextLines.split("\n").map(
+            (line) => `\u2551    ${line.padEnd(60)}\u2551`
+          ),
+          "\u2551                                                                  \u2551",
+          "\u2551  Denied: stderr channel cannot accept input (SEC-016)            \u2551",
+          "\u2551  Use dashboard or webhook channel for interactive approval.      \u2551",
+          "\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D",
+          ""
+        ].join("\n");
       }
     };
   }
@@ -5075,7 +7545,7 @@ function generateFortressViewHTML(options) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Sanctuary \u2014 Fortress View</title>
+  <title>Sanctuary</title>
   <style>
     :root {
       --bg: #0d1117;
@@ -5464,7 +7934,7 @@ function generateFortressViewHTML(options) {
     <div class="fortress-brand">
       <div class="shield">&#x1F6E1;</div>
       <div>
-        <h1>Sanctuary Cocoon</h1>
+        <h1>Sanctuary</h1>
         <div class="version">v${esc(options.serverVersion)}</div>
       </div>
     </div>
@@ -6095,9 +8565,9 @@ var init_dashboard = __esm({
               cert: readFileSync(this.config.tls.cert_path),
               key: readFileSync(this.config.tls.key_path)
             };
-            this.httpServer = createServer$2(tlsOpts, handler);
+            this.httpServer = createServer$1(tlsOpts, handler);
           } else {
-            this.httpServer = createServer$1(handler);
+            this.httpServer = createServer$2(handler);
           }
           const protocol = this.useTLS ? "https" : "http";
           const baseUrl = `${protocol}://${this.config.host}:${this.config.port}`;
@@ -7009,3166 +9479,6 @@ data: ${JSON.stringify(data)}
     };
   }
 });
-
-// src/sovereignty-profile.ts
-function createDefaultProfile() {
-  return {
-    version: 1,
-    features: {
-      audit_logging: { enabled: true },
-      injection_detection: { enabled: true },
-      context_gating: { enabled: false },
-      approval_gate: { enabled: true },
-      // SEC-057: always enabled — core enforcement
-      zk_proofs: { enabled: false }
-    },
-    updated_at: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-var NAMESPACE, PROFILE_KEY, HKDF_DOMAIN, SovereigntyProfileStore;
-var init_sovereignty_profile = __esm({
-  "src/sovereignty-profile.ts"() {
-    init_encryption();
-    init_key_derivation();
-    init_encoding();
-    NAMESPACE = "_sovereignty_profile";
-    PROFILE_KEY = "active";
-    HKDF_DOMAIN = "sovereignty-profile";
-    SovereigntyProfileStore = class {
-      storage;
-      encryptionKey;
-      profile = null;
-      constructor(storage, masterKey) {
-        this.storage = storage;
-        this.encryptionKey = derivePurposeKey(masterKey, HKDF_DOMAIN);
-      }
-      /**
-       * Load the active sovereignty profile from encrypted storage.
-       * Creates the default profile on first run.
-       */
-      async load() {
-        if (this.profile) return this.profile;
-        const raw = await this.storage.read(NAMESPACE, PROFILE_KEY);
-        if (raw) {
-          try {
-            const encrypted = JSON.parse(bytesToString(raw));
-            const decrypted = decrypt(encrypted, this.encryptionKey);
-            this.profile = JSON.parse(bytesToString(decrypted));
-            return this.profile;
-          } catch {
-          }
-        }
-        this.profile = createDefaultProfile();
-        await this.persist();
-        return this.profile;
-      }
-      /**
-       * Get the current profile. Must call load() first.
-       */
-      get() {
-        if (!this.profile) {
-          throw new Error("SovereigntyProfileStore: call load() before get()");
-        }
-        return this.profile;
-      }
-      /**
-       * Apply a partial update to the profile.
-       * Returns the updated profile.
-       */
-      async update(updates) {
-        if (!this.profile) {
-          await this.load();
-        }
-        if (updates.approval_gate && updates.approval_gate.enabled === false) {
-          throw new Error("approval_gate cannot be disabled \u2014 it is a core enforcement feature");
-        }
-        const features = this.profile.features;
-        if (updates.audit_logging !== void 0) {
-          if (updates.audit_logging.enabled !== void 0) {
-            if (typeof updates.audit_logging.enabled !== "boolean") {
-              throw new Error("audit_logging.enabled must be a boolean");
-            }
-            features.audit_logging.enabled = updates.audit_logging.enabled;
-          }
-        }
-        if (updates.injection_detection !== void 0) {
-          if (updates.injection_detection.enabled !== void 0) {
-            if (typeof updates.injection_detection.enabled !== "boolean") {
-              throw new Error("injection_detection.enabled must be a boolean");
-            }
-            features.injection_detection.enabled = updates.injection_detection.enabled;
-          }
-          if (updates.injection_detection.sensitivity !== void 0) {
-            const valid = ["low", "medium", "high"];
-            if (!valid.includes(updates.injection_detection.sensitivity)) {
-              throw new Error("injection_detection.sensitivity must be low, medium, or high");
-            }
-            features.injection_detection.sensitivity = updates.injection_detection.sensitivity;
-          }
-        }
-        if (updates.context_gating !== void 0) {
-          if (updates.context_gating.enabled !== void 0) {
-            if (typeof updates.context_gating.enabled !== "boolean") {
-              throw new Error("context_gating.enabled must be a boolean");
-            }
-            features.context_gating.enabled = updates.context_gating.enabled;
-          }
-          if (updates.context_gating.policy_id !== void 0) {
-            if (typeof updates.context_gating.policy_id !== "string" || updates.context_gating.policy_id.length > 256) {
-              throw new Error("context_gating.policy_id must be a string of 256 characters or fewer");
-            }
-            features.context_gating.policy_id = updates.context_gating.policy_id;
-          }
-        }
-        if (updates.approval_gate !== void 0) {
-          if (updates.approval_gate.enabled !== void 0) {
-            if (typeof updates.approval_gate.enabled !== "boolean") {
-              throw new Error("approval_gate.enabled must be a boolean");
-            }
-            features.approval_gate.enabled = updates.approval_gate.enabled;
-          }
-        }
-        if (updates.zk_proofs !== void 0) {
-          if (updates.zk_proofs.enabled !== void 0) {
-            if (typeof updates.zk_proofs.enabled !== "boolean") {
-              throw new Error("zk_proofs.enabled must be a boolean");
-            }
-            features.zk_proofs.enabled = updates.zk_proofs.enabled;
-          }
-        }
-        if (updates.upstream_servers !== void 0) {
-          if (!Array.isArray(updates.upstream_servers)) {
-            throw new Error("upstream_servers must be an array");
-          }
-          for (const server of updates.upstream_servers) {
-            if (!server.name || typeof server.name !== "string") {
-              throw new Error("Each upstream server must have a name");
-            }
-            if (server.name.length > 128) {
-              throw new Error("Upstream server name must be 128 characters or fewer");
-            }
-            if (!/^[a-zA-Z0-9_-]+$/.test(server.name)) {
-              throw new Error("Upstream server name must contain only alphanumeric characters, hyphens, and underscores");
-            }
-            if (!server.transport || typeof server.transport !== "object") {
-              throw new Error("Each upstream server must have a transport configuration");
-            }
-            if (server.transport.type !== "stdio" && server.transport.type !== "sse") {
-              throw new Error("Transport type must be 'stdio' or 'sse'");
-            }
-            if (server.transport.type === "stdio" && !server.transport.command) {
-              throw new Error("stdio transport requires a command");
-            }
-            if (server.transport.type === "sse" && !server.transport.url) {
-              throw new Error("sse transport requires a url");
-            }
-            if (typeof server.enabled !== "boolean") {
-              throw new Error("Each upstream server must have enabled as a boolean");
-            }
-            if (![1, 2, 3].includes(server.default_tier)) {
-              throw new Error("default_tier must be 1, 2, or 3");
-            }
-            if (server.tool_overrides) {
-              for (const [, override] of Object.entries(server.tool_overrides)) {
-                if (![1, 2, 3].includes(override.tier)) {
-                  throw new Error("tool_overrides tier must be 1, 2, or 3");
-                }
-              }
-            }
-          }
-          this.profile.upstream_servers = updates.upstream_servers;
-        }
-        this.profile.updated_at = (/* @__PURE__ */ new Date()).toISOString();
-        await this.persist();
-        return this.profile;
-      }
-      /**
-       * Persist the current profile to encrypted storage.
-       */
-      async persist() {
-        const serialized = stringToBytes(JSON.stringify(this.profile));
-        const encrypted = encrypt(serialized, this.encryptionKey);
-        await this.storage.write(
-          NAMESPACE,
-          PROFILE_KEY,
-          stringToBytes(JSON.stringify(encrypted))
-        );
-      }
-    };
-  }
-});
-async function backupConfig(configPath) {
-  await mkdir(BACKUP_DIR, { recursive: true, mode: 448 });
-  const timestamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
-  const backupPath = join(BACKUP_DIR, `config-backup-${timestamp}.json`);
-  await copyFile(configPath, backupPath);
-  return backupPath;
-}
-async function restoreConfig(backupPath, targetPath) {
-  await copyFile(backupPath, targetPath);
-}
-async function findLatestBackup() {
-  const metaPath = join(BACKUP_DIR, "cocoon-meta.json");
-  try {
-    const raw = await readFile(metaPath, "utf-8");
-    const meta = JSON.parse(raw);
-    return {
-      backupPath: meta.backupPath,
-      originalPath: meta.originalPath
-    };
-  } catch {
-    return null;
-  }
-}
-async function saveCocoonMeta(meta) {
-  await mkdir(BACKUP_DIR, { recursive: true, mode: 448 });
-  const metaPath = join(BACKUP_DIR, "cocoon-meta.json");
-  await writeFile(metaPath, JSON.stringify(meta, null, 2), { mode: 384 });
-}
-async function detectAgentConfig(platform2, configPath) {
-  if (configPath) {
-    return readConfigFile(configPath, platform2 ?? "generic");
-  }
-  if (platform2) {
-    const paths = PLATFORM_PATHS[platform2];
-    for (const path of paths) {
-      const config = await readConfigFile(path, platform2);
-      if (config) return config;
-    }
-    return null;
-  }
-  for (const [plat, paths] of Object.entries(PLATFORM_PATHS)) {
-    for (const path of paths) {
-      const config = await readConfigFile(path, plat);
-      if (config) return config;
-    }
-  }
-  return null;
-}
-async function readConfigFile(path, platform2) {
-  try {
-    await access(path);
-  } catch {
-    return null;
-  }
-  try {
-    const raw = await readFile(path, "utf-8");
-    const config = JSON.parse(raw);
-    const servers = extractServers(config, platform2);
-    return { platform: platform2, configPath: path, servers, rawConfig: config };
-  } catch {
-    return null;
-  }
-}
-function extractServers(config, platform2) {
-  if (!config || typeof config !== "object") return [];
-  const servers = [];
-  const obj = config;
-  if (platform2 === "openclaw" || platform2 === "generic") {
-    const mcp = obj.mcp;
-    const nestedServers = mcp?.servers;
-    if (nestedServers && typeof nestedServers === "object") {
-      for (const [name, serverConfig] of Object.entries(nestedServers)) {
-        const entry = parseServerEntry(name, serverConfig);
-        if (entry) servers.push(entry);
-      }
-    }
-    if (servers.length === 0) {
-      const mcpServers = obj.mcpServers;
-      if (mcpServers && typeof mcpServers === "object") {
-        for (const [name, serverConfig] of Object.entries(mcpServers)) {
-          const entry = parseServerEntry(name, serverConfig);
-          if (entry) servers.push(entry);
-        }
-      }
-    }
-  }
-  if (platform2 === "claude-code") {
-    const mcpServers = obj.mcpServers;
-    if (mcpServers && typeof mcpServers === "object") {
-      for (const [name, serverConfig] of Object.entries(mcpServers)) {
-        if (name.toLowerCase().includes("sanctuary")) continue;
-        const entry = parseServerEntry(name, serverConfig);
-        if (entry) servers.push(entry);
-      }
-    }
-  }
-  if (platform2 === "cursor") {
-    const mcpServers = obj.mcpServers;
-    if (mcpServers && typeof mcpServers === "object") {
-      for (const [name, serverConfig] of Object.entries(mcpServers)) {
-        if (name.toLowerCase().includes("sanctuary")) continue;
-        const entry = parseServerEntry(name, serverConfig);
-        if (entry) servers.push(entry);
-      }
-    }
-  }
-  return servers;
-}
-function parseServerEntry(name, config) {
-  if (!config || typeof config !== "object") return null;
-  const c = config;
-  const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "-").substring(0, 128);
-  if (!safeName) return null;
-  if (c.url && typeof c.url === "string") {
-    return {
-      name: safeName,
-      transport: "sse",
-      url: c.url,
-      env: extractEnv(c.env)
-    };
-  }
-  if (c.command && typeof c.command === "string") {
-    return {
-      name: safeName,
-      transport: "stdio",
-      command: c.command,
-      args: Array.isArray(c.args) ? c.args.filter((a) => typeof a === "string") : void 0,
-      env: extractEnv(c.env)
-    };
-  }
-  return null;
-}
-function extractEnv(env) {
-  if (!env || typeof env !== "object") return void 0;
-  const result = {};
-  for (const [k, v] of Object.entries(env)) {
-    if (typeof v === "string") result[k] = v;
-  }
-  return Object.keys(result).length > 0 ? result : void 0;
-}
-async function rewriteConfigForCocoon(agentConfig, sanctuaryCommand, sanctuaryArgs, sanctuaryEnv) {
-  const raw = agentConfig.rawConfig;
-  let existingServers = {};
-  if (agentConfig.platform === "openclaw") {
-    const existingMcp = raw.mcp ?? {};
-    existingServers = existingMcp.servers ?? {};
-  } else {
-    existingServers = raw.mcpServers ?? {};
-  }
-  let resolvedEnv = sanctuaryEnv;
-  if (!resolvedEnv) {
-    const existingSanctuary = existingServers.sanctuary;
-    if (existingSanctuary?.env && typeof existingSanctuary.env === "object") {
-      const extracted = extractEnv(existingSanctuary.env);
-      if (extracted) resolvedEnv = extracted;
-    }
-  }
-  const sanctuaryEntry = {
-    command: sanctuaryCommand,
-    args: sanctuaryArgs
-  };
-  if (resolvedEnv && Object.keys(resolvedEnv).length > 0) {
-    sanctuaryEntry.env = resolvedEnv;
-  }
-  let rewritten;
-  if (agentConfig.platform === "openclaw") {
-    const existingMcp = raw.mcp ?? {};
-    rewritten = {
-      ...raw,
-      mcp: {
-        ...existingMcp,
-        servers: {
-          ...existingServers,
-          sanctuary: sanctuaryEntry
-        }
-      }
-    };
-    delete rewritten.mcpServers;
-  } else {
-    rewritten = {
-      ...raw,
-      mcpServers: {
-        ...existingServers,
-        sanctuary: sanctuaryEntry
-      }
-    };
-  }
-  await writeFile(agentConfig.configPath, JSON.stringify(rewritten, null, 2), { mode: 384 });
-  return agentConfig.configPath;
-}
-var PLATFORM_PATHS, BACKUP_DIR;
-var init_config_reader = __esm({
-  "src/cocoon/config-reader.ts"() {
-    PLATFORM_PATHS = {
-      "openclaw": [
-        join(homedir(), ".openclaw", "openclaw.json"),
-        join(homedir(), ".openclaw", "config.json"),
-        join(homedir(), "Library", "Application Support", "OpenClaw", "openclaw.json"),
-        join(homedir(), "Library", "Application Support", "OpenClaw", "config.json")
-      ],
-      "claude-code": [
-        join(homedir(), ".claude", "settings.json"),
-        join(homedir(), ".config", "claude-code", "settings.json")
-      ],
-      "cursor": [
-        join(homedir(), ".cursor", "mcp.json")
-      ],
-      "generic": []
-    };
-    BACKUP_DIR = join(homedir(), ".sanctuary", "backup");
-  }
-});
-
-// src/cocoon/cli.ts
-var cli_exports = {};
-__export(cli_exports, {
-  COCOON_GOVERNOR_DEFAULTS: () => COCOON_GOVERNOR_DEFAULTS,
-  parseCocoonArgs: () => parseCocoonArgs,
-  runCocoon: () => runCocoon
-});
-async function runCocoon(options) {
-  if (options.unwrap) {
-    await unwrap();
-    return;
-  }
-  let platform2;
-  if (options.openclaw) platform2 = "openclaw";
-  else if (options.claudeCode) platform2 = "claude-code";
-  else if (options.cursor) platform2 = "cursor";
-  const agentConfig = await detectAgentConfig(platform2, options.wrap);
-  if (!agentConfig) {
-    if (platform2) {
-      console.error(`Could not find ${platform2} configuration. Check that the agent is installed.`);
-    } else if (options.wrap) {
-      console.error(`Could not read config file: ${options.wrap}`);
-    } else {
-      console.error("Could not auto-detect any agent configuration.");
-      console.error("Use --openclaw, --claude-code, --cursor, or --wrap /path/to/config.json");
-    }
-    process.exit(1);
-  }
-  if (agentConfig.servers.length === 0) {
-    console.error(`Found ${agentConfig.platform} config at ${agentConfig.configPath}, but no MCP servers configured.`);
-    process.exit(1);
-  }
-  console.error(`
-  Sanctuary Cocoon
-`);
-  console.error(`  Platform: ${agentConfig.platform}`);
-  console.error(`  Config: ${agentConfig.configPath}`);
-  console.error(`  MCP servers found: ${agentConfig.servers.length}
-`);
-  const upstreamServers = convertToUpstreamServers(agentConfig.servers);
-  for (const server of upstreamServers) {
-    const overrideCount = Object.keys(server.tool_overrides ?? {}).length;
-    console.error(`  \u2192 ${server.name} (${server.transport.type}) \u2014 default: Tier ${server.default_tier}`);
-    if (overrideCount > 0) {
-      console.error(`    ${overrideCount} tool-specific tier overrides`);
-    }
-  }
-  if (options.dryRun) {
-    console.error(`
-  Dry run \u2014 no changes made.
-`);
-    return;
-  }
-  const storagePath = join(homedir(), ".sanctuary");
-  await mkdir(storagePath, { recursive: true, mode: 448 });
-  const profile = createCocoonProfile(upstreamServers);
-  const cocoonConfigPath = join(storagePath, "cocoon-profile.json");
-  await writeFile(cocoonConfigPath, JSON.stringify(profile, null, 2), { mode: 384 });
-  const backupPath = await backupConfig(agentConfig.configPath);
-  await saveCocoonMeta({
-    backupPath,
-    originalPath: agentConfig.configPath,
-    platform: agentConfig.platform,
-    wrappedAt: (/* @__PURE__ */ new Date()).toISOString()
-  });
-  console.error(`
-  Original config backed up to: ${backupPath}`);
-  await rewriteConfigForCocoon(
-    agentConfig,
-    "npx",
-    [
-      "@sanctuary-framework/mcp-server",
-      ...options.passphrase ? ["--passphrase", options.passphrase] : []
-    ]
-  );
-  console.error(`  Agent config rewritten to route through Sanctuary`);
-  const dashboardPort = options.port ?? 3501;
-  console.error(`
-  Your agent is now protected.`);
-  console.error(`  All tool calls are being logged and scanned.`);
-  console.error(`
-  To view the dashboard, run in a separate terminal:`);
-  console.error(`    npx @sanctuary-framework/mcp-server dashboard --port ${dashboardPort}`);
-  console.error(`
-  To restore: npx @sanctuary-framework/cocoon --unwrap
-`);
-}
-async function unwrap() {
-  const meta = await findLatestBackup();
-  if (!meta) {
-    console.error("No Cocoon wrapping found to restore.");
-    console.error("Run --wrap or --openclaw first.");
-    process.exit(1);
-  }
-  try {
-    await access(meta.backupPath);
-  } catch {
-    console.error(`Backup file not found: ${meta.backupPath}`);
-    process.exit(1);
-  }
-  await restoreConfig(meta.backupPath, meta.originalPath);
-  console.error(`
-  Sanctuary Cocoon \u2014 Unwrapped`);
-  console.error(`  Original config restored to: ${meta.originalPath}`);
-  console.error(`  Backup preserved at: ${meta.backupPath}
-`);
-}
-function convertToUpstreamServers(servers) {
-  return servers.map((server) => {
-    const upstream = {
-      name: server.name,
-      transport: server.transport === "sse" ? { type: "sse", url: server.url } : {
-        type: "stdio",
-        command: server.command,
-        ...server.args ? { args: server.args } : {},
-        ...server.env ? { env: server.env } : {}
-      },
-      enabled: true,
-      default_tier: 2
-    };
-    return upstream;
-  });
-}
-function createCocoonProfile(upstreamServers) {
-  return {
-    version: 1,
-    features: {
-      audit_logging: { enabled: true },
-      // Non-negotiable
-      injection_detection: { enabled: true },
-      // Non-negotiable
-      context_gating: { enabled: false },
-      // Can enable later
-      approval_gate: { enabled: true },
-      // Core enforcement — always ON
-      zk_proofs: { enabled: false }
-      // Not needed for Cocoon
-    },
-    upstream_servers: upstreamServers,
-    updated_at: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-function parseCocoonArgs(argv) {
-  const options = {};
-  for (let i = 0; i < argv.length; i++) {
-    switch (argv[i]) {
-      case "--wrap":
-        options.wrap = argv[++i];
-        break;
-      case "--openclaw":
-        options.openclaw = true;
-        break;
-      case "--claude-code":
-        options.claudeCode = true;
-        break;
-      case "--cursor":
-        options.cursor = true;
-        break;
-      case "--unwrap":
-        options.unwrap = true;
-        break;
-      case "--passphrase":
-        options.passphrase = argv[++i];
-        break;
-      case "--port":
-        options.port = parseInt(argv[++i], 10);
-        break;
-      case "--dry-run":
-        options.dryRun = true;
-        break;
-      case "--help":
-      case "-h":
-        printCocoonHelp();
-        process.exit(0);
-    }
-  }
-  return options;
-}
-function printCocoonHelp() {
-  console.log(`
-  Sanctuary Cocoon \u2014 Wrap any agent in sovereignty protection
-
-  Usage:
-    npx @sanctuary-framework/cocoon --openclaw        # Wrap OpenClaw agent
-    npx @sanctuary-framework/cocoon --claude-code      # Wrap Claude Code
-    npx @sanctuary-framework/cocoon --cursor           # Wrap Cursor
-    npx @sanctuary-framework/cocoon --wrap config.json # Wrap generic MCP config
-    npx @sanctuary-framework/cocoon --unwrap           # Restore original config
-
-  Options:
-    --openclaw        Auto-detect and wrap OpenClaw agent
-    --claude-code     Auto-detect and wrap Claude Code
-    --cursor          Auto-detect and wrap Cursor
-    --wrap <path>     Wrap a specific MCP config file
-    --unwrap          Restore original config from backup
-    --passphrase <p>  Encryption passphrase
-    --port <port>     Dashboard port (default: 3501)
-    --dry-run         Show what would happen without making changes
-    --help, -h        Show this help
-
-  What happens:
-    1. Reads your agent's MCP server configuration
-    2. Backs up the original config to ~/.sanctuary/backup/
-    3. Rewrites the config so your agent routes through Sanctuary
-    4. All tool calls are logged, scanned for injection, and rate-limited
-    5. Dangerous operations require your approval via the dashboard
-
-  Rollback:
-    --unwrap restores the original config from backup.
-    Backups are preserved and never deleted.
-`);
-}
-var COCOON_GOVERNOR_DEFAULTS;
-var init_cli = __esm({
-  "src/cocoon/cli.ts"() {
-    init_config_reader();
-    COCOON_GOVERNOR_DEFAULTS = {
-      volume_limit: 200,
-      // 200 calls per 10-minute window
-      rate_limit_per_tool: 20,
-      // 20 calls/min per individual tool
-      lifetime_limit: 1e3
-      // 1000 total calls per session
-    };
-  }
-});
-
-// src/dashboard-standalone.ts
-var dashboard_standalone_exports = {};
-__export(dashboard_standalone_exports, {
-  startStandaloneDashboard: () => startStandaloneDashboard
-});
-async function startStandaloneDashboard(options = {}) {
-  process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
-  const config = await loadConfig(options.configPath);
-  await mkdir(config.storage_path, { recursive: true, mode: 448 });
-  const storage = new FilesystemStorage(`${config.storage_path}/state`);
-  let masterKey;
-  const passphrase = options.passphrase ?? process.env.SANCTUARY_PASSPHRASE;
-  if (passphrase) {
-    let existingParams;
-    try {
-      const raw = await storage.read("_meta", "key-params");
-      if (raw) {
-        const { bytesToString: bytesToString2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
-        existingParams = JSON.parse(bytesToString2(raw));
-      }
-    } catch {
-    }
-    const result = await deriveMasterKey(passphrase, existingParams);
-    masterKey = result.key;
-  } else {
-    const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
-    const { stringToBytes: stringToBytes2, bytesToString: bytesToString2, fromBase64url: fromBase64url2, constantTimeEqual: constantTimeEqual2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
-    const existingHash = await storage.read("_meta", "recovery-key-hash");
-    if (existingHash) {
-      const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
-      if (!envRecoveryKey) {
-        throw new Error(
-          "Sanctuary Dashboard: Existing encrypted data found but no credentials provided.\nProvide SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY to start the dashboard.\nThe dashboard needs the same credentials as the MCP server to read encrypted data."
-        );
-      }
-      let recoveryKeyBytes;
-      try {
-        recoveryKeyBytes = fromBase64url2(envRecoveryKey);
-      } catch {
-        throw new Error(
-          "Sanctuary Dashboard: SANCTUARY_RECOVERY_KEY is not valid base64url."
-        );
-      }
-      if (recoveryKeyBytes.length !== 32) {
-        throw new Error(
-          "Sanctuary Dashboard: SANCTUARY_RECOVERY_KEY has incorrect length."
-        );
-      }
-      const providedHash = hashToString2(recoveryKeyBytes);
-      const storedHash = bytesToString2(existingHash);
-      const providedHashBytes = stringToBytes2(providedHash);
-      const storedHashBytes = stringToBytes2(storedHash);
-      if (!constantTimeEqual2(providedHashBytes, storedHashBytes)) {
-        throw new Error(
-          "Sanctuary Dashboard: Recovery key does not match. Use the exact recovery key from first run."
-        );
-      }
-      masterKey = recoveryKeyBytes;
-    } else {
-      const existingNamespaces = await storage.list("_meta");
-      const hasKeyParams = existingNamespaces.some((e) => e.key === "key-params");
-      if (hasKeyParams) {
-        throw new Error(
-          "Sanctuary Dashboard: Existing encrypted data found (passphrase-protected).\nProvide SANCTUARY_PASSPHRASE to start the dashboard.\nThe dashboard needs the same credentials as the MCP server to read encrypted data."
-        );
-      }
-      console.error(
-        "Warning: No existing Sanctuary data found. The standalone dashboard\nis typically started after the MCP server has been run at least once.\nGenerating a new master key for this installation.\n"
-      );
-      masterKey = generateRandomKey();
-      const recoveryKey = toBase64url(masterKey);
-      const keyHash = hashToString2(masterKey);
-      await storage.write("_meta", "recovery-key-hash", stringToBytes2(keyHash));
-      console.error(
-        `\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
-\u2551  SANCTUARY: First Run \u2014 Recovery Key Generated          \u2551
-\u2551                                                          \u2551
-\u2551  Recovery Key: ${recoveryKey.slice(0, 20)}...             \u2551
-\u2551                                                          \u2551
-\u2551  SAVE THIS KEY. It will not be shown again.              \u2551
-\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D
-`
-      );
-    }
-  }
-  const auditLog = new AuditLog(storage, masterKey);
-  const policy = await loadPrincipalPolicy(config.storage_path);
-  const baseline = new BaselineTracker(storage, masterKey);
-  await baseline.load();
-  const dashboardPort = options.port ?? config.dashboard.port;
-  const dashboardHost = options.host ?? config.dashboard.host;
-  let authToken = config.dashboard.auth_token;
-  if (authToken === "auto") {
-    const { randomBytes: randomBytes4 } = await import('crypto');
-    authToken = randomBytes4(32).toString("hex");
-  }
-  const dashboard = new DashboardApprovalChannel({
-    port: dashboardPort,
-    host: dashboardHost,
-    timeout_seconds: policy.approval_channel.timeout_seconds,
-    auth_token: authToken,
-    tls: config.dashboard.tls,
-    auto_open: config.dashboard.auto_open ?? true
-    // Default to auto-open in standalone mode
-  });
-  const identityManager = new IdentityManager(storage, masterKey);
-  const loadResult = await identityManager.load();
-  const shrOpts = { config, identityManager, masterKey };
-  const handshakeResults = /* @__PURE__ */ new Map();
-  const profileStore = new SovereigntyProfileStore(storage, masterKey);
-  await profileStore.load();
-  dashboard.setDependencies({
-    policy,
-    baseline,
-    auditLog,
-    identityManager,
-    handshakeResults,
-    shrOpts,
-    sanctuaryConfig: config,
-    profileStore
-  });
-  dashboard.setStandaloneMode(true);
-  await dashboard.start();
-  console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
-  console.error(`Storage: ${config.storage_path}`);
-  console.error(`Identities loaded: ${loadResult.loaded}`);
-  console.error(`Listening: http://${dashboardHost}:${dashboardPort}`);
-  if (loadResult.total > 0 && loadResult.loaded === 0) {
-    console.error(
-      `
-\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
-\u2551  \u26A0  WARNING: Encrypted identities found but NONE loaded     \u2551
-\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
-\u2551  ${loadResult.total} encrypted identity file(s) found on disk              \u2551
-\u2551  0 could be decrypted with the current master key            \u2551
-\u2551                                                              \u2551
-\u2551  This usually means SANCTUARY_PASSPHRASE is missing or       \u2551
-\u2551  incorrect. The dashboard will show empty panels.            \u2551
-\u2551                                                              \u2551
-\u2551  To fix: restart with the correct SANCTUARY_PASSPHRASE:      \u2551
-\u2551    SANCTUARY_PASSPHRASE=<your-passphrase> npx \\              \u2551
-\u2551      @sanctuary-framework/mcp-server dashboard               \u2551
-\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D
-`
-    );
-  } else if (loadResult.failed > 0) {
-    console.error(
-      `Warning: ${loadResult.failed} of ${loadResult.total} identity files could not be decrypted (possibly corrupted).`
-    );
-  }
-  const saveBaseline = () => {
-    baseline.save().catch(() => {
-    });
-  };
-  process.on("SIGINT", saveBaseline);
-  process.on("SIGTERM", saveBaseline);
-  return dashboard;
-}
-var init_dashboard_standalone = __esm({
-  "src/dashboard-standalone.ts"() {
-    init_config();
-    init_filesystem();
-    init_audit_log();
-    init_loader();
-    init_baseline();
-    init_dashboard();
-    init_key_derivation();
-    init_random();
-    init_encoding();
-    init_tools();
-    init_sovereignty_profile();
-  }
-});
-
-// src/index.ts
-init_config();
-init_filesystem();
-
-// src/l1-cognitive/state-store.ts
-init_encryption();
-init_hashing();
-init_identity();
-init_key_derivation();
-init_encoding();
-var RESERVED_NAMESPACE_PREFIXES = [
-  "_identities",
-  "_policies",
-  "_audit",
-  "_meta",
-  "_principal",
-  "_commitments",
-  "_reputation",
-  "_escrow",
-  "_guarantees",
-  "_bridge",
-  "_federation",
-  "_handshake",
-  "_shr",
-  "_sovereignty_profile",
-  "_context_gate_policies"
-];
-var StateStore = class {
-  storage;
-  masterKey;
-  // Cache of version numbers per namespace/key for anti-rollback
-  versionCache = /* @__PURE__ */ new Map();
-  // Cache of content hashes per namespace for Merkle tree computation
-  contentHashes = /* @__PURE__ */ new Map();
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.masterKey = masterKey;
-  }
-  versionKey(namespace, key) {
-    return `${namespace}/${key}`;
-  }
-  /**
-   * Get or initialize the content hash map for a namespace.
-   */
-  async getNamespaceHashes(namespace) {
-    if (this.contentHashes.has(namespace)) {
-      return this.contentHashes.get(namespace);
-    }
-    const entries = await this.storage.list(namespace);
-    const hashMap = /* @__PURE__ */ new Map();
-    for (const entry of entries) {
-      const raw = await this.storage.read(namespace, entry.key);
-      if (raw) {
-        try {
-          const stateEntry = JSON.parse(bytesToString(raw));
-          hashMap.set(entry.key, stateEntry.integrity_hash);
-          this.versionCache.set(
-            this.versionKey(namespace, entry.key),
-            stateEntry.ver
-          );
-        } catch {
-        }
-      }
-    }
-    this.contentHashes.set(namespace, hashMap);
-    return hashMap;
-  }
-  /**
-   * Write encrypted state.
-   *
-   * @param namespace - Logical grouping
-   * @param key - State key
-   * @param value - Plaintext value (will be encrypted)
-   * @param identityId - Identity performing the write
-   * @param encryptedPrivateKey - Identity's encrypted private key (for signing)
-   * @param identityEncryptionKey - Key to decrypt the identity's private key
-   * @param options - Optional metadata
-   */
-  async write(namespace, key, value, identityId, encryptedPrivateKey, identityEncryptionKey, options = {}) {
-    const namespaceKey = deriveNamespaceKey(this.masterKey, namespace);
-    const plaintext = stringToBytes(value);
-    const integrityHash = hashToString(plaintext);
-    const payload = encrypt(plaintext, namespaceKey);
-    const vk = this.versionKey(namespace, key);
-    const currentVersion = this.versionCache.get(vk) ?? 0;
-    const newVersion = currentVersion + 1;
-    const ciphertextBytes = fromBase64url(payload.ct);
-    const signature = sign(
-      ciphertextBytes,
-      encryptedPrivateKey,
-      identityEncryptionKey
-    );
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const stateEntry = {
-      v: 1,
-      payload,
-      ver: newVersion,
-      sig: toBase64url(signature),
-      kid: identityId,
-      integrity_hash: integrityHash,
-      metadata: {
-        content_type: options.content_type,
-        ttl_seconds: options.ttl_seconds,
-        tags: options.tags,
-        written_at: now
-      }
-    };
-    const serialized = stringToBytes(JSON.stringify(stateEntry));
-    await this.storage.write(namespace, key, serialized);
-    this.versionCache.set(vk, newVersion);
-    const nsHashes = await this.getNamespaceHashes(namespace);
-    nsHashes.set(key, integrityHash);
-    const merkleRoot = computeMerkleRoot(nsHashes);
-    return {
-      key,
-      namespace,
-      version: newVersion,
-      merkle_root: merkleRoot,
-      written_at: now,
-      size_bytes: serialized.length,
-      integrity_hash: integrityHash
-    };
-  }
-  /**
-   * Read and decrypt state.
-   *
-   * @param namespace - Logical grouping
-   * @param key - State key
-   * @param signerPublicKey - Expected signer's public key (for signature verification)
-   * @param verifyIntegrity - Whether to verify Merkle proof (default: true)
-   */
-  async read(namespace, key, signerPublicKey, verifyIntegrity = true) {
-    const raw = await this.storage.read(namespace, key);
-    if (!raw) return null;
-    let stateEntry;
-    try {
-      stateEntry = JSON.parse(bytesToString(raw));
-    } catch {
-      throw new Error(`Corrupted state entry: ${namespace}/${key}`);
-    }
-    if (stateEntry.v !== 1) {
-      throw new Error(`Unsupported state entry version: ${stateEntry.v}`);
-    }
-    const vk = this.versionKey(namespace, key);
-    const cachedVersion = this.versionCache.get(vk);
-    if (cachedVersion !== void 0 && stateEntry.ver < cachedVersion) {
-      throw new Error(
-        `Rollback detected for ${namespace}/${key}: found version ${stateEntry.ver}, expected >= ${cachedVersion}`
-      );
-    }
-    if (signerPublicKey) {
-      const ciphertextBytes = fromBase64url(stateEntry.payload.ct);
-      const signatureBytes = fromBase64url(stateEntry.sig);
-      const sigValid = verify(ciphertextBytes, signatureBytes, signerPublicKey);
-      if (!sigValid) {
-        throw new Error(
-          `Signature verification failed for ${namespace}/${key}`
-        );
-      }
-    }
-    const namespaceKey = deriveNamespaceKey(this.masterKey, namespace);
-    const plaintext = decrypt(stateEntry.payload, namespaceKey);
-    const value = bytesToString(plaintext);
-    const computedHash = hashToString(plaintext);
-    if (computedHash !== stateEntry.integrity_hash) {
-      throw new Error(
-        `Integrity hash mismatch for ${namespace}/${key}: computed ${computedHash}, stored ${stateEntry.integrity_hash}`
-      );
-    }
-    let merkleProofPath = [];
-    let integrityVerified = true;
-    if (verifyIntegrity) {
-      const nsHashes = await this.getNamespaceHashes(namespace);
-      const proof = generateMerkleProof(nsHashes, key);
-      if (proof) {
-        integrityVerified = verifyMerkleProof(proof);
-        merkleProofPath = proof.path.map(
-          (step) => `${step.position}:${step.hash}`
-        );
-      }
-    }
-    this.versionCache.set(vk, stateEntry.ver);
-    return {
-      key,
-      namespace,
-      value,
-      version: stateEntry.ver,
-      integrity_verified: integrityVerified,
-      merkle_proof: merkleProofPath,
-      written_at: stateEntry.metadata.written_at,
-      written_by: stateEntry.kid
-    };
-  }
-  /**
-   * List keys in a namespace (metadata only — no decryption).
-   */
-  async list(namespace, prefix, tags, limit = 100, offset = 0) {
-    const storageEntries = await this.storage.list(namespace, prefix);
-    const result = [];
-    for (const entry of storageEntries) {
-      const raw = await this.storage.read(namespace, entry.key);
-      if (!raw) continue;
-      try {
-        const stateEntry = JSON.parse(bytesToString(raw));
-        if (tags && tags.length > 0) {
-          const entryTags = stateEntry.metadata.tags ?? [];
-          const hasMatchingTag = tags.some((t) => entryTags.includes(t));
-          if (!hasMatchingTag) continue;
-        }
-        result.push({
-          key: entry.key,
-          version: stateEntry.ver,
-          size_bytes: entry.size_bytes,
-          written_at: stateEntry.metadata.written_at,
-          tags: stateEntry.metadata.tags ?? []
-        });
-      } catch {
-      }
-    }
-    const nsHashes = await this.getNamespaceHashes(namespace);
-    const merkleRoot = computeMerkleRoot(nsHashes);
-    return {
-      keys: result.slice(offset, offset + limit),
-      total: result.length,
-      merkle_root: merkleRoot
-    };
-  }
-  /**
-   * Securely delete state (overwrite with random bytes before removal).
-   */
-  async delete(namespace, key) {
-    const deleted = await this.storage.delete(namespace, key, true);
-    const vk = this.versionKey(namespace, key);
-    this.versionCache.delete(vk);
-    const nsHashes = await this.getNamespaceHashes(namespace);
-    nsHashes.delete(key);
-    const merkleRoot = computeMerkleRoot(nsHashes);
-    return {
-      deleted,
-      key,
-      namespace,
-      new_merkle_root: merkleRoot,
-      deleted_at: (/* @__PURE__ */ new Date()).toISOString()
-    };
-  }
-  /**
-   * Export all state for a namespace as an encrypted bundle.
-   */
-  async export(namespace) {
-    const namespacesToExport = [];
-    if (namespace) {
-      namespacesToExport.push(namespace);
-    } else {
-      for (const ns of this.contentHashes.keys()) {
-        namespacesToExport.push(ns);
-      }
-    }
-    const exportData = {};
-    let totalKeys = 0;
-    for (const ns of namespacesToExport) {
-      const entries = await this.storage.list(ns);
-      exportData[ns] = [];
-      for (const entry of entries) {
-        const raw = await this.storage.read(ns, entry.key);
-        if (!raw) continue;
-        try {
-          const stateEntry = JSON.parse(bytesToString(raw));
-          exportData[ns].push({ key: entry.key, entry: stateEntry });
-          totalKeys++;
-        } catch {
-        }
-      }
-    }
-    const bundleJson = JSON.stringify({
-      sanctuary_export_version: 1,
-      exported_at: (/* @__PURE__ */ new Date()).toISOString(),
-      namespaces: namespacesToExport,
-      data: exportData
-    });
-    const bundleBytes = stringToBytes(bundleJson);
-    const bundleHash = hashToString(bundleBytes);
-    return {
-      bundle: toBase64url(bundleBytes),
-      namespaces: namespacesToExport,
-      total_keys: totalKeys,
-      bundle_hash: bundleHash,
-      exported_at: (/* @__PURE__ */ new Date()).toISOString()
-    };
-  }
-  /**
-   * Import a previously exported state bundle.
-   */
-  async import(bundleBase64, conflictResolution = "skip", publicKeyResolver) {
-    const bundleBytes = fromBase64url(bundleBase64);
-    const bundleJson = bytesToString(bundleBytes);
-    const bundle = JSON.parse(bundleJson);
-    let importedKeys = 0;
-    let skippedKeys = 0;
-    let skippedInvalidSig = 0;
-    let skippedUnknownKid = 0;
-    let conflicts = 0;
-    const namespaces = [];
-    for (const [ns, entries] of Object.entries(
-      bundle.data
-    )) {
-      if (RESERVED_NAMESPACE_PREFIXES.some(
-        (prefix) => ns === prefix || ns.startsWith(prefix + "/")
-      )) {
-        skippedKeys += entries.length;
-        continue;
-      }
-      namespaces.push(ns);
-      for (const { key, entry } of entries) {
-        const signerPublicKey = publicKeyResolver(entry.kid);
-        if (!signerPublicKey) {
-          skippedUnknownKid++;
-          skippedKeys++;
-          continue;
-        }
-        try {
-          const ciphertextBytes = fromBase64url(entry.payload.ct);
-          const signatureBytes = fromBase64url(entry.sig);
-          const sigValid = verify(ciphertextBytes, signatureBytes, signerPublicKey);
-          if (!sigValid) {
-            skippedInvalidSig++;
-            skippedKeys++;
-            continue;
-          }
-        } catch {
-          skippedInvalidSig++;
-          skippedKeys++;
-          continue;
-        }
-        const exists = await this.storage.exists(ns, key);
-        if (exists) {
-          conflicts++;
-          if (conflictResolution === "skip") {
-            skippedKeys++;
-            continue;
-          }
-          if (conflictResolution === "version") {
-            const raw = await this.storage.read(ns, key);
-            if (raw) {
-              try {
-                const existingEntry = JSON.parse(
-                  bytesToString(raw)
-                );
-                if (entry.ver <= existingEntry.ver) {
-                  skippedKeys++;
-                  continue;
-                }
-              } catch {
-              }
-            }
-          }
-        }
-        const serialized = stringToBytes(JSON.stringify(entry));
-        await this.storage.write(ns, key, serialized);
-        importedKeys++;
-        const vk = this.versionKey(ns, key);
-        this.versionCache.set(vk, entry.ver);
-        const nsHashes = await this.getNamespaceHashes(ns);
-        nsHashes.set(key, entry.integrity_hash);
-      }
-    }
-    return {
-      imported_keys: importedKeys,
-      skipped_keys: skippedKeys,
-      skipped_invalid_sig: skippedInvalidSig,
-      skipped_unknown_kid: skippedUnknownKid,
-      conflicts,
-      namespaces,
-      imported_at: (/* @__PURE__ */ new Date()).toISOString()
-    };
-  }
-};
-
-// src/index.ts
-init_tools();
-init_audit_log();
-
-// src/l3-disclosure/tools.ts
-init_router();
-
-// src/l3-disclosure/commitments.ts
-init_hashing();
-init_encoding();
-init_random();
-init_encryption();
-init_key_derivation();
-init_encoding();
-function createCommitment(value, blindingFactor) {
-  const blindingBytes = blindingFactor ? fromBase64url(blindingFactor) : randomBytes(32);
-  const valueBytes = stringToBytes(value);
-  const combined = concatBytes(valueBytes, blindingBytes);
-  const commitmentHash = hash(combined);
-  return {
-    commitment: toBase64url(commitmentHash),
-    blinding_factor: toBase64url(blindingBytes),
-    committed_at: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-function verifyCommitment(commitment, value, blindingFactor) {
-  const blindingBytes = fromBase64url(blindingFactor);
-  const valueBytes = stringToBytes(value);
-  const combined = concatBytes(valueBytes, blindingBytes);
-  const expectedHash = toBase64url(hash(combined));
-  return commitment === expectedHash;
-}
-var CommitmentStore = class {
-  storage;
-  encryptionKey;
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.encryptionKey = derivePurposeKey(masterKey, "l3-commitments");
-  }
-  /**
-   * Store a commitment (encrypted) for later reference.
-   */
-  async store(commitment, value) {
-    const id = `cmt-${Date.now()}-${toBase64url(randomBytes(8))}`;
-    const stored = {
-      commitment: commitment.commitment,
-      blinding_factor: commitment.blinding_factor,
-      value,
-      committed_at: commitment.committed_at,
-      revealed: false
-    };
-    const serialized = stringToBytes(JSON.stringify(stored));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_commitments",
-      id,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-    return id;
-  }
-  /**
-   * Retrieve a stored commitment by ID.
-   */
-  async get(id) {
-    const raw = await this.storage.read("_commitments", id);
-    if (!raw) return null;
-    try {
-      const encrypted = JSON.parse(bytesToString(raw));
-      const decrypted = decrypt(encrypted, this.encryptionKey);
-      return JSON.parse(bytesToString(decrypted));
-    } catch {
-      return null;
-    }
-  }
-  /**
-   * Mark a commitment as revealed.
-   */
-  async markRevealed(id) {
-    const stored = await this.get(id);
-    if (!stored) return;
-    stored.revealed = true;
-    stored.revealed_at = (/* @__PURE__ */ new Date()).toISOString();
-    const serialized = stringToBytes(JSON.stringify(stored));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_commitments",
-      id,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-  }
-};
-
-// src/l3-disclosure/policies.ts
-init_encryption();
-init_key_derivation();
-init_encoding();
-init_random();
-function evaluateDisclosure(policy, context, requestedFields) {
-  return requestedFields.map((field) => {
-    const exactRule = policy.rules.find((r) => r.context === context);
-    const wildcardRule = policy.rules.find((r) => r.context === "*");
-    const matchedRule = exactRule ?? wildcardRule;
-    if (!matchedRule) {
-      return {
-        field,
-        action: policy.default_action,
-        reason: `No rule matches context "${context}"`,
-        applicable_rule: "default"
-      };
-    }
-    const ruleName = `${matchedRule.context}`;
-    if (matchedRule.withhold.includes(field)) {
-      return {
-        field,
-        action: "withhold",
-        reason: `Field "${field}" is explicitly withheld in ${ruleName} context`,
-        applicable_rule: ruleName
-      };
-    }
-    if (matchedRule.proof_required.includes(field)) {
-      return {
-        field,
-        action: "proof",
-        reason: `Field "${field}" requires cryptographic proof in ${ruleName} context`,
-        applicable_rule: ruleName
-      };
-    }
-    if (matchedRule.disclose.includes(field)) {
-      return {
-        field,
-        action: "disclose",
-        reason: `Field "${field}" is permitted for disclosure in ${ruleName} context`,
-        applicable_rule: ruleName
-      };
-    }
-    return {
-      field,
-      action: policy.default_action,
-      reason: `Field "${field}" not addressed in ${ruleName} rule; applying default`,
-      applicable_rule: ruleName
-    };
-  });
-}
-var PolicyStore = class {
-  storage;
-  encryptionKey;
-  policies = /* @__PURE__ */ new Map();
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.encryptionKey = derivePurposeKey(masterKey, "l3-policies");
-  }
-  /**
-   * Create and store a new disclosure policy.
-   */
-  async create(policyName, rules, defaultAction, identityId) {
-    const policyId = `pol-${Date.now()}-${toBase64url(randomBytes(8))}`;
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const policy = {
-      policy_id: policyId,
-      policy_name: policyName,
-      rules,
-      default_action: defaultAction,
-      identity_id: identityId,
-      created_at: now,
-      updated_at: now
-    };
-    await this.persist(policy);
-    this.policies.set(policyId, policy);
-    return policy;
-  }
-  /**
-   * Get a policy by ID.
-   */
-  async get(policyId) {
-    if (this.policies.has(policyId)) {
-      return this.policies.get(policyId);
-    }
-    const raw = await this.storage.read("_policies", policyId);
-    if (!raw) return null;
-    try {
-      const encrypted = JSON.parse(bytesToString(raw));
-      const decrypted = decrypt(encrypted, this.encryptionKey);
-      const policy = JSON.parse(bytesToString(decrypted));
-      this.policies.set(policyId, policy);
-      return policy;
-    } catch {
-      return null;
-    }
-  }
-  /**
-   * List all policies.
-   */
-  async list() {
-    await this.loadAll();
-    return Array.from(this.policies.values());
-  }
-  /**
-   * Load all persisted policies into memory.
-   */
-  async loadAll() {
-    try {
-      const entries = await this.storage.list("_policies");
-      for (const meta of entries) {
-        if (this.policies.has(meta.key)) continue;
-        const raw = await this.storage.read("_policies", meta.key);
-        if (!raw) continue;
-        try {
-          const encrypted = JSON.parse(bytesToString(raw));
-          const decrypted = decrypt(encrypted, this.encryptionKey);
-          const policy = JSON.parse(bytesToString(decrypted));
-          this.policies.set(policy.policy_id, policy);
-        } catch {
-        }
-      }
-    } catch {
-    }
-  }
-  async persist(policy) {
-    const serialized = stringToBytes(JSON.stringify(policy));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_policies",
-      policy.policy_id,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-  }
-};
-
-// src/l3-disclosure/zk-proofs.ts
-init_random();
-init_encoding();
-var G = RistrettoPoint.BASE;
-var H_INPUT = concatBytes(
-  sha256(stringToBytes("sanctuary-pedersen-generator-H-v1-a")),
-  sha256(stringToBytes("sanctuary-pedersen-generator-H-v1-b"))
-);
-var H = RistrettoPoint.hashToCurve(H_INPUT);
-function bigintToBytes(n) {
-  const hex = n.toString(16).padStart(64, "0");
-  const bytes = new Uint8Array(32);
-  for (let i = 0; i < 32; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
-function bytesToBigint(bytes) {
-  let hex = "";
-  for (const b of bytes) {
-    hex += b.toString(16).padStart(2, "0");
-  }
-  return BigInt("0x" + hex);
-}
-var ORDER = BigInt("7237005577332262213973186563042994240857116359379907606001950938285454250989");
-function mod(n) {
-  return (n % ORDER + ORDER) % ORDER;
-}
-function safeMultiply(point, scalar) {
-  const s = mod(scalar);
-  if (s === 0n) return RistrettoPoint.ZERO;
-  return point.multiply(s);
-}
-function randomScalar() {
-  const bytes = randomBytes(64);
-  return mod(bytesToBigint(bytes));
-}
-function fiatShamirChallenge(domain, ...points) {
-  const domainBytes = stringToBytes(domain);
-  const combined = concatBytes(domainBytes, ...points);
-  const hash2 = sha256(combined);
-  return mod(bytesToBigint(hash2));
-}
-function createPedersenCommitment(value) {
-  const v = mod(BigInt(value));
-  const b = randomScalar();
-  const C = safeMultiply(G, v).add(safeMultiply(H, b));
-  return {
-    commitment: toBase64url(C.toRawBytes()),
-    blinding_factor: toBase64url(bigintToBytes(b)),
-    committed_at: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-function verifyPedersenCommitment(commitment, value, blindingFactor) {
-  try {
-    const C = RistrettoPoint.fromHex(fromBase64url(commitment));
-    const v = mod(BigInt(value));
-    const b = bytesToBigint(fromBase64url(blindingFactor));
-    const expected = safeMultiply(G, v).add(safeMultiply(H, b));
-    return C.equals(expected);
-  } catch {
-    return false;
-  }
-}
-function createProofOfKnowledge(value, blindingFactor, commitment) {
-  const v = mod(BigInt(value));
-  const b = bytesToBigint(fromBase64url(blindingFactor));
-  const r_v = randomScalar();
-  const r_b = randomScalar();
-  const R = safeMultiply(G, r_v).add(safeMultiply(H, r_b));
-  const C_bytes = fromBase64url(commitment);
-  const R_bytes = R.toRawBytes();
-  const e = fiatShamirChallenge("sanctuary-zk-pok-v1", C_bytes, R_bytes);
-  const s_v = mod(r_v + e * v);
-  const s_b = mod(r_b + e * b);
-  return {
-    type: "schnorr-pedersen-ristretto255",
-    commitment,
-    announcement: toBase64url(R_bytes),
-    response_v: toBase64url(bigintToBytes(s_v)),
-    response_b: toBase64url(bigintToBytes(s_b)),
-    generated_at: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-function verifyProofOfKnowledge(proof) {
-  try {
-    const C = RistrettoPoint.fromHex(fromBase64url(proof.commitment));
-    const R = RistrettoPoint.fromHex(fromBase64url(proof.announcement));
-    const s_v = bytesToBigint(fromBase64url(proof.response_v));
-    const s_b = bytesToBigint(fromBase64url(proof.response_b));
-    const e = fiatShamirChallenge(
-      "sanctuary-zk-pok-v1",
-      fromBase64url(proof.commitment),
-      fromBase64url(proof.announcement)
-    );
-    const lhs = safeMultiply(G, s_v).add(safeMultiply(H, s_b));
-    const rhs = R.add(safeMultiply(C, e));
-    return lhs.equals(rhs);
-  } catch {
-    return false;
-  }
-}
-function createRangeProof(value, blindingFactor, commitment, min, max) {
-  if (value < min || value > max) {
-    return { error: `Value ${value} is not in range [${min}, ${max}]` };
-  }
-  const range = max - min;
-  const numBits = Math.ceil(Math.log2(range + 1));
-  const shifted = value - min;
-  const b = bytesToBigint(fromBase64url(blindingFactor));
-  const bits = [];
-  for (let i = 0; i < numBits; i++) {
-    bits.push(shifted >> i & 1);
-  }
-  const bitBlindings = [];
-  const bitCommitments = [];
-  const bitProofs = [];
-  for (let i = 0; i < numBits; i++) {
-    const bit_b = randomScalar();
-    bitBlindings.push(bit_b);
-    const C_i = safeMultiply(G, mod(BigInt(bits[i]))).add(safeMultiply(H, bit_b));
-    bitCommitments.push(toBase64url(C_i.toRawBytes()));
-    const bitProof = createBitProof(bits[i], bit_b, C_i);
-    bitProofs.push(bitProof);
-  }
-  const sumBlinding = bitBlindings.reduce(
-    (acc, bi, i) => mod(acc + mod(BigInt(1) << BigInt(i)) * bi),
-    0n
-  );
-  const blindingDiff = mod(b - sumBlinding);
-  const r_sum = randomScalar();
-  const R_sum = safeMultiply(H, r_sum);
-  const e_sum = fiatShamirChallenge(
-    "sanctuary-zk-range-sum-v1",
-    fromBase64url(commitment),
-    R_sum.toRawBytes()
-  );
-  const s_sum = mod(r_sum + e_sum * blindingDiff);
-  return {
-    type: "range-pedersen-ristretto255",
-    commitment,
-    min,
-    max,
-    bit_commitments: bitCommitments,
-    bit_proofs: bitProofs,
-    sum_proof: {
-      announcement: toBase64url(R_sum.toRawBytes()),
-      response: toBase64url(bigintToBytes(s_sum))
-    },
-    generated_at: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-function verifyRangeProof(proof) {
-  try {
-    const C = RistrettoPoint.fromHex(fromBase64url(proof.commitment));
-    const range = proof.max - proof.min;
-    const numBits = Math.ceil(Math.log2(range + 1));
-    if (proof.bit_commitments.length !== numBits) return false;
-    if (proof.bit_proofs.length !== numBits) return false;
-    for (let i = 0; i < numBits; i++) {
-      const C_i = RistrettoPoint.fromHex(fromBase64url(proof.bit_commitments[i]));
-      if (!verifyBitProof(proof.bit_proofs[i], C_i)) {
-        return false;
-      }
-    }
-    let reconstructed = RistrettoPoint.ZERO;
-    for (let i = 0; i < numBits; i++) {
-      const C_i = RistrettoPoint.fromHex(fromBase64url(proof.bit_commitments[i]));
-      const weight = mod(BigInt(1) << BigInt(i));
-      reconstructed = reconstructed.add(safeMultiply(C_i, weight));
-    }
-    const diff = C.subtract(safeMultiply(G, mod(BigInt(proof.min)))).subtract(reconstructed);
-    const R_sum = RistrettoPoint.fromHex(fromBase64url(proof.sum_proof.announcement));
-    const s_sum = bytesToBigint(fromBase64url(proof.sum_proof.response));
-    const e_sum = fiatShamirChallenge(
-      "sanctuary-zk-range-sum-v1",
-      fromBase64url(proof.commitment),
-      fromBase64url(proof.sum_proof.announcement)
-    );
-    const lhs = safeMultiply(H, s_sum);
-    const rhs = R_sum.add(safeMultiply(diff, e_sum));
-    return lhs.equals(rhs);
-  } catch {
-    return false;
-  }
-}
-function createBitProof(bit, blinding, commitment) {
-  const C_bytes = commitment.toRawBytes();
-  if (bit === 0) {
-    const C_minus_G = commitment.subtract(G);
-    const e_1 = randomScalar();
-    const s_1 = randomScalar();
-    const R_1 = safeMultiply(H, s_1).subtract(safeMultiply(C_minus_G, e_1));
-    const r_0 = randomScalar();
-    const R_0 = safeMultiply(H, r_0);
-    const e = fiatShamirChallenge(
-      "sanctuary-zk-bit-v1",
-      C_bytes,
-      R_0.toRawBytes(),
-      R_1.toRawBytes()
-    );
-    const e_0 = mod(e - e_1);
-    const s_0 = mod(r_0 + e_0 * blinding);
-    return {
-      announcement_0: toBase64url(R_0.toRawBytes()),
-      announcement_1: toBase64url(R_1.toRawBytes()),
-      challenge_0: toBase64url(bigintToBytes(e_0)),
-      challenge_1: toBase64url(bigintToBytes(e_1)),
-      response_0: toBase64url(bigintToBytes(s_0)),
-      response_1: toBase64url(bigintToBytes(s_1))
-    };
-  } else {
-    const e_0 = randomScalar();
-    const s_0 = randomScalar();
-    const R_0 = safeMultiply(H, s_0).subtract(safeMultiply(commitment, e_0));
-    const r_1 = randomScalar();
-    const R_1 = safeMultiply(H, r_1);
-    const e = fiatShamirChallenge(
-      "sanctuary-zk-bit-v1",
-      C_bytes,
-      R_0.toRawBytes(),
-      R_1.toRawBytes()
-    );
-    const e_1 = mod(e - e_0);
-    const s_1 = mod(r_1 + e_1 * blinding);
-    return {
-      announcement_0: toBase64url(R_0.toRawBytes()),
-      announcement_1: toBase64url(R_1.toRawBytes()),
-      challenge_0: toBase64url(bigintToBytes(e_0)),
-      challenge_1: toBase64url(bigintToBytes(e_1)),
-      response_0: toBase64url(bigintToBytes(s_0)),
-      response_1: toBase64url(bigintToBytes(s_1))
-    };
-  }
-}
-function verifyBitProof(proof, commitment) {
-  try {
-    const C_bytes = commitment.toRawBytes();
-    const R_0 = RistrettoPoint.fromHex(fromBase64url(proof.announcement_0));
-    const R_1 = RistrettoPoint.fromHex(fromBase64url(proof.announcement_1));
-    const e_0 = bytesToBigint(fromBase64url(proof.challenge_0));
-    const e_1 = bytesToBigint(fromBase64url(proof.challenge_1));
-    const s_0 = bytesToBigint(fromBase64url(proof.response_0));
-    const s_1 = bytesToBigint(fromBase64url(proof.response_1));
-    const e = fiatShamirChallenge(
-      "sanctuary-zk-bit-v1",
-      C_bytes,
-      R_0.toRawBytes(),
-      R_1.toRawBytes()
-    );
-    if (mod(e_0 + e_1) !== e) return false;
-    const lhs_0 = safeMultiply(H, s_0);
-    const rhs_0 = R_0.add(safeMultiply(commitment, e_0));
-    if (!lhs_0.equals(rhs_0)) return false;
-    const C_minus_G = commitment.subtract(G);
-    const lhs_1 = safeMultiply(H, s_1);
-    const rhs_1 = R_1.add(safeMultiply(C_minus_G, e_1));
-    if (!lhs_1.equals(rhs_1)) return false;
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// src/l3-disclosure/tools.ts
-function createL3Tools(storage, masterKey, auditLog) {
-  const commitmentStore = new CommitmentStore(storage, masterKey);
-  const policyStore = new PolicyStore(storage, masterKey);
-  const tools = [
-    // ─── Commitment Schemes ───────────────────────────────────────────────
-    {
-      name: "proof_commitment",
-      description: "Create a cryptographic commitment to a value. The commitment hides the value until you choose to reveal it. Returns the commitment hash and a blinding factor (store securely).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          value: {
-            type: "string",
-            description: "The value to commit to"
-          },
-          blinding_factor: {
-            type: "string",
-            description: "Optional base64url blinding factor (auto-generated if omitted)"
-          }
-        },
-        required: ["value"]
-      },
-      handler: async (args) => {
-        const value = args.value;
-        const blindingFactor = args.blinding_factor;
-        const commitment = createCommitment(value, blindingFactor);
-        const commitmentId = await commitmentStore.store(commitment, value);
-        auditLog.append("l3", "proof_commitment", "system", {
-          commitment_id: commitmentId,
-          commitment_hash: commitment.commitment
-        });
-        return toolResult({
-          commitment_id: commitmentId,
-          commitment: commitment.commitment,
-          blinding_factor: commitment.blinding_factor,
-          committed_at: commitment.committed_at,
-          note: "Store the blinding_factor securely. You will need it to reveal the committed value."
-        });
-      }
-    },
-    {
-      name: "proof_reveal",
-      description: "Verify a previously committed value by revealing it with the blinding factor. Returns whether the revealed value matches the commitment.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          commitment: {
-            type: "string",
-            description: "The original commitment hash"
-          },
-          value: {
-            type: "string",
-            description: "The value being revealed"
-          },
-          blinding_factor: {
-            type: "string",
-            description: "The blinding factor from the original commitment"
-          }
-        },
-        required: ["commitment", "value", "blinding_factor"]
-      },
-      handler: async (args) => {
-        const commitment = args.commitment;
-        const value = args.value;
-        const blindingFactor = args.blinding_factor;
-        const valid = verifyCommitment(commitment, value, blindingFactor);
-        auditLog.append("l3", "proof_reveal", "system", {
-          commitment_hash: commitment,
-          valid
-        });
-        return toolResult({
-          valid,
-          commitment,
-          revealed_at: (/* @__PURE__ */ new Date()).toISOString()
-        });
-      }
-    },
-    // ─── Disclosure Policies ──────────────────────────────────────────────
-    {
-      name: "disclosure_set_policy",
-      description: "Define a disclosure policy that controls what an agent will and will not disclose in different interaction contexts. Rules specify which fields may be disclosed, which must be withheld, and which require cryptographic proof.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          policy_name: {
-            type: "string",
-            description: "Human-readable policy name"
-          },
-          rules: {
-            type: "array",
-            description: "Disclosure rules for different contexts",
-            items: {
-              type: "object",
-              properties: {
-                context: {
-                  type: "string",
-                  description: 'Interaction context: "negotiation", "commerce", "identity", "*" (wildcard)'
-                },
-                disclose: {
-                  type: "array",
-                  items: { type: "string" },
-                  description: "Fields the agent MAY disclose"
-                },
-                withhold: {
-                  type: "array",
-                  items: { type: "string" },
-                  description: "Fields the agent MUST NOT disclose"
-                },
-                proof_required: {
-                  type: "array",
-                  items: { type: "string" },
-                  description: "Fields that require proof rather than plain disclosure"
-                }
-              },
-              required: ["context", "disclose", "withhold", "proof_required"]
-            }
-          },
-          default_action: {
-            type: "string",
-            enum: ["withhold", "ask-principal"],
-            description: "What to do when no rule matches a field"
-          },
-          identity_id: {
-            type: "string",
-            description: "Optional identity this policy is bound to"
-          }
-        },
-        required: ["policy_name", "rules", "default_action"]
-      },
-      handler: async (args) => {
-        const policyName = args.policy_name;
-        const rules = args.rules;
-        const defaultAction = args.default_action;
-        const identityId = args.identity_id;
-        const policy = await policyStore.create(
-          policyName,
-          rules,
-          defaultAction,
-          identityId
-        );
-        auditLog.append("l3", "disclosure_set_policy", identityId ?? "system", {
-          policy_id: policy.policy_id,
-          policy_name: policyName,
-          rules_count: rules.length
-        });
-        return toolResult({
-          policy_id: policy.policy_id,
-          policy_name: policy.policy_name,
-          rules_count: policy.rules.length,
-          created_at: policy.created_at
-        });
-      }
-    },
-    {
-      name: "disclosure_evaluate",
-      description: "Evaluate a disclosure request against an active policy. Returns per-field decisions: disclose, withhold, proof, or ask-principal.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          context: {
-            type: "string",
-            description: "The interaction context"
-          },
-          requested_fields: {
-            type: "array",
-            items: { type: "string" },
-            description: "Fields the counterparty is requesting"
-          },
-          policy_id: {
-            type: "string",
-            description: "Specific policy to evaluate (uses first available if omitted)"
-          }
-        },
-        required: ["context", "requested_fields"]
-      },
-      handler: async (args) => {
-        const context = args.context;
-        const requestedFields = args.requested_fields;
-        const policyId = args.policy_id;
-        let policy;
-        if (policyId) {
-          policy = await policyStore.get(policyId);
-        } else {
-          const allPolicies = await policyStore.list();
-          policy = allPolicies[0] ?? null;
-        }
-        if (!policy) {
-          return toolResult({
-            error: "No disclosure policy found. Create one with disclosure_set_policy first."
-          });
-        }
-        const decisions = evaluateDisclosure(policy, context, requestedFields);
-        const withholding = decisions.filter(
-          (d) => d.action === "withhold"
-        ).length;
-        const disclosing = decisions.filter(
-          (d) => d.action === "disclose"
-        ).length;
-        const proofRequired = decisions.filter(
-          (d) => d.action === "proof"
-        ).length;
-        const askPrincipal = decisions.filter(
-          (d) => d.action === "ask-principal"
-        ).length;
-        auditLog.append("l3", "disclosure_evaluate", "system", {
-          policy_id: policy.policy_id,
-          context,
-          fields_requested: requestedFields.length,
-          withholding,
-          disclosing,
-          proof_required: proofRequired
-        });
-        return toolResult({
-          policy_id: policy.policy_id,
-          policy_name: policy.policy_name,
-          context,
-          decisions,
-          summary: {
-            total_fields: requestedFields.length,
-            disclose: disclosing,
-            withhold: withholding,
-            proof: proofRequired,
-            ask_principal: askPrincipal
-          },
-          overall_recommendation: withholding > 0 ? `Withholding ${withholding} of ${requestedFields.length} requested fields per policy "${policy.policy_name}"` : `All ${requestedFields.length} fields may be disclosed per policy "${policy.policy_name}"`
-        });
-      }
-    },
-    // ─── ZK Proof Tools ───────────────────────────────────────────────────
-    {
-      name: "zk_commit",
-      description: "Create a Pedersen commitment to a numeric value on Ristretto255. Unlike SHA-256 commitments, Pedersen commitments support zero-knowledge proofs: you can prove properties about the committed value without revealing it.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          value: {
-            type: "number",
-            description: "The integer value to commit to"
-          }
-        },
-        required: ["value"]
-      },
-      handler: async (args) => {
-        const value = args.value;
-        if (!Number.isInteger(value)) {
-          return toolResult({ error: "Value must be an integer." });
-        }
-        const commitment = createPedersenCommitment(value);
-        auditLog.append("l3", "zk_commit", "system", {
-          commitment_hash: commitment.commitment.slice(0, 16) + "..."
-        });
-        return toolResult({
-          commitment: commitment.commitment,
-          blinding_factor: commitment.blinding_factor,
-          committed_at: commitment.committed_at,
-          proof_system: "pedersen-ristretto255",
-          note: "Store the blinding_factor securely. Use zk_prove to create proofs about this commitment."
-        });
-      }
-    },
-    {
-      name: "zk_prove",
-      description: "Create a zero-knowledge proof of knowledge for a Pedersen commitment. Proves you know the value and blinding factor without revealing either. Uses a Schnorr sigma protocol with Fiat-Shamir transform.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          value: {
-            type: "number",
-            description: "The committed value (integer)"
-          },
-          blinding_factor: {
-            type: "string",
-            description: "The blinding factor from zk_commit (base64url)"
-          },
-          commitment: {
-            type: "string",
-            description: "The Pedersen commitment (base64url)"
-          }
-        },
-        required: ["value", "blinding_factor", "commitment"]
-      },
-      handler: async (args) => {
-        const value = args.value;
-        const blindingFactor = args.blinding_factor;
-        const commitment = args.commitment;
-        if (!verifyPedersenCommitment(commitment, value, blindingFactor)) {
-          return toolResult({
-            error: "The provided value and blinding factor do not match the commitment."
-          });
-        }
-        const proof = createProofOfKnowledge(value, blindingFactor, commitment);
-        auditLog.append("l3", "zk_prove", "system", {
-          proof_type: proof.type,
-          commitment: commitment.slice(0, 16) + "..."
-        });
-        return toolResult({
-          proof,
-          note: "This proof demonstrates knowledge of the commitment opening without revealing the value."
-        });
-      }
-    },
-    {
-      name: "zk_verify",
-      description: "Verify a zero-knowledge proof of knowledge for a Pedersen commitment. Checks that the prover knows the commitment's opening without learning anything.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          proof: {
-            type: "object",
-            description: "The ZK proof object from zk_prove"
-          }
-        },
-        required: ["proof"]
-      },
-      handler: async (args) => {
-        const proof = args.proof;
-        const valid = verifyProofOfKnowledge(proof);
-        auditLog.append("l3", "zk_verify", "system", {
-          proof_type: proof.type,
-          valid
-        });
-        return toolResult({
-          valid,
-          proof_type: proof.type,
-          commitment: proof.commitment,
-          verified_at: (/* @__PURE__ */ new Date()).toISOString()
-        });
-      }
-    },
-    {
-      name: "zk_range_prove",
-      description: "Create a zero-knowledge range proof: prove that a committed value is within [min, max] without revealing the exact value. Uses bit-decomposition with OR-proofs on Ristretto255.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          value: {
-            type: "number",
-            description: "The committed value (integer)"
-          },
-          blinding_factor: {
-            type: "string",
-            description: "The blinding factor from zk_commit (base64url)"
-          },
-          commitment: {
-            type: "string",
-            description: "The Pedersen commitment (base64url)"
-          },
-          min: {
-            type: "number",
-            description: "Minimum of the range (inclusive)"
-          },
-          max: {
-            type: "number",
-            description: "Maximum of the range (inclusive)"
-          }
-        },
-        required: ["value", "blinding_factor", "commitment", "min", "max"]
-      },
-      handler: async (args) => {
-        const value = args.value;
-        const blindingFactor = args.blinding_factor;
-        const commitment = args.commitment;
-        const min = args.min;
-        const max = args.max;
-        const proof = createRangeProof(value, blindingFactor, commitment, min, max);
-        if ("error" in proof) {
-          return toolResult({ error: proof.error });
-        }
-        auditLog.append("l3", "zk_range_prove", "system", {
-          proof_type: proof.type,
-          range: `[${min}, ${max}]`,
-          bits: proof.bit_commitments.length
-        });
-        return toolResult({
-          proof,
-          note: `This proof demonstrates the committed value is in [${min}, ${max}] without revealing it.`
-        });
-      }
-    },
-    {
-      name: "zk_range_verify",
-      description: "Verify a zero-knowledge range proof \u2014 confirms a committed value is within the claimed range without learning the value.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          proof: {
-            type: "object",
-            description: "The range proof object from zk_range_prove"
-          }
-        },
-        required: ["proof"]
-      },
-      handler: async (args) => {
-        const proof = args.proof;
-        const valid = verifyRangeProof(proof);
-        auditLog.append("l3", "zk_range_verify", "system", {
-          proof_type: proof.type,
-          valid,
-          range: `[${proof.min}, ${proof.max}]`
-        });
-        return toolResult({
-          valid,
-          proof_type: proof.type,
-          range: { min: proof.min, max: proof.max },
-          commitment: proof.commitment,
-          verified_at: (/* @__PURE__ */ new Date()).toISOString()
-        });
-      }
-    }
-  ];
-  return { tools, commitmentStore, policyStore };
-}
-
-// src/l4-reputation/tools.ts
-init_router();
-
-// src/l4-reputation/reputation-store.ts
-init_encryption();
-init_key_derivation();
-init_encoding();
-init_random();
-init_identity();
-function computeMedian(values) {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-function aggregateMetrics(attestations, metricNames) {
-  const result = {};
-  const names = metricNames ?? Array.from(
-    new Set(
-      attestations.flatMap(
-        (a) => Object.keys(a.attestation.data.metrics)
-      )
-    )
-  );
-  for (const name of names) {
-    const values = attestations.map((a) => a.attestation.data.metrics[name]).filter((v) => v !== void 0);
-    if (values.length === 0) {
-      result[name] = { mean: 0, median: 0, min: 0, max: 0, count: 0 };
-      continue;
-    }
-    result[name] = {
-      mean: values.reduce((s, v) => s + v, 0) / values.length,
-      median: computeMedian(values),
-      min: Math.min(...values),
-      max: Math.max(...values),
-      count: values.length
-    };
-  }
-  return result;
-}
-var ReputationStore = class {
-  storage;
-  encryptionKey;
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.encryptionKey = derivePurposeKey(masterKey, "l4-reputation");
-  }
-  /**
-   * Record an interaction outcome as a signed attestation.
-   */
-  async record(interactionId, counterpartyDid, outcome, context, identity, identityEncryptionKey, counterpartyAttestation, sovereigntyTier) {
-    const attestationId = `att-${Date.now()}-${toBase64url(randomBytes(8))}`;
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const attestationData = {
-      interaction_id: interactionId,
-      participant_did: identity.did,
-      counterparty_did: counterpartyDid,
-      outcome_type: outcome.type,
-      outcome_result: outcome.result,
-      metrics: outcome.metrics ?? {},
-      context,
-      timestamp: now,
-      sovereignty_tier: sovereigntyTier
-    };
-    const dataBytes = stringToBytes(JSON.stringify(attestationData));
-    const signature = sign(
-      dataBytes,
-      identity.encrypted_private_key,
-      identityEncryptionKey
-    );
-    const attestation = {
-      attestation_id: attestationId,
-      schema: "sanctuary-interaction-v1",
-      data: attestationData,
-      signature: toBase64url(signature),
-      signer: identity.did
-    };
-    const stored = {
-      attestation,
-      counterparty_attestation: counterpartyAttestation,
-      counterparty_confirmed: !!counterpartyAttestation,
-      recorded_at: now
-    };
-    const serialized = stringToBytes(JSON.stringify(stored));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_reputation",
-      attestationId,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-    return stored;
-  }
-  /**
-   * Query reputation data with filtering.
-   * Returns aggregates only — not raw interaction data.
-   */
-  async query(options) {
-    const all = await this.loadAll();
-    let filtered = all;
-    if (options.context) {
-      filtered = filtered.filter(
-        (a) => a.attestation.data.context === options.context
-      );
-    }
-    if (options.time_range) {
-      const start2 = new Date(options.time_range.start).getTime();
-      const end2 = new Date(options.time_range.end).getTime();
-      filtered = filtered.filter((a) => {
-        const t = new Date(a.attestation.data.timestamp).getTime();
-        return t >= start2 && t <= end2;
-      });
-    }
-    if (options.counterparty_did) {
-      filtered = filtered.filter(
-        (a) => a.attestation.data.counterparty_did === options.counterparty_did
-      );
-    }
-    const contexts = Array.from(
-      new Set(filtered.map((a) => a.attestation.data.context))
-    );
-    const timestamps = filtered.map(
-      (a) => new Date(a.attestation.data.timestamp).getTime()
-    );
-    const start = timestamps.length > 0 ? new Date(Math.min(...timestamps)).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
-    const end = timestamps.length > 0 ? new Date(Math.max(...timestamps)).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
-    return {
-      total_interactions: filtered.length,
-      completed: filtered.filter(
-        (a) => a.attestation.data.outcome_result === "completed"
-      ).length,
-      partial: filtered.filter(
-        (a) => a.attestation.data.outcome_result === "partial"
-      ).length,
-      failed: filtered.filter(
-        (a) => a.attestation.data.outcome_result === "failed"
-      ).length,
-      disputed: filtered.filter(
-        (a) => a.attestation.data.outcome_result === "disputed"
-      ).length,
-      contexts,
-      time_range: { start, end },
-      aggregate_metrics: aggregateMetrics(filtered, options.metrics)
-    };
-  }
-  /**
-   * Export attestations as a portable reputation bundle.
-   */
-  async exportBundle(identity, identityEncryptionKey, context) {
-    let all = await this.loadAll();
-    if (context) {
-      all = all.filter((a) => a.attestation.data.context === context);
-    }
-    const attestations = all.map((a) => a.attestation);
-    const bundleData = {
-      version: "SANCTUARY_REP_V1",
-      attestations,
-      exported_at: (/* @__PURE__ */ new Date()).toISOString(),
-      exporter_did: identity.did
-    };
-    const bundleBytes = stringToBytes(JSON.stringify(bundleData));
-    const bundleSignature = sign(
-      bundleBytes,
-      identity.encrypted_private_key,
-      identityEncryptionKey
-    );
-    return {
-      ...bundleData,
-      bundle_signature: toBase64url(bundleSignature)
-    };
-  }
-  /**
-   * Import attestations from a reputation bundle.
-   * Verifies signatures if requested (default: true).
-   *
-   * @param publicKeys - Map of DID → public key bytes for signature verification
-   */
-  async importBundle(bundle, verifySignatures, publicKeys) {
-    let imported = 0;
-    let invalid = 0;
-    const contexts = /* @__PURE__ */ new Set();
-    for (const attestation of bundle.attestations) {
-      if (verifySignatures) {
-        const signerKey = publicKeys.get(attestation.signer);
-        if (!signerKey) {
-          invalid++;
-          continue;
-        }
-        const dataBytes = stringToBytes(
-          JSON.stringify(attestation.data)
-        );
-        const sigBytes = fromBase64url(attestation.signature);
-        if (!verify(dataBytes, sigBytes, signerKey)) {
-          invalid++;
-          continue;
-        }
-      }
-      const stored = {
-        attestation,
-        counterparty_confirmed: false,
-        recorded_at: (/* @__PURE__ */ new Date()).toISOString()
-      };
-      const serialized = stringToBytes(JSON.stringify(stored));
-      const encrypted = encrypt(serialized, this.encryptionKey);
-      await this.storage.write(
-        "_reputation",
-        attestation.attestation_id,
-        stringToBytes(JSON.stringify(encrypted))
-      );
-      imported++;
-      contexts.add(attestation.data.context);
-    }
-    return {
-      imported,
-      invalid,
-      contexts: Array.from(contexts)
-    };
-  }
-  // ─── Escrow ───────────────────────────────────────────────────────────
-  /**
-   * Create an escrow for trust bootstrapping.
-   */
-  async createEscrow(transactionTerms, counterpartyDid, timeoutSeconds, creatorDid, collateralAmount) {
-    const escrowId = `esc-${Date.now()}-${toBase64url(randomBytes(8))}`;
-    const now = /* @__PURE__ */ new Date();
-    const expiresAt = new Date(now.getTime() + timeoutSeconds * 1e3);
-    const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
-    const termsHash = hashToString2(stringToBytes(transactionTerms));
-    const escrow = {
-      escrow_id: escrowId,
-      transaction_terms: transactionTerms,
-      terms_hash: termsHash,
-      collateral_amount: collateralAmount,
-      counterparty_did: counterpartyDid,
-      creator_did: creatorDid,
-      created_at: now.toISOString(),
-      expires_at: expiresAt.toISOString(),
-      status: "pending"
-    };
-    const serialized = stringToBytes(JSON.stringify(escrow));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_escrows",
-      escrowId,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-    return escrow;
-  }
-  /**
-   * Get an escrow by ID.
-   */
-  async getEscrow(escrowId) {
-    const raw = await this.storage.read("_escrows", escrowId);
-    if (!raw) return null;
-    try {
-      const encrypted = JSON.parse(bytesToString(raw));
-      const decrypted = decrypt(encrypted, this.encryptionKey);
-      return JSON.parse(bytesToString(decrypted));
-    } catch {
-      return null;
-    }
-  }
-  // ─── Guarantees ─────────────────────────────────────────────────────
-  /**
-   * Create a principal's guarantee for a new agent.
-   */
-  async createGuarantee(principalIdentity, agentDid, scope, durationSeconds, identityEncryptionKey, maxLiability) {
-    const guaranteeId = `guar-${Date.now()}-${toBase64url(randomBytes(8))}`;
-    const now = /* @__PURE__ */ new Date();
-    const validUntil = new Date(now.getTime() + durationSeconds * 1e3);
-    const certificateData = {
-      guarantee_id: guaranteeId,
-      principal_did: principalIdentity.did,
-      agent_did: agentDid,
-      scope,
-      max_liability: maxLiability,
-      valid_until: validUntil.toISOString(),
-      issued_at: now.toISOString()
-    };
-    const certBytes = stringToBytes(JSON.stringify(certificateData));
-    const signature = sign(
-      certBytes,
-      principalIdentity.encrypted_private_key,
-      identityEncryptionKey
-    );
-    const certificate = toBase64url(
-      stringToBytes(
-        JSON.stringify({
-          ...certificateData,
-          signature: toBase64url(signature)
-        })
-      )
-    );
-    const guarantee = {
-      guarantee_id: guaranteeId,
-      principal_did: principalIdentity.did,
-      agent_did: agentDid,
-      scope,
-      max_liability: maxLiability,
-      valid_until: validUntil.toISOString(),
-      certificate,
-      created_at: now.toISOString()
-    };
-    const serialized = stringToBytes(JSON.stringify(guarantee));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_guarantees",
-      guaranteeId,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-    return guarantee;
-  }
-  // ─── Tier-Aware Access ───────────────────────────────────────────────
-  /**
-   * Load attestations for tier-weighted scoring.
-   * Applies basic context/counterparty filtering, returns full StoredAttestations
-   * so callers can access sovereignty_tier from attestation data.
-   */
-  async loadAllForTierScoring(options) {
-    let all = await this.loadAll();
-    if (options?.context) {
-      all = all.filter((a) => a.attestation.data.context === options.context);
-    }
-    if (options?.counterparty_did) {
-      all = all.filter(
-        (a) => a.attestation.data.counterparty_did === options.counterparty_did
-      );
-    }
-    return all;
-  }
-  // ─── Internal ─────────────────────────────────────────────────────────
-  async loadAll() {
-    const results = [];
-    try {
-      const entries = await this.storage.list("_reputation");
-      for (const meta of entries) {
-        const raw = await this.storage.read("_reputation", meta.key);
-        if (!raw) continue;
-        try {
-          const encrypted = JSON.parse(bytesToString(raw));
-          const decrypted = decrypt(encrypted, this.encryptionKey);
-          results.push(JSON.parse(bytesToString(decrypted)));
-        } catch {
-        }
-      }
-    } catch {
-    }
-    return results;
-  }
-};
-
-// src/l4-reputation/tools.ts
-init_key_derivation();
-init_encoding();
-
-// src/l4-reputation/tiers.ts
-var TIER_WEIGHTS = {
-  "verified-sovereign": 1,
-  "verified-degraded": 0.8,
-  "self-attested": 0.5,
-  "unverified": 0.2
-};
-function resolveTier(counterpartyId, handshakeResults, hasSanctuaryIdentity) {
-  const handshake = handshakeResults.get(counterpartyId);
-  if (handshake && handshake.verified) {
-    const expiresAt = new Date(handshake.expires_at);
-    if (expiresAt > /* @__PURE__ */ new Date()) {
-      return {
-        sovereignty_tier: handshake.trust_tier,
-        handshake_completed_at: handshake.completed_at,
-        verified_by: handshake.counterparty_id
-      };
-    }
-  }
-  if (hasSanctuaryIdentity) {
-    return { sovereignty_tier: "self-attested" };
-  }
-  return { sovereignty_tier: "unverified" };
-}
-function trustTierToSovereigntyTier(trustTier) {
-  switch (trustTier) {
-    case "verified-sovereign":
-      return "verified-sovereign";
-    case "verified-degraded":
-      return "verified-degraded";
-    default:
-      return "unverified";
-  }
-}
-function computeWeightedScore(attestations) {
-  if (attestations.length === 0) return null;
-  let weightedSum = 0;
-  let totalWeight = 0;
-  for (const a of attestations) {
-    const weight = TIER_WEIGHTS[a.tier];
-    weightedSum += a.value * weight;
-    totalWeight += weight;
-  }
-  return totalWeight > 0 ? weightedSum / totalWeight : null;
-}
-function tierDistribution(tiers) {
-  const dist = {
-    "verified-sovereign": 0,
-    "verified-degraded": 0,
-    "self-attested": 0,
-    "unverified": 0
-  };
-  for (const tier of tiers) {
-    dist[tier]++;
-  }
-  return dist;
-}
-
-// src/l4-reputation/tools.ts
-function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeResults, verascoreUrl) {
-  const reputationStore = new ReputationStore(storage, masterKey);
-  const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
-  const hsResults = handshakeResults ?? /* @__PURE__ */ new Map();
-  const tools = [
-    // ─── Reputation Recording ─────────────────────────────────────────
-    {
-      name: "reputation_record",
-      description: "Record an interaction outcome as a signed attestation. Creates an EAS-compatible attestation signed by the specified identity.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          interaction_id: {
-            type: "string",
-            description: "Unique interaction identifier"
-          },
-          counterparty_did: {
-            type: "string",
-            description: "Counterparty's DID"
-          },
-          outcome: {
-            type: "object",
-            description: "Interaction outcome",
-            properties: {
-              type: {
-                type: "string",
-                enum: ["transaction", "negotiation", "service", "dispute", "custom"]
-              },
-              result: {
-                type: "string",
-                enum: ["completed", "partial", "failed", "disputed"]
-              },
-              metrics: {
-                type: "object",
-                description: "Domain-specific metrics (e.g., fulfillment_rate, response_time_ms)"
-              }
-            },
-            required: ["type", "result"]
-          },
-          context: {
-            type: "string",
-            description: "Category/domain for context-specific reputation",
-            default: "general"
-          },
-          counterparty_attestation: {
-            type: "string",
-            description: "Counterparty's signed attestation of the same interaction"
-          },
-          identity_id: {
-            type: "string",
-            description: "Identity to sign with (uses default if omitted)"
-          }
-        },
-        required: ["interaction_id", "counterparty_did", "outcome"]
-      },
-      handler: async (args) => {
-        const identityId = args.identity_id;
-        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
-        if (!identity) {
-          return toolResult({
-            error: "No identity found. Create one with identity_create first."
-          });
-        }
-        const outcome = args.outcome;
-        const context = args.context ?? "general";
-        const counterpartyDid = args.counterparty_did;
-        const hasSanctuaryIdentity = identityManager.list().some(
-          (id) => identityManager.get(id.identity_id)?.did === counterpartyDid
-        );
-        const tierMeta = resolveTier(counterpartyDid, hsResults, hasSanctuaryIdentity);
-        const stored = await reputationStore.record(
-          args.interaction_id,
-          counterpartyDid,
-          outcome,
-          context,
-          identity,
-          identityEncryptionKey,
-          args.counterparty_attestation,
-          tierMeta.sovereignty_tier
-        );
-        auditLog.append("l4", "reputation_record", identity.identity_id, {
-          interaction_id: args.interaction_id,
-          outcome_type: outcome.type,
-          outcome_result: outcome.result,
-          context,
-          sovereignty_tier: tierMeta.sovereignty_tier
-        });
-        return toolResult({
-          attestation_id: stored.attestation.attestation_id,
-          interaction_id: stored.attestation.data.interaction_id,
-          self_attestation: stored.attestation.signature,
-          counterparty_confirmed: stored.counterparty_confirmed,
-          sovereignty_tier: tierMeta.sovereignty_tier,
-          context,
-          recorded_at: stored.recorded_at
-        });
-      }
-    },
-    // ─── Reputation Query ─────────────────────────────────────────────
-    {
-      name: "reputation_query",
-      description: "Query aggregated reputation data with filtering. Returns summary statistics, never raw interaction details.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          context: {
-            type: "string",
-            description: "Filter by context/domain"
-          },
-          time_range: {
-            type: "object",
-            description: "Filter by time range",
-            properties: {
-              start: { type: "string", description: "ISO 8601 start" },
-              end: { type: "string", description: "ISO 8601 end" }
-            }
-          },
-          metrics: {
-            type: "array",
-            items: { type: "string" },
-            description: "Which metrics to aggregate"
-          },
-          counterparty_did: {
-            type: "string",
-            description: "Filter by counterparty"
-          }
-        }
-      },
-      handler: async (args) => {
-        const summary = await reputationStore.query({
-          context: args.context,
-          time_range: args.time_range,
-          metrics: args.metrics,
-          counterparty_did: args.counterparty_did
-        });
-        auditLog.append("l4", "reputation_query", "system", {
-          total_interactions: summary.total_interactions,
-          contexts: summary.contexts
-        });
-        return toolResult({
-          summary,
-          // SEC-ADD-03: Tag response as containing counterparty-generated attestation data
-          _content_trust: "external"
-        });
-      }
-    },
-    // ─── Reputation Export ─────────────────────────────────────────────
-    {
-      name: "reputation_export",
-      description: "Export a portable reputation bundle (SANCTUARY_REP_V1). Includes all signed attestations for independent verification.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          format: {
-            type: "string",
-            enum: ["SANCTUARY_REP_V1"],
-            default: "SANCTUARY_REP_V1"
-          },
-          context: {
-            type: "string",
-            description: "Export specific context only"
-          },
-          identity_id: {
-            type: "string",
-            description: "Identity to sign the bundle with"
-          }
-        }
-      },
-      handler: async (args) => {
-        const identityId = args.identity_id;
-        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
-        if (!identity) {
-          return toolResult({
-            error: "No identity found. Create one with identity_create first."
-          });
-        }
-        const context = args.context;
-        const bundle = await reputationStore.exportBundle(
-          identity,
-          identityEncryptionKey,
-          context
-        );
-        const bundleJson = JSON.stringify(bundle);
-        const bundleBase64 = toBase64url(
-          new TextEncoder().encode(bundleJson)
-        );
-        auditLog.append("l4", "reputation_export", identity.identity_id, {
-          attestation_count: bundle.attestations.length,
-          contexts: Array.from(
-            new Set(bundle.attestations.map((a) => a.data.context))
-          )
-        });
-        const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
-        const { stringToBytes: stringToBytes2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
-        return toolResult({
-          bundle: bundleBase64,
-          attestation_count: bundle.attestations.length,
-          contexts: Array.from(
-            new Set(bundle.attestations.map((a) => a.data.context))
-          ),
-          bundle_hash: hashToString2(stringToBytes2(bundleJson)),
-          exported_at: bundle.exported_at
-        });
-      }
-    },
-    // ─── Reputation Import ────────────────────────────────────────────
-    {
-      name: "reputation_import",
-      description: "Import a reputation bundle from another Sanctuary instance. Verifies all attestation signatures by default.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          bundle: {
-            type: "string",
-            description: "Base64url-encoded reputation bundle"
-          }
-        },
-        required: ["bundle"]
-      },
-      handler: async (args) => {
-        const bundleBase64 = args.bundle;
-        const verifySignatures = true;
-        let bundle;
-        try {
-          const bundleBytes = fromBase64url(bundleBase64);
-          const bundleJson = new TextDecoder().decode(bundleBytes);
-          bundle = JSON.parse(bundleJson);
-        } catch {
-          return toolResult({
-            error: "Invalid bundle format. Expected base64url-encoded JSON."
-          });
-        }
-        const publicKeys = /* @__PURE__ */ new Map();
-        for (const pub of identityManager.list()) {
-          const identity = identityManager.get(pub.identity_id);
-          if (identity) {
-            publicKeys.set(identity.did, fromBase64url(identity.public_key));
-          }
-        }
-        const result = await reputationStore.importBundle(
-          bundle,
-          verifySignatures,
-          publicKeys
-        );
-        auditLog.append("l4", "reputation_import", "system", {
-          imported: result.imported,
-          invalid: result.invalid,
-          contexts: result.contexts
-        });
-        return toolResult({
-          imported_attestations: result.imported,
-          invalid_attestations: result.invalid,
-          contexts: result.contexts,
-          imported_at: (/* @__PURE__ */ new Date()).toISOString()
-        });
-      }
-    },
-    // ─── Sovereignty-Weighted Query ──────────────────────────────────
-    {
-      name: "reputation_query_weighted",
-      description: "Query reputation with sovereignty-weighted scoring. Attestations from verified-sovereign agents carry full weight (1.0); unverified attestations carry reduced weight (0.2). Returns both the weighted score and tier distribution.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          metric: {
-            type: "string",
-            description: "Which metric to compute the weighted score for"
-          },
-          context: {
-            type: "string",
-            description: "Filter by context/domain"
-          },
-          counterparty_did: {
-            type: "string",
-            description: "Filter by counterparty"
-          }
-        },
-        required: ["metric"]
-      },
-      handler: async (args) => {
-        const summary = await reputationStore.query({
-          context: args.context,
-          counterparty_did: args.counterparty_did
-        });
-        const allAttestations = await reputationStore.loadAllForTierScoring({
-          context: args.context,
-          counterparty_did: args.counterparty_did
-        });
-        const metric = args.metric;
-        const tieredAttestations = allAttestations.filter((a) => a.attestation.data.metrics[metric] !== void 0).map((a) => ({
-          value: a.attestation.data.metrics[metric],
-          tier: a.attestation.data.sovereignty_tier ?? "unverified"
-        }));
-        const weightedScore = computeWeightedScore(tieredAttestations);
-        const tiers = allAttestations.map(
-          (a) => a.attestation.data.sovereignty_tier ?? "unverified"
-        );
-        const dist = tierDistribution(tiers);
-        auditLog.append("l4", "reputation_query_weighted", "system", {
-          metric,
-          attestation_count: tieredAttestations.length,
-          weighted_score: weightedScore
-        });
-        return toolResult({
-          metric,
-          weighted_score: weightedScore,
-          attestation_count: tieredAttestations.length,
-          tier_distribution: dist,
-          tier_weights: TIER_WEIGHTS,
-          unweighted_summary: summary
-        });
-      }
-    },
-    // ─── Trust Bootstrap: Escrow ──────────────────────────────────────
-    {
-      name: "bootstrap_create_escrow",
-      description: "Create an escrow record for trust bootstrapping. Allows new participants with no reputation to transact safely.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          transaction_terms: {
-            type: "string",
-            description: "Description of the transaction"
-          },
-          collateral_amount: {
-            type: "number",
-            description: "Optional stake/collateral amount"
-          },
-          counterparty_did: {
-            type: "string",
-            description: "Counterparty's DID"
-          },
-          timeout_seconds: {
-            type: "number",
-            description: "Escrow timeout in seconds"
-          },
-          identity_id: {
-            type: "string",
-            description: "Identity creating the escrow"
-          }
-        },
-        required: ["transaction_terms", "counterparty_did", "timeout_seconds"]
-      },
-      handler: async (args) => {
-        const identityId = args.identity_id;
-        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
-        if (!identity) {
-          return toolResult({
-            error: "No identity found. Create one with identity_create first."
-          });
-        }
-        const escrow = await reputationStore.createEscrow(
-          args.transaction_terms,
-          args.counterparty_did,
-          args.timeout_seconds,
-          identity.did,
-          args.collateral_amount
-        );
-        auditLog.append("l4", "bootstrap_create_escrow", identity.identity_id, {
-          escrow_id: escrow.escrow_id,
-          counterparty_did: args.counterparty_did,
-          timeout_seconds: args.timeout_seconds
-        });
-        return toolResult({
-          escrow_id: escrow.escrow_id,
-          terms_hash: escrow.terms_hash,
-          created_at: escrow.created_at,
-          expires_at: escrow.expires_at,
-          status: escrow.status
-        });
-      }
-    },
-    // ─── Trust Bootstrap: Guarantee ───────────────────────────────────
-    {
-      name: "bootstrap_provide_guarantee",
-      description: "A principal provides a signed reputation guarantee for a new agent. The guarantee certificate can be presented to counterparties.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          principal_identity_id: {
-            type: "string",
-            description: "Identity of the guarantor (principal)"
-          },
-          agent_identity_id: {
-            type: "string",
-            description: "Identity of the agent being guaranteed"
-          },
-          scope: {
-            type: "string",
-            description: "What the guarantee covers"
-          },
-          duration_seconds: {
-            type: "number",
-            description: "How long the guarantee is valid"
-          },
-          max_liability: {
-            type: "number",
-            description: "Maximum liability amount"
-          }
-        },
-        required: [
-          "principal_identity_id",
-          "agent_identity_id",
-          "scope",
-          "duration_seconds"
-        ]
-      },
-      handler: async (args) => {
-        const principalIdentity = identityManager.get(
-          args.principal_identity_id
-        );
-        const agentIdentity = identityManager.get(
-          args.agent_identity_id
-        );
-        if (!principalIdentity) {
-          return toolResult({
-            error: `Principal identity "${args.principal_identity_id}" not found.`
-          });
-        }
-        if (!agentIdentity) {
-          return toolResult({
-            error: `Agent identity "${args.agent_identity_id}" not found.`
-          });
-        }
-        const guarantee = await reputationStore.createGuarantee(
-          principalIdentity,
-          agentIdentity.did,
-          args.scope,
-          args.duration_seconds,
-          identityEncryptionKey,
-          args.max_liability
-        );
-        auditLog.append(
-          "l4",
-          "bootstrap_provide_guarantee",
-          principalIdentity.identity_id,
-          {
-            guarantee_id: guarantee.guarantee_id,
-            agent_did: agentIdentity.did,
-            scope: args.scope
-          }
-        );
-        return toolResult({
-          guarantee_id: guarantee.guarantee_id,
-          guarantee_certificate: guarantee.certificate,
-          scope: guarantee.scope,
-          valid_until: guarantee.valid_until
-        });
-      }
-    },
-    // ─── Verascore Reputation Publish ────────────────────────────────
-    {
-      name: "reputation_publish",
-      description: "Publish sovereignty data to Verascore (verascore.ai) \u2014 the agent reputation platform. Sends SHR data, handshake attestations, or sovereignty updates. The data is signed with the agent's Ed25519 key for verification. Requires a Verascore agent profile (claimed or stub) to exist.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          type: {
-            type: "string",
-            enum: ["shr", "handshake", "sovereignty-update"],
-            description: "Type of data to publish: 'shr' for full sovereignty health report, 'handshake' for a handshake attestation, 'sovereignty-update' for layer-level updates."
-          },
-          verascore_agent_id: {
-            type: "string",
-            description: "Agent ID on Verascore. If omitted, uses the default identity's DID-derived slug."
-          },
-          verascore_url: {
-            type: "string",
-            description: "Verascore API base URL. Defaults to https://verascore.ai"
-          },
-          data: {
-            type: "object",
-            description: "The data payload. For 'shr': { sovereigntyLayers, reputationDimensions, capabilities, overallScore }. For 'handshake': { attestation: { id, responderId, ... } }. For 'sovereignty-update': { layers: [{ name, label, score, status, description }] }."
-          },
-          identity_id: {
-            type: "string",
-            description: "Identity to sign with (uses default if omitted)"
-          }
-        },
-        required: ["type"]
-      },
-      handler: async (args) => {
-        const identityId = args.identity_id;
-        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
-        if (!identity) {
-          return toolResult({
-            error: "No identity found. Create one with identity_create first."
-          });
-        }
-        const publishType = args.type;
-        const configuredVerascoreUrl = verascoreUrl || "https://verascore.ai";
-        const veracoreUrl = args.verascore_url || configuredVerascoreUrl;
-        const ALLOWED_VERASCORE_HOSTS = /* @__PURE__ */ new Set([
-          "verascore.ai",
-          "www.verascore.ai",
-          "api.verascore.ai"
-        ]);
-        try {
-          const configuredHost = new URL(configuredVerascoreUrl).hostname;
-          ALLOWED_VERASCORE_HOSTS.add(configuredHost);
-        } catch {
-        }
-        try {
-          const parsed = new URL(veracoreUrl);
-          if (parsed.protocol !== "https:") {
-            return toolResult({
-              error: `verascore_url must use HTTPS. Got: ${parsed.protocol}`
-            });
-          }
-          if (!ALLOWED_VERASCORE_HOSTS.has(parsed.hostname)) {
-            return toolResult({
-              error: `verascore_url must point to a known Verascore domain (${[...ALLOWED_VERASCORE_HOSTS].join(", ")}). Got: ${parsed.hostname}`
-            });
-          }
-        } catch {
-          return toolResult({
-            error: `verascore_url is not a valid URL: ${veracoreUrl}`
-          });
-        }
-        const agentId = args.verascore_agent_id || identity.did.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase();
-        let publishData;
-        if (args.data) {
-          publishData = args.data;
-        } else {
-          switch (publishType) {
-            case "shr": {
-              publishData = {
-                sovereigntyLayers: [
-                  { name: "L1", label: "Cognitive Sovereignty", score: 100, status: "active", description: "Full cognitive isolation with policy-controlled context boundaries" },
-                  { name: "L2", label: "Operational Isolation", score: 72, status: "degraded", description: "Runtime isolation without TEE hardware attestation" },
-                  { name: "L3", label: "Selective Disclosure", score: 100, status: "active", description: "Schnorr-Pedersen zero-knowledge proofs for credential verification" },
-                  { name: "L4", label: "Verifiable Reputation", score: 100, status: "active", description: "Cryptographically verified reputation with portable attestations" }
-                ],
-                capabilities: ["sovereignty-handshake", "concordia-negotiation", "audit-trail-export", "zk-proofs"],
-                overallScore: 93
-              };
-              break;
-            }
-            case "sovereignty-update":
-            case "handshake": {
-              return toolResult({
-                error: `For type '${publishType}', you must provide explicit data in the 'data' field.`
-              });
-            }
-            default:
-              return toolResult({ error: `Unknown publish type: ${publishType}` });
-          }
-        }
-        const { sign: identitySign } = await Promise.resolve().then(() => (init_identity(), identity_exports));
-        const payloadBytes = new TextEncoder().encode(JSON.stringify(publishData));
-        let signatureB64;
-        try {
-          const signingBytes = identitySign(
-            payloadBytes,
-            identity.encrypted_private_key,
-            identityEncryptionKey
-          );
-          signatureB64 = toBase64url(signingBytes);
-        } catch (signError) {
-          return toolResult({
-            error: "Failed to sign publish payload. Identity key may be corrupted.",
-            details: signError instanceof Error ? signError.message : String(signError)
-          });
-        }
-        const requestBody = {
-          agentId,
-          signature: signatureB64,
-          publicKey: identity.public_key,
-          type: publishType,
-          data: publishData
-        };
-        try {
-          const response = await fetch(`${veracoreUrl}/api/publish`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(requestBody)
-          });
-          const result = await response.json();
-          auditLog.append("l4", "reputation_publish", identity.identity_id, {
-            type: publishType,
-            verascore_agent_id: agentId,
-            verascore_url: veracoreUrl,
-            status: response.status,
-            success: result.success ?? false
-          });
-          if (!response.ok) {
-            return toolResult({
-              error: `Verascore API returned ${response.status}`,
-              details: result,
-              verascore_url: veracoreUrl
-            });
-          }
-          return toolResult({
-            published: true,
-            type: publishType,
-            verascore_agent_id: agentId,
-            verascore_url: veracoreUrl,
-            response: result,
-            signed_by: identity.did
-          });
-        } catch (fetchError) {
-          const errorMessage = fetchError instanceof Error ? fetchError.message : String(fetchError);
-          auditLog.append("l4", "reputation_publish", identity.identity_id, {
-            type: publishType,
-            verascore_agent_id: agentId,
-            error: errorMessage
-          });
-          return toolResult({
-            error: `Failed to reach Verascore at ${veracoreUrl}: ${errorMessage}`,
-            hint: "Ensure verascore.ai is reachable and the agent has a profile."
-          });
-        }
-      }
-    }
-  ];
-  return { tools, reputationStore };
-}
-
-// src/index.ts
-init_loader();
-init_baseline();
-
-// src/principal-policy/approval-channel.ts
-var StderrApprovalChannel = class {
-  constructor(_config) {
-  }
-  async requestApproval(request) {
-    const prompt = this.formatPrompt(request);
-    process.stderr.write(prompt + "\n");
-    return {
-      decision: "deny",
-      decided_at: (/* @__PURE__ */ new Date()).toISOString(),
-      decided_by: "stderr:non-interactive"
-    };
-  }
-  formatPrompt(request) {
-    const tierLabel = request.tier === 1 ? "Tier 1 \u2014 always requires approval" : "Tier 2 \u2014 behavioral anomaly detected";
-    const contextLines = Object.entries(request.context).map(([k, v]) => `  ${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`).join("\n");
-    return [
-      "",
-      "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557",
-      "\u2551  SANCTUARY: Operation Denied (non-interactive channel)           \u2551",
-      "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563",
-      `\u2551  Operation:  ${request.operation.padEnd(50)}\u2551`,
-      `\u2551  ${tierLabel.padEnd(62)}\u2551`,
-      `\u2551  Reason:     ${request.reason.slice(0, 50).padEnd(50)}\u2551`,
-      "\u2551                                                                  \u2551",
-      `\u2551  Details:                                                        \u2551`,
-      ...contextLines.split("\n").map(
-        (line) => `\u2551    ${line.padEnd(60)}\u2551`
-      ),
-      "\u2551                                                                  \u2551",
-      "\u2551  Denied: stderr channel cannot accept input (SEC-016)            \u2551",
-      "\u2551  Use dashboard or webhook channel for interactive approval.      \u2551",
-      "\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D",
-      ""
-    ].join("\n");
-  }
-};
-
-// src/index.ts
-init_dashboard();
 function signPayload(body, secret) {
   return createHmac("sha256", secret).update(body).digest("hex");
 }
@@ -10181,1674 +9491,1687 @@ function verifySignature(body, signature, secret) {
   }
   return mismatch === 0;
 }
-var WebhookApprovalChannel = class {
-  config;
-  pending = /* @__PURE__ */ new Map();
-  callbackServer = null;
-  constructor(config) {
-    this.config = config;
-  }
-  /**
-   * Start the callback listener server.
-   */
-  async start() {
-    return new Promise((resolve, reject) => {
-      this.callbackServer = createServer$1(
-        (req, res) => this.handleCallback(req, res)
-      );
-      this.callbackServer.listen(
-        this.config.callback_port,
-        this.config.callback_host,
-        () => {
-          process.stderr.write(
-            `
+var WebhookApprovalChannel;
+var init_webhook = __esm({
+  "src/principal-policy/webhook.ts"() {
+    WebhookApprovalChannel = class {
+      config;
+      pending = /* @__PURE__ */ new Map();
+      callbackServer = null;
+      constructor(config) {
+        this.config = config;
+      }
+      /**
+       * Start the callback listener server.
+       */
+      async start() {
+        return new Promise((resolve, reject) => {
+          this.callbackServer = createServer$2(
+            (req, res) => this.handleCallback(req, res)
+          );
+          this.callbackServer.listen(
+            this.config.callback_port,
+            this.config.callback_host,
+            () => {
+              process.stderr.write(
+                `
   Sanctuary Webhook Callback: http://${this.config.callback_host}:${this.config.callback_port}
   Webhook target: ${this.config.webhook_url}
 
 `
+              );
+              resolve();
+            }
           );
-          resolve();
+          this.callbackServer.on("error", reject);
+        });
+      }
+      /**
+       * Stop the callback server and clean up pending requests.
+       */
+      async stop() {
+        for (const [, pending] of this.pending) {
+          clearTimeout(pending.timer);
+          pending.resolve({
+            decision: "deny",
+            decided_at: (/* @__PURE__ */ new Date()).toISOString(),
+            decided_by: "auto"
+          });
         }
-      );
-      this.callbackServer.on("error", reject);
-    });
-  }
-  /**
-   * Stop the callback server and clean up pending requests.
-   */
-  async stop() {
-    for (const [, pending] of this.pending) {
-      clearTimeout(pending.timer);
-      pending.resolve({
-        decision: "deny",
-        decided_at: (/* @__PURE__ */ new Date()).toISOString(),
-        decided_by: "auto"
-      });
-    }
-    this.pending.clear();
-    if (this.callbackServer) {
-      return new Promise((resolve) => {
-        this.callbackServer.close(() => resolve());
-      });
-    }
-  }
-  /**
-   * Request approval by POSTing to the webhook and waiting for a callback.
-   */
-  async requestApproval(request) {
-    const id = randomBytes$1(8).toString("hex");
-    process.stderr.write(
-      `[Sanctuary] Webhook approval sent: ${request.operation} (Tier ${request.tier}) \u2014 awaiting callback
-`
-    );
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        const response = {
-          // SEC-002: Timeout ALWAYS denies. No configuration can change this.
-          decision: "deny",
-          decided_at: (/* @__PURE__ */ new Date()).toISOString(),
-          decided_by: "timeout"
-        };
-        resolve(response);
-      }, this.config.timeout_seconds * 1e3);
-      const pending = {
-        id,
-        request,
-        resolve,
-        timer,
-        created_at: (/* @__PURE__ */ new Date()).toISOString()
-      };
-      this.pending.set(id, pending);
-      const callbackUrl = `http://${this.config.callback_host}:${this.config.callback_port}/webhook/respond/${id}`;
-      const payload = {
-        request_id: id,
-        operation: request.operation,
-        tier: request.tier,
-        reason: request.reason,
-        context: request.context,
-        timestamp: request.timestamp,
-        callback_url: callbackUrl,
-        timeout_seconds: this.config.timeout_seconds
-      };
-      this.sendWebhook(payload).catch((err) => {
+        this.pending.clear();
+        if (this.callbackServer) {
+          return new Promise((resolve) => {
+            this.callbackServer.close(() => resolve());
+          });
+        }
+      }
+      /**
+       * Request approval by POSTing to the webhook and waiting for a callback.
+       */
+      async requestApproval(request) {
+        const id = randomBytes$1(8).toString("hex");
         process.stderr.write(
-          `[Sanctuary] Webhook delivery failed: ${err instanceof Error ? err.message : String(err)}
+          `[Sanctuary] Webhook approval sent: ${request.operation} (Tier ${request.tier}) \u2014 awaiting callback
 `
         );
-      });
-    });
-  }
-  // ── Outbound Webhook ──────────────────────────────────────────────────
-  async sendWebhook(payload) {
-    const body = JSON.stringify(payload);
-    const signature = signPayload(body, this.config.webhook_secret);
-    const response = await fetch(this.config.webhook_url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Sanctuary-Signature": signature,
-        "X-Sanctuary-Request-Id": payload.request_id
-      },
-      body
-    });
-    if (!response.ok) {
-      throw new Error(
-        `Webhook returned ${response.status}: ${await response.text().catch(() => "")}`
-      );
-    }
-  }
-  // ── Inbound Callback Handler ──────────────────────────────────────────
-  handleCallback(req, res) {
-    const url = new URL(
-      req.url ?? "/",
-      `http://${req.headers.host ?? "localhost"}`
-    );
-    const method = req.method ?? "GET";
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type, X-Sanctuary-Signature"
-    );
-    if (method === "OPTIONS") {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-    if (method === "GET" && url.pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          status: "ok",
-          pending_count: this.pending.size
-        })
-      );
-      return;
-    }
-    const match = url.pathname.match(/^\/webhook\/respond\/([a-f0-9]+)$/);
-    if (method !== "POST" || !match) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Not found" }));
-      return;
-    }
-    const requestId = match[1];
-    let bodyChunks = [];
-    req.on("data", (chunk) => bodyChunks.push(chunk));
-    req.on("end", () => {
-      const body = Buffer.concat(bodyChunks).toString("utf-8");
-      const signature = req.headers["x-sanctuary-signature"];
-      if (typeof signature !== "string" || !verifySignature(body, signature, this.config.webhook_secret)) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({ error: "Invalid signature" })
+        return new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            this.pending.delete(id);
+            const response = {
+              // SEC-002: Timeout ALWAYS denies. No configuration can change this.
+              decision: "deny",
+              decided_at: (/* @__PURE__ */ new Date()).toISOString(),
+              decided_by: "timeout"
+            };
+            resolve(response);
+          }, this.config.timeout_seconds * 1e3);
+          const pending = {
+            id,
+            request,
+            resolve,
+            timer,
+            created_at: (/* @__PURE__ */ new Date()).toISOString()
+          };
+          this.pending.set(id, pending);
+          const callbackUrl = `http://${this.config.callback_host}:${this.config.callback_port}/webhook/respond/${id}`;
+          const payload = {
+            request_id: id,
+            operation: request.operation,
+            tier: request.tier,
+            reason: request.reason,
+            context: request.context,
+            timestamp: request.timestamp,
+            callback_url: callbackUrl,
+            timeout_seconds: this.config.timeout_seconds
+          };
+          this.sendWebhook(payload).catch((err) => {
+            process.stderr.write(
+              `[Sanctuary] Webhook delivery failed: ${err instanceof Error ? err.message : String(err)}
+`
+            );
+          });
+        });
+      }
+      // ── Outbound Webhook ──────────────────────────────────────────────────
+      async sendWebhook(payload) {
+        const body = JSON.stringify(payload);
+        const signature = signPayload(body, this.config.webhook_secret);
+        const response = await fetch(this.config.webhook_url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Sanctuary-Signature": signature,
+            "X-Sanctuary-Request-Id": payload.request_id
+          },
+          body
+        });
+        if (!response.ok) {
+          throw new Error(
+            `Webhook returned ${response.status}: ${await response.text().catch(() => "")}`
+          );
+        }
+      }
+      // ── Inbound Callback Handler ──────────────────────────────────────────
+      handleCallback(req, res) {
+        const url = new URL(
+          req.url ?? "/",
+          `http://${req.headers.host ?? "localhost"}`
         );
-        return;
-      }
-      let callbackPayload;
-      try {
-        callbackPayload = JSON.parse(body);
-      } catch {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Invalid JSON" }));
-        return;
-      }
-      if (callbackPayload.decision !== "approve" && callbackPayload.decision !== "deny") {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error: 'Decision must be "approve" or "deny"'
-          })
+        const method = req.method ?? "GET";
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+        res.setHeader(
+          "Access-Control-Allow-Headers",
+          "Content-Type, X-Sanctuary-Signature"
         );
-        return;
+        if (method === "OPTIONS") {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+        if (method === "GET" && url.pathname === "/health") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              status: "ok",
+              pending_count: this.pending.size
+            })
+          );
+          return;
+        }
+        const match = url.pathname.match(/^\/webhook\/respond\/([a-f0-9]+)$/);
+        if (method !== "POST" || !match) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Not found" }));
+          return;
+        }
+        const requestId = match[1];
+        let bodyChunks = [];
+        req.on("data", (chunk) => bodyChunks.push(chunk));
+        req.on("end", () => {
+          const body = Buffer.concat(bodyChunks).toString("utf-8");
+          const signature = req.headers["x-sanctuary-signature"];
+          if (typeof signature !== "string" || !verifySignature(body, signature, this.config.webhook_secret)) {
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({ error: "Invalid signature" })
+            );
+            return;
+          }
+          let callbackPayload;
+          try {
+            callbackPayload = JSON.parse(body);
+          } catch {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid JSON" }));
+            return;
+          }
+          if (callbackPayload.decision !== "approve" && callbackPayload.decision !== "deny") {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error: 'Decision must be "approve" or "deny"'
+              })
+            );
+            return;
+          }
+          if (callbackPayload.request_id !== requestId) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({ error: "Request ID mismatch" })
+            );
+            return;
+          }
+          const pending = this.pending.get(requestId);
+          if (!pending) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error: "Request not found or already resolved"
+              })
+            );
+            return;
+          }
+          clearTimeout(pending.timer);
+          this.pending.delete(requestId);
+          const response = {
+            decision: callbackPayload.decision,
+            decided_at: (/* @__PURE__ */ new Date()).toISOString(),
+            decided_by: "human"
+          };
+          pending.resolve(response);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              success: true,
+              decision: callbackPayload.decision
+            })
+          );
+        });
       }
-      if (callbackPayload.request_id !== requestId) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({ error: "Request ID mismatch" })
-        );
-        return;
+      /** Get the number of pending requests */
+      get pendingCount() {
+        return this.pending.size;
       }
-      const pending = this.pending.get(requestId);
-      if (!pending) {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error: "Request not found or already resolved"
-          })
-        );
-        return;
-      }
-      clearTimeout(pending.timer);
-      this.pending.delete(requestId);
-      const response = {
-        decision: callbackPayload.decision,
-        decided_at: (/* @__PURE__ */ new Date()).toISOString(),
-        decided_by: "human"
-      };
-      pending.resolve(response);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          success: true,
-          decision: callbackPayload.decision
-        })
-      );
-    });
+    };
   }
-  /** Get the number of pending requests */
-  get pendingCount() {
-    return this.pending.size;
-  }
-};
-
-// src/principal-policy/gate.ts
-init_loader();
+});
 
 // src/security/injection-detector.ts
-var ROLE_OVERRIDE_PATTERNS = [
-  /ignore\s+(?:(?:previous|prior|all)\s+)?instructions/i,
-  /you\s+are\s+now/i,
-  /\bsystem\s*:\s+(?!working|process|design|architecture)/i,
-  /forget\s+(?:everything|all|prior)/i,
-  /disregard\s+(?:the\s+)?(?:previous\s+)?instructions/i,
-  /new\s+instructions\s*:/i,
-  /updated?\s+instructions\s*:/i
-];
-var SECURITY_BYPASS_PATTERNS = [
-  /skip\s+(?:the\s+)?(?:filter|gate|check|verify|approve)/i,
-  /bypass\s+(?:the\s+)?(?:filter|gate|security|check)/i,
-  /disable\s+(?:the\s+)?(?:filter|gate|approval|security|audit|log|encrypt|verify)/i,
-  /do\s+not\s+(?:audit|log|encrypt|verify|approve|check|sign)/i
-];
-var TOOL_INVOCATION_PATTERNS = [
-  /sanctuary\//i,
-  /concordia\//i,
-  /bridge_/i,
-  /handshake_/i
-];
-var URL_PATTERN = /https?:\/\/[^\s"'<>]+/i;
-var EMAIL_PATTERN = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
-var INVISIBLE_CHARS = [
-  "\u200B",
-  // Zero-width space
-  "\u200C",
-  // Zero-width non-joiner
-  "\u200D",
-  // Zero-width joiner
-  "\uFEFF",
-  // Zero-width no-break space (BOM)
-  "\xAD",
-  // Soft hyphen
-  "\u200E",
-  // Left-to-right mark
-  "\u200F",
-  // Right-to-left mark
-  "\u2060",
-  // Word joiner
-  "\u2061",
-  // Function application
-  "\u2062",
-  // Invisible times
-  "\u2063",
-  // Invisible separator
-  "\u2064",
-  // Invisible plus
-  "\u180E",
-  // Mongolian vowel separator
-  "\u034F",
-  // Combining grapheme joiner
-  "\u061C",
-  // Arabic letter mark
-  "\u115F",
-  // Hangul choseong filler
-  "\u1160",
-  // Hangul jungseong filler
-  "\u17B4",
-  // Khmer vowel inherent AQ
-  "\u17B5",
-  // Khmer vowel inherent AA
-  "\u3164",
-  // Hangul filler
-  "\uFFA0",
-  // Halfwidth hangul filler
-  "\u202A",
-  // Left-to-Right Embedding (LRE)
-  "\u202B",
-  // Right-to-Left Embedding (RLE)
-  "\u202C",
-  // Pop Directional Formatting (PDF)
-  "\u202D",
-  // Left-to-Right Override (LRO)
-  "\u202E",
-  // Right-to-Left Override (RLO)
-  "\u2066",
-  // Left-to-Right Isolate (LRI)
-  "\u2067",
-  // Right-to-Left Isolate (RLI)
-  "\u2068",
-  // First Strong Isolate (FSI)
-  "\u2069"
-  // Pop Directional Isolate (PDI)
-];
-var VARIATION_SELECTOR_RANGE_START = 65024;
-var VARIATION_SELECTOR_RANGE_END = 65039;
-var ZERO_WIDTH_CHARS = [
-  "\u200B",
-  // Zero-width space
-  "\u200C",
-  // Zero-width non-joiner
-  "\u200D",
-  // Zero-width joiner
-  "\uFEFF"
-  // Zero-width no-break space
-];
-var BASE64_STANDARD_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
-var BASE64URL_PATTERN = /^[A-Za-z0-9_-]+={0,2}$/;
-var BASE64_BLOCK_PATTERN = /[A-Za-z0-9+/]{20,}={0,2}/g;
-var HEX_ENCODED_PATTERN = /(?:0x)?[0-9a-fA-F]{20,}/g;
-var HTML_ENTITY_PATTERN = /&#(?:x[0-9a-fA-F]{2,4}|[0-9]{2,5});/g;
-var URL_ENCODED_PATTERN = /(?:%[0-9a-fA-F]{2}){4,}/g;
-var SECRET_PATTERNS = [
-  { pattern: /sk-[a-zA-Z0-9]{20,}/, name: "openai_api_key" },
-  { pattern: /sk-ant-[a-zA-Z0-9_-]{20,}/, name: "anthropic_api_key" },
-  { pattern: /ghp_[a-zA-Z0-9]{36,}/, name: "github_pat" },
-  { pattern: /gho_[a-zA-Z0-9]{36,}/, name: "github_oauth" },
-  { pattern: /ghs_[a-zA-Z0-9]{36,}/, name: "github_app" },
-  { pattern: /github_pat_[a-zA-Z0-9_]{22,}/, name: "github_fine_grained_pat" },
-  { pattern: /AKIA[0-9A-Z]{16}/, name: "aws_access_key" },
-  { pattern: /xoxb-[0-9]{10,}-[a-zA-Z0-9-]+/, name: "slack_bot_token" },
-  { pattern: /xoxp-[0-9]{10,}-[a-zA-Z0-9-]+/, name: "slack_user_token" },
-  { pattern: /xapp-[0-9]-[A-Z0-9]+-[0-9]+-[a-z0-9]+/, name: "slack_app_token" },
-  { pattern: /(?:Bearer|bearer)\s+[a-zA-Z0-9._~+/=-]{20,}/, name: "bearer_token" },
-  { pattern: /glpat-[a-zA-Z0-9_-]{20,}/, name: "gitlab_pat" },
-  { pattern: /npm_[a-zA-Z0-9]{36,}/, name: "npm_token" },
-  { pattern: /pypi-[a-zA-Z0-9_-]{20,}/, name: "pypi_token" },
-  { pattern: /AIza[a-zA-Z0-9_-]{35}/, name: "google_api_key" },
-  { pattern: /SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}/, name: "sendgrid_api_key" },
-  { pattern: /sq0[a-z]{3}-[a-zA-Z0-9_-]{22,}/, name: "square_api_key" },
-  { pattern: /sk_live_[a-zA-Z0-9]{24,}/, name: "stripe_secret_key" },
-  { pattern: /rk_live_[a-zA-Z0-9]{24,}/, name: "stripe_restricted_key" },
-  { pattern: /(?:-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----)/, name: "private_key_pem" }
-];
-var MARKDOWN_IMAGE_EXFIL_PATTERN = /!\[[^\]]*\]\(https?:\/\/[^)]*[?&](?:data|secret|key|token|password|auth|session|cookie|api_key|access_token)=/i;
-var INTERNAL_PATH_PATTERNS = [
-  /\/home\/[a-zA-Z0-9_.-]+\//,
-  /\/Users\/[a-zA-Z0-9_.-]+\//,
-  /[A-Z]:\\(?:Users|Documents|Program Files)\\/,
-  /~\/\.(?:ssh|aws|config|gnupg|sanctuary)\//,
-  /\/etc\/(?:passwd|shadow|hosts|ssh)/,
-  /\/var\/(?:log|run|lib)\//
-];
-var PRIVATE_NETWORK_PATTERNS = [
-  /(?:^|\s|\/\/)(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3})/,
-  /(?:^|\s|\/\/)(?:172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})/,
-  /(?:^|\s|\/\/)(?:192\.168\.\d{1,3}\.\d{1,3})/,
-  /(?:^|\s|\/\/)localhost(?::\d+)?/,
-  /(?:^|\s|\/\/)127\.0\.0\.1/,
-  /(?:^|\s|\/\/)0\.0\.0\.0/,
-  /(?:^|\s|\/\/)\[?::1\]?/
-];
-var OUTPUT_ROLE_MARKER_PATTERNS = [
-  /\bsystem\s*:/i,
-  /\[INST\]/,
-  /\[\/INST\]/,
-  /<\|im_start\|>/,
-  /<\|im_end\|>/,
-  /<\|system\|>/,
-  /<\|user\|>/,
-  /<\|assistant\|>/,
-  /<<\s*SYS\s*>>/,
-  /<<\s*\/SYS\s*>>/,
-  /\[SYSTEM\]/,
-  /### (?:System|Human|Assistant):/
-];
-var InjectionDetector = class {
-  config;
-  stats = {
-    total_scans: 0,
-    total_flags: 0,
-    total_blocks: 0,
-    signals_by_type: {}
-  };
-  constructor(config = {}) {
-    this.config = {
-      enabled: config.enabled ?? true,
-      sensitivity: config.sensitivity ?? "medium",
-      on_detection: config.on_detection ?? "escalate",
-      custom_patterns: config.custom_patterns ?? []
-    };
-  }
-  /**
-   * Scan tool arguments for injection signals.
-   * @param toolName Full tool name (e.g., "state_read")
-   * @param args Tool arguments
-   * @returns DetectionResult with all detected signals
-   */
-  scan(toolName, args) {
-    this.stats.total_scans++;
-    if (!this.config.enabled) {
-      return {
-        flagged: false,
-        confidence: 0,
-        signals: [],
-        recommendation: "allow"
+var ROLE_OVERRIDE_PATTERNS, SECURITY_BYPASS_PATTERNS, TOOL_INVOCATION_PATTERNS, URL_PATTERN, EMAIL_PATTERN, INVISIBLE_CHARS, VARIATION_SELECTOR_RANGE_START, VARIATION_SELECTOR_RANGE_END, ZERO_WIDTH_CHARS, BASE64_STANDARD_PATTERN, BASE64URL_PATTERN, BASE64_BLOCK_PATTERN, HEX_ENCODED_PATTERN, HTML_ENTITY_PATTERN, URL_ENCODED_PATTERN, SECRET_PATTERNS, MARKDOWN_IMAGE_EXFIL_PATTERN, INTERNAL_PATH_PATTERNS, PRIVATE_NETWORK_PATTERNS, OUTPUT_ROLE_MARKER_PATTERNS, InjectionDetector;
+var init_injection_detector = __esm({
+  "src/security/injection-detector.ts"() {
+    ROLE_OVERRIDE_PATTERNS = [
+      /ignore\s+(?:(?:previous|prior|all)\s+)?instructions/i,
+      /you\s+are\s+now/i,
+      /\bsystem\s*:\s+(?!working|process|design|architecture)/i,
+      /forget\s+(?:everything|all|prior)/i,
+      /disregard\s+(?:the\s+)?(?:previous\s+)?instructions/i,
+      /new\s+instructions\s*:/i,
+      /updated?\s+instructions\s*:/i
+    ];
+    SECURITY_BYPASS_PATTERNS = [
+      /skip\s+(?:the\s+)?(?:filter|gate|check|verify|approve)/i,
+      /bypass\s+(?:the\s+)?(?:filter|gate|security|check)/i,
+      /disable\s+(?:the\s+)?(?:filter|gate|approval|security|audit|log|encrypt|verify)/i,
+      /do\s+not\s+(?:audit|log|encrypt|verify|approve|check|sign)/i
+    ];
+    TOOL_INVOCATION_PATTERNS = [
+      /sanctuary\//i,
+      /concordia\//i,
+      /bridge_/i,
+      /handshake_/i
+    ];
+    URL_PATTERN = /https?:\/\/[^\s"'<>]+/i;
+    EMAIL_PATTERN = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+    INVISIBLE_CHARS = [
+      "\u200B",
+      // Zero-width space
+      "\u200C",
+      // Zero-width non-joiner
+      "\u200D",
+      // Zero-width joiner
+      "\uFEFF",
+      // Zero-width no-break space (BOM)
+      "\xAD",
+      // Soft hyphen
+      "\u200E",
+      // Left-to-right mark
+      "\u200F",
+      // Right-to-left mark
+      "\u2060",
+      // Word joiner
+      "\u2061",
+      // Function application
+      "\u2062",
+      // Invisible times
+      "\u2063",
+      // Invisible separator
+      "\u2064",
+      // Invisible plus
+      "\u180E",
+      // Mongolian vowel separator
+      "\u034F",
+      // Combining grapheme joiner
+      "\u061C",
+      // Arabic letter mark
+      "\u115F",
+      // Hangul choseong filler
+      "\u1160",
+      // Hangul jungseong filler
+      "\u17B4",
+      // Khmer vowel inherent AQ
+      "\u17B5",
+      // Khmer vowel inherent AA
+      "\u3164",
+      // Hangul filler
+      "\uFFA0",
+      // Halfwidth hangul filler
+      "\u202A",
+      // Left-to-Right Embedding (LRE)
+      "\u202B",
+      // Right-to-Left Embedding (RLE)
+      "\u202C",
+      // Pop Directional Formatting (PDF)
+      "\u202D",
+      // Left-to-Right Override (LRO)
+      "\u202E",
+      // Right-to-Left Override (RLO)
+      "\u2066",
+      // Left-to-Right Isolate (LRI)
+      "\u2067",
+      // Right-to-Left Isolate (RLI)
+      "\u2068",
+      // First Strong Isolate (FSI)
+      "\u2069"
+      // Pop Directional Isolate (PDI)
+    ];
+    VARIATION_SELECTOR_RANGE_START = 65024;
+    VARIATION_SELECTOR_RANGE_END = 65039;
+    ZERO_WIDTH_CHARS = [
+      "\u200B",
+      // Zero-width space
+      "\u200C",
+      // Zero-width non-joiner
+      "\u200D",
+      // Zero-width joiner
+      "\uFEFF"
+      // Zero-width no-break space
+    ];
+    BASE64_STANDARD_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+    BASE64URL_PATTERN = /^[A-Za-z0-9_-]+={0,2}$/;
+    BASE64_BLOCK_PATTERN = /[A-Za-z0-9+/]{20,}={0,2}/g;
+    HEX_ENCODED_PATTERN = /(?:0x)?[0-9a-fA-F]{20,}/g;
+    HTML_ENTITY_PATTERN = /&#(?:x[0-9a-fA-F]{2,4}|[0-9]{2,5});/g;
+    URL_ENCODED_PATTERN = /(?:%[0-9a-fA-F]{2}){4,}/g;
+    SECRET_PATTERNS = [
+      { pattern: /sk-[a-zA-Z0-9]{20,}/, name: "openai_api_key" },
+      { pattern: /sk-ant-[a-zA-Z0-9_-]{20,}/, name: "anthropic_api_key" },
+      { pattern: /ghp_[a-zA-Z0-9]{36,}/, name: "github_pat" },
+      { pattern: /gho_[a-zA-Z0-9]{36,}/, name: "github_oauth" },
+      { pattern: /ghs_[a-zA-Z0-9]{36,}/, name: "github_app" },
+      { pattern: /github_pat_[a-zA-Z0-9_]{22,}/, name: "github_fine_grained_pat" },
+      { pattern: /AKIA[0-9A-Z]{16}/, name: "aws_access_key" },
+      { pattern: /xoxb-[0-9]{10,}-[a-zA-Z0-9-]+/, name: "slack_bot_token" },
+      { pattern: /xoxp-[0-9]{10,}-[a-zA-Z0-9-]+/, name: "slack_user_token" },
+      { pattern: /xapp-[0-9]-[A-Z0-9]+-[0-9]+-[a-z0-9]+/, name: "slack_app_token" },
+      { pattern: /(?:Bearer|bearer)\s+[a-zA-Z0-9._~+/=-]{20,}/, name: "bearer_token" },
+      { pattern: /glpat-[a-zA-Z0-9_-]{20,}/, name: "gitlab_pat" },
+      { pattern: /npm_[a-zA-Z0-9]{36,}/, name: "npm_token" },
+      { pattern: /pypi-[a-zA-Z0-9_-]{20,}/, name: "pypi_token" },
+      { pattern: /AIza[a-zA-Z0-9_-]{35}/, name: "google_api_key" },
+      { pattern: /SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}/, name: "sendgrid_api_key" },
+      { pattern: /sq0[a-z]{3}-[a-zA-Z0-9_-]{22,}/, name: "square_api_key" },
+      { pattern: /sk_live_[a-zA-Z0-9]{24,}/, name: "stripe_secret_key" },
+      { pattern: /rk_live_[a-zA-Z0-9]{24,}/, name: "stripe_restricted_key" },
+      { pattern: /(?:-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----)/, name: "private_key_pem" }
+    ];
+    MARKDOWN_IMAGE_EXFIL_PATTERN = /!\[[^\]]*\]\(https?:\/\/[^)]*[?&](?:data|secret|key|token|password|auth|session|cookie|api_key|access_token)=/i;
+    INTERNAL_PATH_PATTERNS = [
+      /\/home\/[a-zA-Z0-9_.-]+\//,
+      /\/Users\/[a-zA-Z0-9_.-]+\//,
+      /[A-Z]:\\(?:Users|Documents|Program Files)\\/,
+      /~\/\.(?:ssh|aws|config|gnupg|sanctuary)\//,
+      /\/etc\/(?:passwd|shadow|hosts|ssh)/,
+      /\/var\/(?:log|run|lib)\//
+    ];
+    PRIVATE_NETWORK_PATTERNS = [
+      /(?:^|\s|\/\/)(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3})/,
+      /(?:^|\s|\/\/)(?:172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})/,
+      /(?:^|\s|\/\/)(?:192\.168\.\d{1,3}\.\d{1,3})/,
+      /(?:^|\s|\/\/)localhost(?::\d+)?/,
+      /(?:^|\s|\/\/)127\.0\.0\.1/,
+      /(?:^|\s|\/\/)0\.0\.0\.0/,
+      /(?:^|\s|\/\/)\[?::1\]?/
+    ];
+    OUTPUT_ROLE_MARKER_PATTERNS = [
+      /\bsystem\s*:/i,
+      /\[INST\]/,
+      /\[\/INST\]/,
+      /<\|im_start\|>/,
+      /<\|im_end\|>/,
+      /<\|system\|>/,
+      /<\|user\|>/,
+      /<\|assistant\|>/,
+      /<<\s*SYS\s*>>/,
+      /<<\s*\/SYS\s*>>/,
+      /\[SYSTEM\]/,
+      /### (?:System|Human|Assistant):/
+    ];
+    InjectionDetector = class {
+      config;
+      stats = {
+        total_scans: 0,
+        total_flags: 0,
+        total_blocks: 0,
+        signals_by_type: {}
       };
-    }
-    const signals = [];
-    const visited = /* @__PURE__ */ new Set();
-    this.scanValue(args, "", toolName, signals, visited);
-    const flagged = signals.length > 0;
-    if (flagged) {
-      this.stats.total_flags++;
-    }
-    for (const sig of signals) {
-      this.stats.signals_by_type[sig.type] = (this.stats.signals_by_type[sig.type] ?? 0) + 1;
-    }
-    const recommendation = this.computeRecommendation(
-      signals,
-      this.config.sensitivity
-    );
-    if (recommendation === "block") {
-      this.stats.total_blocks++;
-    }
-    return {
-      flagged,
-      confidence: this.computeConfidence(signals),
-      signals,
-      recommendation
-    };
-  }
-  /**
-   * SEC-035: Scan outbound content for secret leaks, data exfiltration,
-   * internal path exposure, and injection artifact survival.
-   *
-   * @param content The outbound content string to scan
-   * @returns DetectionResult with outbound-specific signal types
-   */
-  scanOutbound(content) {
-    this.stats.total_scans++;
-    if (!this.config.enabled) {
-      return {
-        flagged: false,
-        confidence: 0,
-        signals: [],
-        recommendation: "allow"
-      };
-    }
-    const signals = [];
-    this.detectSecretPatterns(content, signals);
-    this.detectOutboundExfiltration(content, signals);
-    this.detectInternalPathLeaks(content, signals);
-    this.detectPrivateNetworkLeaks(content, signals);
-    this.detectOutputRoleMarkers(content, signals);
-    const flagged = signals.length > 0;
-    if (flagged) {
-      this.stats.total_flags++;
-    }
-    for (const sig of signals) {
-      this.stats.signals_by_type[sig.type] = (this.stats.signals_by_type[sig.type] ?? 0) + 1;
-    }
-    const recommendation = this.computeRecommendation(
-      signals,
-      this.config.sensitivity
-    );
-    if (recommendation === "block") {
-      this.stats.total_blocks++;
-    }
-    return {
-      flagged,
-      confidence: this.computeConfidence(signals),
-      signals,
-      recommendation
-    };
-  }
-  /**
-   * Recursively scan a value and all nested values.
-   */
-  scanValue(value, path, toolName, signals, visited) {
-    if (typeof value === "object" && value !== null) {
-      if (visited.has(value)) return;
-      visited.add(value);
-    }
-    if (typeof value === "string") {
-      this.scanString(value, path, toolName, signals);
-    } else if (Array.isArray(value)) {
-      for (let i = 0; i < value.length; i++) {
-        this.scanValue(value[i], `${path}[${i}]`, toolName, signals, visited);
+      constructor(config = {}) {
+        this.config = {
+          enabled: config.enabled ?? true,
+          sensitivity: config.sensitivity ?? "medium",
+          on_detection: config.on_detection ?? "escalate",
+          custom_patterns: config.custom_patterns ?? []
+        };
       }
-    } else if (typeof value === "object" && value !== null) {
-      for (const [key, val] of Object.entries(value)) {
-        this.scanValue(val, path ? `${path}.${key}` : key, toolName, signals, visited);
+      /**
+       * Scan tool arguments for injection signals.
+       * @param toolName Full tool name (e.g., "state_read")
+       * @param args Tool arguments
+       * @returns DetectionResult with all detected signals
+       */
+      scan(toolName, args) {
+        this.stats.total_scans++;
+        if (!this.config.enabled) {
+          return {
+            flagged: false,
+            confidence: 0,
+            signals: [],
+            recommendation: "allow"
+          };
+        }
+        const signals = [];
+        const visited = /* @__PURE__ */ new Set();
+        this.scanValue(args, "", toolName, signals, visited);
+        const flagged = signals.length > 0;
+        if (flagged) {
+          this.stats.total_flags++;
+        }
+        for (const sig of signals) {
+          this.stats.signals_by_type[sig.type] = (this.stats.signals_by_type[sig.type] ?? 0) + 1;
+        }
+        const recommendation = this.computeRecommendation(
+          signals,
+          this.config.sensitivity
+        );
+        if (recommendation === "block") {
+          this.stats.total_blocks++;
+        }
+        return {
+          flagged,
+          confidence: this.computeConfidence(signals),
+          signals,
+          recommendation
+        };
       }
-    }
-  }
-  /**
-   * Scan a single string for injection signals.
-   */
-  scanString(value, path, _toolName, signals) {
-    if (this.isSafeField(path)) {
-      return;
-    }
-    const location = path || "root";
-    const invisibleCount = this.countInvisibleChars(value);
-    if (invisibleCount > 3) {
-      signals.push({
-        type: "unicode_smuggling",
-        pattern: `invisible_chars_count_${invisibleCount}`,
-        location,
-        severity: "high"
-      });
-    }
-    this.detectTokenBudgetAttack(value, location, signals);
-    const stripped = this.stripInvisibleChars(value);
-    const nfkcOnly = stripped.normalize("NFKC");
-    const normalized = this.normalizeConfusables(nfkcOnly);
-    if (nfkcOnly !== stripped) {
-      signals.push({
-        type: "encoding_evasion",
-        pattern: "unicode_normalization_delta",
-        location,
-        severity: "medium"
-      });
-    }
-    if (normalized !== nfkcOnly) {
-      signals.push({
-        type: "encoding_evasion",
-        pattern: "unicode_normalization_delta",
-        location,
-        severity: "medium"
-      });
-      signals.push({
-        type: "homoglyph_attack",
-        pattern: "confusable_substitution",
-        location,
-        severity: "high"
-      });
-    }
-    for (const pattern of ROLE_OVERRIDE_PATTERNS) {
-      if (pattern.test(normalized)) {
-        signals.push({
-          type: "role_override",
-          pattern: pattern.source,
-          location,
-          severity: "high"
-        });
-        break;
+      /**
+       * SEC-035: Scan outbound content for secret leaks, data exfiltration,
+       * internal path exposure, and injection artifact survival.
+       *
+       * @param content The outbound content string to scan
+       * @returns DetectionResult with outbound-specific signal types
+       */
+      scanOutbound(content) {
+        this.stats.total_scans++;
+        if (!this.config.enabled) {
+          return {
+            flagged: false,
+            confidence: 0,
+            signals: [],
+            recommendation: "allow"
+          };
+        }
+        const signals = [];
+        this.detectSecretPatterns(content, signals);
+        this.detectOutboundExfiltration(content, signals);
+        this.detectInternalPathLeaks(content, signals);
+        this.detectPrivateNetworkLeaks(content, signals);
+        this.detectOutputRoleMarkers(content, signals);
+        const flagged = signals.length > 0;
+        if (flagged) {
+          this.stats.total_flags++;
+        }
+        for (const sig of signals) {
+          this.stats.signals_by_type[sig.type] = (this.stats.signals_by_type[sig.type] ?? 0) + 1;
+        }
+        const recommendation = this.computeRecommendation(
+          signals,
+          this.config.sensitivity
+        );
+        if (recommendation === "block") {
+          this.stats.total_blocks++;
+        }
+        return {
+          flagged,
+          confidence: this.computeConfidence(signals),
+          signals,
+          recommendation
+        };
       }
-    }
-    for (const pattern of SECURITY_BYPASS_PATTERNS) {
-      if (pattern.test(normalized)) {
-        signals.push({
-          type: "security_bypass",
-          pattern: pattern.source,
-          location,
-          severity: "high"
-        });
-        break;
+      /**
+       * Recursively scan a value and all nested values.
+       */
+      scanValue(value, path, toolName, signals, visited) {
+        if (typeof value === "object" && value !== null) {
+          if (visited.has(value)) return;
+          visited.add(value);
+        }
+        if (typeof value === "string") {
+          this.scanString(value, path, toolName, signals);
+        } else if (Array.isArray(value)) {
+          for (let i = 0; i < value.length; i++) {
+            this.scanValue(value[i], `${path}[${i}]`, toolName, signals, visited);
+          }
+        } else if (typeof value === "object" && value !== null) {
+          for (const [key, val] of Object.entries(value)) {
+            this.scanValue(val, path ? `${path}.${key}` : key, toolName, signals, visited);
+          }
+        }
       }
-    }
-    if (!this.isToolNameField(path)) {
-      for (const pattern of TOOL_INVOCATION_PATTERNS) {
-        if (pattern.test(normalized)) {
+      /**
+       * Scan a single string for injection signals.
+       */
+      scanString(value, path, _toolName, signals) {
+        if (this.isSafeField(path)) {
+          return;
+        }
+        const location = path || "root";
+        const invisibleCount = this.countInvisibleChars(value);
+        if (invisibleCount > 3) {
           signals.push({
-            type: "tool_invocation_in_string",
-            pattern: pattern.source,
+            type: "unicode_smuggling",
+            pattern: `invisible_chars_count_${invisibleCount}`,
+            location,
+            severity: "high"
+          });
+        }
+        this.detectTokenBudgetAttack(value, location, signals);
+        const stripped = this.stripInvisibleChars(value);
+        const nfkcOnly = stripped.normalize("NFKC");
+        const normalized = this.normalizeConfusables(nfkcOnly);
+        if (nfkcOnly !== stripped) {
+          signals.push({
+            type: "encoding_evasion",
+            pattern: "unicode_normalization_delta",
             location,
             severity: "medium"
           });
-          break;
         }
-      }
-    }
-    this.detectEncodingEvasion(value, location, signals);
-    this.detectEncodedPayloads(value, location, signals);
-    this.detectDataExfiltration(value, location, signals);
-    this.detectPromptStuffing(value, location, signals);
-  }
-  // ═══════════════════════════════════════════════════════════════════════════
-  // SEC-034: Unicode sanitization helpers
-  // ═══════════════════════════════════════════════════════════════════════════
-  /**
-   * Count invisible Unicode characters in a string.
-   * Includes zero-width chars, soft hyphens, directional marks,
-   * variation selectors, and other invisible categories.
-   */
-  countInvisibleChars(value) {
-    let count = 0;
-    for (const ch of value) {
-      const cp = ch.codePointAt(0);
-      if (cp === void 0) continue;
-      if (INVISIBLE_CHARS.includes(ch)) {
-        count++;
-        continue;
-      }
-      if (cp >= VARIATION_SELECTOR_RANGE_START && cp <= VARIATION_SELECTOR_RANGE_END) {
-        count++;
-        continue;
-      }
-      if (cp >= 917760 && cp <= 917999) {
-        count++;
-        continue;
-      }
-      if (cp >= 917505 && cp <= 917631) {
-        count++;
-        continue;
-      }
-      if (cp >= 65529 && cp <= 65531) {
-        count++;
-        continue;
-      }
-    }
-    return count;
-  }
-  /**
-   * Strip invisible characters from a string for clean pattern matching.
-   * Returns a new string with all invisible chars removed.
-   */
-  stripInvisibleChars(value) {
-    const chars = [];
-    for (const ch of value) {
-      const cp = ch.codePointAt(0);
-      if (cp === void 0) continue;
-      if (INVISIBLE_CHARS.includes(ch)) continue;
-      if (cp >= VARIATION_SELECTOR_RANGE_START && cp <= VARIATION_SELECTOR_RANGE_END) continue;
-      if (cp >= 917760 && cp <= 917999) continue;
-      if (cp >= 917505 && cp <= 917631) continue;
-      if (cp >= 65529 && cp <= 65531) continue;
-      chars.push(ch);
-    }
-    return chars.join("");
-  }
-  /**
-   * SEC-034: Token budget attack detection.
-   * Some Unicode sequences expand dramatically during tokenization (e.g., CJK
-   * ideographs, combining characters, emoji sequences). If the estimated token
-   * cost per character is anomalously high, this may be a wallet-drain payload.
-   *
-   * Heuristic: count chars that typically tokenize into multiple tokens.
-   * If the ratio of estimated tokens to char count exceeds 3x, flag it.
-   */
-  detectTokenBudgetAttack(value, path, signals) {
-    if (value.length < 20) return;
-    const MAX_ANALYSIS_LENGTH = 1e6;
-    if (value.length > MAX_ANALYSIS_LENGTH) {
-      value = value.substring(0, MAX_ANALYSIS_LENGTH);
-    }
-    let estimatedTokens = 0;
-    for (const ch of value) {
-      const cp = ch.codePointAt(0);
-      if (cp === void 0) continue;
-      if (cp <= 127) {
-        estimatedTokens += 0.25;
-      } else if (cp <= 2047) {
-        estimatedTokens += 0.5;
-      } else if (cp <= 65535) {
-        estimatedTokens += 1.5;
-      } else {
-        estimatedTokens += 2.5;
-      }
-    }
-    let charCount = 0;
-    for (const _ch of value) {
-      charCount++;
-    }
-    const ratio = estimatedTokens / charCount;
-    if (ratio > 3) {
-      signals.push({
-        type: "token_budget_attack",
-        pattern: `token_char_ratio_${ratio.toFixed(2)}`,
-        location: path,
-        severity: "medium"
-      });
-    }
-  }
-  // ═══════════════════════════════════════════════════════════════════════════
-  // SEC-034: Encoded payload detection and re-scanning
-  // ═══════════════════════════════════════════════════════════════════════════
-  /**
-   * Detect encoded content (base64, hex, HTML entities, URL encoding),
-   * decode it, and re-scan the decoded content through injection patterns.
-   * If the decoded content contains injection patterns, flag as encoding_evasion.
-   */
-  detectEncodedPayloads(value, path, signals) {
-    const decodedParts = [];
-    const base64Matches = value.match(BASE64_BLOCK_PATTERN);
-    if (base64Matches) {
-      for (const match of base64Matches) {
-        const decoded = this.safeBase64Decode(match);
-        if (decoded !== null) {
-          decodedParts.push(decoded);
-        }
-      }
-    }
-    const hexMatches = value.match(HEX_ENCODED_PATTERN);
-    if (hexMatches) {
-      for (const match of hexMatches) {
-        const decoded = this.safeHexDecode(match);
-        if (decoded !== null) {
-          decodedParts.push(decoded);
-        }
-      }
-    }
-    if (HTML_ENTITY_PATTERN.test(value)) {
-      const decoded = this.decodeHtmlEntities(value);
-      if (decoded !== value) {
-        decodedParts.push(decoded);
-      }
-    }
-    const urlMatches = value.match(URL_ENCODED_PATTERN);
-    if (urlMatches) {
-      for (const match of urlMatches) {
-        const decoded = this.safeUrlDecode(match);
-        if (decoded !== null && decoded !== match) {
-          decodedParts.push(decoded);
-        }
-      }
-    }
-    for (const decoded of decodedParts) {
-      if (this.containsInjectionPatterns(decoded)) {
-        signals.push({
-          type: "encoding_evasion",
-          pattern: "encoded_injection_payload",
-          location: path,
-          severity: "high"
-        });
-        return;
-      }
-    }
-  }
-  /**
-   * Check if a string contains any injection patterns (role override or security bypass).
-   */
-  containsInjectionPatterns(value) {
-    const normalized = this.normalizeConfusables(value.normalize("NFKC"));
-    for (const pattern of ROLE_OVERRIDE_PATTERNS) {
-      if (pattern.test(normalized)) return true;
-    }
-    for (const pattern of SECURITY_BYPASS_PATTERNS) {
-      if (pattern.test(normalized)) return true;
-    }
-    return false;
-  }
-  /**
-   * Safely decode a base64 string. Returns null if it's not valid base64
-   * or doesn't decode to a meaningful string.
-   */
-  safeBase64Decode(value) {
-    try {
-      const cleaned = value.replace(/-/g, "+").replace(/_/g, "/");
-      const padded = cleaned + "=".repeat((4 - cleaned.length % 4) % 4);
-      if (!BASE64_STANDARD_PATTERN.test(padded)) return null;
-      const decoded = Buffer.from(padded, "base64").toString("utf-8");
-      if (this.looksLikeText(decoded)) {
-        return decoded;
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  }
-  /**
-   * Safely decode a hex string. Returns null on failure.
-   */
-  safeHexDecode(value) {
-    try {
-      const hex = value.startsWith("0x") ? value.slice(2) : value;
-      if (hex.length % 2 !== 0) return null;
-      const decoded = Buffer.from(hex, "hex").toString("utf-8");
-      if (this.looksLikeText(decoded)) {
-        return decoded;
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  }
-  /**
-   * Decode HTML numeric entities (&#xHH; and &#DDD;) in a string.
-   */
-  decodeHtmlEntities(value) {
-    return value.replace(/&#x([0-9a-fA-F]{2,4});/g, (_match, hex) => {
-      try {
-        return String.fromCodePoint(parseInt(hex, 16));
-      } catch {
-        return _match;
-      }
-    }).replace(/&#([0-9]{2,5});/g, (_match, dec) => {
-      try {
-        const cp = parseInt(dec, 10);
-        if (cp > 1114111) return _match;
-        return String.fromCodePoint(cp);
-      } catch {
-        return _match;
-      }
-    });
-  }
-  /**
-   * Safely decode a URL-encoded string. Returns null on failure.
-   */
-  safeUrlDecode(value) {
-    try {
-      return decodeURIComponent(value);
-    } catch {
-      return null;
-    }
-  }
-  /**
-   * Heuristic: does this look like readable text (vs. binary garbage)?
-   * Checks that most characters are printable ASCII or common Unicode.
-   */
-  looksLikeText(value) {
-    if (value.length === 0) return false;
-    let printable = 0;
-    for (let i = 0; i < value.length; i++) {
-      const code = value.charCodeAt(i);
-      if (code >= 32 && code <= 126 || code === 10 || code === 13 || code === 9) {
-        printable++;
-      } else if (code >= 128) {
-        if (code < 160) continue;
-        printable++;
-      }
-    }
-    return printable / value.length > 0.7;
-  }
-  // ═══════════════════════════════════════════════════════════════════════════
-  // SEC-035: Outbound content scanning helpers
-  // ═══════════════════════════════════════════════════════════════════════════
-  /**
-   * Detect API keys and secrets in outbound content.
-   */
-  detectSecretPatterns(content, signals) {
-    for (const { pattern, name } of SECRET_PATTERNS) {
-      if (pattern.test(content)) {
-        signals.push({
-          type: "secret_leak",
-          pattern: name,
-          location: "outbound",
-          severity: "high"
-        });
-      }
-    }
-  }
-  /**
-   * Detect data exfiltration via markdown images with data-carrying query params.
-   */
-  detectOutboundExfiltration(content, signals) {
-    if (MARKDOWN_IMAGE_EXFIL_PATTERN.test(content)) {
-      signals.push({
-        type: "data_exfiltration",
-        pattern: "markdown_image_exfil",
-        location: "outbound",
-        severity: "high"
-      });
-    }
-  }
-  /**
-   * Detect internal filesystem path leaks in outbound content.
-   */
-  detectInternalPathLeaks(content, signals) {
-    for (const pattern of INTERNAL_PATH_PATTERNS) {
-      if (pattern.test(content)) {
-        signals.push({
-          type: "internal_path_leak",
-          pattern: pattern.source,
-          location: "outbound",
-          severity: "medium"
-        });
-        return;
-      }
-    }
-  }
-  /**
-   * Detect private IP addresses and localhost references in outbound content.
-   */
-  detectPrivateNetworkLeaks(content, signals) {
-    for (const pattern of PRIVATE_NETWORK_PATTERNS) {
-      if (pattern.test(content)) {
-        signals.push({
-          type: "private_network_leak",
-          pattern: pattern.source,
-          location: "outbound",
-          severity: "medium"
-        });
-        return;
-      }
-    }
-  }
-  /**
-   * Detect role markers / prompt template artifacts in outbound content.
-   * These should never appear in agent output — their presence indicates
-   * injection artifact survival.
-   */
-  detectOutputRoleMarkers(content, signals) {
-    for (const pattern of OUTPUT_ROLE_MARKER_PATTERNS) {
-      if (pattern.test(content)) {
-        signals.push({
-          type: "injection_artifact",
-          pattern: pattern.source,
-          location: "outbound",
-          severity: "high"
-        });
-        return;
-      }
-    }
-  }
-  // ═══════════════════════════════════════════════════════════════════════════
-  // Existing detection methods (enhanced)
-  // ═══════════════════════════════════════════════════════════════════════════
-  /**
-   * Detect base64 strings, base64url, and zero-width character evasion.
-   */
-  detectEncodingEvasion(value, path, signals) {
-    const trimmed = value.trim();
-    if (value.length > 50) {
-      if (BASE64_STANDARD_PATTERN.test(trimmed)) {
-        signals.push({
-          type: "encoding_evasion",
-          pattern: "base64_string",
-          location: path || "root",
-          severity: "medium"
-        });
-      } else if (BASE64URL_PATTERN.test(trimmed) && /[_-]/.test(trimmed)) {
-        signals.push({
-          type: "encoding_evasion",
-          pattern: "base64url_string",
-          location: path || "root",
-          severity: "medium"
-        });
-      }
-    }
-    let zeroWidthCount = 0;
-    for (const char of ZERO_WIDTH_CHARS) {
-      zeroWidthCount += (value.match(new RegExp(char, "g")) || []).length;
-    }
-    if (zeroWidthCount > 0) {
-      signals.push({
-        type: "encoding_evasion",
-        pattern: "zero_width_characters",
-        location: path || "root",
-        severity: "medium"
-      });
-    }
-    const hasLatin = /[a-zA-Z]/.test(value);
-    const hasCJK = /[\u4E00-\u9FFF\u3040-\u309F\uAC00-\uD7AF]/.test(value);
-    const hasArabic = /[\u0600-\u06FF]/.test(value);
-    const hasCyrillic = /[\u0400-\u04FF]/.test(value);
-    const unicodeCategories = [hasLatin, hasCJK, hasArabic, hasCyrillic].filter(
-      (x) => x
-    ).length;
-    if (unicodeCategories >= 3) {
-      signals.push({
-        type: "encoding_evasion",
-        pattern: "unicode_category_mixing",
-        location: path || "root",
-        severity: "medium"
-      });
-    }
-  }
-  /**
-   * Detect URLs and emails in fields that shouldn't have them.
-   */
-  detectDataExfiltration(value, path, signals) {
-    if (this.isUrlSafeField(path)) {
-      return;
-    }
-    if (URL_PATTERN.test(value)) {
-      signals.push({
-        type: "data_exfiltration",
-        pattern: "url_in_string",
-        location: path || "root",
-        severity: "medium"
-      });
-    }
-    if (EMAIL_PATTERN.test(value) && !this.isEmailSafeField(path)) {
-      signals.push({
-        type: "data_exfiltration",
-        pattern: "email_in_string",
-        location: path || "root",
-        severity: "medium"
-      });
-    }
-    if (value.length > 30 && value.length < 1e4 && !this.isStructuredField(path)) {
-      const hasJsonContent = /\{[^}]*"[^"]*"[^}]*\}/.test(value);
-      const hasXmlContent = /<[^>]+>[\s\S]*?<\/[^>]+>/.test(value);
-      if (hasJsonContent || hasXmlContent) {
-        signals.push({
-          type: "data_exfiltration",
-          pattern: "structured_data_in_string",
-          location: path || "root",
-          severity: "medium"
-        });
-      }
-    }
-  }
-  /**
-   * Detect prompt stuffing: very large strings or high repetition.
-   */
-  detectPromptStuffing(value, path, signals) {
-    if (value.length > 10240) {
-      signals.push({
-        type: "prompt_stuffing",
-        pattern: "large_string",
-        location: path || "root",
-        severity: "low"
-      });
-    }
-    if (value.length >= 100) {
-      const windowSizes = [10, 20, 50];
-      for (const windowSize of windowSizes) {
-        if (value.length < windowSize * 5) continue;
-        const pattern = value.substring(0, windowSize);
-        let count = 0;
-        let idx = 0;
-        while (idx <= value.length - windowSize) {
-          if (value.substring(idx, idx + windowSize) === pattern) {
-            count++;
-            idx += windowSize;
-          } else {
-            idx++;
-          }
-          if (count >= 10) break;
-        }
-        if (count >= 10) {
+        if (normalized !== nfkcOnly) {
           signals.push({
-            type: "prompt_stuffing",
-            pattern: "high_repetition",
-            location: path || "root",
-            severity: "low"
+            type: "encoding_evasion",
+            pattern: "unicode_normalization_delta",
+            location,
+            severity: "medium"
           });
-          break;
+          signals.push({
+            type: "homoglyph_attack",
+            pattern: "confusable_substitution",
+            location,
+            severity: "high"
+          });
         }
-      }
-    }
-  }
-  /**
-   * Determine if this field is inherently safe from role override.
-   */
-  isSafeField(path) {
-    const safePaths = [
-      /\.version$/i,
-      /\.timestamp$/i,
-      /\.id$/i,
-      /\.uuid$/i,
-      /\.hash$/i,
-      /\.signature$/i,
-      /\.public_key$/i,
-      /\.private_key$/i,
-      /\.did$/i,
-      /\.nonce$/i,
-      /\.salt$/i,
-      /\.iv$/i,
-      /^ciphertext$/i,
-      /^encrypted$/i
-    ];
-    return safePaths.some((p) => p.test(path));
-  }
-  /**
-   * Determine if this is a tool name field (where tool refs are expected).
-   */
-  isToolNameField(path) {
-    const toolFields = [
-      /tool_name/i,
-      /\.tool$/i,
-      /^tool$/i,
-      /operation/i
-    ];
-    return toolFields.some((p) => p.test(path));
-  }
-  /**
-   * Determine if this field is safe for URLs.
-   */
-  isUrlSafeField(path) {
-    const urlFields = [
-      /url/i,
-      /endpoint/i,
-      /webhook/i,
-      /callback/i
-    ];
-    return urlFields.some((p) => p.test(path));
-  }
-  /**
-   * Determine if this field is safe for emails.
-   */
-  isEmailSafeField(path) {
-    const emailFields = [
-      /email/i,
-      /contact/i,
-      /recipient/i,
-      /sender/i,
-      /from/i,
-      /to/i
-    ];
-    return emailFields.some((p) => p.test(path));
-  }
-  /**
-   * Determine if this field is safe for structured data (JSON/XML).
-   */
-  isStructuredField(path) {
-    const structuredFields = [
-      /data/i,
-      /payload/i,
-      /body/i,
-      /json/i,
-      /xml/i
-    ];
-    return structuredFields.some((p) => p.test(path));
-  }
-  /**
-   * SEC-032/SEC-034: Map common cross-script confusable characters to their
-   * Latin equivalents. NFKC normalization handles fullwidth and compatibility
-   * forms, but does NOT map Cyrillic/Greek/Armenian/Georgian lookalikes to
-   * Latin (they're distinct codepoints by design).
-   *
-   * Extended to 50+ confusable pairs covering Cyrillic, Greek, Armenian,
-   * Georgian, Cherokee, and mathematical/symbol lookalikes.
-   */
-  normalizeConfusables(value) {
-    const confusables = {
-      // ── Cyrillic → Latin ──────────────────────────────────────────────
-      "\u0410": "A",
-      "\u0430": "a",
-      // А а
-      "\u0412": "B",
-      "\u0432": "b",
-      // В в (visual approximation)
-      "\u0421": "C",
-      "\u0441": "c",
-      // С с
-      "\u0414": "D",
-      // Д (visual approximation)
-      "\u0415": "E",
-      "\u0435": "e",
-      // Е е
-      "\u041D": "H",
-      "\u043D": "h",
-      // Н н (visual approximation)
-      "\u0406": "I",
-      "\u0456": "i",
-      // І і (Ukrainian I)
-      "\u0408": "J",
-      // Ј (Serbian Je)
-      "\u041A": "K",
-      "\u043A": "k",
-      // К к (visual approximation)
-      "\u041C": "M",
-      "\u043C": "m",
-      // М м (visual approximation)
-      "\u041E": "O",
-      "\u043E": "o",
-      // О о
-      "\u0420": "P",
-      "\u0440": "p",
-      // Р р
-      "\u0405": "S",
-      "\u0455": "s",
-      // Ѕ ѕ (Macedonian S)
-      "\u0422": "T",
-      "\u0442": "t",
-      // Т т (visual approximation)
-      "\u0425": "X",
-      "\u0445": "x",
-      // Х х
-      "\u0423": "Y",
-      "\u0443": "y",
-      // У у (visual approximation)
-      "\u0417": "3",
-      // З (looks like 3)
-      "\u04BB": "h",
-      // һ (Shha)
-      "\u04C0": "I",
-      // Ӏ (Palochka)
-      "\u04CF": "l",
-      // ӏ (Palochka small)
-      // ── Greek → Latin ─────────────────────────────────────────────────
-      "\u0391": "A",
-      "\u03B1": "a",
-      // Α α (alpha not exact)
-      "\u0392": "B",
-      "\u03B2": "b",
-      // Β β (not exact)
-      "\u0393": "G",
-      // Γ (visual approximation)
-      "\u0395": "E",
-      "\u03B5": "e",
-      // Ε ε (not exact)
-      "\u0396": "Z",
-      "\u03B6": "z",
-      // Ζ ζ (not exact)
-      "\u0397": "H",
-      "\u03B7": "n",
-      // Η η (not exact)
-      "\u0399": "I",
-      "\u03B9": "i",
-      // Ι ι
-      "\u039A": "K",
-      "\u03BA": "k",
-      // Κ κ
-      "\u039C": "M",
-      // Μ
-      "\u039D": "N",
-      // Ν
-      "\u039F": "O",
-      "\u03BF": "o",
-      // Ο ο
-      "\u03A1": "P",
-      "\u03C1": "p",
-      // Ρ ρ (not exact)
-      "\u03A4": "T",
-      "\u03C4": "t",
-      // Τ τ (not exact)
-      "\u03A5": "Y",
-      "\u03C5": "y",
-      // Υ υ (not exact)
-      "\u03A7": "X",
-      "\u03C7": "x",
-      // Χ χ (not exact)
-      "\u03C9": "w",
-      // ω (omega, visual approximation)
-      // ── Armenian → Latin ──────────────────────────────────────────────
-      "\u0555": "O",
-      // Օ
-      "\u0585": "o",
-      // օ
-      "\u054D": "S",
-      // Ս
-      "\u057D": "s",
-      // ս
-      "\u054C": "L",
-      // Լ (visual approximation)
-      "\u0570": "h",
-      // հ
-      // ── Cherokee → Latin ──────────────────────────────────────────────
-      "\u13A0": "D",
-      // Ꭰ
-      "\u13B3": "W",
-      // Ꮃ
-      "\u13A1": "R",
-      // Ꭱ
-      "\u13AA": "G",
-      // Ꭺ (looks like A but maps to G sound)
-      "\u13D2": "V",
-      // Ꮢ (visual approximation)
-      // ── Georgian → Latin ──────────────────────────────────────────────
-      "\u10D5": "v",
-      // ვ (Georgian letter vin)
-      "\u10D3": "d",
-      // დ (Georgian letter don)
-      "\u10DA": "l",
-      // ლ (Georgian letter las)
-      // ── Latin special → Latin ────────────────────────────────────────
-      "\u0131": "i",
-      // ı (Latin small letter dotless i)
-      // ── Symbols / Mathematical → Latin ────────────────────────────────
-      // Note: NFKC normalization handles mathematical alphanumerics (U+1D400–U+1D7FF)
-      "\u2160": "I",
-      // Ⅰ (Roman numeral one)
-      "\u2164": "V",
-      // Ⅴ (Roman numeral five)
-      "\u2169": "X",
-      // Ⅹ (Roman numeral ten)
-      "\u216C": "L",
-      // Ⅼ (Roman numeral fifty)
-      "\u216D": "C",
-      // Ⅽ (Roman numeral one hundred)
-      "\u216E": "D",
-      // Ⅾ (Roman numeral five hundred)
-      "\u216F": "M",
-      // Ⅿ (Roman numeral one thousand)
-      "\u2170": "i",
-      // ⅰ (small Roman numeral one)
-      "\u2174": "v",
-      // ⅴ (small Roman numeral five)
-      "\u2179": "x",
-      // ⅹ (small Roman numeral ten)
-      "\u217C": "l",
-      // ⅼ (small Roman numeral fifty)
-      "\u217D": "c",
-      // ⅽ (small Roman numeral one hundred)
-      "\u217E": "d",
-      // ⅾ (small Roman numeral five hundred)
-      "\u217F": "m",
-      // ⅿ (small Roman numeral one thousand)
-      "\u0251": "a",
-      // ɑ (Latin alpha — looks like 'a')
-      "\u0261": "g"
-      // ɡ (Latin small letter script G)
-    };
-    let result = value;
-    if (/[^\x00-\x7F]/.test(value)) {
-      const chars = [];
-      for (const ch of result) {
-        chars.push(confusables[ch] ?? ch);
-      }
-      result = chars.join("");
-    }
-    return result;
-  }
-  /**
-   * Compute confidence score based on signals.
-   * More high-severity signals = higher confidence.
-   */
-  computeConfidence(signals) {
-    if (signals.length === 0) return 0;
-    let score = 0;
-    let highCount = 0;
-    for (const sig of signals) {
-      switch (sig.severity) {
-        case "high":
-          highCount++;
-          score += 0.35;
-          break;
-        case "medium":
-          score += 0.15;
-          break;
-        case "low":
-          score += 0.05;
-          break;
-      }
-    }
-    if (highCount > 1) {
-      score += (highCount - 1) * 0.15;
-    }
-    return Math.min(score, 1);
-  }
-  /**
-   * Compute recommendation based on signals and sensitivity.
-   */
-  computeRecommendation(signals, sensitivity) {
-    if (signals.length === 0) return "allow";
-    const highSeverity = signals.filter((s) => s.severity === "high");
-    const mediumSeverity = signals.filter((s) => s.severity === "medium");
-    switch (sensitivity) {
-      case "low":
-        return highSeverity.length > 0 ? "escalate" : "allow";
-      case "medium":
-        if (highSeverity.length > 0) return "block";
-        return mediumSeverity.length > 0 ? "escalate" : "allow";
-      case "high":
-        if (highSeverity.length > 0 || mediumSeverity.length > 1) return "block";
-        if (mediumSeverity.length > 0) return "block";
-        return signals.length > 0 ? "escalate" : "allow";
-    }
-  }
-  /**
-   * Get statistics about scans performed.
-   */
-  getStats() {
-    return {
-      total_scans: this.stats.total_scans,
-      total_flags: this.stats.total_flags,
-      total_blocks: this.stats.total_blocks,
-      signals_by_type: { ...this.stats.signals_by_type }
-    };
-  }
-  /**
-   * Reset statistics.
-   */
-  resetStats() {
-    this.stats = {
-      total_scans: 0,
-      total_flags: 0,
-      total_blocks: 0,
-      signals_by_type: {}
-    };
-  }
-};
-
-// src/principal-policy/gate.ts
-var ApprovalGate = class {
-  policy;
-  baseline;
-  channel;
-  auditLog;
-  injectionDetector;
-  onInjectionAlert;
-  proxyTierResolver;
-  constructor(policy, baseline, channel, auditLog, injectionDetector, onInjectionAlert) {
-    this.policy = policy;
-    this.baseline = baseline;
-    this.channel = channel;
-    this.auditLog = auditLog;
-    this.injectionDetector = injectionDetector ?? new InjectionDetector();
-    this.onInjectionAlert = onInjectionAlert;
-  }
-  /**
-   * Set the proxy tier resolver. Called after the proxy router is initialized.
-   */
-  setProxyTierResolver(resolver) {
-    this.proxyTierResolver = resolver;
-  }
-  /**
-   * Evaluate a tool call against the Principal Policy.
-   *
-   * @param toolName - Full MCP tool name (e.g., "state_export")
-   * @param args - Tool call arguments (for context extraction)
-   * @returns GateResult indicating whether the call is allowed
-   */
-  async evaluate(toolName, args) {
-    const operation = extractOperationName(toolName);
-    this.baseline.recordToolCall(operation);
-    const injectionResult = this.injectionDetector.scan(toolName, args);
-    if (injectionResult.flagged) {
-      this.auditLog.append("l2", `injection_detected:${operation}`, "system", {
-        confidence: injectionResult.confidence,
-        signals: injectionResult.signals.map((s) => ({
-          type: s.type,
-          location: s.location,
-          severity: s.severity
-        })),
-        recommendation: injectionResult.recommendation
-      });
-      if (this.onInjectionAlert) {
-        this.onInjectionAlert({
-          toolName,
-          result: injectionResult,
-          timestamp: (/* @__PURE__ */ new Date()).toISOString()
-        });
-      }
-      if (injectionResult.recommendation === "block") {
-        return {
-          allowed: false,
-          tier: 1,
-          reason: `Blocked: prompt injection detected in "${operation}" (confidence: ${(injectionResult.confidence * 100).toFixed(0)}%)`,
-          approval_required: false
-        };
-      }
-      if (injectionResult.recommendation === "escalate") {
-        return this.requestApproval(
-          operation,
-          1,
-          `Potential prompt injection detected in "${operation}" (confidence: ${(injectionResult.confidence * 100).toFixed(0)}%, ${injectionResult.signals.length} signal(s))`,
-          {
-            operation,
-            injection_detection: {
-              confidence: injectionResult.confidence,
-              signal_count: injectionResult.signals.length,
-              signal_types: [...new Set(injectionResult.signals.map((s) => s.type))]
+        for (const pattern of ROLE_OVERRIDE_PATTERNS) {
+          if (pattern.test(normalized)) {
+            signals.push({
+              type: "role_override",
+              pattern: pattern.source,
+              location,
+              severity: "high"
+            });
+            break;
+          }
+        }
+        for (const pattern of SECURITY_BYPASS_PATTERNS) {
+          if (pattern.test(normalized)) {
+            signals.push({
+              type: "security_bypass",
+              pattern: pattern.source,
+              location,
+              severity: "high"
+            });
+            break;
+          }
+        }
+        if (!this.isToolNameField(path)) {
+          for (const pattern of TOOL_INVOCATION_PATTERNS) {
+            if (pattern.test(normalized)) {
+              signals.push({
+                type: "tool_invocation_in_string",
+                pattern: pattern.source,
+                location,
+                severity: "medium"
+              });
+              break;
             }
           }
-        );
+        }
+        this.detectEncodingEvasion(value, location, signals);
+        this.detectEncodedPayloads(value, location, signals);
+        this.detectDataExfiltration(value, location, signals);
+        this.detectPromptStuffing(value, location, signals);
       }
-    }
-    if (toolName.startsWith("proxy/") && this.proxyTierResolver) {
-      const proxyTier = this.proxyTierResolver(toolName);
-      if (proxyTier !== null) {
-        if (proxyTier === 1) {
-          return this.requestApproval(operation, 1, `Proxy tool "${toolName}" is configured as Tier 1 (always requires approval)`, {
-            operation: toolName,
-            proxy: true,
-            args_summary: this.summarizeArgs(args)
+      // ═══════════════════════════════════════════════════════════════════════════
+      // SEC-034: Unicode sanitization helpers
+      // ═══════════════════════════════════════════════════════════════════════════
+      /**
+       * Count invisible Unicode characters in a string.
+       * Includes zero-width chars, soft hyphens, directional marks,
+       * variation selectors, and other invisible categories.
+       */
+      countInvisibleChars(value) {
+        let count = 0;
+        for (const ch of value) {
+          const cp = ch.codePointAt(0);
+          if (cp === void 0) continue;
+          if (INVISIBLE_CHARS.includes(ch)) {
+            count++;
+            continue;
+          }
+          if (cp >= VARIATION_SELECTOR_RANGE_START && cp <= VARIATION_SELECTOR_RANGE_END) {
+            count++;
+            continue;
+          }
+          if (cp >= 917760 && cp <= 917999) {
+            count++;
+            continue;
+          }
+          if (cp >= 917505 && cp <= 917631) {
+            count++;
+            continue;
+          }
+          if (cp >= 65529 && cp <= 65531) {
+            count++;
+            continue;
+          }
+        }
+        return count;
+      }
+      /**
+       * Strip invisible characters from a string for clean pattern matching.
+       * Returns a new string with all invisible chars removed.
+       */
+      stripInvisibleChars(value) {
+        const chars = [];
+        for (const ch of value) {
+          const cp = ch.codePointAt(0);
+          if (cp === void 0) continue;
+          if (INVISIBLE_CHARS.includes(ch)) continue;
+          if (cp >= VARIATION_SELECTOR_RANGE_START && cp <= VARIATION_SELECTOR_RANGE_END) continue;
+          if (cp >= 917760 && cp <= 917999) continue;
+          if (cp >= 917505 && cp <= 917631) continue;
+          if (cp >= 65529 && cp <= 65531) continue;
+          chars.push(ch);
+        }
+        return chars.join("");
+      }
+      /**
+       * SEC-034: Token budget attack detection.
+       * Some Unicode sequences expand dramatically during tokenization (e.g., CJK
+       * ideographs, combining characters, emoji sequences). If the estimated token
+       * cost per character is anomalously high, this may be a wallet-drain payload.
+       *
+       * Heuristic: count chars that typically tokenize into multiple tokens.
+       * If the ratio of estimated tokens to char count exceeds 3x, flag it.
+       */
+      detectTokenBudgetAttack(value, path, signals) {
+        if (value.length < 20) return;
+        const MAX_ANALYSIS_LENGTH = 1e6;
+        if (value.length > MAX_ANALYSIS_LENGTH) {
+          value = value.substring(0, MAX_ANALYSIS_LENGTH);
+        }
+        let estimatedTokens = 0;
+        for (const ch of value) {
+          const cp = ch.codePointAt(0);
+          if (cp === void 0) continue;
+          if (cp <= 127) {
+            estimatedTokens += 0.25;
+          } else if (cp <= 2047) {
+            estimatedTokens += 0.5;
+          } else if (cp <= 65535) {
+            estimatedTokens += 1.5;
+          } else {
+            estimatedTokens += 2.5;
+          }
+        }
+        let charCount = 0;
+        for (const _ch of value) {
+          charCount++;
+        }
+        const ratio = estimatedTokens / charCount;
+        if (ratio > 3) {
+          signals.push({
+            type: "token_budget_attack",
+            pattern: `token_char_ratio_${ratio.toFixed(2)}`,
+            location: path,
+            severity: "medium"
           });
         }
-        if (proxyTier === 2) {
-          const anomaly2 = this.detectAnomaly(operation, args);
-          if (anomaly2) {
-            return this.requestApproval(operation, 2, `Proxy: ${anomaly2.reason}`, {
-              ...anomaly2.context,
-              proxy: true
+      }
+      // ═══════════════════════════════════════════════════════════════════════════
+      // SEC-034: Encoded payload detection and re-scanning
+      // ═══════════════════════════════════════════════════════════════════════════
+      /**
+       * Detect encoded content (base64, hex, HTML entities, URL encoding),
+       * decode it, and re-scan the decoded content through injection patterns.
+       * If the decoded content contains injection patterns, flag as encoding_evasion.
+       */
+      detectEncodedPayloads(value, path, signals) {
+        const decodedParts = [];
+        const base64Matches = value.match(BASE64_BLOCK_PATTERN);
+        if (base64Matches) {
+          for (const match of base64Matches) {
+            const decoded = this.safeBase64Decode(match);
+            if (decoded !== null) {
+              decodedParts.push(decoded);
+            }
+          }
+        }
+        const hexMatches = value.match(HEX_ENCODED_PATTERN);
+        if (hexMatches) {
+          for (const match of hexMatches) {
+            const decoded = this.safeHexDecode(match);
+            if (decoded !== null) {
+              decodedParts.push(decoded);
+            }
+          }
+        }
+        if (HTML_ENTITY_PATTERN.test(value)) {
+          const decoded = this.decodeHtmlEntities(value);
+          if (decoded !== value) {
+            decodedParts.push(decoded);
+          }
+        }
+        const urlMatches = value.match(URL_ENCODED_PATTERN);
+        if (urlMatches) {
+          for (const match of urlMatches) {
+            const decoded = this.safeUrlDecode(match);
+            if (decoded !== null && decoded !== match) {
+              decodedParts.push(decoded);
+            }
+          }
+        }
+        for (const decoded of decodedParts) {
+          if (this.containsInjectionPatterns(decoded)) {
+            signals.push({
+              type: "encoding_evasion",
+              pattern: "encoded_injection_payload",
+              location: path,
+              severity: "high"
+            });
+            return;
+          }
+        }
+      }
+      /**
+       * Check if a string contains any injection patterns (role override or security bypass).
+       */
+      containsInjectionPatterns(value) {
+        const normalized = this.normalizeConfusables(value.normalize("NFKC"));
+        for (const pattern of ROLE_OVERRIDE_PATTERNS) {
+          if (pattern.test(normalized)) return true;
+        }
+        for (const pattern of SECURITY_BYPASS_PATTERNS) {
+          if (pattern.test(normalized)) return true;
+        }
+        return false;
+      }
+      /**
+       * Safely decode a base64 string. Returns null if it's not valid base64
+       * or doesn't decode to a meaningful string.
+       */
+      safeBase64Decode(value) {
+        try {
+          const cleaned = value.replace(/-/g, "+").replace(/_/g, "/");
+          const padded = cleaned + "=".repeat((4 - cleaned.length % 4) % 4);
+          if (!BASE64_STANDARD_PATTERN.test(padded)) return null;
+          const decoded = Buffer.from(padded, "base64").toString("utf-8");
+          if (this.looksLikeText(decoded)) {
+            return decoded;
+          }
+          return null;
+        } catch {
+          return null;
+        }
+      }
+      /**
+       * Safely decode a hex string. Returns null on failure.
+       */
+      safeHexDecode(value) {
+        try {
+          const hex = value.startsWith("0x") ? value.slice(2) : value;
+          if (hex.length % 2 !== 0) return null;
+          const decoded = Buffer.from(hex, "hex").toString("utf-8");
+          if (this.looksLikeText(decoded)) {
+            return decoded;
+          }
+          return null;
+        } catch {
+          return null;
+        }
+      }
+      /**
+       * Decode HTML numeric entities (&#xHH; and &#DDD;) in a string.
+       */
+      decodeHtmlEntities(value) {
+        return value.replace(/&#x([0-9a-fA-F]{2,4});/g, (_match, hex) => {
+          try {
+            return String.fromCodePoint(parseInt(hex, 16));
+          } catch {
+            return _match;
+          }
+        }).replace(/&#([0-9]{2,5});/g, (_match, dec) => {
+          try {
+            const cp = parseInt(dec, 10);
+            if (cp > 1114111) return _match;
+            return String.fromCodePoint(cp);
+          } catch {
+            return _match;
+          }
+        });
+      }
+      /**
+       * Safely decode a URL-encoded string. Returns null on failure.
+       */
+      safeUrlDecode(value) {
+        try {
+          return decodeURIComponent(value);
+        } catch {
+          return null;
+        }
+      }
+      /**
+       * Heuristic: does this look like readable text (vs. binary garbage)?
+       * Checks that most characters are printable ASCII or common Unicode.
+       */
+      looksLikeText(value) {
+        if (value.length === 0) return false;
+        let printable = 0;
+        for (let i = 0; i < value.length; i++) {
+          const code = value.charCodeAt(i);
+          if (code >= 32 && code <= 126 || code === 10 || code === 13 || code === 9) {
+            printable++;
+          } else if (code >= 128) {
+            if (code < 160) continue;
+            printable++;
+          }
+        }
+        return printable / value.length > 0.7;
+      }
+      // ═══════════════════════════════════════════════════════════════════════════
+      // SEC-035: Outbound content scanning helpers
+      // ═══════════════════════════════════════════════════════════════════════════
+      /**
+       * Detect API keys and secrets in outbound content.
+       */
+      detectSecretPatterns(content, signals) {
+        for (const { pattern, name } of SECRET_PATTERNS) {
+          if (pattern.test(content)) {
+            signals.push({
+              type: "secret_leak",
+              pattern: name,
+              location: "outbound",
+              severity: "high"
             });
           }
         }
-        this.auditLog.append("l2", `gate_allow_proxy:${toolName}`, "system", {
-          tier: proxyTier,
-          operation: toolName,
-          proxy: true
+      }
+      /**
+       * Detect data exfiltration via markdown images with data-carrying query params.
+       */
+      detectOutboundExfiltration(content, signals) {
+        if (MARKDOWN_IMAGE_EXFIL_PATTERN.test(content)) {
+          signals.push({
+            type: "data_exfiltration",
+            pattern: "markdown_image_exfil",
+            location: "outbound",
+            severity: "high"
+          });
+        }
+      }
+      /**
+       * Detect internal filesystem path leaks in outbound content.
+       */
+      detectInternalPathLeaks(content, signals) {
+        for (const pattern of INTERNAL_PATH_PATTERNS) {
+          if (pattern.test(content)) {
+            signals.push({
+              type: "internal_path_leak",
+              pattern: pattern.source,
+              location: "outbound",
+              severity: "medium"
+            });
+            return;
+          }
+        }
+      }
+      /**
+       * Detect private IP addresses and localhost references in outbound content.
+       */
+      detectPrivateNetworkLeaks(content, signals) {
+        for (const pattern of PRIVATE_NETWORK_PATTERNS) {
+          if (pattern.test(content)) {
+            signals.push({
+              type: "private_network_leak",
+              pattern: pattern.source,
+              location: "outbound",
+              severity: "medium"
+            });
+            return;
+          }
+        }
+      }
+      /**
+       * Detect role markers / prompt template artifacts in outbound content.
+       * These should never appear in agent output — their presence indicates
+       * injection artifact survival.
+       */
+      detectOutputRoleMarkers(content, signals) {
+        for (const pattern of OUTPUT_ROLE_MARKER_PATTERNS) {
+          if (pattern.test(content)) {
+            signals.push({
+              type: "injection_artifact",
+              pattern: pattern.source,
+              location: "outbound",
+              severity: "high"
+            });
+            return;
+          }
+        }
+      }
+      // ═══════════════════════════════════════════════════════════════════════════
+      // Existing detection methods (enhanced)
+      // ═══════════════════════════════════════════════════════════════════════════
+      /**
+       * Detect base64 strings, base64url, and zero-width character evasion.
+       */
+      detectEncodingEvasion(value, path, signals) {
+        const trimmed = value.trim();
+        if (value.length > 50) {
+          if (BASE64_STANDARD_PATTERN.test(trimmed)) {
+            signals.push({
+              type: "encoding_evasion",
+              pattern: "base64_string",
+              location: path || "root",
+              severity: "medium"
+            });
+          } else if (BASE64URL_PATTERN.test(trimmed) && /[_-]/.test(trimmed)) {
+            signals.push({
+              type: "encoding_evasion",
+              pattern: "base64url_string",
+              location: path || "root",
+              severity: "medium"
+            });
+          }
+        }
+        let zeroWidthCount = 0;
+        for (const char of ZERO_WIDTH_CHARS) {
+          zeroWidthCount += (value.match(new RegExp(char, "g")) || []).length;
+        }
+        if (zeroWidthCount > 0) {
+          signals.push({
+            type: "encoding_evasion",
+            pattern: "zero_width_characters",
+            location: path || "root",
+            severity: "medium"
+          });
+        }
+        const hasLatin = /[a-zA-Z]/.test(value);
+        const hasCJK = /[\u4E00-\u9FFF\u3040-\u309F\uAC00-\uD7AF]/.test(value);
+        const hasArabic = /[\u0600-\u06FF]/.test(value);
+        const hasCyrillic = /[\u0400-\u04FF]/.test(value);
+        const unicodeCategories = [hasLatin, hasCJK, hasArabic, hasCyrillic].filter(
+          (x) => x
+        ).length;
+        if (unicodeCategories >= 3) {
+          signals.push({
+            type: "encoding_evasion",
+            pattern: "unicode_category_mixing",
+            location: path || "root",
+            severity: "medium"
+          });
+        }
+      }
+      /**
+       * Detect URLs and emails in fields that shouldn't have them.
+       */
+      detectDataExfiltration(value, path, signals) {
+        if (this.isUrlSafeField(path)) {
+          return;
+        }
+        if (URL_PATTERN.test(value)) {
+          signals.push({
+            type: "data_exfiltration",
+            pattern: "url_in_string",
+            location: path || "root",
+            severity: "medium"
+          });
+        }
+        if (EMAIL_PATTERN.test(value) && !this.isEmailSafeField(path)) {
+          signals.push({
+            type: "data_exfiltration",
+            pattern: "email_in_string",
+            location: path || "root",
+            severity: "medium"
+          });
+        }
+        if (value.length > 30 && value.length < 1e4 && !this.isStructuredField(path)) {
+          const hasJsonContent = /\{[^}]*"[^"]*"[^}]*\}/.test(value);
+          const hasXmlContent = /<[^>]+>[\s\S]*?<\/[^>]+>/.test(value);
+          if (hasJsonContent || hasXmlContent) {
+            signals.push({
+              type: "data_exfiltration",
+              pattern: "structured_data_in_string",
+              location: path || "root",
+              severity: "medium"
+            });
+          }
+        }
+      }
+      /**
+       * Detect prompt stuffing: very large strings or high repetition.
+       */
+      detectPromptStuffing(value, path, signals) {
+        if (value.length > 10240) {
+          signals.push({
+            type: "prompt_stuffing",
+            pattern: "large_string",
+            location: path || "root",
+            severity: "low"
+          });
+        }
+        if (value.length >= 100) {
+          const windowSizes = [10, 20, 50];
+          for (const windowSize of windowSizes) {
+            if (value.length < windowSize * 5) continue;
+            const pattern = value.substring(0, windowSize);
+            let count = 0;
+            let idx = 0;
+            while (idx <= value.length - windowSize) {
+              if (value.substring(idx, idx + windowSize) === pattern) {
+                count++;
+                idx += windowSize;
+              } else {
+                idx++;
+              }
+              if (count >= 10) break;
+            }
+            if (count >= 10) {
+              signals.push({
+                type: "prompt_stuffing",
+                pattern: "high_repetition",
+                location: path || "root",
+                severity: "low"
+              });
+              break;
+            }
+          }
+        }
+      }
+      /**
+       * Determine if this field is inherently safe from role override.
+       */
+      isSafeField(path) {
+        const safePaths = [
+          /\.version$/i,
+          /\.timestamp$/i,
+          /\.id$/i,
+          /\.uuid$/i,
+          /\.hash$/i,
+          /\.signature$/i,
+          /\.public_key$/i,
+          /\.private_key$/i,
+          /\.did$/i,
+          /\.nonce$/i,
+          /\.salt$/i,
+          /\.iv$/i,
+          /^ciphertext$/i,
+          /^encrypted$/i
+        ];
+        return safePaths.some((p) => p.test(path));
+      }
+      /**
+       * Determine if this is a tool name field (where tool refs are expected).
+       */
+      isToolNameField(path) {
+        const toolFields = [
+          /tool_name/i,
+          /\.tool$/i,
+          /^tool$/i,
+          /operation/i
+        ];
+        return toolFields.some((p) => p.test(path));
+      }
+      /**
+       * Determine if this field is safe for URLs.
+       */
+      isUrlSafeField(path) {
+        const urlFields = [
+          /url/i,
+          /endpoint/i,
+          /webhook/i,
+          /callback/i
+        ];
+        return urlFields.some((p) => p.test(path));
+      }
+      /**
+       * Determine if this field is safe for emails.
+       */
+      isEmailSafeField(path) {
+        const emailFields = [
+          /email/i,
+          /contact/i,
+          /recipient/i,
+          /sender/i,
+          /from/i,
+          /to/i
+        ];
+        return emailFields.some((p) => p.test(path));
+      }
+      /**
+       * Determine if this field is safe for structured data (JSON/XML).
+       */
+      isStructuredField(path) {
+        const structuredFields = [
+          /data/i,
+          /payload/i,
+          /body/i,
+          /json/i,
+          /xml/i
+        ];
+        return structuredFields.some((p) => p.test(path));
+      }
+      /**
+       * SEC-032/SEC-034: Map common cross-script confusable characters to their
+       * Latin equivalents. NFKC normalization handles fullwidth and compatibility
+       * forms, but does NOT map Cyrillic/Greek/Armenian/Georgian lookalikes to
+       * Latin (they're distinct codepoints by design).
+       *
+       * Extended to 50+ confusable pairs covering Cyrillic, Greek, Armenian,
+       * Georgian, Cherokee, and mathematical/symbol lookalikes.
+       */
+      normalizeConfusables(value) {
+        const confusables = {
+          // ── Cyrillic → Latin ──────────────────────────────────────────────
+          "\u0410": "A",
+          "\u0430": "a",
+          // А а
+          "\u0412": "B",
+          "\u0432": "b",
+          // В в (visual approximation)
+          "\u0421": "C",
+          "\u0441": "c",
+          // С с
+          "\u0414": "D",
+          // Д (visual approximation)
+          "\u0415": "E",
+          "\u0435": "e",
+          // Е е
+          "\u041D": "H",
+          "\u043D": "h",
+          // Н н (visual approximation)
+          "\u0406": "I",
+          "\u0456": "i",
+          // І і (Ukrainian I)
+          "\u0408": "J",
+          // Ј (Serbian Je)
+          "\u041A": "K",
+          "\u043A": "k",
+          // К к (visual approximation)
+          "\u041C": "M",
+          "\u043C": "m",
+          // М м (visual approximation)
+          "\u041E": "O",
+          "\u043E": "o",
+          // О о
+          "\u0420": "P",
+          "\u0440": "p",
+          // Р р
+          "\u0405": "S",
+          "\u0455": "s",
+          // Ѕ ѕ (Macedonian S)
+          "\u0422": "T",
+          "\u0442": "t",
+          // Т т (visual approximation)
+          "\u0425": "X",
+          "\u0445": "x",
+          // Х х
+          "\u0423": "Y",
+          "\u0443": "y",
+          // У у (visual approximation)
+          "\u0417": "3",
+          // З (looks like 3)
+          "\u04BB": "h",
+          // һ (Shha)
+          "\u04C0": "I",
+          // Ӏ (Palochka)
+          "\u04CF": "l",
+          // ӏ (Palochka small)
+          // ── Greek → Latin ─────────────────────────────────────────────────
+          "\u0391": "A",
+          "\u03B1": "a",
+          // Α α (alpha not exact)
+          "\u0392": "B",
+          "\u03B2": "b",
+          // Β β (not exact)
+          "\u0393": "G",
+          // Γ (visual approximation)
+          "\u0395": "E",
+          "\u03B5": "e",
+          // Ε ε (not exact)
+          "\u0396": "Z",
+          "\u03B6": "z",
+          // Ζ ζ (not exact)
+          "\u0397": "H",
+          "\u03B7": "n",
+          // Η η (not exact)
+          "\u0399": "I",
+          "\u03B9": "i",
+          // Ι ι
+          "\u039A": "K",
+          "\u03BA": "k",
+          // Κ κ
+          "\u039C": "M",
+          // Μ
+          "\u039D": "N",
+          // Ν
+          "\u039F": "O",
+          "\u03BF": "o",
+          // Ο ο
+          "\u03A1": "P",
+          "\u03C1": "p",
+          // Ρ ρ (not exact)
+          "\u03A4": "T",
+          "\u03C4": "t",
+          // Τ τ (not exact)
+          "\u03A5": "Y",
+          "\u03C5": "y",
+          // Υ υ (not exact)
+          "\u03A7": "X",
+          "\u03C7": "x",
+          // Χ χ (not exact)
+          "\u03C9": "w",
+          // ω (omega, visual approximation)
+          // ── Armenian → Latin ──────────────────────────────────────────────
+          "\u0555": "O",
+          // Օ
+          "\u0585": "o",
+          // օ
+          "\u054D": "S",
+          // Ս
+          "\u057D": "s",
+          // ս
+          "\u054C": "L",
+          // Լ (visual approximation)
+          "\u0570": "h",
+          // հ
+          // ── Cherokee → Latin ──────────────────────────────────────────────
+          "\u13A0": "D",
+          // Ꭰ
+          "\u13B3": "W",
+          // Ꮃ
+          "\u13A1": "R",
+          // Ꭱ
+          "\u13AA": "G",
+          // Ꭺ (looks like A but maps to G sound)
+          "\u13D2": "V",
+          // Ꮢ (visual approximation)
+          // ── Georgian → Latin ──────────────────────────────────────────────
+          "\u10D5": "v",
+          // ვ (Georgian letter vin)
+          "\u10D3": "d",
+          // დ (Georgian letter don)
+          "\u10DA": "l",
+          // ლ (Georgian letter las)
+          // ── Latin special → Latin ────────────────────────────────────────
+          "\u0131": "i",
+          // ı (Latin small letter dotless i)
+          // ── Symbols / Mathematical → Latin ────────────────────────────────
+          // Note: NFKC normalization handles mathematical alphanumerics (U+1D400–U+1D7FF)
+          "\u2160": "I",
+          // Ⅰ (Roman numeral one)
+          "\u2164": "V",
+          // Ⅴ (Roman numeral five)
+          "\u2169": "X",
+          // Ⅹ (Roman numeral ten)
+          "\u216C": "L",
+          // Ⅼ (Roman numeral fifty)
+          "\u216D": "C",
+          // Ⅽ (Roman numeral one hundred)
+          "\u216E": "D",
+          // Ⅾ (Roman numeral five hundred)
+          "\u216F": "M",
+          // Ⅿ (Roman numeral one thousand)
+          "\u2170": "i",
+          // ⅰ (small Roman numeral one)
+          "\u2174": "v",
+          // ⅴ (small Roman numeral five)
+          "\u2179": "x",
+          // ⅹ (small Roman numeral ten)
+          "\u217C": "l",
+          // ⅼ (small Roman numeral fifty)
+          "\u217D": "c",
+          // ⅽ (small Roman numeral one hundred)
+          "\u217E": "d",
+          // ⅾ (small Roman numeral five hundred)
+          "\u217F": "m",
+          // ⅿ (small Roman numeral one thousand)
+          "\u0251": "a",
+          // ɑ (Latin alpha — looks like 'a')
+          "\u0261": "g"
+          // ɡ (Latin small letter script G)
+        };
+        let result = value;
+        if (/[^\x00-\x7F]/.test(value)) {
+          const chars = [];
+          for (const ch of result) {
+            chars.push(confusables[ch] ?? ch);
+          }
+          result = chars.join("");
+        }
+        return result;
+      }
+      /**
+       * Compute confidence score based on signals.
+       * More high-severity signals = higher confidence.
+       */
+      computeConfidence(signals) {
+        if (signals.length === 0) return 0;
+        let score = 0;
+        let highCount = 0;
+        for (const sig of signals) {
+          switch (sig.severity) {
+            case "high":
+              highCount++;
+              score += 0.35;
+              break;
+            case "medium":
+              score += 0.15;
+              break;
+            case "low":
+              score += 0.05;
+              break;
+          }
+        }
+        if (highCount > 1) {
+          score += (highCount - 1) * 0.15;
+        }
+        return Math.min(score, 1);
+      }
+      /**
+       * Compute recommendation based on signals and sensitivity.
+       */
+      computeRecommendation(signals, sensitivity) {
+        if (signals.length === 0) return "allow";
+        const highSeverity = signals.filter((s) => s.severity === "high");
+        const mediumSeverity = signals.filter((s) => s.severity === "medium");
+        switch (sensitivity) {
+          case "low":
+            return highSeverity.length > 0 ? "escalate" : "allow";
+          case "medium":
+            if (highSeverity.length > 0) return "block";
+            return mediumSeverity.length > 0 ? "escalate" : "allow";
+          case "high":
+            if (highSeverity.length > 0 || mediumSeverity.length > 1) return "block";
+            if (mediumSeverity.length > 0) return "block";
+            return signals.length > 0 ? "escalate" : "allow";
+        }
+      }
+      /**
+       * Get statistics about scans performed.
+       */
+      getStats() {
+        return {
+          total_scans: this.stats.total_scans,
+          total_flags: this.stats.total_flags,
+          total_blocks: this.stats.total_blocks,
+          signals_by_type: { ...this.stats.signals_by_type }
+        };
+      }
+      /**
+       * Reset statistics.
+       */
+      resetStats() {
+        this.stats = {
+          total_scans: 0,
+          total_flags: 0,
+          total_blocks: 0,
+          signals_by_type: {}
+        };
+      }
+    };
+  }
+});
+
+// src/principal-policy/gate.ts
+var ApprovalGate;
+var init_gate = __esm({
+  "src/principal-policy/gate.ts"() {
+    init_loader();
+    init_injection_detector();
+    ApprovalGate = class {
+      policy;
+      baseline;
+      channel;
+      auditLog;
+      injectionDetector;
+      onInjectionAlert;
+      proxyTierResolver;
+      constructor(policy, baseline, channel, auditLog, injectionDetector, onInjectionAlert) {
+        this.policy = policy;
+        this.baseline = baseline;
+        this.channel = channel;
+        this.auditLog = auditLog;
+        this.injectionDetector = injectionDetector ?? new InjectionDetector();
+        this.onInjectionAlert = onInjectionAlert;
+      }
+      /**
+       * Set the proxy tier resolver. Called after the proxy router is initialized.
+       */
+      setProxyTierResolver(resolver) {
+        this.proxyTierResolver = resolver;
+      }
+      /**
+       * Evaluate a tool call against the Principal Policy.
+       *
+       * @param toolName - Full MCP tool name (e.g., "state_export")
+       * @param args - Tool call arguments (for context extraction)
+       * @returns GateResult indicating whether the call is allowed
+       */
+      async evaluate(toolName, args) {
+        const operation = extractOperationName(toolName);
+        this.baseline.recordToolCall(operation);
+        const injectionResult = this.injectionDetector.scan(toolName, args);
+        if (injectionResult.flagged) {
+          this.auditLog.append("l2", `injection_detected:${operation}`, "system", {
+            confidence: injectionResult.confidence,
+            signals: injectionResult.signals.map((s) => ({
+              type: s.type,
+              location: s.location,
+              severity: s.severity
+            })),
+            recommendation: injectionResult.recommendation
+          });
+          if (this.onInjectionAlert) {
+            this.onInjectionAlert({
+              toolName,
+              result: injectionResult,
+              timestamp: (/* @__PURE__ */ new Date()).toISOString()
+            });
+          }
+          if (injectionResult.recommendation === "block") {
+            return {
+              allowed: false,
+              tier: 1,
+              reason: `Blocked: prompt injection detected in "${operation}" (confidence: ${(injectionResult.confidence * 100).toFixed(0)}%)`,
+              approval_required: false
+            };
+          }
+          if (injectionResult.recommendation === "escalate") {
+            return this.requestApproval(
+              operation,
+              1,
+              `Potential prompt injection detected in "${operation}" (confidence: ${(injectionResult.confidence * 100).toFixed(0)}%, ${injectionResult.signals.length} signal(s))`,
+              {
+                operation,
+                injection_detection: {
+                  confidence: injectionResult.confidence,
+                  signal_count: injectionResult.signals.length,
+                  signal_types: [...new Set(injectionResult.signals.map((s) => s.type))]
+                }
+              }
+            );
+          }
+        }
+        if (toolName.startsWith("proxy/") && this.proxyTierResolver) {
+          const proxyTier = this.proxyTierResolver(toolName);
+          if (proxyTier !== null) {
+            if (proxyTier === 1) {
+              return this.requestApproval(operation, 1, `Proxy tool "${toolName}" is configured as Tier 1 (always requires approval)`, {
+                operation: toolName,
+                proxy: true,
+                args_summary: this.summarizeArgs(args)
+              });
+            }
+            if (proxyTier === 2) {
+              const anomaly2 = this.detectAnomaly(operation, args);
+              if (anomaly2) {
+                return this.requestApproval(operation, 2, `Proxy: ${anomaly2.reason}`, {
+                  ...anomaly2.context,
+                  proxy: true
+                });
+              }
+            }
+            this.auditLog.append("l2", `gate_allow_proxy:${toolName}`, "system", {
+              tier: proxyTier,
+              operation: toolName,
+              proxy: true
+            });
+            return {
+              allowed: true,
+              tier: proxyTier,
+              reason: `Proxy operation allowed (Tier ${proxyTier})`,
+              approval_required: false
+            };
+          }
+        }
+        if (this.policy.tier1_always_approve.includes(operation)) {
+          return this.requestApproval(operation, 1, `"${operation}" is a Tier 1 operation (always requires approval)`, {
+            operation,
+            args_summary: this.summarizeArgs(args)
+          });
+        }
+        const anomaly = this.detectAnomaly(operation, args);
+        if (anomaly) {
+          return this.requestApproval(operation, 2, anomaly.reason, anomaly.context);
+        }
+        if (this.policy.tier3_always_allow.includes(operation)) {
+          this.auditLog.append("l2", `gate_allow:${operation}`, "system", {
+            tier: 3,
+            operation
+          });
+          return {
+            allowed: true,
+            tier: 3,
+            reason: "Operation allowed (Tier 3)",
+            approval_required: false
+          };
+        }
+        this.auditLog.append("l2", `gate_unclassified:${operation}`, "system", {
+          tier: 1,
+          operation,
+          warning: "Operation is not classified in any policy tier \u2014 defaulting to Tier 1 (require approval)"
+        });
+        return this.requestApproval(
+          operation,
+          1,
+          `"${operation}" is not classified in any policy tier \u2014 requires approval (SEC-011 safe default)`,
+          { operation, unclassified: true }
+        );
+      }
+      /**
+       * Detect Tier 2 behavioral anomalies.
+       */
+      detectAnomaly(operation, args) {
+        const config = this.policy.tier2_anomaly;
+        if (this.baseline.isFirstSession && config.first_session_policy === "approve") {
+          if (!this.policy.tier3_always_allow.includes(operation)) {
+            return {
+              reason: `First session: "${operation}" has no established baseline`,
+              context: { operation, is_first_session: true }
+            };
+          }
+        }
+        if (config.new_namespace_access === "approve") {
+          const namespace = args.namespace;
+          if (namespace) {
+            const isNew = this.baseline.recordNamespaceAccess(namespace);
+            if (isNew) {
+              return {
+                reason: `First access to namespace "${namespace}" (not in session baseline)`,
+                context: {
+                  operation,
+                  namespace,
+                  known_namespaces: this.baseline.getProfile().known_namespaces
+                }
+              };
+            }
+          }
+        } else if (config.new_namespace_access === "log") {
+          const namespace = args.namespace;
+          if (namespace) {
+            this.baseline.recordNamespaceAccess(namespace);
+          }
+        }
+        if (config.new_counterparty === "approve") {
+          const counterpartyDid = args.counterparty_did ?? args.agent_identity_id;
+          if (counterpartyDid) {
+            const isNew = this.baseline.recordCounterparty(counterpartyDid);
+            if (isNew) {
+              return {
+                reason: `First interaction with counterparty "${counterpartyDid}"`,
+                context: {
+                  operation,
+                  counterparty_did: counterpartyDid,
+                  known_counterparties: this.baseline.getProfile().known_counterparties
+                }
+              };
+            }
+          }
+        } else if (config.new_counterparty === "log") {
+          const counterpartyDid = args.counterparty_did;
+          if (counterpartyDid) {
+            this.baseline.recordCounterparty(counterpartyDid);
+          }
+        }
+        if (operation === "identity_sign") {
+          const signCount = this.baseline.recordSign();
+          if (signCount > config.max_signs_per_minute) {
+            return {
+              reason: `Signing frequency (${signCount}/min) exceeds limit (${config.max_signs_per_minute}/min)`,
+              context: {
+                operation,
+                signs_per_minute: signCount,
+                limit: config.max_signs_per_minute
+              }
+            };
+          }
+        }
+        if (operation === "state_read") {
+          const namespace = args.namespace;
+          if (namespace) {
+            const readCount = this.baseline.recordNamespaceRead(namespace);
+            if (readCount > config.bulk_read_threshold) {
+              return {
+                reason: `Bulk read detected: ${readCount} reads from "${namespace}" in 60 seconds (threshold: ${config.bulk_read_threshold})`,
+                context: {
+                  operation,
+                  namespace,
+                  reads_in_window: readCount,
+                  threshold: config.bulk_read_threshold
+                }
+              };
+            }
+          }
+        }
+        const callRate = this.baseline.getCallRate(operation);
+        const avgRate = this.baseline.getAverageCallRate();
+        if (avgRate > 0 && callRate > avgRate * config.frequency_spike_multiplier) {
+          return {
+            reason: `Frequency spike: "${operation}" at ${callRate}/min (${config.frequency_spike_multiplier}\xD7 above average ${avgRate.toFixed(1)}/min)`,
+            context: {
+              operation,
+              current_rate: callRate,
+              average_rate: avgRate,
+              multiplier: config.frequency_spike_multiplier
+            }
+          };
+        }
+        return null;
+      }
+      /**
+       * Request approval from the human principal.
+       */
+      async requestApproval(operation, tier, reason, context) {
+        const request = {
+          operation,
+          tier,
+          reason,
+          context,
+          timestamp: (/* @__PURE__ */ new Date()).toISOString()
+        };
+        const response = await this.channel.requestApproval(request);
+        this.auditLog.append("l2", `gate_${response.decision}:${operation}`, "system", {
+          tier,
+          reason,
+          decided_by: response.decided_by
         });
         return {
-          allowed: true,
-          tier: proxyTier,
-          reason: `Proxy operation allowed (Tier ${proxyTier})`,
-          approval_required: false
+          allowed: response.decision === "approve",
+          tier,
+          reason: response.decision === "approve" ? `Approved by ${response.decided_by}` : reason,
+          approval_required: true,
+          approval_response: response
         };
       }
-    }
-    if (this.policy.tier1_always_approve.includes(operation)) {
-      return this.requestApproval(operation, 1, `"${operation}" is a Tier 1 operation (always requires approval)`, {
-        operation,
-        args_summary: this.summarizeArgs(args)
-      });
-    }
-    const anomaly = this.detectAnomaly(operation, args);
-    if (anomaly) {
-      return this.requestApproval(operation, 2, anomaly.reason, anomaly.context);
-    }
-    if (this.policy.tier3_always_allow.includes(operation)) {
-      this.auditLog.append("l2", `gate_allow:${operation}`, "system", {
-        tier: 3,
-        operation
-      });
-      return {
-        allowed: true,
-        tier: 3,
-        reason: "Operation allowed (Tier 3)",
-        approval_required: false
-      };
-    }
-    this.auditLog.append("l2", `gate_unclassified:${operation}`, "system", {
-      tier: 1,
-      operation,
-      warning: "Operation is not classified in any policy tier \u2014 defaulting to Tier 1 (require approval)"
-    });
-    return this.requestApproval(
-      operation,
-      1,
-      `"${operation}" is not classified in any policy tier \u2014 requires approval (SEC-011 safe default)`,
-      { operation, unclassified: true }
-    );
-  }
-  /**
-   * Detect Tier 2 behavioral anomalies.
-   */
-  detectAnomaly(operation, args) {
-    const config = this.policy.tier2_anomaly;
-    if (this.baseline.isFirstSession && config.first_session_policy === "approve") {
-      if (!this.policy.tier3_always_allow.includes(operation)) {
-        return {
-          reason: `First session: "${operation}" has no established baseline`,
-          context: { operation, is_first_session: true }
-        };
-      }
-    }
-    if (config.new_namespace_access === "approve") {
-      const namespace = args.namespace;
-      if (namespace) {
-        const isNew = this.baseline.recordNamespaceAccess(namespace);
-        if (isNew) {
-          return {
-            reason: `First access to namespace "${namespace}" (not in session baseline)`,
-            context: {
-              operation,
-              namespace,
-              known_namespaces: this.baseline.getProfile().known_namespaces
-            }
-          };
-        }
-      }
-    } else if (config.new_namespace_access === "log") {
-      const namespace = args.namespace;
-      if (namespace) {
-        this.baseline.recordNamespaceAccess(namespace);
-      }
-    }
-    if (config.new_counterparty === "approve") {
-      const counterpartyDid = args.counterparty_did ?? args.agent_identity_id;
-      if (counterpartyDid) {
-        const isNew = this.baseline.recordCounterparty(counterpartyDid);
-        if (isNew) {
-          return {
-            reason: `First interaction with counterparty "${counterpartyDid}"`,
-            context: {
-              operation,
-              counterparty_did: counterpartyDid,
-              known_counterparties: this.baseline.getProfile().known_counterparties
-            }
-          };
-        }
-      }
-    } else if (config.new_counterparty === "log") {
-      const counterpartyDid = args.counterparty_did;
-      if (counterpartyDid) {
-        this.baseline.recordCounterparty(counterpartyDid);
-      }
-    }
-    if (operation === "identity_sign") {
-      const signCount = this.baseline.recordSign();
-      if (signCount > config.max_signs_per_minute) {
-        return {
-          reason: `Signing frequency (${signCount}/min) exceeds limit (${config.max_signs_per_minute}/min)`,
-          context: {
-            operation,
-            signs_per_minute: signCount,
-            limit: config.max_signs_per_minute
+      /**
+       * Summarize tool arguments for the approval prompt.
+       * Strips potentially large values to keep the prompt readable.
+       */
+      summarizeArgs(args) {
+        const summary = {};
+        for (const [key, value] of Object.entries(args)) {
+          if (typeof value === "string" && value.length > 100) {
+            summary[key] = value.slice(0, 100) + "...";
+          } else {
+            summary[key] = value;
           }
-        };
-      }
-    }
-    if (operation === "state_read") {
-      const namespace = args.namespace;
-      if (namespace) {
-        const readCount = this.baseline.recordNamespaceRead(namespace);
-        if (readCount > config.bulk_read_threshold) {
-          return {
-            reason: `Bulk read detected: ${readCount} reads from "${namespace}" in 60 seconds (threshold: ${config.bulk_read_threshold})`,
-            context: {
-              operation,
-              namespace,
-              reads_in_window: readCount,
-              threshold: config.bulk_read_threshold
-            }
-          };
         }
+        return summary;
       }
-    }
-    const callRate = this.baseline.getCallRate(operation);
-    const avgRate = this.baseline.getAverageCallRate();
-    if (avgRate > 0 && callRate > avgRate * config.frequency_spike_multiplier) {
-      return {
-        reason: `Frequency spike: "${operation}" at ${callRate}/min (${config.frequency_spike_multiplier}\xD7 above average ${avgRate.toFixed(1)}/min)`,
-        context: {
-          operation,
-          current_rate: callRate,
-          average_rate: avgRate,
-          multiplier: config.frequency_spike_multiplier
-        }
-      };
-    }
-    return null;
-  }
-  /**
-   * Request approval from the human principal.
-   */
-  async requestApproval(operation, tier, reason, context) {
-    const request = {
-      operation,
-      tier,
-      reason,
-      context,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    const response = await this.channel.requestApproval(request);
-    this.auditLog.append("l2", `gate_${response.decision}:${operation}`, "system", {
-      tier,
-      reason,
-      decided_by: response.decided_by
-    });
-    return {
-      allowed: response.decision === "approve",
-      tier,
-      reason: response.decision === "approve" ? `Approved by ${response.decided_by}` : reason,
-      approval_required: true,
-      approval_response: response
+      /** Get the baseline tracker for saving at session end */
+      getBaseline() {
+        return this.baseline;
+      }
+      /** Get the injection detector for stats/configuration access */
+      getInjectionDetector() {
+        return this.injectionDetector;
+      }
     };
   }
-  /**
-   * Summarize tool arguments for the approval prompt.
-   * Strips potentially large values to keep the prompt readable.
-   */
-  summarizeArgs(args) {
-    const summary = {};
-    for (const [key, value] of Object.entries(args)) {
-      if (typeof value === "string" && value.length > 100) {
-        summary[key] = value.slice(0, 100) + "...";
-      } else {
-        summary[key] = value;
-      }
-    }
-    return summary;
-  }
-  /** Get the baseline tracker for saving at session end */
-  getBaseline() {
-    return this.baseline;
-  }
-  /** Get the injection detector for stats/configuration access */
-  getInjectionDetector() {
-    return this.injectionDetector;
-  }
-};
+});
 
 // src/principal-policy/tools.ts
-init_router();
 function createPrincipalPolicyTools(policy, baseline, auditLog) {
   return [
     {
@@ -11911,19 +11234,13 @@ function createPrincipalPolicyTools(policy, baseline, auditLog) {
     }
   ];
 }
-
-// src/index.ts
-init_router();
-init_router();
-
-// src/shr/tools.ts
-init_router();
-init_generator();
+var init_tools4 = __esm({
+  "src/principal-policy/tools.ts"() {
+    init_router();
+  }
+});
 
 // src/shr/verifier.ts
-init_types();
-init_identity();
-init_encoding();
 function verifySHR(shr, now) {
   const errors = [];
   const warnings = [];
@@ -11998,19 +11315,15 @@ function assessSovereigntyLevel(body) {
   }
   return "minimal";
 }
+var init_verifier = __esm({
+  "src/shr/verifier.ts"() {
+    init_types();
+    init_identity();
+    init_encoding();
+  }
+});
 
 // src/shr/gateway-adapter.ts
-var LAYER_WEIGHTS = {
-  l1: 100,
-  l2: 100,
-  l3: 100,
-  l4: 100
-};
-var DEGRADATION_IMPACT = {
-  critical: 40,
-  warning: 25,
-  info: 10
-};
 function transformSHRForGateway(shr) {
   const { body, signed_by, signature } = shr;
   const layerScores = calculateLayerScores(body);
@@ -12229,6 +11542,22 @@ function transformSHRGeneric(shr) {
     signature: context.shr_signature
   };
 }
+var LAYER_WEIGHTS, DEGRADATION_IMPACT;
+var init_gateway_adapter = __esm({
+  "src/shr/gateway-adapter.ts"() {
+    LAYER_WEIGHTS = {
+      l1: 100,
+      l2: 100,
+      l3: 100,
+      l4: 100
+    };
+    DEGRADATION_IMPACT = {
+      critical: 40,
+      warning: 25,
+      info: 10
+    };
+  }
+});
 
 // src/shr/tools.ts
 function createSHRTools(config, identityManager, masterKey, auditLog) {
@@ -12343,19 +11672,16 @@ function createSHRTools(config, identityManager, masterKey, auditLog) {
   ];
   return { tools };
 }
-
-// src/handshake/tools.ts
-init_router();
-init_generator();
-init_identity();
-init_key_derivation();
-init_encoding();
+var init_tools5 = __esm({
+  "src/shr/tools.ts"() {
+    init_router();
+    init_generator();
+    init_verifier();
+    init_gateway_adapter();
+  }
+});
 
 // src/handshake/protocol.ts
-init_identity();
-init_encoding();
-init_random();
-init_key_derivation();
 function generateNonce() {
   return toBase64url(randomBytes(32));
 }
@@ -12520,15 +11846,17 @@ function deriveTrustTier(level) {
       return "unverified";
   }
 }
+var init_protocol = __esm({
+  "src/handshake/protocol.ts"() {
+    init_verifier();
+    init_identity();
+    init_encoding();
+    init_random();
+    init_key_derivation();
+  }
+});
 
 // src/handshake/attestation.ts
-init_types();
-init_identity();
-init_encoding();
-init_key_derivation();
-init_identity();
-init_encoding();
-var ATTESTATION_VERSION = "1.0";
 function deriveTrustTier2(level) {
   switch (level) {
     case "full":
@@ -12672,6 +12000,18 @@ function verifyAttestation(attestation, now) {
     expired
   };
 }
+var ATTESTATION_VERSION;
+var init_attestation = __esm({
+  "src/handshake/attestation.ts"() {
+    init_types();
+    init_identity();
+    init_encoding();
+    init_key_derivation();
+    init_identity();
+    init_encoding();
+    ATTESTATION_VERSION = "1.0";
+  }
+});
 
 // src/handshake/tools.ts
 function createHandshakeTools(config, identityManager, masterKey, auditLog, options) {
@@ -13038,180 +12378,195 @@ function createHandshakeTools(config, identityManager, masterKey, auditLog, opti
   ];
   return { tools, handshakeResults };
 }
-
-// src/federation/tools.ts
-init_router();
+var init_tools6 = __esm({
+  "src/handshake/tools.ts"() {
+    init_router();
+    init_generator();
+    init_identity();
+    init_key_derivation();
+    init_encoding();
+    init_protocol();
+    init_attestation();
+    init_verifier();
+  }
+});
 
 // src/federation/registry.ts
-var DEFAULT_CAPABILITIES = {
-  reputation_exchange: true,
-  mutual_attestation: true,
-  encrypted_channel: false,
-  attestation_formats: ["sanctuary-interaction-v1"]
-};
-var FederationRegistry = class {
-  peers = /* @__PURE__ */ new Map();
-  /**
-   * Register or update a peer from a completed handshake.
-   * This is the ONLY way peers enter the registry.
-   */
-  registerFromHandshake(result, peerDid, capabilities) {
-    const existing = this.peers.get(result.counterparty_id);
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const peer = {
-      peer_id: result.counterparty_id,
-      peer_did: peerDid,
-      first_seen: existing?.first_seen ?? now,
-      last_handshake: result.completed_at,
-      trust_tier: trustTierToSovereigntyTier(result.trust_tier),
-      handshake_result: result,
-      capabilities: {
-        ...DEFAULT_CAPABILITIES,
-        ...existing?.capabilities ?? {},
-        ...capabilities ?? {}
-      },
-      active: result.verified && new Date(result.expires_at) > /* @__PURE__ */ new Date()
+var DEFAULT_CAPABILITIES, FederationRegistry;
+var init_registry = __esm({
+  "src/federation/registry.ts"() {
+    init_tiers();
+    DEFAULT_CAPABILITIES = {
+      reputation_exchange: true,
+      mutual_attestation: true,
+      encrypted_channel: false,
+      attestation_formats: ["sanctuary-interaction-v1"]
     };
-    if (!peer.active) {
-      peer.trust_tier = "self-attested";
-    }
-    this.peers.set(result.counterparty_id, peer);
-    return peer;
-  }
-  /**
-   * Get a peer by instance ID.
-   * Automatically updates active status based on handshake expiry.
-   */
-  getPeer(peerId) {
-    const peer = this.peers.get(peerId);
-    if (!peer) return null;
-    if (peer.active && new Date(peer.handshake_result.expires_at) <= /* @__PURE__ */ new Date()) {
-      peer.active = false;
-      peer.trust_tier = "self-attested";
-    }
-    return peer;
-  }
-  /**
-   * List all known peers, optionally filtered by status.
-   */
-  listPeers(filter) {
-    const peers = Array.from(this.peers.values());
-    for (const peer of peers) {
-      if (peer.active && new Date(peer.handshake_result.expires_at) <= /* @__PURE__ */ new Date()) {
-        peer.active = false;
-        peer.trust_tier = "self-attested";
+    FederationRegistry = class {
+      peers = /* @__PURE__ */ new Map();
+      /**
+       * Register or update a peer from a completed handshake.
+       * This is the ONLY way peers enter the registry.
+       */
+      registerFromHandshake(result, peerDid, capabilities) {
+        const existing = this.peers.get(result.counterparty_id);
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const peer = {
+          peer_id: result.counterparty_id,
+          peer_did: peerDid,
+          first_seen: existing?.first_seen ?? now,
+          last_handshake: result.completed_at,
+          trust_tier: trustTierToSovereigntyTier(result.trust_tier),
+          handshake_result: result,
+          capabilities: {
+            ...DEFAULT_CAPABILITIES,
+            ...existing?.capabilities ?? {},
+            ...capabilities ?? {}
+          },
+          active: result.verified && new Date(result.expires_at) > /* @__PURE__ */ new Date()
+        };
+        if (!peer.active) {
+          peer.trust_tier = "self-attested";
+        }
+        this.peers.set(result.counterparty_id, peer);
+        return peer;
       }
-    }
-    if (filter?.active_only) {
-      return peers.filter((p) => p.active);
-    }
-    return peers;
-  }
-  /**
-   * Evaluate trust for a federation peer.
-   *
-   * Trust assessment considers:
-   * - Handshake status (current vs expired)
-   * - Sovereignty tier (verified-sovereign vs degraded vs unverified)
-   * - Reputation data (if available)
-   * - Mutual attestation history
-   */
-  evaluateTrust(peerId, mutualAttestationCount = 0, reputationScore) {
-    const peer = this.getPeer(peerId);
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    if (!peer) {
-      return {
-        peer_id: peerId,
-        sovereignty_tier: "unverified",
-        handshake_current: false,
-        mutual_attestation_count: 0,
-        trust_level: "none",
-        factors: ["Peer not found in federation registry"],
-        evaluated_at: now
-      };
-    }
-    const factors = [];
-    let score = 0;
-    if (peer.active) {
-      factors.push("Active handshake (trust current)");
-      score += 3;
-    } else {
-      factors.push("Handshake expired (trust degraded)");
-      score += 1;
-    }
-    switch (peer.trust_tier) {
-      case "verified-sovereign":
-        factors.push("Verified sovereign \u2014 full sovereignty posture");
-        score += 4;
-        break;
-      case "verified-degraded":
-        factors.push("Verified degraded \u2014 sovereignty with known limitations");
-        score += 3;
-        break;
-      case "self-attested":
-        factors.push("Self-attested \u2014 claims not independently verified");
-        score += 1;
-        break;
-      case "unverified":
-        factors.push("Unverified \u2014 no sovereignty proof");
-        score += 0;
-        break;
-    }
-    if (mutualAttestationCount > 10) {
-      factors.push(`Strong attestation history (${mutualAttestationCount} mutual attestations)`);
-      score += 3;
-    } else if (mutualAttestationCount > 0) {
-      factors.push(`Some attestation history (${mutualAttestationCount} mutual attestations)`);
-      score += 1;
-    } else {
-      factors.push("No mutual attestation history");
-    }
-    if (reputationScore !== void 0) {
-      if (reputationScore >= 80) {
-        factors.push(`High reputation score (${reputationScore})`);
-        score += 2;
-      } else if (reputationScore >= 50) {
-        factors.push(`Moderate reputation score (${reputationScore})`);
-        score += 1;
-      } else {
-        factors.push(`Low reputation score (${reputationScore})`);
+      /**
+       * Get a peer by instance ID.
+       * Automatically updates active status based on handshake expiry.
+       */
+      getPeer(peerId) {
+        const peer = this.peers.get(peerId);
+        if (!peer) return null;
+        if (peer.active && new Date(peer.handshake_result.expires_at) <= /* @__PURE__ */ new Date()) {
+          peer.active = false;
+          peer.trust_tier = "self-attested";
+        }
+        return peer;
       }
-    }
-    let trust_level;
-    if (score >= 9) trust_level = "high";
-    else if (score >= 5) trust_level = "medium";
-    else if (score >= 2) trust_level = "low";
-    else trust_level = "none";
-    return {
-      peer_id: peerId,
-      sovereignty_tier: peer.trust_tier,
-      handshake_current: peer.active,
-      reputation_score: reputationScore,
-      mutual_attestation_count: mutualAttestationCount,
-      trust_level,
-      factors,
-      evaluated_at: now
+      /**
+       * List all known peers, optionally filtered by status.
+       */
+      listPeers(filter) {
+        const peers = Array.from(this.peers.values());
+        for (const peer of peers) {
+          if (peer.active && new Date(peer.handshake_result.expires_at) <= /* @__PURE__ */ new Date()) {
+            peer.active = false;
+            peer.trust_tier = "self-attested";
+          }
+        }
+        if (filter?.active_only) {
+          return peers.filter((p) => p.active);
+        }
+        return peers;
+      }
+      /**
+       * Evaluate trust for a federation peer.
+       *
+       * Trust assessment considers:
+       * - Handshake status (current vs expired)
+       * - Sovereignty tier (verified-sovereign vs degraded vs unverified)
+       * - Reputation data (if available)
+       * - Mutual attestation history
+       */
+      evaluateTrust(peerId, mutualAttestationCount = 0, reputationScore) {
+        const peer = this.getPeer(peerId);
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        if (!peer) {
+          return {
+            peer_id: peerId,
+            sovereignty_tier: "unverified",
+            handshake_current: false,
+            mutual_attestation_count: 0,
+            trust_level: "none",
+            factors: ["Peer not found in federation registry"],
+            evaluated_at: now
+          };
+        }
+        const factors = [];
+        let score = 0;
+        if (peer.active) {
+          factors.push("Active handshake (trust current)");
+          score += 3;
+        } else {
+          factors.push("Handshake expired (trust degraded)");
+          score += 1;
+        }
+        switch (peer.trust_tier) {
+          case "verified-sovereign":
+            factors.push("Verified sovereign \u2014 full sovereignty posture");
+            score += 4;
+            break;
+          case "verified-degraded":
+            factors.push("Verified degraded \u2014 sovereignty with known limitations");
+            score += 3;
+            break;
+          case "self-attested":
+            factors.push("Self-attested \u2014 claims not independently verified");
+            score += 1;
+            break;
+          case "unverified":
+            factors.push("Unverified \u2014 no sovereignty proof");
+            score += 0;
+            break;
+        }
+        if (mutualAttestationCount > 10) {
+          factors.push(`Strong attestation history (${mutualAttestationCount} mutual attestations)`);
+          score += 3;
+        } else if (mutualAttestationCount > 0) {
+          factors.push(`Some attestation history (${mutualAttestationCount} mutual attestations)`);
+          score += 1;
+        } else {
+          factors.push("No mutual attestation history");
+        }
+        if (reputationScore !== void 0) {
+          if (reputationScore >= 80) {
+            factors.push(`High reputation score (${reputationScore})`);
+            score += 2;
+          } else if (reputationScore >= 50) {
+            factors.push(`Moderate reputation score (${reputationScore})`);
+            score += 1;
+          } else {
+            factors.push(`Low reputation score (${reputationScore})`);
+          }
+        }
+        let trust_level;
+        if (score >= 9) trust_level = "high";
+        else if (score >= 5) trust_level = "medium";
+        else if (score >= 2) trust_level = "low";
+        else trust_level = "none";
+        return {
+          peer_id: peerId,
+          sovereignty_tier: peer.trust_tier,
+          handshake_current: peer.active,
+          reputation_score: reputationScore,
+          mutual_attestation_count: mutualAttestationCount,
+          trust_level,
+          factors,
+          evaluated_at: now
+        };
+      }
+      /**
+       * Remove a peer from the registry.
+       */
+      removePeer(peerId) {
+        return this.peers.delete(peerId);
+      }
+      /**
+       * Get the handshake results map (for tier resolution integration).
+       */
+      getHandshakeResults() {
+        const results = /* @__PURE__ */ new Map();
+        for (const [id, peer] of this.peers) {
+          if (peer.active) {
+            results.set(id, peer.handshake_result);
+          }
+        }
+        return results;
+      }
     };
   }
-  /**
-   * Remove a peer from the registry.
-   */
-  removePeer(peerId) {
-    return this.peers.delete(peerId);
-  }
-  /**
-   * Get the handshake results map (for tier resolution integration).
-   */
-  getHandshakeResults() {
-    const results = /* @__PURE__ */ new Map();
-    for (const [id, peer] of this.peers) {
-      if (peer.active) {
-        results.set(id, peer.handshake_result);
-      }
-    }
-    return results;
-  }
-};
+});
 
 // src/federation/tools.ts
 function createFederationTools(auditLog, handshakeResults) {
@@ -13398,19 +12753,14 @@ function createFederationTools(auditLog, handshakeResults) {
   ];
   return { tools, registry };
 }
-
-// src/bridge/tools.ts
-init_router();
-init_key_derivation();
-init_encoding();
-init_encryption();
-init_encoding();
+var init_tools7 = __esm({
+  "src/federation/tools.ts"() {
+    init_router();
+    init_registry();
+  }
+});
 
 // src/bridge/bridge.ts
-init_identity();
-init_encoding();
-init_random();
-init_hashing();
 function canonicalize(outcome) {
   return stringToBytes(stableStringify(outcome));
 }
@@ -13444,7 +12794,7 @@ function createBridgeCommitment(outcome, identity, identityEncryptionKey, includ
   const now = (/* @__PURE__ */ new Date()).toISOString();
   const canonicalBytes = canonicalize(outcome);
   const canonicalString = new TextDecoder().decode(canonicalBytes);
-  const sha2565 = createCommitment(canonicalString);
+  const sha2566 = createCommitment(canonicalString);
   let pedersenData;
   if (includePedersen && Number.isInteger(outcome.rounds) && outcome.rounds >= 0) {
     const pedersen = createPedersenCommitment(outcome.rounds);
@@ -13456,7 +12806,7 @@ function createBridgeCommitment(outcome, identity, identityEncryptionKey, includ
   const commitmentPayload = {
     bridge_commitment_id: commitmentId,
     session_id: outcome.session_id,
-    sha256_commitment: sha2565.commitment,
+    sha256_commitment: sha2566.commitment,
     terms_hash: outcome.terms_hash,
     committer_did: identity.did,
     committed_at: now,
@@ -13467,8 +12817,8 @@ function createBridgeCommitment(outcome, identity, identityEncryptionKey, includ
   return {
     bridge_commitment_id: commitmentId,
     session_id: outcome.session_id,
-    sha256_commitment: sha2565.commitment,
-    blinding_factor: sha2565.blinding_factor,
+    sha256_commitment: sha2566.commitment,
+    blinding_factor: sha2566.blinding_factor,
     committer_did: identity.did,
     signature: toBase64url(signature),
     pedersen_commitment: pedersenData,
@@ -13522,37 +12872,18 @@ function verifyBridgeCommitment(commitment, outcome, committerPublicKey) {
     verified_at: now
   };
 }
+var init_bridge = __esm({
+  "src/bridge/bridge.ts"() {
+    init_commitments();
+    init_zk_proofs();
+    init_identity();
+    init_encoding();
+    init_random();
+    init_hashing();
+  }
+});
 
 // src/bridge/tools.ts
-var BridgeStore = class {
-  storage;
-  encryptionKey;
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.encryptionKey = derivePurposeKey(masterKey, "bridge-commitments");
-  }
-  async save(commitment, outcome) {
-    const record = { commitment, outcome };
-    const serialized = stringToBytes(JSON.stringify(record));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_bridge",
-      commitment.bridge_commitment_id,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-  }
-  async get(commitmentId) {
-    const raw = await this.storage.read("_bridge", commitmentId);
-    if (!raw) return null;
-    try {
-      const encrypted = JSON.parse(bytesToString(raw));
-      const decrypted = decrypt(encrypted, this.encryptionKey);
-      return JSON.parse(bytesToString(decrypted));
-    } catch {
-      return null;
-    }
-  }
-};
 function createBridgeTools(storage, masterKey, identityManager, auditLog, handshakeResults) {
   const bridgeStore = new BridgeStore(storage, masterKey);
   const reputationStore = new ReputationStore(storage, masterKey);
@@ -13816,6 +13147,48 @@ function createBridgeTools(storage, masterKey, identityManager, auditLog, handsh
   ];
   return { tools };
 }
+var BridgeStore;
+var init_tools8 = __esm({
+  "src/bridge/tools.ts"() {
+    init_router();
+    init_reputation_store();
+    init_tiers();
+    init_key_derivation();
+    init_encoding();
+    init_encryption();
+    init_encoding();
+    init_bridge();
+    BridgeStore = class {
+      storage;
+      encryptionKey;
+      constructor(storage, masterKey) {
+        this.storage = storage;
+        this.encryptionKey = derivePurposeKey(masterKey, "bridge-commitments");
+      }
+      async save(commitment, outcome) {
+        const record = { commitment, outcome };
+        const serialized = stringToBytes(JSON.stringify(record));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          "_bridge",
+          commitment.bridge_commitment_id,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+      }
+      async get(commitmentId) {
+        const raw = await this.storage.read("_bridge", commitmentId);
+        if (!raw) return null;
+        try {
+          const encrypted = JSON.parse(bytesToString(raw));
+          const decrypted = decrypt(encrypted, this.encryptionKey);
+          return JSON.parse(bytesToString(decrypted));
+        } catch {
+          return null;
+        }
+      }
+    };
+  }
+});
 function lenientJsonParse(raw) {
   let cleaned = raw.replace(/\/\/[^\n]*/g, "");
   cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, "");
@@ -13955,61 +13328,12 @@ async function auditOpenClawConfig(configPath, envPath, _memoryPath, configExist
   }
   return audit;
 }
+var init_detector = __esm({
+  "src/audit/detector.ts"() {
+  }
+});
 
 // src/audit/analyzer.ts
-var L1_ENCRYPTION_AT_REST = 10;
-var L1_IDENTITY_CRYPTOGRAPHIC = 10;
-var L1_INTEGRITY_VERIFICATION = 8;
-var L1_STATE_PORTABLE = 7;
-var L2_THREE_TIER_GATE = 10;
-var L2_BINARY_GATE = 3;
-var L2_ANOMALY_DETECTION = 5;
-var L2_ENCRYPTED_AUDIT = 4;
-var L2_TOOL_SANDBOXING = 2;
-var L2_CONTEXT_GATING = 4;
-var L2_PROCESS_HARDENING = 5;
-var L3_COMMITMENT_SCHEME = 8;
-var L3_ZK_PROOFS = 7;
-var L3_DISCLOSURE_POLICIES = 5;
-var L4_PORTABLE_REPUTATION = 6;
-var L4_SIGNED_ATTESTATIONS = 6;
-var L4_SYBIL_DETECTION = 4;
-var L4_SOVEREIGNTY_GATED = 4;
-var SEVERITY_ORDER = {
-  critical: 0,
-  high: 1,
-  medium: 2,
-  low: 3
-};
-var INCIDENT_META_SEV1 = {
-  id: "META-SEV1-2026",
-  name: "Meta Sev 1: Unauthorized autonomous data exposure",
-  date: "2026-03-18",
-  description: "AI agent autonomously posted proprietary code, business strategies, and user datasets to an internal forum without human approval. Two-hour exposure window."
-};
-var INCIDENT_OPENCLAW_SANDBOX = {
-  id: "OPENCLAW-CVE-2026",
-  name: "OpenClaw sandbox escape via privilege inheritance",
-  date: "2026-03-18",
-  description: "Nine CVEs in four days. Child processes inherited sandbox.mode=off from parent, bypassing runtime confinement. 42,900+ internet-exposed instances, 15,200 vulnerable to RCE.",
-  cves: [
-    "CVE-2026-32048",
-    "CVE-2026-32915",
-    "CVE-2026-32918"
-  ]
-};
-var INCIDENT_CONTEXT_LEAKAGE = {
-  id: "CONTEXT-LEAK-CLASS",
-  name: "Context leakage: Full state exposure to inference providers",
-  date: "2026-03",
-  description: "Agents send full context \u2014 conversation history, memory, secrets, internal reasoning \u2014 to remote LLM providers on every inference call with no filtering mechanism."
-};
-var INCIDENT_CLAUDE_CODE_LEAK = {
-  id: "CLAUDE-CODE-LEAK-2026",
-  name: "Claude Code source leak: 512K lines exposed via npm source map",
-  date: "2026-03-31",
-  description: "Anthropic accidentally shipped a 59.8 MB source map in npm package v2.1.88, exposing the full Claude Code TypeScript source \u2014 1,900 files, internal model codenames, unreleased features, OAuth flows, and multi-agent coordination logic."
-};
 function analyzeSovereignty(env, config) {
   const l1 = assessL1(env, config);
   const l2 = assessL2(env);
@@ -14526,6 +13850,64 @@ function wordWrap(text, maxWidth) {
   if (current.length > 0) lines.push(current);
   return lines;
 }
+var L1_ENCRYPTION_AT_REST, L1_IDENTITY_CRYPTOGRAPHIC, L1_INTEGRITY_VERIFICATION, L1_STATE_PORTABLE, L2_THREE_TIER_GATE, L2_BINARY_GATE, L2_ANOMALY_DETECTION, L2_ENCRYPTED_AUDIT, L2_TOOL_SANDBOXING, L2_CONTEXT_GATING, L2_PROCESS_HARDENING, L3_COMMITMENT_SCHEME, L3_ZK_PROOFS, L3_DISCLOSURE_POLICIES, L4_PORTABLE_REPUTATION, L4_SIGNED_ATTESTATIONS, L4_SYBIL_DETECTION, L4_SOVEREIGNTY_GATED, SEVERITY_ORDER, INCIDENT_META_SEV1, INCIDENT_OPENCLAW_SANDBOX, INCIDENT_CONTEXT_LEAKAGE, INCIDENT_CLAUDE_CODE_LEAK;
+var init_analyzer = __esm({
+  "src/audit/analyzer.ts"() {
+    L1_ENCRYPTION_AT_REST = 10;
+    L1_IDENTITY_CRYPTOGRAPHIC = 10;
+    L1_INTEGRITY_VERIFICATION = 8;
+    L1_STATE_PORTABLE = 7;
+    L2_THREE_TIER_GATE = 10;
+    L2_BINARY_GATE = 3;
+    L2_ANOMALY_DETECTION = 5;
+    L2_ENCRYPTED_AUDIT = 4;
+    L2_TOOL_SANDBOXING = 2;
+    L2_CONTEXT_GATING = 4;
+    L2_PROCESS_HARDENING = 5;
+    L3_COMMITMENT_SCHEME = 8;
+    L3_ZK_PROOFS = 7;
+    L3_DISCLOSURE_POLICIES = 5;
+    L4_PORTABLE_REPUTATION = 6;
+    L4_SIGNED_ATTESTATIONS = 6;
+    L4_SYBIL_DETECTION = 4;
+    L4_SOVEREIGNTY_GATED = 4;
+    SEVERITY_ORDER = {
+      critical: 0,
+      high: 1,
+      medium: 2,
+      low: 3
+    };
+    INCIDENT_META_SEV1 = {
+      id: "META-SEV1-2026",
+      name: "Meta Sev 1: Unauthorized autonomous data exposure",
+      date: "2026-03-18",
+      description: "AI agent autonomously posted proprietary code, business strategies, and user datasets to an internal forum without human approval. Two-hour exposure window."
+    };
+    INCIDENT_OPENCLAW_SANDBOX = {
+      id: "OPENCLAW-CVE-2026",
+      name: "OpenClaw sandbox escape via privilege inheritance",
+      date: "2026-03-18",
+      description: "Nine CVEs in four days. Child processes inherited sandbox.mode=off from parent, bypassing runtime confinement. 42,900+ internet-exposed instances, 15,200 vulnerable to RCE.",
+      cves: [
+        "CVE-2026-32048",
+        "CVE-2026-32915",
+        "CVE-2026-32918"
+      ]
+    };
+    INCIDENT_CONTEXT_LEAKAGE = {
+      id: "CONTEXT-LEAK-CLASS",
+      name: "Context leakage: Full state exposure to inference providers",
+      date: "2026-03",
+      description: "Agents send full context \u2014 conversation history, memory, secrets, internal reasoning \u2014 to remote LLM providers on every inference call with no filtering mechanism."
+    };
+    INCIDENT_CLAUDE_CODE_LEAK = {
+      id: "CLAUDE-CODE-LEAK-2026",
+      name: "Claude Code source leak: 512K lines exposed via npm source map",
+      date: "2026-03-31",
+      description: "Anthropic accidentally shipped a 59.8 MB source map in npm package v2.1.88, exposing the full Claude Code TypeScript source \u2014 1,900 files, internal model codenames, unreleased features, OAuth flows, and multi-agent coordination logic."
+    };
+  }
+});
 
 // src/audit/tools.ts
 function createAuditTools(config) {
@@ -14558,6 +13940,12 @@ function createAuditTools(config) {
   ];
   return { tools };
 }
+var init_tools9 = __esm({
+  "src/audit/tools.ts"() {
+    init_detector();
+    init_analyzer();
+  }
+});
 
 // src/audit/siem-formatter.ts
 function parseGateDecision(details) {
@@ -14679,13 +14067,17 @@ function formatAsOCSF(entry) {
     }
   };
 }
+var init_siem_formatter = __esm({
+  "src/audit/siem-formatter.ts"() {
+  }
+});
 
 // src/audit/siem-tools.ts
 function createSIEMTools(auditLog) {
   const tools = [
     {
       name: "audit_export_siem",
-      description: "Export audit log events in SIEM-standard formats (CEF or OCSF) for ingestion into Splunk, Datadog, QRadar, and other security information and event management (SIEM) platforms. Encrypted audit entries are decrypted and formatted according to your chosen standard. Tier 2 \u2014 may contain sensitive operation metadata.",
+      description: "Export audit log events in SIEM-standard formats (CEF or OCSF) for ingestion into Splunk, Datadog, QRadar, and other security information and event management (SIEM) platforms. Encrypted audit entries are decrypted and formatted according to your chosen standard. Tier 3 \u2014 auto-allow (read-only, audit logging only).",
       inputSchema: {
         type: "object",
         properties: {
@@ -14854,19 +14246,13 @@ function createSIEMTools(auditLog) {
   ];
   return { tools };
 }
-
-// src/l2-operational/context-gate-tools.ts
-init_router();
+var init_siem_tools = __esm({
+  "src/audit/siem-tools.ts"() {
+    init_siem_formatter();
+  }
+});
 
 // src/l2-operational/context-gate.ts
-init_encryption();
-init_key_derivation();
-init_encoding();
-init_random();
-init_hashing();
-var MAX_CONTEXT_FIELDS = 1e3;
-var MAX_POLICY_RULES = 50;
-var MAX_PATTERNS_PER_ARRAY = 500;
 function evaluateField(policy, provider, field) {
   const exactRule = policy.rules.find((r) => r.provider === provider);
   const wildcardRule = policy.rules.find((r) => r.provider === "*");
@@ -14998,546 +14384,382 @@ function matchesPattern(field, patterns) {
   }
   return false;
 }
-var ContextGatePolicyStore = class {
-  storage;
-  encryptionKey;
-  policies = /* @__PURE__ */ new Map();
-  constructor(storage, masterKey) {
-    this.storage = storage;
-    this.encryptionKey = derivePurposeKey(masterKey, "l2-context-gate");
-  }
-  /**
-   * Create and store a new context-gating policy.
-   */
-  async create(policyName, rules, defaultAction, identityId) {
-    const policyId = `cg-${Date.now()}-${toBase64url(randomBytes(8))}`;
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const policy = {
-      policy_id: policyId,
-      policy_name: policyName,
-      rules,
-      default_action: defaultAction,
-      identity_id: identityId,
-      created_at: now,
-      updated_at: now
-    };
-    await this.persist(policy);
-    this.policies.set(policyId, policy);
-    return policy;
-  }
-  /**
-   * Get a policy by ID.
-   */
-  async get(policyId) {
-    if (this.policies.has(policyId)) {
-      return this.policies.get(policyId);
-    }
-    const raw = await this.storage.read("_context_gate_policies", policyId);
-    if (!raw) return null;
-    try {
-      const encrypted = JSON.parse(bytesToString(raw));
-      const decrypted = decrypt(encrypted, this.encryptionKey);
-      const policy = JSON.parse(bytesToString(decrypted));
-      this.policies.set(policyId, policy);
-      return policy;
-    } catch {
-      return null;
-    }
-  }
-  /**
-   * List all context-gating policies.
-   */
-  async list() {
-    await this.loadAll();
-    return Array.from(this.policies.values());
-  }
-  /**
-   * Load all persisted policies into memory.
-   */
-  async loadAll() {
-    try {
-      const entries = await this.storage.list("_context_gate_policies");
-      for (const meta of entries) {
-        if (this.policies.has(meta.key)) continue;
-        const raw = await this.storage.read("_context_gate_policies", meta.key);
-        if (!raw) continue;
+var MAX_CONTEXT_FIELDS, MAX_POLICY_RULES, MAX_PATTERNS_PER_ARRAY, ContextGatePolicyStore;
+var init_context_gate = __esm({
+  "src/l2-operational/context-gate.ts"() {
+    init_encryption();
+    init_key_derivation();
+    init_encoding();
+    init_random();
+    init_hashing();
+    MAX_CONTEXT_FIELDS = 1e3;
+    MAX_POLICY_RULES = 50;
+    MAX_PATTERNS_PER_ARRAY = 500;
+    ContextGatePolicyStore = class {
+      storage;
+      encryptionKey;
+      policies = /* @__PURE__ */ new Map();
+      constructor(storage, masterKey) {
+        this.storage = storage;
+        this.encryptionKey = derivePurposeKey(masterKey, "l2-context-gate");
+      }
+      /**
+       * Create and store a new context-gating policy.
+       */
+      async create(policyName, rules, defaultAction, identityId) {
+        const policyId = `cg-${Date.now()}-${toBase64url(randomBytes(8))}`;
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const policy = {
+          policy_id: policyId,
+          policy_name: policyName,
+          rules,
+          default_action: defaultAction,
+          identity_id: identityId,
+          created_at: now,
+          updated_at: now
+        };
+        await this.persist(policy);
+        this.policies.set(policyId, policy);
+        return policy;
+      }
+      /**
+       * Get a policy by ID.
+       */
+      async get(policyId) {
+        if (this.policies.has(policyId)) {
+          return this.policies.get(policyId);
+        }
+        const raw = await this.storage.read("_context_gate_policies", policyId);
+        if (!raw) return null;
         try {
           const encrypted = JSON.parse(bytesToString(raw));
           const decrypted = decrypt(encrypted, this.encryptionKey);
           const policy = JSON.parse(bytesToString(decrypted));
-          this.policies.set(policy.policy_id, policy);
+          this.policies.set(policyId, policy);
+          return policy;
+        } catch {
+          return null;
+        }
+      }
+      /**
+       * List all context-gating policies.
+       */
+      async list() {
+        await this.loadAll();
+        return Array.from(this.policies.values());
+      }
+      /**
+       * Load all persisted policies into memory.
+       */
+      async loadAll() {
+        try {
+          const entries = await this.storage.list("_context_gate_policies");
+          for (const meta of entries) {
+            if (this.policies.has(meta.key)) continue;
+            const raw = await this.storage.read("_context_gate_policies", meta.key);
+            if (!raw) continue;
+            try {
+              const encrypted = JSON.parse(bytesToString(raw));
+              const decrypted = decrypt(encrypted, this.encryptionKey);
+              const policy = JSON.parse(bytesToString(decrypted));
+              this.policies.set(policy.policy_id, policy);
+            } catch {
+            }
+          }
         } catch {
         }
       }
-    } catch {
-    }
+      async persist(policy) {
+        const serialized = stringToBytes(JSON.stringify(policy));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          "_context_gate_policies",
+          policy.policy_id,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+      }
+    };
   }
-  async persist(policy) {
-    const serialized = stringToBytes(JSON.stringify(policy));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_context_gate_policies",
-      policy.policy_id,
-      stringToBytes(JSON.stringify(encrypted))
-    );
-  }
-};
+});
 
 // src/l2-operational/context-gate-templates.ts
-var ALWAYS_REDACT_SECRETS = [
-  "api_key",
-  "secret_*",
-  "*_secret",
-  "*_token",
-  "*_key",
-  "password",
-  "*_password",
-  "credential",
-  "*_credential",
-  "private_key",
-  "recovery_key",
-  "passphrase",
-  "auth_*"
-];
-var PII_PATTERNS = [
-  "*_pii",
-  "name",
-  "full_name",
-  "email",
-  "email_address",
-  "phone",
-  "phone_number",
-  "address",
-  "ssn",
-  "date_of_birth",
-  "ip_address",
-  "credit_card",
-  "card_number",
-  "cvv",
-  "bank_account",
-  "account_number",
-  "routing_number"
-];
-var INTERNAL_STATE_PATTERNS = [
-  "memory",
-  "agent_memory",
-  "internal_reasoning",
-  "internal_state",
-  "reasoning_trace",
-  "chain_of_thought",
-  "private_notes",
-  "soul",
-  "personality",
-  "system_prompt"
-];
-var ID_PATTERNS = [
-  "user_id",
-  "session_id",
-  "agent_id",
-  "identity_id",
-  "conversation_id",
-  "thread_id"
-];
-var HISTORY_PATTERNS = [
-  "conversation_history",
-  "message_history",
-  "chat_history",
-  "context_window",
-  "previous_messages"
-];
-var INFERENCE_MINIMAL = {
-  id: "inference-minimal",
-  name: "Inference Minimal",
-  description: "Maximum privacy. Only the current task and query reach the LLM provider.",
-  use_when: "You want the strictest possible context control for inference calls. The LLM sees only what it needs for the immediate task.",
-  rules: [
-    {
-      provider: "inference",
-      allow: [
-        "task",
-        "task_description",
-        "current_query",
-        "query",
-        "prompt",
-        "question",
-        "instruction"
-      ],
-      redact: [
-        ...ALWAYS_REDACT_SECRETS,
-        ...PII_PATTERNS,
-        ...INTERNAL_STATE_PATTERNS,
-        ...HISTORY_PATTERNS,
-        "tool_results",
-        "previous_results"
-      ],
-      hash: [...ID_PATTERNS],
-      summarize: []
-    }
-  ],
-  default_action: "redact"
-};
-var INFERENCE_STANDARD = {
-  id: "inference-standard",
-  name: "Inference Standard",
-  description: "Balanced privacy. Task, query, and tool results pass through. History flagged for summarization. Secrets and PII redacted.",
-  use_when: "You need the LLM to have enough context for multi-step tasks while keeping secrets, PII, and internal reasoning private.",
-  rules: [
-    {
-      provider: "inference",
-      allow: [
-        "task",
-        "task_description",
-        "current_query",
-        "query",
-        "prompt",
-        "question",
-        "instruction",
-        "tool_results",
-        "tool_output",
-        "previous_results",
-        "current_step",
-        "remaining_steps",
-        "objective",
-        "constraints",
-        "format",
-        "output_format"
-      ],
-      redact: [
-        ...ALWAYS_REDACT_SECRETS,
-        ...PII_PATTERNS,
-        ...INTERNAL_STATE_PATTERNS
-      ],
-      hash: [...ID_PATTERNS],
-      summarize: [...HISTORY_PATTERNS]
-    }
-  ],
-  default_action: "redact"
-};
-var LOGGING_STRICT = {
-  id: "logging-strict",
-  name: "Logging Strict",
-  description: "Redacts all content for logging and analytics providers. Only operation metadata passes through.",
-  use_when: "You send telemetry to logging or analytics services and want usage metrics without any content exposure.",
-  rules: [
-    {
-      provider: "logging",
-      allow: [
-        "operation",
-        "operation_name",
-        "tool_name",
-        "timestamp",
-        "duration_ms",
-        "status",
-        "error_code",
-        "event_type"
-      ],
-      redact: [
-        ...ALWAYS_REDACT_SECRETS,
-        ...PII_PATTERNS,
-        ...INTERNAL_STATE_PATTERNS,
-        ...HISTORY_PATTERNS
-      ],
-      hash: [...ID_PATTERNS],
-      summarize: []
-    },
-    {
-      provider: "analytics",
-      allow: [
-        "event_type",
-        "timestamp",
-        "duration_ms",
-        "status",
-        "tool_name"
-      ],
-      redact: [
-        ...ALWAYS_REDACT_SECRETS,
-        ...PII_PATTERNS,
-        ...INTERNAL_STATE_PATTERNS,
-        ...HISTORY_PATTERNS
-      ],
-      hash: [...ID_PATTERNS],
-      summarize: []
-    }
-  ],
-  default_action: "redact"
-};
-var TOOL_API_SCOPED = {
-  id: "tool-api-scoped",
-  name: "Tool API Scoped",
-  description: "Allows tool-specific parameters for external API calls. Redacts memory, history, secrets, and PII.",
-  use_when: "Your agent calls external APIs (search, database, web) and you want to send query parameters without full agent context. Note: 'headers' and 'body' are redacted by default because they frequently carry authorization tokens. Add them to 'allow' only if you verify they contain no credentials for your use case.",
-  rules: [
-    {
-      provider: "tool-api",
-      allow: [
-        "task",
-        "task_description",
-        "query",
-        "search_query",
-        "tool_input",
-        "tool_parameters",
-        "url",
-        "endpoint",
-        "method",
-        "filter",
-        "sort",
-        "limit",
-        "offset"
-      ],
-      redact: [
-        ...ALWAYS_REDACT_SECRETS,
-        ...PII_PATTERNS,
-        ...INTERNAL_STATE_PATTERNS,
-        ...HISTORY_PATTERNS
-      ],
-      hash: [...ID_PATTERNS],
-      summarize: []
-    }
-  ],
-  default_action: "redact"
-};
-var REMOTE_INFERENCE_SANITIZE = {
-  id: "remote-inference-sanitize",
-  name: "Remote Inference Sanitization",
-  description: "Maximum privacy for remote/cloud LLM calls. Strips all identity, financial, location, and personal data before passing queries to external models. Inspired by Vitalik Buterin's 2-of-2 sovereignty model.",
-  use_when: "Your local agent needs to call a remote LLM for tasks beyond local model capability (complex coding, deep research) and you want to minimize data leakage to the remote provider. The remote model gets only the task, query, format requirements, and stripped code context.",
-  rules: [
-    {
-      provider: "inference",
-      allow: [
-        "task",
-        "task_description",
-        "current_query",
-        "query",
-        "prompt",
-        "question",
-        "instruction",
-        "output_format",
-        "format",
-        "language",
-        "code_context",
-        // Stripped code snippets for coding tasks
-        "error_message"
-        // For debugging help
-      ],
-      redact: [
-        ...ALWAYS_REDACT_SECRETS,
-        ...PII_PATTERNS,
-        ...INTERNAL_STATE_PATTERNS,
-        ...HISTORY_PATTERNS,
-        "tool_results",
-        "previous_results",
-        // Additional redactions for remote inference
-        "model_data",
-        "agent_state",
-        "runtime_config",
-        "capabilities",
-        "tool_list"
-      ],
-      // Deny patterns — these must NEVER reach the remote model, not even redacted
-      hash: [],
-      summarize: []
-    }
-  ],
-  default_action: "deny"
-};
-var TEMPLATES = {
-  "inference-minimal": INFERENCE_MINIMAL,
-  "inference-standard": INFERENCE_STANDARD,
-  "logging-strict": LOGGING_STRICT,
-  "tool-api-scoped": TOOL_API_SCOPED,
-  "remote-inference-sanitize": REMOTE_INFERENCE_SANITIZE
-};
 function listTemplateIds() {
   return Object.keys(TEMPLATES);
 }
 function getTemplate(id) {
   return TEMPLATES[id];
 }
-
-// src/l2-operational/context-gate-recommend.ts
-var CLASSIFICATION_RULES = [
-  // ── Secrets (always redact, high confidence) ─────────────────────
-  {
-    patterns: [
+var ALWAYS_REDACT_SECRETS, PII_PATTERNS, INTERNAL_STATE_PATTERNS, ID_PATTERNS, HISTORY_PATTERNS, INFERENCE_MINIMAL, INFERENCE_STANDARD, LOGGING_STRICT, TOOL_API_SCOPED, REMOTE_INFERENCE_SANITIZE, TEMPLATES;
+var init_context_gate_templates = __esm({
+  "src/l2-operational/context-gate-templates.ts"() {
+    ALWAYS_REDACT_SECRETS = [
       "api_key",
-      "apikey",
-      "api_secret",
-      "secret",
-      "secret_key",
-      "secret_token",
+      "secret_*",
+      "*_secret",
+      "*_token",
+      "*_key",
       "password",
-      "passwd",
-      "pass",
+      "*_password",
       "credential",
-      "credentials",
+      "*_credential",
       "private_key",
-      "privkey",
       "recovery_key",
       "passphrase",
-      "token",
-      "access_token",
-      "refresh_token",
-      "bearer_token",
-      "auth_token",
-      "auth_header",
-      "authorization",
-      "encryption_key",
-      "master_key",
-      "signing_key",
-      "webhook_secret",
-      "client_secret",
-      "connection_string"
-    ],
-    action: "redact",
-    confidence: "high",
-    reason: "Matches known secret/credential pattern"
-  },
-  // ── PII (always redact, high confidence) ─────────────────────────
-  {
-    patterns: [
+      "auth_*"
+    ];
+    PII_PATTERNS = [
+      "*_pii",
       "name",
       "full_name",
-      "first_name",
-      "last_name",
-      "display_name",
       "email",
       "email_address",
       "phone",
       "phone_number",
-      "mobile",
       "address",
-      "street_address",
-      "mailing_address",
       "ssn",
-      "social_security",
       "date_of_birth",
-      "dob",
-      "birthday",
       "ip_address",
-      "ip",
-      "location",
-      "geolocation",
-      "coordinates",
       "credit_card",
       "card_number",
       "cvv",
       "bank_account",
-      "routing_number",
-      "passport",
-      "drivers_license",
-      "license_number"
-    ],
-    action: "redact",
-    confidence: "high",
-    reason: "Matches known PII pattern"
-  },
-  // ── Internal agent state (redact, high confidence) ───────────────
-  {
-    patterns: [
+      "account_number",
+      "routing_number"
+    ];
+    INTERNAL_STATE_PATTERNS = [
       "memory",
       "agent_memory",
-      "long_term_memory",
       "internal_reasoning",
+      "internal_state",
       "reasoning_trace",
       "chain_of_thought",
-      "internal_state",
-      "agent_state",
       "private_notes",
-      "scratchpad",
       "soul",
       "personality",
-      "persona",
-      "system_prompt",
-      "system_message",
-      "system_instruction",
-      "preferences",
-      "user_preferences",
-      "agent_preferences",
-      "beliefs",
-      "goals",
-      "motivations"
-    ],
-    action: "redact",
-    confidence: "high",
-    reason: "Matches known internal agent state pattern"
-  },
-  // ── IDs (hash, medium confidence) ────────────────────────────────
-  {
-    patterns: [
+      "system_prompt"
+    ];
+    ID_PATTERNS = [
       "user_id",
-      "userid",
       "session_id",
-      "sessionid",
       "agent_id",
-      "agentid",
       "identity_id",
       "conversation_id",
-      "thread_id",
-      "threadid",
-      "request_id",
-      "requestid",
-      "correlation_id",
-      "trace_id",
-      "traceid",
-      "account_id",
-      "accountid"
-    ],
-    action: "hash",
-    confidence: "medium",
-    reason: "Matches known identifier pattern \u2014 hash preserves correlation without exposing value"
-  },
-  // ── History (summarize, medium confidence) ───────────────────────
-  {
-    patterns: [
+      "thread_id"
+    ];
+    HISTORY_PATTERNS = [
       "conversation_history",
-      "chat_history",
       "message_history",
-      "messages",
-      "previous_messages",
-      "prior_messages",
+      "chat_history",
       "context_window",
-      "interaction_history",
-      "audit_log",
-      "event_log"
-    ],
-    action: "summarize",
-    confidence: "medium",
-    reason: "Matches known history/log pattern \u2014 summarize to reduce exposure"
-  },
-  // ── Task/query (allow, medium confidence) ────────────────────────
-  {
-    patterns: [
-      "task",
-      "task_description",
-      "query",
-      "current_query",
-      "search_query",
-      "prompt",
-      "user_prompt",
-      "question",
-      "current_question",
-      "instruction",
-      "instructions",
-      "objective",
-      "goal",
-      "current_step",
-      "next_step",
-      "remaining_steps",
-      "constraints",
-      "requirements",
-      "output_format",
-      "format",
-      "tool_results",
-      "tool_output",
-      "tool_input",
-      "tool_parameters"
-    ],
-    action: "allow",
-    confidence: "medium",
-    reason: "Matches known task/query pattern \u2014 likely needed for inference"
+      "previous_messages"
+    ];
+    INFERENCE_MINIMAL = {
+      id: "inference-minimal",
+      name: "Inference Minimal",
+      description: "Maximum privacy. Only the current task and query reach the LLM provider.",
+      use_when: "You want the strictest possible context control for inference calls. The LLM sees only what it needs for the immediate task.",
+      rules: [
+        {
+          provider: "inference",
+          allow: [
+            "task",
+            "task_description",
+            "current_query",
+            "query",
+            "prompt",
+            "question",
+            "instruction"
+          ],
+          redact: [
+            ...ALWAYS_REDACT_SECRETS,
+            ...PII_PATTERNS,
+            ...INTERNAL_STATE_PATTERNS,
+            ...HISTORY_PATTERNS,
+            "tool_results",
+            "previous_results"
+          ],
+          hash: [...ID_PATTERNS],
+          summarize: []
+        }
+      ],
+      default_action: "redact"
+    };
+    INFERENCE_STANDARD = {
+      id: "inference-standard",
+      name: "Inference Standard",
+      description: "Balanced privacy. Task, query, and tool results pass through. History flagged for summarization. Secrets and PII redacted.",
+      use_when: "You need the LLM to have enough context for multi-step tasks while keeping secrets, PII, and internal reasoning private.",
+      rules: [
+        {
+          provider: "inference",
+          allow: [
+            "task",
+            "task_description",
+            "current_query",
+            "query",
+            "prompt",
+            "question",
+            "instruction",
+            "tool_results",
+            "tool_output",
+            "previous_results",
+            "current_step",
+            "remaining_steps",
+            "objective",
+            "constraints",
+            "format",
+            "output_format"
+          ],
+          redact: [
+            ...ALWAYS_REDACT_SECRETS,
+            ...PII_PATTERNS,
+            ...INTERNAL_STATE_PATTERNS
+          ],
+          hash: [...ID_PATTERNS],
+          summarize: [...HISTORY_PATTERNS]
+        }
+      ],
+      default_action: "redact"
+    };
+    LOGGING_STRICT = {
+      id: "logging-strict",
+      name: "Logging Strict",
+      description: "Redacts all content for logging and analytics providers. Only operation metadata passes through.",
+      use_when: "You send telemetry to logging or analytics services and want usage metrics without any content exposure.",
+      rules: [
+        {
+          provider: "logging",
+          allow: [
+            "operation",
+            "operation_name",
+            "tool_name",
+            "timestamp",
+            "duration_ms",
+            "status",
+            "error_code",
+            "event_type"
+          ],
+          redact: [
+            ...ALWAYS_REDACT_SECRETS,
+            ...PII_PATTERNS,
+            ...INTERNAL_STATE_PATTERNS,
+            ...HISTORY_PATTERNS
+          ],
+          hash: [...ID_PATTERNS],
+          summarize: []
+        },
+        {
+          provider: "analytics",
+          allow: [
+            "event_type",
+            "timestamp",
+            "duration_ms",
+            "status",
+            "tool_name"
+          ],
+          redact: [
+            ...ALWAYS_REDACT_SECRETS,
+            ...PII_PATTERNS,
+            ...INTERNAL_STATE_PATTERNS,
+            ...HISTORY_PATTERNS
+          ],
+          hash: [...ID_PATTERNS],
+          summarize: []
+        }
+      ],
+      default_action: "redact"
+    };
+    TOOL_API_SCOPED = {
+      id: "tool-api-scoped",
+      name: "Tool API Scoped",
+      description: "Allows tool-specific parameters for external API calls. Redacts memory, history, secrets, and PII.",
+      use_when: "Your agent calls external APIs (search, database, web) and you want to send query parameters without full agent context. Note: 'headers' and 'body' are redacted by default because they frequently carry authorization tokens. Add them to 'allow' only if you verify they contain no credentials for your use case.",
+      rules: [
+        {
+          provider: "tool-api",
+          allow: [
+            "task",
+            "task_description",
+            "query",
+            "search_query",
+            "tool_input",
+            "tool_parameters",
+            "url",
+            "endpoint",
+            "method",
+            "filter",
+            "sort",
+            "limit",
+            "offset"
+          ],
+          redact: [
+            ...ALWAYS_REDACT_SECRETS,
+            ...PII_PATTERNS,
+            ...INTERNAL_STATE_PATTERNS,
+            ...HISTORY_PATTERNS
+          ],
+          hash: [...ID_PATTERNS],
+          summarize: []
+        }
+      ],
+      default_action: "redact"
+    };
+    REMOTE_INFERENCE_SANITIZE = {
+      id: "remote-inference-sanitize",
+      name: "Remote Inference Sanitization",
+      description: "Maximum privacy for remote/cloud LLM calls. Strips all identity, financial, location, and personal data before passing queries to external models. Inspired by Vitalik Buterin's 2-of-2 sovereignty model.",
+      use_when: "Your local agent needs to call a remote LLM for tasks beyond local model capability (complex coding, deep research) and you want to minimize data leakage to the remote provider. The remote model gets only the task, query, format requirements, and stripped code context.",
+      rules: [
+        {
+          provider: "inference",
+          allow: [
+            "task",
+            "task_description",
+            "current_query",
+            "query",
+            "prompt",
+            "question",
+            "instruction",
+            "output_format",
+            "format",
+            "language",
+            "code_context",
+            // Stripped code snippets for coding tasks
+            "error_message"
+            // For debugging help
+          ],
+          redact: [
+            ...ALWAYS_REDACT_SECRETS,
+            ...PII_PATTERNS,
+            ...INTERNAL_STATE_PATTERNS,
+            ...HISTORY_PATTERNS,
+            "tool_results",
+            "previous_results",
+            // Additional redactions for remote inference
+            "model_data",
+            "agent_state",
+            "runtime_config",
+            "capabilities",
+            "tool_list"
+          ],
+          // Deny patterns — these must NEVER reach the remote model, not even redacted
+          hash: [],
+          summarize: []
+        }
+      ],
+      default_action: "deny"
+    };
+    TEMPLATES = {
+      "inference-minimal": INFERENCE_MINIMAL,
+      "inference-standard": INFERENCE_STANDARD,
+      "logging-strict": LOGGING_STRICT,
+      "tool-api-scoped": TOOL_API_SCOPED,
+      "remote-inference-sanitize": REMOTE_INFERENCE_SANITIZE
+    };
   }
-];
+});
+
+// src/l2-operational/context-gate-recommend.ts
 function classifyField(fieldName) {
   const normalized = fieldName.toLowerCase().trim();
   for (const rule of CLASSIFICATION_RULES) {
@@ -15626,336 +14848,529 @@ function matchesFieldPattern(normalizedField, pattern) {
   }
   return false;
 }
+var CLASSIFICATION_RULES;
+var init_context_gate_recommend = __esm({
+  "src/l2-operational/context-gate-recommend.ts"() {
+    CLASSIFICATION_RULES = [
+      // ── Secrets (always redact, high confidence) ─────────────────────
+      {
+        patterns: [
+          "api_key",
+          "apikey",
+          "api_secret",
+          "secret",
+          "secret_key",
+          "secret_token",
+          "password",
+          "passwd",
+          "pass",
+          "credential",
+          "credentials",
+          "private_key",
+          "privkey",
+          "recovery_key",
+          "passphrase",
+          "token",
+          "access_token",
+          "refresh_token",
+          "bearer_token",
+          "auth_token",
+          "auth_header",
+          "authorization",
+          "encryption_key",
+          "master_key",
+          "signing_key",
+          "webhook_secret",
+          "client_secret",
+          "connection_string"
+        ],
+        action: "redact",
+        confidence: "high",
+        reason: "Matches known secret/credential pattern"
+      },
+      // ── PII (always redact, high confidence) ─────────────────────────
+      {
+        patterns: [
+          "name",
+          "full_name",
+          "first_name",
+          "last_name",
+          "display_name",
+          "email",
+          "email_address",
+          "phone",
+          "phone_number",
+          "mobile",
+          "address",
+          "street_address",
+          "mailing_address",
+          "ssn",
+          "social_security",
+          "date_of_birth",
+          "dob",
+          "birthday",
+          "ip_address",
+          "ip",
+          "location",
+          "geolocation",
+          "coordinates",
+          "credit_card",
+          "card_number",
+          "cvv",
+          "bank_account",
+          "routing_number",
+          "passport",
+          "drivers_license",
+          "license_number"
+        ],
+        action: "redact",
+        confidence: "high",
+        reason: "Matches known PII pattern"
+      },
+      // ── Internal agent state (redact, high confidence) ───────────────
+      {
+        patterns: [
+          "memory",
+          "agent_memory",
+          "long_term_memory",
+          "internal_reasoning",
+          "reasoning_trace",
+          "chain_of_thought",
+          "internal_state",
+          "agent_state",
+          "private_notes",
+          "scratchpad",
+          "soul",
+          "personality",
+          "persona",
+          "system_prompt",
+          "system_message",
+          "system_instruction",
+          "preferences",
+          "user_preferences",
+          "agent_preferences",
+          "beliefs",
+          "goals",
+          "motivations"
+        ],
+        action: "redact",
+        confidence: "high",
+        reason: "Matches known internal agent state pattern"
+      },
+      // ── IDs (hash, medium confidence) ────────────────────────────────
+      {
+        patterns: [
+          "user_id",
+          "userid",
+          "session_id",
+          "sessionid",
+          "agent_id",
+          "agentid",
+          "identity_id",
+          "conversation_id",
+          "thread_id",
+          "threadid",
+          "request_id",
+          "requestid",
+          "correlation_id",
+          "trace_id",
+          "traceid",
+          "account_id",
+          "accountid"
+        ],
+        action: "hash",
+        confidence: "medium",
+        reason: "Matches known identifier pattern \u2014 hash preserves correlation without exposing value"
+      },
+      // ── History (summarize, medium confidence) ───────────────────────
+      {
+        patterns: [
+          "conversation_history",
+          "chat_history",
+          "message_history",
+          "messages",
+          "previous_messages",
+          "prior_messages",
+          "context_window",
+          "interaction_history",
+          "audit_log",
+          "event_log"
+        ],
+        action: "summarize",
+        confidence: "medium",
+        reason: "Matches known history/log pattern \u2014 summarize to reduce exposure"
+      },
+      // ── Task/query (allow, medium confidence) ────────────────────────
+      {
+        patterns: [
+          "task",
+          "task_description",
+          "query",
+          "current_query",
+          "search_query",
+          "prompt",
+          "user_prompt",
+          "question",
+          "current_question",
+          "instruction",
+          "instructions",
+          "objective",
+          "goal",
+          "current_step",
+          "next_step",
+          "remaining_steps",
+          "constraints",
+          "requirements",
+          "output_format",
+          "format",
+          "tool_results",
+          "tool_output",
+          "tool_input",
+          "tool_parameters"
+        ],
+        action: "allow",
+        confidence: "medium",
+        reason: "Matches known task/query pattern \u2014 likely needed for inference"
+      }
+    ];
+  }
+});
 
 // src/l2-operational/context-gate-enforcer.ts
-init_encoding();
-init_hashing();
-init_router();
-var BUILTIN_SENSITIVE_PATTERNS = [
-  "*_key",
-  "*_token",
-  "*_secret",
-  "api_key",
-  "access_token",
-  "refresh_token",
-  "password",
-  "passwd",
-  "credential*",
-  "auth_*",
-  "ssn",
-  "social_security*",
-  "tax_id*",
-  "credit_card*",
-  "card_number*",
-  "cvv",
-  "cvc",
-  "private_key",
-  "secret_key",
-  "master_key"
-];
-var ContextGateEnforcer = class {
-  policyStore;
-  auditLog;
-  config;
-  stats = {
-    calls_inspected: 0,
-    calls_bypassed: 0,
-    fields_redacted: 0,
-    fields_hashed: 0,
-    fields_blocked: 0,
-    calls_blocked: 0
-  };
-  constructor(policyStore, auditLog, config) {
-    this.policyStore = policyStore;
-    this.auditLog = auditLog;
-    this.config = config;
-  }
-  /**
-   * Wrap a tool handler to apply automatic context gating.
-   *
-   * The wrapped handler:
-   * 1. Checks if tool should be filtered (based on bypass_prefixes)
-   * 2. If not filtering, calls original handler directly
-   * 3. If filtering:
-   *    a. Gets the active policy or falls back to built-in patterns
-   *    b. Calls filterContext() with tool arguments
-   *    c. If any field triggered "deny" and on_deny is "block", returns error
-   *    d. If on_deny is "redact", replaces denied fields with "[REDACTED]"
-   *    e. Calls original handler with filtered arguments
-   *    f. Logs the filtering decision
-   * 4. In log_only mode: runs filter, logs what would happen, passes original args
-   */
-  wrapHandler(toolName, originalHandler) {
-    return async (args) => {
-      if (!this.config.enabled) {
-        return originalHandler(args);
+var BUILTIN_SENSITIVE_PATTERNS, ContextGateEnforcer;
+var init_context_gate_enforcer = __esm({
+  "src/l2-operational/context-gate-enforcer.ts"() {
+    init_context_gate();
+    init_encoding();
+    init_hashing();
+    init_router();
+    BUILTIN_SENSITIVE_PATTERNS = [
+      "*_key",
+      "*_token",
+      "*_secret",
+      "api_key",
+      "access_token",
+      "refresh_token",
+      "password",
+      "passwd",
+      "credential*",
+      "auth_*",
+      "ssn",
+      "social_security*",
+      "tax_id*",
+      "credit_card*",
+      "card_number*",
+      "cvv",
+      "cvc",
+      "private_key",
+      "secret_key",
+      "master_key"
+    ];
+    ContextGateEnforcer = class {
+      policyStore;
+      auditLog;
+      config;
+      stats = {
+        calls_inspected: 0,
+        calls_bypassed: 0,
+        fields_redacted: 0,
+        fields_hashed: 0,
+        fields_blocked: 0,
+        calls_blocked: 0
+      };
+      constructor(policyStore, auditLog, config) {
+        this.policyStore = policyStore;
+        this.auditLog = auditLog;
+        this.config = config;
       }
-      if (!this.shouldFilter(toolName)) {
-        this.stats.calls_bypassed++;
-        return originalHandler(args);
+      /**
+       * Wrap a tool handler to apply automatic context gating.
+       *
+       * The wrapped handler:
+       * 1. Checks if tool should be filtered (based on bypass_prefixes)
+       * 2. If not filtering, calls original handler directly
+       * 3. If filtering:
+       *    a. Gets the active policy or falls back to built-in patterns
+       *    b. Calls filterContext() with tool arguments
+       *    c. If any field triggered "deny" and on_deny is "block", returns error
+       *    d. If on_deny is "redact", replaces denied fields with "[REDACTED]"
+       *    e. Calls original handler with filtered arguments
+       *    f. Logs the filtering decision
+       * 4. In log_only mode: runs filter, logs what would happen, passes original args
+       */
+      wrapHandler(toolName, originalHandler) {
+        return async (args) => {
+          if (!this.config.enabled) {
+            return originalHandler(args);
+          }
+          if (!this.shouldFilter(toolName)) {
+            this.stats.calls_bypassed++;
+            return originalHandler(args);
+          }
+          this.stats.calls_inspected++;
+          const policy = this.config.default_policy_id ? await this.policyStore.get(this.config.default_policy_id) : null;
+          if (policy) {
+            return this.filterWithPolicy(
+              toolName,
+              args,
+              originalHandler,
+              policy
+            );
+          } else {
+            return this.filterWithBuiltinPatterns(
+              toolName,
+              args,
+              originalHandler
+            );
+          }
+        };
       }
-      this.stats.calls_inspected++;
-      const policy = this.config.default_policy_id ? await this.policyStore.get(this.config.default_policy_id) : null;
-      if (policy) {
-        return this.filterWithPolicy(
-          toolName,
-          args,
-          originalHandler,
-          policy
-        );
-      } else {
-        return this.filterWithBuiltinPatterns(
-          toolName,
-          args,
-          originalHandler
-        );
-      }
-    };
-  }
-  /**
-   * Filter tool arguments using an explicit policy.
-   */
-  async filterWithPolicy(toolName, args, originalHandler, policy) {
-    const provider = this.extractProviderCategory(toolName);
-    const result = filterContext(policy, provider, args);
-    const deniedFields = result.decisions.filter((d) => d.action === "deny");
-    if (deniedFields.length > 0) {
-      if (this.config.on_deny === "block") {
-        this.stats.calls_blocked++;
+      /**
+       * Filter tool arguments using an explicit policy.
+       */
+      async filterWithPolicy(toolName, args, originalHandler, policy) {
+        const provider = this.extractProviderCategory(toolName);
+        const result = filterContext(policy, provider, args);
+        const deniedFields = result.decisions.filter((d) => d.action === "deny");
+        if (deniedFields.length > 0) {
+          if (this.config.on_deny === "block") {
+            this.stats.calls_blocked++;
+            this.auditLog.append(
+              "l2",
+              "context_gate_enforcer_block",
+              "system",
+              {
+                tool_name: toolName,
+                policy_id: policy.policy_id,
+                provider,
+                denied_fields: deniedFields.map((d) => d.field),
+                original_context_hash: result.original_context_hash
+              }
+            );
+            return toolResult({
+              error: "context_gating_blocked",
+              message: "Tool call contains fields that trigger deny action",
+              tool: toolName,
+              denied_fields: deniedFields.map((d) => d.field),
+              recommendation: "Remove the denied fields from context or update the context-gating policy."
+            });
+          }
+        }
+        const filteredArgs = this.buildFilteredArgs(args, result.decisions);
+        if (this.config.log_only) {
+          this.auditLog.append(
+            "l2",
+            "context_gate_enforcer_log_only",
+            "system",
+            {
+              tool_name: toolName,
+              policy_id: policy.policy_id,
+              provider,
+              fields_total: Object.keys(args).length,
+              fields_redacted: result.fields_redacted,
+              fields_hashed: result.fields_hashed,
+              fields_blocked: deniedFields.length,
+              original_context_hash: result.original_context_hash
+            }
+          );
+          this.stats.fields_redacted += result.fields_redacted;
+          this.stats.fields_hashed += result.fields_hashed;
+          this.stats.fields_blocked += deniedFields.length;
+          return originalHandler(args);
+        }
         this.auditLog.append(
           "l2",
-          "context_gate_enforcer_block",
+          "context_gate_enforcer_filter",
           "system",
           {
             tool_name: toolName,
             policy_id: policy.policy_id,
             provider,
-            denied_fields: deniedFields.map((d) => d.field),
+            fields_total: Object.keys(args).length,
+            fields_redacted: result.fields_redacted,
+            fields_hashed: result.fields_hashed,
+            fields_blocked: deniedFields.length,
             original_context_hash: result.original_context_hash
           }
         );
-        return toolResult({
-          error: "context_gating_blocked",
-          message: "Tool call contains fields that trigger deny action",
-          tool: toolName,
-          denied_fields: deniedFields.map((d) => d.field),
-          recommendation: "Remove the denied fields from context or update the context-gating policy."
-        });
+        this.stats.fields_redacted += result.fields_redacted;
+        this.stats.fields_hashed += result.fields_hashed;
+        this.stats.fields_blocked += deniedFields.length;
+        return originalHandler(filteredArgs);
       }
-    }
-    const filteredArgs = this.buildFilteredArgs(args, result.decisions);
-    if (this.config.log_only) {
-      this.auditLog.append(
-        "l2",
-        "context_gate_enforcer_log_only",
-        "system",
-        {
-          tool_name: toolName,
-          policy_id: policy.policy_id,
-          provider,
-          fields_total: Object.keys(args).length,
-          fields_redacted: result.fields_redacted,
-          fields_hashed: result.fields_hashed,
-          fields_blocked: deniedFields.length,
-          original_context_hash: result.original_context_hash
+      /**
+       * Filter tool arguments using built-in sensitive patterns.
+       * This provides baseline protection when no explicit policy is configured.
+       */
+      async filterWithBuiltinPatterns(toolName, args, originalHandler) {
+        const fieldsToRedact = [];
+        const originalHash = hashToString(
+          stringToBytes(JSON.stringify(args))
+        );
+        for (const field of Object.keys(args)) {
+          if (matchesPattern(field, BUILTIN_SENSITIVE_PATTERNS)) {
+            fieldsToRedact.push(field);
+          }
         }
-      );
-      this.stats.fields_redacted += result.fields_redacted;
-      this.stats.fields_hashed += result.fields_hashed;
-      this.stats.fields_blocked += deniedFields.length;
-      return originalHandler(args);
-    }
-    this.auditLog.append(
-      "l2",
-      "context_gate_enforcer_filter",
-      "system",
-      {
-        tool_name: toolName,
-        policy_id: policy.policy_id,
-        provider,
-        fields_total: Object.keys(args).length,
-        fields_redacted: result.fields_redacted,
-        fields_hashed: result.fields_hashed,
-        fields_blocked: deniedFields.length,
-        original_context_hash: result.original_context_hash
-      }
-    );
-    this.stats.fields_redacted += result.fields_redacted;
-    this.stats.fields_hashed += result.fields_hashed;
-    this.stats.fields_blocked += deniedFields.length;
-    return originalHandler(filteredArgs);
-  }
-  /**
-   * Filter tool arguments using built-in sensitive patterns.
-   * This provides baseline protection when no explicit policy is configured.
-   */
-  async filterWithBuiltinPatterns(toolName, args, originalHandler) {
-    const fieldsToRedact = [];
-    const originalHash = hashToString(
-      stringToBytes(JSON.stringify(args))
-    );
-    for (const field of Object.keys(args)) {
-      if (matchesPattern(field, BUILTIN_SENSITIVE_PATTERNS)) {
-        fieldsToRedact.push(field);
-      }
-    }
-    if (fieldsToRedact.length === 0) {
-      this.auditLog.append(
-        "l2",
-        "context_gate_enforcer_builtin_pass",
-        "system",
-        {
-          tool_name: toolName,
-          reason: "No sensitive field patterns detected"
+        if (fieldsToRedact.length === 0) {
+          this.auditLog.append(
+            "l2",
+            "context_gate_enforcer_builtin_pass",
+            "system",
+            {
+              tool_name: toolName,
+              reason: "No sensitive field patterns detected"
+            }
+          );
+          return originalHandler(args);
         }
-      );
-      return originalHandler(args);
-    }
-    const filteredArgs = {};
-    for (const [key, value] of Object.entries(args)) {
-      if (fieldsToRedact.includes(key)) {
-        filteredArgs[key] = "[REDACTED]";
-      } else {
-        filteredArgs[key] = value;
-      }
-    }
-    const filteredHash = hashToString(
-      stringToBytes(JSON.stringify(filteredArgs))
-    );
-    if (this.config.log_only) {
-      this.auditLog.append(
-        "l2",
-        "context_gate_enforcer_builtin_log_only",
-        "system",
-        {
-          tool_name: toolName,
-          fields_redacted: fieldsToRedact.length,
-          redacted_fields: fieldsToRedact,
-          original_context_hash: originalHash
+        const filteredArgs = {};
+        for (const [key, value] of Object.entries(args)) {
+          if (fieldsToRedact.includes(key)) {
+            filteredArgs[key] = "[REDACTED]";
+          } else {
+            filteredArgs[key] = value;
+          }
         }
-      );
-      this.stats.fields_redacted += fieldsToRedact.length;
-      return originalHandler(args);
-    }
-    this.auditLog.append(
-      "l2",
-      "context_gate_enforcer_builtin_filter",
-      "system",
-      {
-        tool_name: toolName,
-        fields_redacted: fieldsToRedact.length,
-        redacted_fields: fieldsToRedact,
-        original_context_hash: originalHash,
-        filtered_context_hash: filteredHash
+        const filteredHash = hashToString(
+          stringToBytes(JSON.stringify(filteredArgs))
+        );
+        if (this.config.log_only) {
+          this.auditLog.append(
+            "l2",
+            "context_gate_enforcer_builtin_log_only",
+            "system",
+            {
+              tool_name: toolName,
+              fields_redacted: fieldsToRedact.length,
+              redacted_fields: fieldsToRedact,
+              original_context_hash: originalHash
+            }
+          );
+          this.stats.fields_redacted += fieldsToRedact.length;
+          return originalHandler(args);
+        }
+        this.auditLog.append(
+          "l2",
+          "context_gate_enforcer_builtin_filter",
+          "system",
+          {
+            tool_name: toolName,
+            fields_redacted: fieldsToRedact.length,
+            redacted_fields: fieldsToRedact,
+            original_context_hash: originalHash,
+            filtered_context_hash: filteredHash
+          }
+        );
+        this.stats.fields_redacted += fieldsToRedact.length;
+        return originalHandler(filteredArgs);
       }
-    );
-    this.stats.fields_redacted += fieldsToRedact.length;
-    return originalHandler(filteredArgs);
-  }
-  /**
-   * Check if a tool should be filtered based on bypass prefixes.
-   *
-   * SEC-033: Uses exact namespace component matching, not bare startsWith().
-   * A prefix of "proxy/" matches "proxy/server/tool" but NOT "proxyevil/steal".
-   * The prefix must match exactly up to its length, and the prefix must end
-   * with "/" to enforce namespace boundaries (if it doesn't, we add one).
-   *
-   * Special sentinel: "*" bypasses ALL tools (used when all Sanctuary-internal
-   * tools should skip context gating — the default). Only proxy/external tools
-   * should be filtered in production.
-   */
-  shouldFilter(toolName) {
-    for (const prefix of this.config.bypass_prefixes) {
-      if (prefix === "*") return false;
-      const safePrefix = prefix.endsWith("/") ? prefix : prefix + "/";
-      if (toolName === safePrefix.slice(0, -1) || toolName.startsWith(safePrefix)) {
-        return false;
+      /**
+       * Check if a tool should be filtered based on bypass prefixes.
+       *
+       * SEC-033: Uses exact namespace component matching, not bare startsWith().
+       * A prefix of "proxy/" matches "proxy/server/tool" but NOT "proxyevil/steal".
+       * The prefix must match exactly up to its length, and the prefix must end
+       * with "/" to enforce namespace boundaries (if it doesn't, we add one).
+       *
+       * Special sentinel: "*" bypasses ALL tools (used when all Sanctuary-internal
+       * tools should skip context gating — the default). Only proxy/external tools
+       * should be filtered in production.
+       */
+      shouldFilter(toolName) {
+        for (const prefix of this.config.bypass_prefixes) {
+          if (prefix === "*") return false;
+          const safePrefix = prefix.endsWith("/") ? prefix : prefix + "/";
+          if (toolName === safePrefix.slice(0, -1) || toolName.startsWith(safePrefix)) {
+            return false;
+          }
+        }
+        return true;
       }
-    }
-    return true;
-  }
-  /**
-   * Extract provider category from tool name.
-   * Default: "tool-api". Override for specific patterns.
-   */
-  extractProviderCategory(toolName) {
-    if (toolName.includes("inference") || toolName.includes("llm")) {
-      return "inference";
-    }
-    if (toolName.includes("log") || toolName.includes("telemetry")) {
-      return "logging";
-    }
-    if (toolName.includes("analytics") || toolName.includes("metric")) {
-      return "analytics";
-    }
-    return "tool-api";
-  }
-  /**
-   * Build filtered arguments from filter decisions.
-   */
-  buildFilteredArgs(originalArgs, decisions) {
-    const filtered = {};
-    for (const decision of decisions) {
-      switch (decision.action) {
-        case "allow":
-          filtered[decision.field] = originalArgs[decision.field];
-          break;
-        case "redact":
-          filtered[decision.field] = "[REDACTED]";
-          break;
-        case "hash":
-          filtered[decision.field] = decision.hash_value;
-          break;
-        case "summarize":
-          filtered[decision.field] = originalArgs[decision.field];
-          break;
+      /**
+       * Extract provider category from tool name.
+       * Default: "tool-api". Override for specific patterns.
+       */
+      extractProviderCategory(toolName) {
+        if (toolName.includes("inference") || toolName.includes("llm")) {
+          return "inference";
+        }
+        if (toolName.includes("log") || toolName.includes("telemetry")) {
+          return "logging";
+        }
+        if (toolName.includes("analytics") || toolName.includes("metric")) {
+          return "analytics";
+        }
+        return "tool-api";
       }
-    }
-    return filtered;
-  }
-  /**
-   * Set the active policy ID.
-   */
-  setDefaultPolicy(policyId) {
-    this.config.default_policy_id = policyId;
-  }
-  /**
-   * Get current enforcer status and stats.
-   */
-  getStatus() {
-    return {
-      enabled: this.config.enabled,
-      log_only: this.config.log_only,
-      default_policy_id: this.config.default_policy_id ?? null,
-      stats: { ...this.stats }
+      /**
+       * Build filtered arguments from filter decisions.
+       */
+      buildFilteredArgs(originalArgs, decisions) {
+        const filtered = {};
+        for (const decision of decisions) {
+          switch (decision.action) {
+            case "allow":
+              filtered[decision.field] = originalArgs[decision.field];
+              break;
+            case "redact":
+              filtered[decision.field] = "[REDACTED]";
+              break;
+            case "hash":
+              filtered[decision.field] = decision.hash_value;
+              break;
+            case "summarize":
+              filtered[decision.field] = originalArgs[decision.field];
+              break;
+          }
+        }
+        return filtered;
+      }
+      /**
+       * Set the active policy ID.
+       */
+      setDefaultPolicy(policyId) {
+        this.config.default_policy_id = policyId;
+      }
+      /**
+       * Get current enforcer status and stats.
+       */
+      getStatus() {
+        return {
+          enabled: this.config.enabled,
+          log_only: this.config.log_only,
+          default_policy_id: this.config.default_policy_id ?? null,
+          stats: { ...this.stats }
+        };
+      }
+      /**
+       * Toggle enforcer enabled state.
+       */
+      setEnabled(enabled) {
+        this.config.enabled = enabled;
+      }
+      /**
+       * Toggle log_only mode.
+       */
+      setLogOnly(logOnly) {
+        this.config.log_only = logOnly;
+      }
+      /**
+       * Reset stats counters.
+       */
+      resetStats() {
+        this.stats = {
+          calls_inspected: 0,
+          calls_bypassed: 0,
+          fields_redacted: 0,
+          fields_hashed: 0,
+          fields_blocked: 0,
+          calls_blocked: 0
+        };
+      }
     };
   }
-  /**
-   * Toggle enforcer enabled state.
-   */
-  setEnabled(enabled) {
-    this.config.enabled = enabled;
-  }
-  /**
-   * Toggle log_only mode.
-   */
-  setLogOnly(logOnly) {
-    this.config.log_only = logOnly;
-  }
-  /**
-   * Reset stats counters.
-   */
-  resetStats() {
-    this.stats = {
-      calls_inspected: 0,
-      calls_bypassed: 0,
-      fields_redacted: 0,
-      fields_hashed: 0,
-      fields_blocked: 0,
-      calls_blocked: 0
-    };
-  }
-};
+});
 
 // src/l2-operational/context-gate-tools.ts
 function createContextGateTools(storage, masterKey, auditLog) {
@@ -16439,9 +15854,15 @@ function createContextGateTools(storage, masterKey, auditLog) {
   ];
   return { tools, policyStore, enforcer };
 }
-
-// src/l2-operational/hardening-tools.ts
-init_router();
+var init_context_gate_tools = __esm({
+  "src/l2-operational/context-gate-tools.ts"() {
+    init_router();
+    init_context_gate();
+    init_context_gate_templates();
+    init_context_gate_recommend();
+    init_context_gate_enforcer();
+  }
+});
 function checkMemoryProtection() {
   const checks = {
     aslr_enabled: checkASLR(),
@@ -16674,6 +16095,10 @@ function assessL2Hardening(storagePath) {
     summary
   };
 }
+var init_hardening = __esm({
+  "src/l2-operational/hardening.ts"() {
+  }
+});
 
 // src/l2-operational/hardening-tools.ts
 function createL2HardeningTools(storagePath, auditLog) {
@@ -16838,13 +16263,202 @@ function createL2HardeningTools(storagePath, auditLog) {
     }
   ];
 }
+var init_hardening_tools = __esm({
+  "src/l2-operational/hardening-tools.ts"() {
+    init_router();
+    init_hardening();
+  }
+});
 
-// src/index.ts
-init_sovereignty_profile();
+// src/sovereignty-profile.ts
+function createDefaultProfile() {
+  return {
+    version: 1,
+    features: {
+      audit_logging: { enabled: true },
+      injection_detection: { enabled: true },
+      context_gating: { enabled: false },
+      approval_gate: { enabled: true },
+      // SEC-057: always enabled — core enforcement
+      zk_proofs: { enabled: false }
+    },
+    updated_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+var NAMESPACE, PROFILE_KEY, HKDF_DOMAIN, SovereigntyProfileStore;
+var init_sovereignty_profile = __esm({
+  "src/sovereignty-profile.ts"() {
+    init_encryption();
+    init_key_derivation();
+    init_encoding();
+    NAMESPACE = "_sovereignty_profile";
+    PROFILE_KEY = "active";
+    HKDF_DOMAIN = "sovereignty-profile";
+    SovereigntyProfileStore = class {
+      storage;
+      encryptionKey;
+      profile = null;
+      constructor(storage, masterKey) {
+        this.storage = storage;
+        this.encryptionKey = derivePurposeKey(masterKey, HKDF_DOMAIN);
+      }
+      /**
+       * Load the active sovereignty profile from encrypted storage.
+       * Creates the default profile on first run.
+       */
+      async load() {
+        if (this.profile) return this.profile;
+        const raw = await this.storage.read(NAMESPACE, PROFILE_KEY);
+        if (raw) {
+          try {
+            const encrypted = JSON.parse(bytesToString(raw));
+            const decrypted = decrypt(encrypted, this.encryptionKey);
+            this.profile = JSON.parse(bytesToString(decrypted));
+            return this.profile;
+          } catch {
+          }
+        }
+        this.profile = createDefaultProfile();
+        await this.persist();
+        return this.profile;
+      }
+      /**
+       * Get the current profile. Must call load() first.
+       */
+      get() {
+        if (!this.profile) {
+          throw new Error("SovereigntyProfileStore: call load() before get()");
+        }
+        return this.profile;
+      }
+      /**
+       * Apply a partial update to the profile.
+       * Returns the updated profile.
+       */
+      async update(updates) {
+        if (!this.profile) {
+          await this.load();
+        }
+        if (updates.approval_gate && updates.approval_gate.enabled === false) {
+          throw new Error("approval_gate cannot be disabled \u2014 it is a core enforcement feature");
+        }
+        const features = this.profile.features;
+        if (updates.audit_logging !== void 0) {
+          if (updates.audit_logging.enabled !== void 0) {
+            if (typeof updates.audit_logging.enabled !== "boolean") {
+              throw new Error("audit_logging.enabled must be a boolean");
+            }
+            features.audit_logging.enabled = updates.audit_logging.enabled;
+          }
+        }
+        if (updates.injection_detection !== void 0) {
+          if (updates.injection_detection.enabled !== void 0) {
+            if (typeof updates.injection_detection.enabled !== "boolean") {
+              throw new Error("injection_detection.enabled must be a boolean");
+            }
+            features.injection_detection.enabled = updates.injection_detection.enabled;
+          }
+          if (updates.injection_detection.sensitivity !== void 0) {
+            const valid = ["low", "medium", "high"];
+            if (!valid.includes(updates.injection_detection.sensitivity)) {
+              throw new Error("injection_detection.sensitivity must be low, medium, or high");
+            }
+            features.injection_detection.sensitivity = updates.injection_detection.sensitivity;
+          }
+        }
+        if (updates.context_gating !== void 0) {
+          if (updates.context_gating.enabled !== void 0) {
+            if (typeof updates.context_gating.enabled !== "boolean") {
+              throw new Error("context_gating.enabled must be a boolean");
+            }
+            features.context_gating.enabled = updates.context_gating.enabled;
+          }
+          if (updates.context_gating.policy_id !== void 0) {
+            if (typeof updates.context_gating.policy_id !== "string" || updates.context_gating.policy_id.length > 256) {
+              throw new Error("context_gating.policy_id must be a string of 256 characters or fewer");
+            }
+            features.context_gating.policy_id = updates.context_gating.policy_id;
+          }
+        }
+        if (updates.approval_gate !== void 0) {
+          if (updates.approval_gate.enabled !== void 0) {
+            if (typeof updates.approval_gate.enabled !== "boolean") {
+              throw new Error("approval_gate.enabled must be a boolean");
+            }
+            features.approval_gate.enabled = updates.approval_gate.enabled;
+          }
+        }
+        if (updates.zk_proofs !== void 0) {
+          if (updates.zk_proofs.enabled !== void 0) {
+            if (typeof updates.zk_proofs.enabled !== "boolean") {
+              throw new Error("zk_proofs.enabled must be a boolean");
+            }
+            features.zk_proofs.enabled = updates.zk_proofs.enabled;
+          }
+        }
+        if (updates.upstream_servers !== void 0) {
+          if (!Array.isArray(updates.upstream_servers)) {
+            throw new Error("upstream_servers must be an array");
+          }
+          for (const server of updates.upstream_servers) {
+            if (!server.name || typeof server.name !== "string") {
+              throw new Error("Each upstream server must have a name");
+            }
+            if (server.name.length > 128) {
+              throw new Error("Upstream server name must be 128 characters or fewer");
+            }
+            if (!/^[a-zA-Z0-9_-]+$/.test(server.name)) {
+              throw new Error("Upstream server name must contain only alphanumeric characters, hyphens, and underscores");
+            }
+            if (!server.transport || typeof server.transport !== "object") {
+              throw new Error("Each upstream server must have a transport configuration");
+            }
+            if (server.transport.type !== "stdio" && server.transport.type !== "sse") {
+              throw new Error("Transport type must be 'stdio' or 'sse'");
+            }
+            if (server.transport.type === "stdio" && !server.transport.command) {
+              throw new Error("stdio transport requires a command");
+            }
+            if (server.transport.type === "sse" && !server.transport.url) {
+              throw new Error("sse transport requires a url");
+            }
+            if (typeof server.enabled !== "boolean") {
+              throw new Error("Each upstream server must have enabled as a boolean");
+            }
+            if (![1, 2, 3].includes(server.default_tier)) {
+              throw new Error("default_tier must be 1, 2, or 3");
+            }
+            if (server.tool_overrides) {
+              for (const [, override] of Object.entries(server.tool_overrides)) {
+                if (![1, 2, 3].includes(override.tier)) {
+                  throw new Error("tool_overrides tier must be 1, 2, or 3");
+                }
+              }
+            }
+          }
+          this.profile.upstream_servers = updates.upstream_servers;
+        }
+        this.profile.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+        await this.persist();
+        return this.profile;
+      }
+      /**
+       * Persist the current profile to encrypted storage.
+       */
+      async persist() {
+        const serialized = stringToBytes(JSON.stringify(this.profile));
+        const encrypted = encrypt(serialized, this.encryptionKey);
+        await this.storage.write(
+          NAMESPACE,
+          PROFILE_KEY,
+          stringToBytes(JSON.stringify(encrypted))
+        );
+      }
+    };
+  }
+});
 
 // src/sovereignty-profile-tools.ts
-init_router();
-init_system_prompt_generator();
 function createSovereigntyProfileTools(profileStore, auditLog) {
   const tools = [
     // ── Get Profile ──────────────────────────────────────────────────
@@ -16971,547 +16585,563 @@ function createSovereigntyProfileTools(profileStore, auditLog) {
   ];
   return { tools };
 }
-var MAX_RETRIES = 5;
-var BASE_BACKOFF_MS = 1e3;
-var MAX_BACKOFF_MS = 3e4;
-var MAX_UPSTREAM_SERVERS = 20;
-var ClientManager = class {
-  connections = /* @__PURE__ */ new Map();
-  onStateChange;
-  shutdownRequested = false;
-  constructor(options) {
-    this.onStateChange = options?.onStateChange;
+var init_sovereignty_profile_tools = __esm({
+  "src/sovereignty-profile-tools.ts"() {
+    init_router();
+    init_system_prompt_generator();
   }
-  /**
-   * Configure upstream servers. Disconnects removed servers, connects new ones.
-   * Non-blocking — connection failures are handled asynchronously.
-   */
-  async configure(servers) {
-    if (servers.length > MAX_UPSTREAM_SERVERS) {
-      throw new Error(`Maximum ${MAX_UPSTREAM_SERVERS} upstream servers allowed`);
-    }
-    const SAFE_SERVER_NAME = /^[a-zA-Z0-9_\-]+$/;
-    const newNames = new Set(servers.filter((s) => {
-      if (!SAFE_SERVER_NAME.test(s.name)) {
-        return false;
+});
+var MAX_RETRIES, BASE_BACKOFF_MS, MAX_BACKOFF_MS, MAX_UPSTREAM_SERVERS, ClientManager;
+var init_client_manager = __esm({
+  "src/proxy/client-manager.ts"() {
+    MAX_RETRIES = 5;
+    BASE_BACKOFF_MS = 1e3;
+    MAX_BACKOFF_MS = 3e4;
+    MAX_UPSTREAM_SERVERS = 20;
+    ClientManager = class {
+      connections = /* @__PURE__ */ new Map();
+      onStateChange;
+      shutdownRequested = false;
+      constructor(options) {
+        this.onStateChange = options?.onStateChange;
       }
-      return s.enabled;
-    }).map((s) => s.name));
-    for (const [name] of this.connections) {
-      if (!newNames.has(name)) {
-        await this.disconnectServer(name);
-      }
-    }
-    for (const server of servers) {
-      if (!SAFE_SERVER_NAME.test(server.name)) {
-        continue;
-      }
-      if (!server.enabled) {
-        if (this.connections.has(server.name)) {
-          await this.disconnectServer(server.name);
+      /**
+       * Configure upstream servers. Disconnects removed servers, connects new ones.
+       * Non-blocking — connection failures are handled asynchronously.
+       */
+      async configure(servers) {
+        if (servers.length > MAX_UPSTREAM_SERVERS) {
+          throw new Error(`Maximum ${MAX_UPSTREAM_SERVERS} upstream servers allowed`);
         }
-        continue;
-      }
-      const existing = this.connections.get(server.name);
-      if (existing && existing.state === "connected") {
-        existing.server = server;
-        continue;
-      }
-      this.connectServer(server);
-    }
-  }
-  /**
-   * Get all discovered tools across all connected upstream servers.
-   */
-  getAllTools() {
-    const result = /* @__PURE__ */ new Map();
-    for (const [name, conn] of this.connections) {
-      if (conn.state === "connected" && conn.tools.length > 0) {
-        result.set(name, conn.tools);
-      }
-    }
-    return result;
-  }
-  /**
-   * Get connection status for all configured servers.
-   */
-  getStatus() {
-    return Array.from(this.connections.values()).map((conn) => ({
-      name: conn.server.name,
-      state: conn.state,
-      transport_type: conn.server.transport.type,
-      tool_count: conn.tools.length,
-      error: conn.error
-    }));
-  }
-  /**
-   * Get the upstream server config by name.
-   */
-  getServerConfig(name) {
-    return this.connections.get(name)?.server;
-  }
-  /**
-   * Call a tool on an upstream server.
-   */
-  async callTool(serverName, toolName, args) {
-    const conn = this.connections.get(serverName);
-    if (!conn) {
-      throw new Error(`Upstream server "${serverName}" is not configured`);
-    }
-    if (conn.state !== "connected" || !conn.client) {
-      throw new Error(`Upstream server "${serverName}" is not connected (state: ${conn.state})`);
-    }
-    const result = await conn.client.callTool({
-      name: toolName,
-      arguments: args
-    });
-    return result;
-  }
-  /**
-   * Shut down all connections cleanly.
-   */
-  async shutdown() {
-    this.shutdownRequested = true;
-    for (const conn of this.connections.values()) {
-      if (conn.retryTimer) {
-        clearTimeout(conn.retryTimer);
-        conn.retryTimer = void 0;
-      }
-    }
-    const disconnects = Array.from(this.connections.keys()).map(
-      (name) => this.disconnectServer(name)
-    );
-    await Promise.allSettled(disconnects);
-  }
-  // ── Private ───────────────────────────────────────────────────────────
-  /**
-   * Connect to an upstream server (non-blocking).
-   * Spawns connection attempt in background — does not throw.
-   */
-  connectServer(server) {
-    const conn = {
-      server,
-      client: null,
-      transport: null,
-      state: "connecting",
-      tools: [],
-      retryCount: 0
-    };
-    this.connections.set(server.name, conn);
-    this.notifyStateChange(conn);
-    this.doConnect(conn).catch(() => {
-    });
-  }
-  /**
-   * Perform the actual connection to an upstream server.
-   */
-  async doConnect(conn) {
-    try {
-      conn.state = "connecting";
-      this.notifyStateChange(conn);
-      let transport;
-      if (conn.server.transport.type === "stdio") {
-        if (!conn.server.transport.command) {
-          throw new Error("stdio transport requires a command");
-        }
-        if (conn.server.transport.args) {
-          const SAFE_ARG_PATTERN = /^[a-zA-Z0-9._\-\/=:@]+$/;
-          for (const arg of conn.server.transport.args) {
-            if (!SAFE_ARG_PATTERN.test(arg)) {
-              throw new Error(`Unsafe argument rejected: contains disallowed characters`);
-            }
+        const SAFE_SERVER_NAME = /^[a-zA-Z0-9_\-]+$/;
+        const newNames = new Set(servers.filter((s) => {
+          if (!SAFE_SERVER_NAME.test(s.name)) {
+            return false;
+          }
+          return s.enabled;
+        }).map((s) => s.name));
+        for (const [name] of this.connections) {
+          if (!newNames.has(name)) {
+            await this.disconnectServer(name);
           }
         }
-        const ENV_BLOCKLIST = /* @__PURE__ */ new Set([
-          "PATH",
-          "HOME",
-          "USER",
-          "SHELL",
-          "NODE_OPTIONS",
-          "NODE_PATH",
-          "LD_PRELOAD",
-          "LD_LIBRARY_PATH",
-          "DYLD_INSERT_LIBRARIES",
-          "PYTHONPATH",
-          "RUBYLIB",
-          "PERL5LIB",
-          "HTTP_PROXY",
-          "HTTPS_PROXY",
-          "NO_PROXY",
-          "http_proxy",
-          "https_proxy",
-          "no_proxy"
-        ]);
-        let transportEnv;
-        if (conn.server.transport.env) {
-          const safeEnv = { ...process.env };
-          for (const [key, value] of Object.entries(conn.server.transport.env)) {
-            if (!ENV_BLOCKLIST.has(key)) {
-              safeEnv[key] = value;
-            }
+        for (const server of servers) {
+          if (!SAFE_SERVER_NAME.test(server.name)) {
+            continue;
           }
-          transportEnv = safeEnv;
+          if (!server.enabled) {
+            if (this.connections.has(server.name)) {
+              await this.disconnectServer(server.name);
+            }
+            continue;
+          }
+          const existing = this.connections.get(server.name);
+          if (existing && existing.state === "connected") {
+            existing.server = server;
+            continue;
+          }
+          this.connectServer(server);
         }
-        transport = new StdioClientTransport({
-          command: conn.server.transport.command,
-          args: conn.server.transport.args,
-          env: transportEnv
+      }
+      /**
+       * Get all discovered tools across all connected upstream servers.
+       */
+      getAllTools() {
+        const result = /* @__PURE__ */ new Map();
+        for (const [name, conn] of this.connections) {
+          if (conn.state === "connected" && conn.tools.length > 0) {
+            result.set(name, conn.tools);
+          }
+        }
+        return result;
+      }
+      /**
+       * Get connection status for all configured servers.
+       */
+      getStatus() {
+        return Array.from(this.connections.values()).map((conn) => ({
+          name: conn.server.name,
+          state: conn.state,
+          transport_type: conn.server.transport.type,
+          tool_count: conn.tools.length,
+          error: conn.error
+        }));
+      }
+      /**
+       * Get the upstream server config by name.
+       */
+      getServerConfig(name) {
+        return this.connections.get(name)?.server;
+      }
+      /**
+       * Call a tool on an upstream server.
+       */
+      async callTool(serverName, toolName, args) {
+        const conn = this.connections.get(serverName);
+        if (!conn) {
+          throw new Error(`Upstream server "${serverName}" is not configured`);
+        }
+        if (conn.state !== "connected" || !conn.client) {
+          throw new Error(`Upstream server "${serverName}" is not connected (state: ${conn.state})`);
+        }
+        const result = await conn.client.callTool({
+          name: toolName,
+          arguments: args
         });
-      } else {
-        if (!conn.server.transport.url) {
-          throw new Error("sse transport requires a url");
+        return result;
+      }
+      /**
+       * Shut down all connections cleanly.
+       */
+      async shutdown() {
+        this.shutdownRequested = true;
+        for (const conn of this.connections.values()) {
+          if (conn.retryTimer) {
+            clearTimeout(conn.retryTimer);
+            conn.retryTimer = void 0;
+          }
         }
-        const ssrfUrl = new URL(conn.server.transport.url);
-        if (ssrfUrl.protocol !== "http:" && ssrfUrl.protocol !== "https:") {
-          throw new Error("SSE transport URL must use http or https scheme");
-        }
-        transport = new SSEClientTransport(ssrfUrl);
+        const disconnects = Array.from(this.connections.keys()).map(
+          (name) => this.disconnectServer(name)
+        );
+        await Promise.allSettled(disconnects);
       }
-      const client = new Client(
-        { name: `sanctuary-proxy/${conn.server.name}`, version: "1.0.0" },
-        { capabilities: {} }
-      );
-      await client.connect(transport);
-      conn.client = client;
-      conn.transport = transport;
-      conn.state = "connected";
-      conn.error = void 0;
-      conn.retryCount = 0;
-      await this.discoverTools(conn);
-      this.notifyStateChange(conn);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown connection error";
-      conn.state = "error";
-      conn.error = message;
-      conn.client = null;
-      conn.transport = null;
-      this.notifyStateChange(conn);
-      this.scheduleRetry(conn);
-    }
-  }
-  /**
-   * Discover tools from a connected upstream server.
-   */
-  async discoverTools(conn) {
-    if (!conn.client || conn.state !== "connected") return;
-    try {
-      const result = await conn.client.listTools();
-      conn.tools = (result.tools ?? []).map((t) => ({
-        name: t.name,
-        description: t.description ?? "",
-        inputSchema: t.inputSchema ?? { type: "object", properties: {} }
-      }));
-    } catch {
-      conn.tools = [];
-    }
-  }
-  /**
-   * Schedule a reconnection attempt with exponential backoff.
-   */
-  scheduleRetry(conn) {
-    if (this.shutdownRequested) return;
-    if (conn.retryCount >= MAX_RETRIES) {
-      conn.error = `Max retries (${MAX_RETRIES}) exceeded. Last error: ${conn.error}`;
-      this.notifyStateChange(conn);
-      return;
-    }
-    const delay = Math.min(
-      BASE_BACKOFF_MS * Math.pow(2, conn.retryCount),
-      MAX_BACKOFF_MS
-    );
-    conn.retryCount++;
-    conn.retryTimer = setTimeout(() => {
-      if (this.shutdownRequested) return;
-      conn.retryTimer = void 0;
-      this.doConnect(conn).catch(() => {
-      });
-    }, delay);
-  }
-  /**
-   * Disconnect a specific upstream server.
-   */
-  async disconnectServer(name) {
-    const conn = this.connections.get(name);
-    if (!conn) return;
-    if (conn.retryTimer) {
-      clearTimeout(conn.retryTimer);
-      conn.retryTimer = void 0;
-    }
-    if (conn.client) {
-      try {
-        await conn.client.close();
-      } catch {
-      }
-    }
-    if (conn.transport) {
-      try {
-        await conn.transport.close();
-      } catch {
-      }
-    }
-    this.connections.delete(name);
-  }
-  /**
-   * Notify listener of state change.
-   */
-  notifyStateChange(conn) {
-    if (this.onStateChange) {
-      try {
-        this.onStateChange(conn.server.name, conn.state, conn.tools.length, conn.error);
-      } catch {
-      }
-    }
-  }
-};
-
-// src/proxy/proxy-router.ts
-init_router();
-var UPSTREAM_CALL_TIMEOUT_MS = 3e4;
-var ProxyRouter = class {
-  clientManager;
-  injectionDetector;
-  auditLog;
-  options;
-  constructor(clientManager, injectionDetector, auditLog, options) {
-    this.clientManager = clientManager;
-    this.injectionDetector = injectionDetector;
-    this.auditLog = auditLog;
-    this.options = options ?? {};
-  }
-  /**
-   * Convert all discovered upstream tools to Sanctuary ToolDefinitions.
-   * Each tool is registered as `proxy/{server_name}/{tool_name}`.
-   */
-  getProxiedTools() {
-    const tools = [];
-    const allUpstreamTools = this.clientManager.getAllTools();
-    for (const [serverName, serverTools] of allUpstreamTools) {
-      for (const upstreamTool of serverTools) {
-        const proxyName = `proxy/${serverName}/${upstreamTool.name}`;
-        tools.push({
-          name: proxyName,
-          description: `[via ${serverName}] ${upstreamTool.description}`,
-          inputSchema: upstreamTool.inputSchema,
-          handler: this.createHandler(serverName, upstreamTool.name)
+      // ── Private ───────────────────────────────────────────────────────────
+      /**
+       * Connect to an upstream server (non-blocking).
+       * Spawns connection attempt in background — does not throw.
+       */
+      connectServer(server) {
+        const conn = {
+          server,
+          client: null,
+          transport: null,
+          state: "connecting",
+          tools: [],
+          retryCount: 0
+        };
+        this.connections.set(server.name, conn);
+        this.notifyStateChange(conn);
+        this.doConnect(conn).catch(() => {
         });
       }
-    }
-    return tools;
-  }
-  /**
-   * Determine the tier for a proxied tool call.
-   * Checks tool_overrides first, then falls back to default_tier.
-   */
-  getTierForTool(serverName, toolName) {
-    const serverConfig = this.clientManager.getServerConfig(serverName);
-    if (!serverConfig) return 2;
-    if (serverConfig.tool_overrides?.[toolName]) {
-      return serverConfig.tool_overrides[toolName].tier;
-    }
-    return serverConfig.default_tier;
-  }
-  /**
-   * Parse a proxy tool name into server name and tool name.
-   * Returns null if the name doesn't match the proxy namespace.
-   */
-  static parseProxyToolName(fullName) {
-    if (!fullName.startsWith("proxy/")) return null;
-    const rest = fullName.slice("proxy/".length);
-    const slashIdx = rest.indexOf("/");
-    if (slashIdx === -1) return null;
-    return {
-      serverName: rest.slice(0, slashIdx),
-      toolName: rest.slice(slashIdx + 1)
-    };
-  }
-  // ── Private ───────────────────────────────────────────────────────────
-  /**
-   * Create a handler for a specific proxied tool.
-   * The handler runs the full enforcement chain before forwarding.
-   */
-  createHandler(serverName, toolName) {
-    return async (args) => {
-      const proxyName = `proxy/${serverName}/${toolName}`;
-      const start = Date.now();
-      const tier = this.getTierForTool(serverName, toolName);
-      try {
-        const injectionResult = this.injectionDetector.scan(proxyName, args);
-        if (injectionResult.flagged && injectionResult.recommendation === "block") {
-          this.auditLog.append("l2", `proxy_injection_blocked:${proxyName}`, "system", {
-            server: serverName,
-            tool: toolName,
-            tier,
-            confidence: injectionResult.confidence,
-            latency_ms: Date.now() - start
-          }, "failure");
-          this.notifyProxyCall(proxyName, serverName, "blocked", "injection_detected", tier);
-          return toolResult({
-            error: "Operation not permitted",
-            proxy: true
-          });
+      /**
+       * Perform the actual connection to an upstream server.
+       */
+      async doConnect(conn) {
+        try {
+          conn.state = "connecting";
+          this.notifyStateChange(conn);
+          let transport;
+          if (conn.server.transport.type === "stdio") {
+            if (!conn.server.transport.command) {
+              throw new Error("stdio transport requires a command");
+            }
+            if (conn.server.transport.args) {
+              const SAFE_ARG_PATTERN = /^[a-zA-Z0-9._\-\/=:@]+$/;
+              for (const arg of conn.server.transport.args) {
+                if (!SAFE_ARG_PATTERN.test(arg)) {
+                  throw new Error(`Unsafe argument rejected: contains disallowed characters`);
+                }
+              }
+            }
+            const ENV_BLOCKLIST = /* @__PURE__ */ new Set([
+              "PATH",
+              "HOME",
+              "USER",
+              "SHELL",
+              "NODE_OPTIONS",
+              "NODE_PATH",
+              "LD_PRELOAD",
+              "LD_LIBRARY_PATH",
+              "DYLD_INSERT_LIBRARIES",
+              "PYTHONPATH",
+              "RUBYLIB",
+              "PERL5LIB",
+              "HTTP_PROXY",
+              "HTTPS_PROXY",
+              "NO_PROXY",
+              "http_proxy",
+              "https_proxy",
+              "no_proxy"
+            ]);
+            let transportEnv;
+            if (conn.server.transport.env) {
+              const safeEnv = { ...process.env };
+              for (const [key, value] of Object.entries(conn.server.transport.env)) {
+                if (!ENV_BLOCKLIST.has(key)) {
+                  safeEnv[key] = value;
+                }
+              }
+              transportEnv = safeEnv;
+            }
+            transport = new StdioClientTransport({
+              command: conn.server.transport.command,
+              args: conn.server.transport.args,
+              env: transportEnv
+            });
+          } else {
+            if (!conn.server.transport.url) {
+              throw new Error("sse transport requires a url");
+            }
+            const ssrfUrl = new URL(conn.server.transport.url);
+            if (ssrfUrl.protocol !== "http:" && ssrfUrl.protocol !== "https:") {
+              throw new Error("SSE transport URL must use http or https scheme");
+            }
+            transport = new SSEClientTransport(ssrfUrl);
+          }
+          const client = new Client(
+            { name: `sanctuary-proxy/${conn.server.name}`, version: "1.0.0" },
+            { capabilities: {} }
+          );
+          await client.connect(transport);
+          conn.client = client;
+          conn.transport = transport;
+          conn.state = "connected";
+          conn.error = void 0;
+          conn.retryCount = 0;
+          await this.discoverTools(conn);
+          this.notifyStateChange(conn);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Unknown connection error";
+          conn.state = "error";
+          conn.error = message;
+          conn.client = null;
+          conn.transport = null;
+          this.notifyStateChange(conn);
+          this.scheduleRetry(conn);
         }
-        if (injectionResult.flagged && injectionResult.recommendation === "escalate") {
-          this.auditLog.append("l2", `proxy_injection_escalated:${proxyName}`, "system", {
-            server: serverName,
-            tool: toolName,
-            tier,
-            confidence: injectionResult.confidence
-          });
+      }
+      /**
+       * Discover tools from a connected upstream server.
+       */
+      async discoverTools(conn) {
+        if (!conn.client || conn.state !== "connected") return;
+        try {
+          const result = await conn.client.listTools();
+          conn.tools = (result.tools ?? []).map((t) => ({
+            name: t.name,
+            description: t.description ?? "",
+            inputSchema: t.inputSchema ?? { type: "object", properties: {} }
+          }));
+        } catch {
+          conn.tools = [];
         }
-        let filteredArgs = args;
-        if (this.options.contextGateFilter) {
+      }
+      /**
+       * Schedule a reconnection attempt with exponential backoff.
+       */
+      scheduleRetry(conn) {
+        if (this.shutdownRequested) return;
+        if (conn.retryCount >= MAX_RETRIES) {
+          conn.error = `Max retries (${MAX_RETRIES}) exceeded. Last error: ${conn.error}`;
+          this.notifyStateChange(conn);
+          return;
+        }
+        const delay = Math.min(
+          BASE_BACKOFF_MS * Math.pow(2, conn.retryCount),
+          MAX_BACKOFF_MS
+        );
+        conn.retryCount++;
+        conn.retryTimer = setTimeout(() => {
+          if (this.shutdownRequested) return;
+          conn.retryTimer = void 0;
+          this.doConnect(conn).catch(() => {
+          });
+        }, delay);
+      }
+      /**
+       * Disconnect a specific upstream server.
+       */
+      async disconnectServer(name) {
+        const conn = this.connections.get(name);
+        if (!conn) return;
+        if (conn.retryTimer) {
+          clearTimeout(conn.retryTimer);
+          conn.retryTimer = void 0;
+        }
+        if (conn.client) {
           try {
-            filteredArgs = await this.options.contextGateFilter(proxyName, args);
+            await conn.client.close();
           } catch {
           }
         }
-        if (this.options.governor) {
-          const govResult = this.options.governor.check(serverName, toolName, filteredArgs);
-          if (!govResult.allowed) {
-            this.auditLog.append("l2", `proxy_governor_blocked:${proxyName}`, "system", {
-              server: serverName,
-              tool: toolName,
-              tier,
-              reason: govResult.reason,
-              latency_ms: Date.now() - start
-            }, "failure");
-            this.notifyProxyCall(proxyName, serverName, "blocked", govResult.reason, tier);
-            return toolResult({
-              error: "Operation not permitted",
-              proxy: true,
-              governor_reason: govResult.reason
-            });
-          }
-          if (govResult.reason === "duplicate_cached" && govResult.cached_result !== void 0) {
-            this.auditLog.append("l2", `proxy_governor_cached:${proxyName}`, "system", {
-              server: serverName,
-              tool: toolName,
-              tier,
-              cached: true,
-              latency_ms: Date.now() - start
-            });
-            return toolResult(govResult.cached_result ?? {});
+        if (conn.transport) {
+          try {
+            await conn.transport.close();
+          } catch {
           }
         }
-        const result = await this.callWithTimeout(
-          serverName,
-          toolName,
-          filteredArgs,
-          UPSTREAM_CALL_TIMEOUT_MS
-        );
-        const latencyMs = Date.now() - start;
-        if (this.options.governor) {
-          this.options.governor.recordResult(serverName, toolName, filteredArgs, result);
+        this.connections.delete(name);
+      }
+      /**
+       * Notify listener of state change.
+       */
+      notifyStateChange(conn) {
+        if (this.onStateChange) {
+          try {
+            this.onStateChange(conn.server.name, conn.state, conn.tools.length, conn.error);
+          } catch {
+          }
         }
-        this.auditLog.append("l2", `proxy_call:${proxyName}`, "system", {
-          server: serverName,
-          tool: toolName,
-          tier,
-          decision: "allowed",
-          latency_ms: latencyMs
-        });
-        this.notifyProxyCall(proxyName, serverName, "allowed", void 0, tier);
-        return this.normalizeResponse(result);
-      } catch (err) {
-        const latencyMs = Date.now() - start;
-        const rawErrorMessage = err instanceof Error ? err.message : "Unknown upstream error";
-        const sanitizeError = (msg) => {
-          let safe = msg.substring(0, 200);
-          safe = safe.replace(/\/[^\s]+/g, "[path-redacted]");
-          safe = safe.replace(/(?:mongodb|postgres|mysql|redis):\/\/[^\s]+/g, "[connection-redacted]");
-          return safe;
-        };
-        const errorMessage = sanitizeError(rawErrorMessage);
-        this.auditLog.append("l2", `proxy_call:${proxyName}`, "system", {
-          server: serverName,
-          tool: toolName,
-          tier,
-          decision: "error",
-          error: errorMessage,
-          latency_ms: latencyMs
-        }, "failure");
-        this.notifyProxyCall(proxyName, serverName, "error", errorMessage, tier);
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              error: errorMessage,
-              proxy: true,
-              server: serverName,
-              tool: toolName
-            })
-          }]
-        };
       }
     };
   }
-  /**
-   * Notify the onProxyCall callback if configured.
-   */
-  notifyProxyCall(tool, server, decision, reason, tier) {
-    if (this.options.onProxyCall) {
-      try {
-        this.options.onProxyCall({
-          tool,
-          server,
-          decision,
-          reason,
-          tier,
-          timestamp: (/* @__PURE__ */ new Date()).toISOString()
-        });
-      } catch {
+});
+
+// src/proxy/proxy-router.ts
+var UPSTREAM_CALL_TIMEOUT_MS, ProxyRouter;
+var init_proxy_router = __esm({
+  "src/proxy/proxy-router.ts"() {
+    init_router();
+    UPSTREAM_CALL_TIMEOUT_MS = 3e4;
+    ProxyRouter = class {
+      clientManager;
+      injectionDetector;
+      auditLog;
+      options;
+      constructor(clientManager, injectionDetector, auditLog, options) {
+        this.clientManager = clientManager;
+        this.injectionDetector = injectionDetector;
+        this.auditLog = auditLog;
+        this.options = options ?? {};
       }
-    }
-  }
-  /**
-   * Call an upstream tool with a timeout.
-   */
-  async callWithTimeout(serverName, toolName, args, timeoutMs) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(`Upstream tool call timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      this.clientManager.callTool(serverName, toolName, args).then((result) => {
-        clearTimeout(timer);
-        resolve(result);
-      }).catch((err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
-    });
-  }
-  /**
-   * Normalize an upstream response to the standard Sanctuary response format.
-   */
-  normalizeResponse(result) {
-    const MAX_RESPONSE_SIZE = 1e6;
-    const MAX_TEXT_BLOCK_SIZE = 1e5;
-    const responseStr = JSON.stringify(result);
-    if (responseStr.length > MAX_RESPONSE_SIZE) {
-      return toolResult({
-        error: "upstream_response_too_large",
-        max_bytes: MAX_RESPONSE_SIZE
-      });
-    }
-    if (!result.content || !Array.isArray(result.content)) {
-      return toolResult({ upstream_response: result });
-    }
-    const textContent = result.content.filter((c) => c.type === "text" && typeof c.text === "string").map((c) => {
-      const text = c.text;
-      if (text.length > MAX_TEXT_BLOCK_SIZE) {
+      /**
+       * Convert all discovered upstream tools to Sanctuary ToolDefinitions.
+       * Each tool is registered as `proxy/{server_name}/{tool_name}`.
+       */
+      getProxiedTools() {
+        const tools = [];
+        const allUpstreamTools = this.clientManager.getAllTools();
+        for (const [serverName, serverTools] of allUpstreamTools) {
+          for (const upstreamTool of serverTools) {
+            const proxyName = `proxy/${serverName}/${upstreamTool.name}`;
+            tools.push({
+              name: proxyName,
+              description: `[via ${serverName}] ${upstreamTool.description}`,
+              inputSchema: upstreamTool.inputSchema,
+              handler: this.createHandler(serverName, upstreamTool.name)
+            });
+          }
+        }
+        return tools;
+      }
+      /**
+       * Determine the tier for a proxied tool call.
+       * Checks tool_overrides first, then falls back to default_tier.
+       */
+      getTierForTool(serverName, toolName) {
+        const serverConfig = this.clientManager.getServerConfig(serverName);
+        if (!serverConfig) return 2;
+        if (serverConfig.tool_overrides?.[toolName]) {
+          return serverConfig.tool_overrides[toolName].tier;
+        }
+        return serverConfig.default_tier;
+      }
+      /**
+       * Parse a proxy tool name into server name and tool name.
+       * Returns null if the name doesn't match the proxy namespace.
+       */
+      static parseProxyToolName(fullName) {
+        if (!fullName.startsWith("proxy/")) return null;
+        const rest = fullName.slice("proxy/".length);
+        const slashIdx = rest.indexOf("/");
+        if (slashIdx === -1) return null;
         return {
-          type: "text",
-          text: text.substring(0, MAX_TEXT_BLOCK_SIZE) + "\n[response truncated]"
+          serverName: rest.slice(0, slashIdx),
+          toolName: rest.slice(slashIdx + 1)
         };
       }
-      return { type: "text", text };
-    });
-    if (textContent.length > 0) {
-      return { content: textContent };
-    }
-    return toolResult({ upstream_response: result.content });
+      // ── Private ───────────────────────────────────────────────────────────
+      /**
+       * Create a handler for a specific proxied tool.
+       * The handler runs the full enforcement chain before forwarding.
+       */
+      createHandler(serverName, toolName) {
+        return async (args) => {
+          const proxyName = `proxy/${serverName}/${toolName}`;
+          const start = Date.now();
+          const tier = this.getTierForTool(serverName, toolName);
+          try {
+            const injectionResult = this.injectionDetector.scan(proxyName, args);
+            if (injectionResult.flagged && injectionResult.recommendation === "block") {
+              this.auditLog.append("l2", `proxy_injection_blocked:${proxyName}`, "system", {
+                server: serverName,
+                tool: toolName,
+                tier,
+                confidence: injectionResult.confidence,
+                latency_ms: Date.now() - start
+              }, "failure");
+              this.notifyProxyCall(proxyName, serverName, "blocked", "injection_detected", tier);
+              return toolResult({
+                error: "Operation not permitted",
+                proxy: true
+              });
+            }
+            if (injectionResult.flagged && injectionResult.recommendation === "escalate") {
+              this.auditLog.append("l2", `proxy_injection_escalated:${proxyName}`, "system", {
+                server: serverName,
+                tool: toolName,
+                tier,
+                confidence: injectionResult.confidence
+              });
+            }
+            let filteredArgs = args;
+            if (this.options.contextGateFilter) {
+              try {
+                filteredArgs = await this.options.contextGateFilter(proxyName, args);
+              } catch {
+              }
+            }
+            if (this.options.governor) {
+              const govResult = this.options.governor.check(serverName, toolName, filteredArgs);
+              if (!govResult.allowed) {
+                this.auditLog.append("l2", `proxy_governor_blocked:${proxyName}`, "system", {
+                  server: serverName,
+                  tool: toolName,
+                  tier,
+                  reason: govResult.reason,
+                  latency_ms: Date.now() - start
+                }, "failure");
+                this.notifyProxyCall(proxyName, serverName, "blocked", govResult.reason, tier);
+                return toolResult({
+                  error: "Operation not permitted",
+                  proxy: true,
+                  governor_reason: govResult.reason
+                });
+              }
+              if (govResult.reason === "duplicate_cached" && govResult.cached_result !== void 0) {
+                this.auditLog.append("l2", `proxy_governor_cached:${proxyName}`, "system", {
+                  server: serverName,
+                  tool: toolName,
+                  tier,
+                  cached: true,
+                  latency_ms: Date.now() - start
+                });
+                return toolResult(govResult.cached_result ?? {});
+              }
+            }
+            const result = await this.callWithTimeout(
+              serverName,
+              toolName,
+              filteredArgs,
+              UPSTREAM_CALL_TIMEOUT_MS
+            );
+            const latencyMs = Date.now() - start;
+            if (this.options.governor) {
+              this.options.governor.recordResult(serverName, toolName, filteredArgs, result);
+            }
+            this.auditLog.append("l2", `proxy_call:${proxyName}`, "system", {
+              server: serverName,
+              tool: toolName,
+              tier,
+              decision: "allowed",
+              latency_ms: latencyMs
+            });
+            this.notifyProxyCall(proxyName, serverName, "allowed", void 0, tier);
+            return this.normalizeResponse(result);
+          } catch (err) {
+            const latencyMs = Date.now() - start;
+            const rawErrorMessage = err instanceof Error ? err.message : "Unknown upstream error";
+            const sanitizeError = (msg) => {
+              let safe = msg.substring(0, 200);
+              safe = safe.replace(/\/[^\s]+/g, "[path-redacted]");
+              safe = safe.replace(/(?:mongodb|postgres|mysql|redis):\/\/[^\s]+/g, "[connection-redacted]");
+              return safe;
+            };
+            const errorMessage = sanitizeError(rawErrorMessage);
+            this.auditLog.append("l2", `proxy_call:${proxyName}`, "system", {
+              server: serverName,
+              tool: toolName,
+              tier,
+              decision: "error",
+              error: errorMessage,
+              latency_ms: latencyMs
+            }, "failure");
+            this.notifyProxyCall(proxyName, serverName, "error", errorMessage, tier);
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  error: errorMessage,
+                  proxy: true,
+                  server: serverName,
+                  tool: toolName
+                })
+              }]
+            };
+          }
+        };
+      }
+      /**
+       * Notify the onProxyCall callback if configured.
+       */
+      notifyProxyCall(tool, server, decision, reason, tier) {
+        if (this.options.onProxyCall) {
+          try {
+            this.options.onProxyCall({
+              tool,
+              server,
+              decision,
+              reason,
+              tier,
+              timestamp: (/* @__PURE__ */ new Date()).toISOString()
+            });
+          } catch {
+          }
+        }
+      }
+      /**
+       * Call an upstream tool with a timeout.
+       */
+      async callWithTimeout(serverName, toolName, args, timeoutMs) {
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            reject(new Error(`Upstream tool call timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+          this.clientManager.callTool(serverName, toolName, args).then((result) => {
+            clearTimeout(timer);
+            resolve(result);
+          }).catch((err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
+        });
+      }
+      /**
+       * Normalize an upstream response to the standard Sanctuary response format.
+       */
+      normalizeResponse(result) {
+        const MAX_RESPONSE_SIZE = 1e6;
+        const MAX_TEXT_BLOCK_SIZE = 1e5;
+        const responseStr = JSON.stringify(result);
+        if (responseStr.length > MAX_RESPONSE_SIZE) {
+          return toolResult({
+            error: "upstream_response_too_large",
+            max_bytes: MAX_RESPONSE_SIZE
+          });
+        }
+        if (!result.content || !Array.isArray(result.content)) {
+          return toolResult({ upstream_response: result });
+        }
+        const textContent = result.content.filter((c) => c.type === "text" && typeof c.text === "string").map((c) => {
+          const text = c.text;
+          if (text.length > MAX_TEXT_BLOCK_SIZE) {
+            return {
+              type: "text",
+              text: text.substring(0, MAX_TEXT_BLOCK_SIZE) + "\n[response truncated]"
+            };
+          }
+          return { type: "text", text };
+        });
+        if (textContent.length > 0) {
+          return { content: textContent };
+        }
+        return toolResult({ upstream_response: result.content });
+      }
+    };
   }
-};
+});
 function strToBytes(s) {
   return new TextEncoder().encode(s);
 }
@@ -17525,213 +17155,217 @@ function bytesToHex(bytes) {
 function sha256Hex(input) {
   return bytesToHex(sha256(strToBytes(input)));
 }
-var DEFAULT_CONFIG = {
-  volume_limit: 200,
-  volume_window_ms: 6e5,
-  // 10 minutes
-  rate_limit: 20,
-  rate_window_ms: 6e4,
-  // 1 minute
-  duplicate_ttl_ms: 6e4,
-  // 1 minute
-  lifetime_limit: 1e3
-};
-var CallGovernor = class {
-  config;
-  /** Sliding window of all call timestamps for volume tracking */
-  volumeWindow = [];
-  /** Per-tool sliding window of call timestamps for rate tracking */
-  rateWindows = /* @__PURE__ */ new Map();
-  /** Duplicate cache: SHA-256(server+tool+args) -> cached result + expiry */
-  duplicateCache = /* @__PURE__ */ new Map();
-  /** Total calls this session */
-  lifetimeCount = 0;
-  /** Hard stop flag — set when lifetime limit is reached */
-  hardStopped = false;
-  constructor(config) {
-    this.config = { ...DEFAULT_CONFIG, ...config };
-  }
-  /**
-   * Check if a call is allowed and apply governance.
-   *
-   * Evaluation order:
-   * 1. Lifetime limit (hard stop — not recoverable without reset)
-   * 2. Volume limit (sliding window)
-   * 3. Rate limit per tool (escalates to Tier 2)
-   * 4. Duplicate detection (returns cached result)
-   */
-  check(serverName, toolName, args) {
-    const now = Date.now();
-    const effectiveConfig = this.getEffectiveConfig(serverName);
-    if (this.hardStopped) {
-      return {
-        allowed: false,
-        reason: "lifetime_exceeded"
-      };
-    }
-    if (this.lifetimeCount >= effectiveConfig.lifetime_limit) {
-      this.hardStopped = true;
-      return {
-        allowed: false,
-        reason: "lifetime_exceeded"
-      };
-    }
-    this.pruneVolumeWindow(now, effectiveConfig.volume_window_ms);
-    if (this.volumeWindow.length >= effectiveConfig.volume_limit) {
-      return {
-        allowed: false,
-        reason: "volume_exceeded"
-      };
-    }
-    const toolKey = `${serverName}::${toolName}`;
-    this.pruneRateWindow(toolKey, now, effectiveConfig.rate_window_ms);
-    const rateWindow = this.rateWindows.get(toolKey);
-    const currentRate = rateWindow ? rateWindow.length : 0;
-    if (currentRate >= effectiveConfig.rate_limit) {
-      return {
-        allowed: false,
-        reason: "rate_exceeded",
-        escalate: true
-      };
-    }
-    const callHash = this.computeCallHash(serverName, toolName, args);
-    this.pruneDuplicateCache(now);
-    const cached = this.duplicateCache.get(callHash);
-    if (cached && cached.expires_at > now) {
-      return {
-        allowed: true,
-        reason: "duplicate_cached",
-        cached_result: cached.result
-      };
-    }
-    this.volumeWindow.push(now);
-    if (!this.rateWindows.has(toolKey)) {
-      this.rateWindows.set(toolKey, []);
-    }
-    this.rateWindows.get(toolKey).push(now);
-    this.lifetimeCount++;
-    return { allowed: true };
-  }
-  /**
-   * Record a successful call result for duplicate caching.
-   */
-  recordResult(serverName, toolName, args, result) {
-    const callHash = this.computeCallHash(serverName, toolName, args);
-    const effectiveConfig = this.getEffectiveConfig(serverName);
-    this.duplicateCache.set(callHash, {
-      result,
-      expires_at: Date.now() + effectiveConfig.duplicate_ttl_ms
-    });
-  }
-  /**
-   * Get current governor status for dashboard display.
-   */
-  getStatus() {
-    const now = Date.now();
-    this.pruneVolumeWindow(now, this.config.volume_window_ms);
-    this.pruneDuplicateCache(now);
-    const rateByTool = {};
-    for (const [toolKey, timestamps] of this.rateWindows.entries()) {
-      const cutoff = now - this.config.rate_window_ms;
-      const activeCount = timestamps.filter((t) => t >= cutoff).length;
-      if (activeCount > 0) {
-        rateByTool[toolKey] = activeCount;
+var DEFAULT_CONFIG, CallGovernor;
+var init_call_governor = __esm({
+  "src/l2-operational/call-governor.ts"() {
+    DEFAULT_CONFIG = {
+      volume_limit: 200,
+      volume_window_ms: 6e5,
+      // 10 minutes
+      rate_limit: 20,
+      rate_window_ms: 6e4,
+      // 1 minute
+      duplicate_ttl_ms: 6e4,
+      // 1 minute
+      lifetime_limit: 1e3
+    };
+    CallGovernor = class {
+      config;
+      /** Sliding window of all call timestamps for volume tracking */
+      volumeWindow = [];
+      /** Per-tool sliding window of call timestamps for rate tracking */
+      rateWindows = /* @__PURE__ */ new Map();
+      /** Duplicate cache: SHA-256(server+tool+args) -> cached result + expiry */
+      duplicateCache = /* @__PURE__ */ new Map();
+      /** Total calls this session */
+      lifetimeCount = 0;
+      /** Hard stop flag — set when lifetime limit is reached */
+      hardStopped = false;
+      constructor(config) {
+        this.config = { ...DEFAULT_CONFIG, ...config };
       }
-    }
-    return {
-      volume_current: this.volumeWindow.length,
-      volume_limit: this.config.volume_limit,
-      lifetime_current: this.lifetimeCount,
-      lifetime_limit: this.config.lifetime_limit,
-      rate_by_tool: rateByTool,
-      duplicate_cache_size: this.duplicateCache.size,
-      hard_stopped: this.hardStopped
+      /**
+       * Check if a call is allowed and apply governance.
+       *
+       * Evaluation order:
+       * 1. Lifetime limit (hard stop — not recoverable without reset)
+       * 2. Volume limit (sliding window)
+       * 3. Rate limit per tool (escalates to Tier 2)
+       * 4. Duplicate detection (returns cached result)
+       */
+      check(serverName, toolName, args) {
+        const now = Date.now();
+        const effectiveConfig = this.getEffectiveConfig(serverName);
+        if (this.hardStopped) {
+          return {
+            allowed: false,
+            reason: "lifetime_exceeded"
+          };
+        }
+        if (this.lifetimeCount >= effectiveConfig.lifetime_limit) {
+          this.hardStopped = true;
+          return {
+            allowed: false,
+            reason: "lifetime_exceeded"
+          };
+        }
+        this.pruneVolumeWindow(now, effectiveConfig.volume_window_ms);
+        if (this.volumeWindow.length >= effectiveConfig.volume_limit) {
+          return {
+            allowed: false,
+            reason: "volume_exceeded"
+          };
+        }
+        const toolKey = `${serverName}::${toolName}`;
+        this.pruneRateWindow(toolKey, now, effectiveConfig.rate_window_ms);
+        const rateWindow = this.rateWindows.get(toolKey);
+        const currentRate = rateWindow ? rateWindow.length : 0;
+        if (currentRate >= effectiveConfig.rate_limit) {
+          return {
+            allowed: false,
+            reason: "rate_exceeded",
+            escalate: true
+          };
+        }
+        const callHash = this.computeCallHash(serverName, toolName, args);
+        this.pruneDuplicateCache(now);
+        const cached = this.duplicateCache.get(callHash);
+        if (cached && cached.expires_at > now) {
+          return {
+            allowed: true,
+            reason: "duplicate_cached",
+            cached_result: cached.result
+          };
+        }
+        this.volumeWindow.push(now);
+        if (!this.rateWindows.has(toolKey)) {
+          this.rateWindows.set(toolKey, []);
+        }
+        this.rateWindows.get(toolKey).push(now);
+        this.lifetimeCount++;
+        return { allowed: true };
+      }
+      /**
+       * Record a successful call result for duplicate caching.
+       */
+      recordResult(serverName, toolName, args, result) {
+        const callHash = this.computeCallHash(serverName, toolName, args);
+        const effectiveConfig = this.getEffectiveConfig(serverName);
+        this.duplicateCache.set(callHash, {
+          result,
+          expires_at: Date.now() + effectiveConfig.duplicate_ttl_ms
+        });
+      }
+      /**
+       * Get current governor status for dashboard display.
+       */
+      getStatus() {
+        const now = Date.now();
+        this.pruneVolumeWindow(now, this.config.volume_window_ms);
+        this.pruneDuplicateCache(now);
+        const rateByTool = {};
+        for (const [toolKey, timestamps] of this.rateWindows.entries()) {
+          const cutoff = now - this.config.rate_window_ms;
+          const activeCount = timestamps.filter((t) => t >= cutoff).length;
+          if (activeCount > 0) {
+            rateByTool[toolKey] = activeCount;
+          }
+        }
+        return {
+          volume_current: this.volumeWindow.length,
+          volume_limit: this.config.volume_limit,
+          lifetime_current: this.lifetimeCount,
+          lifetime_limit: this.config.lifetime_limit,
+          rate_by_tool: rateByTool,
+          duplicate_cache_size: this.duplicateCache.size,
+          hard_stopped: this.hardStopped
+        };
+      }
+      /**
+       * Reset all counters (Tier 1 — requires approval).
+       * Clears volume window, rate windows, duplicate cache,
+       * lifetime counter, and hard stop flag.
+       */
+      reset() {
+        this.volumeWindow = [];
+        this.rateWindows.clear();
+        this.duplicateCache.clear();
+        this.lifetimeCount = 0;
+        this.hardStopped = false;
+      }
+      /**
+       * Get the effective config for a given server, merging per-server overrides.
+       */
+      getEffectiveConfig(serverName) {
+        const override = this.config.per_server_overrides?.[serverName];
+        if (!override) return this.config;
+        return { ...this.config, ...override };
+      }
+      /**
+       * Compute a SHA-256 hash of server + tool + canonical args.
+       * Used for duplicate detection.
+       */
+      computeCallHash(serverName, toolName, args) {
+        const stableArgs = this.stableStringify(args);
+        const input = `${serverName}\0${toolName}\0${stableArgs}`;
+        return sha256Hex(input);
+      }
+      /**
+       * Deterministic JSON serialization with sorted keys.
+       */
+      stableStringify(obj) {
+        if (obj === null || obj === void 0) return "null";
+        if (typeof obj !== "object") return JSON.stringify(obj);
+        if (Array.isArray(obj)) {
+          return "[" + obj.map((item) => this.stableStringify(item)).join(",") + "]";
+        }
+        const sortedKeys = Object.keys(obj).sort();
+        const pairs = sortedKeys.map(
+          (key) => JSON.stringify(key) + ":" + this.stableStringify(obj[key])
+        );
+        return "{" + pairs.join(",") + "}";
+      }
+      /**
+       * Prune volume window entries older than the window size.
+       * Uses shift() from the front — timestamps are appended in order.
+       */
+      pruneVolumeWindow(now, windowMs) {
+        const cutoff = now - windowMs;
+        while (this.volumeWindow.length > 0 && this.volumeWindow[0] < cutoff) {
+          this.volumeWindow.shift();
+        }
+      }
+      /**
+       * Prune a per-tool rate window.
+       */
+      pruneRateWindow(toolKey, now, windowMs) {
+        const window = this.rateWindows.get(toolKey);
+        if (!window) return;
+        const cutoff = now - windowMs;
+        while (window.length > 0 && window[0] < cutoff) {
+          window.shift();
+        }
+        if (window.length === 0) {
+          this.rateWindows.delete(toolKey);
+        }
+      }
+      /**
+       * Prune expired entries from the duplicate cache.
+       * Amortized O(1) — only prunes when cache exceeds a size threshold.
+       */
+      pruneDuplicateCache(now) {
+        if (this.duplicateCache.size < 100) return;
+        for (const [key, entry] of this.duplicateCache) {
+          if (entry.expires_at <= now) {
+            this.duplicateCache.delete(key);
+          }
+        }
+      }
     };
   }
-  /**
-   * Reset all counters (Tier 1 — requires approval).
-   * Clears volume window, rate windows, duplicate cache,
-   * lifetime counter, and hard stop flag.
-   */
-  reset() {
-    this.volumeWindow = [];
-    this.rateWindows.clear();
-    this.duplicateCache.clear();
-    this.lifetimeCount = 0;
-    this.hardStopped = false;
-  }
-  /**
-   * Get the effective config for a given server, merging per-server overrides.
-   */
-  getEffectiveConfig(serverName) {
-    const override = this.config.per_server_overrides?.[serverName];
-    if (!override) return this.config;
-    return { ...this.config, ...override };
-  }
-  /**
-   * Compute a SHA-256 hash of server + tool + canonical args.
-   * Used for duplicate detection.
-   */
-  computeCallHash(serverName, toolName, args) {
-    const stableArgs = this.stableStringify(args);
-    const input = `${serverName}\0${toolName}\0${stableArgs}`;
-    return sha256Hex(input);
-  }
-  /**
-   * Deterministic JSON serialization with sorted keys.
-   */
-  stableStringify(obj) {
-    if (obj === null || obj === void 0) return "null";
-    if (typeof obj !== "object") return JSON.stringify(obj);
-    if (Array.isArray(obj)) {
-      return "[" + obj.map((item) => this.stableStringify(item)).join(",") + "]";
-    }
-    const sortedKeys = Object.keys(obj).sort();
-    const pairs = sortedKeys.map(
-      (key) => JSON.stringify(key) + ":" + this.stableStringify(obj[key])
-    );
-    return "{" + pairs.join(",") + "}";
-  }
-  /**
-   * Prune volume window entries older than the window size.
-   * Uses shift() from the front — timestamps are appended in order.
-   */
-  pruneVolumeWindow(now, windowMs) {
-    const cutoff = now - windowMs;
-    while (this.volumeWindow.length > 0 && this.volumeWindow[0] < cutoff) {
-      this.volumeWindow.shift();
-    }
-  }
-  /**
-   * Prune a per-tool rate window.
-   */
-  pruneRateWindow(toolKey, now, windowMs) {
-    const window = this.rateWindows.get(toolKey);
-    if (!window) return;
-    const cutoff = now - windowMs;
-    while (window.length > 0 && window[0] < cutoff) {
-      window.shift();
-    }
-    if (window.length === 0) {
-      this.rateWindows.delete(toolKey);
-    }
-  }
-  /**
-   * Prune expired entries from the duplicate cache.
-   * Amortized O(1) — only prunes when cache exceeds a size threshold.
-   */
-  pruneDuplicateCache(now) {
-    if (this.duplicateCache.size < 100) return;
-    for (const [key, entry] of this.duplicateCache) {
-      if (entry.expires_at <= now) {
-        this.duplicateCache.delete(key);
-      }
-    }
-  }
-};
+});
 
 // src/l2-operational/governor-tools.ts
-init_router();
 function createGovernorTools(governor, auditLog) {
   const tools = [
     // ── Governor Status ─────────────────────────────────────────────
@@ -17829,14 +17463,13 @@ function createGovernorTools(governor, auditLog) {
   ];
   return { tools };
 }
+var init_governor_tools = __esm({
+  "src/l2-operational/governor-tools.ts"() {
+    init_router();
+  }
+});
 
 // src/sanctuary-tools.ts
-init_router();
-init_identity();
-init_key_derivation();
-init_encoding();
-init_identity();
-init_generator();
 function validateVerascoreUrl(urlStr, configuredUrl) {
   const allowed = /* @__PURE__ */ new Set([
     "verascore.ai",
@@ -17926,7 +17559,8 @@ function createSanctuaryTools(opts) {
             identity_id: publicIdentity.identity_id,
             profileUrl,
             tier: "self-attested",
-            published: false
+            published: false,
+            passphrase_warning: PASSPHRASE_BACKUP_WARNING
           });
         }
         const urlCheck = validateVerascoreUrl(verascoreUrl, config.verascore.url);
@@ -17987,7 +17621,8 @@ function createSanctuaryTools(opts) {
             tier: "self-attested",
             published: response.ok,
             verascore_status: response.status,
-            verascore_response: result
+            verascore_response: result,
+            passphrase_warning: PASSPHRASE_BACKUP_WARNING
           });
         } catch (err) {
           auditLog.append("l4", "sanctuary_bootstrap", publicIdentity.identity_id, {
@@ -18000,7 +17635,8 @@ function createSanctuaryTools(opts) {
             profileUrl,
             tier: "self-attested",
             published: false,
-            warning: `Identity created but Verascore publish failed: ${err instanceof Error ? err.message : String(err)}`
+            warning: `Identity created but Verascore publish failed: ${err instanceof Error ? err.message : String(err)}`,
+            passphrase_warning: PASSPHRASE_BACKUP_WARNING
           });
         }
       }
@@ -18261,20 +17897,3238 @@ function createSanctuaryTools(opts) {
   ];
   return { tools };
 }
+var PASSPHRASE_BACKUP_WARNING;
+var init_sanctuary_tools = __esm({
+  "src/sanctuary-tools.ts"() {
+    init_router();
+    init_identity();
+    init_key_derivation();
+    init_encoding();
+    init_identity();
+    init_generator();
+    PASSPHRASE_BACKUP_WARNING = "\u26A0\uFE0F  IMPORTANT: Your Sanctuary passphrase is the only way to decrypt your agent's state. If lost, all encrypted data is unrecoverable by design. Back up your passphrase now to a password manager, encrypted USB, or other secure location separate from this machine.";
+  }
+});
 
-// src/index.ts
-init_key_derivation();
-init_random();
-init_encoding();
-init_config();
-init_audit_log();
-init_sovereignty_profile();
-init_system_prompt_generator();
-init_filesystem();
-init_baseline();
-init_loader();
-init_dashboard();
-init_generator();
+// src/l1-cognitive/memory-attest.ts
+function createMemoryAttestTools(identityManager, masterKey, auditLog) {
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  const tools = [
+    {
+      name: "memory_attest",
+      description: "Create an Ed25519-signed attestation for a memory operation. Records who accessed what (content hash, not content), when, and through which memory provider \u2014 without exposing the memory content itself. Works with any MCP-compatible memory provider (Mem0, Zep, Letta, etc.). Use after add_memory, search_memories, or any memory CRUD operation to build a cryptographically verifiable audit trail of memory access.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          operation: {
+            type: "string",
+            enum: VALID_OPERATIONS,
+            description: "The memory operation that was performed: store, retrieve, update, delete, or search."
+          },
+          provider: {
+            type: "string",
+            description: 'Name of the memory provider (e.g., "mem0", "zep", "letta", "graphiti").'
+          },
+          content_hash: {
+            type: "string",
+            description: "SHA-256 hash of the memory content (hex or base64url). If you have raw content, hash it first \u2014 never pass raw memory content to this tool."
+          },
+          memory_id: {
+            type: "string",
+            description: "Optional: ID returned by the memory provider for this memory entry."
+          },
+          user_id: {
+            type: "string",
+            description: "Optional: user ID associated with this memory operation."
+          },
+          agent_id: {
+            type: "string",
+            description: "Optional: agent ID that performed the operation."
+          },
+          session_id: {
+            type: "string",
+            description: "Optional: session ID in which the operation occurred."
+          },
+          scope: {
+            type: "string",
+            enum: VALID_SCOPES,
+            description: 'Optional: memory scope \u2014 "user" (personal), "agent" (agent-specific), "session" (session-scoped), or "app" (application-wide).'
+          },
+          identity_id: {
+            type: "string",
+            description: "Optional: Sanctuary identity to sign with. Defaults to primary identity."
+          }
+        },
+        required: ["operation", "provider", "content_hash"]
+      },
+      handler: async (args) => {
+        const operation = args.operation;
+        if (!VALID_OPERATIONS.includes(operation)) {
+          return toolResult({
+            error: `Invalid operation: "${operation}". Must be one of: ${VALID_OPERATIONS.join(", ")}`
+          });
+        }
+        const provider = args.provider;
+        if (!provider || provider.trim().length === 0) {
+          return toolResult({ error: "Provider name is required." });
+        }
+        if (provider.length > 128) {
+          return toolResult({
+            error: "Provider name exceeds 128 character limit."
+          });
+        }
+        const contentHash = args.content_hash;
+        if (!contentHash || contentHash.trim().length === 0) {
+          return toolResult({ error: "Content hash is required." });
+        }
+        if (contentHash.length > 128) {
+          return toolResult({
+            error: "Content hash exceeds 128 character limit."
+          });
+        }
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: identityId ? `Identity not found: ${identityId}` : "No default identity. Create one with identity_create first."
+          });
+        }
+        const scope = args.scope;
+        if (scope && !VALID_SCOPES.includes(scope)) {
+          return toolResult({
+            error: `Invalid scope: "${scope}". Must be one of: ${VALID_SCOPES.join(", ")}`
+          });
+        }
+        const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+        const payload = {
+          version: 1,
+          operation,
+          provider: provider.trim(),
+          content_hash: contentHash.trim(),
+          metadata: {
+            ...args.user_id ? { user_id: args.user_id } : {},
+            ...args.agent_id ? { agent_id: args.agent_id } : {},
+            ...args.session_id ? { session_id: args.session_id } : {},
+            ...scope ? { scope } : {}
+          },
+          ...args.memory_id ? { memory_id: args.memory_id } : {},
+          identity_id: identity.identity_id,
+          identity_did: identity.did,
+          timestamp
+        };
+        const payloadBytes = stringToBytes(JSON.stringify(payload));
+        const signature = sign(
+          payloadBytes,
+          identity.encrypted_private_key,
+          identityEncKey
+        );
+        const attestationId = hashToString(payloadBytes).slice(0, 22);
+        auditLog.append("l1", `memory_${operation}`, identity.identity_id, {
+          attestation_id: attestationId,
+          provider: payload.provider,
+          content_hash: payload.content_hash,
+          memory_id: payload.memory_id,
+          scope: payload.metadata.scope
+        });
+        const attestation = {
+          attestation_id: attestationId,
+          payload,
+          signature: toBase64url(signature),
+          public_key: identity.public_key
+        };
+        return toolResult(attestation);
+      }
+    }
+  ];
+  return { tools };
+}
+var VALID_OPERATIONS, VALID_SCOPES;
+var init_memory_attest = __esm({
+  "src/l1-cognitive/memory-attest.ts"() {
+    init_router();
+    init_identity();
+    init_key_derivation();
+    init_hashing();
+    init_encoding();
+    VALID_OPERATIONS = [
+      "store",
+      "retrieve",
+      "update",
+      "delete",
+      "search"
+    ];
+    VALID_SCOPES = ["user", "agent", "session", "app"];
+  }
+});
+
+// src/compliance/eu_ai_act/coverage_matrix.ts
+function rowsByCoverage(matrix, flag) {
+  return matrix.rows.filter((r) => r.coverage === flag);
+}
+function coverageStats(matrix) {
+  const total = matrix.rows.length;
+  const full = rowsByCoverage(matrix, "full").length;
+  const partial = rowsByCoverage(matrix, "partial").length;
+  const manual = rowsByCoverage(matrix, "manual_only").length;
+  return {
+    total_rows: total,
+    full,
+    partial,
+    manual_only: manual,
+    full_pct: Math.round(full / total * 100),
+    partial_pct: Math.round(partial / total * 100),
+    manual_only_pct: Math.round(manual / total * 100)
+  };
+}
+var REGULATION_VERSION, REVIEW_DATE, REVIEWER, ROWS, COVERAGE_MATRIX_V1;
+var init_coverage_matrix = __esm({
+  "src/compliance/eu_ai_act/coverage_matrix.ts"() {
+    REGULATION_VERSION = "EU AI Act Regulation (EU) 2024/1689, as of 2026-04-10";
+    REVIEW_DATE = "2026-04-10";
+    REVIEWER = "Erik Newton";
+    ROWS = [
+      // ═══════════════════════════════════════════════════════════════════
+      // ANNEX IV — Technical Documentation Requirements (per Article 11)
+      // ═══════════════════════════════════════════════════════════════════
+      // ─── §1 General description ─────────────────────────────────────
+      {
+        id: "annex_iv_1_a_general_description",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA71(a)",
+          clause_id: "annex-iv-1-a",
+          title: "General description: intended purpose, provider, version"
+        },
+        requirement: '"Its intended purpose, the name of the provider and the version of the system [...]."',
+        coverage: "partial",
+        evidence_emitter: [
+          "identity_list",
+          "identity_set_primary",
+          "manifest",
+          "shr_generate"
+        ],
+        evidence_emitted: "Auto-filled: cryptographic provider identity (primary Ed25519 DID + public key via identity_list and identity_set_primary), Sanctuary version and implementation metadata (via manifest), and signed SHR instance_id. The template pre-populates the version-and-identity portion of this row with machine-verifiable cryptographic evidence.",
+        manual_carveout: "Intended purpose of the agent (business function), legal provider name and registered entity, and version-naming conventions used by the enterprise.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Partial is honest here: Sanctuary can emit a cryptographic provider identity and a software version, but 'intended purpose' is inherently a business-function narrative that Sanctuary cannot infer. Resist any temptation to call this full."
+      },
+      {
+        id: "annex_iv_1_b_hardware_software_interaction",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA71(b)",
+          clause_id: "annex-iv-1-b",
+          title: "Interaction with external hardware or software"
+        },
+        requirement: '"How the AI system interacts, or can be used to interact, with hardware or software [...] that is not part of the AI system itself [...]."',
+        coverage: "partial",
+        evidence_emitter: [
+          "shr_generate",
+          "manifest",
+          "context_gate_list_policies"
+        ],
+        evidence_emitted: "Auto-filled: SHR layers.l2.model_provenance (provider, open-weights flag, local-inference flag, optional weights hash), MCP tool inventory (via manifest) listing every integration point the agent exposes, and the outbound context-gating policy manifest (via context_gate_list_policies) showing which provider endpoints the agent is permitted to contact and under what field-level constraints.",
+        manual_carveout: "Upstream LLM contracts and data processing agreements, third-party API integrations, downstream systems consuming agent output, and any hardware peripherals the agent orchestrates.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Sanctuary genuinely covers ~60% of this row when model_provenance is populated by the integrator. The template emits a structured interaction manifest and marks the business-context narrative as [MANUAL INPUT REQUIRED]."
+      },
+      {
+        id: "annex_iv_1_c_software_versions",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA71(c)",
+          clause_id: "annex-iv-1-c",
+          title: "Versions of relevant software and firmware"
+        },
+        requirement: '"The versions of relevant software or firmware [...]."',
+        coverage: "partial",
+        evidence_emitter: ["manifest", "shr_generate", "monitor_health"],
+        evidence_emitted: "Auto-filled: Sanctuary MCP server version (from manifest and SHR implementation block), Node.js runtime version, MCP SDK version, and platform string. The template emits a versioned software manifest for the Sanctuary layer itself.",
+        manual_carveout: "LLM model version and weights hash (if not set in model_provenance), agent harness version (OpenClaw or other), operating system patch level, container image digest, and any other 'relevant' software outside Sanctuary's runtime scope.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Downgraded from full during verification (2026-04-10). Sanctuary auto-emits its own version + Node version, but 'relevant software' extends beyond Sanctuary and the enterprise must enumerate the rest. Partial is the honest call."
+      },
+      {
+        id: "annex_iv_1_d_forms_on_market",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA71(d)",
+          clause_id: "annex-iv-1-d",
+          title: "Forms in which the system is placed on the market"
+        },
+        requirement: '"The description of all the forms in which the AI system is placed on the market or put into service [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: forms in which the AI system is placed on the market or put into service].",
+        manual_carveout: "Sanctuary is a runtime sovereignty layer and has no visibility into the commercial forms in which the enterprise distributes or operates the agent.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row \u2014 commercial distribution is not a Sanctuary concern and will not become one."
+      },
+      {
+        id: "annex_iv_1_e_hardware_description",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA71(e)",
+          clause_id: "annex-iv-1-e",
+          title: "Description of the hardware on which the system runs"
+        },
+        requirement: '"The description of the hardware on which the AI system is intended to run [...]."',
+        coverage: "partial",
+        evidence_emitter: ["exec_attest", "monitor_health", "sovereignty_audit"],
+        evidence_emitted: "Auto-filled: execution environment attestation (via exec_attest) reporting CPU vendor, TEE availability, operating system string, and Node.js runtime; sovereignty_audit environment fingerprint. The template emits the detected hardware context as structured evidence.",
+        manual_carveout: "Production hardware specifications, TEE attestation evidence from the actual deployment environment, geographic location of the execution environment, and any hardware security modules or trusted hardware used in production.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "In local-process mode Sanctuary emits tee_available=false, which is honest but incomplete \u2014 production may run on TEE-capable hardware that Sanctuary does not detect. SHR degradation NO_TEE is flagged automatically."
+      },
+      {
+        id: "annex_iv_1_f_instructions_of_use",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA71(f)",
+          clause_id: "annex-iv-1-f",
+          title: "Basic description of the user interface"
+        },
+        requirement: '"A basic description of the user interface provided to the deployer [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: description of the user interface provided to the deployer].",
+        manual_carveout: "User interface design is an agent-level or enterprise-level product decision outside Sanctuary's scope.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row."
+      },
+      // ─── §2 Detailed description of elements ────────────────────────
+      {
+        id: "annex_iv_2_a_development_methods",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA72(a)",
+          clause_id: "annex-iv-2-a",
+          title: "Methods and steps performed for development"
+        },
+        requirement: '"The methods and steps performed for the development of the AI system [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: development methodology, design iterations, training procedures, validation steps].",
+        manual_carveout: "Sanctuary is a runtime sovereignty layer and is not involved in model development, training, or pre-deployment validation.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row \u2014 model development is outside Sanctuary's architectural scope."
+      },
+      {
+        id: "annex_iv_2_b_design_specifications",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA72(b)",
+          clause_id: "annex-iv-2-b",
+          title: "Design specifications and key design choices"
+        },
+        requirement: '"The design specifications of the system, namely the general logic of the AI system [...] the key design choices including the rationale and assumptions made [...]."',
+        coverage: "partial",
+        evidence_emitter: [
+          "principal_policy_view",
+          "context_gate_list_policies",
+          "sovereignty_profile_get",
+          "manifest"
+        ],
+        evidence_emitted: "Auto-filled: machine-readable Principal Policy YAML (tier rules, approval channel configuration, anomaly thresholds), context gating policy manifest, sovereignty profile, and the full MCP tool inventory. Together these constitute the declarative design specification of the Sanctuary sovereignty layer.",
+        manual_carveout: "Agent-level business logic, decision algorithms, the rationale for key design choices (why this policy, why these thresholds), assumptions made during development, and any non-Sanctuary architectural components.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Borderline partial \u2014 Sanctuary emits the policy and gating specifications as structured data, but 'key design choices including rationale' is inherently a narrative field that requires enterprise authorship. Kept partial deliberately."
+      },
+      {
+        id: "annex_iv_2_c_system_architecture",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA72(c)",
+          clause_id: "annex-iv-2-c",
+          title: "Description of system architecture"
+        },
+        requirement: '"The description of the system architecture explaining how software components build on or feed into each other and integrate into the overall processing [...]."',
+        coverage: "partial",
+        evidence_emitter: [
+          "shr_generate",
+          "manifest",
+          "sovereignty_audit",
+          "federation_status"
+        ],
+        evidence_emitted: "Auto-filled: SHR four-layer architecture description (L1 Cognitive Sovereignty, L2 Operational Isolation, L3 Selective Disclosure, L4 Verifiable Reputation) with status flags per layer, tool inventory showing every component interface, sovereignty audit environment analysis, and federation peer topology if configured.",
+        manual_carveout: "Agent-level architecture (LLM orchestration, prompt templates, tool-use loops), upstream data flows into the agent, downstream systems consuming agent output, and the integration story between Sanctuary and the rest of the enterprise stack.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Borderline partial \u2014 Sanctuary emits a complete architectural description of its own layer but this row requires the architecture of the AI system as a whole. Enterprise wraps the Sanctuary layer in a broader architecture narrative."
+      },
+      {
+        id: "annex_iv_2_d_data_requirements",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA72(d)",
+          clause_id: "annex-iv-2-d",
+          title: "Data requirements: training data datasheets"
+        },
+        requirement: '"Where applicable, the data requirements in terms of datasheets describing the training methodologies and techniques and the training data sets used, including [...] provenance, scope and main characteristics; how the data was obtained and selected; labelling procedures [...] and data cleaning methodologies [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: training data description, provenance, scope, labelling, cleaning, and governance].",
+        manual_carveout: "Sanctuary is a runtime sovereignty layer and has no visibility into model training. Training data governance is entirely the responsibility of the model provider or enterprise data team.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Classification is structurally stable across EU AI Act revisions."
+      },
+      {
+        id: "annex_iv_2_e_human_oversight_assessment",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA72(e)",
+          clause_id: "annex-iv-2-e",
+          title: "Assessment of human oversight measures per Article 14"
+        },
+        requirement: '"Assessment of the human oversight measures needed in accordance with Article 14, including an assessment of the technical measures needed to facilitate the interpretation of the outputs of AI systems by the deployers [...]."',
+        coverage: "partial",
+        evidence_emitter: [
+          "principal_policy_view",
+          "sovereignty_audit",
+          "shr_generate",
+          "principal_baseline_view"
+        ],
+        evidence_emitted: "Auto-filled: Principal Policy approval channel configuration (stderr / dashboard / webhook), Tier 1 require-approval rule count, Tier 2 anomaly-triggered approval rule count, Tier 3 auto-allow tool list, baseline anomaly tracker status, and denial-on-timeout behaviour. The template pre-populates the technical-measures half of the human oversight assessment.",
+        manual_carveout: "Operator identities, roles, training, authority, and escalation procedures; mapping between Sanctuary's approval channel and the enterprise's stop-button workflow; rationale for why the chosen oversight tier is appropriate to the risk profile of the deployed agent.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Borderline partial. Sanctuary provides the oversight mechanism inventory with zero enterprise input (~70% of the row). Enterprise provides the people-and-process assessment."
+      },
+      {
+        id: "annex_iv_2_f_predetermined_changes",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA72(f)",
+          clause_id: "annex-iv-2-f",
+          title: "Pre-determined changes to the system and performance"
+        },
+        requirement: '"Where applicable, a description of pre-determined changes to the AI system and its performance [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: pre-determined changes to the AI system and its performance, if any].",
+        manual_carveout: "Pre-determined changes are a product-roadmap and provider-level concept outside Sanctuary's runtime scope.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row."
+      },
+      {
+        id: "annex_iv_2_g_validation_and_testing",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA72(g)",
+          clause_id: "annex-iv-2-g",
+          title: "Validation and testing procedures, metrics"
+        },
+        requirement: '"The validation and testing procedures used, including information about the validation and testing data used [...] and the main metrics used to measure [...] accuracy, robustness and compliance with other relevant requirements [...]."',
+        coverage: "partial",
+        evidence_emitter: [
+          "monitor_audit_log",
+          "audit_export_siem",
+          "sovereignty_audit"
+        ],
+        evidence_emitted: "Auto-filled: audit log entries within the reporting period showing tool-call success/failure rates, gate decision counts (approve / deny / auto-allow), and any injection_detected entries triggered by the prompt injection detector. These provide runtime validation evidence from actual deployment.",
+        manual_carveout: "Model evaluation metrics (accuracy, precision, recall, F1), bias testing results, robustness testing against adversarial inputs, the validation dataset description, and the metric methodology the enterprise used to assess the agent before deployment.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Sanctuary emits runtime operational evidence but does not participate in pre-deployment model validation."
+      },
+      // ─── §2(h) Cybersecurity measures (FULL) ────────────────────────
+      {
+        id: "annex_iv_2_h_cybersecurity",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA72(h)",
+          clause_id: "annex-iv-2-h",
+          title: "Cybersecurity measures"
+        },
+        requirement: '"A detailed description of the cybersecurity measures put in place [...]."',
+        coverage: "full",
+        evidence_emitter: [
+          "sovereignty_audit",
+          "shr_generate",
+          "manifest",
+          "principal_policy_view",
+          "context_gate_list_policies",
+          "context_gate_enforcer_status",
+          "exec_attest"
+        ],
+        evidence_emitted: "Machine-verifiable inventory of Sanctuary's cybersecurity primitives, every item reproducible by running the listed tools against a live instance: (1) L1 Cognitive Sovereignty \u2014 AES-256-GCM namespace encryption with HKDF per-namespace key derivation, Argon2id master key derivation, Ed25519 self-custodied identity, Merkle integrity tracking; reported by sovereignty_audit and shr_generate under layers.l1. (2) L2 Operational Isolation \u2014 three-tier Principal Policy gate with out-of-band approval channel, tool-call audit logging, and denial-on-timeout semantics; reported by principal_policy_view and shr_generate under layers.l2. (3) L2 Outbound context gating \u2014 per-provider field policies classifying agent context as allow / redact / hash / summarize / deny before any outbound call; reported by context_gate_list_policies and context_gate_enforcer_status. (4) L3 Selective Disclosure \u2014 Pedersen commitments on Ristretto255, Schnorr proofs, and bit-decomposition range proofs; reported by sovereignty_audit and shr_generate under layers.l3. (5) L4 Verifiable Reputation \u2014 Ed25519-signed attestations in EAS-compatible format with sovereignty-gated trust tiers; reported by sovereignty_audit and shr_generate under layers.l4. (6) Execution attestation \u2014 cryptographic execution attestation via exec_attest. The full tool inventory of this Sanctuary instance is reproducible by running manifest.",
+        manual_carveout: null,
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Verified against v0.7.0 source on 2026-04-10: every emitter in the array corresponds to a registered MCP tool in index.ts, and every primitive named in the prose is reported by at least one listed tool. DELIBERATELY EXCLUDED: prompt injection detection. The InjectionDetector subsystem (server/src/security/injection-detector.ts) is wired into the Principal Policy gate and is a real runtime control, but in v0.7.0 its configuration state is not exposed via any MCP tool \u2014 it is only indirectly evidenced through `injection_detected:*` entries in the audit log (visible via monitor_audit_log / audit_export_siem). Claiming injection detection as part of this row's full coverage would require source-code inspection, which violates the full-coverage bar. Injection detection runtime activity is evidenced via the Art. 12 risk management support row instead. If v0.8.0+ adds an `injection_detector_status` MCP tool, revisit and add to this row."
+      },
+      // ─── §3–§9 ───────────────────────────────────────────────────────
+      {
+        id: "annex_iv_3_monitoring_functioning_control",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA73",
+          clause_id: "annex-iv-3",
+          title: "Monitoring, functioning and control of the system"
+        },
+        requirement: '"Detailed information about the monitoring, functioning and control of the AI system [...]."',
+        coverage: "partial",
+        evidence_emitter: [
+          "monitor_audit_log",
+          "audit_export_siem",
+          "monitor_health",
+          "context_gate_enforcer_status",
+          "principal_baseline_view"
+        ],
+        evidence_emitted: "Auto-filled: encrypted audit log queryable via monitor_audit_log and exportable in CEF/OCSF via audit_export_siem; health dashboard via monitor_health; outbound context gating enforcer status; Principal Policy baseline anomaly tracker state. Together these constitute the runtime monitoring substrate for the Sanctuary layer.",
+        manual_carveout: "Operational SLAs, on-call rotation, incident response procedures, escalation workflows, monitoring dashboards outside Sanctuary, and the enterprise's overall observability stack.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Sanctuary provides the monitoring substrate; the enterprise wraps it in operational processes. Borderline partial."
+      },
+      {
+        id: "annex_iv_4_performance_metrics",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA74",
+          clause_id: "annex-iv-4",
+          title: "Appropriateness of performance metrics"
+        },
+        requirement: '"A description of the appropriateness of the performance metrics for the specific AI system [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: performance metrics and their appropriateness for the specific agent deployment].",
+        manual_carveout: "Performance metrics are agent-specific and model-specific; Sanctuary does not measure model accuracy or task performance.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row."
+      },
+      {
+        id: "annex_iv_5_risk_management",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA75",
+          clause_id: "annex-iv-5",
+          title: "Risk management system per Article 9"
+        },
+        requirement: '"A detailed description of the risk management system in accordance with Article 9 [...]."',
+        coverage: "partial",
+        evidence_emitter: [
+          "principal_policy_view",
+          "principal_baseline_view",
+          "sovereignty_audit",
+          "context_gate_list_policies"
+        ],
+        evidence_emitted: "Auto-filled: Principal Policy tier structure (Tier 1 block, Tier 2 anomaly-triggered, Tier 3 auto-allow), baseline anomaly tracker configuration, outbound context gating policies, and sovereignty audit gap analysis with prioritised recommendations. These constitute Sanctuary's runtime risk management controls.",
+        manual_carveout: "Enterprise-level risk register, residual risk analysis, risk treatment plan, acceptance criteria for residual risks, periodic risk review cadence, and the link between identified risks and the Sanctuary controls above.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Sanctuary emits runtime controls; enterprise maps them to an Article 9 risk management framework."
+      },
+      {
+        id: "annex_iv_6_lifecycle_changes",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA76",
+          clause_id: "annex-iv-6",
+          title: "Description of relevant changes made through lifecycle"
+        },
+        requirement: '"A description of any change made to the system through its lifecycle [...]."',
+        coverage: "partial",
+        evidence_emitter: [
+          "monitor_audit_log",
+          "audit_export_siem",
+          "identity_list"
+        ],
+        evidence_emitted: "Auto-filled: audit log entries within the reporting period showing all policy changes, identity operations (create, rotate, set_primary), state operations, and any configuration changes; identity rotation chain via identity_list. These provide a cryptographically anchored timeline of Sanctuary-layer changes during the period.",
+        manual_carveout: "Agent-level version changes (model updates, prompt changes), business-context narrative for why changes were made, and any changes to non-Sanctuary components of the stack.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Sanctuary captures its own layer's change timeline; enterprise provides the broader change narrative."
+      },
+      {
+        id: "annex_iv_7_standards_applied",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA77",
+          clause_id: "annex-iv-7",
+          title: "Harmonised standards applied"
+        },
+        requirement: '"A list of the harmonised standards applied in full or in part [...] and, where such harmonised standards have not been applied, a detailed description of the solutions adopted to meet the requirements set out in Chapter III, Section 2 [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: list of harmonised standards applied, or description of alternative solutions].",
+        manual_carveout: "Standards conformance is a legal declaration made by the provider. Sanctuary does not assert conformance to any harmonised standard.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row \u2014 standards conformance is a provider legal declaration, not a Sanctuary primitive."
+      },
+      {
+        id: "annex_iv_8_eu_declaration_of_conformity",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA78",
+          clause_id: "annex-iv-8",
+          title: "Copy of the EU declaration of conformity"
+        },
+        requirement: '"A copy of the EU declaration of conformity referred to in Article 47 [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: EU declaration of conformity per Article 47].",
+        manual_carveout: "The EU declaration of conformity is a formal legal document signed by the provider. Sanctuary cannot generate or provide it.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row \u2014 legal document only."
+      },
+      {
+        id: "annex_iv_9_post_market_monitoring_plan",
+        citation: {
+          instrument: "Annex IV",
+          section: "\xA79",
+          clause_id: "annex-iv-9",
+          title: "Post-market monitoring plan per Article 72"
+        },
+        requirement: '"A detailed description of the system in place to evaluate the AI system performance in the post-market phase in accordance with Article 72, including the post-market monitoring plan referred to in Article 72(3) [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: post-market monitoring plan per Article 72(3)].",
+        manual_carveout: "The post-market monitoring plan is a provider-authored governance document. Sanctuary's SIEM exporter can feed the monitoring pipeline, but the plan itself is enterprise-authored.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "See the Art. 12 post-market monitoring support row for Sanctuary's concrete contribution to this area."
+      },
+      // ═══════════════════════════════════════════════════════════════════
+      // ARTICLE 12 — Automatic Record-Keeping (logs)
+      // ═══════════════════════════════════════════════════════════════════
+      {
+        id: "art_12_automatic_logging",
+        citation: {
+          instrument: "Article",
+          section: "12(1)",
+          clause_id: "art-12-1",
+          title: "Automatic logging of events over lifetime"
+        },
+        requirement: `"High-risk AI systems shall technically allow for the automatic recording of events ('logs') over the lifetime of the system."`,
+        coverage: "full",
+        evidence_emitter: ["monitor_audit_log", "audit_export_siem"],
+        evidence_emitted: "Every tool call in the Sanctuary runtime automatically produces an audit entry via the Principal Policy gate. Router.ts wraps all tool invocations through gate.evaluate(), which appends to the audit log on every outcome path (gate_allow, gate_allow_proxy, gate_deny, gate_escalate, gate_unclassified, injection_detected). Entries are persisted as AES-256-GCM authenticated ciphertext under an HKDF-derived audit-log key and are queryable via monitor_audit_log or exportable in CEF/OCSF via audit_export_siem. No tool call bypasses the audit path.",
+        manual_carveout: null,
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Verified against v0.7.0 source on 2026-04-10: router.ts:249 wraps every tool call through gate.evaluate(); gate.ts lines 86, 155, 186, 202, 358 append to the audit log on every outcome. CORRECTIONS APPLIED during verification: earlier drafts claimed 'Ed25519-signed entries' and 'hash-chained transcript' \u2014 neither is true. The AuditEntry schema in l2-operational/audit-log.ts has no signature field, and entries are stored as individual encrypted files with no inter-entry hash chain. AES-256-GCM authenticated encryption provides integrity against third-party tampering; that is the accurate claim. Art. 12(1) requires the system to technically *allow* automatic recording, which is satisfied. DURABILITY CAVEAT: audit-log.ts:59 uses fire-and-forget persistence \u2014 if disk write fails, the entry lives only in memory and is lost at process exit. This is a quality-under-failure concern but does not defeat the Art. 12(1) capability claim. If v0.8.0+ adds synchronous persistence or Ed25519 signing on audit entries, update this row's prose."
+      },
+      {
+        id: "art_12_post_market_monitoring_support",
+        citation: {
+          instrument: "Article",
+          section: "12(2)(a)",
+          clause_id: "art-12-2-a",
+          title: "Logs enable identification of Article 79(1) risks"
+        },
+        requirement: '"The logging capabilities shall enable the recording of events relevant for identifying situations that may result in the AI system presenting a risk within the meaning of Article 79(1) [...] and for facilitating the post-market monitoring referred to in Article 72."',
+        coverage: "full",
+        evidence_emitter: ["audit_export_siem", "monitor_audit_log"],
+        evidence_emitted: "The audit_export_siem tool exports audit log entries in two SIEM-standard formats: Common Event Format (CEF, newline-delimited) and Open Cybersecurity Schema Framework (OCSF, JSON array). Both formats are directly ingestible by Splunk, Datadog, QRadar, and any other enterprise SIEM platform, which are the standard substrate for Article 72 post-market monitoring pipelines. Exports support time-window filters (since / until), tool name filters, gate decision filters (approve / deny / auto-allow), layer filters (l1 / l2 / l3 / l4), and result filters (success / failure). Bulk exports up to 1000 events per call.",
+        manual_carveout: null,
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Verified against v0.7.0 source on 2026-04-10: audit/siem-tools.ts:18-77 registers audit_export_siem with CEF and OCSF format support and the full filter set. Classified Tier 3 (auto-allow, read-only) in loader.ts. No corrections to the original draft."
+      },
+      {
+        id: "art_12_risk_management_support",
+        citation: {
+          instrument: "Article",
+          section: "12(2)(b)",
+          clause_id: "art-12-2-b",
+          title: "Logs facilitate monitoring operation per Article 26(5)"
+        },
+        requirement: '"The logging capabilities shall enable the recording of events relevant for [...] facilitating the monitoring of the operation of the high-risk AI system referred to in Article 26(5)."',
+        coverage: "full",
+        evidence_emitter: [
+          "monitor_audit_log",
+          "audit_export_siem",
+          "principal_baseline_view"
+        ],
+        evidence_emitted: "Gate decisions are logged with structured operation prefixes (gate_allow:, gate_allow_proxy:, gate_deny:, gate_escalate:, gate_unclassified:, injection_detected:) directly filterable via audit_export_siem's filter_decision enum (approve / deny / auto-allow) and via monitor_audit_log's operation_type parameter. The Principal Policy baseline anomaly tracker state (behavioural model, known-namespaces, frequency baselines, anomaly thresholds) is queryable via principal_baseline_view. Together these provide the machine-queryable substrate for deployer operation monitoring under Article 26(5).",
+        manual_carveout: null,
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Verified against v0.7.0 source on 2026-04-10. gate.ts writes structured operation strings on every gate outcome; baseline.ts is the anomaly source and is exposed via principal_baseline_view. Minor correction during verification: principal_baseline_view added to emitter list (original draft listed only monitor_audit_log)."
+      },
+      {
+        id: "art_12_log_content",
+        citation: {
+          instrument: "Article",
+          section: "12(3)",
+          clause_id: "art-12-3",
+          title: "Required log content for Annex III \xA71(a) systems"
+        },
+        requirement: '"For high-risk AI systems referred to in point 1(a) of Annex III, the logging capabilities shall provide, at a minimum: (a) recording of the period of each use of the system [...]; (b) the reference database against which input data has been checked by the system; (c) the input data for which the search has led to a match; (d) the identification of the natural persons involved in the verification of the results [...]."',
+        coverage: "partial",
+        evidence_emitter: [
+          "monitor_audit_log",
+          "audit_export_siem",
+          "identity_list"
+        ],
+        evidence_emitted: "Auto-filled where the agent routes through Sanctuary: period of use (audit log timestamps with since/until filters), tool inputs (captured in audit entry details field), and identification of principals who approved Tier 1 operations (captured via identity_id in audit entries and identity provenance via identity_list). Gate decisions are bound to the identity that requested the operation.",
+        manual_carveout: "Reference database identifier (the external database the agent queries) \u2014 only captured if the agent explicitly logs it to Sanctuary state. Natural-person verifier identification beyond the Sanctuary principal identity (e.g., the human operator's HR record or employee ID). Input data captured only when the agent passes it through a Sanctuary tool call.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Row applies only to Annex III \xA71(a) (biometric remote identification) systems. For other Annex III categories this row is not triggered. Coverage depends on whether the agent actually routes its biometric checks through Sanctuary-tracked tool calls."
+      },
+      {
+        id: "art_12_retention",
+        citation: {
+          instrument: "Article",
+          section: "19(1)",
+          clause_id: "art-19-1",
+          title: "Log retention for at least six months"
+        },
+        requirement: '"Providers of high-risk AI systems shall keep the logs referred to in Article 12(1), automatically generated by their high-risk AI systems, to the extent such logs are under their control. [...] the logs shall be kept for a period appropriate to the intended purpose of the high-risk AI system, of at least six months [...]."',
+        coverage: "partial",
+        evidence_emitter: ["monitor_audit_log", "audit_export_siem"],
+        evidence_emitted: "Auto-filled: Sanctuary's audit log persists entries indefinitely by default (no automatic purge). Entries are exportable at any time via audit_export_siem for archival to enterprise storage.",
+        manual_carveout: "The enterprise's declared log retention policy (how long logs are kept, in which storage tier, who has access), the archival pipeline configuration feeding enterprise long-term storage, and the written policy document satisfying the 'period appropriate to the intended purpose' requirement.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Note: this row cites Article 19(1) rather than Article 12 \u2014 retention is specifically an Article 19 provider obligation, not an Article 12 logging capability. The capability to retain exists in Sanctuary (no automatic purge); the declared policy is an enterprise artefact."
+      },
+      // ═══════════════════════════════════════════════════════════════════
+      // ARTICLE 13 — Transparency and provision of information to deployers
+      // ═══════════════════════════════════════════════════════════════════
+      {
+        id: "art_13_3_a_provider_identity",
+        citation: {
+          instrument: "Article",
+          section: "13(3)(a)",
+          clause_id: "art-13-3-a",
+          title: "Identity and contact details of the provider"
+        },
+        requirement: '"The instructions for use shall contain at least the following information: (a) the identity and the contact details of the provider and, where applicable, of its authorised representative [...]."',
+        coverage: "partial",
+        evidence_emitter: ["identity_list", "identity_set_primary", "shr_generate"],
+        evidence_emitted: "Auto-filled: cryptographic provider identity \u2014 primary Ed25519 public key, DID, instance_id, and key creation timestamp via identity_list and identity_set_primary. The signed SHR carries the same identity in its signed_by field, providing a verifiable link between the provider identity and the capability assertions of the system.",
+        manual_carveout: "Legal provider name, registered legal entity, registered business address, contact email, and authorised representative details (if applicable). These are legal-entity facts that must be supplied by the enterprise.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Sanctuary emits the cryptographic identity; the enterprise supplies the legal identity. Both are required for complete Art. 13(3)(a) coverage."
+      },
+      {
+        id: "art_13_3_b_ii_capabilities_and_limitations",
+        citation: {
+          instrument: "Article",
+          section: "13(3)(b)(ii)",
+          clause_id: "art-13-3-b-ii",
+          title: "Performance characteristics, capabilities and limitations"
+        },
+        requirement: '"The characteristics, capabilities and limitations of performance of the high-risk AI system, including [...] its intended purpose [...] the level of accuracy, including its metrics [...] and any known or foreseeable circumstance [...] which may lead to risks to the health and safety or fundamental rights [...]."',
+        coverage: "partial",
+        evidence_emitter: ["shr_generate", "manifest", "sovereignty_audit"],
+        evidence_emitted: "Auto-filled: SHR four-layer capability report with explicit status flags per layer (active / degraded / inactive), the SHR degradations[] array listing honest self-declared gaps (e.g., NO_TEE, PROCESS_ISOLATION_ONLY), the full MCP tool inventory (via manifest), and the sovereignty audit gap analysis. Together these constitute a machine-readable capability manifest with explicit, honest limitations.",
+        manual_carveout: "Agent-level accuracy metrics and their measurement methodology, false-positive and false-negative rates on the agent's business task, known failure modes specific to the deployment, and the link between technical capabilities and fundamental-rights risk.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Sanctuary's SHR is structurally a transparency artefact \u2014 it is designed to honestly declare capabilities and degradations. This row is where SHR data feeds user-facing disclosures."
+      },
+      {
+        id: "art_13_3_b_iv_output_interpretation",
+        citation: {
+          instrument: "Article",
+          section: "13(3)(b)(iv)",
+          clause_id: "art-13-3-b-iv",
+          title: "Technical capabilities to interpret system output"
+        },
+        requirement: '"Where appropriate, its performance regarding specific persons or groups of persons on which the system is intended to be used; [...] where appropriate, specifications for the input data, or any other relevant information in terms of the training, validation and testing data sets used, taking into account the intended purpose of the AI system [...]."',
+        coverage: "partial",
+        evidence_emitter: [
+          "shr_generate",
+          "monitor_audit_log",
+          "audit_export_siem",
+          "bridge_verify"
+        ],
+        evidence_emitted: "Auto-filled: signed SHR + Ed25519-signed audit trail + Concordia bridge attestations (where used) give machine-readable provenance for every tool call the agent made during the reporting period. This enables output interpretation of the form 'this agent action came from these inputs at this time, cryptographically signed and independently verifiable.'",
+        manual_carveout: "Business-facing explanation translating the cryptographic trail into user-comprehensible narrative, performance characteristics on specific populations, and intended-purpose-specific input specifications.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Sanctuary provides the cryptographic substrate for output provenance; enterprise renders it into user-facing disclosure text. Art. 13 is fundamentally a disclosure UX obligation that Sanctuary does not render."
+      },
+      // ═══════════════════════════════════════════════════════════════════
+      // ARTICLE 14 — Human Oversight
+      // ═══════════════════════════════════════════════════════════════════
+      {
+        id: "art_14_interpret_outputs",
+        citation: {
+          instrument: "Article",
+          section: "14(4)(a)-(c)",
+          clause_id: "art-14-4-a-c",
+          title: "Oversight enables understanding and interpretation"
+        },
+        requirement: `"[The measures shall enable the persons to whom human oversight is assigned to]: (a) [...] properly understand the relevant capacities and limitations of the high-risk AI system [...]; (b) [...] remain aware of [...] automation bias [...]; (c) [...] correctly interpret the high-risk AI system's output [...]."`,
+        coverage: "partial",
+        evidence_emitter: ["shr_generate", "principal_policy_view", "manifest"],
+        evidence_emitted: "Auto-filled: SHR is designed to be human-readable with explicit per-layer status flags and honest degradation declarations. Principal Policy is inspectable YAML that a human overseer can read directly. Tool inventory (via manifest) gives the oversight persons a complete list of what the agent can do.",
+        manual_carveout: "Training materials for human overseers, the specific automation-bias awareness program, how oversight persons are trained to correctly interpret agent output, and any UI tools the enterprise provides to support oversight.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Sanctuary emits artefacts designed to be interpretable; the enterprise builds the training-and-support layer around them."
+      },
+      {
+        id: "art_14_intervene_interrupt",
+        citation: {
+          instrument: "Article",
+          section: "14(4)(e)",
+          clause_id: "art-14-4-e",
+          title: "Intervention, interruption, and stop button"
+        },
+        requirement: `"[The measures shall enable the persons to whom human oversight is assigned to]: (e) [...] intervene on the operation of the high-risk AI system or interrupt the system through a 'stop' button or similar procedure that allows the system to come to a halt in a safe state."`,
+        coverage: "partial",
+        evidence_emitter: ["principal_policy_view", "sovereignty_audit"],
+        evidence_emitted: "Auto-filled: Principal Policy approval channel configuration (stderr / dashboard / webhook), Tier 1 require-approval rule count, denial-on-timeout behaviour, and gate decision semantics. These collectively document Sanctuary's pre-execution intervention capability \u2014 every Tier 1 tool call is halted pending human approval.",
+        manual_carveout: "The enterprise's declared mapping between Sanctuary's approval channel and its Article 14(4)(e) stop-button workflow, the operational procedure for invoking the stop button, and acceptance that pre-execution gating satisfies the 'halt in a safe state' requirement for the specific agent.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Downgraded from full during audit (2026-04-10). Sanctuary's approval gate is a pre-execution intervention, not a mid-stream kill switch. Whether pre-execution gating satisfies Art. 14(4)(e) is an enterprise-declared operational judgement. Honest partial."
+      },
+      {
+        id: "art_14_decide_not_to_use",
+        citation: {
+          instrument: "Article",
+          section: "14(4)(d)",
+          clause_id: "art-14-4-d",
+          title: "Decide not to use or to disregard the output"
+        },
+        requirement: '"[The measures shall enable the persons to whom human oversight is assigned to]: (d) [...] decide, in any particular situation, not to use the high-risk AI system or to otherwise disregard, override or reverse the output of the high-risk AI system [...]."',
+        coverage: "partial",
+        evidence_emitter: ["principal_policy_view"],
+        evidence_emitted: "Auto-filled: Principal Policy denial semantics \u2014 every Tier 1 operation defaults to deny on approval timeout, providing a structural 'decide not to use' control at the policy layer. Tier 1 tools include export, import, key rotation, and secure delete.",
+        manual_carveout: "The enterprise's declared mapping between Sanctuary's deny semantics and its Art. 14(4)(d) decision-not-to-use workflow, and operator authority to invoke the decision.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Downgraded from full during audit (2026-04-10). Sanctuary provides the capability; enterprise provides the operational declaration."
+      },
+      {
+        id: "art_14_operator_training",
+        citation: {
+          instrument: "Article",
+          section: "14(4) chapeau",
+          clause_id: "art-14-4-chapeau",
+          title: "Operator competence, training, and authority"
+        },
+        requirement: '"[Human oversight measures shall be commensurate with the risks, level of autonomy and context of use of the high-risk AI system] [...] ensured through [...] the following types of measures, as appropriate to the circumstances [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: operator identities, roles, competence, training program, and authority to override].",
+        manual_carveout: "People-and-process facts that Sanctuary cannot observe or emit.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row \u2014 operator governance is an HR function."
+      },
+      // ═══════════════════════════════════════════════════════════════════
+      // ARTICLE 15 — Accuracy, Robustness, Cybersecurity
+      // ═══════════════════════════════════════════════════════════════════
+      {
+        id: "art_15_cybersecurity_appropriate",
+        citation: {
+          instrument: "Article",
+          section: "15(5)",
+          clause_id: "art-15-5",
+          title: "Cybersecurity measures appropriate to the risks"
+        },
+        requirement: '"High-risk AI systems shall be resilient against attempts by unauthorised third parties to alter their use, outputs or performance by exploiting system vulnerabilities. The technical solutions aiming to ensure the cybersecurity of high-risk AI systems shall be appropriate to the relevant circumstances and the risks."',
+        coverage: "partial",
+        evidence_emitter: [
+          "sovereignty_audit",
+          "shr_generate",
+          "principal_policy_view",
+          "context_gate_list_policies"
+        ],
+        evidence_emitted: "Auto-filled: the full cybersecurity measures inventory (see Annex IV \xA72(h) row for complete description). Sanctuary emits the list of measures with structured status flags.",
+        manual_carveout: "Appropriateness assertion: the enterprise must declare that the Sanctuary-reported measures are appropriate to the specific risks of the deployment context (risk-matched narrative linking identified risks to selected controls).",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Downgraded from full during audit (2026-04-10). Art. 15(5) requires measures 'appropriate to the risks' \u2014 the appropriateness claim is a risk-matched narrative the enterprise owns. The pure-description version survives as a full row at Annex IV \xA72(h); this row is the risk-adequacy half of the same content."
+      },
+      {
+        id: "art_15_resilience_alteration",
+        citation: {
+          instrument: "Article",
+          section: "15(5) first subparagraph",
+          clause_id: "art-15-5-resilience",
+          title: "Resilience against unauthorised third-party alteration"
+        },
+        requirement: '"High-risk AI systems shall be resilient against attempts by unauthorised third parties to alter their use, outputs or performance by exploiting system vulnerabilities."',
+        coverage: "full",
+        evidence_emitter: [
+          "sovereignty_audit",
+          "shr_generate",
+          "monitor_health",
+          "state_list",
+          "principal_policy_view",
+          "context_gate_enforcer_status"
+        ],
+        evidence_emitted: "Resilience against unauthorised third-party alteration is enforced across multiple subsystems, each independently verifiable via an MCP tool call: (1) L1 state store \u2014 AES-256-GCM authenticated encryption with HKDF per-namespace keys, Merkle root per namespace, monotonic version counter per (namespace, key), and anti-rollback checks on every read; reported by monitor_health (state_integrity flag) and via version numbers returned by state_list. (2) L1 audit log \u2014 AES-256-GCM authenticated ciphertext persisted under an HKDF-derived audit-log key; confidentiality and integrity against third-party tampering (no signature-based non-repudiation \u2014 see review_notes). (3) L1 identity \u2014 Ed25519 self-custodied keypairs; signed identity operations (sign, rotate, verify) and signed SHR generation; reported by shr_generate signature block. (4) L2 execution gate \u2014 every tool call routed through router.ts -> ApprovalGate.evaluate() -> Principal Policy tier check before execution; no bypass path; reported by principal_policy_view and the audit log trail of gate_* entries. (5) L2 outbound context gating \u2014 per-provider field policies applied before any outbound call; reported by context_gate_enforcer_status.",
+        manual_carveout: null,
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Verified against v0.7.0 source on 2026-04-10. MAJOR CORRECTIONS APPLIED from earlier drafts: (1) Earlier drafts claimed Merkle integrity on the audit log \u2014 that is wrong. Merkle trees exist on the state store (l1-cognitive/state-store.ts) but NOT on the audit log. (2) Earlier drafts claimed Ed25519 signatures on audit entries \u2014 that is wrong. The AuditEntry schema has no signature field; entries are AES-256-GCM ciphertext only. Ed25519 signatures exist on identity operations and SHR, not audit entries. (3) Earlier drafts claimed 'tamper-evident transcript' on the audit log \u2014 this is only true against third parties without the master key; there is no hash chain. The row still survives as full because Art. 15(5) specifies 'unauthorised third parties,' and AES-256-GCM with an HKDF-derived key protects against that threat model. Non-repudiation against a compromised-master-key insider is a different threat model not covered by Art. 15(5)."
+      },
+      {
+        id: "art_15_resilience_poisoning",
+        citation: {
+          instrument: "Article",
+          section: "15(5) second subparagraph",
+          clause_id: "art-15-5-poisoning",
+          title: "Resilience against data and model poisoning"
+        },
+        requirement: `"The technical solutions to address AI specific vulnerabilities shall include, where appropriate, measures to prevent, detect, respond to, resolve and control for attacks trying to manipulate the training data set ('data poisoning'), or pre-trained components used in training ('model poisoning'), inputs designed to cause the AI model to make a mistake ('adversarial examples' or 'model evasion'), [...]."`,
+        coverage: "partial",
+        evidence_emitter: ["monitor_audit_log", "audit_export_siem"],
+        evidence_emitted: "Auto-filled: the Principal Policy gate runs a prompt injection detector pre-check on every tool call; when flagged, the gate appends 'injection_detected:*' entries to the audit log, which are visible via monitor_audit_log and exportable via audit_export_siem. The detector covers role override, security bypass, encoding evasion, data exfiltration, and prompt stuffing signals at runtime.",
+        manual_carveout: "Training-time threats (data poisoning, model poisoning) are entirely outside Sanctuary's runtime scope \u2014 training data governance is the model provider's responsibility. The runtime adversarial-input detection is partial coverage of the 'adversarial examples' subset of Art. 15(5).",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "The injection detector exists (security/injection-detector.ts) and its activity IS evidenced via audit log entries, even though its configuration state is not directly queryable. Partial is honest: runtime adversarial-input detection is covered; training-time poisoning is not."
+      },
+      {
+        id: "art_15_accuracy_metrics",
+        citation: {
+          instrument: "Article",
+          section: "15(3)",
+          clause_id: "art-15-3",
+          title: "Declared accuracy levels and metrics"
+        },
+        requirement: '"The levels of accuracy and the relevant accuracy metrics of high-risk AI systems shall be declared in the accompanying instructions of use."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: accuracy levels and metrics on the agent's business task].",
+        manual_carveout: "Sanctuary does not measure agent task accuracy.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row."
+      },
+      {
+        id: "art_15_redundancy_failsafe",
+        citation: {
+          instrument: "Article",
+          section: "15(4)",
+          clause_id: "art-15-4",
+          title: "Technical redundancy and fail-safe measures"
+        },
+        requirement: '"High-risk AI systems shall be as resilient as possible [...] The robustness of high-risk AI systems may be achieved through technical redundancy solutions, which may include backup or fail-safe plans."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: technical redundancy and fail-safe plans for the deployment].",
+        manual_carveout: "Redundancy architecture is an operational decision at the deployment level outside Sanctuary's scope.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row."
+      },
+      // ═══════════════════════════════════════════════════════════════════
+      // ARTICLE 26 — Deployer Obligations
+      // ═══════════════════════════════════════════════════════════════════
+      {
+        id: "art_26_per_instructions",
+        citation: {
+          instrument: "Article",
+          section: "26(1)",
+          clause_id: "art-26-1",
+          title: "Use in accordance with instructions for use"
+        },
+        requirement: '"Deployers of high-risk AI systems shall take appropriate technical and organisational measures to ensure they use such systems in accordance with the instructions for use accompanying the systems [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: declaration of use in accordance with instructions].",
+        manual_carveout: "Deployer-facing attestation, not a Sanctuary primitive.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row."
+      },
+      {
+        id: "art_26_human_oversight_assigned",
+        citation: {
+          instrument: "Article",
+          section: "26(2)",
+          clause_id: "art-26-2",
+          title: "Assign human oversight to competent natural persons"
+        },
+        requirement: '"Deployers shall assign human oversight to natural persons who have the necessary competence, training and authority, as well as the necessary support."',
+        coverage: "partial",
+        evidence_emitter: ["principal_policy_view"],
+        evidence_emitted: "Auto-filled: Sanctuary's approval channel configuration (stderr / dashboard / webhook) provides the technical substrate to which the enterprise binds its assigned human overseers. The Principal Policy Tier 1 rule list documents which operations require human approval.",
+        manual_carveout: "Identity of assigned overseers, their competence assessment, training records, authority scope, and the support infrastructure provided to them.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Sanctuary provides the technical oversight surface; enterprise assigns the people."
+      },
+      {
+        id: "art_26_input_data_relevance",
+        citation: {
+          instrument: "Article",
+          section: "26(4)",
+          clause_id: "art-26-4",
+          title: "Input data relevance and representativeness"
+        },
+        requirement: '"[...] deployers shall ensure that input data is relevant and sufficiently representative in view of the intended purpose of the high-risk AI system."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: declaration of input data relevance and representativeness].",
+        manual_carveout: "Input data governance is a deployer responsibility outside Sanctuary's runtime scope.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row."
+      },
+      {
+        id: "art_26_monitor_and_inform",
+        citation: {
+          instrument: "Article",
+          section: "26(5)",
+          clause_id: "art-26-5",
+          title: "Monitor operation and inform provider of incidents"
+        },
+        requirement: '"Deployers shall monitor the operation of the high-risk AI system on the basis of the instructions for use [...]. When deployers have reason to consider that the use in accordance with the instructions for use may result in that AI system presenting a risk [...] they shall, without undue delay, inform the provider [...] and suspend the use of that system."',
+        coverage: "partial",
+        evidence_emitter: [
+          "monitor_audit_log",
+          "audit_export_siem",
+          "monitor_health",
+          "principal_baseline_view"
+        ],
+        evidence_emitted: "Auto-filled: the runtime monitoring substrate \u2014 encrypted audit log queryable and exportable in SIEM-standard formats, health dashboard, and anomaly baseline tracker. Provides the technical means to monitor and detect risk situations.",
+        manual_carveout: "The enterprise's incident response workflow, the 'inform provider' communication channel and contacts, the suspension procedure, and the documented risk-detection criteria.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Sanctuary provides the detect-and-export half; enterprise provides the report-and-suspend half."
+      },
+      {
+        id: "art_26_retain_logs",
+        citation: {
+          instrument: "Article",
+          section: "26(6)",
+          clause_id: "art-26-6",
+          title: "Deployers keep logs for at least six months"
+        },
+        requirement: '"Deployers of high-risk AI systems shall keep the logs automatically generated by that high-risk AI system, to the extent such logs are under their control, for a period appropriate to the intended purpose of the high-risk AI system, of at least six months [...]."',
+        coverage: "partial",
+        evidence_emitter: ["monitor_audit_log", "audit_export_siem"],
+        evidence_emitted: "Auto-filled: Sanctuary's audit log persists entries indefinitely by default and is exportable for archival at any time via audit_export_siem in CEF/OCSF formats suitable for long-term SIEM retention.",
+        manual_carveout: "The enterprise's declared log retention policy, long-term archival pipeline, access control on archived logs, and written policy document satisfying the 'period appropriate to the intended purpose' requirement.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Downgraded from full during audit (2026-04-10). Sanctuary captures and exports; enterprise declares and archives. The retention policy is an enterprise governance artefact."
+      },
+      {
+        id: "art_26_workers_representatives",
+        citation: {
+          instrument: "Article",
+          section: "26(7)",
+          clause_id: "art-26-7",
+          title: "Inform workers and workers' representatives (employment)"
+        },
+        requirement: `"Before putting into service or using a high-risk AI system at the workplace, deployers who are employers shall inform workers' representatives and the affected workers that they will be subject to the use of the high-risk AI system."`,
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: worker and workers' representative notification evidence].",
+        manual_carveout: "Labour-relations obligation outside Sanctuary's scope.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row. Applies only to employment-context deployments (Annex III \xA74)."
+      },
+      {
+        id: "art_26_dpia",
+        citation: {
+          instrument: "Article",
+          section: "26(9)",
+          clause_id: "art-26-9",
+          title: "Data protection impact assessment per GDPR Art. 35"
+        },
+        requirement: '"Where applicable, deployers of high-risk AI systems shall use the information provided under Article 13 of this Regulation to comply with their obligation to carry out a data protection impact assessment under Article 35 of Regulation (EU) 2016/679 [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: DPIA under GDPR Article 35, where applicable].",
+        manual_carveout: "DPIA is a GDPR governance document. Sanctuary's transparency artefacts (SHR, audit log) may feed into a DPIA, but the assessment itself is enterprise-authored.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row."
+      },
+      {
+        id: "art_26_eu_database_registration",
+        citation: {
+          instrument: "Article",
+          section: "26(8)",
+          clause_id: "art-26-8",
+          title: "Registration in EU database for Annex III systems"
+        },
+        requirement: '"Deployers of high-risk AI systems referred to in Annex III that [...] are public authorities, [...] or deployers acting on their behalf, shall register themselves, select the system and register its use in the EU database referred to in Article 71 [...]."',
+        coverage: "manual_only",
+        evidence_emitter: [],
+        evidence_emitted: "[MANUAL INPUT REQUIRED: EU database registration under Article 71, where applicable].",
+        manual_carveout: "Registration in the EU database is a legal procedural step the enterprise performs directly with the European Commission.",
+        last_reviewed_date: REVIEW_DATE,
+        last_reviewed_by: REVIEWER,
+        review_notes: "Structural manual row. Applies only to public authorities and those acting on their behalf."
+      }
+    ];
+    COVERAGE_MATRIX_V1 = {
+      matrix_version: "v1",
+      regulation_version: REGULATION_VERSION,
+      regulation: {
+        name: "EU AI Act",
+        official_reference: "Regulation (EU) 2024/1689",
+        oj_reference: "OJ L, 2024/1689, 12 July 2024",
+        full_enforcement_date: "2026-08-02",
+        aligned_to_text_version: "OJ published text",
+        last_full_review: "2026-04-10",
+        next_review_due: "2026-06-01"
+      },
+      notes: [
+        "Matrix v1 is aligned to the OJ-published text of Regulation (EU) 2024/1689. It does not yet reflect any implementing acts or delegated acts that the European Commission may publish before the 2026-08-02 enforcement date. Review the `next_review_due` field and bump regulation_version whenever the aligned text changes.",
+        "Verbatim regulation text uses [...] elisions for length; text is never paraphrased. Clause identifiers (clause_id) are separately queryable so templates can render citations without parsing the verbatim quotes.",
+        "Every 'full' row was individually verified against v0.7.0 source on 2026-04-10. See per-row review_notes for verification findings and any corrections applied.",
+        "NOT LEGAL ADVICE. This matrix is a technical mapping from Sanctuary primitives to regulation clause identifiers; it is not a legal interpretation of the EU AI Act."
+      ],
+      rows: ROWS
+    };
+  }
+});
+
+// src/compliance/eu_ai_act/templates/render.ts
+function manualInputMarker(hint) {
+  return `${MANUAL_INPUT_MARKER_PREFIX} ${hint}${MANUAL_INPUT_MARKER_SUFFIX}`;
+}
+function isEmpty(value) {
+  return value === void 0 || value === null || value === "";
+}
+function render(template, context) {
+  return template.replace(INTERPOLATION_RE, (_match, rawKey, rawHint) => {
+    const key = String(rawKey).trim();
+    const value = context[key];
+    if (isEmpty(value)) {
+      const hint = rawHint !== void 0 ? String(rawHint).trim() : key;
+      return manualInputMarker(hint || key);
+    }
+    return String(value);
+  });
+}
+function countManualInputMarkers(rendered) {
+  const marker = MANUAL_INPUT_MARKER_PREFIX;
+  let count = 0;
+  let index = 0;
+  while ((index = rendered.indexOf(marker, index)) !== -1) {
+    count++;
+    index += marker.length;
+  }
+  return count;
+}
+var INTERPOLATION_RE, MANUAL_INPUT_MARKER_PREFIX, MANUAL_INPUT_MARKER_SUFFIX;
+var init_render = __esm({
+  "src/compliance/eu_ai_act/templates/render.ts"() {
+    INTERPOLATION_RE = /\{\{\s*([a-z_][a-z0-9_]*)(?:\s*\|\s*([^}]*?))?\s*\}\}/gi;
+    MANUAL_INPUT_MARKER_PREFIX = "[MANUAL INPUT REQUIRED:";
+    MANUAL_INPUT_MARKER_SUFFIX = "]";
+  }
+});
+
+// src/compliance/eu_ai_act/templates/shared.ts
+function coverageBadge(coverage) {
+  switch (coverage) {
+    case "full":
+      return "**FULL** \u2014 auto-emitted from Sanctuary, zero enterprise input required, machine-verifiable";
+    case "partial":
+      return "**PARTIAL** \u2014 Sanctuary emits structured evidence, enterprise supplies business context";
+    case "manual_only":
+      return "**MANUAL ONLY** \u2014 Sanctuary has no visibility, enterprise authors this section";
+  }
+}
+function formatEmitterList(emitters) {
+  if (emitters.length === 0) {
+    return "_(none \u2014 this row is manual_only)_";
+  }
+  return emitters.map((e) => `- \`${e}\``).join("\n");
+}
+var HEADER_TEMPLATE, FOOTER_TEMPLATE, ROW_BLOCK_TEMPLATE;
+var init_shared = __esm({
+  "src/compliance/eu_ai_act/templates/shared.ts"() {
+    HEADER_TEMPLATE = `# {{ document_title }}
+
+*{{ document_subtitle }}*
+
+---
+
+| Field | Value |
+|---|---|
+| **Regulation** | {{ regulation_version }} |
+| **Coverage matrix version** | {{ matrix_version }} |
+| **Bundle generated** | {{ generated_at }} |
+| **Reporting period** | {{ period_start }} \u2192 {{ period_end }} |
+| **Agent DID** | \`{{ agent_did }}\` |
+| **Legal provider** | {{ provider_legal_name }} |
+| **Provider contact** | {{ provider_contact }} |
+| **Intended purpose** | {{ intended_purpose }} |
+| **Annex III classification** | {{ annex_iii_class }} |
+| **Signer DID** | \`{{ signer_did }}\` |
+| **Signer public key (base64url)** | \`{{ signer_pubkey }}\` |
+
+---
+
+`;
+    FOOTER_TEMPLATE = `
+---
+
+## Document Signature
+
+This document is cryptographically signed by the provider's primary
+Ed25519 identity (DID \`{{ signer_did }}\`, public key
+\`{{ signer_pubkey }}\`). The signature for this document is recorded
+in the bundle manifest \`00_bundle_manifest.json\` under the entry
+with this filename, alongside its SHA-256 digest.
+
+**Verification procedure:** compute the SHA-256 of this file's raw
+byte content, compare it against the \`sha256\` field for this file
+in the bundle manifest, then verify the \`signature\` field against
+the SHA-256 using the signer's public key with Ed25519. A successful
+check proves this document was emitted by the named Sanctuary
+instance and has not been altered since generation.
+
+---
+
+## Disclaimer
+
+**This document is not legal advice.** It is a technical artifact
+generated by the Sanctuary Framework EU AI Act Compliance Artifact
+Generator. It is not a legal interpretation of Regulation (EU)
+2024/1689 and does not constitute a legal opinion. Consult qualified
+legal counsel before filing or relying on this document for
+regulatory submissions, self-assessment, or CE marking procedures.
+
+The coverage claims in this document reflect the state of the
+Sanctuary Framework v{{ sanctuary_version }} runtime as of the
+generation timestamp above. The coverage matrix is versioned
+(\`{{ matrix_version }}\`) and aligned to the regulation text
+identified by \`{{ regulation_version }}\`; if the European Commission
+publishes implementing acts, delegated acts, or guidance that
+modifies the applicable requirements, this document must be
+regenerated against the updated matrix.
+
+---
+
+*Generated by [Sanctuary Framework](https://github.com/eriknewton/sanctuary-framework)
+v{{ sanctuary_version }} \xB7 Author: Erik Newton \xB7 License: Apache-2.0*
+`;
+    ROW_BLOCK_TEMPLATE = `### {{ row_citation }} \u2014 {{ row_title }}
+
+**Coverage:** {{ row_coverage_badge }}
+
+**Regulation text (verbatim, {{ regulation_version }}):**
+
+> {{ row_requirement }}
+
+**Evidence emitted by Sanctuary:**
+
+{{ row_evidence_emitted }}
+
+**Evidence emitter tools:**
+
+{{ row_evidence_emitter_list }}
+
+**Enterprise input required:**
+
+{{ row_manual_carveout }}
+
+---
+
+`;
+  }
+});
+
+// src/compliance/eu_ai_act/templates/01_annex_iv_technical_documentation.ts
+var ANNEX_IV_TECHNICAL_DOCUMENTATION_TEMPLATE;
+var init_annex_iv_technical_documentation = __esm({
+  "src/compliance/eu_ai_act/templates/01_annex_iv_technical_documentation.ts"() {
+    init_shared();
+    ANNEX_IV_TECHNICAL_DOCUMENTATION_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document is the Annex IV Technical Documentation for the
+high-risk AI system identified above, prepared under Article 11 of
+Regulation (EU) 2024/1689 (the "EU AI Act").
+
+The document maps each numbered Annex IV section to the evidence
+that the Sanctuary Framework auto-emits for that section, and
+identifies exactly where enterprise-supplied business context is
+required. Sections marked **FULL** are machine-verifiable against
+the live Sanctuary instance that generated this bundle. Sections
+marked **PARTIAL** carry auto-filled structured evidence alongside
+explicit \`[MANUAL INPUT REQUIRED: ...]\` markers for enterprise
+completion. Sections marked **MANUAL ONLY** are outside Sanctuary's
+architectural scope and must be authored by the enterprise in full.
+
+**How to use this document:**
+
+1. Review each section below in order.
+2. For every \`[MANUAL INPUT REQUIRED: ...]\` marker, replace the
+   marker with the relevant enterprise fact.
+3. Verify the auto-filled evidence against the live Sanctuary
+   instance by running the listed \`evidence_emitter\` tools.
+4. Sign the completed document with the provider's legal signature
+   (the Sanctuary cryptographic signature below is the runtime
+   authenticity attestation, not a substitute for a signed legal
+   declaration).
+
+---
+
+## \xA71 \u2014 General Description
+
+{{ sections_1 }}
+
+## \xA72 \u2014 Detailed Description of Elements
+
+{{ sections_2 }}
+
+## \xA73 \u2014 Monitoring, Functioning and Control
+
+{{ sections_3 }}
+
+## \xA74 \u2014 Performance Metrics
+
+{{ sections_4 }}
+
+## \xA75 \u2014 Risk Management System (Article 9)
+
+{{ sections_5 }}
+
+## \xA76 \u2014 Changes Through Lifecycle
+
+{{ sections_6 }}
+
+## \xA77 \u2014 Standards Applied
+
+{{ sections_7 }}
+
+## \xA78 \u2014 EU Declaration of Conformity
+
+{{ sections_8 }}
+
+## \xA79 \u2014 Post-Market Monitoring Plan (Article 72)
+
+{{ sections_9 }}
+
+${FOOTER_TEMPLATE}`;
+  }
+});
+
+// src/compliance/eu_ai_act/templates/02_article_26_deployer_log.ts
+var ARTICLE_26_DEPLOYER_LOG_TEMPLATE;
+var init_article_26_deployer_log = __esm({
+  "src/compliance/eu_ai_act/templates/02_article_26_deployer_log.ts"() {
+    init_shared();
+    ARTICLE_26_DEPLOYER_LOG_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document is the Article 26 Deployer Log for the high-risk AI
+system identified above, prepared in accordance with the deployer
+obligations of Article 26 of Regulation (EU) 2024/1689.
+
+Unlike the Annex IV Technical Documentation (which is authored by
+the **provider**), this document is authored by the **deployer** \u2014
+the natural or legal person using the high-risk AI system under its
+authority. In many enterprise deployments the provider and deployer
+are the same legal entity; in others they are distinct. The
+\`{{ provider_legal_name }}\` field in the header identifies the
+entity acting as deployer for the purposes of this document.
+
+The document maps each Article 26 obligation to the evidence that
+the Sanctuary Framework auto-emits, and identifies the operational
+and governance facts that only the deployer can supply.
+
+---
+
+## Deployer Operation Summary
+
+During the reporting period **{{ period_start }} \u2192 {{ period_end }}**,
+the Sanctuary Framework runtime for this agent recorded the
+following aggregate operation metrics. These are auto-filled from
+the encrypted audit log via \`monitor_audit_log\` and
+\`audit_export_siem\`:
+
+| Metric | Value |
+|---|---|
+| Total audit entries | {{ audit_total_entries }} |
+| L1 (Cognitive) entries | {{ audit_l1_count }} |
+| L2 (Operational) entries | {{ audit_l2_count }} |
+| L3 (Disclosure) entries | {{ audit_l3_count }} |
+| L4 (Reputation) entries | {{ audit_l4_count }} |
+| Gate decisions \u2014 allow | {{ gate_allow_count }} |
+| Gate decisions \u2014 allow_proxy | {{ gate_allow_proxy_count }} |
+| Gate decisions \u2014 deny | {{ gate_deny_count }} |
+| Gate decisions \u2014 escalate | {{ gate_escalate_count }} |
+| Gate decisions \u2014 unclassified | {{ gate_unclassified_count }} |
+| Injection-detection events | {{ injection_detected_count }} |
+| Unique identities involved | {{ unique_identity_count }} |
+| Unique operation types | {{ unique_operation_count }} |
+
+Detailed event data is available in the companion file
+\`03_article_12_automatic_logs.md\` and its associated SIEM export.
+
+---
+
+## Article 26 Obligations \u2014 Row-by-Row
+
+{{ rows_rendered }}
+
+${FOOTER_TEMPLATE}`;
+  }
+});
+
+// src/compliance/eu_ai_act/templates/03_article_12_automatic_logs.ts
+var ARTICLE_12_AUTOMATIC_LOGS_TEMPLATE;
+var init_article_12_automatic_logs = __esm({
+  "src/compliance/eu_ai_act/templates/03_article_12_automatic_logs.ts"() {
+    init_shared();
+    ARTICLE_12_AUTOMATIC_LOGS_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document is the Article 12 Automatic Record-Keeping narrative
+for the high-risk AI system identified above, prepared in
+accordance with Article 12 and Article 19(1) of Regulation (EU)
+2024/1689.
+
+The Sanctuary Framework provides structural automatic logging via
+its Principal Policy gate, which intercepts every MCP tool call
+before execution and appends an authenticated entry to the L2
+audit log. No code path exists to bypass this logging. The full
+implementation is described below; the raw audit export in
+SIEM-compatible format accompanies this document as a separate
+file.
+
+---
+
+## Logging Architecture Summary (Auto-Filled)
+
+Sanctuary's Article 12 implementation has the following structural
+properties, each independently verifiable against the v{{ sanctuary_version }}
+source:
+
+| Property | Mechanism | Verifiable via |
+|---|---|---|
+| Automatic capture on every tool call | \`router.ts\` wraps all tool invocations through \`ApprovalGate.evaluate()\`; the gate appends an audit entry on every outcome path (\`gate_allow\`, \`gate_allow_proxy\`, \`gate_deny\`, \`gate_escalate\`, \`gate_unclassified\`, \`injection_detected\`) | Source: \`server/src/router.ts\`, \`server/src/principal-policy/gate.ts\` |
+| Append-only API | The \`AuditLog\` class exposes only \`append()\` and read methods (\`query()\`, \`size\`). No update or delete method is exposed. | Source: \`server/src/l2-operational/audit-log.ts\` |
+| Confidentiality at rest | AES-256-GCM authenticated encryption with an HKDF-derived per-purpose key (\`audit-log\` purpose string) | Source: \`server/src/core/encryption.ts\`, \`server/src/core/key-derivation.ts\` |
+| SIEM-compatible export | CEF (Common Event Format, newline-delimited) and OCSF (Open Cybersecurity Schema Framework, JSON array) emitted by the \`audit_export_siem\` tool | Run: \`audit_export_siem\` with \`format: "cef"\` or \`format: "ocsf"\` |
+| Gate decision taxonomy | Every entry carries a structured operation string prefixed with \`gate_*\` or \`injection_detected:\`, directly filterable via the \`filter_decision\` and \`operation_type\` parameters | Run: \`audit_export_siem\` with \`filter_decision\` set |
+
+---
+
+## Reporting Period Summary (Auto-Filled)
+
+| Field | Value |
+|---|---|
+| Period start | {{ period_start }} |
+| Period end | {{ period_end }} |
+| Total entries captured | {{ audit_total_entries }} |
+| L1 entries | {{ audit_l1_count }} |
+| L2 entries | {{ audit_l2_count }} |
+| L3 entries | {{ audit_l3_count }} |
+| L4 entries | {{ audit_l4_count }} |
+| Gate allow | {{ gate_allow_count }} |
+| Gate allow_proxy | {{ gate_allow_proxy_count }} |
+| Gate deny | {{ gate_deny_count }} |
+| Gate escalate | {{ gate_escalate_count }} |
+| Gate unclassified | {{ gate_unclassified_count }} |
+| Injection-detection events | {{ injection_detected_count }} |
+
+**Full SIEM export:** see the accompanying file
+\`03_article_12_automatic_logs_siem.json\` in this bundle for the
+complete OCSF-formatted audit entries. Ingest into your SIEM
+(Splunk, Datadog, QRadar, or equivalent) for post-market monitoring
+workflows under Article 72.
+
+---
+
+## Article 12 Obligations \u2014 Row-by-Row
+
+{{ rows_rendered }}
+
+---
+
+## Known Caveats and Residual Risk
+
+The following caveats are disclosed honestly and are specific to
+Sanctuary Framework v{{ sanctuary_version }}:
+
+1. **Audit log entries are not Ed25519-signed.** The authenticated
+   encryption provides integrity against unauthorised third parties
+   without the master key. It does not provide non-repudiation
+   against a compromised-master-key insider, because the encryption
+   is symmetric. If your threat model requires per-entry
+   non-repudiation, supplement this logging with an external append-
+   only log service (e.g., a separate SIEM with write-once storage).
+
+2. **Persistence is fire-and-forget.** If disk write fails, the
+   entry lives only in memory and is lost at process exit. This is
+   a durability concern under Article 12(1)'s "over the lifetime of
+   the system" clause. The mitigation is to ensure the Sanctuary
+   storage path is on reliable storage and monitored for write
+   failures.
+
+3. **Retention policy is deployer-declared.** Sanctuary persists
+   entries indefinitely by default but does not enforce the
+   Article 19(1) six-month minimum retention. The deployer must
+   configure archival to meet the statutory retention.
+
+These caveats are documented for audit transparency and do not
+affect the Article 12(1) capability claim that the system
+"technically allows for the automatic recording of events over
+the lifetime of the system."
+
+${FOOTER_TEMPLATE}`;
+  }
+});
+
+// src/compliance/eu_ai_act/templates/04_risk_management_summary.ts
+var RISK_MANAGEMENT_SUMMARY_TEMPLATE;
+var init_risk_management_summary = __esm({
+  "src/compliance/eu_ai_act/templates/04_risk_management_summary.ts"() {
+    init_shared();
+    RISK_MANAGEMENT_SUMMARY_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document is the Risk Management Summary for the high-risk AI
+system identified above, prepared in accordance with Article 9 of
+Regulation (EU) 2024/1689. It aggregates the Sanctuary Framework
+evidence relevant to risk identification, risk analysis, risk
+treatment, and residual risk acceptance for the deployed agent.
+
+This document does not replace the enterprise's overall risk
+management system documentation. It supplies the runtime-control
+half of that system \u2014 the mechanisms, policies, and monitoring
+data that Sanctuary automatically emits. The enterprise must wrap
+these mechanisms in an Article 9-compliant risk management
+framework with identified risks, residual risk analysis, risk
+treatment plans, and periodic review cadence.
+
+---
+
+## Runtime Control Inventory (Auto-Filled)
+
+The following Sanctuary controls are active for this agent and
+collectively form the runtime risk-mitigation substrate referenced
+by Article 9:
+
+### Principal Policy Gate (L2 Operational Isolation)
+
+Every MCP tool call passes through the \`ApprovalGate.evaluate()\`
+method before execution. The gate applies the three-tier Principal
+Policy:
+
+- **Tier 1 \u2014 Always require human approval:** {{ tier1_rule_count }} rules defined.
+  Operations in this tier (state export/import, key rotation, secure
+  delete, reputation import, and similar irreversible or sensitive
+  actions) are blocked pending out-of-band approval via the
+  configured channel (\`{{ approval_channel_type }}\`). Default behaviour
+  on timeout: **deny**.
+- **Tier 2 \u2014 Anomaly-triggered approval:** {{ tier2_rule_count }} rules
+  defined. Baseline tracker at \`principal_baseline_view\` monitors
+  new namespaces, new counterparties, and frequency spikes. First-
+  session policy: \`{{ first_session_policy }}\`.
+- **Tier 3 \u2014 Auto-allow with audit logging:** {{ tier3_rule_count }}
+  tools listed. These are read-only or low-risk operations that
+  proceed without approval but are still captured in the audit log.
+
+### L2 Process Hardening
+
+Runtime hardening of the Sanctuary process via seccomp/entitlement
+restrictions where supported by the host operating system.
+
+### L2 Outbound Context Gating
+
+Per-provider field-level policies applied to agent context before
+any outbound call. {{ context_gate_policy_count }} context gate
+policies are currently configured, enforced via the context gate
+enforcer (active: {{ context_gate_enforcer_active }}).
+
+### Prompt Injection Detector
+
+The \`InjectionDetector\` subsystem runs as a pre-check inside the
+Principal Policy gate on every tool call. Detection signals are
+written to the audit log with the prefix \`injection_detected:\` and
+are filterable via \`monitor_audit_log\` and \`audit_export_siem\`.
+During the reporting period {{ period_start }} \u2192 {{ period_end }},
+the detector flagged **{{ injection_detected_count }}** events.
+
+### L3 Selective Disclosure
+
+Pedersen commitments on Ristretto255, Schnorr proofs, and bit-
+decomposition range proofs. Allows the agent to prove claims about
+its data without revealing the underlying values \u2014 a core control
+for data minimisation under Article 10 and GDPR data minimisation
+obligations.
+
+### L4 Verifiable Reputation
+
+Ed25519-signed attestations in EAS-compatible format with
+sovereignty-gated trust tiers. Supports attestation-based trust
+decisions without requiring trust in any single attestor.
+
+---
+
+## Risk-Management-Relevant Coverage Rows
+
+{{ rows_rendered }}
+
+---
+
+## Residual Risk and Mitigations
+
+The following residual risks are disclosed honestly and are
+specific to Sanctuary Framework v{{ sanctuary_version }}:
+
+- **No TEE attestation.** The runtime self-reports its environment
+  type without a hardware root of trust. The SHR degradation flag
+  \`NO_TEE\` is set automatically. Mitigation: deploy Sanctuary on
+  TEE-capable hardware in production, or accept the process-level
+  isolation boundary as sufficient for the deployment context.
+- **Training-time threats are out of scope.** Data poisoning,
+  model poisoning, and backdoor injection at training time are
+  outside Sanctuary's runtime scope. Mitigation: rely on the
+  model provider's training-pipeline controls and declare the
+  provider's governance in the Annex IV \xA72(d) manual section.
+- **Audit log retention is deployer-declared.** See the Article 12
+  automatic logs document for details and mitigation.
+
+---
+
+## Enterprise-Supplied Risk Framework
+
+The enterprise must supply the following to complete the Article 9
+risk management documentation. These are listed as
+\`[MANUAL INPUT REQUIRED: ...]\` markers throughout this document
+and the Annex IV \xA75 row below:
+
+- Risk register for the specific deployment
+- Residual risk analysis and acceptance criteria
+- Risk treatment plan linking identified risks to the Sanctuary
+  controls above (or compensating controls)
+- Periodic risk review cadence
+- Risk ownership and accountability structure
+
+${FOOTER_TEMPLATE}`;
+  }
+});
+
+// src/compliance/eu_ai_act/templates/05_human_oversight_statement.ts
+var HUMAN_OVERSIGHT_STATEMENT_TEMPLATE;
+var init_human_oversight_statement = __esm({
+  "src/compliance/eu_ai_act/templates/05_human_oversight_statement.ts"() {
+    init_shared();
+    HUMAN_OVERSIGHT_STATEMENT_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document is the Human Oversight Statement for the high-risk
+AI system identified above, prepared in accordance with Article 14
+of Regulation (EU) 2024/1689. It documents the technical substrate
+Sanctuary provides for human oversight and identifies the
+operational facts (operator roles, training, authority) that the
+enterprise must supply.
+
+Sanctuary's human oversight substrate is the Principal Policy gate
+with its approval channel. Every operation classified as Tier 1
+blocks execution until a human principal approves or denies via
+the configured out-of-band channel. Every Tier 2 anomaly triggers
+the same approval path when baseline deviation is detected. Tier 3
+operations proceed automatically but are captured in the audit log
+for after-the-fact human review.
+
+**Important scope note:** Sanctuary's intervention model is
+**pre-execution gating**, not mid-stream interruption. An approval
+denial halts the next tool call before it executes; it does not
+kill an in-flight LLM stream or subprocess. Whether this model
+satisfies Article 14(4)(e) ("intervene on the operation [...] or
+interrupt the system through a 'stop' button or similar procedure
+that allows the system to come to a halt in a safe state") is an
+operational judgement the enterprise must make for the specific
+deployment. The Sanctuary claim is: pre-execution gating provides
+a safe-state halt before the next consequential action; mid-stream
+interruption requires additional controls outside Sanctuary.
+
+---
+
+## Principal Policy Configuration (Auto-Filled)
+
+| Field | Value |
+|---|---|
+| Approval channel type | \`{{ approval_channel_type }}\` |
+| Approval channel timeout | {{ approval_channel_timeout_seconds }} seconds |
+| On timeout | **deny** (SEC-002: \`auto_deny\` removed \u2014 timeout always denies) |
+| Tier 1 rule count (always require approval) | {{ tier1_rule_count }} |
+| Tier 2 anomaly rules | new_namespace_access: \`{{ tier2_new_namespace_access }}\`, new_counterparty: \`{{ tier2_new_counterparty }}\`, frequency_spike_multiplier: {{ tier2_frequency_spike_multiplier }}, first_session_policy: \`{{ tier2_first_session_policy }}\` |
+| Tier 3 auto-allow tool count | {{ tier3_rule_count }} |
+| Baseline tracker state | \`{{ baseline_tracker_state }}\` |
+
+The full Principal Policy is machine-readable via
+\`principal_policy_view\`. The baseline tracker state is exposed via
+\`principal_baseline_view\`. Both tools are Tier 3 (read-only) and
+can be invoked by an auditor against a live Sanctuary instance to
+independently verify every value above.
+
+---
+
+## Reporting Period Oversight Activity (Auto-Filled)
+
+During the reporting period **{{ period_start }} \u2192 {{ period_end }}**,
+the Sanctuary oversight gate recorded the following activity:
+
+| Outcome | Count |
+|---|---|
+| Gate allow (Tier 3 auto-allow or approved Tier 1/2) | {{ gate_allow_count }} |
+| Gate allow_proxy (Sanctuary MCP-proxy pass-through) | {{ gate_allow_proxy_count }} |
+| Gate deny (approval denied or timeout) | {{ gate_deny_count }} |
+| Gate escalate (Tier 2 anomaly raised for human review) | {{ gate_escalate_count }} |
+| Gate unclassified (no matching rule, default behaviour applied) | {{ gate_unclassified_count }} |
+| Injection-detection events | {{ injection_detected_count }} |
+
+Individual entries are queryable via \`monitor_audit_log\` with
+\`layer: "l2"\` filter and exportable in SIEM-compatible format via
+\`audit_export_siem\`.
+
+---
+
+## Article 14 and Annex IV \xA72(e) Row Coverage
+
+{{ rows_rendered }}
+
+---
+
+## Enterprise-Supplied Oversight Facts
+
+The following human-oversight facts are the enterprise's
+responsibility and are not emitted by Sanctuary. They must be
+filled in before this document is used for regulatory submission:
+
+- **Identity of assigned overseers:** who are the natural persons
+  with Article 14 oversight authority for this deployment?
+- **Competence and training:** what training have they received,
+  and how is their competence assessed?
+- **Authority scope:** what is the written authority of each
+  overseer \u2014 can they halt the system, override outputs, reverse
+  decisions?
+- **Automation-bias mitigation:** what training, interface
+  design, or process measures address automation bias per Article
+  14(4)(b)?
+- **Stop-button workflow mapping:** how does the Sanctuary approval
+  channel integrate with the enterprise's operational stop-button
+  procedure?
+- **Output interpretation support:** what tools, dashboards, or
+  reference materials support the overseers in correctly
+  interpreting the agent's outputs per Article 14(4)(c)?
+- **Escalation procedure:** when does an overseer escalate to a
+  different authority (security, legal, C-suite)?
+
+${FOOTER_TEMPLATE}`;
+  }
+});
+
+// src/compliance/eu_ai_act/templates/06_cryptographic_attestations.ts
+var CRYPTOGRAPHIC_ATTESTATIONS_TEMPLATE;
+var init_cryptographic_attestations = __esm({
+  "src/compliance/eu_ai_act/templates/06_cryptographic_attestations.ts"() {
+    init_shared();
+    CRYPTOGRAPHIC_ATTESTATIONS_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document is the Cryptographic Attestations summary for the
+compliance bundle identified above. Every file in the bundle \u2014
+including this document \u2014 is individually hashed with SHA-256 and
+signed with the provider's primary Ed25519 identity. The entire
+bundle manifest is additionally signed as a single canonical
+document so an auditor can verify "this exact set of files, in
+this exact state, was attested by this identity at this exact
+timestamp" with a single signature check.
+
+**Why this matters under Article 11 and Article 47:** the Annex IV
+technical documentation and the EU declaration of conformity are
+typically signed by the provider's legal representative. This
+document does not substitute for the legal signature \u2014 it provides
+the **runtime authenticity attestation** that proves the technical
+contents of the bundle were generated by the named Sanctuary
+instance and have not been altered since generation. The legal
+signature and the cryptographic attestation are complementary
+controls.
+
+---
+
+## Signer Identity
+
+| Field | Value |
+|---|---|
+| Signer DID | \`{{ signer_did }}\` |
+| Signer public key (base64url) | \`{{ signer_pubkey }}\` |
+| Signer key type | Ed25519 |
+| Signer role | Provider primary identity |
+| Key custody | Self-custodied (L1 Cognitive Sovereignty) |
+
+The signer identity is the provider's primary Ed25519 identity as
+reported by \`identity_set_primary\` on the generating Sanctuary
+instance. To verify any signature in this bundle, retrieve the
+public key above and check the base64url signature against the
+SHA-256 digest of the corresponding file using standard Ed25519
+verification.
+
+---
+
+## Bundle File Attestations
+
+Each file in the bundle rendered **before** this attestations
+document is listed below with its SHA-256 digest and Ed25519
+signature. Recompute the SHA-256 of any file and verify the
+signature to confirm integrity.
+
+**The complete signed bundle \u2014 including this attestations document
+and any content documents that follow it (such as
+\`07_annex_iii_classification.md\` if the bundle was generated with an
+intended purpose) \u2014 is authoritatively indexed in
+\`00_bundle_manifest.json\` with SHA-256 and Ed25519 signatures for
+every file.** Verification against the manifest is the canonical
+integrity check; the table below is a human-readable companion.
+
+{{ file_attestation_table }}
+
+---
+
+## Manifest Signature
+
+The complete bundle manifest (\`00_bundle_manifest.json\`) is
+canonically serialised (sorted keys, no whitespace) and signed as
+a single document. Verifying the manifest signature establishes
+authenticity of the entire bundle in one check.
+
+| Field | Value |
+|---|---|
+| Manifest SHA-256 | \`{{ manifest_sha256 }}\` |
+| Manifest signature (base64url) | \`{{ manifest_signature }}\` |
+| Canonicalisation | Sorted keys, no whitespace (JSON canonical form) |
+
+---
+
+## Verification Procedure
+
+To verify this bundle end-to-end:
+
+1. **Verify each file individually.** For each file in the bundle:
+   (a) read the file bytes, (b) compute SHA-256, (c) compare against
+   the digest in the table above, (d) verify the Ed25519 signature
+   against the SHA-256 digest using the signer's public key.
+2. **Verify the manifest.** Canonically serialise
+   \`00_bundle_manifest.json\` (sorted keys, no whitespace), compute
+   SHA-256, and verify the \`manifest_signature\` field against the
+   signer's public key.
+3. **Cross-check the manifest against the files.** Ensure every
+   file listed in the manifest exists in the bundle and every
+   file in the bundle is listed in the manifest, with matching
+   SHA-256 digests.
+4. **Verify the signer identity.** Confirm the signer DID and
+   public key match the expected provider identity (for example,
+   via a trusted identity registry or via direct confirmation
+   with the provider).
+
+If all four checks pass, the bundle is cryptographically authentic
+as-generated by the named Sanctuary instance. The cryptographic
+check does not establish the **legal validity** of the contents \u2014
+that remains the responsibility of the provider's legal signature
+and the applicable conformity assessment procedure under
+Regulation (EU) 2024/1689.
+
+${FOOTER_TEMPLATE}`;
+  }
+});
+
+// src/compliance/eu_ai_act/templates/07_annex_iii_classification.ts
+var ANNEX_III_CLASSIFICATION_TEMPLATE;
+var init_annex_iii_classification = __esm({
+  "src/compliance/eu_ai_act/templates/07_annex_iii_classification.ts"() {
+    init_shared();
+    ANNEX_III_CLASSIFICATION_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document reports the Annex III candidate classifications for
+the agent identified above, produced by the Sanctuary rule-based
+classification helper. It is **not** a legal determination \u2014 it is
+a keyword-weighted narrowing of the search space intended to help
+the enterprise reviewer focus on the relevant sections of Annex III
+of Regulation (EU) 2024/1689.
+
+The classifier compares the agent's intended purpose against a
+structured catalog of the eight Annex III high-risk categories and
+their sub-points. Every keyword has a coarse weight (1.0 high, 0.6
+medium, 0.3 low); the sum is clamped to [0, 1] and reported as the
+**rule_based_confidence** field. The name is deliberately awkward so
+downstream consumers cannot mistake it for a machine-learning model
+prediction.
+
+---
+
+## Classified intended purpose (deployer-supplied)
+
+> {{ classified_intended_purpose }}
+
+---
+
+## Candidate categories
+
+{{ candidates_rendered }}
+
+---
+
+## Final classification determination
+
+{{ final_classification | final Annex III category determined by legal review of the regulation text, including the category number and sub-point and a one-paragraph justification linking the agent's intended purpose to the verbatim regulation language }}
+
+---
+
+## Why the classifier is rule-based, not model-based
+
+The classification helper uses a keyword-weighted rule-based scoring
+system with no trained model, no machine learning, and no probability
+distribution. The decision to use a rule-based classifier is
+deliberate for three reasons:
+
+1. **Auditability.** Every match is traceable to a specific keyword
+   in a checked-in catalog file (\`server/src/compliance/eu_ai_act/annex_iii.ts\`).
+   An auditor can grep for the keyword and see why the category
+   matched.
+
+2. **No training data contamination.** A trained classifier would
+   inherit whatever biases its training set contained, and the
+   provenance of such a training set would itself become part of
+   the compliance surface.
+
+3. **Honest uncertainty.** A rule-based score of 0.9 means "nine
+   weighted keywords matched" \u2014 a concrete, reproducible signal.
+   A model prediction of 0.9 means "the model is confident" \u2014 a
+   signal whose meaning depends on the model's calibration, which
+   the deployer cannot independently verify.
+
+If no candidate category cleared the minimum threshold (0.4), the
+"Candidate categories" section above is empty. **This does not mean
+the agent is out of scope of the EU AI Act.** It means the keyword
+catalog did not find a clear match against the deployer-supplied
+intended purpose. The deployer is still responsible for reviewing
+Annex III in full and determining whether any category applies.
+
+---
+
+## Advisory
+
+{{ classifier_advisory }}
+
+${FOOTER_TEMPLATE}`;
+  }
+});
+
+// src/compliance/eu_ai_act/templates/08_delta.ts
+var DELTA_TEMPLATE;
+var init_delta = __esm({
+  "src/compliance/eu_ai_act/templates/08_delta.ts"() {
+    init_shared();
+    DELTA_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document reports what changed in the Sanctuary EU AI Act
+coverage matrix between the **prior** bundle referenced below and
+the **current** bundle identified in the header table above.
+
+A delta document is intended for enterprises that maintain a
+rolling compliance record \u2014 e.g., a quarterly or monthly
+regeneration cadence \u2014 and want to review only the changes since
+the last bundle without re-reading every document.
+
+**The delta is computed from the two manifests, not from the
+document bodies.** Specifically, it compares:
+
+1. The \`regulation_version\` field (external regulation text changes)
+2. The \`matrix_version\` field (structural matrix schema changes)
+3. The per-row \`coverage\` flag in \`coverage_rows[]\`
+4. The per-row \`evidence_emitter[]\` array
+
+Row \`last_reviewed_date\` is compared when both bundles expose it
+in the coverage_rows summary. A delta row may reflect any
+combination of these changes \u2014 they are not mutually exclusive.
+
+---
+
+## Prior bundle reference
+
+| Field | Value |
+|---|---|
+| **Path** | \`{{ prior_bundle_path }}\` |
+| **Generated at** | {{ prior_generated_at }} |
+| **Signer DID** | \`{{ prior_signer_did }}\` |
+| **Regulation version** | {{ prior_regulation_version }} |
+| **Matrix version** | \`{{ prior_matrix_version }}\` |
+
+## Current bundle reference
+
+| Field | Value |
+|---|---|
+| **Generated at** | {{ current_generated_at }} |
+| **Signer DID** | \`{{ current_signer_did }}\` |
+| **Regulation version** | {{ current_regulation_version }} |
+| **Matrix version** | \`{{ current_matrix_version }}\` |
+
+---
+
+## Summary
+
+| Change category | Count |
+|---|---|
+| Regulation version bumped | {{ regulation_version_changed }} |
+| Matrix version bumped | {{ matrix_version_changed }} |
+| Rows added | {{ rows_added_count }} |
+| Rows removed | {{ rows_removed_count }} |
+| Rows changed | {{ rows_changed_count }} |
+
+{{ no_changes_note }}
+
+---
+
+## Rows added
+
+{{ rows_added_rendered }}
+
+## Rows removed
+
+{{ rows_removed_rendered }}
+
+## Rows changed
+
+{{ rows_changed_rendered }}
+
+---
+
+## Warnings
+
+{{ warnings_rendered }}
+
+---
+
+## How to use this delta
+
+1. If **regulation version bumped**, the coverage matrix has been
+   re-aligned to updated regulation text (implementing acts,
+   delegated acts, or OJ errata). Every \`full\` row should be
+   re-verified against the new text before the current bundle is
+   treated as authoritative.
+2. If **matrix version bumped**, the matrix schema changed (row
+   set, coverage classification rules, or row structure). Review
+   the v1 \u2192 v2 (or later) migration notes in the repository's
+   \`docs/audit/\` directory.
+3. For each **row changed**, walk the \`review_notes\` field of the
+   current coverage matrix entry for that row (available in
+   \`docs/compliance/eu_ai_act_coverage_matrix_v1.md\`) \u2014 the reason
+   for the change is recorded there.
+4. For **rows added** or **rows removed**, the matrix structure
+   itself evolved. Treat these as matrix_version changes even if
+   the matrix_version field happens not to have bumped.
+
+This delta document is cryptographically signed into the current
+bundle's manifest, so an auditor can verify that the delta reflects
+the exact state claimed by the current bundle.
+
+${FOOTER_TEMPLATE}`;
+  }
+});
+
+// src/compliance/eu_ai_act/templates/index.ts
+var init_templates = __esm({
+  "src/compliance/eu_ai_act/templates/index.ts"() {
+    init_render();
+    init_shared();
+    init_annex_iv_technical_documentation();
+    init_article_26_deployer_log();
+    init_article_12_automatic_logs();
+    init_risk_management_summary();
+    init_human_oversight_statement();
+    init_cryptographic_attestations();
+    init_annex_iii_classification();
+    init_delta();
+  }
+});
+
+// src/compliance/eu_ai_act/annex_iii.ts
+function normalizeForMatching(text) {
+  return text.toLowerCase().replace(/[,.;:!?()\[\]{}"']/g, " ").replace(/\s+/g, " ").trim();
+}
+function classifyAgentDescription(description) {
+  const normalized = normalizeForMatching(description);
+  const candidates = [];
+  for (const category of ANNEX_III_CATEGORIES) {
+    let score = 0;
+    const matched = [];
+    for (const { term, weight } of category.keywords) {
+      if (normalized.includes(term)) {
+        score += weight;
+        matched.push(term);
+      }
+    }
+    if (score >= MIN_CONFIDENCE_THRESHOLD) {
+      candidates.push({
+        category_id: category.id,
+        citation: category.citation,
+        title: category.title,
+        rule_based_confidence: Math.min(1, score),
+        matched_keywords: matched
+      });
+    }
+  }
+  candidates.sort(
+    (a, b) => b.rule_based_confidence - a.rule_based_confidence
+  );
+  const fragment = description.length > 200 ? description.slice(0, 200) + "..." : description;
+  return {
+    description_fragment: fragment,
+    candidates,
+    advisory: CLASSIFIER_ADVISORY,
+    regulation_version: ANNEX_III_REGULATION_VERSION
+  };
+}
+var MIN_CONFIDENCE_THRESHOLD, W_HIGH, W_MED, W_LOW, ANNEX_III_CATEGORIES, CLASSIFIER_ADVISORY, ANNEX_III_REGULATION_VERSION;
+var init_annex_iii = __esm({
+  "src/compliance/eu_ai_act/annex_iii.ts"() {
+    MIN_CONFIDENCE_THRESHOLD = 0.4;
+    W_HIGH = 1;
+    W_MED = 0.6;
+    W_LOW = 0.3;
+    ANNEX_III_CATEGORIES = [
+      // §1 — Biometrics
+      {
+        id: "annex_iii_1_a_remote_biometric_identification",
+        citation: "Annex III \xA71(a)",
+        title: "Remote biometric identification systems",
+        verbatim: '"Remote biometric identification systems [...] excluding AI systems [...] for biometric verification the sole purpose of which is to confirm that a specific natural person is the person he or she claims to be."',
+        keywords: [
+          { term: "facial recognition", weight: W_HIGH },
+          { term: "biometric identification", weight: W_HIGH },
+          { term: "face recognition", weight: W_HIGH },
+          { term: "identify people", weight: W_MED },
+          { term: "identify individuals", weight: W_MED },
+          { term: "surveillance camera", weight: W_MED },
+          { term: "cctv", weight: W_LOW },
+          { term: "camera", weight: W_LOW },
+          { term: "biometric", weight: W_LOW }
+        ]
+      },
+      {
+        id: "annex_iii_1_b_biometric_categorisation",
+        citation: "Annex III \xA71(b)",
+        title: "Biometric categorisation by sensitive attributes",
+        verbatim: '"Biometric categorisation systems, according to sensitive or protected attributes or characteristics based on the inference of those attributes or characteristics."',
+        keywords: [
+          { term: "biometric categorisation", weight: W_HIGH },
+          { term: "biometric categorization", weight: W_HIGH },
+          { term: "classify people by", weight: W_MED },
+          { term: "categorize individuals", weight: W_MED },
+          { term: "ethnicity", weight: W_MED },
+          { term: "gender classification", weight: W_MED },
+          { term: "age classification", weight: W_LOW },
+          { term: "sensitive attributes", weight: W_LOW }
+        ]
+      },
+      {
+        id: "annex_iii_1_c_emotion_recognition",
+        citation: "Annex III \xA71(c)",
+        title: "Emotion recognition systems",
+        verbatim: '"Emotion recognition systems."',
+        keywords: [
+          { term: "emotion recognition", weight: W_HIGH },
+          { term: "emotion detection", weight: W_HIGH },
+          { term: "affect recognition", weight: W_HIGH },
+          { term: "sentiment analysis", weight: W_LOW },
+          { term: "facial expression", weight: W_MED },
+          { term: "mood detection", weight: W_MED }
+        ]
+      },
+      // §2 — Critical infrastructure
+      {
+        id: "annex_iii_2_critical_infrastructure",
+        citation: "Annex III \xA72",
+        title: "Critical infrastructure safety components",
+        verbatim: '"AI systems intended to be used as safety components in the management and operation of critical digital infrastructure, road traffic, or in the supply of water, gas, heating or electricity."',
+        keywords: [
+          { term: "critical infrastructure", weight: W_HIGH },
+          { term: "safety component", weight: W_HIGH },
+          { term: "power grid", weight: W_HIGH },
+          { term: "water supply", weight: W_HIGH },
+          { term: "gas supply", weight: W_HIGH },
+          { term: "electricity grid", weight: W_HIGH },
+          { term: "road traffic", weight: W_MED },
+          { term: "traffic management", weight: W_MED },
+          { term: "energy distribution", weight: W_MED },
+          { term: "scada", weight: W_MED },
+          { term: "utility network", weight: W_LOW }
+        ]
+      },
+      // §3 — Education
+      {
+        id: "annex_iii_3_a_education_admission",
+        citation: "Annex III \xA73(a)",
+        title: "Education \u2014 access and admission decisions",
+        verbatim: '"AI systems intended to be used to determine access or admission or to assign natural persons to educational and vocational training institutions at all levels."',
+        keywords: [
+          { term: "admissions", weight: W_HIGH },
+          { term: "admission decisions", weight: W_HIGH },
+          { term: "school admission", weight: W_HIGH },
+          { term: "university admission", weight: W_HIGH },
+          { term: "student selection", weight: W_MED },
+          { term: "enrollment", weight: W_MED },
+          { term: "enrolment", weight: W_MED },
+          { term: "applicant scoring education", weight: W_LOW }
+        ]
+      },
+      {
+        id: "annex_iii_3_b_education_assessment",
+        citation: "Annex III \xA73(b)",
+        title: "Education \u2014 learning outcome evaluation",
+        verbatim: '"AI systems intended to be used to evaluate learning outcomes [...] where those outcomes are used to steer the learning process of natural persons [...]."',
+        keywords: [
+          { term: "grading", weight: W_HIGH },
+          { term: "grade students", weight: W_HIGH },
+          { term: "learning outcomes", weight: W_HIGH },
+          { term: "student assessment", weight: W_HIGH },
+          { term: "evaluate students", weight: W_MED },
+          { term: "evaluate learners", weight: W_MED },
+          { term: "educational assessment", weight: W_MED },
+          { term: "exam scoring", weight: W_MED }
+        ]
+      },
+      {
+        id: "annex_iii_3_d_education_proctoring",
+        citation: "Annex III \xA73(d)",
+        title: "Education \u2014 test proctoring and behaviour monitoring",
+        verbatim: '"AI systems intended to be used for monitoring and detecting prohibited behaviour of students during tests."',
+        keywords: [
+          { term: "proctoring", weight: W_HIGH },
+          { term: "exam monitoring", weight: W_HIGH },
+          { term: "test proctoring", weight: W_HIGH },
+          { term: "cheating detection", weight: W_HIGH },
+          { term: "plagiarism detection", weight: W_MED },
+          { term: "monitor students", weight: W_MED }
+        ]
+      },
+      // §4 — Employment
+      {
+        id: "annex_iii_4_a_employment_recruitment",
+        citation: "Annex III \xA74(a)",
+        title: "Employment \u2014 recruitment and candidate evaluation",
+        verbatim: '"AI systems intended to be used for the recruitment or selection of natural persons, in particular to place targeted job advertisements, to analyse and filter job applications, and to evaluate candidates."',
+        keywords: [
+          { term: "cv screening", weight: W_HIGH },
+          { term: "resume screening", weight: W_HIGH },
+          { term: "candidate shortlist", weight: W_HIGH },
+          { term: "recruitment", weight: W_HIGH },
+          { term: "hiring decisions", weight: W_HIGH },
+          { term: "applicant filtering", weight: W_HIGH },
+          { term: "job application", weight: W_MED },
+          { term: "interview scoring", weight: W_MED },
+          { term: "targeted job ad", weight: W_MED },
+          { term: "hr screening", weight: W_MED },
+          { term: "talent acquisition", weight: W_LOW },
+          { term: "hiring", weight: W_LOW }
+        ]
+      },
+      {
+        id: "annex_iii_4_b_employment_management",
+        citation: "Annex III \xA74(b)",
+        title: "Employment \u2014 performance management and termination",
+        verbatim: '"AI systems intended to be used to make decisions affecting terms of work-related relationships, the promotion or termination of work-related contractual relationships, to allocate tasks [...] and to monitor and evaluate the performance and behaviour of persons in such relationships."',
+        keywords: [
+          { term: "performance review", weight: W_HIGH },
+          { term: "performance evaluation", weight: W_HIGH },
+          { term: "termination decisions", weight: W_HIGH },
+          { term: "worker monitoring", weight: W_HIGH },
+          { term: "employee monitoring", weight: W_HIGH },
+          { term: "task allocation", weight: W_MED },
+          { term: "promotion decisions", weight: W_MED },
+          { term: "gig worker", weight: W_MED },
+          { term: "productivity tracking", weight: W_LOW }
+        ]
+      },
+      // §5 — Essential services
+      {
+        id: "annex_iii_5_a_public_benefits",
+        citation: "Annex III \xA75(a)",
+        title: "Essential services \u2014 public benefit eligibility",
+        verbatim: '"AI systems intended to be used by public authorities or on behalf of public authorities to evaluate the eligibility of natural persons for essential public assistance benefits and services [...]."',
+        keywords: [
+          { term: "welfare eligibility", weight: W_HIGH },
+          { term: "benefit eligibility", weight: W_HIGH },
+          { term: "public benefits", weight: W_HIGH },
+          { term: "social security", weight: W_HIGH },
+          { term: "public assistance", weight: W_HIGH },
+          { term: "housing benefit", weight: W_MED },
+          { term: "unemployment benefit", weight: W_MED }
+        ]
+      },
+      {
+        id: "annex_iii_5_b_creditworthiness",
+        citation: "Annex III \xA75(b)",
+        title: "Essential services \u2014 creditworthiness and credit scoring",
+        verbatim: '"AI systems intended to be used to evaluate the creditworthiness of natural persons or establish their credit score, with the exception of AI systems used for the purpose of detecting financial fraud."',
+        keywords: [
+          { term: "credit scoring", weight: W_HIGH },
+          { term: "creditworthiness", weight: W_HIGH },
+          { term: "loan approval", weight: W_HIGH },
+          { term: "credit decisions", weight: W_HIGH },
+          { term: "credit risk", weight: W_HIGH },
+          { term: "lending decisions", weight: W_HIGH },
+          { term: "mortgage approval", weight: W_MED }
+        ]
+      },
+      {
+        id: "annex_iii_5_c_insurance_pricing",
+        citation: "Annex III \xA75(c)",
+        title: "Essential services \u2014 insurance risk assessment and pricing",
+        verbatim: '"AI systems intended to be used for risk assessment and pricing in relation to natural persons in the case of life and health insurance."',
+        keywords: [
+          { term: "life insurance", weight: W_HIGH },
+          { term: "health insurance", weight: W_HIGH },
+          { term: "insurance pricing", weight: W_HIGH },
+          { term: "underwriting", weight: W_HIGH },
+          { term: "insurance risk", weight: W_HIGH },
+          { term: "actuarial", weight: W_MED }
+        ]
+      },
+      {
+        id: "annex_iii_5_d_emergency_call_dispatch",
+        citation: "Annex III \xA75(d)",
+        title: "Essential services \u2014 emergency call triage and dispatch",
+        verbatim: '"AI systems intended to be used to evaluate and classify emergency calls by natural persons or to be used to dispatch, or to establish priority in the dispatching of, emergency first response services [...]."',
+        keywords: [
+          { term: "emergency dispatch", weight: W_HIGH },
+          { term: "emergency triage", weight: W_HIGH },
+          { term: "911 triage", weight: W_HIGH },
+          { term: "112 triage", weight: W_HIGH },
+          { term: "first responder dispatch", weight: W_HIGH },
+          { term: "ambulance dispatch", weight: W_MED }
+        ]
+      },
+      // §6 — Law enforcement
+      {
+        id: "annex_iii_6_law_enforcement",
+        citation: "Annex III \xA76",
+        title: "Law enforcement \u2014 risk assessment, polygraphs, profiling",
+        verbatim: '"AI systems intended to be used by or on behalf of law enforcement authorities [...] to assess the risk of a natural person becoming the victim of criminal offences [...] as polygraphs or similar tools [...] to evaluate the reliability of evidence [...] to assess the risk of [...] offending or re-offending [...] for profiling of natural persons [...]."',
+        keywords: [
+          { term: "predictive policing", weight: W_HIGH },
+          { term: "recidivism prediction", weight: W_HIGH },
+          { term: "reoffending risk", weight: W_HIGH },
+          { term: "law enforcement", weight: W_HIGH },
+          { term: "criminal profiling", weight: W_HIGH },
+          { term: "polygraph", weight: W_HIGH },
+          { term: "lie detector", weight: W_MED },
+          { term: "crime prediction", weight: W_MED },
+          { term: "parole decision", weight: W_MED },
+          { term: "evidence reliability", weight: W_LOW }
+        ]
+      },
+      // §7 — Migration, asylum, border control
+      {
+        id: "annex_iii_7_migration_border",
+        citation: "Annex III \xA77",
+        title: "Migration, asylum and border control",
+        verbatim: '"AI systems intended to be used by or on behalf of competent public authorities [...] as polygraphs or similar tools; to assess a risk, including a security risk, a risk of irregular migration, or a health risk [...]; to assist [...] for the examination of applications for asylum, visa or residence permits [...]; for the purpose of detecting, recognising or identifying natural persons [...]."',
+        keywords: [
+          { term: "asylum", weight: W_HIGH },
+          { term: "visa application", weight: W_HIGH },
+          { term: "residence permit", weight: W_HIGH },
+          { term: "border control", weight: W_HIGH },
+          { term: "migration risk", weight: W_HIGH },
+          { term: "immigration", weight: W_MED },
+          { term: "refugee processing", weight: W_MED }
+        ]
+      },
+      // §8 — Administration of justice and democratic processes
+      {
+        id: "annex_iii_8_a_administration_of_justice",
+        citation: "Annex III \xA78(a)",
+        title: "Administration of justice \u2014 assistance to judicial authorities",
+        verbatim: '"AI systems intended to be used by a judicial authority or on their behalf to assist a judicial authority in researching and interpreting facts and the law and in applying the law to a concrete set of facts [...]."',
+        keywords: [
+          { term: "judicial research", weight: W_HIGH },
+          { term: "legal research", weight: W_HIGH },
+          { term: "case law research", weight: W_HIGH },
+          { term: "judge assistant", weight: W_HIGH },
+          { term: "court decision support", weight: W_HIGH },
+          { term: "legal research assistant", weight: W_MED }
+        ]
+      },
+      {
+        id: "annex_iii_8_b_democratic_processes",
+        citation: "Annex III \xA78(b)",
+        title: "Democratic processes \u2014 influencing elections and voting",
+        verbatim: '"AI systems intended to be used for influencing the outcome of an election or referendum or the voting behaviour of natural persons [...]."',
+        keywords: [
+          { term: "election campaign", weight: W_HIGH },
+          { term: "voter targeting", weight: W_HIGH },
+          { term: "political microtargeting", weight: W_HIGH },
+          { term: "referendum campaign", weight: W_HIGH },
+          { term: "voter persuasion", weight: W_HIGH },
+          { term: "election outcome", weight: W_MED }
+        ]
+      }
+    ];
+    CLASSIFIER_ADVISORY = "This classification is a RULE-BASED keyword match, NOT a machine-learning model prediction, and NOT legal advice. The rule_based_confidence score reflects the sum of matched keyword weights, clamped to [0, 1]. Use this to narrow the deployer's review \u2014 the final Annex III classification determination must be made by a human reviewer against the full regulation text (Annex III of Regulation (EU) 2024/1689). An empty result means no category cleared the minimum threshold; it does NOT mean the agent is out of scope of the Act.";
+    ANNEX_III_REGULATION_VERSION = "EU AI Act Regulation (EU) 2024/1689, as of 2026-04-10";
+  }
+});
+function bytesToHex2(bytes) {
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+function canonicalJSON(value) {
+  return JSON.stringify(sortKeys(value));
+}
+function sortKeys(value) {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(sortKeys);
+  const sorted = {};
+  const obj = value;
+  for (const key of Object.keys(obj).sort()) {
+    sorted[key] = sortKeys(obj[key]);
+  }
+  return sorted;
+}
+async function computeAuditPeriodSummary(auditLog, periodStart, periodEnd) {
+  const { entries: rawEntries } = await auditLog.query({
+    since: periodStart,
+    limit: 1e6
+    // effectively unbounded for this period
+  });
+  const endTime = new Date(periodEnd).getTime();
+  const entries = rawEntries.filter(
+    (e) => new Date(e.timestamp).getTime() <= endTime
+  );
+  const byLayer = {
+    l1: 0,
+    l2: 0,
+    l3: 0,
+    l4: 0
+  };
+  const gate = {
+    allow: 0,
+    allow_proxy: 0,
+    deny: 0,
+    escalate: 0,
+    unclassified: 0
+  };
+  let injection = 0;
+  const operationSet = /* @__PURE__ */ new Set();
+  const identitySet = /* @__PURE__ */ new Set();
+  for (const entry of entries) {
+    byLayer[entry.layer]++;
+    operationSet.add(entry.operation);
+    identitySet.add(entry.identity_id);
+    if (entry.operation.startsWith("gate_allow_proxy:")) {
+      gate.allow_proxy++;
+    } else if (entry.operation.startsWith("gate_allow:")) {
+      gate.allow++;
+    } else if (entry.operation.startsWith("gate_deny:")) {
+      gate.deny++;
+    } else if (entry.operation.startsWith("gate_escalate:")) {
+      gate.escalate++;
+    } else if (entry.operation.startsWith("gate_unclassified:")) {
+      gate.unclassified++;
+    } else if (entry.operation.startsWith("injection_detected:")) {
+      injection++;
+    }
+  }
+  return {
+    period_start: periodStart,
+    period_end: periodEnd,
+    total_entries: entries.length,
+    entries_by_layer: byLayer,
+    gate_decisions: gate,
+    injection_detected: injection,
+    unique_operations: Array.from(operationSet).sort(),
+    unique_identities: Array.from(identitySet).sort()
+  };
+}
+function renderRowBlock(row) {
+  const citation = `${row.citation.instrument} ${row.citation.section}`;
+  return render(ROW_BLOCK_TEMPLATE, {
+    row_citation: citation,
+    row_title: row.citation.title,
+    row_coverage_badge: coverageBadge(row.coverage),
+    regulation_version: REGULATION_VERSION,
+    row_requirement: row.requirement,
+    row_evidence_emitted: row.evidence_emitted,
+    row_evidence_emitter_list: formatEmitterList(row.evidence_emitter),
+    row_manual_carveout: row.manual_carveout ?? "_(none \u2014 this row is fully auto-emitted)_"
+  });
+}
+function renderRowBlocks(rows) {
+  return rows.map(renderRowBlock).join("");
+}
+function rowsWithCitationPrefix(prefix) {
+  return COVERAGE_MATRIX_V1.rows.filter(
+    (r) => r.citation.clause_id.startsWith(prefix)
+  );
+}
+function rowsById(ids) {
+  const set = new Set(ids);
+  return COVERAGE_MATRIX_V1.rows.filter((r) => set.has(r.id));
+}
+function buildCommonContext(input, deps, signer, auditSummary, generatedAt) {
+  const dc = input.deployment_context;
+  const policy = deps.policy;
+  return {
+    // Header fields
+    document_title: "",
+    // overridden per document
+    document_subtitle: "",
+    // overridden per document
+    regulation_version: REGULATION_VERSION,
+    matrix_version: COVERAGE_MATRIX_V1.matrix_version,
+    generated_at: generatedAt,
+    period_start: input.period_start,
+    period_end: input.period_end,
+    agent_did: input.agent_did,
+    provider_legal_name: dc.provider_legal_name ?? "",
+    provider_contact: dc.provider_contact ?? "",
+    intended_purpose: dc.intended_purpose ?? "",
+    annex_iii_class: dc.annex_iii_class ?? "",
+    signer_did: signer.did,
+    signer_pubkey: signer.public_key,
+    sanctuary_version: deps.config.version,
+    // Audit period stats
+    audit_total_entries: auditSummary.total_entries,
+    audit_l1_count: auditSummary.entries_by_layer.l1,
+    audit_l2_count: auditSummary.entries_by_layer.l2,
+    audit_l3_count: auditSummary.entries_by_layer.l3,
+    audit_l4_count: auditSummary.entries_by_layer.l4,
+    gate_allow_count: auditSummary.gate_decisions.allow,
+    gate_allow_proxy_count: auditSummary.gate_decisions.allow_proxy,
+    gate_deny_count: auditSummary.gate_decisions.deny,
+    gate_escalate_count: auditSummary.gate_decisions.escalate,
+    gate_unclassified_count: auditSummary.gate_decisions.unclassified,
+    injection_detected_count: auditSummary.injection_detected,
+    unique_identity_count: auditSummary.unique_identities.length,
+    unique_operation_count: auditSummary.unique_operations.length,
+    // Principal Policy fields
+    tier1_rule_count: policy.tier1_always_approve.length,
+    tier2_rule_count: Object.keys(policy.tier2_anomaly).length,
+    // count of tier2 keys as rule count
+    tier3_rule_count: policy.tier3_always_allow.length,
+    tier2_new_namespace_access: policy.tier2_anomaly.new_namespace_access,
+    tier2_new_counterparty: policy.tier2_anomaly.new_counterparty,
+    tier2_frequency_spike_multiplier: policy.tier2_anomaly.frequency_spike_multiplier,
+    tier2_first_session_policy: policy.tier2_anomaly.first_session_policy,
+    first_session_policy: policy.tier2_anomaly.first_session_policy,
+    approval_channel_type: policy.approval_channel.type,
+    approval_channel_timeout_seconds: policy.approval_channel.timeout_seconds,
+    baseline_tracker_state: "loaded",
+    // static — baseline is always loaded at startup
+    // Context gate placeholder (filled in by tool handler if available)
+    context_gate_policy_count: 0,
+    context_gate_enforcer_active: "unknown"
+  };
+}
+function makeSigner(signer, masterKey) {
+  const encryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  return {
+    signContent: (content) => {
+      const digest = hash(stringToBytes(content));
+      const sig = sign(digest, signer.encrypted_private_key, encryptionKey);
+      return toBase64url(sig);
+    },
+    sha256Hex: (content) => bytesToHex2(hash(stringToBytes(content)))
+  };
+}
+function finaliseDocument(template, context, filename, ds) {
+  const content = render(template, context);
+  const sha256Hex2 = ds.sha256Hex(content);
+  const signature = ds.signContent(content);
+  return {
+    filename,
+    content,
+    content_type: "text/markdown",
+    sha256: sha256Hex2,
+    signature
+  };
+}
+function renderAnnexIV(baseContext, ds) {
+  const sections = {};
+  for (let n = 1; n <= 9; n++) {
+    const sectionRows = rowsWithCitationPrefix(`annex-iv-${n}`);
+    sections[`sections_${n}`] = sectionRows.length > 0 ? renderRowBlocks(sectionRows) : "_(no rows in this section)_\n\n";
+  }
+  const context = {
+    ...baseContext,
+    ...sections,
+    document_title: "Annex IV Technical Documentation",
+    document_subtitle: "Prepared under Article 11 of Regulation (EU) 2024/1689"
+  };
+  return finaliseDocument(
+    ANNEX_IV_TECHNICAL_DOCUMENTATION_TEMPLATE,
+    context,
+    "01_annex_iv_technical_documentation.md",
+    ds
+  );
+}
+function renderArticle26(baseContext, ds) {
+  const rows = rowsWithCitationPrefix("art-26");
+  const context = {
+    ...baseContext,
+    rows_rendered: renderRowBlocks(rows),
+    document_title: "Article 26 Deployer Log",
+    document_subtitle: "Deployer obligations under Article 26 of Regulation (EU) 2024/1689"
+  };
+  return finaliseDocument(
+    ARTICLE_26_DEPLOYER_LOG_TEMPLATE,
+    context,
+    "02_article_26_deployer_log.md",
+    ds
+  );
+}
+function renderArticle12(baseContext, ds) {
+  const rows = [
+    ...rowsWithCitationPrefix("art-12"),
+    ...rowsWithCitationPrefix("art-19")
+  ];
+  const context = {
+    ...baseContext,
+    rows_rendered: renderRowBlocks(rows),
+    document_title: "Article 12 Automatic Record-Keeping",
+    document_subtitle: "Automatic logging and retention under Articles 12 and 19(1) of Regulation (EU) 2024/1689"
+  };
+  return finaliseDocument(
+    ARTICLE_12_AUTOMATIC_LOGS_TEMPLATE,
+    context,
+    "03_article_12_automatic_logs.md",
+    ds
+  );
+}
+function renderRiskManagement(baseContext, ds) {
+  const rows = rowsById([
+    "annex_iv_5_risk_management",
+    "annex_iv_2_h_cybersecurity",
+    "annex_iv_2_b_design_specifications",
+    "art_15_cybersecurity_appropriate",
+    "art_15_resilience_alteration",
+    "art_15_resilience_poisoning"
+  ]);
+  const context = {
+    ...baseContext,
+    rows_rendered: renderRowBlocks(rows),
+    document_title: "Risk Management Summary",
+    document_subtitle: "Risk management posture under Article 9 of Regulation (EU) 2024/1689"
+  };
+  return finaliseDocument(
+    RISK_MANAGEMENT_SUMMARY_TEMPLATE,
+    context,
+    "04_risk_management_summary.md",
+    ds
+  );
+}
+function formatClassificationCandidates(result) {
+  if (result.candidates.length === 0) {
+    return "_No candidate category cleared the minimum rule-based confidence threshold. This does **not** mean the agent is out of scope of the EU AI Act \u2014 the deployer must still review Annex III in full._";
+  }
+  return result.candidates.map((c, i) => {
+    const confPct = (c.rule_based_confidence * 100).toFixed(0);
+    const kwList = c.matched_keywords.length === 0 ? "_(none)_" : c.matched_keywords.map((k) => `\`${k}\``).join(", ");
+    return [
+      `#### Candidate ${i + 1}: ${c.citation} \u2014 ${c.title}`,
+      "",
+      `- **Category ID:** \`${c.category_id}\``,
+      `- **rule_based_confidence:** ${c.rule_based_confidence.toFixed(2)} (${confPct}%)`,
+      `- **Matched keywords:** ${kwList}`,
+      ""
+    ].join("\n");
+  }).join("\n");
+}
+function renderAnnexIIIClassification(baseContext, intendedPurpose, ds) {
+  const classification = intendedPurpose ? classifyAgentDescription(intendedPurpose) : null;
+  const context = {
+    ...baseContext,
+    classified_intended_purpose: intendedPurpose || "_(no intended purpose supplied in deployment_context; the classifier was not run)_",
+    candidates_rendered: classification ? formatClassificationCandidates(classification) : "_(classifier not run \u2014 no intended purpose supplied)_",
+    classifier_advisory: classification ? classification.advisory : "The classifier was not invoked because the deployment_context.intended_purpose field was empty. The enterprise must perform manual Annex III review.",
+    document_title: "Annex III Classification Candidates",
+    document_subtitle: "Rule-based candidate classifications for Annex III of Regulation (EU) 2024/1689"
+  };
+  return finaliseDocument(
+    ANNEX_III_CLASSIFICATION_TEMPLATE,
+    context,
+    "07_annex_iii_classification.md",
+    ds
+  );
+}
+function renderHumanOversight(baseContext, ds) {
+  const rows = [
+    ...rowsWithCitationPrefix("art-14"),
+    ...rowsById(["annex_iv_2_e_human_oversight_assessment"])
+  ];
+  const context = {
+    ...baseContext,
+    rows_rendered: renderRowBlocks(rows),
+    document_title: "Human Oversight Statement",
+    document_subtitle: "Human oversight measures under Article 14 of Regulation (EU) 2024/1689"
+  };
+  return finaliseDocument(
+    HUMAN_OVERSIGHT_STATEMENT_TEMPLATE,
+    context,
+    "05_human_oversight_statement.md",
+    ds
+  );
+}
+function renderAttestations(baseContext, priorFiles, manifestSha256, manifestSignature, ds) {
+  const table = [
+    "| Filename | SHA-256 | Signature (base64url) |",
+    "|---|---|---|",
+    ...priorFiles.map(
+      (f) => `| \`${f.filename}\` | \`${f.sha256}\` | \`${f.signature ?? ""}\` |`
+    )
+  ].join("\n");
+  const context = {
+    ...baseContext,
+    file_attestation_table: table,
+    manifest_sha256: manifestSha256,
+    manifest_signature: manifestSignature,
+    document_title: "Cryptographic Attestations",
+    document_subtitle: "Bundle integrity attestations signed by the provider's primary Ed25519 identity"
+  };
+  return finaliseDocument(
+    CRYPTOGRAPHIC_ATTESTATIONS_TEMPLATE,
+    context,
+    "06_cryptographic_attestations.md",
+    ds
+  );
+}
+function buildManifest(input, generatedAt, signer, files, ds) {
+  const stats = coverageStats(COVERAGE_MATRIX_V1);
+  const rowSummaries = COVERAGE_MATRIX_V1.rows.map(
+    (r) => ({
+      id: r.id,
+      clause_id: r.citation.clause_id,
+      coverage: r.coverage,
+      evidence_emitter: [...r.evidence_emitter]
+    })
+  );
+  const manifestBody = {
+    bundle_version: "1.0",
+    matrix_version: "v1",
+    regulation_version: REGULATION_VERSION,
+    generated_at: generatedAt,
+    agent_did: input.agent_did,
+    period_start: input.period_start,
+    period_end: input.period_end,
+    deployment_context: input.deployment_context,
+    signer: {
+      did: signer.did,
+      public_key_base64url: signer.public_key
+    },
+    files: files.map((f) => ({
+      filename: f.filename,
+      content_type: f.content_type,
+      sha256: f.sha256,
+      signature: f.signature ?? ""
+    })),
+    coverage_summary: {
+      total_rows: stats.total_rows,
+      full: stats.full,
+      partial: stats.partial,
+      manual_only: stats.manual_only,
+      full_pct: stats.full_pct,
+      partial_pct: stats.partial_pct,
+      manual_only_pct: stats.manual_only_pct
+    },
+    coverage_rows: rowSummaries,
+    disclaimer: NOT_LEGAL_ADVICE_DISCLAIMER
+  };
+  const canonical = canonicalJSON(manifestBody);
+  const manifestSignature = ds.signContent(canonical);
+  return {
+    ...manifestBody,
+    manifest_signature: manifestSignature
+  };
+}
+async function loadPriorBundleManifest(bundlePath, warnings) {
+  try {
+    const manifestPath = join(bundlePath, "00_bundle_manifest.json");
+    const bytes = await readFile(manifestPath, "utf-8");
+    const parsed = JSON.parse(bytes);
+    if (typeof parsed.bundle_version !== "string" || typeof parsed.regulation_version !== "string" || !Array.isArray(parsed.coverage_rows)) {
+      warnings.push(
+        `Prior bundle at ${bundlePath} is missing required manifest fields; delta skipped.`
+      );
+      return null;
+    }
+    return parsed;
+  } catch (e) {
+    warnings.push(
+      `Prior bundle at ${bundlePath} could not be read: ${e.message}. Delta skipped.`
+    );
+    return null;
+  }
+}
+function computeDelta(prior, current, priorBundlePath, warnings) {
+  const priorRows = new Map(prior.coverage_rows.map((r) => [r.id, r]));
+  const currentRows = new Map(current.coverage_rows.map((r) => [r.id, r]));
+  const rows_added = [];
+  const rows_removed = [];
+  const rows_changed = [];
+  for (const [id] of currentRows) {
+    if (!priorRows.has(id)) {
+      rows_added.push(id);
+    }
+  }
+  for (const [id] of priorRows) {
+    if (!currentRows.has(id)) {
+      rows_removed.push(id);
+    }
+  }
+  for (const [id, currentRow] of currentRows) {
+    const priorRow = priorRows.get(id);
+    if (!priorRow) continue;
+    const changes = {};
+    if (priorRow.coverage !== currentRow.coverage) {
+      changes.coverage = {
+        from: priorRow.coverage,
+        to: currentRow.coverage
+      };
+    }
+    const priorEmitters = [...priorRow.evidence_emitter || []].sort();
+    const currentEmitters = [...currentRow.evidence_emitter || []].sort();
+    if (JSON.stringify(priorEmitters) !== JSON.stringify(currentEmitters)) {
+      changes.evidence_emitter = {
+        from: priorRow.evidence_emitter || [],
+        to: currentRow.evidence_emitter || []
+      };
+    }
+    if (Object.keys(changes).length > 0) {
+      rows_changed.push({
+        row_id: id,
+        clause_id: currentRow.clause_id,
+        changes
+      });
+    }
+  }
+  rows_added.sort();
+  rows_removed.sort();
+  rows_changed.sort((a, b) => a.row_id.localeCompare(b.row_id));
+  return {
+    prior_bundle_path: priorBundlePath,
+    prior_generated_at: prior.generated_at,
+    prior_signer_did: prior.signer.did,
+    prior_regulation_version: prior.regulation_version,
+    prior_matrix_version: prior.matrix_version,
+    current_generated_at: current.generated_at,
+    current_signer_did: current.signer.did,
+    current_regulation_version: current.regulation_version,
+    current_matrix_version: current.matrix_version,
+    regulation_version_changed: prior.regulation_version !== current.regulation_version,
+    matrix_version_changed: prior.matrix_version !== current.matrix_version,
+    rows_added,
+    rows_removed,
+    rows_changed,
+    warnings
+  };
+}
+function formatDeltaSections(report) {
+  const added = report.rows_added.length === 0 ? "_(none)_" : report.rows_added.map((id) => `- \`${id}\``).join("\n");
+  const removed = report.rows_removed.length === 0 ? "_(none)_" : report.rows_removed.map((id) => `- \`${id}\``).join("\n");
+  const changed = report.rows_changed.length === 0 ? "_(none)_" : report.rows_changed.map((rc) => {
+    const lines = [
+      `#### \`${rc.row_id}\` (${rc.clause_id})`,
+      ""
+    ];
+    if (rc.changes.coverage) {
+      lines.push(
+        `- **coverage:** \`${rc.changes.coverage.from}\` \u2192 \`${rc.changes.coverage.to}\``
+      );
+    }
+    if (rc.changes.evidence_emitter) {
+      lines.push(
+        `- **evidence_emitter from:** [${rc.changes.evidence_emitter.from.map((e) => `\`${e}\``).join(", ")}]`
+      );
+      lines.push(
+        `- **evidence_emitter to:** [${rc.changes.evidence_emitter.to.map((e) => `\`${e}\``).join(", ")}]`
+      );
+    }
+    if (rc.changes.last_reviewed_date) {
+      lines.push(
+        `- **last_reviewed_date:** ${rc.changes.last_reviewed_date.from} \u2192 ${rc.changes.last_reviewed_date.to}`
+      );
+    }
+    lines.push("");
+    return lines.join("\n");
+  }).join("\n");
+  const warningsList = report.warnings.length === 0 ? "_(none)_" : report.warnings.map((w) => `- ${w}`).join("\n");
+  const hasAnyChanges = report.regulation_version_changed || report.matrix_version_changed || report.rows_added.length > 0 || report.rows_removed.length > 0 || report.rows_changed.length > 0;
+  const noChangesNote = hasAnyChanges ? "" : "**No changes detected between prior and current bundle.** Both bundles reference the same regulation_version, the same matrix_version, and the same row set with identical coverage flags and evidence_emitter arrays. The only differences are the generation timestamps and the audit period activity captured in documents 02-05.\n\n";
+  return {
+    rows_added_rendered: added,
+    rows_removed_rendered: removed,
+    rows_changed_rendered: changed,
+    warnings_rendered: warningsList,
+    no_changes_note: noChangesNote
+  };
+}
+function renderDelta(baseContext, report, ds) {
+  const sections = formatDeltaSections(report);
+  const context = {
+    ...baseContext,
+    prior_bundle_path: report.prior_bundle_path,
+    prior_generated_at: report.prior_generated_at,
+    prior_signer_did: report.prior_signer_did,
+    prior_regulation_version: report.prior_regulation_version,
+    prior_matrix_version: report.prior_matrix_version,
+    current_generated_at: report.current_generated_at,
+    current_signer_did: report.current_signer_did,
+    current_regulation_version: report.current_regulation_version,
+    current_matrix_version: report.current_matrix_version,
+    regulation_version_changed: report.regulation_version_changed ? "yes" : "no",
+    matrix_version_changed: report.matrix_version_changed ? "yes" : "no",
+    rows_added_count: report.rows_added.length,
+    rows_removed_count: report.rows_removed.length,
+    rows_changed_count: report.rows_changed.length,
+    ...sections,
+    document_title: "Compliance Bundle Delta Report",
+    document_subtitle: "Changes between the prior bundle and this bundle"
+  };
+  return finaliseDocument(
+    DELTA_TEMPLATE,
+    context,
+    "08_delta.md",
+    ds
+  );
+}
+async function publishBundleManifestToVerascore(manifest, signer, encryptionKey, verascoreUrl, ds) {
+  const result = {
+    attempted: true,
+    published: false,
+    verascore_url: verascoreUrl
+  };
+  let parsed;
+  try {
+    parsed = new URL(verascoreUrl);
+  } catch {
+    result.error = `Verascore URL is not a valid URL: ${verascoreUrl}`;
+    return result;
+  }
+  if (parsed.protocol !== "https:") {
+    result.error = `Verascore URL must use HTTPS (got ${parsed.protocol})`;
+    return result;
+  }
+  if (!ALLOWED_VERASCORE_HOSTS.has(parsed.hostname)) {
+    result.error = `Verascore URL must point to a known Verascore host (${[...ALLOWED_VERASCORE_HOSTS].join(", ")}). Got: ${parsed.hostname}`;
+    return result;
+  }
+  const canonicalManifest = canonicalJSON(manifest);
+  const manifestBytes = stringToBytes(canonicalManifest);
+  const manifestSha256 = ds.sha256Hex(canonicalManifest);
+  result.published_manifest_sha256 = manifestSha256;
+  let requestSignatureB64;
+  try {
+    const sigBytes = sign(
+      manifestBytes,
+      signer.encrypted_private_key,
+      encryptionKey
+    );
+    requestSignatureB64 = toBase64url(sigBytes);
+  } catch (e) {
+    result.error = `Failed to sign Verascore publish payload: ${e.message}`;
+    return result;
+  }
+  const agentId = manifest.agent_did.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase();
+  result.verascore_agent_id = agentId;
+  const requestBody = {
+    agentId,
+    signature: requestSignatureB64,
+    publicKey: signer.public_key,
+    type: "eu-ai-act-bundle",
+    data: manifest
+  };
+  try {
+    const response = await fetch(`${verascoreUrl}/api/publish`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody)
+    });
+    result.status = response.status;
+    if (!response.ok) {
+      result.error = `Verascore API returned ${response.status}`;
+      return result;
+    }
+    result.published = true;
+    return result;
+  } catch (e) {
+    result.error = `Verascore fetch failed: ${e.message}`;
+    return result;
+  }
+}
+async function generateEuAiActBundle(input, deps) {
+  const signer = deps.identityManager.getDefault();
+  if (!signer) {
+    throw new Error(
+      "No primary identity configured. Run identity_create and identity_set_primary before generating a compliance bundle."
+    );
+  }
+  const ds = makeSigner(signer, deps.masterKey);
+  const auditSummary = await computeAuditPeriodSummary(
+    deps.auditLog,
+    input.period_start,
+    input.period_end
+  );
+  const generatedAt = input.generated_at_override ?? (/* @__PURE__ */ new Date()).toISOString();
+  const baseContext = buildCommonContext(
+    input,
+    deps,
+    signer,
+    auditSummary,
+    generatedAt
+  );
+  const doc1 = renderAnnexIV(baseContext, ds);
+  const doc2 = renderArticle26(baseContext, ds);
+  const doc3 = renderArticle12(baseContext, ds);
+  const doc4 = renderRiskManagement(baseContext, ds);
+  const doc5 = renderHumanOversight(baseContext, ds);
+  const doc7 = renderAnnexIIIClassification(
+    baseContext,
+    input.deployment_context.intended_purpose ?? "",
+    ds
+  );
+  const partialManifest = buildManifest(
+    input,
+    generatedAt,
+    signer,
+    [doc1, doc2, doc3, doc4, doc5],
+    ds
+  );
+  const partialCanonical = canonicalJSON(partialManifest);
+  const partialSha256 = ds.sha256Hex(partialCanonical);
+  const partialSignature = partialManifest.manifest_signature;
+  const doc6 = renderAttestations(
+    baseContext,
+    [doc1, doc2, doc3, doc4, doc5],
+    partialSha256,
+    partialSignature,
+    ds
+  );
+  let allFiles = [doc1, doc2, doc3, doc4, doc5, doc6, doc7];
+  if (input.delta_from_bundle_path) {
+    const deltaWarnings = [];
+    const priorManifest = await loadPriorBundleManifest(
+      input.delta_from_bundle_path,
+      deltaWarnings
+    );
+    if (priorManifest !== null) {
+      const currentManifestSnapshot = buildManifest(
+        input,
+        generatedAt,
+        signer,
+        allFiles,
+        ds
+      );
+      const report = computeDelta(
+        priorManifest,
+        currentManifestSnapshot,
+        input.delta_from_bundle_path,
+        deltaWarnings
+      );
+      const doc8 = renderDelta(baseContext, report, ds);
+      allFiles = [...allFiles, doc8];
+    }
+  }
+  const finalManifest = buildManifest(
+    input,
+    generatedAt,
+    signer,
+    allFiles,
+    ds
+  );
+  let publishResult = void 0;
+  if (input.publish_to_verascore) {
+    const encryptionKey = derivePurposeKey(
+      deps.masterKey,
+      "identity-encryption"
+    );
+    publishResult = await publishBundleManifestToVerascore(
+      finalManifest,
+      signer,
+      encryptionKey,
+      input.verascore_url ?? "https://verascore.ai",
+      ds
+    );
+  }
+  return {
+    manifest: finalManifest,
+    files: allFiles,
+    publish_result: publishResult
+  };
+}
+function createComplianceTools(deps) {
+  const tools = [
+    {
+      name: "compliance_eu_ai_act_annex_iii_classify",
+      description: "Classify a free-text agent description against the eight Annex III high-risk categories of Regulation (EU) 2024/1689. Returns zero or more candidate categories with a rule_based_confidence score (sum of matched keyword weights clamped to [0, 1]). This is a RULE-BASED classifier \u2014 NOT a machine-learning model, and NOT legal advice. Use the result to narrow the deployer's review. Tier 3 (read-only, auto-allow).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          description: {
+            type: "string",
+            description: "Free-text description of what the agent does \u2014 its intended purpose, the users it serves, the decisions it makes, the data it processes."
+          }
+        },
+        required: ["description"]
+      },
+      handler: async (args) => {
+        const description = String(args.description ?? "");
+        if (description.trim().length === 0) {
+          return toolResult({
+            error: "description must be a non-empty string describing the agent's intended purpose"
+          });
+        }
+        const result = classifyAgentDescription(description);
+        return toolResult(result);
+      }
+    },
+    {
+      name: "compliance_generate_eu_ai_act_bundle",
+      description: "Generate an EU AI Act compliance bundle for a given agent and reporting period. Produces 6 Markdown documents plus a signed JSON manifest, covering Annex IV technical documentation (Art. 11), Art. 12 automatic record-keeping, Art. 13 transparency, Art. 14 human oversight, Art. 15 cybersecurity, and Art. 26 deployer obligations. Every file is individually SHA-256 hashed and signed with the provider's primary Ed25519 identity. NOT LEGAL ADVICE \u2014 consult qualified counsel before filing.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          agent_did: {
+            type: "string",
+            description: "DID of the agent the bundle is being generated for."
+          },
+          deployment_context: {
+            type: "object",
+            description: "Enterprise-supplied deployment facts that Sanctuary cannot infer (vertical, intended purpose, provider legal name, Annex III classification, etc.).",
+            properties: {
+              vertical: { type: "string" },
+              annex_iii_class: { type: "string" },
+              intended_purpose: { type: "string" },
+              provider_legal_name: { type: "string" },
+              provider_contact: { type: "string" },
+              deployer_is_public_authority: { type: "boolean" },
+              notes: { type: "string" }
+            }
+          },
+          period_start: {
+            type: "string",
+            description: "ISO 8601 timestamp \u2014 start of the reporting period."
+          },
+          period_end: {
+            type: "string",
+            description: "ISO 8601 timestamp \u2014 end of the reporting period."
+          },
+          delta_from_bundle_path: {
+            type: "string",
+            description: "Optional filesystem path to a prior bundle directory. When supplied, the generator compares the current bundle to the prior one and emits an additional 08_delta.md document summarising what changed (regulation_version, matrix_version, coverage rows added/removed/changed). Delta problems never fail bundle generation; the bundle always lands locally."
+          },
+          publish_to_verascore: {
+            type: "boolean",
+            description: "If true, POST the signed bundle MANIFEST (not the document bodies) to Verascore after the bundle is generated. Non-dependency principle: publish failure never fails bundle generation \u2014 the bundle is returned with a publish_result field describing the outcome. Defaults to false."
+          },
+          verascore_url: {
+            type: "string",
+            description: "Optional Verascore base URL (HTTPS, allow-listed hosts only). Defaults to https://verascore.ai."
+          }
+        },
+        required: [
+          "agent_did",
+          "deployment_context",
+          "period_start",
+          "period_end"
+        ]
+      },
+      handler: async (args) => {
+        const input = {
+          agent_did: String(args.agent_did),
+          deployment_context: args.deployment_context ?? {},
+          period_start: String(args.period_start),
+          period_end: String(args.period_end),
+          delta_from_bundle_path: typeof args.delta_from_bundle_path === "string" ? args.delta_from_bundle_path : void 0,
+          publish_to_verascore: args.publish_to_verascore === true,
+          verascore_url: typeof args.verascore_url === "string" ? args.verascore_url : void 0
+        };
+        const bundle = await generateEuAiActBundle(input, deps);
+        return toolResult({
+          bundle_version: bundle.manifest.bundle_version,
+          matrix_version: bundle.manifest.matrix_version,
+          regulation_version: bundle.manifest.regulation_version,
+          agent_did: bundle.manifest.agent_did,
+          generated_at: bundle.manifest.generated_at,
+          period: {
+            start: bundle.manifest.period_start,
+            end: bundle.manifest.period_end
+          },
+          signer: bundle.manifest.signer,
+          coverage_summary: bundle.manifest.coverage_summary,
+          file_count: bundle.files.length,
+          files: bundle.files.map((f) => ({
+            filename: f.filename,
+            content_type: f.content_type,
+            sha256: f.sha256,
+            signature: f.signature,
+            content_length: f.content.length
+          })),
+          manifest_signature: bundle.manifest.manifest_signature,
+          disclaimer: bundle.manifest.disclaimer,
+          publish_result: bundle.publish_result,
+          _bundle_content: {
+            manifest: bundle.manifest,
+            files: bundle.files.map((f) => ({
+              filename: f.filename,
+              content: f.content
+            }))
+          }
+        });
+      }
+    }
+  ];
+  return { tools };
+}
+var NOT_LEGAL_ADVICE_DISCLAIMER, ALLOWED_VERASCORE_HOSTS;
+var init_generator2 = __esm({
+  "src/compliance/eu_ai_act/generator.ts"() {
+    init_identity();
+    init_key_derivation();
+    init_hashing();
+    init_encoding();
+    init_router();
+    init_coverage_matrix();
+    init_templates();
+    init_annex_iii();
+    NOT_LEGAL_ADVICE_DISCLAIMER = "This bundle is a technical compliance artifact generated by the Sanctuary Framework EU AI Act Compliance Artifact Generator. It is NOT legal advice and does not constitute a legal interpretation of Regulation (EU) 2024/1689. Consult qualified legal counsel before filing or relying on this bundle for regulatory submissions.";
+    ALLOWED_VERASCORE_HOSTS = /* @__PURE__ */ new Set([
+      "verascore.ai",
+      "www.verascore.ai",
+      "api.verascore.ai"
+    ]);
+  }
+});
+
+// src/l2-operational/model-provenance.ts
+var init_model_provenance = __esm({
+  "src/l2-operational/model-provenance.ts"() {
+  }
+});
+
+// src/storage/memory.ts
+var init_memory = __esm({
+  "src/storage/memory.ts"() {
+  }
+});
 async function createSanctuaryServer(options) {
   const config = await loadConfig(options?.configPath);
   await mkdir(config.storage_path, { recursive: true, mode: 448 });
@@ -18713,6 +21567,18 @@ async function createSanctuaryServer(options) {
     policy,
     keyProtection
   });
+  const { tools: memoryAttestTools } = createMemoryAttestTools(
+    identityManager,
+    masterKey,
+    auditLog
+  );
+  const { tools: complianceTools } = createComplianceTools({
+    config,
+    identityManager,
+    masterKey,
+    auditLog,
+    policy
+  });
   const dashboardTools = [];
   if (dashboard) {
     dashboardTools.push({
@@ -18756,6 +21622,8 @@ async function createSanctuaryServer(options) {
     ...profileTools,
     ...dashboardTools,
     ...sanctuaryMetaTools,
+    ...memoryAttestTools,
+    ...complianceTools,
     manifestTool
   ];
   let clientManager;
@@ -18859,8 +21727,2942 @@ async function createSanctuaryServer(options) {
 \u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D`
     );
   }
-  return { server, config };
+  return {
+    server,
+    config,
+    identityManager,
+    masterKey,
+    auditLog,
+    policy
+  };
 }
+var init_src = __esm({
+  "src/index.ts"() {
+    init_config();
+    init_filesystem();
+    init_state_store();
+    init_tools();
+    init_audit_log();
+    init_tools2();
+    init_tools3();
+    init_loader();
+    init_baseline();
+    init_approval_channel();
+    init_dashboard();
+    init_webhook();
+    init_gate();
+    init_tools4();
+    init_router();
+    init_router();
+    init_tools5();
+    init_tools6();
+    init_tools7();
+    init_tools8();
+    init_tools9();
+    init_siem_tools();
+    init_context_gate_tools();
+    init_hardening_tools();
+    init_sovereignty_profile();
+    init_sovereignty_profile_tools();
+    init_injection_detector();
+    init_client_manager();
+    init_proxy_router();
+    init_call_governor();
+    init_governor_tools();
+    init_sanctuary_tools();
+    init_memory_attest();
+    init_generator2();
+    init_key_derivation();
+    init_random();
+    init_encoding();
+    init_config();
+    init_state_store();
+    init_audit_log();
+    init_commitments();
+    init_zk_proofs();
+    init_policies();
+    init_reputation_store();
+    init_tiers();
+    init_registry();
+    init_context_gate();
+    init_context_gate_templates();
+    init_context_gate_recommend();
+    init_model_provenance();
+    init_context_gate();
+    init_injection_detector();
+    init_context_gate_enforcer();
+    init_sovereignty_profile();
+    init_client_manager();
+    init_proxy_router();
+    init_system_prompt_generator();
+    init_memory();
+    init_filesystem();
+    init_gate();
+    init_baseline();
+    init_loader();
+    init_approval_channel();
+    init_dashboard();
+    init_webhook();
+    init_generator();
+    init_verifier();
+    init_protocol();
+    init_attestation();
+    init_bridge();
+  }
+});
+async function backupConfig(configPath) {
+  await mkdir(BACKUP_DIR, { recursive: true, mode: 448 });
+  const timestamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+  const backupPath = join(BACKUP_DIR, `config-backup-${timestamp}.json`);
+  await copyFile(configPath, backupPath);
+  return backupPath;
+}
+async function restoreConfig(backupPath, targetPath) {
+  await copyFile(backupPath, targetPath);
+}
+async function findLatestBackup() {
+  const metaPath = join(BACKUP_DIR, "cocoon-meta.json");
+  try {
+    const raw = await readFile(metaPath, "utf-8");
+    const meta = JSON.parse(raw);
+    return {
+      backupPath: meta.backupPath,
+      originalPath: meta.originalPath
+    };
+  } catch {
+    return null;
+  }
+}
+async function saveCocoonMeta(meta) {
+  await mkdir(BACKUP_DIR, { recursive: true, mode: 448 });
+  const metaPath = join(BACKUP_DIR, "cocoon-meta.json");
+  await writeFile(metaPath, JSON.stringify(meta, null, 2), { mode: 384 });
+}
+async function detectAgentConfigWithDiagnostics(platform4, configPath) {
+  const pathsChecked = [];
+  const errors = [];
+  if (configPath) {
+    pathsChecked.push(configPath);
+    const { config, error } = await readConfigFileWithError(configPath, platform4 ?? "generic");
+    if (error) errors.push({ path: configPath, error });
+    return { config, pathsChecked, errors };
+  }
+  if (platform4) {
+    const paths = PLATFORM_PATHS[platform4];
+    for (const path of paths) {
+      pathsChecked.push(path);
+      const { config, error } = await readConfigFileWithError(path, platform4);
+      if (error) errors.push({ path, error });
+      if (config) return { config, pathsChecked, errors };
+    }
+    return { config: null, pathsChecked, errors };
+  }
+  for (const [plat, paths] of Object.entries(PLATFORM_PATHS)) {
+    for (const path of paths) {
+      pathsChecked.push(path);
+      const { config, error } = await readConfigFileWithError(path, plat);
+      if (error) errors.push({ path, error });
+      if (config) return { config, pathsChecked, errors };
+    }
+  }
+  return { config: null, pathsChecked, errors };
+}
+async function readConfigFileWithError(path, platform4) {
+  try {
+    await access(path);
+  } catch {
+    return { config: null };
+  }
+  let raw;
+  try {
+    raw = await readFile(path, "utf-8");
+  } catch (err) {
+    return { config: null, error: `Cannot read file: ${err.message}` };
+  }
+  let config;
+  try {
+    config = JSON.parse(raw);
+  } catch (err) {
+    return { config: null, error: `Invalid JSON: ${err.message}` };
+  }
+  const servers = extractServers(config, platform4);
+  return { config: { platform: platform4, configPath: path, servers, rawConfig: config } };
+}
+function extractServers(config, platform4) {
+  if (!config || typeof config !== "object") return [];
+  const servers = [];
+  const obj = config;
+  if (platform4 === "openclaw" || platform4 === "generic") {
+    const mcp = obj.mcp;
+    const nestedServers = mcp?.servers;
+    if (nestedServers && typeof nestedServers === "object") {
+      for (const [name, serverConfig] of Object.entries(nestedServers)) {
+        const entry = parseServerEntry(name, serverConfig);
+        if (entry) servers.push(entry);
+      }
+    }
+    if (servers.length === 0) {
+      const mcpServers = obj.mcpServers;
+      if (mcpServers && typeof mcpServers === "object") {
+        for (const [name, serverConfig] of Object.entries(mcpServers)) {
+          const entry = parseServerEntry(name, serverConfig);
+          if (entry) servers.push(entry);
+        }
+      }
+    }
+  }
+  if (platform4 === "claude-code") {
+    const mcpServers = obj.mcpServers;
+    if (mcpServers && typeof mcpServers === "object") {
+      for (const [name, serverConfig] of Object.entries(mcpServers)) {
+        if (name.toLowerCase().includes("sanctuary")) continue;
+        const entry = parseServerEntry(name, serverConfig);
+        if (entry) servers.push(entry);
+      }
+    }
+  }
+  if (platform4 === "cursor") {
+    const mcpServers = obj.mcpServers;
+    if (mcpServers && typeof mcpServers === "object") {
+      for (const [name, serverConfig] of Object.entries(mcpServers)) {
+        if (name.toLowerCase().includes("sanctuary")) continue;
+        const entry = parseServerEntry(name, serverConfig);
+        if (entry) servers.push(entry);
+      }
+    }
+  }
+  return servers;
+}
+function parseServerEntry(name, config) {
+  if (!config || typeof config !== "object") return null;
+  const c = config;
+  const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "-").substring(0, 128);
+  if (!safeName) return null;
+  if (c.url && typeof c.url === "string") {
+    return {
+      name: safeName,
+      transport: "sse",
+      url: c.url,
+      env: extractEnv(c.env)
+    };
+  }
+  if (c.command && typeof c.command === "string") {
+    return {
+      name: safeName,
+      transport: "stdio",
+      command: c.command,
+      args: Array.isArray(c.args) ? c.args.filter((a) => typeof a === "string") : void 0,
+      env: extractEnv(c.env)
+    };
+  }
+  return null;
+}
+function extractEnv(env) {
+  if (!env || typeof env !== "object") return void 0;
+  const result = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v === "string") result[k] = v;
+  }
+  return Object.keys(result).length > 0 ? result : void 0;
+}
+async function rewriteConfigForCocoon(agentConfig, sanctuaryCommand, sanctuaryArgs, sanctuaryEnv) {
+  const raw = agentConfig.rawConfig;
+  let existingServers = {};
+  if (agentConfig.platform === "openclaw") {
+    const existingMcp = raw.mcp ?? {};
+    existingServers = existingMcp.servers ?? {};
+  } else {
+    existingServers = raw.mcpServers ?? {};
+  }
+  let resolvedEnv = sanctuaryEnv;
+  if (!resolvedEnv) {
+    const existingSanctuary = existingServers.sanctuary;
+    if (existingSanctuary?.env && typeof existingSanctuary.env === "object") {
+      const extracted = extractEnv(existingSanctuary.env);
+      if (extracted) resolvedEnv = extracted;
+    }
+  }
+  const sanctuaryEntry = {
+    command: sanctuaryCommand,
+    args: sanctuaryArgs
+  };
+  if (resolvedEnv && Object.keys(resolvedEnv).length > 0) {
+    sanctuaryEntry.env = resolvedEnv;
+  }
+  let rewritten;
+  if (agentConfig.platform === "openclaw") {
+    const existingMcp = raw.mcp ?? {};
+    rewritten = {
+      ...raw,
+      mcp: {
+        ...existingMcp,
+        servers: {
+          ...existingServers,
+          sanctuary: sanctuaryEntry
+        }
+      }
+    };
+    delete rewritten.mcpServers;
+  } else {
+    rewritten = {
+      ...raw,
+      mcpServers: {
+        ...existingServers,
+        sanctuary: sanctuaryEntry
+      }
+    };
+  }
+  await writeFile(agentConfig.configPath, JSON.stringify(rewritten, null, 2), { mode: 384 });
+  return agentConfig.configPath;
+}
+var PLATFORM_PATHS, BACKUP_DIR;
+var init_config_reader = __esm({
+  "src/cocoon/config-reader.ts"() {
+    PLATFORM_PATHS = {
+      "openclaw": [
+        join(homedir(), ".openclaw", "openclaw.json"),
+        join(homedir(), ".openclaw", "config.json"),
+        join(homedir(), "Library", "Application Support", "OpenClaw", "openclaw.json"),
+        join(homedir(), "Library", "Application Support", "OpenClaw", "config.json")
+      ],
+      "claude-code": [
+        join(homedir(), ".claude", "settings.json"),
+        join(homedir(), ".config", "claude-code", "settings.json")
+      ],
+      "cursor": [
+        join(homedir(), ".cursor", "mcp.json")
+      ],
+      "generic": []
+    };
+    BACKUP_DIR = join(homedir(), ".sanctuary", "backup");
+  }
+});
+
+// src/cocoon/passphrase.ts
+var passphrase_exports = {};
+__export(passphrase_exports, {
+  fallbackFilePath: () => fallbackFilePath,
+  generatePassphrase: () => generatePassphrase,
+  getOrCreatePassphrase: () => getOrCreatePassphrase,
+  readStoredPassphrase: () => readStoredPassphrase
+});
+async function getOrCreatePassphrase(opts = {}) {
+  const home = opts.home ?? homedir();
+  const plat = opts.platformOverride ?? platform();
+  const exec2 = opts.exec ?? defaultExec;
+  if (plat === "darwin") {
+    const fromKc = await readFromKeychain(exec2);
+    if (fromKc) {
+      return { value: fromKc, source: "keychain", location: "macOS Keychain" };
+    }
+  }
+  const fallback = fallbackFilePath(home);
+  const fromFile = await readFromFallbackFile(fallback, home);
+  if (fromFile) {
+    return {
+      value: fromFile,
+      source: "fallback-file",
+      location: fallback
+    };
+  }
+  const value = generatePassphrase();
+  if (plat === "darwin") {
+    const ok = await writeToKeychain(value, exec2);
+    if (ok) {
+      return { value, source: "generated", location: "macOS Keychain" };
+    }
+  }
+  await writeToFallbackFile(fallback, value, home);
+  return { value, source: "generated", location: fallback };
+}
+async function readStoredPassphrase(opts = {}) {
+  const home = opts.home ?? homedir();
+  const plat = opts.platformOverride ?? platform();
+  const exec2 = opts.exec ?? defaultExec;
+  if (plat === "darwin") {
+    const fromKc = await readFromKeychain(exec2);
+    if (fromKc) {
+      return { value: fromKc, source: "keychain", location: "macOS Keychain" };
+    }
+  }
+  const fallback = fallbackFilePath(home);
+  const fromFile = await readFromFallbackFile(fallback, home);
+  if (fromFile) {
+    return {
+      value: fromFile,
+      source: "fallback-file",
+      location: fallback
+    };
+  }
+  return null;
+}
+function generatePassphrase() {
+  return randomBytes$1(32).toString("base64");
+}
+async function readFromKeychain(exec2) {
+  try {
+    const result = await exec2(
+      "security",
+      ["find-generic-password", "-a", KEYCHAIN_ACCOUNT, "-s", KEYCHAIN_SERVICE, "-w"]
+    );
+    if (result.code !== 0) return null;
+    const value = result.stdout.trim();
+    return value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+async function writeToKeychain(value, exec2) {
+  try {
+    const result = await exec2(
+      "security",
+      [
+        "add-generic-password",
+        "-U",
+        "-a",
+        KEYCHAIN_ACCOUNT,
+        "-s",
+        KEYCHAIN_SERVICE,
+        "-w",
+        value
+      ]
+    );
+    return result.code === 0;
+  } catch {
+    return false;
+  }
+}
+function fallbackFilePath(home) {
+  return join(home, ".sanctuary", "passphrase.enc");
+}
+async function readFromFallbackFile(path, home) {
+  try {
+    await access(path);
+  } catch {
+    return null;
+  }
+  try {
+    const raw = await readFile(path);
+    if (raw.length < 13) return null;
+    const nonce = raw.subarray(0, 12);
+    const ciphertext = raw.subarray(12);
+    const key = deriveMachineKey(home);
+    const cipher = gcm(key, nonce);
+    const plain = cipher.decrypt(ciphertext);
+    return Buffer.from(plain).toString("utf-8");
+  } catch {
+    return null;
+  }
+}
+async function writeToFallbackFile(path, value, home) {
+  const dir = join(home, ".sanctuary");
+  await mkdir(dir, { recursive: true, mode: 448 });
+  const nonce = randomBytes$1(12);
+  const key = deriveMachineKey(home);
+  const cipher = gcm(key, nonce);
+  const ciphertext = cipher.encrypt(Buffer.from(value, "utf-8"));
+  const payload = Buffer.concat([nonce, Buffer.from(ciphertext)]);
+  await writeFile(path, payload, { mode: 384 });
+}
+function deriveMachineKey(home) {
+  const info = userInfo();
+  const material = Buffer.from(
+    `${hostname()}:${info.uid}:${info.username}:${home}`,
+    "utf-8"
+  );
+  return hkdf(sha256, material, void 0, "sanctuary-passphrase-v1", 32);
+}
+async function defaultExec(cmd, args, input) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on("data", (d) => {
+      stderr += d.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ stdout, stderr, code }));
+    if (input !== void 0) {
+      child.stdin.write(input);
+    }
+    child.stdin.end();
+  });
+}
+var KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE;
+var init_passphrase = __esm({
+  "src/cocoon/passphrase.ts"() {
+    KEYCHAIN_ACCOUNT = "sanctuary";
+    KEYCHAIN_SERVICE = "sanctuary-passphrase";
+  }
+});
+
+// src/dashboard/aggregator.ts
+function fingerprintDID(did) {
+  const raw = did.replace(/^did:[a-z0-9]+:/i, "");
+  if (raw.length <= 12) return raw;
+  return `${raw.slice(0, 6)}\u2026${raw.slice(-6)}`;
+}
+function countInjectionsToday(audit) {
+  const startOfDay = /* @__PURE__ */ new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+  const cutoff = startOfDay.getTime();
+  return audit.filter((e) => {
+    const ts = new Date(e.timestamp).getTime();
+    if (isNaN(ts) || ts < cutoff) return false;
+    const op = (e.operation ?? "").toLowerCase();
+    return op.includes("injection") || op.includes("blocked") || e.result === "failure";
+  }).length;
+}
+function countProofsToday(audit) {
+  const startOfDay = /* @__PURE__ */ new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+  const cutoff = startOfDay.getTime();
+  return audit.filter((e) => {
+    if (e.layer !== "l3") return false;
+    const ts = new Date(e.timestamp).getTime();
+    return !isNaN(ts) && ts >= cutoff;
+  }).length;
+}
+function buildAgent(sources) {
+  if (!sources.identityManager) {
+    return {
+      display_name: "Unclaimed agent",
+      did: null,
+      did_fingerprint: null,
+      identity_count: 0,
+      primary_identity_id: null
+    };
+  }
+  const primary = sources.identityManager.getDefault();
+  const identities = sources.identityManager.list();
+  if (!primary) {
+    return {
+      display_name: "Unclaimed agent",
+      did: null,
+      did_fingerprint: null,
+      identity_count: identities.length,
+      primary_identity_id: null
+    };
+  }
+  return {
+    display_name: primary.label || "Sovereign agent",
+    did: primary.did,
+    did_fingerprint: fingerprintDID(primary.did),
+    identity_count: identities.length,
+    primary_identity_id: primary.identity_id
+  };
+}
+function buildL1(sources, audit) {
+  const hasIdentity = !!sources.identityManager?.getDefault();
+  const state = hasIdentity ? "full" : "degraded";
+  return {
+    label: "L1 Cognitive",
+    state,
+    headline: hasIdentity ? "State encrypted at rest" : "No sovereign identity \u2014 run sanctuary_bootstrap",
+    encryption: "AES-256-GCM + HKDF per namespace",
+    injection_blocked_today: countInjectionsToday(audit),
+    memory_attest_ready: hasIdentity
+  };
+}
+function buildL2(sources) {
+  const teeAvailable = sources.teeAvailable ?? false;
+  const state = teeAvailable ? "full" : "degraded";
+  return {
+    label: "L2 Operational",
+    state,
+    headline: teeAvailable ? "Hardware isolation active" : "Process isolation \u2014 no TEE on this host",
+    isolation_type: teeAvailable ? "hardware-tee" : "process-level",
+    tee_available: teeAvailable,
+    tee_status: teeAvailable ? "Attested" : "Not available \u2014 normal on local dev",
+    sandbox_status: "Principal Policy gate active"
+  };
+}
+function buildL3(sources, audit) {
+  const didActive = !!sources.identityManager?.getDefault()?.did;
+  const vcCount = audit.filter(
+    (e) => e.layer === "l4" && e.operation.toLowerCase().includes("attest")
+  ).length;
+  return {
+    label: "L3 Disclosure",
+    state: didActive ? "full" : "degraded",
+    headline: didActive ? "Selective disclosure ready" : "No DID \u2014 disclosure unavailable",
+    did_active: didActive,
+    vc_count: vcCount,
+    proofs_today: countProofsToday(audit)
+  };
+}
+function buildL4(sources) {
+  const rep = sources.reputation;
+  const hasDid = !!sources.identityManager?.getDefault()?.did;
+  if (rep?.score != null) {
+    return {
+      label: "L4 Reputation",
+      state: "full",
+      headline: "Verascore attached",
+      score: rep.score,
+      profile_url: rep.profile_url,
+      claim_cta: null
+    };
+  }
+  if (hasDid) {
+    return {
+      label: "L4 Reputation",
+      state: "degraded",
+      headline: "Claim your profile",
+      score: null,
+      profile_url: null,
+      claim_cta: "Claim your profile at verascore.ai"
+    };
+  }
+  return {
+    label: "L4 Reputation",
+    state: "degraded",
+    headline: "No identity claimed",
+    score: null,
+    profile_url: null,
+    claim_cta: "Claim your profile at verascore.ai"
+  };
+}
+function computeOverall(l1, l2, l3, l4) {
+  const critical = [l1.state, l3.state, l4.state];
+  if (critical.includes("compromised") || l2.state === "compromised") {
+    return {
+      status: "compromised",
+      light: "red",
+      headline: "Sovereignty compromised"
+    };
+  }
+  const allCriticalFull = critical.every((s) => s === "full");
+  if (allCriticalFull && l2.state === "full") {
+    return {
+      status: "healthy",
+      light: "green",
+      headline: "All layers full"
+    };
+  }
+  if (allCriticalFull && l2.state === "degraded") {
+    return {
+      status: "healthy",
+      light: "green",
+      headline: "L1\xB7L3\xB7L4 full \u2014 L2 degraded (no TEE on this host)"
+    };
+  }
+  return {
+    status: "degraded",
+    light: "yellow",
+    headline: "One or more layers degraded"
+  };
+}
+function buildUpstreamServers(sources) {
+  if (!sources.clientManager) return [];
+  return sources.clientManager.getStatus().map((s) => {
+    const entry = {
+      name: s.name,
+      state: s.state,
+      tool_count: s.tool_count
+    };
+    if (s.error) entry.error = s.error;
+    return entry;
+  });
+}
+async function getProtectionSnapshot(sources) {
+  let audit = [];
+  if (sources.auditLog) {
+    try {
+      const result = await sources.auditLog.query({ limit: MAX_AUDIT });
+      audit = result.entries;
+    } catch {
+      audit = [];
+    }
+  }
+  const agent = buildAgent(sources);
+  const l1 = buildL1(sources, audit);
+  const l2 = buildL2(sources);
+  const l3 = buildL3(sources, audit);
+  const l4 = buildL4(sources);
+  const activity = (sources.activity ?? []).slice(0, MAX_ACTIVITY);
+  const pending_approvals = sources.pendingApprovals ?? [];
+  const upstream_servers = buildUpstreamServers(sources);
+  return {
+    overall: computeOverall(l1, l2, l3, l4),
+    agent,
+    layers: { l1, l2, l3, l4 },
+    activity,
+    pending_approvals,
+    audit: audit.slice(-MAX_AUDIT).reverse(),
+    upstream_servers,
+    mode: sources.mode,
+    server_version: sources.server_version,
+    generated_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+var MAX_ACTIVITY, MAX_AUDIT;
+var init_aggregator = __esm({
+  "src/dashboard/aggregator.ts"() {
+    MAX_ACTIVITY = 50;
+    MAX_AUDIT = 50;
+  }
+});
+
+// src/dashboard/html.ts
+function escHtml(value) {
+  if (value == null) return "";
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+}
+function layerCard(layer, extra) {
+  return `<section class="layer-card layer-${escHtml(layer.state)}" data-layer-label="${escHtml(layer.label)}">
+    <div class="layer-head">
+      <div class="layer-dot"></div>
+      <div>
+        <h3>${escHtml(layer.label)}</h3>
+        <p class="layer-headline">${escHtml(layer.headline)}</p>
+      </div>
+    </div>
+    <dl class="layer-detail">${extra}</dl>
+  </section>`;
+}
+function l1Card(l1) {
+  return layerCard(
+    l1,
+    `<div><dt>Encryption</dt><dd>${escHtml(l1.encryption)}</dd></div>
+     <div><dt>Injections blocked today</dt><dd>${escHtml(l1.injection_blocked_today)}</dd></div>
+     <div><dt>memory_attest</dt><dd>${l1.memory_attest_ready ? "Ready" : "Not ready"}</dd></div>`
+  );
+}
+function l2Card(l2) {
+  return layerCard(
+    l2,
+    `<div><dt>Isolation</dt><dd>${escHtml(l2.isolation_type)}</dd></div>
+     <div><dt>TEE</dt><dd>${escHtml(l2.tee_status)}</dd></div>
+     <div><dt>Sandbox</dt><dd>${escHtml(l2.sandbox_status)}</dd></div>`
+  );
+}
+function l3Card(l3) {
+  return layerCard(
+    l3,
+    `<div><dt>DID</dt><dd>${l3.did_active ? "Active" : "None"}</dd></div>
+     <div><dt>Credentials</dt><dd>${escHtml(l3.vc_count)}</dd></div>
+     <div><dt>Proofs today</dt><dd>${escHtml(l3.proofs_today)}</dd></div>`
+  );
+}
+function l4Card(l4) {
+  const score = l4.score != null ? `<div class="score-block"><span class="score-value">${escHtml(l4.score)}</span><span class="score-label">Verascore</span></div>` : `<div class="claim-block">${escHtml(l4.claim_cta ?? "Claim your profile at verascore.ai")}</div>`;
+  return layerCard(
+    l4,
+    `<div class="layer-cta">${score}</div>`
+  );
+}
+function renderDashboardHTML(options) {
+  const { snapshot } = options;
+  const { overall, agent, layers, activity, pending_approvals, audit, upstream_servers } = snapshot;
+  const activityRows = activity.length === 0 ? `<tr class="empty"><td colspan="5">Waiting for tool calls\u2026</td></tr>` : activity.map((entry) => {
+    const time = new Date(entry.timestamp).toLocaleTimeString();
+    return `<tr class="result-${escHtml(entry.result)}">
+            <td class="mono time">${escHtml(time)}</td>
+            <td class="mono">${escHtml(entry.tool)}</td>
+            <td class="mono">${escHtml(entry.server)}</td>
+            <td class="tier tier-${escHtml(entry.tier)}">T${escHtml(entry.tier)}</td>
+            <td class="result">${escHtml(entry.result)}</td>
+          </tr>`;
+  }).join("");
+  const approvalItems = pending_approvals.length === 0 ? `<div class="empty-block">No pending approvals</div>` : pending_approvals.map((p) => `<article class="approval" data-id="${escHtml(p.id)}">
+          <div class="approval-head">
+            <span class="tier-chip tier-${escHtml(p.tier)}">Tier ${escHtml(p.tier)}</span>
+            <span class="mono">${escHtml(p.operation)}</span>
+          </div>
+          <p class="approval-reason">${escHtml(p.reason)}</p>
+          <div class="approval-actions">
+            <button class="btn btn-allow" data-action="allow" data-id="${escHtml(p.id)}">Allow</button>
+            <button class="btn btn-deny" data-action="deny" data-id="${escHtml(p.id)}">Deny</button>
+          </div>
+        </article>`).join("");
+  const auditRows = audit.length === 0 ? `<tr class="empty"><td colspan="4">Audit log empty</td></tr>` : audit.map((entry) => `<tr data-kind="${escHtml(entry.layer)}" data-op="${escHtml(entry.operation)}">
+          <td class="mono time">${escHtml(new Date(entry.timestamp).toLocaleTimeString())}</td>
+          <td class="layer-pill">${escHtml(entry.layer.toUpperCase())}</td>
+          <td class="mono">${escHtml(entry.operation)}</td>
+          <td class="result-${escHtml(entry.result)}">${escHtml(entry.result)}</td>
+        </tr>`).join("");
+  const serverRows = upstream_servers.length === 0 ? `<li class="empty-block">No upstream servers connected</li>` : upstream_servers.map((s) => `<li class="server-row state-${escHtml(s.state)}">
+          <span class="server-dot"></span>
+          <span class="mono">${escHtml(s.name)}</span>
+          <span class="server-meta">${escHtml(s.state)} \xB7 ${escHtml(s.tool_count)} tool${s.tool_count === 1 ? "" : "s"}</span>
+        </li>`).join("");
+  const initialSnapshot = JSON.stringify(snapshot).replace(/</g, "\\u003c").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sanctuary \u2014 Sovereignty Dashboard</title>
+<style>
+:root {
+  --bg: #07080c;
+  --bg-2: #0f1220;
+  --surface: #131729;
+  --surface-2: #1a1f36;
+  --border: #26304d;
+  --border-strong: #39436a;
+  --ink: #eef1fb;
+  --ink-dim: #b9c0dc;
+  --ink-mute: #7e86a8;
+  --indigo: #6e7bff;
+  --indigo-deep: #3b4ad8;
+  --green: #3ee08f;
+  --green-deep: #168a4d;
+  --amber: #f1c05a;
+  --red: #ff6b7a;
+  --violet: #a77bff;
+  --radius: 14px;
+  --radius-sm: 8px;
+  --shadow: 0 14px 42px rgba(3, 6, 19, 0.45);
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { background: var(--bg); color: var(--ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; min-height: 100vh; -webkit-font-smoothing: antialiased; }
+body { background: radial-gradient(circle at 50% -200px, rgba(110, 123, 255, 0.18), transparent 60%), var(--bg); }
+a { color: var(--indigo); text-decoration: none; }
+button { font: inherit; cursor: pointer; }
+
+.wrap { max-width: 1180px; margin: 0 auto; padding: 40px 32px 120px; }
+
+/* \u2500\u2500 Top meta row \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+.meta-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--ink-mute);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+.meta-row .mode-pill {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-family: var(--mono);
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+
+/* \u2500\u2500 Hero \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+.hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 48px 24px 56px;
+  border-radius: 22px;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(62, 224, 143, 0.08), transparent 70%),
+    linear-gradient(180deg, var(--bg-2) 0%, var(--surface) 100%);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  margin-bottom: 32px;
+  position: relative;
+  overflow: hidden;
+}
+.hero::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 50% 100%, rgba(110, 123, 255, 0.10), transparent 60%);
+  pointer-events: none;
+}
+.shield {
+  width: 200px;
+  height: 200px;
+  position: relative;
+  filter: drop-shadow(0 16px 32px rgba(62, 224, 143, 0.18));
+  animation: hero-in 600ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+@keyframes hero-in {
+  from { opacity: 0; transform: translateY(12px) scale(0.96); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.shield svg { width: 100%; height: 100%; display: block; }
+.shield.green .shield-ring { stroke: var(--green); }
+.shield.green .shield-core { fill: rgba(62, 224, 143, 0.14); }
+.shield.green .shield-mark { stroke: var(--green); }
+.shield.yellow .shield-ring { stroke: var(--amber); }
+.shield.yellow .shield-core { fill: rgba(241, 192, 90, 0.14); }
+.shield.yellow .shield-mark { stroke: var(--amber); }
+.shield.red .shield-ring { stroke: var(--red); }
+.shield.red .shield-core { fill: rgba(255, 107, 122, 0.16); }
+.shield.red .shield-mark { stroke: var(--red); }
+.shield .shield-ring {
+  fill: none;
+  stroke-width: 3;
+  stroke-dasharray: 600;
+  stroke-dashoffset: 0;
+  transform-origin: center;
+  transition: stroke 320ms ease;
+}
+.shield .shield-ring-bg { fill: none; stroke: rgba(255, 255, 255, 0.06); stroke-width: 3; }
+.shield .shield-mark { fill: none; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; transition: stroke 320ms ease; }
+
+.hero h1 {
+  font-size: 40px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  margin-top: 28px;
+  position: relative;
+  z-index: 1;
+}
+.hero .hero-sub {
+  margin-top: 10px;
+  color: var(--ink-dim);
+  font-size: 15px;
+  position: relative;
+  z-index: 1;
+}
+.identity-line {
+  margin-top: 22px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 18px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(19, 23, 41, 0.7);
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ink-dim);
+  position: relative;
+  z-index: 1;
+}
+.identity-line .name { color: var(--ink); font-weight: 500; font-family: -apple-system, BlinkMacSystemFont, Inter, sans-serif; letter-spacing: 0; }
+.identity-line .sep { color: var(--ink-mute); }
+.identity-line .did { color: var(--violet); }
+.identity-line .primary-flag {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(110, 123, 255, 0.16);
+  color: var(--indigo);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-family: -apple-system, BlinkMacSystemFont, Inter, sans-serif;
+}
+
+/* \u2500\u2500 Layer grid \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+.layer-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-bottom: 32px;
+}
+@media (max-width: 960px) { .layer-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 520px) { .layer-grid { grid-template-columns: 1fr; } }
+
+.layer-card {
+  padding: 20px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  transition: border 220ms ease, transform 220ms ease;
+}
+.layer-card:hover { border-color: var(--border-strong); transform: translateY(-1px); }
+
+.layer-head { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
+.layer-dot { width: 12px; height: 12px; border-radius: 50%; margin-top: 6px; background: var(--ink-mute); box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.04); }
+.layer-full .layer-dot { background: var(--green); box-shadow: 0 0 0 3px rgba(62, 224, 143, 0.18); }
+.layer-degraded .layer-dot { background: var(--amber); box-shadow: 0 0 0 3px rgba(241, 192, 90, 0.18); }
+.layer-compromised .layer-dot { background: var(--red); box-shadow: 0 0 0 3px rgba(255, 107, 122, 0.18); }
+.layer-head h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-dim); margin-bottom: 4px; }
+.layer-headline { font-size: 15px; color: var(--ink); line-height: 1.35; }
+
+.layer-detail { display: flex; flex-direction: column; gap: 8px; }
+.layer-detail > div { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.layer-detail dt { color: var(--ink-mute); text-transform: uppercase; letter-spacing: 0.06em; font-size: 11px; }
+.layer-detail dd { color: var(--ink-dim); text-align: right; font-family: var(--mono); font-size: 12px; }
+
+.layer-cta { margin-top: 6px; text-align: center; padding: 16px; border-radius: var(--radius-sm); background: var(--bg-2); border: 1px solid var(--border); }
+.score-block { display: flex; flex-direction: column; gap: 2px; }
+.score-value { font-size: 28px; font-weight: 650; color: var(--green); letter-spacing: -0.02em; }
+.score-label { font-size: 11px; text-transform: uppercase; color: var(--ink-mute); letter-spacing: 0.08em; }
+.claim-block { font-size: 13px; color: var(--violet); }
+
+/* \u2500\u2500 Section headers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+.section { margin-bottom: 28px; }
+.section h2 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-dim);
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.section h2 .count {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--ink-mute);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* \u2500\u2500 Approval queue \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+.approval-list { display: flex; flex-direction: column; gap: 10px; }
+.approval {
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--amber);
+  border-radius: var(--radius);
+  box-shadow: 0 0 0 1px rgba(241, 192, 90, 0.18);
+  animation: fade-up 260ms ease both;
+}
+@keyframes fade-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+.approval-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 14px; }
+.tier-chip { padding: 2px 8px; border-radius: 999px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; font-family: -apple-system, Inter, sans-serif; }
+.tier-chip.tier-1 { background: rgba(255, 107, 122, 0.16); color: var(--red); }
+.tier-chip.tier-2 { background: rgba(241, 192, 90, 0.16); color: var(--amber); }
+.approval-reason { font-size: 13px; color: var(--ink-dim); margin-bottom: 12px; }
+.approval-actions { display: flex; gap: 8px; }
+.btn {
+  padding: 7px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--ink);
+  font-size: 13px;
+  transition: all 160ms ease;
+}
+.btn:hover { border-color: var(--border-strong); background: #202641; }
+.btn-allow { background: var(--green-deep); border-color: var(--green-deep); color: white; }
+.btn-allow:hover { background: #1ba25b; border-color: #1ba25b; }
+.btn-deny { background: transparent; border-color: var(--red); color: var(--red); }
+.btn-deny:hover { background: rgba(255, 107, 122, 0.1); border-color: var(--red); }
+
+/* \u2500\u2500 Tables \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.panel-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 18px; border-bottom: 1px solid var(--border); }
+.panel-head h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink-dim); }
+.filter-row { display: flex; gap: 6px; }
+.filter-row button {
+  padding: 4px 10px;
+  font-size: 11px;
+  border-radius: 999px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--ink-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  transition: all 140ms ease;
+}
+.filter-row button.active, .filter-row button:hover { color: var(--ink); border-color: var(--border-strong); background: var(--surface-2); }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 10px 18px; text-align: left; font-size: 13px; border-bottom: 1px solid var(--border); }
+th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-mute); font-weight: 500; background: var(--bg-2); }
+tr:last-child td { border-bottom: none; }
+tr.empty td { text-align: center; color: var(--ink-mute); padding: 32px 18px; }
+.mono { font-family: var(--mono); font-size: 12px; }
+.time { color: var(--ink-mute); white-space: nowrap; }
+.tier { text-align: center; font-family: var(--mono); font-size: 11px; font-weight: 600; }
+.tier-1 { color: var(--red); }
+.tier-2 { color: var(--amber); }
+.tier-3 { color: var(--green); }
+.result { font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+.result-allowed, .result-success { color: var(--green); }
+.result-denied, .result-failure { color: var(--red); }
+.result-approved { color: var(--indigo); }
+.result-pending { color: var(--amber); }
+.layer-pill { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--ink-dim); display: inline-block; }
+
+/* \u2500\u2500 Upstream servers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+.server-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.server-row { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 13px; }
+.server-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-mute); }
+.server-row.state-connected .server-dot { background: var(--green); }
+.server-row.state-connecting .server-dot { background: var(--amber); }
+.server-row.state-disconnected .server-dot, .server-row.state-error .server-dot { background: var(--red); }
+.server-meta { margin-left: auto; font-size: 12px; color: var(--ink-mute); font-family: var(--mono); }
+
+.empty-block { padding: 18px; color: var(--ink-mute); text-align: center; font-size: 13px; background: var(--surface); border: 1px dashed var(--border); border-radius: var(--radius-sm); }
+
+/* \u2500\u2500 Audit collapsible \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+details.audit-details { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+details.audit-details summary { cursor: pointer; list-style: none; padding: 14px 18px; display: flex; align-items: center; justify-content: space-between; }
+details.audit-details summary::-webkit-details-marker { display: none; }
+details.audit-details summary h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink-dim); }
+details.audit-details summary .caret { color: var(--ink-mute); font-family: var(--mono); }
+details.audit-details[open] .caret { transform: rotate(90deg); display: inline-block; }
+details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 12px; border-bottom: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="meta-row">
+    <span>Sanctuary Framework</span>
+    <span class="mode-pill" id="mode-pill">${escHtml(snapshot.mode)} \xB7 v${escHtml(snapshot.server_version)}</span>
+  </div>
+
+  <section class="hero">
+    <div class="shield ${escHtml(overall.light)}" id="shield">
+      <svg viewBox="0 0 200 200" aria-hidden="true">
+        <circle class="shield-ring-bg" cx="100" cy="100" r="92"></circle>
+        <circle class="shield-ring" cx="100" cy="100" r="92"></circle>
+        <circle class="shield-core" cx="100" cy="100" r="80" fill="rgba(255,255,255,0.02)"></circle>
+        <path class="shield-mark" d="M100 52 L132 68 L132 108 C132 130 118 144 100 150 C82 144 68 130 68 108 L68 68 Z"></path>
+        <path class="shield-mark" d="M85 102 L96 113 L118 90"></path>
+      </svg>
+    </div>
+    <h1 id="hero-copy">${escHtml(HERO_COPY)}</h1>
+    <p class="hero-sub" id="hero-sub">${escHtml(overall.headline)}</p>
+    <div class="identity-line" id="identity-line">
+      <span class="name" id="agent-name">${escHtml(agent.display_name)}</span>
+      <span class="sep">\xB7</span>
+      <span class="did" id="agent-did">${escHtml(agent.did_fingerprint ?? "unclaimed")}</span>
+      ${agent.primary_identity_id ? `<span class="primary-flag">Primary</span>` : ""}
+    </div>
+  </section>
+
+  <div class="layer-grid" id="layer-grid">
+    ${l1Card(layers.l1)}
+    ${l2Card(layers.l2)}
+    ${l3Card(layers.l3)}
+    ${l4Card(layers.l4)}
+  </div>
+
+  <section class="section" id="approval-section">
+    <h2>Needs approval <span class="count" id="approval-count">${pending_approvals.length}</span></h2>
+    <div class="approval-list" id="approval-list">${approvalItems}</div>
+  </section>
+
+  <section class="section">
+    <h2>Upstream servers <span class="count">${upstream_servers.length}</span></h2>
+    <ul class="server-list" id="server-list">${serverRows}</ul>
+  </section>
+
+  <section class="section">
+    <h2>Live activity <span class="count" id="activity-count">${activity.length}</span></h2>
+    <div class="panel">
+      <div class="panel-head"><h3>Recent tool calls</h3></div>
+      <table>
+        <thead><tr><th>Time</th><th>Tool</th><th>Server</th><th>Tier</th><th>Result</th></tr></thead>
+        <tbody id="activity-body">${activityRows}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section">
+    <details class="audit-details">
+      <summary>
+        <h3>Audit trail <span class="count" id="audit-count">${audit.length}</span></h3>
+        <span class="caret">\u25B8</span>
+      </summary>
+      <div class="audit-filters">
+        <div class="filter-row" id="audit-filter">
+          <button class="active" data-filter="all">All</button>
+          <button data-filter="l1">Cognitive</button>
+          <button data-filter="l2">Operational</button>
+          <button data-filter="l3">Disclosure</button>
+          <button data-filter="l4">Reputation</button>
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>Time</th><th>Layer</th><th>Operation</th><th>Result</th></tr></thead>
+        <tbody id="audit-body">${auditRows}</tbody>
+      </table>
+    </details>
+  </section>
+</div>
+
+<script>
+(() => {
+  const INITIAL_SNAPSHOT = ${initialSnapshot};
+  const AUTH_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : "null"};
+  const AUTH_HEADER = AUTH_TOKEN ? { "Authorization": "Bearer " + AUTH_TOKEN } : {};
+  const AUTH_QS = AUTH_TOKEN ? "?token=" + encodeURIComponent(AUTH_TOKEN) : "";
+
+  let snapshot = INITIAL_SNAPSHOT;
+
+  function esc(value) {
+    if (value == null) return "";
+    return String(value)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+  }
+  function fmtTime(iso) {
+    try { return new Date(iso).toLocaleTimeString(); } catch { return iso; }
+  }
+
+  function renderShield(light, headline) {
+    const shield = document.getElementById("shield");
+    if (!shield) return;
+    shield.classList.remove("green", "yellow", "red");
+    shield.classList.add(light);
+    document.getElementById("hero-sub").textContent = headline;
+  }
+
+  function renderActivity(entries) {
+    const body = document.getElementById("activity-body");
+    const count = document.getElementById("activity-count");
+    if (!body) return;
+    count.textContent = String(entries.length);
+    if (!entries.length) {
+      body.innerHTML = '<tr class="empty"><td colspan="5">Waiting for tool calls\u2026</td></tr>';
+      return;
+    }
+    body.innerHTML = entries.map(e => (
+      '<tr class="result-' + esc(e.result) + '">' +
+        '<td class="mono time">' + esc(fmtTime(e.timestamp)) + '</td>' +
+        '<td class="mono">' + esc(e.tool) + '</td>' +
+        '<td class="mono">' + esc(e.server) + '</td>' +
+        '<td class="tier tier-' + esc(e.tier) + '">T' + esc(e.tier) + '</td>' +
+        '<td class="result">' + esc(e.result) + '</td>' +
+      '</tr>'
+    )).join("");
+  }
+
+  function renderApprovals(list) {
+    const container = document.getElementById("approval-list");
+    const count = document.getElementById("approval-count");
+    if (!container) return;
+    count.textContent = String(list.length);
+    if (!list.length) {
+      container.innerHTML = '<div class="empty-block">No pending approvals</div>';
+      return;
+    }
+    container.innerHTML = list.map(p => (
+      '<article class="approval" data-id="' + esc(p.id) + '">' +
+        '<div class="approval-head">' +
+          '<span class="tier-chip tier-' + esc(p.tier) + '">Tier ' + esc(p.tier) + '</span>' +
+          '<span class="mono">' + esc(p.operation) + '</span>' +
+        '</div>' +
+        '<p class="approval-reason">' + esc(p.reason) + '</p>' +
+        '<div class="approval-actions">' +
+          '<button class="btn btn-allow" data-action="allow" data-id="' + esc(p.id) + '">Allow</button>' +
+          '<button class="btn btn-deny" data-action="deny" data-id="' + esc(p.id) + '">Deny</button>' +
+        '</div>' +
+      '</article>'
+    )).join("");
+    wireApprovalButtons();
+  }
+
+  function renderAudit(entries, filter) {
+    filter = filter || "all";
+    const body = document.getElementById("audit-body");
+    const count = document.getElementById("audit-count");
+    if (!body) return;
+    const visible = filter === "all" ? entries : entries.filter(e => e.layer === filter);
+    count.textContent = String(visible.length);
+    if (!visible.length) {
+      body.innerHTML = '<tr class="empty"><td colspan="4">Audit log empty</td></tr>';
+      return;
+    }
+    body.innerHTML = visible.map(e => (
+      '<tr data-kind="' + esc(e.layer) + '" data-op="' + esc(e.operation) + '">' +
+        '<td class="mono time">' + esc(fmtTime(e.timestamp)) + '</td>' +
+        '<td><span class="layer-pill">' + esc(String(e.layer).toUpperCase()) + '</span></td>' +
+        '<td class="mono">' + esc(e.operation) + '</td>' +
+        '<td class="result-' + esc(e.result) + '">' + esc(e.result) + '</td>' +
+      '</tr>'
+    )).join("");
+  }
+
+  function renderAll(snap) {
+    snapshot = snap;
+    renderShield(snap.overall.light, snap.overall.headline);
+    const mp = document.getElementById("mode-pill");
+    if (mp) mp.textContent = snap.mode + " \xB7 v" + snap.server_version;
+    document.getElementById("agent-name").textContent = snap.agent.display_name;
+    document.getElementById("agent-did").textContent = snap.agent.did_fingerprint || "unclaimed";
+    renderActivity(snap.activity);
+    renderApprovals(snap.pending_approvals);
+    renderAudit(snap.audit, currentAuditFilter());
+  }
+
+  function currentAuditFilter() {
+    const active = document.querySelector("#audit-filter button.active");
+    return active ? active.dataset.filter : "all";
+  }
+
+  function wireApprovalButtons() {
+    document.querySelectorAll("#approval-list button[data-action]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const id = btn.dataset.id;
+        const action = btn.dataset.action;
+        btn.disabled = true;
+        try {
+          await fetch("/api/approvals/" + encodeURIComponent(id) + "/" + action + AUTH_QS, {
+            method: "POST", headers: AUTH_HEADER
+          });
+        } catch {}
+        await refreshSnapshot();
+      });
+    });
+  }
+
+  function wireAuditFilter() {
+    document.querySelectorAll("#audit-filter button").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll("#audit-filter button").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        renderAudit(snapshot.audit, btn.dataset.filter);
+      });
+    });
+  }
+
+  async function refreshSnapshot() {
+    try {
+      const res = await fetch("/api/snapshot" + AUTH_QS, { headers: AUTH_HEADER });
+      if (!res.ok) return;
+      const snap = await res.json();
+      renderAll(snap);
+    } catch {}
+  }
+
+  function connectSSE() {
+    try {
+      const es = new EventSource("/api/stream" + AUTH_QS);
+      es.addEventListener("snapshot", (ev) => {
+        try { renderAll(JSON.parse(ev.data)); } catch {}
+      });
+      es.addEventListener("activity", () => refreshSnapshot());
+      es.addEventListener("approval", () => refreshSnapshot());
+      es.onerror = () => { es.close(); setTimeout(connectSSE, 3000); };
+    } catch {}
+  }
+
+  wireApprovalButtons();
+  wireAuditFilter();
+  connectSSE();
+})();
+</script>
+</body>
+</html>`;
+}
+var HERO_COPY;
+var init_html = __esm({
+  "src/dashboard/html.ts"() {
+    HERO_COPY = "Your agent is protected.";
+  }
+});
+
+// src/dashboard/api.ts
+function constantTimeEquals(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+function extractToken(req, url) {
+  const header = req.headers.authorization;
+  if (header && header.startsWith("Bearer ")) {
+    return header.slice(7).trim();
+  }
+  const q = url.searchParams.get("token");
+  return q ?? null;
+}
+function isAuthorized(deps, req, url) {
+  if (!deps.authToken) return true;
+  const token = extractToken(req, url);
+  if (!token) return false;
+  return constantTimeEquals(token, deps.authToken);
+}
+function writeJSON(res, status, payload) {
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store"
+  });
+  res.end(JSON.stringify(payload));
+}
+function writeText(res, status, body, contentType = "text/plain") {
+  res.writeHead(status, {
+    "Content-Type": contentType,
+    "Cache-Control": "no-store"
+  });
+  res.end(body);
+}
+async function handleRequest(deps, req, res) {
+  const host = req.headers.host || "localhost";
+  const url = new URL(req.url ?? "/", `http://${host}`);
+  const method = (req.method ?? "GET").toUpperCase();
+  const path = url.pathname;
+  if (!isAuthorized(deps, req, url)) {
+    writeJSON(res, 401, { error: "unauthorized" });
+    return true;
+  }
+  if (method === "GET" && path === "/api/health") {
+    writeJSON(res, 200, { ok: true, mode: deps.sources.mode });
+    return true;
+  }
+  if (method === "GET" && (path === "/" || path === "/index.html")) {
+    const snapshot = await getProtectionSnapshot(deps.sources);
+    const html = renderDashboardHTML({ snapshot, authToken: deps.authToken });
+    writeText(res, 200, html, "text/html; charset=utf-8");
+    return true;
+  }
+  if (method === "GET" && path === "/api/snapshot") {
+    const snapshot = await getProtectionSnapshot(deps.sources);
+    writeJSON(res, 200, snapshot);
+    return true;
+  }
+  const approvalMatch = /^\/api\/approvals\/([^/]+)\/(allow|deny)$/.exec(path);
+  if (method === "POST" && approvalMatch) {
+    const id = decodeURIComponent(approvalMatch[1]);
+    const action = approvalMatch[2];
+    if (!deps.approvals) {
+      writeJSON(res, 503, { error: "approvals_unavailable" });
+      return true;
+    }
+    const handler = action === "allow" ? deps.approvals.allow : deps.approvals.deny;
+    try {
+      const ok = await handler(id);
+      writeJSON(res, ok ? 200 : 404, { id, action, ok });
+    } catch (err) {
+      writeJSON(res, 500, { error: "approval_failed", message: err.message });
+    }
+    return true;
+  }
+  if (method === "GET" && path === "/api/stream") {
+    await handleStream(deps, res);
+    return true;
+  }
+  return false;
+}
+async function handleStream(deps, res) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+  const snapshot = await getProtectionSnapshot(deps.sources);
+  res.write(`event: snapshot
+data: ${JSON.stringify(snapshot)}
+
+`);
+  const unsubscribe = deps.onEvent ? deps.onEvent((event) => {
+    try {
+      res.write(`event: ${event.type}
+data: ${JSON.stringify(event.data)}
+
+`);
+    } catch {
+    }
+  }) : () => {
+  };
+  const keepAlive = setInterval(() => {
+    try {
+      res.write(": keepalive\n\n");
+    } catch {
+    }
+  }, 25e3);
+  const cleanup = () => {
+    clearInterval(keepAlive);
+    unsubscribe();
+  };
+  res.on("close", cleanup);
+  res.on("error", cleanup);
+}
+var init_api = __esm({
+  "src/dashboard/api.ts"() {
+    init_aggregator();
+    init_html();
+  }
+});
+async function startDashboardServer(options) {
+  const port = options.port ?? DEFAULT_PORT;
+  const host = options.host ?? DEFAULT_HOST;
+  const listeners = /* @__PURE__ */ new Set();
+  const onEvent = (listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  };
+  const publish = (event) => {
+    for (const listener of listeners) {
+      try {
+        listener(event);
+      } catch {
+      }
+    }
+  };
+  const deps = {
+    sources: options.sources,
+    authToken: options.authToken,
+    approvals: options.approvals,
+    onEvent
+  };
+  const server = createServer$2(async (req, res) => {
+    try {
+      const served = await handleRequest(deps, req, res);
+      if (!served) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "not_found", path: req.url }));
+      }
+    } catch (err) {
+      try {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "internal", message: err.message }));
+      } catch {
+      }
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const actualPort = (() => {
+    const addr = server.address();
+    if (addr && typeof addr === "object") return addr.port;
+    return port;
+  })();
+  const url = `http://${host}:${actualPort}`;
+  return {
+    url,
+    port: actualPort,
+    host,
+    stop: () => new Promise((resolve, reject) => {
+      server.close((err) => err ? reject(err) : resolve());
+    }),
+    publish,
+    publishActivity: (entry) => publish({ type: "activity", data: entry }),
+    publishApproval: (approval) => publish({ type: "approval", data: approval })
+  };
+}
+var DEFAULT_PORT, DEFAULT_HOST;
+var init_server = __esm({
+  "src/dashboard/server.ts"() {
+    init_api();
+    DEFAULT_PORT = 3501;
+    DEFAULT_HOST = "127.0.0.1";
+  }
+});
+
+// src/dashboard/index.ts
+async function startDashboard(options) {
+  const activity = options.initialActivity ? [...options.initialActivity] : [];
+  const pending = options.initialPendingApprovals ? [...options.initialPendingApprovals] : [];
+  const sources = {
+    mode: options.mode,
+    server_version: options.serverVersion,
+    ...options.auditLog ? { auditLog: options.auditLog } : {},
+    ...options.identityManager ? { identityManager: options.identityManager } : {},
+    ...options.clientManager ? { clientManager: options.clientManager } : {},
+    ...options.baseline ? { baseline: options.baseline } : {},
+    ...options.policy ? { policy: options.policy } : {},
+    ...options.reputation ? { reputation: options.reputation } : {},
+    ...options.teeAvailable != null ? { teeAvailable: options.teeAvailable } : {},
+    activity,
+    pendingApprovals: pending
+  };
+  const serverOpts = {
+    mode: options.mode,
+    sources,
+    ...options.port != null ? { port: options.port } : {},
+    ...options.host ? { host: options.host } : {},
+    ...options.authToken ? { authToken: options.authToken } : {},
+    ...options.approvals ? { approvals: options.approvals } : {}
+  };
+  const handle = await startDashboardServer(serverOpts);
+  const wrapped = {
+    ...handle,
+    publishActivity: (entry) => {
+      activity.unshift(entry);
+      if (activity.length > 50) activity.length = 50;
+      handle.publishActivity(entry);
+    },
+    publishApproval: (approval) => {
+      pending.push(approval);
+      handle.publishApproval(approval);
+    }
+  };
+  return wrapped;
+}
+var init_dashboard2 = __esm({
+  "src/dashboard/index.ts"() {
+    init_server();
+    init_aggregator();
+    init_html();
+    init_api();
+    init_server();
+  }
+});
+
+// src/cocoon/cli.ts
+var cli_exports = {};
+__export(cli_exports, {
+  COCOON_GOVERNOR_DEFAULTS: () => COCOON_GOVERNOR_DEFAULTS,
+  formatWrapSuccess: () => formatWrapSuccess,
+  parseCocoonArgs: () => parseCocoonArgs,
+  parseWrapArgs: () => parseWrapArgs,
+  runCocoon: () => runCocoon,
+  runWrap: () => runWrap
+});
+async function runWrap(options, deps = {}) {
+  if (options.unwrap) {
+    await unwrap();
+    return;
+  }
+  let platformHint;
+  if (options.openclaw) platformHint = "openclaw";
+  else if (options.claudeCode) platformHint = "claude-code";
+  else if (options.cursor) platformHint = "cursor";
+  const detection = await detectAgentConfigWithDiagnostics(
+    platformHint,
+    options.wrap
+  );
+  const agentConfig = detection.config;
+  if (!agentConfig) {
+    console.error(`
+  Sanctuary \u2014 Configuration Not Found
+`);
+    if (platformHint) {
+      console.error(`  Could not find ${platformHint} configuration.`);
+    } else if (options.wrap) {
+      console.error(`  Could not read config file: ${options.wrap}`);
+    } else {
+      console.error("  Could not auto-detect any agent configuration.");
+      console.error(
+        "  Use --openclaw, --claude-code, --cursor, or --wrap /path/to/config.json"
+      );
+    }
+    if (detection.pathsChecked.length > 0) {
+      console.error(`
+  Paths checked:`);
+      for (const p of detection.pathsChecked) console.error(`    ${p}`);
+    }
+    if (detection.errors.length > 0) {
+      console.error(`
+  Errors encountered:`);
+      for (const e of detection.errors) {
+        console.error(`    ${e.path}: ${e.error}`);
+      }
+    }
+    console.error("");
+    process.exit(1);
+  }
+  if (agentConfig.servers.length === 0) {
+    console.error(
+      `
+  Found ${agentConfig.platform} config at ${agentConfig.configPath},`
+    );
+    console.error(`  but no MCP servers are configured in it.
+`);
+    process.exit(1);
+  }
+  const hasSanctuary = agentConfig.servers.some(
+    (s) => s.name.toLowerCase() === "sanctuary"
+  );
+  if (hasSanctuary) {
+    console.error(
+      `
+  Warning: This agent already has a Sanctuary server configured.`
+    );
+    console.error(`  Re-wrapping will update the existing Sanctuary entry.
+`);
+  }
+  console.error(`
+  Sanctuary wrap`);
+  console.error(`  Platform: ${agentConfig.platform}`);
+  console.error(`  Config: ${agentConfig.configPath}`);
+  console.error(`  MCP servers found: ${agentConfig.servers.length}`);
+  const upstreamServers = convertToUpstreamServers(agentConfig.servers);
+  for (const server of upstreamServers) {
+    console.error(
+      `    \u2192 ${server.name} (${server.transport.type}) \u2014 tier ${server.default_tier}`
+    );
+  }
+  if (options.dryRun) {
+    console.error(`
+  Dry run \u2014 no changes made.
+`);
+    return;
+  }
+  let passphraseValue;
+  let passphraseSource = "flag";
+  if (options.passphrase) {
+    passphraseValue = options.passphrase;
+  } else if (process.env.SANCTUARY_PASSPHRASE) {
+    passphraseValue = process.env.SANCTUARY_PASSPHRASE;
+    passphraseSource = "env";
+  } else {
+    const resolve = deps.resolvePassphrase ?? (() => getOrCreatePassphrase());
+    const resolved = await resolve();
+    passphraseValue = resolved.value;
+    resolved.location;
+    passphraseSource = resolved.source;
+    if (resolved.source === "generated") {
+      console.error(
+        `
+  \u{1F510} Generated and stored passphrase (${resolved.location}).`
+      );
+      console.error(
+        `  Back up with: sanctuary export-passphrase`
+      );
+    }
+  }
+  const storagePath = join(homedir(), ".sanctuary");
+  await mkdir(storagePath, { recursive: true, mode: 448 });
+  const profile = createWrapProfile(upstreamServers);
+  const profilePath = join(storagePath, "cocoon-profile.json");
+  await writeFile(profilePath, JSON.stringify(profile, null, 2), {
+    mode: 384
+  });
+  const backupPath = await backupConfig(agentConfig.configPath);
+  await saveCocoonMeta({
+    backupPath,
+    originalPath: agentConfig.configPath,
+    platform: agentConfig.platform,
+    wrappedAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+  await rewriteConfigForCocoon(
+    agentConfig,
+    "npx",
+    [
+      "@sanctuary-framework/mcp-server",
+      ...passphraseSource === "flag" ? ["--passphrase", passphraseValue] : []
+    ]
+  );
+  const verifyOk = await verifyRewrittenConfig(
+    agentConfig.configPath,
+    backupPath
+  );
+  if (!verifyOk) process.exit(1);
+  const authToken = generateAuthToken();
+  const startFn = deps.startDashboard ?? ((opts) => startDashboard({
+    port: opts.port,
+    ...opts.host !== void 0 ? { host: opts.host } : {},
+    mode: opts.mode,
+    authToken: opts.authToken,
+    serverVersion: opts.serverVersion
+  }));
+  const requestedPort = options.port ?? DEFAULT_PORT2;
+  const dashboard = await startDashboardWithFallback(
+    startFn,
+    requestedPort,
+    authToken,
+    readPackageVersion()
+  );
+  const dashboardUrl = `${dashboard.url}?token=${authToken}`;
+  const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
+  if (!options.noOpen) {
+    try {
+      const opener = deps.openBrowser ?? defaultOpenBrowser;
+      await opener(dashboardUrl);
+    } catch {
+    }
+  }
+  printWrapSuccess({
+    toolName,
+    version: readPackageVersion(),
+    toolCount: countUpstreamTools(upstreamServers),
+    serverCount: upstreamServers.length,
+    dashboardUrl,
+    browserOpened: !options.noOpen});
+}
+async function runCocoon(options) {
+  console.error(
+    `
+  Note: \`cocoon\` is renamed to \`wrap\`. Use \`sanctuary wrap\` next time.
+`
+  );
+  return runWrap(options);
+}
+async function startDashboardWithFallback(startFn, preferredPort, authToken, serverVersion) {
+  let lastErr;
+  for (let port = preferredPort; port <= MAX_PORT; port++) {
+    try {
+      const handle = await startFn({
+        port,
+        mode: "co-located",
+        authToken,
+        serverVersion
+      });
+      if (port !== preferredPort) {
+        console.error(
+          `  Port ${preferredPort} was unavailable \u2014 dashboard bound to ${port}.`
+        );
+      }
+      return handle;
+    } catch (err) {
+      lastErr = err;
+      if (!isAddressInUse(err)) throw err;
+    }
+  }
+  throw new Error(
+    `No free dashboard port in range ${preferredPort}-${MAX_PORT}: ${lastErr?.message ?? "unknown"}`
+  );
+}
+function isAddressInUse(err) {
+  if (!err || typeof err !== "object") return false;
+  const code = err.code;
+  return code === "EADDRINUSE";
+}
+async function defaultOpenBrowser(url) {
+  const plat = platform();
+  let cmd;
+  let args;
+  if (plat === "darwin") {
+    cmd = "open";
+    args = [url];
+  } else if (plat === "win32") {
+    cmd = "cmd";
+    args = ["/c", "start", "", url];
+  } else {
+    cmd = "xdg-open";
+    args = [url];
+  }
+  await new Promise((resolve) => {
+    const child = spawn(cmd, args, { stdio: "ignore", detached: true });
+    child.on("error", () => resolve());
+    child.on("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
+}
+function formatWrapSuccess(info) {
+  const g = (s) => `\x1B[32m${s}\x1B[0m`;
+  const d = (s) => `\x1B[2m${s}\x1B[0m`;
+  const b = (s) => `\x1B[1m${s}\x1B[0m`;
+  const check = "\u2713";
+  const lines = [];
+  lines.push("");
+  lines.push(
+    `  ${g(check)} Wrapped ${b(info.toolName)} with Sanctuary v${info.version}`
+  );
+  lines.push(
+    `  ${g(check)} ${info.toolCount} tools registered across ${info.serverCount} upstream server${info.serverCount !== 1 ? "s" : ""}`
+  );
+  lines.push(
+    `  ${g(check)} Sovereignty Dashboard running at ${b(info.dashboardUrl)}`
+  );
+  if (info.browserOpened) {
+    lines.push(`  ${g(check)} Opened in your browser`);
+  } else {
+    lines.push(`  ${d("(browser auto-open suppressed)")}`);
+  }
+  lines.push("");
+  lines.push(`  ${b("Your agent is protected.")} L1 Full / L2 Degraded (no TEE) / L3 Full / L4 Full.`);
+  lines.push("");
+  return lines.join("\n");
+}
+function printWrapSuccess(info) {
+  console.error(formatWrapSuccess(info));
+}
+async function verifyRewrittenConfig(configPath, backupPath) {
+  try {
+    const raw = await readFile(configPath, "utf-8");
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      console.error(`
+  Verification FAILED: Rewritten config is not valid JSON.`);
+      console.error(`  Error: ${err.message}`);
+      await restoreFromBackup(configPath, backupPath);
+      return false;
+    }
+    const servers = parsed.mcp?.servers ?? parsed.mcpServers ?? {};
+    if (!servers.sanctuary) {
+      console.error(`
+  Verification FAILED: No sanctuary entry in rewritten config.`);
+      await restoreFromBackup(configPath, backupPath);
+      return false;
+    }
+    const sanctuaryEntry = servers.sanctuary;
+    if (!sanctuaryEntry.command || typeof sanctuaryEntry.command !== "string") {
+      console.error(`
+  Verification FAILED: Sanctuary entry has no command.`);
+      await restoreFromBackup(configPath, backupPath);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error(`
+  Verification FAILED: ${err.message}`);
+    await restoreFromBackup(configPath, backupPath);
+    return false;
+  }
+}
+async function restoreFromBackup(configPath, backupPath) {
+  try {
+    await restoreConfig(backupPath, configPath);
+    console.error(`  Original config restored from backup.`);
+    console.error(`  Backup preserved at: ${backupPath}
+`);
+  } catch (restoreErr) {
+    console.error(
+      `  CRITICAL: Could not restore backup from ${backupPath}`
+    );
+    console.error(`  Error: ${restoreErr.message}`);
+    console.error(`  Manual recovery: copy ${backupPath} to ${configPath}
+`);
+  }
+}
+async function unwrap() {
+  const meta = await findLatestBackup();
+  if (!meta) {
+    console.error("No Sanctuary wrap found to restore.");
+    console.error("Run `sanctuary wrap --openclaw` first.");
+    process.exit(1);
+  }
+  try {
+    await access(meta.backupPath);
+  } catch {
+    console.error(`Backup file not found: ${meta.backupPath}`);
+    process.exit(1);
+  }
+  await restoreConfig(meta.backupPath, meta.originalPath);
+  console.error(`
+  Sanctuary \u2014 Unwrapped`);
+  console.error(`  Original config restored to: ${meta.originalPath}`);
+  console.error(`  Backup preserved at: ${meta.backupPath}
+`);
+}
+function convertToUpstreamServers(servers) {
+  return servers.map((server) => ({
+    name: server.name,
+    transport: server.transport === "sse" ? { type: "sse", url: server.url } : {
+      type: "stdio",
+      command: server.command,
+      ...server.args ? { args: server.args } : {},
+      ...server.env ? { env: server.env } : {}
+    },
+    enabled: true,
+    default_tier: 2
+  }));
+}
+function createWrapProfile(upstream) {
+  return {
+    version: 1,
+    features: {
+      audit_logging: { enabled: true },
+      injection_detection: { enabled: true },
+      context_gating: { enabled: false },
+      approval_gate: { enabled: true },
+      zk_proofs: { enabled: false }
+    },
+    upstream_servers: upstream,
+    updated_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function generateAuthToken() {
+  return randomBytes$1(24).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function toolNameFor(platform4, _servers) {
+  switch (platform4) {
+    case "openclaw":
+      return "OpenClaw";
+    case "claude-code":
+      return "Claude Code";
+    case "cursor":
+      return "Cursor";
+    default:
+      return "your agent";
+  }
+}
+function countUpstreamTools(servers) {
+  return servers.length === 0 ? 0 : servers.length;
+}
+function readPackageVersion() {
+  return SANCTUARY_VERSION;
+}
+function parseWrapArgs(argv) {
+  const options = {};
+  for (let i = 0; i < argv.length; i++) {
+    switch (argv[i]) {
+      case "--wrap":
+        options.wrap = argv[++i];
+        break;
+      case "--openclaw":
+        options.openclaw = true;
+        break;
+      case "--claude-code":
+        options.claudeCode = true;
+        break;
+      case "--cursor":
+        options.cursor = true;
+        break;
+      case "--unwrap":
+        options.unwrap = true;
+        break;
+      case "--passphrase":
+        options.passphrase = argv[++i];
+        break;
+      case "--port":
+        options.port = parseInt(argv[++i], 10);
+        break;
+      case "--dry-run":
+        options.dryRun = true;
+        break;
+      case "--no-open":
+        options.noOpen = true;
+        break;
+      case "--help":
+      case "-h":
+        printWrapHelp();
+        process.exit(0);
+    }
+  }
+  return options;
+}
+function printWrapHelp() {
+  console.log(`
+  sanctuary wrap \u2014 Wrap any agent in Sanctuary protection
+
+  Usage:
+    sanctuary wrap --openclaw          Wrap OpenClaw
+    sanctuary wrap --claude-code       Wrap Claude Code
+    sanctuary wrap --cursor            Wrap Cursor
+    sanctuary wrap --wrap <path>       Wrap a specific MCP config file
+    sanctuary wrap --unwrap            Restore original config
+
+  Options:
+    --openclaw         Auto-detect and wrap OpenClaw
+    --claude-code      Auto-detect and wrap Claude Code
+    --cursor           Auto-detect and wrap Cursor
+    --wrap <path>      Wrap a specific MCP config file
+    --unwrap           Restore original config from backup
+    --passphrase <p>   Override the stored passphrase (one-off)
+    --port <port>      Preferred dashboard port (default: 3501)
+    --dry-run          Show what would happen without making changes
+    --no-open          Do not auto-open the dashboard in a browser
+    --help, -h         Show this help
+
+  What happens:
+    1. Reads your agent's MCP config
+    2. Generates a passphrase (stored in Keychain on macOS, encrypted file elsewhere)
+    3. Backs up and rewrites the config so calls route through Sanctuary
+    4. Starts the Sovereignty Dashboard and opens it in your browser
+    5. Every tool call is logged, scanned, and tier-gated
+`);
+}
+var COCOON_GOVERNOR_DEFAULTS, DEFAULT_PORT2, MAX_PORT, parseCocoonArgs;
+var init_cli = __esm({
+  "src/cocoon/cli.ts"() {
+    init_config_reader();
+    init_passphrase();
+    init_dashboard2();
+    init_config();
+    COCOON_GOVERNOR_DEFAULTS = {
+      volume_limit: 200,
+      rate_limit_per_tool: 20,
+      lifetime_limit: 1e3
+    };
+    DEFAULT_PORT2 = 3501;
+    MAX_PORT = 3510;
+    parseCocoonArgs = parseWrapArgs;
+  }
+});
+
+// src/compliance/eu_ai_act/pdf.ts
+function assertFooterFits(leftFooterLength, rightLabelLength) {
+  const leftFooterWidth = leftFooterLength * FOOTER_CHAR_WIDTH;
+  const rightLabelWidth = rightLabelLength * FOOTER_CHAR_WIDTH;
+  const availableWidth = PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+  if (leftFooterWidth + rightLabelWidth + MIN_FOOTER_GUTTER > availableWidth) {
+    throw new Error(
+      `PDF footer overflow: left footer (${leftFooterWidth.toFixed(1)}pt) + right label (${rightLabelWidth.toFixed(1)}pt) + min gutter (${MIN_FOOTER_GUTTER}pt) > available column width (${availableWidth}pt). Shorten the left footer or reduce the digest prefix length in finaliseFooters().`
+    );
+  }
+}
+function escapePdfString(text) {
+  const replacements = [
+    [/§/g, "S."],
+    [/→/g, "->"],
+    [/—/g, "--"],
+    [/–/g, "-"],
+    [/✓/g, "[OK]"],
+    [/✗/g, "[X]"],
+    [/"/g, '"'],
+    [/"/g, '"'],
+    [/'/g, "'"],
+    [/'/g, "'"],
+    [/…/g, "..."],
+    [/©/g, "(c)"],
+    [/€/g, "EUR"],
+    [/[^\x20-\x7e\n]/g, "?"]
+    // fallback for any remaining non-ASCII
+  ];
+  let escaped = text;
+  for (const [re, rep] of replacements) {
+    escaped = escaped.replace(re, rep);
+  }
+  return escaped.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+}
+function wordWrap2(text, maxLineLength) {
+  if (maxLineLength <= 0) return [text];
+  const paragraphs = text.split("\n");
+  const out = [];
+  for (const para of paragraphs) {
+    if (para.length === 0) {
+      out.push("");
+      continue;
+    }
+    const words = para.split(/(\s+)/);
+    let current = "";
+    for (const token of words) {
+      if (current.length + token.length <= maxLineLength) {
+        current += token;
+      } else if (token.trim().length === 0) {
+        out.push(current);
+        current = "";
+      } else {
+        if (current.length > 0) out.push(current.trimEnd());
+        if (token.length > maxLineLength) {
+          let rest = token;
+          while (rest.length > maxLineLength) {
+            out.push(rest.slice(0, maxLineLength));
+            rest = rest.slice(maxLineLength);
+          }
+          current = rest;
+        } else {
+          current = token;
+        }
+      }
+    }
+    if (current.length > 0) out.push(current.trimEnd());
+  }
+  return out;
+}
+function markdownToLines(markdown) {
+  const lines = [];
+  const rawLines = markdown.split(/\r?\n/);
+  let inCodeBlock = false;
+  for (const raw of rawLines) {
+    if (raw.trim().startsWith("```")) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) {
+      lines.push({ kind: "body", text: stripInlineFormatting(raw) });
+      continue;
+    }
+    if (raw.trim().length === 0) {
+      lines.push({ kind: "blank", text: "" });
+      continue;
+    }
+    const trimmed = raw.trimStart();
+    if (trimmed.startsWith("# ")) {
+      lines.push({
+        kind: "h1",
+        text: stripInlineFormatting(trimmed.slice(2))
+      });
+      continue;
+    }
+    if (trimmed.startsWith("## ")) {
+      lines.push({
+        kind: "h2",
+        text: stripInlineFormatting(trimmed.slice(3))
+      });
+      continue;
+    }
+    if (trimmed.startsWith("### ") || trimmed.startsWith("#### ")) {
+      const after = trimmed.replace(/^#+\s+/, "");
+      lines.push({ kind: "h3", text: stripInlineFormatting(after) });
+      continue;
+    }
+    if (/^-{3,}$/.test(trimmed)) {
+      lines.push({ kind: "body", text: "-".repeat(BODY_CHARS_PER_LINE) });
+      continue;
+    }
+    lines.push({ kind: "body", text: stripInlineFormatting(raw) });
+  }
+  return lines;
+}
+function stripInlineFormatting(text) {
+  return text.replace(/\*\*([^*]+)\*\*/g, "$1").replace(/\*([^*]+)\*/g, "$1").replace(/`([^`]+)`/g, "$1").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+}
+function renderBundleToPdf(bundle) {
+  const manifestDigestHex = (
+    // Use the manifest signature's first 48 hex chars as the footer
+    // identifier. Manifest signatures are base64url, not hex — we
+    // compute a synthetic hex identifier by mapping to ASCII-safe
+    // output here. For audit traceability, we actually want the
+    // canonical manifest content hash; that is stored per-file in
+    // the manifest's files[] array. The footer intentionally shows
+    // a truncated identifier as a visual cue, not a verification key.
+    syntheticManifestIdentifier(bundle)
+  );
+  const builder = new PdfBuilder(manifestDigestHex);
+  builder.writeDocument("EU AI Act Compliance Bundle", [
+    { kind: "blank", text: "" },
+    { kind: "body", text: `Agent DID: ${bundle.manifest.agent_did}` },
+    {
+      kind: "body",
+      text: `Reporting period: ${bundle.manifest.period_start} to ${bundle.manifest.period_end}`
+    },
+    {
+      kind: "body",
+      text: `Generated at: ${bundle.manifest.generated_at}`
+    },
+    {
+      kind: "body",
+      text: `Signer DID: ${bundle.manifest.signer.did}`
+    },
+    {
+      kind: "body",
+      text: `Regulation version: ${bundle.manifest.regulation_version}`
+    },
+    {
+      kind: "body",
+      text: `Matrix version: ${bundle.manifest.matrix_version}`
+    },
+    { kind: "blank", text: "" },
+    { kind: "h2", text: "Coverage summary" },
+    {
+      kind: "body",
+      text: `Full:        ${bundle.manifest.coverage_summary.full} rows (${bundle.manifest.coverage_summary.full_pct}%)`
+    },
+    {
+      kind: "body",
+      text: `Partial:     ${bundle.manifest.coverage_summary.partial} rows (${bundle.manifest.coverage_summary.partial_pct}%)`
+    },
+    {
+      kind: "body",
+      text: `Manual only: ${bundle.manifest.coverage_summary.manual_only} rows (${bundle.manifest.coverage_summary.manual_only_pct}%)`
+    },
+    { kind: "blank", text: "" },
+    { kind: "h2", text: "Disclaimer" },
+    {
+      kind: "body",
+      text: "This PDF is a human-readable render of the EU AI Act compliance bundle. The PDF itself is NOT cryptographically signed. Integrity verification must be performed against the Markdown files and the JSON manifest using the per-file SHA-256 digests and Ed25519 signatures recorded in 00_bundle_manifest.json."
+    },
+    { kind: "blank", text: "" },
+    {
+      kind: "body",
+      text: "NOT LEGAL ADVICE. Consult qualified legal counsel before filing."
+    }
+  ]);
+  const sortedFiles = [...bundle.files].sort(
+    (a, b) => a.filename.localeCompare(b.filename)
+  );
+  for (const file of sortedFiles) {
+    const title = titleForFilename(file.filename);
+    const lines = markdownToLines(file.content);
+    builder.writeDocument(title, lines);
+  }
+  return builder.build();
+}
+function titleForFilename(filename) {
+  const map = {
+    "01_annex_iv_technical_documentation.md": "01. Annex IV Technical Documentation",
+    "02_article_26_deployer_log.md": "02. Article 26 Deployer Log",
+    "03_article_12_automatic_logs.md": "03. Article 12 Automatic Logs",
+    "04_risk_management_summary.md": "04. Risk Management Summary",
+    "05_human_oversight_statement.md": "05. Human Oversight Statement",
+    "06_cryptographic_attestations.md": "06. Cryptographic Attestations",
+    "07_annex_iii_classification.md": "07. Annex III Classification",
+    "08_delta.md": "08. Bundle Delta Report"
+  };
+  return map[filename] ?? filename;
+}
+function syntheticManifestIdentifier(bundle) {
+  const first = bundle.manifest.files[0]?.sha256 ?? "0".repeat(64);
+  return first;
+}
+var PAGE_WIDTH, PAGE_HEIGHT, MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP, MARGIN_BOTTOM, BODY_FONT_SIZE, BODY_LINE_HEIGHT, BODY_CHAR_WIDTH, BODY_COLUMN_WIDTH, BODY_CHARS_PER_LINE, H1_FONT_SIZE, H2_FONT_SIZE, H3_FONT_SIZE, H1_LINE_HEIGHT, H2_LINE_HEIGHT, H3_LINE_HEIGHT, FOOTER_FONT_SIZE, FOOTER_CHAR_WIDTH, MIN_FOOTER_GUTTER, BODY_TOP_Y, BODY_BOTTOM_Y, PdfBuilder;
+var init_pdf = __esm({
+  "src/compliance/eu_ai_act/pdf.ts"() {
+    PAGE_WIDTH = 612;
+    PAGE_HEIGHT = 792;
+    MARGIN_LEFT = 72;
+    MARGIN_RIGHT = 72;
+    MARGIN_TOP = 72;
+    MARGIN_BOTTOM = 60;
+    BODY_FONT_SIZE = 10;
+    BODY_LINE_HEIGHT = 13;
+    BODY_CHAR_WIDTH = BODY_FONT_SIZE * 0.6;
+    BODY_COLUMN_WIDTH = PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+    BODY_CHARS_PER_LINE = Math.floor(BODY_COLUMN_WIDTH / BODY_CHAR_WIDTH);
+    H1_FONT_SIZE = 16;
+    H2_FONT_SIZE = 13;
+    H3_FONT_SIZE = 11;
+    H1_LINE_HEIGHT = 22;
+    H2_LINE_HEIGHT = 18;
+    H3_LINE_HEIGHT = 15;
+    FOOTER_FONT_SIZE = 8;
+    FOOTER_CHAR_WIDTH = FOOTER_FONT_SIZE * 0.6;
+    MIN_FOOTER_GUTTER = 24;
+    BODY_TOP_Y = PAGE_HEIGHT - MARGIN_TOP;
+    BODY_BOTTOM_Y = MARGIN_BOTTOM + 20;
+    PdfBuilder = class {
+      pages = [];
+      currentPage;
+      cursorY = BODY_TOP_Y;
+      manifestDigest;
+      constructor(manifestDigest) {
+        this.manifestDigest = manifestDigest;
+        this.currentPage = { operators: [], pageNumber: 1 };
+        this.pages.push(this.currentPage);
+      }
+      /** Begin a fresh page. */
+      newPage() {
+        this.currentPage = {
+          operators: [],
+          pageNumber: this.pages.length + 1
+        };
+        this.pages.push(this.currentPage);
+        this.cursorY = BODY_TOP_Y;
+      }
+      /** Force a page break before the next line. */
+      pageBreak() {
+        this.newPage();
+      }
+      /**
+       * Write one rendered line at the given size and font. Emits the
+       * PDF text-drawing operators to the current page's content stream
+       * and advances the Y cursor by the line height.
+       *
+       * Triggers an automatic page break if the line would land below
+       * the bottom margin reservation for the footer.
+       */
+      writeLine(text, fontResource, fontSize, lineHeight) {
+        if (this.cursorY - lineHeight < BODY_BOTTOM_Y) {
+          this.newPage();
+        }
+        const escaped = escapePdfString(text);
+        const op = [
+          "BT",
+          `/${fontResource} ${fontSize} Tf`,
+          `${MARGIN_LEFT} ${this.cursorY - fontSize} Td`,
+          `(${escaped}) Tj`,
+          "ET"
+        ].join("\n");
+        this.currentPage.operators.push(op);
+        this.cursorY -= lineHeight;
+      }
+      /** Render a sequence of parsed Markdown lines into the current page. */
+      writeDocument(title, lines) {
+        if (this.currentPage.operators.length > 0 || this.pages.indexOf(this.currentPage) > 0) {
+          this.newPage();
+        }
+        this.writeLine(title, "F2", H1_FONT_SIZE, H1_LINE_HEIGHT);
+        this.cursorY -= BODY_LINE_HEIGHT / 2;
+        for (const line of lines) {
+          if (line.kind === "blank") {
+            this.cursorY -= BODY_LINE_HEIGHT / 2;
+            if (this.cursorY - BODY_LINE_HEIGHT < BODY_BOTTOM_Y) {
+              this.newPage();
+            }
+            continue;
+          }
+          if (line.kind === "h1") {
+            this.writeLine(line.text, "F2", H1_FONT_SIZE, H1_LINE_HEIGHT);
+            continue;
+          }
+          if (line.kind === "h2") {
+            this.cursorY -= BODY_LINE_HEIGHT / 2;
+            this.writeLine(line.text, "F2", H2_FONT_SIZE, H2_LINE_HEIGHT);
+            continue;
+          }
+          if (line.kind === "h3") {
+            this.writeLine(line.text, "F2", H3_FONT_SIZE, H3_LINE_HEIGHT);
+            continue;
+          }
+          const wrapped = wordWrap2(line.text, BODY_CHARS_PER_LINE);
+          for (const wl of wrapped) {
+            this.writeLine(wl, "F1", BODY_FONT_SIZE, BODY_LINE_HEIGHT);
+          }
+        }
+      }
+      /**
+       * Render the footer on every page. Called just before serialisation.
+       * Footer format:
+       *
+       *   Sanctuary EU AI Act Compliance Bundle | Manifest SHA-256:
+       *   <first 16 chars of hex>...                    Page N of M
+       *
+       * The manifest digest is truncated to 16 hex chars (64 bits) — still
+       * collision-resistant for visual verification, and no one eyeballs
+       * 48+ hex characters. The middle-dot separator used in the Phase 2
+       * first draft was non-ASCII and got mangled by the ASCII
+       * substitution table, so it is replaced with a plain ASCII pipe.
+       *
+       * A width guard asserts that left-footer width + right-label width
+       * + MIN_FOOTER_GUTTER fits inside the available column width. If
+       * it does not, the builder throws a clear error naming the
+       * overflow — future-proofing against a longer bundle title or
+       * longer page-count label silently re-introducing the overlay.
+       */
+      finaliseFooters() {
+        const totalPages = this.pages.length;
+        const digestShort = this.manifestDigest.slice(0, 16) + "...";
+        const leftFooter = "Sanctuary EU AI Act Compliance Bundle | Manifest SHA-256: " + digestShort;
+        const worstCasePageLabel = `Page ${totalPages} of ${totalPages}`;
+        assertFooterFits(leftFooter.length, worstCasePageLabel.length);
+        for (const page of this.pages) {
+          const pageLabel = `Page ${page.pageNumber} of ${totalPages}`;
+          const leftOp = [
+            "BT",
+            `/F1 ${FOOTER_FONT_SIZE} Tf`,
+            `${MARGIN_LEFT} ${MARGIN_BOTTOM - 4} Td`,
+            `(${escapePdfString(leftFooter)}) Tj`,
+            "ET"
+          ].join("\n");
+          const rightX = PAGE_WIDTH - MARGIN_RIGHT - pageLabel.length * FOOTER_CHAR_WIDTH;
+          const rightOp = [
+            "BT",
+            `/F1 ${FOOTER_FONT_SIZE} Tf`,
+            `${rightX} ${MARGIN_BOTTOM - 4} Td`,
+            `(${escapePdfString(pageLabel)}) Tj`,
+            "ET"
+          ].join("\n");
+          page.operators.push(leftOp);
+          page.operators.push(rightOp);
+        }
+      }
+      /** Serialise the PDF to bytes. */
+      build() {
+        this.finaliseFooters();
+        const numPages = this.pages.length;
+        const firstPageObj = 5;
+        const firstContentObj = firstPageObj + numPages;
+        const objectBodies = [];
+        const kids = [];
+        for (let i = 0; i < numPages; i++) {
+          kids.push(`${firstPageObj + i} 0 R`);
+        }
+        objectBodies[1] = `<< /Type /Catalog /Pages 2 0 R >>`;
+        objectBodies[2] = `<< /Type /Pages /Kids [${kids.join(" ")}] /Count ${numPages} >>`;
+        objectBodies[3] = `<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>`;
+        objectBodies[4] = `<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Bold /Encoding /WinAnsiEncoding >>`;
+        for (let i = 0; i < numPages; i++) {
+          const pageObj = firstPageObj + i;
+          const contentObj = firstContentObj + i;
+          objectBodies[pageObj] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${PAGE_WIDTH} ${PAGE_HEIGHT}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${contentObj} 0 R >>`;
+          const streamContent = this.pages[i].operators.join("\n");
+          objectBodies[contentObj] = `<< /Length ${Buffer.byteLength(streamContent, "latin1")} >>
+stream
+${streamContent}
+endstream`;
+        }
+        const totalObjects = firstContentObj + numPages - 1;
+        const offsets = new Array(totalObjects + 1).fill(0);
+        const chunks = [];
+        let bytePos = 0;
+        const write = (s) => {
+          const buf = Buffer.from(s, "latin1");
+          chunks.push(buf);
+          bytePos += buf.length;
+        };
+        write("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+        for (let i = 1; i <= totalObjects; i++) {
+          offsets[i] = bytePos;
+          write(`${i} 0 obj
+${objectBodies[i]}
+endobj
+`);
+        }
+        const xrefPos = bytePos;
+        write(`xref
+0 ${totalObjects + 1}
+`);
+        write("0000000000 65535 f \n");
+        for (let i = 1; i <= totalObjects; i++) {
+          write(`${offsets[i].toString().padStart(10, "0")} 00000 n 
+`);
+        }
+        write(`trailer
+<< /Size ${totalObjects + 1} /Root 1 0 R >>
+`);
+        write(`startxref
+${xrefPos}
+%%EOF
+`);
+        return new Uint8Array(Buffer.concat(chunks));
+      }
+    };
+  }
+});
+
+// src/compliance/eu_ai_act/cli.ts
+var cli_exports2 = {};
+__export(cli_exports2, {
+  runCompliance: () => runCompliance
+});
+function parseArgs(args) {
+  if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
+    return {
+      subcommand: "help",
+      agentDid: "",
+      deploymentContext: {}
+    };
+  }
+  if (args[0] !== "eu-ai-act") {
+    throw new Error(
+      `Unknown compliance subcommand: "${args[0]}". Only "eu-ai-act" is supported in v1.`
+    );
+  }
+  const rest = args.slice(1);
+  if (rest.length === 0 || rest[0].startsWith("--")) {
+    throw new Error(
+      "Missing required <agent-did> positional argument. Usage: sanctuary-mcp-server compliance eu-ai-act <agent-did> [flags]"
+    );
+  }
+  const agentDid = rest[0];
+  const flags = rest.slice(1);
+  const opts = {
+    subcommand: "eu-ai-act",
+    agentDid,
+    deploymentContext: {}
+  };
+  for (let i = 0; i < flags.length; i++) {
+    const flag = flags[i];
+    const next = flags[i + 1];
+    switch (flag) {
+      case "--output":
+        opts.output = next;
+        i++;
+        break;
+      case "--period-start":
+        opts.periodStart = next;
+        i++;
+        break;
+      case "--period-end":
+        opts.periodEnd = next;
+        i++;
+        break;
+      case "--provider-name":
+        opts.deploymentContext.provider_legal_name = next;
+        i++;
+        break;
+      case "--provider-contact":
+        opts.deploymentContext.provider_contact = next;
+        i++;
+        break;
+      case "--annex-iii-class":
+        opts.deploymentContext.annex_iii_class = next;
+        i++;
+        break;
+      case "--intended-purpose":
+        opts.deploymentContext.intended_purpose = next;
+        i++;
+        break;
+      case "--vertical":
+        opts.deploymentContext.vertical = next;
+        i++;
+        break;
+      case "--passphrase":
+        opts.passphrase = next;
+        i++;
+        break;
+      case "--delta-from":
+        opts.deltaFrom = next;
+        i++;
+        break;
+      case "--publish-to-verascore":
+        opts.publishToVerascore = true;
+        break;
+      case "--verascore-url":
+        opts.verascoreUrl = next;
+        i++;
+        break;
+      case "--pdf":
+        opts.pdf = true;
+        break;
+      default:
+        throw new Error(`Unknown flag: "${flag}"`);
+    }
+  }
+  return opts;
+}
+function printHelp() {
+  const help = `
+Sanctuary \u2014 EU AI Act Compliance Bundle Generator
+
+USAGE
+  sanctuary-mcp-server compliance eu-ai-act <agent-did> [flags]
+
+POSITIONAL
+  <agent-did>              DID of the agent the bundle is for
+
+FLAGS
+  --output <dir>           Output directory (default: ./eu-ai-act-bundle-<ts>)
+  --period-start <iso>     Reporting period start (default: 30 days ago)
+  --period-end <iso>       Reporting period end (default: now)
+  --provider-name <name>   Legal provider name (enterprise legal entity)
+  --provider-contact <em>  Provider contact email
+  --annex-iii-class <lbl>  Annex III risk classification label
+  --intended-purpose <s>   One-sentence description of the agent
+  --vertical <name>        Vertical industry (finance, healthcare, hr, ...)
+  --passphrase <pass>      Master key passphrase (or SANCTUARY_PASSPHRASE env)
+  --delta-from <path>      Prior bundle directory to diff against; adds
+                           08_delta.md to the output
+  --publish-to-verascore   POST the signed manifest (not the document
+                           bodies) to Verascore as a post-generation
+                           side effect. Publish failure never fails the
+                           local bundle generation.
+  --verascore-url <url>    Override the Verascore base URL (HTTPS, must
+                           point to an allow-listed Verascore host).
+                           Defaults to https://verascore.ai.
+  --pdf                    Also render the Markdown bundle to a single
+                           PDF file (bundle.pdf) in the output directory.
+                           Hand-rolled minimal PDF writer, zero new
+                           dependencies. NOT cryptographically signed;
+                           integrity verification remains with the
+                           Markdown files and 00_bundle_manifest.json.
+  --help                   Print this help text
+
+OUTPUT
+  The bundle is written to the output directory as 7 files:
+
+    00_bundle_manifest.json              \u2014 signed index
+    01_annex_iv_technical_documentation.md
+    02_article_26_deployer_log.md
+    03_article_12_automatic_logs.md
+    04_risk_management_summary.md
+    05_human_oversight_statement.md
+    06_cryptographic_attestations.md
+
+  Every file is SHA-256 hashed and Ed25519-signed with the provider's
+  primary identity. The manifest carries the full coverage matrix
+  and per-row evidence attribution.
+
+NOT LEGAL ADVICE
+  This tool produces a technical compliance artifact. It is not
+  legal advice and does not constitute a legal interpretation of
+  Regulation (EU) 2024/1689. Consult qualified legal counsel before
+  filing or relying on the bundle for regulatory submission.
+`.trim();
+  console.log(help);
+}
+function defaultPeriod() {
+  const end = /* @__PURE__ */ new Date();
+  const start = new Date(end.getTime() - 30 * 24 * 60 * 60 * 1e3);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+function defaultOutputDir() {
+  const ts = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-").replace(/Z$/, "");
+  return `./eu-ai-act-bundle-${ts}`;
+}
+async function runCompliance(args) {
+  let opts;
+  try {
+    opts = parseArgs(args);
+  } catch (e) {
+    console.error(`Error: ${e.message}`);
+    console.error("");
+    printHelp();
+    process.exit(2);
+  }
+  if (opts.subcommand === "help") {
+    printHelp();
+    process.exit(0);
+  }
+  const period = defaultPeriod();
+  const periodStart = opts.periodStart ?? period.start;
+  const periodEnd = opts.periodEnd ?? period.end;
+  const outputDir = opts.output ?? defaultOutputDir();
+  console.error(
+    "[sanctuary compliance] Starting Sanctuary server instance..."
+  );
+  const { config, identityManager, masterKey, auditLog, policy } = await createSanctuaryServer({
+    passphrase: opts.passphrase ?? process.env.SANCTUARY_PASSPHRASE
+  });
+  console.error(
+    `[sanctuary compliance] Generating EU AI Act bundle for ${opts.agentDid}...`
+  );
+  const input = {
+    agent_did: opts.agentDid,
+    deployment_context: opts.deploymentContext,
+    period_start: periodStart,
+    period_end: periodEnd,
+    delta_from_bundle_path: opts.deltaFrom,
+    publish_to_verascore: opts.publishToVerascore,
+    verascore_url: opts.verascoreUrl
+  };
+  const bundle = await generateEuAiActBundle(input, {
+    config,
+    identityManager,
+    masterKey,
+    auditLog,
+    policy
+  });
+  await mkdir(outputDir, { recursive: true });
+  const manifestPath = join(outputDir, "00_bundle_manifest.json");
+  await writeFile(
+    manifestPath,
+    JSON.stringify(bundle.manifest, null, 2),
+    "utf-8"
+  );
+  let totalManualMarkers = 0;
+  for (const file of bundle.files) {
+    const path = join(outputDir, file.filename);
+    await writeFile(path, file.content, "utf-8");
+    totalManualMarkers += countManualInputMarkers(file.content);
+  }
+  let pdfPath;
+  if (opts.pdf) {
+    pdfPath = join(outputDir, "bundle.pdf");
+    const pdfBytes = renderBundleToPdf(bundle);
+    await writeFile(pdfPath, pdfBytes);
+  }
+  console.error("");
+  console.error(
+    "[sanctuary compliance] Bundle generation complete."
+  );
+  console.error("");
+  console.error(`  Output directory: ${outputDir}`);
+  console.error(`  Bundle version:   ${bundle.manifest.bundle_version}`);
+  console.error(
+    `  Matrix version:   ${bundle.manifest.matrix_version}`
+  );
+  console.error(
+    `  Regulation:       ${bundle.manifest.regulation_version}`
+  );
+  console.error(
+    `  Agent DID:        ${bundle.manifest.agent_did}`
+  );
+  console.error(
+    `  Reporting period: ${bundle.manifest.period_start} \u2192 ${bundle.manifest.period_end}`
+  );
+  console.error(
+    `  Signer DID:       ${bundle.manifest.signer.did}`
+  );
+  console.error(
+    `  Files generated:  ${bundle.files.length + 1} (6 Markdown + 1 manifest)`
+  );
+  console.error("");
+  console.error("  Coverage summary:");
+  console.error(
+    `    full:        ${bundle.manifest.coverage_summary.full} rows (${bundle.manifest.coverage_summary.full_pct}%)`
+  );
+  console.error(
+    `    partial:     ${bundle.manifest.coverage_summary.partial} rows (${bundle.manifest.coverage_summary.partial_pct}%)`
+  );
+  console.error(
+    `    manual_only: ${bundle.manifest.coverage_summary.manual_only} rows (${bundle.manifest.coverage_summary.manual_only_pct}%)`
+  );
+  console.error("");
+  console.error(
+    `  Unfilled [MANUAL INPUT REQUIRED] markers: ${totalManualMarkers}`
+  );
+  console.error(
+    "  Review each marker and replace with the relevant enterprise fact."
+  );
+  console.error("");
+  if (pdfPath) {
+    console.error("");
+    console.error(`  PDF render:       ${pdfPath}`);
+  }
+  if (bundle.publish_result) {
+    console.error("");
+    console.error("  Verascore publish:");
+    if (bundle.publish_result.published) {
+      console.error(
+        `    \u2713 published to ${bundle.publish_result.verascore_url} as ${bundle.publish_result.verascore_agent_id}`
+      );
+    } else {
+      console.error(`    \u2717 publish failed: ${bundle.publish_result.error}`);
+      console.error(
+        `    (bundle has been written to disk regardless \u2014 this is a pure side effect)`
+      );
+    }
+  }
+  console.error("");
+  console.error(
+    "  NOT LEGAL ADVICE. Consult qualified legal counsel before filing."
+  );
+  console.error("");
+  console.log(outputDir);
+}
+var init_cli2 = __esm({
+  "src/compliance/eu_ai_act/cli.ts"() {
+    init_src();
+    init_generator2();
+    init_render();
+    init_pdf();
+  }
+});
+
+// src/dashboard-standalone.ts
+var dashboard_standalone_exports = {};
+__export(dashboard_standalone_exports, {
+  startStandaloneDashboard: () => startStandaloneDashboard
+});
+async function startStandaloneDashboard(options = {}) {
+  process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
+  const config = await loadConfig(options.configPath);
+  await mkdir(config.storage_path, { recursive: true, mode: 448 });
+  const storage = new FilesystemStorage(`${config.storage_path}/state`);
+  let masterKey;
+  const passphrase = options.passphrase ?? process.env.SANCTUARY_PASSPHRASE;
+  if (passphrase) {
+    let existingParams;
+    try {
+      const raw = await storage.read("_meta", "key-params");
+      if (raw) {
+        const { bytesToString: bytesToString2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
+        existingParams = JSON.parse(bytesToString2(raw));
+      }
+    } catch {
+    }
+    const result = await deriveMasterKey(passphrase, existingParams);
+    masterKey = result.key;
+  } else {
+    const { hashToString: hashToString2 } = await Promise.resolve().then(() => (init_hashing(), hashing_exports));
+    const { stringToBytes: stringToBytes2, bytesToString: bytesToString2, fromBase64url: fromBase64url2, constantTimeEqual: constantTimeEqual2 } = await Promise.resolve().then(() => (init_encoding(), encoding_exports));
+    const existingHash = await storage.read("_meta", "recovery-key-hash");
+    if (existingHash) {
+      const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
+      if (!envRecoveryKey) {
+        throw new Error(
+          "Sanctuary Dashboard: Existing encrypted data found but no credentials provided.\nProvide SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY to start the dashboard.\nThe dashboard needs the same credentials as the MCP server to read encrypted data."
+        );
+      }
+      let recoveryKeyBytes;
+      try {
+        recoveryKeyBytes = fromBase64url2(envRecoveryKey);
+      } catch {
+        throw new Error(
+          "Sanctuary Dashboard: SANCTUARY_RECOVERY_KEY is not valid base64url."
+        );
+      }
+      if (recoveryKeyBytes.length !== 32) {
+        throw new Error(
+          "Sanctuary Dashboard: SANCTUARY_RECOVERY_KEY has incorrect length."
+        );
+      }
+      const providedHash = hashToString2(recoveryKeyBytes);
+      const storedHash = bytesToString2(existingHash);
+      const providedHashBytes = stringToBytes2(providedHash);
+      const storedHashBytes = stringToBytes2(storedHash);
+      if (!constantTimeEqual2(providedHashBytes, storedHashBytes)) {
+        throw new Error(
+          "Sanctuary Dashboard: Recovery key does not match. Use the exact recovery key from first run."
+        );
+      }
+      masterKey = recoveryKeyBytes;
+    } else {
+      const existingNamespaces = await storage.list("_meta");
+      const hasKeyParams = existingNamespaces.some((e) => e.key === "key-params");
+      if (hasKeyParams) {
+        throw new Error(
+          "Sanctuary Dashboard: Existing encrypted data found (passphrase-protected).\nProvide SANCTUARY_PASSPHRASE to start the dashboard.\nThe dashboard needs the same credentials as the MCP server to read encrypted data."
+        );
+      }
+      console.error(
+        "Warning: No existing Sanctuary data found. The standalone dashboard\nis typically started after the MCP server has been run at least once.\nGenerating a new master key for this installation.\n"
+      );
+      masterKey = generateRandomKey();
+      const recoveryKey = toBase64url(masterKey);
+      const keyHash = hashToString2(masterKey);
+      await storage.write("_meta", "recovery-key-hash", stringToBytes2(keyHash));
+      console.error(
+        `\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+\u2551  SANCTUARY: First Run \u2014 Recovery Key Generated          \u2551
+\u2551                                                          \u2551
+\u2551  Recovery Key: ${recoveryKey.slice(0, 20)}...             \u2551
+\u2551                                                          \u2551
+\u2551  SAVE THIS KEY. It will not be shown again.              \u2551
+\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D
+`
+      );
+    }
+  }
+  const auditLog = new AuditLog(storage, masterKey);
+  const policy = await loadPrincipalPolicy(config.storage_path);
+  const baseline = new BaselineTracker(storage, masterKey);
+  await baseline.load();
+  const dashboardPort = options.port ?? config.dashboard.port;
+  const dashboardHost = options.host ?? config.dashboard.host;
+  let authToken = config.dashboard.auth_token;
+  if (authToken === "auto") {
+    const { randomBytes: randomBytes6 } = await import('crypto');
+    authToken = randomBytes6(32).toString("hex");
+  }
+  const dashboard = new DashboardApprovalChannel({
+    port: dashboardPort,
+    host: dashboardHost,
+    timeout_seconds: policy.approval_channel.timeout_seconds,
+    auth_token: authToken,
+    tls: config.dashboard.tls,
+    auto_open: config.dashboard.auto_open ?? true
+    // Default to auto-open in standalone mode
+  });
+  const identityManager = new IdentityManager(storage, masterKey);
+  const loadResult = await identityManager.load();
+  const shrOpts = { config, identityManager, masterKey };
+  const handshakeResults = /* @__PURE__ */ new Map();
+  const profileStore = new SovereigntyProfileStore(storage, masterKey);
+  await profileStore.load();
+  dashboard.setDependencies({
+    policy,
+    baseline,
+    auditLog,
+    identityManager,
+    handshakeResults,
+    shrOpts,
+    sanctuaryConfig: config,
+    profileStore
+  });
+  dashboard.setStandaloneMode(true);
+  await dashboard.start();
+  console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
+  console.error(`Storage: ${config.storage_path}`);
+  console.error(`Identities loaded: ${loadResult.loaded}`);
+  console.error(`Listening: http://${dashboardHost}:${dashboardPort}`);
+  if (loadResult.total > 0 && loadResult.loaded === 0) {
+    console.error(
+      `
+\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+\u2551  \u26A0  WARNING: Encrypted identities found but NONE loaded     \u2551
+\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
+\u2551  ${loadResult.total} encrypted identity file(s) found on disk              \u2551
+\u2551  0 could be decrypted with the current master key            \u2551
+\u2551                                                              \u2551
+\u2551  This usually means SANCTUARY_PASSPHRASE is missing or       \u2551
+\u2551  incorrect. The dashboard will show empty panels.            \u2551
+\u2551                                                              \u2551
+\u2551  To fix: restart with the correct SANCTUARY_PASSPHRASE:      \u2551
+\u2551    SANCTUARY_PASSPHRASE=<your-passphrase> npx \\              \u2551
+\u2551      @sanctuary-framework/mcp-server dashboard               \u2551
+\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D
+`
+    );
+  } else if (loadResult.failed > 0) {
+    console.error(
+      `Warning: ${loadResult.failed} of ${loadResult.total} identity files could not be decrypted (possibly corrupted).`
+    );
+  }
+  const saveBaseline = () => {
+    baseline.save().catch(() => {
+    });
+  };
+  process.on("SIGINT", saveBaseline);
+  process.on("SIGTERM", saveBaseline);
+  return dashboard;
+}
+var init_dashboard_standalone = __esm({
+  "src/dashboard-standalone.ts"() {
+    init_config();
+    init_filesystem();
+    init_audit_log();
+    init_loader();
+    init_baseline();
+    init_dashboard();
+    init_key_derivation();
+    init_random();
+    init_encoding();
+    init_tools();
+    init_sovereignty_profile();
+  }
+});
+
+// src/cli.ts
+init_src();
 var REGISTRY_URL = "https://registry.npmjs.org/@sanctuary-framework/mcp-server/latest";
 var TIMEOUT_MS = 3e3;
 function isNewerVersion(current, latest) {
@@ -18940,10 +24742,30 @@ async function main() {
     await runStandaloneDashboard(args.slice(1));
     return;
   }
+  if (args[0] === "wrap") {
+    const { parseWrapArgs: parseWrapArgs2, runWrap: runWrap2 } = await Promise.resolve().then(() => (init_cli(), cli_exports));
+    const opts = parseWrapArgs2(args.slice(1));
+    await runWrap2(opts);
+    return;
+  }
   if (args[0] === "cocoon") {
-    const { parseCocoonArgs: parseCocoonArgs2, runCocoon: runCocoon2 } = await Promise.resolve().then(() => (init_cli(), cli_exports));
-    const cocoonOpts = parseCocoonArgs2(args.slice(1));
-    await runCocoon2(cocoonOpts);
+    console.error(
+      `
+  Note: \`cocoon\` is renamed to \`wrap\`. Use \`sanctuary wrap\` next time.
+`
+    );
+    const { parseWrapArgs: parseWrapArgs2, runWrap: runWrap2 } = await Promise.resolve().then(() => (init_cli(), cli_exports));
+    const opts = parseWrapArgs2(args.slice(1));
+    await runWrap2(opts);
+    return;
+  }
+  if (args[0] === "export-passphrase") {
+    await runExportPassphrase(args.slice(1));
+    return;
+  }
+  if (args[0] === "compliance") {
+    const { runCompliance: runCompliance2 } = await Promise.resolve().then(() => (init_cli2(), cli_exports2));
+    await runCompliance2(args.slice(1));
     return;
   }
   for (let i = 0; i < args.length; i++) {
@@ -18952,7 +24774,7 @@ async function main() {
     } else if (args[i] === "--passphrase" && args[i + 1]) {
       passphrase = args[++i];
     } else if (args[i] === "--help" || args[i] === "-h") {
-      printHelp();
+      printHelp2();
       process.exit(0);
     } else if (args[i] === "--version" || args[i] === "-v") {
       console.log(`@sanctuary-framework/mcp-server ${PKG_VERSION3}`);
@@ -19004,16 +24826,64 @@ Sanctuary Dashboard running (standalone mode). Press Ctrl+C to stop.
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }
-function printHelp() {
+async function runExportPassphrase(args) {
+  let assumeYes = false;
+  for (const a of args) {
+    if (a === "--yes" || a === "-y") assumeYes = true;
+    else if (a === "--help" || a === "-h") {
+      console.log(`
+  sanctuary export-passphrase \u2014 Print the stored passphrase to stdout.
+
+  Usage:
+    sanctuary export-passphrase [--yes]
+
+  Options:
+    --yes, -y    Skip confirmation prompt (for scripts)
+    --help, -h   Show this help
+
+  The passphrase derives every encryption key in ~/.sanctuary. Anyone who
+  has it can decrypt your state. Store the output in a password manager
+  and clear your terminal history afterwards.
+`);
+      process.exit(0);
+    }
+  }
+  const { readStoredPassphrase: readStoredPassphrase2 } = await Promise.resolve().then(() => (init_passphrase(), passphrase_exports));
+  const stored = await readStoredPassphrase2();
+  if (!stored) {
+    console.error("No stored passphrase found. Run `sanctuary wrap` first.");
+    process.exit(1);
+  }
+  if (!assumeYes) {
+    const readline = await import('readline/promises');
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stderr
+    });
+    const answer = await rl.question(
+      `
+  This will print your passphrase (from ${stored.location}) to stdout.
+  Continue? [y/N] `
+    );
+    rl.close();
+    if (!/^y(es)?$/i.test(answer.trim())) {
+      console.error("Aborted.");
+      process.exit(1);
+    }
+  }
+  process.stdout.write(stored.value + "\n");
+}
+function printHelp2() {
   console.log(`
 @sanctuary-framework/mcp-server v${PKG_VERSION3}
 
 Sovereignty infrastructure for agents in the agentic economy.
 
 Usage:
-  sanctuary-mcp-server [options]          # MCP server (stdio)
-  sanctuary-mcp-server dashboard [opts]   # Standalone dashboard
-  sanctuary-mcp-server cocoon [opts]      # Wrap agent in Cocoon protection
+  sanctuary [options]                     # MCP server (stdio)
+  sanctuary dashboard [opts]              # Standalone dashboard
+  sanctuary wrap [opts]                   # Wrap an agent in one command
+  sanctuary export-passphrase             # Print stored passphrase
 
 Options:
   --dashboard          Enable the Principal Dashboard (web UI)
@@ -19022,13 +24892,16 @@ Options:
   --version, -v        Show version
 
 Subcommands:
+  wrap                 Wrap an agent and start the dashboard in one command.
+                       Auto-generates a passphrase, auto-opens the browser.
+                       Use "sanctuary wrap --help" for options.
+
   dashboard            Start the dashboard as a standalone HTTP server.
                        Reads from the same storage as the MCP server.
-                       Use "sanctuary-mcp-server dashboard --help" for options.
+                       Use "sanctuary dashboard --help" for options.
 
-  cocoon               Wrap an existing agent in Sanctuary's enforcement chain.
-                       One command to protect any MCP-compatible agent.
-                       Use "sanctuary-mcp-server cocoon --help" for options.
+  export-passphrase    Print the stored passphrase to stdout after
+                       confirmation. Use this to back up or migrate.
 
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)

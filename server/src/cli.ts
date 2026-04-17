@@ -32,10 +32,26 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "wrap") {
+    const { parseWrapArgs, runWrap } = await import("./cocoon/cli.js");
+    const opts = parseWrapArgs(args.slice(1));
+    await runWrap(opts);
+    return;
+  }
+
   if (args[0] === "cocoon") {
-    const { parseCocoonArgs, runCocoon } = await import("./cocoon/cli.js");
-    const cocoonOpts = parseCocoonArgs(args.slice(1));
-    await runCocoon(cocoonOpts);
+    // Hidden deprecated alias — one-release grace period before removal.
+    console.error(
+      `\n  Note: \`cocoon\` is renamed to \`wrap\`. Use \`sanctuary wrap\` next time.\n`
+    );
+    const { parseWrapArgs, runWrap } = await import("./cocoon/cli.js");
+    const opts = parseWrapArgs(args.slice(1));
+    await runWrap(opts);
+    return;
+  }
+
+  if (args[0] === "export-passphrase") {
+    await runExportPassphrase(args.slice(1));
     return;
   }
 
@@ -135,6 +151,55 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   process.on("SIGTERM", shutdown);
 }
 
+async function runExportPassphrase(args: string[]): Promise<void> {
+  let assumeYes = false;
+  for (const a of args) {
+    if (a === "--yes" || a === "-y") assumeYes = true;
+    else if (a === "--help" || a === "-h") {
+      console.log(`
+  sanctuary export-passphrase — Print the stored passphrase to stdout.
+
+  Usage:
+    sanctuary export-passphrase [--yes]
+
+  Options:
+    --yes, -y    Skip confirmation prompt (for scripts)
+    --help, -h   Show this help
+
+  The passphrase derives every encryption key in ~/.sanctuary. Anyone who
+  has it can decrypt your state. Store the output in a password manager
+  and clear your terminal history afterwards.
+`);
+      process.exit(0);
+    }
+  }
+
+  const { readStoredPassphrase } = await import("./cocoon/passphrase.js");
+  const stored = await readStoredPassphrase();
+  if (!stored) {
+    console.error("No stored passphrase found. Run `sanctuary wrap` first.");
+    process.exit(1);
+  }
+
+  if (!assumeYes) {
+    const readline = await import("node:readline/promises");
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stderr,
+    });
+    const answer = await rl.question(
+      `\n  This will print your passphrase (from ${stored.location}) to stdout.\n  Continue? [y/N] `
+    );
+    rl.close();
+    if (!/^y(es)?$/i.test(answer.trim())) {
+      console.error("Aborted.");
+      process.exit(1);
+    }
+  }
+
+  process.stdout.write(stored.value + "\n");
+}
+
 function printHelp(): void {
   console.log(`
 @sanctuary-framework/mcp-server v${PKG_VERSION}
@@ -142,9 +207,10 @@ function printHelp(): void {
 Sovereignty infrastructure for agents in the agentic economy.
 
 Usage:
-  sanctuary-mcp-server [options]          # MCP server (stdio)
-  sanctuary-mcp-server dashboard [opts]   # Standalone dashboard
-  sanctuary-mcp-server cocoon [opts]      # Wrap agent in Cocoon protection
+  sanctuary [options]                     # MCP server (stdio)
+  sanctuary dashboard [opts]              # Standalone dashboard
+  sanctuary wrap [opts]                   # Wrap an agent in one command
+  sanctuary export-passphrase             # Print stored passphrase
 
 Options:
   --dashboard          Enable the Principal Dashboard (web UI)
@@ -153,13 +219,16 @@ Options:
   --version, -v        Show version
 
 Subcommands:
+  wrap                 Wrap an agent and start the dashboard in one command.
+                       Auto-generates a passphrase, auto-opens the browser.
+                       Use "sanctuary wrap --help" for options.
+
   dashboard            Start the dashboard as a standalone HTTP server.
                        Reads from the same storage as the MCP server.
-                       Use "sanctuary-mcp-server dashboard --help" for options.
+                       Use "sanctuary dashboard --help" for options.
 
-  cocoon               Wrap an existing agent in Sanctuary's enforcement chain.
-                       One command to protect any MCP-compatible agent.
-                       Use "sanctuary-mcp-server cocoon --help" for options.
+  export-passphrase    Print the stored passphrase to stdout after
+                       confirmation. Use this to back up or migrate.
 
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)

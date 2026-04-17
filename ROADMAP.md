@@ -10,7 +10,7 @@
 - Collapse YAML/TS policy sources of truth into single authoritative source
 - Remove `tool_overrides` from UpstreamServer (tier assignment from Principal Policy only)
 
-### Cocoon Runtime Enforcement
+### Runtime Wrap Enforcement
 - Move from config-rewriting to actual runtime MCP proxy interception
 - Enforce principal policy at the transport layer, not just the configuration layer
 

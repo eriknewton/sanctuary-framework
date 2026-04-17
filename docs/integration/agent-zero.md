@@ -103,7 +103,8 @@ server (v0.9.3+). An Agent Zero instance running Sanctuary can be consumed by
 Claude Agent SDK, Managed Agents, or any other MCP client — creating a
 sovereignty-enabled Agent Zero bridge. Note: Sanctuary tools are NOT
 automatically re-exported through Agent Zero's MCP server interface. For tool
-passthrough, use Sanctuary's MCP Proxy mode (Cocoon).
+passthrough, wrap the agent with `sanctuary wrap` so all calls flow through
+Sanctuary's proxy enforcement chain.
 
 **Docker deployment.** Agent Zero commonly runs in Docker. Ensure Node.js 18+
 is available in the container:
@@ -159,7 +160,8 @@ agent to call `manifest` explicitly to see all 68 tools.
 **Agent Zero MCP server doesn't expose Sanctuary tools**
 Expected behavior. When Agent Zero exposes itself as an MCP server, it exports
 its own native tools, not tools from connected MCP servers like Sanctuary. For
-Sanctuary tool passthrough to downstream clients, use Sanctuary's Cocoon proxy.
+Sanctuary tool passthrough to downstream clients, wrap the agent with
+`sanctuary wrap` so Sanctuary sits in front of every tool call.
 
 **Permission errors on `~/.sanctuary/`**
 In Docker, ensure the container user has write access to `~/.sanctuary/`.

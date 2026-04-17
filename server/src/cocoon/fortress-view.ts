@@ -1,13 +1,13 @@
 /**
- * Sanctuary Cocoon — Fortress View
+ * Sanctuary — Fortress View
  *
  * Human-facing dashboard that answers three questions:
  * 1. Is my agent safe? (green/yellow/red status)
  * 2. What is my agent doing? (live tool call feed)
  * 3. What needs my attention? (pending approvals, alerts)
  *
- * This is the default landing page when the dashboard is accessed in Cocoon mode.
- * The existing detailed panels become the "Advanced" tab.
+ * This is the default landing page when the dashboard is launched via
+ * `sanctuary wrap`. The existing detailed panels become the "Advanced" tab.
  */
 
 export interface FortressViewOptions {
@@ -25,7 +25,7 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Sanctuary — Fortress View</title>
+  <title>Sanctuary</title>
   <style>
     :root {
       --bg: #0d1117;
@@ -414,7 +414,7 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
     <div class="fortress-brand">
       <div class="shield">&#x1F6E1;</div>
       <div>
-        <h1>Sanctuary Cocoon</h1>
+        <h1>Sanctuary</h1>
         <div class="version">v${esc(options.serverVersion)}</div>
       </div>
     </div>
