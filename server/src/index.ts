@@ -986,3 +986,28 @@ export type {
   BridgeAttestationRequest,
   BridgeAttestationResult,
 } from "./bridge/types.js";
+
+// ── Sovereignty Dashboard ───────────────────────────────────────────
+export {
+  startDashboard,
+  startDashboardServer,
+  getProtectionSnapshot,
+  renderDashboardHTML,
+  HERO_COPY,
+} from "./dashboard/index.js";
+export type {
+  StartDashboardOptions,
+  DashboardHandle,
+  DashboardServerOptions,
+  ProtectionSnapshot,
+  ActivityEntry,
+  PendingApproval,
+  ReputationLookup,
+  AggregatorSources,
+  L1Status,
+  L2Status,
+  L3Status,
+  L4Status,
+  ApprovalHandlers,
+  StreamEvent,
+} from "./dashboard/index.js";
