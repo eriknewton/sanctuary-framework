@@ -327,6 +327,21 @@ function transformDegradations(degradations: SHRDegradation[]): GatewayDegradati
       authzImpact = "Must share entire data context, cannot redact";
     } else if (deg.code === "BASIC_SYBIL_ONLY") {
       authzImpact = "Restrict to interactions with known agents only";
+    } else if (deg.code === "NO_REPUTATION_HISTORY") {
+      authzImpact =
+        "No prior reputation — treat as a new counterparty; require escrow or human approval for value transfer";
+    } else if (deg.code === "LOW_TIER_DOMINANCE") {
+      authzImpact =
+        "Reputation dominated by self-attested / unverified signers — weight accordingly, require additional confirmation on high-value actions";
+    } else if (deg.code === "STALE_REPUTATION") {
+      authzImpact =
+        "Reputation is stale — may not reflect current behavior; refresh before relying on it";
+    } else if (deg.code === "DISPUTE_ON_RECORD") {
+      authzImpact =
+        "Disputes on record — review dispute context before extending trust beyond low-value interactions";
+    } else if (deg.code === "NO_VERASCORE_LINK") {
+      authzImpact =
+        "No external reputation profile — counterparty cannot independently discover reputation bundle";
     } else {
       authzImpact = "Unknown authorization impact";
     }
