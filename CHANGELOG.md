@@ -4,15 +4,61 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## v0.8.0 (unreleased — on main, not yet published to npm)
+## v0.9.0-rc.3 (unreleased — in progress)
 
+### Fixed
+- Constant-time comparison for L3 commitment verification (audit #15)
+- Non-macOS fallback storage warning on first wrap (SEC-063)
+- Audit log size-based rotation with configurable limits (audit #18)
+
+### Changed
+- Bumped `@modelcontextprotocol/sdk` to ^1.29.0 — resolves path-to-regexp DoS, hono advisories
+- Removed 3 `as any` casts with typed adapters (audit #1, #2, #3)
+- Paginated reputation store `loadAll()` via async iterator (audit #31)
+- HKDF namespace key cache (LRU, 15-min TTL) in StateStore (audit #36)
+- Async TLS cert reads in dashboard (audit #33)
+- Combined zero-width char regex into single pattern (audit #38)
+- Refreshed CLAUDE.md and README version/tool claims to match v0.9.0-rc.1
+- Updated CHANGELOG to Keep-a-Changelog format through rc.3
+
+### Added
+- Test coverage for 9 previously untested source files
+- Regression tests for 1MB input cap and encoded-payload re-scanning mitigations
+
+## v0.9.0-rc.2 (2026-04-17)
+
+### Security
+- **SEC-061** — Removed `--passphrase` flag from rewritten agent config (was persisting passphrase as plaintext in argv)
+- **SEC-062** — Fallback passphrase file now distinguishes NOT_FOUND vs UNREADABLE; never auto-regenerates on decrypt failure
+
+### Added
+- `PassphraseUnreadableError` with remediation steps for failed decryption
+- `persistUserProvidedPassphrase()` — one-time passphrase setter that routes to Keychain/fallback
+
+## v0.9.0-rc.1 (2026-04-16)
+
+### Added
+- **Sovereignty Dashboard** — unified single-page "you are protected" view with SSE live updates, approval gate integration, and auto-open in browser
+- **`sanctuary wrap`** — one-command agent wrapping (replaces the 6-step manual setup)
+- macOS Keychain integration for passphrase storage
+- Dashboard screenshots in GitHub Release
+
+### Changed
+- Dropped "Cocoon" from all user-facing surfaces (deprecated alias retained)
+- `sanctuary` CLI bin alias added
+
+## v0.8.0 (2026-04-14)
+
+### Added
 - EU AI Act compliance artifact generator (Annex III classifier, delta mode, Verascore publish hook, PDF writer)
 - `memory_attest` tool (Ed25519 signed content hash attestation)
 - Test baseline hardening (pre-commit hook, CI workflow, branch protection runbook)
-- SIEM export reclassified to Tier 3
 - `identity_set_primary` tool with persistent primary identity tracking
 
-## v0.7.0 (current on npm — `npm install @sanctuary-framework/mcp-server@0.7.0`)
+### Changed
+- SIEM export reclassified to Tier 3
+
+## v0.7.0
 
 - Removed `sanctuary/` prefix from all 67 tool names (fixes OpenClaw double-mangling)
 - SIEM CEF/OCSF export (`audit_export_siem` tool)
@@ -398,5 +444,8 @@ See `docs/MIGRATION_v0.3_to_v0.4.md` for detailed upgrade instructions.
 - **0.2.x:** Initial foundation (L1–L4 core, identity, reputation)
 - **0.3.x:** Audit, federation, integration (sovereignty audit, SHR spec, handshake, integrations)
 - **0.4.x:** Lifecycle, hardening, composition (decommissioning, L2 hardening, gateway export, context gating)
-- **0.5.x (planned):** Signed tool provenance, SIEM integration, delegation chain metadata
+- **0.5.x–0.6.x:** Quickstart, bootstrap, SIEM, framework integrations
+- **0.7.x:** Tool name cleanup, Cocoon CLI
+- **0.8.x:** EU AI Act compliance, test baseline hardening
+- **0.9.x:** Sovereignty Dashboard, one-command wrap, security hardening, deep-audit polish
 

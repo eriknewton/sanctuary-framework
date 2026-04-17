@@ -105,13 +105,10 @@ const INVISIBLE_CHARS = [
 const VARIATION_SELECTOR_RANGE_START = 0xfe00;
 const VARIATION_SELECTOR_RANGE_END = 0xfe0f;
 
-// Zero-width characters (legacy array kept for backward compat in tests)
-const ZERO_WIDTH_CHARS = [
-  "\u200B", // Zero-width space
-  "\u200C", // Zero-width non-joiner
-  "\u200D", // Zero-width joiner
-  "\uFEFF", // Zero-width no-break space
-];
+// Zero-width chars detected via combined regex /[\u200B\u200C\u200D\uFEFF]/g
+// in detectEncodingEvasion(). Individual chars listed here for reference:
+// \u200B = Zero-width space, \u200C = Zero-width non-joiner,
+// \u200D = Zero-width joiner, \uFEFF = Zero-width no-break space (BOM)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SEC-034: Base64url pattern for encoded content detection
@@ -935,11 +932,9 @@ export class InjectionDetector {
       }
     }
 
-    // Zero-width character detection
-    let zeroWidthCount = 0;
-    for (const char of ZERO_WIDTH_CHARS) {
-      zeroWidthCount += (value.match(new RegExp(char, "g")) || []).length;
-    }
+    // Zero-width character detection — single combined regex instead of four passes
+    const zeroWidthMatches = value.match(/[\u200B\u200C\u200D\uFEFF]/g);
+    const zeroWidthCount = zeroWidthMatches ? zeroWidthMatches.length : 0;
 
     if (zeroWidthCount > 0) {
       signals.push({

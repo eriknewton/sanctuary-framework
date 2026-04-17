@@ -190,6 +190,20 @@ export class IdentityManager {
       key_protection: si.key_protection,
     }));
   }
+
+  /** List identities with rotation count (for dashboard display). */
+  listWithRotationCount(): Array<PublicIdentity & { rotation_count: number }> {
+    return Array.from(this.identities.values()).map((si) => ({
+      identity_id: si.identity_id,
+      label: si.label,
+      public_key: si.public_key,
+      did: si.did,
+      created_at: si.created_at,
+      key_type: si.key_type,
+      key_protection: si.key_protection,
+      rotation_count: si.rotation_history?.length ?? 0,
+    }));
+  }
 }
 
 /**

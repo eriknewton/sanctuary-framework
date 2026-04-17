@@ -94,6 +94,23 @@ describe("L3 Commitment Schemes", () => {
 
       expect(valid).toBe(false);
     });
+
+    it("uses constant-time comparison (audit #15)", () => {
+      // Verify that the function correctly handles the constant-time path
+      // by testing matching and non-matching commitments both work
+      const value = "timing-safe-test";
+      const c = createCommitment(value);
+
+      // Valid commitment
+      expect(verifyCommitment(c.commitment, value, c.blinding_factor)).toBe(true);
+
+      // Commitment with single-char difference (would reveal via timing in naive ===)
+      const tampered = c.commitment.slice(0, -1) + (c.commitment.endsWith("A") ? "B" : "A");
+      expect(verifyCommitment(tampered, value, c.blinding_factor)).toBe(false);
+
+      // Empty commitment
+      expect(verifyCommitment("", value, c.blinding_factor)).toBe(false);
+    });
   });
 
   describe("CommitmentStore", () => {

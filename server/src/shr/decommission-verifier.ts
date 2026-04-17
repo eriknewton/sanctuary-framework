@@ -75,7 +75,7 @@ export function verifyDecommissionCertificate(
   if (errors.length === 0) {
     try {
       // Canonicalize the body for verification
-      const canonical = canonicalizeSHR(cert.body as any);
+      const canonical = canonicalizeSHR(cert.body);
       const payload = stringToBytes(canonical);
 
       // Verify signature

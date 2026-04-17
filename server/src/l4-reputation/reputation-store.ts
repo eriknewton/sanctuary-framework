@@ -566,24 +566,41 @@ export class ReputationStore {
 
   private async loadAll(): Promise<StoredAttestation[]> {
     const results: StoredAttestation[] = [];
+    for await (const page of this.loadAllPaginated(100)) {
+      results.push(...page);
+    }
+    return results;
+  }
 
+  /**
+   * Cursor-based async iterator that loads attestations in pages.
+   * Prevents OOM at 100K+ records by reading and decrypting in batches.
+   */
+  async *loadAllPaginated(
+    pageSize = 100
+  ): AsyncGenerator<StoredAttestation[]> {
+    let entries: Array<{ key: string }>;
     try {
-      const entries = await this.storage.list("_reputation");
-      for (const meta of entries) {
+      entries = await this.storage.list("_reputation");
+    } catch {
+      return; // Storage not available
+    }
+
+    for (let i = 0; i < entries.length; i += pageSize) {
+      const page: StoredAttestation[] = [];
+      const slice = entries.slice(i, i + pageSize);
+      for (const meta of slice) {
         const raw = await this.storage.read("_reputation", meta.key);
         if (!raw) continue;
         try {
           const encrypted: EncryptedPayload = JSON.parse(bytesToString(raw));
           const decrypted = decrypt(encrypted, this.encryptionKey);
-          results.push(JSON.parse(bytesToString(decrypted)));
+          page.push(JSON.parse(bytesToString(decrypted)));
         } catch {
           // Skip corrupted entries
         }
       }
-    } catch {
-      // Storage not available
+      if (page.length > 0) yield page;
     }
-
-    return results;
   }
 }

@@ -122,6 +122,12 @@ export interface WriteOptions {
   tags?: string[];
 }
 
+/** Cached namespace key with TTL */
+interface CachedKey {
+  key: Uint8Array;
+  expiresAt: number;
+}
+
 export class StateStore {
   private storage: StorageBackend;
   private masterKey: Uint8Array;
@@ -132,9 +138,46 @@ export class StateStore {
   // Cache of content hashes per namespace for Merkle tree computation
   private contentHashes = new Map<string, Map<string, string>>();
 
+  // LRU-with-TTL cache for derived namespace keys (avoids repeated HKDF)
+  private namespaceKeyCache = new Map<string, CachedKey>();
+  private static readonly KEY_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+  private static readonly KEY_CACHE_MAX_ENTRIES = 128;
+
   constructor(storage: StorageBackend, masterKey: Uint8Array) {
     this.storage = storage;
     this.masterKey = masterKey;
+  }
+
+  /**
+   * Get or derive a namespace encryption key, with caching.
+   * Cache entries expire after 15 minutes and are evicted LRU when
+   * the cache exceeds 128 entries.
+   */
+  private getNamespaceKey(namespace: string): Uint8Array {
+    const now = Date.now();
+    const cached = this.namespaceKeyCache.get(namespace);
+    if (cached && cached.expiresAt > now) {
+      return cached.key;
+    }
+
+    // Evict expired or LRU entries if at capacity
+    if (this.namespaceKeyCache.size >= StateStore.KEY_CACHE_MAX_ENTRIES) {
+      // Remove oldest entry (Map iteration order = insertion order)
+      const firstKey = this.namespaceKeyCache.keys().next().value;
+      if (firstKey !== undefined) this.namespaceKeyCache.delete(firstKey);
+    }
+
+    const derived = deriveNamespaceKey(this.masterKey, namespace);
+    this.namespaceKeyCache.set(namespace, {
+      key: derived,
+      expiresAt: now + StateStore.KEY_CACHE_TTL_MS,
+    });
+    return derived;
+  }
+
+  /** Invalidate all cached namespace keys (call on master key rotation). */
+  invalidateKeyCache(): void {
+    this.namespaceKeyCache.clear();
   }
 
   private versionKey(namespace: string, key: string): string {
@@ -195,7 +238,7 @@ export class StateStore {
     identityEncryptionKey: Uint8Array,
     options: WriteOptions = {}
   ): Promise<WriteResult> {
-    const namespaceKey = deriveNamespaceKey(this.masterKey, namespace);
+    const namespaceKey = this.getNamespaceKey(namespace);
     const plaintext = stringToBytes(value);
 
     // Compute integrity hash of plaintext
@@ -309,7 +352,7 @@ export class StateStore {
     }
 
     // Decrypt
-    const namespaceKey = deriveNamespaceKey(this.masterKey, namespace);
+    const namespaceKey = this.getNamespaceKey(namespace);
     const plaintext = decrypt(stateEntry.payload, namespaceKey);
     const value = bytesToString(plaintext);
 

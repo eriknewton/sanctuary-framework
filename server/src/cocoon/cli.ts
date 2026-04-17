@@ -250,6 +250,25 @@ export async function runWrap(
     }
   }
 
+  // Emit fallback-storage warning (SEC-063) when not using Keychain.
+  // One-time: only on first wrap (source === "generated") when the location
+  // is the fallback file, not when reading back a pre-existing fallback.
+  const isFallbackGenerated =
+    passphraseSource === "generated" &&
+    passphraseLocation !== "macOS Keychain";
+  const isFallbackUserProvided =
+    passphraseSource === "fallback-file" &&
+    passphraseLocation !== "macOS Keychain";
+  if (isFallbackGenerated || (options.passphrase && isFallbackUserProvided)) {
+    console.error(
+      `\n  \u26A0  Passphrase stored in encrypted fallback file (machine-local key).` +
+      `\n     This is protected only against off-machine access. On macOS we use` +
+      `\n     Keychain by default. To migrate: \`sanctuary export-passphrase\` on` +
+      `\n     the current machine, then import into Keychain or pass via the` +
+      `\n     SANCTUARY_PASSPHRASE env var on the new machine.`
+    );
+  }
+
   // Write sovereignty profile.
   const storagePath = join(homedir(), ".sanctuary");
   await mkdir(storagePath, { recursive: true, mode: 0o700 });
