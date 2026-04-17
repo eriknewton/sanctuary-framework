@@ -83,6 +83,14 @@ jobs:
       - name: Gate 2 — run tests and capture output
         id: run_tests
         working-directory: server
+        # NO_COLOR / FORCE_COLOR=0 keep vitest's output ANSI-free so the
+        # grep-based gates 2b and 2c can parse the summary lines without
+        # tripping over color escape codes. Without this, vitest emits
+        # e.g. `Tests \e[1m\e[32m1328 passed\e[22m` which breaks the
+        # `Tests[[:space:]]+[0-9]+ passed` regex in Gate 2c.
+        env:
+          NO_COLOR: "1"
+          FORCE_COLOR: "0"
         run: |
           set -o pipefail
           # tee to both the GitHub Actions log and a file we parse
