@@ -128,6 +128,565 @@ interface StorageBackend {
 }
 
 /**
+ * Sanctuary MCP Server — L2 Operational Isolation: Audit Log
+ *
+ * Append-only log of all sovereignty-relevant operations.
+ * Stored encrypted under L1 sovereignty.
+ *
+ * Every tool invocation that modifies state, generates proofs,
+ * or records reputation produces an audit entry. The human principal
+ * can inspect what their agent has done.
+ */
+
+interface AuditEntry {
+    timestamp: string;
+    layer: "l1" | "l2" | "l3" | "l4";
+    operation: string;
+    identity_id: string;
+    result: "success" | "failure";
+    details?: Record<string, unknown>;
+}
+declare class AuditLog {
+    private storage;
+    private encryptionKey;
+    private entries;
+    private counter;
+    constructor(storage: StorageBackend, masterKey: Uint8Array);
+    /**
+     * Append an audit entry.
+     */
+    append(layer: AuditEntry["layer"], operation: string, identityId: string, details?: Record<string, unknown>, result?: "success" | "failure"): void;
+    private persistEntry;
+    /**
+     * Query the audit log with filtering.
+     */
+    query(options: {
+        since?: string;
+        layer?: AuditEntry["layer"];
+        operation_type?: string;
+        limit?: number;
+    }): Promise<{
+        entries: AuditEntry[];
+        total: number;
+    }>;
+    private loadPersistedEntries;
+    /**
+     * Get total number of entries.
+     */
+    get size(): number;
+}
+
+/**
+ * Sanctuary MCP Server — Principal Policy Types
+ *
+ * Type definitions for the Principal Policy system.
+ * The Principal Policy is the human-controlled, agent-immutable
+ * configuration that gates operations through approval tiers.
+ */
+/** Tier 2 anomaly action: what to do when an anomaly is detected */
+type AnomalyAction = "approve" | "log" | "allow";
+/** Tier 2 anomaly detection configuration */
+interface Tier2Config {
+    /** Action when agent accesses a namespace it hasn't used before */
+    new_namespace_access: AnomalyAction;
+    /** Action when agent interacts with an unknown counterparty DID */
+    new_counterparty: AnomalyAction;
+    /** Tool call frequency multiplier that triggers anomaly */
+    frequency_spike_multiplier: number;
+    /** Maximum signing operations per minute before triggering */
+    max_signs_per_minute: number;
+    /** Reading more than N keys in a namespace within 60 seconds */
+    bulk_read_threshold: number;
+    /** Policy for first session when no baseline exists */
+    first_session_policy: AnomalyAction;
+}
+/** Approval channel configuration */
+interface ApprovalChannelConfig {
+    type: "stderr" | "webhook" | "callback";
+    timeout_seconds: number;
+    /**
+     * SEC-002: auto_deny is hardcoded to true and not configurable.
+     * Timeout on any approval channel ALWAYS results in denial.
+     * This field is retained for backward compatibility with existing
+     * policy files but is ignored — timeout always denies.
+     */
+    auto_deny?: boolean;
+    webhook_url?: string;
+    webhook_secret?: string;
+}
+/** Complete Principal Policy */
+interface PrincipalPolicy {
+    version: number;
+    /** Operations that always require human approval */
+    tier1_always_approve: string[];
+    /** Behavioral anomaly detection configuration */
+    tier2_anomaly: Tier2Config;
+    /** Operations that never require approval (audit only) */
+    tier3_always_allow: string[];
+    /** How approval requests reach the human */
+    approval_channel: ApprovalChannelConfig;
+}
+/** Approval request sent to the human */
+interface ApprovalRequest {
+    operation: string;
+    tier: 1 | 2;
+    reason: string;
+    context: Record<string, unknown>;
+    timestamp: string;
+}
+/** Approval response from the human */
+interface ApprovalResponse {
+    decision: "approve" | "deny";
+    decided_at: string;
+    decided_by: "human" | "timeout" | "auto" | "stderr:non-interactive";
+}
+/** Result of the approval gate evaluation */
+interface GateResult {
+    allowed: boolean;
+    tier: 1 | 2 | 3;
+    reason: string;
+    approval_required: boolean;
+    approval_response?: ApprovalResponse;
+}
+/** Behavioral baseline for anomaly detection */
+interface SessionProfile {
+    /** Namespaces accessed (read or write) */
+    known_namespaces: string[];
+    /** Counterparty DIDs seen in reputation operations */
+    known_counterparties: string[];
+    /** Tool call counts per tool name (lifetime in session) */
+    tool_call_counts: Record<string, number>;
+    /** Whether this is the first session (no prior baseline) */
+    is_first_session: boolean;
+    /** Session start time */
+    started_at: string;
+    /** When the baseline was last saved */
+    saved_at?: string;
+}
+
+/**
+ * Sanctuary MCP Server — Approval Channel
+ *
+ * Out-of-band communication with the human principal for operation approval.
+ * The default channel uses stderr (outside MCP's stdin/stdout protocol),
+ * ensuring the agent cannot intercept or forge approval responses.
+ *
+ * Security invariant:
+ * - Approval prompts go through a channel the agent cannot access.
+ * - Timeouts result in denial by default (fail closed).
+ */
+
+/** Abstract approval channel interface */
+interface ApprovalChannel {
+    requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
+}
+/**
+ * Stderr approval channel — non-interactive informational channel.
+ *
+ * In the MCP stdio model:
+ * - stdin/stdout carry the MCP protocol (JSON-RPC)
+ * - stderr is available for out-of-band human communication
+ *
+ * Because stdin is consumed by the MCP JSON-RPC transport, this channel
+ * CANNOT read interactive human input. It is strictly informational:
+ * the prompt is displayed so the human sees what is happening, and the
+ * operation is denied immediately.
+ *
+ * SEC-002 + SEC-016 invariants:
+ * - This channel ALWAYS denies. No configuration can change this.
+ * - There is no timeout or async delay — denial is synchronous.
+ * - The `auto_deny` config field is ignored (SEC-002).
+ * - For interactive approval, use the dashboard or webhook channel.
+ */
+declare class StderrApprovalChannel implements ApprovalChannel {
+    constructor(_config: ApprovalChannelConfig);
+    requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
+    private formatPrompt;
+}
+/**
+ * Programmatic approval channel — for testing and API integration.
+ */
+declare class CallbackApprovalChannel implements ApprovalChannel {
+    private callback;
+    constructor(callback: (request: ApprovalRequest) => Promise<ApprovalResponse>);
+    requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
+}
+/**
+ * Auto-approve channel — for testing. Approves everything.
+ */
+declare class AutoApproveChannel implements ApprovalChannel {
+    requestApproval(_request: ApprovalRequest): Promise<ApprovalResponse>;
+}
+
+/**
+ * Sanctuary MCP Server — Behavioral Baseline Tracker
+ *
+ * Tracks the agent's behavioral profile during a session and persists
+ * it for cross-session anomaly detection. The baseline defines "normal"
+ * so that deviations can trigger Tier 2 approval.
+ *
+ * Security invariants:
+ * - Baseline is stored encrypted under L1 sovereignty
+ * - Baseline changes are audit-logged
+ * - Baseline is integrity-verified via L1 Merkle tree
+ * - No MCP tool can directly modify the baseline
+ */
+
+declare class BaselineTracker {
+    private storage;
+    private encryptionKey;
+    private profile;
+    /** Sliding window: timestamps of tool calls per tool name (last 60s) */
+    private callWindows;
+    /** Sliding window: read counts per namespace (last 60s) */
+    private readWindows;
+    /** Sliding window: sign call timestamps (last 60s) */
+    private signWindow;
+    constructor(storage: StorageBackend, masterKey: Uint8Array);
+    /**
+     * Load the previous session's baseline from storage.
+     * If none exists, this is a first session.
+     */
+    load(): Promise<void>;
+    /**
+     * Save the current baseline to storage (encrypted).
+     * Called at session end or periodically.
+     */
+    save(): Promise<void>;
+    /**
+     * Record a tool call for baseline tracking.
+     * Returns anomaly information if applicable.
+     */
+    recordToolCall(toolName: string): void;
+    /**
+     * Record a namespace access.
+     * @returns true if this is a new namespace (not in baseline)
+     */
+    recordNamespaceAccess(namespace: string): boolean;
+    /**
+     * Record a namespace read for bulk-read detection.
+     * @returns the number of reads in the current 60-second window
+     */
+    recordNamespaceRead(namespace: string): number;
+    /**
+     * Record a counterparty DID interaction.
+     * @returns true if this is a new counterparty (not in baseline)
+     */
+    recordCounterparty(did: string): boolean;
+    /**
+     * Record a signing operation.
+     * @returns the number of signs in the current 60-second window
+     */
+    recordSign(): number;
+    /**
+     * Get the current call rate for a tool (calls per minute).
+     */
+    getCallRate(toolName: string): number;
+    /**
+     * Get the average call rate across all tools in the baseline.
+     */
+    getAverageCallRate(): number;
+    /** Whether this is the first session */
+    get isFirstSession(): boolean;
+    /** Get a read-only view of the current profile */
+    getProfile(): SessionProfile;
+}
+
+/**
+ * Sanctuary MCP Server — Prompt Injection Detection Layer
+ *
+ * Fast, zero-dependency detection of common prompt injection patterns.
+ * Scans tool arguments for role override, security bypass, encoding evasion,
+ * data exfiltration, and prompt stuffing signals.
+ *
+ * SEC-034/SEC-035: Enhanced with Unicode sanitization pre-pass, decoded content
+ * re-scanning, token budget analysis, and outbound content scanning.
+ *
+ * Security invariants:
+ * - Always returns a result, never throws
+ * - Typical scan completes in < 5ms
+ * - False positives minimized via field-aware scanning
+ * - Recursive scanning of nested objects/arrays
+ * - Outbound scanning catches secret leaks and injection artifact survival
+ */
+interface InjectionDetectorConfig {
+    enabled: boolean;
+    sensitivity: "low" | "medium" | "high";
+    on_detection: "escalate" | "block" | "log";
+    custom_patterns?: string[];
+}
+interface InjectionSignal {
+    type: string;
+    pattern: string;
+    location: string;
+    severity: "low" | "medium" | "high";
+}
+interface DetectionResult {
+    flagged: boolean;
+    confidence: number;
+    signals: InjectionSignal[];
+    recommendation: "allow" | "escalate" | "block";
+}
+declare class InjectionDetector {
+    private config;
+    private stats;
+    constructor(config?: Partial<InjectionDetectorConfig>);
+    /**
+     * Scan tool arguments for injection signals.
+     * @param toolName Full tool name (e.g., "state_read")
+     * @param args Tool arguments
+     * @returns DetectionResult with all detected signals
+     */
+    scan(toolName: string, args: Record<string, unknown>): DetectionResult;
+    /**
+     * SEC-035: Scan outbound content for secret leaks, data exfiltration,
+     * internal path exposure, and injection artifact survival.
+     *
+     * @param content The outbound content string to scan
+     * @returns DetectionResult with outbound-specific signal types
+     */
+    scanOutbound(content: string): DetectionResult;
+    /**
+     * Recursively scan a value and all nested values.
+     */
+    private scanValue;
+    /**
+     * Scan a single string for injection signals.
+     */
+    private scanString;
+    /**
+     * Count invisible Unicode characters in a string.
+     * Includes zero-width chars, soft hyphens, directional marks,
+     * variation selectors, and other invisible categories.
+     */
+    private countInvisibleChars;
+    /**
+     * Strip invisible characters from a string for clean pattern matching.
+     * Returns a new string with all invisible chars removed.
+     */
+    private stripInvisibleChars;
+    /**
+     * SEC-034: Token budget attack detection.
+     * Some Unicode sequences expand dramatically during tokenization (e.g., CJK
+     * ideographs, combining characters, emoji sequences). If the estimated token
+     * cost per character is anomalously high, this may be a wallet-drain payload.
+     *
+     * Heuristic: count chars that typically tokenize into multiple tokens.
+     * If the ratio of estimated tokens to char count exceeds 3x, flag it.
+     */
+    private detectTokenBudgetAttack;
+    /**
+     * Detect encoded content (base64, hex, HTML entities, URL encoding),
+     * decode it, and re-scan the decoded content through injection patterns.
+     * If the decoded content contains injection patterns, flag as encoding_evasion.
+     */
+    private detectEncodedPayloads;
+    /**
+     * Check if a string contains any injection patterns (role override or security bypass).
+     */
+    private containsInjectionPatterns;
+    /**
+     * Safely decode a base64 string. Returns null if it's not valid base64
+     * or doesn't decode to a meaningful string.
+     */
+    private safeBase64Decode;
+    /**
+     * Safely decode a hex string. Returns null on failure.
+     */
+    private safeHexDecode;
+    /**
+     * Decode HTML numeric entities (&#xHH; and &#DDD;) in a string.
+     */
+    private decodeHtmlEntities;
+    /**
+     * Safely decode a URL-encoded string. Returns null on failure.
+     */
+    private safeUrlDecode;
+    /**
+     * Heuristic: does this look like readable text (vs. binary garbage)?
+     * Checks that most characters are printable ASCII or common Unicode.
+     */
+    private looksLikeText;
+    /**
+     * Detect API keys and secrets in outbound content.
+     */
+    private detectSecretPatterns;
+    /**
+     * Detect data exfiltration via markdown images with data-carrying query params.
+     */
+    private detectOutboundExfiltration;
+    /**
+     * Detect internal filesystem path leaks in outbound content.
+     */
+    private detectInternalPathLeaks;
+    /**
+     * Detect private IP addresses and localhost references in outbound content.
+     */
+    private detectPrivateNetworkLeaks;
+    /**
+     * Detect role markers / prompt template artifacts in outbound content.
+     * These should never appear in agent output — their presence indicates
+     * injection artifact survival.
+     */
+    private detectOutputRoleMarkers;
+    /**
+     * Detect base64 strings, base64url, and zero-width character evasion.
+     */
+    private detectEncodingEvasion;
+    /**
+     * Detect URLs and emails in fields that shouldn't have them.
+     */
+    private detectDataExfiltration;
+    /**
+     * Detect prompt stuffing: very large strings or high repetition.
+     */
+    private detectPromptStuffing;
+    /**
+     * Determine if this field is inherently safe from role override.
+     */
+    private isSafeField;
+    /**
+     * Determine if this is a tool name field (where tool refs are expected).
+     */
+    private isToolNameField;
+    /**
+     * Determine if this field is safe for URLs.
+     */
+    private isUrlSafeField;
+    /**
+     * Determine if this field is safe for emails.
+     */
+    private isEmailSafeField;
+    /**
+     * Determine if this field is safe for structured data (JSON/XML).
+     */
+    private isStructuredField;
+    /**
+     * SEC-032/SEC-034: Map common cross-script confusable characters to their
+     * Latin equivalents. NFKC normalization handles fullwidth and compatibility
+     * forms, but does NOT map Cyrillic/Greek/Armenian/Georgian lookalikes to
+     * Latin (they're distinct codepoints by design).
+     *
+     * Extended to 50+ confusable pairs covering Cyrillic, Greek, Armenian,
+     * Georgian, Cherokee, and mathematical/symbol lookalikes.
+     */
+    private normalizeConfusables;
+    /**
+     * Compute confidence score based on signals.
+     * More high-severity signals = higher confidence.
+     */
+    private computeConfidence;
+    /**
+     * Compute recommendation based on signals and sensitivity.
+     */
+    private computeRecommendation;
+    /**
+     * Get statistics about scans performed.
+     */
+    getStats(): {
+        total_scans: number;
+        total_flags: number;
+        total_blocks: number;
+        signals_by_type: Record<string, number>;
+    };
+    /**
+     * Reset statistics.
+     */
+    resetStats(): void;
+}
+
+/**
+ * Sanctuary MCP Server — Approval Gate
+ *
+ * The three-tier approval gate sits between the MCP router and tool handlers.
+ * Every tool call passes through the gate before execution.
+ *
+ * Evaluation order:
+ * 1. Tier 1: Is this operation in the always-approve list? → Request approval.
+ * 2. Tier 2: Does this call represent a behavioral anomaly? → Request approval.
+ * 3. Tier 3 / default: Allow with audit logging.
+ *
+ * Security invariants:
+ * - The gate cannot be bypassed — it wraps every tool handler.
+ * - Denial responses do not reveal policy details to the agent.
+ * - All gate decisions (approve, deny, allow) are audit-logged.
+ */
+
+/** Callback invoked when an injection is detected, for dashboard broadcasting */
+type InjectionAlertCallback = (alert: {
+    toolName: string;
+    result: DetectionResult;
+    timestamp: string;
+}) => void;
+/** Resolver for proxy tool tiers — provided by the ProxyRouter */
+type ProxyTierResolver = (toolName: string) => (1 | 2 | 3) | null;
+declare class ApprovalGate {
+    private policy;
+    private baseline;
+    private channel;
+    private auditLog;
+    private injectionDetector;
+    private onInjectionAlert?;
+    private proxyTierResolver?;
+    constructor(policy: PrincipalPolicy, baseline: BaselineTracker, channel: ApprovalChannel, auditLog: AuditLog, injectionDetector?: InjectionDetector, onInjectionAlert?: InjectionAlertCallback);
+    /**
+     * Set the proxy tier resolver. Called after the proxy router is initialized.
+     */
+    setProxyTierResolver(resolver: ProxyTierResolver): void;
+    /**
+     * Evaluate a tool call against the Principal Policy.
+     *
+     * @param toolName - Full MCP tool name (e.g., "state_export")
+     * @param args - Tool call arguments (for context extraction)
+     * @returns GateResult indicating whether the call is allowed
+     */
+    evaluate(toolName: string, args: Record<string, unknown>): Promise<GateResult>;
+    /**
+     * Detect Tier 2 behavioral anomalies.
+     */
+    private detectAnomaly;
+    /**
+     * Request approval from the human principal.
+     */
+    private requestApproval;
+    /**
+     * Summarize tool arguments for the approval prompt.
+     * Strips potentially large values to keep the prompt readable.
+     */
+    private summarizeArgs;
+    /** Get the baseline tracker for saving at session end */
+    getBaseline(): BaselineTracker;
+    /** Get the injection detector for stats/configuration access */
+    getInjectionDetector(): InjectionDetector;
+}
+
+/**
+ * Sanctuary MCP Server — Tool Router
+ *
+ * Routes sanctuary/* tool calls to their layer-specific handlers.
+ * Every tool call passes through schema validation and the ApprovalGate
+ * (if configured) before execution. Neither can be bypassed.
+ *
+ * This module is the abstraction boundary for MCP SDK version migration —
+ * if the SDK API changes, only this module needs updating.
+ */
+
+/** Tool handler function signature */
+type ToolHandler = (args: Record<string, unknown>) => Promise<{
+    content: Array<{
+        type: "text";
+        text: string;
+    }>;
+}>;
+/** Tool definition for registration */
+interface ToolDefinition {
+    name: string;
+    description: string;
+    inputSchema: Record<string, unknown>;
+    handler: ToolHandler;
+}
+
+/**
  * Sanctuary MCP Server — AES-256-GCM Encryption
  *
  * All state encryption in Sanctuary uses AES-256-GCM (authenticated encryption).
@@ -279,52 +838,74 @@ declare class StateStore {
 }
 
 /**
- * Sanctuary MCP Server — L2 Operational Isolation: Audit Log
+ * Sanctuary MCP Server — Ed25519 Identity Management
  *
- * Append-only log of all sovereignty-relevant operations.
- * Stored encrypted under L1 sovereignty.
+ * Sovereign identity based on Ed25519 keypairs.
+ * Private keys are always encrypted at rest — never stored in plaintext.
  *
- * Every tool invocation that modifies state, generates proofs,
- * or records reputation produces an audit entry. The human principal
- * can inspect what their agent has done.
+ * Security invariants:
+ * - Private keys never appear in any MCP tool response
+ * - Private keys are encrypted with identity-specific keys derived from the master key
+ * - Key rotation produces a signed rotation event (verifiable chain)
  */
 
-interface AuditEntry {
-    timestamp: string;
-    layer: "l1" | "l2" | "l3" | "l4";
-    operation: string;
+/** Public identity information (safe to share) */
+interface PublicIdentity {
     identity_id: string;
-    result: "success" | "failure";
-    details?: Record<string, unknown>;
+    label: string;
+    public_key: string;
+    did: string;
+    created_at: string;
+    key_type: "ed25519";
+    key_protection: "passphrase" | "hardware-key" | "recovery-key";
 }
-declare class AuditLog {
-    private storage;
-    private encryptionKey;
-    private entries;
-    private counter;
-    constructor(storage: StorageBackend, masterKey: Uint8Array);
-    /**
-     * Append an audit entry.
-     */
-    append(layer: AuditEntry["layer"], operation: string, identityId: string, details?: Record<string, unknown>, result?: "success" | "failure"): void;
-    private persistEntry;
-    /**
-     * Query the audit log with filtering.
-     */
-    query(options: {
-        since?: string;
-        layer?: AuditEntry["layer"];
-        operation_type?: string;
-        limit?: number;
-    }): Promise<{
-        entries: AuditEntry[];
-        total: number;
+/** Stored identity (private key is encrypted) */
+interface StoredIdentity extends PublicIdentity {
+    encrypted_private_key: EncryptedPayload;
+    /** Previous public keys (for rotation chain verification) */
+    rotation_history: Array<{
+        old_public_key: string;
+        new_public_key: string;
+        rotation_event: string;
+        rotated_at: string;
     }>;
-    private loadPersistedEntries;
-    /**
-     * Get total number of entries.
+}
+
+/**
+ * Sanctuary MCP Server — L1 Cognitive Sovereignty: Tool Definitions
+ *
+ * MCP tool wrappers for StateStore and IdentityRoot operations.
+ * These tools are the public API that agents interact with.
+ */
+
+/** Manages all identities — provides storage and retrieval */
+declare class IdentityManager {
+    private storage;
+    private masterKey;
+    private identities;
+    private primaryIdentityId;
+    private metadataKey;
+    constructor(storage: StorageBackend, masterKey: Uint8Array);
+    private get encryptionKey();
+    /** Load identities from storage on startup.
+     *  Returns { total: number of encrypted files found, loaded: number successfully decrypted }.
+     *  A mismatch (total > 0, loaded === 0) indicates a wrong master key / missing passphrase.
      */
-    get size(): number;
+    load(): Promise<{
+        total: number;
+        loaded: number;
+        failed: number;
+    }>;
+    /** Save an identity to storage */
+    save(identity: StoredIdentity): Promise<void>;
+    /** Set which identity is the default/primary identity */
+    setPrimary(identityId: string): Promise<boolean>;
+    /** Persist the primary identity ID to storage */
+    private savePrimaryIdentityId;
+    get(id: string): StoredIdentity | undefined;
+    getDefault(): StoredIdentity | undefined;
+    getPrimaryIdentityId(): string | null;
+    list(): PublicIdentity[];
 }
 
 /**
@@ -590,40 +1171,6 @@ declare class PolicyStore {
      */
     private loadAll;
     private persist;
-}
-
-/**
- * Sanctuary MCP Server — Ed25519 Identity Management
- *
- * Sovereign identity based on Ed25519 keypairs.
- * Private keys are always encrypted at rest — never stored in plaintext.
- *
- * Security invariants:
- * - Private keys never appear in any MCP tool response
- * - Private keys are encrypted with identity-specific keys derived from the master key
- * - Key rotation produces a signed rotation event (verifiable chain)
- */
-
-/** Public identity information (safe to share) */
-interface PublicIdentity {
-    identity_id: string;
-    label: string;
-    public_key: string;
-    did: string;
-    created_at: string;
-    key_type: "ed25519";
-    key_protection: "passphrase" | "hardware-key" | "recovery-key";
-}
-/** Stored identity (private key is encrypted) */
-interface StoredIdentity extends PublicIdentity {
-    encrypted_private_key: EncryptedPayload;
-    /** Previous public keys (for rotation chain verification) */
-    rotation_history: Array<{
-        old_public_key: string;
-        new_public_key: string;
-        rotation_event: string;
-        rotated_at: string;
-    }>;
 }
 
 /**
@@ -1494,516 +2041,6 @@ declare const MODEL_PRESETS: {
 };
 
 /**
- * Sanctuary MCP Server — Prompt Injection Detection Layer
- *
- * Fast, zero-dependency detection of common prompt injection patterns.
- * Scans tool arguments for role override, security bypass, encoding evasion,
- * data exfiltration, and prompt stuffing signals.
- *
- * SEC-034/SEC-035: Enhanced with Unicode sanitization pre-pass, decoded content
- * re-scanning, token budget analysis, and outbound content scanning.
- *
- * Security invariants:
- * - Always returns a result, never throws
- * - Typical scan completes in < 5ms
- * - False positives minimized via field-aware scanning
- * - Recursive scanning of nested objects/arrays
- * - Outbound scanning catches secret leaks and injection artifact survival
- */
-interface InjectionDetectorConfig {
-    enabled: boolean;
-    sensitivity: "low" | "medium" | "high";
-    on_detection: "escalate" | "block" | "log";
-    custom_patterns?: string[];
-}
-interface InjectionSignal {
-    type: string;
-    pattern: string;
-    location: string;
-    severity: "low" | "medium" | "high";
-}
-interface DetectionResult {
-    flagged: boolean;
-    confidence: number;
-    signals: InjectionSignal[];
-    recommendation: "allow" | "escalate" | "block";
-}
-declare class InjectionDetector {
-    private config;
-    private stats;
-    constructor(config?: Partial<InjectionDetectorConfig>);
-    /**
-     * Scan tool arguments for injection signals.
-     * @param toolName Full tool name (e.g., "state_read")
-     * @param args Tool arguments
-     * @returns DetectionResult with all detected signals
-     */
-    scan(toolName: string, args: Record<string, unknown>): DetectionResult;
-    /**
-     * SEC-035: Scan outbound content for secret leaks, data exfiltration,
-     * internal path exposure, and injection artifact survival.
-     *
-     * @param content The outbound content string to scan
-     * @returns DetectionResult with outbound-specific signal types
-     */
-    scanOutbound(content: string): DetectionResult;
-    /**
-     * Recursively scan a value and all nested values.
-     */
-    private scanValue;
-    /**
-     * Scan a single string for injection signals.
-     */
-    private scanString;
-    /**
-     * Count invisible Unicode characters in a string.
-     * Includes zero-width chars, soft hyphens, directional marks,
-     * variation selectors, and other invisible categories.
-     */
-    private countInvisibleChars;
-    /**
-     * Strip invisible characters from a string for clean pattern matching.
-     * Returns a new string with all invisible chars removed.
-     */
-    private stripInvisibleChars;
-    /**
-     * SEC-034: Token budget attack detection.
-     * Some Unicode sequences expand dramatically during tokenization (e.g., CJK
-     * ideographs, combining characters, emoji sequences). If the estimated token
-     * cost per character is anomalously high, this may be a wallet-drain payload.
-     *
-     * Heuristic: count chars that typically tokenize into multiple tokens.
-     * If the ratio of estimated tokens to char count exceeds 3x, flag it.
-     */
-    private detectTokenBudgetAttack;
-    /**
-     * Detect encoded content (base64, hex, HTML entities, URL encoding),
-     * decode it, and re-scan the decoded content through injection patterns.
-     * If the decoded content contains injection patterns, flag as encoding_evasion.
-     */
-    private detectEncodedPayloads;
-    /**
-     * Check if a string contains any injection patterns (role override or security bypass).
-     */
-    private containsInjectionPatterns;
-    /**
-     * Safely decode a base64 string. Returns null if it's not valid base64
-     * or doesn't decode to a meaningful string.
-     */
-    private safeBase64Decode;
-    /**
-     * Safely decode a hex string. Returns null on failure.
-     */
-    private safeHexDecode;
-    /**
-     * Decode HTML numeric entities (&#xHH; and &#DDD;) in a string.
-     */
-    private decodeHtmlEntities;
-    /**
-     * Safely decode a URL-encoded string. Returns null on failure.
-     */
-    private safeUrlDecode;
-    /**
-     * Heuristic: does this look like readable text (vs. binary garbage)?
-     * Checks that most characters are printable ASCII or common Unicode.
-     */
-    private looksLikeText;
-    /**
-     * Detect API keys and secrets in outbound content.
-     */
-    private detectSecretPatterns;
-    /**
-     * Detect data exfiltration via markdown images with data-carrying query params.
-     */
-    private detectOutboundExfiltration;
-    /**
-     * Detect internal filesystem path leaks in outbound content.
-     */
-    private detectInternalPathLeaks;
-    /**
-     * Detect private IP addresses and localhost references in outbound content.
-     */
-    private detectPrivateNetworkLeaks;
-    /**
-     * Detect role markers / prompt template artifacts in outbound content.
-     * These should never appear in agent output — their presence indicates
-     * injection artifact survival.
-     */
-    private detectOutputRoleMarkers;
-    /**
-     * Detect base64 strings, base64url, and zero-width character evasion.
-     */
-    private detectEncodingEvasion;
-    /**
-     * Detect URLs and emails in fields that shouldn't have them.
-     */
-    private detectDataExfiltration;
-    /**
-     * Detect prompt stuffing: very large strings or high repetition.
-     */
-    private detectPromptStuffing;
-    /**
-     * Determine if this field is inherently safe from role override.
-     */
-    private isSafeField;
-    /**
-     * Determine if this is a tool name field (where tool refs are expected).
-     */
-    private isToolNameField;
-    /**
-     * Determine if this field is safe for URLs.
-     */
-    private isUrlSafeField;
-    /**
-     * Determine if this field is safe for emails.
-     */
-    private isEmailSafeField;
-    /**
-     * Determine if this field is safe for structured data (JSON/XML).
-     */
-    private isStructuredField;
-    /**
-     * SEC-032/SEC-034: Map common cross-script confusable characters to their
-     * Latin equivalents. NFKC normalization handles fullwidth and compatibility
-     * forms, but does NOT map Cyrillic/Greek/Armenian/Georgian lookalikes to
-     * Latin (they're distinct codepoints by design).
-     *
-     * Extended to 50+ confusable pairs covering Cyrillic, Greek, Armenian,
-     * Georgian, Cherokee, and mathematical/symbol lookalikes.
-     */
-    private normalizeConfusables;
-    /**
-     * Compute confidence score based on signals.
-     * More high-severity signals = higher confidence.
-     */
-    private computeConfidence;
-    /**
-     * Compute recommendation based on signals and sensitivity.
-     */
-    private computeRecommendation;
-    /**
-     * Get statistics about scans performed.
-     */
-    getStats(): {
-        total_scans: number;
-        total_flags: number;
-        total_blocks: number;
-        signals_by_type: Record<string, number>;
-    };
-    /**
-     * Reset statistics.
-     */
-    resetStats(): void;
-}
-
-/**
- * Sanctuary MCP Server — Principal Policy Types
- *
- * Type definitions for the Principal Policy system.
- * The Principal Policy is the human-controlled, agent-immutable
- * configuration that gates operations through approval tiers.
- */
-/** Tier 2 anomaly action: what to do when an anomaly is detected */
-type AnomalyAction = "approve" | "log" | "allow";
-/** Tier 2 anomaly detection configuration */
-interface Tier2Config {
-    /** Action when agent accesses a namespace it hasn't used before */
-    new_namespace_access: AnomalyAction;
-    /** Action when agent interacts with an unknown counterparty DID */
-    new_counterparty: AnomalyAction;
-    /** Tool call frequency multiplier that triggers anomaly */
-    frequency_spike_multiplier: number;
-    /** Maximum signing operations per minute before triggering */
-    max_signs_per_minute: number;
-    /** Reading more than N keys in a namespace within 60 seconds */
-    bulk_read_threshold: number;
-    /** Policy for first session when no baseline exists */
-    first_session_policy: AnomalyAction;
-}
-/** Approval channel configuration */
-interface ApprovalChannelConfig {
-    type: "stderr" | "webhook" | "callback";
-    timeout_seconds: number;
-    /**
-     * SEC-002: auto_deny is hardcoded to true and not configurable.
-     * Timeout on any approval channel ALWAYS results in denial.
-     * This field is retained for backward compatibility with existing
-     * policy files but is ignored — timeout always denies.
-     */
-    auto_deny?: boolean;
-    webhook_url?: string;
-    webhook_secret?: string;
-}
-/** Complete Principal Policy */
-interface PrincipalPolicy {
-    version: number;
-    /** Operations that always require human approval */
-    tier1_always_approve: string[];
-    /** Behavioral anomaly detection configuration */
-    tier2_anomaly: Tier2Config;
-    /** Operations that never require approval (audit only) */
-    tier3_always_allow: string[];
-    /** How approval requests reach the human */
-    approval_channel: ApprovalChannelConfig;
-}
-/** Approval request sent to the human */
-interface ApprovalRequest {
-    operation: string;
-    tier: 1 | 2;
-    reason: string;
-    context: Record<string, unknown>;
-    timestamp: string;
-}
-/** Approval response from the human */
-interface ApprovalResponse {
-    decision: "approve" | "deny";
-    decided_at: string;
-    decided_by: "human" | "timeout" | "auto" | "stderr:non-interactive";
-}
-/** Result of the approval gate evaluation */
-interface GateResult {
-    allowed: boolean;
-    tier: 1 | 2 | 3;
-    reason: string;
-    approval_required: boolean;
-    approval_response?: ApprovalResponse;
-}
-/** Behavioral baseline for anomaly detection */
-interface SessionProfile {
-    /** Namespaces accessed (read or write) */
-    known_namespaces: string[];
-    /** Counterparty DIDs seen in reputation operations */
-    known_counterparties: string[];
-    /** Tool call counts per tool name (lifetime in session) */
-    tool_call_counts: Record<string, number>;
-    /** Whether this is the first session (no prior baseline) */
-    is_first_session: boolean;
-    /** Session start time */
-    started_at: string;
-    /** When the baseline was last saved */
-    saved_at?: string;
-}
-
-/**
- * Sanctuary MCP Server — Approval Channel
- *
- * Out-of-band communication with the human principal for operation approval.
- * The default channel uses stderr (outside MCP's stdin/stdout protocol),
- * ensuring the agent cannot intercept or forge approval responses.
- *
- * Security invariant:
- * - Approval prompts go through a channel the agent cannot access.
- * - Timeouts result in denial by default (fail closed).
- */
-
-/** Abstract approval channel interface */
-interface ApprovalChannel {
-    requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
-}
-/**
- * Stderr approval channel — non-interactive informational channel.
- *
- * In the MCP stdio model:
- * - stdin/stdout carry the MCP protocol (JSON-RPC)
- * - stderr is available for out-of-band human communication
- *
- * Because stdin is consumed by the MCP JSON-RPC transport, this channel
- * CANNOT read interactive human input. It is strictly informational:
- * the prompt is displayed so the human sees what is happening, and the
- * operation is denied immediately.
- *
- * SEC-002 + SEC-016 invariants:
- * - This channel ALWAYS denies. No configuration can change this.
- * - There is no timeout or async delay — denial is synchronous.
- * - The `auto_deny` config field is ignored (SEC-002).
- * - For interactive approval, use the dashboard or webhook channel.
- */
-declare class StderrApprovalChannel implements ApprovalChannel {
-    constructor(_config: ApprovalChannelConfig);
-    requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
-    private formatPrompt;
-}
-/**
- * Programmatic approval channel — for testing and API integration.
- */
-declare class CallbackApprovalChannel implements ApprovalChannel {
-    private callback;
-    constructor(callback: (request: ApprovalRequest) => Promise<ApprovalResponse>);
-    requestApproval(request: ApprovalRequest): Promise<ApprovalResponse>;
-}
-/**
- * Auto-approve channel — for testing. Approves everything.
- */
-declare class AutoApproveChannel implements ApprovalChannel {
-    requestApproval(_request: ApprovalRequest): Promise<ApprovalResponse>;
-}
-
-/**
- * Sanctuary MCP Server — Behavioral Baseline Tracker
- *
- * Tracks the agent's behavioral profile during a session and persists
- * it for cross-session anomaly detection. The baseline defines "normal"
- * so that deviations can trigger Tier 2 approval.
- *
- * Security invariants:
- * - Baseline is stored encrypted under L1 sovereignty
- * - Baseline changes are audit-logged
- * - Baseline is integrity-verified via L1 Merkle tree
- * - No MCP tool can directly modify the baseline
- */
-
-declare class BaselineTracker {
-    private storage;
-    private encryptionKey;
-    private profile;
-    /** Sliding window: timestamps of tool calls per tool name (last 60s) */
-    private callWindows;
-    /** Sliding window: read counts per namespace (last 60s) */
-    private readWindows;
-    /** Sliding window: sign call timestamps (last 60s) */
-    private signWindow;
-    constructor(storage: StorageBackend, masterKey: Uint8Array);
-    /**
-     * Load the previous session's baseline from storage.
-     * If none exists, this is a first session.
-     */
-    load(): Promise<void>;
-    /**
-     * Save the current baseline to storage (encrypted).
-     * Called at session end or periodically.
-     */
-    save(): Promise<void>;
-    /**
-     * Record a tool call for baseline tracking.
-     * Returns anomaly information if applicable.
-     */
-    recordToolCall(toolName: string): void;
-    /**
-     * Record a namespace access.
-     * @returns true if this is a new namespace (not in baseline)
-     */
-    recordNamespaceAccess(namespace: string): boolean;
-    /**
-     * Record a namespace read for bulk-read detection.
-     * @returns the number of reads in the current 60-second window
-     */
-    recordNamespaceRead(namespace: string): number;
-    /**
-     * Record a counterparty DID interaction.
-     * @returns true if this is a new counterparty (not in baseline)
-     */
-    recordCounterparty(did: string): boolean;
-    /**
-     * Record a signing operation.
-     * @returns the number of signs in the current 60-second window
-     */
-    recordSign(): number;
-    /**
-     * Get the current call rate for a tool (calls per minute).
-     */
-    getCallRate(toolName: string): number;
-    /**
-     * Get the average call rate across all tools in the baseline.
-     */
-    getAverageCallRate(): number;
-    /** Whether this is the first session */
-    get isFirstSession(): boolean;
-    /** Get a read-only view of the current profile */
-    getProfile(): SessionProfile;
-}
-
-/**
- * Sanctuary MCP Server — Approval Gate
- *
- * The three-tier approval gate sits between the MCP router and tool handlers.
- * Every tool call passes through the gate before execution.
- *
- * Evaluation order:
- * 1. Tier 1: Is this operation in the always-approve list? → Request approval.
- * 2. Tier 2: Does this call represent a behavioral anomaly? → Request approval.
- * 3. Tier 3 / default: Allow with audit logging.
- *
- * Security invariants:
- * - The gate cannot be bypassed — it wraps every tool handler.
- * - Denial responses do not reveal policy details to the agent.
- * - All gate decisions (approve, deny, allow) are audit-logged.
- */
-
-/** Callback invoked when an injection is detected, for dashboard broadcasting */
-type InjectionAlertCallback = (alert: {
-    toolName: string;
-    result: DetectionResult;
-    timestamp: string;
-}) => void;
-/** Resolver for proxy tool tiers — provided by the ProxyRouter */
-type ProxyTierResolver = (toolName: string) => (1 | 2 | 3) | null;
-declare class ApprovalGate {
-    private policy;
-    private baseline;
-    private channel;
-    private auditLog;
-    private injectionDetector;
-    private onInjectionAlert?;
-    private proxyTierResolver?;
-    constructor(policy: PrincipalPolicy, baseline: BaselineTracker, channel: ApprovalChannel, auditLog: AuditLog, injectionDetector?: InjectionDetector, onInjectionAlert?: InjectionAlertCallback);
-    /**
-     * Set the proxy tier resolver. Called after the proxy router is initialized.
-     */
-    setProxyTierResolver(resolver: ProxyTierResolver): void;
-    /**
-     * Evaluate a tool call against the Principal Policy.
-     *
-     * @param toolName - Full MCP tool name (e.g., "state_export")
-     * @param args - Tool call arguments (for context extraction)
-     * @returns GateResult indicating whether the call is allowed
-     */
-    evaluate(toolName: string, args: Record<string, unknown>): Promise<GateResult>;
-    /**
-     * Detect Tier 2 behavioral anomalies.
-     */
-    private detectAnomaly;
-    /**
-     * Request approval from the human principal.
-     */
-    private requestApproval;
-    /**
-     * Summarize tool arguments for the approval prompt.
-     * Strips potentially large values to keep the prompt readable.
-     */
-    private summarizeArgs;
-    /** Get the baseline tracker for saving at session end */
-    getBaseline(): BaselineTracker;
-    /** Get the injection detector for stats/configuration access */
-    getInjectionDetector(): InjectionDetector;
-}
-
-/**
- * Sanctuary MCP Server — Tool Router
- *
- * Routes sanctuary/* tool calls to their layer-specific handlers.
- * Every tool call passes through schema validation and the ApprovalGate
- * (if configured) before execution. Neither can be bypassed.
- *
- * This module is the abstraction boundary for MCP SDK version migration —
- * if the SDK API changes, only this module needs updating.
- */
-
-/** Tool handler function signature */
-type ToolHandler = (args: Record<string, unknown>) => Promise<{
-    content: Array<{
-        type: "text";
-        text: string;
-    }>;
-}>;
-/** Tool definition for registration */
-interface ToolDefinition {
-    name: string;
-    description: string;
-    inputSchema: Record<string, unknown>;
-    handler: ToolHandler;
-}
-
-/**
  * Sanctuary MCP Server — L2 Context Gating: Automatic Enforcer
  *
  * The context gate enforcer wraps tool handlers to automatically filter
@@ -2619,37 +2656,6 @@ declare class FilesystemStorage implements StorageBackend {
  * The returned policy is frozen — immutable at runtime.
  */
 declare function loadPrincipalPolicy(storagePath: string): Promise<PrincipalPolicy>;
-
-/**
- * Sanctuary MCP Server — L1 Cognitive Sovereignty: Tool Definitions
- *
- * MCP tool wrappers for StateStore and IdentityRoot operations.
- * These tools are the public API that agents interact with.
- */
-
-/** Manages all identities — provides storage and retrieval */
-declare class IdentityManager {
-    private storage;
-    private masterKey;
-    private identities;
-    private primaryIdentityId;
-    constructor(storage: StorageBackend, masterKey: Uint8Array);
-    private get encryptionKey();
-    /** Load identities from storage on startup.
-     *  Returns { total: number of encrypted files found, loaded: number successfully decrypted }.
-     *  A mismatch (total > 0, loaded === 0) indicates a wrong master key / missing passphrase.
-     */
-    load(): Promise<{
-        total: number;
-        loaded: number;
-        failed: number;
-    }>;
-    /** Save an identity to storage */
-    save(identity: StoredIdentity): Promise<void>;
-    get(id: string): StoredIdentity | undefined;
-    getDefault(): StoredIdentity | undefined;
-    list(): PublicIdentity[];
-}
 
 /**
  * Sanctuary MCP Server — SHR Generator
@@ -3368,6 +3374,16 @@ declare function verifyBridgeCommitment(commitment: BridgeCommitment, outcome: C
 interface SanctuaryServer {
     server: Server;
     config: SanctuaryConfig;
+    /**
+     * Runtime dependencies exposed for embedding callers that need
+     * direct access to the Sanctuary substrate (e.g., the EU AI Act
+     * compliance CLI subcommand). Most callers only use `server` and
+     * `config`; these are optional-usage extras.
+     */
+    identityManager: IdentityManager;
+    masterKey: Uint8Array;
+    auditLog: AuditLog;
+    policy: PrincipalPolicy;
 }
 /**
  * Initialize the Sanctuary MCP Server.

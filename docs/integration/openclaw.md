@@ -101,10 +101,10 @@ server config block to the subprocess. Include `SANCTUARY_PASSPHRASE` for
 encrypted audit trails. Do NOT include `SANCTUARY_DASHBOARD_ENABLED` or
 `SANCTUARY_DASHBOARD_AUTH_TOKEN` in the MCP server config.
 
-**Cocoon wrapper (experimental).** `cocoon --openclaw` can wrap all upstream
-MCP servers through Sanctuary's proxy enforcement chain. Known bug: the wrapper
-drops env vars and extra servers. Use direct config (above) for now. Cocoon
-wrapper fix tracked for v0.8.0.
+**One-command wrap.** `sanctuary wrap --openclaw` auto-generates a passphrase,
+wraps all upstream MCP servers through Sanctuary's enforcement chain, and opens
+the Sovereignty Dashboard in your browser. Runs in v0.9+. For production, the
+direct config (above) remains the stable path.
 
 **Adding Concordia alongside Sanctuary.** Both can run as separate MCP servers:
 
@@ -151,9 +151,9 @@ Known issue with some OpenClaw versions. Verify the agent is using the correct
 namespaced tool names (`sanctuary__manifest`, not `manifest`). If the problem
 persists, restart OpenClaw — the MCP subprocess may need a clean reconnection.
 
-**Cocoon `--openclaw` drops servers**
-Known bug. Don't use `cocoon --openclaw --wrap` in production yet. Direct
-config (Step 1 above) works reliably.
+**`sanctuary wrap --openclaw` drops servers**
+Fixed in v0.9. If you're on an older version, use the direct config (Step 1
+above) — it works reliably across versions.
 
 **OpenClaw update breaks dependencies**
 OpenClaw 2026.4.5 had missing peer dependencies. If an update breaks, roll

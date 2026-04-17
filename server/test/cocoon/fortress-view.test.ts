@@ -15,7 +15,7 @@ describe("Fortress View", () => {
     });
 
     expect(html).toContain("<!DOCTYPE html>");
-    expect(html).toContain("Sanctuary Cocoon");
+    expect(html).toContain("<h1>Sanctuary</h1>");
     expect(html).toContain("0.7.0");
   });
 

@@ -175,10 +175,10 @@ Remove from Claude Code:
 claude mcp remove sanctuary
 ```
 
-If Cocoon was enabled:
+If the agent was wrapped:
 
 ```bash
-npx @sanctuary-framework/mcp-server cocoon --unwrap
+npx @sanctuary-framework/mcp-server wrap --unwrap
 ```
 
 Sanctuary's encrypted state remains in `~/.sanctuary/` until manually deleted.

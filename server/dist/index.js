@@ -1329,6 +1329,7 @@ var IdentityManager = class {
   masterKey;
   identities = /* @__PURE__ */ new Map();
   primaryIdentityId = null;
+  metadataKey = "primary_identity_id";
   constructor(storage, masterKey) {
     this.storage = storage;
     this.masterKey = masterKey;
@@ -1351,12 +1352,25 @@ var IdentityManager = class {
         const decrypted = decrypt(encrypted, this.encryptionKey);
         const identity = JSON.parse(bytesToString(decrypted));
         this.identities.set(identity.identity_id, identity);
-        if (!this.primaryIdentityId) {
-          this.primaryIdentityId = identity.identity_id;
-        }
       } catch {
         failed++;
       }
+    }
+    try {
+      const metaRaw = await this.storage.read("_meta", this.metadataKey);
+      if (metaRaw) {
+        const metaStr = bytesToString(metaRaw);
+        const primaryId = JSON.parse(metaStr);
+        if (this.identities.has(primaryId)) {
+          this.primaryIdentityId = primaryId;
+        } else {
+          this.primaryIdentityId = this.identities.keys().next().value || null;
+        }
+      } else {
+        this.primaryIdentityId = this.identities.keys().next().value || null;
+      }
+    } catch {
+      this.primaryIdentityId = this.identities.keys().next().value || null;
     }
     return { total: entries.length, loaded: this.identities.size, failed };
   }
@@ -1372,6 +1386,25 @@ var IdentityManager = class {
     this.identities.set(identity.identity_id, identity);
     if (!this.primaryIdentityId) {
       this.primaryIdentityId = identity.identity_id;
+      this.savePrimaryIdentityId();
+    }
+  }
+  /** Set which identity is the default/primary identity */
+  async setPrimary(identityId) {
+    if (!this.identities.has(identityId)) {
+      return false;
+    }
+    this.primaryIdentityId = identityId;
+    await this.savePrimaryIdentityId();
+    return true;
+  }
+  /** Persist the primary identity ID to storage */
+  async savePrimaryIdentityId() {
+    if (!this.primaryIdentityId) return;
+    try {
+      const serialized = stringToBytes(JSON.stringify(this.primaryIdentityId));
+      await this.storage.write("_meta", this.metadataKey, serialized);
+    } catch {
     }
   }
   get(id) {
@@ -1380,6 +1413,9 @@ var IdentityManager = class {
   getDefault() {
     if (!this.primaryIdentityId) return void 0;
     return this.identities.get(this.primaryIdentityId);
+  }
+  getPrimaryIdentityId() {
+    return this.primaryIdentityId;
   }
   list() {
     return Array.from(this.identities.values()).map((si) => ({
@@ -1583,6 +1619,44 @@ function createL1Tools(stateStore, storage, masterKey, keyProtection, auditLog) 
           new_public_key: rotationEvent.new_public_key,
           new_did: updatedIdentity.did,
           rotated_at: rotationEvent.rotated_at
+        });
+      }
+    },
+    {
+      name: "identity_set_primary",
+      description: "Set which identity is the default/primary identity. This identity will be used by shr_generate, reputation_publish, and other tools when no explicit identity_id parameter is provided. The selection is persisted across server restarts.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          identity_id: {
+            type: "string",
+            description: "The identity ID to set as primary"
+          }
+        },
+        required: ["identity_id"]
+      },
+      handler: async (args) => {
+        const identityId = args.identity_id;
+        const identity = identityMgr.get(identityId);
+        if (!identity) {
+          return toolResult({
+            error: `Identity "${identityId}" not found.`
+          });
+        }
+        const success = await identityMgr.setPrimary(identityId);
+        if (!success) {
+          return toolResult({
+            error: `Failed to set primary identity to "${identityId}".`
+          });
+        }
+        auditLog?.append("l1", "identity_set_primary", identityId, {
+          previous_primary: identityMgr.getPrimaryIdentityId()
+        });
+        return toolResult({
+          primary_identity_id: identityId,
+          label: identity.label,
+          did: identity.did,
+          set_at: (/* @__PURE__ */ new Date()).toISOString()
         });
       }
     },
@@ -3698,14 +3772,14 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
         const publishType = args.type;
         const configuredVerascoreUrl = verascoreUrl || "https://verascore.ai";
         const veracoreUrl = args.verascore_url || configuredVerascoreUrl;
-        const ALLOWED_VERASCORE_HOSTS = /* @__PURE__ */ new Set([
+        const ALLOWED_VERASCORE_HOSTS2 = /* @__PURE__ */ new Set([
           "verascore.ai",
           "www.verascore.ai",
           "api.verascore.ai"
         ]);
         try {
           const configuredHost = new URL(configuredVerascoreUrl).hostname;
-          ALLOWED_VERASCORE_HOSTS.add(configuredHost);
+          ALLOWED_VERASCORE_HOSTS2.add(configuredHost);
         } catch {
         }
         try {
@@ -3715,9 +3789,9 @@ function createL4Tools(storage, masterKey, identityManager, auditLog, handshakeR
               error: `verascore_url must use HTTPS. Got: ${parsed.protocol}`
             });
           }
-          if (!ALLOWED_VERASCORE_HOSTS.has(parsed.hostname)) {
+          if (!ALLOWED_VERASCORE_HOSTS2.has(parsed.hostname)) {
             return toolResult({
-              error: `verascore_url must point to a known Verascore domain (${[...ALLOWED_VERASCORE_HOSTS].join(", ")}). Got: ${parsed.hostname}`
+              error: `verascore_url must point to a known Verascore domain (${[...ALLOWED_VERASCORE_HOSTS2].join(", ")}). Got: ${parsed.hostname}`
             });
           }
         } catch {
@@ -3904,6 +3978,7 @@ var DEFAULT_POLICY = {
     "l2_hardening_status",
     "l2_verify_isolation",
     "sovereignty_audit",
+    "audit_export_siem",
     "shr_gateway_export",
     "bridge_commit",
     "bridge_verify",
@@ -3916,8 +3991,16 @@ var DEFAULT_POLICY = {
     "governor_status",
     "reputation_publish",
     // Auto-allow: publishing sovereignty data to Verascore is routine
-    "sanctuary_policy_status"
+    "sanctuary_policy_status",
     // Read-only policy summary
+    "identity_set_primary",
+    // One-time set, persists via _meta storage — safe at Tier 3
+    "memory_attest",
+    // Read-only audit attestation — records that a memory op happened
+    "compliance_generate_eu_ai_act_bundle",
+    // Read-only; emits signed compliance documents from existing state
+    "compliance_eu_ai_act_annex_iii_classify"
+    // Read-only; rule-based Annex III classifier
   ],
   approval_channel: DEFAULT_CHANNEL
 };
@@ -4090,6 +4173,7 @@ tier3_always_allow:
   - context_gate_filter
   - context_gate_list_policies
   - sovereignty_audit
+  - audit_export_siem
   - shr_gateway_export
   - bridge_commit
   - bridge_verify
@@ -4099,7 +4183,9 @@ tier3_always_allow:
   - governor_status
   - reputation_publish
   - sanctuary_policy_status
-
+  - memory_attest
+  - compliance_generate_eu_ai_act_bundle
+  - compliance_eu_ai_act_annex_iii_classify
 # \u2500\u2500\u2500 Approval Channel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # How Sanctuary reaches you when approval is needed.
 # NOTE: Timeout always results in denial. This is not configurable (SEC-002).
@@ -7371,7 +7457,7 @@ function generateFortressViewHTML(options) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Sanctuary \u2014 Fortress View</title>
+  <title>Sanctuary</title>
   <style>
     :root {
       --bg: #0d1117;
@@ -7760,7 +7846,7 @@ function generateFortressViewHTML(options) {
     <div class="fortress-brand">
       <div class="shield">&#x1F6E1;</div>
       <div>
-        <h1>Sanctuary Cocoon</h1>
+        <h1>Sanctuary</h1>
         <div class="version">v${esc(options.serverVersion)}</div>
       </div>
     </div>
@@ -13780,7 +13866,7 @@ function createSIEMTools(auditLog) {
   const tools = [
     {
       name: "audit_export_siem",
-      description: "Export audit log events in SIEM-standard formats (CEF or OCSF) for ingestion into Splunk, Datadog, QRadar, and other security information and event management (SIEM) platforms. Encrypted audit entries are decrypted and formatted according to your chosen standard. Tier 2 \u2014 may contain sensitive operation metadata.",
+      description: "Export audit log events in SIEM-standard formats (CEF or OCSF) for ingestion into Splunk, Datadog, QRadar, and other security information and event management (SIEM) platforms. Encrypted audit entries are decrypted and formatted according to your chosen standard. Tier 3 \u2014 auto-allow (read-only, audit logging only).",
       inputSchema: {
         type: "object",
         properties: {
@@ -17096,6 +17182,7 @@ function createGovernorTools(governor, auditLog) {
 init_identity();
 init_encoding();
 init_identity();
+var PASSPHRASE_BACKUP_WARNING = "\u26A0\uFE0F  IMPORTANT: Your Sanctuary passphrase is the only way to decrypt your agent's state. If lost, all encrypted data is unrecoverable by design. Back up your passphrase now to a password manager, encrypted USB, or other secure location separate from this machine.";
 function validateVerascoreUrl(urlStr, configuredUrl) {
   const allowed = /* @__PURE__ */ new Set([
     "verascore.ai",
@@ -17185,7 +17272,8 @@ function createSanctuaryTools(opts) {
             identity_id: publicIdentity.identity_id,
             profileUrl,
             tier: "self-attested",
-            published: false
+            published: false,
+            passphrase_warning: PASSPHRASE_BACKUP_WARNING
           });
         }
         const urlCheck = validateVerascoreUrl(verascoreUrl, config.verascore.url);
@@ -17246,7 +17334,8 @@ function createSanctuaryTools(opts) {
             tier: "self-attested",
             published: response.ok,
             verascore_status: response.status,
-            verascore_response: result
+            verascore_response: result,
+            passphrase_warning: PASSPHRASE_BACKUP_WARNING
           });
         } catch (err) {
           auditLog.append("l4", "sanctuary_bootstrap", publicIdentity.identity_id, {
@@ -17259,7 +17348,8 @@ function createSanctuaryTools(opts) {
             profileUrl,
             tier: "self-attested",
             published: false,
-            warning: `Identity created but Verascore publish failed: ${err instanceof Error ? err.message : String(err)}`
+            warning: `Identity created but Verascore publish failed: ${err instanceof Error ? err.message : String(err)}`,
+            passphrase_warning: PASSPHRASE_BACKUP_WARNING
           });
         }
       }
@@ -17514,6 +17604,3091 @@ function createSanctuaryTools(opts) {
           signed_by: identity.did,
           domain_tag: domainTag,
           purpose
+        });
+      }
+    }
+  ];
+  return { tools };
+}
+
+// src/l1-cognitive/memory-attest.ts
+init_identity();
+init_hashing();
+init_encoding();
+var VALID_OPERATIONS = [
+  "store",
+  "retrieve",
+  "update",
+  "delete",
+  "search"
+];
+var VALID_SCOPES = ["user", "agent", "session", "app"];
+function createMemoryAttestTools(identityManager, masterKey, auditLog) {
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  const tools = [
+    {
+      name: "memory_attest",
+      description: "Create an Ed25519-signed attestation for a memory operation. Records who accessed what (content hash, not content), when, and through which memory provider \u2014 without exposing the memory content itself. Works with any MCP-compatible memory provider (Mem0, Zep, Letta, etc.). Use after add_memory, search_memories, or any memory CRUD operation to build a cryptographically verifiable audit trail of memory access.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          operation: {
+            type: "string",
+            enum: VALID_OPERATIONS,
+            description: "The memory operation that was performed: store, retrieve, update, delete, or search."
+          },
+          provider: {
+            type: "string",
+            description: 'Name of the memory provider (e.g., "mem0", "zep", "letta", "graphiti").'
+          },
+          content_hash: {
+            type: "string",
+            description: "SHA-256 hash of the memory content (hex or base64url). If you have raw content, hash it first \u2014 never pass raw memory content to this tool."
+          },
+          memory_id: {
+            type: "string",
+            description: "Optional: ID returned by the memory provider for this memory entry."
+          },
+          user_id: {
+            type: "string",
+            description: "Optional: user ID associated with this memory operation."
+          },
+          agent_id: {
+            type: "string",
+            description: "Optional: agent ID that performed the operation."
+          },
+          session_id: {
+            type: "string",
+            description: "Optional: session ID in which the operation occurred."
+          },
+          scope: {
+            type: "string",
+            enum: VALID_SCOPES,
+            description: 'Optional: memory scope \u2014 "user" (personal), "agent" (agent-specific), "session" (session-scoped), or "app" (application-wide).'
+          },
+          identity_id: {
+            type: "string",
+            description: "Optional: Sanctuary identity to sign with. Defaults to primary identity."
+          }
+        },
+        required: ["operation", "provider", "content_hash"]
+      },
+      handler: async (args) => {
+        const operation = args.operation;
+        if (!VALID_OPERATIONS.includes(operation)) {
+          return toolResult({
+            error: `Invalid operation: "${operation}". Must be one of: ${VALID_OPERATIONS.join(", ")}`
+          });
+        }
+        const provider = args.provider;
+        if (!provider || provider.trim().length === 0) {
+          return toolResult({ error: "Provider name is required." });
+        }
+        if (provider.length > 128) {
+          return toolResult({
+            error: "Provider name exceeds 128 character limit."
+          });
+        }
+        const contentHash = args.content_hash;
+        if (!contentHash || contentHash.trim().length === 0) {
+          return toolResult({ error: "Content hash is required." });
+        }
+        if (contentHash.length > 128) {
+          return toolResult({
+            error: "Content hash exceeds 128 character limit."
+          });
+        }
+        const identityId = args.identity_id;
+        const identity = identityId ? identityManager.get(identityId) : identityManager.getDefault();
+        if (!identity) {
+          return toolResult({
+            error: identityId ? `Identity not found: ${identityId}` : "No default identity. Create one with identity_create first."
+          });
+        }
+        const scope = args.scope;
+        if (scope && !VALID_SCOPES.includes(scope)) {
+          return toolResult({
+            error: `Invalid scope: "${scope}". Must be one of: ${VALID_SCOPES.join(", ")}`
+          });
+        }
+        const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+        const payload = {
+          version: 1,
+          operation,
+          provider: provider.trim(),
+          content_hash: contentHash.trim(),
+          metadata: {
+            ...args.user_id ? { user_id: args.user_id } : {},
+            ...args.agent_id ? { agent_id: args.agent_id } : {},
+            ...args.session_id ? { session_id: args.session_id } : {},
+            ...scope ? { scope } : {}
+          },
+          ...args.memory_id ? { memory_id: args.memory_id } : {},
+          identity_id: identity.identity_id,
+          identity_did: identity.did,
+          timestamp
+        };
+        const payloadBytes = stringToBytes(JSON.stringify(payload));
+        const signature = sign(
+          payloadBytes,
+          identity.encrypted_private_key,
+          identityEncKey
+        );
+        const attestationId = hashToString(payloadBytes).slice(0, 22);
+        auditLog.append("l1", `memory_${operation}`, identity.identity_id, {
+          attestation_id: attestationId,
+          provider: payload.provider,
+          content_hash: payload.content_hash,
+          memory_id: payload.memory_id,
+          scope: payload.metadata.scope
+        });
+        const attestation = {
+          attestation_id: attestationId,
+          payload,
+          signature: toBase64url(signature),
+          public_key: identity.public_key
+        };
+        return toolResult(attestation);
+      }
+    }
+  ];
+  return { tools };
+}
+
+// src/compliance/eu_ai_act/generator.ts
+init_identity();
+init_hashing();
+init_encoding();
+
+// src/compliance/eu_ai_act/coverage_matrix.ts
+var REGULATION_VERSION = "EU AI Act Regulation (EU) 2024/1689, as of 2026-04-10";
+var REVIEW_DATE = "2026-04-10";
+var REVIEWER = "Erik Newton";
+var ROWS = [
+  // ═══════════════════════════════════════════════════════════════════
+  // ANNEX IV — Technical Documentation Requirements (per Article 11)
+  // ═══════════════════════════════════════════════════════════════════
+  // ─── §1 General description ─────────────────────────────────────
+  {
+    id: "annex_iv_1_a_general_description",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA71(a)",
+      clause_id: "annex-iv-1-a",
+      title: "General description: intended purpose, provider, version"
+    },
+    requirement: '"Its intended purpose, the name of the provider and the version of the system [...]."',
+    coverage: "partial",
+    evidence_emitter: [
+      "identity_list",
+      "identity_set_primary",
+      "manifest",
+      "shr_generate"
+    ],
+    evidence_emitted: "Auto-filled: cryptographic provider identity (primary Ed25519 DID + public key via identity_list and identity_set_primary), Sanctuary version and implementation metadata (via manifest), and signed SHR instance_id. The template pre-populates the version-and-identity portion of this row with machine-verifiable cryptographic evidence.",
+    manual_carveout: "Intended purpose of the agent (business function), legal provider name and registered entity, and version-naming conventions used by the enterprise.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Partial is honest here: Sanctuary can emit a cryptographic provider identity and a software version, but 'intended purpose' is inherently a business-function narrative that Sanctuary cannot infer. Resist any temptation to call this full."
+  },
+  {
+    id: "annex_iv_1_b_hardware_software_interaction",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA71(b)",
+      clause_id: "annex-iv-1-b",
+      title: "Interaction with external hardware or software"
+    },
+    requirement: '"How the AI system interacts, or can be used to interact, with hardware or software [...] that is not part of the AI system itself [...]."',
+    coverage: "partial",
+    evidence_emitter: [
+      "shr_generate",
+      "manifest",
+      "context_gate_list_policies"
+    ],
+    evidence_emitted: "Auto-filled: SHR layers.l2.model_provenance (provider, open-weights flag, local-inference flag, optional weights hash), MCP tool inventory (via manifest) listing every integration point the agent exposes, and the outbound context-gating policy manifest (via context_gate_list_policies) showing which provider endpoints the agent is permitted to contact and under what field-level constraints.",
+    manual_carveout: "Upstream LLM contracts and data processing agreements, third-party API integrations, downstream systems consuming agent output, and any hardware peripherals the agent orchestrates.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Sanctuary genuinely covers ~60% of this row when model_provenance is populated by the integrator. The template emits a structured interaction manifest and marks the business-context narrative as [MANUAL INPUT REQUIRED]."
+  },
+  {
+    id: "annex_iv_1_c_software_versions",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA71(c)",
+      clause_id: "annex-iv-1-c",
+      title: "Versions of relevant software and firmware"
+    },
+    requirement: '"The versions of relevant software or firmware [...]."',
+    coverage: "partial",
+    evidence_emitter: ["manifest", "shr_generate", "monitor_health"],
+    evidence_emitted: "Auto-filled: Sanctuary MCP server version (from manifest and SHR implementation block), Node.js runtime version, MCP SDK version, and platform string. The template emits a versioned software manifest for the Sanctuary layer itself.",
+    manual_carveout: "LLM model version and weights hash (if not set in model_provenance), agent harness version (OpenClaw or other), operating system patch level, container image digest, and any other 'relevant' software outside Sanctuary's runtime scope.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Downgraded from full during verification (2026-04-10). Sanctuary auto-emits its own version + Node version, but 'relevant software' extends beyond Sanctuary and the enterprise must enumerate the rest. Partial is the honest call."
+  },
+  {
+    id: "annex_iv_1_d_forms_on_market",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA71(d)",
+      clause_id: "annex-iv-1-d",
+      title: "Forms in which the system is placed on the market"
+    },
+    requirement: '"The description of all the forms in which the AI system is placed on the market or put into service [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: forms in which the AI system is placed on the market or put into service].",
+    manual_carveout: "Sanctuary is a runtime sovereignty layer and has no visibility into the commercial forms in which the enterprise distributes or operates the agent.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row \u2014 commercial distribution is not a Sanctuary concern and will not become one."
+  },
+  {
+    id: "annex_iv_1_e_hardware_description",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA71(e)",
+      clause_id: "annex-iv-1-e",
+      title: "Description of the hardware on which the system runs"
+    },
+    requirement: '"The description of the hardware on which the AI system is intended to run [...]."',
+    coverage: "partial",
+    evidence_emitter: ["exec_attest", "monitor_health", "sovereignty_audit"],
+    evidence_emitted: "Auto-filled: execution environment attestation (via exec_attest) reporting CPU vendor, TEE availability, operating system string, and Node.js runtime; sovereignty_audit environment fingerprint. The template emits the detected hardware context as structured evidence.",
+    manual_carveout: "Production hardware specifications, TEE attestation evidence from the actual deployment environment, geographic location of the execution environment, and any hardware security modules or trusted hardware used in production.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "In local-process mode Sanctuary emits tee_available=false, which is honest but incomplete \u2014 production may run on TEE-capable hardware that Sanctuary does not detect. SHR degradation NO_TEE is flagged automatically."
+  },
+  {
+    id: "annex_iv_1_f_instructions_of_use",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA71(f)",
+      clause_id: "annex-iv-1-f",
+      title: "Basic description of the user interface"
+    },
+    requirement: '"A basic description of the user interface provided to the deployer [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: description of the user interface provided to the deployer].",
+    manual_carveout: "User interface design is an agent-level or enterprise-level product decision outside Sanctuary's scope.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row."
+  },
+  // ─── §2 Detailed description of elements ────────────────────────
+  {
+    id: "annex_iv_2_a_development_methods",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA72(a)",
+      clause_id: "annex-iv-2-a",
+      title: "Methods and steps performed for development"
+    },
+    requirement: '"The methods and steps performed for the development of the AI system [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: development methodology, design iterations, training procedures, validation steps].",
+    manual_carveout: "Sanctuary is a runtime sovereignty layer and is not involved in model development, training, or pre-deployment validation.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row \u2014 model development is outside Sanctuary's architectural scope."
+  },
+  {
+    id: "annex_iv_2_b_design_specifications",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA72(b)",
+      clause_id: "annex-iv-2-b",
+      title: "Design specifications and key design choices"
+    },
+    requirement: '"The design specifications of the system, namely the general logic of the AI system [...] the key design choices including the rationale and assumptions made [...]."',
+    coverage: "partial",
+    evidence_emitter: [
+      "principal_policy_view",
+      "context_gate_list_policies",
+      "sovereignty_profile_get",
+      "manifest"
+    ],
+    evidence_emitted: "Auto-filled: machine-readable Principal Policy YAML (tier rules, approval channel configuration, anomaly thresholds), context gating policy manifest, sovereignty profile, and the full MCP tool inventory. Together these constitute the declarative design specification of the Sanctuary sovereignty layer.",
+    manual_carveout: "Agent-level business logic, decision algorithms, the rationale for key design choices (why this policy, why these thresholds), assumptions made during development, and any non-Sanctuary architectural components.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Borderline partial \u2014 Sanctuary emits the policy and gating specifications as structured data, but 'key design choices including rationale' is inherently a narrative field that requires enterprise authorship. Kept partial deliberately."
+  },
+  {
+    id: "annex_iv_2_c_system_architecture",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA72(c)",
+      clause_id: "annex-iv-2-c",
+      title: "Description of system architecture"
+    },
+    requirement: '"The description of the system architecture explaining how software components build on or feed into each other and integrate into the overall processing [...]."',
+    coverage: "partial",
+    evidence_emitter: [
+      "shr_generate",
+      "manifest",
+      "sovereignty_audit",
+      "federation_status"
+    ],
+    evidence_emitted: "Auto-filled: SHR four-layer architecture description (L1 Cognitive Sovereignty, L2 Operational Isolation, L3 Selective Disclosure, L4 Verifiable Reputation) with status flags per layer, tool inventory showing every component interface, sovereignty audit environment analysis, and federation peer topology if configured.",
+    manual_carveout: "Agent-level architecture (LLM orchestration, prompt templates, tool-use loops), upstream data flows into the agent, downstream systems consuming agent output, and the integration story between Sanctuary and the rest of the enterprise stack.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Borderline partial \u2014 Sanctuary emits a complete architectural description of its own layer but this row requires the architecture of the AI system as a whole. Enterprise wraps the Sanctuary layer in a broader architecture narrative."
+  },
+  {
+    id: "annex_iv_2_d_data_requirements",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA72(d)",
+      clause_id: "annex-iv-2-d",
+      title: "Data requirements: training data datasheets"
+    },
+    requirement: '"Where applicable, the data requirements in terms of datasheets describing the training methodologies and techniques and the training data sets used, including [...] provenance, scope and main characteristics; how the data was obtained and selected; labelling procedures [...] and data cleaning methodologies [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: training data description, provenance, scope, labelling, cleaning, and governance].",
+    manual_carveout: "Sanctuary is a runtime sovereignty layer and has no visibility into model training. Training data governance is entirely the responsibility of the model provider or enterprise data team.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Classification is structurally stable across EU AI Act revisions."
+  },
+  {
+    id: "annex_iv_2_e_human_oversight_assessment",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA72(e)",
+      clause_id: "annex-iv-2-e",
+      title: "Assessment of human oversight measures per Article 14"
+    },
+    requirement: '"Assessment of the human oversight measures needed in accordance with Article 14, including an assessment of the technical measures needed to facilitate the interpretation of the outputs of AI systems by the deployers [...]."',
+    coverage: "partial",
+    evidence_emitter: [
+      "principal_policy_view",
+      "sovereignty_audit",
+      "shr_generate",
+      "principal_baseline_view"
+    ],
+    evidence_emitted: "Auto-filled: Principal Policy approval channel configuration (stderr / dashboard / webhook), Tier 1 require-approval rule count, Tier 2 anomaly-triggered approval rule count, Tier 3 auto-allow tool list, baseline anomaly tracker status, and denial-on-timeout behaviour. The template pre-populates the technical-measures half of the human oversight assessment.",
+    manual_carveout: "Operator identities, roles, training, authority, and escalation procedures; mapping between Sanctuary's approval channel and the enterprise's stop-button workflow; rationale for why the chosen oversight tier is appropriate to the risk profile of the deployed agent.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Borderline partial. Sanctuary provides the oversight mechanism inventory with zero enterprise input (~70% of the row). Enterprise provides the people-and-process assessment."
+  },
+  {
+    id: "annex_iv_2_f_predetermined_changes",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA72(f)",
+      clause_id: "annex-iv-2-f",
+      title: "Pre-determined changes to the system and performance"
+    },
+    requirement: '"Where applicable, a description of pre-determined changes to the AI system and its performance [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: pre-determined changes to the AI system and its performance, if any].",
+    manual_carveout: "Pre-determined changes are a product-roadmap and provider-level concept outside Sanctuary's runtime scope.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row."
+  },
+  {
+    id: "annex_iv_2_g_validation_and_testing",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA72(g)",
+      clause_id: "annex-iv-2-g",
+      title: "Validation and testing procedures, metrics"
+    },
+    requirement: '"The validation and testing procedures used, including information about the validation and testing data used [...] and the main metrics used to measure [...] accuracy, robustness and compliance with other relevant requirements [...]."',
+    coverage: "partial",
+    evidence_emitter: [
+      "monitor_audit_log",
+      "audit_export_siem",
+      "sovereignty_audit"
+    ],
+    evidence_emitted: "Auto-filled: audit log entries within the reporting period showing tool-call success/failure rates, gate decision counts (approve / deny / auto-allow), and any injection_detected entries triggered by the prompt injection detector. These provide runtime validation evidence from actual deployment.",
+    manual_carveout: "Model evaluation metrics (accuracy, precision, recall, F1), bias testing results, robustness testing against adversarial inputs, the validation dataset description, and the metric methodology the enterprise used to assess the agent before deployment.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Sanctuary emits runtime operational evidence but does not participate in pre-deployment model validation."
+  },
+  // ─── §2(h) Cybersecurity measures (FULL) ────────────────────────
+  {
+    id: "annex_iv_2_h_cybersecurity",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA72(h)",
+      clause_id: "annex-iv-2-h",
+      title: "Cybersecurity measures"
+    },
+    requirement: '"A detailed description of the cybersecurity measures put in place [...]."',
+    coverage: "full",
+    evidence_emitter: [
+      "sovereignty_audit",
+      "shr_generate",
+      "manifest",
+      "principal_policy_view",
+      "context_gate_list_policies",
+      "context_gate_enforcer_status",
+      "exec_attest"
+    ],
+    evidence_emitted: "Machine-verifiable inventory of Sanctuary's cybersecurity primitives, every item reproducible by running the listed tools against a live instance: (1) L1 Cognitive Sovereignty \u2014 AES-256-GCM namespace encryption with HKDF per-namespace key derivation, Argon2id master key derivation, Ed25519 self-custodied identity, Merkle integrity tracking; reported by sovereignty_audit and shr_generate under layers.l1. (2) L2 Operational Isolation \u2014 three-tier Principal Policy gate with out-of-band approval channel, tool-call audit logging, and denial-on-timeout semantics; reported by principal_policy_view and shr_generate under layers.l2. (3) L2 Outbound context gating \u2014 per-provider field policies classifying agent context as allow / redact / hash / summarize / deny before any outbound call; reported by context_gate_list_policies and context_gate_enforcer_status. (4) L3 Selective Disclosure \u2014 Pedersen commitments on Ristretto255, Schnorr proofs, and bit-decomposition range proofs; reported by sovereignty_audit and shr_generate under layers.l3. (5) L4 Verifiable Reputation \u2014 Ed25519-signed attestations in EAS-compatible format with sovereignty-gated trust tiers; reported by sovereignty_audit and shr_generate under layers.l4. (6) Execution attestation \u2014 cryptographic execution attestation via exec_attest. The full tool inventory of this Sanctuary instance is reproducible by running manifest.",
+    manual_carveout: null,
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Verified against v0.7.0 source on 2026-04-10: every emitter in the array corresponds to a registered MCP tool in index.ts, and every primitive named in the prose is reported by at least one listed tool. DELIBERATELY EXCLUDED: prompt injection detection. The InjectionDetector subsystem (server/src/security/injection-detector.ts) is wired into the Principal Policy gate and is a real runtime control, but in v0.7.0 its configuration state is not exposed via any MCP tool \u2014 it is only indirectly evidenced through `injection_detected:*` entries in the audit log (visible via monitor_audit_log / audit_export_siem). Claiming injection detection as part of this row's full coverage would require source-code inspection, which violates the full-coverage bar. Injection detection runtime activity is evidenced via the Art. 12 risk management support row instead. If v0.8.0+ adds an `injection_detector_status` MCP tool, revisit and add to this row."
+  },
+  // ─── §3–§9 ───────────────────────────────────────────────────────
+  {
+    id: "annex_iv_3_monitoring_functioning_control",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA73",
+      clause_id: "annex-iv-3",
+      title: "Monitoring, functioning and control of the system"
+    },
+    requirement: '"Detailed information about the monitoring, functioning and control of the AI system [...]."',
+    coverage: "partial",
+    evidence_emitter: [
+      "monitor_audit_log",
+      "audit_export_siem",
+      "monitor_health",
+      "context_gate_enforcer_status",
+      "principal_baseline_view"
+    ],
+    evidence_emitted: "Auto-filled: encrypted audit log queryable via monitor_audit_log and exportable in CEF/OCSF via audit_export_siem; health dashboard via monitor_health; outbound context gating enforcer status; Principal Policy baseline anomaly tracker state. Together these constitute the runtime monitoring substrate for the Sanctuary layer.",
+    manual_carveout: "Operational SLAs, on-call rotation, incident response procedures, escalation workflows, monitoring dashboards outside Sanctuary, and the enterprise's overall observability stack.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Sanctuary provides the monitoring substrate; the enterprise wraps it in operational processes. Borderline partial."
+  },
+  {
+    id: "annex_iv_4_performance_metrics",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA74",
+      clause_id: "annex-iv-4",
+      title: "Appropriateness of performance metrics"
+    },
+    requirement: '"A description of the appropriateness of the performance metrics for the specific AI system [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: performance metrics and their appropriateness for the specific agent deployment].",
+    manual_carveout: "Performance metrics are agent-specific and model-specific; Sanctuary does not measure model accuracy or task performance.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row."
+  },
+  {
+    id: "annex_iv_5_risk_management",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA75",
+      clause_id: "annex-iv-5",
+      title: "Risk management system per Article 9"
+    },
+    requirement: '"A detailed description of the risk management system in accordance with Article 9 [...]."',
+    coverage: "partial",
+    evidence_emitter: [
+      "principal_policy_view",
+      "principal_baseline_view",
+      "sovereignty_audit",
+      "context_gate_list_policies"
+    ],
+    evidence_emitted: "Auto-filled: Principal Policy tier structure (Tier 1 block, Tier 2 anomaly-triggered, Tier 3 auto-allow), baseline anomaly tracker configuration, outbound context gating policies, and sovereignty audit gap analysis with prioritised recommendations. These constitute Sanctuary's runtime risk management controls.",
+    manual_carveout: "Enterprise-level risk register, residual risk analysis, risk treatment plan, acceptance criteria for residual risks, periodic risk review cadence, and the link between identified risks and the Sanctuary controls above.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Sanctuary emits runtime controls; enterprise maps them to an Article 9 risk management framework."
+  },
+  {
+    id: "annex_iv_6_lifecycle_changes",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA76",
+      clause_id: "annex-iv-6",
+      title: "Description of relevant changes made through lifecycle"
+    },
+    requirement: '"A description of any change made to the system through its lifecycle [...]."',
+    coverage: "partial",
+    evidence_emitter: [
+      "monitor_audit_log",
+      "audit_export_siem",
+      "identity_list"
+    ],
+    evidence_emitted: "Auto-filled: audit log entries within the reporting period showing all policy changes, identity operations (create, rotate, set_primary), state operations, and any configuration changes; identity rotation chain via identity_list. These provide a cryptographically anchored timeline of Sanctuary-layer changes during the period.",
+    manual_carveout: "Agent-level version changes (model updates, prompt changes), business-context narrative for why changes were made, and any changes to non-Sanctuary components of the stack.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Sanctuary captures its own layer's change timeline; enterprise provides the broader change narrative."
+  },
+  {
+    id: "annex_iv_7_standards_applied",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA77",
+      clause_id: "annex-iv-7",
+      title: "Harmonised standards applied"
+    },
+    requirement: '"A list of the harmonised standards applied in full or in part [...] and, where such harmonised standards have not been applied, a detailed description of the solutions adopted to meet the requirements set out in Chapter III, Section 2 [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: list of harmonised standards applied, or description of alternative solutions].",
+    manual_carveout: "Standards conformance is a legal declaration made by the provider. Sanctuary does not assert conformance to any harmonised standard.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row \u2014 standards conformance is a provider legal declaration, not a Sanctuary primitive."
+  },
+  {
+    id: "annex_iv_8_eu_declaration_of_conformity",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA78",
+      clause_id: "annex-iv-8",
+      title: "Copy of the EU declaration of conformity"
+    },
+    requirement: '"A copy of the EU declaration of conformity referred to in Article 47 [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: EU declaration of conformity per Article 47].",
+    manual_carveout: "The EU declaration of conformity is a formal legal document signed by the provider. Sanctuary cannot generate or provide it.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row \u2014 legal document only."
+  },
+  {
+    id: "annex_iv_9_post_market_monitoring_plan",
+    citation: {
+      instrument: "Annex IV",
+      section: "\xA79",
+      clause_id: "annex-iv-9",
+      title: "Post-market monitoring plan per Article 72"
+    },
+    requirement: '"A detailed description of the system in place to evaluate the AI system performance in the post-market phase in accordance with Article 72, including the post-market monitoring plan referred to in Article 72(3) [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: post-market monitoring plan per Article 72(3)].",
+    manual_carveout: "The post-market monitoring plan is a provider-authored governance document. Sanctuary's SIEM exporter can feed the monitoring pipeline, but the plan itself is enterprise-authored.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "See the Art. 12 post-market monitoring support row for Sanctuary's concrete contribution to this area."
+  },
+  // ═══════════════════════════════════════════════════════════════════
+  // ARTICLE 12 — Automatic Record-Keeping (logs)
+  // ═══════════════════════════════════════════════════════════════════
+  {
+    id: "art_12_automatic_logging",
+    citation: {
+      instrument: "Article",
+      section: "12(1)",
+      clause_id: "art-12-1",
+      title: "Automatic logging of events over lifetime"
+    },
+    requirement: `"High-risk AI systems shall technically allow for the automatic recording of events ('logs') over the lifetime of the system."`,
+    coverage: "full",
+    evidence_emitter: ["monitor_audit_log", "audit_export_siem"],
+    evidence_emitted: "Every tool call in the Sanctuary runtime automatically produces an audit entry via the Principal Policy gate. Router.ts wraps all tool invocations through gate.evaluate(), which appends to the audit log on every outcome path (gate_allow, gate_allow_proxy, gate_deny, gate_escalate, gate_unclassified, injection_detected). Entries are persisted as AES-256-GCM authenticated ciphertext under an HKDF-derived audit-log key and are queryable via monitor_audit_log or exportable in CEF/OCSF via audit_export_siem. No tool call bypasses the audit path.",
+    manual_carveout: null,
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Verified against v0.7.0 source on 2026-04-10: router.ts:249 wraps every tool call through gate.evaluate(); gate.ts lines 86, 155, 186, 202, 358 append to the audit log on every outcome. CORRECTIONS APPLIED during verification: earlier drafts claimed 'Ed25519-signed entries' and 'hash-chained transcript' \u2014 neither is true. The AuditEntry schema in l2-operational/audit-log.ts has no signature field, and entries are stored as individual encrypted files with no inter-entry hash chain. AES-256-GCM authenticated encryption provides integrity against third-party tampering; that is the accurate claim. Art. 12(1) requires the system to technically *allow* automatic recording, which is satisfied. DURABILITY CAVEAT: audit-log.ts:59 uses fire-and-forget persistence \u2014 if disk write fails, the entry lives only in memory and is lost at process exit. This is a quality-under-failure concern but does not defeat the Art. 12(1) capability claim. If v0.8.0+ adds synchronous persistence or Ed25519 signing on audit entries, update this row's prose."
+  },
+  {
+    id: "art_12_post_market_monitoring_support",
+    citation: {
+      instrument: "Article",
+      section: "12(2)(a)",
+      clause_id: "art-12-2-a",
+      title: "Logs enable identification of Article 79(1) risks"
+    },
+    requirement: '"The logging capabilities shall enable the recording of events relevant for identifying situations that may result in the AI system presenting a risk within the meaning of Article 79(1) [...] and for facilitating the post-market monitoring referred to in Article 72."',
+    coverage: "full",
+    evidence_emitter: ["audit_export_siem", "monitor_audit_log"],
+    evidence_emitted: "The audit_export_siem tool exports audit log entries in two SIEM-standard formats: Common Event Format (CEF, newline-delimited) and Open Cybersecurity Schema Framework (OCSF, JSON array). Both formats are directly ingestible by Splunk, Datadog, QRadar, and any other enterprise SIEM platform, which are the standard substrate for Article 72 post-market monitoring pipelines. Exports support time-window filters (since / until), tool name filters, gate decision filters (approve / deny / auto-allow), layer filters (l1 / l2 / l3 / l4), and result filters (success / failure). Bulk exports up to 1000 events per call.",
+    manual_carveout: null,
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Verified against v0.7.0 source on 2026-04-10: audit/siem-tools.ts:18-77 registers audit_export_siem with CEF and OCSF format support and the full filter set. Classified Tier 3 (auto-allow, read-only) in loader.ts. No corrections to the original draft."
+  },
+  {
+    id: "art_12_risk_management_support",
+    citation: {
+      instrument: "Article",
+      section: "12(2)(b)",
+      clause_id: "art-12-2-b",
+      title: "Logs facilitate monitoring operation per Article 26(5)"
+    },
+    requirement: '"The logging capabilities shall enable the recording of events relevant for [...] facilitating the monitoring of the operation of the high-risk AI system referred to in Article 26(5)."',
+    coverage: "full",
+    evidence_emitter: [
+      "monitor_audit_log",
+      "audit_export_siem",
+      "principal_baseline_view"
+    ],
+    evidence_emitted: "Gate decisions are logged with structured operation prefixes (gate_allow:, gate_allow_proxy:, gate_deny:, gate_escalate:, gate_unclassified:, injection_detected:) directly filterable via audit_export_siem's filter_decision enum (approve / deny / auto-allow) and via monitor_audit_log's operation_type parameter. The Principal Policy baseline anomaly tracker state (behavioural model, known-namespaces, frequency baselines, anomaly thresholds) is queryable via principal_baseline_view. Together these provide the machine-queryable substrate for deployer operation monitoring under Article 26(5).",
+    manual_carveout: null,
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Verified against v0.7.0 source on 2026-04-10. gate.ts writes structured operation strings on every gate outcome; baseline.ts is the anomaly source and is exposed via principal_baseline_view. Minor correction during verification: principal_baseline_view added to emitter list (original draft listed only monitor_audit_log)."
+  },
+  {
+    id: "art_12_log_content",
+    citation: {
+      instrument: "Article",
+      section: "12(3)",
+      clause_id: "art-12-3",
+      title: "Required log content for Annex III \xA71(a) systems"
+    },
+    requirement: '"For high-risk AI systems referred to in point 1(a) of Annex III, the logging capabilities shall provide, at a minimum: (a) recording of the period of each use of the system [...]; (b) the reference database against which input data has been checked by the system; (c) the input data for which the search has led to a match; (d) the identification of the natural persons involved in the verification of the results [...]."',
+    coverage: "partial",
+    evidence_emitter: [
+      "monitor_audit_log",
+      "audit_export_siem",
+      "identity_list"
+    ],
+    evidence_emitted: "Auto-filled where the agent routes through Sanctuary: period of use (audit log timestamps with since/until filters), tool inputs (captured in audit entry details field), and identification of principals who approved Tier 1 operations (captured via identity_id in audit entries and identity provenance via identity_list). Gate decisions are bound to the identity that requested the operation.",
+    manual_carveout: "Reference database identifier (the external database the agent queries) \u2014 only captured if the agent explicitly logs it to Sanctuary state. Natural-person verifier identification beyond the Sanctuary principal identity (e.g., the human operator's HR record or employee ID). Input data captured only when the agent passes it through a Sanctuary tool call.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Row applies only to Annex III \xA71(a) (biometric remote identification) systems. For other Annex III categories this row is not triggered. Coverage depends on whether the agent actually routes its biometric checks through Sanctuary-tracked tool calls."
+  },
+  {
+    id: "art_12_retention",
+    citation: {
+      instrument: "Article",
+      section: "19(1)",
+      clause_id: "art-19-1",
+      title: "Log retention for at least six months"
+    },
+    requirement: '"Providers of high-risk AI systems shall keep the logs referred to in Article 12(1), automatically generated by their high-risk AI systems, to the extent such logs are under their control. [...] the logs shall be kept for a period appropriate to the intended purpose of the high-risk AI system, of at least six months [...]."',
+    coverage: "partial",
+    evidence_emitter: ["monitor_audit_log", "audit_export_siem"],
+    evidence_emitted: "Auto-filled: Sanctuary's audit log persists entries indefinitely by default (no automatic purge). Entries are exportable at any time via audit_export_siem for archival to enterprise storage.",
+    manual_carveout: "The enterprise's declared log retention policy (how long logs are kept, in which storage tier, who has access), the archival pipeline configuration feeding enterprise long-term storage, and the written policy document satisfying the 'period appropriate to the intended purpose' requirement.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Note: this row cites Article 19(1) rather than Article 12 \u2014 retention is specifically an Article 19 provider obligation, not an Article 12 logging capability. The capability to retain exists in Sanctuary (no automatic purge); the declared policy is an enterprise artefact."
+  },
+  // ═══════════════════════════════════════════════════════════════════
+  // ARTICLE 13 — Transparency and provision of information to deployers
+  // ═══════════════════════════════════════════════════════════════════
+  {
+    id: "art_13_3_a_provider_identity",
+    citation: {
+      instrument: "Article",
+      section: "13(3)(a)",
+      clause_id: "art-13-3-a",
+      title: "Identity and contact details of the provider"
+    },
+    requirement: '"The instructions for use shall contain at least the following information: (a) the identity and the contact details of the provider and, where applicable, of its authorised representative [...]."',
+    coverage: "partial",
+    evidence_emitter: ["identity_list", "identity_set_primary", "shr_generate"],
+    evidence_emitted: "Auto-filled: cryptographic provider identity \u2014 primary Ed25519 public key, DID, instance_id, and key creation timestamp via identity_list and identity_set_primary. The signed SHR carries the same identity in its signed_by field, providing a verifiable link between the provider identity and the capability assertions of the system.",
+    manual_carveout: "Legal provider name, registered legal entity, registered business address, contact email, and authorised representative details (if applicable). These are legal-entity facts that must be supplied by the enterprise.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Sanctuary emits the cryptographic identity; the enterprise supplies the legal identity. Both are required for complete Art. 13(3)(a) coverage."
+  },
+  {
+    id: "art_13_3_b_ii_capabilities_and_limitations",
+    citation: {
+      instrument: "Article",
+      section: "13(3)(b)(ii)",
+      clause_id: "art-13-3-b-ii",
+      title: "Performance characteristics, capabilities and limitations"
+    },
+    requirement: '"The characteristics, capabilities and limitations of performance of the high-risk AI system, including [...] its intended purpose [...] the level of accuracy, including its metrics [...] and any known or foreseeable circumstance [...] which may lead to risks to the health and safety or fundamental rights [...]."',
+    coverage: "partial",
+    evidence_emitter: ["shr_generate", "manifest", "sovereignty_audit"],
+    evidence_emitted: "Auto-filled: SHR four-layer capability report with explicit status flags per layer (active / degraded / inactive), the SHR degradations[] array listing honest self-declared gaps (e.g., NO_TEE, PROCESS_ISOLATION_ONLY), the full MCP tool inventory (via manifest), and the sovereignty audit gap analysis. Together these constitute a machine-readable capability manifest with explicit, honest limitations.",
+    manual_carveout: "Agent-level accuracy metrics and their measurement methodology, false-positive and false-negative rates on the agent's business task, known failure modes specific to the deployment, and the link between technical capabilities and fundamental-rights risk.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Sanctuary's SHR is structurally a transparency artefact \u2014 it is designed to honestly declare capabilities and degradations. This row is where SHR data feeds user-facing disclosures."
+  },
+  {
+    id: "art_13_3_b_iv_output_interpretation",
+    citation: {
+      instrument: "Article",
+      section: "13(3)(b)(iv)",
+      clause_id: "art-13-3-b-iv",
+      title: "Technical capabilities to interpret system output"
+    },
+    requirement: '"Where appropriate, its performance regarding specific persons or groups of persons on which the system is intended to be used; [...] where appropriate, specifications for the input data, or any other relevant information in terms of the training, validation and testing data sets used, taking into account the intended purpose of the AI system [...]."',
+    coverage: "partial",
+    evidence_emitter: [
+      "shr_generate",
+      "monitor_audit_log",
+      "audit_export_siem",
+      "bridge_verify"
+    ],
+    evidence_emitted: "Auto-filled: signed SHR + Ed25519-signed audit trail + Concordia bridge attestations (where used) give machine-readable provenance for every tool call the agent made during the reporting period. This enables output interpretation of the form 'this agent action came from these inputs at this time, cryptographically signed and independently verifiable.'",
+    manual_carveout: "Business-facing explanation translating the cryptographic trail into user-comprehensible narrative, performance characteristics on specific populations, and intended-purpose-specific input specifications.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Sanctuary provides the cryptographic substrate for output provenance; enterprise renders it into user-facing disclosure text. Art. 13 is fundamentally a disclosure UX obligation that Sanctuary does not render."
+  },
+  // ═══════════════════════════════════════════════════════════════════
+  // ARTICLE 14 — Human Oversight
+  // ═══════════════════════════════════════════════════════════════════
+  {
+    id: "art_14_interpret_outputs",
+    citation: {
+      instrument: "Article",
+      section: "14(4)(a)-(c)",
+      clause_id: "art-14-4-a-c",
+      title: "Oversight enables understanding and interpretation"
+    },
+    requirement: `"[The measures shall enable the persons to whom human oversight is assigned to]: (a) [...] properly understand the relevant capacities and limitations of the high-risk AI system [...]; (b) [...] remain aware of [...] automation bias [...]; (c) [...] correctly interpret the high-risk AI system's output [...]."`,
+    coverage: "partial",
+    evidence_emitter: ["shr_generate", "principal_policy_view", "manifest"],
+    evidence_emitted: "Auto-filled: SHR is designed to be human-readable with explicit per-layer status flags and honest degradation declarations. Principal Policy is inspectable YAML that a human overseer can read directly. Tool inventory (via manifest) gives the oversight persons a complete list of what the agent can do.",
+    manual_carveout: "Training materials for human overseers, the specific automation-bias awareness program, how oversight persons are trained to correctly interpret agent output, and any UI tools the enterprise provides to support oversight.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Sanctuary emits artefacts designed to be interpretable; the enterprise builds the training-and-support layer around them."
+  },
+  {
+    id: "art_14_intervene_interrupt",
+    citation: {
+      instrument: "Article",
+      section: "14(4)(e)",
+      clause_id: "art-14-4-e",
+      title: "Intervention, interruption, and stop button"
+    },
+    requirement: `"[The measures shall enable the persons to whom human oversight is assigned to]: (e) [...] intervene on the operation of the high-risk AI system or interrupt the system through a 'stop' button or similar procedure that allows the system to come to a halt in a safe state."`,
+    coverage: "partial",
+    evidence_emitter: ["principal_policy_view", "sovereignty_audit"],
+    evidence_emitted: "Auto-filled: Principal Policy approval channel configuration (stderr / dashboard / webhook), Tier 1 require-approval rule count, denial-on-timeout behaviour, and gate decision semantics. These collectively document Sanctuary's pre-execution intervention capability \u2014 every Tier 1 tool call is halted pending human approval.",
+    manual_carveout: "The enterprise's declared mapping between Sanctuary's approval channel and its Article 14(4)(e) stop-button workflow, the operational procedure for invoking the stop button, and acceptance that pre-execution gating satisfies the 'halt in a safe state' requirement for the specific agent.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Downgraded from full during audit (2026-04-10). Sanctuary's approval gate is a pre-execution intervention, not a mid-stream kill switch. Whether pre-execution gating satisfies Art. 14(4)(e) is an enterprise-declared operational judgement. Honest partial."
+  },
+  {
+    id: "art_14_decide_not_to_use",
+    citation: {
+      instrument: "Article",
+      section: "14(4)(d)",
+      clause_id: "art-14-4-d",
+      title: "Decide not to use or to disregard the output"
+    },
+    requirement: '"[The measures shall enable the persons to whom human oversight is assigned to]: (d) [...] decide, in any particular situation, not to use the high-risk AI system or to otherwise disregard, override or reverse the output of the high-risk AI system [...]."',
+    coverage: "partial",
+    evidence_emitter: ["principal_policy_view"],
+    evidence_emitted: "Auto-filled: Principal Policy denial semantics \u2014 every Tier 1 operation defaults to deny on approval timeout, providing a structural 'decide not to use' control at the policy layer. Tier 1 tools include export, import, key rotation, and secure delete.",
+    manual_carveout: "The enterprise's declared mapping between Sanctuary's deny semantics and its Art. 14(4)(d) decision-not-to-use workflow, and operator authority to invoke the decision.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Downgraded from full during audit (2026-04-10). Sanctuary provides the capability; enterprise provides the operational declaration."
+  },
+  {
+    id: "art_14_operator_training",
+    citation: {
+      instrument: "Article",
+      section: "14(4) chapeau",
+      clause_id: "art-14-4-chapeau",
+      title: "Operator competence, training, and authority"
+    },
+    requirement: '"[Human oversight measures shall be commensurate with the risks, level of autonomy and context of use of the high-risk AI system] [...] ensured through [...] the following types of measures, as appropriate to the circumstances [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: operator identities, roles, competence, training program, and authority to override].",
+    manual_carveout: "People-and-process facts that Sanctuary cannot observe or emit.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row \u2014 operator governance is an HR function."
+  },
+  // ═══════════════════════════════════════════════════════════════════
+  // ARTICLE 15 — Accuracy, Robustness, Cybersecurity
+  // ═══════════════════════════════════════════════════════════════════
+  {
+    id: "art_15_cybersecurity_appropriate",
+    citation: {
+      instrument: "Article",
+      section: "15(5)",
+      clause_id: "art-15-5",
+      title: "Cybersecurity measures appropriate to the risks"
+    },
+    requirement: '"High-risk AI systems shall be resilient against attempts by unauthorised third parties to alter their use, outputs or performance by exploiting system vulnerabilities. The technical solutions aiming to ensure the cybersecurity of high-risk AI systems shall be appropriate to the relevant circumstances and the risks."',
+    coverage: "partial",
+    evidence_emitter: [
+      "sovereignty_audit",
+      "shr_generate",
+      "principal_policy_view",
+      "context_gate_list_policies"
+    ],
+    evidence_emitted: "Auto-filled: the full cybersecurity measures inventory (see Annex IV \xA72(h) row for complete description). Sanctuary emits the list of measures with structured status flags.",
+    manual_carveout: "Appropriateness assertion: the enterprise must declare that the Sanctuary-reported measures are appropriate to the specific risks of the deployment context (risk-matched narrative linking identified risks to selected controls).",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Downgraded from full during audit (2026-04-10). Art. 15(5) requires measures 'appropriate to the risks' \u2014 the appropriateness claim is a risk-matched narrative the enterprise owns. The pure-description version survives as a full row at Annex IV \xA72(h); this row is the risk-adequacy half of the same content."
+  },
+  {
+    id: "art_15_resilience_alteration",
+    citation: {
+      instrument: "Article",
+      section: "15(5) first subparagraph",
+      clause_id: "art-15-5-resilience",
+      title: "Resilience against unauthorised third-party alteration"
+    },
+    requirement: '"High-risk AI systems shall be resilient against attempts by unauthorised third parties to alter their use, outputs or performance by exploiting system vulnerabilities."',
+    coverage: "full",
+    evidence_emitter: [
+      "sovereignty_audit",
+      "shr_generate",
+      "monitor_health",
+      "state_list",
+      "principal_policy_view",
+      "context_gate_enforcer_status"
+    ],
+    evidence_emitted: "Resilience against unauthorised third-party alteration is enforced across multiple subsystems, each independently verifiable via an MCP tool call: (1) L1 state store \u2014 AES-256-GCM authenticated encryption with HKDF per-namespace keys, Merkle root per namespace, monotonic version counter per (namespace, key), and anti-rollback checks on every read; reported by monitor_health (state_integrity flag) and via version numbers returned by state_list. (2) L1 audit log \u2014 AES-256-GCM authenticated ciphertext persisted under an HKDF-derived audit-log key; confidentiality and integrity against third-party tampering (no signature-based non-repudiation \u2014 see review_notes). (3) L1 identity \u2014 Ed25519 self-custodied keypairs; signed identity operations (sign, rotate, verify) and signed SHR generation; reported by shr_generate signature block. (4) L2 execution gate \u2014 every tool call routed through router.ts -> ApprovalGate.evaluate() -> Principal Policy tier check before execution; no bypass path; reported by principal_policy_view and the audit log trail of gate_* entries. (5) L2 outbound context gating \u2014 per-provider field policies applied before any outbound call; reported by context_gate_enforcer_status.",
+    manual_carveout: null,
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Verified against v0.7.0 source on 2026-04-10. MAJOR CORRECTIONS APPLIED from earlier drafts: (1) Earlier drafts claimed Merkle integrity on the audit log \u2014 that is wrong. Merkle trees exist on the state store (l1-cognitive/state-store.ts) but NOT on the audit log. (2) Earlier drafts claimed Ed25519 signatures on audit entries \u2014 that is wrong. The AuditEntry schema has no signature field; entries are AES-256-GCM ciphertext only. Ed25519 signatures exist on identity operations and SHR, not audit entries. (3) Earlier drafts claimed 'tamper-evident transcript' on the audit log \u2014 this is only true against third parties without the master key; there is no hash chain. The row still survives as full because Art. 15(5) specifies 'unauthorised third parties,' and AES-256-GCM with an HKDF-derived key protects against that threat model. Non-repudiation against a compromised-master-key insider is a different threat model not covered by Art. 15(5)."
+  },
+  {
+    id: "art_15_resilience_poisoning",
+    citation: {
+      instrument: "Article",
+      section: "15(5) second subparagraph",
+      clause_id: "art-15-5-poisoning",
+      title: "Resilience against data and model poisoning"
+    },
+    requirement: `"The technical solutions to address AI specific vulnerabilities shall include, where appropriate, measures to prevent, detect, respond to, resolve and control for attacks trying to manipulate the training data set ('data poisoning'), or pre-trained components used in training ('model poisoning'), inputs designed to cause the AI model to make a mistake ('adversarial examples' or 'model evasion'), [...]."`,
+    coverage: "partial",
+    evidence_emitter: ["monitor_audit_log", "audit_export_siem"],
+    evidence_emitted: "Auto-filled: the Principal Policy gate runs a prompt injection detector pre-check on every tool call; when flagged, the gate appends 'injection_detected:*' entries to the audit log, which are visible via monitor_audit_log and exportable via audit_export_siem. The detector covers role override, security bypass, encoding evasion, data exfiltration, and prompt stuffing signals at runtime.",
+    manual_carveout: "Training-time threats (data poisoning, model poisoning) are entirely outside Sanctuary's runtime scope \u2014 training data governance is the model provider's responsibility. The runtime adversarial-input detection is partial coverage of the 'adversarial examples' subset of Art. 15(5).",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "The injection detector exists (security/injection-detector.ts) and its activity IS evidenced via audit log entries, even though its configuration state is not directly queryable. Partial is honest: runtime adversarial-input detection is covered; training-time poisoning is not."
+  },
+  {
+    id: "art_15_accuracy_metrics",
+    citation: {
+      instrument: "Article",
+      section: "15(3)",
+      clause_id: "art-15-3",
+      title: "Declared accuracy levels and metrics"
+    },
+    requirement: '"The levels of accuracy and the relevant accuracy metrics of high-risk AI systems shall be declared in the accompanying instructions of use."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: accuracy levels and metrics on the agent's business task].",
+    manual_carveout: "Sanctuary does not measure agent task accuracy.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row."
+  },
+  {
+    id: "art_15_redundancy_failsafe",
+    citation: {
+      instrument: "Article",
+      section: "15(4)",
+      clause_id: "art-15-4",
+      title: "Technical redundancy and fail-safe measures"
+    },
+    requirement: '"High-risk AI systems shall be as resilient as possible [...] The robustness of high-risk AI systems may be achieved through technical redundancy solutions, which may include backup or fail-safe plans."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: technical redundancy and fail-safe plans for the deployment].",
+    manual_carveout: "Redundancy architecture is an operational decision at the deployment level outside Sanctuary's scope.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row."
+  },
+  // ═══════════════════════════════════════════════════════════════════
+  // ARTICLE 26 — Deployer Obligations
+  // ═══════════════════════════════════════════════════════════════════
+  {
+    id: "art_26_per_instructions",
+    citation: {
+      instrument: "Article",
+      section: "26(1)",
+      clause_id: "art-26-1",
+      title: "Use in accordance with instructions for use"
+    },
+    requirement: '"Deployers of high-risk AI systems shall take appropriate technical and organisational measures to ensure they use such systems in accordance with the instructions for use accompanying the systems [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: declaration of use in accordance with instructions].",
+    manual_carveout: "Deployer-facing attestation, not a Sanctuary primitive.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row."
+  },
+  {
+    id: "art_26_human_oversight_assigned",
+    citation: {
+      instrument: "Article",
+      section: "26(2)",
+      clause_id: "art-26-2",
+      title: "Assign human oversight to competent natural persons"
+    },
+    requirement: '"Deployers shall assign human oversight to natural persons who have the necessary competence, training and authority, as well as the necessary support."',
+    coverage: "partial",
+    evidence_emitter: ["principal_policy_view"],
+    evidence_emitted: "Auto-filled: Sanctuary's approval channel configuration (stderr / dashboard / webhook) provides the technical substrate to which the enterprise binds its assigned human overseers. The Principal Policy Tier 1 rule list documents which operations require human approval.",
+    manual_carveout: "Identity of assigned overseers, their competence assessment, training records, authority scope, and the support infrastructure provided to them.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Sanctuary provides the technical oversight surface; enterprise assigns the people."
+  },
+  {
+    id: "art_26_input_data_relevance",
+    citation: {
+      instrument: "Article",
+      section: "26(4)",
+      clause_id: "art-26-4",
+      title: "Input data relevance and representativeness"
+    },
+    requirement: '"[...] deployers shall ensure that input data is relevant and sufficiently representative in view of the intended purpose of the high-risk AI system."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: declaration of input data relevance and representativeness].",
+    manual_carveout: "Input data governance is a deployer responsibility outside Sanctuary's runtime scope.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row."
+  },
+  {
+    id: "art_26_monitor_and_inform",
+    citation: {
+      instrument: "Article",
+      section: "26(5)",
+      clause_id: "art-26-5",
+      title: "Monitor operation and inform provider of incidents"
+    },
+    requirement: '"Deployers shall monitor the operation of the high-risk AI system on the basis of the instructions for use [...]. When deployers have reason to consider that the use in accordance with the instructions for use may result in that AI system presenting a risk [...] they shall, without undue delay, inform the provider [...] and suspend the use of that system."',
+    coverage: "partial",
+    evidence_emitter: [
+      "monitor_audit_log",
+      "audit_export_siem",
+      "monitor_health",
+      "principal_baseline_view"
+    ],
+    evidence_emitted: "Auto-filled: the runtime monitoring substrate \u2014 encrypted audit log queryable and exportable in SIEM-standard formats, health dashboard, and anomaly baseline tracker. Provides the technical means to monitor and detect risk situations.",
+    manual_carveout: "The enterprise's incident response workflow, the 'inform provider' communication channel and contacts, the suspension procedure, and the documented risk-detection criteria.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Sanctuary provides the detect-and-export half; enterprise provides the report-and-suspend half."
+  },
+  {
+    id: "art_26_retain_logs",
+    citation: {
+      instrument: "Article",
+      section: "26(6)",
+      clause_id: "art-26-6",
+      title: "Deployers keep logs for at least six months"
+    },
+    requirement: '"Deployers of high-risk AI systems shall keep the logs automatically generated by that high-risk AI system, to the extent such logs are under their control, for a period appropriate to the intended purpose of the high-risk AI system, of at least six months [...]."',
+    coverage: "partial",
+    evidence_emitter: ["monitor_audit_log", "audit_export_siem"],
+    evidence_emitted: "Auto-filled: Sanctuary's audit log persists entries indefinitely by default and is exportable for archival at any time via audit_export_siem in CEF/OCSF formats suitable for long-term SIEM retention.",
+    manual_carveout: "The enterprise's declared log retention policy, long-term archival pipeline, access control on archived logs, and written policy document satisfying the 'period appropriate to the intended purpose' requirement.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Downgraded from full during audit (2026-04-10). Sanctuary captures and exports; enterprise declares and archives. The retention policy is an enterprise governance artefact."
+  },
+  {
+    id: "art_26_workers_representatives",
+    citation: {
+      instrument: "Article",
+      section: "26(7)",
+      clause_id: "art-26-7",
+      title: "Inform workers and workers' representatives (employment)"
+    },
+    requirement: `"Before putting into service or using a high-risk AI system at the workplace, deployers who are employers shall inform workers' representatives and the affected workers that they will be subject to the use of the high-risk AI system."`,
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: worker and workers' representative notification evidence].",
+    manual_carveout: "Labour-relations obligation outside Sanctuary's scope.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row. Applies only to employment-context deployments (Annex III \xA74)."
+  },
+  {
+    id: "art_26_dpia",
+    citation: {
+      instrument: "Article",
+      section: "26(9)",
+      clause_id: "art-26-9",
+      title: "Data protection impact assessment per GDPR Art. 35"
+    },
+    requirement: '"Where applicable, deployers of high-risk AI systems shall use the information provided under Article 13 of this Regulation to comply with their obligation to carry out a data protection impact assessment under Article 35 of Regulation (EU) 2016/679 [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: DPIA under GDPR Article 35, where applicable].",
+    manual_carveout: "DPIA is a GDPR governance document. Sanctuary's transparency artefacts (SHR, audit log) may feed into a DPIA, but the assessment itself is enterprise-authored.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row."
+  },
+  {
+    id: "art_26_eu_database_registration",
+    citation: {
+      instrument: "Article",
+      section: "26(8)",
+      clause_id: "art-26-8",
+      title: "Registration in EU database for Annex III systems"
+    },
+    requirement: '"Deployers of high-risk AI systems referred to in Annex III that [...] are public authorities, [...] or deployers acting on their behalf, shall register themselves, select the system and register its use in the EU database referred to in Article 71 [...]."',
+    coverage: "manual_only",
+    evidence_emitter: [],
+    evidence_emitted: "[MANUAL INPUT REQUIRED: EU database registration under Article 71, where applicable].",
+    manual_carveout: "Registration in the EU database is a legal procedural step the enterprise performs directly with the European Commission.",
+    last_reviewed_date: REVIEW_DATE,
+    last_reviewed_by: REVIEWER,
+    review_notes: "Structural manual row. Applies only to public authorities and those acting on their behalf."
+  }
+];
+var COVERAGE_MATRIX_V1 = {
+  matrix_version: "v1",
+  rows: ROWS
+};
+function rowsByCoverage(matrix, flag) {
+  return matrix.rows.filter((r) => r.coverage === flag);
+}
+function coverageStats(matrix) {
+  const total = matrix.rows.length;
+  const full = rowsByCoverage(matrix, "full").length;
+  const partial = rowsByCoverage(matrix, "partial").length;
+  const manual = rowsByCoverage(matrix, "manual_only").length;
+  return {
+    total_rows: total,
+    full,
+    partial,
+    manual_only: manual,
+    full_pct: Math.round(full / total * 100),
+    partial_pct: Math.round(partial / total * 100),
+    manual_only_pct: Math.round(manual / total * 100)
+  };
+}
+
+// src/compliance/eu_ai_act/templates/render.ts
+var INTERPOLATION_RE = /\{\{\s*([a-z_][a-z0-9_]*)(?:\s*\|\s*([^}]*?))?\s*\}\}/gi;
+var MANUAL_INPUT_MARKER_PREFIX = "[MANUAL INPUT REQUIRED:";
+var MANUAL_INPUT_MARKER_SUFFIX = "]";
+function manualInputMarker(hint) {
+  return `${MANUAL_INPUT_MARKER_PREFIX} ${hint}${MANUAL_INPUT_MARKER_SUFFIX}`;
+}
+function isEmpty(value) {
+  return value === void 0 || value === null || value === "";
+}
+function render(template, context) {
+  return template.replace(INTERPOLATION_RE, (_match, rawKey, rawHint) => {
+    const key = String(rawKey).trim();
+    const value = context[key];
+    if (isEmpty(value)) {
+      const hint = rawHint !== void 0 ? String(rawHint).trim() : key;
+      return manualInputMarker(hint || key);
+    }
+    return String(value);
+  });
+}
+
+// src/compliance/eu_ai_act/templates/shared.ts
+var HEADER_TEMPLATE = `# {{ document_title }}
+
+*{{ document_subtitle }}*
+
+---
+
+| Field | Value |
+|---|---|
+| **Regulation** | {{ regulation_version }} |
+| **Coverage matrix version** | {{ matrix_version }} |
+| **Bundle generated** | {{ generated_at }} |
+| **Reporting period** | {{ period_start }} \u2192 {{ period_end }} |
+| **Agent DID** | \`{{ agent_did }}\` |
+| **Legal provider** | {{ provider_legal_name }} |
+| **Provider contact** | {{ provider_contact }} |
+| **Intended purpose** | {{ intended_purpose }} |
+| **Annex III classification** | {{ annex_iii_class }} |
+| **Signer DID** | \`{{ signer_did }}\` |
+| **Signer public key (base64url)** | \`{{ signer_pubkey }}\` |
+
+---
+
+`;
+var FOOTER_TEMPLATE = `
+---
+
+## Document Signature
+
+This document is cryptographically signed by the provider's primary
+Ed25519 identity (DID \`{{ signer_did }}\`, public key
+\`{{ signer_pubkey }}\`). The signature for this document is recorded
+in the bundle manifest \`00_bundle_manifest.json\` under the entry
+with this filename, alongside its SHA-256 digest.
+
+**Verification procedure:** compute the SHA-256 of this file's raw
+byte content, compare it against the \`sha256\` field for this file
+in the bundle manifest, then verify the \`signature\` field against
+the SHA-256 using the signer's public key with Ed25519. A successful
+check proves this document was emitted by the named Sanctuary
+instance and has not been altered since generation.
+
+---
+
+## Disclaimer
+
+**This document is not legal advice.** It is a technical artifact
+generated by the Sanctuary Framework EU AI Act Compliance Artifact
+Generator. It is not a legal interpretation of Regulation (EU)
+2024/1689 and does not constitute a legal opinion. Consult qualified
+legal counsel before filing or relying on this document for
+regulatory submissions, self-assessment, or CE marking procedures.
+
+The coverage claims in this document reflect the state of the
+Sanctuary Framework v{{ sanctuary_version }} runtime as of the
+generation timestamp above. The coverage matrix is versioned
+(\`{{ matrix_version }}\`) and aligned to the regulation text
+identified by \`{{ regulation_version }}\`; if the European Commission
+publishes implementing acts, delegated acts, or guidance that
+modifies the applicable requirements, this document must be
+regenerated against the updated matrix.
+
+---
+
+*Generated by [Sanctuary Framework](https://github.com/eriknewton/sanctuary-framework)
+v{{ sanctuary_version }} \xB7 Author: Erik Newton \xB7 License: Apache-2.0*
+`;
+var ROW_BLOCK_TEMPLATE = `### {{ row_citation }} \u2014 {{ row_title }}
+
+**Coverage:** {{ row_coverage_badge }}
+
+**Regulation text (verbatim, {{ regulation_version }}):**
+
+> {{ row_requirement }}
+
+**Evidence emitted by Sanctuary:**
+
+{{ row_evidence_emitted }}
+
+**Evidence emitter tools:**
+
+{{ row_evidence_emitter_list }}
+
+**Enterprise input required:**
+
+{{ row_manual_carveout }}
+
+---
+
+`;
+function coverageBadge(coverage) {
+  switch (coverage) {
+    case "full":
+      return "**FULL** \u2014 auto-emitted from Sanctuary, zero enterprise input required, machine-verifiable";
+    case "partial":
+      return "**PARTIAL** \u2014 Sanctuary emits structured evidence, enterprise supplies business context";
+    case "manual_only":
+      return "**MANUAL ONLY** \u2014 Sanctuary has no visibility, enterprise authors this section";
+  }
+}
+function formatEmitterList(emitters) {
+  if (emitters.length === 0) {
+    return "_(none \u2014 this row is manual_only)_";
+  }
+  return emitters.map((e) => `- \`${e}\``).join("\n");
+}
+
+// src/compliance/eu_ai_act/templates/01_annex_iv_technical_documentation.ts
+var ANNEX_IV_TECHNICAL_DOCUMENTATION_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document is the Annex IV Technical Documentation for the
+high-risk AI system identified above, prepared under Article 11 of
+Regulation (EU) 2024/1689 (the "EU AI Act").
+
+The document maps each numbered Annex IV section to the evidence
+that the Sanctuary Framework auto-emits for that section, and
+identifies exactly where enterprise-supplied business context is
+required. Sections marked **FULL** are machine-verifiable against
+the live Sanctuary instance that generated this bundle. Sections
+marked **PARTIAL** carry auto-filled structured evidence alongside
+explicit \`[MANUAL INPUT REQUIRED: ...]\` markers for enterprise
+completion. Sections marked **MANUAL ONLY** are outside Sanctuary's
+architectural scope and must be authored by the enterprise in full.
+
+**How to use this document:**
+
+1. Review each section below in order.
+2. For every \`[MANUAL INPUT REQUIRED: ...]\` marker, replace the
+   marker with the relevant enterprise fact.
+3. Verify the auto-filled evidence against the live Sanctuary
+   instance by running the listed \`evidence_emitter\` tools.
+4. Sign the completed document with the provider's legal signature
+   (the Sanctuary cryptographic signature below is the runtime
+   authenticity attestation, not a substitute for a signed legal
+   declaration).
+
+---
+
+## \xA71 \u2014 General Description
+
+{{ sections_1 }}
+
+## \xA72 \u2014 Detailed Description of Elements
+
+{{ sections_2 }}
+
+## \xA73 \u2014 Monitoring, Functioning and Control
+
+{{ sections_3 }}
+
+## \xA74 \u2014 Performance Metrics
+
+{{ sections_4 }}
+
+## \xA75 \u2014 Risk Management System (Article 9)
+
+{{ sections_5 }}
+
+## \xA76 \u2014 Changes Through Lifecycle
+
+{{ sections_6 }}
+
+## \xA77 \u2014 Standards Applied
+
+{{ sections_7 }}
+
+## \xA78 \u2014 EU Declaration of Conformity
+
+{{ sections_8 }}
+
+## \xA79 \u2014 Post-Market Monitoring Plan (Article 72)
+
+{{ sections_9 }}
+
+${FOOTER_TEMPLATE}`;
+
+// src/compliance/eu_ai_act/templates/02_article_26_deployer_log.ts
+var ARTICLE_26_DEPLOYER_LOG_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document is the Article 26 Deployer Log for the high-risk AI
+system identified above, prepared in accordance with the deployer
+obligations of Article 26 of Regulation (EU) 2024/1689.
+
+Unlike the Annex IV Technical Documentation (which is authored by
+the **provider**), this document is authored by the **deployer** \u2014
+the natural or legal person using the high-risk AI system under its
+authority. In many enterprise deployments the provider and deployer
+are the same legal entity; in others they are distinct. The
+\`{{ provider_legal_name }}\` field in the header identifies the
+entity acting as deployer for the purposes of this document.
+
+The document maps each Article 26 obligation to the evidence that
+the Sanctuary Framework auto-emits, and identifies the operational
+and governance facts that only the deployer can supply.
+
+---
+
+## Deployer Operation Summary
+
+During the reporting period **{{ period_start }} \u2192 {{ period_end }}**,
+the Sanctuary Framework runtime for this agent recorded the
+following aggregate operation metrics. These are auto-filled from
+the encrypted audit log via \`monitor_audit_log\` and
+\`audit_export_siem\`:
+
+| Metric | Value |
+|---|---|
+| Total audit entries | {{ audit_total_entries }} |
+| L1 (Cognitive) entries | {{ audit_l1_count }} |
+| L2 (Operational) entries | {{ audit_l2_count }} |
+| L3 (Disclosure) entries | {{ audit_l3_count }} |
+| L4 (Reputation) entries | {{ audit_l4_count }} |
+| Gate decisions \u2014 allow | {{ gate_allow_count }} |
+| Gate decisions \u2014 allow_proxy | {{ gate_allow_proxy_count }} |
+| Gate decisions \u2014 deny | {{ gate_deny_count }} |
+| Gate decisions \u2014 escalate | {{ gate_escalate_count }} |
+| Gate decisions \u2014 unclassified | {{ gate_unclassified_count }} |
+| Injection-detection events | {{ injection_detected_count }} |
+| Unique identities involved | {{ unique_identity_count }} |
+| Unique operation types | {{ unique_operation_count }} |
+
+Detailed event data is available in the companion file
+\`03_article_12_automatic_logs.md\` and its associated SIEM export.
+
+---
+
+## Article 26 Obligations \u2014 Row-by-Row
+
+{{ rows_rendered }}
+
+${FOOTER_TEMPLATE}`;
+
+// src/compliance/eu_ai_act/templates/03_article_12_automatic_logs.ts
+var ARTICLE_12_AUTOMATIC_LOGS_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document is the Article 12 Automatic Record-Keeping narrative
+for the high-risk AI system identified above, prepared in
+accordance with Article 12 and Article 19(1) of Regulation (EU)
+2024/1689.
+
+The Sanctuary Framework provides structural automatic logging via
+its Principal Policy gate, which intercepts every MCP tool call
+before execution and appends an authenticated entry to the L2
+audit log. No code path exists to bypass this logging. The full
+implementation is described below; the raw audit export in
+SIEM-compatible format accompanies this document as a separate
+file.
+
+---
+
+## Logging Architecture Summary (Auto-Filled)
+
+Sanctuary's Article 12 implementation has the following structural
+properties, each independently verifiable against the v{{ sanctuary_version }}
+source:
+
+| Property | Mechanism | Verifiable via |
+|---|---|---|
+| Automatic capture on every tool call | \`router.ts\` wraps all tool invocations through \`ApprovalGate.evaluate()\`; the gate appends an audit entry on every outcome path (\`gate_allow\`, \`gate_allow_proxy\`, \`gate_deny\`, \`gate_escalate\`, \`gate_unclassified\`, \`injection_detected\`) | Source: \`server/src/router.ts\`, \`server/src/principal-policy/gate.ts\` |
+| Append-only API | The \`AuditLog\` class exposes only \`append()\` and read methods (\`query()\`, \`size\`). No update or delete method is exposed. | Source: \`server/src/l2-operational/audit-log.ts\` |
+| Confidentiality at rest | AES-256-GCM authenticated encryption with an HKDF-derived per-purpose key (\`audit-log\` purpose string) | Source: \`server/src/core/encryption.ts\`, \`server/src/core/key-derivation.ts\` |
+| SIEM-compatible export | CEF (Common Event Format, newline-delimited) and OCSF (Open Cybersecurity Schema Framework, JSON array) emitted by the \`audit_export_siem\` tool | Run: \`audit_export_siem\` with \`format: "cef"\` or \`format: "ocsf"\` |
+| Gate decision taxonomy | Every entry carries a structured operation string prefixed with \`gate_*\` or \`injection_detected:\`, directly filterable via the \`filter_decision\` and \`operation_type\` parameters | Run: \`audit_export_siem\` with \`filter_decision\` set |
+
+---
+
+## Reporting Period Summary (Auto-Filled)
+
+| Field | Value |
+|---|---|
+| Period start | {{ period_start }} |
+| Period end | {{ period_end }} |
+| Total entries captured | {{ audit_total_entries }} |
+| L1 entries | {{ audit_l1_count }} |
+| L2 entries | {{ audit_l2_count }} |
+| L3 entries | {{ audit_l3_count }} |
+| L4 entries | {{ audit_l4_count }} |
+| Gate allow | {{ gate_allow_count }} |
+| Gate allow_proxy | {{ gate_allow_proxy_count }} |
+| Gate deny | {{ gate_deny_count }} |
+| Gate escalate | {{ gate_escalate_count }} |
+| Gate unclassified | {{ gate_unclassified_count }} |
+| Injection-detection events | {{ injection_detected_count }} |
+
+**Full SIEM export:** see the accompanying file
+\`03_article_12_automatic_logs_siem.json\` in this bundle for the
+complete OCSF-formatted audit entries. Ingest into your SIEM
+(Splunk, Datadog, QRadar, or equivalent) for post-market monitoring
+workflows under Article 72.
+
+---
+
+## Article 12 Obligations \u2014 Row-by-Row
+
+{{ rows_rendered }}
+
+---
+
+## Known Caveats and Residual Risk
+
+The following caveats are disclosed honestly and are specific to
+Sanctuary Framework v{{ sanctuary_version }}:
+
+1. **Audit log entries are not Ed25519-signed.** The authenticated
+   encryption provides integrity against unauthorised third parties
+   without the master key. It does not provide non-repudiation
+   against a compromised-master-key insider, because the encryption
+   is symmetric. If your threat model requires per-entry
+   non-repudiation, supplement this logging with an external append-
+   only log service (e.g., a separate SIEM with write-once storage).
+
+2. **Persistence is fire-and-forget.** If disk write fails, the
+   entry lives only in memory and is lost at process exit. This is
+   a durability concern under Article 12(1)'s "over the lifetime of
+   the system" clause. The mitigation is to ensure the Sanctuary
+   storage path is on reliable storage and monitored for write
+   failures.
+
+3. **Retention policy is deployer-declared.** Sanctuary persists
+   entries indefinitely by default but does not enforce the
+   Article 19(1) six-month minimum retention. The deployer must
+   configure archival to meet the statutory retention.
+
+These caveats are documented for audit transparency and do not
+affect the Article 12(1) capability claim that the system
+"technically allows for the automatic recording of events over
+the lifetime of the system."
+
+${FOOTER_TEMPLATE}`;
+
+// src/compliance/eu_ai_act/templates/04_risk_management_summary.ts
+var RISK_MANAGEMENT_SUMMARY_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document is the Risk Management Summary for the high-risk AI
+system identified above, prepared in accordance with Article 9 of
+Regulation (EU) 2024/1689. It aggregates the Sanctuary Framework
+evidence relevant to risk identification, risk analysis, risk
+treatment, and residual risk acceptance for the deployed agent.
+
+This document does not replace the enterprise's overall risk
+management system documentation. It supplies the runtime-control
+half of that system \u2014 the mechanisms, policies, and monitoring
+data that Sanctuary automatically emits. The enterprise must wrap
+these mechanisms in an Article 9-compliant risk management
+framework with identified risks, residual risk analysis, risk
+treatment plans, and periodic review cadence.
+
+---
+
+## Runtime Control Inventory (Auto-Filled)
+
+The following Sanctuary controls are active for this agent and
+collectively form the runtime risk-mitigation substrate referenced
+by Article 9:
+
+### Principal Policy Gate (L2 Operational Isolation)
+
+Every MCP tool call passes through the \`ApprovalGate.evaluate()\`
+method before execution. The gate applies the three-tier Principal
+Policy:
+
+- **Tier 1 \u2014 Always require human approval:** {{ tier1_rule_count }} rules defined.
+  Operations in this tier (state export/import, key rotation, secure
+  delete, reputation import, and similar irreversible or sensitive
+  actions) are blocked pending out-of-band approval via the
+  configured channel (\`{{ approval_channel_type }}\`). Default behaviour
+  on timeout: **deny**.
+- **Tier 2 \u2014 Anomaly-triggered approval:** {{ tier2_rule_count }} rules
+  defined. Baseline tracker at \`principal_baseline_view\` monitors
+  new namespaces, new counterparties, and frequency spikes. First-
+  session policy: \`{{ first_session_policy }}\`.
+- **Tier 3 \u2014 Auto-allow with audit logging:** {{ tier3_rule_count }}
+  tools listed. These are read-only or low-risk operations that
+  proceed without approval but are still captured in the audit log.
+
+### L2 Process Hardening
+
+Runtime hardening of the Sanctuary process via seccomp/entitlement
+restrictions where supported by the host operating system.
+
+### L2 Outbound Context Gating
+
+Per-provider field-level policies applied to agent context before
+any outbound call. {{ context_gate_policy_count }} context gate
+policies are currently configured, enforced via the context gate
+enforcer (active: {{ context_gate_enforcer_active }}).
+
+### Prompt Injection Detector
+
+The \`InjectionDetector\` subsystem runs as a pre-check inside the
+Principal Policy gate on every tool call. Detection signals are
+written to the audit log with the prefix \`injection_detected:\` and
+are filterable via \`monitor_audit_log\` and \`audit_export_siem\`.
+During the reporting period {{ period_start }} \u2192 {{ period_end }},
+the detector flagged **{{ injection_detected_count }}** events.
+
+### L3 Selective Disclosure
+
+Pedersen commitments on Ristretto255, Schnorr proofs, and bit-
+decomposition range proofs. Allows the agent to prove claims about
+its data without revealing the underlying values \u2014 a core control
+for data minimisation under Article 10 and GDPR data minimisation
+obligations.
+
+### L4 Verifiable Reputation
+
+Ed25519-signed attestations in EAS-compatible format with
+sovereignty-gated trust tiers. Supports attestation-based trust
+decisions without requiring trust in any single attestor.
+
+---
+
+## Risk-Management-Relevant Coverage Rows
+
+{{ rows_rendered }}
+
+---
+
+## Residual Risk and Mitigations
+
+The following residual risks are disclosed honestly and are
+specific to Sanctuary Framework v{{ sanctuary_version }}:
+
+- **No TEE attestation.** The runtime self-reports its environment
+  type without a hardware root of trust. The SHR degradation flag
+  \`NO_TEE\` is set automatically. Mitigation: deploy Sanctuary on
+  TEE-capable hardware in production, or accept the process-level
+  isolation boundary as sufficient for the deployment context.
+- **Training-time threats are out of scope.** Data poisoning,
+  model poisoning, and backdoor injection at training time are
+  outside Sanctuary's runtime scope. Mitigation: rely on the
+  model provider's training-pipeline controls and declare the
+  provider's governance in the Annex IV \xA72(d) manual section.
+- **Audit log retention is deployer-declared.** See the Article 12
+  automatic logs document for details and mitigation.
+
+---
+
+## Enterprise-Supplied Risk Framework
+
+The enterprise must supply the following to complete the Article 9
+risk management documentation. These are listed as
+\`[MANUAL INPUT REQUIRED: ...]\` markers throughout this document
+and the Annex IV \xA75 row below:
+
+- Risk register for the specific deployment
+- Residual risk analysis and acceptance criteria
+- Risk treatment plan linking identified risks to the Sanctuary
+  controls above (or compensating controls)
+- Periodic risk review cadence
+- Risk ownership and accountability structure
+
+${FOOTER_TEMPLATE}`;
+
+// src/compliance/eu_ai_act/templates/05_human_oversight_statement.ts
+var HUMAN_OVERSIGHT_STATEMENT_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document is the Human Oversight Statement for the high-risk
+AI system identified above, prepared in accordance with Article 14
+of Regulation (EU) 2024/1689. It documents the technical substrate
+Sanctuary provides for human oversight and identifies the
+operational facts (operator roles, training, authority) that the
+enterprise must supply.
+
+Sanctuary's human oversight substrate is the Principal Policy gate
+with its approval channel. Every operation classified as Tier 1
+blocks execution until a human principal approves or denies via
+the configured out-of-band channel. Every Tier 2 anomaly triggers
+the same approval path when baseline deviation is detected. Tier 3
+operations proceed automatically but are captured in the audit log
+for after-the-fact human review.
+
+**Important scope note:** Sanctuary's intervention model is
+**pre-execution gating**, not mid-stream interruption. An approval
+denial halts the next tool call before it executes; it does not
+kill an in-flight LLM stream or subprocess. Whether this model
+satisfies Article 14(4)(e) ("intervene on the operation [...] or
+interrupt the system through a 'stop' button or similar procedure
+that allows the system to come to a halt in a safe state") is an
+operational judgement the enterprise must make for the specific
+deployment. The Sanctuary claim is: pre-execution gating provides
+a safe-state halt before the next consequential action; mid-stream
+interruption requires additional controls outside Sanctuary.
+
+---
+
+## Principal Policy Configuration (Auto-Filled)
+
+| Field | Value |
+|---|---|
+| Approval channel type | \`{{ approval_channel_type }}\` |
+| Approval channel timeout | {{ approval_channel_timeout_seconds }} seconds |
+| On timeout | **deny** (SEC-002: \`auto_deny\` removed \u2014 timeout always denies) |
+| Tier 1 rule count (always require approval) | {{ tier1_rule_count }} |
+| Tier 2 anomaly rules | new_namespace_access: \`{{ tier2_new_namespace_access }}\`, new_counterparty: \`{{ tier2_new_counterparty }}\`, frequency_spike_multiplier: {{ tier2_frequency_spike_multiplier }}, first_session_policy: \`{{ tier2_first_session_policy }}\` |
+| Tier 3 auto-allow tool count | {{ tier3_rule_count }} |
+| Baseline tracker state | \`{{ baseline_tracker_state }}\` |
+
+The full Principal Policy is machine-readable via
+\`principal_policy_view\`. The baseline tracker state is exposed via
+\`principal_baseline_view\`. Both tools are Tier 3 (read-only) and
+can be invoked by an auditor against a live Sanctuary instance to
+independently verify every value above.
+
+---
+
+## Reporting Period Oversight Activity (Auto-Filled)
+
+During the reporting period **{{ period_start }} \u2192 {{ period_end }}**,
+the Sanctuary oversight gate recorded the following activity:
+
+| Outcome | Count |
+|---|---|
+| Gate allow (Tier 3 auto-allow or approved Tier 1/2) | {{ gate_allow_count }} |
+| Gate allow_proxy (Sanctuary MCP-proxy pass-through) | {{ gate_allow_proxy_count }} |
+| Gate deny (approval denied or timeout) | {{ gate_deny_count }} |
+| Gate escalate (Tier 2 anomaly raised for human review) | {{ gate_escalate_count }} |
+| Gate unclassified (no matching rule, default behaviour applied) | {{ gate_unclassified_count }} |
+| Injection-detection events | {{ injection_detected_count }} |
+
+Individual entries are queryable via \`monitor_audit_log\` with
+\`layer: "l2"\` filter and exportable in SIEM-compatible format via
+\`audit_export_siem\`.
+
+---
+
+## Article 14 and Annex IV \xA72(e) Row Coverage
+
+{{ rows_rendered }}
+
+---
+
+## Enterprise-Supplied Oversight Facts
+
+The following human-oversight facts are the enterprise's
+responsibility and are not emitted by Sanctuary. They must be
+filled in before this document is used for regulatory submission:
+
+- **Identity of assigned overseers:** who are the natural persons
+  with Article 14 oversight authority for this deployment?
+- **Competence and training:** what training have they received,
+  and how is their competence assessed?
+- **Authority scope:** what is the written authority of each
+  overseer \u2014 can they halt the system, override outputs, reverse
+  decisions?
+- **Automation-bias mitigation:** what training, interface
+  design, or process measures address automation bias per Article
+  14(4)(b)?
+- **Stop-button workflow mapping:** how does the Sanctuary approval
+  channel integrate with the enterprise's operational stop-button
+  procedure?
+- **Output interpretation support:** what tools, dashboards, or
+  reference materials support the overseers in correctly
+  interpreting the agent's outputs per Article 14(4)(c)?
+- **Escalation procedure:** when does an overseer escalate to a
+  different authority (security, legal, C-suite)?
+
+${FOOTER_TEMPLATE}`;
+
+// src/compliance/eu_ai_act/templates/06_cryptographic_attestations.ts
+var CRYPTOGRAPHIC_ATTESTATIONS_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document is the Cryptographic Attestations summary for the
+compliance bundle identified above. Every file in the bundle \u2014
+including this document \u2014 is individually hashed with SHA-256 and
+signed with the provider's primary Ed25519 identity. The entire
+bundle manifest is additionally signed as a single canonical
+document so an auditor can verify "this exact set of files, in
+this exact state, was attested by this identity at this exact
+timestamp" with a single signature check.
+
+**Why this matters under Article 11 and Article 47:** the Annex IV
+technical documentation and the EU declaration of conformity are
+typically signed by the provider's legal representative. This
+document does not substitute for the legal signature \u2014 it provides
+the **runtime authenticity attestation** that proves the technical
+contents of the bundle were generated by the named Sanctuary
+instance and have not been altered since generation. The legal
+signature and the cryptographic attestation are complementary
+controls.
+
+---
+
+## Signer Identity
+
+| Field | Value |
+|---|---|
+| Signer DID | \`{{ signer_did }}\` |
+| Signer public key (base64url) | \`{{ signer_pubkey }}\` |
+| Signer key type | Ed25519 |
+| Signer role | Provider primary identity |
+| Key custody | Self-custodied (L1 Cognitive Sovereignty) |
+
+The signer identity is the provider's primary Ed25519 identity as
+reported by \`identity_set_primary\` on the generating Sanctuary
+instance. To verify any signature in this bundle, retrieve the
+public key above and check the base64url signature against the
+SHA-256 digest of the corresponding file using standard Ed25519
+verification.
+
+---
+
+## Bundle File Attestations
+
+Each file in the bundle rendered **before** this attestations
+document is listed below with its SHA-256 digest and Ed25519
+signature. Recompute the SHA-256 of any file and verify the
+signature to confirm integrity.
+
+**The complete signed bundle \u2014 including this attestations document
+and any content documents that follow it (such as
+\`07_annex_iii_classification.md\` if the bundle was generated with an
+intended purpose) \u2014 is authoritatively indexed in
+\`00_bundle_manifest.json\` with SHA-256 and Ed25519 signatures for
+every file.** Verification against the manifest is the canonical
+integrity check; the table below is a human-readable companion.
+
+{{ file_attestation_table }}
+
+---
+
+## Manifest Signature
+
+The complete bundle manifest (\`00_bundle_manifest.json\`) is
+canonically serialised (sorted keys, no whitespace) and signed as
+a single document. Verifying the manifest signature establishes
+authenticity of the entire bundle in one check.
+
+| Field | Value |
+|---|---|
+| Manifest SHA-256 | \`{{ manifest_sha256 }}\` |
+| Manifest signature (base64url) | \`{{ manifest_signature }}\` |
+| Canonicalisation | Sorted keys, no whitespace (JSON canonical form) |
+
+---
+
+## Verification Procedure
+
+To verify this bundle end-to-end:
+
+1. **Verify each file individually.** For each file in the bundle:
+   (a) read the file bytes, (b) compute SHA-256, (c) compare against
+   the digest in the table above, (d) verify the Ed25519 signature
+   against the SHA-256 digest using the signer's public key.
+2. **Verify the manifest.** Canonically serialise
+   \`00_bundle_manifest.json\` (sorted keys, no whitespace), compute
+   SHA-256, and verify the \`manifest_signature\` field against the
+   signer's public key.
+3. **Cross-check the manifest against the files.** Ensure every
+   file listed in the manifest exists in the bundle and every
+   file in the bundle is listed in the manifest, with matching
+   SHA-256 digests.
+4. **Verify the signer identity.** Confirm the signer DID and
+   public key match the expected provider identity (for example,
+   via a trusted identity registry or via direct confirmation
+   with the provider).
+
+If all four checks pass, the bundle is cryptographically authentic
+as-generated by the named Sanctuary instance. The cryptographic
+check does not establish the **legal validity** of the contents \u2014
+that remains the responsibility of the provider's legal signature
+and the applicable conformity assessment procedure under
+Regulation (EU) 2024/1689.
+
+${FOOTER_TEMPLATE}`;
+
+// src/compliance/eu_ai_act/templates/07_annex_iii_classification.ts
+var ANNEX_III_CLASSIFICATION_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document reports the Annex III candidate classifications for
+the agent identified above, produced by the Sanctuary rule-based
+classification helper. It is **not** a legal determination \u2014 it is
+a keyword-weighted narrowing of the search space intended to help
+the enterprise reviewer focus on the relevant sections of Annex III
+of Regulation (EU) 2024/1689.
+
+The classifier compares the agent's intended purpose against a
+structured catalog of the eight Annex III high-risk categories and
+their sub-points. Every keyword has a coarse weight (1.0 high, 0.6
+medium, 0.3 low); the sum is clamped to [0, 1] and reported as the
+**rule_based_confidence** field. The name is deliberately awkward so
+downstream consumers cannot mistake it for a machine-learning model
+prediction.
+
+---
+
+## Classified intended purpose (deployer-supplied)
+
+> {{ classified_intended_purpose }}
+
+---
+
+## Candidate categories
+
+{{ candidates_rendered }}
+
+---
+
+## Final classification determination
+
+{{ final_classification | final Annex III category determined by legal review of the regulation text, including the category number and sub-point and a one-paragraph justification linking the agent's intended purpose to the verbatim regulation language }}
+
+---
+
+## Why the classifier is rule-based, not model-based
+
+The classification helper uses a keyword-weighted rule-based scoring
+system with no trained model, no machine learning, and no probability
+distribution. The decision to use a rule-based classifier is
+deliberate for three reasons:
+
+1. **Auditability.** Every match is traceable to a specific keyword
+   in a checked-in catalog file (\`server/src/compliance/eu_ai_act/annex_iii.ts\`).
+   An auditor can grep for the keyword and see why the category
+   matched.
+
+2. **No training data contamination.** A trained classifier would
+   inherit whatever biases its training set contained, and the
+   provenance of such a training set would itself become part of
+   the compliance surface.
+
+3. **Honest uncertainty.** A rule-based score of 0.9 means "nine
+   weighted keywords matched" \u2014 a concrete, reproducible signal.
+   A model prediction of 0.9 means "the model is confident" \u2014 a
+   signal whose meaning depends on the model's calibration, which
+   the deployer cannot independently verify.
+
+If no candidate category cleared the minimum threshold (0.4), the
+"Candidate categories" section above is empty. **This does not mean
+the agent is out of scope of the EU AI Act.** It means the keyword
+catalog did not find a clear match against the deployer-supplied
+intended purpose. The deployer is still responsible for reviewing
+Annex III in full and determining whether any category applies.
+
+---
+
+## Advisory
+
+{{ classifier_advisory }}
+
+${FOOTER_TEMPLATE}`;
+
+// src/compliance/eu_ai_act/templates/08_delta.ts
+var DELTA_TEMPLATE = `${HEADER_TEMPLATE}
+## Introduction
+
+This document reports what changed in the Sanctuary EU AI Act
+coverage matrix between the **prior** bundle referenced below and
+the **current** bundle identified in the header table above.
+
+A delta document is intended for enterprises that maintain a
+rolling compliance record \u2014 e.g., a quarterly or monthly
+regeneration cadence \u2014 and want to review only the changes since
+the last bundle without re-reading every document.
+
+**The delta is computed from the two manifests, not from the
+document bodies.** Specifically, it compares:
+
+1. The \`regulation_version\` field (external regulation text changes)
+2. The \`matrix_version\` field (structural matrix schema changes)
+3. The per-row \`coverage\` flag in \`coverage_rows[]\`
+4. The per-row \`evidence_emitter[]\` array
+
+Row \`last_reviewed_date\` is compared when both bundles expose it
+in the coverage_rows summary. A delta row may reflect any
+combination of these changes \u2014 they are not mutually exclusive.
+
+---
+
+## Prior bundle reference
+
+| Field | Value |
+|---|---|
+| **Path** | \`{{ prior_bundle_path }}\` |
+| **Generated at** | {{ prior_generated_at }} |
+| **Signer DID** | \`{{ prior_signer_did }}\` |
+| **Regulation version** | {{ prior_regulation_version }} |
+| **Matrix version** | \`{{ prior_matrix_version }}\` |
+
+## Current bundle reference
+
+| Field | Value |
+|---|---|
+| **Generated at** | {{ current_generated_at }} |
+| **Signer DID** | \`{{ current_signer_did }}\` |
+| **Regulation version** | {{ current_regulation_version }} |
+| **Matrix version** | \`{{ current_matrix_version }}\` |
+
+---
+
+## Summary
+
+| Change category | Count |
+|---|---|
+| Regulation version bumped | {{ regulation_version_changed }} |
+| Matrix version bumped | {{ matrix_version_changed }} |
+| Rows added | {{ rows_added_count }} |
+| Rows removed | {{ rows_removed_count }} |
+| Rows changed | {{ rows_changed_count }} |
+
+{{ no_changes_note }}
+
+---
+
+## Rows added
+
+{{ rows_added_rendered }}
+
+## Rows removed
+
+{{ rows_removed_rendered }}
+
+## Rows changed
+
+{{ rows_changed_rendered }}
+
+---
+
+## Warnings
+
+{{ warnings_rendered }}
+
+---
+
+## How to use this delta
+
+1. If **regulation version bumped**, the coverage matrix has been
+   re-aligned to updated regulation text (implementing acts,
+   delegated acts, or OJ errata). Every \`full\` row should be
+   re-verified against the new text before the current bundle is
+   treated as authoritative.
+2. If **matrix version bumped**, the matrix schema changed (row
+   set, coverage classification rules, or row structure). Review
+   the v1 \u2192 v2 (or later) migration notes in the repository's
+   \`docs/audit/\` directory.
+3. For each **row changed**, walk the \`review_notes\` field of the
+   current coverage matrix entry for that row (available in
+   \`docs/compliance/eu_ai_act_coverage_matrix_v1.md\`) \u2014 the reason
+   for the change is recorded there.
+4. For **rows added** or **rows removed**, the matrix structure
+   itself evolved. Treat these as matrix_version changes even if
+   the matrix_version field happens not to have bumped.
+
+This delta document is cryptographically signed into the current
+bundle's manifest, so an auditor can verify that the delta reflects
+the exact state claimed by the current bundle.
+
+${FOOTER_TEMPLATE}`;
+
+// src/compliance/eu_ai_act/annex_iii.ts
+var MIN_CONFIDENCE_THRESHOLD = 0.4;
+var W_HIGH = 1;
+var W_MED = 0.6;
+var W_LOW = 0.3;
+var ANNEX_III_CATEGORIES = [
+  // §1 — Biometrics
+  {
+    id: "annex_iii_1_a_remote_biometric_identification",
+    citation: "Annex III \xA71(a)",
+    title: "Remote biometric identification systems",
+    verbatim: '"Remote biometric identification systems [...] excluding AI systems [...] for biometric verification the sole purpose of which is to confirm that a specific natural person is the person he or she claims to be."',
+    keywords: [
+      { term: "facial recognition", weight: W_HIGH },
+      { term: "biometric identification", weight: W_HIGH },
+      { term: "face recognition", weight: W_HIGH },
+      { term: "identify people", weight: W_MED },
+      { term: "identify individuals", weight: W_MED },
+      { term: "surveillance camera", weight: W_MED },
+      { term: "cctv", weight: W_LOW },
+      { term: "camera", weight: W_LOW },
+      { term: "biometric", weight: W_LOW }
+    ]
+  },
+  {
+    id: "annex_iii_1_b_biometric_categorisation",
+    citation: "Annex III \xA71(b)",
+    title: "Biometric categorisation by sensitive attributes",
+    verbatim: '"Biometric categorisation systems, according to sensitive or protected attributes or characteristics based on the inference of those attributes or characteristics."',
+    keywords: [
+      { term: "biometric categorisation", weight: W_HIGH },
+      { term: "biometric categorization", weight: W_HIGH },
+      { term: "classify people by", weight: W_MED },
+      { term: "categorize individuals", weight: W_MED },
+      { term: "ethnicity", weight: W_MED },
+      { term: "gender classification", weight: W_MED },
+      { term: "age classification", weight: W_LOW },
+      { term: "sensitive attributes", weight: W_LOW }
+    ]
+  },
+  {
+    id: "annex_iii_1_c_emotion_recognition",
+    citation: "Annex III \xA71(c)",
+    title: "Emotion recognition systems",
+    verbatim: '"Emotion recognition systems."',
+    keywords: [
+      { term: "emotion recognition", weight: W_HIGH },
+      { term: "emotion detection", weight: W_HIGH },
+      { term: "affect recognition", weight: W_HIGH },
+      { term: "sentiment analysis", weight: W_LOW },
+      { term: "facial expression", weight: W_MED },
+      { term: "mood detection", weight: W_MED }
+    ]
+  },
+  // §2 — Critical infrastructure
+  {
+    id: "annex_iii_2_critical_infrastructure",
+    citation: "Annex III \xA72",
+    title: "Critical infrastructure safety components",
+    verbatim: '"AI systems intended to be used as safety components in the management and operation of critical digital infrastructure, road traffic, or in the supply of water, gas, heating or electricity."',
+    keywords: [
+      { term: "critical infrastructure", weight: W_HIGH },
+      { term: "safety component", weight: W_HIGH },
+      { term: "power grid", weight: W_HIGH },
+      { term: "water supply", weight: W_HIGH },
+      { term: "gas supply", weight: W_HIGH },
+      { term: "electricity grid", weight: W_HIGH },
+      { term: "road traffic", weight: W_MED },
+      { term: "traffic management", weight: W_MED },
+      { term: "energy distribution", weight: W_MED },
+      { term: "scada", weight: W_MED },
+      { term: "utility network", weight: W_LOW }
+    ]
+  },
+  // §3 — Education
+  {
+    id: "annex_iii_3_a_education_admission",
+    citation: "Annex III \xA73(a)",
+    title: "Education \u2014 access and admission decisions",
+    verbatim: '"AI systems intended to be used to determine access or admission or to assign natural persons to educational and vocational training institutions at all levels."',
+    keywords: [
+      { term: "admissions", weight: W_HIGH },
+      { term: "admission decisions", weight: W_HIGH },
+      { term: "school admission", weight: W_HIGH },
+      { term: "university admission", weight: W_HIGH },
+      { term: "student selection", weight: W_MED },
+      { term: "enrollment", weight: W_MED },
+      { term: "enrolment", weight: W_MED },
+      { term: "applicant scoring education", weight: W_LOW }
+    ]
+  },
+  {
+    id: "annex_iii_3_b_education_assessment",
+    citation: "Annex III \xA73(b)",
+    title: "Education \u2014 learning outcome evaluation",
+    verbatim: '"AI systems intended to be used to evaluate learning outcomes [...] where those outcomes are used to steer the learning process of natural persons [...]."',
+    keywords: [
+      { term: "grading", weight: W_HIGH },
+      { term: "grade students", weight: W_HIGH },
+      { term: "learning outcomes", weight: W_HIGH },
+      { term: "student assessment", weight: W_HIGH },
+      { term: "evaluate students", weight: W_MED },
+      { term: "evaluate learners", weight: W_MED },
+      { term: "educational assessment", weight: W_MED },
+      { term: "exam scoring", weight: W_MED }
+    ]
+  },
+  {
+    id: "annex_iii_3_d_education_proctoring",
+    citation: "Annex III \xA73(d)",
+    title: "Education \u2014 test proctoring and behaviour monitoring",
+    verbatim: '"AI systems intended to be used for monitoring and detecting prohibited behaviour of students during tests."',
+    keywords: [
+      { term: "proctoring", weight: W_HIGH },
+      { term: "exam monitoring", weight: W_HIGH },
+      { term: "test proctoring", weight: W_HIGH },
+      { term: "cheating detection", weight: W_HIGH },
+      { term: "plagiarism detection", weight: W_MED },
+      { term: "monitor students", weight: W_MED }
+    ]
+  },
+  // §4 — Employment
+  {
+    id: "annex_iii_4_a_employment_recruitment",
+    citation: "Annex III \xA74(a)",
+    title: "Employment \u2014 recruitment and candidate evaluation",
+    verbatim: '"AI systems intended to be used for the recruitment or selection of natural persons, in particular to place targeted job advertisements, to analyse and filter job applications, and to evaluate candidates."',
+    keywords: [
+      { term: "cv screening", weight: W_HIGH },
+      { term: "resume screening", weight: W_HIGH },
+      { term: "candidate shortlist", weight: W_HIGH },
+      { term: "recruitment", weight: W_HIGH },
+      { term: "hiring decisions", weight: W_HIGH },
+      { term: "applicant filtering", weight: W_HIGH },
+      { term: "job application", weight: W_MED },
+      { term: "interview scoring", weight: W_MED },
+      { term: "targeted job ad", weight: W_MED },
+      { term: "hr screening", weight: W_MED },
+      { term: "talent acquisition", weight: W_LOW },
+      { term: "hiring", weight: W_LOW }
+    ]
+  },
+  {
+    id: "annex_iii_4_b_employment_management",
+    citation: "Annex III \xA74(b)",
+    title: "Employment \u2014 performance management and termination",
+    verbatim: '"AI systems intended to be used to make decisions affecting terms of work-related relationships, the promotion or termination of work-related contractual relationships, to allocate tasks [...] and to monitor and evaluate the performance and behaviour of persons in such relationships."',
+    keywords: [
+      { term: "performance review", weight: W_HIGH },
+      { term: "performance evaluation", weight: W_HIGH },
+      { term: "termination decisions", weight: W_HIGH },
+      { term: "worker monitoring", weight: W_HIGH },
+      { term: "employee monitoring", weight: W_HIGH },
+      { term: "task allocation", weight: W_MED },
+      { term: "promotion decisions", weight: W_MED },
+      { term: "gig worker", weight: W_MED },
+      { term: "productivity tracking", weight: W_LOW }
+    ]
+  },
+  // §5 — Essential services
+  {
+    id: "annex_iii_5_a_public_benefits",
+    citation: "Annex III \xA75(a)",
+    title: "Essential services \u2014 public benefit eligibility",
+    verbatim: '"AI systems intended to be used by public authorities or on behalf of public authorities to evaluate the eligibility of natural persons for essential public assistance benefits and services [...]."',
+    keywords: [
+      { term: "welfare eligibility", weight: W_HIGH },
+      { term: "benefit eligibility", weight: W_HIGH },
+      { term: "public benefits", weight: W_HIGH },
+      { term: "social security", weight: W_HIGH },
+      { term: "public assistance", weight: W_HIGH },
+      { term: "housing benefit", weight: W_MED },
+      { term: "unemployment benefit", weight: W_MED }
+    ]
+  },
+  {
+    id: "annex_iii_5_b_creditworthiness",
+    citation: "Annex III \xA75(b)",
+    title: "Essential services \u2014 creditworthiness and credit scoring",
+    verbatim: '"AI systems intended to be used to evaluate the creditworthiness of natural persons or establish their credit score, with the exception of AI systems used for the purpose of detecting financial fraud."',
+    keywords: [
+      { term: "credit scoring", weight: W_HIGH },
+      { term: "creditworthiness", weight: W_HIGH },
+      { term: "loan approval", weight: W_HIGH },
+      { term: "credit decisions", weight: W_HIGH },
+      { term: "credit risk", weight: W_HIGH },
+      { term: "lending decisions", weight: W_HIGH },
+      { term: "mortgage approval", weight: W_MED }
+    ]
+  },
+  {
+    id: "annex_iii_5_c_insurance_pricing",
+    citation: "Annex III \xA75(c)",
+    title: "Essential services \u2014 insurance risk assessment and pricing",
+    verbatim: '"AI systems intended to be used for risk assessment and pricing in relation to natural persons in the case of life and health insurance."',
+    keywords: [
+      { term: "life insurance", weight: W_HIGH },
+      { term: "health insurance", weight: W_HIGH },
+      { term: "insurance pricing", weight: W_HIGH },
+      { term: "underwriting", weight: W_HIGH },
+      { term: "insurance risk", weight: W_HIGH },
+      { term: "actuarial", weight: W_MED }
+    ]
+  },
+  {
+    id: "annex_iii_5_d_emergency_call_dispatch",
+    citation: "Annex III \xA75(d)",
+    title: "Essential services \u2014 emergency call triage and dispatch",
+    verbatim: '"AI systems intended to be used to evaluate and classify emergency calls by natural persons or to be used to dispatch, or to establish priority in the dispatching of, emergency first response services [...]."',
+    keywords: [
+      { term: "emergency dispatch", weight: W_HIGH },
+      { term: "emergency triage", weight: W_HIGH },
+      { term: "911 triage", weight: W_HIGH },
+      { term: "112 triage", weight: W_HIGH },
+      { term: "first responder dispatch", weight: W_HIGH },
+      { term: "ambulance dispatch", weight: W_MED }
+    ]
+  },
+  // §6 — Law enforcement
+  {
+    id: "annex_iii_6_law_enforcement",
+    citation: "Annex III \xA76",
+    title: "Law enforcement \u2014 risk assessment, polygraphs, profiling",
+    verbatim: '"AI systems intended to be used by or on behalf of law enforcement authorities [...] to assess the risk of a natural person becoming the victim of criminal offences [...] as polygraphs or similar tools [...] to evaluate the reliability of evidence [...] to assess the risk of [...] offending or re-offending [...] for profiling of natural persons [...]."',
+    keywords: [
+      { term: "predictive policing", weight: W_HIGH },
+      { term: "recidivism prediction", weight: W_HIGH },
+      { term: "reoffending risk", weight: W_HIGH },
+      { term: "law enforcement", weight: W_HIGH },
+      { term: "criminal profiling", weight: W_HIGH },
+      { term: "polygraph", weight: W_HIGH },
+      { term: "lie detector", weight: W_MED },
+      { term: "crime prediction", weight: W_MED },
+      { term: "parole decision", weight: W_MED },
+      { term: "evidence reliability", weight: W_LOW }
+    ]
+  },
+  // §7 — Migration, asylum, border control
+  {
+    id: "annex_iii_7_migration_border",
+    citation: "Annex III \xA77",
+    title: "Migration, asylum and border control",
+    verbatim: '"AI systems intended to be used by or on behalf of competent public authorities [...] as polygraphs or similar tools; to assess a risk, including a security risk, a risk of irregular migration, or a health risk [...]; to assist [...] for the examination of applications for asylum, visa or residence permits [...]; for the purpose of detecting, recognising or identifying natural persons [...]."',
+    keywords: [
+      { term: "asylum", weight: W_HIGH },
+      { term: "visa application", weight: W_HIGH },
+      { term: "residence permit", weight: W_HIGH },
+      { term: "border control", weight: W_HIGH },
+      { term: "migration risk", weight: W_HIGH },
+      { term: "immigration", weight: W_MED },
+      { term: "refugee processing", weight: W_MED }
+    ]
+  },
+  // §8 — Administration of justice and democratic processes
+  {
+    id: "annex_iii_8_a_administration_of_justice",
+    citation: "Annex III \xA78(a)",
+    title: "Administration of justice \u2014 assistance to judicial authorities",
+    verbatim: '"AI systems intended to be used by a judicial authority or on their behalf to assist a judicial authority in researching and interpreting facts and the law and in applying the law to a concrete set of facts [...]."',
+    keywords: [
+      { term: "judicial research", weight: W_HIGH },
+      { term: "legal research", weight: W_HIGH },
+      { term: "case law research", weight: W_HIGH },
+      { term: "judge assistant", weight: W_HIGH },
+      { term: "court decision support", weight: W_HIGH },
+      { term: "legal research assistant", weight: W_MED }
+    ]
+  },
+  {
+    id: "annex_iii_8_b_democratic_processes",
+    citation: "Annex III \xA78(b)",
+    title: "Democratic processes \u2014 influencing elections and voting",
+    verbatim: '"AI systems intended to be used for influencing the outcome of an election or referendum or the voting behaviour of natural persons [...]."',
+    keywords: [
+      { term: "election campaign", weight: W_HIGH },
+      { term: "voter targeting", weight: W_HIGH },
+      { term: "political microtargeting", weight: W_HIGH },
+      { term: "referendum campaign", weight: W_HIGH },
+      { term: "voter persuasion", weight: W_HIGH },
+      { term: "election outcome", weight: W_MED }
+    ]
+  }
+];
+var CLASSIFIER_ADVISORY = "This classification is a RULE-BASED keyword match, NOT a machine-learning model prediction, and NOT legal advice. The rule_based_confidence score reflects the sum of matched keyword weights, clamped to [0, 1]. Use this to narrow the deployer's review \u2014 the final Annex III classification determination must be made by a human reviewer against the full regulation text (Annex III of Regulation (EU) 2024/1689). An empty result means no category cleared the minimum threshold; it does NOT mean the agent is out of scope of the Act.";
+var ANNEX_III_REGULATION_VERSION = "EU AI Act Regulation (EU) 2024/1689, as of 2026-04-10";
+function normalizeForMatching(text) {
+  return text.toLowerCase().replace(/[,.;:!?()\[\]{}"']/g, " ").replace(/\s+/g, " ").trim();
+}
+function classifyAgentDescription(description) {
+  const normalized = normalizeForMatching(description);
+  const candidates = [];
+  for (const category of ANNEX_III_CATEGORIES) {
+    let score = 0;
+    const matched = [];
+    for (const { term, weight } of category.keywords) {
+      if (normalized.includes(term)) {
+        score += weight;
+        matched.push(term);
+      }
+    }
+    if (score >= MIN_CONFIDENCE_THRESHOLD) {
+      candidates.push({
+        category_id: category.id,
+        citation: category.citation,
+        title: category.title,
+        rule_based_confidence: Math.min(1, score),
+        matched_keywords: matched
+      });
+    }
+  }
+  candidates.sort(
+    (a, b) => b.rule_based_confidence - a.rule_based_confidence
+  );
+  const fragment = description.length > 200 ? description.slice(0, 200) + "..." : description;
+  return {
+    description_fragment: fragment,
+    candidates,
+    advisory: CLASSIFIER_ADVISORY,
+    regulation_version: ANNEX_III_REGULATION_VERSION
+  };
+}
+
+// src/compliance/eu_ai_act/generator.ts
+function bytesToHex2(bytes) {
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+var NOT_LEGAL_ADVICE_DISCLAIMER = "This bundle is a technical compliance artifact generated by the Sanctuary Framework EU AI Act Compliance Artifact Generator. It is NOT legal advice and does not constitute a legal interpretation of Regulation (EU) 2024/1689. Consult qualified legal counsel before filing or relying on this bundle for regulatory submissions.";
+function canonicalJSON(value) {
+  return JSON.stringify(sortKeys(value));
+}
+function sortKeys(value) {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(sortKeys);
+  const sorted = {};
+  const obj = value;
+  for (const key of Object.keys(obj).sort()) {
+    sorted[key] = sortKeys(obj[key]);
+  }
+  return sorted;
+}
+async function computeAuditPeriodSummary(auditLog, periodStart, periodEnd) {
+  const { entries: rawEntries } = await auditLog.query({
+    since: periodStart,
+    limit: 1e6
+    // effectively unbounded for this period
+  });
+  const endTime = new Date(periodEnd).getTime();
+  const entries = rawEntries.filter(
+    (e) => new Date(e.timestamp).getTime() <= endTime
+  );
+  const byLayer = {
+    l1: 0,
+    l2: 0,
+    l3: 0,
+    l4: 0
+  };
+  const gate = {
+    allow: 0,
+    allow_proxy: 0,
+    deny: 0,
+    escalate: 0,
+    unclassified: 0
+  };
+  let injection = 0;
+  const operationSet = /* @__PURE__ */ new Set();
+  const identitySet = /* @__PURE__ */ new Set();
+  for (const entry of entries) {
+    byLayer[entry.layer]++;
+    operationSet.add(entry.operation);
+    identitySet.add(entry.identity_id);
+    if (entry.operation.startsWith("gate_allow_proxy:")) {
+      gate.allow_proxy++;
+    } else if (entry.operation.startsWith("gate_allow:")) {
+      gate.allow++;
+    } else if (entry.operation.startsWith("gate_deny:")) {
+      gate.deny++;
+    } else if (entry.operation.startsWith("gate_escalate:")) {
+      gate.escalate++;
+    } else if (entry.operation.startsWith("gate_unclassified:")) {
+      gate.unclassified++;
+    } else if (entry.operation.startsWith("injection_detected:")) {
+      injection++;
+    }
+  }
+  return {
+    period_start: periodStart,
+    period_end: periodEnd,
+    total_entries: entries.length,
+    entries_by_layer: byLayer,
+    gate_decisions: gate,
+    injection_detected: injection,
+    unique_operations: Array.from(operationSet).sort(),
+    unique_identities: Array.from(identitySet).sort()
+  };
+}
+function renderRowBlock(row) {
+  const citation = `${row.citation.instrument} ${row.citation.section}`;
+  return render(ROW_BLOCK_TEMPLATE, {
+    row_citation: citation,
+    row_title: row.citation.title,
+    row_coverage_badge: coverageBadge(row.coverage),
+    regulation_version: REGULATION_VERSION,
+    row_requirement: row.requirement,
+    row_evidence_emitted: row.evidence_emitted,
+    row_evidence_emitter_list: formatEmitterList(row.evidence_emitter),
+    row_manual_carveout: row.manual_carveout ?? "_(none \u2014 this row is fully auto-emitted)_"
+  });
+}
+function renderRowBlocks(rows) {
+  return rows.map(renderRowBlock).join("");
+}
+function rowsWithCitationPrefix(prefix) {
+  return COVERAGE_MATRIX_V1.rows.filter(
+    (r) => r.citation.clause_id.startsWith(prefix)
+  );
+}
+function rowsById(ids) {
+  const set = new Set(ids);
+  return COVERAGE_MATRIX_V1.rows.filter((r) => set.has(r.id));
+}
+function buildCommonContext(input, deps, signer, auditSummary, generatedAt) {
+  const dc = input.deployment_context;
+  const policy = deps.policy;
+  return {
+    // Header fields
+    document_title: "",
+    // overridden per document
+    document_subtitle: "",
+    // overridden per document
+    regulation_version: REGULATION_VERSION,
+    matrix_version: COVERAGE_MATRIX_V1.matrix_version,
+    generated_at: generatedAt,
+    period_start: input.period_start,
+    period_end: input.period_end,
+    agent_did: input.agent_did,
+    provider_legal_name: dc.provider_legal_name ?? "",
+    provider_contact: dc.provider_contact ?? "",
+    intended_purpose: dc.intended_purpose ?? "",
+    annex_iii_class: dc.annex_iii_class ?? "",
+    signer_did: signer.did,
+    signer_pubkey: signer.public_key,
+    sanctuary_version: deps.config.version,
+    // Audit period stats
+    audit_total_entries: auditSummary.total_entries,
+    audit_l1_count: auditSummary.entries_by_layer.l1,
+    audit_l2_count: auditSummary.entries_by_layer.l2,
+    audit_l3_count: auditSummary.entries_by_layer.l3,
+    audit_l4_count: auditSummary.entries_by_layer.l4,
+    gate_allow_count: auditSummary.gate_decisions.allow,
+    gate_allow_proxy_count: auditSummary.gate_decisions.allow_proxy,
+    gate_deny_count: auditSummary.gate_decisions.deny,
+    gate_escalate_count: auditSummary.gate_decisions.escalate,
+    gate_unclassified_count: auditSummary.gate_decisions.unclassified,
+    injection_detected_count: auditSummary.injection_detected,
+    unique_identity_count: auditSummary.unique_identities.length,
+    unique_operation_count: auditSummary.unique_operations.length,
+    // Principal Policy fields
+    tier1_rule_count: policy.tier1_always_approve.length,
+    tier2_rule_count: Object.keys(policy.tier2_anomaly).length,
+    // count of tier2 keys as rule count
+    tier3_rule_count: policy.tier3_always_allow.length,
+    tier2_new_namespace_access: policy.tier2_anomaly.new_namespace_access,
+    tier2_new_counterparty: policy.tier2_anomaly.new_counterparty,
+    tier2_frequency_spike_multiplier: policy.tier2_anomaly.frequency_spike_multiplier,
+    tier2_first_session_policy: policy.tier2_anomaly.first_session_policy,
+    first_session_policy: policy.tier2_anomaly.first_session_policy,
+    approval_channel_type: policy.approval_channel.type,
+    approval_channel_timeout_seconds: policy.approval_channel.timeout_seconds,
+    baseline_tracker_state: "loaded",
+    // static — baseline is always loaded at startup
+    // Context gate placeholder (filled in by tool handler if available)
+    context_gate_policy_count: 0,
+    context_gate_enforcer_active: "unknown"
+  };
+}
+function makeSigner(signer, masterKey) {
+  const encryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  return {
+    signContent: (content) => {
+      const digest = hash(stringToBytes(content));
+      const sig = sign(digest, signer.encrypted_private_key, encryptionKey);
+      return toBase64url(sig);
+    },
+    sha256Hex: (content) => bytesToHex2(hash(stringToBytes(content)))
+  };
+}
+function finaliseDocument(template, context, filename, ds) {
+  const content = render(template, context);
+  const sha256Hex2 = ds.sha256Hex(content);
+  const signature = ds.signContent(content);
+  return {
+    filename,
+    content,
+    content_type: "text/markdown",
+    sha256: sha256Hex2,
+    signature
+  };
+}
+function renderAnnexIV(baseContext, ds) {
+  const sections = {};
+  for (let n = 1; n <= 9; n++) {
+    const sectionRows = rowsWithCitationPrefix(`annex-iv-${n}`);
+    sections[`sections_${n}`] = sectionRows.length > 0 ? renderRowBlocks(sectionRows) : "_(no rows in this section)_\n\n";
+  }
+  const context = {
+    ...baseContext,
+    ...sections,
+    document_title: "Annex IV Technical Documentation",
+    document_subtitle: "Prepared under Article 11 of Regulation (EU) 2024/1689"
+  };
+  return finaliseDocument(
+    ANNEX_IV_TECHNICAL_DOCUMENTATION_TEMPLATE,
+    context,
+    "01_annex_iv_technical_documentation.md",
+    ds
+  );
+}
+function renderArticle26(baseContext, ds) {
+  const rows = rowsWithCitationPrefix("art-26");
+  const context = {
+    ...baseContext,
+    rows_rendered: renderRowBlocks(rows),
+    document_title: "Article 26 Deployer Log",
+    document_subtitle: "Deployer obligations under Article 26 of Regulation (EU) 2024/1689"
+  };
+  return finaliseDocument(
+    ARTICLE_26_DEPLOYER_LOG_TEMPLATE,
+    context,
+    "02_article_26_deployer_log.md",
+    ds
+  );
+}
+function renderArticle12(baseContext, ds) {
+  const rows = [
+    ...rowsWithCitationPrefix("art-12"),
+    ...rowsWithCitationPrefix("art-19")
+  ];
+  const context = {
+    ...baseContext,
+    rows_rendered: renderRowBlocks(rows),
+    document_title: "Article 12 Automatic Record-Keeping",
+    document_subtitle: "Automatic logging and retention under Articles 12 and 19(1) of Regulation (EU) 2024/1689"
+  };
+  return finaliseDocument(
+    ARTICLE_12_AUTOMATIC_LOGS_TEMPLATE,
+    context,
+    "03_article_12_automatic_logs.md",
+    ds
+  );
+}
+function renderRiskManagement(baseContext, ds) {
+  const rows = rowsById([
+    "annex_iv_5_risk_management",
+    "annex_iv_2_h_cybersecurity",
+    "annex_iv_2_b_design_specifications",
+    "art_15_cybersecurity_appropriate",
+    "art_15_resilience_alteration",
+    "art_15_resilience_poisoning"
+  ]);
+  const context = {
+    ...baseContext,
+    rows_rendered: renderRowBlocks(rows),
+    document_title: "Risk Management Summary",
+    document_subtitle: "Risk management posture under Article 9 of Regulation (EU) 2024/1689"
+  };
+  return finaliseDocument(
+    RISK_MANAGEMENT_SUMMARY_TEMPLATE,
+    context,
+    "04_risk_management_summary.md",
+    ds
+  );
+}
+function formatClassificationCandidates(result) {
+  if (result.candidates.length === 0) {
+    return "_No candidate category cleared the minimum rule-based confidence threshold. This does **not** mean the agent is out of scope of the EU AI Act \u2014 the deployer must still review Annex III in full._";
+  }
+  return result.candidates.map((c, i) => {
+    const confPct = (c.rule_based_confidence * 100).toFixed(0);
+    const kwList = c.matched_keywords.length === 0 ? "_(none)_" : c.matched_keywords.map((k) => `\`${k}\``).join(", ");
+    return [
+      `#### Candidate ${i + 1}: ${c.citation} \u2014 ${c.title}`,
+      "",
+      `- **Category ID:** \`${c.category_id}\``,
+      `- **rule_based_confidence:** ${c.rule_based_confidence.toFixed(2)} (${confPct}%)`,
+      `- **Matched keywords:** ${kwList}`,
+      ""
+    ].join("\n");
+  }).join("\n");
+}
+function renderAnnexIIIClassification(baseContext, intendedPurpose, ds) {
+  const classification = intendedPurpose ? classifyAgentDescription(intendedPurpose) : null;
+  const context = {
+    ...baseContext,
+    classified_intended_purpose: intendedPurpose || "_(no intended purpose supplied in deployment_context; the classifier was not run)_",
+    candidates_rendered: classification ? formatClassificationCandidates(classification) : "_(classifier not run \u2014 no intended purpose supplied)_",
+    classifier_advisory: classification ? classification.advisory : "The classifier was not invoked because the deployment_context.intended_purpose field was empty. The enterprise must perform manual Annex III review.",
+    document_title: "Annex III Classification Candidates",
+    document_subtitle: "Rule-based candidate classifications for Annex III of Regulation (EU) 2024/1689"
+  };
+  return finaliseDocument(
+    ANNEX_III_CLASSIFICATION_TEMPLATE,
+    context,
+    "07_annex_iii_classification.md",
+    ds
+  );
+}
+function renderHumanOversight(baseContext, ds) {
+  const rows = [
+    ...rowsWithCitationPrefix("art-14"),
+    ...rowsById(["annex_iv_2_e_human_oversight_assessment"])
+  ];
+  const context = {
+    ...baseContext,
+    rows_rendered: renderRowBlocks(rows),
+    document_title: "Human Oversight Statement",
+    document_subtitle: "Human oversight measures under Article 14 of Regulation (EU) 2024/1689"
+  };
+  return finaliseDocument(
+    HUMAN_OVERSIGHT_STATEMENT_TEMPLATE,
+    context,
+    "05_human_oversight_statement.md",
+    ds
+  );
+}
+function renderAttestations(baseContext, priorFiles, manifestSha256, manifestSignature, ds) {
+  const table = [
+    "| Filename | SHA-256 | Signature (base64url) |",
+    "|---|---|---|",
+    ...priorFiles.map(
+      (f) => `| \`${f.filename}\` | \`${f.sha256}\` | \`${f.signature ?? ""}\` |`
+    )
+  ].join("\n");
+  const context = {
+    ...baseContext,
+    file_attestation_table: table,
+    manifest_sha256: manifestSha256,
+    manifest_signature: manifestSignature,
+    document_title: "Cryptographic Attestations",
+    document_subtitle: "Bundle integrity attestations signed by the provider's primary Ed25519 identity"
+  };
+  return finaliseDocument(
+    CRYPTOGRAPHIC_ATTESTATIONS_TEMPLATE,
+    context,
+    "06_cryptographic_attestations.md",
+    ds
+  );
+}
+function buildManifest(input, generatedAt, signer, files, ds) {
+  const stats = coverageStats(COVERAGE_MATRIX_V1);
+  const rowSummaries = COVERAGE_MATRIX_V1.rows.map(
+    (r) => ({
+      id: r.id,
+      clause_id: r.citation.clause_id,
+      coverage: r.coverage,
+      evidence_emitter: [...r.evidence_emitter]
+    })
+  );
+  const manifestBody = {
+    bundle_version: "1.0",
+    matrix_version: "v1",
+    regulation_version: REGULATION_VERSION,
+    generated_at: generatedAt,
+    agent_did: input.agent_did,
+    period_start: input.period_start,
+    period_end: input.period_end,
+    deployment_context: input.deployment_context,
+    signer: {
+      did: signer.did,
+      public_key_base64url: signer.public_key
+    },
+    files: files.map((f) => ({
+      filename: f.filename,
+      content_type: f.content_type,
+      sha256: f.sha256,
+      signature: f.signature ?? ""
+    })),
+    coverage_summary: {
+      total_rows: stats.total_rows,
+      full: stats.full,
+      partial: stats.partial,
+      manual_only: stats.manual_only,
+      full_pct: stats.full_pct,
+      partial_pct: stats.partial_pct,
+      manual_only_pct: stats.manual_only_pct
+    },
+    coverage_rows: rowSummaries,
+    disclaimer: NOT_LEGAL_ADVICE_DISCLAIMER
+  };
+  const canonical = canonicalJSON(manifestBody);
+  const manifestSignature = ds.signContent(canonical);
+  return {
+    ...manifestBody,
+    manifest_signature: manifestSignature
+  };
+}
+async function loadPriorBundleManifest(bundlePath, warnings) {
+  try {
+    const manifestPath = join(bundlePath, "00_bundle_manifest.json");
+    const bytes = await readFile(manifestPath, "utf-8");
+    const parsed = JSON.parse(bytes);
+    if (typeof parsed.bundle_version !== "string" || typeof parsed.regulation_version !== "string" || !Array.isArray(parsed.coverage_rows)) {
+      warnings.push(
+        `Prior bundle at ${bundlePath} is missing required manifest fields; delta skipped.`
+      );
+      return null;
+    }
+    return parsed;
+  } catch (e) {
+    warnings.push(
+      `Prior bundle at ${bundlePath} could not be read: ${e.message}. Delta skipped.`
+    );
+    return null;
+  }
+}
+function computeDelta(prior, current, priorBundlePath, warnings) {
+  const priorRows = new Map(prior.coverage_rows.map((r) => [r.id, r]));
+  const currentRows = new Map(current.coverage_rows.map((r) => [r.id, r]));
+  const rows_added = [];
+  const rows_removed = [];
+  const rows_changed = [];
+  for (const [id] of currentRows) {
+    if (!priorRows.has(id)) {
+      rows_added.push(id);
+    }
+  }
+  for (const [id] of priorRows) {
+    if (!currentRows.has(id)) {
+      rows_removed.push(id);
+    }
+  }
+  for (const [id, currentRow] of currentRows) {
+    const priorRow = priorRows.get(id);
+    if (!priorRow) continue;
+    const changes = {};
+    if (priorRow.coverage !== currentRow.coverage) {
+      changes.coverage = {
+        from: priorRow.coverage,
+        to: currentRow.coverage
+      };
+    }
+    const priorEmitters = [...priorRow.evidence_emitter || []].sort();
+    const currentEmitters = [...currentRow.evidence_emitter || []].sort();
+    if (JSON.stringify(priorEmitters) !== JSON.stringify(currentEmitters)) {
+      changes.evidence_emitter = {
+        from: priorRow.evidence_emitter || [],
+        to: currentRow.evidence_emitter || []
+      };
+    }
+    if (Object.keys(changes).length > 0) {
+      rows_changed.push({
+        row_id: id,
+        clause_id: currentRow.clause_id,
+        changes
+      });
+    }
+  }
+  rows_added.sort();
+  rows_removed.sort();
+  rows_changed.sort((a, b) => a.row_id.localeCompare(b.row_id));
+  return {
+    prior_bundle_path: priorBundlePath,
+    prior_generated_at: prior.generated_at,
+    prior_signer_did: prior.signer.did,
+    prior_regulation_version: prior.regulation_version,
+    prior_matrix_version: prior.matrix_version,
+    current_generated_at: current.generated_at,
+    current_signer_did: current.signer.did,
+    current_regulation_version: current.regulation_version,
+    current_matrix_version: current.matrix_version,
+    regulation_version_changed: prior.regulation_version !== current.regulation_version,
+    matrix_version_changed: prior.matrix_version !== current.matrix_version,
+    rows_added,
+    rows_removed,
+    rows_changed,
+    warnings
+  };
+}
+function formatDeltaSections(report) {
+  const added = report.rows_added.length === 0 ? "_(none)_" : report.rows_added.map((id) => `- \`${id}\``).join("\n");
+  const removed = report.rows_removed.length === 0 ? "_(none)_" : report.rows_removed.map((id) => `- \`${id}\``).join("\n");
+  const changed = report.rows_changed.length === 0 ? "_(none)_" : report.rows_changed.map((rc) => {
+    const lines = [
+      `#### \`${rc.row_id}\` (${rc.clause_id})`,
+      ""
+    ];
+    if (rc.changes.coverage) {
+      lines.push(
+        `- **coverage:** \`${rc.changes.coverage.from}\` \u2192 \`${rc.changes.coverage.to}\``
+      );
+    }
+    if (rc.changes.evidence_emitter) {
+      lines.push(
+        `- **evidence_emitter from:** [${rc.changes.evidence_emitter.from.map((e) => `\`${e}\``).join(", ")}]`
+      );
+      lines.push(
+        `- **evidence_emitter to:** [${rc.changes.evidence_emitter.to.map((e) => `\`${e}\``).join(", ")}]`
+      );
+    }
+    if (rc.changes.last_reviewed_date) {
+      lines.push(
+        `- **last_reviewed_date:** ${rc.changes.last_reviewed_date.from} \u2192 ${rc.changes.last_reviewed_date.to}`
+      );
+    }
+    lines.push("");
+    return lines.join("\n");
+  }).join("\n");
+  const warningsList = report.warnings.length === 0 ? "_(none)_" : report.warnings.map((w) => `- ${w}`).join("\n");
+  const hasAnyChanges = report.regulation_version_changed || report.matrix_version_changed || report.rows_added.length > 0 || report.rows_removed.length > 0 || report.rows_changed.length > 0;
+  const noChangesNote = hasAnyChanges ? "" : "**No changes detected between prior and current bundle.** Both bundles reference the same regulation_version, the same matrix_version, and the same row set with identical coverage flags and evidence_emitter arrays. The only differences are the generation timestamps and the audit period activity captured in documents 02-05.\n\n";
+  return {
+    rows_added_rendered: added,
+    rows_removed_rendered: removed,
+    rows_changed_rendered: changed,
+    warnings_rendered: warningsList,
+    no_changes_note: noChangesNote
+  };
+}
+function renderDelta(baseContext, report, ds) {
+  const sections = formatDeltaSections(report);
+  const context = {
+    ...baseContext,
+    prior_bundle_path: report.prior_bundle_path,
+    prior_generated_at: report.prior_generated_at,
+    prior_signer_did: report.prior_signer_did,
+    prior_regulation_version: report.prior_regulation_version,
+    prior_matrix_version: report.prior_matrix_version,
+    current_generated_at: report.current_generated_at,
+    current_signer_did: report.current_signer_did,
+    current_regulation_version: report.current_regulation_version,
+    current_matrix_version: report.current_matrix_version,
+    regulation_version_changed: report.regulation_version_changed ? "yes" : "no",
+    matrix_version_changed: report.matrix_version_changed ? "yes" : "no",
+    rows_added_count: report.rows_added.length,
+    rows_removed_count: report.rows_removed.length,
+    rows_changed_count: report.rows_changed.length,
+    ...sections,
+    document_title: "Compliance Bundle Delta Report",
+    document_subtitle: "Changes between the prior bundle and this bundle"
+  };
+  return finaliseDocument(
+    DELTA_TEMPLATE,
+    context,
+    "08_delta.md",
+    ds
+  );
+}
+var ALLOWED_VERASCORE_HOSTS = /* @__PURE__ */ new Set([
+  "verascore.ai",
+  "www.verascore.ai",
+  "api.verascore.ai"
+]);
+async function publishBundleManifestToVerascore(manifest, signer, encryptionKey, verascoreUrl, ds) {
+  const result = {
+    attempted: true,
+    published: false,
+    verascore_url: verascoreUrl
+  };
+  let parsed;
+  try {
+    parsed = new URL(verascoreUrl);
+  } catch {
+    result.error = `Verascore URL is not a valid URL: ${verascoreUrl}`;
+    return result;
+  }
+  if (parsed.protocol !== "https:") {
+    result.error = `Verascore URL must use HTTPS (got ${parsed.protocol})`;
+    return result;
+  }
+  if (!ALLOWED_VERASCORE_HOSTS.has(parsed.hostname)) {
+    result.error = `Verascore URL must point to a known Verascore host (${[...ALLOWED_VERASCORE_HOSTS].join(", ")}). Got: ${parsed.hostname}`;
+    return result;
+  }
+  const canonicalManifest = canonicalJSON(manifest);
+  const manifestBytes = stringToBytes(canonicalManifest);
+  const manifestSha256 = ds.sha256Hex(canonicalManifest);
+  result.published_manifest_sha256 = manifestSha256;
+  let requestSignatureB64;
+  try {
+    const sigBytes = sign(
+      manifestBytes,
+      signer.encrypted_private_key,
+      encryptionKey
+    );
+    requestSignatureB64 = toBase64url(sigBytes);
+  } catch (e) {
+    result.error = `Failed to sign Verascore publish payload: ${e.message}`;
+    return result;
+  }
+  const agentId = manifest.agent_did.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase();
+  result.verascore_agent_id = agentId;
+  const requestBody = {
+    agentId,
+    signature: requestSignatureB64,
+    publicKey: signer.public_key,
+    type: "eu-ai-act-bundle",
+    data: manifest
+  };
+  try {
+    const response = await fetch(`${verascoreUrl}/api/publish`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody)
+    });
+    result.status = response.status;
+    if (!response.ok) {
+      result.error = `Verascore API returned ${response.status}`;
+      return result;
+    }
+    result.published = true;
+    return result;
+  } catch (e) {
+    result.error = `Verascore fetch failed: ${e.message}`;
+    return result;
+  }
+}
+async function generateEuAiActBundle(input, deps) {
+  const signer = deps.identityManager.getDefault();
+  if (!signer) {
+    throw new Error(
+      "No primary identity configured. Run identity_create and identity_set_primary before generating a compliance bundle."
+    );
+  }
+  const ds = makeSigner(signer, deps.masterKey);
+  const auditSummary = await computeAuditPeriodSummary(
+    deps.auditLog,
+    input.period_start,
+    input.period_end
+  );
+  const generatedAt = input.generated_at_override ?? (/* @__PURE__ */ new Date()).toISOString();
+  const baseContext = buildCommonContext(
+    input,
+    deps,
+    signer,
+    auditSummary,
+    generatedAt
+  );
+  const doc1 = renderAnnexIV(baseContext, ds);
+  const doc2 = renderArticle26(baseContext, ds);
+  const doc3 = renderArticle12(baseContext, ds);
+  const doc4 = renderRiskManagement(baseContext, ds);
+  const doc5 = renderHumanOversight(baseContext, ds);
+  const doc7 = renderAnnexIIIClassification(
+    baseContext,
+    input.deployment_context.intended_purpose ?? "",
+    ds
+  );
+  const partialManifest = buildManifest(
+    input,
+    generatedAt,
+    signer,
+    [doc1, doc2, doc3, doc4, doc5],
+    ds
+  );
+  const partialCanonical = canonicalJSON(partialManifest);
+  const partialSha256 = ds.sha256Hex(partialCanonical);
+  const partialSignature = partialManifest.manifest_signature;
+  const doc6 = renderAttestations(
+    baseContext,
+    [doc1, doc2, doc3, doc4, doc5],
+    partialSha256,
+    partialSignature,
+    ds
+  );
+  let allFiles = [doc1, doc2, doc3, doc4, doc5, doc6, doc7];
+  if (input.delta_from_bundle_path) {
+    const deltaWarnings = [];
+    const priorManifest = await loadPriorBundleManifest(
+      input.delta_from_bundle_path,
+      deltaWarnings
+    );
+    if (priorManifest !== null) {
+      const currentManifestSnapshot = buildManifest(
+        input,
+        generatedAt,
+        signer,
+        allFiles,
+        ds
+      );
+      const report = computeDelta(
+        priorManifest,
+        currentManifestSnapshot,
+        input.delta_from_bundle_path,
+        deltaWarnings
+      );
+      const doc8 = renderDelta(baseContext, report, ds);
+      allFiles = [...allFiles, doc8];
+    }
+  }
+  const finalManifest = buildManifest(
+    input,
+    generatedAt,
+    signer,
+    allFiles,
+    ds
+  );
+  let publishResult = void 0;
+  if (input.publish_to_verascore) {
+    const encryptionKey = derivePurposeKey(
+      deps.masterKey,
+      "identity-encryption"
+    );
+    publishResult = await publishBundleManifestToVerascore(
+      finalManifest,
+      signer,
+      encryptionKey,
+      input.verascore_url ?? "https://verascore.ai",
+      ds
+    );
+  }
+  return {
+    manifest: finalManifest,
+    files: allFiles,
+    publish_result: publishResult
+  };
+}
+function createComplianceTools(deps) {
+  const tools = [
+    {
+      name: "compliance_eu_ai_act_annex_iii_classify",
+      description: "Classify a free-text agent description against the eight Annex III high-risk categories of Regulation (EU) 2024/1689. Returns zero or more candidate categories with a rule_based_confidence score (sum of matched keyword weights clamped to [0, 1]). This is a RULE-BASED classifier \u2014 NOT a machine-learning model, and NOT legal advice. Use the result to narrow the deployer's review. Tier 3 (read-only, auto-allow).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          description: {
+            type: "string",
+            description: "Free-text description of what the agent does \u2014 its intended purpose, the users it serves, the decisions it makes, the data it processes."
+          }
+        },
+        required: ["description"]
+      },
+      handler: async (args) => {
+        const description = String(args.description ?? "");
+        if (description.trim().length === 0) {
+          return toolResult({
+            error: "description must be a non-empty string describing the agent's intended purpose"
+          });
+        }
+        const result = classifyAgentDescription(description);
+        return toolResult(result);
+      }
+    },
+    {
+      name: "compliance_generate_eu_ai_act_bundle",
+      description: "Generate an EU AI Act compliance bundle for a given agent and reporting period. Produces 6 Markdown documents plus a signed JSON manifest, covering Annex IV technical documentation (Art. 11), Art. 12 automatic record-keeping, Art. 13 transparency, Art. 14 human oversight, Art. 15 cybersecurity, and Art. 26 deployer obligations. Every file is individually SHA-256 hashed and signed with the provider's primary Ed25519 identity. NOT LEGAL ADVICE \u2014 consult qualified counsel before filing.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          agent_did: {
+            type: "string",
+            description: "DID of the agent the bundle is being generated for."
+          },
+          deployment_context: {
+            type: "object",
+            description: "Enterprise-supplied deployment facts that Sanctuary cannot infer (vertical, intended purpose, provider legal name, Annex III classification, etc.).",
+            properties: {
+              vertical: { type: "string" },
+              annex_iii_class: { type: "string" },
+              intended_purpose: { type: "string" },
+              provider_legal_name: { type: "string" },
+              provider_contact: { type: "string" },
+              deployer_is_public_authority: { type: "boolean" },
+              notes: { type: "string" }
+            }
+          },
+          period_start: {
+            type: "string",
+            description: "ISO 8601 timestamp \u2014 start of the reporting period."
+          },
+          period_end: {
+            type: "string",
+            description: "ISO 8601 timestamp \u2014 end of the reporting period."
+          },
+          delta_from_bundle_path: {
+            type: "string",
+            description: "Optional filesystem path to a prior bundle directory. When supplied, the generator compares the current bundle to the prior one and emits an additional 08_delta.md document summarising what changed (regulation_version, matrix_version, coverage rows added/removed/changed). Delta problems never fail bundle generation; the bundle always lands locally."
+          },
+          publish_to_verascore: {
+            type: "boolean",
+            description: "If true, POST the signed bundle MANIFEST (not the document bodies) to Verascore after the bundle is generated. Non-dependency principle: publish failure never fails bundle generation \u2014 the bundle is returned with a publish_result field describing the outcome. Defaults to false."
+          },
+          verascore_url: {
+            type: "string",
+            description: "Optional Verascore base URL (HTTPS, allow-listed hosts only). Defaults to https://verascore.ai."
+          }
+        },
+        required: [
+          "agent_did",
+          "deployment_context",
+          "period_start",
+          "period_end"
+        ]
+      },
+      handler: async (args) => {
+        const input = {
+          agent_did: String(args.agent_did),
+          deployment_context: args.deployment_context ?? {},
+          period_start: String(args.period_start),
+          period_end: String(args.period_end),
+          delta_from_bundle_path: typeof args.delta_from_bundle_path === "string" ? args.delta_from_bundle_path : void 0,
+          publish_to_verascore: args.publish_to_verascore === true,
+          verascore_url: typeof args.verascore_url === "string" ? args.verascore_url : void 0
+        };
+        const bundle = await generateEuAiActBundle(input, deps);
+        return toolResult({
+          bundle_version: bundle.manifest.bundle_version,
+          matrix_version: bundle.manifest.matrix_version,
+          regulation_version: bundle.manifest.regulation_version,
+          agent_did: bundle.manifest.agent_did,
+          generated_at: bundle.manifest.generated_at,
+          period: {
+            start: bundle.manifest.period_start,
+            end: bundle.manifest.period_end
+          },
+          signer: bundle.manifest.signer,
+          coverage_summary: bundle.manifest.coverage_summary,
+          file_count: bundle.files.length,
+          files: bundle.files.map((f) => ({
+            filename: f.filename,
+            content_type: f.content_type,
+            sha256: f.sha256,
+            signature: f.signature,
+            content_length: f.content.length
+          })),
+          manifest_signature: bundle.manifest.manifest_signature,
+          disclaimer: bundle.manifest.disclaimer,
+          publish_result: bundle.publish_result,
+          _bundle_content: {
+            manifest: bundle.manifest,
+            files: bundle.files.map((f) => ({
+              filename: f.filename,
+              content: f.content
+            }))
+          }
         });
       }
     }
@@ -18112,6 +21287,18 @@ async function createSanctuaryServer(options) {
     policy,
     keyProtection
   });
+  const { tools: memoryAttestTools } = createMemoryAttestTools(
+    identityManager,
+    masterKey,
+    auditLog
+  );
+  const { tools: complianceTools } = createComplianceTools({
+    config,
+    identityManager,
+    masterKey,
+    auditLog,
+    policy
+  });
   const dashboardTools = [];
   if (dashboard) {
     dashboardTools.push({
@@ -18155,6 +21342,8 @@ async function createSanctuaryServer(options) {
     ...profileTools,
     ...dashboardTools,
     ...sanctuaryMetaTools,
+    ...memoryAttestTools,
+    ...complianceTools,
     manifestTool
   ];
   let clientManager;
@@ -18258,7 +21447,14 @@ async function createSanctuaryServer(options) {
 \u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D`
     );
   }
-  return { server, config };
+  return {
+    server,
+    config,
+    identityManager,
+    masterKey,
+    auditLog,
+    policy
+  };
 }
 
 export { ATTESTATION_VERSION, ApprovalGate, AuditLog, AutoApproveChannel, BaselineTracker, TEMPLATES as CONTEXT_GATE_TEMPLATES, CallbackApprovalChannel, ClientManager, CommitmentStore, ContextGateEnforcer, ContextGatePolicyStore, DashboardApprovalChannel, FederationRegistry, FilesystemStorage, InMemoryModelProvenanceStore, InjectionDetector, MODEL_PRESETS, MemoryStorage, PolicyStore, ProxyRouter, ReputationStore, SovereigntyProfileStore, StateStore, StderrApprovalChannel, TIER_WEIGHTS, WebhookApprovalChannel, canonicalize, classifyField, completeHandshake, computeWeightedScore, createBridgeCommitment, createDefaultProfile, createPedersenCommitment, createProofOfKnowledge, createRangeProof, createSanctuaryServer, evaluateField, filterContext, generateAttestation, generateSHR, generateSystemPrompt, getTemplate, initiateHandshake, listTemplateIds, loadConfig, loadPrincipalPolicy, recommendPolicy, resolveTier, respondToHandshake, signPayload, tierDistribution, verifyAttestation, verifyBridgeCommitment, verifyCompletion, verifyPedersenCommitment, verifyProofOfKnowledge, verifyRangeProof, verifySHR, verifySignature };

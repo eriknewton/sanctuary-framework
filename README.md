@@ -132,36 +132,50 @@ Store this passphrase securely — it derives the encryption keys for all persis
 
 ---
 
-## Cocoon: Wrap Any Agent
+## Wrap Any Agent in One Command
 
-Already running an agent on OpenClaw, Claude Code, or Cursor? Cocoon wraps it in Sanctuary's enforcement chain with one command — no code changes required.
+Already running an agent on OpenClaw, Claude Code, or Cursor? One command wraps it in Sanctuary's enforcement chain, starts the Sovereignty Dashboard, and opens it in your browser.
 
 ```bash
-# Set a passphrase (once)
+npx @sanctuary-framework/mcp-server wrap --openclaw
+```
+
+<!-- TODO: coordinator will record and drop in docs/images/wrap-demo.gif -->
+![wrap demo](./docs/images/wrap-demo.gif)
+
+**Before (six steps):**
+
+```bash
 export SANCTUARY_PASSPHRASE=$(openssl rand -base64 32)
-
-# Wrap your OpenClaw agent
 npx @sanctuary-framework/mcp-server cocoon --openclaw
-```
-
-What this does:
-
-1. Backs up your existing MCP config to `~/.sanctuary/backup/`
-2. Rewrites the config to route all tool calls through Sanctuary
-3. Every call is now logged, scanned for injection, and rate-limited
-4. Dangerous operations require your approval via the dashboard
-
-To see the dashboard:
-```bash
 npx @sanctuary-framework/mcp-server dashboard --port 3501
+open http://localhost:3501
 ```
 
-To restore your original config:
+**After (one step):**
+
 ```bash
-npx @sanctuary-framework/mcp-server cocoon --unwrap
+npx @sanctuary-framework/mcp-server wrap --openclaw
+# → browser opens automatically, dashboard running, agent protected
 ```
 
-Cocoon supports `--openclaw`, `--claude-code`, `--cursor`, and `--wrap <path>` for generic MCP configs. Use `--dry-run` to preview changes without modifying anything.
+What happens:
+
+1. A passphrase is generated and stored in the macOS Keychain (or an encrypted fallback file on Linux/Windows).
+2. Your existing MCP config is backed up to `~/.sanctuary/backup/`.
+3. The config is rewritten so every tool call routes through Sanctuary.
+4. The Sovereignty Dashboard starts on `http://localhost:3501` (or the next free port up to 3510) and opens in your browser with a one-click auth token.
+5. Every call is logged, scanned for injection, and tier-gated. Dangerous operations require your approval.
+
+Supports `--openclaw`, `--claude-code`, `--cursor`, and `--wrap <path>`. Add `--dry-run` to preview, `--no-open` for CI/headless, or `--unwrap` to restore the original config.
+
+**Back up your passphrase:**
+
+```bash
+sanctuary export-passphrase
+```
+
+Prints the passphrase to stdout after a confirmation prompt. Store it in a password manager — if you lose it, encrypted state cannot be recovered.
 
 ---
 
