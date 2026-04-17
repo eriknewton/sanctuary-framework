@@ -8,7 +8,6 @@
  *   sanctuary-mcp-server                     # stdio transport (default)
  *   sanctuary-mcp-server dashboard            # standalone dashboard (persistent HTTP)
  *   sanctuary-mcp-server --dashboard          # enable principal dashboard alongside MCP
- *   sanctuary-mcp-server --passphrase <pass>  # derive key from passphrase
  *
  * Environment variables override CLI flags. See --help for full list.
  */
@@ -67,6 +66,10 @@ async function main(): Promise<void> {
     if (args[i] === "--dashboard") {
       process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
     } else if (args[i] === "--passphrase" && args[i + 1]) {
+      console.error(
+        `  Deprecation: --passphrase is deprecated and will be removed in v1.0.` +
+        `\n  Use SANCTUARY_PASSPHRASE env var or \`sanctuary wrap\` (auto-Keychain) instead.`
+      );
       passphrase = args[++i];
     } else if (args[i] === "--help" || args[i] === "-h") {
       printHelp();
@@ -120,6 +123,9 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--passphrase" && args[i + 1]) {
+      console.error(
+        `  Deprecation: --passphrase is deprecated. Use SANCTUARY_PASSPHRASE env var instead.`
+      );
       passphrase = args[++i];
     } else if (args[i] === "--port" && args[i + 1]) {
       port = parseInt(args[++i]!, 10);
@@ -226,7 +232,6 @@ Usage:
 
 Options:
   --dashboard          Enable the Principal Dashboard (web UI)
-  --passphrase <pass>  Derive encryption key from passphrase
   --help, -h           Show this help
   --version, -v        Show version
 
@@ -273,7 +278,6 @@ Usage:
 Options:
   --port <port>        Dashboard port (default: from config or 3501)
   --host <host>        Bind address (default: 127.0.0.1)
-  --passphrase <pass>  Derive encryption key from passphrase
   --help, -h           Show this help
 
 Environment variables:
@@ -293,9 +297,6 @@ Examples:
 
   # Start on a custom port
   sanctuary-mcp-server dashboard --port 8080
-
-  # Start with passphrase
-  sanctuary-mcp-server dashboard --passphrase "my secret"
 
   # macOS launchd: add to ~/Library/LaunchAgents/ for auto-start
 `);
