@@ -89,6 +89,28 @@ jobs:
           npm test 2>&1 | tee /tmp/vitest-output.log
           exit "${PIPESTATUS[0]}"
 
+      # Produce an ANSI-stripped copy of the log for the parsing gates.
+      # Vitest emits colour codes in CI (the auto-disable only fires
+      # when no TTY is detected, which differs run-to-run on GitHub
+      # runners), and colour codes break the `grep -oE "Tests N passed"`
+      # pattern used below. Keep the original /tmp/vitest-output.log
+      # untouched so the Actions log view stays readable; parse the
+      # stripped copy.
+      - name: Strip ANSI codes for parsing
+        run: |
+          sed 's/\x1b\[[0-9;]*m//g' /tmp/vitest-output.log > /tmp/vitest-output.txt
+          # Self-test: pin the regex against a literal ANSI-coloured
+          # sample so a future vitest output change that re-breaks the
+          # parser fails here instead of silently returning 0 matches.
+          sample=$'[2m Test Files [22m [1m[32m80 passed[39m[22m[90m (80)[39m\n[2m      Tests [22m [1m[32m1295 passed[39m[22m[2m | [22m[33m2 skipped[39m[90m (1297)[39m'
+          stripped=$(printf '%s' "$sample" | sed 's/\x1b\[[0-9;]*m//g')
+          test_passing=$(printf '%s' "$stripped" | grep -oE "Tests[[:space:]]+[0-9]+ passed" | grep -oE "[0-9]+" | head -1)
+          if [[ "$test_passing" != "1295" ]]; then
+            echo "::error::Self-test failed: ANSI-stripped regex did not extract 1295 from sample. Got: '$test_passing'"
+            exit 1
+          fi
+          echo "✓ ANSI strip self-test passed: extracted $test_passing from coloured sample."
+
       - name: Gate 2a — transform/collection error detection
         run: |
           # Patterns match the vitest / vite:esbuild failure signatures
@@ -111,9 +133,9 @@ jobs:
           # vitest version emits a transform error without failing
           # the run.
           PATTERNS='(transform failed|transform error|failed to parse|failed to collect|failed to load source|cannot find module|failed suites)'
-          if grep -Eqi "$PATTERNS" /tmp/vitest-output.log; then
+          if grep -Eqi "$PATTERNS" /tmp/vitest-output.txt; then
             echo "::error::Transform/collection error detected in vitest output. This is the specific failure class from commit 4ac95830 (see docs/audit/commit-4ac95830-postmortem.md)."
-            grep -Ei "$PATTERNS" /tmp/vitest-output.log | head -20
+            grep -Ei "$PATTERNS" /tmp/vitest-output.txt | head -20
             exit 1
           fi
           echo "✓ No transform/collection errors detected."
@@ -121,13 +143,13 @@ jobs:
       - name: Gate 2b — silent test file drop detection
         run: |
           expected_files=$(find server/test -name "*.test.ts" -not -path "*/node_modules/*" | wc -l | tr -d '[:space:]')
-          actual_total=$(grep -oE "Test Files[[:space:]]+.*\([0-9]+\)" /tmp/vitest-output.log | grep -oE "\([0-9]+\)" | tr -d '()' | tail -1)
+          actual_total=$(grep -oE "Test Files[[:space:]]+.*\([0-9]+\)" /tmp/vitest-output.txt | grep -oE "\([0-9]+\)" | tr -d '()' | tail -1)
           if [[ -z "$actual_total" ]]; then
-            actual_total=$(grep -oE "Test Files[[:space:]]+[0-9]+ passed" /tmp/vitest-output.log | grep -oE "[0-9]+" | head -1)
+            actual_total=$(grep -oE "Test Files[[:space:]]+[0-9]+ passed" /tmp/vitest-output.txt | grep -oE "[0-9]+" | head -1)
           fi
           if [[ -z "$actual_total" ]]; then
             echo "::error::Could not parse 'Test Files' count from vitest output."
-            tail -30 /tmp/vitest-output.log
+            tail -30 /tmp/vitest-output.txt
             exit 1
           fi
           echo "Files on disk:       $expected_files"
@@ -141,10 +163,10 @@ jobs:
       - name: Gate 2c — passing count >= baseline
         run: |
           baseline="${{ steps.baseline.outputs.baseline }}"
-          passing=$(grep -oE "Tests[[:space:]]+[0-9]+ passed" /tmp/vitest-output.log | grep -oE "[0-9]+" | head -1)
+          passing=$(grep -oE "Tests[[:space:]]+[0-9]+ passed" /tmp/vitest-output.txt | grep -oE "[0-9]+" | head -1)
           if [[ -z "$passing" ]]; then
             echo "::error::Could not parse passing-test count from vitest output."
-            tail -30 /tmp/vitest-output.log
+            tail -30 /tmp/vitest-output.txt
             exit 1
           fi
           echo "Baseline floor: $baseline"
