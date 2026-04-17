@@ -62,6 +62,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "secrets") {
+    const { runSecretsCommand } = await import("./cli/secrets.js");
+    const code = await runSecretsCommand({ argv: args.slice(1) });
+    process.exit(code);
+  }
+
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dashboard") {
       process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
