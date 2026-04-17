@@ -38,7 +38,7 @@
     "prepublishOnly": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.26.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@noble/ciphers": "^2.1.1",
     "@noble/curves": "^1.8.0",
     "@noble/hashes": "^1.7.0",
