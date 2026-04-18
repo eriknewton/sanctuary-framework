@@ -175,4 +175,115 @@ describeIfDarwin("sanctuary secrets CLI", () => {
     expect(r.code).toBe(2);
     expect(r.err).toContain("Unknown subcommand");
   });
+
+  // v0.10.0-rc.2 regression guards — broker write operations hung 15 min
+  // during rc.1 soak because the CLI ignored a value passed as argv and
+  // waited on an open-but-empty stdin. See:
+  //   Wiki/status/nsa-soak-report-v010-rc1-2026-04-18.md (BLOCKING #2)
+
+  it("add accepts value as 2nd positional arg (rc.2 regression)", async () => {
+    const r = await run(["add", "STRIPE_KEY", "sk_test_placeholder"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("Stored secret: STRIPE_KEY");
+    // Security warning is emitted on argv path
+    expect(r.err).toContain("briefly visible in `ps aux`");
+    // Value actually landed in the keychain
+    const list = await run(["list"]);
+    expect(list.out).toContain("STRIPE_KEY");
+  });
+
+  it("rotate accepts value as 2nd positional arg (rc.2 regression)", async () => {
+    await run(["add", "STRIPE_KEY", "v1"]);
+    const r = await run(["rotate", "STRIPE_KEY", "v2"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("Rotated secret: STRIPE_KEY");
+    expect(r.err).toContain("briefly visible in `ps aux`");
+  });
+
+  it(
+    "full secrets lifecycle completes under 30s (rc.2 regression)",
+    async () => {
+      const start = Date.now();
+      let r = await run(["add", "STRIPE_KEY", "sk_test_placeholder"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("Stored secret");
+
+      r = await run(["list"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("STRIPE_KEY");
+
+      r = await run(["grant", "demo-agent", "STRIPE_KEY", "--scope", "read", "--ttl", "3600"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("Granted:");
+
+      r = await run(["audit", "--limit", "20"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("broker_secret_added");
+      expect(r.out).toContain("broker_secret_granted");
+
+      r = await run(["rotate", "STRIPE_KEY", "sk_test_new_value"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("Rotated secret");
+
+      r = await run(["revoke", "demo-agent", "STRIPE_KEY"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("Revoked:");
+
+      r = await run(["delete", "STRIPE_KEY"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("Deleted secret");
+
+      const elapsed = Date.now() - start;
+      expect(elapsed).toBeLessThan(30_000);
+    },
+    35_000
+  );
+
+  it("add with neither argv nor stdin input aborts under the 30s deadline (rc.2 regression)", async () => {
+    // Simulate the rc.1 soak hang: no argv value, stdin is non-TTY but
+    // produces no line. Before rc.2 this hung 15 minutes. Now it should
+    // return "Aborted: empty value" well under the 30s deadline.
+    const { Readable } = await import("node:stream");
+    const neverEmits = new Readable({ read() { /* never pushes */ } }) as
+      unknown as NodeJS.ReadableStream & { isTTY?: boolean };
+    neverEmits.isTTY = false;
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const prevStorage = process.env.SANCTUARY_STORAGE_PATH;
+    const prevPP = process.env.SANCTUARY_PASSPHRASE;
+    const prevHome = process.env.HOME;
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_PASSPHRASE = PP;
+    process.env.HOME = tempDir;
+
+    // Tighten the deadline for this test by closing the never-emits stream
+    // after a short wait, which mimics the empty-pipe path without waiting
+    // the full 30s deadline in the test runner.
+    setTimeout(() => {
+      (neverEmits as unknown as Readable).push(null);
+    }, 500);
+
+    try {
+      const start = Date.now();
+      const code = await runSecretsCommand({
+        argv: ["add", "empty_value_test"],
+        out,
+        err,
+        stdin: neverEmits,
+        passphrase: PP,
+        storagePath: tempDir,
+      });
+      const elapsed = Date.now() - start;
+      expect(code).toBe(1);
+      expect(err.text).toContain("Aborted: empty value");
+      // Well under the rc.1 15-minute hang; deadline is 30s but we closed
+      // the stream at 500ms so this should be ~500ms.
+      expect(elapsed).toBeLessThan(5_000);
+    } finally {
+      process.env.SANCTUARY_STORAGE_PATH = prevStorage;
+      process.env.SANCTUARY_PASSPHRASE = prevPP;
+      process.env.HOME = prevHome;
+    }
+  });
 });
