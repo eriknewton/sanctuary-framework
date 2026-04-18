@@ -99,6 +99,23 @@ interface RateLimitEntry {
   decisions: number[]; // timestamps of decision requests
 }
 
+/**
+ * Classify a request as an HTML/SSE "view" route that must remain unthrottled.
+ * Operator page loads, refreshes, and the single long-lived SSE stream are
+ * exempt from the general rate limit so the dashboard never 429s the user out
+ * of their own UI. API endpoints still hit the rate limiter so loops or scrapes
+ * are throttled.
+ */
+export function isDashboardViewRoute(method: string, path: string): boolean {
+  if (method !== "GET") return false;
+  return (
+    path === "/" ||
+    path === "/dashboard" ||
+    path === "/fortress" ||
+    path === "/events"
+  );
+}
+
 export class DashboardApprovalChannel implements ApprovalChannel {
   private config: DashboardConfig;
   private pending: Map<string, PendingRequest> = new Map();
@@ -589,7 +606,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // For GET /: serve login page if not authenticated (instead of JSON 401)
     if (method === "GET" && url.pathname === "/" && this.authToken) {
       if (!this.isAuthenticated(req, url)) {
-        if (!this.checkRateLimit(req, res, "general")) return;
+        // Login page is a view — no rate limit (auth brute force is gated on /auth/session).
         this.serveLoginPage(res);
         return;
       }
@@ -598,8 +615,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // Authenticate all other non-OPTIONS requests
     if (!this.checkAuth(req, url, res)) return;
 
-    // Rate limiting: apply general limit to all authenticated requests
-    if (!this.checkRateLimit(req, res, "general")) return;
+    // Rate limiting: apply general limit to authenticated API requests only.
+    // HTML view routes (`/`, `/dashboard`, `/fortress`) and the long-lived SSE
+    // stream (`/events`) are exempt — operator page loads and browser
+    // refreshes must never 429. Decision endpoints (approve/deny) and the
+    // session-exchange endpoint keep their own stricter limits below.
+    if (!isDashboardViewRoute(method, url.pathname)) {
+      if (!this.checkRateLimit(req, res, "general")) return;
+    }
 
     try {
       if (method === "GET" && url.pathname === "/fortress") {

@@ -467,6 +467,47 @@ describe("Principal Dashboard", () => {
       expect.fail("Expected 429 response but never received one");
     });
 
+    // v0.10.0-rc.2 regression guard: exempt HTML/SSE view routes from the
+    // general rate limit so the operator can never 429 themselves out of
+    // their own dashboard on a normal browser refresh. See the soak report
+    // for v0.10.0-rc.1 for the original failure mode.
+    it("does NOT rate-limit HTML view route `/` (rc.2 regression)", async () => {
+      const results: number[] = [];
+      for (let i = 0; i < 150; i++) {
+        const res = await fetch(`http://127.0.0.1:${port}/`);
+        results.push(res.status);
+      }
+      expect(results).not.toContain(429);
+      for (const s of results) expect(s).toBe(200);
+    });
+
+    it("does NOT rate-limit /dashboard (rc.2 regression)", async () => {
+      const results: number[] = [];
+      for (let i = 0; i < 140; i++) {
+        const res = await fetch(`http://127.0.0.1:${port}/dashboard`);
+        results.push(res.status);
+      }
+      expect(results).not.toContain(429);
+    });
+
+    it("still rate-limits API routes while view routes are exempt (rc.2 regression)", async () => {
+      // View routes stay green, API routes still get throttled — proves the
+      // exemption is scoped, not a blanket disable.
+      const viewResults: number[] = [];
+      const apiResults: number[] = [];
+      for (let i = 0; i < 130; i++) {
+        const r = await fetch(`http://127.0.0.1:${port}/`);
+        viewResults.push(r.status);
+      }
+      for (let i = 0; i < 130; i++) {
+        const r = await fetch(`http://127.0.0.1:${port}/api/status`);
+        apiResults.push(r.status);
+        if (r.status === 429) break;
+      }
+      expect(viewResults).not.toContain(429);
+      expect(apiResults).toContain(429);
+    });
+
     it("rate-limits decision endpoints more tightly", async () => {
       // Create many pending requests
       const promises: Promise<unknown>[] = [];
