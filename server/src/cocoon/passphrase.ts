@@ -14,16 +14,18 @@
 import { spawn } from "node:child_process";
 import { readFile, writeFile, mkdir, access } from "node:fs/promises";
 import { homedir, hostname, platform, userInfo } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { gcm } from "@noble/ciphers/aes.js";
 import { hkdf } from "@noble/hashes/hkdf";
 import { sha256 } from "@noble/hashes/sha256";
+import { resolveStoragePath, DEFAULT_STORAGE_DIR } from "../paths.js";
 
 // ── Constants ───────────────────────────────────────────────────────
 
 const KEYCHAIN_ACCOUNT = "sanctuary";
-const KEYCHAIN_SERVICE = "sanctuary-passphrase";
+/** Legacy single-tenant Keychain service name — kept for backward compat. */
+const KEYCHAIN_SERVICE_DEFAULT = "sanctuary-passphrase";
 
 /** Where does the passphrase live? */
 export type PassphraseSource = "keychain" | "fallback-file" | "generated";
@@ -40,6 +42,17 @@ export interface PassphraseResult {
 export interface PassphraseOptions {
   /** Override home directory (for tests). */
   home?: string;
+  /**
+   * Override the storage path (for multi-tenant deployments and tests).
+   * When set, the fallback passphrase file lives at `<storagePath>/passphrase.enc`
+   * and the Keychain service name is namespaced to this path, so two wrapped
+   * agents on one host do not share a passphrase.
+   *
+   * When unset, `resolveStoragePath()` is consulted (which honours
+   * `SANCTUARY_STORAGE_PATH`), and falls back to `<home>/.sanctuary` for
+   * single-tenant callers that predate env-var support.
+   */
+  storagePath?: string;
   /** Override platform detection (for tests). */
   platformOverride?: NodeJS.Platform;
   /**
@@ -104,20 +117,22 @@ export async function getOrCreatePassphrase(
   opts: PassphraseOptions = {}
 ): Promise<PassphraseResult> {
   const home = opts.home ?? homedir();
+  const storagePath = opts.storagePath ?? resolveStoragePath(process.env, home);
+  const service = keychainServiceFor(storagePath, home);
   const plat = opts.platformOverride ?? platform();
   const exec = opts.exec ?? defaultExec;
   const derive = opts.deriveMachineKey ?? deriveMachineKey;
 
   // 1. Try Keychain (macOS only).
   if (plat === "darwin") {
-    const fromKc = await readFromKeychain(exec);
+    const fromKc = await readFromKeychain(exec, service);
     if (fromKc) {
       return { value: fromKc, source: "keychain", location: "macOS Keychain" };
     }
   }
 
   // 2. Try fallback file.
-  const fallback = fallbackFilePath(home);
+  const fallback = fallbackFilePath(home, storagePath);
   const fromFile = await readFromFallbackFile(fallback, home, derive);
   if (fromFile.status === "ok") {
     return {
@@ -133,7 +148,7 @@ export async function getOrCreatePassphrase(
   // 3. Generate and store (only reachable when no prior passphrase exists).
   const value = generatePassphrase();
   if (plat === "darwin") {
-    const ok = await writeToKeychain(value, exec);
+    const ok = await writeToKeychain(value, exec, service);
     if (ok) {
       return { value, source: "generated", location: "macOS Keychain" };
     }
@@ -154,18 +169,20 @@ export async function readStoredPassphrase(
   opts: PassphraseOptions = {}
 ): Promise<PassphraseResult | null> {
   const home = opts.home ?? homedir();
+  const storagePath = opts.storagePath ?? resolveStoragePath(process.env, home);
+  const service = keychainServiceFor(storagePath, home);
   const plat = opts.platformOverride ?? platform();
   const exec = opts.exec ?? defaultExec;
   const derive = opts.deriveMachineKey ?? deriveMachineKey;
 
   if (plat === "darwin") {
-    const fromKc = await readFromKeychain(exec);
+    const fromKc = await readFromKeychain(exec, service);
     if (fromKc) {
       return { value: fromKc, source: "keychain", location: "macOS Keychain" };
     }
   }
 
-  const fallback = fallbackFilePath(home);
+  const fallback = fallbackFilePath(home, storagePath);
   const fromFile = await readFromFallbackFile(fallback, home, derive);
   if (fromFile.status === "ok") {
     return {
@@ -194,19 +211,21 @@ export async function persistUserProvidedPassphrase(
   opts: PassphraseOptions = {}
 ): Promise<{ location: string; source: "keychain" | "fallback-file" }> {
   const home = opts.home ?? homedir();
+  const storagePath = opts.storagePath ?? resolveStoragePath(process.env, home);
+  const service = keychainServiceFor(storagePath, home);
   const plat = opts.platformOverride ?? platform();
   const exec = opts.exec ?? defaultExec;
   const derive = opts.deriveMachineKey ?? deriveMachineKey;
 
   if (plat === "darwin") {
-    const ok = await writeToKeychain(value, exec);
+    const ok = await writeToKeychain(value, exec, service);
     if (ok) {
       return { location: "macOS Keychain", source: "keychain" };
     }
     // Keychain failed — try fallback file before giving up.
   }
 
-  const fallback = fallbackFilePath(home);
+  const fallback = fallbackFilePath(home, storagePath);
   try {
     await writeToFallbackFile(fallback, value, home, derive);
   } catch (err) {
@@ -228,12 +247,13 @@ export function generatePassphrase(): string {
 // ── Keychain (macOS) ────────────────────────────────────────────────
 
 async function readFromKeychain(
-  exec: (cmd: string, args: string[], input?: string) => Promise<ExecResult>
+  exec: (cmd: string, args: string[], input?: string) => Promise<ExecResult>,
+  service: string = KEYCHAIN_SERVICE_DEFAULT
 ): Promise<string | null> {
   try {
     const result = await exec(
       "security",
-      ["find-generic-password", "-a", KEYCHAIN_ACCOUNT, "-s", KEYCHAIN_SERVICE, "-w"]
+      ["find-generic-password", "-a", KEYCHAIN_ACCOUNT, "-s", service, "-w"]
     );
     if (result.code !== 0) return null;
     const value = result.stdout.trim();
@@ -245,7 +265,8 @@ async function readFromKeychain(
 
 async function writeToKeychain(
   value: string,
-  exec: (cmd: string, args: string[], input?: string) => Promise<ExecResult>
+  exec: (cmd: string, args: string[], input?: string) => Promise<ExecResult>,
+  service: string = KEYCHAIN_SERVICE_DEFAULT
 ): Promise<boolean> {
   try {
     // -U updates in place if the item already exists.
@@ -255,7 +276,7 @@ async function writeToKeychain(
         "add-generic-password",
         "-U",
         "-a", KEYCHAIN_ACCOUNT,
-        "-s", KEYCHAIN_SERVICE,
+        "-s", service,
         "-w", value,
       ]
     );
@@ -265,10 +286,47 @@ async function writeToKeychain(
   }
 }
 
+/**
+ * Derive the Keychain service name for a given storage path.
+ *
+ * Per-tenant isolation on macOS: when two Sanctuary instances run on one
+ * host with distinct `SANCTUARY_STORAGE_PATH` values, each gets its own
+ * Keychain item so their state cannot be decrypted by the other instance's
+ * key material.
+ *
+ * Backward compatibility: for the default storage path (`~/.sanctuary` with
+ * no env override), the service name is the legacy `sanctuary-passphrase`,
+ * so pre-existing wraps continue to read their saved passphrase.
+ */
+export function keychainServiceFor(
+  storagePath: string,
+  home: string = homedir()
+): string {
+  const defaultPath = join(home, DEFAULT_STORAGE_DIR);
+  if (storagePath === defaultPath) return KEYCHAIN_SERVICE_DEFAULT;
+
+  // Stable 12-char hex hash of the full storage path — short enough to be
+  // legible in a Keychain listing, long enough to avoid collisions on any
+  // reasonable fleet.
+  const digest = sha256(Buffer.from(storagePath, "utf-8"));
+  const suffix = Buffer.from(digest).toString("hex").slice(0, 12);
+  return `${KEYCHAIN_SERVICE_DEFAULT}-${suffix}`;
+}
+
 // ── Fallback file (all platforms) ───────────────────────────────────
 
-export function fallbackFilePath(home: string): string {
-  return join(home, ".sanctuary", "passphrase.enc");
+/**
+ * Resolve the encrypted fallback passphrase file path.
+ *
+ * When `storagePath` is supplied, the file lives at
+ * `<storagePath>/passphrase.enc` — per-tenant isolation.
+ *
+ * When it is omitted, the legacy path `<home>/.sanctuary/passphrase.enc` is
+ * returned so existing single-tenant callers keep reading their saved file.
+ */
+export function fallbackFilePath(home: string, storagePath?: string): string {
+  if (storagePath !== undefined) return join(storagePath, "passphrase.enc");
+  return join(home, DEFAULT_STORAGE_DIR, "passphrase.enc");
 }
 
 async function readFromFallbackFile(
@@ -306,7 +364,10 @@ async function writeToFallbackFile(
   home: string,
   derive: (home: string) => Uint8Array = deriveMachineKey
 ): Promise<void> {
-  const dir = join(home, ".sanctuary");
+  // Derive the parent directory from the resolved path rather than assuming
+  // `<home>/.sanctuary`, so multi-tenant callers with a custom storage path
+  // create the correct directory.
+  const dir = dirname(path);
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const nonce = randomBytes(12);
   const key = derive(home);

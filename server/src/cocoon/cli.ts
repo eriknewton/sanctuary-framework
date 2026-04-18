@@ -19,7 +19,7 @@
 
 import { writeFile, readFile, mkdir, access } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir, platform } from "node:os";
+import { platform } from "node:os";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
@@ -39,6 +39,7 @@ import {
 } from "./passphrase.js";
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
 import { SANCTUARY_VERSION } from "../config.js";
+import { resolveStoragePath, resolveDashboardPort } from "../paths.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -76,7 +77,6 @@ export const COCOON_GOVERNOR_DEFAULTS = {
   lifetime_limit: 1000,
 } as const;
 
-const DEFAULT_PORT = 3501;
 const MAX_PORT = 3510;
 
 // ── Dashboard integration ───────────────────────────────────────────
@@ -194,6 +194,11 @@ export async function runWrap(
     return;
   }
 
+  // Resolve the storage path once up front so the passphrase, sovereignty
+  // profile, backup dir, and every other on-disk artifact land in the same
+  // per-tenant location when SANCTUARY_STORAGE_PATH is set.
+  const storagePath = resolveStoragePath();
+
   // Resolve or generate passphrase.
   //
   // Invariant: the resolved passphrase never reaches argv or the rewritten
@@ -207,7 +212,7 @@ export async function runWrap(
     try {
       const persist =
         deps.persistPassphrase ??
-        ((value: string) => persistUserProvidedPassphrase(value));
+        ((value: string) => persistUserProvidedPassphrase(value, { storagePath }));
       const persisted = await persist(options.passphrase);
       passphraseLocation = persisted.location;
       passphraseSource = persisted.source;
@@ -228,7 +233,9 @@ export async function runWrap(
     passphraseSource = "env";
   } else {
     try {
-      const resolve = deps.resolvePassphrase ?? (() => getOrCreatePassphrase());
+      const resolve =
+        deps.resolvePassphrase ??
+        (() => getOrCreatePassphrase({ storagePath }));
       const resolved = await resolve();
       passphraseLocation = resolved.location;
       passphraseSource = resolved.source;
@@ -269,8 +276,8 @@ export async function runWrap(
     );
   }
 
-  // Write sovereignty profile.
-  const storagePath = join(homedir(), ".sanctuary");
+  // Write sovereignty profile into the per-tenant storage path resolved
+  // above (honours SANCTUARY_STORAGE_PATH for multi-agent hosts).
   await mkdir(storagePath, { recursive: true, mode: 0o700 });
   const profile = createWrapProfile(upstreamServers);
   const profilePath = join(storagePath, "cocoon-profile.json");
@@ -330,7 +337,9 @@ export async function runWrap(
         authToken: opts.authToken,
         serverVersion: opts.serverVersion,
       }));
-  const requestedPort = options.port ?? DEFAULT_PORT;
+  // Multi-tenancy: honour SANCTUARY_DASHBOARD_PORT so two wraps can pick
+  // distinct starting ports without both racing for 3501.
+  const requestedPort = resolveDashboardPort(options.port);
   const dashboard = await startDashboardWithFallback(
     startFn,
     requestedPort,

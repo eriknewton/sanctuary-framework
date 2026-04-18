@@ -419,3 +419,178 @@ describe("runWrap — SEC-061 passphrase leak regression", () => {
     expect(rewriteArgs).toEqual(["@sanctuary-framework/mcp-server"]);
   });
 });
+
+// ── v0.10.0 WP1: multi-tenancy env var wiring ────────────────────────────
+//
+// These cover `runWrap` end-to-end-lite, proving the CLI routes through
+// `resolveStoragePath()` and `resolveDashboardPort()` so two agents on one
+// host can pick distinct storage dirs + dashboard start ports without
+// manual CLI flags.
+
+describe("runWrap — v0.10.0 WP1 multi-tenancy env vars", () => {
+  let tempHome: string;
+  let originalHome: string | undefined;
+  let originalStoragePath: string | undefined;
+  let originalDashboardPort: string | undefined;
+  let configPath: string;
+
+  function capturingDashboardStarter(seen: { port?: number }): DashboardStarter {
+    return async (opts) => {
+      seen.port = opts.port;
+      return {
+        url: `http://127.0.0.1:${opts.port}`,
+        port: opts.port,
+        host: "127.0.0.1",
+        stop: async () => {},
+        publish: () => {},
+        publishActivity: () => {},
+        publishApproval: () => {},
+      };
+    };
+  }
+
+  function makeRewriteSpy(path: string): ReturnType<typeof vi.fn> {
+    return vi.fn(async (_agentConfig, command: string, args: string[]) => {
+      await writeFile(
+        path,
+        JSON.stringify({
+          mcp: {
+            servers: {
+              sanctuary: { command, args },
+            },
+          },
+        }),
+        "utf-8"
+      );
+      return path;
+    });
+  }
+
+  beforeEach(async () => {
+    tempHome = await mkdtemp(join(tmpdir(), "sanctuary-wp1-"));
+    originalHome = process.env.HOME;
+    originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+    originalDashboardPort = process.env.SANCTUARY_DASHBOARD_PORT;
+    process.env.HOME = tempHome;
+    configPath = join(tempHome, "openclaw.json");
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        mcp: {
+          servers: {
+            demo: { command: "node", args: ["demo-server.js"] },
+          },
+        },
+      }),
+      "utf-8"
+    );
+  });
+
+  afterEach(async () => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalStoragePath === undefined)
+      delete process.env.SANCTUARY_STORAGE_PATH;
+    else process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
+    if (originalDashboardPort === undefined)
+      delete process.env.SANCTUARY_DASHBOARD_PORT;
+    else process.env.SANCTUARY_DASHBOARD_PORT = originalDashboardPort;
+    await rm(tempHome, { recursive: true, force: true });
+  });
+
+  it("writes cocoon-profile.json under SANCTUARY_STORAGE_PATH when set", async () => {
+    const tenantDir = join(tempHome, "tenant-a");
+    process.env.SANCTUARY_STORAGE_PATH = tenantDir;
+
+    const seen: { port?: number } = {};
+    await runWrap(
+      { wrap: configPath, noOpen: true },
+      {
+        startDashboard: capturingDashboardStarter(seen),
+        openBrowser: async () => {},
+        resolvePassphrase: async () => ({
+          value: "gen",
+          location: "macOS Keychain",
+          source: "generated",
+        }),
+        rewriteConfig: makeRewriteSpy(configPath),
+      }
+    );
+
+    const profile = JSON.parse(
+      await readFile(join(tenantDir, "cocoon-profile.json"), "utf-8")
+    );
+    expect(profile.version).toBe(1);
+  });
+
+  it("picks SANCTUARY_DASHBOARD_PORT when no --port is supplied", async () => {
+    process.env.SANCTUARY_DASHBOARD_PORT = "3507";
+
+    const seen: { port?: number } = {};
+    await runWrap(
+      { wrap: configPath, noOpen: true },
+      {
+        startDashboard: capturingDashboardStarter(seen),
+        openBrowser: async () => {},
+        resolvePassphrase: async () => ({
+          value: "gen",
+          location: "macOS Keychain",
+          source: "generated",
+        }),
+        rewriteConfig: makeRewriteSpy(configPath),
+      }
+    );
+
+    expect(seen.port).toBe(3507);
+  });
+
+  it("prefers an explicit --port over SANCTUARY_DASHBOARD_PORT", async () => {
+    process.env.SANCTUARY_DASHBOARD_PORT = "3507";
+
+    const seen: { port?: number } = {};
+    // Pick an explicit port inside the 3501–3510 fallback range so the CLI
+    // does not exhaust the range before handing to our fake starter.
+    await runWrap(
+      { wrap: configPath, noOpen: true, port: 3503 },
+      {
+        startDashboard: capturingDashboardStarter(seen),
+        openBrowser: async () => {},
+        resolvePassphrase: async () => ({
+          value: "gen",
+          location: "macOS Keychain",
+          source: "generated",
+        }),
+        rewriteConfig: makeRewriteSpy(configPath),
+      }
+    );
+
+    expect(seen.port).toBe(3503);
+  });
+
+  it("writes backup and meta under the per-tenant storage path", async () => {
+    const tenantDir = join(tempHome, "tenant-b");
+    process.env.SANCTUARY_STORAGE_PATH = tenantDir;
+
+    const seen: { port?: number } = {};
+    await runWrap(
+      { wrap: configPath, noOpen: true },
+      {
+        startDashboard: capturingDashboardStarter(seen),
+        openBrowser: async () => {},
+        resolvePassphrase: async () => ({
+          value: "gen",
+          location: "macOS Keychain",
+          source: "generated",
+        }),
+        rewriteConfig: makeRewriteSpy(configPath),
+      }
+    );
+
+    // The backup dir and cocoon-meta.json live inside the tenant root.
+    const meta = JSON.parse(
+      await readFile(join(tenantDir, "backup", "cocoon-meta.json"), "utf-8")
+    );
+    expect(meta.originalPath).toBe(configPath);
+    expect(meta.backupPath.startsWith(join(tenantDir, "backup"))).toBe(true);
+  });
+});

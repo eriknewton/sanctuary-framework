@@ -11,6 +11,7 @@
 import { readFile, writeFile, mkdir, copyFile, access } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { resolveStoragePath } from "../paths.js";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -59,16 +60,26 @@ const PLATFORM_PATHS: Record<AgentPlatform, string[]> = {
 
 // ── Backup ──────────────────────────────────────────────────────────
 
-const BACKUP_DIR = join(homedir(), ".sanctuary", "backup");
+/**
+ * Resolve the per-tenant backup directory.
+ *
+ * Multi-tenancy: each Sanctuary instance keeps its backups under its own
+ * `SANCTUARY_STORAGE_PATH/backup` so `sanctuary wrap --unwrap` on one
+ * agent cannot pick up a meta pointer written by a sibling instance.
+ */
+function backupDir(): string {
+  return join(resolveStoragePath(), "backup");
+}
 
 /**
  * Back up a config file before modification.
  * Returns the backup path.
  */
 export async function backupConfig(configPath: string): Promise<string> {
-  await mkdir(BACKUP_DIR, { recursive: true, mode: 0o700 });
+  const dir = backupDir();
+  await mkdir(dir, { recursive: true, mode: 0o700 });
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const backupPath = join(BACKUP_DIR, `config-backup-${timestamp}.json`);
+  const backupPath = join(dir, `config-backup-${timestamp}.json`);
   await copyFile(configPath, backupPath);
   return backupPath;
 }
@@ -84,7 +95,7 @@ export async function restoreConfig(backupPath: string, targetPath: string): Pro
  * Find the most recent backup.
  */
 export async function findLatestBackup(): Promise<{ backupPath: string; originalPath: string } | null> {
-  const metaPath = join(BACKUP_DIR, "cocoon-meta.json");
+  const metaPath = join(backupDir(), "cocoon-meta.json");
   try {
     const raw = await readFile(metaPath, "utf-8");
     const meta = JSON.parse(raw);
@@ -106,8 +117,9 @@ export async function saveCocoonMeta(meta: {
   platform: AgentPlatform;
   wrappedAt: string;
 }): Promise<void> {
-  await mkdir(BACKUP_DIR, { recursive: true, mode: 0o700 });
-  const metaPath = join(BACKUP_DIR, "cocoon-meta.json");
+  const dir = backupDir();
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const metaPath = join(dir, "cocoon-meta.json");
   await writeFile(metaPath, JSON.stringify(meta, null, 2), { mode: 0o600 });
 }
 
