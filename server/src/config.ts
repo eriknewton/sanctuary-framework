@@ -18,7 +18,6 @@ export const SANCTUARY_VERSION = PKG_VERSION;
 export interface SanctuaryConfig {
   version: string;
   storage_path: string;
-  principal_id?: string;
 
   state: {
     encryption: "aes-256-gcm";
