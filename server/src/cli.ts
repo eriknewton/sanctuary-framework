@@ -68,6 +68,20 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
+  if (args[0] === "broker-server") {
+    const { openBroker } = await import("./l3-disclosure/broker/open.js");
+    const { createBrokerMcpServer } = await import("./mcp/broker-server.js");
+    const { broker } = await openBroker();
+    const server = createBrokerMcpServer(broker, {
+      agentId: process.env.SANCTUARY_AGENT_ID ?? "mcp-host",
+      identityId: process.env.SANCTUARY_IDENTITY_ID ?? "sanctuary-broker",
+    });
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("Sanctuary Secret Broker MCP server running (stdio)");
+    return;
+  }
+
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dashboard") {
       process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
