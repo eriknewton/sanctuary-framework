@@ -34,6 +34,7 @@ import { toBase64url } from "./core/encoding.js";
 import { IdentityManager } from "./l1-cognitive/tools.js";
 import type { HandshakeResult } from "./handshake/types.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
+import { writeTenantRuntime, clearTenantRuntime } from "./cli/agents/runtime.js";
 
 export interface StandaloneDashboardOptions {
   passphrase?: string;
@@ -219,6 +220,29 @@ export async function startStandaloneDashboard(
   });
   dashboard.setStandaloneMode(true);
   await dashboard.start();
+
+  // Advertise this tenant's dashboard to `sanctuary agents` + multi-agent
+  // aggregator. Best-effort, cleaned up on graceful shutdown.
+  await writeTenantRuntime(config.storage_path, {
+    version: SANCTUARY_VERSION,
+    pid: process.pid,
+    started_at: new Date().toISOString(),
+    dashboard_host: dashboardHost,
+    dashboard_port: dashboardPort,
+    ...(typeof config.webhook?.callback_port === "number"
+      ? {
+          webhook_callback_port: config.webhook.callback_port,
+          webhook_callback_host: config.webhook.callback_host,
+        }
+      : {}),
+    mode: "standalone",
+  });
+  const clearRuntime = () => {
+    clearTenantRuntime(config.storage_path).catch(() => {});
+  };
+  process.once("SIGINT", clearRuntime);
+  process.once("SIGTERM", clearRuntime);
+  process.once("exit", clearRuntime);
 
   console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
   console.error(`Storage: ${config.storage_path}`);

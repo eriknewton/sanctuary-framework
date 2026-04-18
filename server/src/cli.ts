@@ -68,6 +68,12 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
+  if (args[0] === "agents") {
+    const { runAgentsCommand } = await import("./cli/agents/index.js");
+    const code = await runAgentsCommand({ argv: args.slice(1) });
+    process.exit(code);
+  }
+
   if (args[0] === "broker-server") {
     const { openBroker } = await import("./l3-disclosure/broker/open.js");
     const { createBrokerMcpServer } = await import("./mcp/broker-server.js");
@@ -140,6 +146,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   let passphrase = process.env.SANCTUARY_PASSPHRASE;
   let port: number | undefined;
   let host: string | undefined;
+  let multi = false;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--passphrase" && args[i + 1]) {
@@ -151,10 +158,40 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       port = parseInt(args[++i]!, 10);
     } else if (args[i] === "--host" && args[i + 1]) {
       host = args[++i];
+    } else if (args[i] === "--multi") {
+      multi = true;
     } else if (args[i] === "--help" || args[i] === "-h") {
       printDashboardHelp();
       process.exit(0);
     }
+  }
+
+  if (multi || process.env.SANCTUARY_MULTI_DASHBOARD === "true") {
+    const { startMultiDashboardServer } = await import(
+      "./dashboard/multi-server.js"
+    );
+    const envPort = process.env.SANCTUARY_MULTI_DASHBOARD_PORT;
+    const resolvedPort =
+      port ?? (envPort ? parseInt(envPort, 10) : undefined);
+    const authToken =
+      process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN &&
+      process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN !== "auto"
+        ? process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN
+        : undefined;
+    const handle = await startMultiDashboardServer({
+      ...(resolvedPort !== undefined ? { port: resolvedPort } : {}),
+      ...(host !== undefined ? { host } : {}),
+      ...(authToken !== undefined ? { authToken } : {}),
+    });
+    console.error(
+      `Sanctuary multi-agent dashboard running at ${handle.url} (press Ctrl+C to stop).`
+    );
+    const shutdown = () => {
+      handle.stop().finally(() => process.exit(0));
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    return;
   }
 
   const { startStandaloneDashboard } = await import("./dashboard-standalone.js");
@@ -263,6 +300,10 @@ Subcommands:
   dashboard            Start the dashboard as a standalone HTTP server.
                        Reads from the same storage as the MCP server.
                        Use "sanctuary dashboard --help" for options.
+                       Pass --multi to render the multi-tenant overview.
+
+  agents               List / inspect tenants on a multi-agent host.
+                       Use "sanctuary agents --help" for options.
 
   export-passphrase    Print the stored passphrase to stdout after
                        confirmation. Use this to back up or migrate.
@@ -296,8 +337,11 @@ Usage:
   sanctuary-mcp-server dashboard [options]
 
 Options:
-  --port <port>        Dashboard port (default: from config or 3501)
+  --port <port>        Dashboard port (default: from config or 3501; 3500 for --multi)
   --host <host>        Bind address (default: 127.0.0.1)
+  --multi              Start the multi-agent overview instead of a single-tenant
+                       dashboard. Does not decrypt any tenant state — scans every
+                       tenant on the host and deep-links into per-tenant dashboards.
   --help, -h           Show this help
 
 Environment variables:
@@ -306,6 +350,9 @@ Environment variables:
   SANCTUARY_RECOVERY_KEY            Recovery key for existing installations
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
   SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"
+  SANCTUARY_MULTI_DASHBOARD         "true" to auto-enable multi-agent mode
+  SANCTUARY_MULTI_DASHBOARD_PORT    Multi-agent dashboard port (default: 3500)
+  SANCTUARY_AGENTS_EXTRA_PATHS      Colon-separated extra tenant storage paths
 
 Note: In standalone mode, the dashboard shows audit log history and policy
 status. Live SSE events (tool calls, injection alerts) are only available

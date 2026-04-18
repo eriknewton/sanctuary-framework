@@ -40,6 +40,7 @@ import {
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
 import { SANCTUARY_VERSION } from "../config.js";
 import { resolveStoragePath, resolveDashboardPort } from "../paths.js";
+import { writeTenantRuntime, clearTenantRuntime } from "../cli/agents/runtime.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -348,6 +349,36 @@ export async function runWrap(
   );
 
   const dashboardUrl = `${dashboard.url}?token=${authToken}`;
+
+  // Publish runtime state so `sanctuary agents` + the multi-agent
+  // dashboard aggregator can find this tenant's actual port. Best-effort:
+  // write failures must not block wrap, and we clean up on shutdown.
+  const webhookCallbackPortRaw = process.env.SANCTUARY_WEBHOOK_CALLBACK_PORT;
+  const webhookCallbackPort = webhookCallbackPortRaw
+    ? parseInt(webhookCallbackPortRaw, 10)
+    : undefined;
+  await writeTenantRuntime(storagePath, {
+    version: readPackageVersion(),
+    pid: process.pid,
+    started_at: new Date().toISOString(),
+    dashboard_host: dashboard.host,
+    dashboard_port: dashboard.port,
+    ...(webhookCallbackPort !== undefined &&
+    !Number.isNaN(webhookCallbackPort)
+      ? {
+          webhook_callback_port: webhookCallbackPort,
+          webhook_callback_host:
+            process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST ?? "127.0.0.1",
+        }
+      : {}),
+    mode: "wrap",
+  });
+  const cleanupRuntime = () => {
+    clearTenantRuntime(storagePath).catch(() => {});
+  };
+  process.once("SIGINT", cleanupRuntime);
+  process.once("SIGTERM", cleanupRuntime);
+  process.once("exit", cleanupRuntime);
 
   // Auto-open in browser.
   const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);

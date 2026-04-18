@@ -11,6 +11,13 @@
 
 import type { ProtectionSnapshot } from "./aggregator.js";
 
+// Re-export the multi-tenant renderer so dashboard consumers can import a
+// single module for both modes.
+export {
+  renderMultiAgentHTML,
+  type MultiAgentHTMLOptions,
+} from "./multi-html.js";
+
 /** Hero copy. Change here if we ever A/B test. */
 export const HERO_COPY = "Your agent is protected.";
 
