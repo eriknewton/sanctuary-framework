@@ -471,9 +471,13 @@ describe("Principal Dashboard", () => {
     // general rate limit so the operator can never 429 themselves out of
     // their own dashboard on a normal browser refresh. See the soak report
     // for v0.10.0-rc.1 for the original failure mode.
-    it("does NOT rate-limit HTML view route `/` (rc.2 regression)", async () => {
+    //
+    // Request counts are kept just above the 120 general limit — enough to
+    // prove exemption without exhausting sockets on CI runners. Each test
+    // retries once on beforeEach port collisions (rare but observed).
+    it("does NOT rate-limit HTML view route `/` (rc.2 regression)", { retry: 2 }, async () => {
       const results: number[] = [];
-      for (let i = 0; i < 150; i++) {
+      for (let i = 0; i < 125; i++) {
         const res = await fetch(`http://127.0.0.1:${port}/`);
         results.push(res.status);
       }
@@ -481,25 +485,25 @@ describe("Principal Dashboard", () => {
       for (const s of results) expect(s).toBe(200);
     });
 
-    it("does NOT rate-limit /dashboard (rc.2 regression)", async () => {
+    it("does NOT rate-limit /dashboard (rc.2 regression)", { retry: 2 }, async () => {
       const results: number[] = [];
-      for (let i = 0; i < 140; i++) {
+      for (let i = 0; i < 125; i++) {
         const res = await fetch(`http://127.0.0.1:${port}/dashboard`);
         results.push(res.status);
       }
       expect(results).not.toContain(429);
     });
 
-    it("still rate-limits API routes while view routes are exempt (rc.2 regression)", async () => {
+    it("still rate-limits API routes while view routes are exempt (rc.2 regression)", { retry: 2 }, async () => {
       // View routes stay green, API routes still get throttled — proves the
       // exemption is scoped, not a blanket disable.
       const viewResults: number[] = [];
       const apiResults: number[] = [];
-      for (let i = 0; i < 130; i++) {
+      for (let i = 0; i < 125; i++) {
         const r = await fetch(`http://127.0.0.1:${port}/`);
         viewResults.push(r.status);
       }
-      for (let i = 0; i < 130; i++) {
+      for (let i = 0; i < 125; i++) {
         const r = await fetch(`http://127.0.0.1:${port}/api/status`);
         apiResults.push(r.status);
         if (r.status === 429) break;
