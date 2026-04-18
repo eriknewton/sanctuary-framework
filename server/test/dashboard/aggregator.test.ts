@@ -389,4 +389,111 @@ describe("getProtectionSnapshot", () => {
       expect(snap.layers.l1.injection_blocked_today).toBe(0);
     });
   });
+
+  // ─── v0.9.1: L4 evidence widget ──────────────────────────────────
+  describe("L4 evidence widget", () => {
+    function zeroTiers() {
+      return {
+        "verified-sovereign": 0,
+        "verified-degraded": 0,
+        "self-attested": 0,
+        "unverified": 0,
+      };
+    }
+
+    it("omits evidence when no l4Evidence is supplied (backward-compat)", async () => {
+      const snap = await getProtectionSnapshot(
+        baseSources({ identityManager: stubIdentityManager(stubIdentity()) })
+      );
+      expect(snap.layers.l4.evidence).toBeUndefined();
+      expect(snap.layers.l4.active_degradations).toBeUndefined();
+      expect(snap.layers.l4.layer_score).toBeUndefined();
+    });
+
+    it("populates evidence + degradations when l4Evidence is supplied", async () => {
+      const snap = await getProtectionSnapshot(
+        baseSources({
+          identityManager: stubIdentityManager(stubIdentity()),
+          l4Evidence: {
+            attestation_count: 0,
+            tier_distribution: zeroTiers(),
+            most_recent_attestation_at: null,
+            dispute_count: 0,
+            context_breakdown: {},
+            verascore_linked: false,
+          },
+        })
+      );
+      expect(snap.layers.l4.evidence).toBeDefined();
+      expect(snap.layers.l4.evidence?.attestation_count).toBe(0);
+      const codes = (snap.layers.l4.active_degradations ?? []).map((d) => d.code);
+      expect(codes).toContain("NO_REPUTATION_HISTORY");
+      expect(codes).toContain("NO_VERASCORE_LINK");
+      expect(typeof snap.layers.l4.layer_score).toBe("number");
+      expect(snap.layers.l4.layer_score!).toBeLessThan(100);
+    });
+
+    it("downgrades L4 state to 'degraded' when evidence fires degradations even if Verascore is attached", async () => {
+      const snap = await getProtectionSnapshot(
+        baseSources({
+          identityManager: stubIdentityManager(stubIdentity()),
+          reputation: { score: 85, profile_url: "https://verascore.ai/p/x" },
+          l4Evidence: {
+            attestation_count: 0,
+            tier_distribution: zeroTiers(),
+            most_recent_attestation_at: null,
+            dispute_count: 0,
+            context_breakdown: {},
+            verascore_linked: false,
+          },
+        })
+      );
+      expect(snap.layers.l4.state).toBe("degraded");
+    });
+
+    it("keeps L4 state 'full' when evidence is healthy AND Verascore is attached", async () => {
+      const snap = await getProtectionSnapshot(
+        baseSources({
+          identityManager: stubIdentityManager(stubIdentity()),
+          reputation: { score: 85, profile_url: "https://verascore.ai/p/x" },
+          l4Evidence: {
+            attestation_count: 10,
+            tier_distribution: {
+              "verified-sovereign": 8,
+              "verified-degraded": 2,
+              "self-attested": 0,
+              "unverified": 0,
+            },
+            most_recent_attestation_at: new Date().toISOString(),
+            dispute_count: 0,
+            context_breakdown: { commerce: 10 },
+            verascore_linked: true,
+          },
+        })
+      );
+      expect(snap.layers.l4.state).toBe("full");
+      expect(snap.layers.l4.layer_score).toBeGreaterThanOrEqual(100);
+      expect(snap.layers.l4.active_degradations).toEqual([]);
+    });
+
+    it("surfaces mitigation text in active_degradations", async () => {
+      const snap = await getProtectionSnapshot(
+        baseSources({
+          identityManager: stubIdentityManager(stubIdentity()),
+          l4Evidence: {
+            attestation_count: 0,
+            tier_distribution: zeroTiers(),
+            most_recent_attestation_at: null,
+            dispute_count: 0,
+            context_breakdown: {},
+            verascore_linked: false,
+          },
+        })
+      );
+      const noHistory = (snap.layers.l4.active_degradations ?? []).find(
+        (d) => d.code === "NO_REPUTATION_HISTORY"
+      );
+      expect(noHistory?.mitigation).toBeTruthy();
+    });
+  });
 });

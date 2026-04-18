@@ -87,6 +87,24 @@ export interface ReputationSummary {
   aggregate_metrics: Record<string, MetricAggregate>;
 }
 
+/**
+ * L4 attestation evidence summary for the SHR degradation emitter and the
+ * dashboard evidence widget. Derived from the stored attestations; does not
+ * include Verascore-link state (tracked separately via audit log).
+ */
+export interface L4AttestationSummary {
+  /** Total number of attestations covered by the summary */
+  attestation_count: number;
+  /** Count of attestations at each sovereignty tier */
+  tier_distribution: Record<SovereigntyTier, number>;
+  /** ISO timestamp of the most recent attestation, or null if none */
+  most_recent_attestation_at: string | null;
+  /** Count of attestations with outcome_result === "disputed" */
+  dispute_count: number;
+  /** Count of attestations per context label */
+  context_breakdown: Record<string, number>;
+}
+
 /** Portable reputation bundle */
 export interface ReputationBundle {
   version: "SANCTUARY_REP_V1";
@@ -535,6 +553,64 @@ export class ReputationStore {
     );
 
     return guarantee;
+  }
+
+  // ─── L4 Evidence Summary ─────────────────────────────────────────────
+
+  /**
+   * Summarize attestations for the L4 degradation emitter and dashboard widget.
+   *
+   * Returns aggregate evidence about the identity's reputation state —
+   * counts, tier distribution, recency, dispute counts, context coverage —
+   * without exposing raw attestations. The caller combines this with an
+   * audit-log check for Verascore link state to produce the final
+   * `L4Evidence` struct consumed by the SHR generator.
+   *
+   * @param participantDid - If provided, only count attestations where the
+   *   `participant_did` matches. If omitted, covers all attestations in the
+   *   store.
+   */
+  async summarizeForSHR(
+    participantDid?: string
+  ): Promise<L4AttestationSummary> {
+    const all = await this.loadAll();
+    const filtered = participantDid
+      ? all.filter((a) => a.attestation.data.participant_did === participantDid)
+      : all;
+
+    const tierDist: Record<SovereigntyTier, number> = {
+      "verified-sovereign": 0,
+      "verified-degraded": 0,
+      "self-attested": 0,
+      "unverified": 0,
+    };
+    const contextBreakdown: Record<string, number> = {};
+    let mostRecentMs: number | null = null;
+    let disputeCount = 0;
+
+    for (const a of filtered) {
+      const tier = a.attestation.data.sovereignty_tier;
+      if (tier) tierDist[tier]++;
+
+      const ctx = a.attestation.data.context;
+      if (ctx) contextBreakdown[ctx] = (contextBreakdown[ctx] ?? 0) + 1;
+
+      const ts = new Date(a.attestation.data.timestamp).getTime();
+      if (!isNaN(ts) && (mostRecentMs === null || ts > mostRecentMs)) {
+        mostRecentMs = ts;
+      }
+
+      if (a.attestation.data.outcome_result === "disputed") disputeCount++;
+    }
+
+    return {
+      attestation_count: filtered.length,
+      tier_distribution: tierDist,
+      most_recent_attestation_at:
+        mostRecentMs !== null ? new Date(mostRecentMs).toISOString() : null,
+      dispute_count: disputeCount,
+      context_breakdown: contextBreakdown,
+    };
   }
 
   // ─── Tier-Aware Access ───────────────────────────────────────────────

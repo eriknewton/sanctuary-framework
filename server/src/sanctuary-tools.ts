@@ -26,7 +26,9 @@ const PASSPHRASE_BACKUP_WARNING =
 import { derivePurposeKey } from "./core/key-derivation.js";
 import { toBase64url } from "./core/encoding.js";
 import { createIdentity } from "./core/identity.js";
-import { generateSHR } from "./shr/generator.js";
+import { generateSHR, type L4Evidence } from "./shr/generator.js";
+import { gatherL4Evidence } from "./shr/tools.js";
+import type { ReputationStore } from "./l4-reputation/reputation-store.js";
 
 export interface SanctuaryToolsOptions {
   config: SanctuaryConfig;
@@ -35,6 +37,12 @@ export interface SanctuaryToolsOptions {
   auditLog: AuditLog;
   policy: PrincipalPolicy;
   keyProtection: "passphrase" | "hardware-key" | "recovery-key";
+  /**
+   * Optional reputation store. When provided, identity-bundle exports
+   * include an SHR with L4 degradation evidence reflecting the current
+   * reputation state.
+   */
+  reputationStore?: ReputationStore;
 }
 
 /**
@@ -75,8 +83,40 @@ function validateVerascoreUrl(
 export function createSanctuaryTools(
   opts: SanctuaryToolsOptions
 ): { tools: ToolDefinition[] } {
-  const { config, identityManager, masterKey, auditLog, policy, keyProtection } = opts;
+  const { config, identityManager, masterKey, auditLog, policy, keyProtection, reputationStore } = opts;
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+
+  /**
+   * Build L4 evidence for an existing identity. Returns undefined when
+   * no reputation store is configured (generator then leaves L4 alone).
+   */
+  async function l4EvidenceForIdentity(
+    identity: { identity_id: string; did: string }
+  ): Promise<L4Evidence | undefined> {
+    if (!reputationStore) return undefined;
+    return gatherL4Evidence(reputationStore, auditLog, identity);
+  }
+
+  /**
+   * Build empty L4 evidence for a brand-new identity (bootstrap path).
+   * The identity was just created so `NO_REPUTATION_HISTORY` and
+   * `NO_VERASCORE_LINK` will always fire — that's the truth of the state.
+   */
+  function emptyL4Evidence(): L4Evidence {
+    return {
+      attestation_count: 0,
+      tier_distribution: {
+        "verified-sovereign": 0,
+        "verified-degraded": 0,
+        "self-attested": 0,
+        "unverified": 0,
+      },
+      most_recent_attestation_at: null,
+      dispute_count: 0,
+      context_breakdown: {},
+      verascore_linked: false,
+    };
+  }
 
   const tools: ToolDefinition[] = [
     // ─── sanctuary_bootstrap ───────────────────────────────────────────
@@ -123,11 +163,14 @@ export function createSanctuaryTools(
           did: publicIdentity.did,
         });
 
-        // 2. Generate SHR for the new identity
+        // 2. Generate SHR for the new identity.
+        // A brand-new identity has no reputation and no Verascore link,
+        // so the emitter will produce NO_REPUTATION_HISTORY + NO_VERASCORE_LINK.
         const shr = generateSHR(publicIdentity.identity_id, {
           config,
           identityManager,
           masterKey,
+          l4Evidence: emptyL4Evidence(),
         });
         if (typeof shr === "string") {
           return toolResult({
@@ -324,10 +367,12 @@ export function createSanctuaryTools(
           });
         }
 
+        const l4Evidence = await l4EvidenceForIdentity(identity);
         const shr = generateSHR(identity.identity_id, {
           config,
           identityManager,
           masterKey,
+          l4Evidence,
         });
 
         const attestations = (args.attestations as unknown[] | undefined) ?? [];

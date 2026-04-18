@@ -20,7 +20,13 @@ export type DegradationCode =
   | "NO_ZK_PROOFS"
   | "SELF_REPORTED_ATTESTATION"
   | "NO_SELECTIVE_DISCLOSURE"
-  | "BASIC_SYBIL_ONLY";
+  | "BASIC_SYBIL_ONLY"
+  // L4 reputation degradations (v0.9.1 — additive)
+  | "NO_REPUTATION_HISTORY"
+  | "LOW_TIER_DOMINANCE"
+  | "STALE_REPUTATION"
+  | "DISPUTE_ON_RECORD"
+  | "NO_VERASCORE_LINK";
 
 // ── SHR Body (signed content) ────────────────────────────────────────
 

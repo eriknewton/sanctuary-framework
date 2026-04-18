@@ -227,4 +227,115 @@ describe("Sovereignty Health Report (SHR)", () => {
       expect(c1).toBe(c2);
     });
   });
+
+  // ─── v0.9.1: L4 degradation emitter integration ──────────────────
+  describe("L4 degradation emitter (v0.9.1)", () => {
+    it("embeds L4 degradations in the signed body and flips l4.status to degraded", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+        l4Evidence: {
+          attestation_count: 0,
+          tier_distribution: {
+            "verified-sovereign": 0,
+            "verified-degraded": 0,
+            "self-attested": 0,
+            "unverified": 0,
+          },
+          most_recent_attestation_at: null,
+          dispute_count: 0,
+          context_breakdown: {},
+          verascore_linked: false,
+        },
+      }) as SignedSHR;
+
+      const l4Codes = shr.body.degradations
+        .filter((d) => d.layer === "l4")
+        .map((d) => d.code);
+      expect(l4Codes).toContain("NO_REPUTATION_HISTORY");
+      expect(l4Codes).toContain("NO_VERASCORE_LINK");
+      expect(shr.body.layers.l4.status).toBe("degraded");
+    });
+
+    it("leaves L4 active when evidence is healthy", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+        l4Evidence: {
+          attestation_count: 10,
+          tier_distribution: {
+            "verified-sovereign": 8,
+            "verified-degraded": 2,
+            "self-attested": 0,
+            "unverified": 0,
+          },
+          most_recent_attestation_at: new Date().toISOString(),
+          dispute_count: 0,
+          context_breakdown: { commerce: 10 },
+          verascore_linked: true,
+        },
+      }) as SignedSHR;
+
+      const l4Codes = shr.body.degradations
+        .filter((d) => d.layer === "l4")
+        .map((d) => d.code);
+      expect(l4Codes).toEqual([]);
+      expect(shr.body.layers.l4.status).toBe("active");
+    });
+
+    it("keeps signature verifiable with L4 degradations present (roundtrip)", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+        l4Evidence: {
+          attestation_count: 5,
+          tier_distribution: {
+            "verified-sovereign": 0,
+            "verified-degraded": 0,
+            "self-attested": 4,
+            "unverified": 1,
+          },
+          most_recent_attestation_at: new Date().toISOString(),
+          dispute_count: 1,
+          context_breakdown: { commerce: 5 },
+          verascore_linked: false,
+        },
+      }) as SignedSHR;
+
+      const result = verifySHR(shr);
+      expect(result.valid).toBe(true);
+      expect(result.errors).toEqual([]);
+
+      // Degradations must survive canonical serialization — the body we
+      // verify against is the same body we signed, including every L4 code.
+      const l4Codes = shr.body.degradations
+        .filter((d) => d.layer === "l4")
+        .map((d) => d.code)
+        .sort();
+      expect(l4Codes).toEqual(
+        [
+          "LOW_TIER_DOMINANCE",
+          "DISPUTE_ON_RECORD",
+          "NO_VERASCORE_LINK",
+        ].sort()
+      );
+    });
+
+    it("omitting l4Evidence preserves the legacy behavior (L4 active, no codes)", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+      }) as SignedSHR;
+
+      const l4Codes = shr.body.degradations
+        .filter((d) => d.layer === "l4")
+        .map((d) => d.code);
+      expect(l4Codes).toEqual([]);
+      expect(shr.body.layers.l4.status).toBe("active");
+    });
+  });
 });

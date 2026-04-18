@@ -201,4 +201,106 @@ describe("renderDashboardHTML", () => {
     });
     expect(html).toContain('AUTH_TOKEN = "tok-abc"');
   });
+
+  // ─── v0.9.1: L4 evidence widget ──────────────────────────────────
+  describe("L4 evidence widget", () => {
+    function snapshotWithEvidence() {
+      const base = makeSnapshot();
+      return {
+        ...base,
+        layers: {
+          ...base.layers,
+          l4: {
+            label: "L4 Reputation",
+            state: "degraded" as const,
+            headline: "Attached, but evidence is degraded",
+            score: 82,
+            profile_url: "https://verascore.ai/p/test",
+            claim_cta: null,
+            evidence: {
+              attestation_count: 7,
+              tier_distribution: {
+                "verified-sovereign": 2,
+                "verified-degraded": 0,
+                "self-attested": 4,
+                "unverified": 1,
+              },
+              most_recent_attestation_at: new Date(
+                Date.now() - 3 * 24 * 60 * 60 * 1000
+              ).toISOString(),
+              dispute_count: 1,
+              context_breakdown: { commerce: 5, negotiation: 2 },
+              verascore_linked: true,
+            },
+            layer_score: 55,
+            active_degradations: [
+              {
+                code: "LOW_TIER_DOMINANCE",
+                severity: "info" as const,
+                description: "71% of attestations are self-attested or unverified",
+                mitigation: "Complete sovereignty handshakes with counterparties",
+              },
+              {
+                code: "DISPUTE_ON_RECORD",
+                severity: "warning" as const,
+                description: "1 attestation marked as disputed",
+                mitigation: "Review disputed interactions",
+              },
+            ],
+          },
+        },
+      };
+    }
+
+    it("renders the L4 score and evidence counts when evidence is present", () => {
+      const html = renderDashboardHTML({ snapshot: snapshotWithEvidence() });
+      expect(html).toContain("L4 score");
+      expect(html).toContain("55 / 100");
+      expect(html).toContain("Attestations");
+      expect(html).toContain(">7<");
+      expect(html).toContain("Disputes");
+      expect(html).toContain("Verascore link");
+    });
+
+    it("renders each active L4 degradation with code, severity, description, and mitigation", () => {
+      const html = renderDashboardHTML({ snapshot: snapshotWithEvidence() });
+      expect(html).toContain("LOW_TIER_DOMINANCE");
+      expect(html).toContain("DISPUTE_ON_RECORD");
+      expect(html).toMatch(/l4-deg-info/);
+      expect(html).toMatch(/l4-deg-warning/);
+      expect(html).toContain(
+        "71% of attestations are self-attested or unverified"
+      );
+      expect(html).toContain("1 attestation marked as disputed");
+      expect(html).toContain(
+        "Complete sovereignty handshakes with counterparties"
+      );
+    });
+
+    it("omits the evidence block entirely when l4.evidence is undefined", () => {
+      const html = renderDashboardHTML({ snapshot: makeSnapshot() });
+      // The evidence widget block and its rendered content do not appear.
+      // (The CSS declarations for .l4-evidence always ship with the
+      // stylesheet so consumers can theme them — we check the rendered
+      // DOM instead.)
+      expect(html).not.toContain(`<div class="l4-evidence">`);
+      expect(html).not.toMatch(/<dt>L4 score<\/dt>/);
+    });
+
+    it("escapes HTML in evidence-derived fields", () => {
+      const base = snapshotWithEvidence();
+      base.layers.l4.active_degradations = [
+        {
+          code: "<script>x</script>",
+          severity: "info",
+          description: "<img src=x onerror=1>",
+          mitigation: "</div>",
+        },
+      ];
+      const html = renderDashboardHTML({ snapshot: base });
+      expect(html).not.toContain("<script>x</script>");
+      expect(html).not.toContain("<img src=x");
+      expect(html).toContain("&lt;script&gt;");
+    });
+  });
 });

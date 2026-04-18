@@ -483,15 +483,7 @@ export async function createSanctuaryServer(options?: {
   // 11. Create L3 tools
   const { tools: l3Tools } = createL3Tools(storage, masterKey, auditLog);
 
-  // 12. Create SHR tools (machine-readable sovereignty health report)
-  const { tools: shrTools } = createSHRTools(
-    config,
-    identityManager,
-    masterKey,
-    auditLog
-  );
-
-  // 13. Create Handshake tools (sovereignty handshake protocol)
+  // 12. Create Handshake tools (sovereignty handshake protocol)
   // Must be created before L4 so handshakeResults can feed tier resolution
   const { tools: handshakeTools, handshakeResults } = createHandshakeTools(
     config,
@@ -504,14 +496,28 @@ export async function createSanctuaryServer(options?: {
     }
   );
 
-  // 14. Create L4 tools (reputation with sovereignty-gated tiers)
-  const { tools: l4Tools, reputationStore: _reputationStore } = createL4Tools(
+  // 13. Create L4 tools (reputation with sovereignty-gated tiers)
+  // Produces the ReputationStore that feeds SHR L4 evidence, so create
+  // this before the SHR tools.
+  const { tools: l4Tools, reputationStore } = createL4Tools(
     storage,
     masterKey,
     identityManager,
     auditLog,
     handshakeResults,
     config.verascore.url
+  );
+
+  // 14. Create SHR tools (machine-readable sovereignty health report).
+  // Receives the reputationStore so the generator can emit L4 degradation
+  // evidence (NO_REPUTATION_HISTORY, LOW_TIER_DOMINANCE, STALE_REPUTATION,
+  // DISPUTE_ON_RECORD, NO_VERASCORE_LINK).
+  const { tools: shrTools } = createSHRTools(
+    config,
+    identityManager,
+    masterKey,
+    auditLog,
+    reputationStore
   );
 
   // 14b. Create Federation tools (MCP-to-MCP)
@@ -637,6 +643,7 @@ export async function createSanctuaryServer(options?: {
     auditLog,
     policy,
     keyProtection,
+    reputationStore,
   });
 
   // 16b. Create memory attestation tools (L1 cognitive sovereignty)

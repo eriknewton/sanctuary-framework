@@ -83,8 +83,65 @@ function l4Card(l4: ProtectionSnapshot["layers"]["l4"]): string {
       : `<div class="claim-block">${escHtml(l4.claim_cta ?? "Claim your profile at verascore.ai")}</div>`;
   return layerCard(
     l4,
-    `<div class="layer-cta">${score}</div>`
+    `<div class="layer-cta">${score}</div>${l4EvidenceBlock(l4)}`
   );
+}
+
+function formatRelativeDays(iso: string | null): string {
+  if (!iso) return "none on record";
+  const ts = new Date(iso).getTime();
+  if (isNaN(ts)) return "unknown";
+  const days = Math.round((Date.now() - ts) / (24 * 60 * 60 * 1000));
+  if (days <= 0) return "today";
+  if (days === 1) return "1 day ago";
+  return `${days} days ago`;
+}
+
+function l4EvidenceBlock(l4: ProtectionSnapshot["layers"]["l4"]): string {
+  if (!l4.evidence) return "";
+  const ev = l4.evidence;
+  const tierSovereign = ev.tier_distribution["verified-sovereign"];
+  const tierDegraded = ev.tier_distribution["verified-degraded"];
+  const tierSelf = ev.tier_distribution["self-attested"];
+  const tierUnverified = ev.tier_distribution["unverified"];
+  const contextCount = Object.keys(ev.context_breakdown).length;
+  const mostRecent = formatRelativeDays(ev.most_recent_attestation_at);
+  const score = l4.layer_score ?? 100;
+
+  const summaryLine = `
+    <div><dt>L4 score</dt><dd>${escHtml(score)} / 100</dd></div>
+    <div><dt>Attestations</dt><dd>${escHtml(ev.attestation_count)}</dd></div>
+    <div><dt>Verified tiers</dt><dd>${escHtml(tierSovereign)} sovereign · ${escHtml(tierDegraded)} degraded</dd></div>
+    <div><dt>Lower tiers</dt><dd>${escHtml(tierSelf)} self · ${escHtml(tierUnverified)} unverified</dd></div>
+    <div><dt>Contexts</dt><dd>${escHtml(contextCount)}</dd></div>
+    <div><dt>Disputes</dt><dd>${escHtml(ev.dispute_count)}</dd></div>
+    <div><dt>Last activity</dt><dd>${escHtml(mostRecent)}</dd></div>
+    <div><dt>Verascore link</dt><dd>${ev.verascore_linked ? "Yes" : "Not linked"}</dd></div>
+  `;
+
+  const degs = l4.active_degradations ?? [];
+  const degList = degs.length === 0
+    ? ""
+    : `<ul class="l4-deg-list">${degs
+        .map(
+          (d) => `
+          <li class="l4-deg l4-deg-${escHtml(d.severity)}">
+            <div class="l4-deg-head">
+              <span class="l4-deg-code">${escHtml(d.code)}</span>
+              <span class="l4-deg-sev">${escHtml(d.severity)}</span>
+            </div>
+            <p class="l4-deg-desc">${escHtml(d.description)}</p>
+            ${d.mitigation ? `<p class="l4-deg-mit">${escHtml(d.mitigation)}</p>` : ""}
+          </li>`
+        )
+        .join("")}</ul>`;
+
+  return `
+    <div class="l4-evidence">
+      <dl class="layer-detail l4-evidence-summary">${summaryLine}</dl>
+      ${degList}
+    </div>
+  `;
 }
 
 export function renderDashboardHTML(options: DashboardHTMLOptions): string {
@@ -345,6 +402,24 @@ button { font: inherit; cursor: pointer; }
 .score-value { font-size: 28px; font-weight: 650; color: var(--green); letter-spacing: -0.02em; }
 .score-label { font-size: 11px; text-transform: uppercase; color: var(--ink-mute); letter-spacing: 0.08em; }
 .claim-block { font-size: 13px; color: var(--violet); }
+
+/* ── L4 evidence widget (v0.9.1) ──────────────────────────────── */
+.l4-evidence { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); }
+.l4-evidence-summary { gap: 6px; margin-bottom: 10px; }
+.l4-evidence-summary dt { font-size: 10px; }
+.l4-evidence-summary dd { font-size: 11px; }
+.l4-deg-list { list-style: none; display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.l4-deg { padding: 8px 10px; border-radius: var(--radius-sm); background: var(--bg-2); border: 1px solid var(--border); font-size: 12px; }
+.l4-deg-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 3px; }
+.l4-deg-code { font-family: var(--mono); font-size: 11px; color: var(--ink); letter-spacing: 0.02em; }
+.l4-deg-sev { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-mute); }
+.l4-deg-warning { border-color: rgba(241, 192, 90, 0.4); }
+.l4-deg-warning .l4-deg-sev { color: var(--amber); }
+.l4-deg-critical { border-color: rgba(255, 107, 122, 0.5); }
+.l4-deg-critical .l4-deg-sev { color: var(--red); }
+.l4-deg-info .l4-deg-sev { color: var(--indigo); }
+.l4-deg-desc { color: var(--ink-dim); line-height: 1.35; font-size: 11px; }
+.l4-deg-mit { color: var(--ink-mute); line-height: 1.35; font-size: 10px; margin-top: 3px; font-style: italic; }
 
 /* ── Section headers ─────────────────────────────────────────── */
 .section { margin-bottom: 28px; }
