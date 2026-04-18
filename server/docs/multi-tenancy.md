@@ -225,3 +225,113 @@ no cross-contamination of identities, state, or audit logs. Run it with:
 ```bash
 cd server && npm test -- --run test/integration/multi-instance-isolation.test.ts
 ```
+
+---
+
+## Operating multiple tenants
+
+### `sanctuary agents` — inventory CLI
+
+Once you have two or more wrapped tenants on a host, `sanctuary agents`
+gives you a read-only inventory without needing any tenant's passphrase.
+It discovers tenants by scanning `~/.sanctuary/` for sub-directories that
+look initialized (have a `state/` dir and/or a `cocoon-profile.json`), plus
+any extras you register via `SANCTUARY_AGENTS_EXTRA_PATHS` or an
+`~/.sanctuary/agents-extra.json` file.
+
+```bash
+# Human-readable table of every tenant on the host.
+sanctuary agents list
+# NAME     STATUS   DASH  HOOK  PP               STORAGE
+# nsa      running  3501  3511  keychain         /Users/you/.sanctuary/nsa
+# standards stopped  -     -     fallback-file    /Users/you/.sanctuary/standards
+
+# Machine-readable output for scripts.
+sanctuary agents list --json
+
+# One-line summary per tenant — good for `watch`.
+sanctuary agents status
+
+# Details for a single tenant.
+sanctuary agents show nsa
+#   tenant:            nsa
+#   storage_path:      /Users/you/.sanctuary/nsa
+#   keychain_service:  sanctuary-passphrase-<12-hex>
+#   passphrase:        keychain
+#   last_activity:     2026-04-17T21:15:04.123Z (3m ago)
+#   runtime:
+#     dashboard:       http://127.0.0.1:3501
+#     webhook_callback: http://127.0.0.1:3511
+#   probe:             running
+```
+
+Scope note: the CLI is read-only and never decrypts tenant state. There is
+no `sanctuary agents create` / `init` verb — tenant creation is still done
+via `sanctuary wrap` with `SANCTUARY_STORAGE_PATH` set, exactly as above.
+Use `sanctuary agents` to audit what's on the host afterwards.
+
+#### Registering tenants whose storage lives outside `~/.sanctuary/`
+
+Two ways, both additive:
+
+- **Env var (per shell):** `SANCTUARY_AGENTS_EXTRA_PATHS=/srv/sanctuary/a:/srv/sanctuary/b sanctuary agents list`
+- **File (per host):** drop a JSON array of paths at `~/.sanctuary/agents-extra.json`:
+  ```json
+  ["/srv/sanctuary/a", "/srv/sanctuary/b"]
+  ```
+
+### `sanctuary dashboard --multi` — multi-agent overview
+
+The single-tenant dashboard still works exactly as before — nothing
+changes for users with one wrapped agent. For hosts with more than one
+tenant, `sanctuary dashboard --multi` starts a lightweight HTTP portal
+(default port `3500`) that shows every tenant in a table and deep-links
+into each one's per-tenant dashboard.
+
+```bash
+# Start the overview on the default port (3500).
+sanctuary dashboard --multi
+
+# Or pick an explicit port / host.
+SANCTUARY_MULTI_DASHBOARD_PORT=4000 sanctuary dashboard --multi --host 0.0.0.0
+```
+
+The portal:
+
+- Scans the same tenant roots as `sanctuary agents`.
+- Reads each tenant's `runtime.json` (written automatically by wrap and
+  the standalone dashboard on start, removed on clean shutdown) to learn
+  the dashboard port.
+- Probes each tenant's `/api/health` to show live running / stopped.
+- Does **not** aggregate tenant reputation, audit logs, or any decrypted
+  state — each tenant's encrypted data stays in that tenant's dashboard.
+- Exposes `/api/agents` for machine consumption (same JSON shape as
+  `sanctuary agents list --json`).
+
+When the portal runs behind an auth token, set
+`SANCTUARY_DASHBOARD_AUTH_TOKEN` in the environment where you launch it;
+the per-tenant dashboards keep their own independent tokens.
+
+### How a running tenant advertises itself
+
+When `sanctuary wrap` (or `sanctuary dashboard` in standalone mode) starts
+the dashboard, it writes a plaintext `runtime.json` file into that
+tenant's `SANCTUARY_STORAGE_PATH`:
+
+```json
+{
+  "version": "0.10.0",
+  "pid": 84231,
+  "started_at": "2026-04-17T21:04:13.712Z",
+  "dashboard_host": "127.0.0.1",
+  "dashboard_port": 3501,
+  "webhook_callback_port": 3511,
+  "webhook_callback_host": "127.0.0.1",
+  "mode": "wrap"
+}
+```
+
+The file contains **no secrets** — it is 0600 (owner-only) and is deleted
+on graceful shutdown (SIGINT / SIGTERM / `exit`). A crashed process may
+leave a stale file; `sanctuary agents` and the multi-agent dashboard treat
+a tenant as running only when the `/api/health` probe actually answers.
