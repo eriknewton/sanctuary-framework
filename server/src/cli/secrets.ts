@@ -5,10 +5,18 @@
  * stored credentials, grant/revoke per-skill scope, and query the
  * broker-scoped audit log.
  *
- * Value input for `add` and `rotate`:
- * - If stdin is a TTY, prompt silently (echo suppressed).
- * - Otherwise, read one line from stdin (supports
- *   `echo "..." | sanctuary secrets add X`).
+ * Value input for `add` and `rotate` (in priority order):
+ *   1. If a value is passed as a second positional argument, use it
+ *      directly. This is the path operators naturally reach for;
+ *      emits a stderr warning because the value is briefly visible in
+ *      `ps aux` during invocation.
+ *   2. Else if stdin is NOT a TTY, read one line from stdin. Supports
+ *      `echo "..." | sanctuary secrets add X` and shell-scripted
+ *      lifecycles. A 30-second read deadline prevents indefinite hangs
+ *      when stdin is piped from nothing (the v0.10.0-rc.1 soak mode —
+ *      operator passed value via argv, got silently dropped, CLI hung
+ *      15 minutes on an open but empty stdin).
+ *   3. Else (TTY), prompt silently with echo suppressed.
  *
  * The grant/revoke commands edit ~/.sanctuary/broker-policy.json so the
  * next broker startup picks up the change. Running brokers can call
@@ -79,15 +87,25 @@ export async function runSecretsCommand(args: SecretsArgs): Promise<number> {
 function printUsage(s: NodeJS.WritableStream): void {
   s.write(`Usage: sanctuary secrets <command> [args]
 
-  add <name>                         Store a new secret (reads value from stdin).
+  add <name> [value]                 Store a new secret. Value sources, in order:
+                                       1. 2nd positional arg (shown here) — convenient
+                                          but briefly visible in \`ps aux\`.
+                                       2. Piped stdin: \`echo "..." | sanctuary
+                                          secrets add NAME\` — not visible in \`ps\`.
+                                       3. TTY prompt (echo suppressed) when neither
+                                          positional nor pipe is supplied.
   list                               List stored secret names.
-  rotate <name>                      Replace the value of a stored secret.
+  rotate <name> [value]              Replace the value of a stored secret (same
+                                     value-source precedence as \`add\`).
   delete <name>                      Remove a secret.
   grant <skill> <secret> [flags]     Authorize a skill to request this secret.
     --scope <read|rotate>            Grant scope (default: read).
     --ttl <seconds>                  Token TTL cap (default: 900).
   revoke <skill> <secret>            Revoke a skill's access to a secret.
-  audit [--since <iso>]              Show the broker-scoped audit trail.
+  audit [--since <iso>] [--limit N]  Show the broker-scoped audit trail.
+
+See also: \`sanctuary broker-server\` — run the Secret Broker as a separate
+MCP server so skills can request scoped ephemeral tokens over stdio.
 `);
 }
 
@@ -97,13 +115,14 @@ async function cmdAdd(
   argv: string[],
   ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream; stdin: NodeJS.ReadableStream & { isTTY?: boolean }; args: SecretsArgs }
 ): Promise<number> {
-  const name = requirePositional(argv, 0, "add <name>");
+  const name = requirePositional(argv, 0, "add <name> [value]");
+  const argvValue = optionalPositional(argv, 1);
   const { broker, close } = await openBroker({
     passphrase: ctx.args.passphrase,
     storagePath: ctx.args.storagePath,
   });
   try {
-    const value = await readValue(ctx.stdin, `Enter value for "${name}"`);
+    const value = await resolveValue(argvValue, ctx.stdin, ctx.err, `Enter value for "${name}"`);
     if (!value) {
       ctx.err.write("Aborted: empty value\n");
       return 1;
@@ -155,13 +174,14 @@ async function cmdRotate(
   argv: string[],
   ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream; stdin: NodeJS.ReadableStream & { isTTY?: boolean }; args: SecretsArgs }
 ): Promise<number> {
-  const name = requirePositional(argv, 0, "rotate <name>");
+  const name = requirePositional(argv, 0, "rotate <name> [value]");
+  const argvValue = optionalPositional(argv, 1);
   const { broker, close } = await openBroker({
     passphrase: ctx.args.passphrase,
     storagePath: ctx.args.storagePath,
   });
   try {
-    const value = await readValue(ctx.stdin, `Enter new value for "${name}"`);
+    const value = await resolveValue(argvValue, ctx.stdin, ctx.err, `Enter new value for "${name}"`);
     if (!value) {
       ctx.err.write("Aborted: empty value\n");
       return 1;
@@ -327,10 +347,45 @@ function requirePositional(argv: string[], i: number, usage: string): string {
   return v;
 }
 
+/** Read an optional positional at index `i` — returns undefined if missing or
+ *  if the slot is a `--flag` (reserved for named options). */
+function optionalPositional(argv: string[], i: number): string | undefined {
+  const v = argv[i];
+  if (!v || v.startsWith("--")) return undefined;
+  return v;
+}
+
 function parseFlag(argv: string[], name: string): string | undefined {
   const idx = argv.indexOf(name);
   if (idx === -1) return undefined;
   return argv[idx + 1];
+}
+
+/** Deadline on non-TTY stdin reads. Prevents the v0.10.0-rc.1 soak failure
+ *  mode where an operator-supplied argv value was silently dropped and the
+ *  CLI hung 15 minutes on an open-but-empty stdin. 30s is ample for any
+ *  legitimate pipe. */
+const STDIN_READ_DEADLINE_MS = 30_000;
+
+/**
+ * Resolve the secret value from (in order): argv positional, piped stdin,
+ * or an interactive TTY prompt. Emits a stderr warning when the value comes
+ * from argv because it is briefly visible in `ps aux`.
+ */
+async function resolveValue(
+  argvValue: string | undefined,
+  stdin: NodeJS.ReadableStream & { isTTY?: boolean },
+  err: NodeJS.WritableStream,
+  prompt: string
+): Promise<string> {
+  if (argvValue !== undefined) {
+    err.write(
+      "Warning: secret value passed as CLI argument is briefly visible in `ps aux`.\n" +
+      "  For better security, pipe via stdin: `echo \"value\" | sanctuary secrets add NAME`\n"
+    );
+    return argvValue;
+  }
+  return await readValue(stdin, prompt);
 }
 
 async function defaultStoragePath(): Promise<string> {
@@ -358,15 +413,27 @@ async function readFirstLine(stdin: NodeJS.ReadableStream): Promise<string> {
   return new Promise((resolve, reject) => {
     const rl = createInterface({ input: stdin });
     let resolved = false;
-    rl.once("line", (line) => {
+    const finish = (value: string) => {
+      if (resolved) return;
       resolved = true;
-      rl.close();
-      resolve(line);
+      clearTimeout(deadline);
+      try { rl.close(); } catch { /* already closed */ }
+      resolve(value);
+    };
+    const deadline = setTimeout(() => {
+      // Don't hang forever when stdin is opened but never produces input
+      // (the rc.1 soak failure mode). An empty return triggers the
+      // "Aborted: empty value" path with a non-zero exit code.
+      finish("");
+    }, STDIN_READ_DEADLINE_MS);
+    rl.once("line", (line) => finish(line));
+    rl.once("close", () => finish(""));
+    rl.once("error", (e) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(deadline);
+      reject(e);
     });
-    rl.once("close", () => {
-      if (!resolved) resolve("");
-    });
-    rl.once("error", reject);
   });
 }
 

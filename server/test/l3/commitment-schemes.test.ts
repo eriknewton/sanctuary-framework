@@ -104,8 +104,14 @@ describe("L3 Commitment Schemes", () => {
       // Valid commitment
       expect(verifyCommitment(c.commitment, value, c.blinding_factor)).toBe(true);
 
-      // Commitment with single-char difference (would reveal via timing in naive ===)
-      const tampered = c.commitment.slice(0, -1) + (c.commitment.endsWith("A") ? "B" : "A");
+      // Commitment with single-char difference at a leading position (would
+      // reveal via timing in naive ===). The hash is 32 bytes, so base64url
+      // encodes to 43 chars where the *last* char only contributes 4 bits
+      // with 2 forced-zero padding bits. Tampering only the last char can
+      // therefore decode back to the same 32 bytes and fail this assertion.
+      // Tamper the first char, which contributes all 6 of its bits to the
+      // first byte — always produces different bytes.
+      const tampered = (c.commitment[0] === "A" ? "B" : "A") + c.commitment.slice(1);
       expect(verifyCommitment(tampered, value, c.blinding_factor)).toBe(false);
 
       // Empty commitment
