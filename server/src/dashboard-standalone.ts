@@ -123,6 +123,24 @@ export async function startStandaloneDashboard(
 
     const result = await deriveMasterKey(passphrase, existingParams);
     masterKey = result.key;
+
+    // v0.10.2: persist derivation params on first run, matching the MCP
+    // server (index.ts) and broker (l3-disclosure/broker/open.ts) paths.
+    // The standalone dashboard used to assume the MCP server would write
+    // `_meta/key-params` first, so it only ever READ them. With the new
+    // Keychain-autoload boot path `sanctuary dashboard` can now be the
+    // first component to run on a machine — if it derives against a
+    // random salt without persisting, the next boot will derive a
+    // DIFFERENT master key from the same passphrase and fail to decrypt
+    // everything this boot just wrote.
+    if (!existingParams) {
+      const { stringToBytes } = await import("./core/encoding.js");
+      await storage.write(
+        "_meta",
+        "key-params",
+        stringToBytes(JSON.stringify(result.params))
+      );
+    }
   } else {
     // Recovery key path
     const { hashToString } = await import("./core/hashing.js");
@@ -258,6 +276,23 @@ export async function startStandaloneDashboard(
     profileStore,
   });
   dashboard.setStandaloneMode(true);
+
+  // v0.10.2 — loopback auto-auth: the passphrase that unlocked at least
+  // one identity above is strictly stronger than the dashboard bearer
+  // token (which lives only in memory and is re-generated on restart).
+  // Once terminal-side auth has succeeded, requiring the operator to paste
+  // that same passphrase into a browser form on localhost is pure friction
+  // and trains the wrong habit. Skip the login prompt for loopback callers
+  // when (a) the dashboard binds a loopback interface AND (b) at least one
+  // identity decrypted. Remote callers keep the bearer-token requirement.
+  const hostIsLoopback =
+    dashboardHost === "127.0.0.1" ||
+    dashboardHost === "::1" ||
+    dashboardHost === "localhost";
+  if (hostIsLoopback && loadResult.loaded > 0) {
+    dashboard.setAutoAuthLocalhost(true);
+  }
+
   await dashboard.start();
 
   // Advertise this tenant's dashboard to `sanctuary agents` + multi-agent

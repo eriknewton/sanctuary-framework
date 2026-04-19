@@ -209,6 +209,70 @@ describe("Standalone Dashboard", () => {
     expect(res.status).toBe(200);
   });
 
+  // v0.10.2 regression — after the supplied passphrase decrypts at least one
+  // identity, loopback callers skip the dashboard login prompt. The operator
+  // has already proved principalship on the command line; re-prompting in the
+  // auto-opened browser just trains users to paste secrets into web forms.
+  it("v0.10.2: loopback callers skip the login prompt once identities decrypt", async () => {
+    // Seed one identity encrypted under passphrase A so the second boot's
+    // `loadResult.loaded > 0` gate flips.
+    const seedPort = randomPort();
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "autoauth-seed-token";
+    const seed = await startStandaloneDashboard({
+      passphrase: "autoauth-tenant-passphrase",
+      port: seedPort,
+      host: "127.0.0.1",
+    });
+
+    const { IdentityManager } = await import("../src/l1-cognitive/tools.js");
+    const { FilesystemStorage } = await import("../src/storage/filesystem.js");
+    const { deriveMasterKey, derivePurposeKey } = await import(
+      "../src/core/key-derivation.js"
+    );
+    const { createIdentity } = await import("../src/core/identity.js");
+    const { bytesToString } = await import("../src/core/encoding.js");
+    const storage = new FilesystemStorage(`${tempDir}/state`);
+    const rawParams = await storage.read("_meta", "key-params");
+    const params = rawParams ? JSON.parse(bytesToString(rawParams)) : undefined;
+    const { key: mk } = await deriveMasterKey("autoauth-tenant-passphrase", params);
+    const idEncKey = derivePurposeKey(mk, "identity-encryption");
+    const idMgr = new IdentityManager(storage, mk);
+    await idMgr.load();
+    const { storedIdentity } = createIdentity(
+      "autoauth-test-identity",
+      idEncKey,
+      "passphrase"
+    );
+    await idMgr.save(storedIdentity);
+    await seed.stop();
+
+    // Real boot — auth token is set, but loopback callers should bypass it.
+    const port = randomPort();
+    dashboard = await startStandaloneDashboard({
+      passphrase: "autoauth-tenant-passphrase",
+      port,
+      host: "127.0.0.1",
+    });
+
+    // GET / from loopback with no Authorization header must serve the
+    // dashboard HTML (not the login page). Pre-fix behaviour served the
+    // login page here because auth_token was truthy.
+    const res = await fetch(`http://127.0.0.1:${port}/`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    // Login page contains "Auth Token" / "Session tokens expire" copy; the
+    // real dashboard does not. Assert we got the real dashboard.
+    expect(body).not.toMatch(/Auth Token/);
+    expect(body).not.toMatch(/Session tokens expire/);
+
+    // API endpoints must also work without a bearer token on loopback.
+    const statusRes = await fetch(`http://127.0.0.1:${port}/api/status`);
+    expect(statusRes.status).toBe(200);
+    const statusJson = await statusRes.json();
+    expect(statusJson).toHaveProperty("pending_count");
+  });
+
   it("v0.10.2: the `identities none loaded` warning names the tenant's Keychain service", async () => {
     const logs: string[] = [];
     const origError = console.error;

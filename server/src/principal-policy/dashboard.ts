@@ -144,6 +144,24 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private rateLimits: Map<string, RateLimitEntry> = new Map();
   /** Whether the dashboard is running in standalone mode (no MCP server) */
   private _standaloneMode = false;
+  /**
+   * v0.10.2: when set, requests from loopback addresses (127.0.0.1 / ::1)
+   * are treated as authenticated without requiring a Bearer token or
+   * dashboard session cookie. Only the `startStandaloneDashboard` boot
+   * path enables this, and ONLY after the supplied passphrase successfully
+   * decrypts at least one stored identity — proving the caller already
+   * holds the primary secret that protects every piece of Sanctuary state.
+   *
+   * Rationale: the dashboard auth token is a dashboard-access credential
+   * layered on top of the master-key unlock. Once the operator has already
+   * presented the passphrase on the command line (terminal-side auth), a
+   * second login prompt in the auto-opened browser just trains users to
+   * paste secrets into web forms — the exact habit Sanctuary exists to
+   * discourage. Remote (non-loopback) callers still require the bearer
+   * token, so this is a localhost-only ergonomics unlock, not a network
+   * policy change.
+   */
+  private _autoAuthLocalhost = false;
 
   constructor(config: DashboardConfig) {
     this.config = config;
@@ -193,6 +211,28 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   setStandaloneMode(standalone: boolean): void {
     this._standaloneMode = standalone;
+  }
+
+  /**
+   * v0.10.2: enable (or disable) the loopback auto-auth fast path. See
+   * {@link _autoAuthLocalhost} for the rationale and threat model. Callers
+   * should gate this on both (a) the dashboard host being a loopback
+   * interface and (b) the master-key unlock having succeeded against
+   * on-disk state.
+   */
+  setAutoAuthLocalhost(enabled: boolean): void {
+    this._autoAuthLocalhost = enabled;
+  }
+
+  /**
+   * v0.10.2: is this request from a loopback interface? We treat the
+   * standard IPv4/IPv6 loopback addresses plus the IPv4-mapped IPv6 form
+   * as loopback so LAN clients never accidentally hit the unauthenticated
+   * fast path even on hosts where the HTTP server binds 0.0.0.0.
+   */
+  private isLoopbackRequest(req: IncomingMessage): boolean {
+    const addr = this.getRemoteAddr(req);
+    return addr === "127.0.0.1" || addr === "::1" || addr === "localhost";
   }
 
   /**
@@ -369,6 +409,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private checkAuth(req: IncomingMessage, url: URL, res: ServerResponse): boolean {
     if (!this.authToken) return true; // Auth disabled
 
+    // v0.10.2: loopback auto-auth — see _autoAuthLocalhost comment.
+    if (this._autoAuthLocalhost && this.isLoopbackRequest(req)) {
+      return true;
+    }
+
     // Check Authorization: Bearer <token> header (primary auth method)
     const authHeader = req.headers.authorization;
     if (authHeader) {
@@ -407,6 +452,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private isAuthenticated(req: IncomingMessage, url: URL): boolean {
     if (!this.authToken) return true;
+
+    // v0.10.2: loopback auto-auth mirrors checkAuth so GET / serves the
+    // dashboard HTML instead of the login page for localhost callers.
+    if (this._autoAuthLocalhost && this.isLoopbackRequest(req)) {
+      return true;
+    }
 
     const authHeader = req.headers.authorization;
     if (authHeader) {
