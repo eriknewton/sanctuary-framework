@@ -45,7 +45,8 @@ export function resolveStoragePath(
  *   2. `SANCTUARY_DASHBOARD_PORT` env var
  *   3. Default 3501
  *
- * Auto-fallback (3501→3510) is handled downstream once a port is chosen.
+ * Auto-fallback (chosen port, then the next PORT_FALLBACK_ATTEMPTS-1
+ * consecutive ports) is handled downstream once a port is chosen.
  */
 export function resolveDashboardPort(
   explicitPort?: number,

@@ -58,7 +58,13 @@ export interface WrapOptions {
   unwrap?: boolean;
   /** Explicit passphrase override. If unset, one is generated and stored. */
   passphrase?: string;
-  /** Dashboard port (default: 3501, falls back up to 3510). */
+  /**
+   * Dashboard port (default 3501). If bound, the loop retries
+   * `preferredPort` through `preferredPort + PORT_FALLBACK_ATTEMPTS - 1`
+   * regardless of the absolute port number. v0.10.0 shipped a hardcoded
+   * absolute upper bound of 3510, which silently rejected multi-tenant
+   * setups starting above 3510.
+   */
   port?: number;
   /** Preview changes without writing. */
   dryRun?: boolean;
@@ -78,7 +84,17 @@ export const COCOON_GOVERNOR_DEFAULTS = {
   lifetime_limit: 1000,
 } as const;
 
-const MAX_PORT = 3510;
+/**
+ * How many consecutive ports the dashboard fallback tries, starting at
+ * `preferredPort`. v0.10.0 hardcoded an absolute `MAX_PORT = 3510` cap —
+ * starting above it (the documented tenant ports 3511/3512) produced an
+ * empty range and the error "No free dashboard port in range 3511-3510".
+ * Making the window relative to `preferredPort` fixes both the multi-tenant
+ * case and the nonsensical error message.
+ *
+ * Exported for tests; not public API.
+ */
+export const PORT_FALLBACK_ATTEMPTS = 20;
 
 // ── Dashboard integration ───────────────────────────────────────────
 
@@ -413,14 +429,15 @@ export async function runCocoon(options: CocoonOptions): Promise<void> {
 
 // ── Dashboard: port fallback ────────────────────────────────────────
 
-async function startDashboardWithFallback(
+export async function startDashboardWithFallback(
   startFn: DashboardStarter,
   preferredPort: number,
   authToken: string,
   serverVersion: string
 ): Promise<DashboardHandle> {
   let lastErr: unknown;
-  for (let port = preferredPort; port <= MAX_PORT; port++) {
+  for (let i = 0; i < PORT_FALLBACK_ATTEMPTS; i++) {
+    const port = preferredPort + i;
     try {
       const handle = await startFn({
         port,
@@ -439,8 +456,9 @@ async function startDashboardWithFallback(
       if (!isAddressInUse(err)) throw err;
     }
   }
+  const lastPort = preferredPort + PORT_FALLBACK_ATTEMPTS - 1;
   throw new Error(
-    `No free dashboard port in range ${preferredPort}-${MAX_PORT}: ${
+    `No free dashboard port in the ${PORT_FALLBACK_ATTEMPTS} ports starting at ${preferredPort} (tried ${preferredPort}-${lastPort}): ${
       (lastErr as Error)?.message ?? "unknown"
     }`
   );
