@@ -147,6 +147,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   let port: number | undefined;
   let host: string | undefined;
   let multi = false;
+  let tenant: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--passphrase" && args[i + 1]) {
@@ -160,6 +161,8 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       host = args[++i];
     } else if (args[i] === "--multi") {
       multi = true;
+    } else if (args[i] === "--tenant" && args[i + 1]) {
+      tenant = args[++i];
     } else if (args[i] === "--help" || args[i] === "-h") {
       printDashboardHelp();
       process.exit(0);
@@ -200,6 +203,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
     passphrase,
     port,
     host,
+    ...(tenant !== undefined ? { tenant } : {}),
   });
 
   // Keep the process alive — the HTTP server is listening
@@ -339,6 +343,10 @@ Usage:
 Options:
   --port <port>        Dashboard port (default: from config or 3501; 3500 for --multi)
   --host <host>        Bind address (default: 127.0.0.1)
+  --tenant <name>      Boot against a specific wrapped tenant by the name printed
+                       by \`sanctuary agents\`. Resolves the per-tenant storage
+                       path and Keychain entry automatically. Use this on multi-
+                       tenant hosts instead of guessing SANCTUARY_PASSPHRASE.
   --multi              Start the multi-agent overview instead of a single-tenant
                        dashboard. Does not decrypt any tenant state — scans every
                        tenant on the host and deep-links into per-tenant dashboards.

@@ -41,12 +41,77 @@ import {
   keychainServiceFor,
   PassphraseUnreadableError,
 } from "./cocoon/passphrase.js";
+import { discoverTenants, findTenant, type TenantDescriptor } from "./cli/agents/discovery.js";
 
 export interface StandaloneDashboardOptions {
   passphrase?: string;
   port?: number;
   host?: string;
   configPath?: string;
+  /**
+   * Resolve a tenant by the human-readable name printed by `sanctuary agents`
+   * and boot against its storage path. Wins over `SANCTUARY_STORAGE_PATH`
+   * because the operator typed it explicitly. Throws when no tenant matches.
+   */
+  tenant?: string;
+}
+
+/**
+ * List the tenants visible on this host that the operator could boot against
+ * other than the storage path the current process is already configured for.
+ *
+ * Returns an empty list when no tenants exist or when the current path is the
+ * only thing on disk. Filters out the configured storage path itself so the
+ * "did you mean?" hint never suggests the tenant the user is already pointed
+ * at.
+ */
+export async function discoverableSubTenants(
+  currentStoragePath: string
+): Promise<TenantDescriptor[]> {
+  let all: TenantDescriptor[];
+  try {
+    all = await discoverTenants();
+  } catch {
+    return [];
+  }
+  return all.filter((t) => t.storage_path !== currentStoragePath && t.initialized);
+}
+
+/**
+ * Render the multi-tenant "did you mean?" message that v0.10.4 surfaces
+ * instead of the misleading legacy "set SANCTUARY_PASSPHRASE" hint.
+ *
+ * Exported for unit tests; the wording is part of the contract — operators
+ * have to be able to copy a remediation command out of it.
+ */
+export function renderTenantDiscoveryHint(tenants: TenantDescriptor[]): string {
+  if (tenants.length === 0) {
+    return (
+      `No wrapped tenants discovered on this host.\n` +
+      `Run \`sanctuary wrap\` to create one, or set SANCTUARY_STORAGE_PATH\n` +
+      `if your tenant lives outside ~/.sanctuary/.`
+    );
+  }
+  const lines = tenants.map((t) => {
+    const runtime = t.runtime ? ` (running on :${t.runtime.dashboard_port})` : "";
+    return `  • ${t.name}${runtime}\n      storage: ${t.storage_path}\n      keychain: ${t.keychain_service}`;
+  });
+  if (tenants.length === 1) {
+    return (
+      `Detected 1 wrapped tenant on this host:\n` +
+      lines.join("\n") +
+      `\n\nBoot the dashboard against it with:\n` +
+      `  sanctuary dashboard --tenant ${tenants[0]!.name}\n`
+    );
+  }
+  return (
+    `Detected ${tenants.length} wrapped tenants on this host:\n` +
+    lines.join("\n") +
+    `\n\nPick one explicitly:\n` +
+    `  sanctuary dashboard --tenant <name>\n\n` +
+    `Or browse all of them in the multi-tenant overview (no decryption):\n` +
+    `  sanctuary dashboard --multi\n`
+  );
 }
 
 /**
@@ -61,6 +126,22 @@ export async function startStandaloneDashboard(
 ): Promise<DashboardApprovalChannel> {
   // Force dashboard enabled for this mode
   process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
+
+  // 0. Resolve --tenant before loadConfig so the rest of the boot path picks
+  //    up the per-tenant storage path. Operator-typed --tenant beats env var.
+  if (options.tenant !== undefined) {
+    const match = await findTenant(options.tenant);
+    if (!match) {
+      const available = await discoverTenants();
+      const names = available.map((t) => t.name).join(", ") || "(none — run `sanctuary wrap`)";
+      throw new Error(
+        `Sanctuary Dashboard: --tenant "${options.tenant}" did not match any wrapped tenant.\n` +
+          `Available tenants: ${names}\n` +
+          `List details with \`sanctuary agents\`.`
+      );
+    }
+    process.env.SANCTUARY_STORAGE_PATH = match.storage_path;
+  }
 
   // 1. Load configuration
   const config = await loadConfig(options.configPath);
@@ -147,15 +228,25 @@ export async function startStandaloneDashboard(
     const { stringToBytes, bytesToString, fromBase64url, constantTimeEqual } =
       await import("./core/encoding.js");
 
+    // v0.10.4: before falling into recovery-key handling against a tenant we
+    // could not unlock, check whether the operator probably meant a different
+    // tenant. The most common moltbook failure mode is `sanctuary dashboard`
+    // run with no flag against a default root that has orphan state but no
+    // resolvable passphrase, while sub-tenants exist with their own keychain
+    // entries. Surface those sub-tenants instead of the misleading
+    // "set SANCTUARY_PASSPHRASE" hint that v0.10.1–v0.10.3 produced.
+    const otherTenants = await discoverableSubTenants(config.storage_path);
+
     const existingHash = await storage.read("_meta", "recovery-key-hash");
     if (existingHash) {
       // Recovery key path: existing installation with recovery key
       const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
       if (!envRecoveryKey) {
         throw new Error(
-          "Sanctuary Dashboard: Existing encrypted data found but no credentials provided.\n" +
-          "Provide SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY to start the dashboard.\n" +
-          "The dashboard needs the same credentials as the MCP server to read encrypted data."
+          `Sanctuary Dashboard: Existing encrypted data found at ${config.storage_path} but no credentials provided.\n` +
+          `Provide SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY to start the dashboard against this storage path.\n\n` +
+          (otherTenants.length > 0 ? renderTenantDiscoveryHint(otherTenants) + "\n" : "") +
+          `See server/docs/keychain-schema.md for the keychain layout.`
         );
       }
 
@@ -192,9 +283,23 @@ export async function startStandaloneDashboard(
       const hasKeyParams = existingNamespaces.some(e => e.key === "key-params");
       if (hasKeyParams) {
         throw new Error(
-          "Sanctuary Dashboard: Existing encrypted data found (passphrase-protected).\n" +
-          "Provide SANCTUARY_PASSPHRASE to start the dashboard.\n" +
-          "The dashboard needs the same credentials as the MCP server to read encrypted data."
+          `Sanctuary Dashboard: Existing encrypted data found at ${config.storage_path} (passphrase-protected).\n` +
+          `No passphrase was supplied via --passphrase, SANCTUARY_PASSPHRASE,\n` +
+          `or the per-tenant Keychain item ${keychainServiceFor(config.storage_path, homedir())}.\n\n` +
+          (otherTenants.length > 0 ? renderTenantDiscoveryHint(otherTenants) + "\n" : "") +
+          `See server/docs/keychain-schema.md for the keychain layout and recovery options.`
+        );
+      }
+
+      // v0.10.4: refuse to silently fresh-install over a host that already
+      // has wrapped tenants. Pre-fix the dashboard would generate a brand-new
+      // recovery key in the default root, which made the operator think they
+      // had just lost access to N other tenants.
+      if (otherTenants.length > 0) {
+        throw new Error(
+          `Sanctuary Dashboard: ${config.storage_path} has no Sanctuary state, but other wrapped tenants exist on this host.\n` +
+          `Refusing to generate a new recovery key over the default root — that would obscure the existing tenants.\n\n` +
+          renderTenantDiscoveryHint(otherTenants)
         );
       }
 
@@ -336,23 +441,25 @@ export async function startStandaloneDashboard(
         : passphraseSource === "fallback-file"
         ? "encrypted fallback file"
         : "recovery key";
+    const otherTenants = await discoverableSubTenants(config.storage_path);
+    const hint =
+      otherTenants.length > 0
+        ? `\n     ${renderTenantDiscoveryHint(otherTenants).split("\n").join("\n     ")}\n`
+        : "";
     console.error(
       `\n  ⚠  WARNING: Encrypted identities found but NONE loaded\n` +
         `     ${loadResult.total} encrypted identity file(s) in ${config.storage_path}/state/_identities/\n` +
         `     0 could be decrypted with the master key derived from the ${sourceLabel}.\n\n` +
-        `     The dashboard will show empty panels. Since v0.10.0 each wrapped\n` +
-        `     tenant has its OWN passphrase, stored under a per-tenant Keychain\n` +
-        `     service name. A single SANCTUARY_PASSPHRASE unlocks at most one\n` +
-        `     tenant — it is not a global master credential.\n\n` +
-        `     To diagnose:\n` +
-        `       • List tenants on this host:       sanctuary agents\n` +
-        `       • Multi-tenant overview (no decrypt): sanctuary dashboard --multi\n` +
-        `       • Point at a specific tenant:      SANCTUARY_STORAGE_PATH=<path> sanctuary dashboard\n` +
-        `       • Inspect this tenant's Keychain:  security find-generic-password -s '${service}' -w\n\n` +
-        `     If this tenant's passphrase lives only in a different Keychain item\n` +
-        `     or on another machine, restore it before this dashboard can read\n` +
-        `     any state. Sanctuary will never auto-regenerate — that would\n` +
-        `     permanently destroy the data encrypted under the prior key.\n`
+        `     The dashboard will show empty panels. Each wrapped tenant has its\n` +
+        `     own passphrase under its own per-tenant Keychain service\n` +
+        `     (this tenant's service: ${service}) — there is no global master\n` +
+        `     credential. Setting SANCTUARY_PASSPHRASE here will not help unless\n` +
+        `     that value is the passphrase that originally encrypted the\n` +
+        `     identity files at this storage path.\n` +
+        hint +
+        `\n     Diagnostic recipes: server/docs/keychain-schema.md\n` +
+        `     Sanctuary will never auto-regenerate — that would permanently\n` +
+        `     destroy the data encrypted under the prior key.\n`
     );
   } else if (loadResult.failed > 0) {
     console.error(
