@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.10.4 (2026-04-19)
+
+### Fixed
+- **Standalone dashboard could not boot on a real multi-tenant install.** v0.10.2 shipped a fix that passed CI but did not land in the field — moltbook saw `Identities loaded: 0` through v0.10.1 → v0.10.2 → v0.10.3. Root cause: the keychain entry per storage path (sha256-derived suffix) was correct, but the dashboard's default-root boot path could not reach the per-tenant entries, and its regression test mocked a wrong schema (one entry per identity, which is not how Sanctuary stores anything).
+- `sanctuary dashboard` against a default root with orphan identity files and no resolvable passphrase now refuses with an actionable error that names the storage path and lists the wrapped tenants discoverable on the host. Pre-fix it threw "Provide SANCTUARY_PASSPHRASE" with no further context.
+- `sanctuary dashboard` against a clean default root that has no Sanctuary state but other wrapped tenants now refuses to fresh-install a recovery key over the default root. Pre-fix this obscured the real tenants.
+- `Encrypted identities found but NONE loaded` warning banner rewritten: removed the misleading `SANCTUARY_PASSPHRASE=<your-passphrase>` fix-hint, surfaced other discoverable tenants, and pointed at the new keychain-schema doc.
+
+### Added
+- `sanctuary dashboard --tenant <name>` flag — resolves a tenant by the human-readable name printed by `sanctuary agents`, sets the per-tenant storage path internally, and looks up the matching Keychain item. The multi-tenant-safe boot path operators need.
+- `server/docs/keychain-schema.md` — canonical reference for how Sanctuary stores per-tenant passphrases (macOS Keychain entries, encrypted fallback files), the Argon2id key-derivation flow, the per-purpose HKDF subkeys, the multi-tenant directory layout, and diagnostic recipes.
+- Regression test (`test/dashboard-standalone-v010-4.test.ts`) that builds real identity .enc files via the production `IdentityManager` + AES-256-GCM path and persists per-tenant passphrases via `persistUserProvidedPassphrase` exactly the way `sanctuary wrap` does. No keychain shape is mocked. The tests fail without this patch.
+
+### Internal
+- `discoverableSubTenants(currentStoragePath)` and `renderTenantDiscoveryHint(tenants)` exported from `dashboard-standalone` so the multi-tenant guidance text is unit-testable and reusable from other boot paths.
+- `.test-baseline` floor raised from 1654 → 1661 (+7 regression tests; macOS run reports 1697 passed, but the floor stays Linux-CI-safe per the v0.10.0 rc.2 handoff finding that ~23 darwin-only tests skew MBA-side counts).
+
 ## v0.10.3 (2026-04-19)
 
 ### Changed
