@@ -22,16 +22,23 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { createRequire } from "node:module";
 import type { Broker } from "../l3-disclosure/broker/broker.js";
+import { SANCTUARY_VERSION } from "../config.js";
 import {
   BrokerDeniedError,
   BrokerTokenExpiredError,
   BrokerTokenUnknownError,
 } from "../l3-disclosure/broker/token-issuer.js";
 
-const require = createRequire(import.meta.url);
-const { version: PKG_VERSION } = require("../../package.json");
+// Re-export the shared package version. v0.10.0-rc.2 had an inlined local
+// require of package.json at this file's source depth — correct from src/
+// but one level too high from the bundled server/dist/cli.js, so the
+// broker-server subcommand died at module-load with "Cannot find module".
+// Routing the version through config.SANCTUARY_VERSION keeps the require
+// concern in exactly one file (config.ts), where source-depth and
+// bundle-depth happen to match. See Wiki/status/nsa-soak-report-v010-rc2-2026-04-18.md
+// Finding 1 for the full postmortem.
+const PKG_VERSION = SANCTUARY_VERSION;
 
 export interface BrokerServerOptions {
   /** Caller agent id surfaced in every audit entry. */

@@ -92,7 +92,11 @@ export async function openBroker(opts: OpenBrokerOptions = {}): Promise<{
   return {
     broker,
     close: async () => {
-      // AuditLog persists fire-and-forget; storage is FS so no close needed.
+      // Drain pending audit writes before the caller exits — without this,
+      // CLI invocations that call `process.exit()` immediately after a
+      // broker mutation drop the audit entry mid-write. Storage is FS so
+      // no socket close is needed.
+      await auditLog.flush();
     },
   };
 }
