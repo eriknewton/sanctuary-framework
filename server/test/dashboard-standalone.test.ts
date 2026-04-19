@@ -328,14 +328,16 @@ describe("Standalone Dashboard", () => {
 
       const banner = logs.join("\n");
       expect(banner).toMatch(/Encrypted identities found but NONE loaded/);
-      // v0.10.2: banner must surface the per-tenant Keychain service name
-      // derived from the storage path, not the legacy global
-      // `sanctuary-passphrase` or a generic "set SANCTUARY_PASSPHRASE" fix.
+      // v0.10.4: banner names this tenant's per-tenant Keychain service so
+      // operators can run `security find-generic-password -s <service> -w`.
       expect(banner).toMatch(/sanctuary-passphrase-[0-9a-f]{12}/);
-      // v0.10.2: banner must point operators at the multi-tenant diagnostics
-      // rather than the legacy single-env-var remediation.
-      expect(banner).toMatch(/sanctuary dashboard --multi/);
-      expect(banner).toMatch(/SANCTUARY_STORAGE_PATH=/);
+      // v0.10.4: banner points at the canonical schema doc (which contains
+      // every diagnostic recipe) rather than inlining a remediation
+      // command that may go stale.
+      expect(banner).toMatch(/server\/docs\/keychain-schema\.md/);
+      // v0.10.4: the misleading `SANCTUARY_PASSPHRASE=<your-passphrase>`
+      // hint that v0.10.1–v0.10.3 printed must not return.
+      expect(banner).not.toMatch(/SANCTUARY_PASSPHRASE=<your-passphrase>/);
     } finally {
       console.error = origError;
     }
