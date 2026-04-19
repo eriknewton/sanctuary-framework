@@ -61,6 +61,7 @@ export class AuditLog {
   private readonly maxTotalSizeBytes: number;
   private readonly maxEntries: number;
   private rotationInFlight = false;
+  private readonly pendingWrites = new Set<Promise<void>>();
 
   constructor(storage: StorageBackend, masterKey: Uint8Array, config?: AuditLogConfig) {
     this.storage = storage;
@@ -71,6 +72,15 @@ export class AuditLog {
 
   /**
    * Append an audit entry.
+   *
+   * The on-disk persist is async and tracked via `pendingWrites`. Long-lived
+   * callers (the main MCP server) can ignore that tracking and let writes
+   * drain naturally. Short-lived callers — the `sanctuary secrets` CLI which
+   * `process.exit()`s immediately after returning from a broker mutation —
+   * MUST await `flush()` before exiting, or in-flight writes get killed
+   * with the event loop and the entry is silently lost. That was the
+   * v0.10.0-rc.2 soak failure mode where `secrets audit` returned empty
+   * after a clean 7-verb lifecycle.
    */
   append(
     layer: AuditEntry["layer"],
@@ -90,10 +100,25 @@ export class AuditLog {
 
     this.entries.push(entry);
 
-    // Async persist (fire-and-forget for performance; entries are also in memory)
-    this.persistEntry(entry).catch(() => {
-      // Persistence failure is logged but doesn't block the operation
+    const writePromise = this.persistEntry(entry).catch(() => {
+      // Persistence failure is non-fatal at the call site; flush() callers
+      // see a settled promise either way.
     });
+    this.pendingWrites.add(writePromise);
+    void writePromise.finally(() => this.pendingWrites.delete(writePromise));
+  }
+
+  /**
+   * Wait for every in-flight `append()` persist (and its rotation pass) to
+   * settle. Safe to call multiple times — newly-appended entries during a
+   * flush are also awaited. Re-entrant only at the granularity of "drain
+   * everything queued so far". Short-lived CLIs MUST call this before
+   * `process.exit()` to keep audit writes durable.
+   */
+  async flush(): Promise<void> {
+    while (this.pendingWrites.size > 0) {
+      await Promise.allSettled([...this.pendingWrites]);
+    }
   }
 
   private async persistEntry(entry: AuditEntry): Promise<void> {
@@ -106,8 +131,9 @@ export class AuditLog {
       stringToBytes(JSON.stringify(encrypted))
     );
 
-    // Fire-and-forget rotation check after each persist
-    this.maybeRotate().catch(() => {
+    // Rotation runs as part of the same tracked promise so flush() also
+    // covers any prune-driven deletes.
+    await this.maybeRotate().catch(() => {
       // Rotation failure is non-fatal
     });
   }
