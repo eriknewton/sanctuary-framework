@@ -6,14 +6,14 @@ layout: null
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sanctuary — Sovereignty infrastructure for agents</title>
-<meta name="description" content="Sanctuary is an open-source MCP server that gives AI agents encrypted state, self-custodied identity, human-in-the-loop approval gates, and verifiable reputation. Install with one command — no changes to your agent harness.">
+<title>Sanctuary — Your agent. Your machine. Your keys.</title>
+<meta name="description" content="Sanctuary gives an AI agent encrypted memory, an approval dashboard for dangerous actions, and a portable cryptographic identity — in one MCP server, runnable with npx. No harness changes, no platform dependency.">
 <meta name="author" content="Erik Newton">
 <meta name="theme-color" content="#0b1326">
 
 <!-- Open Graph -->
-<meta property="og:title" content="Sanctuary — Sovereignty infrastructure for agents">
-<meta property="og:description" content="Encrypted state. Self-custodied identity. Approval gates. Portable reputation. One MCP server. Install in seconds.">
+<meta property="og:title" content="Sanctuary — Your agent. Your machine. Your keys.">
+<meta property="og:description" content="An MCP server that adds encrypted state, approval gates, and a portable identity to any AI agent. Runs locally. Apache-2.0. Install with npx.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sanctuaryprotocol.ai/">
 <meta property="og:site_name" content="Sanctuary Protocol">
@@ -61,25 +61,27 @@ layout: null
   <section class="hero container" aria-labelledby="hero-title">
     <div class="hero__eyebrow">
       <span class="hero__eyebrow-dot" aria-hidden="true"></span>
-      <span class="eyebrow">Open source · Apache-2.0 · v0.6.0</span>
+      <span class="eyebrow">Open source · Apache-2.0 · v0.10.3</span>
     </div>
 
     <h1 id="hero-title" class="hero__title">
-      Sovereignty infrastructure<br>
-      for <span class="text-gradient">agents</span>.
+      Your agent.<br>
+      Your machine.<br>
+      Your <span class="text-gradient">keys</span>.
     </h1>
 
     <p class="hero__sub">
-      Sanctuary is an MCP server that gives your agent encrypted state, self-custodied identity,
-      human-in-the-loop approval gates, and portable reputation. Drop it in any harness — Claude
-      Code, OpenClaw, CrewAI, LangChain — without touching your agent code.
+      Sanctuary gives an AI agent encrypted memory, an approval dashboard for dangerous actions,
+      and a portable cryptographic identity — in one MCP server, runnable with
+      <code class="mono">npx</code>. Drop it in any harness — Claude Code, OpenClaw, CrewAI,
+      LangChain — without touching your agent code.
     </p>
 
     <!-- Install block -->
     <div class="install surface-card">
       <div class="install__label">
         <span>Install</span>
-        <span>Node 18+ · macOS · Linux · Windows</span>
+        <span>Node 22+ · macOS · Linux · Windows</span>
       </div>
       <div class="install__row">
         <code class="install__cmd mono"><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server</code>
@@ -98,8 +100,8 @@ layout: null
     </div>
 
     <div class="hero__stats" aria-label="Project stats">
-      <div class="hero__stat"><strong>62</strong><span>MCP tools</span></div>
-      <div class="hero__stat"><strong>661</strong><span>Passing tests</span></div>
+      <div class="hero__stat"><strong>75</strong><span>MCP tools</span></div>
+      <div class="hero__stat"><strong>1,690</strong><span>Passing tests</span></div>
       <div class="hero__stat"><strong>4</strong><span>Sovereignty layers</span></div>
       <div class="hero__stat"><strong>0</strong><span>Harness changes</span></div>
     </div>
@@ -481,7 +483,7 @@ sanctuary = MCPTool.from_stdio(
       <div>© 2026 Erik Newton. Apache-2.0 (code) / CC-BY-4.0 (specification).</div>
       <div class="footer__status">
         <span class="footer__status-dot" aria-hidden="true"></span>
-        <span>v0.6.0 · live on npm</span>
+        <span>v0.10.3 · live on npm</span>
       </div>
     </div>
   </div>
