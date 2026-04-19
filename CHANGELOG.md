@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.10.3 (2026-04-19)
+
+### Changed
+- README hero rewritten for clarity: replaces "Security, privacy, and control for your AI agent." with "Your agent. Your machine. Your keys." and a concrete subhead naming the three things Sanctuary ships (encrypted memory, approval dashboard, portable cryptographic identity).
+- New "Why this matters" section earns the "sovereignty" framing after the value prop lands, rather than leading with the abstraction.
+- npm package description rewritten to match the new hero — "Your agent, your machine, your keys — an MCP server that adds encrypted state, approval gates, and a portable identity to any AI agent." (previous copy trained readers to mis-file the project as security architecture.)
+
+No code changes. Messaging-clarity patch only.
+
 ## v0.9.0-rc.3 (unreleased — in progress)
 
 ### Fixed

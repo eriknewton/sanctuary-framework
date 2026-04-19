@@ -1,8 +1,12 @@
 # Sanctuary Framework
 
-**Security, privacy, and control for your AI agent.**
+**Your agent. Your machine. Your keys.**
 
-Your agent handles sensitive data, makes decisions, and talks to other agents. Sanctuary makes sure you're in control.
+Sanctuary gives an AI agent encrypted memory, an approval dashboard for dangerous actions, and a portable cryptographic identity — in one MCP server, runnable with `npx`.
+
+### Why this matters
+
+Most AI infrastructure asks you to surrender the agent's memory, identity, and audit trail to a platform. Sanctuary is the opposite bet: your agent runs where you run, signs what it does, and carries its reputation as portable evidence. We call that sovereignty — but you don't need to agree with the word to use the tool.
 
 ---
 
