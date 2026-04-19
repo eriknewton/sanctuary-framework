@@ -22,6 +22,7 @@
  */
 
 import { mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import { loadConfig, SANCTUARY_VERSION } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
 import { AuditLog } from "./l2-operational/audit-log.js";
@@ -35,6 +36,11 @@ import { IdentityManager } from "./l1-cognitive/tools.js";
 import type { HandshakeResult } from "./handshake/types.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
 import { writeTenantRuntime, clearTenantRuntime } from "./cli/agents/runtime.js";
+import {
+  readStoredPassphrase,
+  keychainServiceFor,
+  PassphraseUnreadableError,
+} from "./cocoon/passphrase.js";
 
 export interface StandaloneDashboardOptions {
   passphrase?: string;
@@ -66,8 +72,41 @@ export async function startStandaloneDashboard(
   const storage = new FilesystemStorage(`${config.storage_path}/state`);
 
   // 4. Derive or load master key (same logic as index.ts)
+  //
+  // v0.10.2: when no explicit passphrase is given via options or env var,
+  // fall back to the per-tenant Keychain / fallback-file lookup keyed off
+  // `config.storage_path` (same path `sanctuary wrap` and the broker use).
+  // This lets `sanctuary dashboard` boot against a wrapped tenant without
+  // forcing the user to re-type — or re-paste — the passphrase the wrap
+  // already persisted. Multi-tenant hosts with N per-tenant Keychain items
+  // (service `sanctuary-passphrase-<12hex>`) no longer require a single
+  // `SANCTUARY_PASSPHRASE` that can only unlock one tenant.
   let masterKey: Uint8Array;
-  const passphrase = options.passphrase ?? process.env.SANCTUARY_PASSPHRASE;
+  let passphrase = options.passphrase ?? process.env.SANCTUARY_PASSPHRASE;
+  let passphraseSource: "option" | "env" | "keychain" | "fallback-file" | null = null;
+  if (passphrase) {
+    passphraseSource = options.passphrase !== undefined ? "option" : "env";
+  } else {
+    try {
+      const stored = await readStoredPassphrase({
+        storagePath: config.storage_path,
+      });
+      if (stored) {
+        passphrase = stored.value;
+        passphraseSource = stored.source === "keychain" ? "keychain" : "fallback-file";
+        console.error(
+          `Passphrase: loaded from ${stored.location} (service ${keychainServiceFor(config.storage_path, homedir())})`
+        );
+      }
+    } catch (err) {
+      if (err instanceof PassphraseUnreadableError) {
+        // Never auto-regenerate — rethrow so the operator sees the same
+        // remediation steps the wrap CLI prints.
+        throw err;
+      }
+      // Non-fatal: fall through to the recovery-key path below.
+    }
+  }
 
   if (passphrase) {
     // Passphrase path: derive master key via Argon2id
@@ -84,6 +123,24 @@ export async function startStandaloneDashboard(
 
     const result = await deriveMasterKey(passphrase, existingParams);
     masterKey = result.key;
+
+    // v0.10.2: persist derivation params on first run, matching the MCP
+    // server (index.ts) and broker (l3-disclosure/broker/open.ts) paths.
+    // The standalone dashboard used to assume the MCP server would write
+    // `_meta/key-params` first, so it only ever READ them. With the new
+    // Keychain-autoload boot path `sanctuary dashboard` can now be the
+    // first component to run on a machine — if it derives against a
+    // random salt without persisting, the next boot will derive a
+    // DIFFERENT master key from the same passphrase and fail to decrypt
+    // everything this boot just wrote.
+    if (!existingParams) {
+      const { stringToBytes } = await import("./core/encoding.js");
+      await storage.write(
+        "_meta",
+        "key-params",
+        stringToBytes(JSON.stringify(result.params))
+      );
+    }
   } else {
     // Recovery key path
     const { hashToString } = await import("./core/hashing.js");
@@ -219,6 +276,23 @@ export async function startStandaloneDashboard(
     profileStore,
   });
   dashboard.setStandaloneMode(true);
+
+  // v0.10.2 — loopback auto-auth: the passphrase that unlocked at least
+  // one identity above is strictly stronger than the dashboard bearer
+  // token (which lives only in memory and is re-generated on restart).
+  // Once terminal-side auth has succeeded, requiring the operator to paste
+  // that same passphrase into a browser form on localhost is pure friction
+  // and trains the wrong habit. Skip the login prompt for loopback callers
+  // when (a) the dashboard binds a loopback interface AND (b) at least one
+  // identity decrypted. Remote callers keep the bearer-token requirement.
+  const hostIsLoopback =
+    dashboardHost === "127.0.0.1" ||
+    dashboardHost === "::1" ||
+    dashboardHost === "localhost";
+  if (hostIsLoopback && loadResult.loaded > 0) {
+    dashboard.setAutoAuthLocalhost(true);
+  }
+
   await dashboard.start();
 
   // Advertise this tenant's dashboard to `sanctuary agents` + multi-agent
@@ -251,20 +325,34 @@ export async function startStandaloneDashboard(
 
   // 9a. Warn loudly if encrypted identity files exist but none could be decrypted
   if (loadResult.total > 0 && loadResult.loaded === 0) {
+    const service = keychainServiceFor(config.storage_path, homedir());
+    const sourceLabel =
+      passphraseSource === "option"
+        ? "--passphrase option"
+        : passphraseSource === "env"
+        ? "SANCTUARY_PASSPHRASE env var"
+        : passphraseSource === "keychain"
+        ? `macOS Keychain (service ${service})`
+        : passphraseSource === "fallback-file"
+        ? "encrypted fallback file"
+        : "recovery key";
     console.error(
-      "\n╔══════════════════════════════════════════════════════════════╗\n" +
-      "║  ⚠  WARNING: Encrypted identities found but NONE loaded     ║\n" +
-      "╠══════════════════════════════════════════════════════════════╣\n" +
-      `║  ${loadResult.total} encrypted identity file(s) found on disk              ║\n` +
-      "║  0 could be decrypted with the current master key            ║\n" +
-      "║                                                              ║\n" +
-      "║  This usually means SANCTUARY_PASSPHRASE is missing or       ║\n" +
-      "║  incorrect. The dashboard will show empty panels.            ║\n" +
-      "║                                                              ║\n" +
-      "║  To fix: restart with the correct SANCTUARY_PASSPHRASE:      ║\n" +
-      "║    SANCTUARY_PASSPHRASE=<your-passphrase> npx \\              ║\n" +
-      "║      @sanctuary-framework/mcp-server dashboard               ║\n" +
-      "╚══════════════════════════════════════════════════════════════╝\n"
+      `\n  ⚠  WARNING: Encrypted identities found but NONE loaded\n` +
+        `     ${loadResult.total} encrypted identity file(s) in ${config.storage_path}/state/_identities/\n` +
+        `     0 could be decrypted with the master key derived from the ${sourceLabel}.\n\n` +
+        `     The dashboard will show empty panels. Since v0.10.0 each wrapped\n` +
+        `     tenant has its OWN passphrase, stored under a per-tenant Keychain\n` +
+        `     service name. A single SANCTUARY_PASSPHRASE unlocks at most one\n` +
+        `     tenant — it is not a global master credential.\n\n` +
+        `     To diagnose:\n` +
+        `       • List tenants on this host:       sanctuary agents\n` +
+        `       • Multi-tenant overview (no decrypt): sanctuary dashboard --multi\n` +
+        `       • Point at a specific tenant:      SANCTUARY_STORAGE_PATH=<path> sanctuary dashboard\n` +
+        `       • Inspect this tenant's Keychain:  security find-generic-password -s '${service}' -w\n\n` +
+        `     If this tenant's passphrase lives only in a different Keychain item\n` +
+        `     or on another machine, restore it before this dashboard can read\n` +
+        `     any state. Sanctuary will never auto-regenerate — that would\n` +
+        `     permanently destroy the data encrypted under the prior key.\n`
     );
   } else if (loadResult.failed > 0) {
     console.error(
