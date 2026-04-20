@@ -173,6 +173,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.dashboardHTML = generateDashboardHTML({
       timeoutSeconds: config.timeout_seconds,
       serverVersion: PKG_VERSION,
+      // Construction-time default; real value is set by setAutoAuthLocalhost()
+      // below (which regenerates this HTML). Default false preserves the
+      // pre-v0.10.6 remote-deployment behavior when auto-auth is not enabled.
+      loopbackAutoAuth: this._autoAuthLocalhost,
     });
     this.loginHTML = generateLoginHTML({ serverVersion: PKG_VERSION });
     // SEC-012: Periodic cleanup of expired sessions (every 60s)
@@ -222,6 +226,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   setAutoAuthLocalhost(enabled: boolean): void {
     this._autoAuthLocalhost = enabled;
+    // v0.10.6: the dashboard HTML embeds a LOOPBACK_AUTH constant that mirrors
+    // this flag so the client-side init gate knows not to redirect-loop when
+    // sessionStorage is empty. Regenerate the HTML here because construction
+    // happens before the caller decides whether to enable auto-auth.
+    this.dashboardHTML = generateDashboardHTML({
+      timeoutSeconds: this.config.timeout_seconds,
+      serverVersion: PKG_VERSION,
+      loopbackAutoAuth: this._autoAuthLocalhost,
+    });
   }
 
   /**
