@@ -32,6 +32,30 @@ function randomPort(): number {
   return 17000 + Math.floor(Math.random() * 30000);
 }
 
+/**
+ * Retry-safe wrapper around `startStandaloneDashboard` for tests.
+ *
+ * `dashboard.start()` rejects with `EADDRINUSE` when its bound port collides
+ * with another concurrent vitest worker (we share the host's port space and
+ * vitest fans tests out over multiple processes). Retry on EADDRINUSE only —
+ * any other failure is a real bug and must surface.
+ */
+async function startWithRetry(
+  options: Parameters<typeof startStandaloneDashboard>[0]
+): Promise<{ dashboard: DashboardApprovalChannel; port: number }> {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const port = randomPort();
+    try {
+      const dashboard = await startStandaloneDashboard({ ...options, port });
+      return { dashboard, port };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EADDRINUSE") continue;
+      throw err;
+    }
+  }
+  throw new Error("startStandaloneDashboard: no free port after 6 attempts");
+}
+
 async function seedTenant(storagePath: string, passphrase: string): Promise<void> {
   await mkdir(join(storagePath, "state"), { recursive: true, mode: 0o700 });
   await persistUserProvidedPassphrase(passphrase, {
@@ -122,12 +146,12 @@ describe("v0.10.5: dashboard panels populate — route table matches HTML calls"
     await seedTenant(root, "v010-5-passphrase");
     process.env.SANCTUARY_STORAGE_PATH = root;
 
-    const port = randomPort();
-    dashboard = await startStandaloneDashboard({
+    const started = await startWithRetry({
       passphrase: "v010-5-passphrase",
-      port,
       host: "127.0.0.1",
     });
+    dashboard = started.dashboard;
+    const port = started.port;
 
     // Loopback auto-auth is on (loaded > 0), so no Authorization header
     // is needed for any of these requests — exactly the conditions
@@ -206,12 +230,12 @@ describe("v0.10.5: dashboard panels populate — route table matches HTML calls"
     await seedTenant(root, "v010-5-sse-pass");
     process.env.SANCTUARY_STORAGE_PATH = root;
 
-    const port = randomPort();
-    dashboard = await startStandaloneDashboard({
+    const started = await startWithRetry({
       passphrase: "v010-5-sse-pass",
-      port,
       host: "127.0.0.1",
     });
+    dashboard = started.dashboard;
+    const port = started.port;
 
     const indexRes = await fetch(`http://127.0.0.1:${port}/`);
     const html = await indexRes.text();
@@ -245,12 +269,12 @@ describe("v0.10.5: dashboard panels populate — route table matches HTML calls"
     await seedTenant(root, "v010-5-sov-pass");
     process.env.SANCTUARY_STORAGE_PATH = root;
 
-    const port = randomPort();
-    dashboard = await startStandaloneDashboard({
+    const started = await startWithRetry({
       passphrase: "v010-5-sov-pass",
-      port,
       host: "127.0.0.1",
     });
+    dashboard = started.dashboard;
+    const port = started.port;
 
     const res = await fetch(`http://127.0.0.1:${port}/api/sovereignty`);
     expect(res.status).toBe(200);
