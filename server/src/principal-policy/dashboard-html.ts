@@ -260,6 +260,15 @@ export function generateDashboardHTML(options: {
   serverVersion: string;
   // SEC-056: authToken parameter removed entirely from function signature.
   // The client uses sessionStorage (set during login flow) for API authentication.
+  // v0.10.6: mirror the server's loopback auto-auth decision to the client so
+  // the init-time auth gate doesn't redirect-loop when sessionStorage is empty
+  // on a fresh tab. See dashboard.ts:isAuthenticated() — when _autoAuthLocalhost
+  // is true and the caller is a loopback address, the server serves the
+  // dashboard HTML without a bearer token. Without a client-side mirror of
+  // that decision, the inline init() sees empty sessionStorage.authToken and
+  // redirects to '/', which is the same URL, which loads the dashboard again,
+  // which redirects again — the v0.10.5 reload-loop bug.
+  loopbackAutoAuth: boolean;
 }): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1799,6 +1808,11 @@ export function generateDashboardHTML(options: {
     // SEC-038: Do NOT embed the long-lived auth token in page source.
     // Use only the session token stored in sessionStorage by the login flow.
     const AUTH_TOKEN = sessionStorage.getItem('authToken') || '';
+    // v0.10.6: server-baked flag mirroring _autoAuthLocalhost. When true,
+    // the init-time auth gate does NOT redirect to '/' on empty AUTH_TOKEN,
+    // because the server already admitted this loopback caller without a
+    // bearer token. See dashboard-html.ts generateDashboardHTML() doc.
+    const LOOPBACK_AUTH = ${JSON.stringify(options.loopbackAutoAuth === true)};
     const TIMEOUT_SECONDS = ${options.timeoutSeconds};
     const API_BASE = '';
 
@@ -2906,7 +2920,13 @@ export function generateDashboardHTML(options: {
 
     // Initialize
     async function initialize() {
-      if (!AUTH_TOKEN) {
+      // v0.10.6: gate on BOTH sessionStorage and the server-baked loopback
+      // auto-auth mirror. Pre-fix, a fresh loopback tab had empty
+      // sessionStorage.authToken AND was admitted by the server via
+      // _autoAuthLocalhost — this single-operand gate redirected to '/'
+      // which reloaded the same page, which redirected again, infinitely.
+      // See generateDashboardHTML() header comment for full threat model.
+      if (!AUTH_TOKEN && !LOOPBACK_AUTH) {
         redirectToLogin();
         return;
       }

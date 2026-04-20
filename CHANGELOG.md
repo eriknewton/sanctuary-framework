@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.10.6 (2026-04-20)
+
+### Fixed
+- **Standalone dashboard reload-loop on a fresh browser tab under loopback auto-auth.** Field signal: moltbook on v0.10.5 confirmed the SSE URL fix (`/api/events` → `/events`) landed cleanly — every documented endpoint returns real data (`/events` streams, `/api/sovereignty-profile` = 200, `/api/proxy/servers` = 200). But the UI still did not render. Mac Mini devtools Network capture (Web Inspector, preserve-log ON) showed the real shape: dozens of identical ~82.91 KB `127.0.0.1` document requests stacked at page-open, zero `fetch(...)` or `EventSource(...)` traffic. A tight client-side reload loop before any data-fetch fires.
+- Root cause: `initialize()` in `server/src/principal-policy/dashboard-html.ts` gated on `sessionStorage.authToken` with `if (!AUTH_TOKEN) { redirectToLogin(); return; }` (line 2909). On a fresh tab at `127.0.0.1:PORT/`, `sessionStorage` is always empty, so `AUTH_TOKEN === ''` and `redirectToLogin()` fires, setting `window.location.href = '/'`. The server serves the dashboard HTML (not the login page) because `isAuthenticated()` recognizes loopback callers under `_autoAuthLocalhost` (`dashboard.ts:458`). Same URL, same server, same auto-auth → HTML served again → JS runs again → still empty sessionStorage → redirect again. **Infinite.**
+- Server-side loopback auto-auth, no client-side mirror. The fix adds a `loopbackAutoAuth: boolean` option to `generateDashboardHTML`, emits `const LOOPBACK_AUTH = <bool>;` alongside `AUTH_TOKEN` at template boot, and changes the init gate to `if (!AUTH_TOKEN && !LOOPBACK_AUTH)`. `dashboard.setAutoAuthLocalhost()` now regenerates the cached HTML since the flag is decided after construction.
+
+### Added
+- Regression test (`test/dashboard-standalone-v010-6.test.ts`, 4 tests) that exercises the browser init path the v0.10.5 test gap missed. Boots a real dashboard against a real seeded tenant, fetches the served HTML, asserts `LOOPBACK_AUTH = true` is embedded, and executes the actual init gate against stubbed browser globals (empty `sessionStorage`, recording `window.location.href` assignments) to prove no redirect fires. Includes the flip-side assertion: with `loopbackAutoAuth=false` and empty sessionStorage, the gate MUST still redirect to the login page (remote-deployment guard).
+- All 4 tests fail on v0.10.5 HEAD (`dcfa4c8`) and pass after the patch — both directions verified before merge.
+
+### Notes
+- Test-coverage gap, not test-correctness bug: v0.10.5's `dashboard-standalone-v010-5.test.ts` regex-extracted URLs from the served HTML and HTTP-requested each. All routes returned non-4xx — correct. But Node has no `sessionStorage`, so the test never exercised the client-side `initialize()` path where empty sessionStorage triggered the redirect before any fetch fired. v0.10.6 closes this by executing the gate against realistic inputs, not just asserting route mounting.
+- Fix shape chosen: server-baked flag mirror, rejecting the alternative "remove the init gate entirely and let per-fetch 401 handlers drive redirects." Gate-removal would create a brief window where several parallel fetches each 401 and each queue a redirect before the first `location.href = '/'` navigation takes effect — noisy in devtools logs and harder to reason about than the explicit flag. The flag shape is also consistent with how the rest of the codebase mirrors server-side decisions (timeout, server version, API base) into inline template constants.
+- `.test-baseline` floor raised from 1664 → 1668 (+4 regression tests). Linux-CI-safe floor; macOS reports 1704.
+
 ## v0.10.5 (2026-04-19)
 
 ### Fixed
