@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.10.5 (2026-04-19)
+
+### Fixed
+- **Standalone dashboard panels stuck on "Loading…" even after v0.10.4 loaded identities.** Field signal: moltbook on v0.10.4 reported `Identities loaded: 8` (the v0.10.4 acceptance) but every panel in the browser stayed empty and the status bar flashed blue in a retry loop. Root cause: the dashboard HTML's SSE setup pointed `EventSource` at `/api/events`, but Stack A's server mounts SSE at `/events` (server/src/principal-policy/dashboard.ts:688). Every dashboard boot from v0.10.0 through v0.10.4 sent EventSource into a 404 retry loop. The same code also passed `{ headers: { Authorization: ... } }` to the EventSource constructor, which the standard browser API silently drops — auth has to travel as a cookie or `?session=` query param for SSE.
+- The fix is a minimum-change edit: change the URL from `/api/events` to `/events`, drop the broken headers option. The fortress-view dashboard (server/src/cocoon/fortress-view.ts) already does it this way; this commit brings the standard dashboard into line.
+
+### Added
+- Regression test (`test/dashboard-standalone-v010-5.test.ts`, 3 tests) that boots a real dashboard against a real seeded tenant, fetches the served HTML, regex-extracts every fetch + EventSource target, then HTTP-requests each one against the running server. **No route table is mocked.** The test fails on v0.10.4 HEAD with `EventSource -> /api/events returned 404` and passes after the patch. Same anti-pattern guard the v0.10.4 regression test established for identity loading, applied to the data-surface contract.
+
+### Notes
+- v0.10.5 closes the route-table mismatch only. The Stack A vs Stack B architectural question (the standalone dashboard mounts the older "Principal Dashboard" stack from `server/src/principal-policy/`, while a newer "Protection Dashboard" stack in `server/src/dashboard/` is documented but not mounted) is **out of scope** here per the spawn prompt's hard-stop rule, and remains an open coordinator-level question.
+- Moltbook's three `curl` 404s on `/api/health`, `/api/snapshot`, and `/api/agents` were Stack B routes — correct behaviour for what's actually running, unrelated to the panel-population failure. Documented in the PR audit trail.
+- `.test-baseline` floor raised from 1661 → 1664 (+3 regression tests). Linux-CI-safe floor; macOS reports 1700.
+
 ## v0.10.4 (2026-04-19)
 
 ### Fixed
