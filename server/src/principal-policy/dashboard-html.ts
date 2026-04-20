@@ -2203,11 +2203,20 @@ export function generateDashboardHTML(options: {
 
     // SSE Setup
     function setupSSE() {
-      const eventSource = new EventSource(API_BASE + '/api/events', {
-        headers: {
-          'Authorization': 'Bearer ' + AUTH_TOKEN,
-        },
-      });
+      // v0.10.5: the standard browser EventSource API does not support a
+      // headers option — it is silently dropped. Auth must travel as a
+      // cookie (set by /auth/session and sent automatically by the
+      // browser) or as a ?session= query parameter, both of which Stack
+      // A's checkAuth honours. Loopback callers also bypass auth via the
+      // v0.10.2 _autoAuthLocalhost path, which is the path moltbook
+      // hits when the dashboard is auto-opened on 127.0.0.1.
+      //
+      // The endpoint itself is /events — Stack A's route table mounts it
+      // there, and the previous /api/events URL was a 404 in every real
+      // boot from v0.10.0 through v0.10.4. The retry loop that result
+      // produced is exactly the "status bar flashing blue continuously"
+      // moltbook reported on v0.10.4.
+      const eventSource = new EventSource(API_BASE + '/events');
 
       eventSource.addEventListener('init', (e) => {
         console.log('Connected to SSE');
