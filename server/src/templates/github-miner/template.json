@@ -1,0 +1,8 @@
+{
+  "name": "github-miner",
+  "version": "1.0.0",
+  "channel": "read-outputs-only",
+  "tier": "B",
+  "target_archetype": "A Tier B adapter-wrapped data-mining sub-agent that reads from the GitHub API to surface repository, issue, and pull request insights. Write-only to the outputs slot; the operator orchestrator consumes results.",
+  "description": "GitHub data-mining sub-agent: reads from GitHub API, writes research outputs. Read-only output surface, no credentials sync."
+}

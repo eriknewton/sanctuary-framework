@@ -273,3 +273,36 @@ code {
   overflow-y: auto;
 }
 .envelope-dialog::backdrop { background: rgba(0,0,0,0.3); }
+
+/* ── Template Picker ──────────────────────────────────────────── */
+
+.template-card-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+.template-card {
+  border: 1px solid #cdd2db;
+  border-radius: 6px;
+  padding: 12px;
+  background: #fff;
+  transition: border-color 0.15s;
+}
+.template-card:hover {
+  border-color: #3b82f6;
+  background: #f8faff;
+}
+.scaffold-readonly { border: 1px solid #e5e7eb; border-radius: 4px; padding: 12px; }
+.scaffold-readonly legend { font-weight: 600; font-size: 13px; }
+.policy-preview {
+  font-family: monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  max-height: 180px;
+  overflow-y: auto;
+  background: #f0f2f5;
+  padding: 8px;
+  border-radius: 4px;
+}
+.form-actions { display: flex; gap: 8px; justify-content: flex-end; }

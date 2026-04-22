@@ -428,10 +428,11 @@ describe("AC10: No popups, modals, sounds, or notifications", () => {
     );
     const html = await readFile(join(publicDir, "index.html"), "utf-8");
     const dialogMatches = html.match(/<dialog/g) || [];
-    expect(dialogMatches.length).toBeLessThanOrEqual(1);
-    // The dialog is for envelope inspection, not operational notifications
-    if (dialogMatches.length === 1) {
-      expect(html).toContain("envelope-dialog");
+    expect(dialogMatches.length).toBeLessThanOrEqual(2);
+    // Dialogs are for envelope inspection and template-picker scaffold flow
+    expect(html).toContain("envelope-dialog");
+    if (dialogMatches.length >= 2) {
+      expect(html).toContain("template-picker-dialog");
     }
   });
 });

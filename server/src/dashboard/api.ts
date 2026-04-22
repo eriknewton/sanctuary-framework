@@ -6,6 +6,7 @@
  * layer (node:http) and tests can exercise the same code paths.
  */
 
+import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type {
   AggregatorSources,
@@ -15,7 +16,9 @@ import type {
 } from "./aggregator.js";
 import { getProtectionSnapshot } from "./aggregator.js";
 import { renderDashboardHTML } from "./html.js";
-import { listTemplates, getTemplateEntry } from "../templates/registry.js";
+import { listTemplates, getTemplateEntry, getTemplate } from "../templates/registry.js";
+import { initTemplate } from "../templates/init.js";
+import type { TemplateName } from "../templates/registry.js";
 
 export interface ApprovalHandlers {
   allow: (id: string) => Promise<boolean>;
@@ -28,6 +31,14 @@ export interface APIDeps {
   approvals?: ApprovalHandlers;
   /** Register a listener; returns an unsubscribe fn. */
   onEvent?: (listener: (event: StreamEvent) => void) => () => void;
+  /** Node ID for signed-event emissions (template init). */
+  nodeId?: string;
+  /** Node's Ed25519 private key for signing (template init). */
+  nodePrivateKey?: Uint8Array;
+  /** Principal ID for signed-event emissions (template init). */
+  principalId?: string;
+  /** Fortress ID for template init. */
+  fortressId?: string;
 }
 
 export interface StreamEvent {
@@ -72,6 +83,28 @@ function writeJSON(res: ServerResponse, status: number, payload: unknown): void 
     "Cache-Control": "no-store",
   });
   res.end(JSON.stringify(payload));
+}
+
+async function readJSONBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  const MAX = 256 * 1024;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX) throw new Error("request body too large");
+    chunks.push(chunk as Buffer);
+  }
+  const body = Buffer.concat(chunks).toString("utf-8");
+  if (!body) return {};
+  return JSON.parse(body) as Record<string, unknown>;
+}
+
+/**
+ * Generate an ephemeral 32-byte key for dashboard-initiated signing
+ * when no persistent node key is configured.
+ */
+function generateEphemeralKey(): Uint8Array {
+  return new Uint8Array(randomBytes(32));
 }
 
 function writeText(res: ServerResponse, status: number, body: string, contentType = "text/plain"): void {
@@ -175,6 +208,73 @@ export async function handleRequest(
     } catch (err) {
       writeJSON(res, 500, {
         error: "template_load_failed",
+        message: (err as Error).message,
+      });
+    }
+    return true;
+  }
+
+  // ── Template init (POST) ───────────────────────────────────────────
+  const initMatch = /^\/api\/templates\/([^/]+)\/init$/.exec(path);
+  if (method === "POST" && initMatch) {
+    const name = decodeURIComponent(initMatch[1]!);
+    try {
+      // Validate template exists
+      const bundle = getTemplate(name);
+      if (!bundle) {
+        writeJSON(res, 404, { error: "template_not_found", name });
+        return true;
+      }
+
+      // Read request body
+      const body = await readJSONBody(req);
+
+      // Validate required fields
+      if (!body.agent_name || typeof body.agent_name !== "string") {
+        writeJSON(res, 400, {
+          error: "validation_error",
+          message: "agent_name is required and must be a string",
+        });
+        return true;
+      }
+
+      // Validate agent_name format (alphanumeric, hyphens, underscores)
+      if (!/^[a-zA-Z0-9_-]+$/.test(body.agent_name)) {
+        writeJSON(res, 400, {
+          error: "validation_error",
+          message: "agent_name must contain only alphanumeric characters, hyphens, and underscores",
+        });
+        return true;
+      }
+
+      // Build init params, routing through the same code path as CLI
+      const nodeId = deps.nodeId ?? "dashboard-node";
+      const nodePrivateKey = deps.nodePrivateKey ?? generateEphemeralKey();
+      const principalId = deps.principalId ?? "dashboard-principal";
+      const fortressId = deps.fortressId ?? "default";
+
+      const result = initTemplate({
+        template_name: name as TemplateName,
+        agent_id: body.agent_name,
+        fortress_id: fortressId,
+        counterparty: "*",
+        policy_version: 1,
+        emitter_node: nodeId,
+        emitter_principal: principalId,
+        monotonic_seq: 1,
+        node_private_key: nodePrivateKey,
+      });
+
+      writeJSON(res, 200, {
+        agent_id: body.agent_name,
+        signed_event_id: result.signed_event.event_id,
+        policy_version: result.compiled.policy_version,
+        template_name: name,
+        attestation_panel_url: `/console#agent_roster`,
+      });
+    } catch (err) {
+      writeJSON(res, 500, {
+        error: "template_init_failed",
         message: (err as Error).message,
       });
     }
