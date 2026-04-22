@@ -34,4 +34,6 @@ export { CompositionService } from "./composition-service.js";
 export type {
   FortressContextInput,
   HistoricalSidecarPubkey,
+  EmitForCommitmentInput,
+  EmitForCommitmentResult,
 } from "./composition-service.js";

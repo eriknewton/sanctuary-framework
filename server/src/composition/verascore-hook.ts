@@ -54,6 +54,16 @@ export interface VerascorePublishOptions {
 /**
  * Publish a Verascore reputation signal for a commitment close event.
  *
+ * @deprecated for production use as of WP-MVP-10 Follow-up #2a.
+ *
+ * Production callers should use `CompositionService.emitForCommitment()`
+ * (canonical) or `CompositionService.publishVerascoreSignal()` (which defaults
+ * the signingKey to the HKDF-derived sidecar signing key when omitted). This
+ * free function still accepts an explicit signing key for test fixtures and
+ * migration paths, and remains importable, but new production code should
+ * route through the class method so the HKDF-anchoring is preserved by
+ * default.
+ *
  * @param config Composition config (for default scope)
  * @param options Publish options
  * @returns The published VerascoreSignal
