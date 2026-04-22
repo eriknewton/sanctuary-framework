@@ -270,7 +270,7 @@ const REGISTRY: Record<ChannelTemplateId, ChannelTemplateRegistryEntry> = {
     id: "escrow-handoff",
     label: "Escrow handoff",
     description:
-      "Escrow-style handoff — counterparty reads plan, reads + subscribes to outputs, and the intra-mesh-escrow commitment class is declared. Memory and credentials remain hermetic.",
+      "Escrow-style handoff. Counterparty reads plan, reads + subscribes to outputs, and the intra-mesh-escrow commitment class is declared. Memory and credentials remain hermetic.",
     factory: escrowHandoff,
   },
 };
