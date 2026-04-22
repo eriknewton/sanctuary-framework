@@ -22,3 +22,19 @@ export * from "./audit-batch.js";
 export * from "./router.js";
 export * from "./in-memory-transport.js";
 export { canonicalize, canonicalizeToBytes } from "./canonical-json.js";
+export {
+  Libp2pMeshTransport,
+  AGENT_STATE_TRANSFER_PROTOCOL,
+  ALL_STREAM_PROTOCOLS,
+  SYNC_PROTOCOL,
+  UNICAST_PROTOCOL,
+  applyLibp2pConfigDefaults,
+  broadcastTopic,
+  libp2pPrivateKeyFromSanctuarySeed,
+  peerIdFromSanctuaryPubkey,
+  peerIdFromSanctuarySeed,
+  LIBP2P_TRANSPORT_DEFAULTS,
+  type Libp2pMeshTransportParams,
+  type Libp2pTransportConfig,
+  type StreamProtocol,
+} from "./libp2p-transport/index.js";
