@@ -211,11 +211,11 @@ describe("Usage event schema (§6)", () => {
 
   // ─── event_class coverage per spec §6 ───────────────────────────────────
 
-  it("enumerates all 31 event_class values from spec §6", () => {
+  it("enumerates all 32 event_class values from spec §6 + WP-MVP-6", () => {
     // Tripwire: if this count changes, the spec enum changed too and every
     // downstream consumer (audit viewer, Verascore ingest, attestation UX)
-    // needs review.
-    expect(EVENT_CLASSES).toHaveLength(31);
+    // needs review. WP-MVP-6 added retention_sweep (32nd value).
+    expect(EVENT_CLASSES).toHaveLength(32);
   });
 
   it("accepts a lifecycle event_class (launched)", () => {

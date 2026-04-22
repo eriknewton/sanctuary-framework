@@ -18,6 +18,7 @@
 import { canonicalizeToBytes } from "../mesh/canonical-json.js";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
 import {
+  BUDGET_UNITS,
   COMPILED_POLICY_SCHEMA_VERSION,
   POLICY_SLOTS,
   isPolicySlot,
@@ -237,6 +238,133 @@ export function validateCompiledPolicyShape(
     if (!isPolicySlot(key)) {
       throw new CompiledPolicyShapeError(
         `slots.${key} is not a recognized policy slot`
+      );
+    }
+  }
+
+  // ═════════════════════════════════════════════════════════════════════
+  // WP-MVP-6: optional egress, budgets, retention fields
+  // ═════════════════════════════════════════════════════════════════════
+
+  if (p.egress !== undefined) {
+    checkEgressPolicy(p.egress, "egress");
+  }
+  if (p.budgets !== undefined) {
+    checkBudgetPolicy(p.budgets, "budgets");
+  }
+  if (p.retention !== undefined) {
+    checkRetentionPolicy(p.retention, "retention");
+  }
+}
+
+function checkEgressPolicy(value: unknown, path: string): void {
+  if (typeof value !== "object" || value === null) {
+    throw new CompiledPolicyShapeError(`${path} must be an object`);
+  }
+  const eg = value as Record<string, unknown>;
+  if (!Array.isArray(eg.allowlist)) {
+    throw new CompiledPolicyShapeError(`${path}.allowlist must be an array`);
+  }
+  for (let i = 0; i < eg.allowlist.length; i++) {
+    const rule = eg.allowlist[i];
+    if (typeof rule !== "object" || rule === null) {
+      throw new CompiledPolicyShapeError(
+        `${path}.allowlist[${i}] must be an object`
+      );
+    }
+    const r = rule as Record<string, unknown>;
+    if (typeof r.destination !== "string" || r.destination.length === 0) {
+      throw new CompiledPolicyShapeError(
+        `${path}.allowlist[${i}].destination must be a non-empty string`
+      );
+    }
+    if (
+      !Array.isArray(r.methods) ||
+      !r.methods.every((m) => typeof m === "string")
+    ) {
+      throw new CompiledPolicyShapeError(
+        `${path}.allowlist[${i}].methods must be a string[]`
+      );
+    }
+  }
+}
+
+function checkBudgetLimit(value: unknown, path: string): void {
+  if (typeof value !== "object" || value === null) {
+    throw new CompiledPolicyShapeError(`${path} must be an object`);
+  }
+  const lim = value as Record<string, unknown>;
+  if (typeof lim.amount !== "number" || lim.amount <= 0 || !Number.isFinite(lim.amount)) {
+    throw new CompiledPolicyShapeError(
+      `${path}.amount must be a positive finite number`
+    );
+  }
+  if (!(BUDGET_UNITS as readonly string[]).includes(lim.unit as string)) {
+    throw new CompiledPolicyShapeError(
+      `${path}.unit must be one of: ${BUDGET_UNITS.join(", ")}`
+    );
+  }
+  if (lim.soft_warn_threshold !== undefined) {
+    if (
+      typeof lim.soft_warn_threshold !== "number" ||
+      lim.soft_warn_threshold <= 0 ||
+      lim.soft_warn_threshold >= 1
+    ) {
+      throw new CompiledPolicyShapeError(
+        `${path}.soft_warn_threshold must be in (0, 1) when present`
+      );
+    }
+  }
+}
+
+function checkBudgetPolicy(value: unknown, path: string): void {
+  if (typeof value !== "object" || value === null) {
+    throw new CompiledPolicyShapeError(`${path} must be an object`);
+  }
+  const bp = value as Record<string, unknown>;
+  if (bp.daily !== undefined) checkBudgetLimit(bp.daily, `${path}.daily`);
+  if (bp.monthly !== undefined) checkBudgetLimit(bp.monthly, `${path}.monthly`);
+  if (bp.daily === undefined && bp.monthly === undefined) {
+    throw new CompiledPolicyShapeError(
+      `${path} must have at least one of daily or monthly`
+    );
+  }
+}
+
+function checkRetentionPolicy(value: unknown, path: string): void {
+  if (typeof value !== "object" || value === null) {
+    throw new CompiledPolicyShapeError(`${path} must be an object`);
+  }
+  const rp = value as Record<string, unknown>;
+  if (typeof rp.windows !== "object" || rp.windows === null) {
+    throw new CompiledPolicyShapeError(`${path}.windows must be an object`);
+  }
+  const wins = rp.windows as Record<string, unknown>;
+  for (const key of Object.keys(wins)) {
+    if (!isPolicySlot(key)) {
+      throw new CompiledPolicyShapeError(
+        `${path}.windows.${key} is not a recognized policy slot`
+      );
+    }
+    const w = wins[key];
+    if (typeof w !== "object" || w === null) {
+      throw new CompiledPolicyShapeError(
+        `${path}.windows.${key} must be an object`
+      );
+    }
+    const win = w as Record<string, unknown>;
+    if (
+      typeof win.max_age_seconds !== "number" ||
+      !Number.isInteger(win.max_age_seconds) ||
+      win.max_age_seconds <= 0
+    ) {
+      throw new CompiledPolicyShapeError(
+        `${path}.windows.${key}.max_age_seconds must be a positive integer`
+      );
+    }
+    if (win.archive !== undefined && typeof win.archive !== "boolean") {
+      throw new CompiledPolicyShapeError(
+        `${path}.windows.${key}.archive must be boolean when present`
       );
     }
   }
