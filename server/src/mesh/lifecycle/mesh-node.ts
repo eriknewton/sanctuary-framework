@@ -1190,12 +1190,15 @@ export class MeshNode {
     });
     this.router.register("canonical_audit_change", (evt) => {
       this.lifecycleLog.append(evt as SignedEvent<NodeLifecyclePayload>);
+      this.onLifecycleEvent(evt as SignedEvent<NodeLifecyclePayload>, "received");
     });
     this.router.register("master_rotation", (evt) => {
       this.lifecycleLog.append(evt as SignedEvent<NodeLifecyclePayload>);
+      this.onLifecycleEvent(evt as SignedEvent<NodeLifecyclePayload>, "received");
     });
     this.router.register("node_attestation_refresh", (evt) => {
       this.lifecycleLog.append(evt as SignedEvent<NodeLifecyclePayload>);
+      this.onLifecycleEvent(evt as SignedEvent<NodeLifecyclePayload>, "received");
     });
   }
 
