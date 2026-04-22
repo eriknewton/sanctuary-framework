@@ -1,7 +1,7 @@
 /**
  * Sanctuary Chat v1.0 — Types
  *
- * Wire shapes for chat messages, presence events, MLS group state,
+ * Wire shapes for chat messages, presence events, group state,
  * and the chat log persistence layer.
  *
  * WP-MVP-7: Q2 architecture walkthrough decisions.
@@ -17,15 +17,15 @@ import type { PresenceState } from "./constants.js";
 
 /**
  * Payload for a chat_message signed event.
- * The actual message content is MLS-encrypted; this payload carries the
- * MLS ciphertext + metadata needed for routing and log persistence.
+ * The actual message content is AES-256-GCM encrypted per epoch; this payload
+ * carries the ciphertext + metadata needed for routing and log persistence.
  */
 export interface ChatMessagePayload {
-  /** MLS group ID this message belongs to. */
+  /** Chat group ID this message belongs to. */
   group_id: string;
-  /** MLS epoch at which this message was encrypted. */
+  /** Epoch at which this message was encrypted. */
   mls_epoch: number;
-  /** MLS-encrypted ciphertext (base64url). Decrypts to ChatPlaintext. */
+  /** AES-256-GCM ciphertext (base64url). Decrypts to ChatPlaintext. */
   mls_ciphertext: string;
   /** Sender agent_id or operator principal_id. */
   sender_id: string;
@@ -35,7 +35,7 @@ export interface ChatMessagePayload {
   signature_scheme: SignatureScheme;
 }
 
-/** Plaintext shape after MLS decryption. Never appears on the wire. */
+/** Plaintext shape after decryption. Never appears on the wire. */
 export interface ChatPlaintext {
   /** UTF-8 message content. */
   content: string;
@@ -48,20 +48,20 @@ export interface ChatPlaintext {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// MLS group management payloads
+// Group management payloads
 // ═══════════════════════════════════════════════════════════════════════
 
-/** Payload for MLS commit events (add/remove member). */
+/** Payload for group commit events (add/remove member). */
 export interface MLSCommitPayload {
-  /** MLS group ID. */
+  /** Chat group ID. */
   group_id: string;
   /** "add" or "remove" at v1.0. */
   operation: "add" | "remove";
   /** Agent or principal being added/removed. */
   member_id: string;
-  /** MLS KeyPackage for the member (base64url, only for "add"). */
+  /** Key package for the member (base64url, only for "add"). */
   key_package?: string;
-  /** MLS commit message (base64url). */
+  /** Commit message bytes (base64url). */
   mls_commit: string;
   /** New epoch after commit. */
   new_epoch: number;
@@ -69,17 +69,17 @@ export interface MLSCommitPayload {
   signature_scheme: SignatureScheme;
 }
 
-/** Payload for cross-fortress MLS group creation invite. */
+/** Payload for cross-fortress group creation invite. */
 export interface ChatGroupInvitePayload {
-  /** Proposed MLS group ID for the cross-fortress room. */
+  /** Proposed group ID for the cross-fortress room. */
   group_id: string;
   /** Inviting fortress_id. */
   inviter_fortress_id: string;
   /** Invited fortress_id. */
   invitee_fortress_id: string;
-  /** MLS Welcome message for the invitee (base64url). */
+  /** Welcome message for the invitee (base64url). */
   mls_welcome: string;
-  /** MLS GroupInfo for the invitee (base64url). */
+  /** GroupInfo for the invitee (base64url). */
   mls_group_info: string;
   /** Signature scheme. */
   signature_scheme: SignatureScheme;
@@ -87,7 +87,7 @@ export interface ChatGroupInvitePayload {
 
 /** Payload for chat group creation. */
 export interface ChatGroupCreatePayload {
-  /** MLS group ID. */
+  /** Chat group ID. */
   group_id: string;
   /** "intra_fortress" or "cross_fortress". */
   group_type: "intra_fortress" | "cross_fortress";
@@ -106,7 +106,7 @@ export interface ChatGroupCreatePayload {
 /**
  * Payload for presence heartbeat events.
  * Signed but NOT persisted (ephemeral event).
- * NOT MLS-encrypted (low-sensitivity per spawn prompt).
+ * NOT encrypted (low-sensitivity per spawn prompt).
  */
 export interface PresencePayload {
   /** Agent or operator ID publishing presence. */
@@ -129,16 +129,16 @@ export interface PeerPresence {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// MLS group state (local, not on wire)
+// Group state (local, not on wire)
 // ═══════════════════════════════════════════════════════════════════════
 
-/** Local state for an MLS group. Held in memory; group secrets never persisted to disk. */
+/** Local state for a chat group. Held in memory; group secrets never persisted to disk. */
 export interface MLSGroupState {
-  /** MLS group ID. */
+  /** Chat group ID. */
   group_id: string;
   /** "intra_fortress" or "cross_fortress". */
   group_type: "intra_fortress" | "cross_fortress";
-  /** Current MLS epoch. */
+  /** Current epoch. */
   epoch: number;
   /** Member IDs currently in the group. */
   members: string[];
@@ -156,7 +156,7 @@ export interface MLSGroupState {
 export interface ChatLogEntry {
   /** Unique message ID (from the signed-event envelope event_id). */
   message_id: string;
-  /** MLS group ID. */
+  /** Chat group ID. */
   group_id: string;
   /** Sender agent_id or operator principal_id. */
   sender_id: string;

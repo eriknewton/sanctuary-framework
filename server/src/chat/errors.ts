@@ -43,7 +43,7 @@ export class ChatNoCoordinationPeersError extends ChatError {
   }
 }
 
-/** MLS group operation failed. */
+/** Group operation failed. */
 export class MLSGroupError extends ChatError {
   constructor(message: string) {
     super("mls_group_error", message);
@@ -51,7 +51,7 @@ export class MLSGroupError extends ChatError {
   }
 }
 
-/** MLS decryption failed (member not in group or forward secrecy barrier). */
+/** Decryption failed (member not in group or forward secrecy barrier). */
 export class MLSDecryptionError extends ChatError {
   constructor(message: string) {
     super("mls_decryption_error", message);
@@ -59,7 +59,7 @@ export class MLSDecryptionError extends ChatError {
   }
 }
 
-/** Cross-fortress MLS bootstrap handshake failed. */
+/** Cross-fortress group bootstrap handshake failed. */
 export class CrossFortressBootstrapError extends ChatError {
   constructor(message: string) {
     super("cross_fortress_bootstrap_error", message);

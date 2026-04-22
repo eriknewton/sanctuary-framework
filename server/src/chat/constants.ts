@@ -5,7 +5,7 @@
  * All chat topics live under `sanctuary/chat/v1/` to avoid collision with
  * the federation `sanctuary/fed/v0.1/` namespace (§10 naming discipline).
  *
- * WP-MVP-7: libp2p + OpenMLS chat surface per Q2 of the architecture walkthrough.
+ * WP-MVP-7: libp2p chat surface per Q2 of the architecture walkthrough.
  */
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -16,8 +16,8 @@
 const CHAT_TOPIC_PREFIX = "sanctuary/chat/v1";
 
 /**
- * Gossipsub topic for MLS-encrypted chat messages within a fortress.
- * One topic per fortress; MLS group membership controls who can decrypt.
+ * Gossipsub topic for encrypted chat messages within a fortress.
+ * One topic per fortress; group membership controls who can decrypt.
  */
 export function chatTopic(fortressId: string): string {
   if (!fortressId) throw new Error("chatTopic: fortress_id required");
@@ -42,14 +42,14 @@ export function crossFortressChatTopic(
 /**
  * Gossipsub topic for presence heartbeats within a fortress.
  * Presence is signed-but-not-persisted (ephemeral events).
- * NOT MLS-encrypted: presence is low-sensitivity per spawn prompt.
+ * NOT encrypted: presence is low-sensitivity per spawn prompt.
  */
 export function presenceTopic(fortressId: string): string {
   if (!fortressId) throw new Error("presenceTopic: fortress_id required");
   return `${CHAT_TOPIC_PREFIX}/presence/${fortressId}`;
 }
 
-/** Direct-stream protocol for MLS key material exchange (cross-fortress bootstrap). */
+/** Direct-stream protocol for group key material exchange (cross-fortress bootstrap). */
 export const MLS_KEY_EXCHANGE_PROTOCOL =
   "/sanctuary/chat/v1/mls-key-exchange/1.0.0" as const;
 
@@ -103,17 +103,17 @@ export const CHAT_EVENT_TYPES = [
 export type ChatEventType = (typeof CHAT_EVENT_TYPES)[number];
 
 // ═══════════════════════════════════════════════════════════════════════
-// MLS configuration
+// Group encryption configuration
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
- * MLS cipher suite. ts-mls uses DHKEM(X25519, HKDF-SHA256) + AES-128-GCM + SHA256
- * as the default suite, which aligns with Sanctuary's existing noble-curves Ed25519 usage.
+ * Cipher suite identifier. v1.0 uses AES-256-GCM with SHA-256 epoch derivation.
+ * Retained for wire compatibility; real MLS cipher suite negotiation is a v1.1 item.
  */
 export const MLS_CIPHER_SUITE = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519" as const;
 
 /**
- * MLS group ID prefix. Groups are named `sanctuary-chat-v1/<fortress_id>`
+ * Group ID prefix. Groups are named `sanctuary-chat-v1/<fortress_id>`
  * for intra-fortress or `sanctuary-chat-v1/cross/<sorted-ids>` for cross-fortress.
  */
 export const MLS_GROUP_ID_PREFIX = "sanctuary-chat-v1" as const;

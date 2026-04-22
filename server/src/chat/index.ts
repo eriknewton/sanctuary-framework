@@ -1,11 +1,12 @@
 /**
  * Sanctuary Chat v1.0 — Public Surface
  *
- * Single-fortress + cross-fortress MLS-encrypted chat with four-state
+ * Single-fortress + cross-fortress encrypted group chat with four-state
  * presence, coordination-peers enforcement, encrypted log persistence,
- * and pgvector semantic indexing.
+ * and pgvector semantic indexing. AES-256-GCM per-epoch forward-secret
+ * group messaging over libp2p.
  *
- * WP-MVP-7: libp2p + OpenMLS chat surface per Q2 of the architecture walkthrough.
+ * WP-MVP-7: Q2 architecture walkthrough chat surface.
  */
 
 export * from "./constants.js";

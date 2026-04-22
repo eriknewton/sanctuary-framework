@@ -9,7 +9,7 @@
  *   15min no heartbeat -> offline
  *
  * Presence is published as signed ephemeral events on a dedicated
- * libp2p gossipsub topic. NOT MLS-encrypted (low-sensitivity).
+ * libp2p gossipsub topic. NOT encrypted (low-sensitivity).
  * NOT audit-logged (ephemeral).
  */
 

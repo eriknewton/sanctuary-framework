@@ -3,8 +3,8 @@
  *
  * Tests all 8 acceptance criteria from the spawn prompt:
  *
- * 1. MLS group round-trip (single-fortress) with forward secrecy
- * 2. Cross-fortress MLS round-trip
+ * 1. Encrypted group round-trip (single-fortress) with forward secrecy
+ * 2. Cross-fortress encrypted round-trip
  * 3. Presence correctness (staleness transitions)
  * 4. Agent coordination-peers enforcement
  * 5. Retention-sweep integration
@@ -138,10 +138,10 @@ function deterministicEmbed(text: string): Promise<number[]> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// AC-1: MLS group round-trip (single-fortress) + forward secrecy
+// AC-1: Encrypted group round-trip (single-fortress) + forward secrecy
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("AC-1: MLS single-fortress round-trip", () => {
+describe("AC-1: Encrypted single-fortress round-trip", () => {
   let operator: MLSGroupManager;
   let agentB: MLSGroupManager;
   let agentC: MLSGroupManager;
@@ -212,7 +212,7 @@ describe("AC-1: MLS single-fortress round-trip", () => {
     expect(decC.content).toBe("Hello agents!");
   });
 
-  it("MLS ciphertext contains zero plaintext bytes of the message", () => {
+  it("ciphertext contains zero plaintext bytes of the message", () => {
     const groupId = intraFortressGroupId(fortressId);
     operator.createGroup({
       group_id: groupId,
@@ -291,10 +291,10 @@ describe("AC-1: MLS single-fortress round-trip", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// AC-2: Cross-fortress MLS round-trip
+// AC-2: Cross-fortress encrypted round-trip
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("AC-2: Cross-fortress MLS round-trip", () => {
+describe("AC-2: Cross-fortress encrypted round-trip", () => {
   it("two fortresses form cross-fortress group, exchange messages, removal blocks decryption", () => {
     const fortressX = "fortress-x";
     const fortressY = "fortress-y";
@@ -760,7 +760,7 @@ describe("AC-7: Signed-event field correctness", () => {
     }
   });
 
-  it("MLS commit payloads carry signature_scheme", () => {
+  it("commit payloads carry signature_scheme", () => {
     // This tests the type contract; the ChatService emits these
     const payload = {
       group_id: "test-group",
@@ -922,10 +922,10 @@ describe("Chat topic namespaces", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// MLS group ID tests
+// Chat group ID tests
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("MLS group IDs", () => {
+describe("Chat group IDs", () => {
   it("intra-fortress group ID is deterministic", () => {
     expect(intraFortressGroupId("f1")).toBe("sanctuary-chat-v1/f1");
     expect(intraFortressGroupId("f1")).toBe(intraFortressGroupId("f1"));

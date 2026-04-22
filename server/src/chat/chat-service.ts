@@ -1,12 +1,12 @@
 /**
  * Sanctuary Chat v1.0 — Chat Service
  *
- * Orchestrator that wires MLS groups, presence, coordination-peers gate,
- * chat log persistence, and pgvector indexing into a unified chat surface.
+ * Orchestrator that wires encrypted chat groups, presence, coordination-peers
+ * gate, chat log persistence, and pgvector indexing into a unified surface.
  *
  * The chat service is the entry point for:
- * - Creating intra-fortress and cross-fortress MLS groups
- * - Sending/receiving MLS-encrypted messages
+ * - Creating intra-fortress and cross-fortress encrypted groups
+ * - Sending/receiving AES-256-GCM encrypted messages (per-epoch keys)
  * - Publishing/tracking presence
  * - Enforcing coordination-peers policy on agent-initiated sends
  * - Persisting chat logs and indexing them for retrieval
@@ -107,7 +107,7 @@ export class ChatService {
   // ═══════════════════════════════════════════════════════════════════
 
   /**
-   * Create an intra-fortress MLS group.
+   * Create an intra-fortress encrypted chat group.
    * Operator + her wrapped agents form the default group.
    */
   createIntraFortressGroup(): {
@@ -124,7 +124,7 @@ export class ChatService {
   }
 
   /**
-   * Create a cross-fortress MLS group with another fortress.
+   * Create a cross-fortress encrypted chat group with another fortress.
    */
   createCrossFortressGroup(otherFortressId: string): {
     state: MLSGroupState;
@@ -144,7 +144,7 @@ export class ChatService {
 
   /**
    * Add an agent to a group. Operator-only operation.
-   * Returns the MLS commit and Welcome for distributing to the new member.
+   * Returns the commit and Welcome for distributing to the new member.
    */
   addMember(
     groupId: string,
@@ -177,11 +177,11 @@ export class ChatService {
   /**
    * Send a message to a group. Handles:
    * 1. Coordination-peers enforcement (for agent senders)
-   * 2. MLS encryption
+   * 2. AES-256-GCM encryption at current epoch
    * 3. Chat log persistence
    * 4. pgvector indexing
    *
-   * Returns the signed event wrapping the MLS ciphertext.
+   * Returns the signed event wrapping the encrypted ciphertext.
    */
   async sendMessage(params: {
     group_id: string;
@@ -268,7 +268,7 @@ export class ChatService {
   // ═══════════════════════════════════════════════════════════════════
 
   /**
-   * Receive and decrypt an MLS-encrypted chat message.
+   * Receive and decrypt an encrypted chat message.
    * Persists the decrypted message to the chat log and pgvector.
    */
   async receiveMessage(

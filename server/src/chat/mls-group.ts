@@ -1,16 +1,16 @@
 /**
- * Sanctuary Chat v1.0 — MLS Group Management
+ * Sanctuary Chat v1.0 — Group Key Management
  *
- * Wraps ts-mls (RFC 9420) for group creation, member add/remove, and
- * message encrypt/decrypt. Each chat thread = one MLS group.
+ * Per-epoch symmetric-key group messaging with HKDF epoch rotation.
+ * Each chat thread = one group. AES-256-GCM encryption per epoch;
+ * epoch secrets derived via SHA-256(group_secret || epoch_bytes).
+ * Forward secrecy: a member added at epoch N cannot derive epoch N-1 secrets.
  *
  * Agent device key = agent's Ed25519 identity key (Agent Contract v0.1 §4).
  * Operator device key = fortress primary key per Key 14.
  *
- * MLS library: ts-mls (pure TypeScript RFC 9420 implementation).
- * - Active maintenance (29 versions, MIT license)
- * - Uses @hpke/core (same noble ecosystem)
- * - PQC support for future crypto-agility
+ * v1.0 ships a hand-rolled group-chat confidentiality layer. Real MLS
+ * (RFC 9420) integration is a v1.1 follow-up; see Scope Lock escalation.
  */
 
 import { gcm } from "@noble/ciphers/aes.js";
@@ -22,15 +22,15 @@ import { MLSGroupError, MLSDecryptionError } from "./errors.js";
 import type { MLSGroupState, ChatPlaintext } from "./types.js";
 
 // ═══════════════════════════════════════════════════════════════════════
-// MLS group ID generation
+// Chat group ID generation
 // ═══════════════════════════════════════════════════════════════════════
 
-/** Generate an MLS group ID for an intra-fortress chat. */
+/** Generate a group ID for an intra-fortress chat. */
 export function intraFortressGroupId(fortressId: string): string {
   return `${MLS_GROUP_ID_PREFIX}/${fortressId}`;
 }
 
-/** Generate an MLS group ID for a cross-fortress chat between two fortresses. */
+/** Generate a group ID for a cross-fortress chat between two fortresses. */
 export function crossFortressGroupId(
   fortressIdA: string,
   fortressIdB: string
@@ -40,11 +40,11 @@ export function crossFortressGroupId(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// MLS Credential + KeyPackage management
+// Member identity + key material
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
- * A member's MLS identity: their Ed25519 key material + member ID.
+ * A member's identity: Ed25519 key material + member ID.
  * Maps to Agent Contract §4: agent device key = agent's Ed25519 identity key.
  */
 export interface MLSMemberIdentity {
@@ -57,34 +57,35 @@ export interface MLSMemberIdentity {
 }
 
 /**
- * Serialized key package for MLS group add operations.
+ * Serialized key package for group add operations.
  * Contains the public key material needed to add a member.
  */
 export interface SerializedKeyPackage {
   member_id: string;
   public_key: string; // base64url
-  /** Opaque key package bytes for MLS processing (base64url). */
+  /** Opaque key package bytes (base64url). */
   package_bytes: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// MLS Group Manager
+// Group Manager
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
- * Manages MLS groups for a single fortress node.
+ * Manages encrypted chat groups for a single fortress node.
  *
  * This is a pure-logic manager that does not touch the network or storage
  * directly. The ChatService wires it to libp2p transport and state store.
  *
- * Implementation note: ts-mls provides a full RFC 9420 implementation.
- * At v1.0, we use it for group key agreement + message encrypt/decrypt.
- * The MLS tree structure provides forward secrecy: a member added at
- * epoch N cannot decrypt messages from epoch N-1.
+ * Epoch-based forward secrecy: each epoch derives a fresh AES-256-GCM key
+ * from the group secret via SHA-256. A member added at epoch N receives
+ * only epoch N's secret and cannot derive earlier epochs. Member removal
+ * advances the epoch, preventing the removed member from decrypting
+ * subsequent messages.
  *
- * DEVIATION: ts-mls's API may differ from the spawn prompt's assumed
- * @openmls/openmls-node. This wrapper abstracts the difference. The MLS
- * semantics (group, epoch, commit, encrypt, decrypt) are identical.
+ * Not MLS (RFC 9420): no tree-based key schedule, no post-compromise
+ * security, no TLS serialization, no interop with other MLS implementations.
+ * Real MLS integration is a v1.1 follow-up.
  */
 export class MLSGroupManager {
   private groups = new Map<string, MLSGroupInstance>();
@@ -95,8 +96,8 @@ export class MLSGroupManager {
   }
 
   /**
-   * Create a new MLS group. The creating member is automatically the first member.
-   * Returns the group state and the MLS GroupInfo for inviting others.
+   * Create a new chat group. The creating member is automatically the first member.
+   * Returns the group state and GroupInfo for inviting others.
    */
   createGroup(params: {
     group_id: string;
@@ -143,7 +144,7 @@ export class MLSGroupManager {
 
   /**
    * Add a member to an existing group. Only the group creator / operator can add.
-   * Returns the MLS commit and Welcome messages.
+   * Returns the commit and Welcome messages.
    */
   addMember(
     groupId: string,
@@ -177,7 +178,7 @@ export class MLSGroupManager {
 
   /**
    * Remove a member from an existing group.
-   * Returns the MLS commit. The removed member's subsequent decryptions will fail.
+   * Returns the commit. The removed member's subsequent decryptions will fail.
    */
   removeMember(
     groupId: string,
@@ -208,7 +209,7 @@ export class MLSGroupManager {
 
   /**
    * Encrypt a plaintext message for the group at the current epoch.
-   * Returns MLS ciphertext.
+   * Returns AES-256-GCM ciphertext.
    */
   encrypt(groupId: string, plaintext: ChatPlaintext): Uint8Array {
     const group = this.groups.get(groupId);
@@ -224,7 +225,7 @@ export class MLSGroupManager {
   }
 
   /**
-   * Decrypt an MLS ciphertext received from the group.
+   * Decrypt a ciphertext received from the group.
    * Returns the plaintext if the receiver holds the epoch secret; throws otherwise.
    */
   decrypt(groupId: string, ciphertext: Uint8Array, epoch: number): ChatPlaintext {
@@ -244,7 +245,7 @@ export class MLSGroupManager {
   }
 
   /**
-   * Process a received MLS commit (from another member or operator).
+   * Process a received commit (from another member or operator).
    * Updates local group state.
    */
   processCommit(
@@ -362,11 +363,9 @@ interface MLSGroupInstance {
 
 /**
  * Derive an epoch-specific secret from the group secret.
- * Uses HKDF-like expansion: SHA-256(group_secret || epoch_bytes).
- *
- * In a full ts-mls integration, this would use the MLS key schedule.
- * This implementation provides the same forward-secrecy guarantee:
- * knowing epoch N's secret does not reveal epoch N-1's secret.
+ * SHA-256(group_secret || epoch_bytes) provides forward secrecy:
+ * knowing epoch N's secret does not reveal epoch N-1's secret
+ * (pre-image resistance of SHA-256).
  */
 function deriveEpochSecret(groupSecret: Uint8Array, epoch: number): Uint8Array {
   const epochBytes = new Uint8Array(8);
@@ -424,10 +423,9 @@ function mlsDecrypt(
 
 // ═══════════════════════════════════════════════════════════════════════
 // Serialization helpers
-// These serialize MLS messages to/from wire format.
-// In a full ts-mls integration, these would use MLS TLS-serialization.
-// This implementation uses JSON for clarity; the encryption layer
-// (AES-256-GCM per epoch) provides the confidentiality guarantee.
+// JSON wire format for group management messages (GroupInfo, Commit, Welcome).
+// The AES-256-GCM encryption layer provides the confidentiality guarantee;
+// these serialization helpers handle the plaintext structure only.
 // ═══════════════════════════════════════════════════════════════════════
 
 function serializeGroupInfo(group: MLSGroupInstance): Uint8Array {
