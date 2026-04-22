@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sanctuary Attestation Reference Surface</title>
+  <!--
+    Sanctuary Attestation UX v1.0 - Reference HTML Surface
+
+    Renders the three badge layers from live API. No external resource fetches.
+    No CDN. No Google Fonts. No analytics. Everything self-contained.
+
+    Acceptance criterion 10: all three layer badges render with correct colors
+    from live API; no external resource fetches.
+
+    Design brief: Review/Sanctuary/Attestation_UX_Design_Brief_2026-04-21.md
+  -->
+  <style>
+    :root {
+      --green: #22c55e;
+      --yellow: #eab308;
+      --red: #ef4444;
+      --offline: #6b7280;
+      --local-only: #f3f4f6;
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+      --border: #334155;
+      --font: system-ui, -apple-system, sans-serif;
+      --mono: ui-monospace, "Cascadia Mono", "Segoe UI Mono", "Liberation Mono", Menlo, Monaco, Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 0;
+    }
+
+    /* Top bar (Layer 1: global badge) */
+    .top-bar {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 12px 24px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .logo {
+      font-weight: 700;
+      font-size: 16px;
+      letter-spacing: 0.02em;
+    }
+    .global-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      padding: 4px 12px;
+      border-radius: 6px;
+      transition: background 0.15s;
+    }
+    .global-badge:hover {
+      background: rgba(255,255,255,0.05);
+    }
+    .badge-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .badge-dot.green { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .badge-dot.yellow { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+    .badge-dot.red { background: var(--red); box-shadow: 0 0 6px var(--red); }
+    .badge-dot.offline { background: var(--offline); }
+    .badge-dot.local_only { background: var(--local-only); }
+    .badge-label {
+      font-size: 14px;
+      font-weight: 500;
+    }
+    .badge-expand { color: var(--text-muted); font-size: 12px; }
+
+    /* Main content */
+    .main {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    h2 {
+      font-size: 18px;
+      font-weight: 600;
+      margin: 24px 0 12px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-size: 12px;
+    }
+
+    /* Agent cards (Layer 2: per-agent badges) */
+    .agent-list {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .agent-card {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      padding: 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .agent-card:hover { border-color: var(--text-muted); }
+    .agent-info { flex: 1; }
+    .agent-name { font-weight: 600; font-size: 15px; }
+    .agent-detail {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+    .agent-note {
+      font-size: 12px;
+      color: var(--yellow);
+      margin-top: 4px;
+    }
+    .agent-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 0;
+    }
+
+    /* Action receipts (Layer 3: per-action badges) */
+    .receipt-list {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .receipt-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .receipt-agent {
+      font-weight: 500;
+      font-size: 14px;
+      min-width: 100px;
+    }
+    .receipt-action {
+      flex: 1;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    .receipt-time {
+      font-size: 12px;
+      color: var(--text-muted);
+      font-family: var(--mono);
+    }
+
+    /* Fortress health panel */
+    .health-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-top: 12px;
+      display: none;
+    }
+    .health-panel.open { display: block; }
+    .health-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 0;
+      font-size: 14px;
+    }
+    .health-key {
+      color: var(--text-muted);
+      min-width: 120px;
+    }
+
+    /* Status indicator */
+    .status-bar {
+      padding: 8px 24px;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--text-muted);
+      text-align: center;
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+    }
+
+    /* Loading state */
+    .loading {
+      text-align: center;
+      padding: 40px;
+      color: var(--text-muted);
+    }
+    .error-banner {
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid var(--red);
+      color: var(--red);
+      padding: 12px 16px;
+      border-radius: 8px;
+      margin: 12px 0;
+      font-size: 14px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <!-- Layer 1: Global badge in top bar -->
+  <div class="top-bar">
+    <span class="logo">Sanctuary</span>
+    <div class="global-badge" id="global-badge" onclick="toggleHealthPanel()">
+      <span class="badge-dot" id="global-dot"></span>
+      <span class="badge-label" id="global-label">Loading...</span>
+      <span class="badge-expand" id="global-expand">&#9662;</span>
+    </div>
+  </div>
+
+  <div class="main">
+    <!-- Error banner (degrade-not-destroy: shown inline, not modal) -->
+    <div class="error-banner" id="error-banner"></div>
+
+    <!-- Fortress health panel (expandable, not modal) -->
+    <div class="health-panel" id="health-panel">
+      <h2>Fortress Health</h2>
+      <div id="health-rows"></div>
+    </div>
+
+    <!-- Layer 2: Per-agent badges -->
+    <h2>Agents</h2>
+    <div class="agent-list" id="agent-list">
+      <div class="loading">Loading agent attestation state...</div>
+    </div>
+
+    <!-- Layer 3: Per-action badges (recent receipts) -->
+    <h2>Recent Actions</h2>
+    <div class="receipt-list" id="receipt-list">
+      <div class="loading">Loading action receipts...</div>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status-bar">
+    Sanctuary Attestation Reference Surface v1.0
+  </div>
+
+  <script>
+    // Attestation Reference Surface -- Client-Side Logic
+    // No external fetches. No CDN. No analytics.
+    // Badge data is fetched from the local fortress API only.
+
+    const API_BASE = window.location.origin;
+    let healthPanelOpen = false;
+
+    // Badge color mapping
+    const BADGE_COLORS = {
+      green: 'green',
+      yellow: 'yellow',
+      red: 'red',
+      offline: 'offline',
+      local_only: 'local_only'
+    };
+
+    function toggleHealthPanel() {
+      healthPanelOpen = !healthPanelOpen;
+      const panel = document.getElementById('health-panel');
+      const expand = document.getElementById('global-expand');
+      if (healthPanelOpen) {
+        panel.classList.add('open');
+        expand.innerHTML = '&#9652;';
+      } else {
+        panel.classList.remove('open');
+        expand.innerHTML = '&#9662;';
+      }
+    }
+
+    function renderBadgeDot(state) {
+      return '<span class="badge-dot ' + (BADGE_COLORS[state] || 'offline') + '"></span>';
+    }
+
+    function renderGlobalBadge(badge) {
+      const dot = document.getElementById('global-dot');
+      const label = document.getElementById('global-label');
+      dot.className = 'badge-dot ' + (BADGE_COLORS[badge.state] || 'offline');
+      label.textContent = badge.label || badge.state;
+    }
+
+    function renderHealthPanel(badge) {
+      const container = document.getElementById('health-rows');
+      const rows = (badge.source_event_ids || []).map(function(id) {
+        return '<div class="health-row"><span class="health-key">Event</span> ' + id + '</div>';
+      });
+      rows.push(
+        '<div class="health-row"><span class="health-key">Last updated</span> ' +
+        (badge.last_updated_at || 'unknown') + '</div>'
+      );
+      rows.push(
+        '<div class="health-row"><span class="health-key">Explanation</span> ' +
+        (badge.explanation_key || 'none') + '</div>'
+      );
+      container.innerHTML = rows.join('');
+    }
+
+    function renderAgentList(agents) {
+      const container = document.getElementById('agent-list');
+      if (!agents || agents.length === 0) {
+        container.innerHTML = '<div class="loading">No agents found</div>';
+        return;
+      }
+      container.innerHTML = agents.map(function(agent) {
+        var note = '';
+        if (agent.explanation_key && agent.state !== 'green' && agent.state !== 'local_only') {
+          note = '<div class="agent-note">' + agent.explanation_key + '</div>';
+        }
+        return '<div class="agent-card">' +
+          '<div class="agent-info">' +
+            '<div class="agent-name">' + (agent.scope_id || 'Unknown') + '</div>' +
+            '<div class="agent-detail">Layer: ' + agent.layer + ' | State: ' + agent.state + '</div>' +
+            note +
+          '</div>' +
+          '<div class="agent-badge">' + renderBadgeDot(agent.state) + '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+    function renderReceiptList(receipts) {
+      var container = document.getElementById('receipt-list');
+      if (!receipts || receipts.length === 0) {
+        container.innerHTML = '<div class="loading">No recent actions</div>';
+        return;
+      }
+      container.innerHTML = receipts.map(function(receipt) {
+        return '<div class="receipt-row">' +
+          renderBadgeDot(receipt.state) +
+          '<span class="receipt-agent">' + (receipt.scope_id || 'Unknown') + '</span>' +
+          '<span class="receipt-action">' + (receipt.explanation_key || '') + '</span>' +
+          '<span class="receipt-time">' + (receipt.last_updated_at || '') + '</span>' +
+        '</div>';
+      }).join('');
+    }
+
+    function showError(message) {
+      var banner = document.getElementById('error-banner');
+      banner.textContent = message;
+      banner.style.display = 'block';
+    }
+
+    // Fetch badge data from local fortress API (degrade-not-destroy on failure)
+    async function loadAttestationData() {
+      try {
+        var resp = await fetch(API_BASE + '/api/attestation/status');
+        if (!resp.ok) throw new Error('API returned ' + resp.status);
+        var data = await resp.json();
+
+        if (data.global) {
+          renderGlobalBadge(data.global);
+          renderHealthPanel(data.global);
+        }
+        if (data.agents) {
+          renderAgentList(data.agents);
+        }
+        if (data.actions) {
+          renderReceiptList(data.actions);
+        }
+
+        document.getElementById('status-bar').textContent =
+          'Sanctuary Attestation Reference Surface v1.0 | Last refresh: ' +
+          new Date().toLocaleTimeString();
+      } catch (err) {
+        // Degrade-not-destroy: show error inline, not as modal
+        renderGlobalBadge({ state: 'offline', label: 'No signal' });
+        showError('Could not reach fortress API. Badge data is stale or unavailable. ' + err.message);
+        document.getElementById('status-bar').textContent =
+          'Sanctuary Attestation Reference Surface v1.0 | Offline mode';
+      }
+    }
+
+    // Initial load
+    loadAttestationData();
+  </script>
+</body>
+</html>
