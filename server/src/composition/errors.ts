@@ -138,6 +138,30 @@ export class SidecarMessageSizeCapExceededError extends CompositionError {
 }
 
 /**
+ * Thrown when a composition-layer signing entry point is invoked without
+ * a usable Ed25519 signing key. Two production shapes trigger this:
+ *
+ *   1. CompositionService.publishVerascoreSignal() was called with no
+ *      signingKey argument AND the service was constructed without
+ *      FortressContextInput, so getSidecarSigningKey() returned null.
+ *   2. CompositionService.emitForCommitment() was called on a service
+ *      constructed without FortressContextInput.
+ *
+ * The distinguishing callSite field lets reviewers and operator-surface
+ * logs attribute the failure to the correct entry point without parsing
+ * the message.
+ */
+export class MissingSidecarSigningKeyError extends CompositionError {
+  constructor(
+    message: string,
+    public readonly callSite: "publishVerascoreSignal" | "emitForCommitment"
+  ) {
+    super(message, "MISSING_SIDECAR_SIGNING_KEY");
+    this.name = "MissingSidecarSigningKeyError";
+  }
+}
+
+/**
  * Thrown when a composition operation is attempted while the subsystem
  * is in degraded mode (sidecar crashed, restarting, etc.).
  *

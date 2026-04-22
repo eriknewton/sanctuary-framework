@@ -2,7 +2,7 @@
  * Sanctuary Composition v1.0 -- Composition Service
  *
  * Public API: isEnabled, packConcordiaReceipt, verifyMandate,
- * publishVerascoreSignal, getDegradeState.
+ * emitForCommitment (canonical), publishVerascoreSignal, getDegradeState.
  *
  * Orchestrates sidecar lifecycle, degrade monitor, and composition hooks.
  * All operations are gated on composition_enabled. Sidecar crash is NEVER
@@ -29,7 +29,11 @@ import {
   publishVerascoreSignal as hookPublishSignal,
   clearPublishedSignals,
 } from "./verascore-hook.js";
-import { CompositionDisabledError, DegradeStateError } from "./errors.js";
+import {
+  CompositionDisabledError,
+  DegradeStateError,
+  MissingSidecarSigningKeyError,
+} from "./errors.js";
 import type {
   CompositionConfig,
   CompositionDegradeState,
@@ -67,6 +71,41 @@ export interface HistoricalSidecarPubkey {
 export interface FortressContextInput {
   fortress_master_secret: Uint8Array;
   fortress_id: string;
+}
+
+/**
+ * Input to CompositionService.emitForCommitment(), the canonical production
+ * entry point for emitting a reputation signal on a closed commitment.
+ *
+ * The principal_id field is reserved for v1.x multi-principal-data-model
+ * support. It is accepted at v1.0 so v1.x call sites can populate it without
+ * a schema break; the v1.0 emitter ignores it.
+ */
+export interface EmitForCommitmentInput {
+  receipt: ConcordiaReceipt;
+  fortressId: string;
+  /**
+   * Reserved for v1.x per the Public Pool Federation Mode invariant holdout
+   * check: multi-principal data model. Accepted but unused at v1.0.
+   */
+  principal_id?: string;
+  /** Optional publish scope override. Defaults to config default (private). */
+  scope?: VerascoreScope;
+  /** Explicit public opt-in. REQUIRED for public scope. */
+  explicitPublicOptIn?: boolean;
+}
+
+/**
+ * Result of CompositionService.emitForCommitment(). The audit_event_ids
+ * field is reserved for Follow-up #2b's broker wire-up, which will emit
+ * composition_* signed-event envelope ids alongside the verascore signal.
+ * At v1.0 this thread ships the signal emission only, so the field is
+ * always the empty list.
+ */
+export interface EmitForCommitmentResult {
+  signal: VerascoreSignal;
+  /** Reserved for Follow-up #2b. Empty at v1.0. */
+  audit_event_ids: readonly string[];
 }
 
 /**
@@ -255,28 +294,79 @@ export class CompositionService {
   /**
    * Publish a Verascore reputation signal for a commitment close.
    *
+   * When signingKey is omitted, the HKDF-derived sidecar signing key is used
+   * (via getSidecarSigningKey()). This makes the production call shape
+   * ergonomic by default: fortress context installed at construction is
+   * enough, and no caller needs to carry the signing key around. If signingKey
+   * is omitted AND no fortress context was installed, throws
+   * MissingSidecarSigningKeyError.
+   *
+   * Explicit signingKey remains supported for test fixtures and migration
+   * paths. Production call sites should prefer omitting it, OR prefer the
+   * canonical entry point emitForCommitment().
+   *
    * @param receipt The Concordia receipt
    * @param fortressId Fortress ID
-   * @param signingKey Ed25519 private key
+   * @param signingKey Ed25519 private key. Optional; defaults to the
+   *                   HKDF-derived sidecar signing key when omitted.
    * @param options Optional scope override and public opt-in
    * @throws CompositionDisabledError if composition is off
+   * @throws MissingSidecarSigningKeyError if signingKey omitted and no
+   *         fortress context installed
    * @throws ScopeViolationError if public without opt-in
    */
   publishVerascoreSignal(
     receipt: ConcordiaReceipt,
     fortressId: string,
-    signingKey: Uint8Array,
+    signingKey?: Uint8Array,
     options?: { scope?: VerascoreScope; explicitPublicOptIn?: boolean }
   ): VerascoreSignal {
     this.assertEnabled();
 
+    const effectiveSigningKey = this.resolveSigningKey(
+      signingKey,
+      "publishVerascoreSignal"
+    );
+
     return hookPublishSignal(this.config, {
       receipt,
       fortressId,
-      signingKey,
+      signingKey: effectiveSigningKey,
       requestedScope: options?.scope,
       explicitPublicOptIn: options?.explicitPublicOptIn,
     });
+  }
+
+  /**
+   * Canonical production entry point for emitting a reputation signal on a
+   * closed commitment. The broker / commitment-boundary pipeline that lands
+   * in Follow-up #2b calls this method.
+   *
+   * Always uses the HKDF-derived sidecar signing key. There is no signingKey
+   * parameter; callers that want to pass an explicit key are in a test or
+   * migration path and should use publishVerascoreSignal() instead.
+   *
+   * @throws CompositionDisabledError if composition is off
+   * @throws MissingSidecarSigningKeyError if no fortress context installed
+   * @throws ScopeViolationError if public without opt-in
+   */
+  emitForCommitment(input: EmitForCommitmentInput): EmitForCommitmentResult {
+    this.assertEnabled();
+
+    const signingKey = this.resolveSigningKey(undefined, "emitForCommitment");
+
+    const signal = hookPublishSignal(this.config, {
+      receipt: input.receipt,
+      fortressId: input.fortressId,
+      signingKey,
+      requestedScope: input.scope,
+      explicitPublicOptIn: input.explicitPublicOptIn,
+    });
+
+    return {
+      signal,
+      audit_event_ids: [],
+    };
   }
 
   /**
@@ -413,6 +503,31 @@ export class CompositionService {
     if (isCompositionDisabled(this.config)) {
       throw new CompositionDisabledError();
     }
+  }
+
+  /**
+   * Resolve the Ed25519 signing key to use for a composition-layer emit.
+   * If the caller passed one explicitly, it wins (test fixture / migration
+   * path). Otherwise the HKDF-derived sidecar key is used. If neither is
+   * available, throws MissingSidecarSigningKeyError.
+   */
+  private resolveSigningKey(
+    explicitSigningKey: Uint8Array | undefined,
+    callSite: "publishVerascoreSignal" | "emitForCommitment"
+  ): Uint8Array {
+    if (explicitSigningKey) return explicitSigningKey;
+    const derived = this.getSidecarSigningKey();
+    if (derived) return derived.privateKey;
+    if (callSite === "publishVerascoreSignal") {
+      throw new MissingSidecarSigningKeyError(
+        "publishVerascoreSignal called without a signingKey, and no fortress context was provided to CompositionService. Pass a signingKey explicitly OR construct CompositionService with FortressContextInput so that getSidecarSigningKey() can derive one.",
+        "publishVerascoreSignal"
+      );
+    }
+    throw new MissingSidecarSigningKeyError(
+      "emitForCommitment requires fortress context; pass FortressContextInput to the CompositionService constructor.",
+      "emitForCommitment"
+    );
   }
 
   private requireRpc() {
