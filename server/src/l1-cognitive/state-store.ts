@@ -57,6 +57,7 @@ const RESERVED_NAMESPACE_PREFIXES = [
   "_shr",
   "_sovereignty_profile",
   "_context_gate_policies",
+  "_fortress_mode",
 ] as const;
 
 /**
