@@ -1,0 +1,34 @@
+{
+  "egress": [
+    {
+      "destination": "api.example-llm-provider.com",
+      "methods": ["POST"],
+      "comment": "Replace with your model provider inference endpoint."
+    },
+    {
+      "destination": "registry.npmjs.org",
+      "methods": ["GET"],
+      "comment": "npm package registry (read-only). Replace or extend with your package registries."
+    },
+    {
+      "destination": "pypi.org",
+      "methods": ["GET"],
+      "comment": "Python package index (read-only). Remove if not needed."
+    },
+    {
+      "destination": "docs.example-framework.com",
+      "methods": ["GET"],
+      "comment": "Replace with documentation sites your coding agent references."
+    }
+  ],
+  "budgets": {
+    "daily": { "amount": 500000, "unit": "tokens" }
+  },
+  "retention": {
+    "windows": {
+      "memory": { "max_age_seconds": 604800 },
+      "plans": { "max_age_seconds": 2592000 },
+      "outputs": { "max_age_seconds": 7776000 }
+    }
+  }
+}

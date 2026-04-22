@@ -15,6 +15,7 @@ import type {
 } from "./aggregator.js";
 import { getProtectionSnapshot } from "./aggregator.js";
 import { renderDashboardHTML } from "./html.js";
+import { listTemplates, getTemplateEntry } from "../templates/registry.js";
 
 export interface ApprovalHandlers {
   allow: (id: string) => Promise<boolean>;
@@ -144,6 +145,39 @@ export async function handleRequest(
   // ── SSE stream ──────────────────────────────────────────────────────
   if (method === "GET" && path === "/api/stream") {
     await handleStream(deps, res);
+    return true;
+  }
+
+  // ── Template registry (read-only) ─────────────────────────────────
+  if (method === "GET" && path === "/api/templates") {
+    try {
+      const templates = listTemplates();
+      writeJSON(res, 200, { templates });
+    } catch (err) {
+      writeJSON(res, 500, {
+        error: "template_load_failed",
+        message: (err as Error).message,
+      });
+    }
+    return true;
+  }
+
+  const templateMatch = /^\/api\/templates\/([^/]+)$/.exec(path);
+  if (method === "GET" && templateMatch) {
+    const name = decodeURIComponent(templateMatch[1]!);
+    try {
+      const entry = getTemplateEntry(name);
+      if (!entry) {
+        writeJSON(res, 404, { error: "template_not_found", name });
+        return true;
+      }
+      writeJSON(res, 200, entry);
+    } catch (err) {
+      writeJSON(res, 500, {
+        error: "template_load_failed",
+        message: (err as Error).message,
+      });
+    }
     return true;
   }
 

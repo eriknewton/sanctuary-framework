@@ -1,0 +1,14 @@
+{
+  "shapes": [
+    {
+      "commitment_class": "task-accept",
+      "example_deliverable": "Implement the requested feature or fix",
+      "example_deadline_or_terminal": "2026-12-31T23:59:59Z"
+    },
+    {
+      "commitment_class": "output-publish",
+      "example_deliverable": "Code diff, test results, or build artifacts",
+      "example_deadline_or_terminal": "Task completion or explicit operator cancel"
+    }
+  ]
+}

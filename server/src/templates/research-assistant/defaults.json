@@ -1,0 +1,25 @@
+{
+  "egress": [
+    {
+      "destination": "api.example-research-provider.com",
+      "methods": ["GET"],
+      "comment": "Replace with your research data provider endpoint."
+    },
+    {
+      "destination": "scholar.example.com",
+      "methods": ["GET"],
+      "comment": "Replace with your academic search endpoint."
+    },
+    {
+      "destination": "api.example-llm-provider.com",
+      "methods": ["POST"],
+      "comment": "Replace with your model provider inference endpoint."
+    }
+  ],
+  "budgets": {},
+  "retention": {
+    "windows": {
+      "outputs": { "max_age_seconds": 2592000 }
+    }
+  }
+}

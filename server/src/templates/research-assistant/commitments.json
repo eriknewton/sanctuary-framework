@@ -1,0 +1,9 @@
+{
+  "shapes": [
+    {
+      "commitment_class": "output-publish",
+      "example_deliverable": "Research summary on the requested topic",
+      "example_deadline_or_terminal": "2026-12-31T23:59:59Z"
+    }
+  ]
+}
