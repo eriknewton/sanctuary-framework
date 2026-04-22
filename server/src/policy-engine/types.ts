@@ -10,6 +10,7 @@ import type {
   AutoTriggerTier,
   ChannelTemplateId,
   PolicySlot,
+  BudgetUnit,
 } from "./constants.js";
 
 /** A single access grant from an agent on one slot to a counterparty. */
@@ -66,6 +67,56 @@ export interface AutoTriggerLadder {
   ml_anomaly_action: "operator_approved" | "auto";
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// WP-MVP-6 — Egress, Budget, Retention policy shapes
+// ═══════════════════════════════════════════════════════════════════════
+
+/** A single allowlisted outbound destination in the egress policy. */
+export interface EgressRule {
+  /** Domain or domain:port (e.g., "api.openai.com", "internal.svc:8443"). */
+  destination: string;
+  /** HTTP methods allowed. Empty array = all methods permitted for this destination. */
+  methods: string[];
+}
+
+/** Per-agent egress allowlist. Compiled from plain-English operator policy. */
+export interface EgressPolicy {
+  /** Allowlist of outbound destinations. If absent/empty, all egress is blocked. */
+  allowlist: EgressRule[];
+}
+
+/** A single budget limit (daily or monthly). */
+export interface BudgetLimit {
+  /** Budget cap expressed in the given unit. Must be positive. */
+  amount: number;
+  /** Unit: "tokens" for LLM inference, "usd" for metered API spend. */
+  unit: BudgetUnit;
+  /** Fraction at which the soft warn fires (default 0.8). Must be in (0, 1). */
+  soft_warn_threshold?: number;
+}
+
+/** Per-agent spend budget. Compiled from plain-English operator policy. */
+export interface BudgetPolicy {
+  /** Rolling 24h budget limit. */
+  daily?: BudgetLimit;
+  /** Rolling 30d budget limit. */
+  monthly?: BudgetLimit;
+}
+
+/** Retention window for one canonical slot. */
+export interface RetentionWindow {
+  /** Maximum age in seconds. Entries older than this are swept. */
+  max_age_seconds: number;
+  /** If true, archive expired entries instead of deleting. Default false. */
+  archive?: boolean;
+}
+
+/** Per-agent retention policy for the four canonical slots. */
+export interface RetentionPolicy {
+  /** Retention window per slot. Missing slots retain indefinitely. */
+  windows: Partial<Record<PolicySlot, RetentionWindow>>;
+}
+
 /**
  * Deterministic, versioned, signed-outside policy artifact. `policy_blob` on
  * the mesh's PolicyUpdatePayload is base64url(canonicalizeToBytes(this)).
@@ -94,6 +145,21 @@ export interface CompiledPolicy {
   source_english: string;
   /** ISO8601 UTC. */
   compiled_at: string;
+  /**
+   * WP-MVP-6: Per-agent egress allowlist. Optional; absence = no egress
+   * rules compiled (hermetic default blocks all egress).
+   */
+  egress?: EgressPolicy;
+  /**
+   * WP-MVP-6: Per-agent spend budgets. Optional; absence = no budget
+   * enforcement.
+   */
+  budgets?: BudgetPolicy;
+  /**
+   * WP-MVP-6: Per-agent retention windows. Optional; absence = no
+   * retention enforcement (entries persist indefinitely).
+   */
+  retention?: RetentionPolicy;
 }
 
 /**

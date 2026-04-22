@@ -23,4 +23,7 @@ export * from "./sentinel-role.js";
 export * from "./auto-trigger-ladder.js";
 export * from "./channel-templates.js";
 export * from "./commitment-boundary.js";
+export * from "./egress-gate.js";
+export * from "./budget-gate.js";
+export * from "./retention-sweep.js";
 export * from "./gates/index.js";

@@ -716,6 +716,7 @@ const _exhaustiveEventClass: Record<EventClass, true> = {
   mandate_revoked: true,
   budget_consumed: true,
   budget_exceeded: true,
+  retention_sweep: true,
   sentinel_alert: true,
   honeypot_triggered: true,
 };

@@ -31,9 +31,18 @@
  */
 
 import type { PolicySlot } from "./constants.js";
-import { POLICY_SLOTS } from "./constants.js";
+import { POLICY_SLOTS, type BudgetUnit } from "./constants.js";
 import type { AuthoringRequest, CompilePass } from "./compiler.js";
-import type { CompiledPolicy, SlotGrant, SlotRule } from "./types.js";
+import type {
+  BudgetLimit,
+  BudgetPolicy,
+  CompiledPolicy,
+  EgressRule,
+  RetentionPolicy,
+  RetentionWindow,
+  SlotGrant,
+  SlotRule,
+} from "./types.js";
 
 const SLOT_WORDS: Record<string, PolicySlot> = {
   memory: "memory",
@@ -116,6 +125,25 @@ const COMMITMENT_CLASS_REGEX =
   /Agent\s+(?<agent>[A-Za-z0-9_-]+)\s+may\s+emit\s+commitments\s+of\s+class\s+(?<cls>[A-Za-z0-9_:-]+)/gi;
 const HONEYPOT_REGEX =
   /Register\s+honeypot\s+(?<skill>[A-Za-z0-9_:-]+)\s+on\s+agent\s+(?<agent>[A-Za-z0-9_-]+)/gi;
+
+// WP-MVP-6: Egress, Budget, Retention patterns.
+// "Agent X may egress to api.openai.com via POST."
+// "Agent X may egress to api.openai.com." (all methods)
+const EGRESS_REGEX =
+  /Agent\s+(?<agent>[A-Za-z0-9_-]+)\s+may\s+egress\s+to\s+(?<dest>[A-Za-z0-9._:-]+)(?:\s+via\s+(?<method>[A-Z,\s]+))?/gi;
+
+// "Agent X has a daily budget of 1000 tokens."
+// "Agent X has a monthly budget of 50 usd."
+// "Agent X has a daily budget of 10 usd with 90% warn."
+const BUDGET_REGEX =
+  /Agent\s+(?<agent>[A-Za-z0-9_-]+)\s+has\s+a\s+(?<window>daily|monthly)\s+budget\s+of\s+(?<amount>[0-9.]+)\s+(?<unit>tokens|usd)(?:\s+with\s+(?<warn>[0-9]+)%\s+warn)?/gi;
+
+// "Agent X retains memory for 86400 seconds."
+// "Agent X retains outputs for 604800 seconds with archive."
+const RETENTION_REGEX =
+  /Agent\s+(?<agent>[A-Za-z0-9_-]+)\s+retains\s+(?<slot>\w+)\s+for\s+(?<seconds>[0-9]+)\s+seconds(?:\s+with\s+archive)?/gi;
+const RETENTION_ARCHIVE_REGEX =
+  /Agent\s+(?<agent>[A-Za-z0-9_-]+)\s+retains\s+(?<slot>\w+)\s+for\s+(?<seconds>[0-9]+)\s+seconds\s+with\s+archive/gi;
 
 function emptyDenySlots(): CompiledPolicy["slots"] {
   const make = (slot: PolicySlot): SlotRule => ({
@@ -215,6 +243,82 @@ export function compileFixturePolicy(req: AuthoringRequest): CompiledPolicy {
     if (h.groups!.agent === req.agent_id) honeypotSkills.add(h.groups!.skill);
   }
 
+  // WP-MVP-6: Parse egress rules.
+  // WP-MVP-6: Parse egress rules.
+  const egressRules: EgressRule[] = [];
+  const egressRe = new RegExp(EGRESS_REGEX.source, EGRESS_REGEX.flags);
+  let eg: RegExpExecArray | null;
+  while ((eg = egressRe.exec(text)) !== null) {
+    if (eg.groups!.agent !== req.agent_id) continue;
+    const dest = eg.groups!.dest.replace(/\.$/, ""); // strip trailing period
+    const methods = eg.groups!.method
+      ? eg.groups!.method
+          .split(/[,\s]+/)
+          .map((m) => m.trim().toUpperCase())
+          .filter((m) => m.length > 0)
+      : [];
+    // Deduplicate on destination.
+    const existing = egressRules.find((r) => r.destination === dest);
+    if (existing) {
+      for (const m of methods) {
+        if (!existing.methods.includes(m)) existing.methods.push(m);
+      }
+    } else {
+      egressRules.push({ destination: dest, methods });
+    }
+  }
+  egressRules.sort((a, b) => a.destination.localeCompare(b.destination));
+
+  // WP-MVP-6: Parse budget rules.
+  let budgetPolicy: BudgetPolicy | undefined;
+  const budgetRe = new RegExp(BUDGET_REGEX.source, BUDGET_REGEX.flags);
+  let bg: RegExpExecArray | null;
+  while ((bg = budgetRe.exec(text)) !== null) {
+    if (bg.groups!.agent !== req.agent_id) continue;
+    if (!budgetPolicy) budgetPolicy = {};
+    const limit: BudgetLimit = {
+      amount: parseFloat(bg.groups!.amount),
+      unit: bg.groups!.unit as BudgetUnit,
+    };
+    if (bg.groups!.warn) {
+      limit.soft_warn_threshold = parseInt(bg.groups!.warn, 10) / 100;
+    }
+    if (bg.groups!.window === "daily") {
+      budgetPolicy.daily = limit;
+    } else {
+      budgetPolicy.monthly = limit;
+    }
+  }
+
+  // WP-MVP-6: Parse retention rules.
+  let retentionPolicy: RetentionPolicy | undefined;
+  const retRe = new RegExp(RETENTION_REGEX.source, RETENTION_REGEX.flags);
+  const retArchiveRe = new RegExp(
+    RETENTION_ARCHIVE_REGEX.source,
+    RETENTION_ARCHIVE_REGEX.flags
+  );
+  // Pre-scan for archive flags.
+  const archiveSlots = new Set<string>();
+  let ra: RegExpExecArray | null;
+  while ((ra = retArchiveRe.exec(text)) !== null) {
+    if (ra.groups!.agent === req.agent_id) {
+      const slot = slotFromWord(ra.groups!.slot);
+      if (slot) archiveSlots.add(slot);
+    }
+  }
+  let rt: RegExpExecArray | null;
+  while ((rt = retRe.exec(text)) !== null) {
+    if (rt.groups!.agent !== req.agent_id) continue;
+    const slot = slotFromWord(rt.groups!.slot);
+    if (!slot) continue;
+    if (!retentionPolicy) retentionPolicy = { windows: {} };
+    const win: RetentionWindow = {
+      max_age_seconds: parseInt(rt.groups!.seconds, 10),
+    };
+    if (archiveSlots.has(slot)) win.archive = true;
+    retentionPolicy.windows[slot] = win;
+  }
+
   const compiled: CompiledPolicy = {
     schema_version: "0.1",
     agent_id: req.agent_id,
@@ -236,6 +340,15 @@ export function compileFixturePolicy(req: AuthoringRequest): CompiledPolicy {
   };
   if (req.parent_version !== undefined) {
     compiled.parent_version = req.parent_version;
+  }
+  if (egressRules.length > 0) {
+    compiled.egress = { allowlist: egressRules };
+  }
+  if (budgetPolicy) {
+    compiled.budgets = budgetPolicy;
+  }
+  if (retentionPolicy) {
+    compiled.retention = retentionPolicy;
   }
   return compiled;
 }

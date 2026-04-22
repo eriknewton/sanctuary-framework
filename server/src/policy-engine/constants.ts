@@ -93,3 +93,38 @@ export type ChannelTemplateId = (typeof CHANNEL_TEMPLATE_IDS)[number];
  * token rather than a missing field.
  */
 export const COUNTERPARTY_WILDCARD = "*" as const;
+
+// ═══════════════════════════════════════════════════════════════════════
+// WP-MVP-6 — Egress, Budget, Retention constants
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Budget units supported at v1.0 per Key 16. */
+export const BUDGET_UNITS = ["tokens", "usd"] as const;
+export type BudgetUnit = (typeof BUDGET_UNITS)[number];
+
+/** Default soft-warn threshold (fraction of budget). */
+export const DEFAULT_SOFT_WARN_THRESHOLD = 0.8;
+
+/** Default retention sweep interval in ms (15 minutes). */
+export const DEFAULT_RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
+
+/** Rolling daily window in ms (24 hours). */
+export const ROLLING_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/** Rolling monthly window in ms (30 days). */
+export const ROLLING_MONTHLY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Gate reason codes for WP-MVP-6 controls. */
+export const EGRESS_BUDGET_RETENTION_REASON_CODES = {
+  EGRESS_ALLOWED: "egress_allowed",
+  EGRESS_NO_POLICY: "egress_no_policy",
+  EGRESS_DESTINATION_DENIED: "egress_destination_denied",
+  EGRESS_METHOD_DENIED: "egress_method_denied",
+  BUDGET_WITHIN_LIMITS: "budget_within_limits",
+  BUDGET_SOFT_WARN: "budget_soft_warn",
+  BUDGET_HARD_STOP: "budget_hard_stop",
+  BUDGET_NO_POLICY: "budget_no_policy",
+} as const;
+
+export type EgressBudgetRetentionReasonCode =
+  (typeof EGRESS_BUDGET_RETENTION_REASON_CODES)[keyof typeof EGRESS_BUDGET_RETENTION_REASON_CODES];

@@ -115,10 +115,13 @@ export type AgentContractEventType =
  * `Review/Sanctuary/Agent_Contract_V0.1_Spec_2026-04-21.md`). Do not reorder
  * without bumping `AGENT_CONTRACT_VERSION`.
  *
- * Some classes (`mandate_*`, `budget_*`, `honeypot_triggered`) are listed for
- * v1.x emitter coverage and are not emitted by v0.1 enforcement code. They
- * remain in the enum so a spec-conforming external emitter's events validate
- * cleanly against the Sanctuary validator.
+ * Some classes (`mandate_*`, `honeypot_triggered`) are listed for v1.x
+ * emitter coverage and are not emitted by v0.1 enforcement code. They remain
+ * in the enum so a spec-conforming external emitter's events validate cleanly
+ * against the Sanctuary validator.
+ *
+ * `budget_consumed` (soft warn at 80%), `budget_exceeded` (hard stop at 100%),
+ * and `retention_sweep` (bulk slot cleanup) are emitted by WP-MVP-6 controls.
  */
 export const EVENT_CLASSES = [
   "launched",
@@ -150,6 +153,7 @@ export const EVENT_CLASSES = [
   "mandate_revoked",
   "budget_consumed",
   "budget_exceeded",
+  "retention_sweep",
   "sentinel_alert",
   "honeypot_triggered",
 ] as const;
