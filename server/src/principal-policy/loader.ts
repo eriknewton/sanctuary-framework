@@ -48,6 +48,10 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "governor_reset", // Clears all runtime governance state — always requires approval
     "sanctuary_bootstrap", // Creates new Ed25519 identity + publishes — always requires approval
     "sanctuary_export_identity_bundle", // Exports portable identity — always requires approval
+    // WP-MVP-2 Operator Console: federation-node-join requires explicit
+    // operator confirmation per Key 8. No auto-approve path. The console's
+    // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
+    "federation_node_join",
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [
