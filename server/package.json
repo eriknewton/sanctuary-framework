@@ -59,7 +59,6 @@
     "libp2p": "^2.10.0",
     "pg": "^8.20.0",
     "pgvector": "^0.2.1",
-    "ts-mls": "^1.6.2",
     "uint8arraylist": "^2.4.9",
     "uint8arrays": "^5.1.1"
   },
