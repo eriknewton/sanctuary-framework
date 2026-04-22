@@ -57,11 +57,15 @@
     "it-length-prefixed": "^9.1.1",
     "it-pipe": "^3.0.1",
     "libp2p": "^2.10.0",
+    "pg": "^8.20.0",
+    "pgvector": "^0.2.1",
+    "ts-mls": "^1.6.2",
     "uint8arraylist": "^2.4.9",
     "uint8arrays": "^5.1.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.20.0",
     "tsup": "^8.0.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
