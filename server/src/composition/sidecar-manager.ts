@@ -8,11 +8,28 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { SIDECAR_RPC_METHODS } from "./constants.js";
-import { SidecarSpawnError } from "./errors.js";
+import {
+  SidecarMessageSizeCapExceededError,
+  SidecarSpawnError,
+} from "./errors.js";
 import { SidecarRpcClient } from "./sidecar-rpc.js";
 import type { CompositionConfig, SidecarResponse } from "./types.js";
 
 export type SidecarState = "stopped" | "starting" | "running" | "crashed" | "restarting";
+
+/**
+ * Audit record emitted when a sidecar JSON-RPC frame exceeds the per-message
+ * size cap. The SidecarManager fires this on the event listener so the
+ * composition service layer can push the record into the audit log. Fields
+ * are structured (not a free-form string) so a principal-id field can be
+ * added at v1.x per the attestation-UX invariant without a schema break.
+ */
+export interface SidecarSizeCapAuditRecord {
+  buffered_bytes: number;
+  cap_bytes: number;
+  consecutive_crashes: number;
+  at: string;
+}
 
 /**
  * Event listener for sidecar lifecycle events.
@@ -21,6 +38,12 @@ export interface SidecarEventListener {
   onStateChange?: (state: SidecarState) => void;
   onCrash?: (exitCode: number | null, signal: string | null) => void;
   onReady?: () => void;
+  /**
+   * Fired when the per-message size cap trips. The manager has already
+   * killed the sidecar process by the time this callback runs. Wire this
+   * to the audit log.
+   */
+  onMessageSizeCapExceeded?: (record: SidecarSizeCapAuditRecord) => void;
 }
 
 /**
@@ -82,7 +105,8 @@ export class SidecarManager {
 
       this.rpcClient = new SidecarRpcClient(
         this.process,
-        this.config.sidecar_rpc_timeout_ms
+        this.config.sidecar_rpc_timeout_ms,
+        (err) => this.handleSizeCapExceeded(err)
       );
 
       // Wait for the sidecar to respond to a ping
@@ -194,6 +218,34 @@ export class SidecarManager {
     const client = this.getRpcClient();
     if (!client) return null;
     return client.call(SIDECAR_RPC_METHODS.VERSION);
+  }
+
+  /**
+   * Fired by the RPC client when a buffered JSON-RPC frame exceeds the
+   * size cap. The manager must kill the sidecar (this is treated as a
+   * crash for the restart-backoff loop) and surface an audit record to
+   * the listener. The fortress does NOT halt.
+   */
+  private handleSizeCapExceeded(
+    err: SidecarMessageSizeCapExceededError
+  ): void {
+    // Capture the consecutive-crash count BEFORE handleExit increments it,
+    // so the audit record reflects the pre-trip count. The +1 happens in
+    // handleExit when the sidecar process emits its "exit" event after
+    // kill().
+    const record = {
+      buffered_bytes: err.bufferedBytes,
+      cap_bytes: err.capBytes,
+      consecutive_crashes: this.consecutiveCrashes,
+      at: new Date().toISOString(),
+    };
+    try {
+      this.listener?.onMessageSizeCapExceeded?.(record);
+    } catch {
+      // Listener errors must not propagate.
+    }
+    // Treat as a crash: kill + scheduleRestart via the exit handler.
+    this.kill();
   }
 
   private handleExit(code: number | null, signal: string | null): void {

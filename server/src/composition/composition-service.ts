@@ -10,7 +10,15 @@
  */
 
 import { resolveCompositionConfig, isCompositionDisabled, type CompositionConfigInput } from "./composition-config.js";
-import { SidecarManager, type SidecarEventListener } from "./sidecar-manager.js";
+import {
+  SidecarManager,
+  type SidecarEventListener,
+  type SidecarSizeCapAuditRecord,
+} from "./sidecar-manager.js";
+import {
+  deriveSidecarSigningKey,
+  type SidecarSigningKeypair,
+} from "./sidecar-signing-key.js";
 import { DegradeMonitor } from "./degrade-monitor.js";
 import {
   packConcordiaReceipt as adapterPackReceipt,
@@ -33,6 +41,35 @@ import type {
 import type { VerascoreScope } from "./constants.js";
 
 /**
+ * Historical sidecar public key preserved across a master rotation. Kept so
+ * composition events signed under a pre-rotation key remain verifiable after
+ * the master has rotated (Federation Protocol v0.1 §9.5 audit-continuity at
+ * the composition layer).
+ */
+export interface HistoricalSidecarPubkey {
+  /** Base64url-encoded sidecar public key. */
+  publicKey: Uint8Array;
+  /** Fortress master public key that anchored this sidecar key. */
+  anchoringMasterFingerprint: string;
+  /** ISO 8601 timestamp when this key was superseded by a rotation. */
+  retiredAt: string;
+}
+
+/**
+ * Optional fortress context for the composition service. When supplied, the
+ * service HKDF-derives the sidecar signing keypair from the fortress master
+ * secret and manages the rotation cascade automatically.
+ *
+ * If omitted (test-only ergonomic path), callers must pass an explicit
+ * signingKey into publishVerascoreSignal. Production call sites should
+ * always construct with fortress context.
+ */
+export interface FortressContextInput {
+  fortress_master_secret: Uint8Array;
+  fortress_id: string;
+}
+
+/**
  * The composition service. Entry point for all composition operations.
  */
 export class CompositionService {
@@ -40,12 +77,39 @@ export class CompositionService {
   private sidecarManager: SidecarManager | null = null;
   private degradeMonitor: DegradeMonitor;
   private started = false;
+  private sizeCapAuditListeners: Array<(record: SidecarSizeCapAuditRecord) => void> = [];
+  private sizeCapAuditRecords: SidecarSizeCapAuditRecord[] = [];
+  private fortressMasterSecret: Uint8Array | null = null;
+  private fortressId: string | null = null;
+  private sidecarKeypairCache: SidecarSigningKeypair | null = null;
+  private historicalSidecarPubkeys: HistoricalSidecarPubkey[] = [];
 
-  constructor(configInput?: CompositionConfigInput, basePath?: string) {
+  constructor(
+    configInput?: CompositionConfigInput,
+    basePath?: string,
+    fortressContext?: FortressContextInput
+  ) {
     this.config = resolveCompositionConfig(configInput, basePath);
     this.degradeMonitor = new DegradeMonitor(
       this.config.replay_queue_max_depth
     );
+    if (fortressContext) {
+      this.setFortressContext(fortressContext);
+    }
+  }
+
+  /**
+   * Install fortress master secret + fortress_id. Calling this (including
+   * re-calling to set a new master) invalidates the cached sidecar keypair
+   * so the next getSidecarSigningKey() call re-derives under the new master.
+   *
+   * Called by bootstrap code that constructs the service before the master
+   * is available, and by the master-rotation ceremony to re-anchor.
+   */
+  setFortressContext(fortressContext: FortressContextInput): void {
+    this.fortressMasterSecret = fortressContext.fortress_master_secret;
+    this.fortressId = fortressContext.fortress_id;
+    this.sidecarKeypairCache = null;
   }
 
   /**
@@ -77,6 +141,16 @@ export class CompositionService {
         this.degradeMonitor.reportSuccess();
         // Replay queued events
         this.replayQueuedEvents();
+      },
+      onMessageSizeCapExceeded: (record) => {
+        this.sizeCapAuditRecords.push(record);
+        for (const l of this.sizeCapAuditListeners) {
+          try {
+            l(record);
+          } catch {
+            // Listener errors must not propagate.
+          }
+        }
       },
     };
 
@@ -223,6 +297,90 @@ export class CompositionService {
   }
 
   /**
+   * Register a listener for sidecar size-cap audit records. The SanctuaryAuditLog
+   * wires through this subscription to append a composition-layer audit entry
+   * on every cap-triggered rejection. The fortress continues operating; the
+   * sidecar is terminated and restarted via the backoff loop.
+   */
+  onSidecarSizeCapAudit(
+    listener: (record: SidecarSizeCapAuditRecord) => void
+  ): void {
+    this.sizeCapAuditListeners.push(listener);
+  }
+
+  /**
+   * HKDF-derived sidecar signing keypair, anchored in the fortress master
+   * installed via setFortressContext / the constructor. Returns null if no
+   * fortress context has been installed.
+   *
+   * Deterministic: same (master, fortress_id) always yields the same keypair.
+   * A rotateFortressMaster call retires the previous keypair and installs a
+   * new one derived from the new master.
+   *
+   * This is the canonical production-path key for signing composition_*
+   * signed-event envelopes and verascore signals. Tests that use
+   * publishVerascoreSignal with an explicit signingKey argument are using
+   * the v1.0 ergonomic escape hatch; production callers should route through
+   * this method.
+   */
+  getSidecarSigningKey(): SidecarSigningKeypair | null {
+    if (!this.fortressMasterSecret || !this.fortressId) return null;
+    if (this.sidecarKeypairCache) return this.sidecarKeypairCache;
+    this.sidecarKeypairCache = deriveSidecarSigningKey({
+      fortress_master_secret: this.fortressMasterSecret,
+      fortress_id: this.fortressId,
+    });
+    return this.sidecarKeypairCache;
+  }
+
+  /**
+   * Rotate the fortress master secret. The current sidecar signing keypair is
+   * preserved as a historical pubkey (so old signatures still verify) and the
+   * new master is HKDF-anchored to derive a new sidecar keypair on the next
+   * getSidecarSigningKey() call.
+   *
+   * @param newFortressMasterSecret The new fortress master secret (32-byte
+   *                                private key material). Callers MUST zero
+   *                                the old secret after this call returns.
+   * @param anchoringMasterFingerprint Caller-supplied fingerprint (e.g.
+   *                                  base64url of the OLD master pubkey) so
+   *                                  historical-pubkey records can correlate
+   *                                  to a specific rotation.
+   */
+  rotateFortressMaster(
+    newFortressMasterSecret: Uint8Array,
+    anchoringMasterFingerprint: string
+  ): void {
+    // Retire the current keypair, if we had one.
+    const current = this.getSidecarSigningKey();
+    if (current) {
+      this.historicalSidecarPubkeys.push({
+        publicKey: current.publicKey,
+        anchoringMasterFingerprint,
+        retiredAt: new Date().toISOString(),
+      });
+    }
+    this.fortressMasterSecret = newFortressMasterSecret;
+    this.sidecarKeypairCache = null;
+  }
+
+  /**
+   * Historical sidecar public keys preserved across master rotations. Verifiers
+   * consult this list to validate signatures emitted pre-rotation.
+   */
+  getHistoricalSidecarPubkeys(): readonly HistoricalSidecarPubkey[] {
+    return this.historicalSidecarPubkeys;
+  }
+
+  /**
+   * Snapshot of every sidecar size-cap audit record captured since start()
+   * (or since the last clearAll() in tests). Read-only.
+   */
+  getSidecarSizeCapAuditRecords(): readonly SidecarSizeCapAuditRecord[] {
+    return this.sizeCapAuditRecords;
+  }
+
+  /**
    * Get the sidecar version info.
    */
   async getSidecarVersion(): Promise<Record<string, unknown> | null> {
@@ -244,6 +402,10 @@ export class CompositionService {
    */
   clearAll(): void {
     this.degradeMonitor.clear();
+    this.sizeCapAuditRecords = [];
+    this.sizeCapAuditListeners = [];
+    this.sidecarKeypairCache = null;
+    this.historicalSidecarPubkeys = [];
     clearPublishedSignals();
   }
 

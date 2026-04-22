@@ -14,10 +14,24 @@ export * from "./errors.js";
 export { resolveCompositionConfig, isCompositionDisabled } from "./composition-config.js";
 export type { CompositionConfigInput } from "./composition-config.js";
 export { SidecarManager } from "./sidecar-manager.js";
-export type { SidecarState, SidecarEventListener } from "./sidecar-manager.js";
+export type {
+  SidecarState,
+  SidecarEventListener,
+  SidecarSizeCapAuditRecord,
+} from "./sidecar-manager.js";
 export { SidecarRpcClient } from "./sidecar-rpc.js";
+export type { SidecarSizeCapListener } from "./sidecar-rpc.js";
 export { packConcordiaReceipt, verifyConcordiaReceipt, verifyMandate } from "./concordia-adapter.js";
 export { publishVerascoreSignal, getPublishedSignals, clearPublishedSignals } from "./verascore-hook.js";
+export {
+  deriveSidecarSigningKey,
+  rederiveSidecarSigningKeyOnRotation,
+} from "./sidecar-signing-key.js";
+export type { SidecarSigningKeypair } from "./sidecar-signing-key.js";
 export { DegradeMonitor } from "./degrade-monitor.js";
 export type { DegradeStateChangeEvent, DegradeStateChangeListener } from "./degrade-monitor.js";
 export { CompositionService } from "./composition-service.js";
+export type {
+  FortressContextInput,
+  HistoricalSidecarPubkey,
+} from "./composition-service.js";

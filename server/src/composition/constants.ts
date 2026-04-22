@@ -136,3 +136,46 @@ export const COMPOSITION_CONFIG_KEY = "config" as const;
 
 /** HKDF domain separation for composition encryption. */
 export const HKDF_COMPOSITION_INFO = "sanctuary-composition-v1" as const;
+
+// -----------------------------------------------------------------------
+// Sidecar JSON-RPC per-message size cap
+// -----------------------------------------------------------------------
+
+/**
+ * Maximum accepted size of a single JSON-RPC frame received from the sidecar,
+ * in bytes. A frame whose accumulated length exceeds this before the
+ * newline-terminated boundary is rejected. The sidecar process is killed and
+ * an audit entry is written. The fortress continues operating (composition
+ * degrades, fortress does not halt).
+ *
+ * 10 MiB is chosen to comfortably accommodate a large mandate delegation
+ * chain (up to MAX_MANDATE_DELEGATION_DEPTH = 5 nested mandates plus
+ * receipt references) while cutting off OOM vectors from a buggy or
+ * compromised sidecar that tries to emit a multi-GB response.
+ */
+export const MAX_SIDECAR_MESSAGE_BYTES = 10 * 1024 * 1024;
+
+// -----------------------------------------------------------------------
+// HKDF info-string for sidecar signing key derivation
+// -----------------------------------------------------------------------
+
+/**
+ * HKDF info-string for deriving the composition sidecar's Ed25519 signing
+ * keypair from the fortress-master secret. The salt is the fortress_id.
+ *
+ * Decision A default (WP-MVP-10 Follow-up #1):
+ *   composition-scoped, admits patron-scope subkey templating at v1.x
+ *   (e.g. "sanctuary-composition-v1.0-{principal_id}-sidecar-signing-key")
+ *   without breaking the v1.0 derivation.
+ *
+ * The spec §10.3 `composition_*` event-type namespace allocation is the
+ * matching wire-level reservation; this HKDF prefix is the key-material
+ * reservation on the same boundary.
+ *
+ * Recovery cascade alignment: on fortress-master rotation, the derived
+ * sidecar key changes deterministically. Composition events signed under
+ * the old key remain verifiable via the preserved historical-master pubkey
+ * (spec §9.5 audit-continuity).
+ */
+export const HKDF_COMPOSITION_SIDECAR_SIGNING_INFO =
+  "sanctuary-composition-v1.0-sidecar-signing-key" as const;

@@ -117,6 +117,27 @@ export class ScopeViolationError extends CompositionError {
 }
 
 /**
+ * Thrown when a JSON-RPC frame received from the sidecar exceeds the
+ * per-message size cap (MAX_SIDECAR_MESSAGE_BYTES).
+ *
+ * Surfaces through the sidecar event listener so the SidecarManager can
+ * terminate the sidecar process and emit an audit event. The fortress
+ * continues operating (composition degrades, fortress does not halt).
+ */
+export class SidecarMessageSizeCapExceededError extends CompositionError {
+  constructor(
+    public readonly bufferedBytes: number,
+    public readonly capBytes: number
+  ) {
+    super(
+      `Sidecar JSON-RPC frame exceeded ${capBytes} byte cap without newline boundary (buffered: ${bufferedBytes})`,
+      "SIDECAR_MESSAGE_SIZE_CAP_EXCEEDED"
+    );
+    this.name = "SidecarMessageSizeCapExceededError";
+  }
+}
+
+/**
  * Thrown when a composition operation is attempted while the subsystem
  * is in degraded mode (sidecar crashed, restarting, etc.).
  *
