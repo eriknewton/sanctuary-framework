@@ -1,0 +1,3 @@
+# Concordia Python sidecar dependencies.
+# Pinned to v0.4.0 per WP-MVP-10 acceptance criterion 4.
+concordia-protocol==0.4.0
