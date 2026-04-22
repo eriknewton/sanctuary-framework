@@ -1,0 +1,1 @@
+This agent may read approved external sources and write research summaries to the outputs slot. No credentials access. No plans access. No memory sync with other agents. The operator reviews all outputs before acting on them. Outputs are read-only to other agents in the mesh.

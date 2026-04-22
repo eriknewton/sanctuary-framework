@@ -1,0 +1,8 @@
+{
+  "name": "ops-runner",
+  "version": "1.0.0",
+  "channel": "credential-share-scoped",
+  "tier": "B",
+  "target_archetype": "A Tier B adapter-wrapped agent that runs operator-authorized ops tasks against scoped credentials. Monthly USD budget. Plans gated by commitment boundary.",
+  "description": "Ops agent: runs authorized tasks with scoped credentials. Monthly USD budget. Operator fills egress allowlist."
+}

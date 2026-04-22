@@ -1,0 +1,9 @@
+{
+  "shapes": [
+    {
+      "commitment_class": "plan-publish",
+      "example_deliverable": "Implementation plan or revision for operator review",
+      "example_deadline_or_terminal": "Operator approval or plan superseded"
+    }
+  ]
+}

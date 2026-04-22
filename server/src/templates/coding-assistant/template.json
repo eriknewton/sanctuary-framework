@@ -1,0 +1,8 @@
+{
+  "name": "coding-assistant",
+  "version": "1.0.0",
+  "channel": "bidirectional-sync",
+  "tier": "B",
+  "target_archetype": "A Tier B adapter-wrapped agent running an external coding harness. Full four-slot access with bidirectional memory and output sync.",
+  "description": "Coding agent: bidirectional sync on memory and outputs. Daily token budget. Egress to model provider and dev services."
+}

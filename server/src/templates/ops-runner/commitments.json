@@ -1,0 +1,14 @@
+{
+  "shapes": [
+    {
+      "commitment_class": "task-accept",
+      "example_deliverable": "Execute the authorized ops task",
+      "example_deadline_or_terminal": "2026-12-31T23:59:59Z"
+    },
+    {
+      "commitment_class": "credential-share",
+      "example_deliverable": "Share scoped credential with authorized service",
+      "example_deadline_or_terminal": "Credential expiry or operator revocation"
+    }
+  ]
+}

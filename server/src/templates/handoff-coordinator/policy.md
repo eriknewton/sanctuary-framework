@@ -1,0 +1,1 @@
+This agent coordinates handoffs between other agents in the mesh. It may read and write to plans and outputs. Every handoff must pass the commitment boundary gate. The intra-mesh-escrow commitment class is declared. No credentials access. No memory sync. No egress. No budget. The operator reviews handoff outcomes via the outputs slot.

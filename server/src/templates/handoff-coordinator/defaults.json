@@ -1,0 +1,10 @@
+{
+  "egress": [],
+  "budgets": {},
+  "retention": {
+    "windows": {
+      "plans": { "max_age_seconds": 2592000 },
+      "outputs": { "max_age_seconds": 2592000 }
+    }
+  }
+}

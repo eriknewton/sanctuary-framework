@@ -68,6 +68,12 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
+  if (args[0] === "template") {
+    const { runTemplateCommand } = await import("./templates/cli.js");
+    const code = await runTemplateCommand({ argv: args.slice(1) });
+    process.exit(code);
+  }
+
   if (args[0] === "agents") {
     const { runAgentsCommand } = await import("./cli/agents/index.js");
     const code = await runAgentsCommand({ argv: args.slice(1) });
@@ -305,6 +311,9 @@ Subcommands:
                        Reads from the same storage as the MCP server.
                        Use "sanctuary dashboard --help" for options.
                        Pass --multi to render the multi-tenant overview.
+
+  template             Manage policy templates (list, init).
+                       Use "sanctuary template --help" for options.
 
   agents               List / inspect tenants on a multi-agent host.
                        Use "sanctuary agents --help" for options.

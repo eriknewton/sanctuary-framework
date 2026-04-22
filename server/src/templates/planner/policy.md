@@ -1,0 +1,1 @@
+This agent may write and revise plans. The operator reads plans before approving them. Other agents in the mesh may read this agent's plans (read-only inspect). Memory and outputs are read-only for this agent. No credentials access. No egress. No budget. This agent works entirely offline, producing plans for human review.

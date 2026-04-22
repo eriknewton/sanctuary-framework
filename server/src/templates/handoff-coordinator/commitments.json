@@ -1,0 +1,14 @@
+{
+  "shapes": [
+    {
+      "commitment_class": "task-delegate",
+      "example_deliverable": "Delegate subtask to a peer agent",
+      "example_deadline_or_terminal": "Peer agent completion or timeout"
+    },
+    {
+      "commitment_class": "escrow-hold",
+      "example_deliverable": "Hold handoff output in escrow until counterparty confirms",
+      "example_deadline_or_terminal": "Counterparty confirmation or operator intervention"
+    }
+  ]
+}
