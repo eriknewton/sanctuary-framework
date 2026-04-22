@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sanctuary Operator Console</title>
+  <link rel="stylesheet" href="/console/console.css" />
+</head>
+<body>
+  <!-- Persistent attestation header (always visible, top of every view) -->
+  <header id="console-header" class="console-header">
+    <div class="header-left">
+      <h1>Sanctuary Operator Console</h1>
+    </div>
+    <div class="header-badges">
+      <span id="header-global-badge" class="badge badge-offline" title="Loading...">Loading</span>
+      <span id="header-fortress-tier" class="tier-indicator">...</span>
+      <span id="header-peer-count" class="peer-count">0 peers</span>
+    </div>
+  </header>
+
+  <!-- Navigation -->
+  <nav class="console-nav" id="console-nav">
+    <a class="nav-item active" href="#fortress" data-view="fortress">Fortress Mode</a>
+    <a class="nav-item" href="#agent_roster" data-view="agent_roster">Agent Roster</a>
+    <a class="nav-item" href="#policy_editor" data-view="policy_editor">Policy Editor</a>
+    <a class="nav-item" href="#chat" data-view="chat">Secure Chat</a>
+    <a class="nav-item" href="#recovery" data-view="recovery">Recovery</a>
+    <a class="nav-item" href="#audit_log" data-view="audit_log">Audit Log</a>
+  </nav>
+
+  <!-- View mount points (six primary views) -->
+  <main id="console-main">
+
+    <!-- 1. Fortress mode view -->
+    <section id="view-fortress" class="view-panel" data-view="fortress">
+      <h2>Fortress Mode</h2>
+      <div id="fortress-status" class="view-content">
+        <div class="info-grid">
+          <div class="info-item">
+            <label>Current Tier</label>
+            <span id="fortress-tier">Loading...</span>
+          </div>
+          <div class="info-item">
+            <label>Capability Bits</label>
+            <span id="fortress-capability-bits">0</span>
+          </div>
+          <div class="info-item">
+            <label>Last Transition</label>
+            <span id="fortress-last-transition">Never</span>
+          </div>
+        </div>
+        <div id="fortress-transition-actions" class="action-bar"></div>
+        <h3>Transition History</h3>
+        <table id="fortress-history" class="data-table">
+          <thead><tr><th>From</th><th>To</th><th>Reason</th><th>Time</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 2. Agent roster view -->
+    <section id="view-agent_roster" class="view-panel" data-view="agent_roster" style="display:none">
+      <h2>Agent Roster</h2>
+      <div id="agent-roster-content" class="view-content">
+        <table id="agent-table" class="data-table">
+          <thead><tr><th>Agent ID</th><th>Tier</th><th>Harness</th><th>Model</th><th>Policy</th><th>Badge</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <p id="agent-empty" class="empty-state" style="display:none">
+          No wrapped agents on this fortress yet. Use <code>sanctuary wrap</code> to add one.
+        </p>
+      </div>
+    </section>
+
+    <!-- 3. Policy editor view -->
+    <section id="view-policy_editor" class="view-panel" data-view="policy_editor" style="display:none">
+      <h2>Policy Editor</h2>
+      <div class="view-content">
+        <p>Compile a plain-English policy via one of the five channel templates, then pin it to an agent. Pinning emits a signed <code>policy_update</code> event.</p>
+        <form id="policy-form" class="form-grid">
+          <label>Agent ID <input name="agent_id" required pattern="[a-zA-Z0-9_\-]+" /></label>
+          <label>Counterparty <input name="counterparty" required pattern="[a-zA-Z0-9_\-*]+" /></label>
+          <label>Channel Template
+            <select id="policy-template-select" name="channel_template_id" required></select>
+          </label>
+          <label>Scope (optional JSON) <input name="scope_json" placeholder='{"key":"value"}' /></label>
+          <button type="submit" class="btn-primary">Compile and Pin</button>
+        </form>
+        <div id="policy-result" class="result-box" style="display:none"></div>
+        <h3>Channel Templates</h3>
+        <ul id="policy-template-list" class="template-list"></ul>
+      </div>
+    </section>
+
+    <!-- 4. Chat view -->
+    <section id="view-chat" class="view-panel" data-view="chat" style="display:none">
+      <h2>Secure Chat</h2>
+      <div class="view-content">
+        <p class="encryption-label">AES-256-GCM per-epoch forward-secret group messaging</p>
+        <div class="chat-layout">
+          <div class="chat-sidebar">
+            <h3>Groups</h3>
+            <ul id="chat-groups" class="chat-group-list"></ul>
+            <h3>Presence</h3>
+            <ul id="chat-presence" class="presence-list"></ul>
+          </div>
+          <div class="chat-main">
+            <div id="chat-messages" class="chat-messages">
+              <p class="empty-state">Select a group to view messages.</p>
+            </div>
+            <form id="chat-send-form" class="chat-send-bar" style="display:none">
+              <input name="content" placeholder="Type a message..." required />
+              <button type="submit" class="btn-primary">Send</button>
+            </form>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 5. Recovery view -->
+    <section id="view-recovery" class="view-panel" data-view="recovery" style="display:none">
+      <h2>Recovery</h2>
+      <div class="view-content">
+        <div class="info-grid">
+          <div class="info-item">
+            <label>Guardian Threshold</label>
+            <span id="recovery-threshold">Loading...</span>
+          </div>
+          <div class="info-item">
+            <label>DMswitch Window</label>
+            <span id="recovery-dmswitch-window">Loading...</span>
+          </div>
+          <div class="info-item">
+            <label>Estate Planning</label>
+            <span id="recovery-estate-planning">Loading...</span>
+          </div>
+          <div class="info-item">
+            <label>Last Activity</label>
+            <span id="recovery-last-activity">Loading...</span>
+          </div>
+        </div>
+        <h3>Guardian Roster</h3>
+        <table id="guardian-table" class="data-table">
+          <thead><tr><th>Guardian ID</th><th>Public Key</th><th>Enrolled</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <h3>Active Cascades</h3>
+        <div id="recovery-cascades" class="cascade-list">
+          <p class="empty-state">No active recovery cascades.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 6. Audit log view -->
+    <section id="view-audit_log" class="view-panel" data-view="audit_log" style="display:none">
+      <h2>Audit Log</h2>
+      <div class="view-content">
+        <div class="filter-bar">
+          <label>Filter by type:
+            <select id="audit-filter" multiple>
+              <option value="policy_">Policy</option>
+              <option value="chat_">Chat</option>
+              <option value="mesh_">Mesh</option>
+              <option value="recovery_">Recovery</option>
+              <option value="fortress_">Fortress</option>
+              <option value="attestation_">Attestation</option>
+              <option value="identity_">Identity</option>
+            </select>
+          </label>
+          <button id="audit-refresh" class="btn-secondary">Refresh</button>
+        </div>
+        <table id="audit-table" class="data-table">
+          <thead><tr><th>Event ID</th><th>Type</th><th>Node</th><th>Time</th><th>Preview</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Expanding row detail overlay (for audit log) -->
+  <dialog id="envelope-dialog" class="envelope-dialog">
+    <h3>Signed Envelope</h3>
+    <pre id="envelope-json"></pre>
+    <button id="envelope-close" class="btn-secondary">Close</button>
+  </dialog>
+
+  <script src="/console/console.js"></script>
+</body>
+</html>
