@@ -25,3 +25,4 @@ export * from "./envelope.js";
 export * from "./lifecycle.js";
 export * from "./attestation.js";
 export * from "./commitment-boundary.js";
+export * from "./adapters/index.js";
