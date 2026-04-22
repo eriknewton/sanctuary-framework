@@ -114,12 +114,17 @@ export interface FirstNodeBootstrap {
 }
 
 export class MeshNode {
-  private readonly config: MeshNodeConfig;
+  private config: MeshNodeConfig;
   private readonly transport: MeshTransport;
   private approver: JoinApprover;
   private readonly keyStore: NodeKeyStore;
   private readonly counters: CounterStore;
-  private readonly fortressMasterSecret: Uint8Array;
+  /**
+   * In-memory fortress-master secret used for HKDF re-derivation. Swapped on
+   * master rotation (installMasterRotation). Caller MUST zero the old buffer
+   * after rotation.
+   */
+  private fortressMasterSecret: Uint8Array;
 
   private readonly roster = new NodeRoster();
   private readonly policyBundle = new PolicyBundleStore();
@@ -152,6 +157,31 @@ export class MeshNode {
   onAuditBatchEmitted: (info: {
     batch_seq: number;
     entry_count: number;
+  }) => void = () => {};
+  /** Follow-up #3: surfaces rollback / chain-discontinuity / signature failures
+   *  that the canonical audit node would otherwise silently drop. The detector
+   *  module subscribes here to fire `sentinel_alert` to operators. */
+  onAuditBatchRejected: (info: {
+    error: Error;
+    emitter_node?: string;
+  }) => void = () => {};
+  /** Follow-up #3: surfaces envelope verification failures (signature mismatch,
+   *  unknown emitter, cross-operator isolation violation). Same purpose as
+   *  onAuditBatchRejected — convert silent drop to observable alarm. */
+  onEnvelopeRejected: (info: {
+    error: Error;
+    event_type: string;
+    emitter_node?: string;
+  }) => void = () => {};
+  /** Follow-up #3: surfaces every received heartbeat after envelope verification
+   *  succeeds. The compromised-node aggregator inspects monotonic_seq +
+   *  policy-version vector skew here without re-implementing receive plumbing. */
+  onHeartbeatReceived: (info: {
+    emitter_node: string;
+    monotonic_seq: number;
+    policy_version_vector: Record<string, number>;
+    audit_seq: number;
+    advertised_state: string;
   }) => void = () => {};
 
   constructor(
@@ -883,6 +913,114 @@ export class MeshNode {
     });
   }
 
+  /**
+   * Apply a master-rotation cascade locally (§9.4 + §9.5).
+   *
+   * Caller (the failure-mode detector + ceremony orchestrator) constructs the
+   * inputs by calling `acceptMasterRotation` (verifies guardian quorum) and
+   * `rekeyOnMasterRotation` (re-issues per-node certs + re-derives per-node
+   * subkeys under the new master). This method installs the result on this
+   * node and emits the audit-continuity boundary entry.
+   *
+   * NOT a wire-level message — this is the local cascade hook that the
+   * `master_rotation` SignedEvent dispatch path calls into. Idempotent on
+   * (rotated_at, new_master_pubkey): if the rotation has already been applied,
+   * subsequent calls return without effect.
+   *
+   * Spec: §9.4 (cascade implications), §9.5 (audit continuity boundary).
+   */
+  installMasterRotation(params: {
+    payload: import("../types.js").MasterRotationPayload;
+    new_master_secret: Uint8Array;
+    re_issued_self_cert: NodeIdentityCertificate;
+    new_root_principal_cert: PrincipalCertificate;
+  }): { boundary_entry: AuditEntry } {
+    const { payload, new_master_secret, re_issued_self_cert, new_root_principal_cert } = params;
+    if (
+      payload.new_master_pubkey.public_key === this.config.pinned_master_pubkey.public_key
+    ) {
+      // Already installed — idempotent return.
+      const noop = sealAuditEntry({
+        emitter_node: this.config.node_id,
+        emitter_agent: "system",
+        emitter_principal: this.config.system_principal_id ?? "system",
+        policy_version: 0,
+        attestation_state: "present",
+        payload: { kind: "master_rotation_boundary_noop", rotated_at: payload.rotated_at },
+        node_private_key: this.nodePrivateKey!,
+      });
+      return { boundary_entry: noop };
+    }
+    if (re_issued_self_cert.node_id !== this.config.node_id) {
+      throw new MeshError(
+        `installMasterRotation: re_issued_self_cert.node_id=${re_issued_self_cert.node_id} does not match this node ${this.config.node_id}`
+      );
+    }
+    if (
+      re_issued_self_cert.parent_chain.fortress_master_pubkey !==
+      payload.new_master_pubkey.public_key
+    ) {
+      throw new MeshError(
+        `installMasterRotation: re_issued_self_cert does not chain to the new master pubkey`
+      );
+    }
+    // Swap the in-memory master secret + pinned pubkey + principal cert + own cert.
+    this.fortressMasterSecret = new_master_secret;
+    this.config = {
+      ...this.config,
+      pinned_master_pubkey: payload.new_master_pubkey,
+    };
+    this.principalRoster.set(
+      new_root_principal_cert.principal_id,
+      new_root_principal_cert
+    );
+    this.certificate = re_issued_self_cert;
+    // Replace own roster cert (keeps presence + heartbeat history intact —
+    // see NodeRoster.add cert-rotation path).
+    this.roster.add(re_issued_self_cert);
+
+    // Audit-continuity boundary entry — the operator-visible record of the
+    // rotation. Verifiers walking the audit log encounter this and pivot from
+    // pre-rotation pubkey lookups to post-rotation lookups.
+    const boundaryPayload = {
+      kind: "master_rotation_boundary" as const,
+      old_master_pubkey: payload.old_master_pubkey,
+      new_master_pubkey: payload.new_master_pubkey.public_key,
+      guardian_quorum_signatures: payload.quorum_signatures,
+      rotated_at: payload.rotated_at,
+    };
+    const entry = sealAuditEntry({
+      emitter_node: this.config.node_id,
+      emitter_agent: "system",
+      emitter_principal: this.config.system_principal_id ?? "system",
+      policy_version: 0,
+      attestation_state: "present",
+      payload: boundaryPayload,
+      node_private_key: this.nodePrivateKey!,
+    });
+    if (this.oldestPendingEntryAt === null) {
+      this.oldestPendingEntryAt = Date.now();
+    }
+    this.auditBuffer.push(entry);
+    return { boundary_entry: entry };
+  }
+
+  /**
+   * Read this node's currently-pinned fortress-master public key.
+   * Used by the failure-mode detector for diagnostic surfaces.
+   */
+  getPinnedMaster(): FortressMasterPublicKey {
+    return this.config.pinned_master_pubkey;
+  }
+
+  /**
+   * Read this node's current certificate (after any rotations applied).
+   * Used by tests + the cascade orchestrator to verify post-rotation state.
+   */
+  getOwnCertificate(): NodeIdentityCertificate | null {
+    return this.certificate;
+  }
+
   /** Designate a new canonical audit node (§5.4 replica election). */
   async designateCanonicalAudit(params: {
     new_canonical_node: string;
@@ -1012,6 +1150,13 @@ export class MeshNode {
         audit_seq: payload.audit_seq,
         advertised_state: payload.node_state,
       });
+      this.onHeartbeatReceived({
+        emitter_node: evt.emitter_node,
+        monotonic_seq: evt.monotonic_seq,
+        policy_version_vector: payload.policy_version_vector,
+        audit_seq: payload.audit_seq,
+        advertised_state: payload.node_state,
+      });
     });
     this.router.register("policy_update", (evt) => {
       const result = this.policyBundle.upsert(
@@ -1081,9 +1226,11 @@ export class MeshNode {
     try {
       this.verifyOrThrow(evt);
     } catch (e) {
-      // Verification failures are permanent rejects; in production we'd
-      // surface to Follow-up #3's alarm path. v0.1 silently drops.
-      void e;
+      this.onEnvelopeRejected({
+        error: e instanceof Error ? e : new Error(String(e)),
+        event_type: evt.event_type,
+        emitter_node: evt.emitter_node,
+      });
       return;
     }
     this.receivedLog.push({
@@ -1107,8 +1254,13 @@ export class MeshNode {
     if (parsed.kind === "audit_batch") {
       try {
         this.ingestAuditBatch(message);
-      } catch {
-        // Audit-batch verification failures are alarms in Follow-up #3.
+      } catch (e) {
+        const emitterNode =
+          (parsed.batch as { emitter_node?: string } | undefined)?.emitter_node;
+        this.onAuditBatchRejected({
+          error: e instanceof Error ? e : new Error(String(e)),
+          emitter_node: emitterNode,
+        });
       }
       return;
     }
