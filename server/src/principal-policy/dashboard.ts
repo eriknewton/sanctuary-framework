@@ -1336,6 +1336,31 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.broadcastSSE("protection-status", data);
   }
 
+  // ── Mesh-health surface (WP-MVP-3 Follow-up #3) ─────────────────────
+  //
+  // The federation FailureModeDetector pushes per-tick health snapshots and
+  // per-detection alerts here; the existing /events SSE channel transports
+  // them to the browser. No new transport.
+  //
+  // Spec §8 + §9. Spawn-prompt acceptance criterion 7: "Mesh Health dashboard
+  // panel renders via existing SSE /events channel — no new transport. Every
+  // state transition produces an observable SSE event."
+
+  /** Push a Mesh Health snapshot (full re-render trigger on the client). */
+  broadcastMeshHealth(snapshot: Record<string, unknown>): void {
+    this.broadcastSSE("mesh-health", snapshot);
+  }
+
+  /** Push a single failure-mode alert (incremental client update). */
+  broadcastMeshFailureModeAlert(alert: Record<string, unknown>): void {
+    this.broadcastSSE("mesh-failure-mode-alert", alert);
+  }
+
+  /** Push a post-recovery prompt update (master rotation hygiene flow). */
+  broadcastMeshPostRecoveryPrompt(prompt: Record<string, unknown>): void {
+    this.broadcastSSE("mesh-post-recovery-prompt", prompt);
+  }
+
   /**
    * Open a URL in the system's default browser.
    * Cross-platform: macOS (open), Linux (xdg-open), Windows (start).

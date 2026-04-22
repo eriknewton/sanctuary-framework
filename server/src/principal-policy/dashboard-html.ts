@@ -1606,6 +1606,28 @@ export function generateDashboardHTML(options: {
         </div>
       </div>
 
+      <!--
+        Mesh Health panel (WP-MVP-3 Follow-up #3).
+        Subscribes to the existing /events SSE channel — no new transport.
+        Render shape: per-node row with presence + flags + rollup.
+        On open alert: list inline with operator-decision CTAs (rollback /
+        split-brain / canonical-audit promotion).
+        On post-recovery prompt: render rotation-prompt overlay with
+        broker-credential list + "rotate now" buttons (rotation flow itself
+        is the existing v0.10.x broker rotation surface).
+      -->
+      <div class="mesh-health-panel" id="mesh-health-panel">
+        <div class="panel-header">
+          <div class="panel-title">Mesh Health</div>
+          <span class="card-value" id="mesh-health-updated-at" style="font-size: 11px; color: var(--text-secondary);">—</span>
+        </div>
+        <div id="mesh-health-rows" class="mesh-health-rows">
+          <div class="empty-state">Waiting for mesh health data…</div>
+        </div>
+        <div id="mesh-health-alerts" class="mesh-health-alerts" style="margin-top: 12px;"></div>
+        <div id="mesh-post-recovery-prompt" class="mesh-post-recovery-prompt" style="margin-top: 12px; display: none;"></div>
+      </div>
+
       <!-- Sovereignty Profile Panel -->
       <div class="profile-panel" id="sovereignty-profile-panel">
         <div class="panel-header">
@@ -2315,10 +2337,94 @@ export function generateDashboardHTML(options: {
         loadProxyServers();
       });
 
+      // ── Mesh Health (WP-MVP-3 Follow-up #3) ─────────────────────────
+      // The federation FailureModeDetector pushes per-tick snapshots and
+      // per-detection alerts via the existing /events channel. Renders are
+      // best-effort — if the panel DOM is absent (older HTML cache), we
+      // silently skip rather than crashing.
+      eventSource.addEventListener('mesh-health', (e) => {
+        try {
+          const snap = JSON.parse(e.data);
+          renderMeshHealth(snap);
+        } catch (err) { console.error('mesh-health render failed', err); }
+      });
+      eventSource.addEventListener('mesh-failure-mode-alert', (e) => {
+        try {
+          const alert = JSON.parse(e.data);
+          appendMeshAlert(alert);
+        } catch (err) { console.error('mesh alert render failed', err); }
+      });
+      eventSource.addEventListener('mesh-post-recovery-prompt', (e) => {
+        try {
+          const prompt = JSON.parse(e.data);
+          renderMeshPostRecoveryPrompt(prompt);
+        } catch (err) { console.error('mesh post-recovery render failed', err); }
+      });
+
       eventSource.onerror = () => {
         console.error('SSE error');
         setTimeout(setupSSE, 5000);
       };
+    }
+
+    // ── Mesh Health rendering (WP-MVP-3 Follow-up #3) ────────────────
+    function renderMeshHealth(snap) {
+      const updatedAt = document.getElementById('mesh-health-updated-at');
+      const rows = document.getElementById('mesh-health-rows');
+      if (!rows || !snap) return;
+      if (updatedAt) updatedAt.textContent = formatTime(snap.generated_at);
+      const nodes = Array.isArray(snap.nodes) ? snap.nodes : [];
+      if (nodes.length === 0) {
+        rows.innerHTML = '<div class="empty-state">No mesh nodes seen yet.</div>';
+        return;
+      }
+      rows.innerHTML = nodes.map((n) => {
+        const flags = (n.flags || []).map((f) => '<span class="mesh-flag">' + esc(f) + '</span>').join(' ');
+        return '<div class="mesh-row" data-rollup="' + esc(n.rollup) + '">' +
+          '<span class="mesh-node-id">' + esc(n.node_id) + '</span>' +
+          '<span class="mesh-presence">' + esc(n.presence) + '</span>' +
+          '<span class="mesh-rollup">' + esc(n.rollup) + '</span>' +
+          '<span class="mesh-flags">' + flags + '</span>' +
+        '</div>';
+      }).join('');
+      const alertsBox = document.getElementById('mesh-health-alerts');
+      if (alertsBox && Array.isArray(snap.open_alerts)) {
+        alertsBox.innerHTML = snap.open_alerts.map((a) =>
+          '<div class="mesh-alert" data-mode="' + esc(a.mode) + '">' +
+          '<div class="mesh-alert-mode">' + esc(a.mode) + ' — ' + esc(a.target_node) + '</div>' +
+          '<div class="mesh-alert-message">' + esc(a.message) + '</div>' +
+          '</div>'
+        ).join('');
+      }
+    }
+
+    function appendMeshAlert(alert) {
+      const alertsBox = document.getElementById('mesh-health-alerts');
+      if (!alertsBox || !alert) return;
+      const html = '<div class="mesh-alert" data-mode="' + esc(alert.mode) + '">' +
+        '<div class="mesh-alert-mode">' + esc(alert.mode) + ' — ' + esc(alert.target_node) + '</div>' +
+        '<div class="mesh-alert-message">' + esc(alert.message) + '</div>' +
+        '</div>';
+      alertsBox.insertAdjacentHTML('afterbegin', html);
+    }
+
+    function renderMeshPostRecoveryPrompt(prompt) {
+      const box = document.getElementById('mesh-post-recovery-prompt');
+      if (!box || !prompt) return;
+      box.style.display = 'block';
+      const creds = Array.isArray(prompt.credentials) ? prompt.credentials : [];
+      box.innerHTML = '<div class="mesh-rotation-banner">' +
+        '<strong>Post-rotation hygiene:</strong> we just rotated your fortress root key. ' +
+        'Rotate externally-scoped broker credentials that third parties may still associate with ' +
+        'the pre-rotation key material.' +
+        '</div>' +
+        '<ul class="mesh-rotation-list">' +
+        creds.map((c) => '<li>' +
+          '<span class="mesh-cred-name">' + esc(c.secret_name) + '</span>' +
+          '<button class="mesh-cred-rotate" data-secret="' + esc(c.secret_name) + '">' +
+          'rotate now</button>' +
+          '</li>').join('') +
+        '</ul>';
     }
 
     // Activity Feed

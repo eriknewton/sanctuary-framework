@@ -22,6 +22,8 @@ export * from "./audit-batch.js";
 export * from "./router.js";
 export * from "./in-memory-transport.js";
 export { canonicalize, canonicalizeToBytes } from "./canonical-json.js";
+export * from "./guardian/index.js";
+export * from "./failure-modes/index.js";
 export {
   Libp2pMeshTransport,
   AGENT_STATE_TRANSFER_PROTOCOL,
