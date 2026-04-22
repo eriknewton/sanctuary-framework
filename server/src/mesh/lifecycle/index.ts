@@ -31,6 +31,10 @@ export {
   InMemoryNodeKeyStore,
 } from "./cocoon-binding.js";
 export {
+  FileNodeKeyStore,
+  FileCounterStore,
+} from "./file-stores.js";
+export {
   MeshBootstrapTokenError,
   issueBootstrapToken,
   verifyBootstrapToken,
