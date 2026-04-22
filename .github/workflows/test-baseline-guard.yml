@@ -73,10 +73,14 @@ jobs:
           python-version: "3.12"
 
       - name: Provision Concordia sidecar venv
+        # --require-hashes enforces that every dependency in requirements.txt is
+        # pinned with a SHA256 hash. A compromised PyPI release that replaces the
+        # tarball under the same version is rejected at install time. Regenerate
+        # hashes on Concordia version bump per sidecars/concordia/README.md.
         run: |
           python3 -m venv sidecars/concordia/.venv
           sidecars/concordia/.venv/bin/pip install --upgrade pip
-          sidecars/concordia/.venv/bin/pip install -r sidecars/concordia/requirements.txt
+          sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
 
       # ── Gate 1: typecheck ──────────────────────────────────────────
       - name: Gate 1 — typecheck
