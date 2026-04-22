@@ -12,6 +12,7 @@ import type {
   AgentSubkeyPurpose,
   CapabilityKind,
   CommitmentClass,
+  EventClass,
   HarnessTier,
   LifecycleState,
   ModelProvider,
@@ -92,8 +93,19 @@ export interface UsageEvent {
   usage_event_id: string;
   agent_id: string;
   fortress_id: string;
-  /** Capability kind invoked. Must correspond to a declared capability on the card. */
-  capability_kind: CapabilityKind;
+  /**
+   * Event classification per spec §6. Primary discriminator for downstream
+   * consumers — covers lifecycle, tool, egress, gate, policy, capability,
+   * envelope, attestation, commitment, mandate, budget, and sentinel classes.
+   */
+  event_class: EventClass;
+  /**
+   * Capability kind invoked. REQUIRED when `event_class === "tool_call"`;
+   * MUST be absent for every other `event_class`. Downstream consumers that
+   * need a capability-kind dimension on non-tool-call events should look at
+   * `event_class` + the event-specific subject fields instead.
+   */
+  capability_kind?: CapabilityKind;
   /** Specific target — slot name, tool name, URL, counterparty, etc. */
   capability_target: string;
   /** SHA-256 (base64url) of the canonicalized action input. Bytes-level integrity. */

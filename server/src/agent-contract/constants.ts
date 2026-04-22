@@ -105,6 +105,57 @@ export type AgentContractEventType =
   (typeof AGENT_CONTRACT_EVENT_TYPES)[number];
 
 /**
+ * Usage-event classification per spec §6. Every signed usage event carries
+ * exactly one `event_class` from this set; the value is the primary
+ * discriminator for downstream consumers (audit viewers, Verascore ingest,
+ * attestation-UX rendering) and cannot be inferred from `capability_kind`
+ * (which only meaningfully applies when the class is `tool_call`).
+ *
+ * Ordering and spelling match the spec JSON Schema exactly (lines 473–488 of
+ * `Review/Sanctuary/Agent_Contract_V0.1_Spec_2026-04-21.md`). Do not reorder
+ * without bumping `AGENT_CONTRACT_VERSION`.
+ *
+ * Some classes (`mandate_*`, `budget_*`, `honeypot_triggered`) are listed for
+ * v1.x emitter coverage and are not emitted by v0.1 enforcement code. They
+ * remain in the enum so a spec-conforming external emitter's events validate
+ * cleanly against the Sanctuary validator.
+ */
+export const EVENT_CLASSES = [
+  "launched",
+  "paused",
+  "checkpointed",
+  "resumed",
+  "retired",
+  "revoked",
+  "tool_call",
+  "egress_request",
+  "egress_blocked",
+  "gate_request",
+  "gate_approved",
+  "gate_denied",
+  "gate_timeout",
+  "policy_pinned",
+  "policy_update_requested",
+  "capability_declared",
+  "capability_extension_requested",
+  "envelope_sent",
+  "envelope_received",
+  "attestation_emitted",
+  "attestation_failed",
+  "commitment_proposed",
+  "commitment_accepted",
+  "commitment_fulfilled",
+  "commitment_unwound",
+  "mandate_referenced",
+  "mandate_revoked",
+  "budget_consumed",
+  "budget_exceeded",
+  "sentinel_alert",
+  "honeypot_triggered",
+] as const;
+export type EventClass = (typeof EVENT_CLASSES)[number];
+
+/**
  * HKDF info-string prefix for per-agent signing-key derivation.
  *
  * Per-agent Ed25519 private keys are generated fresh at launch (not HKDF-

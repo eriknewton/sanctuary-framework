@@ -329,6 +329,7 @@ export abstract class TierBAdapter {
     const usageOut = emitUsageEvent({
       agent_id: this.params.agent_id,
       fortress_id: this.params.fortress_id,
+      event_class: "tool_call",
       capability_kind: args.capability_kind,
       capability_target: args.capability_target,
       input: args.input,

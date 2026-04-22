@@ -14,6 +14,7 @@ import { describe, it, expect } from "vitest";
 import {
   AGENT_CONTRACT_VERSION,
   CAPABILITY_KINDS,
+  EVENT_CLASSES,
   HARNESS_TIERS,
   MODEL_PROVIDERS,
   SIGNATURE_SCHEME_V1,
@@ -155,6 +156,7 @@ describe("Usage event schema (§6)", () => {
       usage_event_id: "01HX9-1",
       agent_id: "agent-alpha",
       fortress_id: "fortress-1",
+      event_class: "tool_call",
       capability_kind: "tool-call",
       capability_target: "filesystem/read",
       input_hash: "AAAA",
@@ -166,8 +168,17 @@ describe("Usage event schema (§6)", () => {
     };
   }
 
+  /** Variant without capability_kind — for non-tool_call event classes. */
+  function baseNoKind(event_class: string): Record<string, unknown> {
+    const b = base();
+    delete b.capability_kind;
+    b.event_class = event_class;
+    return b;
+  }
+
   it("accepts a well-formed usage event", () => {
     const ev = validateUsageEvent(base());
+    expect(ev.event_class).toBe("tool_call");
     expect(ev.capability_kind).toBe("tool-call");
     expect(ev.attestation_state).toBe("present");
   });
@@ -196,6 +207,78 @@ describe("Usage event schema (§6)", () => {
       b.attestation_state = s;
       expect(() => validateUsageEvent(b)).not.toThrow();
     }
+  });
+
+  // ─── event_class coverage per spec §6 ───────────────────────────────────
+
+  it("enumerates all 31 event_class values from spec §6", () => {
+    // Tripwire: if this count changes, the spec enum changed too and every
+    // downstream consumer (audit viewer, Verascore ingest, attestation UX)
+    // needs review.
+    expect(EVENT_CLASSES).toHaveLength(31);
+  });
+
+  it("accepts a lifecycle event_class (launched)", () => {
+    const ev = validateUsageEvent(baseNoKind("launched"));
+    expect(ev.event_class).toBe("launched");
+  });
+
+  it("accepts a tool event_class (tool_call) with capability_kind", () => {
+    const ev = validateUsageEvent(base());
+    expect(ev.event_class).toBe("tool_call");
+  });
+
+  it("accepts an egress event_class (egress_request)", () => {
+    const ev = validateUsageEvent(baseNoKind("egress_request"));
+    expect(ev.event_class).toBe("egress_request");
+  });
+
+  it("accepts a gate event_class (gate_denied)", () => {
+    const ev = validateUsageEvent(baseNoKind("gate_denied"));
+    expect(ev.event_class).toBe("gate_denied");
+  });
+
+  it("accepts a policy event_class (policy_pinned)", () => {
+    const ev = validateUsageEvent(baseNoKind("policy_pinned"));
+    expect(ev.event_class).toBe("policy_pinned");
+  });
+
+  it("accepts a capability-management event_class (capability_declared)", () => {
+    const ev = validateUsageEvent(baseNoKind("capability_declared"));
+    expect(ev.event_class).toBe("capability_declared");
+  });
+
+  it("accepts an envelope event_class (envelope_sent)", () => {
+    const ev = validateUsageEvent(baseNoKind("envelope_sent"));
+    expect(ev.event_class).toBe("envelope_sent");
+  });
+
+  it("accepts an attestation event_class (attestation_emitted)", () => {
+    const ev = validateUsageEvent(baseNoKind("attestation_emitted"));
+    expect(ev.event_class).toBe("attestation_emitted");
+  });
+
+  it("accepts a commitment event_class (commitment_proposed)", () => {
+    const ev = validateUsageEvent(baseNoKind("commitment_proposed"));
+    expect(ev.event_class).toBe("commitment_proposed");
+  });
+
+  it("rejects usage events missing event_class", () => {
+    const b = base();
+    delete b.event_class;
+    expect(() => validateUsageEvent(b)).toThrow(/event_class/);
+  });
+
+  it("rejects unknown event_class values", () => {
+    const b = baseNoKind("not_a_real_class");
+    expect(() => validateUsageEvent(b)).toThrow(/event_class/);
+  });
+
+  it("rejects capability_kind set when event_class !== 'tool_call'", () => {
+    const b = base();
+    b.event_class = "gate_denied";
+    // capability_kind still present from base()
+    expect(() => validateUsageEvent(b)).toThrow(/capability_kind/);
   });
 });
 

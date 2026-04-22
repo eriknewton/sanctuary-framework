@@ -29,6 +29,7 @@ import {
   SIGNATURE_SCHEME_V1,
   type AgentContractEventType,
   type CapabilityKind,
+  type EventClass,
 } from "./constants.js";
 import { UsageEventSchemaError } from "./errors.js";
 import { validateUsageEvent } from "./schema.js";
@@ -40,7 +41,13 @@ export const AGENT_USAGE_EVENT_TYPE: AgentContractEventType =
 export interface EmitUsageEventParams {
   agent_id: string;
   fortress_id: string;
-  capability_kind: CapabilityKind;
+  /** Spec §6 classification — discriminator for downstream consumers. */
+  event_class: EventClass;
+  /**
+   * Capability kind invoked. REQUIRED when `event_class === "tool_call"`;
+   * MUST be absent for every other class. The validator enforces both sides.
+   */
+  capability_kind?: CapabilityKind;
   capability_target: string;
   /** Raw input value — canonicalized + hashed here. */
   input: unknown;
@@ -75,7 +82,10 @@ export function emitUsageEvent(
     usage_event_id,
     agent_id: params.agent_id,
     fortress_id: params.fortress_id,
-    capability_kind: params.capability_kind,
+    event_class: params.event_class,
+    ...(params.capability_kind !== undefined
+      ? { capability_kind: params.capability_kind }
+      : {}),
     capability_target: params.capability_target,
     input_hash,
     output_hash,

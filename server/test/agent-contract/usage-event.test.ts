@@ -21,6 +21,7 @@ describe("Usage event emission + verification (§6)", () => {
     const { signed_event, event } = emitUsageEvent({
       agent_id: "agent-alpha",
       fortress_id: f.master.public.fortress_id,
+      event_class: "tool_call",
       capability_kind: "tool-call",
       capability_target: "filesystem/read",
       input: { path: "/tmp/a.txt" },
@@ -45,6 +46,7 @@ describe("Usage event emission + verification (§6)", () => {
     const { signed_event } = emitUsageEvent({
       agent_id: "agent-alpha",
       fortress_id: f.master.public.fortress_id,
+      event_class: "tool_call",
       capability_kind: "tool-call",
       capability_target: "x",
       input: null,
@@ -68,6 +70,7 @@ describe("Usage event emission + verification (§6)", () => {
     const { signed_event } = emitUsageEvent({
       agent_id: "agent-alpha",
       fortress_id: f.master.public.fortress_id,
+      event_class: "tool_call",
       capability_kind: "tool-call",
       capability_target: "x",
       input: { a: 1 },
@@ -94,6 +97,7 @@ describe("Usage event emission + verification (§6)", () => {
     const a = emitUsageEvent({
       agent_id: "agent-alpha",
       fortress_id: f.master.public.fortress_id,
+      event_class: "tool_call",
       capability_kind: "tool-call",
       capability_target: "x",
       input: { a: 1, b: 2 },
@@ -109,6 +113,7 @@ describe("Usage event emission + verification (§6)", () => {
     const b = emitUsageEvent({
       agent_id: "agent-alpha",
       fortress_id: f.master.public.fortress_id,
+      event_class: "tool_call",
       capability_kind: "tool-call",
       capability_target: "x",
       input: { b: 2, a: 1 }, // reversed key order

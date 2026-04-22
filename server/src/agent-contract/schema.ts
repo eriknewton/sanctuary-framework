@@ -14,11 +14,13 @@
 import {
   AGENT_CONTRACT_VERSION,
   CAPABILITY_KINDS,
+  EVENT_CLASSES,
   HARNESS_TIERS,
   LIFECYCLE_STATES,
   MODEL_PROVIDERS,
   SIGNATURE_SCHEME_V1,
   type CapabilityKind,
+  type EventClass,
   type HarnessTier,
   type LifecycleState,
   type ModelProvider,
@@ -248,6 +250,7 @@ const USAGE_EVENT_ALLOWED_KEYS = new Set([
   "usage_event_id",
   "agent_id",
   "fortress_id",
+  "event_class",
   "capability_kind",
   "capability_target",
   "input_hash",
@@ -299,10 +302,22 @@ export function validateUsageEvent(v: unknown): UsageEvent {
       `usage event fortress_id must be a non-empty string`
     );
   }
-  if (!isIn(v.capability_kind, CAPABILITY_KINDS)) {
+  if (!isIn(v.event_class, EVENT_CLASSES)) {
     throw new UsageEventSchemaError(
-      `usage event capability_kind must be one of ${CAPABILITY_KINDS.join("|")}; got ${JSON.stringify(v.capability_kind)}`
+      `usage event event_class must be one of ${EVENT_CLASSES.join("|")}; got ${JSON.stringify(v.event_class)}`
     );
+  }
+  if (v.capability_kind !== undefined) {
+    if (!isIn(v.capability_kind, CAPABILITY_KINDS)) {
+      throw new UsageEventSchemaError(
+        `usage event capability_kind must be one of ${CAPABILITY_KINDS.join("|")}; got ${JSON.stringify(v.capability_kind)}`
+      );
+    }
+    if (v.event_class !== "tool_call") {
+      throw new UsageEventSchemaError(
+        `usage event capability_kind may only be set when event_class === "tool_call"; got event_class=${JSON.stringify(v.event_class)}`
+      );
+    }
   }
   if (!isNonEmptyString(v.capability_target)) {
     throw new UsageEventSchemaError(
@@ -669,3 +684,39 @@ const _exhaustiveModelProvider: Record<ModelProvider, true> = {
   other: true,
 };
 void _exhaustiveModelProvider;
+
+/** Compile-time check: every EventClass is enumerated. */
+const _exhaustiveEventClass: Record<EventClass, true> = {
+  launched: true,
+  paused: true,
+  checkpointed: true,
+  resumed: true,
+  retired: true,
+  revoked: true,
+  tool_call: true,
+  egress_request: true,
+  egress_blocked: true,
+  gate_request: true,
+  gate_approved: true,
+  gate_denied: true,
+  gate_timeout: true,
+  policy_pinned: true,
+  policy_update_requested: true,
+  capability_declared: true,
+  capability_extension_requested: true,
+  envelope_sent: true,
+  envelope_received: true,
+  attestation_emitted: true,
+  attestation_failed: true,
+  commitment_proposed: true,
+  commitment_accepted: true,
+  commitment_fulfilled: true,
+  commitment_unwound: true,
+  mandate_referenced: true,
+  mandate_revoked: true,
+  budget_consumed: true,
+  budget_exceeded: true,
+  sentinel_alert: true,
+  honeypot_triggered: true,
+};
+void _exhaustiveEventClass;
