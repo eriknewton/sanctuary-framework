@@ -63,12 +63,15 @@
     <section id="view-agent_roster" class="view-panel" data-view="agent_roster" style="display:none">
       <h2>Agent Roster</h2>
       <div id="agent-roster-content" class="view-content">
+        <div class="action-bar">
+          <button id="add-agent-btn" class="btn-primary">Add Agent</button>
+        </div>
         <table id="agent-table" class="data-table">
           <thead><tr><th>Agent ID</th><th>Tier</th><th>Harness</th><th>Model</th><th>Policy</th><th>Badge</th></tr></thead>
           <tbody></tbody>
         </table>
         <p id="agent-empty" class="empty-state" style="display:none">
-          No wrapped agents on this fortress yet. Use <code>sanctuary wrap</code> to add one.
+          No wrapped agents on this fortress yet. Use <code>sanctuary wrap</code> or the Add Agent button to get started.
         </p>
       </div>
     </section>
@@ -178,6 +181,44 @@
     </section>
 
   </main>
+
+  <!-- Template picker + scaffold config dialog -->
+  <dialog id="template-picker-dialog" class="envelope-dialog">
+    <h3>Add Agent from Template</h3>
+    <div id="template-picker-step-1">
+      <p>Select a template to scaffold a new agent:</p>
+      <div id="template-card-list" class="template-card-list"></div>
+    </div>
+    <div id="template-picker-step-2" style="display:none">
+      <h4 id="scaffold-template-title"></h4>
+      <form id="scaffold-form" class="form-grid">
+        <label>Agent Name <input name="agent_name" required pattern="[a-zA-Z0-9_\-]+" placeholder="my-x-miner" /></label>
+        <label>Model Provider
+          <select name="model_provider">
+            <option value="xai">xAI</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="openai">OpenAI</option>
+            <option value="mistral">Mistral</option>
+          </select>
+        </label>
+        <fieldset class="scaffold-readonly">
+          <legend>Policy Preview (read-only)</legend>
+          <div id="scaffold-policy-preview" class="policy-preview"></div>
+        </fieldset>
+        <fieldset>
+          <legend>Egress Allowlist</legend>
+          <div id="scaffold-egress-list" class="egress-list"></div>
+          <label>Additional host <input name="extra_egress" placeholder="api.example.com (optional)" /></label>
+        </fieldset>
+        <div class="form-actions">
+          <button type="button" id="scaffold-back" class="btn-secondary">Back</button>
+          <button type="submit" class="btn-primary">Scaffold</button>
+        </div>
+      </form>
+      <div id="scaffold-result" class="result-box" style="display:none"></div>
+    </div>
+    <button id="template-picker-close" class="btn-secondary" style="margin-top:1em">Close</button>
+  </dialog>
 
   <!-- Expanding row detail overlay (for audit log) -->
   <dialog id="envelope-dialog" class="envelope-dialog">

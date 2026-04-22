@@ -33,6 +33,9 @@
     RECOVERY_DMSWITCH: "/api/console/recovery/dmswitch",
     AUDIT_EVENTS: "/api/console/audit/events",
     EVENTS: "/api/console/events",
+    TEMPLATES_LIST: "/api/templates",
+    TEMPLATE_DETAIL: "/api/templates/",
+    TEMPLATE_INIT: "/api/templates/",
   };
 
   var TIER_LABELS = {
@@ -333,6 +336,119 @@
     });
   }
 
+  // ── Template Picker + Scaffold Flow ─────────────────────────────────
+
+  var scaffoldTemplateName = null;
+
+  async function openTemplatePicker() {
+    var dialog = qs("#template-picker-dialog");
+    var step1 = qs("#template-picker-step-1");
+    var step2 = qs("#template-picker-step-2");
+    var cardList = qs("#template-card-list");
+    var resultBox = qs("#scaffold-result");
+
+    // Reset to step 1
+    step1.style.display = "";
+    step2.style.display = "none";
+    resultBox.style.display = "none";
+    cardList.innerHTML = '<p class="empty-state">Loading templates...</p>';
+
+    dialog.showModal();
+
+    try {
+      var res = await apiGet(API.TEMPLATES_LIST);
+      var templates = (res && res.templates) || [];
+      cardList.innerHTML = "";
+      templates.forEach(function (t) {
+        var card = document.createElement("div");
+        card.className = "template-card";
+        card.innerHTML = "<strong>" + escapeHtml(t.metadata.name) + "</strong>"
+          + "<br/><small>" + escapeHtml(t.metadata.description) + "</small>"
+          + "<br/><span class='badge badge-local'>" + escapeHtml(t.metadata.channel) + "</span>"
+          + " <span class='badge badge-local'>Tier " + escapeHtml(t.metadata.tier) + "</span>";
+        card.style.cursor = "pointer";
+        card.addEventListener("click", function () {
+          selectTemplate(t.metadata.name);
+        });
+        cardList.appendChild(card);
+      });
+    } catch (e) {
+      cardList.innerHTML = '<p class="empty-state">Failed to load templates.</p>';
+    }
+  }
+
+  async function selectTemplate(name) {
+    scaffoldTemplateName = name;
+    var step1 = qs("#template-picker-step-1");
+    var step2 = qs("#template-picker-step-2");
+    var resultBox = qs("#scaffold-result");
+    resultBox.style.display = "none";
+
+    qs("#scaffold-template-title").textContent = "Scaffold: " + name;
+    step1.style.display = "none";
+    step2.style.display = "";
+
+    // Fetch template details for policy preview + egress
+    try {
+      var res = await apiGet(API.TEMPLATE_DETAIL + encodeURIComponent(name));
+      if (res && res.metadata) {
+        var preview = qs("#scaffold-policy-preview");
+        preview.textContent = "Channel: " + res.metadata.channel
+          + "\nTier: " + res.metadata.tier
+          + "\n\n" + (res.onboarding || "").slice(0, 500);
+
+        // Pre-select model provider based on template
+        var provSelect = qs('#scaffold-form select[name="model_provider"]');
+        if (name === "x-miner") provSelect.value = "xai";
+        else if (name === "github-miner") provSelect.value = "anthropic";
+        else provSelect.value = "anthropic";
+      }
+    } catch (e) { /* proceed with defaults */ }
+
+    // Reset form
+    qs('#scaffold-form input[name="agent_name"]').value = "";
+    qs('#scaffold-form input[name="extra_egress"]').value = "";
+  }
+
+  async function handleScaffoldSubmit(ev) {
+    ev.preventDefault();
+    if (!scaffoldTemplateName) return;
+    var fd = new FormData(qs("#scaffold-form"));
+    var agentName = fd.get("agent_name");
+    var modelProvider = fd.get("model_provider");
+    var extraEgress = fd.get("extra_egress");
+
+    var body = {
+      agent_name: agentName,
+      model_provider: modelProvider,
+    };
+    if (extraEgress) {
+      body.overrides = { egress_allow: [extraEgress] };
+    }
+
+    var resultBox = qs("#scaffold-result");
+    try {
+      var res = await apiPost(
+        API.TEMPLATE_INIT + encodeURIComponent(scaffoldTemplateName) + "/init",
+        body
+      );
+      if (res.agent_id) {
+        resultBox.style.display = "";
+        resultBox.textContent = "Agent \"" + res.agent_id + "\" scaffolded successfully. "
+          + "Policy v" + res.policy_version + " pinned. "
+          + "Event: " + res.signed_event_id;
+        // Refresh agent roster after scaffold
+        loadAgentRosterView();
+      } else {
+        resultBox.style.display = "";
+        resultBox.textContent = "Error: " + (res.message || res.error || "Unknown error");
+      }
+    } catch (e) {
+      resultBox.style.display = "";
+      resultBox.textContent = "Error: " + (e.message || "Request failed");
+    }
+  }
+
   // ── View Router ────────────────────────────────────────────────────
 
   function loadView(view) {
@@ -402,6 +518,27 @@
     if (ec) ec.addEventListener("click", function () {
       qs("#envelope-dialog").close();
     });
+
+    // Template picker: "Add Agent" button
+    var addAgentBtn = qs("#add-agent-btn");
+    if (addAgentBtn) addAgentBtn.addEventListener("click", openTemplatePicker);
+
+    // Template picker: close button
+    var tpc = qs("#template-picker-close");
+    if (tpc) tpc.addEventListener("click", function () {
+      qs("#template-picker-dialog").close();
+    });
+
+    // Template picker: back button
+    var sb = qs("#scaffold-back");
+    if (sb) sb.addEventListener("click", function () {
+      qs("#template-picker-step-1").style.display = "";
+      qs("#template-picker-step-2").style.display = "none";
+    });
+
+    // Template picker: scaffold form submit
+    var sf = qs("#scaffold-form");
+    if (sf) sf.addEventListener("submit", handleScaffoldSubmit);
 
     // ── SSE ─────────────────────────────────────────────────────────
     try {

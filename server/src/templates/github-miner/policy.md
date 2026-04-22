@@ -1,0 +1,1 @@
+This agent may read from the GitHub API to mine repository, issue, and pull request data. It writes research outputs to the outputs slot for the operator orchestrator to consume. No credentials access. No plans access. No memory sync with other agents. The operator reviews all outputs before acting on them. Outputs are read-only to other agents in the mesh.
