@@ -26,7 +26,14 @@
  * via `cocoon-binding.ts`.
  */
 
-import { promises as fs } from "node:fs";
+import {
+  promises as fs,
+  closeSync,
+  fsyncSync,
+  openSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import * as path from "node:path";
 import type { EncryptedPayload } from "../../core/encryption.js";
 import type { CounterName, CounterStore, NodeKeyStore } from "./types.js";
@@ -201,22 +208,23 @@ export class FileCounterStore implements CounterStore {
   }
 
   private persistSync(): void {
-    // Lazily-imported sync-fs functions; avoids the top-level cost when
-    // tests construct but never write.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fss = require("node:fs") as typeof import("node:fs");
+    // Pure-ESM: use the top-level static imports. The prior `require("node:fs")`
+    // pattern silently broke under `npx tsx` / real Node.js ESM runtimes
+    // — vitest's module wrapper polyfilled `require` but nothing else did,
+    // so the pilot onboarding script failed at `emitHeartbeat` on every
+    // counter persist.
     const tmp = this.file + ".tmp";
     const snapshot: Record<string, number> = {};
     for (const [k, v] of this.values) snapshot[k] = v;
     const bytes = JSON.stringify(snapshot);
-    const fd = fss.openSync(tmp, "w", 0o600);
+    const fd = openSync(tmp, "w", 0o600);
     try {
-      fss.writeFileSync(fd, bytes, { encoding: "utf8" });
-      fss.fsyncSync(fd);
+      writeFileSync(fd, bytes, { encoding: "utf8" });
+      fsyncSync(fd);
     } finally {
-      fss.closeSync(fd);
+      closeSync(fd);
     }
-    fss.renameSync(tmp, this.file);
+    renameSync(tmp, this.file);
   }
 }
 
