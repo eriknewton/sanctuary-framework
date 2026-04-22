@@ -2,7 +2,7 @@
  * README sanity check — verifies the user-facing README has dropped
  * "Cocoon" from its active copy.
  *
- * One historical mention is allowed inside the "Before (six steps)" block,
+ * One historical mention is allowed inside the "Before" block,
  * where we contrast the new wrap command against the old cocoon subcommand.
  */
 
@@ -16,7 +16,7 @@ describe("README", () => {
   it("advertises the new one-command wrap", async () => {
     const readme = await readFile(README_PATH, "utf-8");
     expect(readme).toContain("npx @sanctuary-framework/mcp-server wrap --openclaw");
-    expect(readme).toContain("Wrap Any Agent in One Command");
+    expect(readme).toContain("Wrap any harness in one command");
   });
 
   it("documents export-passphrase", async () => {
@@ -32,7 +32,7 @@ describe("README", () => {
 
   it("does not describe 'Cocoon' as a current feature (post-Before)", async () => {
     const readme = await readFile(README_PATH, "utf-8");
-    const beforeMarker = "**Before (six steps):**";
+    const beforeMarker = "**Before (four steps):**";
     const afterMarker = "**After (one step):**";
     const beforeIdx = readme.indexOf(beforeMarker);
     const afterIdx = readme.indexOf(afterMarker);
