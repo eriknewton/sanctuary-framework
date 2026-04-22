@@ -1,0 +1,671 @@
+/**
+ * Sanctuary Agent Contract v0.1 — Schema Validation.
+ *
+ * Hand-rolled structural validators matching the spec §3 (Agent Card) and
+ * §6 (usage event) JSON Schemas exactly. No runtime dependency on Zod.
+ * The policy engine follows the same pattern — deterministic checks on
+ * known fields, explicit rejection of unknown fields where forward-compat
+ * is not intended.
+ *
+ * Every validator throws the matching `AgentContractError` subclass on
+ * failure. No validator returns partial data or coerces values.
+ */
+
+import {
+  AGENT_CONTRACT_VERSION,
+  CAPABILITY_KINDS,
+  HARNESS_TIERS,
+  LIFECYCLE_STATES,
+  MODEL_PROVIDERS,
+  SIGNATURE_SCHEME_V1,
+  type CapabilityKind,
+  type HarnessTier,
+  type LifecycleState,
+  type ModelProvider,
+} from "./constants.js";
+import {
+  AgentCardSchemaError,
+  UsageEventSchemaError,
+  AgentContractError,
+} from "./errors.js";
+import type {
+  AgentCard,
+  AgentCardCapability,
+  Attestation,
+  CommitmentProposal,
+  HarnessEnvelope,
+  LifecycleEvent,
+  UsageEvent,
+} from "./types.js";
+
+// ═══════════════════════════════════════════════════════════════════════
+// Primitives
+// ═══════════════════════════════════════════════════════════════════════
+
+const BASE64URL = /^[A-Za-z0-9_-]+$/;
+/**
+ * ISO 8601 UTC with required `Z` terminator and second precision or finer.
+ * Rejects offsets other than `Z` so receivers don't need timezone math.
+ */
+const ISO8601_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0;
+}
+
+function isBase64url(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0 && BASE64URL.test(v);
+}
+
+function isISOUtc(v: unknown): v is string {
+  return typeof v === "string" && ISO8601_UTC.test(v);
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** Enum membership check. */
+function isIn<T extends readonly string[]>(
+  v: unknown,
+  set: T
+): v is T[number] {
+  return typeof v === "string" && (set as readonly string[]).includes(v);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Agent Card (§3)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Allowed top-level keys on an Agent Card. Unknown keys are rejected so the
+ * schema is closed — spec §3 versions the schema via `schema_version`, not
+ * via silent extension. If a future version adds fields, bump schema_version
+ * and fan out the allowed key set.
+ */
+const AGENT_CARD_ALLOWED_KEYS = new Set([
+  "schema_version",
+  "signature_scheme",
+  "agent_id",
+  "fortress_id",
+  "tier",
+  "harness_id",
+  "model_provider",
+  "model_id",
+  "agent_pubkey",
+  "policy_version_hash",
+  "policy_version",
+  "attestation_endpoint",
+  "capabilities",
+  "issued_at",
+  "expires_at",
+]);
+
+const CAPABILITY_ALLOWED_KEYS = new Set(["kind", "target", "constraints"]);
+
+/**
+ * Validate a single capability entry on an Agent Card. Throws
+ * AgentCardSchemaError on any deviation.
+ */
+export function validateCapability(c: unknown): AgentCardCapability {
+  if (!isPlainObject(c)) {
+    throw new AgentCardSchemaError(
+      `capability must be an object; got ${typeof c}`
+    );
+  }
+  for (const key of Object.keys(c)) {
+    if (!CAPABILITY_ALLOWED_KEYS.has(key)) {
+      throw new AgentCardSchemaError(
+        `capability has unknown key "${key}" — allowed: ${[...CAPABILITY_ALLOWED_KEYS].join(", ")}`
+      );
+    }
+  }
+  if (!isIn(c.kind, CAPABILITY_KINDS)) {
+    throw new AgentCardSchemaError(
+      `capability.kind must be one of ${CAPABILITY_KINDS.join("|")}; got ${JSON.stringify(c.kind)}`
+    );
+  }
+  if (!isNonEmptyString(c.target)) {
+    throw new AgentCardSchemaError(
+      `capability.target must be a non-empty string; got ${JSON.stringify(c.target)}`
+    );
+  }
+  if ("constraints" in c && c.constraints !== undefined) {
+    if (!isPlainObject(c.constraints)) {
+      throw new AgentCardSchemaError(
+        `capability.constraints must be a plain object if present; got ${typeof c.constraints}`
+      );
+    }
+  }
+  return c as unknown as AgentCardCapability;
+}
+
+/**
+ * Validate an Agent Card against spec §3. Returns the card typed on success;
+ * throws AgentCardSchemaError on any deviation.
+ *
+ * Closed-schema: unknown top-level keys are rejected.
+ */
+export function validateAgentCard(v: unknown): AgentCard {
+  if (!isPlainObject(v)) {
+    throw new AgentCardSchemaError(
+      `Agent Card must be an object; got ${typeof v}`
+    );
+  }
+  for (const key of Object.keys(v)) {
+    if (!AGENT_CARD_ALLOWED_KEYS.has(key)) {
+      throw new AgentCardSchemaError(
+        `Agent Card has unknown key "${key}" — bump schema_version instead of silently extending`
+      );
+    }
+  }
+  if (v.schema_version !== AGENT_CONTRACT_VERSION) {
+    throw new AgentCardSchemaError(
+      `Agent Card schema_version must be "${AGENT_CONTRACT_VERSION}"; got ${JSON.stringify(v.schema_version)}`
+    );
+  }
+  if (v.signature_scheme !== SIGNATURE_SCHEME_V1) {
+    throw new AgentCardSchemaError(
+      `Agent Card signature_scheme must be "${SIGNATURE_SCHEME_V1}"; got ${JSON.stringify(v.signature_scheme)} — crypto-agility hinge, do not drop`
+    );
+  }
+  if (!isNonEmptyString(v.agent_id)) {
+    throw new AgentCardSchemaError(
+      `Agent Card agent_id must be a non-empty string`
+    );
+  }
+  if (!isNonEmptyString(v.fortress_id)) {
+    throw new AgentCardSchemaError(
+      `Agent Card fortress_id must be a non-empty string`
+    );
+  }
+  if (!isIn(v.tier, HARNESS_TIERS)) {
+    throw new AgentCardSchemaError(
+      `Agent Card tier must be one of ${HARNESS_TIERS.join("|")}; got ${JSON.stringify(v.tier)}`
+    );
+  }
+  if (!isNonEmptyString(v.harness_id)) {
+    throw new AgentCardSchemaError(
+      `Agent Card harness_id must be a non-empty string`
+    );
+  }
+  if (!isIn(v.model_provider, MODEL_PROVIDERS)) {
+    throw new AgentCardSchemaError(
+      `Agent Card model_provider must be one of ${MODEL_PROVIDERS.join("|")}; got ${JSON.stringify(v.model_provider)}`
+    );
+  }
+  if (!isNonEmptyString(v.model_id)) {
+    throw new AgentCardSchemaError(
+      `Agent Card model_id must be a non-empty string`
+    );
+  }
+  if (!isBase64url(v.agent_pubkey)) {
+    throw new AgentCardSchemaError(
+      `Agent Card agent_pubkey must be a base64url string`
+    );
+  }
+  if (!isBase64url(v.policy_version_hash)) {
+    throw new AgentCardSchemaError(
+      `Agent Card policy_version_hash must be a base64url string`
+    );
+  }
+  if (typeof v.policy_version !== "number" || !Number.isInteger(v.policy_version)) {
+    throw new AgentCardSchemaError(
+      `Agent Card policy_version must be an integer; got ${JSON.stringify(v.policy_version)}`
+    );
+  }
+  if (!isNonEmptyString(v.attestation_endpoint)) {
+    throw new AgentCardSchemaError(
+      `Agent Card attestation_endpoint must be a non-empty string`
+    );
+  }
+  if (!Array.isArray(v.capabilities)) {
+    throw new AgentCardSchemaError(
+      `Agent Card capabilities must be an array; got ${typeof v.capabilities}`
+    );
+  }
+  for (const c of v.capabilities) validateCapability(c);
+  if (!isISOUtc(v.issued_at)) {
+    throw new AgentCardSchemaError(
+      `Agent Card issued_at must be ISO8601 UTC (with Z terminator); got ${JSON.stringify(v.issued_at)}`
+    );
+  }
+  if (v.expires_at !== undefined && !isISOUtc(v.expires_at)) {
+    throw new AgentCardSchemaError(
+      `Agent Card expires_at must be ISO8601 UTC or omitted; got ${JSON.stringify(v.expires_at)}`
+    );
+  }
+  return v as unknown as AgentCard;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Usage event (§6)
+// ═══════════════════════════════════════════════════════════════════════
+
+const USAGE_EVENT_ALLOWED_KEYS = new Set([
+  "schema_version",
+  "signature_scheme",
+  "usage_event_id",
+  "agent_id",
+  "fortress_id",
+  "capability_kind",
+  "capability_target",
+  "input_hash",
+  "output_hash",
+  "policy_version",
+  "policy_version_hash",
+  "attestation_state",
+  "emitted_at",
+  "extension",
+]);
+
+const ATTESTATION_STATES = ["present", "degraded", "unavailable"] as const;
+
+export function validateUsageEvent(v: unknown): UsageEvent {
+  if (!isPlainObject(v)) {
+    throw new UsageEventSchemaError(
+      `usage event must be an object; got ${typeof v}`
+    );
+  }
+  for (const key of Object.keys(v)) {
+    if (!USAGE_EVENT_ALLOWED_KEYS.has(key)) {
+      throw new UsageEventSchemaError(
+        `usage event has unknown key "${key}"`
+      );
+    }
+  }
+  if (v.schema_version !== AGENT_CONTRACT_VERSION) {
+    throw new UsageEventSchemaError(
+      `usage event schema_version must be "${AGENT_CONTRACT_VERSION}"; got ${JSON.stringify(v.schema_version)}`
+    );
+  }
+  if (v.signature_scheme !== SIGNATURE_SCHEME_V1) {
+    throw new UsageEventSchemaError(
+      `usage event signature_scheme must be "${SIGNATURE_SCHEME_V1}"; got ${JSON.stringify(v.signature_scheme)}`
+    );
+  }
+  if (!isNonEmptyString(v.usage_event_id)) {
+    throw new UsageEventSchemaError(
+      `usage event usage_event_id must be a non-empty string`
+    );
+  }
+  if (!isNonEmptyString(v.agent_id)) {
+    throw new UsageEventSchemaError(
+      `usage event agent_id must be a non-empty string`
+    );
+  }
+  if (!isNonEmptyString(v.fortress_id)) {
+    throw new UsageEventSchemaError(
+      `usage event fortress_id must be a non-empty string`
+    );
+  }
+  if (!isIn(v.capability_kind, CAPABILITY_KINDS)) {
+    throw new UsageEventSchemaError(
+      `usage event capability_kind must be one of ${CAPABILITY_KINDS.join("|")}; got ${JSON.stringify(v.capability_kind)}`
+    );
+  }
+  if (!isNonEmptyString(v.capability_target)) {
+    throw new UsageEventSchemaError(
+      `usage event capability_target must be a non-empty string`
+    );
+  }
+  if (!isBase64url(v.input_hash)) {
+    throw new UsageEventSchemaError(
+      `usage event input_hash must be a base64url string`
+    );
+  }
+  if (!isBase64url(v.output_hash)) {
+    throw new UsageEventSchemaError(
+      `usage event output_hash must be a base64url string`
+    );
+  }
+  if (
+    typeof v.policy_version !== "number" ||
+    !Number.isInteger(v.policy_version)
+  ) {
+    throw new UsageEventSchemaError(
+      `usage event policy_version must be an integer`
+    );
+  }
+  if (!isBase64url(v.policy_version_hash)) {
+    throw new UsageEventSchemaError(
+      `usage event policy_version_hash must be a base64url string`
+    );
+  }
+  if (!isIn(v.attestation_state, ATTESTATION_STATES)) {
+    throw new UsageEventSchemaError(
+      `usage event attestation_state must be one of ${ATTESTATION_STATES.join("|")}; got ${JSON.stringify(v.attestation_state)}`
+    );
+  }
+  if (!isISOUtc(v.emitted_at)) {
+    throw new UsageEventSchemaError(
+      `usage event emitted_at must be ISO8601 UTC with Z terminator`
+    );
+  }
+  if (v.extension !== undefined && !isPlainObject(v.extension)) {
+    throw new UsageEventSchemaError(
+      `usage event extension must be a plain object if present`
+    );
+  }
+  return v as unknown as UsageEvent;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Lifecycle event (§2.8)
+// ═══════════════════════════════════════════════════════════════════════
+
+const LIFECYCLE_FROM_STATES = [...LIFECYCLE_STATES, "uninstantiated"] as const;
+
+export function validateLifecycleEvent(v: unknown): LifecycleEvent {
+  if (!isPlainObject(v)) {
+    throw new AgentContractError(
+      `lifecycle event must be an object; got ${typeof v}`
+    );
+  }
+  if (v.schema_version !== AGENT_CONTRACT_VERSION) {
+    throw new AgentContractError(
+      `lifecycle event schema_version must be "${AGENT_CONTRACT_VERSION}"`
+    );
+  }
+  if (v.signature_scheme !== SIGNATURE_SCHEME_V1) {
+    throw new AgentContractError(
+      `lifecycle event signature_scheme must be "${SIGNATURE_SCHEME_V1}"`
+    );
+  }
+  if (!isNonEmptyString(v.agent_id)) {
+    throw new AgentContractError(`lifecycle event agent_id required`);
+  }
+  if (!isNonEmptyString(v.fortress_id)) {
+    throw new AgentContractError(`lifecycle event fortress_id required`);
+  }
+  if (!isIn(v.from_state, LIFECYCLE_FROM_STATES)) {
+    throw new AgentContractError(
+      `lifecycle event from_state must be one of ${LIFECYCLE_FROM_STATES.join("|")}`
+    );
+  }
+  if (!isIn(v.to_state, LIFECYCLE_STATES)) {
+    throw new AgentContractError(
+      `lifecycle event to_state must be one of ${LIFECYCLE_STATES.join("|")}`
+    );
+  }
+  if (!isNonEmptyString(v.reason)) {
+    throw new AgentContractError(`lifecycle event reason required`);
+  }
+  if (!isISOUtc(v.emitted_at)) {
+    throw new AgentContractError(`lifecycle event emitted_at must be ISO8601 UTC`);
+  }
+  if (v.checkpoint_hash !== undefined && !isBase64url(v.checkpoint_hash)) {
+    throw new AgentContractError(
+      `lifecycle event checkpoint_hash must be base64url if present`
+    );
+  }
+  if (v.guardian_quorum !== undefined) {
+    if (!Array.isArray(v.guardian_quorum)) {
+      throw new AgentContractError(
+        `lifecycle event guardian_quorum must be an array if present`
+      );
+    }
+    for (const g of v.guardian_quorum) {
+      if (!isPlainObject(g)) {
+        throw new AgentContractError(
+          `guardian_quorum entry must be an object`
+        );
+      }
+      if (!isBase64url(g.guardian_pubkey) || !isBase64url(g.signature)) {
+        throw new AgentContractError(
+          `guardian_quorum entry must have base64url guardian_pubkey + signature`
+        );
+      }
+    }
+  }
+  return v as unknown as LifecycleEvent;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Attestation (§2.9)
+// ═══════════════════════════════════════════════════════════════════════
+
+const ATTESTATION_SOURCES = ["harness_self_report", "proxy_canonical"] as const;
+
+export function validateAttestation(v: unknown): Attestation {
+  if (!isPlainObject(v)) {
+    throw new AgentContractError(
+      `attestation must be an object; got ${typeof v}`
+    );
+  }
+  if (v.schema_version !== AGENT_CONTRACT_VERSION) {
+    throw new AgentContractError(`attestation schema_version mismatch`);
+  }
+  if (v.signature_scheme !== SIGNATURE_SCHEME_V1) {
+    throw new AgentContractError(`attestation signature_scheme mismatch`);
+  }
+  if (!isNonEmptyString(v.attestation_id)) {
+    throw new AgentContractError(`attestation_id required`);
+  }
+  if (!isNonEmptyString(v.agent_id)) {
+    throw new AgentContractError(`attestation agent_id required`);
+  }
+  if (!isNonEmptyString(v.fortress_id)) {
+    throw new AgentContractError(`attestation fortress_id required`);
+  }
+  if (!isNonEmptyString(v.usage_event_id)) {
+    throw new AgentContractError(`attestation usage_event_id required`);
+  }
+  if (!isIn(v.source, ATTESTATION_SOURCES)) {
+    throw new AgentContractError(
+      `attestation source must be one of ${ATTESTATION_SOURCES.join("|")}`
+    );
+  }
+  if (!isBase64url(v.attested_hash)) {
+    throw new AgentContractError(`attestation attested_hash must be base64url`);
+  }
+  if (!isISOUtc(v.emitted_at)) {
+    throw new AgentContractError(`attestation emitted_at must be ISO8601 UTC`);
+  }
+  if (v.attested_payload !== undefined && !isPlainObject(v.attested_payload)) {
+    throw new AgentContractError(
+      `attestation attested_payload must be a plain object if present`
+    );
+  }
+  return v as unknown as Attestation;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Commitment proposal (§7.1 output shape)
+// ═══════════════════════════════════════════════════════════════════════
+
+export function validateCommitmentProposal(v: unknown): CommitmentProposal {
+  if (!isPlainObject(v)) {
+    throw new AgentContractError(
+      `commitment proposal must be an object; got ${typeof v}`
+    );
+  }
+  if (v.schema_version !== AGENT_CONTRACT_VERSION) {
+    throw new AgentContractError(`commitment proposal schema_version mismatch`);
+  }
+  if (v.signature_scheme !== SIGNATURE_SCHEME_V1) {
+    throw new AgentContractError(`commitment proposal signature_scheme mismatch`);
+  }
+  if (!isNonEmptyString(v.proposal_id)) {
+    throw new AgentContractError(`commitment proposal proposal_id required`);
+  }
+  if (!isNonEmptyString(v.agent_id)) {
+    throw new AgentContractError(`commitment proposal agent_id required`);
+  }
+  if (!isNonEmptyString(v.fortress_id)) {
+    throw new AgentContractError(`commitment proposal fortress_id required`);
+  }
+  if (!isNonEmptyString(v.commitment_class)) {
+    throw new AgentContractError(`commitment proposal commitment_class required`);
+  }
+  if (!isNonEmptyString(v.counterparty)) {
+    throw new AgentContractError(`commitment proposal counterparty required`);
+  }
+  if (!isPlainObject(v.bounded_scope)) {
+    throw new AgentContractError(`commitment proposal bounded_scope required`);
+  }
+  for (const field of [
+    "deliverable",
+    "deadline_or_terminal",
+    "budget_ref",
+  ] as const) {
+    const bs = v.bounded_scope as Record<string, unknown>;
+    if (!isNonEmptyString(bs[field])) {
+      throw new AgentContractError(
+        `commitment proposal bounded_scope.${field} required (non-empty)`
+      );
+    }
+  }
+  if (
+    typeof v.policy_version !== "number" ||
+    !Number.isInteger(v.policy_version)
+  ) {
+    throw new AgentContractError(`commitment proposal policy_version must be integer`);
+  }
+  if (!isBase64url(v.policy_version_hash)) {
+    throw new AgentContractError(`commitment proposal policy_version_hash base64url required`);
+  }
+  if (!isISOUtc(v.emitted_at)) {
+    throw new AgentContractError(`commitment proposal emitted_at must be ISO8601 UTC`);
+  }
+  if (!isNonEmptyString(v.gate_receipt_id)) {
+    throw new AgentContractError(`commitment proposal gate_receipt_id required`);
+  }
+  return v as unknown as CommitmentProposal;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Harness envelope (§2.3)
+// ═══════════════════════════════════════════════════════════════════════
+
+const ENVELOPE_DIRECTIONS = ["harness_in", "harness_out"] as const;
+
+export function validateHarnessEnvelope(v: unknown): HarnessEnvelope {
+  if (!isPlainObject(v)) {
+    throw new AgentContractError(
+      `harness envelope must be an object; got ${typeof v}`
+    );
+  }
+  if (v.schema_version !== AGENT_CONTRACT_VERSION) {
+    throw new AgentContractError(`harness envelope schema_version mismatch`);
+  }
+  if (v.signature_scheme !== SIGNATURE_SCHEME_V1) {
+    throw new AgentContractError(`harness envelope signature_scheme mismatch`);
+  }
+  if (!isNonEmptyString(v.envelope_id)) {
+    throw new AgentContractError(`harness envelope envelope_id required`);
+  }
+  if (!isIn(v.direction, ENVELOPE_DIRECTIONS)) {
+    throw new AgentContractError(
+      `harness envelope direction must be one of ${ENVELOPE_DIRECTIONS.join("|")}`
+    );
+  }
+  if (!isNonEmptyString(v.agent_id)) {
+    throw new AgentContractError(`harness envelope agent_id required`);
+  }
+  if (!isNonEmptyString(v.fortress_id)) {
+    throw new AgentContractError(`harness envelope fortress_id required`);
+  }
+  if (!isIn(v.capability_kind, CAPABILITY_KINDS)) {
+    throw new AgentContractError(
+      `harness envelope capability_kind must be a valid CapabilityKind`
+    );
+  }
+  if (!isNonEmptyString(v.capability_target)) {
+    throw new AgentContractError(`harness envelope capability_target required`);
+  }
+  if (v.body === undefined) {
+    throw new AgentContractError(`harness envelope body required`);
+  }
+  if (!isBase64url(v.body_hash)) {
+    throw new AgentContractError(`harness envelope body_hash must be base64url`);
+  }
+  if (
+    typeof v.policy_version !== "number" ||
+    !Number.isInteger(v.policy_version)
+  ) {
+    throw new AgentContractError(`harness envelope policy_version must be integer`);
+  }
+  if (!isPlainObject(v.sender_claim)) {
+    throw new AgentContractError(`harness envelope sender_claim required`);
+  }
+  const claim = v.sender_claim as Record<string, unknown>;
+  if (!isNonEmptyString(claim.claimant) || !isISOUtc(claim.asserted_at)) {
+    throw new AgentContractError(
+      `harness envelope sender_claim.{claimant,asserted_at} malformed`
+    );
+  }
+  if (!isISOUtc(v.wrapped_at)) {
+    throw new AgentContractError(`harness envelope wrapped_at must be ISO8601 UTC`);
+  }
+  if (v.receiver_check !== undefined) {
+    if (!isPlainObject(v.receiver_check)) {
+      throw new AgentContractError(
+        `harness envelope receiver_check must be an object if present`
+      );
+    }
+    const rc = v.receiver_check as Record<string, unknown>;
+    if (rc.decision !== "allow" && rc.decision !== "deny") {
+      throw new AgentContractError(
+        `harness envelope receiver_check.decision must be allow|deny`
+      );
+    }
+    if (!isNonEmptyString(rc.reason_code)) {
+      throw new AgentContractError(
+        `harness envelope receiver_check.reason_code required`
+      );
+    }
+  }
+  return v as unknown as HarnessEnvelope;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Type-level reassurance — exhaustiveness aids
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Compile-time check: every CapabilityKind is enumerated. */
+const _exhaustiveCapabilityKind: Record<CapabilityKind, true> = {
+  "read-slot": true,
+  "write-slot": true,
+  "subscribe-slot": true,
+  "tool-call": true,
+  egress: true,
+  "concordia-commitment": true,
+  attestation: true,
+  lifecycle: true,
+};
+void _exhaustiveCapabilityKind;
+
+/** Compile-time check: every HarnessTier is enumerated. */
+const _exhaustiveHarnessTier: Record<HarnessTier, true> = {
+  A: true,
+  B: true,
+  C: true,
+};
+void _exhaustiveHarnessTier;
+
+/** Compile-time check: every LifecycleState is enumerated. */
+const _exhaustiveLifecycleState: Record<LifecycleState, true> = {
+  launched: true,
+  paused: true,
+  checkpointed: true,
+  resumed: true,
+  retired: true,
+  revoked: true,
+};
+void _exhaustiveLifecycleState;
+
+/** Compile-time check: every ModelProvider is enumerated. */
+const _exhaustiveModelProvider: Record<ModelProvider, true> = {
+  anthropic: true,
+  openai: true,
+  google: true,
+  meta: true,
+  mistral: true,
+  cohere: true,
+  xai: true,
+  venice: true,
+  "self-hosted": true,
+  other: true,
+};
+void _exhaustiveModelProvider;
