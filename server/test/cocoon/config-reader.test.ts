@@ -131,6 +131,55 @@ describe("Config Reader", () => {
       expect(result!.servers).toHaveLength(1);
       expect(result!.servers[0]!.name).toBe("filesystem");
     });
+
+    it("reads Hermes-style mcp_servers config (snake_case, flat)", async () => {
+      const configPath = join(tmpDir, "cli-config.json");
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          mcp_servers: {
+            filesystem: {
+              command: "node",
+              args: ["fs-server.js"],
+            },
+            github: {
+              command: "npx",
+              args: ["-y", "@github/mcp-server"],
+              env: { GITHUB_TOKEN: "tok_hermes" },
+            },
+          },
+        })
+      );
+
+      const result = await detectAgentConfig("hermes", configPath);
+      expect(result).not.toBeNull();
+      expect(result!.platform).toBe("hermes");
+      expect(result!.servers).toHaveLength(2);
+      expect(result!.servers[0]!.name).toBe("filesystem");
+      expect(result!.servers[1]!.name).toBe("github");
+      expect(result!.servers[1]!.env).toEqual({ GITHUB_TOKEN: "tok_hermes" });
+    });
+
+    it("skips sanctuary entries in Hermes mcp_servers config", async () => {
+      const configPath = join(tmpDir, "cli-config.json");
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          mcp_servers: {
+            sanctuary: {
+              command: "npx",
+              args: ["@sanctuary-framework/mcp-server"],
+            },
+            filesystem: { command: "node", args: ["fs-server.js"] },
+          },
+        })
+      );
+
+      const result = await detectAgentConfig("hermes", configPath);
+      expect(result).not.toBeNull();
+      expect(result!.servers).toHaveLength(1);
+      expect(result!.servers[0]!.name).toBe("filesystem");
+    });
   });
 
   // ── Backup and restore ──────────────────────────────────────────
@@ -314,6 +363,57 @@ describe("Config Reader", () => {
       expect(rewritten.mcp.servers.sanctuary.env).toEqual({
         SANCTUARY_PASSPHRASE: "new-secret",
       });
+    });
+
+    it("rewrites Hermes config keeping snake_case mcp_servers and top-level siblings", async () => {
+      const configPath = join(tmpDir, "cli-config.json");
+      const original = {
+        model_provider: "self-hosted",
+        memory: { enabled: true },
+        mcp_servers: {
+          filesystem: { command: "node", args: ["fs-server.js"] },
+          github: {
+            command: "npx",
+            args: ["-y", "@github/mcp-server"],
+            env: { GITHUB_TOKEN: "tok_hermes" },
+          },
+        },
+      };
+      await writeFile(configPath, JSON.stringify(original));
+
+      const agentConfig = await detectAgentConfig("hermes", configPath);
+      expect(agentConfig).not.toBeNull();
+
+      await rewriteConfigForCocoon(
+        agentConfig!,
+        "npx",
+        ["@sanctuary-framework/mcp-server"],
+        { SANCTUARY_PASSPHRASE: "test-hermes" }
+      );
+
+      const rewritten = JSON.parse(await readFile(configPath, "utf-8"));
+
+      // Hermes uses snake_case mcp_servers — camelCase must NOT appear.
+      expect(rewritten.mcp_servers).toBeDefined();
+      expect(rewritten.mcpServers).toBeUndefined();
+
+      // Sanctuary entry added with provided env
+      expect(rewritten.mcp_servers.sanctuary).toBeDefined();
+      expect(rewritten.mcp_servers.sanctuary.command).toBe("npx");
+      expect(rewritten.mcp_servers.sanctuary.env).toEqual({
+        SANCTUARY_PASSPHRASE: "test-hermes",
+      });
+
+      // Existing servers preserved with env vars intact
+      expect(rewritten.mcp_servers.filesystem).toBeDefined();
+      expect(rewritten.mcp_servers.github).toBeDefined();
+      expect(rewritten.mcp_servers.github.env).toEqual({
+        GITHUB_TOKEN: "tok_hermes",
+      });
+
+      // Top-level siblings (non-mcp Hermes fields) preserved.
+      expect(rewritten.model_provider).toBe("self-hosted");
+      expect(rewritten.memory).toEqual({ enabled: true });
     });
 
     it("preserves top-level mcp fields in OpenClaw format", async () => {
