@@ -37,3 +37,11 @@ export type {
   EmitForCommitmentInput,
   EmitForCommitmentResult,
 } from "./composition-service.js";
+export { runCompositionPipeline } from "./production-pipeline.js";
+export type {
+  CompositionPipelineInput,
+  CompositionPipelineResult,
+  CompositionPipelineStatus,
+  CompositionAuditEntry,
+  CompositionAuditAppender,
+} from "./production-pipeline.js";

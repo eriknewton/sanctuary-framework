@@ -32,6 +32,10 @@ describe("parseWrapArgs", () => {
     expect(parseWrapArgs(["--cursor"]).cursor).toBe(true);
   });
 
+  it("parses --hermes flag", () => {
+    expect(parseWrapArgs(["--hermes"]).hermes).toBe(true);
+  });
+
   it("parses --cline flag", () => {
     expect(parseWrapArgs(["--cline"]).cline).toBe(true);
   });
@@ -668,5 +672,140 @@ describe("runWrap — v0.10.0 WP1 multi-tenancy env vars", () => {
     );
     expect(meta.originalPath).toBe(configPath);
     expect(meta.backupPath.startsWith(join(tenantDir, "backup"))).toBe(true);
+  });
+});
+
+// ── WP-MVP-1 Follow-up: runWrap — --hermes path ──────────────────────
+//
+// Integration test for the Hermes wrap-CLI surface. Exercises the full
+// path: parse --hermes → detect Hermes at the canonical JSON config path
+// → rewrite to route through Sanctuary → verify the rewritten config
+// carries the Hermes-shaped `mcp_servers` key with a `sanctuary` entry.
+
+describe("runWrap — --hermes wrap path (WP-MVP-1 follow-up)", () => {
+  let tempHome: string;
+  let originalHome: string | undefined;
+  let hermesConfigPath: string;
+
+  function fakeDashboardStarter(): DashboardStarter {
+    return async (opts) => ({
+      url: `http://127.0.0.1:${opts.port}`,
+      port: opts.port,
+      host: "127.0.0.1",
+      stop: async () => {},
+      publish: () => {},
+      publishActivity: () => {},
+      publishApproval: () => {},
+    });
+  }
+
+  beforeEach(async () => {
+    tempHome = await mkdtemp(join(tmpdir(), "sanctuary-hermes-"));
+    originalHome = process.env.HOME;
+    process.env.HOME = tempHome;
+
+    // Seed ~/.hermes/cli-config.json with the Hermes canonical shape.
+    const hermesDir = join(tempHome, ".hermes");
+    await import("node:fs/promises").then((fs) =>
+      fs.mkdir(hermesDir, { recursive: true })
+    );
+    hermesConfigPath = join(hermesDir, "cli-config.json");
+    await writeFile(
+      hermesConfigPath,
+      JSON.stringify({
+        model_provider: "self-hosted",
+        mcp_servers: {
+          filesystem: {
+            command: "node",
+            args: ["fs-server.js"],
+          },
+          github: {
+            command: "npx",
+            args: ["-y", "@github/mcp-server"],
+            env: { GITHUB_TOKEN: "tok_hermes" },
+          },
+        },
+      }),
+      "utf-8"
+    );
+  });
+
+  afterEach(async () => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    await rm(tempHome, { recursive: true, force: true });
+  });
+
+  it("auto-detects ~/.hermes/cli-config.json when --hermes is passed", async () => {
+    const rewriteSpy = vi.fn(async (agentConfig, command: string, args: string[]) => {
+      // Write a minimal post-rewrite shape that the verifier is happy with:
+      // Hermes uses snake_case mcp_servers, and verifyRewrittenConfig now
+      // reads that key.
+      await writeFile(
+        hermesConfigPath,
+        JSON.stringify({
+          model_provider: "self-hosted",
+          mcp_servers: {
+            sanctuary: { command, args },
+          },
+        }),
+        "utf-8"
+      );
+      return hermesConfigPath;
+    });
+
+    await runWrap(
+      { hermes: true, noOpen: true },
+      {
+        startDashboard: fakeDashboardStarter(),
+        openBrowser: async () => {},
+        resolvePassphrase: async () => ({
+          value: "gen",
+          location: "macOS Keychain",
+          source: "generated",
+        }),
+        rewriteConfig: rewriteSpy,
+      }
+    );
+
+    expect(rewriteSpy).toHaveBeenCalledTimes(1);
+    const callArgs = rewriteSpy.mock.calls[0]!;
+    const passedConfig = callArgs[0] as { platform: string; configPath: string };
+    expect(passedConfig.platform).toBe("hermes");
+    expect(passedConfig.configPath).toBe(hermesConfigPath);
+  });
+
+  it("rewrites Hermes config preserving top-level siblings and existing servers", async () => {
+    // This test uses the real rewrite (no spy) to prove the Hermes-shape
+    // emission end-to-end.
+    await runWrap(
+      { hermes: true, noOpen: true },
+      {
+        startDashboard: fakeDashboardStarter(),
+        openBrowser: async () => {},
+        resolvePassphrase: async () => ({
+          value: "gen",
+          location: "macOS Keychain",
+          source: "generated",
+        }),
+      }
+    );
+
+    const rewritten = JSON.parse(await readFile(hermesConfigPath, "utf-8"));
+
+    // Top-level sibling preserved
+    expect(rewritten.model_provider).toBe("self-hosted");
+    // Hermes-shape key preserved (snake_case)
+    expect(rewritten.mcp_servers).toBeDefined();
+    expect(rewritten.mcpServers).toBeUndefined();
+    // Sanctuary added
+    expect(rewritten.mcp_servers.sanctuary).toBeDefined();
+    expect(rewritten.mcp_servers.sanctuary.command).toBe("npx");
+    // Existing servers preserved with env vars intact
+    expect(rewritten.mcp_servers.filesystem).toBeDefined();
+    expect(rewritten.mcp_servers.github).toBeDefined();
+    expect(rewritten.mcp_servers.github.env).toEqual({
+      GITHUB_TOKEN: "tok_hermes",
+    });
   });
 });

@@ -15,7 +15,13 @@ import { resolveStoragePath } from "../paths.js";
 
 // ── Types ───────────────────────────────────────────────────────────
 
-export type AgentPlatform = "openclaw" | "claude-code" | "cursor" | "cline" | "generic";
+export type AgentPlatform =
+  | "openclaw"
+  | "claude-code"
+  | "cursor"
+  | "hermes"
+  | "cline"
+  | "generic";
 
 export interface MCPServerEntry {
   /** Human-readable name for this server */
@@ -41,73 +47,95 @@ export interface AgentConfig {
 
 // ── Platform Paths ──────────────────────────────────────────────────
 
-const PLATFORM_PATHS: Record<AgentPlatform, string[]> = {
-  "openclaw": [
-    join(homedir(), ".openclaw", "openclaw.json"),
-    join(homedir(), ".openclaw", "config.json"),
-    join(homedir(), "Library", "Application Support", "OpenClaw", "openclaw.json"),
-    join(homedir(), "Library", "Application Support", "OpenClaw", "config.json"),
-  ],
-  "claude-code": [
-    join(homedir(), ".claude", "settings.json"),
-    join(homedir(), ".config", "claude-code", "settings.json"),
-  ],
-  "cursor": [
-    join(homedir(), ".cursor", "mcp.json"),
-  ],
-  // Cline is a VS Code extension (saoudrizwan.claude-dev). Its MCP settings
-  // live under the VS Code globalStorage tree, which is OS-specific. We
-  // enumerate the three supported OS layouts; at detection time only the
-  // one matching the running OS will exist.
-  "cline": [
-    // macOS
-    join(
-      homedir(),
-      "Library",
-      "Application Support",
-      "Code",
-      "User",
-      "globalStorage",
-      "saoudrizwan.claude-dev",
-      "settings",
-      "cline_mcp_settings.json"
-    ),
-    // Linux
-    join(
-      homedir(),
-      ".config",
-      "Code",
-      "User",
-      "globalStorage",
-      "saoudrizwan.claude-dev",
-      "settings",
-      "cline_mcp_settings.json"
-    ),
-    // Windows (honour APPDATA when set, otherwise reconstruct under homedir)
-    process.env.APPDATA
-      ? join(
-          process.env.APPDATA,
-          "Code",
-          "User",
-          "globalStorage",
-          "saoudrizwan.claude-dev",
-          "settings",
-          "cline_mcp_settings.json"
-        )
-      : join(
-          homedir(),
-          "AppData",
-          "Roaming",
-          "Code",
-          "User",
-          "globalStorage",
-          "saoudrizwan.claude-dev",
-          "settings",
-          "cline_mcp_settings.json"
-        ),
-  ],
-  "generic": [],
-};
+// Iteration order = auto-detect priority. OpenClaw first (primary dogfood),
+// Hermes second (v1.0 secondary per README agent-installable rewrite),
+// Cline third (VS Code extension), Claude Code + Cursor trail. `generic` is
+// the catch-all with no paths.
+//
+// Computed lazily from the current homedir() on every call so sandboxed /
+// multi-tenant callers that reassign `process.env.HOME` at runtime get the
+// paths rooted at their current HOME. Matches the pattern of
+// `resolveStoragePath()` already used elsewhere in the cocoon surface.
+export function getPlatformPaths(): Record<AgentPlatform, string[]> {
+  const home = homedir();
+  return {
+    "openclaw": [
+      join(home, ".openclaw", "openclaw.json"),
+      join(home, ".openclaw", "config.json"),
+      join(home, "Library", "Application Support", "OpenClaw", "openclaw.json"),
+      join(home, "Library", "Application Support", "OpenClaw", "config.json"),
+    ],
+    // Hermes Agent (NousResearch, v0.9.0) canonicals live under ~/.hermes.
+    // Hermes ships `cli-config.yaml` as the primary surface per upstream docs.
+    // Sanctuary wrap v1.0 detects the JSON variant only: operators who keep
+    // YAML can still wrap via `sanctuary wrap --wrap <path>` after exporting
+    // to JSON. YAML-native detection is flagged as a v1.x follow-up.
+    "hermes": [
+      join(home, ".hermes", "cli-config.json"),
+      join(home, ".hermes", "config.json"),
+      join(home, ".config", "hermes", "cli-config.json"),
+    ],
+    "claude-code": [
+      join(home, ".claude", "settings.json"),
+      join(home, ".config", "claude-code", "settings.json"),
+    ],
+    "cursor": [
+      join(home, ".cursor", "mcp.json"),
+    ],
+    // Cline is a VS Code extension (saoudrizwan.claude-dev). Its MCP settings
+    // live under the VS Code globalStorage tree, which is OS-specific. We
+    // enumerate the three supported OS layouts; at detection time only the
+    // one matching the running OS will exist.
+    "cline": [
+      // macOS
+      join(
+        home,
+        "Library",
+        "Application Support",
+        "Code",
+        "User",
+        "globalStorage",
+        "saoudrizwan.claude-dev",
+        "settings",
+        "cline_mcp_settings.json"
+      ),
+      // Linux
+      join(
+        home,
+        ".config",
+        "Code",
+        "User",
+        "globalStorage",
+        "saoudrizwan.claude-dev",
+        "settings",
+        "cline_mcp_settings.json"
+      ),
+      // Windows (honour APPDATA when set, otherwise reconstruct under home)
+      process.env.APPDATA
+        ? join(
+            process.env.APPDATA,
+            "Code",
+            "User",
+            "globalStorage",
+            "saoudrizwan.claude-dev",
+            "settings",
+            "cline_mcp_settings.json"
+          )
+        : join(
+            home,
+            "AppData",
+            "Roaming",
+            "Code",
+            "User",
+            "globalStorage",
+            "saoudrizwan.claude-dev",
+            "settings",
+            "cline_mcp_settings.json"
+          ),
+    ],
+    "generic": [],
+  };
+}
 
 // ── Backup ──────────────────────────────────────────────────────────
 
@@ -217,7 +245,7 @@ export async function detectAgentConfigWithDiagnostics(
 
   // If platform specified, check its known paths
   if (platform) {
-    const paths = PLATFORM_PATHS[platform];
+    const paths = getPlatformPaths()[platform];
     for (const path of paths) {
       pathsChecked.push(path);
       const { config, error } = await readConfigFileWithError(path, platform);
@@ -228,7 +256,7 @@ export async function detectAgentConfigWithDiagnostics(
   }
 
   // Auto-detect: try each platform in order
-  for (const [plat, paths] of Object.entries(PLATFORM_PATHS)) {
+  for (const [plat, paths] of Object.entries(getPlatformPaths())) {
     for (const path of paths) {
       pathsChecked.push(path);
       const { config, error } = await readConfigFileWithError(path, plat as AgentPlatform);
@@ -329,6 +357,21 @@ function extractServers(config: unknown, platform: AgentPlatform): MCPServerEntr
     }
   }
 
+  // Hermes format (per upstream docs): { mcp_servers: { name: { command, args, env, url, headers } } }
+  // Note the snake_case top-level key; differs from Claude Code / Cursor's
+  // camelCase `mcpServers`. Server entries carry the same command/args/env/url
+  // fields that `parseServerEntry` already understands.
+  if (platform === "hermes") {
+    const mcpServers = obj.mcp_servers as Record<string, unknown> | undefined;
+    if (mcpServers && typeof mcpServers === "object") {
+      for (const [name, serverConfig] of Object.entries(mcpServers)) {
+        if (name.toLowerCase().includes("sanctuary")) continue;
+        const entry = parseServerEntry(name, serverConfig);
+        if (entry) servers.push(entry);
+      }
+    }
+  }
+
   // Cline format: { mcpServers: { name: { command, args } } } (same flat
   // shape as Claude Code and Cursor). Cline is a VS Code extension that
   // reads its MCP settings file from globalStorage; the file contents are
@@ -406,6 +449,8 @@ export async function rewriteConfigForCocoon(
   if (agentConfig.platform === "openclaw") {
     const existingMcp = (raw.mcp as Record<string, unknown>) ?? {};
     existingServers = (existingMcp.servers as Record<string, unknown>) ?? {};
+  } else if (agentConfig.platform === "hermes") {
+    existingServers = (raw.mcp_servers as Record<string, unknown>) ?? {};
   } else {
     existingServers = (raw.mcpServers as Record<string, unknown>) ?? {};
   }
@@ -459,6 +504,16 @@ export async function rewriteConfigForCocoon(
     };
     // Remove flat mcpServers if it existed (from a shim)
     delete rewritten.mcpServers;
+  } else if (agentConfig.platform === "hermes") {
+    // Hermes uses flat snake_case mcp_servers; preserve top-level siblings
+    // (model_provider, memory, telemetry, etc.) and existing servers.
+    rewritten = {
+      ...raw,
+      mcp_servers: {
+        ...existingServers,
+        sanctuary: sanctuaryEntry,
+      },
+    };
   } else {
     // Claude Code / Cursor / generic use flat mcpServers — preserve existing servers
     rewritten = {

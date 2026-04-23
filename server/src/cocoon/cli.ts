@@ -8,6 +8,7 @@
  *
  * Usage:
  *   npx @sanctuary-framework/mcp-server wrap --openclaw
+ *   npx @sanctuary-framework/mcp-server wrap --hermes
  *   npx @sanctuary-framework/mcp-server wrap --claude-code
  *   npx @sanctuary-framework/mcp-server wrap --cursor
  *   npx @sanctuary-framework/mcp-server wrap --cline
@@ -63,6 +64,8 @@ export interface WrapOptions {
   wrap?: string;
   /** Auto-detect OpenClaw config. */
   openclaw?: boolean;
+  /** Auto-detect Hermes Agent config (NousResearch). */
+  hermes?: boolean;
   /** Auto-detect Claude Code config. */
   claudeCode?: boolean;
   /** Auto-detect Cursor config. */
@@ -156,6 +159,7 @@ export async function runWrap(
 
   let platformHint: AgentPlatform | undefined;
   if (options.openclaw) platformHint = "openclaw";
+  else if (options.hermes) platformHint = "hermes";
   else if (options.claudeCode) platformHint = "claude-code";
   else if (options.cursor) platformHint = "cursor";
   else if (options.cline) platformHint = "cline";
@@ -175,7 +179,7 @@ export async function runWrap(
     } else {
       console.error("  Could not auto-detect any agent configuration.");
       console.error(
-        "  Use --openclaw, --claude-code, --cursor, --cline, or --wrap /path/to/config.json"
+        "  Use --openclaw, --hermes, --claude-code, --cursor, --cline, or --wrap /path/to/config.json"
       );
     }
     if (detection.pathsChecked.length > 0) {
@@ -578,6 +582,7 @@ async function verifyRewrittenConfig(
     const servers =
       ((parsed.mcp as Record<string, unknown>)?.servers as Record<string, unknown>) ??
       (parsed.mcpServers as Record<string, unknown>) ??
+      (parsed.mcp_servers as Record<string, unknown>) ??
       {};
 
     if (!servers.sanctuary) {
@@ -689,6 +694,7 @@ function generateAuthToken(): string {
 function toolNameFor(platform: AgentPlatform, _servers: MCPServerEntry[]): string {
   switch (platform) {
     case "openclaw": return "OpenClaw";
+    case "hermes": return "Hermes Agent";
     case "claude-code": return "Claude Code";
     case "cursor": return "Cursor";
     case "cline": return "Cline";
@@ -719,6 +725,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--openclaw":
         options.openclaw = true;
+        break;
+      case "--hermes":
+        options.hermes = true;
         break;
       case "--claude-code":
         options.claudeCode = true;
@@ -763,6 +772,7 @@ function printWrapHelp(): void {
 
   Usage:
     sanctuary wrap --openclaw          Wrap OpenClaw
+    sanctuary wrap --hermes            Wrap Hermes Agent (NousResearch)
     sanctuary wrap --claude-code       Wrap Claude Code
     sanctuary wrap --cursor            Wrap Cursor
     sanctuary wrap --cline             Wrap Cline (VS Code extension)
@@ -771,6 +781,7 @@ function printWrapHelp(): void {
 
   Options:
     --openclaw         Auto-detect and wrap OpenClaw
+    --hermes           Auto-detect and wrap Hermes Agent
     --claude-code      Auto-detect and wrap Claude Code
     --cursor           Auto-detect and wrap Cursor
     --cline            Auto-detect and wrap Cline (VS Code extension)
