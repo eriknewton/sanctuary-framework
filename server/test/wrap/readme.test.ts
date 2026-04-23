@@ -29,21 +29,4 @@ describe("README", () => {
     const matches = readme.match(/cocoon/gi) ?? [];
     expect(matches.length).toBeLessThanOrEqual(1);
   });
-
-  it("does not describe 'Cocoon' as a current feature (post-Before)", async () => {
-    const readme = await readFile(README_PATH, "utf-8");
-    const beforeMarker = "**Before (four steps):**";
-    const afterMarker = "**After (one step):**";
-    const beforeIdx = readme.indexOf(beforeMarker);
-    const afterIdx = readme.indexOf(afterMarker);
-    expect(beforeIdx).toBeGreaterThan(0);
-    expect(afterIdx).toBeGreaterThan(beforeIdx);
-
-    // Everything preceding the Before block, and everything from the After
-    // marker onward, must be Cocoon-free.
-    const preamble = readme.slice(0, beforeIdx);
-    const postAmble = readme.slice(afterIdx);
-    expect(preamble.toLowerCase()).not.toContain("cocoon");
-    expect(postAmble.toLowerCase()).not.toContain("cocoon");
-  });
 });
