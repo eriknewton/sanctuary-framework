@@ -1,0 +1,113 @@
+# Sanctuary npm Publish on Tag
+#
+# Copyright 2026 Erik Newton
+# SPDX-License-Identifier: Apache-2.0
+#
+# Closes the v1.0 rc.1 release-pipeline gap (drill finding N): eleven PRs
+# merged to main between v0.10.6 and the v1.0 rc.1 cut without ever
+# tagging or publishing, so every operator following the README's
+# documented `npx @sanctuary-framework/mcp-server wrap --<harness>` path
+# resolved to a stale read-only build that did not match the README's
+# claims.
+#
+# Fires on any version tag push matching `v[0-9]*.[0-9]*.[0-9]*` (and
+# pre-release variants like `v1.0.0-rc.1`). Refuses to publish if the
+# tag's version string does not match `server/package.json` — guards
+# against the pre-v0.9.0 RC tag/version-string drift class.
+#
+# Required repo secret:
+#   NPM_TOKEN  — npm automation token with publish access for the
+#                @sanctuary-framework scope. Add at
+#                Settings → Secrets and variables → Actions.
+#
+# This workflow does not fire for the v1.0.0-rc.1 release itself (that
+# tag is published manually from MBA). Every subsequent rc / final tag
+# fires here.
+
+name: Publish on Tag
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Verify tag matches server/package.json version
+        id: verify-version
+        run: |
+          tag_ref="${GITHUB_REF#refs/tags/}"
+          tag_version="${tag_ref#v}"
+          pkg_version=$(node -p "require('./server/package.json').version")
+          echo "Tag version:     ${tag_version}"
+          echo "Package version: ${pkg_version}"
+          if [[ "${tag_version}" != "${pkg_version}" ]]; then
+            echo "::error::Tag version (${tag_version}) does not match server/package.json version (${pkg_version}). Refusing to publish."
+            exit 1
+          fi
+          echo "tag_version=${tag_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Set up Python 3.12 for Concordia sidecar
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Provision Concordia sidecar venv
+        run: |
+          python3 -m venv sidecars/concordia/.venv
+          sidecars/concordia/.venv/bin/pip install --upgrade pip
+          sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
+
+      - name: Type check
+        working-directory: server
+        run: npm run typecheck
+
+      - name: Run tests
+        working-directory: server
+        run: npm test
+
+      - name: Build
+        working-directory: server
+        run: npm run build
+
+      - name: Determine npm dist-tag
+        id: dist-tag
+        run: |
+          version="${{ steps.verify-version.outputs.tag_version }}"
+          # Pre-release tags (anything with a hyphen, e.g. 1.0.0-rc.1)
+          # publish under the "next" dist-tag so `npx @sanctuary-framework/
+          # mcp-server` keeps resolving to the stable release.
+          if [[ "$version" == *-* ]]; then
+            echo "tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm
+        working-directory: server
+        run: npm publish --access public --tag "${{ steps.dist-tag.outputs.tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
