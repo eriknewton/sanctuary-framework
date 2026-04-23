@@ -26,6 +26,11 @@ describe("Cocoon CLI", () => {
       expect(opts.cursor).toBe(true);
     });
 
+    it("parses --cline flag", () => {
+      const opts = parseCocoonArgs(["--cline"]);
+      expect(opts.cline).toBe(true);
+    });
+
     it("parses --wrap with path", () => {
       const opts = parseCocoonArgs(["--wrap", "/path/to/config.json"]);
       expect(opts.wrap).toBe("/path/to/config.json");

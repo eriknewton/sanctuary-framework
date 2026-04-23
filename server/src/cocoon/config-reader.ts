@@ -2,7 +2,7 @@
  * Sanctuary Cocoon — Agent Config Reader
  *
  * Detects and reads MCP server configurations from various agent platforms.
- * Supports: OpenClaw, Claude Code, Cursor, and generic MCP config files.
+ * Supports: OpenClaw, Claude Code, Cursor, Cline, and generic MCP config files.
  *
  * Security invariant: Never modifies configs without explicit request.
  * All original configs are backed up before any modification.
@@ -20,6 +20,7 @@ export type AgentPlatform =
   | "claude-code"
   | "cursor"
   | "hermes"
+  | "cline"
   | "generic";
 
 export interface MCPServerEntry {
@@ -48,7 +49,8 @@ export interface AgentConfig {
 
 // Iteration order = auto-detect priority. OpenClaw first (primary dogfood),
 // Hermes second (v1.0 secondary per README agent-installable rewrite),
-// Claude Code + Cursor trail. `generic` is the catch-all with no paths.
+// Cline third (VS Code extension), Claude Code + Cursor trail. `generic` is
+// the catch-all with no paths.
 //
 // Computed lazily from the current homedir() on every call so sandboxed /
 // multi-tenant callers that reassign `process.env.HOME` at runtime get the
@@ -79,6 +81,57 @@ export function getPlatformPaths(): Record<AgentPlatform, string[]> {
     ],
     "cursor": [
       join(home, ".cursor", "mcp.json"),
+    ],
+    // Cline is a VS Code extension (saoudrizwan.claude-dev). Its MCP settings
+    // live under the VS Code globalStorage tree, which is OS-specific. We
+    // enumerate the three supported OS layouts; at detection time only the
+    // one matching the running OS will exist.
+    "cline": [
+      // macOS
+      join(
+        home,
+        "Library",
+        "Application Support",
+        "Code",
+        "User",
+        "globalStorage",
+        "saoudrizwan.claude-dev",
+        "settings",
+        "cline_mcp_settings.json"
+      ),
+      // Linux
+      join(
+        home,
+        ".config",
+        "Code",
+        "User",
+        "globalStorage",
+        "saoudrizwan.claude-dev",
+        "settings",
+        "cline_mcp_settings.json"
+      ),
+      // Windows (honour APPDATA when set, otherwise reconstruct under home)
+      process.env.APPDATA
+        ? join(
+            process.env.APPDATA,
+            "Code",
+            "User",
+            "globalStorage",
+            "saoudrizwan.claude-dev",
+            "settings",
+            "cline_mcp_settings.json"
+          )
+        : join(
+            home,
+            "AppData",
+            "Roaming",
+            "Code",
+            "User",
+            "globalStorage",
+            "saoudrizwan.claude-dev",
+            "settings",
+            "cline_mcp_settings.json"
+          ),
     ],
     "generic": [],
   };
@@ -310,6 +363,21 @@ function extractServers(config: unknown, platform: AgentPlatform): MCPServerEntr
   // fields that `parseServerEntry` already understands.
   if (platform === "hermes") {
     const mcpServers = obj.mcp_servers as Record<string, unknown> | undefined;
+    if (mcpServers && typeof mcpServers === "object") {
+      for (const [name, serverConfig] of Object.entries(mcpServers)) {
+        if (name.toLowerCase().includes("sanctuary")) continue;
+        const entry = parseServerEntry(name, serverConfig);
+        if (entry) servers.push(entry);
+      }
+    }
+  }
+
+  // Cline format: { mcpServers: { name: { command, args } } } (same flat
+  // shape as Claude Code and Cursor). Cline is a VS Code extension that
+  // reads its MCP settings file from globalStorage; the file contents are
+  // the same as the other flat-format harnesses.
+  if (platform === "cline") {
+    const mcpServers = obj.mcpServers as Record<string, unknown> | undefined;
     if (mcpServers && typeof mcpServers === "object") {
       for (const [name, serverConfig] of Object.entries(mcpServers)) {
         if (name.toLowerCase().includes("sanctuary")) continue;

@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   detectAgentConfig,
+  detectAgentConfigWithDiagnostics,
   backupConfig,
   restoreConfig,
   saveCocoonMeta,
@@ -176,6 +177,71 @@ describe("Config Reader", () => {
       );
 
       const result = await detectAgentConfig("hermes", configPath);
+      expect(result).not.toBeNull();
+      expect(result!.servers).toHaveLength(1);
+      expect(result!.servers[0]!.name).toBe("filesystem");
+    });
+
+    it("reads Cline mcpServers config (flat shape)", async () => {
+      const configPath = join(tmpDir, "cline_mcp_settings.json");
+      await writeFile(configPath, JSON.stringify({
+        mcpServers: {
+          filesystem: {
+            command: "node",
+            args: ["fs-server.js"],
+          },
+          github: {
+            command: "npx",
+            args: ["-y", "@github/mcp-server"],
+            env: { GITHUB_TOKEN: "tok_cline" },
+          },
+          remote: {
+            url: "http://localhost:9000/sse",
+          },
+        },
+      }));
+
+      const result = await detectAgentConfig("cline", configPath);
+      expect(result).not.toBeNull();
+      expect(result!.platform).toBe("cline");
+      expect(result!.servers).toHaveLength(3);
+      const byName = Object.fromEntries(
+        result!.servers.map((s) => [s.name, s])
+      );
+      expect(byName.filesystem!.transport).toBe("stdio");
+      expect(byName.filesystem!.command).toBe("node");
+      expect(byName.github!.env).toEqual({ GITHUB_TOKEN: "tok_cline" });
+      expect(byName.remote!.transport).toBe("sse");
+      expect(byName.remote!.url).toBe("http://localhost:9000/sse");
+    });
+
+    it("returns diagnostics with platform='cline' paths when Cline config is absent", async () => {
+      // When a caller passes platform hint "cline" but no config exists
+      // anywhere under the enumerated globalStorage paths, the function
+      // must report the cline platform paths in the diagnostics block so
+      // the CLI can surface a useful error. This pins the getPlatformPaths()
+      // wiring from user-facing surface back into config-reader.
+      const result = await detectAgentConfigWithDiagnostics(
+        "cline",
+        join(tmpDir, "does-not-exist.json")
+      );
+      expect(result.config).toBeNull();
+      // Diagnostics enumerate the specific path we asked about.
+      expect(result.pathsChecked).toContain(
+        join(tmpDir, "does-not-exist.json")
+      );
+    });
+
+    it("skips sanctuary entries in cline config", async () => {
+      const configPath = join(tmpDir, "cline_mcp_settings.json");
+      await writeFile(configPath, JSON.stringify({
+        mcpServers: {
+          sanctuary: { command: "npx", args: ["@sanctuary-framework/mcp-server"] },
+          filesystem: { command: "node", args: ["fs-server.js"] },
+        },
+      }));
+
+      const result = await detectAgentConfig("cline", configPath);
       expect(result).not.toBeNull();
       expect(result!.servers).toHaveLength(1);
       expect(result!.servers[0]!.name).toBe("filesystem");
@@ -414,6 +480,66 @@ describe("Config Reader", () => {
       // Top-level siblings (non-mcp Hermes fields) preserved.
       expect(rewritten.model_provider).toBe("self-hosted");
       expect(rewritten.memory).toEqual({ enabled: true });
+    });
+
+    it("rewrites Cline config with sanctuary in flat mcpServers and is idempotent across re-wrap", async () => {
+      const configPath = join(tmpDir, "cline_mcp_settings.json");
+      const original = {
+        mcpServers: {
+          sanctuary: {
+            command: "npx",
+            args: ["@sanctuary-framework/mcp-server"],
+            env: { SANCTUARY_PASSPHRASE: "old-secret" },
+          },
+          filesystem: {
+            command: "node",
+            args: ["fs-server.js"],
+            env: { FS_ROOT: "/tmp" },
+          },
+        },
+      };
+      await writeFile(configPath, JSON.stringify(original));
+
+      // First rewrite — re-wrap an already-wrapped Cline config.
+      const firstRead = await detectAgentConfig("cline", configPath);
+      expect(firstRead).not.toBeNull();
+      // extractServers skipped the pre-existing sanctuary entry, so only
+      // filesystem shows up as a wrappable upstream.
+      expect(firstRead!.servers).toHaveLength(1);
+      expect(firstRead!.servers[0]!.name).toBe("filesystem");
+
+      await rewriteConfigForCocoon(
+        firstRead!,
+        "npx",
+        ["@sanctuary-framework/mcp-server"],
+        { SANCTUARY_PASSPHRASE: "new-secret" }
+      );
+
+      const afterFirst = JSON.parse(await readFile(configPath, "utf-8"));
+      // Exactly one sanctuary entry (not stacked), updated env.
+      expect(Object.keys(afterFirst.mcpServers)).toEqual(
+        expect.arrayContaining(["sanctuary", "filesystem"])
+      );
+      expect(Object.keys(afterFirst.mcpServers).length).toBe(2);
+      expect(afterFirst.mcpServers.sanctuary.env).toEqual({
+        SANCTUARY_PASSPHRASE: "new-secret",
+      });
+      expect(afterFirst.mcpServers.filesystem.env).toEqual({ FS_ROOT: "/tmp" });
+
+      // Second rewrite — idempotent re-wrap keeps the shape stable.
+      const secondRead = await detectAgentConfig("cline", configPath);
+      await rewriteConfigForCocoon(
+        secondRead!,
+        "npx",
+        ["@sanctuary-framework/mcp-server"],
+        { SANCTUARY_PASSPHRASE: "even-newer" }
+      );
+      const afterSecond = JSON.parse(await readFile(configPath, "utf-8"));
+      expect(Object.keys(afterSecond.mcpServers).length).toBe(2);
+      expect(afterSecond.mcpServers.sanctuary.env).toEqual({
+        SANCTUARY_PASSPHRASE: "even-newer",
+      });
+      expect(afterSecond.mcpServers.filesystem.env).toEqual({ FS_ROOT: "/tmp" });
     });
 
     it("preserves top-level mcp fields in OpenClaw format", async () => {
