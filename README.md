@@ -257,6 +257,20 @@ A fortress. Walls separate the inside from the outside. Gates let specific thing
 
 ---
 
+## The rights you hold by default
+
+Rights that normally only ship to enterprises with dedicated identity and security teams, embedded in an open-source product every operator can run. The four-layer architecture enforces them; this is what they mean for the operator.
+
+- **Identity.** Your agent has a key you own. No provider can impersonate you or revoke your agent. You can prove the agent is yours without asking anyone's permission.
+- **Data.** Your agent's state is encrypted against the provider running it. The platform sees the calls going out; it does not see your life going in. Your conversations, your memory, and your plans stay yours.
+- **Portability.** Your agent's memory, reputation, and commitments travel with you. If a provider goes bad, raises prices, or shuts down, you leave without losing what you built.
+- **Attestation.** What your agent did is provable. To you, to a third party, to a court if it comes to that. The audit log is signed, append-only, and portable.
+- **Exit.** Nothing you build up is locked to a platform that can revoke it. Keys, state, reputation, and commitments are yours to move, copy, or keep offline.
+
+Sanctuary ships the rights substrate. Access (compute, devices, bandwidth, literacy) belongs to civic-infrastructure partners (public libraries, legal-aid organizations, labor unions, public-interest tech groups, community colleges) who host agentic AI on behalf of users who do not self-host. The partner provides access; Sanctuary provides rights. The two compose; they do not substitute.
+
+---
+
 ## Works with
 
 Sanctuary wraps any MCP-compatible harness:
