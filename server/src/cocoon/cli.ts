@@ -32,7 +32,7 @@
  */
 
 import { writeFile, readFile, mkdir, access } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { platform } from "node:os";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -43,6 +43,7 @@ import {
   findLatestBackup,
   restoreConfig,
   rewriteConfigForCocoon,
+  getPlatformPaths,
   type AgentPlatform,
   type MCPServerEntry,
 } from "./config-reader.js";
@@ -164,11 +165,44 @@ export async function runWrap(
   else if (options.cursor) platformHint = "cursor";
   else if (options.cline) platformHint = "cline";
 
-  const detection = await detectAgentConfigWithDiagnostics(
+  let detection = await detectAgentConfigWithDiagnostics(
     platformHint,
     options.wrap
   );
-  const agentConfig = detection.config;
+  let agentConfig = detection.config;
+
+  // If no config file exists for an explicitly-hinted platform, bootstrap an
+  // empty one at the canonical (first-listed) path. Wrap then proceeds to
+  // inject Sanctuary as the sole entry. First-time operators on a fresh
+  // Claude Code install (no prior `claude mcp add`) hit this path; pre-v1.0
+  // wrap exited here and forced them to seed an unrelated placeholder.
+  if (!agentConfig && platformHint && !options.wrap) {
+    const candidatePaths = getPlatformPaths()[platformHint];
+    const canonicalPath = candidatePaths[0];
+    if (canonicalPath) {
+      try {
+        await mkdir(dirname(canonicalPath), { recursive: true, mode: 0o700 });
+        await writeFile(canonicalPath, "{}", { mode: 0o600 });
+        console.error(
+          `\n  No existing ${platformHint} config found.`
+        );
+        console.error(
+          `  Bootstrapped a fresh config at ${canonicalPath}.\n`
+        );
+        detection = await detectAgentConfigWithDiagnostics(
+          platformHint,
+          options.wrap
+        );
+        agentConfig = detection.config;
+      } catch (err) {
+        console.error(
+          `\n  Sanctuary: could not bootstrap ${platformHint} config at ${canonicalPath}`
+        );
+        console.error(`  Error: ${(err as Error).message}\n`);
+        process.exit(1);
+      }
+    }
+  }
 
   if (!agentConfig) {
     console.error(`\n  Sanctuary — Configuration Not Found\n`);
@@ -196,22 +230,25 @@ export async function runWrap(
     process.exit(1);
   }
 
-  if (agentConfig.servers.length === 0) {
-    console.error(
-      `\n  Found ${agentConfig.platform} config at ${agentConfig.configPath},`
-    );
-    console.error(`  but no MCP servers are configured in it.\n`);
-    process.exit(1);
-  }
-
-  const hasSanctuary = agentConfig.servers.some(
-    (s) => s.name.toLowerCase() === "sanctuary"
+  // An empty server list is no longer a hard error: wrap proceeds to inject
+  // Sanctuary as the sole entry. This unblocks (a) first-install configs
+  // that have no `mcpServers` key yet and (b) re-wrap of a config whose
+  // only entry was Sanctuary (which extractServers filters out).
+  const hasSanctuaryInRaw = rawConfigContainsSanctuary(
+    agentConfig.rawConfig,
+    agentConfig.platform
   );
-  if (hasSanctuary) {
+  if (hasSanctuaryInRaw) {
     console.error(
-      `\n  Warning: This agent already has a Sanctuary server configured.`
+      `\n  Sanctuary already wrapped: updating the existing Sanctuary entry.\n`
     );
-    console.error(`  Re-wrapping will update the existing Sanctuary entry.\n`);
+  } else if (agentConfig.servers.length === 0) {
+    console.error(
+      `\n  Found ${agentConfig.platform} config at ${agentConfig.configPath} with no MCP servers yet.`
+    );
+    console.error(
+      `  Sanctuary will be installed as the only MCP server.\n`
+    );
   }
 
   console.error(`\n  Sanctuary wrap`);
@@ -711,6 +748,36 @@ function countUpstreamTools(servers: UpstreamServer[]): number {
 
 function readPackageVersion(): string {
   return SANCTUARY_VERSION;
+}
+
+/**
+ * Detects whether a parsed agent config already has a Sanctuary entry under
+ * its platform-specific MCP servers key. extractServers filters Sanctuary
+ * out of the upstream list (so we don't stack entries on rewrite), so the
+ * filtered `agentConfig.servers` array can't be used to detect re-wrap;
+ * we have to look at the raw config instead.
+ */
+function rawConfigContainsSanctuary(
+  raw: unknown,
+  agentPlatform: AgentPlatform
+): boolean {
+  if (!raw || typeof raw !== "object") return false;
+  const obj = raw as Record<string, unknown>;
+  let serversBag: Record<string, unknown> | undefined;
+  if (agentPlatform === "openclaw") {
+    const mcp = obj.mcp as Record<string, unknown> | undefined;
+    serversBag =
+      (mcp?.servers as Record<string, unknown> | undefined) ??
+      (obj.mcpServers as Record<string, unknown> | undefined);
+  } else if (agentPlatform === "hermes") {
+    serversBag = obj.mcp_servers as Record<string, unknown> | undefined;
+  } else {
+    serversBag = obj.mcpServers as Record<string, unknown> | undefined;
+  }
+  if (!serversBag || typeof serversBag !== "object") return false;
+  return Object.keys(serversBag).some(
+    (name) => name.toLowerCase() === "sanctuary"
+  );
 }
 
 // ── CLI argument parser ─────────────────────────────────────────────

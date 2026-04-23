@@ -83,11 +83,18 @@ function l3Card(l3: ProtectionSnapshot["layers"]["l3"]): string {
   );
 }
 
+// The apex verascore.ai 307-redirects to www.verascore.ai; linking the
+// www host directly avoids the redirect round trip on every click.
+const VERASCORE_CLAIM_URL = "https://www.verascore.ai";
+
 function l4Card(l4: ProtectionSnapshot["layers"]["l4"]): string {
-  const score =
-    l4.score != null
-      ? `<div class="score-block"><span class="score-value">${escHtml(l4.score)}</span><span class="score-label">Verascore</span></div>`
-      : `<div class="claim-block">${escHtml(l4.claim_cta ?? "Claim your profile at verascore.ai")}</div>`;
+  let score: string;
+  if (l4.score != null) {
+    score = `<div class="score-block"><span class="score-value">${escHtml(l4.score)}</span><span class="score-label">Verascore</span></div>`;
+  } else {
+    const claimText = l4.claim_cta ?? "Claim your profile at verascore.ai";
+    score = `<div class="claim-block"><a class="claim-link" href="${VERASCORE_CLAIM_URL}" target="_blank" rel="noopener noreferrer">${escHtml(claimText)}</a></div>`;
+  }
   return layerCard(
     l4,
     `<div class="layer-cta">${score}</div>${l4EvidenceBlock(l4)}`

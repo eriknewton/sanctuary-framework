@@ -75,7 +75,13 @@ export function getPlatformPaths(): Record<AgentPlatform, string[]> {
       join(home, ".hermes", "config.json"),
       join(home, ".config", "hermes", "cli-config.json"),
     ],
+    // Claude Code's modern canonical surface is ~/.claude.json (`claude mcp
+    // add` writes here). The legacy ~/.claude/settings.json shape predates
+    // it and is still respected if present. Probe order = preference order:
+    // wrap operates on the first one that exists, and bootstraps a fresh
+    // ~/.claude.json when neither is present (per the cli.ts bootstrap).
     "claude-code": [
+      join(home, ".claude.json"),
       join(home, ".claude", "settings.json"),
       join(home, ".config", "claude-code", "settings.json"),
     ],
@@ -337,8 +343,7 @@ function extractServers(config: unknown, platform: AgentPlatform): MCPServerEntr
     const mcpServers = obj.mcpServers as Record<string, unknown> | undefined;
     if (mcpServers && typeof mcpServers === "object") {
       for (const [name, serverConfig] of Object.entries(mcpServers)) {
-        // Skip Sanctuary itself if already listed
-        if (name.toLowerCase().includes("sanctuary")) continue;
+        if (isCanonicalSanctuaryName(name)) continue;
         const entry = parseServerEntry(name, serverConfig);
         if (entry) servers.push(entry);
       }
@@ -350,7 +355,7 @@ function extractServers(config: unknown, platform: AgentPlatform): MCPServerEntr
     const mcpServers = obj.mcpServers as Record<string, unknown> | undefined;
     if (mcpServers && typeof mcpServers === "object") {
       for (const [name, serverConfig] of Object.entries(mcpServers)) {
-        if (name.toLowerCase().includes("sanctuary")) continue;
+        if (isCanonicalSanctuaryName(name)) continue;
         const entry = parseServerEntry(name, serverConfig);
         if (entry) servers.push(entry);
       }
@@ -365,7 +370,7 @@ function extractServers(config: unknown, platform: AgentPlatform): MCPServerEntr
     const mcpServers = obj.mcp_servers as Record<string, unknown> | undefined;
     if (mcpServers && typeof mcpServers === "object") {
       for (const [name, serverConfig] of Object.entries(mcpServers)) {
-        if (name.toLowerCase().includes("sanctuary")) continue;
+        if (isCanonicalSanctuaryName(name)) continue;
         const entry = parseServerEntry(name, serverConfig);
         if (entry) servers.push(entry);
       }
@@ -380,7 +385,7 @@ function extractServers(config: unknown, platform: AgentPlatform): MCPServerEntr
     const mcpServers = obj.mcpServers as Record<string, unknown> | undefined;
     if (mcpServers && typeof mcpServers === "object") {
       for (const [name, serverConfig] of Object.entries(mcpServers)) {
-        if (name.toLowerCase().includes("sanctuary")) continue;
+        if (isCanonicalSanctuaryName(name)) continue;
         const entry = parseServerEntry(name, serverConfig);
         if (entry) servers.push(entry);
       }
@@ -388,6 +393,20 @@ function extractServers(config: unknown, platform: AgentPlatform): MCPServerEntr
   }
 
   return servers;
+}
+
+/**
+ * Identifies the canonical Sanctuary server entry (the one wrap installs).
+ * Pre-v1.0 used a substring match on "sanctuary", which incorrectly
+ * filtered legitimate operator-installed servers like `sanctuary-helper` or
+ * `my-sanctuary-fork`. Re-wrap of an already-wrapped config also reported
+ * "no MCP servers configured" because the substring match on the sole
+ * remaining entry collapsed the upstream count to zero. Exact match keeps
+ * stacked-entry prevention intact while letting operator-named siblings
+ * pass through.
+ */
+function isCanonicalSanctuaryName(name: string): boolean {
+  return name.toLowerCase() === "sanctuary";
 }
 
 function parseServerEntry(name: string, config: unknown): MCPServerEntry | null {

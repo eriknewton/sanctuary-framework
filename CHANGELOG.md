@@ -4,6 +4,122 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.0.0-rc.1 (2026-04-23)
+
+First release candidate for the v1.0 line. Bundles the v1.0 MVP sprint
+(WP-MVP-1 through WP-MVP-11 plus follow-ups, 26 PRs merged between
+v0.10.6 and `5a73ba4`) with five intrinsic defects surfaced by the
+2026-04-23 acceptance drill on moltbook.
+
+### Fixed (drill blockers)
+
+- **Finding A. Wrap inserts Sanctuary on empty Claude Code config.**
+  Pre-v1.0 wrap exited non-zero when `~/.claude/settings.json` existed
+  but had no `mcpServers` key (the first-install default), forcing
+  operators to seed an unrelated placeholder before wrap would proceed.
+  The empty-servers exit gate is gone; `cli.ts` now bootstraps a fresh
+  config at the platform's canonical path when none exists for an
+  explicitly-hinted platform (`--claude-code`, `--cursor`, `--cline`,
+  `--openclaw`, `--hermes`), and re-wrap detection moved off the
+  Sanctuary-filtered servers list onto a new `rawConfigContainsSanctuary`
+  helper that inspects the raw config directly.
+- **Finding B. Exact-match Sanctuary filter (config-reader.ts).**
+  `extractServers` used a case-insensitive substring match on
+  "sanctuary" to skip the canonical entry that wrap installs, which
+  silently dropped operator-installed siblings like `sanctuary-helper`
+  or `my-sanctuary-fork` and made every re-wrap of an already-wrapped
+  config exit non-zero with "no MCP servers configured". Tightened to
+  an exact lowercase match across all four adapter platforms
+  (claude-code, cursor, hermes, cline). Stacked-entry prevention is
+  preserved; sibling preservation is restored; combined with Finding A,
+  re-wrap is now idempotent with an informative
+  "Sanctuary already wrapped: updating the existing Sanctuary entry"
+  message.
+- **Finding C. Probe `~/.claude.json` for Claude Code MCP config.**
+  Modern Claude Code writes its MCP config to `~/.claude.json` (the
+  file `claude mcp add` updates). Added it as the FIRST entry in
+  `getPlatformPaths()["claude-code"]`. Probe order is preference order:
+  `~/.claude.json` → `~/.claude/settings.json` (legacy) →
+  `~/.config/claude-code/settings.json` (XDG sibling). Bootstrap
+  (Finding A) creates one at the canonical path when neither legacy nor
+  modern config is present.
+- **Finding I. Linkify the L4 claim CTA on the dashboard.** The L4
+  panel rendered "Claim your profile at verascore.ai" as plain text;
+  operators who treated it as an instruction had to manually retype the
+  URL. Wrapped the entire CTA phrase in an anchor pointing at
+  `https://www.verascore.ai` (the apex 307-redirects, so the www host
+  is canonical) with `target="_blank" rel="noopener noreferrer"`.
+
+### Added (release pipeline)
+
+- **Finding N. `.github/workflows/publish-on-tag.yml`.** Closes the
+  release-pipeline gap that let 26 PRs land on main without ever
+  tagging or publishing. Fires on any version tag push matching
+  `v[0-9]+.[0-9]+.[0-9]+` and pre-release variants. Verifies that the
+  tag's version string matches `server/package.json`, runs typecheck +
+  tests + build, then publishes to npm under the `next` dist-tag for
+  pre-releases (so `npx @sanctuary-framework/mcp-server` keeps
+  resolving to stable). The v1.0.0-rc.1 tag itself is published
+  manually from MBA; this workflow takes over for rc.2 onward.
+
+### v1.0 MVP sprint (rolled into rc.1)
+
+The eleven work packages of the MVP sprint, in scope-lock order:
+
+- **WP-MVP-1.** Fortress Modes v1.0 (#44): Tier 1 Private / Tier 2
+  Federated / Tier 3 Interop hooks. Follow-ups: Hermes wrap adapter
+  (#52, Tier B), Cline wrap adapter (#53, Layer 1).
+- **WP-MVP-2.** Operator Console v1.0 (#38, #46): browser-primary HTML
+  reference surface, six views, persistent attestation header.
+- **WP-MVP-3.** Federation Protocol v0.1 foundation (#29):
+  trust-root, signed-event envelope, audit-batch, hard-gate
+  walkthrough. Follow-ups: lifecycle orchestrator (#30), libp2p wire
+  adapter (#34), failure-mode operator surfaces + recovery cascade
+  (#36), three-mode acceptance drill §12.1-§12.7 (#35), §12.8 + §12.9
+  closeout (#37).
+- **WP-MVP-4.** Agent Contract v0.1 implementation (#33).
+- **WP-MVP-5.** Policy Engine v0.1 (#31): four canonical slots,
+  deterministic compile, signed gates.
+- **WP-MVP-6.** Egress Controls + Spend Budgets + Retention Windows
+  v1.0 (#39).
+- **WP-MVP-7.** Chat v1.0 (#42): libp2p transport with per-epoch
+  AES-256-GCM forward-secret encryption.
+- **WP-MVP-8.** Recovery Flows v1.0 (#40), Recovery Cascade v1.0 (#45):
+  guardian threshold + DMswitch + multi-principal.
+- **WP-MVP-9.** Attestation UX v1.0 (#43): three-layer badge surface,
+  failure-mode catalog, degrade-not-destroy.
+- **WP-MVP-10.** Concordia + Verascore Optional Composition v1.0
+  (#47): opt-in, default-off, real Concordia v0.4.0 Python sidecar via
+  JSON-RPC 2.0 over stdio. Hardening: composition v1.0 hardening (#49,
+  size cap + hash pin + HKDF sidecar key), production-caller surface
+  tightening (#50, HKDF default + `emitForCommitment`), commitment-
+  boundary → propose → emit production pipeline (#51).
+- **WP-MVP-11.** Template Library Starter Set v1.0 (#41), Console
+  Scaffolding UI + X-Miner + GitHub-Miner + 10-min SLA (#48).
+
+Other landed work in the rc.1 window: README rewrite against
+rearticulation brief (#32, operator-sovereign hero, non-dependency,
+dead-claim purge); README rewrite for agent-mediated install (#54).
+
+### Notes
+
+- **Acceptance gate (Scope Lock §6) status:** drill ran against the
+  stale v0.10.6 binary and paused mid-Phase 1 once the binary mismatch
+  was confirmed. Re-run against the published rc.1 is the next step;
+  findings D, E, H, J, K, L, M from the drill are flagged for
+  re-verification (they may resolve as stale-binary artifacts or
+  persist as separate issues).
+- **Out of scope for rc.1 (carried forward):** v1.x crypto agility
+  sprint (group-messaging upgrade plus post-quantum hybrid primitives;
+  v1.0 chat ships forward-secret per-epoch AES-256-GCM, not the
+  upgraded protocol); v1.x MSP / Fleet Operator Console; v1.x native
+  mobile interface; v1.x x402 / Agentic.Market sovereign-signer adapter
+  (Key 17); v1.x EU AI Act compliance pack.
+- The drill script itself has independent drift (findings F, G:
+  keychain service-name suffix, audit-log path/format) that the
+  coordinator (MBA thread) owns; build-thread scope is the five
+  intrinsic code defects only.
+
 ## v0.10.6 (2026-04-20)
 
 ### Fixed
