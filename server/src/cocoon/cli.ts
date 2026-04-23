@@ -196,7 +196,7 @@ export async function runWrap(
         agentConfig = detection.config;
       } catch (err) {
         console.error(
-          `\n  Sanctuary — Could not bootstrap ${platformHint} config at ${canonicalPath}`
+          `\n  Sanctuary: could not bootstrap ${platformHint} config at ${canonicalPath}`
         );
         console.error(`  Error: ${(err as Error).message}\n`);
         process.exit(1);
@@ -240,7 +240,7 @@ export async function runWrap(
   );
   if (hasSanctuaryInRaw) {
     console.error(
-      `\n  Sanctuary already wrapped — updating the existing Sanctuary entry.\n`
+      `\n  Sanctuary already wrapped: updating the existing Sanctuary entry.\n`
     );
   } else if (agentConfig.servers.length === 0) {
     console.error(
