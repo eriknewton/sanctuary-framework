@@ -173,6 +173,53 @@ describe("renderDashboardHTML", () => {
     expect(html).toContain("Claim your profile at verascore.ai");
   });
 
+  // v1.0 rc.1 finding I — the L4 claim CTA must be a real anchor, not
+  // plain text. Operators on the dashboard need to click through to
+  // claim a profile; pre-v1.0 they had to retype the URL into a browser.
+  // The href targets www.verascore.ai directly to avoid the apex 307
+  // redirect.
+  it("renders the claim CTA as a clickable anchor to www.verascore.ai", () => {
+    const snap = makeSnapshot({
+      layers: {
+        ...makeSnapshot().layers,
+        l4: {
+          label: "L4 Reputation",
+          state: "degraded",
+          headline: "Claim your profile",
+          score: null,
+          profile_url: null,
+          claim_cta: "Claim your profile at verascore.ai",
+        },
+      },
+    });
+    const html = renderDashboardHTML({ snapshot: snap });
+    expect(html).toContain('href="https://www.verascore.ai"');
+    expect(html).toContain('target="_blank"');
+    expect(html).toContain('rel="noopener noreferrer"');
+    // The anchor wraps the entire CTA phrase, so the existing substring
+    // still appears in the rendered HTML.
+    expect(html).toContain("Claim your profile at verascore.ai");
+  });
+
+  it("falls back to the default CTA copy when claim_cta is null", () => {
+    const snap = makeSnapshot({
+      layers: {
+        ...makeSnapshot().layers,
+        l4: {
+          label: "L4 Reputation",
+          state: "degraded",
+          headline: "Claim your profile",
+          score: null,
+          profile_url: null,
+          claim_cta: null,
+        },
+      },
+    });
+    const html = renderDashboardHTML({ snapshot: snap });
+    expect(html).toContain('href="https://www.verascore.ai"');
+    expect(html).toContain("Claim your profile at verascore.ai");
+  });
+
   it("escapes HTML in user-controlled fields to prevent XSS", () => {
     const snap = makeSnapshot({
       agent: {
