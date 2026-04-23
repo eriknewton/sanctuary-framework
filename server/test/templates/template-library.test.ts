@@ -505,7 +505,11 @@ describe("CLI subcommands", () => {
     expect(output).toContain("handoff-coordinator");
   });
 
-  it("template init with valid name + agent-id returns exit 0", async () => {
+  // Stub that treats every agent as wrapped; used for positive-path
+  // tests that do not exercise the orphan-reject gate.
+  const STUB_ALWAYS_WRAPPED = async () => true;
+
+  it("template init with valid name + agent-id + wrapped harness returns exit 0", async () => {
     const chunks: string[] = [];
     const out = {
       write: (chunk: string) => { chunks.push(chunk); return true; },
@@ -518,12 +522,48 @@ describe("CLI subcommands", () => {
       argv: ["init", "research-assistant", "--agent-id", "test-agent"],
       out,
       err: errStream,
+      isAgentWrapped: STUB_ALWAYS_WRAPPED,
     });
     expect(code).toBe(0);
     const output = chunks.join("");
     expect(output).toContain("Template initialized successfully");
     expect(output).toContain("research-assistant");
     expect(output).toContain("test-agent");
+  });
+
+  it("template init rejects orphan agent-id (no wrapped harness) with exit 1 + sanctuary wrap pointer", async () => {
+    const errChunks: string[] = [];
+    const errStream = {
+      write: (chunk: string) => { errChunks.push(chunk); return true; },
+    } as unknown as NodeJS.WritableStream;
+    const code = await runTemplateCommand({
+      argv: ["init", "research-assistant", "--agent-id", "orphan-agent"],
+      err: errStream,
+      isAgentWrapped: async () => false,
+    });
+    expect(code).toBe(1);
+    const errOutput = errChunks.join("");
+    expect(errOutput).toContain("no wrapped harness found for agent-id \"orphan-agent\"");
+    expect(errOutput).toContain("sanctuary wrap");
+    expect(errOutput).toContain("sanctuary template init research-assistant --agent-id orphan-agent");
+  });
+
+  it("template init passes agent-id to the orphan-check callback", async () => {
+    const seen: string[] = [];
+    const errStream = {
+      write: () => true,
+    } as unknown as NodeJS.WritableStream;
+    const out = { write: () => true } as unknown as NodeJS.WritableStream;
+    await runTemplateCommand({
+      argv: ["init", "coding-assistant", "--agent-id", "my-wrapped-agent"],
+      out,
+      err: errStream,
+      isAgentWrapped: async (agentId: string) => {
+        seen.push(agentId);
+        return true;
+      },
+    });
+    expect(seen).toEqual(["my-wrapped-agent"]);
   });
 
   it("template init without agent-id returns exit 1", async () => {
@@ -534,6 +574,7 @@ describe("CLI subcommands", () => {
     const code = await runTemplateCommand({
       argv: ["init", "research-assistant"],
       err: errStream,
+      isAgentWrapped: STUB_ALWAYS_WRAPPED,
     });
     expect(code).toBe(1);
     expect(errChunks.join("")).toContain("--agent-id is required");
@@ -547,6 +588,7 @@ describe("CLI subcommands", () => {
     const code = await runTemplateCommand({
       argv: ["init", "nonexistent", "--agent-id", "x"],
       err: errStream,
+      isAgentWrapped: STUB_ALWAYS_WRAPPED,
     });
     expect(code).toBe(1);
     expect(errChunks.join("")).toContain("unknown template");

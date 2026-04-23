@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.0.0-rc.2 (2026-04-23)
+
+Scope-alignment back-out. rc.1 shipped named-agent runtime templates (`x-miner`, `github-miner`) that drifted from Scope Lock §11's channel-orthogonal template archetypes. Sanctuary governs harnesses; operators bring runtimes. See `Wiki/decisions/sanctuary-does-not-ship-sub-agent-runtimes.md` for the rule and rationale.
+
+### Removed
+
+- `server/src/templates/x-miner/` and `server/src/templates/github-miner/` directories, registry entries, and the `x-miner-sla.test.ts` acceptance test that asserted on them.
+- Console hardcoded provider mapping for the removed templates (`server/public/console/console.js`).
+- README references to the removed templates (archetype table row, narrative copy, CLI scaffold example).
+
+### Changed
+
+- `template init` now rejects orphan `agent_id`. If no wrapped harness exists for the given agent_id, the command exits non-zero with a `sanctuary wrap` pointer. The HTTP dashboard API at `POST /api/templates/:name/init` returns `400 {"error":"orphan_agent_id"}` with the same pointer. Channel-shape governance templates bind to already-wrapped harnesses; authoring a policy artifact for nothing was the runtime-drift surface this rc closed.
+- v1.0 acceptance drill Phase 2 rewritten around channel-shape binding to wrapped harnesses (`read-outputs-only` bound to OpenClaw, `bidirectional-sync` bound to Claude Code, plus an orphan-reject demonstration). Observation log rows and post-drill write-up updated to the new roster. Drill script lives in the coordinator workspace at `Review/Sanctuary/V1.0_Acceptance_Drill_Script_2026-04-23.md` (v2.3).
+- `server/test/mesh/policy-update-flow.test.ts` renamed its arbitrary `agent_id` string literal from `"x-miner"` to `"governed-harness-a"` so the test name and the naming-discipline gate agree post-back-out. The test itself is unchanged; it never exercised the deleted template.
+
+### Housekeeping
+
+- `.test-baseline` Linux floor adjusted to match the rc.2 test surface (deletion of the x-miner SLA suite plus addition of orphan-handling coverage). The bump lands in a separate scoped commit so the baseline-guard audit trail stays clean.
+- `NPM_TOKEN` repo secret required for automated publish on tag push for rc.2 and later. Setup notes in `server/docs/RELEASE.md`.
+
+### Not changed
+
+- rc.1 stays published under npm `next`. rc.2 supersedes cleanly under `next`. Promotion to `latest` gates on the v1.0 acceptance drill clearing on rc.2, not on this PR.
+
 ## v1.0.0-rc.1 (2026-04-23)
 
 First release candidate for the v1.0 line. Bundles the v1.0 MVP sprint

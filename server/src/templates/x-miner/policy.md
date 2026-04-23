@@ -1,1 +1,0 @@
-This agent may read from the xAI Grok API to mine data from X. It writes research outputs to the outputs slot for the operator orchestrator to consume. No credentials access. No plans access. No memory sync with other agents. The operator reviews all outputs before acting on them. Outputs are read-only to other agents in the mesh.

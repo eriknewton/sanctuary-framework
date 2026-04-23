@@ -3,16 +3,28 @@
  *
  * `sanctuary template list` — enumerate available templates.
  * `sanctuary template init <name> --agent-id <id>` — load a template.
+ *
+ * Orphan-rejection policy (v1.0, Option A): `template init` requires an
+ * already-wrapped harness. The default `isAgentWrapped` check resolves
+ * `agent_id` against the tenant discovery layer (`findTenant`); a tenant
+ * that is present and initialized counts as wrapped. Callers may override
+ * via `TemplateCommandArgs.isAgentWrapped` for tests.
  */
 
 import { listTemplates, getTemplate, TEMPLATE_NAMES, isTemplateName } from "./registry.js";
 import { buildCompiledPolicyFromTemplate } from "./init.js";
 import { encodePolicyBlob } from "../policy-engine/canonical-policy.js";
+import { findTenant } from "../cli/agents/discovery.js";
 
 export interface TemplateCommandArgs {
   argv: string[];
   out?: NodeJS.WritableStream;
   err?: NodeJS.WritableStream;
+  /**
+   * Override the orphan-check. Returns true when a cocoon is bound to the
+   * given agent_id. Default: resolves against tenant discovery.
+   */
+  isAgentWrapped?: (agentId: string) => Promise<boolean>;
 }
 
 export async function runTemplateCommand(args: TemplateCommandArgs): Promise<number> {
@@ -29,12 +41,23 @@ export async function runTemplateCommand(args: TemplateCommandArgs): Promise<num
     case "list":
       return cmdList(out, err);
     case "init":
-      return cmdInit(rest, out, err);
+      return cmdInit(rest, out, err, args.isAgentWrapped ?? defaultIsAgentWrapped);
     default:
       err.write(`Unknown template subcommand: ${sub}\n`);
       printTemplateHelp(err);
       return 1;
   }
+}
+
+/**
+ * Default orphan-check. An agent counts as wrapped when tenant discovery
+ * finds a tenant with that name and the tenant is initialized (state dir
+ * or cocoon-profile.json present).
+ */
+async function defaultIsAgentWrapped(agentId: string): Promise<boolean> {
+  const tenant = await findTenant(agentId);
+  if (!tenant) return false;
+  return tenant.initialized || tenant.has_cocoon_profile;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -77,11 +100,12 @@ function padRight(str: string, len: number): string {
 // init
 // ═══════════════════════════════════════════════════════════════════════
 
-function cmdInit(
+async function cmdInit(
   argv: string[],
   out: NodeJS.WritableStream,
-  err: NodeJS.WritableStream
-): number {
+  err: NodeJS.WritableStream,
+  isAgentWrapped: (agentId: string) => Promise<boolean>
+): Promise<number> {
   let templateName: string | undefined;
   let agentId: string | undefined;
   let fortressId = "fortress-default";
@@ -116,6 +140,25 @@ function cmdInit(
 
   if (!agentId) {
     err.write("Error: --agent-id is required.\n");
+    return 1;
+  }
+
+  // Orphan-reject: a channel-shape template binds to an already-wrapped
+  // harness. If no cocoon exists for this agent_id, fail loudly and point
+  // the operator at `sanctuary wrap`. Sanctuary ships channel-shape
+  // governance templates, not named-agent runtimes; authoring a policy
+  // for nothing is the drift surface we closed in v1.0.0-rc.2.
+  const wrapped = await isAgentWrapped(agentId);
+  if (!wrapped) {
+    err.write(
+      `Error: no wrapped harness found for agent-id "${agentId}".\n` +
+      `\n` +
+      `A channel-shape template binds to an already-wrapped harness.\n` +
+      `Wrap the harness first, then re-run template init:\n` +
+      `\n` +
+      `  sanctuary wrap --claude-code   # or --openclaw, --hermes, --cursor, --cline\n` +
+      `  sanctuary template init ${templateName} --agent-id ${agentId}\n`
+    );
     return 1;
   }
 

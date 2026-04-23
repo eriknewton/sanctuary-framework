@@ -1,8 +1,0 @@
-{
-  "name": "x-miner",
-  "version": "1.0.0",
-  "channel": "read-outputs-only",
-  "tier": "B",
-  "target_archetype": "A Tier B adapter-wrapped data-mining sub-agent that reads from the xAI Grok API to surface insights from X (formerly Twitter). Write-only to the outputs slot; the operator orchestrator consumes results.",
-  "description": "X data-mining sub-agent: reads from xAI Grok API, writes research outputs. Read-only output surface, no credentials sync."
-}

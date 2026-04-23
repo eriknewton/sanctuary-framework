@@ -31,8 +31,6 @@ export const TEMPLATE_NAMES = [
   "ops-runner",
   "planner",
   "handoff-coordinator",
-  "x-miner",
-  "github-miner",
 ] as const;
 
 export type TemplateName = (typeof TEMPLATE_NAMES)[number];

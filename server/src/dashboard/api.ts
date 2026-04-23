@@ -19,6 +19,7 @@ import { renderDashboardHTML } from "./html.js";
 import { listTemplates, getTemplateEntry, getTemplate } from "../templates/registry.js";
 import { initTemplate } from "../templates/init.js";
 import type { TemplateName } from "../templates/registry.js";
+import { findTenant } from "../cli/agents/discovery.js";
 
 export interface ApprovalHandlers {
   allow: (id: string) => Promise<boolean>;
@@ -39,6 +40,12 @@ export interface APIDeps {
   principalId?: string;
   /** Fortress ID for template init. */
   fortressId?: string;
+  /**
+   * Override the orphan-check for template init. Returns true when a
+   * cocoon is bound to the given agent_id. Default: resolves against
+   * tenant discovery (`findTenant`).
+   */
+  isAgentWrapped?: (agentId: string) => Promise<boolean>;
 }
 
 export interface StreamEvent {
@@ -243,6 +250,27 @@ export async function handleRequest(
         writeJSON(res, 400, {
           error: "validation_error",
           message: "agent_name must contain only alphanumeric characters, hyphens, and underscores",
+        });
+        return true;
+      }
+
+      // Orphan-reject: a channel-shape template binds to an already-wrapped
+      // harness. A template init against an agent_id with no cocoon behind
+      // it would author a policy artifact bound to nothing, which is the
+      // runtime-drift surface the v1.0.0-rc.2 back-out closed. Sanctuary
+      // ships channel-shape governance templates, not named-agent runtimes.
+      const isAgentWrapped =
+        deps.isAgentWrapped ?? (async (agentId: string) => {
+          const tenant = await findTenant(agentId);
+          if (!tenant) return false;
+          return tenant.initialized || tenant.has_cocoon_profile;
+        });
+      if (!(await isAgentWrapped(body.agent_name))) {
+        writeJSON(res, 400, {
+          error: "orphan_agent_id",
+          message:
+            `No wrapped harness found for agent_id "${body.agent_name}". ` +
+            `Run \`sanctuary wrap\` to wrap the harness first, then retry template init.`,
         });
         return true;
       }
