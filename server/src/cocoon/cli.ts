@@ -10,11 +10,24 @@
  *   npx @sanctuary-framework/mcp-server wrap --openclaw
  *   npx @sanctuary-framework/mcp-server wrap --claude-code
  *   npx @sanctuary-framework/mcp-server wrap --cursor
+ *   npx @sanctuary-framework/mcp-server wrap --cline
  *   npx @sanctuary-framework/mcp-server wrap --wrap /path/to/config.json
  *   npx @sanctuary-framework/mcp-server wrap --unwrap
  *
  * The `cocoon` subcommand is preserved as a hidden alias that prints a
  * deprecation notice. It will be removed in a future release.
+ *
+ * Layer 1 vs Layer 2 (Cline, and any other harness that has both):
+ *   `sanctuary wrap --cline` is the Layer 1 install-time flag handled here.
+ *   It detects the operator's existing Cline VS Code extension MCP config,
+ *   backs it up, and rewrites it so Sanctuary becomes the upstream gateway.
+ *   The operator keeps running Cline; Sanctuary slips in front of Cline's
+ *   MCP client.
+ *
+ *   `sanctuary wrap --tier-b cline` is the Layer 2 managed-child SDK
+ *   adapter selector (see server/src/agent-contract/adapters/cline.ts).
+ *   It spawns Cline as a child process and brokers MCP over stdio. This is
+ *   the advanced path; most operators want Layer 1.
  */
 
 import { writeFile, readFile, mkdir, access } from "node:fs/promises";
@@ -54,6 +67,8 @@ export interface WrapOptions {
   claudeCode?: boolean;
   /** Auto-detect Cursor config. */
   cursor?: boolean;
+  /** Auto-detect Cline config. */
+  cline?: boolean;
   /** Unwrap — restore the original config. */
   unwrap?: boolean;
   /** Explicit passphrase override. If unset, one is generated and stored. */
@@ -143,6 +158,7 @@ export async function runWrap(
   if (options.openclaw) platformHint = "openclaw";
   else if (options.claudeCode) platformHint = "claude-code";
   else if (options.cursor) platformHint = "cursor";
+  else if (options.cline) platformHint = "cline";
 
   const detection = await detectAgentConfigWithDiagnostics(
     platformHint,
@@ -159,7 +175,7 @@ export async function runWrap(
     } else {
       console.error("  Could not auto-detect any agent configuration.");
       console.error(
-        "  Use --openclaw, --claude-code, --cursor, or --wrap /path/to/config.json"
+        "  Use --openclaw, --claude-code, --cursor, --cline, or --wrap /path/to/config.json"
       );
     }
     if (detection.pathsChecked.length > 0) {
@@ -675,6 +691,7 @@ function toolNameFor(platform: AgentPlatform, _servers: MCPServerEntry[]): strin
     case "openclaw": return "OpenClaw";
     case "claude-code": return "Claude Code";
     case "cursor": return "Cursor";
+    case "cline": return "Cline";
     default: return "your agent";
   }
 }
@@ -708,6 +725,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--cursor":
         options.cursor = true;
+        break;
+      case "--cline":
+        options.cline = true;
         break;
       case "--unwrap":
         options.unwrap = true;
@@ -745,6 +765,7 @@ function printWrapHelp(): void {
     sanctuary wrap --openclaw          Wrap OpenClaw
     sanctuary wrap --claude-code       Wrap Claude Code
     sanctuary wrap --cursor            Wrap Cursor
+    sanctuary wrap --cline             Wrap Cline (VS Code extension)
     sanctuary wrap --wrap <path>       Wrap a specific MCP config file
     sanctuary wrap --unwrap            Restore original config
 
@@ -752,6 +773,7 @@ function printWrapHelp(): void {
     --openclaw         Auto-detect and wrap OpenClaw
     --claude-code      Auto-detect and wrap Claude Code
     --cursor           Auto-detect and wrap Cursor
+    --cline            Auto-detect and wrap Cline (VS Code extension)
     --wrap <path>      Wrap a specific MCP config file
     --unwrap           Restore original config from backup
     --passphrase <p>   Override the stored passphrase (one-off)

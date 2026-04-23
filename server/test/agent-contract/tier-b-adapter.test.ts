@@ -125,6 +125,19 @@ describe("Tier B adapter SDK — registry + invariants (§5)", () => {
     expect(reg?.label).toContain("Anthropic");
   });
 
+  // WP-MVP-1 Follow-up — Cline wrap adapter (Layer 1) regression guard.
+  // The Layer 2 SDK adapter at server/src/agent-contract/adapters/cline.ts
+  // is NOT modified by the Layer 1 install-time --cline wrap flag, but any
+  // future refactor that accidentally deregisters the cline SDK must fail
+  // this test. See Review/Sanctuary/WP-MVP-1_Followup_Cline_Wrap_Adapter_Spawn_Prompt_2026-04-22.md A5.
+  it("returns the cline Tier B SDK adapter registration (Layer 2 guard)", () => {
+    const reg = getTierBAdapter("cline");
+    expect(reg).toBeDefined();
+    expect(reg?.id).toBe("cline");
+    expect(reg?.label).toContain("Cline");
+    expect(typeof reg?.factory).toBe("function");
+  });
+
   it("buildHarnessEnv includes HTTP_PROXY + HTTPS_PROXY + Sanctuary vars", async () => {
     const { base } = await buildAdapterParams();
     const t = makeStubClineTransport();

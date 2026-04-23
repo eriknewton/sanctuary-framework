@@ -32,6 +32,10 @@ describe("parseWrapArgs", () => {
     expect(parseWrapArgs(["--cursor"]).cursor).toBe(true);
   });
 
+  it("parses --cline flag", () => {
+    expect(parseWrapArgs(["--cline"]).cline).toBe(true);
+  });
+
   it("parses --wrap with path", () => {
     expect(parseWrapArgs(["--wrap", "/etc/x.json"]).wrap).toBe("/etc/x.json");
   });
@@ -574,6 +578,69 @@ describe("runWrap — v0.10.0 WP1 multi-tenancy env vars", () => {
     );
 
     expect(seen.port).toBe(3503);
+  });
+
+  it("routes the cline flag through detection with platform='cline'", async () => {
+    // Seed a Cline-shape flat mcpServers config at a temp path and drive
+    // runWrap({ cline: true, wrap: <path> }). We verify platform dispatch
+    // two ways: (a) the rewriteConfig spy receives an AgentConfig whose
+    // platform === "cline"; (b) runWrap completes successfully through
+    // the verifyRewrittenConfig step (no restoreFromBackup triggered).
+    const tenantDir = join(tempHome, "tenant-cline");
+    process.env.SANCTUARY_STORAGE_PATH = tenantDir;
+    const clineConfigPath = join(tempHome, "cline_mcp_settings.json");
+    await writeFile(
+      clineConfigPath,
+      JSON.stringify({
+        mcpServers: {
+          filesystem: { command: "node", args: ["fs.js"] },
+        },
+      }),
+      "utf-8"
+    );
+
+    const rewriteSpy = vi.fn(
+      async (
+        agentConfig: { platform: string; configPath: string },
+        command: string,
+        args: string[]
+      ) => {
+        // Persist a sanctuary entry so verifyRewrittenConfig is happy.
+        await writeFile(
+          agentConfig.configPath,
+          JSON.stringify({
+            mcpServers: {
+              sanctuary: { command, args },
+            },
+          }),
+          "utf-8"
+        );
+        return agentConfig.configPath;
+      }
+    );
+
+    const seen: { port?: number } = {};
+    await runWrap(
+      { wrap: clineConfigPath, cline: true, noOpen: true },
+      {
+        startDashboard: capturingDashboardStarter(seen),
+        openBrowser: async () => {},
+        resolvePassphrase: async () => ({
+          value: "gen",
+          location: "macOS Keychain",
+          source: "generated",
+        }),
+        rewriteConfig: rewriteSpy,
+      }
+    );
+
+    expect(rewriteSpy).toHaveBeenCalledTimes(1);
+    const calledWith = rewriteSpy.mock.calls[0]?.[0] as {
+      platform: string;
+      configPath: string;
+    };
+    expect(calledWith.platform).toBe("cline");
+    expect(calledWith.configPath).toBe(clineConfigPath);
   });
 
   it("writes backup and meta under the per-tenant storage path", async () => {
