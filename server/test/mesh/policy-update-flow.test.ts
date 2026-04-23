@@ -138,7 +138,7 @@ describe("mesh — policy_update distributed across three-mode mesh (§12 criter
 
     // Console (local node) authors and broadcasts a policy_update.
     const payload: PolicyUpdatePayload = {
-      agent_id: "x-miner",
+      agent_id: "governed-harness-a",
       policy_version: 1,
       policy_blob: "compiled-policy-bytes-v1",
     };
@@ -154,15 +154,15 @@ describe("mesh — policy_update distributed across three-mode mesh (§12 criter
     });
     await localT.broadcast(evt);
 
-    // Both receiving nodes pinned version 1 for x-miner.
-    expect(cloudPolicies.get("x-miner")?.policy_version).toBe(1);
-    expect(teePolicies.get("x-miner")?.policy_version).toBe(1);
+    // Both receiving nodes pinned version 1 for governed-harness-a.
+    expect(cloudPolicies.get("governed-harness-a")?.policy_version).toBe(1);
+    expect(teePolicies.get("governed-harness-a")?.policy_version).toBe(1);
     expect(cloudRouter.stats().dispatched).toBe(1);
     expect(teeRouter.stats().dispatched).toBe(1);
 
     // Second policy update: higher version, pins on both.
     const payload2: PolicyUpdatePayload = {
-      agent_id: "x-miner",
+      agent_id: "governed-harness-a",
       policy_version: 2,
       policy_blob: "compiled-policy-bytes-v2",
       parent_version: 1,
@@ -179,8 +179,8 @@ describe("mesh — policy_update distributed across three-mode mesh (§12 criter
     });
     await localT.broadcast(evt2);
 
-    expect(cloudPolicies.get("x-miner")?.policy_version).toBe(2);
-    expect(teePolicies.get("x-miner")?.policy_version).toBe(2);
+    expect(cloudPolicies.get("governed-harness-a")?.policy_version).toBe(2);
+    expect(teePolicies.get("governed-harness-a")?.policy_version).toBe(2);
   });
 
   it("router silently drops reserved-namespace event_type after signature passes (forward-compat §10.3)", async () => {

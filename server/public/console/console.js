@@ -397,11 +397,9 @@
           + "\nTier: " + res.metadata.tier
           + "\n\n" + (res.onboarding || "").slice(0, 500);
 
-        // Pre-select model provider based on template
+        // Default model provider; channel-shape archetypes do not prescribe one.
         var provSelect = qs('#scaffold-form select[name="model_provider"]');
-        if (name === "x-miner") provSelect.value = "xai";
-        else if (name === "github-miner") provSelect.value = "anthropic";
-        else provSelect.value = "anthropic";
+        provSelect.value = "anthropic";
       }
     } catch (e) { /* proceed with defaults */ }
 

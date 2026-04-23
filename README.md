@@ -78,22 +78,22 @@ ls -la ~/.sanctuary/audit/*.jsonl >/dev/null 2>&1 && echo "audit=ok"
 
 If any check fails, see "Troubleshooting" near the bottom of this README.
 
-### Step 4: Scaffold the operator's first sub-agent (recommended)
+### Step 4: Scaffold the operator's first governed harness (recommended)
 
-After the wrap succeeds, ask the operator: "What kind of sub-agent do you want first? I have one-click templates for X-Miner (reads your X / Grok account), GitHub-Miner (reads GitHub repos), research-assistant, coding-assistant, ops-runner, planner, and handoff-coordinator. Or I can skip this step."
+After the wrap succeeds, ask the operator: "Which channel shape do you want on this harness? I have one-click archetypes for research-assistant, coding-assistant, ops-runner, planner, and handoff-coordinator. Or I can skip this step."
 
-If they pick a template, run:
+If they pick an archetype, run:
 
 ```bash
 curl -X POST "http://localhost:3501/api/templates/<template-name>/init" \
   -H "Content-Type: application/json" \
   -d '{
-    "agent_name": "<operator-supplied-name>",
+    "agent_name": "<already-wrapped-agent-id>",
     "model_provider": "<xai|anthropic|openai|mistral>"
   }'
 ```
 
-Substitute `<template-name>` with the template the operator picked (`x-miner`, `github-miner`, `research-assistant`, etc.). Confirm the response includes a `signed_policy_event_id` and an `attestation_panel_url`. Open that URL in the operator's browser.
+Substitute `<template-name>` with the archetype the operator picked (`research-assistant`, `coding-assistant`, etc.). The `agent_name` must match an already-wrapped harness; `template init` rejects an orphan `agent_id` with no cocoon behind it and points the operator at `sanctuary wrap`. Confirm the response includes a `signed_policy_event_id` and an `attestation_panel_url`. Open that URL in the operator's browser.
 
 ### Step 5: Hand back to the operator
 
@@ -206,24 +206,24 @@ Scores your setup 0-100 across security, isolation, and privacy. Detects problem
 
 After `wrap`, the dashboard exposes a one-click template picker. Click "Add agent" on the Agents view, pick a template, fill in a name and model provider, click Scaffold. The template provisions sensible defaults for egress allowed-hosts, budgets, retention windows, and policy gates.
 
-Templates that ship with v1.0:
+Channel-shape archetypes that ship with v1.0:
 
-| Template | What it is | Reads from | Recommended model |
+| Archetype | Channel shape | Reads from | Recommended model |
 |---|---|---|---|
-| **X-Miner** | Mines your X / Twitter account through Grok or any LLM | `api.x.ai` | xai |
-| **GitHub-Miner** | Mines GitHub repos, issues, and PRs | `api.github.com` | anthropic |
 | **research-assistant** | General-purpose research helper | configurable | any |
 | **coding-assistant** | Reads your codebase, suggests changes | local + git remote | any |
 | **ops-runner** | Runs ops scripts on approval | scoped per agent | any |
 | **planner** | Generates plans without executing them | none | any |
 | **handoff-coordinator** | Coordinates work across multiple agents | inter-agent only | any |
 
+Sanctuary ships channel-shape governance templates (policy, egress, budgets, retention) rather than named-agent runtimes. Operators bring their own harnesses and wrap them; `template init` binds a channel shape to an already-wrapped harness.
+
 Operator authoring beyond this list: copy any template directory under `~/.sanctuary/templates/`, edit `template.json`, `defaults.json`, `policy.md`, `commitments.json`, and `onboarding.md`, then run `sanctuary template init <your-template>`.
 
 CLI scaffolding works the same way the dashboard button does:
 
 ```bash
-sanctuary template init x-miner --name my-x-miner --provider xai
+sanctuary template init research-assistant --name my-agent --provider anthropic
 ```
 
 ---
