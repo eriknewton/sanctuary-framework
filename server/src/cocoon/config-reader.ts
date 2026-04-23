@@ -75,7 +75,13 @@ export function getPlatformPaths(): Record<AgentPlatform, string[]> {
       join(home, ".hermes", "config.json"),
       join(home, ".config", "hermes", "cli-config.json"),
     ],
+    // Claude Code's modern canonical surface is ~/.claude.json (`claude mcp
+    // add` writes here). The legacy ~/.claude/settings.json shape predates
+    // it and is still respected if present. Probe order = preference order:
+    // wrap operates on the first one that exists, and bootstraps a fresh
+    // ~/.claude.json when neither is present (per the cli.ts bootstrap).
     "claude-code": [
+      join(home, ".claude.json"),
       join(home, ".claude", "settings.json"),
       join(home, ".config", "claude-code", "settings.json"),
     ],
