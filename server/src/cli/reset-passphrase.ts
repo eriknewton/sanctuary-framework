@@ -1,0 +1,670 @@
+/**
+ * Sanctuary MCP Server — `sanctuary reset-passphrase` CLI subcommand
+ *
+ * Recovery flow for passphrase loss. Three mutually exclusive paths:
+ *
+ *   (a) Recovery shares   — reconstruct the master key from M-of-N shares.
+ *                           Operationally available only when the operator has
+ *                           previously persisted shares to this fortress. v1.0.x
+ *                           does not yet ship share persistence; this path
+ *                           degrades gracefully today.
+ *
+ *   (b) Guardian quorum   — initiate a federation v0.1
+ *                           `guardian_recovery_request` and wait for the
+ *                           configured guardian threshold. Requires an
+ *                           unlocked local cocoon to talk to the federation,
+ *                           which the lost-passphrase scenario does not have.
+ *                           Path ships with v1.1 federation full mesh.
+ *
+ *   (c) Nuke and rebind   — destroy the cocoon entirely and re-initialize.
+ *                           ALL state (identities, broker tokens, audit log,
+ *                           federation membership) is permanently lost. The
+ *                           operator types the fortress name and the literal
+ *                           word DESTROY before the wipe runs.
+ *
+ * Refuse-if-unlocked guard: if `<storage>/runtime.json` exists, refuse with a
+ * clear hint to stop the dashboard and any wrapped agents first. Operators on
+ * a stale runtime file can remove it manually after confirming nothing is
+ * running.
+ *
+ * Multi-principal note: v1.0.x cocoons are single-principal. When a future
+ * v1.x ships multi-principal cocoons (Federation Protocol §10 reservation,
+ * Architecture Walk Q4), this command MUST branch on principal selection so a
+ * single principal's lost passphrase does not silently nuke the whole
+ * fortress. The hook point is `selectMode()` below; the survey logic at
+ * `surveyAvailableModes()` is the right place to enumerate per-principal
+ * mode availability when that lands.
+ *
+ * No Concordia or Verascore imports (non-dependency principle).
+ */
+
+import { createInterface, Interface as ReadlineInterface } from "node:readline";
+import { spawn } from "node:child_process";
+import {
+  readdir,
+  rm,
+  stat,
+  writeFile,
+  appendFile,
+  access,
+} from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, join } from "node:path";
+
+import { resolveStoragePath } from "../paths.js";
+import { keychainServiceFor } from "../cocoon/passphrase.js";
+
+// ── Types ───────────────────────────────────────────────────────────
+
+export type RecoveryMode = "shares" | "guardian" | "nuke";
+
+export interface ResetPassphraseArgs {
+  argv: string[];
+  /** Output stream (stdout in prod; captured in tests). */
+  out?: NodeJS.WritableStream;
+  /** Error stream (stderr in prod; captured in tests). */
+  err?: NodeJS.WritableStream;
+  /** Stdin source for prompts (tests inject Readable; prod uses process.stdin). */
+  stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
+  /** Override storage path (tests; prod resolves from env). */
+  storagePath?: string;
+  /** Override home directory (tests). */
+  home?: string;
+  /** Override platform detection (tests). */
+  platformOverride?: NodeJS.Platform;
+  /**
+   * Override `security` exec for Keychain cleanup (tests). Production uses a
+   * default that spawns `/usr/bin/security`.
+   */
+  exec?: (
+    cmd: string,
+    args: string[]
+  ) => Promise<{ stdout: string; stderr: string; code: number | null }>;
+}
+
+interface ModeAvailability {
+  shares: { available: boolean; reason: string };
+  guardian: { available: boolean; reason: string };
+  nuke: { available: boolean; reason: string };
+}
+
+interface ParsedArgs {
+  mode?: RecoveryMode;
+  storage?: string;
+  help: boolean;
+}
+
+// ── Public entry ────────────────────────────────────────────────────
+
+export async function runResetPassphraseCommand(
+  args: ResetPassphraseArgs
+): Promise<number> {
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const stdin = args.stdin ?? (process.stdin as NodeJS.ReadableStream & { isTTY?: boolean });
+  const home = args.home ?? homedir();
+  const plat = args.platformOverride ?? process.platform;
+
+  const parsed = parseArgs(args.argv);
+  if (parsed.help) {
+    printUsage(out);
+    return 0;
+  }
+
+  const storagePath =
+    parsed.storage ??
+    args.storagePath ??
+    resolveStoragePath(process.env, home);
+
+  out.write(banner(storagePath));
+
+  // Refuse-if-unlocked guard.
+  const runtimeFile = join(storagePath, "runtime.json");
+  if (await fileExists(runtimeFile)) {
+    err.write(
+      `Refusing to reset: ${runtimeFile} exists, indicating a Sanctuary process may be running.\n` +
+        `Close the dashboard and stop all wrapped agents before running reset-passphrase.\n` +
+        `If you have already stopped everything and the file is stale, remove it manually:\n` +
+        `  rm ${runtimeFile}\n` +
+        `Then re-run this command.\n`
+    );
+    return 1;
+  }
+
+  // Single readline interface shared across all prompts in this command run.
+  // Tests pass a pre-loaded Readable; production hands process.stdin which
+  // stays open for the duration of the command.
+  const lines = new LineReader(stdin);
+  try {
+    const availability = await surveyAvailableModes(storagePath);
+    const mode = parsed.mode ?? (await selectMode(lines, out, err, availability));
+    if (!mode) {
+      err.write("Aborted: no recovery mode selected.\n");
+      return 1;
+    }
+
+    if (mode === "shares") {
+      return await runSharesPath(out, err, availability);
+    }
+    if (mode === "guardian") {
+      return await runGuardianPath(out, err, availability);
+    }
+    return await runNukePath({
+      out,
+      err,
+      lines,
+      storagePath,
+      home,
+      plat,
+      exec: args.exec ?? defaultExec,
+    });
+  } finally {
+    lines.close();
+  }
+}
+
+// ── Argument parsing ────────────────────────────────────────────────
+
+function parseArgs(argv: string[]): ParsedArgs {
+  const out: ParsedArgs = { help: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--help" || a === "-h") {
+      out.help = true;
+    } else if (a === "--mode" && argv[i + 1]) {
+      const v = argv[++i] as RecoveryMode;
+      if (v !== "shares" && v !== "guardian" && v !== "nuke") {
+        throw new Error(
+          `--mode must be one of: shares, guardian, nuke (got ${v})`
+        );
+      }
+      out.mode = v;
+    } else if (a === "--storage" && argv[i + 1]) {
+      out.storage = argv[++i];
+    } else if (a && a.startsWith("--")) {
+      throw new Error(`Unknown flag: ${a}`);
+    }
+  }
+  return out;
+}
+
+function printUsage(out: NodeJS.WritableStream): void {
+  out.write(`
+Usage: sanctuary reset-passphrase [options]
+
+Recover a fortress whose passphrase has been lost or corrupted. Three modes:
+
+  shares     Reconstruct the master key from M-of-N recovery shares.
+             Available only when shares were previously persisted to this
+             fortress. Not yet configured by default in v1.0.x.
+
+  guardian   Initiate a guardian-quorum recovery via the federation. Ships
+             with v1.1 federation full mesh; not operational on a single
+             unreachable local cocoon today.
+
+  nuke       Destroy the cocoon entirely and re-initialize. ALL identities,
+             broker tokens, audit log entries, and federation membership are
+             permanently lost. Operator types the fortress name and the
+             literal word DESTROY before the wipe runs. Use this only when
+             paths (shares) and (guardian) are unavailable and you accept
+             starting over.
+
+Options:
+  --mode <shares|guardian|nuke>   Pick a path non-interactively.
+  --storage <path>                Override the resolved storage path.
+                                  Defaults to SANCTUARY_STORAGE_PATH or
+                                  ~/.sanctuary.
+  --help, -h                      Show this help.
+
+Without --mode, the command surveys which paths are operationally available
+on this fortress and presents an interactive menu.
+
+Refuse-if-unlocked: this command refuses to run while runtime.json exists
+under the storage path, since that signals a live Sanctuary process. Close
+the dashboard and stop all wrapped agents first.
+
+After a successful nuke, run:
+  sanctuary wrap
+
+to re-initialize a fresh fortress.
+`);
+}
+
+// ── Mode survey ─────────────────────────────────────────────────────
+
+async function surveyAvailableModes(
+  storagePath: string
+): Promise<ModeAvailability> {
+  const sharesFile = join(storagePath, "recovery-shares.json");
+  const guardianFile = join(storagePath, "guardian-roster.json");
+
+  const sharesPresent = await fileExists(sharesFile);
+  const guardianPresent = await fileExists(guardianFile);
+
+  return {
+    shares: {
+      available: sharesPresent,
+      reason: sharesPresent
+        ? "recovery shares persisted on this fortress"
+        : "not yet configured on this fortress (M-of-N share persistence ships with v1.1)",
+    },
+    guardian: {
+      available: false,
+      reason: guardianPresent
+        ? "guardian roster present, but the guardian recovery transport ships with v1.1 federation full mesh"
+        : "not-yet-supported: guardian path ships with federation v0.1 full mesh, expected v1.1; use shares (when configured) or nuke for now",
+    },
+    nuke: {
+      available: true,
+      reason: "destroys all state and re-initializes a fresh fortress",
+    },
+  };
+}
+
+// ── Mode selection (interactive) ────────────────────────────────────
+
+async function selectMode(
+  lines: LineReader,
+  out: NodeJS.WritableStream,
+  err: NodeJS.WritableStream,
+  availability: ModeAvailability
+): Promise<RecoveryMode | undefined> {
+  out.write(`
+Pick a recovery path:
+
+  1) shares    ${availability.shares.available ? "(available)" : "(unavailable)"}
+     ${availability.shares.reason}
+
+  2) guardian  ${availability.guardian.available ? "(available)" : "(unavailable)"}
+     ${availability.guardian.reason}
+
+  3) nuke      (available, DESTRUCTIVE)
+     ${availability.nuke.reason}
+
+`);
+  const answer = await prompt(lines, err, "Choose 1, 2, or 3 (or q to abort): ");
+  const trimmed = answer.trim().toLowerCase();
+  if (trimmed === "1" || trimmed === "shares") return "shares";
+  if (trimmed === "2" || trimmed === "guardian") return "guardian";
+  if (trimmed === "3" || trimmed === "nuke") return "nuke";
+  return undefined;
+}
+
+// ── Path (a) shares ─────────────────────────────────────────────────
+
+async function runSharesPath(
+  _out: NodeJS.WritableStream,
+  err: NodeJS.WritableStream,
+  availability: ModeAvailability
+): Promise<number> {
+  if (!availability.shares.available) {
+    err.write(
+      `Recovery shares: ${availability.shares.reason}.\n` +
+        `Falling through. Re-run with --mode guardian or --mode nuke to choose another path,\n` +
+        `or omit --mode for the interactive menu.\n`
+    );
+    return 2;
+  }
+  // Reserved for v1.1 implementation. When share persistence lands, this
+  // branch prompts for M shares, reconstructs the master, asks for the new
+  // passphrase, derives a new Argon2id key via core/key-derivation, re-wraps,
+  // and writes a passphrase_reset audit entry signed by the preserved
+  // identity.
+  err.write(
+    "Recovery-share reconstruction is reserved for v1.1. The detection branch\n" +
+      "is in place, but the reconstruction primitive has not yet shipped.\n"
+  );
+  return 2;
+}
+
+// ── Path (b) guardian ───────────────────────────────────────────────
+
+async function runGuardianPath(
+  _out: NodeJS.WritableStream,
+  err: NodeJS.WritableStream,
+  availability: ModeAvailability
+): Promise<number> {
+  err.write(
+    `Guardian recovery: ${availability.guardian.reason}.\n` +
+      `The federation v0.1 \`guardian_recovery_request\` message class lands with v1.1\n` +
+      `full-mesh transport. Use --mode shares (when configured) or --mode nuke today.\n`
+  );
+  return 2;
+}
+
+// ── Path (c) nuke ───────────────────────────────────────────────────
+
+interface NukeContext {
+  out: NodeJS.WritableStream;
+  err: NodeJS.WritableStream;
+  lines: LineReader;
+  storagePath: string;
+  home: string;
+  plat: NodeJS.Platform;
+  exec: (
+    cmd: string,
+    args: string[]
+  ) => Promise<{ stdout: string; stderr: string; code: number | null }>;
+}
+
+async function runNukePath(ctx: NukeContext): Promise<number> {
+  const fortressName = basename(ctx.storagePath) || "sanctuary";
+
+  // 1. Enumerate what is about to die.
+  const inventory = await inventoryStorage(ctx.storagePath);
+  ctx.out.write(`
+About to permanently destroy the fortress at:
+  ${ctx.storagePath}
+
+Contents (${inventory.entries.length} entries, ${formatBytes(inventory.totalBytes)} total):
+`);
+  for (const e of inventory.entries) {
+    ctx.out.write(`  ${e.kind === "dir" ? "d" : "f"} ${e.name}  (${formatBytes(e.bytes)})\n`);
+  }
+  if (inventory.entries.length === 0) {
+    ctx.out.write(`  (storage path is empty, nothing to destroy)\n`);
+  }
+
+  ctx.out.write(`
+This action is IRREVERSIBLE. You will lose:
+  - All wrapped agent identities (Ed25519 private keys)
+  - All Secret Broker tokens and grants
+  - The encrypted audit log and policy configuration
+  - Federation membership and guardian roster
+  - All L1 cognitive state, L3 commitments, L4 reputation attestations
+
+If you have backups (state_export, identity export, recovery shares, guardian
+quorum), use those instead. Closing this prompt with anything other than the
+exact confirmations below aborts the wipe.
+
+`);
+
+  // 2. Type the fortress name.
+  const nameAnswer = await prompt(
+    ctx.lines,
+    ctx.err,
+    `Type the fortress name (${fortressName}) to continue: `
+  );
+  if (nameAnswer.trim() !== fortressName) {
+    ctx.err.write(
+      `Aborted: fortress name did not match (expected "${fortressName}", got "${nameAnswer.trim()}").\n`
+    );
+    return 1;
+  }
+
+  // 3. Type the literal word DESTROY.
+  const destroyAnswer = await prompt(
+    ctx.lines,
+    ctx.err,
+    `Type the word DESTROY (uppercase) to continue: `
+  );
+  if (destroyAnswer.trim() !== "DESTROY") {
+    ctx.err.write(`Aborted: confirmation word did not match.\n`);
+    return 1;
+  }
+
+  // 4. Final yes/no.
+  const finalAnswer = await prompt(
+    ctx.lines,
+    ctx.err,
+    `Final confirmation. Wipe ${ctx.storagePath} now? [y/N] `
+  );
+  if (!/^y(es)?$/i.test(finalAnswer.trim())) {
+    ctx.err.write(`Aborted: final confirmation declined.\n`);
+    return 1;
+  }
+
+  // 5. Perform the wipe.
+  const startedAt = new Date().toISOString();
+  await wipeStorage(ctx.storagePath);
+
+  // 6. Clear the macOS Keychain entry for this storage path so a fresh
+  //    `sanctuary wrap` regenerates a fresh passphrase rather than picking
+  //    up the orphaned entry.
+  let keychainCleared = false;
+  if (ctx.plat === "darwin") {
+    keychainCleared = await clearKeychainEntry(ctx);
+  }
+
+  // 7. Write a plaintext reset marker so a future fortress at the same
+  //    storage path can show this history on first boot. Audit-log
+  //    continuity is impossible by definition (the audit log was just
+  //    destroyed), so this marker is the best-effort substitute.
+  const completedAt = new Date().toISOString();
+  await writeResetMarker(ctx.storagePath, {
+    started_at: startedAt,
+    completed_at: completedAt,
+    recovery_mode: "nuke",
+    fortress_name: fortressName,
+    storage_path: ctx.storagePath,
+    keychain_cleared: keychainCleared,
+  });
+
+  ctx.out.write(`
+Reset complete.
+  recovery_mode: nuke
+  started_at:    ${startedAt}
+  completed_at:  ${completedAt}
+  storage_path:  ${ctx.storagePath}
+  keychain:      ${ctx.plat === "darwin" ? (keychainCleared ? "cleared" : "no entry to clear") : "skipped (non-darwin)"}
+
+Reset marker: ${join(ctx.storagePath, ".reset-history.log")}
+Next step:    sanctuary wrap
+`);
+  return 0;
+}
+
+// ── Storage helpers ─────────────────────────────────────────────────
+
+interface InventoryEntry {
+  name: string;
+  kind: "file" | "dir";
+  bytes: number;
+}
+
+interface Inventory {
+  entries: InventoryEntry[];
+  totalBytes: number;
+}
+
+async function inventoryStorage(storagePath: string): Promise<Inventory> {
+  if (!(await fileExists(storagePath))) {
+    return { entries: [], totalBytes: 0 };
+  }
+  const names = await readdir(storagePath);
+  const entries: InventoryEntry[] = [];
+  let totalBytes = 0;
+  for (const name of names) {
+    const full = join(storagePath, name);
+    try {
+      const s = await stat(full);
+      const bytes = s.isDirectory() ? await dirSize(full) : s.size;
+      entries.push({
+        name,
+        kind: s.isDirectory() ? "dir" : "file",
+        bytes,
+      });
+      totalBytes += bytes;
+    } catch {
+      // Permission denied or vanished mid-scan; skip.
+    }
+  }
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  return { entries, totalBytes };
+}
+
+async function dirSize(path: string): Promise<number> {
+  let total = 0;
+  try {
+    const names = await readdir(path);
+    for (const name of names) {
+      const full = join(path, name);
+      try {
+        const s = await stat(full);
+        total += s.isDirectory() ? await dirSize(full) : s.size;
+      } catch {
+        // Skip unreadable.
+      }
+    }
+  } catch {
+    // Skip unreadable directory.
+  }
+  return total;
+}
+
+async function wipeStorage(storagePath: string): Promise<void> {
+  if (!(await fileExists(storagePath))) return;
+  const names = await readdir(storagePath);
+  for (const name of names) {
+    if (name === ".reset-history.log") {
+      // Preserve any prior reset history across iterative resets.
+      continue;
+    }
+    await rm(join(storagePath, name), { recursive: true, force: true });
+  }
+}
+
+async function clearKeychainEntry(ctx: NukeContext): Promise<boolean> {
+  const service = keychainServiceFor(ctx.storagePath, ctx.home);
+  try {
+    const result = await ctx.exec("security", [
+      "delete-generic-password",
+      "-a",
+      "sanctuary",
+      "-s",
+      service,
+    ]);
+    return result.code === 0;
+  } catch {
+    return false;
+  }
+}
+
+interface ResetMarker {
+  started_at: string;
+  completed_at: string;
+  recovery_mode: RecoveryMode;
+  fortress_name: string;
+  storage_path: string;
+  keychain_cleared: boolean;
+}
+
+async function writeResetMarker(
+  storagePath: string,
+  marker: ResetMarker
+): Promise<void> {
+  const path = join(storagePath, ".reset-history.log");
+  const line = JSON.stringify(marker) + "\n";
+  if (await fileExists(path)) {
+    await appendFile(path, line, { mode: 0o600 });
+  } else {
+    await writeFile(path, line, { mode: 0o600 });
+  }
+}
+
+// ── Misc helpers ────────────────────────────────────────────────────
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function banner(storagePath: string): string {
+  return `
+Sanctuary reset-passphrase
+Storage: ${storagePath}
+
+`;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MiB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(1)} GiB`;
+}
+
+async function prompt(
+  lines: LineReader,
+  err: NodeJS.WritableStream,
+  question: string
+): Promise<string> {
+  err.write(question);
+  return await lines.next();
+}
+
+/**
+ * Single-readline-interface-per-command wrapper. Buffers `line` events and
+ * serves them on demand so multiple `prompt()` calls in the same command can
+ * share one underlying interface (a fresh readline.Interface per prompt
+ * stops working when the source stdin is a one-shot Readable, like the test
+ * harness uses).
+ */
+class LineReader {
+  private readonly rl: ReadlineInterface;
+  private readonly queue: string[] = [];
+  private readonly waiters: Array<(line: string) => void> = [];
+  private closed = false;
+
+  constructor(stdin: NodeJS.ReadableStream) {
+    this.rl = createInterface({ input: stdin });
+    this.rl.on("line", (line) => {
+      const w = this.waiters.shift();
+      if (w) {
+        w(line);
+      } else {
+        this.queue.push(line);
+      }
+    });
+    this.rl.on("close", () => {
+      this.closed = true;
+      while (this.waiters.length > 0) {
+        const w = this.waiters.shift();
+        if (w) w("");
+      }
+    });
+  }
+
+  next(): Promise<string> {
+    if (this.queue.length > 0) {
+      return Promise.resolve(this.queue.shift() as string);
+    }
+    if (this.closed) return Promise.resolve("");
+    return new Promise((resolve) => {
+      this.waiters.push(resolve);
+    });
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      this.rl.close();
+    } catch {
+      // Already closed.
+    }
+  }
+}
+
+async function defaultExec(
+  cmd: string,
+  args: string[]
+): Promise<{ stdout: string; stderr: string; code: number | null }> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on("data", (d) => {
+      stderr += d.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ stdout, stderr, code }));
+  });
+}

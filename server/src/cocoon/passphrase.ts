@@ -99,7 +99,8 @@ export interface PassphraseOptions {
  * Never auto-regenerate in response — that would permanently destroy all
  * state encrypted under the previous passphrase. Surface the error and let
  * the user restore from backup, re-import via SANCTUARY_PASSPHRASE, or run
- * a future `sanctuary reset-passphrase` subcommand (not yet implemented).
+ * `sanctuary reset-passphrase` to recover (recovery shares, guardian quorum)
+ * or destroy and start fresh.
  */
 export class PassphraseUnreadableError extends Error {
   readonly path: string;
@@ -110,8 +111,9 @@ export class PassphraseUnreadableError extends Error {
         `Your existing encrypted state cannot be recovered with a new passphrase. Options:\n` +
         `  1. Restore ${path} from a backup.\n` +
         `  2. Re-import the original passphrase via SANCTUARY_PASSPHRASE=<value> sanctuary wrap ...\n` +
-        `  3. Run \`sanctuary reset-passphrase\` (coming soon) to wipe state and start fresh.\n\n` +
-        `Refusing to regenerate the passphrase — that would permanently destroy the data encrypted under the previous key.`
+        `  3. Run \`sanctuary reset-passphrase\` to recover via shares or guardian quorum, or to destroy state and start fresh.\n` +
+        `     See \`sanctuary reset-passphrase --help\` for the three recovery modes.\n\n` +
+        `Refusing to regenerate the passphrase, that would permanently destroy the data encrypted under the previous key.`
     );
     this.name = "PassphraseUnreadableError";
     this.path = path;
