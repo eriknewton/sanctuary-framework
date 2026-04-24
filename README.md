@@ -34,7 +34,7 @@ Current capability summary:
 | Cross-fortress/fleet hub | Federation v0.1 foundation shipped; full fleet console is v1.x |
 | Runtime transport-layer interception | v1.x roadmap |
 | Sovereign-managed TEE and hardware secure elements | v2 roadmap |
-| Post-quantum / MLS-class cryptographic upgrades | v1.1 roadmap |
+| Post-quantum / RFC 9420 class cryptographic upgrades | v1.1 roadmap |
 
 ---
 

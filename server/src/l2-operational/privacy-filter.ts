@@ -18,7 +18,12 @@ export type PrivacySpanClass =
   | "phone"
   | "ssn"
   | "credit_card"
-  | "secret_assignment";
+  | "secret_assignment"
+  | "account_number"
+  | "address"
+  | "person"
+  | "url"
+  | "date";
 
 export interface PrivacyFinding {
   path: string;
@@ -225,6 +230,68 @@ export async function applyPrivacyPlaceholders<T = unknown>(
   return { value: filtered, findings };
 }
 
+export interface OpenAIPrivacyFilterSpan {
+  label: string;
+  start: number;
+  end: number;
+  text: string;
+  placeholder?: string;
+}
+
+export interface OpenAIPrivacyFilterResult {
+  schema_version: number;
+  detected_spans: OpenAIPrivacyFilterSpan[];
+  text: string;
+  redacted_text?: string;
+}
+
+export async function applyOpenAIPrivacyFilterResult(
+  result: OpenAIPrivacyFilterResult,
+  vault: PrivacyPlaceholderVault,
+  scope = "default",
+  path = "$"
+): Promise<PrivacyFilterResult<string>> {
+  const text = result.text;
+  const findings: PrivacyFinding[] = [];
+  const spans = result.detected_spans
+    .map((span) => ({
+      ...span,
+      class: mapOpenAIPrivacyLabel(span.label),
+    }))
+    .filter((span): span is OpenAIPrivacyFilterSpan & { class: PrivacySpanClass } =>
+      span.class !== null &&
+      Number.isInteger(span.start) &&
+      Number.isInteger(span.end) &&
+      span.start >= 0 &&
+      span.end > span.start &&
+      span.end <= text.length
+    )
+    .sort((a, b) => a.start - b.start);
+
+  let cursor = 0;
+  const pieces: string[] = [];
+  for (const span of spans) {
+    if (span.start < cursor) continue;
+    const raw = text.slice(span.start, span.end);
+    const placeholder = await vault.placeholderFor(span.class, raw, scope);
+    pieces.push(text.slice(cursor, span.start));
+    pieces.push(placeholder);
+    cursor = span.end;
+    findings.push({
+      path,
+      class: span.class,
+      action: "placeholder",
+      placeholder,
+    });
+  }
+  pieces.push(text.slice(cursor));
+
+  return {
+    value: pieces.join(""),
+    findings,
+  };
+}
+
 function filterValue(
   value: unknown,
   path: string,
@@ -347,5 +414,40 @@ async function placeholderString(
 }
 
 function placeholderPrefixFor(spanClass: PrivacySpanClass): string {
-  return SPAN_PATTERNS.find((p) => p.class === spanClass)?.placeholderPrefix ?? "PRIVATE";
+  return SPAN_PATTERNS.find((p) => p.class === spanClass)?.placeholderPrefix
+    ?? OPENAI_LABEL_PREFIXES[spanClass]
+    ?? "PRIVATE";
+}
+
+const OPENAI_LABEL_PREFIXES: Partial<Record<PrivacySpanClass, string>> = {
+  account_number: "ACCOUNT",
+  address: "ADDRESS",
+  person: "PERSON",
+  url: "URL",
+  date: "DATE",
+};
+
+function mapOpenAIPrivacyLabel(label: string): PrivacySpanClass | null {
+  switch (label) {
+    case "account_number":
+      return "account_number";
+    case "private_address":
+      return "address";
+    case "private_email":
+      return "email";
+    case "private_person":
+      return "person";
+    case "private_phone":
+      return "phone";
+    case "private_url":
+      return "url";
+    case "private_date":
+      return "date";
+    case "secret":
+      return "secret_assignment";
+    case "redacted":
+      return "secret_assignment";
+    default:
+      return null;
+  }
 }

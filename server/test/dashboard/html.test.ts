@@ -80,6 +80,12 @@ function makeSnapshot(overrides: Partial<ProtectionSnapshot> = {}): ProtectionSn
         result: "success",
       },
     ],
+    privacy: {
+      filtered_events: 1,
+      filtered_spans: 2,
+      classes: { email: 1, phone: 1 },
+      last_filtered_at: new Date().toISOString(),
+    },
     upstream_servers: [
       { name: "filesystem", state: "connected", tool_count: 5 },
     ],
@@ -125,6 +131,14 @@ describe("renderDashboardHTML", () => {
   it("renders the hero copy from the exported HERO_COPY constant", () => {
     const html = renderDashboardHTML({ snapshot: makeSnapshot() });
     expect(html).toContain(HERO_COPY);
+  });
+
+  it("renders the privacy boundary summary", () => {
+    const html = renderDashboardHTML({ snapshot: makeSnapshot() });
+    expect(html).toContain("Privacy boundary");
+    expect(html).toContain("Filtered spans");
+    expect(html).toContain("email 1");
+    expect(html).toContain("phone 1");
   });
 
   it("echoes the aggregator headline in the hero sub-text", () => {

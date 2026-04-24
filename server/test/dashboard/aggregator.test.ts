@@ -176,6 +176,42 @@ describe("getProtectionSnapshot", () => {
     expect(snap.layers.l1.injection_blocked_today).toBeGreaterThanOrEqual(1);
   });
 
+  it("summarizes privacy filtering from audit metadata", async () => {
+    const now = new Date().toISOString();
+    const audit: AuditEntry[] = [
+      {
+        timestamp: now,
+        layer: "l2",
+        operation: "context_gate_filter",
+        identity_id: "id-1",
+        result: "success",
+        details: {
+          privacy_findings: 2,
+          privacy_classes: ["email", "phone"],
+        },
+      },
+      {
+        timestamp: now,
+        layer: "l2",
+        operation: "context_gate_enforcer_builtin_privacy_filter",
+        identity_id: "id-1",
+        result: "success",
+        details: {
+          privacy_findings: 1,
+          privacy_classes: ["email"],
+        },
+      },
+    ];
+
+    const snap = await getProtectionSnapshot(
+      baseSources({ auditLog: stubAuditLog(audit) })
+    );
+    expect(snap.privacy.filtered_events).toBe(2);
+    expect(snap.privacy.filtered_spans).toBe(3);
+    expect(snap.privacy.classes).toEqual({ email: 2, phone: 1 });
+    expect(snap.privacy.last_filtered_at).toBe(now);
+  });
+
   it("attaches a Verascore score when reputation is provided", async () => {
     const sources = baseSources({
       identityManager: stubIdentityManager(stubIdentity()),

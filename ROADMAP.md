@@ -43,14 +43,15 @@ Point releases close field-verification gaps and platform parity.
 
 ---
 
-## v1.1 product completion track
+## v1.1 (product completion track)
 
 This track closes the three user-facing promises that make Sanctuary feel complete rather than merely well-instrumented: privacy at the query boundary, the dashboard as the operator's hub, and exit without platform lock-in. Work may ship in v1.0.x if low-risk, but the track is complete only when the drills below pass.
 
 ### Query minimization and privacy filtering
 
-- Local privacy-filter foundation: shipped deterministic local detector/placeholder substitution for common PII and secret spans; OpenAI `privacy-filter` adapter remains queued for broader detector coverage.
-- Placeholder vault: shipped encrypted local placeholders for detected spans such as `EMAIL_1`, `PHONE_1`, `SSN_1`, `CARD_1`, and `SECRET_1`; named-entity placeholders such as `PERSON_1`, `ORG_1`, `PROJECT_1`, and `ACCOUNT_1` remain queued.
+- Local privacy-filter foundation: shipped deterministic local detector/placeholder substitution for common PII and secret spans.
+- OpenAI `privacy-filter` adapter surface: shipped JSON span normalization into Sanctuary placeholders; runtime invocation and dashboard configuration remain queued.
+- Placeholder vault: shipped encrypted local placeholders for detected spans such as `EMAIL_1`, `PHONE_1`, `SSN_1`, `CARD_1`, `SECRET_1`, `PERSON_1`, `ADDRESS_1`, and `ACCOUNT_1`; project and organization placeholders remain queued.
 - Policy-bound rehydration: allow reversible substitution only when the destination policy permits it; otherwise the placeholder remains the exported form.
 - Privacy audit surface: record detector class, field path, action, hashes, policy id, and destination category without storing raw sensitive content in the audit log.
 - Dashboard privacy panel: show what was filtered, why, and which policy caused the decision.
@@ -80,9 +81,11 @@ Gate: hub drill passes. A pilot operates two or three wrapped Tier B agents from
 
 Gate: exit drill passes. A pilot moves an agent from one harness or machine to another, verifies identity/reputation/audit continuity, and can demonstrate the original platform no longer controls the agent's durable record.
 
+Drill artifact: `server/docs/exit-drill-v0.1.md`.
+
 ---
 
-## v1.1 (post-MVP cryptographic primitives sprint)
+## v1.1 (cryptographic primitives sprint)
 
 Bundled cryptographic primitives upgrade. One coordinated thread, four to eight weeks, spawns after v1.0 pilot acceptance clears.
 
