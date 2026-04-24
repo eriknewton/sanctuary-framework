@@ -88,6 +88,13 @@ export interface SanctuaryConfig {
     /** Whether to auto-publish on successful handshake_respond calls. */
     auto_publish_handshakes: boolean;
   };
+
+  privacy_filter: {
+    mode: "local" | "opf" | "off";
+    fail_mode: "closed" | "fallback";
+    command: string;
+    timeout_ms: number;
+  };
 }
 
 /** Default configuration */
@@ -140,6 +147,12 @@ export function defaultConfig(): SanctuaryConfig {
       auto_publish_to_verascore: true,
       // DELTA-04: default OFF for privacy. Enable explicitly per deployment.
       auto_publish_handshakes: false,
+    },
+    privacy_filter: {
+      mode: "local",
+      fail_mode: "fallback",
+      command: "opf",
+      timeout_ms: 5000,
     },
   };
 }
@@ -241,6 +254,22 @@ export async function loadConfig(
   if (process.env.SANCTUARY_AUTO_PUBLISH_HANDSHAKES === "false") {
     config.verascore.auto_publish_handshakes = false;
   }
+  if (process.env.SANCTUARY_PRIVACY_FILTER) {
+    config.privacy_filter.mode = process.env.SANCTUARY_PRIVACY_FILTER as "local" | "opf" | "off";
+  }
+  if (process.env.SANCTUARY_PRIVACY_FILTER_FAIL_MODE) {
+    config.privacy_filter.fail_mode =
+      process.env.SANCTUARY_PRIVACY_FILTER_FAIL_MODE as "closed" | "fallback";
+  }
+  if (process.env.SANCTUARY_PRIVACY_FILTER_COMMAND) {
+    config.privacy_filter.command = process.env.SANCTUARY_PRIVACY_FILTER_COMMAND;
+  }
+  if (process.env.SANCTUARY_PRIVACY_FILTER_TIMEOUT_MS) {
+    config.privacy_filter.timeout_ms = parseInt(
+      process.env.SANCTUARY_PRIVACY_FILTER_TIMEOUT_MS,
+      10
+    );
+  }
 
   // Phase 3: Always stamp the running version from package.json (Bug 2 fix —
   // sanctuary.json may store a stale version from first run)
@@ -323,6 +352,29 @@ export function validateConfig(config: SanctuaryConfig): void {
       `Unimplemented config value: reputation.mode = "${config.reputation.mode}". ` +
       `Only ${[...implementedReputationMode].map(v => `"${v}"`).join(", ")} is currently implemented. ` +
       `Using an unimplemented reputation mode would silently skip reputation verification.`
+    );
+  }
+
+  const implementedPrivacyModes = new Set(["local", "opf", "off"]);
+  if (!implementedPrivacyModes.has(config.privacy_filter.mode)) {
+    errors.push(
+      `Invalid config value: privacy_filter.mode = "${config.privacy_filter.mode}". ` +
+      `Use ${[...implementedPrivacyModes].map(v => `"${v}"`).join(", ")}.`
+    );
+  }
+
+  const implementedPrivacyFailModes = new Set(["closed", "fallback"]);
+  if (!implementedPrivacyFailModes.has(config.privacy_filter.fail_mode)) {
+    errors.push(
+      `Invalid config value: privacy_filter.fail_mode = "${config.privacy_filter.fail_mode}". ` +
+      `Use ${[...implementedPrivacyFailModes].map(v => `"${v}"`).join(", ")}.`
+    );
+  }
+
+  if (!Number.isFinite(config.privacy_filter.timeout_ms) || config.privacy_filter.timeout_ms < 100) {
+    errors.push(
+      `Invalid config value: privacy_filter.timeout_ms = "${config.privacy_filter.timeout_ms}". ` +
+      `Use an integer timeout of at least 100 ms.`
     );
   }
 

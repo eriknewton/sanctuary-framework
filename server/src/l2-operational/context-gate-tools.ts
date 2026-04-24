@@ -19,6 +19,7 @@ import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { AuditLog } from "./audit-log.js";
 import type { StorageBackend } from "../storage/interface.js";
+import type { SanctuaryConfig } from "../config.js";
 import {
   ContextGatePolicyStore,
   filterContext,
@@ -39,9 +40,13 @@ import {
   type EnforcerConfig,
 } from "./context-gate-enforcer.js";
 import {
-  applyPrivacyPlaceholders,
   PrivacyPlaceholderVault,
 } from "./privacy-filter.js";
+import {
+  applyConfiguredPrivacyFilter,
+  PrivacyFilterRuntimeError,
+  type PrivacyFilterRuntimeConfig,
+} from "./privacy-filter-runner.js";
 
 /**
  * Create the context-gating MCP tools.
@@ -49,7 +54,8 @@ import {
 export function createContextGateTools(
   storage: StorageBackend,
   masterKey: Uint8Array,
-  auditLog: AuditLog
+  auditLog: AuditLog,
+  options: { privacyFilter?: SanctuaryConfig["privacy_filter"] } = {}
 ): {
   tools: ToolDefinition[];
   policyStore: ContextGatePolicyStore;
@@ -57,6 +63,12 @@ export function createContextGateTools(
 } {
   const policyStore = new ContextGatePolicyStore(storage, masterKey);
   const privacyVault = new PrivacyPlaceholderVault(storage, masterKey);
+  const privacyFilterConfig: PrivacyFilterRuntimeConfig = options.privacyFilter ?? {
+    mode: "local",
+    fail_mode: "fallback",
+    command: "opf",
+    timeout_ms: 5000,
+  };
 
   // Create the automatic enforcer
   const enforcerConfig: EnforcerConfig = {
@@ -466,11 +478,38 @@ export function createContextGateTools(
               break;
           }
         }
-        const privacyFiltered = await applyPrivacyPlaceholders(
-          safeContext,
-          privacyVault,
-          policyId
-        );
+        let privacyFiltered: Awaited<ReturnType<typeof applyConfiguredPrivacyFilter>>;
+        try {
+          privacyFiltered = await applyConfiguredPrivacyFilter(
+            safeContext,
+            privacyVault,
+            policyId,
+            privacyFilterConfig
+          );
+        } catch (err) {
+          if (err instanceof PrivacyFilterRuntimeError) {
+            auditLog.append("l2", "context_gate_privacy_filter_failure", policy.identity_id ?? "system", {
+              policy_id: policyId,
+              provider,
+              mode: privacyFilterConfig.mode,
+              fail_mode: privacyFilterConfig.fail_mode,
+              original_context_hash: result.original_context_hash,
+              error: err.message,
+            }, "failure");
+
+            return toolResult({
+              blocked: true,
+              error: "privacy_filter_failed",
+              message: err.message,
+              mode: privacyFilterConfig.mode,
+              recommendation:
+                privacyFilterConfig.fail_mode === "closed"
+                  ? "Install/configure the local privacy filter or switch SANCTUARY_PRIVACY_FILTER_FAIL_MODE to fallback."
+                  : "Check the local privacy filter configuration.",
+            });
+          }
+          throw err;
+        }
 
         auditLog.append("l2", "context_gate_filter", policy.identity_id ?? "system", {
           policy_id: policyId,
@@ -482,6 +521,9 @@ export function createContextGateTools(
           fields_summarized: result.fields_summarized,
           privacy_findings: privacyFiltered.findings.length,
           privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
+          privacy_filter_mode: privacyFiltered.mode,
+          privacy_filter_configured_mode: privacyFilterConfig.mode,
+          privacy_filter_fallback_from: privacyFiltered.fallback_from,
           original_context_hash: result.original_context_hash,
           filtered_context_hash: result.filtered_context_hash,
         });
@@ -499,6 +541,9 @@ export function createContextGateTools(
           },
           decisions: result.decisions,
           privacy_filter: {
+            mode: privacyFiltered.mode,
+            configured_mode: privacyFilterConfig.mode,
+            fallback_from: privacyFiltered.fallback_from,
             findings: privacyFiltered.findings,
           },
           audit: {
