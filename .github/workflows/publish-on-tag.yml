@@ -1,36 +1,44 @@
-# Sanctuary npm Publish on Tag
+# Sanctuary npm Publish (manual dispatch)
 #
 # Copyright 2026 Erik Newton
 # SPDX-License-Identifier: Apache-2.0
 #
-# Closes the v1.0 rc.1 release-pipeline gap (drill finding N): eleven PRs
-# merged to main between v0.10.6 and the v1.0 rc.1 cut without ever
-# tagging or publishing, so every operator following the README's
-# documented `npx @sanctuary-framework/mcp-server wrap --<harness>` path
-# resolved to a stale read-only build that did not match the README's
-# claims.
+# Publish intent is separate from tag intent. A git tag push is a
+# versioning operation (rc cut, audit point, rollback marker); it is
+# not a shipping decision. This workflow runs only when a maintainer
+# explicitly invokes "Run workflow" from the Actions tab and types
+# the version string being published. The input must match the
+# version in server/package.json at the checked-out SHA, or the job
+# refuses to publish.
 #
-# Fires on any version tag push matching `v[0-9]*.[0-9]*.[0-9]*` (and
-# pre-release variants like `v1.0.0-rc.1`). Refuses to publish if the
-# tag's version string does not match `server/package.json` — guards
-# against the pre-v0.9.0 RC tag/version-string drift class.
+# History: the earlier on-tag trigger fired twice in the v1.0 rc
+# cycle when the maintainer was not ready to ship. Both runs failed
+# only because NPM_TOKEN was absent at the time. Once NPM_TOKEN is
+# configured on the repo, an on-tag trigger would auto-publish on
+# any future tag push, including rc cuts the maintainer did not
+# intend to release. Requiring workflow_dispatch closes that gap.
 #
 # Required repo secret:
-#   NPM_TOKEN  — npm automation token with publish access for the
-#                @sanctuary-framework scope. Add at
-#                Settings → Secrets and variables → Actions.
+#   NPM_TOKEN  npm automation token with publish access for the
+#              @sanctuary-framework scope. Add at
+#              Settings, Secrets and variables, Actions.
 #
-# This workflow does not fire for the v1.0.0-rc.1 release itself (that
-# tag is published manually from MBA). Every subsequent rc / final tag
-# fires here.
+# See .github/RELEASING.md for the full release procedure.
 
-name: Publish on Tag
+name: Publish (manual)
 
 on:
-  push:
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version being published. Must match server/package.json at HEAD (example 1.0.1 or 1.0.0-rc.2)."
+        required: true
+        type: string
+      ref:
+        description: "Git ref to publish from (tag, branch, or SHA). Defaults to the selected branch when blank."
+        required: false
+        type: string
+        default: ""
 
 jobs:
   publish:
@@ -43,6 +51,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
 
       - name: Use Node.js 24
         uses: actions/setup-node@v4
@@ -52,19 +62,22 @@ jobs:
           cache: npm
           cache-dependency-path: server/package-lock.json
 
-      - name: Verify tag matches server/package.json version
+      - name: Verify dispatch input matches server/package.json version
         id: verify-version
         run: |
-          tag_ref="${GITHUB_REF#refs/tags/}"
-          tag_version="${tag_ref#v}"
+          input_version="${{ inputs.version }}"
           pkg_version=$(node -p "require('./server/package.json').version")
-          echo "Tag version:     ${tag_version}"
-          echo "Package version: ${pkg_version}"
-          if [[ "${tag_version}" != "${pkg_version}" ]]; then
-            echo "::error::Tag version (${tag_version}) does not match server/package.json version (${pkg_version}). Refusing to publish."
+          echo "Dispatch input version: ${input_version}"
+          echo "Package version:        ${pkg_version}"
+          if [[ -z "${input_version}" ]]; then
+            echo "::error::Dispatch input 'version' is empty. Refusing to publish."
             exit 1
           fi
-          echo "tag_version=${tag_version}" >> "$GITHUB_OUTPUT"
+          if [[ "${input_version}" != "${pkg_version}" ]]; then
+            echo "::error::Dispatch input version (${input_version}) does not match server/package.json version (${pkg_version}) at the checked-out ref. Refusing to publish."
+            exit 1
+          fi
+          echo "version=${pkg_version}" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         working-directory: server
@@ -96,8 +109,8 @@ jobs:
       - name: Determine npm dist-tag
         id: dist-tag
         run: |
-          version="${{ steps.verify-version.outputs.tag_version }}"
-          # Pre-release tags (anything with a hyphen, e.g. 1.0.0-rc.1)
+          version="${{ steps.verify-version.outputs.version }}"
+          # Pre-release versions (anything with a hyphen, e.g. 1.0.0-rc.1)
           # publish under the "next" dist-tag so `npx @sanctuary-framework/
           # mcp-server` keeps resolving to the stable release.
           if [[ "$version" == *-* ]]; then
