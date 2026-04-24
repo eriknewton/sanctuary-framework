@@ -120,6 +120,7 @@ def handle_verify_receipt(params: dict[str, Any]) -> dict[str, Any]:
         "receipt_id": params.get("receipt_id", ""),
         "schema_urn": "urn:concordia:schema:receipt:v1",
         "source_event_id": params.get("source_event_id", ""),
+        "source_event_type": params.get("source_event_type", ""),
         "agent_id": params.get("agent_id", ""),
         "counterparty_id": params.get("counterparty_id", ""),
         "commitment_class": params.get("commitment_class", ""),

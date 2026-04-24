@@ -335,6 +335,24 @@ describe("Composition v1.0", () => {
       expect(sourceRef!.ref_type).toBe("receipt");
       expect(sourceRef!.relationship).toBe("references");
     }, 20000);
+
+    it("packed receipt verifies through the same real Concordia sidecar", async () => {
+      svc = new CompositionService(
+        {
+          composition_enabled: true,
+          sidecar_script_path: SIDECAR_SCRIPT,
+          python_path: PYTHON_PATH,
+          sidecar_spawn_timeout_ms: 15000,
+          sidecar_rpc_timeout_ms: 10000,
+        },
+        WORKTREE_ROOT
+      );
+      await svc.start();
+
+      const receipt = await svc.packReceipt(buildTestCommitmentEvent());
+
+      await expect(svc.verifyReceipt(receipt)).resolves.toBe(true);
+    }, 20000);
   });
 
   // =====================================================================
