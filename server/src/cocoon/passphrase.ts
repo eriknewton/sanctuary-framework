@@ -3,8 +3,15 @@
  *
  * On first run, generates a 32-byte random passphrase and stores it in:
  *   - macOS: Keychain (via `security add-generic-password`)
- *   - Linux / Windows / fallback: ~/.sanctuary/passphrase.enc (AES-256-GCM,
- *     key derived from hostname + uid via HKDF-SHA256)
+ *   - Linux: Secret Service via `secret-tool(1)` (D-Bus; GNOME Keyring,
+ *     KDE Wallet 6, KeePassXC, and any libsecret-compatible backend)
+ *   - Windows / no-OS-keyring fallback: <storage_path>/passphrase.enc
+ *     (AES-256-GCM, key derived from hostname + uid via HKDF-SHA256)
+ *
+ * The Linux branch falls through to the fallback file when `secret-tool` is
+ * absent, when no D-Bus session bus is running, or when the keyring refuses
+ * the write; production behavior on those hosts matches the pre-existing
+ * Linux path so upgrades are never downgrades.
  *
  * On subsequent runs, reads back from the same source. The goal is that a
  * user who ran `sanctuary wrap` once should never have to think about
@@ -26,6 +33,26 @@ import { resolveStoragePath, DEFAULT_STORAGE_DIR } from "../paths.js";
 const KEYCHAIN_ACCOUNT = "sanctuary";
 /** Legacy single-tenant Keychain service name — kept for backward compat. */
 const KEYCHAIN_SERVICE_DEFAULT = "sanctuary-passphrase";
+/** Human-readable label for Linux Secret Service items (shown in Seahorse,
+ * KeePassXC, KDE KWalletManager). Invisible on macOS. */
+const KEYCHAIN_LABEL = "Sanctuary Passphrase";
+
+/** Human-readable description for an OS keyring location. Platform-aware;
+ * stable public contract so callers can key off equality. */
+export const OS_KEYRING_LOCATION_MACOS = "macOS Keychain";
+export const OS_KEYRING_LOCATION_LINUX = "Linux Secret Service";
+
+/**
+ * True when `location` refers to an OS keyring (macOS Keychain or Linux
+ * Secret Service). Callers use this instead of equality on a single string
+ * when deciding whether to emit the fallback-file warning.
+ */
+export function isOsKeyringLocation(location: string): boolean {
+  return (
+    location === OS_KEYRING_LOCATION_MACOS ||
+    location === OS_KEYRING_LOCATION_LINUX
+  );
+}
 
 /** Where does the passphrase live? */
 export type PassphraseSource = "keychain" | "fallback-file" | "generated";
@@ -123,11 +150,16 @@ export async function getOrCreatePassphrase(
   const exec = opts.exec ?? defaultExec;
   const derive = opts.deriveMachineKey ?? deriveMachineKey;
 
-  // 1. Try Keychain (macOS only).
+  // 1. Try the OS keyring.
   if (plat === "darwin") {
     const fromKc = await readFromKeychain(exec, service);
     if (fromKc) {
-      return { value: fromKc, source: "keychain", location: "macOS Keychain" };
+      return { value: fromKc, source: "keychain", location: OS_KEYRING_LOCATION_MACOS };
+    }
+  } else if (plat === "linux") {
+    const fromSs = await readFromSecretService(exec, service);
+    if (fromSs) {
+      return { value: fromSs, source: "keychain", location: OS_KEYRING_LOCATION_LINUX };
     }
   }
 
@@ -150,7 +182,12 @@ export async function getOrCreatePassphrase(
   if (plat === "darwin") {
     const ok = await writeToKeychain(value, exec, service);
     if (ok) {
-      return { value, source: "generated", location: "macOS Keychain" };
+      return { value, source: "generated", location: OS_KEYRING_LOCATION_MACOS };
+    }
+  } else if (plat === "linux") {
+    const ok = await writeToSecretService(value, exec, service);
+    if (ok) {
+      return { value, source: "generated", location: OS_KEYRING_LOCATION_LINUX };
     }
   }
 
@@ -178,7 +215,12 @@ export async function readStoredPassphrase(
   if (plat === "darwin") {
     const fromKc = await readFromKeychain(exec, service);
     if (fromKc) {
-      return { value: fromKc, source: "keychain", location: "macOS Keychain" };
+      return { value: fromKc, source: "keychain", location: OS_KEYRING_LOCATION_MACOS };
+    }
+  } else if (plat === "linux") {
+    const fromSs = await readFromSecretService(exec, service);
+    if (fromSs) {
+      return { value: fromSs, source: "keychain", location: OS_KEYRING_LOCATION_LINUX };
     }
   }
 
@@ -220,9 +262,15 @@ export async function persistUserProvidedPassphrase(
   if (plat === "darwin") {
     const ok = await writeToKeychain(value, exec, service);
     if (ok) {
-      return { location: "macOS Keychain", source: "keychain" };
+      return { location: OS_KEYRING_LOCATION_MACOS, source: "keychain" };
     }
     // Keychain failed — try fallback file before giving up.
+  } else if (plat === "linux") {
+    const ok = await writeToSecretService(value, exec, service);
+    if (ok) {
+      return { location: OS_KEYRING_LOCATION_LINUX, source: "keychain" };
+    }
+    // Secret Service failed — try fallback file before giving up.
   }
 
   const fallback = fallbackFilePath(home, storagePath);
@@ -311,6 +359,88 @@ export function keychainServiceFor(
   const digest = sha256(Buffer.from(storagePath, "utf-8"));
   const suffix = Buffer.from(digest).toString("hex").slice(0, 12);
   return `${KEYCHAIN_SERVICE_DEFAULT}-${suffix}`;
+}
+
+// ── Secret Service (Linux) ──────────────────────────────────────────
+//
+// Uses `secret-tool(1)` from libsecret, the cross-desktop Secret Service
+// D-Bus client. Any libsecret-compatible backend works: GNOME Keyring, KDE
+// Wallet 6, KeePassXC (with the Secret Service integration enabled), or a
+// bespoke backend registered on the session bus.
+//
+// Design choice vs. the `@node-libsecret/*` native binding: the CLI is
+// already present on every major Linux distribution's default package set
+// (`libsecret-tools` on Debian/Ubuntu, `libsecret` on Fedora/Arch) and
+// requires zero build toolchain. A native binding would pull in node-gyp,
+// gcc, and platform-specific headers at install time; that's a significant
+// regression for an npm-distributed server whose install must be boring.
+// The CLI path is slightly slower per call (process spawn) but the unlock
+// happens once per boot.
+//
+// Items are keyed by the same `service` + `account` attribute pair used on
+// macOS. The `--label` flag sets the human-readable name that appears in
+// Seahorse / KWalletManager; it does not participate in lookup.
+//
+// Failure modes all fall through to the encrypted fallback file:
+//   - `secret-tool` binary missing (ENOENT on spawn)
+//   - no D-Bus session bus (headless CI, `DBUS_SESSION_BUS_ADDRESS` unset
+//     and `--session` auto-launch fails)
+//   - Secret Service daemon absent / refusing connections
+//   - user cancels keyring unlock prompt
+//
+// Graceful degradation is per CLAUDE.md invariant 5: never auto-approve,
+// never silently succeed. Here, "fail = try the next path" is the safe
+// behavior because the fallback file is itself authenticated encryption.
+
+async function readFromSecretService(
+  exec: (cmd: string, args: string[], input?: string) => Promise<ExecResult>,
+  service: string = KEYCHAIN_SERVICE_DEFAULT
+): Promise<string | null> {
+  try {
+    const result = await exec("secret-tool", [
+      "lookup",
+      "service",
+      service,
+      "account",
+      KEYCHAIN_ACCOUNT,
+    ]);
+    if (result.code !== 0) return null;
+    // secret-tool lookup does NOT append a trailing newline to the value
+    // (unlike `security -w`); trim defensively in case a future version
+    // changes that, and to tolerate keyring backends that wrap the value.
+    const value = result.stdout.replace(/\r?\n$/, "");
+    return value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeToSecretService(
+  value: string,
+  exec: (cmd: string, args: string[], input?: string) => Promise<ExecResult>,
+  service: string = KEYCHAIN_SERVICE_DEFAULT
+): Promise<boolean> {
+  try {
+    // `secret-tool store` reads the value from stdin (one line terminated
+    // by a newline; the newline is stripped before storage). If an item
+    // with the same attributes already exists it is replaced in place.
+    const result = await exec(
+      "secret-tool",
+      [
+        "store",
+        "--label",
+        KEYCHAIN_LABEL,
+        "service",
+        service,
+        "account",
+        KEYCHAIN_ACCOUNT,
+      ],
+      value + "\n"
+    );
+    return result.code === 0;
+  } catch {
+    return false;
+  }
 }
 
 // ── Fallback file (all platforms) ───────────────────────────────────

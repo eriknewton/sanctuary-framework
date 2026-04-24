@@ -55,7 +55,14 @@ async function seedTenant(
   if (options.persistPassphrase) {
     await persistUserProvidedPassphrase(passphrase, {
       storagePath,
-      platformOverride: "linux", // never touch the real macOS Keychain in tests
+      platformOverride: "linux",
+      // Force fallback-file path even on Linux hosts with Secret Service
+      // running. Without this, a test run on a developer's Linux machine
+      // with gnome-keyring active would write the test passphrase into the
+      // real Secret Service and pollute the user's keyring. Returning code
+      // 1 from the injected exec causes writeToSecretService() to treat the
+      // attempt as failed and fall through to the encrypted fallback file.
+      exec: async () => ({ stdout: "", stderr: "", code: 1 }),
     });
   }
   const storage = new FilesystemStorage(join(storagePath, "state"));

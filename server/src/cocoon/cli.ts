@@ -50,6 +50,7 @@ import {
 import {
   getOrCreatePassphrase,
   persistUserProvidedPassphrase,
+  isOsKeyringLocation,
   PassphraseUnreadableError,
 } from "./passphrase.js";
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
@@ -331,21 +332,23 @@ export async function runWrap(
     }
   }
 
-  // Emit fallback-storage warning (SEC-063) when not using Keychain.
+  // Emit fallback-storage warning (SEC-063) when not using an OS keyring.
   // One-time: only on first wrap (source === "generated") when the location
   // is the fallback file, not when reading back a pre-existing fallback.
-  const isFallbackGenerated =
-    passphraseSource === "generated" &&
-    passphraseLocation !== "macOS Keychain";
+  // Treats macOS Keychain and Linux Secret Service as equivalent OS-keyring
+  // destinations; the warning is about falling back to the machine-local
+  // encrypted file, which is weaker than either keyring.
+  const usingFallback = !isOsKeyringLocation(passphraseLocation);
+  const isFallbackGenerated = passphraseSource === "generated" && usingFallback;
   const isFallbackUserProvided =
-    passphraseSource === "fallback-file" &&
-    passphraseLocation !== "macOS Keychain";
+    passphraseSource === "fallback-file" && usingFallback;
   if (isFallbackGenerated || (options.passphrase && isFallbackUserProvided)) {
     console.error(
       `\n  \u26A0  Passphrase stored in encrypted fallback file (machine-local key).` +
-      `\n     This is protected only against off-machine access. On macOS we use` +
-      `\n     Keychain by default. To migrate: \`sanctuary export-passphrase\` on` +
-      `\n     the current machine, then import into Keychain or pass via the` +
+      `\n     This is protected only against off-machine access. On macOS, Sanctuary` +
+      `\n     uses Keychain; on Linux, Sanctuary uses Secret Service (D-Bus, via` +
+      `\n     libsecret) when available. To migrate: run \`sanctuary export-passphrase\`` +
+      `\n     on the current machine, then import into the OS keyring or pass via the` +
       `\n     SANCTUARY_PASSPHRASE env var on the new machine.`
     );
   }
