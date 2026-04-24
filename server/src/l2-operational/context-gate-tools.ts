@@ -38,7 +38,10 @@ import {
   ContextGateEnforcer,
   type EnforcerConfig,
 } from "./context-gate-enforcer.js";
-import { applyLocalPrivacyFilter } from "./privacy-filter.js";
+import {
+  applyPrivacyPlaceholders,
+  PrivacyPlaceholderVault,
+} from "./privacy-filter.js";
 
 /**
  * Create the context-gating MCP tools.
@@ -53,6 +56,7 @@ export function createContextGateTools(
   enforcer: ContextGateEnforcer;
 } {
   const policyStore = new ContextGatePolicyStore(storage, masterKey);
+  const privacyVault = new PrivacyPlaceholderVault(storage, masterKey);
 
   // Create the automatic enforcer
   const enforcerConfig: EnforcerConfig = {
@@ -61,7 +65,12 @@ export function createContextGateTools(
     log_only: false, // Filter immediately
     on_deny: "block", // Block requests with denied fields
   };
-  const enforcer = new ContextGateEnforcer(policyStore, auditLog, enforcerConfig);
+  const enforcer = new ContextGateEnforcer(
+    policyStore,
+    auditLog,
+    enforcerConfig,
+    privacyVault
+  );
 
   const tools: ToolDefinition[] = [
     // ── Set Policy ──────────────────────────────────────────────────
@@ -457,7 +466,11 @@ export function createContextGateTools(
               break;
           }
         }
-        const privacyFiltered = applyLocalPrivacyFilter(safeContext);
+        const privacyFiltered = await applyPrivacyPlaceholders(
+          safeContext,
+          privacyVault,
+          policyId
+        );
 
         auditLog.append("l2", "context_gate_filter", policy.identity_id ?? "system", {
           policy_id: policyId,

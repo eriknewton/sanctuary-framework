@@ -25,7 +25,11 @@ import type { AuditLog } from "./audit-log.js";
 import { stringToBytes } from "../core/encoding.js";
 import { hashToString } from "../core/hashing.js";
 import { toolResult } from "../router.js";
-import { applyLocalPrivacyFilter } from "./privacy-filter.js";
+import {
+  applyLocalPrivacyFilter,
+  applyPrivacyPlaceholders,
+  type PrivacyPlaceholderVault,
+} from "./privacy-filter.js";
 
 // ── Configuration ───────────────────────────────────────────────────────
 
@@ -93,6 +97,7 @@ export interface EnforcerStatus {
 export class ContextGateEnforcer {
   private policyStore: ContextGatePolicyStore;
   private auditLog: AuditLog;
+  private privacyVault?: PrivacyPlaceholderVault;
   private config: EnforcerConfig;
   private stats = {
     calls_inspected: 0,
@@ -106,10 +111,12 @@ export class ContextGateEnforcer {
   constructor(
     policyStore: ContextGatePolicyStore,
     auditLog: AuditLog,
-    config: EnforcerConfig
+    config: EnforcerConfig,
+    privacyVault?: PrivacyPlaceholderVault
   ) {
     this.policyStore = policyStore;
     this.auditLog = auditLog;
+    this.privacyVault = privacyVault;
     this.config = config;
   }
 
@@ -215,7 +222,9 @@ export class ContextGateEnforcer {
 
     // Build filtered arguments, then scrub sensitive spans inside allowed values.
     const filteredArgs = this.buildFilteredArgs(args, result.decisions);
-    const privacyFiltered = applyLocalPrivacyFilter(filteredArgs);
+    const privacyFiltered = this.privacyVault
+      ? await applyPrivacyPlaceholders(filteredArgs, this.privacyVault, policy.policy_id)
+      : applyLocalPrivacyFilter(filteredArgs);
 
     if (this.config.log_only) {
       // Log but pass original args
@@ -291,7 +300,9 @@ export class ContextGateEnforcer {
     }
 
     if (fieldsToRedact.length === 0) {
-      const privacyFiltered = applyLocalPrivacyFilter(args);
+      const privacyFiltered = this.privacyVault
+        ? await applyPrivacyPlaceholders(args, this.privacyVault, `builtin:${toolName}`)
+        : applyLocalPrivacyFilter(args);
       if (privacyFiltered.findings.length > 0) {
         const filteredHash = hashToString(
           stringToBytes(JSON.stringify(privacyFiltered.value))
@@ -350,7 +361,9 @@ export class ContextGateEnforcer {
       }
     }
 
-    const privacyFiltered = applyLocalPrivacyFilter(filteredArgs);
+    const privacyFiltered = this.privacyVault
+      ? await applyPrivacyPlaceholders(filteredArgs, this.privacyVault, `builtin:${toolName}`)
+      : applyLocalPrivacyFilter(filteredArgs);
     const filteredHash = hashToString(
       stringToBytes(JSON.stringify(privacyFiltered.value))
     );

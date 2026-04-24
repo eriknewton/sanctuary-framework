@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { applyLocalPrivacyFilter } from "../../src/l2-operational/privacy-filter.js";
+import {
+  applyLocalPrivacyFilter,
+  applyPrivacyPlaceholders,
+  PrivacyPlaceholderVault,
+} from "../../src/l2-operational/privacy-filter.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { generateRandomKey } from "../../src/core/random.js";
+import { bytesToString } from "../../src/core/encoding.js";
 
 describe("L2 local privacy filter", () => {
   it("redacts common sensitive spans inside strings", () => {
@@ -41,5 +48,63 @@ describe("L2 local privacy filter", () => {
       { path: "$.messages[1].text", class: "email", action: "redact" },
     ]);
   });
-});
 
+  it("replaces sensitive spans with stable encrypted placeholders", async () => {
+    const storage = new MemoryStorage();
+    const vault = new PrivacyPlaceholderVault(storage, generateRandomKey());
+
+    const first = await applyPrivacyPlaceholders(
+      { prompt: "Email jane@example.com and call 415-555-1212" },
+      vault,
+      "policy-a"
+    );
+    const second = await applyPrivacyPlaceholders(
+      { prompt: "Email jane@example.com again" },
+      vault,
+      "policy-a"
+    );
+
+    expect(first.value).toEqual({
+      prompt: "Email EMAIL_1 and call PHONE_1",
+    });
+    expect(second.value).toEqual({
+      prompt: "Email EMAIL_1 again",
+    });
+    expect(first.findings).toEqual([
+      {
+        path: "$.prompt",
+        class: "email",
+        action: "placeholder",
+        placeholder: "EMAIL_1",
+      },
+      {
+        path: "$.prompt",
+        class: "phone",
+        action: "placeholder",
+        placeholder: "PHONE_1",
+      },
+    ]);
+    await expect(vault.resolvePlaceholder("EMAIL_1", "policy-a")).resolves.toBe(
+      "jane@example.com"
+    );
+  });
+
+  it("does not store raw sensitive values in plaintext", async () => {
+    const storage = new MemoryStorage();
+    const vault = new PrivacyPlaceholderVault(storage, generateRandomKey());
+
+    await applyPrivacyPlaceholders(
+      { prompt: "Email jane@example.com" },
+      vault,
+      "policy-a"
+    );
+
+    const entries = await storage.list("_privacy_placeholder_vault");
+    expect(entries.length).toBeGreaterThan(0);
+    for (const entry of entries) {
+      const raw = await storage.read(entry.namespace, entry.key);
+      expect(raw).not.toBeNull();
+      expect(bytesToString(raw!)).not.toContain("jane@example.com");
+    }
+  });
+});

@@ -49,8 +49,8 @@ This track closes the three user-facing promises that make Sanctuary feel comple
 
 ### Query minimization and privacy filtering
 
-- Local privacy-filter adapter: integrate a local detector/redactor for PII, secrets, account identifiers, addresses, URLs, and other high-risk spans before remote inference or external-tool egress.
-- Placeholder vault: replace sensitive spans with stable local placeholders such as `PERSON_1`, `ORG_1`, `PROJECT_1`, and `ACCOUNT_1`, stored encrypted under the operator's key.
+- Local privacy-filter foundation: shipped deterministic local detector/placeholder substitution for common PII and secret spans; OpenAI `privacy-filter` adapter remains queued for broader detector coverage.
+- Placeholder vault: shipped encrypted local placeholders for detected spans such as `EMAIL_1`, `PHONE_1`, `SSN_1`, `CARD_1`, and `SECRET_1`; named-entity placeholders such as `PERSON_1`, `ORG_1`, `PROJECT_1`, and `ACCOUNT_1` remain queued.
 - Policy-bound rehydration: allow reversible substitution only when the destination policy permits it; otherwise the placeholder remains the exported form.
 - Privacy audit surface: record detector class, field path, action, hashes, policy id, and destination category without storing raw sensitive content in the audit log.
 - Dashboard privacy panel: show what was filtered, why, and which policy caused the decision.

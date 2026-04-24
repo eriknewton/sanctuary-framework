@@ -132,7 +132,7 @@ describe("Context Gate Tools", () => {
       expect(text).not.toContain('"policy_not_found"');
     });
 
-    it("scrubs sensitive spans inside allowed context values", async () => {
+    it("substitutes placeholders for sensitive spans inside allowed context values", async () => {
       const { findTool } = setup();
       const setPolicyTool = findTool("context_gate_set_policy");
       const setResult = await setPolicyTool.handler({
@@ -156,13 +156,14 @@ describe("Context Gate Tools", () => {
 
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.safe_context.prompt).toBe(
-        "Email [EMAIL_REDACTED] about the test"
+        "Email EMAIL_1 about the test"
       );
       expect(parsed.summary.privacy_filtered_spans).toBe(1);
       expect(parsed.privacy_filter.findings[0]).toMatchObject({
         path: "$.prompt",
         class: "email",
-        action: "redact",
+        action: "placeholder",
+        placeholder: "EMAIL_1",
       });
     });
 
