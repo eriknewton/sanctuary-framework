@@ -2,7 +2,7 @@
 review_status: pending_erik_review
 author: Erik Newton
 date: 2026-04-21
-companion_to: Federation_Protocol_V0.1_Spec_2026-04-21.md
+companion_to: federation-protocol-v0.1-spec.md
 satisfies: Acceptance criterion 10 of Federation Protocol v0.1 (the hard gate)
 ---
 
