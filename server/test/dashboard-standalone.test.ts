@@ -187,12 +187,14 @@ describe("Standalone Dashboard", () => {
     const passphrase = "persisted-tenant-passphrase-0.10.2";
 
     // Pre-seed the tenant's passphrase exactly the way `sanctuary wrap` does.
-    // Forcing `platformOverride: "linux"` makes the persistence write to the
-    // encrypted fallback file rather than the real macOS Keychain, so the test
-    // does not touch the developer's Keychain on macOS CI / local runs.
+    // Forcing `platformOverride: "linux"` plus an injected exec that always
+    // returns code 1 ensures the persistence writes to the encrypted fallback
+    // file rather than the real macOS Keychain or a live Linux Secret Service
+    // on a developer host with gnome-keyring active.
     await persistUserProvidedPassphrase(passphrase, {
       storagePath: tempDir,
       platformOverride: "linux",
+      exec: async () => ({ stdout: "", stderr: "", code: 1 }),
     });
 
     process.env.SANCTUARY_STORAGE_PATH = tempDir;

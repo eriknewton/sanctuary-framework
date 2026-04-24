@@ -437,7 +437,7 @@ export async function startStandaloneDashboard(
         : passphraseSource === "env"
         ? "SANCTUARY_PASSPHRASE env var"
         : passphraseSource === "keychain"
-        ? `macOS Keychain (service ${service})`
+        ? `${process.platform === "linux" ? "Linux Secret Service" : "macOS Keychain"} (service ${service})`
         : passphraseSource === "fallback-file"
         ? "encrypted fallback file"
         : "recovery key";

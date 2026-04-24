@@ -2,15 +2,15 @@
 
 This document is the canonical reference for how Sanctuary stores and retrieves
 the per-tenant passphrase used to derive the master key for L1-encrypted state.
-It describes what lives where on macOS, what the equivalent paths are on other
-platforms, and how the boot path turns "user enters a passphrase" into
-"identity decrypted."
+It describes what lives where on macOS, Linux, and Windows, and how the boot
+path turns "user enters a passphrase" into "identity decrypted."
 
 The doc was created during the v0.10.4 fix cycle after the standalone dashboard
 was found unable to boot on a real multi-tenant install: the keychain schema
 had moved to per-tenant entries in v0.10.0 but no doc described the new shape,
 so the field failure surfaced as `Identities loaded: 0` with a fix-hint that
-could not work.
+could not work. The Linux Secret Service section was added in v1.0.1 when the
+Linux keyring backend was shipped (closing the v0.10.1 backlog item).
 
 ---
 
@@ -67,10 +67,67 @@ Replace `<service-name>` with `sanctuary-passphrase` for the default tenant
 or `sanctuary-passphrase-<12hex>` for a sub-tenant. `sanctuary agents` prints
 the right service name for every discovered tenant.
 
-### Linux / Windows / fallback — encrypted file
+### Linux: Secret Service (preferred)
 
-When the macOS Keychain is unavailable (other platforms, or when the keychain
-write fails) Sanctuary writes the passphrase to an encrypted fallback file:
+On Linux Sanctuary stores the passphrase in the Secret Service, the
+cross-desktop D-Bus standard implemented by GNOME Keyring, KDE Wallet 6,
+KeePassXC (with the Secret Service integration enabled), and any other
+libsecret-compatible backend. Access goes through `secret-tool(1)` from the
+`libsecret-tools` package (`libsecret` on Arch/Fedora, `libsecret-tools` on
+Debian/Ubuntu).
+
+| Field          | Value                                                         |
+|----------------|---------------------------------------------------------------|
+| Service attr   | `sanctuary-passphrase` (default tenant) **or** `sanctuary-passphrase-<12hex>` (per-tenant) |
+| Account attr   | `sanctuary` (constant)                                        |
+| Label          | `Sanctuary Passphrase` (shown in Seahorse / KWalletManager)   |
+| Value          | The base64-encoded 32-byte passphrase                         |
+
+Service and account semantics match the macOS Keychain entry one-to-one, so
+the same per-tenant isolation logic applies: two wraps with distinct
+`SANCTUARY_STORAGE_PATH` values get distinct Secret Service items, one wrap
+with many identities gets one item.
+
+You can list every Sanctuary Secret Service entry with:
+
+```sh
+secret-tool search service sanctuary-passphrase
+```
+
+Or, for a specific tenant:
+
+```sh
+secret-tool search service sanctuary-passphrase-<12hex>
+```
+
+You can read one entry's value with:
+
+```sh
+secret-tool lookup service <service-name> account sanctuary
+```
+
+Replace `<service-name>` with `sanctuary-passphrase` for the default tenant
+or `sanctuary-passphrase-<12hex>` for a sub-tenant. `sanctuary agents` prints
+the right service name for every discovered tenant, same as on macOS.
+
+Sanctuary falls through to the encrypted fallback file (described below)
+when:
+
+- `secret-tool` is not installed (`ENOENT` on spawn),
+- no D-Bus session bus is running (typical in headless CI and minimal
+  installations without `dbus-launch`),
+- the Secret Service daemon refuses the connection or the user cancels the
+  keyring unlock prompt.
+
+This mirrors the macOS behavior of falling through to the fallback file when
+`/usr/bin/security` writes fail.
+
+### Windows or no-OS-keyring fallback: encrypted file
+
+When no supported OS keyring is available (Windows currently, headless
+Linux, older Linux desktops without Secret Service, or any platform where
+the keyring write fails at runtime) Sanctuary writes the passphrase to an
+encrypted fallback file:
 
 | Tenant type   | Path                                            |
 |---------------|-------------------------------------------------|
@@ -79,7 +136,7 @@ write fails) Sanctuary writes the passphrase to an encrypted fallback file:
 
 The file is AES-256-GCM ciphertext (12-byte IV prepended) under a machine-local
 key derived via HKDF-SHA256 from `hostname + uid + username + home`. This is
-not cryptographically strong authentication — anyone with local read access can
+not cryptographically strong authentication: anyone with local read access can
 re-derive the key. The protection it provides is "the file cannot be copied off
 this machine and decrypted on another."
 
@@ -268,7 +325,12 @@ sanctuary agents
 
 # Inspect the keychain entry for a specific tenant by name.
 sanctuary agents --json | jq -r '.tenants[] | select(.name=="alpha") | .keychain_service'
+
+# macOS: read one entry's value from the Keychain.
 security find-generic-password -a sanctuary -s sanctuary-passphrase-<12hex> -w
+
+# Linux: read one entry's value from the Secret Service.
+secret-tool lookup service sanctuary-passphrase-<12hex> account sanctuary
 
 # Boot the dashboard against a specific tenant.
 sanctuary dashboard --tenant alpha

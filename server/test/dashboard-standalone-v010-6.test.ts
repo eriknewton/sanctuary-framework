@@ -69,6 +69,10 @@ async function seedTenant(storagePath: string, passphrase: string): Promise<void
   await persistUserProvidedPassphrase(passphrase, {
     storagePath,
     platformOverride: "linux",
+    // Force fallback-file path; never touch a real Secret Service on a
+    // developer's Linux host (see dashboard-standalone-v010-4.test.ts for
+    // the full rationale).
+    exec: async () => ({ stdout: "", stderr: "", code: 1 }),
   });
   const storage = new FilesystemStorage(join(storagePath, "state"));
   const { key: mk, params } = await deriveMasterKey(passphrase);
