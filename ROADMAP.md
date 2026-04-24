@@ -1,86 +1,113 @@
 # Roadmap
 
-12-month public roadmap for Sanctuary Framework. Updated April 2026.
+Sanctuary Framework ships the rights substrate for operator-sovereign AI agents: Identity, Data, Portability, Attestation, Exit. Open source, self-hostable, composition-friendly.
 
-## Q2 2026 (April – June)
+Your agent. Your machine. Your keys.
 
-### v0.8.0
-- Per-upstream rate limiting: integrate CallGovernor with proxy router for per-server quotas
-- Signed tool provenance: capability manifests attesting security review status
-- Collapse YAML/TS policy sources of truth into single authoritative source
-- Remove `tool_overrides` from UpstreamServer (tier assignment from Principal Policy only)
+This document is a thin milestone view. Shipped history lives in `CHANGELOG.md`. Interface specs live in `server/docs/`. Scope documentation is maintained privately and released to the public repo on version bumps.
 
-### Runtime Wrap Enforcement
-- Move from config-rewriting to actual runtime MCP proxy interception
-- Enforce principal policy at the transport layer, not just the configuration layer
+Last updated: 2026-04-24.
 
-### Compliance
-- EU AI Act Article 19 compliance artifact generator (SHR → audit trail mapping)
+---
+
+## v1.0 (in final acceptance)
+
+v1.0 is the operator-sovereign fortress. Eleven work packages merged. Package-level status:
+
+- Fortress modes (solo, networked, audited): shipped
+- Console (single-fortress and cross-fortress chat): shipped
+- Federation Protocol v0.1 (per-node HKDF subkeys, signed events, canonical audit node): shipped; spec at `server/docs/federation-protocol-v0.1-spec.md`
+- Agent Contract v0.1 (ten contract points, Agent Card schema, three-tier harness taxonomy): shipped
+- Policy engine (four canonical slots, five channel templates, no-LLM-at-gate enforcement): shipped
+- Egress controls, budgets, retention: shipped
+- Chat transport (libp2p; forward-secret per-epoch encryption): shipped
+- Recovery cascade and guardian flow: shipped
+- Attestation UX (three-layer persistent-badge surface, degrade-not-destroy on failure): shipped
+- Concordia and Verascore optional composition (default off, non-dependency preserved): shipped
+- Template library starter set (channel-shape governance archetypes, five): shipped
+
+Remaining v1.0 gate: pilot operator stands up a fortress plus two or three Tier B agents plus a multi-agent workflow plus a recovery drill in under 60 minutes, with no help. Drill rerun queued on the v1.0.0-rc.2 release candidate (published on npm tag `next`).
+
+---
+
+## v1.0.x (patch track)
+
+Point releases close field-verification gaps and platform parity.
+
+- NPM_TOKEN auto-publish guard: shipped
+- Linux Secret Service keychain backend: shipped (real-backend CI exercise queued for v1.0.2)
+- `sanctuary reset-passphrase` subcommand, nuke-and-rebind path: shipped (recovery-shares and guardian-approval paths stubbed for v1.0.x follow-up)
+- Reset-history continuity: signed "recovered-from-reset" audit entry on next `sanctuary wrap` after a reset, hashing the prior chain genesis forward; queued for v1.0.2
+- Test-baseline headroom bump: queued for v1.0.2
+- Windows Credential Manager keychain backend: queued
+
+---
+
+## v1.1 (post-MVP cryptographic primitives sprint)
+
+Bundled cryptographic primitives upgrade. One coordinated thread, four to eight weeks, spawns after v1.0 pilot acceptance clears.
+
+- Group messaging upgrade with post-compromise security properties (RFC 9420 class of protocol)
+- Post-quantum signature and key-exchange primitives, hybrid migration-safe via the `signature_scheme` field shipped in Federation Protocol v0.1
+- Underlying elliptic-curve library major-version migration across the crypto stack
+
+Gate: v1.0 MVP acceptance drill clears on a pilot operator with no help.
+
+---
+
+## v1.x (framework extensions)
+
+Composition surfaces and operator variants. Spawn independently once v1.1 stabilizes. Order is not final.
+
+- Fleet operator console for multi-operator estates managed through a single pane (closed-source product variant; the framework alone remains fully operational with no fleet console present)
+- Public-pool federation mode (multi-principal data model, patron-scope keys under operator-scope, volunteer-compute composition; v1.0 spec surface preserves the six invariants that make this possible without a breaking change)
+- Civic-layer integration for operators served by civic partners (the rights substrate ships at zero cost; the access substrate, compute and device and bandwidth and literacy, is the civic partner's domain; composition, not substitution)
+- Agent Vault composition adapter for sovereign signing of external-stack payment rails, delegation mandates, and reputation receipts (composition partners include Coinbase x402, Google AP2, and peers)
+- Runtime transport-layer interception: move policy enforcement from config-rewriting to actual MCP proxy interception at the transport layer
+- Bootstrap bundle (`@sanctuary-framework/agent-bundle`) for zero-config deployment
+- Agent Registry Federation: multi-organization agent discovery with sovereignty-gated trust boundaries
+- Named channel templates and authoring flow
+- Cross-fortress chat interop bridge
+- Native mobile surface (phone-first operator experience with biometric unlock and push notifications)
+- Breach-feed aggregation and scoped sub-token rotation
+- EU AI Act compliance pack (Annex IV artifacts generator)
 - NIST AI RMF alignment documentation
 
-### Standards Engagement
-- AAIF Security Working Group participation
-- W3C Agentic Integrity Verification Specification CG: advocate for Ed25519 as first-class signature algorithm
-- Position SHR as candidate governance standard for MCP Registry
+---
 
-## Q3 2026 (July – September)
+## v2 (post-pilot horizon)
 
-### v0.9.0
-- Delegation chain metadata format: verifiable authorization chains
-- Agent decommissioning certificates: secure lifecycle termination
-- Upstream server count limits with validation
+Shape locks after first real pilots generate operator-usage data. Current direction:
 
-### Enterprise Readiness
-- Enterprise pilot deployments targeting finance, healthcare, and energy verticals
-- Managed Agents integration guide and reference architecture
+- Curated rate table and shared-pool arbitration grammar
+- Broader ecosystem composition (additional payment and attestation rails; cross-framework receipt portability)
+- Hardware-backed secure-element integration and third-party secret-manager import
 
-### Ecosystem Growth
-- Rust reference implementation (specification-compatible, for goose/AAIF integration)
-- Python reference implementation (for Concordia Protocol native composition)
-- Interoperability test suite for cross-ecosystem agent trust verification
+---
 
-### Events
-- AGNTCon + MCPCon San Jose (October 22-23): talk proposal submitted
+## Standards engagement
 
-## Q4 2026 (October – December)
+Cross-cutting, not tied to a single version. Sanctuary engages standards bodies to land operator-sovereign primitives as open specifications rather than proprietary interfaces.
 
-### v1.0.0 — Stable Release
-- Stable API with backward-compatibility guarantees
-- Long-term support (LTS) commitment
-- Comprehensive migration guide from 0.x to 1.0
+- W3C Agentic Integrity Verification Specification community group (Agent Contract v0.1 submission pathway; Ed25519 as a first-class signature algorithm)
+- W3C DID method alignment (Ed25519 key material mapped cleanly to DIDs)
+- IETF trust-scoring alignment (Verascore dimensions in conversation with draft-sharif)
+- AAIF Security Working Group participation (sovereignty primitives in the agent-authentication frame)
+- MCP Registry governance proposal (Sovereignty Health Report as a governance verification shape for registry-listed MCP servers)
+- Reputation Portability Standard (cross-ecosystem reputation verification over Concordia receipts)
 
-### MCP Registry Integration
-- SHR as governance verification standard for MCP Registry launch (Q4 2026)
-- Automated sovereignty scoring for registry-listed MCP servers
+---
 
-### Research
-- Academic publication targeting NDSS, CCS, or IEEE S&P security conferences
-- Concordia Protocol bridge: cross-protocol negotiation with sovereignty guarantees
+## Non-dependency and composition posture
 
-## Q1–Q2 2027
+Sanctuary never requires Concordia. Concordia never requires Sanctuary. Composition with external frameworks is always optional and default off. The framework alone, with no external dependency of any kind, is a fully operational sovereign fortress.
 
-### Standards Harmonization
-- W3C DID method specification alignment (Ed25519 → DIDs)
-- IETF trust scoring alignment (Verascore dimensions → IETF draft-sharif)
+Composition partners are named as partners: Coinbase x402, Google AP2, Anthropic MCP, Hermes A2A, and peers in the agent-interop space.
 
-### Community
-- Community-elected Technical Steering Committee operational
-- Bootstrap bundle (`@sanctuary-framework/agent-bundle`) for zero-config deployment
+---
 
-### Federation
-- Agent Registry Federation: multi-organization agent discovery with sovereignty-gated trust boundaries
-- Reputation Portability Standard: cross-ecosystem reputation verification
+## Contributing to the roadmap
 
-## How to Influence the Roadmap
+Scope changes against the current major version happen through dated amendments to the private scope-lock document, not rewrites. Minor items land via GitHub issue and pull request. Major items land via brief and coordinator approval before a build thread spawns. For standards-track engagement, participation in the relevant community group or working group is the fastest route. Enterprise pilot inquiries reach the maintainer via GitHub.
 
-- Open a GitHub Issue with your use case or feature request
-- Participate in RFC discussions for upcoming features
-- Join the AAIF Security Working Group to shape governance standards
-- Enterprise pilot partners: contact the maintainer via GitHub
-
-## Status Key
-
-Items move through: **Planned** → **In Progress** → **Shipped** → **Stable**
-
-Current version: **v0.7.0** (shipped April 8, 2026)
-Next milestone: **v0.8.0** (targeting May 2026)
+Sole author: Erik Newton.
