@@ -30,6 +30,10 @@ describe("loadConfig", () => {
     delete process.env.SANCTUARY_STORAGE_PATH;
     delete process.env.SANCTUARY_TRANSPORT;
     delete process.env.SANCTUARY_HTTP_PORT;
+    delete process.env.SANCTUARY_PRIVACY_FILTER;
+    delete process.env.SANCTUARY_PRIVACY_FILTER_FAIL_MODE;
+    delete process.env.SANCTUARY_PRIVACY_FILTER_COMMAND;
+    delete process.env.SANCTUARY_PRIVACY_FILTER_TIMEOUT_MS;
 
     // Clean up temp dir
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
@@ -146,6 +150,40 @@ describe("loadConfig", () => {
 
       expect(config.dashboard.enabled).toBe(true);
       expect(config.http_port).toBe(5000);
+    });
+  });
+
+  describe("Privacy filter config", () => {
+    it("defaults to local placeholder filtering with fallback fail mode", async () => {
+      const config = await loadConfig(join(tempDir, "nonexistent.json"));
+      expect(config.privacy_filter).toEqual({
+        mode: "local",
+        fail_mode: "fallback",
+        command: "opf",
+        timeout_ms: 5000,
+      });
+    });
+
+    it("env vars override privacy filter config", async () => {
+      process.env.SANCTUARY_PRIVACY_FILTER = "opf";
+      process.env.SANCTUARY_PRIVACY_FILTER_FAIL_MODE = "closed";
+      process.env.SANCTUARY_PRIVACY_FILTER_COMMAND = "/tmp/mock-opf";
+      process.env.SANCTUARY_PRIVACY_FILTER_TIMEOUT_MS = "750";
+
+      const config = await loadConfig(join(tempDir, "nonexistent.json"));
+      expect(config.privacy_filter).toEqual({
+        mode: "opf",
+        fail_mode: "closed",
+        command: "/tmp/mock-opf",
+        timeout_ms: 750,
+      });
+    });
+
+    it("rejects invalid privacy filter mode", async () => {
+      process.env.SANCTUARY_PRIVACY_FILTER = "remote";
+      await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
+        /privacy_filter\.mode/
+      );
     });
   });
 });

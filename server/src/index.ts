@@ -543,7 +543,9 @@ export async function createSanctuaryServer(options?: {
 
   // 14e. Create Context Gating tools (L2 outbound context control)
   const { tools: contextGateTools, enforcer: contextGateEnforcer } =
-    createContextGateTools(storage, masterKey, auditLog);
+    createContextGateTools(storage, masterKey, auditLog, {
+      privacyFilter: config.privacy_filter,
+    });
 
   // 14f. Create L2 Process Hardening tools
   const hardeningTools = createL2HardeningTools(config.storage_path, auditLog);
