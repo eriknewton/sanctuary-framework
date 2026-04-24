@@ -132,6 +132,40 @@ describe("Context Gate Tools", () => {
       expect(text).not.toContain('"policy_not_found"');
     });
 
+    it("scrubs sensitive spans inside allowed context values", async () => {
+      const { findTool } = setup();
+      const setPolicyTool = findTool("context_gate_set_policy");
+      const setResult = await setPolicyTool.handler({
+        policy_id: "allow-prompt",
+        rules: [
+          {
+            provider_category: "inference",
+            allow: ["prompt"],
+            redact: [],
+          },
+        ],
+      });
+      const policy = JSON.parse(setResult.content[0].text);
+
+      const filterTool = findTool("context_gate_filter");
+      const result = await filterTool.handler({
+        policy_id: policy.policy_id,
+        provider: "inference",
+        context: { prompt: "Email jane@example.com about the test" },
+      });
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.safe_context.prompt).toBe(
+        "Email [EMAIL_REDACTED] about the test"
+      );
+      expect(parsed.summary.privacy_filtered_spans).toBe(1);
+      expect(parsed.privacy_filter.findings[0]).toMatchObject({
+        path: "$.prompt",
+        class: "email",
+        action: "redact",
+      });
+    });
+
     it("returns error for non-existent policy", async () => {
       const { findTool } = setup();
       const tool = findTool("context_gate_filter");

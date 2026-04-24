@@ -43,6 +43,45 @@ Point releases close field-verification gaps and platform parity.
 
 ---
 
+## v1.1 product completion track
+
+This track closes the three user-facing promises that make Sanctuary feel complete rather than merely well-instrumented: privacy at the query boundary, the dashboard as the operator's hub, and exit without platform lock-in. Work may ship in v1.0.x if low-risk, but the track is complete only when the drills below pass.
+
+### Query minimization and privacy filtering
+
+- Local privacy-filter adapter: integrate a local detector/redactor for PII, secrets, account identifiers, addresses, URLs, and other high-risk spans before remote inference or external-tool egress.
+- Placeholder vault: replace sensitive spans with stable local placeholders such as `PERSON_1`, `ORG_1`, `PROJECT_1`, and `ACCOUNT_1`, stored encrypted under the operator's key.
+- Policy-bound rehydration: allow reversible substitution only when the destination policy permits it; otherwise the placeholder remains the exported form.
+- Privacy audit surface: record detector class, field path, action, hashes, policy id, and destination category without storing raw sensitive content in the audit log.
+- Dashboard privacy panel: show what was filtered, why, and which policy caused the decision.
+
+Gate: privacy drill passes. A pilot sends a query containing PII, secrets, and project-specific identifiers through a wrapped agent; Sanctuary proves the remote-bound payload was filtered, the local mapping remains encrypted, and the audit log contains only safe metadata.
+
+Terminology: until transport unlinkability and traffic-analysis defenses exist, the public promise is "query minimization and PII filtering," not strong anonymization.
+
+### Operator hub completion
+
+- Unified inbox for pending approvals, blocked egress, privacy events, budget warnings, recovery prompts, and agent errors.
+- Agent registry across wrapped harnesses, tenants, and federation nodes, with status, model/provider, policy, budget, and last-activity columns.
+- Agent controls for start, stop, restart, unwrap, template assignment, and policy changes.
+- Live activity feed across all agents and nodes, backed by audit events.
+- Policy center for channel templates, per-agent rules, egress allowlists, retention, budgets, and privacy-filter settings.
+- Guided import/export/recovery flows surfaced in the dashboard rather than requiring CLI-only operation.
+
+Gate: hub drill passes. A pilot operates two or three wrapped Tier B agents from the dashboard, resolves approvals and blocked egress, changes policy, and completes a recovery/export action without CLI help.
+
+### Portability and exit workflows
+
+- One-click export bundle containing public identity, state, policy, audit receipts, reputation bundle, commitments, and manifest hashes.
+- One-click import into a fresh machine or fortress, with conflict handling and verification before activation.
+- Re-keying flow for encrypted state so export/import does not require carrying forward the original passphrase forever.
+- Third-party verifier CLI for exported audit/reputation bundles.
+- Harness migration flow: unwrap from one supported harness and re-wrap another while preserving identity, reputation, policies, and audit continuity.
+
+Gate: exit drill passes. A pilot moves an agent from one harness or machine to another, verifies identity/reputation/audit continuity, and can demonstrate the original platform no longer controls the agent's durable record.
+
+---
+
 ## v1.1 (post-MVP cryptographic primitives sprint)
 
 Bundled cryptographic primitives upgrade. One coordinated thread, four to eight weeks, spawns after v1.0 pilot acceptance clears.

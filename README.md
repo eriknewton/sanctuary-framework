@@ -2,13 +2,39 @@
 
 **Your agent. Your machine. Your keys.**
 
-Sanctuary puts cryptographic walls around every AI agent in your life and gives you the keys. Your agents run on your machines, in your cloud, or in a sealed cloud box we manage. Every action an agent takes is signed with a per-agent identity rooted in keys you hold, gated by policy you control, and logged to a portable audit trail. You don't have to give up the tools you already use: `sanctuary wrap` adds sovereignty underneath your existing harness, invisibly.
+Sanctuary puts cryptographic walls around every AI agent in your life and gives you the keys. Your agents run on your machines today, with operator-cloud and sovereign-managed deployment modes on the roadmap. Every action an agent takes is signed with a per-agent identity rooted in keys you hold, gated by policy you control, and logged to a portable audit trail. You don't have to give up the tools you already use: `sanctuary wrap` adds sovereignty underneath your existing harness, invisibly.
 
 ### Why this matters
 
 Most AI infrastructure monetizes something the operator cannot take with them: platform lock-in, inference margin, managed-cloud rent, training-data extraction, or custodial settlement. Operator-owned keys undermine every one of those revenue models. That is the business-model wedge. Features get copied; a business model that runs against the vendor's own does not.
 
 The conversation UI is the easy part. Sanctuary is the version where you own the keys, every message is signed with the agent's cryptographic identity rooted in yours, and you can move agents between machines without losing the audit trail or commitment records.
+
+---
+
+## Release status
+
+`main` is the development branch. The current release candidate is `v1.0.0-rc.2` on the npm `next` tag. The default npm `latest` channel remains `0.10.6` until the v1.0 pilot acceptance drill clears.
+
+```bash
+# Current stable channel
+npm install -g @sanctuary-framework/mcp-server
+
+# v1.0 release-candidate channel
+npm install -g @sanctuary-framework/mcp-server@next
+```
+
+Current capability summary:
+
+| Surface | Current status |
+|---|---|
+| Local `sanctuary wrap`, dashboard, policy gates, encrypted state, audit trail | Shipped / in v1.0 acceptance |
+| Context gating and sensitive-field redaction | Shipped foundation; query anonymization completion track remains open |
+| Portable identity, state export/import, reputation bundles, Concordia composition | Shipped foundation; polished exit workflow remains open |
+| Cross-fortress/fleet hub | Federation v0.1 foundation shipped; full fleet console is v1.x |
+| Runtime transport-layer interception | v1.x roadmap |
+| Sovereign-managed TEE and hardware secure elements | v2 roadmap |
+| Post-quantum / MLS-class cryptographic upgrades | v1.1 roadmap |
 
 ---
 
@@ -70,10 +96,10 @@ curl -fsS "http://localhost:3501/api/health" | grep -q '"status":"ok"' && echo "
 curl -fsS "http://localhost:3501/api/identities" | grep -q '"identities":\[' && echo "identities=ok"
 
 # (c) Passphrase backed up to keychain (macOS)
-security find-generic-password -s "sanctuary-passphrase-default" >/dev/null 2>&1 && echo "passphrase=ok"
+security find-generic-password -s "sanctuary-passphrase" >/dev/null 2>&1 && echo "passphrase=ok"
 
-# (d) Audit log writable
-ls -la ~/.sanctuary/audit/*.jsonl >/dev/null 2>&1 && echo "audit=ok"
+# (d) Audit log initialized
+test -d ~/.sanctuary/state/_audit && echo "audit=ok"
 ```
 
 If any check fails, see "Troubleshooting" near the bottom of this README.
@@ -228,17 +254,17 @@ sanctuary template init research-assistant --name my-agent --provider anthropic
 
 ---
 
-## Three deployment modes, one console
+## Deployment modes
 
-Sanctuary runs the same code in three places. One console speaks to all three. Mix modes as you like; the operator picks per workload.
+Sanctuary is designed to run the same rights substrate in three places. The local mode is the v1.0 acceptance surface; operator-cloud and sovereign-managed TEE modes are roadmap surfaces that build on the same federation and policy foundations.
 
-| Mode | What it is | Who picks this |
-|---|---|---|
-| **On your machines** (Local) | Runs on the Macs, Linux boxes, or Windows machines you already own. Nothing leaves your house unless you tell it to. | Self-hosters, privacy-maximalists, anyone who already runs a homelab. |
-| **In your cloud** (Operator cloud) | Runs in your own GCP / Azure / AWS account. Same code, same keys, on rented hardware you control. | Prosumers, small businesses, operators with light IT but no rack at home. |
-| **In a sealed cloud box we manage** (Sovereign-managed TEE) | Runs on hardware Sanctuary operates, but the hardware proves to your console that even Sanctuary cannot see what's inside. You hold the keys; we hold the metal. | Regulated industries, operators who want sovereignty without operational burden. |
+| Mode | Status | What it is | Who picks this |
+|---|---|---|---|
+| **On your machines** (Local) | v1.0 acceptance | Runs on the Macs, Linux boxes, or Windows machines you already own. Nothing leaves your house unless you tell it to. | Self-hosters, privacy-maximalists, anyone who already runs a homelab. |
+| **In your cloud** (Operator cloud) | v1.x roadmap | Runs in your own GCP / Azure / AWS account. Same code, same keys, on rented hardware you control. | Prosumers, small businesses, operators with light IT but no rack at home. |
+| **In a sealed cloud box we manage** (Sovereign-managed TEE) | v2 roadmap | Runs on hardware Sanctuary operates, but the hardware proves to your console that even Sanctuary cannot see what's inside. You hold the keys; we hold the metal. | Regulated industries, operators who want sovereignty without operational burden. |
 
-The operator holds the keys in every mode. The sovereign-managed mode uses hardware attestation to prove the vendor cannot see the workload.
+The operator holds the keys in every mode. The sovereign-managed mode will require hardware attestation before it is treated as shipped.
 
 ---
 
@@ -253,7 +279,7 @@ A fortress. Walls separate the inside from the outside. Gates let specific thing
 | **L3: Selective Disclosure** (drawbridge) | Every external contact (A2A message, MCP tool call, x402 payment, ERC-8004 attestation, AP2 mandate) goes out through a disclosure envelope signed by the agent's derived key. The envelope carries only what policy permits. Lockdown drops egress mid-flight under attack. |
 | **L4: Verifiable Reputation** (chronicle) | Portable, append-only, signed audit trail. Travels with the agent across machines. Every action, every commitment, every attestation, recorded and verifiable. |
 
-**Today:** Ed25519 signing, Argon2id passphrase unlock, per-purpose HKDF subkeys, hardware-backed secure-element support where available. **Crypto-agility:** every audit entry embeds a scheme identifier so hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) can land without breaking historical receipts.
+**Today:** Ed25519 signing, Argon2id passphrase unlock, and per-purpose HKDF subkeys. **Crypto-agility:** every audit entry embeds a scheme identifier so hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) can land without breaking historical receipts. Hardware-backed secure elements are on the v2 roadmap.
 
 ---
 
@@ -305,8 +331,8 @@ pip install concordia-protocol
 Sanctuary composes with the existing open ecosystem.
 
 - **Identity:** W3C DIDs, KERI, Verifiable Credentials
-- **Execution:** Trusted Execution Environments (Intel TDX, AMD SEV-SNP, ARM CCA)
-- **Cryptography:** Ed25519 today; NIST Post-Quantum Cryptography (ML-DSA / FIPS 204, ML-KEM / FIPS 203) on the migration path; hybrid signing planned for v1.x
+- **Execution:** Trusted Execution Environments (Intel TDX, AMD SEV-SNP, ARM CCA) on the v2 roadmap
+- **Cryptography:** Ed25519 today; NIST Post-Quantum Cryptography (ML-DSA / FIPS 204, ML-KEM / FIPS 203) on the migration path; hybrid signing planned after v1.0 acceptance
 - **Settlement:** x402 (Coinbase micropayments), AP2 (Google Agent Payments Protocol), ACP
 
 ---
@@ -326,10 +352,11 @@ For AI coding agents handling install failures, here are the common cases.
 - The wrap command may have failed to write to the Keychain (typically a permissions prompt the operator dismissed). Rerun the wrap command and approve the Keychain prompt when it appears.
 
 **Install Step 3 (c) on Linux or Windows:**
-- The keychain check is macOS-specific. On Linux, the passphrase falls back to an encrypted file at `~/.sanctuary/passphrase.enc`. Test with `test -f ~/.sanctuary/passphrase.enc && echo "passphrase=ok"`.
+- The keychain check is macOS-specific. On Linux, Sanctuary uses Secret Service when available and falls back to an encrypted file at `~/.sanctuary/passphrase.enc`. Windows Credential Manager support is queued on the v1.0.x patch track. Test the fallback with `test -f ~/.sanctuary/passphrase.enc && echo "passphrase=ok"`.
 
 **Install Step 3 (d) "audit=ok" check fails:**
 - Confirm `~/.sanctuary/` exists and is writable by the current user. If it doesn't exist, the wrap did not complete; rerun.
+- Audit entries are stored encrypted under `~/.sanctuary/state/_audit/`, not as plaintext JSONL. Use `audit_export_siem` when you need a decrypted export.
 
 **`sanctuary` CLI not found after `npm install -g`:**
 - Confirm `npm bin -g` is on the PATH. On macOS with nvm, this typically lives at `~/.nvm/versions/node/<version>/bin/`.

@@ -38,6 +38,7 @@ import {
   ContextGateEnforcer,
   type EnforcerConfig,
 } from "./context-gate-enforcer.js";
+import { applyLocalPrivacyFilter } from "./privacy-filter.js";
 
 /**
  * Create the context-gating MCP tools.
@@ -435,7 +436,9 @@ export function createContextGateTools(
           });
         }
 
-        // Build the filtered context that is safe to send
+        // Build the filtered context that is safe to send. Field-level policy
+        // runs first; local span filtering then catches PII/secrets inside
+        // otherwise-allowed strings.
         const safeContext: Record<string, unknown> = {};
         for (const decision of result.decisions) {
           switch (decision.action) {
@@ -454,6 +457,7 @@ export function createContextGateTools(
               break;
           }
         }
+        const privacyFiltered = applyLocalPrivacyFilter(safeContext);
 
         auditLog.append("l2", "context_gate_filter", policy.identity_id ?? "system", {
           policy_id: policyId,
@@ -463,21 +467,27 @@ export function createContextGateTools(
           fields_redacted: result.fields_redacted,
           fields_hashed: result.fields_hashed,
           fields_summarized: result.fields_summarized,
+          privacy_findings: privacyFiltered.findings.length,
+          privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
           original_context_hash: result.original_context_hash,
           filtered_context_hash: result.filtered_context_hash,
         });
 
         return toolResult({
           blocked: false,
-          safe_context: safeContext,
+          safe_context: privacyFiltered.value,
           summary: {
             total_fields: Object.keys(context).length,
             allowed: result.fields_allowed,
             redacted: result.fields_redacted,
             hashed: result.fields_hashed,
             summarized: result.fields_summarized,
+            privacy_filtered_spans: privacyFiltered.findings.length,
           },
           decisions: result.decisions,
+          privacy_filter: {
+            findings: privacyFiltered.findings,
+          },
           audit: {
             original_context_hash: result.original_context_hash,
             filtered_context_hash: result.filtered_context_hash,

@@ -358,6 +358,35 @@ describe("L2 Context Gate Enforcer", () => {
       expect(parsed.args.tax_id_number).toBe("[REDACTED]");
       expect(parsed.args.name).toBe("John Doe");
     });
+
+    it("redacts sensitive spans inside otherwise safe fields", async () => {
+      const config: EnforcerConfig = {
+        enabled: true,
+        bypass_prefixes: [""],
+        log_only: false,
+        on_deny: "block",
+      };
+
+      const enforcer = new ContextGateEnforcer(policyStore, auditLog, config);
+
+      const originalHandler: ToolHandler = async (args) => {
+        return toolResult({ args });
+      };
+
+      const wrappedHandler = enforcer.wrapHandler("tool/api", originalHandler);
+
+      const result = await wrappedHandler({
+        task: "email jane@example.com about project alpha",
+        nested: { note: "phone 415-555-1212" },
+      });
+
+      const content = result.content[0];
+      const parsed = JSON.parse(content.text);
+      expect(parsed.args.task).toBe(
+        "email [EMAIL_REDACTED] about project alpha"
+      );
+      expect(parsed.args.nested.note).toBe("phone [PHONE_REDACTED]");
+    });
   });
 
   // ── log_only Mode ───────────────────────────────────────────────────

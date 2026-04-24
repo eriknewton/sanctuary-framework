@@ -25,6 +25,7 @@ import type { AuditLog } from "./audit-log.js";
 import { stringToBytes } from "../core/encoding.js";
 import { hashToString } from "../core/hashing.js";
 import { toolResult } from "../router.js";
+import { applyLocalPrivacyFilter } from "./privacy-filter.js";
 
 // ── Configuration ───────────────────────────────────────────────────────
 
@@ -212,8 +213,9 @@ export class ContextGateEnforcer {
       // If on_deny is "redact", continue with filtered args below
     }
 
-    // Build filtered arguments
+    // Build filtered arguments, then scrub sensitive spans inside allowed values.
     const filteredArgs = this.buildFilteredArgs(args, result.decisions);
+    const privacyFiltered = applyLocalPrivacyFilter(filteredArgs);
 
     if (this.config.log_only) {
       // Log but pass original args
@@ -229,6 +231,8 @@ export class ContextGateEnforcer {
           fields_redacted: result.fields_redacted,
           fields_hashed: result.fields_hashed,
           fields_blocked: deniedFields.length,
+          privacy_findings: privacyFiltered.findings.length,
+          privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
           original_context_hash: result.original_context_hash,
         }
       );
@@ -252,6 +256,8 @@ export class ContextGateEnforcer {
         fields_redacted: result.fields_redacted,
         fields_hashed: result.fields_hashed,
         fields_blocked: deniedFields.length,
+        privacy_findings: privacyFiltered.findings.length,
+        privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
         original_context_hash: result.original_context_hash,
       }
     );
@@ -260,7 +266,7 @@ export class ContextGateEnforcer {
     this.stats.fields_hashed += result.fields_hashed;
     this.stats.fields_blocked += deniedFields.length;
 
-    return originalHandler(filteredArgs);
+    return originalHandler(privacyFiltered.value as Record<string, unknown>);
   }
 
   /**
@@ -285,6 +291,42 @@ export class ContextGateEnforcer {
     }
 
     if (fieldsToRedact.length === 0) {
+      const privacyFiltered = applyLocalPrivacyFilter(args);
+      if (privacyFiltered.findings.length > 0) {
+        const filteredHash = hashToString(
+          stringToBytes(JSON.stringify(privacyFiltered.value))
+        );
+
+        if (this.config.log_only) {
+          this.auditLog.append(
+            "l2",
+            "context_gate_enforcer_builtin_privacy_log_only",
+            "system",
+            {
+              tool_name: toolName,
+              privacy_findings: privacyFiltered.findings.length,
+              privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
+              original_context_hash: originalHash,
+            }
+          );
+          return originalHandler(args);
+        }
+
+        this.auditLog.append(
+          "l2",
+          "context_gate_enforcer_builtin_privacy_filter",
+          "system",
+          {
+            tool_name: toolName,
+            privacy_findings: privacyFiltered.findings.length,
+            privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
+            original_context_hash: originalHash,
+            filtered_context_hash: filteredHash,
+          }
+        );
+        return originalHandler(privacyFiltered.value as Record<string, unknown>);
+      }
+
       // No sensitive fields detected — pass through
       this.auditLog.append(
         "l2",
@@ -308,8 +350,9 @@ export class ContextGateEnforcer {
       }
     }
 
+    const privacyFiltered = applyLocalPrivacyFilter(filteredArgs);
     const filteredHash = hashToString(
-      stringToBytes(JSON.stringify(filteredArgs))
+      stringToBytes(JSON.stringify(privacyFiltered.value))
     );
 
     if (this.config.log_only) {
@@ -321,6 +364,8 @@ export class ContextGateEnforcer {
           tool_name: toolName,
           fields_redacted: fieldsToRedact.length,
           redacted_fields: fieldsToRedact,
+          privacy_findings: privacyFiltered.findings.length,
+          privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
           original_context_hash: originalHash,
         }
       );
@@ -337,6 +382,8 @@ export class ContextGateEnforcer {
         tool_name: toolName,
         fields_redacted: fieldsToRedact.length,
         redacted_fields: fieldsToRedact,
+        privacy_findings: privacyFiltered.findings.length,
+        privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
         original_context_hash: originalHash,
         filtered_context_hash: filteredHash,
       }
@@ -344,7 +391,7 @@ export class ContextGateEnforcer {
 
     this.stats.fields_redacted += fieldsToRedact.length;
 
-    return originalHandler(filteredArgs);
+    return originalHandler(privacyFiltered.value as Record<string, unknown>);
   }
 
   /**
