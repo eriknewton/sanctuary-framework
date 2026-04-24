@@ -118,6 +118,7 @@ export async function verifyConcordiaReceipt(
     references: receipt.references,
     packed_at: receipt.packed_at,
     source_event_id: receipt.source_event_id,
+    source_event_type: receipt.source_event_type,
     signature_scheme: receipt.signature_scheme,
   });
 
