@@ -160,7 +160,7 @@ function l4EvidenceBlock(l4: ProtectionSnapshot["layers"]["l4"]): string {
 
 export function renderDashboardHTML(options: DashboardHTMLOptions): string {
   const { snapshot } = options;
-  const { overall, agent, layers, activity, pending_approvals, audit, upstream_servers } = snapshot;
+  const { overall, agent, layers, activity, pending_approvals, audit, privacy, upstream_servers } = snapshot;
 
   const activityRows = activity.length === 0
     ? `<tr class="empty"><td colspan="5">Waiting for tool calls…</td></tr>`
@@ -213,6 +213,14 @@ export function renderDashboardHTML(options: DashboardHTMLOptions): string {
           <span class="server-meta">${escHtml(s.state)} · ${escHtml(s.tool_count)} tool${s.tool_count === 1 ? "" : "s"}</span>
         </li>`)
         .join("");
+
+  const privacyClasses = Object.entries(privacy.classes)
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, count]) => `<span class="privacy-chip">${escHtml(name)} ${escHtml(count)}</span>`)
+    .join("");
+  const privacyLast = privacy.last_filtered_at
+    ? new Date(privacy.last_filtered_at).toLocaleString()
+    : "No filtering events yet";
 
   const initialSnapshot = JSON.stringify(snapshot)
     .replace(/</g, "\\u003c")
@@ -495,6 +503,13 @@ button { font: inherit; cursor: pointer; }
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
 .panel-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 18px; border-bottom: 1px solid var(--border); }
 .panel-head h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink-dim); }
+.privacy-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.privacy-metric { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; }
+.privacy-metric dt { color: var(--ink-mute); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
+.privacy-metric dd { color: var(--ink); font-size: 22px; font-weight: 700; }
+.privacy-metric dd.small { font-size: 13px; font-weight: 500; color: var(--ink-dim); line-height: 1.35; overflow-wrap: anywhere; }
+.privacy-classes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.privacy-chip { border: 1px solid var(--border); color: var(--ink-dim); border-radius: 999px; padding: 4px 8px; font-size: 12px; background: rgba(255,255,255,0.03); }
 .filter-row { display: flex; gap: 6px; }
 .filter-row button {
   padding: 4px 10px;
@@ -590,6 +605,27 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
   <section class="section">
     <h2>Upstream servers <span class="count">${upstream_servers.length}</span></h2>
     <ul class="server-list" id="server-list">${serverRows}</ul>
+  </section>
+
+  <section class="section">
+    <h2>Privacy boundary <span class="count" id="privacy-count">${privacy.filtered_spans}</span></h2>
+    <dl class="privacy-grid">
+      <div class="privacy-metric">
+        <dt>Filtered spans</dt>
+        <dd id="privacy-spans">${escHtml(privacy.filtered_spans)}</dd>
+      </div>
+      <div class="privacy-metric">
+        <dt>Filtered events</dt>
+        <dd id="privacy-events">${escHtml(privacy.filtered_events)}</dd>
+      </div>
+      <div class="privacy-metric">
+        <dt>Last filter</dt>
+        <dd class="small" id="privacy-last">${escHtml(privacyLast)}</dd>
+      </div>
+    </dl>
+    <div class="privacy-classes" id="privacy-classes">
+      ${privacyClasses || `<span class="privacy-chip">No classes recorded</span>`}
+    </div>
   </section>
 
   <section class="section">
@@ -719,6 +755,23 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
     )).join("");
   }
 
+  function renderPrivacy(summary) {
+    const count = document.getElementById("privacy-count");
+    const spans = document.getElementById("privacy-spans");
+    const events = document.getElementById("privacy-events");
+    const last = document.getElementById("privacy-last");
+    const classes = document.getElementById("privacy-classes");
+    if (!summary || !spans || !events || !last || !classes) return;
+    if (count) count.textContent = String(summary.filtered_spans || 0);
+    spans.textContent = String(summary.filtered_spans || 0);
+    events.textContent = String(summary.filtered_events || 0);
+    last.textContent = summary.last_filtered_at ? new Date(summary.last_filtered_at).toLocaleString() : "No filtering events yet";
+    const rows = Object.entries(summary.classes || {}).sort((a, b) => b[1] - a[1]);
+    classes.innerHTML = rows.length
+      ? rows.map(([name, n]) => '<span class="privacy-chip">' + esc(name) + ' ' + esc(n) + '</span>').join("")
+      : '<span class="privacy-chip">No classes recorded</span>';
+  }
+
   function renderAll(snap) {
     snapshot = snap;
     renderShield(snap.overall.light, snap.overall.headline);
@@ -728,6 +781,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
     document.getElementById("agent-did").textContent = snap.agent.did_fingerprint || "unclaimed";
     renderActivity(snap.activity);
     renderApprovals(snap.pending_approvals);
+    renderPrivacy(snap.privacy);
     renderAudit(snap.audit, currentAuditFilter());
   }
 

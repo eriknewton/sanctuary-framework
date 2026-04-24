@@ -120,6 +120,13 @@ export interface UpstreamServerStatus {
   error?: string;
 }
 
+export interface PrivacySummary {
+  filtered_events: number;
+  filtered_spans: number;
+  classes: Record<string, number>;
+  last_filtered_at: string | null;
+}
+
 export interface ProtectionSnapshot {
   overall: {
     status: OverallStatus;
@@ -136,6 +143,7 @@ export interface ProtectionSnapshot {
   activity: ActivityEntry[];
   pending_approvals: PendingApproval[];
   audit: AuditEntry[];
+  privacy: PrivacySummary;
   upstream_servers: UpstreamServerStatus[];
   mode: "co-located" | "standalone";
   server_version: string;
@@ -479,6 +487,43 @@ function buildUpstreamServers(
   });
 }
 
+function buildPrivacySummary(audit: AuditEntry[]): PrivacySummary {
+  const classes: Record<string, number> = {};
+  let filteredEvents = 0;
+  let filteredSpans = 0;
+  let lastFilteredAt: string | null = null;
+
+  for (const entry of audit) {
+    const details = entry.details ?? {};
+    const rawFindings = details.privacy_findings;
+    const findings = typeof rawFindings === "number" && Number.isFinite(rawFindings)
+      ? Math.max(0, rawFindings)
+      : 0;
+    if (findings <= 0) continue;
+
+    filteredEvents++;
+    filteredSpans += findings;
+    if (!lastFilteredAt || new Date(entry.timestamp).getTime() > new Date(lastFilteredAt).getTime()) {
+      lastFilteredAt = entry.timestamp;
+    }
+
+    const rawClasses = details.privacy_classes;
+    if (Array.isArray(rawClasses)) {
+      for (const rawClass of rawClasses) {
+        const key = String(rawClass);
+        classes[key] = (classes[key] ?? 0) + 1;
+      }
+    }
+  }
+
+  return {
+    filtered_events: filteredEvents,
+    filtered_spans: filteredSpans,
+    classes,
+    last_filtered_at: lastFilteredAt,
+  };
+}
+
 /**
  * Pull a unified protection snapshot from the injected sources.
  *
@@ -508,6 +553,7 @@ export async function getProtectionSnapshot(
 
   const activity = (sources.activity ?? []).slice(0, MAX_ACTIVITY);
   const pending_approvals = sources.pendingApprovals ?? [];
+  const privacy = buildPrivacySummary(audit);
   const upstream_servers = buildUpstreamServers(sources);
 
   return {
@@ -517,6 +563,7 @@ export async function getProtectionSnapshot(
     activity,
     pending_approvals,
     audit: audit.slice(-MAX_AUDIT).reverse(),
+    privacy,
     upstream_servers,
     mode: sources.mode,
     server_version: sources.server_version,

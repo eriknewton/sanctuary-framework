@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyOpenAIPrivacyFilterResult,
   applyLocalPrivacyFilter,
   applyPrivacyPlaceholders,
   PrivacyPlaceholderVault,
@@ -106,5 +107,50 @@ describe("L2 local privacy filter", () => {
       expect(raw).not.toBeNull();
       expect(bytesToString(raw!)).not.toContain("jane@example.com");
     }
+  });
+
+  it("adapts OpenAI privacy-filter spans into encrypted placeholders", async () => {
+    const storage = new MemoryStorage();
+    const vault = new PrivacyPlaceholderVault(storage, generateRandomKey());
+    const text = "Jane Smith emailed jane@example.com from 1 Main St.";
+
+    const result = await applyOpenAIPrivacyFilterResult(
+      {
+        schema_version: 1,
+        text,
+        detected_spans: [
+          {
+            label: "private_person",
+            start: 0,
+            end: 10,
+            text: "Jane Smith",
+          },
+          {
+            label: "private_email",
+            start: 19,
+            end: 35,
+            text: "jane@example.com",
+          },
+          {
+            label: "private_address",
+            start: 41,
+            end: 50,
+            text: "1 Main St",
+          },
+        ],
+      },
+      vault,
+      "opf-policy"
+    );
+
+    expect(result.value).toBe("PERSON_1 emailed EMAIL_1 from ADDRESS_1.");
+    expect(result.findings.map((f) => f.class)).toEqual([
+      "person",
+      "email",
+      "address",
+    ]);
+    await expect(vault.resolvePlaceholder("PERSON_1", "opf-policy")).resolves.toBe(
+      "Jane Smith"
+    );
   });
 });
