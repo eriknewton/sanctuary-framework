@@ -80,6 +80,14 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
+  if (args[0] === "reset-passphrase") {
+    const { runResetPassphraseCommand } = await import(
+      "./cli/reset-passphrase.js"
+    );
+    const code = await runResetPassphraseCommand({ argv: args.slice(1) });
+    process.exit(code);
+  }
+
   if (args[0] === "broker-server") {
     const { openBroker } = await import("./l3-disclosure/broker/open.js");
     const { createBrokerMcpServer } = await import("./mcp/broker-server.js");
@@ -321,7 +329,13 @@ Subcommands:
   export-passphrase    Print the stored passphrase to stdout after
                        confirmation. Use this to back up or migrate.
 
-  cocoon               (deprecated — use "wrap")
+  reset-passphrase     Recover a fortress whose passphrase has been lost
+                       or corrupted. Three modes: shares (M-of-N
+                       reconstruction), guardian (federation quorum), or
+                       nuke (destroys all state, fresh start).
+                       Use "sanctuary reset-passphrase --help" for options.
+
+  cocoon               (deprecated, use "wrap")
 
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
