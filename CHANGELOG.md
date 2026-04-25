@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased — v1.1 acceptance drill suite + (j) plumbing (2026-04-25)
+
+v1.1 acceptance drills land as automated integration tests covering the four pillars of the Local Sovereignty Harness checklist (`server/docs/v1.1-acceptance-checklist.md`). The drills exercise the privacy core, internal coordination, operator hub, and exit bundle end-to-end against real fortresses with no mocks at the contract boundary. They are the gating proof that v1.1 implementation has converged before the v1.1.0 release tag.
+
+### Added
+
+- Four drill files under `server/test/drills/` mirroring the four acceptance pillars:
+  - `v1.1-privacy-drill.test.ts`: outbound query containing PII, secrets, project, and client identifiers is filtered, audited safely (no raw spans in the audit payload), and rehydrated only when policy permits. Fail-closed sub-drill verifies missing-policy denial, oversized-payload denial, and operator-override permit-with-audit-trail.
+  - `v1.1-coordination-drill.test.ts`: two-agent local handoff completes propose -> accept -> complete with verified Layer 1 record signatures and Layer 2 audit-payload signatures at every stage. Policy-gate sub-drill verifies deny short-circuits handoff creation. Non-Concordia-dependency sub-drill carries the structural import-graph crawl so the invariant cannot regress under acceptance review.
+  - `v1.1-hub-drill.test.ts`: pause + resume run synchronously; fortress-wide Tier 1 lockdown via `/api/hub/fortress/lockdown` returns 202 + inbox item, defers controller invocation, and lands the lockdown only after the operator approves via the inbox (operator-confirms-twice). Privacy event surfaces under `category=privacy` in the activity feed; cross-fortress query parameter rejected with `HubLocalOnlyError` 422; unauthenticated request rejected with 401.
+  - `v1.1-exit-drill.test.ts`: source fortress with state, reputation, and audit history exports a SANCTUARY_EXIT_BUNDLE_V1 via the Tier 1 hub fortress endpoint; the operator-facing `sanctuary exit verify` CLI passes; tampering one byte fails with a non-zero exit code; injecting `..` in an artifact path fails with `failure_class: "artifact_path_unsafe"`; a fresh destination fortress imports + re-keys; re-import without explicit overwrite refuses to overwrite previously-imported state. v1.0.2 backlog items (h)/(i)/(j) verified inline (see Changed below for (j)).
+
+### Changed
+
+- **v1.0.2 (j) `export_approval_audit_id` plumbing.** `HubServiceDeps.fortressExportBundle` now accepts an optional `approvalAuditId` argument; the hub passes the inbox item id when it invokes the callback after a fortress-scope Tier 1 approval lands. `ExportExitBundleOptions` carries an optional `exportApprovalAuditId` that, when present, becomes the manifest's `export_approval_audit_id` field and the L1 `exit_bundle_export` audit entry's `approval_id`. The manifest now ties one-to-one to the operator's actual Tier 1 inbox approval rather than an internally-generated `exit-export-${Date.now()}` id. Backwards-compatible: existing zero-arg callbacks and existing `exportExitBundle()` callers continue to work.
+
+### Verified (no fix required)
+
+- **v1.0.2 (i) Import overwrite-refusal.** Default `conflictResolution` is `"skip"`. Re-importing the same bundle on a destination without explicit `conflictResolution: "overwrite"` reports state conflicts and skips the import; previously-imported state is not silently overwritten. Drill verifies via second-import call.
+- **v1.0.2 (h) Re-key cleanup.** Re-key occurs in memory inside `rekeyState()`; source-key-encrypted ciphertext is never persisted on the destination fortress. Source-key blobs live only inside the operator-owned bundle directory. Drill verifies by enumerating destination namespaces post-import and asserting none match staged-import or rekey-temp patterns.
+
 ## v1.0.0-rc.2 (2026-04-23)
 
 Scope-alignment back-out. rc.1 shipped named-agent runtime templates (`x-miner`, `github-miner`) that drifted from Scope Lock §11's channel-orthogonal template archetypes. Sanctuary governs harnesses; operators bring runtimes. See `Wiki/decisions/sanctuary-does-not-ship-sub-agent-runtimes.md` for the rule and rationale.
