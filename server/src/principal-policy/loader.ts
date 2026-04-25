@@ -48,6 +48,10 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "governor_reset", // Clears all runtime governance state — always requires approval
     "sanctuary_bootstrap", // Creates new Ed25519 identity + publishes — always requires approval
     "sanctuary_export_identity_bundle", // Exports portable identity — always requires approval
+    "exit_bundle_export", // Complete portability bundle export — always requires approval
+    "exit_bundle_import", // External durable-record import — always requires approval
+    "exit_bundle_import_activate", // Activates imported material — always requires approval
+    "exit_bundle_rekey", // Re-encrypts imported state under destination keys
     // WP-MVP-2 Operator Console: federation-node-join requires explicit
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
@@ -278,6 +282,10 @@ tier1_always_approve:
   - governor_reset
   - sanctuary_bootstrap
   - sanctuary_export_identity_bundle
+  - exit_bundle_export
+  - exit_bundle_import
+  - exit_bundle_import_activate
+  - exit_bundle_rekey
 
 # ─── Tier 2: Behavioral Anomaly Detection ────────────────────────────────
 # Triggers approval when agent behavior deviates from its baseline.

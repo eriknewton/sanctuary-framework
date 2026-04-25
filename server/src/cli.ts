@@ -80,6 +80,12 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
+  if (args[0] === "exit") {
+    const { runExitCommand } = await import("./exit/index.js");
+    const code = await runExitCommand({ argv: args.slice(1) });
+    process.exit(code);
+  }
+
   if (args[0] === "reset-passphrase") {
     const { runResetPassphraseCommand } = await import(
       "./cli/reset-passphrase.js"
@@ -325,6 +331,9 @@ Subcommands:
 
   agents               List / inspect tenants on a multi-agent host.
                        Use "sanctuary agents --help" for options.
+
+  exit                 Export, verify, and import SANCTUARY_EXIT_BUNDLE_V1
+                       bundles. Use "sanctuary exit --help" for options.
 
   export-passphrase    Print the stored passphrase to stdout after
                        confirmation. Use this to back up or migrate.
