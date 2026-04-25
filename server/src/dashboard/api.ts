@@ -48,8 +48,19 @@ export interface APIDeps {
   isAgentWrapped?: (agentId: string) => Promise<boolean>;
 }
 
+/**
+ * SSE event taxonomy.
+ *
+ * v1.0 event names: `snapshot` (initial hydration), `activity` (audit feed
+ * append), `approval` (pending approval surfaced).
+ *
+ * v1.1 added: `inbox` (HubInboxItem replace-or-prepend by item_id) and
+ * `agent_status` (HubAgentStatusSnapshot replace by agent_id). The hub
+ * service emits these via the existing `publish` interface; the producer
+ * wires every name verbatim through `event: <type>` SSE frames.
+ */
 export interface StreamEvent {
-  type: "snapshot" | "activity" | "approval";
+  type: "snapshot" | "activity" | "approval" | "inbox" | "agent_status";
   data: unknown;
 }
 
