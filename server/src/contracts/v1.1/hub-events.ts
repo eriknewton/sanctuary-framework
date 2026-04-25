@@ -121,6 +121,20 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
     | "other";
   /** ISO8601 deadline after which the request will be auto-denied if applicable. */
   deadline?: string;
+  /**
+   * Result fields surfaced after the Tier 1 handler runs. Empty until
+   * resolution. Populated for fortress-scope `exit_bundle_export` so the
+   * dashboard exit-drill page can advance the wizard from the inbox
+   * resolution alone, without round-tripping through the activity feed.
+   * Per-agent items leave it undefined. Producers MUST keep field values
+   * to safe metadata only (paths and hex hashes); raw secrets MUST NOT
+   * appear here.
+   */
+  resolution_payload?: {
+    bundle_dir?: string;
+    manifest_hash?: string;
+    artifact_count?: number;
+  };
 }
 
 /**

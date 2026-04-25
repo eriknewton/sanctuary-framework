@@ -91,6 +91,10 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
   // ── approval_pending.tier1.* ─────────────────────────────────────────
   "approval_pending.tier1.lockdown": (a) =>
     `Lock down agent ${arg(a, "agent_id")}. This stops all egress and freezes gates.`,
+  "approval_pending.tier1.fortress_lockdown": () =>
+    "Lock down the entire fortress (all agents pause, egress blocks).",
+  "approval_pending.tier1.fortress_exit_bundle_export": () =>
+    "Export the entire fortress as a portable exit bundle.",
   "approval_pending.tier1.unwrap": (a) =>
     `Unwrap agent ${arg(a, "agent_id")}. Cocoon and registry binding will be removed.`,
   "approval_pending.tier1.policy_change": (a) =>

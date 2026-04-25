@@ -30,10 +30,12 @@ import {
   HUB_API_PREFIX,
   HUB_AGENTS_DEFAULT_LIMIT,
   HUB_AGENTS_MAX_LIMIT,
+  HUB_FORTRESS_AGENT_ID_SENTINEL,
   HUB_INBOX_ACTIONS,
   HUB_INBOX_DEFAULT_LIMIT,
   HUB_INBOX_MAX_LIMIT,
   HUB_MAX_REQUEST_BODY_BYTES,
+  HUB_ROUTES,
   type HubAgentControlAction,
   type HubInboxAction,
 } from "./constants.js";
@@ -230,6 +232,26 @@ export async function handleHubRoute(
       return true;
     }
 
+    // ── POST /api/hub/fortress/lockdown ─────────────────────────────
+    if (
+      method === "POST" &&
+      path === HUB_ROUTES.FORTRESS_LOCKDOWN
+    ) {
+      const result = deps.service.enqueueFortressLockdown();
+      writeJSON(res, 202, { ok: true, data: result });
+      return true;
+    }
+
+    // ── POST /api/hub/fortress/exit-bundle/export ───────────────────
+    if (
+      method === "POST" &&
+      path === HUB_ROUTES.FORTRESS_EXIT_BUNDLE_EXPORT
+    ) {
+      const result = deps.service.enqueueFortressExportBundle();
+      writeJSON(res, 202, { ok: true, data: result });
+      return true;
+    }
+
     // ── GET /api/hub/agents (+ filters) ─────────────────────────────
     if (method === "GET" && path === `${HUB_API_PREFIX}/agents`) {
       const limit = parseLimit(
@@ -255,6 +277,30 @@ export async function handleHubRoute(
     const agentMatch = matchAgentRoute(path);
     if (agentMatch) {
       const { agentId, remainder } = agentMatch;
+
+      // Routing-layer alias for the v1.1 dashboard's existing call paths.
+      // The dashboard sends `/api/hub/agents/all/lockdown` and
+      // `/api/hub/agents/all/exit-bundle/export` as fortress-scope. The
+      // canonical paths are HUB_ROUTES.FORTRESS_*; this branch keeps the
+      // dashboard's 404 toast workaround retired without touching the
+      // dashboard. Cross-fortress params already rejected above.
+      if (
+        method === "POST" &&
+        agentId === HUB_FORTRESS_AGENT_ID_SENTINEL
+      ) {
+        if (remainder === "lockdown") {
+          const result = deps.service.enqueueFortressLockdown();
+          writeJSON(res, 202, { ok: true, data: result });
+          return true;
+        }
+        if (remainder === "exit-bundle/export") {
+          const result = deps.service.enqueueFortressExportBundle();
+          writeJSON(res, 202, { ok: true, data: result });
+          return true;
+        }
+        // Other remainders fall through and 404 below; the sentinel is
+        // only an alias for the two fortress-scope Tier 1 actions.
+      }
 
       // GET /api/hub/agents/:id
       if (method === "GET" && remainder === null) {
