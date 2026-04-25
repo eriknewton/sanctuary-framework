@@ -108,6 +108,12 @@ export interface ConcordiaReceipt {
   signature_scheme: SignatureScheme;
   /** ISO8601 UTC timestamp. */
   packed_at: string;
+  /** Bounded scope from the source commitment event (if populated). */
+  bounded_scope?: {
+    deliverable: string;
+    deadline_or_terminal: string;
+    budget_ref: string;
+  };
   /** Concordia attestation metadata (behavioral signals only, no raw terms). */
   attestation_metadata?: Record<string, unknown>;
 }
