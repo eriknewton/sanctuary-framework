@@ -40,7 +40,7 @@ export function formatUpdateMessage(
   current: string,
   latest: string
 ): string {
-  return `[Sanctuary] Update available: ${current} → ${latest} — run: npx @sanctuary-framework/mcp-server@latest`;
+  return `[Sanctuary] Update available: ${current} → ${latest}. Run: npx @sanctuary-framework/mcp-server@latest`;
 }
 
 /**

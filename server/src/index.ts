@@ -866,7 +866,7 @@ export async function createSanctuaryServer(options?: {
   if (recoveryKey) {
     console.error(
       "╔══════════════════════════════════════════════════════════╗\n" +
-      "║  SANCTUARY: First Run — Recovery Key Generated          ║\n" +
+      "║  SANCTUARY: First Run, Recovery Key Generated           ║\n" +
       "║                                                          ║\n" +
       `║  Recovery Key: ${recoveryKey.slice(0, 20)}...             ║\n` +
       "║                                                          ║\n" +
