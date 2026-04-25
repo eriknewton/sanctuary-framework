@@ -41,25 +41,78 @@ import type {
 export type ExitBundleHashAlg = "sha256";
 
 /**
+ * Safe-path rules for `ExitBundleArtifactEntry.path`.
+ *
+ * The verifier MUST reject any artifact entry whose `path` does not satisfy
+ * EVERY rule below. The export command MUST refuse to emit a manifest
+ * containing any path that fails any rule. Together these constraints
+ * defeat path-traversal, separator-bypass, and link-substitution attacks
+ * that would otherwise let a malicious bundle write outside the extraction
+ * root or impersonate a different artifact.
+ *
+ * Rejection rules:
+ *
+ *   1. Path MUST match `EXIT_BUNDLE_PATH_PATTERN`. POSIX-style only:
+ *      lowercase `[a-z0-9._-]+` segments separated by single forward
+ *      slashes. No leading slash. No trailing slash. No empty segments.
+ *      No segment equal to "." or "..". Maximum total length 256 bytes.
+ *
+ *   2. Path MUST NOT be absolute (no leading "/" or drive letter).
+ *
+ *   3. Path MUST NOT contain ".." in any segment, in any encoding
+ *      (URL-encoded, double-encoded, percent-encoded, Unicode-normalized).
+ *      Verifier MUST decode and normalize before checking.
+ *
+ *   4. Path MUST NOT contain backslashes ("\\"), null bytes ("\\0"), or any
+ *      character outside the regex range. Windows-style separators are
+ *      rejected even on Windows hosts; POSIX-style is canonical.
+ *
+ *   5. Two `ExitBundleArtifactEntry` entries within a single manifest MUST
+ *      NOT share the same `path`. Duplicate paths are rejected.
+ *
+ *   6. The verifier MUST refuse to follow filesystem symlinks or hardlinks
+ *      during extraction. If the archive format embeds link entries, the
+ *      verifier rejects the entire bundle.
+ *
+ *   7. Resolved extraction destination (extraction_root + path) MUST be a
+ *      direct descendant of `extraction_root`. Verifier MUST `realpath`
+ *      both sides and confirm the prefix match before opening any file.
+ *
+ *   8. The verifier MUST NOT extract before verification. Verification
+ *      reads from the archive in-place; extraction (if any) happens only
+ *      after every artifact's hash + size pass.
+ */
+export const EXIT_BUNDLE_PATH_PATTERN = /^[a-z0-9._-]+(?:\/[a-z0-9._-]+)*$/;
+export const EXIT_BUNDLE_PATH_MAX_BYTES = 256;
+
+/**
  * One artifact entry inside the manifest. Each artifact lives at a relative
  * path inside the bundle archive. The verifier reads the file at that path
- * and confirms its hash.
+ * and confirms its hash. See `EXIT_BUNDLE_PATH_PATTERN` and the safe-path
+ * rules block above for the full set of constraints.
  */
 export interface ExitBundleArtifactEntry {
   /** Coarse artifact kind. */
   kind: ExitBundleArtifactKind;
-  /** Relative path inside the bundle, POSIX-style. */
+  /**
+   * Relative path inside the bundle, POSIX-style. MUST satisfy
+   * `EXIT_BUNDLE_PATH_PATTERN` and the safe-path rules block above.
+   * The verifier rejects any entry whose path is absolute, contains "..",
+   * contains backslashes, or duplicates another entry's path. The verifier
+   * does NOT follow symlinks or hardlinks during extraction.
+   */
   path: string;
   /** Hash algorithm. v1.1 ships only "sha256". */
   hash_alg: ExitBundleHashAlg;
   /** Hex-encoded artifact hash. */
   hash: string;
-  /** Size in bytes. Convenience field; verifier MAY skip if it independently sizes the file. */
+  /** Size in bytes. Verifier MAY independently re-size and reject on mismatch. */
   size_bytes: number;
   /**
    * Optional discriminator inside the kind, e.g., "audit-receipt-2026-Q2".
    * Verifier does not interpret this; the import command may use it to order
-   * artifacts.
+   * artifacts. Same path-pattern constraints DO NOT apply to subkind, but
+   * subkind MUST NOT contain control characters.
    */
   subkind?: string;
 }
@@ -80,6 +133,13 @@ export interface ExitBundleIdentityBinding {
 
 /**
  * v1 manifest body — what the operator's fortress-master signs.
+ *
+ * `signature_scheme` lives INSIDE the body deliberately so the scheme is
+ * covered by the fortress-master signature. Without this, an attacker who
+ * substituted both `signature` and `signature_scheme` on the wrapper could
+ * present a valid-looking manifest with a different scheme. Pinning the
+ * scheme inside the signed bytes makes the crypto-agility hinge non-
+ * substitutable.
  */
 export interface ExitBundleManifestBody {
   /** Manifest version constant. */
@@ -107,10 +167,20 @@ export interface ExitBundleManifestBody {
    * cross-reference with the source fortress audit chain.
    */
   export_approval_audit_id: string;
+  /**
+   * Signature scheme covering the wrapper's `signature` field. v1.1 ships
+   * only "ed25519-v1". Embedded inside the signed body so the scheme cannot
+   * be substituted independently of the signature.
+   */
+  signature_scheme: SignatureScheme;
 }
 
 /**
  * Full signed manifest. Top-level shape that ships in the bundle archive.
+ *
+ * The wrapper carries only the `signature` and a pointer to the body. The
+ * scheme that produced the signature lives inside `body.signature_scheme`,
+ * so the signature itself attests to which scheme produced it.
  */
 export interface ExitBundleManifest {
   /** Body — what the signature covers. */
@@ -118,11 +188,10 @@ export interface ExitBundleManifest {
   /**
    * Base64url-encoded Ed25519 signature over canonicalize(body) by the
    * fortress-master private key. The bundle archive is otherwise unsigned;
-   * artifact integrity comes from artifact hashes inside the body.
+   * artifact integrity comes from artifact hashes inside the body. The
+   * signing scheme is `body.signature_scheme`.
    */
   signature: string;
-  /** Signature scheme. v1.1 ships only "ed25519-v1". */
-  signature_scheme: SignatureScheme;
 }
 
 /**
@@ -160,10 +229,15 @@ export interface ExitBundleVerifierResult {
   failure_class?:
     | "manifest_signature_invalid"
     | "manifest_unknown_version"
+    | "manifest_signature_scheme_invalid"
     | "artifact_hash_mismatch"
     | "artifact_missing"
     | "artifact_size_mismatch"
     | "aggregate_hash_mismatch"
+    | "artifact_path_unsafe"
+    | "artifact_path_duplicate"
+    | "artifact_path_escapes_root"
+    | "archive_contains_symlink"
     | "private_material_present"
     | "other";
 }

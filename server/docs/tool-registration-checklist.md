@@ -23,7 +23,7 @@ A no-op rename does not require a fresh review, but the checklist entry MUST mov
 
 Pick one of:
 
-- `tier1` — Always requires human approval through the Principal Policy gate. Examples: `state_export`, `state_import`, `key_rotate`, `identity_delete`, `reputation_import`, `exit_bundle_export`, `exit_bundle_import`.
+- `tier1` — Always requires human approval through the Principal Policy gate. Examples (canonical names from `server/src/principal-policy/loader.ts`): `state_export`, `state_import`, `state_delete`, `identity_rotate`, `reputation_export`, `reputation_import`, `sanctuary_export_identity_bundle`, plus v1.1 additions `exit_bundle_export`, `exit_bundle_import`, `exit_bundle_rekey`, `policy_change`, `lockdown`, `unwrap` (these v1.1 names MUST be added to the loader's Tier 1 set in the same PR that lands their behavior).
 - `tier2` — Requires approval when behavioral anomaly detection triggers. Examples: an action against a new namespace, a new counterparty, or an unusual rate.
 - `tier3` — Auto-allow with audit logging.
 
@@ -47,12 +47,12 @@ Block conditions: any tool that egresses to a remote host MUST flow its outbound
 Pick one of:
 
 - A reference to an existing audit-event type in `server/src/audit/types.ts` (e.g., "L2 gate decision audit entry").
-- A new audit-event type committed in the same PR. New types MUST include: timestamp, identity id, agent id, tool name, tier, outcome, content hashes for any payload material, and `signature_scheme`.
+- A new audit-event type committed in the same PR. New types MUST include: timestamp, identity id, agent id, tool name, tier, outcome, and content hashes for any payload material. Signature lives on the enclosing audit-chain entry, not on the event payload itself.
 
 Block conditions:
 
 - The audit event MUST NOT carry raw sensitive content. Hashes only.
-- Every signed audit event MUST include `signature_scheme: "ed25519-v1"` per the v1.1 contracts (`server/src/contracts/v1.1/constants.ts`).
+- Every signed envelope (mesh-batch, handoff record, exit-bundle manifest) MUST include `signature_scheme: "ed25519-v1"` per the v1.1 contracts (`server/src/contracts/v1.1/constants.ts`). Audit-event payloads that are not themselves signed envelopes MUST flow through an enclosing audit-chain entry that verifies under the same scheme.
 - Tools that touch the privacy filter MUST emit a privacy event from `server/src/contracts/v1.1/privacy-events.ts` in addition to the L2 gate audit entry.
 - Tools that touch a handoff MUST emit a `LocalHandoffAuditEvent` from `server/src/contracts/v1.1/handoff-records.ts`.
 
@@ -72,34 +72,44 @@ Block conditions:
 
 ## How to fill out the checklist
 
-In the tool's source file, add a TSDoc block above the tool registration (or extend an existing block):
+The canonical source for the four declarations is a **structured registry** at `server/src/tool-registry/v1.1.ts` (lands in the v1.1 build wave). The registry is a typed map keyed by tool name; each entry carries the four declarations as enum values plus a human-readable `justification` string. CI parses the registry, not source comments. Comments are documentation, not the source of truth.
+
+Backends register a tool by importing the registry and adding an entry:
 
 ```ts
-/**
- * Tool: <name>
- *
- * Registration declarations (v1.1 tool-registration-checklist):
- * - policy_tier: tier1 | tier2 | tier3
- * - outbound_network: none | model_only | specific_allowlist[<hosts>] | wildcard_with_policy
- * - audit_event: <type or ref to types.ts>
- * - privacy_impact: no_external_data | model_context_only | external_payload | provider_credential_use
- *
- * Justification (one line per declaration; concrete enough that a reviewer
- * can challenge it without reading the implementation).
- */
+import { registerTool } from "../tool-registry/v1.1.js";
+
+registerTool({
+  name: "state_export",
+  policy_tier: "tier1",
+  outbound_network: "none",
+  audit_event: "L2_GATE_DECISION",
+  privacy_impact: "no_external_data",
+  justification: "Tier 1 because export is irreversible; no_external_data because the bundle stays on the operator's machine.",
+});
 ```
 
-The TSDoc block is the canonical source. CI parses the block and cross-checks it against the runtime registration in `server/src/principal-policy/loader.ts` and the audit-event registry. Drift between the TSDoc block and the registration table is a release blocker.
+Each tool's TSDoc block SHOULD reference the registry entry for human readers, but the TSDoc itself is documentation. Adding the same entry to the registry is mandatory; adding a TSDoc reference is recommended.
+
+The registry has runtime validators that:
+
+1. Cross-check `policy_tier` against `server/src/principal-policy/loader.ts`.
+2. Cross-check `outbound_network` against the egress policy registry.
+3. Cross-check `audit_event` against the audit types module.
+4. Cross-check `privacy_impact` against the privacy filter registration.
+5. Refuse to register a tool whose declarations conflict with the runtime gates.
+
+Drift between the registry and any runtime gate is a release blocker.
 
 ## CI gate
 
-A v1.1 follow-up workstream adds CI coverage that:
+A v1.1 follow-up workstream lands the registry validators above as a CI check. The check fails the build on:
 
-1. Requires every tool registered through `addTool` (or whatever the canonical registration helper is at the time the gate lands) to have all four declarations.
-2. Cross-checks `policy_tier` against the loader.
-3. Cross-checks `outbound_network` against the egress policy registry.
-4. Cross-checks `audit_event` against the audit types module.
-5. Cross-checks `privacy_impact` against the privacy filter registration.
+- A tool registered with the MCP server but missing from the registry.
+- A registry entry whose `policy_tier` disagrees with `principal-policy/loader.ts`.
+- A registry entry whose `outbound_network` disagrees with the egress policy registry.
+- A registry entry whose `audit_event` references an unknown type.
+- A registry entry whose `privacy_impact` is `model_context_only` or `external_payload` but is not bound to the privacy filter.
 
 Until that CI lands, the four declarations are required by reviewer convention. Pull requests that miss declarations are rejected without merge.
 

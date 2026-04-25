@@ -51,16 +51,17 @@ export type PrivacyDetectorClass =
  * Outbound destination categories. The privacy filter and the remote-bound
  * enforcement workstream agree on this enum so events compose end-to-end.
  *
- * Categories deliberately mirror the L2 ProviderCategory taxonomy without
- * importing across module boundaries. If the L2 category set grows, keep this
- * v1.1 list in lockstep through coordinator review.
+ * Categories deliberately mirror the L2 `ProviderCategory` taxonomy in
+ * `server/src/l2-operational/context-gate.ts` (hyphen form) so JSON-stable
+ * strings flow through both layers without translation. If the L2 category
+ * set grows, keep this v1.1 list in lockstep through coordinator review.
  */
 export const PRIVACY_DESTINATION_CATEGORIES = [
   "inference",
-  "tool_api",
+  "tool-api",
   "logging",
   "analytics",
-  "peer_agent",
+  "peer-agent",
   "custom",
 ] as const;
 export type PrivacyDestinationCategory =
@@ -80,6 +81,48 @@ export const PRIVACY_ACTIONS = [
   "rehydrate",
 ] as const;
 export type PrivacyAction = (typeof PRIVACY_ACTIONS)[number];
+
+/**
+ * Hash algorithm identifier embedded in every privacy event content_hash.
+ *
+ * v1.1 ships ONLY `hmac-sha256-fortress-keyed-v1`: HMAC-SHA-256 over the
+ * raw field value, using a per-fortress secret derived from the master key
+ * via HKDF info string `sanctuary-v1.1-privacy-content-hmac`. Plain SHA-256
+ * is NOT permitted because privacy field values (PII, project names, client
+ * names, file paths) are low-entropy and dictionary-attackable. The keyed
+ * hash makes content hashes meaningful for equality checks across events
+ * within a fortress while remaining opaque to anyone without the per-
+ * fortress key.
+ *
+ * Forward-compat: a future v1.x privacy hardening pass may add ML-DSA-keyed
+ * variants. Verifiers MUST reject unknown algorithms.
+ */
+export const PRIVACY_HASH_ALGS = [
+  "hmac-sha256-fortress-keyed-v1",
+] as const;
+export type PrivacyHashAlg = (typeof PRIVACY_HASH_ALGS)[number];
+
+/**
+ * Sanitized field-path schema for privacy events.
+ *
+ * Raw object keys CAN themselves leak sensitive information ("client_acme",
+ * "project_secret_launch"). v1.1 privacy events MUST emit field paths in
+ * sanitized form: a stable, fortress-local identifier mapped from the real
+ * path through the placeholder vault. Two formats are accepted on the wire:
+ *
+ *   - "$<n>" — opaque positional reference (e.g., "$0", "$1.$2"); the
+ *     fortress-local mapping resolves the index back to a path. Indices are
+ *     stable per-event but NOT stable across events (rotated per emission).
+ *
+ *   - "<schema>:<n>" — typed positional reference where <schema> is one of
+ *     a small enumerated set: "obj", "arr", "key", "val". Used when the
+ *     dashboard needs to render structural distinctions ("a key was
+ *     redacted" vs "a value was redacted") without revealing the real key.
+ *
+ * Real object keys MUST NOT appear in `field_path` on the wire. The
+ * privacy core is responsible for the sanitization step before emission.
+ */
+export const PRIVACY_FIELD_PATH_PATTERN = /^(\$[0-9]+|(?:obj|arr|key|val):[0-9]+)(?:\.(?:\$[0-9]+|(?:obj|arr|key|val):[0-9]+))*$/;
 
 /**
  * Hub inbox item kinds. Hub API and dashboard consume the same enum so the

@@ -16,15 +16,19 @@
  * provider tokens are not.
  */
 
-import type {
-  HubAgentStatus,
-  SignatureScheme,
-} from "./constants.js";
+import type { HubAgentStatus } from "./constants.js";
 
 /**
  * Coarse harness label. Mirrors the README-supported wrap targets at v1.1
  * ship. Adding a harness requires a new entry here plus harness-compatibility
  * coverage from Prompt 9.
+ *
+ * `mastra` has a first-class Tier B adapter at
+ * `server/src/agent-contract/adapters/mastra.ts` and is therefore a
+ * first-class kind here. `langgraph` does NOT have a dedicated adapter at
+ * v1.1 ship; LangGraph wraps land via the generic `sanctuary wrap --wrap
+ * <path>` path and surface as `generic_mcp`. When a dedicated LangGraph
+ * adapter ships, add `langgraph` here in the same PR.
  */
 export type LocalHarnessKind =
   | "openclaw"
@@ -32,6 +36,7 @@ export type LocalHarnessKind =
   | "claude_code"
   | "cursor"
   | "cline"
+  | "mastra"
   | "generic_mcp"
   | "other";
 
@@ -108,10 +113,20 @@ export interface LocalAgentRecord {
   /** Current lifecycle status as surfaced to the hub. */
   status: HubAgentStatus;
   /**
-   * Free-text reason for the current status. Templated where status is
-   * locked_down or error; absent otherwise.
+   * Reason class for the current status. Stable enum, not free text.
+   * Present only when status is `locked_down`, `error`, or `restarting`.
+   * The dashboard renders human-readable copy from a template catalog
+   * keyed by this value; backends MUST NOT emit raw reason text.
    */
-  status_reason?: string;
+  status_reason_class?:
+    | "operator_lockdown"
+    | "policy_breach"
+    | "budget_hard_cap"
+    | "harness_error"
+    | "harness_unreachable"
+    | "passphrase_required"
+    | "config_drift"
+    | "other";
   /** Budget summary snapshot. */
   budget_summary: LocalAgentBudgetSummary;
   /** ISO8601 timestamp of last agent activity. */
@@ -131,13 +146,17 @@ export interface LocalAgentRecord {
     can_chat: boolean;
     can_change_template: boolean;
   };
-  /**
-   * Signature scheme on any signed audit entries that reference this record.
-   * Surfacing the scheme here lets the dashboard show "ed25519-v1" alongside
-   * the agent without crawling the audit chain.
-   */
-  signature_scheme: SignatureScheme;
 }
+
+/**
+ * Note on signing:
+ * `LocalAgentRecord` is a read-from-storage projection of agent registry
+ * state. It is NOT a signed envelope. Signed audit entries that reference
+ * this record (wrap, unwrap, policy change, lockdown, etc.) carry the
+ * signature scheme on the enclosing audit-chain entry, not on the record
+ * itself. Consumers that need to verify a registry change MUST resolve
+ * through the audit chain.
+ */
 
 /**
  * Hub-side filter shape used by the registry list API. Workstreams may extend

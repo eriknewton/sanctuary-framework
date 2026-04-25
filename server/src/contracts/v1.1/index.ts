@@ -22,6 +22,14 @@
  * v1.1 ships local-only, single-operator scope. Cross-fortress, fleet,
  * public-federation, mobile-native runtime, payments, and compliance-pack
  * shapes are out of scope and live in v1.2 / v1.3 / v1.4+ contract surfaces.
+ *
+ * Internal-only export surface:
+ * These contracts are internal types for the v1.1 build wave. They are NOT
+ * part of the published `@sanctuary-framework/mcp-server` package's public
+ * export surface and carry no external SemVer stability guarantees. The
+ * outward-facing public-API surface is the Agent Contract on the W3C AIVS
+ * track, plus a future `@sanctuary-framework/agent-bundle` (v1.4+). External
+ * consumers MUST NOT import from this path.
  */
 
 export * from "./constants.js";

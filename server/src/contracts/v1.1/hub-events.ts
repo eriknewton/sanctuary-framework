@@ -3,8 +3,10 @@
  *
  * Shared shapes for the unified inbox, the activity feed, and the per-agent
  * status panels. The operator hub API workstream (Prompt 5) emits these; the
- * dashboard UI workstream (Prompt 8) consumes them; the mobile-companion
- * planning workstream (Prompt 11) targets the same shapes for v1.2.
+ * dashboard UI workstream (Prompt 8) consumes them. v1.2 mobile companion
+ * planning will evaluate these shapes when it scopes a phone surface, but
+ * v1.1 does not commit to mobile compatibility — these contracts are
+ * tuned for the local dashboard surface only.
  *
  * Local-only invariant:
  * Every event in this file describes activity inside a single fortress on a
@@ -21,11 +23,37 @@
 import type {
   HubAgentStatus,
   HubInboxKind,
-  SignatureScheme,
+  PrivacyDestinationCategory,
 } from "./constants.js";
 
 /**
+ * Allowed value space for `display_template_args`. Only safe primitives plus
+ * a small enumerated value set are permitted. Free-form strings ARE NOT
+ * accepted; the dashboard rejects rendering on any value outside this union.
+ *
+ * The renderer treats every value as data to interpolate into a fixed
+ * template registered under `template_id` — never as raw content. This
+ * defends against secrets, query text, file paths, and client names leaking
+ * into inbox cards via stringly-typed display fields.
+ */
+export type HubDisplayTemplateArg =
+  | { kind: "agent_id"; value: string }
+  | { kind: "identity_id"; value: string }
+  | { kind: "policy_id"; value: string }
+  | { kind: "destination_category"; value: PrivacyDestinationCategory }
+  | { kind: "tier"; value: "tier1" | "tier2" | "tier3" }
+  | { kind: "count"; value: number }
+  | { kind: "iso8601"; value: string }
+  | { kind: "duration_ms"; value: number };
+
+/**
  * Common header on every v1.1 hub inbox item.
+ *
+ * Display rendering uses a `template_id` plus typed args, NOT free-form
+ * strings. The dashboard owns the template registry; backends only emit the
+ * id and the args. This makes secret-leakage into inbox copy structurally
+ * impossible: a backend cannot smuggle raw query content into a card by
+ * accident, because there is no free-text channel.
  */
 export interface HubInboxItemHeader {
   /** v1.1 event-shape version. */
@@ -41,14 +69,19 @@ export interface HubInboxItemHeader {
   /** Operator identity id. */
   identity_id: string;
   /**
-   * Display title for the dashboard card. MUST NOT contain raw sensitive content;
-   * generated from a small set of templated strings.
+   * Display template id. Resolved by the dashboard against a registered
+   * template catalog; the catalog owns the actual render strings. Backends
+   * MUST NOT emit raw display copy. Template id space is namespaced per
+   * inbox kind, e.g., "approval_pending.tier1.export".
    */
-  display_title: string;
+  display_template_id: string;
   /**
-   * Optional one-line subtitle. Same constraints as display_title.
+   * Typed args interpolated into the template. Every value MUST be a
+   * `HubDisplayTemplateArg` instance — no free-form strings. Renderers
+   * reject any arg outside this union, which structurally blocks secret
+   * leakage via inbox copy.
    */
-  display_subtitle?: string;
+  display_template_args: HubDisplayTemplateArg[];
   /** Whether the operator has resolved this inbox item. */
   resolved: boolean;
   /** ISO8601 timestamp of resolution, if resolved. */
@@ -64,17 +97,24 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
   tier: "tier1" | "tier2";
   /**
    * Coarse operation category. Stable enum so the UI can group consistently;
-   * does not reveal underlying tool args.
+   * does not reveal underlying tool args. Names align with the canonical
+   * Tier 1 / Tier 2 sets in `server/src/principal-policy/loader.ts`. Names
+   * NOT in the canonical loader (e.g., `exit_bundle_export`, `policy_change`,
+   * `lockdown`, `unwrap`) are v1.1-new and MUST be added to the loader's
+   * Tier 1 set in the same PR that lands their behavior. Drift is a release
+   * blocker.
    */
   operation_category:
     | "state_export"
     | "state_import"
-    | "key_rotate"
-    | "identity_delete"
+    | "state_delete"
+    | "identity_rotate"
+    | "reputation_export"
     | "reputation_import"
+    | "sanctuary_export_identity_bundle"
     | "exit_bundle_export"
     | "exit_bundle_import"
-    | "rekey"
+    | "exit_bundle_rekey"
     | "policy_change"
     | "lockdown"
     | "unwrap"
@@ -89,10 +129,11 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
 export interface HubBlockedEgressItem extends HubInboxItemHeader {
   kind: "blocked_egress";
   /**
-   * Coarse destination category. Mirrors the privacy destination categories
-   * for consistency in the unified inbox.
+   * Destination category. Same enum as the privacy filter so unified inbox,
+   * privacy panel, and egress dashboards group consistently. Drift is a
+   * release blocker.
    */
-  destination_category: string;
+  destination_category: PrivacyDestinationCategory;
   /**
    * Why the egress was blocked. Coarse enum, not free text. Specific policy
    * rule names are NOT revealed.
@@ -177,6 +218,11 @@ export type HubInboxItem =
  * Activity feed entry. The feed is a flat stream backed by the audit chain;
  * inbox items often reference a feed entry, but feed entries are not always
  * inbox items.
+ *
+ * Activity feed entries are read-from-storage projections of audit-chain
+ * entries. They are NOT signed envelopes themselves; integrity derives from
+ * the underlying audit entry. Consumers that need to verify the feed entry
+ * MUST resolve it to the source audit entry by `entry_id` and verify there.
  */
 export interface HubActivityFeedEntry {
   version: "1.1";
@@ -200,11 +246,13 @@ export interface HubActivityFeedEntry {
     | "config"
     | "other";
   /**
-   * Coarse summary text. Templated; no raw sensitive content.
+   * Display template id. Resolved by the dashboard against the activity-feed
+   * template catalog. Backends MUST NOT emit raw summary text — the template
+   * id plus typed args is the only legitimate channel.
    */
-  summary: string;
-  /** Underlying signature scheme on the source audit entry. */
-  signature_scheme: SignatureScheme;
+  display_template_id: string;
+  /** Typed args. Same constraints as `HubInboxItemHeader.display_template_args`. */
+  display_template_args: HubDisplayTemplateArg[];
 }
 
 /**
@@ -216,8 +264,20 @@ export interface HubAgentStatusSnapshot {
   version: "1.1";
   agent_id: string;
   status: HubAgentStatus;
-  /** Reason text for the current status, when status is locked_down or error. */
-  status_reason?: string;
+  /**
+   * Reason class for the current status. Same enum as
+   * `LocalAgentRecord.status_reason_class`. Stable, not free text. Present
+   * only when status is `locked_down`, `error`, or `restarting`.
+   */
+  status_reason_class?:
+    | "operator_lockdown"
+    | "policy_breach"
+    | "budget_hard_cap"
+    | "harness_error"
+    | "harness_unreachable"
+    | "passphrase_required"
+    | "config_drift"
+    | "other";
   /** ISO8601 last-seen timestamp. */
   last_activity_at: string;
   /** Inbox-item ids currently unresolved against this agent. */
