@@ -64,6 +64,32 @@ export interface HubTier1ApprovalEnqueuedResult {
 }
 
 /**
+ * Result returned from a fortress-scope Tier-1 action that has been
+ * deferred to operator approval. Distinguished from the per-agent shape by
+ * the absence of `agent_id` and the presence of `fortress_scope: true`.
+ * The Tier 1 handler iterates fortress-wide on approval; nothing executes
+ * until the operator resolves the inbox item.
+ */
+export interface HubTier1FortressApprovalEnqueuedResult {
+  inbox_item_id: string;
+  status: "approval_pending";
+  operation_category: HubApprovalPendingItem["operation_category"];
+  /** Always true. Distinguishes from the per-agent shape. */
+  fortress_scope: true;
+}
+
+/**
+ * Result returned from `fortressExportBundle` after a fortress-scope
+ * exit-bundle export approval lands. Surfaced both in the inbox item's
+ * `resolution_payload` and (separately) in an activity feed entry.
+ */
+export interface HubFortressExportResult {
+  bundle_dir: string;
+  manifest_hash: string;
+  artifact_count: number;
+}
+
+/**
  * Generic capability check delegated to the underlying harness controller.
  * The hub never performs the harness-side action itself; it asks the
  * controller to apply a transition and reports the new status back.
@@ -263,6 +289,15 @@ export interface HubServiceDeps {
   policyBudgetSources: HubPolicyAndBudgetSources;
   /** Underlying agent controller for control endpoints. */
   agentController: HubAgentController;
+  /**
+   * Optional fortress-scope exit-bundle export callback. Invoked only
+   * after a fortress-scope Tier 1 approval lands. The callback owns its
+   * own dependency wiring (storage, masterKey, identityManager, auditLog,
+   * policy, reputationStore, state namespaces); the hub layer remains
+   * crypto-agnostic. When omitted, the fortress export endpoint returns
+   * `HubCapabilityError`.
+   */
+  fortressExportBundle?: () => Promise<HubFortressExportResult>;
   /**
    * Clock override for deterministic timestamp emission in tests.
    * Defaults to `() => new Date()` when omitted.

@@ -50,9 +50,11 @@ import { aggregateActivity } from "./activity-feed.js";
 import type {
   HubAgentControlResult,
   HubBudgetSummary,
+  HubFortressExportResult,
   HubPolicySummary,
   HubServiceDeps,
   HubTier1ApprovalEnqueuedResult,
+  HubTier1FortressApprovalEnqueuedResult,
 } from "./types.js";
 
 function isTier1ControlAction(
@@ -355,6 +357,182 @@ export class HubService {
       record.agent_id,
       templateId,
     );
+  }
+
+  // ── Fortress-scope Tier 1 actions ──────────────────────────────────
+
+  /**
+   * Enqueue a fortress-scope Tier 1 lockdown. One inbox item is created;
+   * on operator approval the handler iterates `agentController.lockdown`
+   * over every wrapped agent for the bound identity, captures partial
+   * failures as per-agent `agent_error` inbox items, and emits a single
+   * `lifecycle` activity entry. Stacked fortress lockdowns are rejected
+   * with `HubConflictError` until the prior pending item resolves.
+   */
+  enqueueFortressLockdown(): HubTier1FortressApprovalEnqueuedResult {
+    this.assertNoPendingFortressTier1("lockdown");
+
+    const itemId = `tier1.fortress.lockdown.${randomUUID()}`;
+    const item: HubApprovalPendingItem = {
+      version: "1.1",
+      item_id: itemId,
+      kind: "approval_pending",
+      created_at: this.nowIso(),
+      identity_id: this.deps.identityId,
+      display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.approval_pending}.tier1.fortress_lockdown`,
+      display_template_args: [
+        { kind: "identity_id", value: this.deps.identityId },
+        { kind: "tier", value: "tier1" },
+      ],
+      resolved: false,
+      tier: "tier1",
+      operation_category: "lockdown",
+    };
+
+    this.inboxStore.enqueueTier1(item, async (_approvedItem, decision) => {
+      if (decision === "deny") return;
+      const records = this.deps.agentRegistry.list({
+        identity_id: this.deps.identityId,
+      });
+      const failed: Array<{ agent_id: string; error: string }> = [];
+      for (const record of records) {
+        try {
+          const status = await this.deps.agentController.lockdown(
+            record.agent_id,
+          );
+          this.deps.agentRegistry.updateStatus(
+            record.agent_id,
+            status,
+            "operator_lockdown",
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          failed.push({ agent_id: record.agent_id, error: msg });
+        }
+      }
+      // One fortress-level activity entry, regardless of partial-failure
+      // count. Per-agent failures surface as individual agent_error items
+      // below.
+      this.deps.activitySources.auditLog.append(
+        "l2",
+        "fortress_lockdown_engaged",
+        this.deps.identityId,
+        {
+          fortress_id: this.deps.fortressId,
+          locked_count: records.length - failed.length,
+          failed_count: failed.length,
+        },
+      );
+      // One agent_error inbox item per per-agent failure; the operator
+      // sees both the fortress success AND the failed agents.
+      for (const f of failed) {
+        const errId = `fortress.lockdown.error.${f.agent_id}.${randomUUID()}`;
+        this.inboxStore.upsertFromSource({
+          version: "1.1",
+          item_id: errId,
+          kind: "agent_error",
+          created_at: this.nowIso(),
+          identity_id: this.deps.identityId,
+          agent_id: f.agent_id,
+          display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.agent_error}.E_FORTRESS_LOCKDOWN_FAILED`,
+          display_template_args: [
+            { kind: "agent_id", value: f.agent_id },
+          ],
+          resolved: false,
+          error_class: "E_FORTRESS_LOCKDOWN_FAILED",
+          agent_still_active: true,
+        });
+      }
+    });
+
+    return {
+      inbox_item_id: itemId,
+      status: "approval_pending",
+      operation_category: "lockdown",
+      fortress_scope: true,
+    };
+  }
+
+  /**
+   * Enqueue a fortress-scope Tier 1 exit-bundle export. One inbox item is
+   * created; on operator approval the handler invokes
+   * `fortressExportBundle()` once at fortress scope, attaches
+   * `bundle_dir` + `manifest_hash` + `artifact_count` to the inbox item's
+   * `resolution_payload`, and emits a `lifecycle` activity entry.
+   * Stacked exports are rejected with `HubConflictError`.
+   */
+  enqueueFortressExportBundle(): HubTier1FortressApprovalEnqueuedResult {
+    if (!this.deps.fortressExportBundle) {
+      throw new HubCapabilityError("fortress_exit_bundle_export");
+    }
+    this.assertNoPendingFortressTier1("exit_bundle_export");
+
+    const itemId = `tier1.fortress.exit_bundle_export.${randomUUID()}`;
+    const item: HubApprovalPendingItem = {
+      version: "1.1",
+      item_id: itemId,
+      kind: "approval_pending",
+      created_at: this.nowIso(),
+      identity_id: this.deps.identityId,
+      display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.approval_pending}.tier1.fortress_exit_bundle_export`,
+      display_template_args: [
+        { kind: "identity_id", value: this.deps.identityId },
+        { kind: "tier", value: "tier1" },
+      ],
+      resolved: false,
+      tier: "tier1",
+      operation_category: "exit_bundle_export",
+    };
+
+    const fortressExportBundle = this.deps.fortressExportBundle;
+    this.inboxStore.enqueueTier1(item, async (_approvedItem, decision) => {
+      if (decision === "deny") return;
+      const result: HubFortressExportResult = await fortressExportBundle();
+      this.deps.activitySources.auditLog.append(
+        "l2",
+        "exit_bundle_exported",
+        this.deps.identityId,
+        {
+          fortress_id: this.deps.fortressId,
+          bundle_dir: result.bundle_dir,
+          manifest_hash: result.manifest_hash,
+          artifact_count: result.artifact_count,
+        },
+      );
+      return {
+        resolution_payload: {
+          bundle_dir: result.bundle_dir,
+          manifest_hash: result.manifest_hash,
+          artifact_count: result.artifact_count,
+        },
+      };
+    });
+
+    return {
+      inbox_item_id: itemId,
+      status: "approval_pending",
+      operation_category: "exit_bundle_export",
+      fortress_scope: true,
+    };
+  }
+
+  /**
+   * Reject stacked fortress-scope Tier 1 items. The check scans the inbox
+   * store for an unresolved `approval_pending` item with the same
+   * `operation_category` and no `agent_id` (the fortress-scope marker).
+   */
+  private assertNoPendingFortressTier1(
+    operationCategory: HubApprovalPendingItem["operation_category"],
+  ): void {
+    for (const item of this.inboxStore.list()) {
+      if (item.kind !== "approval_pending") continue;
+      if (item.resolved) continue;
+      if (item.agent_id !== undefined) continue;
+      if (item.operation_category !== operationCategory) continue;
+      throw new HubConflictError(
+        `fortress-scope ${operationCategory} already pending; resolve the existing inbox item first`,
+      );
+    }
   }
 
   // ── Activity feed ───────────────────────────────────────────────────

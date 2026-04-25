@@ -14,7 +14,11 @@ export * from "./constants.js";
 export * from "./errors.js";
 export * from "./types.js";
 export { InMemoryLocalAgentRegistry } from "./agent-registry.js";
-export { HubInboxStore, type Tier1ResolutionHandler } from "./inbox-store.js";
+export {
+  HubInboxStore,
+  type Tier1HandlerResult,
+  type Tier1ResolutionHandler,
+} from "./inbox-store.js";
 export { aggregateInbox } from "./inbox-aggregator.js";
 export { aggregateActivity, type HubActivityCategory } from "./activity-feed.js";
 export { HubService } from "./hub-service.js";

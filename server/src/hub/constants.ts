@@ -41,7 +41,24 @@ export const HUB_ROUTES = {
   ACTIVITY_LIST: "/api/hub/activity",
   POLICIES_LIST: "/api/hub/policies",
   BUDGETS_LIST: "/api/hub/budgets",
+  /**
+   * Fortress-scope Tier 1 control routes (closes binding addendum 8.1).
+   * One inbox item per call, fortress-scope iteration on approve.
+   */
+  FORTRESS_LOCKDOWN: "/api/hub/fortress/lockdown",
+  FORTRESS_EXIT_BUNDLE_EXPORT: "/api/hub/fortress/exit-bundle/export",
 } as const;
+
+/**
+ * Sentinel agent_id the v1.1 dashboard sends on the per-agent control
+ * routes when it intends fortress-scope. The router treats the sentinel as
+ * an alias for the canonical fortress route so the dashboard's existing
+ * 404 toast workaround retires automatically once these endpoints land.
+ *
+ * The sentinel is a routing-layer alias only; the canonical paths in
+ * `HUB_ROUTES.FORTRESS_*` remain the documented surface.
+ */
+export const HUB_FORTRESS_AGENT_ID_SENTINEL = "all" as const;
 
 /**
  * Inbox-resolve actions. The router rejects any other action token.

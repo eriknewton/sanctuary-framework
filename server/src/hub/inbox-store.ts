@@ -24,11 +24,21 @@ import { HubConflictError, HubNotFoundError } from "./errors.js";
  * Callback the store invokes when an enqueued Tier 1 inbox item is approved.
  * The hub-service registers a handler at enqueue time so the store stays
  * decoupled from the agent controller.
+ *
+ * The handler MAY return a `Tier1HandlerResult` carrying a
+ * `resolution_payload` to attach to the inbox item before the store flips
+ * `resolved`. Used by fortress-scope `exit_bundle_export` to surface
+ * `bundle_dir` + `manifest_hash` to the dashboard exit-drill wizard.
+ * Returning `void` is equivalent to no payload.
  */
 export type Tier1ResolutionHandler = (
   item: HubApprovalPendingItem,
   decision: "approve" | "deny",
-) => Promise<void>;
+) => Promise<Tier1HandlerResult | void>;
+
+export interface Tier1HandlerResult {
+  resolution_payload?: HubApprovalPendingItem["resolution_payload"];
+}
 
 interface StoredEntry {
   item: HubInboxItem;
@@ -110,13 +120,14 @@ export class HubInboxStore {
       throw new HubConflictError(`inbox item ${itemId} already resolved`);
     }
 
+    let handlerResult: Tier1HandlerResult | void = undefined;
     if (entry.tier1Handler && entry.item.kind === "approval_pending") {
       if (decision === "dismiss") {
         throw new HubConflictError(
           "tier 1 approval items cannot be dismissed; use approve or deny",
         );
       }
-      await entry.tier1Handler(
+      handlerResult = await entry.tier1Handler(
         entry.item as HubApprovalPendingItem,
         decision,
       );
@@ -124,11 +135,24 @@ export class HubInboxStore {
 
     entry.resolved = true;
     entry.resolved_at = nowIso;
-    entry.item = {
-      ...entry.item,
-      resolved: true,
-      resolved_at: nowIso,
-    };
+    const resolutionPayload =
+      handlerResult && handlerResult.resolution_payload
+        ? handlerResult.resolution_payload
+        : undefined;
+    if (entry.item.kind === "approval_pending" && resolutionPayload) {
+      entry.item = {
+        ...(entry.item as HubApprovalPendingItem),
+        resolved: true,
+        resolved_at: nowIso,
+        resolution_payload: resolutionPayload,
+      };
+    } else {
+      entry.item = {
+        ...entry.item,
+        resolved: true,
+        resolved_at: nowIso,
+      };
+    }
     return entry.item;
   }
 
