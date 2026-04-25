@@ -21,6 +21,8 @@ import type { ClientManager } from "./client-manager.js";
 import type { InjectionDetector } from "../security/injection-detector.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 import type { CallGovernor } from "../l2-operational/call-governor.js";
+import type { LocalPrivacyEngine, PrivacyPolicy } from "../l2-operational/privacy-core.js";
+import type { PrivacyDestinationCategory } from "../contracts/v1.1/index.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -32,6 +34,30 @@ export interface ProxyRouterOptions {
   ) => Promise<Record<string, unknown>>;
   /** Optional call governor for runtime governance */
   governor?: CallGovernor;
+  /**
+   * Optional v1.1 remote-bound privacy enforcement.
+   *
+   * When set, every proxied tool call is routed through
+   * `engine.filterOutbound` before the upstream forward. The bound
+   * `PrivacyPolicy` is resolved per-server via `policyResolver`, and the
+   * destination category comes from the server's `destination_category`
+   * field (defaulting to `tool-api` when absent).
+   *
+   * Fail-closed semantics:
+   * - `policyResolver` returns null when no policy is bound for the server;
+   *   the privacy engine treats that as `fail_closed_no_policy` and denies.
+   * - `policyResolver` rejecting (vault unreachable, decrypt failure, etc.)
+   *   is treated as `fail_closed_filter_error` and denies.
+   * - Operator overrides on the policy (`operator_override.allow_on_*`)
+   *   are honored by the engine itself.
+   */
+  privacyEnforcement?: {
+    engine: LocalPrivacyEngine;
+    policyResolver: (
+      server: string,
+      identityId: string | undefined
+    ) => Promise<PrivacyPolicy | null>;
+  };
   /** Optional callback after each proxy call decision (for dashboard feed) */
   onProxyCall?: (data: {
     tool: string;
@@ -212,6 +238,67 @@ export class ProxyRouter {
           }
         }
 
+        // Step 3.5: v1.1 remote-bound privacy enforcement.
+        // When configured, route the outbound payload through the
+        // LocalPrivacyEngine. On `denied`, short-circuit fail-closed before
+        // any bytes leave the fortress. On `filtered`, replace the args with
+        // the redacted payload so the upstream call never sees raw values.
+        // Track the bound policy so the response can be rehydrated below.
+        let privacyPolicy: PrivacyPolicy | null = null;
+        let privacyDestination: PrivacyDestinationCategory = "tool-api";
+        let outboundFiltered = false;
+        if (this.options.privacyEnforcement) {
+          const serverConfig = this.clientManager.getServerConfig(serverName);
+          privacyDestination =
+            (serverConfig?.destination_category as PrivacyDestinationCategory | undefined) ??
+            "tool-api";
+          const identityId = serverConfig?.privacy_identity_id;
+          try {
+            privacyPolicy = await this.options.privacyEnforcement.policyResolver(
+              serverName,
+              identityId
+            );
+          } catch {
+            privacyPolicy = null;
+          }
+
+          const decision = await this.options.privacyEnforcement.engine.filterOutbound({
+            payload: filteredArgs,
+            policy: privacyPolicy,
+            identity_id: identityId,
+            agent_id: `proxy:${serverName}`,
+            destination_category: privacyDestination,
+            audit_log: this.auditLog,
+          });
+
+          if (decision.status === "denied") {
+            this.auditLog.append("l2", `proxy_privacy_denied:${proxyName}`, "system", {
+              server: serverName,
+              tool: toolName,
+              tier,
+              denial_reason_class: decision.audit_payload.denial_reason_class,
+              latency_ms: Date.now() - start,
+            }, "failure");
+            this.notifyProxyCall(
+              proxyName,
+              serverName,
+              "blocked",
+              "privacy_denied",
+              tier
+            );
+            return toolResult({
+              error: "Operation not permitted",
+              proxy: true,
+              privacy_denied: true,
+            });
+          }
+
+          if (decision.status === "filtered") {
+            outboundFiltered = true;
+            filteredArgs = decision.payload as Record<string, unknown>;
+          }
+        }
+
         // Step 4: Forward to upstream server
         const result = await this.callWithTimeout(
           serverName,
@@ -237,6 +324,32 @@ export class ProxyRouter {
         });
 
         this.notifyProxyCall(proxyName, serverName, "allowed", undefined, tier);
+
+        // Step 7: v1.1 rehydration of upstream response.
+        // Only attempts rehydration if the outbound was filtered AND a policy
+        // is bound. Engine fails closed on denied rehydration (placeholders
+        // remain in the response unchanged); audit captures the decision.
+        if (outboundFiltered && this.options.privacyEnforcement && privacyPolicy) {
+          const serverConfig = this.clientManager.getServerConfig(serverName);
+          const identityId = serverConfig?.privacy_identity_id;
+          const rehydrated = await this.options.privacyEnforcement.engine.rehydrateResponse({
+            response: result,
+            policy: privacyPolicy,
+            identity_id: identityId,
+            agent_id: `proxy:${serverName}`,
+            destination_category: privacyDestination,
+            audit_log: this.auditLog,
+          });
+          if (rehydrated.status === "rehydrated") {
+            return this.normalizeResponse(
+              rehydrated.response as { content: Array<{ type: string; text?: string; [key: string]: unknown }> }
+            );
+          }
+          // Denied rehydration: caller sees placeholders unchanged.
+          return this.normalizeResponse(
+            (rehydrated.response as { content: Array<{ type: string; text?: string; [key: string]: unknown }> })
+          );
+        }
 
         // Return the upstream response, coerced to standard text format
         return this.normalizeResponse(result);
