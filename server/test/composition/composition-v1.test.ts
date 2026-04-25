@@ -353,6 +353,57 @@ describe("Composition v1.0", () => {
 
       await expect(svc.verifyReceipt(receipt)).resolves.toBe(true);
     }, 20000);
+
+    it("packReceipt with bounded_scope preserves field on round-trip", async () => {
+      svc = new CompositionService(
+        {
+          composition_enabled: true,
+          sidecar_script_path: SIDECAR_SCRIPT,
+          python_path: PYTHON_PATH,
+          sidecar_spawn_timeout_ms: 15000,
+          sidecar_rpc_timeout_ms: 10000,
+        },
+        WORKTREE_ROOT
+      );
+      await svc.start();
+
+      const event = buildTestCommitmentEvent({
+        bounded_scope: {
+          deliverable: "draft-spec-section",
+          deadline_or_terminal: "2026-05-01T00:00:00Z",
+          budget_ref: "budget-2026-Q2-ops",
+        },
+      });
+      const receipt = await svc.packReceipt(event);
+
+      expect(receipt.bounded_scope).toBeDefined();
+      expect(receipt.bounded_scope).toEqual(event.bounded_scope);
+    }, 20000);
+
+    it("packed receipt with bounded_scope verifies through the same real Concordia sidecar", async () => {
+      svc = new CompositionService(
+        {
+          composition_enabled: true,
+          sidecar_script_path: SIDECAR_SCRIPT,
+          python_path: PYTHON_PATH,
+          sidecar_spawn_timeout_ms: 15000,
+          sidecar_rpc_timeout_ms: 10000,
+        },
+        WORKTREE_ROOT
+      );
+      await svc.start();
+
+      const event = buildTestCommitmentEvent({
+        bounded_scope: {
+          deliverable: "draft-spec-section",
+          deadline_or_terminal: "2026-05-01T00:00:00Z",
+          budget_ref: "budget-2026-Q2-ops",
+        },
+      });
+      const receipt = await svc.packReceipt(event);
+
+      await expect(svc.verifyReceipt(receipt)).resolves.toBe(true);
+    }, 20000);
   });
 
   // =====================================================================

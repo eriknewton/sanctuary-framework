@@ -94,6 +94,7 @@ export async function packConcordiaReceipt(
     signature: result.signature as string,
     signature_scheme: SIDECAR_SIGNATURE_SCHEME,
     packed_at: result.packed_at as string ?? new Date().toISOString(),
+    bounded_scope: event.bounded_scope,
     attestation_metadata: result.attestation_metadata as Record<string, unknown> | undefined,
   };
 }
@@ -120,6 +121,7 @@ export async function verifyConcordiaReceipt(
     source_event_id: receipt.source_event_id,
     source_event_type: receipt.source_event_type,
     signature_scheme: receipt.signature_scheme,
+    bounded_scope: receipt.bounded_scope,
   });
 
   if (response.error) {

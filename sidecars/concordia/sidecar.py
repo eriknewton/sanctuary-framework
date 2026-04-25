@@ -129,6 +129,9 @@ def handle_verify_receipt(params: dict[str, Any]) -> dict[str, Any]:
         "packed_at": params.get("packed_at", ""),
     }
 
+    if params.get("bounded_scope"):
+        receipt_data["bounded_scope"] = params["bounded_scope"]
+
     signature = params.get("signature", "")
 
     try:
