@@ -1,0 +1,987 @@
+/**
+ * Sanctuary v1.1 — Operator Hub API regression suite (Prompt 5).
+ *
+ * Real-shape tests against an http server wired to a HubService backed by
+ * the in-memory agent registry, real AuditLog over MemoryStorage, and
+ * stub source callbacks for the inbox kinds. No mocks at the contract
+ * boundary — every endpoint is fetched over the network.
+ */
+
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import {
+  HUB_AGENT_CONTROL_ACTIONS,
+  HUB_API_PREFIX,
+  HUB_INBOX_TEMPLATE_NAMESPACES,
+  HUB_TIER_1_AGENT_CONTROL_ACTIONS,
+  HUB_VERSION,
+} from "../../src/hub/constants.js";
+import {
+  HubService,
+  InMemoryLocalAgentRegistry,
+  handleHubRoute,
+  type HubAgentController,
+  type HubInboxSources,
+  type HubAgentRegistrySource,
+  type HubBudgetSummary,
+  type HubPolicySummary,
+} from "../../src/hub/index.js";
+import type {
+  HubAgentErrorItem,
+  HubApprovalPendingItem,
+  HubBlockedEgressItem,
+  HubBudgetWarningItem,
+  HubInboxItem,
+  HubPrivacyEventItem,
+  HubRecoveryPromptItem,
+} from "../../src/contracts/v1.1/hub-events.js";
+import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
+import type { HubAgentStatus } from "../../src/contracts/v1.1/constants.js";
+import type { AuthConfig } from "../../src/console/auth-middleware.js";
+import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
+
+// ─────────────────────────────────────────────────────────────────────
+// Test fixtures
+// ─────────────────────────────────────────────────────────────────────
+
+const IDENTITY_ID = "operator-test-001";
+const FORTRESS_ID = "fortress-test-001";
+
+function makeAgent(
+  overrides: Partial<LocalAgentRecord> = {},
+): LocalAgentRecord {
+  const base: LocalAgentRecord = {
+    version: "1.1",
+    agent_id: "agent-alpha",
+    identity_id: IDENTITY_ID,
+    harness: "openclaw",
+    harness_version: "0.10.6",
+    model_provider: {
+      vendor: "anthropic",
+      model_id: "claude-opus-4-7",
+      runs_locally: false,
+    },
+    policy_id: "policy-default",
+    channel_template_id: "read-outputs-only",
+    status: "active",
+    budget_summary: {
+      daily: { unit: "tokens", cap: 100_000, used: 25_000, soft_warn: 0.8 },
+      monthly: { unit: "usd", cap: 100, used: 12, soft_warn: 0.75 },
+      last_refreshed_at: "2026-04-25T00:00:00.000Z",
+    },
+    last_activity_at: "2026-04-25T00:00:00.000Z",
+    wrapped_at: "2026-04-20T00:00:00.000Z",
+    capabilities: {
+      can_pause: true,
+      can_resume: true,
+      can_restart: true,
+      can_unwrap: true,
+      can_lockdown: true,
+      can_chat: true,
+      can_change_template: true,
+    },
+  };
+  return { ...base, ...overrides };
+}
+
+class StubAgentController implements HubAgentController {
+  calls: Array<{ action: string; agentId: string; arg?: unknown }> = [];
+
+  async pause(agentId: string): Promise<HubAgentStatus> {
+    this.calls.push({ action: "pause", agentId });
+    return "paused";
+  }
+  async resume(agentId: string): Promise<HubAgentStatus> {
+    this.calls.push({ action: "resume", agentId });
+    return "active";
+  }
+  async restart(agentId: string): Promise<HubAgentStatus> {
+    this.calls.push({ action: "restart", agentId });
+    return "active";
+  }
+  async unwrap(agentId: string): Promise<HubAgentStatus> {
+    this.calls.push({ action: "unwrap", agentId });
+    return "unwrapping";
+  }
+  async lockdown(agentId: string): Promise<HubAgentStatus> {
+    this.calls.push({ action: "lockdown", agentId });
+    return "locked_down";
+  }
+  async bindPolicy(agentId: string, policyId: string): Promise<void> {
+    this.calls.push({ action: "bindPolicy", agentId, arg: policyId });
+  }
+  async bindChannelTemplate(agentId: string, templateId: string): Promise<void> {
+    this.calls.push({
+      action: "bindChannelTemplate",
+      agentId,
+      arg: templateId,
+    });
+  }
+}
+
+interface InboxSourceState {
+  approvals: HubApprovalPendingItem[];
+  blockedEgress: HubBlockedEgressItem[];
+  privacy: HubPrivacyEventItem[];
+  budget: HubBudgetWarningItem[];
+  recovery: HubRecoveryPromptItem[];
+  agentErrors: HubAgentErrorItem[];
+}
+
+function makeInboxSources(state: InboxSourceState): HubInboxSources {
+  return {
+    listPendingApprovals: () => state.approvals,
+    listRecentBlockedEgress: () => state.blockedEgress,
+    listRecentPrivacyEvents: () => state.privacy,
+    listActiveBudgetWarnings: () => state.budget,
+    listActiveRecoveryPrompts: () => state.recovery,
+    listRecentAgentErrors: () => state.agentErrors,
+  };
+}
+
+function makeEmptyInboxState(): InboxSourceState {
+  return {
+    approvals: [],
+    blockedEgress: [],
+    privacy: [],
+    budget: [],
+    recovery: [],
+    agentErrors: [],
+  };
+}
+
+// Helpers to build a fully-populated inbox state.
+function seedInboxState(): InboxSourceState {
+  const baseHeader = {
+    version: "1.1" as const,
+    identity_id: IDENTITY_ID,
+    agent_id: "agent-alpha",
+    created_at: "2026-04-25T01:00:00.000Z",
+    resolved: false,
+  };
+  return {
+    approvals: [
+      {
+        ...baseHeader,
+        item_id: "approval-1",
+        kind: "approval_pending",
+        display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.approval_pending}.tier1.state_export`,
+        display_template_args: [
+          { kind: "agent_id", value: "agent-alpha" },
+          { kind: "tier", value: "tier1" },
+        ],
+        tier: "tier1",
+        operation_category: "state_export",
+      },
+    ],
+    blockedEgress: [
+      {
+        ...baseHeader,
+        item_id: "egress-1",
+        kind: "blocked_egress",
+        display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.blocked_egress}.policy_deny`,
+        display_template_args: [
+          { kind: "destination_category", value: "inference" },
+        ],
+        destination_category: "inference",
+        block_reason_class: "egress_policy_deny",
+      },
+    ],
+    privacy: [
+      {
+        ...baseHeader,
+        item_id: "privacy-1",
+        kind: "privacy_event",
+        display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.privacy_event}.denied`,
+        display_template_args: [
+          { kind: "destination_category", value: "tool-api" },
+        ],
+        privacy_event_id: "audit-priv-001",
+        privacy_event_kind: "denied",
+      },
+    ],
+    budget: [
+      {
+        ...baseHeader,
+        item_id: "budget-1",
+        kind: "budget_warning",
+        display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.budget_warning}.soft_warn`,
+        display_template_args: [{ kind: "count", value: 80 }],
+        bucket: "daily",
+        severity: "soft_warn",
+        used_fraction: 0.81,
+      },
+    ],
+    recovery: [
+      {
+        ...baseHeader,
+        item_id: "recovery-1",
+        kind: "recovery_prompt",
+        display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.recovery_prompt}.exit_drill`,
+        display_template_args: [{ kind: "agent_id", value: "agent-alpha" }],
+        recovery_class: "exit_drill",
+      },
+    ],
+    agentErrors: [
+      {
+        ...baseHeader,
+        item_id: "error-1",
+        kind: "agent_error",
+        display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.agent_error}.E_HARNESS_TIMEOUT`,
+        display_template_args: [{ kind: "agent_id", value: "agent-alpha" }],
+        error_class: "E_HARNESS_TIMEOUT",
+        agent_still_active: true,
+      },
+    ],
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Test rig: starts a real http server bound to handleHubRoute
+// ─────────────────────────────────────────────────────────────────────
+
+interface TestRig {
+  url: string;
+  service: HubService;
+  registry: HubAgentRegistrySource;
+  controller: StubAgentController;
+  inboxState: InboxSourceState;
+  auditLog: AuditLog;
+  authToken: string;
+  stop: () => Promise<void>;
+}
+
+interface RigOptions {
+  authConfig?: AuthConfig;
+  policySummaries?: HubPolicySummary[];
+  budgetSummaries?: HubBudgetSummary[];
+}
+
+async function startRig(options: RigOptions = {}): Promise<TestRig> {
+  const storage = new MemoryStorage();
+  const masterKey = randomBytes(32);
+  const auditLog = new AuditLog(storage, masterKey);
+
+  const registry = new InMemoryLocalAgentRegistry([makeAgent()]);
+  const controller = new StubAgentController();
+  const inboxState = makeEmptyInboxState();
+  const policySummaries = options.policySummaries ?? [];
+  const budgetSummaries = options.budgetSummaries ?? [];
+
+  const service = new HubService({
+    identityId: IDENTITY_ID,
+    fortressId: FORTRESS_ID,
+    agentRegistry: registry,
+    inboxSources: makeInboxSources(inboxState),
+    activitySources: { auditLog, identityId: IDENTITY_ID },
+    policyBudgetSources: {
+      listPolicySummaries: () => policySummaries,
+      listBudgetSummaries: () => budgetSummaries,
+    },
+    agentController: controller,
+  });
+
+  const authToken = options.authConfig?.authToken ?? "test-token-abc";
+  const authConfig: AuthConfig = options.authConfig ?? {
+    loopbackAutoAuth: false,
+    authToken,
+  };
+
+  const server: Server = createServer(
+    async (req: IncomingMessage, res: ServerResponse) => {
+      try {
+        const handled = await handleHubRoute(
+          { authConfig, service },
+          req,
+          res,
+        );
+        if (!handled) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({ ok: false, error: "not_found", path: req.url }),
+          );
+        }
+      } catch (err) {
+        try {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({ ok: false, error: (err as Error).message }),
+          );
+        } catch {
+          // socket already gone
+        }
+      }
+    },
+  );
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+
+  const addr = server.address();
+  if (!addr || typeof addr !== "object") throw new Error("no address");
+  const url = `http://127.0.0.1:${addr.port}`;
+
+  return {
+    url,
+    service,
+    registry,
+    controller,
+    inboxState,
+    auditLog,
+    authToken,
+    stop: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      }),
+  };
+}
+
+function withAuth(headers: HeadersInit, token: string): HeadersInit {
+  return { ...headers, Authorization: `Bearer ${token}` };
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Tests
+// ═════════════════════════════════════════════════════════════════════
+
+describe("Hub API constants", () => {
+  it("HUB_VERSION reads 1.1.0", () => {
+    expect(HUB_VERSION).toBe("1.1.0");
+  });
+
+  it("every control action surface mirrors a Tier 1 entry where applicable", () => {
+    for (const action of HUB_TIER_1_AGENT_CONTROL_ACTIONS) {
+      expect(DEFAULT_POLICY.tier1_always_approve).toContain(action);
+    }
+    // policy_change is not a control action token but lands as Tier 1 too.
+    expect(DEFAULT_POLICY.tier1_always_approve).toContain("policy_change");
+  });
+
+  it("exposes exactly five agent-control actions", () => {
+    expect([...HUB_AGENT_CONTROL_ACTIONS]).toEqual([
+      "pause",
+      "resume",
+      "restart",
+      "unwrap",
+      "lockdown",
+    ]);
+  });
+});
+
+describe("Hub inbox happy path (Test 1)", () => {
+  let rig: TestRig;
+
+  beforeEach(async () => {
+    rig = await startRig();
+    Object.assign(rig.inboxState, seedInboxState());
+  });
+  afterEach(async () => rig.stop());
+
+  it("returns one item per inbox kind with correct discriminator", async () => {
+    const res = await fetch(`${rig.url}${HUB_API_PREFIX}/inbox`, {
+      headers: withAuth({}, rig.authToken),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: true;
+      data: { items: HubInboxItem[] };
+    };
+    const kinds = new Set(body.data.items.map((i) => i.kind));
+    expect(kinds).toEqual(
+      new Set([
+        "approval_pending",
+        "blocked_egress",
+        "privacy_event",
+        "budget_warning",
+        "recovery_prompt",
+        "agent_error",
+      ]),
+    );
+    expect(body.data.items.length).toBe(6);
+    for (const item of body.data.items) {
+      expect(item.version).toBe("1.1");
+      expect(item.identity_id).toBe(IDENTITY_ID);
+      expect(typeof item.display_template_id).toBe("string");
+      expect(Array.isArray(item.display_template_args)).toBe(true);
+    }
+  });
+});
+
+describe("Hub inbox approve / deny (Test 2)", () => {
+  let rig: TestRig;
+
+  beforeEach(async () => {
+    rig = await startRig();
+    Object.assign(rig.inboxState, seedInboxState());
+  });
+  afterEach(async () => rig.stop());
+
+  it("POST .../approve flips an approval-pending item to resolved", async () => {
+    // Source items are not Tier-1 hub-enqueued, so approve resolves
+    // without a controller call.
+    const seedRes = await fetch(`${rig.url}${HUB_API_PREFIX}/inbox`, {
+      headers: withAuth({}, rig.authToken),
+    });
+    expect(seedRes.status).toBe(200);
+
+    const approveRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/approval-1/approve`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(approveRes.status).toBe(200);
+    const approveBody = (await approveRes.json()) as {
+      ok: true;
+      data: { item: HubInboxItem };
+    };
+    expect(approveBody.data.item.resolved).toBe(true);
+    expect(approveBody.data.item.resolved_at).toBeDefined();
+
+    // Subsequent GET reflects the resolution.
+    const afterRes = await fetch(`${rig.url}${HUB_API_PREFIX}/inbox`, {
+      headers: withAuth({}, rig.authToken),
+    });
+    const after = (await afterRes.json()) as {
+      ok: true;
+      data: { items: HubInboxItem[] };
+    };
+    const item = after.data.items.find((i) => i.item_id === "approval-1");
+    expect(item?.resolved).toBe(true);
+  });
+
+  it("POST .../deny flips a blocked-egress item via dismiss", async () => {
+    const denyRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/egress-1/dismiss`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(denyRes.status).toBe(200);
+    const body = (await denyRes.json()) as {
+      ok: true;
+      data: { item: HubInboxItem };
+    };
+    expect(body.data.item.resolved).toBe(true);
+  });
+
+  it("re-resolving a resolved item returns 409", async () => {
+    await fetch(`${rig.url}${HUB_API_PREFIX}/inbox`, {
+      headers: withAuth({}, rig.authToken),
+    });
+    await fetch(`${rig.url}${HUB_API_PREFIX}/inbox/approval-1/approve`, {
+      method: "POST",
+      headers: withAuth({}, rig.authToken),
+    });
+    const second = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/approval-1/approve`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(second.status).toBe(409);
+  });
+});
+
+describe("Hub agent registry list (Test 3)", () => {
+  let rig: TestRig;
+
+  beforeEach(async () => (rig = await startRig()));
+  afterEach(async () => rig.stop());
+
+  it("returns wrapped agents with full LocalAgentRecord shape", async () => {
+    const res = await fetch(`${rig.url}${HUB_API_PREFIX}/agents`, {
+      headers: withAuth({}, rig.authToken),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: true;
+      data: { agents: LocalAgentRecord[] };
+    };
+    expect(body.data.agents.length).toBe(1);
+    const a = body.data.agents[0]!;
+    expect(a.version).toBe("1.1");
+    expect(a.identity_id).toBe(IDENTITY_ID);
+    expect(a.harness).toBe("openclaw");
+    expect(a.policy_id).toBe("policy-default");
+    expect(a.budget_summary.daily?.cap).toBe(100_000);
+    expect(a.capabilities.can_pause).toBe(true);
+  });
+
+  it("GET /api/hub/agents/:id returns the record + status snapshot", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: true;
+      data: {
+        agent: LocalAgentRecord;
+        snapshot: { agent_id: string; status: HubAgentStatus };
+      };
+    };
+    expect(body.data.agent.agent_id).toBe("agent-alpha");
+    expect(body.data.snapshot.agent_id).toBe("agent-alpha");
+    expect(body.data.snapshot.status).toBe("active");
+  });
+});
+
+describe("Hub agent control endpoints (Test 4)", () => {
+  let rig: TestRig;
+
+  beforeEach(async () => (rig = await startRig()));
+  afterEach(async () => rig.stop());
+
+  it("pause then resume flips status and records both calls", async () => {
+    const pauseRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/pause`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(pauseRes.status).toBe(200);
+    const pauseBody = (await pauseRes.json()) as {
+      ok: true;
+      data: { prior_status: string; new_status: string };
+    };
+    expect(pauseBody.data.prior_status).toBe("active");
+    expect(pauseBody.data.new_status).toBe("paused");
+
+    const resumeRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/resume`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    const resumeBody = (await resumeRes.json()) as {
+      ok: true;
+      data: { prior_status: string; new_status: string };
+    };
+    expect(resumeBody.data.prior_status).toBe("paused");
+    expect(resumeBody.data.new_status).toBe("active");
+
+    expect(rig.controller.calls.map((c) => c.action)).toEqual([
+      "pause",
+      "resume",
+    ]);
+  });
+
+  it("Tier 1 lockdown does NOT execute synchronously; enqueues approval", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/lockdown`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as {
+      ok: true;
+      data: {
+        agent_id: string;
+        inbox_item_id: string;
+        status: string;
+        operation_category: string;
+      };
+    };
+    expect(body.data.status).toBe("approval_pending");
+    expect(body.data.operation_category).toBe("lockdown");
+    // No controller call yet — still pending.
+    expect(rig.controller.calls.length).toBe(0);
+
+    // Approving fires the controller call.
+    const approveRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/${encodeURIComponent(body.data.inbox_item_id)}/approve`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(approveRes.status).toBe(200);
+    expect(rig.controller.calls.map((c) => c.action)).toEqual(["lockdown"]);
+  });
+
+  it("Tier 1 unwrap denial does NOT call the controller", async () => {
+    const enqueue = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/unwrap`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    const enqueueBody = (await enqueue.json()) as {
+      ok: true;
+      data: { inbox_item_id: string };
+    };
+    const deny = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/${encodeURIComponent(enqueueBody.data.inbox_item_id)}/deny`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(deny.status).toBe(200);
+    expect(rig.controller.calls.length).toBe(0);
+  });
+
+  it("policy bind enqueues Tier 1 inbox item, not synchronous", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/policy`,
+      {
+        method: "POST",
+        headers: withAuth(
+          { "Content-Type": "application/json" },
+          rig.authToken,
+        ),
+        body: JSON.stringify({ policy_id: "policy-strict-001" }),
+      },
+    );
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as {
+      ok: true;
+      data: { operation_category: string; status: string };
+    };
+    expect(body.data.operation_category).toBe("policy_change");
+    expect(body.data.status).toBe("approval_pending");
+    expect(rig.controller.calls.length).toBe(0);
+  });
+
+  it("template bind is synchronous (not Tier 1) and updates the record", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/template`,
+      {
+        method: "POST",
+        headers: withAuth(
+          { "Content-Type": "application/json" },
+          rig.authToken,
+        ),
+        body: JSON.stringify({ channel_template_id: "bidirectional-sync" }),
+      },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: true;
+      data: { agent: LocalAgentRecord };
+    };
+    expect(body.data.agent.channel_template_id).toBe("bidirectional-sync");
+    expect(rig.controller.calls).toEqual([
+      {
+        action: "bindChannelTemplate",
+        agentId: "agent-alpha",
+        arg: "bidirectional-sync",
+      },
+    ]);
+  });
+});
+
+describe("Hub activity feed pagination (Test 5)", () => {
+  let rig: TestRig;
+
+  beforeEach(async () => (rig = await startRig()));
+  afterEach(async () => rig.stop());
+
+  it("respects since + limit", async () => {
+    rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
+      agent_id: "agent-alpha",
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    const cutoff = new Date().toISOString();
+    await new Promise((r) => setTimeout(r, 5));
+    rig.auditLog.append("l2", "egress_blocked", IDENTITY_ID, {
+      agent_id: "agent-alpha",
+    });
+    rig.auditLog.append("l2", "privacy_event", IDENTITY_ID, {
+      agent_id: "agent-alpha",
+    });
+    await rig.auditLog.flush();
+
+    const all = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?limit=10`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const allBody = (await all.json()) as {
+      ok: true;
+      data: { entries: Array<{ category: string; emitted_at: string }> };
+    };
+    expect(allBody.data.entries.length).toBe(3);
+    const categories = allBody.data.entries.map((e) => e.category).sort();
+    expect(categories).toContain("egress");
+    expect(categories).toContain("privacy");
+
+    const sinceRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?since=${encodeURIComponent(cutoff)}&limit=10`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const sinceBody = (await sinceRes.json()) as {
+      ok: true;
+      data: { entries: Array<{ category: string }> };
+    };
+    expect(sinceBody.data.entries.length).toBe(2);
+
+    const limited = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?limit=1`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const limitedBody = (await limited.json()) as {
+      ok: true;
+      data: { entries: unknown[] };
+    };
+    expect(limitedBody.data.entries.length).toBe(1);
+  });
+
+  it("filter by agent_id and category narrows results", async () => {
+    rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
+      agent_id: "agent-alpha",
+    });
+    rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
+      agent_id: "agent-beta",
+    });
+    rig.auditLog.append("l2", "egress_blocked", IDENTITY_ID, {
+      agent_id: "agent-beta",
+    });
+    await rig.auditLog.flush();
+
+    const filtered = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?agent_id=agent-beta&category=egress`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const body = (await filtered.json()) as {
+      ok: true;
+      data: { entries: Array<{ agent_id?: string; category: string }> };
+    };
+    expect(body.data.entries.length).toBe(1);
+    expect(body.data.entries[0]!.agent_id).toBe("agent-beta");
+    expect(body.data.entries[0]!.category).toBe("egress");
+  });
+});
+
+describe("Hub authorization (Test 6)", () => {
+  let rig: TestRig;
+
+  beforeEach(async () => (rig = await startRig()));
+  afterEach(async () => rig.stop());
+
+  it("rejects unauthenticated requests with 401", async () => {
+    const res = await fetch(`${rig.url}${HUB_API_PREFIX}/inbox`);
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects bad token with 401", async () => {
+    const res = await fetch(`${rig.url}${HUB_API_PREFIX}/agents`, {
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("loopback auto-auth lets localhost pass without token", async () => {
+    const loopbackRig = await startRig({
+      authConfig: { loopbackAutoAuth: true, authToken: "irrelevant" },
+    });
+    try {
+      const res = await fetch(
+        `${loopbackRig.url}${HUB_API_PREFIX}/agents`,
+      );
+      expect(res.status).toBe(200);
+    } finally {
+      await loopbackRig.stop();
+    }
+  });
+});
+
+describe("No raw secret in inbox (Test 7)", () => {
+  let rig: TestRig;
+  const MAGIC_SECRET = "PLAINTEXT_API_KEY_sk_supersecret_1234";
+
+  beforeEach(async () => {
+    rig = await startRig();
+    // Agent emits an error containing the magic string. The inbox source
+    // is responsible for sanitization; this test asserts the contract:
+    // raw error text MUST NOT cross the wire. The agent_error item
+    // carries an error_class token + typed args, never the raw string.
+    rig.inboxState.agentErrors.push({
+      version: "1.1",
+      item_id: "error-secret-1",
+      kind: "agent_error",
+      identity_id: IDENTITY_ID,
+      agent_id: "agent-alpha",
+      created_at: "2026-04-25T01:00:00.000Z",
+      display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.agent_error}.E_HARNESS_FAILURE`,
+      display_template_args: [{ kind: "agent_id", value: "agent-alpha" }],
+      resolved: false,
+      error_class: "E_HARNESS_FAILURE",
+      agent_still_active: false,
+    });
+  });
+  afterEach(async () => rig.stop());
+
+  it("inbox response body never contains the magic plaintext string", async () => {
+    const res = await fetch(`${rig.url}${HUB_API_PREFIX}/inbox`, {
+      headers: withAuth({}, rig.authToken),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain(MAGIC_SECRET);
+    expect(text).toContain("E_HARNESS_FAILURE");
+    expect(text).toContain("display_template_id");
+    expect(text).toContain("display_template_args");
+  });
+
+  it("registry shape rejects forbidden secret-shaped fields on put", () => {
+    const reg = new InMemoryLocalAgentRegistry();
+    expect(() =>
+      reg.put({
+        ...makeAgent(),
+        // @ts-expect-error — intentionally simulating bad backend code
+        api_key: "abc",
+      }),
+    ).toThrow(/forbidden secret-shaped field/);
+  });
+});
+
+describe("Local-only enforcement (Test 8)", () => {
+  let rig: TestRig;
+
+  beforeEach(async () => (rig = await startRig()));
+  afterEach(async () => rig.stop());
+
+  it("rejects fortress_id query parameter with 422", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox?fortress_id=other-fortress-001`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as { ok: false; error: string };
+    expect(body.error).toBe("HubLocalOnlyError");
+  });
+
+  it("rejects peer_id query parameter on agents listing", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents?peer_id=peer-001`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    expect(res.status).toBe(422);
+  });
+
+  it("rejects remote_fortress_id query parameter on activity feed", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?remote_fortress_id=rf-001`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    expect(res.status).toBe(422);
+  });
+});
+
+describe("Hub policy + budget summaries", () => {
+  it("returns the injected summary list", async () => {
+    const policySummaries: HubPolicySummary[] = [
+      {
+        policy_id: "policy-default",
+        display_label: "Default channel",
+        bound_at: "2026-04-25T00:00:00.000Z",
+        agent_count: 1,
+        channel_template_id: "read-outputs-only",
+      },
+    ];
+    const budgetSummaries: HubBudgetSummary[] = [
+      {
+        bucket_id: "daily-tokens",
+        display_label: "Daily tokens",
+        unit: "tokens",
+        cap: 100_000,
+        used: 25_000,
+        last_refreshed_at: "2026-04-25T00:00:00.000Z",
+      },
+    ];
+    const rig = await startRig({ policySummaries, budgetSummaries });
+    try {
+      const policiesRes = await fetch(
+        `${rig.url}${HUB_API_PREFIX}/policies`,
+        { headers: withAuth({}, rig.authToken) },
+      );
+      const policiesBody = (await policiesRes.json()) as {
+        ok: true;
+        data: { policies: HubPolicySummary[] };
+      };
+      expect(policiesBody.data.policies).toEqual(policySummaries);
+
+      const budgetsRes = await fetch(
+        `${rig.url}${HUB_API_PREFIX}/budgets`,
+        { headers: withAuth({}, rig.authToken) },
+      );
+      const budgetsBody = (await budgetsRes.json()) as {
+        ok: true;
+        data: { budgets: HubBudgetSummary[] };
+      };
+      expect(budgetsBody.data.budgets).toEqual(budgetSummaries);
+    } finally {
+      await rig.stop();
+    }
+  });
+});
+
+describe("Hub source-file contract scans", () => {
+  const srcFiles = [
+    "constants.ts",
+    "errors.ts",
+    "types.ts",
+    "agent-registry.ts",
+    "inbox-store.ts",
+    "inbox-aggregator.ts",
+    "activity-feed.ts",
+    "hub-service.ts",
+    "api-router.ts",
+    "index.ts",
+  ];
+
+  it("no concordia or verascore imports in hub source files", async () => {
+    const dir = join(
+      new URL(".", import.meta.url).pathname,
+      "..",
+      "..",
+      "src",
+      "hub",
+    );
+    for (const f of srcFiles) {
+      const content = await readFile(join(dir, f), "utf-8");
+      expect(content).not.toMatch(/from\s+["'].*concordia/i);
+      expect(content).not.toMatch(/from\s+["'].*verascore/i);
+    }
+  });
+
+  it("no em-dash characters in any hub source file", async () => {
+    const dir = join(
+      new URL(".", import.meta.url).pathname,
+      "..",
+      "..",
+      "src",
+      "hub",
+    );
+    for (const f of srcFiles) {
+      const content = await readFile(join(dir, f), "utf-8");
+      expect(content).not.toContain("—");
+    }
+  });
+
+  it("no MLS dead claims in any hub source file", async () => {
+    const dir = join(
+      new URL(".", import.meta.url).pathname,
+      "..",
+      "..",
+      "src",
+      "hub",
+    );
+    for (const f of srcFiles) {
+      const content = await readFile(join(dir, f), "utf-8");
+      expect(content).not.toMatch(/\bMLS\b|RFC\s*9420/);
+    }
+  });
+
+  it("no UBAI dead claims in any hub source file", async () => {
+    const dir = join(
+      new URL(".", import.meta.url).pathname,
+      "..",
+      "..",
+      "src",
+      "hub",
+    );
+    for (const f of srcFiles) {
+      const content = await readFile(join(dir, f), "utf-8");
+      expect(content).not.toMatch(/\bUBAI\b|Universal Basic AI|Universal Basic Intelligence/);
+    }
+  });
+});
