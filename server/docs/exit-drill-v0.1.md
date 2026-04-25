@@ -21,8 +21,8 @@ Out of scope for v0.1:
 - Cross-operator transfer
 - Hardware key transfer
 - Managed TEE migration
-- Full state re-keying UX
-- Third-party verifier UX
+- Dashboard state re-keying wizard
+- Third-party verifier UX beyond the standalone CLI
 
 ## Preconditions
 
@@ -40,61 +40,59 @@ Out of scope for v0.1:
    sanctuary agents
    ```
 
-2. Export agent state from the wrapped source agent through the approved Tier 1 flow:
+2. Export the complete exit bundle through the approved Tier 1 flow:
 
-   ```text
-   state_export
+   ```bash
+   sanctuary exit export --out ./sanctuary-exit-bundle
    ```
 
-   Acceptance: the export requires human approval and produces an export bundle.
+   Acceptance: the export requires human approval and produces a
+   `SANCTUARY_EXIT_BUNDLE_V1` directory containing public identity, encrypted
+   state, policy, audit receipts, reputation bundle, commitments,
+   placeholder-vault metadata, artifact hashes, and a signed manifest.
 
-3. Export reputation from the source agent:
+3. Verify the bundle before moving or importing it:
 
-   ```text
-   reputation_export
+   ```bash
+   sanctuary exit verify ./sanctuary-exit-bundle
    ```
 
-   Acceptance: the export bundle contains signed attestations and no private keys.
+   Acceptance: the verifier checks the manifest signature, every artifact hash,
+   public identity signature, reputation bundle signature, and verifiable
+   reputation attestation signatures. Legacy L2 audit receipts are pinned by
+   the signed manifest hash and reported as not individually signed.
 
-4. Export public identity material:
+4. Move the exported bundle to the destination machine through operator-approved storage.
 
-   ```text
-   sanctuary_export_identity_bundle
-   ```
-
-   Acceptance: the identity bundle contains public identity material, DID, SHR or attestation evidence when available, and no private keys.
-
-5. Move the exported bundles to the destination machine through operator-approved storage.
-
-6. Install or update Sanctuary on the destination machine:
+5. Install or update Sanctuary on the destination machine:
 
    ```bash
    npm install -g @sanctuary-framework/mcp-server@next
    ```
 
-7. Import state into the destination tenant:
+6. Import and activate the verified bundle on the destination tenant:
 
-   ```text
-   state_import
+   ```bash
+   sanctuary exit import ./sanctuary-exit-bundle \
+     --activate \
+     --source-passphrase "$SOURCE_SANCTUARY_PASSPHRASE" \
+     --destination-identity-id "$DESTINATION_SIGNER_ID"
    ```
 
-   Acceptance: import verifies signatures where public keys are available and reports conflicts before activation.
+   Acceptance: import verifies the bundle before activation, reports conflicts,
+   imports reputation attestations that verify against included public identity
+   material, stages audit/policy/commitment/placeholder metadata for inspection,
+   and re-keys encrypted state under the destination master key when source key
+   material and a destination signing identity are supplied. Imported material
+   that cannot be verified is skipped or explicitly marked unverifiable.
 
-8. Import reputation:
-
-   ```text
-   reputation_import
-   ```
-
-   Acceptance: imported attestations verify against known source identities or are marked unverifiable rather than trusted.
-
-9. Wrap the destination harness:
+7. Wrap the destination harness:
 
    ```bash
    sanctuary wrap --<harness>
    ```
 
-10. Open the dashboard and confirm:
+8. Open the dashboard and confirm:
 
     - Agent identity is visible.
     - Recent audit continuity is visible.
@@ -114,11 +112,14 @@ The exit drill passes only if all of the following are true:
 
 ## Current Gaps
 
-- No single command creates a complete exit bundle.
-- State import and reputation import are separate flows.
-- Re-keying imported encrypted state under a new master key is not yet an operator-facing wizard.
 - Dashboard does not yet guide the operator through the drill.
-- Third-party verification exists in pieces but is not packaged as a standalone verifier command.
+- Legacy L2 audit log entries are not individually signed; the exit verifier
+  pins audit receipts by signed manifest hash and reports that limitation.
+- Import stages principal policy for inspection instead of overwriting the
+  destination policy file automatically.
+- State re-keying requires source key material and a destination signing
+  identity; without both, encrypted state remains staged and is not trusted as
+  active destination state.
 
 ## Product Follow-Up
 
@@ -129,4 +130,3 @@ The dashboard exit wizard should automate this drill while preserving the same g
 - Separate public identity material from private recovery material.
 - Verify every imported artifact before activation.
 - Record the migration as a signed audit event.
-

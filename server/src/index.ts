@@ -970,6 +970,7 @@ export type { ProxyRouterOptions } from "./proxy/proxy-router.js";
 export { generateSystemPrompt } from "./system-prompt-generator.js";
 export { MemoryStorage } from "./storage/memory.js";
 export { FilesystemStorage } from "./storage/filesystem.js";
+export * from "./exit/index.js";
 export { ApprovalGate } from "./principal-policy/gate.js";
 export { BaselineTracker } from "./principal-policy/baseline.js";
 export { loadPrincipalPolicy } from "./principal-policy/loader.js";
