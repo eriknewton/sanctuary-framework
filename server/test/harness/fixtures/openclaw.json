@@ -1,0 +1,13 @@
+{
+  "mcp": {
+    "servers": {
+      "anthropic-mcp-files": {
+        "command": "node",
+        "args": ["fixtures/anthropic-mcp-files.js"],
+        "env": {
+          "ANTHROPIC_MCP_MODE": "fixture"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "mcp_servers": {
+    "hermes-a2a-fixture": {
+      "command": "node",
+      "args": ["fixtures/hermes-a2a.js"],
+      "env": {
+        "HERMES_A2A_MODE": "fixture"
+      }
+    }
+  }
+}
