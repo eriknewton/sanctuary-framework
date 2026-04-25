@@ -487,7 +487,12 @@ export class HubService {
     const fortressExportBundle = this.deps.fortressExportBundle;
     this.inboxStore.enqueueTier1(item, async (_approvedItem, decision) => {
       if (decision === "deny") return;
-      const result: HubFortressExportResult = await fortressExportBundle();
+      // Thread the inbox item id into the callback as the approval audit
+      // id so `exportExitBundle()` can embed it in the manifest's
+      // `export_approval_audit_id` field (v1.0.2 (j)).
+      const result: HubFortressExportResult = await fortressExportBundle(
+        itemId,
+      );
       this.deps.activitySources.auditLog.append(
         "l2",
         "exit_bundle_exported",

@@ -296,8 +296,17 @@ export interface HubServiceDeps {
    * policy, reputationStore, state namespaces); the hub layer remains
    * crypto-agnostic. When omitted, the fortress export endpoint returns
    * `HubCapabilityError`.
+   *
+   * The hub passes the inbox item's id as `approvalAuditId` so the
+   * callback can thread it into `exportExitBundle({ exportApprovalAuditId })`,
+   * tying the manifest's `export_approval_audit_id` to the operator's
+   * actual approval flow rather than an internally-generated value
+   * (closes v1.0.2 backlog item (j)). The argument is optional for
+   * backwards compatibility with existing callbacks.
    */
-  fortressExportBundle?: () => Promise<HubFortressExportResult>;
+  fortressExportBundle?: (
+    approvalAuditId?: string,
+  ) => Promise<HubFortressExportResult>;
   /**
    * Clock override for deterministic timestamp emission in tests.
    * Defaults to `() => new Date()` when omitted.

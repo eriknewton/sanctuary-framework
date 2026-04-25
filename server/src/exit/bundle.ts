@@ -149,6 +149,16 @@ export interface ExportExitBundleOptions {
   stateStoragePath?: string;
   stateNamespaces?: string[];
   keySource?: "passphrase" | "recovery-key" | "unknown";
+  /**
+   * When the export is gated by a Tier 1 approval flow (e.g. the hub's
+   * fortress-scope export endpoint), the caller supplies the approval's
+   * audit id here. The value is embedded in the manifest's
+   * `export_approval_audit_id` field and as the `approval_id` of the L1
+   * "exit_bundle_export" audit entry, tying the manifest to the operator's
+   * actual approval rather than an internally-generated id (v1.0.2 (j)).
+   * When omitted, the export self-generates an id.
+   */
+  exportApprovalAuditId?: string;
 }
 
 export interface ExportExitBundleResult {
@@ -472,7 +482,8 @@ export async function exportExitBundle(
     throw new Error("Cannot export exit bundle: no default identity exists.");
   }
 
-  const exportApprovalAuditId = `exit-export-${Date.now()}`;
+  const exportApprovalAuditId =
+    opts.exportApprovalAuditId ?? `exit-export-${Date.now()}`;
   opts.auditLog.append("l1", "exit_bundle_export", identity.identity_id, {
     approval_id: exportApprovalAuditId,
     manifest_version: EXIT_BUNDLE_MANIFEST_VERSION,
