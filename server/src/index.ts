@@ -31,6 +31,10 @@ import { createHandshakeTools } from "./handshake/tools.js";
 import { createFederationTools } from "./federation/tools.js";
 import { createBridgeTools } from "./bridge/tools.js";
 import { createAuditTools } from "./audit/tools.js";
+import {
+  consumeResetHistoryMarker,
+  ResetHistoryMalformedError,
+} from "./audit/reset-history.js";
 import { createSIEMTools } from "./audit/siem-tools.js";
 import { createContextGateTools } from "./l2-operational/context-gate-tools.js";
 import { createL2HardeningTools } from "./l2-operational/hardening-tools.js";
@@ -211,6 +215,26 @@ export async function createSanctuaryServer(options?: {
 
   // 5. Initialize audit log
   const auditLog = new AuditLog(storage, masterKey);
+
+  // 5a. Reset-history continuity (v1.0.2 item a). If a prior nuke left a
+  // `.reset-history.log` marker beside the storage path, append one
+  // `fortress_recovered_from_reset` audit entry per marker line, bind the
+  // marker hash into the entry, then delete the marker. Idempotent: re-runs
+  // see no marker and no-op. Refuses to continue if the marker is malformed.
+  try {
+    await consumeResetHistoryMarker({
+      storagePath: config.storage_path,
+      auditLog,
+    });
+  } catch (err) {
+    if (err instanceof ResetHistoryMalformedError) {
+      throw new Error(
+        `Sanctuary: ${err.message}\n` +
+          `Refusing to start the cocoon while the reset-history marker is unreadable.`
+      );
+    }
+    throw err;
+  }
 
   // 6. Initialize state store
   const stateStore = new StateStore(storage, masterKey);

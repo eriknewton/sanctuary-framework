@@ -26,6 +26,10 @@ import { homedir } from "node:os";
 import { loadConfig, SANCTUARY_VERSION } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
 import { AuditLog } from "./l2-operational/audit-log.js";
+import {
+  consumeResetHistoryMarker,
+  ResetHistoryMalformedError,
+} from "./audit/reset-history.js";
 import { loadPrincipalPolicy } from "./principal-policy/loader.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
@@ -329,6 +333,26 @@ export async function startStandaloneDashboard(
 
   // 5. Initialize audit log (for reading historical entries)
   const auditLog = new AuditLog(storage, masterKey);
+
+  // 5a. Reset-history continuity (v1.0.2 item a). Same one-shot marker
+  // consumption as the MCP server boot path (server/src/index.ts) so the
+  // first cocoon-unlock after `reset-passphrase --nuke` records continuity
+  // regardless of whether that unlock is the MCP server or the standalone
+  // dashboard.
+  try {
+    await consumeResetHistoryMarker({
+      storagePath: config.storage_path,
+      auditLog,
+    });
+  } catch (err) {
+    if (err instanceof ResetHistoryMalformedError) {
+      throw new Error(
+        `Sanctuary Dashboard: ${err.message}\n` +
+          `Refusing to start the dashboard while the reset-history marker is unreadable.`
+      );
+    }
+    throw err;
+  }
 
   // 6. Load principal policy and baseline
   const policy = await loadPrincipalPolicy(config.storage_path);
