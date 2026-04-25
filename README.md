@@ -29,12 +29,16 @@ Current capability summary:
 | Surface | Current status |
 |---|---|
 | Local `sanctuary wrap`, dashboard, policy gates, encrypted state, audit trail | Shipped / in v1.0 acceptance |
-| Context gating and sensitive-field redaction | Shipped foundation; query anonymization completion track remains open |
+| Context gating and sensitive-field redaction | Shipped foundation; v1.1 query minimization / Anonymized Query Mode completion remains open |
 | Portable identity, state export/import, reputation bundles, Concordia composition | Shipped foundation; polished exit workflow remains open |
-| Cross-fortress/fleet hub | Federation v0.1 foundation shipped; full fleet console is v1.x |
-| Runtime transport-layer interception | v1.x roadmap |
+| Operator-agent communication and local multi-agent coordination | Shipped foundation; complete local sovereignty harness is v1.1 |
+| Mobile operator companion | v1.2 roadmap |
+| Public federation | Federation v0.1 foundation shipped; public cross-operator coordination is v1.3 |
+| Fleet, payments, compliance, operator-cloud, generalized transport interception | v1.4+ roadmap |
 | Sovereign-managed TEE and hardware secure elements | v2 roadmap |
-| Post-quantum / RFC 9420 class cryptographic upgrades | v1.1 roadmap |
+| Post-quantum / RFC 9420 class cryptographic upgrades | v1.4+ roadmap |
+
+Roadmap shape: v1.1 completes the local sovereignty harness; v1.2 adds the phone as the operator companion; v1.3 opens public federation for cross-operator agent interaction; v1.4+ carries fleet, payments, compliance, generalized transport interception, operator-cloud, and advanced cryptography. See [ROADMAP.md](ROADMAP.md).
 
 ---
 
@@ -256,12 +260,12 @@ sanctuary template init research-assistant --name my-agent --provider anthropic
 
 ## Deployment modes
 
-Sanctuary is designed to run the same rights substrate in three places. The local mode is the v1.0 acceptance surface; operator-cloud and sovereign-managed TEE modes are roadmap surfaces that build on the same federation and policy foundations.
+Sanctuary is designed to run the same rights substrate in three places. The local mode is the v1.0 acceptance surface and v1.1 completion surface; operator-cloud and sovereign-managed TEE modes are later roadmap surfaces that build on the same federation and policy foundations.
 
 | Mode | Status | What it is | Who picks this |
 |---|---|---|---|
 | **On your machines** (Local) | v1.0 acceptance | Runs on the Macs, Linux boxes, or Windows machines you already own. Nothing leaves your house unless you tell it to. | Self-hosters, privacy-maximalists, anyone who already runs a homelab. |
-| **In your cloud** (Operator cloud) | v1.x roadmap | Runs in your own GCP / Azure / AWS account. Same code, same keys, on rented hardware you control. | Prosumers, small businesses, operators with light IT but no rack at home. |
+| **In your cloud** (Operator cloud) | v1.4+ roadmap | Runs in your own GCP / Azure / AWS account. Same code, same keys, on rented hardware you control. | Prosumers, small businesses, operators with light IT but no rack at home. |
 | **In a sealed cloud box we manage** (Sovereign-managed TEE) | v2 roadmap | Runs on hardware Sanctuary operates, but the hardware proves to your console that even Sanctuary cannot see what's inside. You hold the keys; we hold the metal. | Regulated industries, operators who want sovereignty without operational burden. |
 
 The operator holds the keys in every mode. The sovereign-managed mode will require hardware attestation before it is treated as shipped.
@@ -332,7 +336,7 @@ Sanctuary composes with the existing open ecosystem.
 
 - **Identity:** W3C DIDs, KERI, Verifiable Credentials
 - **Execution:** Trusted Execution Environments (Intel TDX, AMD SEV-SNP, ARM CCA) on the v2 roadmap
-- **Cryptography:** Ed25519 today; NIST Post-Quantum Cryptography (ML-DSA / FIPS 204, ML-KEM / FIPS 203) on the migration path; hybrid signing planned after v1.0 acceptance
+- **Cryptography:** Ed25519 today; NIST Post-Quantum Cryptography (ML-DSA / FIPS 204, ML-KEM / FIPS 203) on the migration path; hybrid signing planned after the local sovereignty harness is complete
 - **Settlement:** x402 (Coinbase micropayments), AP2 (Google Agent Payments Protocol), ACP
 
 ---
