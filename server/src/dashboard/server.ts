@@ -41,6 +41,18 @@ export interface DashboardHandle {
   publishActivity: (entry: ActivityEntry) => void;
   /** Push a new pending approval (already added by the approval channel). */
   publishApproval: (approval: PendingApproval) => void;
+  /**
+   * Push a v1.1 hub inbox item update. Producers (HubService) call this
+   * on inbox writes (Tier 1 enqueue, Tier 1 resolve, source-pulled item
+   * surfaced). Consumers replace-or-prepend by `item_id`.
+   */
+  publishInbox: (item: unknown) => void;
+  /**
+   * Push a v1.1 per-agent status update. Producers call this when the
+   * agent registry's `updateStatus` transitions. Consumers replace by
+   * `agent_id`.
+   */
+  publishAgentStatus: (snapshot: unknown) => void;
 }
 
 const DEFAULT_PORT = 3501;
@@ -120,5 +132,8 @@ export async function startDashboardServer(
       publish({ type: "activity", data: entry }),
     publishApproval: (approval: PendingApproval) =>
       publish({ type: "approval", data: approval }),
+    publishInbox: (item: unknown) => publish({ type: "inbox", data: item }),
+    publishAgentStatus: (snapshot: unknown) =>
+      publish({ type: "agent_status", data: snapshot }),
   };
 }
