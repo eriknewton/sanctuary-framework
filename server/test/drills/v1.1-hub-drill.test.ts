@@ -322,12 +322,8 @@ describe("v1.1 acceptance drill - Pillar 2: operator hub end-to-end", () => {
     // Step 3: activity feed reflects the fortress lockdown engagement.
     // The fortress lockdown handler emits a single audit entry with
     // operation `fortress_lockdown_engaged`; the activity-feed
-    // categorizer maps it via the layer-l2 fallback ("policy_decision")
-    // because the operation token is not a bare lifecycle verb. The
-    // drill asserts the entry exists with the expected display template
-    // id and locks in the categorization the dashboard will see today.
-    // Surface drift (operation token not lifecycle-categorized) is
-    // documented in the PR follow-up notes.
+    // categorizer routes it to `lifecycle` per dashboard binding
+    // addendum §1.2.
     await rig.auditLog.flush();
     const activityRes = await fetch(
       `${rig.url}${HUB_API_PREFIX}/activity?limit=20`,
@@ -343,14 +339,23 @@ describe("v1.1 acceptance drill - Pillar 2: operator hub end-to-end", () => {
       entry.display_template_id.includes("fortress_lockdown_engaged"),
     );
     expect(lockdownActivity).toBeDefined();
-    // The categorizer routes "fortress_lockdown_engaged" through the
-    // layer-l2 fallback today; the dashboard binding addendum's
-    // expectation of `category=lifecycle` is a coordinator follow-up
-    // (categorizer needs a bare-prefix match).
-    expect([
-      "lifecycle",
-      "policy_decision",
-    ]).toContain(lockdownActivity!.category);
+    expect(lockdownActivity!.category).toBe("lifecycle");
+
+    const lifecycleRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?category=lifecycle&limit=20`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const lifecycleBody = (await lifecycleRes.json()) as {
+      ok: true;
+      data: {
+        entries: Array<{ category: string; display_template_id: string }>;
+      };
+    };
+    expect(
+      lifecycleBody.data.entries.some((entry) =>
+        entry.display_template_id.includes("fortress_lockdown_engaged"),
+      ),
+    ).toBe(true);
 
     // Step 4: privacy event seeded into the same audit log surfaces under
     // category=privacy.
