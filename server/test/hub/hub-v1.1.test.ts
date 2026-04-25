@@ -602,6 +602,113 @@ describe("Hub agent control endpoints (Test 4)", () => {
     expect(rig.controller.calls.map((c) => c.action)).toEqual(["lockdown"]);
   });
 
+  it("Tier 1 lockdown approval emits agent_lockdown_engaged lifecycle activity", async () => {
+    const enqueue = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/lockdown`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    const enqueueBody = (await enqueue.json()) as {
+      ok: true;
+      data: { inbox_item_id: string };
+    };
+    const approveRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/${encodeURIComponent(enqueueBody.data.inbox_item_id)}/approve`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(approveRes.status).toBe(200);
+
+    await rig.auditLog.flush();
+    const lifecycleRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?category=lifecycle&limit=20`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const lifecycleBody = (await lifecycleRes.json()) as {
+      ok: true;
+      data: {
+        entries: Array<{
+          category: string;
+          agent_id?: string;
+          display_template_id: string;
+        }>;
+      };
+    };
+    const engaged = lifecycleBody.data.entries.find((e) =>
+      e.display_template_id.includes("agent_lockdown_engaged"),
+    );
+    expect(engaged).toBeDefined();
+    expect(engaged!.category).toBe("lifecycle");
+    expect(engaged!.agent_id).toBe("agent-alpha");
+  });
+
+  it("Tier 1 unwrap approval emits agent_unwrap_engaged lifecycle activity", async () => {
+    const enqueue = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/unwrap`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    const enqueueBody = (await enqueue.json()) as {
+      ok: true;
+      data: { inbox_item_id: string };
+    };
+    const approveRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/${encodeURIComponent(enqueueBody.data.inbox_item_id)}/approve`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(approveRes.status).toBe(200);
+
+    await rig.auditLog.flush();
+    const lifecycleRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?category=lifecycle&limit=20`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const lifecycleBody = (await lifecycleRes.json()) as {
+      ok: true;
+      data: {
+        entries: Array<{
+          category: string;
+          display_template_id: string;
+        }>;
+      };
+    };
+    expect(
+      lifecycleBody.data.entries.some((e) =>
+        e.display_template_id.includes("agent_unwrap_engaged"),
+      ),
+    ).toBe(true);
+  });
+
+  it("Tier 1 lockdown denial does NOT emit agent_lockdown_engaged lifecycle activity", async () => {
+    const enqueue = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/lockdown`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    const enqueueBody = (await enqueue.json()) as {
+      ok: true;
+      data: { inbox_item_id: string };
+    };
+    const denyRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/${encodeURIComponent(enqueueBody.data.inbox_item_id)}/deny`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(denyRes.status).toBe(200);
+
+    await rig.auditLog.flush();
+    const lifecycleRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?category=lifecycle&limit=20`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const lifecycleBody = (await lifecycleRes.json()) as {
+      ok: true;
+      data: {
+        entries: Array<{ display_template_id: string }>;
+      };
+    };
+    expect(
+      lifecycleBody.data.entries.some((e) =>
+        e.display_template_id.includes("agent_lockdown_engaged"),
+      ),
+    ).toBe(false);
+  });
+
   it("Tier 1 unwrap denial does NOT call the controller", async () => {
     const enqueue = await fetch(
       `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/unwrap`,

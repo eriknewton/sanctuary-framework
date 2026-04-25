@@ -267,6 +267,16 @@ export class HubService {
             status,
             "operator_lockdown",
           );
+          this.deps.activitySources.auditLog.append(
+            "l2",
+            "agent_unwrap_engaged",
+            this.deps.identityId,
+            {
+              agent_id: record.agent_id,
+              identity_id: record.identity_id,
+              operator_audit_id: itemId,
+            },
+          );
           return;
         }
         case "lockdown": {
@@ -277,6 +287,16 @@ export class HubService {
             record.agent_id,
             status,
             "operator_lockdown",
+          );
+          this.deps.activitySources.auditLog.append(
+            "l2",
+            "agent_lockdown_engaged",
+            this.deps.identityId,
+            {
+              agent_id: record.agent_id,
+              identity_id: record.identity_id,
+              operator_audit_id: itemId,
+            },
           );
           return;
         }

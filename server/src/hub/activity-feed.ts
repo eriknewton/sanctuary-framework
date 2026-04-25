@@ -46,7 +46,22 @@ interface ActivityFilter {
  * stable strings emitted by the various enforcement layers.
  *
  * Anything not classified maps to "other".
+ *
+ * Lifecycle bucket per dashboard binding addendum §1.2: covers
+ * `wrap`, `unwrap`, `lockdown`, `pause`, `resume`, `restart`, plus
+ * fortress-scope and per-agent suffixed forms emitted by the hub Tier 1
+ * control handlers (e.g. `fortress_lockdown_engaged`,
+ * `agent_lockdown_engaged`, `fortress_lockdown_lifted`).
  */
+const LIFECYCLE_VERBS = [
+  "wrap",
+  "unwrap",
+  "lockdown",
+  "pause",
+  "resume",
+  "restart",
+] as const;
+
 function categorizeOperation(
   layer: AuditEntry["layer"],
   operation: string,
@@ -63,14 +78,11 @@ function categorizeOperation(
   }
   if (op.includes("egress") || op.includes("upstream_call")) return "egress";
   if (op.startsWith("handoff_") || op === "handoff") return "handoff";
+  if ((LIFECYCLE_VERBS as readonly string[]).includes(op)) return "lifecycle";
+  if (op.startsWith("agent_")) return "lifecycle";
   if (
-    op === "wrap" ||
-    op === "unwrap" ||
-    op === "lockdown" ||
-    op === "restart" ||
-    op === "pause" ||
-    op === "resume" ||
-    op.startsWith("agent_")
+    op.startsWith("fortress_") &&
+    LIFECYCLE_VERBS.some((verb) => op.includes(verb))
   ) {
     return "lifecycle";
   }
