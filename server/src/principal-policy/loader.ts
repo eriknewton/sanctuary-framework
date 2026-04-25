@@ -48,10 +48,18 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "governor_reset", // Clears all runtime governance state — always requires approval
     "sanctuary_bootstrap", // Creates new Ed25519 identity + publishes — always requires approval
     "sanctuary_export_identity_bundle", // Exports portable identity — always requires approval
-    "exit_bundle_export", // Complete portability bundle export — always requires approval
-    "exit_bundle_import", // External durable-record import — always requires approval
-    "exit_bundle_import_activate", // Activates imported material — always requires approval
-    "exit_bundle_rekey", // Re-encrypts imported state under destination keys
+    "exit_bundle_export", // Complete portability bundle export. Always requires approval.
+    "exit_bundle_import", // External durable-record import. Always requires approval.
+    "exit_bundle_import_activate", // Activates imported material. Always requires approval.
+    "exit_bundle_rekey", // Re-encrypts imported state under destination keys.
+    // v1.1 hub-control surfaces. Every operation_category in
+    // server/src/contracts/v1.1/hub-events.ts that is not already canonical
+    // here MUST be enrolled under Tier 1 in the same PR that lands the hub
+    // endpoint that surfaces it. Drift between the contract enum and this
+    // list is a release blocker per the contract comment.
+    "policy_change", // Operator-driven policy bind on a wrapped agent.
+    "lockdown", // Operator-driven hard-stop of a wrapped agent.
+    "unwrap", // Operator-driven removal of the Sanctuary wrap from an agent.
     // WP-MVP-2 Operator Console: federation-node-join requires explicit
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
@@ -286,6 +294,9 @@ tier1_always_approve:
   - exit_bundle_import
   - exit_bundle_import_activate
   - exit_bundle_rekey
+  - policy_change
+  - lockdown
+  - unwrap
 
 # ─── Tier 2: Behavioral Anomaly Detection ────────────────────────────────
 # Triggers approval when agent behavior deviates from its baseline.
