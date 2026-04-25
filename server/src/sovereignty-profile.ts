@@ -35,6 +35,15 @@ export interface UpstreamServer {
   enabled: boolean;
   default_tier: 1 | 2 | 3;  // Default tier for all tools from this server
   tool_overrides?: Record<string, { tier: 1 | 2 | 3 }>; // Per-tool tier overrides
+  // v1.1: Remote-bound privacy enforcement binding.
+  // When set, every proxied tool call to this server flows through the
+  // LocalPrivacyEngine before forwarding. Defaults: destination_category is
+  // "tool-api" if omitted; privacy_policy_id absent means the operator has
+  // not bound a policy and outbound traffic fails closed unless the proxy
+  // router was started without privacy enforcement at all.
+  destination_category?: "inference" | "tool-api" | "logging" | "analytics" | "peer-agent" | "custom";
+  privacy_policy_id?: string;
+  privacy_identity_id?: string;
 }
 
 export interface SovereigntyProfile {
