@@ -206,7 +206,7 @@ export async function runWrap(
   }
 
   if (!agentConfig) {
-    console.error(`\n  Sanctuary — Configuration Not Found\n`);
+    console.error(`\n  Sanctuary: Configuration Not Found\n`);
     if (platformHint) {
       console.error(`  Could not find ${platformHint} configuration.`);
     } else if (options.wrap) {
@@ -260,12 +260,12 @@ export async function runWrap(
   const upstreamServers = convertToUpstreamServers(agentConfig.servers);
   for (const server of upstreamServers) {
     console.error(
-      `    → ${server.name} (${server.transport.type}) — tier ${server.default_tier}`
+      `    → ${server.name} (${server.transport.type}, tier ${server.default_tier})`
     );
   }
 
   if (options.dryRun) {
-    console.error(`\n  Dry run — no changes made.\n`);
+    console.error(`\n  Dry run. No changes made.\n`);
     return;
   }
 
@@ -298,7 +298,7 @@ export async function runWrap(
         `  Back up with: sanctuary export-passphrase`
       );
     } catch (err) {
-      console.error(`\n  Sanctuary — Passphrase Persistence Failed`);
+      console.error(`\n  Sanctuary: Passphrase Persistence Failed`);
       console.error(`  ${(err as Error).message}`);
       console.error("");
       process.exit(2);
@@ -324,7 +324,7 @@ export async function runWrap(
       }
     } catch (err) {
       if (err instanceof PassphraseUnreadableError) {
-        console.error(`\n  Sanctuary — Passphrase Unreadable`);
+        console.error(`\n  Sanctuary: Passphrase Unreadable`);
         console.error(`  ${err.message}\n`);
         process.exit(2);
       }
@@ -507,7 +507,7 @@ export async function startDashboardWithFallback(
       });
       if (port !== preferredPort) {
         console.error(
-          `  Port ${preferredPort} was unavailable — dashboard bound to ${port}.`
+          `  Port ${preferredPort} was unavailable. Dashboard bound to ${port}.`
         );
       }
       return handle;
@@ -681,7 +681,7 @@ async function unwrap(): Promise<void> {
   }
 
   await restoreConfig(meta.backupPath, meta.originalPath);
-  console.error(`\n  Sanctuary — Unwrapped`);
+  console.error(`\n  Sanctuary: Unwrapped`);
   console.error(`  Original config restored to: ${meta.originalPath}`);
   console.error(`  Backup preserved at: ${meta.backupPath}\n`);
 }
@@ -838,7 +838,7 @@ export const parseCocoonArgs = parseWrapArgs;
 
 function printWrapHelp(): void {
   console.log(`
-  sanctuary wrap — Wrap any agent in Sanctuary protection
+  sanctuary wrap. Wrap any agent in Sanctuary protection.
 
   Usage:
     sanctuary wrap --openclaw          Wrap OpenClaw

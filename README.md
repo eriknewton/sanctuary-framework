@@ -90,19 +90,23 @@ Note the port (it may be 3501-3510 if 3501 is taken).
 
 ### Step 3: Verify the install
 
-Run all four checks. The install is good if every one passes.
+After Step 2 (wrap succeeds), the dashboard is running. Verify the install:
 
 ```bash
 # (a) Dashboard responds
 curl -fsS "http://localhost:3501/api/health" | grep -q '"status":"ok"' && echo "dashboard=ok"
 
-# (b) Identities loaded (one per wrapped agent)
+# (b) Passphrase backed up to keychain (macOS)
+security find-generic-password -s "sanctuary-passphrase" >/dev/null 2>&1 && echo "passphrase=ok"
+```
+
+The first time you open the Sovereignty Dashboard in your browser, Sanctuary derives your master key from the keychain-stored passphrase, creates your fortress's Ed25519 identity, and writes the audit log genesis. Wrap configures these on disk; the first dashboard unlock initializes them. Verify after first unlock:
+
+```bash
+# (c) Identities loaded (run after opening the dashboard once)
 curl -fsS "http://localhost:3501/api/identities" | grep -q '"identities":\[' && echo "identities=ok"
 
-# (c) Passphrase backed up to keychain (macOS)
-security find-generic-password -s "sanctuary-passphrase" >/dev/null 2>&1 && echo "passphrase=ok"
-
-# (d) Audit log initialized
+# (d) Audit log initialized (run after opening the dashboard once)
 test -d ~/.sanctuary/state/_audit && echo "audit=ok"
 ```
 
@@ -155,7 +159,7 @@ Generate the passphrase with `openssl rand -base64 32` and store it in the opera
 
 ## Wrap any harness in one command
 
-Already running an agent on OpenClaw, Hermes, Claude Code, Cursor, or Cline? One command wraps it in Sanctuary's policy gates and audit log, starts the Sovereignty Dashboard, and opens it in your browser.
+Already running an agent on OpenClaw, Hermes, Claude Code, Cursor, or Cline? One command wraps it in Sanctuary's policy gates and audit trail (the audit log writes its genesis on your first dashboard unlock), starts the Sovereignty Dashboard, and opens it in your browser.
 
 ```bash
 npx @sanctuary-framework/mcp-server wrap --openclaw

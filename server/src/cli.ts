@@ -244,7 +244,7 @@ async function runExportPassphrase(args: string[]): Promise<void> {
     if (a === "--yes" || a === "-y") assumeYes = true;
     else if (a === "--help" || a === "-h") {
       console.log(`
-  sanctuary export-passphrase — Print the stored passphrase to stdout.
+  sanctuary export-passphrase. Print the stored passphrase to stdout.
 
   Usage:
     sanctuary export-passphrase [--yes]
@@ -269,7 +269,7 @@ async function runExportPassphrase(args: string[]): Promise<void> {
     stored = await readStoredPassphrase();
   } catch (err) {
     if (err instanceof PassphraseUnreadableError) {
-      console.error(`\n  Sanctuary — Passphrase Unreadable`);
+      console.error(`\n  Sanctuary: Passphrase Unreadable`);
       console.error(`  ${err.message}\n`);
       process.exit(2);
     }
@@ -363,7 +363,7 @@ For more info: https://github.com/eriknewton/sanctuary-framework
 
 function printDashboardHelp(): void {
   console.log(`
-@sanctuary-framework/mcp-server v${PKG_VERSION} — Standalone Dashboard
+@sanctuary-framework/mcp-server v${PKG_VERSION}. Standalone Dashboard.
 
 Start the Principal Dashboard as a persistent HTTP server without running
 the MCP server. Use this when the MCP server runs via stdio (e.g., OpenClaw)
@@ -380,7 +380,7 @@ Options:
                        path and Keychain entry automatically. Use this on multi-
                        tenant hosts instead of guessing SANCTUARY_PASSPHRASE.
   --multi              Start the multi-agent overview instead of a single-tenant
-                       dashboard. Does not decrypt any tenant state — scans every
+                       dashboard. Does not decrypt any tenant state; scans every
                        tenant on the host and deep-links into per-tenant dashboards.
   --help, -h           Show this help
 
