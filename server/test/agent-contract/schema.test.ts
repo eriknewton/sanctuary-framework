@@ -56,6 +56,26 @@ function baseCard(): Record<string, unknown> {
   };
 }
 
+describe("Schema explicit-construction (#8 type-safety)", () => {
+  it("validateCapability returns object literal containing only validated fields", () => {
+    const out = validateCapability({ kind: "read-slot", target: "memory" });
+    expect(Object.keys(out).sort()).toEqual(["kind", "target"]);
+  });
+
+  it("validateAgentCard returns object literal omitting expires_at when absent", () => {
+    const card = validateAgentCard(baseCard());
+    expect("expires_at" in card).toBe(false);
+  });
+
+  it("validateAgentCard ignores extra-keys-after-validation contamination", () => {
+    const c = baseCard();
+    const card = validateAgentCard(c);
+    // Mutate the input post-validation; output must be unaffected (literal copy, not reference)
+    (c as Record<string, unknown>).agent_id = "tampered";
+    expect(card.agent_id).toBe("agent-alpha");
+  });
+});
+
 describe("Agent Card schema (§3)", () => {
   it("accepts a well-formed card", () => {
     const card = validateAgentCard(baseCard());

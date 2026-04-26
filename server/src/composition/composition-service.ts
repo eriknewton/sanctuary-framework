@@ -34,6 +34,7 @@ import {
   DegradeStateError,
   MissingSidecarSigningKeyError,
 } from "./errors.js";
+import { isPlainObject } from "./assert-shape.js";
 import type {
   CompositionConfig,
   CompositionDegradeState,
@@ -477,7 +478,7 @@ export class CompositionService {
     if (!this.sidecarManager) return null;
     const response = await this.sidecarManager.getVersion();
     if (!response || response.error) return null;
-    return response.result as Record<string, unknown>;
+    return isPlainObject(response.result) ? response.result : null;
   }
 
   /**

@@ -109,11 +109,25 @@ async function applyOpenAIPrivacyFilter<T>(
   return { value, findings: [] };
 }
 
+/**
+ * Cap on the OPF subprocess stdout payload before it reaches JSON.parse.
+ * Mirrors the 10 MB sidecar JSON-RPC frame cap (composition layer). A
+ * compromised or runaway OPF process emitting tens of megabytes of JSON
+ * would otherwise force an unbounded JSON.parse plus oversized result
+ * traversal, opening a DoS path.
+ */
+export const OPF_STDOUT_MAX_BYTES = 10_000_000;
+
 export async function runOpenAIPrivacyFilter(
   text: string,
   config: PrivacyFilterRuntimeConfig
 ): Promise<OpenAIPrivacyFilterResult> {
   const stdout = await runCommand(config.command, text, config.timeout_ms);
+  if (Buffer.byteLength(stdout, "utf8") > OPF_STDOUT_MAX_BYTES) {
+    throw new PrivacyFilterRuntimeError(
+      `OpenAI privacy-filter stdout exceeded ${OPF_STDOUT_MAX_BYTES}-byte cap`
+    );
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);

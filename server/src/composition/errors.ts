@@ -162,6 +162,30 @@ export class MissingSidecarSigningKeyError extends CompositionError {
 }
 
 /**
+ * Thrown when a sidecar JSON-RPC response fails runtime shape validation.
+ *
+ * The sidecar is a separate process speaking JSON-RPC over stdio. tsc
+ * cannot prove its responses match the expected shape, so casting
+ * `response.result` directly is a trust-boundary leak (Sanctuary
+ * Invariant #4: never assume trust across the Sanctuary-Concordia
+ * boundary). This error fires when the response is malformed or missing
+ * required fields, letting the fortress handle the failure without
+ * propagating untrusted data into typed code paths.
+ */
+export class SidecarResponseShapeError extends CompositionError {
+  constructor(
+    public readonly method: string,
+    public readonly missingOrInvalid: string
+  ) {
+    super(
+      `Sidecar "${method}" returned malformed result: ${missingOrInvalid}`,
+      "SIDECAR_RESPONSE_SHAPE_INVALID"
+    );
+    this.name = "SidecarResponseShapeError";
+  }
+}
+
+/**
  * Thrown when a composition operation is attempted while the subsystem
  * is in degraded mode (sidecar crashed, restarting, etc.).
  *

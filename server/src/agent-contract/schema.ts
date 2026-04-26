@@ -139,7 +139,14 @@ export function validateCapability(c: unknown): AgentCardCapability {
       );
     }
   }
-  return c as unknown as AgentCardCapability;
+  const out: AgentCardCapability = {
+    kind: c.kind,
+    target: c.target,
+  };
+  if (c.constraints !== undefined) {
+    out.constraints = c.constraints as Record<string, unknown>;
+  }
+  return out;
 }
 
 /**
@@ -237,7 +244,26 @@ export function validateAgentCard(v: unknown): AgentCard {
       `Agent Card expires_at must be ISO8601 UTC or omitted; got ${JSON.stringify(v.expires_at)}`
     );
   }
-  return v as unknown as AgentCard;
+  const out: AgentCard = {
+    schema_version: AGENT_CONTRACT_VERSION,
+    signature_scheme: SIGNATURE_SCHEME_V1,
+    agent_id: v.agent_id as string,
+    fortress_id: v.fortress_id as string,
+    tier: v.tier as HarnessTier,
+    harness_id: v.harness_id as string,
+    model_provider: v.model_provider as ModelProvider,
+    model_id: v.model_id as string,
+    agent_pubkey: v.agent_pubkey as string,
+    policy_version_hash: v.policy_version_hash as string,
+    policy_version: v.policy_version,
+    attestation_endpoint: v.attestation_endpoint as string,
+    capabilities: v.capabilities.map(validateCapability),
+    issued_at: v.issued_at as string,
+  };
+  if (v.expires_at !== undefined) {
+    out.expires_at = v.expires_at as string;
+  }
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -362,7 +388,28 @@ export function validateUsageEvent(v: unknown): UsageEvent {
       `usage event extension must be a plain object if present`
     );
   }
-  return v as unknown as UsageEvent;
+  const out: UsageEvent = {
+    schema_version: AGENT_CONTRACT_VERSION,
+    signature_scheme: SIGNATURE_SCHEME_V1,
+    usage_event_id: v.usage_event_id as string,
+    agent_id: v.agent_id as string,
+    fortress_id: v.fortress_id as string,
+    event_class: v.event_class as EventClass,
+    capability_target: v.capability_target as string,
+    input_hash: v.input_hash as string,
+    output_hash: v.output_hash as string,
+    policy_version: v.policy_version,
+    policy_version_hash: v.policy_version_hash as string,
+    attestation_state: v.attestation_state as UsageEvent["attestation_state"],
+    emitted_at: v.emitted_at as string,
+  };
+  if (v.capability_kind !== undefined) {
+    out.capability_kind = v.capability_kind as CapabilityKind;
+  }
+  if (v.extension !== undefined) {
+    out.extension = v.extension as Record<string, unknown>;
+  }
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -433,7 +480,26 @@ export function validateLifecycleEvent(v: unknown): LifecycleEvent {
       }
     }
   }
-  return v as unknown as LifecycleEvent;
+  const out: LifecycleEvent = {
+    schema_version: AGENT_CONTRACT_VERSION,
+    signature_scheme: SIGNATURE_SCHEME_V1,
+    agent_id: v.agent_id as string,
+    fortress_id: v.fortress_id as string,
+    from_state: v.from_state as LifecycleEvent["from_state"],
+    to_state: v.to_state as LifecycleState,
+    reason: v.reason as string,
+    emitted_at: v.emitted_at as string,
+  };
+  if (v.checkpoint_hash !== undefined) {
+    out.checkpoint_hash = v.checkpoint_hash as string;
+  }
+  if (v.guardian_quorum !== undefined) {
+    out.guardian_quorum = (v.guardian_quorum as Array<Record<string, unknown>>).map((g) => ({
+      guardian_pubkey: g.guardian_pubkey as string,
+      signature: g.signature as string,
+    }));
+  }
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -482,7 +548,21 @@ export function validateAttestation(v: unknown): Attestation {
       `attestation attested_payload must be a plain object if present`
     );
   }
-  return v as unknown as Attestation;
+  const out: Attestation = {
+    schema_version: AGENT_CONTRACT_VERSION,
+    signature_scheme: SIGNATURE_SCHEME_V1,
+    attestation_id: v.attestation_id as string,
+    agent_id: v.agent_id as string,
+    fortress_id: v.fortress_id as string,
+    usage_event_id: v.usage_event_id as string,
+    source: v.source as Attestation["source"],
+    attested_hash: v.attested_hash as string,
+    emitted_at: v.emitted_at as string,
+  };
+  if (v.attested_payload !== undefined) {
+    out.attested_payload = v.attested_payload as Record<string, unknown>;
+  }
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -546,7 +626,25 @@ export function validateCommitmentProposal(v: unknown): CommitmentProposal {
   if (!isNonEmptyString(v.gate_receipt_id)) {
     throw new AgentContractError(`commitment proposal gate_receipt_id required`);
   }
-  return v as unknown as CommitmentProposal;
+  const bs = v.bounded_scope as Record<string, unknown>;
+  return {
+    schema_version: AGENT_CONTRACT_VERSION,
+    signature_scheme: SIGNATURE_SCHEME_V1,
+    proposal_id: v.proposal_id as string,
+    agent_id: v.agent_id as string,
+    fortress_id: v.fortress_id as string,
+    commitment_class: v.commitment_class as CommitmentProposal["commitment_class"],
+    counterparty: v.counterparty as string,
+    bounded_scope: {
+      deliverable: bs.deliverable as string,
+      deadline_or_terminal: bs.deadline_or_terminal as string,
+      budget_ref: bs.budget_ref as string,
+    },
+    policy_version: v.policy_version,
+    policy_version_hash: v.policy_version_hash as string,
+    emitted_at: v.emitted_at as string,
+    gate_receipt_id: v.gate_receipt_id as string,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -631,7 +729,42 @@ export function validateHarnessEnvelope(v: unknown): HarnessEnvelope {
       );
     }
   }
-  return v as unknown as HarnessEnvelope;
+  const senderClaim = v.sender_claim as Record<string, unknown>;
+  const out: HarnessEnvelope = {
+    schema_version: AGENT_CONTRACT_VERSION,
+    signature_scheme: SIGNATURE_SCHEME_V1,
+    envelope_id: v.envelope_id as string,
+    direction: v.direction as HarnessEnvelope["direction"],
+    agent_id: v.agent_id as string,
+    fortress_id: v.fortress_id as string,
+    capability_kind: v.capability_kind as CapabilityKind,
+    capability_target: v.capability_target as string,
+    body: v.body,
+    body_hash: v.body_hash as string,
+    policy_version: v.policy_version,
+    sender_claim: {
+      claimant: senderClaim.claimant as string,
+      asserted_at: senderClaim.asserted_at as string,
+    },
+    wrapped_at: v.wrapped_at as string,
+  };
+  if (v.receiver_check !== undefined) {
+    const rc = v.receiver_check as Record<string, unknown>;
+    const recv: HarnessEnvelope["receiver_check"] = {
+      decision: rc.decision as "allow" | "deny",
+      reason_code: rc.reason_code as string,
+    };
+    if (rc.gate_receipt_id !== undefined) {
+      if (typeof rc.gate_receipt_id !== "string") {
+        throw new AgentContractError(
+          `harness envelope receiver_check.gate_receipt_id must be a string when present`
+        );
+      }
+      recv!.gate_receipt_id = rc.gate_receipt_id;
+    }
+    out.receiver_check = recv;
+  }
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

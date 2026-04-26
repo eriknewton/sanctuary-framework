@@ -76,13 +76,15 @@ const GRANT_PATTERNS: Array<{
     regex:
       /Agent\s+(?<agent>[A-Za-z0-9_-]+)\s+may\s+(?<action>read|write)\s+(?<slot>\w+)\s+(?:from|to)\s+agent\s+(?<cp>[A-Za-z0-9_-]+)/gi,
     extract: (m) => {
-      const slot = slotFromWord(m.groups!.slot);
+      const g = m.groups;
+      if (!g) return undefined;
+      const slot = slotFromWord(g.slot);
       if (!slot) return undefined;
       return {
-        agent: m.groups!.agent,
-        action: m.groups!.action.toLowerCase(),
+        agent: g.agent,
+        action: g.action.toLowerCase(),
         slot,
-        counterparty: m.groups!.cp,
+        counterparty: g.cp,
       };
     },
   },
@@ -91,13 +93,15 @@ const GRANT_PATTERNS: Array<{
     regex:
       /Agent\s+(?<agent>[A-Za-z0-9_-]+)\s+may\s+subscribe\s+to\s+agent\s+(?<cp>[A-Za-z0-9_-]+)'?s\s+(?<slot>\w+)/gi,
     extract: (m) => {
-      const slot = slotFromWord(m.groups!.slot);
+      const g = m.groups;
+      if (!g) return undefined;
+      const slot = slotFromWord(g.slot);
       if (!slot) return undefined;
       return {
-        agent: m.groups!.agent,
+        agent: g.agent,
         action: "subscribe",
         slot,
-        counterparty: m.groups!.cp,
+        counterparty: g.cp,
       };
     },
   },
@@ -106,13 +110,15 @@ const GRANT_PATTERNS: Array<{
     regex:
       /Agent\s+(?<agent>[A-Za-z0-9_-]+)\s+may\s+share\s+(?<slot>\w+)\s+with\s+agent\s+(?<cp>[A-Za-z0-9_-]+)/gi,
     extract: (m) => {
-      const slot = slotFromWord(m.groups!.slot);
+      const g = m.groups;
+      if (!g) return undefined;
+      const slot = slotFromWord(g.slot);
       if (!slot) return undefined;
       return {
-        agent: m.groups!.agent,
+        agent: g.agent,
         action: "share",
         slot,
-        counterparty: m.groups!.cp,
+        counterparty: g.cp,
       };
     },
   },
@@ -228,31 +234,38 @@ export function compileFixturePolicy(req: AuthoringRequest): CompiledPolicy {
   const sentRe = new RegExp(SENTINEL_REGEX.source, SENTINEL_REGEX.flags);
   let s: RegExpExecArray | null;
   while ((s = sentRe.exec(text)) !== null) {
-    if (s.groups!.agent === req.agent_id) isSentinel = true;
+    const g = s.groups;
+    if (!g) continue;
+    if (g.agent === req.agent_id) isSentinel = true;
   }
 
   const cRe = new RegExp(COMMITMENT_CLASS_REGEX.source, COMMITMENT_CLASS_REGEX.flags);
   let c: RegExpExecArray | null;
   while ((c = cRe.exec(text)) !== null) {
-    if (c.groups!.agent === req.agent_id) commitmentClasses.add(c.groups!.cls);
+    const g = c.groups;
+    if (!g) continue;
+    if (g.agent === req.agent_id) commitmentClasses.add(g.cls);
   }
 
   const hRe = new RegExp(HONEYPOT_REGEX.source, HONEYPOT_REGEX.flags);
   let h: RegExpExecArray | null;
   while ((h = hRe.exec(text)) !== null) {
-    if (h.groups!.agent === req.agent_id) honeypotSkills.add(h.groups!.skill);
+    const g = h.groups;
+    if (!g) continue;
+    if (g.agent === req.agent_id) honeypotSkills.add(g.skill);
   }
 
-  // WP-MVP-6: Parse egress rules.
   // WP-MVP-6: Parse egress rules.
   const egressRules: EgressRule[] = [];
   const egressRe = new RegExp(EGRESS_REGEX.source, EGRESS_REGEX.flags);
   let eg: RegExpExecArray | null;
   while ((eg = egressRe.exec(text)) !== null) {
-    if (eg.groups!.agent !== req.agent_id) continue;
-    const dest = eg.groups!.dest.replace(/\.$/, ""); // strip trailing period
-    const methods = eg.groups!.method
-      ? eg.groups!.method
+    const g = eg.groups;
+    if (!g) continue;
+    if (g.agent !== req.agent_id) continue;
+    const dest = g.dest.replace(/\.$/, ""); // strip trailing period
+    const methods = g.method
+      ? g.method
           .split(/[,\s]+/)
           .map((m) => m.trim().toUpperCase())
           .filter((m) => m.length > 0)
@@ -274,16 +287,18 @@ export function compileFixturePolicy(req: AuthoringRequest): CompiledPolicy {
   const budgetRe = new RegExp(BUDGET_REGEX.source, BUDGET_REGEX.flags);
   let bg: RegExpExecArray | null;
   while ((bg = budgetRe.exec(text)) !== null) {
-    if (bg.groups!.agent !== req.agent_id) continue;
+    const g = bg.groups;
+    if (!g) continue;
+    if (g.agent !== req.agent_id) continue;
     if (!budgetPolicy) budgetPolicy = {};
     const limit: BudgetLimit = {
-      amount: parseFloat(bg.groups!.amount),
-      unit: bg.groups!.unit as BudgetUnit,
+      amount: parseFloat(g.amount),
+      unit: g.unit as BudgetUnit,
     };
-    if (bg.groups!.warn) {
-      limit.soft_warn_threshold = parseInt(bg.groups!.warn, 10) / 100;
+    if (g.warn) {
+      limit.soft_warn_threshold = parseInt(g.warn, 10) / 100;
     }
-    if (bg.groups!.window === "daily") {
+    if (g.window === "daily") {
       budgetPolicy.daily = limit;
     } else {
       budgetPolicy.monthly = limit;
@@ -301,19 +316,23 @@ export function compileFixturePolicy(req: AuthoringRequest): CompiledPolicy {
   const archiveSlots = new Set<string>();
   let ra: RegExpExecArray | null;
   while ((ra = retArchiveRe.exec(text)) !== null) {
-    if (ra.groups!.agent === req.agent_id) {
-      const slot = slotFromWord(ra.groups!.slot);
+    const g = ra.groups;
+    if (!g) continue;
+    if (g.agent === req.agent_id) {
+      const slot = slotFromWord(g.slot);
       if (slot) archiveSlots.add(slot);
     }
   }
   let rt: RegExpExecArray | null;
   while ((rt = retRe.exec(text)) !== null) {
-    if (rt.groups!.agent !== req.agent_id) continue;
-    const slot = slotFromWord(rt.groups!.slot);
+    const g = rt.groups;
+    if (!g) continue;
+    if (g.agent !== req.agent_id) continue;
+    const slot = slotFromWord(g.slot);
     if (!slot) continue;
     if (!retentionPolicy) retentionPolicy = { windows: {} };
     const win: RetentionWindow = {
-      max_age_seconds: parseInt(rt.groups!.seconds, 10),
+      max_age_seconds: parseInt(g.seconds, 10),
     };
     if (archiveSlots.has(slot)) win.archive = true;
     retentionPolicy.windows[slot] = win;

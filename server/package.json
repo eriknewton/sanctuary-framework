@@ -50,7 +50,7 @@
     "@libp2p/tcp": "^10.1.19",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@multiformats/multiaddr": "^12.5.1",
-    "@noble/ciphers": "^2.1.1",
+    "@noble/ciphers": "^2.2.0",
     "@noble/curves": "^1.8.0",
     "@noble/hashes": "^1.7.0",
     "hash-wasm": "^4.12.0",
