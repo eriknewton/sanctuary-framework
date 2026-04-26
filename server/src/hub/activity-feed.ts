@@ -51,7 +51,8 @@ interface ActivityFilter {
  * `wrap`, `unwrap`, `lockdown`, `pause`, `resume`, `restart`, plus
  * fortress-scope and per-agent suffixed forms emitted by the hub Tier 1
  * control handlers (e.g. `fortress_lockdown_engaged`,
- * `agent_lockdown_engaged`, `fortress_lockdown_lifted`).
+ * `agent_lockdown_engaged`, `agent_policy_change_engaged`,
+ * `fortress_lockdown_lifted`).
  */
 const LIFECYCLE_VERBS = [
   "wrap",

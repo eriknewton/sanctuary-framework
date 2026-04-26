@@ -69,6 +69,7 @@ describe("Activity feed categorizer: lifecycle routing", () => {
       "agent_lockdown_engaged",
       "agent_unwrap_engaged",
       "agent_lockdown_lifted",
+      "agent_policy_change_engaged",
     ]) {
       expect(await categoryFor(rig, "l2", op)).toBe("lifecycle");
     }

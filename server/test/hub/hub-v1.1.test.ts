@@ -748,6 +748,93 @@ describe("Hub agent control endpoints (Test 4)", () => {
     expect(rig.controller.calls.length).toBe(0);
   });
 
+  it("Tier 1 policy_change approval emits agent_policy_change_engaged lifecycle activity", async () => {
+    const enqueue = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/policy`,
+      {
+        method: "POST",
+        headers: withAuth(
+          { "Content-Type": "application/json" },
+          rig.authToken,
+        ),
+        body: JSON.stringify({ policy_id: "policy-strict-001" }),
+      },
+    );
+    const enqueueBody = (await enqueue.json()) as {
+      ok: true;
+      data: { inbox_item_id: string };
+    };
+    const approveRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/${encodeURIComponent(enqueueBody.data.inbox_item_id)}/approve`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(approveRes.status).toBe(200);
+    expect(rig.controller.calls.map((c) => c.action)).toEqual(["bindPolicy"]);
+
+    await rig.auditLog.flush();
+    const lifecycleRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?category=lifecycle&limit=20`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const lifecycleBody = (await lifecycleRes.json()) as {
+      ok: true;
+      data: {
+        entries: Array<{
+          category: string;
+          agent_id?: string;
+          display_template_id: string;
+        }>;
+      };
+    };
+    const engaged = lifecycleBody.data.entries.find((e) =>
+      e.display_template_id.includes("agent_policy_change_engaged"),
+    );
+    expect(engaged).toBeDefined();
+    expect(engaged!.category).toBe("lifecycle");
+    expect(engaged!.agent_id).toBe("agent-alpha");
+  });
+
+  it("Tier 1 policy_change denial does NOT emit agent_policy_change_engaged lifecycle activity", async () => {
+    const enqueue = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/policy`,
+      {
+        method: "POST",
+        headers: withAuth(
+          { "Content-Type": "application/json" },
+          rig.authToken,
+        ),
+        body: JSON.stringify({ policy_id: "policy-strict-001" }),
+      },
+    );
+    const enqueueBody = (await enqueue.json()) as {
+      ok: true;
+      data: { inbox_item_id: string };
+    };
+    const denyRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/${encodeURIComponent(enqueueBody.data.inbox_item_id)}/deny`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(denyRes.status).toBe(200);
+    expect(rig.controller.calls.length).toBe(0);
+
+    await rig.auditLog.flush();
+    const lifecycleRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?category=lifecycle&limit=20`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const lifecycleBody = (await lifecycleRes.json()) as {
+      ok: true;
+      data: {
+        entries: Array<{ display_template_id: string }>;
+      };
+    };
+    expect(
+      lifecycleBody.data.entries.some((e) =>
+        e.display_template_id.includes("agent_policy_change_engaged"),
+      ),
+    ).toBe(false);
+  });
+
   it("template bind is synchronous (not Tier 1) and updates the record", async () => {
     const res = await fetch(
       `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/template`,
