@@ -65,7 +65,7 @@ export function createContextGateTools(
   const privacyVault = new PrivacyPlaceholderVault(storage, masterKey);
   const privacyFilterConfig: PrivacyFilterRuntimeConfig = options.privacyFilter ?? {
     mode: "local",
-    fail_mode: "fallback",
+    fail_mode: "closed",
     command: "opf",
     timeout_ms: 5000,
   };

@@ -150,7 +150,10 @@ export function defaultConfig(): SanctuaryConfig {
     },
     privacy_filter: {
       mode: "local",
-      fail_mode: "fallback",
+      // Fail-closed by default per Sanctuary Invariant #5: never silently
+      // degrade to a less-secure behavior on error. Operators who need a
+      // legacy fallback path opt in explicitly via config or env var.
+      fail_mode: "closed",
       command: "opf",
       timeout_ms: 5000,
     },
@@ -176,9 +179,15 @@ export async function loadConfig(
     const raw = await readFile(path, "utf-8");
     const fileConfig = JSON.parse(raw);
     config = deepMerge(config, fileConfig);
+    // Catch shape regressions from a malformed user-supplied JSON
+    // (e.g. `dashboard: "not-an-object"`) before downstream code casts.
+    assertSanctuaryConfigShape(config as unknown as Record<string, unknown>);
   } catch (err) {
     // Re-throw validation errors — only swallow file-not-found
     if (err instanceof Error && err.message.includes("unimplemented features")) {
+      throw err;
+    }
+    if (err instanceof Error && err.message.startsWith("Sanctuary config field")) {
       throw err;
     }
     // No config file — continue with defaults
@@ -405,4 +414,53 @@ function deepMerge(base: object, override: object): SanctuaryConfig {
     }
   }
   return result as unknown as SanctuaryConfig;
+}
+
+/**
+ * Lightweight structural shape check before downstream consumers treat the
+ * loaded config as a SanctuaryConfig. Catches the case where a user's
+ * config file overrides a load-bearing object key with a primitive (e.g.
+ * `dashboard: "broken"`) - without this, the cast in deepMerge would
+ * silently produce a malformed config that crashes downstream consumers
+ * in surprising ways.
+ *
+ * Not a full validator - that's the existing `validateConfig` step. This
+ * only asserts top-level required keys exist with the right kind (object
+ * vs string vs number vs boolean). Called once on the merged config in
+ * loadConfig (NOT recursively from deepMerge).
+ */
+export function assertSanctuaryConfigShape(c: Record<string, unknown>): void {
+  const requiredObjectKeys = [
+    "state",
+    "execution",
+    "disclosure",
+    "reputation",
+    "dashboard",
+    "webhook",
+    "verascore",
+    "privacy_filter",
+  ];
+  for (const k of requiredObjectKeys) {
+    if (typeof c[k] !== "object" || c[k] === null || Array.isArray(c[k])) {
+      throw new Error(
+        `Sanctuary config field "${k}" must be an object; got ${
+          c[k] === null ? "null" : Array.isArray(c[k]) ? "array" : typeof c[k]
+        }`
+      );
+    }
+  }
+  if (typeof c.version !== "string") {
+    throw new Error(`Sanctuary config field "version" must be a string`);
+  }
+  if (typeof c.storage_path !== "string") {
+    throw new Error(`Sanctuary config field "storage_path" must be a string`);
+  }
+  if (c.transport !== "stdio" && c.transport !== "http") {
+    throw new Error(
+      `Sanctuary config field "transport" must be "stdio" | "http"; got ${JSON.stringify(c.transport)}`
+    );
+  }
+  if (typeof c.http_port !== "number" || !Number.isFinite(c.http_port)) {
+    throw new Error(`Sanctuary config field "http_port" must be a finite number`);
+  }
 }

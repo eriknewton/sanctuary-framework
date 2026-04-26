@@ -361,12 +361,16 @@ export class ApprovalGate {
       decided_by: response.decided_by,
     });
 
+    // Agent-facing denial reasons MUST NOT leak policy threshold values
+    // (Sanctuary Invariant #7). The detailed `reason` flows into the audit
+    // log and the out-of-band approval channel for the human reviewer; the
+    // value returned to the caller becomes a generic string.
     return {
       allowed: response.decision === "approve",
       tier,
       reason: response.decision === "approve"
         ? `Approved by ${response.decided_by}`
-        : reason,
+        : `Tier ${tier} operation requires approval`,
       approval_required: true,
       approval_response: response,
     };

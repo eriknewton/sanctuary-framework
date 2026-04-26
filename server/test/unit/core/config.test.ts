@@ -154,11 +154,13 @@ describe("loadConfig", () => {
   });
 
   describe("Privacy filter config", () => {
-    it("defaults to local placeholder filtering with fallback fail mode", async () => {
+    it("defaults to local placeholder filtering with closed fail mode", async () => {
+      // Default fail_mode is "closed" (Sanctuary Invariant #5: never silently
+      // degrade on error). Operators opt in to legacy fallback explicitly.
       const config = await loadConfig(join(tempDir, "nonexistent.json"));
       expect(config.privacy_filter).toEqual({
         mode: "local",
-        fail_mode: "fallback",
+        fail_mode: "closed",
         command: "opf",
         timeout_ms: 5000,
       });
@@ -184,6 +186,37 @@ describe("loadConfig", () => {
       await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
         /privacy_filter\.mode/
       );
+    });
+  });
+
+  describe("Config structural shape validation (#4)", () => {
+    it("rejects a config file that overrides an object-typed key with a string", async () => {
+      const path = join(tempDir, "broken-shape.json");
+      await writeFile(path, JSON.stringify({ dashboard: "totally-not-an-object" }));
+      await expect(loadConfig(path)).rejects.toThrow(/dashboard.*must be an object/);
+    });
+
+    it("rejects a config file that overrides an object-typed key with an array", async () => {
+      const path = join(tempDir, "broken-shape-array.json");
+      await writeFile(path, JSON.stringify({ privacy_filter: ["not", "an", "object"] }));
+      await expect(loadConfig(path)).rejects.toThrow(/privacy_filter.*must be an object/);
+    });
+
+    it("rejects a config file that overrides transport with an unknown literal", async () => {
+      const path = join(tempDir, "broken-transport.json");
+      await writeFile(path, JSON.stringify({ transport: "carrier-pigeon" }));
+      await expect(loadConfig(path)).rejects.toThrow(/transport.*"stdio"/);
+    });
+
+    it("accepts a well-formed config file", async () => {
+      const path = join(tempDir, "well-formed.json");
+      await writeFile(
+        path,
+        JSON.stringify({ dashboard: { enabled: true, port: 9999, host: "0.0.0.0" } })
+      );
+      const config = await loadConfig(path);
+      expect(config.dashboard.port).toBe(9999);
+      expect(config.dashboard.enabled).toBe(true);
     });
   });
 });

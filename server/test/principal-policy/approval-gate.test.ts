@@ -341,5 +341,86 @@ describe("Approval Gate", () => {
       const result = await gate.evaluate("state_export", {});
       expect(result.tier).toBe(1);
     });
+
+    it("agent-facing denial reason does not leak threshold values (Invariant #7) (#3)", async () => {
+      // Bulk-read trip: same namespace read repeatedly forces detectAnomaly()
+      // to produce a detailed reason that names `bulk_read_threshold`. The
+      // agent-facing GateResult.reason MUST NOT contain that value; the
+      // detailed reason continues to flow into the audit log + OOB channel.
+      const policy = createTestPolicy({
+        tier3_always_allow: ["state_read"],
+        tier2_anomaly: {
+          new_namespace_access: "log",
+          new_counterparty: "log",
+          frequency_spike_multiplier: 5,
+          max_signs_per_minute: 3,
+          bulk_read_threshold: 2,
+          first_session_policy: "allow",
+        },
+      });
+      await baseline.save();
+      const baseline2 = new BaselineTracker(storage, masterKey);
+      await baseline2.load();
+
+      const captured: ApprovalRequest[] = [];
+      const channel = new CallbackApprovalChannel(async (req) => {
+        captured.push(req);
+        return { decision: "deny", decided_at: new Date().toISOString(), decided_by: "human" };
+      });
+      const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
+
+      // Trigger bulk-read anomaly (3 reads against threshold 2)
+      await gate.evaluate("state_read", { namespace: "alpha" });
+      await gate.evaluate("state_read", { namespace: "alpha" });
+      const denied = await gate.evaluate("state_read", { namespace: "alpha" });
+
+      // Agent-facing surface: generic message, no thresholds, no rule names.
+      // Tier number is fine (it's the public classification, not a policy
+      // value); concrete threshold values like bulk_read_threshold,
+      // signs_per_minute, callRate, multiplier MUST NOT appear.
+      expect(denied.allowed).toBe(false);
+      expect(denied.reason).not.toContain("bulk_read_threshold");
+      expect(denied.reason).not.toContain("threshold");
+      expect(denied.reason).not.toContain("Bulk read");
+      expect(denied.reason).toBe("Tier 2 operation requires approval");
+
+      // OOB channel surface (human reviewer): detailed reason preserved
+      expect(captured.length).toBeGreaterThan(0);
+      const lastApproval = captured[captured.length - 1];
+      expect(lastApproval.reason).toContain("Bulk read");
+      expect(lastApproval.reason).toContain("threshold");
+    });
+
+    it("frequency-spike denial does not leak frequency_spike_multiplier (#3)", async () => {
+      const policy = createTestPolicy({
+        tier3_always_allow: ["state_write"],
+        tier2_anomaly: {
+          new_namespace_access: "log",
+          new_counterparty: "log",
+          frequency_spike_multiplier: 2,
+          max_signs_per_minute: 3,
+          bulk_read_threshold: 100,
+          first_session_policy: "allow",
+        },
+      });
+      await baseline.save();
+      const baseline2 = new BaselineTracker(storage, masterKey);
+      await baseline2.load();
+
+      const channel = new CallbackApprovalChannel(async () => ({
+        decision: "deny",
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      }));
+      const gate = new ApprovalGate(policy, baseline2, channel, auditLog);
+
+      // No detailed-reason leak even if anomaly fires
+      const denied = await gate.evaluate("state_write", { namespace: "alpha" });
+      // (Whether or not anomaly fires for state_write, the test enforces no leakage)
+      if (denied.approval_required && !denied.allowed) {
+        expect(denied.reason).not.toContain("frequency_spike_multiplier");
+        expect(denied.reason).not.toContain("Frequency spike");
+      }
+    });
   });
 });

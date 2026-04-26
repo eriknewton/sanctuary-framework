@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   applyConfiguredPrivacyFilter,
+  OPF_STDOUT_MAX_BYTES,
   PrivacyFilterRuntimeError,
   runOpenAIPrivacyFilter,
   type PrivacyFilterRuntimeConfig,
@@ -125,6 +126,29 @@ describe("privacy filter runtime runner", () => {
       mode: "off",
     });
     await expect(vault.resolvePlaceholder("EMAIL_1", "policy-a")).resolves.toBeNull();
+  });
+
+  it("rejects oversized OPF stdout before JSON.parse (#6)", async () => {
+    // Emit a payload just over the 10 MB cap. Using zero-padding keeps the
+    // test cheap on memory (no JSON tree growth) while exercising the
+    // pre-parse byte-length guard.
+    const command = join(tempDir, "mock-opf-oversized.mjs");
+    const oversized = OPF_STDOUT_MAX_BYTES + 1;
+    await writeFile(
+      command,
+      [
+        "#!/usr/bin/env node",
+        "process.stdin.resume();",
+        `process.stdout.write("0".repeat(${oversized}));`,
+        "",
+      ].join("\n"),
+      { mode: 0o700 }
+    );
+    await chmod(command, 0o700);
+
+    await expect(
+      runOpenAIPrivacyFilter("hello", opfConfig(command))
+    ).rejects.toThrow(/exceeded.*10000000.*cap/i);
   });
 
   async function writeOpfCommand(stdout: string): Promise<string> {
