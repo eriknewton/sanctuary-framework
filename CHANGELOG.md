@@ -4,26 +4,104 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## Unreleased — v1.1 acceptance drill suite + (j) plumbing (2026-04-25)
+## v1.1.0 — Local Sovereignty Harness (2026-04-25)
 
-v1.1 acceptance drills land as automated integration tests covering the four pillars of the Local Sovereignty Harness checklist (`server/docs/v1.1-acceptance-checklist.md`). The drills exercise the privacy core, internal coordination, operator hub, and exit bundle end-to-end against real fortresses with no mocks at the contract boundary. They are the gating proof that v1.1 implementation has converged before the v1.1.0 release tag.
+Sanctuary v1.1 ships the complete Local Sovereignty Harness for running and governing AI agents on operator-owned hardware. v1.1.0 is the first stable release on the 1.x line and the first that pilots can install to `latest` for production use. v1.0.0 GA tag is intentionally skipped (1.0.0-rc.2 was the precursor; 1.1.0 is a strict superset).
+
+The release adds four new pillars on top of v0.10.6 / v1.0.0-rc.2: query privacy enforcement, an operator hub API, internal agent coordination with signed handoffs, and durable portable exit bundles with a standalone verifier. A v1.1 sovereignty dashboard renders the four pillars as a single operator control surface. A harness compatibility matrix locks in v1.0/v1.1 wrap behavior for OpenClaw, Hermes, Claude Code, Cursor, Cline, and generic MCP. An acceptance drill suite covers the four pillars end-to-end against real fortresses. A pre-tag security wave closes three Sanctuary-invariant violations, runtime-validates the Sanctuary-Concordia bridge boundary, and adds a permanent canonical-JSON parity test guarding the bridge contract.
 
 ### Added
 
-- Four drill files under `server/test/drills/` mirroring the four acceptance pillars:
+- **v1.1 contracts** (PR #67): scope-lock contract types under `server/src/contracts/v1.1/` covering privacy events, hub events, local agent records, handoff records, and exit bundle manifest body. Every signed shape pins `signature_scheme: "ed25519-v1"` inside the signed bytes (substitution-resistance invariant). The contracts are the shared spine the rest of v1.1 builds against.
+
+- **Query privacy core** (PR #69): `LocalPrivacyEngine` at `server/src/l2-operational/privacy-core.ts` with `filterOutbound` and `rehydrateResponse`. Recursive bounded sensitive-span detection. Fortress-keyed HMAC content hashes via HKDF info string `sanctuary-v1.1-privacy-content-hmac`. Encrypted placeholder vault. Five destination categories (`inference`, `tool-api`, `logging`, `analytics`, `peer-agent`, `custom`). Five-kind audit-payload union (`allowed`, `filtered`, `denied`, `error`, `rehydrated`). Fail-closed semantics with explicit operator overrides.
+
+- **Remote-bound privacy enforcement** (PR #71): proxy router chokepoint at `server/src/proxy/proxy-router.ts` Step 3.5 routes every outbound proxied tool call through the privacy engine. Activation-gated on hub policy resolver wiring; production behavior unchanged until operator binds a privacy policy. Fourteen magic-string-wire-byte tests confirm the chokepoint runs on the production code path.
+
+- **Operator hub API** (PR #73): eleven routes under `/api/hub/` covering unified inbox (six discriminated-union event kinds: approval-pending, blocked egress, privacy event, budget warning, recovery prompt, agent error), local agent registry (list, get, status snapshot), agent control (pause / resume / restart / unwrap / lockdown / change template / change policy), policy summaries, budget summaries, and the activity feed (read-side projection over the audit chain). Tier 1 control actions (`unwrap`, `lockdown`, `policy_change`) defer to the inbox via `enqueueTier1ControlAction` and only fire the controller call after the operator approves the inbox item (operator-confirms-twice). Defense-in-depth cross-fortress rejection at both router (`rejectCrossFortressParams`) and service (`assertLocalOnlyFilter`) layers.
+
+- **Internal agent coordination** (PR #72): five-state local handoff lifecycle (`created -> accepted -> completed`, with branches `accepted -> denied`, `accepted -> failed`, `created -> denied`) under `server/src/coordination/`. Two-layer signing: Layer 1 handoff record signed by the sender agent's identity key; Layer 2 audit payload signed by the actor (sender / recipient / policy-gate). Every signature uses `Omit<…, "signature">` typing on the input so the signature field is structurally absent during canonicalization. Optional policy gate adapter for capability-based handoff filtering. Non-Concordia-dependency invariant guarded by a structural import-graph test.
+
+- **Exit bundle and verifier** (PR #70): durable signed export of fortress state, identity, audit history, policy set, reputation attestations, and placeholder vault metadata under `server/src/exit/`. Manifest format `SANCTUARY_EXIT_BUNDLE_V1` with eight path-safety rules enforced at write and verify. Standalone verifier CLI (`sanctuary exit verify`) runs out-of-process; the dashboard displays the verifier command, never invokes it in-process (the cross-process trust boundary is part of the sovereignty story). Re-key on import via `sourcePassphrase` flow; default `conflictResolution: "skip"` blocks silent overwrite.
+
+- **Harness compatibility matrix** (PR #74): formal `server/docs/harness-compatibility-matrix.md` plus 21 fixtures and smoke tests covering OpenClaw, Hermes, Claude Code, Cursor, Cline, and generic MCP wrap behavior. Documents the lazy-init pattern: `sanctuary wrap` configures the harness adapter and persists the passphrase but does NOT create the Ed25519 identity or audit-log genesis; those happen on first cocoon-unlock when the master key derives.
+
+- **Sovereignty Dashboard v1.1** (PR #75): server-rendered HTML with embedded ES module client at `server/src/dashboard/v1_1/`. Renders unified inbox (six event kinds with capability-gated actions), local agent registry, activity feed, privacy panel (safe-metadata-only render of `PrivacyAuditPayload`), exit drill wizard (six steps mapping to backend operations, verifier displayed as CLI command not invoked in-process), Tier 1 approval flow rendered honestly (no optimistic flips). SSE-driven live updates via `/api/stream`. Out-of-scope screens hidden from sidebar nav: federation (v1.3), composition (v1.4+ adapter), full recovery management (v1.2+).
+
+- **Fortress-level Tier 1 endpoints** (PR #77): `POST /api/hub/fortress/lockdown` and `POST /api/hub/fortress/exit-bundle/export`. Each creates a single inbox item; on operator approval the handler iterates per-agent (lockdown) or runs `exportExitBundle()` once at fortress scope (export). Routing-layer sentinel alias maps the dashboard's `/api/hub/agents/all/lockdown` and `/api/hub/agents/all/exit-bundle/export` call paths to the canonical `/fortress/*` handlers. Closes Dashboard Backend Binding Addendum §8.1.
+
+- **v1.1 acceptance drill suite** (PR #78): four drills under `server/test/drills/` mirroring the four acceptance pillars:
   - `v1.1-privacy-drill.test.ts`: outbound query containing PII, secrets, project, and client identifiers is filtered, audited safely (no raw spans in the audit payload), and rehydrated only when policy permits. Fail-closed sub-drill verifies missing-policy denial, oversized-payload denial, and operator-override permit-with-audit-trail.
   - `v1.1-coordination-drill.test.ts`: two-agent local handoff completes propose -> accept -> complete with verified Layer 1 record signatures and Layer 2 audit-payload signatures at every stage. Policy-gate sub-drill verifies deny short-circuits handoff creation. Non-Concordia-dependency sub-drill carries the structural import-graph crawl so the invariant cannot regress under acceptance review.
   - `v1.1-hub-drill.test.ts`: pause + resume run synchronously; fortress-wide Tier 1 lockdown via `/api/hub/fortress/lockdown` returns 202 + inbox item, defers controller invocation, and lands the lockdown only after the operator approves via the inbox (operator-confirms-twice). Privacy event surfaces under `category=privacy` in the activity feed; cross-fortress query parameter rejected with `HubLocalOnlyError` 422; unauthenticated request rejected with 401.
-  - `v1.1-exit-drill.test.ts`: source fortress with state, reputation, and audit history exports a SANCTUARY_EXIT_BUNDLE_V1 via the Tier 1 hub fortress endpoint; the operator-facing `sanctuary exit verify` CLI passes; tampering one byte fails with a non-zero exit code; injecting `..` in an artifact path fails with `failure_class: "artifact_path_unsafe"`; a fresh destination fortress imports + re-keys; re-import without explicit overwrite refuses to overwrite previously-imported state. v1.0.2 backlog items (h)/(i)/(j) verified inline (see Changed below for (j)).
+  - `v1.1-exit-drill.test.ts`: source fortress with state, reputation, and audit history exports a SANCTUARY_EXIT_BUNDLE_V1 via the Tier 1 hub fortress endpoint; the operator-facing `sanctuary exit verify` CLI passes; tampering one byte fails with a non-zero exit code; injecting `..` in an artifact path fails with `failure_class: "artifact_path_unsafe"`; a fresh destination fortress imports + re-keys; re-import without explicit overwrite refuses to overwrite previously-imported state.
+
+- **Cross-language canonical-JSON parity test** (PR #80, fix #18): new test at `server/test/integration/canonical-json-parity.test.ts` plus `sidecars/concordia/test-canonical-parity.py`. Twenty-four fixtures cover nesting, key ordering, integers, Unicode (Greek, CJK, emoji), escape sequences, null vs absent, signed-event shapes, and sort stability. Asserts byte-identical output between TypeScript `canonicalize()` and Python `canonical_json`. The test is the permanent guard on the Sanctuary-Concordia bridge contract that CLAUDE.md flags as Known Complexity #1 (highest-risk interop surface). All 24 fixtures parity-clean on first execution.
+
+- **Runtime shape validation on Sanctuary-Concordia bridge** (PR #80, fixes #1 + #8): new helper at `server/src/composition/assert-shape.ts` with runtime validators for sidecar JSON-RPC responses (`packConcordiaReceipt`, `verifyConcordiaReceipt`, `verifyMandate`). Malformed `receipt_id` (non-string), `signature` (null), missing fields, and extra fields all throw `SidecarResponseShapeError` before the result reaches L3/L4 commit-and-sign. The seven `agent-contract/schema.ts` validator paths refactored from `as unknown as AgentCardX` casts to explicit object literals; manual field guards above the cast are preserved, but the cast that bypassed tsc narrowing is gone.
 
 ### Changed
 
-- **v1.0.2 (j) `export_approval_audit_id` plumbing.** `HubServiceDeps.fortressExportBundle` now accepts an optional `approvalAuditId` argument; the hub passes the inbox item id when it invokes the callback after a fortress-scope Tier 1 approval lands. `ExportExitBundleOptions` carries an optional `exportApprovalAuditId` that, when present, becomes the manifest's `export_approval_audit_id` field and the L1 `exit_bundle_export` audit entry's `approval_id`. The manifest now ties one-to-one to the operator's actual Tier 1 inbox approval rather than an internally-generated `exit-export-${Date.now()}` id. Backwards-compatible: existing zero-arg callbacks and existing `exportExitBundle()` callers continue to work.
+- **Privacy filter fail-closed default** (PR #80, fix #2). `fail_mode` default changed from `"fallback"` to `"closed"` in BOTH `server/src/config.ts` `defaultConfig()` and `server/src/l2-operational/context-gate-tools.ts:68`. Operators on default config now get fail-closed semantics on OPF subprocess failure; explicit opt-in required for graceful-fallback behavior. **Behavior change.** Operators relying on the previous default need to set `fail_mode: "fallback"` explicitly if they want it. Closes Sanctuary Invariant #5 violation surfaced by the Quality Report.
 
-### Verified (no fix required)
+- **Denial messages redacted at gate boundary** (PR #80, fix #3). `server/src/principal-policy/gate.ts` redaction implemented at the single GateResult return site. Agent-facing denials now read `Tier ${tier} operation requires approval` instead of the previous detailed reasons that included `frequency_spike_multiplier`, `callRate`, `avgRate`, and bulk-read thresholds. The audit log STILL captures detailed reasons for the operator and the approval channel (which the operator authenticates to). Future denial paths inherit redaction automatically. Closes Sanctuary Invariant #7 violation (agent enumeration of policy thresholds).
 
-- **v1.0.2 (i) Import overwrite-refusal.** Default `conflictResolution` is `"skip"`. Re-importing the same bundle on a destination without explicit `conflictResolution: "overwrite"` reports state conflicts and skips the import; previously-imported state is not silently overwritten. Drill verifies via second-import call.
+- **Config structural validation before cast** (PR #80, fix #4). `assertSanctuaryConfigShape()` runs after `deepMerge()` and validates required object keys before the `as unknown as SanctuaryConfig` cast at `server/src/config.ts:407`. A malformed config file with missing required sections or wrong-typed values throws with a helpful error instead of passing silently into runtime.
+
+- **Privacy filter LRU-bounded caches** (PR #80, fix #9). The `cache: Map<string, PlaceholderRecord>` and `pathCache: Map<string, FieldPathRecord>` at `server/src/l2-operational/privacy-filter.ts` now use a bounded LRU (insertion-order Map eviction, 5000 entries each). Long-lived sessions can no longer accumulate unbounded cache entries.
+
+- **Signed-event-stream explicit close and heartbeat reaper** (PR #80, fix #14). `server/src/console/signed-event-stream.ts` adds a `close(clientId)` method that explicitly clears the keepalive interval and removes listeners, plus a heartbeat-timeout reaper that closes clients whose Response object has missed three consecutive keepalives (~75s at the 25s keepalive interval). Network-partitioned clients no longer leak intervals + listeners until garbage collection.
+
+- **10MB cap on OPF subprocess JSON output** (PR #80, fix #6). `server/src/l2-operational/privacy-filter-runner.ts:119` checks `Buffer.byteLength(stdout, "utf8") > OPF_STDOUT_MAX_BYTES` before `JSON.parse`. A misbehaving OPF process can no longer exhaust memory by emitting unbounded JSON before timeout. Mirrors the sidecar JSON-RPC 10MB cap pattern from PR #49.
+
+- **v1.0.2 (j) `export_approval_audit_id` plumbing** (PR #78). `HubServiceDeps.fortressExportBundle` now accepts an optional `approvalAuditId` argument; the hub passes the inbox item id when it invokes the callback after a fortress-scope Tier 1 approval lands. `ExportExitBundleOptions` carries an optional `exportApprovalAuditId` that, when present, becomes the manifest's `export_approval_audit_id` field and the L1 `exit_bundle_export` audit entry's `approval_id`. The manifest now ties one-to-one to the operator's actual Tier 1 inbox approval rather than an internally-generated `exit-export-${Date.now()}` id. Backwards-compatible: existing zero-arg callbacks and existing `exportExitBundle()` callers continue to work.
+
+- **v1.0.2 (l) README identity/audit drift fix** (PR #76). README install verification block split into post-wrap (dashboard responding, passphrase backed up) and post-first-unlock (identities loaded, audit log initialized) phases with an explanatory paragraph. Wrap configures; first-unlock initializes. Operators running the verification immediately after `sanctuary wrap` no longer see false negatives.
+
+- **v1.0.2 (k) CLI em-dash sweep** (PR #76 + PR #80). All user-facing CLI strings in `server/src/cli.ts`, `server/src/cocoon/cli.ts`, `server/src/update-check.ts`, `server/src/index.ts`, and `plugin/README.md` swept of em-dashes per the no-em-dash rule. Replaced with periods, commas, colons, or semicolons per context. New CI-time test gate at `server/test/cli/no-em-dash-in-cli.test.ts` prevents regression.
+
+- **`@noble/ciphers` patch bump** (PR #80, fix #12). 2.1.1 -> 2.2.0. Patch release; no breaking changes. v1 -> v2 migrations for `@noble/curves` and `@noble/hashes` deliberately deferred to the v1.4+ Crypto Agility Sprint.
+
+### Fixed
+
+- **v1.0.2 (a) Reset-history continuity** (PR #68). When a post-reset fortress spins up via `sanctuary wrap`, the lazy-init path on first cocoon-unlock reads the `.reset-history.log` marker written by `sanctuary reset-passphrase --nuke` and emits a signed `recovered-from-reset` audit entry hashing the prior marker into the new chain genesis. Closes the continuity gap between nuked and rebuilt fortress audit chains.
+
+- **Activity-feed categorizer routes `fortress_lockdown_engaged` to `lifecycle`** (PR #79). The categorizer at `server/src/hub/activity-feed.ts` now uses an extracted `LIFECYCLE_VERBS` constant and routes `fortress_*`-prefixed operations through it. `fortress_lockdown_engaged`, `fortress_lockdown_lifted`, and `fortress_unwrap_engaged` all return `category: "lifecycle"` per the dashboard binding addendum §1.2. `fortress_exit_bundle_exported` correctly falls through (it is not a lifecycle event).
+
+- **Per-agent Tier 1 lockdown approve handler emits lifecycle activity** (PR #79). `server/src/hub/hub-service.ts:267-300` now appends `agent_lockdown_engaged` (and `agent_unwrap_engaged` for the parallel path) to the audit log on successful per-agent Tier 1 approval. The per-agent path now mirrors the fortress-scope handler that PR #77 shipped.
+
+- **CHANGELOG.md `v0.9.0-rc.3 (unreleased — in progress)` orphan section** (PR #80, fix #11). Removed; the rc.3 work shipped under `v0.9.0` final and the placeholder no longer represented unfinished work.
+
+- **Stray empty `main` file at repo root** (PR #80, fix #16). Deleted. Predated the v1.1 audit window (introduced at v0.5.6 commit `0daa8eb`).
+
+- **Twenty-eight regex named-group non-null assertions** (PR #80, fix #15). `server/src/policy-engine/compiler-fixture.ts` replaced `m.groups!.X` patterns with safe per-block guards (`const g = m.groups; if (!g) continue;`). No happy-path behavior change; strictly safer if a future regex edit drops a required named group.
+
+### Verified (no fix required, drill confirms property holds)
+
+- **v1.0.2 (i) Import overwrite-refusal.** Default `conflictResolution` is `"skip"`. Re-importing the same bundle on a destination without explicit `conflictResolution: "overwrite"` reports state conflicts and skips the import; previously-imported state is not silently overwritten. Drill at `v1.1-exit-drill.test.ts` verifies via second-import call.
+
 - **v1.0.2 (h) Re-key cleanup.** Re-key occurs in memory inside `rekeyState()`; source-key-encrypted ciphertext is never persisted on the destination fortress. Source-key blobs live only inside the operator-owned bundle directory. Drill verifies by enumerating destination namespaces post-import and asserting none match staged-import or rekey-temp patterns.
+
+- **Sanctuary-Concordia bridge canonical-JSON parity.** Cross-language parity test at `server/test/integration/canonical-json-parity.test.ts` confirms TypeScript `canonicalize()` and Python `canonical_json` produce byte-identical output across 24 fixtures spanning nesting, key ordering, Unicode, integer/float boundaries, null vs absent, and signed-event shapes. The bridge contract holds end-to-end.
+
+### Deferred (out of v1.1 scope)
+
+- **v1.4+ Crypto Agility Sprint** — bundled real RFC 9420 MLS plus ML-DSA / ML-KEM-768 hybrid primitives. The `@noble/curves` and `@noble/hashes` v1 -> v2 majors gate on this sprint.
+- **v1.2 Mobile Operator Companion** — phone as approval surface, inbox, and emergency brake. Not a full mobile runtime.
+- **v1.3 Public Federation** — cross-operator discovery, messaging, and reputation.
+- **v1.4+ Key 17 sovereign-signer adapter** for x402 / Agentic.Market payments. Sanctuary signs Identity + x402 requests + AP2 mandates; Verascore signs Reputation + Validation; x402 wallets stay Coinbase-custodial.
+- **v1.4+ EU AI Act compliance generator** (operator-facing tool, not a Sanctuary-binding obligation).
+- **v1.4+ MSP / Fleet Operator Console** for service providers running agents on behalf of clients.
+- **v1.4+ Agent Vault composition adapter** for external-stack signing.
+
+### Notes
+
+- **v1.0.0 GA tag intentionally skipped.** v1.0.0-rc.2 was the precursor to v1.1.0; the v1.1 wave is a strict superset of the v1.0 functionality. Pilots install over the top via `npm install -g @sanctuary-framework/mcp-server@1.1.0`. Existing fortresses unlock cleanly under the same passphrase; v1.0 -> v1.1 schema migration happens on first dashboard open via the lazy-init pattern.
+- **`next` dist-tag removed at release.** v1.0.0-rc.2 stops being installable via `npm install ...@next` at v1.1.0 ship. The `next` label re-spawns when v1.2 pre-release work begins.
+- **Backwards compatible with v0.10.6.** Existing wrapped agents continue to function; the v1.1 dashboard renders the same agent registry plus the new privacy / coordination / exit / hub surfaces.
+- **Composition with Concordia and Verascore remains default-off and external** per the non-dependency principle. Sanctuary never requires Concordia, and vice versa. Verascore never requires either at runtime.
+- **Pilot operators on this version do NOT have remote-bound privacy enforcement active until they bind a privacy policy.** The proxy chokepoint shipped in PR #71; activation gates on the operator's hub policy resolver wiring (which lands at policy-creation time per the operator's choice).
+- **Quality Report 2026-04-25** sweep produced 21 fix items; 14 landed in PR #80 pre-tag wave; 7 deferred to v1.1.x backlog.
 
 ## v1.0.0-rc.2 (2026-04-23)
 
