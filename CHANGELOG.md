@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.1.1] - 2026-04-26
+
+Hotfix release. Closes the v1.1.0 release-blocker (recovery key truncated on display, Finding U), wires the v1.1 dashboard / hub API / exit bundle / coordination endpoints into the entry-point servers, and lands the fortress isolation flags that v1.1.0 advertised but silently ignored.
+
+### Fixed
+
+- **Recovery key disclosure (Finding U).** v1.1.0 printed the recovery key truncated with a literal `...` and never persisted the plaintext anywhere, so any operator following the documented init flow ended up with an unrecoverable fortress on principal loss. The fix prints the full key in a dynamically-sized banner, writes the plaintext to `<fortress>/recovery-key.txt` mode 0600 with explicit "move off-host immediately" instructions (single-issuance, never overwritten on subsequent runs), and adds an interactive confirmation prompt on TTY callers (bypass via `--no-confirm` for CI / launchd / systemd). The MCP server stdio first-run path is non-interactive by definition (the host harness owns stdin) and discloses via banner plus file only.
+
 ## v1.1.0 — Local Sovereignty Harness (2026-04-25)
 
 Sanctuary v1.1 ships the complete Local Sovereignty Harness for running and governing AI agents on operator-owned hardware. v1.1.0 is the first stable release on the 1.x line and the first that pilots can install to `latest` for production use. v1.0.0 GA tag is intentionally skipped (1.0.0-rc.2 was the precursor; 1.1.0 is a strict superset).

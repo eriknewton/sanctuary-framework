@@ -45,6 +45,11 @@ import {
   keychainServiceFor,
   PassphraseUnreadableError,
 } from "./cocoon/passphrase.js";
+import {
+  discloseRecoveryKey,
+  RecoveryKeyConfirmationDeclinedError,
+  RecoveryKeyConfirmationNonInteractiveError,
+} from "./cocoon/recovery-key-disclosure.js";
 import { discoverTenants, findTenant, type TenantDescriptor } from "./cli/agents/discovery.js";
 
 export interface StandaloneDashboardOptions {
@@ -58,6 +63,12 @@ export interface StandaloneDashboardOptions {
    * because the operator typed it explicitly. Throws when no tenant matches.
    */
   tenant?: string;
+  /**
+   * Skip the interactive confirmation prompt when the standalone dashboard
+   * generates a fresh recovery key on first run. Required for non-TTY
+   * (CI/launchd/systemd) callers that would otherwise refuse to start.
+   */
+  noConfirm?: boolean;
 }
 
 /**
@@ -319,15 +330,22 @@ export async function startStandaloneDashboard(
       const keyHash = hashToString(masterKey);
       await storage.write("_meta", "recovery-key-hash", stringToBytes(keyHash));
 
-      console.error(
-        "╔══════════════════════════════════════════════════════════╗\n" +
-        "║  SANCTUARY: First Run — Recovery Key Generated          ║\n" +
-        "║                                                          ║\n" +
-        `║  Recovery Key: ${recoveryKey.slice(0, 20)}...             ║\n` +
-        "║                                                          ║\n" +
-        "║  SAVE THIS KEY. It will not be shown again.              ║\n" +
-        "╚══════════════════════════════════════════════════════════╝\n"
-      );
+      try {
+        await discloseRecoveryKey({
+          recoveryKey,
+          storagePath: config.storage_path,
+          mode: options.noConfirm ? "no-confirm" : "interactive",
+        });
+      } catch (err) {
+        if (
+          err instanceof RecoveryKeyConfirmationDeclinedError ||
+          err instanceof RecoveryKeyConfirmationNonInteractiveError
+        ) {
+          console.error(`\nSanctuary Dashboard: ${err.message}\n`);
+          process.exit(2);
+        }
+        throw err;
+      }
     }
   }
 

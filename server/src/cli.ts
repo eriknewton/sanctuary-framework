@@ -168,6 +168,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   let host: string | undefined;
   let multi = false;
   let tenant: string | undefined;
+  let noConfirm = false;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--passphrase" && args[i + 1]) {
@@ -183,6 +184,8 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       multi = true;
     } else if (args[i] === "--tenant" && args[i + 1]) {
       tenant = args[++i];
+    } else if (args[i] === "--no-confirm") {
+      noConfirm = true;
     } else if (args[i] === "--help" || args[i] === "-h") {
       printDashboardHelp();
       process.exit(0);
@@ -224,6 +227,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
     port,
     host,
     ...(tenant !== undefined ? { tenant } : {}),
+    noConfirm,
   });
 
   // Keep the process alive — the HTTP server is listening
@@ -382,6 +386,8 @@ Options:
   --multi              Start the multi-agent overview instead of a single-tenant
                        dashboard. Does not decrypt any tenant state; scans every
                        tenant on the host and deep-links into per-tenant dashboards.
+  --no-confirm         Skip the recovery-key confirmation prompt on first run.
+                       Required for non-TTY callers (CI, launchd, systemd).
   --help, -h           Show this help
 
 Environment variables:

@@ -51,6 +51,7 @@ import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
+import { discloseRecoveryKey } from "./cocoon/recovery-key-disclosure.js";
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
@@ -862,18 +863,18 @@ export async function createSanctuaryServer(options?: {
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
 
-  // 22. Log the recovery key if generated (shown once, never again)
+  // 22. Disclose the full recovery key if generated (shown once, never again).
+  // The MCP server stdio path is not interactive (the host harness owns
+  // stdin), so we disclose via banner + recovery-key.txt file but skip the
+  // confirmation prompt. Operators who want the prompt should run
+  // `sanctuary init` first instead of letting the stdio server first-run
+  // generate the key.
   if (recoveryKey) {
-    console.error(
-      "╔══════════════════════════════════════════════════════════╗\n" +
-      "║  SANCTUARY: First Run, Recovery Key Generated           ║\n" +
-      "║                                                          ║\n" +
-      `║  Recovery Key: ${recoveryKey.slice(0, 20)}...             ║\n` +
-      "║                                                          ║\n" +
-      "║  SAVE THIS KEY. It will not be shown again.              ║\n" +
-      "║  Without it, your encrypted state is unrecoverable.      ║\n" +
-      "╚══════════════════════════════════════════════════════════╝"
-    );
+    await discloseRecoveryKey({
+      recoveryKey,
+      storagePath: config.storage_path,
+      mode: "stdio-server",
+    });
   }
 
   return {
