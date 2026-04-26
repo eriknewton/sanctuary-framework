@@ -38,6 +38,23 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "init") {
+    const { parseInitArgs, runInit, printInitHelp } = await import(
+      "./cocoon/init.js"
+    );
+    const opts = parseInitArgs(args.slice(1));
+    if (opts.helpRequested) {
+      printInitHelp();
+      process.exit(0);
+    }
+    try {
+      await runInit(opts);
+      process.exit(0);
+    } catch {
+      process.exit(1);
+    }
+  }
+
   if (args[0] === "cocoon") {
     // Hidden deprecated alias — one-release grace period before removal.
     console.error(
@@ -311,6 +328,7 @@ Sovereignty infrastructure for agents in the agentic economy.
 
 Usage:
   sanctuary [options]                     # MCP server (stdio)
+  sanctuary init [opts]                   # Create a fresh fortress
   sanctuary dashboard [opts]              # Standalone dashboard
   sanctuary wrap [opts]                   # Wrap an agent in one command
   sanctuary export-passphrase             # Print stored passphrase
@@ -321,6 +339,11 @@ Options:
   --version, -v        Show version
 
 Subcommands:
+  init                 Create a fresh fortress at a chosen path. Pairs
+                       with --fortress to keep multiple fortresses
+                       isolated on one host.
+                       Use "sanctuary init --help" for options.
+
   wrap                 Wrap an agent and start the dashboard in one command.
                        Auto-generates a passphrase, auto-opens the browser.
                        Use "sanctuary wrap --help" for options.
@@ -352,6 +375,7 @@ Subcommands:
 
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
+  SANCTUARY_FORTRESS_PATH           Operator-friendly alias for STORAGE_PATH
   SANCTUARY_PASSPHRASE              Key derivation passphrase
   SANCTUARY_DASHBOARD_ENABLED       "true" to enable dashboard
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
@@ -392,6 +416,7 @@ Options:
 
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
+  SANCTUARY_FORTRESS_PATH           Operator-friendly alias for STORAGE_PATH
   SANCTUARY_PASSPHRASE              Key derivation passphrase
   SANCTUARY_RECOVERY_KEY            Recovery key for existing installations
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)

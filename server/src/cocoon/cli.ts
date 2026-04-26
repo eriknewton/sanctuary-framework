@@ -79,6 +79,13 @@ export interface WrapOptions {
   /** Explicit passphrase override. If unset, one is generated and stored. */
   passphrase?: string;
   /**
+   * Operator-supplied fortress path. Overrides SANCTUARY_FORTRESS_PATH and
+   * SANCTUARY_STORAGE_PATH env vars. v1.1.0 silently ignored this flag
+   * (Finding T); v1.1.1 honors it end-to-end. The fortress directory is
+   * created if it does not exist.
+   */
+  fortress?: string;
+  /**
    * Dashboard port (default 3501). If bound, the loop retries
    * `preferredPort` through `preferredPort + PORT_FALLBACK_ATTEMPTS - 1`
    * regardless of the absolute port number. v0.10.0 shipped a hardcoded
@@ -94,6 +101,34 @@ export interface WrapOptions {
 
 /** Backward-compat alias for the old `parseCocoonArgs` return type. */
 export type CocoonOptions = WrapOptions;
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+/**
+ * v1.1.1 hotfix (Finding T): promote --fortress and SANCTUARY_FORTRESS_PATH
+ * onto SANCTUARY_STORAGE_PATH so downstream code that reads
+ * SANCTUARY_STORAGE_PATH (resolveStoragePath, etc.) sees the operator's
+ * intended fortress location.
+ *
+ * Precedence (highest wins):
+ *   1. options.fortress (--fortress CLI flag)
+ *   2. SANCTUARY_FORTRESS_PATH env var
+ *   3. SANCTUARY_STORAGE_PATH env var (left untouched)
+ *
+ * Exported for unit tests that pin precedence without standing up the
+ * whole wrap flow.
+ */
+export function promoteFortressToStoragePath(options: {
+  fortress?: string;
+}): void {
+  if (options.fortress) {
+    process.env.SANCTUARY_STORAGE_PATH = options.fortress;
+    return;
+  }
+  if (process.env.SANCTUARY_FORTRESS_PATH) {
+    process.env.SANCTUARY_STORAGE_PATH = process.env.SANCTUARY_FORTRESS_PATH;
+  }
+}
 
 // ── Constants ───────────────────────────────────────────────────────
 
@@ -158,6 +193,12 @@ export async function runWrap(
     await unwrap();
     return;
   }
+
+  // v1.1.1 hotfix (Finding T): honor --fortress and SANCTUARY_FORTRESS_PATH
+  // by promoting them onto SANCTUARY_STORAGE_PATH BEFORE any code calls
+  // resolveStoragePath(). Extracted so tests can pin the precedence
+  // without standing up the whole wrap flow.
+  promoteFortressToStoragePath(options);
 
   let platformHint: AgentPlatform | undefined;
   if (options.openclaw) platformHint = "openclaw";
@@ -823,6 +864,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--no-open":
         options.noOpen = true;
         break;
+      case "--fortress":
+        options.fortress = argv[++i];
+        break;
       case "--help":
       case "-h":
         printWrapHelp();
@@ -858,6 +902,10 @@ function printWrapHelp(): void {
     --wrap <path>      Wrap a specific MCP config file
     --unwrap           Restore original config from backup
     --passphrase <p>   Override the stored passphrase (one-off)
+    --fortress <path>  Fortress directory (default: ~/.sanctuary). Honors
+                       SANCTUARY_FORTRESS_PATH env var when the flag is
+                       absent. Use to keep multiple fortresses isolated
+                       on one host.
     --port <port>      Preferred dashboard port (default: 3501)
     --dry-run          Show what would happen without making changes
     --no-open          Do not auto-open the dashboard in a browser
