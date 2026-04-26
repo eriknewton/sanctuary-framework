@@ -123,13 +123,23 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
   it("discoverableSubTenants() returns initialized tenants under the discovery root, excluding the configured path", async () => {
     await seedTenant(join(root, "alpha"), "alpha-pass", 1);
     await seedTenant(join(root, "beta"), "beta-pass", 1);
-    const found = await discoverableSubTenants(root);
+    // Pass an isolated discovery scope rooted at the temp dir so the test
+    // never reads from the developer's real ~/.sanctuary/. Without this,
+    // a developer machine that has run `sanctuary wrap` for real surfaces
+    // its own "default" tenant and the not-toContain("default") assertion
+    // below fails — bites local commits even though CI passes on fresh
+    // runners. The configured currentStoragePath is `root` itself, which
+    // is the parent of the seeded tenants and not initialized as a tenant
+    // on its own, so it is correctly excluded by both the `initialized`
+    // filter and the `currentStoragePath` filter.
+    const found = await discoverableSubTenants(root, {
+      root,
+      home: root,
+      env: {},
+    });
     const names = found.map((t) => t.name).sort();
-    // discovery scans HOME — under the temp dir there is nothing, so this
-    // assertion validates the function shape (returns an array, never
-    // throws). The full integration is exercised by the throw + boot tests
-    // below using SANCTUARY_AGENTS_EXTRA_PATHS to register the temp tenants.
     expect(Array.isArray(found)).toBe(true);
+    expect(names).toEqual(["alpha", "beta"]);
     expect(names).not.toContain("default"); // never includes the configured path
   });
 
