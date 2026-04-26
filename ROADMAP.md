@@ -6,7 +6,7 @@ Your agent. Your machine. Your keys.
 
 This document is the public milestone view. Shipped history lives in `CHANGELOG.md`. Interface specs live in `server/docs/`. Scope documentation is maintained privately and released to the public repo on version bumps.
 
-Last updated: 2026-04-25.
+Last updated: 2026-04-26.
 
 ---
 
@@ -16,11 +16,13 @@ v1.1 makes Sanctuary the complete local sovereignty harness.
 
 v1.2 makes the harness available from the operator's phone.
 
-v1.3 opens sovereign agent-to-agent interaction across operator boundaries.
+v1.3 makes the operator's data sovereign before the data crosses any boundary.
 
-v1.4+ expands into fleet, payments, compliance, advanced cryptography, operator cloud, and managed TEE modes.
+v1.4 opens sovereign agent-to-agent interaction across operator boundaries.
 
-The current sequencing deliberately delays public federation, fleet management, payment rails, compliance packs, and cryptographic migration until the local operator experience is complete. The local harness is the product center: attach agents, communicate with them, coordinate them, filter what leaves, record what happened, and leave with the durable record.
+v1.5+ expands into fleet, payments, compliance, advanced cryptography, operator cloud, and managed TEE modes.
+
+The current sequencing deliberately delays public federation, fleet management, payment rails, compliance packs, and cryptographic migration until the local operator experience is complete and the operator owns the durable record. The local harness is the product center: attach agents, communicate with them, coordinate them, filter what leaves, record what happened, hold that record where the operator owns it, and leave with that record intact.
 
 ---
 
@@ -331,11 +333,55 @@ An operator pairs a phone, receives a generic approval notification, opens the a
 
 ---
 
-## v1.3: Public Federation
+## v1.3: Sovereign Data Warehouse
+
+The agent's durable record belongs to the operator. v1.3 builds the substrate so the operator's working data, query history, document corpus, and intermediate state live in a place the operator controls, not in a vendor's silo.
+
+This is the precondition for public federation to be operationally meaningful. Two operators federating empty fortresses is a demo. Two operators federating fortresses that hold their actual work is a network.
+
+### 1. Ingestion Adapter Template
+
+Capabilities:
+
+- Pluggable adapter interface for pulling vendor-side state (chat history, document corpus, project state, query logs) into the operator's fortress
+- Per-source provenance envelope recording when each record was ingested, from where, and under which credential
+- Operator-controlled scheduling, retention, and deletion
+- Audit entries for every ingestion event
+
+### 2. Sovereign Data Lake Schema And Indexing Primitive
+
+Capabilities:
+
+- Operator-sovereign storage layout for ingested and locally generated data
+- Cross-source query routing that preserves provenance in the result
+- Vendor-state and operator-state separation at the schema layer
+- Slice-scope policy DSL extension so policies bind to data slices, not just to actions
+- Local index suitable for the working sizes a single operator generates
+
+This is the load-bearing surface. Schema design is a real research project, not a port of an existing pattern.
+
+### 3. Continuous-Sync Orchestration
+
+Capabilities:
+
+- Workflow primitive for long-running sync jobs across vendor sources
+- Composes with the v1.1 internal coordination layer for multi-step sync workflows
+- Failure modes that degrade gracefully without losing provenance
+- Operator-visible status and intervention surface
+
+Substrate selection is informed by parallel composition mapping research. The sync layer composes with an external workflow engine rather than building one in-tree.
+
+### v1.3 Acceptance Gate
+
+A pilot ingests a meaningful slice of one vendor's data into their fortress, queries it locally with provenance preserved, applies a slice-scope policy, runs a multi-step sync, and demonstrates that the data continues to be available after the vendor relationship ends.
+
+---
+
+## v1.4: Public Federation
 
 Public federation is the outside-world coordination layer. Independent Sanctuary operators can let agents discover, message, verify, or transact across fortress boundaries without joining one central platform.
 
-This is important for the future of agent-to-agent interaction, but it is delayed until local privacy, operator control, internal coordination, and exit are solid.
+This is important for the future of agent-to-agent interaction, but it is delayed until local privacy, operator control, internal coordination, exit, and operator-owned data are solid.
 
 Capabilities:
 
@@ -353,9 +399,9 @@ Two independent operators complete a signed cross-fortress interaction where eac
 
 ---
 
-## v1.4+ Expansion
+## v1.5+ Expansion
 
-These tracks start only after v1.1 has completed the local harness and v1.2/v1.3 have validated mobile and public coordination demand.
+These tracks start only after v1.1 has completed the local harness and v1.2, v1.3, and v1.4 have validated mobile, sovereign data, and public federation.
 
 - Fleet operator console for multi-operator estates
 - Agent Vault composition adapter for sovereign signing of external-stack payment rails, delegation mandates, and reputation receipts
