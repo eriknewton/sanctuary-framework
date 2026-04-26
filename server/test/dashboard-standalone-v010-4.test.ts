@@ -88,10 +88,18 @@ async function seedTenant(
 describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
   let dashboard: DashboardApprovalChannel | null = null;
   let root: string;
+  let originalHome: string | undefined;
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "sanctuary-v010-4-"));
     process.env.VITEST = "true";
+    // Override HOME so discoverTenants() does not scan the developer's real
+    // ~/.sanctuary (which on a developer machine includes a "default"
+    // tenant and breaks the assertion below). CI runners have no
+    // ~/.sanctuary so the assertion held there even without this override;
+    // local runs against a wrapped Sanctuary install previously failed.
+    originalHome = process.env.HOME;
+    process.env.HOME = root;
   });
 
   afterEach(async () => {
@@ -105,6 +113,11 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
     delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
     delete process.env.SANCTUARY_DASHBOARD_PORT;
     delete process.env.SANCTUARY_RECOVERY_KEY;
+    if (originalHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
+    }
   });
 
   it("discoverableSubTenants() returns initialized tenants under the discovery root, excluding the configured path", async () => {
