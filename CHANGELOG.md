@@ -222,27 +222,6 @@ dead-claim purge); README rewrite for agent-mediated install (#54).
 
 No code changes. Messaging-clarity patch only.
 
-## v0.9.0-rc.3 (unreleased — in progress)
-
-### Fixed
-- Constant-time comparison for L3 commitment verification (audit #15)
-- Non-macOS fallback storage warning on first wrap (SEC-063)
-- Audit log size-based rotation with configurable limits (audit #18)
-
-### Changed
-- Bumped `@modelcontextprotocol/sdk` to ^1.29.0 — resolves path-to-regexp DoS, hono advisories
-- Removed 3 `as any` casts with typed adapters (audit #1, #2, #3)
-- Paginated reputation store `loadAll()` via async iterator (audit #31)
-- HKDF namespace key cache (LRU, 15-min TTL) in StateStore (audit #36)
-- Async TLS cert reads in dashboard (audit #33)
-- Combined zero-width char regex into single pattern (audit #38)
-- Refreshed CLAUDE.md and README version/tool claims to match v0.9.0-rc.1
-- Updated CHANGELOG to Keep-a-Changelog format through rc.3
-
-### Added
-- Test coverage for 9 previously untested source files
-- Regression tests for 1MB input cap and encoded-payload re-scanning mitigations
-
 ## v0.9.0-rc.2 (2026-04-17)
 
 ### Security
