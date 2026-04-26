@@ -292,6 +292,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return handled;
     }
 
+    // v1.1.1 hotfix (Finding E): /api/identities is the pre-v1.1
+    // endpoint name some operator scripts target. Alias it to
+    // /api/hub/agents so existing tooling keeps working through the
+    // upgrade. Same auth contract; same response shape.
+    if (method === "GET" && url.pathname === "/api/identities") {
+      const authConfig: AuthConfig = {
+        loopbackAutoAuth: this._autoAuthLocalhost,
+        ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
+      };
+      // Rewrite the URL so the hub router matches /api/hub/agents.
+      const aliasReq = Object.create(req) as IncomingMessage;
+      aliasReq.url = "/api/hub/agents" + url.search;
+      const handled = await handleHubRoute(
+        { authConfig, service: this.v11Bindings.hubService },
+        aliasReq,
+        res,
+      );
+      return handled;
+    }
+
     return false;
   }
 

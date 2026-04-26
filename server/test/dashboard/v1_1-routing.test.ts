@@ -218,4 +218,37 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
     });
     expect(res.status).toBe(404);
   });
+
+  // v1.1.1 hotfix Finding E: /api/identities was the pre-v1.1 endpoint
+  // name; this hotfix aliases it to /api/hub/agents for back-compat.
+  it("GET /api/identities aliases to /api/hub/agents (Finding E back-compat)", async () => {
+    const aliasRes = await fetch(`${rig.baseUrl}/api/identities`, {
+      headers: { Authorization: `Bearer ${rig.authToken}` },
+    });
+    const directRes = await fetch(`${rig.baseUrl}/api/hub/agents`, {
+      headers: { Authorization: `Bearer ${rig.authToken}` },
+    });
+    expect(aliasRes.status).toBe(200);
+    expect(directRes.status).toBe(200);
+    const aliasBody = (await aliasRes.json()) as { ok: boolean; data: unknown };
+    const directBody = (await directRes.json()) as { ok: boolean; data: unknown };
+    expect(aliasBody).toEqual(directBody);
+  });
+
+  it("GET /api/identities preserves query string (?harness=foo)", async () => {
+    const res = await fetch(
+      `${rig.baseUrl}/api/identities?harness=openclaw&limit=5`,
+      {
+        headers: { Authorization: `Bearer ${rig.authToken}` },
+      },
+    );
+    // Empty registry returns empty list regardless of filters; the assertion
+    // is shape, not contents.
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      data: { agents: unknown[] };
+    };
+    expect(Array.isArray(body.data.agents)).toBe(true);
+  });
 });

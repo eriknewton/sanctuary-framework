@@ -22,6 +22,8 @@ Hotfix release. Closes the v1.1.0 release-blocker (recovery key truncated on dis
 
 - **v1.1 server route wiring.** v1.1.0 shipped the v1.1 module suite (dashboard, hub API, exit bundle endpoints, coordination endpoints) but no entry-point server imported them, so operators saw only the legacy v1.0 surface after install. The hotfix mounts v1.1 additively at `/v1.1` (legacy stays at `/`) on both `dashboard-standalone.ts` and the embedded `principal-policy/dashboard.ts`. Hub API at `/api/hub/*` (agents, inbox, fortress exit-bundle, policy and budget summaries, activity feed). Activity feed reads from the real audit log; agent registry, inbox sources, and policy / budget summaries start empty and light up as v1.2 wires their data planes. Agent controller surfaces a typed capability error rather than lying about pause / unwrap / lockdown. Default-route flip from `/` to `/v1.1` is deferred to v1.2.
 
+- **`/api/identities` back-compat alias (Finding E).** Returns the same response shape as `/api/hub/agents` so existing operator scripts targeting the pre-v1.1 endpoint name keep working through the upgrade. Preserves query-string filters. Same auth contract as the hub API.
+
 ## v1.1.0 — Local Sovereignty Harness (2026-04-25)
 
 Sanctuary v1.1 ships the complete Local Sovereignty Harness for running and governing AI agents on operator-owned hardware. v1.1.0 is the first stable release on the 1.x line and the first that pilots can install to `latest` for production use. v1.0.0 GA tag is intentionally skipped (1.0.0-rc.2 was the precursor; 1.1.0 is a strict superset).
