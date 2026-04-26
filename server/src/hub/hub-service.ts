@@ -346,6 +346,17 @@ export class HubService {
       if (decision === "deny") return;
       await this.deps.agentController.bindPolicy(record.agent_id, policyId);
       this.deps.agentRegistry.updatePolicyBinding(record.agent_id, policyId);
+      this.deps.activitySources.auditLog.append(
+        "l2",
+        "agent_policy_change_engaged",
+        this.deps.identityId,
+        {
+          agent_id: record.agent_id,
+          identity_id: record.identity_id,
+          operator_audit_id: itemId,
+          policy_id: policyId,
+        },
+      );
     });
 
     return {
