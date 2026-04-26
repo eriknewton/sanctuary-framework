@@ -51,6 +51,10 @@ import {
   RecoveryKeyConfirmationNonInteractiveError,
 } from "./cocoon/recovery-key-disclosure.js";
 import { discoverTenants, findTenant, type TenantDescriptor } from "./cli/agents/discovery.js";
+import {
+  buildV11Bindings,
+  fortressIdFromStoragePath,
+} from "./dashboard/v1_1/wiring.js";
 
 export interface StandaloneDashboardOptions {
   passphrase?: string;
@@ -423,6 +427,22 @@ export async function startStandaloneDashboard(
     profileStore,
   });
   dashboard.setStandaloneMode(true);
+
+  // v1.1.1 hotfix: light up the v1.1 dashboard at /v1.1 plus the operator
+  // hub API at /api/hub/*. Legacy routes at / continue to serve. The
+  // primary identity (if any) scopes the hub; an empty identity registry
+  // falls back to a synthesized fortress-local label so the API surface
+  // stays consistent across boots without any identity unlocked.
+  const hubIdentityId =
+    identityManager.getPrimaryIdentityId() ??
+    `fortress:${config.storage_path}`;
+  dashboard.setV11Bindings(
+    buildV11Bindings({
+      identityId: hubIdentityId,
+      fortressId: fortressIdFromStoragePath(config.storage_path),
+      auditLog,
+    }),
+  );
 
   // v0.10.2 — loopback auto-auth: the passphrase that unlocked at least
   // one identity above is strictly stronger than the dashboard bearer

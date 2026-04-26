@@ -52,6 +52,10 @@ import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
 import { discloseRecoveryKey } from "./cocoon/recovery-key-disclosure.js";
+import {
+  buildV11Bindings,
+  fortressIdFromStoragePath,
+} from "./dashboard/v1_1/wiring.js";
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
@@ -616,6 +620,21 @@ export async function createSanctuaryServer(options?: {
       sanctuaryConfig: config,
       profileStore,
     });
+    // v1.1.1 hotfix: bind the v1.1 dashboard at /v1.1 + hub API at
+    // /api/hub/* on the embedded dashboard path so operators see the
+    // v1.1 surface whether they boot via `sanctuary --dashboard` or
+    // `sanctuary dashboard` (standalone). Legacy routes at / continue
+    // to serve.
+    const embeddedHubIdentityId =
+      identityManager.getPrimaryIdentityId() ??
+      `fortress:${config.storage_path}`;
+    dashboard.setV11Bindings(
+      buildV11Bindings({
+        identityId: embeddedHubIdentityId,
+        fortressId: fortressIdFromStoragePath(config.storage_path),
+        auditLog,
+      }),
+    );
     await dashboard.start();
     approvalChannel = dashboard;
   } else if (config.webhook.enabled && config.webhook.url && config.webhook.secret) {

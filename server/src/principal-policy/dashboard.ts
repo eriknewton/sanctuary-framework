@@ -40,6 +40,10 @@ import { generateFortressViewHTML } from "../cocoon/fortress-view.js";
 import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer } from "../sovereignty-profile.js";
 import { generateSystemPrompt } from "../system-prompt-generator.js";
 import type { ClientManager } from "../proxy/client-manager.js";
+import { handleHubRoute } from "../hub/api-router.js";
+import { handleDashboardV11Route } from "../dashboard/v1_1/index.js";
+import type { V11Bindings } from "../dashboard/v1_1/wiring.js";
+import type { AuthConfig } from "../console/auth-middleware.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -162,6 +166,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * policy change.
    */
   private _autoAuthLocalhost = false;
+  /**
+   * v1.1 routes (dashboard HTML at /v1.1, hub API at /api/hub/*) are
+   * mounted additively when set. Legacy routes at / continue to serve
+   * regardless. Default route flip is deferred to v1.2.
+   */
+  private v11Bindings: V11Bindings | null = null;
 
   constructor(config: DashboardConfig) {
     this.config = config;
@@ -215,6 +225,74 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   setStandaloneMode(standalone: boolean): void {
     this._standaloneMode = standalone;
+  }
+
+  /**
+   * v1.1.1 hotfix: bind the v1.1 dashboard + hub API to this dashboard
+   * instance. After binding, requests to `/v1.1` serve the v1.1 HTML and
+   * requests under `/api/hub/*` route through the hub API. Legacy routes
+   * at `/` and `/api/*` keep their pre-v1.1 behavior (additive mount).
+   *
+   * Pass `null` to detach the bindings (used by tests and during shutdown).
+   */
+  setV11Bindings(bindings: V11Bindings | null): void {
+    this.v11Bindings = bindings;
+  }
+
+  /**
+   * v1.1 dispatch entry point. Called from `handleRequest` before the
+   * legacy route table. Returns true when the request was served by v1.1
+   * routes; false to fall through to legacy routing.
+   *
+   * Auth gating: the v1.1 dashboard HTML is served unconditionally (the
+   * client script handles its own auth dance). Hub API routes run through
+   * the same auth contract as legacy `/api/*` routes via the AuthConfig
+   * passed to `handleHubRoute`.
+   */
+  private async dispatchV11(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+    method: string,
+  ): Promise<boolean> {
+    if (!this.v11Bindings) return false;
+
+    // v1.1 dashboard HTML at /v1.1 (and trailing slash). Served before
+    // auth so the operator can land on the page; the inline client
+    // negotiates the bearer token / loopback auto-auth on its own.
+    if (
+      method === "GET" &&
+      (url.pathname === "/v1.1" || url.pathname === "/v1.1/")
+    ) {
+      const handled = handleDashboardV11Route(
+        {
+          identityId: this.v11Bindings.identityId,
+          fortressId: this.v11Bindings.fortressId,
+          ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
+        },
+        req,
+        res,
+      );
+      return handled;
+    }
+
+    // Hub API at /api/hub/*. Reuses dashboard auth: bearer-token gate
+    // unless loopback auto-auth is enabled, in which case loopback
+    // requests pass without a token.
+    if (url.pathname.startsWith("/api/hub/")) {
+      const authConfig: AuthConfig = {
+        loopbackAutoAuth: this._autoAuthLocalhost,
+        ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
+      };
+      const handled = await handleHubRoute(
+        { authConfig, service: this.v11Bindings.hubService },
+        req,
+        res,
+      );
+      return handled;
+    }
+
+    return false;
   }
 
   /**
@@ -655,6 +733,35 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
 
+    // v1.1.1 hotfix: try v1.1 dispatch first. dispatchV11 returns true when
+    // the request matched a v1.1 route (dashboard HTML at /v1.1, hub API
+    // at /api/hub/*). When false, fall through to the legacy route table
+    // below so v1.0 surfaces stay live (additive mount, default route flip
+    // deferred to v1.2).
+    if (this.v11Bindings) {
+      this.dispatchV11(req, res, url, method)
+        .then((handled) => {
+          if (handled) return;
+          this.handleLegacyRequest(req, res, url, method);
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+      return;
+    }
+
+    this.handleLegacyRequest(req, res, url, method);
+  }
+
+  private handleLegacyRequest(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+    method: string,
+  ): void {
     // SEC-012: Session exchange does its own auth (header-only) — let it through before checkAuth
     if (method === "POST" && url.pathname === "/auth/session") {
       if (!this.checkRateLimit(req, res, "general")) return;

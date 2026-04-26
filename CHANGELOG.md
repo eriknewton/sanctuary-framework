@@ -12,6 +12,10 @@ Hotfix release. Closes the v1.1.0 release-blocker (recovery key truncated on dis
 
 - **Recovery key disclosure (Finding U).** v1.1.0 printed the recovery key truncated with a literal `...` and never persisted the plaintext anywhere, so any operator following the documented init flow ended up with an unrecoverable fortress on principal loss. The fix prints the full key in a dynamically-sized banner, writes the plaintext to `<fortress>/recovery-key.txt` mode 0600 with explicit "move off-host immediately" instructions (single-issuance, never overwritten on subsequent runs), and adds an interactive confirmation prompt on TTY callers (bypass via `--no-confirm` for CI / launchd / systemd). The MCP server stdio first-run path is non-interactive by definition (the host harness owns stdin) and discloses via banner plus file only.
 
+### Added
+
+- **v1.1 server route wiring.** v1.1.0 shipped the v1.1 module suite (dashboard, hub API, exit bundle endpoints, coordination endpoints) but no entry-point server imported them, so operators saw only the legacy v1.0 surface after install. The hotfix mounts v1.1 additively at `/v1.1` (legacy stays at `/`) on both `dashboard-standalone.ts` and the embedded `principal-policy/dashboard.ts`. Hub API at `/api/hub/*` (agents, inbox, fortress exit-bundle, policy and budget summaries, activity feed). Activity feed reads from the real audit log; agent registry, inbox sources, and policy / budget summaries start empty and light up as v1.2 wires their data planes. Agent controller surfaces a typed capability error rather than lying about pause / unwrap / lockdown. Default-route flip from `/` to `/v1.1` is deferred to v1.2.
+
 ## v1.1.0 — Local Sovereignty Harness (2026-04-25)
 
 Sanctuary v1.1 ships the complete Local Sovereignty Harness for running and governing AI agents on operator-owned hardware. v1.1.0 is the first stable release on the 1.x line and the first that pilots can install to `latest` for production use. v1.0.0 GA tag is intentionally skipped (1.0.0-rc.2 was the precursor; 1.1.0 is a strict superset).
