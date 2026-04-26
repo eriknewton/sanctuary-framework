@@ -14,6 +14,8 @@ Hotfix release. Closes the v1.1.0 release-blocker (recovery key truncated on dis
 
 - **`sanctuary wrap --fortress <path>` ignored (Finding T).** v1.1.0 silently ignored the `--fortress` flag, found the existing harness config, and updated the singleton at `~/.sanctuary` regardless. The flag is now respected end-to-end. Honors the `SANCTUARY_FORTRESS_PATH` env var as a secondary mechanism (lower priority than the flag, higher priority than the legacy `SANCTUARY_STORAGE_PATH`).
 
+- **Re-wrap reports "0 MCP servers" (Finding B).** When the only existing entry was Sanctuary's own canonical wrap, re-wrap reported `MCP servers found: 0` because the canonical entry filters out before counting (so it doesn't get double-wrapped). Operators saw a "0" count next to a clearly-wrapped fortress and concluded wrap had nothing to do. The CLI now reports counts honestly: `MCP servers found: 1 Sanctuary entry (existing), N other servers` with proper pluralization.
+
 ### Added
 
 - **`sanctuary init` subcommand.** New lightweight command that creates a fresh fortress at a chosen path without wrapping any agent harness. The drill needed this primitive to satisfy "stand up a side-by-side isolated fortress" guardrails (Finding S); v1.1.0 had no working primitive for that workflow because typing `sanctuary init` fell through to the stdio MCP server boot. Honors `--fortress <path>`, `--force` (overwrite a non-empty directory), `--no-confirm`, `SANCTUARY_FORTRESS_PATH`, and `SANCTUARY_STORAGE_PATH` (precedence: flag, FORTRESS env, STORAGE env, default `~/.sanctuary`). The first-run banner uses the same disclosure surface as `wrap` and the standalone dashboard.

@@ -130,6 +130,29 @@ export function promoteFortressToStoragePath(options: {
   }
 }
 
+/**
+ * v1.1.1 hotfix (Finding B): the wrap "MCP servers found" reporting line
+ * pre-fix read "MCP servers found: 0" when a re-wrap found Sanctuary
+ * already present, because the filtered `agentConfig.servers` excludes
+ * the canonical Sanctuary entry to avoid double-wrapping. Operators saw
+ * a "0 servers" message and concluded wrap had nothing to do, even
+ * though Sanctuary was clearly there.
+ *
+ * This helper formats counts honestly: it splits the Sanctuary entry
+ * (already-wrapped) count from the other-server count and pluralizes
+ * properly.
+ */
+export function formatMcpServerCount(
+  otherCount: number,
+  hasSanctuaryEntry: boolean,
+): string {
+  if (!hasSanctuaryEntry) {
+    return `MCP servers found: ${otherCount}`;
+  }
+  const otherWord = otherCount === 1 ? "server" : "servers";
+  return `MCP servers found: 1 Sanctuary entry (existing), ${otherCount} other ${otherWord}`;
+}
+
 // ── Constants ───────────────────────────────────────────────────────
 
 /** Default CallGovernor limits for wrapped agents. */
@@ -296,7 +319,10 @@ export async function runWrap(
   console.error(`\n  Sanctuary wrap`);
   console.error(`  Platform: ${agentConfig.platform}`);
   console.error(`  Config: ${agentConfig.configPath}`);
-  console.error(`  MCP servers found: ${agentConfig.servers.length}`);
+
+  console.error(
+    `  ${formatMcpServerCount(agentConfig.servers.length, hasSanctuaryInRaw)}`
+  );
 
   const upstreamServers = convertToUpstreamServers(agentConfig.servers);
   for (const server of upstreamServers) {
