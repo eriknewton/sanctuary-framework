@@ -18,6 +18,32 @@ import type {
 } from "./types.js";
 import { MandateVerificationError } from "./errors.js";
 import { COMPOSITION_DEFAULTS, CONCORDIA_MANDATE_SCHEMA_URN } from "./constants.js";
+import {
+  assertBoolean,
+  assertChecksRecord,
+  assertNonEmptyString,
+  assertOptionalPlainObject,
+  assertOptionalString,
+  assertPlainObject,
+} from "./assert-shape.js";
+
+const MANDATE_CHECK_FLAGS = [
+  "signature_valid",
+  "chain_valid",
+  "not_expired",
+  "not_revoked",
+  "constraints_valid",
+] as const;
+
+const MANDATE_VALID_STATUSES = ["active", "expired", "revoked", "suspended"] as const;
+type MandateStatus = (typeof MANDATE_VALID_STATUSES)[number];
+
+function isMandateStatus(v: unknown): v is MandateStatus {
+  return (
+    typeof v === "string" &&
+    (MANDATE_VALID_STATUSES as readonly string[]).includes(v)
+  );
+}
 
 /**
  * Pack a Concordia receipt from a Sanctuary commitment event.
@@ -80,10 +106,20 @@ export async function packConcordiaReceipt(
     throw new Error(`Sidecar pack_receipt failed: ${response.error.message}`);
   }
 
-  const result = response.result as Record<string, unknown>;
+  const result = assertPlainObject(SIDECAR_RPC_METHODS.PACK_RECEIPT, response.result);
+  const receiptId = assertNonEmptyString(SIDECAR_RPC_METHODS.PACK_RECEIPT, result, "receipt_id");
+  const signature = assertNonEmptyString(SIDECAR_RPC_METHODS.PACK_RECEIPT, result, "signature");
+  const packedAt =
+    assertOptionalString(SIDECAR_RPC_METHODS.PACK_RECEIPT, result, "packed_at") ??
+    new Date().toISOString();
+  const attestationMetadata = assertOptionalPlainObject(
+    SIDECAR_RPC_METHODS.PACK_RECEIPT,
+    result,
+    "attestation_metadata"
+  );
 
   return {
-    receipt_id: result.receipt_id as string,
+    receipt_id: receiptId,
     schema_urn: CONCORDIA_RECEIPT_SCHEMA_URN,
     source_event_id: event.event_id,
     source_event_type: event.event_type,
@@ -91,11 +127,11 @@ export async function packConcordiaReceipt(
     counterparty_id: event.counterparty_id,
     commitment_class: event.commitment_class,
     references,
-    signature: result.signature as string,
+    signature,
     signature_scheme: SIDECAR_SIGNATURE_SCHEME,
-    packed_at: result.packed_at as string ?? new Date().toISOString(),
+    packed_at: packedAt,
     bounded_scope: event.bounded_scope,
-    attestation_metadata: result.attestation_metadata as Record<string, unknown> | undefined,
+    attestation_metadata: attestationMetadata,
   };
 }
 
@@ -128,8 +164,8 @@ export async function verifyConcordiaReceipt(
     return false;
   }
 
-  const result = response.result as Record<string, unknown>;
-  return result.valid === true;
+  const result = assertPlainObject(SIDECAR_RPC_METHODS.VERIFY_RECEIPT, response.result);
+  return assertBoolean(SIDECAR_RPC_METHODS.VERIFY_RECEIPT, result, "valid");
 }
 
 /**
@@ -167,23 +203,30 @@ export async function verifyMandate(
     );
   }
 
-  const result = response.result as Record<string, unknown>;
-  const checks = result.checks as Record<string, boolean>;
+  const result = assertPlainObject(SIDECAR_RPC_METHODS.VERIFY_MANDATE, response.result);
+  const valid = assertBoolean(SIDECAR_RPC_METHODS.VERIFY_MANDATE, result, "valid");
+  const checks = assertChecksRecord(
+    SIDECAR_RPC_METHODS.VERIFY_MANDATE,
+    result,
+    "checks",
+    MANDATE_CHECK_FLAGS
+  );
+  const status: MandateStatus = isMandateStatus(result.status) ? result.status : "active";
 
   return {
-    valid: result.valid === true,
+    valid,
     mandate_id: mandateId,
     schema_urn: CONCORDIA_MANDATE_SCHEMA_URN,
     issuer: (mandateData.issuer as string) ?? "",
     subject: (mandateData.subject as string) ?? "",
     delegation_depth: chain ? chain.length : 0,
-    status: (result.status as "active" | "expired" | "revoked" | "suspended") ?? "active",
+    status,
     checks: {
-      signature_valid: checks?.signature_valid ?? false,
-      chain_valid: checks?.chain_valid ?? false,
-      not_expired: checks?.not_expired ?? false,
-      not_revoked: checks?.not_revoked ?? false,
-      constraints_valid: checks?.constraints_valid ?? false,
+      signature_valid: checks.signature_valid,
+      chain_valid: checks.chain_valid,
+      not_expired: checks.not_expired,
+      not_revoked: checks.not_revoked,
+      constraints_valid: checks.constraints_valid,
     },
     verified_at: new Date().toISOString(),
     signature_scheme: SIDECAR_SIGNATURE_SCHEME,
