@@ -6,7 +6,7 @@ Your agent. Your machine. Your keys.
 
 This document is the public milestone view. Shipped history lives in `CHANGELOG.md`. Interface specs live in `server/docs/`. Scope documentation is maintained privately and released to the public repo on version bumps.
 
-Last updated: 2026-04-26.
+Last updated: 2026-04-27.
 
 ---
 
@@ -24,6 +24,31 @@ v1.5+ expands into fleet, payments, compliance, advanced cryptography, operator 
 
 The current sequencing deliberately delays public federation, fleet management, payment rails, compliance packs, and cryptographic migration until the local operator experience is complete and the operator owns the durable record. The local harness is the product center: attach agents, communicate with them, coordinate them, filter what leaves, record what happened, hold that record where the operator owns it, and leave with that record intact.
 
+The published agent-stack standards are anti-lock-in on paper. In practice, lock-in returns at the integration layer, when mandate primitives are minted through one vendor's API, on-chain registry entries are anchored through one vendor's wallet, and identity assertions are issued by one vendor's identity provider. The operator's data is portable in theory and coupled in practice. Sanctuary's L4 control plane is the substrate that turns paper-portability into practical portability. The fortress holds operator identity and durable record on the operator's side of every integration.
+
+---
+
+## Composition Map
+
+The agent stack is now publicly composed across four layers. Sanctuary lives at L4.
+
+```
+L4  Operator-sovereign control plane    Sanctuary (you are here)
+    Identity, keys, signed receipts, approvals, fortress
+    Composes with: ERC-8004, DIF MCP-I, AIVS, A2A
+
+L3  Mandates and commerce                Concordia, Google AP2, A2A extensions
+    Mandate primitives, session receipts, commitment binding
+
+L2  Runtime security                     Open-source runtime egress filters
+    Per-host policy, request filtering, sandboxing
+
+L1  Payments                             Coinbase x402, Agentic.Market
+    Sovereign-signer adapter at v1.5+
+```
+
+Composition partners are named where Sanctuary explicitly composes with them. Layers without named partners are referenced as categories.
+
 ---
 
 ## v1.0 GA: Freeze And Acceptance
@@ -40,10 +65,11 @@ Shipped foundation:
 - Egress controls, budgets, retention, and recovery flows
 - Concordia and Verascore optional composition, default off
 - Template library starter set
+- Tier B harness adapter coverage at v1.0: OpenClaw, Claude Code, Cursor, Hermes, Cline, plus a generic adapter shape
 
 GA gate:
 
-A pilot operator can stand up a fortress, wrap two or three Tier B agents, communicate with them, run a local multi-agent workflow, approve or deny risky actions, and complete a recovery drill in under 60 minutes with no help.
+An external pilot operator, not the maintainer, can stand up a fortress, wrap two or three Tier B agents, communicate with them, run a local multi-agent workflow, approve or deny risky actions, and complete a recovery drill in under 60 minutes with no help.
 
 Allowed v1.0 work:
 
@@ -75,10 +101,13 @@ Point releases close field-verification gaps and platform parity without changin
 - Windows Credential Manager keychain backend
 - Dashboard session hardening and credential-leak audit
 - `sanctuary doctor` or equivalent diagnostics for wrap, keychain, dashboard, audit, and config-backup failures
+- Operator attestation surface: global, per-agent, and per-action badges over existing fortress attestation primitives, with degrade-not-destroy posture on attestation failure
 
 Gate:
 
 An operator who hits a normal install, keychain, dashboard, or recovery failure gets a local diagnostic that identifies the failing subsystem and the next action without needing maintainer help.
+
+The attestation surface is the operator-facing layer that makes the fortress legible to a non-technical operator. Existing fortress primitives already produce signed attestation events. The v1.0.x scope is the persistent badge surface, the failure-mode catalog, and the operator-visible degraded states. Design-research panel work runs in parallel and may shift specifics.
 
 ---
 
@@ -399,6 +428,12 @@ Two independent operators complete a signed cross-fortress interaction where eac
 
 ---
 
+### Regulatory Posture
+
+The full EU AI Act compliance pack ships in v1.5+. The architecture-independent first-mile is already in the fortress: signed audit trail, signed receipts, and signed-event envelopes provide a defensible record-keeping substrate for Article 12 obligations. Operators preparing for the August 2 enforcement date can compose those primitives with an external compliance toolchain in the meantime. The full compliance pack adds Article 50 transparency primitives and the operator-facing compliance generator.
+
+---
+
 ## v1.5+ Expansion
 
 These tracks start only after v1.1 has completed the local harness and v1.2, v1.3, and v1.4 have validated mobile, sovereign data, and public federation.
@@ -412,10 +447,10 @@ These tracks start only after v1.1 has completed the local harness and v1.2, v1.
 - Breach-feed aggregation and scoped sub-token rotation
 - EU AI Act compliance pack
 - NIST AI RMF alignment documentation
-- Post-quantum signatures and key exchange
-- RFC 9420 class group messaging upgrade
+- Crypto Agility Sprint: bundled post-quantum signature and key-exchange migration plus group-messaging upgrade, executed as one coordinated cryptographic-library transition
 - Operator-cloud deployment mode
 - Sovereign-managed TEE and hardware secure elements
+- Additional Tier B adapter candidates including production TypeScript-native harnesses with native MCP support, scoped against operator demand
 
 ---
 
@@ -443,6 +478,8 @@ Cross-cutting, not tied to a single version. Sanctuary engages standards bodies 
 - AAIF Security Working Group participation
 - MCP Registry governance proposal
 - Reputation Portability Standard
+- DIF MCP-I Task Force, Verifier-role reference implementation against the L2 conformance tier
+- DIF Delegatable Attenuated Authorization Task Force, observer posture aligned to Concordia Protocol composition
 
 ---
 
