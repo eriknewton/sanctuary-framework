@@ -256,9 +256,22 @@ run_iteration() {
   fi
 
   # Tear down this iteration's wrap subprocess so the next iteration can
-  # bind its own port without contention.
+  # bind its own port without contention. SIGTERM first; the wrap process
+  # owns dashboard + child keychain calls and may not exit instantly under
+  # SIGTERM, so escalate to SIGKILL after a short grace window. Bash
+  # builtin `wait` is unbounded, which would hang the script if the child
+  # graceful-shutdown path stalls; the bounded poll below is the fix.
   if kill -0 "${wrap_pid}" 2>/dev/null; then
     kill "${wrap_pid}" 2>/dev/null || true
+    local grace
+    for grace in 1 2 3; do
+      if ! kill -0 "${wrap_pid}" 2>/dev/null; then break; fi
+      sleep 1
+    done
+    if kill -0 "${wrap_pid}" 2>/dev/null; then
+      kill -KILL "${wrap_pid}" 2>/dev/null || true
+    fi
+    # Reap the zombie without blocking; redirect noise from `wait`.
     wait "${wrap_pid}" 2>/dev/null || true
   fi
 }
