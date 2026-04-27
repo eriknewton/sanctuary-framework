@@ -4,17 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.1.1] - 2026-04-26
+## v1.1.1 - Hotfix (2026-04-26)
 
-Hotfix release. Closes the v1.1.0 release-blocker (recovery key truncated on display, Finding U), wires the v1.1 dashboard / hub API / exit bundle / coordination endpoints into the entry-point servers, and lands the fortress isolation flags that v1.1.0 advertised but silently ignored.
+Hotfix release. Closes the v1.1.0 release-blocker (recovery key truncated on display, Finding U), wires the v1.1 dashboard, hub API, and exit bundle endpoints into the entry-point servers, and lands the fortress isolation flags that v1.1.0 advertised but silently ignored. Strict superset of v1.1.0; operators on v1.1.0 should upgrade.
 
 ### Fixed
 
-- **Recovery key disclosure (Finding U).** v1.1.0 printed the recovery key truncated with a literal `...` and never persisted the plaintext anywhere, so any operator following the documented init flow ended up with an unrecoverable fortress on principal loss. The fix prints the full key in a dynamically-sized banner, writes the plaintext to `<fortress>/recovery-key.txt` mode 0600 with explicit "move off-host immediately" instructions (single-issuance, never overwritten on subsequent runs), and adds an interactive confirmation prompt on TTY callers (bypass via `--no-confirm` for CI / launchd / systemd). The MCP server stdio first-run path is non-interactive by definition (the host harness owns stdin) and discloses via banner plus file only.
+- **Recovery key disclosure (Finding U).** v1.1.0 printed the recovery key truncated with a literal `...` and never persisted the plaintext anywhere, so any operator following the documented init flow ended up with an unrecoverable fortress on principal loss. The fix prints the full key in a dynamically-sized banner, writes the plaintext to `<fortress>/recovery-key.txt` mode 0600 with explicit "move off-host immediately" instructions (single-issuance, never overwritten on subsequent runs), and adds an interactive confirmation prompt on TTY callers (bypass via `--no-confirm` for CI, launchd, systemd). The MCP server stdio first-run path is non-interactive by definition (the host harness owns stdin) and discloses via banner plus file only.
 
 - **`sanctuary wrap --fortress <path>` ignored (Finding T).** v1.1.0 silently ignored the `--fortress` flag, found the existing harness config, and updated the singleton at `~/.sanctuary` regardless. The flag is now respected end-to-end. Honors the `SANCTUARY_FORTRESS_PATH` env var as a secondary mechanism (lower priority than the flag, higher priority than the legacy `SANCTUARY_STORAGE_PATH`).
 
 - **Re-wrap reports "0 MCP servers" (Finding B).** When the only existing entry was Sanctuary's own canonical wrap, re-wrap reported `MCP servers found: 0` because the canonical entry filters out before counting (so it doesn't get double-wrapped). Operators saw a "0" count next to a clearly-wrapped fortress and concluded wrap had nothing to do. The CLI now reports counts honestly: `MCP servers found: 1 Sanctuary entry (existing), N other servers` with proper pluralization.
+
+- **`dashboard-standalone-v010-4.test.ts` developer-machine flake.** The test now overrides `HOME` during execution so it does not read from the developer's real `~/.sanctuary` directory. CI was unaffected (fresh runners). Developers running `npm test` locally on machines with a real wrapped fortress at `~/.sanctuary/default/` no longer see a spurious test-isolation failure.
 
 ### Added
 
@@ -23,6 +25,12 @@ Hotfix release. Closes the v1.1.0 release-blocker (recovery key truncated on dis
 - **v1.1 server route wiring.** v1.1.0 shipped the v1.1 module suite (dashboard, hub API, exit bundle endpoints, coordination endpoints) but no entry-point server imported them, so operators saw only the legacy v1.0 surface after install. The hotfix mounts v1.1 additively at `/v1.1` (legacy stays at `/`) on both `dashboard-standalone.ts` and the embedded `principal-policy/dashboard.ts`. Hub API at `/api/hub/*` (agents, inbox, fortress exit-bundle, policy and budget summaries, activity feed). Activity feed reads from the real audit log; agent registry, inbox sources, and policy / budget summaries start empty and light up as v1.2 wires their data planes. Agent controller surfaces a typed capability error rather than lying about pause / unwrap / lockdown. Default-route flip from `/` to `/v1.1` is deferred to v1.2.
 
 - **`/api/identities` back-compat alias (Finding E).** Returns the same response shape as `/api/hub/agents` so existing operator scripts targeting the pre-v1.1 endpoint name keep working through the upgrade. Preserves query-string filters. Same auth contract as the hub API.
+
+### Known follow-ups
+
+- Coordination route handler `/api/coordination/*` is queued in v1.1.x housekeeping. The `LocalCoordinator` class is fully tested but operator-facing routes are not yet built.
+- `publishV11Event` SSE producer extension is queued in v1.1.x housekeeping. Hub events do not yet fan out to `/api/stream` consumers in real time; the dashboard polls instead.
+- Pre-existing CLI em-dash sweep in `server/src/cli.ts` continues as v1.0.2 (k); some sites already swept in PR #76 and PR #80, residual sites tracked separately.
 
 ## v1.1.0 — Local Sovereignty Harness (2026-04-25)
 
