@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.1.3 - Hotfix (2026-04-26)
+
+Hotfix release. Closes the v1.1.2 release-blocker (`sanctuary wrap` against a fresh canonical fortress did not disclose the generated passphrase, Finding X) on the wrap path. Mirror of the Finding U fix from v1.1.2 onto the wrap-fresh-fortress code path. Strict superset of v1.1.2; operators on v1.1.2 should upgrade.
+
+### Fixed
+
+- **Generated passphrase silently persisted on wrap-fresh-fortress (Finding X).** When the operator ran `sanctuary wrap --claude-code` against a fresh `~/.sanctuary` without setting `SANCTUARY_PASSPHRASE` and without `--passphrase`, Sanctuary generated a passphrase, persisted it to the keychain or fallback file, and never told the operator. Host loss plus keychain loss meant fortress loss with no off-host backup. The hotfix wires `runWrap` to call a new `disclosePassphrase()` helper when `passphraseSource === "generated"` (case 3 only). Cases where the operator supplies the passphrase via the `--passphrase` flag (case 1) or `SANCTUARY_PASSPHRASE` environment variable (case 2) correctly skip disclosure since the operator already holds the secret. Disclosure shape mirrors `init`'s recovery-key disclosure from v1.1.2: full passphrase in stderr banner, plaintext to `<fortress>/passphrase-backup.txt` at mode `0600` with off-host stash instructions, single-issuance (never overwrites an existing file).
+
+### Added
+
+- **Wrap-fresh-fortress passphrase-disclosure regression suite.** Eight tests at `server/test/cocoon/wrap-recovery-key-disclosure.test.ts` cover all three passphrase-source paths: case 3 (generated) asserts banner plus file plus single-issuance; case 2 (env) asserts no banner plus no file; case 1 (`--passphrase`) asserts no banner plus no file. Negative assertions on cases 1 and 2 lock in the no-disclosure behavior so a future change cannot accidentally start writing plaintext passphrases on automated runs.
+
+- **Pre-promote tarball-smoke script extended with two iterations.** `scripts/published-tarball-smoke-2026-04-26.sh` now runs iter1 with `SANCTUARY_PASSPHRASE` env (asserts no disclosure) and iter2 without env (asserts disclosure). Cross-platform octal-mode helper added for macOS and Linux stat compatibility. This trust-failure class is now structurally impossible to ship past local smoke.
+
+### Internal
+
+- Extracted shared `discloseSecret()` helper from `discloseRecoveryKey()`. Public API of `discloseRecoveryKey()` is byte-stable. New `disclosePassphrase()` and `PassphraseConfirmation*Error` exports.
+
+### Known follow-ups
+
+- Smoke iter2 hangs on macOS keychain ACL prompt for the npm-spawned node binary on a developer Mac. Linux CI runs it cleanly. Filed as v1.1.x housekeeping: either pre-grant macOS keychain access at iter2 setup or skip iter2 on macOS and rely on Linux CI for case-3 coverage.
+- Drill resumption doc to be repinned to `@1.1.3` in newton-wiki, with case-2 vs case-3 framing added (env-supplied passphrase means the operator already holds the secret; case-3 generated path triggers the banner plus file).
+- Coordination route handler `/api/coordination/*` and `publishV11Event` SSE producer extension remain in v1.1.x housekeeping (carried from v1.1.2).
+- Workflow `version` strict-string-compare and Node.js 20 actions cohort bump remain in v1.1.x housekeeping.
+
 ## v1.1.2 - Hotfix (2026-04-26)
 
 Hotfix release. Closes the v1.1.1 release-blocker (v1.1 dashboard, hub API, and `/api/identities` alias absent on the dashboard the operator hits during `sanctuary wrap`, Finding V) and persists the operator-supplied fortress path across harness restarts (Finding W). Strict superset of v1.1.1; operators on v1.1.1 should upgrade.
