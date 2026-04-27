@@ -32,7 +32,7 @@
  */
 
 import { writeFile, readFile, mkdir, access } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { platform } from "node:os";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -470,6 +470,26 @@ export async function runWrap(
   }
   if (process.env.SANCTUARY_DASHBOARD_ENABLED) {
     sanctuaryEnv.SANCTUARY_DASHBOARD_ENABLED = process.env.SANCTUARY_DASHBOARD_ENABLED;
+  }
+  // v1.1.2 hotfix (Finding W): persist the operator-supplied --fortress
+  // path so harness restarts (Claude Code re-spawning the MCP server)
+  // keep the same fortress directory. Pre-fix, --fortress was honored at
+  // wrap time (via promoteFortressToStoragePath above) but never written
+  // into ~/.claude.json — every harness restart fell back to the default
+  // fortress location, silently drifting cocoon isolation across reboots.
+  //
+  // The args list stays constant: persistence travels through env vars
+  // exclusively, matching the SANCTUARY_PASSPHRASE pattern. The runtime
+  // promotion at promoteFortressToStoragePath() honors SANCTUARY_FORTRESS_PATH
+  // identically, so the spawned MCP server resolves the right storage
+  // path on its boot path. Resolved to absolute so subsequent CWD
+  // changes do not break the persisted reference.
+  if (options.fortress) {
+    sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(options.fortress);
+  } else if (process.env.SANCTUARY_FORTRESS_PATH) {
+    sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(
+      process.env.SANCTUARY_FORTRESS_PATH,
+    );
   }
 
   const rewrite = deps.rewriteConfig ?? rewriteConfigForCocoon;
