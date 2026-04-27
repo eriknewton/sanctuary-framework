@@ -60,8 +60,16 @@ require jq
 require node
 require npm
 
-echo "==> Building tarball from ${SERVER_DIR}"
+echo "==> Rebuilding dist/ from current source"
+# CRITICAL: npm pack does NOT trigger prepublishOnly, so dist/ would
+# otherwise carry whatever was last built (likely a stale prior version).
+# Always rebuild here so the tarball reflects current source. Caught a
+# real promotion-blocker on 2026-04-26 (smoke against a v1.1.2-labeled
+# tarball that still contained v1.1.1 dist output).
 cd "${SERVER_DIR}"
+npm run build --silent
+
+echo "==> Building tarball from ${SERVER_DIR}"
 TARBALL=$(npm pack --silent | tail -1)
 TARBALL_ABS="${SERVER_DIR}/${TARBALL}"
 [[ -f "${TARBALL_ABS}" ]] || {
@@ -96,22 +104,29 @@ SANCTUARY_DASHBOARD_AUTH_TOKEN="smoke-token-fixed-for-deterministic-curl" \
   > "${WRAP_LOG}" 2>&1 &
 WRAP_PID=$!
 
-# Give wrap up to 30s to print the URL + bind the dashboard.
+# Give wrap up to 30s to print the URL + token + bind the dashboard.
+# Capture the full URL including the ?token=<random> suffix so probes can
+# satisfy the legacy /api/* + / auth gate (loopback auto-auth applies only
+# to v1.1 routes; legacy routes still require an explicit token).
 URL=""
 for i in $(seq 1 30); do
   if grep -q "Sovereignty Dashboard running" "${WRAP_LOG}" 2>/dev/null; then
-    URL=$(grep -o 'http://127.0.0.1:[0-9]*' "${WRAP_LOG}" | head -1)
+    URL=$(grep -oE 'http://127\.0\.0\.1:[0-9]+\?token=[A-Za-z0-9_-]+' "${WRAP_LOG}" | head -1)
     break
   fi
   sleep 1
 done
 
 [[ -n "${URL}" ]] || {
-  echo "ERROR: wrap did not print a dashboard URL within 30s. wrap.log:" >&2
+  echo "ERROR: wrap did not print a tokenized dashboard URL within 30s. wrap.log:" >&2
   cat "${WRAP_LOG}" >&2
   exit 2
 }
-echo "    Dashboard URL: ${URL}"
+# Split into base (scheme://host:port) and query (token=<value>) so we can
+# insert the path between them: ${BASE_URL}${path}?${QUERY}.
+BASE_URL="${URL%%\?*}"
+QUERY="${URL#*\?}"
+echo "    Dashboard URL: ${BASE_URL} (token captured)"
 
 echo "==> Probing v1.1 surfaces"
 fail=0
@@ -120,7 +135,7 @@ probe() {
   local path="$1"
   local label="$2"
   local code
-  code=$(curl -sS -o /dev/null -w "%{http_code}" "${URL}${path}")
+  code=$(curl -sS -o /dev/null -w "%{http_code}" "${BASE_URL}${path}?${QUERY}")
   if [[ "${code}" == "200" ]]; then
     echo "    PASS: ${label} (${path}) → 200"
   else
