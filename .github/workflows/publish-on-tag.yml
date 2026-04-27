@@ -50,18 +50,34 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
 
       - name: Use Node.js 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
           cache: npm
           cache-dependency-path: server/package-lock.json
 
+      # Verify dispatch input matches server/package.json version.
+      #
+      # Convention (enforced below):
+      #   inputs.version  numeric semver, no `v` prefix (e.g. 1.1.4, 1.0.0-rc.2)
+      #   inputs.ref      git ref, conventionally a tag with `v` prefix
+      #                   (e.g. v1.1.4); blank defaults to the dispatched
+      #                   branch ref. Branch and SHA refs are accepted to
+      #                   support pre-release testing dispatches.
+      #
+      # The `version` vs `package.json` comparison is a strict bash string
+      # equality (`[[ "$a" != "$b" ]]`). It is intentionally not a regex,
+      # not a glob, and not a version-range comparator: a maintainer typing
+      # `v1.1.4` instead of `1.1.4` should hit a loud failure here, not
+      # silently publish under a coerced version. The explicit `v`-prefix
+      # rejection below produces a clearer error message than relying on
+      # the equality check alone.
       - name: Verify dispatch input matches server/package.json version
         id: verify-version
         run: |
@@ -71,6 +87,19 @@ jobs:
           echo "Package version:        ${pkg_version}"
           if [[ -z "${input_version}" ]]; then
             echo "::error::Dispatch input 'version' is empty. Refusing to publish."
+            exit 1
+          fi
+          # Reject `v` prefix explicitly so the maintainer gets a clear
+          # error message instead of a generic does-not-match comparison.
+          if [[ "${input_version}" == v* ]]; then
+            echo "::error::Dispatch input 'version' starts with 'v' (got '${input_version}'). The version input must be the numeric form (e.g. 1.1.4), without the 'v' prefix. The 'ref' input is where the 'v'-prefixed tag goes."
+            exit 1
+          fi
+          # Shape check: numeric semver with optional pre-release suffix.
+          # Accepts: 1.0.0, 1.1.4, 1.0.0-rc.2, 2.0.0-beta.1, 1.0.0-alpha.10.
+          # Rejects: latest, v1.0.0, 1.0, 1.0.0.0, anything with whitespace.
+          if ! [[ "${input_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+(\.[0-9]+)?)?$ ]]; then
+            echo "::error::Dispatch input 'version' (${input_version}) is not a valid numeric semver. Expected forms: 1.1.4 or 1.0.0-rc.2. Refusing to publish."
             exit 1
           fi
           if [[ "${input_version}" != "${pkg_version}" ]]; then
@@ -84,7 +113,7 @@ jobs:
         run: npm ci
 
       - name: Set up Python 3.12 for Concordia sidecar
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
