@@ -232,13 +232,19 @@ export function renderDashboardV11Html(
       `<a href="#${n.id}" data-route="${n.id}"><span>${escHtml(n.label)}</span></a>`,
   ).join("\n        ");
 
+  // Emit raw JSON inside `<script type="application/json">`. HTML parsers
+  // treat script content as RAWTEXT so character references are NOT
+  // decoded; HTML-escaping the JSON would produce `&quot;` and break the
+  // client's `JSON.parse(cfgEl.textContent)`. JSON.stringify already
+  // escapes `"` and `\`; the only remaining concern is a config value
+  // containing `</script>`, prevented by unicode-escaping `<`.
   const config = JSON.stringify({
     authToken,
     hubApiBase,
     streamUrl,
     identityId,
     fortressId,
-  });
+  }).replace(/</g, "\\u003c");
 
   const clientBlock = embedClient
     ? `<script type="module">${getClientScript()}</script>`
@@ -273,7 +279,7 @@ export function renderDashboardV11Html(
     <aside class="fortress" id="fortress"><p class="muted">Loading fortress column.</p></aside>
   </div>
   <div id="toast-host" aria-live="polite"></div>
-  <script id="dashboard-config" type="application/json">${escHtml(config)}</script>
+  <script id="dashboard-config" type="application/json">${config}</script>
   ${clientBlock}
 </body>
 </html>`;
