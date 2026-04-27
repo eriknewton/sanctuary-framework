@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.1.5 - Hotfix (2026-04-27)
+
+Hotfix release. Closes the v1.1.4 release-blockers (Findings Z + AA from moltbook drill arrest at Phase 1.3). Strict superset of v1.1.4; operators on v1.1.4 should upgrade.
+
+### Fixed
+
+- **`sanctuary wrap` now populates the v1.1 dashboard Agents view (Finding Z).** wrap was modifying the harness's MCP config but not writing any fortress-side agent record. The dashboard's `/api/hub/agents` endpoint correctly returned an empty array because the in-memory `InMemoryLocalAgentRegistry` was constructed empty at boot and wrap had nothing to populate it from. The hotfix introduces a hub-layer persistence helper at `server/src/hub/agent-registry-persistence.ts` that writes `LocalAgentRecord` entries to `<storagePath>/state/_hub/local-agents.json` (atomic write via `.tmp` rename, mode `0600`). `runWrap` upserts a record after harness-config verification; `buildV11Bindings()` rehydrates the in-memory registry from disk on dashboard boot. The L1 identity layer remains lazy-init by design (created on first cocoon-unlock); the new hub-layer registry is a separate v1.1 surface that does not cross the L1 boundary. Standalone `sanctuary dashboard` now logs `Local agents loaded: N` alongside the existing `Identities loaded: N` line so the operator-visible signal is symmetric across wrap-emitted and standalone dashboards.
+
+- **`sanctuary wrap` accepts `--no-dashboard` flag (Finding AA).** Each `sanctuary wrap --<harness>` invocation previously spawned its own dashboard server bound to a fresh port. Operators wrapping multiple harnesses against the same fortress accumulated multiple dashboard URLs pointing at the same data. The hotfix adds a `--no-dashboard` flag that skips dashboard spawn (no port bind, no auth-token print, no browser auto-open) while preserving Z's persistence write. The recommended operator-clean flow is now `sanctuary dashboard &` once, then `sanctuary wrap --<harness> --no-dashboard` per harness, producing a single persistent dashboard with all wrapped harnesses visible. Default behavior (no flag) is preserved for backward compatibility.
+
+### Added
+
+- **Hub-layer agent registry persistence module.** `server/src/hub/agent-registry-persistence.ts` provides atomic write and best-effort read for `LocalAgentRecord` entries persisted under `<storagePath>/state/_hub/local-agents.json`. The v1.1.5 record shape is `{ harness, model_provider: { vendor: "unknown" }, identity_id, fortress_id, wrap_timestamp, sanctuary_version, policy_id }` with `vendor: "unknown"` as the v1.1.5-default placeholder pending model-detection work and `policy_id` left unbound at wrap time. v1.2 data-plane work will extend the schema; Phase 2 channel-shape binding flows separately and is the natural binding point for `policy_id`.
+
+- **Z and AA regression suites.** 33 platform-agnostic tests added (19 covering wrap-to-registry write, multi-harness shared-fortress, idempotent re-wrap, and `/api/hub/agents` non-empty assertion; 14 covering `--no-dashboard` flag behavior, default preservation, and standalone-dashboard-plus-no-dashboard combined flow).
+
+- **Pre-promote tarball-smoke script extended to four iterations.** `scripts/published-tarball-smoke-2026-04-26.sh` now exercises (iter1) env-supplied passphrase with no disclosure, (iter2) generated passphrase with disclosure, (iter3) `--no-dashboard` flag, (iter4) standalone dashboard plus `--no-dashboard` wraps producing single-dashboard multi-harness flow. Iter1 and iter2 also gained `/api/hub/agents` non-empty assertion. Smoke now exercises six operator-path findings (V, W, X, Y, Z, AA).
+
+### Known follow-ups
+
+- **Auto-detect existing dashboard (AA option (a)).** The `--no-dashboard` flag is the v1.1.5 fix; auto-detect via per-fortress lockfile or PID check is a stronger long-term shape, queued as v1.1.x housekeeping.
+- **Real `model_provider` detection.** v1.1.5 ships `vendor: "unknown"` placeholder. Real detection requires runtime handshake from the spawned MCP child or harness-specific introspection; queued for v1.1.x housekeeping or v1.2 data-plane work.
+- **`policy_id` auto-binding.** Wrap leaves `policy_id` unbound. Phase 2 channel-shape binding flows separately; if a default policy slot should be auto-bound at wrap time, that is a separate spawn cycle.
+- **Headless-browser smoke gate (Playwright).** Drill report continues to argue for a release gate that exercises the actual operator path end-to-end. Queued as v1.1.x housekeeping; the comprehensive Codex-targeted spawn prompt at `Review/Sanctuary/V1.1.4_Codex_Comprehensive_Spawn_Prompt_2026-04-27.md` retargets to a follow-up release.
+- **Drill resumption doc edits.** Coordinator handles the `@1.1.4` to `@1.1.5` repin post-merge, plus reframing the standalone-dashboard acceptance criterion (`Local agents loaded: N` rather than `Identities loaded: N`, with explanation of the hub-vs-L1 layer split), adding the `--no-dashboard` flow note, and removing any `/api/hub/feed` references (drill-side probe error; SPA uses `/api/hub/activity`).
+- Workflow `version` strict-string-compare and Node 20 to 24 actions cohort bump remain in v1.1.x housekeeping wave A.
+
 ## v1.1.4 - Hotfix (2026-04-27)
 
 Hotfix release. Closes the v1.1.3 release-blocker (v1.1 dashboard SPA bootstrap crashed on HTML-entity-encoded JSON config, Finding Y) at the dashboard rendering surface. Strict superset of v1.1.3; operators on v1.1.3 should upgrade.
