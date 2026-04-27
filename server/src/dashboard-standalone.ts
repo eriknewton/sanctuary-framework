@@ -50,7 +50,12 @@ import {
   RecoveryKeyConfirmationDeclinedError,
   RecoveryKeyConfirmationNonInteractiveError,
 } from "./cocoon/recovery-key-disclosure.js";
-import { discoverTenants, findTenant, type TenantDescriptor } from "./cli/agents/discovery.js";
+import {
+  discoverTenants,
+  findTenant,
+  type DiscoveryOptions,
+  type TenantDescriptor,
+} from "./cli/agents/discovery.js";
 import {
   buildV11Bindings,
   fortressIdFromStoragePath,
@@ -83,13 +88,21 @@ export interface StandaloneDashboardOptions {
  * only thing on disk. Filters out the configured storage path itself so the
  * "did you mean?" hint never suggests the tenant the user is already pointed
  * at.
+ *
+ * `discoveryOptions` forwards to `discoverTenants()`. Production callers leave
+ * it undefined so discovery scans the real `~/.sanctuary/`. Tests pass
+ * `{ root, home }` overrides to isolate from the developer's home directory;
+ * without that isolation, a developer machine that has run `sanctuary wrap`
+ * for real would surface its own `~/.sanctuary/default/` tenant in test runs
+ * and break assertions that expect the discovery scope to be empty.
  */
 export async function discoverableSubTenants(
-  currentStoragePath: string
+  currentStoragePath: string,
+  discoveryOptions?: DiscoveryOptions
 ): Promise<TenantDescriptor[]> {
   let all: TenantDescriptor[];
   try {
-    all = await discoverTenants();
+    all = await discoverTenants(discoveryOptions);
   } catch {
     return [];
   }
