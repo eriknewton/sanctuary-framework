@@ -16,6 +16,7 @@ import type {
   PendingApproval,
 } from "./aggregator.js";
 import { handleRequest, type ApprovalHandlers, type StreamEvent } from "./api.js";
+import type { V11Bindings } from "./v1_1/wiring.js";
 
 export interface DashboardServerOptions {
   port?: number;
@@ -53,6 +54,23 @@ export interface DashboardHandle {
    * `agent_id`.
    */
   publishAgentStatus: (snapshot: unknown) => void;
+  /**
+   * v1.1.2 hotfix (Finding V): bind v1.1 hub bindings to this dashboard
+   * instance so /v1.1, /api/hub/*, and /api/identities serve the v1.1
+   * surface. Pass null to detach. PR #82 wired these routes only on the
+   * principal-policy DashboardApprovalChannel; the wrap-auto operator
+   * dashboard (this server) needed the same wiring for the wrap-emitted
+   * URL to expose the v1.1 surfaces the v1.1.1 release notes claim.
+   */
+  setV11Bindings: (bindings: V11Bindings | null) => void;
+  /**
+   * v1.1.2: enable loopback auto-auth for /api/hub/* + /api/identities.
+   * When true, requests from 127.0.0.1 / ::1 bypass the bearer-token
+   * check (mirrors the principal-policy dashboard's _autoAuthLocalhost
+   * flag). Set true when the dashboard binds to a loopback host and the
+   * caller has independently authenticated the operator.
+   */
+  setV11LoopbackAutoAuth: (enabled: boolean) => void;
 }
 
 const DEFAULT_PORT = 3501;
@@ -79,15 +97,22 @@ export async function startDashboardServer(
     }
   };
 
-  const deps = {
-    sources: options.sources,
-    authToken: options.authToken,
-    approvals: options.approvals,
-    onEvent,
-  };
+  // v1.1.2 hotfix (Finding V): mutable per-server state for the v1.1
+  // bindings + loopback auto-auth flag. handleRequest sees the latest
+  // values on every call because we re-build the deps object per request.
+  let v11Bindings: V11Bindings | null = null;
+  let v11LoopbackAutoAuth = false;
 
   const server: Server = createServer(async (req, res) => {
     try {
+      const deps = {
+        sources: options.sources,
+        authToken: options.authToken,
+        approvals: options.approvals,
+        onEvent,
+        v11Bindings,
+        loopbackAutoAuth: v11LoopbackAutoAuth,
+      };
       const served = await handleRequest(deps, req, res);
       if (!served) {
         res.writeHead(404, { "Content-Type": "application/json" });
@@ -135,5 +160,11 @@ export async function startDashboardServer(
     publishInbox: (item: unknown) => publish({ type: "inbox", data: item }),
     publishAgentStatus: (snapshot: unknown) =>
       publish({ type: "agent_status", data: snapshot }),
+    setV11Bindings: (bindings: V11Bindings | null) => {
+      v11Bindings = bindings;
+    },
+    setV11LoopbackAutoAuth: (enabled: boolean) => {
+      v11LoopbackAutoAuth = enabled;
+    },
   };
 }

@@ -108,6 +108,8 @@ export async function startDashboard(
   const handle = await startDashboardServer(serverOpts);
 
   // Wrap publish* helpers so buffered lists stay in sync with SSE pushes.
+  // setV11Bindings + setV11LoopbackAutoAuth are passed through unchanged
+  // (no buffered state to maintain; the underlying server stores them).
   const wrapped: DashboardHandle = {
     ...handle,
     publishActivity: (entry: ActivityEntry) => {

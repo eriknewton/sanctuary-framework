@@ -20,6 +20,8 @@ import { listTemplates, getTemplateEntry, getTemplate } from "../templates/regis
 import { initTemplate } from "../templates/init.js";
 import type { TemplateName } from "../templates/registry.js";
 import { findTenant } from "../cli/agents/discovery.js";
+import { dispatchV11Request } from "./v1_1/dispatch.js";
+import type { V11Bindings } from "./v1_1/wiring.js";
 
 export interface ApprovalHandlers {
   allow: (id: string) => Promise<boolean>;
@@ -46,6 +48,22 @@ export interface APIDeps {
    * tenant discovery (`findTenant`).
    */
   isAgentWrapped?: (agentId: string) => Promise<boolean>;
+  /**
+   * v1.1.2 hotfix (Finding V): bound v1.1 hub bindings. When set, requests
+   * to `/v1.1`, `/api/hub/*`, and `/api/identities` route through the
+   * shared v1.1 dispatch helper before the legacy auth gate. When null
+   * or undefined, the legacy route table handles the request and those
+   * paths 404 (matches the pre-v1.1.2 behavior of this server).
+   */
+  v11Bindings?: V11Bindings | null;
+  /**
+   * v1.1.2 hotfix: when true, loopback requests bypass the bearer-token
+   * check on /api/hub/* + /api/identities (mirrors PR #82's
+   * `_autoAuthLocalhost` flag on the principal-policy dashboard).
+   * Defaults to false; the wrap-auto dashboard sets true to keep the
+   * operator UX one-click from the wrap-emitted URL.
+   */
+  loopbackAutoAuth?: boolean;
 }
 
 /**
@@ -146,6 +164,30 @@ export async function handleRequest(
   const url = new URL(req.url ?? "/", `http://${host}`);
   const method = (req.method ?? "GET").toUpperCase();
   const path = url.pathname;
+
+  // ── v1.1 dispatch (v1.1.2 hotfix, Finding V) ────────────────────────
+  // Try v1.1 routes first when bindings are set. Mounted additively at
+  // /v1.1 (HTML) and /api/hub/* (API); legacy routes at / continue to
+  // serve. Default route flip deferred to v1.2.
+  //
+  // Auth gating is intentionally inside the shared helper so the v1.1
+  // HTML at /v1.1 can serve unauthenticated (the inline client handles
+  // its own auth dance) while /api/hub/* and /api/identities honor the
+  // same bearer-token + loopback-auto-auth contract as legacy /api/*.
+  if (deps.v11Bindings) {
+    const handled = await dispatchV11Request(
+      {
+        bindings: deps.v11Bindings,
+        ...(deps.authToken !== undefined ? { authToken: deps.authToken } : {}),
+        loopbackAutoAuth: deps.loopbackAutoAuth ?? false,
+      },
+      req,
+      res,
+      url,
+      method,
+    );
+    if (handled) return true;
+  }
 
   // ── Auth (all routes) ───────────────────────────────────────────────
   if (!isAuthorized(deps, req, url)) {
