@@ -113,10 +113,16 @@ export function buildV11Bindings(
       ? readPersistedLocalAgents(inputs.storagePath)
       : [];
   const registry = new InMemoryLocalAgentRegistry(seed);
+  const storagePath = inputs.storagePath;
+  const readPersisted =
+    storagePath !== undefined
+      ? () => readPersistedLocalAgents(storagePath)
+      : undefined;
   const hubService = new HubService({
     identityId: inputs.identityId,
     fortressId: inputs.fortressId,
     agentRegistry: registry,
+    ...(readPersisted ? { readPersistedLocalAgents: readPersisted } : {}),
     inboxSources: {
       listPendingApprovals: () => [],
       listRecentBlockedEgress: () => [],
