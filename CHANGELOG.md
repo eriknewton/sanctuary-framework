@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.1.2 - Hotfix (2026-04-26)
+
+Hotfix release. Closes the v1.1.1 release-blocker (v1.1 dashboard, hub API, and `/api/identities` alias absent on the dashboard the operator hits during `sanctuary wrap`, Finding V) and persists the operator-supplied fortress path across harness restarts (Finding W). Strict superset of v1.1.1; operators on v1.1.1 should upgrade.
+
+### Fixed
+
+- **v1.1 routes absent on wrap-emitted dashboard (Finding V).** v1.1.1 mounted v1.1 dispatch on `principal-policy/dashboard.ts` (the standalone and MCP-server-boot dashboard) but missed the third dashboard caller. `cocoon/cli.ts:runWrap` starts `dashboard/server.ts` (the legacy operator dashboard the wrap-emitted URL hits). Operators following the documented wrap flow saw `/v1.1`, `/api/hub/*`, and `/api/identities` return 404 against the published binary. The hotfix extracts a shared dispatch helper at `server/src/dashboard/v1_1/dispatch.ts`, plumbs it into both dashboard servers, and wires the v1.1 bindings on the wrap-auto dashboard with a real master-key-derived `AuditLog` so the activity feed reads from the actual audit log, not a stub.
+
+- **`sanctuary wrap --fortress <path>` not persisted to harness config (Finding W).** v1.1.1 honored the flag for the in-process operator dashboard but never wrote `SANCTUARY_FORTRESS_PATH` into the rewritten `~/.claude.json` env block. On harness restart, the spawned MCP server fell back to the default fortress location, silently breaking isolation. The hotfix persists the env var into the rewritten config when `--fortress` is set or `SANCTUARY_FORTRESS_PATH` is in the parent process env. The MCP server boot path also now promotes `SANCTUARY_FORTRESS_PATH` to `SANCTUARY_STORAGE_PATH` early in `cli.ts`, mirroring the existing wrap-time promotion at `cocoon/cli.ts:128-129`, so the persisted env reaches config resolution.
+
+### Added
+
+- **Pre-promote tarball smoke test.** `scripts/published-tarball-smoke-2026-04-26.sh` runs `npm pack` plus install-from-tarball plus curls `/v1.1`, `/api/hub/agents`, `/api/identities` against the actual to-be-published binary, then asserts `SANCTUARY_FORTRESS_PATH` is persisted in a test `.claude.json`. Discipline gap PR #82 demonstrated does not yet exist in CI; for v1.1.2 the operator runs locally pre-promote. Future work: wire into a release-engineering workflow.
+
+- **Wrap-auto dashboard regression smoke suite.** Seven tests at `server/test/wrap/v1_1-routes-smoke.test.ts` boot the actual wrap-auto dashboard (not the standalone path that already had v1.1 routes) and curl every v1.1 endpoint plus the persistence assertion. Locks in the wiring at the entry point operators actually hit.
+
+### Known follow-ups
+
+- Coordination route handler `/api/coordination/*` and `publishV11Event` SSE producer extension remain in v1.1.x housekeeping (carried from v1.1.1 known follow-ups).
+- Workflow `version` strict-string-compare (must pass `1.1.0` not `v1.1.0`) is v1.1.x housekeeping; one-line YAML edit in `.github/workflows/publish-on-tag.yml`.
+- Node.js 20 actions cohort bump (`actions/checkout@v4`, `actions/setup-node@v4`, `actions/setup-python@v5`) before 2026-09-16 deadline.
+
 ## v1.1.1 - Hotfix (2026-04-26)
 
 Hotfix release. Closes the v1.1.0 release-blocker (recovery key truncated on display, Finding U), wires the v1.1 dashboard, hub API, and exit bundle endpoints into the entry-point servers, and lands the fortress isolation flags that v1.1.0 advertised but silently ignored. Strict superset of v1.1.0; operators on v1.1.0 should upgrade.
