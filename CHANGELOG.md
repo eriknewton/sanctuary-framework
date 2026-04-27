@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.1.4 - Hotfix (2026-04-27)
+
+Hotfix release. Closes the v1.1.3 release-blocker (v1.1 dashboard SPA bootstrap crashed on HTML-entity-encoded JSON config, Finding Y) at the dashboard rendering surface. Strict superset of v1.1.3; operators on v1.1.3 should upgrade.
+
+### Fixed
+
+- **v1.1 dashboard SPA bootstrap crash on HTML-entity-encoded JSON config (Finding Y).** The v1.1 dashboard's `<script id="dashboard-config" type="application/json">` block was rendered through `escHtml()`, which encoded the JSON's `"` characters as `&quot;` entities. HTML parsers treat `<script>` tags as RAWTEXT, where character references are NOT decoded, so the SPA's bootstrap `JSON.parse(cfgEl.textContent)` failed on the first `&` with `SyntaxError: JSON Parse error: Unrecognized token '&'`. The dashboard stayed on "Loading dashboard." indefinitely with zero XHR/fetch requests issued; every `/v1.1` page on every wrap-emitted dashboard was dead on arrival in browsers even though `curl /v1.1` returned a valid 200. The hotfix replaces `${escHtml(config)}` at `server/src/dashboard/v1_1/html.ts` with `${config}` where `config` is built via `JSON.stringify({...}).replace(/</g, "\\u003c")`. The `<` unicode-escape prevents any future config value containing `</script>` from prematurely closing the script block; `JSON.stringify` already handles all other escaping. The narrow `escHtml()` helper is unchanged, preserving correct behavior for HTML attribute and text contexts elsewhere in the file.
+
+### Added
+
+- **Server-side regression suite for dashboard-config emission.** Five tests at `server/test/dashboard/v1_1/config-emission.test.ts` cover: `JSON.parse` round-trip on the served HTML, key and value preservation through the substitution, negative assertion on `&quot;` (locks in the fix), `</script>` injection guard via `<`, and default-option fallback. No headless-browser dependency; catches Y's class on every test run.
+- **Pre-promote tarball-smoke script extended with dashboard-config-parse assertion.** `scripts/published-tarball-smoke-2026-04-26.sh` now curls `/v1.1`, extracts the dashboard-config block, and pipes through `node JSON.parse` with typeof checks. This trust-failure class is now structurally impossible to ship past local smoke. Combined with the v1.1.3 case-3 disclosure assertions and v1.1.2 dashboard-route + fortress-persistence assertions, the smoke now exercises all four most-recent operator-path findings (V, W, X, Y).
+
+### Known follow-ups
+
+- **Headless-browser smoke gate (Playwright).** The drill report argues for a release gate that exercises the actual operator path end-to-end; the v1.1.4 server-side parse assertion catches Y class but not all browser-side bugs. Queued as v1.1.x housekeeping; the comprehensive spawn prompt at `Review/Sanctuary/V1.1.4_Codex_Comprehensive_Spawn_Prompt_2026-04-27.md` retargets cleanly to a follow-up release.
+- **`/api/hub/templates` mount.** Wire-not-mount; v1.1 SPA does not currently call (uses client-side mirror). Queued as focused spawn prompt when Phase 2 channel-shape binding actually exercises it.
+- **`/api/exit-bundle/status` design pass.** No-handler; needs status state machine, persistence, and progress signals from `exportExitBundle`. Queued for Phase 4 exit-drill needs.
+- **Drill probe correction:** `/api/hub/feed` was a drill-side probe error; the SPA uses `/api/hub/activity` (mounted, returning 200). Drill resumption doc repinned by coordinator post-merge to reflect the correct endpoint.
+- **CHANGELOG insert pattern:** the v1.1.4 release script inlines the head/tail splice pattern instead of the BSD-awk multi-line pattern that silently dropped the v1.1.3 entry. The reusable helper at `scripts/release-changelog-insert.sh` ships in v1.1.x housekeeping wave A.
+- Workflow `version` strict-string-compare and Node 20 to 24 actions cohort bump remain in v1.1.x housekeeping wave A.
+
 ## v1.1.3 - Hotfix (2026-04-26)
 
 Hotfix release. Closes the v1.1.2 release-blocker (`sanctuary wrap` against a fresh canonical fortress did not disclose the generated passphrase, Finding X) on the wrap path. Mirror of the Finding U fix from v1.1.2 onto the wrap-fresh-fortress code path. Strict superset of v1.1.2; operators on v1.1.2 should upgrade.
