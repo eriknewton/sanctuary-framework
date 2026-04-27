@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Sanctuary v1.1.3 Pre-Promote Smoke (Findings V + W + X verification)
+# Sanctuary v1.1.4 Pre-Promote Smoke (Findings V + W + X + Y verification)
 #
 # Operators following the v1.1.1 release notes hit 404 on the v1.1
 # dashboard at the wrap-emitted URL because PR #82's wiring landed only
 # on the principal-policy dashboard server, not the wrap-auto dashboard
 # server. v1.1.2 closed that. v1.1.3 closes Finding X: a fresh wrap
 # without an env-supplied passphrase generated one and never disclosed
-# it, leaving the operator without an off-host backup.
+# it, leaving the operator without an off-host backup. v1.1.4 closes
+# Finding Y: the v1.1 SPA bootstrap was crashing on
+# `JSON.parse(cfgEl.textContent)` because the server emitted
+# HTML-entity-encoded JSON inside `<script type="application/json">`.
 #
-# This script proves both bug classes are GONE in the to-be-published
+# This script proves all bug classes are GONE in the to-be-published
 # tarball before the dist-tag flips to `latest`. Two iterations:
 #
 #   Iteration 1 (case 2, env-supplied passphrase):
@@ -191,6 +194,40 @@ run_iteration() {
     fi
   done
 
+  # Finding Y check: served /v1.1 HTML's `<script id="dashboard-config">`
+  # block must parse as JSON. v1.1.3 emitted HTML-entity-encoded JSON
+  # (`&quot;` instead of `"`) inside a `<script type="application/json">`
+  # block; HTML parses script content as RAWTEXT (no entity decoding) so
+  # the client's JSON.parse(cfgEl.textContent) crashed before any XHR.
+  # Catches the class against the actual published binary, not just the
+  # unit suite.
+  local v11_html config_block parse_log
+  v11_html=$(curl -sS "${base_url}/v1.1?${query}")
+  if [[ -z "${v11_html}" ]]; then
+    echo "    FAIL: [${label}] /v1.1 returned empty body" >&2
+    overall_fail=1
+  else
+    config_block=$(printf '%s' "${v11_html}" \
+      | sed -n 's|.*<script id="dashboard-config" type="application/json">\(.*\)</script>.*|\1|p' \
+      | head -1)
+    if [[ -z "${config_block}" ]]; then
+      echo "    FAIL: [${label}] dashboard-config script block not found in /v1.1 HTML" >&2
+      overall_fail=1
+    else
+      parse_log=$(printf '%s' "${config_block}" \
+        | node -e 'try { const c = require("fs").readFileSync(0, "utf8"); const o = JSON.parse(c); if (typeof o.authToken !== "string") { console.error("authToken missing or non-string"); process.exit(3); } if (typeof o.fortressId !== "string") { console.error("fortressId missing or non-string"); process.exit(3); } process.exit(0); } catch (e) { console.error(e.message); process.exit(2); }' 2>&1) \
+        && parse_status=0 || parse_status=$?
+      if [[ "${parse_status}" == "0" ]]; then
+        echo "    PASS: [${label}] /v1.1 dashboard-config parses as JSON with expected keys"
+      else
+        echo "    FAIL: [${label}] /v1.1 dashboard-config did not parse as JSON (status ${parse_status})" >&2
+        echo "         parser stderr: ${parse_log}" >&2
+        echo "         block (first 200 chars): ${config_block:0:200}" >&2
+        overall_fail=1
+      fi
+    fi
+  fi
+
   # Finding W check: ~/.claude.json carries SANCTUARY_FORTRESS_PATH.
   local claude_json="${iter_home}/.claude.json"
   if [[ ! -f "${claude_json}" ]]; then
@@ -284,10 +321,10 @@ run_iteration "iter2-generated" 0 1
 
 echo
 if [[ "${overall_fail}" == "0" ]]; then
-  echo "==> v1.1.3 pre-promote smoke: PASS. Safe to flip dist-tag to latest."
+  echo "==> v1.1.4 pre-promote smoke: PASS. Safe to flip dist-tag to latest."
   exit 0
 else
-  echo "==> v1.1.3 pre-promote smoke: FAIL. Do NOT promote latest." >&2
+  echo "==> v1.1.4 pre-promote smoke: FAIL. Do NOT promote latest." >&2
   echo "    SMOKE_ROOT (preserved for triage): ${SMOKE_ROOT}" >&2
   trap - EXIT
   exit 1
