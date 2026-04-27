@@ -58,6 +58,11 @@ import {
   buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../dashboard/v1_1/wiring.js";
+import { upsertPersistedLocalAgent } from "../hub/agent-registry-persistence.js";
+import type {
+  LocalAgentRecord,
+  LocalHarnessKind,
+} from "../contracts/v1.1/local-agent-records.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../core/encoding.js";
@@ -110,6 +115,16 @@ export interface WrapOptions {
   dryRun?: boolean;
   /** Suppress auto-open of the browser. */
   noOpen?: boolean;
+  /**
+   * Suppress dashboard server spawn (v1.1.5, Finding AA). When set, wrap
+   * persists the agent record and updates the harness config but does not
+   * start a per-call dashboard server, bind a port, or print a dashboard
+   * URL. Operators that want a single persistent dashboard run
+   * `sanctuary dashboard &` once, then `sanctuary wrap --<harness>
+   * --no-dashboard` per harness; the persistent dashboard rehydrates the
+   * agent registry from the same fortress file each wrap writes.
+   */
+  noDashboard?: boolean;
 }
 
 /** Backward-compat alias for the old `parseCocoonArgs` return type. */
@@ -547,6 +562,58 @@ export async function runWrap(
   );
   if (!verifyOk) process.exit(1);
 
+  // v1.1.5 (Finding Z): persist a v1.1 hub `LocalAgentRecord` so the
+  // dashboard's Agents view (`/api/hub/agents`, `/v1.1`) reflects the
+  // wrap. Without this, v1.1.1 ships the API surface but never populates
+  // it (registry construction at `dashboard/v1_1/wiring.ts` was empty by
+  // design, deferring the data plane to v1.2). Persistence fires here,
+  // after harness-config verification succeeds and before dashboard
+  // spawn, so that:
+  //   (a) the wrap-auto dashboard's `setV11Bindings` call below picks
+  //       up the new record via the rehydrating `buildV11Bindings`;
+  //   (b) `--no-dashboard` wraps still register, so a later `sanctuary
+  //       dashboard` (or the next wrap) sees the cumulative set;
+  //   (c) re-wrapping the same harness updates rather than duplicates
+  //       (`upsertPersistedLocalAgent` keys on `agent_id`).
+  // Best-effort: persistence errors do not fail wrap (the harness
+  // config is already rewritten and operational; a missing dashboard
+  // record is a UX degradation, not a security one). The error is
+  // surfaced on stderr so operators can re-run later if needed.
+  try {
+    upsertPersistedLocalAgent(
+      storagePath,
+      buildLocalAgentRecord({
+        storagePath,
+        platform: agentConfig.platform,
+      }),
+    );
+  } catch (err) {
+    console.error(
+      `  Note: v1.1 hub agent record not persisted ` +
+        `(${(err as Error).message}). ` +
+        `Re-run \`sanctuary wrap\` to retry, or check storage permissions on ${storagePath}.`,
+    );
+  }
+
+  if (options.noDashboard) {
+    // v1.1.5 (Finding AA): operator opted out of the per-call dashboard
+    // spawn. The agent record is already persisted above; a later
+    // `sanctuary dashboard` (or another wrap) will pick it up. Skip the
+    // dashboard server, the v1.1 binding, the runtime advertisement,
+    // and the auto-open browser path; print a concise success line that
+    // points operators at the persistent dashboard.
+    const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
+    printWrapSuccessNoDashboard({
+      toolName,
+      version: readPackageVersion(),
+      toolCount: countUpstreamTools(upstreamServers),
+      serverCount: upstreamServers.length,
+      passphraseLocation,
+      passphraseSource,
+    });
+    return;
+  }
+
   // Start the dashboard in-process.
   const authToken = generateAuthToken();
   const startFn: DashboardStarter =
@@ -623,6 +690,11 @@ export async function runWrap(
           identityId: `fortress:${storagePath}`,
           fortressId: fortressIdFromStoragePath(storagePath),
           auditLog: wrapAuditLog,
+          // v1.1.5 (Finding Z): rehydrate from the file the upsert
+          // above just wrote, so the registry the wrap-auto dashboard
+          // serves contains this wrap plus any prior wraps against the
+          // same fortress.
+          storagePath,
         }),
       );
       // The wrap-auto dashboard always binds 127.0.0.1; the operator
@@ -815,6 +887,55 @@ function printWrapSuccess(info: WrapSuccessInfo): void {
   console.error(formatWrapSuccess(info));
 }
 
+interface WrapSuccessNoDashboardInfo {
+  toolName: string;
+  version: string;
+  toolCount: number;
+  serverCount: number;
+  passphraseLocation: string;
+  passphraseSource: string;
+}
+
+/**
+ * Format the wrap-success output for the v1.1.5 `--no-dashboard` path
+ * (Finding AA). Mirrors `formatWrapSuccess` but replaces the dashboard
+ * URL line with a single-line note pointing operators at the persistent
+ * dashboard pattern. Exposed for tests; production callers go through
+ * `printWrapSuccessNoDashboard`.
+ */
+export function formatWrapSuccessNoDashboard(
+  info: WrapSuccessNoDashboardInfo,
+): string {
+  const g = (s: string) => `\x1b[32m${s}\x1b[0m`;
+  const d = (s: string) => `\x1b[2m${s}\x1b[0m`;
+  const b = (s: string) => `\x1b[1m${s}\x1b[0m`;
+  const check = "✓";
+
+  const lines: string[] = [];
+  lines.push("");
+  lines.push(
+    `  ${g(check)} Wrapped ${b(info.toolName)} with Sanctuary v${info.version}`,
+  );
+  lines.push(
+    `  ${g(check)} ${info.toolCount} tools registered across ${info.serverCount} upstream server${info.serverCount !== 1 ? "s" : ""}`,
+  );
+  lines.push(
+    `  ${d("Dashboard spawn skipped per --no-dashboard. Run `sanctuary dashboard` separately for a persistent dashboard.")}`,
+  );
+  lines.push("");
+  lines.push(
+    `  ${b("Your agent is protected.")} L1 Full / L2 Degraded (no TEE) / L3 Full / L4 Full.`,
+  );
+  lines.push("");
+  return lines.join("\n");
+}
+
+function printWrapSuccessNoDashboard(
+  info: WrapSuccessNoDashboardInfo,
+): void {
+  console.error(formatWrapSuccessNoDashboard(info));
+}
+
 // ── Post-wrap verification ──────────────────────────────────────────
 
 async function verifyRewrittenConfig(
@@ -956,6 +1077,80 @@ function toolNameFor(platform: AgentPlatform, _servers: MCPServerEntry[]): strin
   }
 }
 
+/**
+ * Map the wrap-side `AgentPlatform` (kebab-cased, harness detection
+ * vocabulary) to the v1.1 hub registry's `LocalHarnessKind` (snake-cased,
+ * dashboard-render vocabulary). The two enums describe the same set of
+ * supported wrap targets but live in different layers; centralizing the
+ * mapping here means the hub layer doesn't import the wrap layer's enum
+ * and vice versa.
+ */
+function harnessKindForPlatform(platform: AgentPlatform): LocalHarnessKind {
+  switch (platform) {
+    case "openclaw": return "openclaw";
+    case "hermes": return "hermes";
+    case "claude-code": return "claude_code";
+    case "cursor": return "cursor";
+    case "cline": return "cline";
+    case "generic": return "generic_mcp";
+    default: {
+      // Defensive: unknown future platforms map to "other" rather than
+      // crashing wrap. Adding a new platform should land its
+      // `LocalHarnessKind` mapping in the same PR.
+      const _exhaustive: never = platform;
+      void _exhaustive;
+      return "other";
+    }
+  }
+}
+
+/**
+ * Build the v1.1 hub `LocalAgentRecord` for a freshly wrapped harness.
+ *
+ * v1.1.5 placeholders (Finding Z): wrap does not yet detect the model
+ * provider or bind a policy at wrap time, so `model_provider.vendor`
+ * stays "unknown" and `policy_id` stays "unbound" until the v1.2
+ * data-plane work lands real detection / Phase 2 binding. The capability
+ * flags reflect what the v1.1.1 `CapabilityErrorAgentController` honestly
+ * supports today: `can_unwrap` is the only mutation wrap exposes; the
+ * rest stay false until controller wiring lands.
+ */
+function buildLocalAgentRecord(input: {
+  storagePath: string;
+  platform: AgentPlatform;
+}): LocalAgentRecord {
+  const harness = harnessKindForPlatform(input.platform);
+  const fortressId = fortressIdFromStoragePath(input.storagePath);
+  const nowIso = new Date().toISOString();
+  return {
+    version: "1.1",
+    agent_id: `agent:${harness}:${fortressId}`,
+    identity_id: `fortress:${input.storagePath}`,
+    harness,
+    model_provider: {
+      vendor: "unknown",
+      model_id: "unknown",
+      runs_locally: false,
+    },
+    policy_id: "unbound",
+    status: "active",
+    budget_summary: {
+      last_refreshed_at: nowIso,
+    },
+    last_activity_at: nowIso,
+    wrapped_at: nowIso,
+    capabilities: {
+      can_pause: false,
+      can_resume: false,
+      can_restart: false,
+      can_unwrap: true,
+      can_lockdown: false,
+      can_chat: false,
+      can_change_template: false,
+    },
+  };
+}
+
 function countUpstreamTools(servers: UpstreamServer[]): number {
   // Conservative estimate — real count requires live tool discovery.
   // At wrap time we do not have an MCP client connection yet, so we show
@@ -1037,6 +1232,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--no-open":
         options.noOpen = true;
         break;
+      case "--no-dashboard":
+        options.noDashboard = true;
+        break;
       case "--fortress":
         options.fortress = argv[++i];
         break;
@@ -1082,6 +1280,11 @@ function printWrapHelp(): void {
     --port <port>      Preferred dashboard port (default: 3501)
     --dry-run          Show what would happen without making changes
     --no-open          Do not auto-open the dashboard in a browser
+    --no-dashboard     Do not spawn a per-call dashboard server. Wrap still
+                       persists the agent record so a separately-running
+                       \`sanctuary dashboard\` (or a later wrap) sees the
+                       harness. Use this for the clean operator setup
+                       (one persistent dashboard + many wraps).
     --help, -h         Show this help
 
   What happens:

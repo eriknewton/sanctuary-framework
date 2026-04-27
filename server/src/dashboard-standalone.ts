@@ -60,6 +60,7 @@ import {
   buildV11Bindings,
   fortressIdFromStoragePath,
 } from "./dashboard/v1_1/wiring.js";
+import { readPersistedLocalAgents } from "./hub/agent-registry-persistence.js";
 
 export interface StandaloneDashboardOptions {
   passphrase?: string;
@@ -454,6 +455,11 @@ export async function startStandaloneDashboard(
       identityId: hubIdentityId,
       fortressId: fortressIdFromStoragePath(config.storage_path),
       auditLog,
+      // v1.1.5 (Finding Z): rehydrate the hub agent registry from
+      // `<storagePath>/state/_hub/local-agents.json` so the standalone
+      // dashboard surfaces wraps performed by prior `sanctuary wrap`
+      // invocations against this same fortress.
+      storagePath: config.storage_path,
     }),
   );
 
@@ -501,6 +507,16 @@ export async function startStandaloneDashboard(
   console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
   console.error(`Storage: ${config.storage_path}`);
   console.error(`Identities loaded: ${loadResult.loaded}`);
+  // v1.1.5 (Finding Z): surface the v1.1 hub-layer agent count alongside
+  // the L1 identity count. The two layers describe different concerns:
+  // L1 identities are cocoon-derived Ed25519 keys created lazily on
+  // first cocoon-unlock; the hub agent registry tracks what `sanctuary
+  // wrap` has registered. Both lines are valid; reading 0 on either is
+  // not a failure mode, just a state of the fortress at boot.
+  const persistedAgentsCount = readPersistedLocalAgents(
+    config.storage_path,
+  ).length;
+  console.error(`Local agents loaded: ${persistedAgentsCount}`);
   console.error(`Listening: http://${dashboardHost}:${dashboardPort}`);
 
   // 9a. Warn loudly if encrypted identity files exist but none could be decrypted

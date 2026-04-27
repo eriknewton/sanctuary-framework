@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
-# Sanctuary v1.1.4 Pre-Promote Smoke (Findings V + W + X + Y verification)
+# Sanctuary v1.1.5 Pre-Promote Smoke (Findings V + W + X + Y + Z + AA)
 #
-# Operators following the v1.1.1 release notes hit 404 on the v1.1
-# dashboard at the wrap-emitted URL because PR #82's wiring landed only
-# on the principal-policy dashboard server, not the wrap-auto dashboard
-# server. v1.1.2 closed that. v1.1.3 closes Finding X: a fresh wrap
-# without an env-supplied passphrase generated one and never disclosed
-# it, leaving the operator without an off-host backup. v1.1.4 closes
-# Finding Y: the v1.1 SPA bootstrap was crashing on
-# `JSON.parse(cfgEl.textContent)` because the server emitted
-# HTML-entity-encoded JSON inside `<script type="application/json">`.
+# v1.1.2 closed Finding V (v1.1 routes mounted on the wrap-auto
+# dashboard) and Finding W (SANCTUARY_FORTRESS_PATH persisted into
+# `~/.claude.json`). v1.1.3 closed Finding X (passphrase disclosure on
+# case 3 fresh wraps). v1.1.4 closed Finding Y (v1.1 SPA bootstrap +
+# JSON.parse crash on HTML-entity-encoded config). v1.1.5 closes Z
+# (`/api/hub/agents` was structurally empty after wrap because v1.1.1
+# deferred persistence to v1.2; wrap now writes a fortress-side agent
+# record that `buildV11Bindings()` rehydrates from disk) and AA
+# (`sanctuary wrap --no-dashboard` skips the per-call dashboard spawn
+# so operators can run one persistent dashboard alongside many wraps).
 #
 # This script proves all bug classes are GONE in the to-be-published
-# tarball before the dist-tag flips to `latest`. Two iterations:
+# tarball before the dist-tag flips to `latest`. Four iterations:
 #
 #   Iteration 1 (case 2, env-supplied passphrase):
 #     - wrap with SANCTUARY_PASSPHRASE set
 #     - assert v1.1 endpoints all 200
-#     - assert ~/.claude.json carries SANCTUARY_FORTRESS_PATH (Finding W)
+#     - assert ~/.claude.json carries SANCTUARY_FORTRESS_PATH (W)
+#     - assert /api/hub/agents data.agents.length >= 1 (Z)
 #     - NEGATIVE: assert NO passphrase-backup.txt written
 #     - NEGATIVE: assert NO disclosure banner in wrap stderr
 #
@@ -26,10 +28,25 @@
 #     - POSITIVE: assert passphrase-backup.txt exists at mode 0600
 #     - POSITIVE: assert disclosure banner header present in wrap stderr
 #     - POSITIVE: assert backup-file content contains the off-host warning
+#     - assert /api/hub/agents data.agents.length >= 1 (Z)
 #
-# Both iterations must PASS for overall PASS.
+#   Iteration 3 (--no-dashboard, AA):
+#     - wrap with --no-dashboard against a fresh fortress
+#     - assert wrap exit code 0
+#     - assert no Sovereignty Dashboard URL printed on stderr
+#     - assert state/_hub/local-agents.json written with one record
+#       (Z fix preserved on the no-dashboard path)
+#     - assert "Dashboard spawn skipped per --no-dashboard" line on stderr
 #
-# Usage (from a developer Mac with the v1.1.3 tag built):
+#   Iteration 4 (standalone dashboard + --no-dashboard wrap, AA + Z together):
+#     - sanctuary dashboard --fortress <path> &
+#     - sanctuary wrap --claude-code --fortress <same path> --no-dashboard
+#     - curl /api/hub/agents against the standalone dashboard
+#     - assert response contains the wrapped harness (rehydration works)
+#
+# All iterations must PASS for overall PASS.
+#
+# Usage (from a developer Mac with the v1.1.5-hotfix branch built):
 #
 #   bash scripts/published-tarball-smoke-2026-04-26.sh
 #
@@ -194,6 +211,41 @@ run_iteration() {
     fi
   done
 
+  # Finding Z check: /api/hub/agents must return a non-empty agents
+  # array after wrap. Pre-v1.1.5 this returned `data.agents = []` even
+  # on a freshly wrapped fortress because the in-memory registry was
+  # constructed empty on every boot and wrap had no persistence write.
+  # v1.1.5 wrap writes <storagePath>/state/_hub/local-agents.json and
+  # buildV11Bindings rehydrates from it.
+  local agents_json agents_count agents_first_harness
+  agents_json=$(curl -sS "${base_url}/api/hub/agents?${query}")
+  agents_count=$(printf '%s' "${agents_json}" \
+    | jq -r '.data.agents | length' 2>/dev/null || echo "0")
+  if [[ "${agents_count}" -ge "1" ]]; then
+    agents_first_harness=$(printf '%s' "${agents_json}" \
+      | jq -r '.data.agents[0].harness // "<missing>"')
+    echo "    PASS: [${label}] /api/hub/agents reports ${agents_count} wrapped harness(es) (first: ${agents_first_harness})"
+  else
+    echo "    FAIL: [${label}] /api/hub/agents data.agents.length = ${agents_count} (expected >= 1)" >&2
+    echo "         response: ${agents_json:0:200}" >&2
+    overall_fail=1
+  fi
+
+  local hub_file="${iter_fortress}/state/_hub/local-agents.json"
+  if [[ -f "${hub_file}" ]]; then
+    local hub_mode
+    hub_mode=$(mode_bits "${hub_file}")
+    if [[ "${hub_mode}" == "600" ]]; then
+      echo "    PASS: [${label}] state/_hub/local-agents.json mode 0600"
+    else
+      echo "    FAIL: [${label}] state/_hub/local-agents.json mode ${hub_mode} (expected 600)" >&2
+      overall_fail=1
+    fi
+  else
+    echo "    FAIL: [${label}] state/_hub/local-agents.json not written by wrap" >&2
+    overall_fail=1
+  fi
+
   # Finding Y check: served /v1.1 HTML's `<script id="dashboard-config">`
   # block must parse as JSON. v1.1.3 emitted HTML-entity-encoded JSON
   # (`&quot;` instead of `"`) inside a `<script type="application/json">`
@@ -313,18 +365,201 @@ run_iteration() {
   fi
 }
 
+# Iteration 3 (Finding AA): wrap with --no-dashboard. Asserts no
+# dashboard URL printed, exit code 0, agent record persisted, and the
+# persistent-dashboard skip note appears on stderr.
+run_no_dashboard_iteration() {
+  local label="iter3-no-dashboard"
+  local iter_home="${SMOKE_ROOT}/${label}-home"
+  local iter_fortress="${SMOKE_ROOT}/${label}-fortress"
+  mkdir -p "${iter_home}" "${iter_fortress}"
+  local wrap_log="${iter_home}/wrap.log"
+
+  echo
+  echo "==> [${label}] Running sanctuary wrap --no-dashboard"
+  local wrap_exit=0
+  HOME="${iter_home}" \
+  SANCTUARY_PASSPHRASE="smoke-test-passphrase-do-not-use-in-prod-${label}" \
+    "${SANCTUARY_BIN}" wrap --claude-code --fortress "${iter_fortress}" \
+      --no-dashboard --no-open \
+      > "${wrap_log}" 2>&1 || wrap_exit=$?
+
+  if [[ "${wrap_exit}" == "0" ]]; then
+    echo "    PASS: [${label}] wrap exit code 0"
+  else
+    echo "    FAIL: [${label}] wrap exit code ${wrap_exit}" >&2
+    cat "${wrap_log}" >&2
+    overall_fail=1
+    return
+  fi
+
+  if grep -q "Sovereignty Dashboard running at" "${wrap_log}" 2>/dev/null; then
+    echo "    FAIL: [${label}] dashboard URL printed (must NOT on --no-dashboard)" >&2
+    overall_fail=1
+  else
+    echo "    PASS: [${label}] no dashboard URL printed"
+  fi
+
+  if grep -q "Dashboard spawn skipped per --no-dashboard" "${wrap_log}" 2>/dev/null; then
+    echo "    PASS: [${label}] persistent-dashboard skip note present"
+  else
+    echo "    FAIL: [${label}] persistent-dashboard skip note missing" >&2
+    overall_fail=1
+  fi
+
+  local hub_file="${iter_fortress}/state/_hub/local-agents.json"
+  if [[ ! -f "${hub_file}" ]]; then
+    echo "    FAIL: [${label}] state/_hub/local-agents.json not written" >&2
+    overall_fail=1
+    return
+  fi
+  local persisted_count
+  persisted_count=$(jq -r '.agents | length' "${hub_file}" 2>/dev/null || echo "0")
+  if [[ "${persisted_count}" == "1" ]]; then
+    local persisted_harness
+    persisted_harness=$(jq -r '.agents[0].harness // "<missing>"' "${hub_file}")
+    echo "    PASS: [${label}] state/_hub/local-agents.json has 1 record (harness: ${persisted_harness})"
+  else
+    echo "    FAIL: [${label}] state/_hub/local-agents.json has ${persisted_count} records (expected 1)" >&2
+    overall_fail=1
+  fi
+}
+
+# Iteration 4 (Findings AA + Z together): standalone `sanctuary dashboard`
+# alongside `sanctuary wrap --no-dashboard` exercises the canonical
+# operator-clean flow. The standalone dashboard rehydrates the agent
+# registry from the hub file each wrap writes.
+run_standalone_plus_wrap_iteration() {
+  local label="iter4-standalone-plus-wrap"
+  local iter_home="${SMOKE_ROOT}/${label}-home"
+  local iter_fortress="${SMOKE_ROOT}/${label}-fortress"
+  mkdir -p "${iter_home}" "${iter_fortress}"
+  local dashboard_log="${iter_home}/dashboard.log"
+  local wrap_log="${iter_home}/wrap.log"
+
+  echo
+  echo "==> [${label}] Starting persistent sanctuary dashboard"
+  HOME="${iter_home}" \
+  SANCTUARY_PASSPHRASE="smoke-test-passphrase-do-not-use-in-prod-${label}" \
+  SANCTUARY_DASHBOARD_AUTH_TOKEN="smoke-token-${label}" \
+    "${SANCTUARY_BIN}" dashboard --fortress "${iter_fortress}" --no-open \
+      > "${dashboard_log}" 2>&1 &
+  local dash_pid=$!
+  WRAP_PIDS+=("${dash_pid}")
+
+  # Wait up to 30s for the standalone dashboard to bind.
+  local dash_url=""
+  local i
+  for i in $(seq 1 30); do
+    if grep -q "Listening:" "${dashboard_log}" 2>/dev/null; then
+      dash_url=$(grep -oE 'http://127\.0\.0\.1:[0-9]+' "${dashboard_log}" | head -1)
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ -z "${dash_url}" ]]; then
+    echo "    FAIL: [${label}] standalone dashboard did not bind within 30s" >&2
+    cat "${dashboard_log}" >&2
+    overall_fail=1
+    return
+  fi
+  echo "    Standalone dashboard: ${dash_url}"
+
+  echo "    Running sanctuary wrap --no-dashboard against same fortress"
+  HOME="${iter_home}" \
+  SANCTUARY_PASSPHRASE="smoke-test-passphrase-do-not-use-in-prod-${label}" \
+    "${SANCTUARY_BIN}" wrap --claude-code --fortress "${iter_fortress}" \
+      --no-dashboard --no-open \
+      > "${wrap_log}" 2>&1 || {
+    echo "    FAIL: [${label}] wrap --no-dashboard failed" >&2
+    cat "${wrap_log}" >&2
+    overall_fail=1
+    return
+  }
+
+  # The standalone dashboard's hub registry was constructed at boot,
+  # before wrap wrote the local-agents.json file. Restart the standalone
+  # dashboard so its in-memory registry rehydrates. (v1.1.5 rehydration
+  # happens at construction; live re-read is a v1.1.x backlog item.)
+  if kill -0 "${dash_pid}" 2>/dev/null; then
+    kill "${dash_pid}" 2>/dev/null || true
+    local grace
+    for grace in 1 2 3; do
+      if ! kill -0 "${dash_pid}" 2>/dev/null; then break; fi
+      sleep 1
+    done
+    if kill -0 "${dash_pid}" 2>/dev/null; then
+      kill -KILL "${dash_pid}" 2>/dev/null || true
+    fi
+    wait "${dash_pid}" 2>/dev/null || true
+  fi
+  : > "${dashboard_log}"
+
+  HOME="${iter_home}" \
+  SANCTUARY_PASSPHRASE="smoke-test-passphrase-do-not-use-in-prod-${label}" \
+  SANCTUARY_DASHBOARD_AUTH_TOKEN="smoke-token-${label}" \
+    "${SANCTUARY_BIN}" dashboard --fortress "${iter_fortress}" --no-open \
+      > "${dashboard_log}" 2>&1 &
+  local dash_pid2=$!
+  WRAP_PIDS+=("${dash_pid2}")
+
+  dash_url=""
+  for i in $(seq 1 30); do
+    if grep -q "Listening:" "${dashboard_log}" 2>/dev/null; then
+      dash_url=$(grep -oE 'http://127\.0\.0\.1:[0-9]+' "${dashboard_log}" | head -1)
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ -z "${dash_url}" ]]; then
+    echo "    FAIL: [${label}] standalone dashboard restart did not bind within 30s" >&2
+    cat "${dashboard_log}" >&2
+    overall_fail=1
+    return
+  fi
+
+  if grep -q "Local agents loaded:" "${dashboard_log}" 2>/dev/null; then
+    local loaded_line
+    loaded_line=$(grep "Local agents loaded:" "${dashboard_log}" | head -1)
+    echo "    PASS: [${label}] standalone dashboard logged: ${loaded_line}"
+  else
+    echo "    FAIL: [${label}] 'Local agents loaded:' line missing from standalone dashboard log" >&2
+    overall_fail=1
+  fi
+
+  local agents_json agents_count
+  agents_json=$(curl -sS -H "Authorization: Bearer smoke-token-${label}" "${dash_url}/api/hub/agents")
+  agents_count=$(printf '%s' "${agents_json}" \
+    | jq -r '.data.agents | length' 2>/dev/null || echo "0")
+  if [[ "${agents_count}" -ge "1" ]]; then
+    echo "    PASS: [${label}] standalone /api/hub/agents reports ${agents_count} wrapped harness(es) (rehydration works)"
+  else
+    echo "    FAIL: [${label}] standalone /api/hub/agents data.agents.length = ${agents_count} (expected >= 1)" >&2
+    echo "         response: ${agents_json:0:200}" >&2
+    overall_fail=1
+  fi
+}
+
 # Iteration 1: case 2 (env-supplied passphrase, no disclosure expected).
 run_iteration "iter1-env" 1 0
 
 # Iteration 2: case 3 (Sanctuary-generated passphrase, disclosure expected).
 run_iteration "iter2-generated" 0 1
 
+# Iteration 3 (Finding AA): --no-dashboard.
+run_no_dashboard_iteration
+
+# Iteration 4 (Findings AA + Z together): standalone + --no-dashboard.
+run_standalone_plus_wrap_iteration
+
 echo
 if [[ "${overall_fail}" == "0" ]]; then
-  echo "==> v1.1.4 pre-promote smoke: PASS. Safe to flip dist-tag to latest."
+  echo "==> v1.1.5 pre-promote smoke: PASS. Safe to flip dist-tag to latest."
   exit 0
 else
-  echo "==> v1.1.4 pre-promote smoke: FAIL. Do NOT promote latest." >&2
+  echo "==> v1.1.5 pre-promote smoke: FAIL. Do NOT promote latest." >&2
   echo "    SMOKE_ROOT (preserved for triage): ${SMOKE_ROOT}" >&2
   trap - EXIT
   exit 1

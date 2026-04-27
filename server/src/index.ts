@@ -633,6 +633,11 @@ export async function createSanctuaryServer(options?: {
         identityId: embeddedHubIdentityId,
         fortressId: fortressIdFromStoragePath(config.storage_path),
         auditLog,
+        // v1.1.5 (Finding Z): rehydrate the hub agent registry from
+        // `<storagePath>/state/_hub/local-agents.json` so the embedded
+        // dashboard surfaces wraps performed by prior `sanctuary wrap`
+        // invocations against this same fortress.
+        storagePath: config.storage_path,
       }),
     );
     await dashboard.start();
