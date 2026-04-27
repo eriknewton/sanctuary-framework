@@ -115,6 +115,16 @@ export interface WrapOptions {
   dryRun?: boolean;
   /** Suppress auto-open of the browser. */
   noOpen?: boolean;
+  /**
+   * Suppress dashboard server spawn (v1.1.5, Finding AA). When set, wrap
+   * persists the agent record and updates the harness config but does not
+   * start a per-call dashboard server, bind a port, or print a dashboard
+   * URL. Operators that want a single persistent dashboard run
+   * `sanctuary dashboard &` once, then `sanctuary wrap --<harness>
+   * --no-dashboard` per harness; the persistent dashboard rehydrates the
+   * agent registry from the same fortress file each wrap writes.
+   */
+  noDashboard?: boolean;
 }
 
 /** Backward-compat alias for the old `parseCocoonArgs` return type. */
@@ -585,6 +595,25 @@ export async function runWrap(
     );
   }
 
+  if (options.noDashboard) {
+    // v1.1.5 (Finding AA): operator opted out of the per-call dashboard
+    // spawn. The agent record is already persisted above; a later
+    // `sanctuary dashboard` (or another wrap) will pick it up. Skip the
+    // dashboard server, the v1.1 binding, the runtime advertisement,
+    // and the auto-open browser path; print a concise success line that
+    // points operators at the persistent dashboard.
+    const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
+    printWrapSuccessNoDashboard({
+      toolName,
+      version: readPackageVersion(),
+      toolCount: countUpstreamTools(upstreamServers),
+      serverCount: upstreamServers.length,
+      passphraseLocation,
+      passphraseSource,
+    });
+    return;
+  }
+
   // Start the dashboard in-process.
   const authToken = generateAuthToken();
   const startFn: DashboardStarter =
@@ -856,6 +885,55 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
 
 function printWrapSuccess(info: WrapSuccessInfo): void {
   console.error(formatWrapSuccess(info));
+}
+
+interface WrapSuccessNoDashboardInfo {
+  toolName: string;
+  version: string;
+  toolCount: number;
+  serverCount: number;
+  passphraseLocation: string;
+  passphraseSource: string;
+}
+
+/**
+ * Format the wrap-success output for the v1.1.5 `--no-dashboard` path
+ * (Finding AA). Mirrors `formatWrapSuccess` but replaces the dashboard
+ * URL line with a single-line note pointing operators at the persistent
+ * dashboard pattern. Exposed for tests; production callers go through
+ * `printWrapSuccessNoDashboard`.
+ */
+export function formatWrapSuccessNoDashboard(
+  info: WrapSuccessNoDashboardInfo,
+): string {
+  const g = (s: string) => `\x1b[32m${s}\x1b[0m`;
+  const d = (s: string) => `\x1b[2m${s}\x1b[0m`;
+  const b = (s: string) => `\x1b[1m${s}\x1b[0m`;
+  const check = "✓";
+
+  const lines: string[] = [];
+  lines.push("");
+  lines.push(
+    `  ${g(check)} Wrapped ${b(info.toolName)} with Sanctuary v${info.version}`,
+  );
+  lines.push(
+    `  ${g(check)} ${info.toolCount} tools registered across ${info.serverCount} upstream server${info.serverCount !== 1 ? "s" : ""}`,
+  );
+  lines.push(
+    `  ${d("Dashboard spawn skipped per --no-dashboard. Run `sanctuary dashboard` separately for a persistent dashboard.")}`,
+  );
+  lines.push("");
+  lines.push(
+    `  ${b("Your agent is protected.")} L1 Full / L2 Degraded (no TEE) / L3 Full / L4 Full.`,
+  );
+  lines.push("");
+  return lines.join("\n");
+}
+
+function printWrapSuccessNoDashboard(
+  info: WrapSuccessNoDashboardInfo,
+): void {
+  console.error(formatWrapSuccessNoDashboard(info));
 }
 
 // ── Post-wrap verification ──────────────────────────────────────────
@@ -1154,6 +1232,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--no-open":
         options.noOpen = true;
         break;
+      case "--no-dashboard":
+        options.noDashboard = true;
+        break;
       case "--fortress":
         options.fortress = argv[++i];
         break;
@@ -1199,6 +1280,11 @@ function printWrapHelp(): void {
     --port <port>      Preferred dashboard port (default: 3501)
     --dry-run          Show what would happen without making changes
     --no-open          Do not auto-open the dashboard in a browser
+    --no-dashboard     Do not spawn a per-call dashboard server. Wrap still
+                       persists the agent record so a separately-running
+                       \`sanctuary dashboard\` (or a later wrap) sees the
+                       harness. Use this for the clean operator setup
+                       (one persistent dashboard + many wraps).
     --help, -h         Show this help
 
   What happens:
