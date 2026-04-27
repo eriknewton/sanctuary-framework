@@ -58,6 +58,11 @@ import {
   buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../dashboard/v1_1/wiring.js";
+import { upsertPersistedLocalAgent } from "../hub/agent-registry-persistence.js";
+import type {
+  LocalAgentRecord,
+  LocalHarnessKind,
+} from "../contracts/v1.1/local-agent-records.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../core/encoding.js";
@@ -547,6 +552,39 @@ export async function runWrap(
   );
   if (!verifyOk) process.exit(1);
 
+  // v1.1.5 (Finding Z): persist a v1.1 hub `LocalAgentRecord` so the
+  // dashboard's Agents view (`/api/hub/agents`, `/v1.1`) reflects the
+  // wrap. Without this, v1.1.1 ships the API surface but never populates
+  // it (registry construction at `dashboard/v1_1/wiring.ts` was empty by
+  // design, deferring the data plane to v1.2). Persistence fires here,
+  // after harness-config verification succeeds and before dashboard
+  // spawn, so that:
+  //   (a) the wrap-auto dashboard's `setV11Bindings` call below picks
+  //       up the new record via the rehydrating `buildV11Bindings`;
+  //   (b) `--no-dashboard` wraps still register, so a later `sanctuary
+  //       dashboard` (or the next wrap) sees the cumulative set;
+  //   (c) re-wrapping the same harness updates rather than duplicates
+  //       (`upsertPersistedLocalAgent` keys on `agent_id`).
+  // Best-effort: persistence errors do not fail wrap (the harness
+  // config is already rewritten and operational; a missing dashboard
+  // record is a UX degradation, not a security one). The error is
+  // surfaced on stderr so operators can re-run later if needed.
+  try {
+    upsertPersistedLocalAgent(
+      storagePath,
+      buildLocalAgentRecord({
+        storagePath,
+        platform: agentConfig.platform,
+      }),
+    );
+  } catch (err) {
+    console.error(
+      `  Note: v1.1 hub agent record not persisted ` +
+        `(${(err as Error).message}). ` +
+        `Re-run \`sanctuary wrap\` to retry, or check storage permissions on ${storagePath}.`,
+    );
+  }
+
   // Start the dashboard in-process.
   const authToken = generateAuthToken();
   const startFn: DashboardStarter =
@@ -623,6 +661,11 @@ export async function runWrap(
           identityId: `fortress:${storagePath}`,
           fortressId: fortressIdFromStoragePath(storagePath),
           auditLog: wrapAuditLog,
+          // v1.1.5 (Finding Z): rehydrate from the file the upsert
+          // above just wrote, so the registry the wrap-auto dashboard
+          // serves contains this wrap plus any prior wraps against the
+          // same fortress.
+          storagePath,
         }),
       );
       // The wrap-auto dashboard always binds 127.0.0.1; the operator
@@ -954,6 +997,80 @@ function toolNameFor(platform: AgentPlatform, _servers: MCPServerEntry[]): strin
     case "cline": return "Cline";
     default: return "your agent";
   }
+}
+
+/**
+ * Map the wrap-side `AgentPlatform` (kebab-cased, harness detection
+ * vocabulary) to the v1.1 hub registry's `LocalHarnessKind` (snake-cased,
+ * dashboard-render vocabulary). The two enums describe the same set of
+ * supported wrap targets but live in different layers; centralizing the
+ * mapping here means the hub layer doesn't import the wrap layer's enum
+ * and vice versa.
+ */
+function harnessKindForPlatform(platform: AgentPlatform): LocalHarnessKind {
+  switch (platform) {
+    case "openclaw": return "openclaw";
+    case "hermes": return "hermes";
+    case "claude-code": return "claude_code";
+    case "cursor": return "cursor";
+    case "cline": return "cline";
+    case "generic": return "generic_mcp";
+    default: {
+      // Defensive: unknown future platforms map to "other" rather than
+      // crashing wrap. Adding a new platform should land its
+      // `LocalHarnessKind` mapping in the same PR.
+      const _exhaustive: never = platform;
+      void _exhaustive;
+      return "other";
+    }
+  }
+}
+
+/**
+ * Build the v1.1 hub `LocalAgentRecord` for a freshly wrapped harness.
+ *
+ * v1.1.5 placeholders (Finding Z): wrap does not yet detect the model
+ * provider or bind a policy at wrap time, so `model_provider.vendor`
+ * stays "unknown" and `policy_id` stays "unbound" until the v1.2
+ * data-plane work lands real detection / Phase 2 binding. The capability
+ * flags reflect what the v1.1.1 `CapabilityErrorAgentController` honestly
+ * supports today: `can_unwrap` is the only mutation wrap exposes; the
+ * rest stay false until controller wiring lands.
+ */
+function buildLocalAgentRecord(input: {
+  storagePath: string;
+  platform: AgentPlatform;
+}): LocalAgentRecord {
+  const harness = harnessKindForPlatform(input.platform);
+  const fortressId = fortressIdFromStoragePath(input.storagePath);
+  const nowIso = new Date().toISOString();
+  return {
+    version: "1.1",
+    agent_id: `agent:${harness}:${fortressId}`,
+    identity_id: `fortress:${input.storagePath}`,
+    harness,
+    model_provider: {
+      vendor: "unknown",
+      model_id: "unknown",
+      runs_locally: false,
+    },
+    policy_id: "unbound",
+    status: "active",
+    budget_summary: {
+      last_refreshed_at: nowIso,
+    },
+    last_activity_at: nowIso,
+    wrapped_at: nowIso,
+    capabilities: {
+      can_pause: false,
+      can_resume: false,
+      can_restart: false,
+      can_unwrap: true,
+      can_lockdown: false,
+      can_chat: false,
+      can_change_template: false,
+    },
+  };
 }
 
 function countUpstreamTools(servers: UpstreamServer[]): number {
