@@ -25,6 +25,21 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   let passphrase = process.env.SANCTUARY_PASSPHRASE;
 
+  // v1.1.2 hotfix (Finding W): the MCP-server-boot path documents
+  // SANCTUARY_FORTRESS_PATH as an operator-friendly alias for
+  // SANCTUARY_STORAGE_PATH (see help text below) but pre-fix never
+  // promoted the env var, so a fortress persisted via `sanctuary wrap
+  // --fortress <path>` never reached resolveStoragePath() / config.ts on
+  // harness restart. Promote here once, before any subcommand or boot
+  // path reads either var. Idempotent on re-run; STORAGE_PATH wins when
+  // both are set.
+  if (
+    process.env.SANCTUARY_FORTRESS_PATH &&
+    !process.env.SANCTUARY_STORAGE_PATH
+  ) {
+    process.env.SANCTUARY_STORAGE_PATH = process.env.SANCTUARY_FORTRESS_PATH;
+  }
+
   // Check for subcommands first
   if (args[0] === "dashboard") {
     await runStandaloneDashboard(args.slice(1));

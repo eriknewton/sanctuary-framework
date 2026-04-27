@@ -32,7 +32,7 @@
  */
 
 import { writeFile, readFile, mkdir, access } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { platform } from "node:os";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -54,6 +54,14 @@ import {
   PassphraseUnreadableError,
 } from "./passphrase.js";
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
+import {
+  buildV11Bindings,
+  fortressIdFromStoragePath,
+} from "../dashboard/v1_1/wiring.js";
+import { FilesystemStorage } from "../storage/filesystem.js";
+import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
+import { stringToBytes, bytesToString } from "../core/encoding.js";
+import { AuditLog } from "../l2-operational/audit-log.js";
 import { SANCTUARY_VERSION } from "../config.js";
 import { resolveStoragePath, resolveDashboardPort } from "../paths.js";
 import { writeTenantRuntime, clearTenantRuntime } from "../cli/agents/runtime.js";
@@ -350,6 +358,12 @@ export async function runWrap(
   // See SEC-061 in docs/audit/DELTA_REVIEW_V0.9.0_RC1.md.
   let passphraseLocation: string;
   let passphraseSource: string;
+  // v1.1.2 hotfix (Finding V): capture the passphrase value so the
+  // wrap-auto dashboard can derive the master key + initialize an
+  // AuditLog for the v1.1 hub bindings. Held in this function's scope
+  // only; never persisted to disk beyond the existing keychain write
+  // and never injected into the rewritten harness env.
+  let passphraseValue: string | undefined;
   if (options.passphrase) {
     try {
       const persist =
@@ -358,6 +372,7 @@ export async function runWrap(
       const persisted = await persist(options.passphrase);
       passphraseLocation = persisted.location;
       passphraseSource = persisted.source;
+      passphraseValue = options.passphrase;
       console.error(
         `\n  \u{1F510} Persisted user-supplied passphrase (${persisted.location}).`
       );
@@ -373,6 +388,7 @@ export async function runWrap(
   } else if (process.env.SANCTUARY_PASSPHRASE) {
     passphraseLocation = "SANCTUARY_PASSPHRASE";
     passphraseSource = "env";
+    passphraseValue = process.env.SANCTUARY_PASSPHRASE;
   } else {
     try {
       const resolve =
@@ -381,6 +397,7 @@ export async function runWrap(
       const resolved = await resolve();
       passphraseLocation = resolved.location;
       passphraseSource = resolved.source;
+      passphraseValue = resolved.value;
       if (resolved.source === "generated") {
         console.error(
           `\n  \u{1F510} Generated and stored passphrase (${resolved.location}).`
@@ -454,6 +471,26 @@ export async function runWrap(
   if (process.env.SANCTUARY_DASHBOARD_ENABLED) {
     sanctuaryEnv.SANCTUARY_DASHBOARD_ENABLED = process.env.SANCTUARY_DASHBOARD_ENABLED;
   }
+  // v1.1.2 hotfix (Finding W): persist the operator-supplied --fortress
+  // path so harness restarts (Claude Code re-spawning the MCP server)
+  // keep the same fortress directory. Pre-fix, --fortress was honored at
+  // wrap time (via promoteFortressToStoragePath above) but never written
+  // into ~/.claude.json — every harness restart fell back to the default
+  // fortress location, silently drifting cocoon isolation across reboots.
+  //
+  // The args list stays constant: persistence travels through env vars
+  // exclusively, matching the SANCTUARY_PASSPHRASE pattern. The runtime
+  // promotion at promoteFortressToStoragePath() honors SANCTUARY_FORTRESS_PATH
+  // identically, so the spawned MCP server resolves the right storage
+  // path on its boot path. Resolved to absolute so subsequent CWD
+  // changes do not break the persisted reference.
+  if (options.fortress) {
+    sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(options.fortress);
+  } else if (process.env.SANCTUARY_FORTRESS_PATH) {
+    sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(
+      process.env.SANCTUARY_FORTRESS_PATH,
+    );
+  }
 
   const rewrite = deps.rewriteConfig ?? rewriteConfigForCocoon;
   await rewrite(
@@ -490,6 +527,75 @@ export async function runWrap(
     authToken,
     readPackageVersion()
   );
+
+  // v1.1.2 hotfix (Finding V): bind v1.1 hub surfaces to the wrap-auto
+  // dashboard so /v1.1, /api/hub/*, and /api/identities serve content
+  // from the wrap-emitted URL. PR #82 wired these routes only into the
+  // principal-policy dashboard (sanctuary dashboard standalone path) and
+  // the MCP-server boot path; the wrap-auto dashboard at server/src/dashboard/
+  // is a separate HTTP server and shipped without any v1.1 routing.
+  //
+  // Initialization mirrors the standalone path (dashboard-standalone.ts):
+  // derive the master key over the persisted passphrase, construct
+  // FilesystemStorage + AuditLog. The fortress-on-disk is shared between
+  // this short-lived wrap process and any later MCP-server-boot process;
+  // both derive the same master key from the same passphrase via Argon2id
+  // (read existing key-params if present, else persist fresh ones), so
+  // the activity feed projection reads the same audit log the MCP server
+  // writes once it boots.
+  //
+  // IdentityManager.load() is intentionally NOT called: at wrap time the
+  // cocoon may have no identities (created by the MCP server later); the
+  // fortress-id fallback covers the empty case for the hub binding.
+  // Reset-history continuity (v1.0.2 item a) is also not consumed here;
+  // the next caller (MCP-server-boot or sanctuary dashboard standalone)
+  // handles it on first cocoon-unlock as before.
+  //
+  // Best-effort: a derivation failure does not fail wrap (operators still
+  // get a working v1.0 dashboard at /). The v1.1 surface is reachable
+  // via `sanctuary dashboard` if this wiring path errors.
+  if (passphraseValue !== undefined) {
+    try {
+      const v11Storage = new FilesystemStorage(`${storagePath}/state`);
+      let existingParams: KeyDerivationParams | undefined;
+      try {
+        const raw = await v11Storage.read("_meta", "key-params");
+        if (raw) {
+          existingParams = JSON.parse(bytesToString(raw)) as KeyDerivationParams;
+        }
+      } catch {
+        // No existing params; first run. deriveMasterKey will pick fresh
+        // params; we persist them below so the spawned MCP server derives
+        // the same key from the same passphrase.
+      }
+      const derived = await deriveMasterKey(passphraseValue, existingParams);
+      if (!existingParams) {
+        await v11Storage.write(
+          "_meta",
+          "key-params",
+          stringToBytes(JSON.stringify(derived.params)),
+        );
+      }
+      const wrapAuditLog = new AuditLog(v11Storage, derived.key);
+      dashboard.setV11Bindings(
+        buildV11Bindings({
+          identityId: `fortress:${storagePath}`,
+          fortressId: fortressIdFromStoragePath(storagePath),
+          auditLog: wrapAuditLog,
+        }),
+      );
+      // The wrap-auto dashboard always binds 127.0.0.1; the operator
+      // already has the bearer token in the auto-opened URL. Loopback
+      // auto-auth keeps the v1.1 client one-click from the URL.
+      dashboard.setV11LoopbackAutoAuth(true);
+    } catch (err) {
+      console.error(
+        `  Note: v1.1 dashboard surfaces unavailable on wrap URL ` +
+          `(${(err as Error).message}). ` +
+          `Run \`sanctuary dashboard\` to reach them.`,
+      );
+    }
+  }
 
   const dashboardUrl = `${dashboard.url}?token=${authToken}`;
 

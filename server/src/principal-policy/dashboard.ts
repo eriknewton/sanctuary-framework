@@ -40,10 +40,8 @@ import { generateFortressViewHTML } from "../cocoon/fortress-view.js";
 import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer } from "../sovereignty-profile.js";
 import { generateSystemPrompt } from "../system-prompt-generator.js";
 import type { ClientManager } from "../proxy/client-manager.js";
-import { handleHubRoute } from "../hub/api-router.js";
-import { handleDashboardV11Route } from "../dashboard/v1_1/index.js";
+import { dispatchV11Request } from "../dashboard/v1_1/dispatch.js";
 import type { V11Bindings } from "../dashboard/v1_1/wiring.js";
-import type { AuthConfig } from "../console/auth-middleware.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -256,63 +254,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     method: string,
   ): Promise<boolean> {
     if (!this.v11Bindings) return false;
-
-    // v1.1 dashboard HTML at /v1.1 (and trailing slash). Served before
-    // auth so the operator can land on the page; the inline client
-    // negotiates the bearer token / loopback auto-auth on its own.
-    if (
-      method === "GET" &&
-      (url.pathname === "/v1.1" || url.pathname === "/v1.1/")
-    ) {
-      const handled = handleDashboardV11Route(
-        {
-          identityId: this.v11Bindings.identityId,
-          fortressId: this.v11Bindings.fortressId,
-          ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
-        },
-        req,
-        res,
-      );
-      return handled;
-    }
-
-    // Hub API at /api/hub/*. Reuses dashboard auth: bearer-token gate
-    // unless loopback auto-auth is enabled, in which case loopback
-    // requests pass without a token.
-    if (url.pathname.startsWith("/api/hub/")) {
-      const authConfig: AuthConfig = {
-        loopbackAutoAuth: this._autoAuthLocalhost,
+    return dispatchV11Request(
+      {
+        bindings: this.v11Bindings,
         ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
-      };
-      const handled = await handleHubRoute(
-        { authConfig, service: this.v11Bindings.hubService },
-        req,
-        res,
-      );
-      return handled;
-    }
-
-    // v1.1.1 hotfix (Finding E): /api/identities is the pre-v1.1
-    // endpoint name some operator scripts target. Alias it to
-    // /api/hub/agents so existing tooling keeps working through the
-    // upgrade. Same auth contract; same response shape.
-    if (method === "GET" && url.pathname === "/api/identities") {
-      const authConfig: AuthConfig = {
         loopbackAutoAuth: this._autoAuthLocalhost,
-        ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
-      };
-      // Rewrite the URL so the hub router matches /api/hub/agents.
-      const aliasReq = Object.create(req) as IncomingMessage;
-      aliasReq.url = "/api/hub/agents" + url.search;
-      const handled = await handleHubRoute(
-        { authConfig, service: this.v11Bindings.hubService },
-        aliasReq,
-        res,
-      );
-      return handled;
-    }
-
-    return false;
+      },
+      req,
+      res,
+      url,
+      method,
+    );
   }
 
   /**
