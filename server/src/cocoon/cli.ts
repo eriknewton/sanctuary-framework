@@ -65,6 +65,11 @@ import { AuditLog } from "../l2-operational/audit-log.js";
 import { SANCTUARY_VERSION } from "../config.js";
 import { resolveStoragePath, resolveDashboardPort } from "../paths.js";
 import { writeTenantRuntime, clearTenantRuntime } from "../cli/agents/runtime.js";
+import {
+  disclosePassphrase,
+  PassphraseConfirmationDeclinedError,
+  PassphraseConfirmationNonInteractiveError,
+} from "./recovery-key-disclosure.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -440,6 +445,42 @@ export async function runWrap(
   // Write sovereignty profile into the per-tenant storage path resolved
   // above (honours SANCTUARY_STORAGE_PATH for multi-agent hosts).
   await mkdir(storagePath, { recursive: true, mode: 0o700 });
+
+  // v1.1.3 hotfix (Finding X): when Sanctuary generated the passphrase
+  // itself (case 3 in the source/value resolution above), the operator has
+  // no off-host backup. Disclose it the same way `sanctuary init` discloses
+  // a recovery key: full passphrase in stderr banner + plaintext written to
+  // <fortress>/passphrase-backup.txt at mode 0600 with off-host stash
+  // instructions, single-issuance. Cases 1 (--passphrase flag) and 2
+  // (SANCTUARY_PASSPHRASE env) skip disclosure: the operator already holds
+  // the secret. Mirrors the v1.1.1 init disclosure shape under coordinator
+  // decision B-1 (Review/Sanctuary/V1.1.3_Phase_0_Coordinator_Decision_2026-04-26.md).
+  if (passphraseSource === "generated" && passphraseValue !== undefined) {
+    try {
+      await disclosePassphrase({
+        passphrase: passphraseValue,
+        storagePath,
+        fortressId: fortressIdFromStoragePath(storagePath),
+        // --no-open (CI / scripted) or non-TTY stdin both skip the prompt
+        // the same way init's --no-confirm does. Operator who scripted the
+        // call still gets the banner + the file; they will not see a hang.
+        mode:
+          options.noOpen || process.stdin.isTTY !== true
+            ? "no-confirm"
+            : "interactive",
+      });
+    } catch (err) {
+      if (
+        err instanceof PassphraseConfirmationDeclinedError ||
+        err instanceof PassphraseConfirmationNonInteractiveError
+      ) {
+        console.error(`\n  Sanctuary wrap: ${err.message}\n`);
+        process.exit(2);
+      }
+      throw err;
+    }
+  }
+
   const profile = createWrapProfile(upstreamServers);
   const profilePath = join(storagePath, "cocoon-profile.json");
   await writeFile(profilePath, JSON.stringify(profile, null, 2), {
