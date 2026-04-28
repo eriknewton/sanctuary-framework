@@ -543,11 +543,13 @@ function renderFortress() {
             : "This harness does not support " + mi.label.toLowerCase() + ".";
           return '<button class="btn" data-action="agent-' + mi.action + '" data-agent-id="' + escHtml(a.agent_id) + '"' + (mi.enabled ? '' : ' disabled') + ' title="' + escHtml(tip) + '">' + escHtml(mi.label) + '</button>';
         }).join("");
-        return '<div class="row" data-agent-row="' + escHtml(a.agent_id) + '">' +
-          '<span class="glyph ' + map.glyph + '" title="' + escHtml(REASON_LABELS[a.status_reason_class] || "") + '"></span>' +
-          '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong></div>' +
-          '<span class="pill">' + escHtml(map.label) + '</span>' +
-          '<div style="display:flex;gap:4px;flex-wrap:wrap;">' + buttons + '</div>' +
+        return '<div class="row agent-row" data-agent-row="' + escHtml(a.agent_id) + '">' +
+          '<div class="agent-row-head">' +
+            '<span class="glyph ' + map.glyph + '" title="' + escHtml(REASON_LABELS[a.status_reason_class] || "") + '"></span>' +
+            '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong></div>' +
+            '<span class="pill">' + escHtml(map.label) + '</span>' +
+          '</div>' +
+          '<div class="agent-row-actions">' + buttons + '</div>' +
           '</div>';
       }).join("\n")
     : '<p class="muted">No agents wrapped.</p>';
