@@ -244,6 +244,12 @@ export interface HubPolicyAndBudgetSources {
  * may persist records to disk or recompute them per call.
  */
 export interface HubAgentRegistrySource {
+  /**
+   * Insert or replace a record. Used by wrap-side registration and by
+   * read-side persistence refresh to merge records written after dashboard
+   * boot.
+   */
+  put(record: LocalAgentRecord): void;
   list(filter?: LocalAgentRegistryFilter): LocalAgentRecord[];
   get(agentId: string): LocalAgentRecord | null;
   /**
@@ -281,6 +287,12 @@ export interface HubServiceDeps {
   fortressId: string;
   /** Local agent registry source. */
   agentRegistry: HubAgentRegistrySource;
+  /**
+   * Optional best-effort persisted agent reader. When supplied, list
+   * operations merge records written after hub construction before
+   * returning the in-memory projection.
+   */
+  readPersistedLocalAgents?: () => LocalAgentRecord[];
   /** Inbox aggregation sources. */
   inboxSources: HubInboxSources;
   /** Activity feed sources. */

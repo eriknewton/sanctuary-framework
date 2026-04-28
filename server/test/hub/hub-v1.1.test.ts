@@ -14,7 +14,8 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -37,6 +38,10 @@ import {
   type HubBudgetSummary,
   type HubPolicySummary,
 } from "../../src/hub/index.js";
+import {
+  readPersistedLocalAgents,
+  writePersistedLocalAgents,
+} from "../../src/hub/agent-registry-persistence.js";
 import type {
   HubAgentErrorItem,
   HubApprovalPendingItem,
@@ -356,6 +361,35 @@ function withAuth(headers: HeadersInit, token: string): HeadersInit {
   return { ...headers, Authorization: `Bearer ${token}` };
 }
 
+async function withTmpFortress<T>(
+  fn: (storagePath: string) => Promise<T>,
+): Promise<T> {
+  const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-hub-refresh-"));
+  try {
+    return await fn(storagePath);
+  } finally {
+    await rm(storagePath, { recursive: true, force: true });
+  }
+}
+
+function makeRefreshService(storagePath: string): HubService {
+  const storage = new MemoryStorage();
+  const auditLog = new AuditLog(storage, randomBytes(32));
+  return new HubService({
+    identityId: IDENTITY_ID,
+    fortressId: FORTRESS_ID,
+    agentRegistry: new InMemoryLocalAgentRegistry(),
+    readPersistedLocalAgents: () => readPersistedLocalAgents(storagePath),
+    inboxSources: makeInboxSources(makeEmptyInboxState()),
+    activitySources: { auditLog, identityId: IDENTITY_ID },
+    policyBudgetSources: {
+      listPolicySummaries: () => [],
+      listBudgetSummaries: () => [],
+    },
+    agentController: new StubAgentController(),
+  });
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════════
@@ -381,6 +415,60 @@ describe("Hub API constants", () => {
       "unwrap",
       "lockdown",
     ]);
+  });
+});
+
+describe("Hub agent listing persisted refresh (Finding BB)", () => {
+  it("refreshes records written after dashboard boot before listing", async () => {
+    await withTmpFortress(async (storagePath) => {
+      const service = makeRefreshService(storagePath);
+      const wrappedAfterBoot = makeAgent({ agent_id: "agent-after-boot" });
+
+      writePersistedLocalAgents(storagePath, [wrappedAfterBoot]);
+
+      expect(service.listAgents().map((agent) => agent.agent_id)).toEqual([
+        "agent-after-boot",
+      ]);
+    });
+  });
+
+  it("merges multiple persisted records wrapped sequentially after boot", async () => {
+    await withTmpFortress(async (storagePath) => {
+      const service = makeRefreshService(storagePath);
+      const first = makeAgent({
+        agent_id: "agent-claude-code",
+        harness: "claude-code",
+      });
+      const second = makeAgent({
+        agent_id: "agent-openclaw",
+        harness: "openclaw",
+      });
+
+      writePersistedLocalAgents(storagePath, [first]);
+      expect(service.listAgents().map((agent) => agent.agent_id)).toEqual([
+        "agent-claude-code",
+      ]);
+
+      writePersistedLocalAgents(storagePath, [first, second]);
+      expect(service.listAgents().map((agent) => agent.agent_id)).toEqual([
+        "agent-claude-code",
+        "agent-openclaw",
+      ]);
+    });
+  });
+
+  it("is idempotent when listing repeatedly with unchanged persisted state", async () => {
+    await withTmpFortress(async (storagePath) => {
+      const service = makeRefreshService(storagePath);
+      const record = makeAgent({ agent_id: "agent-idempotent" });
+      writePersistedLocalAgents(storagePath, [record]);
+
+      const first = service.listAgents().map((agent) => agent.agent_id);
+      const second = service.listAgents().map((agent) => agent.agent_id);
+
+      expect(second).toEqual(first);
+      expect(second).toEqual(["agent-idempotent"]);
+    });
   });
 });
 

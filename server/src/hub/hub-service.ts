@@ -113,6 +113,14 @@ export class HubService {
     return this.now().toISOString();
   }
 
+  private refreshPersistedLocalAgents(): void {
+    const readPersistedLocalAgents = this.deps.readPersistedLocalAgents;
+    if (!readPersistedLocalAgents) return;
+    for (const record of readPersistedLocalAgents()) {
+      this.deps.agentRegistry.put(record);
+    }
+  }
+
   // ── Inbox ───────────────────────────────────────────────────────────
 
   listInbox(): HubInboxItem[] {
@@ -134,6 +142,7 @@ export class HubService {
   // ── Agents ──────────────────────────────────────────────────────────
 
   listAgents(filter?: LocalAgentRegistryFilter): LocalAgentRecord[] {
+    this.refreshPersistedLocalAgents();
     const safeFilter: LocalAgentRegistryFilter = {
       ...(filter ?? {}),
       identity_id: this.deps.identityId,
