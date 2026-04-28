@@ -280,7 +280,7 @@ function renderMain() {
   const main = document.getElementById("main");
   if (!main) return;
   switch (state.route) {
-    case "dashboard": main.innerHTML = renderChatThread(); break;
+    case "dashboard": main.innerHTML = renderDashboardWelcome(); break;
     case "agents": main.innerHTML = renderAgentsList(); break;
     case "agent-detail": main.innerHTML = renderAgentDetail(); break;
     case "policy": main.innerHTML = renderPolicyCenter(); break;
@@ -292,48 +292,32 @@ function renderMain() {
   }
 }
 
-// ── Render: chat thread ────────────────────────────────────────────────
-function renderChatThread() {
-  const activeId = state.chatActiveAgentId;
-  const agent = activeId ? state.agents.find(function (a) { return a.agent_id === activeId; }) : null;
-  const header = '<header style="padding:8px 0;border-bottom:1px solid var(--rule);margin-bottom:8px;">' +
-    '<strong>' + escHtml(agent ? agent.agent_id : "Concierge") + '</strong>' +
-    ' <span class="muted">' + (agent ? "agent" : "Sanctuary advisory only. Operator-agent direct command via chat lands in v1.2.") + '</span>' +
-    '</header>';
-
-  // Three message kinds. (1) operator (UI-side suggestions, not backend POST).
-  // (2) agent-initiated approvals from inbox filtered by agent_id. (3) activity
-  // events filtered by agent_id rendered as system-style.
-  const msgs = [];
-  if (!agent) {
-    msgs.push('<div class="chat-msg system"><strong>Concierge:</strong> Pick an agent in the right pane to scope the thread. Tier 1 actions appear here as approve/deny prompts. Free text is advisory only at v1.1.</div>');
-  } else {
-    const pending = state.inbox.filter(function (i) { return i.kind === "approval_pending" && i.agent_id === activeId && !i.resolved; });
-    pending.forEach(function (i) {
-      const text = renderTemplate(i.display_template_id, i.display_template_args);
-      msgs.push(
-        '<div class="chat-msg agent" data-msg-kind="agent-initiated" data-item-id="' + escHtml(i.item_id) + '">' +
-          '<div>' + escHtml(text) + '</div>' +
-          '<div style="margin-top:6px;display:flex;gap:6px;">' +
-            '<button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(i.item_id) + '">Approve</button>' +
-            '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(i.item_id) + '">Deny</button>' +
-            '<button class="btn" data-action="show-details" data-item-id="' + escHtml(i.item_id) + '">Show details</button>' +
-          '</div>' +
-        '</div>'
-      );
-    });
-    const events = state.activity.filter(function (e) { return e.agent_id === activeId; }).slice(0, 20);
-    events.forEach(function (e) {
-      const text = renderTemplate(e.display_template_id, e.display_template_args);
-      msgs.push('<div class="chat-msg system"><span class="muted">' + escHtml(shortTime(e.emitted_at)) + '</span> ' + escHtml(text) + '</div>');
-    });
-  }
-
-  const composer = '<form class="composer" id="chat-composer">' +
-    '<input type="text" placeholder="Suggestion to concierge. (Direct commands land in v1.2.)" id="chat-input" />' +
-    '<button type="submit" class="btn">Send</button>' +
-    '</form>';
-  return header + '<div class="chat-thread">' + (msgs.length ? msgs.join("\n") : '<p class="muted">No messages yet.</p>') + '</div>' + composer;
+// ── Render: dashboard welcome ──────────────────────────────────────────
+// v1.1.7: replaces the half-built chat surface that v1.1.6 shipped with
+// a "What you can do today" summary card mapping each nav target to
+// the operator action it enables. Direct concierge chat is a v1.2 work
+// package (WP-V1.2-3 + WP-V1.2-4).
+function renderDashboardWelcome() {
+  return [
+    '<h1>What you can do today</h1>',
+    '<div class="card">',
+      '<dl class="kv">',
+        '<dt><a href="#agents">Agents</a></dt>',
+        '<dd>Pause, resume, restart, lockdown, or unwrap any wrapped harness.</dd>',
+        '<dt><a href="#policy">Policy</a></dt>',
+        '<dd>Review the active policy bound to each agent.</dd>',
+        '<dt><a href="#privacy">Privacy</a></dt>',
+        '<dd>See what context is flowing to which provider per channel.</dd>',
+        '<dt><a href="#coordination">Coordination</a></dt>',
+        '<dd>Inspect intra-fortress agent coordination state.</dd>',
+        '<dt><a href="#health">Health</a></dt>',
+        '<dd>Check fortress posture, cocoon status, and dashboard refresh.</dd>',
+        '<dt><a href="#exit-drill">Exit drill</a></dt>',
+        '<dd>Snapshot, verify, and prepare a portable exit bundle.</dd>',
+      '</dl>',
+    '</div>',
+    '<p class="muted">Direct chat with the concierge ships in v1.2.</p>'
+  ].join("");
 }
 
 // ── Render: agents list / detail ───────────────────────────────────────
@@ -372,8 +356,10 @@ function renderAgentDetail() {
       '<dt>Status</dt><dd><span class="glyph ' + map.glyph + '"></span> ' + escHtml(map.label) + '</dd>' +
       '</dl>' +
     '</div>' +
-    '<div class="card"><h3>Timeline</h3>' + timeline + '</div>' +
-    '<button class="btn" data-action="set-route" data-route="dashboard">Open chat</button>';
+    '<div class="card"><h3>Timeline</h3>' + timeline + '</div>';
+  // v1.1.7: "Open chat" button removed alongside the half-built chat
+  // surface (Finding EE). The agent-detail timeline + capability buttons
+  // are the operator's interaction surface at v1.1; chat ships in v1.2.
 }
 
 // ── Render: privacy ────────────────────────────────────────────────────
@@ -543,11 +529,13 @@ function renderFortress() {
             : "This harness does not support " + mi.label.toLowerCase() + ".";
           return '<button class="btn" data-action="agent-' + mi.action + '" data-agent-id="' + escHtml(a.agent_id) + '"' + (mi.enabled ? '' : ' disabled') + ' title="' + escHtml(tip) + '">' + escHtml(mi.label) + '</button>';
         }).join("");
-        return '<div class="row" data-agent-row="' + escHtml(a.agent_id) + '">' +
-          '<span class="glyph ' + map.glyph + '" title="' + escHtml(REASON_LABELS[a.status_reason_class] || "") + '"></span>' +
-          '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong></div>' +
-          '<span class="pill">' + escHtml(map.label) + '</span>' +
-          '<div style="display:flex;gap:4px;flex-wrap:wrap;">' + buttons + '</div>' +
+        return '<div class="row agent-row" data-agent-row="' + escHtml(a.agent_id) + '">' +
+          '<div class="agent-row-head">' +
+            '<span class="glyph ' + map.glyph + '" title="' + escHtml(REASON_LABELS[a.status_reason_class] || "") + '"></span>' +
+            '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong></div>' +
+            '<span class="pill">' + escHtml(map.label) + '</span>' +
+          '</div>' +
+          '<div class="agent-row-actions">' + buttons + '</div>' +
           '</div>';
       }).join("\n")
     : '<p class="muted">No agents wrapped.</p>';
@@ -791,19 +779,10 @@ document.addEventListener("click", function (ev) {
   }
 });
 
-document.addEventListener("submit", function (ev) {
-  if (ev.target && ev.target.id === "chat-composer") {
-    ev.preventDefault();
-    const inp = document.getElementById("chat-input");
-    if (!inp) return;
-    const txt = inp.value.trim();
-    inp.value = "";
-    if (!txt) return;
-    // Concierge suggestion engine, NOT a backend command POST.
-    // Operator-typed direct commands land in v1.2.
-    toast("Concierge: I cannot run that as a command at v1.1. Use the inbox or the Agents view to take action.");
-  }
-});
+// v1.1.7: chat composer submit handler removed alongside the half-built
+// chat surface (Finding EE). Direct concierge chat ships in v1.2; until
+// then the dashboard view renders a static welcome card with no form
+// inputs that could be confused for a working command surface.
 
 // Theme: system preference only at v1.1.
 const mq = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;

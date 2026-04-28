@@ -155,6 +155,10 @@ body {
 .row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px dashed var(--rule); }
 .row:last-child { border-bottom: 0; }
 .row .grow { flex: 1; min-width: 0; }
+.agent-row { flex-direction: column; align-items: stretch; gap: 6px; }
+.agent-row-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.agent-row-head .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-row-actions { display: flex; flex-wrap: wrap; gap: 4px; }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; font-size: 12px; }
 .kv dt { color: var(--ink-3); }
 .kv dd { margin: 0; color: var(--ink); }

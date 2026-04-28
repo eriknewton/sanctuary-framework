@@ -54,10 +54,18 @@ export async function dispatchV11Request(
 ): Promise<boolean> {
   const { bindings, authToken, loopbackAutoAuth } = inputs;
 
-  // v1.1 dashboard HTML at /v1.1 (and trailing slash).
+  // v1.1 dashboard HTML at /, /dashboard, /v1.1 (and trailing slash).
+  // v1.1.7: root and /dashboard route to the v1.1 SPA so wrap-printed URLs
+  // land operators on the current surface. Legacy v1.0 dashboard is preserved
+  // at /v1.0 by the legacy route tables in principal-policy/dashboard.ts and
+  // dashboard/api.ts; /v1.1 continues to serve for back-compat with operator
+  // bookmarks.
   if (
     method === "GET" &&
-    (url.pathname === "/v1.1" || url.pathname === "/v1.1/")
+    (url.pathname === "/" ||
+      url.pathname === "/dashboard" ||
+      url.pathname === "/v1.1" ||
+      url.pathname === "/v1.1/")
   ) {
     return handleDashboardV11Route(
       {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sanctuary v1.1.6 Pre-Promote Smoke (Findings V + W + X + Y + Z + AA + BB)
+# Sanctuary v1.1.7 Pre-Promote Smoke (Findings V + W + X + Y + Z + AA + BB + CC + DD + EE)
 #
 # v1.1.2 closed Finding V (v1.1 routes mounted on the wrap-auto
 # dashboard) and Finding W (SANCTUARY_FORTRESS_PATH persisted into
@@ -12,10 +12,14 @@
 # (`sanctuary wrap --no-dashboard` skips the per-call dashboard spawn
 # so operators can run one persistent dashboard alongside many wraps).
 # v1.1.6 closes BB (a persistent dashboard now refreshes records written
-# by later no-dashboard wraps on read).
+# by later no-dashboard wraps on read). v1.1.7 closes CC (root path
+# serves the v1.1 SPA; legacy moves to /v1.0), DD (Agents widget row CSS
+# stacking; covered by unit-tests, not curl-grep), and EE (half-built
+# concierge chat surface removed; replaced with "What you can do today"
+# welcome card).
 #
 # This script proves all bug classes are GONE in the to-be-published
-# tarball before the dist-tag flips to `latest`. Five iterations:
+# tarball before the dist-tag flips to `latest`. Six iterations:
 #
 #   Iteration 1 (case 2, env-supplied passphrase):
 #     - wrap with SANCTUARY_PASSPHRASE set
@@ -52,6 +56,21 @@
 #     - sanctuary wrap --openclaw --fortress <same path> --no-dashboard
 #     - curl /api/hub/agents against the still-running dashboard
 #     - assert response contains both wrapped harnesses
+#
+#   Iteration 6 (v1.1.7 dashboard route swap + EE removal, CC + EE):
+#     - sanctuary dashboard & against a fresh fortress
+#     - assert GET / returns 200 + body contains v1.1 SPA mount markers
+#       (id="main" + id="fortress"); does NOT contain legacy
+#       "Principal Dashboard" header
+#     - assert GET /dashboard returns 200 + body contains the v1.1 SPA
+#       mount markers (alias preserved on the SPA, not legacy)
+#     - assert GET /v1.0 returns 200 + body contains a legacy marker
+#       (NOT id="fortress"); preserves prior surface at the new URL
+#     - assert GET /v1.1 returns 200 (back-compat preserved)
+#     - assert NEITHER `/` nor `/v1.0` body contains the literal
+#       "Suggestion to concierge" string (EE chat affordance removed)
+#     - assert `/` body contains "What you can do today" (EE welcome
+#       card present in the bundled JS)
 #
 # All iterations must PASS for overall PASS.
 #
@@ -202,13 +221,16 @@ run_iteration() {
   local query="${url#*\?}"
   echo "    Dashboard URL: ${base_url} (token captured)"
 
-  # Probe v1.1 + legacy endpoints.
+  # Probe v1.1 + legacy endpoints. v1.1.7: root and /dashboard now route
+  # to the v1.1 SPA (Finding CC); legacy v1.0 is preserved at /v1.0.
   local probe_path probe_label code
   for entry in \
-      "/v1.1|v1.1 dashboard HTML" \
+      "/v1.1|v1.1 dashboard HTML (back-compat)" \
+      "/|v1.1 SPA at root (CC root-route flip)" \
+      "/dashboard|v1.1 SPA at /dashboard (CC alias)" \
+      "/v1.0|legacy v1.0 dashboard (CC preserve)" \
       "/api/hub/agents|v1.1 hub agents API" \
-      "/api/identities|Finding E /api/identities alias" \
-      "/|legacy v1.0 dashboard"; do
+      "/api/identities|Finding E /api/identities alias"; do
     probe_path="${entry%%|*}"
     probe_label="${entry#*|}"
     code=$(curl -sS -o /dev/null -w "%{http_code}" "${base_url}${probe_path}?${query}")
@@ -592,6 +614,133 @@ run_live_refresh_iteration() {
   fi
 }
 
+# Iteration 6 (v1.1.7 Findings CC + EE): dashboard route swap + EE removal.
+# Boots the standalone dashboard against a fresh fortress and asserts
+# the new route shape: / serves the v1.1 SPA, /dashboard alias serves
+# the SPA, /v1.0 preserves legacy, /v1.1 stays for back-compat. Also
+# asserts the EE half-built chat surface is gone (no "Suggestion to
+# concierge" anywhere) and the EE welcome card text ("What you can do
+# today") is present in the bundled SPA JS.
+run_v117_route_swap_iteration() {
+  local label="iter6-route-swap"
+  local iter_home="${SMOKE_ROOT}/${label}-home"
+  local iter_fortress="${SMOKE_ROOT}/${label}-fortress"
+  mkdir -p "${iter_home}" "${iter_fortress}"
+  local dashboard_log="${iter_home}/dashboard.log"
+
+  echo
+  echo "==> [${label}] Starting standalone sanctuary dashboard"
+  HOME="${iter_home}" \
+  SANCTUARY_STORAGE_PATH="${iter_fortress}" \
+  SANCTUARY_PASSPHRASE="smoke-test-passphrase-do-not-use-in-prod-${label}" \
+  SANCTUARY_DASHBOARD_AUTH_TOKEN="smoke-token-${label}" \
+    "${SANCTUARY_BIN}" dashboard --port 3517 --no-open \
+      > "${dashboard_log}" 2>&1 &
+  local dash_pid=$!
+  WRAP_PIDS+=("${dash_pid}")
+
+  local dash_url=""
+  local i
+  for i in $(seq 1 30); do
+    if grep -q "Listening:" "${dashboard_log}" 2>/dev/null; then
+      dash_url=$(grep -oE 'http://127\.0\.0\.1:[0-9]+' "${dashboard_log}" | head -1)
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ -z "${dash_url}" ]]; then
+    echo "    FAIL: [${label}] standalone dashboard did not bind within 30s" >&2
+    cat "${dashboard_log}" >&2
+    overall_fail=1
+    return
+  fi
+  echo "    Standalone dashboard: ${dash_url}"
+
+  local auth_header="Authorization: Bearer smoke-token-${label}"
+  local body_root body_dashboard body_v10 code_v11
+
+  # GET / -> v1.1 SPA (CC root-route flip). Body must carry the SPA
+  # mount-marker pair `id="main"` + `id="fortress"`. Must NOT carry the
+  # legacy "Principal Dashboard" string.
+  body_root=$(curl -sS -H "${auth_header}" "${dash_url}/")
+  if printf '%s' "${body_root}" | grep -q 'id="main"' \
+      && printf '%s' "${body_root}" | grep -q 'id="fortress"'; then
+    echo "    PASS: [${label}] GET / serves v1.1 SPA (id=\"main\" + id=\"fortress\" markers present)"
+  else
+    echo "    FAIL: [${label}] GET / missing v1.1 SPA markers" >&2
+    overall_fail=1
+  fi
+  if printf '%s' "${body_root}" | grep -q 'Principal Dashboard'; then
+    echo "    FAIL: [${label}] GET / unexpectedly contains legacy \"Principal Dashboard\" string" >&2
+    overall_fail=1
+  else
+    echo "    PASS: [${label}] GET / does not contain legacy \"Principal Dashboard\" string"
+  fi
+
+  # GET /dashboard -> v1.1 SPA alias (CC). Same SPA mount markers.
+  body_dashboard=$(curl -sS -H "${auth_header}" "${dash_url}/dashboard")
+  if printf '%s' "${body_dashboard}" | grep -q 'id="main"' \
+      && printf '%s' "${body_dashboard}" | grep -q 'id="fortress"'; then
+    echo "    PASS: [${label}] GET /dashboard serves v1.1 SPA (CC alias)"
+  else
+    echo "    FAIL: [${label}] GET /dashboard missing v1.1 SPA markers" >&2
+    overall_fail=1
+  fi
+
+  # GET /v1.0 -> legacy preserved. The legacy HTML emits a "Principal
+  # Dashboard" header and does NOT carry the v1.1 SPA `id="fortress"`
+  # mount marker.
+  body_v10=$(curl -sS -H "${auth_header}" "${dash_url}/v1.0")
+  if printf '%s' "${body_v10}" | grep -q 'Principal Dashboard'; then
+    echo "    PASS: [${label}] GET /v1.0 serves legacy dashboard (Principal Dashboard header present)"
+  else
+    echo "    FAIL: [${label}] GET /v1.0 missing legacy header" >&2
+    overall_fail=1
+  fi
+  if printf '%s' "${body_v10}" | grep -q 'id="fortress"'; then
+    echo "    FAIL: [${label}] GET /v1.0 unexpectedly contains v1.1 SPA mount marker" >&2
+    overall_fail=1
+  else
+    echo "    PASS: [${label}] GET /v1.0 does not contain v1.1 SPA mount marker"
+  fi
+
+  # GET /v1.1 -> back-compat with operator bookmarks pointing at the
+  # explicit version path.
+  code_v11=$(curl -sS -o /dev/null -w "%{http_code}" -H "${auth_header}" "${dash_url}/v1.1")
+  if [[ "${code_v11}" == "200" ]]; then
+    echo "    PASS: [${label}] GET /v1.1 -> 200 (back-compat)"
+  else
+    echo "    FAIL: [${label}] GET /v1.1 -> ${code_v11} (expected 200)" >&2
+    overall_fail=1
+  fi
+
+  # EE: half-built chat surface removed. The literal v1.1.6 placeholder
+  # copy must not appear in any dashboard surface.
+  if printf '%s' "${body_root}" | grep -q 'Suggestion to concierge'; then
+    echo "    FAIL: [${label}] GET / still contains 'Suggestion to concierge' (EE not removed)" >&2
+    overall_fail=1
+  else
+    echo "    PASS: [${label}] GET / does not contain 'Suggestion to concierge' (EE removed)"
+  fi
+  if printf '%s' "${body_v10}" | grep -q 'Suggestion to concierge'; then
+    echo "    FAIL: [${label}] GET /v1.0 contains 'Suggestion to concierge' (legacy bleed)" >&2
+    overall_fail=1
+  else
+    echo "    PASS: [${label}] GET /v1.0 does not contain 'Suggestion to concierge'"
+  fi
+
+  # EE: welcome card present in the bundled SPA JS. The script source
+  # contains the literal "What you can do today" string from
+  # renderDashboardWelcome().
+  if printf '%s' "${body_root}" | grep -q 'What you can do today'; then
+    echo "    PASS: [${label}] GET / contains EE welcome card copy ('What you can do today')"
+  else
+    echo "    FAIL: [${label}] GET / missing EE welcome card copy" >&2
+    overall_fail=1
+  fi
+}
+
 # Iteration 1: case 2 (env-supplied passphrase, no disclosure expected).
 run_iteration "iter1-env" 1 0
 
@@ -607,12 +756,15 @@ run_standalone_plus_wrap_iteration
 # Iteration 5 (Finding BB): live dashboard refresh after later wraps.
 run_live_refresh_iteration
 
+# Iteration 6 (v1.1.7 Findings CC + EE): route swap + EE chat removal.
+run_v117_route_swap_iteration
+
 echo
 if [[ "${overall_fail}" == "0" ]]; then
-  echo "==> v1.1.6 pre-promote smoke: PASS. Safe to flip dist-tag to latest."
+  echo "==> v1.1.7 pre-promote smoke: PASS. Safe to flip dist-tag to latest."
   exit 0
 else
-  echo "==> v1.1.6 pre-promote smoke: FAIL. Do NOT promote latest." >&2
+  echo "==> v1.1.7 pre-promote smoke: FAIL. Do NOT promote latest." >&2
   echo "    SMOKE_ROOT (preserved for triage): ${SMOKE_ROOT}" >&2
   trap - EXIT
   exit 1

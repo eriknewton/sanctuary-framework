@@ -36,8 +36,13 @@ describe("Principal Dashboard", () => {
   // ── HTTP Server ──────────────────────────────────────────────────────
 
   describe("HTTP Server", () => {
-    it("serves the dashboard HTML at /", async () => {
-      const res = await fetch(`http://127.0.0.1:${port}/`);
+    it("serves the legacy dashboard HTML at /v1.0", async () => {
+      // v1.1.7: legacy four-panel dashboard moved to /v1.0; root + /dashboard
+      // route to the v1.1 SPA via dispatchV11 when v11Bindings are wired
+      // (not in this rig). This rig boots a bare DashboardApprovalChannel,
+      // so the v1.1 dispatch is dormant and the legacy route is the active
+      // surface — pinned at the new /v1.0 URL.
+      const res = await fetch(`http://127.0.0.1:${port}/v1.0`);
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toContain("text/html");
       const text = await res.text();
@@ -330,9 +335,11 @@ describe("Principal Dashboard", () => {
       expect(data.pending_count).toBe(0);
     });
 
-    it("serves dashboard HTML with bearer header (SEC-012)", async () => {
-      // SEC-012: Dashboard is accessed via Authorization header, not ?token= in URL
-      const res = await fetch(`http://127.0.0.1:${authPort}/`, {
+    it("serves legacy dashboard HTML at /v1.0 with bearer header (SEC-012)", async () => {
+      // SEC-012: Dashboard is accessed via Authorization header, not ?token= in URL.
+      // v1.1.7: legacy four-panel dashboard moved to /v1.0. This rig has no
+      // v11Bindings, so the v1.1 dispatch is dormant and we test legacy.
+      const res = await fetch(`http://127.0.0.1:${authPort}/v1.0`, {
         headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
       });
       expect(res.status).toBe(200);
@@ -341,8 +348,9 @@ describe("Principal Dashboard", () => {
       expect(text).toContain("Principal Dashboard");
     });
 
-    it("serves login page instead of dashboard when unauthenticated", async () => {
-      const res = await fetch(`http://127.0.0.1:${authPort}/`);
+    it("serves login page instead of legacy dashboard at /v1.0 when unauthenticated", async () => {
+      // v1.1.7: legacy login flow moved with the legacy dashboard to /v1.0.
+      const res = await fetch(`http://127.0.0.1:${authPort}/v1.0`);
       expect(res.status).toBe(200);
       const body = await res.text();
       // Should be the login page, not the full dashboard
@@ -475,10 +483,15 @@ describe("Principal Dashboard", () => {
     // Request counts are kept just above the 120 general limit — enough to
     // prove exemption without exhausting sockets on CI runners. Each test
     // retries once on beforeEach port collisions (rare but observed).
-    it("does NOT rate-limit HTML view route `/` (rc.2 regression)", { retry: 2 }, async () => {
+    it("does NOT rate-limit HTML view route `/v1.0` (rc.2 regression, v1.1.7 path-flip)", { retry: 2 }, async () => {
+      // v1.1.7: legacy dashboard moved from `/` to `/v1.0`. Rate-limit
+      // exemption applies to the legacy view route at its new path; the
+      // root path is now claimed by the v1.1 SPA via dispatchV11 in
+      // production wiring (this rig is bare so legacy is the active
+      // surface).
       const results: number[] = [];
       for (let i = 0; i < 125; i++) {
-        const res = await fetch(`http://127.0.0.1:${port}/`);
+        const res = await fetch(`http://127.0.0.1:${port}/v1.0`);
         results.push(res.status);
       }
       expect(results).not.toContain(429);
