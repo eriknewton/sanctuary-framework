@@ -111,9 +111,11 @@ The attestation surface is the operator-facing layer that makes the fortress leg
 
 ---
 
-## v1.1: Local Sovereignty Harness
+## v1.1: Local Sovereignty Harness Foundation
 
-v1.1 is the critical product-completion release. It should feel complete for one operator running agents on their own machines.
+v1.1 ships the foundation that makes the local sovereignty harness real: identity, keys, persistence, signed audit, recovery, encrypted state, fortress-local hub APIs, and a v1.1 dashboard surface that renders the wrapped harnesses an operator runs. The library substrate for channel-shape template binding, signed coordination handoffs, and unified approval inbox all ships in v1.1; the operator-facing wiring for those substrates ships in v1.2 (see WP-V1.2-2, WP-V1.2-3, WP-V1.2-4 below).
+
+v1.1 acceptance: an operator can wrap two or three harnesses against one fortress, see them in the v1.1 dashboard Agents view, run a Tier 1 action through the legacy ApprovalGate channel with signed audit entry, and recover the fortress from a passphrase backup if principal loss simulates. This is the foundation. Operator-facing template binding, multi-agent workflow handoffs, and a unified approval inbox arrive in v1.2.
 
 ### 1. Query Privacy And Anonymized Query Mode
 
@@ -335,7 +337,13 @@ Parallelization rules:
 
 ---
 
-## v1.2: Mobile Operator Companion
+## v1.2: Mobile Operator Companion + Operator-Facing v1.1 Surfaces
+
+The v1.1 acceptance audit (`Review/Sanctuary/V1.1.x_Operator_Path_Audit_Pass_B_2026-04-27.md`) and v1.2 scope brief (`Review/Sanctuary/V1.2_Scope_Brief_2026-04-27.md`) split v1.2 into four work packages: WP-V1.2-1 mobile companion (per the section below), WP-V1.2-2 channel-template binding flow (per-agent template-binding control in v1.1 dashboard + Tier 1 `policy_change` backend), WP-V1.2-3 unified approval inbox bridge (legacy `ApprovalGate` requests surfaced in v1.1 hub inbox with unified provenance), WP-V1.2-4 operator-facing coordination handoff (MCP tool or dashboard control to initiate signed handoff between wrapped agents).
+
+Recommended sequencing: WP-V1.2-2 first (smallest operator-visible gap; unblocks original v1.1 acceptance drill's Phase 2 shape), then WP-V1.2-4 (coordination library is solid), then WP-V1.2-3 (bridges multiple subsystems). WP-V1.2-1 mobile parallel-trackable per below.
+
+### WP-V1.2-1: Mobile Operator Companion
 
 Mobile is pulled forward because operators want to communicate with and control agents from the phone. v1.2 is not a full mobile agent runtime.
 
