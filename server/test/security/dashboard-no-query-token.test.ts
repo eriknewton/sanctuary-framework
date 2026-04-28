@@ -48,9 +48,13 @@ describe("SEC-012: Dashboard auth token never in URL query string", () => {
   it("rejects long-lived auth token in ?token= query string (401)", async () => {
     await createDashboard();
 
-    // This is exactly the pattern that SEC-012 forbids: token in URL
-    // GET / without valid auth serves the login page (200), NOT the dashboard
-    const res = await fetch(`${baseUrl}/?token=${AUTH_TOKEN}`);
+    // SEC-012 forbids the long-lived token in URL. v1.1.7: legacy login
+    // page is reached at /v1.0 (root and /dashboard now route to the v1.1
+    // SPA via dispatchV11 in production wiring; this rig boots without
+    // v11Bindings so /v1.0 is the active legacy surface). The token in
+    // the query string must NOT promote the request to authenticated;
+    // unauth still serves the login page.
+    const res = await fetch(`${baseUrl}/v1.0?token=${AUTH_TOKEN}`);
     expect(res.status).toBe(200);
 
     const body = await res.text();
@@ -65,7 +69,7 @@ describe("SEC-012: Dashboard auth token never in URL query string", () => {
   it("accepts long-lived auth token in Authorization: Bearer header", async () => {
     await createDashboard();
 
-    const res = await fetch(`${baseUrl}/`, {
+    const res = await fetch(`${baseUrl}/v1.0`, {
       headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
     });
     expect(res.status).toBe(200);

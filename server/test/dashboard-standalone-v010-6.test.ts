@@ -123,7 +123,10 @@ describe("v0.10.6: dashboard HTML must not reload-loop under loopback auto-auth"
     dashboard = started.dashboard;
     const port = started.port;
 
-    const res = await fetch(`http://127.0.0.1:${port}/`);
+    // v1.1.7: legacy dashboard moved from `/` to `/v1.0`. The LOOPBACK_AUTH
+    // constant is embedded in the legacy generated HTML; this canary follows
+    // the legacy surface to its new URL.
+    const res = await fetch(`http://127.0.0.1:${port}/v1.0`);
     expect(res.status).toBe(200);
     const html = await res.text();
 

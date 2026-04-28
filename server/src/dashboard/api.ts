@@ -201,8 +201,15 @@ export async function handleRequest(
     return true;
   }
 
-  // ── Root HTML ───────────────────────────────────────────────────────
-  if (method === "GET" && (path === "/" || path === "/index.html")) {
+  // ── Legacy v1.0 HTML (preserved at /v1.0) ───────────────────────────
+  // v1.1.7: root and /dashboard now serve the v1.1 SPA via dispatchV11
+  // above. The legacy four-panel dashboard moved to /v1.0 so operators
+  // who explicitly want the prior surface can reach it; /index.html
+  // alias preserved on the legacy path for parity.
+  if (
+    method === "GET" &&
+    (path === "/v1.0" || path === "/v1.0/" || path === "/v1.0/index.html")
+  ) {
     const snapshot = await getProtectionSnapshot(deps.sources);
     const html = renderDashboardHTML({ snapshot, authToken: deps.authToken });
     writeText(res, 200, html, "text/html; charset=utf-8");

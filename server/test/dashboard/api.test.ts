@@ -54,9 +54,13 @@ describe("Dashboard HTTP API", () => {
     expect(body.server_version).toBe("0.9.0-test");
   });
 
-  it("serves the hero HTML at /", async () => {
+  it("serves the legacy hero HTML at /v1.0 (v1.1.7 path-flip)", async () => {
+    // v1.1.7: legacy four-panel hero dashboard moved from `/` to `/v1.0`.
+    // Root and /dashboard now route to the v1.1 SPA via dispatchV11 in
+    // production wiring (this rig boots without v11Bindings, so the
+    // dispatch is dormant and legacy serves at the new /v1.0 URL).
     handle = await startForTest();
-    const res = await fetch(handle.url);
+    const res = await fetch(`${handle.url}/v1.0`);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("<!DOCTYPE html>");

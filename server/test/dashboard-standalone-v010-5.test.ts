@@ -146,7 +146,7 @@ describe("v0.10.5: dashboard panels populate — route table matches HTML calls"
     delete process.env.SANCTUARY_DASHBOARD_PORT;
   });
 
-  it("REGRESSION: every fetch + EventSource target in the served dashboard HTML maps to a mounted route", async () => {
+  it("REGRESSION: every fetch + EventSource target in the served legacy dashboard HTML maps to a mounted route", async () => {
     await seedTenant(root, "v010-5-passphrase");
     process.env.SANCTUARY_STORAGE_PATH = root;
 
@@ -157,10 +157,10 @@ describe("v0.10.5: dashboard panels populate — route table matches HTML calls"
     dashboard = started.dashboard;
     const port = started.port;
 
-    // Loopback auto-auth is on (loaded > 0), so no Authorization header
-    // is needed for any of these requests — exactly the conditions
-    // moltbook hits when the auto-opened browser loads `/`.
-    const indexRes = await fetch(`http://127.0.0.1:${port}/`);
+    // v1.1.7: the v0.10.5 SSE-URL regression canary protects the legacy
+    // (Stack A) dashboard's HTML↔route-table parity. Legacy HTML moved
+    // from `/` to `/v1.0` at v1.1.7; the canary follows it.
+    const indexRes = await fetch(`http://127.0.0.1:${port}/v1.0`);
     expect(indexRes.status).toBe(200);
     const html = await indexRes.text();
 
@@ -241,7 +241,8 @@ describe("v0.10.5: dashboard panels populate — route table matches HTML calls"
     dashboard = started.dashboard;
     const port = started.port;
 
-    const indexRes = await fetch(`http://127.0.0.1:${port}/`);
+    // v1.1.7: legacy dashboard moved from `/` to `/v1.0`.
+    const indexRes = await fetch(`http://127.0.0.1:${port}/v1.0`);
     const html = await indexRes.text();
     const { eventSources } = extractCalledPaths(html);
 

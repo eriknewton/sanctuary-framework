@@ -113,6 +113,7 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
   return (
     path === "/" ||
     path === "/dashboard" ||
+    path === "/v1.0" ||
     path === "/fortress" ||
     path === "/events"
   );
@@ -746,8 +747,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
 
-    // For GET /: serve login page if not authenticated (instead of JSON 401)
-    if (method === "GET" && url.pathname === "/" && this.authToken) {
+    // For GET /v1.0: serve login page if not authenticated (instead of JSON 401).
+    // v1.1.7: root path now serves the v1.1 SPA (handled by dispatchV11
+    // above). The legacy four-panel dashboard moved to /v1.0; the login
+    // page mirrors that move so unauthenticated requests at /v1.0 still
+    // hit the legacy login flow.
+    if (method === "GET" && url.pathname === "/v1.0" && this.authToken) {
       if (!this.isAuthenticated(req, url)) {
         // Login page is a view — no rate limit (auth brute force is gated on /auth/session).
         this.serveLoginPage(res);
@@ -770,8 +775,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     try {
       if (method === "GET" && url.pathname === "/fortress") {
         this.serveFortressView(res);
-      } else if (method === "GET" && (url.pathname === "/" || url.pathname === "/dashboard")) {
-        // Serve Fortress View as default if available (Cocoon mode), else standard dashboard
+      } else if (method === "GET" && url.pathname === "/v1.0") {
+        // v1.1.7: legacy v1.0 dashboard preserved at /v1.0. Root and
+        // /dashboard now route to the v1.1 SPA via dispatchV11 above.
         if (this.fortressHTML) {
           this.serveFortressView(res);
         } else {

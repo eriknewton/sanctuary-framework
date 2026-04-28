@@ -161,13 +161,45 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
     expect(res.status).toBe(401);
   });
 
-  it("GET / (legacy) still serves the dashboard surface", async () => {
+  it("GET / serves the v1.1 SPA (v1.1.7 root-route flip)", async () => {
     const res = await fetch(`${rig.baseUrl}/`, {
       headers: { Authorization: `Bearer ${rig.authToken}` },
     });
-    // Either legacy dashboard HTML or fortress view, both 200.
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
+    const html = await res.text();
+    // SPA marker: the inline client mounts on #main and #fortress.
+    expect(html).toContain('id="main"');
+    expect(html).toContain('id="fortress"');
+  });
+
+  it("GET /dashboard serves the v1.1 SPA (v1.1.7 alias)", async () => {
+    const res = await fetch(`${rig.baseUrl}/dashboard`, {
+      headers: { Authorization: `Bearer ${rig.authToken}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/text\/html/);
+    const html = await res.text();
+    expect(html).toContain('id="main"');
+  });
+
+  it("GET /v1.1 continues to serve the v1.1 SPA (back-compat)", async () => {
+    const res = await fetch(`${rig.baseUrl}/v1.1`, {
+      headers: { Authorization: `Bearer ${rig.authToken}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/text\/html/);
+  });
+
+  it("GET /v1.0 serves the legacy four-panel dashboard (v1.1.7 preserve)", async () => {
+    const res = await fetch(`${rig.baseUrl}/v1.0`, {
+      headers: { Authorization: `Bearer ${rig.authToken}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/text\/html/);
+    const html = await res.text();
+    // Legacy HTML does NOT contain the v1.1 SPA inline-client mount.
+    expect(html).not.toContain('id="fortress"');
   });
 
   it("GET /api/status (legacy) routes to the pre-v1.1 handler (not consumed by v1.1 dispatch)", async () => {
