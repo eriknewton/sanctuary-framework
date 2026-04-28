@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.1.6 - Hotfix (2026-04-27)
+
+Hotfix release. Closes the v1.1.5 release-blocker (Finding BB from operator-path audit Pass A) at the dashboard live-refresh layer. Strict superset of v1.1.5; operators on v1.1.5 should upgrade.
+
+### Fixed
+
+- **Standalone dashboard now reflects new `wrap --no-dashboard` writes without restart (Finding BB).** v1.1.5 added write-side persistence in `wrap` and boot-time rehydration in `buildV11Bindings()`, but the documented operator-clean flow (`sanctuary dashboard &` first, then `sanctuary wrap --<harness> --no-dashboard` per harness) did not work because the standalone dashboard's `InMemoryLocalAgentRegistry` was seeded once at boot and never re-read the persisted `state/_hub/local-agents.json` file. The hotfix wires an on-read refresh into the hub service: `GET /api/hub/agents` now re-reads the persisted file via the existing best-effort persistence module before responding. The `InMemoryLocalAgentRegistry` class is byte-stable; the refresh sits at the service layer for smallest blast radius. Tests + mutation paths that don't need persistence continue to use the registry directly. Operators can now run `sanctuary dashboard &` once, then `sanctuary wrap --<harness> --no-dashboard` per harness, and the running dashboard reflects each new wrap on next page load.
+
+### Added
+
+- **BB regression suite.** Three tests at `server/test/hub/hub-v1.1.test.ts` covering: (a) operator-clean flow simulation (build empty registry, write record to disk, call list, assert record appears); (b) multi-record merge after dashboard boot; (c) idempotency on repeated list calls.
+- **Pre-promote tarball-smoke iter5.** `scripts/published-tarball-smoke-2026-04-26.sh` now exercises the operator-clean flow: start `sanctuary dashboard &`, wait for boot, run `wrap --no-dashboard` against fresh fortress, curl `/api/hub/agents`, assert non-empty. Iter5 specifically locks in BB live-refresh behavior. The smoke now exercises seven operator-path findings (V, W, X, Y, Z, AA, BB).
+
+### Known follow-ups
+
+- **Headless-browser smoke gate (Playwright).** Continues to be the structural fix that catches V/X/Y/BB-class bugs pre-publish on every PR. Multi-stage Codex spawn prompt at `Review/Sanctuary/V1.1.6_Codex_Multi_Stage_2026-04-27.md` Stage 3 retargets to a fresh weekly budget. Queued as v1.1.x housekeeping.
+- **v1.2 scope brief shipped.** Four work packages (mobile companion, channel-template binding, unified approval inbox bridge, operator-facing coordination handoff) at `Review/Sanctuary/V1.2_Scope_Brief_2026-04-27.md`. v1.1 publicly reframes as "Local Sovereignty Harness Foundation"; the operator-path surfaces from the original v1.1 acceptance drill ship in v1.2.
+- **Drill resumption doc revision.** Phase 2 (channel-template binding) and Phase 3.3 (operator-facing coordination handoff) deferred to v1.2 acceptance criteria. Phase 3.1-3.2 narrowed to legacy ApprovalGate verification. Phase 4 reset-history expectation removed; passphrase recovery + audit resumption preserved. Coordinator handles the wiki edits separately.
+- File watcher option for live local-agent registry refresh (instead of on-read re-read) remains a v1.1.x housekeeping option if per-request file-read overhead becomes measurable.
+
 ## v1.1.5 - Hotfix (2026-04-27)
 
 Hotfix release. Closes the v1.1.4 release-blockers (Findings Z + AA from moltbook drill arrest at Phase 1.3). Strict superset of v1.1.4; operators on v1.1.4 should upgrade.
