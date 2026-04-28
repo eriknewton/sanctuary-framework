@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.1.7 - Dashboard UX Hotfix (2026-04-27)
+
+Hotfix release. Closes three dashboard UX findings (CC, DD, EE) surfaced during the v1.1.6 acceptance drill. Pure SPA + CSS + routing; no server-side logic, no policy-engine touches, no hub-API changes. Strict superset of v1.1.6; operators on v1.1.6 should upgrade.
+
+### Fixed
+
+- **Dashboard root path now serves the v1.1 SPA (Finding CC).** Loading `/` and `/dashboard` against the standalone dashboard or the wrap-spawned dashboard now serves the v1.1 SPA. The legacy v1.0 dashboard moves to `/v1.0` (preserved for back-compat); the v1.1 SPA also remains reachable at `/v1.1`. Operators following the wrap-printed URL land on v1.1 directly.
+- **v1.1 Agents widget row layout fixed (Finding DD).** Agent ID + status pill no longer overlap action buttons (Pause / Resume / Restart / Lockdown / Unwrap). Always-stacked row: head row contains glyph + agent ID + status pill; second row contains action buttons. Renders correctly at 800 / 1280 / 1440 / 1920 widths without media queries.
+- **v1.1 Dashboard main panel rewritten (Finding EE).** Replaced the half-built `Suggestion to concierge` advisory text input with a "What you can do today" summary card listing the six nav targets (Agents, Policy, Privacy, Coordination, Health, Exit drill) with one-line operator-action descriptors. The half-built chat affordance is retired; direct chat with the concierge ships in v1.2.
+
+### Added
+
+- **Z empty-state regression-canary.** Static guard on the empty-state code path plus populated-API smoke ensures the Agents-page empty-state copy never appears against a fortress with at least one wrapped harness. The SPA bundles the empty-state string as a JS literal regardless of which branch renders, so the canary tests the structural invariant rather than the rendered HTML.
+- **CC + DD + EE regression suites.** 13 net new platform-agnostic tests across the route-swap, agents-widget layout, welcome-card render, and empty-state canary. `.test-baseline` floor 2870 → 2883.
+- **Pre-promote tarball-smoke iter6.** `scripts/published-tarball-smoke-2026-04-26.sh` now exercises route shape (`/` and `/dashboard` return v1.1 SPA markers; `/v1.0` returns legacy markers; `/v1.1` retains back-compat) and EE chat-removal (no `Suggestion to concierge` string in any served HTML). Combined with prior iterations, smoke now exercises ten operator-path findings (V, W, X, Y, Z, AA, BB, CC, DD, EE).
+
+### Known follow-ups
+
+- **Headless-browser smoke gate (Playwright).** Stage 3 of the v1.1.6 multi-stage Codex spawn prompt at `Review/Sanctuary/V1.1.6_Codex_Multi_Stage_2026-04-27.md` retargets to a fresh weekly budget; the v1.1.7 server-side DOM-shape assertions cover the structural invariants but not full browser-side rendering.
+- **Spawn-prompt template fix.** Step 1.5 grep pattern needs a template-literal URL match (e.g. backtick + `${...}/`) to catch route assertions that build URLs via template literals; v1.1.7 build thread surfaced 6 test files using template literals that the literal-string grep missed.
+- **v1.2 work packages.** WP-V1.2-1 mobile companion, WP-V1.2-2 channel-template binding flow, WP-V1.2-3 unified inbox bridge, WP-V1.2-4 operator-initiated coordination handoff. The deferred operator-facing surfaces from the original v1.1 acceptance drill (Phase 2 + Phase 3.3) ship as these work packages. Scope brief at `Review/Sanctuary/V1.2_Scope_Brief_2026-04-27.md`.
+
 ## v1.1.6 - Hotfix (2026-04-27)
 
 Hotfix release. Closes the v1.1.5 release-blocker (Finding BB from operator-path audit Pass A) at the dashboard live-refresh layer. Strict superset of v1.1.5; operators on v1.1.5 should upgrade.
