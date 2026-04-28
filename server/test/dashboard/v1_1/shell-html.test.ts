@@ -115,26 +115,23 @@ describe("v1.1 dashboard exit drill verifier-out-of-process", () => {
 });
 
 describe("v1.1 dashboard chat protocol", () => {
-  it("does NOT POST operator-typed free text as a backend command", () => {
+  it("ships no chat-composer submit handler at v1.1.7 (Finding EE)", () => {
     const client = getClientScript();
-    // The submit handler must not produce a POST against any agent or
-    // tool endpoint. Free text routes to the concierge as a UI-side
-    // suggestion.
-    const submitBlock = client.match(/submit"[\s\S]+?\}\);/);
-    expect(submitBlock).toBeTruthy();
-    if (submitBlock) {
-      const body = submitBlock[0];
-      // Should NOT contain a fetch + POST of agent text.
-      // Heuristic: the submit handler must NOT call api(...) with method
-      // POST. We assert absence of api( inside the submit block.
-      expect(body).not.toMatch(/\bapi\(/);
-    }
+    // v1.1.7 (Finding EE) removed the half-built chat surface entirely.
+    // No chat-composer form, no submit handler, no chat-input element.
+    // The dashboard view renders a static "What you can do today" welcome
+    // card — there is no path for operator-typed text to reach a backend
+    // command at v1.1, by construction. Direct chat ships in v1.2.
+    expect(client).not.toContain("chat-composer");
+    expect(client).not.toContain("chat-input");
+    expect(client).not.toContain('document.getElementById("chat-input")');
   });
 
   it("renders concierge advisory copy referencing v1.2 deferral", () => {
     const client = getClientScript();
     expect(client).toContain("v1.2");
-    // Concierge surface explicitly named.
+    // Concierge surface explicitly named (in the welcome card's deferral
+    // line: "Direct chat with the concierge ships in v1.2.").
     expect(client.toLowerCase()).toContain("concierge");
   });
 });
