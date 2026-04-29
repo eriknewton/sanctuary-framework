@@ -1,14 +1,5 @@
-/**
- * Five channel-template factories (Walkthrough Key 10 LOCKED starter set).
- * Each template produces a CompiledPolicy that, once packed through the
- * mesh envelope, round-trips cleanly AND evaluates as the spec intends.
- */
-
 import { describe, expect, it } from "vitest";
-import {
-  CHANNEL_TEMPLATE_IDS,
-  GATE_REASON_CODES,
-} from "../../src/policy-engine/constants.js";
+import { CHANNEL_TEMPLATE_IDS } from "../../src/policy-engine/constants.js";
 import {
   allChannelTemplateIds,
   applyChannelTemplate,
@@ -19,7 +10,6 @@ import {
   unpackPolicyUpdate,
 } from "../../src/policy-engine/envelope.js";
 import {
-  evaluateCredentialsGate,
   evaluateMemoryGate,
   evaluateOutputsGate,
   evaluatePlansGate,
@@ -27,28 +17,29 @@ import {
 import type { SlotGateExtendedContext } from "../../src/policy-engine/gates/evaluator.js";
 import { buildFortress, verifyCtxFor } from "./fixture.js";
 
-describe("policy-engine/channel-templates — registry", () => {
-  it("lists exactly the five LOCKED ids", () => {
+describe("policy-engine/channel-templates registry", () => {
+  it("lists exactly the six design-canonical ids", () => {
     const list = listChannelTemplates();
     expect(list.map((t) => t.id)).toEqual([...CHANNEL_TEMPLATE_IDS]);
-    expect(list).toHaveLength(5);
+    expect(list).toHaveLength(6);
   });
 
-  it("every registered template has a label + description", () => {
+  it("every registered template has operator-facing metadata", () => {
     for (const entry of listChannelTemplates()) {
       expect(entry.label.length).toBeGreaterThan(0);
       expect(entry.description.length).toBeGreaterThan(0);
+      expect(["LOW", "MEDIUM"]).toContain(entry.severity);
     }
   });
 
-  it("self-check: all LOCKED ids registered", () => {
+  it("self-checks the registered ids", () => {
     expect(allChannelTemplateIds()).toEqual([...CHANNEL_TEMPLATE_IDS]);
   });
 });
 
 function ctxFor(
   f: ReturnType<typeof buildFortress>,
-  policy: SlotGateExtendedContext["policy"]
+  policy: SlotGateExtendedContext["policy"],
 ): SlotGateExtendedContext {
   return {
     policy,
@@ -58,139 +49,148 @@ function ctxFor(
   };
 }
 
-describe("policy-engine/channel-templates — behavior per template", () => {
-  it("read-outputs-only grants outputs:read only", () => {
+describe("policy-engine/channel-templates behavior", () => {
+  it("request-approve-act opens read-only task context and keeps credentials denied", () => {
     const f = buildFortress();
-    const p = applyChannelTemplate("read-outputs-only", {
+    const p = applyChannelTemplate("request-approve-act", {
       agent_id: "a1",
-      counterparty: "a2",
-      fortress_id: f.master.public.fortress_id,
-      policy_version: 1,
-    });
-    expect(p.slots.outputs.mode).toBe("grant");
-    expect(p.slots.outputs.grants).toEqual([
-      { counterparty: "a2", action: "read" },
-    ]);
-    expect(p.slots.memory.mode).toBe("deny");
-    expect(p.slots.credentials.mode).toBe("deny");
-    expect(p.slots.plans.mode).toBe("deny");
-
-    const ctx = ctxFor(f, p);
-    expect(
-      evaluateOutputsGate(ctx, { agent_id: "a1", counterparty: "a2", action: "read" })
-        .decision
-    ).toBe("allow");
-    expect(
-      evaluateMemoryGate(ctx, { agent_id: "a1", counterparty: "a2", action: "read" })
-        .decision
-    ).toBe("deny");
-  });
-
-  it("bidirectional-sync opens memory + outputs read+subscribe", () => {
-    const f = buildFortress();
-    const p = applyChannelTemplate("bidirectional-sync", {
-      agent_id: "a1",
-      counterparty: "a2",
+      counterparty: "operator",
       fortress_id: f.master.public.fortress_id,
       policy_version: 1,
     });
     expect(p.slots.memory.mode).toBe("grant");
-    expect(p.slots.outputs.mode).toBe("grant");
-    expect(p.slots.plans.mode).toBe("deny");
-    expect(p.slots.credentials.mode).toBe("deny");
-    const ctx = ctxFor(f, p);
-    for (const action of ["read", "subscribe"] as const) {
-      expect(
-        evaluateMemoryGate(ctx, { agent_id: "a1", counterparty: "a2", action })
-          .decision
-      ).toBe("allow");
-      expect(
-        evaluateOutputsGate(ctx, { agent_id: "a1", counterparty: "a2", action })
-          .decision
-      ).toBe("allow");
-    }
-  });
-
-  it("credential-share-scoped requires + retains credential_id scope", () => {
-    const f = buildFortress();
-    const p = applyChannelTemplate("credential-share-scoped", {
-      agent_id: "a1",
-      counterparty: "a2",
-      fortress_id: f.master.public.fortress_id,
-      policy_version: 1,
-      scope: { credential_id: "stripe-prod-readonly" },
-    });
-    const grants = p.slots.credentials.grants;
-    expect(grants).toHaveLength(1);
-    expect(grants[0].action).toBe("share");
-    expect((grants[0].scope as Record<string, string>).credential_id).toBe(
-      "stripe-prod-readonly"
-    );
-    // Other slots remain hermetic.
-    expect(p.slots.memory.mode).toBe("deny");
-    expect(p.slots.plans.mode).toBe("deny");
-    expect(p.slots.outputs.mode).toBe("deny");
-    const ctx = ctxFor(f, p);
-    expect(
-      evaluateCredentialsGate(ctx, {
-        agent_id: "a1",
-        counterparty: "a2",
-        action: "share",
-      }).decision
-    ).toBe("allow");
-    expect(
-      evaluateCredentialsGate(ctx, {
-        agent_id: "a1",
-        counterparty: "a2",
-        action: "read",
-      }).decision
-    ).toBe("deny");
-  });
-
-  it("plan-inspect-read-only grants plans:read only", () => {
-    const f = buildFortress();
-    const p = applyChannelTemplate("plan-inspect-read-only", {
-      agent_id: "a1",
-      counterparty: "a2",
-      fortress_id: f.master.public.fortress_id,
-      policy_version: 1,
-    });
     expect(p.slots.plans.mode).toBe("grant");
+    expect(p.slots.outputs.mode).toBe("grant");
+    expect(p.slots.credentials.mode).toBe("deny");
+    expect(p.budgets?.daily?.amount).toBe(5);
+
     const ctx = ctxFor(f, p);
     expect(
-      evaluatePlansGate(ctx, { agent_id: "a1", counterparty: "a2", action: "read" })
-        .decision
+      evaluatePlansGate(ctx, {
+        agent_id: "a1",
+        counterparty: "operator",
+        action: "read",
+      }).decision,
     ).toBe("allow");
     expect(
-      evaluatePlansGate(ctx, { agent_id: "a1", counterparty: "a2", action: "write" })
-        .decision
+      evaluatePlansGate(ctx, {
+        agent_id: "a1",
+        counterparty: "operator",
+        action: "write",
+      }).decision,
     ).toBe("deny");
   });
 
-  it("escrow-handoff declares intra-mesh-escrow commitment class and opens plan/outputs", () => {
+  it("read-then-report allows output reads and preserves allowed hosts", () => {
     const f = buildFortress();
-    const p = applyChannelTemplate("escrow-handoff", {
+    const p = applyChannelTemplate("read-then-report", {
       agent_id: "a1",
-      counterparty: "a2",
+      counterparty: "operator",
+      fortress_id: f.master.public.fortress_id,
+      policy_version: 1,
+      scope: { allowed_hosts: ["docs.example"] },
+    });
+    expect(p.slots.outputs.mode).toBe("grant");
+    expect(p.egress?.allowlist).toEqual([
+      { destination: "docs.example", methods: ["GET"] },
+    ]);
+    expect(
+      evaluateOutputsGate(ctxFor(f, p), {
+        agent_id: "a1",
+        counterparty: "operator",
+        action: "read",
+      }).decision,
+    ).toBe("allow");
+  });
+
+  it("scheduled-digest subscribes summaries without opening writes", () => {
+    const f = buildFortress();
+    const p = applyChannelTemplate("scheduled-digest", {
+      agent_id: "a1",
+      counterparty: "operator",
+      fortress_id: f.master.public.fortress_id,
+      policy_version: 1,
+    });
+    const ctx = ctxFor(f, p);
+    expect(
+      evaluateOutputsGate(ctx, {
+        agent_id: "a1",
+        counterparty: "operator",
+        action: "subscribe",
+      }).decision,
+    ).toBe("allow");
+    expect(
+      evaluateOutputsGate(ctx, {
+        agent_id: "a1",
+        counterparty: "operator",
+        action: "write",
+      }).decision,
+    ).toBe("deny");
+  });
+
+  it("plan-draft-only grants plan read and no execution-shaped output write", () => {
+    const f = buildFortress();
+    const p = applyChannelTemplate("plan-draft-only", {
+      agent_id: "a1",
+      counterparty: "operator",
+      fortress_id: f.master.public.fortress_id,
+      policy_version: 1,
+    });
+    const ctx = ctxFor(f, p);
+    expect(
+      evaluatePlansGate(ctx, {
+        agent_id: "a1",
+        counterparty: "operator",
+        action: "read",
+      }).decision,
+    ).toBe("allow");
+    expect(p.slots.memory.mode).toBe("deny");
+    expect(p.slots.outputs.mode).toBe("deny");
+  });
+
+  it("fortress-relay declares dual-signature relay commitments", () => {
+    const f = buildFortress();
+    const p = applyChannelTemplate("fortress-relay", {
+      agent_id: "a1",
+      counterparty: "peer-fortress",
       fortress_id: f.master.public.fortress_id,
       policy_version: 1,
     });
     expect(p.capabilities.concordia_commitment_classes).toContain(
-      "intra-mesh-escrow"
+      "fortress-relay-dual-signature",
     );
-    expect(p.slots.plans.mode).toBe("grant");
-    expect(p.slots.outputs.mode).toBe("grant");
-    expect(p.slots.memory.mode).toBe("deny");
+    expect(p.slots.outputs.grants.map((g) => g.action).sort()).toEqual([
+      "read",
+      "subscribe",
+    ]);
+  });
+
+  it("concierge-loop reads local state and blocks outward egress", () => {
+    const f = buildFortress();
+    const p = applyChannelTemplate("concierge-loop", {
+      agent_id: "a1",
+      counterparty: "operator",
+      fortress_id: f.master.public.fortress_id,
+      policy_version: 1,
+    });
+    expect(p.egress?.allowlist).toEqual([]);
     expect(p.slots.credentials.mode).toBe("deny");
+    expect(
+      evaluateMemoryGate(ctxFor(f, p), {
+        agent_id: "a1",
+        counterparty: "operator",
+        action: "read",
+      }).decision,
+    ).toBe("allow");
   });
 });
 
-describe("policy-engine/channel-templates — pack + unpack via mesh envelope", () => {
-  it("a template-produced policy round-trips through packPolicyUpdate + unpackPolicyUpdate", () => {
+describe("policy-engine/channel-templates envelope and merge", () => {
+  it("a template-produced policy round-trips through the mesh envelope", () => {
     const f = buildFortress();
-    const p = applyChannelTemplate("read-outputs-only", {
+    const p = applyChannelTemplate("request-approve-act", {
       agent_id: "a1",
-      counterparty: "a2",
+      counterparty: "operator",
       fortress_id: f.master.public.fortress_id,
       policy_version: 2,
       parent_version: 1,
@@ -208,41 +208,32 @@ describe("policy-engine/channel-templates — pack + unpack via mesh envelope", 
       meshVerifyContext: verifyCtxFor(f),
       pinnedVersionHead: 1,
     });
-    expect(r.compiled.slots.outputs.grants).toEqual([
-      { counterparty: "a2", action: "read" },
-    ]);
     expect(r.compiled.parent_version).toBe(1);
+    expect(r.compiled.slots.plans.mode).toBe("grant");
   });
-});
 
-describe("policy-engine/channel-templates — merge_into preserves prior grants", () => {
-  it("applying escrow-handoff on top of read-outputs-only does not drop outputs:read", () => {
+  it("merge_into preserves prior grants", () => {
     const f = buildFortress();
-    const base = applyChannelTemplate("read-outputs-only", {
+    const base = applyChannelTemplate("read-then-report", {
       agent_id: "a1",
-      counterparty: "a2",
+      counterparty: "operator",
       fortress_id: f.master.public.fortress_id,
       policy_version: 1,
     });
-    const merged = applyChannelTemplate("escrow-handoff", {
+    const merged = applyChannelTemplate("fortress-relay", {
       agent_id: "a1",
-      counterparty: "a2",
+      counterparty: "peer-fortress",
       fortress_id: f.master.public.fortress_id,
       policy_version: 2,
       parent_version: 1,
       merge_into: base,
     });
-    // The outputs:read grant from base AND the outputs:subscribe grant from
-    // escrow-handoff both survive.
-    const actions = merged.slots.outputs.grants
-      .filter((g) => g.counterparty === "a2")
-      .map((g) => g.action)
-      .sort();
-    expect(actions).toContain("read");
-    expect(actions).toContain("subscribe");
+    expect(merged.slots.outputs.grants).toEqual(
+      expect.arrayContaining([
+        { counterparty: "operator", action: "read" },
+        { counterparty: "peer-fortress", action: "read" },
+        { counterparty: "peer-fortress", action: "subscribe" },
+      ]),
+    );
   });
 });
-
-// Silence unused imports warning — GATE_REASON_CODES retained for potential
-// future assertions on specific deny reason codes.
-void GATE_REASON_CODES;

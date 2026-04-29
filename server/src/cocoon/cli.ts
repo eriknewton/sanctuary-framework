@@ -1111,9 +1111,9 @@ function harnessKindForPlatform(platform: AgentPlatform): LocalHarnessKind {
  * provider or bind a policy at wrap time, so `model_provider.vendor`
  * stays "unknown" and `policy_id` stays "unbound" until the v1.2
  * data-plane work lands real detection / Phase 2 binding. The capability
- * flags reflect what the v1.1.1 `CapabilityErrorAgentController` honestly
- * supports today: `can_unwrap` is the only mutation wrap exposes; the
- * rest stay false until controller wiring lands.
+ * flags reflect what the dashboard controller honestly supports today:
+ * `can_unwrap` remains the only harness mutation exposed, and
+ * `can_change_template` is registry-local through the Tier 1 binding flow.
  */
 function buildLocalAgentRecord(input: {
   storagePath: string;
@@ -1146,7 +1146,7 @@ function buildLocalAgentRecord(input: {
       can_unwrap: true,
       can_lockdown: false,
       can_chat: false,
-      can_change_template: false,
+      can_change_template: true,
     },
   };
 }

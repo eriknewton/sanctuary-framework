@@ -58,6 +58,7 @@ function arg(
     case "agent_id":
     case "identity_id":
     case "policy_id":
+    case "channel_template_id":
     case "destination_category":
     case "tier":
     case "iso8601":
@@ -99,6 +100,8 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
     `Unwrap agent ${arg(a, "agent_id")}. Cocoon and registry binding will be removed.`,
   "approval_pending.tier1.policy_change": (a) =>
     `Bind agent ${arg(a, "agent_id")} to policy ${arg(a, "policy_id")}.`,
+  "approval_pending.tier1.policy_change_template": (a) =>
+    `Bind agent ${arg(a, "agent_id")} to template ${arg(a, "policy_id")}.`,
   "approval_pending.tier1.exit_bundle_export": (a) =>
     `Export the fortress as a portable bundle. Agent: ${arg(a, "agent_id", "all agents")}.`,
   "approval_pending.tier1.exit_bundle_import": (a) =>
@@ -203,6 +206,10 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
     `Internal handoff event involving agent ${arg(a, "agent_id")}.`,
   "activity.lifecycle": (a) =>
     `Lifecycle change on agent ${arg(a, "agent_id")} at ${shortTime(arg(a, "iso8601", ""))}.`,
+  "activity.agent_policy_change_engaged": (a) =>
+    `Template binding changed on agent ${arg(a, "agent_id")}: ${arg(a, "channel_template_id", "default none")} to ${arg(a, "policy_id")}.`,
+  "activity.agent_policy_change_denied": (a) =>
+    `Template binding denied on agent ${arg(a, "agent_id")}: ${arg(a, "channel_template_id", "default none")} to ${arg(a, "policy_id")}.`,
   "activity.config": (a) =>
     `Configuration change applied. Agent: ${arg(a, "agent_id", "(fortress)")}.`,
   "activity.other": (a) =>

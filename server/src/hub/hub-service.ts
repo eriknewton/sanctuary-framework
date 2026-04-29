@@ -28,6 +28,7 @@ import type {
 } from "../contracts/v1.1/local-agent-records.js";
 import type { ChannelTemplateId } from "../policy-engine/constants.js";
 import { CHANNEL_TEMPLATE_IDS } from "../policy-engine/constants.js";
+import { applyChannelTemplate } from "../policy-engine/channel-templates.js";
 
 import {
   HUB_AGENT_CONTROL_ACTIONS,
@@ -55,6 +56,7 @@ import type {
   HubServiceDeps,
   HubTier1ApprovalEnqueuedResult,
   HubTier1FortressApprovalEnqueuedResult,
+  HubTemplateBindingApprovalEnqueuedResult,
 } from "./types.js";
 
 function isTier1ControlAction(
@@ -377,26 +379,90 @@ export class HubService {
   }
 
   /**
-   * Bind a different channel template. Not Tier 1; channel templates are
-   * compositions over the four canonical slots and bind synchronously.
+   * Bind a different channel template. Tier 1: enqueues a policy_change
+   * approval item and only applies the binding after operator approval.
    */
-  async bindAgentChannelTemplate(
+  bindAgentChannelTemplate(
     agentId: string,
     rawTemplateId: unknown,
-  ): Promise<LocalAgentRecord> {
+  ): HubTemplateBindingApprovalEnqueuedResult {
     const templateId = checkChannelTemplateId(rawTemplateId);
     const record = this.getAgent(agentId);
-    if (!record.capabilities.can_change_template) {
-      throw new HubCapabilityError("change_template");
-    }
-    await this.deps.agentController.bindChannelTemplate(
-      record.agent_id,
-      templateId,
-    );
-    return this.deps.agentRegistry.updateChannelTemplateBinding(
-      record.agent_id,
-      templateId,
-    );
+    const currentTemplate =
+      typeof record.channel_template_id === "string" &&
+      (CHANNEL_TEMPLATE_IDS as readonly string[]).includes(record.channel_template_id)
+        ? (record.channel_template_id as ChannelTemplateId)
+        : undefined;
+    const compiled = applyChannelTemplate(templateId, {
+      agent_id: record.agent_id,
+      counterparty: this.deps.identityId,
+      fortress_id: this.deps.fortressId,
+      policy_version: Date.now(),
+    });
+    const compiledPolicyId = `${record.agent_id}:${templateId}:v${compiled.policy_version}`;
+    const itemId = `tier1.policy_change.template.${record.agent_id}.${randomUUID()}`;
+    const item: HubApprovalPendingItem = {
+      version: "1.1",
+      item_id: itemId,
+      kind: "approval_pending",
+      created_at: this.nowIso(),
+      agent_id: record.agent_id,
+      identity_id: record.identity_id,
+      display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.approval_pending}.tier1.policy_change_template`,
+      display_template_args: [
+        { kind: "agent_id", value: record.agent_id },
+        { kind: "policy_id", value: templateId },
+        { kind: "tier", value: "tier1" },
+      ],
+      resolved: false,
+      tier: "tier1",
+      operation_category: "policy_change",
+    };
+
+    this.inboxStore.enqueueTier1(item, async (_approvedItem, decision) => {
+      if (decision === "deny") {
+        this.deps.activitySources.auditLog.append(
+          "l2",
+          "agent_policy_change_denied",
+          this.deps.identityId,
+          {
+            agent_id: record.agent_id,
+            identity_id: record.identity_id,
+            operator_audit_id: itemId,
+            current_template: currentTemplate ?? null,
+            proposed_template: templateId,
+          },
+        );
+        return;
+      }
+      await this.deps.agentController.bindChannelTemplate(record.agent_id, templateId);
+      this.deps.agentRegistry.updateChannelTemplateBinding(record.agent_id, templateId);
+      this.deps.agentRegistry.updatePolicyBinding(record.agent_id, compiledPolicyId);
+      this.deps.writePersistedLocalAgents?.(this.deps.agentRegistry.list());
+      this.deps.activitySources.auditLog.append(
+        "l2",
+        "agent_policy_change_engaged",
+        this.deps.identityId,
+        {
+          agent_id: record.agent_id,
+          identity_id: record.identity_id,
+          operator_audit_id: itemId,
+          current_template: currentTemplate ?? null,
+          proposed_template: templateId,
+          policy_id: compiledPolicyId,
+        },
+      );
+    });
+
+    return {
+      agent_id: record.agent_id,
+      inbox_item_id: itemId,
+      status: "approval_pending",
+      operation_category: "policy_change",
+      ...(currentTemplate ? { current_template_id: currentTemplate } : {}),
+      proposed_template_id: templateId,
+      compiled_policy_id: compiledPolicyId,
+    };
   }
 
   // ── Fortress-scope Tier 1 actions ──────────────────────────────────

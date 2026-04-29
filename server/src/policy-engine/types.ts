@@ -228,7 +228,7 @@ export interface GateReceipt {
   signature: string;
 }
 
-/** Channel-template parameters common to all five templates. */
+/** Channel-template parameters common to all shipped templates. */
 export interface ChannelTemplateParams {
   /** Caller agent whose policy this channel opens on. */
   agent_id: string;
@@ -257,5 +257,7 @@ export interface ChannelTemplateRegistryEntry {
   label: string;
   /** English description of what the template opens. */
   description: string;
+  /** Operator-facing policy severity tag. */
+  severity: "LOW" | "MEDIUM";
   factory: ChannelTemplateFactory;
 }

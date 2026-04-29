@@ -204,9 +204,9 @@ describe("AC4: Agent roster view embeds per-agent attestation badge", () => {
 // =====================================================================
 
 describe("AC5: Policy editor compiles plain-English to signed artifact", () => {
-  it("lists exactly five channel templates", () => {
+  it("lists every canonical channel template", () => {
     const templates = listChannelTemplates();
-    expect(templates).toHaveLength(5);
+    expect(templates).toHaveLength(CHANNEL_TEMPLATE_IDS.length);
     expect(templates.map((t) => t.id).sort()).toEqual(
       [...CHANNEL_TEMPLATE_IDS].sort()
     );

@@ -78,7 +78,7 @@ function makeAgent(
       runs_locally: false,
     },
     policy_id: "policy-default",
-    channel_template_id: "read-outputs-only",
+    channel_template_id: "request-approve-act",
     status: "active",
     budget_summary: {
       daily: { unit: "tokens", cap: 100_000, used: 25_000, soft_warn: 0.8 },
@@ -923,7 +923,7 @@ describe("Hub agent control endpoints (Test 4)", () => {
     ).toBe(false);
   });
 
-  it("template bind is synchronous (not Tier 1) and updates the record", async () => {
+  it("template bind is Tier 1 and updates the record only after approval", async () => {
     const res = await fetch(
       `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/template`,
       {
@@ -932,22 +932,38 @@ describe("Hub agent control endpoints (Test 4)", () => {
           { "Content-Type": "application/json" },
           rig.authToken,
         ),
-        body: JSON.stringify({ channel_template_id: "bidirectional-sync" }),
+        body: JSON.stringify({ template_id: "read-then-report" }),
       },
     );
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(202);
     const body = (await res.json()) as {
       ok: true;
-      data: { agent: LocalAgentRecord };
+      data: { inbox_item_id: string; proposed_template_id: string };
     };
-    expect(body.data.agent.channel_template_id).toBe("bidirectional-sync");
+    expect(body.data.proposed_template_id).toBe("read-then-report");
+    expect(rig.controller.calls).toEqual([]);
+
+    const approveRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/${encodeURIComponent(body.data.inbox_item_id)}/approve`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(approveRes.status).toBe(200);
     expect(rig.controller.calls).toEqual([
       {
         action: "bindChannelTemplate",
         agentId: "agent-alpha",
-        arg: "bidirectional-sync",
+        arg: "read-then-report",
       },
     ]);
+    const agentRes = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const agentBody = (await agentRes.json()) as {
+      ok: true;
+      data: { agent: LocalAgentRecord };
+    };
+    expect(agentBody.data.agent.channel_template_id).toBe("read-then-report");
   });
 });
 
@@ -1156,7 +1172,7 @@ describe("Hub policy + budget summaries", () => {
         display_label: "Default channel",
         bound_at: "2026-04-25T00:00:00.000Z",
         agent_count: 1,
-        channel_template_id: "read-outputs-only",
+        channel_template_id: "request-approve-act",
       },
     ];
     const budgetSummaries: HubBudgetSummary[] = [

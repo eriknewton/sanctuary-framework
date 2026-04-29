@@ -187,7 +187,7 @@ function makeAgent(agentId: string): LocalAgentRecord {
       runs_locally: false,
     },
     policy_id: "policy-drill",
-    channel_template_id: "read-outputs-only",
+    channel_template_id: "request-approve-act",
     status: "active",
     budget_summary: {
       daily: { unit: "tokens", cap: 100_000, used: 25_000, soft_warn: 0.8 },

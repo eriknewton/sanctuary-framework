@@ -1,7 +1,7 @@
 {
   "name": "research-assistant",
   "version": "1.0.0",
-  "channel": "read-outputs-only",
+  "channel": "read-then-report",
   "tier": "B",
   "target_archetype": "A Tier B adapter-wrapped agent that reads approved sources and writes research summaries. Minimal footprint, read-only output surface.",
   "description": "Research agent: reads sources, writes summaries to outputs. No credentials, no plans, no bidirectional sync."

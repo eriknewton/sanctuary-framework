@@ -1,8 +1,17 @@
 {
   "name": "handoff-coordinator",
   "version": "1.0.0",
-  "channel": "escrow-handoff",
+  "channel": "fortress-relay",
   "tier": "B",
+  "slot_augmentations": {
+    "plans": {
+      "mode": "grant",
+      "grants": [
+        { "counterparty": "*", "action": "read" }
+      ]
+    },
+    "concordia_commitment_classes": ["intra-mesh-escrow"]
+  },
   "target_archetype": "A Tier B adapter-wrapped agent that coordinates handoffs between other agents. Commitment boundary enforces every handoff.",
   "description": "Handoff coordinator: manages escrow-style handoffs between agents. Commitment boundary on every handoff."
 }
