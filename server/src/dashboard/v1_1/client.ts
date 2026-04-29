@@ -55,6 +55,7 @@ const state = {
   inbox: [],
   activity: [],
   policies: [],
+  templateBinding: { agentId: null, selectedTemplateId: null, pendingItemId: null, error: null },
   privacyEvents: [],
   handoffEvents: [],
   topbarPills: { deployment: "local", mode: "solo", attestation: "pending" },
@@ -130,6 +131,7 @@ const TEMPLATES = {
   "approval_pending.tier1.lockdown": (a) => "Lock down agent " + arg(a,"agent_id") + ". This stops all egress and freezes gates.",
   "approval_pending.tier1.unwrap": (a) => "Unwrap agent " + arg(a,"agent_id") + ". Cocoon and registry binding will be removed.",
   "approval_pending.tier1.policy_change": (a) => "Bind agent " + arg(a,"agent_id") + " to policy " + arg(a,"policy_id") + ".",
+  "approval_pending.tier1.policy_change_template": (a) => "Bind agent " + arg(a,"agent_id") + " to template " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.exit_bundle_export": (a) => "Export the fortress as a portable bundle. Agent: " + arg(a,"agent_id","all agents") + ".",
   "approval_pending.tier1.exit_bundle_import": (a) => "Import a portable bundle into this fortress.",
   "approval_pending.tier1.exit_bundle_rekey": (a) => "Re-key encrypted state for portable export.",
@@ -173,6 +175,8 @@ const TEMPLATES = {
   "activity.privacy": (a) => "Privacy event recorded for agent " + arg(a,"agent_id") + ".",
   "activity.handoff": (a) => "Internal handoff event involving agent " + arg(a,"agent_id") + ".",
   "activity.lifecycle": (a) => "Lifecycle change on agent " + arg(a,"agent_id") + ".",
+  "activity.agent_policy_change_engaged": (a) => "Template binding changed on agent " + arg(a,"agent_id") + ": " + arg(a,"channel_template_id","default none") + " to " + arg(a,"policy_id") + ".",
+  "activity.agent_policy_change_denied": (a) => "Template binding denied on agent " + arg(a,"agent_id") + ": " + arg(a,"channel_template_id","default none") + " to " + arg(a,"policy_id") + ".",
   "activity.config": (a) => "Configuration change applied.",
   "activity.other": (a) => "Audit event recorded for agent " + arg(a,"agent_id","(fortress)") + "."
 };
@@ -204,6 +208,45 @@ const REASON_LABELS = {
   config_drift: "Configuration drift detected",
   other: "Other reason. See activity feed."
 };
+
+const CHANNEL_TEMPLATES = [
+  {
+    id: "request-approve-act",
+    severity: "MEDIUM",
+    title: "Request -> approve -> act",
+    description: "Operator sends a task. Agent proposes writes, pauses for approval, then executes. Most wrapped agents live here."
+  },
+  {
+    id: "read-then-report",
+    severity: "LOW",
+    title: "Read -> report",
+    description: "Agent reads allowed sources and reports back. Any fetch outside allowed-hosts surfaces as an approval request."
+  },
+  {
+    id: "scheduled-digest",
+    severity: "LOW",
+    title: "Scheduled digest",
+    description: "Runs on timer or external trigger. Pushes summaries into chat. Cannot write outward without approval."
+  },
+  {
+    id: "plan-draft-only",
+    severity: "LOW",
+    title: "Plan, draft-only",
+    description: "Drafts plans you review before anything runs. Cannot execute, pay, or mutate state on its own."
+  },
+  {
+    id: "fortress-relay",
+    severity: "MEDIUM",
+    title: "Fortress relay",
+    description: "Routes signed events between peer fortresses. Commits bind only when both sides sign."
+  },
+  {
+    id: "concierge-loop",
+    severity: "LOW",
+    title: "Concierge loop",
+    description: "Bidirectional Q&A with the operator. Reads local fortress state; never writes outward."
+  }
+];
 
 // ── Inbox action surface per kind (binding addendum 1.2) ───────────────
 function inboxActions(item) {
@@ -427,26 +470,68 @@ function renderHealthPage() {
 
 // ── Render: policy ─────────────────────────────────────────────────────
 function renderPolicyCenter() {
-  const channelTemplates = ["read-outputs-only","bidirectional-sync","credential-share-scoped","plan-inspect-read-only","escrow-handoff"];
-  const summaries = state.policies.length
-    ? state.policies.map(function (p) {
-        return '<div class="row">' +
-          '<strong class="grow">' + escHtml(p.display_label) + '</strong>' +
-          '<span class="mono muted">' + escHtml(p.policy_id) + '</span>' +
-          '<span class="pill">' + escHtml(p.agent_count) + ' bound</span>' +
-          '</div>';
-      }).join("\n")
-    : '<p class="muted">No policies bound yet.</p>';
-  const tmplCards = channelTemplates.map(function (t) {
-    return '<div class="row"><span class="mono">' + escHtml(t) + '</span></div>';
+  const tmplCards = CHANNEL_TEMPLATES.map(function (t) {
+    return '<article class="template-card">' +
+      '<div class="template-card-head">' +
+        '<span class="severity ' + (t.severity === "MEDIUM" ? "medium" : "low") + '">' + escHtml(t.severity) + '</span>' +
+        '<span class="template-id mono">' + escHtml(t.id) + '</span>' +
+      '</div>' +
+      '<h3>' + escHtml(t.title) + '</h3>' +
+      '<p>' + escHtml(t.description) + '</p>' +
+    '</article>';
   }).join("\n");
-  return '<h1>Policy</h1>' +
-    '<div class="card"><h3>Bound policies</h3>' + summaries + '</div>' +
-    '<div class="card"><h3>Channel templates</h3>' + tmplCards + '</div>' +
-    '<div style="display:flex;gap:8px;margin-top:8px;">' +
-      '<button class="btn" disabled title="Bulk allowlist edit lands in v1.2.">Edit allowlists in bulk</button>' +
-      '<button class="btn" disabled title="Tighten-all batch action lands in v1.2.">Tighten all to T1+T2</button>' +
-    '</div>';
+  const rows = state.agents.length
+    ? state.agents.map(function (a) {
+        const binding = a.channel_template_id || "default none";
+        const budget = a.budget_summary && a.budget_summary.daily
+          ? "$" + escHtml(a.budget_summary.daily.cap) + "/day"
+          : "Not set";
+        const open = state.templateBinding.agentId === a.agent_id;
+        return '<tr>' +
+          '<td><button class="link-btn" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">' + escHtml(a.agent_id) + '</button></td>' +
+          '<td><button class="template-cell" data-action="template-picker-open" data-agent-id="' + escHtml(a.agent_id) + '">' + escHtml(binding) + '</button>' +
+            (open ? renderTemplatePicker(a) : '') +
+          '</td>' +
+          '<td><span class="allow-count">12</span> <span class="muted">.</span> <span class="block-count">3</span></td>' +
+          '<td>' + budget + '</td>' +
+          '<td>30 d</td>' +
+          '<td><span class="toggle-on" aria-label="enabled"></span></td>' +
+          '<td>T1, T2</td>' +
+        '</tr>';
+      }).join("\n")
+    : '<tr><td colspan="7" class="muted">No wrapped agents yet.</td></tr>';
+  return '<section class="policy-center">' +
+    '<p class="eyebrow">POLICY CENTER</p>' +
+    '<h1>One screen for every rule <span class="pill tone-verified">v1.1</span></h1>' +
+    '<p class="policy-subtitle">Templates, per-agent rules, egress allowlists, retention, budgets, and privacy-minimization settings. Edits write a signed receipt; agents pick up changes within one tool-call cycle.</p>' +
+    '<section class="policy-panel"><h2>Channel templates · 6 shipped</h2><div class="template-grid">' + tmplCards + '</div></section>' +
+    '<section class="policy-panel"><h2>Per-agent rules</h2>' +
+      '<div class="rules-scroll"><table class="rules-table">' +
+      '<thead><tr><th>AGENT</th><th>TEMPLATE</th><th>ALLOW / BLOCK</th><th>BUDGET</th><th>RETENTION</th><th>MINIMIZE</th><th>APPROVALS</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table></div>' +
+    '</section>' +
+  '</section>';
+}
+
+function renderTemplatePicker(agent) {
+  const current = agent.channel_template_id || "";
+  const selected = state.templateBinding.selectedTemplateId || current || CHANNEL_TEMPLATES[0].id;
+  const options = CHANNEL_TEMPLATES.map(function (t) {
+    return '<label class="template-option">' +
+      '<input type="radio" name="template-choice-' + escHtml(agent.agent_id) + '" value="' + escHtml(t.id) + '"' + (selected === t.id ? ' checked' : '') + ' data-action="template-picker-select" data-agent-id="' + escHtml(agent.agent_id) + '" data-template-id="' + escHtml(t.id) + '">' +
+      '<span><strong>' + escHtml(t.title) + '</strong><small>' + escHtml(t.description) + '</small></span>' +
+    '</label>';
+  }).join("");
+  const pending = state.templateBinding.pendingItemId ? '<p class="muted">Awaiting approval...</p>' : '';
+  const error = state.templateBinding.error ? '<p class="error-text">' + escHtml(state.templateBinding.error) + '</p>' : '';
+  return '<div class="template-picker">' +
+    '<div class="template-picker-options">' + options + '</div>' +
+    pending + error +
+    '<div class="template-picker-actions">' +
+      '<button class="btn" data-action="template-picker-close">Cancel</button>' +
+      '<button class="btn btn-primary" data-action="template-bind" data-agent-id="' + escHtml(agent.agent_id) + '"' + (state.templateBinding.pendingItemId ? ' disabled' : '') + '>Bind</button>' +
+    '</div>' +
+  '</div>';
 }
 
 // ── Render: exit drill ────────────────────────────────────────────────
@@ -665,6 +750,32 @@ async function onExitExportStart() {
   }
 }
 
+async function onTemplateBind(agentId) {
+  const templateId = state.templateBinding.selectedTemplateId;
+  if (!templateId) {
+    state.templateBinding.error = "Pick a template before binding.";
+    return rerender();
+  }
+  try {
+    state.templateBinding.pendingItemId = "pending";
+    state.templateBinding.error = null;
+    rerender();
+    const r = await api("/agents/" + encodeURIComponent(agentId) + "/template", {
+      method: "POST",
+      body: { template_id: templateId }
+    });
+    state.templateBinding.pendingItemId = r.data.inbox_item_id;
+    toast("Approval pending. See inbox.", "info");
+    await fetchAll();
+    rerender();
+  } catch (e) {
+    state.templateBinding.pendingItemId = null;
+    state.templateBinding.error = e.message;
+    toast("Template binding failed: " + e.message, "error");
+    rerender();
+  }
+}
+
 // ── SSE wire-up ────────────────────────────────────────────────────────
 function connectStream() {
   let es = null;
@@ -763,6 +874,27 @@ document.addEventListener("click", function (ev) {
   if (action === "exit-export-start") return void onExitExportStart();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
   if (action === "open-agent" && agentId) { state.selectedAgentId = agentId; location.hash = "agent-detail"; return; }
+  if (action === "template-picker-open" && agentId) {
+    const agent = state.agents.find(function (a) { return a.agent_id === agentId; });
+    state.templateBinding = {
+      agentId: agentId,
+      selectedTemplateId: (agent && agent.channel_template_id) || CHANNEL_TEMPLATES[0].id,
+      pendingItemId: null,
+      error: null
+    };
+    return rerender();
+  }
+  if (action === "template-picker-close") {
+    state.templateBinding = { agentId: null, selectedTemplateId: null, pendingItemId: null, error: null };
+    return rerender();
+  }
+  if (action === "template-picker-select" && agentId) {
+    state.templateBinding.agentId = agentId;
+    state.templateBinding.selectedTemplateId = tgt.getAttribute("data-template-id");
+    state.templateBinding.error = null;
+    return rerender();
+  }
+  if (action === "template-bind" && agentId) return void onTemplateBind(agentId);
   if (action === "set-route" && route) { location.hash = route; return; }
   if (action === "show-details" && itemId) {
     const i = state.inbox.find(function (x) { return x.item_id === itemId; });

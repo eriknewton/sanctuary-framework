@@ -11,7 +11,7 @@
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CHANNEL_TEMPLATE_IDS } from "../policy-engine/constants.js";
+import { CHANNEL_TEMPLATE_IDS, POLICY_SLOTS } from "../policy-engine/constants.js";
 import type {
   TemplateBundle,
   TemplateMetadata,
@@ -78,6 +78,60 @@ function validateMetadata(name: string, data: unknown): asserts data is Template
   }
   if (typeof d.description !== "string" || d.description.length === 0) {
     throw new TemplateValidationError(name, "template.json description must be a non-empty string");
+  }
+  if (d.slot_augmentations !== undefined) {
+    validateSlotAugmentations(name, d.slot_augmentations);
+  }
+}
+
+function validateSlotAugmentations(name: string, data: unknown): void {
+  if (typeof data !== "object" || data === null) {
+    throw new TemplateValidationError(name, "template.json slot_augmentations must be an object");
+  }
+  const d = data as Record<string, unknown>;
+  for (const key of Object.keys(d)) {
+    if (key === "concordia_commitment_classes") continue;
+    if (!(POLICY_SLOTS as readonly string[]).includes(key)) {
+      throw new TemplateValidationError(name, `unknown slot_augmentations key: ${key}`);
+    }
+  }
+  for (const slot of POLICY_SLOTS) {
+    const rule = d[slot];
+    if (rule === undefined) continue;
+    if (typeof rule !== "object" || rule === null) {
+      throw new TemplateValidationError(name, `slot_augmentations.${slot} must be an object`);
+    }
+    const r = rule as Record<string, unknown>;
+    if (r.mode !== "grant") {
+      throw new TemplateValidationError(name, `slot_augmentations.${slot}.mode must be "grant"`);
+    }
+    if (!Array.isArray(r.grants)) {
+      throw new TemplateValidationError(name, `slot_augmentations.${slot}.grants must be an array`);
+    }
+    for (const grant of r.grants) {
+      if (typeof grant !== "object" || grant === null) {
+        throw new TemplateValidationError(name, `slot_augmentations.${slot}.grants entries must be objects`);
+      }
+      const g = grant as Record<string, unknown>;
+      if (typeof g.counterparty !== "string" || g.counterparty.length === 0) {
+        throw new TemplateValidationError(name, `slot_augmentations.${slot}.grants counterparty must be a non-empty string`);
+      }
+      if (typeof g.action !== "string" || g.action.length === 0) {
+        throw new TemplateValidationError(name, `slot_augmentations.${slot}.grants action must be a non-empty string`);
+      }
+      if (g.scope !== undefined && (typeof g.scope !== "object" || g.scope === null || Array.isArray(g.scope))) {
+        throw new TemplateValidationError(name, `slot_augmentations.${slot}.grants scope must be an object when present`);
+      }
+      if (g.max_uses_per_day !== undefined && (typeof g.max_uses_per_day !== "number" || g.max_uses_per_day <= 0)) {
+        throw new TemplateValidationError(name, `slot_augmentations.${slot}.grants max_uses_per_day must be a positive number`);
+      }
+    }
+  }
+  const classes = d.concordia_commitment_classes;
+  if (classes !== undefined) {
+    if (!Array.isArray(classes) || classes.some((cls) => typeof cls !== "string" || cls.length === 0)) {
+      throw new TemplateValidationError(name, "slot_augmentations.concordia_commitment_classes must be an array of non-empty strings");
+    }
   }
 }
 

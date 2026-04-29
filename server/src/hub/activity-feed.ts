@@ -122,6 +122,17 @@ function buildTemplateArgs(
   if (agentIdHint) {
     args.push({ kind: "agent_id", value: agentIdHint });
   }
+  const details = entry.details as Record<string, unknown> | undefined;
+  if (details) {
+    const proposed = details.proposed_template;
+    const current = details.current_template;
+    if (typeof current === "string" && current.length > 0) {
+      args.push({ kind: "channel_template_id", value: current });
+    }
+    if (typeof proposed === "string" && proposed.length > 0) {
+      args.push({ kind: "policy_id", value: proposed });
+    }
+  }
   return args;
 }
 

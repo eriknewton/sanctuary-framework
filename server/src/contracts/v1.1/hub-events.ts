@@ -40,6 +40,7 @@ export type HubDisplayTemplateArg =
   | { kind: "agent_id"; value: string }
   | { kind: "identity_id"; value: string }
   | { kind: "policy_id"; value: string }
+  | { kind: "channel_template_id"; value: string }
   | { kind: "destination_category"; value: PrivacyDestinationCategory }
   | { kind: "tier"; value: "tier1" | "tier2" | "tier3" }
   | { kind: "count"; value: number }

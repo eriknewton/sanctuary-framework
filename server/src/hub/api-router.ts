@@ -327,13 +327,14 @@ export async function handleHubRoute(
       // POST /api/hub/agents/:id/template
       if (method === "POST" && remainder === "template") {
         const body = await readJSONBody<{
+          template_id?: unknown;
           channel_template_id?: unknown;
         }>(req);
-        const record = await deps.service.bindAgentChannelTemplate(
+        const result = deps.service.bindAgentChannelTemplate(
           agentId,
-          body.channel_template_id,
+          body.template_id ?? body.channel_template_id,
         );
-        writeJSON(res, 200, { ok: true, data: { agent: record } });
+        writeJSON(res, 202, { ok: true, data: result });
         return true;
       }
 

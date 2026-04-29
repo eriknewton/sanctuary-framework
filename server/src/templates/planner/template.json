@@ -1,7 +1,7 @@
 {
   "name": "planner",
   "version": "1.0.0",
-  "channel": "plan-inspect-read-only",
+  "channel": "plan-draft-only",
   "tier": "B",
   "target_archetype": "A Tier B adapter-wrapped agent that writes and revises plans for operator review. Plans slot read-write; other slots read-only. No egress.",
   "description": "Planning agent: writes plans for operator review. No egress, no budget, read-only on other slots."

@@ -19,12 +19,13 @@
  */
 
 import { applyChannelTemplate } from "../policy-engine/channel-templates.js";
-import type { ChannelTemplateId } from "../policy-engine/constants.js";
+import { POLICY_SLOTS, type ChannelTemplateId, type PolicySlot } from "../policy-engine/constants.js";
 import type {
   CompiledPolicy,
   BudgetPolicy,
   EgressPolicy,
   RetentionPolicy,
+  SlotGrant,
 } from "../policy-engine/types.js";
 import { validateCompiledPolicyShape } from "../policy-engine/canonical-policy.js";
 import { packPolicyUpdate } from "../policy-engine/envelope.js";
@@ -88,6 +89,53 @@ function deterministicCompiledAt(version: string): string {
   return epoch.toISOString();
 }
 
+function applyGrant(policy: CompiledPolicy, slot: PolicySlot, grant: SlotGrant): void {
+  const rule = policy.slots[slot];
+  rule.mode = "grant";
+  const existing = rule.grants.find(
+    (g) => g.counterparty === grant.counterparty && g.action === grant.action
+  );
+  if (existing) {
+    if (grant.scope) existing.scope = { ...(existing.scope ?? {}), ...grant.scope };
+    if (grant.max_uses_per_day !== undefined) {
+      existing.max_uses_per_day = grant.max_uses_per_day;
+    }
+    return;
+  }
+  rule.grants.push({
+    counterparty: grant.counterparty,
+    action: grant.action,
+    ...(grant.scope ? { scope: { ...grant.scope } } : {}),
+    ...(grant.max_uses_per_day !== undefined
+      ? { max_uses_per_day: grant.max_uses_per_day }
+      : {}),
+  });
+  rule.grants.sort((a, b) => {
+    if (a.counterparty === b.counterparty) return a.action.localeCompare(b.action);
+    return a.counterparty.localeCompare(b.counterparty);
+  });
+}
+
+function applySlotAugmentations(policy: CompiledPolicy, bundle: TemplateBundle): void {
+  const augmentations = bundle.metadata.slot_augmentations;
+  if (!augmentations) return;
+
+  for (const slot of POLICY_SLOTS) {
+    const rule = augmentations[slot];
+    if (!rule) continue;
+    for (const grant of rule.grants) {
+      applyGrant(policy, slot, grant);
+    }
+  }
+
+  for (const cls of augmentations.concordia_commitment_classes ?? []) {
+    if (!policy.capabilities.concordia_commitment_classes.includes(cls)) {
+      policy.capabilities.concordia_commitment_classes.push(cls);
+    }
+  }
+  policy.capabilities.concordia_commitment_classes.sort();
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Build compiled policy from template
 // ═══════════════════════════════════════════════════════════════════════
@@ -119,10 +167,13 @@ export function buildCompiledPolicyFromTemplate(
   // 2. Fix compiled_at for determinism
   policy.compiled_at = deterministicCompiledAt(bundle.metadata.version);
 
-  // 3. Set source_english from the template's policy.md
+  // 3. Layer starter-persona grants over the design-canonical channel template
+  applySlotAugmentations(policy, bundle);
+
+  // 4. Set source_english from the template's policy.md
   policy.source_english = bundle.policy_english;
 
-  // 4. Overlay WP-MVP-6 egress from defaults
+  // 5. Overlay WP-MVP-6 egress from defaults
   if (bundle.defaults.egress.length > 0) {
     const egress: EgressPolicy = {
       allowlist: bundle.defaults.egress.map((e) => ({
@@ -133,7 +184,7 @@ export function buildCompiledPolicyFromTemplate(
     policy.egress = egress;
   }
 
-  // 5. Overlay WP-MVP-6 budgets from defaults
+  // 6. Overlay WP-MVP-6 budgets from defaults
   const budgets: BudgetPolicy = {};
   if (bundle.defaults.budgets.daily) {
     budgets.daily = { ...bundle.defaults.budgets.daily };
@@ -145,7 +196,7 @@ export function buildCompiledPolicyFromTemplate(
     policy.budgets = budgets;
   }
 
-  // 6. Overlay WP-MVP-6 retention from defaults
+  // 7. Overlay WP-MVP-6 retention from defaults
   const windows = bundle.defaults.retention.windows;
   if (Object.keys(windows).length > 0) {
     const retention: RetentionPolicy = {
@@ -159,7 +210,7 @@ export function buildCompiledPolicyFromTemplate(
     policy.retention = retention;
   }
 
-  // 7. Seed commitment classes from commitments.json
+  // 8. Seed commitment classes from commitments.json
   const classes = bundle.commitments.shapes.map((s) => s.commitment_class);
   for (const cls of classes) {
     if (!policy.capabilities.concordia_commitment_classes.includes(cls)) {
@@ -168,7 +219,7 @@ export function buildCompiledPolicyFromTemplate(
   }
   policy.capabilities.concordia_commitment_classes.sort();
 
-  // 8. Validate the assembled policy shape
+  // 9. Validate the assembled policy shape
   validateCompiledPolicyShape(policy);
 
   return policy;

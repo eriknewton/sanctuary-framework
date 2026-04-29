@@ -63,6 +63,13 @@ export interface HubTier1ApprovalEnqueuedResult {
   operation_category: HubApprovalPendingItem["operation_category"];
 }
 
+export interface HubTemplateBindingApprovalEnqueuedResult
+  extends HubTier1ApprovalEnqueuedResult {
+  current_template_id?: ChannelTemplateId;
+  proposed_template_id: ChannelTemplateId;
+  compiled_policy_id: string;
+}
+
 /**
  * Result returned from a fortress-scope Tier-1 action that has been
  * deferred to operator approval. Distinguished from the per-agent shape by
@@ -119,11 +126,7 @@ export interface HubAgentController {
    * approval lands.
    */
   bindPolicy(agentId: string, policyId: string): Promise<void>;
-  /**
-   * Apply a non-Tier-1 channel-template binding. Channel templates are
-   * compositions over the canonical four slots; binding does not require
-   * Tier 1 approval at v1.1.
-   */
+  /** Apply an operator-approved channel-template binding. */
   bindChannelTemplate(
     agentId: string,
     templateId: ChannelTemplateId,
@@ -293,6 +296,11 @@ export interface HubServiceDeps {
    * returning the in-memory projection.
    */
   readPersistedLocalAgents?: () => LocalAgentRecord[];
+  /**
+   * Optional persisted agent writer. Used when approved hub actions mutate
+   * registry-local fields that should survive refresh and restart.
+   */
+  writePersistedLocalAgents?: (records: LocalAgentRecord[]) => void;
   /** Inbox aggregation sources. */
   inboxSources: HubInboxSources;
   /** Activity feed sources. */

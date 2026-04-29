@@ -1,7 +1,7 @@
 /**
  * Outputs-slot gate entry. Walkthrough Key 10 LOCKED slot. Gates cross-
  * agent consumption of results (tool-call results, artifacts). Default-deny;
- * the "read-outputs-only" channel template grants the minimum useful shape
+ * the "request-approve-act" channel template grants the minimum useful shape
  * for supervision workflows.
  */
 

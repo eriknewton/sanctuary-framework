@@ -21,10 +21,10 @@
  *     the v1.2 work to project those into operator cards.
  *   - Activity feed reads from the real audit log. This is the one source
  *     that's already complete in v1.1.0 and just needs to be plugged in.
- *   - Agent controller errors on every action. v1.1.1 cannot honestly
- *     pause / unwrap / lockdown anything because no agent registry yet
- *     exists; the wiring returns `HubCapabilityError` rather than lying
- *     about what shipped.
+ *   - Agent controller errors on runtime harness actions that v1.1 cannot
+ *     honestly execute. Channel-template binding is registry-local in v1.2,
+ *     so its controller hook is a no-op and HubService persists the binding
+ *     after Tier 1 approval.
  */
 
 import { createHash } from "node:crypto";
@@ -36,7 +36,10 @@ import {
   type HubAgentController,
 } from "../../hub/index.js";
 import { HubCapabilityError } from "../../hub/errors.js";
-import { readPersistedLocalAgents } from "../../hub/agent-registry-persistence.js";
+import {
+  readPersistedLocalAgents,
+  writePersistedLocalAgents,
+} from "../../hub/agent-registry-persistence.js";
 import type { ChannelTemplateId } from "../../policy-engine/constants.js";
 import type { HubAgentStatus } from "../../contracts/v1.1/constants.js";
 
@@ -91,7 +94,7 @@ class CapabilityErrorAgentController implements HubAgentController {
     _agentId: string,
     _templateId: ChannelTemplateId,
   ): Promise<void> {
-    this.fail("bindChannelTemplate");
+    return;
   }
 }
 
@@ -118,11 +121,17 @@ export function buildV11Bindings(
     storagePath !== undefined
       ? () => readPersistedLocalAgents(storagePath)
       : undefined;
+  const writePersisted =
+    storagePath !== undefined
+      ? (records: ReturnType<typeof readPersistedLocalAgents>) =>
+          writePersistedLocalAgents(storagePath, records)
+      : undefined;
   const hubService = new HubService({
     identityId: inputs.identityId,
     fortressId: inputs.fortressId,
     agentRegistry: registry,
     ...(readPersisted ? { readPersistedLocalAgents: readPersisted } : {}),
+    ...(writePersisted ? { writePersistedLocalAgents: writePersisted } : {}),
     inboxSources: {
       listPendingApprovals: () => [],
       listRecentBlockedEgress: () => [],

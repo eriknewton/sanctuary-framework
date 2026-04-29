@@ -94,6 +94,23 @@ describe("v1.1 dashboard shell HTML", () => {
     const client = getClientScript();
     expect(client).toContain("approval_pending.tier1.lockdown");
   });
+
+  it("renders the v1.2 Policy Center template binding surface", () => {
+    const client = getClientScript();
+    for (const id of [
+      "request-approve-act",
+      "read-then-report",
+      "scheduled-digest",
+      "plan-draft-only",
+      "fortress-relay",
+      "concierge-loop",
+    ]) {
+      expect(client).toContain(id);
+    }
+    expect(client).toContain("Per-agent rules");
+    expect(client).toContain("template-picker-open");
+    expect(client).toContain('body: { template_id: templateId }');
+  });
 });
 
 describe("v1.1 dashboard exit drill verifier-out-of-process", () => {

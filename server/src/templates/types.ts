@@ -8,6 +8,17 @@
  */
 
 import type { ChannelTemplateId, PolicySlot, BudgetUnit } from "../policy-engine/constants.js";
+import type { SlotGrant } from "../policy-engine/types.js";
+
+export interface TemplateSlotAugmentationRule {
+  mode: "grant";
+  grants: SlotGrant[];
+}
+
+export interface TemplateSlotAugmentations
+  extends Partial<Record<PolicySlot, TemplateSlotAugmentationRule>> {
+  concordia_commitment_classes?: string[];
+}
 
 /** Template metadata from template.json. */
 export interface TemplateMetadata {
@@ -23,6 +34,8 @@ export interface TemplateMetadata {
   target_archetype: string;
   /** Short description for CLI + registry listing. */
   description: string;
+  /** Starter-persona grants layered over the public channel template. */
+  slot_augmentations?: TemplateSlotAugmentations;
 }
 
 /** A single egress allowlist seed entry from defaults.json. */
