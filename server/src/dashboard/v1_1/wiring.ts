@@ -42,6 +42,7 @@ import {
 } from "../../hub/agent-registry-persistence.js";
 import type { ChannelTemplateId } from "../../policy-engine/constants.js";
 import type { HubAgentStatus } from "../../contracts/v1.1/constants.js";
+import type { SubstrateSelector } from "../../intelligence/selector.js";
 
 export interface BuildV11BindingsInputs {
   /** Operator identity id this hub is scoped to. */
@@ -58,12 +59,32 @@ export interface BuildV11BindingsInputs {
    * want an empty registry (e.g. unit tests, future ephemeral modes).
    */
   storagePath?: string;
+  /**
+   * Optional Intelligence Substrate Selector. When present, the dashboard
+   * dispatch layer mounts `/api/hub/intelligence/*` against this selector
+   * and the v1.1 SPA renders the Intelligence panel from its config.
+   *
+   * The selector is constructed by the entry point (which has access to
+   * the fortress storage backend, master key, and audit log) and passed
+   * through here so this wiring layer stays storage-agnostic.
+   *
+   * Callers that omit it (early v1.2 boots, ephemeral test harnesses)
+   * still get a working hub binding; the dashboard's Intelligence panel
+   * surfaces a "not configured" state instead of failing to render.
+   */
+  intelligenceSelector?: SubstrateSelector;
 }
 
 export interface V11Bindings {
   hubService: HubService;
   identityId: string;
   fortressId: string;
+  /**
+   * Optional Intelligence Substrate Selector. Dispatch layer routes
+   * `/api/hub/intelligence/*` here when set; absent means the routes
+   * 503 with a "selector not configured" body.
+   */
+  intelligenceSelector?: SubstrateSelector;
 }
 
 class CapabilityErrorAgentController implements HubAgentController {
@@ -154,6 +175,9 @@ export function buildV11Bindings(
     hubService,
     identityId: inputs.identityId,
     fortressId: inputs.fortressId,
+    ...(inputs.intelligenceSelector
+      ? { intelligenceSelector: inputs.intelligenceSelector }
+      : {}),
   };
 }
 

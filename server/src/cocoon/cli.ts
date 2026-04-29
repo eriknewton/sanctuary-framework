@@ -67,6 +67,7 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../core/encoding.js";
 import { AuditLog } from "../l2-operational/audit-log.js";
+import { SubstrateSelector } from "../intelligence/selector.js";
 import { SANCTUARY_VERSION } from "../config.js";
 import { resolveStoragePath, resolveDashboardPort } from "../paths.js";
 import { writeTenantRuntime, clearTenantRuntime } from "../cli/agents/runtime.js";
@@ -685,6 +686,26 @@ export async function runWrap(
         );
       }
       const wrapAuditLog = new AuditLog(v11Storage, derived.key);
+      // WP-V1.2-5: construct + load the Intelligence Substrate Selector
+      // against the wrap-auto fortress. The selector reads / writes its
+      // config under the fortress storage namespace `_intelligence`,
+      // encrypted with the same master key the wrap path just derived.
+      let wrapIntelligenceSelector: SubstrateSelector | undefined;
+      try {
+        wrapIntelligenceSelector = new SubstrateSelector({
+          storage: v11Storage,
+          masterKey: derived.key,
+          auditLog: wrapAuditLog,
+          identityId: `fortress:${storagePath}`,
+        });
+        await wrapIntelligenceSelector.load();
+      } catch (err) {
+        console.error(
+          `  Note: Intelligence panel unavailable on wrap URL ` +
+            `(${(err as Error).message}).`,
+        );
+        wrapIntelligenceSelector = undefined;
+      }
       dashboard.setV11Bindings(
         buildV11Bindings({
           identityId: `fortress:${storagePath}`,
@@ -695,6 +716,9 @@ export async function runWrap(
           // serves contains this wrap plus any prior wraps against the
           // same fortress.
           storagePath,
+          ...(wrapIntelligenceSelector
+            ? { intelligenceSelector: wrapIntelligenceSelector }
+            : {}),
         }),
       );
       // The wrap-auto dashboard always binds 127.0.0.1; the operator

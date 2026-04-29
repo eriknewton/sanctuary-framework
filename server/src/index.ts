@@ -56,6 +56,7 @@ import {
   buildV11Bindings,
   fortressIdFromStoragePath,
 } from "./dashboard/v1_1/wiring.js";
+import { SubstrateSelector } from "./intelligence/selector.js";
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
@@ -628,6 +629,27 @@ export async function createSanctuaryServer(options?: {
     const embeddedHubIdentityId =
       identityManager.getPrimaryIdentityId() ??
       `fortress:${config.storage_path}`;
+    // WP-V1.2-5: construct the Intelligence Substrate Selector against the
+    // unlocked fortress. The selector reads / writes its config under the
+    // fortress storage namespace `_intelligence`, encrypted with the
+    // master key. Best-effort: any construction failure degrades to a
+    // selector-less binding (Intelligence panel surfaces "not configured").
+    let intelligenceSelector: SubstrateSelector | undefined;
+    try {
+      intelligenceSelector = new SubstrateSelector({
+        storage,
+        masterKey,
+        auditLog,
+        identityId: embeddedHubIdentityId,
+      });
+      await intelligenceSelector.load();
+    } catch (err) {
+      console.error(
+        `  Note: Intelligence panel unavailable (${(err as Error).message}). ` +
+          `Run \`sanctuary dashboard\` and pick a substrate.`,
+      );
+      intelligenceSelector = undefined;
+    }
     dashboard.setV11Bindings(
       buildV11Bindings({
         identityId: embeddedHubIdentityId,
@@ -638,6 +660,7 @@ export async function createSanctuaryServer(options?: {
         // dashboard surfaces wraps performed by prior `sanctuary wrap`
         // invocations against this same fortress.
         storagePath: config.storage_path,
+        ...(intelligenceSelector ? { intelligenceSelector } : {}),
       }),
     );
     await dashboard.start();

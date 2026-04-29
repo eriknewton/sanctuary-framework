@@ -66,7 +66,24 @@ const state = {
   selectedAgentId: null,
   chatActiveAgentId: null,
   seenEventIds: new Set(),
-  sidebarCollapsed: sessionStorage.getItem(SESSION_KEY) === "1"
+  sidebarCollapsed: sessionStorage.getItem(SESSION_KEY) === "1",
+  intelligence: {
+    status: null,
+    config: null,
+    notConfigured: false,
+    loadError: null,
+    picker: {
+      open: false,
+      surface: null,
+      candidate: null,
+      localModelPick: null,
+      veniceApiKey: "",
+      frontierProvider: "anthropic",
+      frontierApiKey: "",
+      saving: false,
+      error: null
+    }
+  }
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -280,7 +297,7 @@ function setRoute(route) {
   const app = document.getElementById("app");
   if (!app) return;
   app.setAttribute("data-route", route);
-  const fullRoutes = ["agents", "policy", "privacy", "coordination", "health", "exit-drill", "agent-detail"];
+  const fullRoutes = ["agents", "policy", "intelligence", "privacy", "coordination", "health", "exit-drill", "agent-detail"];
   if (fullRoutes.indexOf(route) >= 0) app.classList.add("route-full");
   else app.classList.remove("route-full");
   document.querySelectorAll("#sidebar-nav a").forEach(function (a) {
@@ -327,6 +344,7 @@ function renderMain() {
     case "agents": main.innerHTML = renderAgentsList(); break;
     case "agent-detail": main.innerHTML = renderAgentDetail(); break;
     case "policy": main.innerHTML = renderPolicyCenter(); break;
+    case "intelligence": main.innerHTML = renderIntelligenceCenter(); break;
     case "privacy": main.innerHTML = renderPrivacyPage(); break;
     case "coordination": main.innerHTML = renderCoordinationPage(); break;
     case "health": main.innerHTML = renderHealthPage(); break;
@@ -349,6 +367,8 @@ function renderDashboardWelcome() {
         '<dd>Pause, resume, restart, lockdown, or unwrap any wrapped harness.</dd>',
         '<dt><a href="#policy">Policy</a></dt>',
         '<dd>Review the active policy bound to each agent.</dd>',
+        '<dt><a href="#intelligence">Intelligence</a></dt>',
+        '<dd>Pick the LLM substrate per surface. Tradeoffs visible.</dd>',
         '<dt><a href="#privacy">Privacy</a></dt>',
         '<dd>See what context is flowing to which provider per channel.</dd>',
         '<dt><a href="#coordination">Coordination</a></dt>',
@@ -466,6 +486,352 @@ function renderHealthPage() {
       '</dl>' +
     '</div>' +
     '<button class="btn" disabled title="Manual audit landing in v1.2.">Run full audit</button>';
+}
+
+// ── Render: intelligence ───────────────────────────────────────────────
+// Stable label + tradeoff registry mirrored from server templates.ts. Keep
+// these strings in sync with server/src/intelligence/templates.ts; the
+// dashboard owns the canonical render so the operator-visible copy is
+// reviewable here without grep-walking the selector module.
+const SUBSTRATE_LABELS = {
+  "local": "Local model",
+  "venice": "Venice.ai",
+  "frontier-with-filter": "Frontier with PII filter",
+  "hybrid": "Hybrid (per surface)",
+  "disabled": "Disabled"
+};
+const SUBSTRATE_TRADEOFFS = {
+  "local": "Your queries never leave your machine. Capability is moderate; complex reasoning may underperform a frontier model. Hardware required: 8GB RAM Apple Silicon M1+ or equivalent.",
+  "venice": "Queries reach Venice's relay during inference. Venice's contract states no retention or training on user data. Trust is contractual, not cryptographic. Capability higher than local.",
+  "frontier-with-filter": "Queries reach the frontier provider after PII redaction. Highest capability. The frontier provider may log queries per their ToS. Redaction can fail on subtle PII (paraphrased addresses, contextual identifiers); expect imperfect privacy. The Privacy Filter event log shows what was redacted.",
+  "hybrid": "Each surface routes to its own substrate per your configuration. Tradeoffs apply per surface; see each row.",
+  "disabled": "This surface does not invoke an LLM. Privacy filter falls back to Tier 1 regex; concierge, sentinel scoring, and gate explanation surfaces become unavailable until you pick a substrate."
+};
+const LOCAL_MODEL_LABELS = {
+  "gemma-2-2b": "Gemma 2 2B (via Ollama)",
+  "phi-4-mini": "Phi-4 Mini (via Ollama)",
+  "llama-3.1-8b": "Llama 3.1 8B (via Ollama)"
+};
+const SURFACE_LABELS = {
+  "concierge": "Concierge",
+  "direct-agent-gate-advisor": "Direct-agent gate advisor",
+  "sentinel-scoring": "Sentinel scoring",
+  "gate-explanation": "Gate explanation",
+  "privacy-filter-tier-2": "Privacy filter (Tier 2)",
+  "template-suggestion": "Template suggestion"
+};
+const SURFACES_ORDER = [
+  "concierge",
+  "direct-agent-gate-advisor",
+  "sentinel-scoring",
+  "gate-explanation",
+  "privacy-filter-tier-2",
+  "template-suggestion"
+];
+const SUBSTRATE_OPTIONS = ["local", "venice", "frontier-with-filter", "hybrid", "disabled"];
+const FRONTIER_PROVIDERS = ["anthropic", "openai", "google"];
+const FRONTIER_PROVIDER_LABELS = {
+  "anthropic": "Anthropic",
+  "openai": "OpenAI",
+  "google": "Google"
+};
+
+function substrateLabel(substrate) {
+  return SUBSTRATE_LABELS[substrate] || substrate;
+}
+
+function substrateTradeoff(substrate) {
+  return SUBSTRATE_TRADEOFFS[substrate] || "Tradeoffs documented in source.";
+}
+
+function statusDotClass(status) {
+  if (status === "green") return "green";
+  if (status === "yellow") return "yellow";
+  return "red";
+}
+
+function statusLabel(health) {
+  if (health === "ok") return "Working";
+  if (health === "degraded") return "Degraded";
+  return "Unavailable";
+}
+
+function tierLabel(tier) {
+  if (tier === "below-baseline") return "Below baseline (under 8 GB RAM)";
+  if (tier === "baseline") return "Baseline (8 to 16 GB RAM)";
+  if (tier === "mid") return "Mid (16 to 32 GB RAM)";
+  if (tier === "pro") return "Pro (32 GB+ RAM)";
+  return "Unknown";
+}
+
+function renderIntelligenceCenter() {
+  if (state.intelligence.notConfigured) {
+    return '<section class="intel-center">' +
+      '<p class="eyebrow">INTELLIGENCE</p>' +
+      '<h1>Substrate selector not configured</h1>' +
+      '<p class="intel-subtitle">This dashboard binding does not include an Intelligence Substrate Selector. Run <code>sanctuary dashboard</code> against an unlocked fortress to bind one. See the WP-V1.2-5 release notes for setup details.</p>' +
+    '</section>';
+  }
+  if (state.intelligence.loadError) {
+    return '<section class="intel-center">' +
+      '<p class="eyebrow">INTELLIGENCE</p>' +
+      '<h1>Could not load substrate status</h1>' +
+      '<p class="intel-subtitle error-text">' + escHtml(state.intelligence.loadError) + '</p>' +
+      '<button class="btn" data-action="intel-reload">Retry</button>' +
+    '</section>';
+  }
+  if (!state.intelligence.status) {
+    return '<section class="intel-center">' +
+      '<p class="eyebrow">INTELLIGENCE</p>' +
+      '<h1>Intelligence Substrate</h1>' +
+      '<p class="intel-subtitle muted">Loading substrate status.</p>' +
+    '</section>';
+  }
+  const status = state.intelligence.status;
+  const config = state.intelligence.config || {};
+  const surfaceRows = SURFACES_ORDER.map(function (surfaceId) {
+    const surfaceStatus = (status.surfaces || []).find(function (s) { return s.surface === surfaceId; });
+    if (!surfaceStatus) {
+      return '<div class="intel-row"><div class="intel-row-name">' + escHtml(SURFACE_LABELS[surfaceId] || surfaceId) +
+        '<small>' + escHtml(surfaceId) + '</small></div>' +
+        '<div class="intel-row-body muted">No status reported.</div>' +
+        '<div></div></div>';
+    }
+    const substrate = surfaceStatus.chosen;
+    const localPick = (config.local_model_picks || {})[surfaceId];
+    let currentBadge = substrateLabel(substrate);
+    if (substrate === "local" && localPick) {
+      currentBadge = currentBadge + " . " + (LOCAL_MODEL_LABELS[localPick] || localPick);
+    }
+    if (substrate === "frontier-with-filter") {
+      // Surface which provider is wired (first non-empty per pickFrontierProvider rule).
+      const fp = config.frontier_keys_present || {};
+      let provider = null;
+      if (fp.anthropic) provider = "anthropic";
+      else if (fp.openai) provider = "openai";
+      else if (fp.google) provider = "google";
+      if (provider) currentBadge = currentBadge + " (" + (FRONTIER_PROVIDER_LABELS[provider] || provider) + ")";
+    }
+    const dotClass = statusDotClass((surfaceStatus.badge || {}).status || "red");
+    return '<div class="intel-row" data-intel-surface="' + escHtml(surfaceId) + '">' +
+      '<div class="intel-row-name">' + escHtml(SURFACE_LABELS[surfaceId] || surfaceId) +
+        '<small>' + escHtml(surfaceId) + '</small></div>' +
+      '<div class="intel-row-body">' +
+        '<div class="intel-row-current">' +
+          '<span class="intel-status-dot ' + dotClass + '" title="' + escHtml(statusLabel(surfaceStatus.health)) + '"></span>' +
+          '<span class="pill">' + escHtml(currentBadge) + '</span>' +
+          '<span class="muted mono">' + escHtml(statusLabel(surfaceStatus.health)) + '</span>' +
+        '</div>' +
+        '<div class="intel-row-tradeoff">' + escHtml(substrateTradeoff(substrate)) + '</div>' +
+      '</div>' +
+      '<div><button class="btn" data-action="intel-picker-open" data-intel-surface="' + escHtml(surfaceId) + '">Change</button></div>' +
+    '</div>';
+  }).join("\n");
+
+  const hardware = status.hardware || {};
+  const recommended = hardware.recommendedLocalModel ? (LOCAL_MODEL_LABELS[hardware.recommendedLocalModel] || hardware.recommendedLocalModel) : "(below baseline)";
+  const ollamaLabel = hardware.ollamaReachable
+    ? 'Reachable. Models present: ' + ((hardware.ollamaModels || []).length || 0)
+    : 'Not reachable at ' + escHtml(config.ollama_endpoint || "http://localhost:11434");
+
+  const modal = state.intelligence.picker.open ? renderIntelligencePicker() : "";
+
+  return '<section class="intel-center">' +
+    '<p class="eyebrow">INTELLIGENCE</p>' +
+    '<h1>Intelligence Substrate</h1>' +
+    '<p class="intel-subtitle">Choose how Sanctuary thinks. Tradeoffs visible per surface. Multi-option framing is preserved: no single substrate is the right answer.</p>' +
+    '<section class="intel-panel"><h2>Surfaces</h2>' + surfaceRows + '</section>' +
+    '<section class="intel-panel"><h2>Host capability</h2>' +
+      '<dl class="intel-hardware">' +
+        '<dt>Total RAM</dt><dd>' + escHtml(hardware.totalRamGb || "?") + ' GB</dd>' +
+        '<dt>CPU arch</dt><dd>' + escHtml(hardware.cpuArch || "?") + '</dd>' +
+        '<dt>Tier</dt><dd>' + escHtml(tierLabel(hardware.tier)) + '</dd>' +
+        '<dt>Recommended local model</dt><dd>' + escHtml(recommended) + '</dd>' +
+        '<dt>Ollama endpoint</dt><dd class="mono">' + escHtml(config.ollama_endpoint || "http://localhost:11434") + '</dd>' +
+        '<dt>Ollama status</dt><dd>' + ollamaLabel + '</dd>' +
+      '</dl>' +
+    '</section>' +
+    modal +
+  '</section>';
+}
+
+function renderIntelligencePicker() {
+  const p = state.intelligence.picker;
+  const status = state.intelligence.status || {};
+  const hardware = status.hardware || {};
+  const config = state.intelligence.config || {};
+  const surfaceLabel = SURFACE_LABELS[p.surface] || p.surface;
+  const candidate = p.candidate || "local";
+  const optionRows = SUBSTRATE_OPTIONS.map(function (sub) {
+    const cls = "intel-option" + (candidate === sub ? " selected" : "");
+    return '<button type="button" class="' + cls + '" data-action="intel-picker-select-substrate" data-intel-substrate="' + escHtml(sub) + '">' +
+      '<input type="radio" name="intel-substrate" tabindex="-1"' + (candidate === sub ? ' checked' : '') + '>' +
+      '<span class="intel-option-body">' +
+        '<strong>' + escHtml(substrateLabel(sub)) + '</strong>' +
+        '<small>' + escHtml(substrateTradeoff(sub)) + '</small>' +
+      '</span>' +
+    '</button>';
+  }).join("");
+
+  let sub = "";
+  if (candidate === "local") {
+    const recommended = hardware.recommendedLocalModel || "gemma-2-2b";
+    const localPick = p.localModelPick || (config.local_model_picks || {})[p.surface] || recommended;
+    const presentModels = hardware.ollamaModels || [];
+    const ollamaLine = hardware.ollamaReachable
+      ? 'Ollama reachable. Models present: ' + (presentModels.length ? presentModels.join(", ") : "(none)")
+      : 'Ollama not reachable at ' + (config.ollama_endpoint || "http://localhost:11434") + '. Install Ollama and run "ollama pull gemma2:2b".';
+    sub = '<div class="intel-suboptions">' +
+      '<label>Pick a local model:</label>' +
+      ['gemma-2-2b','phi-4-mini','llama-3.1-8b'].map(function (m) {
+        return '<label><input type="radio" name="intel-local-model" value="' + escHtml(m) + '"' +
+          (localPick === m ? ' checked' : '') +
+          ' data-action="intel-picker-select-local-model" data-intel-local-model="' + escHtml(m) + '"> ' +
+          escHtml(LOCAL_MODEL_LABELS[m]) + (recommended === m ? ' (recommended)' : '') + '</label>';
+      }).join("") +
+      '<p class="muted" style="margin-top:8px;">' + escHtml(ollamaLine) + '</p>' +
+    '</div>';
+  } else if (candidate === "venice") {
+    const haveKey = (config.venice_api_key_present === true);
+    sub = '<div class="intel-suboptions">' +
+      '<label>Venice API key:</label>' +
+      '<input type="password" name="intel-venice-key" placeholder="' + (haveKey ? "(saved; enter to replace)" : "Paste your Venice API key") + '" value="' + escHtml(p.veniceApiKey) + '" data-action="intel-picker-input-venice-key">' +
+      '<p class="muted" style="margin-top:6px;">Anonymous payment recommended. See Venice setup docs for crypto-payment flow.</p>' +
+    '</div>';
+  } else if (candidate === "frontier-with-filter") {
+    const fp = config.frontier_keys_present || {};
+    const provider = p.frontierProvider || "anthropic";
+    const haveKey = !!fp[provider];
+    const providerOptions = FRONTIER_PROVIDERS.map(function (f) {
+      return '<label><input type="radio" name="intel-frontier-provider" value="' + escHtml(f) + '"' +
+        (provider === f ? ' checked' : '') +
+        ' data-action="intel-picker-select-frontier-provider" data-intel-frontier-provider="' + escHtml(f) + '"> ' +
+        escHtml(FRONTIER_PROVIDER_LABELS[f]) +
+        (fp[f] ? ' (key saved)' : '') + '</label>';
+    }).join("");
+    sub = '<div class="intel-suboptions">' +
+      '<label>Frontier provider:</label>' +
+      providerOptions +
+      '<label style="margin-top:8px;">API key:</label>' +
+      '<input type="password" name="intel-frontier-key" placeholder="' + (haveKey ? "(saved; enter to replace)" : "Paste your provider API key") + '" value="' + escHtml(p.frontierApiKey) + '" data-action="intel-picker-input-frontier-key">' +
+      '<p class="muted" style="margin-top:6px;">Queries route through Privacy Filter Tier 2 before egress. Redaction can fail on subtle PII; expect imperfect privacy.</p>' +
+    '</div>';
+  } else if (candidate === "hybrid") {
+    sub = '<div class="intel-suboptions"><p class="muted">Hybrid routes per-surface using rules set elsewhere. Each surface should be assigned an explicit substrate before picking hybrid here.</p></div>';
+  } else if (candidate === "disabled") {
+    sub = '<div class="intel-suboptions"><p class="muted">This surface will not invoke an LLM. Privacy filter (Tier 2) falls back to Tier 1 regex when disabled here.</p></div>';
+  }
+
+  const errorBlock = p.error ? '<p class="error-text">' + escHtml(p.error) + '</p>' : "";
+  const saveLabel = p.saving ? "Saving..." : "Save";
+  return '<div class="intel-modal-backdrop" data-action="intel-picker-close-backdrop">' +
+    '<div class="intel-modal" role="dialog" aria-label="Pick substrate" data-action="intel-picker-modal-stop">' +
+      '<h2>Pick a substrate for ' + escHtml(surfaceLabel) + '</h2>' +
+      '<p class="intel-modal-subtitle">' + escHtml(SUBSTRATE_TRADEOFFS[candidate] || "") + '</p>' +
+      optionRows +
+      sub +
+      errorBlock +
+      '<div class="intel-modal-actions">' +
+        '<button class="btn" data-action="intel-picker-close">Cancel</button>' +
+        '<button class="btn btn-primary" data-action="intel-picker-save"' + (p.saving ? ' disabled' : '') + '>' + escHtml(saveLabel) + '</button>' +
+      '</div>' +
+    '</div>' +
+  '</div>';
+}
+
+async function fetchIntelligenceState() {
+  state.intelligence.loadError = null;
+  try {
+    const sr = await api("/intelligence/status");
+    state.intelligence.status = sr.data || null;
+    state.intelligence.notConfigured = false;
+  } catch (e) {
+    if (e.status === 503) {
+      state.intelligence.notConfigured = true;
+      state.intelligence.status = null;
+      state.intelligence.config = null;
+      return;
+    }
+    state.intelligence.loadError = e.message;
+    return;
+  }
+  try {
+    const cr = await api("/intelligence/config");
+    state.intelligence.config = cr.data || null;
+  } catch (e) {
+    if (e.status === 503) {
+      state.intelligence.notConfigured = true;
+      return;
+    }
+    state.intelligence.loadError = e.message;
+  }
+}
+
+async function onIntelPickerOpen(surfaceId) {
+  if (!state.intelligence.status || state.intelligence.notConfigured) {
+    toast("Intelligence panel not configured.", "error");
+    return;
+  }
+  const surfaceStatus = (state.intelligence.status.surfaces || []).find(function (s) { return s.surface === surfaceId; });
+  const config = state.intelligence.config || {};
+  state.intelligence.picker = {
+    open: true,
+    surface: surfaceId,
+    candidate: surfaceStatus ? surfaceStatus.chosen : "local",
+    localModelPick: (config.local_model_picks || {})[surfaceId] || null,
+    veniceApiKey: "",
+    frontierProvider: "anthropic",
+    frontierApiKey: "",
+    saving: false,
+    error: null
+  };
+  rerender();
+}
+
+function onIntelPickerClose() {
+  state.intelligence.picker = {
+    open: false, surface: null, candidate: null, localModelPick: null,
+    veniceApiKey: "", frontierProvider: "anthropic", frontierApiKey: "",
+    saving: false, error: null
+  };
+  rerender();
+}
+
+async function onIntelPickerSave() {
+  const p = state.intelligence.picker;
+  if (!p.open || !p.surface || !p.candidate) return;
+  p.saving = true;
+  p.error = null;
+  rerender();
+  try {
+    if (p.candidate === "venice" && p.veniceApiKey && p.veniceApiKey.length > 0) {
+      await api("/intelligence/credentials/venice", {
+        method: "POST",
+        body: { api_key: p.veniceApiKey }
+      });
+    }
+    if (p.candidate === "frontier-with-filter" && p.frontierApiKey && p.frontierApiKey.length > 0) {
+      await api("/intelligence/credentials/frontier", {
+        method: "POST",
+        body: { provider: p.frontierProvider, api_key: p.frontierApiKey }
+      });
+    }
+    const choiceBody = { substrate: p.candidate };
+    if (p.candidate === "local" && p.localModelPick) {
+      choiceBody.local_model_pick = p.localModelPick;
+    }
+    await api("/intelligence/surfaces/" + encodeURIComponent(p.surface) + "/choice", {
+      method: "POST",
+      body: choiceBody
+    });
+    await fetchIntelligenceState();
+    onIntelPickerClose();
+    toast("Substrate updated for " + (SURFACE_LABELS[p.surface] || p.surface) + ".", "info");
+  } catch (e) {
+    state.intelligence.picker.saving = false;
+    state.intelligence.picker.error = e.message;
+    rerender();
+  }
 }
 
 // ── Render: policy ─────────────────────────────────────────────────────
@@ -670,6 +1036,7 @@ async function fetchAll() {
     const he = await api("/activity?category=handoff");
     state.handoffEvents = he.data.entries || [];
   } catch (e) { /* tolerate */ }
+  await fetchIntelligenceState();
 }
 
 // Tier 1 lockdown click. Two-step: POST returns 202 + inbox_item_id, button
@@ -863,14 +1230,46 @@ function bindHashRoute() {
 }
 
 document.addEventListener("click", function (ev) {
-  const tgt = ev.target;
-  if (!(tgt instanceof Element)) return;
+  const rawTgt = ev.target;
+  if (!(rawTgt instanceof Element)) return;
+  // Walk up to the first ancestor that carries a data-action so clicks on
+  // child elements inside option buttons land on the option, not on the
+  // inner text node. Fall back to the original target for non-action
+  // clicks (the early-return below catches them).
+  let tgt = rawTgt;
+  while (tgt && !tgt.getAttribute("data-action")) {
+    tgt = tgt.parentElement;
+  }
+  if (!tgt) return;
   const action = tgt.getAttribute("data-action");
   if (!action) return;
   const itemId = tgt.getAttribute("data-item-id");
   const agentId = tgt.getAttribute("data-agent-id");
   const route = tgt.getAttribute("data-route");
+  const intelSurface = tgt.getAttribute("data-intel-surface");
+  const intelSubstrate = tgt.getAttribute("data-intel-substrate");
+  const intelLocalModel = tgt.getAttribute("data-intel-local-model");
+  const intelFrontierProvider = tgt.getAttribute("data-intel-frontier-provider");
   if (action === "lockdown") return void onLockdownClick();
+  if (action === "intel-reload") { return void fetchIntelligenceState().then(rerender); }
+  if (action === "intel-picker-open" && intelSurface) return void onIntelPickerOpen(intelSurface);
+  if (action === "intel-picker-close") return onIntelPickerClose();
+  if (action === "intel-picker-close-backdrop") return onIntelPickerClose();
+  if (action === "intel-picker-modal-stop") { ev.stopPropagation(); return; }
+  if (action === "intel-picker-select-substrate" && intelSubstrate) {
+    state.intelligence.picker.candidate = intelSubstrate;
+    state.intelligence.picker.error = null;
+    return rerender();
+  }
+  if (action === "intel-picker-select-local-model" && intelLocalModel) {
+    state.intelligence.picker.localModelPick = intelLocalModel;
+    return rerender();
+  }
+  if (action === "intel-picker-select-frontier-provider" && intelFrontierProvider) {
+    state.intelligence.picker.frontierProvider = intelFrontierProvider;
+    return rerender();
+  }
+  if (action === "intel-picker-save") return void onIntelPickerSave();
   if (action === "exit-export-start") return void onExitExportStart();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
   if (action === "open-agent" && agentId) { state.selectedAgentId = agentId; location.hash = "agent-detail"; return; }
@@ -908,6 +1307,20 @@ document.addEventListener("click", function (ev) {
   if (action.indexOf("agent-") === 0 && agentId) {
     const sub = action.slice("agent-".length);
     return void onAgentControl(agentId, sub);
+  }
+});
+
+// Intelligence picker: capture password / text input updates without
+// re-rendering on every keystroke (re-rendering would clobber the input
+// state). The state mirrors back into the picker on save.
+document.addEventListener("input", function (ev) {
+  const tgt = ev.target;
+  if (!(tgt instanceof HTMLInputElement)) return;
+  const action = tgt.getAttribute("data-action");
+  if (action === "intel-picker-input-venice-key") {
+    state.intelligence.picker.veniceApiKey = tgt.value;
+  } else if (action === "intel-picker-input-frontier-key") {
+    state.intelligence.picker.frontierApiKey = tgt.value;
   }
 });
 

@@ -61,6 +61,7 @@ import {
   fortressIdFromStoragePath,
 } from "./dashboard/v1_1/wiring.js";
 import { readPersistedLocalAgents } from "./hub/agent-registry-persistence.js";
+import { SubstrateSelector } from "./intelligence/selector.js";
 
 export interface StandaloneDashboardOptions {
   passphrase?: string;
@@ -450,6 +451,25 @@ export async function startStandaloneDashboard(
   const hubIdentityId =
     identityManager.getPrimaryIdentityId() ??
     `fortress:${config.storage_path}`;
+  // WP-V1.2-5: construct + load the Intelligence Substrate Selector against
+  // the unlocked fortress so the v1.1 dashboard's Intelligence panel has
+  // a live config to render. Best-effort: any failure degrades to a
+  // selector-less binding (panel surfaces "not configured").
+  let intelligenceSelector: SubstrateSelector | undefined;
+  try {
+    intelligenceSelector = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: hubIdentityId,
+    });
+    await intelligenceSelector.load();
+  } catch (err) {
+    console.error(
+      `  Note: Intelligence panel unavailable (${(err as Error).message}).`,
+    );
+    intelligenceSelector = undefined;
+  }
   dashboard.setV11Bindings(
     buildV11Bindings({
       identityId: hubIdentityId,
@@ -460,6 +480,7 @@ export async function startStandaloneDashboard(
       // dashboard surfaces wraps performed by prior `sanctuary wrap`
       // invocations against this same fortress.
       storagePath: config.storage_path,
+      ...(intelligenceSelector ? { intelligenceSelector } : {}),
     }),
   );
 

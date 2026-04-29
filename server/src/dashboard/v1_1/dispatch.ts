@@ -23,6 +23,10 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { handleHubRoute } from "../../hub/api-router.js";
 import { handleDashboardV11Route } from "./index.js";
+import {
+  handleIntelligenceRoute,
+  INTELLIGENCE_API_PREFIX,
+} from "./intelligence-api-router.js";
 import type { V11Bindings } from "./wiring.js";
 import type { AuthConfig } from "../../console/auth-middleware.js";
 
@@ -73,6 +77,40 @@ export async function dispatchV11Request(
         fortressId: bindings.fortressId,
         ...(authToken !== undefined ? { authToken } : {}),
       },
+      req,
+      res,
+    );
+  }
+
+  // Intelligence API at /api/hub/intelligence/*. Mounted BEFORE the
+  // generic /api/hub/* dispatch so the more specific prefix wins. Same
+  // auth contract as the rest of /api/hub/*; selector-bearing bindings
+  // serve operator config, selector-less bindings respond 503 with a
+  // documented "selector not configured" body.
+  if (
+    url.pathname === INTELLIGENCE_API_PREFIX ||
+    url.pathname.startsWith(`${INTELLIGENCE_API_PREFIX}/`)
+  ) {
+    const authConfig: AuthConfig = {
+      loopbackAutoAuth,
+      ...(authToken !== undefined ? { authToken } : {}),
+    };
+    if (!bindings.intelligenceSelector) {
+      res.writeHead(503, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: "selector_not_configured",
+          detail: "Intelligence substrate selector is not wired into this dashboard binding.",
+        }),
+      );
+      return true;
+    }
+    return handleIntelligenceRoute(
+      { authConfig, selector: bindings.intelligenceSelector },
       req,
       res,
     );
