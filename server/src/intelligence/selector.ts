@@ -327,6 +327,24 @@ export class SubstrateSelector {
   }
 
   /**
+   * Install (or replace) the redactor used by the frontier-with-filter
+   * substrate. Bootstrap code calls this after constructing the selector
+   * with the default IDENTITY_REDACTOR; the Privacy Filter Tier 2
+   * commit's `buildPrivacyTier2Redactor` produces the redactor that
+   * closes over the selector for audit emission. Late-binding via this
+   * method avoids the circular construction dependency
+   * (selector needs redactor; redactor needs selector for emit).
+   *
+   * Subsequent calls to getSubstrate("...frontier-with-filter") will use
+   * the installed redactor; already-issued handles continue to use the
+   * redactor that was installed at handle-issue time. Consumers that
+   * cache handles SHOULD re-issue after installRedactor.
+   */
+  installRedactor(redactor: FrontierRedactor): void {
+    this.redactor = redactor;
+  }
+
+  /**
    * Build a typed SubstrateHandle for the given surface. Lazily
    * instantiates the substrate client based on the operator's binding;
    * the handle carries the substrate label, tradeoff badge, capability

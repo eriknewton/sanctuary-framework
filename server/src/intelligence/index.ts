@@ -110,6 +110,11 @@ export {
   type HybridResolvedChoice,
 } from "./substrates/hybrid/per-surface-router.js";
 
+export {
+  buildPrivacyTier2Redactor,
+  type Tier2RedactorConfig,
+} from "./privacy-tier2-redactor.js";
+
 export type {
   IntelligenceAuditPayload,
   IntelligenceAuditPayloadHeader,
