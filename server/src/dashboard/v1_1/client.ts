@@ -365,6 +365,26 @@ function renderTopbar() {
 function renderMain() {
   const main = document.getElementById("main");
   if (!main) return;
+  // F8 fix: capture focused-input identity + caret position so an SSE-
+  // triggered rerender during typing does not clobber the operator's
+  // typing experience. innerHTML replacement creates new DOM nodes; we
+  // re-find the equivalent input by data-action + optional data-agent-id
+  // and restore focus + selection range.
+  const active = document.activeElement;
+  let focus = null;
+  if (
+    active &&
+    active.tagName === "INPUT" &&
+    typeof active.getAttribute === "function" &&
+    active.getAttribute("data-action")
+  ) {
+    focus = {
+      action: active.getAttribute("data-action"),
+      agentId: active.getAttribute("data-agent-id"),
+      selectionStart: active.selectionStart,
+      selectionEnd: active.selectionEnd
+    };
+  }
   switch (state.route) {
     case "dashboard": main.innerHTML = renderDashboardConcierge(); break;
     case "agents": main.innerHTML = renderAgentsList(); break;
@@ -376,6 +396,23 @@ function renderMain() {
     case "health": main.innerHTML = renderHealthPage(); break;
     case "exit-drill": main.innerHTML = renderExitDrill(); break;
     default: main.innerHTML = '<p class="muted">Route not found.</p>';
+  }
+  if (focus) {
+    let sel = 'input[data-action="' + focus.action + '"]';
+    if (focus.agentId) sel += '[data-agent-id="' + focus.agentId + '"]';
+    const el = main.querySelector(sel);
+    if (el && typeof el.focus === "function") {
+      try {
+        el.focus();
+        if (
+          typeof el.setSelectionRange === "function" &&
+          focus.selectionStart != null &&
+          focus.selectionEnd != null
+        ) {
+          el.setSelectionRange(focus.selectionStart, focus.selectionEnd);
+        }
+      } catch (e) { /* ignore browsers that disallow programmatic focus */ }
+    }
   }
 }
 
@@ -522,7 +559,12 @@ function renderAgentDetail() {
   // template binding inline. Per-message handoff is convenience inside
   // the conversation; session entry is the privileged action.
   const chatPanel = renderDirectAgentChat(a);
+  // F7 fix: chat panel is the primary action surface; render it
+  // immediately under the H1 above the Identity card so the composer +
+  // history are visible above the fold instead of pushed below the
+  // Identity dl. Identity + Timeline drop to reference position.
   return '<h1>' + escHtml(a.agent_id) + '</h1>' +
+    chatPanel +
     '<div class="card"><h3>Identity</h3>' +
       '<dl class="kv">' +
       '<dt>Harness</dt><dd class="mono">' + escHtml(a.harness) + '</dd>' +
@@ -532,7 +574,6 @@ function renderAgentDetail() {
       '<dt>Status</dt><dd><span class="glyph ' + map.glyph + '"></span> ' + escHtml(map.label) + '</dd>' +
       '</dl>' +
     '</div>' +
-    chatPanel +
     '<div class="card"><h3>Timeline</h3>' + timeline + '</div>';
 }
 
@@ -1545,6 +1586,24 @@ async function onInboxAction(itemId, action) {
         "Direct chat session open with " + boundAgentId + ". Type below or end the session.",
         "info",
       );
+      // Defer focus until the next tick so the rerender below has run
+      // and the composer input is in the DOM.
+      setTimeout(function () {
+        const main = document.getElementById("main");
+        if (!main) return;
+        const el = main.querySelector(
+          'input[data-action="direct-agent-input"][data-agent-id="' + boundAgentId + '"]'
+        );
+        if (el && typeof el.focus === "function") {
+          el.focus();
+          // Scroll the chat surface into view so the composer + history
+          // are above the fold even on shorter viewports.
+          const card = el.closest(".concierge-card");
+          if (card && typeof card.scrollIntoView === "function") {
+            card.scrollIntoView({ block: "start", behavior: "smooth" });
+          }
+        }
+      }, 0);
     }
     rerender();
   } catch (e) {
