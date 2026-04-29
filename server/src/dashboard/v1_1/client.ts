@@ -403,6 +403,35 @@ const CONCIERGE_SUGGESTIONS = [
   { id: "open-approvals", label: "any open approvals?", query: "Are there any open Tier 1 approvals or pending inbox items I should look at?" }
 ];
 
+function renderActiveChatsPanel() {
+  const sessionMap = state.chat.directAgent.sessionByAgentId || {};
+  const pendingMap = state.chat.directAgent.pendingApprovalByAgentId || {};
+  const activeAgentIds = Object.keys(sessionMap).filter(function (aid) {
+    return sessionMap[aid] && !sessionMap[aid].closed_at;
+  });
+  const pendingAgentIds = Object.keys(pendingMap).filter(function (aid) {
+    return !!pendingMap[aid];
+  });
+  if (activeAgentIds.length === 0 && pendingAgentIds.length === 0) return "";
+  const rows = activeAgentIds.map(function (aid) {
+    const s = sessionMap[aid];
+    const expiry = s.expires_at ? '<span class="muted mono">expires ' + escHtml(shortTime(s.expires_at)) + '</span>' : '';
+    return '<div class="row">' +
+      '<span class="pill tone-verified">chat open</span>' +
+      '<div class="grow mono">' + escHtml(aid) + '</div>' +
+      expiry +
+      '<button class="btn btn-primary" data-action="open-agent" data-agent-id="' + escHtml(aid) + '">Open chat</button>' +
+      '</div>';
+  }).concat(pendingAgentIds.map(function (aid) {
+    return '<div class="row">' +
+      '<span class="pill tone-info">approval pending</span>' +
+      '<div class="grow mono">' + escHtml(aid) + '</div>' +
+      '<button class="btn" data-action="open-agent" data-agent-id="' + escHtml(aid) + '">Approve</button>' +
+      '</div>';
+  })).join("\n");
+  return '<div class="card" style="margin-bottom:14px;"><h3>Active chats</h3>' + rows + '</div>';
+}
+
 function renderDashboardConcierge() {
   const c = state.chat.concierge;
   const badge = c.badge && c.badge.displayLabel
@@ -426,8 +455,10 @@ function renderDashboardConcierge() {
   const chips = CONCIERGE_SUGGESTIONS.map(function (s) {
     return '<button class="btn chip" data-action="concierge-suggestion" data-suggestion-id="' + escHtml(s.id) + '"' + sendDisabled + '>' + escHtml(s.label) + '</button>';
   }).join("\n");
+  const activeChatsPanel = renderActiveChatsPanel();
   return [
     '<h1>Chat <span class="muted">/ This fortress</span></h1>',
+    activeChatsPanel,
     '<div class="card concierge-card">',
       '<div class="concierge-header">',
         '<div class="concierge-persona"><strong>Sanctuary Fortress concierge</strong> <span class="muted">read-only over fortress state</span></div>',
@@ -448,14 +479,26 @@ function renderDashboardConcierge() {
 // ── Render: agents list / detail ───────────────────────────────────────
 function renderAgentsList() {
   if (!state.agents.length) return '<h1>Agents</h1><p class="muted">No wrapped agents yet. Run <code>sanctuary wrap</code> to wrap a harness.</p>';
+  const sessionMap = state.chat.directAgent.sessionByAgentId || {};
+  const pendingMap = state.chat.directAgent.pendingApprovalByAgentId || {};
   const rows = state.agents.map(function (a) {
     const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
     const reason = a.status_reason_class ? (REASON_LABELS[a.status_reason_class] || "") : "";
+    const hasSession = !!(sessionMap[a.agent_id] && !sessionMap[a.agent_id].closed_at);
+    const hasPending = !!pendingMap[a.agent_id];
+    const sessionPill = hasSession
+      ? '<span class="pill tone-verified">chat open</span>'
+      : hasPending
+      ? '<span class="pill tone-info">approval pending</span>'
+      : "";
+    const btnLabel = hasSession ? "Open chat" : hasPending ? "Approve" : "Open";
+    const btnCls = hasSession || hasPending ? "btn btn-primary" : "btn";
     return '<div class="row">' +
       '<span class="glyph ' + map.glyph + '"></span>' +
       '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong> <span class="muted mono">' + escHtml(a.harness) + '</span></div>' +
+      sessionPill +
       '<span class="pill" title="' + escHtml(reason) + '">' + escHtml(map.label) + '</span>' +
-      '<button class="btn" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">Open</button>' +
+      '<button class="' + btnCls + '" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">' + btnLabel + '</button>' +
       '</div>';
   }).join("\n");
   return '<h1>Agents</h1><div class="card">' + rows + '</div>';
@@ -1480,6 +1523,29 @@ async function onInboxAction(itemId, action) {
       delete state.chat.directAgent.pendingApprovalByAgentId[boundAgentId];
     }
     await fetchAll();
+    // After approve on a direct-agent chat opening, route the operator
+    // straight to the agent-detail panel so the active chat surface is
+    // visible without needing a sidebar click. F6 fix: prior behavior
+    // left the operator wherever they were when the round-trip
+    // completed, with no visible affordance back into the chat.
+    if (
+      action === "approve" &&
+      boundAgentId &&
+      state.chat.directAgent.sessionByAgentId[boundAgentId]
+    ) {
+      state.selectedAgentId = boundAgentId;
+      if (location.hash !== "#agent-detail") {
+        location.hash = "agent-detail";
+      } else {
+        // Same-route reassignment does not fire hashchange; force a
+        // route refresh so renderMain picks up the new session state.
+        setRoute("agent-detail");
+      }
+      toast(
+        "Direct chat session open with " + boundAgentId + ". Type below or end the session.",
+        "info",
+      );
+    }
     rerender();
   } catch (e) {
     // Tier 1 dismiss returns HubConflictError (409) per binding addendum 1.2.
