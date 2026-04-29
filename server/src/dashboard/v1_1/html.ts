@@ -267,6 +267,107 @@ body {
   font-family: var(--mono); font-size: 12px; box-sizing: border-box;
 }
 .intel-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.banner-warn {
+  background: var(--ochre-bg); color: var(--ochre); border: 1px solid var(--ochre);
+  border-radius: var(--rad); padding: 8px 12px; margin: 8px 0; font-size: 13px;
+}
+.banner-info {
+  background: var(--indigo-bg); color: var(--indigo); border: 1px solid var(--indigo);
+  border-radius: var(--rad); padding: 8px 12px; margin: 8px 0; font-size: 13px;
+}
+.btn.chip {
+  border-radius: 999px; padding: 4px 12px; font-size: 12px;
+  background: var(--surface-2); border-color: var(--rule);
+}
+.btn.chip:hover:not(:disabled) { background: var(--paper-3); }
+.concierge-card {
+  display: flex; flex-direction: column;
+  min-height: calc(100vh - 180px);
+  padding: 16px 18px;
+  gap: 0;
+}
+.concierge-header {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--rule);
+  flex-wrap: wrap;
+}
+.concierge-persona {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 14px;
+}
+.concierge-persona strong { font-size: 14px; }
+.concierge-badge { white-space: nowrap; }
+.concierge-history {
+  flex: 1 1 auto;
+  min-height: 360px;
+  overflow-y: auto;
+  padding: 14px 4px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.concierge-msg {
+  display: flex; flex-direction: column; gap: 4px;
+  max-width: 80%;
+}
+.concierge-msg-author {
+  font-size: 11px;
+}
+.concierge-msg-body {
+  padding: 10px 14px; border-radius: 12px;
+  border: 1px solid var(--rule); background: var(--surface);
+  white-space: pre-wrap; word-wrap: break-word;
+  font-size: 14px; line-height: 1.5;
+}
+.concierge-msg-concierge { align-self: flex-start; }
+.concierge-msg-operator { align-self: flex-end; align-items: flex-end; }
+.concierge-msg-operator .concierge-msg-body {
+  background: var(--ink); color: var(--paper); border-color: var(--ink);
+}
+.concierge-empty {
+  padding: 24px 8px; text-align: left;
+  font-size: 13px; line-height: 1.6;
+}
+.concierge-composer {
+  display: flex; gap: 10px; align-items: center;
+  padding: 12px 0 8px;
+  border-top: 1px solid var(--rule);
+}
+.concierge-composer input {
+  flex: 1; min-width: 0;
+  padding: 10px 14px;
+  border: 1px solid var(--rule); border-radius: var(--rad);
+  font-family: var(--sans); font-size: 14px;
+  background: var(--surface); color: var(--ink);
+}
+.concierge-composer input:focus {
+  outline: none; border-color: var(--ink-3);
+}
+.concierge-composer .btn-primary {
+  padding: 8px 18px; font-size: 13px; flex-shrink: 0;
+}
+.concierge-chips {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  padding: 10px 0 0;
+}
+.concierge-chips::before {
+  content: "Try:"; color: var(--ink-3); font-size: 12px;
+  align-self: center; margin-right: 4px;
+}
+.concierge-foot {
+  margin: 12px 0 0; padding-top: 10px; border-top: 1px dashed var(--rule);
+  font-size: 12px;
+}
+.concierge-foot a { color: var(--ink-2); }
+.tier1-approval-card {
+  background: var(--ochre-bg); border: 1px solid var(--ochre);
+  border-radius: var(--rad); padding: 14px 16px; margin: 12px 0;
+}
+.tier1-approval-card h3 {
+  margin: 0 0 8px; color: var(--ochre); font-size: 14px;
+}
+.tier1-approval-card p { margin: 0 0 12px; font-size: 13px; }
+.tier1-approval-card .actions {
+  display: flex; gap: 8px; flex-wrap: wrap;
+}
 @media (max-width: 1100px) {
   .app, .app.route-full { grid-template-columns: 56px 1fr; grid-template-areas: "sidebar topbar" "sidebar main"; }
   .fortress { display: none; }

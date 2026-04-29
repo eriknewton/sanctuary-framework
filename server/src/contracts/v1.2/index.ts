@@ -21,3 +21,4 @@
  */
 
 export * from "./intelligence-events.js";
+export * from "./operator-chat-events.js";

@@ -719,6 +719,12 @@ export async function runWrap(
           ...(wrapIntelligenceSelector
             ? { intelligenceSelector: wrapIntelligenceSelector }
             : {}),
+          // WP-V1.2-4: forward the wrap-auto fortress's storage + master
+          // key so buildV11Bindings constructs the operator chat service.
+          // The wrap-emitted dashboard URL surfaces concierge + direct-
+          // agent chat from first launch.
+          storage: v11Storage,
+          masterKey: derived.key,
         }),
       );
       // The wrap-auto dashboard always binds 127.0.0.1; the operator

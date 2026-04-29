@@ -481,6 +481,13 @@ export async function startStandaloneDashboard(
       // invocations against this same fortress.
       storagePath: config.storage_path,
       ...(intelligenceSelector ? { intelligenceSelector } : {}),
+      // WP-V1.2-4: forward the storage backend + master key so
+      // buildV11Bindings constructs the operator chat service. The
+      // chat surfaces (concierge + direct-agent) depend on these for
+      // encrypted at-rest persistence under the reserved `_chat`
+      // namespace.
+      storage,
+      masterKey,
     }),
   );
 

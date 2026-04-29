@@ -83,6 +83,32 @@ const state = {
       saving: false,
       error: null
     }
+  },
+  // WP-V1.2-4: operator chat surfaces. Concierge is fortress-wide; direct-
+  // agent is per-agent and Tier 1 gated. Composer text is held module-local
+  // so input keystrokes do NOT trigger re-render (the input listener mirrors
+  // value into state without rerender; send handler reads from state).
+  chat: {
+    concierge: {
+      messages: [],
+      composer: "",
+      sending: false,
+      error: null,
+      badge: null
+    },
+    directAgent: {
+      threadByAgentId: {},
+      sessionByAgentId: {},
+      pendingApprovalByAgentId: {},
+      // pendingResolveByAgentId tracks an in-flight inbox-resolve call
+      // (approve/deny) so the inline buttons can disable themselves and
+      // surface a busy label. Keyed by agent_id; values are
+      // "approve" | "deny" | undefined.
+      pendingResolveByAgentId: {},
+      composer: "",
+      sending: false,
+      error: null
+    }
   }
 };
 
@@ -339,8 +365,28 @@ function renderTopbar() {
 function renderMain() {
   const main = document.getElementById("main");
   if (!main) return;
+  // F8 fix: capture focused-input identity + caret position so an SSE-
+  // triggered rerender during typing does not clobber the operator's
+  // typing experience. innerHTML replacement creates new DOM nodes; we
+  // re-find the equivalent input by data-action + optional data-agent-id
+  // and restore focus + selection range.
+  const active = document.activeElement;
+  let focus = null;
+  if (
+    active &&
+    active.tagName === "INPUT" &&
+    typeof active.getAttribute === "function" &&
+    active.getAttribute("data-action")
+  ) {
+    focus = {
+      action: active.getAttribute("data-action"),
+      agentId: active.getAttribute("data-agent-id"),
+      selectionStart: active.selectionStart,
+      selectionEnd: active.selectionEnd
+    };
+  }
   switch (state.route) {
-    case "dashboard": main.innerHTML = renderDashboardWelcome(); break;
+    case "dashboard": main.innerHTML = renderDashboardConcierge(); break;
     case "agents": main.innerHTML = renderAgentsList(); break;
     case "agent-detail": main.innerHTML = renderAgentDetail(); break;
     case "policy": main.innerHTML = renderPolicyCenter(); break;
@@ -351,49 +397,145 @@ function renderMain() {
     case "exit-drill": main.innerHTML = renderExitDrill(); break;
     default: main.innerHTML = '<p class="muted">Route not found.</p>';
   }
+  if (focus) {
+    let sel = 'input[data-action="' + focus.action + '"]';
+    if (focus.agentId) sel += '[data-agent-id="' + focus.agentId + '"]';
+    const el = main.querySelector(sel);
+    if (el && typeof el.focus === "function") {
+      try {
+        el.focus();
+        if (
+          typeof el.setSelectionRange === "function" &&
+          focus.selectionStart != null &&
+          focus.selectionEnd != null
+        ) {
+          el.setSelectionRange(focus.selectionStart, focus.selectionEnd);
+        }
+      } catch (e) { /* ignore browsers that disallow programmatic focus */ }
+    }
+  }
 }
 
-// ── Render: dashboard welcome ──────────────────────────────────────────
-// v1.1.7: replaces the half-built chat surface that v1.1.6 shipped with
-// a "What you can do today" summary card mapping each nav target to
-// the operator action it enables. Direct concierge chat is a v1.2 work
-// package (WP-V1.2-3 + WP-V1.2-4).
-function renderDashboardWelcome() {
+// ── Render: dashboard concierge ────────────────────────────────────────
+// WP-V1.2-4 concierge surface (replaces v1.1.7's "What you can do today"
+// landing card per Finding EE follow-up). The concierge is a fortress-
+// wide chat panel: operator types in plain English, the substrate
+// selector summarizes audit log + activity feed + agent registry, the
+// response renders inline. No session model. PII filter (Tier 1 regex)
+// runs pre-substrate; Tier 2 NER is substrate-routed.
+//
+// Visual contract per the spawn-prompt screenshots 00 + 01:
+// - Header: "Chat / This fortress" with sub-header
+//   "Sanctuary Fortress concierge" persona.
+// - Chat history (operator + concierge messages, oldest first).
+// - Input field at the bottom, send button.
+// - Suggested-action chips below the input (hardcoded in v1.2 per
+//   spawn-prompt §4.1; LLM-suggested chips defer to v1.3+).
+// - Substrate badge in the header (e.g. "Local Gemma 2 2B" or
+//   "Concierge unavailable; substrate not configured") sourced from the
+//   last response's served_by + display_label.
+const CONCIERGE_SUGGESTIONS = [
+  { id: "summarize-hour", label: "summarize the last hour", query: "Summarize what happened in this fortress in the last hour." },
+  { id: "agent-touched", label: "what has each agent touched today", query: "What has each wrapped agent done today? Group by agent." },
+  { id: "open-approvals", label: "any open approvals?", query: "Are there any open Tier 1 approvals or pending inbox items I should look at?" }
+];
+
+function renderActiveChatsPanel() {
+  const sessionMap = state.chat.directAgent.sessionByAgentId || {};
+  const pendingMap = state.chat.directAgent.pendingApprovalByAgentId || {};
+  const activeAgentIds = Object.keys(sessionMap).filter(function (aid) {
+    return sessionMap[aid] && !sessionMap[aid].closed_at;
+  });
+  const pendingAgentIds = Object.keys(pendingMap).filter(function (aid) {
+    return !!pendingMap[aid];
+  });
+  if (activeAgentIds.length === 0 && pendingAgentIds.length === 0) return "";
+  const rows = activeAgentIds.map(function (aid) {
+    const s = sessionMap[aid];
+    const expiry = s.expires_at ? '<span class="muted mono">expires ' + escHtml(shortTime(s.expires_at)) + '</span>' : '';
+    return '<div class="row">' +
+      '<span class="pill tone-verified">chat open</span>' +
+      '<div class="grow mono">' + escHtml(aid) + '</div>' +
+      expiry +
+      '<button class="btn btn-primary" data-action="open-agent" data-agent-id="' + escHtml(aid) + '">Open chat</button>' +
+      '</div>';
+  }).concat(pendingAgentIds.map(function (aid) {
+    return '<div class="row">' +
+      '<span class="pill tone-info">approval pending</span>' +
+      '<div class="grow mono">' + escHtml(aid) + '</div>' +
+      '<button class="btn" data-action="open-agent" data-agent-id="' + escHtml(aid) + '">Approve</button>' +
+      '</div>';
+  })).join("\n");
+  return '<div class="card" style="margin-bottom:14px;"><h3>Active chats</h3>' + rows + '</div>';
+}
+
+function renderDashboardConcierge() {
+  const c = state.chat.concierge;
+  const badge = c.badge && c.badge.displayLabel
+    ? '<span class="pill mono concierge-badge" title="Substrate that served the most recent response">' + escHtml(c.badge.displayLabel) + '</span>'
+    : '<span class="pill muted concierge-badge">Concierge: substrate not yet contacted</span>';
+  const messages = c.messages.length
+    ? c.messages.map(function (m) {
+        const cls = m.role === "operator" ? "concierge-msg-operator" : "concierge-msg-concierge";
+        const author = m.role === "operator" ? "you" : "Sanctuary Fortress concierge";
+        return '<div class="concierge-msg ' + cls + '">' +
+          '<div class="concierge-msg-author muted">' + escHtml(author) + ' · ' + escHtml(shortTime(m.created_at)) + '</div>' +
+          '<div class="concierge-msg-body">' + escHtml(m.body) + '</div>' +
+          '</div>';
+      }).join("\n")
+    : '<p class="muted concierge-empty">No messages yet. Ask the concierge anything about your fortress: it can summarize agent activity, surface open approvals, or describe the current policy.</p>';
+  const errorBanner = c.error
+    ? '<div class="banner banner-warn">' + escHtml(c.error) + '</div>'
+    : "";
+  const sendDisabled = c.sending ? ' disabled' : '';
+  const sendLabel = c.sending ? 'Sending...' : 'Send';
+  const chips = CONCIERGE_SUGGESTIONS.map(function (s) {
+    return '<button class="btn chip" data-action="concierge-suggestion" data-suggestion-id="' + escHtml(s.id) + '"' + sendDisabled + '>' + escHtml(s.label) + '</button>';
+  }).join("\n");
+  const activeChatsPanel = renderActiveChatsPanel();
   return [
-    '<h1>What you can do today</h1>',
-    '<div class="card">',
-      '<dl class="kv">',
-        '<dt><a href="#agents">Agents</a></dt>',
-        '<dd>Pause, resume, restart, lockdown, or unwrap any wrapped harness.</dd>',
-        '<dt><a href="#policy">Policy</a></dt>',
-        '<dd>Review the active policy bound to each agent.</dd>',
-        '<dt><a href="#intelligence">Intelligence</a></dt>',
-        '<dd>Pick the LLM substrate per surface. Tradeoffs visible.</dd>',
-        '<dt><a href="#privacy">Privacy</a></dt>',
-        '<dd>See what context is flowing to which provider per channel.</dd>',
-        '<dt><a href="#coordination">Coordination</a></dt>',
-        '<dd>Inspect intra-fortress agent coordination state.</dd>',
-        '<dt><a href="#health">Health</a></dt>',
-        '<dd>Check fortress posture, cocoon status, and dashboard refresh.</dd>',
-        '<dt><a href="#exit-drill">Exit drill</a></dt>',
-        '<dd>Snapshot, verify, and prepare a portable exit bundle.</dd>',
-      '</dl>',
-    '</div>',
-    '<p class="muted">Direct chat with the concierge ships in v1.2.</p>'
+    '<h1>Chat <span class="muted">/ This fortress</span></h1>',
+    activeChatsPanel,
+    '<div class="card concierge-card">',
+      '<div class="concierge-header">',
+        '<div class="concierge-persona"><strong>Sanctuary Fortress concierge</strong> <span class="muted">read-only over fortress state</span></div>',
+        badge,
+      '</div>',
+      errorBanner,
+      '<div class="concierge-history" id="concierge-history">' + messages + '</div>',
+      '<form class="concierge-composer" data-action="concierge-submit">',
+        '<input type="text" name="concierge-input" placeholder="Ask the concierge about this fortress..." value="' + escHtml(c.composer) + '" data-action="concierge-input"' + sendDisabled + ' autocomplete="off">',
+        '<button type="submit" class="btn btn-primary" data-action="concierge-send"' + sendDisabled + '>' + escHtml(sendLabel) + '</button>',
+      '</form>',
+      '<div class="concierge-chips">' + chips + '</div>',
+      '<p class="muted concierge-foot">First time? <a href="#intelligence">Pick a substrate</a> to enable concierge replies.</p>',
+    '</div>'
   ].join("");
 }
 
 // ── Render: agents list / detail ───────────────────────────────────────
 function renderAgentsList() {
   if (!state.agents.length) return '<h1>Agents</h1><p class="muted">No wrapped agents yet. Run <code>sanctuary wrap</code> to wrap a harness.</p>';
+  const sessionMap = state.chat.directAgent.sessionByAgentId || {};
+  const pendingMap = state.chat.directAgent.pendingApprovalByAgentId || {};
   const rows = state.agents.map(function (a) {
     const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
     const reason = a.status_reason_class ? (REASON_LABELS[a.status_reason_class] || "") : "";
+    const hasSession = !!(sessionMap[a.agent_id] && !sessionMap[a.agent_id].closed_at);
+    const hasPending = !!pendingMap[a.agent_id];
+    const sessionPill = hasSession
+      ? '<span class="pill tone-verified">chat open</span>'
+      : hasPending
+      ? '<span class="pill tone-info">approval pending</span>'
+      : "";
+    const btnLabel = hasSession ? "Open chat" : hasPending ? "Approve" : "Open";
+    const btnCls = hasSession || hasPending ? "btn btn-primary" : "btn";
     return '<div class="row">' +
       '<span class="glyph ' + map.glyph + '"></span>' +
       '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong> <span class="muted mono">' + escHtml(a.harness) + '</span></div>' +
+      sessionPill +
       '<span class="pill" title="' + escHtml(reason) + '">' + escHtml(map.label) + '</span>' +
-      '<button class="btn" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">Open</button>' +
+      '<button class="' + btnCls + '" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">' + btnLabel + '</button>' +
       '</div>';
   }).join("\n");
   return '<h1>Agents</h1><div class="card">' + rows + '</div>';
@@ -410,19 +552,124 @@ function renderAgentDetail() {
         return '<div class="row"><span class="muted">' + escHtml(shortTime(e.emitted_at)) + '</span><span>' + escHtml(t) + '</span></div>';
       }).join("\n")
     : '<p class="muted">No activity yet.</p>';
+  // WP-V1.2-4 direct-agent chat surface. Per spawn-prompt §4.2 + the
+  // Agent Chat screenshot: clicking "Open direct chat" fires the Tier 1
+  // ApprovalGate (one approval per session-open, NOT per message). On
+  // approval the chat surface opens with the agent's identity + current
+  // template binding inline. Per-message handoff is convenience inside
+  // the conversation; session entry is the privileged action.
+  const chatPanel = renderDirectAgentChat(a);
+  // F7 fix: chat panel is the primary action surface; render it
+  // immediately under the H1 above the Identity card so the composer +
+  // history are visible above the fold instead of pushed below the
+  // Identity dl. Identity + Timeline drop to reference position.
   return '<h1>' + escHtml(a.agent_id) + '</h1>' +
+    chatPanel +
     '<div class="card"><h3>Identity</h3>' +
       '<dl class="kv">' +
       '<dt>Harness</dt><dd class="mono">' + escHtml(a.harness) + '</dd>' +
       '<dt>Model</dt><dd class="mono">' + escHtml(a.model_provider.vendor) + " / " + escHtml(a.model_provider.model_id) + '</dd>' +
       '<dt>Policy</dt><dd class="mono">' + escHtml(a.policy_id) + '</dd>' +
+      '<dt>Template</dt><dd class="mono">' + escHtml(a.channel_template_id || "no_template") + '</dd>' +
       '<dt>Status</dt><dd><span class="glyph ' + map.glyph + '"></span> ' + escHtml(map.label) + '</dd>' +
       '</dl>' +
     '</div>' +
     '<div class="card"><h3>Timeline</h3>' + timeline + '</div>';
-  // v1.1.7: "Open chat" button removed alongside the half-built chat
-  // surface (Finding EE). The agent-detail timeline + capability buttons
-  // are the operator's interaction surface at v1.1; chat ships in v1.2.
+}
+
+// Direct-agent chat panel for the Agents view per the spawn-prompt
+// screenshot "Agent Chat.png". Three states:
+//   1. No session and no pending approval: show "Open direct chat" CTA
+//      that fires the Tier 1 inbox enqueue. The CTA copy is the spawn
+//      prompt's exact framing of the privileged action.
+//   2. Tier 1 inbox item pending: show a "Approve in inbox" hint + the
+//      pending inbox item id so the operator can resolve it from the
+//      inbox panel (the existing Tier 1 inbox flow handles approve/deny).
+//   3. Active session: chat surface (header with agent identity +
+//      template binding + session expiry + End-session button + chat
+//      history + composer). Per-message Tier 1 gate is NOT fired (one
+//      approval per session-open).
+function renderDirectAgentChat(agent) {
+  const da = state.chat.directAgent;
+  const session = da.sessionByAgentId[agent.agent_id] || null;
+  const pendingInboxId = da.pendingApprovalByAgentId[agent.agent_id] || null;
+  const errorBanner = da.error
+    ? '<div class="banner banner-warn">' + escHtml(da.error) + '</div>'
+    : "";
+
+  // State 3: active session: render chat surface.
+  if (session && !session.closed_at) {
+    const thread = da.threadByAgentId[agent.agent_id] || [];
+    const messages = thread.length
+      ? thread.map(function (m) {
+          const cls = m.role === "operator" ? "concierge-msg-operator" : "concierge-msg-concierge";
+          const author = m.role === "operator" ? "you" : escHtml(agent.agent_id);
+          return '<div class="concierge-msg ' + cls + '">' +
+            '<div class="concierge-msg-author muted">' + escHtml(author) + ' · ' + escHtml(shortTime(m.created_at)) + '</div>' +
+            '<div class="concierge-msg-body">' + escHtml(m.body) + '</div>' +
+            '</div>';
+        }).join("\n")
+      : '<p class="muted concierge-empty">Session open. Type a message; the wrapped agent will reply when its harness wires up the v1.2.x reply hook. Operator-side messages persist + audit-emit immediately.</p>';
+    const sendDisabled = da.sending ? ' disabled' : '';
+    const sendLabel = da.sending ? 'Sending...' : 'Send';
+    const expiry = session.expires_at
+      ? '<span class="muted mono">Session expires ' + escHtml(shortTime(session.expires_at)) + '</span>'
+      : '';
+    return '<div class="card concierge-card">' +
+      '<div class="concierge-header">' +
+        '<div class="concierge-persona"><strong>Direct chat with ' + escHtml(agent.agent_id) + '</strong> ' +
+          '<span class="muted">' + escHtml(agent.channel_template_id || "no_template") + '</span></div>' +
+        expiry +
+      '</div>' +
+      errorBanner +
+      '<div class="concierge-history" id="direct-agent-history">' + messages + '</div>' +
+      '<form class="concierge-composer" data-action="direct-agent-submit" data-agent-id="' + escHtml(agent.agent_id) + '">' +
+        '<input type="text" name="direct-agent-input" placeholder="Type a message to ' + escHtml(agent.agent_id) + '..." value="' + escHtml(da.composer) + '" data-action="direct-agent-input"' + sendDisabled + ' autocomplete="off">' +
+        '<button type="submit" class="btn btn-primary" data-action="direct-agent-send" data-agent-id="' + escHtml(agent.agent_id) + '"' + sendDisabled + '>' + escHtml(sendLabel) + '</button>' +
+      '</form>' +
+      '<div class="concierge-chips">' +
+        '<button class="btn" data-action="direct-agent-end" data-agent-id="' + escHtml(agent.agent_id) + '"' + sendDisabled + '>End session</button>' +
+      '</div>' +
+    '</div>';
+  }
+
+  // State 2: Tier 1 inbox item pending operator approval. Render inline
+  // on the agent-detail panel so the operator can approve or deny without
+  // navigating to the dashboard inbox column. Per Erik directive
+  // 2026-04-29: approval surface lives where the agent context is.
+  if (pendingInboxId) {
+    // Look up the inbox item so we can render the operator-facing prompt
+    // alongside the buttons. If the inbox feed has not arrived yet (race
+    // between session/start return and the SSE inbox event), fall back to
+    // the canonical Tier 1 prompt template.
+    const inboxItem = state.inbox.find(function (x) { return x.item_id === pendingInboxId; });
+    const promptText = inboxItem
+      ? renderTemplate(inboxItem.display_template_id, inboxItem.display_template_args)
+      : "Open a Tier 1 direct chat session with " + agent.agent_id + ".";
+    const pending = da.pendingResolveByAgentId && da.pendingResolveByAgentId[agent.agent_id];
+    const busy = pending ? ' disabled' : '';
+    const approveLabel = pending === "approve" ? "Approving..." : "Approve and open chat";
+    const denyLabel = pending === "deny" ? "Denying..." : "Deny";
+    return '<div class="card tier1-approval-card">' +
+      '<h3>Tier 1 approval required</h3>' +
+      '<p>' + escHtml(promptText) + '</p>' +
+      errorBanner +
+      '<div class="actions">' +
+        '<button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(pendingInboxId) + '"' + busy + '>' + escHtml(approveLabel) + '</button>' +
+        '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(pendingInboxId) + '"' + busy + '>' + escHtml(denyLabel) + '</button>' +
+      '</div>' +
+      '<p class="muted mono" style="margin-top:10px;font-size:11px;">' + escHtml(pendingInboxId) + '</p>' +
+    '</div>';
+  }
+
+  // State 1: no session and no pending approval: CTA.
+  return '<div class="card">' +
+    '<h3>Direct chat</h3>' +
+    errorBanner +
+    '<p>Open a Tier 1 approved chat session with this wrapped agent. ' +
+      'One approval per session-open; per-message handoff is convenience inside the conversation.</p>' +
+    '<button class="btn btn-primary" data-action="direct-agent-start" data-agent-id="' + escHtml(agent.agent_id) + '">Open direct chat (Tier 1)</button>' +
+  '</div>';
 }
 
 // ── Render: privacy ────────────────────────────────────────────────────
@@ -834,6 +1081,199 @@ async function onIntelPickerSave() {
   }
 }
 
+// ── WP-V1.2-4 chat handlers ─────────────────────────────────────────────
+
+async function fetchConciergeHistory() {
+  try {
+    const res = await api("/chat/concierge/history");
+    state.chat.concierge.messages = (res.data && res.data.messages) || [];
+    // Surface the most recent concierge response's served_by as the
+    // header badge so the operator sees which substrate served the
+    // last visible reply.
+    const reversed = state.chat.concierge.messages.slice().reverse();
+    const lastConcierge = reversed.find(function (m) { return m.role === "concierge"; });
+    if (lastConcierge && lastConcierge.served_by) {
+      state.chat.concierge.badge = {
+        substrate: lastConcierge.served_by,
+        displayLabel: substrateBadgeLabel(lastConcierge.served_by)
+      };
+    }
+  } catch (e) {
+    // On 422 (chat not wired) or 404 etc., leave history empty; the
+    // concierge surface itself surfaces "substrate not configured" once
+    // the operator submits.
+    state.chat.concierge.messages = [];
+  }
+}
+
+function substrateBadgeLabel(sub) {
+  if (sub === "local") return "Concierge: Local model";
+  if (sub === "venice") return "Concierge: Venice.ai";
+  if (sub === "frontier-with-filter") return "Concierge: Frontier with PII filter";
+  if (sub === "hybrid") return "Concierge: Hybrid (per-surface)";
+  if (sub === "disabled") return "Concierge: substrate not configured";
+  return "Concierge: " + sub;
+}
+
+async function onConciergeSend() {
+  const c = state.chat.concierge;
+  if (c.sending) return;
+  const message = (c.composer || "").trim();
+  if (message.length === 0) return;
+  c.sending = true;
+  c.error = null;
+  rerender();
+  try {
+    const res = await api("/chat/concierge", {
+      method: "POST",
+      body: { message: message }
+    });
+    const data = res.data || {};
+    // Refetch history so both operator submit + concierge response
+    // render in chronological order. The service persisted both
+    // messages before the response returned; the history endpoint is
+    // the single source of truth for the visible thread.
+    await fetchConciergeHistory();
+    // Update the badge directly from the response so it reflects what
+    // served THIS query even before the next render.
+    if (data.served_by) {
+      state.chat.concierge.badge = {
+        substrate: data.served_by,
+        displayLabel: data.display_label || substrateBadgeLabel(data.served_by)
+      };
+    }
+    c.composer = "";
+  } catch (e) {
+    c.error = e.message || "Concierge call failed.";
+  } finally {
+    c.sending = false;
+    rerender();
+  }
+}
+
+async function fetchDirectAgentHistory(agentId) {
+  try {
+    const res = await api("/chat/agents/" + encodeURIComponent(agentId) + "/history");
+    state.chat.directAgent.threadByAgentId[agentId] = (res.data && res.data.messages) || [];
+  } catch (e) {
+    // Tolerate 422/404; operator will see the empty thread + can still
+    // open a session.
+    state.chat.directAgent.threadByAgentId[agentId] = [];
+  }
+}
+
+async function fetchActiveSessions() {
+  try {
+    const res = await api("/chat/sessions");
+    const sessions = (res.data && res.data.sessions) || [];
+    const map = {};
+    for (let i = 0; i < sessions.length; i++) {
+      const s = sessions[i];
+      if (s && s.agent_id && !s.closed_at) map[s.agent_id] = s;
+    }
+    state.chat.directAgent.sessionByAgentId = map;
+    // When an active session is observed for an agent, clear any pending
+    // approval bookkeeping so renderDirectAgentChat falls into state-3
+    // (active session) cleanly. Without this, pendingApprovalByAgentId
+    // stays set after the inbox item resolves and the agent panel can
+    // briefly flash the approval card after the chat surface should be
+    // visible.
+    const agentIds = Object.keys(map);
+    for (let j = 0; j < agentIds.length; j++) {
+      const aid = agentIds[j];
+      if (state.chat.directAgent.pendingApprovalByAgentId[aid]) {
+        delete state.chat.directAgent.pendingApprovalByAgentId[aid];
+      }
+      // Hydrate the per-agent thread so the chat surface renders with
+      // full history on first paint instead of an empty pane that fills
+      // in after a separate round trip.
+      await fetchDirectAgentHistory(aid);
+    }
+  } catch (e) {
+    // 422 (chat not wired) leaves sessionByAgentId untouched.
+  }
+}
+
+async function onDirectAgentStart(agentId) {
+  const da = state.chat.directAgent;
+  da.error = null;
+  rerender();
+  try {
+    const res = await api("/chat/agents/" + encodeURIComponent(agentId) + "/session/start", {
+      method: "POST",
+      body: {}
+    });
+    const data = res.data || {};
+    if (data.status === "approval_pending" && data.inbox_item_id) {
+      // Tier 1 inbox flow: track the pending item id; the operator
+      // approves it from the inbox panel; on approve the session opens
+      // and shows up in the next /chat/sessions fetch.
+      da.pendingApprovalByAgentId[agentId] = data.inbox_item_id;
+      toast("Tier 1 approval queued. Approve in the dashboard inbox to open the session.", "info");
+      await fetchAll();
+    } else {
+      // The hub returned a session record directly (test rig path or
+      // future auto-approve mode). Pick up the session.
+      await fetchActiveSessions();
+    }
+  } catch (e) {
+    da.error = e.message || "Could not open direct chat.";
+  } finally {
+    rerender();
+  }
+}
+
+async function onDirectAgentSend(agentId) {
+  const da = state.chat.directAgent;
+  if (da.sending) return;
+  const message = (da.composer || "").trim();
+  if (message.length === 0) return;
+  const session = da.sessionByAgentId[agentId];
+  if (!session || session.closed_at) {
+    da.error = "Session is not active. Open a new direct chat session.";
+    rerender();
+    return;
+  }
+  da.sending = true;
+  da.error = null;
+  rerender();
+  try {
+    await api("/chat/agents/" + encodeURIComponent(agentId) + "/message", {
+      method: "POST",
+      body: { session_id: session.session_id, message: message }
+    });
+    await fetchDirectAgentHistory(agentId);
+    da.composer = "";
+  } catch (e) {
+    da.error = e.message || "Could not send message.";
+  } finally {
+    da.sending = false;
+    rerender();
+  }
+}
+
+async function onDirectAgentEnd(agentId) {
+  const da = state.chat.directAgent;
+  const session = da.sessionByAgentId[agentId];
+  if (!session) return;
+  da.error = null;
+  rerender();
+  try {
+    await api("/chat/agents/" + encodeURIComponent(agentId) + "/session/end", {
+      method: "POST",
+      body: { session_id: session.session_id }
+    });
+    delete da.sessionByAgentId[agentId];
+    delete da.pendingApprovalByAgentId[agentId];
+    da.composer = "";
+    await fetchActiveSessions();
+  } catch (e) {
+    da.error = e.message || "Could not end session.";
+  } finally {
+    rerender();
+  }
+}
+
 // ── Render: policy ─────────────────────────────────────────────────────
 function renderPolicyCenter() {
   const tmplCards = CHANNEL_TEMPLATES.map(function (t) {
@@ -940,8 +1380,9 @@ function renderExitDrill() {
 function renderFortress() {
   const fortress = document.getElementById("fortress");
   if (!fortress) return;
-  const inboxRows = state.inbox.length
-    ? state.inbox.map(function (i) {
+  const visibleInbox = state.inbox.filter(function (i) { return !i.resolved; });
+  const inboxRows = visibleInbox.length
+    ? visibleInbox.map(function (i) {
         const text = renderTemplate(i.display_template_id, i.display_template_args);
         const actions = inboxActions(i);
         const buttons = actions.map(function (act) {
@@ -1037,6 +1478,12 @@ async function fetchAll() {
     state.handoffEvents = he.data.entries || [];
   } catch (e) { /* tolerate */ }
   await fetchIntelligenceState();
+  // WP-V1.2-4: hydrate operator chat state on every fetch cycle so the
+  // concierge thread, active sessions, and per-agent direct-chat history
+  // all reflect what the server holds. Each call tolerates 422
+  // (chat not wired); the surfaces degrade to honest empty states.
+  await fetchConciergeHistory();
+  await fetchActiveSessions();
 }
 
 // Tier 1 lockdown click. Two-step: POST returns 202 + inbox_item_id, button
@@ -1076,6 +1523,24 @@ async function onAgentControl(agentId, action) {
 }
 
 async function onInboxAction(itemId, action) {
+  // Find the agent_id this inbox item is bound to (if any) so we can
+  // surface the in-flight busy state on the inline approval card and
+  // clean up pendingApprovalByAgentId after resolve. Look in the inbox
+  // first, then fall back to any pending-approval mapping (covers the
+  // race where the inbox SSE event has not yet arrived).
+  const item0 = state.inbox.find(function (x) { return x.item_id === itemId; });
+  let boundAgentId = (item0 && item0.agent_id) || null;
+  if (!boundAgentId) {
+    const map = state.chat.directAgent.pendingApprovalByAgentId || {};
+    const keys = Object.keys(map);
+    for (let i = 0; i < keys.length; i++) {
+      if (map[keys[i]] === itemId) { boundAgentId = keys[i]; break; }
+    }
+  }
+  if (boundAgentId && (action === "approve" || action === "deny")) {
+    state.chat.directAgent.pendingResolveByAgentId[boundAgentId] = action;
+    rerender();
+  }
   try {
     const r = await api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST", body: {} });
     // Tier 1 lockdown engagement: the approve handler triggers the controller
@@ -1091,7 +1556,55 @@ async function onInboxAction(itemId, action) {
       // activity feed. v1.1 ships projection-only.
       state.exitDrill.bundleResult = { bundle_dir: "(see activity feed)", manifest_hash: "" };
     }
+    // Clear pending-approval bookkeeping so the agent panel transitions
+    // out of the inline approval card. fetchActiveSessions called inside
+    // fetchAll will re-set sessionByAgentId for approve, dropping into
+    // state-3 (active session); deny falls into state-1 (CTA).
+    if (boundAgentId) {
+      delete state.chat.directAgent.pendingApprovalByAgentId[boundAgentId];
+    }
     await fetchAll();
+    // After approve on a direct-agent chat opening, route the operator
+    // straight to the agent-detail panel so the active chat surface is
+    // visible without needing a sidebar click. F6 fix: prior behavior
+    // left the operator wherever they were when the round-trip
+    // completed, with no visible affordance back into the chat.
+    if (
+      action === "approve" &&
+      boundAgentId &&
+      state.chat.directAgent.sessionByAgentId[boundAgentId]
+    ) {
+      state.selectedAgentId = boundAgentId;
+      if (location.hash !== "#agent-detail") {
+        location.hash = "agent-detail";
+      } else {
+        // Same-route reassignment does not fire hashchange; force a
+        // route refresh so renderMain picks up the new session state.
+        setRoute("agent-detail");
+      }
+      toast(
+        "Direct chat session open with " + boundAgentId + ". Type below or end the session.",
+        "info",
+      );
+      // Defer focus until the next tick so the rerender below has run
+      // and the composer input is in the DOM.
+      setTimeout(function () {
+        const main = document.getElementById("main");
+        if (!main) return;
+        const el = main.querySelector(
+          'input[data-action="direct-agent-input"][data-agent-id="' + boundAgentId + '"]'
+        );
+        if (el && typeof el.focus === "function") {
+          el.focus();
+          // Scroll the chat surface into view so the composer + history
+          // are above the fold even on shorter viewports.
+          const card = el.closest(".concierge-card");
+          if (card && typeof card.scrollIntoView === "function") {
+            card.scrollIntoView({ block: "start", behavior: "smooth" });
+          }
+        }
+      }, 0);
+    }
     rerender();
   } catch (e) {
     // Tier 1 dismiss returns HubConflictError (409) per binding addendum 1.2.
@@ -1099,6 +1612,11 @@ async function onInboxAction(itemId, action) {
       toast("Tier 1 items cannot be dismissed. Approve or deny.", "error");
     } else {
       toast("Inbox action failed: " + e.message, "error");
+    }
+  } finally {
+    if (boundAgentId) {
+      delete state.chat.directAgent.pendingResolveByAgentId[boundAgentId];
+      rerender();
     }
   }
 }
@@ -1270,6 +1788,23 @@ document.addEventListener("click", function (ev) {
     return rerender();
   }
   if (action === "intel-picker-save") return void onIntelPickerSave();
+  // WP-V1.2-4 concierge handlers ──────────────────────────────────
+  if (action === "concierge-submit") { ev.preventDefault(); return void onConciergeSend(); }
+  if (action === "concierge-send") { ev.preventDefault(); return void onConciergeSend(); }
+  if (action === "concierge-suggestion") {
+    const sid = tgt.getAttribute("data-suggestion-id");
+    const found = CONCIERGE_SUGGESTIONS.find(function (s) { return s.id === sid; });
+    if (found) {
+      state.chat.concierge.composer = found.query;
+      return void onConciergeSend();
+    }
+    return;
+  }
+  // WP-V1.2-4 direct-agent handlers ───────────────────────────────
+  if (action === "direct-agent-start" && agentId) return void onDirectAgentStart(agentId);
+  if (action === "direct-agent-submit" && agentId) { ev.preventDefault(); return void onDirectAgentSend(agentId); }
+  if (action === "direct-agent-send" && agentId) { ev.preventDefault(); return void onDirectAgentSend(agentId); }
+  if (action === "direct-agent-end" && agentId) return void onDirectAgentEnd(agentId);
   if (action === "exit-export-start") return void onExitExportStart();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
   if (action === "open-agent" && agentId) { state.selectedAgentId = agentId; location.hash = "agent-detail"; return; }
@@ -1321,6 +1856,12 @@ document.addEventListener("input", function (ev) {
     state.intelligence.picker.veniceApiKey = tgt.value;
   } else if (action === "intel-picker-input-frontier-key") {
     state.intelligence.picker.frontierApiKey = tgt.value;
+  } else if (action === "concierge-input") {
+    // Mirror composer text into state without rerender so keystrokes
+    // do not clobber the input element's value or caret position.
+    state.chat.concierge.composer = tgt.value;
+  } else if (action === "direct-agent-input") {
+    state.chat.directAgent.composer = tgt.value;
   }
 });
 

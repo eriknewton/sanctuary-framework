@@ -51,6 +51,7 @@ import { aggregateActivity } from "./activity-feed.js";
 import type {
   HubAgentControlResult,
   HubBudgetSummary,
+  HubDirectAgentSessionRequestResult,
   HubFortressExportResult,
   HubPolicySummary,
   HubServiceDeps,
@@ -58,6 +59,12 @@ import type {
   HubTier1FortressApprovalEnqueuedResult,
   HubTemplateBindingApprovalEnqueuedResult,
 } from "./types.js";
+import type {
+  ConciergeResponse,
+  DirectAgentSendResponse,
+  OperatorChatMessage,
+  OperatorChatSession,
+} from "../chat/operator-chat-types.js";
 
 function isTier1ControlAction(
   action: HubAgentControlAction,
@@ -694,6 +701,170 @@ export class HubService {
    */
   inboxStoreSize(): number {
     return this.inboxStore.size();
+  }
+
+  // ── Operator chat (WP-V1.2-4) ──────────────────────────────────────
+
+  private requireOperatorChat(): NonNullable<HubServiceDeps["operatorChat"]> {
+    if (!this.deps.operatorChat) {
+      throw new HubCapabilityError("operator_chat_not_wired");
+    }
+    return this.deps.operatorChat;
+  }
+
+  /**
+   * Operator submit on the concierge chat surface. Pass-through to the
+   * operator-chat-service which owns substrate-selector routing, PII
+   * filtering, persistence, and audit emission.
+   */
+  async sendConcierge(query: string): Promise<ConciergeResponse> {
+    const chat = this.requireOperatorChat();
+    return chat.sendConcierge(query);
+  }
+
+  /**
+   * Read the persisted concierge thread.
+   */
+  async getConciergeHistory(): Promise<OperatorChatMessage[]> {
+    const chat = this.requireOperatorChat();
+    return chat.getConciergeHistory();
+  }
+
+  /**
+   * Request a direct-agent chat session on a wrapped agent. Tier 1:
+   * enqueues an inbox approval item. On approve, the operator-chat-
+   * service opens the session via `openDirectAgentSession` and emits
+   * `direct_agent_session_open`.
+   *
+   * The returned `inbox_item_id` is the same id the chat surface polls
+   * (or subscribes to via SSE) until the session is approved or denied.
+   * On approval the session_id surfaces through the
+   * `direct_agent_session_open` audit event; the dashboard's chat
+   * surface listens for that event to swap into the active-session UI.
+   */
+  requestDirectAgentSession(
+    agentId: string,
+    expiresAtIsoOverride?: string,
+  ): HubDirectAgentSessionRequestResult {
+    const chat = this.requireOperatorChat();
+    const record = this.getAgent(agentId);
+    const itemId = `tier1.direct_agent_session_open.${record.agent_id}.${randomUUID()}`;
+    const channelTemplateId =
+      typeof record.channel_template_id === "string"
+        ? record.channel_template_id
+        : null;
+    const item: HubApprovalPendingItem = {
+      version: "1.1",
+      item_id: itemId,
+      kind: "approval_pending",
+      created_at: this.nowIso(),
+      agent_id: record.agent_id,
+      identity_id: record.identity_id,
+      display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.approval_pending}.tier1.direct_agent_session_open`,
+      display_template_args: [
+        { kind: "agent_id", value: record.agent_id },
+        { kind: "identity_id", value: record.identity_id },
+        { kind: "tier", value: "tier1" },
+      ],
+      resolved: false,
+      tier: "tier1",
+      operation_category: "direct_agent_session_open",
+    };
+
+    this.inboxStore.enqueueTier1(item, async (_approvedItem, decision) => {
+      if (decision === "deny") {
+        this.deps.activitySources.auditLog.append(
+          "l2",
+          "direct_agent_session_denied",
+          this.deps.identityId,
+          {
+            agent_id: record.agent_id,
+            identity_id: record.identity_id,
+            operator_audit_id: itemId,
+          },
+        );
+        return;
+      }
+      // The chat-service emits `direct_agent_session_open` itself with
+      // the assigned session_id; this hub layer leaves the activity
+      // entry shape to the chat-service so audit event payloads stay
+      // co-located with the surface that owns them.
+      await chat.openDirectAgentSession({
+        agentId: record.agent_id,
+        approvalInboxItemId: itemId,
+        channelTemplateId,
+        ...(expiresAtIsoOverride !== undefined
+          ? { expiresAtIsoOverride }
+          : {}),
+      });
+    });
+
+    const result: HubDirectAgentSessionRequestResult = {
+      agent_id: record.agent_id,
+      inbox_item_id: itemId,
+      status: "approval_pending",
+      operation_category: "direct_agent_session_open",
+    };
+    if (expiresAtIsoOverride !== undefined) {
+      result.requested_expires_at = expiresAtIsoOverride;
+    }
+    return result;
+  }
+
+  /**
+   * Operator submit on a direct-agent chat session. The operator-chat-
+   * service owns persistence + audit; the hub validates session
+   * membership belongs to the correct identity at the routing layer.
+   */
+  async sendDirectAgentMessage(
+    sessionId: string,
+    body: string,
+  ): Promise<DirectAgentSendResponse> {
+    const chat = this.requireOperatorChat();
+    const session = chat.getSession(sessionId);
+    if (!session) {
+      throw new HubNotFoundError(`chat session ${sessionId}`);
+    }
+    // Verify the session's bound agent belongs to this identity. The
+    // chat-service is identity-scoped at construction so this is a
+    // belt-and-suspenders check; defense in depth against future
+    // multi-identity wiring drift.
+    this.getAgent(session.agent_id);
+    return chat.sendToAgent({ sessionId, body });
+  }
+
+  /**
+   * Read the persisted direct-agent chat history for a wrapped agent.
+   * Returns an empty array when no thread exists yet.
+   */
+  async getDirectAgentHistory(
+    agentId: string,
+  ): Promise<OperatorChatMessage[]> {
+    const chat = this.requireOperatorChat();
+    this.getAgent(agentId);
+    return chat.getDirectAgentHistory(agentId);
+  }
+
+  /**
+   * Operator-driven session close. Returns null when the session is
+   * already closed or unknown. Emits `direct_agent_session_close`
+   * through the chat-service.
+   */
+  async closeDirectAgentSession(
+    sessionId: string,
+  ): Promise<OperatorChatSession | null> {
+    const chat = this.requireOperatorChat();
+    return chat.closeDirectAgentSession(sessionId, "operator_close");
+  }
+
+  /**
+   * Snapshot of in-memory active direct-agent sessions for this
+   * fortress. Used by the dashboard to repaint the chat header on page
+   * refresh and by the hub routes' GET /sessions endpoint.
+   */
+  listActiveDirectAgentSessions(): OperatorChatSession[] {
+    if (!this.deps.operatorChat) return [];
+    return this.deps.operatorChat.listActiveSessions();
   }
 }
 

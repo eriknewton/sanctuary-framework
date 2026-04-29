@@ -64,6 +64,12 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
     "federation_node_join",
+    // WP-V1.2-4 Operator Chat: direct-agent session entry is privileged.
+    // The hub's `requestDirectAgentSession` enqueues an inbox approval;
+    // the operator-chat service only opens the session after operator
+    // approval through the inbox flow. Mirrors the hub's existing
+    // `unwrap` / `lockdown` / `policy_change` Tier 1 pattern.
+    "direct_agent_session_open",
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [

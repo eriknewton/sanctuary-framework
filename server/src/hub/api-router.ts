@@ -30,6 +30,7 @@ import {
   HUB_API_PREFIX,
   HUB_AGENTS_DEFAULT_LIMIT,
   HUB_AGENTS_MAX_LIMIT,
+  HUB_CHAT_MESSAGE_MAX_CHARS,
   HUB_FORTRESS_AGENT_ID_SENTINEL,
   HUB_INBOX_ACTIONS,
   HUB_INBOX_DEFAULT_LIMIT,
@@ -141,6 +142,50 @@ function matchAgentRoute(path: string): {
     agentId: decodeURIComponent(rest.slice(0, slash)),
     remainder: rest.slice(slash + 1),
   };
+}
+
+/**
+ * Match `/api/hub/chat/agents/<id>/<remainder>` and
+ * `/api/hub/chat/agents/<id>` patterns. Returns null if the path is
+ * not under the chat-agents prefix.
+ */
+function matchChatAgentRoute(path: string): {
+  agentId: string;
+  remainder: string | null;
+} | null {
+  const prefix = `${HUB_API_PREFIX}/chat/agents/`;
+  if (!path.startsWith(prefix)) return null;
+  const rest = path.slice(prefix.length);
+  if (rest.length === 0) return null;
+  const slash = rest.indexOf("/");
+  if (slash === -1) {
+    return { agentId: decodeURIComponent(rest), remainder: null };
+  }
+  return {
+    agentId: decodeURIComponent(rest.slice(0, slash)),
+    remainder: rest.slice(slash + 1),
+  };
+}
+
+/**
+ * Pull a non-empty chat message body out of a request body. Throws
+ * HubValidationError when the body is missing, the wrong type, or
+ * exceeds the per-message length cap.
+ */
+function checkChatMessage(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new HubValidationError("message must be a string");
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    throw new HubValidationError("message must not be empty");
+  }
+  if (trimmed.length > HUB_CHAT_MESSAGE_MAX_CHARS) {
+    throw new HubValidationError(
+      `message exceeds ${HUB_CHAT_MESSAGE_MAX_CHARS}-character cap`,
+    );
+  }
+  return trimmed;
 }
 
 /**
@@ -396,6 +441,122 @@ export async function handleHubRoute(
       const budgets = deps.service.listBudgetSummaries();
       writeJSON(res, 200, { ok: true, data: { budgets } });
       return true;
+    }
+
+    // ── POST /api/hub/chat/concierge ─────────────────────────────
+    if (
+      method === "POST" &&
+      path === HUB_ROUTES.CHAT_CONCIERGE_SEND
+    ) {
+      const body = await readJSONBody<{ message?: unknown }>(req);
+      const message = checkChatMessage(body.message);
+      const result = await deps.service.sendConcierge(message);
+      writeJSON(res, 200, { ok: true, data: result });
+      return true;
+    }
+
+    // ── GET /api/hub/chat/concierge/history ──────────────────────
+    if (
+      method === "GET" &&
+      path === HUB_ROUTES.CHAT_CONCIERGE_HISTORY
+    ) {
+      const messages = await deps.service.getConciergeHistory();
+      writeJSON(res, 200, { ok: true, data: { messages } });
+      return true;
+    }
+
+    // ── GET /api/hub/chat/sessions ───────────────────────────────
+    if (
+      method === "GET" &&
+      path === HUB_ROUTES.CHAT_SESSIONS_LIST
+    ) {
+      const sessions = deps.service.listActiveDirectAgentSessions();
+      writeJSON(res, 200, { ok: true, data: { sessions } });
+      return true;
+    }
+
+    // ── /api/hub/chat/agents/:id/* ───────────────────────────────
+    const chatAgentMatch = matchChatAgentRoute(path);
+    if (chatAgentMatch) {
+      const { agentId, remainder } = chatAgentMatch;
+
+      // GET /api/hub/chat/agents/:id/history
+      if (method === "GET" && remainder === "history") {
+        const messages = await deps.service.getDirectAgentHistory(agentId);
+        writeJSON(res, 200, { ok: true, data: { messages } });
+        return true;
+      }
+
+      // POST /api/hub/chat/agents/:id/session/start
+      if (method === "POST" && remainder === "session/start") {
+        const body = await readJSONBody<{ expires_at?: unknown }>(req);
+        let expiresAtIso: string | undefined;
+        if (body.expires_at !== undefined) {
+          if (typeof body.expires_at !== "string") {
+            throw new HubValidationError(
+              "expires_at must be an ISO8601 string",
+            );
+          }
+          if (Number.isNaN(Date.parse(body.expires_at))) {
+            throw new HubValidationError(
+              "expires_at must be a parseable ISO8601 timestamp",
+            );
+          }
+          expiresAtIso = body.expires_at;
+        }
+        const result = deps.service.requestDirectAgentSession(
+          agentId,
+          expiresAtIso,
+        );
+        writeJSON(res, 202, { ok: true, data: result });
+        return true;
+      }
+
+      // POST /api/hub/chat/agents/:id/session/end
+      if (method === "POST" && remainder === "session/end") {
+        const body = await readJSONBody<{ session_id?: unknown }>(req);
+        if (
+          typeof body.session_id !== "string" ||
+          body.session_id.length === 0
+        ) {
+          throw new HubValidationError("session_id required");
+        }
+        const session = await deps.service.closeDirectAgentSession(
+          body.session_id,
+        );
+        writeJSON(res, 200, { ok: true, data: { session } });
+        return true;
+      }
+
+      // POST /api/hub/chat/agents/:id/message
+      if (method === "POST" && remainder === "message") {
+        const body = await readJSONBody<{
+          message?: unknown;
+          session_id?: unknown;
+        }>(req);
+        const message = checkChatMessage(body.message);
+        if (
+          typeof body.session_id !== "string" ||
+          body.session_id.length === 0
+        ) {
+          throw new HubValidationError("session_id required");
+        }
+        const result = await deps.service.sendDirectAgentMessage(
+          body.session_id,
+          message,
+        );
+        // The session bound by `body.session_id` MUST belong to
+        // `agentId`; the chat-service throws HubNotFoundError if not.
+        // Defense in depth: validate the session.agent_id matches the
+        // url path explicitly here.
+        if (result.session.agent_id !== agentId) {
+          throw new HubValidationError(
+            "session_id does not belong to this agent",
+          );
+        }
+        writeJSON(res, 200, { ok: true, data: result });
+        return true;
+      }
     }
 
     // No hub route matched.

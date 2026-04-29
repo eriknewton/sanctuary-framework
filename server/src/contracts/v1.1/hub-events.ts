@@ -119,6 +119,7 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
     | "policy_change"
     | "lockdown"
     | "unwrap"
+    | "direct_agent_session_open"
     | "other";
   /** ISO8601 deadline after which the request will be auto-denied if applicable. */
   deadline?: string;
