@@ -100,6 +100,11 @@ const state = {
       threadByAgentId: {},
       sessionByAgentId: {},
       pendingApprovalByAgentId: {},
+      // pendingResolveByAgentId tracks an in-flight inbox-resolve call
+      // (approve/deny) so the inline buttons can disable themselves and
+      // surface a busy label. Keyed by agent_id; values are
+      // "approve" | "deny" | undefined.
+      pendingResolveByAgentId: {},
       composer: "",
       sending: false,
       error: null
@@ -544,15 +549,32 @@ function renderDirectAgentChat(agent) {
     '</div>';
   }
 
-  // State 2: Tier 1 inbox item pending operator approval.
+  // State 2: Tier 1 inbox item pending operator approval. Render inline
+  // on the agent-detail panel so the operator can approve or deny without
+  // navigating to the dashboard inbox column. Per Erik directive
+  // 2026-04-29: approval surface lives where the agent context is.
   if (pendingInboxId) {
-    return '<div class="card">' +
-      '<h3>Direct chat</h3>' +
+    // Look up the inbox item so we can render the operator-facing prompt
+    // alongside the buttons. If the inbox feed has not arrived yet (race
+    // between session/start return and the SSE inbox event), fall back to
+    // the canonical Tier 1 prompt template.
+    const inboxItem = state.inbox.find(function (x) { return x.item_id === pendingInboxId; });
+    const promptText = inboxItem
+      ? renderTemplate(inboxItem.display_template_id, inboxItem.display_template_args)
+      : "Open a Tier 1 direct chat session with " + agent.agent_id + ".";
+    const pending = da.pendingResolveByAgentId && da.pendingResolveByAgentId[agent.agent_id];
+    const busy = pending ? ' disabled' : '';
+    const approveLabel = pending === "approve" ? "Approving..." : "Approve and open chat";
+    const denyLabel = pending === "deny" ? "Denying..." : "Deny";
+    return '<div class="card tier1-approval-card">' +
+      '<h3>Tier 1 approval required</h3>' +
+      '<p>' + escHtml(promptText) + '</p>' +
       errorBanner +
-      '<p>Tier 1 approval pending for direct chat with <span class="mono">' + escHtml(agent.agent_id) + '</span>. ' +
-        'Approve or deny it in the <a href="#dashboard">inbox</a>; ' +
-        'the chat surface opens here on approve.</p>' +
-      '<p class="muted mono">' + escHtml(pendingInboxId) + '</p>' +
+      '<div class="actions">' +
+        '<button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(pendingInboxId) + '"' + busy + '>' + escHtml(approveLabel) + '</button>' +
+        '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(pendingInboxId) + '"' + busy + '>' + escHtml(denyLabel) + '</button>' +
+      '</div>' +
+      '<p class="muted mono" style="margin-top:10px;font-size:11px;">' + escHtml(pendingInboxId) + '</p>' +
     '</div>';
   }
 
@@ -1066,12 +1088,22 @@ async function fetchActiveSessions() {
       if (s && s.agent_id && !s.closed_at) map[s.agent_id] = s;
     }
     state.chat.directAgent.sessionByAgentId = map;
-    // For any active session, hydrate the per-agent thread so the chat
-    // surface renders with full history on first paint instead of an
-    // empty pane that fills in after a separate round trip.
+    // When an active session is observed for an agent, clear any pending
+    // approval bookkeeping so renderDirectAgentChat falls into state-3
+    // (active session) cleanly. Without this, pendingApprovalByAgentId
+    // stays set after the inbox item resolves and the agent panel can
+    // briefly flash the approval card after the chat surface should be
+    // visible.
     const agentIds = Object.keys(map);
     for (let j = 0; j < agentIds.length; j++) {
-      await fetchDirectAgentHistory(agentIds[j]);
+      const aid = agentIds[j];
+      if (state.chat.directAgent.pendingApprovalByAgentId[aid]) {
+        delete state.chat.directAgent.pendingApprovalByAgentId[aid];
+      }
+      // Hydrate the per-agent thread so the chat surface renders with
+      // full history on first paint instead of an empty pane that fills
+      // in after a separate round trip.
+      await fetchDirectAgentHistory(aid);
     }
   } catch (e) {
     // 422 (chat not wired) leaves sessionByAgentId untouched.
@@ -1264,8 +1296,9 @@ function renderExitDrill() {
 function renderFortress() {
   const fortress = document.getElementById("fortress");
   if (!fortress) return;
-  const inboxRows = state.inbox.length
-    ? state.inbox.map(function (i) {
+  const visibleInbox = state.inbox.filter(function (i) { return !i.resolved; });
+  const inboxRows = visibleInbox.length
+    ? visibleInbox.map(function (i) {
         const text = renderTemplate(i.display_template_id, i.display_template_args);
         const actions = inboxActions(i);
         const buttons = actions.map(function (act) {
@@ -1406,6 +1439,24 @@ async function onAgentControl(agentId, action) {
 }
 
 async function onInboxAction(itemId, action) {
+  // Find the agent_id this inbox item is bound to (if any) so we can
+  // surface the in-flight busy state on the inline approval card and
+  // clean up pendingApprovalByAgentId after resolve. Look in the inbox
+  // first, then fall back to any pending-approval mapping (covers the
+  // race where the inbox SSE event has not yet arrived).
+  const item0 = state.inbox.find(function (x) { return x.item_id === itemId; });
+  let boundAgentId = (item0 && item0.agent_id) || null;
+  if (!boundAgentId) {
+    const map = state.chat.directAgent.pendingApprovalByAgentId || {};
+    const keys = Object.keys(map);
+    for (let i = 0; i < keys.length; i++) {
+      if (map[keys[i]] === itemId) { boundAgentId = keys[i]; break; }
+    }
+  }
+  if (boundAgentId && (action === "approve" || action === "deny")) {
+    state.chat.directAgent.pendingResolveByAgentId[boundAgentId] = action;
+    rerender();
+  }
   try {
     const r = await api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST", body: {} });
     // Tier 1 lockdown engagement: the approve handler triggers the controller
@@ -1421,6 +1472,13 @@ async function onInboxAction(itemId, action) {
       // activity feed. v1.1 ships projection-only.
       state.exitDrill.bundleResult = { bundle_dir: "(see activity feed)", manifest_hash: "" };
     }
+    // Clear pending-approval bookkeeping so the agent panel transitions
+    // out of the inline approval card. fetchActiveSessions called inside
+    // fetchAll will re-set sessionByAgentId for approve, dropping into
+    // state-3 (active session); deny falls into state-1 (CTA).
+    if (boundAgentId) {
+      delete state.chat.directAgent.pendingApprovalByAgentId[boundAgentId];
+    }
     await fetchAll();
     rerender();
   } catch (e) {
@@ -1429,6 +1487,11 @@ async function onInboxAction(itemId, action) {
       toast("Tier 1 items cannot be dismissed. Approve or deny.", "error");
     } else {
       toast("Inbox action failed: " + e.message, "error");
+    }
+  } finally {
+    if (boundAgentId) {
+      delete state.chat.directAgent.pendingResolveByAgentId[boundAgentId];
+      rerender();
     }
   }
 }
