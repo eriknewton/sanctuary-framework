@@ -337,102 +337,70 @@ Parallelization rules:
 
 ---
 
-## v1.2: Mobile Operator Companion + Operator-Facing v1.1 Surfaces
+## v1.2: Operator-Facing Surfaces + Intelligence Substrate
 
-The v1.1 acceptance audit (`Review/Sanctuary/V1.1.x_Operator_Path_Audit_Pass_B_2026-04-27.md`) and v1.2 scope brief (`Review/Sanctuary/V1.2_Scope_Brief_2026-04-27.md`) split v1.2 into four work packages: WP-V1.2-1 mobile companion (per the section below), WP-V1.2-2 channel-template binding flow (per-agent template-binding control in v1.1 dashboard + Tier 1 `policy_change` backend), WP-V1.2-3 unified approval inbox bridge (legacy `ApprovalGate` requests surfaced in v1.1 hub inbox with unified provenance), WP-V1.2-4 operator-facing coordination handoff (MCP tool or dashboard control to initiate signed handoff between wrapped agents).
+The v1.1 acceptance audit (`Review/Sanctuary/V1.1.x_Operator_Path_Audit_Pass_B_2026-04-27.md`), the v1.2 scope brief (`Review/Sanctuary/V1.2_Scope_Brief_2026-04-27.md`), and the Intelligence Layer Drift Audit (`Review/Sanctuary/Intelligence_Layer_Drift_Audit_and_Substrate_Resolution_2026-04-29.md`) define v1.2 as the milestone that lights up the operator-facing surfaces v1.1 wired but never powered.
 
-Recommended sequencing: WP-V1.2-2 first (smallest operator-visible gap; unblocks original v1.1 acceptance drill's Phase 2 shape), then WP-V1.2-4 (coordination library is solid), then WP-V1.2-3 (bridges multiple subsystems). WP-V1.2-1 mobile parallel-trackable per below.
+Mobile companion moves to v1.4 as a PWA (deferred per coordinator decision 2026-04-29 so the desktop ships feature-complete first). Sovereign Data Warehouse moves to v1.4 (pulled back per Erik directive 2026-04-29 evening so v1.3 can deliver advanced Sanctuary intelligence affordances first). Unified inbox bridge and coordination handoff visualization move to v1.3 (alongside sentinels and anomaly detection, where they pair more naturally).
 
-### WP-V1.2-1: Mobile Operator Companion
+Five WPs in v1.2:
 
-Mobile is pulled forward because operators want to communicate with and control agents from the phone. v1.2 is not a full mobile agent runtime.
+- **WP-V1.2-2 Channel-Template Binding Flow** (operator picks a channel template per wrapped agent in the Policy Center; Tier 1 `policy_change` approval fires; activity feed records the binding). Library reconciliation rides along: the v1.1 internal template IDs are retired in favor of the six design-canonical templates surfaced in the Policy Center.
+- **WP-V1.2-4a+b Operator Chat (concierge + direct-agent)** — concierge surface (Dashboard nav default; operator talks to Sanctuary in plain English about agent activity, gets summaries, fires actions); direct-agent surface (Agents view, click an agent, talk directly to it; Tier 1 gated). Both consume the substrate selector from WP-V1.2-5 for the LLM call.
+- **WP-V1.2-5 Intelligence Substrate Selector** (the architecture, not a substrate). Operator picks per surface among local model (Ollama with bundled Gemma 2 2B + Phi-4 Mini), Venice.ai (privacy-respecting hosted; named composition partner per Erik directive 2026-04-29), operator-frontier with Privacy Filter Tier 2 redaction, or hybrid per-surface routing. Selector ships with operator-facing tradeoff transparency UI; per-operator marketing claims become defensible only via this surface.
+- **Telegram bridge stopgap** (separate brief at `Review/Sanctuary/Telegram_Mobile_Channel_Stopgap_Brief_2026-04-29.md`; queued behind v1.2-2 + v1.2-4 + v1.2-5; ships any free Codex window during the v1.2 cycle). Ports approval-needed events to a Telegram bot so the operator gets phone notifications + remote approval before the PWA mobile companion lands in v1.4.
 
-The phone is the operator key, inbox, approval surface, alert surface, and emergency brake.
+Recommended sequencing: WP-V1.2-2 first (well-bounded; library reconciliation alongside picker UI), then WP-V1.2-5 (substrate selector unblocks chat), then WP-V1.2-4a+b in parallel as soon as the substrate selector's local-model integration is stable. Coordination handoff visualization (formerly WP-V1.2-4c) defers to v1.3.
 
-Capabilities:
+v1.2 acceptance gate:
 
-- QR pairing from local dashboard
-- Scoped mobile-control grant recorded by the fortress
-- Mobile inbox for approvals, blocked egress, privacy events, budget warnings, recovery prompts, and agent errors
-- Push notifications with generic payloads only; no sensitive query text, tool args, filenames, client names, or secrets
-- Biometric approval for Tier 1 and Tier 2 actions where platform support exists
-- Emergency pause, deny-all-pending, and lockdown controls
-- Status and audit summaries
-- Recovery and export assistance
-
-Dependency:
-
-The v1.1 hub APIs must be stable before native mobile work begins. A mobile-responsive dashboard or PWA may ship earlier if it does not distort the API design.
-
-Gate:
-
-An operator pairs a phone, receives a generic approval notification, opens the app, reviews details fetched from the local fortress or approved relay, approves with biometric unlock, and can revoke the phone from the dashboard.
+An operator wraps two harnesses, picks an intelligence substrate (any of the four options, with the tradeoff visible at selection), uses the concierge to ask "what did agent X do today" and gets a real summary, clicks an agent in Agents view to open direct chat, types a message, gets a response with a Tier 1 approval gate honored. The operator binds a channel template to a wrapped agent through the Policy Center and sees the binding reflected in the Per-agent rules table and the activity feed. The substrate selector's transparency UI shows the per-surface routing the operator chose. Privacy Filter Tier 2 works (regex Tier 1 always; Tier 2 routed per substrate selection).
 
 ---
 
-## v1.3: Sovereign Data Warehouse
+## v1.3: Advanced Sanctuary Intelligence
 
-The agent's durable record belongs to the operator. v1.3 builds the substrate so the operator's working data, query history, document corpus, and intermediate state live in a place the operator controls, not in a vendor's silo.
+v1.3 is every Sanctuary-native sovereignty affordance the operator can see, configure, and audit. The library substrate (audit log, policy engine, channel templates, coordination primitives) shipped in v1.0 and v1.1; the substrate selector ships in v1.2. v1.3 builds the intelligence layer on top.
 
-This is the precondition for public federation to be operationally meaningful. Two operators federating empty fortresses is a demo. Two operators federating fortresses that hold their actual work is a network.
+Per the Intelligence Layer Drift Audit (2026-04-29), this milestone closes the drift identified in twelve drift-catalog rows by sequencing the locked-2026-04-20 sentinel, anomaly, English-gate, honeypot, and auto-trigger affordances into a coherent operator-facing intelligence release.
 
-### 1. Ingestion Adapter Template
+Seven WPs in v1.3:
 
-Capabilities:
+- **WP-V1.3-1 Sentinel Baseline Pack** — five baseline sentinels (egress-volume watcher, credential-usage watcher, cross-agent-chatter watcher, suspicious-tool-call detector, anomaly-trigger). Each ships as a default-installable agent that uses the substrate selector. Operator subscribes via the Sanctuary dashboard; sentinels are inward-facing only (no external network access) and surface findings to the unified inbox.
+- **WP-V1.3-2 Anomaly Detection Pipeline** — per-agent feature classifier with local pattern learning, drift detection, and operator-visible alerts. Sovereignty-critical: ML training stays on the operator's machine; never centrally aggregated.
+- **WP-V1.3-3 Coordination Handoff Visualization** (formerly v1.2-4c) — read-only Coordination view rendering handoff log, per-handoff context-transfer breakdown (transferred vs withheld), and workflow state.
+- **WP-V1.3-4 Unified Approval Inbox Bridge** (formerly v1.2-3) — bridges legacy ApprovalGate and v1.1 hub inbox with unified provenance. Operator sees approvals, blocked egress, privacy events, budget warnings, recovery prompts, agent errors, and sentinel findings in one stream.
+- **WP-V1.3-5 Honeypot Authoring** (pulled forward from v1.4 per Erik directive 2026-04-29 evening) — operator writes a honeypot in plain English; LLM compiles to a runtime trap; integrates with the sentinel layer. Uses the substrate selector.
+- **WP-V1.3-6 English-Authored Gates** (pulled forward from v1.4 per Erik directive 2026-04-29 evening) — operator writes a custom policy in plain English; LLM compiles to a structured rule and synthesizes the operator-facing explanation. Uses the substrate selector. Templates remain the v1.2 default for the six canonical channel templates; English-authored gates layer on top for custom policies.
+- **WP-V1.3-7 Auto-Trigger Ladder + Threshold Calibration** (pulled forward from v1.4 per Erik directive 2026-04-29 evening) — operator-configurable thresholds for sentinels and anomaly detection. Calibration UI lets the operator move rules from operator-approved to auto-action incrementally as confidence builds.
 
-- Pluggable adapter interface for pulling vendor-side state (chat history, document corpus, project state, query logs) into the operator's fortress
-- Per-source provenance envelope recording when each record was ingested, from where, and under which credential
-- Operator-controlled scheduling, retention, and deletion
-- Audit entries for every ingestion event
+v1.3 acceptance gate:
 
-### 2. Sovereign Data Lake Schema And Indexing Primitive
-
-Capabilities:
-
-- Operator-sovereign storage layout for ingested and locally generated data
-- Cross-source query routing that preserves provenance in the result
-- Vendor-state and operator-state separation at the schema layer
-- Slice-scope policy DSL extension so policies bind to data slices, not just to actions
-- Local index suitable for the working sizes a single operator generates
-
-This is the load-bearing surface. Schema design is a real research project, not a port of an existing pattern.
-
-### 3. Continuous-Sync Orchestration
-
-Capabilities:
-
-- Workflow primitive for long-running sync jobs across vendor sources
-- Composes with the v1.1 internal coordination layer for multi-step sync workflows
-- Failure modes that degrade gracefully without losing provenance
-- Operator-visible status and intervention surface
-
-Substrate selection is informed by parallel composition mapping research. The sync layer composes with an external workflow engine rather than building one in-tree.
-
-### v1.3 Acceptance Gate
-
-A pilot ingests a meaningful slice of one vendor's data into their fortress, queries it locally with provenance preserved, applies a slice-scope policy, runs a multi-step sync, and demonstrates that the data continues to be available after the vendor relationship ends.
+The operator subscribes a sentinel; the sentinel observes agent activity and reports a finding via the unified inbox. Anomaly detection identifies an intentional drift (operator triggers a deviant tool call) and surfaces an alert. The Coordination view shows a multi-agent handoff history with full provenance. The operator authors a honeypot in plain English and watches it fire on trigger. The operator authors a custom policy gate in plain English and sees the LLM-compiled rule plus operator-facing explanation. The auto-trigger ladder honors the operator's threshold configuration.
 
 ---
 
-## v1.4: Public Federation
+## v1.4: Reach — Mobile, Federation, Sovereign Data Warehouse
 
-Public federation is the outside-world coordination layer. Independent Sanctuary operators can let agents discover, message, verify, or transact across fortress boundaries without joining one central platform.
+v1.4 extends the fortress beyond the local single-operator deployment. Mobile reaches your phone. Public federation reaches other operators. Sovereign Data Warehouse reaches data sources beyond the agent loop. All three are about the fortress reaching outward while the operator's sovereignty stays intact.
 
-This is important for the future of agent-to-agent interaction, but it is delayed until local privacy, operator control, internal coordination, exit, and operator-owned data are solid.
+SDW pushed back from v1.3 per Erik directive 2026-04-29 evening so v1.3 can deliver the advanced Sanctuary intelligence affordances first. Mobile pushed back from v1.2 per coordinator decision 2026-04-29 so the desktop ships feature-complete first.
 
-Capabilities:
+Three WPs in v1.4:
 
-- Cross-operator discovery
-- Signed inter-fortress messaging
-- Public or semi-public agent pools
-- Reputation exchange
-- Anonymized wants and requests
-- Abuse, spam, and rate controls
-- Policy-enforced disclosure envelopes for anything crossing the boundary
+- **WP-V1.4-1 PWA Mobile Companion** (formerly WP-V1.2-1) — phone as operator key, inbox, approval surface, alert surface, emergency brake. PWA implementation: install on home screen, push notifications via Web Push API, biometric unlock via WebAuthn / passkeys, QR pairing from the desktop dashboard. Defers native iOS/Android indefinitely; PWA on iOS 16.4+ and current Android covers the operator-control scope. Telegram bridge from v1.2 stops being load-bearing once the PWA ships but stays available as an alternate notification channel.
+- **WP-V1.4-2 Public Federation** — cross-operator discovery, signed inter-fortress messaging, public or semi-public agent pools, reputation exchange, anonymized wants and requests, abuse and rate controls, policy-enforced disclosure envelopes for anything crossing the boundary. Per the Federation Protocol v0.1 spec already shipped (`Review/Sanctuary/Federation_Protocol_V0.1_Spec_2026-04-21.md`).
+- **WP-V1.4-3 Sovereign Data Warehouse** (pushed from v1.3 per Erik directive 2026-04-29 evening). The agent's durable record belongs to the operator. SDW builds the substrate so the operator's working data, query history, document corpus, and intermediate state live in a place the operator controls, not in a vendor's silo. Composes with the v1.2 substrate selector: the operator's local model handles SDW queries; Venice or frontier-with-filter available for capability-heavy SDW analysis.
 
-Gate:
+  Three sub-deliverables:
 
-Two independent operators complete a signed cross-fortress interaction where each side controls what identity, query content, reputation, commitments, and audit receipts leave its fortress.
+  - **Ingestion Adapter Template** — pluggable adapter interface for pulling vendor-side state (chat history, document corpus, project state, query logs) into the operator's fortress. Per-source provenance envelope. Operator-controlled scheduling, retention, deletion. Audit entries on every ingestion event.
+  - **Sovereign Data Lake Schema And Indexing Primitive** — operator-sovereign storage layout for ingested and locally generated data. Cross-source query routing preserves provenance. Vendor-state and operator-state separated at the schema layer. Slice-scope policy DSL extension so policies bind to data slices, not just actions. Local index suitable for working sizes a single operator generates. (Schema design is a real research project, not a port.)
+  - **Continuous-Sync Orchestration** — workflow primitive for long-running sync jobs across vendor sources. Composes with the v1.1 internal coordination layer for multi-step sync. Failure modes degrade without losing provenance. Operator-visible status and intervention surface.
+
+v1.4 acceptance gate:
+
+An operator pairs a phone, receives a generic approval notification, opens the PWA, reviews details fetched from the local fortress, approves with biometric unlock, and can revoke the phone from the desktop dashboard. Two independent operators complete a signed cross-fortress interaction where each side controls what identity, query content, reputation, commitments, and audit receipts leave the fortress. A pilot ingests a meaningful slice of one vendor's data into the fortress, queries it locally with provenance preserved, applies a slice-scope policy, runs a multi-step sync, and demonstrates the data continues to be available after the vendor relationship ends.
 
 ---
 
