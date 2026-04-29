@@ -29,6 +29,7 @@ import type {
   LocalHarnessKind,
 } from "../contracts/v1.1/local-agent-records.js";
 import type { ChannelTemplateId } from "../policy-engine/constants.js";
+import type { OperatorChatService } from "../chat/operator-chat-service.js";
 
 // -----------------------------------------------------------------------
 // Agent control
@@ -332,6 +333,32 @@ export interface HubServiceDeps {
    * Defaults to `() => new Date()` when omitted.
    */
   now?: () => Date;
+  /**
+   * Optional operator-chat service. When supplied, the hub exposes the
+   * concierge + direct-agent chat endpoints; when omitted, those routes
+   * return HubCapabilityError. Construction-time injection lets the
+   * dashboard wiring layer build the chat service against the same
+   * audit log + master key + storage backend as the rest of the v1.1
+   * hub without forcing the chat-service constructor through a circular
+   * import.
+   */
+  operatorChat?: OperatorChatService;
+}
+
+/**
+ * Result returned from `requestDirectAgentSession`. The session is
+ * created only after the Tier 1 inbox item is approved; before approval
+ * the caller polls the inbox or waits for the session-open audit event.
+ *
+ * On approval the operator-chat-service emits `direct_agent_session_open`
+ * with the assigned `session_id`; consumers that need the id before the
+ * inbox flow lands MUST wait for that event.
+ */
+export interface HubDirectAgentSessionRequestResult
+  extends HubTier1ApprovalEnqueuedResult {
+  operation_category: "direct_agent_session_open";
+  /** Operator-configured expiry; defaults to 1 hour from approval. */
+  requested_expires_at?: string;
 }
 
 // -----------------------------------------------------------------------

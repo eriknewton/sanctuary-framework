@@ -47,6 +47,17 @@ export const HUB_ROUTES = {
    */
   FORTRESS_LOCKDOWN: "/api/hub/fortress/lockdown",
   FORTRESS_EXIT_BUNDLE_EXPORT: "/api/hub/fortress/exit-bundle/export",
+  /**
+   * Operator chat routes (WP-V1.2-4). Concierge is fortress-scoped;
+   * direct-agent chat is per-agent and Tier 1 gated on session-open.
+   */
+  CHAT_CONCIERGE_SEND: "/api/hub/chat/concierge",
+  CHAT_CONCIERGE_HISTORY: "/api/hub/chat/concierge/history",
+  CHAT_AGENT_HISTORY: "/api/hub/chat/agents/:id/history",
+  CHAT_AGENT_SESSION_START: "/api/hub/chat/agents/:id/session/start",
+  CHAT_AGENT_SESSION_END: "/api/hub/chat/agents/:id/session/end",
+  CHAT_AGENT_SESSION_MESSAGE: "/api/hub/chat/agents/:id/message",
+  CHAT_SESSIONS_LIST: "/api/hub/chat/sessions",
 } as const;
 
 /**
@@ -124,6 +135,14 @@ export const HUB_AGENTS_MAX_LIMIT = 500;
  * Maximum JSON request body size for any hub mutation.
  */
 export const HUB_MAX_REQUEST_BODY_BYTES = 256 * 1024;
+
+/**
+ * Maximum length (chars) of a single operator chat message body. Set
+ * conservatively at v1.2; the substrate selector's per-surface request
+ * envelope caps will narrow further. Operator-typed bodies above this
+ * threshold are rejected at the route layer with `HubValidationError`.
+ */
+export const HUB_CHAT_MESSAGE_MAX_CHARS = 4000;
 
 /**
  * Display-template-id namespaces. Backends emit ids drawn from these
