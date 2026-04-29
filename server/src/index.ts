@@ -661,6 +661,10 @@ export async function createSanctuaryServer(options?: {
         // invocations against this same fortress.
         storagePath: config.storage_path,
         ...(intelligenceSelector ? { intelligenceSelector } : {}),
+        // WP-V1.2-4: forward storage + master key so chat service is
+        // constructed and the /api/hub/chat/* routes light up.
+        storage,
+        masterKey,
       }),
     );
     await dashboard.start();

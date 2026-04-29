@@ -43,6 +43,17 @@ import {
 import type { ChannelTemplateId } from "../../policy-engine/constants.js";
 import type { HubAgentStatus } from "../../contracts/v1.1/constants.js";
 import type { SubstrateSelector } from "../../intelligence/selector.js";
+import type { StorageBackend } from "../../storage/interface.js";
+import {
+  OperatorChatService,
+  OperatorChatStore,
+  type ConciergeContextProviders,
+  type ConciergePiiFilter,
+} from "../../chat/operator-chat-index.js";
+import {
+  detectSensitiveSpans,
+  detectorClassForSpan,
+} from "../../l2-operational/privacy-filter.js";
 
 export interface BuildV11BindingsInputs {
   /** Operator identity id this hub is scoped to. */
@@ -73,6 +84,20 @@ export interface BuildV11BindingsInputs {
    * surfaces a "not configured" state instead of failing to render.
    */
   intelligenceSelector?: SubstrateSelector;
+  /**
+   * Fortress storage backend. Required to wire the v1.2 operator chat
+   * surfaces (encrypted thread persistence under the reserved `_chat`
+   * namespace). Omit at construction time if the caller wants the v1.1
+   * hub surface only; chat routes return HubCapabilityError until the
+   * service is wired.
+   */
+  storage?: StorageBackend;
+  /**
+   * Fortress master key. Required to wire the v1.2 operator chat
+   * surfaces (HKDF-derived purpose key for encrypted thread storage).
+   * Omit and the chat service is not constructed.
+   */
+  masterKey?: Uint8Array;
 }
 
 export interface V11Bindings {
@@ -85,6 +110,13 @@ export interface V11Bindings {
    * 503 with a "selector not configured" body.
    */
   intelligenceSelector?: SubstrateSelector;
+  /**
+   * Optional Operator Chat Service. Constructed when storage + masterKey
+   * are passed to `buildV11Bindings`. The HubService accepts this
+   * directly via its `operatorChat` dep; callers that want the harness-
+   * side `recordAgentReply` integration also need the service handle.
+   */
+  operatorChatService?: OperatorChatService;
 }
 
 class CapabilityErrorAgentController implements HubAgentController {
@@ -147,6 +179,32 @@ export function buildV11Bindings(
       ? (records: ReturnType<typeof readPersistedLocalAgents>) =>
           writePersistedLocalAgents(storagePath, records)
       : undefined;
+
+  // WP-V1.2-4: construct the operator-chat service when the caller has
+  // wired the fortress storage + master key. Concierge surface depends
+  // on the substrate selector for the LLM call; when no selector is
+  // wired the service still works for direct-agent and concierge
+  // returns the honest "Concierge unavailable; substrate not configured"
+  // surface so the chat history reflects exactly what the operator sees.
+  let operatorChatService: OperatorChatService | undefined;
+  if (inputs.storage && inputs.masterKey) {
+    const chatStore = new OperatorChatStore(inputs.storage, inputs.masterKey);
+    operatorChatService = new OperatorChatService({
+      store: chatStore,
+      auditLog: inputs.auditLog,
+      identityId: inputs.identityId,
+      ...(inputs.intelligenceSelector
+        ? { substrateSelector: inputs.intelligenceSelector }
+        : {}),
+      conciergeContextProviders: buildConciergeContextProviders({
+        auditLog: inputs.auditLog,
+        identityId: inputs.identityId,
+        registry,
+      }),
+      conciergePiiFilter: buildConciergePiiFilter(),
+    });
+  }
+
   const hubService = new HubService({
     identityId: inputs.identityId,
     fortressId: inputs.fortressId,
@@ -170,6 +228,7 @@ export function buildV11Bindings(
       listBudgetSummaries: () => [],
     },
     agentController: new CapabilityErrorAgentController(),
+    ...(operatorChatService ? { operatorChat: operatorChatService } : {}),
   });
   return {
     hubService,
@@ -178,6 +237,87 @@ export function buildV11Bindings(
     ...(inputs.intelligenceSelector
       ? { intelligenceSelector: inputs.intelligenceSelector }
       : {}),
+    ...(operatorChatService ? { operatorChatService } : {}),
+  };
+}
+
+/**
+ * Stitch fortress state into plain text for the concierge prompt. Each
+ * provider returns a free-form string; the chat service folds the three
+ * together with newlines. Keeping the prompt-shape decisions out of the
+ * chat service (which stays storage/registry-agnostic) lets the
+ * dashboard team iterate concierge prompts without touching the service
+ * layer.
+ */
+function buildConciergeContextProviders(args: {
+  auditLog: AuditLog;
+  identityId: string;
+  registry: InMemoryLocalAgentRegistry;
+}): ConciergeContextProviders {
+  return {
+    recentActivity: async () => {
+      const result = await args.auditLog.query({ limit: 30 });
+      const lines = result.entries
+        .filter((e) => e.identity_id === args.identityId)
+        .slice(-30)
+        .map((e) => {
+          const agentId =
+            (e.details && typeof e.details["agent_id"] === "string"
+              ? (e.details["agent_id"] as string)
+              : null) ?? "_fortress";
+          return `${e.timestamp}  ${e.layer}.${e.operation}  agent=${agentId}  result=${e.result}`;
+        });
+      if (lines.length === 0) return "(no recent activity)";
+      return lines.join("\n");
+    },
+    agentInventory: async () => {
+      const records = args.registry.list({ identity_id: args.identityId });
+      if (records.length === 0) return "(no wrapped agents)";
+      const lines = records.map((r) => {
+        const tmpl =
+          typeof r.channel_template_id === "string"
+            ? r.channel_template_id
+            : "no_template";
+        return `${r.agent_id}  harness=${r.harness}  status=${r.status}  template=${tmpl}`;
+      });
+      return lines.join("\n");
+    },
+    openInbox: async () => {
+      // The inbox sources in v1.1.x wiring return empty arrays by
+      // default; the concierge surface degrades to an honest "(no
+      // open inbox items)" until the inbox aggregator is wired.
+      return "(no open inbox items)";
+    },
+  };
+}
+
+/**
+ * Tier 1 regex-only PII redactor for the concierge query path. Wraps
+ * the existing `detectSensitiveSpans` shipped in
+ * `l2-operational/privacy-filter.ts`. Tier 2 NER + LLM redaction lives
+ * in the substrate-selector layer (substrate-routed); the concierge
+ * surface invokes Tier 1 here as defense-in-depth pre-substrate.
+ *
+ * Replacement strategy: each detected span is replaced with
+ * `[REDACTED:CLASS]` markers (e.g. `[REDACTED:EMAIL]`) so the substrate
+ * sees the structure of the redaction without the underlying value.
+ */
+function buildConciergePiiFilter(): ConciergePiiFilter {
+  return {
+    filter(input: string): { filtered: string; redactions: number } {
+      const spans = detectSensitiveSpans(input);
+      if (spans.length === 0) return { filtered: input, redactions: 0 };
+      const sorted = [...spans].sort((a, b) => b.start - a.start);
+      let result = input;
+      for (const span of sorted) {
+        const cls = detectorClassForSpan(span.class).toUpperCase();
+        result =
+          result.slice(0, span.start) +
+          `[REDACTED:${cls}]` +
+          result.slice(span.end);
+      }
+      return { filtered: result, redactions: spans.length };
+    },
   };
 }
 
