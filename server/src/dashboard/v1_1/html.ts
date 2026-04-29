@@ -220,12 +220,61 @@ body {
 .toggle-on { display: inline-block; width: 28px; height: 16px; border-radius: 999px; background: var(--sage); position: relative; }
 .toggle-on::after { content: ""; position: absolute; right: 2px; top: 2px; width: 12px; height: 12px; border-radius: 50%; background: var(--surface); }
 .error-text { color: var(--rust); margin: 8px 0 0; }
+.intel-center { max-width: 980px; margin: 0 auto; }
+.intel-center .eyebrow { margin: 0 0 6px; color: var(--ink-3); font-family: var(--mono); font-size: 12px; letter-spacing: 0; }
+.intel-center h1 { font-family: var(--serif); font-size: 36px; line-height: 1.08; font-weight: 400; margin: 0 0 10px; }
+.intel-subtitle { max-width: 860px; color: var(--ink-2); font-size: 15px; margin: 0 0 24px; }
+.intel-panel { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--rad-lg); padding: 20px; margin: 18px 0; }
+.intel-panel h2 { font-family: var(--serif); font-size: 22px; font-weight: 400; margin: 0 0 14px; }
+.intel-row { display: grid; grid-template-columns: 200px 1fr auto; gap: 16px; padding: 14px 0; border-bottom: 1px solid var(--rule); align-items: start; }
+.intel-row:last-child { border-bottom: 0; }
+.intel-row-name { font-weight: 600; }
+.intel-row-name small { display: block; color: var(--ink-3); font-weight: 400; font-size: 12px; margin-top: 2px; font-family: var(--mono); }
+.intel-row-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.intel-row-current { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.intel-row-tradeoff { color: var(--ink-2); font-size: 13px; line-height: 1.5; }
+.intel-status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; }
+.intel-status-dot.green { background: var(--sage); }
+.intel-status-dot.yellow { background: var(--ochre); }
+.intel-status-dot.red { background: var(--rust); }
+.intel-hardware { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; font-size: 13px; }
+.intel-hardware dt { color: var(--ink-3); font-family: var(--mono); }
+.intel-hardware dd { margin: 0; }
+.intel-modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 1100;
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 40px 16px; overflow-y: auto;
+}
+.intel-modal {
+  background: var(--surface); border: 1px solid var(--rule-2); border-radius: var(--rad-lg);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.18); padding: 24px;
+  width: 100%; max-width: 640px;
+}
+.intel-modal h2 { font-family: var(--serif); font-size: 22px; font-weight: 400; margin: 0 0 8px; }
+.intel-modal-subtitle { color: var(--ink-3); margin: 0 0 18px; font-size: 13px; }
+.intel-option {
+  border: 1px solid var(--rule); border-radius: var(--rad); padding: 12px;
+  margin-bottom: 10px; background: var(--surface-2); cursor: pointer;
+  display: grid; grid-template-columns: 18px 1fr; gap: 10px; align-items: start;
+}
+.intel-option.selected { border-color: var(--ink); background: var(--surface); }
+.intel-option-body strong { display: block; font-size: 14px; margin-bottom: 4px; }
+.intel-option-body small { display: block; color: var(--ink-3); font-size: 12px; line-height: 1.5; }
+.intel-suboptions { margin-top: 10px; padding: 10px; background: var(--paper-3); border-radius: var(--rad); }
+.intel-suboptions label { display: block; margin: 6px 0; font-size: 13px; }
+.intel-suboptions input[type="text"], .intel-suboptions input[type="password"] {
+  width: 100%; padding: 6px 8px; border: 1px solid var(--rule); border-radius: var(--rad);
+  font-family: var(--mono); font-size: 12px; box-sizing: border-box;
+}
+.intel-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 @media (max-width: 1100px) {
   .app, .app.route-full { grid-template-columns: 56px 1fr; grid-template-areas: "sidebar topbar" "sidebar main"; }
   .fortress { display: none; }
   .sidebar h1, .sidebar nav a span { display: none; }
   .template-grid { grid-template-columns: 1fr; }
   .policy-center h1 { font-size: 30px; }
+  .intel-center h1 { font-size: 30px; }
+  .intel-row { grid-template-columns: 1fr; }
 }
 `;
 
@@ -238,6 +287,7 @@ const NAV_ITEMS: Array<{ id: string; label: string }> = [
   { id: "dashboard", label: "Dashboard" },
   { id: "agents", label: "Agents" },
   { id: "policy", label: "Policy" },
+  { id: "intelligence", label: "Intelligence" },
   { id: "privacy", label: "Privacy" },
   { id: "coordination", label: "Coordination" },
   { id: "health", label: "Health" },

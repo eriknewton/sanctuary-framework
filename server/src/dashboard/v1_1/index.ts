@@ -34,3 +34,8 @@ export {
   type HubActivityStreamEvent,
 } from "./sse-events.js";
 export { getClientScript } from "./client.js";
+export {
+  handleIntelligenceRoute,
+  INTELLIGENCE_API_PREFIX,
+  type IntelligenceRouterDeps,
+} from "./intelligence-api-router.js";
