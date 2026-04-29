@@ -78,6 +78,8 @@ import {
 import { LocalSubstrate, OllamaClient, LOCAL_CAPABILITY } from "./substrates/local.js";
 import { VeniceClient, VeniceSubstrate, VENICE_CAPABILITY, VENICE_DEFAULT_ENDPOINT, VENICE_DEFAULT_MODEL } from "./substrates/venice.js";
 import { FrontierClient, FrontierWithFilterSubstrate, FRONTIER_CAPABILITY, FRONTIER_DEFAULT_MODELS, type FrontierRedactor } from "./substrates/frontier.js";
+import { resolveHybridChoice, validateHybridRules } from "./substrates/hybrid/per-surface-router.js";
+import type { HybridRoutingRules } from "./types.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type {
   IntelligenceAuditPayload,
@@ -252,6 +254,29 @@ export class SubstrateSelector {
     if (apiKey === null) delete next[provider];
     else next[provider] = apiKey;
     this.config = { ...this.config, frontierConfig: next };
+    await this.store.save(this.config);
+  }
+
+  /**
+   * Set the hybrid routing rules. The picker modal calls this when the
+   * operator saves the hybrid configuration tab. Validates the rules
+   * (every surface bound, no `hybrid` recursion) before persist; throws
+   * on invalid input so the operator-facing form can surface the failure.
+   *
+   * Setting rules does NOT change any surface's per-surface choice; the
+   * operator must also pick `hybrid` for the surfaces they want routed
+   * through these rules. This separation keeps the flow obvious in the
+   * UI (set rules + then choose hybrid for each surface that should use
+   * them) and lets the operator test rule changes without mass-flipping
+   * surfaces to hybrid.
+   */
+  async setHybridRules(rules: HybridRoutingRules): Promise<void> {
+    await this.ensureLoaded();
+    const validation = validateHybridRules(rules);
+    if (!validation.ok) {
+      throw new Error(`invalid hybrid rules: ${validation.reason}`);
+    }
+    this.config = { ...this.config, hybridRules: rules };
     await this.store.save(this.config);
   }
 
@@ -479,7 +504,7 @@ export class SubstrateSelector {
     if (choice === "venice") return this.veniceHandle(surface);
     if (choice === "frontier-with-filter") return this.frontierHandle(surface);
     if (choice === "hybrid") {
-      const sub = this.config.hybridRules?.perSurface[surface];
+      const sub = resolveHybridChoice(this.config.hybridRules, surface);
       if (sub) return this.buildHandle(surface, sub);
       return this.disabledHandle(surface);
     }
@@ -608,7 +633,7 @@ export class SubstrateSelector {
         failureClass = "substrate_misconfigured";
       }
     } else if (choice === "hybrid") {
-      const sub = this.config.hybridRules?.perSurface[surface];
+      const sub = resolveHybridChoice(this.config.hybridRules, surface);
       if (!sub) {
         health = "unavailable";
         failureClass = "substrate_misconfigured";

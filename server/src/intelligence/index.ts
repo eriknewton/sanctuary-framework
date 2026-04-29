@@ -103,6 +103,13 @@ export {
   type FrontierRedactor,
 } from "./substrates/frontier.js";
 
+export {
+  resolveHybridChoice,
+  buildHybridRules,
+  validateHybridRules,
+  type HybridResolvedChoice,
+} from "./substrates/hybrid/per-surface-router.js";
+
 export type {
   IntelligenceAuditPayload,
   IntelligenceAuditPayloadHeader,
