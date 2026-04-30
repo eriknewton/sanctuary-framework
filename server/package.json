@@ -19,6 +19,7 @@
   },
   "files": [
     "dist",
+    "scripts/sanctuary-chat-stop-hook.sh",
     "README.md",
     "LICENSE"
   ],

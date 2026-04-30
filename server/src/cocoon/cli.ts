@@ -140,6 +140,20 @@ export interface WrapOptions {
    * default unchanged.
    */
   devDist?: string;
+  /**
+   * v1.2.0 F10: install the Sanctuary chat-autonomy Stop hook at
+   * `~/.claude/settings.json` so a Claude Code wrap drains the operator
+   * chat inbox automatically at every turn-end.
+   *
+   * Default: ON for `--platform claude-code`, OFF for every other
+   * platform (no equivalent hook surface). Tri-state to distinguish
+   * "operator opted in / out explicitly" from "default applies":
+   *
+   *   undefined → apply default (on for claude-code, off otherwise)
+   *   true      → install (claude-code: install; non-claude-code: warn)
+   *   false     → do not install (operator opted out via --no-install-hooks)
+   */
+  installHooks?: boolean;
 }
 
 /** Backward-compat alias for the old `parseCocoonArgs` return type. */
@@ -249,6 +263,15 @@ export interface RunWrapDeps {
    * undefined.
    */
   rewriteConfig?: typeof rewriteConfigForCocoon;
+  /**
+   * Override the Claude Code Stop hook installer (v1.2.0 F10). Production
+   * uses the bundled `installClaudeCodeStopHook`; tests inject a stub to
+   * assert the call shape without touching the developer's real
+   * ~/.claude/settings.json.
+   */
+  installClaudeCodeStopHook?: (
+    opts: import("./claude-code-hooks.js").InstallClaudeCodeHookOptions,
+  ) => Promise<import("./claude-code-hooks.js").InstallClaudeCodeHookResult>;
 }
 
 export async function runWrap(
@@ -622,6 +645,71 @@ export async function runWrap(
     backupPath
   );
   if (!verifyOk) process.exit(1);
+
+  // v1.2.0 F10: install the Sanctuary chat-autonomy Stop hook at
+  // ~/.claude/settings.json so direct-agent chat drains the operator
+  // inbox at every Claude turn-end. Default ON for --claude-code, OFF
+  // for every other platform (no equivalent hook surface today).
+  // Operator opt-out via `--no-install-hooks`.
+  //
+  // Best-effort: hook install failures do not fail wrap. The harness
+  // MCP-config registration is the load-bearing surface; the hook is
+  // opt-in autonomy. Errors surface on stderr so the operator can
+  // re-run or install manually.
+  const hooksRequested = options.installHooks;
+  const isClaudeCode = agentConfig.platform === "claude-code";
+  const shouldInstallHooks =
+    hooksRequested === true ||
+    (hooksRequested === undefined && isClaudeCode);
+
+  if (shouldInstallHooks && !isClaudeCode) {
+    console.error(
+      `\n  Note: --install-hooks is only supported for --claude-code today. ` +
+        `For ${agentConfig.platform}, see server/docs/operator-chat-setup.md ` +
+        `for the per-harness system-prompt augmentation snippet.\n`,
+    );
+  } else if (shouldInstallHooks && isClaudeCode) {
+    try {
+      const installFn =
+        deps.installClaudeCodeStopHook ??
+        (async (o) => {
+          const { installClaudeCodeStopHook } = await import(
+            "./claude-code-hooks.js"
+          );
+          return installClaudeCodeStopHook(o);
+        });
+      const result = await installFn({
+        agentId: chatAgentId,
+        identityId: "sanctuary-chat",
+        fortressPath: storagePath,
+      });
+      if (result.alreadyPresent && !result.envUpdated) {
+        console.error(
+          `  Stop hook already present at ${result.installedAt} (Sanctuary chat autonomy). No change.`,
+        );
+      } else if (result.alreadyPresent && result.envUpdated) {
+        console.error(
+          `  Stop hook refreshed at ${result.installedAt} (Sanctuary chat autonomy; env updated for current fortress).`,
+        );
+      } else {
+        console.error(
+          `  Stop hook installed at ${result.installedAt} (Sanctuary chat autonomy). Remove with sanctuary unwrap --remove-hooks.`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        `  Note: Stop hook install failed (${(err as Error).message}). ` +
+          `Direct-agent chat still works; the autonomous wake on Claude turn-end is skipped. ` +
+          `Re-run \`sanctuary wrap --install-hooks\` to retry, or pin the system-prompt augmentation ` +
+          `from server/docs/operator-chat-setup.md as a fallback.`,
+      );
+    }
+  } else if (hooksRequested === false && isClaudeCode) {
+    console.error(
+      `  Stop hook NOT installed (--no-install-hooks). ` +
+        `See server/docs/operator-chat-setup.md for manual setup options.`,
+    );
+  }
 
   // v1.1.5 (Finding Z): persist a v1.1 hub `LocalAgentRecord` so the
   // dashboard's Agents view (`/api/hub/agents`, `/v1.1`) reflects the
@@ -1331,6 +1419,12 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--dev-dist":
         options.devDist = argv[++i];
         break;
+      case "--install-hooks":
+        options.installHooks = true;
+        break;
+      case "--no-install-hooks":
+        options.installHooks = false;
+        break;
       case "--help":
       case "-h":
         printWrapHelp();
@@ -1385,6 +1479,16 @@ function printWrapHelp(): void {
                        version doesn't have new subcommands yet, and
                        npx pulls from the registry, not your checkout.
                        Pass the absolute path to dist/cli.js.
+    --install-hooks    Install the Sanctuary chat-autonomy Stop hook at
+                       ~/.claude/settings.json so direct-agent chat
+                       drains the operator inbox at every Claude
+                       turn-end. Default ON for --claude-code, OFF
+                       otherwise. Tagged with the SanctuaryChatPoll
+                       matcher so it coexists with operator hooks.
+    --no-install-hooks Skip the Stop hook install on a --claude-code
+                       wrap (opt-out). For non-claude-code platforms,
+                       see server/docs/operator-chat-setup.md for the
+                       per-harness system-prompt augmentation snippet.
     --help, -h         Show this help
 
   What happens:

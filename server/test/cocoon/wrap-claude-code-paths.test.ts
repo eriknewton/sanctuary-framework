@@ -177,10 +177,19 @@ describe("Claude Code config path probing (finding C)", () => {
     await expect(access(legacyPath)).rejects.toThrow();
 
     const deps = makeDeps();
-    await runWrap({ claudeCode: true, noOpen: true }, deps);
+    // v1.2.0 F10: skip the Stop-hook install so this test stays scoped to
+    // MCP-config path probing. The hook installer would otherwise create
+    // ~/.claude/settings.json on the legacy path because that's where
+    // Claude Code's hooks live (independent surface from .claude.json).
+    // Hook-install behaviour gets dedicated coverage in
+    // wrap-claude-code-hook-flag.test.ts and claude-code-hook-install.test.ts.
+    await runWrap(
+      { claudeCode: true, noOpen: true, installHooks: false },
+      deps,
+    );
 
     // Bootstrap creates the canonical (first-listed) path: ~/.claude.json.
-    // Legacy path remains absent.
+    // Legacy path remains absent (hook-install path is exercised separately).
     const written = JSON.parse(await readFile(claudeJsonPath, "utf-8"));
     expect(written.mcpServers.sanctuary).toBeDefined();
     await expect(access(legacyPath)).rejects.toThrow();
