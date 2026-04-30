@@ -47,6 +47,7 @@
  */
 
 import { readFile, writeFile, rename, unlink, copyFile, mkdir, access } from "node:fs/promises";
+import { accessSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -136,33 +137,87 @@ function defaultSettingsPath(): string {
 }
 
 /**
- * Resolve the absolute path to the bundled hook script. Works whether
- * Sanctuary is invoked from a published npm tarball (dist/cli.js +
- * scripts/sanctuary-chat-stop-hook.sh siblings under the package root)
- * or from a tsx/ts-node source run (src/cocoon/claude-code-hooks.ts +
- * server/scripts/sanctuary-chat-stop-hook.sh).
+ * Resolve the absolute path to the bundled hook script. Probes multiple
+ * candidate locations because the layout differs between environments:
  *
- * Compiled (dist) layout:
+ * Published npm tarball (tsup bundles into dist/cli.js):
  *   <pkgRoot>/dist/cli.js
  *   <pkgRoot>/scripts/sanctuary-chat-stop-hook.sh
  *
- * Source layout:
- *   <pkgRoot>/src/cocoon/claude-code-hooks.ts
- *   <pkgRoot>/scripts/sanctuary-chat-stop-hook.sh
+ * Dev worktree (tsx runs from source):
+ *   <repoRoot>/server/src/cocoon/claude-code-hooks.ts
+ *   <repoRoot>/server/scripts/sanctuary-chat-stop-hook.sh
  *
- * In both layouts, `scripts/sanctuary-chat-stop-hook.sh` is two levels
- * up from this module file.
+ * The function anchors off process.argv[1] (the executable entry point)
+ * and walks up one directory from dist/ to pkgRoot. Falls back to
+ * import.meta.url for test contexts where argv[1] may not be cli.js.
+ *
+ * @internal Exported for testing only.
  */
-function resolveBundledHookScriptPath(): string {
+export function resolveBundledHookScriptPath(): string {
+  const SCRIPT_NAME = "sanctuary-chat-stop-hook.sh";
+
+  // Primary anchor: process.argv[1] is the entry point (dist/cli.js in
+  // bundled mode, or the tsx loader target in dev).
+  const entryFile = process.argv[1];
+  const entryDir = entryFile ? dirname(resolve(entryFile)) : null;
+
+  // Secondary anchor: import.meta.url (this file's location). In bundled
+  // mode this resolves inside dist/cli.js; in source mode it resolves to
+  // src/cocoon/claude-code-hooks.ts.
   const here = fileURLToPath(import.meta.url);
-  // dist/cocoon/claude-code-hooks.js → dist/.. (one level up) → pkg root
-  // src/cocoon/claude-code-hooks.ts → src/.. (one level up) → pkg root
-  // Both shapes: `here` lives under <pkgRoot>/<X>/cocoon/. Walk up two
-  // levels to <pkgRoot>, then descend into scripts/.
-  const cocoonDir = dirname(here); // .../cocoon
-  const innerDir = dirname(cocoonDir); // .../{src,dist}
-  const pkgRoot = dirname(innerDir);
-  return resolve(pkgRoot, "scripts", "sanctuary-chat-stop-hook.sh");
+
+  // Build candidate list by walking up from each anchor.
+  // We try up to 3 ancestor levels from each anchor point.
+  const candidates: string[] = [];
+
+  // Argv-based candidates first (most reliable for bundled execution).
+  if (entryDir) {
+    // dist/cli.js → walk up 1 level → <pkgRoot>/scripts/ (npm tarball)
+    // src/cocoon/file.ts → walk up 1 = src/scripts (miss)
+    //                     → walk up 2 = server/scripts (dev hit)
+    //                     → walk up 3 = repo/scripts (unlikely but safe)
+    let dir = entryDir;
+    for (let i = 0; i < 3; i++) {
+      dir = dirname(dir);
+      candidates.push(resolve(dir, "scripts", SCRIPT_NAME));
+    }
+  }
+
+  // import.meta.url-based candidates (fallback for test/non-argv contexts).
+  const hereDir = dirname(here);
+  let metaDir = hereDir;
+  for (let i = 0; i < 3; i++) {
+    metaDir = dirname(metaDir);
+    candidates.push(resolve(metaDir, "scripts", SCRIPT_NAME));
+  }
+
+  // Deduplicate while preserving order.
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const c of candidates) {
+    const normalized = resolve(c);
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      unique.push(normalized);
+    }
+  }
+
+  // Return the first candidate that exists on disk.
+  for (const candidate of unique) {
+    try {
+      accessSync(candidate);
+      return candidate;
+    } catch {
+      // Not found at this location; try next.
+    }
+  }
+
+  throw new Error(
+    `Sanctuary: bundled hook script not found. Probed:\n` +
+      unique.map((p) => `  - ${p}`).join("\n") +
+      `\nReinstall the npm package: npm install -g @sanctuary-framework/mcp-server@latest`,
+  );
 }
 
 async function pathExists(p: string): Promise<boolean> {
