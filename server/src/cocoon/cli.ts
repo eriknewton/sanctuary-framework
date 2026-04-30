@@ -140,6 +140,25 @@ export interface WrapOptions {
    * default unchanged.
    */
   devDist?: string;
+  /**
+   * v1.2.0 F10: install the Sanctuary chat-autonomy CLAUDE.md
+   * augmentation at `~/.claude/CLAUDE.md` so a Claude Code wrap
+   * voluntarily polls the operator chat inbox after every turn.
+   *
+   * Default: ON for `--platform claude-code`, OFF for every other
+   * platform (no equivalent harness-native augmentation surface today).
+   * Tri-state to distinguish "operator opted in / out explicitly" from
+   * "default applies":
+   *
+   *   undefined : apply default (on for claude-code, off otherwise)
+   *   true      : install (claude-code: install; non-claude-code: warn)
+   *   false     : do not install (operator opted out via --no-install-hooks)
+   *
+   * Flag name preserved from PR #99's earlier Stop-hook design for
+   * operator continuity; the underlying installer changed shape but
+   * the operator-facing CLI surface stayed stable.
+   */
+  installHooks?: boolean;
 }
 
 /** Backward-compat alias for the old `parseCocoonArgs` return type. */
@@ -249,6 +268,18 @@ export interface RunWrapDeps {
    * undefined.
    */
   rewriteConfig?: typeof rewriteConfigForCocoon;
+  /**
+   * Override the Claude Code CLAUDE.md augmentation installer
+   * (v1.2.0 F10). Production uses the bundled
+   * `installClaudeCodeAugmentation`; tests inject a stub to assert the
+   * call shape without touching the developer's real
+   * ~/.claude/CLAUDE.md.
+   */
+  installClaudeCodeAugmentation?: (
+    opts: import("./claude-code-augmentation.js").InstallClaudeCodeAugmentationOptions,
+  ) => Promise<
+    import("./claude-code-augmentation.js").InstallClaudeCodeAugmentationResult
+  >;
 }
 
 export async function runWrap(
@@ -622,6 +653,77 @@ export async function runWrap(
     backupPath
   );
   if (!verifyOk) process.exit(1);
+
+  // v1.2.0 F10: install the Sanctuary chat-autonomy CLAUDE.md
+  // augmentation at ~/.claude/CLAUDE.md so a wrapped Claude Code
+  // session voluntarily polls the operator chat inbox via the
+  // `sanctuary-chat` MCP server's `chat/poll_inbox` tool after every
+  // turn. The augmentation is operator-supplied context (the trusted
+  // shape); Claude reads it on session start and acts on it
+  // voluntarily, not as a mid-stream injection. Default ON for
+  // --claude-code, OFF for other platforms (no equivalent
+  // harness-native augmentation surface today). Operator opt-out via
+  // `--no-install-hooks`.
+  //
+  // Best-effort: augmentation install failures do not fail wrap. The
+  // harness MCP-config registration is the load-bearing surface; the
+  // augmentation is opt-in autonomy. Errors surface on stderr so the
+  // operator can re-run or pin the snippet manually from
+  // server/docs/operator-chat-setup.md.
+  const hooksRequested = options.installHooks;
+  const isClaudeCode = agentConfig.platform === "claude-code";
+  const shouldInstallHooks =
+    hooksRequested === true ||
+    (hooksRequested === undefined && isClaudeCode);
+
+  if (shouldInstallHooks && !isClaudeCode) {
+    console.error(
+      `\n  Note: --install-hooks is only supported for --claude-code today. ` +
+        `For ${agentConfig.platform}, see server/docs/operator-chat-setup.md ` +
+        `for the per-harness system-prompt augmentation snippet.\n`,
+    );
+  } else if (shouldInstallHooks && isClaudeCode) {
+    try {
+      const installFn =
+        deps.installClaudeCodeAugmentation ??
+        (async (o) => {
+          const { installClaudeCodeAugmentation } = await import(
+            "./claude-code-augmentation.js"
+          );
+          return installClaudeCodeAugmentation(o);
+        });
+      const result = await installFn({
+        agentId: chatAgentId,
+        identityId: "sanctuary-chat",
+        fortressPath: storagePath,
+      });
+      if (result.alreadyPresent) {
+        console.error(
+          `  Sanctuary chat augmentation already present at ${result.installedAt}. No change.`,
+        );
+      } else {
+        console.error(
+          `  Sanctuary chat augmentation installed at ${result.installedAt} ` +
+            `(auto-poll on every Claude turn). ` +
+            `Remove with sanctuary unwrap --remove-hooks.`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        `  Note: chat augmentation install failed (${(err as Error).message}). ` +
+          `Direct-agent chat still works; the autonomous voluntary poll on ` +
+          `Claude turn-end is skipped. ` +
+          `Re-run \`sanctuary wrap --install-hooks\` to retry, or pin the ` +
+          `system-prompt augmentation from server/docs/operator-chat-setup.md ` +
+          `as a fallback.`,
+      );
+    }
+  } else if (hooksRequested === false && isClaudeCode) {
+    console.error(
+      `  Sanctuary chat augmentation NOT installed (--no-install-hooks). ` +
+        `See server/docs/operator-chat-setup.md for manual setup options.`,
+    );
+  }
 
   // v1.1.5 (Finding Z): persist a v1.1 hub `LocalAgentRecord` so the
   // dashboard's Agents view (`/api/hub/agents`, `/v1.1`) reflects the
@@ -1331,6 +1433,12 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--dev-dist":
         options.devDist = argv[++i];
         break;
+      case "--install-hooks":
+        options.installHooks = true;
+        break;
+      case "--no-install-hooks":
+        options.installHooks = false;
+        break;
       case "--help":
       case "-h":
         printWrapHelp();
@@ -1385,6 +1493,18 @@ function printWrapHelp(): void {
                        version doesn't have new subcommands yet, and
                        npx pulls from the registry, not your checkout.
                        Pass the absolute path to dist/cli.js.
+    --install-hooks    Install the Sanctuary chat-autonomy augmentation
+                       at \`~/.claude/CLAUDE.md\` so a wrapped Claude Code
+                       session voluntarily polls the operator chat inbox
+                       via the \`sanctuary-chat\` MCP server's
+                       \`chat/poll_inbox\` tool after every turn. Default
+                       ON for --claude-code, OFF otherwise. Idempotent;
+                       operator content above and below the Sanctuary
+                       section is preserved.
+    --no-install-hooks Skip the augmentation install on a --claude-code
+                       wrap (opt-out). For non-claude-code platforms,
+                       see server/docs/operator-chat-setup.md for the
+                       per-harness system-prompt augmentation snippet.
     --help, -h         Show this help
 
   What happens:
