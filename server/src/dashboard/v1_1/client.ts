@@ -1457,8 +1457,14 @@ function renderFortress() {
             : "This harness does not support " + mi.label.toLowerCase() + ".";
           return '<button class="btn" data-action="agent-' + mi.action + '" data-agent-id="' + escHtml(a.agent_id) + '"' + (mi.enabled ? '' : ' disabled') + ' title="' + escHtml(tip) + '">' + escHtml(mi.label) + '</button>';
         }).join("");
+        // Click-to-chat: the head sub-row is the click target. A click
+        // navigates to agent-detail and opens a direct-chat session
+        // synchronously via the PR #98 route. Lifecycle buttons in
+        // agent-row-actions still take precedence (the dispatcher walks
+        // up to the closest data-action ancestor; buttons are siblings,
+        // not children, of the head).
         return '<div class="row agent-row" data-agent-row="' + escHtml(a.agent_id) + '">' +
-          '<div class="agent-row-head">' +
+          '<div class="agent-row-head" data-action="open-agent-chat" data-agent-id="' + escHtml(a.agent_id) + '" role="button" tabindex="0" title="Open direct chat with ' + escHtml(a.agent_id) + '">' +
             '<span class="glyph ' + map.glyph + '" title="' + escHtml(REASON_LABELS[a.status_reason_class] || "") + '"></span>' +
             '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong></div>' +
             '<span class="pill">' + escHtml(map.label) + '</span>' +
@@ -1878,6 +1884,27 @@ document.addEventListener("click", function (ev) {
   if (action === "exit-export-start") return void onExitExportStart();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
   if (action === "open-agent" && agentId) { state.selectedAgentId = agentId; location.hash = "agent-detail"; return; }
+  // Click-to-chat from the fortress-column agent rows: navigate to the
+  // agent-detail view AND fire the synchronous /session/start route so
+  // the chat surface mounts already-open. The optimistic "Opening..."
+  // pane (clickInflightAgentId) renders during the round-trip; the
+  // route's response populates sessionByAgentId and the chat surface
+  // takes over. Same chat-surface component as the Agents-view CTA.
+  if (action === "open-agent-chat" && agentId) {
+    state.selectedAgentId = agentId;
+    if (location.hash !== "#agent-detail") {
+      location.hash = "agent-detail";
+    } else {
+      setRoute("agent-detail");
+    }
+    void onDirectAgentStart(agentId);
+    return;
+  }
+  // Keyboard activation for the role="button" agent-row-head: Enter and
+  // Space invoke the same handler as a click. Mirrors native button
+  // semantics for accessibility without restructuring the head into a
+  // real <button> (the head contains a glyph span + grow div + pill,
+  // which would be awkward children of a button element).
   if (action === "template-picker-open" && agentId) {
     const agent = state.agents.find(function (a) { return a.agent_id === agentId; });
     state.templateBinding = {
@@ -1913,6 +1940,30 @@ document.addEventListener("click", function (ev) {
     const sub = action.slice("agent-".length);
     return void onAgentControl(agentId, sub);
   }
+});
+
+// Keyboard activation for the fortress-column agent-row click target.
+// The agent-row-head is a div with role="button" + tabindex="0", so it
+// is focusable but does not activate on Enter/Space the way a real
+// button does. This handler restores native button keyboard semantics
+// for the click-to-chat surface only; other data-action elements are
+// real buttons and inherit Enter/Space natively.
+document.addEventListener("keydown", function (ev) {
+  if (ev.key !== "Enter" && ev.key !== " ") return;
+  const rawTgt = ev.target;
+  if (!(rawTgt instanceof Element)) return;
+  const action = rawTgt.getAttribute("data-action");
+  if (action !== "open-agent-chat") return;
+  const agentId = rawTgt.getAttribute("data-agent-id");
+  if (!agentId) return;
+  ev.preventDefault();
+  state.selectedAgentId = agentId;
+  if (location.hash !== "#agent-detail") {
+    location.hash = "agent-detail";
+  } else {
+    setRoute("agent-detail");
+  }
+  void onDirectAgentStart(agentId);
 });
 
 // Intelligence picker: capture password / text input updates without

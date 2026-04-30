@@ -159,6 +159,13 @@ body {
 .agent-row-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .agent-row-head .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-row-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+/* Click-to-chat affordance: the head sub-row of a fortress-column
+   agent row is a click target. cursor + hover signal clickability;
+   focus ring keeps keyboard navigation legible for screen-reader users
+   who tab to the role="button" head. */
+.agent-row-head[data-action="open-agent-chat"] { cursor: pointer; border-radius: var(--rad); padding: 4px 6px; margin: -4px -6px; }
+.agent-row-head[data-action="open-agent-chat"]:hover { background: var(--paper-3); }
+.agent-row-head[data-action="open-agent-chat"]:focus-visible { outline: 2px solid var(--ink-3); outline-offset: 1px; }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; font-size: 12px; }
 .kv dt { color: var(--ink-3); }
 .kv dd { margin: 0; color: var(--ink); }
