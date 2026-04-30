@@ -85,7 +85,9 @@ const state = {
     }
   },
   // WP-V1.2-4: operator chat surfaces. Concierge is fortress-wide; direct-
-  // agent is per-agent and Tier 1 gated. Composer text is held module-local
+  // agent is per-agent. v1.2.x click-to-chat opens the session
+  // synchronously on click (the click IS the affirmative action; no
+  // separate approval ask). Composer text is held module-local
   // so input keystrokes do NOT trigger re-render (the input listener mirrors
   // value into state without rerender; send handler reads from state).
   chat: {
@@ -99,12 +101,19 @@ const state = {
     directAgent: {
       threadByAgentId: {},
       sessionByAgentId: {},
+      // Retained for back-compat with the deprecated inbox-routed path
+      // (HubService.requestDirectAgentSession). v1.2.x click-to-chat does
+      // not populate this; an active session shows up directly in
+      // sessionByAgentId after onDirectAgentStart returns.
       pendingApprovalByAgentId: {},
       // pendingResolveByAgentId tracks an in-flight inbox-resolve call
-      // (approve/deny) so the inline buttons can disable themselves and
-      // surface a busy label. Keyed by agent_id; values are
-      // "approve" | "deny" | undefined.
+      // (approve/deny) for the deprecated inbox-routed path.
       pendingResolveByAgentId: {},
+      // clickInflightAgentId: agent id whose click-to-chat round-trip is
+      // in flight. Set during onDirectAgentStart so the CTA hides on
+      // click; cleared in the finally branch. Used by renderDirectAgentChat
+      // to render an interim "opening..." pane instead of the CTA.
+      clickInflightAgentId: null,
       composer: "",
       sending: false,
       error: null
@@ -552,12 +561,11 @@ function renderAgentDetail() {
         return '<div class="row"><span class="muted">' + escHtml(shortTime(e.emitted_at)) + '</span><span>' + escHtml(t) + '</span></div>';
       }).join("\n")
     : '<p class="muted">No activity yet.</p>';
-  // WP-V1.2-4 direct-agent chat surface. Per spawn-prompt §4.2 + the
-  // Agent Chat screenshot: clicking "Open direct chat" fires the Tier 1
-  // ApprovalGate (one approval per session-open, NOT per message). On
-  // approval the chat surface opens with the agent's identity + current
-  // template binding inline. Per-message handoff is convenience inside
-  // the conversation; session entry is the privileged action.
+  // WP-V1.2-4 direct-agent chat surface. v1.2.x click-to-chat: clicking
+  // "Open direct chat" opens the session synchronously (the click IS the
+  // affirmative action). The chat surface opens immediately with the
+  // agent's identity + current template binding inline. Per-message
+  // handoff is convenience inside the conversation.
   const chatPanel = renderDirectAgentChat(a);
   // F7 fix: chat panel is the primary action surface; render it
   // immediately under the H1 above the Identity card so the composer +
@@ -577,14 +585,20 @@ function renderAgentDetail() {
     '<div class="card"><h3>Timeline</h3>' + timeline + '</div>';
 }
 
-// Direct-agent chat panel for the Agents view per the spawn-prompt
-// screenshot "Agent Chat.png". Three states:
-//   1. No session and no pending approval: show "Open direct chat" CTA
-//      that fires the Tier 1 inbox enqueue. The CTA copy is the spawn
-//      prompt's exact framing of the privileged action.
-//   2. Tier 1 inbox item pending: show a "Approve in inbox" hint + the
-//      pending inbox item id so the operator can resolve it from the
-//      inbox panel (the existing Tier 1 inbox flow handles approve/deny).
+// Direct-agent chat panel for the Agents view. v1.2.x click-to-chat:
+// clicking the chat affordance opens the session synchronously; no
+// inbox-pending intermediate UI surfaces on the new path. States:
+//   1. No session: show "Open direct chat" CTA. Click triggers
+//      onDirectAgentStart which hits the synchronous /session/start
+//      route. On in-flight, the optimistic "opening..." pane renders
+//      until the response lands.
+//   1b. Optimistic-open in flight: render an "Opening direct chat..."
+//       interim pane. Replaces the CTA on click; falls back to State 1
+//       on error.
+//   2. (deprecated) Tier 1 inbox-routed approval pending: surfaces only
+//      if a caller still uses the deprecated requestDirectAgentSession
+//      shape. The operator approves from the inline card or the inbox
+//      panel; the existing inbox-resolve flow handles it.
 //   3. Active session: chat surface (header with agent identity +
 //      template binding + session expiry + End-session button + chat
 //      history + composer). Per-message Tier 1 gate is NOT fired (one
@@ -593,6 +607,7 @@ function renderDirectAgentChat(agent) {
   const da = state.chat.directAgent;
   const session = da.sessionByAgentId[agent.agent_id] || null;
   const pendingInboxId = da.pendingApprovalByAgentId[agent.agent_id] || null;
+  const optimisticOpening = da.clickInflightAgentId === agent.agent_id;
   const errorBanner = da.error
     ? '<div class="banner banner-warn">' + escHtml(da.error) + '</div>'
     : "";
@@ -662,13 +677,26 @@ function renderDirectAgentChat(agent) {
     '</div>';
   }
 
-  // State 1: no session and no pending approval: CTA.
+  // State 1b: optimistic-open in flight (click registered, route round-
+  // trip pending). Replaces the CTA so the operator sees the click took
+  // effect; falls back to State 1 on route error via the catch branch.
+  if (optimisticOpening) {
+    return '<div class="card">' +
+      '<h3>Direct chat</h3>' +
+      errorBanner +
+      '<p class="muted">Opening direct chat with ' + escHtml(agent.agent_id) + '...</p>' +
+    '</div>';
+  }
+
+  // State 1: no session: CTA. Click opens the session synchronously via
+  // onDirectAgentStart; the operator does not see a separate approval
+  // ask. The click affordance IS the affirmative action.
   return '<div class="card">' +
     '<h3>Direct chat</h3>' +
     errorBanner +
-    '<p>Open a Tier 1 approved chat session with this wrapped agent. ' +
-      'One approval per session-open; per-message handoff is convenience inside the conversation.</p>' +
-    '<button class="btn btn-primary" data-action="direct-agent-start" data-agent-id="' + escHtml(agent.agent_id) + '">Open direct chat (Tier 1)</button>' +
+    '<p>Open a direct chat session with this wrapped agent. ' +
+      'The session persists, audit-emits, and times out after 1 hour by default.</p>' +
+    '<button class="btn btn-primary" data-action="direct-agent-start" data-agent-id="' + escHtml(agent.agent_id) + '">Open direct chat</button>' +
   '</div>';
 }
 
@@ -1195,30 +1223,38 @@ async function fetchActiveSessions() {
 }
 
 async function onDirectAgentStart(agentId) {
+  // v1.2.x click-to-chat: the operator's click on the chat affordance IS
+  // the affirmative action. Hit the synchronous /session/start route and
+  // pick up the returned session record directly. No Tier 1 inbox ask;
+  // no "approval pending" intermediate UI. F11 polish.
   const da = state.chat.directAgent;
   da.error = null;
+  // Optimistic render: drop the "Open direct chat" CTA immediately so the
+  // operator sees the click registered. The session pane swaps in as soon
+  // as the route returns. On error, the optimistic state is rolled back
+  // by the catch branch (no session record to render).
+  da.clickInflightAgentId = agentId;
   rerender();
   try {
     const res = await api("/chat/agents/" + encodeURIComponent(agentId) + "/session/start", {
       method: "POST",
       body: {}
     });
-    const data = res.data || {};
-    if (data.status === "approval_pending" && data.inbox_item_id) {
-      // Tier 1 inbox flow: track the pending item id; the operator
-      // approves it from the inbox panel; on approve the session opens
-      // and shows up in the next /chat/sessions fetch.
-      da.pendingApprovalByAgentId[agentId] = data.inbox_item_id;
-      toast("Tier 1 approval queued. Approve in the dashboard inbox to open the session.", "info");
-      await fetchAll();
+    const session = (res.data && res.data.session) || null;
+    if (session && session.agent_id) {
+      da.sessionByAgentId[session.agent_id] = session;
+      // Hydrate the per-agent thread so the chat surface renders with
+      // any persisted history on first paint.
+      await fetchDirectAgentHistory(session.agent_id);
     } else {
-      // The hub returned a session record directly (test rig path or
-      // future auto-approve mode). Pick up the session.
+      // Defensive: if the hub returned an unexpected shape, fall back to
+      // a sessions fetch.
       await fetchActiveSessions();
     }
   } catch (e) {
     da.error = e.message || "Could not open direct chat.";
   } finally {
+    da.clickInflightAgentId = null;
     rerender();
   }
 }

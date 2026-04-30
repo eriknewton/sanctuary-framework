@@ -104,16 +104,24 @@ export interface OperatorChatThread {
 }
 
 /**
- * Direct-agent chat session. Created on Tier 1 inbox approval; closes on
- * operator click, timeout, or fortress lockdown.
+ * Direct-agent chat session. Opened synchronously on operator click in v1.2.x
+ * (the click affordance IS the operator's affirmative action; no separate
+ * approval ask). Closes on operator click, timeout, or fortress lockdown.
+ *
+ * `approval_inbox_item_id` is null for click-to-chat sessions (the
+ * operator-visible action is itself the approval). The deprecated
+ * inbox-routed path retained for back-compat sets a real Tier 1 item id.
  */
 export interface OperatorChatSession {
   /** Stable session id (uuid). */
   session_id: string;
   /** The wrapped agent the session is bound to. */
   agent_id: string;
-  /** Tier 1 inbox item the session was approved through. */
-  approval_inbox_item_id: string;
+  /**
+   * Tier 1 inbox item the session was approved through, or null when the
+   * session was opened directly via click-to-chat (no out-of-band approval).
+   */
+  approval_inbox_item_id: string | null;
   /** ISO8601 created at. */
   created_at: string;
   /** ISO8601 expires at (operator-configurable; default 1h after create). */

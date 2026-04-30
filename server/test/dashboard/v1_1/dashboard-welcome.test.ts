@@ -102,20 +102,26 @@ describe("v1.2 dashboard direct-agent chat (WP-V1.2-4)", () => {
     expect(script).toContain("const chatPanel = renderDirectAgentChat(a);");
   });
 
-  it("direct-agent CTA emits the Tier 1 framing copy", () => {
+  it("direct-agent CTA uses the click-to-chat framing copy (no Tier 1 ask)", () => {
     const script = getClientScript();
-    expect(script).toContain("Open direct chat (Tier 1)");
+    // v1.2.x click-to-chat: the CTA does not promise a separate Tier 1
+    // approval; the click IS the affirmative action.
     expect(script).toContain('data-action="direct-agent-start"');
+    expect(script).toContain(">Open direct chat<");
+    // Hard-anchor against the deprecated "(Tier 1)" framing.
+    expect(script).not.toContain("Open direct chat (Tier 1)");
   });
 
-  it("direct-agent start handler enqueues a Tier 1 inbox item", () => {
+  it("direct-agent start handler opens the session synchronously", () => {
     const script = getClientScript();
     expect(script).toContain("async function onDirectAgentStart(agentId)");
     expect(script).toContain('"/chat/agents/" + encodeURIComponent(agentId) + "/session/start"');
-    // Pending inbox-item id is tracked per agent so the CTA hides and
-    // the "approve in inbox" hint appears between session-start and
-    // session-open.
-    expect(script).toContain("pendingApprovalByAgentId");
+    // Click-to-chat uses optimistic-render keyed on clickInflightAgentId
+    // while the synchronous round-trip is in flight, instead of staging
+    // an inbox-pending UI.
+    expect(script).toContain("clickInflightAgentId");
+    // Hard-anchor against the deprecated "approval pending" toast copy.
+    expect(script).not.toContain("Tier 1 approval queued");
   });
 
   it("direct-agent send + end handlers exist and route through hub api", () => {
