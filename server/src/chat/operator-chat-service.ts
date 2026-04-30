@@ -364,11 +364,12 @@ export class OperatorChatService {
   // ── Direct-agent ─────────────────────────────────────────────────────
 
   /**
-   * Begin a direct-agent chat session after the Tier 1 inbox flow has
-   * approved it. The hub's `bindDirectAgentSession` calls this on
-   * approval-callback; this service does not perform Tier 1 gating
-   * itself (the gating lives in the hub layer to mirror the existing
-   * v1.1 unwrap / lockdown / policy_change pattern).
+   * Begin a direct-agent chat session. v1.2.x: opened synchronously on the
+   * operator's click in the dashboard. The click affordance IS the
+   * affirmative action; no Tier 1 inbox approval ask. The deprecated
+   * inbox-routed path (kept for back-compat callers) sets
+   * `approvalInboxItemId` to the resolved item id; the click-to-chat path
+   * passes null.
    *
    * The `expiresAt` argument is the operator-configured expiry; the
    * service does NOT auto-time-out (the hub or a periodic sweeper
@@ -378,10 +379,12 @@ export class OperatorChatService {
    */
   async openDirectAgentSession(args: {
     agentId: string;
-    approvalInboxItemId: string;
+    /** Tier 1 inbox item id; null on click-to-chat path. */
+    approvalInboxItemId?: string | null;
     channelTemplateId: string | null;
     expiresAtIsoOverride?: string;
   }): Promise<OperatorChatSession> {
+    const approvalInboxItemId = args.approvalInboxItemId ?? null;
     const sessionId = `chat-session-${randomUUID()}`;
     const createdAt = new Date();
     const expiresAtIso =
@@ -390,7 +393,7 @@ export class OperatorChatService {
     const session: OperatorChatSession = {
       session_id: sessionId,
       agent_id: args.agentId,
-      approval_inbox_item_id: args.approvalInboxItemId,
+      approval_inbox_item_id: approvalInboxItemId,
       created_at: createdAt.toISOString(),
       expires_at: expiresAtIso,
       last_polled_message_id: null,
@@ -412,7 +415,7 @@ export class OperatorChatService {
       agent_id: args.agentId,
       session_id: sessionId,
       channel_template_id: args.channelTemplateId,
-      approval_inbox_item_id: args.approvalInboxItemId,
+      approval_inbox_item_id: approvalInboxItemId,
       expires_at: expiresAtIso,
     };
     this.emit(OPERATOR_CHAT_OPS.DIRECT_AGENT_SESSION_OPEN, payload, "success");

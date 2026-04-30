@@ -488,6 +488,10 @@ export async function handleHubRoute(
       }
 
       // POST /api/hub/chat/agents/:id/session/start
+      // v1.2.x: synchronous click-to-chat. The operator's click on the
+      // dashboard chat affordance IS the affirmative action; the hub opens
+      // the session immediately and returns the session record. Audit
+      // event `direct_agent_session_open` fires on session-create.
       if (method === "POST" && remainder === "session/start") {
         const body = await readJSONBody<{ expires_at?: unknown }>(req);
         let expiresAtIso: string | undefined;
@@ -504,11 +508,11 @@ export async function handleHubRoute(
           }
           expiresAtIso = body.expires_at;
         }
-        const result = deps.service.requestDirectAgentSession(
+        const session = await deps.service.openDirectAgentSession(
           agentId,
           expiresAtIso,
         );
-        writeJSON(res, 202, { ok: true, data: result });
+        writeJSON(res, 200, { ok: true, data: { session } });
         return true;
       }
 

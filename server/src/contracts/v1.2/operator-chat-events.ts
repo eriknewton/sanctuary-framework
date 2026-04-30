@@ -129,11 +129,12 @@ export interface AgentDirectAgentReplyPayload extends OperatorChatAuditPayloadHe
 }
 
 /**
- * Operator opened a direct-agent chat session. Emitted on Tier 1 approval
- * (see `principal-policy/loader.ts` `tier1_always_approve` enrollment of
- * `direct_agent_session_open`). The Tier 1 inbox approval that gates
- * session-open emits its own `agent_*` activity entry; this event is the
- * chat-layer marker that records the session lifecycle.
+ * Operator opened a direct-agent chat session. Emitted on synchronous
+ * session-open from the click-to-chat path (the click IS the operator's
+ * affirmative action; see `principal-policy/loader.ts` enrollment of
+ * `direct_agent_session_open` under `tier3_always_allow`). The deprecated
+ * inbox-approval path also emits this event and populates
+ * `approval_inbox_item_id` with the resolved Tier 1 item id.
  */
 export interface OperatorDirectAgentSessionOpenPayload extends OperatorChatAuditPayloadHeader {
   kind: "direct_agent_session_open";
@@ -141,8 +142,11 @@ export interface OperatorDirectAgentSessionOpenPayload extends OperatorChatAudit
   session_id: string;
   /** Operator-readable label of the agent's current channel-template binding. */
   channel_template_id: string | null;
-  /** Tier 1 inbox item id the session was approved through. */
-  approval_inbox_item_id: string;
+  /**
+   * Tier 1 inbox item id the session was approved through, or null when
+   * opened via click-to-chat (no out-of-band approval).
+   */
+  approval_inbox_item_id: string | null;
   /** ISO8601 timestamp the session expires at (operator-configurable; default 1h). */
   expires_at: string;
 }

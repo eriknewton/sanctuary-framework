@@ -731,16 +731,46 @@ export class HubService {
   }
 
   /**
-   * Request a direct-agent chat session on a wrapped agent. Tier 1:
-   * enqueues an inbox approval item. On approve, the operator-chat-
-   * service opens the session via `openDirectAgentSession` and emits
-   * `direct_agent_session_open`.
+   * Open a direct-agent chat session on a wrapped agent. v1.2.x: the
+   * operator's click in the dashboard IS the affirmative action; the
+   * session is created synchronously by the operator-chat-service which
+   * emits `direct_agent_session_open` with the assigned session_id.
    *
-   * The returned `inbox_item_id` is the same id the chat surface polls
-   * (or subscribes to via SSE) until the session is approved or denied.
-   * On approval the session_id surfaces through the
-   * `direct_agent_session_open` audit event; the dashboard's chat
-   * surface listens for that event to swap into the active-session UI.
+   * No Tier 1 inbox approval ask is enqueued on this path. The deprecated
+   * `requestDirectAgentSession` retains the inbox-routed shape for any
+   * callers that still depend on it; new callers should use this method.
+   */
+  async openDirectAgentSession(
+    agentId: string,
+    expiresAtIsoOverride?: string,
+  ): Promise<OperatorChatSession> {
+    const chat = this.requireOperatorChat();
+    const record = this.getAgent(agentId);
+    const channelTemplateId =
+      typeof record.channel_template_id === "string"
+        ? record.channel_template_id
+        : null;
+    return chat.openDirectAgentSession({
+      agentId: record.agent_id,
+      approvalInboxItemId: null,
+      channelTemplateId,
+      ...(expiresAtIsoOverride !== undefined
+        ? { expiresAtIsoOverride }
+        : {}),
+    });
+  }
+
+  /**
+   * @deprecated v1.2.x: superseded by {@link openDirectAgentSession}. The
+   * click-to-chat path no longer routes through Tier 1 inbox approval; the
+   * operator's click on the dashboard chat affordance is the affirmative
+   * action. This method remains callable for back-compat with any caller
+   * that still depends on the inbox-routed shape; new code paths should
+   * call `openDirectAgentSession` directly.
+   *
+   * Behavior preserved: enqueues a Tier 1 inbox item; on operator approve
+   * the chat service opens the session and emits
+   * `direct_agent_session_open` populated with the resolved item id.
    */
   requestDirectAgentSession(
     agentId: string,
