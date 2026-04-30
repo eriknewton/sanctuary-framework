@@ -147,9 +147,27 @@ export interface OperatorChatServiceDeps {
 const DEFAULT_CONCIERGE_MAX_TOKENS = 512;
 
 /**
- * Bookkeeping for in-memory direct-agent sessions. Sessions persist
- * implicitly through the audit log (open / close events); restoring
- * sessions across server restart is a v1.2.x concern.
+ * Bookkeeping for in-memory direct-agent sessions. v1.2.x F9 added
+ * fortress-encrypted persistence so the chat-server subprocess (a
+ * separate process spawned by the harness's MCP runtime) can read +
+ * mutate the cursor on the same session record. The in-memory Map is
+ * a hot-path cache for the dashboard's sync `listActiveSessions()`
+ * surface; mutations write through to persistence so the chat-server
+ * picks them up on its next poll.
+ *
+ * Cross-process consistency model:
+ *  - Dashboard process: owns session lifecycle (open + close). Writes
+ *    persistence + cache on every mutation. Reads from cache on hot
+ *    paths; falls back to persistence when cache misses.
+ *  - Chat-server subprocess: constructs its own service instance
+ *    pointed at the same fortress storage. Cache starts empty;
+ *    persistence-fallback hydrates on first lookup. Only the
+ *    `last_polled_message_id` cursor is written by the chat-server
+ *    (via `advancePollCursor`) — never the lifecycle fields. The two
+ *    writer roles don't overlap on the same field by design.
+ *  - Restart of the dashboard process: in-flight sessions persist on
+ *    disk. v1.2.x ships fresh-fortress acceptance only; full hydration
+ *    of pre-existing sessions on dashboard boot is a v1.3 polish item.
  */
 type SessionMap = Map<string, OperatorChatSession>;
 
@@ -375,8 +393,15 @@ export class OperatorChatService {
       approval_inbox_item_id: args.approvalInboxItemId,
       created_at: createdAt.toISOString(),
       expires_at: expiresAtIso,
+      last_polled_message_id: null,
     };
     this.sessions.set(sessionId, session);
+    // v1.2.x F9: write-through to fortress persistence so the chat-server
+    // subprocess sees the new session on its next poll. Index-by-agent
+    // gives the chat-server O(1) "is there an active session for this
+    // agent?" lookup without scanning every session record.
+    await this.store.writeSession(session);
+    await this.store.setActiveSessionIdForAgent(args.agentId, sessionId);
 
     const payload: OperatorDirectAgentSessionOpenPayload = {
       version: "1.2",
@@ -408,7 +433,7 @@ export class OperatorChatService {
       | "fortress_lockdown"
       | "agent_unwrapped",
   ): Promise<OperatorChatSession | null> {
-    const session = this.sessions.get(sessionId);
+    const session = await this.resolveSession(sessionId);
     if (!session) return null;
     if (session.closed_at) return session;
     const closedAt = new Date().toISOString();
@@ -418,6 +443,12 @@ export class OperatorChatService {
       close_reason: reason,
     };
     this.sessions.set(sessionId, closed);
+    // v1.2.x F9: persist the closed-state record so the chat-server
+    // subprocess returns generic-error "No active session" on its next
+    // poll, and clear the per-agent active-session index so a fresh
+    // session on the same agent can rebind cleanly.
+    await this.store.writeSession(closed);
+    await this.store.setActiveSessionIdForAgent(session.agent_id, null);
 
     const payload: OperatorDirectAgentSessionClosePayload = {
       version: "1.2",
@@ -443,10 +474,80 @@ export class OperatorChatService {
   }
 
   /**
-   * Look up a session by id. Returns null if unknown.
+   * Look up a session by id from the in-memory cache only. Sync — used
+   * by the dashboard's hot path (hub-service `sendDirectAgentMessage`,
+   * route handlers). Returns null when the session is not in cache,
+   * including the cross-process case where the chat-server has just
+   * advanced a cursor on a session this instance has never seen. For
+   * cross-process consistency use `resolveSession` (async).
    */
   getSession(sessionId: string): OperatorChatSession | null {
     return this.sessions.get(sessionId) ?? null;
+  }
+
+  /**
+   * Look up a session by id, falling back to fortress persistence on
+   * cache miss. Used by every public method that needs the latest
+   * session state (open/close/send/reply). The chat-server subprocess's
+   * service instance starts with an empty cache and resolves on first
+   * call; the dashboard process's instance cache is hot from session
+   * lifecycle and only falls back when the chat-server has advanced
+   * a cursor between calls.
+   *
+   * Populates the cache on persistence-fallback hit so subsequent reads
+   * of the same session id are O(1).
+   */
+  async resolveSession(
+    sessionId: string,
+  ): Promise<OperatorChatSession | null> {
+    const cached = this.sessions.get(sessionId);
+    if (cached) return cached;
+    const persisted = await this.store.loadSession(sessionId);
+    if (persisted) this.sessions.set(sessionId, persisted);
+    return persisted;
+  }
+
+  /**
+   * Look up the active session bound to an agent. Reads the per-agent
+   * index from persistence. Returns null when no active session exists
+   * (or when the indexed session is closed). Used by the chat-server's
+   * `chat/poll_inbox` handler.
+   */
+  async findActiveSessionForAgent(
+    agentId: string,
+  ): Promise<OperatorChatSession | null> {
+    const sessionId = await this.store.getActiveSessionIdForAgent(agentId);
+    if (!sessionId) return null;
+    const session = await this.resolveSession(sessionId);
+    if (!session) return null;
+    if (session.closed_at) return null;
+    return session;
+  }
+
+  /**
+   * Advance the per-session poll cursor to a new message id. Used by
+   * the chat-server's `chat/poll_inbox` handler after returning a
+   * batch of operator messages to the wrapped agent. Last-write-wins;
+   * concurrent advances on the same session resolve to whichever value
+   * the storage backend's tail accepts last (the chat-server is the
+   * only writer of this field, so concurrent writers don't actually
+   * arise in v1.2.x).
+   *
+   * Persists the new cursor and refreshes the in-memory cache.
+   */
+  async advancePollCursor(
+    sessionId: string,
+    lastSeenMessageId: string,
+  ): Promise<void> {
+    const session = await this.resolveSession(sessionId);
+    if (!session) return;
+    if (session.closed_at) return;
+    const next: OperatorChatSession = {
+      ...session,
+      last_polled_message_id: lastSeenMessageId,
+    };
+    this.sessions.set(sessionId, next);
+    await this.store.writeSession(next);
   }
 
   /**
@@ -464,7 +565,7 @@ export class OperatorChatService {
     sessionId: string;
     body: string;
   }): Promise<DirectAgentSendResponse> {
-    const session = this.sessions.get(args.sessionId);
+    const session = await this.resolveSession(args.sessionId);
     if (!session) {
       throw new Error("unknown chat session");
     }
@@ -525,7 +626,7 @@ export class OperatorChatService {
     sessionId: string;
     body: string;
   }): Promise<OperatorChatMessage> {
-    const session = this.sessions.get(args.sessionId);
+    const session = await this.resolveSession(args.sessionId);
     if (!session) {
       throw new Error("unknown chat session");
     }
