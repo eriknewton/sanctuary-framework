@@ -56,6 +56,11 @@ describe("Cocoon CLI", () => {
       expect(opts.dryRun).toBe(true);
     });
 
+    it("parses --dev-dist with path (v1.2.x F9 dogfood path)", () => {
+      const opts = parseCocoonArgs(["--dev-dist", "/abs/path/to/dist/cli.js"]);
+      expect(opts.devDist).toBe("/abs/path/to/dist/cli.js");
+    });
+
     it("parses combined flags", () => {
       const opts = parseCocoonArgs([
         "--openclaw",

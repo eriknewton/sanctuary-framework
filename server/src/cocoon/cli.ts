@@ -126,6 +126,20 @@ export interface WrapOptions {
    * agent registry from the same fortress file each wrap writes.
    */
   noDashboard?: boolean;
+  /**
+   * v1.2.x F9 dogfood path (`--dev-dist <path>`): point the harness MCP
+   * config entries at a local Sanctuary build instead of `npx
+   * @sanctuary-framework/mcp-server`. Without this, an unpublished branch
+   * (e.g. an in-flight PR) gets shadowed by the npm-resolved version
+   * because npx pulls from the registry, not from the local checkout.
+   *
+   * Pass the absolute path to the build's `dist/cli.js`. The wrap CLI
+   * registers `node <path>` for `sanctuary` and `node <path> chat-server`
+   * for `sanctuary-chat`. `--dev-dist` is intended for local development
+   * and CI dogfood; published-version wraps omit it and use the npx
+   * default unchanged.
+   */
+  devDist?: string;
 }
 
 /** Backward-compat alias for the old `parseCocoonArgs` return type. */
@@ -567,11 +581,29 @@ export async function runWrap(
   if (sanctuaryEnv.SANCTUARY_FORTRESS_PATH) {
     chatEnv.SANCTUARY_FORTRESS_PATH = sanctuaryEnv.SANCTUARY_FORTRESS_PATH;
   }
+
+  // v1.2.x F9 dogfood path (`--dev-dist <path>`): when set, point both
+  // the main `sanctuary` entry and the `sanctuary-chat` sibling at a
+  // local Sanctuary build instead of the npm-published version. Without
+  // this flag, an unpublished branch (e.g. an in-flight PR) gets
+  // shadowed by the npm-resolved version because npx pulls from the
+  // registry. Published-version wraps omit the flag and use the npx
+  // default unchanged.
+  const useDevDist = options.devDist !== undefined;
+  const sanctuaryCommand = useDevDist ? "node" : "npx";
+  const sanctuaryArgs = useDevDist
+    ? [options.devDist!]
+    : ["@sanctuary-framework/mcp-server"];
+  const chatCommand = useDevDist ? "node" : "npx";
+  const chatArgs = useDevDist
+    ? [options.devDist!, "chat-server"]
+    : ["@sanctuary-framework/mcp-server", "chat-server"];
+
   const auxiliaryEntries = [
     {
       name: "sanctuary-chat",
-      command: "npx",
-      args: ["@sanctuary-framework/mcp-server", "chat-server"],
+      command: chatCommand,
+      args: chatArgs,
       env: chatEnv,
     },
   ];
@@ -579,8 +611,8 @@ export async function runWrap(
   const rewrite = deps.rewriteConfig ?? rewriteConfigForCocoon;
   await rewrite(
     agentConfig,
-    "npx",
-    ["@sanctuary-framework/mcp-server"],
+    sanctuaryCommand,
+    sanctuaryArgs,
     Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined,
     auxiliaryEntries
   );
@@ -1296,6 +1328,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--fortress":
         options.fortress = argv[++i];
         break;
+      case "--dev-dist":
+        options.devDist = argv[++i];
+        break;
       case "--help":
       case "-h":
         printWrapHelp();
@@ -1343,6 +1378,13 @@ function printWrapHelp(): void {
                        \`sanctuary dashboard\` (or a later wrap) sees the
                        harness. Use this for the clean operator setup
                        (one persistent dashboard + many wraps).
+    --dev-dist <path>  Dogfood path. Point the harness MCP entries at a
+                       local Sanctuary build (\`node <path>\` instead of
+                       \`npx @sanctuary-framework/mcp-server\`). Required
+                       when testing an unpublished branch; the published
+                       version doesn't have new subcommands yet, and
+                       npx pulls from the registry, not your checkout.
+                       Pass the absolute path to dist/cli.js.
     --help, -h         Show this help
 
   What happens:

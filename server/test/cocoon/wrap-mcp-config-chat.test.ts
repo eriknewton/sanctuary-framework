@@ -142,4 +142,46 @@ describe("Wrap — sanctuary-chat sibling MCP entry (v1.2.x F9)", () => {
     const keys = Object.keys(written.mcpServers).sort();
     expect(keys).toEqual(["sanctuary", "sanctuary-chat"]);
   });
+
+  it("--dev-dist points both entries at the local build", async () => {
+    const settingsDir = join(tmpHome, ".claude");
+    await mkdir(settingsDir, { recursive: true });
+    const settingsPath = join(settingsDir, "settings.json");
+    await writeFile(settingsPath, JSON.stringify({ mcpServers: {} }, null, 2));
+
+    const distPath = "/path/to/local/dist/cli.js";
+    await runWrap(
+      { claudeCode: true, noOpen: true, devDist: distPath },
+      makeDeps(),
+    );
+
+    const written = JSON.parse(await readFile(settingsPath, "utf-8"));
+    expect(written.mcpServers.sanctuary.command).toBe("node");
+    expect(written.mcpServers.sanctuary.args).toEqual([distPath]);
+    expect(written.mcpServers["sanctuary-chat"].command).toBe("node");
+    expect(written.mcpServers["sanctuary-chat"].args).toEqual([
+      distPath,
+      "chat-server",
+    ]);
+  });
+
+  it("default (no --dev-dist) keeps npx command", async () => {
+    const settingsDir = join(tmpHome, ".claude");
+    await mkdir(settingsDir, { recursive: true });
+    const settingsPath = join(settingsDir, "settings.json");
+    await writeFile(settingsPath, JSON.stringify({ mcpServers: {} }, null, 2));
+
+    await runWrap({ claudeCode: true, noOpen: true }, makeDeps());
+
+    const written = JSON.parse(await readFile(settingsPath, "utf-8"));
+    expect(written.mcpServers.sanctuary.command).toBe("npx");
+    expect(written.mcpServers.sanctuary.args).toEqual([
+      "@sanctuary-framework/mcp-server",
+    ]);
+    expect(written.mcpServers["sanctuary-chat"].command).toBe("npx");
+    expect(written.mcpServers["sanctuary-chat"].args).toEqual([
+      "@sanctuary-framework/mcp-server",
+      "chat-server",
+    ]);
+  });
 });
