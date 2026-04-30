@@ -126,6 +126,14 @@ export interface OperatorChatSession {
     | "session_timeout"
     | "fortress_lockdown"
     | "agent_unwrapped";
+  /**
+   * Cursor for the wrapped-agent poll loop. v1.2.x: the chat-server MCP's
+   * `chat/poll_inbox` returns operator messages newer than this id and
+   * advances the cursor atomically. Null on a freshly-opened session
+   * (the agent's first poll returns the full backlog from session-open).
+   * Optional for forward-compat with v1.2 records that lack the field.
+   */
+  last_polled_message_id?: string | null;
 }
 
 /**
