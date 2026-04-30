@@ -20,6 +20,47 @@
  * Denials return generic error messages; the reason is in the audit log,
  * never in the response. This matches the Sanctuary denial-opacity rule
  * shared with broker-server.
+ *
+ * v1.2.x KNOWN GAP — autonomous polling not yet shipped.
+ *
+ * F9 ships the MCP TOOL CONTRACT for replies. The wrapped agent's
+ * RUNTIME LOOP that calls those tools is harness-level behavior, not an
+ * MCP-server behavior. v1.2.x relies on operator-prompted round-trip:
+ * when the operator wants a reply, they prompt their wrapped agent
+ * (e.g. "check chat/poll_inbox and respond to any operator messages")
+ * and the agent's runtime calls the tools. There is no autonomous
+ * "background poll every 5 seconds" loop.
+ *
+ * Three paths to bridge the gap, each at a different layer:
+ *
+ *   1. Operator-prompted (v1.2.x default): the operator asks their
+ *      wrapped agent to check the inbox. Lowest infrastructure cost,
+ *      requires operator manual action per round-trip.
+ *
+ *   2. System-prompt augmentation (v1.2.x optional, harness-level):
+ *      add to the harness's CLAUDE.md or system prompt:
+ *
+ *        "You are operating inside Sanctuary Framework. You have an
+ *         operator chat inbox at chat/poll_inbox. At the start of every
+ *         turn, before doing anything else, call chat/poll_inbox. If it
+ *         returns operator messages, respond via chat/send_reply
+ *         before continuing your current task."
+ *
+ *      Works for Claude Code today; latency = one Claude turn (~2-5s).
+ *      Not part of F9 because it's an operator-config concern, not a
+ *      Sanctuary-server concern.
+ *
+ *   3. MCP push notifications (v1.3 work): wire
+ *      `notifications/list_changed` so the chat-server actively pushes
+ *      when new operator messages land, instead of waiting for the
+ *      agent to poll. Was explicitly deferred in F9's spawn prompt
+ *      ("Rejected alternatives: harness support varies"); revisit when
+ *      Claude Code, Cline, OpenClaw, etc. all support it.
+ *
+ * v1.2.x ships path 1 as the default operator workflow. Path 2 is
+ * documented as harness-config guidance for operators who want
+ * lower-friction replies. Path 3 lands as a future spec change once
+ * harness adoption matures.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
