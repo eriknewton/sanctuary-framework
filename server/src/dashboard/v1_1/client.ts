@@ -1730,6 +1730,40 @@ function schedulePolling() {
   setInterval(function () { fetchAll().then(rerender); }, 5000);
 }
 
+// v1.2.x F9: poll direct-agent chat history every 2s while at least one
+// active session exists. The wrapped agent's reply lands via the
+// chat-server MCP subprocess on a separate process boundary; the
+// dashboard process has no SSE channel for it in v1.2 (SSE upgrade is
+// v1.3 work). Polling is the honest minimum: invisible to the operator
+// in steady state, picks up replies within ~2s of their arrival, and
+// auto-stops when no active sessions exist.
+//
+// Diff-and-render: only rerender when message count changes for any
+// tracked agent. This avoids UI jitter from a no-op poll cycle.
+async function pollDirectAgentChatHistory() {
+  var sessions = state.chat.directAgent.sessionByAgentId || {};
+  var agentIds = Object.keys(sessions);
+  if (agentIds.length === 0) return;
+  var changed = false;
+  for (var i = 0; i < agentIds.length; i++) {
+    var aid = agentIds[i];
+    if (!sessions[aid] || sessions[aid].closed_at) continue;
+    var beforeLen = (state.chat.directAgent.threadByAgentId[aid] || []).length;
+    await fetchDirectAgentHistory(aid);
+    var afterLen = (state.chat.directAgent.threadByAgentId[aid] || []).length;
+    if (afterLen !== beforeLen) changed = true;
+  }
+  if (changed) rerender();
+}
+
+function scheduleDirectAgentChatPoll() {
+  setInterval(function () {
+    pollDirectAgentChatHistory().catch(function () {
+      // Tolerate transient fetch failures; next tick retries.
+    });
+  }, 2000);
+}
+
 // ── Rerender ───────────────────────────────────────────────────────────
 function rerender() {
   renderTopbar();
@@ -1882,4 +1916,5 @@ if (mq) mq.addEventListener("change", function (e) {
 fetchAll().then(function () { rerender(); });
 bindHashRoute();
 connectStream();
+scheduleDirectAgentChatPoll();
 `;
