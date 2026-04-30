@@ -101,7 +101,11 @@ describe("Wrap — empty Claude Code config (finding A)", () => {
 
     const written = JSON.parse(await readFile(settingsPath, "utf-8"));
     expect(written.mcpServers.sanctuary).toBeDefined();
-    expect(Object.keys(written.mcpServers).length).toBe(1);
+    // v1.2.x F9: wrap registers sanctuary-chat alongside sanctuary so the
+    // wrapped agent's MCP runtime can deliver replies on direct-agent
+    // chat sessions.
+    expect(written.mcpServers["sanctuary-chat"]).toBeDefined();
+    expect(Object.keys(written.mcpServers).length).toBe(2);
   });
 
   it("inserts Sanctuary alongside existing placeholder server", async () => {
@@ -125,11 +129,20 @@ describe("Wrap — empty Claude Code config (finding A)", () => {
     await runWrap({ claudeCode: true, noOpen: true }, deps);
 
     const written = JSON.parse(await readFile(settingsPath, "utf-8"));
+    // v1.2.x F9: wrap registers sanctuary-chat alongside sanctuary so the
+    // wrapped agent's MCP runtime can deliver replies on direct-agent
+    // chat sessions. Existing user-named siblings are preserved.
     expect(Object.keys(written.mcpServers).sort()).toEqual([
       "placeholder",
       "sanctuary",
+      "sanctuary-chat",
     ]);
     expect(written.mcpServers.sanctuary.command).toBe("npx");
+    expect(written.mcpServers["sanctuary-chat"].command).toBe("npx");
+    expect(written.mcpServers["sanctuary-chat"].args).toEqual([
+      "@sanctuary-framework/mcp-server",
+      "chat-server",
+    ]);
     expect(written.mcpServers.placeholder.command).toBe("echo");
   });
 

@@ -451,14 +451,47 @@ function extractEnv(env: unknown): Record<string, string> | undefined {
 }
 
 /**
+ * Description of an additional MCP server entry to register alongside
+ * `sanctuary` in the harness config. v1.2.x F9 uses this for the
+ * `sanctuary-chat` reply-hook subprocess; future companions (v1.3
+ * SSE, v1.4+ federation gateway) plug in through the same shape.
+ *
+ * Idempotent on re-wrap: if a sibling entry with this name already
+ * exists, it is overwritten with the new command/args/env (the wrap
+ * CLI's source-of-truth posture). Existing user-named siblings are
+ * preserved.
+ */
+export interface AuxiliaryMcpServerEntry {
+  /** Server name as it appears in the harness MCP config map. */
+  name: string;
+  /** Stdio command (mirror of `sanctuaryCommand` shape). */
+  command: string;
+  /** Args list passed to the command. */
+  args: string[];
+  /**
+   * Optional env vars passed alongside the entry. Critical-var
+   * propagation (SANCTUARY_PASSPHRASE etc.) follows the same rules as
+   * the main sanctuary entry: process.env wins when neither the caller
+   * nor the existing entry provided a value.
+   */
+  env?: Record<string, string>;
+}
+
+/**
  * Rewrite an agent config to route through Sanctuary as the sole MCP server.
  * Returns the path to the rewritten config.
+ *
+ * v1.2.x F9: optional `additionalEntries` registers sibling MCP servers
+ * (e.g. `sanctuary-chat`) alongside `sanctuary` in the harness config.
+ * Each sibling is merged into the platform-specific MCP map; user-named
+ * siblings already present in the config are preserved unchanged.
  */
 export async function rewriteConfigForCocoon(
   agentConfig: AgentConfig,
   sanctuaryCommand: string,
   sanctuaryArgs: string[],
-  sanctuaryEnv?: Record<string, string>
+  sanctuaryEnv?: Record<string, string>,
+  additionalEntries?: AuxiliaryMcpServerEntry[]
 ): Promise<string> {
   const raw = agentConfig.rawConfig as Record<string, unknown>;
 
@@ -506,6 +539,33 @@ export async function rewriteConfigForCocoon(
     sanctuaryEntry.env = resolvedEnv;
   }
 
+  // v1.2.x F9: build the merged MCP map (existing + sanctuary + sibling
+  // auxiliaries). Each auxiliary inherits the same critical-var pass-
+  // through rules as the main sanctuary entry so passphrase + fortress
+  // path travel into the sibling subprocess automatically.
+  const auxiliaryMap: Record<string, Record<string, unknown>> = {};
+  for (const aux of additionalEntries ?? []) {
+    const auxEntry: Record<string, unknown> = {
+      command: aux.command,
+      args: aux.args,
+    };
+    let auxEnv: Record<string, string> | undefined = aux.env
+      ? { ...aux.env }
+      : undefined;
+    // Inherit critical vars from process.env when the caller didn't supply
+    // them explicitly. Mirrors the sanctuary-entry inheritance above.
+    for (const key of CRITICAL_VARS) {
+      if (process.env[key] && (!auxEnv || !auxEnv[key])) {
+        if (!auxEnv) auxEnv = {};
+        auxEnv[key] = process.env[key]!;
+      }
+    }
+    if (auxEnv && Object.keys(auxEnv).length > 0) {
+      auxEntry.env = auxEnv;
+    }
+    auxiliaryMap[aux.name] = auxEntry;
+  }
+
   let rewritten: Record<string, unknown>;
 
   if (agentConfig.platform === "openclaw") {
@@ -518,6 +578,7 @@ export async function rewriteConfigForCocoon(
         servers: {
           ...existingServers,
           sanctuary: sanctuaryEntry,
+          ...auxiliaryMap,
         },
       },
     };
@@ -531,6 +592,7 @@ export async function rewriteConfigForCocoon(
       mcp_servers: {
         ...existingServers,
         sanctuary: sanctuaryEntry,
+        ...auxiliaryMap,
       },
     };
   } else {
@@ -540,6 +602,7 @@ export async function rewriteConfigForCocoon(
       mcpServers: {
         ...existingServers,
         sanctuary: sanctuaryEntry,
+        ...auxiliaryMap,
       },
     };
   }

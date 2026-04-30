@@ -549,12 +549,40 @@ export async function runWrap(
     );
   }
 
+  // v1.2.x F9: register `sanctuary-chat` as a sibling MCP server in the
+  // harness config so the wrapped agent's MCP runtime can call
+  // chat/poll_inbox + chat/send_reply against the operator's fortress.
+  // Uses the same npx pkg as the main sanctuary entry; subcommand is
+  // "chat-server". Per-agent SANCTUARY_AGENT_ID is the load-bearing
+  // cross-agent isolation guard; the chat-server rejects any operation
+  // on a different agent's session. The agent_id matches the v1.1 hub
+  // registry shape (agent:<harness>:<fortressId>) so the dashboard's
+  // session.agent_id and the chat-server's bound agent_id resolve to
+  // the same identifier.
+  const chatHarness = harnessKindForPlatform(agentConfig.platform);
+  const chatAgentId = `agent:${chatHarness}:${fortressIdFromStoragePath(storagePath)}`;
+  const chatEnv: Record<string, string> = {
+    SANCTUARY_AGENT_ID: chatAgentId,
+  };
+  if (sanctuaryEnv.SANCTUARY_FORTRESS_PATH) {
+    chatEnv.SANCTUARY_FORTRESS_PATH = sanctuaryEnv.SANCTUARY_FORTRESS_PATH;
+  }
+  const auxiliaryEntries = [
+    {
+      name: "sanctuary-chat",
+      command: "npx",
+      args: ["@sanctuary-framework/mcp-server", "chat-server"],
+      env: chatEnv,
+    },
+  ];
+
   const rewrite = deps.rewriteConfig ?? rewriteConfigForCocoon;
   await rewrite(
     agentConfig,
     "npx",
     ["@sanctuary-framework/mcp-server"],
-    Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined
+    Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined,
+    auxiliaryEntries
   );
 
   const verifyOk = await verifyRewrittenConfig(
