@@ -140,6 +140,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "chat-poll") {
+    const { runChatPoll } = await import("./cli/chat-poll.js");
+    const code = await runChatPoll({ argv: args.slice(1) });
+    process.exit(code);
+  }
+
   if (args[0] === "chat-server") {
     const { openOperatorChat } = await import("./chat/open.js");
     const { createChatMcpServer } = await import("./mcp/chat-server.js");
