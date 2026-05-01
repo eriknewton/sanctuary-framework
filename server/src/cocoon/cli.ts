@@ -280,6 +280,17 @@ export interface RunWrapDeps {
   ) => Promise<
     import("./claude-code-augmentation.js").InstallClaudeCodeAugmentationResult
   >;
+  /**
+   * Override the Claude Code permissions.allow installer (v1.2.0 F10-B).
+   * Production uses the bundled `installClaudeCodeAllowlist`; tests
+   * inject a stub to assert the call shape without touching the
+   * developer's real ~/.claude/settings.json.
+   */
+  installClaudeCodeAllowlist?: (
+    opts: import("./claude-code-allowlist.js").InstallClaudeCodeAllowlistOptions,
+  ) => Promise<
+    import("./claude-code-allowlist.js").InstallClaudeCodeAllowlistResult
+  >;
 }
 
 export async function runWrap(
@@ -716,6 +727,44 @@ export async function runWrap(
           `Re-run \`sanctuary wrap --install-hooks\` to retry, or pin the ` +
           `system-prompt augmentation from server/docs/operator-chat-setup.md ` +
           `as a fallback.`,
+      );
+    }
+
+    // F10-B: also write the sanctuary-chat tool identifiers to Claude
+    // Code's permissions.allow list so the after-every-response polling
+    // loop runs without a per-turn permission prompt for the operator.
+    // Without this, the F10 augmentation triggers Claude Code's default
+    // tool-permission flow and the operator must "Always allow" each
+    // tool once per project, defeating the autonomy the augmentation is
+    // designed to provide. Best-effort: failure logs to stderr but does
+    // not fail wrap (operator can still grant permission interactively).
+    try {
+      const allowFn =
+        deps.installClaudeCodeAllowlist ??
+        (async (o) => {
+          const { installClaudeCodeAllowlist } = await import(
+            "./claude-code-allowlist.js"
+          );
+          return installClaudeCodeAllowlist(o);
+        });
+      const allowResult = await allowFn({});
+      if (allowResult.alreadyPresent) {
+        console.error(
+          `  Sanctuary chat tool allowlist already present at ${allowResult.installedAt}. No change.`,
+        );
+      } else {
+        console.error(
+          `  Sanctuary chat tool allowlist updated at ${allowResult.installedAt} ` +
+            `(${allowResult.added.length} ${allowResult.added.length === 1 ? "entry" : "entries"} added; ` +
+            `polling loop runs without per-turn prompts).`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        `  Note: chat tool allowlist write failed (${(err as Error).message}). ` +
+          `Augmentation still installed; Claude Code will prompt to approve ` +
+          `chat/poll_inbox and chat/send_reply on first call. ` +
+          `Click "Always allow" once per tool to resume the autonomous loop.`,
       );
     }
   } else if (hooksRequested === false && isClaudeCode) {

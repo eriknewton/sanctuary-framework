@@ -180,9 +180,20 @@ describe("Claude Code config path probing (finding C)", () => {
     await runWrap({ claudeCode: true, noOpen: true }, deps);
 
     // Bootstrap creates the canonical (first-listed) path: ~/.claude.json.
-    // Legacy path remains absent.
+    // The legacy path may legitimately exist post-wrap because F10-B
+    // writes Claude Code's permissions.allow to ~/.claude/settings.json
+    // for chat-tool autonomy. The MCP-config probing concern is that
+    // the legacy path is not the MCP-config target: assert no mcpServers
+    // there (rather than asserting whole-file absence).
     const written = JSON.parse(await readFile(claudeJsonPath, "utf-8"));
     expect(written.mcpServers.sanctuary).toBeDefined();
-    await expect(access(legacyPath)).rejects.toThrow();
+    let legacyHasMcpServers = false;
+    try {
+      const legacy = JSON.parse(await readFile(legacyPath, "utf-8"));
+      legacyHasMcpServers = legacy.mcpServers !== undefined;
+    } catch {
+      /* legacy path absent is fine; test passes either way */
+    }
+    expect(legacyHasMcpServers).toBe(false);
   });
 });
