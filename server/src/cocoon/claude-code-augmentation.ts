@@ -114,6 +114,7 @@ export const SANCTUARY_AUGMENTATION_BODY = `## Sanctuary Operator Chat
 This Claude Code session may be wrapped by Sanctuary Framework, in which case the \`sanctuary-chat\` MCP server is available with two tools: \`chat/poll_inbox\` and \`chat/send_reply\`.
 
 When \`sanctuary-chat\` is present:
+- These two tools may show up in your deferred-tools list at session start (schemas not auto-loaded into context). If so, load both via \`ToolSearch\` with \`select:chat/poll_inbox,chat/send_reply\` before your first response. The rule below requires the schemas to be available.
 - After completing a response to my prompt, call \`chat/poll_inbox\` to check for any pending messages from me sent through the Sanctuary dashboard.
 - If \`chat/poll_inbox\` returns one or more messages, treat each as a follow-up prompt from me. Compose a reply to each message and deliver it via \`chat/send_reply\` (the tool returns the persisted message record on success).
 - If \`chat/poll_inbox\` returns no messages, take no further action.
