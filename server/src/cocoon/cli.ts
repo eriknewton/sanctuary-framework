@@ -127,17 +127,16 @@ export interface WrapOptions {
    */
   noDashboard?: boolean;
   /**
-   * v1.2.x F9 dogfood path (`--dev-dist <path>`): point the harness MCP
-   * config entries at a local Sanctuary build instead of `npx
+   * Dogfood path (`--dev-dist <path>`): point the harness MCP
+   * config entry at a local Sanctuary build instead of `npx
    * @sanctuary-framework/mcp-server`. Without this, an unpublished branch
    * (e.g. an in-flight PR) gets shadowed by the npm-resolved version
    * because npx pulls from the registry, not from the local checkout.
    *
    * Pass the absolute path to the build's `dist/cli.js`. The wrap CLI
-   * registers `node <path>` for `sanctuary` and `node <path> chat-server`
-   * for `sanctuary-chat`. `--dev-dist` is intended for local development
-   * and CI dogfood; published-version wraps omit it and use the npx
-   * default unchanged.
+   * registers `node <path>` as the `sanctuary` command. `--dev-dist`
+   * is intended for local development and CI dogfood; published-version
+   * wraps omit it and use the npx default unchanged.
    */
   devDist?: string;
 }
@@ -563,50 +562,17 @@ export async function runWrap(
     );
   }
 
-  // v1.2.x F9: register `sanctuary-chat` as a sibling MCP server in the
-  // harness config so the wrapped agent's MCP runtime can call
-  // chat/poll_inbox + chat/send_reply against the operator's fortress.
-  // Uses the same npx pkg as the main sanctuary entry; subcommand is
-  // "chat-server". Per-agent SANCTUARY_AGENT_ID is the load-bearing
-  // cross-agent isolation guard; the chat-server rejects any operation
-  // on a different agent's session. The agent_id matches the v1.1 hub
-  // registry shape (agent:<harness>:<fortressId>) so the dashboard's
-  // session.agent_id and the chat-server's bound agent_id resolve to
-  // the same identifier.
-  const chatHarness = harnessKindForPlatform(agentConfig.platform);
-  const chatAgentId = `agent:${chatHarness}:${fortressIdFromStoragePath(storagePath)}`;
-  const chatEnv: Record<string, string> = {
-    SANCTUARY_AGENT_ID: chatAgentId,
-  };
-  if (sanctuaryEnv.SANCTUARY_FORTRESS_PATH) {
-    chatEnv.SANCTUARY_FORTRESS_PATH = sanctuaryEnv.SANCTUARY_FORTRESS_PATH;
-  }
-
-  // v1.2.x F9 dogfood path (`--dev-dist <path>`): when set, point both
-  // the main `sanctuary` entry and the `sanctuary-chat` sibling at a
-  // local Sanctuary build instead of the npm-published version. Without
-  // this flag, an unpublished branch (e.g. an in-flight PR) gets
-  // shadowed by the npm-resolved version because npx pulls from the
-  // registry. Published-version wraps omit the flag and use the npx
-  // default unchanged.
+  // Dogfood path (`--dev-dist <path>`): when set, point the main
+  // `sanctuary` entry at a local Sanctuary build instead of the
+  // npm-published version. Without this flag, an unpublished branch
+  // (e.g. an in-flight PR) gets shadowed by the npm-resolved version
+  // because npx pulls from the registry. Published-version wraps omit
+  // the flag and use the npx default unchanged.
   const useDevDist = options.devDist !== undefined;
   const sanctuaryCommand = useDevDist ? "node" : "npx";
   const sanctuaryArgs = useDevDist
     ? [options.devDist!]
     : ["@sanctuary-framework/mcp-server"];
-  const chatCommand = useDevDist ? "node" : "npx";
-  const chatArgs = useDevDist
-    ? [options.devDist!, "chat-server"]
-    : ["@sanctuary-framework/mcp-server", "chat-server"];
-
-  const auxiliaryEntries = [
-    {
-      name: "sanctuary-chat",
-      command: chatCommand,
-      args: chatArgs,
-      env: chatEnv,
-    },
-  ];
 
   const rewrite = deps.rewriteConfig ?? rewriteConfigForCocoon;
   await rewrite(
@@ -614,7 +580,6 @@ export async function runWrap(
     sanctuaryCommand,
     sanctuaryArgs,
     Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined,
-    auxiliaryEntries
   );
 
   const verifyOk = await verifyRewrittenConfig(

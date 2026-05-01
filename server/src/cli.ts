@@ -140,29 +140,6 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (args[0] === "chat-server") {
-    const { openOperatorChat } = await import("./chat/open.js");
-    const { createChatMcpServer } = await import("./mcp/chat-server.js");
-    const agentId = process.env.SANCTUARY_AGENT_ID;
-    if (!agentId) {
-      console.error(
-        "Sanctuary chat-server: SANCTUARY_AGENT_ID is required (set by `sanctuary wrap` in the harness MCP config)."
-      );
-      process.exit(1);
-    }
-    const identityId =
-      process.env.SANCTUARY_IDENTITY_ID ?? "sanctuary-chat";
-    const handle = await openOperatorChat({ identityId });
-    const server = createChatMcpServer(handle.service, {
-      agentId,
-      identityId,
-    });
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error("Sanctuary Operator Chat MCP server running (stdio)");
-    return;
-  }
-
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dashboard") {
       process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
