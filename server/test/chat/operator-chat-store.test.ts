@@ -66,14 +66,14 @@ describe("Operator Chat Store", () => {
 
     const secretBody = "totally-secret-cleartext-body-nobody-must-see";
     await store.appendMessage(
-      "direct-agent",
-      "claude-code",
-      makeMessage({ surface: "direct-agent", agent_id: "claude-code", body: secretBody }),
+      "concierge",
+      CONCIERGE_THREAD_KEY,
+      makeMessage({ surface: "concierge", body: secretBody }),
     );
 
     const raw = await storage.read(
       OPERATOR_CHAT_NAMESPACE,
-      chatStorageKey("direct-agent", "claude-code"),
+      chatStorageKey("concierge", CONCIERGE_THREAD_KEY),
     );
     expect(raw).not.toBeNull();
     const onDisk = bytesToString(raw!);
@@ -121,9 +121,6 @@ describe("Operator Chat Store", () => {
   it("chatStorageKey uses surface-prefixed flat key layout", () => {
     expect(chatStorageKey("concierge", CONCIERGE_THREAD_KEY)).toBe(
       `concierge.${CONCIERGE_THREAD_KEY}`,
-    );
-    expect(chatStorageKey("direct-agent", "claude-code")).toBe(
-      "agent.claude-code",
     );
   });
 

@@ -245,17 +245,30 @@ export function createServer(
     // ── Approval Gate ──────────────────────────────────────────────
     // If a gate is configured, every tool call must pass through it.
     // Denied calls return a generic error that does not reveal policy.
+    // When the block is approval-pending (Tier 1), the response carries
+    // a plain-English `operator_message` the agent's LLM can relay to
+    // the operator naturally. WP-V1.2 reshape: gives operators a second
+    // channel beyond the dashboard for noticing pending approvals.
     if (gate) {
       const result = await gate.evaluate(name, typedArgs);
       if (!result.allowed) {
+        const errorPayload: {
+          error: string;
+          approval_required: boolean;
+          operator_message?: string;
+        } = {
+          error: "Operation not permitted",
+          approval_required: result.approval_required,
+        };
+        if (result.approval_required) {
+          errorPayload.operator_message =
+            "This action requires your operator's approval. Sanctuary has logged this request for your operator to review. You can pause and ask your operator to check Sanctuary, or retry in a few seconds.";
+        }
         return {
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify({
-                error: "Operation not permitted",
-                approval_required: result.approval_required,
-              }),
+              text: JSON.stringify(errorPayload),
             },
           ],
           isError: true,

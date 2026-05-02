@@ -335,30 +335,43 @@ export interface HubServiceDeps {
   now?: () => Date;
   /**
    * Optional operator-chat service. When supplied, the hub exposes the
-   * concierge + direct-agent chat endpoints; when omitted, those routes
-   * return HubCapabilityError. Construction-time injection lets the
-   * dashboard wiring layer build the chat service against the same
-   * audit log + master key + storage backend as the rest of the v1.1
-   * hub without forcing the chat-service constructor through a circular
-   * import.
+   * concierge chat endpoints; when omitted, those routes return
+   * HubCapabilityError. Construction-time injection lets the dashboard
+   * wiring layer build the chat service against the same audit log +
+   * master key + storage backend as the rest of the v1.1 hub without
+   * forcing the chat-service constructor through a circular import.
+   * The direct-agent chat surface was removed in the v1.2 reshape
+   * (2026-04-30); the field name is retained for source compatibility.
    */
   operatorChat?: OperatorChatService;
 }
 
 /**
- * Result returned from `requestDirectAgentSession`. The session is
- * created only after the Tier 1 inbox item is approved; before approval
- * the caller polls the inbox or waits for the session-open audit event.
- *
- * On approval the operator-chat-service emits `direct_agent_session_open`
- * with the assigned `session_id`; consumers that need the id before the
- * inbox flow lands MUST wait for that event.
+ * Click-to-inspect panel returned by `openAgentInspectPanel`. The panel
+ * surfaces the agent's recent activity, pending approvals routed through
+ * this agent, and policy summary at a glance, repurposing the click-
+ * to-chat wire-up shipped in PR #98 + PR #100. The direct-agent chat
+ * surface was removed in the v1.2 reshape; this panel is the operational
+ * destination for the click.
  */
-export interface HubDirectAgentSessionRequestResult
-  extends HubTier1ApprovalEnqueuedResult {
-  operation_category: "direct_agent_session_open";
-  /** Operator-configured expiry; defaults to 1 hour from approval. */
-  requested_expires_at?: string;
+export interface HubAgentInspectPanel {
+  /** The agent the panel was opened on. */
+  agent_id: string;
+  /** ISO8601 timestamp the panel was opened. */
+  opened_at: string;
+  /** Recent activity-feed entries for this agent, oldest first. */
+  recent_activity: HubActivityFeedEntry[];
+  /**
+   * Open Tier 1 inbox items routed through this agent. Empty when the
+   * agent has no pending approvals.
+   */
+  pending_approvals: HubInboxItem[];
+  /**
+   * Bound policy summary for this agent. Null when the agent has no
+   * channel-template binding (e.g. immediately after wrap, before the
+   * operator picks a template).
+   */
+  policy_summary: HubPolicySummary | null;
 }
 
 // -----------------------------------------------------------------------

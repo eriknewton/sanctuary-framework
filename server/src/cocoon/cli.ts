@@ -127,17 +127,16 @@ export interface WrapOptions {
    */
   noDashboard?: boolean;
   /**
-   * v1.2.x F9 dogfood path (`--dev-dist <path>`): point the harness MCP
-   * config entries at a local Sanctuary build instead of `npx
+   * Dogfood path (`--dev-dist <path>`): point the harness MCP
+   * config entry at a local Sanctuary build instead of `npx
    * @sanctuary-framework/mcp-server`. Without this, an unpublished branch
    * (e.g. an in-flight PR) gets shadowed by the npm-resolved version
    * because npx pulls from the registry, not from the local checkout.
    *
    * Pass the absolute path to the build's `dist/cli.js`. The wrap CLI
-   * registers `node <path>` for `sanctuary` and `node <path> chat-server`
-   * for `sanctuary-chat`. `--dev-dist` is intended for local development
-   * and CI dogfood; published-version wraps omit it and use the npx
-   * default unchanged.
+   * registers `node <path>` as the `sanctuary` command. `--dev-dist`
+   * is intended for local development and CI dogfood; published-version
+   * wraps omit it and use the npx default unchanged.
    */
   devDist?: string;
 }
@@ -249,6 +248,17 @@ export interface RunWrapDeps {
    * undefined.
    */
   rewriteConfig?: typeof rewriteConfigForCocoon;
+  /**
+   * Override the Claude Code permissions.allow installer (WP-V1.2 reshape).
+   * Production uses the bundled `installClaudeCodeAllowlist`; tests
+   * inject a stub to assert the call shape without touching the
+   * developer's real ~/.claude/settings.json.
+   */
+  installClaudeCodeAllowlist?: (
+    opts: import("./claude-code-allowlist.js").InstallClaudeCodeAllowlistOptions,
+  ) => Promise<
+    import("./claude-code-allowlist.js").InstallClaudeCodeAllowlistResult
+  >;
 }
 
 export async function runWrap(
@@ -563,50 +573,17 @@ export async function runWrap(
     );
   }
 
-  // v1.2.x F9: register `sanctuary-chat` as a sibling MCP server in the
-  // harness config so the wrapped agent's MCP runtime can call
-  // chat/poll_inbox + chat/send_reply against the operator's fortress.
-  // Uses the same npx pkg as the main sanctuary entry; subcommand is
-  // "chat-server". Per-agent SANCTUARY_AGENT_ID is the load-bearing
-  // cross-agent isolation guard; the chat-server rejects any operation
-  // on a different agent's session. The agent_id matches the v1.1 hub
-  // registry shape (agent:<harness>:<fortressId>) so the dashboard's
-  // session.agent_id and the chat-server's bound agent_id resolve to
-  // the same identifier.
-  const chatHarness = harnessKindForPlatform(agentConfig.platform);
-  const chatAgentId = `agent:${chatHarness}:${fortressIdFromStoragePath(storagePath)}`;
-  const chatEnv: Record<string, string> = {
-    SANCTUARY_AGENT_ID: chatAgentId,
-  };
-  if (sanctuaryEnv.SANCTUARY_FORTRESS_PATH) {
-    chatEnv.SANCTUARY_FORTRESS_PATH = sanctuaryEnv.SANCTUARY_FORTRESS_PATH;
-  }
-
-  // v1.2.x F9 dogfood path (`--dev-dist <path>`): when set, point both
-  // the main `sanctuary` entry and the `sanctuary-chat` sibling at a
-  // local Sanctuary build instead of the npm-published version. Without
-  // this flag, an unpublished branch (e.g. an in-flight PR) gets
-  // shadowed by the npm-resolved version because npx pulls from the
-  // registry. Published-version wraps omit the flag and use the npx
-  // default unchanged.
+  // Dogfood path (`--dev-dist <path>`): when set, point the main
+  // `sanctuary` entry at a local Sanctuary build instead of the
+  // npm-published version. Without this flag, an unpublished branch
+  // (e.g. an in-flight PR) gets shadowed by the npm-resolved version
+  // because npx pulls from the registry. Published-version wraps omit
+  // the flag and use the npx default unchanged.
   const useDevDist = options.devDist !== undefined;
   const sanctuaryCommand = useDevDist ? "node" : "npx";
   const sanctuaryArgs = useDevDist
     ? [options.devDist!]
     : ["@sanctuary-framework/mcp-server"];
-  const chatCommand = useDevDist ? "node" : "npx";
-  const chatArgs = useDevDist
-    ? [options.devDist!, "chat-server"]
-    : ["@sanctuary-framework/mcp-server", "chat-server"];
-
-  const auxiliaryEntries = [
-    {
-      name: "sanctuary-chat",
-      command: chatCommand,
-      args: chatArgs,
-      env: chatEnv,
-    },
-  ];
 
   const rewrite = deps.rewriteConfig ?? rewriteConfigForCocoon;
   await rewrite(
@@ -614,7 +591,6 @@ export async function runWrap(
     sanctuaryCommand,
     sanctuaryArgs,
     Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined,
-    auxiliaryEntries
   );
 
   const verifyOk = await verifyRewrittenConfig(
@@ -622,6 +598,48 @@ export async function runWrap(
     backupPath
   );
   if (!verifyOk) process.exit(1);
+
+  // WP-V1.2 reshape: write the broker-tool identifiers to Claude Code's
+  // permissions.allow list at wrap time so the wrapped agent's routine
+  // broker calls (request_token, read_secret, list_grants, audit_query)
+  // run without a per-turn permission prompt for the operator. The
+  // broker's policy gate stops any write-side or destructive operation
+  // regardless of the allowlist; the allowlist only suppresses the
+  // Claude Code UI confirmation flow on routine reads. Best-effort:
+  // failure logs to stderr but does not fail wrap (operator can still
+  // grant permission interactively on first call).
+  if (agentConfig.platform === "claude-code") {
+    try {
+      const allowFn =
+        deps.installClaudeCodeAllowlist ??
+        (async (o) => {
+          const { installClaudeCodeAllowlist } = await import(
+            "./claude-code-allowlist.js"
+          );
+          return installClaudeCodeAllowlist(o);
+        });
+      const allowResult = await allowFn({});
+      if (allowResult.alreadyPresent) {
+        console.error(
+          `  Sanctuary broker tool allowlist already present at ${allowResult.installedAt}. No change.`,
+        );
+      } else {
+        console.error(
+          `  Sanctuary broker tool allowlist updated at ${allowResult.installedAt} ` +
+            `(${allowResult.added.length} ${allowResult.added.length === 1 ? "entry" : "entries"} added; ` +
+            `routine broker calls run without per-turn prompts).`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        `  Note: broker tool allowlist write failed (${(err as Error).message}). ` +
+          `Wrap is otherwise complete; Claude Code will prompt to approve ` +
+          `broker/request_token, broker/read_secret, broker/list_grants, ` +
+          `and broker/audit_query on first call. ` +
+          `Click "Always allow" once per tool to suppress future prompts.`,
+      );
+    }
+  }
 
   // v1.1.5 (Finding Z): persist a v1.1 hub `LocalAgentRecord` so the
   // dashboard's Agents view (`/api/hub/agents`, `/v1.1`) reflects the

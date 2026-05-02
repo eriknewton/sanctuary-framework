@@ -58,10 +58,12 @@ describe("v1.2 dashboard concierge surface (WP-V1.2-4)", () => {
     expect(script).toContain('await fetchConciergeHistory();');
   });
 
-  it("concierge boot path hydrates history + active sessions on every fetchAll cycle", () => {
+  it("concierge boot path hydrates history on every fetchAll cycle", () => {
     const script = getClientScript();
     expect(script).toContain('await fetchConciergeHistory();');
-    expect(script).toContain('await fetchActiveSessions();');
+    // Direct-agent surface removed in the v1.2 reshape; the inspect
+    // panel is fetched lazily on click rather than maintained in state.
+    expect(script).not.toContain('await fetchActiveSessions();');
   });
 
   it("concierge surface uses no em-dashes (public-facing copy hard gate)", () => {
@@ -93,48 +95,45 @@ describe("v1.2 dashboard concierge surface (WP-V1.2-4)", () => {
   });
 });
 
-describe("v1.2 dashboard direct-agent chat (WP-V1.2-4)", () => {
-  it("agent-detail view embeds the direct-agent chat panel", () => {
+describe("v1.2 dashboard click-to-inspect (WP-V1.2 reshape)", () => {
+  it("agent-detail view embeds the inspect panel", () => {
     const script = getClientScript();
-    expect(script).toContain("function renderDirectAgentChat(agent)");
-    // The agent-detail render calls into renderDirectAgentChat and
+    expect(script).toContain("function renderAgentInspectPanel(agent)");
+    // The agent-detail render calls into renderAgentInspectPanel and
     // appends the panel between the identity card and the timeline.
-    expect(script).toContain("const chatPanel = renderDirectAgentChat(a);");
+    expect(script).toContain("const inspectPanel = renderAgentInspectPanel(a);");
   });
 
-  it("direct-agent CTA uses the click-to-chat framing copy (no Tier 1 ask)", () => {
+  it("inspect CTA uses the click-to-inspect framing copy (read-only)", () => {
     const script = getClientScript();
-    // v1.2.x click-to-chat: the CTA does not promise a separate Tier 1
-    // approval; the click IS the affirmative action.
-    expect(script).toContain('data-action="direct-agent-start"');
-    expect(script).toContain(">Open direct chat<");
-    // Hard-anchor against the deprecated "(Tier 1)" framing.
-    expect(script).not.toContain("Open direct chat (Tier 1)");
+    // The CTA opens a read-only inspect panel; no chat session, no
+    // Tier 1 approval ask, the click is a plain navigate.
+    expect(script).toContain('data-action="agent-inspect-open"');
+    expect(script).toContain(">Open inspect panel<");
+    // Hard-anchor against direct-agent chat framing.
+    expect(script).not.toContain(">Open direct chat<");
+    expect(script).not.toContain('data-action="direct-agent-start"');
   });
 
-  it("direct-agent start handler opens the session synchronously", () => {
+  it("inspect-open handler hits the new /agents/:id/inspect/open route", () => {
     const script = getClientScript();
-    expect(script).toContain("async function onDirectAgentStart(agentId)");
-    expect(script).toContain('"/chat/agents/" + encodeURIComponent(agentId) + "/session/start"');
-    // Click-to-chat uses optimistic-render keyed on clickInflightAgentId
-    // while the synchronous round-trip is in flight, instead of staging
-    // an inbox-pending UI.
-    expect(script).toContain("clickInflightAgentId");
-    // Hard-anchor against the deprecated "approval pending" toast copy.
-    expect(script).not.toContain("Tier 1 approval queued");
+    expect(script).toContain("async function onAgentInspectOpen(agentId)");
+    expect(script).toContain('"/agents/" + encodeURIComponent(agentId) + "/inspect/open"');
+    // Optimistic-render keyed on openingAgentId while the round-trip
+    // is in flight.
+    expect(script).toContain("openingAgentId");
   });
 
-  it("direct-agent send + end handlers exist and route through hub api", () => {
+  it("direct-agent send + end handlers are removed", () => {
     const script = getClientScript();
-    expect(script).toContain("async function onDirectAgentSend(agentId)");
-    expect(script).toContain('"/chat/agents/" + encodeURIComponent(agentId) + "/message"');
-    expect(script).toContain("async function onDirectAgentEnd(agentId)");
-    expect(script).toContain('"/chat/agents/" + encodeURIComponent(agentId) + "/session/end"');
+    expect(script).not.toContain("async function onDirectAgentSend");
+    expect(script).not.toContain("async function onDirectAgentEnd");
+    expect(script).not.toContain('/chat/agents/');
   });
 
-  it("direct-agent surface uses no em-dashes (public-facing copy hard gate)", () => {
+  it("inspect panel uses no em-dashes (public-facing copy hard gate)", () => {
     const script = getClientScript();
-    const fnMatch = script.match(/function renderDirectAgentChat\(agent\)\s*\{[\s\S]+?return\s*'<div class="card">'[\s\S]+?'<\/div>';\n\s*\}/);
+    const fnMatch = script.match(/function renderAgentInspectPanel\(agent\)\s*\{[\s\S]+?return\s*'<div class="card">'[\s\S]+?'<\/div>';\n\s*\}/);
     expect(fnMatch).toBeTruthy();
     if (fnMatch) {
       expect(fnMatch[0]).not.toMatch(/—/);

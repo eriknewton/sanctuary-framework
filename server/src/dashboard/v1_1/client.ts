@@ -98,24 +98,16 @@ const state = {
       error: null,
       badge: null
     },
-    directAgent: {
-      threadByAgentId: {},
-      sessionByAgentId: {},
-      // Retained for back-compat with the deprecated inbox-routed path
-      // (HubService.requestDirectAgentSession). v1.2.x click-to-chat does
-      // not populate this; an active session shows up directly in
-      // sessionByAgentId after onDirectAgentStart returns.
-      pendingApprovalByAgentId: {},
-      // pendingResolveByAgentId tracks an in-flight inbox-resolve call
-      // (approve/deny) for the deprecated inbox-routed path.
-      pendingResolveByAgentId: {},
-      // clickInflightAgentId: agent id whose click-to-chat round-trip is
-      // in flight. Set during onDirectAgentStart so the CTA hides on
-      // click; cleared in the finally branch. Used by renderDirectAgentChat
-      // to render an interim "opening..." pane instead of the CTA.
-      clickInflightAgentId: null,
-      composer: "",
-      sending: false,
+    inspect: {
+      // panelByAgentId: keyed by agent_id, the most recently fetched
+      // inspect-panel response (recent_activity + pending_approvals +
+      // policy_summary + opened_at). The panel is read-only; no
+      // streaming updates. The dashboard re-fetches on click.
+      panelByAgentId: {},
+      // openingAgentId: agent id whose inspect-open round-trip is in
+      // flight. Set during onAgentInspectOpen so the CTA hides on click;
+      // cleared in the finally branch.
+      openingAgentId: null,
       error: null
     }
   }
@@ -449,33 +441,13 @@ const CONCIERGE_SUGGESTIONS = [
   { id: "open-approvals", label: "any open approvals?", query: "Are there any open Tier 1 approvals or pending inbox items I should look at?" }
 ];
 
+// Direct-agent chat surface was removed in the v1.2 reshape; the
+// click-to-chat affordance now opens the inspect/approve panel
+// (recent activity + pending approvals + policy summary). The
+// "Active chats" panel is gone with the surface; its replacement
+// surfaces live on each agent row + the inspect panel itself.
 function renderActiveChatsPanel() {
-  const sessionMap = state.chat.directAgent.sessionByAgentId || {};
-  const pendingMap = state.chat.directAgent.pendingApprovalByAgentId || {};
-  const activeAgentIds = Object.keys(sessionMap).filter(function (aid) {
-    return sessionMap[aid] && !sessionMap[aid].closed_at;
-  });
-  const pendingAgentIds = Object.keys(pendingMap).filter(function (aid) {
-    return !!pendingMap[aid];
-  });
-  if (activeAgentIds.length === 0 && pendingAgentIds.length === 0) return "";
-  const rows = activeAgentIds.map(function (aid) {
-    const s = sessionMap[aid];
-    const expiry = s.expires_at ? '<span class="muted mono">expires ' + escHtml(shortTime(s.expires_at)) + '</span>' : '';
-    return '<div class="row">' +
-      '<span class="pill tone-verified">chat open</span>' +
-      '<div class="grow mono">' + escHtml(aid) + '</div>' +
-      expiry +
-      '<button class="btn btn-primary" data-action="open-agent" data-agent-id="' + escHtml(aid) + '">Open chat</button>' +
-      '</div>';
-  }).concat(pendingAgentIds.map(function (aid) {
-    return '<div class="row">' +
-      '<span class="pill tone-info">approval pending</span>' +
-      '<div class="grow mono">' + escHtml(aid) + '</div>' +
-      '<button class="btn" data-action="open-agent" data-agent-id="' + escHtml(aid) + '">Approve</button>' +
-      '</div>';
-  })).join("\n");
-  return '<div class="card" style="margin-bottom:14px;"><h3>Active chats</h3>' + rows + '</div>';
+  return "";
 }
 
 function renderDashboardConcierge() {
@@ -525,26 +497,14 @@ function renderDashboardConcierge() {
 // ── Render: agents list / detail ───────────────────────────────────────
 function renderAgentsList() {
   if (!state.agents.length) return '<h1>Agents</h1><p class="muted">No wrapped agents yet. Run <code>sanctuary wrap</code> to wrap a harness.</p>';
-  const sessionMap = state.chat.directAgent.sessionByAgentId || {};
-  const pendingMap = state.chat.directAgent.pendingApprovalByAgentId || {};
   const rows = state.agents.map(function (a) {
     const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
     const reason = a.status_reason_class ? (REASON_LABELS[a.status_reason_class] || "") : "";
-    const hasSession = !!(sessionMap[a.agent_id] && !sessionMap[a.agent_id].closed_at);
-    const hasPending = !!pendingMap[a.agent_id];
-    const sessionPill = hasSession
-      ? '<span class="pill tone-verified">chat open</span>'
-      : hasPending
-      ? '<span class="pill tone-info">approval pending</span>'
-      : "";
-    const btnLabel = hasSession ? "Open chat" : hasPending ? "Approve" : "Open";
-    const btnCls = hasSession || hasPending ? "btn btn-primary" : "btn";
     return '<div class="row">' +
       '<span class="glyph ' + map.glyph + '"></span>' +
       '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong> <span class="muted mono">' + escHtml(a.harness) + '</span></div>' +
-      sessionPill +
       '<span class="pill" title="' + escHtml(reason) + '">' + escHtml(map.label) + '</span>' +
-      '<button class="' + btnCls + '" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">' + btnLabel + '</button>' +
+      '<button class="btn" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">Open</button>' +
       '</div>';
   }).join("\n");
   return '<h1>Agents</h1><div class="card">' + rows + '</div>';
@@ -561,18 +521,18 @@ function renderAgentDetail() {
         return '<div class="row"><span class="muted">' + escHtml(shortTime(e.emitted_at)) + '</span><span>' + escHtml(t) + '</span></div>';
       }).join("\n")
     : '<p class="muted">No activity yet.</p>';
-  // WP-V1.2-4 direct-agent chat surface. v1.2.x click-to-chat: clicking
-  // "Open direct chat" opens the session synchronously (the click IS the
-  // affirmative action). The chat surface opens immediately with the
-  // agent's identity + current template binding inline. Per-message
-  // handoff is convenience inside the conversation.
-  const chatPanel = renderDirectAgentChat(a);
-  // F7 fix: chat panel is the primary action surface; render it
-  // immediately under the H1 above the Identity card so the composer +
-  // history are visible above the fold instead of pushed below the
-  // Identity dl. Identity + Timeline drop to reference position.
+  // WP-V1.2 reshape click-to-inspect surface. Clicking "Open inspect
+  // panel" hits POST /api/hub/agents/:id/inspect/open synchronously and
+  // renders recent activity + pending approvals + policy summary. The
+  // chat surface was removed in the reshape; the panel is read-only and
+  // re-fetches on each click (no streaming updates).
+  const inspectPanel = renderAgentInspectPanel(a);
+  // Inspect panel is the primary action surface; render it immediately
+  // under the H1 above the Identity card so recent activity + pending
+  // approvals are visible above the fold. Identity + Timeline drop to
+  // reference position.
   return '<h1>' + escHtml(a.agent_id) + '</h1>' +
-    chatPanel +
+    inspectPanel +
     '<div class="card"><h3>Identity</h3>' +
       '<dl class="kv">' +
       '<dt>Harness</dt><dd class="mono">' + escHtml(a.harness) + '</dd>' +
@@ -585,118 +545,90 @@ function renderAgentDetail() {
     '<div class="card"><h3>Timeline</h3>' + timeline + '</div>';
 }
 
-// Direct-agent chat panel for the Agents view. v1.2.x click-to-chat:
-// clicking the chat affordance opens the session synchronously; no
-// inbox-pending intermediate UI surfaces on the new path. States:
-//   1. No session: show "Open direct chat" CTA. Click triggers
-//      onDirectAgentStart which hits the synchronous /session/start
-//      route. On in-flight, the optimistic "opening..." pane renders
-//      until the response lands.
-//   1b. Optimistic-open in flight: render an "Opening direct chat..."
-//       interim pane. Replaces the CTA on click; falls back to State 1
-//       on error.
-//   2. (deprecated) Tier 1 inbox-routed approval pending: surfaces only
-//      if a caller still uses the deprecated requestDirectAgentSession
-//      shape. The operator approves from the inline card or the inbox
-//      panel; the existing inbox-resolve flow handles it.
-//   3. Active session: chat surface (header with agent identity +
-//      template binding + session expiry + End-session button + chat
-//      history + composer). Per-message Tier 1 gate is NOT fired (one
-//      approval per session-open).
-function renderDirectAgentChat(agent) {
-  const da = state.chat.directAgent;
-  const session = da.sessionByAgentId[agent.agent_id] || null;
-  const pendingInboxId = da.pendingApprovalByAgentId[agent.agent_id] || null;
-  const optimisticOpening = da.clickInflightAgentId === agent.agent_id;
-  const errorBanner = da.error
-    ? '<div class="banner banner-warn">' + escHtml(da.error) + '</div>'
+// Inspect panel for the Agents view (WP-V1.2 reshape). Clicking the
+// inspect affordance opens the panel synchronously via POST
+// /api/hub/agents/:id/inspect/open. The panel is read-only:
+// recent activity, pending Tier 1 approvals, policy summary. States:
+//   1. No panel data yet: show "Open inspect panel" CTA.
+//   1b. Optimistic-open in flight: render an interim "Opening..." pane.
+//   2. Panel loaded: render activity feed + pending approvals + policy
+//      summary. Operator can re-open to refresh.
+function renderAgentInspectPanel(agent) {
+  const ip = state.chat.inspect;
+  const panel = ip.panelByAgentId[agent.agent_id] || null;
+  const opening = ip.openingAgentId === agent.agent_id;
+  const errorBanner = ip.error
+    ? '<div class="banner banner-warn">' + escHtml(ip.error) + '</div>'
     : "";
 
-  // State 3: active session: render chat surface.
-  if (session && !session.closed_at) {
-    const thread = da.threadByAgentId[agent.agent_id] || [];
-    const messages = thread.length
-      ? thread.map(function (m) {
-          const cls = m.role === "operator" ? "concierge-msg-operator" : "concierge-msg-concierge";
-          const author = m.role === "operator" ? "you" : escHtml(agent.agent_id);
-          return '<div class="concierge-msg ' + cls + '">' +
-            '<div class="concierge-msg-author muted">' + escHtml(author) + ' · ' + escHtml(shortTime(m.created_at)) + '</div>' +
-            '<div class="concierge-msg-body">' + escHtml(m.body) + '</div>' +
+  // State 2: panel loaded.
+  if (panel) {
+    const activity = (panel.recent_activity || []).slice(0, 20);
+    const activityHtml = activity.length
+      ? activity.map(function (e) {
+          const t = renderTemplate(e.display_template_id, e.display_template_args);
+          return '<div class="row"><span class="muted mono">' + escHtml(shortTime(e.emitted_at)) + '</span><span>' + escHtml(t) + '</span></div>';
+        }).join("\n")
+      : '<p class="muted">No recent activity for this agent.</p>';
+
+    const approvals = panel.pending_approvals || [];
+    const approvalsHtml = approvals.length
+      ? approvals.map(function (item) {
+          const promptText = renderTemplate(item.display_template_id, item.display_template_args);
+          return '<div class="row">' +
+            '<span class="pill tone-info">' + escHtml(item.tier || "tier1") + '</span>' +
+            '<div class="grow">' + escHtml(promptText) + '</div>' +
+            '<button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '">Approve</button>' +
+            '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button>' +
             '</div>';
         }).join("\n")
-      : '<p class="muted concierge-empty">Session open. Type a message; the wrapped agent will reply when its harness wires up the v1.2.x reply hook. Operator-side messages persist + audit-emit immediately.</p>';
-    const sendDisabled = da.sending ? ' disabled' : '';
-    const sendLabel = da.sending ? 'Sending...' : 'Send';
-    const expiry = session.expires_at
-      ? '<span class="muted mono">Session expires ' + escHtml(shortTime(session.expires_at)) + '</span>'
-      : '';
-    return '<div class="card concierge-card">' +
-      '<div class="concierge-header">' +
-        '<div class="concierge-persona"><strong>Direct chat with ' + escHtml(agent.agent_id) + '</strong> ' +
-          '<span class="muted">' + escHtml(agent.channel_template_id || "no_template") + '</span></div>' +
-        expiry +
-      '</div>' +
-      errorBanner +
-      '<div class="concierge-history" id="direct-agent-history">' + messages + '</div>' +
-      '<form class="concierge-composer" data-action="direct-agent-submit" data-agent-id="' + escHtml(agent.agent_id) + '">' +
-        '<input type="text" name="direct-agent-input" placeholder="Type a message to ' + escHtml(agent.agent_id) + '..." value="' + escHtml(da.composer) + '" data-action="direct-agent-input"' + sendDisabled + ' autocomplete="off">' +
-        '<button type="submit" class="btn btn-primary" data-action="direct-agent-send" data-agent-id="' + escHtml(agent.agent_id) + '"' + sendDisabled + '>' + escHtml(sendLabel) + '</button>' +
-      '</form>' +
-      '<div class="concierge-chips">' +
-        '<button class="btn" data-action="direct-agent-end" data-agent-id="' + escHtml(agent.agent_id) + '"' + sendDisabled + '>End session</button>' +
-      '</div>' +
-    '</div>';
-  }
+      : '<p class="muted">No pending approvals routed through this agent.</p>';
 
-  // State 2: Tier 1 inbox item pending operator approval. Render inline
-  // on the agent-detail panel so the operator can approve or deny without
-  // navigating to the dashboard inbox column. Per Erik directive
-  // 2026-04-29: approval surface lives where the agent context is.
-  if (pendingInboxId) {
-    // Look up the inbox item so we can render the operator-facing prompt
-    // alongside the buttons. If the inbox feed has not arrived yet (race
-    // between session/start return and the SSE inbox event), fall back to
-    // the canonical Tier 1 prompt template.
-    const inboxItem = state.inbox.find(function (x) { return x.item_id === pendingInboxId; });
-    const promptText = inboxItem
-      ? renderTemplate(inboxItem.display_template_id, inboxItem.display_template_args)
-      : "Open a Tier 1 direct chat session with " + agent.agent_id + ".";
-    const pending = da.pendingResolveByAgentId && da.pendingResolveByAgentId[agent.agent_id];
-    const busy = pending ? ' disabled' : '';
-    const approveLabel = pending === "approve" ? "Approving..." : "Approve and open chat";
-    const denyLabel = pending === "deny" ? "Denying..." : "Deny";
-    return '<div class="card tier1-approval-card">' +
-      '<h3>Tier 1 approval required</h3>' +
-      '<p>' + escHtml(promptText) + '</p>' +
-      errorBanner +
-      '<div class="actions">' +
-        '<button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(pendingInboxId) + '"' + busy + '>' + escHtml(approveLabel) + '</button>' +
-        '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(pendingInboxId) + '"' + busy + '>' + escHtml(denyLabel) + '</button>' +
-      '</div>' +
-      '<p class="muted mono" style="margin-top:10px;font-size:11px;">' + escHtml(pendingInboxId) + '</p>' +
-    '</div>';
-  }
+    const policyLine = panel.policy_summary
+      ? '<dt>Policy</dt><dd class="mono">' + escHtml(panel.policy_summary.display_label || panel.policy_summary.policy_id) + '</dd>' +
+        (panel.policy_summary.channel_template_id
+          ? '<dt>Template</dt><dd class="mono">' + escHtml(panel.policy_summary.channel_template_id) + '</dd>'
+          : '') +
+        '<dt>Bound</dt><dd class="mono">' + escHtml(shortTime(panel.policy_summary.bound_at)) + '</dd>'
+      : '<dt>Policy</dt><dd class="muted">No bound policy yet.</dd>';
 
-  // State 1b: optimistic-open in flight (click registered, route round-
-  // trip pending). Replaces the CTA so the operator sees the click took
-  // effect; falls back to State 1 on route error via the catch branch.
-  if (optimisticOpening) {
     return '<div class="card">' +
-      '<h3>Direct chat</h3>' +
+      '<div class="concierge-header">' +
+        '<div class="concierge-persona"><strong>Inspect ' + escHtml(agent.agent_id) + '</strong> ' +
+          '<span class="muted">opened ' + escHtml(shortTime(panel.opened_at)) + '</span></div>' +
+        '<button class="btn" data-action="agent-inspect-open" data-agent-id="' + escHtml(agent.agent_id) + '">Refresh</button>' +
+      '</div>' +
       errorBanner +
-      '<p class="muted">Opening direct chat with ' + escHtml(agent.agent_id) + '...</p>' +
+      '<h3>Pending approvals</h3>' +
+      approvalsHtml +
+      '<h3 style="margin-top:14px;">Recent activity</h3>' +
+      activityHtml +
+      '<h3 style="margin-top:14px;">Policy</h3>' +
+      '<dl class="kv">' + policyLine + '</dl>' +
+      '<p class="muted" style="margin-top:10px;font-size:12px;">' +
+        '<a href="#activity?agent=' + escHtml(agent.agent_id) + '">View full activity</a> · ' +
+        '<a href="#policy">Edit policy</a>' +
+      '</p>' +
     '</div>';
   }
 
-  // State 1: no session: CTA. Click opens the session synchronously via
-  // onDirectAgentStart; the operator does not see a separate approval
-  // ask. The click affordance IS the affirmative action.
+  // State 1b: optimistic-open in flight.
+  if (opening) {
+    return '<div class="card">' +
+      '<h3>Inspect</h3>' +
+      errorBanner +
+      '<p class="muted">Opening inspect panel for ' + escHtml(agent.agent_id) + '...</p>' +
+    '</div>';
+  }
+
+  // State 1: no panel data: CTA.
   return '<div class="card">' +
-    '<h3>Direct chat</h3>' +
+    '<h3>Inspect</h3>' +
     errorBanner +
-    '<p>Open a direct chat session with this wrapped agent. ' +
-      'The session persists, audit-emits, and times out after 1 hour by default.</p>' +
-    '<button class="btn btn-primary" data-action="direct-agent-start" data-agent-id="' + escHtml(agent.agent_id) + '">Open direct chat</button>' +
+    '<p>Open the inspect panel to see this agent\'s recent activity, ' +
+      'pending Tier 1 approvals, and policy summary at a glance. ' +
+      'Read-only; the panel re-fetches on each open.</p>' +
+    '<button class="btn btn-primary" data-action="agent-inspect-open" data-agent-id="' + escHtml(agent.agent_id) + '">Open inspect panel</button>' +
   '</div>';
 }
 
@@ -1179,133 +1111,35 @@ async function onConciergeSend() {
   }
 }
 
-async function fetchDirectAgentHistory(agentId) {
-  try {
-    const res = await api("/chat/agents/" + encodeURIComponent(agentId) + "/history");
-    state.chat.directAgent.threadByAgentId[agentId] = (res.data && res.data.messages) || [];
-  } catch (e) {
-    // Tolerate 422/404; operator will see the empty thread + can still
-    // open a session.
-    state.chat.directAgent.threadByAgentId[agentId] = [];
-  }
-}
-
-async function fetchActiveSessions() {
-  try {
-    const res = await api("/chat/sessions");
-    const sessions = (res.data && res.data.sessions) || [];
-    const map = {};
-    for (let i = 0; i < sessions.length; i++) {
-      const s = sessions[i];
-      if (s && s.agent_id && !s.closed_at) map[s.agent_id] = s;
-    }
-    state.chat.directAgent.sessionByAgentId = map;
-    // When an active session is observed for an agent, clear any pending
-    // approval bookkeeping so renderDirectAgentChat falls into state-3
-    // (active session) cleanly. Without this, pendingApprovalByAgentId
-    // stays set after the inbox item resolves and the agent panel can
-    // briefly flash the approval card after the chat surface should be
-    // visible.
-    const agentIds = Object.keys(map);
-    for (let j = 0; j < agentIds.length; j++) {
-      const aid = agentIds[j];
-      if (state.chat.directAgent.pendingApprovalByAgentId[aid]) {
-        delete state.chat.directAgent.pendingApprovalByAgentId[aid];
-      }
-      // Hydrate the per-agent thread so the chat surface renders with
-      // full history on first paint instead of an empty pane that fills
-      // in after a separate round trip.
-      await fetchDirectAgentHistory(aid);
-    }
-  } catch (e) {
-    // 422 (chat not wired) leaves sessionByAgentId untouched.
-  }
-}
-
-async function onDirectAgentStart(agentId) {
-  // v1.2.x click-to-chat: the operator's click on the chat affordance IS
-  // the affirmative action. Hit the synchronous /session/start route and
-  // pick up the returned session record directly. No Tier 1 inbox ask;
-  // no "approval pending" intermediate UI. F11 polish.
-  const da = state.chat.directAgent;
-  da.error = null;
-  // Optimistic render: drop the "Open direct chat" CTA immediately so the
-  // operator sees the click registered. The session pane swaps in as soon
-  // as the route returns. On error, the optimistic state is rolled back
-  // by the catch branch (no session record to render).
-  da.clickInflightAgentId = agentId;
+async function onAgentInspectOpen(agentId) {
+  // WP-V1.2 reshape click-to-inspect: the operator's click on the
+  // inspect affordance hits POST /api/hub/agents/:id/inspect/open
+  // synchronously. Returns the panel data (recent activity + pending
+  // approvals + policy summary). The panel is read-only; no streaming
+  // updates. The operator can re-open to refresh.
+  const ip = state.chat.inspect;
+  ip.error = null;
+  // Optimistic render: drop the CTA immediately so the operator sees
+  // the click registered. The panel swaps in as soon as the route
+  // returns. On error, the optimistic state is rolled back by the
+  // catch branch (no panel data to render).
+  ip.openingAgentId = agentId;
   rerender();
   try {
-    const res = await api("/chat/agents/" + encodeURIComponent(agentId) + "/session/start", {
+    const res = await api("/agents/" + encodeURIComponent(agentId) + "/inspect/open", {
       method: "POST",
       body: {}
     });
-    const session = (res.data && res.data.session) || null;
-    if (session && session.agent_id) {
-      da.sessionByAgentId[session.agent_id] = session;
-      // Hydrate the per-agent thread so the chat surface renders with
-      // any persisted history on first paint.
-      await fetchDirectAgentHistory(session.agent_id);
+    const panel = (res.data && res.data.panel) || null;
+    if (panel && panel.agent_id) {
+      ip.panelByAgentId[panel.agent_id] = panel;
     } else {
-      // Defensive: if the hub returned an unexpected shape, fall back to
-      // a sessions fetch.
-      await fetchActiveSessions();
+      ip.error = "Inspect panel returned an unexpected shape.";
     }
   } catch (e) {
-    da.error = e.message || "Could not open direct chat.";
+    ip.error = e.message || "Could not open inspect panel.";
   } finally {
-    da.clickInflightAgentId = null;
-    rerender();
-  }
-}
-
-async function onDirectAgentSend(agentId) {
-  const da = state.chat.directAgent;
-  if (da.sending) return;
-  const message = (da.composer || "").trim();
-  if (message.length === 0) return;
-  const session = da.sessionByAgentId[agentId];
-  if (!session || session.closed_at) {
-    da.error = "Session is not active. Open a new direct chat session.";
-    rerender();
-    return;
-  }
-  da.sending = true;
-  da.error = null;
-  rerender();
-  try {
-    await api("/chat/agents/" + encodeURIComponent(agentId) + "/message", {
-      method: "POST",
-      body: { session_id: session.session_id, message: message }
-    });
-    await fetchDirectAgentHistory(agentId);
-    da.composer = "";
-  } catch (e) {
-    da.error = e.message || "Could not send message.";
-  } finally {
-    da.sending = false;
-    rerender();
-  }
-}
-
-async function onDirectAgentEnd(agentId) {
-  const da = state.chat.directAgent;
-  const session = da.sessionByAgentId[agentId];
-  if (!session) return;
-  da.error = null;
-  rerender();
-  try {
-    await api("/chat/agents/" + encodeURIComponent(agentId) + "/session/end", {
-      method: "POST",
-      body: { session_id: session.session_id }
-    });
-    delete da.sessionByAgentId[agentId];
-    delete da.pendingApprovalByAgentId[agentId];
-    da.composer = "";
-    await fetchActiveSessions();
-  } catch (e) {
-    da.error = e.message || "Could not end session.";
-  } finally {
+    ip.openingAgentId = null;
     rerender();
   }
 }
@@ -1457,14 +1291,15 @@ function renderFortress() {
             : "This harness does not support " + mi.label.toLowerCase() + ".";
           return '<button class="btn" data-action="agent-' + mi.action + '" data-agent-id="' + escHtml(a.agent_id) + '"' + (mi.enabled ? '' : ' disabled') + ' title="' + escHtml(tip) + '">' + escHtml(mi.label) + '</button>';
         }).join("");
-        // Click-to-chat: the head sub-row is the click target. A click
-        // navigates to agent-detail and opens a direct-chat session
-        // synchronously via the PR #98 route. Lifecycle buttons in
-        // agent-row-actions still take precedence (the dispatcher walks
-        // up to the closest data-action ancestor; buttons are siblings,
-        // not children, of the head).
+        // Click-to-inspect: the head sub-row is the click target. A click
+        // navigates to agent-detail and opens the read-only inspect panel
+        // synchronously via the WP-V1.2 reshape route (the original PR #98
+        // chat wire-up was repurposed when direct-agent chat was removed
+        // from v1.2). Lifecycle buttons in agent-row-actions still take
+        // precedence (the dispatcher walks up to the closest data-action
+        // ancestor; buttons are siblings, not children, of the head).
         return '<div class="row agent-row" data-agent-row="' + escHtml(a.agent_id) + '">' +
-          '<div class="agent-row-head" data-action="open-agent-chat" data-agent-id="' + escHtml(a.agent_id) + '" role="button" tabindex="0" title="Open direct chat with ' + escHtml(a.agent_id) + '">' +
+          '<div class="agent-row-head" data-action="agent-row-inspect-open" data-agent-id="' + escHtml(a.agent_id) + '" role="button" tabindex="0" title="Open inspect panel for ' + escHtml(a.agent_id) + '">' +
             '<span class="glyph ' + map.glyph + '" title="' + escHtml(REASON_LABELS[a.status_reason_class] || "") + '"></span>' +
             '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong></div>' +
             '<span class="pill">' + escHtml(map.label) + '</span>' +
@@ -1520,12 +1355,10 @@ async function fetchAll() {
     state.handoffEvents = he.data.entries || [];
   } catch (e) { /* tolerate */ }
   await fetchIntelligenceState();
-  // WP-V1.2-4: hydrate operator chat state on every fetch cycle so the
-  // concierge thread, active sessions, and per-agent direct-chat history
-  // all reflect what the server holds. Each call tolerates 422
-  // (chat not wired); the surfaces degrade to honest empty states.
+  // WP-V1.2 reshape: hydrate the concierge thread on every fetch cycle.
+  // The direct-agent surface was removed; the inspect panel is fetched
+  // lazily on click rather than maintained in state.
   await fetchConciergeHistory();
-  await fetchActiveSessions();
 }
 
 // Tier 1 lockdown click. Two-step: POST returns 202 + inbox_item_id, button
@@ -1565,24 +1398,14 @@ async function onAgentControl(agentId, action) {
 }
 
 async function onInboxAction(itemId, action) {
-  // Find the agent_id this inbox item is bound to (if any) so we can
-  // surface the in-flight busy state on the inline approval card and
-  // clean up pendingApprovalByAgentId after resolve. Look in the inbox
-  // first, then fall back to any pending-approval mapping (covers the
-  // race where the inbox SSE event has not yet arrived).
+  // WP-V1.2 reshape: direct-agent chat surface removed; the
+  // pending-approval bookkeeping that previously synced with chat
+  // session state is gone. Inbox approve/deny now is a clean inbox-only
+  // resolve with the lockdown / exit-drill side effects preserved.
+  // After approve, the inspect panel for the bound agent (if any) is
+  // re-fetched via the route, not through state mutation.
   const item0 = state.inbox.find(function (x) { return x.item_id === itemId; });
-  let boundAgentId = (item0 && item0.agent_id) || null;
-  if (!boundAgentId) {
-    const map = state.chat.directAgent.pendingApprovalByAgentId || {};
-    const keys = Object.keys(map);
-    for (let i = 0; i < keys.length; i++) {
-      if (map[keys[i]] === itemId) { boundAgentId = keys[i]; break; }
-    }
-  }
-  if (boundAgentId && (action === "approve" || action === "deny")) {
-    state.chat.directAgent.pendingResolveByAgentId[boundAgentId] = action;
-    rerender();
-  }
+  const boundAgentId = (item0 && item0.agent_id) || null;
   try {
     const r = await api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST", body: {} });
     // Tier 1 lockdown engagement: the approve handler triggers the controller
@@ -1598,54 +1421,17 @@ async function onInboxAction(itemId, action) {
       // activity feed. v1.1 ships projection-only.
       state.exitDrill.bundleResult = { bundle_dir: "(see activity feed)", manifest_hash: "" };
     }
-    // Clear pending-approval bookkeeping so the agent panel transitions
-    // out of the inline approval card. fetchActiveSessions called inside
-    // fetchAll will re-set sessionByAgentId for approve, dropping into
-    // state-3 (active session); deny falls into state-1 (CTA).
-    if (boundAgentId) {
-      delete state.chat.directAgent.pendingApprovalByAgentId[boundAgentId];
-    }
     await fetchAll();
-    // After approve on a direct-agent chat opening, route the operator
-    // straight to the agent-detail panel so the active chat surface is
-    // visible without needing a sidebar click. F6 fix: prior behavior
-    // left the operator wherever they were when the round-trip
-    // completed, with no visible affordance back into the chat.
+    // After approve on an agent-bound inbox item, refresh the inspect
+    // panel for that agent if the operator is currently viewing it, so
+    // the panel reflects the resolved approval.
     if (
       action === "approve" &&
       boundAgentId &&
-      state.chat.directAgent.sessionByAgentId[boundAgentId]
+      state.selectedAgentId === boundAgentId &&
+      state.chat.inspect.panelByAgentId[boundAgentId]
     ) {
-      state.selectedAgentId = boundAgentId;
-      if (location.hash !== "#agent-detail") {
-        location.hash = "agent-detail";
-      } else {
-        // Same-route reassignment does not fire hashchange; force a
-        // route refresh so renderMain picks up the new session state.
-        setRoute("agent-detail");
-      }
-      toast(
-        "Direct chat session open with " + boundAgentId + ". Type below or end the session.",
-        "info",
-      );
-      // Defer focus until the next tick so the rerender below has run
-      // and the composer input is in the DOM.
-      setTimeout(function () {
-        const main = document.getElementById("main");
-        if (!main) return;
-        const el = main.querySelector(
-          'input[data-action="direct-agent-input"][data-agent-id="' + boundAgentId + '"]'
-        );
-        if (el && typeof el.focus === "function") {
-          el.focus();
-          // Scroll the chat surface into view so the composer + history
-          // are above the fold even on shorter viewports.
-          const card = el.closest(".concierge-card");
-          if (card && typeof card.scrollIntoView === "function") {
-            card.scrollIntoView({ block: "start", behavior: "smooth" });
-          }
-        }
-      }, 0);
+      void onAgentInspectOpen(boundAgentId);
     }
     rerender();
   } catch (e) {
@@ -1654,11 +1440,6 @@ async function onInboxAction(itemId, action) {
       toast("Tier 1 items cannot be dismissed. Approve or deny.", "error");
     } else {
       toast("Inbox action failed: " + e.message, "error");
-    }
-  } finally {
-    if (boundAgentId) {
-      delete state.chat.directAgent.pendingResolveByAgentId[boundAgentId];
-      rerender();
     }
   }
 }
@@ -1772,39 +1553,9 @@ function schedulePolling() {
   setInterval(function () { fetchAll().then(rerender); }, 5000);
 }
 
-// v1.2.x F9: poll direct-agent chat history every 2s while at least one
-// active session exists. The wrapped agent's reply lands via the
-// chat-server MCP subprocess on a separate process boundary; the
-// dashboard process has no SSE channel for it in v1.2 (SSE upgrade is
-// v1.3 work). Polling is the honest minimum: invisible to the operator
-// in steady state, picks up replies within ~2s of their arrival, and
-// auto-stops when no active sessions exist.
-//
-// Diff-and-render: only rerender when message count changes for any
-// tracked agent. This avoids UI jitter from a no-op poll cycle.
-async function pollDirectAgentChatHistory() {
-  var sessions = state.chat.directAgent.sessionByAgentId || {};
-  var agentIds = Object.keys(sessions);
-  if (agentIds.length === 0) return;
-  var changed = false;
-  for (var i = 0; i < agentIds.length; i++) {
-    var aid = agentIds[i];
-    if (!sessions[aid] || sessions[aid].closed_at) continue;
-    var beforeLen = (state.chat.directAgent.threadByAgentId[aid] || []).length;
-    await fetchDirectAgentHistory(aid);
-    var afterLen = (state.chat.directAgent.threadByAgentId[aid] || []).length;
-    if (afterLen !== beforeLen) changed = true;
-  }
-  if (changed) rerender();
-}
-
-function scheduleDirectAgentChatPoll() {
-  setInterval(function () {
-    pollDirectAgentChatHistory().catch(function () {
-      // Tolerate transient fetch failures; next tick retries.
-    });
-  }, 2000);
-}
+// WP-V1.2 reshape: the F9 polling loop for direct-agent chat history
+// was removed with the chat surface. The inspect panel is fetched
+// lazily on click and is read-only; no streaming updates required.
 
 // ── Rerender ───────────────────────────────────────────────────────────
 function rerender() {
@@ -1876,28 +1627,24 @@ document.addEventListener("click", function (ev) {
     }
     return;
   }
-  // WP-V1.2-4 direct-agent handlers ───────────────────────────────
-  if (action === "direct-agent-start" && agentId) return void onDirectAgentStart(agentId);
-  if (action === "direct-agent-submit" && agentId) { ev.preventDefault(); return void onDirectAgentSend(agentId); }
-  if (action === "direct-agent-send" && agentId) { ev.preventDefault(); return void onDirectAgentSend(agentId); }
-  if (action === "direct-agent-end" && agentId) return void onDirectAgentEnd(agentId);
+  // WP-V1.2 reshape click-to-inspect handler ────────────────────────
+  if (action === "agent-inspect-open" && agentId) return void onAgentInspectOpen(agentId);
   if (action === "exit-export-start") return void onExitExportStart();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
   if (action === "open-agent" && agentId) { state.selectedAgentId = agentId; location.hash = "agent-detail"; return; }
-  // Click-to-chat from the fortress-column agent rows: navigate to the
-  // agent-detail view AND fire the synchronous /session/start route so
-  // the chat surface mounts already-open. The optimistic "Opening..."
-  // pane (clickInflightAgentId) renders during the round-trip; the
-  // route's response populates sessionByAgentId and the chat surface
-  // takes over. Same chat-surface component as the Agents-view CTA.
-  if (action === "open-agent-chat" && agentId) {
+  // Click-to-inspect from the fortress-column agent rows (PR #100
+  // sidebar wire-up): navigate to the agent-detail view AND fire the
+  // synchronous /inspect/open route so the panel renders already-loaded.
+  // Same component as the Agents-view CTA; the optimistic "Opening..."
+  // pane (openingAgentId) renders during the round-trip.
+  if (action === "agent-row-inspect-open" && agentId) {
     state.selectedAgentId = agentId;
     if (location.hash !== "#agent-detail") {
       location.hash = "agent-detail";
     } else {
       setRoute("agent-detail");
     }
-    void onDirectAgentStart(agentId);
+    void onAgentInspectOpen(agentId);
     return;
   }
   // Keyboard activation for the role="button" agent-row-head: Enter and
@@ -1946,14 +1693,14 @@ document.addEventListener("click", function (ev) {
 // The agent-row-head is a div with role="button" + tabindex="0", so it
 // is focusable but does not activate on Enter/Space the way a real
 // button does. This handler restores native button keyboard semantics
-// for the click-to-chat surface only; other data-action elements are
-// real buttons and inherit Enter/Space natively.
+// for the click-to-inspect surface only; other data-action elements
+// are real buttons and inherit Enter/Space natively.
 document.addEventListener("keydown", function (ev) {
   if (ev.key !== "Enter" && ev.key !== " ") return;
   const rawTgt = ev.target;
   if (!(rawTgt instanceof Element)) return;
   const action = rawTgt.getAttribute("data-action");
-  if (action !== "open-agent-chat") return;
+  if (action !== "agent-row-inspect-open") return;
   const agentId = rawTgt.getAttribute("data-agent-id");
   if (!agentId) return;
   ev.preventDefault();
@@ -1963,7 +1710,7 @@ document.addEventListener("keydown", function (ev) {
   } else {
     setRoute("agent-detail");
   }
-  void onDirectAgentStart(agentId);
+  void onAgentInspectOpen(agentId);
 });
 
 // Intelligence picker: capture password / text input updates without
@@ -1981,8 +1728,6 @@ document.addEventListener("input", function (ev) {
     // Mirror composer text into state without rerender so keystrokes
     // do not clobber the input element's value or caret position.
     state.chat.concierge.composer = tgt.value;
-  } else if (action === "direct-agent-input") {
-    state.chat.directAgent.composer = tgt.value;
   }
 });
 
@@ -2003,5 +1748,4 @@ if (mq) mq.addEventListener("change", function (e) {
 fetchAll().then(function () { rerender(); });
 bindHashRoute();
 connectStream();
-scheduleDirectAgentChatPoll();
 `;

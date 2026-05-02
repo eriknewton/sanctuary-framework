@@ -28,14 +28,10 @@ export {
 
 export {
   CONCIERGE_THREAD_KEY,
-  DEFAULT_SESSION_TIMEOUT_MS,
   OPERATOR_CHAT_MAX_THREAD_LENGTH,
   type ConciergeResponse,
-  type DirectAgentSendResponse,
   type OperatorChatMessage,
   type OperatorChatRole,
-  type OperatorChatSession,
-  type OperatorChatSessionState,
   type OperatorChatSurface,
   type OperatorChatThread,
 } from "./operator-chat-types.js";

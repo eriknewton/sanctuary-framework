@@ -48,16 +48,19 @@ export const HUB_ROUTES = {
   FORTRESS_LOCKDOWN: "/api/hub/fortress/lockdown",
   FORTRESS_EXIT_BUNDLE_EXPORT: "/api/hub/fortress/exit-bundle/export",
   /**
-   * Operator chat routes (WP-V1.2-4). Concierge is fortress-scoped;
-   * direct-agent chat is per-agent and Tier 1 gated on session-open.
+   * Operator concierge chat routes (WP-V1.2-4). Concierge is fortress-
+   * scoped; the direct-agent chat surface was removed in the v1.2
+   * reshape and replaced with the click-to-inspect panel below.
    */
   CHAT_CONCIERGE_SEND: "/api/hub/chat/concierge",
   CHAT_CONCIERGE_HISTORY: "/api/hub/chat/concierge/history",
-  CHAT_AGENT_HISTORY: "/api/hub/chat/agents/:id/history",
-  CHAT_AGENT_SESSION_START: "/api/hub/chat/agents/:id/session/start",
-  CHAT_AGENT_SESSION_END: "/api/hub/chat/agents/:id/session/end",
-  CHAT_AGENT_SESSION_MESSAGE: "/api/hub/chat/agents/:id/message",
-  CHAT_SESSIONS_LIST: "/api/hub/chat/sessions",
+  /**
+   * Click-to-inspect panel (WP-V1.2 reshape). Returns the agent's
+   * recent activity feed, pending Tier 1 approvals routed through this
+   * agent, and policy summary. Replaces the `/api/hub/chat/agents/:id/
+   * session/*` direct-agent routes.
+   */
+  AGENT_INSPECT_OPEN: "/api/hub/agents/:id/inspect/open",
 } as const;
 
 /**

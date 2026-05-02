@@ -252,7 +252,7 @@ The release adds four new pillars on top of v0.10.6 / v1.0.0-rc.2: query privacy
 
 ### Deferred (out of v1.1 scope)
 
-- **v1.4+ Crypto Agility Sprint** — bundled real RFC 9420 MLS plus ML-DSA / ML-KEM-768 hybrid primitives. The `@noble/curves` and `@noble/hashes` v1 -> v2 majors gate on this sprint.
+- **v1.4+ Crypto Agility Sprint** — bundled next-generation messaging-layer-security plus ML-DSA / ML-KEM-768 hybrid primitives. The `@noble/curves` and `@noble/hashes` v1 -> v2 majors gate on this sprint.
 - **v1.2 Mobile Operator Companion** — phone as approval surface, inbox, and emergency brake. Not a full mobile runtime.
 - **v1.3 Public Federation** — cross-operator discovery, messaging, and reputation.
 - **v1.4+ Key 17 sovereign-signer adapter** for x402 / Agentic.Market payments. Sanctuary signs Identity + x402 requests + AP2 mandates; Verascore signs Reputation + Validation; x402 wallets stay Coinbase-custodial.
