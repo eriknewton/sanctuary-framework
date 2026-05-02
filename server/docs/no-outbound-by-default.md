@@ -1,0 +1,139 @@
+# Sanctuary, no outbound by default
+
+**Status:** active rule (WP-V1.2 reshape)
+**Date:** 2026-05-01
+**Scope:** server runtime, dashboard, MCP servers, broker, hub
+**Enforcement:** `server/scripts/outbound-audit.sh` (manual + acceptance drill)
+
+## The rule
+
+Sanctuary initiates no network connection except to operator-configured
+endpoints. Specifically, the server runtime, dashboard, MCP servers,
+broker, and hub MUST NOT:
+
+- Phone home for telemetry, version checks, or analytics.
+- Run a Sanctuary-hosted SMTP relay or any other Sanctuary-hosted
+  outbound channel.
+- Open any connection to a destination the operator did not explicitly
+  configure (substrate endpoint, webhook URL, federation peer, etc.).
+
+The only outbound destinations a fresh Sanctuary install reaches are:
+
+1. **localhost** (broker stdio, dashboard, local-Ollama if the operator
+   selected it as substrate).
+2. **Operator-configured substrate endpoints** declared in the
+   intelligence-layer config (Venice.ai, frontier provider with filter,
+   custom endpoints).
+3. **Operator-configured outbound channels** declared in the principal
+   policy or hub config (webhook approval channel pointed at an
+   operator-chosen URL, future operator-chosen SMTP for daily digest,
+   etc.). All such channels are explicit operator opt-in, default off.
+
+## Why
+
+**Sovereignty-strict operators will not allow phone-home.** Enterprises
+running Sanctuary as the operator-sovereign agent control plane reject
+any vendor-controlled network egress on principle. A single
+Sanctuary-initiated connection to a vendor endpoint disqualifies the
+product for the segment we are building for. The rule is load-bearing
+to the substrate-position thesis.
+
+**The Castle Layer 1 enforcement story (RFC-0003) layers on this.**
+Once the OS-level egress filter ships, even prompt-injected wrapped
+agents cannot bypass operator-configured destinations. The "no outbound
+by default" rule guarantees the Sanctuary substrate itself never
+contributes to that egress profile, so the wall has a clean baseline to
+enforce against.
+
+**Trust precondition for the audit log.** The audit log is the operator's
+source of truth for what their fortress has done. If the runtime can
+quietly call out to vendor endpoints, the log is incomplete by
+construction. The rule keeps the log honest.
+
+## How the rule is enforced
+
+### Build-time
+
+- No HTTP client libraries are imported into the runtime hot path
+  except for the operator-configured substrate adapters and the
+  operator-configured webhook channel.
+- Pre-commit grep gates would catch a `fetch(`, `https.request(`, etc.
+  introduction in unauthorized modules. (Suggested follow-up:
+  `.githooks/pre-commit` extension; not blocking this rule.)
+
+### Runtime
+
+- `server/scripts/outbound-audit.sh` boots Sanctuary in a smoke fortress
+  with no operator-configured external substrates, captures all outbound
+  connections from the process tree for the soak window
+  (`SOAK_SECONDS`, default 60), and asserts every destination is in the
+  allowed-pattern list (localhost variants only by default).
+- Failure exits non-zero and prints the unauthorized destinations.
+- Run as part of the v1.2.0 acceptance drill before npm publish.
+- `--report-only` mode prints the destination list without asserting,
+  for triage when the rule legitimately needs an addition.
+
+## Operator-opt-in escape hatches
+
+The rule applies to default behavior. Operators can explicitly enable
+outbound channels by configuring them:
+
+- **Substrate endpoint:** `intelligence/config.json` substrate selection
+  (Venice, frontier with filter, custom). The substrate selector is the
+  single authority for inference egress; no other module calls vendor
+  inference endpoints.
+- **Webhook approval channel:** `principal-policy/channel` set to
+  `webhook` with operator-chosen URL. HMAC-signed POSTs only; payload
+  is operation metadata, never state content.
+- **Future daily digest delivery:** when daily digest ships, default is
+  OS notification + dashboard view + signed local file write. Email
+  (operator-chosen SMTP), Slack webhook, Telegram bot are explicit
+  operator opt-in with operator-chosen endpoints.
+
+Each escape hatch must be:
+
+1. Configured by the operator (no Sanctuary-shipped default endpoint).
+2. Documented as outbound in the `outbound-audit.sh` allowed-pattern
+   list when enabled, with a comment naming the operator-config source.
+3. Logged in the audit chain on every use.
+
+## Related
+
+- RFC-0003 Castle Architecture (`server/rfcs/`, queued).
+- WP-V1.x-CASTLE-WALL milestone (Phase 1 macOS+Linux egress filter).
+- Substrate selector (`server/src/intelligence/selector.ts`) is the
+  canonical inference egress point.
+- Webhook approval channel
+  (`server/src/principal-policy/approval-channel.ts`).
+
+## Baseline result on this PR
+
+Captured 2026-05-01 against `wp-v1.2-chat-removal-reshape` HEAD with a
+15-second soak (lower bound; production drill will run the default
+60-second window):
+
+```
+outbound-audit: soak window 15s, platform Darwin
+outbound-audit: Sanctuary running as PID 29986. Capturing outbound connections...
+outbound-audit: soak complete; analyzing connections...
+
+outbound-audit: connection summary
+  total unique connections: 0
+  unauthorized destinations: 0
+
+outbound-audit: PASS — no unauthorized outbound destinations.
+```
+
+The dashboard process opened zero outbound connections during the soak.
+This baseline ships with the PR; subsequent changes that introduce a
+new outbound destination (substrate adapter, federation peer, future
+daily-digest channel) MUST update the allowed-pattern list and surface
+the addition in PR review.
+
+## Open follow-ups
+
+- Wiki copy at `Wiki/decisions/sanctuary-no-outbound-by-default.md`
+  (separate `newton-wiki` repo; coordinator drafts when convenient).
+- Pre-commit grep gate for unauthorized HTTP client imports.
+- CI integration: a sanitized variant of `outbound-audit.sh` that runs
+  in the Linux CI runner against a stubbed substrate.
