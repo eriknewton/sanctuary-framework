@@ -1291,14 +1291,15 @@ function renderFortress() {
             : "This harness does not support " + mi.label.toLowerCase() + ".";
           return '<button class="btn" data-action="agent-' + mi.action + '" data-agent-id="' + escHtml(a.agent_id) + '"' + (mi.enabled ? '' : ' disabled') + ' title="' + escHtml(tip) + '">' + escHtml(mi.label) + '</button>';
         }).join("");
-        // Click-to-chat: the head sub-row is the click target. A click
-        // navigates to agent-detail and opens a direct-chat session
-        // synchronously via the PR #98 route. Lifecycle buttons in
-        // agent-row-actions still take precedence (the dispatcher walks
-        // up to the closest data-action ancestor; buttons are siblings,
-        // not children, of the head).
+        // Click-to-inspect: the head sub-row is the click target. A click
+        // navigates to agent-detail and opens the read-only inspect panel
+        // synchronously via the WP-V1.2 reshape route (the original PR #98
+        // chat wire-up was repurposed when direct-agent chat was removed
+        // from v1.2). Lifecycle buttons in agent-row-actions still take
+        // precedence (the dispatcher walks up to the closest data-action
+        // ancestor; buttons are siblings, not children, of the head).
         return '<div class="row agent-row" data-agent-row="' + escHtml(a.agent_id) + '">' +
-          '<div class="agent-row-head" data-action="open-agent-chat" data-agent-id="' + escHtml(a.agent_id) + '" role="button" tabindex="0" title="Open direct chat with ' + escHtml(a.agent_id) + '">' +
+          '<div class="agent-row-head" data-action="agent-row-inspect-open" data-agent-id="' + escHtml(a.agent_id) + '" role="button" tabindex="0" title="Open inspect panel for ' + escHtml(a.agent_id) + '">' +
             '<span class="glyph ' + map.glyph + '" title="' + escHtml(REASON_LABELS[a.status_reason_class] || "") + '"></span>' +
             '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong></div>' +
             '<span class="pill">' + escHtml(map.label) + '</span>' +
@@ -1636,7 +1637,7 @@ document.addEventListener("click", function (ev) {
   // synchronous /inspect/open route so the panel renders already-loaded.
   // Same component as the Agents-view CTA; the optimistic "Opening..."
   // pane (openingAgentId) renders during the round-trip.
-  if (action === "open-agent-chat" && agentId) {
+  if (action === "agent-row-inspect-open" && agentId) {
     state.selectedAgentId = agentId;
     if (location.hash !== "#agent-detail") {
       location.hash = "agent-detail";
@@ -1699,7 +1700,7 @@ document.addEventListener("keydown", function (ev) {
   const rawTgt = ev.target;
   if (!(rawTgt instanceof Element)) return;
   const action = rawTgt.getAttribute("data-action");
-  if (action !== "open-agent-chat") return;
+  if (action !== "agent-row-inspect-open") return;
   const agentId = rawTgt.getAttribute("data-agent-id");
   if (!agentId) return;
   ev.preventDefault();
