@@ -335,12 +335,13 @@ export interface HubServiceDeps {
   now?: () => Date;
   /**
    * Optional operator-chat service. When supplied, the hub exposes the
-   * concierge + direct-agent chat endpoints; when omitted, those routes
-   * return HubCapabilityError. Construction-time injection lets the
-   * dashboard wiring layer build the chat service against the same
-   * audit log + master key + storage backend as the rest of the v1.1
-   * hub without forcing the chat-service constructor through a circular
-   * import.
+   * concierge chat endpoints; when omitted, those routes return
+   * HubCapabilityError. Construction-time injection lets the dashboard
+   * wiring layer build the chat service against the same audit log +
+   * master key + storage backend as the rest of the v1.1 hub without
+   * forcing the chat-service constructor through a circular import.
+   * The direct-agent chat surface was removed in the v1.2 reshape
+   * (2026-04-30); the field name is retained for source compatibility.
    */
   operatorChat?: OperatorChatService;
 }
