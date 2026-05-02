@@ -16,12 +16,12 @@ import {
   verifySignature,
 } from "../../src/principal-policy/webhook.js";
 import type { ApprovalRequest } from "../../src/principal-policy/types.js";
+import {
+  bindWithRetry,
+  randomTestPort,
+} from "../util/port-collision-retry.js";
 
 const WEBHOOK_SECRET = "test-webhook-secret-abc123";
-
-function randomPort(): number {
-  return 10000 + Math.floor(Math.random() * 50000);
-}
 
 // ── Mock Webhook Receiver ──────────────────────────────────────────────
 
@@ -59,9 +59,18 @@ function createMockReceiver(port: number): {
   return {
     server,
     received,
+    // start() must surface listen errors (e.g. EADDRINUSE) to its caller so
+    // the bindWithRetry wrapper above can detect the collision and retry
+    // with a fresh port. The pre-fix shape only registered a success
+    // listener and would hang forever on EADDRINUSE.
     start: () =>
-      new Promise((resolve) => {
-        server.listen(port, "127.0.0.1", () => resolve());
+      new Promise((resolve, reject) => {
+        const onError = (err: NodeJS.ErrnoException) => reject(err);
+        server.once("error", onError);
+        server.listen(port, "127.0.0.1", () => {
+          server.removeListener("error", onError);
+          resolve();
+        });
       }),
     stop: () =>
       new Promise((resolve) => {
@@ -109,21 +118,35 @@ describe("Webhook Approval Channel", () => {
     let callbackPort: number;
 
     beforeEach(async () => {
-      receiverPort = randomPort();
-      callbackPort = randomPort();
-
-      receiver = createMockReceiver(receiverPort);
-      await receiver.start();
-
-      webhook = new WebhookApprovalChannel({
-        webhook_url: `http://127.0.0.1:${receiverPort}/webhook`,
-        webhook_secret: WEBHOOK_SECRET,
-        callback_port: callbackPort,
-        callback_host: "127.0.0.1",
-        timeout_seconds: 2,
-        auto_deny: true,
+      // Acquire both ports under bindWithRetry so an EADDRINUSE collision
+      // on either listener triggers a clean retry with a fresh pair. The
+      // setup tears down the receiver first if the webhook listener fails
+      // so partial bindings do not leak file descriptors across attempts.
+      const result = await bindWithRetry(async () => {
+        const rp = randomTestPort();
+        const cp = randomTestPort();
+        const rec = createMockReceiver(rp);
+        await rec.start();
+        const wh = new WebhookApprovalChannel({
+          webhook_url: `http://127.0.0.1:${rp}/webhook`,
+          webhook_secret: WEBHOOK_SECRET,
+          callback_port: cp,
+          callback_host: "127.0.0.1",
+          timeout_seconds: 2,
+          auto_deny: true,
+        });
+        try {
+          await wh.start();
+        } catch (err) {
+          await rec.stop();
+          throw err;
+        }
+        return { rec, wh, rp, cp };
       });
-      await webhook.start();
+      receiver = result.rec;
+      webhook = result.wh;
+      receiverPort = result.rp;
+      callbackPort = result.cp;
     });
 
     afterEach(async () => {
@@ -205,21 +228,31 @@ describe("Webhook Approval Channel", () => {
     let callbackPort: number;
 
     beforeEach(async () => {
-      receiverPort = randomPort();
-      callbackPort = randomPort();
-
-      receiver = createMockReceiver(receiverPort);
-      await receiver.start();
-
-      webhook = new WebhookApprovalChannel({
-        webhook_url: `http://127.0.0.1:${receiverPort}/webhook`,
-        webhook_secret: WEBHOOK_SECRET,
-        callback_port: callbackPort,
-        callback_host: "127.0.0.1",
-        timeout_seconds: 5,
-        auto_deny: true,
+      const result = await bindWithRetry(async () => {
+        const rp = randomTestPort();
+        const cp = randomTestPort();
+        const rec = createMockReceiver(rp);
+        await rec.start();
+        const wh = new WebhookApprovalChannel({
+          webhook_url: `http://127.0.0.1:${rp}/webhook`,
+          webhook_secret: WEBHOOK_SECRET,
+          callback_port: cp,
+          callback_host: "127.0.0.1",
+          timeout_seconds: 5,
+          auto_deny: true,
+        });
+        try {
+          await wh.start();
+        } catch (err) {
+          await rec.stop();
+          throw err;
+        }
+        return { rec, wh, rp, cp };
       });
-      await webhook.start();
+      receiver = result.rec;
+      webhook = result.wh;
+      receiverPort = result.rp;
+      callbackPort = result.cp;
     });
 
     afterEach(async () => {
@@ -378,21 +411,31 @@ describe("Webhook Approval Channel", () => {
     let callbackPort: number;
 
     beforeEach(async () => {
-      receiverPort = randomPort();
-      callbackPort = randomPort();
-
-      receiver = createMockReceiver(receiverPort);
-      await receiver.start();
-
-      webhook = new WebhookApprovalChannel({
-        webhook_url: `http://127.0.0.1:${receiverPort}/webhook`,
-        webhook_secret: WEBHOOK_SECRET,
-        callback_port: callbackPort,
-        callback_host: "127.0.0.1",
-        timeout_seconds: 1,
-        auto_deny: false, // SEC-002: this is now ignored
+      const result = await bindWithRetry(async () => {
+        const rp = randomTestPort();
+        const cp = randomTestPort();
+        const rec = createMockReceiver(rp);
+        await rec.start();
+        const wh = new WebhookApprovalChannel({
+          webhook_url: `http://127.0.0.1:${rp}/webhook`,
+          webhook_secret: WEBHOOK_SECRET,
+          callback_port: cp,
+          callback_host: "127.0.0.1",
+          timeout_seconds: 1,
+          auto_deny: false, // SEC-002: this is now ignored
+        });
+        try {
+          await wh.start();
+        } catch (err) {
+          await rec.stop();
+          throw err;
+        }
+        return { rec, wh, rp, cp };
       });
-      await webhook.start();
+      receiver = result.rec;
+      webhook = result.wh;
+      receiverPort = result.rp;
+      callbackPort = result.cp;
     });
 
     afterEach(async () => {
@@ -418,21 +461,29 @@ describe("Webhook Approval Channel", () => {
 
   describe("Cleanup", () => {
     it("stop() resolves all pending as deny", async () => {
-      const receiverPort = randomPort();
-      const callbackPort = randomPort();
-
-      const receiver = createMockReceiver(receiverPort);
-      await receiver.start();
-
-      const webhook = new WebhookApprovalChannel({
-        webhook_url: `http://127.0.0.1:${receiverPort}/webhook`,
-        webhook_secret: WEBHOOK_SECRET,
-        callback_port: callbackPort,
-        callback_host: "127.0.0.1",
-        timeout_seconds: 10,
-        auto_deny: true,
+      const setup = await bindWithRetry(async () => {
+        const rp = randomTestPort();
+        const cp = randomTestPort();
+        const rec = createMockReceiver(rp);
+        await rec.start();
+        const wh = new WebhookApprovalChannel({
+          webhook_url: `http://127.0.0.1:${rp}/webhook`,
+          webhook_secret: WEBHOOK_SECRET,
+          callback_port: cp,
+          callback_host: "127.0.0.1",
+          timeout_seconds: 10,
+          auto_deny: true,
+        });
+        try {
+          await wh.start();
+        } catch (err) {
+          await rec.stop();
+          throw err;
+        }
+        return { rec, wh };
       });
-      await webhook.start();
+      const receiver = setup.rec;
+      const webhook = setup.wh;
 
       const request: ApprovalRequest = {
         operation: "state_export",

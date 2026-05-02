@@ -11,9 +11,24 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { persistUserProvidedPassphrase } from "../src/cocoon/passphrase.js";
+import {
+  bindWithRetry,
+  randomTestPort,
+} from "./util/port-collision-retry.js";
 
-function randomPort(): number {
-  return 10000 + Math.floor(Math.random() * 50000);
+/**
+ * Boot startStandaloneDashboard with a freshly chosen port, retrying on
+ * EADDRINUSE up to 3 times with a small jitter. See
+ * server/test/util/port-collision-retry.ts for rationale.
+ */
+async function startDashboardOnFreePort(
+  options: Omit<Parameters<typeof startStandaloneDashboard>[0], "port"> = {},
+): Promise<{ dashboard: DashboardApprovalChannel; port: number }> {
+  return bindWithRetry(async () => {
+    const port = randomTestPort();
+    const dashboard = await startStandaloneDashboard({ ...options, port });
+    return { dashboard, port };
+  });
 }
 
 describe("Standalone Dashboard", () => {
@@ -41,18 +56,17 @@ describe("Standalone Dashboard", () => {
   });
 
   it("starts a standalone dashboard HTTP server", async () => {
-    const port = randomPort();
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-standalone";
 
-    dashboard = await startStandaloneDashboard({
+    const result = await startDashboardOnFreePort({
       passphrase: "test-passphrase-standalone",
-      port,
       host: "127.0.0.1",
     });
+    dashboard = result.dashboard;
 
     // Dashboard should be serving
-    const res = await fetch(`http://127.0.0.1:${port}/`);
+    const res = await fetch(`http://127.0.0.1:${result.port}/`);
     expect(res.status).toBe(200);
     const text = await res.text();
     // Should show login page (we didn't provide auth)
@@ -60,18 +74,17 @@ describe("Standalone Dashboard", () => {
   });
 
   it("serves audit log API in standalone mode", async () => {
-    const port = randomPort();
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-audit";
 
-    dashboard = await startStandaloneDashboard({
+    const result = await startDashboardOnFreePort({
       passphrase: "test-passphrase-audit",
-      port,
       host: "127.0.0.1",
     });
+    dashboard = result.dashboard;
 
     // Authenticate and get audit log
-    const res = await fetch(`http://127.0.0.1:${port}/api/audit-log`, {
+    const res = await fetch(`http://127.0.0.1:${result.port}/api/audit-log`, {
       headers: { Authorization: "Bearer test-token-audit" },
     });
     expect(res.status).toBe(200);
@@ -87,17 +100,16 @@ describe("Standalone Dashboard", () => {
   });
 
   it("serves policy status in standalone mode", async () => {
-    const port = randomPort();
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-status";
 
-    dashboard = await startStandaloneDashboard({
+    const result = await startDashboardOnFreePort({
       passphrase: "test-passphrase-status",
-      port,
       host: "127.0.0.1",
     });
+    dashboard = result.dashboard;
 
-    const res = await fetch(`http://127.0.0.1:${port}/api/status`, {
+    const res = await fetch(`http://127.0.0.1:${result.port}/api/status`, {
       headers: { Authorization: "Bearer test-token-status" },
     });
     expect(res.status).toBe(200);
@@ -108,44 +120,44 @@ describe("Standalone Dashboard", () => {
   });
 
   it("uses custom port from options", async () => {
-    const port = randomPort();
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
 
-    dashboard = await startStandaloneDashboard({
+    const result = await startDashboardOnFreePort({
       passphrase: "test-passphrase-port",
-      port,
       host: "127.0.0.1",
     });
+    dashboard = result.dashboard;
 
     // Should be accessible on the custom port
-    const res = await fetch(`http://127.0.0.1:${port}/`);
+    const res = await fetch(`http://127.0.0.1:${result.port}/`);
     expect(res.status).toBe(200);
   });
 
   it("requires credentials when existing data is present", async () => {
     // First run: create data with a passphrase
-    const port1 = randomPort();
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-creds";
 
-    dashboard = await startStandaloneDashboard({
+    const first = await startDashboardOnFreePort({
       passphrase: "first-run-passphrase",
-      port: port1,
       host: "127.0.0.1",
     });
+    dashboard = first.dashboard;
     await dashboard.stop();
     dashboard = null;
 
-    // Second run: no credentials should fail
+    // Second run: no credentials should fail. The expected failure is at the
+    // credentials-resolution stage which runs before any port is bound, so
+    // EADDRINUSE retry is irrelevant here. We still pick a random port for
+    // forward compatibility with code paths that may bind earlier.
     delete process.env.SANCTUARY_PASSPHRASE;
     delete process.env.SANCTUARY_RECOVERY_KEY;
     delete process.env.SANCTUARY_DASHBOARD_ENABLED;
 
-    const port2 = randomPort();
     let dashboard2: DashboardApprovalChannel | null = null;
     try {
       dashboard2 = await startStandaloneDashboard({
-        port: port2,
+        port: randomTestPort(),
         host: "127.0.0.1",
       });
       // If we get here, clean up and fail
@@ -159,18 +171,17 @@ describe("Standalone Dashboard", () => {
   });
 
   it("auto-generates auth token when set to 'auto'", async () => {
-    const port = randomPort();
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "auto";
 
-    dashboard = await startStandaloneDashboard({
+    const result = await startDashboardOnFreePort({
       passphrase: "test-passphrase-auto",
-      port,
       host: "127.0.0.1",
     });
+    dashboard = result.dashboard;
 
     // Should serve login page (auth is enabled with auto-generated token)
-    const res = await fetch(`http://127.0.0.1:${port}/`);
+    const res = await fetch(`http://127.0.0.1:${result.port}/`);
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text).toContain("Sanctuary");
@@ -183,7 +194,6 @@ describe("Standalone Dashboard", () => {
   // `Identities loaded: 0` when the env var was missing, which is broken on a
   // multi-tenant host where one env-var passphrase cannot unlock N tenants.
   it("v0.10.2: auto-loads the stored passphrase for the tenant when no env var is set", async () => {
-    const port = randomPort();
     const passphrase = "persisted-tenant-passphrase-0.10.2";
 
     // Pre-seed the tenant's passphrase exactly the way `sanctuary wrap` does.
@@ -202,12 +212,12 @@ describe("Standalone Dashboard", () => {
 
     // Boot with NO explicit passphrase — the dashboard must find the
     // persisted fallback-file entry by storage path and boot successfully.
-    dashboard = await startStandaloneDashboard({
-      port,
+    const result = await startDashboardOnFreePort({
       host: "127.0.0.1",
     });
+    dashboard = result.dashboard;
 
-    const res = await fetch(`http://127.0.0.1:${port}/`);
+    const res = await fetch(`http://127.0.0.1:${result.port}/`);
     expect(res.status).toBe(200);
   });
 
@@ -218,12 +228,10 @@ describe("Standalone Dashboard", () => {
   it("v0.10.2: loopback callers skip the login prompt once identities decrypt", async () => {
     // Seed one identity encrypted under passphrase A so the second boot's
     // `loadResult.loaded > 0` gate flips.
-    const seedPort = randomPort();
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "autoauth-seed-token";
-    const seed = await startStandaloneDashboard({
+    const seed = await startDashboardOnFreePort({
       passphrase: "autoauth-tenant-passphrase",
-      port: seedPort,
       host: "127.0.0.1",
     });
 
@@ -247,20 +255,19 @@ describe("Standalone Dashboard", () => {
       "passphrase"
     );
     await idMgr.save(storedIdentity);
-    await seed.stop();
+    await seed.dashboard.stop();
 
     // Real boot — auth token is set, but loopback callers should bypass it.
-    const port = randomPort();
-    dashboard = await startStandaloneDashboard({
+    const result = await startDashboardOnFreePort({
       passphrase: "autoauth-tenant-passphrase",
-      port,
       host: "127.0.0.1",
     });
+    dashboard = result.dashboard;
 
     // GET / from loopback with no Authorization header must serve the
     // dashboard HTML (not the login page). Pre-fix behaviour served the
     // login page here because auth_token was truthy.
-    const res = await fetch(`http://127.0.0.1:${port}/`);
+    const res = await fetch(`http://127.0.0.1:${result.port}/`);
     expect(res.status).toBe(200);
     const body = await res.text();
     // Login page contains "Auth Token" / "Session tokens expire" copy; the
@@ -269,7 +276,7 @@ describe("Standalone Dashboard", () => {
     expect(body).not.toMatch(/Session tokens expire/);
 
     // API endpoints must also work without a bearer token on loopback.
-    const statusRes = await fetch(`http://127.0.0.1:${port}/api/status`);
+    const statusRes = await fetch(`http://127.0.0.1:${result.port}/api/status`);
     expect(statusRes.status).toBe(200);
     const statusJson = await statusRes.json();
     expect(statusJson).toHaveProperty("pending_count");
@@ -283,13 +290,11 @@ describe("Standalone Dashboard", () => {
     };
     try {
       // First boot establishes encrypted state under passphrase A.
-      const port1 = randomPort();
       process.env.SANCTUARY_STORAGE_PATH = tempDir;
       process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-warn-a";
 
-      const first = await startStandaloneDashboard({
+      const first = await startDashboardOnFreePort({
         passphrase: "tenant-passphrase-A",
-        port: port1,
         host: "127.0.0.1",
       });
 
@@ -316,17 +321,15 @@ describe("Standalone Dashboard", () => {
       );
       await idMgr.save(storedIdentity);
 
-      await first.stop();
+      await first.dashboard.stop();
 
       // Second boot supplies a WRONG passphrase — encrypted identities exist
       // on disk, but the master key derived here cannot decrypt any of them.
-      const port2 = randomPort();
-      const second = await startStandaloneDashboard({
+      const second = await startDashboardOnFreePort({
         passphrase: "tenant-passphrase-B-WRONG",
-        port: port2,
         host: "127.0.0.1",
       });
-      dashboard = second;
+      dashboard = second.dashboard;
 
       const banner = logs.join("\n");
       expect(banner).toMatch(/Encrypted identities found but NONE loaded/);
