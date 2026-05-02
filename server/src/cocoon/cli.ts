@@ -248,6 +248,17 @@ export interface RunWrapDeps {
    * undefined.
    */
   rewriteConfig?: typeof rewriteConfigForCocoon;
+  /**
+   * Override the Claude Code permissions.allow installer (WP-V1.2 reshape).
+   * Production uses the bundled `installClaudeCodeAllowlist`; tests
+   * inject a stub to assert the call shape without touching the
+   * developer's real ~/.claude/settings.json.
+   */
+  installClaudeCodeAllowlist?: (
+    opts: import("./claude-code-allowlist.js").InstallClaudeCodeAllowlistOptions,
+  ) => Promise<
+    import("./claude-code-allowlist.js").InstallClaudeCodeAllowlistResult
+  >;
 }
 
 export async function runWrap(
@@ -587,6 +598,48 @@ export async function runWrap(
     backupPath
   );
   if (!verifyOk) process.exit(1);
+
+  // WP-V1.2 reshape: write the broker-tool identifiers to Claude Code's
+  // permissions.allow list at wrap time so the wrapped agent's routine
+  // broker calls (request_token, read_secret, list_grants, audit_query)
+  // run without a per-turn permission prompt for the operator. The
+  // broker's policy gate stops any write-side or destructive operation
+  // regardless of the allowlist; the allowlist only suppresses the
+  // Claude Code UI confirmation flow on routine reads. Best-effort:
+  // failure logs to stderr but does not fail wrap (operator can still
+  // grant permission interactively on first call).
+  if (agentConfig.platform === "claude-code") {
+    try {
+      const allowFn =
+        deps.installClaudeCodeAllowlist ??
+        (async (o) => {
+          const { installClaudeCodeAllowlist } = await import(
+            "./claude-code-allowlist.js"
+          );
+          return installClaudeCodeAllowlist(o);
+        });
+      const allowResult = await allowFn({});
+      if (allowResult.alreadyPresent) {
+        console.error(
+          `  Sanctuary broker tool allowlist already present at ${allowResult.installedAt}. No change.`,
+        );
+      } else {
+        console.error(
+          `  Sanctuary broker tool allowlist updated at ${allowResult.installedAt} ` +
+            `(${allowResult.added.length} ${allowResult.added.length === 1 ? "entry" : "entries"} added; ` +
+            `routine broker calls run without per-turn prompts).`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        `  Note: broker tool allowlist write failed (${(err as Error).message}). ` +
+          `Wrap is otherwise complete; Claude Code will prompt to approve ` +
+          `broker/request_token, broker/read_secret, broker/list_grants, ` +
+          `and broker/audit_query on first call. ` +
+          `Click "Always allow" once per tool to suppress future prompts.`,
+      );
+    }
+  }
 
   // v1.1.5 (Finding Z): persist a v1.1 hub `LocalAgentRecord` so the
   // dashboard's Agents view (`/api/hub/agents`, `/v1.1`) reflects the

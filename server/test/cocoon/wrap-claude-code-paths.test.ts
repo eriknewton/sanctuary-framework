@@ -179,10 +179,18 @@ describe("Claude Code config path probing (finding C)", () => {
     const deps = makeDeps();
     await runWrap({ claudeCode: true, noOpen: true }, deps);
 
-    // Bootstrap creates the canonical (first-listed) path: ~/.claude.json.
-    // Legacy path remains absent.
+    // Bootstrap creates the canonical (first-listed) path: ~/.claude.json
+    // for the MCP config. The WP-V1.2 reshape allowlist installer
+    // legitimately writes broker-tool permissions.allow entries to the
+    // legacy path (`~/.claude/settings.json`); the narrowed assertion is
+    // that the legacy path is NOT the MCP-config target (no mcpServers
+    // key), not that the file is absent.
     const written = JSON.parse(await readFile(claudeJsonPath, "utf-8"));
     expect(written.mcpServers.sanctuary).toBeDefined();
-    await expect(access(legacyPath)).rejects.toThrow();
+    if (await access(legacyPath).then(() => true, () => false)) {
+      const legacyContent = JSON.parse(await readFile(legacyPath, "utf-8"));
+      expect(legacyContent.mcpServers).toBeUndefined();
+      expect(Array.isArray(legacyContent.permissions?.allow)).toBe(true);
+    }
   });
 });
