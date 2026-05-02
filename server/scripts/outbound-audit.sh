@@ -18,8 +18,11 @@
 #   ./outbound-audit.sh --report-only       # print outbound list, no assertion
 #
 # Platform support:
-#   - macOS: uses `lsof -i -p <pid>` per-second poll
-#   - Linux: uses `ss -tunp` filtered by pid
+#   - macOS: uses `lsof -i -p <pid_csv>` per-second poll across the
+#     wrapped Sanctuary process tree (parent dashboard plus every
+#     descendant resolved via ps walk on each tick).
+#   - Linux: uses `ss -tunp` per-second poll, awk-filtered against the
+#     PID set of the Sanctuary process tree (parent plus descendants).
 #   - Other: exits 2 with "platform not supported"
 #
 # Exit codes:
@@ -97,28 +100,65 @@ fi
 
 echo "outbound-audit: Sanctuary running as PID $SANCTUARY_PID. Capturing outbound connections..."
 
+# Resolve the full process tree rooted at $SANCTUARY_PID. Walks ps output
+# breadth-first to include every descendant. Refreshed on every tick so
+# children that spawn mid-soak are picked up. The tree-vs-parent-only
+# fix closes the methodology gap Codex 5.5 second-opinion review flagged
+# on PR #103: filtering by parent PID alone misses outbound connections
+# opened by child processes (e.g., the Concordia sidecar, any spawned
+# substrate worker, future helper subprocesses), so a 0-connection
+# baseline against the parent PID is not general proof of "no outbound
+# by default."
+get_pid_tree() {
+  local root="$1"
+  local pids="$root"
+  local frontier="$root"
+  local next
+  while [ -n "$frontier" ]; do
+    next=$(ps -A -o pid=,ppid= 2>/dev/null | awk -v fset="$frontier" '
+      BEGIN { n = split(fset, parents, " "); for (i = 1; i <= n; i++) ps[parents[i]] = 1 }
+      ps[$2] { print $1 }
+    ')
+    if [ -z "$next" ]; then break; fi
+    pids="$pids $next"
+    frontier="$next"
+  done
+  echo "$pids" | tr ' ' '\n' | awk 'NF' | sort -u | tr '\n' ' '
+}
+
 # Per-second poll of the process tree's outbound connections. Append to
 # OUTBOUND_LOG; deduplicate at the end.
 END_TS=$(($(date +%s) + SOAK_SECONDS))
+TREE_LOG="$SMOKE_FORTRESS/process-tree.log"
 while [ "$(date +%s)" -lt "$END_TS" ]; do
   if ! kill -0 "$SANCTUARY_PID" 2>/dev/null; then
     echo "outbound-audit: Sanctuary process exited mid-soak. Log:" >&2
     cat "$SMOKE_LOG" >&2
     exit 2
   fi
+  TREE=$(get_pid_tree "$SANCTUARY_PID")
+  TREE=$(echo "$TREE" | sed -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//')
+  echo "$(date +%s) $TREE" >> "$TREE_LOG"
   case "$PLATFORM" in
     Darwin)
       # lsof -i lists IPv4/IPv6 connections; -nP suppresses DNS + port-name
-      # lookups so we record raw addresses; -a -p narrows to the process.
-      lsof -nP -i -a -p "$SANCTUARY_PID" 2>/dev/null \
-        | awk 'NR>1 && /->/ {print $9}' \
-        >> "$OUTBOUND_LOG" || true
+      # lookups so we record raw addresses; -a -p narrows to the process
+      # set. lsof accepts a comma-separated PID list.
+      TREE_CSV=$(echo "$TREE" | tr ' ' ',' | sed -e 's/,*$//' -e 's/^,*//')
+      if [ -n "$TREE_CSV" ]; then
+        lsof -nP -i -a -p "$TREE_CSV" 2>/dev/null \
+          | awk 'NR>1 && /->/ {print $9}' \
+          >> "$OUTBOUND_LOG" || true
+      fi
       ;;
     Linux)
-      # ss -tunp shows TCP+UDP with process info. Filter by the PID match
-      # in the users column.
+      # ss -tunp shows TCP+UDP with process info. Filter by any PID in
+      # the tree set via an awk associative-array match.
       ss -tunp 2>/dev/null \
-        | awk -v pid="$SANCTUARY_PID" '$NF ~ "pid="pid"," {print $5}' \
+        | awk -v pids="$TREE" '
+            BEGIN { n = split(pids, p, " "); for (i = 1; i <= n; i++) if (p[i] != "") re[p[i]] = 1 }
+            { for (q in re) if ($NF ~ "pid=" q ",") { print $5; next } }
+          ' \
         >> "$OUTBOUND_LOG" || true
       ;;
   esac
@@ -165,6 +205,10 @@ echo ""
 echo "outbound-audit: connection summary"
 echo "  total unique connections: $(wc -l < "$OUTBOUND_LOG" | tr -d ' ')"
 echo "  unauthorized destinations: ${#UNAUTHORIZED[@]}"
+if [ -f "$TREE_LOG" ]; then
+  TREE_PEAK=$(awk '{ print NF - 1 }' "$TREE_LOG" | sort -n | tail -1)
+  echo "  peak Sanctuary process tree size during soak: ${TREE_PEAK:-1} pid(s)"
+fi
 
 if [ "${#UNAUTHORIZED[@]}" -gt 0 ]; then
   echo ""

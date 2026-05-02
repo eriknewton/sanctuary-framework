@@ -65,9 +65,15 @@ construction. The rule keeps the log honest.
 
 - `server/scripts/outbound-audit.sh` boots Sanctuary in a smoke fortress
   with no operator-configured external substrates, captures all outbound
-  connections from the process tree for the soak window
-  (`SOAK_SECONDS`, default 60), and asserts every destination is in the
-  allowed-pattern list (localhost variants only by default).
+  connections from the **full process tree** rooted at the dashboard
+  parent (parent plus every descendant resolved via per-tick `ps` walk)
+  for the soak window (`SOAK_SECONDS`, default 60), and asserts every
+  destination is in the allowed-pattern list (localhost variants only
+  by default).
+- The process-tree refresh on each tick is load-bearing: a child process
+  spawned mid-soak (Concordia sidecar, substrate worker, future helper)
+  is picked up the next tick, so its outbound is captured. Filtering by
+  parent PID alone would miss those connections.
 - Failure exits non-zero and prints the unauthorized destinations.
 - Run as part of the v1.2.0 acceptance drill before npm publish.
 - `--report-only` mode prints the destination list without asserting,
@@ -110,25 +116,44 @@ Each escape hatch must be:
 
 Captured 2026-05-01 against `wp-v1.2-chat-removal-reshape` HEAD with a
 15-second soak (lower bound; production drill will run the default
-60-second window):
+60-second window). Process-tree capture confirmed: the audit polls the
+full descendant set on every tick, not just the parent dashboard PID.
 
 ```
 outbound-audit: soak window 15s, platform Darwin
-outbound-audit: Sanctuary running as PID 29986. Capturing outbound connections...
+outbound-audit: Sanctuary running as PID 56879. Capturing outbound connections...
 outbound-audit: soak complete; analyzing connections...
 
 outbound-audit: connection summary
   total unique connections: 0
   unauthorized destinations: 0
+  peak Sanctuary process tree size during soak: 1 pid(s)
 
-outbound-audit: PASS — no unauthorized outbound destinations.
+outbound-audit: PASS - no unauthorized outbound destinations.
 ```
 
 The dashboard process opened zero outbound connections during the soak.
+The peak process-tree size of 1 pid means the dashboard did not spawn
+any child processes during normal startup; the methodology is correct
+regardless (when a child does spawn, e.g., a Concordia sidecar handling
+a composition request, the tree-refresh on the next tick picks it up).
 This baseline ships with the PR; subsequent changes that introduce a
 new outbound destination (substrate adapter, federation peer, future
 daily-digest channel) MUST update the allowed-pattern list and surface
 the addition in PR review.
+
+### Methodology fix on this PR (Codex 5.5 second-opinion review feedback)
+
+The initial wave-6 audit script filtered by parent PID only. Codex
+correctly flagged that a child process opening an outbound connection
+(future helper, sidecar, substrate worker) would not be captured, so
+the empirical "0 unauthorized destinations" baseline was hollow against
+the script's own claim of auditing the "Sanctuary process tree." This
+PR fixes the script to walk descendants per tick (`get_pid_tree()`
+helper plus per-platform PID-set filter for `lsof` on macOS and `ss`
+on Linux) and re-runs the baseline against the new methodology. The
+0-connection result holds; the difference is that the result now
+empirically matches the claim.
 
 ## Open follow-ups
 
