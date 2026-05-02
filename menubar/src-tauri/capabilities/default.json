@@ -1,0 +1,35 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Sanctuary menubar default capability set. Allows the popover webview to invoke command handlers, read tray events, fire OS notifications, and reach the local fortress over HTTP.",
+  "windows": ["popover"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "core:window:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-position",
+    "core:window:allow-set-focus",
+    "core:webview:default",
+    "core:tray:default",
+    "core:image:default",
+    "core:path:default",
+    "notification:default",
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission",
+    "notification:allow-notify",
+    "http:default",
+    {
+      "identifier": "http:allow-fetch",
+      "allow": [
+        { "url": "http://127.0.0.1:*" },
+        { "url": "http://localhost:*" },
+        { "url": "https://127.0.0.1:*" },
+        { "url": "https://localhost:*" }
+      ]
+    }
+  ]
+}

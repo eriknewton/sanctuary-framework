@@ -1,0 +1,28 @@
+[package]
+name = "sanctuary-menubar"
+version = "0.1.0"
+description = "Sanctuary menubar app. Castle Layer 3 surface that surfaces fortress state in the operator menubar."
+authors = ["Erik Newton"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "sanctuary_menubar_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-notification = "2"
+tauri-plugin-http = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+keyring = "3"
+log = "0.4"
+env_logger = "0.11"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

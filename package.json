@@ -1,0 +1,13 @@
+{
+  "name": "sanctuary-framework-root",
+  "private": true,
+  "description": "Sanctuary repository root. Delegation surface for the menubar workspace. The canonical published package lives in server/.",
+  "scripts": {
+    "menubar:dev": "cd menubar && npm run tauri:dev",
+    "menubar:build": "cd menubar && npm run tauri:build",
+    "menubar:setup": "cd menubar && npm install"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

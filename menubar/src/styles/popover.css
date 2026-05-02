@@ -1,0 +1,289 @@
+/* Sanctuary menubar popover styles.
+ * Sprint Piece 1: minimal system-default styling. Visual polish lands in Sprint Piece 3
+ * via AI design tools. */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  color: #1c1c1e;
+  background: #f5f5f7;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.popover-container {
+  width: 400px;
+  max-height: 600px;
+  overflow-y: auto;
+  padding: 0;
+  background: #ffffff;
+  border-radius: 8px;
+}
+
+.popover-header {
+  padding: 12px 16px 8px 16px;
+  border-bottom: 1px solid #e5e5ea;
+}
+
+.popover-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.popover-subtitle {
+  font-size: 12px;
+  color: #6c6c70;
+  margin-top: 2px;
+}
+
+.popover-section {
+  padding: 12px 16px;
+  border-bottom: 1px solid #f0f0f2;
+}
+
+.popover-section:last-of-type {
+  border-bottom: none;
+}
+
+.popover-section h3 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6c6c70;
+  margin: 0 0 8px 0;
+}
+
+.popover-section .empty {
+  font-size: 12px;
+  color: #8e8e93;
+  margin: 0;
+}
+
+.pending-list,
+.recent-list,
+.agents-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.pending-item,
+.recent-item,
+.agent-item {
+  padding: 8px 0;
+  border-bottom: 1px solid #f7f7f8;
+}
+
+.pending-item:last-child,
+.recent-item:last-child,
+.agent-item:last-child {
+  border-bottom: none;
+}
+
+.pending-message,
+.recent-message,
+.agent-id {
+  font-size: 13px;
+  color: #1c1c1e;
+}
+
+.pending-meta,
+.recent-meta,
+.agent-meta {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  color: #8e8e93;
+  margin-top: 2px;
+}
+
+.tier-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: #e5e5ea;
+  font-weight: 500;
+}
+
+.tier-1 .tier-badge {
+  background: #ffe5e5;
+  color: #b00020;
+}
+
+.tier-2 .tier-badge {
+  background: #fff3cd;
+  color: #856404;
+}
+
+.action-stub {
+  font-size: 11px;
+  color: #8e8e93;
+  font-style: italic;
+}
+
+.popover-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 16px;
+  background: #fafafa;
+  border-top: 1px solid #e5e5ea;
+  font-size: 11px;
+}
+
+.connection-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #6c6c70;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #34c759;
+}
+
+.status-degraded .status-dot {
+  background: #ff9500;
+}
+
+.status-disconnected .status-dot {
+  background: #ff3b30;
+}
+
+.footer-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: #007aff;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
+.popover-empty {
+  padding: 24px 16px;
+  text-align: center;
+  color: #6c6c70;
+  font-size: 13px;
+}
+
+/* Wizard styles (basic; polished in Sprint Piece 3) */
+
+.wizard {
+  width: 480px;
+  padding: 24px;
+}
+
+.wizard-page h1 {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0 0 12px 0;
+}
+
+.wizard-page p {
+  font-size: 13px;
+  color: #3c3c43;
+  margin: 0 0 12px 0;
+  line-height: 1.4;
+}
+
+.copy-stub {
+  font-style: italic;
+  color: #8e8e93;
+  font-size: 11px;
+}
+
+.field {
+  display: block;
+  margin: 16px 0;
+}
+
+.field span {
+  display: block;
+  font-size: 11px;
+  color: #6c6c70;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.field input {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 13px;
+  border: 1px solid #d1d1d6;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
+.test-result {
+  margin: 12px 0;
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.test-result.ok {
+  background: #d1f4d1;
+  color: #1c5d1c;
+}
+
+.test-result.fail {
+  background: #ffd5d5;
+  color: #8b0000;
+}
+
+.wizard-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 24px;
+}
+
+.btn {
+  padding: 6px 14px;
+  font-size: 13px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  background: #e5e5ea;
+  color: #1c1c1e;
+}
+
+.btn-primary {
+  background: #007aff;
+  color: #ffffff;
+}
+
+.btn-secondary {
+  background: #f0f0f2;
+  border-color: #d1d1d6;
+}
+
+.btn-link {
+  background: none;
+  color: #007aff;
+}
+
+.btn:hover {
+  opacity: 0.9;
+}
