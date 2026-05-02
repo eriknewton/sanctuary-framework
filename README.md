@@ -36,7 +36,7 @@ Current capability summary:
 | Public federation | Federation v0.1 foundation shipped; public cross-operator coordination is v1.3 |
 | Fleet, payments, compliance, operator-cloud, generalized transport interception | v1.4+ roadmap |
 | Sovereign-managed TEE and hardware secure elements | v2 roadmap |
-| Post-quantum / RFC 9420 class cryptographic upgrades | v1.4+ roadmap |
+| Post-quantum and next-generation messaging-layer-security cryptographic upgrades | v1.4+ roadmap |
 
 Roadmap shape: v1.1 completes the local sovereignty harness; v1.2 adds the phone as the operator companion; v1.3 opens public federation for cross-operator agent interaction; v1.4+ carries fleet, payments, compliance, generalized transport interception, operator-cloud, and advanced cryptography. See [ROADMAP.md](ROADMAP.md).
 
