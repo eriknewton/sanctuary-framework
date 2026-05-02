@@ -1,53 +1,72 @@
 # Roadmap
 
-Sanctuary is the operator-owned place to run and govern agents. Operators can attach the harness, model, and deployment shape they choose; Sanctuary supplies the shared sovereignty layer: secure identity, controlled egress, query privacy, signed audit, internal agent coordination, operator approvals, and portable exit.
+Sanctuary is the operator-sovereign substrate for AI agents. Operators bring the harness, model, and deployment shape they choose. Sanctuary supplies the shared sovereignty layer: OS-level enforcement at the cross-boundary wall, internal observation, cooperative sovereignty primitives for compliant agents, and cryptographic accountability for cross-castle commerce.
 
 Your agent. Your machine. Your keys.
 
-This document is the public milestone view. Shipped history lives in `CHANGELOG.md`. Interface specs live in `server/docs/`. Scope documentation is maintained privately and released to the public repo on version bumps.
+This document is the public milestone view. Shipped history lives in `CHANGELOG.md`. Interface specs live in `server/docs/`. Architecture decisions live in `server/rfcs/`. Scope documentation is maintained privately and released to the public repo on version bumps.
 
-Last updated: 2026-04-27.
+Last updated: 2026-04-30.
+
+---
+
+## Architecture: the Castle
+
+Sanctuary's enforcement model is the Castle Architecture, codified at `server/rfcs/RFC-0003-castle-architecture.md`. Four layers, each with a distinct enforcement contract.
+
+- **Layer 1, Castle Wall.** OS-level egress filtering at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass.
+- **Layer 2, Sentinels.** Internal observation via process introspection and behavioral baselining. Anomalies surface to the operator via menubar plus notifications. Observation, not enforcement.
+- **Layer 3, Cooperative MCP.** Additive sovereignty surface for compliant agents. Encrypted state, signed audit, mandate primitives, four canonical policy slots, substrate selector, Concordia receipt integration, Verascore reputation hooks.
+- **Layer 4, Cryptographic Receipts and Reputation.** Concordia receipts for cross-castle commitments, Verascore reputation aggregating across operators. Cross-castle accountability post-action.
+
+Castle-walking principle: real enforcement AND delightful UX. Both sides critical. Hard enforcement at the wall AND approval response under 2 seconds. Default-deny outbound AND smart always-allow rules. Sentinels observe AND do not surface noise. Cooperative MCP path remains additive and fully usable. Composition with agent runtimes is preserved because the runtime sees a normal operating environment with constrained egress.
 
 ---
 
 ## Scope Thesis
 
-v1.1 makes Sanctuary the complete local sovereignty harness.
+v1.0 is the operator-sovereign fortress in final acceptance.
 
-v1.2 makes the harness available from the operator's phone.
+v1.1 ships the foundation that makes the local sovereignty harness real: identity, keys, persistence, signed audit, recovery, encrypted state, fortress-local hub APIs, internal coordination, portable exit.
 
-v1.3 makes the operator's data sovereign before the data crosses any boundary.
+v1.2 ships the operator-facing surfaces and the intelligence substrate selector that make the fortress usable as a daily product: menubar status app, OS notifications, concierge chat, substrate selector, channel-template binding, Tier 1 inline approval, audit feed, exit-bundle drill, operator-friendly tool-error text in MCP gate responses.
 
-v1.4 opens sovereign agent-to-agent interaction across operator boundaries.
+v1.x ships the Castle Wall: OS-level egress enforcement at the operator-external boundary. This is the load-bearing piece that makes Sanctuary's security claims structural, not cooperative-only. Phase 1 (macOS plus Linux) ships within 4-8 weeks of v1.2 shipping. Without the wall, the cooperative MCP path is a polite fiction; with it, the substrate is honest under engineer-grade scrutiny.
 
-v1.5+ expands into fleet, payments, compliance, advanced cryptography, operator cloud, and managed TEE modes.
+v1.3 ships advanced Sanctuary intelligence: sentinels (the Castle Layer 2 observation surface), anomaly detection, conversational sovereignty depth, cross-harness approval inbox, English-authored policy gates, honeypot authoring, auto-trigger ladder.
 
-The current sequencing deliberately delays public federation, fleet management, payment rails, compliance packs, and cryptographic migration until the local operator experience is complete and the operator owns the durable record. The local harness is the product center: attach agents, communicate with them, coordinate them, filter what leaves, record what happened, hold that record where the operator owns it, and leave with that record intact.
+v1.4 extends the fortress beyond the local single-operator deployment: PWA mobile companion, public federation across operators, sovereign data warehouse.
 
-The published agent-stack standards are anti-lock-in on paper. In practice, lock-in returns at the integration layer, when mandate primitives are minted through one vendor's API, on-chain registry entries are anchored through one vendor's wallet, and identity assertions are issued by one vendor's identity provider. The operator's data is portable in theory and coupled in practice. Sanctuary's L4 control plane is the substrate that turns paper-portability into practical portability. The fortress holds operator identity and durable record on the operator's side of every integration.
+v1.5+ expands into fleet operator console, Agent Vault payment-rail composition, Bootstrap bundle, Agent Registry Federation, breach-feed aggregation, EU AI Act compliance pack, NIST AI RMF alignment, Crypto Agility Sprint (post-quantum migration), operator cloud, sovereign-managed TEE, container or microVM isolation for highest-assurance enterprises.
+
+The current sequencing deliberately delays public federation, fleet management, payment rails, compliance packs, and cryptographic migration until the local operator experience is complete and the operator owns the durable record. The local harness is the product center: attach agents, communicate with them, coordinate them, filter what leaves at the OS-level wall, record what happened, hold that record where the operator owns it, and leave with that record intact.
+
+The published agent-stack standards are anti-lock-in on paper. In practice, lock-in returns at the integration layer, when mandate primitives are minted through one vendor's API, on-chain registry entries are anchored through one vendor's wallet, and identity assertions are issued by one vendor's identity provider. The operator's data is portable in theory and coupled in practice. Sanctuary's substrate position is the layer that turns paper-portability into practical portability. The fortress holds operator identity and durable record on the operator's side of every integration.
 
 ---
 
 ## Composition Map
 
-The agent stack is now publicly composed across four layers. Sanctuary lives at L4.
+The agent stack is publicly composed across four ecosystem layers. Sanctuary lives in the operator-sovereign substrate position.
 
 ```
-L4  Operator-sovereign control plane    Sanctuary (you are here)
-    Identity, keys, signed receipts, approvals, fortress
-    Composes with: ERC-8004, DIF MCP-I, AIVS, A2A
+Ecosystem layer 4: Operator-sovereign substrate    Sanctuary (you are here)
+    Castle Architecture (Wall, Sentinels, Cooperative MCP, Receipts plus Reputation)
+    Composes with: ERC-8004, DIF KYA-OS, AIVS, A2A
 
-L3  Mandates and commerce                Concordia, Google AP2, A2A extensions
+Ecosystem layer 3: Mandates and commerce            Concordia, Google AP2, A2A extensions
     Mandate primitives, session receipts, commitment binding
 
-L2  Runtime security                     Open-source runtime egress filters
+Ecosystem layer 2: Runtime security                 Open-source runtime egress filters
     Per-host policy, request filtering, sandboxing
 
-L1  Payments                             Coinbase x402, Agentic.Market
-    Sovereign-signer adapter at v1.5+
+Ecosystem layer 1: Payments                         Coinbase x402, Agentic.Market
+    Sovereign-signer adapter on Sanctuary
 ```
 
 Composition partners are named where Sanctuary explicitly composes with them. Layers without named partners are referenced as categories.
+
+Note on layer naming: the ecosystem layers above (1-4) describe Sanctuary's position within the broader agent stack. Within Sanctuary itself, the Castle Architecture defines four enforcement layers (also Layer 1-4). To avoid confusion, references to Castle Layers always include the prefix "Castle" (e.g., Castle Layer 1, Castle Layer 2). References to ecosystem layers always include "Ecosystem" (e.g., Ecosystem Layer 4).
 
 ---
 
@@ -58,11 +77,13 @@ v1.0 is the operator-sovereign fortress in final acceptance. The remaining work 
 Shipped foundation:
 
 - Local `sanctuary wrap` for existing harnesses
-- Dashboard, policy gates, encrypted state, and signed audit trail
+- Dashboard (configuration plus inspection surface)
+- Cooperative MCP gates (Castle Layer 3): Principal Policy, three-tier approval, four canonical policy slots
+- Encrypted state and signed audit trail
 - Five channel-shape governance templates
 - Federation Protocol v0.1 foundation
 - Agent Contract v0.1
-- Egress controls, budgets, retention, and recovery flows
+- Egress controls (cooperative; structural enforcement ships in v1.x), budgets, retention, and recovery flows
 - Concordia and Verascore optional composition, default off
 - Template library starter set
 - Tier B harness adapter coverage at v1.0: OpenClaw, Claude Code, Cursor, Hermes, Cline, plus a generic adapter shape
@@ -81,11 +102,12 @@ Allowed v1.0 work:
 
 Explicitly deferred:
 
-- New federation modes
-- Mobile app work
-- Payment adapters
-- Compliance packs
-- Post-quantum or RFC 9420 class migration
+- Castle Wall (egress enforcement); ships in v1.x
+- Sentinels (anomaly detection); ships in v1.3
+- Mobile companion; ships in v1.4
+- Payment adapters; ships in v1.5+
+- Compliance packs; ships in v1.5+
+- Post-quantum or next-generation messaging-layer-security migration; ships in v1.5+
 
 ---
 
@@ -101,302 +123,109 @@ Point releases close field-verification gaps and platform parity without changin
 - Windows Credential Manager keychain backend
 - Dashboard session hardening and credential-leak audit
 - `sanctuary doctor` or equivalent diagnostics for wrap, keychain, dashboard, audit, and config-backup failures
-- Operator attestation surface: global, per-agent, and per-action badges over existing fortress attestation primitives, with degrade-not-destroy posture on attestation failure
 
 Gate:
 
 An operator who hits a normal install, keychain, dashboard, or recovery failure gets a local diagnostic that identifies the failing subsystem and the next action without needing maintainer help.
 
-The attestation surface is the operator-facing layer that makes the fortress legible to a non-technical operator. Existing fortress primitives already produce signed attestation events. The v1.0.x scope is the persistent badge surface, the failure-mode catalog, and the operator-visible degraded states. Design-research panel work runs in parallel and may shift specifics.
+---
+
+## v1.1: Local Sovereignty Harness Foundation (shipped or in flight)
+
+v1.1 ships the foundation that makes the local sovereignty harness real: identity, keys, persistence, signed audit, recovery, encrypted state, fortress-local hub APIs, query privacy, internal coordination, portable exit. Detailed pillar descriptions are preserved in `server/docs/v1.1-acceptance-checklist.md`.
+
+v1.1 acceptance gate:
+
+An operator can wrap two or three agents, communicate with them locally, coordinate a local multi-agent workflow, anonymize or pseudonymize outbound queries, approve / deny / pause / resume / lockdown agents, inspect audit and privacy events, and export and import the durable record onto a fresh machine or harness.
 
 ---
 
-## v1.1: Local Sovereignty Harness Foundation
+## v1.2: Operator-Facing Surfaces, Intelligence Substrate, Castle UX
 
-v1.1 ships the foundation that makes the local sovereignty harness real: identity, keys, persistence, signed audit, recovery, encrypted state, fortress-local hub APIs, and a v1.1 dashboard surface that renders the wrapped harnesses an operator runs. The library substrate for channel-shape template binding, signed coordination handoffs, and unified approval inbox all ships in v1.1; the operator-facing wiring for those substrates ships in v1.2 (see WP-V1.2-2, WP-V1.2-3, WP-V1.2-4 below).
+v1.2 lights up the operator-facing surfaces v1.1 wired but never powered, plus introduces the substrate selector and the menubar plus notification UX that becomes the operator's daily-driver interface.
 
-v1.1 acceptance: an operator can wrap two or three harnesses against one fortress, see them in the v1.1 dashboard Agents view, run a Tier 1 action through the legacy ApprovalGate channel with signed audit entry, and recover the fortress from a passphrase backup if principal loss simulates. This is the foundation. Operator-facing template binding, multi-agent workflow handoffs, and a unified approval inbox arrive in v1.2.
+Per the v1.2 build pivot 2026-04-30 evening, direct-agent chat (operator-to-wrapped-agent) is dropped from v1.2 and from the roadmap entirely. Direct chat with the wrapped agent happens in the harness; Sanctuary's job is the substrate, not the harness chat surface. Concierge chat (operator-to-Sanctuary) remains; Sanctuary's runtime is ours, so the safety-prior fight does not apply to that surface.
 
-### 1. Query Privacy And Anonymized Query Mode
+Six work packages in v1.2:
 
-This is the first v1.1 pillar because it protects the boundary most users understand: what the agent sends to remote models, tools, relays, and counterparties.
+- **WP-V1.2-2 Channel-Template Binding Flow.** Operator picks a channel template per wrapped agent in the Policy Center; Tier 1 `policy_change` approval fires; activity feed records the binding. Library reconciliation rides along.
+- **WP-V1.2-4a Concierge Chat (operator-to-Sanctuary).** Dashboard concierge default; operator talks to Sanctuary in plain English about agent activity, gets summaries, fires actions. Consumes the substrate selector.
+- **WP-V1.2-5 Intelligence Substrate Selector.** Operator picks per surface among local model (Ollama with bundled local LLMs), Venice.ai (privacy-respecting hosted; named composition partner), operator-frontier with Privacy Filter Tier 2 redaction, or hybrid per-surface routing. Selector ships with operator-facing tradeoff transparency UI.
+- **WP-V1.2-6 Menubar Status App.** Macbar status app showing all-clear or pending-item badge. Click expands to popover with pending list, one-click approve/deny, click-to-inspect any audit entry. Initial Phase: macOS. Linux and Windows in v1.2.5 or v1.3.
+- **WP-V1.2-7 OS-Native Notifications.** Tier 1 gates and policy-uncertain calls fire OS notifications. Notification copy in plain English; click opens menubar approval flow. Initial Phase: macOS. Linux libnotify and Windows WinRT Toast in v1.2.5 or v1.3.
+- **WP-V1.2-8 Operator-Friendly Tool-Error Text.** MCP gate-block responses use plain-English copy that the agent's LLM naturally surfaces back to the operator. One-day change with three-channel coverage on the approval-gate-invisibility problem.
 
-Capabilities:
-
-- Local sensitive-span detection for PII, secrets, credentials, account identifiers, client names, project names, file paths, and sensitive domain terms
-- Stable local placeholders such as `PERSON_1`, `CLIENT_1`, `PROJECT_1`, `SECRET_1`, and `ACCOUNT_1`
-- Encrypted local placeholder vault
-- Recursive, bounded filtering of nested payloads
-- Identity-bound privacy policies
-- Policy-bound rehydration of model responses when permitted
-- Safe audit metadata: detector class, field path, action, hashes, policy id, and destination category without raw sensitive content
-- Dashboard privacy panel showing what was filtered, why, and which policy caused the decision
-- First enforcement path on actual remote-bound traffic, not only standalone filtering tools
-
-Gate:
-
-A pilot sends a query containing PII, secrets, project identifiers, and client identifiers through a wrapped agent. Sanctuary proves the remote-bound payload was filtered, the local mapping remains encrypted, the response is rehydrated only when policy permits, and the audit log contains only safe metadata.
-
-Terminology:
-
-The technical docs should use "query minimization" and "pseudonymization" where precision matters. "Anonymized Query Mode" is acceptable as product language only if the limits are documented. Full anonymization would require unlinkability, metadata protection, traffic-analysis defenses, and provider-side guarantees.
-
-### 2. Operator-Agent Communication And Control
-
-The operator must be able to talk to agents and govern them from the local control surface.
-
-Capabilities:
-
-- Dashboard chat or command surface for wrapped agents
-- Unified local inbox for pending approvals, blocked egress, privacy events, budget warnings, recovery prompts, and agent errors
-- Agent registry across local wrapped harnesses with status, model/provider, policy, budget, and last activity
-- Agent controls for pause, resume, restart, unwrap, template assignment, policy change, and lockdown
-- Live local activity feed backed by audit events
-- Policy center for channel templates, per-agent rules, egress allowlists, retention, budgets, and privacy-filter settings
-
-Gate:
-
-A pilot can operate two or three wrapped agents from the dashboard, talk to them, resolve approvals and blocked egress, change policy, trigger lockdown, and understand what each agent is doing without CLI help.
-
-### 3. Internal Agent Coordination
-
-Sanctuary should provide the internal plumbing for agent-to-agent coordination before opening the boundary to public federation.
-
-Capabilities:
-
-- Local agent registry
-- Signed local agent-to-agent messages
-- Handoff records with sender, recipient, task scope, policy context, and audit references
-- Shared local workflow state where policy permits
-- Internal-only coordination channels with egress controls at the outer boundary
-- Audit trail for handoffs, approvals, denials, and completed coordination steps
-
-Gate:
-
-A pilot runs a local multi-agent workflow where one agent delegates to another, the handoff is signed and audited, policy controls what context crosses between agents, and no public federation is required.
-
-### 4. Portability And Exit
-
-Exit is a core sovereignty promise, not an afterthought.
-
-Capabilities:
-
-- One-click export bundle containing public identity, encrypted state, policy, audit receipts, reputation bundle, commitments, placeholder-vault metadata, and manifest hashes
-- One-click import into a fresh machine or fortress with conflict handling and verification before activation
-- Re-keying flow for encrypted state so import does not require carrying the original passphrase forward forever
-- Third-party verifier CLI for exported audit and reputation bundles
-- Harness migration flow: unwrap from one supported harness and re-wrap another while preserving identity, reputation, policies, privacy vault continuity, and audit continuity
-- Dashboard-guided exit drill that preserves the same Tier 1 approval gates as the CLI path
-
-Gate:
-
-A pilot moves an agent from one harness or machine to another, verifies identity, reputation, privacy-vault metadata, policy, and audit continuity, and can demonstrate that the original platform no longer controls the agent's durable record.
-
-Drill artifact: `server/docs/exit-drill-v0.1.md`.
-
-### v1.1 Acceptance Gate
-
-v1.1 passes only when an operator can:
-
-- Wrap two or three agents
-- Communicate with them locally
-- Coordinate a local multi-agent workflow
-- Anonymize or pseudonymize outbound queries
-- Approve, deny, pause, resume, and lockdown agents
-- Inspect audit and privacy events
-- Export and import the durable record onto a fresh machine or harness
-
----
-
-## Efficient v1.1 Build Sequence For Codex
-
-Build v1.1 contract-first, then parallelize implementation behind stable interfaces. This reduces merge conflicts, avoids repeated full-suite runs, and keeps agents from editing the same hot files.
-
-### Step 0: Scope Lock And Contracts
-
-Owner: coordinator Codex instance.
-
-Outputs:
-
-- v1.1 acceptance checklist in `server/docs/`
-- Minimal shared interfaces for privacy events, hub events, local agent records, handoff records, and exit-bundle manifests
-- Tool registration checklist requiring policy tier, outbound network behavior, audit shape, and privacy impact
-- Targeted test plan by workstream
-
-Do not parallelize this step. Parallel work should start after the contracts land.
-
-### Step 1: Query Privacy Core
-
-Outputs:
-
-- Recursive bounded detector and filter
-- Placeholder vault
-- Policy-bound rehydration
-- Safe privacy audit events
-- Unit tests with nested objects, long payloads, secret-like values, client/project placeholders, and denial cases
-
-Keep this independent from dashboard UI. Emit events through the shared contract.
-
-### Step 2: Remote-Bound Enforcement Path
-
-Outputs:
-
-- First enforced path for remote-bound model/tool payloads
-- Integration test proving raw sensitive spans do not leave through that path
-- Failure mode: if privacy policy cannot be loaded or filtering fails, outbound traffic fails closed unless the operator explicitly overrides
-
-This is the schedule risk. Keep the first enforcement path narrow and real instead of trying to generalize every transport at once.
-
-### Step 3: Operator Hub Primitives
-
-Outputs:
-
-- Local inbox API
-- Local agent registry API
-- Activity feed backed by audit events
-- Agent controls: pause, resume, restart, unwrap, lockdown
-- Policy and budget summaries
-
-Build the API before polishing the dashboard.
-
-### Step 4: Internal Coordination
-
-Outputs:
-
-- Local signed message and handoff record types
-- Agent-to-agent handoff API
-- Context transfer through policy gates
-- Audit entries for handoffs and coordination outcomes
-- Integration test for a two-agent local workflow
-
-Do not include public discovery or cross-operator federation in this step.
-
-### Step 5: Exit Bundle And Verifier
-
-Outputs:
-
-- `SANCTUARY_EXIT_BUNDLE_V1` manifest
-- Export command
-- Import command with verify-before-activate
-- Re-keying flow
-- Standalone verifier CLI
-- Harness migration drill test
-
-Keep the dashboard wizard out until the CLI and manifest are stable.
-
-### Step 6: Dashboard Flows
-
-Outputs:
-
-- Privacy panel
-- Unified inbox
-- Local agent registry
-- Activity feed
-- Exit wizard
-- Operator-agent chat or command surface
-
-The dashboard should consume the APIs from Steps 1-5, not define their data model.
-
-### Step 7: Acceptance Drills And Release Hardening
-
-Outputs:
-
-- Privacy drill
-- Local coordination drill
-- Hub drill
-- Exit drill
-- Full test run and baseline update
-- README and roadmap alignment
-
-Run targeted tests during workstream development. Run the full suite at integration checkpoints and before release.
-
----
-
-## Parallel Build Map
-
-Use one coordinator and multiple implementation agents with disjoint write scopes. Claude Code can take any worker slice below. The coordinator should own shared contracts, tool registration policy, final integration, and release notes.
-
-| Workstream | Can Start After | Suggested Write Scope | Parallel With | Deliverable |
-|---|---|---|---|---|
-| Privacy core | Step 0 | `server/src/privacy/**`, privacy tests | Hub, exit, coordination | Detector, placeholder vault, rehydration, audit events |
-| Remote-bound enforcement | Step 0 plus privacy event contract | egress/gateway/wrap enforcement modules, integration tests | Hub, exit | Proof that filtered payload is what leaves |
-| Operator hub API | Step 0 | dashboard API modules, local registry modules, hub tests | Privacy, exit, coordination | Inbox, registry, controls, activity feed |
-| Internal coordination | Step 0 | local coordination/message modules, handoff tests | Privacy, exit, hub | Signed local handoffs and audited local workflow |
-| Exit bundle | Step 0 | exit/export/import/verifier modules, CLI tests | Privacy, hub, coordination | Manifest, export/import, re-keying, verifier CLI |
-| Dashboard UI | Hub API stable, privacy event shape stable | dashboard frontend files only | Final CLI/verifier work | Privacy panel, inbox, registry, exit wizard |
-| Harness compatibility | Anytime after v1.0 freeze | fixture configs, integration docs, smoke tests | All feature work | Wrap matrix for supported harnesses |
-| Docs and drills | Contracts stable, then again at end | `server/docs/**`, README excerpts | All feature work | Acceptance drills and operator-facing docs |
-
-Parallelization rules:
-
-- Do not let multiple agents edit shared contracts after Step 0 without coordinator approval.
-- Do not let dashboard work invent API shapes.
-- Do not let privacy enforcement and privacy detector agents both own the same filter internals.
-- Keep Concordia, Verascore, payments, and public federation out of v1.1 workstreams.
-- Prefer targeted Vitest files during development; run the full `npm test` gate only at integration checkpoints and before merge.
-
----
-
-## v1.2: Operator-Facing Surfaces + Intelligence Substrate
-
-The v1.1 acceptance audit (`Review/Sanctuary/V1.1.x_Operator_Path_Audit_Pass_B_2026-04-27.md`), the v1.2 scope brief (`Review/Sanctuary/V1.2_Scope_Brief_2026-04-27.md`), and the Intelligence Layer Drift Audit (`Review/Sanctuary/Intelligence_Layer_Drift_Audit_and_Substrate_Resolution_2026-04-29.md`) define v1.2 as the milestone that lights up the operator-facing surfaces v1.1 wired but never powered.
-
-Mobile companion moves to v1.4 as a PWA (deferred per coordinator decision 2026-04-29 so the desktop ships feature-complete first). Sovereign Data Warehouse moves to v1.4 (pulled back per Erik directive 2026-04-29 evening so v1.3 can deliver advanced Sanctuary intelligence affordances first). Unified inbox bridge and coordination handoff visualization move to v1.3 (alongside sentinels and anomaly detection, where they pair more naturally).
-
-Five WPs in v1.2:
-
-- **WP-V1.2-2 Channel-Template Binding Flow** (operator picks a channel template per wrapped agent in the Policy Center; Tier 1 `policy_change` approval fires; activity feed records the binding). Library reconciliation rides along: the v1.1 internal template IDs are retired in favor of the six design-canonical templates surfaced in the Policy Center.
-- **WP-V1.2-4a+b Operator Chat (concierge + direct-agent)** — concierge surface (Dashboard nav default; operator talks to Sanctuary in plain English about agent activity, gets summaries, fires actions); direct-agent surface (Agents view, click an agent, talk directly to it; Tier 1 gated). Both consume the substrate selector from WP-V1.2-5 for the LLM call.
-- **WP-V1.2-5 Intelligence Substrate Selector** (the architecture, not a substrate). Operator picks per surface among local model (Ollama with bundled Gemma 2 2B + Phi-4 Mini), Venice.ai (privacy-respecting hosted; named composition partner per Erik directive 2026-04-29), operator-frontier with Privacy Filter Tier 2 redaction, or hybrid per-surface routing. Selector ships with operator-facing tradeoff transparency UI; per-operator marketing claims become defensible only via this surface.
-- **Telegram bridge stopgap** (separate brief at `Review/Sanctuary/Telegram_Mobile_Channel_Stopgap_Brief_2026-04-29.md`; queued behind v1.2-2 + v1.2-4 + v1.2-5; ships any free Codex window during the v1.2 cycle). Ports approval-needed events to a Telegram bot so the operator gets phone notifications + remote approval before the PWA mobile companion lands in v1.4.
-
-Recommended sequencing: WP-V1.2-2 first (well-bounded; library reconciliation alongside picker UI), then WP-V1.2-5 (substrate selector unblocks chat), then WP-V1.2-4a+b in parallel as soon as the substrate selector's local-model integration is stable. Coordination handoff visualization (formerly WP-V1.2-4c) defers to v1.3.
+Telegram bridge stopgap (separate brief): ports approval-needed events to a Telegram bot for phone notifications and remote approval. Queued behind the v1.2 WPs; ships any free Codex window during the v1.2 cycle. Replaced by the v1.4 PWA mobile companion when that ships.
 
 v1.2 acceptance gate:
 
-An operator wraps two harnesses, picks an intelligence substrate (any of the four options, with the tradeoff visible at selection), uses the concierge to ask "what did agent X do today" and gets a real summary, clicks an agent in Agents view to open direct chat, types a message, gets a response with a Tier 1 approval gate honored. The operator binds a channel template to a wrapped agent through the Policy Center and sees the binding reflected in the Per-agent rules table and the activity feed. The substrate selector's transparency UI shows the per-surface routing the operator chose. Privacy Filter Tier 2 works (regex Tier 1 always; Tier 2 routed per substrate selection).
+An operator wraps two harnesses, picks an intelligence substrate (any of the four options, with the tradeoff visible at selection), uses the concierge to ask "what did agent X do today" and gets a real summary. The operator binds a channel template to a wrapped agent through the Policy Center and sees the binding reflected in the Per-agent rules table and the activity feed. The substrate selector's transparency UI shows the per-surface routing the operator chose. Privacy Filter Tier 2 works (regex Tier 1 always; Tier 2 routed per substrate selection). Menubar status app shows pending approvals; OS notifications fire on Tier 1 gates; operator approves or denies in under 5 seconds. Operator-friendly tool-error text surfaces blocks back to the operator naturally through the agent's normal output channel.
+
+---
+
+## v1.x: Castle Wall Enforcement (load-bearing)
+
+v1.x ships the Castle Wall: OS-level egress enforcement at the operator-external boundary. This is the structural enforcement layer that makes Sanctuary's security claims real, not cooperative-only. Without the wall, the substrate is a polite fiction; with it, the architecture is honest under engineer-grade scrutiny.
+
+Single work package: WP-V1.x-CASTLE-WALL.
+
+Phase 1 (target 4-8 weeks of execution after v1.2 ships): macOS plus Linux.
+
+- Cross-platform abstraction layer with platform-specific backends
+- Linux backend: netfilter / NFQUEUE plus per-process cgroup or namespace routing
+- macOS backend: Network Extension framework (long-term path) plus pf-based interim
+- Per-process policy integration (extends the four canonical slots with a fifth slot: egress)
+- Notification UX integration (consumes v1.2 menubar plus OS notification surfaces)
+- Agent-side error text (consumes v1.2 operator-friendly tool-error text)
+- First-run wizard for default-deny posture plus common-developer-endpoint pre-allow
+- Cross-platform compatibility matrix (corporate VPNs, Tailscale, common firewalls)
+- Audit and reporting integration (egress decisions feed the existing audit log; events feed Layer 2 sentinels)
+
+Phase 2 (target 4-6 weeks after Phase 1): Windows Filtering Platform backend.
+
+Phase 3 (target post-Phase 2, gated on operator demand): container or microVM isolation for highest-assurance enterprises.
+
+Acceptance gate:
+
+A wrapped agent on a clean Sanctuary install, given a prompt-injection payload designed to exfiltrate data via curl, fails to make the unauthorized network call. The menubar notification fires. The operator approves or denies in under 10 seconds. The audit log records the attempt and the decision. Performance overhead under 10ms p99 on allowed traffic.
+
+This WP gates enterprise pilot demos. Pilot conversations cannot honestly demonstrate Sanctuary's security claims without the wall in place.
 
 ---
 
 ## v1.3: Advanced Sanctuary Intelligence
 
-v1.3 is every Sanctuary-native sovereignty affordance the operator can see, configure, and audit. The library substrate (audit log, policy engine, channel templates, coordination primitives) shipped in v1.0 and v1.1; the substrate selector ships in v1.2. v1.3 builds the intelligence layer on top.
+v1.3 is every Sanctuary-native sovereignty affordance the operator can see, configure, and audit, including the Castle Layer 2 sentinel surface. The library substrate (audit log, policy engine, channel templates, coordination primitives) shipped in v1.0 and v1.1; the substrate selector ships in v1.2; the castle wall ships in v1.x. v1.3 builds the intelligence layer on top.
 
-Per the Intelligence Layer Drift Audit (2026-04-29), this milestone closes the drift identified in twelve drift-catalog rows by sequencing the locked-2026-04-20 sentinel, anomaly, English-gate, honeypot, and auto-trigger affordances into a coherent operator-facing intelligence release.
+Per the build coordinator pivot 2026-04-30 evening, WP-V1.3-8 (autonomous wake mechanism spec) drops entirely. WP-V1.3-1 through WP-V1.3-7 stay and get sharper. Two new work packages added: WP-V1.3-9 (conversational sovereignty depth) and WP-V1.3-10 (cross-harness approval inbox).
 
-Seven WPs in v1.3:
+Nine work packages in v1.3:
 
-- **WP-V1.3-1 Sentinel Baseline Pack** — five baseline sentinels (egress-volume watcher, credential-usage watcher, cross-agent-chatter watcher, suspicious-tool-call detector, anomaly-trigger). Each ships as a default-installable agent that uses the substrate selector. Operator subscribes via the Sanctuary dashboard; sentinels are inward-facing only (no external network access) and surface findings to the unified inbox.
-- **WP-V1.3-2 Anomaly Detection Pipeline** — per-agent feature classifier with local pattern learning, drift detection, and operator-visible alerts. Sovereignty-critical: ML training stays on the operator's machine; never centrally aggregated.
-- **WP-V1.3-3 Coordination Handoff Visualization** (formerly v1.2-4c) — read-only Coordination view rendering handoff log, per-handoff context-transfer breakdown (transferred vs withheld), and workflow state.
-- **WP-V1.3-4 Unified Approval Inbox Bridge** (formerly v1.2-3) — bridges legacy ApprovalGate and v1.1 hub inbox with unified provenance. Operator sees approvals, blocked egress, privacy events, budget warnings, recovery prompts, agent errors, and sentinel findings in one stream.
-- **WP-V1.3-5 Honeypot Authoring** (pulled forward from v1.4 per Erik directive 2026-04-29 evening) — operator writes a honeypot in plain English; LLM compiles to a runtime trap; integrates with the sentinel layer. Uses the substrate selector.
-- **WP-V1.3-6 English-Authored Gates** (pulled forward from v1.4 per Erik directive 2026-04-29 evening) — operator writes a custom policy in plain English; LLM compiles to a structured rule and synthesizes the operator-facing explanation. Uses the substrate selector. Templates remain the v1.2 default for the six canonical channel templates; English-authored gates layer on top for custom policies.
-- **WP-V1.3-7 Auto-Trigger Ladder + Threshold Calibration** (pulled forward from v1.4 per Erik directive 2026-04-29 evening) — operator-configurable thresholds for sentinels and anomaly detection. Calibration UI lets the operator move rules from operator-approved to auto-action incrementally as confidence builds.
+- **WP-V1.3-1 Sentinel Baseline Pack (Castle Layer 2).** Five baseline sentinels (egress-volume watcher, credential-usage watcher, cross-agent-chatter watcher, suspicious-tool-call detector, anomaly-trigger). Each ships as a default-installable agent that uses the substrate selector. Operator subscribes via the Sanctuary dashboard; sentinels are inward-facing only (no external network access) and surface findings to the unified inbox.
+- **WP-V1.3-2 Anomaly Detection Pipeline (Castle Layer 2).** Per-agent feature classifier with local pattern learning, drift detection, and operator-visible alerts. Sovereignty-critical: ML training stays on the operator's machine; never centrally aggregated.
+- **WP-V1.3-3 Coordination Handoff Visualization.** Read-only Coordination view rendering handoff log, per-handoff context-transfer breakdown (transferred vs withheld), and workflow state.
+- **WP-V1.3-4 Unified Approval Inbox Bridge.** Bridges legacy ApprovalGate and v1.1 hub inbox with unified provenance. Operator sees approvals, blocked egress, privacy events, budget warnings, recovery prompts, agent errors, and sentinel findings in one stream.
+- **WP-V1.3-5 Honeypot Authoring.** Operator writes a honeypot in plain English; LLM compiles to a runtime trap; integrates with the sentinel layer. Uses the substrate selector.
+- **WP-V1.3-6 English-Authored Policy Gates.** Operator writes a custom policy in plain English; LLM compiles to a structured rule and synthesizes the operator-facing explanation. Uses the substrate selector. Templates remain the v1.2 default for the six canonical channel templates; English-authored gates layer on top for custom policies.
+- **WP-V1.3-7 Auto-Trigger Ladder plus Threshold Calibration.** Operator-configurable thresholds for sentinels and anomaly detection. Calibration UI lets the operator move rules from operator-approved to auto-action incrementally as confidence builds.
+- **WP-V1.3-9 Conversational Sovereignty Depth.** Take the concierge chat surface (v1.2) from "answers questions about audit log" to "operator's primary natural-language interface to their sovereignty primitives." Audit summaries, batch approvals, policy authoring, exit bundle generation, identity rotation, all available conversationally. This is where the "Sanctuary feels delightful" moment compounds.
+- **WP-V1.3-10 Cross-Harness Approval Inbox.** A single inbox aggregating pending approvals from any number of wrapped harnesses (Claude Code, OpenClaw, Hermes, Mastra, Cline, Cursor running concurrently in the operator's life). Notification-first delivery; menubar surface; conversational query through concierge chat. This is the v1.3 piece that makes Sanctuary's value compound across an operator's whole agent fleet, and it is the substrate-position thesis made concrete.
 
 v1.3 acceptance gate:
 
-The operator subscribes a sentinel; the sentinel observes agent activity and reports a finding via the unified inbox. Anomaly detection identifies an intentional drift (operator triggers a deviant tool call) and surfaces an alert. The Coordination view shows a multi-agent handoff history with full provenance. The operator authors a honeypot in plain English and watches it fire on trigger. The operator authors a custom policy gate in plain English and sees the LLM-compiled rule plus operator-facing explanation. The auto-trigger ladder honors the operator's threshold configuration.
+The operator subscribes a sentinel; the sentinel observes agent activity and reports a finding via the unified inbox. Anomaly detection identifies an intentional drift (operator triggers a deviant tool call) and surfaces an alert. The Coordination view shows a multi-agent handoff history with full provenance. The operator authors a honeypot in plain English and watches it fire on trigger. The operator authors a custom policy gate in plain English and sees the LLM-compiled rule plus operator-facing explanation. The auto-trigger ladder honors the operator's threshold configuration. Concierge chat handles batch approvals, policy authoring, and exit bundle generation conversationally. The cross-harness approval inbox aggregates pending approvals from three concurrently-running wrapped agents (Claude Code, Hermes, Cline) into a single menubar surface.
 
 ---
 
-## v1.4: Reach — Mobile, Federation, Sovereign Data Warehouse
+## v1.4: Reach (Mobile, Federation, Sovereign Data Warehouse)
 
-v1.4 extends the fortress beyond the local single-operator deployment. Mobile reaches your phone. Public federation reaches other operators. Sovereign Data Warehouse reaches data sources beyond the agent loop. All three are about the fortress reaching outward while the operator's sovereignty stays intact.
+v1.4 extends the fortress beyond the local single-operator deployment. Mobile reaches the operator's phone. Public federation reaches other operators. Sovereign Data Warehouse reaches data sources beyond the agent loop. All three are about the fortress reaching outward while the operator's sovereignty stays intact.
 
-SDW pushed back from v1.3 per Erik directive 2026-04-29 evening so v1.3 can deliver the advanced Sanctuary intelligence affordances first. Mobile pushed back from v1.2 per coordinator decision 2026-04-29 so the desktop ships feature-complete first.
+Three work packages in v1.4:
 
-Three WPs in v1.4:
-
-- **WP-V1.4-1 PWA Mobile Companion** (formerly WP-V1.2-1) — phone as operator key, inbox, approval surface, alert surface, emergency brake. PWA implementation: install on home screen, push notifications via Web Push API, biometric unlock via WebAuthn / passkeys, QR pairing from the desktop dashboard. Defers native iOS/Android indefinitely; PWA on iOS 16.4+ and current Android covers the operator-control scope. Telegram bridge from v1.2 stops being load-bearing once the PWA ships but stays available as an alternate notification channel.
-- **WP-V1.4-2 Public Federation** — cross-operator discovery, signed inter-fortress messaging, public or semi-public agent pools, reputation exchange, anonymized wants and requests, abuse and rate controls, policy-enforced disclosure envelopes for anything crossing the boundary. Per the Federation Protocol v0.1 spec already shipped (`Review/Sanctuary/Federation_Protocol_V0.1_Spec_2026-04-21.md`).
-- **WP-V1.4-3 Sovereign Data Warehouse** (pushed from v1.3 per Erik directive 2026-04-29 evening). The agent's durable record belongs to the operator. SDW builds the substrate so the operator's working data, query history, document corpus, and intermediate state live in a place the operator controls, not in a vendor's silo. Composes with the v1.2 substrate selector: the operator's local model handles SDW queries; Venice or frontier-with-filter available for capability-heavy SDW analysis.
-
-  Three sub-deliverables:
-
-  - **Ingestion Adapter Template** — pluggable adapter interface for pulling vendor-side state (chat history, document corpus, project state, query logs) into the operator's fortress. Per-source provenance envelope. Operator-controlled scheduling, retention, deletion. Audit entries on every ingestion event.
-  - **Sovereign Data Lake Schema And Indexing Primitive** — operator-sovereign storage layout for ingested and locally generated data. Cross-source query routing preserves provenance. Vendor-state and operator-state separated at the schema layer. Slice-scope policy DSL extension so policies bind to data slices, not just actions. Local index suitable for working sizes a single operator generates. (Schema design is a real research project, not a port.)
-  - **Continuous-Sync Orchestration** — workflow primitive for long-running sync jobs across vendor sources. Composes with the v1.1 internal coordination layer for multi-step sync. Failure modes degrade without losing provenance. Operator-visible status and intervention surface.
+- **WP-V1.4-1 PWA Mobile Companion.** Phone as operator key, inbox, approval surface, alert surface, emergency brake. PWA implementation: install on home screen, push notifications via Web Push API, biometric unlock via WebAuthn / passkeys, QR pairing from the desktop dashboard. Native iOS / Android deferred indefinitely; PWA on iOS 16.4+ and current Android covers the operator-control scope. Telegram bridge from v1.2 stops being load-bearing once the PWA ships but stays available as an alternate notification channel.
+- **WP-V1.4-2 Public Federation.** Cross-operator discovery, signed inter-fortress messaging, public or semi-public agent pools, reputation exchange, anonymized wants and requests, abuse and rate controls, policy-enforced disclosure envelopes for anything crossing the boundary. Per the Federation Protocol v0.1 spec already shipped.
+- **WP-V1.4-3 Sovereign Data Warehouse.** The agent's durable record belongs to the operator. SDW builds the substrate so the operator's working data, query history, document corpus, and intermediate state live in a place the operator controls, not in a vendor's silo.
 
 v1.4 acceptance gate:
 
@@ -404,19 +233,19 @@ An operator pairs a phone, receives a generic approval notification, opens the P
 
 ---
 
-### Regulatory Posture
+## Regulatory Posture
 
-The full EU AI Act compliance pack ships in v1.5+. The architecture-independent first-mile is already in the fortress: signed audit trail, signed receipts, and signed-event envelopes provide a defensible record-keeping substrate for Article 12 obligations. Operators preparing for the August 2 enforcement date can compose those primitives with an external compliance toolchain in the meantime. The full compliance pack adds Article 50 transparency primitives and the operator-facing compliance generator.
+The full EU AI Act compliance pack ships in v1.5+. The architecture-independent first-mile is already in the fortress: signed audit trail, signed receipts, signed-event envelopes provide a defensible record-keeping substrate for Article 12 obligations. The Castle Wall extends this to enforce Article 50 transparency primitives at the OS level. Operators preparing for the August 2 enforcement date can compose those primitives with an external compliance toolchain in the meantime. The full compliance pack adds Article 50 transparency primitives surfaced to the operator and the operator-facing compliance generator.
 
 ---
 
 ## v1.5+ Expansion
 
-These tracks start only after v1.1 has completed the local harness and v1.2, v1.3, and v1.4 have validated mobile, sovereign data, and public federation.
+These tracks start only after v1.0 GA, v1.x Castle Wall, v1.2 operator-facing surfaces, v1.3 advanced intelligence, and v1.4 reach milestones.
 
 - Fleet operator console for multi-operator estates
 - Agent Vault composition adapter for sovereign signing of external-stack payment rails, delegation mandates, and reputation receipts
-- Runtime transport-layer interception generalized beyond the first privacy enforcement path
+- Container or microVM isolation (Castle Wall Phase 3) for highest-assurance enterprises
 - Bootstrap bundle (`@sanctuary-framework/agent-bundle`) for zero-config deployment
 - Agent Registry Federation across organizations
 - Native mobile features beyond companion control
@@ -448,22 +277,23 @@ Current direction:
 
 Cross-cutting, not tied to a single version. Sanctuary engages standards bodies to land operator-sovereign primitives as open specifications rather than proprietary interfaces.
 
-- W3C Agentic Integrity Verification Specification community group
+- W3C Agentic Integrity Verification Specification (AIVS) community group, Erik chairs. First deliverable: Concordia receipt schema submission within 90 days.
 - W3C DID method alignment
 - IETF trust-scoring alignment
 - AAIF Security Working Group participation
 - MCP Registry governance proposal
 - Reputation Portability Standard
-- DIF MCP-I Task Force, Verifier-role reference implementation against the L2 conformance tier
+- DIF KYA-OS Task Force, Verifier-role reference implementation against the Layer 2 conformance tier
 - DIF Delegatable Attenuated Authorization Task Force, observer posture aligned to Concordia Protocol composition
+- ERC-8004 ecosystem alignment
 
 ---
 
 ## Non-Dependency And Composition Posture
 
-Sanctuary never requires Concordia. Concordia never requires Sanctuary. Composition with external frameworks is always optional and default off. The framework alone, with no external dependency of any kind, is a fully operational local sovereignty harness.
+Sanctuary never requires Concordia. Concordia never requires Sanctuary. Composition with external frameworks is always optional and default off. The framework alone, with no external dependency of any kind, is a fully operational local sovereignty harness with structural enforcement at the Castle Wall.
 
-Composition partners are named as partners: Coinbase x402, Google AP2, Anthropic MCP, Hermes A2A, and peers in the agent-interop space.
+Composition partners are named as partners: Coinbase x402, Google AP2, Anthropic MCP, Hermes A2A, Concordia Protocol, Verascore, ERC-8004 ecosystem, and peers in the agent-interop space.
 
 ---
 
