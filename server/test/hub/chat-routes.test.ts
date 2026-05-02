@@ -254,7 +254,7 @@ describe("Hub chat routes — concierge", () => {
   });
 });
 
-describe("Hub chat routes — direct-agent", () => {
+describe("Hub agent inspect-panel route", () => {
   let rig: ChatRig;
   beforeEach(async () => {
     rig = await startRig({ withChat: true });
@@ -263,164 +263,52 @@ describe("Hub chat routes — direct-agent", () => {
     await rig.stop();
   });
 
-  it("POST /api/hub/chat/agents/:id/session/start opens the session synchronously (click-to-chat)", async () => {
+  it("POST /api/hub/agents/:id/inspect/open returns the inspect panel synchronously", async () => {
     const res = await post(
       rig.url,
-      `/api/hub/chat/agents/${AGENT_ID}/session/start`,
+      `/api/hub/agents/${AGENT_ID}/inspect/open`,
       rig.authToken,
       {},
     );
-    // v1.2.x click-to-chat: 200 with session record, NOT 202 + inbox item.
-    // The operator's click is the affirmative action; no Tier 1 inbox ask.
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
-    expect(res.body.data.session).toBeDefined();
-    expect(res.body.data.session.agent_id).toBe(AGENT_ID);
-    expect(res.body.data.session.session_id).toMatch(/^chat-session-/);
-    // approval_inbox_item_id is null on the click-to-chat path; the
-    // deprecated requestDirectAgentSession path populates it with the
-    // resolved Tier 1 item id.
-    expect(res.body.data.session.approval_inbox_item_id).toBeNull();
+    expect(res.body.data.panel).toBeDefined();
+    expect(res.body.data.panel.agent_id).toBe(AGENT_ID);
+    expect(Array.isArray(res.body.data.panel.recent_activity)).toBe(true);
+    expect(Array.isArray(res.body.data.panel.pending_approvals)).toBe(true);
+    expect(res.body.data.panel.policy_summary).toBeDefined();
   });
 
-  it("session-start emits direct_agent_session_open with null approval_inbox_item_id", async () => {
-    const startRes = await post(
+  it("inspect-open emits agent_inspect_panel_opened audit event", async () => {
+    const res = await post(
       rig.url,
-      `/api/hub/chat/agents/${AGENT_ID}/session/start`,
+      `/api/hub/agents/${AGENT_ID}/inspect/open`,
       rig.authToken,
       {},
     );
-    expect(startRes.status).toBe(200);
+    expect(res.status).toBe(200);
 
-    // The session-open audit event fired with approval_inbox_item_id:
-    // null because no Tier 1 inbox item was created on the click-to-
-    // chat path.
     const audit = await rig.auditLog.query({
-      operation_type: "direct_agent_session_open",
+      operation_type: "agent_inspect_panel_opened",
     });
     expect(audit.entries.length).toBe(1);
-    expect(audit.entries[0].operation).toBe("direct_agent_session_open");
-    expect(audit.entries[0].details?.kind).toBe("direct_agent_session_open");
-    expect(audit.entries[0].details?.approval_inbox_item_id).toBeNull();
-
-    // After session-open, an active session is listed.
-    const sessionRes = await get(
-      rig.url,
-      "/api/hub/chat/sessions",
-      rig.authToken,
-    );
-    expect(sessionRes.status).toBe(200);
-    expect(sessionRes.body.data.sessions.length).toBe(1);
-    expect(sessionRes.body.data.sessions[0].agent_id).toBe(AGENT_ID);
+    expect(audit.entries[0].operation).toBe("agent_inspect_panel_opened");
+    expect(audit.entries[0].details?.agent_id).toBe(AGENT_ID);
   });
 
-  it("session-start does NOT enqueue a Tier 1 inbox item (click-is-confirmation)", async () => {
-    // Filter inbox items to direct_agent_session_open Tier 1 approvals; the
-    // count should stay 0 across session-start (no inbox routing on the
-    // click-to-chat path).
-    const inboxBefore = rig.service
-      .listInbox()
-      .filter((i) =>
-        i.kind === "approval_pending" &&
-        i.operation_category === "direct_agent_session_open",
-      ).length;
-    expect(inboxBefore).toBe(0);
+  it("inspect-open does NOT enqueue a Tier 1 inbox item (read-only panel)", async () => {
+    const inboxBefore = rig.service.listInbox().length;
 
     const res = await post(
       rig.url,
-      `/api/hub/chat/agents/${AGENT_ID}/session/start`,
+      `/api/hub/agents/${AGENT_ID}/inspect/open`,
       rig.authToken,
       {},
     );
     expect(res.status).toBe(200);
 
-    const inboxAfter = rig.service
-      .listInbox()
-      .filter((i) =>
-        i.kind === "approval_pending" &&
-        i.operation_category === "direct_agent_session_open",
-      ).length;
-    expect(inboxAfter).toBe(0);
-  });
-
-  it("POST /api/hub/chat/agents/:id/message persists the operator message", async () => {
-    const startRes = await post(
-      rig.url,
-      `/api/hub/chat/agents/${AGENT_ID}/session/start`,
-      rig.authToken,
-      {},
-    );
-    const sessionId = startRes.body.data.session.session_id as string;
-
-    const sendRes = await post(
-      rig.url,
-      `/api/hub/chat/agents/${AGENT_ID}/message`,
-      rig.authToken,
-      {
-        session_id: sessionId,
-        message: "draft the dashboard PR review please",
-      },
-    );
-    expect(sendRes.status).toBe(200);
-    expect(sendRes.body.data.message.role).toBe("operator");
-
-    const historyRes = await get(
-      rig.url,
-      `/api/hub/chat/agents/${AGENT_ID}/history`,
-      rig.authToken,
-    );
-    expect(historyRes.body.data.messages.length).toBe(1);
-    expect(historyRes.body.data.messages[0].body).toBe(
-      "draft the dashboard PR review please",
-    );
-  });
-
-  it("POST /api/hub/chat/agents/:id/session/end closes the session", async () => {
-    const startRes = await post(
-      rig.url,
-      `/api/hub/chat/agents/${AGENT_ID}/session/start`,
-      rig.authToken,
-      {},
-    );
-    const sessionId = startRes.body.data.session.session_id as string;
-
-    const endRes = await post(
-      rig.url,
-      `/api/hub/chat/agents/${AGENT_ID}/session/end`,
-      rig.authToken,
-      { session_id: sessionId },
-    );
-    expect(endRes.status).toBe(200);
-    expect(endRes.body.data.session.close_reason).toBe("operator_close");
-
-    // No active sessions after close.
-    const sessionRes = await get(
-      rig.url,
-      "/api/hub/chat/sessions",
-      rig.authToken,
-    );
-    expect(sessionRes.body.data.sessions.length).toBe(0);
-  });
-
-  it("rejects message send when session does not belong to the agent", async () => {
-    const startRes = await post(
-      rig.url,
-      `/api/hub/chat/agents/${AGENT_ID}/session/start`,
-      rig.authToken,
-      {},
-    );
-    const sessionId = startRes.body.data.session.session_id as string;
-
-    // POST to a different agent path with this session_id.
-    const sendRes = await post(
-      rig.url,
-      `/api/hub/chat/agents/some-other-agent/message`,
-      rig.authToken,
-      { session_id: sessionId, message: "hello" },
-    );
-    // The agent doesn't exist in the registry; expect HubNotFoundError or
-    // session-mismatch validation.
-    expect([400, 404]).toContain(sendRes.status);
+    const inboxAfter = rig.service.listInbox().length;
+    expect(inboxAfter).toBe(inboxBefore);
   });
 });
 

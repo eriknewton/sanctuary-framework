@@ -64,12 +64,6 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
     "federation_node_join",
-    // NOTE: `direct_agent_session_open` was previously Tier 1 (WP-V1.2-4
-    // landed it under inbox-routed approval). v1.2.x click-to-chat moved
-    // it to `tier3_always_allow` below: the operator's click on the
-    // dashboard chat affordance IS the affirmative action; a second
-    // approval ask was bureaucratic noise. Future v1.x can restore Tier
-    // 1 by moving the entry back here without touching call-site code.
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [
@@ -133,10 +127,6 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "memory_attest", // Read-only audit attestation — records that a memory op happened
     "compliance_generate_eu_ai_act_bundle", // Read-only; emits signed compliance documents from existing state
     "compliance_eu_ai_act_annex_iii_classify", // Read-only; rule-based Annex III classifier
-    // WP-V1.2-4 Follow-up (click-to-chat): direct-agent session entry is
-    // gated by the operator's click in the dashboard, not by an out-of-
-    // band inbox approval. The click IS the affirmative action.
-    "direct_agent_session_open",
   ],
   approval_channel: DEFAULT_CHANNEL,
 };

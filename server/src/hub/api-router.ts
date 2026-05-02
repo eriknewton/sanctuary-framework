@@ -145,29 +145,6 @@ function matchAgentRoute(path: string): {
 }
 
 /**
- * Match `/api/hub/chat/agents/<id>/<remainder>` and
- * `/api/hub/chat/agents/<id>` patterns. Returns null if the path is
- * not under the chat-agents prefix.
- */
-function matchChatAgentRoute(path: string): {
-  agentId: string;
-  remainder: string | null;
-} | null {
-  const prefix = `${HUB_API_PREFIX}/chat/agents/`;
-  if (!path.startsWith(prefix)) return null;
-  const rest = path.slice(prefix.length);
-  if (rest.length === 0) return null;
-  const slash = rest.indexOf("/");
-  if (slash === -1) {
-    return { agentId: decodeURIComponent(rest), remainder: null };
-  }
-  return {
-    agentId: decodeURIComponent(rest.slice(0, slash)),
-    remainder: rest.slice(slash + 1),
-  };
-}
-
-/**
  * Pull a non-empty chat message body out of a request body. Throws
  * HubValidationError when the body is missing, the wrong type, or
  * exceeds the per-message length cap.
@@ -358,6 +335,17 @@ export async function handleHubRoute(
         return true;
       }
 
+      // POST /api/hub/agents/:id/inspect/open
+      // Click-to-inspect (WP-V1.2 reshape). Repurposes the click-to-chat
+      // wire-up from PR #98 + PR #100; the panel returns recent activity,
+      // pending Tier 1 approvals, and policy summary instead of opening
+      // a chat session. Synchronous open shape preserved.
+      if (method === "POST" && remainder === "inspect/open") {
+        const panel = await deps.service.openAgentInspectPanel(agentId);
+        writeJSON(res, 200, { ok: true, data: { panel } });
+        return true;
+      }
+
       // POST /api/hub/agents/:id/policy
       if (method === "POST" && remainder === "policy") {
         const body = await readJSONBody<{ policy_id?: unknown }>(req);
@@ -463,104 +451,6 @@ export async function handleHubRoute(
       const messages = await deps.service.getConciergeHistory();
       writeJSON(res, 200, { ok: true, data: { messages } });
       return true;
-    }
-
-    // ── GET /api/hub/chat/sessions ───────────────────────────────
-    if (
-      method === "GET" &&
-      path === HUB_ROUTES.CHAT_SESSIONS_LIST
-    ) {
-      const sessions = deps.service.listActiveDirectAgentSessions();
-      writeJSON(res, 200, { ok: true, data: { sessions } });
-      return true;
-    }
-
-    // ── /api/hub/chat/agents/:id/* ───────────────────────────────
-    const chatAgentMatch = matchChatAgentRoute(path);
-    if (chatAgentMatch) {
-      const { agentId, remainder } = chatAgentMatch;
-
-      // GET /api/hub/chat/agents/:id/history
-      if (method === "GET" && remainder === "history") {
-        const messages = await deps.service.getDirectAgentHistory(agentId);
-        writeJSON(res, 200, { ok: true, data: { messages } });
-        return true;
-      }
-
-      // POST /api/hub/chat/agents/:id/session/start
-      // v1.2.x: synchronous click-to-chat. The operator's click on the
-      // dashboard chat affordance IS the affirmative action; the hub opens
-      // the session immediately and returns the session record. Audit
-      // event `direct_agent_session_open` fires on session-create.
-      if (method === "POST" && remainder === "session/start") {
-        const body = await readJSONBody<{ expires_at?: unknown }>(req);
-        let expiresAtIso: string | undefined;
-        if (body.expires_at !== undefined) {
-          if (typeof body.expires_at !== "string") {
-            throw new HubValidationError(
-              "expires_at must be an ISO8601 string",
-            );
-          }
-          if (Number.isNaN(Date.parse(body.expires_at))) {
-            throw new HubValidationError(
-              "expires_at must be a parseable ISO8601 timestamp",
-            );
-          }
-          expiresAtIso = body.expires_at;
-        }
-        const session = await deps.service.openDirectAgentSession(
-          agentId,
-          expiresAtIso,
-        );
-        writeJSON(res, 200, { ok: true, data: { session } });
-        return true;
-      }
-
-      // POST /api/hub/chat/agents/:id/session/end
-      if (method === "POST" && remainder === "session/end") {
-        const body = await readJSONBody<{ session_id?: unknown }>(req);
-        if (
-          typeof body.session_id !== "string" ||
-          body.session_id.length === 0
-        ) {
-          throw new HubValidationError("session_id required");
-        }
-        const session = await deps.service.closeDirectAgentSession(
-          body.session_id,
-        );
-        writeJSON(res, 200, { ok: true, data: { session } });
-        return true;
-      }
-
-      // POST /api/hub/chat/agents/:id/message
-      if (method === "POST" && remainder === "message") {
-        const body = await readJSONBody<{
-          message?: unknown;
-          session_id?: unknown;
-        }>(req);
-        const message = checkChatMessage(body.message);
-        if (
-          typeof body.session_id !== "string" ||
-          body.session_id.length === 0
-        ) {
-          throw new HubValidationError("session_id required");
-        }
-        const result = await deps.service.sendDirectAgentMessage(
-          body.session_id,
-          message,
-        );
-        // The session bound by `body.session_id` MUST belong to
-        // `agentId`; the chat-service throws HubNotFoundError if not.
-        // Defense in depth: validate the session.agent_id matches the
-        // url path explicitly here.
-        if (result.session.agent_id !== agentId) {
-          throw new HubValidationError(
-            "session_id does not belong to this agent",
-          );
-        }
-        writeJSON(res, 200, { ok: true, data: result });
-        return true;
-      }
     }
 
     // No hub route matched.

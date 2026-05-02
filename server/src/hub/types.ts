@@ -346,19 +346,31 @@ export interface HubServiceDeps {
 }
 
 /**
- * Result returned from `requestDirectAgentSession`. The session is
- * created only after the Tier 1 inbox item is approved; before approval
- * the caller polls the inbox or waits for the session-open audit event.
- *
- * On approval the operator-chat-service emits `direct_agent_session_open`
- * with the assigned `session_id`; consumers that need the id before the
- * inbox flow lands MUST wait for that event.
+ * Click-to-inspect panel returned by `openAgentInspectPanel`. The panel
+ * surfaces the agent's recent activity, pending approvals routed through
+ * this agent, and policy summary at a glance, repurposing the click-
+ * to-chat wire-up shipped in PR #98 + PR #100. The direct-agent chat
+ * surface was removed in the v1.2 reshape; this panel is the operational
+ * destination for the click.
  */
-export interface HubDirectAgentSessionRequestResult
-  extends HubTier1ApprovalEnqueuedResult {
-  operation_category: "direct_agent_session_open";
-  /** Operator-configured expiry; defaults to 1 hour from approval. */
-  requested_expires_at?: string;
+export interface HubAgentInspectPanel {
+  /** The agent the panel was opened on. */
+  agent_id: string;
+  /** ISO8601 timestamp the panel was opened. */
+  opened_at: string;
+  /** Recent activity-feed entries for this agent, oldest first. */
+  recent_activity: HubActivityFeedEntry[];
+  /**
+   * Open Tier 1 inbox items routed through this agent. Empty when the
+   * agent has no pending approvals.
+   */
+  pending_approvals: HubInboxItem[];
+  /**
+   * Bound policy summary for this agent. Null when the agent has no
+   * channel-template binding (e.g. immediately after wrap, before the
+   * operator picks a template).
+   */
+  policy_summary: HubPolicySummary | null;
 }
 
 // -----------------------------------------------------------------------

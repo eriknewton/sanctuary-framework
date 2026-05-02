@@ -134,20 +134,6 @@ tier1_always_approve:
       expect(DEFAULT_POLICY.tier3_always_allow).toContain("monitor_health");
     });
 
-    it("classifies direct_agent_session_open as Tier 3 (click-to-chat)", () => {
-      // v1.2.x click-to-chat: the operator's click on the dashboard chat
-      // affordance IS the affirmative action. The operation is classified
-      // Tier 3 so any future gate evaluation auto-allows; future v1.x can
-      // restore Tier 1 by moving the entry without touching call-site
-      // code.
-      expect(DEFAULT_POLICY.tier3_always_allow).toContain(
-        "direct_agent_session_open",
-      );
-      expect(DEFAULT_POLICY.tier1_always_approve).not.toContain(
-        "direct_agent_session_open",
-      );
-    });
-
     it("does not include auto_deny (SEC-002: hardcoded deny)", () => {
       // SEC-002: auto_deny is no longer in the default policy
       expect(DEFAULT_POLICY.approval_channel.auto_deny).toBeUndefined();
