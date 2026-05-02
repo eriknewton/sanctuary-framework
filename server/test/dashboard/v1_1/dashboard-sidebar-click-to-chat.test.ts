@@ -31,17 +31,15 @@ describe("v1.1 dashboard sidebar click-to-chat (fortress-column agent rows)", ()
     expect(script).toContain('title="Open direct chat with ');
   });
 
-  it("dispatcher routes open-agent-chat to selectedAgentId + agent-detail + onDirectAgentStart", () => {
+  it("dispatcher routes open-agent-chat to selectedAgentId + agent-detail + onAgentInspectOpen", () => {
     const script = getClientScript();
-    // The new branch must:
-    //  - set state.selectedAgentId
-    //  - navigate to #agent-detail (with the same setRoute fallback the
-    //    inbox-approve flow uses for same-route reassignment)
-    //  - fire onDirectAgentStart(agentId) so the route round-trip starts
-    //    immediately and the optimistic clickInflightAgentId pane shows
-    //    while the response lands
+    // WP-V1.2 reshape: the click-to-chat surface was repurposed as
+    // click-to-inspect. The wire-up still sets selectedAgentId and
+    // navigates to #agent-detail, but the synchronous round-trip is
+    // now POST /agents/:id/inspect/open. The optimistic openingAgentId
+    // pane renders while the response lands.
     expect(script).toContain('action === "open-agent-chat" && agentId');
-    expect(script).toMatch(/state\.selectedAgentId = agentId;[\s\S]*?location\.hash[\s\S]*?onDirectAgentStart\(agentId\)/);
+    expect(script).toMatch(/state\.selectedAgentId = agentId;[\s\S]*?location\.hash[\s\S]*?onAgentInspectOpen\(agentId\)/);
   });
 
   it("Enter and Space activate the role=button head via keydown", () => {
