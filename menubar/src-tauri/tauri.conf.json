@@ -1,0 +1,56 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Sanctuary Menubar",
+  "version": "0.1.0",
+  "identifier": "com.sanctuaryprotocol.menubar",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "popover",
+        "title": "Sanctuary",
+        "width": 400,
+        "height": 600,
+        "visible": false,
+        "decorations": false,
+        "resizable": false,
+        "skipTaskbar": true,
+        "alwaysOnTop": false,
+        "transparent": false,
+        "shadow": true,
+        "url": "index.html"
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "macOSPrivateApi": false,
+    "trayIcon": {
+      "id": "main-tray",
+      "iconPath": "icons/tray-clear.png",
+      "iconAsTemplate": true,
+      "menuOnLeftClick": false
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ],
+    "category": "Utility",
+    "shortDescription": "Sanctuary menubar, operator approval surface",
+    "longDescription": "Sanctuary surfaces pending agent approvals in your macOS menubar. Watches your local fortress and shows what is waiting on you, what just happened, and which agents are wrapped.",
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "exceptionDomain": "127.0.0.1"
+    }
+  },
+  "plugins": {}
+}

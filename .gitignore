@@ -31,3 +31,8 @@ REVIEW_MAP.md
 docs/builds/
 Sanctuary_Concordia_Viral_Strategy.md
 social_posts_*.md
+
+# Menubar workspace (Tauri 2.x)
+menubar/src-tauri/target/
+menubar/src-tauri/gen/
+menubar/.vite/
