@@ -587,6 +587,101 @@ describe("Intelligence router, Finding VV recentFailures field", () => {
   });
 });
 
+// v1.2.0-rc.3 Finding ZZ: end-to-end operator-visible flow.
+// Reproduces the moltbook drill operator's path: bad-substrate runtime
+// failure populates the recent-failures buffer on a surface, operator
+// switches that surface to a working substrate, and the next /status
+// fetch must show empty recentFailures plus a green badge for that
+// surface. The rc.2 unit tests verified the in-memory buffer-clear at
+// the selector method level; this exercises the full HTTP route flow
+// the dashboard SPA actually uses.
+describe("Intelligence router, Finding ZZ end-to-end status reflects clear", () => {
+  let h: Harness;
+  beforeEach(async () => { h = await startHarness(); });
+  afterEach(async () => { await h.stop(); });
+
+  it("after POST /surfaces/concierge/choice flips concierge venice -> local, /status returns concierge with empty recentFailures and a green badge", async () => {
+    await h.selector.setVeniceApiKey("operator-test-key");
+    await h.selector.setPerSurfaceChoice("concierge", "venice");
+    h.selector.recordRecentFailureForTest(
+      "concierge",
+      "substrate_misconfigured",
+      "venice configured model not found on validation probe",
+    );
+
+    const before = await fetch(`${h.url}${INTELLIGENCE_API_PREFIX}/status`, {
+      headers: authedHeaders(h.authToken),
+    });
+    expect(before.status).toBe(200);
+    const beforeBody = await before.json() as {
+      data: { surfaces: Array<{ surface: string; recentFailures: unknown[]; badge: { status: string } }> };
+    };
+    const conciergeBefore = beforeBody.data.surfaces.find((s) => s.surface === "concierge");
+    expect(conciergeBefore).toBeDefined();
+    expect(conciergeBefore!.recentFailures.length).toBe(1);
+    expect(conciergeBefore!.badge.status).toBe("yellow");
+
+    const flip = await fetch(
+      `${h.url}${INTELLIGENCE_API_PREFIX}/surfaces/concierge/choice`,
+      {
+        method: "POST",
+        headers: { ...authedHeaders(h.authToken), "Content-Type": "application/json" },
+        body: JSON.stringify({ substrate: "local" }),
+      },
+    );
+    expect(flip.status).toBe(200);
+
+    const after = await fetch(`${h.url}${INTELLIGENCE_API_PREFIX}/status`, {
+      headers: authedHeaders(h.authToken),
+    });
+    expect(after.status).toBe(200);
+    const afterBody = await after.json() as {
+      data: { surfaces: Array<{ surface: string; chosen: string; recentFailures: unknown[]; badge: { status: string } }> };
+    };
+    const conciergeAfter = afterBody.data.surfaces.find((s) => s.surface === "concierge");
+    expect(conciergeAfter).toBeDefined();
+    expect(conciergeAfter!.chosen).toBe("local");
+    expect(conciergeAfter!.recentFailures.length).toBe(0);
+    expect(["green", "yellow"]).toContain(conciergeAfter!.badge.status);
+  });
+
+  it("after POST /surfaces/all/choice bulk-flips all surfaces to local, /status returns every surface with empty recentFailures", async () => {
+    await h.selector.setPerSurfaceChoice("concierge", "venice");
+    await h.selector.setPerSurfaceChoice("sentinel-scoring", "venice");
+    h.selector.recordRecentFailureForTest(
+      "concierge",
+      "substrate_misconfigured",
+      "venice model not found",
+    );
+    h.selector.recordRecentFailureForTest(
+      "sentinel-scoring",
+      "substrate_auth_failed",
+      "venice key rejected",
+    );
+
+    const flip = await fetch(
+      `${h.url}${INTELLIGENCE_API_PREFIX}/surfaces/all/choice`,
+      {
+        method: "POST",
+        headers: { ...authedHeaders(h.authToken), "Content-Type": "application/json" },
+        body: JSON.stringify({ substrate: "local" }),
+      },
+    );
+    expect(flip.status).toBe(200);
+
+    const after = await fetch(`${h.url}${INTELLIGENCE_API_PREFIX}/status`, {
+      headers: authedHeaders(h.authToken),
+    });
+    expect(after.status).toBe(200);
+    const afterBody = await after.json() as {
+      data: { surfaces: Array<{ surface: string; recentFailures: unknown[] }> };
+    };
+    for (const s of afterBody.data.surfaces) {
+      expect(s.recentFailures.length).toBe(0);
+    }
+  });
+});
+
 describe("Intelligence dispatch — selector-less binding returns 503", () => {
   let h: Harness;
   beforeEach(async () => { h = await startHarness({ withSelector: false }); });

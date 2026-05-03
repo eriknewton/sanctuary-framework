@@ -18,6 +18,7 @@
  */
 
 import { getClientScript } from "./client.js";
+import { SANCTUARY_VERSION } from "../../config.js";
 
 export interface DashboardV11HtmlOptions {
   /** Bearer token for hub API auth, when not running loopback auto-auth. */
@@ -30,6 +31,13 @@ export interface DashboardV11HtmlOptions {
   identityId?: string;
   /** Stable fortress id surfaced in the top bar. */
   fortressId?: string;
+  /**
+   * Server build-time binary version (read from package.json at module
+   * load). Surfaced as a topbar pill so operators can verify the running
+   * binary matches what they expect (Finding CCC, v1.2.0-rc.3). Defaults
+   * to the package's own version constant; tests override.
+   */
+  sanctuaryVersion?: string;
   /** Override for tests: render the inline client script body. Defaults to true. */
   embedClient?: boolean;
 }
@@ -420,6 +428,7 @@ export function renderDashboardV11Html(
   const streamUrl = options.streamUrl ?? "/api/stream";
   const identityId = options.identityId ?? "operator";
   const fortressId = options.fortressId ?? "fortress";
+  const sanctuaryVersion = options.sanctuaryVersion ?? SANCTUARY_VERSION;
   const embedClient = options.embedClient !== false;
 
   const nav = NAV_ITEMS.map(
@@ -439,6 +448,7 @@ export function renderDashboardV11Html(
     streamUrl,
     identityId,
     fortressId,
+    sanctuaryVersion,
   }).replace(/</g, "\\u003c");
 
   const clientBlock = embedClient
@@ -464,6 +474,7 @@ export function renderDashboardV11Html(
     <header class="topbar">
       <span class="brand mono">${escHtml(fortressId)}</span>
       <div class="pills" id="topbar-pills">
+        <span class="pill" data-pill="version">v${escHtml(sanctuaryVersion)}</span>
         <span class="pill" data-pill="deployment">deployment: local</span>
         <span class="pill" data-pill="mode">mode: solo</span>
         <span class="pill" data-pill="attestation">attestation: pending</span>

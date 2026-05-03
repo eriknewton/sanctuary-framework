@@ -46,6 +46,7 @@ const config = cfgEl ? JSON.parse(cfgEl.textContent || "{}") : {};
 const HUB = config.hubApiBase || "/api/hub";
 const STREAM = config.streamUrl || "/api/stream";
 const TOKEN = config.authToken || "";
+const SANCTUARY_VERSION = config.sanctuaryVersion || "";
 const SESSION_KEY = "sanctuary-v11-sidebar";
 
 // ── State ──────────────────────────────────────────────────────────────
@@ -105,7 +106,17 @@ const state = {
       composer: "",
       sending: false,
       error: null,
-      badge: null
+      badge: null,
+      // Finding DDD (v1.2.0-rc.3): when the operator sends a message,
+      // unconditionally scroll the chat history to bottom on the next
+      // render so the operator sees their submitted message and the
+      // concierge reply land in view. For passive renders (poll-driven
+      // history refresh, badge refresh, unrelated state changes) the
+      // scroll is conditional on the operator already being at or near
+      // the bottom (within AUTO_SCROLL_TOLERANCE_PX). If the operator
+      // has scrolled up to read history, do not auto-scroll on background
+      // ticks; that would be hostile.
+      pendingScroll: false
     },
     inspect: {
       // panelByAgentId: keyed by agent_id, the most recently fetched
@@ -347,7 +358,17 @@ function setRoute(route) {
 function renderTopbar() {
   const pillEl = document.getElementById("topbar-pills");
   if (!pillEl) return;
+  // Version pill (Finding CCC, v1.2.0-rc.3): operator-visible binary
+  // version so a stale build is impossible to mistake for a fresh one.
+  // Server-rendered initially in html.ts; refreshed here on every
+  // renderTopbar so the pill survives any future state-driven topbar
+  // rewrite. Reads from the immutable SANCTUARY_VERSION constant
+  // hydrated at boot from the dashboard-config script block.
+  const versionPill = SANCTUARY_VERSION
+    ? '<span class="pill" data-pill="version">v' + escHtml(SANCTUARY_VERSION) + '</span>'
+    : '';
   pillEl.innerHTML = [
+    versionPill,
     '<span class="pill" data-pill="deployment">deployment: ' + escHtml(state.topbarPills.deployment) + '</span>',
     '<span class="pill" data-pill="mode">mode: ' + escHtml(state.topbarPills.mode) + '</span>',
     '<span class="pill tone-' + escHtml(state.topbarPills.attestation) + '" data-pill="attestation">attestation: ' + escHtml(state.topbarPills.attestation) + '</span>'
@@ -381,6 +402,14 @@ function renderTopbar() {
 // generated reply via the standard macOS selection mechanism.
 const __renderCache = { route: null, html: null };
 
+// Finding DDD (v1.2.0-rc.3): if the operator's scroll position in the
+// concierge history is within this many pixels of the bottom at the
+// moment a render fires, treat them as following the conversation and
+// scroll them back to bottom after the DOM is replaced. Above this
+// threshold we assume they have scrolled up to read history and leave
+// their position alone.
+const AUTO_SCROLL_TOLERANCE_PX = 50;
+
 // ── Render: main area ──────────────────────────────────────────────────
 function renderMain() {
   const main = document.getElementById("main");
@@ -405,6 +434,18 @@ function renderMain() {
       selectionEnd: active.selectionEnd
     };
   }
+  // Capture concierge-history scroll-at-bottom intent BEFORE the DOM is
+  // replaced. innerHTML replacement creates a fresh container with
+  // scrollTop=0 by default, which would make every render look like the
+  // operator scrolled all the way up. Snapshot now, restore after.
+  let conciergeWasAtBottom = false;
+  if (state.route === "dashboard") {
+    const histEl = document.getElementById("concierge-history");
+    if (histEl) {
+      const distance = histEl.scrollHeight - histEl.scrollTop - histEl.clientHeight;
+      conciergeWasAtBottom = distance <= AUTO_SCROLL_TOLERANCE_PX;
+    }
+  }
   let nextHtml;
   switch (state.route) {
     case "dashboard": nextHtml = renderDashboardConcierge(); break;
@@ -422,12 +463,28 @@ function renderMain() {
   // to the last write on the same route. Preserves the existing DOM
   // tree, focus, and any active text selection during no-op poll
   // cycles. The route-change branch always writes (cache miss).
+  let didWrite = false;
   if (__renderCache.route === state.route && __renderCache.html === nextHtml) {
     // No-op: DOM already reflects current state.
   } else {
     main.innerHTML = nextHtml;
     __renderCache.route = state.route;
     __renderCache.html = nextHtml;
+    didWrite = true;
+  }
+  // Finding DDD (v1.2.0-rc.3): scroll the concierge history to bottom
+  // when (a) the operator just sent a message (pendingScroll flag), or
+  // (b) the operator was already at or near the bottom before this
+  // render. If the operator scrolled up, leave their position alone.
+  if (state.route === "dashboard" && didWrite) {
+    const histEl = document.getElementById("concierge-history");
+    if (histEl) {
+      const pending = state.chat.concierge.pendingScroll;
+      if (pending || conciergeWasAtBottom) {
+        histEl.scrollTop = histEl.scrollHeight;
+      }
+      state.chat.concierge.pendingScroll = false;
+    }
   }
   if (focus) {
     let sel = 'input[data-action="' + focus.action + '"]';
@@ -1196,6 +1253,11 @@ async function onConciergeSend() {
       };
     }
     c.composer = "";
+    // Finding DDD (v1.2.0-rc.3): the operator just submitted a message
+    // and a concierge reply just landed. Force scroll to bottom on the
+    // next render so the new exchange is in view, even if the operator
+    // had drifted up by a poll-cycle's worth of layout shift.
+    c.pendingScroll = true;
   } catch (e) {
     c.error = e.message || "Concierge call failed.";
   } finally {
