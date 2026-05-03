@@ -187,6 +187,14 @@ export interface SubstrateConfig {
   hybridRules?: HybridRoutingRules;
   /** Fallback behavior per surface. */
   fallback: Record<Surface, FallbackBehavior>;
+  /**
+   * Operator preference for the picker modal: when true, picking a
+   * substrate + key for any one surface fans out to every surface in one
+   * save (Finding SS, v1.2.0-rc.1). Defaults to true; operators wanting
+   * per-surface granularity flip the picker toggle off and the next
+   * single-surface choice persists this back to false.
+   */
+  applyToAllSurfaces?: boolean;
   /** ISO8601 timestamp of last operator change. */
   updatedAt: string;
 }
@@ -319,6 +327,40 @@ export interface SurfaceStatus {
   health: "ok" | "degraded" | "unavailable";
   /** Stable failure class when health != "ok"; null when "ok". */
   failureClass: SubstrateFailureClass | null;
+  /**
+   * Recent runtime + validation failures for this surface, capped at 5
+   * entries and time-windowed to 24 hours. Sourced from real chat-call
+   * outcomes (and validateKey results for substrates that expose it),
+   * NOT from the static probe-time misconfig check.
+   *
+   * Per Finding VV (v1.2.0-rc.1): the operator-visible badge degrades to
+   * "yellow" / "degraded" whenever this array is non-empty even if the
+   * static probe still says ok. This closes the truth-telling gap where
+   * the dashboard reported all surfaces healthy after the runtime chat
+   * had already failed against the same substrate.
+   */
+  recentFailures: RecentFailureEntry[];
+}
+
+/**
+ * One observed substrate failure surfaced via `/api/hub/intelligence/status`.
+ * Carries enough metadata for the operator to triage (when, what failure
+ * class, brief operator-safe snippet) without leaking request bodies,
+ * response bodies, or operator credentials.
+ *
+ * Snippets are bounded human-readable strings (e.g. "venice configured
+ * model not found") drawn from the substrate failure-message field; the
+ * selector strips anything resembling an API key or PII before retention.
+ * Operators wanting full forensic detail consult the L2 audit log; this
+ * surface is the at-a-glance triage path.
+ */
+export interface RecentFailureEntry {
+  /** ISO8601 timestamp of when the failure was observed. */
+  ts: string;
+  /** Stable failure-class enum carried verbatim from the substrate response. */
+  failureClass: SubstrateFailureClass;
+  /** Bounded operator-safe snippet describing the failure. */
+  snippet: string;
 }
 
 export interface HardwareCapabilityReport {

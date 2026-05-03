@@ -490,6 +490,103 @@ describe("Intelligence API router — hybrid + reset", () => {
   });
 });
 
+// v1.2.0-rc.1 Finding SS: bulk apply + apply-to-all preference
+describe("Intelligence router, Finding SS bulk apply", () => {
+  let h: Harness;
+  beforeEach(async () => { h = await startHarness(); });
+  afterEach(async () => { await h.stop(); });
+
+  it("POST /surfaces/all/choice applies substrate to every surface in one save", async () => {
+    const res = await fetch(`${h.url}${INTELLIGENCE_API_PREFIX}/surfaces/all/choice`, {
+      method: "POST",
+      headers: { ...authedHeaders(h.authToken), "Content-Type": "application/json" },
+      body: JSON.stringify({ substrate: "venice" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { data: { per_surface: Record<string, string> } };
+    expect(body.data.per_surface.concierge).toBe("venice");
+    expect(body.data.per_surface["sentinel-scoring"]).toBe("venice");
+    expect(body.data.per_surface["gate-explanation"]).toBe("venice");
+    expect(body.data.per_surface["template-suggestion"]).toBe("venice");
+
+    const events = await h.auditLog.query({ operation_type: INTEL_OPS.BULK_SUBSTRATE_CHOSEN });
+    expect(events.entries.length).toBe(1);
+  });
+
+  it("POST /surfaces/all/choice rejects invalid substrate with 400", async () => {
+    const res = await fetch(`${h.url}${INTELLIGENCE_API_PREFIX}/surfaces/all/choice`, {
+      method: "POST",
+      headers: { ...authedHeaders(h.authToken), "Content-Type": "application/json" },
+      body: JSON.stringify({ substrate: "made-up" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /surfaces/all/choice with local + local_model_pick fans out the pick", async () => {
+    const res = await fetch(`${h.url}${INTELLIGENCE_API_PREFIX}/surfaces/all/choice`, {
+      method: "POST",
+      headers: { ...authedHeaders(h.authToken), "Content-Type": "application/json" },
+      body: JSON.stringify({ substrate: "local", local_model_pick: "phi-4-mini" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { data: { local_model_picks: Record<string, string> } };
+    expect(body.data.local_model_picks.concierge).toBe("phi-4-mini");
+    expect(body.data.local_model_picks["template-suggestion"]).toBe("phi-4-mini");
+  });
+
+  it("POST /preferences/apply-to-all persists boolean preference", async () => {
+    const res = await fetch(`${h.url}${INTELLIGENCE_API_PREFIX}/preferences/apply-to-all`, {
+      method: "POST",
+      headers: { ...authedHeaders(h.authToken), "Content-Type": "application/json" },
+      body: JSON.stringify({ value: false }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { data: { apply_to_all_surfaces: boolean } };
+    expect(body.data.apply_to_all_surfaces).toBe(false);
+  });
+
+  it("POST /preferences/apply-to-all rejects non-boolean value with 400", async () => {
+    const res = await fetch(`${h.url}${INTELLIGENCE_API_PREFIX}/preferences/apply-to-all`, {
+      method: "POST",
+      headers: { ...authedHeaders(h.authToken), "Content-Type": "application/json" },
+      body: JSON.stringify({ value: "yes" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("GET /config exposes apply_to_all_surfaces", async () => {
+    const res = await fetch(`${h.url}${INTELLIGENCE_API_PREFIX}/config`, {
+      headers: authedHeaders(h.authToken),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { data: { apply_to_all_surfaces: boolean } };
+    // Default is true on a fresh fortress.
+    expect(body.data.apply_to_all_surfaces).toBe(true);
+  });
+});
+
+// v1.2.0-rc.1 Finding VV: recentFailures shape on /status
+describe("Intelligence router, Finding VV recentFailures field", () => {
+  let h: Harness;
+  beforeEach(async () => { h = await startHarness(); });
+  afterEach(async () => { await h.stop(); });
+
+  it("GET /status carries a recentFailures array per surface (empty by default)", async () => {
+    const res = await fetch(`${h.url}${INTELLIGENCE_API_PREFIX}/status`, {
+      headers: authedHeaders(h.authToken),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      data: { surfaces: Array<{ surface: string; recentFailures: unknown[] }> };
+    };
+    expect(body.data.surfaces.length).toBeGreaterThan(0);
+    for (const s of body.data.surfaces) {
+      expect(Array.isArray(s.recentFailures)).toBe(true);
+      expect(s.recentFailures.length).toBe(0);
+    }
+  });
+});
+
 describe("Intelligence dispatch — selector-less binding returns 503", () => {
   let h: Harness;
   beforeEach(async () => { h = await startHarness({ withSelector: false }); });

@@ -225,6 +225,7 @@ function sanitizeConfig(selector: SubstrateSelector): {
   frontier_keys_present: Record<FrontierProvider, boolean>;
   hybrid_rules: HybridRoutingRules | null;
   fallback: Record<Surface, FallbackBehavior>;
+  apply_to_all_surfaces: boolean;
   updated_at: string;
 } {
   const cfg = selector.getConfig();
@@ -243,6 +244,7 @@ function sanitizeConfig(selector: SubstrateSelector): {
     },
     hybrid_rules: cfg.hybridRules ?? null,
     fallback: cfg.fallback,
+    apply_to_all_surfaces: cfg.applyToAllSurfaces !== false,
     updated_at: cfg.updatedAt,
   };
 }
@@ -334,6 +336,68 @@ export async function handleIntelligenceRoute(
     // ── POST /api/hub/intelligence/reset ────────────────────────────────
     if (method === "POST" && path === `${INTELLIGENCE_API_PREFIX}/reset`) {
       await deps.selector.resetToDefaults();
+      writeJSON(res, 200, { ok: true, data: sanitizeConfig(deps.selector) });
+      return true;
+    }
+
+    // ── POST /api/hub/intelligence/surfaces/all/choice ──────────────────
+    // Bulk-apply path for the picker modal's "Apply to all surfaces"
+    // toggle (Finding SS, v1.2.0-rc.1). Body shape mirrors the
+    // per-surface choice route minus the surface segment; substrate is
+    // applied to every surface in one selector save with a single bulk
+    // audit event.
+    if (
+      method === "POST" &&
+      path === `${INTELLIGENCE_API_PREFIX}/surfaces/all/choice`
+    ) {
+      const body = await readJSONBody<{
+        substrate?: unknown;
+        local_model_pick?: unknown;
+      }>(req);
+      if (!isSubstrateChoice(body.substrate)) {
+        throw new IntelligenceRouterError(
+          400,
+          "invalid_body",
+          "substrate must be one of local / venice / frontier-with-filter / hybrid / disabled",
+        );
+      }
+      let localModelPick: LocalModelPick | null | undefined;
+      if (body.local_model_pick !== undefined) {
+        if (body.local_model_pick === null) {
+          localModelPick = null;
+        } else if (isLocalModelPick(body.local_model_pick)) {
+          localModelPick = body.local_model_pick;
+        } else {
+          throw new IntelligenceRouterError(
+            400,
+            "invalid_body",
+            "local_model_pick must be one of gemma-2-2b / phi-4-mini / llama-3.1-8b or null",
+          );
+        }
+      }
+      await deps.selector.applyChoiceToAllSurfaces(body.substrate, { localModelPick });
+      writeJSON(res, 200, { ok: true, data: sanitizeConfig(deps.selector) });
+      return true;
+    }
+
+    // ── POST /api/hub/intelligence/preferences/apply-to-all ─────────────
+    // Persist the operator's "Apply to all surfaces" toggle preference
+    // so the picker modal's default checkbox state survives a dashboard
+    // reload. Body: { value: boolean }. No audit event emitted; the
+    // next bulk-or-single choice carries the operator-visible signal.
+    if (
+      method === "POST" &&
+      path === `${INTELLIGENCE_API_PREFIX}/preferences/apply-to-all`
+    ) {
+      const body = await readJSONBody<{ value?: unknown }>(req);
+      if (typeof body.value !== "boolean") {
+        throw new IntelligenceRouterError(
+          400,
+          "invalid_body",
+          "value must be boolean",
+        );
+      }
+      await deps.selector.setApplyToAllPreference(body.value);
       writeJSON(res, 200, { ok: true, data: sanitizeConfig(deps.selector) });
       return true;
     }

@@ -177,6 +177,29 @@ export interface IntelligenceConfigResetPayload extends IntelligenceAuditPayload
   overridden_surface_count: number;
 }
 
+/**
+ * Operator picked a substrate and applied it to every surface in one
+ * action via the "Apply to all surfaces" affordance. Emitted once per
+ * bulk apply. The fan-out is captured in `surface_count` (always 6 in
+ * v1.2, equals SURFACES.length) and each per-surface prior substrate
+ * is captured in `prior_substrates` for forensic reconstruction.
+ *
+ * Per-surface `intelligence_substrate_chosen` events are NOT emitted
+ * alongside this event; the bulk event is the single source of truth.
+ * This avoids audit-log churn when an operator with six default
+ * surfaces flips them all to Venice in one click.
+ */
+export interface IntelligenceBulkSubstrateChosenPayload extends IntelligenceAuditPayloadHeader {
+  kind: "bulk_substrate_chosen";
+  substrate: SubstrateChoice;
+  /** Number of surfaces the substrate was applied to. */
+  surface_count: number;
+  /** SHA-256 base64url of the operator-readable tradeoff text. */
+  tradeoff_text_hash: string;
+  /** Per-surface substrate the operator overrode; null if the surface had no prior binding. */
+  prior_substrates: Partial<Record<Surface, SubstrateChoice | null>>;
+}
+
 /** Discriminated union of every v1.2 intelligence audit payload. */
 export type IntelligenceAuditPayload =
   | IntelligenceSubstrateChosenPayload
@@ -184,4 +207,5 @@ export type IntelligenceAuditPayload =
   | IntelligenceSubstrateFailurePayload
   | IntelligencePiiRedactionEventPayload
   | IntelligenceConfigLoadedPayload
-  | IntelligenceConfigResetPayload;
+  | IntelligenceConfigResetPayload
+  | IntelligenceBulkSubstrateChosenPayload;
