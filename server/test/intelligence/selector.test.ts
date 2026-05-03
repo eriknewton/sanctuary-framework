@@ -399,6 +399,61 @@ describe("SubstrateSelector — operator-visible status report", () => {
     expect(concierge?.failureClass).toBe("substrate_unavailable");
   });
 
+  // Finding ZZ (v1.2.0-rc.6): Ollama defaults the tag to `latest` when a
+  // model is pulled without an explicit tag. `/api/tags` returns the full
+  // `name:tag` form, so the probe must accept `phi4-mini:latest` as the
+  // operator-equivalent of `expectedTag = "phi4-mini"`. Without this, the
+  // operator-visible badge stays yellow / "Degraded" with `failureClass:
+  // substrate_misconfigured` and `recentFailures: []`, even though chat
+  // against the same model succeeds.
+  it("local probe accepts Ollama-default `:latest` suffix when expectedTag lacks one (Finding ZZ rc.6)", async () => {
+    const fetchImpl = makeFetchStub({
+      "/api/tags": { status: 200, body: { models: [{ name: "phi4-mini:latest" }] } },
+    });
+    const { selector } = buildSelector({ fetchImpl });
+    await selector.load();
+    await selector.setPerSurfaceChoice("concierge", "local");
+    await selector.setLocalModelPick("concierge", "phi-4-mini");
+
+    const report = await selector.getOperatorVisibleStatus();
+    const concierge = report.surfaces.find((s) => s.surface === "concierge");
+    expect(concierge?.health).toBe("ok");
+    expect(concierge?.failureClass).toBeNull();
+    expect(concierge?.badge.status).toBe("green");
+    expect(concierge?.recentFailures).toHaveLength(0);
+  });
+
+  it("local probe still reports misconfigured when expectedTag is genuinely missing (regression guard)", async () => {
+    const fetchImpl = makeFetchStub({
+      "/api/tags": { status: 200, body: { models: [{ name: "phi4-mini:latest" }] } },
+    });
+    const { selector } = buildSelector({ fetchImpl });
+    await selector.load();
+    // concierge default is gemma-2-2b (LOCAL_MODEL_TAGS = "gemma2:2b").
+    // Ollama only has phi4-mini:latest. Genuine misconfiguration must
+    // still surface as substrate_misconfigured even after rc.6 leniency.
+    const report = await selector.getOperatorVisibleStatus();
+    const concierge = report.surfaces.find((s) => s.surface === "concierge");
+    expect(concierge?.health).toBe("degraded");
+    expect(concierge?.failureClass).toBe("substrate_misconfigured");
+  });
+
+  it("local probe with explicit-tag expectedTag (e.g. gemma2:2b) still requires exact match (regression guard)", async () => {
+    // expectedTag = "gemma2:2b" already carries a colon, so the rc.6
+    // lenient `${expectedTag}:latest` extension MUST NOT fire. Ollama
+    // would never return `gemma2:2b:latest`; doubly-tagged forms are
+    // not legal Ollama tag strings.
+    const fetchImpl = makeFetchStub({
+      "/api/tags": { status: 200, body: { models: [{ name: "gemma2:2b:latest" }] } },
+    });
+    const { selector } = buildSelector({ fetchImpl });
+    await selector.load();
+    const report = await selector.getOperatorVisibleStatus();
+    const concierge = report.surfaces.find((s) => s.surface === "concierge");
+    expect(concierge?.health).toBe("degraded");
+    expect(concierge?.failureClass).toBe("substrate_misconfigured");
+  });
+
   it("disabled gate-explanation reports unavailable + substrate_disabled", async () => {
     const fetchImpl = makeFetchStub({
       "/api/tags": { status: 200, body: { models: [] } },

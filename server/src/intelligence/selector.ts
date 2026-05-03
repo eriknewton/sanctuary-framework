@@ -878,7 +878,7 @@ export class SubstrateSelector {
         const pick = this.config.localModelPicks[surface] ?? DEFAULT_LOCAL_MODEL_PICKS[surface];
         const customTag = this.config.customLocalModelTags?.[surface];
         const expectedTag = customTag ?? (pick ? LOCAL_MODEL_TAGS[pick] : null);
-        if (expectedTag && !hardware.ollamaModels.includes(expectedTag)) {
+        if (expectedTag && !ollamaHasModel(hardware.ollamaModels, expectedTag)) {
           health = "degraded";
           failureClass = "substrate_misconfigured";
         }
@@ -1067,6 +1067,25 @@ function healthToBadgeStatus(health: "ok" | "degraded" | "unavailable"): Substra
   if (health === "ok") return "green";
   if (health === "degraded") return "yellow";
   return "red";
+}
+
+/**
+ * Finding ZZ (v1.2.0-rc.6): Ollama returns model names with their full
+ * `name:tag` form via `/api/tags`. A model pulled with `ollama pull phi4-mini`
+ * (no explicit tag) is stored under the default `latest` tag and listed as
+ * `phi4-mini:latest`. The probe's `expectedTag` from `LOCAL_MODEL_TAGS` may
+ * lack the explicit `:latest` suffix (e.g. `"phi4-mini"`), so a strict
+ * `includes(expectedTag)` check produced `substrate_misconfigured` even when
+ * the model was actually present and inference would succeed.
+ *
+ * Match policy: exact match wins; when `expectedTag` lacks a colon, also
+ * accept the `${expectedTag}:latest` form. Operator-supplied custom tags
+ * (which always carry an explicit tag) keep exact-match semantics.
+ */
+function ollamaHasModel(models: readonly string[], expectedTag: string): boolean {
+  if (models.includes(expectedTag)) return true;
+  if (!expectedTag.includes(":")) return models.includes(`${expectedTag}:latest`);
+  return false;
 }
 
 export type { LoadOutcome };
