@@ -4,6 +4,56 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.2.0 - Substrate-only Release (2026-05-03)
+
+First minor release after v1.1.x. Castle Architecture is now canonical. The dashboard ships a concierge surface so an operator can talk directly to Sanctuary itself, routed through a per-surface substrate selector. Direct-agent chat has been removed; operators talk to wrapped agents in the agent's native harness. A Tauri-based menubar companion lands as the foundation for Sprint Piece 1, and a Playwright headless-browser harness now exercises the SPA end-to-end.
+
+### Architecture
+
+- **Castle Architecture is canonical.** Four enforcement layers documented in RFC-0003: Castle Wall (OS-level egress filtering, planned), Sentinels (observation, planned), The Charter (Cooperative MCP, this release), The Heralds (cryptographic receipts and reputation). README v3 and ROADMAP v3 reflect the new framing.
+
+### Added
+
+- **Concierge chat surface.** Operators can now talk directly to Sanctuary itself (not to wrapped agents), routed through the substrate selector. Replaces the half-built advisory text input from v1.1.7's main panel.
+- **Substrate selector.** Per-surface choice across six routing categories (concierge, gate advisor, sentinel scoring, gate explanation, privacy filter, template suggestion). Substrates: local Ollama, Venice, frontier-with-filter, hybrid.
+- **Intelligence sidebar.** New dashboard panel for substrate selection, key paste, and bulk apply-to-all-surfaces.
+- **Dashboard topbar version pill.** Static `v1.2.0` pill in the dashboard topbar so operators can verify the running binary at a glance (Finding CCC).
+- **Tauri menubar companion.** Sprint Piece 1 foundation: tray icon, popover, OS notifications on Tier 1 events. macOS first; Linux + Windows in subsequent sprints.
+- **Playwright headless-browser e2e harness.** SPA-level operator-path verification. Closes the v1.1.7 known follow-up for browser-side rendering coverage.
+
+### Changed
+
+- **Dashboard defaults to the operator concierge view.** Replaces the v1.1 landing card.
+- **Chat history auto-scrolls to the latest message** while preserving operator scroll-up position (Finding DDD).
+- **Status truth-telling.** Per-surface badges reflect recent runtime failures, not just key-validation health.
+- **Bulk apply-to-all-surfaces affordance** on the Intelligence panel; per-surface configuration is no longer required for the common case.
+
+### Removed
+
+- **Direct-agent chat surface.** Operators talk to wrapped agents in the agent's native harness, not in the Sanctuary dashboard. Click-on-agent in the dashboard now opens an inspect pane (pending approvals, recent activity, policy, identity, timeline).
+- **Autonomous wake mechanism (F10) and wrapped-agent reply hook (F9).** No longer scoped; both were tied to the direct-agent chat surface that has been removed.
+
+### Fixed
+
+- **Venice substrate default model bumped from the deprecated `llama-3.1-70b` to `llama-3.3-70b`** (Finding TT).
+- **Venice key validation now checks model existence in addition to auth** (Finding TT).
+- **Per-surface recent-failures ring buffer clears on substrate change, bulk apply, and key re-save** (Finding ZZ).
+- **`VENICE_DEFAULT_MODEL` environment override path now produces a visible runtime failure as documented** (Finding YY).
+- **Concierge chat input no longer loses text selection on poll-driven re-renders** (Finding UU).
+
+### Security
+
+- **No-outbound-by-default architecture rule.** Sanctuary initiates no network connection except to operator-configured substrate endpoints. Outbound channels are explicit operator opt-in with operator-chosen endpoints.
+- **Substrate-selector composition rule.** Every Sanctuary-side LLM call routes through the substrate selector. Single source of truth; no hardcoded LLM clients.
+
+### Deprecated
+
+- **`--dev-dist` flag is no longer required for v1.2+.** Operators install via standard `npx @sanctuary-framework/mcp-server@latest`. Sunset target: v1.3.
+
+### Migration
+
+Operators upgrading from v1.1.7 should expect: dashboard layout has changed (Concierge view replaces the prior landing card; Intelligence sidebar is new); direct-agent chat is gone (use the agent's harness); per-agent click in the dashboard opens an inspect pane instead of a chat surface.
+
 ## v1.1.7 - Dashboard UX Hotfix (2026-04-27)
 
 Hotfix release. Closes three dashboard UX findings (CC, DD, EE) surfaced during the v1.1.6 acceptance drill. Pure SPA + CSS + routing; no server-side logic, no policy-engine touches, no hub-API changes. Strict superset of v1.1.6; operators on v1.1.6 should upgrade.
