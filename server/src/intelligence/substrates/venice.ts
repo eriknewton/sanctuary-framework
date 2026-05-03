@@ -39,7 +39,26 @@ export const VENICE_CAPABILITY: SubstrateCapability = {
 };
 
 export const VENICE_DEFAULT_ENDPOINT = "https://api.venice.ai/api/v1";
-export const VENICE_DEFAULT_MODEL = "llama-3.3-70b";
+
+/**
+ * Default Venice model identifier. Reads `VENICE_DEFAULT_MODEL` from the
+ * environment at module load so operators can override the shipped default
+ * without a source patch (Finding YY, v1.2.0-rc.2). The acceptance-drill
+ * "force runtime failure" path documents `VENICE_DEFAULT_MODEL=this-model-does-not-exist`
+ * as the deliberate trigger; without this read, that path silently no-ops.
+ *
+ * Empty-string env value falls back to the shipped default rather than
+ * propagating an obviously broken model identifier.
+ */
+function resolveVeniceDefaultModel(): string {
+  const fromEnv = process.env.VENICE_DEFAULT_MODEL;
+  if (typeof fromEnv === "string" && fromEnv.length > 0) {
+    return fromEnv;
+  }
+  return "llama-3.3-70b";
+}
+
+export const VENICE_DEFAULT_MODEL = resolveVeniceDefaultModel();
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
