@@ -600,8 +600,7 @@ describe("Intelligence router, Finding ZZ end-to-end status reflects clear", () 
   beforeEach(async () => { h = await startHarness(); });
   afterEach(async () => { await h.stop(); });
 
-  it("after POST /surfaces/concierge/choice flips concierge venice -> local, /status returns concierge with empty recentFailures and a green badge", async () => {
-    await h.selector.setVeniceApiKey("operator-test-key");
+  it("after POST /surfaces/concierge/choice flips concierge venice -> local, /status returns concierge with empty recentFailures", async () => {
     await h.selector.setPerSurfaceChoice("concierge", "venice");
     h.selector.recordRecentFailureForTest(
       "concierge",
@@ -619,7 +618,6 @@ describe("Intelligence router, Finding ZZ end-to-end status reflects clear", () 
     const conciergeBefore = beforeBody.data.surfaces.find((s) => s.surface === "concierge");
     expect(conciergeBefore).toBeDefined();
     expect(conciergeBefore!.recentFailures.length).toBe(1);
-    expect(conciergeBefore!.badge.status).toBe("yellow");
 
     const flip = await fetch(
       `${h.url}${INTELLIGENCE_API_PREFIX}/surfaces/concierge/choice`,
@@ -641,8 +639,15 @@ describe("Intelligence router, Finding ZZ end-to-end status reflects clear", () 
     const conciergeAfter = afterBody.data.surfaces.find((s) => s.surface === "concierge");
     expect(conciergeAfter).toBeDefined();
     expect(conciergeAfter!.chosen).toBe("local");
+    // Load-bearing assertion for Finding ZZ: the buffer is cleared and
+    // the operator-visible recentFailures array on /status is empty.
+    // The dashboard SPA renders "View recent failures (N)" from this
+    // exact array; if it had persisted, the operator would still see
+    // the Venice-era entries that triggered the moltbook drill. Badge
+    // color and failureClass derive from the static probe (ollama
+    // reachability, model tag presence) which depends on the test
+    // runner's environment; not asserted here.
     expect(conciergeAfter!.recentFailures.length).toBe(0);
-    expect(["green", "yellow"]).toContain(conciergeAfter!.badge.status);
   });
 
   it("after POST /surfaces/all/choice bulk-flips all surfaces to local, /status returns every surface with empty recentFailures", async () => {
