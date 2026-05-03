@@ -98,8 +98,14 @@ async function startHarness(): Promise<DashboardHarness> {
     selector,
     auditLog,
     bindings,
+    // Force-close active connections before close. The SPA opens an
+    // EventSource on /api/stream that Chromium keeps open across page
+    // navigations; server.close alone waits indefinitely on that
+    // socket and surfaces as a fixture-teardown timeout. Node 18.2
+    // added closeAllConnections specifically for this teardown shape.
     stop: () =>
       new Promise<void>((resolve, reject) => {
+        server.closeAllConnections();
         server.close((err) => (err ? reject(err) : resolve()));
       }),
   };

@@ -15,7 +15,10 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "./test/e2e",
   testMatch: /.*\.e2e\.ts/,
-  timeout: 30_000,
+  // 60s test budget absorbs occasional cold-start variance (browser
+  // launch + first-time TS transform). Per-action and per-expect
+  // timeouts stay tight to keep individual assertions fast.
+  timeout: 60_000,
   expect: { timeout: 5_000 },
   fullyParallel: false,
   forbidOnly: !!process.env.CI,

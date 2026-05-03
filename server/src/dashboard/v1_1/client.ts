@@ -107,15 +107,15 @@ const state = {
       sending: false,
       error: null,
       badge: null,
-      // Finding DDD (v1.2.0-rc.3): when the operator sends a message,
-      // unconditionally scroll the chat history to bottom on the next
-      // render so the operator sees their submitted message and the
-      // concierge reply land in view. For passive renders (poll-driven
-      // history refresh, badge refresh, unrelated state changes) the
-      // scroll is conditional on the operator already being at or near
-      // the bottom (within AUTO_SCROLL_TOLERANCE_PX). If the operator
-      // has scrolled up to read history, do not auto-scroll on background
-      // ticks; that would be hostile.
+      // Finding DDD (v1.2.0-rc.4): when the operator sends a message,
+      // unconditionally bring the latest reply into the viewport on the
+      // next render so the operator sees their submitted message and
+      // the concierge reply land in view. For passive renders (poll-
+      // driven history refresh, badge refresh, unrelated state changes)
+      // the scroll is conditional on the operator already following the
+      // conversation (the latest message was visible before the render).
+      // If the operator scrolled up to read history, do not auto-scroll
+      // on background ticks; that would be hostile.
       pendingScroll: false
     },
     inspect: {
@@ -402,14 +402,6 @@ function renderTopbar() {
 // generated reply via the standard macOS selection mechanism.
 const __renderCache = { route: null, html: null };
 
-// Finding DDD (v1.2.0-rc.3): if the operator's scroll position in the
-// concierge history is within this many pixels of the bottom at the
-// moment a render fires, treat them as following the conversation and
-// scroll them back to bottom after the DOM is replaced. Above this
-// threshold we assume they have scrolled up to read history and leave
-// their position alone.
-const AUTO_SCROLL_TOLERANCE_PX = 50;
-
 // ── Render: main area ──────────────────────────────────────────────────
 function renderMain() {
   const main = document.getElementById("main");
@@ -434,16 +426,35 @@ function renderMain() {
       selectionEnd: active.selectionEnd
     };
   }
-  // Capture concierge-history scroll-at-bottom intent BEFORE the DOM is
-  // replaced. innerHTML replacement creates a fresh container with
-  // scrollTop=0 by default, which would make every render look like the
-  // operator scrolled all the way up. Snapshot now, restore after.
-  let conciergeWasAtBottom = false;
+  // Finding DDD (v1.2.0-rc.4): capture whether the operator is
+  // following the conversation BEFORE the DOM is replaced. The rc.3
+  // fix scrolled concierge-history.scrollTop to scrollHeight, but the
+  // layout has flex 1 1 auto on .concierge-history with no max-height,
+  // so the element grows to fit content and never scrolls internally
+  // (scrollHeight === clientHeight); the page itself is the actual
+  // scroll container. The rc.3 scroll assignment is a no-op and the
+  // latest message lands below the page fold. The rc.4 detection uses
+  // the latest message's bounding rect against the viewport, which is
+  // layout-agnostic; the rc.4 restore uses scrollIntoView, which
+  // scrolls whichever ancestor is the actual scroll container.
+  let conciergeWasFollowing = false;
   if (state.route === "dashboard") {
     const histEl = document.getElementById("concierge-history");
     if (histEl) {
-      const distance = histEl.scrollHeight - histEl.scrollTop - histEl.clientHeight;
-      conciergeWasAtBottom = distance <= AUTO_SCROLL_TOLERANCE_PX;
+      const lastMsg = histEl.querySelector(".concierge-msg:last-child");
+      if (lastMsg) {
+        const rect = lastMsg.getBoundingClientRect();
+        // Following = the latest message is at least partially visible
+        // in the viewport. If the operator scrolled up past the latest
+        // message (rect.bottom <= 0) or somehow the latest is far below
+        // viewport bottom (rect.top >= window.innerHeight), they are
+        // not following.
+        conciergeWasFollowing = rect.top < window.innerHeight && rect.bottom > 0;
+      } else {
+        // Empty thread. Treat as following so a fresh exchange lands
+        // in view.
+        conciergeWasFollowing = true;
+      }
     }
   }
   let nextHtml;
@@ -472,16 +483,23 @@ function renderMain() {
     __renderCache.html = nextHtml;
     didWrite = true;
   }
-  // Finding DDD (v1.2.0-rc.3): scroll the concierge history to bottom
-  // when (a) the operator just sent a message (pendingScroll flag), or
-  // (b) the operator was already at or near the bottom before this
-  // render. If the operator scrolled up, leave their position alone.
+  // Finding DDD (v1.2.0-rc.4): bring the latest concierge message into
+  // the viewport when (a) the operator just sent a message
+  // (pendingScroll flag set in onConciergeSend), or (b) the operator
+  // was following the conversation before this render. If the operator
+  // scrolled up to read history, leave their position alone.
+  // scrollIntoView is layout-agnostic; it scrolls whichever ancestor is
+  // the actual scroll container (window in the current layout, or the
+  // history element if a future layout puts a fixed height on it).
   if (state.route === "dashboard" && didWrite) {
     const histEl = document.getElementById("concierge-history");
     if (histEl) {
       const pending = state.chat.concierge.pendingScroll;
-      if (pending || conciergeWasAtBottom) {
-        histEl.scrollTop = histEl.scrollHeight;
+      if (pending || conciergeWasFollowing) {
+        const lastMsg = histEl.querySelector(".concierge-msg:last-child");
+        if (lastMsg && typeof lastMsg.scrollIntoView === "function") {
+          lastMsg.scrollIntoView({ block: "end", behavior: "auto" });
+        }
       }
       state.chat.concierge.pendingScroll = false;
     }
