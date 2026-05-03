@@ -62,6 +62,7 @@ import {
   type FrontierProvider,
   type HardwareCapabilityReport,
   type LocalModelPick,
+  type RecentFailureEntry,
   type RedactRequest,
   type SubstrateBadge,
   type SubstrateCapability,
@@ -76,13 +77,14 @@ import {
   type SurfaceStatus,
 } from "./types.js";
 import { LocalSubstrate, OllamaClient, LOCAL_CAPABILITY } from "./substrates/local.js";
-import { VeniceClient, VeniceSubstrate, VENICE_CAPABILITY, VENICE_DEFAULT_ENDPOINT, VENICE_DEFAULT_MODEL } from "./substrates/venice.js";
+import { VeniceClient, VeniceSubstrate, VENICE_CAPABILITY, VENICE_DEFAULT_ENDPOINT, VENICE_DEFAULT_MODEL, type VeniceValidateResult } from "./substrates/venice.js";
 import { FrontierClient, FrontierWithFilterSubstrate, FRONTIER_CAPABILITY, FRONTIER_DEFAULT_MODELS, type FrontierRedactor } from "./substrates/frontier.js";
 import { resolveHybridChoice, validateHybridRules } from "./substrates/hybrid/per-surface-router.js";
 import type { HybridRoutingRules } from "./types.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type {
   IntelligenceAuditPayload,
+  IntelligenceBulkSubstrateChosenPayload,
   IntelligenceConfigLoadedPayload,
   IntelligenceConfigResetPayload,
   IntelligencePiiRedactionEventPayload,
@@ -96,6 +98,27 @@ const DISABLED_CAPABILITY: SubstrateCapability = {
   classify: false,
   redact: false,
 };
+
+/**
+ * Cap on the per-surface recent-failures ring buffer. Exposed via
+ * `/api/hub/intelligence/status` so the operator can triage the most
+ * recent failures inline without paging through the L2 audit log.
+ */
+const RECENT_FAILURES_CAP = 5;
+
+/**
+ * Recent-failures retention window. Entries older than this are pruned
+ * on every read of `getOperatorVisibleStatus()` so the operator-visible
+ * status never reflects stale failures from yesterday's debugging.
+ */
+const RECENT_FAILURES_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Truncate operator-visible failure snippets so an over-long upstream
+ * error message cannot bloat the status payload or smuggle accidental PII
+ * into the transparency UI. The L2 audit log retains the full context.
+ */
+const FAILURE_SNIPPET_MAX_LEN = 200;
 
 /**
  * Identity redactor used as the default for the frontier-with-filter
@@ -146,6 +169,14 @@ export class SubstrateSelector {
   private fetchImpl: typeof fetch | undefined;
   private config: SubstrateConfig;
   private loaded = false;
+  /**
+   * Per-surface ring buffer of recent runtime + validation failures. See
+   * `RECENT_FAILURES_CAP` and `RECENT_FAILURES_WINDOW_MS`. Populated by
+   * `recordRecentFailure()` from the `invoke()` failure path and from the
+   * post-config validation hook on substrates that expose validateKey.
+   * Drives the operator-visible degrade in `getOperatorVisibleStatus()`.
+   */
+  private recentFailures = new Map<Surface, RecentFailureEntry[]>();
 
   constructor(cfg: SelectorConfig) {
     this.store = new IntelligenceConfigStore(cfg.storage, cfg.masterKey);
@@ -213,6 +244,76 @@ export class SubstrateSelector {
   }
 
   /**
+   * Apply a substrate choice to every surface in one save. Used by the
+   * picker modal's "Apply to all surfaces" affordance (Finding SS,
+   * v1.2.0-rc.1). Persists the per-surface map mutation in a single
+   * write and emits ONE `intelligence_bulk_substrate_chosen` audit
+   * event rather than six per-surface events.
+   *
+   * If `localModelPick` is provided AND substrate === "local", the same
+   * pick is applied to every surface; ignored for other substrates.
+   *
+   * Per-surface bindings the operator had previously customized are
+   * captured in the audit payload's `prior_substrates` map so the
+   * forensic record makes the configuration discontinuity visible.
+   */
+  async applyChoiceToAllSurfaces(
+    substrate: SubstrateChoice,
+    opts: { localModelPick?: LocalModelPick | null } = {},
+  ): Promise<void> {
+    await this.ensureLoaded();
+
+    const priorSubstrates: Partial<Record<Surface, SubstrateChoice | null>> = {};
+    for (const surface of SURFACES) {
+      priorSubstrates[surface] = this.config.perSurface[surface] ?? null;
+    }
+
+    const nextPerSurface: Record<Surface, SubstrateChoice> = { ...this.config.perSurface };
+    const nextLocalPicks = { ...this.config.localModelPicks };
+    for (const surface of SURFACES) {
+      nextPerSurface[surface] = substrate;
+      if (substrate === "local" && opts.localModelPick !== undefined) {
+        if (opts.localModelPick === null) delete nextLocalPicks[surface];
+        else nextLocalPicks[surface] = opts.localModelPick;
+      }
+    }
+
+    this.config = {
+      ...this.config,
+      perSurface: nextPerSurface,
+      localModelPicks: nextLocalPicks,
+      applyToAllSurfaces: true,
+    };
+    await this.store.save(this.config);
+
+    const payload: IntelligenceBulkSubstrateChosenPayload = {
+      version: "1.2",
+      event_id: makeEventId(),
+      emitted_at: new Date().toISOString(),
+      identity_id: this.identityId,
+      kind: "bulk_substrate_chosen",
+      substrate,
+      surface_count: SURFACES.length,
+      tradeoff_text_hash: tradeoffTextHash(substrate),
+      prior_substrates: priorSubstrates,
+    };
+    this.emit(INTEL_OPS.BULK_SUBSTRATE_CHOSEN, payload, "success");
+  }
+
+  /**
+   * Persist the operator's "Apply to all surfaces" preference. The
+   * picker modal calls this when the operator flips the toggle so the
+   * preference survives a dashboard reload. Does not emit a discrete
+   * audit event; the next bulk or per-surface choice carries the
+   * operator-visible signal.
+   */
+  async setApplyToAllPreference(value: boolean): Promise<void> {
+    await this.ensureLoaded();
+    this.config = { ...this.config, applyToAllSurfaces: value };
+    await this.store.save(this.config);
+  }
+
+  /**
    * Operator picked a local model for a surface bound to the local
    * substrate. Mirrors `setPerSurfaceChoice` for the model-picker case.
    * Does not emit a separate audit event class; the next
@@ -234,6 +335,15 @@ export class SubstrateSelector {
    * SubstrateConfig record. Does not emit a substrate_chosen event by
    * itself; the dashboard flow always pairs key entry with a substrate
    * choice and the choice carries the audit semantics.
+   *
+   * Post-set validation (Finding VV, v1.2.0-rc.1): if a non-null key is
+   * provided, the selector probes Venice with `validateKey()` and records
+   * a failure entry on every Venice-bound surface when the result is not
+   * `"ok"`. This lets the operator-visible status degrade from validation
+   * outcomes alone, not just from runtime chat-call failures, so a broken
+   * key or drifted model is visible before the operator's first chat
+   * attempt. Probe failures (timeout, transport) are not recorded; the
+   * runtime path will surface those when the operator actually invokes.
    */
   async setVeniceApiKey(apiKey: string | null): Promise<void> {
     await this.ensureLoaded();
@@ -242,6 +352,45 @@ export class SubstrateSelector {
     else next.veniceApiKey = apiKey;
     this.config = next;
     await this.store.save(this.config);
+
+    if (apiKey !== null) {
+      await this.validateVeniceAndRecord(apiKey);
+    }
+  }
+
+  /**
+   * Probe Venice with the given API key and record a failure entry on
+   * every surface bound to Venice when the probe returns anything other
+   * than `"ok"`. Failures map to stable substrate failure-class enum
+   * values: `invalid-key` -> `substrate_auth_failed`, `invalid-model` ->
+   * `substrate_misconfigured`, `unreachable` -> swallow (runtime path
+   * will surface).
+   */
+  private async validateVeniceAndRecord(apiKey: string): Promise<void> {
+    const client = new VeniceClient({
+      apiKey,
+      endpoint: VENICE_DEFAULT_ENDPOINT,
+      model: this.config.veniceModel ?? VENICE_DEFAULT_MODEL,
+      fetchImpl: this.fetchImpl,
+    });
+    let result: VeniceValidateResult;
+    try {
+      result = await client.validateKey();
+    } catch {
+      return;
+    }
+    if (result === "ok" || result === "unreachable") return;
+    const failureClass: SubstrateFailureClass =
+      result === "invalid-key" ? "substrate_auth_failed" : "substrate_misconfigured";
+    const snippet =
+      result === "invalid-key"
+        ? "venice key rejected on validation probe"
+        : `venice configured model "${this.config.veniceModel ?? VENICE_DEFAULT_MODEL}" not found on validation probe`;
+    for (const surface of SURFACES) {
+      if (this.config.perSurface[surface] === "venice") {
+        this.recordRecentFailure(surface, failureClass, snippet);
+      }
+    }
   }
 
   /**
@@ -472,6 +621,7 @@ export class SubstrateSelector {
         fallback_taken: this.fallbackAction(surface),
       };
       this.emit(INTEL_OPS.SUBSTRATE_FAILURE, failurePayload, "failure");
+      this.recordRecentFailure(surface, "substrate_capability_unsupported", `${choice} does not support ${method}`);
       return disabledResponse(method, choice, "substrate_capability_unsupported");
     }
 
@@ -505,9 +655,61 @@ export class SubstrateSelector {
         fallback_taken: this.fallbackAction(surface),
       };
       this.emit(INTEL_OPS.SUBSTRATE_FAILURE, failurePayload, "failure");
+      const snippet = response.body.kind === "failure" ? response.body.message : `${choice} ${method} failed`;
+      this.recordRecentFailure(surface, response.failureClass, snippet);
     }
 
     return response;
+  }
+
+  /**
+   * Append a failure entry to the per-surface ring buffer. The selector
+   * uses this in the `invoke()` failure path and in the post-config
+   * `setVeniceApiKey` validation hook so the operator-visible badge
+   * degrades from runtime AND from validation outcomes.
+   *
+   * Operator-safe by construction: snippets are bounded by
+   * `FAILURE_SNIPPET_MAX_LEN` and pulled from substrate `failure.message`
+   * fields (which substrates produce for operator-readable output and
+   * never include API keys or PII). The cap + window prune happen on
+   * every read in `recentFailuresFor()` so the ring buffer never grows.
+   */
+  private recordRecentFailure(
+    surface: Surface,
+    failureClass: SubstrateFailureClass,
+    snippet: string,
+  ): void {
+    const list = this.recentFailures.get(surface) ?? [];
+    const entry: RecentFailureEntry = {
+      ts: new Date().toISOString(),
+      failureClass,
+      snippet: snippet.slice(0, FAILURE_SNIPPET_MAX_LEN),
+    };
+    list.push(entry);
+    while (list.length > RECENT_FAILURES_CAP) list.shift();
+    this.recentFailures.set(surface, list);
+  }
+
+  /**
+   * Read recent failures for a surface, pruning entries older than the
+   * 24-hour window. Pruning happens lazily on read so a long-quiet surface
+   * does not retain stale entries from yesterday's debugging.
+   */
+  private recentFailuresFor(surface: Surface): RecentFailureEntry[] {
+    const list = this.recentFailures.get(surface);
+    if (!list || list.length === 0) return [];
+    const cutoff = Date.now() - RECENT_FAILURES_WINDOW_MS;
+    const live = list.filter((e) => Date.parse(e.ts) >= cutoff);
+    if (live.length !== list.length) this.recentFailures.set(surface, live);
+    return live.slice();
+  }
+
+  /**
+   * Test-only seam: lets selector tests assert on recorded failures
+   * without poking the private ring buffer. Returns a defensive copy.
+   */
+  getRecentFailuresForTest(surface: Surface): RecentFailureEntry[] {
+    return this.recentFailuresFor(surface);
   }
 
   /**
@@ -658,12 +860,29 @@ export class SubstrateSelector {
       }
     }
 
+    // Finding VV (v1.2.0-rc.1): truth-telling pass. If recent runtime or
+    // validation failures exist within the 24h window, degrade the badge
+    // to yellow even when the static probe says ok. The most-recent
+    // failure also provides a representative failureClass for surfaces
+    // whose static probe found nothing wrong but whose runtime path keeps
+    // failing (the operator-visible problem this finding closes).
+    const recentFailures = this.recentFailuresFor(surface);
+    if (recentFailures.length > 0) {
+      if (health === "ok") {
+        health = "degraded";
+        failureClass = recentFailures[recentFailures.length - 1]!.failureClass;
+      } else if (failureClass === null) {
+        failureClass = recentFailures[recentFailures.length - 1]!.failureClass;
+      }
+    }
+
     return {
       surface,
       chosen: choice,
       badge: this.makeBadge(surface, choice, healthToBadgeStatus(health)),
       health,
       failureClass,
+      recentFailures,
     };
   }
 

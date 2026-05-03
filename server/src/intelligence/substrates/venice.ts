@@ -14,8 +14,14 @@
  * directive). The API key itself stores encrypted under the fortress master
  * key in the substrate config; key rotation is operator-initiated.
  *
- * Default model: Llama 3.1 70B. Operator can select 405B for higher capability
+ * Default model: Llama 3.3 70B. Operator can select 405B for higher capability
  * at higher cost; selector exposes the model pick in the picker modal.
+ *
+ * Drift-resistance (v1.2.0-rc.1, Finding TT): Venice rotates model identifiers
+ * without backwards-compat aliases. The substrate ships the current default,
+ * `validateKey()` distinguishes auth-failure from model-not-found, and the
+ * status badge surfaces invalid-model so operators see the actual cause when
+ * the default eventually drifts again.
  */
 
 import type {
@@ -33,9 +39,30 @@ export const VENICE_CAPABILITY: SubstrateCapability = {
 };
 
 export const VENICE_DEFAULT_ENDPOINT = "https://api.venice.ai/api/v1";
-export const VENICE_DEFAULT_MODEL = "llama-3.1-70b";
+export const VENICE_DEFAULT_MODEL = "llama-3.3-70b";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * Result of `VeniceClient.validateKey`. Distinguishes the four meaningful
+ * outcomes operators care about so the Intelligence panel badge can show
+ * the actual cause instead of "auth failure" for any non-200.
+ *
+ *   ok            : auth + model both valid; substrate is callable
+ *   invalid-key   : 401 / 403; operator's API key is wrong or revoked
+ *   invalid-model : 404 + body matches model-not-found shape; operator's
+ *                   key is fine but the configured model identifier has
+ *                   drifted (Venice deprecates model IDs without alias).
+ *                   The body usually names the replacement.
+ *   unreachable   : transport error / non-200/401/403/404; treat as
+ *                   substrate currently unavailable; operator may be
+ *                   offline or Venice may be down.
+ */
+export type VeniceValidateResult =
+  | "ok"
+  | "invalid-key"
+  | "invalid-model"
+  | "unreachable";
 
 export interface VeniceClientConfig {
   apiKey: string;
@@ -61,11 +88,14 @@ export class VeniceClient {
   }
 
   /**
-   * Validate the API key by issuing a tiny chat completion. Returns true on
-   * 200; false on 401/403; rethrows on transport errors.
+   * Validate the API key by issuing a tiny chat completion. Returns one of
+   * the four `VeniceValidateResult` outcomes so the Intelligence panel
+   * badge can distinguish auth-failure from model-drift (Finding TT,
+   * v1.2.0-rc.1). Green badge requires `"ok"` (both auth AND model valid);
+   * any other value flips the surface to a non-green state with a real
+   * failure reason.
    */
-  async validateKey(): Promise<boolean> {
-    const startedAt = Date.now();
+  async validateKey(): Promise<VeniceValidateResult> {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 5_000);
     try {
@@ -79,10 +109,12 @@ export class VeniceClient {
         }),
         signal: ctl.signal,
       });
-      void startedAt;
-      return res.status === 200;
+      if (res.status === 200) return "ok";
+      if (res.status === 401 || res.status === 403) return "invalid-key";
+      if (res.status === 404 && (await isModelNotFound(res))) return "invalid-model";
+      return "unreachable";
     } catch {
-      return false;
+      return "unreachable";
     } finally {
       clearTimeout(timer);
     }
@@ -109,6 +141,19 @@ export class VeniceClient {
         }
         if (res.status === 429) {
           return failure(startedAt, "substrate_rate_limited", "venice rate limit");
+        }
+        if (res.status === 404 && (await isModelNotFound(res.clone()))) {
+          // Venice returns 404 with "Specified model not found: <id>. Did
+          // you mean: <suggestion>" when the substrate's configured model
+          // identifier has drifted. Surface as misconfigured so the
+          // operator badge degrades to a real cause rather than a generic
+          // unavailable. The body reads suggestions but we do not silently
+          // switch models; operator picks the new model in the picker.
+          return failure(
+            startedAt,
+            "substrate_misconfigured",
+            `venice configured model "${this.model}" not found`,
+          );
         }
         if (!res.ok) {
           return failure(startedAt, "substrate_unavailable", `venice HTTP ${res.status}`);
@@ -233,6 +278,28 @@ function failure(
     completedAt: new Date().toISOString(),
     latencyMs: Date.now() - startedAt,
   };
+}
+
+/**
+ * Best-effort detection of Venice's "model not found" 404 shape. Venice's
+ * actual response body looks like:
+ *
+ *   {"error":"Specified model not found: llama-3.1-70b. Did you mean: llama-3.3-70b, ..."}
+ *
+ * Some response bodies use `message` instead of `error`, and the leading
+ * substring may shift across API versions. Match defensively on the
+ * canonical "model not found" phrase, case-insensitive, and tolerate body
+ * read failures (treat as unreachable, not as model-not-found, so the
+ * operator does not get a misleading "your model is wrong" badge when the
+ * real cause was a transport issue).
+ */
+async function isModelNotFound(res: Response): Promise<boolean> {
+  try {
+    const body = await res.text();
+    return /model not found/i.test(body);
+  } catch {
+    return false;
+  }
 }
 
 function tryParseClassification(

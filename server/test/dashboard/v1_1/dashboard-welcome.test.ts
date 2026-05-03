@@ -23,8 +23,24 @@ import { getClientScript } from "../../../src/dashboard/v1_1/index.js";
 describe("v1.2 dashboard concierge surface (WP-V1.2-4)", () => {
   it("dashboard route invokes renderDashboardConcierge (replaces v1.1.7 welcome card)", () => {
     const script = getClientScript();
-    expect(script).toContain('case "dashboard": main.innerHTML = renderDashboardConcierge();');
+    // v1.2.0-rc.1 Finding UU: route dispatch was refactored to write
+    // through a render-cache so unchanged HTML does not blow away the
+    // chat-history DOM (and any active text selection). The dispatch is
+    // now `nextHtml = renderDashboardConcierge();` followed by a cache
+    // compare; assert both pieces.
+    expect(script).toContain('case "dashboard": nextHtml = renderDashboardConcierge();');
     expect(script).toContain("function renderDashboardConcierge()");
+  });
+
+  it("v1.2.0-rc.1 Finding UU: renderMain caches HTML and skips innerHTML write on no-op poll", () => {
+    const script = getClientScript();
+    // Cache structure declared at module scope.
+    expect(script).toContain("__renderCache");
+    // Cache compare branch present (skip write when route + html match).
+    expect(script).toContain("__renderCache.route === state.route && __renderCache.html === nextHtml");
+    // Cache update + write branch present.
+    expect(script).toContain("__renderCache.route = state.route");
+    expect(script).toContain("__renderCache.html = nextHtml");
   });
 
   it("concierge surface presents the 'Sanctuary Fortress concierge' persona inline", () => {

@@ -61,6 +61,13 @@ export const DEFAULT_FALLBACK: Record<Surface, FallbackBehavior> = {
 
 export const DEFAULT_OLLAMA_ENDPOINT = "http://localhost:11434";
 
+/**
+ * Default value for the picker's "Apply to all surfaces" toggle. ON by
+ * default per Finding SS: the operator-friendly path is bulk apply;
+ * per-surface granularity is opt-in.
+ */
+export const DEFAULT_APPLY_TO_ALL_SURFACES = true;
+
 export function buildDefaultConfig(): SubstrateConfig {
   return {
     version: 1,
@@ -69,6 +76,7 @@ export function buildDefaultConfig(): SubstrateConfig {
     ollamaEndpoint: DEFAULT_OLLAMA_ENDPOINT,
     frontierConfig: {},
     fallback: { ...DEFAULT_FALLBACK },
+    applyToAllSurfaces: DEFAULT_APPLY_TO_ALL_SURFACES,
     updatedAt: new Date().toISOString(),
   };
 }

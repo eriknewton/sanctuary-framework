@@ -72,6 +72,10 @@ const state = {
     config: null,
     notConfigured: false,
     loadError: null,
+    // Per-surface expanded-recent-failures toggle. Click "Recent failures (N)"
+    // on a surface row to expand its inline list of recent failure entries.
+    // Map<surfaceId, true>; absence means collapsed.
+    expandedFailures: {},
     picker: {
       open: false,
       surface: null,
@@ -81,7 +85,12 @@ const state = {
       frontierProvider: "anthropic",
       frontierApiKey: "",
       saving: false,
-      error: null
+      error: null,
+      // "Apply to all surfaces" toggle (Finding SS, v1.2.0-rc.1).
+      // Hydrated from config.apply_to_all_surfaces on picker open;
+      // persists back via /api/hub/intelligence/preferences/apply-to-all
+      // so the operator's pick survives a dashboard reload.
+      applyToAll: true
     }
   },
   // WP-V1.2-4: operator chat surfaces. Concierge is fortress-wide; direct-
@@ -362,6 +371,16 @@ function renderTopbar() {
   }
 }
 
+// Per-route cache of the last HTML written to #main. Used by renderMain
+// to skip innerHTML assignment when a poll-driven rerender produces
+// identical output, preserving the existing DOM tree and (crucially) any
+// active text selection in the chat-history container. Finding UU
+// (v1.2.0-rc.1): unconditional innerHTML replacement on every poll cycle
+// destroyed click-and-drag and double-click selections in the concierge
+// chat surface, making it impossible for operators to copy a Sanctuary-
+// generated reply via the standard macOS selection mechanism.
+const __renderCache = { route: null, html: null };
+
 // ── Render: main area ──────────────────────────────────────────────────
 function renderMain() {
   const main = document.getElementById("main");
@@ -386,17 +405,29 @@ function renderMain() {
       selectionEnd: active.selectionEnd
     };
   }
+  let nextHtml;
   switch (state.route) {
-    case "dashboard": main.innerHTML = renderDashboardConcierge(); break;
-    case "agents": main.innerHTML = renderAgentsList(); break;
-    case "agent-detail": main.innerHTML = renderAgentDetail(); break;
-    case "policy": main.innerHTML = renderPolicyCenter(); break;
-    case "intelligence": main.innerHTML = renderIntelligenceCenter(); break;
-    case "privacy": main.innerHTML = renderPrivacyPage(); break;
-    case "coordination": main.innerHTML = renderCoordinationPage(); break;
-    case "health": main.innerHTML = renderHealthPage(); break;
-    case "exit-drill": main.innerHTML = renderExitDrill(); break;
-    default: main.innerHTML = '<p class="muted">Route not found.</p>';
+    case "dashboard": nextHtml = renderDashboardConcierge(); break;
+    case "agents": nextHtml = renderAgentsList(); break;
+    case "agent-detail": nextHtml = renderAgentDetail(); break;
+    case "policy": nextHtml = renderPolicyCenter(); break;
+    case "intelligence": nextHtml = renderIntelligenceCenter(); break;
+    case "privacy": nextHtml = renderPrivacyPage(); break;
+    case "coordination": nextHtml = renderCoordinationPage(); break;
+    case "health": nextHtml = renderHealthPage(); break;
+    case "exit-drill": nextHtml = renderExitDrill(); break;
+    default: nextHtml = '<p class="muted">Route not found.</p>';
+  }
+  // Skip the innerHTML write when the rendered output is byte-identical
+  // to the last write on the same route. Preserves the existing DOM
+  // tree, focus, and any active text selection during no-op poll
+  // cycles. The route-change branch always writes (cache miss).
+  if (__renderCache.route === state.route && __renderCache.html === nextHtml) {
+    // No-op: DOM already reflects current state.
+  } else {
+    main.innerHTML = nextHtml;
+    __renderCache.route = state.route;
+    __renderCache.html = nextHtml;
   }
   if (focus) {
     let sel = 'input[data-action="' + focus.action + '"]';
@@ -820,6 +851,28 @@ function renderIntelligenceCenter() {
       if (provider) currentBadge = currentBadge + " (" + (FRONTIER_PROVIDER_LABELS[provider] || provider) + ")";
     }
     const dotClass = statusDotClass((surfaceStatus.badge || {}).status || "red");
+    const failures = surfaceStatus.recentFailures || [];
+    const expanded = !!state.intelligence.expandedFailures[surfaceId];
+    let failuresBlock = "";
+    if (failures.length > 0) {
+      const toggleLabel = (expanded ? "Hide" : "View") + " recent failures (" + failures.length + ")";
+      const list = expanded
+        ? '<ul class="intel-row-failures-list">' +
+            failures.slice().reverse().map(function (f) {
+              return '<li><span class="muted mono">' + escHtml(shortTime(f.ts)) + '</span> ' +
+                '<span class="pill warn">' + escHtml(f.failureClass) + '</span> ' +
+                '<span class="muted">' + escHtml(f.snippet) + '</span></li>';
+            }).join("") +
+          '</ul>'
+        : '';
+      failuresBlock =
+        '<div class="intel-row-failures">' +
+          '<button class="btn btn-link" data-action="intel-failures-toggle" data-intel-surface="' + escHtml(surfaceId) + '">' +
+            escHtml(toggleLabel) +
+          '</button>' +
+          list +
+        '</div>';
+    }
     return '<div class="intel-row" data-intel-surface="' + escHtml(surfaceId) + '">' +
       '<div class="intel-row-name">' + escHtml(SURFACE_LABELS[surfaceId] || surfaceId) +
         '<small>' + escHtml(surfaceId) + '</small></div>' +
@@ -830,6 +883,7 @@ function renderIntelligenceCenter() {
           '<span class="muted mono">' + escHtml(statusLabel(surfaceStatus.health)) + '</span>' +
         '</div>' +
         '<div class="intel-row-tradeoff">' + escHtml(substrateTradeoff(substrate)) + '</div>' +
+        failuresBlock +
       '</div>' +
       '<div><button class="btn" data-action="intel-picker-open" data-intel-surface="' + escHtml(surfaceId) + '">Change</button></div>' +
     '</div>';
@@ -930,11 +984,26 @@ function renderIntelligencePicker() {
   }
 
   const errorBlock = p.error ? '<p class="error-text">' + escHtml(p.error) + '</p>' : "";
+  // Bulk-apply toggle (Finding SS, v1.2.0-rc.1). Default ON. When ON the
+  // save flow POSTs to /surfaces/all/choice; when OFF it POSTs to
+  // /surfaces/:surface/choice. The H2 label tracks the toggle so the
+  // operator sees what will happen before clicking Save.
+  const heading = p.applyToAll
+    ? "Pick a substrate for all surfaces"
+    : "Pick a substrate for " + surfaceLabel;
+  const applyToAllToggle =
+    '<label class="intel-apply-to-all">' +
+      '<input type="checkbox" data-action="intel-picker-toggle-apply-to-all"' +
+        (p.applyToAll ? ' checked' : '') + '> ' +
+      '<span>Apply to all surfaces (' + SURFACES_ORDER.length + ')</span>' +
+      '<small class="muted">When on, this substrate + key applies to every surface in one save.</small>' +
+    '</label>';
   const saveLabel = p.saving ? "Saving..." : "Save";
   return '<div class="intel-modal-backdrop" data-action="intel-picker-close-backdrop">' +
     '<div class="intel-modal" role="dialog" aria-label="Pick substrate" data-action="intel-picker-modal-stop">' +
-      '<h2>Pick a substrate for ' + escHtml(surfaceLabel) + '</h2>' +
+      '<h2>' + escHtml(heading) + '</h2>' +
       '<p class="intel-modal-subtitle">' + escHtml(SUBSTRATE_TRADEOFFS[candidate] || "") + '</p>' +
+      applyToAllToggle +
       optionRows +
       sub +
       errorBlock +
@@ -981,6 +1050,10 @@ async function onIntelPickerOpen(surfaceId) {
   }
   const surfaceStatus = (state.intelligence.status.surfaces || []).find(function (s) { return s.surface === surfaceId; });
   const config = state.intelligence.config || {};
+  // Default toggle ON for the operator-friendly bulk path. config flag
+  // explicitly false flips it OFF so per-surface operators do not get
+  // surprised by a bulk apply on subsequent picks.
+  const applyToAll = config.apply_to_all_surfaces !== false;
   state.intelligence.picker = {
     open: true,
     surface: surfaceId,
@@ -990,7 +1063,8 @@ async function onIntelPickerOpen(surfaceId) {
     frontierProvider: "anthropic",
     frontierApiKey: "",
     saving: false,
-    error: null
+    error: null,
+    applyToAll: applyToAll
   };
   rerender();
 }
@@ -999,7 +1073,7 @@ function onIntelPickerClose() {
   state.intelligence.picker = {
     open: false, surface: null, candidate: null, localModelPick: null,
     veniceApiKey: "", frontierProvider: "anthropic", frontierApiKey: "",
-    saving: false, error: null
+    saving: false, error: null, applyToAll: true
   };
   rerender();
 }
@@ -1027,13 +1101,32 @@ async function onIntelPickerSave() {
     if (p.candidate === "local" && p.localModelPick) {
       choiceBody.local_model_pick = p.localModelPick;
     }
-    await api("/intelligence/surfaces/" + encodeURIComponent(p.surface) + "/choice", {
-      method: "POST",
-      body: choiceBody
-    });
+    // Persist the toggle state so the picker reopens with the
+    // operator's preference next time. Best-effort: a failure here does
+    // not block the substrate save.
+    try {
+      await api("/intelligence/preferences/apply-to-all", {
+        method: "POST",
+        body: { value: !!p.applyToAll }
+      });
+    } catch (_e) { /* tolerate */ }
+    if (p.applyToAll) {
+      await api("/intelligence/surfaces/all/choice", {
+        method: "POST",
+        body: choiceBody
+      });
+    } else {
+      await api("/intelligence/surfaces/" + encodeURIComponent(p.surface) + "/choice", {
+        method: "POST",
+        body: choiceBody
+      });
+    }
     await fetchIntelligenceState();
     onIntelPickerClose();
-    toast("Substrate updated for " + (SURFACE_LABELS[p.surface] || p.surface) + ".", "info");
+    const target = p.applyToAll
+      ? "all surfaces"
+      : (SURFACE_LABELS[p.surface] || p.surface);
+    toast("Substrate updated for " + target + ".", "info");
   } catch (e) {
     state.intelligence.picker.saving = false;
     state.intelligence.picker.error = e.message;
@@ -1615,6 +1708,19 @@ document.addEventListener("click", function (ev) {
     return rerender();
   }
   if (action === "intel-picker-save") return void onIntelPickerSave();
+  if (action === "intel-picker-toggle-apply-to-all") {
+    state.intelligence.picker.applyToAll = !state.intelligence.picker.applyToAll;
+    state.intelligence.picker.error = null;
+    return rerender();
+  }
+  if (action === "intel-failures-toggle" && intelSurface) {
+    if (state.intelligence.expandedFailures[intelSurface]) {
+      delete state.intelligence.expandedFailures[intelSurface];
+    } else {
+      state.intelligence.expandedFailures[intelSurface] = true;
+    }
+    return rerender();
+  }
   // WP-V1.2-4 concierge handlers ──────────────────────────────────
   if (action === "concierge-submit") { ev.preventDefault(); return void onConciergeSend(); }
   if (action === "concierge-send") { ev.preventDefault(); return void onConciergeSend(); }

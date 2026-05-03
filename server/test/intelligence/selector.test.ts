@@ -446,3 +446,357 @@ describe("SubstrateSelector — emitRedactionEvent", () => {
     expect(details.filter_tier).toBe(2);
   });
 });
+
+// v1.2.0-rc.1 Finding TT: Venice model drift
+describe("VeniceClient.validateKey, Finding TT (v1.2.0-rc.1)", () => {
+  it("returns 'invalid-model' when Venice returns 404 with model-not-found body", async () => {
+    const { VeniceClient } = await import("../../src/intelligence/substrates/venice.js");
+    const fetchImpl = (async () => {
+      return new Response(
+        JSON.stringify({
+          error: "Specified model not found: llama-3.1-70b. Did you mean: llama-3.3-70b, llama-3.2-3b, hermes-3-llama-3.1-405b?",
+        }),
+        { status: 404, headers: { "Content-Type": "application/json" } },
+      );
+    }) as typeof fetch;
+    const client = new VeniceClient({ apiKey: "test", fetchImpl });
+    const result = await client.validateKey();
+    expect(result).toBe("invalid-model");
+  });
+
+  it("returns 'invalid-key' on 401", async () => {
+    const { VeniceClient } = await import("../../src/intelligence/substrates/venice.js");
+    const fetchImpl = (async () => new Response("", { status: 401 })) as typeof fetch;
+    const client = new VeniceClient({ apiKey: "test", fetchImpl });
+    expect(await client.validateKey()).toBe("invalid-key");
+  });
+
+  it("returns 'invalid-key' on 403", async () => {
+    const { VeniceClient } = await import("../../src/intelligence/substrates/venice.js");
+    const fetchImpl = (async () => new Response("", { status: 403 })) as typeof fetch;
+    const client = new VeniceClient({ apiKey: "test", fetchImpl });
+    expect(await client.validateKey()).toBe("invalid-key");
+  });
+
+  it("returns 'ok' on 200", async () => {
+    const { VeniceClient } = await import("../../src/intelligence/substrates/venice.js");
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ choices: [] }), { status: 200, headers: { "Content-Type": "application/json" } })
+    ) as typeof fetch;
+    const client = new VeniceClient({ apiKey: "test", fetchImpl });
+    expect(await client.validateKey()).toBe("ok");
+  });
+
+  it("returns 'unreachable' on 404 without model-not-found body shape", async () => {
+    const { VeniceClient } = await import("../../src/intelligence/substrates/venice.js");
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers: { "Content-Type": "application/json" } })
+    ) as typeof fetch;
+    const client = new VeniceClient({ apiKey: "test", fetchImpl });
+    expect(await client.validateKey()).toBe("unreachable");
+  });
+
+  it("returns 'unreachable' on transport error", async () => {
+    const { VeniceClient } = await import("../../src/intelligence/substrates/venice.js");
+    const fetchImpl = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as typeof fetch;
+    const client = new VeniceClient({ apiKey: "test", fetchImpl });
+    expect(await client.validateKey()).toBe("unreachable");
+  });
+
+  it("VENICE_DEFAULT_MODEL is bumped to llama-3.3-70b", async () => {
+    const { VENICE_DEFAULT_MODEL } = await import("../../src/intelligence/substrates/venice.js");
+    expect(VENICE_DEFAULT_MODEL).toBe("llama-3.3-70b");
+  });
+});
+
+describe("VeniceClient.chat, Finding TT runtime classification", () => {
+  it("classifies 404 with model-not-found body as substrate_misconfigured", async () => {
+    const { VeniceClient, VeniceSubstrate } = await import("../../src/intelligence/substrates/venice.js");
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify({ error: "Specified model not found: llama-3.3-70b. Did you mean: llama-3.4-70b" }),
+        { status: 404, headers: { "Content-Type": "application/json" } },
+      )
+    ) as typeof fetch;
+    const client = new VeniceClient({ apiKey: "k", fetchImpl });
+    const sub = new VeniceSubstrate(client);
+    const resp = await sub.summarize({ kind: "summarize", context: "c", query: "q" });
+    expect(resp.failureClass).toBe("substrate_misconfigured");
+  });
+
+  it("classifies plain 404 as substrate_unavailable", async () => {
+    const { VeniceClient, VeniceSubstrate } = await import("../../src/intelligence/substrates/venice.js");
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ error: "endpoint deprecated" }), { status: 404, headers: { "Content-Type": "application/json" } })
+    ) as typeof fetch;
+    const client = new VeniceClient({ apiKey: "k", fetchImpl });
+    const sub = new VeniceSubstrate(client);
+    const resp = await sub.summarize({ kind: "summarize", context: "c", query: "q" });
+    expect(resp.failureClass).toBe("substrate_unavailable");
+  });
+});
+
+// v1.2.0-rc.1 Finding VV: status truth-telling
+describe("SubstrateSelector, Finding VV recent failures + badge degrade", () => {
+  it("runtime failure on a surface flips badge from green to degraded and surfaces in /status", async () => {
+    // Concierge defaults to local Gemma; arrange Ollama to be reachable
+    // with the expected model so the static probe says ok, then have
+    // /api/generate fail at runtime to trigger the recentFailures path.
+    let calls = 0;
+    const fetchImpl = (async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/api/tags")) {
+        return new Response(JSON.stringify({ models: [{ name: "gemma2:2b" }] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/api/generate")) {
+        calls++;
+        return new Response("", { status: 500 });
+      }
+      return new Response("", { status: 404 });
+    }) as typeof fetch;
+    const { selector } = buildSelector({ fetchImpl });
+    await selector.load();
+
+    // Pre-runtime status: green for concierge.
+    const before = await selector.getOperatorVisibleStatus();
+    const beforeConcierge = before.surfaces.find((s) => s.surface === "concierge");
+    expect(beforeConcierge?.health).toBe("ok");
+    expect(beforeConcierge?.recentFailures).toEqual([]);
+
+    // Trigger one runtime failure.
+    await selector.invokeSummarize("concierge", { kind: "summarize", context: "c", query: "q" });
+    expect(calls).toBe(1);
+
+    // Post-runtime status: degraded for concierge, recentFailures has one entry.
+    const after = await selector.getOperatorVisibleStatus();
+    const afterConcierge = after.surfaces.find((s) => s.surface === "concierge");
+    expect(afterConcierge?.health).toBe("degraded");
+    expect(afterConcierge?.recentFailures.length).toBe(1);
+    expect(afterConcierge?.recentFailures[0]!.failureClass).toBeDefined();
+    expect(typeof afterConcierge?.recentFailures[0]!.snippet).toBe("string");
+    expect(typeof afterConcierge?.recentFailures[0]!.ts).toBe("string");
+  });
+
+  it("entries older than the 24h window are pruned on read", async () => {
+    const fetchImpl = makeFetchStub({
+      "/api/tags": { status: 200, body: { models: [{ name: "gemma2:2b" }] } },
+    });
+    const { selector } = buildSelector({ fetchImpl });
+    await selector.load();
+
+    // Inject a stale recent failure directly via the test seam, then
+    // read recentFailures and expect zero (pruned).
+    const stale: { surface: import("../../src/intelligence/types.js").Surface; failureClass: import("../../src/intelligence/types.js").SubstrateFailureClass; snippet: string } = {
+      surface: "concierge",
+      failureClass: "substrate_unavailable",
+      snippet: "stale",
+    };
+    // Force-record a failure, then mutate the entry's timestamp to older
+    // than 24h via a new failure followed by a private prune. Instead,
+    // assert the public path via a fresh selector seeded with a stale ts.
+    // Cleanest: record failure with frozen Date.now then advance time.
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
+    try {
+      // Simulate runtime failure (fail Ollama) so a real entry lands.
+      const failingFetch = (async (input: RequestInfo | URL): Promise<Response> => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/api/tags")) {
+          return new Response(JSON.stringify({ models: [{ name: "gemma2:2b" }] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response("", { status: 500 });
+      }) as typeof fetch;
+      const { selector: sel2 } = buildSelector({ fetchImpl: failingFetch });
+      await sel2.load();
+      await sel2.invokeSummarize("concierge", { kind: "summarize", context: "c", query: "q" });
+      expect(sel2.getRecentFailuresForTest("concierge").length).toBe(1);
+
+      // Advance virtual clock by 25h.
+      now += 25 * 60 * 60 * 1000;
+      // Pruning happens on read.
+      expect(sel2.getRecentFailuresForTest("concierge").length).toBe(0);
+    } finally {
+      Date.now = realNow;
+    }
+    void stale;
+  });
+
+  it("recentFailures is capped at 5 entries (FIFO eviction)", async () => {
+    const failingFetch = (async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/api/tags")) {
+        return new Response(JSON.stringify({ models: [{ name: "gemma2:2b" }] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("", { status: 500 });
+    }) as typeof fetch;
+    const { selector } = buildSelector({ fetchImpl: failingFetch });
+    await selector.load();
+    for (let i = 0; i < 8; i++) {
+      await selector.invokeSummarize("concierge", { kind: "summarize", context: "c", query: `q${i}` });
+    }
+    expect(selector.getRecentFailuresForTest("concierge").length).toBe(5);
+  });
+
+  it("setVeniceApiKey with invalid model flips badge even before any chat call", async () => {
+    // Probe the local-tags Ollama call to reachable + correct model so
+    // the static probe would normally green-badge, then validate Venice
+    // with model-not-found body. Concierge is on 'local' by default; we
+    // bind it to Venice so the post-set probe records to that surface.
+    const fetchImpl = (async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/api/tags")) {
+        return new Response(JSON.stringify({ models: [{ name: "gemma2:2b" }] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("api.venice.ai")) {
+        return new Response(
+          JSON.stringify({ error: "Specified model not found: llama-3.3-70b. Did you mean: llama-3.4-70b" }),
+          { status: 404, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response("", { status: 404 });
+    }) as typeof fetch;
+    const { selector } = buildSelector({ fetchImpl });
+    await selector.load();
+    await selector.setPerSurfaceChoice("concierge", "venice");
+    await selector.setVeniceApiKey("validation-probe-key");
+
+    const status = await selector.getOperatorVisibleStatus();
+    const concierge = status.surfaces.find((s) => s.surface === "concierge");
+    // Badge degraded: validation-probe entry pushed onto recentFailures.
+    expect(concierge?.recentFailures.length).toBeGreaterThan(0);
+    const last = concierge?.recentFailures[concierge.recentFailures.length - 1]!;
+    expect(last.failureClass).toBe("substrate_misconfigured");
+    expect(last.snippet).toMatch(/venice configured model/i);
+    // Badge degrade fires from recentFailures even when static probe would have been ok.
+    expect(concierge?.health === "degraded" || concierge?.health === "unavailable").toBe(true);
+  });
+
+  it("setVeniceApiKey with invalid key (401) flips badge to degraded", async () => {
+    const fetchImpl = (async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/api/tags")) {
+        return new Response(JSON.stringify({ models: [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (url.includes("api.venice.ai")) {
+        return new Response("", { status: 401 });
+      }
+      return new Response("", { status: 404 });
+    }) as typeof fetch;
+    const { selector } = buildSelector({ fetchImpl });
+    await selector.load();
+    await selector.setPerSurfaceChoice("concierge", "venice");
+    await selector.setVeniceApiKey("bad-key");
+
+    const status = await selector.getOperatorVisibleStatus();
+    const concierge = status.surfaces.find((s) => s.surface === "concierge");
+    expect(concierge?.recentFailures.length).toBeGreaterThan(0);
+    const last = concierge?.recentFailures[concierge.recentFailures.length - 1]!;
+    expect(last.failureClass).toBe("substrate_auth_failed");
+  });
+});
+
+// v1.2.0-rc.1 Finding SS: Apply-to-all-surfaces
+describe("SubstrateSelector, Finding SS bulk apply", () => {
+  it("applyChoiceToAllSurfaces sets every surface to the same substrate", async () => {
+    const { selector } = buildSelector();
+    await selector.load();
+    await selector.applyChoiceToAllSurfaces("venice");
+    const cfg = selector.getConfig();
+    for (const surface of [
+      "concierge",
+      "direct-agent-gate-advisor",
+      "sentinel-scoring",
+      "gate-explanation",
+      "privacy-filter-tier-2",
+      "template-suggestion",
+    ] as const) {
+      expect(cfg.perSurface[surface]).toBe("venice");
+    }
+    expect(cfg.applyToAllSurfaces).toBe(true);
+  });
+
+  it("applyChoiceToAllSurfaces emits a single bulk_substrate_chosen audit event", async () => {
+    const { selector, auditLog } = buildSelector();
+    await selector.load();
+    await selector.applyChoiceToAllSurfaces("venice");
+    const bulk = await auditLog.query({ operation_type: INTEL_OPS.BULK_SUBSTRATE_CHOSEN });
+    expect(bulk.entries.length).toBe(1);
+    const details = bulk.entries[0]!.details as {
+      kind: string;
+      substrate: string;
+      surface_count: number;
+      tradeoff_text_hash: string;
+      prior_substrates: Record<string, string | null>;
+    };
+    expect(details.kind).toBe("bulk_substrate_chosen");
+    expect(details.substrate).toBe("venice");
+    expect(details.surface_count).toBe(6);
+    expect(details.tradeoff_text_hash).toBe(tradeoffTextHash("venice"));
+    expect(details.prior_substrates.concierge).toBe("local");
+    expect(details.prior_substrates["gate-explanation"]).toBe("disabled");
+
+    // No per-surface chosen events should fire for the bulk path.
+    const single = await auditLog.query({ operation_type: INTEL_OPS.SUBSTRATE_CHOSEN });
+    expect(single.entries.length).toBe(0);
+  });
+
+  it("applyChoiceToAllSurfaces with local + localModelPick applies pick to every surface", async () => {
+    const { selector } = buildSelector();
+    await selector.load();
+    await selector.applyChoiceToAllSurfaces("local", { localModelPick: "llama-3.1-8b" });
+    const cfg = selector.getConfig();
+    for (const surface of [
+      "concierge",
+      "direct-agent-gate-advisor",
+      "sentinel-scoring",
+      "gate-explanation",
+      "privacy-filter-tier-2",
+      "template-suggestion",
+    ] as const) {
+      expect(cfg.perSurface[surface]).toBe("local");
+      expect(cfg.localModelPicks[surface]).toBe("llama-3.1-8b");
+    }
+  });
+
+  it("setApplyToAllPreference persists and survives reload", async () => {
+    const { selector, storage, masterKey, auditLog } = buildSelector();
+    await selector.load();
+    await selector.setApplyToAllPreference(false);
+    expect(selector.getConfig().applyToAllSurfaces).toBe(false);
+
+    const reloaded = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "test-identity",
+    });
+    await reloaded.load();
+    expect(reloaded.getConfig().applyToAllSurfaces).toBe(false);
+  });
+
+  it("after bulk apply, per-surface override still works (operator reverts one surface)", async () => {
+    const { selector } = buildSelector();
+    await selector.load();
+    await selector.applyChoiceToAllSurfaces("venice");
+    await selector.setPerSurfaceChoice("sentinel-scoring", "disabled");
+    const cfg = selector.getConfig();
+    expect(cfg.perSurface.concierge).toBe("venice");
+    expect(cfg.perSurface["sentinel-scoring"]).toBe("disabled");
+    expect(cfg.perSurface["template-suggestion"]).toBe("venice");
+  });
+});
