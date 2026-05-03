@@ -228,6 +228,16 @@ export class SubstrateSelector {
     };
     await this.store.save(this.config);
 
+    // Finding ZZ (v1.2.0-rc.2): when the operator changes a surface's
+    // substrate, prior failure entries no longer describe the new binding.
+    // Clear so the badge reflects current configuration; new failures (if
+    // any) will repopulate via the runtime path. No-op when the operator
+    // re-saves the same substrate, so a re-save does not silently wipe a
+    // legitimate failure trail.
+    if (prior !== substrate) {
+      this.recentFailures.delete(surface);
+    }
+
     const payload: IntelligenceSubstrateChosenPayload = {
       version: "1.2",
       event_id: makeEventId(),
@@ -285,6 +295,14 @@ export class SubstrateSelector {
       applyToAllSurfaces: true,
     };
     await this.store.save(this.config);
+
+    // Finding ZZ (v1.2.0-rc.2): bulk re-binding is a global configuration
+    // gesture; prior per-surface failure entries no longer describe the
+    // new bindings. Clear every surface's ring buffer so badges reflect
+    // current configuration.
+    for (const surface of SURFACES) {
+      this.recentFailures.delete(surface);
+    }
 
     const payload: IntelligenceBulkSubstrateChosenPayload = {
       version: "1.2",
@@ -379,7 +397,20 @@ export class SubstrateSelector {
     } catch {
       return;
     }
-    if (result === "ok" || result === "unreachable") return;
+    if (result === "ok") {
+      // Finding ZZ (v1.2.0-rc.2): a re-saved key that probes ok is the
+      // operator's signal that the prior failure has been remediated.
+      // Clear stale failure entries on every Venice-bound surface so the
+      // badge returns to green; runtime invocations will repopulate the
+      // buffer if real failures recur.
+      for (const surface of SURFACES) {
+        if (this.config.perSurface[surface] === "venice") {
+          this.recentFailures.delete(surface);
+        }
+      }
+      return;
+    }
+    if (result === "unreachable") return;
     const failureClass: SubstrateFailureClass =
       result === "invalid-key" ? "substrate_auth_failed" : "substrate_misconfigured";
     const snippet =
@@ -710,6 +741,20 @@ export class SubstrateSelector {
    */
   getRecentFailuresForTest(surface: Surface): RecentFailureEntry[] {
     return this.recentFailuresFor(surface);
+  }
+
+  /**
+   * Test-only seam: lets selector tests seed a recent-failure entry on a
+   * surface so the buffer-clear behavior added for Finding ZZ (v1.2.0-rc.2)
+   * can be exercised without spinning up a real failing substrate. Mirrors
+   * `getRecentFailuresForTest`; never call from production paths.
+   */
+  recordRecentFailureForTest(
+    surface: Surface,
+    failureClass: SubstrateFailureClass,
+    snippet: string,
+  ): void {
+    this.recordRecentFailure(surface, failureClass, snippet);
   }
 
   /**

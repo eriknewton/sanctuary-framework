@@ -511,6 +511,103 @@ describe("VeniceClient.validateKey, Finding TT (v1.2.0-rc.1)", () => {
   });
 });
 
+// v1.2.0-rc.2 Finding YY: VENICE_DEFAULT_MODEL env-override path
+describe("VENICE_DEFAULT_MODEL env override, Finding YY (v1.2.0-rc.2)", () => {
+  const ENV_KEY = "VENICE_DEFAULT_MODEL";
+  const original = process.env[ENV_KEY];
+
+  function restoreEnv(): void {
+    if (original === undefined) {
+      delete process.env[ENV_KEY];
+    } else {
+      process.env[ENV_KEY] = original;
+    }
+  }
+
+  it("reads VENICE_DEFAULT_MODEL from env when set", async () => {
+    vi.resetModules();
+    process.env[ENV_KEY] = "operator-pinned-model-v9";
+    try {
+      const { VENICE_DEFAULT_MODEL } = await import(
+        "../../src/intelligence/substrates/venice.js"
+      );
+      expect(VENICE_DEFAULT_MODEL).toBe("operator-pinned-model-v9");
+    } finally {
+      restoreEnv();
+      vi.resetModules();
+    }
+  });
+
+  it("falls back to llama-3.3-70b when env is unset", async () => {
+    vi.resetModules();
+    delete process.env[ENV_KEY];
+    try {
+      const { VENICE_DEFAULT_MODEL } = await import(
+        "../../src/intelligence/substrates/venice.js"
+      );
+      expect(VENICE_DEFAULT_MODEL).toBe("llama-3.3-70b");
+    } finally {
+      restoreEnv();
+      vi.resetModules();
+    }
+  });
+
+  it("falls back to llama-3.3-70b when env is empty string", async () => {
+    vi.resetModules();
+    process.env[ENV_KEY] = "";
+    try {
+      const { VENICE_DEFAULT_MODEL } = await import(
+        "../../src/intelligence/substrates/venice.js"
+      );
+      expect(VENICE_DEFAULT_MODEL).toBe("llama-3.3-70b");
+    } finally {
+      restoreEnv();
+      vi.resetModules();
+    }
+  });
+
+  // Acceptance-drill Phase 2.6 path A: operator sets a deliberately bogus
+  // model identifier as the trigger for a runtime failure. Without the
+  // env-override read, validateKey() ignores the env entirely and reports
+  // "ok" against whatever the shipped default is, making the drill a no-op.
+  // With the override, the bogus identifier reaches Venice and returns the
+  // 404 model-not-found shape, so validateKey reports "invalid-model" and
+  // the operator badge surfaces the real cause.
+  it("env value of 'this-model-does-not-exist' reaches validateKey and yields invalid-model", async () => {
+    vi.resetModules();
+    process.env[ENV_KEY] = "this-model-does-not-exist";
+    try {
+      const { VeniceClient, VENICE_DEFAULT_MODEL } = await import(
+        "../../src/intelligence/substrates/venice.js"
+      );
+      expect(VENICE_DEFAULT_MODEL).toBe("this-model-does-not-exist");
+
+      let capturedBody: string | null = null;
+      const fetchImpl = (async (
+        _input: RequestInfo | URL,
+        init?: RequestInit,
+      ): Promise<Response> => {
+        capturedBody = init?.body as string;
+        return new Response(
+          JSON.stringify({
+            error:
+              "Specified model not found: this-model-does-not-exist. Did you mean: llama-3.3-70b, llama-3.2-3b?",
+          }),
+          { status: 404, headers: { "Content-Type": "application/json" } },
+        );
+      }) as typeof fetch;
+
+      const client = new VeniceClient({ apiKey: "test", fetchImpl });
+      const result = await client.validateKey();
+      expect(result).toBe("invalid-model");
+      expect(capturedBody).toContain("this-model-does-not-exist");
+    } finally {
+      restoreEnv();
+      vi.resetModules();
+    }
+  });
+});
+
 describe("VeniceClient.chat, Finding TT runtime classification", () => {
   it("classifies 404 with model-not-found body as substrate_misconfigured", async () => {
     const { VeniceClient, VeniceSubstrate } = await import("../../src/intelligence/substrates/venice.js");
@@ -798,5 +895,182 @@ describe("SubstrateSelector, Finding SS bulk apply", () => {
     expect(cfg.perSurface.concierge).toBe("venice");
     expect(cfg.perSurface["sentinel-scoring"]).toBe("disabled");
     expect(cfg.perSurface["template-suggestion"]).toBe("venice");
+  });
+});
+
+// v1.2.0-rc.2 Finding ZZ: clear recent-failures buffer on substrate change
+// or on confirmed-ok Venice key re-save.
+describe("SubstrateSelector, Finding ZZ recent-failures buffer clearing", () => {
+  it("setPerSurfaceChoice clears the surface's recent-failures buffer when the substrate actually changes", async () => {
+    const { selector } = buildSelector();
+    await selector.load();
+    await selector.setPerSurfaceChoice("concierge", "venice");
+    selector.recordRecentFailureForTest(
+      "concierge",
+      "substrate_misconfigured",
+      "venice configured model not found",
+    );
+    expect(selector.getRecentFailuresForTest("concierge").length).toBe(1);
+
+    await selector.setPerSurfaceChoice("concierge", "local");
+
+    expect(selector.getRecentFailuresForTest("concierge").length).toBe(0);
+  });
+
+  it("setPerSurfaceChoice does NOT clear the buffer when the operator re-saves the same substrate", async () => {
+    const { selector } = buildSelector();
+    await selector.load();
+    await selector.setPerSurfaceChoice("concierge", "venice");
+    selector.recordRecentFailureForTest(
+      "concierge",
+      "substrate_auth_failed",
+      "venice key rejected on validation probe",
+    );
+    expect(selector.getRecentFailuresForTest("concierge").length).toBe(1);
+
+    await selector.setPerSurfaceChoice("concierge", "venice");
+
+    expect(selector.getRecentFailuresForTest("concierge").length).toBe(1);
+  });
+
+  it("applyChoiceToAllSurfaces clears every surface's recent-failures buffer", async () => {
+    const { selector } = buildSelector();
+    await selector.load();
+    await selector.setPerSurfaceChoice("concierge", "venice");
+    await selector.setPerSurfaceChoice("sentinel-scoring", "venice");
+    await selector.setPerSurfaceChoice("template-suggestion", "venice");
+    selector.recordRecentFailureForTest(
+      "concierge",
+      "substrate_misconfigured",
+      "venice model not found",
+    );
+    selector.recordRecentFailureForTest(
+      "sentinel-scoring",
+      "substrate_auth_failed",
+      "venice key rejected",
+    );
+    selector.recordRecentFailureForTest(
+      "template-suggestion",
+      "substrate_unavailable",
+      "venice transport error",
+    );
+    expect(selector.getRecentFailuresForTest("concierge").length).toBe(1);
+    expect(selector.getRecentFailuresForTest("sentinel-scoring").length).toBe(1);
+    expect(selector.getRecentFailuresForTest("template-suggestion").length).toBe(1);
+
+    await selector.applyChoiceToAllSurfaces("local", {});
+
+    expect(selector.getRecentFailuresForTest("concierge").length).toBe(0);
+    expect(selector.getRecentFailuresForTest("sentinel-scoring").length).toBe(0);
+    expect(selector.getRecentFailuresForTest("template-suggestion").length).toBe(0);
+    expect(selector.getRecentFailuresForTest("direct-agent-gate-advisor").length).toBe(0);
+    expect(selector.getRecentFailuresForTest("gate-explanation").length).toBe(0);
+    expect(selector.getRecentFailuresForTest("privacy-filter-tier-2").length).toBe(0);
+  });
+
+  it("setVeniceApiKey with a probe that returns ok clears every Venice-bound surface's buffer", async () => {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ choices: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    ) as typeof fetch;
+    const { selector } = buildSelector({ fetchImpl });
+    await selector.load();
+    await selector.setPerSurfaceChoice("concierge", "venice");
+    await selector.setPerSurfaceChoice("sentinel-scoring", "venice");
+    await selector.setPerSurfaceChoice("template-suggestion", "local");
+    selector.recordRecentFailureForTest(
+      "concierge",
+      "substrate_auth_failed",
+      "venice key rejected",
+    );
+    selector.recordRecentFailureForTest(
+      "sentinel-scoring",
+      "substrate_misconfigured",
+      "venice model not found",
+    );
+    selector.recordRecentFailureForTest(
+      "template-suggestion",
+      "substrate_unavailable",
+      "local model down",
+    );
+
+    await selector.setVeniceApiKey("operator-fixed-key");
+
+    expect(selector.getRecentFailuresForTest("concierge").length).toBe(0);
+    expect(selector.getRecentFailuresForTest("sentinel-scoring").length).toBe(0);
+    expect(selector.getRecentFailuresForTest("template-suggestion").length).toBe(1);
+  });
+
+  it("setVeniceApiKey with a probe that returns invalid-key does NOT clear; existing failure remains and a fresh one is recorded", async () => {
+    const fetchImpl = (async () =>
+      new Response("", { status: 401 })
+    ) as typeof fetch;
+    const { selector } = buildSelector({ fetchImpl });
+    await selector.load();
+    await selector.setPerSurfaceChoice("concierge", "venice");
+    selector.recordRecentFailureForTest(
+      "concierge",
+      "substrate_auth_failed",
+      "prior failure",
+    );
+    expect(selector.getRecentFailuresForTest("concierge").length).toBe(1);
+
+    await selector.setVeniceApiKey("still-bad-key");
+
+    const failures = selector.getRecentFailuresForTest("concierge");
+    expect(failures.length).toBe(2);
+    expect(failures[0]!.snippet).toBe("prior failure");
+    expect(failures[1]!.snippet).toContain("venice key rejected");
+  });
+
+  it("setVeniceApiKey with a probe that returns invalid-model does NOT clear; existing failure remains and a fresh one is recorded", async () => {
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify({
+          error:
+            "Specified model not found: llama-3.3-70b. Did you mean: llama-3.4-70b?",
+        }),
+        { status: 404, headers: { "Content-Type": "application/json" } },
+      )
+    ) as typeof fetch;
+    const { selector } = buildSelector({ fetchImpl });
+    await selector.load();
+    await selector.setPerSurfaceChoice("concierge", "venice");
+    selector.recordRecentFailureForTest(
+      "concierge",
+      "substrate_misconfigured",
+      "prior misconfiguration",
+    );
+    expect(selector.getRecentFailuresForTest("concierge").length).toBe(1);
+
+    await selector.setVeniceApiKey("good-key-bad-model");
+
+    const failures = selector.getRecentFailuresForTest("concierge");
+    expect(failures.length).toBe(2);
+    expect(failures[0]!.snippet).toBe("prior misconfiguration");
+    expect(failures[1]!.snippet).toContain("not found on validation probe");
+  });
+
+  it("setVeniceApiKey with a probe that returns unreachable preserves the existing buffer; runtime path will surface", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as typeof fetch;
+    const { selector } = buildSelector({ fetchImpl });
+    await selector.load();
+    await selector.setPerSurfaceChoice("concierge", "venice");
+    selector.recordRecentFailureForTest(
+      "concierge",
+      "substrate_auth_failed",
+      "prior failure pre-key-rotation",
+    );
+
+    await selector.setVeniceApiKey("rotated-key");
+
+    expect(selector.getRecentFailuresForTest("concierge").length).toBe(1);
+    expect(selector.getRecentFailuresForTest("concierge")[0]!.snippet).toBe(
+      "prior failure pre-key-rotation",
+    );
   });
 });
