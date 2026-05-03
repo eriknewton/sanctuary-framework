@@ -31,6 +31,8 @@
     "test:security": "vitest run test/security",
     "test:integration": "vitest run test/integration",
     "test:conformance": "vitest run test/conformance",
+    "test:e2e": "playwright test",
+    "test:e2e:install": "playwright install chromium",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
     "clean": "rm -rf dist",
@@ -63,6 +65,7 @@
     "uint8arrays": "^5.1.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.20.0",
     "tsup": "^8.0.0",

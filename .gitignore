@@ -36,3 +36,7 @@ social_posts_*.md
 menubar/src-tauri/target/
 menubar/src-tauri/gen/
 menubar/.vite/
+
+# Playwright e2e (v1.2.0-rc.4)
+server/playwright-report/
+server/test-results/

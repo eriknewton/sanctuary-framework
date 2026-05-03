@@ -1,0 +1,52 @@
+name: E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Set up Python 3.12 for Concordia sidecar
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Provision Concordia sidecar venv
+        run: |
+          python3 -m venv sidecars/concordia/.venv
+          sidecars/concordia/.venv/bin/pip install --upgrade pip
+          sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
+
+      - name: Install Playwright browsers
+        working-directory: server
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright e2e tests
+        working-directory: server
+        run: npm run test:e2e
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: server/playwright-report/
+          retention-days: 14
