@@ -78,6 +78,37 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(combined.toLowerCase()).not.toContain("forward secrecy via mls");
   });
 
+  it("renders the binary version pill in the topbar (Finding CCC, v1.2.0-rc.3)", () => {
+    const html = renderDashboardV11Html({ sanctuaryVersion: "1.2.0-rc.3" });
+    // Pill is server-rendered alongside deployment / mode / attestation.
+    expect(html).toContain('data-pill="version"');
+    expect(html).toContain("v1.2.0-rc.3");
+    // The pill stays in the same flex container as the other pills.
+    const topbarMatch = html.match(/<div class="pills" id="topbar-pills">[\s\S]*?<\/div>/);
+    expect(topbarMatch).toBeTruthy();
+    expect(topbarMatch![0]).toContain('data-pill="version"');
+    expect(topbarMatch![0]).toContain('data-pill="deployment"');
+  });
+
+  it("falls back to the package binary version when sanctuaryVersion is unset", () => {
+    const html = renderDashboardV11Html({});
+    // Read the package.json version directly to compare against the default.
+    // require + relative path mirrors the constant in config.ts.
+    const pkgVersion = (require("../../../package.json") as { version: string }).version;
+    expect(html).toContain('data-pill="version"');
+    expect(html).toContain("v" + pkgVersion);
+  });
+
+  it("emits sanctuaryVersion in the dashboard-config JSON block so renderTopbar can refresh the pill", () => {
+    const html = renderDashboardV11Html({ sanctuaryVersion: "1.2.0-rc.3" });
+    const configBlockMatch = html.match(
+      /<script id="dashboard-config" type="application\/json">([\s\S]*?)<\/script>/,
+    );
+    expect(configBlockMatch).toBeTruthy();
+    const cfg = JSON.parse(configBlockMatch![1]!) as { sanctuaryVersion?: string };
+    expect(cfg.sanctuaryVersion).toBe("1.2.0-rc.3");
+  });
+
   it("preserves signature_scheme as internal-only (not surfaced in HTML)", () => {
     const html = renderDashboardV11Html({});
     // Per binding addendum acceptance criterion 6: the scheme value is
