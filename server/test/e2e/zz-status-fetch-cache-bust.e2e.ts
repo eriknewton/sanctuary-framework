@@ -8,7 +8,7 @@
  * verifies the fix shape directly: every GET the SPA issues to
  * /api/hub/* must carry both a `_t=<epoch>` query string AND a
  * `cache: "no-store"` request init (surfaced via the `Cache-Control`
- * request header). Either alone is insufficient — Safari has been
+ * request header). Either alone is insufficient. Safari has been
  * documented to ignore `no-store` on responses with ETags but no
  * Last-Modified, and a heuristic cache may reuse a URL that varies
  * only by query string when no Cache-Control is set. Belt + suspenders.
