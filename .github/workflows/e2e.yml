@@ -37,7 +37,7 @@ jobs:
 
       - name: Install Playwright browsers
         working-directory: server
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium webkit
 
       - name: Run Playwright e2e tests
         working-directory: server

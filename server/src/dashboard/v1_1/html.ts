@@ -295,9 +295,24 @@ body {
   background: var(--surface-2); border-color: var(--rule);
 }
 .btn.chip:hover:not(:disabled) { background: var(--paper-3); }
+/* Finding DDD (v1.2.0-rc.5): the concierge card uses a bounded
+ * max-height + the history is the inner scroll container with
+ * min-height: 0 (so flex shrink works in WebKit) + the composer is
+ * flex-shrink: 0 (so it stays pinned at the bottom of the card
+ * regardless of how much history is above). The pre-rc.5 layout used
+ * min-height: calc(100vh - 180px) on the card and min-height: 360px
+ * on the history; with no height bound, the card grew to fit content,
+ * the history never scrolled internally (scrollHeight === clientHeight),
+ * and on long threads the composer was pushed below the page fold.
+ * Operator quote from Pass 5 drill: "It does move the response up
+ * dynamically, but the input box is below the fold, so I still have
+ * to scroll." rc.5 closes that with a structural layout fix.
+ */
 .concierge-card {
   display: flex; flex-direction: column;
-  min-height: calc(100vh - 180px);
+  height: calc(100vh - 180px);
+  max-height: calc(100vh - 180px);
+  min-height: 360px;
   padding: 16px 18px;
   gap: 0;
 }
@@ -305,6 +320,7 @@ body {
   display: flex; align-items: center; justify-content: space-between;
   gap: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--rule);
   flex-wrap: wrap;
+  flex-shrink: 0;
 }
 .concierge-persona {
   display: flex; align-items: baseline; gap: 8px;
@@ -314,7 +330,7 @@ body {
 .concierge-badge { white-space: nowrap; }
 .concierge-history {
   flex: 1 1 auto;
-  min-height: 360px;
+  min-height: 0;
   overflow-y: auto;
   padding: 14px 4px;
   display: flex; flex-direction: column; gap: 14px;
@@ -345,6 +361,7 @@ body {
   display: flex; gap: 10px; align-items: center;
   padding: 12px 0 8px;
   border-top: 1px solid var(--rule);
+  flex-shrink: 0;
 }
 .concierge-composer input {
   flex: 1; min-width: 0;

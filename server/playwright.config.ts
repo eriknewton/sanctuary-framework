@@ -6,11 +6,13 @@
  * real browser. The Playwright suite is the new gate for any
  * operator-visible-state fix going forward.
  *
- * Chromium-only headless. The dashboard SPA targets evergreen Chromium
- * features (CSS grid, ESM modules, oklch). Cross-browser parity is not
- * a v1.x goal; we test what the operator runs.
+ * v1.2.0-rc.5 adds the WebKit project after three consecutive rc.x
+ * rounds (rc.2, rc.3, rc.4) shipped fixes that passed Chromium tests
+ * and field-failed on moltbook Safari. WebKit-specific divergences in
+ * fetch caching and flex layout were the structural gap. Both projects
+ * are now first-class CI gates.
  */
-import { defineConfig } from "@playwright/test";
+import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./test/e2e",
@@ -35,7 +37,11 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: { browserName: "chromium" },
+      use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      name: "webkit",
+      use: { ...devices["Desktop Safari"] },
     },
   ],
 });
