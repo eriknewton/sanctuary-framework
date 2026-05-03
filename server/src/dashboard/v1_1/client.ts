@@ -449,30 +449,33 @@ function renderMain() {
       selectionEnd: active.selectionEnd
     };
   }
-  // Finding DDD (v1.2.0-rc.4): capture whether the operator is
-  // following the conversation BEFORE the DOM is replaced. The rc.3
-  // fix scrolled concierge-history.scrollTop to scrollHeight, but the
-  // layout has flex 1 1 auto on .concierge-history with no max-height,
-  // so the element grows to fit content and never scrolls internally
-  // (scrollHeight === clientHeight); the page itself is the actual
-  // scroll container. The rc.3 scroll assignment is a no-op and the
-  // latest message lands below the page fold. The rc.4 detection uses
-  // the latest message's bounding rect against the viewport, which is
-  // layout-agnostic; the rc.4 restore uses scrollIntoView, which
-  // scrolls whichever ancestor is the actual scroll container.
+  // Finding DDD (v1.2.0-rc.5): capture whether the operator is
+  // following the conversation BEFORE the DOM is replaced. With the
+  // rc.5 bounded-card layout, .concierge-history is the inner scroll
+  // container (max-height on the card + min-height: 0 + overflow-y:
+  // auto on history). The composer sits OUTSIDE the history's scroll
+  // region, so it stays visible regardless of where the operator has
+  // scrolled. "Following" now means the latest message is visible
+  // inside the history container's viewport. The check compares the
+  // last message's bounding rect to the history element's bounding
+  // rect (both are border-box rects in viewport space, so the
+  // intersection test is direct). The rc.5 restore continues to use
+  // scrollIntoView, which scrolls whichever ancestor is the actual
+  // scroll container, now .concierge-history.
   let conciergeWasFollowing = false;
   if (state.route === "dashboard") {
     const histEl = document.getElementById("concierge-history");
     if (histEl) {
       const lastMsg = histEl.querySelector(".concierge-msg:last-child");
       if (lastMsg) {
-        const rect = lastMsg.getBoundingClientRect();
-        // Following = the latest message is at least partially visible
-        // in the viewport. If the operator scrolled up past the latest
-        // message (rect.bottom <= 0) or somehow the latest is far below
-        // viewport bottom (rect.top >= window.innerHeight), they are
-        // not following.
-        conciergeWasFollowing = rect.top < window.innerHeight && rect.bottom > 0;
+        const histRect = histEl.getBoundingClientRect();
+        const lastRect = lastMsg.getBoundingClientRect();
+        // Following = the last message overlaps the history container's
+        // visible region. If the operator scrolled up past the latest
+        // message, the message is below histRect.bottom (clipped); if
+        // far above the visible region, it's above histRect.top.
+        conciergeWasFollowing =
+          lastRect.top < histRect.bottom && lastRect.bottom > histRect.top;
       } else {
         // Empty thread. Treat as following so a fresh exchange lands
         // in view.
