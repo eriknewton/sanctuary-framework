@@ -40,7 +40,7 @@ interface ConciergeMessage {
 
 async function installConciergeStub(page: Page): Promise<{ thread: ConciergeMessage[] }> {
   const thread: ConciergeMessage[] = [];
-  await page.route("**/api/hub/chat/concierge", async (route) => {
+  await page.route(/\/api\/hub\/chat\/concierge(\?|$)/, async (route) => {
     const req = route.request();
     if (req.method() === "POST") {
       const body = req.postDataJSON() as { message?: string };
@@ -72,7 +72,7 @@ async function installConciergeStub(page: Page): Promise<{ thread: ConciergeMess
     }
     await route.continue();
   });
-  await page.route("**/api/hub/chat/concierge/history", async (route) => {
+  await page.route(/\/api\/hub\/chat\/concierge\/history/, async (route) => {
     if (route.request().method() === "GET") {
       await route.fulfill({
         status: 200,

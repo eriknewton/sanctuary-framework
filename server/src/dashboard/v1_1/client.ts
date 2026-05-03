@@ -159,7 +159,30 @@ async function api(path, opts) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(init.body);
   }
-  const res = await fetch(HUB + path, init);
+  // Finding ZZ (v1.2.0-rc.5): the dashboard SPA wants fresh state on
+  // every fetch. WebKit/Safari's HTTP cache serves prior /status,
+  // /policies, /activity responses on subsequent GETs even when the
+  // server-side state has changed (e.g. recent-failures buffer cleared
+  // on substrate flip). The pre-rc.5 client used bare fetch with no
+  // cache control, which on moltbook Safari produced a stale view of
+  // server state and made the operator-visible badge color stick to
+  // its prior value across substrate changes. Belt + suspenders:
+  // cache: "no-store" turns off the response cache; the _t query
+  // string defeats heuristic caches that ignore Cache-Control. Both
+  // are required: Safari has a known history of ignoring no-store on
+  // ETag'd responses with no Last-Modified, and a heuristic cache may
+  // stick on a URL with no query string variation. A POST/PUT/DELETE
+  // is never cached, so the cache-bust path is GET-only; the query
+  // string is appended for GETs that don't already carry one.
+  init.cache = "no-store";
+  init.headers["Cache-Control"] = "no-cache";
+  init.headers["Pragma"] = "no-cache";
+  let url = HUB + path;
+  const method = (init.method || "GET").toUpperCase();
+  if (method === "GET") {
+    url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
+  }
+  const res = await fetch(url, init);
   let body = null;
   try { body = await res.json(); } catch (e) { body = null; }
   if (!res.ok) {
