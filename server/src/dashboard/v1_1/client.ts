@@ -568,9 +568,9 @@ function renderMain() {
 //   "Concierge unavailable; substrate not configured") sourced from the
 //   last response's served_by + display_label.
 const CONCIERGE_SUGGESTIONS = [
-  { id: "summarize-hour", label: "summarize the last hour", query: "Summarize what happened in this fortress in the last hour." },
-  { id: "agent-touched", label: "what has each agent touched today", query: "What has each wrapped agent done today? Group by agent." },
-  { id: "open-approvals", label: "any open approvals?", query: "Are there any open Tier 1 approvals or pending inbox items I should look at?" }
+  { id: "summarize-hour", category: "Summarize", label: "summarize the last hour", query: "Summarize what happened in this fortress in the last hour." },
+  { id: "agent-touched", category: "Inspect", label: "what has each agent touched today", query: "What has each wrapped agent done today? Group by agent." },
+  { id: "open-approvals", category: "Approvals", label: "any open approvals?", query: "Are there any open Tier 1 approvals or pending inbox items I should look at?" }
 ];
 
 // Direct-agent chat surface was removed in the v1.2 reshape; the
@@ -587,41 +587,77 @@ function renderDashboardConcierge() {
   const badge = c.badge && c.badge.displayLabel
     ? '<span class="pill mono concierge-badge" title="Substrate that served the most recent response">' + escHtml(c.badge.displayLabel) + '</span>'
     : '<span class="pill muted concierge-badge">Concierge: substrate not yet contacted</span>';
-  const messages = c.messages.length
+  const sendDisabled = c.sending ? ' disabled' : '';
+  const sendLabel = c.sending ? 'Sending...' : 'Send';
+  // Sprint Piece 2 PR 2: empty state lives INSIDE the concierge-history
+  // container so the DDD e2e selector .concierge-history matches both
+  // empty and active state. The container's flex layout hosts a single
+  // .concierge-empty child that fills the available height with a serif
+  // headline and a 3-up suggest grid; the grid replaces the v1.2 bottom
+  // chip row, which is retired with this polish.
+  const emptyState =
+    '<div class="concierge-empty">' +
+      '<div class="concierge-empty-headline">' +
+        '<h2>Where would you like to begin.</h2>' +
+        '<p>Ask anything about your fortress. Sanctuary holds your context, your agents, your policy. It will answer plainly, or hand you to the right surface.</p>' +
+      '</div>' +
+      '<div class="concierge-suggest-grid">' +
+        CONCIERGE_SUGGESTIONS.map(function (s) {
+          return '<button class="concierge-suggest" data-action="concierge-suggestion" data-suggestion-id="' + escHtml(s.id) + '"' + sendDisabled + '>' +
+            '<span class="label">' + escHtml(s.category || '') + '</span>' +
+            escHtml(s.label) +
+            '</button>';
+        }).join("") +
+      '</div>' +
+    '</div>';
+  const messagesHtml = c.messages.length
     ? c.messages.map(function (m) {
         const cls = m.role === "operator" ? "concierge-msg-operator" : "concierge-msg-concierge";
-        const author = m.role === "operator" ? "you" : "Sanctuary Fortress concierge";
+        const authorLabel = m.role === "operator" ? "you" : "sanctuary";
+        const metaParts = [];
+        if (m.created_at) metaParts.push(escHtml(shortTime(m.created_at)));
+        if (m.role === "concierge" && m.served_by) metaParts.push('substrate: ' + escHtml(m.served_by));
+        const meta = metaParts.length
+          ? '<div class="concierge-msg-meta"><span>' + metaParts.join(' · ') + '</span></div>'
+          : '';
         return '<div class="concierge-msg ' + cls + '">' +
-          '<div class="concierge-msg-author muted">' + escHtml(author) + ' · ' + escHtml(shortTime(m.created_at)) + '</div>' +
+          '<span class="concierge-msg-author">' + escHtml(authorLabel) + '</span>' +
           '<div class="concierge-msg-body">' + escHtml(m.body) + '</div>' +
+          meta +
           '</div>';
       }).join("\n")
-    : '<p class="muted concierge-empty">No messages yet. Ask the concierge anything about your fortress: it can summarize agent activity, surface open approvals, or describe the current policy.</p>';
+    : emptyState;
   const errorBanner = c.error
     ? '<div class="banner banner-warn">' + escHtml(c.error) + '</div>'
     : "";
-  const sendDisabled = c.sending ? ' disabled' : '';
-  const sendLabel = c.sending ? 'Sending...' : 'Send';
-  const chips = CONCIERGE_SUGGESTIONS.map(function (s) {
-    return '<button class="btn chip" data-action="concierge-suggestion" data-suggestion-id="' + escHtml(s.id) + '"' + sendDisabled + '>' + escHtml(s.label) + '</button>';
-  }).join("\n");
   const activeChatsPanel = renderActiveChatsPanel();
   return [
-    '<h1>Chat <span class="muted">/ This fortress</span></h1>',
-    activeChatsPanel,
-    '<div class="card concierge-card">',
-      '<div class="concierge-header">',
-        '<div class="concierge-persona"><strong>Sanctuary Fortress concierge</strong> <span class="muted">read-only over fortress state</span></div>',
-        badge,
+    '<div class="concierge-wrap">',
+      '<div class="page-head"><div>',
+        '<p class="eyebrow">Concierge</p>',
+        '<h1>Talk to your fortress.</h1>',
+        '<p class="sub">A direct line to Sanctuary, routed through the substrate you chose. Nothing leaves without your hand on it.</p>',
+      '</div></div>',
+      activeChatsPanel,
+      '<div class="card concierge-card">',
+        '<div class="concierge-header">',
+          '<div class="concierge-persona">',
+            '<div class="glyph-ring"></div>',
+            '<div class="concierge-persona-text"><strong>Sanctuary Fortress concierge</strong><small>read-only over fortress state</small></div>',
+          '</div>',
+          '<div class="concierge-meta">' + badge + '</div>',
+        '</div>',
+        errorBanner,
+        '<div class="concierge-history" id="concierge-history">' + messagesHtml + '</div>',
+        '<form class="concierge-composer" data-action="concierge-submit">',
+          '<div class="input-wrap">',
+            '<input type="text" name="concierge-input" placeholder="Type to Sanctuary. Enter to send." value="' + escHtml(c.composer) + '" data-action="concierge-input"' + sendDisabled + ' autocomplete="off">',
+            '<span class="composer-meta">Enter</span>',
+          '</div>',
+          '<button type="submit" class="btn btn-primary" data-action="concierge-send"' + sendDisabled + '>' + escHtml(sendLabel) + '</button>',
+        '</form>',
+        '<p class="muted concierge-foot">First time? <a href="#intelligence">Pick a substrate</a> to enable concierge replies.</p>',
       '</div>',
-      errorBanner,
-      '<div class="concierge-history" id="concierge-history">' + messages + '</div>',
-      '<form class="concierge-composer" data-action="concierge-submit">',
-        '<input type="text" name="concierge-input" placeholder="Ask the concierge about this fortress..." value="' + escHtml(c.composer) + '" data-action="concierge-input"' + sendDisabled + ' autocomplete="off">',
-        '<button type="submit" class="btn btn-primary" data-action="concierge-send"' + sendDisabled + '>' + escHtml(sendLabel) + '</button>',
-      '</form>',
-      '<div class="concierge-chips">' + chips + '</div>',
-      '<p class="muted concierge-foot">First time? <a href="#intelligence">Pick a substrate</a> to enable concierge replies.</p>',
     '</div>'
   ].join("");
 }
@@ -1962,7 +1998,7 @@ document.addEventListener("input", function (ev) {
 // system preference and track changes so dark-mode-at-sunset behavior
 // keeps working on macOS / Windows.
 const THEME_KEY = "sanctuary-v11-theme";
-function applyTheme(theme: string): void {
+function applyTheme(theme) {
   if (theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
   else document.documentElement.removeAttribute("data-theme");
 }
