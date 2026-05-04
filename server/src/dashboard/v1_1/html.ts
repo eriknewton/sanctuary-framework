@@ -318,6 +318,135 @@ body {
   font-family: var(--mono); font-size: var(--text-sm); box-sizing: border-box;
 }
 .intel-modal-actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: 18px; }
+/*
+ * Intelligence panel polish (Sprint Piece 2 PR 3). Card grid layout
+ * replaces the legacy 3-col row visual. The legacy .intel-row and
+ * .intel-status-dot rules above are retained for the e2e selector
+ * contract (.intel-row[data-intel-surface="..."]) and as the responsive
+ * fallback. Cards render as a flex column with a substrate inset,
+ * status badge with shaped glyph, and a recent-failures toggle in the
+ * card foot.
+ */
+.intel-wrap { max-width: 1000px; margin: 0 auto; }
+.intel-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.intel-card {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-lg);
+  padding: 16px;
+  display: flex; flex-direction: column;
+  gap: 12px;
+}
+.intel-card-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 10px;
+}
+.intel-card-name {
+  display: flex; flex-direction: column; gap: 2px;
+  min-width: 0;
+}
+.intel-card-name strong {
+  font-family: var(--serif); font-weight: 500;
+  font-size: 15px; letter-spacing: 0.005em;
+}
+.intel-card-name small {
+  color: var(--ink-3); font-size: 11px; font-family: var(--mono);
+}
+.intel-card-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 11px;
+  padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--rule); background: var(--surface-2);
+  flex-shrink: 0;
+}
+.intel-card-status.ok { color: var(--sage); border-color: var(--sage); background: var(--sage-bg); }
+.intel-card-status.warn { color: var(--ochre); border-color: var(--ochre); background: var(--ochre-bg); }
+.intel-card-status.fail { color: var(--rust); border-color: var(--rust); background: var(--rust-bg); }
+.status-glyph {
+  width: 10px; height: 10px;
+  position: relative; flex-shrink: 0;
+}
+.status-glyph.ok::before {
+  content: ""; position: absolute; inset: 0;
+  border-radius: 50%; background: currentColor;
+}
+.status-glyph.warn::before {
+  content: ""; position: absolute; inset: 0;
+  background: currentColor;
+  clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
+}
+.status-glyph.fail::before {
+  content: ""; position: absolute; inset: 1px;
+  background: currentColor;
+  clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
+}
+.intel-substrate {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 12px;
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad);
+}
+.intel-substrate .sub-line {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 10px; font-size: 12px;
+}
+.intel-substrate .sub-line.primary {
+  font-family: var(--mono); font-size: 13px; color: var(--ink);
+}
+.intel-substrate .sub-line.secondary { color: var(--ink-3); font-size: 11px; }
+.intel-card-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding-top: 4px;
+}
+.intel-failures-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; font-family: var(--mono);
+  color: var(--ink-3);
+  background: transparent; border: 0; padding: 0;
+  cursor: pointer;
+}
+.intel-failures-toggle:hover { color: var(--ink); }
+.intel-failures-toggle .caret {
+  display: inline-block; width: 0; height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+  transition: transform 160ms ease;
+}
+.intel-failures-toggle.open .caret { transform: rotate(180deg); }
+.intel-failures {
+  border-top: 1px solid var(--rule);
+  padding-top: 12px;
+  display: flex; flex-direction: column;
+  gap: 8px;
+}
+.intel-failure-row {
+  display: grid; grid-template-columns: 88px 1fr; gap: 12px;
+  font-size: 12px; padding: 8px 10px;
+  border-radius: var(--rad);
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+}
+.intel-failure-row .ts {
+  font-family: var(--mono); font-size: 11px; color: var(--ink-3);
+}
+.intel-failure-row .err-class {
+  font-family: var(--mono); font-size: 10px;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--rust); margin-bottom: 2px;
+}
+.btn-quiet {
+  background: transparent; border: 1px solid var(--rule);
+  padding: 2px 6px; font-size: 11px;
+  border-radius: var(--rad); cursor: pointer;
+  color: var(--ink-2); font-family: var(--sans);
+}
+.btn-quiet:hover { background: var(--surface-2); color: var(--ink); }
 .banner-warn {
   background: var(--ochre-bg); color: var(--ochre); border: 1px solid var(--ochre);
   border-radius: var(--rad); padding: 8px 12px; margin: 8px 0; font-size: var(--text-base);
@@ -570,6 +699,8 @@ body {
   .policy-center h1 { font-size: 30px; }
   .intel-center h1 { font-size: 30px; }
   .intel-row { grid-template-columns: 1fr; }
+  .intel-grid { grid-template-columns: 1fr; }
+  .intel-failure-row { grid-template-columns: 1fr; }
 }
 `;
 

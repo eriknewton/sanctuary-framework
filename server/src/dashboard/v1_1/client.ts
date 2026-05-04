@@ -925,6 +925,16 @@ function statusDotClass(status) {
   return "red";
 }
 
+// Card-grid polish (Sprint Piece 2 PR 3) maps the badge dot class onto
+// the shaped glyph token. Sage circle for ok, ochre triangle for warn,
+// rust diamond for fail. Keep aligned with .status-glyph rules in
+// html.ts and the .intel-card-status modifier classes.
+function statusGlyphClass(dotClass) {
+  if (dotClass === "green") return "ok";
+  if (dotClass === "yellow") return "warn";
+  return "fail";
+}
+
 function statusLabel(health) {
   if (health === "ok") return "Working";
   if (health === "degraded") return "Degraded";
@@ -964,13 +974,18 @@ function renderIntelligenceCenter() {
   }
   const status = state.intelligence.status;
   const config = state.intelligence.config || {};
-  const surfaceRows = SURFACES_ORDER.map(function (surfaceId) {
+  const surfaceCards = SURFACES_ORDER.map(function (surfaceId) {
     const surfaceStatus = (status.surfaces || []).find(function (s) { return s.surface === surfaceId; });
     if (!surfaceStatus) {
-      return '<div class="intel-row"><div class="intel-row-name">' + escHtml(SURFACE_LABELS[surfaceId] || surfaceId) +
-        '<small>' + escHtml(surfaceId) + '</small></div>' +
-        '<div class="intel-row-body muted">No status reported.</div>' +
-        '<div></div></div>';
+      return '<div class="intel-row intel-card" data-intel-surface="' + escHtml(surfaceId) + '">' +
+        '<div class="intel-card-head">' +
+          '<div class="intel-card-name">' +
+            '<strong>' + escHtml(SURFACE_LABELS[surfaceId] || surfaceId) + '</strong>' +
+            '<small>' + escHtml(surfaceId) + '</small>' +
+          '</div>' +
+        '</div>' +
+        '<div class="muted">No status reported.</div>' +
+      '</div>';
     }
     const substrate = surfaceStatus.chosen;
     const localPick = (config.local_model_picks || {})[surfaceId];
@@ -988,41 +1003,62 @@ function renderIntelligenceCenter() {
       if (provider) currentBadge = currentBadge + " (" + (FRONTIER_PROVIDER_LABELS[provider] || provider) + ")";
     }
     const dotClass = statusDotClass((surfaceStatus.badge || {}).status || "red");
+    const glyphClass = statusGlyphClass(dotClass);
     const failures = surfaceStatus.recentFailures || [];
     const expanded = !!state.intelligence.expandedFailures[surfaceId];
-    let failuresBlock = "";
+
+    // Card foot. The failures toggle is the load-bearing affordance for
+    // the rc.6 ZZ test (button[data-action="intel-failures-toggle"] with
+    // text "recent failures (N)"). Pluralization is "failures" regardless
+    // of N for backward compatibility with the seeded test contract.
+    // Surface zero-failure state as a quiet mono note so the card still
+    // has visual rhythm in its foot row.
+    let footHtml;
     if (failures.length > 0) {
       const toggleLabel = (expanded ? "Hide" : "View") + " recent failures (" + failures.length + ")";
-      const list = expanded
-        ? '<ul class="intel-row-failures-list">' +
-            failures.slice().reverse().map(function (f) {
-              return '<li><span class="muted mono">' + escHtml(shortTime(f.ts)) + '</span> ' +
-                '<span class="pill warn">' + escHtml(f.failureClass) + '</span> ' +
-                '<span class="muted">' + escHtml(f.snippet) + '</span></li>';
-            }).join("") +
-          '</ul>'
-        : '';
-      failuresBlock =
-        '<div class="intel-row-failures">' +
-          '<button class="btn btn-link" data-action="intel-failures-toggle" data-intel-surface="' + escHtml(surfaceId) + '">' +
-            escHtml(toggleLabel) +
-          '</button>' +
-          list +
-        '</div>';
+      footHtml =
+        '<button class="intel-failures-toggle' + (expanded ? ' open' : '') + '" data-action="intel-failures-toggle" data-intel-surface="' + escHtml(surfaceId) + '">' +
+          '<span class="caret"></span>' +
+          escHtml(toggleLabel) +
+        '</button>';
+    } else {
+      footHtml = '<span class="muted mono" style="font-size: 11px;">no recent failures</span>';
     }
-    return '<div class="intel-row" data-intel-surface="' + escHtml(surfaceId) + '">' +
-      '<div class="intel-row-name">' + escHtml(SURFACE_LABELS[surfaceId] || surfaceId) +
-        '<small>' + escHtml(surfaceId) + '</small></div>' +
-      '<div class="intel-row-body">' +
-        '<div class="intel-row-current">' +
-          '<span class="intel-status-dot ' + dotClass + '" title="' + escHtml(statusLabel(surfaceStatus.health)) + '"></span>' +
-          '<span class="pill">' + escHtml(currentBadge) + '</span>' +
-          '<span class="muted mono">' + escHtml(statusLabel(surfaceStatus.health)) + '</span>' +
+
+    let failuresBlock = "";
+    if (failures.length > 0 && expanded) {
+      const rows = failures.slice().reverse().map(function (f) {
+        return '<div class="intel-failure-row">' +
+          '<span class="ts">' + escHtml(shortTime(f.ts)) + '</span>' +
+          '<div>' +
+            '<div class="err-class">' + escHtml(f.failureClass) + '</div>' +
+            '<div>' + escHtml(f.snippet) + '</div>' +
+          '</div>' +
+        '</div>';
+      }).join("");
+      failuresBlock = '<div class="intel-failures">' + rows + '</div>';
+    }
+
+    return '<div class="intel-row intel-card" data-intel-surface="' + escHtml(surfaceId) + '">' +
+      '<div class="intel-card-head">' +
+        '<div class="intel-card-name">' +
+          '<strong>' + escHtml(SURFACE_LABELS[surfaceId] || surfaceId) + '</strong>' +
+          '<small>' + escHtml(surfaceId) + '</small>' +
         '</div>' +
-        '<div class="intel-row-tradeoff">' + escHtml(substrateTradeoff(substrate)) + '</div>' +
-        failuresBlock +
+        '<span class="intel-card-status ' + glyphClass + '" title="' + escHtml(statusLabel(surfaceStatus.health)) + '">' +
+          '<span class="status-glyph ' + glyphClass + '"></span>' +
+          escHtml(statusLabel(surfaceStatus.health)) +
+        '</span>' +
       '</div>' +
-      '<div><button class="btn" data-action="intel-picker-open" data-intel-surface="' + escHtml(surfaceId) + '">Change</button></div>' +
+      '<div class="intel-substrate">' +
+        '<div class="sub-line primary">' +
+          '<span>' + escHtml(currentBadge) + '</span>' +
+          '<button class="btn-quiet" data-action="intel-picker-open" data-intel-surface="' + escHtml(surfaceId) + '">Change</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="intel-row-tradeoff">' + escHtml(substrateTradeoff(substrate)) + '</div>' +
+      '<div class="intel-card-foot">' + footHtml + '</div>' +
+      failuresBlock +
     '</div>';
   }).join("\n");
 
@@ -1034,11 +1070,15 @@ function renderIntelligenceCenter() {
 
   const modal = state.intelligence.picker.open ? renderIntelligencePicker() : "";
 
-  return '<section class="intel-center">' +
-    '<p class="eyebrow">INTELLIGENCE</p>' +
-    '<h1>Intelligence Substrate</h1>' +
-    '<p class="intel-subtitle">Choose how Sanctuary thinks. Tradeoffs visible per surface. Multi-option framing is preserved: no single substrate is the right answer.</p>' +
-    '<section class="intel-panel"><h2>Surfaces</h2>' + surfaceRows + '</section>' +
+  return '<section class="intel-wrap">' +
+    '<div class="page-head">' +
+      '<div>' +
+        '<p class="eyebrow">Intelligence</p>' +
+        '<h1>Substrate routing.</h1>' +
+        '<p class="sub">Six surfaces, six choices. Each surface picks where its thinking happens. Local for privacy. Hosted for capability. Hybrid for both.</p>' +
+      '</div>' +
+    '</div>' +
+    '<div class="intel-grid">' + surfaceCards + '</div>' +
     '<section class="intel-panel"><h2>Host capability</h2>' +
       '<dl class="intel-hardware">' +
         '<dt>Total RAM</dt><dd>' + escHtml(hardware.totalRamGb || "?") + ' GB</dd>' +
