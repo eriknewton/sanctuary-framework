@@ -40,10 +40,22 @@ export interface DashboardHarness {
   stop: () => Promise<void>;
 }
 
+export interface DashboardHarnessOptions {
+  /**
+   * Optional fetch override forwarded to the SubstrateSelector. Lets a
+   * test stub the Ollama `/api/tags` probe (and Venice / frontier
+   * outbound calls) so the local-substrate static probe can return a
+   * green status. Without a stub, `ollamaReachable` is false and the
+   * local probe reports `substrate_unavailable`, which precludes any
+   * end-to-end assertion that the post-flip badge is green.
+   */
+  fetchImpl?: typeof fetch;
+}
+
 const IDENTITY = "operator-e2e";
 const FORTRESS = "fortress-e2e";
 
-async function startHarness(): Promise<DashboardHarness> {
+async function startHarness(opts: DashboardHarnessOptions = {}): Promise<DashboardHarness> {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const auditLog = new AuditLog(storage, masterKey);
@@ -52,6 +64,7 @@ async function startHarness(): Promise<DashboardHarness> {
     masterKey,
     auditLog,
     identityId: IDENTITY,
+    fetchImpl: opts.fetchImpl,
   });
   await selector.load();
   const bindings = buildV11Bindings({
@@ -111,9 +124,16 @@ async function startHarness(): Promise<DashboardHarness> {
   };
 }
 
-export const test = base.extend<{ dashboard: DashboardHarness }>({
-  dashboard: async ({}, use) => {
-    const harness = await startHarness();
+export const test = base.extend<{
+  dashboard: DashboardHarness;
+  dashboardOptions: DashboardHarnessOptions;
+}>({
+  // Default: no stubbed fetch. Tests that need a working local-substrate
+  // probe (e.g. ZZ assertions on post-flip badge color) override via
+  // `test.use({ dashboardOptions: { fetchImpl: ... } })`.
+  dashboardOptions: [{}, { option: true }],
+  dashboard: async ({ dashboardOptions }, use) => {
+    const harness = await startHarness(dashboardOptions);
     try {
       await use(harness);
     } finally {
@@ -121,5 +141,27 @@ export const test = base.extend<{ dashboard: DashboardHarness }>({
     }
   },
 });
+
+/**
+ * Build a fetch stub that satisfies the Ollama `/api/tags` probe used
+ * by the SubstrateSelector hardware probe. Returns 200 with the given
+ * model name list. All other URLs return 404 so accidental outbound
+ * traffic during tests is structurally rejected.
+ *
+ * Call shape mirrors `makeFetchStub` in `test/intelligence/selector.test.ts`
+ * so the e2e and unit-level harnesses stay consistent.
+ */
+export function ollamaTagsStub(modelNames: string[]): typeof fetch {
+  return (async (input: RequestInfo | URL): Promise<Response> => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.includes("/api/tags")) {
+      return new Response(
+        JSON.stringify({ models: modelNames.map((n) => ({ name: n })) }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response("", { status: 404 });
+  }) as typeof fetch;
+}
 
 export { expect } from "@playwright/test";
