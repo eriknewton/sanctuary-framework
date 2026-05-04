@@ -1795,6 +1795,13 @@ document.addEventListener("click", function (ev) {
   const intelLocalModel = tgt.getAttribute("data-intel-local-model");
   const intelFrontierProvider = tgt.getAttribute("data-intel-frontier-provider");
   if (action === "lockdown") return void onLockdownClick();
+  if (action === "theme-toggle") {
+    const isDark = document.documentElement.getAttribute("data-theme") === "dark";
+    const next = isDark ? "light" : "dark";
+    sessionStorage.setItem(THEME_KEY, next);
+    applyTheme(next);
+    return;
+  }
   if (action === "intel-reload") { return void fetchIntelligenceState().then(rerender); }
   if (action === "intel-picker-open" && intelSurface) return void onIntelPickerOpen(intelSurface);
   if (action === "intel-picker-close") return onIntelPickerClose();
@@ -1948,12 +1955,30 @@ document.addEventListener("input", function (ev) {
 // then the dashboard view renders a static welcome card with no form
 // inputs that could be confused for a working command surface.
 
-// Theme: system preference only at v1.1.
-const mq = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
-if (mq && mq.matches) document.documentElement.setAttribute("data-theme", "dark");
-if (mq) mq.addEventListener("change", function (e) {
-  if (e.matches) document.documentElement.setAttribute("data-theme", "dark");
+// Theme: explicit operator preference (sessionStorage) overrides system
+// pref. The toggle button in the topbar dispatches data-action
+// "theme-toggle" which writes the chosen theme and updates the
+// [data-theme] attribute. When no explicit choice exists, fall back to
+// system preference and track changes so dark-mode-at-sunset behavior
+// keeps working on macOS / Windows.
+const THEME_KEY = "sanctuary-v11-theme";
+function applyTheme(theme: string): void {
+  if (theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
   else document.documentElement.removeAttribute("data-theme");
+}
+const explicitTheme = sessionStorage.getItem(THEME_KEY);
+const mq = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+if (explicitTheme === "dark" || explicitTheme === "light") {
+  applyTheme(explicitTheme);
+} else if (mq && mq.matches) {
+  applyTheme("dark");
+}
+if (mq) mq.addEventListener("change", function (e) {
+  // Only honor system pref changes when the operator has not made an
+  // explicit choice. Once they toggle, the choice sticks for the
+  // session.
+  if (sessionStorage.getItem(THEME_KEY)) return;
+  applyTheme(e.matches ? "dark" : "light");
 });
 
 // Boot.
