@@ -344,81 +344,206 @@ body {
  * dynamically, but the input box is below the fold, so I still have
  * to scroll." rc.5 closes that with a structural layout fix.
  */
+/* Sprint Piece 2 PR 2 (2026-05-03): concierge surface polish.
+ * Translates Claude Design references at
+ * server/docs/design-refs/sprint-piece-2/surface-concierge.jsx and the
+ * Surface 1 block of surfaces.css. The bounded-card layout above is
+ * preserved verbatim because rc.5 and the DDD e2e suite depend on it;
+ * the Claude Design reference uses height: 720px for the card, but
+ * production keeps the calc-based bounded height so the card adapts
+ * to the operator viewport. The polish lands the persona glyph-ring,
+ * mono uppercase author labels, paper-2 background for concierge
+ * replies, suggest-grid empty-state cards, and the composer input-wrap
+ * with the keyboard-shortcut pill.
+ */
+.concierge-wrap { max-width: 880px; margin: 0 auto; }
+.page-head {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: 18px; padding-bottom: 14px;
+  border-bottom: 1px solid var(--rule);
+}
+.page-head .eyebrow {
+  font-family: var(--mono); font-size: var(--text-xs);
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 6px;
+}
+.page-head h1 {
+  font-family: var(--serif); font-weight: 400;
+  font-size: 28px; letter-spacing: -0.01em;
+  margin: 0 0 4px;
+}
+.page-head .sub {
+  color: var(--ink-3); margin: 0;
+  font-size: var(--text-base); max-width: 60ch;
+}
 .concierge-card {
   display: flex; flex-direction: column;
   height: calc(100vh - 180px);
   max-height: calc(100vh - 180px);
   min-height: 360px;
-  padding: 16px 18px;
+  padding: 18px 22px 14px;
   gap: 0;
 }
 .concierge-header {
   display: flex; align-items: center; justify-content: space-between;
-  gap: var(--space-3); padding-bottom: 12px; border-bottom: 1px solid var(--rule);
+  gap: var(--space-3); padding-bottom: 14px;
+  border-bottom: 1px solid var(--rule);
   flex-wrap: wrap;
   flex-shrink: 0;
 }
-.concierge-persona {
-  display: flex; align-items: baseline; gap: var(--space-2);
-  font-size: var(--text-md);
+.concierge-persona { display: flex; align-items: center; gap: 10px; }
+.concierge-persona .glyph-ring {
+  width: 26px; height: 26px;
+  border: 1.5px solid var(--ink-2);
+  border-radius: 50%;
+  position: relative;
+  flex-shrink: 0;
 }
-.concierge-persona strong { font-size: var(--text-md); }
+.concierge-persona .glyph-ring::after {
+  content: ""; position: absolute; inset: 5px;
+  border-radius: 50%; background: var(--ink-2);
+}
+.concierge-persona-text { display: flex; flex-direction: column; }
+.concierge-persona-text strong {
+  font-family: var(--serif); font-weight: 500;
+  font-size: 15px; letter-spacing: 0.005em;
+}
+.concierge-persona-text small {
+  color: var(--ink-3); font-size: var(--text-xs);
+  font-family: var(--mono);
+}
+.concierge-meta {
+  display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+}
 .concierge-badge { white-space: nowrap; }
 .concierge-history {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: 14px 4px;
-  display: flex; flex-direction: column; gap: 14px;
+  padding: 18px 4px 6px;
+  display: flex; flex-direction: column; gap: 18px;
 }
 .concierge-msg {
-  display: flex; flex-direction: column; gap: 4px;
-  max-width: 80%;
+  display: flex; flex-direction: column; gap: 5px;
+  max-width: 78%;
 }
 .concierge-msg-author {
-  font-size: var(--text-xs);
+  font-size: 10px;
+  font-family: var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-4);
 }
 .concierge-msg-body {
-  padding: 10px 14px; border-radius: 12px;
-  border: 1px solid var(--rule); background: var(--surface);
-  white-space: pre-wrap; word-wrap: break-word;
-  font-size: var(--text-md); line-height: 1.5;
+  padding: 11px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--rule);
+  background: var(--surface);
+  font-size: var(--text-md);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-wrap: break-word;
 }
 .concierge-msg-concierge { align-self: flex-start; }
+.concierge-msg-concierge .concierge-msg-body {
+  background: var(--paper-2);
+}
 .concierge-msg-operator { align-self: flex-end; align-items: flex-end; }
 .concierge-msg-operator .concierge-msg-body {
   background: var(--ink); color: var(--paper); border-color: var(--ink);
 }
+.concierge-msg-meta {
+  display: flex; gap: 6px;
+  font-size: 10px;
+  color: var(--ink-4);
+  font-family: var(--mono);
+}
 .concierge-empty {
-  padding: 24px 8px; text-align: left;
-  font-size: var(--text-base); line-height: 1.6;
+  flex: 1 1 auto;
+  display: flex; flex-direction: column; gap: 22px;
+  justify-content: center;
+  padding: 24px 12px;
+}
+.concierge-empty-headline { max-width: 52ch; }
+.concierge-empty-headline h2 {
+  font-family: var(--serif); font-weight: 400;
+  font-size: var(--text-xl); margin: 0 0 6px;
+  letter-spacing: -0.005em;
+}
+.concierge-empty-headline p {
+  color: var(--ink-3); margin: 0;
+  font-size: var(--text-md); line-height: 1.55;
+}
+.concierge-suggest-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.concierge-suggest {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad);
+  padding: 12px 14px;
+  font-size: var(--text-base);
+  cursor: pointer;
+  display: flex; flex-direction: column;
+  gap: 6px;
+  text-align: left;
+  font-family: var(--sans);
+  color: var(--ink);
+}
+.concierge-suggest:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--rule-2);
+}
+.concierge-suggest:disabled {
+  cursor: not-allowed; color: var(--ink-4); opacity: 0.7;
+}
+.concierge-suggest .label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
 }
 .concierge-composer {
   display: flex; gap: 10px; align-items: center;
-  padding: 12px 0 8px;
+  padding: 12px 0 4px;
   border-top: 1px solid var(--rule);
   flex-shrink: 0;
 }
+.concierge-composer .input-wrap {
+  flex: 1;
+  display: flex; align-items: center; gap: var(--space-2);
+  padding: 8px 12px;
+  border: 1px solid var(--rule);
+  border-radius: var(--rad);
+  background: var(--surface);
+}
+.concierge-composer .input-wrap:focus-within {
+  border-color: var(--ink-3);
+}
 .concierge-composer input {
   flex: 1; min-width: 0;
-  padding: 10px 14px;
-  border: 1px solid var(--rule); border-radius: var(--rad);
-  font-family: var(--sans); font-size: var(--text-md);
-  background: var(--surface); color: var(--ink);
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: var(--text-md);
+  outline: none;
 }
-.concierge-composer input:focus {
-  outline: none; border-color: var(--ink-3);
+.concierge-composer input::placeholder { color: var(--ink-4); }
+.concierge-composer .composer-meta {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-4);
+  letter-spacing: 0.04em;
 }
 .concierge-composer .btn-primary {
   padding: 8px 18px; font-size: var(--text-base); flex-shrink: 0;
-}
-.concierge-chips {
-  display: flex; flex-wrap: wrap; gap: 6px;
-  padding: 10px 0 0;
-}
-.concierge-chips::before {
-  content: "Try:"; color: var(--ink-3); font-size: var(--text-sm);
-  align-self: center; margin-right: 4px;
 }
 .concierge-foot {
   margin: 12px 0 0; padding-top: 10px; border-top: 1px dashed var(--rule);
