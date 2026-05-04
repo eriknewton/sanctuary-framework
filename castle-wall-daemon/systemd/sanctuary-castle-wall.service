@@ -1,0 +1,41 @@
+[Unit]
+Description=Sanctuary Castle Wall filter daemon
+Documentation=https://github.com/eriknewton/sanctuary-framework
+After=network-pre.target
+Before=network.target
+Wants=network-pre.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/libexec/sanctuary/castle-wall-daemon --fortress-id ${SANCTUARY_FORTRESS_ID}
+Restart=on-failure
+RestartSec=2
+User=root
+Group=sanctuary
+
+# Capabilities. PR 2a does not bind any kernel resources; PR 2b adds the
+# specific CAP_NET_ADMIN bound required for nftables and NFQUEUE.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+
+# Filesystem hardening.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/sanctuary /var/lib/sanctuary
+
+# Process isolation.
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=false
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
