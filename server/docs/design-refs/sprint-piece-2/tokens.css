@@ -1,0 +1,72 @@
+/* Sanctuary v1.2 design tokens — lifted from server/src/dashboard/v1_1/html.ts.
+   Source of truth is the dashboard. This file mirrors it for the prototype. */
+
+:root {
+  --paper: #f7f5f0;
+  --paper-2: #efece5;
+  --paper-3: #e6e3da;
+  --ink: #1a1a17;
+  --ink-2: #39362f;
+  --ink-3: #6a6659;
+  --ink-4: #9a9585;
+  --rule: #d8d4c8;
+  --rule-2: #c4bfb0;
+  --surface: #fdfcf8;
+  --surface-2: #f1eee6;
+  --sage: oklch(62% 0.07 145);
+  --sage-bg: oklch(94% 0.02 145);
+  --ochre: oklch(68% 0.09 75);
+  --ochre-bg: oklch(94% 0.03 75);
+  --rust: oklch(55% 0.11 35);
+  --rust-bg: oklch(94% 0.03 35);
+  --indigo: oklch(50% 0.10 260);
+  --indigo-bg: oklch(94% 0.03 260);
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --serif: "Iowan Old Style", "Charter", "Georgia", serif;
+  --rad: 6px;
+  --rad-lg: 10px;
+  --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.02);
+
+  /* Spacing scale formalized for v1.2 (PR 1) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+}
+
+[data-theme="dark"] {
+  --paper: #121210;
+  --paper-2: #171714;
+  --paper-3: #1e1e1b;
+  --ink: #ecebe5;
+  --ink-2: #c7c5bd;
+  --ink-3: #8d8a80;
+  --ink-4: #5e5c55;
+  --rule: #2a2a26;
+  --rule-2: #36352f;
+  --surface: #1a1a17;
+  --surface-2: #1f1e1a;
+  --sage: oklch(72% 0.08 145);
+  --sage-bg: oklch(22% 0.03 145);
+  --ochre: oklch(78% 0.09 75);
+  --ochre-bg: oklch(22% 0.04 75);
+  --rust: oklch(70% 0.11 35);
+  --rust-bg: oklch(22% 0.04 35);
+  --indigo: oklch(72% 0.09 260);
+  --indigo-bg: oklch(22% 0.03 260);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: var(--sans);
+  font-size: 14px;
+  background: var(--paper);
+  color: var(--ink);
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}

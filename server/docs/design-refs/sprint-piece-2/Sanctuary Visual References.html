@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sanctuary v1.2 · design references</title>
+<link rel="stylesheet" href="tokens.css" />
+<link rel="stylesheet" href="dashboard.css" />
+<link rel="stylesheet" href="surfaces.css" />
+<style>
+  /* Reference shell — switcher + frame */
+  body { background: #2a2a26; min-height: 100vh; }
+  [data-theme="dark"] body, body[data-shell-dark="1"] { background: #0a0a09; }
+
+  .ref-shell {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    min-height: 100vh;
+  }
+  .ref-nav {
+    background: #1a1a17;
+    color: #ecebe5;
+    padding: 24px 18px;
+    font-family: var(--sans, -apple-system, sans-serif);
+    border-right: 1px solid #2a2a26;
+    overflow-y: auto;
+  }
+  .ref-nav h1 {
+    font-family: "Iowan Old Style", "Charter", Georgia, serif;
+    font-weight: 400;
+    font-size: 18px;
+    margin: 0 0 4px;
+  }
+  .ref-nav .sub {
+    color: #8d8a80;
+    font-size: 11px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    margin: 0 0 24px;
+    line-height: 1.5;
+  }
+  .ref-group {
+    margin-bottom: 18px;
+  }
+  .ref-group h2 {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #8d8a80;
+    margin: 0 0 8px;
+    font-weight: 500;
+  }
+  .ref-state {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 7px 10px;
+    margin-bottom: 2px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: #c7c5bd;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .ref-state:hover { background: #1f1e1a; color: #ecebe5; }
+  .ref-state.active {
+    background: #1f1e1a;
+    border-color: #36352f;
+    color: #ecebe5;
+  }
+  .ref-theme-row {
+    display: flex; gap: 6px;
+    padding: 12px 10px;
+    margin: 10px 0 18px;
+    background: #1f1e1a;
+    border: 1px solid #2a2a26;
+    border-radius: 6px;
+  }
+  .ref-theme-btn {
+    flex: 1;
+    padding: 6px 10px;
+    border: 1px solid #36352f;
+    border-radius: 4px;
+    background: transparent;
+    color: #c7c5bd;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .ref-theme-btn.active { background: #ecebe5; color: #1a1a17; border-color: #ecebe5; }
+
+  .ref-frame {
+    padding: 20px;
+    overflow: auto;
+  }
+  .ref-frame-inner {
+    width: 1440px;
+    height: 900px;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+    border-radius: 4px;
+    overflow: hidden;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.45), 0 0 0 1px rgba(0,0,0,0.4);
+    position: relative;
+  }
+  .ref-frame-inner .app {
+    background: var(--paper);
+    color: var(--ink);
+  }
+  .ref-caption {
+    width: 1440px;
+    margin-top: 14px;
+    color: #8d8a80;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    line-height: 1.6;
+    padding-bottom: 24px;
+  }
+  .ref-caption strong {
+    color: #ecebe5;
+    font-family: "Iowan Old Style", Georgia, serif;
+    font-weight: 400;
+    font-size: 13px;
+    display: block;
+    margin-bottom: 4px;
+    letter-spacing: 0.005em;
+  }
+  .ref-meta {
+    color: #5e5c55;
+    font-size: 10px;
+    margin-bottom: 4px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script type="text/babel" src="chrome.jsx"></script>
+  <script type="text/babel" src="surface-concierge.jsx"></script>
+  <script type="text/babel" src="surface-intelligence.jsx"></script>
+  <script type="text/babel" src="surface-agents.jsx"></script>
+  <script type="text/babel" src="surface-onboarding.jsx"></script>
+  <script type="text/babel" src="surface-attestation.jsx"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+
+  <script type="text/babel" data-presets="env,react">
+    const { useState, useEffect } = React;
+
+    const STATES = [
+      { surface: 'concierge',    state: 'empty',      label: 'Empty · suggested prompts' },
+      { surface: 'concierge',    state: 'active',     label: 'Active conversation' },
+      { surface: 'concierge',    state: 'thinking',   label: 'Loading · thinking' },
+      { surface: 'concierge',    state: 'error',      label: 'Error · substrate unreachable' },
+
+      { surface: 'intelligence', state: 'configured', label: 'All surfaces configured' },
+      { surface: 'intelligence', state: 'bulk',       label: 'Bulk apply ready' },
+      { surface: 'intelligence', state: 'failures',   label: 'Recent failures expanded' },
+      { surface: 'intelligence', state: 'modal',      label: 'Substrate switcher' },
+
+      { surface: 'agents',       state: 'inspect',    label: 'Agents list + inspect pane' },
+      { surface: 'agents',       state: 'empty',      label: 'Empty · wrap your first agent' },
+
+      { surface: 'onboarding',   state: 'welcome',    label: 'Welcome' },
+      { surface: 'onboarding',   state: 'substrate',  label: 'Substrate selection' },
+      { surface: 'onboarding',   state: 'success',    label: 'First round-trip · success' },
+      { surface: 'onboarding',   state: 'next',       label: 'Next steps' },
+
+      { surface: 'attestation',  state: 'gallery',    label: 'Badge gallery · all four classes' },
+    ];
+
+    const CAPTIONS = {
+      'concierge/empty':        'Concierge first-run state. Three suggested prompts surface what the substrate is for; calm green substrate badge in the header confirms it is local. Composer pinned bottom (rc.5 fix preserved). Serif headline, sans body, mono pills.',
+      'concierge/active':       'Active conversation, five turns. Operator messages right-aligned, dark; concierge messages left, paper-toned. Mono meta line under each concierge reply shows substrate and latency, with a per-action attestation chip.',
+      'concierge/thinking':     'Quietly active. The thinking indicator is its own bubble: three dots breathing, plain-language status. Does not lock input or shift layout.',
+      'concierge/error':        'Substrate unreachable. Inline ochre banner inside the chat, not a modal. Tells operator what happened, what did not happen, and gives two clear actions. Composer keeps the pending message; nothing was lost.',
+      'intelligence/configured':'Six surface cards, each with substrate, latency, healthy / degraded / unconfigured status using color + glyph. Bulk-apply affordance lives in the panel above. Page header explains routing in operator language.',
+      'intelligence/bulk':      'Bulk apply armed: the affordance flips into a primary action so the operator can land all six surfaces on one substrate, then override. Useful for first-wire.',
+      'intelligence/failures':  'Sentinel scoring expanded: last failures with class label, plain-language description, and a remediation hint. Two failures shown; both end with "what to try."',
+      'intelligence/modal':     'Substrate switcher modal. Four options surfaced as plain-English tradeoffs, not benchmark numbers. Paste-key affordance for paid surfaces. Stored encrypted on the fortress, surfaced as one-line guarantee.',
+      'agents/inspect':         'Four wrapped agents with state dots that gently pulse when live; selected row shows the inspect pane on the right. Five inspect sections cleanly separated: pending approvals, recent activity, policy summary, identity, 24h timeline.',
+      'agents/empty':           'No agents wrapped yet. Concentric ring icon (no medieval shapes), serif headline, plain-language pitch, terminal command on its own line with a copy button. Single primary CTA.',
+      'onboarding/welcome':     'Welcome state. Calm, accomplished tone. Three-step preview cards underneath. No celebration. Setup can be skipped at any time.',
+      'onboarding/substrate':   'Substrate selection. Three options described as tradeoffs in plain English ("private by default", "payloads pass through their host"), not jargon. Local pre-selected because ollama was detected.',
+      'onboarding/success':     'First round-trip success. The receipt frames it: routed through, latency, egress, signed by, recorded at. The closing paragraph names the product idea in one sentence.',
+      'onboarding/next':        'Three next-step cards. Wrap an agent. Configure substrates. Read a bit. No SaaS-template celebration; just three plain doors.',
+      'attestation/gallery':    'Four badge classes, each with their states. Global is a circle; per-agent is a square (chip); per-action is a tick; custody is a dashed circle clearly stubbed. Tooltip pattern at the bottom shows the degrade-not-destroy failure mode.',
+    };
+
+    function App() {
+      const [theme, setTheme] = useState('light');
+      const [idx, setIdx] = useState(0);
+      const cfg = STATES[idx];
+      const isOnboarding = cfg.surface === 'onboarding';
+      const isAttestation = cfg.surface === 'attestation';
+
+      useEffect(() => {
+        document.body.setAttribute('data-shell-dark', theme === 'dark' ? '1' : '0');
+      }, [theme]);
+
+      const captionKey = `${cfg.surface}/${cfg.state}`;
+
+      // Group states by surface
+      const groups = STATES.reduce((acc, s, i) => {
+        const k = s.surface;
+        if (!acc[k]) acc[k] = [];
+        acc[k].push({ ...s, i });
+        return acc;
+      }, {});
+      const groupOrder = ['concierge', 'intelligence', 'agents', 'onboarding', 'attestation'];
+      const groupTitles = {
+        concierge: '01 · Concierge',
+        intelligence: '02 · Intelligence',
+        agents: '03 · Agents',
+        onboarding: '04 · Onboarding',
+        attestation: '05 · Attestation',
+      };
+
+      const renderSurface = () => {
+        switch (cfg.surface) {
+          case 'concierge':    return <ConciergeSurface state={cfg.state} />;
+          case 'intelligence': return <IntelligenceSurface state={cfg.state} />;
+          case 'agents':       return <AgentsSurface state={cfg.state} />;
+          case 'onboarding':   return <OnboardingSurface state={cfg.state} />;
+          case 'attestation':  return <AttestationSurface />;
+        }
+      };
+
+      // Onboarding + attestation: full-bleed (no fortress column)
+      const fullBleed = isOnboarding;
+      const noFortress = isOnboarding || isAttestation;
+
+      return (
+        <div className="ref-shell">
+          <aside className="ref-nav">
+            <h1>Sanctuary v1.2</h1>
+            <p className="sub">Sprint Piece 2 · visual references<br/>5 surfaces · 15 states · 2 themes</p>
+
+            <div className="ref-theme-row">
+              <button className={`ref-theme-btn ${theme==='light'?'active':''}`} onClick={() => setTheme('light')}>light</button>
+              <button className={`ref-theme-btn ${theme==='dark'?'active':''}`} onClick={() => setTheme('dark')}>dark</button>
+            </div>
+
+            {groupOrder.map(g => (
+              <div key={g} className="ref-group">
+                <h2>{groupTitles[g]}</h2>
+                {groups[g].map(s => (
+                  <button
+                    key={s.i}
+                    className={`ref-state ${idx === s.i ? 'active' : ''}`}
+                    onClick={() => setIdx(s.i)}
+                    data-screen-label={`${groupTitles[g]} · ${s.label}`}
+                  >
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+            ))}
+          </aside>
+
+          <div className="ref-frame">
+            <div className="ref-frame-inner" data-theme={theme} data-screen-label={`${cfg.surface}/${cfg.state}/${theme}`}>
+              <div className={`app ${noFortress ? 'no-fortress' : ''}`}>
+                <Sidebar surface={cfg.surface} />
+                <Topbar attestationState={cfg.state === 'error' ? 'degraded' : 'verified'} />
+                <main className="main">
+                  {renderSurface()}
+                </main>
+                {!noFortress && <FortressColumn />}
+              </div>
+            </div>
+
+            <div className="ref-caption">
+              <div className="ref-meta">{cfg.surface} / {cfg.state} / {theme}</div>
+              <strong>{cfg.label}</strong>
+              {CAPTIONS[captionKey]}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
