@@ -690,6 +690,294 @@ body {
 .tier1-approval-card .actions {
   display: flex; gap: var(--space-2); flex-wrap: wrap;
 }
+/* Sprint Piece 2 PR 4 (2026-05-04): Agents view + Inspect pane polish.
+ * Translates Claude Design references at
+ * server/docs/design-refs/sprint-piece-2/surface-agents.jsx and the
+ * Surface 3 block of surfaces.css. The fortress-column .agent-row,
+ * .agent-row-head, and .agent-row-actions rules above are kept verbatim
+ * because Finding DD tests pin them; the new Agents-view list scopes
+ * its grid layout under .agents-list (descendant selector) so the
+ * fortress-column rules are unaffected. The inspect pane combines the
+ * existing .card surface with .inspect-pane structure (sticky right
+ * rail, internal scroll, sectioned body) for the agent-detail view.
+ */
+.agents-wrap { max-width: 1080px; margin: 0 auto; }
+.agents-layout {
+  display: grid;
+  grid-template-columns: 1fr 420px;
+  gap: 20px;
+  align-items: start;
+}
+.agents-list {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-lg);
+  overflow: hidden;
+}
+.agents-list-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 110px 120px 88px;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--paper-2);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.agents-list .agent-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 110px 120px 88px;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--rule);
+  align-items: center;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.agents-list .agent-row:last-child { border-bottom: 0; }
+.agents-list .agent-row:hover { background: var(--paper-2); }
+.agents-list .agent-row.selected {
+  background: var(--paper-2);
+  box-shadow: inset 3px 0 0 var(--ink);
+}
+.agent-identity { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.agent-glyph {
+  width: 28px; height: 28px;
+  border-radius: var(--rad);
+  background: var(--paper-3);
+  border: 1px solid var(--rule);
+  display: grid; place-items: center;
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  font-weight: 600;
+}
+.agent-name {
+  display: flex; flex-direction: column; min-width: 0;
+}
+.agent-name strong {
+  font-size: var(--text-base); font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.agent-name small {
+  font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: block;
+}
+.agent-state {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: var(--text-xs);
+  font-family: var(--mono);
+}
+.state-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--ink-4);
+}
+.state-dot.live { background: var(--sage); animation: pulse-soft 2.4s ease-in-out infinite; }
+.state-dot.idle { background: var(--ochre); }
+.state-dot.off { background: var(--ink-4); }
+@keyframes pulse-soft {
+  0%, 100% { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
+  50% { box-shadow: 0 0 0 4px transparent; opacity: 0.7; }
+}
+.agent-last {
+  font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3);
+}
+/* Inspect pane (combined with .card outer wrapper for the
+ * renderAgentInspectPanel return-shape regex anchored in
+ * dashboard-welcome.test.ts:152). The .inspect-pane modifier overrides
+ * .card padding so internal sections control their own spacing.
+ */
+.inspect-pane {
+  padding: 0;
+  display: flex; flex-direction: column;
+  position: sticky;
+  top: 20px;
+  max-height: calc(100vh - 100px);
+  overflow: hidden;
+}
+.inspect-head {
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--rule);
+  display: flex; flex-direction: column; gap: 10px;
+}
+.inspect-head .row1 {
+  display: flex; align-items: center; gap: 10px;
+}
+.inspect-head h3 {
+  font-family: var(--serif); font-weight: 500;
+  font-size: 17px; margin: 0;
+}
+.inspect-head .meta {
+  display: flex; gap: 6px; flex-wrap: wrap;
+}
+.inspect-body {
+  overflow-y: auto;
+  padding: 4px 18px 18px;
+}
+.inspect-section {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--rule);
+}
+.inspect-section:last-child { border-bottom: 0; }
+.inspect-section h4 {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 10px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.inspect-section h4 .count {
+  font-family: var(--mono);
+  background: var(--paper-3);
+  border-radius: 999px;
+  padding: 1px 7px;
+  color: var(--ink-2);
+  font-size: 10px;
+}
+.approval-row {
+  background: var(--ochre-bg);
+  border: 1px solid var(--ochre);
+  border-radius: var(--rad);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.approval-row .what { font-size: var(--text-base); color: var(--ink); }
+.approval-row .what .pill { margin-right: 6px; }
+.approval-row .why {
+  font-size: var(--text-sm); color: var(--ink-2);
+  padding-left: 10px;
+  border-left: 2px solid var(--ochre);
+}
+.approval-row .actions { display: flex; gap: 6px; justify-content: flex-end; }
+.timeline {
+  display: flex; flex-direction: column; gap: 0;
+  position: relative;
+  padding-left: 14px;
+}
+.timeline::before {
+  content: "";
+  position: absolute;
+  left: 4px; top: 6px; bottom: 6px;
+  width: 1px;
+  background: var(--rule);
+}
+.timeline-item {
+  position: relative;
+  padding: 6px 0 10px;
+  font-size: var(--text-sm);
+}
+.timeline-item::before {
+  content: "";
+  position: absolute;
+  left: -14px; top: 11px;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 1.5px solid var(--ink-4);
+}
+.timeline-item.ok::before { border-color: var(--sage); }
+.timeline-item.warn::before { border-color: var(--ochre); }
+.timeline-item.fail::before { border-color: var(--rust); }
+.timeline-item .ts {
+  font-family: var(--mono); font-size: 10px;
+  color: var(--ink-3);
+  letter-spacing: 0.02em;
+}
+.timeline-item .what {
+  margin-top: 2px; color: var(--ink); font-size: var(--text-base);
+}
+.timeline-item .att {
+  margin-top: 4px;
+  display: inline-flex;
+}
+.policy-line {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 5px 0; font-size: var(--text-base);
+  border-bottom: 1px dashed var(--rule);
+}
+.policy-line:last-child { border-bottom: 0; }
+.policy-line .k { color: var(--ink-3); }
+.policy-line .v { font-family: var(--mono); font-size: var(--text-sm); color: var(--ink); }
+/* Empty-state block for when no agents are wrapped. The
+ * renderAgentsList empty-state branch begins with the literal
+ * '<h1>Agents</h1>' (regex-pinned in agents-empty-state-canary.test.ts)
+ * and the "No wrapped agents yet." copy is preserved verbatim.
+ */
+.agents-empty {
+  background: var(--surface);
+  border: 1px dashed var(--rule-2);
+  border-radius: var(--rad-lg);
+  padding: 56px 40px;
+  text-align: center;
+  max-width: 720px;
+  margin: 32px auto;
+}
+.agents-empty .icon-frame {
+  width: 64px; height: 64px;
+  margin: 0 auto 18px;
+  border: 1px solid var(--rule);
+  border-radius: 50%;
+  display: grid; place-items: center;
+  position: relative;
+}
+.agents-empty .icon-frame::before,
+.agents-empty .icon-frame::after {
+  content: "";
+  position: absolute;
+  border: 1px solid var(--rule);
+  border-radius: 50%;
+}
+.agents-empty .icon-frame::before { inset: -8px; opacity: 0.6; }
+.agents-empty .icon-frame::after { inset: -16px; opacity: 0.3; }
+.agents-empty .icon-frame .core {
+  width: 22px; height: 22px;
+  background: var(--ink);
+  border-radius: 50%;
+}
+.agents-empty h2 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: var(--text-xl);
+  margin: 0 0 8px;
+}
+.agents-empty p {
+  color: var(--ink-3);
+  margin: 0 0 20px;
+  font-size: var(--text-md);
+  line-height: 1.55;
+  max-width: 50ch;
+  margin-left: auto; margin-right: auto;
+}
+.terminal-block {
+  text-align: left;
+  background: var(--paper-3);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad);
+  padding: 14px 16px;
+  font-family: var(--mono);
+  font-size: var(--text-base);
+  margin: 0 auto 16px;
+  max-width: 480px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.terminal-block .cmd { color: var(--ink); }
+.terminal-block .cmd .prompt { color: var(--ink-3); margin-right: 8px; user-select: none; }
+.copy-btn {
+  background: transparent; border: 0;
+  color: var(--ink-3); cursor: pointer;
+  font-family: var(--mono); font-size: var(--text-xs);
+  padding: 2px 6px;
+  border-radius: var(--rad);
+}
+.copy-btn:hover { color: var(--ink); background: var(--paper-2); }
 @media (max-width: 1100px) {
   .app, .app.route-full { grid-template-columns: 56px 1fr; grid-template-areas: "sidebar topbar" "sidebar main"; }
   .fortress { display: none; }
@@ -701,6 +989,10 @@ body {
   .intel-row { grid-template-columns: 1fr; }
   .intel-grid { grid-template-columns: 1fr; }
   .intel-failure-row { grid-template-columns: 1fr; }
+  .agents-layout { grid-template-columns: 1fr; }
+  .agents-list-head, .agents-list .agent-row { grid-template-columns: minmax(0, 1fr) 90px 90px; }
+  .agents-list-head span:nth-child(4), .agents-list .agent-row > .agent-last { display: none; }
+  .inspect-pane { position: static; max-height: none; }
 }
 `;
 

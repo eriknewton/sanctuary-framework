@@ -663,19 +663,93 @@ function renderDashboardConcierge() {
 }
 
 // ── Render: agents list / detail ───────────────────────────────────────
+//
+// Sprint Piece 2 PR 4 polish: empty state uses .agents-empty with the
+// concentric icon-frame + a terminal-block CTA. Populated state uses the
+// .agents-layout grid with the .agents-list 4-column table (Agent /
+// State / Attestation / Last seen). The empty-state branch keeps the
+// literal '<h1>Agents</h1>' start and the "No wrapped agents yet." copy
+// because agents-empty-state-canary.test.ts pins both.
+function agentInitials(agentId) {
+  const tail = String(agentId || "").split(":").pop() || "";
+  const cleaned = tail.replace(/[^a-zA-Z0-9]/g, "");
+  return (cleaned.slice(0, 2) || "??").toUpperCase();
+}
+function agentStateClass(status) {
+  if (status === "active") return "live";
+  if (status === "locked_down" || status === "error") return "off";
+  return "idle";
+}
+function agentAttestationTone(status) {
+  if (status === "active") return { cls: "tone-verified", label: "verified" };
+  if (status === "locked_down") return { cls: "tone-locked", label: "locked" };
+  if (status === "error") return { cls: "tone-unverified", label: "unverified" };
+  return { cls: "tone-degraded", label: "degraded" };
+}
+function relTimeFromIso(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const diffMs = Date.now() - d.getTime();
+  const diffSec = Math.max(0, Math.floor(diffMs / 1000));
+  if (diffSec < 60) return diffSec + "s ago";
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return diffMin + "m ago";
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return diffHr + "h ago";
+  const diffDay = Math.floor(diffHr / 24);
+  return diffDay + "d ago";
+}
 function renderAgentsList() {
-  if (!state.agents.length) return '<h1>Agents</h1><p class="muted">No wrapped agents yet. Run <code>sanctuary wrap</code> to wrap a harness.</p>';
+  if (!state.agents.length) return '<h1>Agents</h1>' +
+    '<div class="agents-empty">' +
+      '<div class="icon-frame"><div class="core"></div></div>' +
+      '<h2>No wrapped agents yet.</h2>' +
+      '<p>Wrap an agent to give it a portable identity, a charter, and approval gates. Run <code>sanctuary wrap</code> in any project where your agent lives.</p>' +
+      '<div class="terminal-block"><span class="cmd"><span class="prompt">$</span>sanctuary wrap</span></div>' +
+    '</div>';
+  const count = state.agents.length;
+  const subCopy = count + ' wrapped. Click one to inspect its activity, policy, and pending approvals.';
   const rows = state.agents.map(function (a) {
     const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
-    const reason = a.status_reason_class ? (REASON_LABELS[a.status_reason_class] || "") : "";
-    return '<div class="row">' +
-      '<span class="glyph ' + map.glyph + '"></span>' +
-      '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong> <span class="muted mono">' + escHtml(a.harness) + '</span></div>' +
-      '<span class="pill" title="' + escHtml(reason) + '">' + escHtml(map.label) + '</span>' +
-      '<button class="btn" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">Open</button>' +
+    const dotCls = agentStateClass(a.status);
+    const att = agentAttestationTone(a.status);
+    const initials = agentInitials(a.agent_id);
+    const role = escHtml(a.harness) + (a.model_provider && a.model_provider.model_id ? ' · ' + escHtml(a.model_provider.model_id) : '');
+    const isSelected = state.selectedAgentId === a.agent_id;
+    return '<div class="agent-row' + (isSelected ? ' selected' : '') + '" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '" role="button" tabindex="0" title="Open inspect panel for ' + escHtml(a.agent_id) + '">' +
+      '<div class="agent-identity">' +
+        '<div class="agent-glyph">' + escHtml(initials) + '</div>' +
+        '<div class="agent-name">' +
+          '<strong>' + escHtml(a.agent_id) + '</strong>' +
+          '<small>' + role + '</small>' +
+        '</div>' +
+      '</div>' +
+      '<span class="agent-state">' +
+        '<span class="state-dot ' + dotCls + '"></span>' +
+        escHtml(map.label) +
+      '</span>' +
+      '<span class="pill ' + att.cls + '">' + escHtml(att.label) + '</span>' +
+      '<span class="agent-last">' + escHtml(relTimeFromIso(a.last_activity_at)) + '</span>' +
       '</div>';
   }).join("\n");
-  return '<h1>Agents</h1><div class="card">' + rows + '</div>';
+  return '<div class="agents-wrap">' +
+    '<div class="page-head">' +
+      '<div>' +
+        '<p class="eyebrow">Agents</p>' +
+        '<h1>Agents.</h1>' +
+        '<p class="sub">' + escHtml(subCopy) + '</p>' +
+      '</div>' +
+    '</div>' +
+    '<div class="agents-layout">' +
+      '<div class="agents-list">' +
+        '<div class="agents-list-head">' +
+          '<span>Agent</span><span>State</span><span>Attestation</span><span>Last seen</span>' +
+        '</div>' +
+        rows +
+      '</div>' +
+    '</div>' +
+  '</div>';
 }
 
 function renderAgentDetail() {
@@ -730,53 +804,96 @@ function renderAgentInspectPanel(agent) {
     : "";
 
   // State 2: panel loaded.
+  // Sprint Piece 2 PR 4 polish: outer wrapper combines .card with
+  // .inspect-pane (sticky right rail, internal scroll, sectioned body).
+  // The .card class is preserved so the rendered surface keeps its
+  // shared card chrome; .inspect-pane overrides .card padding so the
+  // inspect-head and inspect-body control their own spacing per design.
   if (panel) {
+    const att = agentAttestationTone(agent.status);
+    const dotCls = agentStateClass(agent.status);
+    const stateMap = STATUS_MAP[agent.status] || STATUS_MAP.unknown;
     const activity = (panel.recent_activity || []).slice(0, 20);
     const activityHtml = activity.length
-      ? activity.map(function (e) {
+      ? '<div class="timeline">' +
+        activity.map(function (e) {
           const t = renderTemplate(e.display_template_id, e.display_template_args);
-          return '<div class="row"><span class="muted mono">' + escHtml(shortTime(e.emitted_at)) + '</span><span>' + escHtml(t) + '</span></div>';
-        }).join("\n")
+          return '<div class="timeline-item ok">' +
+            '<div class="ts">' + escHtml(shortTime(e.emitted_at)) + '</div>' +
+            '<div class="what">' + escHtml(t) + '</div>' +
+            '</div>';
+        }).join("") +
+        '</div>'
       : '<p class="muted">No recent activity for this agent.</p>';
 
     const approvals = panel.pending_approvals || [];
     const approvalsHtml = approvals.length
       ? approvals.map(function (item) {
           const promptText = renderTemplate(item.display_template_id, item.display_template_args);
-          return '<div class="row">' +
-            '<span class="pill tone-info">' + escHtml(item.tier || "tier1") + '</span>' +
-            '<div class="grow">' + escHtml(promptText) + '</div>' +
-            '<button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '">Approve</button>' +
-            '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button>' +
+          return '<div class="approval-row">' +
+            '<div class="what">' +
+              '<span class="pill tone-degraded">' + escHtml(item.tier || "tier1") + '</span>' +
+              escHtml(promptText) +
+            '</div>' +
+            '<div class="actions">' +
+              '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button>' +
+              '<button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '">Approve once</button>' +
+            '</div>' +
             '</div>';
-        }).join("\n")
+        }).join("")
       : '<p class="muted">No pending approvals routed through this agent.</p>';
 
-    const policyLine = panel.policy_summary
-      ? '<dt>Policy</dt><dd class="mono">' + escHtml(panel.policy_summary.display_label || panel.policy_summary.policy_id) + '</dd>' +
+    const policySection = panel.policy_summary
+      ? '<div class="policy-line"><span class="k">Policy</span><span class="v">' + escHtml(panel.policy_summary.display_label || panel.policy_summary.policy_id) + '</span></div>' +
         (panel.policy_summary.channel_template_id
-          ? '<dt>Template</dt><dd class="mono">' + escHtml(panel.policy_summary.channel_template_id) + '</dd>'
+          ? '<div class="policy-line"><span class="k">Template</span><span class="v">' + escHtml(panel.policy_summary.channel_template_id) + '</span></div>'
           : '') +
-        '<dt>Bound</dt><dd class="mono">' + escHtml(shortTime(panel.policy_summary.bound_at)) + '</dd>'
-      : '<dt>Policy</dt><dd class="muted">No bound policy yet.</dd>';
+        '<div class="policy-line"><span class="k">Bound</span><span class="v">' + escHtml(shortTime(panel.policy_summary.bound_at)) + '</span></div>'
+      : '<div class="policy-line"><span class="k">Policy</span><span class="v">No bound policy yet.</span></div>';
 
-    return '<div class="card">' +
-      '<div class="concierge-header">' +
-        '<div class="concierge-persona"><strong>Inspect ' + escHtml(agent.agent_id) + '</strong> ' +
-          '<span class="muted">opened ' + escHtml(shortTime(panel.opened_at)) + '</span></div>' +
-        '<button class="btn" data-action="agent-inspect-open" data-agent-id="' + escHtml(agent.agent_id) + '">Refresh</button>' +
+    const modelLine = agent.model_provider
+      ? '<div class="policy-line"><span class="k">Model</span><span class="v">' + escHtml(agent.model_provider.vendor) + ' / ' + escHtml(agent.model_provider.model_id) + '</span></div>'
+      : '';
+
+    return '<div class="card inspect-pane">' +
+      '<div class="inspect-head">' +
+        '<div class="row1">' +
+          '<div class="agent-glyph">' + escHtml(agentInitials(agent.agent_id)) + '</div>' +
+          '<h3>' + escHtml(agent.agent_id) + '</h3>' +
+          '<span style="margin-left:auto;"><span class="pill ' + att.cls + '">' + escHtml(att.label) + '</span></span>' +
+        '</div>' +
+        '<div class="meta">' +
+          '<span class="pill ' + (dotCls === "live" ? "tone-verified" : "tone-degraded") + '"><span class="state-dot ' + dotCls + '" style="margin-right:4px;"></span>' + escHtml(stateMap.label) + '</span>' +
+          '<span class="pill">opened ' + escHtml(shortTime(panel.opened_at)) + '</span>' +
+          '<button class="btn btn-quiet" data-action="agent-inspect-open" data-agent-id="' + escHtml(agent.agent_id) + '" title="Refresh inspect panel">Refresh</button>' +
+        '</div>' +
       '</div>' +
-      errorBanner +
-      '<h3>Pending approvals</h3>' +
-      approvalsHtml +
-      '<h3 style="margin-top:14px;">Recent activity</h3>' +
-      activityHtml +
-      '<h3 style="margin-top:14px;">Policy</h3>' +
-      '<dl class="kv">' + policyLine + '</dl>' +
-      '<p class="muted" style="margin-top:10px;font-size:12px;">' +
-        '<a href="#activity?agent=' + escHtml(agent.agent_id) + '">View full activity</a> · ' +
-        '<a href="#policy">Edit policy</a>' +
-      '</p>' +
+      '<div class="inspect-body">' +
+        errorBanner +
+        '<div class="inspect-section">' +
+          '<h4>Pending approvals' + (approvals.length ? ' <span class="count">' + approvals.length + '</span>' : '') + '</h4>' +
+          approvalsHtml +
+        '</div>' +
+        '<div class="inspect-section">' +
+          '<h4>Recent activity</h4>' +
+          activityHtml +
+        '</div>' +
+        '<div class="inspect-section">' +
+          '<h4>Policy summary</h4>' +
+          policySection +
+        '</div>' +
+        '<div class="inspect-section">' +
+          '<h4>Identity</h4>' +
+          '<div class="policy-line"><span class="k">Agent id</span><span class="v">' + escHtml(agent.agent_id) + '</span></div>' +
+          '<div class="policy-line"><span class="k">Harness</span><span class="v">' + escHtml(agent.harness) + '</span></div>' +
+          modelLine +
+          '<div class="policy-line"><span class="k">Wrapped at</span><span class="v">' + escHtml(shortTime(agent.wrapped_at)) + '</span></div>' +
+        '</div>' +
+        '<p class="muted" style="margin-top:10px;font-size:12px;">' +
+          '<a href="#activity?agent=' + escHtml(agent.agent_id) + '">View full activity</a> · ' +
+          '<a href="#policy">Edit policy</a>' +
+        '</p>' +
+      '</div>' +
     '</div>';
   }
 
