@@ -1,0 +1,176 @@
+/**
+ * Castle Wall IPC message shapes.
+ *
+ * Wire shape: JSON-RPC 2.0 over LSP-style framing on Linux (Unix domain socket
+ * at `/run/sanctuary/<fortress-id>/filter.sock`); NSXPCConnection on macOS to
+ * Mach service `org.sanctuary-framework.castle-wall.xpc`. Both transports carry
+ * the same JSON message bodies; only the framing and authentication differ.
+ *
+ * Source: Castle Wall Phase 1 Scope Lock 2026-05-03 section 5 Option A
+ * recommendation, including the post-Codex amendments (locked-state semantics,
+ * prompt coalescing, replay protection).
+ *
+ * Subsequent PRs:
+ * - PR 2 implements the Linux daemon side and the SO_PEERCRED + Ed25519
+ *   challenge-response handshake.
+ * - PR 3 implements the macOS XPC adapter against the same message shapes.
+ * - PR 4 wires the `prompt_request` and `prompt_response` flow into the
+ *   Sanctuary main dashboard surface.
+ */
+
+import type { CastleWallAuditEvent } from "../audit/events.js";
+
+/** JSON-RPC 2.0 request id. The daemon and main both generate these as 16-byte hex. */
+export type IpcRequestId = string;
+
+/** Tagged union of every Castle Wall IPC message body. */
+export type CastleWallMessage =
+  | StatusRequest
+  | StatusResponse
+  | PolicyReloadRequest
+  | PolicyReloadResponse
+  | DecisionRequest
+  | DecisionResponse
+  | AuditEmitNotification
+  | AuditEmitMetricBatchNotification
+  | UnlockNotification
+  | LockNotification
+  | HandshakeChallenge
+  | HandshakeResponse;
+
+/** Request from main to daemon: "are you alive?" */
+export interface StatusRequest {
+  type: "status_request";
+  request_id: IpcRequestId;
+}
+
+/** Response from daemon to main carrying liveness + last loaded manifest fingerprint. */
+export interface StatusResponse {
+  type: "status_response";
+  request_id: IpcRequestId;
+  uptime_seconds: number;
+  loaded_manifest_signature_b64url: string | null;
+  loaded_rule_count: number;
+  no_wall_engaged: boolean;
+}
+
+/** Request from main to daemon: "manifest changed; re-read." */
+export interface PolicyReloadRequest {
+  type: "policy_reload_request";
+  request_id: IpcRequestId;
+  manifest_path: string;
+}
+
+/** Response from daemon to main confirming reload outcome. */
+export interface PolicyReloadResponse {
+  type: "policy_reload_response";
+  request_id: IpcRequestId;
+  ok: boolean;
+  loaded_manifest_signature_b64url: string | null;
+  loaded_rule_count: number;
+  error?: string;
+}
+
+/**
+ * Destination details captured by the filter daemon at flow inception.
+ * The `hostname_source` label tells main how confidently the host string
+ * was derived; opaque flows surface a confidence-warning UI per scope-lock
+ * E6.3.
+ */
+export interface IpcDestination {
+  host: string | null;
+  ip: string;
+  port: number;
+  protocol: "tcp" | "udp";
+  hostname_source: "dns" | "sni" | "url" | "socket" | null;
+  opaque: boolean;
+}
+
+/** Agent attribution sent with every novel-destination prompt request. */
+export interface IpcAgentAttribution {
+  id: string;
+  template: string;
+}
+
+/** Request from daemon to main: "novel destination; need operator decision." */
+export interface DecisionRequest {
+  type: "decision_request";
+  request_id: IpcRequestId;
+  surface: "egress";
+  destination: IpcDestination;
+  agent: IpcAgentAttribution;
+  timeout_seconds: number;
+}
+
+/** Granularity at which the operator's "always" choice is persisted. */
+export type LearnedGranularity =
+  | "per_template_domain"
+  | "per_template_etld1"
+  | "per_instance_domain";
+
+/** The four decision values the operator can pick on a novel-destination prompt, plus the timeout-default. */
+export type DecisionValue =
+  | "allow_once"
+  | "allow_always"
+  | "deny_once"
+  | "deny_always"
+  | "timeout_default_deny";
+
+/** Response from main to daemon carrying the operator's decision. */
+export interface DecisionResponse {
+  type: "decision_response";
+  request_id: IpcRequestId;
+  decision: DecisionValue;
+  learn?: {
+    granularity: LearnedGranularity;
+  };
+}
+
+/** One-way notification from daemon to main: "block / allow / decision happened; log it." */
+export interface AuditEmitNotification {
+  type: "audit_emit";
+  event: CastleWallAuditEvent;
+}
+
+/** Aggregate metric batch (per scope-lock section 8 Option D metric path). */
+export interface AuditEmitMetricBatchNotification {
+  type: "audit_emit_metric_batch";
+  window_start: string;
+  window_end: string;
+  by_destination: Array<{
+    host: string | null;
+    port: number;
+    protocol: "tcp" | "udp";
+    agent_id: string;
+    allowed_count: number;
+    blocked_count: number;
+  }>;
+}
+
+/** Notification from main to daemon: "fortress unlocked; accept policy mutations." */
+export interface UnlockNotification {
+  type: "unlock_notification";
+  fortress_id: string;
+  unlocked_at: string;
+}
+
+/** Notification from main to daemon: "fortress locked; serve last validated snapshot." */
+export interface LockNotification {
+  type: "lock_notification";
+  fortress_id: string;
+  locked_at: string;
+}
+
+/** Daemon-to-main challenge issued on connect (Linux UDS handshake). */
+export interface HandshakeChallenge {
+  type: "handshake_challenge";
+  nonce_b64url: string;
+}
+
+/** Main-to-daemon handshake response signed by the fortress identity key. */
+export interface HandshakeResponse {
+  type: "handshake_response";
+  fortress_id: string;
+  signing_key_id: string;
+  nonce_signature_b64url: string;
+}
