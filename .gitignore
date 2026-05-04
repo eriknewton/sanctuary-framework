@@ -40,3 +40,7 @@ menubar/.vite/
 # Playwright e2e (v1.2.0-rc.4)
 server/playwright-report/
 server/test-results/
+
+# Castle Wall daemon Rust artifacts
+castle-wall-daemon/target/
+castle-wall-daemon/Cargo.lock

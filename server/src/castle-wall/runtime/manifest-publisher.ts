@@ -1,0 +1,180 @@
+/**
+ * Manifest publisher: signs the allowlist manifest and atomic-renames it
+ * over the watched location.
+ *
+ * Per scope-lock §4 Option A: rule files written first, then `manifest.json`
+ * written via fs.write + fs.rename so the daemon's inotify watcher only ever
+ * sees a fully-signed, fully-coherent manifest. POSIX rename is atomic on
+ * the same filesystem.
+ *
+ * Pure logic lives in `buildSignedManifest`; the filesystem write half is
+ * abstracted via a `ManifestStorage` interface so unit tests can run in a
+ * mock storage without touching disk.
+ */
+
+import { sha256 } from "@noble/hashes/sha256";
+
+import { canonicalize } from "../../mesh/canonical-json.js";
+import { stringToBytes, toBase64url } from "../../core/encoding.js";
+import { sign as identitySign } from "../../core/identity.js";
+import type { EncryptedPayload } from "../../core/encryption.js";
+import {
+  CASTLE_WALL_SCHEMA_VERSION_V1,
+  CASTLE_WALL_SIGNATURE_SCHEME_V1,
+} from "../constants.js";
+import type {
+  AllowlistManifest,
+  ManifestRuleEntry,
+  ManifestSignature,
+  SignedManifest,
+} from "../allowlist/manifest.js";
+import type { AllowlistRule } from "../allowlist/schema.js";
+import { RuntimeManifestPublishError } from "./errors.js";
+
+/** Encrypted private-key material the publisher uses to sign manifests. */
+export interface ManifestSigningKey {
+  signingKeyId: string;
+  encryptedPrivateKey: EncryptedPayload;
+  encryptionKey: Uint8Array;
+}
+
+/** Storage abstraction for the publish step. */
+export interface ManifestStorage {
+  /** Write rule file at the given relative path. Overwrites if present. */
+  writeRule(filename: string, bytes: Uint8Array): Promise<void>;
+  /** Atomically replace `manifest.json` with the given bytes. */
+  atomicRenameManifest(bytes: Uint8Array): Promise<void>;
+  /** List rule filenames currently present in the directory. */
+  listRules(): Promise<string[]>;
+  /** Remove a rule file. Used when an enabled rule is later disabled. */
+  removeRule(filename: string): Promise<void>;
+}
+
+/** Inputs to `buildSignedManifest`. */
+export interface BuildSignedManifestInput {
+  fortressId: string;
+  issuedAt: string;
+  rules: ReadonlyArray<AllowlistRule>;
+  signingKey: ManifestSigningKey;
+}
+
+/** Compute SHA-256 hex of UTF-8 bytes. */
+export function sha256Hex(bytes: Uint8Array): string {
+  const digest = sha256(bytes);
+  let hex = "";
+  for (let i = 0; i < digest.length; i++) {
+    const b = digest[i] ?? 0;
+    hex += b.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+/** Render a single rule to its canonical-JSON file bytes. */
+export function renderRuleFile(rule: AllowlistRule): Uint8Array {
+  return stringToBytes(canonicalize(rule));
+}
+
+/** Pure: produce a SignedManifest for a given rule set. No I/O. */
+export function buildSignedManifest(input: BuildSignedManifestInput): {
+  signed: SignedManifest;
+  ruleFiles: ReadonlyArray<{ filename: string; bytes: Uint8Array }>;
+} {
+  if (input.rules.length === 0) {
+    // PR 2a accepts an empty rule set; the daemon enforces default-deny on
+    // an empty manifest. Operators may install with no curated entries.
+  }
+  const seen = new Set<string>();
+  const entries: ManifestRuleEntry[] = [];
+  const ruleFiles: { filename: string; bytes: Uint8Array }[] = [];
+  for (const rule of input.rules) {
+    if (!rule.id || typeof rule.id !== "string") {
+      throw new RuntimeManifestPublishError("rule missing id");
+    }
+    if (seen.has(rule.id)) {
+      throw new RuntimeManifestPublishError(`duplicate rule id: ${rule.id}`);
+    }
+    seen.add(rule.id);
+    const filename = `${rule.id}.json`;
+    const bytes = renderRuleFile(rule);
+    const digest = sha256Hex(bytes);
+    entries.push({ rule_id: rule.id, file: filename, sha256: digest });
+    ruleFiles.push({ filename, bytes });
+  }
+  entries.sort((a, b) => a.rule_id.localeCompare(b.rule_id));
+
+  const manifest: AllowlistManifest = {
+    schema_version: CASTLE_WALL_SCHEMA_VERSION_V1,
+    fortress_id: input.fortressId,
+    issued_at: input.issuedAt,
+    rules: entries,
+  };
+
+  let signatureBytes: Uint8Array;
+  try {
+    const canonical = stringToBytes(canonicalize(manifest));
+    signatureBytes = identitySign(
+      canonical,
+      input.signingKey.encryptedPrivateKey,
+      input.signingKey.encryptionKey
+    );
+  } catch (err) {
+    throw new RuntimeManifestPublishError(
+      `manifest signing failed: ${(err as Error).message}`
+    );
+  }
+
+  const signature: ManifestSignature = {
+    signature_scheme: CASTLE_WALL_SIGNATURE_SCHEME_V1,
+    signing_key_id: input.signingKey.signingKeyId,
+    signature_b64url: toBase64url(signatureBytes),
+  };
+
+  return {
+    signed: { manifest, signature },
+    ruleFiles,
+  };
+}
+
+/** Render the SignedManifest to its on-disk JSON bytes. */
+export function renderSignedManifest(signed: SignedManifest): Uint8Array {
+  return stringToBytes(canonicalize(signed));
+}
+
+/**
+ * Publish: write rule files, then atomic-rename `manifest.json`. Removes
+ * orphaned rule files (rules that are no longer referenced) AFTER the new
+ * manifest is in place per scope-lock §4 atomicity rules (rule files are
+ * removed only after the manifest stops referencing them).
+ */
+export async function publishSignedManifest(
+  input: BuildSignedManifestInput,
+  storage: ManifestStorage
+): Promise<{
+  signed: SignedManifest;
+  written_rule_filenames: string[];
+  removed_rule_filenames: string[];
+}> {
+  const { signed, ruleFiles } = buildSignedManifest(input);
+  const newFilenames = new Set<string>(ruleFiles.map((f) => f.filename));
+
+  for (const file of ruleFiles) {
+    await storage.writeRule(file.filename, file.bytes);
+  }
+
+  await storage.atomicRenameManifest(renderSignedManifest(signed));
+
+  const existing = await storage.listRules();
+  const removedRules: string[] = [];
+  for (const name of existing) {
+    if (name === "manifest.json") continue;
+    if (newFilenames.has(name)) continue;
+    await storage.removeRule(name);
+    removedRules.push(name);
+  }
+
+  return {
+    signed,
+    written_rule_filenames: ruleFiles.map((f) => f.filename),
+    removed_rule_filenames: removedRules,
+  };
+}
