@@ -220,7 +220,7 @@ Hotfix release. Closes the v1.1.0 release-blocker (recovery key truncated on dis
 - `publishV11Event` SSE producer extension is queued in v1.1.x housekeeping. Hub events do not yet fan out to `/api/stream` consumers in real time; the dashboard polls instead.
 - Pre-existing CLI em-dash sweep in `server/src/cli.ts` continues as v1.0.2 (k); some sites already swept in PR #76 and PR #80, residual sites tracked separately.
 
-## v1.1.0 — Local Sovereignty Harness (2026-04-25)
+## v1.1.0: Local Sovereignty Harness (2026-04-25)
 
 Sanctuary v1.1 ships the complete Local Sovereignty Harness for running and governing AI agents on operator-owned hardware. v1.1.0 is the first stable release on the 1.x line and the first that pilots can install to `latest` for production use. v1.0.0 GA tag is intentionally skipped (1.0.0-rc.2 was the precursor; 1.1.0 is a strict superset).
 
@@ -286,7 +286,7 @@ The release adds four new pillars on top of v0.10.6 / v1.0.0-rc.2: query privacy
 
 - **Per-agent Tier 1 lockdown approve handler emits lifecycle activity** (PR #79). `server/src/hub/hub-service.ts:267-300` now appends `agent_lockdown_engaged` (and `agent_unwrap_engaged` for the parallel path) to the audit log on successful per-agent Tier 1 approval. The per-agent path now mirrors the fortress-scope handler that PR #77 shipped.
 
-- **CHANGELOG.md `v0.9.0-rc.3 (unreleased — in progress)` orphan section** (PR #80, fix #11). Removed; the rc.3 work shipped under `v0.9.0` final and the placeholder no longer represented unfinished work.
+- **CHANGELOG.md `v0.9.0-rc.3 (unreleased, in progress)` orphan section** (PR #80, fix #11). Removed; the rc.3 work shipped under `v0.9.0` final and the placeholder no longer represented unfinished work.
 
 - **Stray empty `main` file at repo root** (PR #80, fix #16). Deleted. Predated the v1.1 audit window (introduced at v0.5.6 commit `0daa8eb`).
 
@@ -302,9 +302,9 @@ The release adds four new pillars on top of v0.10.6 / v1.0.0-rc.2: query privacy
 
 ### Deferred (out of v1.1 scope)
 
-- **v1.4+ Crypto Agility Sprint** — bundled next-generation messaging-layer-security plus ML-DSA / ML-KEM-768 hybrid primitives. The `@noble/curves` and `@noble/hashes` v1 -> v2 majors gate on this sprint.
-- **v1.2 Mobile Operator Companion** — phone as approval surface, inbox, and emergency brake. Not a full mobile runtime.
-- **v1.3 Public Federation** — cross-operator discovery, messaging, and reputation.
+- **v1.4+ Crypto Agility Sprint**: bundled next-generation messaging-layer-security plus ML-DSA / ML-KEM-768 hybrid primitives. The `@noble/curves` and `@noble/hashes` v1 -> v2 majors gate on this sprint.
+- **v1.2 Mobile Operator Companion**: phone as approval surface, inbox, and emergency brake. Not a full mobile runtime.
+- **v1.3 Public Federation**: cross-operator discovery, messaging, and reputation.
 - **v1.4+ Key 17 sovereign-signer adapter** for x402 / Agentic.Market payments. Sanctuary signs Identity + x402 requests + AP2 mandates; Verascore signs Reputation + Validation; x402 wallets stay Coinbase-custodial.
 - **v1.4+ EU AI Act compliance generator** (operator-facing tool, not a Sanctuary-binding obligation).
 - **v1.4+ MSP / Fleet Operator Console** for service providers running agents on behalf of clients.
@@ -463,23 +463,23 @@ dead-claim purge); README rewrite for agent-mediated install (#54).
 ## v0.10.6 (2026-04-20)
 
 ### Fixed
-- **Standalone dashboard reload-loop on a fresh browser tab under loopback auto-auth.** Field signal: Mini1 on v0.10.5 confirmed the SSE URL fix (`/api/events` → `/events`) landed cleanly — every documented endpoint returns real data (`/events` streams, `/api/sovereignty-profile` = 200, `/api/proxy/servers` = 200). But the UI still did not render. Mac Mini devtools Network capture (Web Inspector, preserve-log ON) showed the real shape: dozens of identical ~82.91 KB `127.0.0.1` document requests stacked at page-open, zero `fetch(...)` or `EventSource(...)` traffic. A tight client-side reload loop before any data-fetch fires.
+- **Standalone dashboard reload-loop on a fresh browser tab under loopback auto-auth.** Field signal: Mini1 on v0.10.5 confirmed the SSE URL fix (`/api/events` → `/events`) landed cleanly. Every documented endpoint returns real data (`/events` streams, `/api/sovereignty-profile` = 200, `/api/proxy/servers` = 200). But the UI still did not render. Mac Mini devtools Network capture (Web Inspector, preserve-log ON) showed the real shape: dozens of identical ~82.91 KB `127.0.0.1` document requests stacked at page-open, zero `fetch(...)` or `EventSource(...)` traffic. A tight client-side reload loop before any data-fetch fires.
 - Root cause: `initialize()` in `server/src/principal-policy/dashboard-html.ts` gated on `sessionStorage.authToken` with `if (!AUTH_TOKEN) { redirectToLogin(); return; }` (line 2909). On a fresh tab at `127.0.0.1:PORT/`, `sessionStorage` is always empty, so `AUTH_TOKEN === ''` and `redirectToLogin()` fires, setting `window.location.href = '/'`. The server serves the dashboard HTML (not the login page) because `isAuthenticated()` recognizes loopback callers under `_autoAuthLocalhost` (`dashboard.ts:458`). Same URL, same server, same auto-auth → HTML served again → JS runs again → still empty sessionStorage → redirect again. **Infinite.**
 - Server-side loopback auto-auth, no client-side mirror. The fix adds a `loopbackAutoAuth: boolean` option to `generateDashboardHTML`, emits `const LOOPBACK_AUTH = <bool>;` alongside `AUTH_TOKEN` at template boot, and changes the init gate to `if (!AUTH_TOKEN && !LOOPBACK_AUTH)`. `dashboard.setAutoAuthLocalhost()` now regenerates the cached HTML since the flag is decided after construction.
 
 ### Added
 - Regression test (`test/dashboard-standalone-v010-6.test.ts`, 4 tests) that exercises the browser init path the v0.10.5 test gap missed. Boots a real dashboard against a real seeded tenant, fetches the served HTML, asserts `LOOPBACK_AUTH = true` is embedded, and executes the actual init gate against stubbed browser globals (empty `sessionStorage`, recording `window.location.href` assignments) to prove no redirect fires. Includes the flip-side assertion: with `loopbackAutoAuth=false` and empty sessionStorage, the gate MUST still redirect to the login page (remote-deployment guard).
-- All 4 tests fail on v0.10.5 HEAD (`dcfa4c8`) and pass after the patch — both directions verified before merge.
+- All 4 tests fail on v0.10.5 HEAD (`dcfa4c8`) and pass after the patch; both directions verified before merge.
 
 ### Notes
-- Test-coverage gap, not test-correctness bug: v0.10.5's `dashboard-standalone-v010-5.test.ts` regex-extracted URLs from the served HTML and HTTP-requested each. All routes returned non-4xx — correct. But Node has no `sessionStorage`, so the test never exercised the client-side `initialize()` path where empty sessionStorage triggered the redirect before any fetch fired. v0.10.6 closes this by executing the gate against realistic inputs, not just asserting route mounting.
-- Fix shape chosen: server-baked flag mirror, rejecting the alternative "remove the init gate entirely and let per-fetch 401 handlers drive redirects." Gate-removal would create a brief window where several parallel fetches each 401 and each queue a redirect before the first `location.href = '/'` navigation takes effect — noisy in devtools logs and harder to reason about than the explicit flag. The flag shape is also consistent with how the rest of the codebase mirrors server-side decisions (timeout, server version, API base) into inline template constants.
+- Test-coverage gap, not test-correctness bug: v0.10.5's `dashboard-standalone-v010-5.test.ts` regex-extracted URLs from the served HTML and HTTP-requested each. All routes returned non-4xx, correct. But Node has no `sessionStorage`, so the test never exercised the client-side `initialize()` path where empty sessionStorage triggered the redirect before any fetch fired. v0.10.6 closes this by executing the gate against realistic inputs, not just asserting route mounting.
+- Fix shape chosen: server-baked flag mirror, rejecting the alternative "remove the init gate entirely and let per-fetch 401 handlers drive redirects." Gate-removal would create a brief window where several parallel fetches each 401 and each queue a redirect before the first `location.href = '/'` navigation takes effect, noisy in devtools logs and harder to reason about than the explicit flag. The flag shape is also consistent with how the rest of the codebase mirrors server-side decisions (timeout, server version, API base) into inline template constants.
 - `.test-baseline` floor raised from 1664 → 1668 (+4 regression tests). Linux-CI-safe floor; macOS reports 1704.
 
 ## v0.10.5 (2026-04-19)
 
 ### Fixed
-- **Standalone dashboard panels stuck on "Loading…" even after v0.10.4 loaded identities.** Field signal: Mini1 on v0.10.4 reported `Identities loaded: 8` (the v0.10.4 acceptance) but every panel in the browser stayed empty and the status bar flashed blue in a retry loop. Root cause: the dashboard HTML's SSE setup pointed `EventSource` at `/api/events`, but Stack A's server mounts SSE at `/events` (server/src/principal-policy/dashboard.ts:688). Every dashboard boot from v0.10.0 through v0.10.4 sent EventSource into a 404 retry loop. The same code also passed `{ headers: { Authorization: ... } }` to the EventSource constructor, which the standard browser API silently drops — auth has to travel as a cookie or `?session=` query param for SSE.
+- **Standalone dashboard panels stuck on "Loading…" even after v0.10.4 loaded identities.** Field signal: Mini1 on v0.10.4 reported `Identities loaded: 8` (the v0.10.4 acceptance) but every panel in the browser stayed empty and the status bar flashed blue in a retry loop. Root cause: the dashboard HTML's SSE setup pointed `EventSource` at `/api/events`, but Stack A's server mounts SSE at `/events` (server/src/principal-policy/dashboard.ts:688). Every dashboard boot from v0.10.0 through v0.10.4 sent EventSource into a 404 retry loop. The same code also passed `{ headers: { Authorization: ... } }` to the EventSource constructor, which the standard browser API silently drops. Auth has to travel as a cookie or `?session=` query param for SSE.
 - The fix is a minimum-change edit: change the URL from `/api/events` to `/events`, drop the broken headers option. The fortress-view dashboard (server/src/cocoon/fortress-view.ts) already does it this way; this commit brings the standard dashboard into line.
 
 ### Added
@@ -487,20 +487,20 @@ dead-claim purge); README rewrite for agent-mediated install (#54).
 
 ### Notes
 - v0.10.5 closes the route-table mismatch only. The Stack A vs Stack B architectural question (the standalone dashboard mounts the older "Principal Dashboard" stack from `server/src/principal-policy/`, while a newer "Protection Dashboard" stack in `server/src/dashboard/` is documented but not mounted) is **out of scope** here per the spawn prompt's hard-stop rule, and remains an open coordinator-level question.
-- Mini1's three `curl` 404s on `/api/health`, `/api/snapshot`, and `/api/agents` were Stack B routes — correct behaviour for what's actually running, unrelated to the panel-population failure. Documented in the PR audit trail.
+- Mini1's three `curl` 404s on `/api/health`, `/api/snapshot`, and `/api/agents` were Stack B routes, correct behaviour for what's actually running, unrelated to the panel-population failure. Documented in the PR audit trail.
 - `.test-baseline` floor raised from 1661 → 1664 (+3 regression tests). Linux-CI-safe floor; macOS reports 1700.
 
 ## v0.10.4 (2026-04-19)
 
 ### Fixed
-- **Standalone dashboard could not boot on a real multi-tenant install.** v0.10.2 shipped a fix that passed CI but did not land in the field — Mini1 saw `Identities loaded: 0` through v0.10.1 → v0.10.2 → v0.10.3. Root cause: the keychain entry per storage path (sha256-derived suffix) was correct, but the dashboard's default-root boot path could not reach the per-tenant entries, and its regression test mocked a wrong schema (one entry per identity, which is not how Sanctuary stores anything).
+- **Standalone dashboard could not boot on a real multi-tenant install.** v0.10.2 shipped a fix that passed CI but did not land in the field. Mini1 saw `Identities loaded: 0` through v0.10.1 → v0.10.2 → v0.10.3. Root cause: the keychain entry per storage path (sha256-derived suffix) was correct, but the dashboard's default-root boot path could not reach the per-tenant entries, and its regression test mocked a wrong schema (one entry per identity, which is not how Sanctuary stores anything).
 - `sanctuary dashboard` against a default root with orphan identity files and no resolvable passphrase now refuses with an actionable error that names the storage path and lists the wrapped tenants discoverable on the host. Pre-fix it threw "Provide SANCTUARY_PASSPHRASE" with no further context.
 - `sanctuary dashboard` against a clean default root that has no Sanctuary state but other wrapped tenants now refuses to fresh-install a recovery key over the default root. Pre-fix this obscured the real tenants.
 - `Encrypted identities found but NONE loaded` warning banner rewritten: removed the misleading `SANCTUARY_PASSPHRASE=<your-passphrase>` fix-hint, surfaced other discoverable tenants, and pointed at the new keychain-schema doc.
 
 ### Added
-- `sanctuary dashboard --tenant <name>` flag — resolves a tenant by the human-readable name printed by `sanctuary agents`, sets the per-tenant storage path internally, and looks up the matching Keychain item. The multi-tenant-safe boot path operators need.
-- `server/docs/keychain-schema.md` — canonical reference for how Sanctuary stores per-tenant passphrases (macOS Keychain entries, encrypted fallback files), the Argon2id key-derivation flow, the per-purpose HKDF subkeys, the multi-tenant directory layout, and diagnostic recipes.
+- `sanctuary dashboard --tenant <name>` flag: resolves a tenant by the human-readable name printed by `sanctuary agents`, sets the per-tenant storage path internally, and looks up the matching Keychain item. The multi-tenant-safe boot path operators need.
+- `server/docs/keychain-schema.md`: canonical reference for how Sanctuary stores per-tenant passphrases (macOS Keychain entries, encrypted fallback files), the Argon2id key-derivation flow, the per-purpose HKDF subkeys, the multi-tenant directory layout, and diagnostic recipes.
 - Regression test (`test/dashboard-standalone-v010-4.test.ts`) that builds real identity .enc files via the production `IdentityManager` + AES-256-GCM path and persists per-tenant passphrases via `persistUserProvidedPassphrase` exactly the way `sanctuary wrap` does. No keychain shape is mocked. The tests fail without this patch.
 
 ### Internal
@@ -512,25 +512,25 @@ dead-claim purge); README rewrite for agent-mediated install (#54).
 ### Changed
 - README hero rewritten for clarity: replaces "Security, privacy, and control for your AI agent." with "Your agent. Your machine. Your keys." and a concrete subhead naming the three things Sanctuary ships (encrypted memory, approval dashboard, portable cryptographic identity).
 - New "Why this matters" section earns the "sovereignty" framing after the value prop lands, rather than leading with the abstraction.
-- npm package description rewritten to match the new hero — "Your agent, your machine, your keys — an MCP server that adds encrypted state, approval gates, and a portable identity to any AI agent." (previous copy trained readers to mis-file the project as security architecture.)
+- npm package description rewritten to match the new hero. "Your agent, your machine, your keys, an MCP server that adds encrypted state, approval gates, and a portable identity to any AI agent." (previous copy trained readers to mis-file the project as security architecture.)
 
 No code changes. Messaging-clarity patch only.
 
 ## v0.9.0-rc.2 (2026-04-17)
 
 ### Security
-- **SEC-061** — Removed `--passphrase` flag from rewritten agent config (was persisting passphrase as plaintext in argv)
-- **SEC-062** — Fallback passphrase file now distinguishes NOT_FOUND vs UNREADABLE; never auto-regenerates on decrypt failure
+- **SEC-061**: Removed `--passphrase` flag from rewritten agent config (was persisting passphrase as plaintext in argv)
+- **SEC-062**: Fallback passphrase file now distinguishes NOT_FOUND vs UNREADABLE; never auto-regenerates on decrypt failure
 
 ### Added
 - `PassphraseUnreadableError` with remediation steps for failed decryption
-- `persistUserProvidedPassphrase()` — one-time passphrase setter that routes to Keychain/fallback
+- `persistUserProvidedPassphrase()`: one-time passphrase setter that routes to Keychain/fallback
 
 ## v0.9.0-rc.1 (2026-04-16)
 
 ### Added
-- **Sovereignty Dashboard** — unified single-page "you are protected" view with SSE live updates, approval gate integration, and auto-open in browser
-- **`sanctuary wrap`** — one-command agent wrapping (replaces the 6-step manual setup)
+- **Sovereignty Dashboard**: unified single-page "you are protected" view with SSE live updates, approval gate integration, and auto-open in browser
+- **`sanctuary wrap`**: one-command agent wrapping (replaces the 6-step manual setup)
 - macOS Keychain integration for passphrase storage
 - Dashboard screenshots in GitHub Release
 
@@ -559,9 +559,9 @@ No code changes. Messaging-clarity patch only.
 
 ---
 
-## [0.8.0] - unreleased — EU AI Act Compliance Artifact Generator (detailed)
+## [0.8.0] - unreleased: EU AI Act Compliance Artifact Generator (detailed)
 
-### Added — Phase 2
+### Added: Phase 2
 
 - **Annex III classification helper (Deliverable 1).** New module
   `server/src/compliance/eu_ai_act/annex_iii.ts` with a structured
@@ -574,8 +574,8 @@ No code changes. Messaging-clarity patch only.
   `classifyAgentDescription(text)` produces zero or more candidate
   categories with a `rule_based_confidence` score (sum of matched
   keyword weights clamped to `[0, 1]`). The confidence field is
-  deliberately named `rule_based_confidence` — not `confidence` or
-  `probability` — so downstream consumers cannot mistake the
+  deliberately named `rule_based_confidence`, not `confidence` or
+  `probability`, so downstream consumers cannot mistake the
   classifier for a machine-learning model. Classifier is exposed
   as a standalone MCP tool `compliance_eu_ai_act_annex_iii_classify`
   (Tier 3) and also auto-included as bundle document 07
@@ -601,7 +601,7 @@ No code changes. Messaging-clarity patch only.
   When enabled, POSTs the signed manifest (not the document bodies)
   to Verascore after the bundle is fully built. Reuses the exact
   wire format, signing path, and SSRF allow-list of the existing
-  `reputation_publish` tool — no second signing pipeline, no new
+  `reputation_publish` tool: no second signing pipeline, no new
   cryptography.
 
   **Non-dependency principle enforced at every layer:** HTTPS
@@ -624,18 +624,18 @@ No code changes. Messaging-clarity patch only.
   and a footer on every page showing the manifest SHA-256
   identifier prefix and page numbering.
 
-  The PDF is explicitly NOT cryptographically signed — integrity
+  The PDF is explicitly NOT cryptographically signed. Integrity
   verification remains with the Markdown files and the JSON
   manifest. The PDF is a human-readable render of those already-
   signed artifacts. macOS `file(1)` confirms the output is a
   valid "PDF document, version 1.4" and real PDF readers can open
   the example at `examples/eu_ai_act_bundle_example/bundle.pdf`.
 
-### Fixed — Phase 2
+### Fixed: Phase 2
 
-- **PDF footer overlay — truncate digest to 16 hex, ASCII separator, width guard.** The Phase 2 Deliverable 4 footer drew the left "Sanctuary EU AI Act Compliance Bundle · Manifest SHA-256: <48 hex>..." string and the right "Page N of M" label at the same Y baseline, overlapping on Letter-sized pages. Fixed by (a) truncating the footer digest prefix from 48 to 16 hex characters (64 bits — still collision-resistant for visual verification), (b) replacing the `·` middle-dot separator with a plain ASCII pipe `|` so the character substitution table doesn't garble it, and (c) adding an `assertFooterFits` width guard + `MIN_FOOTER_GUTTER = 24pt` constant that throws a recognisable error if left-footer width + right-label width + gutter exceeds the available column width. The guard is exported so the regression test can invoke it directly with pathological dimensions. The example HR bundle regenerated under `GENERATE_EXAMPLE=1` remains byte-stable across runs; only `bundle.pdf` changed relative to the pre-fix state (Markdown and JSON files are untouched). +4 tests on the PDF writer.
+- **PDF footer overlay: truncate digest to 16 hex, ASCII separator, width guard.** The Phase 2 Deliverable 4 footer drew the left "Sanctuary EU AI Act Compliance Bundle · Manifest SHA-256: <48 hex>..." string and the right "Page N of M" label at the same Y baseline, overlapping on Letter-sized pages. Fixed by (a) truncating the footer digest prefix from 48 to 16 hex characters (64 bits, still collision-resistant for visual verification), (b) replacing the `·` middle-dot separator with a plain ASCII pipe `|` so the character substitution table doesn't garble it, and (c) adding an `assertFooterFits` width guard + `MIN_FOOTER_GUTTER = 24pt` constant that throws a recognisable error if left-footer width + right-label width + gutter exceeds the available column width. The guard is exported so the regression test can invoke it directly with pathological dimensions. The example HR bundle regenerated under `GENERATE_EXAMPLE=1` remains byte-stable across runs; only `bundle.pdf` changed relative to the pre-fix state (Markdown and JSON files are untouched). +4 tests on the PDF writer.
 
-### Changed — Phase 2
+### Changed: Phase 2
 
 - **Example bundle is now byte-stable across regenerations.** The
   Phase 1 example fixture used real randomness in three places
@@ -645,7 +645,7 @@ No code changes. Messaging-clarity patch only.
   helper that uses a fixed 32-byte private key seed, a fixed IV
   for AES-GCM, and `vi.useFakeTimers` + `vi.setSystemTime` to
   freeze the clock during the example generation. No production
-  code changes — the fixture uses `@noble/curves/ed25519` and
+  code changes. The fixture uses `@noble/curves/ed25519` and
   `@noble/ciphers/aes.js` directly (both already dependencies).
   Verified byte-stable across two consecutive `GENERATE_EXAMPLE=1`
   runs.
@@ -657,13 +657,13 @@ No code changes. Messaging-clarity patch only.
   assertion "exactly 6 Markdown documents" is updated to "exactly
   7 Markdown documents and a manifest" for the default bundle.
 
-### Added — Phase 1
+### Added: Phase 1
 
 - **EU AI Act Compliance Artifact Generator.** New Sanctuary subsystem
   under `server/src/compliance/eu_ai_act/` that generates a signed
   bundle of technical compliance documents from a live Sanctuary
   runtime, aligned to Regulation (EU) 2024/1689.
-  - Coverage matrix v1 (`coverage_matrix.ts`) — 46 rows mapping
+  - Coverage matrix v1 (`coverage_matrix.ts`): 46 rows mapping
     Sanctuary primitives to Annex IV §1–§9, Article 12, Article 13,
     Article 14, Article 15, Article 19(1), and Article 26. Honest
     coverage distribution: **5 full rows** (11%, machine-verifiable
@@ -694,7 +694,7 @@ No code changes. Messaging-clarity patch only.
   - New CLI subcommand `sanctuary-mcp-server compliance eu-ai-act
     <agent-did>` with flags for deployment context, reporting
     period, and output directory.
-  - Example bundle under `examples/eu_ai_act_bundle_example/` — a
+  - Example bundle under `examples/eu_ai_act_bundle_example/`: a
     fictional Fortune 2000 enterprise deploying a high-risk Annex
     III §4 HR screening agent. Byte-stable across regeneration via
     the new `generated_at_override` input field. Verified end-to-end
@@ -747,51 +747,51 @@ No code changes. Messaging-clarity patch only.
   incident reports). Inaugural artifacts: the commit `4ac95830`
   postmortem and the test baseline hardening plan. Commit `eead299`.
 
-## [0.6.1] - 2026-04-04 — Security remediation pass
+## [0.6.1] - 2026-04-04: Security remediation pass
 
 ### Security
 
-- **DELTA-01 — domain separation in `sanctuary_sign_challenge`.** Tool now
+- **DELTA-01: domain separation in `sanctuary_sign_challenge`.** Tool now
   requires a `purpose` argument and signs
   `"sanctuary-sign-challenge-v1" || 0x00 || purpose || 0x00 || nonce`
   instead of raw nonce bytes. Raw-nonce signatures no longer verify;
   cross-purpose signatures do not verify. Prevents signature replay
   across verifiers.
-- **DELTA-05 — handshake auto-publish now signs its payload.** The
+- **DELTA-05: handshake auto-publish now signs its payload.** The
   outbound Verascore envelope carries body.signature (Ed25519 over
   JSON.stringify(data)) plus body.publicKey so /api/publish can
   verify it end-to-end.
-- **DELTA-04 — handshake auto-publish defaults to false.** When
+- **DELTA-04: handshake auto-publish defaults to false.** When
   enabled, the published envelope strips counterparty-identifying
   fields (counterparty_signed_by → "redacted") until explicit consent
   is wired through.
-- **DELTA-08 — `sanctuary_link_to_human` redacts target email.** Tool
+- **DELTA-08: `sanctuary_link_to_human` redacts target email.** Tool
   response now returns only `***@domain`; a compromised agent cannot
   read back which address it emailed.
-- **DELTA-17 — principal-policy tier alignment test.** New test
+- **DELTA-17: principal-policy tier alignment test.** New test
   asserts that sanctuary_bootstrap/export_identity_bundle are Tier 1,
   link_to_human/sign_challenge are Tier 2 (anomaly-gated), and
-  policy_status is Tier 3 — guards against future drift.
+  policy_status is Tier 3. Guards against future drift.
 
 ## [0.6.0] - 2026-04-04
 
 ### Added
 
-- **Quickstart package** (`@sanctuary-framework/quickstart@0.1.0`) — zero-dep
+- **Quickstart package** (`@sanctuary-framework/quickstart@0.1.0`): zero-dep
   `npx` CLI that generates an Ed25519 identity, writes `~/.sanctuary/quickstart-identity.json`
   (0600), and publishes a self-attested SHR to Verascore in under 60 seconds.
   E2E tested against a local node:http mock.
 - **5 new MCP tools** (brings total to 72+):
-  - `sanctuary/bootstrap` — one-shot setup (identity + bundle + quickstart JSON)
-  - `sanctuary/policy_status` — report current Principal Policy state
-  - `sanctuary/export_identity_bundle` — portable identity export
-  - `sanctuary/link_to_human` — bind an agent identity to a human principal
-  - `sanctuary/sign_challenge` — sign a Verascore claim nonce with the agent key
-- **Post-handshake auto-publish hook** — `handshake_respond` POSTs a handshake
+  - `sanctuary/bootstrap`: one-shot setup (identity + bundle + quickstart JSON)
+  - `sanctuary/policy_status`: report current Principal Policy state
+  - `sanctuary/export_identity_bundle`: portable identity export
+  - `sanctuary/link_to_human`: bind an agent identity to a human principal
+  - `sanctuary/sign_challenge`: sign a Verascore claim nonce with the agent key
+- **Post-handshake auto-publish hook**: `handshake_respond` POSTs a handshake
   attestation envelope to Verascore `/api/publish` after a successful response.
   Gated by `config.verascore.auto_publish_handshakes` (default true). HTTPS-only.
   Failures are audit-logged but non-blocking.
-- **Docs** — `server/docs/OWASP.md` (OWASP LLM Top-10 mapping) and
+- **Docs**: `server/docs/OWASP.md` (OWASP LLM Top-10 mapping) and
   `server/docs/DID.md` (did:key method and identity bundle format).
 - Integration test `server/test/integration/auto-publish-handshake.test.ts`
   exercising auto-publish against a real local HTTP mock.
@@ -804,15 +804,15 @@ No code changes. Messaging-clarity patch only.
 
 ### Fixed
 
-- **sovereignty_audit blocked on existing installations** — The v0.4.1 fix added `sovereignty_audit` to `DEFAULT_POLICY.tier3_always_allow`, but existing installations already had a `principal-policy.yaml` on disk from v0.3.1 that was loaded instead. The policy loader now **merges** default tier3 entries into user policy files, so new read-only tools from upgrades are automatically permitted without requiring operators to edit their policy file. This is upgrade-safe: user customizations are preserved and defaults are additive.
+- **sovereignty_audit blocked on existing installations**: The v0.4.1 fix added `sovereignty_audit` to `DEFAULT_POLICY.tier3_always_allow`, but existing installations already had a `principal-policy.yaml` on disk from v0.3.1 that was loaded instead. The policy loader now **merges** default tier3 entries into user policy files, so new read-only tools from upgrades are automatically permitted without requiring operators to edit their policy file. This is upgrade-safe: user customizations are preserved and defaults are additive.
 
 ## [0.4.1] - 2026-04-01
 
 ### Fixed
 
-- **Critical: Packaging bug** — `dist/cli.js` contained a wrong require path for `package.json` in the dashboard module, causing the MCP server to crash silently on startup and expose zero tools through OpenClaw. Root cause: `src/principal-policy/dashboard.ts` used a separate `createRequire` with a path that resolved differently in the bundle vs source. Fix: import version from `config.ts` instead of duplicating the require.
-- **sovereignty_audit permission gate** — The audit tool was documented as Tier 3 (auto-allow) but was never added to the `tier3_always_allow` list, causing it to default to Tier 1 (require approval) per SEC-011. Now correctly classified as Tier 3 alongside `shr_generate` and `monitor_health`.
-- **Missing Tier 3 classifications** — `shr_gateway_export`, `bridge_commit`, `bridge_verify`, and `bridge_attest` were also missing from `tier3_always_allow`. All read-only or outbound-only tools now correctly auto-allow.
+- **Critical: Packaging bug**. `dist/cli.js` contained a wrong require path for `package.json` in the dashboard module, causing the MCP server to crash silently on startup and expose zero tools through OpenClaw. Root cause: `src/principal-policy/dashboard.ts` used a separate `createRequire` with a path that resolved differently in the bundle vs source. Fix: import version from `config.ts` instead of duplicating the require.
+- **sovereignty_audit permission gate**: The audit tool was documented as Tier 3 (auto-allow) but was never added to the `tier3_always_allow` list, causing it to default to Tier 1 (require approval) per SEC-011. Now correctly classified as Tier 3 alongside `shr_generate` and `monitor_health`.
+- **Missing Tier 3 classifications**: `shr_gateway_export`, `bridge_commit`, `bridge_verify`, and `bridge_attest` were also missing from `tier3_always_allow`. All read-only or outbound-only tools now correctly auto-allow.
 
 ### Changed
 
@@ -822,16 +822,16 @@ No code changes. Messaging-clarity patch only.
 
 ### Added
 
-- **Decommissioning Certificate** — Policy framework for decommission operations (Tier 1, requires approval). Tool implementation deferred to v0.5.0.
-- **L2 Hardening Path** — 2 new tools (`sanctuary/l2_hardening_status`, `sanctuary/l2_verify_isolation`). Checks process isolation (container/VM/sandbox), memory protection (ASLR, canaries, Argon2id), filesystem permissions, runtime integrity. New "Hardened" tier between Degraded and Full.
-- **SHR Gateway Export** — 1 new tool (`sanctuary/shr_gateway_export`). Transforms SHR into authorization context for Ping Identity Agent Gateway or other identity providers with trust levels and capability signals.
-- **Context Gating** — 5 tools for field-level context filtering with policy templates (`context_gate_set_policy`, `context_gate_filter`, `context_gate_apply_template`, `context_gate_list_policies`, `context_gate_recommend`).
-- **Concordia Bridge** — 3 tools for optional composition with Concordia Protocol (`bridge_commit`, `bridge_verify`, `bridge_attest`).
-- **Hermes Integration** — adapter and examples for Hermes agent framework.
-- **LangChain Integration** — adapter using official `langchain-mcp-adapters`.
-- **CrewAI Integration** — adapter using native `mcps` field.
-- **Incident class mapping** in sovereignty audit — 5 real-world incidents (Meta Sev 1, OpenClaw CVE flood, context leakage, inbox deletion, Claude Code leak) mapped to sovereignty gaps.
-- **NIST CAISI mapping** in SHR spec (Section 9) — maps NIST's five security dimensions to SHR coverage.
+- **Decommissioning Certificate**: Policy framework for decommission operations (Tier 1, requires approval). Tool implementation deferred to v0.5.0.
+- **L2 Hardening Path**: 2 new tools (`sanctuary/l2_hardening_status`, `sanctuary/l2_verify_isolation`). Checks process isolation (container/VM/sandbox), memory protection (ASLR, canaries, Argon2id), filesystem permissions, runtime integrity. New "Hardened" tier between Degraded and Full.
+- **SHR Gateway Export**: 1 new tool (`sanctuary/shr_gateway_export`). Transforms SHR into authorization context for Ping Identity Agent Gateway or other identity providers with trust levels and capability signals.
+- **Context Gating**: 5 tools for field-level context filtering with policy templates (`context_gate_set_policy`, `context_gate_filter`, `context_gate_apply_template`, `context_gate_list_policies`, `context_gate_recommend`).
+- **Concordia Bridge**: 3 tools for optional composition with Concordia Protocol (`bridge_commit`, `bridge_verify`, `bridge_attest`).
+- **Hermes Integration**: adapter and examples for Hermes agent framework.
+- **LangChain Integration**: adapter using official `langchain-mcp-adapters`.
+- **CrewAI Integration**: adapter using native `mcps` field.
+- **Incident class mapping** in sovereignty audit: 5 real-world incidents (Meta Sev 1, OpenClaw CVE flood, context leakage, inbox deletion, Claude Code leak) mapped to sovereignty gaps.
+- **NIST CAISI mapping** in SHR spec (Section 9): maps NIST's five security dimensions to SHR coverage.
 
 ### Changed
 
@@ -846,7 +846,7 @@ No code changes. Messaging-clarity patch only.
 
 - Issue #6: Version mismatch between package.json and reported version.
 - Issue #4: Dead config values (`withhold-all`, `service-mediated`) accepted without validation.
-- Issue #3: Tier asymmetry — `reputation_export` now correctly at Tier 1.
+- Issue #3: Tier asymmetry. `reputation_export` now correctly at Tier 1.
 - Issue #2: Dashboard had no rate limiting.
 - TypeScript strict-mode compilation errors preventing npm publish.
 
@@ -860,7 +860,7 @@ No code changes. Messaging-clarity patch only.
 
 **No breaking changes to the MCP tool interface.** All v0.3.1 tools remain available with the same names and parameters.
 
-The Concordia Bridge tools are **additive** — they provide optional composition with Concordia Protocol but do not replace any existing tools.
+The Concordia Bridge tools are **additive**: they provide optional composition with Concordia Protocol but do not replace any existing tools.
 
 **Critical upgrade step:** After updating the npm package, your MCP host (OpenClaw, Claude Code, etc.) must restart its gateway to re-enumerate the tool surface. A stale gateway registration may show only a subset of tools.
 
@@ -905,9 +905,9 @@ See `docs/MIGRATION_v0.3_to_v0.4.md` for detailed upgrade instructions.
 
 ### Added
 
-- Principal Policy Framework — govern agent autonomy and delegation across four sovereignty layers
-- Bootstrap Escrow and Guarantee tools — secure initial credential exchange
-- L2 Context Gating foundations — field-level filtering and obfuscation policies
+- Principal Policy Framework: govern agent autonomy and delegation across four sovereignty layers
+- Bootstrap Escrow and Guarantee tools: secure initial credential exchange
+- L2 Context Gating foundations: field-level filtering and obfuscation policies
 - Policy templates for enterprise patterns (logging-strict, export-blocked, minimal-context)
 
 ---
