@@ -378,6 +378,24 @@ function setRoute(route) {
   renderFortress();
 }
 
+// Renders the global attestation badge (Q1 layer 1, persistent across
+// surfaces). Tone is driven by state.topbarPills.attestation. Pending
+// state shows a dashed seal ring; verified shows solid; degraded shows
+// outlined core; unverified shows the broken-seal mark. Observation
+// language only; Castle Layer 1 enforcement ships in WP-V1.x-CASTLE-WALL.
+function renderTopbarAttestationBadge(stateName) {
+  const valid = stateName === "verified" || stateName === "degraded" || stateName === "unverified" || stateName === "pending";
+  const cls = valid ? stateName : "pending";
+  const ringDashed = cls === "pending" ? " dashed" : "";
+  return '<span class="att-global ' + cls + '" data-pill="attestation" title="Fortress attestation">' +
+    '<span class="seal">' +
+      '<span class="seal-ring' + ringDashed + '"></span>' +
+      '<span class="seal-core"></span>' +
+    '</span>' +
+    '<span class="label">' + escHtml(cls) + '</span>' +
+  '</span>';
+}
+
 function renderTopbar() {
   const pillEl = document.getElementById("topbar-pills");
   if (!pillEl) return;
@@ -394,7 +412,7 @@ function renderTopbar() {
     versionPill,
     '<span class="pill" data-pill="deployment">deployment: ' + escHtml(state.topbarPills.deployment) + '</span>',
     '<span class="pill" data-pill="mode">mode: ' + escHtml(state.topbarPills.mode) + '</span>',
-    '<span class="pill tone-' + escHtml(state.topbarPills.attestation) + '" data-pill="attestation">attestation: ' + escHtml(state.topbarPills.attestation) + '</span>'
+    renderTopbarAttestationBadge(state.topbarPills.attestation)
   ].join("");
   // Lockdown button three-state UX (binding addendum 3).
   const btn = document.getElementById("btn-lockdown");
@@ -490,6 +508,7 @@ function renderMain() {
     case "agent-detail": nextHtml = renderAgentDetail(); break;
     case "policy": nextHtml = renderPolicyCenter(); break;
     case "intelligence": nextHtml = renderIntelligenceCenter(); break;
+    case "attestation": nextHtml = renderAttestation(); break;
     case "privacy": nextHtml = renderPrivacyPage(); break;
     case "coordination": nextHtml = renderCoordinationPage(); break;
     case "health": nextHtml = renderHealthPage(); break;
@@ -680,11 +699,159 @@ function agentStateClass(status) {
   if (status === "locked_down" || status === "error") return "off";
   return "idle";
 }
-function agentAttestationTone(status) {
-  if (status === "active") return { cls: "tone-verified", label: "verified" };
-  if (status === "locked_down") return { cls: "tone-locked", label: "locked" };
-  if (status === "error") return { cls: "tone-unverified", label: "unverified" };
-  return { cls: "tone-degraded", label: "degraded" };
+// Per-agent attestation badge (Q1 layer 2). Square chip beside each
+// agent: a bounded glyph beside a bounded entity. Color and fill pattern
+// carry meaning together so the badge reads even monochrome. The "locked"
+// status maps to the unverified visual (rust + hatched mark) since a
+// locked-down agent has no current attestation; the inspect-pane copy
+// explains the distinction. Pure visual surface; no state derivation.
+function renderAgentAttestationBadge(status) {
+  let cls;
+  let label;
+  if (status === "active") { cls = "verified"; label = "verified"; }
+  else if (status === "locked_down") { cls = "unverified"; label = "locked"; }
+  else if (status === "error") { cls = "unverified"; label = "unverified"; }
+  else { cls = "degraded"; label = "degraded"; }
+  return '<span class="att-agent ' + cls + '" title="Agent attestation"><span class="mark"></span>' + escHtml(label) + '</span>';
+}
+// Per-action attestation tick (Q1 layer 3). Tiny inline shape on every
+// timeline row. Two-byte signature fragment is enough at low resolution;
+// the full signature is one click away. Neutral state shows a circle
+// instead of a tick when the signer was unreachable; the action is still
+// recorded. Visual surface only.
+function renderActionAttestationBadge(stateName, sig) {
+  const valid = stateName === "verified" || stateName === "degraded" || stateName === "unverified" || stateName === "neutral";
+  const cls = valid ? stateName : "neutral";
+  const sigText = sig ? String(sig) : "--";
+  return '<span class="att-action ' + cls + '" title="Action attestation">' +
+    '<span class="tick"></span>' +
+    '<span>' + escHtml(sigText) + '</span>' +
+  '</span>';
+}
+// Attestation gallery surface (Q1 four classes: global / per-agent /
+// per-action / per-transaction custody-provenance stub). Reference for
+// operators: shows what each badge looks like across verified, degraded,
+// unverified, and (where applicable) pending or neutral states. Pure
+// visual; no derivation, no live data. Castle Layer 3 cooperative-MCP UX
+// surface; Castle Layer 1 enforcement ships in WP-V1.x-CASTLE-WALL.
+function renderAttestation() {
+  return '<div class="att-gallery">' +
+    '<div class="page-head"><div>' +
+      '<p class="eyebrow">Attestation</p>' +
+      '<h1>Four classes of badge.</h1>' +
+      '<p class="sub">A signature you can see. From the whole fortress, down to a single action. Degrade, never destroy: a failed signature becomes neutral with a tooltip; the surface keeps working.</p>' +
+    '</div></div>' +
+    // Global
+    '<div class="att-section">' +
+      '<div class="att-section-head"><div>' +
+        '<h2>Global. The fortress itself.</h2>' +
+        '<p>Lives in the topbar. Visible on every surface. Tells you the fortress identity is currently signed and matches the binary you installed.</p>' +
+      '</div><span class="label">topbar</span></div>' +
+      attRow(renderTopbarAttestationBadge("verified"), "Verified", "Identity matches. Binary matches. Default state for a healthy fortress.") +
+      attRow(renderTopbarAttestationBadge("degraded"), "Degraded", "The signature is older than the staleness window, or one of two co-signers is unreachable. The fortress keeps running.") +
+      attRow(renderTopbarAttestationBadge("unverified"), "Unverified", "The signature did not validate. The surface still works; lockdown is still available; the badge tells you to investigate.") +
+      attRow(renderTopbarAttestationBadge("pending"), "Pending", "First-run state. Fortress is signing for the first time. Settles in seconds.") +
+    '</div>' +
+    // Per-agent
+    '<div class="att-section">' +
+      '<div class="att-section-head"><div>' +
+        '<h2>Per-agent. In the agents list and inspect pane.</h2>' +
+        '<p>A square chip beside each agent. Square because an agent is bounded; the fortress (a circle) contains it.</p>' +
+      '</div><span class="label">agents view</span></div>' +
+      '<div class="att-row">' +
+        '<div class="demo" style="display:flex; gap:8px; flex-wrap:wrap;">' +
+          renderAgentAttestationBadge("active") +
+          renderAgentAttestationBadgeForState("degraded", "degraded") +
+          renderAgentAttestationBadgeForState("unverified", "unverified") +
+        '</div>' +
+        '<div class="desc"><strong>Verified, degraded, unverified</strong>' +
+          '<small>Color and the fill pattern carry meaning together. A solid square reads "attested" at a glance; a hatched square reads "trouble" at a glance, even monochrome.</small>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+    // Per-action
+    '<div class="att-section">' +
+      '<div class="att-section-head"><div>' +
+        '<h2>Per-action. Inline in the activity timeline.</h2>' +
+        '<p>Each entry in any timeline carries a small signature fragment. Hover to expand. A tick instead of a fill keeps the row visually quiet at low resolution.</p>' +
+      '</div><span class="label">timeline</span></div>' +
+      '<div class="att-row">' +
+        '<div class="demo" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">' +
+          '<span style="font-size:13px; color:var(--ink-2);">14:22:08 doc-reviewer summarized intake.pdf</span>' +
+          renderActionAttestationBadge("verified", "9c7d..2a") +
+        '</div>' +
+        '<div class="desc"><strong>Verified action</strong>' +
+          '<small>The most common shape. Two-byte signature fragment is enough; the full signature is one click away.</small>' +
+        '</div>' +
+      '</div>' +
+      '<div class="att-row">' +
+        '<div class="demo" style="display:flex; gap:10px; align-items:center;">' +
+          '<span style="font-size:13px; color:var(--ink-2);">14:11:47 privacy filter redacted payload</span>' +
+          renderActionAttestationBadge("degraded", "b440..71") +
+        '</div>' +
+        '<div class="desc"><strong>Degraded action</strong>' +
+          '<small>The action signed, but the signature class was less than the policy preferred. Useful when a substrate is still warming up.</small>' +
+        '</div>' +
+      '</div>' +
+      '<div class="att-row">' +
+        '<div class="demo" style="display:flex; gap:10px; align-items:center;">' +
+          '<span style="font-size:13px; color:var(--ink-2);">14:09:02 agent attempted external link</span>' +
+          renderActionAttestationBadge("neutral", "--") +
+        '</div>' +
+        '<div class="desc"><strong>Neutral. Degrade, not destroy.</strong>' +
+          '<small>The signer was unreachable. Rather than hide the action, the badge becomes neutral and a tooltip explains. The action is still recorded.</small>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+    // Custody stub
+    '<div class="att-section">' +
+      '<div class="att-section-head"><div>' +
+        '<h2>Custody. Stub for v1.x.</h2>' +
+        '<p>A fourth class, surfaced conservatively. Reserved for forthcoming custody-provenance signatures (x402 payment receipts, ERC-8004 identity assertions). Visible, dashed, clearly stubbed.</p>' +
+      '</div><span class="label">stub</span></div>' +
+      '<div class="att-row">' +
+        '<div class="demo">' +
+          '<span class="att-custody" title="Custody-provenance, v1.x">' +
+            '<span class="seal-stub"></span>' +
+            '<span class="stub-tag">custody. stub</span>' +
+          '</span>' +
+        '</div>' +
+        '<div class="desc"><strong>Custody. Stub.</strong>' +
+          '<small>Dashed border signals "shape reserved, content pending." Will populate when custody signatures land in a future release. Cannot be confused with a verified badge at any zoom level.</small>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+    // Tooltip
+    '<div class="att-section">' +
+      '<div class="att-section-head"><div>' +
+        '<h2>Tooltip on failure.</h2>' +
+        '<p>A failed badge is never silent. The tooltip explains in plain language, suggests one action, and confirms the surface is still working.</p>' +
+      '</div><span class="label">degrade not destroy</span></div>' +
+      '<div class="att-row">' +
+        '<div class="demo">' +
+          '<span class="att-tooltip">The signer at sig.fortress.local did not respond in 4s. Your fortress kept working. Try: open Health to see the signer status.</span>' +
+        '</div>' +
+        '<div class="desc"><strong>Plain-language tooltip</strong>' +
+          '<small>Three lines, in order: what happened, what did not break, what to do. No jargon, no stack trace.</small>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+  '</div>';
+}
+function attRow(demoHtml, strong, smallText) {
+  return '<div class="att-row">' +
+    '<div class="demo">' + demoHtml + '</div>' +
+    '<div class="desc"><strong>' + escHtml(strong) + '</strong>' +
+      '<small>' + escHtml(smallText) + '</small>' +
+    '</div>' +
+  '</div>';
+}
+// Gallery-only variant: render a per-agent badge for a given visual state
+// (verified / degraded / unverified) without going through the agent
+// status mapping. Used by renderAttestation to show all three states
+// side by side as design reference.
+function renderAgentAttestationBadgeForState(cls, label) {
+  return '<span class="att-agent ' + escHtml(cls) + '" title="Agent attestation"><span class="mark"></span>' + escHtml(label) + '</span>';
 }
 function relTimeFromIso(iso) {
   if (!iso) return "";
@@ -713,7 +880,6 @@ function renderAgentsList() {
   const rows = state.agents.map(function (a) {
     const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
     const dotCls = agentStateClass(a.status);
-    const att = agentAttestationTone(a.status);
     const initials = agentInitials(a.agent_id);
     const role = escHtml(a.harness) + (a.model_provider && a.model_provider.model_id ? ' · ' + escHtml(a.model_provider.model_id) : '');
     const isSelected = state.selectedAgentId === a.agent_id;
@@ -729,7 +895,7 @@ function renderAgentsList() {
         '<span class="state-dot ' + dotCls + '"></span>' +
         escHtml(map.label) +
       '</span>' +
-      '<span class="pill ' + att.cls + '">' + escHtml(att.label) + '</span>' +
+      renderAgentAttestationBadge(a.status) +
       '<span class="agent-last">' + escHtml(relTimeFromIso(a.last_activity_at)) + '</span>' +
       '</div>';
   }).join("\n");
@@ -810,7 +976,6 @@ function renderAgentInspectPanel(agent) {
   // shared card chrome; .inspect-pane overrides .card padding so the
   // inspect-head and inspect-body control their own spacing per design.
   if (panel) {
-    const att = agentAttestationTone(agent.status);
     const dotCls = agentStateClass(agent.status);
     const stateMap = STATUS_MAP[agent.status] || STATUS_MAP.unknown;
     const activity = (panel.recent_activity || []).slice(0, 20);
@@ -860,7 +1025,7 @@ function renderAgentInspectPanel(agent) {
         '<div class="row1">' +
           '<div class="agent-glyph">' + escHtml(agentInitials(agent.agent_id)) + '</div>' +
           '<h3>' + escHtml(agent.agent_id) + '</h3>' +
-          '<span style="margin-left:auto;"><span class="pill ' + att.cls + '">' + escHtml(att.label) + '</span></span>' +
+          '<span style="margin-left:auto;">' + renderAgentAttestationBadge(agent.status) + '</span>' +
         '</div>' +
         '<div class="meta">' +
           '<span class="pill ' + (dotCls === "live" ? "tone-verified" : "tone-degraded") + '"><span class="state-dot ' + dotCls + '" style="margin-right:4px;"></span>' + escHtml(stateMap.label) + '</span>' +

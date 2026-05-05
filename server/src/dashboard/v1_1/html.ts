@@ -978,6 +978,223 @@ body {
   border-radius: var(--rad);
 }
 .copy-btn:hover { color: var(--ink); background: var(--paper-2); }
+
+/* Surface 5. Attestation badge gallery. */
+.att-gallery {
+  display: flex; flex-direction: column; gap: 24px;
+  max-width: 1000px;
+  margin: 0 auto;
+}
+.att-section {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-lg);
+  padding: 22px 24px;
+}
+.att-section-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--rule);
+}
+.att-section-head h2 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 19px;
+  margin: 0 0 4px;
+}
+.att-section-head p {
+  color: var(--ink-3);
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 64ch;
+}
+.att-section-head .label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.att-row {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 24px;
+  padding: 14px 0;
+  border-bottom: 1px dashed var(--rule);
+  align-items: center;
+}
+.att-row:last-child { border-bottom: 0; }
+.att-row .demo {
+  display: flex; align-items: center; justify-content: flex-start;
+  padding: 12px 16px;
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad);
+  min-height: 56px;
+}
+.att-row .desc strong {
+  font-size: 13px; display: block; margin-bottom: 3px;
+}
+.att-row .desc small {
+  color: var(--ink-3); font-size: 12px;
+  line-height: 1.5;
+}
+
+/* Global persistent badge. Lives in the topbar across every surface. */
+.att-global {
+  display: inline-flex; align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 6px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-2);
+}
+.att-global.verified { border-color: var(--sage); background: var(--sage-bg); color: var(--sage); }
+.att-global.degraded { border-color: var(--ochre); background: var(--ochre-bg); color: var(--ochre); }
+.att-global.unverified { border-color: var(--rust); background: var(--rust-bg); color: var(--rust); }
+.att-global .seal {
+  width: 18px; height: 18px;
+  position: relative;
+  flex-shrink: 0;
+}
+.att-global .seal-ring {
+  position: absolute; inset: 0;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+}
+.att-global .seal-ring.dashed { border-style: dashed; }
+.att-global .seal-core {
+  position: absolute; inset: 4px;
+  background: currentColor;
+  border-radius: 50%;
+  opacity: 0.85;
+}
+.att-global.degraded .seal-core { background: transparent; border: 1px solid currentColor; }
+.att-global.unverified .seal-core {
+  background: transparent;
+  border: 1px solid currentColor;
+}
+.att-global.unverified .seal-core::after {
+  content: ""; position: absolute; inset: 0;
+  background: currentColor; opacity: 0.4;
+  clip-path: polygon(0 0, 100% 100%, 100% 90%, 10% 0);
+}
+.att-global .label {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.att-global .hash {
+  font-family: var(--mono);
+  font-size: 10px;
+  opacity: 0.7;
+  border-left: 1px solid currentColor;
+  padding-left: 8px;
+  margin-left: 2px;
+}
+
+/* Per-agent badge. Square chip beside each agent. */
+.att-agent {
+  display: inline-flex; align-items: center;
+  gap: 6px;
+  padding: 3px 7px;
+  border-radius: var(--rad);
+  border: 1px solid var(--rule);
+  background: var(--surface);
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
+}
+.att-agent .mark {
+  width: 10px; height: 10px;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+  position: relative;
+}
+.att-agent.verified { color: var(--sage); border-color: var(--sage); background: var(--sage-bg); }
+.att-agent.verified .mark { background: currentColor; }
+.att-agent.degraded { color: var(--ochre); border-color: var(--ochre); background: var(--ochre-bg); }
+.att-agent.unverified { color: var(--rust); border-color: var(--rust); background: var(--rust-bg); }
+.att-agent.unverified .mark {
+  background: repeating-linear-gradient(
+    45deg, currentColor, currentColor 1px,
+    transparent 1px, transparent 3px
+  );
+}
+
+/* Per-action badge. Tiny inline tick on timeline rows. */
+.att-action {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--paper-3);
+  border: 1px solid transparent;
+}
+.att-action .tick {
+  width: 6px; height: 6px;
+  border-radius: 1px;
+  background: currentColor;
+}
+.att-action.verified { color: var(--sage); }
+.att-action.degraded { color: var(--ochre); }
+.att-action.unverified { color: var(--rust); }
+.att-action.neutral .tick { background: var(--ink-4); border-radius: 50%; }
+
+/* Custody-provenance badge stub (v1.x). Visibly stubbed with dashed border. */
+.att-custody {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 4px 10px 4px 6px;
+  border-radius: var(--rad);
+  border: 1px dashed var(--rule-2);
+  background: var(--paper-3);
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+.att-custody .seal-stub {
+  width: 16px; height: 16px;
+  border: 1px dashed var(--ink-4);
+  border-radius: 50%;
+  position: relative;
+  flex-shrink: 0;
+}
+.att-custody .seal-stub::after {
+  content: ""; position: absolute; inset: 4px;
+  border: 1px dashed var(--ink-4);
+  border-radius: 50%;
+}
+.att-custody .stub-tag {
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* Tooltip surface for badges. */
+.att-tooltip {
+  background: var(--ink);
+  color: var(--paper);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 8px 10px;
+  border-radius: var(--rad);
+  max-width: 280px;
+  line-height: 1.5;
+  display: inline-block;
+}
+[data-theme="dark"] .att-tooltip {
+  background: var(--paper-3);
+  color: var(--ink);
+}
+
 @media (max-width: 1100px) {
   .app, .app.route-full { grid-template-columns: 56px 1fr; grid-template-areas: "sidebar topbar" "sidebar main"; }
   .fortress { display: none; }
@@ -1006,6 +1223,7 @@ const NAV_ITEMS: Array<{ id: string; label: string }> = [
   { id: "agents", label: "Agents" },
   { id: "policy", label: "Policy" },
   { id: "intelligence", label: "Intelligence" },
+  { id: "attestation", label: "Attestation" },
   { id: "privacy", label: "Privacy" },
   { id: "coordination", label: "Coordination" },
   { id: "health", label: "Health" },
@@ -1029,6 +1247,8 @@ const NAV_ICON_PATHS: Record<string, string> = {
     '<path d="M4 2h5l3 3v9H4z"/><path d="M9 2v3h3"/><path d="M6 9h4M6 11.5h4"/>',
   intelligence:
     '<rect x="3.5" y="3.5" width="9" height="9" rx="0.5"/><rect x="6" y="6" width="4" height="4"/><path d="M6 1.5v2M10 1.5v2M6 12.5v2M10 12.5v2M1.5 6h2M1.5 10h2M12.5 6h2M12.5 10h2"/>',
+  attestation:
+    '<circle cx="8" cy="8" r="5.5"/><circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8h1.5M13 8h1.5"/>',
   privacy:
     '<path d="M8 1.5L3 3v4.5c0 3 2.2 5.4 5 7 2.8-1.6 5-4 5-7V3z"/><path d="M6 8l1.5 1.5L10.5 6"/>',
   coordination:
@@ -1120,7 +1340,7 @@ export function renderDashboardV11Html(
         <span class="pill" data-pill="version">v${escHtml(sanctuaryVersion)}</span>
         <span class="pill" data-pill="deployment">deployment: local</span>
         <span class="pill" data-pill="mode">mode: solo</span>
-        <span class="pill" data-pill="attestation">attestation: pending</span>
+        <span class="att-global pending" data-pill="attestation" title="Fortress attestation"><span class="seal"><span class="seal-ring dashed"></span><span class="seal-core"></span></span><span class="label">pending</span></span>
       </div>
       <button class="btn btn-icon" id="btn-theme-toggle" data-action="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
         <span class="icon-moon">${THEME_ICON_MOON}</span>
