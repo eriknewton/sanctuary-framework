@@ -1,6 +1,68 @@
-/* Sanctuary menubar popover styles.
- * Sprint Piece 1: minimal system-default styling. Visual polish lands in Sprint Piece 3
- * via AI design tools. */
+/* Sanctuary menubar popover + onboarding styles.
+ *
+ * Sprint Piece 1 (PR #104) shipped the structural skeleton with minimal
+ * system-default styling. Sprint Piece 2 PR 5 (this file) translates the
+ * Claude Design onboarding visual primitives onto the existing 5-step
+ * wizard skeleton (welcome, endpoint, auth, notifications, done).
+ *
+ * Design source: server/docs/design-refs/sprint-piece-2/surfaces.css
+ * Onboarding block (lines 786-970) and tokens.css (full file).
+ *
+ * State machine is preserved verbatim; full onboarding flow (substrate
+ * selection, first concierge round-trip, persistence) is Sprint Piece 3
+ * territory and not in scope here. */
+
+:root {
+  --paper: #f7f5f0;
+  --paper-2: #efece5;
+  --paper-3: #e6e3da;
+  --ink: #1a1a17;
+  --ink-2: #39362f;
+  --ink-3: #6a6659;
+  --ink-4: #9a9585;
+  --rule: #d8d4c8;
+  --rule-2: #c4bfb0;
+  --surface: #fdfcf8;
+  --surface-2: #f1eee6;
+  --sage: oklch(62% 0.07 145);
+  --sage-bg: oklch(94% 0.02 145);
+  --ochre: oklch(68% 0.09 75);
+  --ochre-bg: oklch(94% 0.03 75);
+  --rust: oklch(55% 0.11 35);
+  --rust-bg: oklch(94% 0.03 35);
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --serif: "Iowan Old Style", "Charter", "Georgia", serif;
+  --rad: 6px;
+  --rad-lg: 10px;
+  --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.02);
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+}
+
+[data-theme="dark"] {
+  --paper: #121210;
+  --paper-2: #171714;
+  --paper-3: #1e1e1b;
+  --ink: #ecebe5;
+  --ink-2: #c7c5bd;
+  --ink-3: #8d8a80;
+  --ink-4: #5e5c55;
+  --rule: #2a2a26;
+  --rule-2: #36352f;
+  --surface: #1a1a17;
+  --surface-2: #1f1e1a;
+  --sage: oklch(72% 0.08 145);
+  --sage-bg: oklch(22% 0.03 145);
+  --ochre: oklch(78% 0.09 75);
+  --ochre-bg: oklch(22% 0.04 75);
+  --rust: oklch(70% 0.11 35);
+  --rust-bg: oklch(22% 0.04 35);
+}
 
 * {
   box-sizing: border-box;
@@ -8,28 +70,31 @@
 
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-family: var(--sans);
   font-size: 13px;
-  color: #1c1c1e;
-  background: #f5f5f7;
+  color: var(--ink);
+  background: var(--paper);
+  -webkit-font-smoothing: antialiased;
 }
 
 #root {
   min-height: 100vh;
 }
 
+/* Popover surface (existing; tokens swapped in for future-proofing) */
+
 .popover-container {
   width: 400px;
   max-height: 600px;
   overflow-y: auto;
   padding: 0;
-  background: #ffffff;
-  border-radius: 8px;
+  background: var(--surface);
+  border-radius: var(--rad-lg);
 }
 
 .popover-header {
   padding: 12px 16px 8px 16px;
-  border-bottom: 1px solid #e5e5ea;
+  border-bottom: 1px solid var(--rule);
 }
 
 .popover-title {
@@ -39,13 +104,13 @@ body {
 
 .popover-subtitle {
   font-size: 12px;
-  color: #6c6c70;
+  color: var(--ink-3);
   margin-top: 2px;
 }
 
 .popover-section {
   padding: 12px 16px;
-  border-bottom: 1px solid #f0f0f2;
+  border-bottom: 1px solid var(--rule);
 }
 
 .popover-section:last-of-type {
@@ -57,13 +122,13 @@ body {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: #6c6c70;
+  color: var(--ink-3);
   margin: 0 0 8px 0;
 }
 
 .popover-section .empty {
   font-size: 12px;
-  color: #8e8e93;
+  color: var(--ink-4);
   margin: 0;
 }
 
@@ -79,7 +144,7 @@ body {
 .recent-item,
 .agent-item {
   padding: 8px 0;
-  border-bottom: 1px solid #f7f7f8;
+  border-bottom: 1px solid var(--rule);
 }
 
 .pending-item:last-child,
@@ -92,7 +157,7 @@ body {
 .recent-message,
 .agent-id {
   font-size: 13px;
-  color: #1c1c1e;
+  color: var(--ink);
 }
 
 .pending-meta,
@@ -101,7 +166,7 @@ body {
   display: flex;
   gap: 8px;
   font-size: 11px;
-  color: #8e8e93;
+  color: var(--ink-4);
   margin-top: 2px;
 }
 
@@ -109,23 +174,23 @@ body {
   display: inline-block;
   padding: 1px 6px;
   border-radius: 3px;
-  background: #e5e5ea;
+  background: var(--paper-2);
   font-weight: 500;
 }
 
 .tier-1 .tier-badge {
-  background: #ffe5e5;
-  color: #b00020;
+  background: var(--rust-bg);
+  color: var(--rust);
 }
 
 .tier-2 .tier-badge {
-  background: #fff3cd;
-  color: #856404;
+  background: var(--ochre-bg);
+  color: var(--ochre);
 }
 
 .action-stub {
   font-size: 11px;
-  color: #8e8e93;
+  color: var(--ink-4);
   font-style: italic;
 }
 
@@ -134,8 +199,8 @@ body {
   justify-content: space-between;
   align-items: center;
   padding: 8px 16px;
-  background: #fafafa;
-  border-top: 1px solid #e5e5ea;
+  background: var(--paper-2);
+  border-top: 1px solid var(--rule);
   font-size: 11px;
 }
 
@@ -143,22 +208,22 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
-  color: #6c6c70;
+  color: var(--ink-3);
 }
 
 .status-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #34c759;
+  background: var(--sage);
 }
 
 .status-degraded .status-dot {
-  background: #ff9500;
+  background: var(--ochre);
 }
 
 .status-disconnected .status-dot {
-  background: #ff3b30;
+  background: var(--rust);
 }
 
 .footer-actions {
@@ -169,10 +234,11 @@ body {
 .link-btn {
   background: none;
   border: none;
-  color: #007aff;
+  color: var(--ink-2);
   font-size: 11px;
   cursor: pointer;
   padding: 0;
+  font-family: var(--mono);
 }
 
 .link-btn:hover {
@@ -182,35 +248,105 @@ body {
 .popover-empty {
   padding: 24px 16px;
   text-align: center;
-  color: #6c6c70;
+  color: var(--ink-3);
   font-size: 13px;
 }
 
-/* Wizard styles (basic; polished in Sprint Piece 3) */
+/* ============================================================
+   Onboarding wizard. Translated from
+   server/docs/design-refs/sprint-piece-2/surfaces.css
+   Surface 4 block (lines 786-970). State-shape primitives only;
+   substrate-selection / success-receipt / next-CTAs visuals
+   are Sprint Piece 3 territory once the state machine catches up.
+   ============================================================ */
 
-.wizard {
+.onb-stage {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: 32px 20px;
+  background: var(--paper);
+}
+
+.onb-card {
   width: 480px;
-  padding: 24px;
+  max-width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-lg);
+  padding: 32px 36px 28px;
 }
 
-.wizard-page h1 {
-  font-size: 18px;
-  font-weight: 600;
-  margin: 0 0 12px 0;
-}
-
-.wizard-page p {
-  font-size: 13px;
-  color: #3c3c43;
-  margin: 0 0 12px 0;
-  line-height: 1.4;
-}
-
-.copy-stub {
-  font-style: italic;
-  color: #8e8e93;
+.onb-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
   font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+  margin-bottom: 20px;
 }
+
+.onb-progress .step-dots {
+  display: flex;
+  gap: 4px;
+}
+
+.onb-progress .step-dots span {
+  width: 18px;
+  height: 3px;
+  background: var(--rule);
+  border-radius: 2px;
+}
+
+.onb-progress .step-dots span.done {
+  background: var(--ink-3);
+}
+
+.onb-progress .step-dots span.active {
+  background: var(--ink);
+}
+
+.onb-card h1 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 24px;
+  letter-spacing: -0.01em;
+  margin: 0 0 10px;
+  line-height: 1.25;
+  color: var(--ink);
+}
+
+.onb-card .lede {
+  color: var(--ink-2);
+  font-size: 14px;
+  line-height: 1.55;
+  margin: 0 0 20px;
+}
+
+.onb-card p {
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0 0 12px;
+}
+
+.onb-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-top: 24px;
+}
+
+.onb-actions .key {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-4);
+  margin-left: auto;
+}
+
+/* Form field, refreshed against the design palette */
 
 .field {
   display: block;
@@ -219,71 +355,150 @@ body {
 
 .field span {
   display: block;
+  font-family: var(--mono);
   font-size: 11px;
-  color: #6c6c70;
-  margin-bottom: 4px;
-  text-transform: uppercase;
   letter-spacing: 0.04em;
+  color: var(--ink-3);
+  margin-bottom: 6px;
+  text-transform: uppercase;
 }
 
 .field input {
   width: 100%;
-  padding: 8px 10px;
+  padding: 8px 12px;
   font-size: 13px;
-  border: 1px solid #d1d1d6;
-  border-radius: 4px;
-  background: #ffffff;
+  font-family: var(--mono);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad);
+  background: var(--paper);
+  color: var(--ink);
 }
+
+.field input:focus {
+  outline: none;
+  border-color: var(--ink-3);
+  background: var(--surface);
+}
+
+/* Inline test result panels (endpoint probe, notification request) */
 
 .test-result {
   margin: 12px 0;
-  padding: 8px 12px;
-  border-radius: 4px;
+  padding: 10px 12px;
+  border-radius: var(--rad);
   font-size: 12px;
+  font-family: var(--mono);
+  border: 1px solid var(--rule);
+  background: var(--paper-2);
+  color: var(--ink-2);
 }
 
 .test-result.ok {
-  background: #d1f4d1;
-  color: #1c5d1c;
+  background: var(--sage-bg);
+  color: var(--sage);
+  border-color: var(--sage);
 }
 
 .test-result.fail {
-  background: #ffd5d5;
-  color: #8b0000;
+  background: var(--rust-bg);
+  color: var(--rust);
+  border-color: var(--rust);
 }
 
-.wizard-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 24px;
+/* Done-page success card. Adapted from .onb-success in the design ref;
+   the receipt grid is Sprint Piece 3 once round-trip data lands. */
+
+.onb-success {
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad);
+  padding: 16px 18px;
+  margin: 0 0 20px;
 }
+
+.onb-success-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sage);
+}
+
+.onb-success-head .check {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--sage);
+  display: grid;
+  place-items: center;
+  position: relative;
+}
+
+.onb-success-head .check::after {
+  content: "";
+  width: 4px;
+  height: 7px;
+  border-right: 1.5px solid var(--paper);
+  border-bottom: 1.5px solid var(--paper);
+  transform: rotate(45deg) translate(-1px, -1px);
+}
+
+/* Buttons. Refreshed against the design palette and preserved for the
+   popover surface (View dashboard / Reopen setup) as well as the wizard
+   action row. */
 
 .btn {
-  padding: 6px 14px;
+  padding: 7px 14px;
   font-size: 13px;
-  border-radius: 4px;
-  border: 1px solid transparent;
+  font-family: var(--sans);
+  border-radius: var(--rad);
+  border: 1px solid var(--rule);
   cursor: pointer;
-  background: #e5e5ea;
-  color: #1c1c1e;
+  background: var(--surface);
+  color: var(--ink);
+  transition: border-color 0.1s ease, background 0.1s ease;
+}
+
+.btn:hover {
+  border-color: var(--rule-2);
+  background: var(--paper-2);
 }
 
 .btn-primary {
-  background: #007aff;
-  color: #ffffff;
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
+}
+
+.btn-primary:hover {
+  background: var(--ink-2);
+  border-color: var(--ink-2);
 }
 
 .btn-secondary {
-  background: #f0f0f2;
-  border-color: #d1d1d6;
+  background: var(--paper-2);
+  border-color: var(--rule);
+  color: var(--ink-2);
 }
 
 .btn-link {
   background: none;
-  color: #007aff;
+  border: 1px solid transparent;
+  color: var(--ink-3);
+  padding: 7px 4px;
 }
 
-.btn:hover {
-  opacity: 0.9;
+.btn-link:hover {
+  background: none;
+  color: var(--ink);
+  border-color: transparent;
+}
+
+.btn-quiet {
+  background: var(--paper-2);
+  border-color: var(--rule);
+  color: var(--ink-2);
 }
