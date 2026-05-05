@@ -17,6 +17,20 @@ pub enum FailureMode {
     RuntimeIpcDropKernelUp,
     RuntimeExternalFirewallClobber,
     RuntimeQueueSaturated,
+    /// Mid-session manifest signature or rule-digest verification failed
+    /// during a reload attempt. Disposition: keep prior good policy in
+    /// force, surface error to operator. Distinct from F-4 startup failure
+    /// which refuses to start.
+    RuntimeManifestVerifyFailed,
+    /// inotify subscription or watcher loop failed; daemon is degraded to
+    /// periodic mtime polling at 1s interval. Enforcement is unaffected;
+    /// reload latency increases.
+    RuntimeManifestWatcherDegraded,
+    /// Daemon-side WAL append failed (filesystem error, permission denied,
+    /// disk full). The audit ring buffer absorbs the event in memory; if
+    /// the buffer overflows the next ACK carries a wal_overflow_loss
+    /// audit entry per scope-lock §8.
+    RuntimeAuditWalAppendFailed,
 }
 
 /// Disposition the daemon and main apply when a FailureMode fires.
@@ -34,6 +48,18 @@ pub enum FailureDisposition {
     },
     RestoreAndAudit {
         restored_within_ms: u32,
+    },
+    /// Mid-session reload failure: daemon retains the prior verified policy
+    /// in force and surfaces the failure to the operator. Used for F-2
+    /// manifest-signature / rule-digest verification failures during a
+    /// reload that did not affect the in-force ruleset.
+    KeepPriorAndAudit {
+        emit_event: &'static str,
+    },
+    /// Watcher subsystem fell back to a less-efficient polling path. Audit
+    /// the degradation; reload still works, just with higher latency.
+    DegradeWatcherToPoll {
+        poll_interval_ms: u32,
     },
 }
 
@@ -67,6 +93,16 @@ pub fn default_disposition(mode: FailureMode) -> FailureDisposition {
         FailureMode::RuntimeQueueSaturated => FailureDisposition::FailClosed {
             emit_event: "egress_blocked",
             reason: "queue_saturated",
+        },
+        FailureMode::RuntimeManifestVerifyFailed => FailureDisposition::KeepPriorAndAudit {
+            emit_event: "manifest_verify_failed_kept_prior",
+        },
+        FailureMode::RuntimeManifestWatcherDegraded => FailureDisposition::DegradeWatcherToPoll {
+            poll_interval_ms: 1_000,
+        },
+        FailureMode::RuntimeAuditWalAppendFailed => FailureDisposition::FailClosed {
+            emit_event: "egress_blocked",
+            reason: "audit_wal_append_failed",
         },
     }
 }
@@ -105,5 +141,38 @@ mod tests {
     fn ipc_drop_kernel_up_fails_degraded() {
         let d = default_disposition(FailureMode::RuntimeIpcDropKernelUp);
         assert!(matches!(d, FailureDisposition::FailDegraded { .. }));
+    }
+
+    #[test]
+    fn manifest_verify_failure_keeps_prior_policy() {
+        let d = default_disposition(FailureMode::RuntimeManifestVerifyFailed);
+        match d {
+            FailureDisposition::KeepPriorAndAudit { emit_event } => {
+                assert_eq!(emit_event, "manifest_verify_failed_kept_prior");
+            }
+            _ => panic!("expected KeepPriorAndAudit"),
+        }
+    }
+
+    #[test]
+    fn watcher_degradation_emits_poll_disposition() {
+        let d = default_disposition(FailureMode::RuntimeManifestWatcherDegraded);
+        match d {
+            FailureDisposition::DegradeWatcherToPoll { poll_interval_ms } => {
+                assert_eq!(poll_interval_ms, 1_000);
+            }
+            _ => panic!("expected DegradeWatcherToPoll"),
+        }
+    }
+
+    #[test]
+    fn audit_wal_append_failure_fails_closed() {
+        let d = default_disposition(FailureMode::RuntimeAuditWalAppendFailed);
+        match d {
+            FailureDisposition::FailClosed { reason, .. } => {
+                assert_eq!(reason, "audit_wal_append_failed");
+            }
+            _ => panic!("expected FailClosed"),
+        }
     }
 }

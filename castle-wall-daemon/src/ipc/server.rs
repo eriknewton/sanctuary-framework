@@ -21,14 +21,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::audit::{AuditRingBuffer, PendingAuditEvent};
+use crate::audit::{AuditRingBuffer, PendingAuditEvent, WalWriter};
 use crate::constants::{AUDIT_LAYER, IPC_NAMESPACE, SCHEMA_VERSION_V1};
 use crate::ipc::auth::{
     encode_nonce_b64url, generate_challenge_nonce, verify_handshake_response, AuthError,
     HandshakeIdentity, CHALLENGE_NONCE_BYTES,
 };
 use crate::ipc::framing::{frame, parse_frame, ParseStep};
-use crate::ipc::messages::{IpcMessage, MessageEnvelope};
+use crate::ipc::messages::{AuditDrainEvent, IpcMessage, MessageEnvelope};
+use crate::manifest::ManifestStore;
 
 /// Socket file permissions (mode 0660 per scope-lock §5).
 const SOCKET_MODE: u32 = 0o660;
@@ -52,6 +53,16 @@ pub struct ServerConfig {
     pub audit_buffer: Arc<Mutex<AuditRingBuffer>>,
     pub shutdown_flag: Arc<AtomicBool>,
     pub fortress_id: String,
+    /// Optional manifest store used by the policy.reload dispatch.
+    ///
+    /// When absent (e.g., in PR 2a integration tests that exercise only
+    /// handshake plus status), policy.reload returns a typed-error response
+    /// so callers can distinguish "not wired" from "verify failed."
+    pub manifest_store: Option<Arc<Mutex<ManifestStore>>>,
+    /// Optional WAL writer used by the audit.drain + audit.drain_ack
+    /// dispatch. When absent, drain returns an empty batch and ack is a
+    /// no-op so PR 2a tests remain green.
+    pub wal_writer: Option<Arc<Mutex<WalWriter>>>,
 }
 
 /// Errors emitted by the IPC server lifecycle.
@@ -115,6 +126,8 @@ impl IpcServer {
             shutdown_flag: config.shutdown_flag.clone(),
             fortress_id: config.fortress_id,
             pinned_public_key: config.pinned_public_key,
+            manifest_store: config.manifest_store,
+            wal_writer: config.wal_writer,
         });
 
         let accept_thread = std::thread::Builder::new()
@@ -154,6 +167,8 @@ struct ServerState {
     shutdown_flag: Arc<AtomicBool>,
     fortress_id: String,
     pinned_public_key: Vec<u8>,
+    manifest_store: Option<Arc<Mutex<ManifestStore>>>,
+    wal_writer: Option<Arc<Mutex<WalWriter>>>,
 }
 
 impl ServerState {
@@ -310,6 +325,193 @@ enum HandshakeError {
     Auth(AuthError),
 }
 
+/// Handle a `policy_reload_request` end-to-end: invoke `ManifestStore::reload`
+/// and translate the result into a `PolicyReloadResponse`. F-2 disposition:
+/// on verify failure the prior good policy is retained and the response
+/// carries `ok: false` plus the reason.
+fn handle_policy_reload(request_id: &str, state: &ServerState) -> IpcMessage {
+    let store = match state.manifest_store.as_ref() {
+        Some(s) => s,
+        None => {
+            state.append_audit(
+                "ipc_policy_reload_store_unwired",
+                request_id,
+            );
+            return IpcMessage::PolicyReloadResponse {
+                request_id: request_id.to_string(),
+                ok: false,
+                loaded_manifest_signature_b64url: None,
+                loaded_rule_count: 0,
+                error: Some(
+                    "manifest store not configured on this daemon instance".to_string(),
+                ),
+            };
+        }
+    };
+    let mut guard = match store.lock() {
+        Ok(g) => g,
+        Err(_poisoned) => {
+            state.append_audit("ipc_policy_reload_store_poisoned", request_id);
+            return IpcMessage::PolicyReloadResponse {
+                request_id: request_id.to_string(),
+                ok: false,
+                loaded_manifest_signature_b64url: None,
+                loaded_rule_count: 0,
+                error: Some("manifest store mutex poisoned".to_string()),
+            };
+        }
+    };
+    match guard.reload() {
+        Ok(loaded) => {
+            let sig = loaded.manifest_signature_b64url.clone();
+            let count = loaded.rule_count;
+            state.append_audit(
+                "ipc_policy_reload_succeeded",
+                &format!("rules={}", count),
+            );
+            IpcMessage::PolicyReloadResponse {
+                request_id: request_id.to_string(),
+                ok: true,
+                loaded_manifest_signature_b64url: Some(sig),
+                loaded_rule_count: count,
+                error: None,
+            }
+        }
+        Err(err) => {
+            // F-2 disposition: keep prior policy in force; surface the error
+            // to Sanctuary main; emit an audit so the operator dashboard can
+            // surface a banner.
+            let reason = err.to_string();
+            state.append_audit(
+                "manifest_verify_failed_kept_prior",
+                &reason,
+            );
+            let kept_prior = guard
+                .current()
+                .map(|c| (c.manifest_signature_b64url.clone(), c.rule_count));
+            IpcMessage::PolicyReloadResponse {
+                request_id: request_id.to_string(),
+                ok: false,
+                loaded_manifest_signature_b64url: kept_prior.as_ref().map(|p| p.0.clone()),
+                loaded_rule_count: kept_prior.map(|p| p.1).unwrap_or(0),
+                error: Some(reason),
+            }
+        }
+    }
+}
+
+/// Handle an `audit_drain_request`: snapshot WAL entries strictly after
+/// `after_seq`, capped at `max_events`. Returns a typed response carrying
+/// the events plus a `more_pending` flag so Sanctuary main knows when to
+/// issue another request.
+fn handle_audit_drain(
+    request_id: &str,
+    after_seq: Option<u64>,
+    max_events: u32,
+    state: &ServerState,
+) -> IpcMessage {
+    let wal = match state.wal_writer.as_ref() {
+        Some(w) => w,
+        None => {
+            return IpcMessage::AuditDrainResponse {
+                request_id: request_id.to_string(),
+                events: Vec::new(),
+                next_after_seq: after_seq,
+                more_pending: false,
+                wal_overflow_count: 0,
+            };
+        }
+    };
+    // Combined ring-buffer overflow + WAL drain cap surface; the in-memory
+    // ring buffer's overflow counter feeds Sanctuary main via the response
+    // so the operator dashboard can surface "N audit events lost during
+    // Sanctuary main downtime" per scope-lock §8.
+    let overflow = state
+        .audit_buffer
+        .lock()
+        .map(|b| b.overflow_count())
+        .unwrap_or(0);
+    let max_for_snapshot = max_events.max(1) as usize;
+    let snapshot = match wal.lock() {
+        Ok(mut w) => match w.snapshot_after(after_seq, max_for_snapshot) {
+            Ok(events) => events,
+            Err(err) => {
+                state.append_audit("audit_drain_snapshot_failed", &err.to_string());
+                return IpcMessage::AuditDrainResponse {
+                    request_id: request_id.to_string(),
+                    events: Vec::new(),
+                    next_after_seq: after_seq,
+                    more_pending: false,
+                    wal_overflow_count: overflow,
+                };
+            }
+        },
+        Err(_) => {
+            state.append_audit("audit_drain_wal_poisoned", request_id);
+            return IpcMessage::AuditDrainResponse {
+                request_id: request_id.to_string(),
+                events: Vec::new(),
+                next_after_seq: after_seq,
+                more_pending: false,
+                wal_overflow_count: overflow,
+            };
+        }
+    };
+    let more_pending = snapshot.len() == max_for_snapshot;
+    let next_after_seq = snapshot.last().map(|e| e.seq).or(after_seq);
+    let events: Vec<AuditDrainEvent> = snapshot
+        .into_iter()
+        .map(|e| AuditDrainEvent {
+            seq: e.seq,
+            captured_at_unix_ms: e.captured_at_unix_ms,
+            prior_sha256_hex: e.prior_sha256_hex,
+            event_canonical_json: e.event_canonical_json,
+            critical: e.critical,
+        })
+        .collect();
+    state.append_audit(
+        "audit_drain_served",
+        &format!("count={}", events.len()),
+    );
+    IpcMessage::AuditDrainResponse {
+        request_id: request_id.to_string(),
+        events,
+        next_after_seq,
+        more_pending,
+        wal_overflow_count: overflow,
+    }
+}
+
+/// Handle an `audit_drain_ack`: truncate the WAL through `last_acked_seq`.
+/// On success the ring-buffer overflow counter is reset because Sanctuary
+/// main has confirmed durable receipt of every event up to and including
+/// the ack point.
+fn handle_audit_drain_ack(request_id: &str, last_acked_seq: u64, state: &ServerState) {
+    let wal = match state.wal_writer.as_ref() {
+        Some(w) => w,
+        None => {
+            state.append_audit("audit_drain_ack_wal_unwired", request_id);
+            return;
+        }
+    };
+    match wal.lock() {
+        Ok(mut w) => match w.truncate_through_seq(last_acked_seq) {
+            Ok(dropped) => {
+                state.append_audit(
+                    "audit_drain_ack_truncated",
+                    &format!("dropped={}", dropped),
+                );
+            }
+            Err(err) => {
+                state.append_audit("audit_drain_ack_truncate_failed", &err.to_string());
+            }
+        },
+        Err(_) => {
+            state.append_audit("audit_drain_ack_wal_poisoned", request_id);
+        }
+    }
+}
+
 fn parse_envelope(body: &str) -> Result<MessageEnvelope, String> {
     serde_json::from_str(body).map_err(|err| err.to_string())
 }
@@ -382,25 +584,32 @@ fn dispatch(envelope: &MessageEnvelope, state: &ServerState) -> Option<MessageEn
             })
         }
         IpcMessage::PolicyReloadRequest { request_id, .. } => {
-            // Manifest watcher + reload land in Checkpoint 2; for now we
-            // acknowledge with a structured "not yet implemented" error so
-            // Sanctuary main sees a typed response rather than a hang.
-            let reply = IpcMessage::PolicyReloadResponse {
-                request_id: request_id.clone(),
-                ok: false,
-                loaded_manifest_signature_b64url: None,
-                loaded_rule_count: 0,
-                error: Some(
-                    "manifest reload lands in Checkpoint 2; daemon currently runs without a loaded policy"
-                        .to_string(),
-                ),
-            };
-            state.append_audit("ipc_policy_reload_pending_checkpoint_2", request_id);
+            let reply = handle_policy_reload(request_id, state);
             Some(MessageEnvelope {
                 jsonrpc: "2.0".to_string(),
                 method: format!("{}.policy_reload_response", IPC_NAMESPACE),
                 params: reply,
             })
+        }
+        IpcMessage::AuditDrainRequest {
+            request_id,
+            after_seq,
+            max_events,
+        } => {
+            let reply = handle_audit_drain(request_id, *after_seq, *max_events, state);
+            Some(MessageEnvelope {
+                jsonrpc: "2.0".to_string(),
+                method: format!("{}.audit_drain_response", IPC_NAMESPACE),
+                params: reply,
+            })
+        }
+        IpcMessage::AuditDrainAck {
+            request_id,
+            last_acked_seq,
+        } => {
+            handle_audit_drain_ack(request_id, *last_acked_seq, state);
+            // ACKs are notifications; no response.
+            None
         }
         IpcMessage::HandshakeResponse { .. } | IpcMessage::HandshakeChallenge { .. } => {
             state.append_audit("ipc_post_handshake_handshake_message", "ignored");
@@ -425,6 +634,10 @@ fn dispatch(envelope: &MessageEnvelope, state: &ServerState) -> Option<MessageEn
             // These are emitted by the daemon, not received. Surface the
             // unexpected direction.
             state.append_audit("ipc_unexpected_audit_emit_direction", "ignored");
+            None
+        }
+        IpcMessage::AuditDrainResponse { .. } => {
+            state.append_audit("ipc_unexpected_response_direction", "audit_drain_response");
             None
         }
         IpcMessage::UnlockNotification { fortress_id, .. } => {
@@ -452,6 +665,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
+    #[allow(dead_code)]
     fn fresh_state(fortress_id: &str, pk: Vec<u8>) -> Arc<ServerState> {
         Arc::new(ServerState {
             audit_buffer: Arc::new(Mutex::new(AuditRingBuffer::new(
@@ -461,6 +675,8 @@ mod tests {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             fortress_id: fortress_id.to_string(),
             pinned_public_key: pk,
+            manifest_store: None,
+            wal_writer: None,
         })
     }
 
@@ -531,6 +747,8 @@ mod tests {
             ))),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             fortress_id: "abc".to_string(),
+            manifest_store: None,
+            wal_writer: None,
         };
         let server = IpcServer::start(cfg).expect("start");
         assert!(socket.exists());
@@ -561,6 +779,8 @@ mod tests {
             ))),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             fortress_id: "abc".to_string(),
+            manifest_store: None,
+            wal_writer: None,
         };
         let server = IpcServer::start(cfg).expect("start despite stale");
         server.stop_and_join();
@@ -583,6 +803,8 @@ mod tests {
             audit_buffer: Arc::clone(&audit),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             fortress_id: "fortress-x".to_string(),
+            manifest_store: None,
+            wal_writer: None,
         };
         let server = IpcServer::start(cfg).expect("start");
         let client_handle =
@@ -639,6 +861,8 @@ mod tests {
             audit_buffer: Arc::clone(&audit),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             fortress_id: "f".to_string(),
+            manifest_store: None,
+            wal_writer: None,
         };
         let server = IpcServer::start(cfg).expect("start");
         let client_handle =

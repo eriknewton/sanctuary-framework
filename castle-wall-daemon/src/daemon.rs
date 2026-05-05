@@ -12,12 +12,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::audit::AuditRingBuffer;
+use crate::audit::{AuditRingBuffer, WalWriter};
 use crate::config::DaemonConfig;
 use crate::constants::{AUDIT_LAYER, SCHEMA_VERSION_V1};
 use crate::failure::{FailureDisposition, FailureMode};
 use crate::ipc::auth::{load_pinned_public_key, AuthError};
 use crate::ipc::server::{IpcServer, IpcServerError};
+use crate::manifest::{ManifestStore, ManifestStoreError};
 
 /// Errors emitted by the daemon lifecycle.
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +35,10 @@ pub enum DaemonError {
     SignalSetup(String),
     #[error("auth subsystem error: {0}")]
     Auth(#[from] AuthError),
+    #[error("WAL open failed: {0}")]
+    WalOpen(String),
+    #[error("manifest store init failed: {0}")]
+    ManifestStoreInit(String),
 }
 
 /// Map a daemon error to a FailureMode for disposition routing.
@@ -45,6 +50,8 @@ pub fn mode_for_error(err: &DaemonError) -> FailureMode {
         DaemonError::PlatformMissing(_) => FailureMode::StartupFilterInstallFailed,
         DaemonError::SignalSetup(_) => FailureMode::StartupFilterInstallFailed,
         DaemonError::Auth(_) => FailureMode::StartupIpcBindFailed,
+        DaemonError::WalOpen(_) => FailureMode::StartupFilterInstallFailed,
+        DaemonError::ManifestStoreInit(_) => FailureMode::StartupPolicyParseFailed,
     }
 }
 
@@ -84,8 +91,30 @@ pub struct DaemonHandle {
     config: DaemonConfig,
     ipc_server: Option<IpcServer>,
     audit_buffer: Arc<Mutex<AuditRingBuffer>>,
+    /// Disk-backed WAL. Shared between the daemon-side audit emitters and
+    /// the IPC drain dispatch. None when boot was invoked with a transient
+    /// in-memory-only configuration (e.g., short-lived smoke runs).
+    wal_writer: Option<Arc<Mutex<WalWriter>>>,
+    /// Manifest store. Shared with the IPC dispatch's policy.reload handler.
+    manifest_store: Option<Arc<Mutex<ManifestStore>>>,
     shutdown_flag: Arc<AtomicBool>,
     started_at: Instant,
+}
+
+impl DaemonHandle {
+    /// Test/integration helper: hand back the manifest store handle so the
+    /// caller can simulate operator-driven flows that the IPC layer carries
+    /// in production.
+    pub fn manifest_store(&self) -> Option<&Arc<Mutex<ManifestStore>>> {
+        self.manifest_store.as_ref()
+    }
+
+    /// Test/integration helper: hand back the WAL writer handle so the
+    /// caller can append synthetic audit events without going through the
+    /// kernel-touching emitter path.
+    pub fn wal_writer(&self) -> Option<&Arc<Mutex<WalWriter>>> {
+        self.wal_writer.as_ref()
+    }
 }
 
 impl DaemonHandle {
@@ -145,7 +174,13 @@ pub struct DaemonExitReport {
 /// Boot the daemon. On success returns a handle; the caller is responsible
 /// for calling `wait_for_shutdown` then `stop`.
 pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
-    let pinned_key = load_pinned_public_key(&config.pinned_public_key_path)
+    let pinned_key_array = ManifestStore::load_pinned_key(&config.pinned_public_key_path)
+        .map_err(|err: ManifestStoreError| DaemonError::PinnedKeyLoad(err.to_string()))?;
+    // The IPC handshake uses raw bytes; the ManifestStore uses a fixed array.
+    // Both views share the same key material loaded above.
+    let pinned_key_bytes = pinned_key_array.to_vec();
+    // Sanity-check via the legacy auth helper as a second integrity gate.
+    let _: Vec<u8> = load_pinned_public_key(&config.pinned_public_key_path)
         .map_err(|err| DaemonError::PinnedKeyLoad(err.to_string()))?;
 
     let audit_buffer = Arc::new(Mutex::new(AuditRingBuffer::new(
@@ -153,26 +188,58 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         config.wal_ttl,
     )));
 
+    // Open the disk-backed WAL. Per scope-lock §8 the WAL is the durable
+    // tier behind the in-memory ring buffer; failure to open it is a refuse-
+    // to-start condition since Sanctuary main relies on durable drain.
+    let wal_writer = match WalWriter::open(&config.wal_path) {
+        Ok(w) => Arc::new(Mutex::new(w)),
+        Err(err) => return Err(DaemonError::WalOpen(err.to_string())),
+    };
+
+    // Construct the manifest store. The pinned key load above is the
+    // refuse-to-start gate; the store is built around the loaded key.
+    // First reload (manifest read from disk) is best-effort: an absent
+    // manifest at boot is acceptable and the store stays in `current=None`
+    // until Sanctuary main triggers the first policy.reload via IPC.
+    let manifest_store = Arc::new(Mutex::new(ManifestStore::new(
+        config.policy_dir.clone(),
+        config.pinned_public_key_path.clone(),
+        pinned_key_array,
+    )));
+    if let Ok(mut store) = manifest_store.lock() {
+        // Best-effort first load; ignore errors here so a missing manifest
+        // at boot does not block the IPC layer from coming up.
+        let _ = store.reload();
+    }
+
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 
     let ipc_server = IpcServer::start(crate::ipc::server::ServerConfig {
         socket_path: config.socket_path.clone(),
-        pinned_public_key: pinned_key,
+        pinned_public_key: pinned_key_bytes,
         prompt_timeout: config.prompt_timeout,
         audit_buffer: Arc::clone(&audit_buffer),
         shutdown_flag: Arc::clone(&shutdown_flag),
         fortress_id: config.fortress_id.clone(),
+        manifest_store: Some(Arc::clone(&manifest_store)),
+        wal_writer: Some(Arc::clone(&wal_writer)),
     })?;
 
     // Emit a daemon_started audit event so reconnects can see the boot.
+    let started_event = format!(
+        "{{\"layer\":\"{}\",\"operation\":\"daemon_started\",\"schema_version\":{},\"fortress_id\":\"{}\"}}",
+        AUDIT_LAYER, SCHEMA_VERSION_V1, config.fortress_id
+    );
     if let Ok(mut buf) = audit_buffer.lock() {
         buf.append(crate::audit::PendingAuditEvent {
-            event_canonical_json: format!(
-                "{{\"layer\":\"{}\",\"operation\":\"daemon_started\",\"schema_version\":{},\"fortress_id\":\"{}\"}}",
-                AUDIT_LAYER, SCHEMA_VERSION_V1, config.fortress_id
-            ),
+            event_canonical_json: started_event.clone(),
             captured_at: std::time::SystemTime::now(),
         });
+    }
+    // Also persist the daemon_started event to the WAL so Sanctuary main
+    // sees it on first drain after reconnect. fsync per critical event.
+    if let Ok(mut wal) = wal_writer.lock() {
+        let _ = wal.append_critical(&started_event);
     }
 
     install_shutdown_signal_handlers(Arc::clone(&shutdown_flag))?;
@@ -181,6 +248,8 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         config,
         ipc_server: Some(ipc_server),
         audit_buffer,
+        wal_writer: Some(wal_writer),
+        manifest_store: Some(manifest_store),
         shutdown_flag,
         started_at: Instant::now(),
     })

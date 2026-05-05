@@ -45,6 +45,38 @@ pub struct SignedManifest {
     pub signature: ManifestSignature,
 }
 
+/// Body of a pinned-key rotation envelope (the bytes that are signed by both
+/// the old and the new key per scope-lock §4 OQ #1 option (a)).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RotationBody {
+    pub schema_version: u32,
+    pub fortress_id: String,
+    pub issued_at: String,
+    pub old_key_hex: String,
+    pub new_key_hex: String,
+}
+
+/// Cross-signed rotation envelope. Both `old_key_signature_b64url` (proving
+/// the old custodian authorized the rotation) and `new_key_signature_b64url`
+/// (proving the new key holder accepted custody) verify against the same
+/// canonical-JSON of `RotationBody`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CrossSignedRotation {
+    pub body: RotationBody,
+    pub old_key_signature_b64url: String,
+    pub new_key_signature_b64url: String,
+}
+
+/// Result of verifying a cross-signed rotation envelope. On success the
+/// daemon may persist `accepted_new_key` to its pinned-key file (subject to
+/// operator-approval gating; see scope-lock §4 OQ #1 option (b), which lands
+/// alongside the prompt path in Checkpoint 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RotationVerifyOutcome {
+    Accepted { accepted_new_key: [u8; PUBLIC_KEY_LENGTH] },
+    Rejected { reason: String },
+}
+
 /// Verification result returned by both signature and rule-bytes paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyResult {
@@ -191,6 +223,142 @@ pub fn verify_rule_digests(
     }
 }
 
+/// Verify a cross-signed rotation envelope against the currently-pinned
+/// fortress public key. Mirrors §4 OQ #1 option (a): the proposed new key is
+/// only acceptable when the envelope carries a valid old-key signature
+/// (proving the old custodian authorized the change) AND a valid new-key
+/// signature (proving the new key holder is in possession). The caller is
+/// responsible for the operator-approval gate before persisting the new
+/// pinned key (option (b); lands with the prompt path in Checkpoint 3).
+pub fn verify_cross_signed_rotation(
+    rotation: &CrossSignedRotation,
+    pinned_public_key: &[u8],
+) -> RotationVerifyOutcome {
+    if rotation.body.schema_version != SCHEMA_VERSION_V1 {
+        return RotationVerifyOutcome::Rejected {
+            reason: format!(
+                "unsupported rotation schema_version: {}",
+                rotation.body.schema_version
+            ),
+        };
+    }
+    if pinned_public_key.len() != PUBLIC_KEY_LENGTH {
+        return RotationVerifyOutcome::Rejected {
+            reason: format!(
+                "pinned public key wrong length (expected {}, got {})",
+                PUBLIC_KEY_LENGTH,
+                pinned_public_key.len()
+            ),
+        };
+    }
+
+    let old_key_bytes = match hex::decode(&rotation.body.old_key_hex) {
+        Ok(b) => b,
+        Err(err) => {
+            return RotationVerifyOutcome::Rejected {
+                reason: format!("old_key_hex decode failed: {}", err),
+            }
+        }
+    };
+    if old_key_bytes != pinned_public_key {
+        return RotationVerifyOutcome::Rejected {
+            reason: "rotation envelope's old_key does not match currently pinned key".to_string(),
+        };
+    }
+
+    let new_key_bytes = match hex::decode(&rotation.body.new_key_hex) {
+        Ok(b) => b,
+        Err(err) => {
+            return RotationVerifyOutcome::Rejected {
+                reason: format!("new_key_hex decode failed: {}", err),
+            }
+        }
+    };
+    if new_key_bytes.len() != PUBLIC_KEY_LENGTH {
+        return RotationVerifyOutcome::Rejected {
+            reason: format!(
+                "new_key_hex wrong length (expected {}, got {})",
+                PUBLIC_KEY_LENGTH,
+                new_key_bytes.len()
+            ),
+        };
+    }
+    if new_key_bytes == pinned_public_key {
+        return RotationVerifyOutcome::Rejected {
+            reason: "rotation envelope's new_key equals old_key; no-op rotation rejected"
+                .to_string(),
+        };
+    }
+
+    let canonical = match serde_json::to_value(&rotation.body)
+        .map_err(|err| format!("rotation body serialize failed: {}", err))
+        .and_then(|v| {
+            canonicalize_to_bytes(&v).map_err(|err| format!("canonicalize failed: {:?}", err))
+        }) {
+        Ok(b) => b,
+        Err(reason) => return RotationVerifyOutcome::Rejected { reason },
+    };
+
+    let old_sig = match decode_signature(&rotation.old_key_signature_b64url) {
+        Ok(b) => b,
+        Err(reason) => return RotationVerifyOutcome::Rejected { reason },
+    };
+    let new_sig = match decode_signature(&rotation.new_key_signature_b64url) {
+        Ok(b) => b,
+        Err(reason) => return RotationVerifyOutcome::Rejected { reason },
+    };
+
+    let mut old_key_arr = [0u8; PUBLIC_KEY_LENGTH];
+    old_key_arr.copy_from_slice(pinned_public_key);
+    let old_verifying_key = match VerifyingKey::from_bytes(&old_key_arr) {
+        Ok(k) => k,
+        Err(err) => {
+            return RotationVerifyOutcome::Rejected {
+                reason: format!("pinned public key invalid: {}", err),
+            }
+        }
+    };
+    let mut new_key_arr = [0u8; PUBLIC_KEY_LENGTH];
+    new_key_arr.copy_from_slice(&new_key_bytes);
+    let new_verifying_key = match VerifyingKey::from_bytes(&new_key_arr) {
+        Ok(k) => k,
+        Err(err) => {
+            return RotationVerifyOutcome::Rejected {
+                reason: format!("rotation new_key invalid: {}", err),
+            }
+        }
+    };
+
+    if old_verifying_key.verify(&canonical, &old_sig).is_err() {
+        return RotationVerifyOutcome::Rejected {
+            reason: "rotation envelope's old_key_signature does not verify".to_string(),
+        };
+    }
+    if new_verifying_key.verify(&canonical, &new_sig).is_err() {
+        return RotationVerifyOutcome::Rejected {
+            reason: "rotation envelope's new_key_signature does not verify".to_string(),
+        };
+    }
+
+    RotationVerifyOutcome::Accepted {
+        accepted_new_key: new_key_arr,
+    }
+}
+
+fn decode_signature(b64url: &str) -> Result<Signature, String> {
+    let bytes = base64_url_decode(b64url).map_err(|err| format!("signature decode: {}", err))?;
+    if bytes.len() != SIGNATURE_LENGTH {
+        return Err(format!(
+            "signature wrong length (expected {}, got {})",
+            SIGNATURE_LENGTH,
+            bytes.len()
+        ));
+    }
+    let mut arr = [0u8; SIGNATURE_LENGTH];
+    arr.copy_from_slice(&bytes);
+    Ok(Signature::from_bytes(&arr))
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -296,6 +464,103 @@ mod tests {
                 assert!(issues.iter().any(|i| i.contains("missing on disk")));
             }
             _ => panic!("expected failure"),
+        }
+    }
+
+    fn build_cross_signed_rotation(
+        old_signing: &SigningKey,
+        new_signing: &SigningKey,
+    ) -> CrossSignedRotation {
+        let body = RotationBody {
+            schema_version: SCHEMA_VERSION_V1,
+            fortress_id: "deadbeef".to_string(),
+            issued_at: "2026-05-05T00:00:00Z".to_string(),
+            old_key_hex: hex::encode(old_signing.verifying_key().to_bytes()),
+            new_key_hex: hex::encode(new_signing.verifying_key().to_bytes()),
+        };
+        let canonical = canonicalize_to_bytes(&serde_json::to_value(&body).unwrap()).unwrap();
+        let old_sig = old_signing.sign(&canonical);
+        let new_sig = new_signing.sign(&canonical);
+        CrossSignedRotation {
+            body,
+            old_key_signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(old_sig.to_bytes()),
+            new_key_signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(new_sig.to_bytes()),
+        }
+    }
+
+    #[test]
+    fn cross_signed_rotation_happy_path() {
+        let old = SigningKey::generate(&mut OsRng);
+        let new = SigningKey::generate(&mut OsRng);
+        let rotation = build_cross_signed_rotation(&old, &new);
+        let outcome = verify_cross_signed_rotation(&rotation, &old.verifying_key().to_bytes());
+        match outcome {
+            RotationVerifyOutcome::Accepted { accepted_new_key } => {
+                assert_eq!(accepted_new_key, new.verifying_key().to_bytes());
+            }
+            RotationVerifyOutcome::Rejected { reason } => panic!("rejected: {}", reason),
+        }
+    }
+
+    #[test]
+    fn rotation_rejected_when_old_key_does_not_match_pinned() {
+        let old = SigningKey::generate(&mut OsRng);
+        let new = SigningKey::generate(&mut OsRng);
+        let rotation = build_cross_signed_rotation(&old, &new);
+        let other = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        match verify_cross_signed_rotation(&rotation, &other) {
+            RotationVerifyOutcome::Rejected { reason } => {
+                assert!(reason.contains("does not match currently pinned"));
+            }
+            RotationVerifyOutcome::Accepted { .. } => panic!("expected rejection"),
+        }
+    }
+
+    #[test]
+    fn rotation_rejected_when_new_key_signature_invalid() {
+        let old = SigningKey::generate(&mut OsRng);
+        let new = SigningKey::generate(&mut OsRng);
+        let mut rotation = build_cross_signed_rotation(&old, &new);
+        // Corrupt the new-key signature by swapping in one over a different message.
+        let bogus = old.sign(b"different bytes");
+        rotation.new_key_signature_b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(bogus.to_bytes());
+        match verify_cross_signed_rotation(&rotation, &old.verifying_key().to_bytes()) {
+            RotationVerifyOutcome::Rejected { reason } => {
+                assert!(reason.contains("new_key_signature does not verify"));
+            }
+            RotationVerifyOutcome::Accepted { .. } => panic!("expected rejection"),
+        }
+    }
+
+    #[test]
+    fn rotation_rejected_when_old_key_signature_invalid() {
+        let old = SigningKey::generate(&mut OsRng);
+        let new = SigningKey::generate(&mut OsRng);
+        let mut rotation = build_cross_signed_rotation(&old, &new);
+        // Corrupt the old-key signature.
+        let bogus = new.sign(b"different bytes");
+        rotation.old_key_signature_b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(bogus.to_bytes());
+        match verify_cross_signed_rotation(&rotation, &old.verifying_key().to_bytes()) {
+            RotationVerifyOutcome::Rejected { reason } => {
+                assert!(reason.contains("old_key_signature does not verify"));
+            }
+            RotationVerifyOutcome::Accepted { .. } => panic!("expected rejection"),
+        }
+    }
+
+    #[test]
+    fn rotation_rejected_when_new_key_equals_old() {
+        let old = SigningKey::generate(&mut OsRng);
+        let rotation = build_cross_signed_rotation(&old, &old);
+        match verify_cross_signed_rotation(&rotation, &old.verifying_key().to_bytes()) {
+            RotationVerifyOutcome::Rejected { reason } => {
+                assert!(reason.contains("no-op rotation"));
+            }
+            RotationVerifyOutcome::Accepted { .. } => panic!("expected rejection"),
         }
     }
 }

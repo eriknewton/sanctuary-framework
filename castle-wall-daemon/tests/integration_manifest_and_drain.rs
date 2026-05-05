@@ -1,0 +1,495 @@
+//! End-to-end integration: boot the daemon, exercise the IPC dispatch for
+//! policy.reload + audit.drain + audit.drain_ack against a real running
+//! UDS server.
+//!
+//! Coverage:
+//! 1. boot_then_policy_reload_succeeds_with_real_manifest_on_disk
+//! 2. policy_reload_keeps_prior_on_signature_failure (F-2 disposition)
+//! 3. audit_drain_returns_daemon_started_event_after_boot
+//! 4. audit_drain_with_after_seq_skips_already_drained_entries
+//! 5. audit_drain_ack_truncates_wal_through_seq
+//! 6. audit_drain_more_pending_when_capped
+//!
+//! Tests run on every host (Linux + macOS) because nothing here touches
+//! kernel-only primitives. The daemon's lifecycle, IPC server, manifest
+//! store, and WAL writer are all platform-portable.
+
+use base64::Engine;
+use castle_wall_daemon::audit::WalWriter;
+use castle_wall_daemon::config::DaemonConfig;
+use castle_wall_daemon::daemon::boot;
+use castle_wall_daemon::ipc::framing::{frame, parse_frame, ParseStep};
+use castle_wall_daemon::ipc::messages::{IpcMessage, MessageEnvelope};
+use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
+use castle_wall_daemon::manifest::verify::{
+    AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+};
+use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
+use ed25519_dalek::{Signer, SigningKey};
+use rand_core::OsRng;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tempfile::TempDir;
+
+const SIGNATURE_SCHEME_V1: &str = "ed25519-v1";
+const IPC_NAMESPACE: &str = "castle-wall";
+
+struct BootedDaemon {
+    handle: castle_wall_daemon::daemon::DaemonHandle,
+    socket_path: PathBuf,
+    signing_key: SigningKey,
+    fortress_id: String,
+    policy_dir: PathBuf,
+    _dir_keepalive: TempDir,
+}
+
+fn boot_daemon_with_policy(rule_bodies: &[&[u8]]) -> BootedDaemon {
+    let dir = TempDir::new().expect("tempdir");
+    let policy_dir = dir.path().join("policy/egress");
+    let pinned_path = policy_dir.join("pinned.key");
+    let wal_path = dir.path().join("filter-events.wal");
+    let socket_path = dir.path().join("filter.sock");
+
+    fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned = signing.verifying_key().to_bytes();
+    fs::write(&pinned_path, pinned).unwrap();
+
+    write_signed_manifest(&policy_dir, &signing, rule_bodies);
+
+    let cfg = DaemonConfig {
+        fortress_id: "deadbeef".to_string(),
+        socket_path: socket_path.clone(),
+        policy_dir: policy_dir.clone(),
+        wal_path,
+        pinned_public_key_path: pinned_path,
+        prompt_timeout: Duration::from_secs(30),
+        no_wall_max_duration: Duration::from_secs(3600),
+        wal_ttl: Duration::from_secs(86_400),
+        wal_size_cap_bytes: 16 * 1024 * 1024,
+    };
+    let handle = boot(cfg).expect("boot daemon");
+    BootedDaemon {
+        handle,
+        socket_path,
+        signing_key: signing,
+        fortress_id: "deadbeef".to_string(),
+        policy_dir,
+        _dir_keepalive: dir,
+    }
+}
+
+fn write_signed_manifest(policy_dir: &Path, signing: &SigningKey, rule_bodies: &[&[u8]]) {
+    fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+    let mut entries = Vec::new();
+    for (i, body) in rule_bodies.iter().enumerate() {
+        let file = format!("rule-{}.json", i);
+        fs::write(policy_dir.join(RULES_SUBDIR).join(&file), body).unwrap();
+        entries.push(ManifestRuleEntry {
+            rule_id: format!("uuid-{}", i),
+            file,
+            sha256: sha256_hex(body),
+        });
+    }
+    let manifest = AllowlistManifest {
+        schema_version: 1,
+        fortress_id: "deadbeef".to_string(),
+        issued_at: "2026-05-05T00:00:00Z".to_string(),
+        rules: entries,
+    };
+    let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
+    let sig = signing.sign(&canonical);
+    let signature_b64url =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
+    let signed = SignedManifest {
+        manifest,
+        signature: ManifestSignature {
+            signature_scheme: SIGNATURE_SCHEME_V1.to_string(),
+            signing_key_id: "test".to_string(),
+            signature_b64url,
+        },
+    };
+    let serialized = serde_json::to_string_pretty(&signed).unwrap();
+    fs::write(policy_dir.join(MANIFEST_FILENAME), serialized).unwrap();
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let out = hasher.finalize();
+    let mut s = String::with_capacity(out.len() * 2);
+    for b in out.iter() {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+fn connect_and_handshake(socket_path: &Path, signing: &SigningKey, fortress_id: &str) -> UnixStream {
+    let mut last_err = String::new();
+    for _ in 0..50 {
+        match UnixStream::connect(socket_path) {
+            Ok(mut stream) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut buf: Vec<u8> = Vec::with_capacity(4096);
+                let body = read_one_frame(&mut stream, &mut buf, Duration::from_secs(5))
+                    .expect("read challenge");
+                let envelope: MessageEnvelope = serde_json::from_str(&body).unwrap();
+                let nonce_b64 = match envelope.params {
+                    IpcMessage::HandshakeChallenge { nonce_b64url } => nonce_b64url,
+                    other => panic!("expected HandshakeChallenge, got {:?}", other),
+                };
+                let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(nonce_b64.as_bytes())
+                    .unwrap();
+                let signature = signing.sign(&nonce);
+                let response = MessageEnvelope {
+                    jsonrpc: "2.0".to_string(),
+                    method: format!("{}.handshake_response", IPC_NAMESPACE),
+                    params: IpcMessage::HandshakeResponse {
+                        fortress_id: fortress_id.to_string(),
+                        signing_key_id: "test".to_string(),
+                        nonce_signature_b64url:
+                            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                .encode(signature.to_bytes()),
+                    },
+                };
+                send_envelope(&mut stream, &response);
+                return stream;
+            }
+            Err(err) => {
+                last_err = err.to_string();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    panic!("connect_and_handshake gave up: {}", last_err);
+}
+
+fn send_envelope(stream: &mut UnixStream, envelope: &MessageEnvelope) {
+    let body = serde_json::to_string(envelope).unwrap();
+    let bytes = frame(&body);
+    stream.write_all(&bytes).unwrap();
+}
+
+fn recv_envelope(stream: &mut UnixStream, buf: &mut Vec<u8>) -> MessageEnvelope {
+    let body = read_one_frame(stream, buf, Duration::from_secs(5)).expect("read frame");
+    serde_json::from_str(&body).unwrap()
+}
+
+fn read_one_frame(
+    stream: &mut UnixStream,
+    buf: &mut Vec<u8>,
+    deadline: Duration,
+) -> Result<String, String> {
+    let started = std::time::Instant::now();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match parse_frame(buf) {
+            ParseStep::Complete {
+                body,
+                consumed_bytes,
+            } => {
+                buf.drain(..consumed_bytes);
+                return Ok(body);
+            }
+            ParseStep::NeedMore => {}
+            ParseStep::Error { reason } => return Err(reason),
+        }
+        if started.elapsed() > deadline {
+            return Err("integration read deadline exceeded".to_string());
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err("server closed".to_string()),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                return Err("integration connection idle timeout".to_string());
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+}
+
+#[test]
+fn boot_then_policy_reload_succeeds_with_real_manifest_on_disk() {
+    let booted = boot_daemon_with_policy(&[b"{\"r\":1}", b"{\"r\":2}"]);
+    let mut stream = connect_and_handshake(
+        &booted.socket_path,
+        &booted.signing_key,
+        &booted.fortress_id,
+    );
+    let req = MessageEnvelope {
+        jsonrpc: "2.0".to_string(),
+        method: format!("{}.policy_reload_request", IPC_NAMESPACE),
+        params: IpcMessage::PolicyReloadRequest {
+            request_id: "policy-1".to_string(),
+            manifest_path: "ignored".to_string(),
+        },
+    };
+    send_envelope(&mut stream, &req);
+    let mut buf = Vec::new();
+    let reply = recv_envelope(&mut stream, &mut buf);
+    match reply.params {
+        IpcMessage::PolicyReloadResponse {
+            request_id,
+            ok,
+            loaded_rule_count,
+            error,
+            ..
+        } => {
+            assert_eq!(request_id, "policy-1");
+            assert!(ok, "expected ok=true; error={:?}", error);
+            assert_eq!(loaded_rule_count, 2);
+            assert!(error.is_none(), "expected no error; got {:?}", error);
+        }
+        other => panic!("unexpected reply {:?}", other),
+    }
+    let _ = stream;
+    let _ = booted.handle.stop();
+}
+
+#[test]
+fn policy_reload_keeps_prior_on_signature_failure() {
+    let booted = boot_daemon_with_policy(&[b"{\"r\":1}"]);
+    // Tamper: rewrite the rule file, breaking the recorded SHA-256 digest.
+    fs::write(
+        booted.policy_dir.join(RULES_SUBDIR).join("rule-0.json"),
+        b"{\"r\":\"tampered\"}",
+    )
+    .unwrap();
+    let mut stream = connect_and_handshake(
+        &booted.socket_path,
+        &booted.signing_key,
+        &booted.fortress_id,
+    );
+    let req = MessageEnvelope {
+        jsonrpc: "2.0".to_string(),
+        method: format!("{}.policy_reload_request", IPC_NAMESPACE),
+        params: IpcMessage::PolicyReloadRequest {
+            request_id: "policy-bad".to_string(),
+            manifest_path: "ignored".to_string(),
+        },
+    };
+    send_envelope(&mut stream, &req);
+    let mut buf = Vec::new();
+    let reply = recv_envelope(&mut stream, &mut buf);
+    match reply.params {
+        IpcMessage::PolicyReloadResponse {
+            ok,
+            loaded_rule_count,
+            error,
+            loaded_manifest_signature_b64url,
+            ..
+        } => {
+            assert!(!ok, "expected ok=false on tampered rule");
+            // Prior policy was loaded at boot (1 rule); tampered reload should
+            // keep the prior count + signature in the response.
+            assert_eq!(loaded_rule_count, 1);
+            assert!(loaded_manifest_signature_b64url.is_some());
+            let err = error.expect("error string for tampered reload");
+            assert!(
+                err.contains("rule") || err.contains("digest") || err.contains("sha256"),
+                "expected rule/digest error; got {}",
+                err
+            );
+        }
+        other => panic!("unexpected reply {:?}", other),
+    }
+    let _ = stream;
+    let _ = booted.handle.stop();
+}
+
+#[test]
+fn audit_drain_returns_daemon_started_event_after_boot() {
+    let booted = boot_daemon_with_policy(&[b"{\"r\":1}"]);
+    let mut stream = connect_and_handshake(
+        &booted.socket_path,
+        &booted.signing_key,
+        &booted.fortress_id,
+    );
+    let req = MessageEnvelope {
+        jsonrpc: "2.0".to_string(),
+        method: format!("{}.audit_drain_request", IPC_NAMESPACE),
+        params: IpcMessage::AuditDrainRequest {
+            request_id: "drain-1".to_string(),
+            after_seq: None,
+            max_events: 100,
+        },
+    };
+    send_envelope(&mut stream, &req);
+    let mut buf = Vec::new();
+    let reply = recv_envelope(&mut stream, &mut buf);
+    match reply.params {
+        IpcMessage::AuditDrainResponse {
+            request_id,
+            events,
+            more_pending,
+            ..
+        } => {
+            assert_eq!(request_id, "drain-1");
+            assert!(!events.is_empty(), "expected daemon_started event");
+            assert!(events
+                .iter()
+                .any(|e| e.event_canonical_json.contains("daemon_started")));
+            assert!(!more_pending);
+            // Genesis entry has no prior chain hash; subsequent entries do.
+            assert_eq!(events[0].prior_sha256_hex, None);
+        }
+        other => panic!("unexpected reply {:?}", other),
+    }
+    let _ = stream;
+    let _ = booted.handle.stop();
+}
+
+#[test]
+fn audit_drain_with_after_seq_skips_already_drained_entries() {
+    let booted = boot_daemon_with_policy(&[b"{\"r\":1}"]);
+    // Push three additional WAL entries directly via the helper.
+    {
+        let wal: &std::sync::Arc<std::sync::Mutex<WalWriter>> =
+            booted.handle.wal_writer().expect("wal handle");
+        let mut w = wal.lock().unwrap();
+        w.append_critical("{\"layer\":\"l1\",\"operation\":\"a\"}").unwrap();
+        w.append_critical("{\"layer\":\"l1\",\"operation\":\"b\"}").unwrap();
+        w.append_critical("{\"layer\":\"l1\",\"operation\":\"c\"}").unwrap();
+    }
+    let mut stream = connect_and_handshake(
+        &booted.socket_path,
+        &booted.signing_key,
+        &booted.fortress_id,
+    );
+    // Drain after seq=0 (skip daemon_started which is at seq 0).
+    let req = MessageEnvelope {
+        jsonrpc: "2.0".to_string(),
+        method: format!("{}.audit_drain_request", IPC_NAMESPACE),
+        params: IpcMessage::AuditDrainRequest {
+            request_id: "drain-after-0".to_string(),
+            after_seq: Some(0),
+            max_events: 100,
+        },
+    };
+    send_envelope(&mut stream, &req);
+    let mut buf = Vec::new();
+    let reply = recv_envelope(&mut stream, &mut buf);
+    match reply.params {
+        IpcMessage::AuditDrainResponse { events, .. } => {
+            // Should see exactly the 3 hand-pushed entries (seq 1, 2, 3).
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[0].seq, 1);
+            assert_eq!(events[2].seq, 3);
+            assert!(events[0].event_canonical_json.contains("\"a\""));
+        }
+        other => panic!("unexpected reply {:?}", other),
+    }
+    let _ = stream;
+    let _ = booted.handle.stop();
+}
+
+#[test]
+fn audit_drain_ack_truncates_wal_through_seq() {
+    let booted = boot_daemon_with_policy(&[b"{\"r\":1}"]);
+    {
+        let wal = booted.handle.wal_writer().expect("wal");
+        let mut w = wal.lock().unwrap();
+        w.append_critical("{\"layer\":\"l1\",\"operation\":\"x\"}").unwrap();
+        w.append_critical("{\"layer\":\"l1\",\"operation\":\"y\"}").unwrap();
+        w.append_critical("{\"layer\":\"l1\",\"operation\":\"z\"}").unwrap();
+        // Now next_seq == 4; daemon_started at 0, x/y/z at 1,2,3.
+    }
+    let mut stream = connect_and_handshake(
+        &booted.socket_path,
+        &booted.signing_key,
+        &booted.fortress_id,
+    );
+    // ACK through seq=2 (drops daemon_started + x + y; keeps z).
+    let ack = MessageEnvelope {
+        jsonrpc: "2.0".to_string(),
+        method: format!("{}.audit_drain_ack", IPC_NAMESPACE),
+        params: IpcMessage::AuditDrainAck {
+            request_id: "ack-1".to_string(),
+            last_acked_seq: 2,
+        },
+    };
+    send_envelope(&mut stream, &ack);
+    // Give the daemon a moment to process the notification.
+    std::thread::sleep(Duration::from_millis(100));
+    // Drain again and confirm only seq=3 survives.
+    let req = MessageEnvelope {
+        jsonrpc: "2.0".to_string(),
+        method: format!("{}.audit_drain_request", IPC_NAMESPACE),
+        params: IpcMessage::AuditDrainRequest {
+            request_id: "drain-after-ack".to_string(),
+            after_seq: None,
+            max_events: 100,
+        },
+    };
+    send_envelope(&mut stream, &req);
+    let mut buf = Vec::new();
+    let reply = recv_envelope(&mut stream, &mut buf);
+    match reply.params {
+        IpcMessage::AuditDrainResponse { events, .. } => {
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].seq, 3);
+            assert!(events[0].event_canonical_json.contains("\"z\""));
+        }
+        other => panic!("unexpected reply {:?}", other),
+    }
+    let _ = stream;
+    let _ = booted.handle.stop();
+}
+
+#[test]
+fn audit_drain_more_pending_when_capped() {
+    let booted = boot_daemon_with_policy(&[b"{\"r\":1}"]);
+    {
+        let wal = booted.handle.wal_writer().expect("wal");
+        let mut w = wal.lock().unwrap();
+        for i in 0..5 {
+            w.append_critical(&format!("{{\"layer\":\"l1\",\"operation\":\"e{}\"}}", i))
+                .unwrap();
+        }
+    }
+    let mut stream = connect_and_handshake(
+        &booted.socket_path,
+        &booted.signing_key,
+        &booted.fortress_id,
+    );
+    let req = MessageEnvelope {
+        jsonrpc: "2.0".to_string(),
+        method: format!("{}.audit_drain_request", IPC_NAMESPACE),
+        params: IpcMessage::AuditDrainRequest {
+            request_id: "drain-cap".to_string(),
+            after_seq: None,
+            max_events: 2,
+        },
+    };
+    send_envelope(&mut stream, &req);
+    let mut buf = Vec::new();
+    let reply = recv_envelope(&mut stream, &mut buf);
+    match reply.params {
+        IpcMessage::AuditDrainResponse {
+            events,
+            more_pending,
+            next_after_seq,
+            ..
+        } => {
+            assert_eq!(events.len(), 2);
+            assert!(more_pending);
+            assert_eq!(next_after_seq, Some(events[1].seq));
+        }
+        other => panic!("unexpected reply {:?}", other),
+    }
+    let _ = stream;
+    let _ = booted.handle.stop();
+}
