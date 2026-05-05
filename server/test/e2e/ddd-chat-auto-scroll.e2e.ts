@@ -16,7 +16,7 @@
  *     container; scrolling the latest message to viewport-bottom
  *     pushed the composer below the page fold.
  *
- * Operator quote from Pass 5 drill on moltbook Safari: "It does move
+ * Operator quote from Pass 5 drill on Mini1 Safari: "It does move
  * the response up dynamically, but the input box is below the fold,
  * so I still have to scroll."
  *

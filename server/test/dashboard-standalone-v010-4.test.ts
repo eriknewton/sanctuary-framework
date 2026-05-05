@@ -1,7 +1,7 @@
 /**
  * Sanctuary MCP Server — v0.10.4 dashboard tenant-discovery regression tests
  *
- * These tests reproduce the moltbook field failure that v0.10.2 shipped a
+ * These tests reproduce the Mini1 field failure that v0.10.2 shipped a
  * "fix" for but did not actually resolve: `sanctuary dashboard` against a
  * default root that holds orphan identity .enc files (or no state at all)
  * while sub-tenants exist under the same root with their own per-tenant
@@ -194,7 +194,7 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
     expect(out).toMatch(/sanctuary dashboard --multi/);
   });
 
-  it("REPRODUCES the moltbook failure: dashboard against a default root with orphan identity files and no resolvable passphrase throws an actionable error mentioning the storage path", async () => {
+  it("REPRODUCES the Mini1 failure: dashboard against a default root with orphan identity files and no resolvable passphrase throws an actionable error mentioning the storage path", async () => {
     // Plant orphan identity .enc files at the default root via the real
     // production path (no mocks). Do NOT persist the passphrase, so the
     // dashboard cannot resolve it via keychain or fallback file.

@@ -98,7 +98,7 @@ Hotfix release. Closes the v1.1.5 release-blocker (Finding BB from operator-path
 
 ## v1.1.5 - Hotfix (2026-04-27)
 
-Hotfix release. Closes the v1.1.4 release-blockers (Findings Z + AA from moltbook drill arrest at Phase 1.3). Strict superset of v1.1.4; operators on v1.1.4 should upgrade.
+Hotfix release. Closes the v1.1.4 release-blockers (Findings Z + AA from Mini1 drill arrest at Phase 1.3). Strict superset of v1.1.4; operators on v1.1.4 should upgrade.
 
 ### Fixed
 
@@ -349,7 +349,7 @@ Scope-alignment back-out. rc.1 shipped named-agent runtime templates (`x-miner`,
 First release candidate for the v1.0 line. Bundles the v1.0 MVP sprint
 (WP-MVP-1 through WP-MVP-11 plus follow-ups, 26 PRs merged between
 v0.10.6 and `5a73ba4`) with five intrinsic defects surfaced by the
-2026-04-23 acceptance drill on moltbook.
+2026-04-23 acceptance drill on Mini1.
 
 ### Fixed (drill blockers)
 
@@ -463,7 +463,7 @@ dead-claim purge); README rewrite for agent-mediated install (#54).
 ## v0.10.6 (2026-04-20)
 
 ### Fixed
-- **Standalone dashboard reload-loop on a fresh browser tab under loopback auto-auth.** Field signal: moltbook on v0.10.5 confirmed the SSE URL fix (`/api/events` → `/events`) landed cleanly — every documented endpoint returns real data (`/events` streams, `/api/sovereignty-profile` = 200, `/api/proxy/servers` = 200). But the UI still did not render. Mac Mini devtools Network capture (Web Inspector, preserve-log ON) showed the real shape: dozens of identical ~82.91 KB `127.0.0.1` document requests stacked at page-open, zero `fetch(...)` or `EventSource(...)` traffic. A tight client-side reload loop before any data-fetch fires.
+- **Standalone dashboard reload-loop on a fresh browser tab under loopback auto-auth.** Field signal: Mini1 on v0.10.5 confirmed the SSE URL fix (`/api/events` → `/events`) landed cleanly — every documented endpoint returns real data (`/events` streams, `/api/sovereignty-profile` = 200, `/api/proxy/servers` = 200). But the UI still did not render. Mac Mini devtools Network capture (Web Inspector, preserve-log ON) showed the real shape: dozens of identical ~82.91 KB `127.0.0.1` document requests stacked at page-open, zero `fetch(...)` or `EventSource(...)` traffic. A tight client-side reload loop before any data-fetch fires.
 - Root cause: `initialize()` in `server/src/principal-policy/dashboard-html.ts` gated on `sessionStorage.authToken` with `if (!AUTH_TOKEN) { redirectToLogin(); return; }` (line 2909). On a fresh tab at `127.0.0.1:PORT/`, `sessionStorage` is always empty, so `AUTH_TOKEN === ''` and `redirectToLogin()` fires, setting `window.location.href = '/'`. The server serves the dashboard HTML (not the login page) because `isAuthenticated()` recognizes loopback callers under `_autoAuthLocalhost` (`dashboard.ts:458`). Same URL, same server, same auto-auth → HTML served again → JS runs again → still empty sessionStorage → redirect again. **Infinite.**
 - Server-side loopback auto-auth, no client-side mirror. The fix adds a `loopbackAutoAuth: boolean` option to `generateDashboardHTML`, emits `const LOOPBACK_AUTH = <bool>;` alongside `AUTH_TOKEN` at template boot, and changes the init gate to `if (!AUTH_TOKEN && !LOOPBACK_AUTH)`. `dashboard.setAutoAuthLocalhost()` now regenerates the cached HTML since the flag is decided after construction.
 
@@ -479,7 +479,7 @@ dead-claim purge); README rewrite for agent-mediated install (#54).
 ## v0.10.5 (2026-04-19)
 
 ### Fixed
-- **Standalone dashboard panels stuck on "Loading…" even after v0.10.4 loaded identities.** Field signal: moltbook on v0.10.4 reported `Identities loaded: 8` (the v0.10.4 acceptance) but every panel in the browser stayed empty and the status bar flashed blue in a retry loop. Root cause: the dashboard HTML's SSE setup pointed `EventSource` at `/api/events`, but Stack A's server mounts SSE at `/events` (server/src/principal-policy/dashboard.ts:688). Every dashboard boot from v0.10.0 through v0.10.4 sent EventSource into a 404 retry loop. The same code also passed `{ headers: { Authorization: ... } }` to the EventSource constructor, which the standard browser API silently drops — auth has to travel as a cookie or `?session=` query param for SSE.
+- **Standalone dashboard panels stuck on "Loading…" even after v0.10.4 loaded identities.** Field signal: Mini1 on v0.10.4 reported `Identities loaded: 8` (the v0.10.4 acceptance) but every panel in the browser stayed empty and the status bar flashed blue in a retry loop. Root cause: the dashboard HTML's SSE setup pointed `EventSource` at `/api/events`, but Stack A's server mounts SSE at `/events` (server/src/principal-policy/dashboard.ts:688). Every dashboard boot from v0.10.0 through v0.10.4 sent EventSource into a 404 retry loop. The same code also passed `{ headers: { Authorization: ... } }` to the EventSource constructor, which the standard browser API silently drops — auth has to travel as a cookie or `?session=` query param for SSE.
 - The fix is a minimum-change edit: change the URL from `/api/events` to `/events`, drop the broken headers option. The fortress-view dashboard (server/src/cocoon/fortress-view.ts) already does it this way; this commit brings the standard dashboard into line.
 
 ### Added
@@ -487,13 +487,13 @@ dead-claim purge); README rewrite for agent-mediated install (#54).
 
 ### Notes
 - v0.10.5 closes the route-table mismatch only. The Stack A vs Stack B architectural question (the standalone dashboard mounts the older "Principal Dashboard" stack from `server/src/principal-policy/`, while a newer "Protection Dashboard" stack in `server/src/dashboard/` is documented but not mounted) is **out of scope** here per the spawn prompt's hard-stop rule, and remains an open coordinator-level question.
-- Moltbook's three `curl` 404s on `/api/health`, `/api/snapshot`, and `/api/agents` were Stack B routes — correct behaviour for what's actually running, unrelated to the panel-population failure. Documented in the PR audit trail.
+- Mini1's three `curl` 404s on `/api/health`, `/api/snapshot`, and `/api/agents` were Stack B routes — correct behaviour for what's actually running, unrelated to the panel-population failure. Documented in the PR audit trail.
 - `.test-baseline` floor raised from 1661 → 1664 (+3 regression tests). Linux-CI-safe floor; macOS reports 1700.
 
 ## v0.10.4 (2026-04-19)
 
 ### Fixed
-- **Standalone dashboard could not boot on a real multi-tenant install.** v0.10.2 shipped a fix that passed CI but did not land in the field — moltbook saw `Identities loaded: 0` through v0.10.1 → v0.10.2 → v0.10.3. Root cause: the keychain entry per storage path (sha256-derived suffix) was correct, but the dashboard's default-root boot path could not reach the per-tenant entries, and its regression test mocked a wrong schema (one entry per identity, which is not how Sanctuary stores anything).
+- **Standalone dashboard could not boot on a real multi-tenant install.** v0.10.2 shipped a fix that passed CI but did not land in the field — Mini1 saw `Identities loaded: 0` through v0.10.1 → v0.10.2 → v0.10.3. Root cause: the keychain entry per storage path (sha256-derived suffix) was correct, but the dashboard's default-root boot path could not reach the per-tenant entries, and its regression test mocked a wrong schema (one entry per identity, which is not how Sanctuary stores anything).
 - `sanctuary dashboard` against a default root with orphan identity files and no resolvable passphrase now refuses with an actionable error that names the storage path and lists the wrapped tenants discoverable on the host. Pre-fix it threw "Provide SANCTUARY_PASSPHRASE" with no further context.
 - `sanctuary dashboard` against a clean default root that has no Sanctuary state but other wrapped tenants now refuses to fresh-install a recovery key over the default root. Pre-fix this obscured the real tenants.
 - `Encrypted identities found but NONE loaded` warning banner rewritten: removed the misleading `SANCTUARY_PASSPHRASE=<your-passphrase>` fix-hint, surfaced other discoverable tenants, and pointed at the new keychain-schema doc.

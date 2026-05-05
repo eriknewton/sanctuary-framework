@@ -588,7 +588,7 @@ describe("Intelligence router, Finding VV recentFailures field", () => {
 });
 
 // v1.2.0-rc.3 Finding ZZ: end-to-end operator-visible flow.
-// Reproduces the moltbook drill operator's path: bad-substrate runtime
+// Reproduces the Mini1 drill operator's path: bad-substrate runtime
 // failure populates the recent-failures buffer on a surface, operator
 // switches that surface to a working substrate, and the next /status
 // fetch must show empty recentFailures plus a green badge for that
@@ -643,7 +643,7 @@ describe("Intelligence router, Finding ZZ end-to-end status reflects clear", () 
     // the operator-visible recentFailures array on /status is empty.
     // The dashboard SPA renders "View recent failures (N)" from this
     // exact array; if it had persisted, the operator would still see
-    // the Venice-era entries that triggered the moltbook drill. Badge
+    // the Venice-era entries that triggered the Mini1 drill. Badge
     // color and failureClass derive from the static probe (ollama
     // reachability, model tag presence) which depends on the test
     // runner's environment; not asserted here.

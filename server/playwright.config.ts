@@ -8,7 +8,7 @@
  *
  * v1.2.0-rc.5 adds the WebKit project after three consecutive rc.x
  * rounds (rc.2, rc.3, rc.4) shipped fixes that passed Chromium tests
- * and field-failed on moltbook Safari. WebKit-specific divergences in
+ * and field-failed on Mini1 Safari. WebKit-specific divergences in
  * fetch caching and flex layout were the structural gap. Both projects
  * are now first-class CI gates.
  */

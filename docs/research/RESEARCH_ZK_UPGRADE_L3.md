@@ -1,5 +1,7 @@
 # Sanctuary Framework — L3 ZK Proving System Upgrade Research
 
+<!-- Moltbook (capital M) is the agent-to-agent social network; not the Mini1 hostname. -->
+
 **Research Date:** March 31, 2026
 **Scope:** Interactive zero-knowledge proof system upgrade for L3 Selective Disclosure
 **Status:** SCOPING DOCUMENT — RESEARCH ONLY, NO CODE WRITTEN
