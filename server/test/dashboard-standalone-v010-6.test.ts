@@ -107,7 +107,7 @@ describe("v0.10.6: dashboard HTML must not reload-loop under loopback auto-auth"
 
   it("REGRESSION: booted against a real loopback tenant, served HTML embeds LOOPBACK_AUTH = true", async () => {
     // This is the field-shape assertion: boot the dashboard exactly the way
-    // `sanctuary dashboard` does on moltbook, fetch `/` with no auth header,
+    // `sanctuary dashboard` does on Mini1, fetch `/` with no auth header,
     // and assert the emitted HTML contains `LOOPBACK_AUTH = true`.
     //
     // Pre-fix, the constant doesn't exist and this regex returns null.

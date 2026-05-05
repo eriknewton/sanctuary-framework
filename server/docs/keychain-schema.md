@@ -200,7 +200,7 @@ salt would produce a different key and would fail to decrypt prior state.
 
 If `key-params` exists but no passphrase can be resolved at the configured
 `storage_path`, the boot paths refuse to derive. This is the failure mode
-that produced moltbook's `Identities loaded: 0` symptom in v0.10.1–v0.10.3.
+that produced Mini1's `Identities loaded: 0` symptom in v0.10.1–v0.10.3.
 
 ### The recovery key alternative
 

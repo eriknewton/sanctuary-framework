@@ -264,7 +264,7 @@ export async function startStandaloneDashboard(
 
     // v0.10.4: before falling into recovery-key handling against a tenant we
     // could not unlock, check whether the operator probably meant a different
-    // tenant. The most common moltbook failure mode is `sanctuary dashboard`
+    // tenant. The most common Mini1 failure mode is `sanctuary dashboard`
     // run with no flag against a default root that has orphan state but no
     // resolvable passphrase, while sub-tenants exist with their own keychain
     // entries. Surface those sub-tenants instead of the misleading

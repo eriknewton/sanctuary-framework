@@ -164,7 +164,7 @@ async function api(path, opts) {
   // /policies, /activity responses on subsequent GETs even when the
   // server-side state has changed (e.g. recent-failures buffer cleared
   // on substrate flip). The pre-rc.5 client used bare fetch with no
-  // cache control, which on moltbook Safari produced a stale view of
+  // cache control, which on Mini1 Safari produced a stale view of
   // server state and made the operator-visible badge color stick to
   // its prior value across substrate changes. Belt + suspenders:
   // cache: "no-store" turns off the response cache; the _t query

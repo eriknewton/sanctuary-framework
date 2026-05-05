@@ -2,7 +2,7 @@
  * Sanctuary MCP Server — v0.10.5 dashboard route-table regression
  *
  * Field signal that drove this release: v0.10.4 fixed identity loading on a
- * real per-tenant install (`Identities loaded: 8` on moltbook), but every
+ * real per-tenant install (`Identities loaded: 8` on Mini1), but every
  * panel in the browser stayed on "Loading…" and the status bar flashed
  * blue in a retry loop. Coordinator's source-level pass found the cause:
  * the dashboard HTML's SSE setup pointed at `/api/events`, but Stack A's
@@ -228,7 +228,7 @@ describe("v0.10.5: dashboard panels populate — route table matches HTML calls"
   }, 30000);
 
   it("dashboard SSE endpoint returns text/event-stream at the URL the HTML actually calls", async () => {
-    // Direct, narrow assertion of the specific symptom moltbook reported:
+    // Direct, narrow assertion of the specific symptom Mini1 reported:
     // EventSource retry loop. The HTML's SSE URL must be a 200 with
     // event-stream content, not a 404.
     await seedTenant(root, "v010-5-sse-pass");

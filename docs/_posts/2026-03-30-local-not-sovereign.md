@@ -6,6 +6,8 @@ author: Erik Newton
 description: "OpenClaw hit 247K stars and a full security crisis in the same month. The distinction between location sovereignty and architectural sovereignty explains why\u2014and what to do about it."
 ---
 
+<!-- Moltbook (capital M) is the agent-to-agent social network; not the Mini1 hostname. -->
+
 OpenClaw hit 247,000 stars on GitHub in March 2026. In the same month, it became the textbook case for why running code on your machine is a necessary but profoundly insufficient guarantee of security. The distinction matters, and it's structural. Understanding the gap between *location sovereignty* and *architectural sovereignty* is essential for anyone building or running agents. This post examines what went wrong, why it happened, and how the problem can be fixed.
 
 ## The Crisis: Numbers and Scope

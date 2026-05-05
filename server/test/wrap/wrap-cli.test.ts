@@ -376,7 +376,7 @@ describe("runWrap — SEC-061 passphrase leak regression", () => {
       // and the fallback banner is skipped by design. On Linux/Windows
       // there is no Keychain, so the banner always appears — this is
       // what the test was written to cover. Guard the platform-specific
-      // assertion so CI (linux) enforces it but the MBA/moltbook dev
+      // assertion so CI (linux) enforces it but the MBA/Mini1 dev
       // loop doesn't break the suite.
       if (process.platform !== "darwin") {
         expect(allOutput).toContain("Passphrase stored in encrypted fallback file");
