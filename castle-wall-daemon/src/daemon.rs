@@ -12,13 +12,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::audit::{AuditRingBuffer, WalWriter};
+use crate::audit::{AuditRingBuffer, WalError, WalWriter};
 use crate::config::DaemonConfig;
 use crate::constants::{AUDIT_LAYER, SCHEMA_VERSION_V1};
 use crate::failure::{FailureDisposition, FailureMode};
 use crate::ipc::auth::{load_pinned_public_key, AuthError};
 use crate::ipc::server::{IpcServer, IpcServerError};
 use crate::manifest::{ManifestStore, ManifestStoreError};
+use crate::manifest::canonical_json::CanonicalJsonError;
+use crate::policy::{
+    build_audit_event_canonical_json, EvaluationRequest, Verdict,
+};
 
 /// Errors emitted by the daemon lifecycle.
 #[derive(Debug, thiserror::Error)]
@@ -115,6 +119,156 @@ impl DaemonHandle {
     pub fn wal_writer(&self) -> Option<&Arc<Mutex<WalWriter>>> {
         self.wal_writer.as_ref()
     }
+
+    /// Evaluate one outbound attempt against the verified ManifestStore
+    /// snapshot, emit a canonical-JSON audit event into the WAL, and
+    /// return the verdict + the assigned WAL seq.
+    ///
+    /// This is the in-process surface the kernel-binding modules
+    /// (`nftables.rs` / `nfqueue.rs`, future checkpoint) drive. It
+    /// realizes the F-1 deny-by-default invariant and the per-attempt
+    /// audit emission path called out in the Checkpoint 3 dispatch.
+    ///
+    /// Returned verdict is whatever [`PolicySnapshot::evaluate`] decides;
+    /// when the daemon is configured in a transient mode without the
+    /// manifest store or WAL wired, [`AttemptError::ManifestStoreUnwired`]
+    /// or [`AttemptError::WalUnwired`] surfaces.
+    pub fn evaluate_attempt(
+        &self,
+        request: &EvaluationRequest,
+    ) -> Result<EvaluationOutcome, AttemptError> {
+        let store = self
+            .manifest_store
+            .as_ref()
+            .ok_or(AttemptError::ManifestStoreUnwired)?;
+        let wal = self
+            .wal_writer
+            .as_ref()
+            .ok_or(AttemptError::WalUnwired)?;
+
+        let verdict = {
+            let guard = store
+                .lock()
+                .map_err(|_| AttemptError::ManifestStorePoisoned)?;
+            // F-1 deny-by-default: when no snapshot has been loaded, the
+            // verdict is DefaultDeny. The evaluator on an empty snapshot
+            // returns the same shape, so we surface the no-snapshot case
+            // through the same code path.
+            match guard.current_snapshot() {
+                Some(snap) => snap.evaluate(request),
+                None => Verdict::Deny {
+                    reason: crate::policy::DeniedReason::DefaultDeny,
+                },
+            }
+        };
+
+        let timestamp_iso = current_timestamp_iso8601();
+        let event_canonical_json = build_audit_event_canonical_json(
+            &verdict,
+            request,
+            &timestamp_iso,
+        )
+        .map_err(AttemptError::AuditCanonicalize)?;
+
+        let seq = {
+            let mut guard = wal
+                .lock()
+                .map_err(|_| AttemptError::WalPoisoned)?;
+            guard
+                .append_critical(&event_canonical_json)
+                .map_err(AttemptError::WalAppend)?
+        };
+
+        // Mirror into the in-memory ring so `wait_for_shutdown` and other
+        // observers see the same event count the WAL holds. The ring is
+        // capped + TTL-evicted on the wait-loop tick.
+        if let Ok(mut buf) = self.audit_buffer.lock() {
+            buf.append(crate::audit::PendingAuditEvent {
+                event_canonical_json: event_canonical_json.clone(),
+                captured_at: std::time::SystemTime::now(),
+            });
+        }
+
+        Ok(EvaluationOutcome {
+            verdict,
+            wal_seq: seq,
+            event_canonical_json,
+            timestamp_iso8601: timestamp_iso,
+        })
+    }
+}
+
+/// Outcome of [`DaemonHandle::evaluate_attempt`]: the policy decision plus
+/// the durable WAL receipt (assigned seq, canonical-JSON body, ISO-8601
+/// timestamp).
+#[derive(Debug, Clone)]
+pub struct EvaluationOutcome {
+    pub verdict: Verdict,
+    pub wal_seq: u64,
+    pub event_canonical_json: String,
+    pub timestamp_iso8601: String,
+}
+
+/// Errors returned by [`DaemonHandle::evaluate_attempt`].
+#[derive(Debug, thiserror::Error)]
+pub enum AttemptError {
+    #[error("manifest store not wired into this daemon instance")]
+    ManifestStoreUnwired,
+    #[error("WAL writer not wired into this daemon instance")]
+    WalUnwired,
+    #[error("manifest store mutex poisoned")]
+    ManifestStorePoisoned,
+    #[error("WAL writer mutex poisoned")]
+    WalPoisoned,
+    #[error("audit-event canonicalization failed: {0}")]
+    AuditCanonicalize(CanonicalJsonError),
+    #[error("WAL append failed: {0}")]
+    WalAppend(WalError),
+}
+
+/// Render the current wall-clock as an ISO-8601 timestamp suitable for
+/// the `AuditEntry.timestamp` field. Uses UTC; format mirrors the existing
+/// Sanctuary audit-log convention (`YYYY-MM-DDTHH:MM:SS.sssZ`).
+fn current_timestamp_iso8601() -> String {
+    let now = std::time::SystemTime::now();
+    let dur = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_ms = dur.as_millis() as i128;
+    let secs = (total_ms / 1000) as i64;
+    let ms = (total_ms % 1000) as i64;
+    let (y, mo, d, h, mi, s) = ymd_hms_from_unix_seconds(secs);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y, mo, d, h, mi, s, ms
+    )
+}
+
+/// Convert a UNIX-epoch second count into UTC (year, month, day, hour,
+/// minute, second). Avoids an external chrono dep; civil-from-days
+/// algorithm by Howard Hinnant. Valid for any year representable as i32.
+fn ymd_hms_from_unix_seconds(unix_seconds: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let secs_per_day: i64 = 86_400;
+    let mut days = unix_seconds.div_euclid(secs_per_day);
+    let mut secs_of_day = unix_seconds.rem_euclid(secs_per_day);
+    if secs_of_day < 0 {
+        secs_of_day += secs_per_day;
+        days -= 1;
+    }
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = (if m <= 2 { y + 1 } else { y }) as i32;
+    let hour = (secs_of_day / 3600) as u32;
+    let minute = ((secs_of_day % 3600) / 60) as u32;
+    let second = (secs_of_day % 60) as u32;
+    (year, m, d, hour, minute, second)
 }
 
 impl DaemonHandle {
@@ -404,5 +558,213 @@ mod tests {
         }
         let report = handle.stop().expect("stop");
         assert!(report.audit_remaining >= 1);
+    }
+
+    // ----- evaluate_attempt path: F-1 deny-by-default, allow-list match,
+    // ----- per-attempt audit emission via WalWriter ------------------------
+
+    use crate::manifest::canonical_json::canonicalize_to_bytes;
+    use crate::manifest::verify::{
+        AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+    };
+    use crate::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
+    use base64::Engine as _;
+    use ed25519_dalek::Signer;
+    use sha2::{Digest, Sha256};
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let out = hasher.finalize();
+        let mut s = String::with_capacity(out.len() * 2);
+        for b in out.iter() {
+            use std::fmt::Write;
+            let _ = write!(s, "{:02x}", b);
+        }
+        s
+    }
+
+    /// Write a signed manifest containing a single rule with `disposition`
+    /// targeting `host` on port 443 over tcp. Used by the
+    /// evaluate_attempt tests below.
+    fn write_single_rule_policy(
+        policy_dir: &std::path::Path,
+        signing: &SigningKey,
+        rule_id: &str,
+        host: &str,
+        disposition: &str,
+    ) {
+        fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+        let body = format!(
+            "{{\"id\":\"{rule_id}\",\"schema_version\":1,\"created_at\":\"2026-05-05T00:00:00Z\",\"match\":{{\"host\":[\"{host}\"],\"port\":[443],\"protocol\":\"tcp\"}},\"disposition\":\"{disposition}\"}}"
+        );
+        let body_bytes = body.into_bytes();
+        let file = "rule-0.json";
+        fs::write(policy_dir.join(RULES_SUBDIR).join(file), &body_bytes).unwrap();
+        let manifest = AllowlistManifest {
+            schema_version: 1,
+            fortress_id: "deadbeef".to_string(),
+            issued_at: "2026-05-05T00:00:00Z".to_string(),
+            rules: vec![ManifestRuleEntry {
+                rule_id: rule_id.to_string(),
+                file: file.to_string(),
+                sha256: sha256_hex(&body_bytes),
+            }],
+        };
+        let canonical =
+            canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
+        let sig = signing.sign(&canonical);
+        let signed = SignedManifest {
+            manifest,
+            signature: ManifestSignature {
+                signature_scheme: "ed25519-v1".to_string(),
+                signing_key_id: "test".to_string(),
+                signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(sig.to_bytes()),
+            },
+        };
+        let serialized = serde_json::to_string_pretty(&signed).unwrap();
+        fs::write(policy_dir.join(MANIFEST_FILENAME), serialized).unwrap();
+    }
+
+    fn boot_with_single_rule(
+        rule_id: &str,
+        host: &str,
+        disposition: &str,
+    ) -> (DaemonHandle, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let (config, signing) = fresh_config_in(&dir);
+        write_single_rule_policy(&config.policy_dir, &signing, rule_id, host, disposition);
+        let handle = boot(config).expect("boot");
+        (handle, dir)
+    }
+
+    fn req_for(host: Option<&str>, port: u16) -> EvaluationRequest {
+        EvaluationRequest {
+            agent_id: "agent-1".to_string(),
+            agent_template: "claude-code".to_string(),
+            dest_host: host.map(|h| h.to_string()),
+            dest_ip: Some("203.0.113.10".to_string()),
+            dest_port: port,
+            dest_protocol: "tcp".to_string(),
+            opaque: host.is_none(),
+        }
+    }
+
+    #[test]
+    fn evaluate_attempt_default_denies_when_no_snapshot_loaded() {
+        // No manifest on disk; ManifestStore::current_snapshot() = None;
+        // F-1 deny-by-default invariant.
+        let dir = TempDir::new().unwrap();
+        let (config, _signing) = fresh_config_in(&dir);
+        let handle = boot(config).expect("boot");
+        let outcome = handle
+            .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
+            .expect("evaluate");
+        assert!(matches!(
+            outcome.verdict,
+            Verdict::Deny {
+                reason: crate::policy::DeniedReason::DefaultDeny
+            }
+        ));
+        // The audit body matches the canonical egress_blocked + default_deny shape.
+        assert!(outcome.event_canonical_json.contains("\"egress_blocked\""));
+        assert!(outcome.event_canonical_json.contains("\"default_deny\""));
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn evaluate_attempt_allow_path_emits_egress_approved_audit() {
+        let (handle, _dir) =
+            boot_with_single_rule("rule-allow-anthropic", "api.anthropic.com", "allow");
+        let outcome = handle
+            .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
+            .expect("evaluate");
+        match &outcome.verdict {
+            Verdict::Allow { rule_id } => assert_eq!(rule_id, "rule-allow-anthropic"),
+            other => panic!("expected Allow verdict; got {:?}", other),
+        }
+        // The WAL seq monotonically increases past the daemon_started seq=0.
+        assert!(outcome.wal_seq >= 1);
+        assert!(outcome.event_canonical_json.contains("\"egress_approved\""));
+        assert!(
+            outcome
+                .event_canonical_json
+                .contains("\"rule-allow-anthropic\"")
+        );
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn evaluate_attempt_default_deny_path_emits_egress_blocked_audit() {
+        // Allow rule for api.anthropic.com; attempt against a different host
+        // hits default-deny.
+        let (handle, _dir) =
+            boot_with_single_rule("rule-allow-anthropic", "api.anthropic.com", "allow");
+        let outcome = handle
+            .evaluate_attempt(&req_for(Some("pastebin.com"), 443))
+            .expect("evaluate");
+        assert!(matches!(
+            outcome.verdict,
+            Verdict::Deny {
+                reason: crate::policy::DeniedReason::DefaultDeny
+            }
+        ));
+        assert!(outcome.event_canonical_json.contains("\"egress_blocked\""));
+        assert!(outcome.event_canonical_json.contains("\"default_deny\""));
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn evaluate_attempt_explicit_deny_rule_emits_blocked_with_static_rule_provenance() {
+        let (handle, _dir) = boot_with_single_rule("rule-deny-pastebin", "pastebin.com", "deny");
+        let outcome = handle
+            .evaluate_attempt(&req_for(Some("pastebin.com"), 443))
+            .expect("evaluate");
+        match &outcome.verdict {
+            Verdict::Deny {
+                reason: crate::policy::DeniedReason::ExplicitRule { rule_id },
+            } => assert_eq!(rule_id, "rule-deny-pastebin"),
+            other => panic!("expected explicit deny; got {:?}", other),
+        }
+        assert!(outcome.event_canonical_json.contains("\"egress_blocked\""));
+        assert!(outcome.event_canonical_json.contains("\"static_rule\""));
+        assert!(outcome.event_canonical_json.contains("\"rule-deny-pastebin\""));
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn evaluate_attempt_writes_durable_wal_seq_visible_through_handle() {
+        let (handle, _dir) =
+            boot_with_single_rule("rule-allow", "api.anthropic.com", "allow");
+        let first = handle
+            .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
+            .expect("evaluate");
+        let second = handle
+            .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
+            .expect("evaluate");
+        // Each evaluation produces a distinct WAL seq, in order.
+        assert!(second.wal_seq > first.wal_seq);
+        // Mirror appears in the in-memory ring too (one daemon_started + two
+        // evaluation events = at least 3 entries).
+        let ring = handle.audit_buffer.lock().unwrap();
+        assert!(ring.len() >= 3);
+        drop(ring);
+        // Drain via the WAL handle directly to confirm the events landed in
+        // the durable tier.
+        let wal = handle.wal_writer().expect("wal wired");
+        let mut wal_guard = wal.lock().unwrap();
+        let snapshot = wal_guard.snapshot_after(None, 100).expect("snapshot");
+        let bodies: Vec<String> = snapshot
+            .iter()
+            .map(|e| e.event_canonical_json.clone())
+            .collect();
+        let approved_count = bodies
+            .iter()
+            .filter(|b| b.contains("\"egress_approved\""))
+            .count();
+        assert!(approved_count >= 2);
+        drop(wal_guard);
+        let _ = handle.stop();
     }
 }

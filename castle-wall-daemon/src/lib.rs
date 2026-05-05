@@ -30,10 +30,14 @@ pub mod nftables;
 pub mod policy;
 
 pub use config::DaemonConfig;
-pub use daemon::{boot, DaemonError, DaemonExitReport, DaemonHandle};
+pub use daemon::{boot, AttemptError, DaemonError, DaemonExitReport, DaemonHandle, EvaluationOutcome};
 pub use ipc::framing::{frame, parse_frame, ParseStep};
 pub use ipc::messages::{IpcMessage, MessageEnvelope};
 pub use manifest::verify::verify_manifest_signature;
+pub use policy::{
+    build_audit_event_canonical_json, DeniedReason, EvaluationRequest, PolicySnapshot,
+    PolicySnapshotError, Verdict,
+};
 
 /// Wire constants synchronized with `server/src/castle-wall/constants.ts`.
 pub mod constants {

@@ -47,7 +47,17 @@ struct BootedDaemon {
     _dir_keepalive: TempDir,
 }
 
-fn boot_daemon_with_policy(rule_bodies: &[&[u8]]) -> BootedDaemon {
+/// Build a minimally-valid `AllowlistRule` JSON body whose `id` field
+/// matches the manifest entry's `rule_id`. PolicySnapshot construction
+/// requires the body to round-trip through `AllowlistRule`.
+fn rule_body_for(rule_id: &str) -> Vec<u8> {
+    format!(
+        "{{\"id\":\"{rule_id}\",\"schema_version\":1,\"created_at\":\"2026-05-05T00:00:00Z\",\"match\":{{}},\"disposition\":\"allow\"}}"
+    )
+    .into_bytes()
+}
+
+fn boot_daemon_with_policy(rule_count: usize) -> BootedDaemon {
     let dir = TempDir::new().expect("tempdir");
     let policy_dir = dir.path().join("policy/egress");
     let pinned_path = policy_dir.join("pinned.key");
@@ -60,7 +70,7 @@ fn boot_daemon_with_policy(rule_bodies: &[&[u8]]) -> BootedDaemon {
     let pinned = signing.verifying_key().to_bytes();
     fs::write(&pinned_path, pinned).unwrap();
 
-    write_signed_manifest(&policy_dir, &signing, rule_bodies);
+    write_signed_manifest(&policy_dir, &signing, rule_count);
 
     let cfg = DaemonConfig {
         fortress_id: "deadbeef".to_string(),
@@ -84,16 +94,18 @@ fn boot_daemon_with_policy(rule_bodies: &[&[u8]]) -> BootedDaemon {
     }
 }
 
-fn write_signed_manifest(policy_dir: &Path, signing: &SigningKey, rule_bodies: &[&[u8]]) {
+fn write_signed_manifest(policy_dir: &Path, signing: &SigningKey, rule_count: usize) {
     fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
     let mut entries = Vec::new();
-    for (i, body) in rule_bodies.iter().enumerate() {
+    for i in 0..rule_count {
         let file = format!("rule-{}.json", i);
-        fs::write(policy_dir.join(RULES_SUBDIR).join(&file), body).unwrap();
+        let rule_id = format!("uuid-{}", i);
+        let body = rule_body_for(&rule_id);
+        fs::write(policy_dir.join(RULES_SUBDIR).join(&file), &body).unwrap();
         entries.push(ManifestRuleEntry {
-            rule_id: format!("uuid-{}", i),
+            rule_id,
             file,
-            sha256: sha256_hex(body),
+            sha256: sha256_hex(&body),
         });
     }
     let manifest = AllowlistManifest {
@@ -223,7 +235,7 @@ fn read_one_frame(
 
 #[test]
 fn boot_then_policy_reload_succeeds_with_real_manifest_on_disk() {
-    let booted = boot_daemon_with_policy(&[b"{\"r\":1}", b"{\"r\":2}"]);
+    let booted = boot_daemon_with_policy(2);
     let mut stream = connect_and_handshake(
         &booted.socket_path,
         &booted.signing_key,
@@ -261,7 +273,7 @@ fn boot_then_policy_reload_succeeds_with_real_manifest_on_disk() {
 
 #[test]
 fn policy_reload_keeps_prior_on_signature_failure() {
-    let booted = boot_daemon_with_policy(&[b"{\"r\":1}"]);
+    let booted = boot_daemon_with_policy(1);
     // Tamper: rewrite the rule file, breaking the recorded SHA-256 digest.
     fs::write(
         booted.policy_dir.join(RULES_SUBDIR).join("rule-0.json"),
@@ -312,7 +324,7 @@ fn policy_reload_keeps_prior_on_signature_failure() {
 
 #[test]
 fn audit_drain_returns_daemon_started_event_after_boot() {
-    let booted = boot_daemon_with_policy(&[b"{\"r\":1}"]);
+    let booted = boot_daemon_with_policy(1);
     let mut stream = connect_and_handshake(
         &booted.socket_path,
         &booted.signing_key,
@@ -354,7 +366,7 @@ fn audit_drain_returns_daemon_started_event_after_boot() {
 
 #[test]
 fn audit_drain_with_after_seq_skips_already_drained_entries() {
-    let booted = boot_daemon_with_policy(&[b"{\"r\":1}"]);
+    let booted = boot_daemon_with_policy(1);
     // Push three additional WAL entries directly via the helper.
     {
         let wal: &std::sync::Arc<std::sync::Mutex<WalWriter>> =
@@ -398,7 +410,7 @@ fn audit_drain_with_after_seq_skips_already_drained_entries() {
 
 #[test]
 fn audit_drain_ack_truncates_wal_through_seq() {
-    let booted = boot_daemon_with_policy(&[b"{\"r\":1}"]);
+    let booted = boot_daemon_with_policy(1);
     {
         let wal = booted.handle.wal_writer().expect("wal");
         let mut w = wal.lock().unwrap();
@@ -450,8 +462,87 @@ fn audit_drain_ack_truncates_wal_through_seq() {
 }
 
 #[test]
+fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
+    // End-to-end: boot the daemon with one allow rule, drive a real
+    // evaluate_attempt through the DaemonHandle, drain via the IPC server
+    // over a real UDS, and assert the audit event arrives on the wire
+    // with the canonical egress_approved + static_rule shape.
+    use castle_wall_daemon::policy::EvaluationRequest;
+    let booted = boot_daemon_with_policy(0);
+    // Manifest store currently has no rule; reload from disk via the
+    // DaemonHandle to load the snapshot. boot_daemon_with_policy(0) wrote
+    // a manifest with zero rules, so we install a real rule manifest now.
+    let signing = &booted.signing_key;
+    write_signed_manifest(&booted.policy_dir, signing, 1);
+    {
+        let store = booted.handle.manifest_store().expect("store");
+        let mut g = store.lock().unwrap();
+        g.reload().expect("reload");
+    }
+    let request = EvaluationRequest {
+        agent_id: "agent-1".to_string(),
+        agent_template: "claude-code".to_string(),
+        // The minimal rule body has empty match_clause, so any host on
+        // any port over any protocol matches and resolves to allow.
+        dest_host: Some("api.example.com".to_string()),
+        dest_ip: Some("203.0.113.42".to_string()),
+        dest_port: 443,
+        dest_protocol: "tcp".to_string(),
+        opaque: false,
+    };
+    let outcome = booted
+        .handle
+        .evaluate_attempt(&request)
+        .expect("evaluate");
+    // Sanity: the verdict resolved through the rule we installed.
+    assert!(matches!(
+        outcome.verdict,
+        castle_wall_daemon::policy::Verdict::Allow { .. }
+    ));
+
+    let mut stream = connect_and_handshake(
+        &booted.socket_path,
+        &booted.signing_key,
+        &booted.fortress_id,
+    );
+    let drain = MessageEnvelope {
+        jsonrpc: "2.0".to_string(),
+        method: format!("{}.audit_drain_request", IPC_NAMESPACE),
+        params: IpcMessage::AuditDrainRequest {
+            request_id: "drain-eval".to_string(),
+            after_seq: None,
+            max_events: 100,
+        },
+    };
+    send_envelope(&mut stream, &drain);
+    let mut buf = Vec::new();
+    let reply = recv_envelope(&mut stream, &mut buf);
+    match reply.params {
+        IpcMessage::AuditDrainResponse { events, .. } => {
+            // daemon_started + at least one egress_approved.
+            assert!(events.len() >= 2);
+            let approved = events
+                .iter()
+                .find(|e| e.event_canonical_json.contains("\"egress_approved\""))
+                .expect("egress_approved on the wire");
+            assert!(approved.critical, "evaluate_attempt emits critical events");
+            assert!(approved.event_canonical_json.contains("\"l1\""));
+            assert!(approved.event_canonical_json.contains("\"static_rule\""));
+            assert!(approved.event_canonical_json.contains("\"agent-1\""));
+            assert!(approved.event_canonical_json.contains("\"api.example.com\""));
+            // Chain integrity: the egress_approved entry's prior_sha256_hex
+            // is not None (it has at least the daemon_started predecessor).
+            assert!(approved.prior_sha256_hex.is_some());
+        }
+        other => panic!("unexpected reply {:?}", other),
+    }
+    let _ = stream;
+    let _ = booted.handle.stop();
+}
+
+#[test]
 fn audit_drain_more_pending_when_capped() {
-    let booted = boot_daemon_with_policy(&[b"{\"r\":1}"]);
+    let booted = boot_daemon_with_policy(1);
     {
         let wal = booted.handle.wal_writer().expect("wal");
         let mut w = wal.lock().unwrap();

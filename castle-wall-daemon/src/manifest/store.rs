@@ -25,6 +25,7 @@ use crate::manifest::verify::{
     verify_manifest_signature, verify_rule_digests, AllowlistManifest, ManifestSignature,
     SignedManifest, VerifyResult,
 };
+use crate::policy::{PolicySnapshot, PolicySnapshotError};
 
 /// File name of the canonical signed manifest within the policy directory.
 pub const MANIFEST_FILENAME: &str = "manifest.json";
@@ -79,16 +80,29 @@ pub enum ManifestStoreError {
         reason: String,
         issues: Vec<String>,
     },
+    #[error("policy snapshot construction failed: {source_message}")]
+    PolicySnapshot { source_message: String },
+}
+
+impl From<PolicySnapshotError> for ManifestStoreError {
+    fn from(err: PolicySnapshotError) -> Self {
+        ManifestStoreError::PolicySnapshot {
+            source_message: err.to_string(),
+        }
+    }
 }
 
 /// In-memory manifest store. Holds the TOFU-pinned key and the last
-/// successfully-verified `LoadedManifest` snapshot (if any).
+/// successfully-verified `LoadedManifest` snapshot (if any), plus a
+/// derived [`PolicySnapshot`] that the policy evaluator runs against on
+/// every outbound attempt.
 #[derive(Debug)]
 pub struct ManifestStore {
     policy_dir: PathBuf,
     pinned_key_path: PathBuf,
     pinned_key: [u8; 32],
     current: Option<LoadedManifest>,
+    current_snapshot: Option<PolicySnapshot>,
 }
 
 impl ManifestStore {
@@ -100,6 +114,7 @@ impl ManifestStore {
             pinned_key_path,
             pinned_key,
             current: None,
+            current_snapshot: None,
         }
     }
 
@@ -160,14 +175,26 @@ impl ManifestStore {
         self.current.as_ref()
     }
 
-    /// Try to reload the manifest from disk. On success returns a reference
-    /// to the new current snapshot. On any failure the `current` field is
-    /// left untouched (F-2 disposition: keep prior good policy) and the
-    /// caller surfaces the error to Sanctuary main as a PolicyReloadResponse
-    /// with `ok: false` and the error message.
+    /// Borrow the current [`PolicySnapshot`] derived from the last
+    /// successful reload. None until the first successful reload.
+    pub fn current_snapshot(&self) -> Option<&PolicySnapshot> {
+        self.current_snapshot.as_ref()
+    }
+
+    /// Try to reload the manifest from disk and rebuild the derived
+    /// [`PolicySnapshot`]. On success returns a reference to the new
+    /// current `LoadedManifest`. On any failure (signature verify, rule
+    /// digest, snapshot construction) the `current` and `current_snapshot`
+    /// fields are left untouched (F-2 disposition: keep prior good policy
+    /// in force) and the caller surfaces the error to Sanctuary main as a
+    /// `PolicyReloadResponse` with `ok: false`.
     pub fn reload(&mut self) -> Result<&LoadedManifest, ManifestStoreError> {
         let next = load_signed_manifest_from_disk(&self.policy_dir, &self.pinned_key)?;
+        // Build the snapshot before mutating self so a parse / id-mismatch
+        // failure on the rule bodies preserves the prior good snapshot.
+        let snapshot = PolicySnapshot::from_loaded_manifest(&next)?;
         self.current = Some(next);
+        self.current_snapshot = Some(snapshot);
         Ok(self.current.as_ref().expect("current set above"))
     }
 }
@@ -282,7 +309,24 @@ mod tests {
         signing_key: SigningKey,
     }
 
-    fn write_valid_policy(rule_bodies: &[&[u8]]) -> WrittenPolicy {
+    /// Build a minimally-valid `AllowlistRule` JSON body whose `id` field
+    /// matches the manifest entry's `rule_id`. The store tests historically
+    /// used opaque blobs like `{"a":1}` because the loader did not parse
+    /// rule bodies; PolicySnapshot construction now does, so the bodies
+    /// must round-trip through `AllowlistRule`.
+    fn rule_body_for(rule_id: &str) -> Vec<u8> {
+        let body = format!(
+            "{{\"id\":\"{rule_id}\",\"schema_version\":1,\"created_at\":\"2026-05-05T00:00:00Z\",\"match\":{{}},\"disposition\":\"allow\"}}"
+        );
+        body.into_bytes()
+    }
+
+    /// Write a signed-manifest policy directory with `count` minimally-valid
+    /// rule bodies under `<dir>/rules/rule-N.json`. Returns the directory
+    /// handle, the pinned key the manifest was signed under, and the
+    /// signing key for tests that re-sign. Tests that want to exercise
+    /// failure paths corrupt the on-disk artifacts after this returns.
+    fn write_valid_policy(count: usize) -> WrittenPolicy {
         let signing = SigningKey::generate(&mut OsRng);
         let pinned_key = signing.verifying_key().to_bytes();
         let dir = TempDir::new().unwrap();
@@ -290,13 +334,15 @@ mod tests {
         fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
 
         let mut entries = Vec::new();
-        for (i, body) in rule_bodies.iter().enumerate() {
+        for i in 0..count {
             let file = format!("rule-{}.json", i);
-            fs::write(policy_dir.join(RULES_SUBDIR).join(&file), body).unwrap();
+            let rule_id = format!("uuid-{}", i);
+            let body = rule_body_for(&rule_id);
+            fs::write(policy_dir.join(RULES_SUBDIR).join(&file), &body).unwrap();
             entries.push(ManifestRuleEntry {
-                rule_id: format!("uuid-{}", i),
+                rule_id,
                 file,
-                sha256: sha256_hex(body),
+                sha256: sha256_hex(&body),
             });
         }
 
@@ -333,7 +379,7 @@ mod tests {
 
     #[test]
     fn load_signed_manifest_happy_path() {
-        let policy = write_valid_policy(&[b"{\"id\":\"r0\"}", b"{\"id\":\"r1\"}"]);
+        let policy = write_valid_policy(2);
         let loaded = load_signed_manifest_from_disk(policy.dir.path(), &policy.pinned_key)
             .expect("load");
         assert_eq!(loaded.rule_count, 2);
@@ -343,7 +389,7 @@ mod tests {
 
     #[test]
     fn load_fails_when_manifest_signature_does_not_verify() {
-        let policy = write_valid_policy(&[b"{\"a\":1}"]);
+        let policy = write_valid_policy(1);
         // Replace the pinned key with a different one so the existing
         // signature cannot verify against it.
         let attacker = SigningKey::generate(&mut OsRng);
@@ -354,7 +400,7 @@ mod tests {
 
     #[test]
     fn load_fails_when_rule_file_missing() {
-        let policy = write_valid_policy(&[b"{\"a\":1}"]);
+        let policy = write_valid_policy(1);
         // Remove the rule file referenced by the manifest.
         fs::remove_file(policy.dir.path().join(RULES_SUBDIR).join("rule-0.json")).unwrap();
         let err = load_signed_manifest_from_disk(policy.dir.path(), &policy.pinned_key).unwrap_err();
@@ -363,7 +409,7 @@ mod tests {
 
     #[test]
     fn load_fails_when_rule_file_tampered() {
-        let policy = write_valid_policy(&[b"{\"a\":1}"]);
+        let policy = write_valid_policy(1);
         // Swap the rule file body without updating the manifest digest.
         fs::write(
             policy.dir.path().join(RULES_SUBDIR).join("rule-0.json"),
@@ -376,7 +422,7 @@ mod tests {
 
     #[test]
     fn load_fails_when_manifest_missing() {
-        let policy = write_valid_policy(&[b"{\"a\":1}"]);
+        let policy = write_valid_policy(1);
         fs::remove_file(policy.dir.path().join(MANIFEST_FILENAME)).unwrap();
         let err = load_signed_manifest_from_disk(policy.dir.path(), &policy.pinned_key).unwrap_err();
         assert!(matches!(err, ManifestStoreError::ManifestIo { .. }));
@@ -384,7 +430,7 @@ mod tests {
 
     #[test]
     fn load_fails_when_schema_version_unknown() {
-        let policy = write_valid_policy(&[b"{\"a\":1}"]);
+        let policy = write_valid_policy(1);
         // Rewrite the manifest with an unsupported schema_version. The
         // signature will then fail too, but schema_version is checked first.
         let raw = fs::read_to_string(policy.dir.path().join(MANIFEST_FILENAME)).unwrap();
@@ -396,7 +442,7 @@ mod tests {
 
     #[test]
     fn store_reload_updates_current_on_success() {
-        let policy = write_valid_policy(&[b"{\"a\":1}"]);
+        let policy = write_valid_policy(1);
         let pinned_path = policy.dir.path().join("pinned.key");
         fs::write(&pinned_path, policy.pinned_key).unwrap();
         let mut store = ManifestStore::new(
@@ -411,9 +457,102 @@ mod tests {
     }
 
     #[test]
+    fn store_reload_builds_policy_snapshot() {
+        let policy = write_valid_policy(2);
+        let pinned_path = policy.dir.path().join("pinned.key");
+        fs::write(&pinned_path, policy.pinned_key).unwrap();
+        let mut store = ManifestStore::new(
+            policy.dir.path().to_path_buf(),
+            pinned_path,
+            policy.pinned_key,
+        );
+        assert!(store.current_snapshot().is_none());
+        store.reload().expect("reload");
+        let snap = store.current_snapshot().expect("snapshot");
+        assert_eq!(snap.rules.len(), 2);
+        assert_eq!(snap.fortress_id, "deadbeef");
+        // Rule ids derived from rule_body_for("uuid-N").
+        assert_eq!(snap.rules[0].id, "uuid-0");
+        assert_eq!(snap.rules[1].id, "uuid-1");
+    }
+
+    #[test]
+    fn store_reload_keeps_prior_snapshot_on_rule_parse_failure() {
+        // Tighter F-2 invariant: even when the rule digest matches but the
+        // rule body fails to round-trip through AllowlistRule, the prior
+        // snapshot is retained.
+        let policy = write_valid_policy(1);
+        let pinned_path = policy.dir.path().join("pinned.key");
+        fs::write(&pinned_path, policy.pinned_key).unwrap();
+        let mut store = ManifestStore::new(
+            policy.dir.path().to_path_buf(),
+            pinned_path,
+            policy.pinned_key,
+        );
+        store.reload().expect("first reload");
+        let prior_snapshot_rule_count = store.current_snapshot().unwrap().rules.len();
+
+        // Re-write the rule body to something whose SHA-256 still matches
+        // the manifest entry but does NOT parse as AllowlistRule. We do this
+        // by re-signing the manifest with a body that has the digest the
+        // manifest entry expects. The simpler equivalent: rewrite the rule
+        // body AND the manifest digest to keep the digest aligned but the
+        // body invalid as AllowlistRule.
+        let rule_path = policy.dir.path().join(RULES_SUBDIR).join("rule-0.json");
+        let bad_body = b"{\"id\":\"uuid-0\",\"schema_version\":1}";
+        // Can't simply overwrite, the digest in the existing manifest no
+        // longer matches. The real demonstration here is via the snapshot
+        // construction error class. Use the lower-level constructor to
+        // exercise it.
+        fs::write(&rule_path, bad_body).unwrap();
+        // Bump the manifest's digest entry to match this body so the
+        // digest gate doesn't trip first; the snapshot construction is the
+        // gate we want to exercise.
+        let raw =
+            fs::read_to_string(policy.dir.path().join(MANIFEST_FILENAME)).unwrap();
+        // Compute the new digest and resign the manifest.
+        use base64::Engine;
+        use ed25519_dalek::Signer;
+        let new_digest = sha256_hex(bad_body);
+        // Parse the existing signed manifest, swap the digest, re-canonicalize, re-sign.
+        let parsed: super::ParsedSignedManifest = serde_json::from_str(&raw).unwrap();
+        let mut new_manifest = parsed.manifest.clone();
+        if let Some(entry) = new_manifest.rules.first_mut() {
+            entry.sha256 = new_digest;
+        }
+        let canonical = canonicalize_to_bytes(&serde_json::to_value(&new_manifest).unwrap()).unwrap();
+        let new_sig = policy.signing_key.sign(&canonical);
+        let new_sig_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(new_sig.to_bytes());
+        let new_envelope = SignedManifest {
+            manifest: new_manifest,
+            signature: ManifestSignature {
+                signature_scheme: crate::constants::SIGNATURE_SCHEME_V1.to_string(),
+                signing_key_id: "test".to_string(),
+                signature_b64url: new_sig_b64,
+            },
+        };
+        let serialized = serde_json::to_string_pretty(&super::ParsedSignedManifest {
+            manifest: new_envelope.manifest,
+            signature: new_envelope.signature,
+        })
+        .unwrap();
+        fs::write(policy.dir.path().join(MANIFEST_FILENAME), serialized).unwrap();
+
+        // Now the manifest signature + digest are clean, but the rule body
+        // is missing required AllowlistRule fields (no `match`, no
+        // `disposition`). The reload should fail at snapshot construction;
+        // the prior snapshot must remain in force.
+        let err = store.reload().unwrap_err();
+        assert!(matches!(err, ManifestStoreError::PolicySnapshot { .. }));
+        let kept = store.current_snapshot().expect("prior snapshot retained");
+        assert_eq!(kept.rules.len(), prior_snapshot_rule_count);
+    }
+
+    #[test]
     fn store_reload_keeps_prior_on_failure() {
         // F-2 disposition: a failed reload leaves `current` unchanged.
-        let policy = write_valid_policy(&[b"{\"a\":1}"]);
+        let policy = write_valid_policy(1);
         let pinned_path = policy.dir.path().join("pinned.key");
         fs::write(&pinned_path, policy.pinned_key).unwrap();
         let mut store = ManifestStore::new(
@@ -442,7 +581,7 @@ mod tests {
 
     #[test]
     fn persist_new_pinned_key_atomically_replaces_pin_file() {
-        let policy = write_valid_policy(&[b"{\"a\":1}"]);
+        let policy = write_valid_policy(1);
         let pinned_path = policy.dir.path().join("pinned.key");
         fs::write(&pinned_path, policy.pinned_key).unwrap();
         let mut store = ManifestStore::new(
