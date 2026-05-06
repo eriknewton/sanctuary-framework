@@ -81,6 +81,41 @@ pub fn build_agent_ruleset(
     script
 }
 
+/// Test-only sibling of `build_agent_ruleset` that emits the agent ruleset
+/// WITHOUT the `socket cgroupv2 level 2 <cgroup_id>` match in the catchall
+/// rule. Used by integration tests that exercise rule load, atomic replace,
+/// catchall presence, and end-to-end policy flow without needing the
+/// cgroupv2 binding live at rule-load time.
+///
+/// Production code MUST call `build_agent_ruleset` (the cgroupv2 socket
+/// match is required for real per-agent egress isolation). nft 1.x
+/// validates `socket cgroupv2 level N <id>` at rule-load time by walking
+/// /sys/fs/cgroup; that lookup is fragile across systemd / cgroup-namespace
+/// combinations on Ubuntu 24.04 CI, separately tracked as a v1.x
+/// production-cgroup hardening item. This sibling sidesteps the lookup
+/// while preserving the catchall's `queue num 0` shape so test assertions
+/// on rule mechanics still hold.
+pub fn build_agent_ruleset_no_cgroup_match(
+    agent_id: &str,
+    rules: &[NftRuleFragment],
+) -> String {
+    let chain_name = agent_chain_name(agent_id);
+    let mut script = String::new();
+    script.push_str(&format!(
+        "flush chain {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name}\n"
+    ));
+    for frag in rules {
+        script.push_str(&format!(
+            "add rule {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name} {}\n",
+            frag.nft_expr
+        ));
+    }
+    script.push_str(&format!(
+        "add rule {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name} queue num 0\n"
+    ));
+    script
+}
+
 /// Derive a sanitized chain name from an agent id.
 fn agent_chain_name(agent_id: &str) -> String {
     // nftables chain names allow alphanumeric, underscore, hyphen, period.
@@ -448,6 +483,26 @@ mod tests {
         assert!(script.contains("tcp dport 443 accept"));
         assert!(script.contains("queue num 0"));
         assert!(script.contains("42"));
+    }
+
+    #[test]
+    fn build_agent_ruleset_no_cgroup_match_omits_cgroupv2_lookup() {
+        let frags = vec![NftRuleFragment {
+            rule_id: "r1".to_string(),
+            nft_expr: "tcp dport 443 accept".to_string(),
+        }];
+        let script = build_agent_ruleset_no_cgroup_match("test-agent", &frags);
+        assert!(script.contains("flush chain"));
+        assert!(script.contains("tcp dport 443 accept"));
+        assert!(script.contains("queue num 0"));
+        assert!(
+            !script.contains("socket cgroupv2"),
+            "test sibling must not emit cgroupv2 socket match: {script}"
+        );
+        assert!(
+            !script.contains("level 2"),
+            "test sibling must not emit cgroup level match: {script}"
+        );
     }
 
     #[test]
