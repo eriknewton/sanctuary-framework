@@ -144,13 +144,13 @@ pub fn verify_handshake_response(
 pub fn peer_uid_for_stream(stream: &std::os::unix::net::UnixStream) -> Result<u32, AuthError> {
     use nix::sys::socket::sockopt::PeerCredentials;
     use nix::sys::socket::getsockopt;
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::{AsRawFd, BorrowedFd};
     let fd = stream.as_raw_fd();
-    // SAFETY: we own the fd via &UnixStream borrow; getsockopt reads the
-    // SO_PEERCRED option without retaining the fd.
-    let cred =
-        getsockopt(unsafe { &nix::fcntl::OwnedFdProxy::from_raw_fd_borrowed(fd) }, PeerCredentials)
-            .map_err(|err| AuthError::PeerCred(err.to_string()))?;
+    // SAFETY: the &UnixStream borrow keeps the fd alive for the duration
+    // of this call; getsockopt reads SO_PEERCRED without retaining the fd.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let cred = getsockopt(&borrowed, PeerCredentials)
+        .map_err(|err| AuthError::PeerCred(err.to_string()))?;
     Ok(cred.uid())
 }
 

@@ -241,7 +241,7 @@ mod linux {
     }
 
     pub fn remove_castle_table_impl() -> Result<(), NftablesError> {
-        run_nft(&["delete", "table", CASTLE_FAMILY, CASTLE_TABLE])
+        run_nft(&["delete", "table", CASTLE_FAMILY, CASTLE_TABLE]).map(|_| ())
     }
 
     pub fn table_exists_impl() -> Result<bool, NftablesError> {
