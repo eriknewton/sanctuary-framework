@@ -14,7 +14,7 @@ use castle_wall_daemon::nftables::{
     self, AgentRulesetId, NftRuleFragment, CASTLE_FAMILY, CASTLE_TABLE,
 };
 use castle_wall_daemon::cgroup;
-use castle_wall_daemon::nfqueue::{self, NfVerdict, NfqueueConfig, PendingPacket};
+use castle_wall_daemon::nfqueue::{self, NfqueueConfig};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -391,7 +391,7 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
 
     // Verify WAL has both events.
     let wal = handle.wal_writer().expect("wal");
-    let wal_guard = wal.lock().unwrap();
+    let mut wal_guard = wal.lock().unwrap();
     let snapshot = wal_guard.snapshot_after(None, 100).expect("snapshot");
     let approved = snapshot.iter().filter(|e| e.event_canonical_json.contains("\"egress_approved\"")).count();
     let blocked = snapshot.iter().filter(|e| e.event_canonical_json.contains("\"egress_blocked\"")).count();
