@@ -35,27 +35,48 @@ fn cleanup_castle_table() {
         .output();
 }
 
-/// Create an ephemeral cgroup at level 2 from root and return its path + inode.
-/// nftables `socket cgroupv2 level 2 <id>` resolves the id to a real cgroup at
-/// rule-load time, so tests must reference a real cgroup that exists on the
-/// runner. Layout: /sys/fs/cgroup/sanctuary-castle-test-<name>/inner-<name>/
-/// (root -> level 1 -> level 2 leaf).
+/// Create a transient systemd scope for testing and return its path + cgroup id.
+/// nftables `socket cgroupv2 level 2 <id>` validates the cgroup id at rule-load
+/// time by walking /sys/fs/cgroup. Plain mkdir cgroups under /sys/fs/cgroup
+/// are not always resolvable by nft (observed on Ubuntu 24.04 CI runner with
+/// nft 1.x), so tests use systemd-run --scope to create cgroups under
+/// /sys/fs/cgroup/system.slice/<name>.scope/ that mirror the production path.
 fn create_test_cgroup(name: &str) -> (PathBuf, u64) {
     use std::os::unix::fs::MetadataExt;
-    let outer = PathBuf::from(format!("/sys/fs/cgroup/sanctuary-castle-test-{name}"));
-    let inner = outer.join(format!("inner-{name}"));
-    std::fs::create_dir_all(&inner)
-        .unwrap_or_else(|e| panic!("create test cgroup {}: {}", inner.display(), e));
-    let meta = std::fs::metadata(&inner)
-        .unwrap_or_else(|e| panic!("metadata {}: {}", inner.display(), e));
-    (inner, meta.ino())
+    let unit = format!("sanctuary-castle-test-{name}.scope");
+    let cgroup_path = PathBuf::from(format!("/sys/fs/cgroup/system.slice/{unit}"));
+
+    // Best-effort cleanup of any prior run.
+    let _ = Command::new("systemctl").args(["stop", &unit]).output();
+
+    let output = Command::new("systemd-run")
+        .args([
+            "--scope",
+            "--unit",
+            &unit,
+            "--property=Delegate=yes",
+            "--remain-after-exit",
+            "/bin/true",
+        ])
+        .output()
+        .expect("systemd-run available on Linux CI");
+    if !output.status.success() {
+        panic!(
+            "systemd-run --scope failed for {}: {}",
+            unit,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let meta = std::fs::metadata(&cgroup_path)
+        .unwrap_or_else(|e| panic!("metadata {}: {}", cgroup_path.display(), e));
+    (cgroup_path, meta.ino())
 }
 
-/// Tear down the ephemeral cgroup created by `create_test_cgroup`.
-fn destroy_test_cgroup(inner: &std::path::Path) {
-    let _ = std::fs::remove_dir(inner);
-    if let Some(outer) = inner.parent() {
-        let _ = std::fs::remove_dir(outer);
+/// Tear down the transient scope created by `create_test_cgroup`.
+fn destroy_test_cgroup(cgroup_path: &std::path::Path) {
+    if let Some(unit_name) = cgroup_path.file_name().and_then(|n| n.to_str()) {
+        let _ = Command::new("systemctl").args(["stop", unit_name]).output();
     }
 }
 
