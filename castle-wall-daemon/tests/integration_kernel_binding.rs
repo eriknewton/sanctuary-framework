@@ -35,17 +35,12 @@ fn cleanup_castle_table() {
         .output();
 }
 
-/// Create a transient systemd service unit for testing and return its cgroup
-/// path + cgroup id. nftables `socket cgroupv2 level 2 <id>` validates cgroup
-/// ids by walking /sys/fs/cgroup at rule-load time. Cgroups under
-/// /sys/fs/cgroup/system.slice/<name>.service/ are reliably resolvable.
-///
-/// Two earlier approaches failed on the Ubuntu 24.04 runner: plain mkdir
-/// cgroups (nft 1.x cgroupv2 path lookup did not find ad-hoc cgroups), and
-/// `systemd-run --scope --remain-after-exit` (newer systemd rejects
-/// --remain-after-exit in --scope mode). Service mode with RemainAfterExit=yes
-/// is the working shape: a transient .service unit runs /bin/true once and
-/// stays active so its cgroup directory persists for the test lifetime.
+/// Create a transient systemd service running a long sleep and return its
+/// cgroup path + cgroup id. nftables `socket cgroupv2 level 2 <id>`
+/// validates cgroup ids at rule-load time by walking /sys/fs/cgroup; an
+/// empty cgroup is reaped quickly even with RemainAfterExit=yes, so the
+/// service must keep at least one process alive. /bin/sleep 60 is plenty
+/// for the integration test (whole suite finishes in seconds).
 fn create_test_cgroup(name: &str) -> (PathBuf, u64) {
     use std::os::unix::fs::MetadataExt;
     let unit = format!("sanctuary-castle-test-{name}.service");
@@ -58,8 +53,8 @@ fn create_test_cgroup(name: &str) -> (PathBuf, u64) {
         .args([
             "--unit",
             &unit,
-            "--property=RemainAfterExit=yes",
-            "/bin/true",
+            "/bin/sleep",
+            "60",
         ])
         .output()
         .expect("systemd-run available on Linux CI");
