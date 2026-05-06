@@ -197,8 +197,10 @@ fn nfqueue_config_default_fail_open_off() {
 
 #[test]
 fn nfqueue_bind_rejects_fail_open_true() {
-    let mut config = NfqueueConfig::default();
-    config.fail_open = true;
+    let config = NfqueueConfig {
+        fail_open: true,
+        ..Default::default()
+    };
     let result = nfqueue::bind_queue(&config);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("FAIL_OPEN"));

@@ -390,8 +390,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn bind_queue_rejects_fail_open_true() {
-        let mut config = NfqueueConfig::default();
-        config.fail_open = true;
+        let config = NfqueueConfig {
+            fail_open: true,
+            ..Default::default()
+        };
         let err = bind_queue_impl(&config);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();

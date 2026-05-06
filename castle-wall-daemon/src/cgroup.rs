@@ -8,7 +8,7 @@
 //!
 //! All kernel-touching functions are `#[cfg(target_os = "linux")]`-gated.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Errors emitted by the cgroup module.
 #[derive(Debug, thiserror::Error)]
@@ -141,7 +141,7 @@ mod linux {
     /// nftables resolves paths to inode IDs at rule-load time, so we must
     /// re-resolve and re-install rules when a scope is destroyed and
     /// recreated.
-    pub fn resolve_cgroup_id(cgroup_path: &PathBuf) -> Result<u64, CgroupError> {
+    pub fn resolve_cgroup_id(cgroup_path: &Path) -> Result<u64, CgroupError> {
         use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(cgroup_path).map_err(|e| {
             CgroupError::IdResolutionFailed(format!(
@@ -177,7 +177,7 @@ mod linux {
     /// Move a process into a cgroup scope by writing its PID to the
     /// cgroup.procs file. Used by the verdict loop to classify wrapped
     /// agent processes into their assigned cgroup.
-    pub fn classify_pid(cgroup_path: &PathBuf, pid: u32) -> Result<(), CgroupError> {
+    pub fn classify_pid(cgroup_path: &Path, pid: u32) -> Result<(), CgroupError> {
         let procs_path = cgroup_path.join("cgroup.procs");
         fs::write(&procs_path, pid.to_string()).map_err(|e| {
             CgroupError::InvocationFailed(format!(
@@ -227,23 +227,23 @@ pub fn destroy_agent_scope(_handle: &ScopeHandle) -> Result<(), CgroupError> {
 
 /// Resolve a cgroup path to its inode ID for nftables matching.
 #[cfg(target_os = "linux")]
-pub fn resolve_cgroup_id(cgroup_path: &PathBuf) -> Result<u64, CgroupError> {
+pub fn resolve_cgroup_id(cgroup_path: &Path) -> Result<u64, CgroupError> {
     linux::resolve_cgroup_id(cgroup_path)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn resolve_cgroup_id(_cgroup_path: &PathBuf) -> Result<u64, CgroupError> {
+pub fn resolve_cgroup_id(_cgroup_path: &Path) -> Result<u64, CgroupError> {
     Err(CgroupError::NotAvailableOnPlatform)
 }
 
 /// Move a process into a cgroup scope.
 #[cfg(target_os = "linux")]
-pub fn classify_pid(cgroup_path: &PathBuf, pid: u32) -> Result<(), CgroupError> {
+pub fn classify_pid(cgroup_path: &Path, pid: u32) -> Result<(), CgroupError> {
     linux::classify_pid(cgroup_path, pid)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn classify_pid(_cgroup_path: &PathBuf, _pid: u32) -> Result<(), CgroupError> {
+pub fn classify_pid(_cgroup_path: &Path, _pid: u32) -> Result<(), CgroupError> {
     Err(CgroupError::NotAvailableOnPlatform)
 }
 
