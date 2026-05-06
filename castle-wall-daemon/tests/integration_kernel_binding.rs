@@ -161,10 +161,12 @@ fn nftables_ruleset_includes_nfqueue_catchall() {
     let script = nftables::build_agent_ruleset_no_cgroup_match("test-queue", &frags);
     nftables::load_agent_ruleset(&id, &script).expect("load");
 
+    // nft canonicalizes the input rule form `queue num 0` to `queue to 0`
+    // in its listing output, so the assertion matches the listing form.
     let out = nft_cmd(&["list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "agent_test-queue"]);
     assert!(
-        out.contains("queue num 0"),
-        "ruleset should include NFQUEUE catch-all (queue num 0): {}",
+        out.contains("queue to 0"),
+        "ruleset should include NFQUEUE catch-all (queue to 0 in nft listing): {}",
         out
     );
 
