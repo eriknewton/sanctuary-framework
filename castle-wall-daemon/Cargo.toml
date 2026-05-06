@@ -24,6 +24,12 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 thiserror = "1.0"
+nix = { version = "0.27", default-features = false, features = ["fs", "user", "signal", "socket", "process", "poll", "net"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify = "0.10"
+nfq = "0.2"
 
 [dev-dependencies]
 tempfile = "3.10"

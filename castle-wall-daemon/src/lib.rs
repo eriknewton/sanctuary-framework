@@ -1,7 +1,7 @@
 //! Castle Wall daemon library surface.
 //!
-//! PR 2a ships the IPC contract path plus module stubs for the Linux
-//! kernel-enforcement work that lands in PR 2b. The crate has two modes:
+//! PR 2b ships the daemon lifecycle and the kernel-enforcement modules
+//! behind the IPC contract that PR 2a established. The crate has two modes:
 //!
 //! 1. Library: pure Rust types and helpers used by both the binary and the
 //!    integration tests in `tests/`. The IPC framing parser, the LSP-style
@@ -13,7 +13,6 @@
 //!    listen-on-socket, accept-and-handshake, JSON-RPC dispatch). On
 //!    non-Linux targets the binary still compiles but the kernel-touching
 //!    modules return structured "not implemented on this platform" errors.
-//!    PR 2b replaces those stubs with real nftables / cgroup / NFQUEUE work.
 //!
 //! Source: Castle_Wall_Phase1_Scope_Lock_2026-05-03.md (sections 1, 4, 5,
 //! 6, 7, 8). Parent ADR: Castle_Architecture_ADR_2026-04-30.md.
@@ -22,6 +21,7 @@ pub mod approval;
 pub mod audit;
 pub mod cgroup;
 pub mod config;
+pub mod daemon;
 pub mod failure;
 pub mod ipc;
 pub mod manifest;
@@ -30,9 +30,14 @@ pub mod nftables;
 pub mod policy;
 
 pub use config::DaemonConfig;
+pub use daemon::{boot, AttemptError, DaemonError, DaemonExitReport, DaemonHandle, EvaluationOutcome};
 pub use ipc::framing::{frame, parse_frame, ParseStep};
 pub use ipc::messages::{IpcMessage, MessageEnvelope};
 pub use manifest::verify::verify_manifest_signature;
+pub use policy::{
+    build_audit_event_canonical_json, DeniedReason, EvaluationRequest, PolicySnapshot,
+    PolicySnapshotError, Verdict,
+};
 
 /// Wire constants synchronized with `server/src/castle-wall/constants.ts`.
 pub mod constants {

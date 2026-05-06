@@ -1,0 +1,100 @@
+name: Castle Wall Linux Integration
+
+# Runs Rust integration tests for the Castle Wall daemon on Linux with
+# CAP_NET_ADMIN. Exercises the full NFQUEUE round-trip end-to-end against
+# real netfilter, the real daemon, and the real WalWriter.
+#
+# Per scope-lock section 9 Tier 0/1: these tests run on every PR and every
+# push to main. The binding does not count as working until this job passes.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  castle-wall-linux-integration:
+    runs-on: ubuntu-24.04
+    # Run as root so nftables + NFQUEUE + cgroup operations succeed
+    # without additional capability grants. CAP_NET_ADMIN is available
+    # to root by default on GitHub Actions Ubuntu runners.
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nftables libnetfilter-queue-dev libnfnetlink-dev
+
+      - name: Load nfnetlink_queue kernel module
+        run: |
+          sudo modprobe nfnetlink_queue || true
+          lsmod | grep nfnetlink || echo "nfnetlink modules may be built-in"
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            castle-wall-daemon/target
+          key: castle-wall-${{ runner.os }}-cargo-${{ hashFiles('castle-wall-daemon/Cargo.lock', 'castle-wall-daemon/Cargo.toml') }}
+          restore-keys: |
+            castle-wall-${{ runner.os }}-cargo-
+
+      - name: Verify nft binary available
+        run: |
+          which nft
+          nft --version
+          # Verify we can create tables (CAP_NET_ADMIN check)
+          sudo nft add table inet test-cap-check
+          sudo nft delete table inet test-cap-check
+          echo "CAP_NET_ADMIN confirmed"
+
+      - name: Verify cgroup v2 available
+        run: |
+          mount | grep cgroup2 || mount | grep "type cgroup2"
+          ls /sys/fs/cgroup/cgroup.controllers
+          echo "cgroup v2 confirmed"
+
+      - name: Verify systemd available
+        run: |
+          systemctl --version || echo "systemd not available (expected in container)"
+          # On GitHub Actions Ubuntu runners, systemd IS PID 1.
+          cat /proc/1/comm
+
+      - name: cargo check
+        working-directory: castle-wall-daemon
+        run: cargo check --all-targets
+
+      - name: cargo clippy (warnings as errors)
+        working-directory: castle-wall-daemon
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version ^0.22
+
+      - name: cargo audit (RustSec advisory database)
+        working-directory: castle-wall-daemon
+        run: cargo audit --deny warnings
+
+      - name: cargo test (lib + integration, as root for kernel access)
+        working-directory: castle-wall-daemon
+        run: |
+          # Run all tests including Linux-gated integration tests.
+          # NFQUEUE and nftables tests need root.
+          sudo -E env "PATH=$PATH" cargo test --all-targets -- --test-threads=1 2>&1
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug
+
+      - name: Cleanup nftables state
+        if: always()
+        run: |
+          sudo nft delete table inet sanctuary-castle 2>/dev/null || true

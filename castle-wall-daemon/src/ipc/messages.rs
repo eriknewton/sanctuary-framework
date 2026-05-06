@@ -58,6 +58,35 @@ pub enum IpcMessage {
         window_end: String,
         by_destination: Vec<MetricBatchEntry>,
     },
+    /// Sanctuary main asks the daemon to drain WAL entries strictly above
+    /// `after_seq`. Capped at `max_events`. Per scope-lock §8 hybrid pull
+    /// model: main drives the pace; daemon never pushes audits unsolicited
+    /// once the IPC link is healthy.
+    #[serde(rename = "audit_drain_request")]
+    AuditDrainRequest {
+        request_id: String,
+        after_seq: Option<u64>,
+        max_events: u32,
+    },
+    /// Daemon's response carrying a batch of WAL entries (canonical-JSON of
+    /// the AuditEntry plus chain metadata). `more_pending` signals that the
+    /// daemon hit the `max_events` cap and additional entries remain to be
+    /// drained on a subsequent request.
+    #[serde(rename = "audit_drain_response")]
+    AuditDrainResponse {
+        request_id: String,
+        events: Vec<AuditDrainEvent>,
+        next_after_seq: Option<u64>,
+        more_pending: bool,
+        wal_overflow_count: u64,
+    },
+    /// Sanctuary main acknowledges that it has durably committed events up
+    /// through `last_acked_seq`. Daemon truncates the WAL through that seq.
+    #[serde(rename = "audit_drain_ack")]
+    AuditDrainAck {
+        request_id: String,
+        last_acked_seq: u64,
+    },
     #[serde(rename = "unlock_notification")]
     UnlockNotification {
         fortress_id: String,
@@ -115,6 +144,19 @@ pub struct MetricBatchEntry {
     pub agent_id: String,
     pub allowed_count: u64,
     pub blocked_count: u64,
+}
+
+/// One drained WAL entry on the wire. Mirrors `audit::WalEntry` but kept
+/// distinct so the IPC schema can evolve independently of on-disk format.
+/// `captured_at_unix_ms` is u64 (not u128) so the wire shape round-trips
+/// cleanly through serde_json.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditDrainEvent {
+    pub seq: u64,
+    pub captured_at_unix_ms: u64,
+    pub prior_sha256_hex: Option<String>,
+    pub event_canonical_json: String,
+    pub critical: bool,
 }
 
 #[cfg(test)]

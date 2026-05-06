@@ -1,55 +1,115 @@
 # castle-wall-daemon
 
-Sanctuary Castle Wall filter daemon. Castle Architecture Layer 1 enforcement: the kernel itself blocks unauthorized cross-boundary calls so even prompt-injected agents cannot bypass.
+The OS-level egress filter that enforces the operator's allow-list at the
+kernel boundary. Castle Architecture Layer 1: the kernel itself blocks
+unauthorized cross-boundary calls, so even a prompt-injected agent cannot
+exfiltrate. Cooperative MCP gates (Castle Layer 3) sit on top for compliant
+agents; this daemon is the deterministic enforcement layer underneath them.
 
-This crate ships in two PRs.
+## Status
 
-## PR 2a (this PR): IPC contract path + Rust scaffold
+Phase 1 Linux: shipped through PR 2b checkpoints 1 to 5 on
+`wp-castle-wall-pr2b-kernel-impl`. The crate compiles on macOS, Linux, and
+Windows; the kernel-touching modules (`nftables`, `cgroup`, `nfqueue`) only
+bind real kernel resources on Linux and refuse to start with structured
+errors elsewhere.
 
-Lands the load-bearing surfaces that PR 2b's kernel work needs:
+Phase 2 macOS Network Extension: queued behind Apple Developer Program
+filing.
 
-- LSP-style framing: `src/ipc/framing.rs`. Mirrors `server/src/castle-wall/ipc/framing.ts` byte-for-byte.
-- Message envelopes: `src/ipc/messages.rs`. Mirrors `server/src/castle-wall/ipc/messages.ts`. Serde-derived JSON.
-- Manifest verifier: `src/manifest/verify.rs`. Ed25519 + canonical-JSON + per-rule SHA-256, mirroring `server/src/castle-wall/allowlist/parse.ts`.
-- Canonical-JSON encoder: `src/manifest/canonical_json.rs`. Mirrors `server/src/mesh/canonical-json.ts`.
-- WAL audit ring buffer: `src/audit.rs`. In-memory portion; PR 2b adds the disk writer.
-- Approval coalescing + nonce store: `src/approval.rs`. Pure data structures and pure decision functions.
-- Failure-mode dispatch: `src/failure.rs`. F-1 through F-8 default disposition table.
-- Policy snapshot types: `src/policy.rs`. The shape PR 2b's evaluator runs against.
-- Daemon configuration: `src/config.rs`. CLI argv parsing and canonical Linux layout defaults.
-- Module stubs (kernel-touching): `src/nftables.rs`, `src/cgroup.rs`, `src/nfqueue.rs`. Each declares its public surface and returns `NotImplementedInPhase2a` until PR 2b lands.
+Phase 3 Windows WFP: queued behind Phase 2.
 
-Binary behavior in PR 2a: `--help` and `--phase2a-stub` flags work end-to-end. Without `--phase2a-stub` the binary refuses to run and points the operator at the README.
+## Architecture
 
-## PR 2b (separate dispatch): kernel enforcement
+Three layers of source, named after the surface they own.
 
-Replaces the stubs with real implementations:
+1. **Manifest store + WAL audit.** `src/manifest/` parses, verifies, and
+   pins the signed allowlist; `src/audit.rs` writes a tamper-evident
+   ring-buffer-backed WAL with chained SHA-256 hashes, fsync-per-entry,
+   and TTL plus size-cap eviction. `src/manifest/watcher.rs` reloads on
+   inotify events with TOFU pinning and cross-signed rotation.
+2. **IPC contract.** `src/ipc/` exposes the LSP-style framing parser
+   (`framing.rs`), the JSON-RPC envelope shapes (`messages.rs`), the
+   handshake authenticator (`auth.rs`), and the UDS server
+   (`server.rs`). The framing is byte-for-byte compatible with the
+   TypeScript main-process side at `server/src/castle-wall/ipc/`.
+3. **Kernel binding.** `src/nftables.rs` installs the `sanctuary-castle`
+   table and per-agent rulesets via the `nft` CLI with atomic
+   `add table` plus `flush` plus `add rule` transactions; `src/cgroup.rs`
+   creates systemd transient scopes per wrapped agent and resolves their
+   numeric cgroup-id through the systemd journal listener;
+   `src/nfqueue.rs` binds the `nfq` crate with `NFQA_CFG_F_FAIL_OPEN`
+   explicitly disabled (Codex amendment 7).
 
-- nftables CLI shell-out with atomic ruleset replacement; rules installed in dedicated `sanctuary-castle` table for E7.2 namespace separation.
-- cgroup v2 systemd transient scope creation per wrapped agent; cgroup-id resolution via systemd journal listener (the cgroup-id-renumbering pattern from `systemd-cgroup-nftables-policy-manager`).
-- NFQUEUE bind via the `nfq` crate with `NFQA_CFG_F_FAIL_OPEN` explicitly **disabled** (Codex amendment 7).
-- inotify manifest watcher with TOFU pinning + cross-signed rotation acceptance.
-- Disk-backed WAL writer with `fsync`-per-entry and TTL + size-cap eviction.
-- Watchdogs that detect each FailureMode and call `failure::default_disposition()`.
-- DNS / DoH / DoT bypass test suite per scope-lock §1 + §9.
+`src/daemon.rs` ties the three layers together and orchestrates the boot
+sequence; `src/failure.rs` maps every failure mode to a fail-closed,
+fail-degraded, or refuse-to-start disposition with operator-facing
+messages.
 
-PR 2b also adds the new `castle-wall-linux-integration` GitHub Actions job that runs the kernel integration tests on `ubuntu-22.04` and `ubuntu-24.04` runners with `CAP_NET_ADMIN`.
+## Local setup
 
-## Source
+Requires Rust stable 1.74 or newer (Cargo.toml `rust-version`).
 
-- `Review/Sanctuary/Castle_Wall_Phase1_Scope_Lock_2026-05-03.md` (ratified post-Codex amendments)
-- `Review/Sanctuary/Castle_Architecture_ADR_2026-04-30.md` (parent ADR)
-- PR #117 on `eriknewton/sanctuary-framework` (PR 1: TypeScript interfaces and types)
-
-## Build
+Linux build dependencies:
 
 ```sh
-cargo build --release
+sudo apt-get install -y nftables libnetfilter-queue-dev libnfnetlink-dev
+```
+
+Build and run unit tests on any platform:
+
+```sh
+cd castle-wall-daemon
+cargo build
 cargo test
 ```
 
-The release binary is intended to land at `/usr/local/libexec/sanctuary/castle-wall-daemon` per the systemd unit at `systemd/sanctuary-castle-wall.service`.
+The Linux integration tests under `tests/` need root because they install
+real nftables tables, attach NFQUEUE binds, and create cgroup v2 scopes:
 
-## Castle-walking test answer for PR 2a
+```sh
+cd castle-wall-daemon
+sudo -E env "PATH=$PATH" cargo test --all-targets -- --test-threads=1
+```
 
-PR 2a ships the contract path that PR 2b's kernel enforcement consumes. The Castle Layer 1 enforcement promise is satisfied across the wave (PR 2a + PR 2b merged); PR 2a alone does not enforce. The TS runtime + Rust scaffold + module stubs are designed so PR 2b's drop-in implementations land without contract changes.
+The release binary is intended to land at
+`/usr/local/libexec/sanctuary/castle-wall-daemon` per the systemd unit at
+`systemd/sanctuary-castle-wall.service`. Inspect the unit before installing
+locally; it constrains `CapabilityBoundingSet` and `RestrictAddressFamilies`
+to the minimum set the daemon needs.
+
+To cross-check Linux builds from a macOS host:
+
+```sh
+rustup target add x86_64-unknown-linux-gnu
+cd castle-wall-daemon
+cargo check --target x86_64-unknown-linux-gnu --all-targets
+cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
+```
+
+## CI surface
+
+Two GitHub Actions workflows guard this crate.
+
+1. **`Castle Wall Linux Integration`** at
+   `.github/workflows/castle-wall-linux.yml`. Runs `cargo check`,
+   `cargo clippy --all-targets -- -D warnings`, and the full
+   `cargo test --all-targets` suite (lib unittests plus integration) on
+   `ubuntu-24.04` as root with `CAP_NET_ADMIN`. Fires on every PR to main
+   and every push to main.
+2. **`CI` Linux cross-compile gate** at `.github/workflows/ci.yml`. Runs
+   `cargo check --target x86_64-unknown-linux-gnu --all-targets` from a
+   macOS-style developer host so contract changes that compile on macOS
+   but break on Linux are caught before they reach the Linux runner.
+
+Both jobs must be green before this PR can be marked ready-for-review.
+
+## Source
+
+- `Review/Sanctuary/Castle_Wall_Phase1_Scope_Lock_2026-05-03.md`
+  (ratified post-Codex amendments).
+- `Review/Sanctuary/Castle_Architecture_ADR_2026-04-30.md` (parent ADR;
+  the architectural intent that this crate enforces).
+- PR #117 (PR 1: TypeScript interfaces and types).
+- PR #119 (PR 2a: IPC contract path plus Rust scaffold).
+- PR #124 (PR 2b: kernel enforcement binding).
