@@ -77,6 +77,13 @@ jobs:
         working-directory: castle-wall-daemon
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version ^0.22
+
+      - name: cargo audit (RustSec advisory database)
+        working-directory: castle-wall-daemon
+        run: cargo audit --deny warnings
+
       - name: cargo test (lib + integration, as root for kernel access)
         working-directory: castle-wall-daemon
         run: |
