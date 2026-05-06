@@ -376,7 +376,8 @@ pub fn rule_to_nft_expr(
             if !port_expr.is_empty() {
                 expr.push_str(&format!(" {port_expr}"));
             }
-            expr.push_str(&format!(" comment \"host={host}\" {disposition_expr}"));
+            // nft syntax: comment must follow the verdict, not precede it.
+            expr.push_str(&format!(" {disposition_expr} comment \"host={host}\""));
             frags.push(NftRuleFragment {
                 rule_id: rule.id.clone(),
                 nft_expr: expr,
