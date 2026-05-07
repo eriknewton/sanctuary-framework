@@ -15,8 +15,8 @@ Group=sanctuary
 
 # Capabilities. PR 2a does not bind any kernel resources; PR 2b adds the
 # specific CAP_NET_ADMIN bound required for nftables and NFQUEUE.
-CapabilityBoundingSet=
-AmbientCapabilities=
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=true
 
 # Filesystem hardening.
