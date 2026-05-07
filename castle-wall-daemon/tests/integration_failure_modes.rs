@@ -34,10 +34,15 @@
 //!   reason=queue_saturated; QueueHandle.packets_saturated counter mechanism
 //!   exercised against the real Atomic counter.
 //! - RuntimeAuditWalAppendFailed -> dispatch maps to FailClosed with
-//!   reason=audit_wal_append_failed; the unit-level dispatch test in
-//!   failure.rs::tests::audit_wal_append_failure_fails_closed already
-//!   covers the mapping. Real WAL append failure injection has no clean
-//!   API today; tracked as a v1.x coverage gap.
+//!   reason=audit_wal_append_failed. Three coverage tiers: (1) the unit
+//!   dispatch test in failure.rs::tests::audit_wal_append_failure_fails_closed
+//!   covers the mapping; (2) the dispatch-tier integration test in this
+//!   file (audit_wal_append_failure_dispatch_is_fail_closed) keeps the
+//!   section 9 catalog trace contiguous; (3) the lib unit tests in
+//!   src/daemon.rs::tests::evaluate_attempt_fails_closed_when_wal_append_errors
+//!   (and the two override companions) exercise the daemon's real
+//!   reaction through evaluate_attempt using the WalWriter::injection_handle
+//!   #[cfg(test)] seam.
 //!
 //! Linux-gated. cfg-out on macOS so `cargo test` on the dev sandbox sees
 //! zero tests from this file.
@@ -589,11 +594,17 @@ fn audit_wal_append_failure_dispatch_is_fail_closed() {
     // trace contiguous in the tests/ directory and binds the assertion to
     // the actual FailureDisposition variant.
     //
-    // Real WAL append failure injection (e.g., a forced fsync error mid-
-    // append) has no clean public API today; tracked as a v1.x integration
-    // coverage gap in this file's module-level docstring. Once the daemon
-    // grows a programmatic "inject WAL failure" hook for testing, the
-    // real failure path lands here.
+    // The end-to-end real-injection path is covered by the lib unit tests
+    // in `src/daemon.rs::tests`:
+    //   - evaluate_attempt_fails_closed_when_wal_append_errors
+    //   - evaluate_attempt_fail_closed_on_wal_failure_overrides_default_deny_too
+    //   - evaluate_attempt_fail_closed_on_wal_failure_overrides_explicit_deny
+    // Those tests use the `WalWriter::injection_handle` test seam (which
+    // is `#[cfg(test)]`-gated and lives only in the lib's test build) to
+    // synthesize a `WalError::Io` shape and exercise the daemon's
+    // `RuntimeAuditWalAppendFailed` dispatch through `evaluate_attempt`.
+    // This integration test keeps the section 9 catalog trace contiguous
+    // by binding the dispatch-table assertion at the integration tier.
     let disposition = default_disposition(FailureMode::RuntimeAuditWalAppendFailed);
     match disposition {
         FailureDisposition::FailClosed { emit_event, reason } => {

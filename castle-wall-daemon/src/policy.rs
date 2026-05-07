@@ -224,6 +224,13 @@ pub enum DeniedReason {
     /// A rule matched and explicitly denied. Carries the rule id so the
     /// operator dashboard can show "blocked by rule X."
     ExplicitRule { rule_id: String },
+    /// Daemon-side WAL append failed. Per scope-lock section 7 the
+    /// `RuntimeAuditWalAppendFailed` failure mode dispatches to FailClosed
+    /// regardless of the original allow/deny verdict; without a durable
+    /// audit chain the egress decision cannot be reconstructed, so the
+    /// safe default is to drop the packet. Mapped to the `egress_blocked`
+    /// audit operation with `decision_provenance = "audit_wal_append_failed"`.
+    AuditWalAppendFailed,
 }
 
 /// Snapshot of the loaded policy. Built from a verified [`LoadedManifest`]
@@ -363,6 +370,9 @@ fn decision_provenance(verdict: &Verdict) -> &'static str {
         Verdict::Deny {
             reason: DeniedReason::ExplicitRule { .. },
         } => "static_rule",
+        Verdict::Deny {
+            reason: DeniedReason::AuditWalAppendFailed,
+        } => "audit_wal_append_failed",
     }
 }
 
@@ -379,7 +389,9 @@ fn result_for_verdict(verdict: &Verdict) -> &'static str {
 }
 
 /// Pull the rule_id (if any) that drove the verdict, for the audit entry's
-/// `details.rule_id_matched` field. None on default-deny.
+/// `details.rule_id_matched` field. None on default-deny and on the
+/// audit-WAL-append-failed dispatch (where the original verdict was
+/// discarded in favor of fail-closed).
 fn matched_rule_id(verdict: &Verdict) -> Option<&str> {
     match verdict {
         Verdict::Allow { rule_id } => Some(rule_id.as_str()),
@@ -389,6 +401,9 @@ fn matched_rule_id(verdict: &Verdict) -> Option<&str> {
         } => Some(rule_id.as_str()),
         Verdict::Deny {
             reason: DeniedReason::DefaultDeny,
+        } => None,
+        Verdict::Deny {
+            reason: DeniedReason::AuditWalAppendFailed,
         } => None,
     }
 }

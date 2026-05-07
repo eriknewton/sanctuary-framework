@@ -247,6 +247,20 @@ pub struct WalWriter {
     next_seq: u64,
     last_chain_hash_hex: Option<String>,
     bytes_written: u64,
+    /// Test-only injection seam. Setting this AtomicBool causes the next
+    /// `append_critical` / `append_metric` call to short-circuit with a
+    /// synthesized `WalError::Io` BEFORE touching the file. The error
+    /// shape is byte-for-byte indistinguishable from a real OS-side
+    /// `WalError::Io` from the daemon evaluator's perspective, so the
+    /// `RuntimeAuditWalAppendFailed` dispatch path can be exercised
+    /// end-to-end without filesystem manipulation. WalWriter state
+    /// (next_seq, last_chain_hash_hex, bytes_written) is NOT advanced on
+    /// an injected failure, mirroring the real-error invariant.
+    ///
+    /// Test-only and not part of the production daemon's surface; the
+    /// field is `#[cfg(test)]`-gated so a release build does not carry it.
+    #[cfg(test)]
+    inject_io_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WalWriter {
@@ -312,7 +326,20 @@ impl WalWriter {
             next_seq,
             last_chain_hash_hex,
             bytes_written: bytes,
+            #[cfg(test)]
+            inject_io_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Test-only handle to the injection flag. The handle is cloned so the
+    /// caller can hold an injection switch independently of any later
+    /// `Arc<Mutex<WalWriter>>` borrow. Setting the AtomicBool to `true`
+    /// causes the next append (critical or metric) to fail with a
+    /// synthesized `WalError::Io` shape; setting it back to `false`
+    /// restores normal append behavior.
+    #[cfg(test)]
+    pub fn injection_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.inject_io_error.clone()
     }
 
     /// Append a critical event with `fsync` per scope-lock §8 OQ #2.
@@ -332,6 +359,16 @@ impl WalWriter {
         critical: bool,
         fsync: bool,
     ) -> Result<u64, WalError> {
+        #[cfg(test)]
+        if self
+            .inject_io_error
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(WalError::Io {
+                path: self.path.clone(),
+                source_message: "test-injected append failure".to_string(),
+            });
+        }
         let entry = WalEntry {
             seq: self.next_seq,
             captured_at_unix_ms: SystemTime::now()

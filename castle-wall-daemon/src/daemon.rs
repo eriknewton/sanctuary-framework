@@ -15,13 +15,13 @@ use std::time::{Duration, Instant};
 use crate::audit::{AuditRingBuffer, WalError, WalWriter};
 use crate::config::DaemonConfig;
 use crate::constants::{AUDIT_LAYER, SCHEMA_VERSION_V1};
-use crate::failure::{FailureDisposition, FailureMode};
+use crate::failure::{default_disposition, FailureDisposition, FailureMode};
 use crate::ipc::auth::{load_pinned_public_key, AuthError};
 use crate::ipc::server::{IpcServer, IpcServerError};
 use crate::manifest::{ManifestStore, ManifestStoreError};
 use crate::manifest::canonical_json::CanonicalJsonError;
 use crate::policy::{
-    build_audit_event_canonical_json, EvaluationRequest, Verdict,
+    build_audit_event_canonical_json, DeniedReason, EvaluationRequest, Verdict,
 };
 
 /// Errors emitted by the daemon lifecycle.
@@ -170,41 +170,100 @@ impl DaemonHandle {
         )
         .map_err(AttemptError::AuditCanonicalize)?;
 
-        let seq = {
+        let append_result = {
             let mut guard = wal
                 .lock()
                 .map_err(|_| AttemptError::WalPoisoned)?;
-            guard
-                .append_critical(&event_canonical_json)
-                .map_err(AttemptError::WalAppend)?
+            guard.append_critical(&event_canonical_json)
         };
 
-        // Mirror into the in-memory ring so `wait_for_shutdown` and other
-        // observers see the same event count the WAL holds. The ring is
-        // capped + TTL-evicted on the wait-loop tick.
-        if let Ok(mut buf) = self.audit_buffer.lock() {
-            buf.append(crate::audit::PendingAuditEvent {
-                event_canonical_json: event_canonical_json.clone(),
-                captured_at: std::time::SystemTime::now(),
-            });
-        }
+        match append_result {
+            Ok(seq) => {
+                // Mirror into the in-memory ring so `wait_for_shutdown` and
+                // other observers see the same event count the WAL holds.
+                // The ring is capped + TTL-evicted on the wait-loop tick.
+                if let Ok(mut buf) = self.audit_buffer.lock() {
+                    buf.append(crate::audit::PendingAuditEvent {
+                        event_canonical_json: event_canonical_json.clone(),
+                        captured_at: std::time::SystemTime::now(),
+                    });
+                }
+                Ok(EvaluationOutcome {
+                    verdict,
+                    wal_seq: Some(seq),
+                    event_canonical_json,
+                    timestamp_iso8601: timestamp_iso,
+                })
+            }
+            Err(_wal_err) => {
+                // Scope-lock section 7 / section 8: the
+                // RuntimeAuditWalAppendFailed dispatch forces fail-closed
+                // regardless of the original verdict. Without a durable
+                // audit chain the egress decision cannot be reconstructed,
+                // so the verdict-loop must drop the packet.
+                let disposition =
+                    default_disposition(FailureMode::RuntimeAuditWalAppendFailed);
+                debug_assert!(
+                    matches!(
+                        disposition,
+                        FailureDisposition::FailClosed {
+                            emit_event: "egress_blocked",
+                            reason: "audit_wal_append_failed",
+                        }
+                    ),
+                    "RuntimeAuditWalAppendFailed must dispatch to FailClosed \
+                     with emit_event=egress_blocked, reason=audit_wal_append_failed",
+                );
+                let _ = disposition;
 
-        Ok(EvaluationOutcome {
-            verdict,
-            wal_seq: seq,
-            event_canonical_json,
-            timestamp_iso8601: timestamp_iso,
-        })
+                let fail_closed_verdict = Verdict::Deny {
+                    reason: DeniedReason::AuditWalAppendFailed,
+                };
+                let fail_closed_canonical_json = build_audit_event_canonical_json(
+                    &fail_closed_verdict,
+                    request,
+                    &timestamp_iso,
+                )
+                .map_err(AttemptError::AuditCanonicalize)?;
+
+                // Mirror the synthesized fail-closed event into the
+                // in-memory ring so the next ACK can carry a
+                // wal_overflow_loss-equivalent record per scope-lock
+                // section 8. The original (allow/deny) audit body is
+                // intentionally NOT mirrored: the durable record never
+                // reached the WAL, and the in-memory ring's contract is
+                // "events the verdict-loop acted on," which is the
+                // fail-closed shape.
+                if let Ok(mut buf) = self.audit_buffer.lock() {
+                    buf.append(crate::audit::PendingAuditEvent {
+                        event_canonical_json: fail_closed_canonical_json.clone(),
+                        captured_at: std::time::SystemTime::now(),
+                    });
+                }
+
+                Ok(EvaluationOutcome {
+                    verdict: fail_closed_verdict,
+                    wal_seq: None,
+                    event_canonical_json: fail_closed_canonical_json,
+                    timestamp_iso8601: timestamp_iso,
+                })
+            }
+        }
     }
 }
 
 /// Outcome of [`DaemonHandle::evaluate_attempt`]: the policy decision plus
 /// the durable WAL receipt (assigned seq, canonical-JSON body, ISO-8601
-/// timestamp).
+/// timestamp). `wal_seq` is `None` when the daemon's
+/// `RuntimeAuditWalAppendFailed` dispatch fired, in which case `verdict`
+/// is the synthesized fail-closed `Verdict::Deny { reason:
+/// DeniedReason::AuditWalAppendFailed }` and `event_canonical_json`
+/// reflects the fail-closed audit shape rather than the original
+/// allow/deny outcome.
 #[derive(Debug, Clone)]
 pub struct EvaluationOutcome {
     pub verdict: Verdict,
-    pub wal_seq: u64,
+    pub wal_seq: Option<u64>,
     pub event_canonical_json: String,
     pub timestamp_iso8601: String,
 }
@@ -685,7 +744,7 @@ mod tests {
             other => panic!("expected Allow verdict; got {:?}", other),
         }
         // The WAL seq monotonically increases past the daemon_started seq=0.
-        assert!(outcome.wal_seq >= 1);
+        assert!(outcome.wal_seq.expect("wal_seq present on success") >= 1);
         assert!(outcome.event_canonical_json.contains("\"egress_approved\""));
         assert!(
             outcome
@@ -744,7 +803,9 @@ mod tests {
             .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
             .expect("evaluate");
         // Each evaluation produces a distinct WAL seq, in order.
-        assert!(second.wal_seq > first.wal_seq);
+        let first_seq = first.wal_seq.expect("first wal_seq present on success");
+        let second_seq = second.wal_seq.expect("second wal_seq present on success");
+        assert!(second_seq > first_seq);
         // Mirror appears in the in-memory ring too (one daemon_started + two
         // evaluation events = at least 3 entries).
         let ring = handle.audit_buffer.lock().unwrap();
@@ -765,6 +826,233 @@ mod tests {
             .count();
         assert!(approved_count >= 2);
         drop(wal_guard);
+        let _ = handle.stop();
+    }
+
+    // ----- RuntimeAuditWalAppendFailed real-injection coverage --------------
+    //
+    // Closes the v1.x housekeeping (2) gap: the failure-mode dispatch table
+    // was already covered at the unit tier (failure.rs) and the integration
+    // tier (integration_failure_modes.rs:audit_wal_append_failure_dispatch_is_fail_closed),
+    // but no test exercised the end-to-end path through evaluate_attempt
+    // when the WAL really fails. The companion injection seam at
+    // `audit::WalWriter::injection_handle` bypasses the file write and
+    // synthesizes a `WalError::Io` shape byte-for-byte indistinguishable
+    // from a real OS-side error from the daemon evaluator's perspective.
+
+    #[test]
+    fn evaluate_attempt_fails_closed_when_wal_append_errors() {
+        // Allow rule for api.anthropic.com so the unforced verdict would be
+        // Allow. With WAL append injected to fail, the dispatch must
+        // override that verdict to FailClosed (Deny + audit_wal_append_failed)
+        // per scope-lock section 7 / section 8.
+        let (handle, _dir) =
+            boot_with_single_rule("rule-allow-anthropic", "api.anthropic.com", "allow");
+
+        // Snapshot ring-buffer baseline (boot path persisted daemon_started).
+        let baseline_ring_len = handle.audit_buffer.lock().unwrap().len();
+
+        // Snapshot WAL baseline so we can confirm no new entry landed on disk.
+        let wal_arc = handle.wal_writer().expect("wal wired").clone();
+        let baseline_wal_count = {
+            let mut guard = wal_arc.lock().unwrap();
+            guard
+                .snapshot_after(None, 1024)
+                .expect("baseline snapshot")
+                .len()
+        };
+        let baseline_next_seq = wal_arc.lock().unwrap().next_seq();
+        let baseline_chain = wal_arc.lock().unwrap().last_chain_hash_hex().map(|s| s.to_string());
+
+        // Arm the injection: the next append_critical inside evaluate_attempt
+        // will short-circuit with a synthesized WalError::Io.
+        let injection = wal_arc.lock().unwrap().injection_handle();
+        injection.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = handle
+            .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
+            .expect("evaluate_attempt must Ok-with-fail-closed, not propagate Err");
+
+        // Disarm so the daemon can shut down cleanly.
+        injection.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // 1) Verdict is the synthesized fail-closed shape, NOT the original Allow.
+        match &outcome.verdict {
+            Verdict::Deny {
+                reason: DeniedReason::AuditWalAppendFailed,
+            } => {}
+            other => panic!(
+                "expected Verdict::Deny(AuditWalAppendFailed); got {other:?}"
+            ),
+        }
+
+        // 2) wal_seq is None: no durable record landed.
+        assert!(
+            outcome.wal_seq.is_none(),
+            "wal_seq must be None on fail-closed dispatch; got {:?}",
+            outcome.wal_seq
+        );
+
+        // 3) Audit body reflects the fail-closed shape (egress_blocked +
+        //    audit_wal_append_failed provenance), NOT the original
+        //    egress_approved that would have been emitted on the Allow path.
+        assert!(
+            outcome
+                .event_canonical_json
+                .contains("\"egress_blocked\""),
+            "fail-closed audit body must contain egress_blocked; got {}",
+            outcome.event_canonical_json
+        );
+        assert!(
+            outcome
+                .event_canonical_json
+                .contains("\"audit_wal_append_failed\""),
+            "fail-closed audit body must contain audit_wal_append_failed provenance; got {}",
+            outcome.event_canonical_json
+        );
+        assert!(
+            !outcome
+                .event_canonical_json
+                .contains("\"egress_approved\""),
+            "fail-closed audit body must NOT contain egress_approved; got {}",
+            outcome.event_canonical_json
+        );
+
+        // 4) The in-memory ring buffer absorbed the fail-closed event.
+        let ring_after = handle.audit_buffer.lock().unwrap();
+        assert_eq!(
+            ring_after.len(),
+            baseline_ring_len + 1,
+            "ring buffer should have grown by exactly one (the fail-closed mirror)"
+        );
+        let mirrored = ring_after
+            .iter()
+            .last()
+            .expect("ring has at least one entry")
+            .event_canonical_json
+            .clone();
+        assert!(mirrored.contains("\"egress_blocked\""));
+        assert!(mirrored.contains("\"audit_wal_append_failed\""));
+        drop(ring_after);
+
+        // 5) WAL state is unchanged: no entry persisted, next_seq did not
+        //    advance, chain hash unchanged. The injection short-circuits the
+        //    append BEFORE any state mutation, mirroring the real-error
+        //    invariant.
+        let mut guard = wal_arc.lock().unwrap();
+        let after_snapshot = guard.snapshot_after(None, 1024).expect("after snapshot");
+        assert_eq!(
+            after_snapshot.len(),
+            baseline_wal_count,
+            "WAL on disk must be unchanged on fail-closed dispatch"
+        );
+        assert_eq!(
+            guard.next_seq(),
+            baseline_next_seq,
+            "next_seq must NOT advance when append fails"
+        );
+        assert_eq!(
+            guard.last_chain_hash_hex().map(|s| s.to_string()),
+            baseline_chain,
+            "last_chain_hash_hex must NOT advance when append fails"
+        );
+        drop(guard);
+
+        // 6) After disarming, evaluate_attempt resumes normal operation.
+        let recovered = handle
+            .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
+            .expect("evaluate after disarm");
+        match &recovered.verdict {
+            Verdict::Allow { rule_id } => assert_eq!(rule_id, "rule-allow-anthropic"),
+            other => panic!("expected Allow after disarm; got {other:?}"),
+        }
+        assert!(
+            recovered.wal_seq.is_some(),
+            "wal_seq should be Some after disarm"
+        );
+
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn evaluate_attempt_fail_closed_on_wal_failure_overrides_default_deny_too() {
+        // Companion to the Allow-override case above: when the unforced
+        // verdict was already a deny (DefaultDeny), the dispatch still
+        // emits the AuditWalAppendFailed-flavored fail-closed shape, NOT
+        // the original DefaultDeny shape. The audit body must reflect the
+        // dispatch provenance, not the original deny reason.
+        let dir = TempDir::new().unwrap();
+        let (config, _signing) = fresh_config_in(&dir);
+        let handle = boot(config).expect("boot");
+
+        let wal_arc = handle.wal_writer().expect("wal wired").clone();
+        let injection = wal_arc.lock().unwrap().injection_handle();
+        injection.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = handle
+            .evaluate_attempt(&req_for(Some("pastebin.com"), 443))
+            .expect("evaluate_attempt must Ok-with-fail-closed");
+
+        injection.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        match &outcome.verdict {
+            Verdict::Deny {
+                reason: DeniedReason::AuditWalAppendFailed,
+            } => {}
+            other => panic!(
+                "expected Verdict::Deny(AuditWalAppendFailed); got {other:?}"
+            ),
+        }
+        assert!(outcome.wal_seq.is_none());
+        // Provenance must be audit_wal_append_failed, NOT default_deny.
+        assert!(
+            outcome
+                .event_canonical_json
+                .contains("\"audit_wal_append_failed\"")
+        );
+        assert!(
+            !outcome.event_canonical_json.contains("\"default_deny\""),
+            "fail-closed dispatch must override the default_deny provenance"
+        );
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn evaluate_attempt_fail_closed_on_wal_failure_overrides_explicit_deny() {
+        // Third companion: explicit-rule deny path also gets overridden.
+        let (handle, _dir) =
+            boot_with_single_rule("rule-deny-pastebin", "pastebin.com", "deny");
+
+        let wal_arc = handle.wal_writer().expect("wal wired").clone();
+        let injection = wal_arc.lock().unwrap().injection_handle();
+        injection.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = handle
+            .evaluate_attempt(&req_for(Some("pastebin.com"), 443))
+            .expect("evaluate_attempt must Ok-with-fail-closed");
+
+        injection.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        match &outcome.verdict {
+            Verdict::Deny {
+                reason: DeniedReason::AuditWalAppendFailed,
+            } => {}
+            other => panic!(
+                "expected Verdict::Deny(AuditWalAppendFailed); got {other:?}"
+            ),
+        }
+        // The original deny would have stamped rule_id_matched and
+        // decision_provenance="static_rule"; the dispatched shape clears
+        // both in favor of the audit_wal_append_failed provenance.
+        assert!(
+            outcome
+                .event_canonical_json
+                .contains("\"audit_wal_append_failed\"")
+        );
+        assert!(
+            !outcome.event_canonical_json.contains("\"rule-deny-pastebin\""),
+            "fail-closed dispatch must drop the original rule_id_matched stamp"
+        );
         let _ = handle.stop();
     }
 }
