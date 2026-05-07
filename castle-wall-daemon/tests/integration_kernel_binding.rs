@@ -82,7 +82,13 @@ fn nftables_load_and_remove_agent_ruleset() {
         scope.cgroup_level,
         &frags,
     );
-    nftables::load_agent_ruleset(&id, &script).expect("load_agent_ruleset");
+    nftables::load_agent_ruleset(
+        &id,
+        &script,
+        scope.cgroup_level,
+        &cgroup_relative,
+    )
+    .expect("load_agent_ruleset");
 
     let output = nft_cmd(&["list", "table", CASTLE_FAMILY, CASTLE_TABLE]);
     assert!(
@@ -126,7 +132,13 @@ fn nftables_atomic_replace_updates_rules() {
         scope.cgroup_level,
         &frags1,
     );
-    nftables::load_agent_ruleset(&id, &script1).expect("load v1");
+    nftables::load_agent_ruleset(
+        &id,
+        &script1,
+        scope.cgroup_level,
+        &cgroup_relative,
+    )
+    .expect("load v1");
 
     let frags2 = vec![NftRuleFragment {
         rule_id: "r2".to_string(),
@@ -138,7 +150,13 @@ fn nftables_atomic_replace_updates_rules() {
         scope.cgroup_level,
         &frags2,
     );
-    nftables::load_agent_ruleset(&id, &script2).expect("load v2");
+    nftables::load_agent_ruleset(
+        &id,
+        &script2,
+        scope.cgroup_level,
+        &cgroup_relative,
+    )
+    .expect("load v2");
 
     let out = nft_cmd(&["list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "agent_test-replace"]);
     assert!(out.contains("8443"), "v2 should contain 8443: {}", out);
@@ -187,7 +205,13 @@ fn nftables_ruleset_includes_nfqueue_catchall() {
         scope.cgroup_level,
         &frags,
     );
-    nftables::load_agent_ruleset(&id, &script).expect("load");
+    nftables::load_agent_ruleset(
+        &id,
+        &script,
+        scope.cgroup_level,
+        &cgroup_relative,
+    )
+    .expect("load");
 
     // nft canonicalizes the input rule form `queue num 0` to `queue to 0`
     // in its listing output, so the assertion matches the listing form.
@@ -198,6 +222,139 @@ fn nftables_ruleset_includes_nfqueue_catchall() {
         out
     );
 
+    let _ = cgroup::destroy_agent_scope(&scope);
+    cleanup_castle_table();
+}
+
+#[test]
+fn nftables_load_agent_ruleset_installs_base_chain_jump() {
+    // Closes the Castle Wall Phase 1 production gate: the per-agent chain
+    // is reachable from the netfilter output hook only if a jump rule
+    // gates entry from the base output chain. Without this, the per-agent
+    // chain is dead and packets bypass enforcement entirely. After load,
+    // the base output chain must contain exactly one `goto agent_<id>`
+    // rule with the cgroupv2 socket match.
+    cleanup_castle_table();
+    nftables::install_castle_table().expect("install");
+
+    let scope = cgroup::create_agent_scope("jump-test").expect("create_agent_scope");
+    let cgroup_relative =
+        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    let id = AgentRulesetId {
+        agent_id: "jump-test".to_string(),
+        cgroup_path: scope.cgroup_path.clone(),
+    };
+    let frags = vec![NftRuleFragment {
+        rule_id: "r1".to_string(),
+        nft_expr: "tcp dport 443 accept".to_string(),
+    }];
+    let script = nftables::build_agent_ruleset(
+        "jump-test",
+        &cgroup_relative,
+        scope.cgroup_level,
+        &frags,
+    );
+    nftables::load_agent_ruleset(
+        &id,
+        &script,
+        scope.cgroup_level,
+        &cgroup_relative,
+    )
+    .expect("load");
+
+    // The base `output` chain now holds the jump rule.
+    let listing = nft_cmd(&["-a", "list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "output"]);
+    let goto_count = listing.matches("goto agent_jump-test").count();
+    assert_eq!(
+        goto_count, 1,
+        "base output chain must hold exactly one jump rule for jump-test; got: {listing}"
+    );
+    assert!(
+        listing.contains("socket cgroupv2"),
+        "jump rule must carry cgroupv2 socket match; got: {listing}"
+    );
+
+    nftables::remove_agent_ruleset(&id).expect("remove");
+    let listing_after_remove =
+        nft_cmd(&["-a", "list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "output"]);
+    assert!(
+        !listing_after_remove.contains("goto agent_jump-test"),
+        "remove_agent_ruleset must clean up the jump rule; got: {listing_after_remove}"
+    );
+
+    let _ = cgroup::destroy_agent_scope(&scope);
+    cleanup_castle_table();
+}
+
+#[test]
+fn nftables_load_agent_ruleset_idempotent_under_reload() {
+    // Pin the delete-then-add shape inside install_agent_jump_rule_impl:
+    // a future refactor must not regress to "leak a stale jump per
+    // reload." Loading the agent ruleset twice in sequence (simulating
+    // policy reload) must result in exactly one jump rule for the agent
+    // in the base output chain after each load.
+    cleanup_castle_table();
+    nftables::install_castle_table().expect("install");
+
+    let scope = cgroup::create_agent_scope("idem-test").expect("create_agent_scope");
+    let cgroup_relative =
+        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    let id = AgentRulesetId {
+        agent_id: "idem-test".to_string(),
+        cgroup_path: scope.cgroup_path.clone(),
+    };
+
+    let frags1 = vec![NftRuleFragment {
+        rule_id: "r1".to_string(),
+        nft_expr: "tcp dport 443 accept".to_string(),
+    }];
+    let script1 = nftables::build_agent_ruleset(
+        "idem-test",
+        &cgroup_relative,
+        scope.cgroup_level,
+        &frags1,
+    );
+    nftables::load_agent_ruleset(
+        &id,
+        &script1,
+        scope.cgroup_level,
+        &cgroup_relative,
+    )
+    .expect("load v1");
+    let listing1 = nft_cmd(&["-a", "list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "output"]);
+    assert_eq!(
+        listing1.matches("goto agent_idem-test").count(),
+        1,
+        "exactly one jump rule after first load; got: {listing1}"
+    );
+
+    // Second load with a different rule body: jump rule must be replaced
+    // (delete-then-add), not duplicated.
+    let frags2 = vec![NftRuleFragment {
+        rule_id: "r2".to_string(),
+        nft_expr: "tcp dport 8443 accept".to_string(),
+    }];
+    let script2 = nftables::build_agent_ruleset(
+        "idem-test",
+        &cgroup_relative,
+        scope.cgroup_level,
+        &frags2,
+    );
+    nftables::load_agent_ruleset(
+        &id,
+        &script2,
+        scope.cgroup_level,
+        &cgroup_relative,
+    )
+    .expect("load v2");
+    let listing2 = nft_cmd(&["-a", "list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "output"]);
+    assert_eq!(
+        listing2.matches("goto agent_idem-test").count(),
+        1,
+        "still exactly one jump rule after second load (no leak): {listing2}"
+    );
+
+    nftables::remove_agent_ruleset(&id).expect("remove");
     let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
@@ -405,7 +562,13 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         agent_id: "test-e2e".to_string(),
         cgroup_path: scope.cgroup_path.clone(),
     };
-    nftables::load_agent_ruleset(&agent_id, &ruleset_script).expect("load");
+    nftables::load_agent_ruleset(
+        &agent_id,
+        &ruleset_script,
+        scope.cgroup_level,
+        &cgroup_relative,
+    )
+    .expect("load");
 
     // Verify rules installed.
     let output = nft_cmd(&["list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "agent_test-e2e"]);
