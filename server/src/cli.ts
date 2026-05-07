@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Sanctuary MCP Server — CLI Entry Point
+ * Sanctuary MCP Server: CLI Entry Point
  *
  * Starts the Sanctuary MCP server and connects it to the appropriate transport.
  *
@@ -71,7 +71,7 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "cocoon") {
-    // Hidden deprecated alias — one-release grace period before removal.
+    // Hidden deprecated alias. One-release grace period before removal.
     console.error(
       `\n  Note: \`cocoon\` is renamed to \`wrap\`. Use \`sanctuary wrap\` next time.\n`
     );
@@ -167,10 +167,10 @@ async function main(): Promise<void> {
     console.error(`Storage: ${config.storage_path}`);
     console.error("Tools: all registered");
 
-    // Non-blocking update check — fire and forget
+    // Non-blocking update check. Fire and forget.
     checkForUpdate(PKG_VERSION);
   } else {
-    // HTTP transport — future implementation
+    // HTTP transport (future implementation)
     console.error("HTTP transport not yet implemented. Use stdio.");
     process.exit(1);
   }
@@ -179,7 +179,7 @@ async function main(): Promise<void> {
 /**
  * Standalone Dashboard Mode
  *
- * Starts ONLY the dashboard HTTP server — no MCP server, no stdio transport.
+ * Starts ONLY the dashboard HTTP server. No MCP server, no stdio transport.
  * This is designed for deployments where the MCP server runs via stdio (e.g.,
  * OpenClaw), but the dashboard needs to persist independently.
  *
@@ -262,7 +262,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
     noConfirm,
   });
 
-  // Keep the process alive — the HTTP server is listening
+  // Keep the process alive. The HTTP server is listening.
   console.error(`\nSanctuary Dashboard running (standalone mode). Press Ctrl+C to stop.\n`);
 
   // Graceful shutdown
