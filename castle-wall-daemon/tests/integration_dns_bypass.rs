@@ -408,7 +408,12 @@ impl KernelBypassFixture {
             rule_id: "allow-example".to_string(),
             nft_expr: "ip daddr 93.184.216.34 tcp dport 443 accept".to_string(),
         }];
-        let script = nftables::build_agent_ruleset(agent_id, scope.cgroup_id, &frags);
+        let script = nftables::build_agent_ruleset(
+            agent_id,
+            scope.cgroup_id,
+            scope.cgroup_level,
+            &frags,
+        );
         let ruleset_id = AgentRulesetId {
             agent_id: agent_id.to_string(),
             cgroup_path: scope.cgroup_path.clone(),

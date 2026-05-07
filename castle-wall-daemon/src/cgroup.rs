@@ -43,6 +43,14 @@ pub struct ScopeHandle {
     pub scope_unit: String,
     pub cgroup_path: PathBuf,
     pub cgroup_id: u64,
+    /// Depth of the cgroup in the cgroup-v2 hierarchy, counting from the
+    /// root (`/sys/fs/cgroup`) as depth 0. The agent's cgroup is depth 2
+    /// in canonical deployments (`/system.slice/sanctuary-agent-foo.service`)
+    /// but can be 3+ in nested environments (CI runners, Docker-in-Docker)
+    /// where the daemon process itself is already inside a deeper cgroup.
+    /// Used by nftables `socket cgroupv2 level <N> <id>` rule emission so
+    /// the level matches where systemd actually placed the unit.
+    pub cgroup_level: u32,
 }
 
 /// Derive the systemd transient unit name from an agent id.
@@ -195,12 +203,23 @@ mod linux {
         }
         let cgroup_path = PathBuf::from(format!("/sys/fs/cgroup{control_group}"));
         let cgroup_id = resolve_cgroup_id(&cgroup_path)?;
+        // Depth in the cgroup-v2 hierarchy, counted from root. `control_group`
+        // looks like `/system.slice/foo.service` (depth 2) or
+        // `/system.slice/parent.service/foo.service` (depth 3) in nested
+        // environments. Counting non-empty path components after the leading
+        // slash gives the right number for nftables `level N` matching.
+        let cgroup_level: u32 = control_group
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .count() as u32;
 
         Ok(ScopeHandle {
             agent_id: agent_id.to_string(),
             scope_unit: unit,
             cgroup_path,
             cgroup_id,
+            cgroup_level,
         })
     }
 
