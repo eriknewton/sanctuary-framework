@@ -16,6 +16,8 @@
  * resolves the template id against its catalog (Prompt 8).
  */
 
+import { createHash } from "node:crypto";
+
 import type { AuditEntry } from "../l2-operational/audit-log.js";
 import type {
   HubActivityFeedEntry,
@@ -148,18 +150,50 @@ function extractAgentIdHint(entry: AuditEntry): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+/**
+ * Derive a short visible hex fragment from the audit-chain entry id.
+ *
+ * Shape is `<4hex>..<2hex>` (6 hex chars total) to match the Sprint Piece 2
+ * attestation gallery example (`9c7d..2a`). Deterministic: same entry id
+ * always derives the same fragment. NOT a per-event signature; the audit
+ * chain itself is the integrity claim.
+ */
+function deriveAttestationFragment(entryId: string): string {
+  const hash = createHash("sha256").update(entryId).digest("hex");
+  return `${hash.slice(0, 4)}..${hash.slice(4, 6)}`;
+}
+
+/**
+ * Map an audit-entry result onto an attestation render state.
+ *
+ * Success entries render `verified`; failure entries render `degraded`.
+ * Future v1.x work may enrich this (e.g. distinguish kernel-level egress
+ * drops from policy-level denials), but the audit-entry result is the
+ * stable signal available at projection time today.
+ */
+function deriveAttestationState(
+  entry: AuditEntry,
+): "verified" | "degraded" {
+  return entry.result === "success" ? "verified" : "degraded";
+}
+
 function projectEntry(entry: AuditEntry): HubActivityFeedEntry {
   const agentIdHint = extractAgentIdHint(entry);
   const category = categorizeOperation(entry.layer, entry.operation);
+  const entryId = `${entry.timestamp}|${entry.operation}|${entry.identity_id}`;
   return {
     version: "1.1",
-    entry_id: `${entry.timestamp}|${entry.operation}|${entry.identity_id}`,
+    entry_id: entryId,
     emitted_at: entry.timestamp,
     ...(agentIdHint ? { agent_id: agentIdHint } : {}),
     identity_id: entry.identity_id,
     category,
     display_template_id: templateIdFor(category, entry.operation),
     display_template_args: buildTemplateArgs(entry, agentIdHint),
+    attestation: {
+      state: deriveAttestationState(entry),
+      fragment: deriveAttestationFragment(entryId),
+    },
   };
 }
 

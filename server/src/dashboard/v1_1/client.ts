@@ -1,5 +1,5 @@
 /**
- * Sanctuary v1.1 Dashboard — Embedded Client Script
+ * Sanctuary v1.1 Dashboard Embedded Client Script
  *
  * Returns the ES-module body as a string. The HTML shell embeds this
  * inside `<script type="module">`. Pattern matches the v1.0 dashboard.
@@ -926,7 +926,10 @@ function renderAgentDetail() {
   const timeline = events.length
     ? events.map(function (e) {
         const t = renderTemplate(e.display_template_id, e.display_template_args);
-        return '<div class="row"><span class="muted">' + escHtml(shortTime(e.emitted_at)) + '</span><span>' + escHtml(t) + '</span></div>';
+        const badgeHtml = e.attestation
+          ? ' ' + renderActionAttestationBadge(e.attestation.state, e.attestation.fragment)
+          : '';
+        return '<div class="row"><span class="muted">' + escHtml(shortTime(e.emitted_at)) + '</span><span>' + escHtml(t) + badgeHtml + '</span></div>';
       }).join("\n")
     : '<p class="muted">No activity yet.</p>';
   // WP-V1.2 reshape click-to-inspect surface. Clicking "Open inspect
@@ -983,9 +986,13 @@ function renderAgentInspectPanel(agent) {
       ? '<div class="timeline">' +
         activity.map(function (e) {
           const t = renderTemplate(e.display_template_id, e.display_template_args);
+          const badgeHtml = e.attestation
+            ? renderActionAttestationBadge(e.attestation.state, e.attestation.fragment)
+            : '';
           return '<div class="timeline-item ok">' +
             '<div class="ts">' + escHtml(shortTime(e.emitted_at)) + '</div>' +
             '<div class="what">' + escHtml(t) + '</div>' +
+            (badgeHtml ? '<div class="att">' + badgeHtml + '</div>' : '') +
             '</div>';
         }).join("") +
         '</div>'
