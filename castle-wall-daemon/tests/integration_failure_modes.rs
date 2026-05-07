@@ -51,6 +51,7 @@
 
 use base64::Engine as _;
 use castle_wall_daemon::audit::WalWriter;
+use castle_wall_daemon::cgroup;
 use castle_wall_daemon::config::DaemonConfig;
 use castle_wall_daemon::daemon::{boot, mode_for_error, refuse_to_start_message, DaemonError};
 use castle_wall_daemon::failure::{default_disposition, FailureDisposition, FailureMode};
@@ -323,15 +324,25 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
     let handle = boot(config).expect("boot");
     nftables::install_castle_table().expect("install_castle_table");
 
+    // Real agent scope so the production rule's cgroupv2 path lookup
+    // succeeds at rule-load time.
+    let scope = cgroup::create_agent_scope("f2-test").expect("create_agent_scope");
+    let cgroup_relative =
+        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
     let id = AgentRulesetId {
         agent_id: "f2-test".to_string(),
-        cgroup_path: PathBuf::from("/test-placeholder/f2-test"),
+        cgroup_path: scope.cgroup_path.clone(),
     };
     let frags = vec![NftRuleFragment {
         rule_id: "r-f2".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script = nftables::build_agent_ruleset_no_cgroup_match("f2-test", &frags);
+    let script = nftables::build_agent_ruleset(
+        "f2-test",
+        &cgroup_relative,
+        scope.cgroup_level,
+        &frags,
+    );
     nftables::load_agent_ruleset(&id, &script).expect("load_agent_ruleset");
 
     // Sanity: the chain is in the kernel before the simulated crash.
@@ -386,6 +397,7 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
     }
 
     let _ = handle2.stop();
+    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
 
@@ -404,15 +416,23 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
     let handle = boot(config).expect("boot");
     nftables::install_castle_table().expect("install");
 
+    let scope = cgroup::create_agent_scope("f3-test").expect("create_agent_scope");
+    let cgroup_relative =
+        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
     let id = AgentRulesetId {
         agent_id: "f3-test".to_string(),
-        cgroup_path: PathBuf::from("/test-placeholder/f3-test"),
+        cgroup_path: scope.cgroup_path.clone(),
     };
     let frags = vec![NftRuleFragment {
         rule_id: "r-f3".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script = nftables::build_agent_ruleset_no_cgroup_match("f3-test", &frags);
+    let script = nftables::build_agent_ruleset(
+        "f3-test",
+        &cgroup_relative,
+        scope.cgroup_level,
+        &frags,
+    );
     nftables::load_agent_ruleset(&id, &script).expect("load");
 
     // Connect, handshake, then forcibly close the client side mid-session.
@@ -462,6 +482,7 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
 
     drop(stream2);
     let _ = handle.stop();
+    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
 

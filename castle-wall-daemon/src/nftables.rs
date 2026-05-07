@@ -53,17 +53,25 @@ pub struct NftRuleFragment {
 /// `sanctuary-castle` table. The chain ends with a `queue num 0` verdict
 /// for any unmatched traffic (NFQUEUE with FAIL_OPEN explicitly off).
 ///
+/// `cgroup_relative_path` is the cgroup-v2 path with the `/sys/fs/cgroup/`
+/// prefix stripped, e.g. `system.slice/sanctuary-agent-foo.service`. nft
+/// expects a quoted path string at rule-load time and walks
+/// `/sys/fs/cgroup/<path>` at depth `cgroup_level` to validate the cgroup
+/// exists. Earlier production code emitted the cgroup inode integer
+/// instead, which nft 1.x rejects: the integer is the post-resolution
+/// internal form (what `nft list rules` displays back), not the documented
+/// input form. Compute the relative path via `cgroup::cgroup_relative_path`
+/// from a `ScopeHandle.cgroup_path`.
+///
 /// `cgroup_level` is the depth at which the agent's cgroup lives in the
 /// cgroup-v2 hierarchy (counted from `/sys/fs/cgroup` as depth 0). It comes
 /// from `cgroup::ScopeHandle::cgroup_level`, which is derived from
-/// systemd's reported ControlGroup. nft validates `socket cgroupv2 level
-/// <N> <id>` at rule-load time by walking the cgroup tree to depth N
-/// looking for `<id>`; if level is wrong (because the deployment is
-/// nested), nft rejects with "cgroupv2 path fails: No such file or
-/// directory". Threading the actual level through avoids that.
+/// systemd's reported ControlGroup. If the level is wrong (because the
+/// deployment is nested), nft rejects with "cgroupv2 path fails: No such
+/// file or directory". Threading the actual level through avoids that.
 pub fn build_agent_ruleset(
     agent_id: &str,
-    cgroup_id: u64,
+    cgroup_relative_path: &str,
     cgroup_level: u32,
     rules: &[NftRuleFragment],
 ) -> String {
@@ -86,42 +94,7 @@ pub fn build_agent_ruleset(
     // Per scope-lock section 1: `queue num 0` without `bypass` flag.
     script.push_str(&format!(
         "add rule {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name} \
-         socket cgroupv2 level {cgroup_level} {cgroup_id} queue num 0\n"
-    ));
-    script
-}
-
-/// Test-only sibling of `build_agent_ruleset` that emits the agent ruleset
-/// WITHOUT the `socket cgroupv2 level 2 <cgroup_id>` match in the catchall
-/// rule. Used by integration tests that exercise rule load, atomic replace,
-/// catchall presence, and end-to-end policy flow without needing the
-/// cgroupv2 binding live at rule-load time.
-///
-/// Production code MUST call `build_agent_ruleset` (the cgroupv2 socket
-/// match is required for real per-agent egress isolation). nft 1.x
-/// validates `socket cgroupv2 level N <id>` at rule-load time by walking
-/// /sys/fs/cgroup; that lookup is fragile across systemd / cgroup-namespace
-/// combinations on Ubuntu 24.04 CI, separately tracked as a v1.x
-/// production-cgroup hardening item. This sibling sidesteps the lookup
-/// while preserving the catchall's `queue num 0` shape so test assertions
-/// on rule mechanics still hold.
-pub fn build_agent_ruleset_no_cgroup_match(
-    agent_id: &str,
-    rules: &[NftRuleFragment],
-) -> String {
-    let chain_name = agent_chain_name(agent_id);
-    let mut script = String::new();
-    script.push_str(&format!(
-        "flush chain {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name}\n"
-    ));
-    for frag in rules {
-        script.push_str(&format!(
-            "add rule {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name} {}\n",
-            frag.nft_expr
-        ));
-    }
-    script.push_str(&format!(
-        "add rule {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name} queue num 0\n"
+         socket cgroupv2 level {cgroup_level} \"{cgroup_relative_path}\" queue num 0\n"
     ));
     script
 }
@@ -488,14 +461,22 @@ mod tests {
             rule_id: "r1".to_string(),
             nft_expr: "tcp dport 443 accept".to_string(),
         }];
-        let script = build_agent_ruleset("test-agent", 42, 2, &frags);
+        let script = build_agent_ruleset(
+            "test-agent",
+            "system.slice/sanctuary-agent-test.service",
+            2,
+            &frags,
+        );
         assert!(script.contains("flush chain"));
         assert!(script.contains("tcp dport 443 accept"));
         assert!(script.contains("queue num 0"));
-        assert!(script.contains("42"));
-        // Level 2 is the canonical depth for `/system.slice/<unit>`; nested
+        // Path is quoted, comes after the level, no leading slash. Level 2
+        // is the canonical depth for `/system.slice/<unit>`; nested
         // deployments pass higher values, hence the rule encoding the level.
-        assert!(script.contains("level 2 42"));
+        assert!(
+            script.contains("level 2 \"system.slice/sanctuary-agent-test.service\""),
+            "rule must emit quoted cgroup-relative path after level: {script}"
+        );
     }
 
     #[test]
@@ -507,28 +488,51 @@ mod tests {
             rule_id: "r1".to_string(),
             nft_expr: "tcp dport 443 accept".to_string(),
         }];
-        let script = build_agent_ruleset("nested", 99, 3, &frags);
-        assert!(script.contains("level 3 99"));
+        let script = build_agent_ruleset(
+            "nested",
+            "system.slice/parent.service/sanctuary-agent-nested.service",
+            3,
+            &frags,
+        );
+        assert!(script.contains(
+            "level 3 \"system.slice/parent.service/sanctuary-agent-nested.service\""
+        ));
         assert!(!script.contains("level 2"));
     }
 
     #[test]
-    fn build_agent_ruleset_no_cgroup_match_omits_cgroupv2_lookup() {
+    fn build_agent_ruleset_emits_quoted_path_not_inode_integer() {
+        // Regression guard: earlier production code emitted the post-resolution
+        // inode integer where nft expects a quoted cgroup-relative path string.
+        // nft 1.x rejects integer input at rule-load time. This test pins the
+        // emission to the documented input form.
         let frags = vec![NftRuleFragment {
             rule_id: "r1".to_string(),
             nft_expr: "tcp dport 443 accept".to_string(),
         }];
-        let script = build_agent_ruleset_no_cgroup_match("test-agent", &frags);
-        assert!(script.contains("flush chain"));
-        assert!(script.contains("tcp dport 443 accept"));
-        assert!(script.contains("queue num 0"));
-        assert!(
-            !script.contains("socket cgroupv2"),
-            "test sibling must not emit cgroupv2 socket match: {script}"
+        let script = build_agent_ruleset(
+            "regression",
+            "system.slice/sanctuary-agent-regression.service",
+            2,
+            &frags,
         );
+        // Path must be quoted.
         assert!(
-            !script.contains("level 2"),
-            "test sibling must not emit cgroup level match: {script}"
+            script.contains("\"system.slice/sanctuary-agent-regression.service\""),
+            "cgroup path must be quoted: {script}"
+        );
+        // Must not emit a bare integer where the path goes (i.e. no
+        // `level 2 <digit>` pattern without a quote).
+        let lines: Vec<&str> = script.lines().filter(|l| l.contains("cgroupv2")).collect();
+        assert_eq!(lines.len(), 1, "exactly one cgroupv2 rule expected");
+        let cgroupv2_line = lines[0];
+        let post_level = cgroupv2_line
+            .split("level 2 ")
+            .nth(1)
+            .expect("expected 'level 2 ' marker");
+        assert!(
+            post_level.starts_with('"'),
+            "after 'level 2 ' nft requires a quoted path, got: {post_level}"
         );
     }
 

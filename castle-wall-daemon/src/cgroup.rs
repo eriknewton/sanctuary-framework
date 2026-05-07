@@ -48,8 +48,8 @@ pub struct ScopeHandle {
     /// in canonical deployments (`/system.slice/sanctuary-agent-foo.service`)
     /// but can be 3+ in nested environments (CI runners, Docker-in-Docker)
     /// where the daemon process itself is already inside a deeper cgroup.
-    /// Used by nftables `socket cgroupv2 level <N> <id>` rule emission so
-    /// the level matches where systemd actually placed the unit.
+    /// Used by nftables `socket cgroupv2 level <N> "<path>"` rule emission
+    /// so the level matches where systemd actually placed the unit.
     pub cgroup_level: u32,
 }
 
@@ -81,6 +81,37 @@ pub fn cgroup_path_for_scope(scope_unit: &str) -> PathBuf {
     // (system-level) or /sys/fs/cgroup/user.slice/user-<UID>.slice/
     // (user-level). The daemon runs as root, so system.slice is canonical.
     PathBuf::from(format!("/sys/fs/cgroup/system.slice/{scope_unit}"))
+}
+
+/// Compute the cgroup-v2 relative path string from a `ScopeHandle`.
+///
+/// nftables `socket cgroupv2 level <N> "<path>"` rules expect the cgroup
+/// path with the `/sys/fs/cgroup/` prefix stripped, no leading slash, no
+/// trailing slash (e.g. `system.slice/sanctuary-agent-foo.service`). The
+/// kernel walks `/sys/fs/cgroup/<path>` at rule-load time at depth N.
+///
+/// Returns `CgroupError::PathNotFound` if the absolute path does not start
+/// with `/sys/fs/cgroup/`, which would indicate the daemon resolved the
+/// scope from somewhere unexpected (a non-canonical mount or a user-slice
+/// hierarchy on a non-root invocation).
+pub fn cgroup_relative_path(handle: &ScopeHandle) -> Result<String, CgroupError> {
+    const ROOT: &str = "/sys/fs/cgroup/";
+    let abs = handle.cgroup_path.to_string_lossy();
+    match abs.strip_prefix(ROOT) {
+        Some(rel) => {
+            let trimmed = rel.trim_end_matches('/');
+            if trimmed.is_empty() {
+                Err(CgroupError::PathNotFound(format!(
+                    "cgroup path {abs} is the root; expected a per-agent subpath"
+                )))
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+        None => Err(CgroupError::PathNotFound(format!(
+            "cgroup path {abs} does not start with {ROOT}"
+        ))),
+    }
 }
 
 // ---- Linux implementations ------------------------------------------------
@@ -135,7 +166,7 @@ mod linux {
     /// truth) rather than synthesized from the unit name. This avoids
     /// drift between the daemon's path assumption and where systemd 255
     /// actually places the cgroup, and it lets nft's
-    /// `socket cgroupv2 level 2 <id>` rule lookup find the cgroup at
+    /// `socket cgroupv2 level 2 "<path>"` rule lookup find the cgroup at
     /// rule-load time. Waits for the unit to reach `active` state before
     /// resolving so the cgroup inode is stable.
     pub fn create_agent_scope_impl(agent_id: &str) -> Result<ScopeHandle, CgroupError> {
@@ -376,6 +407,67 @@ mod tests {
             path,
             PathBuf::from("/sys/fs/cgroup/system.slice/sanctuary-agent-test.service")
         );
+    }
+
+    fn make_scope_handle(abs_path: &str, level: u32) -> ScopeHandle {
+        ScopeHandle {
+            agent_id: "x".to_string(),
+            scope_unit: "sanctuary-agent-x.service".to_string(),
+            cgroup_path: PathBuf::from(abs_path),
+            cgroup_id: 0,
+            cgroup_level: level,
+        }
+    }
+
+    #[test]
+    fn cgroup_relative_path_strips_canonical_prefix() {
+        let h = make_scope_handle(
+            "/sys/fs/cgroup/system.slice/sanctuary-agent-foo.service",
+            2,
+        );
+        let rel = cgroup_relative_path(&h).expect("relative path");
+        assert_eq!(rel, "system.slice/sanctuary-agent-foo.service");
+    }
+
+    #[test]
+    fn cgroup_relative_path_handles_nested_depth() {
+        let h = make_scope_handle(
+            "/sys/fs/cgroup/system.slice/parent.service/sanctuary-agent-nested.service",
+            3,
+        );
+        let rel = cgroup_relative_path(&h).expect("relative path");
+        assert_eq!(
+            rel,
+            "system.slice/parent.service/sanctuary-agent-nested.service"
+        );
+    }
+
+    #[test]
+    fn cgroup_relative_path_rejects_non_canonical_prefix() {
+        let h = make_scope_handle("/var/lib/docker/cgroups/foo", 2);
+        assert!(matches!(
+            cgroup_relative_path(&h),
+            Err(CgroupError::PathNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn cgroup_relative_path_trims_trailing_slash() {
+        let h = make_scope_handle(
+            "/sys/fs/cgroup/system.slice/sanctuary-agent-trim.service/",
+            2,
+        );
+        let rel = cgroup_relative_path(&h).expect("relative path");
+        assert_eq!(rel, "system.slice/sanctuary-agent-trim.service");
+    }
+
+    #[test]
+    fn cgroup_relative_path_rejects_root() {
+        let h = make_scope_handle("/sys/fs/cgroup/", 0);
+        assert!(matches!(
+            cgroup_relative_path(&h),
+            Err(CgroupError::PathNotFound(_))
+        ));
     }
 
     #[cfg(target_os = "linux")]

@@ -59,19 +59,29 @@ fn nftables_load_and_remove_agent_ruleset() {
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
-    // Test asserts load + remove mechanics; cgroup id irrelevant. Use the
-    // test-only sibling that elides the `socket cgroupv2 level 2 <id>` match
-    // so rule-load does not trip nft's cgroupv2 path lookup.
+    // Production rule emission requires a real cgroup at the path string
+    // because nft validates `socket cgroupv2 level <N> "<path>"` at
+    // rule-load time by walking `/sys/fs/cgroup/<path>`. Create a real
+    // agent scope via systemd-run so the lookup succeeds.
+    let scope = cgroup::create_agent_scope("test-agent-1").expect("create_agent_scope");
+    let cgroup_relative =
+        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+
     let id = AgentRulesetId {
         agent_id: "test-agent-1".to_string(),
-        cgroup_path: PathBuf::from("/test-placeholder/agent-1"),
+        cgroup_path: scope.cgroup_path.clone(),
     };
 
     let frags = vec![NftRuleFragment {
         rule_id: "r-test-1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script = nftables::build_agent_ruleset_no_cgroup_match("test-agent-1", &frags);
+    let script = nftables::build_agent_ruleset(
+        "test-agent-1",
+        &cgroup_relative,
+        scope.cgroup_level,
+        &frags,
+    );
     nftables::load_agent_ruleset(&id, &script).expect("load_agent_ruleset");
 
     let output = nft_cmd(&["list", "table", CASTLE_FAMILY, CASTLE_TABLE]);
@@ -88,6 +98,7 @@ fn nftables_load_and_remove_agent_ruleset() {
     let listed = nftables::list_agent_rulesets().expect("list after remove");
     assert!(!listed.iter().any(|r| r.agent_id == "test-agent-1"));
 
+    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
 
@@ -96,30 +107,43 @@ fn nftables_atomic_replace_updates_rules() {
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
-    // Test asserts atomic-replace semantics; cgroup id irrelevant. Use the
-    // test-only sibling so rule-load does not trip nft's cgroupv2 path lookup.
+    let scope = cgroup::create_agent_scope("test-replace").expect("create_agent_scope");
+    let cgroup_relative =
+        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+
     let id = AgentRulesetId {
         agent_id: "test-replace".to_string(),
-        cgroup_path: PathBuf::from("/test-placeholder/replace"),
+        cgroup_path: scope.cgroup_path.clone(),
     };
 
     let frags1 = vec![NftRuleFragment {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script1 = nftables::build_agent_ruleset_no_cgroup_match("test-replace", &frags1);
+    let script1 = nftables::build_agent_ruleset(
+        "test-replace",
+        &cgroup_relative,
+        scope.cgroup_level,
+        &frags1,
+    );
     nftables::load_agent_ruleset(&id, &script1).expect("load v1");
 
     let frags2 = vec![NftRuleFragment {
         rule_id: "r2".to_string(),
         nft_expr: "tcp dport 8443 accept".to_string(),
     }];
-    let script2 = nftables::build_agent_ruleset_no_cgroup_match("test-replace", &frags2);
+    let script2 = nftables::build_agent_ruleset(
+        "test-replace",
+        &cgroup_relative,
+        scope.cgroup_level,
+        &frags2,
+    );
     nftables::load_agent_ruleset(&id, &script2).expect("load v2");
 
     let out = nft_cmd(&["list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "agent_test-replace"]);
     assert!(out.contains("8443"), "v2 should contain 8443: {}", out);
 
+    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
 
@@ -144,21 +168,25 @@ fn nftables_ruleset_includes_nfqueue_catchall() {
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
-    // Test asserts catchall presence in the listed chain. The catchall's
-    // `queue num 0` shape is preserved by the test-only sibling, which is
-    // what this test actually checks; the cgroupv2 socket match is
-    // exercised separately via production integration tests once the v1.x
-    // production-cgroup hardening item lands.
+    let scope = cgroup::create_agent_scope("test-queue").expect("create_agent_scope");
+    let cgroup_relative =
+        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+
     let id = AgentRulesetId {
         agent_id: "test-queue".to_string(),
-        cgroup_path: PathBuf::from("/test-placeholder/queue"),
+        cgroup_path: scope.cgroup_path.clone(),
     };
 
     let frags = vec![NftRuleFragment {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script = nftables::build_agent_ruleset_no_cgroup_match("test-queue", &frags);
+    let script = nftables::build_agent_ruleset(
+        "test-queue",
+        &cgroup_relative,
+        scope.cgroup_level,
+        &frags,
+    );
     nftables::load_agent_ruleset(&id, &script).expect("load");
 
     // nft canonicalizes the input rule form `queue num 0` to `queue to 0`
@@ -170,6 +198,7 @@ fn nftables_ruleset_includes_nfqueue_catchall() {
         out
     );
 
+    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
 
@@ -361,13 +390,20 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     let frags = rule_to_nft_expr(&test_rule);
     assert!(!frags.is_empty());
 
-    // End-to-end policy + audit flow; cgroup id irrelevant to the
-    // assertions. Use the test-only sibling so rule-load does not trip
-    // nft's cgroupv2 path lookup.
-    let ruleset_script = nftables::build_agent_ruleset_no_cgroup_match("test-e2e", &frags);
+    // End-to-end policy + audit flow with the production cgroupv2 match.
+    // Create a real agent scope so nft's path lookup at rule-load succeeds.
+    let scope = cgroup::create_agent_scope("test-e2e").expect("create_agent_scope");
+    let cgroup_relative =
+        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    let ruleset_script = nftables::build_agent_ruleset(
+        "test-e2e",
+        &cgroup_relative,
+        scope.cgroup_level,
+        &frags,
+    );
     let agent_id = AgentRulesetId {
         agent_id: "test-e2e".to_string(),
-        cgroup_path: PathBuf::from("/test-placeholder/e2e"),
+        cgroup_path: scope.cgroup_path.clone(),
     };
     nftables::load_agent_ruleset(&agent_id, &ruleset_script).expect("load");
 
@@ -419,5 +455,6 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     drop(wal_guard);
 
     let _ = handle.stop();
+    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
