@@ -1,7 +1,7 @@
 {
   "name": "@sanctuary-framework/mcp-server",
   "version": "1.2.0",
-  "description": "Your agent, your machine, your keys — an MCP server that adds encrypted state, approval gates, and a portable identity to any AI agent.",
+  "description": "Your agent, your machine, your keys. An MCP server that adds encrypted state, approval gates, and a portable identity to any AI agent.",
   "type": "module",
   "main": "dist/index.cjs",
   "module": "dist/index.js",
