@@ -52,9 +52,19 @@ pub struct NftRuleFragment {
 /// The fragments are installed inside a per-agent chain within the
 /// `sanctuary-castle` table. The chain ends with a `queue num 0` verdict
 /// for any unmatched traffic (NFQUEUE with FAIL_OPEN explicitly off).
+///
+/// `cgroup_level` is the depth at which the agent's cgroup lives in the
+/// cgroup-v2 hierarchy (counted from `/sys/fs/cgroup` as depth 0). It comes
+/// from `cgroup::ScopeHandle::cgroup_level`, which is derived from
+/// systemd's reported ControlGroup. nft validates `socket cgroupv2 level
+/// <N> <id>` at rule-load time by walking the cgroup tree to depth N
+/// looking for `<id>`; if level is wrong (because the deployment is
+/// nested), nft rejects with "cgroupv2 path fails: No such file or
+/// directory". Threading the actual level through avoids that.
 pub fn build_agent_ruleset(
     agent_id: &str,
     cgroup_id: u64,
+    cgroup_level: u32,
     rules: &[NftRuleFragment],
 ) -> String {
     let chain_name = agent_chain_name(agent_id);
@@ -76,7 +86,7 @@ pub fn build_agent_ruleset(
     // Per scope-lock section 1: `queue num 0` without `bypass` flag.
     script.push_str(&format!(
         "add rule {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name} \
-         socket cgroupv2 level 2 {cgroup_id} queue num 0\n"
+         socket cgroupv2 level {cgroup_level} {cgroup_id} queue num 0\n"
     ));
     script
 }
@@ -478,11 +488,28 @@ mod tests {
             rule_id: "r1".to_string(),
             nft_expr: "tcp dport 443 accept".to_string(),
         }];
-        let script = build_agent_ruleset("test-agent", 42, &frags);
+        let script = build_agent_ruleset("test-agent", 42, 2, &frags);
         assert!(script.contains("flush chain"));
         assert!(script.contains("tcp dport 443 accept"));
         assert!(script.contains("queue num 0"));
         assert!(script.contains("42"));
+        // Level 2 is the canonical depth for `/system.slice/<unit>`; nested
+        // deployments pass higher values, hence the rule encoding the level.
+        assert!(script.contains("level 2 42"));
+    }
+
+    #[test]
+    fn build_agent_ruleset_threads_dynamic_level() {
+        // In nested environments (CI runners, Docker-in-Docker) the agent's
+        // cgroup may be at depth 3 or 4; the rule must reflect that or nft
+        // rejects with "cgroupv2 path fails" at load time.
+        let frags = vec![NftRuleFragment {
+            rule_id: "r1".to_string(),
+            nft_expr: "tcp dport 443 accept".to_string(),
+        }];
+        let script = build_agent_ruleset("nested", 99, 3, &frags);
+        assert!(script.contains("level 3 99"));
+        assert!(!script.contains("level 2"));
     }
 
     #[test]

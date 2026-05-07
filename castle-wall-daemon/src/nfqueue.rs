@@ -200,6 +200,12 @@ pub fn run_verdict_loop_impl(
         .set_fail_open(config.queue_number, false)
         .map_err(|e| NfqueueError::BindFailed(format!("set_fail_open(false): {e}")))?;
 
+    // Non-blocking recv so the loop checks `stop_flag` on a bounded cadence
+    // instead of waiting indefinitely for the next packet. Without this,
+    // a quiet network leaves the loop blocked in `queue.recv()` and
+    // `stop_flag = true` is invisible until the next packet arrives.
+    queue.set_nonblocking(true);
+
     while !handle.stop_flag.load(Ordering::Relaxed) {
         let mut msg = match queue.recv() {
             Ok(msg) => msg,
@@ -208,6 +214,9 @@ pub fn run_verdict_loop_impl(
                 if err_str.contains("Resource temporarily unavailable")
                     || err_str.contains("Interrupted system call")
                 {
+                    // No packet ready; brief sleep avoids a busy-loop while
+                    // keeping the stop_flag check responsive (~10ms).
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
                 return Err(NfqueueError::VerdictLoopError(err_str));

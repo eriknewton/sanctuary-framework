@@ -1,10 +1,19 @@
-//! cgroup v2 transient scope creation via systemd-run.
+//! cgroup v2 transient unit creation via systemd-run.
 //!
 //! Per scope-lock section 1: each wrapped agent runs in its own systemd
-//! transient scope. The daemon resolves the cgroup ID from the scope path
+//! transient unit. The daemon resolves the cgroup ID from the unit path
 //! for use in nftables `socket cgroupv2` matches. The cgroup-id renumbering
 //! gotcha (nftables resolves cgroup paths to numeric inode IDs at rule-load
-//! time) is handled by re-installing rules when a scope is re-created.
+//! time) is handled by re-installing rules when a unit is re-created.
+//!
+//! Implementation note: we use systemd transient `.service` units with a
+//! `sleep infinity` placeholder to anchor the cgroup lifetime. The earlier
+//! `--scope --remain-after-exit /bin/true` shape was rejected on systemd
+//! 255 (Ubuntu 24.04 and later) because `--remain-after-exit` is not
+//! supported in `--scope` mode. The `--service` shape is the correct
+//! unit type for "create a cgroup that outlives systemd-run": services
+//! manage their own lifetime, accept `Delegate=yes`, and return promptly
+//! when invoked with `--no-block`.
 //!
 //! All kernel-touching functions are `#[cfg(target_os = "linux")]`-gated.
 
@@ -34,9 +43,22 @@ pub struct ScopeHandle {
     pub scope_unit: String,
     pub cgroup_path: PathBuf,
     pub cgroup_id: u64,
+    /// Depth of the cgroup in the cgroup-v2 hierarchy, counting from the
+    /// root (`/sys/fs/cgroup`) as depth 0. The agent's cgroup is depth 2
+    /// in canonical deployments (`/system.slice/sanctuary-agent-foo.service`)
+    /// but can be 3+ in nested environments (CI runners, Docker-in-Docker)
+    /// where the daemon process itself is already inside a deeper cgroup.
+    /// Used by nftables `socket cgroupv2 level <N> <id>` rule emission so
+    /// the level matches where systemd actually placed the unit.
+    pub cgroup_level: u32,
 }
 
-/// Derive the systemd scope unit name from an agent id.
+/// Derive the systemd transient unit name from an agent id.
+///
+/// Returns a `.service` unit name. The earlier `.scope` shape was changed
+/// to `.service` when the production code switched to `systemd-run --service`
+/// to work around systemd 255 rejecting `--remain-after-exit` in `--scope`
+/// mode.
 pub fn scope_unit_name(agent_id: &str) -> String {
     // Sanitize: systemd unit names allow alphanumeric, hyphen, underscore,
     // period, backslash, colon. Replace anything else with underscore.
@@ -50,15 +72,14 @@ pub fn scope_unit_name(agent_id: &str) -> String {
             }
         })
         .collect();
-    format!("sanctuary-agent-{sanitized}.scope")
+    format!("sanctuary-agent-{sanitized}.service")
 }
 
-/// Resolve the cgroup v2 path for a systemd scope unit.
+/// Resolve the cgroup v2 path for a systemd transient unit.
 pub fn cgroup_path_for_scope(scope_unit: &str) -> PathBuf {
-    // systemd places transient scopes under /sys/fs/cgroup/system.slice/
-    // (system scopes) or /sys/fs/cgroup/user.slice/user-<UID>.slice/
-    // (user scopes). For the daemon (running as root), system scope is
-    // canonical.
+    // systemd places transient system units under /sys/fs/cgroup/system.slice/
+    // (system-level) or /sys/fs/cgroup/user.slice/user-<UID>.slice/
+    // (user-level). The daemon runs as root, so system.slice is canonical.
     PathBuf::from(format!("/sys/fs/cgroup/system.slice/{scope_unit}"))
 }
 
@@ -98,20 +119,35 @@ mod linux {
         }
     }
 
-    /// Create a transient systemd scope for an agent. Uses `systemd-run`
-    /// in scope mode. The scope is a pure cgroup container; no process
-    /// is launched inside it yet. The caller (nfqueue verdict loop)
-    /// classifies processes into this cgroup.
+    /// Create a transient systemd unit for an agent. Uses `systemd-run`
+    /// in service mode with a `sleep infinity` placeholder to anchor the
+    /// cgroup lifetime. `--no-block` ensures `systemd-run` returns promptly
+    /// once the unit is queued; the caller (nfqueue verdict loop) then
+    /// classifies real agent processes into the cgroup.
+    ///
+    /// systemd 255 rejects `--remain-after-exit` in `--scope` mode, so the
+    /// older `--scope --remain-after-exit /bin/true` shape no longer works.
+    /// Service units are the correct unit type for "create an empty cgroup
+    /// that survives the create call."
+    ///
+    /// The `cgroup_path` returned is queried from systemd via
+    /// `systemctl show --property=ControlGroup` (the canonical source of
+    /// truth) rather than synthesized from the unit name. This avoids
+    /// drift between the daemon's path assumption and where systemd 255
+    /// actually places the cgroup, and it lets nft's
+    /// `socket cgroupv2 level 2 <id>` rule lookup find the cgroup at
+    /// rule-load time. Waits for the unit to reach `active` state before
+    /// resolving so the cgroup inode is stable.
     pub fn create_agent_scope_impl(agent_id: &str) -> Result<ScopeHandle, CgroupError> {
         let unit = scope_unit_name(agent_id);
         let output = Command::new("systemd-run")
             .args([
-                "--scope",
+                "--no-block",
                 "--unit",
                 &unit,
                 "--property=Delegate=yes",
-                "--remain-after-exit",
-                "/bin/true",
+                "/usr/bin/sleep",
+                "infinity",
             ])
             .output()
             .map_err(|e| CgroupError::InvocationFailed(e.to_string()))?;
@@ -125,14 +161,65 @@ mod linux {
             )));
         }
 
-        let cgroup_path = cgroup_path_for_scope(&unit);
+        // Wait for the unit to reach `active` state so the placeholder
+        // process is running and the cgroup is fully materialized. Up to
+        // ~2s with 50ms polling. Without this, `--no-block` can return
+        // while the unit is still in `activating`, the cgroup directory
+        // is empty (cgroup.procs has no PID yet), and downstream
+        // `nft -f -` rule loads can race the directory's full setup.
+        let mut active = false;
+        for _ in 0..40 {
+            let status = Command::new("systemctl")
+                .args(["is-active", "--quiet", &unit])
+                .status();
+            if matches!(status, Ok(s) if s.success()) {
+                active = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !active {
+            return Err(CgroupError::InvocationFailed(format!(
+                "unit {unit} did not reach active state within 2s"
+            )));
+        }
+
+        // Query systemd for the canonical ControlGroup path. The earlier
+        // synthesized path (`/sys/fs/cgroup/system.slice/<unit>`) was a
+        // best guess; systemd 255's actual placement under cgroup-v2 is
+        // authoritative. The systemctl --value form returns just the
+        // path, e.g. `/system.slice/sanctuary-agent-foo.service`.
+        let show = Command::new("systemctl")
+            .args(["show", &unit, "--property=ControlGroup", "--value"])
+            .output()
+            .map_err(|e| {
+                CgroupError::InvocationFailed(format!("systemctl show ControlGroup: {e}"))
+            })?;
+        let control_group = String::from_utf8_lossy(&show.stdout).trim().to_string();
+        if control_group.is_empty() {
+            return Err(CgroupError::PathNotFound(format!(
+                "unit {unit} has no ControlGroup"
+            )));
+        }
+        let cgroup_path = PathBuf::from(format!("/sys/fs/cgroup{control_group}"));
         let cgroup_id = resolve_cgroup_id(&cgroup_path)?;
+        // Depth in the cgroup-v2 hierarchy, counted from root. `control_group`
+        // looks like `/system.slice/foo.service` (depth 2) or
+        // `/system.slice/parent.service/foo.service` (depth 3) in nested
+        // environments. Counting non-empty path components after the leading
+        // slash gives the right number for nftables `level N` matching.
+        let cgroup_level: u32 = control_group
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .count() as u32;
 
         Ok(ScopeHandle {
             agent_id: agent_id.to_string(),
             scope_unit: unit,
             cgroup_path,
             cgroup_id,
+            cgroup_level,
         })
     }
 
@@ -269,22 +356,25 @@ mod tests {
 
     #[test]
     fn scope_unit_name_sanitizes() {
+        // Suffix is `.service` (not `.scope`): production switched to
+        // `systemd-run --service` after systemd 255 rejected
+        // `--remain-after-exit` in `--scope` mode.
         assert_eq!(
             scope_unit_name("my-agent"),
-            "sanctuary-agent-my-agent.scope"
+            "sanctuary-agent-my-agent.service"
         );
         assert_eq!(
             scope_unit_name("agent/with spaces"),
-            "sanctuary-agent-agent_with_spaces.scope"
+            "sanctuary-agent-agent_with_spaces.service"
         );
     }
 
     #[test]
     fn cgroup_path_for_scope_is_under_system_slice() {
-        let path = cgroup_path_for_scope("sanctuary-agent-test.scope");
+        let path = cgroup_path_for_scope("sanctuary-agent-test.service");
         assert_eq!(
             path,
-            PathBuf::from("/sys/fs/cgroup/system.slice/sanctuary-agent-test.scope")
+            PathBuf::from("/sys/fs/cgroup/system.slice/sanctuary-agent-test.service")
         );
     }
 

@@ -40,6 +40,7 @@
 #![cfg(target_os = "linux")]
 
 use base64::Engine as _;
+use castle_wall_daemon::cgroup;
 use castle_wall_daemon::config::DaemonConfig;
 use castle_wall_daemon::daemon::{boot, DaemonHandle};
 use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
@@ -47,12 +48,17 @@ use castle_wall_daemon::manifest::verify::{
     AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
 };
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
+use castle_wall_daemon::nfqueue::{self, NfVerdict, NfqueueConfig, PendingPacket, QueueHandle};
+use castle_wall_daemon::nftables::{self, AgentRulesetId, NftRuleFragment};
 use castle_wall_daemon::policy::{DeniedReason, EvaluationRequest, Verdict};
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -368,62 +374,372 @@ fn policy_allows_explicitly_listed_destination_alongside_bypass_denials() {
     let _ = handle.stop();
 }
 
-// ---- Tier B: real-cgroup, real-packet bypass tests (#[ignore]'d) ----------
+// ---- Tier B: real-cgroup, real-packet bypass tests ------------------------
+//
+// These tests are scaffolded against the production
+// `nftables::build_agent_ruleset` (real `socket cgroupv2 level <N> <id>`
+// match), real `cgroup::create_agent_scope`, real subprocess attach, real
+// NFQUEUE verdict loop, and real audit drain assertion. The cgroup
+// creation path (the original v1.x ticket scope) was fixed in this PR:
+// systemd-run no longer rejects with `--remain-after-exit and
+// --service-type= are not supported in --scope mode`. The cgroup is
+// created, the inode is resolved from systemd's canonical ControlGroup
+// path, and the level is threaded dynamically.
+//
+// However, on Ubuntu 24.04 + nftables v1.0.9 + systemd 255, the
+// `nft -f -` invocation that loads the ruleset rejects with
+//
+//     /dev/stdin:3:78-81: Error: cgroupv2 path fails: No such file or
+//     directory
+//     add rule inet sanctuary-castle agent_<id> socket cgroupv2 level 2
+//     <inode> queue num 0
+//
+// The rejection happens at rule-load time inside nft's
+// `cgroup_path_v2()` helper, which walks `/sys/fs/cgroup/` looking for a
+// directory at depth `<level>` whose inode matches `<id>`. The cgroup
+// IS created at the expected path (`/system.slice/<unit>.service`,
+// depth 2) with the matching inode, but nft's lookup fails. The same
+// failure surfaced in PR #124 Checkpoint 3.5 and motivated the
+// `build_agent_ruleset_no_cgroup_match` test sibling. The narrow
+// theory was "fix cgroup creation and nft will work"; that turned out
+// to be wrong. The remaining blocker is a separate nft 1.0.9 +
+// cgroup-v2 + systemd 255 interaction that needs its own
+// investigation.
+//
+// The 3 tests below stay `#[ignore]`-d, gated on a follow-on v1.x
+// ticket that investigates the nft cgroupv2 path lookup specifically.
+// The fixture and helpers stay in place so activation in the future
+// is just removing the `#[ignore]` (no rewrite).
+
+/// Test fixture: kernel-binding pieces for one bypass scenario.
+#[allow(dead_code)] // used by #[ignore]'d tests pending a follow-on v1.x ticket
+struct KernelBypassFixture {
+    daemon: DaemonHandle,
+    _tempdir: TempDir,
+    agent_id: String,
+    scope: cgroup::ScopeHandle,
+    ruleset_id: AgentRulesetId,
+    nfq_thread: Option<std::thread::JoinHandle<()>>,
+    nfq_stop: Arc<std::sync::atomic::AtomicBool>,
+    captured: Arc<Mutex<Vec<PendingPacket>>>,
+}
+
+impl KernelBypassFixture {
+    /// Stand up a daemon with example.com:443 allowed, create an agent
+    /// cgroup scope, install the production ruleset (with the real
+    /// `socket cgroupv2 level 2 <id>` match), and start an NFQUEUE
+    /// verdict-loop thread that captures packets and drops them.
+    fn setup(agent_id: &str, queue_number: u16) -> Self {
+        let (daemon, tempdir) = boot_with_only_example_com_443_allowed();
+
+        cleanup_castle_table_silent();
+        nftables::install_castle_table().expect("install_castle_table");
+
+        let scope = cgroup::create_agent_scope(agent_id).expect("create_agent_scope");
+
+        // Production ruleset: real `socket cgroupv2 level 2 <id>` match.
+        // The allow rule covers example.com (93.184.216.34) at 443/tcp;
+        // anything else hits the catchall and is queued to NFQUEUE.
+        let frags = vec![NftRuleFragment {
+            rule_id: "allow-example".to_string(),
+            nft_expr: "ip daddr 93.184.216.34 tcp dport 443 accept".to_string(),
+        }];
+        let script = nftables::build_agent_ruleset(
+            agent_id,
+            scope.cgroup_id,
+            scope.cgroup_level,
+            &frags,
+        );
+        let ruleset_id = AgentRulesetId {
+            agent_id: agent_id.to_string(),
+            cgroup_path: scope.cgroup_path.clone(),
+        };
+        nftables::load_agent_ruleset(&ruleset_id, &script).expect("load_agent_ruleset");
+
+        let captured: Arc<Mutex<Vec<PendingPacket>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+
+        let nfq_cfg = NfqueueConfig {
+            queue_number,
+            ..NfqueueConfig::default()
+        };
+        let nfq_handle = nfqueue::bind_queue(&nfq_cfg).expect("bind_queue");
+        let nfq_stop = nfq_handle.stop_flag.clone();
+
+        let thread_handle = QueueHandle {
+            queue_number: nfq_handle.queue_number,
+            packets_processed: nfq_handle.packets_processed.clone(),
+            packets_saturated: nfq_handle.packets_saturated.clone(),
+            stop_flag: nfq_stop.clone(),
+        };
+
+        let nfq_thread = std::thread::spawn(move || {
+            let cfg = NfqueueConfig {
+                queue_number,
+                ..NfqueueConfig::default()
+            };
+            let _ = nfqueue::run_verdict_loop(
+                &thread_handle,
+                &cfg,
+                Box::new(move |pkt| {
+                    captured_clone.lock().unwrap().push(pkt.clone());
+                    NfVerdict::Drop
+                }),
+            );
+        });
+
+        Self {
+            daemon,
+            _tempdir: tempdir,
+            agent_id: agent_id.to_string(),
+            scope,
+            ruleset_id,
+            nfq_thread: Some(nfq_thread),
+            nfq_stop,
+            captured,
+        }
+    }
+
+    /// Spawn the bypass attempt subprocess in the agent cgroup. The shell
+    /// wrapper writes the subprocess PID to `cgroup.procs` BEFORE exec'ing
+    /// the real command, so the network attempt happens from inside the
+    /// cgroup (no race window).
+    fn spawn_bypass(&self, bypass_shell_cmd: &str) {
+        let cgroup_procs = self.scope.cgroup_path.join("cgroup.procs");
+        let wrapped = format!(
+            "echo $$ > {} && exec {}",
+            cgroup_procs.display(),
+            bypass_shell_cmd
+        );
+        let mut child = Command::new("sh")
+            .args(["-c", &wrapped])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bypass subprocess");
+        // Give the kernel ~2s to route the attempt's packets through
+        // nftables and into NFQUEUE for the verdict-loop thread to capture.
+        std::thread::sleep(Duration::from_secs(2));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Drain captured kernel packets, synthesize an `EvaluationRequest`
+    /// for one of them, run it through the daemon's policy evaluator
+    /// (which writes the audit entry), and return the audit canonical-JSON.
+    /// Falls back to a synthetic request shape if no packets were captured
+    /// so a clear assertion failure surfaces with diagnostic context.
+    fn drive_audit_for_first_capture(
+        &self,
+        fallback_protocol: &str,
+        fallback_port: u16,
+        fallback_dest_ip: &str,
+        fallback_dest_host: Option<&str>,
+    ) -> (usize, String) {
+        let snapshot = self.captured.lock().unwrap().clone();
+        let captured_count = snapshot.len();
+
+        // Use the first captured packet that looks like the expected
+        // bypass shape (right protocol + port). If none match, fall back
+        // to the synthetic request so the audit assertion still fires
+        // and the failure mode is debuggable.
+        let proto_byte: u8 = match fallback_protocol {
+            "tcp" => 6,
+            "udp" => 17,
+            _ => 0,
+        };
+        let chosen = snapshot
+            .iter()
+            .find(|pkt| pkt.protocol == proto_byte && pkt.dest_port == fallback_port);
+
+        let (dest_ip, dest_port, protocol_str) = match chosen {
+            Some(pkt) => (
+                pkt.dest_ip.clone().unwrap_or_else(|| fallback_dest_ip.to_string()),
+                pkt.dest_port,
+                fallback_protocol.to_string(),
+            ),
+            None => (
+                fallback_dest_ip.to_string(),
+                fallback_port,
+                fallback_protocol.to_string(),
+            ),
+        };
+
+        let req = EvaluationRequest {
+            agent_id: self.agent_id.clone(),
+            agent_template: "claude-code".to_string(),
+            dest_host: fallback_dest_host.map(|h| h.to_string()),
+            dest_ip: Some(dest_ip),
+            dest_port,
+            dest_protocol: protocol_str,
+            opaque: fallback_dest_host.is_none(),
+        };
+        let outcome = self
+            .daemon
+            .evaluate_attempt(&req)
+            .expect("evaluate_attempt");
+        (captured_count, outcome.event_canonical_json)
+    }
+
+    fn shutdown(mut self) {
+        self.nfq_stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.nfq_thread.take() {
+            // Bounded join: the verdict loop polls stop_flag every ~10ms
+            // (non-blocking recv + brief sleep), so this returns promptly.
+            let _ = thread.join();
+        }
+        let _ = nftables::remove_agent_ruleset(&self.ruleset_id);
+        cleanup_castle_table_silent();
+        let _ = cgroup::destroy_agent_scope(&self.scope);
+        let _ = self.daemon.stop();
+    }
+}
+
+fn cleanup_castle_table_silent() {
+    let _ = std::process::Command::new("nft")
+        .args(["delete", "table", "inet", "sanctuary-castle"])
+        .output();
+}
 
 /// Real-cgroup-driven plain DNS bypass test. Creates an agent cgroup,
-/// installs a castle-wall ruleset that only allows example.com:443, attaches
-/// a subprocess to the cgroup that attempts UDP/53 to 8.8.8.8, and asserts
-/// via the daemon's audit drain that the attempt was kernel-dropped.
-///
-/// Blocked on v1.x cgroup_create_agent_scope fix. Once the production
-/// cgroup creation path works on Ubuntu 24.04 + systemd 255 (per the v1.x
-/// housekeeping ticket carried from Checkpoint 3.5), this test activates
-/// by removing the `#[ignore]` attribute.
+/// installs the production castle-wall ruleset (real `socket cgroupv2`
+/// match) that only allows example.com:443, attaches a subprocess to the
+/// cgroup that attempts UDP/53 to 8.8.8.8, captures packets via the
+/// NFQUEUE verdict loop, and asserts the daemon's audit emits an
+/// `egress_blocked` + `default_deny` shape for the bypass.
 #[test]
-#[ignore = "blocked on v1.x cgroup_create_agent_scope fix (Ubuntu 24.04 + systemd 255)"]
+#[ignore = "blocked on nft 1.0.9 cgroupv2 path lookup at rule-load time on \
+            Ubuntu 24.04 + systemd 255: nft rejects production rule with \
+            'cgroupv2 path fails: No such file or directory' even when the \
+            agent cgroup exists at the systemd-reported ControlGroup path \
+            with the matching inode. Tracked as a follow-on v1.x ticket \
+            (separate root cause from the cgroup-creation fix shipped in \
+            this PR)."]
 fn kernel_drops_plain_dns_to_unallowed_resolver() {
-    // Scaffolding for the v1.x activation. The shape:
-    //
-    //  1. cgroup::create_agent_scope("dns-bypass-test") -> ScopeHandle
-    //  2. nftables::install_castle_table()
-    //  3. Build a ruleset that allows only example.com:443/tcp and uses
-    //     the real `socket cgroupv2 level 2 <id>` match (NOT the test
-    //     sibling), so the catchall scopes to the agent cgroup only.
-    //  4. nftables::load_agent_ruleset(&id, &script)
-    //  5. Spawn `nslookup -type=A example.com 8.8.8.8` as a subprocess
-    //     attached to the agent cgroup (cgroup::classify_pid).
-    //  6. Run NFQUEUE verdict loop (or sample audit drain) for ~2s.
-    //  7. Assert audit drain returns at least one egress_blocked event
-    //     for udp/53 with default_deny provenance.
-    //  8. Cleanup: destroy_agent_scope, remove_castle_table.
-    //
-    // The test sibling pattern from Checkpoint 3.5 is intentionally not
-    // used here: the whole point of the kernel-level test is to verify
-    // the cgroup match fires.
+    let fixture = KernelBypassFixture::setup("dns-bypass-test", 0);
+
+    // `nslookup` is in `bsdmainutils` on Ubuntu and may not always be
+    // present on a stripped runner. Fall back to a Rust-equivalent that
+    // any Linux ships: a UDP send to 8.8.8.8:53. The shell wrapper
+    // ensures the sender is in the agent cgroup before sending.
+    fixture.spawn_bypass(
+        "python3 -c \"import socket,sys;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(1.0);s.sendto(b'\\x00\\x01\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x07example\\x03com\\x00\\x00\\x01\\x00\\x01',('8.8.8.8',53));\\\nimport time;time.sleep(0.3)\" || true",
+    );
+
+    let (captured_count, audit_json) =
+        fixture.drive_audit_for_first_capture("udp", 53, "8.8.8.8", None);
+
+    assert!(
+        captured_count >= 1,
+        "expected at least one packet in NFQUEUE for plain-DNS bypass; got 0. \
+         This suggests either the cgroupv2 match did not fire (production ruleset bug) \
+         or the subprocess did not enter the cgroup."
+    );
+    assert!(
+        audit_json.contains("\"egress_blocked\""),
+        "audit must record egress_blocked; got: {audit_json}"
+    );
+    assert!(
+        audit_json.contains("\"default_deny\""),
+        "audit must record default_deny provenance; got: {audit_json}"
+    );
+    assert!(
+        audit_json.contains("\"udp\""),
+        "audit must record udp protocol; got: {audit_json}"
+    );
+
+    fixture.shutdown();
 }
 
 /// Real-cgroup-driven DoH bypass test. Same shape as the plain DNS
-/// scaffolding above, but the subprocess is `curl https://dns.google/dns-query`
-/// (or equivalent). Asserts the kernel drop fires for the TCP/443
-/// connection because dns.google is not in the allow set.
+/// activation, but the subprocess opens a TCP/443 connection to
+/// `dns.google` (8.8.8.8). Asserts the production ruleset's catchall
+/// queues the SYN to NFQUEUE and the audit records `egress_blocked` for
+/// tcp/443 with `default_deny` provenance.
 #[test]
-#[ignore = "blocked on v1.x cgroup_create_agent_scope fix (Ubuntu 24.04 + systemd 255)"]
+#[ignore = "blocked on nft 1.0.9 cgroupv2 path lookup at rule-load time on \
+            Ubuntu 24.04 + systemd 255 (see kernel_drops_plain_dns_to_unallowed_resolver \
+            for the full failure mode and follow-on v1.x ticket reference)."]
 fn kernel_drops_doh_to_unallowed_provider() {
-    // See kernel_drops_plain_dns_to_unallowed_resolver above for the
-    // activation shape. Subprocess is `curl --max-time 2 -o /dev/null
-    // https://dns.google/dns-query?dns=...`. Audit drain assertion
-    // identical except the destination shape is dns.google:443/tcp.
+    let fixture = KernelBypassFixture::setup("doh-bypass-test", 1);
+
+    // TCP SYN to 8.8.8.8:443 from inside the agent cgroup. The kernel's
+    // `socket cgroupv2` match fires on the SYN packet's owning socket,
+    // queueing it to NFQUEUE before any TLS handshake completes. Python's
+    // socket library connect() with a short timeout is a deterministic
+    // way to emit one SYN and surface the captured packet.
+    fixture.spawn_bypass(
+        "python3 -c \"import socket;s=socket.socket();s.settimeout(1.5);\\\ntry: s.connect(('8.8.8.8',443))\\\nexcept Exception: pass\" || true",
+    );
+
+    let (captured_count, audit_json) = fixture.drive_audit_for_first_capture(
+        "tcp",
+        443,
+        "8.8.8.8",
+        Some("dns.google"),
+    );
+
+    assert!(
+        captured_count >= 1,
+        "expected at least one packet in NFQUEUE for DoH bypass; got 0. \
+         This suggests the production cgroupv2 match did not fire."
+    );
+    assert!(
+        audit_json.contains("\"egress_blocked\""),
+        "audit must record egress_blocked; got: {audit_json}"
+    );
+    assert!(
+        audit_json.contains("\"default_deny\""),
+        "audit must record default_deny provenance; got: {audit_json}"
+    );
+    assert!(
+        audit_json.contains("\"tcp\""),
+        "audit must record tcp protocol; got: {audit_json}"
+    );
+
+    fixture.shutdown();
 }
 
-/// Real-cgroup-driven DoT bypass test. Same shape as the DoH scaffolding,
-/// but the subprocess opens a TCP/853 connection to a DoT provider and
-/// negotiates TLS. Asserts the kernel drop fires before the TLS handshake
-/// completes.
+/// Real-cgroup-driven DoT bypass test. Same shape as the DoH activation,
+/// but the subprocess opens a TCP/853 connection to a DoT provider
+/// (cloudflare-dns.com / 1.1.1.1). Asserts the kernel drop fires before
+/// the TLS handshake completes; audit records `egress_blocked` for
+/// tcp/853 with `default_deny` provenance.
 #[test]
-#[ignore = "blocked on v1.x cgroup_create_agent_scope fix (Ubuntu 24.04 + systemd 255)"]
+#[ignore = "blocked on nft 1.0.9 cgroupv2 path lookup at rule-load time on \
+            Ubuntu 24.04 + systemd 255 (see kernel_drops_plain_dns_to_unallowed_resolver \
+            for the full failure mode and follow-on v1.x ticket reference)."]
 fn kernel_drops_dot_to_unallowed_resolver() {
-    // See kernel_drops_plain_dns_to_unallowed_resolver above for the
-    // activation shape. Subprocess is `kdig -d @1.1.1.1 +tls
-    // -p 853 example.com` or equivalent. Audit drain assertion identical
-    // except the destination shape is the chosen DoT IP:853/tcp.
+    let fixture = KernelBypassFixture::setup("dot-bypass-test", 2);
+
+    fixture.spawn_bypass(
+        "python3 -c \"import socket;s=socket.socket();s.settimeout(1.5);\\\ntry: s.connect(('1.1.1.1',853))\\\nexcept Exception: pass\" || true",
+    );
+
+    let (captured_count, audit_json) = fixture.drive_audit_for_first_capture(
+        "tcp",
+        853,
+        "1.1.1.1",
+        Some("cloudflare-dns.com"),
+    );
+
+    assert!(
+        captured_count >= 1,
+        "expected at least one packet in NFQUEUE for DoT bypass; got 0. \
+         This suggests the production cgroupv2 match did not fire."
+    );
+    assert!(
+        audit_json.contains("\"egress_blocked\""),
+        "audit must record egress_blocked; got: {audit_json}"
+    );
+    assert!(
+        audit_json.contains("\"default_deny\""),
+        "audit must record default_deny provenance; got: {audit_json}"
+    );
+    assert!(
+        audit_json.contains("\"853\""),
+        "audit must record port 853; got: {audit_json}"
+    );
+
+    fixture.shutdown();
 }
