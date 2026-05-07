@@ -376,43 +376,46 @@ fn policy_allows_explicitly_listed_destination_alongside_bypass_denials() {
 
 // ---- Tier B: real-cgroup, real-packet bypass tests ------------------------
 //
-// These tests are scaffolded against the production
-// `nftables::build_agent_ruleset` (real `socket cgroupv2 level <N> <id>`
-// match), real `cgroup::create_agent_scope`, real subprocess attach, real
-// NFQUEUE verdict loop, and real audit drain assertion. The cgroup
-// creation path (the original v1.x ticket scope) was fixed in this PR:
-// systemd-run no longer rejects with `--remain-after-exit and
-// --service-type= are not supported in --scope mode`. The cgroup is
-// created, the inode is resolved from systemd's canonical ControlGroup
-// path, and the level is threaded dynamically.
+// These tests exercise the full production drop path:
+// `cgroup::create_agent_scope` (real systemd transient unit + cgroup),
+// `nftables::build_agent_ruleset` with the production path-string emission
+// (`socket cgroupv2 level <N> "<cgroup-relative-path>" queue num 0`), real
+// subprocess attach via `cgroup::classify_pid`, real NFQUEUE verdict loop,
+// and a real audit drain assertion against the daemon's policy evaluator.
 //
-// However, on Ubuntu 24.04 + nftables v1.0.9 + systemd 255, the
-// `nft -f -` invocation that loads the ruleset rejects with
+// The earlier rule-load failure on Ubuntu 24.04 + nft 1.0.9 + systemd 255
+// (`cgroupv2 path fails: No such file or directory`) was a Sanctuary-side
+// input-format bug: the rule emitted the cgroup inode integer where nft
+// expects a quoted cgroup-relative path string. The integer is what nft
+// stores internally after path-to-inode resolution at rule-load time and
+// what `nft list rules` displays back; it is not the documented input
+// form. The fix shipped in this PR emits the path string, which nft's
+// rule-load parser accepts; the kernel-binding tests in
+// `integration_kernel_binding.rs` now exercise this end-to-end against
+// real systemd transient units.
 //
-//     /dev/stdin:3:78-81: Error: cgroupv2 path fails: No such file or
-//     directory
-//     add rule inet sanctuary-castle agent_<id> socket cgroupv2 level 2
-//     <inode> queue num 0
+// However, the Tier B activation surfaced a SEPARATE production gap that
+// blocks real packet flow: the per-agent chains hold rules with the
+// cgroupv2 socket match, but `install_castle_table` creates a base
+// `output` chain (`type filter hook output priority 0 ; policy accept`)
+// with no `jump` or `goto` rule into the per-agent chain. nftables
+// non-base chains are dead chains until something hooked into netfilter
+// jumps to them. Without that wiring, packets emitted by the bypass
+// subprocess flow through the base `output` chain (policy accept) and
+// never enter the per-agent chain where the cgroupv2 match lives. Result:
+// no packets in NFQUEUE; the activation tests panic with "expected at
+// least one packet in NFQUEUE for {plain DNS|DoH|DoT} bypass; got 0."
+// The path-string fix in this PR is necessary but not sufficient for
+// real-cgroup, real-packet enforcement; the chain-wiring layer is the
+// remaining production gap and is tracked separately as the next v1.x
+// hardening item.
 //
-// The rejection happens at rule-load time inside nft's
-// `cgroup_path_v2()` helper, which walks `/sys/fs/cgroup/` looking for a
-// directory at depth `<level>` whose inode matches `<id>`. The cgroup
-// IS created at the expected path (`/system.slice/<unit>.service`,
-// depth 2) with the matching inode, but nft's lookup fails. The same
-// failure surfaced in PR #124 Checkpoint 3.5 and motivated the
-// `build_agent_ruleset_no_cgroup_match` test sibling. The narrow
-// theory was "fix cgroup creation and nft will work"; that turned out
-// to be wrong. The remaining blocker is a separate nft 1.0.9 +
-// cgroup-v2 + systemd 255 interaction that needs its own
-// investigation.
-//
-// The 3 tests below stay `#[ignore]`-d, gated on a follow-on v1.x
-// ticket that investigates the nft cgroupv2 path lookup specifically.
-// The fixture and helpers stay in place so activation in the future
-// is just removing the `#[ignore]` (no rewrite).
+// The 3 tests below stay `#[ignore]`-d behind that separate v1.x ticket.
+// The fixture and helpers stay in place so activation in the future is
+// just removing the `#[ignore]` (no rewrite).
 
 /// Test fixture: kernel-binding pieces for one bypass scenario.
-#[allow(dead_code)] // used by #[ignore]'d tests pending a follow-on v1.x ticket
+#[allow(dead_code)] // used by #[ignore]'d tests pending the chain-wiring v1.x item
 struct KernelBypassFixture {
     daemon: DaemonHandle,
     _tempdir: TempDir,
@@ -436,8 +439,10 @@ impl KernelBypassFixture {
         nftables::install_castle_table().expect("install_castle_table");
 
         let scope = cgroup::create_agent_scope(agent_id).expect("create_agent_scope");
+        let cgroup_relative =
+            cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
 
-        // Production ruleset: real `socket cgroupv2 level 2 <id>` match.
+        // Production ruleset: real `socket cgroupv2 level <N> "<path>"` match.
         // The allow rule covers example.com (93.184.216.34) at 443/tcp;
         // anything else hits the catchall and is queued to NFQUEUE.
         let frags = vec![NftRuleFragment {
@@ -446,7 +451,7 @@ impl KernelBypassFixture {
         }];
         let script = nftables::build_agent_ruleset(
             agent_id,
-            scope.cgroup_id,
+            &cgroup_relative,
             scope.cgroup_level,
             &frags,
         );
@@ -608,13 +613,15 @@ fn cleanup_castle_table_silent() {
 /// NFQUEUE verdict loop, and asserts the daemon's audit emits an
 /// `egress_blocked` + `default_deny` shape for the bypass.
 #[test]
-#[ignore = "blocked on nft 1.0.9 cgroupv2 path lookup at rule-load time on \
-            Ubuntu 24.04 + systemd 255: nft rejects production rule with \
-            'cgroupv2 path fails: No such file or directory' even when the \
-            agent cgroup exists at the systemd-reported ControlGroup path \
-            with the matching inode. Tracked as a follow-on v1.x ticket \
-            (separate root cause from the cgroup-creation fix shipped in \
-            this PR)."]
+#[ignore = "blocked on a separate v1.x ticket: the per-agent chain holding \
+            the cgroupv2 socket match is not jumped to from the base output \
+            chain, so packets bypass the per-agent rules entirely. \
+            `install_castle_table` creates the base `output` chain with \
+            policy accept and no jump rule; per-agent chains are dead \
+            chains until that wiring lands. The path-string fix in this PR \
+            is necessary but not sufficient for real-cgroup enforcement. \
+            Activate by removing `#[ignore]` once the chain-wiring v1.x \
+            ticket merges."]
 fn kernel_drops_plain_dns_to_unallowed_resolver() {
     let fixture = KernelBypassFixture::setup("dns-bypass-test", 0);
 
@@ -657,9 +664,9 @@ fn kernel_drops_plain_dns_to_unallowed_resolver() {
 /// queues the SYN to NFQUEUE and the audit records `egress_blocked` for
 /// tcp/443 with `default_deny` provenance.
 #[test]
-#[ignore = "blocked on nft 1.0.9 cgroupv2 path lookup at rule-load time on \
-            Ubuntu 24.04 + systemd 255 (see kernel_drops_plain_dns_to_unallowed_resolver \
-            for the full failure mode and follow-on v1.x ticket reference)."]
+#[ignore = "blocked on the chain-wiring v1.x ticket (see \
+            kernel_drops_plain_dns_to_unallowed_resolver for the full \
+            failure mode and remaining production gap)."]
 fn kernel_drops_doh_to_unallowed_provider() {
     let fixture = KernelBypassFixture::setup("doh-bypass-test", 1);
 
@@ -706,9 +713,9 @@ fn kernel_drops_doh_to_unallowed_provider() {
 /// the TLS handshake completes; audit records `egress_blocked` for
 /// tcp/853 with `default_deny` provenance.
 #[test]
-#[ignore = "blocked on nft 1.0.9 cgroupv2 path lookup at rule-load time on \
-            Ubuntu 24.04 + systemd 255 (see kernel_drops_plain_dns_to_unallowed_resolver \
-            for the full failure mode and follow-on v1.x ticket reference)."]
+#[ignore = "blocked on the chain-wiring v1.x ticket (see \
+            kernel_drops_plain_dns_to_unallowed_resolver for the full \
+            failure mode and remaining production gap)."]
 fn kernel_drops_dot_to_unallowed_resolver() {
     let fixture = KernelBypassFixture::setup("dot-bypass-test", 2);
 
