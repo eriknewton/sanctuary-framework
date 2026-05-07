@@ -1,11 +1,11 @@
 /**
- * Sanctuary v1.1 — Operator Hub Event Contracts
+ * Sanctuary v1.1 Operator Hub Event Contracts
  *
  * Shared shapes for the unified inbox, the activity feed, and the per-agent
  * status panels. The operator hub API workstream (Prompt 5) emits these; the
  * dashboard UI workstream (Prompt 8) consumes them. v1.2 mobile companion
  * planning will evaluate these shapes when it scopes a phone surface, but
- * v1.1 does not commit to mobile compatibility — these contracts are
+ * v1.1 does not commit to mobile compatibility. These contracts are
  * tuned for the local dashboard surface only.
  *
  * Local-only invariant:
@@ -32,7 +32,7 @@ import type {
  * accepted; the dashboard rejects rendering on any value outside this union.
  *
  * The renderer treats every value as data to interpolate into a fixed
- * template registered under `template_id` — never as raw content. This
+ * template registered under `template_id`, never as raw content. This
  * defends against secrets, query text, file paths, and client names leaking
  * into inbox cards via stringly-typed display fields.
  */
@@ -78,7 +78,7 @@ export interface HubInboxItemHeader {
   display_template_id: string;
   /**
    * Typed args interpolated into the template. Every value MUST be a
-   * `HubDisplayTemplateArg` instance — no free-form strings. Renderers
+   * `HubDisplayTemplateArg` instance, no free-form strings. Renderers
    * reject any arg outside this union, which structurally blocks secret
    * leakage via inbox copy.
    */
@@ -193,7 +193,7 @@ export interface HubBudgetWarningItem extends HubInboxItemHeader {
 }
 
 /**
- * Recovery prompt — operator should run a recovery flow (passphrase reset,
+ * Recovery prompt. Operator should run a recovery flow (passphrase reset,
  * keychain rebind, exit drill, etc.).
  */
 export interface HubRecoveryPromptItem extends HubInboxItemHeader {
@@ -262,12 +262,32 @@ export interface HubActivityFeedEntry {
     | "other";
   /**
    * Display template id. Resolved by the dashboard against the activity-feed
-   * template catalog. Backends MUST NOT emit raw summary text — the template
+   * template catalog. Backends MUST NOT emit raw summary text. The template
    * id plus typed args is the only legitimate channel.
    */
   display_template_id: string;
   /** Typed args. Same constraints as `HubInboxItemHeader.display_template_args`. */
   display_template_args: HubDisplayTemplateArg[];
+  /**
+   * Per-action attestation fragment for dashboard timeline rendering.
+   *
+   * Optional; absence means the row renders without a badge.
+   *
+   * `state` drives the `att-action` CSS class on the rendered badge.
+   * `fragment` is a deterministic short hex string derived from the
+   * audit-chain entry id; it gives operators a stable per-row visual hook
+   * the same shape the Sprint Piece 2 attestation gallery shows.
+   *
+   * Important: the fragment is NOT a real per-event Ed25519 signature.
+   * The audit chain itself is tamper-evident at the main-process boundary
+   * (scope-lock §8); the fragment is the visible projection of the entry's
+   * audit-chain identity. Real per-event signatures land post-v1.5+ in the
+   * Crypto Agility Sprint.
+   */
+  attestation?: {
+    state: "verified" | "degraded" | "unverified" | "neutral";
+    fragment: string;
+  };
 }
 
 /**
