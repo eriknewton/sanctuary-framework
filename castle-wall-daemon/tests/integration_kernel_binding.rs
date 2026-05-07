@@ -186,16 +186,18 @@ fn cgroup_resolve_id_on_root_cgroup() {
 
 #[test]
 fn cgroup_scope_unit_name_format() {
+    // `.service` suffix: production code switched from `--scope` to
+    // `--service` mode after systemd 255 rejected `--remain-after-exit`.
     let name = cgroup::scope_unit_name("my-agent");
-    assert_eq!(name, "sanctuary-agent-my-agent.scope");
+    assert_eq!(name, "sanctuary-agent-my-agent.service");
 }
 
 #[test]
 fn cgroup_path_for_scope_shape() {
-    let path = cgroup::cgroup_path_for_scope("sanctuary-agent-test.scope");
+    let path = cgroup::cgroup_path_for_scope("sanctuary-agent-test.service");
     assert_eq!(
         path,
-        PathBuf::from("/sys/fs/cgroup/system.slice/sanctuary-agent-test.scope")
+        PathBuf::from("/sys/fs/cgroup/system.slice/sanctuary-agent-test.service")
     );
 }
 

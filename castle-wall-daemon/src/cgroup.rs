@@ -1,10 +1,19 @@
-//! cgroup v2 transient scope creation via systemd-run.
+//! cgroup v2 transient unit creation via systemd-run.
 //!
 //! Per scope-lock section 1: each wrapped agent runs in its own systemd
-//! transient scope. The daemon resolves the cgroup ID from the scope path
+//! transient unit. The daemon resolves the cgroup ID from the unit path
 //! for use in nftables `socket cgroupv2` matches. The cgroup-id renumbering
 //! gotcha (nftables resolves cgroup paths to numeric inode IDs at rule-load
-//! time) is handled by re-installing rules when a scope is re-created.
+//! time) is handled by re-installing rules when a unit is re-created.
+//!
+//! Implementation note: we use systemd transient `.service` units with a
+//! `sleep infinity` placeholder to anchor the cgroup lifetime. The earlier
+//! `--scope --remain-after-exit /bin/true` shape was rejected on systemd
+//! 255 (Ubuntu 24.04 and later) because `--remain-after-exit` is not
+//! supported in `--scope` mode. The `--service` shape is the correct
+//! unit type for "create a cgroup that outlives systemd-run": services
+//! manage their own lifetime, accept `Delegate=yes`, and return promptly
+//! when invoked with `--no-block`.
 //!
 //! All kernel-touching functions are `#[cfg(target_os = "linux")]`-gated.
 
@@ -36,7 +45,12 @@ pub struct ScopeHandle {
     pub cgroup_id: u64,
 }
 
-/// Derive the systemd scope unit name from an agent id.
+/// Derive the systemd transient unit name from an agent id.
+///
+/// Returns a `.service` unit name. The earlier `.scope` shape was changed
+/// to `.service` when the production code switched to `systemd-run --service`
+/// to work around systemd 255 rejecting `--remain-after-exit` in `--scope`
+/// mode.
 pub fn scope_unit_name(agent_id: &str) -> String {
     // Sanitize: systemd unit names allow alphanumeric, hyphen, underscore,
     // period, backslash, colon. Replace anything else with underscore.
@@ -50,15 +64,14 @@ pub fn scope_unit_name(agent_id: &str) -> String {
             }
         })
         .collect();
-    format!("sanctuary-agent-{sanitized}.scope")
+    format!("sanctuary-agent-{sanitized}.service")
 }
 
-/// Resolve the cgroup v2 path for a systemd scope unit.
+/// Resolve the cgroup v2 path for a systemd transient unit.
 pub fn cgroup_path_for_scope(scope_unit: &str) -> PathBuf {
-    // systemd places transient scopes under /sys/fs/cgroup/system.slice/
-    // (system scopes) or /sys/fs/cgroup/user.slice/user-<UID>.slice/
-    // (user scopes). For the daemon (running as root), system scope is
-    // canonical.
+    // systemd places transient system units under /sys/fs/cgroup/system.slice/
+    // (system-level) or /sys/fs/cgroup/user.slice/user-<UID>.slice/
+    // (user-level). The daemon runs as root, so system.slice is canonical.
     PathBuf::from(format!("/sys/fs/cgroup/system.slice/{scope_unit}"))
 }
 
@@ -98,20 +111,26 @@ mod linux {
         }
     }
 
-    /// Create a transient systemd scope for an agent. Uses `systemd-run`
-    /// in scope mode. The scope is a pure cgroup container; no process
-    /// is launched inside it yet. The caller (nfqueue verdict loop)
-    /// classifies processes into this cgroup.
+    /// Create a transient systemd unit for an agent. Uses `systemd-run`
+    /// in service mode with a `sleep infinity` placeholder to anchor the
+    /// cgroup lifetime. `--no-block` ensures `systemd-run` returns promptly
+    /// once the unit is queued; the caller (nfqueue verdict loop) then
+    /// classifies real agent processes into the cgroup.
+    ///
+    /// systemd 255 rejects `--remain-after-exit` in `--scope` mode, so the
+    /// older `--scope --remain-after-exit /bin/true` shape no longer works.
+    /// Service units are the correct unit type for "create an empty cgroup
+    /// that survives the create call."
     pub fn create_agent_scope_impl(agent_id: &str) -> Result<ScopeHandle, CgroupError> {
         let unit = scope_unit_name(agent_id);
         let output = Command::new("systemd-run")
             .args([
-                "--scope",
+                "--no-block",
                 "--unit",
                 &unit,
                 "--property=Delegate=yes",
-                "--remain-after-exit",
-                "/bin/true",
+                "/usr/bin/sleep",
+                "infinity",
             ])
             .output()
             .map_err(|e| CgroupError::InvocationFailed(e.to_string()))?;
@@ -125,7 +144,17 @@ mod linux {
             )));
         }
 
+        // `--no-block` returns once the start request is queued, before
+        // the unit is fully active and the cgroup directory exists. Poll
+        // briefly (up to ~1s) for the cgroup path to appear before
+        // resolving the inode id.
         let cgroup_path = cgroup_path_for_scope(&unit);
+        for _ in 0..50 {
+            if cgroup_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let cgroup_id = resolve_cgroup_id(&cgroup_path)?;
 
         Ok(ScopeHandle {
@@ -269,22 +298,25 @@ mod tests {
 
     #[test]
     fn scope_unit_name_sanitizes() {
+        // Suffix is `.service` (not `.scope`): production switched to
+        // `systemd-run --service` after systemd 255 rejected
+        // `--remain-after-exit` in `--scope` mode.
         assert_eq!(
             scope_unit_name("my-agent"),
-            "sanctuary-agent-my-agent.scope"
+            "sanctuary-agent-my-agent.service"
         );
         assert_eq!(
             scope_unit_name("agent/with spaces"),
-            "sanctuary-agent-agent_with_spaces.scope"
+            "sanctuary-agent-agent_with_spaces.service"
         );
     }
 
     #[test]
     fn cgroup_path_for_scope_is_under_system_slice() {
-        let path = cgroup_path_for_scope("sanctuary-agent-test.scope");
+        let path = cgroup_path_for_scope("sanctuary-agent-test.service");
         assert_eq!(
             path,
-            PathBuf::from("/sys/fs/cgroup/system.slice/sanctuary-agent-test.scope")
+            PathBuf::from("/sys/fs/cgroup/system.slice/sanctuary-agent-test.service")
         );
     }
 
