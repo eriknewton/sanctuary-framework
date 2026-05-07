@@ -121,6 +121,15 @@ mod linux {
     /// older `--scope --remain-after-exit /bin/true` shape no longer works.
     /// Service units are the correct unit type for "create an empty cgroup
     /// that survives the create call."
+    ///
+    /// The `cgroup_path` returned is queried from systemd via
+    /// `systemctl show --property=ControlGroup` (the canonical source of
+    /// truth) rather than synthesized from the unit name. This avoids
+    /// drift between the daemon's path assumption and where systemd 255
+    /// actually places the cgroup, and it lets nft's
+    /// `socket cgroupv2 level 2 <id>` rule lookup find the cgroup at
+    /// rule-load time. Waits for the unit to reach `active` state before
+    /// resolving so the cgroup inode is stable.
     pub fn create_agent_scope_impl(agent_id: &str) -> Result<ScopeHandle, CgroupError> {
         let unit = scope_unit_name(agent_id);
         let output = Command::new("systemd-run")
@@ -144,17 +153,47 @@ mod linux {
             )));
         }
 
-        // `--no-block` returns once the start request is queued, before
-        // the unit is fully active and the cgroup directory exists. Poll
-        // briefly (up to ~1s) for the cgroup path to appear before
-        // resolving the inode id.
-        let cgroup_path = cgroup_path_for_scope(&unit);
-        for _ in 0..50 {
-            if cgroup_path.exists() {
+        // Wait for the unit to reach `active` state so the placeholder
+        // process is running and the cgroup is fully materialized. Up to
+        // ~2s with 50ms polling. Without this, `--no-block` can return
+        // while the unit is still in `activating`, the cgroup directory
+        // is empty (cgroup.procs has no PID yet), and downstream
+        // `nft -f -` rule loads can race the directory's full setup.
+        let mut active = false;
+        for _ in 0..40 {
+            let status = Command::new("systemctl")
+                .args(["is-active", "--quiet", &unit])
+                .status();
+            if matches!(status, Ok(s) if s.success()) {
+                active = true;
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        if !active {
+            return Err(CgroupError::InvocationFailed(format!(
+                "unit {unit} did not reach active state within 2s"
+            )));
+        }
+
+        // Query systemd for the canonical ControlGroup path. The earlier
+        // synthesized path (`/sys/fs/cgroup/system.slice/<unit>`) was a
+        // best guess; systemd 255's actual placement under cgroup-v2 is
+        // authoritative. The systemctl --value form returns just the
+        // path, e.g. `/system.slice/sanctuary-agent-foo.service`.
+        let show = Command::new("systemctl")
+            .args(["show", &unit, "--property=ControlGroup", "--value"])
+            .output()
+            .map_err(|e| {
+                CgroupError::InvocationFailed(format!("systemctl show ControlGroup: {e}"))
+            })?;
+        let control_group = String::from_utf8_lossy(&show.stdout).trim().to_string();
+        if control_group.is_empty() {
+            return Err(CgroupError::PathNotFound(format!(
+                "unit {unit} has no ControlGroup"
+            )));
+        }
+        let cgroup_path = PathBuf::from(format!("/sys/fs/cgroup{control_group}"));
         let cgroup_id = resolve_cgroup_id(&cgroup_path)?;
 
         Ok(ScopeHandle {
