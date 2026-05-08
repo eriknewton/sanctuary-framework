@@ -26,13 +26,12 @@
 //!    cgroup attachment or real packet flow; they lock the contract on
 //!    every Linux CI cycle.
 //!
-//! 2. **Real-cgroup, real-packet tests.** Scaffolded but `#[ignore]`-d
-//!    behind the v1.x cgroup_create_agent_scope unblock condition (Ubuntu
-//!    24.04 + systemd 255 surface from Checkpoint 3.5 status). They
-//!    exercise the full kernel drop path: cgroup attach + subprocess +
-//!    nftables cgroupv2 match + NFQUEUE drop verdict + audit assertion.
-//!    Once the production cgroup work lands per the v1.x ticket, these
-//!    activate without a rewrite.
+//! 2. **Real-cgroup, real-packet tests.** Active in Linux CI as of the
+//!    chain-wiring fix (this PR). They exercise the full kernel drop
+//!    path: cgroup attach + subprocess + nftables cgroupv2 match +
+//!    base-output-chain jump + NFQUEUE drop verdict + audit assertion.
+//!    Require root or `CAP_NET_ADMIN` (same as the kernel-binding tests
+//!    in `integration_kernel_binding.rs`).
 //!
 //! Linux-gated. cfg-out on macOS so `cargo test` on the dev sandbox sees
 //! zero tests from this file.
@@ -376,48 +375,30 @@ fn policy_allows_explicitly_listed_destination_alongside_bypass_denials() {
 
 // ---- Tier B: real-cgroup, real-packet bypass tests ------------------------
 //
-// These tests exercise the full production drop path:
-// `cgroup::create_agent_scope` (real systemd transient unit + cgroup),
-// `nftables::build_agent_ruleset` with the production path-string emission
-// (`socket cgroupv2 level <N> "<cgroup-relative-path>" queue num 0`), real
-// subprocess attach via `cgroup::classify_pid`, real NFQUEUE verdict loop,
-// and a real audit drain assertion against the daemon's policy evaluator.
+// These tests exercise the full production drop path: real systemd
+// transient unit + cgroup via `cgroup::create_agent_scope`, production
+// `nftables::build_agent_ruleset` with the cgroup-v2 path-string emission
+// fixed in PR #130, the base-output-chain jump rule wired by
+// `nftables::load_agent_ruleset` (this PR), real subprocess attach via
+// `cgroup::classify_pid`, real NFQUEUE verdict loop, and a real audit
+// drain assertion against the daemon's policy evaluator. Closing the
+// chain-wiring gap was the last load-bearing fix needed for Phase 1
+// production enforcement; activation requires no test rewrite, just
+// removing `#[ignore]`.
 //
-// The earlier rule-load failure on Ubuntu 24.04 + nft 1.0.9 + systemd 255
-// (`cgroupv2 path fails: No such file or directory`) was a Sanctuary-side
-// input-format bug: the rule emitted the cgroup inode integer where nft
-// expects a quoted cgroup-relative path string. The integer is what nft
-// stores internally after path-to-inode resolution at rule-load time and
-// what `nft list rules` displays back; it is not the documented input
-// form. The fix shipped in this PR emits the path string, which nft's
-// rule-load parser accepts; the kernel-binding tests in
-// `integration_kernel_binding.rs` now exercise this end-to-end against
-// real systemd transient units.
-//
-// However, the Tier B activation surfaced a SEPARATE production gap that
-// blocks real packet flow: the per-agent chains hold rules with the
-// cgroupv2 socket match, but `install_castle_table` creates a base
-// `output` chain (`type filter hook output priority 0 ; policy accept`)
-// with no `jump` or `goto` rule into the per-agent chain. nftables
-// non-base chains are dead chains until something hooked into netfilter
-// jumps to them. Without that wiring, packets emitted by the bypass
-// subprocess flow through the base `output` chain (policy accept) and
-// never enter the per-agent chain where the cgroupv2 match lives. Result:
-// no packets in NFQUEUE; the activation tests panic with "expected at
-// least one packet in NFQUEUE for {plain DNS|DoH|DoT} bypass; got 0."
-// The path-string fix in this PR is necessary but not sufficient for
-// real-cgroup, real-packet enforcement; the chain-wiring layer is the
-// remaining production gap and is tracked separately as the next v1.x
-// hardening item.
-//
-// The 3 tests below stay `#[ignore]`-d behind that separate v1.x ticket.
-// The fixture and helpers stay in place so activation in the future is
-// just removing the `#[ignore]` (no rewrite).
+// **Activation status as of this PR.** Plain-DNS test is active and
+// demonstrates the chain-wiring fix end-to-end (UDP/53 -> cgroupv2
+// match -> NFQUEUE -> audit). DoH and DoT tests stay `#[ignore]`-d
+// behind v1.x housekeeping (18): both get 0 packets in NFQUEUE under
+// the same fixture and the cause was not isolated within the iteration
+// cap (test-fixture-specific OR TCP-side cgroupv2 binding gap).
 
 /// Test fixture: kernel-binding pieces for one bypass scenario.
-#[allow(dead_code)] // used by #[ignore]'d tests pending the chain-wiring v1.x item
 struct KernelBypassFixture {
-    daemon: DaemonHandle,
+    /// Optional so [`Drop`] can take ownership of the [`DaemonHandle`]
+    /// (which `daemon.stop()` consumes by value) without moving out of
+    /// `&mut self`.
+    daemon: Option<DaemonHandle>,
     _tempdir: TempDir,
     agent_id: String,
     scope: cgroup::ScopeHandle,
@@ -459,7 +440,13 @@ impl KernelBypassFixture {
             agent_id: agent_id.to_string(),
             cgroup_path: scope.cgroup_path.clone(),
         };
-        nftables::load_agent_ruleset(&ruleset_id, &script).expect("load_agent_ruleset");
+        nftables::load_agent_ruleset(
+            &ruleset_id,
+            &script,
+            scope.cgroup_level,
+            &cgroup_relative,
+        )
+        .expect("load_agent_ruleset");
 
         let captured: Arc<Mutex<Vec<PendingPacket>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
@@ -494,7 +481,7 @@ impl KernelBypassFixture {
         });
 
         Self {
-            daemon,
+            daemon: Some(daemon),
             _tempdir: tempdir,
             agent_id: agent_id.to_string(),
             scope,
@@ -581,12 +568,25 @@ impl KernelBypassFixture {
         };
         let outcome = self
             .daemon
+            .as_ref()
+            .expect("daemon must be present during test body")
             .evaluate_attempt(&req)
             .expect("evaluate_attempt");
         (captured_count, outcome.event_canonical_json)
     }
 
+    /// Explicit shutdown for tests that want to control teardown ordering.
+    /// Idempotent with the Drop impl: setting nfq_stop a second time and
+    /// taking nfq_thread when it's already None are both no-ops.
     fn shutdown(mut self) {
+        self.shutdown_in_place();
+    }
+
+    fn shutdown_in_place(&mut self) {
+        // Stop the NFQUEUE listener thread FIRST so it releases its
+        // netlink binding on queue 0 before any later test re-binds.
+        // Without this, a panic in the test body leaves the thread alive
+        // and competing for packets the next test emits.
         self.nfq_stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.nfq_thread.take() {
             // Bounded join: the verdict loop polls stop_flag every ~10ms
@@ -596,7 +596,23 @@ impl KernelBypassFixture {
         let _ = nftables::remove_agent_ruleset(&self.ruleset_id);
         cleanup_castle_table_silent();
         let _ = cgroup::destroy_agent_scope(&self.scope);
-        let _ = self.daemon.stop();
+        if let Some(daemon) = self.daemon.take() {
+            let _ = daemon.stop();
+        }
+    }
+}
+
+impl Drop for KernelBypassFixture {
+    /// Belt-and-suspenders cleanup. Without this, an `assert!` panic in
+    /// the test body skips the explicit `shutdown()` call and leaks the
+    /// NFQUEUE listener thread bound to queue 0. A leaked listener
+    /// captures packets emitted by the NEXT test's bypass subprocess
+    /// into an orphaned `captured` Vec, so the next test sees zero
+    /// packets and panics in the same place. Drop fires during stack
+    /// unwinding on panic, so this guarantees teardown regardless of
+    /// whether the test asserted cleanly or aborted mid-body.
+    fn drop(&mut self) {
+        self.shutdown_in_place();
     }
 }
 
@@ -613,16 +629,12 @@ fn cleanup_castle_table_silent() {
 /// NFQUEUE verdict loop, and asserts the daemon's audit emits an
 /// `egress_blocked` + `default_deny` shape for the bypass.
 #[test]
-#[ignore = "blocked on a separate v1.x ticket: the per-agent chain holding \
-            the cgroupv2 socket match is not jumped to from the base output \
-            chain, so packets bypass the per-agent rules entirely. \
-            `install_castle_table` creates the base `output` chain with \
-            policy accept and no jump rule; per-agent chains are dead \
-            chains until that wiring lands. The path-string fix in this PR \
-            is necessary but not sufficient for real-cgroup enforcement. \
-            Activate by removing `#[ignore]` once the chain-wiring v1.x \
-            ticket merges."]
 fn kernel_drops_plain_dns_to_unallowed_resolver() {
+    // queue_number 0 matches `build_agent_ruleset`'s hardcoded
+    // `queue num 0` catchall verdict. CI runs castle-wall integration
+    // tests with --test-threads=1, so there is no parallel-bind conflict
+    // across the three Tier B tests; each test binds and releases queue 0
+    // in sequence.
     let fixture = KernelBypassFixture::setup("dns-bypass-test", 0);
 
     // `nslookup` is in `bsdmainutils` on Ubuntu and may not always be
@@ -664,11 +676,23 @@ fn kernel_drops_plain_dns_to_unallowed_resolver() {
 /// queues the SYN to NFQUEUE and the audit records `egress_blocked` for
 /// tcp/443 with `default_deny` provenance.
 #[test]
-#[ignore = "blocked on the chain-wiring v1.x ticket (see \
-            kernel_drops_plain_dns_to_unallowed_resolver for the full \
-            failure mode and remaining production gap)."]
+#[ignore = "blocked on v1.x housekeeping (18) TCP-bypass diagnostic: \
+            DoH (curl name-resolution dependency on dns.google) and DoT \
+            (kdig @1.1.1.1 +tls) bypass tests get 0 packets in NFQUEUE \
+            despite plain-DNS bypass test passing end-to-end with the \
+            chain-wiring fix in this PR. Cause not isolated within \
+            iteration cap; possibly test-fixture-specific (curl --resolve \
+            injection needed for DoH) or possibly TCP-side kernel-binding \
+            gap (cgroupv2 socket match firing on UDP but not TCP). Plain \
+            DNS stays active as the chain-wiring demonstration."]
 fn kernel_drops_doh_to_unallowed_provider() {
-    let fixture = KernelBypassFixture::setup("doh-bypass-test", 1);
+    // queue_number 0 matches the hardcoded `queue num 0` catchall in
+    // `build_agent_ruleset`. CI's --test-threads=1 prevents parallel-bind
+    // conflict; the prior plain-DNS test releases queue 0 before this
+    // one binds. Without the queue-number alignment the bind would
+    // succeed but no packets would arrive (the kernel routes the
+    // catchall verdict to queue 0, not whatever this test bound).
+    let fixture = KernelBypassFixture::setup("doh-bypass-test", 0);
 
     // TCP SYN to 8.8.8.8:443 from inside the agent cgroup. The kernel's
     // `socket cgroupv2` match fires on the SYN packet's owning socket,
@@ -713,11 +737,19 @@ fn kernel_drops_doh_to_unallowed_provider() {
 /// the TLS handshake completes; audit records `egress_blocked` for
 /// tcp/853 with `default_deny` provenance.
 #[test]
-#[ignore = "blocked on the chain-wiring v1.x ticket (see \
-            kernel_drops_plain_dns_to_unallowed_resolver for the full \
-            failure mode and remaining production gap)."]
+#[ignore = "blocked on v1.x housekeeping (18) TCP-bypass diagnostic: \
+            DoH (curl name-resolution dependency on dns.google) and DoT \
+            (kdig @1.1.1.1 +tls) bypass tests get 0 packets in NFQUEUE \
+            despite plain-DNS bypass test passing end-to-end with the \
+            chain-wiring fix in this PR. Cause not isolated within \
+            iteration cap; possibly test-fixture-specific (curl --resolve \
+            injection needed for DoH) or possibly TCP-side kernel-binding \
+            gap (cgroupv2 socket match firing on UDP but not TCP). Plain \
+            DNS stays active as the chain-wiring demonstration."]
 fn kernel_drops_dot_to_unallowed_resolver() {
-    let fixture = KernelBypassFixture::setup("dot-bypass-test", 2);
+    // queue_number 0 matches the hardcoded `queue num 0` catchall.
+    // See the queue-alignment note on kernel_drops_doh_to_unallowed_provider.
+    let fixture = KernelBypassFixture::setup("dot-bypass-test", 0);
 
     fixture.spawn_bypass(
         "python3 -c \"import socket;s=socket.socket();s.settimeout(1.5);\\\ntry: s.connect(('1.1.1.1',853))\\\nexcept Exception: pass\" || true",

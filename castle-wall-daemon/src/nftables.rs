@@ -99,6 +99,38 @@ pub fn build_agent_ruleset(
     script
 }
 
+/// Build the jump rule that routes packets from an agent's cgroup-v2
+/// directory into its per-agent chain in the `sanctuary-castle` output
+/// chain. Pure helper: emits the nft rule string only; callers shell out
+/// to apply it.
+///
+/// The base `output` chain created by [`install_castle_table`] is hooked
+/// into netfilter (`type filter hook output priority 0`) but has no rules
+/// of its own. Per-agent chains are non-base chains and stay dead until
+/// something jumps to them. This helper produces the `goto agent_<id>`
+/// rule that gates entry into the per-agent chain on the cgroup-v2
+/// `socket cgroupv2 level <N> "<path>"` match: only packets owned by a
+/// socket inside the agent's cgroup transit the per-agent rules. Every
+/// other packet in the operator's host (browser, OS daemons, the
+/// operator's other apps) flows past the jump and is allowed by the base
+/// chain's `policy accept`.
+///
+/// The path is quoted at emission time (the same correctness invariant
+/// pinned for [`build_agent_ruleset`] in PR #130). `cgroup_level` mirrors
+/// the same dynamic-depth shape: depth 2 in canonical
+/// `system.slice/<unit>` placement, deeper for nested deployments.
+pub fn build_agent_jump_rule(
+    agent_id: &str,
+    cgroup_level: u32,
+    cgroup_relative_path: &str,
+) -> String {
+    let chain_name = agent_chain_name(agent_id);
+    format!(
+        "add rule {CASTLE_FAMILY} {CASTLE_TABLE} output \
+         socket cgroupv2 level {cgroup_level} \"{cgroup_relative_path}\" goto {chain_name}"
+    )
+}
+
 /// Derive a sanitized chain name from an agent id.
 fn agent_chain_name(agent_id: &str) -> String {
     // nftables chain names allow alphanumeric, underscore, hyphen, period.
@@ -214,6 +246,8 @@ mod linux {
     pub fn load_agent_ruleset_impl(
         id: &AgentRulesetId,
         ruleset_script: &str,
+        cgroup_level: u32,
+        cgroup_relative_path: &str,
     ) -> Result<(), NftablesError> {
         let chain_name = agent_chain_name(&id.agent_id);
         // Ensure the per-agent chain exists.
@@ -221,18 +255,118 @@ mod linux {
             "add chain {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name}\n"
         );
         let _ = run_nft_stdin(&create);
-        // Apply the ruleset script (atomic replace).
-        run_nft_stdin(ruleset_script)
+        // Apply the ruleset script (atomic replace on the per-agent chain).
+        run_nft_stdin(ruleset_script)?;
+        // Wire the base output chain to this per-agent chain so kernel
+        // packets actually traverse the per-agent rules. Without this jump,
+        // the per-agent chain is a dead chain and packets bypass enforcement
+        // entirely. Idempotent: any existing jump rule for this agent is
+        // removed before the new one is added (supports policy reload).
+        install_agent_jump_rule_impl(id, cgroup_level, cgroup_relative_path)
     }
 
     pub fn remove_agent_ruleset_impl(id: &AgentRulesetId) -> Result<(), NftablesError> {
         let chain_name = agent_chain_name(&id.agent_id);
+        // Remove the base-chain jump rule first so it does not dangle
+        // pointing at a deleted chain. Idempotent: missing rule is fine.
+        let _ = remove_agent_jump_rule_impl(id);
         // Flush rules first, then delete the chain.
         let script = format!(
             "flush chain {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name}\n\
              delete chain {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name}\n"
         );
         run_nft_stdin(&script)
+    }
+
+    /// Install the jump rule from the base `output` chain into this agent's
+    /// per-agent chain, gated on the cgroup-v2 socket match. Idempotent:
+    /// any prior jump rule pointing at the same agent's chain is removed
+    /// (handle-based delete) before the new rule is added. This lets the
+    /// function double as both the fresh-install and policy-reload path
+    /// without leaking stale jumps.
+    pub fn install_agent_jump_rule_impl(
+        id: &AgentRulesetId,
+        cgroup_level: u32,
+        cgroup_relative_path: &str,
+    ) -> Result<(), NftablesError> {
+        // Drop any existing jump rule for this agent before adding a new
+        // one. Failures during the lookup are not fatal here: a missing
+        // base chain (table just created, nothing in output yet) returns
+        // an error from `nft -a list chain`; the upcoming add will fail
+        // with a clearer message if the table is genuinely absent.
+        let _ = remove_agent_jump_rule_impl(id);
+        let rule = build_agent_jump_rule(&id.agent_id, cgroup_level, cgroup_relative_path);
+        let script = format!("{rule}\n");
+        run_nft_stdin(&script)
+    }
+
+    /// Remove the jump rule from the base `output` chain that targets this
+    /// agent's per-agent chain. Idempotent: zero matching rules returns
+    /// `Ok(())` rather than an error so policy-reload code paths can call
+    /// it unconditionally.
+    pub fn remove_agent_jump_rule_impl(id: &AgentRulesetId) -> Result<(), NftablesError> {
+        let chain_name = agent_chain_name(&id.agent_id);
+        // `-a` annotates each rule with `# handle <N>`; we parse those
+        // handles for any rule whose verdict targets our chain.
+        let listing = match run_nft(&["-a", "list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "output"])
+        {
+            Ok(s) => s,
+            Err(NftablesError::InvocationFailed(msg))
+                if msg.contains("No such file or directory")
+                    || msg.contains("does not exist") =>
+            {
+                // Base chain absent (table was deleted or never installed).
+                // Treat as zero matching rules.
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let handles = parse_jump_rule_handles(&listing, &chain_name);
+        for handle in handles {
+            run_nft(&[
+                "delete",
+                "rule",
+                CASTLE_FAMILY,
+                CASTLE_TABLE,
+                "output",
+                "handle",
+                &handle.to_string(),
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// Parse `nft -a list chain ... output` output, returning the handle
+    /// integer for every rule whose verdict is `goto <chain_name>`. The
+    /// match is token-precise (no substring match) so chain names that
+    /// share a prefix (`agent_foo`, `agent_foo_bar`) do not collide.
+    pub(super) fn parse_jump_rule_handles(listing: &str, chain_name: &str) -> Vec<u64> {
+        let mut handles = Vec::new();
+        for line in listing.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            // Find a `goto <chain_name>` token pair. nft also emits `jump`
+            // for non-terminating verdicts; we only emit `goto` so we
+            // restrict the match to that.
+            let has_goto = tokens
+                .iter()
+                .enumerate()
+                .any(|(i, tok)| *tok == "goto" && tokens.get(i + 1) == Some(&chain_name));
+            if !has_goto {
+                continue;
+            }
+            // Extract handle from "# handle <N>". `nft -a` always emits
+            // both tokens together at the end of the rule line.
+            if let Some(handle_idx) = tokens.iter().position(|t| *t == "handle") {
+                if handle_idx > 0 && tokens[handle_idx - 1] == "#" {
+                    if let Some(handle_tok) = tokens.get(handle_idx + 1) {
+                        if let Ok(h) = handle_tok.parse::<u64>() {
+                            handles.push(h);
+                        }
+                    }
+                }
+            }
+        }
+        handles
     }
 
     pub fn list_agent_rulesets_impl() -> Result<Vec<AgentRulesetId>, NftablesError> {
@@ -293,18 +427,38 @@ pub fn install_castle_table() -> Result<(), NftablesError> {
 
 /// Load a ruleset for one agent's cgroup. Atomic replace on the per-agent
 /// chain; existing connections preserved per nftables atomic-replace
-/// semantics.
+/// semantics. Also installs (or refreshes) the jump rule in the base
+/// `output` chain that gates entry into the per-agent chain on the
+/// cgroup-v2 socket match. Without that jump rule the per-agent chain is
+/// a dead chain and the kernel never consults it.
+///
+/// `cgroup_level` is the depth of the agent's cgroup in the cgroup-v2
+/// hierarchy (matches `ScopeHandle::cgroup_level`). `cgroup_relative_path`
+/// is the path with the `/sys/fs/cgroup/` prefix stripped (matches
+/// [`crate::cgroup::cgroup_relative_path`]).
 #[cfg(target_os = "linux")]
-pub fn load_agent_ruleset(id: &AgentRulesetId, ruleset: &str) -> Result<(), NftablesError> {
-    linux::load_agent_ruleset_impl(id, ruleset)
+pub fn load_agent_ruleset(
+    id: &AgentRulesetId,
+    ruleset: &str,
+    cgroup_level: u32,
+    cgroup_relative_path: &str,
+) -> Result<(), NftablesError> {
+    linux::load_agent_ruleset_impl(id, ruleset, cgroup_level, cgroup_relative_path)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn load_agent_ruleset(_id: &AgentRulesetId, _ruleset: &str) -> Result<(), NftablesError> {
+pub fn load_agent_ruleset(
+    _id: &AgentRulesetId,
+    _ruleset: &str,
+    _cgroup_level: u32,
+    _cgroup_relative_path: &str,
+) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
-/// Remove an agent's ruleset (called on agent shutdown / unwrap).
+/// Remove an agent's ruleset (called on agent shutdown / unwrap). Removes
+/// the base-chain jump rule first so it does not dangle pointing at a
+/// deleted chain, then flushes and deletes the per-agent chain.
 #[cfg(target_os = "linux")]
 pub fn remove_agent_ruleset(id: &AgentRulesetId) -> Result<(), NftablesError> {
     linux::remove_agent_ruleset_impl(id)
@@ -312,6 +466,47 @@ pub fn remove_agent_ruleset(id: &AgentRulesetId) -> Result<(), NftablesError> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn remove_agent_ruleset(_id: &AgentRulesetId) -> Result<(), NftablesError> {
+    Err(NftablesError::NotAvailableOnPlatform)
+}
+
+/// Install the jump rule from the base `output` chain into the per-agent
+/// chain, gated on the cgroup-v2 socket match. Idempotent: a prior jump
+/// rule for the same agent is removed (handle-based delete) before the
+/// new one is added.
+///
+/// Most callers should use [`load_agent_ruleset`], which combines the
+/// per-agent chain rules with the jump-rule wiring in one call. This
+/// granular surface is exposed for binding code that needs to refresh
+/// the jump rule independently (e.g., on a cgroup-id renumbering event
+/// where the chain rules have not changed).
+#[cfg(target_os = "linux")]
+pub fn install_agent_jump_rule(
+    id: &AgentRulesetId,
+    cgroup_level: u32,
+    cgroup_relative_path: &str,
+) -> Result<(), NftablesError> {
+    linux::install_agent_jump_rule_impl(id, cgroup_level, cgroup_relative_path)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn install_agent_jump_rule(
+    _id: &AgentRulesetId,
+    _cgroup_level: u32,
+    _cgroup_relative_path: &str,
+) -> Result<(), NftablesError> {
+    Err(NftablesError::NotAvailableOnPlatform)
+}
+
+/// Remove the jump rule from the base `output` chain that targets this
+/// agent's per-agent chain. Idempotent: zero matching rules returns
+/// `Ok(())`.
+#[cfg(target_os = "linux")]
+pub fn remove_agent_jump_rule(id: &AgentRulesetId) -> Result<(), NftablesError> {
+    linux::remove_agent_jump_rule_impl(id)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn remove_agent_jump_rule(_id: &AgentRulesetId) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
@@ -588,5 +783,143 @@ mod tests {
         assert_eq!(frags.len(), 2);
         assert!(frags[0].nft_expr.contains("a.com"));
         assert!(frags[1].nft_expr.contains("b.com"));
+    }
+
+    // ---- build_agent_jump_rule pure-helper tests --------------------------
+
+    #[test]
+    fn build_agent_jump_rule_emits_canonical_shape() {
+        // Pin the exact rule string for the canonical case: depth-2 cgroup
+        // under system.slice, single-segment agent id. This is what the
+        // base output chain needs to route packets from the agent's cgroup
+        // into the per-agent chain.
+        let rule = build_agent_jump_rule(
+            "alpha",
+            2,
+            "system.slice/sanctuary-agent-alpha.service",
+        );
+        assert_eq!(
+            rule,
+            "add rule inet sanctuary-castle output \
+             socket cgroupv2 level 2 \"system.slice/sanctuary-agent-alpha.service\" \
+             goto agent_alpha"
+        );
+    }
+
+    #[test]
+    fn build_agent_jump_rule_quotes_cgroup_path() {
+        // Defense against the integer-bug recurrence pattern PR #130 fixed
+        // for build_agent_ruleset: nft 1.x rejects unquoted path strings
+        // and unquoted integer-only inputs at rule-load time. The jump
+        // rule must always emit a quoted path.
+        let rule = build_agent_jump_rule(
+            "regression",
+            2,
+            "system.slice/sanctuary-agent-regression.service",
+        );
+        assert!(
+            rule.contains("\"system.slice/sanctuary-agent-regression.service\""),
+            "cgroup path must be quoted: {rule}"
+        );
+        // No bare integer where the path goes.
+        let post_level = rule
+            .split("level 2 ")
+            .nth(1)
+            .expect("expected 'level 2 ' marker");
+        assert!(
+            post_level.starts_with('"'),
+            "after 'level 2 ' nft requires a quoted path, got: {post_level}"
+        );
+    }
+
+    #[test]
+    fn build_agent_jump_rule_threads_dynamic_level() {
+        // Mirror the build_agent_ruleset dynamic-depth shape: nested
+        // deployments place the agent's cgroup deeper than depth 2, and
+        // the jump rule must reflect the actual depth or nft rejects with
+        // "cgroupv2 path fails".
+        let rule = build_agent_jump_rule(
+            "nested",
+            3,
+            "system.slice/parent.service/sanctuary-agent-nested.service",
+        );
+        assert!(rule.contains(
+            "level 3 \"system.slice/parent.service/sanctuary-agent-nested.service\""
+        ));
+        assert!(!rule.contains("level 2"));
+    }
+
+    #[test]
+    fn build_agent_jump_rule_chain_name_matches_agent_chain_name() {
+        // The goto target must match agent_chain_name(agent_id) exactly so
+        // the per-agent chain created by load_agent_ruleset_impl is the
+        // chain reached by this jump.
+        for agent_id in &["alpha", "my-agent", "team_a.svc1", "weird/id"] {
+            let rule = build_agent_jump_rule(agent_id, 2, "system.slice/x.service");
+            let chain = agent_chain_name(agent_id);
+            assert!(
+                rule.ends_with(&format!("goto {chain}")),
+                "jump rule must end with goto <chain_name> matching agent_chain_name; \
+                 agent={agent_id} chain={chain} rule={rule}"
+            );
+        }
+    }
+
+    // ---- parse_jump_rule_handles tests ------------------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_jump_rule_handles_matches_target_chain_only() {
+        // Synthetic `nft -a list chain` output with three rules: one
+        // jumping to our chain, one jumping to a different chain, one
+        // doing something else entirely.
+        let listing = "\
+table inet sanctuary-castle {
+\tchain output {
+\t\ttype filter hook output priority 0; policy accept;
+\t\tsocket cgroupv2 level 2 \"system.slice/sanctuary-agent-alpha.service\" goto agent_alpha # handle 5
+\t\tsocket cgroupv2 level 2 \"system.slice/sanctuary-agent-beta.service\" goto agent_beta # handle 7
+\t\tudp dport 53 accept # handle 9
+\t}
+}";
+        let handles = linux::parse_jump_rule_handles(listing, "agent_alpha");
+        assert_eq!(handles, vec![5]);
+        let handles_beta = linux::parse_jump_rule_handles(listing, "agent_beta");
+        assert_eq!(handles_beta, vec![7]);
+        let handles_missing = linux::parse_jump_rule_handles(listing, "agent_gamma");
+        assert!(handles_missing.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_jump_rule_handles_does_not_substring_match() {
+        // Critical correctness invariant: chain names that share a prefix
+        // (`agent_foo` and `agent_foo_bar`) must not collide. A naive
+        // substring match for `agent_foo` would wrongly hit the line
+        // ending in `goto agent_foo_bar`.
+        let listing = "\
+\t\tsocket cgroupv2 level 2 \"system.slice/foo.service\" goto agent_foo # handle 11
+\t\tsocket cgroupv2 level 2 \"system.slice/foo_bar.service\" goto agent_foo_bar # handle 13
+";
+        let handles_foo = linux::parse_jump_rule_handles(listing, "agent_foo");
+        assert_eq!(handles_foo, vec![11], "must not match agent_foo_bar");
+        let handles_foo_bar = linux::parse_jump_rule_handles(listing, "agent_foo_bar");
+        assert_eq!(handles_foo_bar, vec![13]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_jump_rule_handles_collects_all_duplicates() {
+        // If a prior install-and-no-remove path leaked stale jumps for the
+        // same agent (the bug shape `install_agent_jump_rule_impl`'s
+        // delete-then-add prevents going forward), the parser must surface
+        // every handle so a remove call cleans them all out.
+        let listing = "\
+\t\tsocket cgroupv2 level 2 \"x\" goto agent_dup # handle 21
+\t\tsocket cgroupv2 level 2 \"x\" goto agent_dup # handle 22
+\t\tsocket cgroupv2 level 2 \"x\" goto agent_dup # handle 23
+";
+        let handles = linux::parse_jump_rule_handles(listing, "agent_dup");
+        assert_eq!(handles, vec![21, 22, 23]);
     }
 }

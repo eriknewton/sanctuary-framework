@@ -343,7 +343,13 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
         scope.cgroup_level,
         &frags,
     );
-    nftables::load_agent_ruleset(&id, &script).expect("load_agent_ruleset");
+    nftables::load_agent_ruleset(
+        &id,
+        &script,
+        scope.cgroup_level,
+        &cgroup_relative,
+    )
+    .expect("load_agent_ruleset");
 
     // Sanity: the chain is in the kernel before the simulated crash.
     let pre = Command::new("nft")
@@ -433,7 +439,13 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
         scope.cgroup_level,
         &frags,
     );
-    nftables::load_agent_ruleset(&id, &script).expect("load");
+    nftables::load_agent_ruleset(
+        &id,
+        &script,
+        scope.cgroup_level,
+        &cgroup_relative,
+    )
+    .expect("load");
 
     // Connect, handshake, then forcibly close the client side mid-session.
     let stream = connect_with_handshake(&socket_path, &signing, &fortress_id);
