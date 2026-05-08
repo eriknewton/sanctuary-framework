@@ -277,6 +277,7 @@ export class MeshNode {
           issued_at: new Date().toISOString(),
           expires_at: new Date(Date.now() + 60_000).toISOString(),
           nonce: "self-bootstrap",
+          signature_scheme: "ed25519-v1",
           signature: "self-bootstrap",
         },
         node_pubkey: toBase64url(nodeKp.publicKey),

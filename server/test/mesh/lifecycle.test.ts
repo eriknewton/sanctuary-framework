@@ -29,6 +29,7 @@ import { randomBytes } from "../../src/core/random.js";
 import {
   CAP_STANDARD_FORTRESS_NODE,
   DEFAULTS,
+  SIGNATURE_SCHEME_V1,
 } from "../../src/mesh/constants.js";
 import {
   generateFortressMaster,
@@ -374,6 +375,38 @@ describe("lifecycle/bootstrap-token — issue + verify gate", () => {
         issuing_principal_cert: fx.root_principal_cert,
       })
     ).not.toThrow();
+    expect(token.signature_scheme).toBe(SIGNATURE_SCHEME_V1);
+  });
+
+  it("rejects a token with a missing or unknown signature_scheme", () => {
+    const fx = bootFortress();
+    const token = issueBootstrapToken({
+      intended_node_id: "node-X",
+      intended_node_mode: "local",
+      fortress_id: fx.master_public.fortress_id,
+      issuing_principal: fx.root_principal_cert.principal_id,
+      principal_private_key: fx.root_principal_keypair.privateKey,
+    });
+    const missing = { ...token };
+    delete (missing as Partial<typeof token>).signature_scheme;
+    expect(() =>
+      verifyBootstrapToken({
+        token: missing,
+        expected_fortress_id: fx.master_public.fortress_id,
+        issuing_principal_cert: fx.root_principal_cert,
+      })
+    ).toThrow(MeshBootstrapTokenError);
+
+    expect(() =>
+      verifyBootstrapToken({
+        token: {
+          ...token,
+          signature_scheme: "ed25519+ml-dsa-v1" as typeof token.signature_scheme,
+        },
+        expected_fortress_id: fx.master_public.fortress_id,
+        issuing_principal_cert: fx.root_principal_cert,
+      })
+    ).toThrow(MeshBootstrapTokenError);
   });
 
   it("rejects an expired token", () => {
