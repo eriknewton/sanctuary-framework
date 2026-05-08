@@ -76,14 +76,13 @@ export type GateReasonCode =
 export const AUTO_TRIGGER_TIERS = ["honeypot", "threshold_rule", "ml_anomaly"] as const;
 export type AutoTriggerTier = (typeof AUTO_TRIGGER_TIERS)[number];
 
-/** Channel-template identifiers per v1.2 design-canonical starter set. */
+/** Channel-template identifiers per the five-template canonical starter set. */
 export const CHANNEL_TEMPLATE_IDS = [
   "request-approve-act",
   "read-then-report",
   "scheduled-digest",
   "plan-draft-only",
   "fortress-relay",
-  "concierge-loop",
 ] as const;
 
 export type ChannelTemplateId = (typeof CHANNEL_TEMPLATE_IDS)[number];

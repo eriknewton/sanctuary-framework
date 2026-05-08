@@ -8,6 +8,7 @@
  */
 
 import type { EncryptedPayload } from "../../core/encryption.js";
+import type { SignatureScheme } from "../constants.js";
 import type {
   AuditBatch,
   FortressMasterPublicKey,
@@ -46,6 +47,8 @@ export interface BootstrapToken {
   issued_at: string;
   /** Opaque nonce to bind this token to a single join attempt. */
   nonce: string;
+  /** Signature scheme committed into the token's signed bytes. */
+  signature_scheme: SignatureScheme;
   /** Ed25519 signature over canonicalize(token minus signature) by issuing principal. */
   signature: string;
 }

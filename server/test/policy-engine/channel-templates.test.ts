@@ -10,7 +10,6 @@ import {
   unpackPolicyUpdate,
 } from "../../src/policy-engine/envelope.js";
 import {
-  evaluateMemoryGate,
   evaluateOutputsGate,
   evaluatePlansGate,
 } from "../../src/policy-engine/gates/index.js";
@@ -18,10 +17,10 @@ import type { SlotGateExtendedContext } from "../../src/policy-engine/gates/eval
 import { buildFortress, verifyCtxFor } from "./fixture.js";
 
 describe("policy-engine/channel-templates registry", () => {
-  it("lists exactly the six design-canonical ids", () => {
+  it("lists exactly the five spec-canonical ids", () => {
     const list = listChannelTemplates();
     expect(list.map((t) => t.id)).toEqual([...CHANNEL_TEMPLATE_IDS]);
-    expect(list).toHaveLength(6);
+    expect(list).toHaveLength(5);
   });
 
   it("every registered template has operator-facing metadata", () => {
@@ -165,24 +164,6 @@ describe("policy-engine/channel-templates behavior", () => {
     ]);
   });
 
-  it("concierge-loop reads local state and blocks outward egress", () => {
-    const f = buildFortress();
-    const p = applyChannelTemplate("concierge-loop", {
-      agent_id: "a1",
-      counterparty: "operator",
-      fortress_id: f.master.public.fortress_id,
-      policy_version: 1,
-    });
-    expect(p.egress?.allowlist).toEqual([]);
-    expect(p.slots.credentials.mode).toBe("deny");
-    expect(
-      evaluateMemoryGate(ctxFor(f, p), {
-        agent_id: "a1",
-        counterparty: "operator",
-        action: "read",
-      }).decision,
-    ).toBe("allow");
-  });
 });
 
 describe("policy-engine/channel-templates envelope and merge", () => {

@@ -283,11 +283,18 @@ describe("Usage event schema (§6)", () => {
 
   // ─── event_class coverage per spec §6 ───────────────────────────────────
 
-  it("enumerates all 32 event_class values from spec §6 + WP-MVP-6", () => {
+  it("enumerates all 31 canonical event_class values from spec §6", () => {
     // Tripwire: if this count changes, the spec enum changed too and every
     // downstream consumer (audit viewer, Verascore ingest, attestation UX)
-    // needs review. WP-MVP-6 added retention_sweep (32nd value).
-    expect(EVENT_CLASSES).toHaveLength(32);
+    // needs review.
+    expect(EVENT_CLASSES).toHaveLength(31);
+  });
+
+  it("keeps v1.3 honeypot_triggered outside the v0.1 event_class enum", () => {
+    expect(EVENT_CLASSES).not.toContain("honeypot_triggered");
+    expect(() => validateUsageEvent(baseNoKind("honeypot_triggered"))).toThrow(
+      /event_class/,
+    );
   });
 
   it("accepts a lifecycle event_class (launched)", () => {

@@ -115,7 +115,7 @@ export type AgentContractEventType =
  * `Review/Sanctuary/Agent_Contract_V0.1_Spec_2026-04-21.md`). Do not reorder
  * without bumping `AGENT_CONTRACT_VERSION`.
  *
- * Some classes (`mandate_*`, `honeypot_triggered`) are listed for v1.x
+ * Some classes (`mandate_*`) are listed for v1.x
  * emitter coverage and are not emitted by v0.1 enforcement code. They remain
  * in the enum so a spec-conforming external emitter's events validate cleanly
  * against the Sanctuary validator.
@@ -155,7 +155,6 @@ export const EVENT_CLASSES = [
   "budget_exceeded",
   "retention_sweep",
   "sentinel_alert",
-  "honeypot_triggered",
 ] as const;
 export type EventClass = (typeof EVENT_CLASSES)[number];
 

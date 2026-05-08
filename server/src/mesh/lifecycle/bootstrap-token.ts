@@ -12,7 +12,7 @@ import { sha256 } from "@noble/hashes/sha256";
 import { fromBase64url, toBase64url } from "../../core/encoding.js";
 import { randomBytes } from "../../core/random.js";
 import { canonicalizeToBytes } from "../canonical-json.js";
-import type { NodeMode } from "../constants.js";
+import { SIGNATURE_SCHEME_V1, type NodeMode } from "../constants.js";
 import { MeshError } from "../errors.js";
 import type { PrincipalCertificate } from "../types.js";
 import { BOOTSTRAP_TOKEN_TTL_MS } from "./constants.js";
@@ -43,6 +43,7 @@ export function issueBootstrapToken(params: {
     issued_at: new Date(now).toISOString(),
     expires_at: new Date(now + ttl).toISOString(),
     nonce: toBase64url(randomBytes(16)),
+    signature_scheme: SIGNATURE_SCHEME_V1,
   };
   const sig = ed25519.sign(
     canonicalizeToBytes(body),
@@ -76,6 +77,11 @@ export function verifyBootstrapToken(params: {
       `bootstrap token expired at ${params.token.expires_at}`
     );
   }
+  if (params.token.signature_scheme !== SIGNATURE_SCHEME_V1) {
+    throw new MeshBootstrapTokenError(
+      `bootstrap token signature_scheme must be ${SIGNATURE_SCHEME_V1}`
+    );
+  }
   const body: Omit<BootstrapToken, "signature"> = {
     intended_node_id: params.token.intended_node_id,
     intended_node_mode: params.token.intended_node_mode,
@@ -84,6 +90,7 @@ export function verifyBootstrapToken(params: {
     issued_at: params.token.issued_at,
     expires_at: params.token.expires_at,
     nonce: params.token.nonce,
+    signature_scheme: params.token.signature_scheme,
   };
   const ok = ed25519.verify(
     fromBase64url(params.token.signature),

@@ -8,7 +8,6 @@
 
 import {
   CHANNEL_TEMPLATE_IDS,
-  COUNTERPARTY_WILDCARD,
   POLICY_SLOTS,
   type ChannelTemplateId,
   type PolicySlot,
@@ -216,25 +215,6 @@ const fortressRelay: ChannelTemplateFactory = (params) => {
   return p;
 };
 
-const conciergeLoop: ChannelTemplateFactory = (params) => {
-  const p = basePolicy(params);
-  p.source_english =
-    "Bidirectional Q&A with the operator. Reads local fortress state; never writes outward.";
-  grantOn(p, "memory", {
-    counterparty: params.counterparty,
-    action: "read",
-    scope: { local_fortress_state_only: true, ...(params.scope ?? {}) },
-  });
-  grantOn(p, "outputs", {
-    counterparty: params.counterparty || COUNTERPARTY_WILDCARD,
-    action: "read",
-    scope: { operator_chat_only: true, ...(params.scope ?? {}) },
-  });
-  p.egress = { allowlist: [] };
-  setRetentionDays(p, 14);
-  return p;
-};
-
 function allowedHostsFromScope(scope: Record<string, unknown> | undefined): string[] {
   const raw = scope?.allowed_hosts;
   if (!Array.isArray(raw)) return [];
@@ -281,14 +261,6 @@ const REGISTRY: Record<ChannelTemplateId, ChannelTemplateRegistryEntry> = {
     description:
       "Routes signed events between peer fortresses. Commits bind only when both sides sign.",
     factory: fortressRelay,
-  },
-  "concierge-loop": {
-    id: "concierge-loop",
-    severity: "LOW",
-    label: "Concierge loop",
-    description:
-      "Bidirectional Q&A with the operator. Reads local fortress state; never writes outward.",
-    factory: conciergeLoop,
   },
 };
 

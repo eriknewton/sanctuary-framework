@@ -12,6 +12,7 @@ import { createIdentity } from "../../src/core/identity.js";
 import { generateSHR } from "../../src/shr/generator.js";
 import { verifySHR } from "../../src/shr/verifier.js";
 import { canonicalizeForSigning } from "../../src/shr/types.js";
+import { SIGNATURE_SCHEME_V1 } from "../../src/mesh/constants.js";
 import type { SignedSHR } from "../../src/shr/types.js";
 import type { SanctuaryConfig } from "../../src/config.js";
 import { defaultConfig } from "../../src/config.js";
@@ -72,6 +73,7 @@ describe("Sovereignty Health Report (SHR)", () => {
       expect(shr.body.generated_at).toBeTruthy();
       expect(shr.body.expires_at).toBeTruthy();
       expect(shr.signed_by).toBeTruthy();
+      expect(shr.signature_scheme).toBe(SIGNATURE_SCHEME_V1);
       expect(shr.signature).toBeTruthy();
     });
 
@@ -151,6 +153,26 @@ describe("Sovereignty Health Report (SHR)", () => {
       expect(result.valid).toBe(true);
       expect(result.errors).toHaveLength(0);
       expect(result.counterparty_id).toBe(shr.body.instance_id);
+    });
+
+    it("rejects SHRs with missing or unknown signature_scheme", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+      }) as SignedSHR;
+
+      const missing = JSON.parse(JSON.stringify(shr)) as Partial<SignedSHR>;
+      delete missing.signature_scheme;
+      expect(verifySHR(missing as SignedSHR).valid).toBe(false);
+
+      const unknown = {
+        ...shr,
+        signature_scheme: "ed25519+ml-dsa-v1" as typeof shr.signature_scheme,
+      };
+      const result = verifySHR(unknown);
+      expect(result.valid).toBe(false);
+      expect(result.errors.some((e) => e.includes("signature_scheme"))).toBe(true);
     });
 
     it("detects tampered body", () => {

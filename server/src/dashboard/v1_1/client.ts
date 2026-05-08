@@ -326,12 +326,6 @@ const CHANNEL_TEMPLATES = [
     severity: "MEDIUM",
     title: "Fortress relay",
     description: "Routes signed events between peer fortresses. Commits bind only when both sides sign."
-  },
-  {
-    id: "concierge-loop",
-    severity: "LOW",
-    title: "Concierge loop",
-    description: "Bidirectional Q&A with the operator. Reads local fortress state; never writes outward."
   }
 ];
 

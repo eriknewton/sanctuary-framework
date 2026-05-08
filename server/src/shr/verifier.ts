@@ -12,6 +12,7 @@ import type { SignedSHR, SHRVerificationResult, SHRBody } from "./types.js";
 import { canonicalizeForSigning } from "./types.js";
 import { verify } from "../core/identity.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
+import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
 
 /**
  * Verify a signed SHR.
@@ -29,8 +30,8 @@ export function verifySHR(
   const currentTime = now ?? new Date();
 
   // 1. Schema validation
-  if (!shr.body || !shr.signed_by || !shr.signature) {
-    errors.push("Missing required SHR fields (body, signed_by, or signature)");
+  if (!shr.body || !shr.signed_by || !shr.signature || !shr.signature_scheme) {
+    errors.push("Missing required SHR fields (body, signed_by, signature_scheme, or signature)");
     return {
       valid: false,
       errors,
@@ -43,6 +44,9 @@ export function verifySHR(
 
   if (shr.body.shr_version !== "1.0") {
     errors.push(`Unsupported SHR version: ${shr.body.shr_version}`);
+  }
+  if (shr.signature_scheme !== SIGNATURE_SCHEME_V1) {
+    errors.push(`Unsupported SHR signature_scheme: ${String(shr.signature_scheme)}`);
   }
 
   // 2. Temporal validation
