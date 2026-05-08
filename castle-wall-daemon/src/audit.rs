@@ -620,11 +620,23 @@ fn replay_existing(contents: &str) -> Result<(u64, Option<String>, u64), WalErro
             line: line_num,
             source_message: err.to_string(),
         })?;
-        // Verify chain integrity: each entry after the first remaining WAL
-        // line references the hash of the previous audit-event bytes. A
-        // truncated WAL may retain a first entry whose prior hash points at
-        // an already-ACKed entry that no longer exists on disk.
-        if next_seq != 0 && entry.prior_sha256_hex != last_chain_hash {
+        // Verify chain integrity. Two valid shapes for the first remaining
+        // WAL line: (a) genesis (entry.seq == 0, prior_sha256_hex == None)
+        // or (b) post-truncate first entry (entry.seq > 0, prior_sha256_hex
+        // points at an already-ACKed entry no longer on disk; cannot verify
+        // locally). A genesis entry with a non-None prior_sha256_hex is
+        // tampering and must be rejected. Subsequent entries follow the
+        // standard chain check.
+        let is_first_iteration = next_seq == 0;
+        if is_first_iteration {
+            if entry.seq == 0 && entry.prior_sha256_hex.is_some() {
+                return Err(WalError::ChainBroken {
+                    seq: entry.seq,
+                    expected: None,
+                    found: entry.prior_sha256_hex.clone(),
+                });
+            }
+        } else if entry.prior_sha256_hex != last_chain_hash {
             return Err(WalError::ChainBroken {
                 seq: entry.seq,
                 expected: last_chain_hash.clone(),
