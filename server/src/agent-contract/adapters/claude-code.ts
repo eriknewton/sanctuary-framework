@@ -32,7 +32,10 @@ import {
   type TierBAdapterParams,
 } from "./tier-b-sdk.js";
 import { CapabilityUndeclaredError } from "../errors.js";
-import type { CapabilityKind } from "../constants.js";
+import {
+  requiredModelProviderFor,
+  type CapabilityKind,
+} from "../constants.js";
 
 /**
  * Abstract transport for the Claude Code subprocess. The integration test
@@ -66,9 +69,14 @@ export class ClaudeCodeAdapter extends TierBAdapter {
 
   constructor(private ccParams: ClaudeCodeAdapterParams) {
     super(ccParams);
-    if (ccParams.model_provider !== "anthropic") {
+    // Defense in depth: the structural enforcement lives at `issueAgentCard`
+    // (constants.ts ADAPTER_PROVIDER_PINS). Construction-time check stays so a
+    // misconfiguration surfaces at adapter instantiation rather than later
+    // during launch.
+    const required = requiredModelProviderFor("claude-code");
+    if (required !== null && ccParams.model_provider !== required) {
       throw new Error(
-        `claude-code adapter requires model_provider="anthropic"; got ${ccParams.model_provider}`
+        `claude-code adapter requires model_provider="${required}"; got ${ccParams.model_provider}`
       );
     }
   }
