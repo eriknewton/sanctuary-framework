@@ -197,7 +197,7 @@ mod tests {
 
 /// One persisted entry in the daemon-side WAL. Serialized to canonical JSON
 /// per line (NDJSON). The `prior_sha256_hex` field references the SHA-256 of
-/// the prior entry's serialized canonical-JSON bytes so Sanctuary main can
+/// the prior entry's audit-event canonical-JSON bytes so Sanctuary main can
 /// detect drops or reordering on drain.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WalEntry {
@@ -234,6 +234,11 @@ pub enum WalError {
         expected: Option<String>,
         found: Option<String>,
     },
+    #[error("WAL truncate rename failed at {path}: {source_message}; in-memory state unchanged")]
+    RenameFailed {
+        path: PathBuf,
+        source_message: String,
+    },
 }
 
 /// Disk-backed append-only writer. Persists `WalEntry` records to a file
@@ -261,6 +266,8 @@ pub struct WalWriter {
     /// field is `#[cfg(test)]`-gated so a release build does not carry it.
     #[cfg(test)]
     inject_io_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    inject_rename_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WalWriter {
@@ -328,6 +335,8 @@ impl WalWriter {
             bytes_written: bytes,
             #[cfg(test)]
             inject_io_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            inject_rename_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -340,6 +349,11 @@ impl WalWriter {
     #[cfg(test)]
     pub fn injection_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.inject_io_error.clone()
+    }
+
+    #[cfg(test)]
+    pub fn rename_injection_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.inject_rename_error.clone()
     }
 
     /// Append a critical event with `fsync` per scope-lock §8 OQ #2.
@@ -369,14 +383,18 @@ impl WalWriter {
                 source_message: "test-injected append failure".to_string(),
             });
         }
+        let seq = self.next_seq;
+        let prior_sha256_hex = self.last_chain_hash_hex.clone();
+        let event_canonical_json =
+            add_wal_chain_fields(event_canonical_json, seq, prior_sha256_hex.as_deref())?;
         let entry = WalEntry {
-            seq: self.next_seq,
+            seq,
             captured_at_unix_ms: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
                 .unwrap_or(0),
-            prior_sha256_hex: self.last_chain_hash_hex.clone(),
-            event_canonical_json: event_canonical_json.to_string(),
+            prior_sha256_hex,
+            event_canonical_json,
             critical,
         };
         let serialized = serde_json::to_string(&entry).map_err(|err| WalError::Io {
@@ -400,7 +418,7 @@ impl WalWriter {
             })?;
         }
         self.bytes_written += serialized.len() as u64 + 1;
-        self.last_chain_hash_hex = Some(sha256_hex(serialized.as_bytes()));
+        self.last_chain_hash_hex = Some(sha256_hex(entry.event_canonical_json.as_bytes()));
         self.next_seq += 1;
         Ok(entry.seq)
     }
@@ -529,17 +547,31 @@ impl WalWriter {
                 source_message: err.to_string(),
             })?;
             new_bytes += serialized.len() as u64 + 1;
-            new_chain_hash = Some(sha256_hex(serialized.as_bytes()));
+            new_chain_hash = Some(sha256_hex(entry.event_canonical_json.as_bytes()));
         }
         tmp.sync_all().map_err(|err| WalError::Io {
             path: tmp_path.clone(),
             source_message: err.to_string(),
         })?;
         drop(tmp);
-        std::fs::rename(&tmp_path, &self.path).map_err(|err| WalError::Io {
-            path: self.path.clone(),
-            source_message: err.to_string(),
-        })?;
+        #[cfg(test)]
+        if self
+            .inject_rename_error
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(WalError::RenameFailed {
+                path: self.path.clone(),
+                source_message: "test-injected truncate rename failure".to_string(),
+            });
+        }
+        if let Err(err) = std::fs::rename(&tmp_path, &self.path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(WalError::RenameFailed {
+                path: self.path.clone(),
+                source_message: err.to_string(),
+            });
+        }
 
         // Re-open the now-replaced file for append.
         let mut opts = OpenOptions::new();
@@ -588,9 +620,11 @@ fn replay_existing(contents: &str) -> Result<(u64, Option<String>, u64), WalErro
             line: line_num,
             source_message: err.to_string(),
         })?;
-        // Verify chain integrity: each entry's prior_sha256_hex matches the
-        // hash of the previous serialized line.
-        if entry.prior_sha256_hex != last_chain_hash {
+        // Verify chain integrity: each entry after the first remaining WAL
+        // line references the hash of the previous audit-event bytes. A
+        // truncated WAL may retain a first entry whose prior hash points at
+        // an already-ACKed entry that no longer exists on disk.
+        if next_seq != 0 && entry.prior_sha256_hex != last_chain_hash {
             return Err(WalError::ChainBroken {
                 seq: entry.seq,
                 expected: last_chain_hash.clone(),
@@ -598,10 +632,50 @@ fn replay_existing(contents: &str) -> Result<(u64, Option<String>, u64), WalErro
             });
         }
         next_seq = entry.seq + 1;
-        last_chain_hash = Some(sha256_hex(line.as_bytes()));
+        last_chain_hash = Some(sha256_hex(entry.event_canonical_json.as_bytes()));
         bytes += line.len() as u64 + 1;
     }
     Ok((next_seq, last_chain_hash, bytes))
+}
+
+fn add_wal_chain_fields(
+    event_canonical_json: &str,
+    seq: u64,
+    prior_sha256_hex: Option<&str>,
+) -> Result<String, WalError> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(event_canonical_json).map_err(|err| WalError::Io {
+            path: PathBuf::from("<audit-event>"),
+            source_message: err.to_string(),
+        })?;
+    let entry = value.as_object_mut().ok_or_else(|| WalError::Io {
+        path: PathBuf::from("<audit-event>"),
+        source_message: "audit event must be a JSON object".to_string(),
+    })?;
+    if !entry.get("details").is_some_and(|details| details.is_object()) {
+        entry.insert(
+            "details".to_string(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        );
+    }
+    let details = entry
+        .get_mut("details")
+        .and_then(|details| details.as_object_mut())
+        .expect("details was initialized as an object");
+    details.insert(
+        "seq".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(seq)),
+    );
+    details.insert(
+        "prior_sha256_hex".to_string(),
+        prior_sha256_hex
+            .map(|hash| serde_json::Value::String(hash.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    crate::manifest::canonical_json::canonicalize(&value).map_err(|err| WalError::Io {
+        path: PathBuf::from("<audit-event>"),
+        source_message: err.to_string(),
+    })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -658,6 +732,30 @@ mod wal_tests {
     }
 
     #[test]
+    fn append_includes_wal_chain_fields_in_event_details() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wal.jsonl");
+        let mut wal = WalWriter::open(&path).expect("open");
+        wal.append_critical("{\"details\":{},\"layer\":\"l1\",\"operation\":\"first\"}")
+            .expect("append first");
+        wal.append_critical("{\"details\":{},\"layer\":\"l1\",\"operation\":\"second\"}")
+            .expect("append second");
+
+        let snapshot = wal.snapshot_after(None, 10).expect("snapshot");
+        let first: serde_json::Value =
+            serde_json::from_str(&snapshot[0].event_canonical_json).unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&snapshot[1].event_canonical_json).unwrap();
+        assert_eq!(first["details"]["seq"], 0);
+        assert!(first["details"]["prior_sha256_hex"].is_null());
+        assert_eq!(second["details"]["seq"], 1);
+        assert_eq!(
+            second["details"]["prior_sha256_hex"],
+            serde_json::Value::String(snapshot[1].prior_sha256_hex.clone().unwrap())
+        );
+    }
+
+    #[test]
     fn snapshot_after_returns_only_newer_entries() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("wal.jsonl");
@@ -697,6 +795,39 @@ mod wal_tests {
         let remaining = wal.snapshot_after(None, 100).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].seq, 3);
+    }
+
+    #[test]
+    fn truncate_rename_failure_leaves_in_memory_state_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wal.jsonl");
+        let mut wal = WalWriter::open(&path).expect("open");
+        wal.append_critical("{\"k\":1}").unwrap();
+        wal.append_critical("{\"k\":2}").unwrap();
+        let acked = wal.append_critical("{\"k\":3}").unwrap();
+        let before_next_seq = wal.next_seq();
+        let before_bytes = wal.bytes_written();
+        let before_chain = wal.last_chain_hash_hex().map(str::to_string);
+        let before_disk = std::fs::read_to_string(&path).unwrap();
+
+        let rename_injection = wal.rename_injection_handle();
+        rename_injection.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = wal.truncate_through_seq(acked).unwrap_err();
+        assert!(matches!(err, WalError::RenameFailed { .. }));
+        assert_eq!(wal.next_seq(), before_next_seq);
+        assert_eq!(wal.bytes_written(), before_bytes);
+        assert_eq!(wal.last_chain_hash_hex().map(str::to_string), before_chain);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before_disk);
+
+        rename_injection.store(false, std::sync::atomic::Ordering::SeqCst);
+        let appended = wal.append_critical("{\"k\":4}").unwrap();
+        assert_eq!(appended, before_next_seq);
+        drop(wal);
+        let mut reopened = WalWriter::open(&path).expect("reopen");
+        let entries = reopened.snapshot_after(None, 10).expect("snapshot");
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[3].seq, appended);
+        assert_eq!(entries[3].prior_sha256_hex, before_chain);
     }
 
     #[test]

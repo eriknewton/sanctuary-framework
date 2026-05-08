@@ -5,15 +5,20 @@
  * and metric-batch passthrough.
  */
 
+import { createHash } from "node:crypto";
 import { describe, it, expect, beforeEach } from "vitest";
 
 import {
   ACCEPTED_EVENT_TYPES,
+  AuditChainError,
   AuditConsumer,
   validateEvent,
   type AuditSink,
 } from "../../../src/castle-wall/runtime/audit-consumer.js";
-import { buildAuditEvent } from "../../../src/castle-wall/audit/builder.js";
+import {
+  buildAuditEvent,
+  canonicalizeAuditEvent,
+} from "../../../src/castle-wall/audit/builder.js";
 import { CASTLE_WALL_AUDIT_LAYER } from "../../../src/castle-wall/constants.js";
 import type { CastleWallAuditEvent } from "../../../src/castle-wall/audit/events.js";
 
@@ -38,6 +43,19 @@ class RecordingSink implements AuditSink {
   async flush(): Promise<void> {
     this.flushedCount += 1;
   }
+}
+
+function eventHash(event: CastleWallAuditEvent): string {
+  return createHash("sha256").update(canonicalizeAuditEvent(event), "utf8").digest("hex");
+}
+
+function chainedEvent(seq: number, prior_sha256_hex: string | null): CastleWallAuditEvent {
+  return buildAuditEvent({
+    timestamp: `2026-05-04T00:00:0${seq}Z`,
+    fortress_id: "f",
+    event_type: "egress_allowed",
+    details: { seq, prior_sha256_hex },
+  });
 }
 
 describe("castle-wall/runtime/audit-consumer : validateEvent", () => {
@@ -108,6 +126,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
       destination: { host: "example.com", ip: "1.2.3.4", port: 443, protocol: "tcp" },
       decision: "allow_once",
       rule_id: "r1",
+      details: { seq: 0, prior_sha256_hex: null },
     });
     let acked = false;
     await consumer.ingestCritical({
@@ -121,6 +140,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     expect(sink.flushedCount).toBe(1);
     expect(acked).toBe(true);
     expect(consumer.getStats().acceptedCriticalEvents).toBe(1);
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
   });
 
   it("ACKs malformed events with a failure entry, not a re-delivery loop", async () => {
@@ -156,6 +176,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
       destination: { host: "h", ip: "1", port: 1, protocol: "tcp" },
       decision: "deny_once",
       rule_id: "r",
+      details: { seq: 0, prior_sha256_hex: null },
     });
     await consumer.ingestCritical({ event, ack: async () => {} });
     const details = sink.entries[0]!.details!;
@@ -168,6 +189,56 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     });
     expect(details.decision).toBe("deny_once");
     expect(details.rule_id).toBe("r");
+  });
+
+  it("rejects events with missing WAL chain fields", async () => {
+    const event = buildAuditEvent({
+      timestamp: "2026-05-04T00:00:00Z",
+      fortress_id: "f",
+      event_type: "egress_allowed",
+    });
+
+    await expect(consumer.ingestCritical({ event, ack: async () => {} })).rejects.toThrow(
+      AuditChainError
+    );
+    expect(sink.entries[0]!.operation).toBe("wal_chain_verification_failed");
+    expect(sink.entries[0]!.details?.reason).toBe("chain_fields_missing");
+    expect(consumer.getStats().rejectedEvents).toBe(1);
+  });
+
+  it("rejects sequence regression", async () => {
+    const eventSeq5 = chainedEvent(5, null);
+    await consumer.ingestCritical({ event: eventSeq5, ack: async () => {} });
+
+    const eventSeq4 = chainedEvent(4, eventHash(eventSeq5));
+    await expect(consumer.ingestCritical({ event: eventSeq4, ack: async () => {} })).rejects.toThrow(
+      /seq_regression/
+    );
+    expect(sink.entries.at(-1)!.operation).toBe("wal_chain_verification_failed");
+    expect(sink.entries.at(-1)!.details?.reason).toBe("seq_regression");
+  });
+
+  it("rejects chain break when prior hash does not match the accepted event", async () => {
+    const eventSeq5 = chainedEvent(5, null);
+    await consumer.ingestCritical({ event: eventSeq5, ack: async () => {} });
+
+    const tampered = chainedEvent(6, "deadbeef");
+    await expect(consumer.ingestCritical({ event: tampered, ack: async () => {} })).rejects.toThrow(
+      /wal_chain_verification_failed/
+    );
+    expect(sink.entries.at(-1)!.operation).toBe("wal_chain_verification_failed");
+    expect(sink.entries.at(-1)!.details?.reason).toBe("wal_chain_verification_failed");
+  });
+
+  it("accepts valid chain continuation", async () => {
+    const eventSeq5 = chainedEvent(5, null);
+    await consumer.ingestCritical({ event: eventSeq5, ack: async () => {} });
+    const eventSeq6 = chainedEvent(6, eventHash(eventSeq5));
+    await consumer.ingestCritical({ event: eventSeq6, ack: async () => {} });
+
+    expect(sink.entries.length).toBe(2);
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(6);
+    expect(consumer.getWalChainState().lastEventCanonicalHash).toBe(eventHash(eventSeq6));
   });
 });
 
