@@ -591,6 +591,11 @@ fn cleanup_castle_table_silent() {
 /// `egress_blocked` + `default_deny` shape for the bypass.
 #[test]
 fn kernel_drops_plain_dns_to_unallowed_resolver() {
+    // queue_number 0 matches `build_agent_ruleset`'s hardcoded
+    // `queue num 0` catchall verdict. CI runs castle-wall integration
+    // tests with --test-threads=1, so there is no parallel-bind conflict
+    // across the three Tier B tests; each test binds and releases queue 0
+    // in sequence.
     let fixture = KernelBypassFixture::setup("dns-bypass-test", 0);
 
     // `nslookup` is in `bsdmainutils` on Ubuntu and may not always be
@@ -633,7 +638,13 @@ fn kernel_drops_plain_dns_to_unallowed_resolver() {
 /// tcp/443 with `default_deny` provenance.
 #[test]
 fn kernel_drops_doh_to_unallowed_provider() {
-    let fixture = KernelBypassFixture::setup("doh-bypass-test", 1);
+    // queue_number 0 matches the hardcoded `queue num 0` catchall in
+    // `build_agent_ruleset`. CI's --test-threads=1 prevents parallel-bind
+    // conflict; the prior plain-DNS test releases queue 0 before this
+    // one binds. Without the queue-number alignment the bind would
+    // succeed but no packets would arrive (the kernel routes the
+    // catchall verdict to queue 0, not whatever this test bound).
+    let fixture = KernelBypassFixture::setup("doh-bypass-test", 0);
 
     // TCP SYN to 8.8.8.8:443 from inside the agent cgroup. The kernel's
     // `socket cgroupv2` match fires on the SYN packet's owning socket,
@@ -679,7 +690,9 @@ fn kernel_drops_doh_to_unallowed_provider() {
 /// tcp/853 with `default_deny` provenance.
 #[test]
 fn kernel_drops_dot_to_unallowed_resolver() {
-    let fixture = KernelBypassFixture::setup("dot-bypass-test", 2);
+    // queue_number 0 matches the hardcoded `queue num 0` catchall.
+    // See the queue-alignment note on kernel_drops_doh_to_unallowed_provider.
+    let fixture = KernelBypassFixture::setup("dot-bypass-test", 0);
 
     fixture.spawn_bypass(
         "python3 -c \"import socket;s=socket.socket();s.settimeout(1.5);\\\ntry: s.connect(('1.1.1.1',853))\\\nexcept Exception: pass\" || true",
