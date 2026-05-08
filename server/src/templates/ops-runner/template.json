@@ -1,7 +1,7 @@
 {
   "name": "ops-runner",
   "version": "1.0.0",
-  "channel": "concierge-loop",
+  "channel": "read-then-report",
   "tier": "B",
   "slot_augmentations": {
     "credentials": {

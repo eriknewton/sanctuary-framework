@@ -134,7 +134,6 @@ describe("v1.1 dashboard shell HTML", () => {
       "scheduled-digest",
       "plan-draft-only",
       "fortress-relay",
-      "concierge-loop",
     ]) {
       expect(client).toContain(id);
     }
