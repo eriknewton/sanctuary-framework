@@ -73,8 +73,18 @@ function encode(value: unknown): string {
 
 function encodeArray(arr: unknown[]): string {
   const parts: string[] = [];
-  for (const item of arr) {
-    parts.push(item === undefined ? "null" : encode(item));
+  for (let i = 0; i < arr.length; i++) {
+    const item = arr[i];
+    if (item === undefined) {
+      // RFC 8785 forbids undefined at any depth. Object encoding correctly
+      // omits undefined values; array encoding must not silently coerce to
+      // "null" — a producer-side mistake would otherwise be signed and only
+      // surface as a non-deterministic verification failure on the receiver.
+      throw new MeshCanonicalJsonError(
+        `canonicalize(): undefined is not a valid JSON value at array index ${i}`
+      );
+    }
+    parts.push(encode(item));
   }
   return "[" + parts.join(",") + "]";
 }
