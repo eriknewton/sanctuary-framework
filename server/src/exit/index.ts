@@ -2,6 +2,7 @@ export {
   exportExitBundle,
   importExitBundle,
   exitBundleManifestShape,
+  ExitBundleImportError,
   type ExportExitBundleOptions,
   type ExportExitBundleResult,
   type ImportExitBundleOptions,
@@ -20,6 +21,7 @@ export {
   loadExitArtifact,
   type ExitBundleDetailedVerifierResult,
   type LoadedExitArtifact,
+  type VerifyExitBundleOptions,
 } from "./verifier.js";
 
 export { runExitCommand, type ExitCommandArgs } from "./cli.js";

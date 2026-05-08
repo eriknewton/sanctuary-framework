@@ -64,6 +64,7 @@ import {
   ReputationStore,
 } from "../../src/l4-reputation/reputation-store.js";
 import {
+  ExitBundleImportError,
   exitBundleManifestShape,
   exportExitBundle,
   importExitBundle,
@@ -591,9 +592,32 @@ describe("v1.1 acceptance drill - Pillar 4: portability + exit", () => {
       destIdentityId,
     );
 
-    // ─── (i) VERIFY: re-import without explicit overwrite refuses to
-    // overwrite previously-imported state. The default conflictResolution
-    // is "skip", which is the safe fail-mode.
+    // ─── (i) VERIFY: re-import without explicit forceRebind refuses to
+    // replace the existing fortress public identity (full-sweep #54). The
+    // default behavior throws ExitBundleImportError code
+    // IDENTITY_OVERWRITE_REFUSED, which closes v1.0.2 (i).
+    let reimportError: ExitBundleImportError | null = null;
+    try {
+      await importExitBundle({
+        bundleDir,
+        storage: destination.storage,
+        masterKey: destination.masterKey,
+        identityManager: destination.identityManager,
+        auditLog: destination.auditLog,
+        reputationStore: destination.reputationStore,
+        activate: true,
+        sourceMasterKey: source.masterKey,
+        destinationSignerIdentityId: destIdentityId,
+      });
+    } catch (err) {
+      reimportError = err as ExitBundleImportError;
+    }
+    expect(reimportError).toBeInstanceOf(ExitBundleImportError);
+    expect(reimportError?.code).toBe("IDENTITY_OVERWRITE_REFUSED");
+
+    // With explicit forceRebind, re-import activates again. State-conflict
+    // resolution still defaults to "skip", so previously-imported state is
+    // preserved (no silent overwrite of operator data).
     const reimport = await importExitBundle({
       bundleDir,
       storage: destination.storage,
@@ -602,6 +626,7 @@ describe("v1.1 acceptance drill - Pillar 4: portability + exit", () => {
       auditLog: destination.auditLog,
       reputationStore: destination.reputationStore,
       activate: true,
+      forceRebind: true,
       sourceMasterKey: source.masterKey,
       destinationSignerIdentityId: destIdentityId,
       // conflictResolution intentionally omitted -> defaults to "skip".

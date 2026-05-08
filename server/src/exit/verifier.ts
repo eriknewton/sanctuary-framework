@@ -305,8 +305,22 @@ function verifyReputationArtifact(
   };
 }
 
+/**
+ * Caller-supplied verifier knobs. v1.0.2 / full-sweep #55.
+ *
+ * `acceptUnverifiableAttestations` flips the bundle verdict from strict-by-default
+ * (any unverifiable attestation fails the bundle) to a relaxed verdict that
+ * tolerates attestations whose signer DID is not in the bundle's published
+ * identity material. Operators opt in explicitly through the CLI
+ * `--accept-unverifiable-attestations` flag (Tier 1 confirmation).
+ */
+export interface VerifyExitBundleOptions {
+  acceptUnverifiableAttestations?: boolean;
+}
+
 export async function verifyExitBundle(
-  bundleDir: string
+  bundleDir: string,
+  options: VerifyExitBundleOptions = {}
 ): Promise<ExitBundleDetailedVerifierResult> {
   const root = resolve(bundleDir);
   let manifest: ExitBundleManifest;
@@ -507,10 +521,19 @@ export async function verifyExitBundle(
     reputation?.bundle_signature_valid === false ||
     (reputation?.invalid_attestations ?? 0) > 0;
   const identityFailed = identity ? !identity.signature_valid : false;
+  const unverifiableCount = reputation?.unverifiable_attestations ?? 0;
+  const unverifiableFailed =
+    unverifiableCount > 0 && !options.acceptUnverifiableAttestations;
+  if (unverifiableFailed) {
+    warnings.push(
+      `${unverifiableCount} reputation attestation(s) have unknown signer public keys; ` +
+        `pass --accept-unverifiable-attestations to import anyway`
+    );
+  }
 
   return {
     version: "1.1",
-    passed: !reputationFailed && !identityFailed,
+    passed: !reputationFailed && !identityFailed && !unverifiableFailed,
     verified_at: new Date().toISOString(),
     manifest_path: join(root, "manifest.json"),
     manifest_hash: sha256Hex(manifestBytes),
@@ -528,7 +551,9 @@ export async function verifyExitBundle(
     audit,
     reputation,
     failure_class:
-      reputationFailed || identityFailed ? "other" : undefined,
+      reputationFailed || identityFailed || unverifiableFailed
+        ? "other"
+        : undefined,
   };
 }
 

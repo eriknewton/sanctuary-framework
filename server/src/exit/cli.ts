@@ -154,6 +154,11 @@ Options:
   --destination-identity-id <id>    Destination signer for re-keyed state
   --state-namespace <name>          Export a namespace; repeatable
   --conflict <skip|overwrite|version>
+  --force-rebind                    On import: explicitly replace an existing fortress
+                                    public identity (Tier 1 confirmation)
+  --accept-unverifiable-attestations
+                                    On import: accept reputation attestations whose
+                                    signer DID is not in the bundle (Tier 1 confirmation)
   --json
   --yes, -y                         Explicit non-interactive Tier 1 approval
   --help, -h
@@ -187,7 +192,12 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         write(err, "Usage: sanctuary exit verify <dir>\n");
         return 2;
       }
-      const result = await verifyExitBundle(dir);
+      const result = await verifyExitBundle(dir, {
+        acceptUnverifiableAttestations: hasFlag(
+          argv,
+          "--accept-unverifiable-attestations"
+        ),
+      });
       if (json) {
         write(out, JSON.stringify(result, null, 2) + "\n");
       } else {
@@ -258,9 +268,17 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         return 2;
       }
       const activate = hasFlag(argv, "--activate");
+      const forceRebind = hasFlag(argv, "--force-rebind");
+      const acceptUnverifiableAttestations = hasFlag(
+        argv,
+        "--accept-unverifiable-attestations"
+      );
       if (activate) {
+        const prompt = forceRebind
+          ? "Tier 1 approval required: activate verified imported exit bundle AND replace the existing fortress public identity (force-rebind)?"
+          : "Tier 1 approval required: activate verified imported exit bundle?";
         const approved = await confirmTier1(
-          "Tier 1 approval required: activate verified imported exit bundle?",
+          prompt,
           hasFlag(argv, "--yes") || hasFlag(argv, "-y"),
           stdin,
           err
@@ -268,6 +286,18 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         if (!approved) {
           write(err, "Aborted.\n");
           return 1;
+        }
+        if (acceptUnverifiableAttestations) {
+          const acceptApproved = await confirmTier1(
+            "Tier 1 approval required: accept unverifiable reputation attestations on import?",
+            hasFlag(argv, "--yes") || hasFlag(argv, "-y"),
+            stdin,
+            err
+          );
+          if (!acceptApproved) {
+            write(err, "Aborted.\n");
+            return 1;
+          }
         }
       }
       const ctx = await openExitContext(argv, env);
@@ -286,6 +316,8 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         auditLog: ctx.auditLog,
         reputationStore: ctx.reputationStore,
         activate,
+        forceRebind,
+        acceptUnverifiableAttestations,
         conflictResolution: conflict,
         sourcePassphrase: flagValue(argv, "--source-passphrase"),
         sourceRecoveryKey: flagValue(argv, "--source-recovery-key"),
