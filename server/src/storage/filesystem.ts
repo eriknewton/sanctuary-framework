@@ -22,13 +22,13 @@
  *
  * Legacy fallback (forward compatibility):
  *   Pre-fix code used `replace(/[^a-zA-Z0-9_-]/g, "_")` for namespaces and
- *   `replace(/[^a-zA-Z0-9_.-]/g, "_")` for keys — non-bijective. read(),
+ *   `replace(/[^a-zA-Z0-9_.-]/g, "_")` for keys; non-bijective. read(),
  *   exists(), and delete() try the new path first; on ENOENT they fall back
  *   to the legacy path so existing fortresses with operator-supplied
  *   namespaces containing non-safe characters keep working. write() always
  *   uses the new bijective path. list() and totalSize() walk on-disk
  *   directory names directly and cannot disambiguate legacy collision-class
- *   pairs — they are forward-only by design.
+ *   pairs; they are forward-only by design.
  */
 
 import { mkdir, readFile, writeFile, unlink, readdir, stat } from "node:fs/promises";
@@ -44,7 +44,7 @@ function bijectiveEncode(name: string): string {
   );
 }
 
-// Legacy whitelist sanitizers — used ONLY for read-fallback against fortresses
+// Legacy whitelist sanitizers, used ONLY for read-fallback against fortresses
 // written before full-sweep #41. write() never produces these paths.
 function legacyNamespaceSanitize(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_");

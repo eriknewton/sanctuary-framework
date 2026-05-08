@@ -78,7 +78,7 @@ function encodeArray(arr: unknown[]): string {
     if (item === undefined) {
       // RFC 8785 forbids undefined at any depth. Object encoding correctly
       // omits undefined values; array encoding must not silently coerce to
-      // "null" — a producer-side mistake would otherwise be signed and only
+      // "null". A producer-side mistake would otherwise be signed and only
       // surface as a non-deterministic verification failure on the receiver.
       throw new MeshCanonicalJsonError(
         `canonicalize(): undefined is not a valid JSON value at array index ${i}`

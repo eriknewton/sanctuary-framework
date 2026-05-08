@@ -13,7 +13,7 @@ import {
   MeshCanonicalJsonError,
 } from "../../src/mesh/canonical-json.js";
 
-describe("canonicalize — rejection rules", () => {
+describe("canonicalize: rejection rules", () => {
   it("rejects top-level undefined", () => {
     expect(() => canonicalize(undefined)).toThrow(MeshCanonicalJsonError);
     expect(() => canonicalize(undefined)).toThrow(/top-level undefined/);
@@ -39,7 +39,7 @@ describe("canonicalize — rejection rules", () => {
     ).toThrow(/array index 1/);
   });
 
-  it("rejects non-finite numbers (regression — pre-existing)", () => {
+  it("rejects non-finite numbers (regression, pre-existing)", () => {
     expect(() => canonicalize(NaN)).toThrow(/non-finite/);
     expect(() => canonicalize(Infinity)).toThrow(/non-finite/);
     expect(() => canonicalize(-Infinity)).toThrow(/non-finite/);
@@ -52,7 +52,7 @@ describe("canonicalize — rejection rules", () => {
   });
 });
 
-describe("canonicalize — object undefined-omit (regression guard for #42 fix)", () => {
+describe("canonicalize: object undefined-omit (regression guard for #42 fix)", () => {
   it("omits undefined values from objects (does NOT regress to throw)", () => {
     // RFC 8785 + Sanctuary policy: undefined in object position is omitted,
     // matching JSON.stringify behavior. The #42 fix must not over-correct
@@ -73,7 +73,7 @@ describe("canonicalize — object undefined-omit (regression guard for #42 fix)"
   });
 });
 
-describe("canonicalize — basic shape (smoke)", () => {
+describe("canonicalize: basic shape (smoke)", () => {
   it("sorts object keys lexicographically", () => {
     expect(canonicalize({ b: 2, a: 1 })).toBe('{"a":1,"b":2}');
   });

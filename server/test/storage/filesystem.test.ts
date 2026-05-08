@@ -40,7 +40,7 @@ describe("FilesystemStorage", () => {
       await storage.write("../etc", "key", new Uint8Array([1, 2, 3]));
       // Security invariant: must NOT create basePath/etc (would be one level
       // up's neighbor) or anything matching ".." literally. Specific encoded
-      // form is an implementation detail — assert the invariant, not the form.
+      // form is an implementation detail. Assert the invariant, not the form.
       const entries = await readdir(basePath);
       expect(entries).not.toContain("etc");
       expect(entries).not.toContain("..");
@@ -101,7 +101,7 @@ describe("FilesystemStorage", () => {
     it("internal namespace names with underscore prefix preserve their on-disk path", async () => {
       // _audit, _bridge, _identities, etc. all start with `_`. Underscore
       // remains in the safe set so internal namespaces have stable on-disk
-      // paths — no migration needed for any existing fortress whose
+      // paths; no migration needed for any existing fortress whose
       // namespaces use only safe-set characters.
       await storage.write("_audit", "k", new Uint8Array([7]));
       const entries = await readdir(basePath);
@@ -155,7 +155,7 @@ describe("FilesystemStorage", () => {
     it("read() prefers new path when both new and legacy paths exist", async () => {
       // Edge case: an operator who upgraded and re-wrote to the same logical
       // namespace ends up with data at both paths. The new bijective path
-      // should win — it is the source of truth post-upgrade.
+      // should win; it is the source of truth post-upgrade.
       await storage.write("a/b", "k", new Uint8Array([42])); // new path
       const legacyDir = join(basePath, "a_b");
       await mkdir(legacyDir, { recursive: true, mode: 0o700 });
