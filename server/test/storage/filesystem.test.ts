@@ -7,7 +7,15 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile, stat, readdir } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  rm,
+  readFile,
+  stat,
+  readdir,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -28,12 +36,17 @@ describe("FilesystemStorage", () => {
   // ── Path traversal sanitization ─────────────────────────────────────
 
   describe("path traversal sanitization", () => {
-    it("sanitizes ../ in namespace", async () => {
+    it("prevents ../ in namespace from escaping basePath", async () => {
       await storage.write("../etc", "key", new Uint8Array([1, 2, 3]));
-      // Should write to basePath/___etc/ not basePath/../etc/
+      // Security invariant: must NOT create basePath/etc (would be one level
+      // up's neighbor) or anything matching ".." literally. Specific encoded
+      // form is an implementation detail — assert the invariant, not the form.
       const entries = await readdir(basePath);
-      expect(entries).toContain("___etc");
       expect(entries).not.toContain("etc");
+      expect(entries).not.toContain("..");
+      // Round-trip works under the same namespace string.
+      const result = await storage.read("../etc", "key");
+      expect(result).toEqual(new Uint8Array([1, 2, 3]));
     });
 
     it("sanitizes / in key names", async () => {
@@ -45,6 +58,109 @@ describe("FilesystemStorage", () => {
     it("sanitizes special characters in namespace and key", async () => {
       await storage.write("ns with spaces!", "key:special", new Uint8Array([42]));
       const result = await storage.read("ns with spaces!", "key:special");
+      expect(result).toEqual(new Uint8Array([42]));
+    });
+  });
+
+  // ── Path bijection (full-sweep #41 + #43) ───────────────────────────
+  //
+  // Pre-fix sanitizer collapsed any non-safe character to "_", causing
+  // distinct namespace strings (e.g., "a/b" and "a_b") to share one disk
+  // path. Within a tenant, that lets one agent overwrite or read another
+  // namespace it should not see. The bijective encoder must produce
+  // distinct on-disk paths for every distinct input string.
+
+  describe("path bijection", () => {
+    it("collision-class namespace pairs round-trip independently", async () => {
+      const collisions: Array<[string, string]> = [
+        ["a/b", "a_b"],
+        ["x:y", "x_y"],
+        ["m\\n", "m_n"],
+        ["t b", "t_b"],
+        ["p|q", "p_q"],
+      ];
+      for (const [nsA, nsB] of collisions) {
+        const valA = new Uint8Array([1, 1, 1]);
+        const valB = new Uint8Array([2, 2, 2]);
+        await storage.write(nsA, "k", valA);
+        await storage.write(nsB, "k", valB);
+        // Old code: second write would overwrite first (same disk path).
+        // New code: distinct disk paths, both values survive.
+        expect(await storage.read(nsA, "k")).toEqual(valA);
+        expect(await storage.read(nsB, "k")).toEqual(valB);
+      }
+    });
+
+    it("collision-class key pairs round-trip independently within one namespace", async () => {
+      await storage.write("ns", "a/b", new Uint8Array([10]));
+      await storage.write("ns", "a_b", new Uint8Array([20]));
+      expect(await storage.read("ns", "a/b")).toEqual(new Uint8Array([10]));
+      expect(await storage.read("ns", "a_b")).toEqual(new Uint8Array([20]));
+    });
+
+    it("internal namespace names with underscore prefix preserve their on-disk path", async () => {
+      // _audit, _bridge, _identities, etc. all start with `_`. Underscore
+      // remains in the safe set so internal namespaces have stable on-disk
+      // paths — no migration needed for any existing fortress whose
+      // namespaces use only safe-set characters.
+      await storage.write("_audit", "k", new Uint8Array([7]));
+      const entries = await readdir(basePath);
+      expect(entries).toContain("_audit");
+    });
+  });
+
+  // ── Legacy on-disk fallback (forward compat) ─────────────────────────
+  //
+  // Existing fortresses written before #41 used the non-bijective whitelist
+  // sanitizer. read(), exists(), and delete() try the new bijective path
+  // first; on ENOENT they fall back to the legacy path so operators do not
+  // lose data on upgrade. write() always uses the new path.
+
+  describe("legacy on-disk fallback", () => {
+    it("read() falls back to legacy whitelist-sanitized path on ENOENT", async () => {
+      // Simulate a pre-#41 fortress: data written via the OLD sanitizer.
+      // OLD whitelist: namespace 'a/b' was sanitized to 'a_b' on disk.
+      const legacyDir = join(basePath, "a_b");
+      await mkdir(legacyDir, { recursive: true, mode: 0o700 });
+      await writeFile(join(legacyDir, "k.enc"), new Uint8Array([99]));
+
+      // New code reads using the ORIGINAL namespace string. The new
+      // bijective path (basePath/a!2Fb/k.enc) does not exist; fallback
+      // resolves the legacy on-disk shape.
+      const result = await storage.read("a/b", "k");
+      expect(result).toEqual(new Uint8Array([99]));
+    });
+
+    it("exists() falls back to legacy path", async () => {
+      const legacyDir = join(basePath, "a_b");
+      await mkdir(legacyDir, { recursive: true, mode: 0o700 });
+      await writeFile(join(legacyDir, "k.enc"), new Uint8Array([1]));
+      expect(await storage.exists("a/b", "k")).toBe(true);
+    });
+
+    it("delete() falls back to legacy path", async () => {
+      const legacyDir = join(basePath, "a_b");
+      await mkdir(legacyDir, { recursive: true, mode: 0o700 });
+      await writeFile(join(legacyDir, "k.enc"), new Uint8Array([1, 2, 3]));
+      const deleted = await storage.delete("a/b", "k", false);
+      expect(deleted).toBe(true);
+      // File at legacy path is gone.
+      await expect(stat(join(legacyDir, "k.enc"))).rejects.toThrow();
+    });
+
+    it("read() returns null when neither new nor legacy path exists", async () => {
+      expect(await storage.read("nonexistent/ns", "k")).toBeNull();
+    });
+
+    it("read() prefers new path when both new and legacy paths exist", async () => {
+      // Edge case: an operator who upgraded and re-wrote to the same logical
+      // namespace ends up with data at both paths. The new bijective path
+      // should win — it is the source of truth post-upgrade.
+      await storage.write("a/b", "k", new Uint8Array([42])); // new path
+      const legacyDir = join(basePath, "a_b");
+      await mkdir(legacyDir, { recursive: true, mode: 0o700 });
+      await writeFile(join(legacyDir, "k.enc"), new Uint8Array([99])); // legacy
+      const result = await storage.read("a/b", "k");
       expect(result).toEqual(new Uint8Array([42]));
     });
   });
