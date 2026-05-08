@@ -773,8 +773,11 @@ fn kernel_drops_dot_to_unallowed_resolver() {
         audit_json.contains("\"default_deny\""),
         "audit must record default_deny provenance; got: {audit_json}"
     );
+    // `dest_port` is a JSON integer in the audit canonical-JSON, so the
+    // substring is `853` without surrounding double quotes (matches the
+    // shape used by the working plain-DNS test's `contains("53")`).
     assert!(
-        audit_json.contains("\"853\""),
+        audit_json.contains("853"),
         "audit must record port 853; got: {audit_json}"
     );
 
