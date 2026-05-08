@@ -55,6 +55,13 @@ fn encode(value: &Value, out: &mut String) -> Result<(), CanonicalJsonError> {
             Ok(())
         }
         Value::String(s) => {
+            // Safety: `serde_json::to_string` on a Rust `String`/`&str` is
+            // infallible. Strings have no Serialize implementation that can
+            // return Err and no numeric or IO surface to fail on. A panic
+            // here would mean the serde_json contract has changed and the
+            // canonical-form invariant (cross-language byte-match with
+            // server/src/mesh/canonical-json.ts) is broken; fail-fast is
+            // the correct response.
             out.push_str(&serde_json::to_string(s).expect("serialize str"));
             Ok(())
         }
@@ -86,8 +93,14 @@ fn encode(value: &Value, out: &mut String) -> Result<(), CanonicalJsonError> {
                 if i > 0 {
                     out.push(',');
                 }
+                // Safety: same infallibility argument as the Value::String
+                // arm above; `serde_json::to_string` on `&str` cannot fail.
                 out.push_str(&serde_json::to_string(k.as_str()).expect("serialize key"));
                 out.push(':');
+                // Safety: `keys` was built from `map.keys().collect()` and
+                // sorted in place, with no intervening mutation of `map`;
+                // every key in `keys` is therefore present in `map` and
+                // `map.get(*k)` cannot return None.
                 encode(map.get(*k).expect("key present"), out)?;
             }
             out.push('}');

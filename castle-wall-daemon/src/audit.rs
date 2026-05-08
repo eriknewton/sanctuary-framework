@@ -670,6 +670,9 @@ fn add_wal_chain_fields(
             serde_json::Value::Object(serde_json::Map::new()),
         );
     }
+    // Safety: the if-block immediately above guarantees `entry["details"]`
+    // exists and is a JSON object; the get_mut + as_object_mut chain cannot
+    // return None unless the program is corrupted in memory.
     let details = entry
         .get_mut("details")
         .and_then(|details| details.as_object_mut())
