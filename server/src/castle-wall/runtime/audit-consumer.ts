@@ -47,6 +47,18 @@ export interface AuditConsumerStats {
   acceptedCriticalEvents: number;
   acceptedMetricBatches: number;
   rejectedEvents: number;
+  /**
+   * Count of duplicate critical events the consumer has dropped (post-ACK-
+   * failure replays from the daemon) per finding #92. Audit log records
+   * each drop as a `critical_event_duplicate_dropped` entry.
+   */
+  duplicatesDropped: number;
+  /**
+   * Count of ACK failures observed per finding #92. Audit log records each
+   * as a `critical_event_ack_failed` entry; the daemon retries and the
+   * duplicate path closes the loop.
+   */
+  ackFailures: number;
 }
 
 export class AuditChainError extends Error {
@@ -125,13 +137,36 @@ export class AuditConsumer {
     acceptedCriticalEvents: 0,
     acceptedMetricBatches: 0,
     rejectedEvents: 0,
+    duplicatesDropped: 0,
+    ackFailures: 0,
   };
   private lastAckedSeq: number | null = null;
   private lastEventCanonicalHash: string | null = null;
 
   constructor(private readonly sink: AuditSink) {}
 
-  /** Persist a critical event then invoke the daemon-supplied ACK callback. */
+  /**
+   * Persist a critical event then invoke the daemon-supplied ACK callback.
+   *
+   * Failure modes addressed by full-sweep #92:
+   *
+   *   - **ACK failure (transport).** The IPC channel back to the daemon may
+   *     fail after data is durably persisted. We update consumer state
+   *     BEFORE invoking `ack()` (the flushed event is already on disk; the
+   *     consumer's view of the chain must reflect that). The ACK itself is
+   *     wrapped in a try-catch. On failure, we emit a
+   *     `critical_event_ack_failed` audit entry and continue without
+   *     rethrowing. The daemon will retry with the same event; the retry
+   *     path below handles it as a duplicate replay.
+   *
+   *   - **Duplicate replay.** Daemon retried after a prior ACK failure.
+   *     `validateWalChain` distinguishes this from a genuine `seq_regression`
+   *     by comparing the canonical hash of the incoming event against the
+   *     last persisted hash at the same seq. On match, we drop the duplicate
+   *     payload and emit a `critical_event_duplicate_dropped` diagnostic
+   *     entry; the daemon receives a fresh ACK so it stops retrying. Audit
+   *     log integrity is preserved (no silent duplicate entries).
+   */
   async ingestCritical(envelope: CriticalEventEnvelope): Promise<void> {
     const reason = validateEvent(envelope.event);
     if (reason) {
@@ -144,13 +179,33 @@ export class AuditConsumer {
         "failure"
       );
       // ACK rejected events too; the daemon should not re-deliver malformed.
-      await envelope.ack();
+      await this.tryAck(envelope, "audit_event_rejected");
       return;
     }
-    const chainFailure = this.validateWalChain(envelope.event);
-    if (chainFailure) {
-      await this.emitVerificationFailure(chainFailure, envelope.event);
-      throw new AuditChainError(chainFailure);
+    const chainOutcome = this.validateWalChain(envelope.event);
+    if (chainOutcome.kind === "duplicate_replay") {
+      // Daemon retried a critical event whose persistence completed but whose
+      // ACK never landed. Drop the payload silently (no double-append) and
+      // record the diagnostic entry so an auditor can see why the chain has a
+      // marker without a duplicate event.
+      this.sink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        "critical_event_duplicate_dropped",
+        envelope.event.fortress_id,
+        {
+          seq: envelope.event.details.seq,
+          event_type: envelope.event.event_type,
+        },
+        "success"
+      );
+      await this.sink.flush();
+      this.stats.duplicatesDropped += 1;
+      await this.tryAck(envelope, "critical_event_duplicate_dropped");
+      return;
+    }
+    if (chainOutcome.kind === "error") {
+      await this.emitVerificationFailure(chainOutcome.reason, envelope.event);
+      throw new AuditChainError(chainOutcome.reason);
     }
     this.sink.append(
       CASTLE_WALL_AUDIT_LAYER,
@@ -160,10 +215,43 @@ export class AuditConsumer {
       "success"
     );
     await this.sink.flush();
-    await envelope.ack();
+    // Update state BEFORE the ACK call. The event is now durably persisted;
+    // a transport-layer ACK failure must NOT leave the consumer's chain view
+    // out of sync with what is actually on disk.
     this.lastAckedSeq = Number(envelope.event.details.seq);
     this.lastEventCanonicalHash = computeCanonicalHash(envelope.event);
     this.stats.acceptedCriticalEvents += 1;
+    await this.tryAck(envelope, envelope.event.event_type);
+  }
+
+  /**
+   * Invoke the daemon-supplied ACK callback. On failure, emit a
+   * `critical_event_ack_failed` audit entry and continue without rethrowing.
+   * The data is already durable; the daemon will retry; the retry path
+   * recognizes the duplicate. This is the structural close of finding #92.
+   */
+  private async tryAck(
+    envelope: CriticalEventEnvelope,
+    operationContext: string
+  ): Promise<void> {
+    try {
+      await envelope.ack();
+    } catch (err) {
+      this.stats.ackFailures += 1;
+      this.sink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        "critical_event_ack_failed",
+        envelope.event.fortress_id ?? "unknown",
+        {
+          seq: envelope.event.details?.seq,
+          event_type: envelope.event.event_type,
+          ack_for: operationContext,
+          reason: err instanceof Error ? err.message : String(err),
+        },
+        "failure"
+      );
+      await this.sink.flush();
+    }
   }
 
   /** Append one batch entry per scope-lock §8 metric-event shape. */
@@ -193,7 +281,23 @@ export class AuditConsumer {
     };
   }
 
-  private validateWalChain(event: CastleWallAuditEvent): string | null {
+  /**
+   * Classify an inbound critical event against the WAL chain.
+   *
+   * Returns:
+   *   - `{ kind: "ok" }` for fresh, well-chained events.
+   *   - `{ kind: "duplicate_replay" }` for daemon retries of an already-
+   *     persisted event (same seq + same canonical hash). #92 path.
+   *   - `{ kind: "error", reason }` for chain corruption: missing fields,
+   *     genuine seq regression with different content, or prior-hash
+   *     mismatch.
+   */
+  private validateWalChain(
+    event: CastleWallAuditEvent
+  ):
+    | { kind: "ok" }
+    | { kind: "duplicate_replay" }
+    | { kind: "error"; reason: string } {
     const hasSeq = Object.prototype.hasOwnProperty.call(event.details, "seq");
     const hasPriorHash = Object.prototype.hasOwnProperty.call(
       event.details,
@@ -208,15 +312,26 @@ export class AuditConsumer {
       !hasPriorHash ||
       !(typeof priorHash === "string" || priorHash === null)
     ) {
-      return "chain_fields_missing";
+      return { kind: "error", reason: "chain_fields_missing" };
     }
     if (this.lastAckedSeq !== null && seq <= this.lastAckedSeq) {
-      return "seq_regression";
+      // Distinguish duplicate replay (same seq + same content) from a
+      // genuine regression (same seq + different content). A daemon retry
+      // after ACK failure produces the former; corruption or a rolled-back
+      // daemon WAL produces the latter.
+      if (
+        seq === this.lastAckedSeq &&
+        this.lastEventCanonicalHash !== null &&
+        computeCanonicalHash(event) === this.lastEventCanonicalHash
+      ) {
+        return { kind: "duplicate_replay" };
+      }
+      return { kind: "error", reason: "seq_regression" };
     }
     if (this.lastEventCanonicalHash !== null && priorHash !== this.lastEventCanonicalHash) {
-      return "wal_chain_verification_failed";
+      return { kind: "error", reason: "wal_chain_verification_failed" };
     }
-    return null;
+    return { kind: "ok" };
   }
 
   private async emitVerificationFailure(

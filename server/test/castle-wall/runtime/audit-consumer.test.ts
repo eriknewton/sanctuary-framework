@@ -240,6 +240,94 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     expect(consumer.getWalChainState().lastAckedSeq).toBe(6);
     expect(consumer.getWalChainState().lastEventCanonicalHash).toBe(eventHash(eventSeq6));
   });
+
+  // ─── #92 ACK failure handling + duplicate replay ────────────────────────
+
+  it("emits critical_event_ack_failed on ACK exception, does not throw (#92)", async () => {
+    const eventSeq5 = chainedEvent(5, null);
+    const ackError = new Error("ipc broken pipe");
+    await consumer.ingestCritical({
+      event: eventSeq5,
+      ack: async () => {
+        throw ackError;
+      },
+    });
+    // Original event still appended + flushed (data is durable).
+    expect(sink.entries.length).toBe(2);
+    expect(sink.entries[0]!.operation).toBe("egress_allowed");
+    // Diagnostic entry recorded.
+    expect(sink.entries[1]!.operation).toBe("critical_event_ack_failed");
+    expect(sink.entries[1]!.result).toBe("failure");
+    expect(sink.entries[1]!.details?.seq).toBe(5);
+    expect(sink.entries[1]!.details?.reason).toBe("ipc broken pipe");
+    expect(sink.entries[1]!.details?.event_type).toBe("egress_allowed");
+    // Stats reflect both the accepted event and the ACK failure.
+    expect(consumer.getStats().acceptedCriticalEvents).toBe(1);
+    expect(consumer.getStats().ackFailures).toBe(1);
+    // State updated even though ACK failed: flush completed before ACK.
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(5);
+    expect(consumer.getWalChainState().lastEventCanonicalHash).toBe(
+      eventHash(eventSeq5)
+    );
+  });
+
+  it("drops duplicate critical event silently on daemon retry after ACK failure (#92)", async () => {
+    const eventSeq5 = chainedEvent(5, null);
+    // First delivery: ACK fails.
+    await consumer.ingestCritical({
+      event: eventSeq5,
+      ack: async () => {
+        throw new Error("first ack failed");
+      },
+    });
+    const beforeReplayLength = sink.entries.length;
+    // Daemon retries the SAME event (same seq, same canonical content).
+    let secondAcked = false;
+    await consumer.ingestCritical({
+      event: eventSeq5,
+      ack: async () => {
+        secondAcked = true;
+      },
+    });
+    // No second copy of `egress_allowed`. Instead, a duplicate-dropped marker.
+    const replayEntries = sink.entries.slice(beforeReplayLength);
+    const dupEntry = replayEntries.find(
+      (e) => e.operation === "critical_event_duplicate_dropped"
+    );
+    expect(dupEntry).toBeDefined();
+    expect(dupEntry!.details?.seq).toBe(5);
+    expect(dupEntry!.details?.event_type).toBe("egress_allowed");
+    // Original event was appended exactly once across both deliveries.
+    const originals = sink.entries.filter(
+      (e) => e.operation === "egress_allowed"
+    );
+    expect(originals).toHaveLength(1);
+    // Stats: the duplicate counter incremented; acceptedCriticalEvents stays 1.
+    expect(consumer.getStats().duplicatesDropped).toBe(1);
+    expect(consumer.getStats().acceptedCriticalEvents).toBe(1);
+    // Daemon receives the second ACK, so it stops retrying.
+    expect(secondAcked).toBe(true);
+  });
+
+  it("treats same-seq with different content as a genuine seq_regression (not a duplicate) (#92)", async () => {
+    const eventSeq5 = chainedEvent(5, null);
+    await consumer.ingestCritical({ event: eventSeq5, ack: async () => {} });
+    // Different timestamp ⇒ different canonical hash, but same seq=5.
+    const tampered = buildAuditEvent({
+      timestamp: "2026-05-04T01:00:05Z", // different from chainedEvent's "...0:05Z"
+      fortress_id: "f",
+      event_type: "egress_allowed",
+      details: { seq: 5, prior_sha256_hex: null },
+    });
+    await expect(
+      consumer.ingestCritical({ event: tampered, ack: async () => {} })
+    ).rejects.toThrow(/seq_regression/);
+    // No `critical_event_duplicate_dropped` for this case: it's corruption.
+    const dupEntries = sink.entries.filter(
+      (e) => e.operation === "critical_event_duplicate_dropped"
+    );
+    expect(dupEntries).toHaveLength(0);
+  });
 });
 
 describe("castle-wall/runtime/audit-consumer : ingestMetricBatch", () => {
