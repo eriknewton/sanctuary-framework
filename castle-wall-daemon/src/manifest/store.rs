@@ -197,7 +197,7 @@ impl ManifestStore {
         self.current_snapshot = Some(snapshot);
         // Safety: `self.current = Some(next)` two lines above sets the option;
         // there is no intervening mutation point on this single-threaded path,
-        // so the as_ref().expect() cannot return None.
+        // so the option is guaranteed to be Some at the read below.
         Ok(self.current.as_ref().expect("current set above"))
     }
 }
