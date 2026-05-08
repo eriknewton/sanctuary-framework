@@ -388,7 +388,10 @@ fn policy_allows_explicitly_listed_destination_alongside_bypass_denials() {
 
 /// Test fixture: kernel-binding pieces for one bypass scenario.
 struct KernelBypassFixture {
-    daemon: DaemonHandle,
+    /// Optional so [`Drop`] can take ownership of the [`DaemonHandle`]
+    /// (which `daemon.stop()` consumes by value) without moving out of
+    /// `&mut self`.
+    daemon: Option<DaemonHandle>,
     _tempdir: TempDir,
     agent_id: String,
     scope: cgroup::ScopeHandle,
@@ -471,7 +474,7 @@ impl KernelBypassFixture {
         });
 
         Self {
-            daemon,
+            daemon: Some(daemon),
             _tempdir: tempdir,
             agent_id: agent_id.to_string(),
             scope,
@@ -558,12 +561,25 @@ impl KernelBypassFixture {
         };
         let outcome = self
             .daemon
+            .as_ref()
+            .expect("daemon must be present during test body")
             .evaluate_attempt(&req)
             .expect("evaluate_attempt");
         (captured_count, outcome.event_canonical_json)
     }
 
+    /// Explicit shutdown for tests that want to control teardown ordering.
+    /// Idempotent with the Drop impl: setting nfq_stop a second time and
+    /// taking nfq_thread when it's already None are both no-ops.
     fn shutdown(mut self) {
+        self.shutdown_in_place();
+    }
+
+    fn shutdown_in_place(&mut self) {
+        // Stop the NFQUEUE listener thread FIRST so it releases its
+        // netlink binding on queue 0 before any later test re-binds.
+        // Without this, a panic in the test body leaves the thread alive
+        // and competing for packets the next test emits.
         self.nfq_stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.nfq_thread.take() {
             // Bounded join: the verdict loop polls stop_flag every ~10ms
@@ -573,7 +589,23 @@ impl KernelBypassFixture {
         let _ = nftables::remove_agent_ruleset(&self.ruleset_id);
         cleanup_castle_table_silent();
         let _ = cgroup::destroy_agent_scope(&self.scope);
-        let _ = self.daemon.stop();
+        if let Some(daemon) = self.daemon.take() {
+            let _ = daemon.stop();
+        }
+    }
+}
+
+impl Drop for KernelBypassFixture {
+    /// Belt-and-suspenders cleanup. Without this, an `assert!` panic in
+    /// the test body skips the explicit `shutdown()` call and leaks the
+    /// NFQUEUE listener thread bound to queue 0. A leaked listener
+    /// captures packets emitted by the NEXT test's bypass subprocess
+    /// into an orphaned `captured` Vec, so the next test sees zero
+    /// packets and panics in the same place. Drop fires during stack
+    /// unwinding on panic, so this guarantees teardown regardless of
+    /// whether the test asserted cleanly or aborted mid-body.
+    fn drop(&mut self) {
+        self.shutdown_in_place();
     }
 }
 
