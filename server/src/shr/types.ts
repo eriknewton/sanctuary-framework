@@ -9,6 +9,8 @@
  * SHR version: 1.0
  */
 
+import type { SignatureScheme } from "../mesh/constants.js";
+
 // ── Layer Status ─────────────────────────────────────────────────────
 
 export type LayerStatus = "active" | "degraded" | "inactive";
@@ -113,6 +115,7 @@ export interface SHRBody {
 export interface SignedSHR {
   body: SHRBody;
   signed_by: string;       // Public key (base64url)
+  signature_scheme: SignatureScheme; // Layer 1 crypto-agility tag
   signature: string;       // Ed25519 signature over canonical body (base64url)
 }
 

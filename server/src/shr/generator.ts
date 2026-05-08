@@ -18,6 +18,7 @@ import { canonicalizeForSigning } from "./types.js";
 import { sign } from "../core/identity.js";
 import { toBase64url, stringToBytes } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
+import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
 import type { SovereigntyTier } from "../l4-reputation/tiers.js";
 
 /** Default SHR validity window: 1 hour */
@@ -312,6 +313,7 @@ export function generateSHR(
   return {
     body,
     signed_by: identity.public_key,
+    signature_scheme: SIGNATURE_SCHEME_V1,
     signature: toBase64url(signatureBytes),
   };
 }

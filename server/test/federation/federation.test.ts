@@ -33,6 +33,7 @@ const mockSHR: SignedSHR = {
     degradations: [],
   },
   signed_by: "mock-key",
+  signature_scheme: "ed25519-v1",
   signature: "mock-sig",
 };
 
