@@ -182,6 +182,36 @@ export interface ImportExitBundleOptions {
   sourceRecoveryKey?: string;
   sourceMasterKey?: Uint8Array;
   destinationSignerIdentityId?: string;
+  /**
+   * v1.0.2 (i) / full-sweep #54. When the destination fortress already has a
+   * staged `public_identity` for the bundle's identity_id, activation is refused
+   * unless the operator passes this flag. The CLI surfaces the flag as
+   * `--force-rebind` and re-prompts Tier 1 confirmation. When `forceRebind` is
+   * true and the rebind triggers, an `exit_bundle_force_rebind` L1 audit entry
+   * records the explicit replacement.
+   */
+  forceRebind?: boolean;
+  /**
+   * v1.0.2 / full-sweep #55. Reputation attestations whose signer DID is not
+   * present in the bundle's published identity material are marked
+   * `unverifiable` by the verifier. By default the verdict is now strict and
+   * an unverifiable attestation fails the bundle. Setting this flag opts the
+   * operator in to an explicit relaxed verdict (Tier 1 confirmation in CLI).
+   */
+  acceptUnverifiableAttestations?: boolean;
+}
+
+/**
+ * Structured error raised by `importExitBundle` for codes the CLI / hub want
+ * to branch on without parsing free-text messages. v1.0.2 (i) / full-sweep #54.
+ */
+export class ExitBundleImportError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "ExitBundleImportError";
+    this.code = code;
+  }
 }
 
 export interface ExitBundleConflictReport {
@@ -796,7 +826,9 @@ async function stageArtifact(
 export async function importExitBundle(
   opts: ImportExitBundleOptions
 ): Promise<ImportExitBundleResult> {
-  const verification = await verifyExitBundle(opts.bundleDir);
+  const verification = await verifyExitBundle(opts.bundleDir, {
+    acceptUnverifiableAttestations: opts.acceptUnverifiableAttestations,
+  });
   if (!verification.passed) {
     return {
       verified: false,
@@ -895,6 +927,25 @@ export async function importExitBundle(
       warnings: verification.warnings,
       unsupported_artifacts: verification.unsupported_artifacts,
     };
+  }
+
+  if (conflicts.public_identity_exists && !opts.forceRebind) {
+    throw new ExitBundleImportError(
+      "IDENTITY_OVERWRITE_REFUSED",
+      "Importing this bundle would overwrite an existing fortress public identity. " +
+        "Pass forceRebind: true (CLI: --force-rebind) to confirm explicit replacement."
+    );
+  }
+  if (conflicts.public_identity_exists && opts.forceRebind && identityArtifact) {
+    opts.auditLog.append(
+      "l1",
+      "exit_bundle_force_rebind",
+      identityArtifact.json.bundle.identity_id,
+      {
+        manifest_version: manifest.body.manifest_version,
+        fortress_id: manifest.body.identity_binding.fortress_id,
+      }
+    );
   }
 
   const importId = importIdForManifest(manifest);
