@@ -12,6 +12,8 @@
  * wires the real `AuditLog.append` connection.
  */
 
+import { createHash } from "node:crypto";
+
 import { CASTLE_WALL_AUDIT_LAYER } from "../constants.js";
 import { canonicalize } from "../../mesh/canonical-json.js";
 import type {
@@ -45,6 +47,13 @@ export interface AuditConsumerStats {
   acceptedCriticalEvents: number;
   acceptedMetricBatches: number;
   rejectedEvents: number;
+}
+
+export class AuditChainError extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+    this.name = "AuditChainError";
+  }
 }
 
 /** A single critical event awaiting persistence + ACK. */
@@ -117,6 +126,8 @@ export class AuditConsumer {
     acceptedMetricBatches: 0,
     rejectedEvents: 0,
   };
+  private lastAckedSeq: number | null = null;
+  private lastEventCanonicalHash: string | null = null;
 
   constructor(private readonly sink: AuditSink) {}
 
@@ -136,6 +147,11 @@ export class AuditConsumer {
       await envelope.ack();
       return;
     }
+    const chainFailure = this.validateWalChain(envelope.event);
+    if (chainFailure) {
+      await this.emitVerificationFailure(chainFailure, envelope.event);
+      throw new AuditChainError(chainFailure);
+    }
     this.sink.append(
       CASTLE_WALL_AUDIT_LAYER,
       envelope.event.event_type,
@@ -145,6 +161,8 @@ export class AuditConsumer {
     );
     await this.sink.flush();
     await envelope.ack();
+    this.lastAckedSeq = Number(envelope.event.details.seq);
+    this.lastEventCanonicalHash = computeCanonicalHash(envelope.event);
     this.stats.acceptedCriticalEvents += 1;
   }
 
@@ -167,6 +185,54 @@ export class AuditConsumer {
   getStats(): AuditConsumerStats {
     return { ...this.stats };
   }
+
+  getWalChainState(): { lastAckedSeq: number | null; lastEventCanonicalHash: string | null } {
+    return {
+      lastAckedSeq: this.lastAckedSeq,
+      lastEventCanonicalHash: this.lastEventCanonicalHash,
+    };
+  }
+
+  private validateWalChain(event: CastleWallAuditEvent): string | null {
+    const hasSeq = Object.prototype.hasOwnProperty.call(event.details, "seq");
+    const hasPriorHash = Object.prototype.hasOwnProperty.call(
+      event.details,
+      "prior_sha256_hex"
+    );
+    const seq = event.details.seq;
+    const priorHash = event.details.prior_sha256_hex;
+    if (
+      !hasSeq ||
+      typeof seq !== "number" ||
+      !Number.isSafeInteger(seq) ||
+      !hasPriorHash ||
+      !(typeof priorHash === "string" || priorHash === null)
+    ) {
+      return "chain_fields_missing";
+    }
+    if (this.lastAckedSeq !== null && seq <= this.lastAckedSeq) {
+      return "seq_regression";
+    }
+    if (this.lastEventCanonicalHash !== null && priorHash !== this.lastEventCanonicalHash) {
+      return "wal_chain_verification_failed";
+    }
+    return null;
+  }
+
+  private async emitVerificationFailure(
+    reason: string,
+    event: CastleWallAuditEvent
+  ): Promise<void> {
+    this.stats.rejectedEvents += 1;
+    this.sink.append(
+      CASTLE_WALL_AUDIT_LAYER,
+      "wal_chain_verification_failed",
+      event.fortress_id ?? "unknown",
+      { reason, event_canonical: canonicalize(event) },
+      "failure"
+    );
+    await this.sink.flush();
+  }
 }
 
 /** Build the `details` payload from an event, omitting redundant top-level fields. */
@@ -177,4 +243,8 @@ function buildDetailsForEvent(event: CastleWallAuditEvent): Record<string, unkno
   if (event.decision !== null) out.decision = event.decision;
   if (event.rule_id !== null) out.rule_id = event.rule_id;
   return out;
+}
+
+function computeCanonicalHash(event: CastleWallAuditEvent): string {
+  return createHash("sha256").update(canonicalize(event), "utf8").digest("hex");
 }
