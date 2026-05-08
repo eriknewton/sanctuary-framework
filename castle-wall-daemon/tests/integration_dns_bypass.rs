@@ -386,12 +386,15 @@ fn policy_allows_explicitly_listed_destination_alongside_bypass_denials() {
 // production enforcement; activation requires no test rewrite, just
 // removing `#[ignore]`.
 //
-// **Activation status as of this PR.** Plain-DNS test is active and
-// demonstrates the chain-wiring fix end-to-end (UDP/53 -> cgroupv2
-// match -> NFQUEUE -> audit). DoH and DoT tests stay `#[ignore]`-d
-// behind v1.x housekeeping (18): both get 0 packets in NFQUEUE under
-// the same fixture and the cause was not isolated within the iteration
-// cap (test-fixture-specific OR TCP-side cgroupv2 binding gap).
+// **Activation status.** All three Tier B tests are active. Plain-DNS
+// (UDP/53), DoH (TCP/443), and DoT (TCP/853) all exercise the full
+// production drop path end-to-end (cgroup attach -> cgroupv2 match ->
+// base-output-chain jump -> NFQUEUE drop -> audit assertion). The DoH
+// and DoT tests were `#[ignore]`-d in PR #131 because both got 0 packets
+// in NFQUEUE; v1.x housekeeping (18) traced the cause to a shell
+// line-continuation interaction in the subprocess wrapper rather than
+// any kernel-binding gap. The fix is a single-line `connect_ex` Python
+// shape that emits one TCP SYN cleanly.
 
 /// Test fixture: kernel-binding pieces for one bypass scenario.
 struct KernelBypassFixture {
@@ -676,15 +679,6 @@ fn kernel_drops_plain_dns_to_unallowed_resolver() {
 /// queues the SYN to NFQUEUE and the audit records `egress_blocked` for
 /// tcp/443 with `default_deny` provenance.
 #[test]
-#[ignore = "blocked on v1.x housekeeping (18) TCP-bypass diagnostic: \
-            DoH (curl name-resolution dependency on dns.google) and DoT \
-            (kdig @1.1.1.1 +tls) bypass tests get 0 packets in NFQUEUE \
-            despite plain-DNS bypass test passing end-to-end with the \
-            chain-wiring fix in this PR. Cause not isolated within \
-            iteration cap; possibly test-fixture-specific (curl --resolve \
-            injection needed for DoH) or possibly TCP-side kernel-binding \
-            gap (cgroupv2 socket match firing on UDP but not TCP). Plain \
-            DNS stays active as the chain-wiring demonstration."]
 fn kernel_drops_doh_to_unallowed_provider() {
     // queue_number 0 matches the hardcoded `queue num 0` catchall in
     // `build_agent_ruleset`. CI's --test-threads=1 prevents parallel-bind
@@ -699,8 +693,16 @@ fn kernel_drops_doh_to_unallowed_provider() {
     // queueing it to NFQUEUE before any TLS handshake completes. Python's
     // socket library connect() with a short timeout is a deterministic
     // way to emit one SYN and surface the captured packet.
+    // Single-line valid Python: `connect_ex` returns errno on failure
+    // instead of raising, so no `try:`/`except:` block is needed. The
+    // earlier shape used `try:`/`except:` with `\<newline>` separators
+    // inside the shell double-quoted command, but sh strips
+    // backslash-newline as a line continuation inside double quotes,
+    // collapsing the script onto one logical line where Python rejects
+    // `try: ... except: ...` as a SyntaxError. The subprocess died
+    // before any SYN was emitted, so NFQUEUE never saw a packet.
     fixture.spawn_bypass(
-        "python3 -c \"import socket;s=socket.socket();s.settimeout(1.5);\\\ntry: s.connect(('8.8.8.8',443))\\\nexcept Exception: pass\" || true",
+        "python3 -c \"import socket;s=socket.socket();s.settimeout(1.5);s.connect_ex(('8.8.8.8',443))\" || true",
     );
 
     let (captured_count, audit_json) = fixture.drive_audit_for_first_capture(
@@ -737,22 +739,18 @@ fn kernel_drops_doh_to_unallowed_provider() {
 /// the TLS handshake completes; audit records `egress_blocked` for
 /// tcp/853 with `default_deny` provenance.
 #[test]
-#[ignore = "blocked on v1.x housekeeping (18) TCP-bypass diagnostic: \
-            DoH (curl name-resolution dependency on dns.google) and DoT \
-            (kdig @1.1.1.1 +tls) bypass tests get 0 packets in NFQUEUE \
-            despite plain-DNS bypass test passing end-to-end with the \
-            chain-wiring fix in this PR. Cause not isolated within \
-            iteration cap; possibly test-fixture-specific (curl --resolve \
-            injection needed for DoH) or possibly TCP-side kernel-binding \
-            gap (cgroupv2 socket match firing on UDP but not TCP). Plain \
-            DNS stays active as the chain-wiring demonstration."]
 fn kernel_drops_dot_to_unallowed_resolver() {
     // queue_number 0 matches the hardcoded `queue num 0` catchall.
     // See the queue-alignment note on kernel_drops_doh_to_unallowed_provider.
     let fixture = KernelBypassFixture::setup("dot-bypass-test", 0);
 
+    // Single-line valid Python via `connect_ex`. See the matching note
+    // on `kernel_drops_doh_to_unallowed_provider` for why the earlier
+    // `try:`/`except:` shape failed (sh line-continuation collapses the
+    // script onto one logical line, Python rejects `try:`/`except:` on
+    // the same line as a SyntaxError, subprocess dies before SYN).
     fixture.spawn_bypass(
-        "python3 -c \"import socket;s=socket.socket();s.settimeout(1.5);\\\ntry: s.connect(('1.1.1.1',853))\\\nexcept Exception: pass\" || true",
+        "python3 -c \"import socket;s=socket.socket();s.settimeout(1.5);s.connect_ex(('1.1.1.1',853))\" || true",
     );
 
     let (captured_count, audit_json) = fixture.drive_audit_for_first_capture(
@@ -775,8 +773,11 @@ fn kernel_drops_dot_to_unallowed_resolver() {
         audit_json.contains("\"default_deny\""),
         "audit must record default_deny provenance; got: {audit_json}"
     );
+    // `dest_port` is a JSON integer in the audit canonical-JSON, so the
+    // substring is `853` without surrounding double quotes (matches the
+    // shape used by the working plain-DNS test's `contains("53")`).
     assert!(
-        audit_json.contains("\"853\""),
+        audit_json.contains("853"),
         "audit must record port 853; got: {audit_json}"
     );
 
