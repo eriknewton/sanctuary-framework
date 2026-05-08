@@ -119,6 +119,16 @@ export interface UsageEvent {
   attestation_state: "present" | "degraded" | "unavailable";
   /** Wall-clock ISO8601 UTC. */
   emitted_at: string;
+  /**
+   * Causal references back to prior usage events that produced this one. Each
+   * entry points at a specific predecessor by `event_class` + `usage_event_id`.
+   * Spec §6 requires this for chain-of-causation reconstruction (commitment
+   * proposal then tool_call, etc.). Omitted when no causal link exists.
+   *
+   * `event_type` MUST be one of EVENT_CLASSES; `event_id` MUST be a non-empty
+   * string. Schema validation enforces both.
+   */
+  references?: Array<{ event_type: EventClass; event_id: string }>;
   /** Optional extension — operator-specific fields. Reserved keys rejected at envelope pack time. */
   extension?: Record<string, unknown>;
 }

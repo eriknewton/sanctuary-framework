@@ -285,8 +285,11 @@ const USAGE_EVENT_ALLOWED_KEYS = new Set([
   "policy_version_hash",
   "attestation_state",
   "emitted_at",
+  "references",
   "extension",
 ]);
+
+const USAGE_EVENT_REFERENCE_ALLOWED_KEYS = new Set(["event_type", "event_id"]);
 
 const ATTESTATION_STATES = ["present", "degraded", "unavailable"] as const;
 
@@ -388,6 +391,8 @@ export function validateUsageEvent(v: unknown): UsageEvent {
       `usage event extension must be a plain object if present`
     );
   }
+  const validatedReferences =
+    v.references !== undefined ? validateUsageEventReferences(v.references) : undefined;
   const out: UsageEvent = {
     schema_version: AGENT_CONTRACT_VERSION,
     signature_scheme: SIGNATURE_SCHEME_V1,
@@ -406,8 +411,62 @@ export function validateUsageEvent(v: unknown): UsageEvent {
   if (v.capability_kind !== undefined) {
     out.capability_kind = v.capability_kind as CapabilityKind;
   }
+  if (validatedReferences !== undefined) {
+    out.references = validatedReferences;
+  }
   if (v.extension !== undefined) {
     out.extension = v.extension as Record<string, unknown>;
+  }
+  return out;
+}
+
+/**
+ * Validate the `references[]` array on a usage event per spec §6.
+ *
+ * Each entry is `{ event_type, event_id }` where `event_type` MUST be a member
+ * of `EVENT_CLASSES` (allow-listed) and `event_id` MUST be a non-empty string
+ * pointing at a prior usage event's `usage_event_id`.
+ *
+ * Empty array is allowed; absence vs empty array carry the same semantics
+ * (no causal link). Unknown keys on entries are rejected: the closed-schema
+ * convention applies here too.
+ */
+export function validateUsageEventReferences(
+  v: unknown
+): Array<{ event_type: EventClass; event_id: string }> {
+  if (!Array.isArray(v)) {
+    throw new UsageEventSchemaError(
+      `usage event references must be an array if present; got ${typeof v}`
+    );
+  }
+  const out: Array<{ event_type: EventClass; event_id: string }> = [];
+  for (const entry of v) {
+    if (!isPlainObject(entry)) {
+      throw new UsageEventSchemaError(
+        `usage event references entry must be an object; got ${typeof entry}`
+      );
+    }
+    for (const key of Object.keys(entry)) {
+      if (!USAGE_EVENT_REFERENCE_ALLOWED_KEYS.has(key)) {
+        throw new UsageEventSchemaError(
+          `usage event references entry has unknown key "${key}"`
+        );
+      }
+    }
+    if (!isIn(entry.event_type, EVENT_CLASSES)) {
+      throw new UsageEventSchemaError(
+        `usage event references entry event_type must be one of ${EVENT_CLASSES.join("|")}; got ${JSON.stringify(entry.event_type)}`
+      );
+    }
+    if (!isNonEmptyString(entry.event_id)) {
+      throw new UsageEventSchemaError(
+        `usage event references entry event_id must be a non-empty string`
+      );
+    }
+    out.push({
+      event_type: entry.event_type as EventClass,
+      event_id: entry.event_id as string,
+    });
   }
   return out;
 }

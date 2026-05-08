@@ -206,3 +206,32 @@ export const COMMITMENT_CLASSES = [
   "credential-share",
 ] as const;
 export type CommitmentClass = (typeof COMMITMENT_CLASSES)[number];
+
+/**
+ * Per-harness `model_provider` pins. Single source of truth for adapters that
+ * MUST issue cards under a fixed provider (e.g. Claude Code → "anthropic").
+ *
+ * The runtime check fires at `issueAgentCard` (not just adapter constructor)
+ * so an operator who calls the issuance entry point directly cannot mint a
+ * mis-attributed card. Mis-attribution corrupts policy-engine routing and
+ * Verascore's view of model-provider correlations.
+ *
+ * Adapters that do NOT pin (Cline, Mastra, Hermes) are deliberately absent
+ * from this map. Hermes in particular is operator-routed to whatever model
+ * the operator chose at launch; pinning would defeat that.
+ */
+export const ADAPTER_PROVIDER_PINS: Readonly<Record<string, ModelProvider>> =
+  Object.freeze({
+    "claude-code": "anthropic",
+  });
+
+/**
+ * Look up the required `model_provider` for a given `harness_id`. Returns
+ * `null` when the adapter does not pin (most adapters).
+ */
+export function requiredModelProviderFor(
+  harness_id: string
+): ModelProvider | null {
+  const pinned = ADAPTER_PROVIDER_PINS[harness_id];
+  return pinned ?? null;
+}

@@ -28,9 +28,10 @@ import type { SignedEvent } from "../mesh/types.js";
 import {
   AGENT_CONTRACT_VERSION,
   SIGNATURE_SCHEME_V1,
+  requiredModelProviderFor,
   type AgentContractEventType,
 } from "./constants.js";
-import { AgentCardVerificationError } from "./errors.js";
+import { AgentCardSchemaError, AgentCardVerificationError } from "./errors.js";
 import { validateAgentCard } from "./schema.js";
 import type { AgentCard, AgentCardCapability } from "./types.js";
 
@@ -81,6 +82,16 @@ export interface IssueAgentCardParams {
 export function issueAgentCard(
   params: IssueAgentCardParams
 ): { signed_event: SignedEvent<AgentCard>; card: AgentCard } {
+  // Enforce per-harness provider pin at issuance, not only at adapter
+  // construction. Adapters MAY validate at construction (defense in depth),
+  // but the issuance gate is the structural enforcement point. Bypassing
+  // an adapter does not bypass this check.
+  const requiredProvider = requiredModelProviderFor(params.harness_id);
+  if (requiredProvider !== null && params.model_provider !== requiredProvider) {
+    throw new AgentCardSchemaError(
+      `harness_id="${params.harness_id}" requires model_provider="${requiredProvider}"; got "${params.model_provider}"`
+    );
+  }
   const issued_at = params.issued_at ?? new Date().toISOString();
   const policy_version_hash = toBase64url(sha256(params.policy_blob_bytes));
   const card: AgentCard = {

@@ -14,7 +14,10 @@ import {
   issueAgentCard,
   verifyAgentCard,
 } from "../../src/agent-contract/card-issuer.js";
-import { AgentCardVerificationError } from "../../src/agent-contract/errors.js";
+import {
+  AgentCardSchemaError,
+  AgentCardVerificationError,
+} from "../../src/agent-contract/errors.js";
 import { MeshSignatureError } from "../../src/mesh/errors.js";
 import { SIGNATURE_SCHEME_V1 } from "../../src/mesh/constants.js";
 import { buildPolicyBlobBytes, buildTestFortress } from "./fixture.js";
@@ -156,6 +159,81 @@ describe("Agent Card issuance + verification (§3)", () => {
     expect(() => verifyAgentCard(forgedEvent, f.verifyContext)).toThrow(
       MeshSignatureError
     );
+  });
+
+  it("rejects model_provider mismatch for pinned harness at issuance gate (#56)", () => {
+    const f = buildTestFortress();
+    const policy = buildPolicyBlobBytes(1);
+    expect(() =>
+      issueAgentCard({
+        agent_id: "agent-pinned",
+        fortress_id: f.master.public.fortress_id,
+        tier: "B",
+        harness_id: "claude-code",
+        // claude-code is pinned to "anthropic" via ADAPTER_PROVIDER_PINS;
+        // even bypassing the adapter constructor, the issuance gate refuses.
+        model_provider: "openai",
+        model_id: "gpt-5",
+        agent_pubkey: toBase64url(new Uint8Array(32).fill(9)),
+        capabilities: [{ kind: "read-slot", target: "memory" }],
+        policy_version: 1,
+        policy_blob_bytes: policy,
+        attestation_endpoint: "http://127.0.0.1:3501/att",
+        emitter_node: f.nodeCert.node_id,
+        emitter_principal: f.principalCert.principal_id,
+        node_private_key: f.nodeKeypair.privateKey,
+        monotonic_seq: 0,
+      })
+    ).toThrow(AgentCardSchemaError);
+  });
+
+  it("accepts pinned-harness card when model_provider matches the pin (#56)", () => {
+    const f = buildTestFortress();
+    const policy = buildPolicyBlobBytes(1);
+    const { card } = issueAgentCard({
+      agent_id: "agent-pinned-ok",
+      fortress_id: f.master.public.fortress_id,
+      tier: "B",
+      harness_id: "claude-code",
+      model_provider: "anthropic",
+      model_id: "claude-opus-4-7",
+      agent_pubkey: toBase64url(new Uint8Array(32).fill(11)),
+      capabilities: [{ kind: "read-slot", target: "memory" }],
+      policy_version: 1,
+      policy_blob_bytes: policy,
+      attestation_endpoint: "http://127.0.0.1:3501/att",
+      emitter_node: f.nodeCert.node_id,
+      emitter_principal: f.principalCert.principal_id,
+      node_private_key: f.nodeKeypair.privateKey,
+      monotonic_seq: 0,
+    });
+    expect(card.harness_id).toBe("claude-code");
+    expect(card.model_provider).toBe("anthropic");
+  });
+
+  it("permits any model_provider for unpinned harness at issuance gate (#56)", () => {
+    const f = buildTestFortress();
+    const policy = buildPolicyBlobBytes(1);
+    // Hermes is deliberately unpinned: operator routes Hermes to whatever
+    // model they choose (NousResearch, Anthropic, OpenAI, etc.).
+    const { card } = issueAgentCard({
+      agent_id: "agent-hermes",
+      fortress_id: f.master.public.fortress_id,
+      tier: "B",
+      harness_id: "hermes",
+      model_provider: "openai",
+      model_id: "gpt-5",
+      agent_pubkey: toBase64url(new Uint8Array(32).fill(13)),
+      capabilities: [{ kind: "read-slot", target: "memory" }],
+      policy_version: 1,
+      policy_blob_bytes: policy,
+      attestation_endpoint: "http://127.0.0.1:3501/att",
+      emitter_node: f.nodeCert.node_id,
+      emitter_principal: f.principalCert.principal_id,
+      node_private_key: f.nodeKeypair.privateKey,
+      monotonic_seq: 0,
+    });
+    expect(card.model_provider).toBe("openai");
   });
 
   it("embeds signature_scheme=ed25519-v1 on every emission (crypto-agility hinge)", () => {
