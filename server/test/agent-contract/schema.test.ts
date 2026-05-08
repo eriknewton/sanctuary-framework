@@ -229,6 +229,58 @@ describe("Usage event schema (§6)", () => {
     }
   });
 
+  // ─── #57 references[] coverage ──────────────────────────────────────────
+
+  it("accepts a usage event with references[] linking a commitment_proposed (#57)", () => {
+    const b = base();
+    b.references = [
+      { event_type: "commitment_proposed", event_id: "evt-prop-1" },
+    ];
+    const ev = validateUsageEvent(b);
+    expect(ev.references).toEqual([
+      { event_type: "commitment_proposed", event_id: "evt-prop-1" },
+    ]);
+  });
+
+  it("accepts an empty references[] array (#57)", () => {
+    const b = base();
+    b.references = [];
+    const ev = validateUsageEvent(b);
+    expect(ev.references).toEqual([]);
+  });
+
+  it("rejects references[] entry with unknown event_type (#57)", () => {
+    const b = base();
+    b.references = [
+      { event_type: "not_a_real_event_class", event_id: "evt-1" },
+    ];
+    expect(() => validateUsageEvent(b)).toThrow(/event_type/);
+  });
+
+  it("rejects references[] entry with empty event_id (#57)", () => {
+    const b = base();
+    b.references = [{ event_type: "commitment_proposed", event_id: "" }];
+    expect(() => validateUsageEvent(b)).toThrow(/event_id/);
+  });
+
+  it("rejects references[] entry with unknown extra keys (#57)", () => {
+    const b = base();
+    b.references = [
+      {
+        event_type: "commitment_proposed",
+        event_id: "evt-1",
+        evil_field: "bad",
+      },
+    ];
+    expect(() => validateUsageEvent(b)).toThrow(/unknown key/);
+  });
+
+  it("rejects references[] when not an array (#57)", () => {
+    const b = base();
+    b.references = "not-an-array";
+    expect(() => validateUsageEvent(b)).toThrow(/array/);
+  });
+
   // ─── event_class coverage per spec §6 ───────────────────────────────────
 
   it("enumerates all 32 event_class values from spec §6 + WP-MVP-6", () => {

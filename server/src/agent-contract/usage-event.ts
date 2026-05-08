@@ -62,6 +62,12 @@ export interface EmitUsageEventParams {
   principal_private_key?: Uint8Array;
   monotonic_seq: number;
   emitted_at?: string;
+  /**
+   * Causal references back to prior usage events per spec §6. Each entry
+   * points at a predecessor by `event_class` + `usage_event_id`. Validator
+   * enforces allow-listed `event_type` values.
+   */
+  references?: Array<{ event_type: EventClass; event_id: string }>;
   extension?: Record<string, unknown>;
 }
 
@@ -93,6 +99,9 @@ export function emitUsageEvent(
     policy_version_hash: params.policy_version_hash,
     attestation_state: params.attestation_state,
     emitted_at,
+    ...(params.references !== undefined && params.references.length > 0
+      ? { references: params.references.map((r) => ({ ...r })) }
+      : {}),
     ...(params.extension ? { extension: params.extension } : {}),
   };
   validateUsageEvent(event);

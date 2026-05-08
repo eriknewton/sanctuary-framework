@@ -92,6 +92,58 @@ describe("Usage event emission + verification (§6)", () => {
     );
   });
 
+  it("emits a usage event with references[] linking to a prior commitment_proposed (#57)", () => {
+    const f = buildTestFortress();
+    const { signed_event, event } = emitUsageEvent({
+      agent_id: "agent-alpha",
+      fortress_id: f.master.public.fortress_id,
+      event_class: "tool_call",
+      capability_kind: "tool-call",
+      capability_target: "concordia/accept",
+      input: { offer_id: "x" },
+      output: { ok: true },
+      policy_version: 1,
+      policy_version_hash: toBase64url(new Uint8Array([1, 2, 3])),
+      attestation_state: "present",
+      references: [
+        { event_type: "commitment_proposed", event_id: "evt-prop-001" },
+      ],
+      emitter_node: f.nodeCert.node_id,
+      emitter_principal: f.principalCert.principal_id,
+      node_private_key: f.nodeKeypair.privateKey,
+      principal_private_key: f.principalKeypair.privateKey,
+      monotonic_seq: 0,
+    });
+    expect(event.references).toEqual([
+      { event_type: "commitment_proposed", event_id: "evt-prop-001" },
+    ]);
+    const r = verifyUsageEvent(signed_event, f.verifyContext);
+    expect(r.event.references).toEqual([
+      { event_type: "commitment_proposed", event_id: "evt-prop-001" },
+    ]);
+  });
+
+  it("omits references[] when not provided (backward-compatible) (#57)", () => {
+    const f = buildTestFortress();
+    const { event } = emitUsageEvent({
+      agent_id: "agent-alpha",
+      fortress_id: f.master.public.fortress_id,
+      event_class: "tool_call",
+      capability_kind: "tool-call",
+      capability_target: "filesystem/read",
+      input: null,
+      output: null,
+      policy_version: 1,
+      policy_version_hash: "aGFzaA",
+      attestation_state: "present",
+      emitter_node: f.nodeCert.node_id,
+      emitter_principal: f.principalCert.principal_id,
+      node_private_key: f.nodeKeypair.privateKey,
+      monotonic_seq: 0,
+    });
+    expect(event.references).toBeUndefined();
+  });
+
   it("produces identical input_hash for equal inputs (canonical canonicalization)", () => {
     const f = buildTestFortress();
     const a = emitUsageEvent({
