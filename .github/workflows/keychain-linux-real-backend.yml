@@ -54,12 +54,16 @@ jobs:
   real-backend-test:
     runs-on: ubuntu-24.04
     env:
-      # Both env vars are scoped to the workspace so nothing touches the
-      # runner's default GnuPG / pass directories. Setting them at the
-      # job level means dbus-run-session inherits them automatically when
-      # it spawns the test shell.
+      # GNUPGHOME is workspace-scoped so the runner's default GnuPG
+      # config stays untouched. pass-secret-service relies on pypass,
+      # which (unlike the pass CLI itself) hardcodes ~/.password-store
+      # and ignores PASSWORD_STORE_DIR. We let `pass init` use the
+      # default location too so the daemon and the CLI agree on where
+      # the store lives. CI run 25611555916 was the proof: with
+      # PASSWORD_STORE_DIR pointed at a workspace path, pass init
+      # populated the workspace store but the daemon hit pypass's
+      # default and raised "could not find .gpg-id file".
       GNUPGHOME: ${{ github.workspace }}/.gnupg-ci
-      PASSWORD_STORE_DIR: ${{ github.workspace }}/.password-store-ci
     steps:
       - uses: actions/checkout@v6
 
@@ -182,7 +186,10 @@ jobs:
           fi
           echo "Generated ephemeral GPG key: $GPG_KEY"
 
-          mkdir -p "$PASSWORD_STORE_DIR"
+          # No PASSWORD_STORE_DIR override: pass-secret-service's pypass
+          # backend hardcodes ~/.password-store, so we let pass CLI use
+          # the same default. ~/.password-store does not exist yet on a
+          # fresh runner; `pass init` creates it.
           pass init "$GPG_KEY"
 
       - name: Run real-backend integration test against pass-secret-service
@@ -230,7 +237,7 @@ jobs:
             echo "=== Environment ==="
             echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
             echo "GNUPGHOME=$GNUPGHOME"
-            echo "PASSWORD_STORE_DIR=$PASSWORD_STORE_DIR"
+            echo "PASSWORD_STORE_DIR=${PASSWORD_STORE_DIR:-$HOME/.password-store (default)}"
             secret-tool --version 2>/dev/null || true
 
             # Smoke test against secret-tool before the suite runs so
