@@ -15,7 +15,7 @@
  * - All gate decisions (approve, deny, allow) are audit-logged.
  */
 
-import type { PrincipalPolicy, GateResult, ApprovalRequest } from "./types.js";
+import type { PrincipalPolicy, GateResult, ApprovalRequest, ApprovalResponse } from "./types.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import { BaselineTracker } from "./baseline.js";
 import { extractOperationName } from "./loader.js";
@@ -344,6 +344,13 @@ export class ApprovalGate {
 
   /**
    * Request approval from the human principal.
+   *
+   * Fail-closed contract (full-sweep #49): if the channel throws (network
+   * down, callback unreachable, dashboard SSE peer dropped, webhook DNS
+   * failure, etc.), the gate denies the operation and audit-logs the cause.
+   * Channel-internal timeouts already resolve with decision: "deny" per
+   * SEC-002; this catch covers the remaining "channel raised" path so an
+   * unhandled rejection cannot turn into an indeterminate state at the gate.
    */
   private async requestApproval(
     operation: string,
@@ -359,7 +366,29 @@ export class ApprovalGate {
       timestamp: new Date().toISOString(),
     };
 
-    const response = await this.channel.requestApproval(request);
+    let response: ApprovalResponse;
+    try {
+      response = await this.channel.requestApproval(request);
+    } catch (err) {
+      const errMessage = err instanceof Error ? err.message : String(err);
+      this.auditLog.append("l2", `gate_deny:${operation}`, "system", {
+        tier,
+        reason,
+        decided_by: "channel_failure",
+        channel_error: errMessage,
+      });
+      return {
+        allowed: false,
+        tier,
+        reason: AGENT_VISIBLE_DENY_REASONS.REQUIRES_APPROVAL,
+        approval_required: true,
+        approval_response: {
+          decision: "deny",
+          decided_at: new Date().toISOString(),
+          decided_by: "channel_failure",
+        },
+      };
+    }
 
     // Audit log the decision
     this.auditLog.append("l2", `gate_${response.decision}:${operation}`, "system", {

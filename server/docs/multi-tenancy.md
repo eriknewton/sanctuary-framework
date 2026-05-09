@@ -331,7 +331,35 @@ tenant's `SANCTUARY_STORAGE_PATH`:
 }
 ```
 
-The file contains **no secrets** — it is 0600 (owner-only) and is deleted
-on graceful shutdown (SIGINT / SIGTERM / `exit`). A crashed process may
-leave a stale file; `sanctuary agents` and the multi-agent dashboard treat
+### What `runtime.json` contains, and what it does not
+
+`runtime.json` carries operational metadata only:
+
+| Field | Purpose |
+|-------|---------|
+| `version` | npm package version of the running process. Lets the multi-agent dashboard surface tenants that need an upgrade. |
+| `pid` | OS process id. Used by `sanctuary agents` to detect a crashed-but-stale runtime file (the pid is no longer alive). |
+| `started_at` | ISO 8601 UTC start timestamp. Surfaced in the agents list so the operator can see uptime at a glance. |
+| `dashboard_host` / `dashboard_port` | The HTTP host and port the dashboard actually bound. Required for the multi-agent dashboard and `sanctuary agents` to reach the per-tenant dashboard. |
+| `webhook_callback_host` / `webhook_callback_port` | Present when the webhook approval channel is enabled. Lets external approval relays post callbacks to the right address. |
+| `mode` | One of `wrap`, `standalone`, `co-located`. Tells the agents list how the tenant was launched. |
+
+There are **no secrets, no passphrases, no encrypted-state references, no
+identity material, and no audit-log content** in `runtime.json`. The file is
+0600 (owner-only) on disk and is deleted on graceful shutdown
+(SIGINT / SIGTERM / `exit`).
+
+**Threat model note: operational metadata, not confidentiality.** The fields
+listed above are observable to root and to any process running inside the
+tenant's storage path (typically the same OS user that owns the tenant). A
+process that can read `runtime.json` can determine the tenant's pid, start
+time, and the `127.0.0.1` port the dashboard is listening on. None of these
+disclose tenant data, identity keys, or audit content. A locally-resident
+attacker with that level of access can already enumerate listening ports
+via `lsof` / `ss` and walk processes via `ps`, so `runtime.json` does not
+expand the local-attacker surface; it only makes the same information
+cheaper to read for legitimate Sanctuary tooling.
+
+A crashed process may leave a stale file; `sanctuary agents` and the
+multi-agent dashboard treat
 a tenant as running only when the `/api/health` probe actually answers.

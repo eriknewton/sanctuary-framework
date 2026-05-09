@@ -143,6 +143,24 @@ not cryptographically strong authentication: anyone with local read access can
 re-derive the key. The protection it provides is "the file cannot be copied off
 this machine and decrypted on another."
 
+> **Threat model warning.** The fallback-file derivation uses a machine-local
+> key from `hostname`, `uid`, `username`, and `home` directory. This is not
+> cryptographically strong authentication. Anyone with local read access to
+> the user's machine can re-derive the key and decrypt the fallback file.
+> Do NOT rely on fallback-file protection on multi-user machines with
+> untrusted local users, on shared CI runners, on snapshotted VMs whose
+> snapshot includes the home directory, or in any setting where a different
+> OS user on the same host could read the file. Use the OS keyring where
+> available (macOS Keychain, Linux Secret Service, Windows Credential
+> Manager). The fallback file exists so single-user machines without an OS
+> keyring still get encryption-at-rest, not so multi-user environments get
+> identity isolation.
+
+The source comment at `server/src/cocoon/passphrase.ts` (around the
+`deriveMachineKey` helper near line 518) cross-references this section so a
+future maintainer touching the derivation does not lose the threat-model
+context.
+
 ---
 
 ## Where the master key comes from

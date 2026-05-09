@@ -563,9 +563,14 @@ async function writeToFallbackFile(
 
 /**
  * Derive a machine-local key from hostname + uid + home path.
- * This is NOT cryptographically strong authentication — it only ensures that
+ * This is NOT cryptographically strong authentication, it only ensures that
  * the encrypted file cannot be read off a different machine. If an attacker
  * already has local access, they can trivially re-derive this.
+ *
+ * Threat model: see `server/docs/keychain-schema.md`, "Windows or
+ * no-OS-keyring fallback: encrypted file" section. The fallback file is
+ * intended for single-user machines without an OS keyring, NOT for
+ * multi-user machines, shared CI runners, or snapshotted VMs.
  */
 function deriveMachineKey(home: string): Uint8Array {
   const info = userInfo();

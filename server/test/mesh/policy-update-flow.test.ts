@@ -246,7 +246,7 @@ describe("mesh — policy_update distributed across three-mode mesh (§12 criter
     // but router drops at dispatch because event_type is in reserved namespace.
     const res = verifySignedEvent(v1xEvt, verifyCtx);
     expect(res.ok).toBe(true);
-    expect(res.unknown_extension_keys).toContain("cross_fortress_read_query");
+    expect(res.recognized_reserved_extension_keys).toContain("cross_fortress_read_query");
 
     const router = new MeshRouter();
     let handlerCalled = false;

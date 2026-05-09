@@ -108,7 +108,7 @@ describe("mesh/envelope — basic pack + verify round-trip", () => {
 
     const res = verifySignedEvent(evt, contextFor(f));
     expect(res.ok).toBe(true);
-    expect(res.unknown_extension_keys).toEqual([]);
+    expect(res.recognized_reserved_extension_keys).toEqual([]);
   });
 
   it("rejects envelope whose payload has been tampered after signing", () => {
@@ -238,7 +238,7 @@ describe("mesh/envelope — hard-gate reservations (§10.1, §10.3)", () => {
     };
     const res = verifySignedEvent(v1xEvt, contextFor(f));
     expect(res.ok).toBe(true);
-    expect(res.unknown_extension_keys).toContain("cross_fortress_read_query");
+    expect(res.recognized_reserved_extension_keys).toContain("cross_fortress_read_query");
   });
 
   it("signature validates across extension-envelope forward-compat boundary", () => {
