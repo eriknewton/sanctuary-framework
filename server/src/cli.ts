@@ -126,6 +126,14 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
+  if (args[0] === "intelligence") {
+    const { runIntelligenceCommand } = await import(
+      "./cli/intelligence.js"
+    );
+    const code = await runIntelligenceCommand({ argv: args.slice(1) });
+    process.exit(code);
+  }
+
   if (args[0] === "broker-server") {
     const { openBroker } = await import("./l3-disclosure/broker/open.js");
     const { createBrokerMcpServer } = await import("./mcp/broker-server.js");

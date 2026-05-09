@@ -1,21 +1,10 @@
 /**
- * Wrap fresh-fortress passphrase disclosure (Finding X / v1.1.3 hotfix).
+ * Wrap fresh-fortress passphrase disclosure (Finding X / v1.1.3, updated
+ * for v1.2.1 Finding GGG: plaintext backup file is now opt-in).
  *
- * Pre-fix: `sanctuary wrap` against a fresh fortress with no env-supplied
- * passphrase generated one via getOrCreatePassphrase(), persisted it to
- * the keychain (or fallback file), and never showed the value. The
- * operator had no off-host backup; keychain compromise + host loss =
- * fortress loss. Same trust-failure shape as Finding U on init.
- *
- * Coordinator decision B-1 (Review/Sanctuary/V1.1.3_Phase_0_Coordinator_Decision_2026-04-26.md):
- * disclose only on case 3 (passphraseSource === "generated"). Cases 1
- * (`--passphrase` flag) and 2 (`SANCTUARY_PASSPHRASE` env) skip disclosure;
- * the operator already holds the secret.
- *
- * These tests pin all three cases against runWrap end-to-end. The
- * disclosure helper is NOT mocked: writePassphraseBackupFile lands a
- * real file at the real path; the banner is intercepted by spying on
- * process.stderr.write.
+ * v1.2.1 change: by default, wrap does NOT write passphrase-backup.txt.
+ * The operator must pass --write-passphrase-backup <path> to get a plaintext
+ * file. Keychain-only is the default on macOS.
  */
 
 import {
@@ -43,7 +32,7 @@ import type { DashboardHandle } from "../../src/dashboard/index.js";
 
 const FIXTURE_GENERATED_PASSPHRASE = "drill-canonical-passphrase-test-fixture-001";
 
-describe("Wrap fresh-fortress passphrase disclosure (Finding X)", () => {
+describe("Wrap fresh-fortress passphrase disclosure (Finding X + GGG)", () => {
   let tmpHome: string;
   let tmpFortress: string;
   let originalHome: string | undefined;
@@ -118,76 +107,35 @@ describe("Wrap fresh-fortress passphrase disclosure (Finding X)", () => {
     };
   }
 
-  describe("case 3 (Sanctuary-generated passphrase)", () => {
-    it("prints the FULL passphrase in a banner with no truncation", async () => {
-      await runWrap(
-        { claudeCode: true, noOpen: true },
-        makeDeps("generated")
-      );
-      const printed = stderrWrites.join("");
-      expect(printed).toContain(FIXTURE_GENERATED_PASSPHRASE);
-      expect(printed).not.toContain("...");
-      expect(printed).toContain("SANCTUARY: First Run, Passphrase Generated");
-      expect(printed).toContain("SAVE THIS PASSPHRASE");
-    });
-
-    it("writes passphrase-backup.txt at mode 0600 with the full passphrase", async () => {
+  describe("case 3 (Sanctuary-generated passphrase) - v1.2.1 default: no backup file", () => {
+    it("does NOT write passphrase-backup.txt by default", async () => {
       await runWrap(
         { claudeCode: true, noOpen: true },
         makeDeps("generated")
       );
       const filePath = join(tmpFortress, PASSPHRASE_BACKUP_FILENAME);
-      const content = await readFile(filePath, "utf-8");
+      await expect(access(filePath)).rejects.toThrow();
+    });
+
+    it("prints Keychain-only guidance in the banner", async () => {
+      await runWrap(
+        { claudeCode: true, noOpen: true },
+        makeDeps("generated")
+      );
+      const printed = stderrWrites.join("");
+      expect(printed).toContain("Keychain");
+      expect(printed).toContain("export-passphrase");
+    });
+
+    it("writes passphrase-backup.txt when --write-passphrase-backup is specified", async () => {
+      const backupPath = join(tmpFortress, PASSPHRASE_BACKUP_FILENAME);
+      await mkdir(tmpFortress, { recursive: true, mode: 0o700 });
+      await runWrap(
+        { claudeCode: true, noOpen: true, writePassphraseBackup: backupPath },
+        makeDeps("generated")
+      );
+      const content = await readFile(backupPath, "utf-8");
       expect(content).toContain(FIXTURE_GENERATED_PASSPHRASE);
-      expect(content).toContain(
-        "DO NOT COMMIT, DO NOT EMAIL, MOVE OFF-HOST IMMEDIATELY"
-      );
-      expect(content).toContain("Fortress:");
-      expect(content).toContain(
-        "Sanctuary will NOT regenerate this file"
-      );
-      const st = await stat(filePath);
-      expect(st.mode & 0o777).toBe(0o600);
-    });
-
-    it("includes the passphrase-backup.txt path in the banner", async () => {
-      await runWrap(
-        { claudeCode: true, noOpen: true },
-        makeDeps("generated")
-      );
-      const printed = stderrWrites.join("");
-      expect(printed).toContain(PASSPHRASE_BACKUP_FILENAME);
-      expect(printed).toContain("Move it off-host");
-    });
-
-    it("never overwrites an existing passphrase-backup.txt (single-issuance)", async () => {
-      // First wrap creates the file.
-      await runWrap(
-        { claudeCode: true, noOpen: true },
-        makeDeps("generated")
-      );
-      const filePath = join(tmpFortress, PASSPHRASE_BACKUP_FILENAME);
-      const firstContent = await readFile(filePath, "utf-8");
-
-      // Second wrap (simulating re-run) must NOT overwrite the file even if
-      // the generated passphrase differs.
-      stderrWrites.length = 0;
-      const secondDeps = {
-        ...makeDeps("generated"),
-        resolvePassphrase: async () => ({
-          value: "DIFFERENT-passphrase-must-not-clobber-the-first",
-          location: "test-keychain",
-          source: "generated",
-        }),
-      };
-      await runWrap({ claudeCode: true, noOpen: true }, secondDeps);
-
-      const secondContent = await readFile(filePath, "utf-8");
-      expect(secondContent).toBe(firstContent);
-      expect(secondContent).not.toContain(
-        "DIFFERENT-passphrase-must-not-clobber-the-first"
-      );
-      expect(secondContent).toContain(FIXTURE_GENERATED_PASSPHRASE);
     });
   });
 
@@ -196,7 +144,6 @@ describe("Wrap fresh-fortress passphrase disclosure (Finding X)", () => {
       process.env.SANCTUARY_PASSPHRASE = "operator-supplied-via-env";
       await runWrap(
         { claudeCode: true, noOpen: true },
-        // resolvePassphrase is unused on the env path; pass a stub anyway.
         makeDeps("env")
       );
       const filePath = join(tmpFortress, PASSPHRASE_BACKUP_FILENAME);

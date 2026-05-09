@@ -23,7 +23,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && node scripts/copy-templates.js",
     "dev": "tsup --watch",
     "start": "node dist/cli.js",
     "test": "vitest run",

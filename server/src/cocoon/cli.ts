@@ -139,6 +139,13 @@ export interface WrapOptions {
    * wraps omit it and use the npx default unchanged.
    */
   devDist?: string;
+  /**
+   * Opt-in plaintext passphrase backup file path. When set, writes the
+   * generated passphrase to this file at mode 0600. Default behavior
+   * (unset): Keychain-only, no plaintext file on disk. v1.2.1 change:
+   * previously wrap wrote passphrase-backup.txt by default.
+   */
+  writePassphraseBackup?: string;
 }
 
 /** Backward-compat alias for the old `parseCocoonArgs` return type. */
@@ -486,38 +493,40 @@ export async function runWrap(
   // above (honours SANCTUARY_STORAGE_PATH for multi-agent hosts).
   await mkdir(storagePath, { recursive: true, mode: 0o700 });
 
-  // v1.1.3 hotfix (Finding X): when Sanctuary generated the passphrase
-  // itself (case 3 in the source/value resolution above), the operator has
-  // no off-host backup. Disclose it the same way `sanctuary init` discloses
-  // a recovery key: full passphrase in stderr banner + plaintext written to
-  // <fortress>/passphrase-backup.txt at mode 0600 with off-host stash
-  // instructions, single-issuance. Cases 1 (--passphrase flag) and 2
-  // (SANCTUARY_PASSPHRASE env) skip disclosure: the operator already holds
-  // the secret. Mirrors the v1.1.1 init disclosure shape under coordinator
-  // decision B-1 (Review/Sanctuary/V1.1.3_Phase_0_Coordinator_Decision_2026-04-26.md).
+  // v1.2.1 (Finding GGG): plaintext passphrase backup file is now opt-in.
+  // Default: Keychain-only on macOS. The plaintext file is written ONLY when
+  // --write-passphrase-backup <path> is supplied. The stderr banner still
+  // prints so the operator sees the passphrase once.
   if (passphraseSource === "generated" && passphraseValue !== undefined) {
-    try {
-      await disclosePassphrase({
-        passphrase: passphraseValue,
-        storagePath,
-        fortressId: fortressIdFromStoragePath(storagePath),
-        // --no-open (CI / scripted) or non-TTY stdin both skip the prompt
-        // the same way init's --no-confirm does. Operator who scripted the
-        // call still gets the banner + the file; they will not see a hang.
-        mode:
-          options.noOpen || process.stdin.isTTY !== true
-            ? "no-confirm"
-            : "interactive",
-      });
-    } catch (err) {
-      if (
-        err instanceof PassphraseConfirmationDeclinedError ||
-        err instanceof PassphraseConfirmationNonInteractiveError
-      ) {
-        console.error(`\n  Sanctuary wrap: ${err.message}\n`);
-        process.exit(2);
+    if (options.writePassphraseBackup) {
+      try {
+        await disclosePassphrase({
+          passphrase: passphraseValue,
+          storagePath: dirname(options.writePassphraseBackup),
+          fortressId: fortressIdFromStoragePath(storagePath),
+          mode:
+            options.noOpen || process.stdin.isTTY !== true
+              ? "no-confirm"
+              : "interactive",
+        });
+      } catch (err) {
+        if (
+          err instanceof PassphraseConfirmationDeclinedError ||
+          err instanceof PassphraseConfirmationNonInteractiveError
+        ) {
+          console.error(`\n  Sanctuary wrap: ${err.message}\n`);
+          process.exit(2);
+        }
+        throw err;
       }
-      throw err;
+    } else {
+      // Keychain-only: print the passphrase banner to stderr but do NOT
+      // write a plaintext file to disk.
+      process.stderr.write(
+        `\n  Passphrase stored in macOS Keychain.` +
+        `\n  Run 'sanctuary export-passphrase' to retrieve it.` +
+        `\n  To write a plaintext backup: sanctuary wrap ... --write-passphrase-backup <path>\n`,
+      );
     }
   }
 
@@ -693,6 +702,11 @@ export async function runWrap(
     return;
   }
 
+  // v1.2.1 (Finding III): track intelligence subsystem health for the
+  // success banner. Updated below when the substrate selector loads.
+  let intelligenceHealthy: boolean | undefined;
+  let intelligenceError: string | undefined;
+
   // Start the dashboard in-process.
   const authToken = generateAuthToken();
   const startFn: DashboardStarter =
@@ -731,9 +745,9 @@ export async function runWrap(
   // the activity feed projection reads the same audit log the MCP server
   // writes once it boots.
   //
-  // IdentityManager.load() is intentionally NOT called: at wrap time the
-  // cocoon may have no identities (created by the MCP server later); the
-  // fortress-id fallback covers the empty case for the hub binding.
+  // v1.2.1 (Finding NNN): create a default identity at wrap time so
+  // `sanctuary exit export` works immediately. IdentityManager.load()
+  // is called to check if an identity already exists before creating.
   // Reset-history continuity (v1.0.2 item a) is also not consumed here;
   // the next caller (MCP-server-boot or sanctuary dashboard standalone)
   // handles it on first cocoon-unlock as before.
@@ -764,6 +778,34 @@ export async function runWrap(
         );
       }
       const wrapAuditLog = new AuditLog(v11Storage, derived.key);
+
+      // v1.2.1 (Finding NNN): auto-create default identity at wrap time.
+      try {
+        const { IdentityManager } = await import("../l1-cognitive/tools.js");
+        const { createIdentity } = await import("../core/identity.js");
+        const { derivePurposeKey } = await import("../core/key-derivation.js");
+        const identityMgr = new IdentityManager(v11Storage, derived.key);
+        const loadResult = await identityMgr.load();
+        if (loadResult.loaded === 0) {
+          const identityEncKey = derivePurposeKey(derived.key, "identity-encryption");
+          const { storedIdentity, publicIdentity } = createIdentity(
+            "default",
+            identityEncKey,
+            "passphrase",
+          );
+          await identityMgr.save(storedIdentity);
+          wrapAuditLog.append("l1", "identity_create", publicIdentity.identity_id, {
+            label: "default",
+            source: "wrap-auto",
+          });
+        }
+      } catch (err) {
+        console.error(
+          `  Note: default identity not created at wrap time ` +
+            `(${(err as Error).message}).`,
+        );
+      }
+
       // WP-V1.2-5: construct + load the Intelligence Substrate Selector
       // against the wrap-auto fortress. The selector reads / writes its
       // config under the fortress storage namespace `_intelligence`,
@@ -777,7 +819,10 @@ export async function runWrap(
           identityId: `fortress:${storagePath}`,
         });
         await wrapIntelligenceSelector.load();
+        intelligenceHealthy = true;
       } catch (err) {
+        intelligenceHealthy = false;
+        intelligenceError = (err as Error).message;
         console.error(
           `  Note: Intelligence panel unavailable on wrap URL ` +
             `(${(err as Error).message}).`,
@@ -870,6 +915,8 @@ export async function runWrap(
     browserOpened: !options.noOpen,
     passphraseLocation,
     passphraseSource,
+    intelligenceHealthy,
+    intelligenceError,
   });
 }
 
@@ -961,6 +1008,8 @@ interface WrapSuccessInfo {
   browserOpened: boolean;
   passphraseLocation: string;
   passphraseSource: string;
+  intelligenceHealthy?: boolean;
+  intelligenceError?: string;
 }
 
 export function formatWrapSuccess(info: WrapSuccessInfo): string {
@@ -986,7 +1035,17 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
     lines.push(`  ${d("(browser auto-open suppressed)")}`);
   }
   lines.push("");
-  lines.push(`  ${b("Your agent is protected.")} L1 Full / L2 Degraded (no TEE) / L3 Full / L4 Full.`);
+  const l2Status = info.intelligenceHealthy === false
+    ? "L2 Degraded (intelligence disabled)"
+    : "L2 Degraded (no TEE)";
+  lines.push(`  ${b("Your agent is protected.")} L1 Full / ${l2Status} / L3 Full / L4 Full.`);
+  if (info.intelligenceHealthy === false && info.intelligenceError) {
+    const w = (s: string) => `\x1b[33m${s}\x1b[0m`; // yellow
+    lines.push("");
+    lines.push(`  ${w("\u26A0")} L2 intelligence disabled: ${info.intelligenceError}`);
+    lines.push(`    Concierge chat and substrate-driven explanations will not work until this is resolved.`);
+    lines.push(`    Run 'sanctuary intelligence diagnose' to inspect substrate config.`);
+  }
   lines.push("");
   return lines.join("\n");
 }
@@ -1002,6 +1061,8 @@ interface WrapSuccessNoDashboardInfo {
   serverCount: number;
   passphraseLocation: string;
   passphraseSource: string;
+  intelligenceHealthy?: boolean;
+  intelligenceError?: string;
 }
 
 /**
@@ -1031,9 +1092,18 @@ export function formatWrapSuccessNoDashboard(
     `  ${d("Dashboard spawn skipped per --no-dashboard. Run `sanctuary dashboard` separately for a persistent dashboard.")}`,
   );
   lines.push("");
+  const l2Status = info.intelligenceHealthy === false
+    ? "L2 Degraded (intelligence disabled)"
+    : "L2 Degraded (no TEE)";
   lines.push(
-    `  ${b("Your agent is protected.")} L1 Full / L2 Degraded (no TEE) / L3 Full / L4 Full.`,
+    `  ${b("Your agent is protected.")} L1 Full / ${l2Status} / L3 Full / L4 Full.`,
   );
+  if (info.intelligenceHealthy === false && info.intelligenceError) {
+    const w = (s: string) => `\x1b[33m${s}\x1b[0m`;
+    lines.push("");
+    lines.push(`  ${w("\u26A0")} L2 intelligence disabled: ${info.intelligenceError}`);
+    lines.push(`    Run 'sanctuary intelligence diagnose' to inspect substrate config.`);
+  }
   lines.push("");
   return lines.join("\n");
 }
@@ -1302,11 +1372,59 @@ function rawConfigContainsSanctuary(
 
 // ── CLI argument parser ─────────────────────────────────────────────
 
+/** Known flags that take a value argument (the next argv element). */
+const WRAP_VALUE_FLAGS = new Set([
+  "--wrap",
+  "--passphrase",
+  "--port",
+  "--fortress",
+  "--dev-dist",
+  "--write-passphrase-backup",
+]);
+
+/** Known boolean flags. */
+const WRAP_BOOLEAN_FLAGS = new Set([
+  "--openclaw",
+  "--hermes",
+  "--claude-code",
+  "--cursor",
+  "--cline",
+  "--unwrap",
+  "--dry-run",
+  "--no-open",
+  "--no-dashboard",
+  "--help",
+  "-h",
+]);
+
+/** Known harness flags (for "did you mean" suggestions). */
+const WRAP_HARNESS_FLAGS = ["--openclaw", "--hermes", "--claude-code", "--cursor", "--cline"];
+
 export function parseWrapArgs(argv: string[]): WrapOptions {
   const options: WrapOptions = {};
 
   for (let i = 0; i < argv.length; i++) {
-    switch (argv[i]) {
+    const arg = argv[i]!;
+
+    // Reject unknown positional arguments
+    if (!arg.startsWith("-")) {
+      const suggestion = WRAP_HARNESS_FLAGS.find(
+        (f) => f.replace(/^--/, "") === arg,
+      );
+      const hint = suggestion ? ` Did you mean ${suggestion}?` : "";
+      throw new Error(
+        `Unrecognized argument '${arg}'.${hint} Run 'sanctuary wrap --help' for valid flags.`,
+      );
+    }
+
+    // Reject unknown flags
+    if (!WRAP_BOOLEAN_FLAGS.has(arg) && !WRAP_VALUE_FLAGS.has(arg)) {
+      throw new Error(
+        `Unrecognized flag '${arg}'. Run 'sanctuary wrap --help' for valid flags.`,
+      );
+    }
+
+    switch (arg) {
       case "--wrap":
         options.wrap = argv[++i];
         break;
@@ -1348,6 +1466,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--dev-dist":
         options.devDist = argv[++i];
+        break;
+      case "--write-passphrase-backup":
+        options.writePassphraseBackup = argv[++i];
         break;
       case "--help":
       case "-h":

@@ -18,7 +18,7 @@ import { loadPrincipalPolicy } from "../principal-policy/loader.js";
 import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
 import { bytesToString, fromBase64url, stringToBytes } from "../core/encoding.js";
 import { exportExitBundle, importExitBundle, exitBundleManifestShape } from "./bundle.js";
-import { verifyExitBundle } from "./verifier.js";
+import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
 
 export interface ExitCommandArgs {
   argv: string[];
@@ -192,12 +192,21 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         write(err, "Usage: sanctuary exit verify <dir>\n");
         return 2;
       }
-      const result = await verifyExitBundle(dir, {
-        acceptUnverifiableAttestations: hasFlag(
-          argv,
-          "--accept-unverifiable-attestations"
-        ),
-      });
+      let result;
+      try {
+        result = await verifyExitBundle(dir, {
+          acceptUnverifiableAttestations: hasFlag(
+            argv,
+            "--accept-unverifiable-attestations"
+          ),
+        });
+      } catch (e) {
+        if (e instanceof InvalidExitBundleError) {
+          write(err, `Error: ${e.message}\n`);
+          return 1;
+        }
+        throw e;
+      }
       if (json) {
         write(out, JSON.stringify(result, null, 2) + "\n");
       } else {
@@ -308,21 +317,30 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         write(err, "--conflict must be skip, overwrite, or version\n");
         return 2;
       }
-      const result = await importExitBundle({
-        bundleDir: dir,
-        storage: ctx.storage,
-        masterKey: ctx.masterKey,
-        identityManager: ctx.identityManager,
-        auditLog: ctx.auditLog,
-        reputationStore: ctx.reputationStore,
-        activate,
-        forceRebind,
-        acceptUnverifiableAttestations,
-        conflictResolution: conflict,
-        sourcePassphrase: flagValue(argv, "--source-passphrase"),
-        sourceRecoveryKey: flagValue(argv, "--source-recovery-key"),
-        destinationSignerIdentityId: flagValue(argv, "--destination-identity-id"),
-      });
+      let result;
+      try {
+        result = await importExitBundle({
+          bundleDir: dir,
+          storage: ctx.storage,
+          masterKey: ctx.masterKey,
+          identityManager: ctx.identityManager,
+          auditLog: ctx.auditLog,
+          reputationStore: ctx.reputationStore,
+          activate,
+          forceRebind,
+          acceptUnverifiableAttestations,
+          conflictResolution: conflict,
+          sourcePassphrase: flagValue(argv, "--source-passphrase"),
+          sourceRecoveryKey: flagValue(argv, "--source-recovery-key"),
+          destinationSignerIdentityId: flagValue(argv, "--destination-identity-id"),
+        });
+      } catch (e) {
+        if (e instanceof InvalidExitBundleError) {
+          write(err, `Error: ${e.message}\n`);
+          return 1;
+        }
+        throw e;
+      }
       if (json) write(out, JSON.stringify(result, null, 2) + "\n");
       else {
         write(out, `verified: ${result.verified}\n`);
