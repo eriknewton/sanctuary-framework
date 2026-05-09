@@ -80,6 +80,28 @@ export interface ResetPassphraseArgs {
     cmd: string,
     args: string[]
   ) => Promise<{ stdout: string; stderr: string; code: number | null }>;
+  /**
+   * Optional buffers holding key material the caller wants zeroed before this
+   * command returns. Each entry has `.fill(0)` applied in a `finally` block,
+   * including on early aborts. Production v1.x reset paths hold no key
+   * material in this CLI module; the hook exists so future recovery-share
+   * reconstruction (path (a)) and any caller that constructs the command
+   * with a pre-decoded passphrase Buffer cannot forget to zeroize.
+   *
+   * JS strings are immutable in V8 and cannot be zeroed; route key material
+   * through Buffer / Uint8Array, place it on this list, and the buffer will
+   * be cleared post-use. See `runNukePath` doc block for the full threat
+   * model.
+   */
+  keyMaterialToZeroize?: Array<Buffer | Uint8Array>;
+  /**
+   * Override for `process.exit`. The `--exit-on-completion` flag calls this
+   * with code 0 after a successful nuke to limit the post-nuke window an
+   * attacker-on-host with heap-dump access could exploit. Tests inject a
+   * spy so the test process does not actually exit; production passes
+   * `process.exit`.
+   */
+  exitProcess?: (code: number) => void;
 }
 
 interface ModeAvailability {
@@ -92,6 +114,7 @@ interface ParsedArgs {
   mode?: RecoveryMode;
   storage?: string;
   fortress?: string;
+  exitOnCompletion: boolean;
   help: boolean;
 }
 
@@ -137,38 +160,60 @@ export async function runResetPassphraseCommand(
   // Tests pass a pre-loaded Readable; production hands process.stdin which
   // stays open for the duration of the command.
   const lines = new LineReader(stdin);
+  let code = 1;
+  let nukeSucceeded = false;
   try {
     const availability = await surveyAvailableModes(storagePath);
     const mode = parsed.mode ?? (await selectMode(lines, out, err, availability));
     if (!mode) {
       err.write("Aborted: no recovery mode selected.\n");
-      return 1;
+      code = 1;
+    } else if (mode === "shares") {
+      code = await runSharesPath(out, err, availability);
+    } else if (mode === "guardian") {
+      code = await runGuardianPath(out, err, availability);
+    } else {
+      code = await runNukePath({
+        out,
+        err,
+        lines,
+        storagePath,
+        home,
+        plat,
+        exec: args.exec ?? defaultExec,
+      });
+      nukeSucceeded = mode === "nuke" && code === 0;
     }
-
-    if (mode === "shares") {
-      return await runSharesPath(out, err, availability);
-    }
-    if (mode === "guardian") {
-      return await runGuardianPath(out, err, availability);
-    }
-    return await runNukePath({
-      out,
-      err,
-      lines,
-      storagePath,
-      home,
-      plat,
-      exec: args.exec ?? defaultExec,
-    });
   } finally {
+    // Zeroize any caller-supplied key-material buffers regardless of which
+    // path we took or whether it succeeded. JS strings on the heap remain
+    // immutable and cannot be cleared; callers MUST pass key material as
+    // Buffer / Uint8Array on `keyMaterialToZeroize` for this hook to do
+    // anything. Order matters: run AFTER the recovery path returns, BEFORE
+    // the readline interface closes (so a buffer that was decrypted
+    // mid-prompt and not yet consumed still gets zeroed on early abort),
+    // and BEFORE any --exit-on-completion process.exit() so the heap is
+    // wiped before the kernel reaps the address space.
+    zeroizeBuffers(args.keyMaterialToZeroize);
     lines.close();
   }
+
+  // --exit-on-completion: bound the heap-dump window for extreme threat
+  // models. Only fires after a successful nuke; aborts and degraded-shares
+  // / degraded-guardian returns leave the shell intact for re-run. The
+  // `finally` block above has already zeroed any caller-supplied buffers;
+  // process.exit reaps everything else.
+  if (parsed.exitOnCompletion && nukeSucceeded) {
+    const doExit = args.exitProcess ?? ((c: number) => process.exit(c));
+    doExit(0);
+  }
+  return code;
 }
 
 // ── Argument parsing ────────────────────────────────────────────────
 
 function parseArgs(argv: string[]): ParsedArgs {
-  const out: ParsedArgs = { help: false };
+  const out: ParsedArgs = { exitOnCompletion: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--help" || a === "-h") {
@@ -185,6 +230,8 @@ function parseArgs(argv: string[]): ParsedArgs {
       out.storage = argv[++i];
     } else if (a === "--fortress" && argv[i + 1]) {
       out.fortress = argv[++i];
+    } else if (a === "--exit-on-completion") {
+      out.exitOnCompletion = true;
     } else if (a && a.startsWith("--")) {
       throw new Error(`Unknown flag: ${a}`);
     }
@@ -218,6 +265,16 @@ Options:
   --fortress <path>               Override the fortress storage path.
                                   Consistent with "sanctuary wrap --fortress".
   --storage <path>                Alias for --fortress.
+  --exit-on-completion            After a successful nuke, call process.exit(0)
+                                  immediately so the post-wipe heap is reaped
+                                  by the OS without re-entering the shell. Use
+                                  on extreme-threat-model deployments where an
+                                  attacker-on-host with heap-dump access could
+                                  recover residual passphrase or key bytes
+                                  between the wipe and the next operator
+                                  command. JS strings cannot be explicitly
+                                  zeroed; this flag is the supported way to
+                                  bound the heap-dump window.
   --help, -h                      Show this help.
 
 Without --mode, the command surveys which paths are operationally available
@@ -351,6 +408,53 @@ interface NukeContext {
   ) => Promise<{ stdout: string; stderr: string; code: number | null }>;
 }
 
+/**
+ * Nuke-path memory-hygiene threat model
+ * --------------------------------------
+ *
+ * Adversary: an attacker-on-host with the ability to capture a heap dump of
+ * this Node.js process between the moment `wipeStorage()` returns and the
+ * moment the process exits or is reaped. Such an adversary could potentially
+ * recover residual passphrase or key bytes that lived in the V8 heap before
+ * the wipe ran.
+ *
+ * Defenses in this path:
+ *
+ *   1. Buffers and Uint8Arrays holding key material are zeroed via
+ *      `Buffer.fill(0)` / `Uint8Array.fill(0)` AFTER their last legitimate
+ *      use and BEFORE this function returns. The current v1.x nuke flow
+ *      holds NO such buffers itself: keychain entries are deleted via
+ *      `security delete-generic-password` (which never reads the value),
+ *      and the encrypted `passphrase.enc` file is removed by `wipeStorage`
+ *      without being decrypted. The `zeroizeBuffers` helper at the bottom
+ *      of this module is the structural hook for any future code path that
+ *      DOES decrypt or fetch key material in the nuke flow.
+ *
+ *   2. JS strings (UTF-16 in V8) cannot be explicitly zeroed in user-space:
+ *      they are immutable, GC-managed, and may be string-interned or copied
+ *      by the runtime. Any passphrase that flows through this command as a
+ *      `string` will linger on the heap until V8 reclaims its slot. Callers
+ *      that require mem-hygiene MUST route key material through Buffer or
+ *      Uint8Array (and put those on `args.keyMaterialToZeroize`) rather than
+ *      as `string`.
+ *
+ *   3. The `--exit-on-completion` flag, when set, calls `process.exit(0)`
+ *      immediately after the wipe summary prints. This is the supported
+ *      mitigation for the string-immutability gap: the kernel reclaims the
+ *      whole address space, so any residual heap bytes (string or otherwise)
+ *      become unreachable to a heap-dump attacker who races the OS reaper.
+ *      It is opt-in because operators on standard threat models prefer the
+ *      shell to return normally so they can immediately run `sanctuary wrap`.
+ *
+ * Out of scope (longer-term hardening):
+ *
+ *   - WASM-backed zeroizer that mlock()s a page, holds key material there,
+ *     and sodium_memzero()s on drop. Tracked for v1.x security hardening.
+ *   - End-to-end heap-dump test that captures the process heap mid-flight
+ *     and asserts no key material is present. Documented in PR body as
+ *     verified by code review and unit test of the buffer-zero path; full
+ *     heap-dump test deferred.
+ */
 async function runNukePath(ctx: NukeContext): Promise<number> {
   const fortressName = basename(ctx.storagePath) || "sanctuary";
 
@@ -650,6 +754,32 @@ class LineReader {
       this.rl.close();
     } catch {
       // Already closed.
+    }
+  }
+}
+
+/**
+ * Zero each Buffer / Uint8Array in `buffers`. Safe on `undefined`, an empty
+ * list, and individual `undefined` entries: callers can pass a sparse list
+ * without checking. Errors during `.fill(0)` (e.g., a detached / shared
+ * buffer view) are swallowed: best-effort hygiene must not throw and abort
+ * a command's `finally` cleanup. See the `runNukePath` threat-model block
+ * for the full motivation and limitations (V8 string immutability is out
+ * of reach of this helper).
+ *
+ * Exported so tests can verify the zeroize semantics directly without
+ * driving a full nuke flow.
+ */
+export function zeroizeBuffers(
+  buffers: ReadonlyArray<Buffer | Uint8Array | undefined> | undefined
+): void {
+  if (!buffers) return;
+  for (const b of buffers) {
+    if (!b) continue;
+    try {
+      b.fill(0);
+    } catch {
+      // Detached / shared / read-only view; best-effort.
     }
   }
 }

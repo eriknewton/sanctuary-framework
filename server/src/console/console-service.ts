@@ -9,7 +9,12 @@
 
 import type { ServerResponse } from "node:http";
 import type { BadgeState } from "../attestation/types.js";
-import { getAgentBadge } from "../attestation/attestation-service.js";
+import {
+  getAgentBadge,
+  resetScopeRetryState,
+  type AttestationRetryStateResetEvent,
+  type ResetScopeRetryStateResult,
+} from "../attestation/attestation-service.js";
 import {
   applyChannelTemplate,
 } from "../policy-engine/channel-templates.js";
@@ -130,6 +135,32 @@ export class ConsoleService {
       );
     }
     return getAgentBadge(agentId);
+  }
+
+  /**
+   * Reset the in-process retry state for an agent's badge scope. Operator
+   * runs this after fixing the underlying cause that produced verification
+   * failures so the next attestation call fires immediately rather than
+   * waiting on the exponential-backoff window or cached-badge expiry.
+   *
+   * The matching scope id mirrors `getAgentBadge` (`agent-badge-<id>`).
+   * Audit emission is via the same SSE channel the dashboard already uses
+   * for badge updates, so connected operators see the reset event in real
+   * time.
+   */
+  resetAgentRetryState(agentId: string): ResetScopeRetryStateResult {
+    if (!agentId || typeof agentId !== "string" || agentId.trim() === "") {
+      throw new ApiRouteError(
+        "/api/console/agents/retry-reset",
+        "agent_id is required and must be a non-empty string"
+      );
+    }
+    const scopeId = `agent-badge-${agentId.trim()}`;
+    return resetScopeRetryState(scopeId, {
+      auditSink: (event: AttestationRetryStateResetEvent): void => {
+        this.sseStream.broadcastNamed("attestation_retry_state_reset", event);
+      },
+    });
   }
 
   // ── Policy editor view ──────────────────────────────────────────────

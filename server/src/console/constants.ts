@@ -79,6 +79,7 @@ export const API_ROUTES = {
   // Agent roster view
   AGENT_LIST: "/api/console/agents",
   AGENT_BADGE: "/api/console/agents/badge",
+  AGENT_RETRY_RESET: "/api/console/agents/retry-reset",
 
   // Policy editor view
   POLICY_COMPILE: "/api/console/policy/compile",

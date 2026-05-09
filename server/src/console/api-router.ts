@@ -142,6 +142,21 @@ export async function handleConsoleRoute(
     return true;
   }
 
+  // Operator-triggered retry-state reset for a stuck red badge. Body:
+  // `{ "agent_id": "<id>" }`. Returns the reset result so the dashboard
+  // can flip the local UI immediately; the broadcast SSE event covers
+  // any other connected dashboard tabs.
+  if (method === "POST" && path === API_ROUTES.AGENT_RETRY_RESET) {
+    try {
+      const body = await readJSONBody<{ agent_id?: string }>(req);
+      const result = deps.service.resetAgentRetryState(body.agent_id ?? "");
+      writeJSON(res, 200, { ok: true, data: result });
+    } catch (err) {
+      handleError(res, err);
+    }
+    return true;
+  }
+
   // ── Policy editor ─────────────────────────────────────────────────
   if (method === "GET" && path === API_ROUTES.POLICY_TEMPLATES) {
     try {
