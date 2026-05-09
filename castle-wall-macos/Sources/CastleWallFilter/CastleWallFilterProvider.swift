@@ -184,6 +184,12 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
     /// Translate an `EvaluationOutcome` to the framework verdict. Public
     /// for unit-test assertions; the test target compares verdicts via
     /// the EvaluationOutcome shape directly when feasible.
+    ///
+    /// Note: `NEFilterNewFlowVerdict.needRules()` is iOS-only. On macOS
+    /// the deferred-decision API is `pause()` paired with a later
+    /// `resumeFlow(_:with:)` once the operator decision lands. Phase 1
+    /// returns `pause()` for uncertain flows; the resume path lands in
+    /// Alpha-4 with the operator-approval IPC return wiring.
     public static func verdict(for outcome: EvaluationOutcome) -> NEFilterNewFlowVerdict {
         switch outcome {
         case .allow:
@@ -191,18 +197,23 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
         case .drop:
             return NEFilterNewFlowVerdict.drop()
         case .uncertain:
-            return NEFilterNewFlowVerdict.needRules()
+            return NEFilterNewFlowVerdict.pause()
         }
     }
 
     /// Extract the substrate the evaluator needs from the framework flow.
     /// Returns `nil` for flow shapes Phase 1 does not yet handle (browser
     /// flows fold into Alpha-3 alongside the DoH / DoT Tier B coverage).
+    ///
+    /// Source-app attribution: macOS exposes
+    /// `sourceAppSigningIdentifier` (TeamID.BundleID format) instead of
+    /// the iOS `sourceAppIdentifier`. The agent resolver maps that
+    /// signing identifier to a Sanctuary `(agentId, templateId)` pair.
     public func makeDescriptor(from flow: NEFilterFlow) -> FilterFlowDescriptor? {
         guard let socketFlow = flow as? NEFilterSocketFlow else {
             return nil
         }
-        let sourceAppId = flow.sourceAppIdentifier ?? "unknown"
+        let sourceAppId = flow.sourceAppSigningIdentifier ?? "unknown"
         let agent = agentResolver(sourceAppId)
 
         let host: String? = socketFlow.remoteHostname
