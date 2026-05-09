@@ -220,7 +220,7 @@ export async function discoverTenants(
     // Skip files, hidden dirs, and the "state" / "backup" / etc. directories
     // that belong to the *default* tenant so we don't double-count them.
     if (child.startsWith(".")) continue;
-    if (child === "state" || child === "backup" || child === "config") continue;
+    if (child === "state" || child === "backup" || child === "config" || child === "default") continue;
     const s = await stat(childPath).catch(() => null);
     if (!s || !s.isDirectory()) continue;
     const desc = await describeTenant(child, childPath, home);
@@ -233,6 +233,20 @@ export async function discoverTenants(
     if (tenants.some((t) => t.storage_path === extra)) continue;
     const desc = await describeTenant(basename(extra), extra, home);
     if (desc) tenants.push(desc);
+  }
+
+  // Warn on duplicate tenant names (defensive against extras or future collision classes).
+  const seen = new Map<string, number>();
+  for (const t of tenants) {
+    seen.set(t.name, (seen.get(t.name) ?? 0) + 1);
+  }
+  for (const [name, count] of seen) {
+    if (count > 1) {
+      console.error(
+        `[sanctuary] warning: ${count} tenants share the name "${name}". ` +
+          `Use --tenant with a unique name or storage path to disambiguate.`
+      );
+    }
   }
 
   tenants.sort((a, b) => {

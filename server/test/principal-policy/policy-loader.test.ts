@@ -67,17 +67,21 @@ version: 1 # policy version
 tier1_always_approve:
   - state_export   # dangerous!
   - identity_rotate
+approval_channel:
+  type: stderr
 `;
       const policy = parsePolicy(yaml);
       expect(policy.version).toBe(1);
       expect(policy.tier1_always_approve).toEqual(["state_export", "identity_rotate"]);
     });
 
-    it("fills missing fields with defaults", () => {
+    it("fills optional fields with defaults when required keys present", () => {
       const yaml = `
 version: 2
 tier1_always_approve:
   - state_export
+approval_channel:
+  type: stderr
 `;
       const policy = parsePolicy(yaml);
 
@@ -88,7 +92,7 @@ tier1_always_approve:
       expect(policy.tier2_anomaly.max_signs_per_minute).toBe(10);
       // Tier 3 should have defaults
       expect(policy.tier3_always_allow).toEqual(DEFAULT_POLICY.tier3_always_allow);
-      // SEC-002: auto_deny is stripped — always undefined
+      // SEC-002: auto_deny is stripped -- always undefined
       expect(policy.approval_channel.auto_deny).toBeUndefined();
     });
   });
