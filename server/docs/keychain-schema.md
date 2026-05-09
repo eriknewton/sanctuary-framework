@@ -380,20 +380,17 @@ because doing so would permanently destroy the original encrypted material.
 The remediation path is restoring the matching backup or, if the data is
 not recoverable, wiping the tenant directory and re-wrapping.
 
-## Real-backend CI exercise
+## Real-backend integration test
 
-The Linux Secret Service backend is exercised end-to-end in CI via the
-`Keychain Linux Real-Backend Integration` workflow at
-`.github/workflows/keychain-linux-real-backend.yml`. The job uses
-`dbus-run-session` plus a daemonized `gnome-keyring-daemon` to create an
-isolated session bus and verifies round-trip save/load against the real
-`secret-tool` CLI. Mock coverage in
-`server/test/keychain-linux-secret-service.test.ts` remains authoritative
-for unit-level behavior; the real-backend job catches regressions in the
-shell-out shape (binary path, exit-code semantics, stdin handling,
-attribute serialization) that mocks cannot see.
+The Linux Secret Service backend has an integration test file at
+`server/test/keychain-linux-real-backend-integration.test.ts` that
+exercises the production `secret-tool` shell-out against a live
+`gnome-keyring-daemon`. The file is gated by `describe.skipIf` so it
+skips cleanly on macOS, Windows, and any Linux host without
+`secret-tool` or `DBUS_SESSION_BUS_ADDRESS` set. Developers running
+`npm test` on macOS see the file as a skipped suite, not a failure.
 
-Test cases covered by the integration job:
+Test cases covered:
 
 1. Round-trip via `getOrCreatePassphrase` (generate then read back).
 2. Round-trip via `persistUserProvidedPassphrase` plus `readStoredPassphrase`.
@@ -404,7 +401,28 @@ Test cases covered by the integration job:
    suppressed (verifies invariant 5: fail-closed-but-encrypted, not silent
    plaintext).
 
-The integration test file is gated by `describe.skipIf` so it skips cleanly
-on macOS and Windows runners and on Linux hosts without `secret-tool` or a
-session bus. Developers running `npm test` on macOS see the file as a
-skipped suite, not a failure.
+To exercise the test on a real Linux desktop session:
+
+```sh
+# Inside any libsecret-compatible session (gnome-shell, KDE Plasma, etc.)
+cd server && npm test -- keychain-linux-real-backend-integration
+```
+
+A `Keychain Linux Real-Backend Integration` workflow exists at
+`.github/workflows/keychain-linux-real-backend.yml` but is registered
+with `workflow_dispatch` only (manual trigger). Four CI attempts on
+2026-05-09 confirmed that gnome-keyring on `ubuntu-latest` cannot create
+the default `login` collection without a GUI prompter (the
+`CreateCollection` D-Bus call returns a Prompt path that requires user
+confirmation, even with an empty password; on a headless runner the
+prompter dismisses with `PromptDismissedException`). Closing this gap in
+automated CI requires a Docker container with a pre-baked keyring image,
+switching to `pass-secret-service` as the backend, or a virtual display
+plus an automated prompter acceptor. That is filed as a v1.x housekeeping
+item; the integration test file ships against the production code path
+and exercises real `secret-tool` end-to-end when run manually on a
+real Linux desktop.
+
+The mock test at `server/test/keychain-linux-secret-service.test.ts`
+remains authoritative for unit-level behavior and runs in standard CI on
+every PR.

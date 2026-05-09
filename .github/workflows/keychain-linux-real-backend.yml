@@ -1,27 +1,38 @@
 name: Keychain Linux Real-Backend Integration
 
 # Exercises the Linux Secret Service path in passphrase.ts against a real
-# secret-tool CLI plus a real gnome-keyring-daemon running on a per-job
-# dbus-run-session bus. Closes the gap carried since v0.10.1 PR #60 (mock
-# coverage only) and full-sweep #45 (P1).
+# secret-tool CLI plus a real gnome-keyring-daemon. Targets the gap
+# carried since v0.10.1 PR #60 (mock coverage only) and full-sweep #45.
 #
-# This workflow runs in addition to the standard CI workflow. The mock test
-# at server/test/keychain-linux-secret-service.test.ts remains authoritative
-# for unit-level behavior; this job catches regressions in the shell-out
-# shape that mocks cannot see.
+# The mock test at server/test/keychain-linux-secret-service.test.ts
+# remains authoritative for unit-level behavior; this job catches
+# regressions in the shell-out shape that mocks cannot see.
+#
+# TRIGGER: workflow_dispatch only.
+#
+# Background, why this is not on push/PR (yet):
+#
+# Four CI attempts on 2026-05-09 confirmed that gnome-keyring on Ubuntu
+# 24.04 ubuntu-latest runners cannot create the default `login`
+# collection without a GUI prompter. The CreateCollection D-Bus call
+# returns a Prompt path that requires user confirmation, even when an
+# empty password is supplied. On a headless runner the prompter fails
+# with PromptDismissedException, so secret-tool store cannot persist
+# anything and tests fall through to the fallback file path.
+#
+# Closing the gap requires one of: a Docker container with a
+# pre-baked unlocked keyring image, switching to pass-secret-service
+# as the backend, or a virtual display with an automated prompter
+# acceptor. Each of those is materially more scope than the original
+# spawn prompt budgeted, so the workflow is filed here for the
+# follow-up pass and runs on workflow_dispatch only in the meantime.
+# Developers with a real Linux desktop session (gnome-shell, KDE
+# Plasma, or any libsecret-compatible session manager that has a real
+# login keyring) can exercise the integration test file directly via
+# `cd server && npm test -- keychain-linux-real-backend-integration`.
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'server/src/cocoon/passphrase.ts'
-      - 'server/test/keychain-linux-real-backend-integration.test.ts'
-      - '.github/workflows/keychain-linux-real-backend.yml'
-  pull_request:
-    paths:
-      - 'server/src/cocoon/passphrase.ts'
-      - 'server/test/keychain-linux-real-backend-integration.test.ts'
-      - '.github/workflows/keychain-linux-real-backend.yml'
+  workflow_dispatch:
 
 jobs:
   real-backend-test:
