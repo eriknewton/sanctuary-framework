@@ -206,19 +206,20 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
     /// flows fold into Alpha-3 alongside the DoH / DoT Tier B coverage).
     ///
     /// Source-app attribution: macOS exposes
-    /// `sourceAppUniqueIdentifier: Data?` (the binary's CDHash bytes)
-    /// instead of the iOS `sourceAppIdentifier` string. We hex-encode the
-    /// CDHash bytes into a stable string the agent resolver can map to a
-    /// Sanctuary `(agentId, templateId)` pair. Production attribution
-    /// also uses the `sourceAppAuditToken` for finer-grained mapping;
+    /// `sourceAppAuditToken: Data?` (a 32-byte audit-token kernel
+    /// structure) as the canonical per-flow attribution surface. We
+    /// hex-encode the bytes into a stable identifier the agent resolver
+    /// can map to a Sanctuary `(agentId, templateId)` pair. Production
+    /// attribution will additionally decode the audit token via
+    /// `SecCodeCopyGuestWithAttributes` to surface the signing identity;
     /// that wiring lands with the wrapped-agent registry surface.
     public func makeDescriptor(from flow: NEFilterFlow) -> FilterFlowDescriptor? {
         guard let socketFlow = flow as? NEFilterSocketFlow else {
             return nil
         }
         let sourceAppId: String
-        if let cdHash = flow.sourceAppUniqueIdentifier {
-            sourceAppId = cdHash.map { String(format: "%02x", $0) }.joined()
+        if let token = flow.sourceAppAuditToken {
+            sourceAppId = token.map { String(format: "%02x", $0) }.joined()
         } else {
             sourceAppId = "unknown"
         }
