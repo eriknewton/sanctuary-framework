@@ -94,24 +94,45 @@ jobs:
           # pass-secret-service has shipped only one PyPI release (0.1a0,
           # 2018) and its imports drifted out of compatibility with
           # current Ubuntu defaults on two fronts:
-          #   1. cryptography.utils.int_from_bytes was removed in
-          #      cryptography 39.0.0 (Jan 2023); pin <39 (40.x already
-          #      lacks it, confirmed in CI run 25611180020).
+          #   1. cryptography.utils.int_from_bytes was removed in modern
+          #      cryptography releases. Rather than chase an exact
+          #      version pin (the removal landed somewhere in 35.x-38.x;
+          #      runs 25611180020 and 25611237849 confirmed both <41 and
+          #      <39 still resolve to a cryptography that lacks the
+          #      symbol), we install a sitecustomize.py shim that
+          #      backfills int_from_bytes from int.from_bytes (they are
+          #      semantically identical). This works for any cryptography
+          #      version pip picks.
           #   2. PyGObject 3.50+ requires libgirepository-2.0-dev, a
           #      package Ubuntu 24.04 does not ship; pin <3.50 so the
           #      build links against libgirepository1.0-dev instead.
           # Plain venv (not pipx) gives exact control of dep resolution.
-          # pipx defaults to latest PyPI versions, which are not
-          # version-compatible with pass-secret-service 0.1a0 anymore.
           # Entry point inside the venv is pass_secret_service
           # (underscores; the hyphenated name is the PyPI package, the
           # underscored name is the console_script).
           python3 -m venv "$HOME/pss-venv"
           "$HOME/pss-venv/bin/pip" install --quiet --upgrade pip wheel
           "$HOME/pss-venv/bin/pip" install --quiet \
-            "cryptography<39" \
             "pygobject<3.50" \
             pass-secret-service
+          # Backfill cryptography.utils.int_from_bytes via sitecustomize
+          # so the daemon's import chain succeeds. sitecustomize.py is
+          # auto-imported by Python at interpreter startup when present
+          # on sys.path; placing it inside the venv's site-packages keeps
+          # the patch venv-scoped.
+          PSS_SITE_PACKAGES="$($HOME/pss-venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+          cat > "$PSS_SITE_PACKAGES/sitecustomize.py" <<'PYEOF'
+          """Backfill removed cryptography.utils.int_from_bytes for pass-secret-service 0.1a0."""
+          try:
+              import cryptography.utils as _cu
+
+              if not hasattr(_cu, "int_from_bytes"):
+                  def int_from_bytes(data, byteorder, signed=False):
+                      return int.from_bytes(data, byteorder, signed=signed)
+                  _cu.int_from_bytes = int_from_bytes
+          except Exception:
+              pass
+          PYEOF
           echo "$HOME/pss-venv/bin" >> "$GITHUB_PATH"
 
       - name: Install npm deps
