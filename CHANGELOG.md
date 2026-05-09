@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.2.3 - Substrate Hardening Wave (2026-05-11)
+
+Bundles 9 substrate fixes shipped across PRs #140-#147. No public MCP tool surface or agent-card schema changes; operators upgrading from v1.2.2 see only the security and friction fixes below. v1.2.2 was deprecated on npm with the bundled-context template path bug; v1.2.3 supersedes both v1.2.1 and v1.2.2.
+
+### Operator-facing fixes
+
+- **Finding RRR (P2): exit import refuses identity overwrite without explicit opt-in.** `sanctuary exit import --activate --yes` now refuses identity overwrite when the target fortress has a different active identity, unless `--force-rebind` is passed. PR #141.
+- **Finding SSS (P2): concierge has Sanctuary domain context.** Castle Architecture, channel templates, policy slots, and key concepts are injected into the concierge system prompt so operators get correct answers about Sanctuary itself. PR #140.
+- **CLI friction cluster.** `sanctuary identity show` is a real subcommand. `reset-passphrase --fortress` accepts the flag. `agents list --fortress <path>` scopes correctly. `exit import` fails fast on missing or invalid bundle before requiring a passphrase. PR #142.
+
+### Security hardening
+
+- **Gate denial info-leak (full-sweep #48, P1).** Agent-visible deny responses use a generic vocabulary; rich reason codes route to the encrypted audit log only. Closes a Castle Layer 3 cooperative-MCP fingerprinting attack surface. PR #147.
+
+### Cryptographic and protocol hardening
+
+- **Handshake `verifyCompletion()` checks `protocol_version`** (full-sweep #51). PR #143.
+- **Handshake `generateNonce()` asserts entropy length** (full-sweep #69). PR #143.
+- **Attestation `deriveActionBadge()` handles `time_of_action_state === 'offline'` explicitly** instead of falling through (full-sweep #71). PR #143.
+- **Crypto and network dependencies pinned to exact versions** on both `server/package.json` (15 deps) and `castle-wall-daemon/Cargo.toml` (4 deps). Closes a supply-chain attack surface (full-sweep #40). PR #145.
+
+### Multi-tenancy and operator routing
+
+- **Keychain service-name resolution uses canonical path comparison** (full-sweep #59), with the suffix extended from 12 to 16 hex chars and a legacy 12-hex fallback for backward compatibility (full-sweep #62). PR #146.
+- **`discoverTenants()` no longer admits a `default` subdirectory as a colliding tenant** (full-sweep #44). PR #144.
+- **`validatePolicy()` rejects user policies missing required keys** (`tier1_always_approve`, `approval_channel`) instead of silently substituting defaults (full-sweep #68). PR #144.
+
+### Build hygiene
+
+- **`npm test` builds dist/ before running.** Fixes a pre-existing fresh-worktree ENOENT in `template-list-tarball.test.ts` (housekeeping 26). PR #145.
+
+### Notes
+
+Test baseline floor: 3465 (Linux CI), unchanged from main HEAD.
+
 ## v1.2.2 - Template Path Hotfix (2026-05-11)
 
 Hotfix for bundled template resolution. v1.2.1 shipped with a path bug where `sanctuary template list` (and any template operation) threw `TemplateValidationError` because esbuild's bundle resolves `import.meta.url` to `dist/cli.js`, placing the template search at `dist/<name>` instead of `dist/templates/<name>`. This patch fixes `resolveTemplatesDir()` to detect the bundled context and look under `dist/templates/`. v1.2.1 is deprecated on npm.
