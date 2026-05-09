@@ -121,24 +121,21 @@ jobs:
             "pygobject<3.50" \
             cryptography \
             pass-secret-service
-          # Backfill cryptography.utils.int_from_bytes via sitecustomize
-          # so the daemon's import chain succeeds. sitecustomize.py is
-          # auto-imported by Python at interpreter startup when present
-          # on sys.path; placing it inside the venv's site-packages keeps
-          # the patch venv-scoped.
-          PSS_SITE_PACKAGES="$($HOME/pss-venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-          cat > "$PSS_SITE_PACKAGES/sitecustomize.py" <<'PYEOF'
-          """Backfill removed cryptography.utils.int_from_bytes for pass-secret-service 0.1a0."""
-          try:
-              import cryptography.utils as _cu
-
-              if not hasattr(_cu, "int_from_bytes"):
-                  def int_from_bytes(data, byteorder, signed=False):
-                      return int.from_bytes(data, byteorder, signed=signed)
-                  _cu.int_from_bytes = int_from_bytes
-          except Exception:
-              pass
-          PYEOF
+          # Patch the one source file in pass-secret-service that uses
+          # the removed symbol. int_from_bytes(data, byteorder, signed)
+          # is byte-equivalent to int.from_bytes(data, byteorder, signed)
+          # since Python 3.2, so the substitution is safe. A
+          # sitecustomize.py shim was tried first (CI run 25611484463)
+          # but did not load in time; sed-patching the on-disk file is
+          # direct and survives any Python startup-path quirks.
+          SESSION_FILE="$(find "$HOME/pss-venv/lib" -path '*/pass_secret_service/interfaces/session.py' -print -quit)"
+          if [ -z "$SESSION_FILE" ]; then
+            echo "could not locate pass_secret_service session.py inside venv" >&2
+            exit 1
+          fi
+          sed -i '/^from cryptography\.utils import int_from_bytes$/d' "$SESSION_FILE"
+          sed -i 's/\bint_from_bytes\b/int.from_bytes/g' "$SESSION_FILE"
+          echo "patched $SESSION_FILE"
           echo "$HOME/pss-venv/bin" >> "$GITHUB_PATH"
 
       - name: Install npm deps
