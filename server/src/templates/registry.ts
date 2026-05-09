@@ -218,23 +218,33 @@ export function lintOnboarding(
 // ═══════════════════════════════════════════════════════════════════════
 
 function resolveTemplatesDir(): string {
-  // Works in both source (ts) and compiled (js) contexts.
-  const thisFile = fileURLToPath(import.meta.url);
-  const thisDir = dirname(thisFile);
-  // In source: server/src/templates/registry.ts -> server/src/templates/
-  // In compiled (local dev): server/dist/templates/ -> check dist first, fallback to src
-  // In compiled (npm install): server/dist/templates/ -> dist has the copies
+  // Works in three contexts:
+  //   1. Source (ts):  server/src/templates/registry.ts  -> thisDir = src/templates/
+  //   2. Compiled unbundled: server/dist/templates/registry.js -> thisDir = dist/templates/
+  //   3. Compiled bundled (esbuild): server/dist/cli.js -> thisDir = dist/
   //
   // The build copies template asset directories into dist/templates/ via
   // scripts/copy-templates.js. When running from an npm install, src/ does
   // not exist; dist/templates/ is the only location.
-  if (thisDir.includes("/dist/")) {
-    // Prefer dist/templates/ (works for npm installs). Fall back to
-    // src/templates/ for local dev when the build hasn't run yet.
-    const srcFallback = thisDir.replace("/dist/templates", "/src/templates");
-    if (existsSync(join(thisDir, TEMPLATE_NAMES[0]))) {
-      return thisDir;
-    }
+  const thisFile = fileURLToPath(import.meta.url);
+  const thisDir = dirname(thisFile);
+
+  if (thisDir.includes("/dist")) {
+    // In a bundle (case 3), thisDir is dist/ not dist/templates/.
+    // Detect by checking whether templates live directly under thisDir.
+    const templatesSubdir = join(thisDir, "templates");
+    const candidateDir = existsSync(join(thisDir, TEMPLATE_NAMES[0]))
+      ? thisDir
+      : existsSync(join(templatesSubdir, TEMPLATE_NAMES[0]))
+        ? templatesSubdir
+        : null;
+
+    if (candidateDir) return candidateDir;
+
+    // Fall back to src/templates/ for local dev when the build hasn't run.
+    const srcFallback = thisDir.endsWith("/templates")
+      ? thisDir.replace("/dist/templates", "/src/templates")
+      : join(thisDir.replace("/dist", "/src"), "templates");
     return srcFallback;
   }
   return thisDir;

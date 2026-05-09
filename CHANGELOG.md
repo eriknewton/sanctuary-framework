@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.2.2 - Template Path Hotfix (2026-05-11)
+
+Hotfix for bundled template resolution. v1.2.1 shipped with a path bug where `sanctuary template list` (and any template operation) threw `TemplateValidationError` because esbuild's bundle resolves `import.meta.url` to `dist/cli.js`, placing the template search at `dist/<name>` instead of `dist/templates/<name>`. This patch fixes `resolveTemplatesDir()` to detect the bundled context and look under `dist/templates/`. v1.2.1 is deprecated on npm.
+
+### Fixed
+
+- **Template path resolution in esbuild bundle.** `resolveTemplatesDir()` now handles three contexts: source (ts), compiled unbundled, and compiled bundled (esbuild). The bundled case checks `dist/templates/` as a subdirectory when templates are not found directly under `thisDir`.
+
 ## v1.2.1 - Mini1 Drill Fixes (2026-05-11)
 
 Patch release shipping 8 fixes from the 2026-05-08 Mini1 acceptance drill. Also corrects the v1.2.0 publish drift: the 1.2.0 npm binary was cut from a SHA 6 hours before PR #134 (exit-bundle hardening) merged, so the published binary did not contain that work. 1.2.1 publishes from current main post-merge.
