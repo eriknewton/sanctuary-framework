@@ -54,12 +54,16 @@ jobs:
   real-backend-test:
     runs-on: ubuntu-24.04
     env:
-      # Both env vars are scoped to the workspace so nothing touches the
-      # runner's default GnuPG / pass directories. Setting them at the
-      # job level means dbus-run-session inherits them automatically when
-      # it spawns the test shell.
+      # GNUPGHOME is workspace-scoped so the runner's default GnuPG
+      # config stays untouched. pass-secret-service relies on pypass,
+      # which (unlike the pass CLI itself) hardcodes ~/.password-store
+      # and ignores PASSWORD_STORE_DIR. We let `pass init` use the
+      # default location too so the daemon and the CLI agree on where
+      # the store lives. CI run 25611555916 was the proof: with
+      # PASSWORD_STORE_DIR pointed at a workspace path, pass init
+      # populated the workspace store but the daemon hit pypass's
+      # default and raised "could not find .gpg-id file".
       GNUPGHOME: ${{ github.workspace }}/.gnupg-ci
-      PASSWORD_STORE_DIR: ${{ github.workspace }}/.password-store-ci
     steps:
       - uses: actions/checkout@v6
 
@@ -74,17 +78,80 @@ jobs:
         run: |
           set -e
           sudo apt-get update -qq
+          # Build deps for the from-source compile of PyGObject below:
+          # libcairo2-dev (pycairo headers), libgirepository1.0-dev
+          # (GObject introspection 1.x headers, the version Ubuntu 24.04
+          # ships; 2.0 is not in noble's archive), pkg-config + python3-dev
+          # for the meson configure step. gir1.2-glib-2.0 is the runtime
+          # typelib PyGObject loads on import.
           sudo apt-get install -y -qq \
             dbus dbus-x11 \
             gnupg \
             pass \
             libsecret-tools \
-            pipx
-          # pipx puts the entry point at ~/.local/bin/pass-secret-service.
-          # The default GitHub Actions PATH does not include ~/.local/bin
-          # for non-login shells, so add it explicitly via GITHUB_PATH.
-          pipx install pass-secret-service
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            python3-venv \
+            python3-dev \
+            libcairo2-dev \
+            libgirepository1.0-dev \
+            pkg-config \
+            gir1.2-glib-2.0
+          # pass-secret-service has shipped only one PyPI release (0.1a0,
+          # 2018) and its imports drifted out of compatibility with
+          # current Ubuntu defaults on two fronts:
+          #   1. cryptography.utils.int_from_bytes was removed in modern
+          #      cryptography releases. Rather than chase an exact
+          #      version pin (the removal landed somewhere in 35.x-38.x;
+          #      runs 25611180020 and 25611237849 confirmed both <41 and
+          #      <39 still resolve to a cryptography that lacks the
+          #      symbol), we install a sitecustomize.py shim that
+          #      backfills int_from_bytes from int.from_bytes (they are
+          #      semantically identical). This works for any cryptography
+          #      version pip picks.
+          #   2. PyGObject 3.50+ requires libgirepository-2.0-dev, a
+          #      package Ubuntu 24.04 does not ship; pin <3.50 so the
+          #      build links against libgirepository1.0-dev instead.
+          # Plain venv (not pipx) gives exact control of dep resolution.
+          # Entry point inside the venv is pass_secret_service
+          # (underscores; the hyphenated name is the PyPI package, the
+          # underscored name is the console_script).
+          python3 -m venv "$HOME/pss-venv"
+          "$HOME/pss-venv/bin/pip" install --quiet --upgrade pip wheel
+          # cryptography is not declared in pass-secret-service 0.1a0's
+          # install_requires (verified by removing it and watching the
+          # daemon fail with ModuleNotFoundError in CI run 25611385152),
+          # so name it explicitly. Any version is fine; the
+          # sitecustomize shim below backfills the int_from_bytes symbol.
+          "$HOME/pss-venv/bin/pip" install --quiet \
+            "pygobject<3.50" \
+            cryptography \
+            pass-secret-service
+          # Patch session.py inside the installed package. Three small
+          # fixes, each independent and observed in successive CI runs:
+          #
+          # 1. cryptography.utils.int_from_bytes was removed in modern
+          #    cryptography. Drop the import and rewrite call sites to
+          #    int.from_bytes (semantically identical since Python 3.2).
+          # 2. _decode_secret calls decryptor.update(password) where
+          #    password = secret[2] -- a value pydbus delivers as
+          #    list[int]. cryptography wants bytes. The author already
+          #    handles secret[1] (the IV) the same way; mirror it for
+          #    secret[2]. Without this, CreateItem fails with
+          #    "Cannot convert '<class 'list'>' instance to a buffer"
+          #    (CI run 25611693756).
+          # 3. _create_dh calls int.from_bytes(input, 'big') where the
+          #    DH peer key arrives over pydbus. Defensive bytes() wrap
+          #    matches the secret[1] / secret[2] pattern.
+          SESSION_FILE="$(find "$HOME/pss-venv/lib" -path '*/pass_secret_service/interfaces/session.py' -print -quit)"
+          if [ -z "$SESSION_FILE" ]; then
+            echo "could not locate pass_secret_service session.py inside venv" >&2
+            exit 1
+          fi
+          sed -i '/^from cryptography\.utils import int_from_bytes$/d' "$SESSION_FILE"
+          sed -i 's/\bint_from_bytes\b/int.from_bytes/g' "$SESSION_FILE"
+          sed -i 's|password = secret\[2\]|password = bytes(secret[2])|' "$SESSION_FILE"
+          sed -i "s|int\.from_bytes(input, 'big')|int.from_bytes(bytes(input), 'big')|" "$SESSION_FILE"
+          echo "patched $SESSION_FILE"
+          echo "$HOME/pss-venv/bin" >> "$GITHUB_PATH"
 
       - name: Install npm deps
         working-directory: server
@@ -130,7 +197,10 @@ jobs:
           fi
           echo "Generated ephemeral GPG key: $GPG_KEY"
 
-          mkdir -p "$PASSWORD_STORE_DIR"
+          # No PASSWORD_STORE_DIR override: pass-secret-service's pypass
+          # backend hardcodes ~/.password-store, so we let pass CLI use
+          # the same default. ~/.password-store does not exist yet on a
+          # fresh runner; `pass init` creates it.
           pass init "$GPG_KEY"
 
       - name: Run real-backend integration test against pass-secret-service
@@ -147,7 +217,7 @@ jobs:
             # D-Bus interface on top of the password store we just
             # initialized. It claims the well-known name on the session
             # bus once it has finished initializing.
-            pass-secret-service > /tmp/pass-secret-service.log 2>&1 &
+            pass_secret_service > /tmp/pass-secret-service.log 2>&1 &
             PSS_PID=$!
             # Make the daemon log visible on every exit path so a
             # registration failure does not require a workflow re-run to
@@ -178,7 +248,7 @@ jobs:
             echo "=== Environment ==="
             echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
             echo "GNUPGHOME=$GNUPGHOME"
-            echo "PASSWORD_STORE_DIR=$PASSWORD_STORE_DIR"
+            echo "PASSWORD_STORE_DIR=${PASSWORD_STORE_DIR:-$HOME/.password-store (default)}"
             secret-tool --version 2>/dev/null || true
 
             # Smoke test against secret-tool before the suite runs so
