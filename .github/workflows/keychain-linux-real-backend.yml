@@ -1,42 +1,65 @@
 name: Keychain Linux Real-Backend Integration
 
-# Exercises the Linux Secret Service path in passphrase.ts against a real
-# secret-tool CLI plus a real gnome-keyring-daemon. Targets the gap
-# carried since v0.10.1 PR #60 (mock coverage only) and full-sweep #45.
+# Exercises the production secret-tool shell-out path in
+# server/src/cocoon/passphrase.ts against a real libsecret-compatible
+# Secret Service backend on every push and pull request that touches the
+# Linux keychain code. Closes the v0.10.1 / v1.0.2 backlog item (b) CI
+# gap diagnosed in PR #151 and tracked in issue #153.
+#
+# Backend choice: pass-secret-service, a libsecret-compatible Secret
+# Service implementation backed by `pass` (GPG-encrypted password store).
+# Unlike gnome-keyring, pass-secret-service has no GUI prompter
+# requirement and creates collections without confirmation, so it works
+# on headless Ubuntu runners. Four CI iterations against gnome-keyring
+# in PR #151 confirmed that its CreateCollection D-Bus call requires a
+# graphical prompter that ubuntu-latest does not provide.
+#
+# The production code is unchanged and unaware of the backend choice; it
+# shells out to `secret-tool`, which speaks the libsecret D-Bus protocol
+# to whichever Secret Service implementation has claimed
+# org.freedesktop.secrets on the session bus. Real desktop sessions
+# still use gnome-keyring, KDE Wallet, or KeePassXC; this workflow
+# exercises the same wire protocol against pass-secret-service so the
+# shell-out shape (binary path, exit-code semantics, stdin handling,
+# attribute serialization) gets a real-D-Bus regression test in
+# automated CI.
 #
 # The mock test at server/test/keychain-linux-secret-service.test.ts
-# remains authoritative for unit-level behavior; this job catches
-# regressions in the shell-out shape that mocks cannot see.
-#
-# TRIGGER: workflow_dispatch only.
-#
-# Background, why this is not on push/PR (yet):
-#
-# Four CI attempts on 2026-05-09 confirmed that gnome-keyring on Ubuntu
-# 24.04 ubuntu-latest runners cannot create the default `login`
-# collection without a GUI prompter. The CreateCollection D-Bus call
-# returns a Prompt path that requires user confirmation, even when an
-# empty password is supplied. On a headless runner the prompter fails
-# with PromptDismissedException, so secret-tool store cannot persist
-# anything and tests fall through to the fallback file path.
-#
-# Closing the gap requires one of: a Docker container with a
-# pre-baked unlocked keyring image, switching to pass-secret-service
-# as the backend, or a virtual display with an automated prompter
-# acceptor. Each of those is materially more scope than the original
-# spawn prompt budgeted, so the workflow is filed here for the
-# follow-up pass and runs on workflow_dispatch only in the meantime.
-# Developers with a real Linux desktop session (gnome-shell, KDE
-# Plasma, or any libsecret-compatible session manager that has a real
-# login keyring) can exercise the integration test file directly via
-# `cd server && npm test -- keychain-linux-real-backend-integration`.
+# remains authoritative for unit-level behavior and runs in standard CI
+# on every PR via ci.yml. This workflow is the belt-and-suspenders layer
+# for shell-out drift the mocks cannot see.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "server/src/cocoon/passphrase.ts"
+      - "server/test/keychain-linux-real-backend-integration.test.ts"
+      - "server/test/keychain-linux-secret-service.test.ts"
+      - "server/package.json"
+      - "server/package-lock.json"
+      - ".github/workflows/keychain-linux-real-backend.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "server/src/cocoon/passphrase.ts"
+      - "server/test/keychain-linux-real-backend-integration.test.ts"
+      - "server/test/keychain-linux-secret-service.test.ts"
+      - "server/package.json"
+      - "server/package-lock.json"
+      - ".github/workflows/keychain-linux-real-backend.yml"
   workflow_dispatch:
 
 jobs:
   real-backend-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      # Both env vars are scoped to the workspace so nothing touches the
+      # runner's default GnuPG / pass directories. Setting them at the
+      # job level means dbus-run-session inherits them automatically when
+      # it spawns the test shell.
+      GNUPGHOME: ${{ github.workspace }}/.gnupg-ci
+      PASSWORD_STORE_DIR: ${{ github.workspace }}/.password-store-ci
     steps:
       - uses: actions/checkout@v6
 
@@ -47,15 +70,21 @@ jobs:
           cache: npm
           cache-dependency-path: server/package-lock.json
 
-      - name: Install Secret Service stack
+      - name: Install Secret Service stack (pass-secret-service backend)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
             dbus dbus-x11 \
-            gnome-keyring \
-            libsecret-1-0 \
+            gnupg \
+            pass \
             libsecret-tools \
-            python3-secretstorage
+            pipx
+          # pipx puts the entry point at ~/.local/bin/pass-secret-service.
+          # The default GitHub Actions PATH does not include ~/.local/bin
+          # for non-login shells, so add it explicitly via GITHUB_PATH.
+          pipx install pass-secret-service
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install npm deps
         working-directory: server
@@ -65,71 +94,107 @@ jobs:
         working-directory: server
         run: npm run build
 
-      - name: Run real-backend integration test
-        # Three earlier attempts diagnosed the underlying problem:
-        # gnome-keyring-daemon --start brings up the D-Bus secret
-        # service correctly, but the `login` collection (which
-        # secret-tool defaults to) is only created by a real graphical
-        # login flow, not by --unlock against a headless runner. The
-        # smoke test from attempt 3 surfaced this verbatim:
-        # `secret-tool: Object does not exist at path
-        # "/org/freedesktop/secrets/collection/login"`.
-        #
-        # Bootstrap the collection programmatically via Python
-        # secretstorage (the libsecret Python binding). create_collection
-        # with empty password works against the daemon without the GUI
-        # prompter because libsecret accepts the empty-password code
-        # path for headless flows. Set the `default` alias to the new
-        # collection so secret-tool's default-collection lookup
-        # resolves correctly.
-        #
-        # Smoke test against secret-tool runs before the integration
-        # suite so any future regression in this setup chain surfaces
-        # a single-line diagnostic of which layer broke.
+      - name: Initialize ephemeral GPG key + pass store
+        run: |
+          set -e
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+
+          # Loopback pinentry: GnuPG 2.x asks an external pinentry binary
+          # for passphrases by default, which has no TTY on a headless
+          # runner. Loopback mode plus an empty passphrase keeps the
+          # whole flow non-interactive.
+          echo "allow-loopback-pinentry" > "$GNUPGHOME/gpg-agent.conf"
+          gpgconf --kill gpg-agent || true
+
+          # %no-protection generates a passphrase-less RSA key. The key
+          # is ephemeral to this runner and never leaves the workspace;
+          # its only job is to satisfy `pass init` so pass-secret-service
+          # can store and read items via GPG-encrypted files.
+          cat > "$GNUPGHOME/key-batch" <<'EOF'
+          %no-protection
+          Key-Type: RSA
+          Key-Length: 2048
+          Name-Real: Sanctuary CI
+          Name-Email: ci@sanctuary-framework.invalid
+          Expire-Date: 0
+          %commit
+          EOF
+          gpg --batch --pinentry-mode loopback --gen-key "$GNUPGHOME/key-batch"
+
+          GPG_KEY="$(gpg --list-secret-keys --with-colons \
+            | awk -F: '/^fpr:/ { print $10; exit }')"
+          if [ -z "$GPG_KEY" ]; then
+            echo "GPG key generation produced no fingerprint" >&2
+            exit 1
+          fi
+          echo "Generated ephemeral GPG key: $GPG_KEY"
+
+          mkdir -p "$PASSWORD_STORE_DIR"
+          pass init "$GPG_KEY"
+
+      - name: Run real-backend integration test against pass-secret-service
         run: |
           set -e
 
-          eval "$(dbus-launch --sh-syntax)"
-          eval "$(printf "" | gnome-keyring-daemon --start --components=secrets,pkcs11,ssh)"
-          export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
+          # dbus-run-session provides a clean session bus for the test
+          # shell and exports DBUS_SESSION_BUS_ADDRESS for child
+          # processes. The integration test reads that env var to decide
+          # whether to skip; here it must be present so the suite
+          # actually runs end-to-end.
+          dbus-run-session -- bash -e -c '
+            # pass-secret-service implements the org.freedesktop.secrets
+            # D-Bus interface on top of the password store we just
+            # initialized. It claims the well-known name on the session
+            # bus once it has finished initializing.
+            pass-secret-service > /tmp/pass-secret-service.log 2>&1 &
+            PSS_PID=$!
+            # Make the daemon log visible on every exit path so a
+            # registration failure does not require a workflow re-run to
+            # diagnose. Tear the daemon down too.
+            trap "kill $PSS_PID 2>/dev/null || true; \
+                  echo \"=== pass-secret-service log ===\"; \
+                  cat /tmp/pass-secret-service.log || true" EXIT
 
-          echo "=== Environment ==="
-          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
-          echo "GNOME_KEYRING_CONTROL=$GNOME_KEYRING_CONTROL"
-          pgrep -af gnome-keyring-daemon || echo "(no daemon process)"
+            # Poll for the well-known name on the bus. Without this the
+            # first secret-tool call races daemon startup and can fail
+            # transiently. Twenty seconds is generous; in practice
+            # registration takes well under a second on a warm runner.
+            for i in $(seq 1 40); do
+              if dbus-send --session --print-reply \
+                   --dest=org.freedesktop.secrets \
+                   /org/freedesktop/secrets \
+                   org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then
+                echo "pass-secret-service registered on session bus (attempt $i)"
+                break
+              fi
+              if [ "$i" = "40" ]; then
+                echo "pass-secret-service did not register within 20s" >&2
+                exit 1
+              fi
+              sleep 0.5
+            done
 
-          echo "=== Bootstrapping default collection via secretstorage ==="
-          python3 - <<'PY'
-          import secretstorage
-          conn = secretstorage.dbus_init()
-          # Try the default collection first; create one only if missing.
-          try:
-              col = secretstorage.get_default_collection(conn)
-              if col.is_locked():
-                  col.unlock()
-              print(f"default collection ready: locked={col.is_locked()} label={col.get_label()!r}")
-          except secretstorage.exceptions.ItemNotFoundException:
-              col = secretstorage.create_collection(conn, "default", alias="default", session=None)
-              if col.is_locked():
-                  col.unlock()
-              print(f"created default collection: locked={col.is_locked()}")
-          PY
+            echo "=== Environment ==="
+            echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+            echo "GNUPGHOME=$GNUPGHOME"
+            echo "PASSWORD_STORE_DIR=$PASSWORD_STORE_DIR"
+            secret-tool --version 2>/dev/null || true
 
-          echo "=== secret-tool smoke test ==="
-          if printf "smokevalue" | secret-tool store --label="smoke" service smoke-svc account smoke-acct; then
-            echo "  store: OK"
-          else
-            echo "  store: FAILED (exit $?)"
-            exit 1
-          fi
-          smoke_value=$(secret-tool lookup service smoke-svc account smoke-acct || echo "")
-          if [ "$smoke_value" = "smokevalue" ]; then
-            echo "  lookup: OK"
-          else
-            echo "  lookup: FAILED (got '$smoke_value')"
-            exit 1
-          fi
-          secret-tool clear service smoke-svc account smoke-acct || true
-          echo "=== smoke test passed ==="
+            # Smoke test against secret-tool before the suite runs so
+            # any future regression in the bus / backend setup chain
+            # surfaces a single-line diagnostic of which layer broke,
+            # rather than reading it out of vitest output.
+            echo "=== secret-tool smoke test ==="
+            printf "smokevalue" | secret-tool store --label=smoke \
+              service smoke-svc account smoke-acct
+            smoke_value="$(secret-tool lookup service smoke-svc account smoke-acct)"
+            if [ "$smoke_value" != "smokevalue" ]; then
+              echo "smoke lookup mismatch: expected smokevalue, got $smoke_value" >&2
+              exit 1
+            fi
+            secret-tool clear service smoke-svc account smoke-acct
+            echo "=== smoke test passed ==="
 
-          cd server && npm test -- keychain-linux-real-backend-integration.test.ts
+            cd server && npm test -- keychain-linux-real-backend-integration.test.ts
+          '

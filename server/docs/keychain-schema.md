@@ -426,21 +426,27 @@ To exercise the test on a real Linux desktop session:
 cd server && npm test -- keychain-linux-real-backend-integration
 ```
 
-A `Keychain Linux Real-Backend Integration` workflow exists at
-`.github/workflows/keychain-linux-real-backend.yml` but is registered
-with `workflow_dispatch` only (manual trigger). Four CI attempts on
-2026-05-09 confirmed that gnome-keyring on `ubuntu-latest` cannot create
-the default `login` collection without a GUI prompter (the
-`CreateCollection` D-Bus call returns a Prompt path that requires user
-confirmation, even with an empty password; on a headless runner the
-prompter dismisses with `PromptDismissedException`). Closing this gap in
-automated CI requires a Docker container with a pre-baked keyring image,
-switching to `pass-secret-service` as the backend, or a virtual display
-plus an automated prompter acceptor. That is filed as a v1.x housekeeping
-item; the integration test file ships against the production code path
-and exercises real `secret-tool` end-to-end when run manually on a
-real Linux desktop.
+The `Keychain Linux Real-Backend Integration` workflow at
+`.github/workflows/keychain-linux-real-backend.yml` runs the suite in
+automated CI on every push and pull request that touches
+`server/src/cocoon/passphrase.ts`, the keychain test files, or the
+workflow itself. The workflow stands up `pass-secret-service` (a
+libsecret-compatible Secret Service implementation backed by `pass`,
+GPG-encrypted password store) on a `dbus-run-session` session bus so the
+production `secret-tool` shell-out exercises a real D-Bus + libsecret
+stack end-to-end. Real desktop sessions still use `gnome-keyring`, KDE
+Wallet, or KeePassXC; the Secret Service wire protocol is identical.
+
+The pass-secret-service backend was chosen after four CI iterations
+against `gnome-keyring` on `ubuntu-latest` (PR #151) confirmed that its
+`CreateCollection` D-Bus call requires a GUI prompter to confirm the
+default collection, even with an empty password. On a headless runner
+the prompter dismisses with `PromptDismissedException`. pass-secret-
+service has no prompter requirement; it materializes collections as
+GPG-encrypted files under `$PASSWORD_STORE_DIR` without confirmation.
+The full diagnostic and resolution-options analysis is in issue #153.
 
 The mock test at `server/test/keychain-linux-secret-service.test.ts`
 remains authoritative for unit-level behavior and runs in standard CI on
-every PR.
+every PR via `ci.yml`. The real-backend workflow is the
+belt-and-suspenders layer for shell-out drift the mocks cannot see.
