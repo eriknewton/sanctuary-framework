@@ -46,6 +46,10 @@ jobs:
         working-directory: server
         run: npm run typecheck
 
+      - name: Build (populates dist/templates for tarball tests)
+        working-directory: server
+        run: npm run build
+
       - name: Run tests
         working-directory: server
         run: npm test

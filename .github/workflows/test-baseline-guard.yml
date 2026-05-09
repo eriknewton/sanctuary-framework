@@ -82,6 +82,11 @@ jobs:
           sidecars/concordia/.venv/bin/pip install --upgrade pip
           sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
 
+      # ── Gate 0: build (populates dist/templates for tarball tests) ─
+      - name: Gate 0 — build
+        working-directory: server
+        run: npm run build
+
       # ── Gate 1: typecheck ──────────────────────────────────────────
       - name: Gate 1 — typecheck
         working-directory: server
