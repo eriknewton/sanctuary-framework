@@ -96,9 +96,12 @@ jobs:
           # satisfied and skips the from-source build that previously
           # failed on `cairo` and `libgirepository-2.0` headers. pipx
           # still isolates pass-secret-service's own pure-Python deps.
-          # Entry point lands at ~/.local/bin/pass-secret-service; the
-          # default GitHub Actions PATH does not include ~/.local/bin for
-          # non-login shells, so add it explicitly via GITHUB_PATH.
+          # Entry point lands at ~/.local/bin/pass_secret_service (note
+          # the underscores: pip installs the package under the hyphenated
+          # name pass-secret-service, but the console_script the package
+          # exposes is pass_secret_service). The default GitHub Actions
+          # PATH does not include ~/.local/bin for non-login shells, so
+          # add it explicitly via GITHUB_PATH.
           pipx install --system-site-packages pass-secret-service
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -163,7 +166,7 @@ jobs:
             # D-Bus interface on top of the password store we just
             # initialized. It claims the well-known name on the session
             # bus once it has finished initializing.
-            pass-secret-service > /tmp/pass-secret-service.log 2>&1 &
+            pass_secret_service > /tmp/pass-secret-service.log 2>&1 &
             PSS_PID=$!
             # Make the daemon log visible on every exit path so a
             # registration failure does not require a workflow re-run to
