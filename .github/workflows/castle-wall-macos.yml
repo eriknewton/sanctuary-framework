@@ -1,0 +1,65 @@
+name: Castle Wall macOS Foundation
+
+# Builds and unit-tests the Castle Wall macOS system extension foundation
+# scaffold (NEFilterProvider subclass + UDS IPC client + Ed25519 handshake
+# verification). Loaded-extension scenarios CANNOT be exercised in CI
+# because Apple's sysextd requires interactive user approval. Those tests
+# land in Alpha-3 alongside the audit-emit pipeline.
+#
+# Per the foundation spawn prompt (2026-05-11): no code signing in CI.
+# Real signing happens during local development (Apple Developer ID
+# YFQSWQ9BJN) and in the Alpha-4 release flow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "castle-wall-macos/**"
+      - "server/src/castle-wall/**"
+      - ".github/workflows/castle-wall-macos.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "castle-wall-macos/**"
+      - "server/src/castle-wall/**"
+      - ".github/workflows/castle-wall-macos.yml"
+
+jobs:
+  castle-wall-macos-foundation:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: xcodebuild list (verify SwiftPM scheme generation)
+        working-directory: castle-wall-macos
+        run: xcodebuild -list
+
+      - name: xcodebuild build (CastleWallExtension scheme)
+        working-directory: castle-wall-macos
+        run: |
+          xcodebuild build \
+            -scheme CastleWallExtension \
+            -destination 'platform=macOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=YES
+
+      - name: xcodebuild test (run XCTest suites)
+        working-directory: castle-wall-macos
+        run: |
+          xcodebuild test \
+            -scheme CastleWallExtension \
+            -destination 'platform=macOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=YES
