@@ -19,7 +19,7 @@ function baseTenant(
     exists: true,
     initialized: true,
     has_cocoon_profile: false,
-    keychain_service: "sanctuary-passphrase-aaaaaaaaaaaa",
+    keychain_service: "sanctuary-passphrase-aaaaaaaaaaaaaaaa",
     passphrase_status: "keychain",
     last_activity: null,
     runtime: null,

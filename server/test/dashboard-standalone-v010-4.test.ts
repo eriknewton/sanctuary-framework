@@ -151,7 +151,7 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
         exists: true,
         initialized: true,
         has_cocoon_profile: false,
-        keychain_service: "sanctuary-passphrase-aaaaaaaaaaaa",
+        keychain_service: "sanctuary-passphrase-aaaaaaaaaaaaaaaa",
         passphrase_status: "fallback-file",
         last_activity: null,
         runtime: null,
@@ -159,7 +159,7 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
     ]);
     expect(out).toMatch(/Detected 1 wrapped tenant/);
     expect(out).toMatch(/sanctuary dashboard --tenant alpha/);
-    expect(out).toMatch(/sanctuary-passphrase-aaaaaaaaaaaa/);
+    expect(out).toMatch(/sanctuary-passphrase-aaaaaaaaaaaaaaaa/);
     // The misleading legacy hint must never appear.
     expect(out).not.toMatch(/SANCTUARY_PASSPHRASE=/);
   });
@@ -172,7 +172,7 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
         exists: true,
         initialized: true,
         has_cocoon_profile: false,
-        keychain_service: "sanctuary-passphrase-aaaaaaaaaaaa",
+        keychain_service: "sanctuary-passphrase-aaaaaaaaaaaaaaaa",
         passphrase_status: "fallback-file",
         last_activity: null,
         runtime: null,
@@ -183,7 +183,7 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
         exists: true,
         initialized: true,
         has_cocoon_profile: false,
-        keychain_service: "sanctuary-passphrase-bbbbbbbbbbbb",
+        keychain_service: "sanctuary-passphrase-bbbbbbbbbbbbbbbb",
         passphrase_status: "keychain",
         last_activity: null,
         runtime: null,

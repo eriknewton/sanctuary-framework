@@ -234,7 +234,7 @@ describe("Linux Secret Service keychain backend", () => {
 
     const expectedService = keychainServiceFor(tenantPath, home);
     expect(expectedService).not.toBe("sanctuary-passphrase");
-    expect(expectedService).toMatch(/^sanctuary-passphrase-[0-9a-f]{12}$/);
+    expect(expectedService).toMatch(/^sanctuary-passphrase-[0-9a-f]{16}$/);
 
     // The stored item must be keyed by the per-tenant service.
     expect(h.stored.has(`${expectedService}|sanctuary`)).toBe(true);

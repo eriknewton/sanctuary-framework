@@ -231,7 +231,7 @@ describe("cli/agents/discovery", () => {
     const defaultT = tenants.find((t) => t.name === "default")!;
     const customT = tenants.find((t) => t.name === "custom")!;
     expect(defaultT.keychain_service).toBe("sanctuary-passphrase");
-    expect(customT.keychain_service).toMatch(/^sanctuary-passphrase-[0-9a-f]{12}$/);
+    expect(customT.keychain_service).toMatch(/^sanctuary-passphrase-[0-9a-f]{16}$/);
     expect(customT.keychain_service).not.toBe(defaultT.keychain_service);
   });
 });

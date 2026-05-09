@@ -335,7 +335,7 @@ describe("Standalone Dashboard", () => {
       expect(banner).toMatch(/Encrypted identities found but NONE loaded/);
       // v0.10.4: banner names this tenant's per-tenant Keychain service so
       // operators can run `security find-generic-password -s <service> -w`.
-      expect(banner).toMatch(/sanctuary-passphrase-[0-9a-f]{12}/);
+      expect(banner).toMatch(/sanctuary-passphrase-[0-9a-f]{16}/);
       // v0.10.4: banner points at the canonical schema doc (which contains
       // every diagnostic recipe) rather than inlining a remediation
       // command that may go stale.

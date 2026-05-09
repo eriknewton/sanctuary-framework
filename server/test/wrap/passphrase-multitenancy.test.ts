@@ -74,7 +74,7 @@ describe("keychainServiceFor", () => {
 
   it("returns a namespaced service name for a custom storage path", () => {
     const name = keychainServiceFor("/srv/agent-a", home);
-    expect(name).toMatch(/^sanctuary-passphrase-[0-9a-f]{12}$/);
+    expect(name).toMatch(/^sanctuary-passphrase-[0-9a-f]{16}$/);
   });
 
   it("derives distinct service names for distinct storage paths", () => {
