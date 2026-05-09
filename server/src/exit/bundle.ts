@@ -905,6 +905,19 @@ export async function importExitBundle(
     manifest
   );
 
+  // Finding RRR: detect mismatched local active identity.
+  // The original predicate only checked if the SAME identity_id existed in
+  // storage. The drill scenario is importing into a fortress that already has
+  // a DIFFERENT active identity, which must also be refused without --force-rebind.
+  if (
+    !conflicts.public_identity_exists &&
+    identityArtifact?.json &&
+    opts.identityManager.getPrimaryIdentityId() !== null &&
+    opts.identityManager.getPrimaryIdentityId() !== identityArtifact.json.bundle.identity_id
+  ) {
+    conflicts.public_identity_exists = true;
+  }
+
   if (!opts.activate) {
     return {
       verified: true,
@@ -932,7 +945,8 @@ export async function importExitBundle(
   if (conflicts.public_identity_exists && !opts.forceRebind) {
     throw new ExitBundleImportError(
       "IDENTITY_OVERWRITE_REFUSED",
-      "Importing this bundle would overwrite an existing fortress public identity. " +
+      "Importing this exit bundle would overwrite an existing fortress public identity " +
+        "(either the same identity already imported, or a different identity is currently active). " +
         "Pass forceRebind: true (CLI: --force-rebind) to confirm explicit replacement."
     );
   }
