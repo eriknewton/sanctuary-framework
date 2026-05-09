@@ -120,6 +120,7 @@ describe("SEC-001: state_delete requires explicit human approval", () => {
       version: 1,
       tier1_always_approve: DEFAULT_POLICY.tier1_always_approve,
       tier3_always_allow: DEFAULT_POLICY.tier3_always_allow,
+      approval_channel: DEFAULT_POLICY.approval_channel,
     });
     const parsed = parsePolicy(policyJson);
 

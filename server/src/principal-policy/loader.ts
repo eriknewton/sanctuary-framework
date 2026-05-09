@@ -234,6 +234,21 @@ function parseScalar(value: string): string | number | boolean {
 }
 
 function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
+  // Required keys: operator must explicitly include these or get a clear error.
+  // Silent default substitution would hide operator intent (full-sweep #68).
+  if (!("tier1_always_approve" in raw)) {
+    throw new Error(
+      "Policy file must include 'tier1_always_approve' as an explicit list " +
+        "(use [] for empty). Remove specific entries instead of removing the whole key."
+    );
+  }
+  if (!("approval_channel" in raw)) {
+    throw new Error(
+      "Policy file must include 'approval_channel' as an explicit object " +
+        "(use {} for defaults). Remove specific entries instead of removing the whole key."
+    );
+  }
+
   // Merge tier3: user's list + any new defaults added in later versions.
   // This ensures upgrades automatically include new read-only tools
   // without requiring operators to manually edit their policy file.
@@ -244,8 +259,7 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
 
   return {
     version: (raw.version as number) ?? 1,
-    tier1_always_approve:
-      (raw.tier1_always_approve as string[]) ?? DEFAULT_POLICY.tier1_always_approve,
+    tier1_always_approve: raw.tier1_always_approve as string[],
     tier2_anomaly: {
       ...DEFAULT_TIER2,
       ...((raw.tier2_anomaly as Record<string, unknown>) ?? {}),
@@ -272,6 +286,11 @@ function generateDefaultPolicyYaml(): string {
 # This file controls what your agent can do without asking.
 # Edit this file directly. Your agent cannot modify it.
 # Changes take effect on server restart.
+#
+# Required keys (must be present; use [] or {} for empty):
+#   tier1_always_approve, approval_channel
+# Optional keys (omit to use defaults; new defaults merge automatically):
+#   tier2_anomaly, tier3_always_allow
 
 version: 1
 
