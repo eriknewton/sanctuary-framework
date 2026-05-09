@@ -21,6 +21,7 @@ import { BaselineTracker } from "./baseline.js";
 import { extractOperationName } from "./loader.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 import { InjectionDetector, type DetectionResult } from "../security/injection-detector.js";
+import { AGENT_VISIBLE_DENY_REASONS } from "./deny-vocabulary.js";
 
 /** Callback invoked when an injection is detected, for dashboard broadcasting */
 export type InjectionAlertCallback = (alert: {
@@ -103,10 +104,16 @@ export class ApprovalGate {
       }
 
       if (injectionResult.recommendation === "block") {
+        this.auditLog.append("l2", `gate_injection_block:${operation}`, "system", {
+          tier: 1,
+          operation,
+          injection_confidence: injectionResult.confidence,
+          signal_count: injectionResult.signals.length,
+        });
         return {
           allowed: false,
           tier: 1,
-          reason: `Blocked: prompt injection detected in "${operation}" (confidence: ${(injectionResult.confidence * 100).toFixed(0)}%)`,
+          reason: AGENT_VISIBLE_DENY_REASONS.NOT_PERMITTED,
           approval_required: false,
         };
       }
@@ -202,7 +209,7 @@ export class ApprovalGate {
     this.auditLog.append("l2", `gate_unclassified:${operation}`, "system", {
       tier: 1,
       operation,
-      warning: "Operation is not classified in any policy tier — defaulting to Tier 1 (require approval)",
+      warning: "Operation is not classified in any policy tier, defaulting to Tier 1 (require approval)",
     });
 
     return this.requestApproval(
@@ -370,7 +377,7 @@ export class ApprovalGate {
       tier,
       reason: response.decision === "approve"
         ? `Approved by ${response.decided_by}`
-        : `Tier ${tier} operation requires approval`,
+        : AGENT_VISIBLE_DENY_REASONS.REQUIRES_APPROVAL,
       approval_required: true,
       approval_response: response,
     };

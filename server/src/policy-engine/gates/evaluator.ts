@@ -36,6 +36,12 @@ import { checkSentinelRestriction } from "../sentinel-role.js";
 import { issueGateReceipt } from "../gate-receipts.js";
 import type { GateContext, GateRequest, GateResult, SlotGrant } from "../types.js";
 
+/**
+ * Generic deny explanation visible to the agent. Rich details stay in the
+ * signed receipt (audit artifact). Prevents policy fingerprinting (#48).
+ */
+const GENERIC_DENY_EXPLANATION = "operation not permitted";
+
 export interface SlotGateExtendedContext extends GateContext {
   /** Optional upstream threshold signal the ladder's tier 2 evaluates against. */
   threshold_signal?: string;
@@ -88,7 +94,7 @@ export function evaluateSlotGate(
       decision: "deny",
       reason_code: GATE_REASON_CODES.NULL_POLICY_HERMETIC_DENY,
       receipt,
-      explanation: `no pinned policy for ${req.agent_id}; hermetic default denies every slot`,
+      explanation: GENERIC_DENY_EXPLANATION,
     };
   }
 
@@ -113,7 +119,7 @@ export function evaluateSlotGate(
       decision: "deny",
       reason_code: sentCheck.reason_code!,
       receipt,
-      explanation: sentCheck.explanation!,
+      explanation: GENERIC_DENY_EXPLANATION,
     };
   }
 
@@ -144,7 +150,9 @@ export function evaluateSlotGate(
       decision: ladder.decision!,
       reason_code: ladder.reason_code!,
       receipt,
-      explanation: ladder.explanation!,
+      explanation: ladder.decision === "deny"
+        ? GENERIC_DENY_EXPLANATION
+        : ladder.explanation!,
     };
   }
 
@@ -169,7 +177,7 @@ export function evaluateSlotGate(
       decision: "deny",
       reason_code: GATE_REASON_CODES.SLOT_MODE_DENY,
       receipt,
-      explanation: `slot ${slot} is in deny mode for agent ${req.agent_id}`,
+      explanation: GENERIC_DENY_EXPLANATION,
     };
   }
   const grant = findMatchingGrant(rule.grants, req.counterparty, req.action);
@@ -192,7 +200,7 @@ export function evaluateSlotGate(
       decision: "deny",
       reason_code: GATE_REASON_CODES.NO_MATCHING_GRANT,
       receipt,
-      explanation: `no grant on slot ${slot} for ${req.agent_id} → ${req.counterparty} / ${req.action}`,
+      explanation: GENERIC_DENY_EXPLANATION,
     };
   }
   const receipt = issueGateReceipt({

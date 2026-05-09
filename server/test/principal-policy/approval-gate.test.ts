@@ -382,7 +382,7 @@ describe("Approval Gate", () => {
       expect(denied.reason).not.toContain("bulk_read_threshold");
       expect(denied.reason).not.toContain("threshold");
       expect(denied.reason).not.toContain("Bulk read");
-      expect(denied.reason).toBe("Tier 2 operation requires approval");
+      expect(denied.reason).toBe("operation requires operator approval");
 
       // OOB channel surface (human reviewer): detailed reason preserved
       expect(captured.length).toBeGreaterThan(0);
