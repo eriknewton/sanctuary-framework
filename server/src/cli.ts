@@ -106,6 +106,12 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
+  if (args[0] === "identity") {
+    const { runIdentityCommand } = await import("./cli/identity.js");
+    const code = await runIdentityCommand({ argv: args.slice(1) });
+    process.exit(code);
+  }
+
   if (args[0] === "agents") {
     const { runAgentsCommand } = await import("./cli/agents/index.js");
     const code = await runAgentsCommand({ argv: args.slice(1) });
@@ -375,6 +381,9 @@ Subcommands:
                        Reads from the same storage as the MCP server.
                        Use "sanctuary dashboard --help" for options.
                        Pass --multi to render the multi-tenant overview.
+
+  identity             Inspect the active identity (DID, public key).
+                       Use "sanctuary identity --help" for options.
 
   template             Manage policy templates (list, init).
                        Use "sanctuary template --help" for options.

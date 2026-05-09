@@ -5,8 +5,8 @@
  * Dashboard wizard work consumes the same module APIs later.
  */
 
-import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { access, readFile as fsReadFile, mkdir } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { AuditLog } from "../l2-operational/audit-log.js";
@@ -276,6 +276,29 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         write(err, "Usage: sanctuary exit import <dir> [--activate]\n");
         return 2;
       }
+
+      // Pre-flight: validate the bundle directory and manifest BEFORE
+      // prompting for a passphrase. Catches the most common operator
+      // error (wrong path or malformed bundle) without forcing auth.
+      const bundleRoot = resolve(dir);
+      try {
+        await access(bundleRoot);
+      } catch {
+        write(err, `Error: bundle directory not found: ${bundleRoot}\n`);
+        return 1;
+      }
+      const manifestPath = join(bundleRoot, "manifest.json");
+      try {
+        const raw = await fsReadFile(manifestPath, "utf8");
+        JSON.parse(raw);
+      } catch {
+        write(
+          err,
+          `Error: bundle manifest missing or malformed at ${manifestPath}\n`
+        );
+        return 1;
+      }
+
       const activate = hasFlag(argv, "--activate");
       const forceRebind = hasFlag(argv, "--force-rebind");
       const acceptUnverifiableAttestations = hasFlag(
