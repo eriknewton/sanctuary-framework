@@ -125,6 +125,43 @@ export interface OperatorChatServiceDeps {
 
 const DEFAULT_CONCIERGE_MAX_TOKENS = 512;
 
+/**
+ * Static Sanctuary domain reference injected into the concierge context
+ * so the substrate can answer operator questions about Sanctuary concepts,
+ * channel templates, policy slots, and architecture.
+ *
+ * v1.3 replaces this with dynamic context injection (pre-fetch live
+ * template list + policy schema at chat time).
+ */
+export const SANCTUARY_DOMAIN_REFERENCE = `\
+Castle Architecture (four enforcement layers):
+1. Castle Wall: OS-boundary egress filter enforced at the kernel level. Blocks unauthorized outbound calls even from prompt-injected agents.
+2. Sentinels: internal observation via process introspection. Surfaces anomalies to the operator; does not enforce.
+3. Charter (Cooperative MCP): the sovereignty surface for compliant agents. Policy gates, approval tiers, audit logging, and encrypted state all live here.
+4. Heralds: Concordia receipts and Verascore reputation. Cross-fortress accountability after an action completes.
+
+Five channel templates (canonical names):
+- request-approve-act: agent proposes an action, operator approves or denies before execution.
+- read-then-report: agent reads outputs from a data source and reports summaries to the operator.
+- scheduled-digest: agent runs on a schedule and delivers a periodic digest.
+- plan-draft-only: agent drafts plans; operator reviews before any execution step.
+- fortress-relay: agent relays messages between fortresses under operator-scoped policy.
+
+Four canonical policy slots:
+- memory: governs what the agent may persist and retrieve from encrypted state.
+- credentials: governs access to secrets, API keys, and tokens held in the broker.
+- plans: governs the agent's ability to create, modify, or execute plans.
+- outputs: governs what the agent may emit to external surfaces (files, APIs, messages).
+
+Key concepts:
+- Fortress: the operator-owned sovereignty harness. All state is encrypted at rest under the cocoon.
+- Cocoon: master-key-wrapped storage derived from the operator's passphrase via Argon2id.
+- Identity: Ed25519 keypair with a DID, owned by the operator. Private keys never leave the cocoon.
+- Audit log: append-only encrypted blobs, sequential, recording every gate decision and tool call.
+- Wrapped agent: any agent runtime that connects to Sanctuary as an MCP client. Tier A (native), Tier B (adapter-wrapped), Tier C (escape hatch).
+
+Note: this is a static reference block (v1.2.x). Dynamic context injection (live template list, policy schema) ships in v1.3.`;
+
 export class OperatorChatService {
   private store: OperatorChatStore;
   private auditLog: AuditLog;
@@ -292,6 +329,9 @@ export class OperatorChatService {
    * than nested structures. Format:
    *
    *   ```
+   *   ## Sanctuary reference
+   *   <static domain reference block>
+   *
    *   ## Recent activity
    *   <recentActivity output>
    *
@@ -303,15 +343,17 @@ export class OperatorChatService {
    *   ```
    */
   private async assembleConciergeContext(): Promise<string> {
+    const ref = `## Sanctuary reference\n${SANCTUARY_DOMAIN_REFERENCE}`;
+
     if (!this.contextProviders) {
-      return "## Recent activity\n(no providers wired)\n\n## Wrapped agents\n(no providers wired)\n\n## Open inbox\n(no providers wired)";
+      return `${ref}\n\n## Recent activity\n(no providers wired)\n\n## Wrapped agents\n(no providers wired)\n\n## Open inbox\n(no providers wired)`;
     }
     const [activity, agents, inbox] = await Promise.all([
       this.contextProviders.recentActivity(),
       this.contextProviders.agentInventory(),
       this.contextProviders.openInbox(),
     ]);
-    return `## Recent activity\n${activity}\n\n## Wrapped agents\n${agents}\n\n## Open inbox\n${inbox}`;
+    return `${ref}\n\n## Recent activity\n${activity}\n\n## Wrapped agents\n${agents}\n\n## Open inbox\n${inbox}`;
   }
 
   // ── audit helpers ────────────────────────────────────────────────────
