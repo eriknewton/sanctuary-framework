@@ -1,0 +1,135 @@
+name: Keychain Linux Real-Backend Integration
+
+# Exercises the Linux Secret Service path in passphrase.ts against a real
+# secret-tool CLI plus a real gnome-keyring-daemon. Targets the gap
+# carried since v0.10.1 PR #60 (mock coverage only) and full-sweep #45.
+#
+# The mock test at server/test/keychain-linux-secret-service.test.ts
+# remains authoritative for unit-level behavior; this job catches
+# regressions in the shell-out shape that mocks cannot see.
+#
+# TRIGGER: workflow_dispatch only.
+#
+# Background, why this is not on push/PR (yet):
+#
+# Four CI attempts on 2026-05-09 confirmed that gnome-keyring on Ubuntu
+# 24.04 ubuntu-latest runners cannot create the default `login`
+# collection without a GUI prompter. The CreateCollection D-Bus call
+# returns a Prompt path that requires user confirmation, even when an
+# empty password is supplied. On a headless runner the prompter fails
+# with PromptDismissedException, so secret-tool store cannot persist
+# anything and tests fall through to the fallback file path.
+#
+# Closing the gap requires one of: a Docker container with a
+# pre-baked unlocked keyring image, switching to pass-secret-service
+# as the backend, or a virtual display with an automated prompter
+# acceptor. Each of those is materially more scope than the original
+# spawn prompt budgeted, so the workflow is filed here for the
+# follow-up pass and runs on workflow_dispatch only in the meantime.
+# Developers with a real Linux desktop session (gnome-shell, KDE
+# Plasma, or any libsecret-compatible session manager that has a real
+# login keyring) can exercise the integration test file directly via
+# `cd server && npm test -- keychain-linux-real-backend-integration`.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  real-backend-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install Secret Service stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dbus dbus-x11 \
+            gnome-keyring \
+            libsecret-1-0 \
+            libsecret-tools \
+            python3-secretstorage
+
+      - name: Install npm deps
+        working-directory: server
+        run: npm ci
+
+      - name: Build
+        working-directory: server
+        run: npm run build
+
+      - name: Run real-backend integration test
+        # Three earlier attempts diagnosed the underlying problem:
+        # gnome-keyring-daemon --start brings up the D-Bus secret
+        # service correctly, but the `login` collection (which
+        # secret-tool defaults to) is only created by a real graphical
+        # login flow, not by --unlock against a headless runner. The
+        # smoke test from attempt 3 surfaced this verbatim:
+        # `secret-tool: Object does not exist at path
+        # "/org/freedesktop/secrets/collection/login"`.
+        #
+        # Bootstrap the collection programmatically via Python
+        # secretstorage (the libsecret Python binding). create_collection
+        # with empty password works against the daemon without the GUI
+        # prompter because libsecret accepts the empty-password code
+        # path for headless flows. Set the `default` alias to the new
+        # collection so secret-tool's default-collection lookup
+        # resolves correctly.
+        #
+        # Smoke test against secret-tool runs before the integration
+        # suite so any future regression in this setup chain surfaces
+        # a single-line diagnostic of which layer broke.
+        run: |
+          set -e
+
+          eval "$(dbus-launch --sh-syntax)"
+          eval "$(printf "" | gnome-keyring-daemon --start --components=secrets,pkcs11,ssh)"
+          export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
+
+          echo "=== Environment ==="
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+          echo "GNOME_KEYRING_CONTROL=$GNOME_KEYRING_CONTROL"
+          pgrep -af gnome-keyring-daemon || echo "(no daemon process)"
+
+          echo "=== Bootstrapping default collection via secretstorage ==="
+          python3 - <<'PY'
+          import secretstorage
+          conn = secretstorage.dbus_init()
+          # Try the default collection first; create one only if missing.
+          try:
+              col = secretstorage.get_default_collection(conn)
+              if col.is_locked():
+                  col.unlock()
+              print(f"default collection ready: locked={col.is_locked()} label={col.get_label()!r}")
+          except secretstorage.exceptions.ItemNotFoundException:
+              col = secretstorage.create_collection(conn, "default", alias="default", session=None)
+              if col.is_locked():
+                  col.unlock()
+              print(f"created default collection: locked={col.is_locked()}")
+          PY
+
+          echo "=== secret-tool smoke test ==="
+          if printf "smokevalue" | secret-tool store --label="smoke" service smoke-svc account smoke-acct; then
+            echo "  store: OK"
+          else
+            echo "  store: FAILED (exit $?)"
+            exit 1
+          fi
+          smoke_value=$(secret-tool lookup service smoke-svc account smoke-acct || echo "")
+          if [ "$smoke_value" = "smokevalue" ]; then
+            echo "  lookup: OK"
+          else
+            echo "  lookup: FAILED (got '$smoke_value')"
+            exit 1
+          fi
+          secret-tool clear service smoke-svc account smoke-acct || true
+          echo "=== smoke test passed ==="
+
+          cd server && npm test -- keychain-linux-real-backend-integration.test.ts
