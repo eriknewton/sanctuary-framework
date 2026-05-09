@@ -112,8 +112,14 @@ jobs:
           # underscored name is the console_script).
           python3 -m venv "$HOME/pss-venv"
           "$HOME/pss-venv/bin/pip" install --quiet --upgrade pip wheel
+          # cryptography is not declared in pass-secret-service 0.1a0's
+          # install_requires (verified by removing it and watching the
+          # daemon fail with ModuleNotFoundError in CI run 25611385152),
+          # so name it explicitly. Any version is fine; the
+          # sitecustomize shim below backfills the int_from_bytes symbol.
           "$HOME/pss-venv/bin/pip" install --quiet \
             "pygobject<3.50" \
+            cryptography \
             pass-secret-service
           # Backfill cryptography.utils.int_from_bytes via sitecustomize
           # so the daemon's import chain succeeds. sitecustomize.py is
