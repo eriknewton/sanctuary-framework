@@ -379,3 +379,32 @@ will never auto-regenerate the passphrase or re-encrypt state in response,
 because doing so would permanently destroy the original encrypted material.
 The remediation path is restoring the matching backup or, if the data is
 not recoverable, wiping the tenant directory and re-wrapping.
+
+## Real-backend CI exercise
+
+The Linux Secret Service backend is exercised end-to-end in CI via the
+`Keychain Linux Real-Backend Integration` workflow at
+`.github/workflows/keychain-linux-real-backend.yml`. The job uses
+`dbus-run-session` plus a daemonized `gnome-keyring-daemon` to create an
+isolated session bus and verifies round-trip save/load against the real
+`secret-tool` CLI. Mock coverage in
+`server/test/keychain-linux-secret-service.test.ts` remains authoritative
+for unit-level behavior; the real-backend job catches regressions in the
+shell-out shape (binary path, exit-code semantics, stdin handling,
+attribute serialization) that mocks cannot see.
+
+Test cases covered by the integration job:
+
+1. Round-trip via `getOrCreatePassphrase` (generate then read back).
+2. Round-trip via `persistUserProvidedPassphrase` plus `readStoredPassphrase`.
+3. Missing entry returns `null`.
+4. Per-tenant isolation: two distinct storage paths produce two distinct
+   keyring entries that do not alias.
+5. Graceful degrade to fallback file when `DBUS_SESSION_BUS_ADDRESS` is
+   suppressed (verifies invariant 5: fail-closed-but-encrypted, not silent
+   plaintext).
+
+The integration test file is gated by `describe.skipIf` so it skips cleanly
+on macOS and Windows runners and on Linux hosts without `secret-tool` or a
+session bus. Developers running `npm test` on macOS see the file as a
+skipped suite, not a failure.

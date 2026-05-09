@@ -1,0 +1,68 @@
+name: Keychain Linux Real-Backend Integration
+
+# Exercises the Linux Secret Service path in passphrase.ts against a real
+# secret-tool CLI plus a real gnome-keyring-daemon running on a per-job
+# dbus-run-session bus. Closes the gap carried since v0.10.1 PR #60 (mock
+# coverage only) and full-sweep #45 (P1).
+#
+# This workflow runs in addition to the standard CI workflow. The mock test
+# at server/test/keychain-linux-secret-service.test.ts remains authoritative
+# for unit-level behavior; this job catches regressions in the shell-out
+# shape that mocks cannot see.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server/src/cocoon/passphrase.ts'
+      - 'server/test/keychain-linux-real-backend-integration.test.ts'
+      - '.github/workflows/keychain-linux-real-backend.yml'
+  pull_request:
+    paths:
+      - 'server/src/cocoon/passphrase.ts'
+      - 'server/test/keychain-linux-real-backend-integration.test.ts'
+      - '.github/workflows/keychain-linux-real-backend.yml'
+
+jobs:
+  real-backend-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install Secret Service stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dbus dbus-x11 \
+            gnome-keyring \
+            libsecret-1-0 \
+            libsecret-tools
+
+      - name: Install npm deps
+        working-directory: server
+        run: npm ci
+
+      - name: Build
+        working-directory: server
+        run: npm run build
+
+      - name: Run real-backend integration test
+        # dbus-run-session creates a per-job session bus. gnome-keyring-daemon
+        # daemonizes against that bus and exports its env vars via stdout;
+        # eval picks them up so the npm child process inherits them. The
+        # keyring is volatile (no persistent storage), so test cleanup is
+        # automatic when the bus tears down at end-of-job.
+        run: |
+          dbus-run-session -- bash -c '
+            set -e
+            eval "$(printf "test-keyring-passphrase\n" | gnome-keyring-daemon --start --unlock --components=secrets)"
+            export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
+            cd server && npm test -- keychain-linux-real-backend-integration.test.ts
+          '
