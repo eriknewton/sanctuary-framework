@@ -63,6 +63,15 @@ function resolveCtx(args: AgentsCommandArgs): ResolvedCtx {
 export async function runAgentsCommand(
   args: AgentsCommandArgs
 ): Promise<number> {
+  // Parse --fortress from argv and plumb into discoverOpts.root.
+  const fortressIdx = args.argv.indexOf("--fortress");
+  if (fortressIdx !== -1 && args.argv[fortressIdx + 1]) {
+    args = { ...args, root: args.argv[fortressIdx + 1] };
+    // Strip --fortress <path> from argv so subcommands don't see it.
+    const filtered = [...args.argv];
+    filtered.splice(fortressIdx, 2);
+    args = { ...args, argv: filtered };
+  }
   const ctx = resolveCtx(args);
   const [sub, ...rest] = args.argv;
 
@@ -97,6 +106,10 @@ function printUsage(s: NodeJS.WritableStream): void {
   list [--json]                 List every tenant visible on this host.
   show <tenant> [--json]        Show details for one tenant.
   status [--json]               One-line-per-tenant running/stopped summary.
+
+Options:
+  --fortress <path>             Scope discovery to a specific storage path
+                                instead of scanning ~/.sanctuary.
 
 Tenants are discovered by scanning ~/.sanctuary and any storage paths in
 SANCTUARY_AGENTS_EXTRA_PATHS or ~/.sanctuary/agents-extra.json. Tenant

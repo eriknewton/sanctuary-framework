@@ -91,6 +91,7 @@ interface ModeAvailability {
 interface ParsedArgs {
   mode?: RecoveryMode;
   storage?: string;
+  fortress?: string;
   help: boolean;
 }
 
@@ -113,6 +114,7 @@ export async function runResetPassphraseCommand(
 
   const storagePath =
     parsed.storage ??
+    parsed.fortress ??
     args.storagePath ??
     resolveStoragePath(process.env, home);
 
@@ -181,6 +183,8 @@ function parseArgs(argv: string[]): ParsedArgs {
       out.mode = v;
     } else if (a === "--storage" && argv[i + 1]) {
       out.storage = argv[++i];
+    } else if (a === "--fortress" && argv[i + 1]) {
+      out.fortress = argv[++i];
     } else if (a && a.startsWith("--")) {
       throw new Error(`Unknown flag: ${a}`);
     }
@@ -211,9 +215,9 @@ Recover a fortress whose passphrase has been lost or corrupted. Three modes:
 
 Options:
   --mode <shares|guardian|nuke>   Pick a path non-interactively.
-  --storage <path>                Override the resolved storage path.
-                                  Defaults to SANCTUARY_STORAGE_PATH or
-                                  ~/.sanctuary.
+  --fortress <path>               Override the fortress storage path.
+                                  Consistent with "sanctuary wrap --fortress".
+  --storage <path>                Alias for --fortress.
   --help, -h                      Show this help.
 
 Without --mode, the command surveys which paths are operationally available
