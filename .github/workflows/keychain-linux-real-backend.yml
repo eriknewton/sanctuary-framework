@@ -54,15 +54,29 @@ jobs:
         run: npm run build
 
       - name: Run real-backend integration test
-        # dbus-run-session creates a per-job session bus. gnome-keyring-daemon
-        # daemonizes against that bus and exports its env vars via stdout;
-        # eval picks them up so the npm child process inherits them. The
-        # keyring is volatile (no persistent storage), so test cleanup is
-        # automatic when the bus tears down at end-of-job.
+        # Canonical dual-call pattern used by python-keyring's CI
+        # (https://github.com/jaraco/keyring/blob/main/.github/workflows/main.yml).
+        # Three steps in one shell so env vars from each eval persist
+        # into the npm test child process:
+        #
+        #   1. dbus-launch starts a session bus and exports
+        #      DBUS_SESSION_BUS_ADDRESS / DBUS_SESSION_BUS_PID via
+        #      --sh-syntax for eval.
+        #   2. First gnome-keyring-daemon --unlock initializes the
+        #      login keyring with an empty password (no display needed
+        #      because empty pw skips the prompter entirely).
+        #   3. Second gnome-keyring-daemon --start --components=secrets
+        #      daemonizes the secrets component against the bus and
+        #      exports GNOME_KEYRING_CONTROL plus SSH_AUTH_SOCK.
+        #
+        # An earlier attempt combined --start --unlock in a single call
+        # under dbus-run-session; that leaves the default keyring
+        # collection locked even though the login keyring is unlocked,
+        # so secret-tool store fires the gcr-prompter which fails with
+        # exit 1 on a headless runner. The dual-call pattern with empty
+        # password unlocks both the login and default collections.
         run: |
-          dbus-run-session -- bash -c '
-            set -e
-            eval "$(printf "test-keyring-passphrase\n" | gnome-keyring-daemon --start --unlock --components=secrets)"
-            export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
-            cd server && npm test -- keychain-linux-real-backend-integration.test.ts
-          '
+          eval $(dbus-launch --sh-syntax)
+          eval $(echo -n "" | gnome-keyring-daemon --unlock)
+          eval $(echo -n "" | gnome-keyring-daemon --start --components=secrets)
+          cd server && npm test -- keychain-linux-real-backend-integration.test.ts
