@@ -28,7 +28,12 @@ import {
   clearCustodyProvenanceStore,
   getCustodyProvenance as getCustodyProvenanceStub,
 } from "./custody-provenance-stub.js";
-import { clearAllRetryStates, safeVerify } from "./degrade-not-destroy.js";
+import {
+  clearAllRetryStates,
+  clearRetryState,
+  getRetryState,
+  safeVerify,
+} from "./degrade-not-destroy.js";
 import {
   FAILURE_MODE_CATALOG,
   getFailureMode,
@@ -252,6 +257,107 @@ export function updateActionBadge(
   source_event_ids?: string[]
 ): BadgeState {
   return updateActionFromContext(ctx, source_event_ids ?? []);
+}
+
+// -----------------------------------------------------------------------
+// Retry-state reset (operator-driven recovery)
+// -----------------------------------------------------------------------
+
+/**
+ * Audit event payload for an operator-triggered retry-state reset.
+ *
+ * Emission path: callers wire `auditSink` to whatever audit channel they
+ * have available (signed-event-stream broadcast on the dashboard side, an
+ * AuditLog.append call on a fully-cocooned host, an SSE named event for a
+ * thinner surface). The attestation module is pure logic and does not own
+ * an AuditLog reference; routing decisions stay with the caller.
+ *
+ * `attestation_retry_state_reset` is additive: existing event consumers
+ * unaffected. Use the constant `RETRY_STATE_RESET_EVENT_TYPE` rather than
+ * a string literal so consumer-side switch statements stay in sync.
+ */
+export const RETRY_STATE_RESET_EVENT_TYPE = "attestation_retry_state_reset";
+
+export interface AttestationRetryStateResetEvent {
+  type: typeof RETRY_STATE_RESET_EVENT_TYPE;
+  scope_id: string;
+  emitted_at: string;
+  prior_attempt_count?: number;
+  prior_failure_reason?: string;
+}
+
+export interface ResetScopeRetryStateOptions {
+  /**
+   * Optional sink for the `attestation_retry_state_reset` audit event.
+   * Callers that own an AuditLog (the dashboard's signed-event-stream, a
+   * cocooned host's L2 audit log) inject a thin adapter; pure-logic tests
+   * pass an array-pusher to assert emission.
+   *
+   * The sink is invoked synchronously after scope-id validation succeeds
+   * and BEFORE the in-process retry-state map is cleared, so the event
+   * can capture the prior attempt count and failure reason.
+   */
+  auditSink?: (event: AttestationRetryStateResetEvent) => void;
+}
+
+export interface ResetScopeRetryStateResult {
+  reset: boolean;
+  reason?: string;
+}
+
+/**
+ * Operator-triggered reset of in-process retry state for a scope. Use after
+ * fixing the underlying cause that produced verification failures so the
+ * next attestation call fires immediately rather than waiting for the
+ * exponential backoff window or for cached-badge expiry.
+ *
+ * Validates `scope_id` (rejects empty / whitespace / non-string), emits the
+ * audit event via `auditSink` if provided, then routes to the internal
+ * `clearRetryState` from `degrade-not-destroy.ts`.
+ *
+ * Architectural note: retry state is process-local and held in an
+ * in-memory `Map`. A CLI invocation in a separate process cannot reach the
+ * dashboard's running map; the meaningful operator surface is the
+ * dashboard "Reset" button which routes through this function inside the
+ * same process. A v1.3 work package can add an HTTP-IPC CLI wrapper that
+ * POSTs to the dashboard endpoint when the operator prefers a terminal.
+ */
+export function resetScopeRetryState(
+  scope_id: string,
+  options?: ResetScopeRetryStateOptions
+): ResetScopeRetryStateResult {
+  if (typeof scope_id !== "string") {
+    return { reset: false, reason: "scope_id is required and must be a string" };
+  }
+  const trimmed = scope_id.trim();
+  if (trimmed.length === 0) {
+    return {
+      reset: false,
+      reason: "scope_id must be a non-empty string",
+    };
+  }
+
+  // Capture prior state before the clear so the audit event records what
+  // was actually wiped, not the post-clear empty state.
+  const prior = getRetryState(trimmed);
+
+  if (options?.auditSink) {
+    try {
+      options.auditSink({
+        type: RETRY_STATE_RESET_EVENT_TYPE,
+        scope_id: trimmed,
+        emitted_at: new Date().toISOString(),
+        prior_attempt_count: prior?.attempt_count,
+        prior_failure_reason: prior?.last_failure_reason,
+      });
+    } catch {
+      // Audit emission failures must not stop the reset itself: the
+      // operator-visible badge clearing is the load-bearing behavior.
+    }
+  }
+
+  clearRetryState(trimmed);
+  return { reset: true };
 }
 
 // -----------------------------------------------------------------------
