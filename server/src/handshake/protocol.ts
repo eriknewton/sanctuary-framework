@@ -25,7 +25,11 @@ import type { IdentityManager } from "../l1-cognitive/tools.js";
 
 /** Generate a cryptographic nonce for handshake */
 function generateNonce(): string {
-  return toBase64url(randomBytes(32));
+  const nonce = randomBytes(32);
+  if (!nonce || nonce.length !== 32) {
+    throw new Error("Nonce generation failed: randomBytes returned unexpected length");
+  }
+  return toBase64url(nonce);
 }
 
 /**
@@ -209,6 +213,20 @@ export function verifyCompletion(
   completion: HandshakeCompletion,
   session: HandshakeSession
 ): HandshakeResult {
+  // Validate protocol version (runtime guard for untrusted input)
+  if ((completion as { protocol_version: string }).protocol_version !== "1.0") {
+    return {
+      counterparty_id: "unknown",
+      counterparty_shr: session.our_shr,
+      verified: false,
+      sovereignty_level: "unverified",
+      trust_tier: "unverified",
+      completed_at: completion.completed_at,
+      expires_at: new Date().toISOString(),
+      errors: [`Unsupported protocol version: ${(completion as { protocol_version: string }).protocol_version}`],
+    };
+  }
+
   const errors: string[] = [];
 
   if (!session.their_shr) {

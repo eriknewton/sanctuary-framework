@@ -153,6 +153,11 @@ export function deriveActionBadge(ctx: ActionLayerContext): BadgeStateColor {
     return "red";
   }
 
+  // If time-of-action was offline, return offline explicitly
+  if (ctx.time_of_action_state === "offline") {
+    return "offline";
+  }
+
   // If time-of-action was green but current verifier disagrees
   if (
     ctx.time_of_action_state === "green" &&
