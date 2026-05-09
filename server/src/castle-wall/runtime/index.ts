@@ -19,3 +19,4 @@ export * from "./audit-consumer.js";
 export * from "./approval-stub.js";
 export * from "./ipc-client.js";
 export * from "./lifecycle.js";
+export * from "./macos-flow-events.js";

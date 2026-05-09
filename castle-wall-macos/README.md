@@ -7,16 +7,19 @@ entitlement gates the kernel-attached chokepoint.
 
 ## Status
 
-**Foundation scaffold only.** This package compiles, signs (during release
-flow), and exposes the IPC contract toward Sanctuary main. It does NOT
-yet enforce egress decisions on real flows. The build sequence:
+**Packet filter logic + manifest sync engaged (Alpha-2).** The package
+ships a working `handleNewFlow` verdict path that consults a manifest
+snapshot received via IPC, an LRU flow cache for hot destinations, and
+new IPC notifications for flow decisions + pending approvals.
+Loaded-extension integration tests + audit-emit pipeline + install flow
+land in subsequent Alpha builds.
 
-| Build | Scope |
-|-------|-------|
-| Alpha-1 (this) | Project structure, NEFilterProvider subclass, UDS IPC client, Ed25519 handshake verification, macOS CI, unit tests |
-| Alpha-2 | Real `handleNewFlow` decisions, manifest-store sync, per-process scoping |
-| Alpha-3 | Audit emit, Tier B coverage (DoH, DoT, content-filter equivalents) |
-| Alpha-4 | Install + uninstall flow, signed dmg, notarization, host-app launcher with operator notification UX |
+| Build | Scope | Status |
+|-------|-------|--------|
+| Alpha-1 | Project structure, NEFilterProvider subclass, UDS IPC client, Ed25519 handshake verification, macOS CI, unit tests | Shipped (PR #150) |
+| Alpha-2 (this) | NEFilterProvider verdict logic, manifest store + flow cache, IPC bridge for manifest sync + flow decision telemetry, server-side handler module | This PR |
+| Alpha-3 | Audit emit pipeline, Tier B coverage (DoH, DoT, content-filter equivalents), loaded-extension integration tests, p99 perf measurement | Pending |
+| Alpha-4 | Install + uninstall flow, signed dmg, notarization, host-app launcher with operator notification UX | Pending |
 
 ## Relationship to `castle-wall-daemon/` (Linux)
 
@@ -128,11 +131,15 @@ identity binding is the load-bearing trust anchor.
 
 ## What ships in subsequent builds
 
-- Alpha-2: real packet decisions, manifest sync, per-process attribution.
 - Alpha-3: audit-emit pipeline, Tier B test surface (DoH, DoT, content
-  filter parity with the Linux daemon's coverage matrix).
+  filter parity with the Linux daemon's coverage matrix), loaded-extension
+  integration tests against real NEFilterFlow shapes, p99 performance
+  measurement on allowed traffic.
 - Alpha-4: install / uninstall flow, signed dmg, notarization, host-app
-  launcher with operator-facing notification UX.
+  launcher with operator-facing notification UX, operator approval flow
+  wiring (the verdict path here surfaces `flow_pending_approval`; the
+  operator-decision IPC return path lands in Alpha-4 alongside the
+  notification UX).
 
 Phase 2 (Windows) and Phase 3 (container/microVM) are out of scope for
 the macOS work package.

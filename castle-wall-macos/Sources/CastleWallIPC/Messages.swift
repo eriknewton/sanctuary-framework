@@ -13,6 +13,11 @@
 // audit_drain_ack. Subsequent builds may extend; existing variants are
 // frozen wire shape.
 //
+// Alpha-2 additions (Castle Wall macOS Phase 1 packet filter + manifest
+// sync): manifest_subscribe, manifest_updated, flow_decision_recorded,
+// flow_pending_approval. Phase 1 ships full-snapshot manifest sync; delta
+// patches are reserved for v1.x.
+//
 
 import Foundation
 
@@ -51,6 +56,10 @@ public enum IpcMessage: Codable, Equatable {
     case lockNotification(fortressId: String, lockedAt: String)
     case handshakeChallenge(nonceB64url: String)
     case handshakeResponse(HandshakeResponseBody)
+    case manifestSubscribe(requestId: String)
+    case manifestUpdated(ManifestUpdatedBody)
+    case flowDecisionRecorded(FlowDecisionRecordedBody)
+    case flowPendingApproval(FlowPendingApprovalBody)
 
     private enum DiscriminatorKeys: String, CodingKey {
         case type
@@ -104,6 +113,15 @@ public enum IpcMessage: Codable, Equatable {
             self = .handshakeChallenge(nonceB64url: inner.nonceB64url)
         case "handshake_response":
             self = .handshakeResponse(try body.decode(HandshakeResponseBody.self))
+        case "manifest_subscribe":
+            let inner = try body.decode(ManifestSubscribeEnvelopeBody.self)
+            self = .manifestSubscribe(requestId: inner.requestId)
+        case "manifest_updated":
+            self = .manifestUpdated(try body.decode(ManifestUpdatedBody.self))
+        case "flow_decision_recorded":
+            self = .flowDecisionRecorded(try body.decode(FlowDecisionRecordedBody.self))
+        case "flow_pending_approval":
+            self = .flowPendingApproval(try body.decode(FlowPendingApprovalBody.self))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type,
@@ -169,6 +187,17 @@ public enum IpcMessage: Codable, Equatable {
                 nonceB64url: nonceB64url
             ))
         case .handshakeResponse(let body):
+            try container.encode(body)
+        case .manifestSubscribe(let requestId):
+            try container.encode(ManifestSubscribeEnvelopeBody(
+                type: "manifest_subscribe",
+                requestId: requestId
+            ))
+        case .manifestUpdated(let body):
+            try container.encode(body)
+        case .flowDecisionRecorded(let body):
+            try container.encode(body)
+        case .flowPendingApproval(let body):
             try container.encode(body)
         }
     }
@@ -487,6 +516,271 @@ public struct HandshakeResponseBody: Codable, Equatable {
     }
 }
 
+// MARK: - Alpha-2: manifest sync + flow decision telemetry
+
+/// Allowlist rule shape mirroring `server/src/castle-wall/allowlist/schema.ts`.
+/// The runtime ships the full snapshot inside `manifest_updated`; the
+/// extension's evaluator consumes this shape directly.
+public struct ManifestRule: Codable, Equatable {
+    public let id: String
+    public let schemaVersion: UInt32
+    public let createdAt: String
+    public let description: String?
+    public let match: ManifestRuleMatch
+    public let scope: ManifestRuleScope
+    public let disposition: String
+    public let timeWindow: ManifestRuleTimeWindow?
+
+    public init(
+        id: String,
+        schemaVersion: UInt32,
+        createdAt: String,
+        description: String?,
+        match: ManifestRuleMatch,
+        scope: ManifestRuleScope,
+        disposition: String,
+        timeWindow: ManifestRuleTimeWindow?
+    ) {
+        self.id = id
+        self.schemaVersion = schemaVersion
+        self.createdAt = createdAt
+        self.description = description
+        self.match = match
+        self.scope = scope
+        self.disposition = disposition
+        self.timeWindow = timeWindow
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case schemaVersion = "schema_version"
+        case createdAt = "created_at"
+        case description
+        case match
+        case scope
+        case disposition
+        case timeWindow = "time_window"
+    }
+}
+
+/// A `host` field that accepts either a single string or an array of strings.
+/// Mirrors the TypeScript `string | string[]` union in `schema.ts`.
+public enum ManifestRuleHostMatch: Codable, Equatable {
+    case single(String)
+    case multiple([String])
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let one = try? container.decode(String.self) {
+            self = .single(one)
+            return
+        }
+        if let many = try? container.decode([String].self) {
+            self = .multiple(many)
+            return
+        }
+        throw DecodingError.dataCorruptedError(
+            in: container,
+            debugDescription: "host must be string or [string]"
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .single(let s):
+            try container.encode(s)
+        case .multiple(let arr):
+            try container.encode(arr)
+        }
+    }
+
+    /// Iterate the host strings without forcing the caller to switch.
+    public var values: [String] {
+        switch self {
+        case .single(let s): return [s]
+        case .multiple(let arr): return arr
+        }
+    }
+}
+
+/// A `port` field that accepts either a single number or an array of numbers.
+public enum ManifestRulePortMatch: Codable, Equatable {
+    case single(Int)
+    case multiple([Int])
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let one = try? container.decode(Int.self) {
+            self = .single(one)
+            return
+        }
+        if let many = try? container.decode([Int].self) {
+            self = .multiple(many)
+            return
+        }
+        throw DecodingError.dataCorruptedError(
+            in: container,
+            debugDescription: "port must be int or [int]"
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .single(let n):
+            try container.encode(n)
+        case .multiple(let arr):
+            try container.encode(arr)
+        }
+    }
+
+    public var values: [Int] {
+        switch self {
+        case .single(let n): return [n]
+        case .multiple(let arr): return arr
+        }
+    }
+}
+
+public struct ManifestRuleMatch: Codable, Equatable {
+    public let host: ManifestRuleHostMatch?
+    public let hostPattern: String?
+    public let port: ManifestRulePortMatch?
+    public let protocolName: String?
+
+    public init(
+        host: ManifestRuleHostMatch?,
+        hostPattern: String?,
+        port: ManifestRulePortMatch?,
+        protocolName: String?
+    ) {
+        self.host = host
+        self.hostPattern = hostPattern
+        self.port = port
+        self.protocolName = protocolName
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case host
+        case hostPattern = "host_pattern"
+        case port
+        case protocolName = "protocol"
+    }
+}
+
+public struct ManifestRuleScope: Codable, Equatable {
+    public let agentIds: [String]?
+    public let templateIds: [String]?
+
+    public init(agentIds: [String]?, templateIds: [String]?) {
+        self.agentIds = agentIds
+        self.templateIds = templateIds
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case agentIds = "agent_ids"
+        case templateIds = "template_ids"
+    }
+}
+
+public struct ManifestRuleTimeWindow: Codable, Equatable {
+    public let start: String
+    public let end: String
+
+    public init(start: String, end: String) {
+        self.start = start
+        self.end = end
+    }
+}
+
+/// `manifest_updated` notification body. Phase 1 ships full-snapshot rules.
+public struct ManifestUpdatedBody: Codable, Equatable {
+    public let type: String
+    public let manifestSignatureB64url: String?
+    public let rules: [ManifestRule]
+
+    public init(manifestSignatureB64url: String?, rules: [ManifestRule]) {
+        self.type = "manifest_updated"
+        self.manifestSignatureB64url = manifestSignatureB64url
+        self.rules = rules
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case manifestSignatureB64url = "manifest_signature_b64url"
+        case rules
+    }
+}
+
+/// `flow_decision_recorded` notification body.
+public struct FlowDecisionRecordedBody: Codable, Equatable {
+    public let type: String
+    public let decision: String
+    public let destination: IpcDestination
+    public let agent: IpcAgentAttribution
+    public let matchedRuleId: String?
+    public let recordedAt: String
+
+    public init(
+        decision: String,
+        destination: IpcDestination,
+        agent: IpcAgentAttribution,
+        matchedRuleId: String?,
+        recordedAt: String
+    ) {
+        self.type = "flow_decision_recorded"
+        self.decision = decision
+        self.destination = destination
+        self.agent = agent
+        self.matchedRuleId = matchedRuleId
+        self.recordedAt = recordedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case decision
+        case destination
+        case agent
+        case matchedRuleId = "matched_rule_id"
+        case recordedAt = "recorded_at"
+    }
+}
+
+/// `flow_pending_approval` notification body.
+public struct FlowPendingApprovalBody: Codable, Equatable {
+    public let type: String
+    public let requestId: String
+    public let destination: IpcDestination
+    public let agent: IpcAgentAttribution
+    public let surface: String
+    public let expiresInSeconds: UInt32
+
+    public init(
+        requestId: String,
+        destination: IpcDestination,
+        agent: IpcAgentAttribution,
+        surface: String,
+        expiresInSeconds: UInt32
+    ) {
+        self.type = "flow_pending_approval"
+        self.requestId = requestId
+        self.destination = destination
+        self.agent = agent
+        self.surface = surface
+        self.expiresInSeconds = expiresInSeconds
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case requestId = "request_id"
+        case destination
+        case agent
+        case surface
+        case expiresInSeconds = "expires_in_seconds"
+    }
+}
+
 // MARK: - Internal envelope-wire bodies for variants without dedicated public structs
 
 private struct StatusRequestEnvelopeBody: Codable {
@@ -573,6 +867,16 @@ private struct HandshakeChallengeEnvelopeBody: Codable {
     enum CodingKeys: String, CodingKey {
         case type
         case nonceB64url = "nonce_b64url"
+    }
+}
+
+private struct ManifestSubscribeEnvelopeBody: Codable {
+    let type: String
+    let requestId: String
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case requestId = "request_id"
     }
 }
 
