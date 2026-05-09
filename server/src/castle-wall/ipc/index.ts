@@ -19,6 +19,10 @@ export type {
   LockNotification,
   HandshakeChallenge,
   HandshakeResponse,
+  ManifestSubscribeRequest,
+  ManifestUpdatedNotification,
+  FlowDecisionRecordedNotification,
+  FlowPendingApprovalNotification,
 } from "./messages.js";
 
 export type { ParseStep } from "./framing.js";

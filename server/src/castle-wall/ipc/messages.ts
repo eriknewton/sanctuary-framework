@@ -19,6 +19,7 @@
  */
 
 import type { CastleWallAuditEvent } from "../audit/events.js";
+import type { AllowlistRule } from "../allowlist/schema.js";
 
 /** JSON-RPC 2.0 request id. The daemon and main both generate these as 16-byte hex. */
 export type IpcRequestId = string;
@@ -36,7 +37,11 @@ export type CastleWallMessage =
   | UnlockNotification
   | LockNotification
   | HandshakeChallenge
-  | HandshakeResponse;
+  | HandshakeResponse
+  | ManifestSubscribeRequest
+  | ManifestUpdatedNotification
+  | FlowDecisionRecordedNotification
+  | FlowPendingApprovalNotification;
 
 /** Request from main to daemon: "are you alive?" */
 export interface StatusRequest {
@@ -173,4 +178,68 @@ export interface HandshakeResponse {
   fortress_id: string;
   signing_key_id: string;
   nonce_signature_b64url: string;
+}
+
+/**
+ * Castle Wall macOS Phase 1 (Alpha-2) message types: manifest sync + flow
+ * decision telemetry.
+ *
+ * Source: Castle Wall macOS Phase 1 packet filter + manifest sync spawn
+ * prompt (2026-05-11), section "Server-side IPC additions". Reserved as a
+ * dedicated message-class block per Federation Protocol v0.1 section 10.3.
+ */
+
+/**
+ * Subscribe request from the macOS system extension. The runtime registers
+ * the connection as a manifest-change subscriber; subscription is cleared
+ * when the IPC connection closes. The runtime emits an immediate
+ * `manifest_updated` notification carrying the current snapshot so the
+ * extension boots with an authoritative ruleset.
+ */
+export interface ManifestSubscribeRequest {
+  type: "manifest_subscribe";
+  request_id: IpcRequestId;
+}
+
+/**
+ * Notification from runtime to subscribers. Phase 1 ships a full snapshot;
+ * future surfaces may add a delta variant under a different `type`.
+ */
+export interface ManifestUpdatedNotification {
+  type: "manifest_updated";
+  manifest_signature_b64url: string | null;
+  rules: AllowlistRule[];
+}
+
+/**
+ * The verdict the macOS extension recorded on a flow. Phase 1 verdicts are
+ * binary: `allow` (a manifest rule matched as `allow`) or `drop` (manifest
+ * rule matched as `deny`, OR default-deny because no rule matched after the
+ * uncertain branch resolved to drop). The `matched_rule_id` is the
+ * authoritative provenance link for the audit log; `null` indicates the
+ * default-deny branch with no matching rule.
+ */
+export interface FlowDecisionRecordedNotification {
+  type: "flow_decision_recorded";
+  decision: "allow" | "drop";
+  destination: IpcDestination;
+  agent: IpcAgentAttribution;
+  matched_rule_id: string | null;
+  recorded_at: string;
+}
+
+/**
+ * Surface from the macOS extension when a flow's evaluation outcome is
+ * Uncertain (no allow rule, no deny rule, default-deny pending operator
+ * decision). The runtime queues the request into the existing approval
+ * pipeline; the eventual operator decision lands back on the extension via
+ * a separate `decision_response` envelope keyed by `request_id`.
+ */
+export interface FlowPendingApprovalNotification {
+  type: "flow_pending_approval";
+  request_id: IpcRequestId;
+  destination: IpcDestination;
+  agent: IpcAgentAttribution;
+  surface: "egress";
+  expires_in_seconds: number;
 }
