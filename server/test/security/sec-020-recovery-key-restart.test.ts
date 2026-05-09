@@ -202,7 +202,7 @@ describe("SEC-020: Recovery key path must not regenerate master key", () => {
 
     await expect(
       createSanctuaryServer({ storage })
-    ).rejects.toThrow(/corrupted|incomplete/i);
+    ).rejects.toThrow(/passphrase required/i);
   });
 
   // ── Passphrase path still works (non-regression) ───────────────────

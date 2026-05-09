@@ -218,15 +218,24 @@ export function lintOnboarding(
 // ═══════════════════════════════════════════════════════════════════════
 
 function resolveTemplatesDir(): string {
-  // Works in both source (ts) and compiled (js) contexts
+  // Works in both source (ts) and compiled (js) contexts.
   const thisFile = fileURLToPath(import.meta.url);
   const thisDir = dirname(thisFile);
-  // In source: server/src/templates/registry.ts → server/src/templates/
-  // In compiled: server/dist/templates/registry.js → server/dist/templates/
-  // Templates ship as source under server/src/templates/<name>/.
-  // When running compiled, we need to resolve back to src.
+  // In source: server/src/templates/registry.ts -> server/src/templates/
+  // In compiled (local dev): server/dist/templates/ -> check dist first, fallback to src
+  // In compiled (npm install): server/dist/templates/ -> dist has the copies
+  //
+  // The build copies template asset directories into dist/templates/ via
+  // scripts/copy-templates.js. When running from an npm install, src/ does
+  // not exist; dist/templates/ is the only location.
   if (thisDir.includes("/dist/")) {
-    return thisDir.replace("/dist/templates", "/src/templates");
+    // Prefer dist/templates/ (works for npm installs). Fall back to
+    // src/templates/ for local dev when the build hasn't run yet.
+    const srcFallback = thisDir.replace("/dist/templates", "/src/templates");
+    if (existsSync(join(thisDir, TEMPLATE_NAMES[0]))) {
+      return thisDir;
+    }
+    return srcFallback;
   }
   return thisDir;
 }

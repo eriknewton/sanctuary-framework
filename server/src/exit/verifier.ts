@@ -6,6 +6,18 @@
  * verifiable from public material in the bundle.
  */
 
+/**
+ * v1.2.1 (Finding PPP): thrown when a directory is not a valid exit bundle
+ * (e.g., missing manifest.json). Distinguished from verification failures
+ * (signature mismatch, hash mismatch) which return `passed: false`.
+ */
+export class InvalidExitBundleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidExitBundleError";
+  }
+}
+
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
@@ -330,7 +342,9 @@ export async function verifyExitBundle(
     manifestBytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
     manifest = JSON.parse(Buffer.from(raw).toString("utf8")) as ExitBundleManifest;
   } catch {
-    return fail(root, null, "other", ["manifest.json is missing or unreadable"]);
+    throw new InvalidExitBundleError(
+      `Not a valid SANCTUARY_EXIT_BUNDLE_V1 directory: manifest.json missing at ${join(root, "manifest.json")}`,
+    );
   }
 
   const warnings: string[] = [];

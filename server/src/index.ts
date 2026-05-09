@@ -200,9 +200,10 @@ export async function createSanctuaryServer(options?: {
       const hasKeyParams = existingNamespaces.some(e => e.key === "key-params");
       if (hasKeyParams) {
         throw new Error(
-          "Sanctuary: Found existing key derivation parameters but no recovery key hash.\n" +
-          "This indicates a corrupted or incomplete installation.\n" +
-          "If you previously used a passphrase, set SANCTUARY_PASSPHRASE to start."
+          "Sanctuary: passphrase required.\n\n" +
+          "The fortress at this path uses passphrase-mode key derivation.\n" +
+          "Set SANCTUARY_PASSPHRASE in your environment, or run\n" +
+          "'sanctuary export-passphrase' to retrieve it from the macOS Keychain."
         );
       }
 
