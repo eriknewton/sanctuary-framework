@@ -74,36 +74,44 @@ jobs:
         run: |
           set -e
           sudo apt-get update -qq
-          # python3-gi + gir1.2-glib-2.0 ship Ubuntu's pre-built PyGObject
-          # 3.48 against libgirepository1.0. We rely on it (via pipx's
-          # --system-site-packages below) instead of letting pip build
-          # PyGObject from source: pip pulls latest PyGObject 3.50+, which
-          # requires libgirepository-2.0-dev, a package Ubuntu 24.04 does
-          # not ship. The from-source build also pulls pycairo, which
-          # needs libcairo2-dev. Both failure modes were observed in the
-          # PR #154 CI run and are sidestepped entirely by reusing the
-          # system PyGObject.
+          # Build deps for the from-source compile of PyGObject below:
+          # libcairo2-dev (pycairo headers), libgirepository1.0-dev
+          # (GObject introspection 1.x headers, the version Ubuntu 24.04
+          # ships; 2.0 is not in noble's archive), pkg-config + python3-dev
+          # for the meson configure step. gir1.2-glib-2.0 is the runtime
+          # typelib PyGObject loads on import.
           sudo apt-get install -y -qq \
             dbus dbus-x11 \
             gnupg \
             pass \
             libsecret-tools \
-            pipx \
-            python3-gi \
+            python3-venv \
+            python3-dev \
+            libcairo2-dev \
+            libgirepository1.0-dev \
+            pkg-config \
             gir1.2-glib-2.0
-          # --system-site-packages lets the pipx-managed venv see the
-          # apt-installed PyGObject, so pip resolves PyGObject as already
-          # satisfied and skips the from-source build that previously
-          # failed on `cairo` and `libgirepository-2.0` headers. pipx
-          # still isolates pass-secret-service's own pure-Python deps.
-          # Entry point lands at ~/.local/bin/pass_secret_service (note
-          # the underscores: pip installs the package under the hyphenated
-          # name pass-secret-service, but the console_script the package
-          # exposes is pass_secret_service). The default GitHub Actions
-          # PATH does not include ~/.local/bin for non-login shells, so
-          # add it explicitly via GITHUB_PATH.
-          pipx install --system-site-packages pass-secret-service
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # pass-secret-service has shipped only one PyPI release (0.1a0,
+          # 2018) and its imports drifted out of compatibility with
+          # current Ubuntu defaults on two fronts:
+          #   1. cryptography.utils.int_from_bytes was removed in
+          #      cryptography 41.0.0 (May 2023); pin <41.
+          #   2. PyGObject 3.50+ requires libgirepository-2.0-dev, a
+          #      package Ubuntu 24.04 does not ship; pin <3.50 so the
+          #      build links against libgirepository1.0-dev instead.
+          # Plain venv (not pipx) gives exact control of dep resolution.
+          # pipx defaults to latest PyPI versions, which are not
+          # version-compatible with pass-secret-service 0.1a0 anymore.
+          # Entry point inside the venv is pass_secret_service
+          # (underscores; the hyphenated name is the PyPI package, the
+          # underscored name is the console_script).
+          python3 -m venv "$HOME/pss-venv"
+          "$HOME/pss-venv/bin/pip" install --quiet --upgrade pip wheel
+          "$HOME/pss-venv/bin/pip" install --quiet \
+            "cryptography<41" \
+            "pygobject<3.50" \
+            pass-secret-service
+          echo "$HOME/pss-venv/bin" >> "$GITHUB_PATH"
 
       - name: Install npm deps
         working-directory: server
