@@ -14,6 +14,18 @@ on:
     branches: [main]
 
 jobs:
+  panic-discipline:
+    # Asserts that every .unwrap() / .expect() in non-test Rust code under
+    # castle-wall-daemon/src/ is either inside a #[cfg(test)] mod block or
+    # carries a // Safety: invariant annotation (PR #138 pattern). Pure
+    # text analysis; runs in seconds on a stock ubuntu runner with no
+    # privileged setup.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check Castle Wall daemon panic discipline
+        run: python3 castle-wall-daemon/scripts/check-panic-discipline.py castle-wall-daemon/src
+
   castle-wall-linux-integration:
     runs-on: ubuntu-24.04
     # Run as root so nftables + NFQUEUE + cgroup operations succeed
