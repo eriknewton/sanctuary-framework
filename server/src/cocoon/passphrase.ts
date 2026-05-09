@@ -21,7 +21,7 @@
 import { spawn } from "node:child_process";
 import { readFile, writeFile, mkdir, access } from "node:fs/promises";
 import { homedir, hostname, platform, userInfo } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { gcm } from "@noble/ciphers/aes.js";
 import { hkdf } from "@noble/hashes/hkdf";
@@ -152,16 +152,31 @@ export async function getOrCreatePassphrase(
   const exec = opts.exec ?? defaultExec;
   const derive = opts.deriveMachineKey ?? deriveMachineKey;
 
-  // 1. Try the OS keyring.
+  const legacyService = legacyKeychainServiceFor(storagePath, home);
+
+  // 1. Try the OS keyring (current 16-hex name, then legacy 12-hex fallback).
   if (plat === "darwin") {
     const fromKc = await readFromKeychain(exec, service);
     if (fromKc) {
       return { value: fromKc, source: "keychain", location: OS_KEYRING_LOCATION_MACOS };
     }
+    // Legacy fallback: try the old 12-hex service name for pre-v1.2.3 entries.
+    if (legacyService !== service) {
+      const fromLegacy = await readFromKeychain(exec, legacyService);
+      if (fromLegacy) {
+        return { value: fromLegacy, source: "keychain", location: OS_KEYRING_LOCATION_MACOS };
+      }
+    }
   } else if (plat === "linux") {
     const fromSs = await readFromSecretService(exec, service);
     if (fromSs) {
       return { value: fromSs, source: "keychain", location: OS_KEYRING_LOCATION_LINUX };
+    }
+    if (legacyService !== service) {
+      const fromLegacy = await readFromSecretService(exec, legacyService);
+      if (fromLegacy) {
+        return { value: fromLegacy, source: "keychain", location: OS_KEYRING_LOCATION_LINUX };
+      }
     }
   }
 
@@ -180,6 +195,7 @@ export async function getOrCreatePassphrase(
   }
 
   // 3. Generate and store (only reachable when no prior passphrase exists).
+  //    Writes always go to the new 16-hex service name.
   const value = generatePassphrase();
   if (plat === "darwin") {
     const ok = await writeToKeychain(value, exec, service);
@@ -210,6 +226,7 @@ export async function readStoredPassphrase(
   const home = opts.home ?? homedir();
   const storagePath = opts.storagePath ?? resolveStoragePath(process.env, home);
   const service = keychainServiceFor(storagePath, home);
+  const legacyService = legacyKeychainServiceFor(storagePath, home);
   const plat = opts.platformOverride ?? platform();
   const exec = opts.exec ?? defaultExec;
   const derive = opts.deriveMachineKey ?? deriveMachineKey;
@@ -219,10 +236,22 @@ export async function readStoredPassphrase(
     if (fromKc) {
       return { value: fromKc, source: "keychain", location: OS_KEYRING_LOCATION_MACOS };
     }
+    if (legacyService !== service) {
+      const fromLegacy = await readFromKeychain(exec, legacyService);
+      if (fromLegacy) {
+        return { value: fromLegacy, source: "keychain", location: OS_KEYRING_LOCATION_MACOS };
+      }
+    }
   } else if (plat === "linux") {
     const fromSs = await readFromSecretService(exec, service);
     if (fromSs) {
       return { value: fromSs, source: "keychain", location: OS_KEYRING_LOCATION_LINUX };
+    }
+    if (legacyService !== service) {
+      const fromLegacy = await readFromSecretService(exec, legacyService);
+      if (fromLegacy) {
+        return { value: fromLegacy, source: "keychain", location: OS_KEYRING_LOCATION_LINUX };
+      }
     }
   }
 
@@ -347,18 +376,41 @@ async function writeToKeychain(
  * Backward compatibility: for the default storage path (`~/.sanctuary` with
  * no env override), the service name is the legacy `sanctuary-passphrase`,
  * so pre-existing wraps continue to read their saved passphrase.
+ *
+ * Path canonicalization: uses `path.resolve()` (NOT `realpath`) to normalize
+ * `.`, `..`, doubled separators, and trailing slashes before comparison and
+ * hashing. Two processes targeting the same canonical path always produce the
+ * same service name regardless of cosmetic path differences.
  */
 export function keychainServiceFor(
   storagePath: string,
   home: string = homedir()
 ): string {
-  const defaultPath = join(home, DEFAULT_STORAGE_DIR);
-  if (storagePath === defaultPath) return KEYCHAIN_SERVICE_DEFAULT;
+  const defaultPath = resolve(join(home, DEFAULT_STORAGE_DIR));
+  const canonicalStorage = resolve(storagePath);
+  if (canonicalStorage === defaultPath) return KEYCHAIN_SERVICE_DEFAULT;
 
-  // Stable 12-char hex hash of the full storage path — short enough to be
-  // legible in a Keychain listing, long enough to avoid collisions on any
-  // reasonable fleet.
-  const digest = sha256(Buffer.from(storagePath, "utf-8"));
+  // Stable 16-char hex hash of the canonical storage path. Birthday bound
+  // ~2^32 paths (was 12 hex / 2^24 prior to v1.2.3).
+  const digest = sha256(Buffer.from(canonicalStorage, "utf-8"));
+  const suffix = Buffer.from(digest).toString("hex").slice(0, 16);
+  return `${KEYCHAIN_SERVICE_DEFAULT}-${suffix}`;
+}
+
+/**
+ * Legacy service name (12-hex suffix) for backward-compatible keychain reads.
+ * Used by the fallback path in keychain lookup: try the current 16-hex name
+ * first, fall back to the legacy 12-hex name for pre-v1.2.3 entries.
+ */
+export function legacyKeychainServiceFor(
+  storagePath: string,
+  home: string = homedir()
+): string {
+  const defaultPath = resolve(join(home, DEFAULT_STORAGE_DIR));
+  const canonicalStorage = resolve(storagePath);
+  if (canonicalStorage === defaultPath) return KEYCHAIN_SERVICE_DEFAULT;
+
+  const digest = sha256(Buffer.from(canonicalStorage, "utf-8"));
   const suffix = Buffer.from(digest).toString("hex").slice(0, 12);
   return `${KEYCHAIN_SERVICE_DEFAULT}-${suffix}`;
 }

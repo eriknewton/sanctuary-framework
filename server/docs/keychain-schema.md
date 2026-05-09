@@ -34,15 +34,18 @@ who has it can decrypt all of that tenant's state.
 
 | Field          | Value                                                         |
 |----------------|---------------------------------------------------------------|
-| Service name   | `sanctuary-passphrase` (default tenant) **or** `sanctuary-passphrase-<12hex>` (per-tenant) |
+| Service name   | `sanctuary-passphrase` (default tenant) **or** `sanctuary-passphrase-<16hex>` (per-tenant, v1.2.3+; was 12-hex before v1.2.3) |
 | Account        | `sanctuary` (constant)                                        |
 | Item kind      | Generic password                                              |
 | Value          | The base64-encoded 32-byte passphrase                         |
 
-The `<12hex>` suffix is the first 12 hex characters of `SHA-256(storage_path)`
-computed by `keychainServiceFor()` in
-[`src/cocoon/passphrase.ts`](../src/cocoon/passphrase.ts). It is **derived
-from the storage path, not from any identity ID**. Two tenants with distinct
+The `<16hex>` suffix is the first 16 hex characters (64 bits) of
+`SHA-256(canonical_storage_path)` computed by `keychainServiceFor()` in
+[`src/cocoon/passphrase.ts`](../src/cocoon/passphrase.ts). The storage path
+is canonicalized via `path.resolve()` before hashing, so cosmetic path
+differences (trailing slashes, `.` segments, `..` segments, doubled
+separators) always resolve to the same service name. It is **derived from
+the storage path, not from any identity ID**. Two tenants with distinct
 storage paths get distinct keychain entries; one tenant with eight identities
 still has exactly one keychain entry.
 
@@ -64,7 +67,7 @@ security find-generic-password -a sanctuary -s '<service-name>' -w
 ```
 
 Replace `<service-name>` with `sanctuary-passphrase` for the default tenant
-or `sanctuary-passphrase-<12hex>` for a sub-tenant. `sanctuary agents` prints
+or `sanctuary-passphrase-<16hex>` for a sub-tenant. `sanctuary agents` prints
 the right service name for every discovered tenant.
 
 ### Linux: Secret Service (preferred)
@@ -78,7 +81,7 @@ Debian/Ubuntu).
 
 | Field          | Value                                                         |
 |----------------|---------------------------------------------------------------|
-| Service attr   | `sanctuary-passphrase` (default tenant) **or** `sanctuary-passphrase-<12hex>` (per-tenant) |
+| Service attr   | `sanctuary-passphrase` (default tenant) **or** `sanctuary-passphrase-<16hex>` (per-tenant, v1.2.3+; was 12-hex before v1.2.3) |
 | Account attr   | `sanctuary` (constant)                                        |
 | Label          | `Sanctuary Passphrase` (shown in Seahorse / KWalletManager)   |
 | Value          | The base64-encoded 32-byte passphrase                         |
@@ -97,7 +100,7 @@ secret-tool search service sanctuary-passphrase
 Or, for a specific tenant:
 
 ```sh
-secret-tool search service sanctuary-passphrase-<12hex>
+secret-tool search service sanctuary-passphrase-<16hex>
 ```
 
 You can read one entry's value with:
@@ -107,7 +110,7 @@ secret-tool lookup service <service-name> account sanctuary
 ```
 
 Replace `<service-name>` with `sanctuary-passphrase` for the default tenant
-or `sanctuary-passphrase-<12hex>` for a sub-tenant. `sanctuary agents` prints
+or `sanctuary-passphrase-<16hex>` for a sub-tenant. `sanctuary agents` prints
 the right service name for every discovered tenant, same as on macOS.
 
 Sanctuary falls through to the encrypted fallback file (described below)
@@ -228,7 +231,7 @@ suffix — they are two independent random values derived from different inputs:
 | What                   | Source                                      | Length     |
 |------------------------|---------------------------------------------|------------|
 | Identity ID            | sha256(public_key)                          | 16 hex     |
-| Keychain service suffix| sha256(storage_path) first 12 hex           | 12 hex     |
+| Keychain service suffix| sha256(canonical_storage_path) first 16 hex | 16 hex     |
 
 Confusing the two has caused field misdiagnosis in the past — the v0.10.2
 fix attempt assumed there was one keychain entry per identity, which is not
@@ -253,7 +256,7 @@ A typical multi-tenant install on macOS looks like this:
   agents-extra.json                      ← (optional) registers paths outside this root
 
   alpha/                                 ← sub-tenant 'alpha'
-    passphrase.enc                       ← (or keychain entry sanctuary-passphrase-<sha(alpha-path)[:12]>)
+    passphrase.enc                       ← (or keychain entry sanctuary-passphrase-<sha(alpha-path)[:16]>)
     cocoon-profile.json
     state/
       _identities/<id-3>.enc
@@ -307,13 +310,33 @@ Pre-v0.10.0 installs have exactly one keychain entry: `sanctuary-passphrase`
 (no suffix), unlocking `~/.sanctuary/state/`. Nothing changes for these
 installs. The default storage path keeps the legacy un-suffixed service name
 specifically to preserve backward compatibility — `keychainServiceFor()`
-short-circuits when `storagePath === <home>/.sanctuary`.
+short-circuits when the canonical (resolved) storage path equals
+`<home>/.sanctuary`.
 
 If you wrap a second agent under `~/.sanctuary/<other>/` after v0.10.0, the
-new tenant gets a `sanctuary-passphrase-<12hex>` entry and the legacy entry
+new tenant gets a `sanctuary-passphrase-<16hex>` entry and the legacy entry
 is left untouched. There is no automatic migration of the default tenant
 into a sub-directory; that would invalidate every existing state file's
 storage-path-derived metadata.
+
+### Migration from 12-hex to 16-hex suffix (v1.2.3)
+
+Starting in v1.2.3, per-tenant keychain service names use 16 hex characters
+(64 bits, birthday bound ~2^32) instead of the previous 12 hex characters
+(48 bits, birthday bound ~2^24). Additionally, storage paths are now
+canonicalized via `path.resolve()` before comparison and hashing, so
+cosmetic path differences (trailing slashes, `.`/`..` segments, doubled
+separators) no longer produce different service names.
+
+**Automatic migration (no operator action required):** the read path tries
+the new 16-hex service name first, then falls back to the legacy 12-hex
+name. Writes always go to the new 16-hex name. Operators are auto-migrated
+on the next write (e.g., next passphrase rotation or next `sanctuary wrap`).
+The legacy 12-hex entry is left in place; it becomes inert once a 16-hex
+entry exists for the same tenant.
+
+The default-path tenant (`~/.sanctuary`) is unaffected by this change; its
+service name is always the un-suffixed `sanctuary-passphrase`.
 
 ---
 
@@ -327,10 +350,10 @@ sanctuary agents
 sanctuary agents --json | jq -r '.tenants[] | select(.name=="alpha") | .keychain_service'
 
 # macOS: read one entry's value from the Keychain.
-security find-generic-password -a sanctuary -s sanctuary-passphrase-<12hex> -w
+security find-generic-password -a sanctuary -s sanctuary-passphrase-<16hex> -w
 
 # Linux: read one entry's value from the Secret Service.
-secret-tool lookup service sanctuary-passphrase-<12hex> account sanctuary
+secret-tool lookup service sanctuary-passphrase-<16hex> account sanctuary
 
 # Boot the dashboard against a specific tenant.
 sanctuary dashboard --tenant alpha
