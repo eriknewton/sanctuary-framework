@@ -95,7 +95,8 @@ jobs:
           # 2018) and its imports drifted out of compatibility with
           # current Ubuntu defaults on two fronts:
           #   1. cryptography.utils.int_from_bytes was removed in
-          #      cryptography 41.0.0 (May 2023); pin <41.
+          #      cryptography 39.0.0 (Jan 2023); pin <39 (40.x already
+          #      lacks it, confirmed in CI run 25611180020).
           #   2. PyGObject 3.50+ requires libgirepository-2.0-dev, a
           #      package Ubuntu 24.04 does not ship; pin <3.50 so the
           #      build links against libgirepository1.0-dev instead.
@@ -108,7 +109,7 @@ jobs:
           python3 -m venv "$HOME/pss-venv"
           "$HOME/pss-venv/bin/pip" install --quiet --upgrade pip wheel
           "$HOME/pss-venv/bin/pip" install --quiet \
-            "cryptography<41" \
+            "cryptography<39" \
             "pygobject<3.50" \
             pass-secret-service
           echo "$HOME/pss-venv/bin" >> "$GITHUB_PATH"
