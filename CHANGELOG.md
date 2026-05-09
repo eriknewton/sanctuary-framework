@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.2.1 - Mini1 Drill Fixes (2026-05-11)
+
+Patch release shipping 8 fixes from the 2026-05-08 Mini1 acceptance drill. Also corrects the v1.2.0 publish drift: the 1.2.0 npm binary was cut from a SHA 6 hours before PR #134 (exit-bundle hardening) merged, so the published binary did not contain that work. 1.2.1 publishes from current main post-merge.
+
+### Fixed
+
+- **Templates packaging (HHH, P0).** `dist/templates/` now ships in the npm artifact; `sanctuary template list` no longer throws.
+- **Force-rebind shipping (JJJ + QQQ, P0).** PR #134's `--force-rebind` flag and `exit_bundle_force_rebind` audit event are now present in the published binary.
+- **Strict argv on `sanctuary wrap` (EEE).** Unknown positionals and flags now error with "Did you mean?" suggestions instead of silently auto-detecting.
+- **Passphrase-required error (FFF).** Unset `SANCTUARY_PASSPHRASE` against a healthy fortress now reports "passphrase required" instead of "corrupted installation."
+- **Plaintext passphrase backup opt-in (GGG).** `wrap` no longer writes a plaintext backup file by default; `--write-passphrase-backup <path>` is the explicit opt-in.
+- **Intelligence health in wrap banner (III).** Intelligence-substrate failures surface in the wrap success banner instead of silently leaving L2 reported as healthy. New `sanctuary intelligence diagnose` subcommand prints substrate config and last error.
+- **Default identity at wrap time (NNN).** `sanctuary wrap` now creates a default Ed25519 signing identity at fortress init; `sanctuary exit export` works immediately post-wrap.
+- **Hard-fail on missing manifest (PPP).** `sanctuary exit verify` and `sanctuary exit import` now hard-fail with `InvalidExitBundleError` on missing `manifest.json` instead of soft-failing with `verified: false`.
+
 ## v1.2.0 - Substrate-only Release (2026-05-03)
 
 First minor release after v1.1.x. Castle Architecture is now canonical. The dashboard ships a concierge surface so an operator can talk directly to Sanctuary itself, routed through a per-surface substrate selector. Direct-agent chat has been removed; operators talk to wrapped agents in the agent's native harness. A Tauri-based menubar companion lands as the foundation for Sprint Piece 1, and a Playwright headless-browser harness now exercises the SPA end-to-end.
