@@ -556,6 +556,8 @@ describe("v1.1 acceptance drill - Pillar 4: portability + exit", () => {
     const destIdentityId = destIdentity.identity_id as string;
 
     // ─── Import on destination ─────────────────────────────────────
+    // forceRebind required: destination already has its own identity
+    // (Finding RRR guard fires on mismatched active identity).
     const imported = await importExitBundle({
       bundleDir,
       storage: destination.storage,
@@ -564,6 +566,7 @@ describe("v1.1 acceptance drill - Pillar 4: portability + exit", () => {
       auditLog: destination.auditLog,
       reputationStore: destination.reputationStore,
       activate: true,
+      forceRebind: true,
       sourceMasterKey: source.masterKey,
       destinationSignerIdentityId: destIdentityId,
     });

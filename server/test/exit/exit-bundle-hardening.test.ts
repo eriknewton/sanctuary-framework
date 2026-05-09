@@ -104,6 +104,8 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     const destination = await makeHarness();
     await callTool(destination.tools, "identity_create", { label: "dest-default" });
 
+    // First import: destination has a different identity, so forceRebind is
+    // required (Finding RRR guard fires on mismatched active identity).
     const firstImport = await importExitBundle({
       bundleDir,
       storage: destination.storage,
@@ -112,6 +114,7 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
       auditLog: destination.auditLog,
       reputationStore: destination.reputationStore,
       activate: true,
+      forceRebind: true,
     });
     expect(firstImport.activated).toBe(true);
     expect(firstImport.staged_artifacts).toContain("public_identity");

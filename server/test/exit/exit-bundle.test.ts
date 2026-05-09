@@ -180,6 +180,7 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
     expect(planned.activated).toBe(false);
     expect(planned.conflicts.state_conflicts).toEqual([]);
 
+    // forceRebind required: destination has its own identity (Finding RRR).
     const imported = await importExitBundle({
       bundleDir,
       storage: destination.storage,
@@ -188,6 +189,7 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
       auditLog: destination.auditLog,
       reputationStore: destination.reputationStore,
       activate: true,
+      forceRebind: true,
       sourceMasterKey: source.masterKey,
       destinationSignerIdentityId: destinationIdentityId,
     });
