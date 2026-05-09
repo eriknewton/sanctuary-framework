@@ -125,13 +125,22 @@ jobs:
             "pygobject<3.50" \
             cryptography \
             pass-secret-service
-          # Patch the one source file in pass-secret-service that uses
-          # the removed symbol. int_from_bytes(data, byteorder, signed)
-          # is byte-equivalent to int.from_bytes(data, byteorder, signed)
-          # since Python 3.2, so the substitution is safe. A
-          # sitecustomize.py shim was tried first (CI run 25611484463)
-          # but did not load in time; sed-patching the on-disk file is
-          # direct and survives any Python startup-path quirks.
+          # Patch session.py inside the installed package. Three small
+          # fixes, each independent and observed in successive CI runs:
+          #
+          # 1. cryptography.utils.int_from_bytes was removed in modern
+          #    cryptography. Drop the import and rewrite call sites to
+          #    int.from_bytes (semantically identical since Python 3.2).
+          # 2. _decode_secret calls decryptor.update(password) where
+          #    password = secret[2] -- a value pydbus delivers as
+          #    list[int]. cryptography wants bytes. The author already
+          #    handles secret[1] (the IV) the same way; mirror it for
+          #    secret[2]. Without this, CreateItem fails with
+          #    "Cannot convert '<class 'list'>' instance to a buffer"
+          #    (CI run 25611693756).
+          # 3. _create_dh calls int.from_bytes(input, 'big') where the
+          #    DH peer key arrives over pydbus. Defensive bytes() wrap
+          #    matches the secret[1] / secret[2] pattern.
           SESSION_FILE="$(find "$HOME/pss-venv/lib" -path '*/pass_secret_service/interfaces/session.py' -print -quit)"
           if [ -z "$SESSION_FILE" ]; then
             echo "could not locate pass_secret_service session.py inside venv" >&2
@@ -139,6 +148,8 @@ jobs:
           fi
           sed -i '/^from cryptography\.utils import int_from_bytes$/d' "$SESSION_FILE"
           sed -i 's/\bint_from_bytes\b/int.from_bytes/g' "$SESSION_FILE"
+          sed -i 's|password = secret\[2\]|password = bytes(secret[2])|' "$SESSION_FILE"
+          sed -i "s|int\.from_bytes(input, 'big')|int.from_bytes(bytes(input), 'big')|" "$SESSION_FILE"
           echo "patched $SESSION_FILE"
           echo "$HOME/pss-venv/bin" >> "$GITHUB_PATH"
 
