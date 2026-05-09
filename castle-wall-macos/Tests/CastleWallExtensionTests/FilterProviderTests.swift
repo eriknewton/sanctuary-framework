@@ -1,13 +1,19 @@
 //
 // FilterProviderTests.swift
 //
-// Verdict-decision glue for `CastleWallFilterProvider`. Drives the
-// testable `evaluate(_:)` entry point with synthesized
-// FilterFlowDescriptor values + injected ManifestStore + FlowCache; the
-// `handleNewFlow(_:)` framework callback exercises NEFilterFlow shapes
-// that integration tests in Alpha-3 cover (loaded-extension scenarios
-// cannot run on macOS GHA runners without sysextd user approval per the
-// macOS CI workflow comment).
+// Verdict-decision glue exercised through `FlowEvaluatorEngine`. The
+// engine holds the same `ManifestStore` + `FlowCache` substrate the
+// provider does and exposes the testable `evaluate(_:)` entry point.
+//
+// `CastleWallFilterProvider` itself is NOT instantiated in these tests:
+// `NEFilterDataProvider`'s initializer asserts a sysextd-loaded context
+// that does not exist in a plain XCTest process and crashes the test
+// runner if invoked outside that context. Loaded-extension integration
+// tests in Alpha-3 cover the framework adapter end-to-end.
+//
+// `verdict(for:)` translation is exercised here against synthesized
+// `EvaluationOutcome` values; that surface is a pure-Swift static
+// function and works without instantiating the provider class.
 //
 
 import XCTest
@@ -73,44 +79,40 @@ final class FilterProviderTests: XCTestCase {
     func testEvaluateReturnsAllowForMatchingRule() {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
-        let provider = CastleWallFilterProvider(
-            manifestStore: store,
-            flowCache: cache,
-            agentResolver: { _ in (agentId: "agent-7", templateId: "coding-assistant") }
-        )
+        let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
         loadStore(store, rules: [rule(id: "r-allow", host: "api.anthropic.com", disposition: "allow")])
 
-        let outcome = provider.evaluate(flow())
+        let outcome = engine.evaluate(flow())
         XCTAssertEqual(outcome, .allow(matchedRuleId: "r-allow"))
     }
 
     func testEvaluateReturnsDropForDenyMatch() {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
-        let provider = CastleWallFilterProvider(manifestStore: store, flowCache: cache)
+        let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
         loadStore(store, rules: [rule(id: "r-deny", host: "api.anthropic.com", disposition: "deny")])
 
-        let outcome = provider.evaluate(flow())
+        let outcome = engine.evaluate(flow())
         XCTAssertEqual(outcome, .drop(matchedRuleId: "r-deny"))
     }
 
     func testEvaluateDefaultDeniesWhenNoMatch() {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
-        let provider = CastleWallFilterProvider(manifestStore: store, flowCache: cache)
+        let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
         loadStore(store, rules: [rule(host: "other.example.com")])
 
-        let outcome = provider.evaluate(flow(host: "novel.example.com"))
+        let outcome = engine.evaluate(flow(host: "novel.example.com"))
         XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
     }
 
     func testEvaluateReturnsUncertainWhenOnlyPromptMatches() {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
-        let provider = CastleWallFilterProvider(manifestStore: store, flowCache: cache)
+        let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
         loadStore(store, rules: [rule(host: "api.anthropic.com", disposition: "prompt")])
 
-        let outcome = provider.evaluate(flow())
+        let outcome = engine.evaluate(flow())
         XCTAssertEqual(outcome, .uncertain)
     }
 
@@ -119,63 +121,64 @@ final class FilterProviderTests: XCTestCase {
     func testEvaluateCachesAllowOutcome() {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
-        let provider = CastleWallFilterProvider(manifestStore: store, flowCache: cache)
+        let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
         loadStore(store, rules: [rule(host: "api.anthropic.com", disposition: "allow")])
 
-        _ = provider.evaluate(flow())
+        _ = engine.evaluate(flow())
         XCTAssertEqual(cache.count, 1)
 
         // Second evaluation returns the cached value even if the manifest
         // is replaced under us with an empty rule set, until the manifest
         // change observer fires the cache clear.
-        let outcome = provider.evaluate(flow())
+        let outcome = engine.evaluate(flow())
         XCTAssertEqual(outcome, .allow(matchedRuleId: "r-1"))
     }
 
     func testEvaluateCachesDropOutcome() {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
-        let provider = CastleWallFilterProvider(manifestStore: store, flowCache: cache)
+        let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
         loadStore(store, rules: [rule(host: "api.anthropic.com", disposition: "deny")])
 
-        _ = provider.evaluate(flow())
+        _ = engine.evaluate(flow())
         XCTAssertEqual(cache.count, 1)
     }
 
     func testEvaluateDoesNotCacheUncertain() {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
-        let provider = CastleWallFilterProvider(manifestStore: store, flowCache: cache)
+        let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
         loadStore(store, rules: [rule(host: "api.anthropic.com", disposition: "prompt")])
 
-        _ = provider.evaluate(flow())
+        _ = engine.evaluate(flow())
         XCTAssertEqual(cache.count, 0)
     }
 
     func testManifestUpdateClearsCache() {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
-        let provider = CastleWallFilterProvider(manifestStore: store, flowCache: cache)
+        let engine = FlowEvaluatorEngine(manifestStore: store, flowCache: cache)
         loadStore(store, rules: [rule(id: "r-allow", disposition: "allow")])
-        _ = provider.evaluate(flow())
+        _ = engine.evaluate(flow())
         XCTAssertEqual(cache.count, 1)
 
-        // Replace the snapshot. The provider's manifest-store observer
+        // Replace the snapshot. The engine's manifest-store observer
         // should have cleared the cache.
         loadStore(store, rules: [rule(id: "r-deny", disposition: "deny")])
         XCTAssertEqual(cache.count, 0)
 
-        let outcome = provider.evaluate(flow())
+        let outcome = engine.evaluate(flow())
         XCTAssertEqual(outcome, .drop(matchedRuleId: "r-deny"))
     }
 
     // MARK: - Verdict translation
+    //
+    // `verdict(for:)` is a pure-Swift static method on the provider class.
+    // Calling it does NOT instantiate `NEFilterDataProvider` (no sysextd
+    // context required); only the framework verdict factory methods are
+    // touched, which work in any process.
 
     func testVerdictTranslationMapsOutcomesToFrameworkVerdicts() {
-        // We compare via the framework's NEFilterNewFlowVerdict object identity
-        // semantics. Apple's verdict factories return distinct objects, so we
-        // assert each outcome maps to a non-nil verdict and that allow / drop
-        // / needRules produce different shapes by string description.
         let allow = CastleWallFilterProvider.verdict(for: .allow(matchedRuleId: "r-1"))
         let drop = CastleWallFilterProvider.verdict(for: .drop(matchedRuleId: nil))
         let pending = CastleWallFilterProvider.verdict(for: .uncertain)
@@ -183,7 +186,7 @@ final class FilterProviderTests: XCTestCase {
         XCTAssertNotNil(allow)
         XCTAssertNotNil(drop)
         XCTAssertNotNil(pending)
-        // Allow vs drop verdicts must not be equal references.
+        // Allow vs drop verdicts must not be the same object reference.
         XCTAssertFalse(allow === drop)
     }
 }

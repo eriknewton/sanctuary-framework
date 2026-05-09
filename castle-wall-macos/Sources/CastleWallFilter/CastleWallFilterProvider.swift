@@ -43,43 +43,23 @@ public typealias AgentResolver = (String) -> (agentId: String, templateId: Strin
 public final class CastleWallFilterProvider: NEFilterDataProvider {
     // MARK: - State
 
-    private let manifestStore: ManifestStore
-    private let flowCache: FlowCache
-    private let agentResolver: AgentResolver
+    /// Pure-Swift substrate: manifest store + flow cache + verdict logic.
+    /// The provider delegates verdict decisions to the engine; test
+    /// targets exercise the engine directly so they do not need to
+    /// instantiate `NEFilterDataProvider` (which sysextd expects to set
+    /// up).
+    private let engine: FlowEvaluatorEngine
     private var ipcClient: IPCClient?
 
     // MARK: - Init
 
-    /// Designated initializer used by the test target to inject the
-    /// substrate. The framework calls the no-arg `init()` at runtime; the
-    /// `convenience init()` wires defaults.
-    public init(
-        manifestStore: ManifestStore = ManifestStore(),
-        flowCache: FlowCache = FlowCache(),
-        agentResolver: @escaping AgentResolver = CastleWallFilterProvider.defaultAgentResolver
-    ) {
-        self.manifestStore = manifestStore
-        self.flowCache = flowCache
-        self.agentResolver = agentResolver
+    /// Framework-driven init. sysextd calls this when the system extension
+    /// loads; the engine is constructed with default substrate. Test
+    /// targets do NOT instantiate this class; they use
+    /// `FlowEvaluatorEngine` directly.
+    public override init() {
+        self.engine = FlowEvaluatorEngine()
         super.init()
-        // When the manifest store changes, evict cached outcomes wholesale
-        // so a deny rule that arrives after a flow was allowed cannot keep
-        // serving stale verdicts.
-        self.manifestStore.addObserver { [weak self] _ in
-            self?.flowCache.clear()
-        }
-    }
-
-    public override convenience init() {
-        self.init(
-            manifestStore: ManifestStore(),
-            flowCache: FlowCache(),
-            agentResolver: CastleWallFilterProvider.defaultAgentResolver
-        )
-    }
-
-    public static let defaultAgentResolver: AgentResolver = { sourceAppId in
-        return (agentId: sourceAppId, templateId: "unknown")
     }
 
     // MARK: - Lifecycle
@@ -142,42 +122,19 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
         completionHandler()
     }
 
-    // MARK: - Verdict path (testable)
-
-    /// Evaluate a flow against the current manifest snapshot, consulting
-    /// the cache first. Side effects: a fresh `(allow|drop)` outcome lands
-    /// in the cache so subsequent flows from the same (source app, dest)
-    /// tuple short-circuit. Uncertain outcomes are NOT cached because the
-    /// resolution arrives via the operator-decision IPC path.
-    public func evaluate(_ descriptor: FilterFlowDescriptor) -> EvaluationOutcome {
-        let key = FlowCacheKey.from(descriptor)
-        if let cached = flowCache.get(key) {
-            return cached
-        }
-        let outcome = AllowlistEvaluator.evaluate(
-            flow: descriptor,
-            rules: manifestStore.currentRules()
-        )
-        switch outcome {
-        case .allow, .drop:
-            flowCache.put(key, outcome)
-        case .uncertain:
-            break
-        }
-        return outcome
-    }
+    // MARK: - Verdict path
 
     /// NEFilter callback. Extracts a descriptor from the framework flow,
-    /// runs the evaluator, returns the matching verdict. Loaded-extension
-    /// integration tests in Alpha-3 exercise this path against real
-    /// NEFilterFlow values; unit tests in Alpha-2 drive `evaluate(_:)`
-    /// directly.
+    /// delegates to the engine, returns the matching verdict.
+    /// Loaded-extension integration tests in Alpha-3 exercise this path
+    /// against real NEFilterFlow values; unit tests in Alpha-2 drive
+    /// `FlowEvaluatorEngine.evaluate(_:)` directly.
     public override func handleNewFlow(_ flow: NEFilterFlow) -> NEFilterNewFlowVerdict {
         guard let descriptor = makeDescriptor(from: flow) else {
             CastleWallLog.lifecycle.notice("flow shape unrecognized; passing without verdict")
             return NEFilterNewFlowVerdict.allow()
         }
-        let outcome = evaluate(descriptor)
+        let outcome = engine.evaluate(descriptor)
         return CastleWallFilterProvider.verdict(for: outcome)
     }
 
@@ -223,7 +180,7 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
         } else {
             sourceAppId = "unknown"
         }
-        let agent = agentResolver(sourceAppId)
+        let agent = engine.agentResolver(sourceAppId)
 
         let host: String? = socketFlow.remoteHostname
         let endpoint = socketFlow.remoteEndpoint as? NWHostEndpoint
