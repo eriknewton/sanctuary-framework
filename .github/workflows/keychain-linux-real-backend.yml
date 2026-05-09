@@ -43,7 +43,8 @@ jobs:
             dbus dbus-x11 \
             gnome-keyring \
             libsecret-1-0 \
-            libsecret-tools
+            libsecret-tools \
+            python3-secretstorage
 
       - name: Install npm deps
         working-directory: server
@@ -54,40 +55,54 @@ jobs:
         run: npm run build
 
       - name: Run real-backend integration test
-        # Bring up D-Bus session bus, gnome-keyring-daemon, and verify
-        # secret-tool round-trip BEFORE running the integration suite.
-        # Two earlier attempts (combined --start --unlock under
-        # dbus-run-session, and the dual-call jaraco/keyring pattern)
-        # both produced the same failure: tests 1, 2, and 4 fell
-        # through to fallback file because secret-tool store exited
-        # non-zero. The dual-call pattern's first --unlock invocation
-        # transiently starts a daemon, so the second --start sees
-        # `discover_other_daemon: 1` and does not re-register the
-        # secrets component on the bus, leaving the default collection
-        # locked.
+        # Three earlier attempts diagnosed the underlying problem:
+        # gnome-keyring-daemon --start brings up the D-Bus secret
+        # service correctly, but the `login` collection (which
+        # secret-tool defaults to) is only created by a real graphical
+        # login flow, not by --unlock against a headless runner. The
+        # smoke test from attempt 3 surfaced this verbatim:
+        # `secret-tool: Object does not exist at path
+        # "/org/freedesktop/secrets/collection/login"`.
         #
-        # This shape uses --replace --start in a single call so the
-        # daemon is forced to take over the secrets role on the bus,
-        # then drops a smoke test against the live secret-tool CLI to
-        # surface keyring failure before the integration tests run
-        # (the smoke test gives a single-line diagnostic of which
-        # layer is broken: env vars, daemon registration, or write
-        # path).
+        # Bootstrap the collection programmatically via Python
+        # secretstorage (the libsecret Python binding). create_collection
+        # with empty password works against the daemon without the GUI
+        # prompter because libsecret accepts the empty-password code
+        # path for headless flows. Set the `default` alias to the new
+        # collection so secret-tool's default-collection lookup
+        # resolves correctly.
+        #
+        # Smoke test against secret-tool runs before the integration
+        # suite so any future regression in this setup chain surfaces
+        # a single-line diagnostic of which layer broke.
         run: |
           set -e
-          mkdir -p "$HOME/.local/share/keyrings"
-          chmod 700 "$HOME/.local/share/keyrings"
-          rm -f "$HOME/.local/share/keyrings"/*.keyring 2>/dev/null || true
 
           eval "$(dbus-launch --sh-syntax)"
-          eval "$(printf "" | gnome-keyring-daemon --replace --start --components=secrets,pkcs11,ssh)"
+          eval "$(printf "" | gnome-keyring-daemon --start --components=secrets,pkcs11,ssh)"
           export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
-          printf "" | gnome-keyring-daemon --unlock || true
 
           echo "=== Environment ==="
           echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
           echo "GNOME_KEYRING_CONTROL=$GNOME_KEYRING_CONTROL"
           pgrep -af gnome-keyring-daemon || echo "(no daemon process)"
+
+          echo "=== Bootstrapping default collection via secretstorage ==="
+          python3 - <<'PY'
+          import secretstorage
+          conn = secretstorage.dbus_init()
+          # Try the default collection first; create one only if missing.
+          try:
+              col = secretstorage.get_default_collection(conn)
+              if col.is_locked():
+                  col.unlock()
+              print(f"default collection ready: locked={col.is_locked()} label={col.get_label()!r}")
+          except secretstorage.exceptions.ItemNotFoundException:
+              col = secretstorage.create_collection(conn, "default", alias="default", session=None)
+              if col.is_locked():
+                  col.unlock()
+              print(f"created default collection: locked={col.is_locked()}")
+          PY
 
           echo "=== secret-tool smoke test ==="
           if printf "smokevalue" | secret-tool store --label="smoke" service smoke-svc account smoke-acct; then
