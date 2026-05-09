@@ -69,6 +69,18 @@ jobs:
           # On GitHub Actions Ubuntu runners, systemd IS PID 1.
           cat /proc/1/comm
 
+      - name: Panic-discipline gate (no unannotated unwrap/expect in src/)
+        working-directory: castle-wall-daemon
+        # Closes full-sweep #58 by structurally preventing regression of the
+        # 5 PR #138 annotations. Test code (#[cfg(test)] mod blocks and the
+        # tests/ directory) is excluded by design. Doc and framework at
+        # castle-wall-daemon/docs/PANIC_DISCIPLINE.md.
+        run: python3 scripts/check-panic-discipline.py
+
+      - name: Panic-discipline gate self-tests
+        working-directory: castle-wall-daemon
+        run: python3 scripts/test_check_panic_discipline.py
+
       - name: cargo check
         working-directory: castle-wall-daemon
         run: cargo check --all-targets
