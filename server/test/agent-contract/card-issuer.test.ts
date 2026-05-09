@@ -54,7 +54,7 @@ describe("Agent Card issuance + verification (§3)", () => {
 
     const verified = verifyAgentCard(signed_event, f.verifyContext);
     expect(verified.card.agent_id).toBe("agent-alpha");
-    expect(verified.unknown_extension_keys).toEqual([]);
+    expect(verified.recognized_reserved_extension_keys).toEqual([]);
     expect(hashAgentCard(verified.card)).toBe(hashAgentCard(card));
   });
 

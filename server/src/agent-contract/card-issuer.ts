@@ -130,8 +130,8 @@ export function issueAgentCard(
 export interface VerifyAgentCardResult {
   card: AgentCard;
   event: SignedEvent<AgentCard>;
-  /** Unknown extension_envelope keys seen — carries forward from mesh verification. */
-  unknown_extension_keys: string[];
+  /** Reserved extension_envelope keys seen, carries forward from mesh verification. */
+  recognized_reserved_extension_keys: string[];
 }
 
 /**
@@ -166,7 +166,7 @@ export function verifyAgentCard(
   return {
     card,
     event: verifyResult.event as SignedEvent<AgentCard>,
-    unknown_extension_keys: verifyResult.unknown_extension_keys,
+    recognized_reserved_extension_keys: verifyResult.recognized_reserved_extension_keys,
   };
 }
 

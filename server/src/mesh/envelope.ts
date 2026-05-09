@@ -139,11 +139,15 @@ export interface VerifyContext {
 export interface VerifyResult {
   ok: boolean;
   /**
-   * Unknown extension_envelope keys encountered during verification.
-   * Empty at v0.1. At v1.x this is how downstream dispatchers know a v1.x
-   * extension payload rode the envelope.
+   * Reserved extension_envelope keys encountered during verification.
+   * These are keys present on the envelope that ARE in the v1.x reserved set
+   * (per Federation Protocol v0.1 spec §10.1). The v0.1 verifier records but
+   * does not reject them, so a v1.x consumer can detect that a forward-compat
+   * extension payload rode the envelope. Keys not in the reserved set pass
+   * through silently per spec §10.1.
+   * Empty when no reserved keys ride the envelope.
    */
-  unknown_extension_keys: string[];
+  recognized_reserved_extension_keys: string[];
   /** Verified event. Same shape as the input; convenience return. */
   event: SignedEvent;
 }
@@ -248,13 +252,15 @@ export function verifySignedEvent(
     }
   }
 
-  // Forward-compat: record (but do not reject) unknown extension_envelope keys.
-  const unknown_extension_keys: string[] = [];
+  // Forward-compat: record (but do not reject) keys that ARE in the reserved
+  // set, allowing forward-compat consumers to detect them; keys not in the
+  // reserved set are silently passed through per spec §10.1.
+  const recognized_reserved_extension_keys: string[] = [];
   for (const key of Object.keys(evt.extension_envelope ?? {})) {
     if (isReservedExtensionKey(key)) {
-      unknown_extension_keys.push(key);
+      recognized_reserved_extension_keys.push(key);
     }
   }
 
-  return { ok: true, unknown_extension_keys, event: evt };
+  return { ok: true, recognized_reserved_extension_keys, event: evt };
 }

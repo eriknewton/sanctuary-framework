@@ -104,8 +104,8 @@ interface PeerEndpoint {
 
 /**
  * Receive and verify a broadcast event. On success, returns the verified event
- * plus any unknown-extension-keys (forward-compat log). On unknown event_type,
- * the event is dropped silently — caller sees `dispatched: false`.
+ * plus any reserved-extension-keys observed (forward-compat log). On unknown
+ * event_type, the event is dropped silently and the caller sees `dispatched: false`.
  */
 export function receiveBroadcast(
   evt: SignedEvent,
@@ -114,7 +114,7 @@ export function receiveBroadcast(
 ): {
   verified: boolean;
   dispatched: boolean;
-  unknown_extension_keys: string[];
+  recognized_reserved_extension_keys: string[];
   drop_reason?: string;
 } {
   const res = verifySignedEvent(evt, ctx);
@@ -122,7 +122,7 @@ export function receiveBroadcast(
   return {
     verified: true,
     dispatched,
-    unknown_extension_keys: res.unknown_extension_keys,
+    recognized_reserved_extension_keys: res.recognized_reserved_extension_keys,
     drop_reason: dispatched ? undefined : "unknown_or_reserved_event_type",
   };
 }

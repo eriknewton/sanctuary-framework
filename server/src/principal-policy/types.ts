@@ -66,7 +66,7 @@ export interface ApprovalRequest {
 export interface ApprovalResponse {
   decision: "approve" | "deny";
   decided_at: string;
-  decided_by: "human" | "timeout" | "auto" | "stderr:non-interactive";
+  decided_by: "human" | "timeout" | "auto" | "stderr:non-interactive" | "channel_failure";
 }
 
 /** Result of the approval gate evaluation */
