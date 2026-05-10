@@ -35,6 +35,7 @@ import { AggregatorPayloadStore } from "./principal-policy/aggregator-store.js";
 import { SentinelFindingStore } from "./sentinel/sentinel-finding-store.js";
 import { SentinelRegistry } from "./sentinel/sentinel-registry.js";
 import { SentinelDispatcher } from "./sentinel/sentinel-dispatcher.js";
+import { AnomalyPipelineDispatcher } from "./anomaly-detection/anomaly-pipeline.js";
 import { PHI1_BASELINE_CATALOG } from "./sentinel/sentinels/index.js";
 import { loadSentinelSubscriptions } from "./sentinel/subscription-store.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
@@ -835,6 +836,28 @@ export async function createSanctuaryServer(options?: {
   if (dashboard) {
     dashboard.setSentinelDispatcher(sentinelDispatcher);
   }
+
+  // v1.3 WP-V1.3-2 Chi-1: Anomaly Detection Pipeline (Castle Layer 2
+  // statistical-drift complement to the rule-based Sentinel pack).
+  // Construct the per-fortress dispatcher; reuse Phi-1 finding store
+  // so anomaly findings flow through the same operator surface.
+  // Detectors are NOT auto-registered; operator-visible registration
+  // UI ships with Chi-3. Sovereignty invariant: classifier state
+  // stays per-fortress, encrypted at rest, never centrally aggregated.
+  const anomalyDispatcher = new AnomalyPipelineDispatcher({
+    findingStore: sentinelFindingStore,
+    auditLog,
+    storage,
+    masterKey,
+    fortressId: fortressIdForAggregator,
+    identityId: aggregatorIdentityId,
+  });
+  anomalyDispatcher.start();
+  // Keep a reference so the GC doesn't collect the dispatcher even
+  // when no detectors are registered. Tests that need access mount
+  // their own; runtime callers reach the dispatcher via the future
+  // dashboard-side accessor (Chi-3).
+  void anomalyDispatcher;
 
   // 16. Create Principal Policy tools (read-only)
   const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
