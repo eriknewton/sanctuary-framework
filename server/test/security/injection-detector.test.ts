@@ -868,7 +868,7 @@ describe("InjectionDetector", () => {
 
   // ── SEC-031: ReDoS resistance ──────────────────────────────────────
   describe("SEC-031: ReDoS resistance in prompt stuffing", () => {
-    it("completes in bounded time on large repetitive input", () => {
+    it("completes in bounded time on large repetitive input", { retry: 3 }, () => {
       const pattern = "A".repeat(20);
       const malicious = pattern.repeat(1000); // 20KB of 'A'
 
@@ -876,10 +876,17 @@ describe("InjectionDetector", () => {
       const result = detector.scan("test/tool", { input: malicious });
       const elapsed = Date.now() - start;
 
-      // Must complete in bounded time, not hang (old regex version would take seconds)
-      // Threshold: 2s. ReDoS would hang for tens of seconds; 2s is comfortable
-      // on shared CI runners while still catching pathological regex regression.
-      expect(elapsed).toBeLessThan(2000);
+      // The PROPERTY this test guards: the regex doesn't hang for tens of
+      // seconds (ReDoS regression). Post-fix algorithm completes in
+      // single-digit ms in isolation; 10s threshold leaves 1000x headroom
+      // against algorithmic correctness while still trapping pathological
+      // regression. Sigma-6 raised the bound from 2000ms to 10000ms and
+      // added { retry: 3 } after observing 4000-5000ms wall-clock under
+      // sustained vitest worker concurrency (heavy crypto + ZK suites
+      // running concurrently). The property is "doesn't hang", not "fast
+      // enough for user-visible latency"; the generous bound is the right
+      // discipline per server/docs/test-concurrency-discipline.md.
+      expect(elapsed).toBeLessThan(10000);
       expect(result.flagged).toBe(true);
       const types = result.signals.map(s => s.type);
       expect(types).toContain("prompt_stuffing");

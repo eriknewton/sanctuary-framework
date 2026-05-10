@@ -41,6 +41,10 @@ function createSilentReceiver(port: number) {
     connections.add(socket);
     socket.on("close", () => connections.delete(socket));
   });
+  // port-discipline: ignore — caller-supplied port; this file's six randomPort()
+  // sites need a coordinated bindWithRetry refactor (v1.x housekeeping follow-up).
+  // The flake risk is lower than dashboard.test.ts because each receiver/channel
+  // pair only binds two ports per test rather than per-suite churn.
   return {
     start: () => new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve)),
     stop: () => new Promise<void>((resolve) => {

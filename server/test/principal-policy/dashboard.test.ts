@@ -8,25 +8,31 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import type { ApprovalRequest, ApprovalResponse } from "../../src/principal-policy/types.js";
-
-// Use a random port to avoid conflicts in parallel test runs
-function randomPort(): number {
-  return 10000 + Math.floor(Math.random() * 50000);
-}
+import {
+  bindWithRetry,
+  randomTestPort,
+} from "../util/port-collision-retry.js";
 
 describe("Principal Dashboard", () => {
   let dashboard: DashboardApprovalChannel;
   let port: number;
 
   beforeEach(async () => {
-    port = randomPort();
-    dashboard = new DashboardApprovalChannel({
-      port,
-      host: "127.0.0.1",
-      timeout_seconds: 2, // Short timeout for tests
-      auto_deny: true,
+    // Sigma-6: bindWithRetry retries on EADDRINUSE so this suite stops
+    // being the recurring port-collision flake offender (9-10 incidents
+    // across iterations 2-6). The retry helper picks a fresh random
+    // port each attempt; the DashboardApprovalChannel.start() surfaces
+    // EADDRINUSE which the helper catches and retries.
+    await bindWithRetry(async () => {
+      port = randomTestPort();
+      dashboard = new DashboardApprovalChannel({
+        port,
+        host: "127.0.0.1",
+        timeout_seconds: 2, // Short timeout for tests
+        auto_deny: true,
+      });
+      await dashboard.start();
     });
-    await dashboard.start();
   });
 
   afterEach(async () => {
@@ -176,14 +182,17 @@ describe("Principal Dashboard", () => {
     let approvePort: number;
 
     beforeEach(async () => {
-      approvePort = randomPort();
-      approvalDashboard = new DashboardApprovalChannel({
-        port: approvePort,
-        host: "127.0.0.1",
-        timeout_seconds: 1,
-        auto_deny: false, // SEC-002: this is now ignored
+      // Sigma-6: bindWithRetry — see top-level beforeEach for rationale.
+      await bindWithRetry(async () => {
+        approvePort = randomTestPort();
+        approvalDashboard = new DashboardApprovalChannel({
+          port: approvePort,
+          host: "127.0.0.1",
+          timeout_seconds: 1,
+          auto_deny: false, // SEC-002: this is now ignored
+        });
+        await approvalDashboard.start();
       });
-      await approvalDashboard.start();
     });
 
     afterEach(async () => {
@@ -274,15 +283,18 @@ describe("Principal Dashboard", () => {
     let authPort: number;
 
     beforeEach(async () => {
-      authPort = randomPort();
-      authDashboard = new DashboardApprovalChannel({
-        port: authPort,
-        host: "127.0.0.1",
-        timeout_seconds: 2,
-        auto_deny: true,
-        auth_token: AUTH_TOKEN,
+      // Sigma-6: bindWithRetry — see top-level beforeEach for rationale.
+      await bindWithRetry(async () => {
+        authPort = randomTestPort();
+        authDashboard = new DashboardApprovalChannel({
+          port: authPort,
+          host: "127.0.0.1",
+          timeout_seconds: 2,
+          auto_deny: true,
+          auth_token: AUTH_TOKEN,
+        });
+        await authDashboard.start();
       });
-      await authDashboard.start();
     });
 
     afterEach(async () => {
