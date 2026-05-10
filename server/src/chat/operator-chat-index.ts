@@ -26,11 +26,13 @@ export {
   CONCIERGE_MEMORY_NAMESPACE,
   CONCIERGE_MEMORY_KEY_PREFIX,
   DEFAULT_CONCIERGE_RETENTION_DAYS,
+  type ConciergeMemoryReadFailure,
   type ConciergeMemoryStoreOptions,
   type ConciergeTurn,
   type ConciergeThreadSummary,
   type ListThreadsOptions,
   type ReadThreadOptions,
+  type ReadThreadStrictResult,
 } from "./concierge-memory-store.js";
 
 export {

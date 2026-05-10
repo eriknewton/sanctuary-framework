@@ -33,6 +33,13 @@ export const OPERATOR_CHAT_OPS = {
    * the deleted bundle.
    */
   CONCIERGE_THREAD_DELETED: "operator_concierge_thread_deleted",
+  /**
+   * Concierge memory fold-read failed (WP-V1.3-9 Tau-2). Emitted when
+   * the multi-turn coherence fold cannot load the active thread's prior
+   * turns; the concierge degrades to single-turn after emitting. Body
+   * carries thread_id + a stable failure_reason enum.
+   */
+  CONCIERGE_MEMORY_READ_FAILED: "operator_concierge_memory_read_failed",
 } as const;
 
 export type OperatorChatOp =
