@@ -20,6 +20,19 @@ export const OPERATOR_CHAT_OPS = {
    * pending approvals + policy summary) instead of a chat session.
    */
   AGENT_INSPECT_PANEL_OPENED: "agent_inspect_panel_opened",
+  /**
+   * Operator viewed concierge thread history (WP-V1.3-9 Tau-1). Emitted
+   * when the operator hits the list-threads or read-thread route. Body
+   * carries the thread_id (or `*` for the list endpoint) and a count;
+   * raw turn content never crosses the audit surface.
+   */
+  CONCIERGE_HISTORY_READ: "operator_concierge_history_read",
+  /**
+   * Operator deleted a concierge thread (WP-V1.3-9 Tau-1). Emitted on
+   * successful thread removal. Body carries thread_id + turn_count of
+   * the deleted bundle.
+   */
+  CONCIERGE_THREAD_DELETED: "operator_concierge_thread_deleted",
 } as const;
 
 export type OperatorChatOp =

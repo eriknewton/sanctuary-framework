@@ -50,8 +50,17 @@ import {
 } from "./operator-chat-types.js";
 import { OperatorChatStore } from "./operator-chat-store.js";
 import type {
+  ConciergeMemoryStore,
+  ConciergeThreadSummary,
+  ConciergeTurn,
+  ListThreadsOptions,
+  ReadThreadOptions,
+} from "./concierge-memory-store.js";
+import type {
   OperatorChatAuditPayload,
   OperatorConciergeChatPayload,
+  OperatorConciergeHistoryReadPayload,
+  OperatorConciergeThreadDeletedPayload,
 } from "../contracts/v1.2/operator-chat-events.js";
 
 /**
@@ -121,6 +130,16 @@ export interface OperatorChatServiceDeps {
    * summary). Operator-tunable via dashboard config.
    */
   conciergeMaxTokens?: number;
+  /**
+   * WP-V1.3-9 Tau-1: optional foundation memory store. When wired,
+   * `sendConcierge` dual-writes each operator+concierge turn pair into
+   * the memory store under a session-scoped thread_id. Read-side wiring
+   * (substrate-selector context-fold) lands in Tau-2.
+   *
+   * Omit at construction time to disable memory-side persistence; the
+   * existing `OperatorChatStore` write keeps working unchanged.
+   */
+  conciergeMemory?: ConciergeMemoryStore;
 }
 
 const DEFAULT_CONCIERGE_MAX_TOKENS = 512;
@@ -170,6 +189,14 @@ export class OperatorChatService {
   private contextProviders?: ConciergeContextProviders;
   private piiFilter?: ConciergePiiFilter;
   private conciergeMaxTokens: number;
+  private memory?: ConciergeMemoryStore;
+  /**
+   * In-memory thread_id assigned to the active concierge session.
+   * The first sendConcierge call after construction allocates a fresh
+   * UUID; subsequent calls reuse it so multi-turn coherence (Tau-2)
+   * folds the prior turns into context. Cleared by `resetConciergeMemoryThread`.
+   */
+  private activeMemoryThreadId?: string;
 
   constructor(deps: OperatorChatServiceDeps) {
     this.store = deps.store;
@@ -182,6 +209,7 @@ export class OperatorChatService {
     if (deps.conciergePiiFilter) this.piiFilter = deps.conciergePiiFilter;
     this.conciergeMaxTokens =
       deps.conciergeMaxTokens ?? DEFAULT_CONCIERGE_MAX_TOKENS;
+    if (deps.conciergeMemory) this.memory = deps.conciergeMemory;
   }
 
   // ── Concierge ─────────────────────────────────────────────────────────
@@ -219,6 +247,21 @@ export class OperatorChatService {
       CONCIERGE_THREAD_KEY,
       operatorMessage,
     );
+
+    // WP-V1.3-9 Tau-1: foundation memory write-side. Append the
+    // operator turn to the active session thread, allocating a fresh
+    // thread_id on first use. Tau-2 wires read-side context-fold; this
+    // PR is intentionally write-only.
+    if (this.memory) {
+      const threadId = this.ensureActiveMemoryThread();
+      await this.memory.appendTurn(threadId, "user", trimmed).catch(() => {
+        // Memory persistence failure must not break the concierge
+        // round-trip. The existing OperatorChatStore write above
+        // covers the in-session render; the audit log captures the
+        // event regardless. Tau-2 will surface persistence health to
+        // the operator.
+      });
+    }
 
     const start = Date.now();
     let conciergeBody: string;
@@ -285,6 +328,18 @@ export class OperatorChatService {
       responseMessage,
     );
 
+    // Tau-1 dual-write of the assistant turn. Same memory store, same
+    // session thread_id assigned for the operator turn above.
+    if (this.memory) {
+      const threadId = this.ensureActiveMemoryThread();
+      await this.memory
+        .appendTurn(threadId, "assistant", conciergeBody)
+        .catch(() => {
+          // See operator-turn note above; persistence failure does not
+          // break the concierge round-trip.
+        });
+    }
+
     const payload: OperatorConciergeChatPayload = {
       version: "1.2",
       event_id: makeEventId("conc"),
@@ -318,6 +373,121 @@ export class OperatorChatService {
       CONCIERGE_THREAD_KEY,
     );
     return thread ? thread.messages : [];
+  }
+
+  // ── WP-V1.3-9 Tau-1 memory accessors ─────────────────────────────────
+
+  /**
+   * Whether the foundation memory store is wired. Routes use this to
+   * 503 cleanly when called against an unwired service.
+   */
+  hasConciergeMemory(): boolean {
+    return this.memory !== undefined;
+  }
+
+  /**
+   * List concierge memory threads, newest-first. Emits the
+   * `operator_concierge_history_read` audit event with `thread_id="*"`.
+   */
+  async listConciergeMemoryThreads(
+    opts?: ListThreadsOptions,
+  ): Promise<ConciergeThreadSummary[]> {
+    if (!this.memory) {
+      throw new Error("concierge memory store not configured");
+    }
+    const summaries = await this.memory.listThreads(opts);
+    const totalTurns = summaries.reduce((acc, s) => acc + s.turn_count, 0);
+    const payload: OperatorConciergeHistoryReadPayload = {
+      version: "1.2",
+      event_id: makeEventId("conc-hist"),
+      emitted_at: new Date().toISOString(),
+      identity_id: this.identityId,
+      kind: "operator_concierge_history_read",
+      surface: "concierge",
+      thread_id: "*",
+      turn_count: totalTurns,
+    };
+    this.emit(OPERATOR_CHAT_OPS.CONCIERGE_HISTORY_READ, payload, "success");
+    return summaries;
+  }
+
+  /**
+   * Read a concierge memory thread, oldest turn first. Emits the
+   * `operator_concierge_history_read` audit event with the named
+   * thread_id and the count of turns surfaced.
+   */
+  async readConciergeMemoryThread(
+    threadId: string,
+    opts?: ReadThreadOptions,
+  ): Promise<ConciergeTurn[]> {
+    if (!this.memory) {
+      throw new Error("concierge memory store not configured");
+    }
+    const turns = await this.memory.readThread(threadId, opts);
+    const payload: OperatorConciergeHistoryReadPayload = {
+      version: "1.2",
+      event_id: makeEventId("conc-hist"),
+      emitted_at: new Date().toISOString(),
+      identity_id: this.identityId,
+      kind: "operator_concierge_history_read",
+      surface: "concierge",
+      thread_id: threadId,
+      turn_count: turns.length,
+    };
+    this.emit(OPERATOR_CHAT_OPS.CONCIERGE_HISTORY_READ, payload, "success");
+    return turns;
+  }
+
+  /**
+   * Delete a concierge memory thread. Emits
+   * `operator_concierge_thread_deleted` only when a bundle was actually
+   * removed; absent threads return false without an audit event.
+   */
+  async deleteConciergeMemoryThread(threadId: string): Promise<boolean> {
+    if (!this.memory) {
+      throw new Error("concierge memory store not configured");
+    }
+    const turnsBefore = await this.memory.readThread(threadId);
+    if (turnsBefore.length === 0) {
+      // No bundle, or empty bundle. Delete is idempotent; we do not
+      // emit an audit event for a no-op deletion.
+      return await this.memory.deleteThread(threadId);
+    }
+    const removed = await this.memory.deleteThread(threadId);
+    if (!removed) return false;
+
+    if (this.activeMemoryThreadId === threadId) {
+      this.activeMemoryThreadId = undefined;
+    }
+
+    const payload: OperatorConciergeThreadDeletedPayload = {
+      version: "1.2",
+      event_id: makeEventId("conc-del"),
+      emitted_at: new Date().toISOString(),
+      identity_id: this.identityId,
+      kind: "operator_concierge_thread_deleted",
+      surface: "concierge",
+      thread_id: threadId,
+      turn_count: turnsBefore.length,
+    };
+    this.emit(OPERATOR_CHAT_OPS.CONCIERGE_THREAD_DELETED, payload, "success");
+    return true;
+  }
+
+  /**
+   * Reset the active session memory thread. Subsequent sendConcierge
+   * calls allocate a fresh thread_id. Surfaced for tests + future "new
+   * conversation" affordance; not currently called by the dashboard.
+   */
+  resetConciergeMemoryThread(): void {
+    this.activeMemoryThreadId = undefined;
+  }
+
+  private ensureActiveMemoryThread(): string {
+    if (!this.activeMemoryThreadId) {
+      this.activeMemoryThreadId = randomUUID();
+    }
+    return this.activeMemoryThreadId;
   }
 
   /**

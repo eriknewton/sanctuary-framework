@@ -22,6 +22,18 @@ export {
 } from "./operator-chat-store.js";
 
 export {
+  ConciergeMemoryStore,
+  CONCIERGE_MEMORY_NAMESPACE,
+  CONCIERGE_MEMORY_KEY_PREFIX,
+  DEFAULT_CONCIERGE_RETENTION_DAYS,
+  type ConciergeMemoryStoreOptions,
+  type ConciergeTurn,
+  type ConciergeThreadSummary,
+  type ListThreadsOptions,
+  type ReadThreadOptions,
+} from "./concierge-memory-store.js";
+
+export {
   OPERATOR_CHAT_OPS,
   type OperatorChatOp,
 } from "./operator-chat-audit-events.js";

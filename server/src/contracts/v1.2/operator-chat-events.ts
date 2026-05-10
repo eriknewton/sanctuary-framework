@@ -88,6 +88,38 @@ export interface OperatorConciergeChatPayload extends OperatorChatAuditPayloadHe
 }
 
 /**
+ * Operator viewed concierge thread history (WP-V1.3-9 Tau-1). Emitted on
+ * list-threads and read-thread routes. `thread_id` carries the requested
+ * id, or the literal `*` for the list endpoint where no single thread is
+ * named. `turn_count` is the number of turns surfaced by the call (0 on
+ * an empty thread or empty list); raw turn content NEVER appears here.
+ */
+export interface OperatorConciergeHistoryReadPayload
+  extends OperatorChatAuditPayloadHeader {
+  kind: "operator_concierge_history_read";
+  surface: Extract<Surface, "concierge">;
+  thread_id: string;
+  turn_count: number;
+}
+
+/**
+ * Operator deleted a concierge thread (WP-V1.3-9 Tau-1). Emitted on
+ * successful thread removal. `turn_count` records how many turns were
+ * dropped at delete time; the audit log retains the per-event history
+ * regardless.
+ */
+export interface OperatorConciergeThreadDeletedPayload
+  extends OperatorChatAuditPayloadHeader {
+  kind: "operator_concierge_thread_deleted";
+  surface: Extract<Surface, "concierge">;
+  thread_id: string;
+  turn_count: number;
+}
+
+/**
  * Discriminated union of every operator-chat payload shape v1.2 emits.
  */
-export type OperatorChatAuditPayload = OperatorConciergeChatPayload;
+export type OperatorChatAuditPayload =
+  | OperatorConciergeChatPayload
+  | OperatorConciergeHistoryReadPayload
+  | OperatorConciergeThreadDeletedPayload;

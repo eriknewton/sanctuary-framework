@@ -45,6 +45,7 @@ import type { HubAgentStatus } from "../../contracts/v1.1/constants.js";
 import type { SubstrateSelector } from "../../intelligence/selector.js";
 import type { StorageBackend } from "../../storage/interface.js";
 import {
+  ConciergeMemoryStore,
   OperatorChatService,
   OperatorChatStore,
   type ConciergeContextProviders,
@@ -98,6 +99,12 @@ export interface BuildV11BindingsInputs {
    * Omit and the chat service is not constructed.
    */
   masterKey?: Uint8Array;
+  /**
+   * Operator-tunable retention window for the WP-V1.3-9 Tau-1 concierge
+   * memory store. Defaults to 30 days when omitted. Wired through from
+   * `principal-policy.yaml` `concierge_memory_retention_days`.
+   */
+  conciergeMemoryRetentionDays?: number;
 }
 
 export interface V11Bindings {
@@ -189,6 +196,24 @@ export function buildV11Bindings(
   let operatorChatService: OperatorChatService | undefined;
   if (inputs.storage && inputs.masterKey) {
     const chatStore = new OperatorChatStore(inputs.storage, inputs.masterKey);
+    // WP-V1.3-9 Tau-1: foundation memory store. Constructed alongside
+    // the existing single-thread store; sendConcierge dual-writes into
+    // both. Tau-2 wires the read-side context-fold into the substrate
+    // selector. pruneExpired fires once at construction so the cocoon-
+    // unlock cycle drops expired turns before any operator interaction.
+    const conciergeMemory = new ConciergeMemoryStore({
+      storage: inputs.storage,
+      masterKey: inputs.masterKey,
+      fortressId: inputs.fortressId,
+      ...(inputs.conciergeMemoryRetentionDays !== undefined
+        ? { retentionDays: inputs.conciergeMemoryRetentionDays }
+        : {}),
+    });
+    void conciergeMemory.pruneExpired().catch(() => {
+      // Pruning is best-effort on cocoon-unlock; a transient storage
+      // hiccup should not block hub construction. The next unlock
+      // re-runs the prune.
+    });
     operatorChatService = new OperatorChatService({
       store: chatStore,
       auditLog: inputs.auditLog,
@@ -202,6 +227,7 @@ export function buildV11Bindings(
         registry,
       }),
       conciergePiiFilter: buildConciergePiiFilter(),
+      conciergeMemory,
     });
   }
 
