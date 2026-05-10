@@ -28,10 +28,11 @@
 import { randomUUID, createHash } from "node:crypto";
 
 import type { StorageBackend } from "../storage/interface.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../core/encoding.js";
+import type { AggregatorPayloadStore } from "./aggregator-store.js";
 
 /** Reserved storage namespace for aggregator records. */
 export const APPROVAL_AGGREGATOR_NAMESPACE = "_approval_aggregator";
@@ -41,12 +42,17 @@ export const APPROVAL_AGGREGATOR_HKDF_INFO = "l2-approval-aggregator-v1";
 
 /**
  * Audit-event operation names emitted by the aggregator. Additive to the
- * existing free-form `operation` field on `AuditEntry`. v1.3-new.
+ * existing free-form `operation` field on `AuditEntry`. The first three
+ * names ship with Upsilon-1; the remaining three (replay surface) ship
+ * with Upsilon-3.
  */
 export const APPROVAL_AGGREGATOR_AUDIT_OPS = {
   AGGREGATED: "cross_harness_approval_aggregated",
   RESOLVED: "cross_harness_approval_resolved",
   DEDUPED: "cross_harness_approval_deduped",
+  PAYLOAD_DECRYPTED: "cross_harness_approval_payload_decrypted",
+  AUDIT_TRAIL_VIEWED: "cross_harness_approval_audit_trail_viewed",
+  REPLAYED: "cross_harness_approval_replayed",
 } as const;
 
 /**
@@ -73,6 +79,20 @@ export type AggregatedApprovalStatus =
   | "denied"
   | "timeout"
   | "expired";
+
+/**
+ * One step in the Castle Architecture enforcement chain that led to this
+ * approval. Layers are: l1 (Castle Wall, OS-level egress), l2 (Sentinel +
+ * cooperative MCP gate), l3 (selective disclosure), l4 (reputation).
+ * v1.3 Upsilon-3 ships the schema; default resolver populates a single
+ * `l2` entry. Future Castle Wall wiring will extend the chain when a
+ * payload's egress was first observed by the kernel filter.
+ */
+export interface EnforcementLayerEvent {
+  layer: "l1" | "l2" | "l3" | "l4";
+  event: string;
+  timestamp: string;
+}
 
 /**
  * Normalized record the aggregator stores per approval. Field set is
@@ -118,6 +138,15 @@ export interface AggregatedApproval {
    * (the cross-link signal lives on the aggregator side only).
    */
   hub_inbox_item_id?: string;
+  /**
+   * Castle Architecture enforcement-layer chain that led to this
+   * approval. Populated by the optional `resolveEnforcementChain` deps
+   * hook; default returns a single `l2` step (cooperative MCP gate
+   * fired). Persisted with the entry so the operator-replay surface can
+   * render the enforcement context after a server restart. v1.3
+   * Upsilon-3.
+   */
+  enforcement_chain?: EnforcementLayerEvent[];
 }
 
 /**
@@ -211,6 +240,25 @@ export interface ApprovalAggregatorDeps {
    * hub inbox store.
    */
   resolveHubInboxItemId?: (event: ApprovalGateEvent) => string | undefined;
+  /**
+   * Optional at-rest payload store. When provided, the aggregator
+   * persists each request payload via `savePayload` on ingest, and
+   * rehydrates payloads on `getFullPayload` if the in-memory map lost
+   * them (e.g. after a server restart). Upsilon-3 surface; absent in
+   * Upsilon-1 / Upsilon-2 deployments, where payloads remain in-memory
+   * only.
+   */
+  payloadStore?: AggregatorPayloadStore;
+  /**
+   * Optional resolver for the Castle Architecture enforcement chain
+   * leading to this approval. Default returns a single `l2` step
+   * (cooperative MCP gate fired). When the Castle Wall (Layer 1) ships,
+   * its kernel-filter observer can populate richer chains by passing a
+   * resolver here.
+   */
+  resolveEnforcementChain?: (
+    event: ApprovalGateEvent,
+  ) => EnforcementLayerEvent[];
 }
 
 /**
@@ -232,6 +280,10 @@ export class ApprovalAggregator {
   private readonly resolveHubInboxItemId: (
     event: ApprovalGateEvent,
   ) => string | undefined;
+  private readonly payloadStore: AggregatorPayloadStore | null;
+  private readonly resolveEnforcementChain: (
+    event: ApprovalGateEvent,
+  ) => EnforcementLayerEvent[];
 
   /** Cached entries by `aggregator_id`. */
   private readonly entries = new Map<string, AggregatedApproval>();
@@ -266,6 +318,16 @@ export class ApprovalAggregator {
       }));
     this.resolveHubInboxItemId =
       deps.resolveHubInboxItemId ?? ((_event) => undefined);
+    this.payloadStore = deps.payloadStore ?? null;
+    this.resolveEnforcementChain =
+      deps.resolveEnforcementChain ??
+      ((event: ApprovalGateEvent): EnforcementLayerEvent[] => [
+        {
+          layer: "l2",
+          event: `approval_required:${event.operation}`,
+          timestamp: event.request_timestamp,
+        },
+      ]);
   }
 
   /**
@@ -331,13 +393,186 @@ export class ApprovalAggregator {
 
   /**
    * Return the original (unhashed) request payload for the entry. Returns
-   * `null` when the entry is unknown or the payload was evicted (e.g. the
-   * process restarted; payloads are in-memory only at v1.3 Upsilon-1).
+   * `null` when the entry is unknown. When the in-memory payload map has
+   * been evicted (e.g. after a server restart) and a `payloadStore` was
+   * provided, the at-rest bundle is decrypted and the in-memory map is
+   * refilled. Audit emission lives on the `*WithAudit` variant; this base
+   * accessor is silent so internal callers can read without polluting the
+   * audit trail.
    */
   async getFullPayload(aggregatorId: string): Promise<unknown> {
     await this.hydrate();
     if (!this.entries.has(aggregatorId)) return null;
-    return this.fullPayloads.get(aggregatorId) ?? null;
+    const cached = this.fullPayloads.get(aggregatorId);
+    if (cached !== undefined) return cached;
+    if (this.payloadStore) {
+      try {
+        const restored = await this.payloadStore.loadPayload(aggregatorId);
+        if (restored !== null) {
+          this.fullPayloads.set(aggregatorId, restored);
+          return restored;
+        }
+      } catch {
+        // Fall through to null on store failure.
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Return the entry record for the given id, or null when unknown.
+   * Idempotent. v1.3 Upsilon-3.
+   */
+  async getEntry(aggregatorId: string): Promise<AggregatedApproval | null> {
+    await this.hydrate();
+    return this.entries.get(aggregatorId) ?? null;
+  }
+
+  /**
+   * Audited variant of `getFullPayload`. Emits the
+   * `cross_harness_approval_payload_decrypted` audit event before
+   * returning. Used by the operator-facing /payload replay route.
+   * v1.3 Upsilon-3.
+   */
+  async getFullPayloadWithAudit(
+    aggregatorId: string,
+    operatorId: string,
+  ): Promise<unknown> {
+    const payload = await this.getFullPayload(aggregatorId);
+    if (payload === null) return null;
+    const entry = this.entries.get(aggregatorId);
+    this.auditLog.append(
+      "l2",
+      APPROVAL_AGGREGATOR_AUDIT_OPS.PAYLOAD_DECRYPTED,
+      operatorId,
+      {
+        aggregator_id: aggregatorId,
+        ...(entry
+          ? {
+              source_harness: entry.source_harness,
+              source_agent_id: entry.source_agent_id,
+              entry_status: entry.status,
+            }
+          : {}),
+      },
+    );
+    return payload;
+  }
+
+  /**
+   * Return the audit-log entries that led to and surround this approval.
+   * Best-effort matching: aggregator-side emissions (AGGREGATED, RESOLVED,
+   * DEDUPED, replay events) all carry `details.aggregator_id` and link
+   * directly. Gate-side emissions (`gate_*:operation`) do not carry the
+   * aggregator id at v1.3, so they are matched via timestamp window
+   * (entry.created_at to entry.resolved_at + 1s, or expires_at + 1s while
+   * pending) and operation suffix. Emits AUDIT_TRAIL_VIEWED on call.
+   * v1.3 Upsilon-3.
+   */
+  async getAuditTrail(
+    aggregatorId: string,
+    operatorId: string,
+  ): Promise<AuditEntry[]> {
+    await this.hydrate();
+    const entry = this.entries.get(aggregatorId);
+    if (!entry) {
+      return [];
+    }
+    const sinceMs = Date.parse(entry.created_at) - 1000;
+    const sinceIso = new Date(sinceMs).toISOString();
+    const queried = await this.auditLog.query({ since: sinceIso, limit: 1000 });
+    const operationPart = entry.policy_rule_id.includes(":")
+      ? entry.policy_rule_id.slice(entry.policy_rule_id.indexOf(":") + 1)
+      : entry.policy_rule_id;
+    const lifetimeStart = sinceMs;
+    const lifetimeEnd = entry.resolved_at
+      ? Date.parse(entry.resolved_at) + 1000
+      : Date.parse(entry.expires_at) + 1000;
+
+    const matches: AuditEntry[] = [];
+    for (const audit of queried.entries) {
+      const detailsId =
+        audit.details !== undefined
+          ? (audit.details as Record<string, unknown>)["aggregator_id"]
+          : undefined;
+      if (detailsId === aggregatorId) {
+        matches.push(audit);
+        continue;
+      }
+      const auditMs = Date.parse(audit.timestamp);
+      if (auditMs < lifetimeStart || auditMs > lifetimeEnd) continue;
+      if (audit.operation.endsWith(`:${operationPart}`)) {
+        matches.push(audit);
+      }
+    }
+    matches.sort((a, b) =>
+      a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
+    );
+
+    this.auditLog.append(
+      "l2",
+      APPROVAL_AGGREGATOR_AUDIT_OPS.AUDIT_TRAIL_VIEWED,
+      operatorId,
+      {
+        aggregator_id: aggregatorId,
+        entry_status: entry.status,
+        match_count: matches.length,
+      },
+    );
+    return matches;
+  }
+
+  /**
+   * List historical (resolved) approvals. Excludes pending entries by
+   * design: `list()` is the pending-inbox surface and `getHistory()` is
+   * the resolved-replay surface. Emits REPLAYED on each call. v1.3
+   * Upsilon-3.
+   */
+  async getHistory(
+    opts: {
+      status?: AggregatedApprovalStatus;
+      sinceTs?: string;
+      limit?: number;
+    } | undefined,
+    operatorId: string,
+  ): Promise<AggregatedApproval[]> {
+    await this.hydrate();
+    await this.expireStale();
+
+    const limit = Math.min(
+      opts?.limit ?? DEFAULT_LIST_PAGE_SIZE,
+      this.maxListLimit,
+    );
+    const sinceMs = opts?.sinceTs
+      ? Date.parse(opts.sinceTs)
+      : Number.NEGATIVE_INFINITY;
+
+    const matching: AggregatedApproval[] = [];
+    for (const entry of this.entries.values()) {
+      if (entry.status === "pending") continue;
+      if (opts?.status && entry.status !== opts.status) continue;
+      const stamp = Date.parse(entry.resolved_at ?? entry.created_at);
+      if (stamp < sinceMs) continue;
+      matching.push(entry);
+    }
+    matching.sort((a, b) => {
+      const aStamp = a.resolved_at ?? a.created_at;
+      const bStamp = b.resolved_at ?? b.created_at;
+      return bStamp.localeCompare(aStamp);
+    });
+    const sliced = matching.slice(0, limit);
+
+    this.auditLog.append(
+      "l2",
+      APPROVAL_AGGREGATOR_AUDIT_OPS.REPLAYED,
+      operatorId,
+      {
+        result_count: sliced.length,
+        ...(opts?.status !== undefined ? { status_filter: opts.status } : {}),
+        ...(opts?.sinceTs !== undefined ? { since: opts.sinceTs } : {}),
+      },
+    );
+    return sliced;
   }
 
   /**
@@ -424,6 +659,7 @@ export class ApprovalAggregator {
     const now = this.now();
     const expires = new Date(now.getTime() + this.pendingTtlMs);
     const hubInboxId = this.resolveHubInboxItemId(event);
+    const enforcementChain = this.resolveEnforcementChain(event);
     const entry: AggregatedApproval = {
       aggregator_id: id,
       source_harness: ctx.source_harness,
@@ -436,6 +672,9 @@ export class ApprovalAggregator {
       created_at: now.toISOString(),
       expires_at: expires.toISOString(),
       ...(hubInboxId !== undefined ? { hub_inbox_item_id: hubInboxId } : {}),
+      ...(enforcementChain.length > 0
+        ? { enforcement_chain: enforcementChain }
+        : {}),
     };
 
     this.entries.set(id, entry);
@@ -444,6 +683,15 @@ export class ApprovalAggregator {
     this.fullPayloads.set(id, event.context);
 
     await this.persist(entry);
+    if (this.payloadStore) {
+      try {
+        await this.payloadStore.savePayload(id, event.context);
+      } catch {
+        // At-rest persistence failure is non-fatal: in-memory map still
+        // serves the payload for the current process. Replay-after-restart
+        // simply degrades for this entry.
+      }
+    }
     this.auditLog.append(
       "l2",
       APPROVAL_AGGREGATOR_AUDIT_OPS.AGGREGATED,
