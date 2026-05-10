@@ -40,6 +40,13 @@ export const OPERATOR_CHAT_OPS = {
    * carries thread_id + a stable failure_reason enum.
    */
   CONCIERGE_MEMORY_READ_FAILED: "operator_concierge_memory_read_failed",
+  /**
+   * Concierge dynamic-context fetcher failed (WP-V1.3-9 Tau-3). Emitted
+   * when a category fetcher throws while assembling the dynamic context
+   * fold. The concierge omits that category and continues; the user-
+   * facing query is never broken. Body carries category + failure_reason.
+   */
+  CONCIERGE_CONTEXT_FETCHER_FAILED: "operator_concierge_context_fetcher_failed",
 } as const;
 
 export type OperatorChatOp =
