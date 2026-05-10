@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.5] - 2026-05-09
+
+Patch release shipping the iteration-2 cascade since v1.2.4: substrate hardening wave 6 plus the second build of two v1.3 preview surfaces (concierge multi-turn coherence and cross-harness approval redirect). The v1.3 preview routes remain additive and non-breaking; v1.3.0 GA waits until WP-V1.3-9 and WP-V1.3-10 fully ship.
+
+### Substrate hardening (wave 6)
+
+Wave 6 (PR #167) closes 5 next full-sweep findings:
+
+- **#64 (P2):** broker per-secret-name mutex serializes concurrent add, rotate, and delete calls on the same name, preventing the keychain find-then-add race from producing duplicate or lost entries. Four regression tests cover add+add, rotate+rotate, add+rotate, plus a parallelism check on distinct names.
+- **#78 (P2):** `importExitBundle` now wraps the re-key path in try/catch; on failure every successfully imported state entry plus every staged artifact is removed via `opts.storage.delete()`. The thrown `ExitBundleImportError` carries the `REKEY_FAILED_AND_CLEANED` code with cleanup counts in the message. New `exit_bundle_rekey_failed_cleanup` audit operation records the rollback.
+- **#86 (P3):** `openBroker` fires `Broker.pruneExpiredTokens` on the cocoon-unlock initialization path so each unlock cycle drops stale token bindings before any operator interaction.
+- **#88 (P3):** `attestation/failure-catalog.ts` gains an `assertCatalogInvariantsAtImport` guard that throws `FailureCatalogInvariantError` if the closed-enum row count, uniqueness, `degrade_decision`, or `affected_layers` invariants drift.
+- **#90 (P3):** new `handshake/audit.ts` exposes session-lifecycle audit hooks (`handshake_initiated`, `handshake_completed`, `handshake_failed`, `handshake_aborted`) wired into every `handshake_initiate`, `respond`, `complete`, and `status` transition. New `handshake_abort` tool exposes the aborted lifecycle to operators.
+
+### v1.3 preview deepening (additive, non-breaking)
+
+Both surfaces below are build 2 of their respective work packages. New routes, audit events, and CLI verbs are additive; full v1.3 GA waits until the remaining WP-V1.3-9 and WP-V1.3-10 builds ship.
+
+- **WP-V1.3-9 Tau-2 concierge multi-turn coherence (preview).** Build 2 of 5 in WP-V1.3-9. The concierge now reads prior turns of the active session via the Tau-1 memory store, applies a 24-hour freshness filter and a 10-turn sliding window, then folds the kept turns into the substrate context as a structured `## Prior conversation` section with explicit `OPERATOR:` and `CONCIERGE:` line boundaries. Token-budget pruning (default ~500 tokens, ~4 chars per token proxy) drops oldest turns first when over budget; the static Sanctuary reference and fortress-state sections are not subject to the budget cap. Active-session TTL (default 24h) allocates a fresh `thread_id` after a quiet period. Graceful degradation on memory read failure: a corrupted bundle, decryption failure, schema mismatch, oversize bundle, or storage IO failure drops the fold to single-turn for the round and emits a new `operator_concierge_memory_read_failed` audit event with a stable `failure_reason` enum (`decrypt_failed`, `schema_mismatch`, `oversize_bundle`, `io_failed`, `unknown`). The user-facing query always proceeds. `OperatorConciergeChatPayload` now carries optional `thread_id`, `turn_index`, and `prior_turns_folded` fields; payloads built against the Tau-1 shape still parse. PR #166.
+
+- **WP-V1.3-10 Upsilon-2 cross-harness approval redirect (preview).** Build 2 of 4 in WP-V1.3-10. New `AggregatorBackedChannel` wraps the underlying `ApprovalChannel` and routes Tier 1/2 approval resolutions through the Upsilon-1 aggregator's resolve API, so operator decisions via the unified inbox can drive gate outcomes. Two modes: `replace` bypasses the underlying channel and awaits the aggregator decision (falls closed at `policy.approval_channel.timeout_seconds`); `notify` races the underlying channel and the aggregator, first decision wins (operator-friendly fallback for harnesses that cannot fully suppress their local approval prompt). Per-fortress config in `principal-policy.yaml` under `approval_redirect.{enabled, mode}`, default disabled. New CLI: `sanctuary agents config <tenant> --approval-redirect=<bool> [--approval-redirect-mode=<replace|notify>]`. `agents show` reflects the persisted state. `sanctuary agent` (singular) is wired as an alias to the existing `sanctuary agents` dispatcher. Per-agent overrides are reserved as schema-stable stub fields under `approval_redirect.per_agent` for v1.4 multi-agent fortresses, when gate signature propagation lands. PR #168.
+
+### Notes
+
+Test baseline floor: 3634 (Linux CI), reflecting the iteration-2 cascade over the v1.2.4 floor of 3568 (Sigma-2 +17, Tau-2 +17, Upsilon-2 +32).
+
 ## [1.2.4] - 2026-05-09
 
 Patch release bundling 8 PRs merged to main since v1.2.3: Castle Wall macOS Phase 1 expansion, a panic-discipline CI gate, a Mini1 drill fix, two more substrate-hardening waves, a docs hygiene sweep, and v1.3 preview surfaces (concierge memory layer + cross-harness approval inbox). The v1.3 preview routes are additive and non-breaking; v1.3.0 GA waits until WP-V1.3-1/2/7/9/10 all ship.
