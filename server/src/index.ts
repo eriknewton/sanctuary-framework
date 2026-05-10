@@ -15,7 +15,7 @@ import { createL1Tools } from "./l1-cognitive/tools.js";
 import { AuditLog } from "./l2-operational/audit-log.js";
 import { createL3Tools } from "./l3-disclosure/tools.js";
 import { createL4Tools } from "./l4-reputation/tools.js";
-import { loadPrincipalPolicy } from "./principal-policy/loader.js";
+import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
 import type { IdentityManager } from "./l1-cognitive/tools.js";
 import type { PrincipalPolicy } from "./principal-policy/types.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
@@ -587,7 +587,16 @@ export async function createSanctuaryServer(options?: {
   const { tools: profileTools } = createSovereigntyProfileTools(profileStore, auditLog);
 
   // 15. Load Principal Policy and create approval gate
-  const policy = await loadPrincipalPolicy(config.storage_path);
+  let policy: PrincipalPolicy;
+  try {
+    policy = await loadPrincipalPolicy(config.storage_path);
+  } catch (err) {
+    if (err instanceof MalformedPrincipalPolicyError) {
+      console.error(`\nSanctuary cannot start.\n${err.message}\n`);
+      process.exit(1);
+    }
+    throw err;
+  }
   const baseline = new BaselineTracker(storage, masterKey);
   await baseline.load();
 
@@ -1026,7 +1035,7 @@ export { FilesystemStorage } from "./storage/filesystem.js";
 export * from "./exit/index.js";
 export { ApprovalGate } from "./principal-policy/gate.js";
 export { BaselineTracker } from "./principal-policy/baseline.js";
-export { loadPrincipalPolicy } from "./principal-policy/loader.js";
+export { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
 export type { PrincipalPolicy, GateResult } from "./principal-policy/types.js";
 export {
   StderrApprovalChannel,
