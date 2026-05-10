@@ -33,10 +33,13 @@ import type { AuditLog } from "../l2-operational/audit-log.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { SentinelFindingStore } from "../sentinel/sentinel-finding-store.js";
 import type {
+  AnomalyClassifier,
   AnomalyContext,
   AnomalyDetector,
   AnomalyFinding,
 } from "./types.js";
+import { CUSUM_CLASSIFIER_ID } from "./classifiers/cusum.js";
+import { PSI_CLASSIFIER_ID } from "./classifiers/psi.js";
 
 export const ANOMALY_AUDIT_OPS = {
   DETECTOR_REGISTERED: "anomaly_detector_registered",
@@ -45,6 +48,15 @@ export const ANOMALY_AUDIT_OPS = {
   EVALUATION_FAILED: "anomaly_evaluation_failed",
   TRAINING_COMPLETED: "anomaly_training_completed",
   TRAINING_FAILED: "anomaly_training_failed",
+  /** Chi-2: a classifier was attached to an existing detector. */
+  CLASSIFIER_SUBSCRIBED: "anomaly_classifier_subscribed",
+  /** Chi-2: a classifier was detached from an existing detector. */
+  CLASSIFIER_UNSUBSCRIBED: "anomaly_classifier_unsubscribed",
+  /** Chi-2: CUSUM-flagged mean-shift drift on a per-agent feature. */
+  CUSUM_DRIFT_DETECTED: "anomaly_cusum_drift_detected",
+  /** Chi-2: PSI-flagged distribution shift on a per-agent feature. */
+  PSI_DISTRIBUTION_SHIFT_DETECTED:
+    "anomaly_psi_distribution_shift_detected",
 } as const;
 
 export type AnomalyAuditOp =
@@ -184,35 +196,43 @@ export class AnomalyPipelineDispatcher {
             const stamped = await this.routeFinding(detectorId, raw);
             findings.push(stamped);
           }
-          try {
-            const trainingResult = await detector.classifier.train();
-            this.auditLog.append(
-              "l2",
-              ANOMALY_AUDIT_OPS.TRAINING_COMPLETED,
-              this.identityId,
-              {
-                detector_id: detectorId,
-                classifier_id: detector.classifier.classifierId,
-                trained_at: trainingResult.trained_at,
-                sample_count: trainingResult.sample_count,
-                agent_count: trainingResult.agent_count,
-                fortress_id: this.fortressId,
-              },
-            );
-          } catch (trainErr) {
-            const message =
-              trainErr instanceof Error ? trainErr.message : String(trainErr);
-            this.auditLog.append(
-              "l2",
-              ANOMALY_AUDIT_OPS.TRAINING_FAILED,
-              this.identityId,
-              {
-                detector_id: detectorId,
-                error_message: message,
-                fortress_id: this.fortressId,
-              },
-              "failure",
-            );
+          // Chi-2: train every attached classifier on this detector;
+          // each gets its own audit emission so the operator can see
+          // per-classifier training cadence in the audit log.
+          for (const classifier of detector.getAllClassifiers()) {
+            try {
+              const trainingResult = await classifier.train();
+              this.auditLog.append(
+                "l2",
+                ANOMALY_AUDIT_OPS.TRAINING_COMPLETED,
+                this.identityId,
+                {
+                  detector_id: detectorId,
+                  classifier_id: classifier.classifierId,
+                  trained_at: trainingResult.trained_at,
+                  sample_count: trainingResult.sample_count,
+                  agent_count: trainingResult.agent_count,
+                  fortress_id: this.fortressId,
+                },
+              );
+            } catch (trainErr) {
+              const message =
+                trainErr instanceof Error
+                  ? trainErr.message
+                  : String(trainErr);
+              this.auditLog.append(
+                "l2",
+                ANOMALY_AUDIT_OPS.TRAINING_FAILED,
+                this.identityId,
+                {
+                  detector_id: detectorId,
+                  classifier_id: classifier.classifierId,
+                  error_message: message,
+                  fortress_id: this.fortressId,
+                },
+                "failure",
+              );
+            }
           }
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -283,6 +303,9 @@ export class AnomalyPipelineDispatcher {
       observed_at: raw.observed_at || this.now().toISOString(),
     };
     await this.findingStore.saveFinding(stamped);
+    const classifierId = (
+      stamped.details["classifier_id"] as string | undefined
+    ) ?? null;
     this.auditLog.append(
       "l2",
       ANOMALY_AUDIT_OPS.FINDING_EMITTED,
@@ -292,12 +315,93 @@ export class AnomalyPipelineDispatcher {
         finding_id: stamped.finding_id,
         severity: stamped.severity,
         anomaly_score: (stamped.details["anomaly_score"] as number | undefined) ?? null,
+        ...(classifierId !== null ? { classifier_id: classifierId } : {}),
         ...(stamped.agent_id !== undefined ? { agent_id: stamped.agent_id } : {}),
         fortress_id: this.fortressId,
       },
     );
+    // Chi-2: classifier-specific audit event in addition to the
+    // generic FINDING_EMITTED. Lets operators filter the audit log
+    // for "show me only CUSUM drifts" or "only PSI shifts" without
+    // walking finding details.
+    const specificOp = classifierSpecificAuditOp(classifierId);
+    if (specificOp !== null) {
+      this.auditLog.append("l2", specificOp, this.identityId, {
+        detector_id: detectorId,
+        finding_id: stamped.finding_id,
+        severity: stamped.severity,
+        anomaly_score:
+          (stamped.details["anomaly_score"] as number | undefined) ?? null,
+        ...(stamped.agent_id !== undefined
+          ? { agent_id: stamped.agent_id }
+          : {}),
+        fortress_id: this.fortressId,
+      });
+    }
     this.emit({ type: "finding", finding: stamped });
     return stamped;
+  }
+
+  /**
+   * Chi-2: attach an additional classifier to an already-registered
+   * detector. Emits ANOMALY_CLASSIFIER_SUBSCRIBED on success. The
+   * factory is called with the fortress AnomalyContext so the
+   * classifier can build its own state-store binding. Idempotent: a
+   * second call with the same classifierId returns false.
+   */
+  async addClassifierToDetector(
+    detectorId: string,
+    factory: (context: AnomalyContext) => AnomalyClassifier,
+  ): Promise<boolean> {
+    const detector = this.detectors.get(detectorId);
+    if (!detector) return false;
+    const context: AnomalyContext = {
+      fortressId: this.fortressId,
+      auditLog: this.auditLog,
+      storage: this.storage,
+      masterKey: this.masterKey,
+      now: this.now,
+    };
+    const classifier = factory(context);
+    const added = detector.addClassifier(classifier);
+    if (!added) return false;
+    this.auditLog.append(
+      "l2",
+      ANOMALY_AUDIT_OPS.CLASSIFIER_SUBSCRIBED,
+      this.identityId,
+      {
+        detector_id: detectorId,
+        classifier_id: classifier.classifierId,
+        fortress_id: this.fortressId,
+      },
+    );
+    return true;
+  }
+
+  /**
+   * Chi-2: detach an additional classifier from an already-registered
+   * detector. Emits ANOMALY_CLASSIFIER_UNSUBSCRIBED on success. The
+   * primary classifier cannot be detached (returns false).
+   */
+  async removeClassifierFromDetector(
+    detectorId: string,
+    classifierId: string,
+  ): Promise<boolean> {
+    const detector = this.detectors.get(detectorId);
+    if (!detector) return false;
+    const removed = detector.removeClassifier(classifierId);
+    if (!removed) return false;
+    this.auditLog.append(
+      "l2",
+      ANOMALY_AUDIT_OPS.CLASSIFIER_UNSUBSCRIBED,
+      this.identityId,
+      {
+        detector_id: detectorId,
+        classifier_id: classifierId,
+        fortress_id: this.fortressId,
+      },
+    );
+    return true;
   }
 
   private emit(event: AnomalyDispatcherAnyEmit): void {
@@ -309,6 +413,24 @@ export class AnomalyPipelineDispatcher {
       }
     }
   }
+}
+
+/**
+ * Map a classifier id to its Chi-2 specific audit op, or null when
+ * the classifier does not have a specific op (e.g. rolling-baseline
+ * uses the generic FINDING_EMITTED only).
+ */
+function classifierSpecificAuditOp(
+  classifierId: string | null,
+): string | null {
+  if (classifierId === null) return null;
+  if (classifierId === CUSUM_CLASSIFIER_ID) {
+    return ANOMALY_AUDIT_OPS.CUSUM_DRIFT_DETECTED;
+  }
+  if (classifierId === PSI_CLASSIFIER_ID) {
+    return ANOMALY_AUDIT_OPS.PSI_DISTRIBUTION_SHIFT_DETECTED;
+  }
+  return null;
 }
 
 // Re-export the foundation types from one place so consumers import a
