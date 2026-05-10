@@ -242,6 +242,7 @@ export async function discoverTenants(
   }
   for (const [name, count] of seen) {
     if (count > 1) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `[sanctuary] warning: ${count} tenants share the name "${name}". ` +
           `Use --tenant with a unique name or storage path to disambiguate.`

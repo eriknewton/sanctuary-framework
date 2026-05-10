@@ -210,6 +210,7 @@ export async function startStandaloneDashboard(
       if (stored) {
         passphrase = stored.value;
         passphraseSource = stored.source === "keychain" ? "keychain" : "fallback-file";
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `Passphrase: loaded from ${stored.location} (service ${keychainServiceFor(config.storage_path, homedir())})`
         );
@@ -340,6 +341,7 @@ export async function startStandaloneDashboard(
 
       // No existing data — first run. Generate a key, but warn that this is unusual
       // for standalone dashboard (normally you'd run the MCP server first).
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         "Warning: No existing Sanctuary data found. The standalone dashboard\n" +
         "is typically started after the MCP server has been run at least once.\n" +
@@ -361,6 +363,7 @@ export async function startStandaloneDashboard(
           err instanceof RecoveryKeyConfirmationDeclinedError ||
           err instanceof RecoveryKeyConfirmationNonInteractiveError
         ) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
           console.error(`\nSanctuary Dashboard: ${err.message}\n`);
           process.exit(2);
         }
@@ -398,6 +401,7 @@ export async function startStandaloneDashboard(
     policy = await loadPrincipalPolicy(config.storage_path);
   } catch (err) {
     if (err instanceof MalformedPrincipalPolicyError) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\nSanctuary cannot start.\n${err.message}\n`);
       process.exit(1);
     }
@@ -475,6 +479,7 @@ export async function startStandaloneDashboard(
     });
     await intelligenceSelector.load();
   } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `  Note: Intelligence panel unavailable (${(err as Error).message}).`,
     );
@@ -542,6 +547,7 @@ export async function startStandaloneDashboard(
   process.once("SIGTERM", clearRuntime);
   process.once("exit", clearRuntime);
 
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
   console.error(`Storage: ${config.storage_path}`);
   console.error(`Identities loaded: ${loadResult.loaded}`);
@@ -554,6 +560,7 @@ export async function startStandaloneDashboard(
   const persistedAgentsCount = readPersistedLocalAgents(
     config.storage_path,
   ).length;
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`Local agents loaded: ${persistedAgentsCount}`);
   console.error(`Listening: http://${dashboardHost}:${dashboardPort}`);
 
@@ -575,6 +582,7 @@ export async function startStandaloneDashboard(
       otherTenants.length > 0
         ? `\n     ${renderTenantDiscoveryHint(otherTenants).split("\n").join("\n     ")}\n`
         : "";
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `\n  ⚠  WARNING: Encrypted identities found but NONE loaded\n` +
         `     ${loadResult.total} encrypted identity file(s) in ${config.storage_path}/state/_identities/\n` +
@@ -591,6 +599,7 @@ export async function startStandaloneDashboard(
         `     destroy the data encrypted under the prior key.\n`
     );
   } else if (loadResult.failed > 0) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `Warning: ${loadResult.failed} of ${loadResult.total} identity files could not be decrypted (possibly corrupted).`
     );

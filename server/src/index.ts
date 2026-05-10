@@ -269,6 +269,7 @@ export async function createSanctuaryServer(options?: {
 
   // 8a. Warn loudly if encrypted identity files exist but none could be decrypted
   if (loadResult.total > 0 && loadResult.loaded === 0) {
+    // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
     console.error(
       "\n╔══════════════════════════════════════════════════════════════╗\n" +
       "║  ⚠  WARNING: Encrypted identities found but NONE loaded     ║\n" +
@@ -284,6 +285,7 @@ export async function createSanctuaryServer(options?: {
       "╚══════════════════════════════════════════════════════════════╝\n"
     );
   } else if (loadResult.failed > 0) {
+    // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
     console.error(
       `Warning: ${loadResult.failed} of ${loadResult.total} identity files could not be decrypted (possibly corrupted).`
     );
@@ -601,6 +603,7 @@ export async function createSanctuaryServer(options?: {
     policy = await loadPrincipalPolicy(config.storage_path);
   } catch (err) {
     if (err instanceof MalformedPrincipalPolicyError) {
+      // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
       console.error(`\nSanctuary cannot start.\n${err.message}\n`);
       process.exit(1);
     }
@@ -663,6 +666,7 @@ export async function createSanctuaryServer(options?: {
       });
       await intelligenceSelector.load();
     } catch (err) {
+      // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
       console.error(
         `  Note: Intelligence panel unavailable (${(err as Error).message}). ` +
           `Run \`sanctuary dashboard\` and pick a substrate.`,
@@ -931,6 +935,7 @@ export async function createSanctuaryServer(options?: {
 
       // Start connecting to upstream servers (non-blocking)
       clientManager.configure(enabledServers).catch(err => {
+        // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
         console.error(`[Sanctuary] Failed to configure upstream servers: ${err instanceof Error ? err.message : "unknown error"}`);
       });
 

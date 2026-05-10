@@ -39,6 +39,7 @@ async function tightenEntry(path: string): Promise<void> {
       try {
         await chmod(path, 0o700);
       } catch (err) {
+        // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
         console.error(`  Warning: could not chmod dir ${path}: ${(err as Error).message}`);
       }
     }
@@ -58,6 +59,7 @@ async function tightenEntry(path: string): Promise<void> {
       try {
         await chmod(path, 0o600);
       } catch (err) {
+        // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
         console.error(`  Warning: could not chmod file ${path}: ${(err as Error).message}`);
       }
     }

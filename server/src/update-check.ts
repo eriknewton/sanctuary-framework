@@ -117,6 +117,7 @@ export async function checkForUpdate(currentVersion: string): Promise<void> {
   try {
     const latest = await fetchLatestVersion(currentVersion);
     if (latest) {
+      // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
       console.error(formatUpdateMessage(currentVersion, latest));
     }
   } catch {

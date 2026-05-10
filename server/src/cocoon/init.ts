@@ -98,6 +98,7 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
   if (!options.force) {
     const empty = await isDirectoryEmpty(fortressPath);
     if (!empty) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `\n  Sanctuary init: refusing to overwrite a non-empty fortress at:\n` +
           `    ${fortressPath}\n\n` +
@@ -119,6 +120,7 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
   const keyHash = hashToString(masterKey);
   await storage.write("_meta", "recovery-key-hash", stringToBytes(keyHash));
 
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`\n  Sanctuary init`);
   console.error(`  Fortress: ${fortressPath}\n`);
 
@@ -137,6 +139,7 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
       err instanceof RecoveryKeyConfirmationDeclinedError ||
       err instanceof RecoveryKeyConfirmationNonInteractiveError
     ) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Sanctuary init: ${err.message}\n`);
       throw err;
     }
@@ -171,6 +174,7 @@ export function parseInitArgs(argv: string[]): ParsedInitArgs {
 }
 
 export function printInitHelp(): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.log(`
 sanctuary init. Create a fresh Sanctuary fortress at a chosen path.
 
