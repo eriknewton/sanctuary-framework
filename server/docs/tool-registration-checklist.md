@@ -23,9 +23,9 @@ A no-op rename does not require a fresh review, but the checklist entry MUST mov
 
 Pick one of:
 
-- `tier1` — Always requires human approval through the Principal Policy gate. Examples (canonical names from `server/src/principal-policy/loader.ts`): `state_export`, `state_import`, `state_delete`, `identity_rotate`, `reputation_export`, `reputation_import`, `sanctuary_export_identity_bundle`, plus v1.1 additions `exit_bundle_export`, `exit_bundle_import`, `exit_bundle_rekey`, `policy_change`, `lockdown`, `unwrap` (these v1.1 names MUST be added to the loader's Tier 1 set in the same PR that lands their behavior).
-- `tier2` — Requires approval when behavioral anomaly detection triggers. Examples: an action against a new namespace, a new counterparty, or an unusual rate.
-- `tier3` — Auto-allow with audit logging.
+- `tier1`: Always requires human approval through the Principal Policy gate. Examples (canonical names from `server/src/principal-policy/loader.ts`): `state_export`, `state_import`, `state_delete`, `identity_rotate`, `reputation_export`, `reputation_import`, `sanctuary_export_identity_bundle`, plus v1.1 additions `exit_bundle_export`, `exit_bundle_import`, `exit_bundle_rekey`, `policy_change`, `lockdown`, `unwrap` (these v1.1 names MUST be added to the loader's Tier 1 set in the same PR that lands their behavior).
+- `tier2`: Requires approval when behavioral anomaly detection triggers. Examples: an action against a new namespace, a new counterparty, or an unusual rate.
+- `tier3`: Auto-allow with audit logging.
 
 Authority: the canonical tier list lives in `server/src/principal-policy/loader.ts`. Tools MUST be registered there with their tier, not only declared in the tool's own file.
 
@@ -35,10 +35,10 @@ Block conditions: a tool that performs an irreversible operation (export, import
 
 Pick one of:
 
-- `none` — Tool reads or writes only local resources. No socket, no spawned subprocess that performs network I/O.
-- `model_only` — Tool calls a remote model provider. No other network destination.
-- `specific_allowlist` — Tool calls one or more explicitly allowlisted hosts. The allowlist MUST be enumerated in the tool's registration.
-- `wildcard_with_policy` — Tool may call any host the operator's egress policy permits. Reserved for proxy and gateway tools that intentionally generalize across destinations. Egress policy is the authoritative gate at runtime.
+- `none`: Tool reads or writes only local resources. No socket, no spawned subprocess that performs network I/O.
+- `model_only`: Tool calls a remote model provider. No other network destination.
+- `specific_allowlist`: Tool calls one or more explicitly allowlisted hosts. The allowlist MUST be enumerated in the tool's registration.
+- `wildcard_with_policy`: Tool may call any host the operator's egress policy permits. Reserved for proxy and gateway tools that intentionally generalize across destinations. Egress policy is the authoritative gate at runtime.
 
 Block conditions: any tool that egresses to a remote host MUST flow its outbound payload through the privacy filter unless the operator has explicitly disabled the filter through a policy override. A new tool that egresses without a privacy-filter integration is a release blocker for v1.1.
 
@@ -60,10 +60,10 @@ Block conditions:
 
 Pick one of:
 
-- `no_external_data` — Tool reads or writes only data already inside the fortress. No outbound data of any kind. No prompt-context capture that flows to remote.
-- `model_context_only` — Tool sends model-context payloads to a remote model provider. Goes through the privacy filter on every call.
-- `external_payload` — Tool sends data to a non-model external endpoint. Goes through the privacy filter and the egress policy on every call.
-- `provider_credential_use` — Tool uses a provider credential to act on the operator's behalf. Credential MUST live in the secret broker; the credential value MUST NOT appear in the tool's audit shape, error messages, or response.
+- `no_external_data`: Tool reads or writes only data already inside the fortress. No outbound data of any kind. No prompt-context capture that flows to remote.
+- `model_context_only`: Tool sends model-context payloads to a remote model provider. Goes through the privacy filter on every call.
+- `external_payload`: Tool sends data to a non-model external endpoint. Goes through the privacy filter and the egress policy on every call.
+- `provider_credential_use`: Tool uses a provider credential to act on the operator's behalf. Credential MUST live in the secret broker; the credential value MUST NOT appear in the tool's audit shape, error messages, or response.
 
 Block conditions:
 

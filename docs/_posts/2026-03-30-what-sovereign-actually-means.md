@@ -6,11 +6,11 @@ author: Erik Newton
 description: "Agent sovereignty without human sovereignty is just autonomy with better cryptography. Real sovereignty requires a single architecture that protects both."
 ---
 
-The word "sovereign" is entering the agent economy vocabulary fast. That's good — it means the industry is starting to ask the right question. But the answers diverge sharply, and the divergence matters.
+The word "sovereign" is entering the agent economy vocabulary fast. That's good, it means the industry is starting to ask the right question. But the answers diverge sharply, and the divergence matters.
 
 One camp treats sovereignty as an agent problem: how does an autonomous agent maintain cryptographic control of its own keys, state, and execution across instances? This is technically serious work. Trusted execution environments, agent-held keys, remote attestation, on-chain governance. The agent breaks free from its developer. The agent owns itself.
 
-The other camp — the one I'm building in — treats sovereignty as a structural problem that applies identically to humans and agents. The architecture that protects a person from having their agent-mediated preferences mined by a cloud provider is the same architecture that would protect an autonomous agent's learned models from inspection by a platform. One standard. Two beneficiaries. Zero redesign if one of them turns out to be conscious.
+The other camp (the one I'm building in) treats sovereignty as a structural problem that applies identically to humans and agents. The architecture that protects a person from having their agent-mediated preferences mined by a cloud provider is the same architecture that would protect an autonomous agent's learned models from inspection by a platform. One standard. Two beneficiaries. Zero redesign if one of them turns out to be conscious.
 
 This isn't a marketing distinction. It's an architectural choice with consequences.
 
@@ -28,13 +28,13 @@ Agent-only sovereignty doesn't answer this. If your agent achieves cryptographic
 
 ## What sovereignty actually requires
 
-Sovereignty — real sovereignty, for any participant — requires four things:
+Sovereignty (real sovereignty, for any participant) requires four things:
 
-**Protected state.** Whatever you've told the agent, whatever the agent has learned about you, whatever models it has built from your data — all of it encrypted at rest, with keys you hold. Not the platform. Not the model provider. You. If the participant is an autonomous agent, the same applies: the agent's learned models and memory are inviolable. Same mechanism, different keyholder.
+**Protected state.** Whatever you've told the agent, whatever the agent has learned about you, whatever models it has built from your data, all of it encrypted at rest, with keys you hold. Not the platform. Not the model provider. You. If the participant is an autonomous agent, the same applies: the agent's learned models and memory are inviolable. Same mechanism, different keyholder.
 
-**Private computation.** When the agent reasons about your medical records, that reasoning must not be observable by infrastructure providers. This isn't just about encrypting the data — it's about ensuring that active computation on that data is shielded. Policy gates that enforce graduated approval for sensitive operations. Anomaly detection that flags unusual access patterns. Denial responses that never reveal what the policy protects.
+**Private computation.** When the agent reasons about your medical records, that reasoning must not be observable by infrastructure providers. This isn't just about encrypting the data, it's about ensuring that active computation on that data is shielded. Policy gates that enforce graduated approval for sensitive operations. Anomaly detection that flags unusual access patterns. Denial responses that never reveal what the policy protects.
 
-**Selective disclosure.** You need the agent to prove things without revealing everything. "This patient is over 65" without revealing the birth date. "This portfolio exceeds the minimum investment threshold" without revealing the balance. Zero-knowledge proofs, Pedersen commitments, range proofs — the cryptographic toolkit exists. The sovereignty standard needs to make it accessible.
+**Selective disclosure.** You need the agent to prove things without revealing everything. "This patient is over 65" without revealing the birth date. "This portfolio exceeds the minimum investment threshold" without revealing the balance. Zero-knowledge proofs, Pedersen commitments, range proofs, the cryptographic toolkit exists. The sovereignty standard needs to make it accessible.
 
 **Portable reputation.** When you move agents, switch platforms, or interact with new counterparties, your track record should follow you. Not locked to a platform. Not dependent on a provider's goodwill. Signed attestations you own, that you can present anywhere, that anyone can verify independently.
 
@@ -54,9 +54,9 @@ And if autonomous agents with genuine interests never emerge? Nothing is lost. E
 
 Three forces are converging that make this urgent rather than theoretical.
 
-The local-first agent community just demonstrated what happens when you confuse location with sovereignty. Running code on your own machine is necessary but not sufficient. Without encrypted state, policy enforcement, and integrity verification, "local" gives you custody without protection — like storing cash under a mattress and calling it a bank vault.
+The local-first agent community just demonstrated what happens when you confuse location with sovereignty. Running code on your own machine is necessary but not sufficient. Without encrypted state, policy enforcement, and integrity verification, "local" gives you custody without protection, like storing cash under a mattress and calling it a bank vault.
 
-The EU AI Act reaches full enforcement on August 2, 2026 — four months from now. The Act requires transparency, accountability, and auditability for high-risk AI systems. A Sovereignty Health Report that documents an agent's cryptographic posture across all four layers becomes a compliance artifact, not an aspiration. Enterprises that can demonstrate L1-L4 coverage will have a regulatory advantage. Those that can't will face enforcement risk.
+The EU AI Act reaches full enforcement on August 2, 2026, four months from now. The Act requires transparency, accountability, and auditability for high-risk AI systems. A Sovereignty Health Report that documents an agent's cryptographic posture across all four layers becomes a compliance artifact, not an aspiration. Enterprises that can demonstrate L1-L4 coverage will have a regulatory advantage. Those that can't will face enforcement risk.
 
 And the agent protocol stack is crystallizing. MCP for tools. A2A for communication. ACP and x402 for payments. But nobody has defined the sovereignty guarantees that must hold across all of these layers. Nobody is asking: would this architecture be adequate if the participant were a conscious being?
 
@@ -66,7 +66,7 @@ That question isn't mystical. It's an engineering specification. It means: are t
 
 Sovereignty doesn't compete with any existing protocol. It composes with all of them. Identity standards (DIDs, KERI, Verifiable Credentials) provide the credential substrate. Execution environments (TEEs, enclaves) provide hardware-backed isolation. Agent frameworks provide orchestration. Settlement protocols handle payments.
 
-What's missing is the composition layer that defines what sovereignty guarantees must hold across the entire stack — from model to runtime to harness to agent. That's the gap. Not another identity provider, not another execution environment, not another agent framework. A standard that ensures every participant, human or machine, retains sovereign control of state, computation, disclosure, and reputation regardless of which specific technologies they compose.
+What's missing is the composition layer that defines what sovereignty guarantees must hold across the entire stack, from model to runtime to harness to agent. That's the gap. Not another identity provider, not another execution environment, not another agent framework. A standard that ensures every participant, human or machine, retains sovereign control of state, computation, disclosure, and reputation regardless of which specific technologies they compose.
 
 This is what I'm building with [Sanctuary](https://github.com/eriknewton/sanctuary-framework). Forty-six MCP tools across four layers. Published, tested, open-source. You can run a sovereignty audit of your current agent setup right now:
 
@@ -76,8 +76,8 @@ npx @sanctuary-framework/mcp-server
 
 The audit scores your environment across all four layers, identifies gaps, and tells you exactly what's missing. If you're running a local harness, it detects the configuration and shows you where location custody ends and architectural sovereignty begins.
 
-Because sovereign doesn't mean local. And it doesn't mean autonomous. It means architecturally protected — with cryptographic guarantees that hold regardless of who the participant is, where they run, or what kind of mind they turn out to have.
+Because sovereign doesn't mean local. And it doesn't mean autonomous. It means architecturally protected, with cryptographic guarantees that hold regardless of who the participant is, where they run, or what kind of mind they turn out to have.
 
 ---
 
-*Erik Newton is the author of Sanctuary Framework and Concordia Protocol — open infrastructure for the agentic economy. He is a licensed California attorney and the cofounder of CIMC.ai*
+*Erik Newton is the author of Sanctuary Framework and Concordia Protocol, open infrastructure for the agentic economy. He is a licensed California attorney and the cofounder of CIMC.ai*

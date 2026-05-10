@@ -1,12 +1,12 @@
 # The Sanctuary Secret Broker
 
-*v0.10.0 feature — native credential broker with per-skill scoped ephemeral tokens.*
+*v0.10.0 feature, native credential broker with per-skill scoped ephemeral tokens.*
 
 Most MCP agents today ask you to drop your credentials into a `.env` file. That file is plaintext, it lives next to your code, and it tends to get committed by accident. Industry leakage data: [29M secrets leaked from public repos in 2025, up 34% YoY](https://gitguardian.com/state-of-secrets-sprawl). This is the gap Sanctuary v0.10.0 closes.
 
 The broker stores credentials in the **macOS Keychain** (Linux / Windows backends coming in v0.10.1), hands out **short-lived, per-skill, scoped tokens** to skills that ask, and writes an **attested audit entry for every operation**. Every component is open source, runs locally, and requires zero external infrastructure.
 
-**Harness compatibility:** the broker is exposed as an MCP server, so any harness that speaks MCP — OpenClaw, Cline, Claude Code, Cursor, LangGraph, Mastra, CrewAI — can consume it. You do not need to wrap your agent in Sanctuary to benefit.
+**Harness compatibility:** the broker is exposed as an MCP server, so any harness that speaks MCP (OpenClaw, Cline, Claude Code, Cursor, LangGraph, Mastra, CrewAI) can consume it. You do not need to wrap your agent in Sanctuary to benefit.
 
 ---
 
@@ -47,7 +47,7 @@ The broker exposes four MCP tools:
 |------|---------|
 | `broker/request_token` | Skill asks for a scoped token (default TTL 15 min, max 1 h). |
 | `broker/read_secret` | Skill exchanges the token for the raw credential value. |
-| `broker/list_grants` | Self-introspection — which grants exist on this broker. |
+| `broker/list_grants` | Self-introspection, which grants exist on this broker. |
 | `broker/audit_query` | Read-only access to the broker-scoped audit trail. |
 
 A typical skill flow looks like:
@@ -68,7 +68,7 @@ const { value } = await mcp.callTool("broker/read_secret", { token });
 await gmailClient.authenticate(value);
 ```
 
-If the broker denies the request, the response is a generic `{ "error": "Broker denied" }`. The specific reason (no grant, scope exceeds grant, revoked, expired) is written to the audit trail, not returned to the caller. This is intentional — denial-opacity prevents a compromised skill from probing policy structure.
+If the broker denies the request, the response is a generic `{ "error": "Broker denied" }`. The specific reason (no grant, scope exceeds grant, revoked, expired) is written to the audit trail, not returned to the caller. This is intentional, denial-opacity prevents a compromised skill from probing policy structure.
 
 ---
 
@@ -103,7 +103,7 @@ Grants are stored in `~/.sanctuary/broker-policy.json`:
 | `skills[].secrets[].scope` | `"read"` or `"rotate"`. `rotate` implies `read`. |
 | `skills[].secrets[].ttl` | Optional TTL cap in seconds; broker clamps at 3600. Omitted = 900s default. |
 
-You can edit this file directly or use `sanctuary secrets grant` / `sanctuary secrets revoke` (they edit it for you and update any in-process broker). Absence of the file, or an empty `skills` array, means **no skill has broker access** — a safe default.
+You can edit this file directly or use `sanctuary secrets grant` / `sanctuary secrets revoke` (they edit it for you and update any in-process broker). Absence of the file, or an empty `skills` array, means **no skill has broker access**: a safe default.
 
 ---
 
@@ -115,7 +115,7 @@ To expose the broker to your harness, start it as an MCP server:
 sanctuary broker-server
 ```
 
-This listens on stdio by default — add it to your harness's MCP server config the same way you would add any other MCP server:
+This listens on stdio by default, add it to your harness's MCP server config the same way you would add any other MCP server:
 
 ```json
 {
@@ -145,7 +145,7 @@ The first invocation creates the keychain (`~/Library/Keychains/sanctuary.keycha
 **What the broker does not claim:**
 
 1. **Defense against a compromised skill during its TTL window.** An attacker who compromises a skill holding a live token has that credential for up to the TTL. Mitigation: aggressive TTLs (15-minute default vs. "hours or days" in competing products), minimum-scope grants, and audit visibility so anomalies are detectable.
-2. **Defense against a compromised host.** If an attacker is root on the box while the broker keychain is unlocked, they can invoke `/usr/bin/security` directly and bypass the broker entirely. The defense is *detection* — the Sanctuary audit log on a compromised host shows a gap between the broker's recorded reads and the credential's actual use.
+2. **Defense against a compromised host.** If an attacker is root on the box while the broker keychain is unlocked, they can invoke `/usr/bin/security` directly and bypass the broker entirely. The defense is *detection*, the Sanctuary audit log on a compromised host shows a gap between the broker's recorded reads and the credential's actual use.
 3. **Endpoint-level scope.** A `read` grant on `gmail_oauth_token` lets the skill use the credential for any Gmail API endpoint the token's underlying OAuth scope permits. Endpoint-level constraint matching (e.g., restricting a token to `gmail.metadata.readonly` vs. `gmail.send`) is planned for v0.10.1.
 
 See `Review/Sanctuary/V0.10.0_Spike_ScopedTokenSemantics.md` for the full design rationale.
@@ -205,4 +205,4 @@ Revoke-then-regrant invalidates outstanding tokens on next use.
 | Linux | 🚧 v0.10.1 (libsecret / `secret-tool`) |
 | Windows | 🚧 v0.10.1 (Credential Manager) |
 
-The `Backend` interface is pluggable — downstream integrations (HashiCorp Vault, Infisical, 1Password Connect) can ship as separate packages implementing the same interface.
+The `Backend` interface is pluggable, downstream integrations (HashiCorp Vault, Infisical, 1Password Connect) can ship as separate packages implementing the same interface.
