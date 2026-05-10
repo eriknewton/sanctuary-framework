@@ -47,6 +47,11 @@ import {
   APPROVAL_INBOX_API_PREFIX,
   handleApprovalInboxRoute,
 } from "./approval-aggregator-routes.js";
+import type { SentinelDispatcher } from "../sentinel/sentinel-dispatcher.js";
+import {
+  SENTINEL_API_PREFIX,
+  handleSentinelRoute,
+} from "../sentinel/sentinel-routes.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -186,6 +191,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private approvalAggregator: ApprovalAggregator | null = null;
 
+  /**
+   * v1.3 WP-V1.3-1 Phi-1 Sentinel dispatcher. Mounted additively at
+   * `/api/sentinels/*` when set. Sentinel surface is read-only against
+   * the audit log; subscribe/unsubscribe writes flow through the
+   * dispatcher's audited paths.
+   */
+  private sentinelDispatcher: SentinelDispatcher | null = null;
+
   constructor(config: DashboardConfig) {
     this.config = config;
     this.authToken = config.auth_token;
@@ -263,6 +276,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * v1.3 WP-V1.3-1 Phi-1: bind the Sentinel dispatcher. Once set,
+   * requests to `/api/sentinels/*` route through `handleSentinelRoute`.
+   * Pass `null` to detach (used by tests + during shutdown).
+   */
+  setSentinelDispatcher(dispatcher: SentinelDispatcher | null): void {
+    this.sentinelDispatcher = dispatcher;
+  }
+
+  /**
    * v1.3 WP-V1.3-10 dispatch entry point. Called from `handleRequest`
    * before the legacy approval route table. Returns true when served.
    */
@@ -279,6 +301,29 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         },
         aggregator: this.approvalAggregator,
         operatorId: this.identityManager?.getPrimaryIdentityId() ?? undefined,
+      },
+      req,
+      res,
+    );
+  }
+
+  /**
+   * v1.3 WP-V1.3-1 Phi-1 dispatch entry point. Routes `/api/sentinels/*`
+   * requests through the sentinel router when a dispatcher has been
+   * bound. Returns true when served.
+   */
+  private async dispatchSentinel(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<boolean> {
+    if (!this.sentinelDispatcher) return false;
+    return handleSentinelRoute(
+      {
+        authConfig: {
+          loopbackAutoAuth: this._autoAuthLocalhost,
+          ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
+        },
+        dispatcher: this.sentinelDispatcher,
       },
       req,
       res,
@@ -762,6 +807,27 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       url.pathname.startsWith(APPROVAL_INBOX_API_PREFIX)
     ) {
       this.dispatchApprovalInbox(req, res)
+        .then((handled) => {
+          if (handled) return;
+          this.handleLegacyRequest(req, res, url, method);
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+      return;
+    }
+
+    // v1.3 WP-V1.3-1 Phi-1: Sentinel surface at `/api/sentinels/*`.
+    // Read-only against the audit log; subscribe/unsubscribe writes
+    // flow through the dispatcher's audited paths.
+    if (
+      this.sentinelDispatcher &&
+      url.pathname.startsWith(SENTINEL_API_PREFIX)
+    ) {
+      this.dispatchSentinel(req, res)
         .then((handled) => {
           if (handled) return;
           this.handleLegacyRequest(req, res, url, method);
