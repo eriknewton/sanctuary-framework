@@ -47,6 +47,17 @@ export const OPERATOR_CHAT_OPS = {
    * facing query is never broken. Body carries category + failure_reason.
    */
   CONCIERGE_CONTEXT_FETCHER_FAILED: "operator_concierge_context_fetcher_failed",
+  /**
+   * Concierge surfaced a proactive starter when a fresh conversation
+   * thread opened (WP-V1.3-9 Tau-5). Emitted once per starter, never on
+   * follow-up turns within the same thread. Body carries `thread_id`,
+   * `trigger` (stable enum), and `triggered_agents_count`. The starter
+   * text body is NOT carried; the trigger enum is sufficient for
+   * dashboard grouping and keeps fortress-internal agent ids off the
+   * audit surface.
+   */
+  CONCIERGE_PROACTIVE_SUGGESTION_OFFERED:
+    "operator_concierge_proactive_suggestion_offered",
 } as const;
 
 export type OperatorChatOp =

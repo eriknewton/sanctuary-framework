@@ -46,6 +46,7 @@ import type {
   SubstrateChoice,
 } from "../../intelligence/types.js";
 import type { ParsedQueryAuditSummary } from "../../chat/concierge-query-grammar.js";
+import type { ProactiveStarterTrigger } from "../../chat/agent-context-cache.js";
 
 /**
  * Common metadata header on every v1.2 operator-chat audit payload.
@@ -128,6 +129,41 @@ export interface OperatorConciergeChatPayload extends OperatorChatAuditPayloadHe
    * forward-compat, no new event class).
    */
   parsed_grammar?: ParsedQueryAuditSummary;
+  /**
+   * Number of agent-context snapshots folded into the substrate prompt
+   * for this round-trip (WP-V1.3-9 Tau-5). Zero when the concierge
+   * agent-context cache is not wired or when the operator has no
+   * wrapped agents. Counts post-budget-prune snapshots (the number
+   * actually rendered into the "Current agent state" section), not the
+   * raw cache size.
+   */
+  agent_context_snapshot_count?: number;
+}
+
+/**
+ * Concierge surfaced a proactive starter when a fresh conversation
+ * thread opened (WP-V1.3-9 Tau-5). Emitted once per starter, never on
+ * follow-up turns within the same thread. `trigger` is the stable enum
+ * the agent-context cache used to choose the suggestion class;
+ * `triggered_agents_count` is how many agents contributed to the
+ * trigger (e.g., the count of stuck agents when trigger is
+ * `stuck_agent`).
+ *
+ * The starter text body is intentionally NOT carried here: trigger +
+ * count are sufficient for dashboard grouping, and keeping the body
+ * off the audit surface protects fortress-internal agent ids that may
+ * appear inside the operator-visible suggestion copy.
+ */
+export interface OperatorConciergeProactiveSuggestionOfferedPayload
+  extends OperatorChatAuditPayloadHeader {
+  kind: "operator_concierge_proactive_suggestion_offered";
+  surface: Extract<Surface, "concierge">;
+  /** Concierge memory thread the starter was offered for. */
+  thread_id: string;
+  /** Stable trigger-class enum chosen by the cache. */
+  trigger: ProactiveStarterTrigger;
+  /** Count of agents whose state contributed to the trigger. */
+  triggered_agents_count: number;
 }
 
 /**
@@ -221,4 +257,5 @@ export type OperatorChatAuditPayload =
   | OperatorConciergeHistoryReadPayload
   | OperatorConciergeThreadDeletedPayload
   | OperatorConciergeMemoryReadFailedPayload
-  | OperatorConciergeContextFetcherFailedPayload;
+  | OperatorConciergeContextFetcherFailedPayload
+  | OperatorConciergeProactiveSuggestionOfferedPayload;
