@@ -112,7 +112,7 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
-  if (args[0] === "agents") {
+  if (args[0] === "agents" || args[0] === "agent") {
     const { runAgentsCommand } = await import("./cli/agents/index.js");
     const code = await runAgentsCommand({ argv: args.slice(1) });
     process.exit(code);

@@ -40,6 +40,45 @@ export interface ApprovalChannelConfig {
   webhook_secret?: string;
 }
 
+/**
+ * WP-V1.3-10 Upsilon-2: cross-harness approval-redirect mode.
+ *
+ * `mode` selects how the underlying channel and the aggregator interact when
+ * a Tier 1/2 approval fires for a wrapped agent:
+ *
+ *  - `replace`: the underlying channel is bypassed; the gate's
+ *    `requestApproval()` blocks awaiting the operator's decision through
+ *    the aggregator HTTP `approve`/`deny` routes (or any other surface that
+ *    calls `aggregator.resolve()`). Default behavior when redirect is
+ *    enabled.
+ *  - `notify`: both the underlying channel AND the aggregator run; the
+ *    first decision wins. Right shape for harnesses (e.g. Mastra) where
+ *    full local-prompt suppression is not viable, so the operator still
+ *    sees the prompt locally but ALSO can resolve from the unified inbox.
+ *
+ * `per_agent` is a stub for v1.4 multi-agent fortresses: a map of
+ * `agent_id -> {enabled, mode}` overrides. v1.x ignores this field; the
+ * fortress-level `enabled` + `mode` apply to every wrapped agent in the
+ * fortress (which is currently single-agent in practice). v1.4 adds
+ * agent-id propagation through the gate signature and consults this map.
+ */
+export interface ApprovalRedirectPerAgentOverride {
+  enabled?: boolean;
+  mode?: "replace" | "notify";
+}
+
+export interface ApprovalRedirectConfig {
+  /** Master toggle. When false, redirect-mode is off across the fortress. */
+  enabled: boolean;
+  /** How the underlying channel and the aggregator coexist. */
+  mode: "replace" | "notify";
+  /**
+   * Per-agent overrides. v1.x stub — populated entries are validated and
+   * persisted but not enforced. Reserved for v1.4 multi-agent fortresses.
+   */
+  per_agent?: Record<string, ApprovalRedirectPerAgentOverride>;
+}
+
 /** Complete Principal Policy */
 export interface PrincipalPolicy {
   version: number;
@@ -58,6 +97,13 @@ export interface PrincipalPolicy {
    * days when absent; values <= 0 fall back to the default.
    */
   concierge_memory_retention_days?: number;
+  /**
+   * WP-V1.3-10 Upsilon-2: cross-harness approval-redirect mode. Optional;
+   * defaults to `{ enabled: false, mode: "replace" }` (preserves legacy
+   * behavior). Operator-toggled via `sanctuary agents config <tenant>
+   * --approval-redirect=<bool>` or by editing principal-policy.yaml.
+   */
+  approval_redirect?: ApprovalRedirectConfig;
 }
 
 /** Approval request sent to the human */
