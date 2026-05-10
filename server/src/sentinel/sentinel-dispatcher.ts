@@ -131,6 +131,11 @@ export class SentinelDispatcher {
       fortressId: this.fortressId,
       auditLog: this.auditLog,
       now: this.now,
+      // Phi-5 meta-sentinel reads the per-fortress finding store to
+      // detect patterns across other sentinels' findings. First-order
+      // sentinels ignore the field; the dispatcher always attaches it
+      // because the store is already in scope here.
+      findingStore: this.findingStore,
       ...(contextOverrides ?? {}),
     };
     const sentinel = await this.registry.subscribe(sentinelId, context);

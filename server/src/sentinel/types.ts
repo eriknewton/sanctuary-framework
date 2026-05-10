@@ -19,6 +19,7 @@
 
 import type { AuditLog, AuditEntry } from "../l2-operational/audit-log.js";
 import type { SubstrateSelector } from "../intelligence/selector.js";
+import type { SentinelFindingStore } from "./sentinel-finding-store.js";
 
 /** Severity tier returned by `Sentinel.evaluate()`. */
 export type SentinelSeverity = "info" | "warn" | "alert";
@@ -39,6 +40,22 @@ export interface SentinelContext {
   substrateSelector?: SubstrateSelector;
   /** Wall-clock provider. Tests inject a deterministic clock. */
   now: () => Date;
+  /**
+   * Optional read view of the per-fortress sentinel finding store
+   * (Phi-1 surface). First-order sentinels (Phi-1/2/3/4) do not need
+   * this; the Phi-5 meta-sentinel reads it to detect patterns ACROSS
+   * other sentinels' findings (compound finding, fortress-wide count
+   * spikes, novel sentinel-ID combinations). The dispatcher attaches
+   * the store automatically on `subscribeSentinel`; tests can omit it
+   * when constructing a context literal for a first-order watcher.
+   *
+   * Multi-fortress isolation rides on the store's existing key shape:
+   * the store is constructed per-fortress from the fortress master
+   * key, so two fortresses' stores produce distinct ciphertext for
+   * identical finding-ids and one fortress's read cannot decode
+   * another fortress's findings.
+   */
+  findingStore?: SentinelFindingStore;
 }
 
 /**
