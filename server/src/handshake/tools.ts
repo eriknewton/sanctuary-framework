@@ -29,6 +29,15 @@ import {
   verifyAttestation,
   type SignedAttestation,
 } from "./attestation.js";
+import {
+  auditHandshakeAborted,
+  auditHandshakeCompleted,
+  auditHandshakeFailed,
+  auditHandshakeInitiated,
+  HANDSHAKE_LIFECYCLE_OPS,
+  type HandshakeAbortReason,
+  type HandshakeFailureReason,
+} from "./audit.js";
 import { verifySHR } from "../shr/verifier.js";
 import type { SignedSHR } from "../shr/types.js";
 import type {
@@ -95,6 +104,11 @@ export function createHandshakeTools(
         sessions.set(session.session_id, session);
 
         auditLog.append("l4", "handshake_initiate", shr.body.instance_id);
+        auditHandshakeInitiated(auditLog, {
+          session_id: session.session_id,
+          role: "initiator",
+          identity_id: shr.body.instance_id,
+        });
 
         return toolResult({
           session_id: session.session_id,
@@ -145,12 +159,25 @@ export function createHandshakeTools(
 
         if ("error" in result) {
           auditLog.append("l4", "handshake_respond", shr.body.instance_id, undefined, "failure");
+          auditHandshakeFailed(auditLog, {
+            session_id: "unknown",
+            role: "responder",
+            identity_id: shr.body.instance_id,
+            reason: classifyRespondFailure(result.error),
+            error: result.error,
+          });
           return toolResult({ error: result.error });
         }
 
         sessions.set(result.session.session_id, result.session);
 
         auditLog.append("l4", "handshake_respond", shr.body.instance_id);
+        auditHandshakeInitiated(auditLog, {
+          session_id: result.session.session_id,
+          role: "responder",
+          identity_id: shr.body.instance_id,
+          counterparty_id: challenge.shr.body.instance_id,
+        });
 
         // Auto-publish handshake attestation to Verascore (configurable).
         // This is a best-effort, non-blocking surface: failures are audit-logged
@@ -281,9 +308,23 @@ export function createHandshakeTools(
 
         const session = sessions.get(sessionId);
         if (!session) {
+          auditHandshakeFailed(auditLog, {
+            session_id: sessionId,
+            role: "initiator",
+            identity_id: "unknown",
+            reason: "session_unknown",
+            error: `No handshake session found: ${sessionId}`,
+          });
           return toolResult({ error: `No handshake session found: ${sessionId}` });
         }
         if (session.state !== "initiated") {
+          auditHandshakeFailed(auditLog, {
+            session_id: sessionId,
+            role: "initiator",
+            identity_id: session.our_shr.body.instance_id,
+            reason: "session_state_mismatch",
+            error: `Session is in state '${session.state}', expected 'initiated'`,
+          });
           return toolResult({
             error: `Session is in state '${session.state}', expected 'initiated'`,
           });
@@ -299,6 +340,13 @@ export function createHandshakeTools(
         if ("error" in result) {
           session.state = "failed";
           auditLog.append("l4", "handshake_complete", session.our_shr.body.instance_id, undefined, "failure");
+          auditHandshakeFailed(auditLog, {
+            session_id: sessionId,
+            role: "initiator",
+            identity_id: session.our_shr.body.instance_id,
+            reason: classifyCompleteFailure(result.error),
+            error: result.error,
+          });
           return toolResult({ error: result.error });
         }
 
@@ -311,6 +359,13 @@ export function createHandshakeTools(
         handshakeResults.set(result.result.counterparty_id, result.result);
 
         auditLog.append("l4", "handshake_complete", session.our_shr.body.instance_id);
+        auditHandshakeCompleted(auditLog, {
+          session_id: sessionId,
+          role: "initiator",
+          identity_id: session.our_shr.body.instance_id,
+          counterparty_id: result.result.counterparty_id,
+          trust_tier: result.result.trust_tier,
+        });
 
         return toolResult({
           completion: result.completion,
@@ -370,6 +425,24 @@ export function createHandshakeTools(
             undefined,
             result.verified ? "success" : "failure"
           );
+          if (result.verified) {
+            auditHandshakeCompleted(auditLog, {
+              session_id: session.session_id,
+              role: "responder",
+              identity_id: session.our_shr.body.instance_id,
+              counterparty_id: result.counterparty_id,
+              trust_tier: result.trust_tier,
+            });
+          } else {
+            auditHandshakeFailed(auditLog, {
+              session_id: session.session_id,
+              role: "responder",
+              identity_id: session.our_shr.body.instance_id,
+              counterparty_id: result.counterparty_id,
+              reason: classifyCompleteFailure(result.errors.join("; ")),
+              error: result.errors.join("; "),
+            });
+          }
 
           return toolResult({ result });
         }
@@ -522,7 +595,90 @@ export function createHandshakeTools(
         });
       },
     },
+
+    {
+      name: "handshake_abort",
+      description:
+        "Abort an in-flight handshake session. Drops the session record and " +
+        "appends a session-lifecycle audit entry (handshake_aborted) so the " +
+        "operator can distinguish operator-cancelled, timed-out, and dropped " +
+        "sessions from sessions that simply fell off the protocol path.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session_id: {
+            type: "string",
+            description: "Session ID returned from handshake_initiate / handshake_respond.",
+          },
+          reason: {
+            type: "string",
+            enum: [
+              "operator_cancelled",
+              "session_timeout",
+              "transport_dropped",
+              "shutdown",
+              "other",
+            ],
+            description:
+              "Why the session is being aborted. Defaults to 'operator_cancelled'.",
+          },
+        },
+        required: ["session_id"],
+      },
+      handler: async (args) => {
+        const sessionId = args.session_id as string;
+        const reason = (args.reason as HandshakeAbortReason | undefined) ??
+          "operator_cancelled";
+        const session = sessions.get(sessionId);
+        if (!session) {
+          return toolResult({ error: `No handshake session found: ${sessionId}` });
+        }
+        if (session.state === "completed") {
+          return toolResult({
+            error: `Session ${sessionId} already completed; abort is only valid for in-flight sessions`,
+          });
+        }
+        sessions.delete(sessionId);
+        auditHandshakeAborted(auditLog, {
+          session_id: sessionId,
+          role: session.role,
+          identity_id: session.our_shr.body.instance_id,
+          ...(session.their_shr
+            ? { counterparty_id: session.their_shr.body.instance_id }
+            : {}),
+          reason,
+        });
+        return toolResult({
+          aborted: true,
+          session_id: sessionId,
+          reason,
+        });
+      },
+    },
   ];
 
   return { tools, handshakeResults };
 }
+
+/**
+ * Map a respondToHandshake error string onto the lifecycle-audit reason
+ * enum. Errors are short, well-known strings produced by protocol.ts.
+ */
+function classifyRespondFailure(error: string): HandshakeFailureReason {
+  if (error.includes("Unsupported protocol version")) return "protocol_version_unsupported";
+  if (error.includes("SHR verification failed")) return "shr_invalid";
+  if (error.includes("No identity available")) return "no_signing_identity";
+  return "other";
+}
+
+/** Same shape as classifyRespondFailure for completeHandshake / verifyCompletion errors. */
+function classifyCompleteFailure(error: string): HandshakeFailureReason {
+  if (error.includes("Unsupported protocol version")) return "protocol_version_unsupported";
+  if (error.includes("SHR verification failed") || error.includes("SHR")) return "shr_invalid";
+  if (error.includes("nonce signature is invalid")) return "nonce_signature_invalid";
+  if (error.includes("No identity available")) return "no_signing_identity";
+  return "other";
+}
+
+// Re-export the lifecycle ops for downstream consumers (audit-query callers).
+export { HANDSHAKE_LIFECYCLE_OPS };

@@ -1,5 +1,5 @@
 /**
- * Sanctuary MCP Server — L3 Secret Broker: Orchestrator
+ * Sanctuary MCP Server, L3 Secret Broker: Orchestrator
  *
  * Composes the pluggable Backend (keychain for v0.10.0) with the scoped
  * token issuer and AuditLog. This is the class the CLI and MCP server
@@ -45,6 +45,22 @@ export class Broker {
   private readonly auditLog: AuditLog;
   private readonly issuer: TokenIssuer;
   private readonly principalIdentityId: string;
+  /**
+   * Per-secret-name mutex. Hardening wave 6 finding #64: two concurrent
+   * addSecret() / rotateSecret() / deleteSecret() calls on the same name
+   * MUST serialize cleanly. The keychain backend's `find-then-add` and
+   * `find-then-delete-then-add` shapes (KeychainBackend.addSecret /
+   * .rotateSecret) are not atomic against another caller racing the same
+   * service-name; without serialization the second caller can observe a
+   * stale "exists" check and either drop the new value or leave a
+   * duplicate keychain entry.
+   *
+   * Implementation: an in-memory promise chain per name. Subsequent
+   * callers `await` the chain tail and append their own work; failures
+   * propagate to the failing caller without poisoning the chain for
+   * later callers.
+   */
+  private readonly nameLocks = new Map<string, Promise<unknown>>();
 
   constructor(opts: BrokerOptions) {
     this.backend = opts.backend;
@@ -55,6 +71,46 @@ export class Broker {
       auditLog: opts.auditLog,
       grants: opts.grants,
     });
+  }
+
+  /**
+   * Serialize `op` against any other in-flight write to the same secret
+   * `name`. Per-name fairness only, distinct names run in parallel.
+   * The current chain tail is used as the acceptance gate; we then
+   * publish a new tail that swallows the operation's outcome so a
+   * thrown error does not poison the next caller's wait.
+   */
+  private async withNameLock<T>(name: string, op: () => Promise<T>): Promise<T> {
+    const previous = this.nameLocks.get(name) ?? Promise.resolve();
+    let release: () => void = () => {};
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // Publish the new tail before awaiting the previous tail so any
+    // racing caller chains behind us, not behind `previous`.
+    this.nameLocks.set(name, next);
+    try {
+      // Wait for the prior chain holder (ignore its outcome, failures
+      // are reported to that caller, not propagated downstream).
+      await previous.catch(() => {});
+      return await op();
+    } finally {
+      release();
+      // If we are still the chain tail, drop the entry so the map does
+      // not grow without bound across the broker's lifetime.
+      if (this.nameLocks.get(name) === next) {
+        this.nameLocks.delete(name);
+      }
+    }
+  }
+
+  /**
+   * Diagnostic-only: visible for tests so they can assert that distinct
+   * names do not contend on a shared lock. Not part of the public broker
+   * contract; do not consume from production code.
+   */
+  __nameLockCountForTests(): number {
+    return this.nameLocks.size;
   }
 
   /** Ensure backend is initialized and unlocked. Audits the unlock. */
@@ -70,33 +126,39 @@ export class Broker {
   }
 
   async addSecret(name: string, value: string): Promise<void> {
-    await this.backend.addSecret(name, value);
-    this.auditLog.append(
-      "l3",
-      BROKER_OPS.SECRET_ADDED,
-      this.principalIdentityId,
-      { secret: name }
-    );
+    await this.withNameLock(name, async () => {
+      await this.backend.addSecret(name, value);
+      this.auditLog.append(
+        "l3",
+        BROKER_OPS.SECRET_ADDED,
+        this.principalIdentityId,
+        { secret: name }
+      );
+    });
   }
 
   async rotateSecret(name: string, newValue: string): Promise<void> {
-    await this.backend.rotateSecret(name, newValue);
-    this.auditLog.append(
-      "l3",
-      BROKER_OPS.SECRET_ROTATED,
-      this.principalIdentityId,
-      { secret: name }
-    );
+    await this.withNameLock(name, async () => {
+      await this.backend.rotateSecret(name, newValue);
+      this.auditLog.append(
+        "l3",
+        BROKER_OPS.SECRET_ROTATED,
+        this.principalIdentityId,
+        { secret: name }
+      );
+    });
   }
 
   async deleteSecret(name: string): Promise<void> {
-    await this.backend.deleteSecret(name);
-    this.auditLog.append(
-      "l3",
-      BROKER_OPS.SECRET_DELETED,
-      this.principalIdentityId,
-      { secret: name }
-    );
+    await this.withNameLock(name, async () => {
+      await this.backend.deleteSecret(name);
+      this.auditLog.append(
+        "l3",
+        BROKER_OPS.SECRET_DELETED,
+        this.principalIdentityId,
+        { secret: name }
+      );
+    });
   }
 
   async listSecretNames(): Promise<string[]> {
@@ -146,12 +208,26 @@ export class Broker {
   }
 
   /**
+   * Drop expired tokens from the in-memory issuer map. Hardening wave 6
+   * finding #86: previously expiry pruning depended on opportunistic
+   * `pruneExpired()` calls; now the cocoon-unlock initialization path
+   * (openBroker -> after backend.ensureInitialized -> after Broker
+   * construction) fires this once so each cocoon-unlock cycle drops
+   * stale bindings before any operator interaction.
+   *
+   * Returns the number of tokens removed. Safe to call repeatedly; idempotent.
+   */
+  pruneExpiredTokens(): number {
+    return this.issuer.pruneExpired();
+  }
+
+  /**
    * Audit query restricted to broker-scoped operations. Returns entries
    * with their timestamps, op, and result (never the secret value).
    */
   async queryAudit(opts?: { since?: string; limit?: number }): Promise<AuditSummary> {
     const allOps = Object.values(BROKER_OPS);
-    // AuditLog.query filters by a single operation — call once per op and merge.
+    // AuditLog.query filters by a single operation, call once per op and merge.
     const merged: AuditSummary["entries"] = [];
     let total = 0;
     for (const op of allOps) {

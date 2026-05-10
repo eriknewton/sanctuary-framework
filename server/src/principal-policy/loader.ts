@@ -97,6 +97,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "handshake_status",
     "handshake_exchange",
     "handshake_verify_attestation",
+    "handshake_abort",
     "reputation_query_weighted",
     "federation_peers",
     "federation_trust_evaluate",
@@ -361,6 +362,7 @@ tier3_always_allow:
   - handshake_status
   - handshake_exchange
   - handshake_verify_attestation
+  - handshake_abort
   - reputation_query_weighted
   - federation_peers
   - federation_trust_evaluate
