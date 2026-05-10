@@ -12,8 +12,22 @@
  * Design brief: Review/Sanctuary/Attestation_UX_Design_Brief_2026-04-21.md section 6
  */
 
-import type { FailureModeCode } from "./constants.js";
+import { FAILURE_MODE_CODES, type FailureModeCode } from "./constants.js";
 import type { FailureModeEntry } from "./types.js";
+
+/**
+ * Runtime guard error thrown if the catalog's structural invariants are
+ * violated at module-init. Hardening wave 6, finding #88: previously the
+ * invariants were only checked test-time via verifyDegradeNotDestroy(); a
+ * future commit could ship a malformed catalog and only fail in CI. This
+ * guard fails fast at import-time, before any consumer reads the catalog.
+ */
+export class FailureCatalogInvariantError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FailureCatalogInvariantError";
+  }
+}
 
 /**
  * The 9-row failure-mode catalog. Closed enum at v1.0.
@@ -208,3 +222,75 @@ export function verifyDegradeNotDestroy(): {
   }
   return { valid: violations.length === 0, violations };
 }
+
+/**
+ * Validate every catalog invariant. Returns the full violation list rather
+ * than throwing so callers (tests, runtime guard) can choose how to react.
+ * Hardening wave 6 finding #88.
+ *
+ * Invariants:
+ *  1. Catalog has exactly the same row-count as FAILURE_MODE_CODES (closed enum).
+ *  2. Every row's `code` appears in FAILURE_MODE_CODES.
+ *  3. Every code in FAILURE_MODE_CODES appears in the catalog (no missing rows).
+ *  4. No duplicate `code` values within the catalog.
+ *  5. Every row's `degrade_decision === "degrade"` (degrade-not-destroy).
+ *  6. Every row's `affected_layers` is non-empty.
+ */
+export function verifyFailureCatalogInvariants(): {
+  valid: boolean;
+  violations: string[];
+} {
+  const violations: string[] = [];
+  const codes = new Set<string>();
+  const expected = new Set<string>(FAILURE_MODE_CODES);
+
+  if (FAILURE_MODE_CATALOG.length !== FAILURE_MODE_CODES.length) {
+    violations.push(
+      `catalog row-count ${FAILURE_MODE_CATALOG.length} does not match closed enum size ${FAILURE_MODE_CODES.length}`
+    );
+  }
+
+  for (const entry of FAILURE_MODE_CATALOG) {
+    if (!expected.has(entry.code)) {
+      violations.push(
+        `${entry.code}: not present in FAILURE_MODE_CODES closed enum`
+      );
+    }
+    if (codes.has(entry.code)) {
+      violations.push(`${entry.code}: duplicate row in catalog`);
+    }
+    codes.add(entry.code);
+    if (entry.degrade_decision !== "degrade") {
+      violations.push(
+        `${entry.code}: degrade_decision is "${entry.degrade_decision}" (must be "degrade")`
+      );
+    }
+    if (!Array.isArray(entry.affected_layers) || entry.affected_layers.length === 0) {
+      violations.push(`${entry.code}: affected_layers must be a non-empty array`);
+    }
+  }
+
+  for (const code of FAILURE_MODE_CODES) {
+    if (!codes.has(code)) {
+      violations.push(`${code}: declared in FAILURE_MODE_CODES but missing from catalog`);
+    }
+  }
+
+  return { valid: violations.length === 0, violations };
+}
+
+/**
+ * Module-init runtime guard. Throws FailureCatalogInvariantError when the
+ * catalog drifts from its closed enum or fails any structural invariant.
+ * Hardening wave 6 finding #88.
+ */
+function assertCatalogInvariantsAtImport(): void {
+  const result = verifyFailureCatalogInvariants();
+  if (!result.valid) {
+    throw new FailureCatalogInvariantError(
+      `Failure-mode catalog invariant violation: ${result.violations.join("; ")}`
+    );
+  }
+}
+
+assertCatalogInvariantsAtImport();

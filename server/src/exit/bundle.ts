@@ -696,11 +696,28 @@ async function resolveSourceMasterKey(
   return null;
 }
 
+/**
+ * A staged artifact location written during importExitBundle. Used to
+ * undo partial imports when the re-key handler fails partway through.
+ * Hardening wave 6 finding #78.
+ */
+interface StagedLocation {
+  namespace: string;
+  key: string;
+}
+
 async function rekeyState(
   encryptedState: ExitEncryptedStateBundle,
   opts: ImportExitBundleOptions,
   sourceMasterKey: Uint8Array,
-  publicKeysByIdentityId: Map<string, Uint8Array>
+  publicKeysByIdentityId: Map<string, Uint8Array>,
+  /**
+   * Accumulator threaded by importExitBundle so the outer cleanup path
+   * can remove every entry rekeyState successfully wrote prior to a
+   * fatal error. Populated even when the import succeeds so callers can
+   * inspect for telemetry; only consumed on the failure path.
+   */
+  importedRekeyEntries?: StagedLocation[]
 ): Promise<ImportExitBundleResult["state"]> {
   const destinationSigner = opts.destinationSignerIdentityId
     ? opts.identityManager.get(opts.destinationSignerIdentityId)
@@ -770,8 +787,9 @@ async function rekeyState(
       }
     }
 
+    let plaintext: Uint8Array;
     try {
-      const plaintext = decrypt(
+      plaintext = decrypt(
         item.entry.payload,
         deriveNamespaceKey(sourceMasterKey, item.namespace)
       );
@@ -780,28 +798,37 @@ async function rekeyState(
         skipped++;
         continue;
       }
-      await stateStore.write(
-        item.namespace,
-        item.key,
-        bytesToString(plaintext),
-        destinationSigner.identity_id,
-        destinationSigner.encrypted_private_key,
-        identityEncryptionKey,
-        {
-          content_type: item.entry.metadata.content_type,
-          ttl_seconds: item.entry.metadata.ttl_seconds,
-          tags: [
-            ...(item.entry.metadata.tags ?? []),
-            "exit-import",
-            `source:${item.entry.kid}`,
-          ],
-        }
-      );
-      imported++;
     } catch {
+      // Source-key derivation or AEAD verification failed. Skip and
+      // continue, this is a per-entry data issue, not a fatal-import
+      // condition, so it does NOT trigger cleanup of prior writes.
       skippedInvalidSig++;
       skipped++;
+      continue;
     }
+
+    // Destination-side write failures DO trigger cleanup. Disk full,
+    // permission denied, signer-key corruption, anything that prevents
+    // a write, must roll back the partial import per finding #78.
+    await stateStore.write(
+      item.namespace,
+      item.key,
+      bytesToString(plaintext),
+      destinationSigner.identity_id,
+      destinationSigner.encrypted_private_key,
+      identityEncryptionKey,
+      {
+        content_type: item.entry.metadata.content_type,
+        ttl_seconds: item.entry.metadata.ttl_seconds,
+        tags: [
+          ...(item.entry.metadata.tags ?? []),
+          "exit-import",
+          `source:${item.entry.kid}`,
+        ],
+      }
+    );
+    imported++;
+    importedRekeyEntries?.push({ namespace: item.namespace, key: item.key });
   }
 
   return {
@@ -812,6 +839,34 @@ async function rekeyState(
     skipped_unknown_kid: skippedUnknownKid,
     conflicts,
   };
+}
+
+/**
+ * Best-effort cleanup of staged paths after a re-key failure. Each
+ * delete is independent, one delete failing should not prevent later
+ * deletes from running. Failures are collected and surfaced in the
+ * thrown ExitBundleImportError so the operator sees what was and was
+ * not cleaned. Hardening wave 6 finding #78.
+ */
+async function cleanupStagedPaths(
+  storage: StorageBackend,
+  staged: StagedLocation[]
+): Promise<{ removed: number; failed: StagedLocation[] }> {
+  let removed = 0;
+  const failed: StagedLocation[] = [];
+  for (const loc of staged) {
+    try {
+      const ok = await storage.delete(loc.namespace, loc.key);
+      if (ok) {
+        removed++;
+      } else {
+        failed.push(loc);
+      }
+    } catch {
+      failed.push(loc);
+    }
+  }
+  return { removed, failed };
 }
 
 async function stageArtifact(
@@ -964,6 +1019,13 @@ export async function importExitBundle(
 
   const importId = importIdForManifest(manifest);
   const stagedArtifacts: string[] = [];
+  // Hardening wave 6 finding #78: track every staged storage location so
+  // a re-key failure can roll back the partial import. Each entry is a
+  // (namespace, key) tuple suitable for opts.storage.delete().
+  const stagedLocations: StagedLocation[] = [];
+  // Same accumulator for the per-entry rekey writes, populated by
+  // rekeyState as it succeeds, consumed on failure.
+  const importedRekeyEntries: StagedLocation[] = [];
   if (identityArtifact) {
     await stageArtifact(
       opts.storage,
@@ -972,10 +1034,15 @@ export async function importExitBundle(
       identityArtifact.json
     );
     stagedArtifacts.push("public_identity");
+    stagedLocations.push({
+      namespace: EXIT_PUBLIC_IDENTITIES_NAMESPACE,
+      key: identityArtifact.json.bundle.identity_id,
+    });
   }
   if (policySet) {
     await stageArtifact(opts.storage, EXIT_POLICY_SETS_NAMESPACE, importId, policySet.json);
     stagedArtifacts.push("policy_set");
+    stagedLocations.push({ namespace: EXIT_POLICY_SETS_NAMESPACE, key: importId });
   }
   if (auditReceipts) {
     await stageArtifact(
@@ -985,10 +1052,12 @@ export async function importExitBundle(
       auditReceipts.json
     );
     stagedArtifacts.push("audit_receipts");
+    stagedLocations.push({ namespace: EXIT_AUDIT_RECEIPTS_NAMESPACE, key: importId });
   }
   if (commitments) {
     await stageArtifact(opts.storage, EXIT_COMMITMENTS_NAMESPACE, importId, commitments.json);
     stagedArtifacts.push("commitments");
+    stagedLocations.push({ namespace: EXIT_COMMITMENTS_NAMESPACE, key: importId });
   }
   if (placeholderMetadata) {
     await stageArtifact(
@@ -998,12 +1067,17 @@ export async function importExitBundle(
       placeholderMetadata.json
     );
     stagedArtifacts.push("placeholder_vault_metadata");
+    stagedLocations.push({
+      namespace: EXIT_PLACEHOLDER_METADATA_NAMESPACE,
+      key: importId,
+    });
   }
   await stageArtifact(opts.storage, EXIT_IMPORT_NAMESPACE, importId, {
     manifest: manifest.body,
     verified_at: verification.verified_at,
     activated_at: new Date().toISOString(),
   });
+  stagedLocations.push({ namespace: EXIT_IMPORT_NAMESPACE, key: importId });
 
   const publicKeys = identityArtifact
     ? publicKeysFromIdentityArtifact(identityArtifact.json)
@@ -1034,31 +1108,69 @@ export async function importExitBundle(
     encryptedState?.json ?? null,
     opts
   );
-  const stateResult =
-    encryptedState && encryptedState.json.entries.length > 0
-      ? sourceMasterKey
-        ? await rekeyState(
-            encryptedState.json,
-            opts,
-            sourceMasterKey,
-            publicKeys.byIdentityId
-          )
+  let stateResult: ImportExitBundleResult["state"];
+  try {
+    stateResult =
+      encryptedState && encryptedState.json.entries.length > 0
+        ? sourceMasterKey
+          ? await rekeyState(
+              encryptedState.json,
+              opts,
+              sourceMasterKey,
+              publicKeys.byIdentityId,
+              importedRekeyEntries
+            )
+          : {
+              status: "staged_requires_source_key" as const,
+              imported_keys: 0,
+              skipped_keys: encryptedState.json.entries.length,
+              skipped_invalid_sig: 0,
+              skipped_unknown_kid: 0,
+              conflicts: conflicts.state_conflicts.length,
+            }
         : {
-            status: "staged_requires_source_key" as const,
+            status: "not_requested" as const,
             imported_keys: 0,
-            skipped_keys: encryptedState.json.entries.length,
+            skipped_keys: 0,
             skipped_invalid_sig: 0,
             skipped_unknown_kid: 0,
-            conflicts: conflicts.state_conflicts.length,
-          }
-      : {
-          status: "not_requested" as const,
-          imported_keys: 0,
-          skipped_keys: 0,
-          skipped_invalid_sig: 0,
-          skipped_unknown_kid: 0,
-          conflicts: 0,
-        };
+            conflicts: 0,
+          };
+  } catch (err) {
+    // Hardening wave 6 finding #78: re-key failed partway through.
+    // Walk back through every successfully staged artifact and every
+    // successfully imported state entry, then re-throw with an error
+    // that names the cleanup so the operator can see what was undone.
+    const toCleanup: StagedLocation[] = [
+      ...importedRekeyEntries,
+      ...stagedLocations,
+    ];
+    const cleanup = await cleanupStagedPaths(opts.storage, toCleanup);
+    opts.auditLog.append(
+      "l1",
+      "exit_bundle_rekey_failed_cleanup",
+      manifest.body.identity_binding.identity_id,
+      {
+        import_id: importId,
+        manifest_version: manifest.body.manifest_version,
+        rekey_entries_removed: importedRekeyEntries.length,
+        staged_artifacts_removed: stagedLocations.length,
+        removed_total: cleanup.removed,
+        cleanup_failed_count: cleanup.failed.length,
+        original_error: err instanceof Error ? err.message : String(err),
+      },
+      "failure"
+    );
+    await opts.auditLog.flush();
+    const originalMessage = err instanceof Error ? err.message : String(err);
+    throw new ExitBundleImportError(
+      "REKEY_FAILED_AND_CLEANED",
+      `Exit-bundle re-key failed: ${originalMessage}. ` +
+        `Cleanup removed ${cleanup.removed} of ${toCleanup.length} staged paths ` +
+        `(${importedRekeyEntries.length} re-keyed entries plus ${stagedLocations.length} staged artifacts; ` +
+        `${cleanup.failed.length} cleanup deletes failed).`
+    );
+  }
 
   opts.auditLog.append("l1", "exit_bundle_import_activate", manifest.body.identity_binding.identity_id, {
     import_id: importId,

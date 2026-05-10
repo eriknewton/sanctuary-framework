@@ -89,6 +89,13 @@ export async function openBroker(opts: OpenBrokerOptions = {}): Promise<{
     principalIdentityId: opts.principalIdentityId ?? "sanctuary-broker",
   });
 
+  // Hardening wave 6 finding #86: cocoon-unlock fires expiry pruning so
+  // any tokens that survived a prior process restart-as-cache scenario
+  // are dropped before the operator can issue or read against them.
+  // pruneExpired is idempotent and synchronous; failures bubble (none
+  // expected, purely in-memory map iteration).
+  broker.pruneExpiredTokens();
+
   return {
     broker,
     close: async () => {
