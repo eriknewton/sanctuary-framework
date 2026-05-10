@@ -79,6 +79,10 @@ import {
 import { LocalSubstrate, OllamaClient, LOCAL_CAPABILITY } from "./substrates/local.js";
 import { VeniceClient, VeniceSubstrate, VENICE_CAPABILITY, VENICE_DEFAULT_ENDPOINT, VENICE_DEFAULT_MODEL, type VeniceValidateResult } from "./substrates/venice.js";
 import { FrontierClient, FrontierWithFilterSubstrate, FRONTIER_CAPABILITY, FRONTIER_DEFAULT_MODELS, type FrontierRedactor } from "./substrates/frontier.js";
+import {
+  QUERY_ANONYMITY_AUDIT_OPS,
+  createAnonymizedFetch,
+} from "../query-anonymity/header-strip.js";
 import { resolveHybridChoice, validateHybridRules } from "./substrates/hybrid/per-surface-router.js";
 import type { HybridRoutingRules } from "./types.js";
 import type { StorageBackend } from "../storage/interface.js";
@@ -183,7 +187,28 @@ export class SubstrateSelector {
     this.auditLog = cfg.auditLog;
     this.identityId = cfg.identityId;
     this.redactor = cfg.redactor ?? IDENTITY_REDACTOR;
-    this.fetchImpl = cfg.fetchImpl;
+    // Rho-1 (WP-V1.x-QUERY-LAYER-ANONYMITY foundation): wrap the
+    // substrate-client fetch with the Tier A header-strip transform.
+    // Default-on, structurally unconditional — no operator opt-out.
+    // Every outbound substrate call now goes through stripHeaders +
+    // undici-defaults defeat, and emits a `query_anonymity_headers_
+    // stripped` audit event with the per-call removed-header summary.
+    // Bypass would require editing this constructor.
+    const baseFetch = cfg.fetchImpl ?? globalThis.fetch;
+    this.fetchImpl = createAnonymizedFetch(baseFetch, (event) => {
+      this.auditLog.append(
+        "l2",
+        QUERY_ANONYMITY_AUDIT_OPS.HEADERS_STRIPPED,
+        this.identityId,
+        {
+          url: event.url,
+          method: event.method,
+          stripped_count: event.stripped_count,
+          removed: event.removed,
+          required_preserved: event.required_preserved,
+        },
+      );
+    });
     this.config = buildDefaultConfig();
   }
 
