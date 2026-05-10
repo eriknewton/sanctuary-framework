@@ -45,6 +45,7 @@ import type {
   Surface,
   SubstrateChoice,
 } from "../../intelligence/types.js";
+import type { ParsedQueryAuditSummary } from "../../chat/concierge-query-grammar.js";
 
 /**
  * Common metadata header on every v1.2 operator-chat audit payload.
@@ -114,6 +115,19 @@ export interface OperatorConciergeChatPayload extends OperatorChatAuditPayloadHe
    * (additive forward-compat, no new event class).
    */
   dynamic_context_categories?: string[];
+  /**
+   * Operator-query grammar parse summary (WP-V1.3-9 Tau-4). Carries
+   * the structured time range, agent names, event types, ambiguity
+   * flags, and parse confidence the grammar layer extracted from the
+   * operator's query before the round-trip. Audit-safe by construction:
+   * the runtime `ParsedQuery.intent_phrase` field (free-form residual
+   * carrying raw operator query content) is stripped at projection;
+   * see `auditSafeSummary` in `chat/concierge-query-grammar.ts`.
+   *
+   * Absent on services constructed without the grammar wired (additive
+   * forward-compat, no new event class).
+   */
+  parsed_grammar?: ParsedQueryAuditSummary;
 }
 
 /**

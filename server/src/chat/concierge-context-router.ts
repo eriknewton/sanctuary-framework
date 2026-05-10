@@ -7,6 +7,14 @@
  * live data relevant to the operator's query and folds it into context
  * between the static Sanctuary reference and the prior-turns fold.
  *
+ * Tau-4 (PR #_, criterion (d)) layers an operator-query grammar on top:
+ * the caller (`operator-chat-service`) parses the query into a
+ * `ParsedQuery` via `concierge-query-grammar`, threads the result into
+ * `classifyQuery` + `foldContext`, and the matches carry the parsed
+ * grammar through to fetchers as `FetcherHints` (time range + agent
+ * names + event types). Existing fetcher implementations that do not
+ * read the second argument continue to work unchanged.
+ *
  * The module is intentionally pure: keyword classification + a small
  * amount of hint extraction + a fold orchestrator that calls caller-
  * provided fetchers. The wiring layer assembles the concrete fetchers
@@ -24,12 +32,12 @@
  *   caller's onFetcherFailure hook. The user-facing concierge query is
  *   never broken by a context-assembly failure.
  *
- * Out of scope here (Tau-4 + Tau-5):
- * - Operator-query grammar (time-range parsing, structured agent-name
- *   extraction). Tau-3 does best-effort hint extraction only.
+ * Out of scope here (Tau-5):
  * - Agent-context awareness (proactive folding without an explicit
- *   query). Tau-3 routes off explicit query content only.
+ *   query). The router still routes off explicit query content only.
  */
+
+import type { ParsedQuery } from "./concierge-query-grammar.js";
 
 const APPROX_CHARS_PER_TOKEN = 4;
 
@@ -73,9 +81,16 @@ export const CONTEXT_CATEGORIES: readonly ContextCategory[] = [
 /**
  * One category match produced by `classifyQuery`. `matched_keywords`
  * surfaces the exact phrases that hit so audit consumers and operators
- * can verify why a category fired. `agent_name_hint` carries a best-
- * effort extraction (Tau-3 keeps this minimal; Tau-4 owns the full
- * grammar).
+ * can verify why a category fired.
+ *
+ * `agent_name_hint` carries a single-name extraction for back-compat
+ * with Tau-3 fetcher signatures. When `query_grammar` is present and
+ * resolved an agent name, `agent_name_hint` mirrors `query_grammar.agent_names[0]`.
+ *
+ * `query_grammar` (Tau-4) carries the full parsed query when the caller
+ * supplied one. Fetchers receive the structured hints derived from it
+ * via `FetcherHints`; matches expose the raw parse for consumers that
+ * want the full residual or ambiguity flags.
  */
 export interface CategoryMatch {
   category: ContextCategory;
@@ -84,6 +99,30 @@ export interface CategoryMatch {
   matched_keywords: string[];
   /** Best-effort agent-name extraction; null when no clean hint surfaces. */
   agent_name_hint: string | null;
+  /** Tau-4 parsed-query attachment. Optional; absent when the caller did not parse. */
+  query_grammar?: ParsedQuery | null;
+}
+
+/**
+ * Structured hints passed to fetchers as the optional second argument
+ * (Tau-4). Derived from `ParsedQuery` by the router; fetchers are free
+ * to read or ignore individual fields. Tau-3 fetchers that take no
+ * second argument continue to work because the slot is optional.
+ */
+export interface FetcherHints {
+  /** Time range derived from the operator's query, when one resolved. */
+  time_range?: { start: Date; end: Date; relative_label?: string };
+  /**
+   * All agent names the parser matched against the registry, in the
+   * order they surfaced. Distinct from the `agentNameHint` first arg
+   * (which carries only the first match for back-compat).
+   */
+  agent_names?: readonly string[];
+  /**
+   * Event-type names the parser matched against the canonical audit-
+   * event-class enumeration. Already filtered to the closed set.
+   */
+  event_types?: readonly string[];
 }
 
 /**
@@ -91,16 +130,28 @@ export interface CategoryMatch {
  * router stitches into the rendered section. Returning the empty string
  * (or whitespace only) is treated as "nothing to fold for this category"
  * and the category drops out of the final categoriesIncluded list.
+ *
+ * Tau-4 extends every fetcher with an optional `hints?: FetcherHints`
+ * argument carrying the parsed-query attachments (time range, agent
+ * names, event types). Fetchers that ignore the argument continue to
+ * compile; fetchers that consume it can scope queries against the
+ * audit log, activity feed, etc., to the operator's stated window.
  */
 export interface ContextFetchers {
-  templates: () => Promise<string>;
-  agent_state: (agentNameHint: string | null) => Promise<string>;
-  agent_activity: (agentNameHint: string | null) => Promise<string>;
-  audit_log: () => Promise<string>;
-  sentinel_findings: () => Promise<string>;
-  anomaly_alerts: () => Promise<string>;
-  recent_receipts: () => Promise<string>;
-  verascore_deltas: () => Promise<string>;
+  templates: (hints?: FetcherHints) => Promise<string>;
+  agent_state: (
+    agentNameHint: string | null,
+    hints?: FetcherHints,
+  ) => Promise<string>;
+  agent_activity: (
+    agentNameHint: string | null,
+    hints?: FetcherHints,
+  ) => Promise<string>;
+  audit_log: (hints?: FetcherHints) => Promise<string>;
+  sentinel_findings: (hints?: FetcherHints) => Promise<string>;
+  anomaly_alerts: (hints?: FetcherHints) => Promise<string>;
+  recent_receipts: (hints?: FetcherHints) => Promise<string>;
+  verascore_deltas: (hints?: FetcherHints) => Promise<string>;
 }
 
 /**
@@ -120,6 +171,13 @@ export interface FoldContextOptions {
   llmAssistClassify?: LlmAssistClassifier;
   /** Audit hook for fetcher failures; receives the category + error. */
   onFetcherFailure?: (category: ContextCategory, error: unknown) => void;
+  /**
+   * Tau-4: pre-parsed operator query. When present, every match attaches
+   * the parse, the agent_name_hint is overridden by the parser's first
+   * `agent_names` entry when non-empty, and fetchers receive the
+   * structured `FetcherHints` derived from the parse.
+   */
+  parsed?: ParsedQuery | null;
 }
 
 export interface FoldContextResult {
@@ -291,10 +349,22 @@ function isTrivialQuery(query: string): boolean {
  * Classify the operator's query against the 8-category route table.
  * Returns 0..N matches ordered by descending confidence, then by
  * categories' enum order to stabilize ranking.
+ *
+ * Tau-4: when `parsedGrammar` is supplied, every match attaches the
+ * parse, and `agent_name_hint` for `agent_state` / `agent_activity`
+ * prefers the parser's first registered agent name (falling back to
+ * the local single-name extractor when the parser found nothing).
  */
-export function classifyQuery(query: string): CategoryMatch[] {
+export function classifyQuery(
+  query: string,
+  parsedGrammar?: ParsedQuery | null,
+): CategoryMatch[] {
   const normalized = query.toLowerCase();
   const matches: CategoryMatch[] = [];
+  const grammarAgent =
+    parsedGrammar && parsedGrammar.agent_names.length > 0
+      ? parsedGrammar.agent_names[0] ?? null
+      : null;
 
   for (const spec of CATEGORY_KEYWORDS) {
     const matchedPhrases: string[] = [];
@@ -309,14 +379,18 @@ export function classifyQuery(query: string): CategoryMatch[] {
 
     const confidence = Math.min(1.0, 0.4 + 0.3 * matchedPhrases.length);
 
+    const wantsAgentHint =
+      spec.category === "agent_state" || spec.category === "agent_activity";
+    const agent_name_hint = wantsAgentHint
+      ? grammarAgent ?? extractAgentNameHint(query)
+      : null;
+
     matches.push({
       category: spec.category,
       confidence,
       matched_keywords: matchedPhrases,
-      agent_name_hint:
-        spec.category === "agent_state" || spec.category === "agent_activity"
-          ? extractAgentNameHint(query)
-          : null,
+      agent_name_hint,
+      ...(parsedGrammar !== undefined ? { query_grammar: parsedGrammar } : {}),
     });
   }
 
@@ -329,6 +403,37 @@ export function classifyQuery(query: string): CategoryMatch[] {
   });
 
   return matches;
+}
+
+/**
+ * Build a `FetcherHints` object from a parsed query. Returns `undefined`
+ * (not an empty object) when the parse contributed no resolvable fields,
+ * so fetchers see a missing arg rather than a hints object full of
+ * absent fields.
+ */
+export function fetcherHintsFromGrammar(
+  parsed: ParsedQuery | null | undefined,
+): FetcherHints | undefined {
+  if (!parsed) return undefined;
+  const hasTime = parsed.time_range !== null;
+  const hasAgents = parsed.agent_names.length > 0;
+  const hasEvents = parsed.event_types.length > 0;
+  if (!hasTime && !hasAgents && !hasEvents) return undefined;
+
+  const hints: FetcherHints = {};
+  if (parsed.time_range) {
+    const range = parsed.time_range;
+    hints.time_range = {
+      start: range.start,
+      end: range.end,
+      ...(range.relative_label !== undefined
+        ? { relative_label: range.relative_label }
+        : {}),
+    };
+  }
+  if (hasAgents) hints.agent_names = parsed.agent_names;
+  if (hasEvents) hints.event_types = parsed.event_types;
+  return hints;
 }
 
 function approxTokenLen(text: string): number {
@@ -354,33 +459,41 @@ interface FetchAttempt {
 async function runFetcher(
   match: CategoryMatch,
   fetchers: ContextFetchers,
+  hints: FetcherHints | undefined,
 ): Promise<string> {
   switch (match.category) {
     case "templates":
-      return fetchers.templates();
+      return fetchers.templates(hints);
     case "agent_state":
-      return fetchers.agent_state(match.agent_name_hint);
+      return fetchers.agent_state(match.agent_name_hint, hints);
     case "agent_activity":
-      return fetchers.agent_activity(match.agent_name_hint);
+      return fetchers.agent_activity(match.agent_name_hint, hints);
     case "audit_log":
-      return fetchers.audit_log();
+      return fetchers.audit_log(hints);
     case "sentinel_findings":
-      return fetchers.sentinel_findings();
+      return fetchers.sentinel_findings(hints);
     case "anomaly_alerts":
-      return fetchers.anomaly_alerts();
+      return fetchers.anomaly_alerts(hints);
     case "recent_receipts":
-      return fetchers.recent_receipts();
+      return fetchers.recent_receipts(hints);
     case "verascore_deltas":
-      return fetchers.verascore_deltas();
+      return fetchers.verascore_deltas(hints);
   }
 }
 
-function trivialMatch(category: ContextCategory): CategoryMatch {
+function trivialMatch(
+  category: ContextCategory,
+  parsedGrammar?: ParsedQuery | null,
+): CategoryMatch {
   return {
     category,
     confidence: 0.5,
     matched_keywords: ["llm-assist"],
-    agent_name_hint: null,
+    agent_name_hint:
+      parsedGrammar && parsedGrammar.agent_names.length > 0
+        ? parsedGrammar.agent_names[0] ?? null
+        : null,
+    ...(parsedGrammar !== undefined ? { query_grammar: parsedGrammar } : {}),
   };
 }
 
@@ -408,14 +521,16 @@ export async function foldContext(
   opts?: FoldContextOptions,
 ): Promise<FoldContextResult> {
   const budget = opts?.maxTokens ?? DEFAULT_DYNAMIC_CONTEXT_TOKEN_BUDGET;
+  const parsed = opts?.parsed ?? null;
+  const hints = fetcherHintsFromGrammar(parsed);
 
-  let matches = classifyQuery(query);
+  let matches = classifyQuery(query, parsed);
 
   if (matches.length === 0 && !isTrivialQuery(query) && opts?.llmAssistClassify) {
     try {
       const picked = await opts.llmAssistClassify(query, CONTEXT_CATEGORIES);
       if (picked !== "none" && CONTEXT_CATEGORIES.includes(picked)) {
-        matches = [trivialMatch(picked)];
+        matches = [trivialMatch(picked, parsed)];
       }
     } catch {
       // LLM-assist failure is non-fatal; fall through with no matches.
@@ -429,7 +544,7 @@ export async function foldContext(
   const attempts: FetchAttempt[] = [];
   for (const match of matches) {
     try {
-      const text = await runFetcher(match, fetchers);
+      const text = await runFetcher(match, fetchers, hints);
       const trimmed = text.trim();
       if (trimmed.length > 0) {
         attempts.push({ category: match.category, text: trimmed });
