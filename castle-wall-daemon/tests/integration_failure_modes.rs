@@ -671,8 +671,9 @@ fn wal_chain_corruption_at_open_refuses_to_start() {
     let err = WalWriter::open(&wal_path).expect_err("corrupt WAL must refuse open");
     let msg = err.to_string();
     assert!(
-        msg.contains("chain") || msg.contains("integrity"),
-        "expected chain integrity error; got {msg}"
+        msg.contains("malformed prior_sha256_hex")
+            || msg.contains("expected 64 lowercase hex chars"),
+        "expected length-validation error refusing to start; got {msg}"
     );
 }
 
