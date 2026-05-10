@@ -60,10 +60,17 @@ import type {
 import type {
   OperatorChatAuditPayload,
   OperatorConciergeChatPayload,
+  OperatorConciergeContextFetcherFailedPayload,
   OperatorConciergeHistoryReadPayload,
   OperatorConciergeMemoryReadFailedPayload,
   OperatorConciergeThreadDeletedPayload,
 } from "../contracts/v1.2/operator-chat-events.js";
+import {
+  foldContext,
+  type ContextCategory,
+  type ContextFetchers,
+  type LlmAssistClassifier,
+} from "./concierge-context-router.js";
 
 /**
  * Snapshot of fortress state surfaces the concierge consults to
@@ -177,6 +184,30 @@ export interface OperatorChatServiceDeps {
    * implementation run.
    */
   conciergeClock?: () => number;
+  /**
+   * WP-V1.3-9 Tau-3: caller-supplied fetchers for dynamic context
+   * injection. When wired alongside the substrate selector, every
+   * `sendConcierge` round-trip routes the operator's query through the
+   * concierge-context-router and folds matching live data into the
+   * substrate prompt between the static Sanctuary reference and the
+   * prior-turns fold. Omit to disable dynamic context (the static
+   * reference + prior-turns paths keep working unchanged).
+   */
+  conciergeContextFetchers?: ContextFetchers;
+  /**
+   * WP-V1.3-9 Tau-3: optional LLM-assist classifier for queries that
+   * fail keyword classification. Coordinator-CTO bake: when wired, the
+   * service routes the auxiliary classifier call through the substrate
+   * selector at the same `concierge` surface, so the auxiliary call
+   * shares the operator's substrate choice and never opens a new
+   * outbound surface.
+   */
+  conciergeContextLlmAssist?: LlmAssistClassifier;
+  /**
+   * WP-V1.3-9 Tau-3: rough token budget for the dynamic-context fold.
+   * Defaults to `DEFAULT_CONCIERGE_DYNAMIC_CONTEXT_BUDGET` (2000).
+   */
+  conciergeDynamicContextBudget?: number;
 }
 
 const DEFAULT_CONCIERGE_MAX_TOKENS = 512;
@@ -191,6 +222,13 @@ export const DEFAULT_CONCIERGE_HISTORY_WINDOW_TURNS = 10;
 export const DEFAULT_CONCIERGE_HISTORY_FRESHNESS_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_CONCIERGE_HISTORY_TOKEN_BUDGET = 500;
 export const DEFAULT_CONCIERGE_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * WP-V1.3-9 Tau-3 default token budget for the dynamic-context fold.
+ * Sized to leave room for static reference + prior-turns + per-provider
+ * sections within the substrate's nominal 4k-token concierge prompt.
+ */
+export const DEFAULT_CONCIERGE_DYNAMIC_CONTEXT_BUDGET = 2000;
 
 /**
  * Approximate-token estimator. The substrate selector does not expose a
@@ -253,6 +291,9 @@ export class OperatorChatService {
   private historyTokenBudget: number;
   private sessionTtlMs: number;
   private clock: () => number;
+  private contextFetchers?: ContextFetchers;
+  private contextLlmAssist?: LlmAssistClassifier;
+  private dynamicContextBudget: number;
   /**
    * In-memory thread_id assigned to the active concierge session.
    * The first sendConcierge call after construction allocates a fresh
@@ -301,6 +342,17 @@ export class OperatorChatService {
         ? deps.conciergeSessionTtlMs
         : DEFAULT_CONCIERGE_SESSION_TTL_MS;
     this.clock = deps.conciergeClock ?? (() => Date.now());
+    if (deps.conciergeContextFetchers) {
+      this.contextFetchers = deps.conciergeContextFetchers;
+    }
+    if (deps.conciergeContextLlmAssist) {
+      this.contextLlmAssist = deps.conciergeContextLlmAssist;
+    }
+    this.dynamicContextBudget =
+      deps.conciergeDynamicContextBudget !== undefined &&
+      deps.conciergeDynamicContextBudget > 0
+        ? deps.conciergeDynamicContextBudget
+        : DEFAULT_CONCIERGE_DYNAMIC_CONTEXT_BUDGET;
   }
 
   // ── Concierge ─────────────────────────────────────────────────────────
@@ -405,6 +457,7 @@ export class OperatorChatService {
     let displayLabel = "Concierge: substrate not configured";
     let outcome: "ok" | "substrate_failure" | "substrate_disabled" =
       "substrate_disabled";
+    let dynamicCategoriesIncluded: ContextCategory[] = [];
 
     if (!this.substrateSelector) {
       conciergeBody =
@@ -420,7 +473,14 @@ export class OperatorChatService {
             "Concierge unavailable. The chosen substrate does not support summarization. Pick a different substrate in the Policy center.";
           outcome = "substrate_disabled";
         } else {
-          const context = await this.assembleConciergeContext(priorTurns);
+          const dynamicResult = await this.runDynamicContextFold(
+            filterResult.filtered,
+          );
+          dynamicCategoriesIncluded = dynamicResult.categoriesIncluded;
+          const context = await this.assembleConciergeContext(
+            priorTurns,
+            dynamicResult.section,
+          );
           const response = await this.substrateSelector.invokeSummarize(
             "concierge",
             {
@@ -503,6 +563,9 @@ export class OperatorChatService {
             prior_turns_folded:
               memoryReadFailureReason === null ? priorTurns.length : 0,
           }
+        : {}),
+      ...(this.contextFetchers
+        ? { dynamic_context_categories: [...dynamicCategoriesIncluded] }
         : {}),
     };
     this.emit(OPERATOR_CHAT_OPS.CONCIERGE_CHAT, payload, outcome === "ok" ? "success" : "failure");
@@ -677,10 +740,13 @@ export class OperatorChatService {
    *   ## Sanctuary reference
    *   <static domain reference block>
    *
+   *   ## Live fortress context          ← WP-V1.3-9 Tau-3, when present
+   *   ### <Category>
+   *   <fetcher payload>
+   *
    *   ## Prior conversation             ← WP-V1.3-9 Tau-2, when present
    *   OPERATOR: ...
    *   CONCIERGE: ...
-   *   ---
    *
    *   ## Recent activity
    *   <recentActivity output>
@@ -701,6 +767,7 @@ export class OperatorChatService {
    */
   private async assembleConciergeContext(
     priorTurns: ConciergeTurn[] = [],
+    dynamicSection = "",
   ): Promise<string> {
     const ref = `## Sanctuary reference\n${SANCTUARY_DOMAIN_REFERENCE}`;
     const priorSection = this.formatPriorTurnsSection(priorTurns);
@@ -708,6 +775,7 @@ export class OperatorChatService {
     if (!this.contextProviders) {
       return [
         ref,
+        ...(dynamicSection ? [dynamicSection] : []),
         ...(priorSection ? [priorSection] : []),
         "## Recent activity\n(no providers wired)",
         "## Wrapped agents\n(no providers wired)",
@@ -721,11 +789,67 @@ export class OperatorChatService {
     ]);
     return [
       ref,
+      ...(dynamicSection ? [dynamicSection] : []),
       ...(priorSection ? [priorSection] : []),
       `## Recent activity\n${activity}`,
       `## Wrapped agents\n${agents}`,
       `## Open inbox\n${inbox}`,
     ].join("\n\n");
+  }
+
+  /**
+   * Run the WP-V1.3-9 Tau-3 dynamic-context fold for a single round-
+   * trip. Fail-soft on every axis: missing fetchers short-circuit to
+   * an empty fold, fetcher failures emit a per-category audit event
+   * and are omitted from the rendered section, an LLM-assist failure
+   * proceeds with no fold. Returns the rendered section + the list of
+   * categories whose data made it into the section (used for the
+   * round-trip audit emission).
+   */
+  private async runDynamicContextFold(query: string): Promise<{
+    section: string;
+    categoriesIncluded: ContextCategory[];
+  }> {
+    if (!this.contextFetchers) {
+      return { section: "", categoriesIncluded: [] };
+    }
+    const result = await foldContext(query, this.contextFetchers, {
+      maxTokens: this.dynamicContextBudget,
+      ...(this.contextLlmAssist
+        ? { llmAssistClassify: this.contextLlmAssist }
+        : {}),
+      onFetcherFailure: (category, error) => {
+        this.emitContextFetcherFailed(category, classifyFetcherError(error));
+      },
+    });
+    return result;
+  }
+
+  /**
+   * Emit the WP-V1.3-9 Tau-3 fetcher-failure audit event. Pulled out
+   * of the fold path so the dynamic-context handler stays readable.
+   * Emits with `result: "failure"` since the named category dropped
+   * from the rendered section for this round-trip.
+   */
+  private emitContextFetcherFailed(
+    category: ContextCategory,
+    failureReason: OperatorConciergeContextFetcherFailedPayload["failure_reason"],
+  ): void {
+    const payload: OperatorConciergeContextFetcherFailedPayload = {
+      version: "1.2",
+      event_id: makeEventId("conc-ctxfail"),
+      emitted_at: new Date().toISOString(),
+      identity_id: this.identityId,
+      kind: "operator_concierge_context_fetcher_failed",
+      surface: "concierge",
+      category,
+      failure_reason: failureReason,
+    };
+    this.emit(
+      OPERATOR_CHAT_OPS.CONCIERGE_CONTEXT_FETCHER_FAILED,
+      payload,
+      "failure",
+    );
   }
 
   /**
@@ -784,6 +908,33 @@ export class OperatorChatService {
 
 function makeEventId(prefix: string): string {
   return `${prefix}-${Date.now()}-${randomUUID().slice(0, 8)}`;
+}
+
+/**
+ * Map a thrown fetcher error into the stable failure-reason enum used
+ * by `OperatorConciergeContextFetcherFailedPayload`. Coordinator-CTO
+ * bake: keep the mapping conservative so dashboards can group by
+ * cause; opaque errors surface as `unknown` so they remain visible
+ * without being mis-classified. Future fetcher implementations may
+ * throw typed errors that this helper extends to recognize.
+ */
+function classifyFetcherError(
+  error: unknown,
+): OperatorConciergeContextFetcherFailedPayload["failure_reason"] {
+  const msg = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  if (msg.includes("timeout") || msg.includes("timed out")) return "timeout";
+  if (msg.includes("schema") || msg.includes("invalid shape")) {
+    return "schema_mismatch";
+  }
+  if (
+    msg.includes("io") ||
+    msg.includes("read") ||
+    msg.includes("enoent") ||
+    msg.includes("eacces")
+  ) {
+    return "io_failed";
+  }
+  return "unknown";
 }
 
 /**

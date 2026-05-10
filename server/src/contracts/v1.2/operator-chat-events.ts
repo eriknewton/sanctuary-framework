@@ -105,6 +105,15 @@ export interface OperatorConciergeChatPayload extends OperatorChatAuditPayloadHe
    * current operator query.
    */
   prior_turns_folded?: number;
+  /**
+   * Dynamic context categories whose fetcher data folded into the
+   * substrate context for this round-trip (WP-V1.3-9 Tau-3). Empty
+   * array on turns where keyword classification produced no matches
+   * and the LLM-assist fallback declined or was not configured.
+   * Absent on services constructed without a dynamic context router
+   * (additive forward-compat, no new event class).
+   */
+  dynamic_context_categories?: string[];
 }
 
 /**
@@ -159,10 +168,43 @@ export interface OperatorConciergeMemoryReadFailedPayload
 }
 
 /**
+ * Concierge dynamic-context fetcher failed (WP-V1.3-9 Tau-3). Emitted
+ * when the dynamic context router runs a category fetcher that throws.
+ * The concierge MUST omit that category's fold and continue rendering
+ * the surviving categories; the user-facing query is never broken by
+ * a context-assembly failure. `category` carries the fetcher that
+ * failed; `failure_reason` is a stable enum so dashboards can group
+ * by cause without parsing free-form text. The error message itself
+ * is intentionally not included to keep operator queries + raw audit
+ * payloads off the audit surface.
+ */
+export interface OperatorConciergeContextFetcherFailedPayload
+  extends OperatorChatAuditPayloadHeader {
+  kind: "operator_concierge_context_fetcher_failed";
+  surface: Extract<Surface, "concierge">;
+  /**
+   * Dynamic context category whose fetcher threw. Stable enum; aligns
+   * with the concierge-context-router category surface.
+   */
+  category:
+    | "templates"
+    | "agent_state"
+    | "agent_activity"
+    | "audit_log"
+    | "sentinel_findings"
+    | "anomaly_alerts"
+    | "recent_receipts"
+    | "verascore_deltas";
+  /** Stable failure-reason enum; defaults to `unknown` on opaque errors. */
+  failure_reason: "unknown" | "io_failed" | "schema_mismatch" | "timeout";
+}
+
+/**
  * Discriminated union of every operator-chat payload shape v1.2 emits.
  */
 export type OperatorChatAuditPayload =
   | OperatorConciergeChatPayload
   | OperatorConciergeHistoryReadPayload
   | OperatorConciergeThreadDeletedPayload
-  | OperatorConciergeMemoryReadFailedPayload;
+  | OperatorConciergeMemoryReadFailedPayload
+  | OperatorConciergeContextFetcherFailedPayload;

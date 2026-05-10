@@ -51,10 +51,16 @@ import {
   type ConciergeContextProviders,
   type ConciergePiiFilter,
 } from "../../chat/operator-chat-index.js";
+import type {
+  ContextFetchers,
+  LlmAssistClassifier,
+  ContextCategory,
+} from "../../chat/concierge-context-router.js";
 import {
   detectSensitiveSpans,
   detectorClassForSpan,
 } from "../../l2-operational/privacy-filter.js";
+import { listTemplates } from "../../templates/registry.js";
 
 export interface BuildV11BindingsInputs {
   /** Operator identity id this hub is scoped to. */
@@ -228,6 +234,19 @@ export function buildV11Bindings(
       }),
       conciergePiiFilter: buildConciergePiiFilter(),
       conciergeMemory,
+      conciergeContextFetchers: buildConciergeContextFetchers({
+        auditLog: inputs.auditLog,
+        identityId: inputs.identityId,
+        registry,
+      }),
+      ...(inputs.intelligenceSelector
+        ? {
+            conciergeContextLlmAssist: buildConciergeContextLlmAssist({
+              selector: inputs.intelligenceSelector,
+              identityId: inputs.identityId,
+            }),
+          }
+        : {}),
     });
   }
 
@@ -314,6 +333,166 @@ function buildConciergeContextProviders(args: {
       // open inbox items)" until the inbox aggregator is wired.
       return "(no open inbox items)";
     },
+  };
+}
+
+/**
+ * WP-V1.3-9 Tau-3 dynamic-context fetcher table. Wires the eight
+ * categories the concierge-context-router routes against to concrete
+ * data sources. Categories with no v1.3 source ship as placeholder
+ * fetchers that return the empty string so the router drops them
+ * cleanly; v1.3+ work threads add real sources without changing the
+ * shape on this side.
+ *
+ * Failure-mode shape: each fetcher SHOULD throw on real data-source
+ * errors; the chat-service wrapper catches and routes through
+ * `onFetcherFailure` so the per-category audit event fires and the
+ * surviving categories continue rendering.
+ */
+function buildConciergeContextFetchers(args: {
+  auditLog: AuditLog;
+  identityId: string;
+  registry: InMemoryLocalAgentRegistry;
+}): ContextFetchers {
+  const empty = async () => "";
+  return {
+    templates: async () => {
+      const entries = listTemplates();
+      if (entries.length === 0) return "(no templates installed)";
+      const lines = entries.map((e) => {
+        const m = e.metadata;
+        return `${m.name} (tier ${m.tier}, channel ${m.channel}, target ${m.target_archetype})`;
+      });
+      return lines.join("\n");
+    },
+    agent_state: async (agentNameHint) => {
+      const records = args.registry.list({ identity_id: args.identityId });
+      if (records.length === 0) return "(no wrapped agents)";
+      const filtered = agentNameHint
+        ? records.filter(
+            (r) =>
+              r.agent_id.toLowerCase().includes(agentNameHint.toLowerCase()) ||
+              r.harness.toLowerCase().includes(agentNameHint.toLowerCase()),
+          )
+        : records;
+      const target = filtered.length > 0 ? filtered : records;
+      const lines = target.slice(0, 20).map((r) => {
+        const tmpl =
+          typeof r.channel_template_id === "string"
+            ? r.channel_template_id
+            : "no_template";
+        return `${r.agent_id}  harness=${r.harness}  status=${r.status}  template=${tmpl}`;
+      });
+      return lines.join("\n");
+    },
+    agent_activity: async (agentNameHint) => {
+      const result = await args.auditLog.query({ limit: 50 });
+      const owned = result.entries.filter(
+        (e) => e.identity_id === args.identityId,
+      );
+      const filtered = agentNameHint
+        ? owned.filter((e) => {
+            const agentId =
+              e.details && typeof e.details["agent_id"] === "string"
+                ? (e.details["agent_id"] as string)
+                : "";
+            return agentId
+              .toLowerCase()
+              .includes(agentNameHint.toLowerCase());
+          })
+        : owned;
+      const tail = (filtered.length > 0 ? filtered : owned).slice(-20);
+      if (tail.length === 0) return "(no activity)";
+      return tail
+        .map((e) => {
+          const agentId =
+            (e.details && typeof e.details["agent_id"] === "string"
+              ? (e.details["agent_id"] as string)
+              : null) ?? "_fortress";
+          return `${e.timestamp}  ${e.layer}.${e.operation}  agent=${agentId}  result=${e.result}`;
+        })
+        .join("\n");
+    },
+    audit_log: async () => {
+      const result = await args.auditLog.query({ limit: 30 });
+      const owned = result.entries.filter(
+        (e) => e.identity_id === args.identityId,
+      );
+      if (owned.length === 0) return "(no audit log entries)";
+      return owned
+        .slice(-30)
+        .map(
+          (e) =>
+            `${e.timestamp}  ${e.layer}.${e.operation}  result=${e.result}`,
+        )
+        .join("\n");
+    },
+    sentinel_findings: empty,
+    anomaly_alerts: empty,
+    recent_receipts: async () => {
+      const result = await args.auditLog.query({ limit: 100 });
+      const owned = result.entries.filter(
+        (e) =>
+          e.identity_id === args.identityId &&
+          e.operation.startsWith("composition_"),
+      );
+      if (owned.length === 0) return "(no recent composition events)";
+      return owned
+        .slice(-15)
+        .map((e) => `${e.timestamp}  ${e.operation}  result=${e.result}`)
+        .join("\n");
+    },
+    verascore_deltas: empty,
+  };
+}
+
+/**
+ * WP-V1.3-9 Tau-3 LLM-assist classifier. Routes the auxiliary
+ * classification call through the substrate selector at the concierge
+ * surface so the operator's substrate choice carries through and no
+ * new outbound channel opens. Returns `"none"` on substrate failure
+ * or when the response cannot be parsed into one of the known
+ * categories; the router treats `"none"` as no classification.
+ *
+ * The prompt deliberately constrains output to a single token from
+ * the closed enum so even small local models (Gemma 2 2B) hit the
+ * accept path predictably.
+ */
+function buildConciergeContextLlmAssist(args: {
+  selector: SubstrateSelector;
+  identityId: string;
+}): LlmAssistClassifier {
+  return async (query, categories) => {
+    const labelList = categories.map((c) => `- ${c}`).join("\n");
+    const prompt =
+      `You are a router. Classify the operator's query into one of the categories below or "none".\n` +
+      `Reply with exactly one token: one category name or "none".\n\n` +
+      `Categories:\n${labelList}\n\n` +
+      `Query: ${query}\n\n` +
+      `Category:`;
+    try {
+      const handle = await args.selector.getSubstrate("concierge");
+      if (!handle.capability.summarize) return "none";
+      const response = await args.selector.invokeSummarize("concierge", {
+        kind: "summarize",
+        context: prompt,
+        query: "Output the single category token.",
+        maxTokens: 16,
+      });
+      if (response.failureClass || response.body.kind !== "summarize") {
+        return "none";
+      }
+      const raw = response.body.text.trim().toLowerCase();
+      const head = raw.split(/\s|[.,!?:;]/)[0] ?? "";
+      const normalized = head.replace(/[^a-z_]/g, "");
+      const known = categories as readonly string[];
+      if (known.includes(normalized)) {
+        return normalized as ContextCategory;
+      }
+      return "none";
+    } catch {
+      return "none";
+    }
   };
 }
 
