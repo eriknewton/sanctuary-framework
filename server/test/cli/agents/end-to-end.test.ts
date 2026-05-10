@@ -49,6 +49,7 @@ async function buildMockTenant(
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
+    // port-discipline: ignore — caller passes 0 (ephemeral); addr.port read back below.
     server.listen(port, "127.0.0.1", () => resolve());
   });
   const addr = server.address();
