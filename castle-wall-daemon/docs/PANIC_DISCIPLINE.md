@@ -133,3 +133,94 @@ This document is canonical for the framework. Future scope expansions
 (extending the gate to other Rust crates, wiring it as a clippy lint,
 adding a `cargo xtask` runner) are coordinator-level decisions and ship as
 follow-on PRs, not as scope creep on this file.
+
+## Log discipline (companion framework)
+
+Panic discipline keeps the daemon alive under stress. Log discipline keeps
+its operator-facing output channels honest: every `println!` or `eprintln!`
+in non-test Rust source must carry an immediately preceding `// SAFETY:`
+comment naming why raw stdout/stderr is the contract at that site, not a
+log channel. The contract sites in the daemon today are CLI surfaces only:
+`--help` text, argv parse-error reporting, the startup banner before the
+audit channel comes up, the refuse-to-start error, and the boot-and-exit
+plus normal-shutdown clean-exit lines that operators and CI smoke harnesses
+scrape.
+
+The framework is enforced by `scripts/check-stdout-discipline.py`, which
+the Castle Wall Linux CI workflow runs on every PR and every push to
+`main`, alongside the panic-discipline gate.
+
+### Marker convention
+
+* Capital `SAFETY:` (uppercase) is used for log discipline. Sites where raw
+  stdout/stderr IS the operator contract.
+* Mixed-case `Safety:` is used for panic discipline. Sites where an
+  `unwrap()`/`expect()` cannot fire under a documented invariant.
+
+The two markers are intentionally distinct so each gate operates on a
+disjoint annotation set; a comment with the wrong case will not satisfy
+the other gate.
+
+### Annotation walk-back
+
+The stdout-discipline gate is more permissive than the panic-discipline
+gate in one specific way: the walk-back from a `println!`/`eprintln!` site
+traverses contiguous earlier print calls and `//` line comments, so a
+single `// SAFETY:` annotation can cover an entire structural output block
+(the multi-line `print_help` function, a banner block, etc.). The
+walk-back still stops at blank lines and at any other code, so a residual
+debug `println!` separated from a legitimate banner by a `let` statement
+or a brace remains unannotated and fails the gate.
+
+Multi-line macro continuations (an `eprintln!(\n …\n);` whose body spans
+several lines) are treated as part of the same call site for walk-back
+purposes; the statement-terminator on the closing line bounds the macro,
+and lines containing structural keywords (`let`, `if`, `match`, `fn`, etc.)
+break the walk so escape-routes for residual debug stay shut.
+
+### Categories
+
+For every `println!`/`eprintln!` site, classify it before merging:
+
+* **Channel-contract output.** stdout/stderr IS the channel. CLI help,
+  argv-error reporting, startup or shutdown banners, smoke-harness scrape
+  lines. Annotate with `// SAFETY:` naming the channel and the reason the
+  call cannot be a log entry. This is the only category present in the
+  daemon today.
+* **Residual debug.** A debug print that snuck in. Remove the call (or
+  route it through a structured logger if/when the daemon adds one); do
+  not annotate.
+
+The daemon does not currently link a structured logging facility (no
+`tracing`, `log`, or `env_logger` dependency). When one is added later,
+the gate continues to do its job: existing channel-contract sites stay
+annotated, and any new residual debug `println!`/`eprintln!` will fail
+the gate. Choosing whether to add a structured logger is a coordinator
+decision, not a build-time fix on this file.
+
+### Running the gate locally
+
+```bash
+# Pass / fail check
+python3 castle-wall-daemon/scripts/check-stdout-discipline.py
+
+# Self-tests for the gate logic itself
+python3 castle-wall-daemon/scripts/test_check_stdout_discipline.py
+```
+
+Pass output:
+
+```
+Castle Wall daemon stdout-discipline gate PASS: 21 annotated production-code site(s), 0 unannotated.
+```
+
+Fail output lists each unannotated site with file path, line number, and
+the offending source line.
+
+### How this closes full-sweep #98
+
+The Sigma-3 sweep classified the 21 production-code `println!`/`eprintln!`
+sites in `castle-wall-daemon/src/` (all in `main.rs`, all CLI surfaces)
+and annotated each with a `// SAFETY:` comment. The new gate is the
+structural floor that prevents future commits from re-introducing
+unannotated sites. Together, the sweep and the gate close finding #98.

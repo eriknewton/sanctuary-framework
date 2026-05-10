@@ -81,6 +81,19 @@ jobs:
         working-directory: castle-wall-daemon
         run: python3 scripts/test_check_panic_discipline.py
 
+      - name: Stdout-discipline gate (no unannotated println/eprintln in src/)
+        working-directory: castle-wall-daemon
+        # Closes full-sweep #98 by structurally preventing residual
+        # println!/eprintln! from being introduced in production paths.
+        # Test code (#[cfg(test)] mod blocks and the tests/ directory) is
+        # excluded by design. Doc lives in the Log discipline section of
+        # castle-wall-daemon/docs/PANIC_DISCIPLINE.md.
+        run: python3 scripts/check-stdout-discipline.py
+
+      - name: Stdout-discipline gate self-tests
+        working-directory: castle-wall-daemon
+        run: python3 scripts/test_check_stdout_discipline.py
+
       - name: cargo check
         working-directory: castle-wall-daemon
         run: cargo check --all-targets
