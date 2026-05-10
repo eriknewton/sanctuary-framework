@@ -15,6 +15,9 @@ use castle_wall_daemon::config::{ConfigError, DaemonConfig};
 use castle_wall_daemon::daemon;
 
 fn print_help() {
+    // SAFETY: stdout is the CLI --help contract here, not a log channel. CLI
+    // convention requires help text on stdout; the contiguous println! block
+    // below is structural operator output and is the channel itself.
     println!("castle-wall-daemon (Sanctuary Castle Wall filter daemon)");
     println!();
     println!("USAGE:");
@@ -47,12 +50,18 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(err) => {
+            // SAFETY: stderr is the CLI parse-error contract here, not a log
+            // channel. argv parsing happens before any logging facility could
+            // be initialized; CLI convention requires error text on stderr.
             eprintln!("castle-wall-daemon: {}", err);
             print_help();
             return ExitCode::from(2);
         }
     };
 
+    // SAFETY: stdout is the CLI startup-banner contract here, not a log
+    // channel. The banner is emitted before daemon::boot installs the audit
+    // channel; this line is the operator-visible "starting" signal.
     println!(
         "castle-wall-daemon: starting for fortress {} (socket {}, policy {}, wal {})",
         config.fortress_id,
@@ -66,6 +75,9 @@ fn main() -> ExitCode {
         Err(err) => {
             let mode = daemon::mode_for_error(&err);
             let disposition = castle_wall_daemon::failure::default_disposition(mode);
+            // SAFETY: stderr is the CLI refuse-to-start contract here, not a
+            // log channel. The message body is operator-formatted upstream by
+            // failure::default_disposition; this site is the visible surface.
             eprintln!(
                 "{}",
                 daemon::refuse_to_start_message(&disposition, &err.to_string())
@@ -75,15 +87,22 @@ fn main() -> ExitCode {
     };
 
     if boot_and_exit {
+        // SAFETY: stdout is the CLI boot-and-exit lifecycle contract here,
+        // not a log channel. CI smoke harnesses scrape this exact line.
         println!("castle-wall-daemon: --boot-and-exit set; tearing down after one tick");
         std::thread::sleep(SHUTDOWN_TICK);
         let report = match handle.stop() {
             Ok(r) => r,
             Err(err) => {
+                // SAFETY: stderr is the CLI shutdown-error contract here, not
+                // a log channel. Emitted after the audit channel has been
+                // drained; this is the operator-visible failure signal.
                 eprintln!("castle-wall-daemon: shutdown error: {}", err);
                 return ExitCode::from(75);
             }
         };
+        // SAFETY: stdout is the CLI clean-exit contract here, not a log
+        // channel. The boot-and-exit smoke harness asserts on this line.
         println!(
             "castle-wall-daemon: clean exit (uptime {:?}, audit overflow {}, audit remaining {})",
             report.uptime, report.audit_overflow_count, report.audit_remaining
@@ -95,10 +114,16 @@ fn main() -> ExitCode {
     let report = match handle.stop() {
         Ok(r) => r,
         Err(err) => {
+            // SAFETY: stderr is the CLI shutdown-error contract here, not a
+            // log channel. Emitted after the audit channel has been drained;
+            // this is the operator-visible failure signal on the normal
+            // shutdown path.
             eprintln!("castle-wall-daemon: shutdown error: {}", err);
             return ExitCode::from(75);
         }
     };
+    // SAFETY: stdout is the CLI clean-exit contract here, not a log channel.
+    // Operators rely on this line to confirm the daemon stopped cleanly.
     println!(
         "castle-wall-daemon: clean exit (uptime {:?}, audit overflow {}, audit remaining {})",
         report.uptime, report.audit_overflow_count, report.audit_remaining
