@@ -63,6 +63,7 @@ import type {
   OperatorConciergeContextFetcherFailedPayload,
   OperatorConciergeHistoryReadPayload,
   OperatorConciergeMemoryReadFailedPayload,
+  OperatorConciergeProactiveSuggestionOfferedPayload,
   OperatorConciergeThreadDeletedPayload,
 } from "../contracts/v1.2/operator-chat-events.js";
 import {
@@ -79,6 +80,13 @@ import {
   type LlmAssistGrammarCompletion,
   type ParsedQuery,
 } from "./concierge-query-grammar.js";
+import {
+  formatCurrentAgentStateSection,
+  generateProactiveStarter,
+  type AgentContextCache,
+  type AgentContextSnapshot,
+  type ConciergeProactiveStarter,
+} from "./agent-context-cache.js";
 
 /**
  * Snapshot of fortress state surfaces the concierge consults to
@@ -236,6 +244,21 @@ export interface OperatorChatServiceDeps {
    * fetcher categories; this hook completes structured grammar fields.
    */
   conciergeGrammarLlmAssist?: LlmAssistGrammarCompletion;
+  /**
+   * WP-V1.3-9 Tau-5: caller-supplied agent-context cache. When wired
+   * alongside the substrate selector, every `sendConcierge` round-trip
+   * folds a "Current agent state" section into the substrate prompt
+   * (between the dynamic-context fold and the prior-conversation
+   * fold), and `getProactiveStarter()` surfaces a fresh-thread starter
+   * based on the cache state. Omit to disable agent-context awareness;
+   * the rest of the concierge surface keeps working unchanged.
+   */
+  conciergeAgentContextCache?: AgentContextCache;
+  /**
+   * WP-V1.3-9 Tau-5: rough token budget for the "Current agent state"
+   * section. Defaults to `DEFAULT_CONCIERGE_AGENT_STATE_BUDGET` (400).
+   */
+  conciergeAgentStateBudget?: number;
 }
 
 const DEFAULT_CONCIERGE_MAX_TOKENS = 512;
@@ -257,6 +280,13 @@ export const DEFAULT_CONCIERGE_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
  * sections within the substrate's nominal 4k-token concierge prompt.
  */
 export const DEFAULT_CONCIERGE_DYNAMIC_CONTEXT_BUDGET = 2000;
+
+/**
+ * WP-V1.3-9 Tau-5 default token budget for the "Current agent state"
+ * section. Sized to fit alongside the dynamic-context fold and prior-
+ * turns fold without crowding the substrate's nominal concierge prompt.
+ */
+export const DEFAULT_CONCIERGE_AGENT_STATE_BUDGET = 400;
 
 /**
  * Approximate-token estimator. The substrate selector does not expose a
@@ -324,6 +354,15 @@ export class OperatorChatService {
   private dynamicContextBudget: number;
   private agentRegistry?: AgentRegistryView;
   private grammarLlmAssist?: LlmAssistGrammarCompletion;
+  private agentContextCache?: AgentContextCache;
+  private agentStateBudget: number;
+  /**
+   * Per-thread guard so the proactive starter fires at most once per
+   * fresh thread. Tracks the thread_id the starter was last offered
+   * for; subsequent `getProactiveStarter()` calls within the same
+   * thread return null instead of re-emitting.
+   */
+  private starterOfferedForThreadId?: string;
   /**
    * In-memory thread_id assigned to the active concierge session.
    * The first sendConcierge call after construction allocates a fresh
@@ -389,6 +428,14 @@ export class OperatorChatService {
     if (deps.conciergeGrammarLlmAssist) {
       this.grammarLlmAssist = deps.conciergeGrammarLlmAssist;
     }
+    if (deps.conciergeAgentContextCache) {
+      this.agentContextCache = deps.conciergeAgentContextCache;
+    }
+    this.agentStateBudget =
+      deps.conciergeAgentStateBudget !== undefined &&
+      deps.conciergeAgentStateBudget > 0
+        ? deps.conciergeAgentStateBudget
+        : DEFAULT_CONCIERGE_AGENT_STATE_BUDGET;
   }
 
   // ── Concierge ─────────────────────────────────────────────────────────
@@ -417,7 +464,9 @@ export class OperatorChatService {
     // WP-V1.3-9 Tau-2: rotate the active session thread when the prior
     // round-trip is older than `sessionTtlMs`. Allocation of the fresh
     // thread_id happens lazily inside `ensureActiveMemoryThread()` once
-    // the rotation cleared the in-memory pointer.
+    // the rotation cleared the in-memory pointer. Tau-5 also clears
+    // the starter-offered guard so a fresh thread is eligible for a
+    // proactive starter.
     const nowMs = this.clock();
     if (
       this.activeMemoryThreadId &&
@@ -425,6 +474,7 @@ export class OperatorChatService {
       nowMs - this.lastInteractionAt > this.sessionTtlMs
     ) {
       this.activeMemoryThreadId = undefined;
+      this.starterOfferedForThreadId = undefined;
     }
 
     const operatorMessage: OperatorChatMessage = {
@@ -495,6 +545,20 @@ export class OperatorChatService {
     // surface, holding the no-new-outbound-surface invariant.
     const parsedGrammar = await this.runGrammarParse(filterResult.filtered);
 
+    // WP-V1.3-9 Tau-5: read the agent-context cache snapshot once for
+    // this round-trip. Synchronous accessor; returns [] until the
+    // cache's first refresh resolves or after a refresh failure left
+    // the cache empty. The fold + section render happen below.
+    const agentSnapshots: AgentContextSnapshot[] = this.agentContextCache
+      ? this.agentContextCache.read()
+      : [];
+    const agentStateSection = this.agentContextCache
+      ? formatCurrentAgentStateSection(agentSnapshots, {
+          maxTokens: this.agentStateBudget,
+        })
+      : "";
+    const renderedAgentCount = agentStateSection ? agentSnapshots.length : 0;
+
     const start = Date.now();
     let conciergeBody: string;
     let servedBy: SubstrateChoice = "disabled";
@@ -525,6 +589,7 @@ export class OperatorChatService {
           const context = await this.assembleConciergeContext(
             priorTurns,
             dynamicResult.section,
+            agentStateSection,
           );
           const response = await this.substrateSelector.invokeSummarize(
             "concierge",
@@ -613,6 +678,9 @@ export class OperatorChatService {
         ? { dynamic_context_categories: [...dynamicCategoriesIncluded] }
         : {}),
       parsed_grammar: auditSafeSummary(parsedGrammar),
+      ...(this.agentContextCache !== undefined
+        ? { agent_context_snapshot_count: renderedAgentCount }
+        : {}),
     };
     this.emit(OPERATOR_CHAT_OPS.CONCIERGE_CHAT, payload, outcome === "ok" ? "success" : "failure");
 
@@ -742,6 +810,7 @@ export class OperatorChatService {
 
     if (this.activeMemoryThreadId === threadId) {
       this.activeMemoryThreadId = undefined;
+      this.starterOfferedForThreadId = undefined;
     }
 
     const payload: OperatorConciergeThreadDeletedPayload = {
@@ -762,9 +831,69 @@ export class OperatorChatService {
    * Reset the active session memory thread. Subsequent sendConcierge
    * calls allocate a fresh thread_id. Surfaced for tests + future "new
    * conversation" affordance; not currently called by the dashboard.
+   *
+   * Tau-5: also clears the proactive-starter guard so the next
+   * `getProactiveStarter()` call against the freshly-allocated thread
+   * is eligible to fire.
    */
   resetConciergeMemoryThread(): void {
     this.activeMemoryThreadId = undefined;
+    this.starterOfferedForThreadId = undefined;
+  }
+
+  /**
+   * WP-V1.3-9 Tau-5: surface a proactive starter for the current
+   * concierge session. Intended to be called by the dashboard UI when
+   * the operator opens the chat surface, before any operator typing.
+   *
+   * Returns null when:
+   * - No agent-context cache is wired (Tau-5 disabled).
+   * - No concierge memory store is wired (no thread_id namespace).
+   * - The cache snapshot has no signal (empty fortress).
+   * - A starter has already been offered for the active thread (the
+   *   guard ensures one starter per fresh thread).
+   *
+   * Side effects:
+   * - Allocates a fresh thread_id if none is active.
+   * - Emits the `operator_concierge_proactive_suggestion_offered`
+   *   audit event with the trigger class + triggered_agents_count.
+   * - Records the offered thread_id so the next call within the same
+   *   thread is a no-op.
+   *
+   * The returned starter's `text` is operator-visible copy; the
+   * dashboard renders it as a system-message-style starter the
+   * operator can accept (clicks/types follow-up) or dismiss (types a
+   * new query).
+   */
+  getProactiveStarter(): ConciergeProactiveStarter | null {
+    if (!this.agentContextCache) return null;
+    if (!this.memory) return null;
+
+    const threadId = this.ensureActiveMemoryThread();
+    if (this.starterOfferedForThreadId === threadId) return null;
+
+    const snapshots = this.agentContextCache.read();
+    const starter = generateProactiveStarter(snapshots);
+    if (!starter) return null;
+
+    const payload: OperatorConciergeProactiveSuggestionOfferedPayload = {
+      version: "1.2",
+      event_id: makeEventId("conc-starter"),
+      emitted_at: new Date().toISOString(),
+      identity_id: this.identityId,
+      kind: "operator_concierge_proactive_suggestion_offered",
+      surface: "concierge",
+      thread_id: threadId,
+      trigger: starter.trigger,
+      triggered_agents_count: starter.triggered_agents_count,
+    };
+    this.emit(
+      OPERATOR_CHAT_OPS.CONCIERGE_PROACTIVE_SUGGESTION_OFFERED,
+      payload,
+      "success",
+    );
+    this.starterOfferedForThreadId = threadId;
+    return starter;
   }
 
   private ensureActiveMemoryThread(): string {
@@ -814,14 +943,24 @@ export class OperatorChatService {
   private async assembleConciergeContext(
     priorTurns: ConciergeTurn[] = [],
     dynamicSection = "",
+    agentStateSection = "",
   ): Promise<string> {
     const ref = `## Sanctuary reference\n${SANCTUARY_DOMAIN_REFERENCE}`;
     const priorSection = this.formatPriorTurnsSection(priorTurns);
 
+    // WP-V1.3-9 Tau-5: agent-state section sits BETWEEN the Tau-3
+    // dynamic-context fold and the Tau-2 prior-conversation fold.
+    // Order is intentional: dynamic categories first (what live data
+    // matches the operator's query), then current agent state (the
+    // proactive snapshot), then prior conversation (multi-turn
+    // coherence). Smaller local models parse the structured
+    // boundaries cleanly when the prompt walks fortress -> agents ->
+    // history in that order.
     if (!this.contextProviders) {
       return [
         ref,
         ...(dynamicSection ? [dynamicSection] : []),
+        ...(agentStateSection ? [agentStateSection] : []),
         ...(priorSection ? [priorSection] : []),
         "## Recent activity\n(no providers wired)",
         "## Wrapped agents\n(no providers wired)",
@@ -836,6 +975,7 @@ export class OperatorChatService {
     return [
       ref,
       ...(dynamicSection ? [dynamicSection] : []),
+      ...(agentStateSection ? [agentStateSection] : []),
       ...(priorSection ? [priorSection] : []),
       `## Recent activity\n${activity}`,
       `## Wrapped agents\n${agents}`,
