@@ -55,6 +55,16 @@ export const HUB_ROUTES = {
   CHAT_CONCIERGE_SEND: "/api/hub/chat/concierge",
   CHAT_CONCIERGE_HISTORY: "/api/hub/chat/concierge/history",
   /**
+   * Concierge memory thread routes (WP-V1.3-9 Tau-1). Thread enumeration,
+   * scrollback, and operator-initiated thread delete. Distinct from the
+   * v1.2 `/history` route, which surfaces the active in-session thread
+   * shape; the new routes target persisted multi-thread memory used by
+   * v1.3 conversational sovereignty depth.
+   */
+  CHAT_CONCIERGE_THREADS_LIST: "/api/hub/chat/concierge/threads",
+  CHAT_CONCIERGE_THREAD_READ: "/api/hub/chat/concierge/threads/:thread_id",
+  CHAT_CONCIERGE_THREAD_DELETE: "/api/hub/chat/concierge/threads/:thread_id",
+  /**
    * Click-to-inspect panel (WP-V1.2 reshape). Returns the agent's
    * recent activity feed, pending Tier 1 approvals routed through this
    * agent, and policy summary. Replaces the `/api/hub/chat/agents/:id/
@@ -121,6 +131,18 @@ export type HubTier1AgentControlAction =
  */
 export const HUB_ACTIVITY_DEFAULT_LIMIT = 50;
 export const HUB_ACTIVITY_MAX_LIMIT = 500;
+
+/**
+ * Default + max page size for concierge thread enumeration (WP-V1.3-9).
+ */
+export const HUB_CHAT_THREADS_DEFAULT_LIMIT = 50;
+export const HUB_CHAT_THREADS_MAX_LIMIT = 500;
+
+/**
+ * Default + max page size for per-thread turn read.
+ */
+export const HUB_CHAT_TURNS_DEFAULT_LIMIT = 200;
+export const HUB_CHAT_TURNS_MAX_LIMIT = 1000;
 
 /**
  * Default + max inbox-list page size.

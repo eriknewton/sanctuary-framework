@@ -31,6 +31,10 @@ import {
   HUB_AGENTS_DEFAULT_LIMIT,
   HUB_AGENTS_MAX_LIMIT,
   HUB_CHAT_MESSAGE_MAX_CHARS,
+  HUB_CHAT_THREADS_DEFAULT_LIMIT,
+  HUB_CHAT_THREADS_MAX_LIMIT,
+  HUB_CHAT_TURNS_DEFAULT_LIMIT,
+  HUB_CHAT_TURNS_MAX_LIMIT,
   HUB_FORTRESS_AGENT_ID_SENTINEL,
   HUB_INBOX_ACTIONS,
   HUB_INBOX_DEFAULT_LIMIT,
@@ -163,6 +167,37 @@ function checkChatMessage(value: unknown): string {
     );
   }
   return trimmed;
+}
+
+/**
+ * Match `/api/hub/chat/concierge/threads/<thread_id>` (WP-V1.3-9 Tau-1).
+ * Returns null if the path does not match the expected shape, including
+ * a missing or empty thread_id.
+ */
+function matchConciergeThreadRoute(
+  path: string,
+): { threadId: string } | null {
+  const prefix = `${HUB_API_PREFIX}/chat/concierge/threads/`;
+  if (!path.startsWith(prefix)) return null;
+  const rest = path.slice(prefix.length);
+  if (rest.length === 0 || rest.includes("/")) return null;
+  const decoded = decodeURIComponent(rest);
+  if (decoded.length === 0) return null;
+  return { threadId: decoded };
+}
+
+/**
+ * Parse the optional `?since=N` query param for the concierge memory
+ * read route. Throws HubValidationError on a non-integer / negative
+ * value; returns undefined when absent.
+ */
+function parseSince(raw: string | null): number | undefined {
+  if (raw === null || raw === "") return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    throw new HubValidationError("since must be a non-negative integer");
+  }
+  return parsed;
 }
 
 /**
@@ -451,6 +486,54 @@ export async function handleHubRoute(
       const messages = await deps.service.getConciergeHistory();
       writeJSON(res, 200, { ok: true, data: { messages } });
       return true;
+    }
+
+    // ── GET /api/hub/chat/concierge/threads ──────────────────────
+    if (
+      method === "GET" &&
+      path === HUB_ROUTES.CHAT_CONCIERGE_THREADS_LIST
+    ) {
+      const limit = parseLimit(
+        url.searchParams.get("limit"),
+        HUB_CHAT_THREADS_DEFAULT_LIMIT,
+        HUB_CHAT_THREADS_MAX_LIMIT,
+      );
+      const threads = await deps.service.listConciergeMemoryThreads({ limit });
+      writeJSON(res, 200, { ok: true, data: { threads } });
+      return true;
+    }
+
+    // ── GET / DELETE /api/hub/chat/concierge/threads/:thread_id ──
+    {
+      const threadMatch = matchConciergeThreadRoute(path);
+      if (threadMatch) {
+        if (method === "GET") {
+          const since = parseSince(url.searchParams.get("since"));
+          const limit = parseLimit(
+            url.searchParams.get("limit"),
+            HUB_CHAT_TURNS_DEFAULT_LIMIT,
+            HUB_CHAT_TURNS_MAX_LIMIT,
+          );
+          const readOpts: { sinceTurnId?: number; limit: number } = { limit };
+          if (since !== undefined) readOpts.sinceTurnId = since;
+          const turns = await deps.service.readConciergeMemoryThread(
+            threadMatch.threadId,
+            readOpts,
+          );
+          writeJSON(res, 200, { ok: true, data: { turns } });
+          return true;
+        }
+        if (method === "DELETE") {
+          const removed = await deps.service.deleteConciergeMemoryThread(
+            threadMatch.threadId,
+          );
+          writeJSON(res, removed ? 200 : 404, {
+            ok: removed,
+            data: { thread_id: threadMatch.threadId, removed },
+          });
+          return true;
+        }
+      }
     }
 
     // No hub route matched.

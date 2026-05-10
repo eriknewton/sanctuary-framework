@@ -63,6 +63,12 @@ import type {
   ConciergeResponse,
   OperatorChatMessage,
 } from "../chat/operator-chat-types.js";
+import type {
+  ConciergeThreadSummary,
+  ConciergeTurn,
+  ListThreadsOptions,
+  ReadThreadOptions,
+} from "../chat/concierge-memory-store.js";
 
 function isTier1ControlAction(
   action: HubAgentControlAction,
@@ -726,6 +732,46 @@ export class HubService {
   async getConciergeHistory(): Promise<OperatorChatMessage[]> {
     const chat = this.requireOperatorChat();
     return chat.getConciergeHistory();
+  }
+
+  // ── Concierge memory threads (WP-V1.3-9 Tau-1) ─────────────────────
+
+  /**
+   * Whether the operator-chat service has the WP-V1.3-9 memory store
+   * wired. Routes use this to 503 cleanly when the foundation memory
+   * surface is unavailable on a given fortress.
+   */
+  hasConciergeMemory(): boolean {
+    return Boolean(this.deps.operatorChat?.hasConciergeMemory());
+  }
+
+  async listConciergeMemoryThreads(
+    opts?: ListThreadsOptions,
+  ): Promise<ConciergeThreadSummary[]> {
+    const chat = this.requireOperatorChat();
+    if (!chat.hasConciergeMemory()) {
+      throw new HubCapabilityError("concierge_memory_not_wired");
+    }
+    return chat.listConciergeMemoryThreads(opts);
+  }
+
+  async readConciergeMemoryThread(
+    threadId: string,
+    opts?: ReadThreadOptions,
+  ): Promise<ConciergeTurn[]> {
+    const chat = this.requireOperatorChat();
+    if (!chat.hasConciergeMemory()) {
+      throw new HubCapabilityError("concierge_memory_not_wired");
+    }
+    return chat.readConciergeMemoryThread(threadId, opts);
+  }
+
+  async deleteConciergeMemoryThread(threadId: string): Promise<boolean> {
+    const chat = this.requireOperatorChat();
+    if (!chat.hasConciergeMemory()) {
+      throw new HubCapabilityError("concierge_memory_not_wired");
+    }
+    return chat.deleteConciergeMemoryThread(threadId);
   }
 
   /**

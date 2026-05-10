@@ -51,6 +51,13 @@ export interface PrincipalPolicy {
   tier3_always_allow: string[];
   /** How approval requests reach the human */
   approval_channel: ApprovalChannelConfig;
+  /**
+   * WP-V1.3-9 Tau-1: operator-tunable retention window (days) for the
+   * concierge memory store. Per-turn `retention_until` is stamped at
+   * append time; cocoon-unlock pruning drops expired turns. Default 30
+   * days when absent; values <= 0 fall back to the default.
+   */
+  concierge_memory_retention_days?: number;
 }
 
 /** Approval request sent to the human */
