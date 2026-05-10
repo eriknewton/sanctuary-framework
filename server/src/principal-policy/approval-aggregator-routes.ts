@@ -13,6 +13,8 @@
  * Routes:
  *   GET    /api/approval-inbox                       (list pending entries)
  *   GET    /api/approval-inbox/history               (list resolved entries; Upsilon-3)
+ *   GET    /api/approval-inbox/revision              (current revision int; Upsilon-4)
+ *   GET    /api/approval-inbox/sync                  (delta since revision; Upsilon-4)
  *   GET    /api/approval-inbox/stream                (SSE stream of new entries)
  *   GET    /api/approval-inbox/:aggregator_id        (full detail incl. payload)
  *   GET    /api/approval-inbox/:aggregator_id/audit-trail  (Upsilon-3)
@@ -24,7 +26,9 @@
  * Castle Wall egress filter (Layer 1) still binds. The aggregator is a
  * Layer 3 cooperative-MCP surface. Replay routes added in Upsilon-3 are
  * read-only and add no new decision authority; kernel-filter
- * enforcement is preserved.
+ * enforcement is preserved. Sync + revision routes added in Upsilon-4
+ * are similarly read-only; they exist for the v1.4 mobile companion to
+ * poll cheap deltas without re-fetching the full list.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -191,6 +195,35 @@ export async function handleApprovalInboxRoute(
       path === `${APPROVAL_INBOX_API_PREFIX}/stream`
     ) {
       await handleStream(deps, res);
+      return true;
+    }
+
+    // GET /api/approval-inbox/revision (Upsilon-4, must precede :id match)
+    if (
+      method === "GET" &&
+      path === `${APPROVAL_INBOX_API_PREFIX}/revision`
+    ) {
+      const revision = await deps.aggregator.getRevision();
+      writeJSON(res, 200, { ok: true, data: { revision } });
+      return true;
+    }
+
+    // GET /api/approval-inbox/sync (Upsilon-4, must precede :id match)
+    if (
+      method === "GET" &&
+      path === `${APPROVAL_INBOX_API_PREFIX}/sync`
+    ) {
+      const sinceRaw = url.searchParams.get("since_revision");
+      const sinceParsed = sinceRaw === null ? 0 : Number.parseInt(sinceRaw, 10);
+      const sinceRevision =
+        Number.isFinite(sinceParsed) && sinceParsed >= 0 ? sinceParsed : 0;
+      const limit = parseLimit(
+        url.searchParams.get("limit"),
+        APPROVAL_INBOX_DEFAULT_LIMIT,
+        APPROVAL_INBOX_MAX_LIMIT,
+      );
+      const delta = await deps.aggregator.getSync({ sinceRevision, limit });
+      writeJSON(res, 200, { ok: true, data: delta });
       return true;
     }
 
