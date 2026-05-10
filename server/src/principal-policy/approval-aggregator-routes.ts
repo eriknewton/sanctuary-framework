@@ -1,5 +1,5 @@
 /**
- * Sanctuary v1.3 WP-V1.3-10 Cross-Harness Approval Inbox Upsilon-1
+ * Sanctuary v1.3 WP-V1.3-10 Cross-Harness Approval Inbox
  *
  * HTTP route surface for the unified approval inbox. Mirrors the hub
  * api-router shape so dashboard glue can wire the aggregator alongside
@@ -12,15 +12,19 @@
  *
  * Routes:
  *   GET    /api/approval-inbox                       (list pending entries)
+ *   GET    /api/approval-inbox/history               (list resolved entries; Upsilon-3)
+ *   GET    /api/approval-inbox/stream                (SSE stream of new entries)
  *   GET    /api/approval-inbox/:aggregator_id        (full detail incl. payload)
+ *   GET    /api/approval-inbox/:aggregator_id/audit-trail  (Upsilon-3)
+ *   GET    /api/approval-inbox/:aggregator_id/payload      (Upsilon-3)
  *   POST   /api/approval-inbox/:aggregator_id/approve
  *   POST   /api/approval-inbox/:aggregator_id/deny
- *   GET    /api/approval-inbox/stream                (SSE stream of new entries)
  *
  * No new outbound network surface. All routes are operator-local; the
  * Castle Wall egress filter (Layer 1) still binds. The aggregator is a
- * Layer 3 cooperative-MCP surface; this Upsilon-1 PR ships the routing
- * substrate; per-harness adapter approval-redirect mode is Upsilon-2.
+ * Layer 3 cooperative-MCP surface. Replay routes added in Upsilon-3 are
+ * read-only and add no new decision authority; kernel-filter
+ * enforcement is preserved.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -190,6 +194,35 @@ export async function handleApprovalInboxRoute(
       return true;
     }
 
+    // GET /api/approval-inbox/history (Upsilon-3, must precede :id match)
+    if (
+      method === "GET" &&
+      path === `${APPROVAL_INBOX_API_PREFIX}/history`
+    ) {
+      const limit = parseLimit(
+        url.searchParams.get("limit"),
+        APPROVAL_INBOX_DEFAULT_LIMIT,
+        APPROVAL_INBOX_MAX_LIMIT,
+      );
+      const statusRaw = url.searchParams.get("status");
+      const sinceTs = url.searchParams.get("since") ?? undefined;
+      const operatorId = deps.operatorId ?? APPROVAL_INBOX_OPERATOR_DEFAULT;
+      const filterStatus =
+        statusRaw && isStatusFilter(statusRaw) && statusRaw !== "pending"
+          ? statusRaw
+          : undefined;
+      const entries = await deps.aggregator.getHistory(
+        {
+          limit,
+          ...(filterStatus !== undefined ? { status: filterStatus } : {}),
+          ...(sinceTs !== undefined ? { sinceTs } : {}),
+        },
+        operatorId,
+      );
+      writeJSON(res, 200, { ok: true, data: { entries } });
+      return true;
+    }
+
     // GET /api/approval-inbox
     if (method === "GET" && path === APPROVAL_INBOX_API_PREFIX) {
       const limit = parseLimit(
@@ -216,12 +249,44 @@ export async function handleApprovalInboxRoute(
       return true;
     }
 
+    // GET /api/approval-inbox/:id/audit-trail (Upsilon-3)
+    if (method === "GET" && entryMatch.action === "audit-trail") {
+      const entry = await deps.aggregator.getEntry(entryMatch.aggregatorId);
+      if (!entry) {
+        writeJSON(res, 404, { ok: false, error: "not_found" });
+        return true;
+      }
+      const operatorId = deps.operatorId ?? APPROVAL_INBOX_OPERATOR_DEFAULT;
+      const trail = await deps.aggregator.getAuditTrail(
+        entryMatch.aggregatorId,
+        operatorId,
+      );
+      writeJSON(res, 200, { ok: true, data: { entry, audit_trail: trail } });
+      return true;
+    }
+
+    // GET /api/approval-inbox/:id/payload (Upsilon-3)
+    if (method === "GET" && entryMatch.action === "payload") {
+      const entry = await deps.aggregator.getEntry(entryMatch.aggregatorId);
+      if (!entry) {
+        writeJSON(res, 404, { ok: false, error: "not_found" });
+        return true;
+      }
+      const operatorId = deps.operatorId ?? APPROVAL_INBOX_OPERATOR_DEFAULT;
+      const payload = await deps.aggregator.getFullPayloadWithAudit(
+        entryMatch.aggregatorId,
+        operatorId,
+      );
+      writeJSON(res, 200, {
+        ok: true,
+        data: { entry, request_payload: payload },
+      });
+      return true;
+    }
+
     // GET /api/approval-inbox/:id
     if (method === "GET" && entryMatch.action === null) {
-      const entries = await deps.aggregator.list({ limit: APPROVAL_INBOX_MAX_LIMIT });
-      const entry = entries.find(
-        (e) => e.aggregator_id === entryMatch.aggregatorId,
-      );
+      const entry = await deps.aggregator.getEntry(entryMatch.aggregatorId);
       if (!entry) {
         writeJSON(res, 404, { ok: false, error: "not_found" });
         return true;

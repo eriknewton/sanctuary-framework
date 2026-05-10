@@ -31,6 +31,7 @@ import {
   AggregatorBackedChannel,
   makeRedirectResolverFromPolicySupplier,
 } from "./principal-policy/channels/aggregator-backed-channel.js";
+import { AggregatorPayloadStore } from "./principal-policy/aggregator-store.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
@@ -736,12 +737,22 @@ export async function createSanctuaryServer(options?: {
   const fortressIdForAggregator = fortressIdFromStoragePath(config.storage_path);
   const aggregatorIdentityId =
     identityManager.getPrimaryIdentityId() ?? `fortress:${config.storage_path}`;
+  // v1.3 WP-V1.3-10 Upsilon-3: at-rest payload persistence so the operator
+  // can replay full request payloads after a server restart. AAD-bound to
+  // aggregator_id; isolated per fortress via the master-key-derived HKDF
+  // subkey. Default 30-day retention mirrors the audit-log envelope.
+  const aggregatorPayloadStore = new AggregatorPayloadStore({
+    storage,
+    masterKey,
+    fortressId: fortressIdForAggregator,
+  });
   const approvalAggregator = new ApprovalAggregator({
     storage,
     masterKey,
     auditLog,
     identityId: aggregatorIdentityId,
     fortressId: fortressIdForAggregator,
+    payloadStore: aggregatorPayloadStore,
   });
 
   // v1.3 WP-V1.3-10 Upsilon-2: wrap the approval channel with the
