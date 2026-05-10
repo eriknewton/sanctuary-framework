@@ -308,9 +308,11 @@ export async function runWrap(
       try {
         await mkdir(dirname(canonicalPath), { recursive: true, mode: 0o700 });
         await writeFile(canonicalPath, "{}", { mode: 0o600 });
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `\n  No existing ${platformHint} config found.`
         );
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Bootstrapped a fresh config at ${canonicalPath}.\n`
         );
@@ -320,9 +322,11 @@ export async function runWrap(
         );
         agentConfig = detection.config;
       } catch (err) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `\n  Sanctuary: could not bootstrap ${platformHint} config at ${canonicalPath}`
         );
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`  Error: ${(err as Error).message}\n`);
         process.exit(1);
       }
@@ -330,8 +334,10 @@ export async function runWrap(
   }
 
   if (!agentConfig) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`\n  Sanctuary: Configuration Not Found\n`);
     if (platformHint) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`  Could not find ${platformHint} configuration.`);
     } else if (options.wrap) {
       console.error(`  Could not read config file: ${options.wrap}`);
@@ -342,12 +348,15 @@ export async function runWrap(
       );
     }
     if (detection.pathsChecked.length > 0) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Paths checked:`);
       for (const p of detection.pathsChecked) console.error(`    ${p}`);
     }
     if (detection.errors.length > 0) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Errors encountered:`);
       for (const e of detection.errors) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`    ${e.path}: ${e.error}`);
       }
     }
@@ -364,34 +373,41 @@ export async function runWrap(
     agentConfig.platform
   );
   if (hasSanctuaryInRaw) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `\n  Sanctuary already wrapped: updating the existing Sanctuary entry.\n`
     );
   } else if (agentConfig.servers.length === 0) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `\n  Found ${agentConfig.platform} config at ${agentConfig.configPath} with no MCP servers yet.`
     );
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `  Sanctuary will be installed as the only MCP server.\n`
     );
   }
 
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`\n  Sanctuary wrap`);
   console.error(`  Platform: ${agentConfig.platform}`);
   console.error(`  Config: ${agentConfig.configPath}`);
 
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `  ${formatMcpServerCount(agentConfig.servers.length, hasSanctuaryInRaw)}`
   );
 
   const upstreamServers = convertToUpstreamServers(agentConfig.servers);
   for (const server of upstreamServers) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `    → ${server.name} (${server.transport.type}, tier ${server.default_tier})`
     );
   }
 
   if (options.dryRun) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`\n  Dry run. No changes made.\n`);
     return;
   }
@@ -425,13 +441,16 @@ export async function runWrap(
       passphraseLocation = persisted.location;
       passphraseSource = persisted.source;
       passphraseValue = options.passphrase;
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `\n  \u{1F510} Persisted user-supplied passphrase (${persisted.location}).`
       );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `  Back up with: sanctuary export-passphrase`
       );
     } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Sanctuary: Passphrase Persistence Failed`);
       console.error(`  ${(err as Error).message}`);
       console.error("");
@@ -451,15 +470,18 @@ export async function runWrap(
       passphraseSource = resolved.source;
       passphraseValue = resolved.value;
       if (resolved.source === "generated") {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `\n  \u{1F510} Generated and stored passphrase (${resolved.location}).`
         );
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Back up with: sanctuary export-passphrase`
         );
       }
     } catch (err) {
       if (err instanceof PassphraseUnreadableError) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`\n  Sanctuary: Passphrase Unreadable`);
         console.error(`  ${err.message}\n`);
         process.exit(2);
@@ -479,6 +501,7 @@ export async function runWrap(
   const isFallbackUserProvided =
     passphraseSource === "fallback-file" && usingFallback;
   if (isFallbackGenerated || (options.passphrase && isFallbackUserProvided)) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `\n  \u26A0  Passphrase stored in encrypted fallback file (machine-local key).` +
       `\n     This is protected only against off-machine access. On macOS, Sanctuary` +
@@ -514,6 +537,7 @@ export async function runWrap(
           err instanceof PassphraseConfirmationDeclinedError ||
           err instanceof PassphraseConfirmationNonInteractiveError
         ) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
           console.error(`\n  Sanctuary wrap: ${err.message}\n`);
           process.exit(2);
         }
@@ -629,10 +653,12 @@ export async function runWrap(
         });
       const allowResult = await allowFn({});
       if (allowResult.alreadyPresent) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Sanctuary broker tool allowlist already present at ${allowResult.installedAt}. No change.`,
         );
       } else {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Sanctuary broker tool allowlist updated at ${allowResult.installedAt} ` +
             `(${allowResult.added.length} ${allowResult.added.length === 1 ? "entry" : "entries"} added; ` +
@@ -640,6 +666,7 @@ export async function runWrap(
         );
       }
     } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `  Note: broker tool allowlist write failed (${(err as Error).message}). ` +
           `Wrap is otherwise complete; Claude Code will prompt to approve ` +
@@ -676,6 +703,7 @@ export async function runWrap(
       }),
     );
   } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `  Note: v1.1 hub agent record not persisted ` +
         `(${(err as Error).message}). ` +
@@ -800,6 +828,7 @@ export async function runWrap(
           });
         }
       } catch (err) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Note: default identity not created at wrap time ` +
             `(${(err as Error).message}).`,
@@ -823,6 +852,7 @@ export async function runWrap(
       } catch (err) {
         intelligenceHealthy = false;
         intelligenceError = (err as Error).message;
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Note: Intelligence panel unavailable on wrap URL ` +
             `(${(err as Error).message}).`,
@@ -855,6 +885,7 @@ export async function runWrap(
       // auto-auth keeps the v1.1 client one-click from the URL.
       dashboard.setV11LoopbackAutoAuth(true);
     } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `  Note: v1.1 dashboard surfaces unavailable on wrap URL ` +
           `(${(err as Error).message}). ` +
@@ -922,6 +953,7 @@ export async function runWrap(
 
 /** Backward-compat alias for the old function name. */
 export async function runCocoon(options: CocoonOptions): Promise<void> {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `\n  Note: \`cocoon\` is renamed to \`wrap\`. Use \`sanctuary wrap\` next time.\n`
   );
@@ -947,6 +979,7 @@ export async function startDashboardWithFallback(
         serverVersion,
       });
       if (port !== preferredPort) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Port ${preferredPort} was unavailable. Dashboard bound to ${port}.`
         );
@@ -1051,6 +1084,7 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
 }
 
 function printWrapSuccess(info: WrapSuccessInfo): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(formatWrapSuccess(info));
 }
 
@@ -1111,6 +1145,7 @@ export function formatWrapSuccessNoDashboard(
 function printWrapSuccessNoDashboard(
   info: WrapSuccessNoDashboardInfo,
 ): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(formatWrapSuccessNoDashboard(info));
 }
 
@@ -1126,6 +1161,7 @@ async function verifyRewrittenConfig(
     try {
       parsed = JSON.parse(raw);
     } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Verification FAILED: Rewritten config is not valid JSON.`);
       console.error(`  Error: ${(err as Error).message}`);
       await restoreFromBackup(configPath, backupPath);
@@ -1139,6 +1175,7 @@ async function verifyRewrittenConfig(
       {};
 
     if (!servers.sanctuary) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Verification FAILED: No sanctuary entry in rewritten config.`);
       await restoreFromBackup(configPath, backupPath);
       return false;
@@ -1146,6 +1183,7 @@ async function verifyRewrittenConfig(
 
     const sanctuaryEntry = servers.sanctuary as Record<string, unknown>;
     if (!sanctuaryEntry.command || typeof sanctuaryEntry.command !== "string") {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Verification FAILED: Sanctuary entry has no command.`);
       await restoreFromBackup(configPath, backupPath);
       return false;
@@ -1153,6 +1191,7 @@ async function verifyRewrittenConfig(
 
     return true;
   } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`\n  Verification FAILED: ${(err as Error).message}`);
     await restoreFromBackup(configPath, backupPath);
     return false;
@@ -1165,12 +1204,14 @@ async function restoreFromBackup(
 ): Promise<void> {
   try {
     await restoreConfig(backupPath, configPath);
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`  Original config restored from backup.`);
     console.error(`  Backup preserved at: ${backupPath}\n`);
   } catch (restoreErr) {
     console.error(
       `  CRITICAL: Could not restore backup from ${backupPath}`
     );
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`  Error: ${(restoreErr as Error).message}`);
     console.error(`  Manual recovery: copy ${backupPath} to ${configPath}\n`);
   }
@@ -1181,6 +1222,7 @@ async function restoreFromBackup(
 async function unwrap(): Promise<void> {
   const meta = await findLatestBackup();
   if (!meta) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("No Sanctuary wrap found to restore.");
     console.error("Run `sanctuary wrap --openclaw` first.");
     process.exit(1);
@@ -1189,11 +1231,13 @@ async function unwrap(): Promise<void> {
   try {
     await access(meta.backupPath);
   } catch {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`Backup file not found: ${meta.backupPath}`);
     process.exit(1);
   }
 
   await restoreConfig(meta.backupPath, meta.originalPath);
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`\n  Sanctuary: Unwrapped`);
   console.error(`  Original config restored to: ${meta.originalPath}`);
   console.error(`  Backup preserved at: ${meta.backupPath}\n`);
@@ -1484,6 +1528,7 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
 export const parseCocoonArgs = parseWrapArgs;
 
 function printWrapHelp(): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.log(`
   sanctuary wrap. Wrap any agent in Sanctuary protection.
 

@@ -511,6 +511,7 @@ export async function loadPrincipalPolicy(
         await writeFile(policyPath, defaultYaml, "utf-8");
         await chmod(policyPath, 0o600);
       } catch (writeErr) {
+        // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
         console.warn(
           `Sanctuary: could not write default principal policy to ${policyPath}: ` +
             `${(writeErr as Error).message}. Continuing with in-memory default.`

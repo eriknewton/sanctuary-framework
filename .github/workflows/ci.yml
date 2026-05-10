@@ -46,6 +46,15 @@ jobs:
         working-directory: server
         run: npm run typecheck
 
+      - name: Console-discipline gate (no unannotated console.* in src/)
+        working-directory: server
+        # Closes full-sweep #97. Asserts every console.log/warn/error/etc.
+        # in non-test TypeScript under server/src/ is either annotated with
+        # a `// SAFETY:` comment or lives inside a template literal
+        # (browser-side JS embedded in HTML). Doc:
+        # server/docs/logging-discipline.md.
+        run: npx vite-node scripts/check-no-raw-console.ts
+
       - name: Build (populates dist/templates for tarball tests)
         working-directory: server
         run: npm run build

@@ -209,6 +209,7 @@ NOT LEGAL ADVICE
   Regulation (EU) 2024/1689. Consult qualified legal counsel before
   filing or relying on the bundle for regulatory submission.
 `.trim();
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.log(help);
 }
 
@@ -239,6 +240,7 @@ export async function runCompliance(args: string[]): Promise<void> {
   try {
     opts = parseArgs(args);
   } catch (e) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`Error: ${(e as Error).message}`);
     console.error("");
     printHelp();
@@ -255,6 +257,7 @@ export async function runCompliance(args: string[]): Promise<void> {
   const periodEnd = opts.periodEnd ?? period.end;
   const outputDir = opts.output ?? defaultOutputDir();
 
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     "[sanctuary compliance] Starting Sanctuary server instance..."
   );
@@ -263,6 +266,7 @@ export async function runCompliance(args: string[]): Promise<void> {
       passphrase: opts.passphrase ?? process.env.SANCTUARY_PASSPHRASE,
     });
 
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `[sanctuary compliance] Generating EU AI Act bundle for ${opts.agentDid}...`
   );
@@ -314,63 +318,80 @@ export async function runCompliance(args: string[]): Promise<void> {
 
   // Print summary to stderr so downstream pipelines can capture the
   // output directory path from stdout if desired.
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("");
   console.error(
     "[sanctuary compliance] Bundle generation complete."
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("");
   console.error(`  Output directory: ${outputDir}`);
   console.error(`  Bundle version:   ${bundle.manifest.bundle_version}`);
   console.error(
     `  Matrix version:   ${bundle.manifest.matrix_version}`
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `  Regulation:       ${bundle.manifest.regulation_version}`
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `  Agent DID:        ${bundle.manifest.agent_did}`
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `  Reporting period: ${bundle.manifest.period_start} → ${bundle.manifest.period_end}`
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `  Signer DID:       ${bundle.manifest.signer.did}`
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `  Files generated:  ${bundle.files.length + 1} (6 Markdown + 1 manifest)`
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("");
   console.error("  Coverage summary:");
   console.error(
     `    full:        ${bundle.manifest.coverage_summary.full} rows (${bundle.manifest.coverage_summary.full_pct}%)`
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `    partial:     ${bundle.manifest.coverage_summary.partial} rows (${bundle.manifest.coverage_summary.partial_pct}%)`
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `    manual_only: ${bundle.manifest.coverage_summary.manual_only} rows (${bundle.manifest.coverage_summary.manual_only_pct}%)`
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("");
   console.error(
     `  Unfilled [MANUAL INPUT REQUIRED] markers: ${totalManualMarkers}`
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     "  Review each marker and replace with the relevant enterprise fact."
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("");
   if (pdfPath) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("");
     console.error(`  PDF render:       ${pdfPath}`);
   }
 
   if (bundle.publish_result) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("");
     console.error("  Verascore publish:");
     if (bundle.publish_result.published) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `    ✓ published to ${bundle.publish_result.verascore_url} as ${bundle.publish_result.verascore_agent_id}`
       );
     } else {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`    ✗ publish failed: ${bundle.publish_result.error}`);
       console.error(
         `    (bundle has been written to disk regardless — this is a pure side effect)`
@@ -378,12 +399,15 @@ export async function runCompliance(args: string[]): Promise<void> {
     }
   }
 
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("");
   console.error(
     "  NOT LEGAL ADVICE. Consult qualified legal counsel before filing."
   );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("");
 
   // Stdout: just the output directory path (for scripting).
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.log(outputDir);
 }

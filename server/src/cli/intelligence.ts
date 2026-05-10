@@ -27,12 +27,14 @@ export async function runIntelligenceCommand(
     return 0;
   }
 
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`Unknown intelligence subcommand: ${subcommand}`);
   printHelp();
   return 2;
 }
 
 function printHelp(): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`
 Usage: sanctuary intelligence <subcommand>
 
@@ -49,6 +51,7 @@ async function runDiagnose(): Promise<number> {
       `${process.env.HOME}/.sanctuary`,
   );
 
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`Intelligence substrate diagnostics`);
   console.error(`Fortress: ${storagePath}`);
   console.error("");
@@ -56,15 +59,19 @@ async function runDiagnose(): Promise<number> {
   // Check for intelligence config in the state directory
   const intelligenceDir = resolve(storagePath, "state", "_intelligence");
   if (!existsSync(intelligenceDir)) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `No intelligence config directory found at ${intelligenceDir}.`,
     );
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       "Intelligence substrate may not have been initialized yet.",
     );
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       "Ensure at least one substrate API key is set in your environment:",
     );
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       "  ANTHROPIC_API_KEY, OPENAI_API_KEY, VENICE_API_KEY, or OLLAMA_HOST",
     );
@@ -74,8 +81,10 @@ async function runDiagnose(): Promise<number> {
   // List intelligence config files
   try {
     const entries = readdirSync(intelligenceDir);
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`Intelligence config entries: ${entries.length}`);
     for (const entry of entries) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`  ${entry}`);
     }
   } catch {
@@ -88,9 +97,11 @@ async function runDiagnose(): Promise<number> {
     try {
       const auditFiles = readdirSync(auditDir).sort().reverse();
       const recentFiles = auditFiles.slice(0, 20);
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error("");
       console.error(`Recent audit entries (${recentFiles.length} of ${auditFiles.length}):`);
       for (const file of recentFiles) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`  ${file}`);
       }
     } catch {
@@ -98,6 +109,7 @@ async function runDiagnose(): Promise<number> {
     }
   }
 
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("");
   console.error("Substrate environment check:");
   const keys = [
@@ -108,6 +120,7 @@ async function runDiagnose(): Promise<number> {
   ];
   for (const key of keys) {
     const val = process.env[key];
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `  ${key}: ${val ? `set (${val.slice(0, 4)}...)` : "not set"}`,
     );

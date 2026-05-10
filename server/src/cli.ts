@@ -72,6 +72,7 @@ async function main(): Promise<void> {
 
   if (args[0] === "cocoon") {
     // Hidden deprecated alias. One-release grace period before removal.
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `\n  Note: \`cocoon\` is renamed to \`wrap\`. Use \`sanctuary wrap\` next time.\n`
     );
@@ -150,6 +151,7 @@ async function main(): Promise<void> {
     });
     const transport = new StdioServerTransport();
     await server.connect(transport);
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("Sanctuary Secret Broker MCP server running (stdio)");
     return;
   }
@@ -158,6 +160,7 @@ async function main(): Promise<void> {
     if (args[i] === "--dashboard") {
       process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
     } else if (args[i] === "--passphrase" && args[i + 1]) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `  Deprecation: --passphrase is deprecated and will be removed in v1.0.` +
         `\n  Use SANCTUARY_PASSPHRASE env var or \`sanctuary wrap\` (auto-Keychain) instead.`
@@ -167,6 +170,7 @@ async function main(): Promise<void> {
       printHelp();
       process.exit(0);
     } else if (args[i] === "--version" || args[i] === "-v") {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.log(`@sanctuary-framework/mcp-server ${PKG_VERSION}`);
       process.exit(0);
     }
@@ -177,6 +181,7 @@ async function main(): Promise<void> {
   if (config.transport === "stdio") {
     const transport = new StdioServerTransport();
     await server.connect(transport);
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`Sanctuary MCP Server v${config.version} running (stdio)`);
     console.error(`Storage: ${config.storage_path}`);
     console.error("Tools: all registered");
@@ -185,6 +190,7 @@ async function main(): Promise<void> {
     checkForUpdate(PKG_VERSION);
   } else {
     // HTTP transport (future implementation)
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("HTTP transport not yet implemented. Use stdio.");
     process.exit(1);
   }
@@ -218,6 +224,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--passphrase" && args[i + 1]) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `  Deprecation: --passphrase is deprecated. Use SANCTUARY_PASSPHRASE env var instead.`
       );
@@ -255,6 +262,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       ...(host !== undefined ? { host } : {}),
       ...(authToken !== undefined ? { authToken } : {}),
     });
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `Sanctuary multi-agent dashboard running at ${handle.url} (press Ctrl+C to stop).`
     );
@@ -277,10 +285,12 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   });
 
   // Keep the process alive. The HTTP server is listening.
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`\nSanctuary Dashboard running (standalone mode). Press Ctrl+C to stop.\n`);
 
   // Graceful shutdown
   const shutdown = () => {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("\nShutting down Sanctuary Dashboard...");
     process.exit(0);
   };
@@ -293,6 +303,7 @@ async function runExportPassphrase(args: string[]): Promise<void> {
   for (const a of args) {
     if (a === "--yes" || a === "-y") assumeYes = true;
     else if (a === "--help" || a === "-h") {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.log(`
   sanctuary export-passphrase. Print the stored passphrase to stdout.
 
@@ -319,6 +330,7 @@ async function runExportPassphrase(args: string[]): Promise<void> {
     stored = await readStoredPassphrase();
   } catch (err) {
     if (err instanceof PassphraseUnreadableError) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Sanctuary: Passphrase Unreadable`);
       console.error(`  ${err.message}\n`);
       process.exit(2);
@@ -326,6 +338,7 @@ async function runExportPassphrase(args: string[]): Promise<void> {
     throw err;
   }
   if (!stored) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("No stored passphrase found. Run `sanctuary wrap` first.");
     process.exit(1);
   }
@@ -341,6 +354,7 @@ async function runExportPassphrase(args: string[]): Promise<void> {
     );
     rl.close();
     if (!/^y(es)?$/i.test(answer.trim())) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error("Aborted.");
       process.exit(1);
     }
@@ -350,6 +364,7 @@ async function runExportPassphrase(args: string[]): Promise<void> {
 }
 
 function printHelp(): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.log(`
 @sanctuary-framework/mcp-server v${PKG_VERSION}
 
@@ -422,6 +437,7 @@ For more info: https://github.com/eriknewton/sanctuary-framework
 }
 
 function printDashboardHelp(): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.log(`
 @sanctuary-framework/mcp-server v${PKG_VERSION}. Standalone Dashboard.
 
@@ -473,6 +489,7 @@ Examples:
 }
 
 main().catch((err) => {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("Sanctuary MCP Server failed to start:", err);
   process.exit(1);
 });

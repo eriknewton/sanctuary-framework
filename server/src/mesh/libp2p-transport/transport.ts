@@ -278,6 +278,7 @@ export class Libp2pMeshTransport implements MeshTransport {
         // manager will autodial when it becomes reachable; mdns / dht may
         // also fill in. Do not throw.
         if (process.env.SANCTUARY_LIBP2P_DEBUG === "1") {
+          // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
           console.error(
             `Libp2pMeshTransport: static-peer dial failed: ${addrStr} — ${(e as Error).message}`
           );
