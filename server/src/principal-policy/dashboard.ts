@@ -52,6 +52,12 @@ import {
   SENTINEL_API_PREFIX,
   handleSentinelRoute,
 } from "../sentinel/sentinel-routes.js";
+import type { HandoffLog } from "../coordination/handoff-log.js";
+import {
+  COORDINATION_API_PREFIX,
+  type HandoffEventBridge,
+  handleCoordinationRoute,
+} from "../coordination/handoff-routes.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -199,6 +205,20 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private sentinelDispatcher: SentinelDispatcher | null = null;
 
+  /**
+   * v1.3 WP-V1.3-3 Omega-1 Coordination Handoff Visualization.
+   * Mounted additively at `/api/coordination/*` when set. Read-only
+   * against the audit log; the only writes are operator-action audit
+   * events (operator_coordination_view_opened,
+   * operator_handoff_entry_drilled).
+   */
+  private handoffLog: HandoffLog | null = null;
+  private handoffEventBridge: HandoffEventBridge | null = null;
+  private handoffAuditLog:
+    | import("../l2-operational/audit-log.js").AuditLog
+    | null = null;
+  private handoffOperatorId: string | null = null;
+
   constructor(config: DashboardConfig) {
     this.config = config;
     this.authToken = config.auth_token;
@@ -285,6 +305,24 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * v1.3 WP-V1.3-3 Omega-1: bind the Coordination handoff log +
+   * event bridge + audit log + operator id. Once set, requests to
+   * `/api/coordination/*` route through `handleCoordinationRoute`.
+   * Pass `null` for any field to detach.
+   */
+  setHandoffLog(opts: {
+    handoffLog: HandoffLog | null;
+    eventBridge?: HandoffEventBridge | null;
+    auditLog?: import("../l2-operational/audit-log.js").AuditLog | null;
+    operatorId?: string | null;
+  }): void {
+    this.handoffLog = opts.handoffLog;
+    this.handoffEventBridge = opts.eventBridge ?? null;
+    this.handoffAuditLog = opts.auditLog ?? null;
+    this.handoffOperatorId = opts.operatorId ?? null;
+  }
+
+  /**
    * v1.3 WP-V1.3-10 dispatch entry point. Called from `handleRequest`
    * before the legacy approval route table. Returns true when served.
    */
@@ -324,6 +362,41 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
         },
         dispatcher: this.sentinelDispatcher,
+      },
+      req,
+      res,
+    );
+  }
+
+  /**
+   * v1.3 WP-V1.3-3 Omega-1 dispatch entry point. Routes
+   * `/api/coordination/*` requests through the coordination router
+   * when a HandoffLog has been bound. Returns true when served.
+   */
+  private async dispatchCoordination(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<boolean> {
+    if (
+      !this.handoffLog ||
+      !this.handoffEventBridge ||
+      !this.handoffAuditLog
+    ) {
+      return false;
+    }
+    return handleCoordinationRoute(
+      {
+        authConfig: {
+          loopbackAutoAuth: this._autoAuthLocalhost,
+          ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
+        },
+        handoffLog: this.handoffLog,
+        auditLog: this.handoffAuditLog,
+        operatorId:
+          this.handoffOperatorId ??
+          this.identityManager?.getPrimaryIdentityId() ??
+          "operator_dashboard",
+        events: this.handoffEventBridge,
       },
       req,
       res,
@@ -828,6 +901,27 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       url.pathname.startsWith(SENTINEL_API_PREFIX)
     ) {
       this.dispatchSentinel(req, res)
+        .then((handled) => {
+          if (handled) return;
+          this.handleLegacyRequest(req, res, url, method);
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+      return;
+    }
+
+    // v1.3 WP-V1.3-3 Omega-1: Coordination handoff surface at
+    // `/api/coordination/*`. Read-only against the audit log; only
+    // writes are operator-action audit events.
+    if (
+      this.handoffLog &&
+      url.pathname.startsWith(COORDINATION_API_PREFIX)
+    ) {
+      this.dispatchCoordination(req, res)
         .then((handled) => {
           if (handled) return;
           this.handleLegacyRequest(req, res, url, method);

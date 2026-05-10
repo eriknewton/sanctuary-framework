@@ -36,6 +36,8 @@ import { SentinelFindingStore } from "./sentinel/sentinel-finding-store.js";
 import { SentinelRegistry } from "./sentinel/sentinel-registry.js";
 import { SentinelDispatcher } from "./sentinel/sentinel-dispatcher.js";
 import { AnomalyPipelineDispatcher } from "./anomaly-detection/anomaly-pipeline.js";
+import { HandoffLog } from "./coordination/handoff-log.js";
+import { HandoffEventBridge } from "./coordination/handoff-routes.js";
 import { PHI1_BASELINE_CATALOG } from "./sentinel/sentinels/index.js";
 import { loadSentinelSubscriptions } from "./sentinel/subscription-store.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
@@ -858,6 +860,24 @@ export async function createSanctuaryServer(options?: {
   // their own; runtime callers reach the dispatcher via the future
   // dashboard-side accessor (Chi-3).
   void anomalyDispatcher;
+
+  // v1.3 WP-V1.3-3 Omega-1: Coordination Handoff Visualization.
+  // Read-only data API + dashboard view over the existing audit log.
+  // No new outbound surface; new audit ops are operator-action
+  // observability only.
+  const handoffLog = new HandoffLog({
+    auditLog,
+    fortressId: fortressIdForAggregator,
+  });
+  const handoffEventBridge = new HandoffEventBridge();
+  if (dashboard) {
+    dashboard.setHandoffLog({
+      handoffLog,
+      eventBridge: handoffEventBridge,
+      auditLog,
+      operatorId: aggregatorIdentityId,
+    });
+  }
 
   // 16. Create Principal Policy tools (read-only)
   const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
