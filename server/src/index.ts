@@ -32,6 +32,11 @@ import {
   makeRedirectResolverFromPolicySupplier,
 } from "./principal-policy/channels/aggregator-backed-channel.js";
 import { AggregatorPayloadStore } from "./principal-policy/aggregator-store.js";
+import { SentinelFindingStore } from "./sentinel/sentinel-finding-store.js";
+import { SentinelRegistry } from "./sentinel/sentinel-registry.js";
+import { SentinelDispatcher } from "./sentinel/sentinel-dispatcher.js";
+import { PHI1_BASELINE_CATALOG } from "./sentinel/sentinels/index.js";
+import { loadSentinelSubscriptions } from "./sentinel/subscription-store.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
@@ -787,6 +792,48 @@ export async function createSanctuaryServer(options?: {
   });
   if (dashboard) {
     dashboard.setApprovalAggregator(approvalAggregator);
+  }
+
+  // v1.3 WP-V1.3-1 Phi-1: Sentinel Baseline Pack (Castle Layer 2 anchor).
+  // Construct the per-fortress dispatcher + finding store, register the
+  // Phi-1 catalog, and re-subscribe whatever the operator opted into on
+  // a prior boot. The dispatcher's auto-tick is enabled so subscribed
+  // sentinels run periodically; tick interval is fixed at the
+  // coordinator-CTO default until per-fortress override lands. No new
+  // outbound surface; sentinels read server-local audit data only.
+  const sentinelFindingStore = new SentinelFindingStore({
+    storage,
+    masterKey,
+    fortressId: fortressIdForAggregator,
+  });
+  const sentinelRegistry = new SentinelRegistry();
+  for (const entry of PHI1_BASELINE_CATALOG) {
+    sentinelRegistry.register(entry);
+  }
+  const sentinelDispatcher = new SentinelDispatcher({
+    registry: sentinelRegistry,
+    findingStore: sentinelFindingStore,
+    auditLog,
+    fortressId: fortressIdForAggregator,
+    identityId: aggregatorIdentityId,
+  });
+  try {
+    const persistedSubscriptions = await loadSentinelSubscriptions(
+      config.storage_path,
+    );
+    for (const sentinelId of persistedSubscriptions) {
+      try {
+        await sentinelDispatcher.subscribeSentinel(sentinelId);
+      } catch {
+        // Unknown sentinel id from a prior version: skip silently.
+      }
+    }
+  } catch {
+    // Subscription file missing or unreadable: dispatcher starts empty.
+  }
+  sentinelDispatcher.start();
+  if (dashboard) {
+    dashboard.setSentinelDispatcher(sentinelDispatcher);
   }
 
   // 16. Create Principal Policy tools (read-only)
