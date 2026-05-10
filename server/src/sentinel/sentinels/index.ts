@@ -12,9 +12,11 @@
  * Phi-3 adds:
  *   - cross-agent-chatter
  *
- * Phi-4 and Phi-5 will register additional entries here:
- *   - suspicious-tool-call (Phi-4)
- *   - anomaly-trigger (Phi-5; meta-sentinel)
+ * Phi-4 adds:
+ *   - suspicious-tool-call
+ *
+ * Phi-5 will register the final entry here:
+ *   - anomaly-trigger (meta-sentinel)
  */
 
 import {
@@ -29,6 +31,10 @@ import {
   CredentialUsageWatcher,
   CREDENTIAL_USAGE_SENTINEL_ID,
 } from "./credential-usage-watcher.js";
+import {
+  SuspiciousToolCallDetector,
+  SUSPICIOUS_TOOL_CALL_SENTINEL_ID,
+} from "./suspicious-tool-call-detector.js";
 import type { SentinelCatalogEntry } from "../sentinel-registry.js";
 
 export const PHI1_BASELINE_CATALOG: SentinelCatalogEntry[] = [
@@ -50,6 +56,12 @@ export const PHI1_BASELINE_CATALOG: SentinelCatalogEntry[] = [
       "Watches per-agent credential reads. Surfaces (agent, secret) usage that exceeds a rolling 7-day baseline, and unfamiliar secret combinations the agent uses for the first time in one 24h window.",
     factory: () => new CredentialUsageWatcher(),
   },
+  {
+    sentinelId: SUSPICIOUS_TOOL_CALL_SENTINEL_ID,
+    description:
+      "Surfaces tool calls whose argument shape, call frequency, or permission combination looks unusual for the fortress's recent history.",
+    factory: () => new SuspiciousToolCallDetector(),
+  },
 ];
 
 export {
@@ -59,4 +71,6 @@ export {
   CROSS_AGENT_CHATTER_SENTINEL_ID,
   CredentialUsageWatcher,
   CREDENTIAL_USAGE_SENTINEL_ID,
+  SuspiciousToolCallDetector,
+  SUSPICIOUS_TOOL_CALL_SENTINEL_ID,
 };
