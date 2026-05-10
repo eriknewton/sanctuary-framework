@@ -42,6 +42,11 @@ import { generateSystemPrompt } from "../system-prompt-generator.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import { dispatchV11Request } from "../dashboard/v1_1/dispatch.js";
 import type { V11Bindings } from "../dashboard/v1_1/wiring.js";
+import type { ApprovalAggregator } from "./approval-aggregator.js";
+import {
+  APPROVAL_INBOX_API_PREFIX,
+  handleApprovalInboxRoute,
+} from "./approval-aggregator-routes.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -172,6 +177,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private v11Bindings: V11Bindings | null = null;
 
+  /**
+   * v1.3 WP-V1.3-10 Cross-Harness Approval Inbox aggregator. Mounted
+   * additively at `/api/approval-inbox/*` when set. Legacy approval
+   * routes at `/api/approvals/:id/(allow|deny)` continue to serve. The
+   * aggregator is a passive subscriber to the gate; the routes here are
+   * the operator-facing query / decision surface.
+   */
+  private approvalAggregator: ApprovalAggregator | null = null;
+
   constructor(config: DashboardConfig) {
     this.config = config;
     this.authToken = config.auth_token;
@@ -236,6 +250,39 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   setV11Bindings(bindings: V11Bindings | null): void {
     this.v11Bindings = bindings;
+  }
+
+  /**
+   * v1.3 WP-V1.3-10 Upsilon-1: bind the cross-harness approval inbox
+   * aggregator. Once set, requests to `/api/approval-inbox/*` route
+   * through `handleApprovalInboxRoute`. Pass `null` to detach (used by
+   * tests + during shutdown).
+   */
+  setApprovalAggregator(aggregator: ApprovalAggregator | null): void {
+    this.approvalAggregator = aggregator;
+  }
+
+  /**
+   * v1.3 WP-V1.3-10 dispatch entry point. Called from `handleRequest`
+   * before the legacy approval route table. Returns true when served.
+   */
+  private async dispatchApprovalInbox(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<boolean> {
+    if (!this.approvalAggregator) return false;
+    return handleApprovalInboxRoute(
+      {
+        authConfig: {
+          loopbackAutoAuth: this._autoAuthLocalhost,
+          ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
+        },
+        aggregator: this.approvalAggregator,
+        operatorId: this.identityManager?.getPrimaryIdentityId() ?? undefined,
+      },
+      req,
+      res,
+    );
   }
 
   /**
@@ -703,6 +750,28 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (method === "OPTIONS") {
       res.writeHead(204);
       res.end();
+      return;
+    }
+
+    // v1.3 WP-V1.3-10 Upsilon-1: cross-harness approval inbox routes at
+    // `/api/approval-inbox/*`. Mounted additively in front of the v1.1
+    // hub + legacy v1.0 surfaces; legacy `/api/approvals/:id/...` paths
+    // stay live for the v1.0 dashboard.
+    if (
+      this.approvalAggregator &&
+      url.pathname.startsWith(APPROVAL_INBOX_API_PREFIX)
+    ) {
+      this.dispatchApprovalInbox(req, res)
+        .then((handled) => {
+          if (handled) return;
+          this.handleLegacyRequest(req, res, url, method);
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
       return;
     }
 

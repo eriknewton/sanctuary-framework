@@ -23,6 +23,10 @@ import { StderrApprovalChannel } from "./principal-policy/approval-channel.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
 import { WebhookApprovalChannel } from "./principal-policy/webhook.js";
 import { ApprovalGate } from "./principal-policy/gate.js";
+import {
+  ApprovalAggregator,
+  type ApprovalGateEvent,
+} from "./principal-policy/approval-aggregator.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
@@ -719,6 +723,29 @@ export async function createSanctuaryServer(options?: {
     : undefined;
 
   const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog, injectionDetector, onInjectionAlert);
+
+  // v1.3 WP-V1.3-10 Upsilon-1: construct the cross-harness approval
+  // aggregator alongside the gate. The aggregator is a passive subscriber
+  // that observes gate lifecycle events but never affects the deny/accept
+  // decision. Wire-up is unconditional so the aggregator persists every
+  // approval request to the encrypted `_approval_aggregator` namespace
+  // and the operator can list them whether or not a dashboard is active.
+  const fortressIdForAggregator = fortressIdFromStoragePath(config.storage_path);
+  const aggregatorIdentityId =
+    identityManager.getPrimaryIdentityId() ?? `fortress:${config.storage_path}`;
+  const approvalAggregator = new ApprovalAggregator({
+    storage,
+    masterKey,
+    auditLog,
+    identityId: aggregatorIdentityId,
+    fortressId: fortressIdForAggregator,
+  });
+  gate.setApprovalEventCallback((event) => {
+    void approvalAggregator.ingest(event as unknown as ApprovalGateEvent);
+  });
+  if (dashboard) {
+    dashboard.setApprovalAggregator(approvalAggregator);
+  }
 
   // 16. Create Principal Policy tools (read-only)
   const policyTools = createPrincipalPolicyTools(policy, baseline, auditLog);
