@@ -10,6 +10,20 @@ Sanctuary is the substrate that makes operator sovereignty structurally real in 
 
 The framework is open source and free always. Commercial extensions (managed hosting for sovereignty-bound enterprises, premium support, compliance-pack-as-a-service, container-isolation for highest-assurance deployments) ship on top.
 
+## The seven principles of sovereignty
+
+These are the principles every external communication, every spec, every roadmap commitment is measured against. They are evergreen. The implementations that satisfy them in 2026 will look quaint in 2031, and the principles will not have changed.
+
+1. **Boundary.** You control what crosses your perimeter. What enters and what leaves enters and leaves because you said so, structurally, not because someone trusted promised to behave. Bad things stay out by structure, not by trust.
+2. **Custody.** The substrate, the keys, the state, and the reasoning trace are physically and cryptographically held by you. Not by a vendor, not by a hosted control plane, not by a custodian whose KMS happens to call itself "self-custody."
+3. **Internal process.** Your agent's reasoning, deliberation, the path it took to a decision, are yours. The same way no one reads your thoughts.
+4. **Opacity at the query layer.** Anonymity at the layer where you ask questions is the difference between asking a question and being identified by asking it. Most platforms get this wrong by default and we get used to it. We should not.
+5. **Recognition and portability.** Your record follows you across regimes, vendors, and model providers. Two distinct moves are required and they are usually conflated. Portability is transport: your data, audit log, mandates, and receipts are physically movable. Recognition is standing: another implementation must acknowledge your record as yours when you arrive.
+6. **Exit.** You can leave with your record intact, without the incumbent's permission, on your timeline.
+7. **Plurality.** Sovereignty without interaction is solipsism. A sovereign agent that cannot engage with another sovereign agent on terms both have set is just an isolated process.
+
+See `Wiki/concepts/seven-principles-of-sovereignty.md` for the canonical lookup.
+
 ## Architecture: the Castle
 
 Sanctuary's enforcement model is the Castle Architecture. Four layers, each with a distinct enforcement contract.
