@@ -76,11 +76,19 @@ export function isV01EventType(s: string): s is V01EventType {
  * v0.1 receivers verify signatures and then silently drop at dispatch.
  *
  * Spec: §10.3, hard-gate walkthrough §2.3.
+ *
+ * v1.3 Upsilon-4 reservation: `cross_harness_approval_` carries
+ * cross-harness approval-inbox events to v1.4 mobile companions over
+ * the existing libp2p mesh. The aggregator's audit-log operation names
+ * already use this prefix (see APPROVAL_AGGREGATOR_AUDIT_OPS), so v1.4
+ * mobile-fortress consumers can map federation events directly to
+ * audit-trail entries.
  */
 export const RESERVED_EVENT_TYPE_PREFIXES = [
   "EXTENSION_",
   "cross_fortress_",
   "multi_master_",
+  "cross_harness_approval_",
 ] as const;
 
 export function isReservedEventType(s: string): boolean {

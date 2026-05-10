@@ -147,6 +147,22 @@ export interface AggregatedApproval {
    * Upsilon-3.
    */
   enforcement_chain?: EnforcementLayerEvent[];
+  /**
+   * Aggregator revision number stamped at entry creation. Stable across
+   * status transitions. Used by the v1.4 mobile companion sync API to
+   * separate "added" from "changed" deltas (created_at_revision >
+   * sinceRevision means added; otherwise it is a status change).
+   * v1.3 Upsilon-4.
+   */
+  created_at_revision?: number;
+  /**
+   * Aggregator revision number stamped at the last mutation (creation,
+   * resolution, expiration). Sync-API consumers compare against the
+   * revision they last saw to compute the delta. Monotonically
+   * increasing per fortress; gaps are normal (one bump per mutation).
+   * v1.3 Upsilon-4.
+   */
+  last_modified_revision?: number;
 }
 
 /**
@@ -207,10 +223,35 @@ export type ApprovalAggregatorUnsubscribe = () => void;
 export interface ApprovalAggregatorEmit {
   /**
    * `aggregated` on first ingest, `resolved` on a status leaving pending,
-   * `deduped` when an ingest dropped because the same dedup key was seen.
+   * `deduped` when an ingest dropped because the same dedup key was seen,
+   * `removed` when an entry was pruned (v1.3 Upsilon-4).
    */
-  type: "aggregated" | "resolved" | "deduped";
+  type: "aggregated" | "resolved" | "deduped" | "removed";
   entry: AggregatedApproval;
+}
+
+/**
+ * Sync-API delta returned by `getSync()`. v1.3 Upsilon-4. Mobile
+ * companions poll this for cheap state-sync without re-fetching the
+ * full inbox. The `revision` field on the response is the aggregator's
+ * current revision; pass it back as `sinceRevision` on the next call.
+ *
+ * `added` carries entries created after `sinceRevision`. `changed`
+ * carries entries that existed at `sinceRevision` but have transitioned
+ * status (resolved, expired) since. `removed` carries the
+ * aggregator_ids of entries pruned after `sinceRevision`.
+ *
+ * Tombstone caveat: removal tombstones live in-process memory. Server
+ * restart clears them. Mobile clients reconnecting after the server
+ * restarted MUST re-bootstrap from `list()` rather than rely on the
+ * sync delta. The v1.4 mobile companion build wires the bootstrap-on-
+ * reconnect flow; v1.3 documents the constraint.
+ */
+export interface ApprovalAggregatorSyncDelta {
+  revision: number;
+  added: AggregatedApproval[];
+  changed: AggregatedApproval[];
+  removed: string[];
 }
 
 /**
@@ -297,6 +338,20 @@ export class ApprovalAggregator {
   private hydrated = false;
   /** Active SSE listeners. */
   private readonly listeners = new Set<(event: ApprovalAggregatorEmit) => void>();
+  /**
+   * Monotonic revision counter, bumped on every mutation (ingest of new
+   * entry, resolve, expire, delete). Hydrated from max(last_modified_revision)
+   * across persisted entries on first read; in-memory after that. v1.3
+   * Upsilon-4.
+   */
+  private currentRevision = 0;
+  /**
+   * Removal tombstones: aggregator_id -> revision at removal. Used by the
+   * sync API to surface "removed" entries to mobile consumers between
+   * polls. In-memory only; server restart clears tombstones (mobile
+   * bootstraps via `list()` on reconnect). v1.3 Upsilon-4.
+   */
+  private readonly removedTombstones = new Map<string, number>();
 
   constructor(deps: ApprovalAggregatorDeps) {
     this.storage = deps.storage;
@@ -339,6 +394,125 @@ export class ApprovalAggregator {
   ): ApprovalAggregatorUnsubscribe {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Current aggregator revision. v1.3 Upsilon-4. Mobile companions
+   * poll the lightweight `/revision` route to detect that something
+   * changed before fetching a full sync delta.
+   */
+  async getRevision(): Promise<number> {
+    await this.hydrate();
+    return this.currentRevision;
+  }
+
+  /**
+   * Compute a delta since `sinceRevision`. v1.3 Upsilon-4. Mobile
+   * clients poll this for cheap state-sync. Behavior:
+   *  - `added`: entries whose `created_at_revision > sinceRevision`.
+   *  - `changed`: entries that existed at `sinceRevision` but had a
+   *    status transition (resolve, expire) since.
+   *  - `removed`: aggregator_ids deleted after `sinceRevision`.
+   *  - `revision`: current aggregator revision; pass this back as
+   *    `sinceRevision` on the next call.
+   *
+   * `limit` caps the total count returned across all three lists,
+   * prioritized as added -> changed -> removed (newer-state first).
+   * When more changes exist than fit, the next call with the returned
+   * revision will pick up the rest because each entry's
+   * last_modified_revision is unchanged by truncation.
+   */
+  async getSync(opts?: {
+    sinceRevision?: number;
+    limit?: number;
+  }): Promise<ApprovalAggregatorSyncDelta> {
+    await this.hydrate();
+    await this.expireStale();
+    const sinceRevision = opts?.sinceRevision ?? 0;
+    const cap = Math.min(
+      opts?.limit ?? DEFAULT_LIST_PAGE_SIZE,
+      this.maxListLimit,
+    );
+    const added: AggregatedApproval[] = [];
+    const changed: AggregatedApproval[] = [];
+    for (const entry of this.entries.values()) {
+      const lastMod = entry.last_modified_revision ?? 0;
+      if (lastMod <= sinceRevision) continue;
+      const createdRev = entry.created_at_revision ?? 0;
+      if (createdRev > sinceRevision) {
+        added.push(entry);
+      } else {
+        changed.push(entry);
+      }
+    }
+    const removed: string[] = [];
+    for (const [id, rev] of this.removedTombstones) {
+      if (rev > sinceRevision) removed.push(id);
+    }
+    added.sort(
+      (a, b) =>
+        (a.last_modified_revision ?? 0) - (b.last_modified_revision ?? 0),
+    );
+    changed.sort(
+      (a, b) =>
+        (a.last_modified_revision ?? 0) - (b.last_modified_revision ?? 0),
+    );
+    let remaining = cap;
+    const addedOut = added.slice(0, Math.max(0, remaining));
+    remaining -= addedOut.length;
+    const changedOut = changed.slice(0, Math.max(0, remaining));
+    remaining -= changedOut.length;
+    const removedOut = removed.slice(0, Math.max(0, remaining));
+    return {
+      revision: this.currentRevision,
+      added: addedOut,
+      changed: changedOut,
+      removed: removedOut,
+    };
+  }
+
+  /**
+   * Delete an entry. Drops the in-memory record, the persisted bundle,
+   * and the at-rest payload (if a payload store is wired). Records a
+   * tombstone with the new revision so sync-API consumers see a
+   * `removed` delta. Returns true when an entry was deleted, false on
+   * unknown id. v1.3 Upsilon-4. Reserved for v1.4+ retention housekeeping;
+   * Upsilon-4 ships the surface so mobile sync-API tests can exercise the
+   * removal path.
+   */
+  async deleteEntry(aggregatorId: string): Promise<boolean> {
+    await this.hydrate();
+    const entry = this.entries.get(aggregatorId);
+    if (!entry) return false;
+    const dedupKey = `${entry.source_harness}|${entry.source_agent_id}|${entry.audit_log_entry_id}`;
+    this.entries.delete(aggregatorId);
+    this.dedupIndex.delete(dedupKey);
+    this.fullPayloads.delete(aggregatorId);
+    for (const [corr, id] of this.correlationIndex) {
+      if (id === aggregatorId) this.correlationIndex.delete(corr);
+    }
+    try {
+      await this.storage.delete(APPROVAL_AGGREGATOR_NAMESPACE, aggregatorId);
+    } catch {
+      // Storage delete failure is non-fatal: the entry is gone from the
+      // in-memory map and the tombstone fires regardless.
+    }
+    if (this.payloadStore) {
+      try {
+        await this.payloadStore.deletePayload(aggregatorId);
+      } catch {
+        // Same non-fatal posture.
+      }
+    }
+    const revision = this.nextRevision();
+    this.removedTombstones.set(aggregatorId, revision);
+    this.emit({ type: "removed", entry: { ...entry } });
+    return true;
+  }
+
+  private nextRevision(): number {
+    this.currentRevision += 1;
+    return this.currentRevision;
   }
 
   /**
@@ -601,6 +775,7 @@ export class ApprovalAggregator {
     entry.status = decision;
     entry.resolved_at = this.now().toISOString();
     entry.resolved_by = operatorId;
+    entry.last_modified_revision = this.nextRevision();
     await this.persist(entry);
     this.auditLog.append(
       "l2",
@@ -660,6 +835,7 @@ export class ApprovalAggregator {
     const expires = new Date(now.getTime() + this.pendingTtlMs);
     const hubInboxId = this.resolveHubInboxItemId(event);
     const enforcementChain = this.resolveEnforcementChain(event);
+    const revision = this.nextRevision();
     const entry: AggregatedApproval = {
       aggregator_id: id,
       source_harness: ctx.source_harness,
@@ -671,6 +847,8 @@ export class ApprovalAggregator {
       status: "pending",
       created_at: now.toISOString(),
       expires_at: expires.toISOString(),
+      created_at_revision: revision,
+      last_modified_revision: revision,
       ...(hubInboxId !== undefined ? { hub_inbox_item_id: hubInboxId } : {}),
       ...(enforcementChain.length > 0
         ? { enforcement_chain: enforcementChain }
@@ -731,6 +909,7 @@ export class ApprovalAggregator {
     entry.status = status;
     entry.resolved_at = event.resolution.decided_at;
     entry.resolved_by = event.resolution.decided_by;
+    entry.last_modified_revision = this.nextRevision();
     await this.persist(entry);
     this.auditLog.append(
       "l2",
@@ -804,6 +983,7 @@ export class ApprovalAggregator {
       entry.status = "expired";
       entry.resolved_at = this.now().toISOString();
       entry.resolved_by = "system_ttl";
+      entry.last_modified_revision = this.nextRevision();
       await this.persist(entry);
       this.auditLog.append(
         "l2",
@@ -852,6 +1032,13 @@ export class ApprovalAggregator {
           this.entries.set(entry.aggregator_id, entry);
           const dedupKey = `${entry.source_harness}|${entry.source_agent_id}|${entry.audit_log_entry_id}`;
           this.dedupIndex.set(dedupKey, entry.aggregator_id);
+          // v1.3 Upsilon-4: re-anchor the revision counter to max persisted
+          // last_modified_revision so post-restart bumps stay monotonic.
+          // Tombstones are not persisted; mobile bootstraps on reconnect.
+          const lastMod = entry.last_modified_revision ?? 0;
+          if (lastMod > this.currentRevision) {
+            this.currentRevision = lastMod;
+          }
         } catch {
           // Skip corrupted entries. Rotation cadence is a follow-up PR.
         }
