@@ -32,15 +32,32 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// One audit event awaiting durable persistence.
+///
+/// `critical` classifies the event for the ring buffer's eviction
+/// policy (full-sweep #76). Critical events (audit truncate, key wrap,
+/// recovery, daemon panic) survive saturation; only metric-class events
+/// are dropped when the cap is hit. If the buffer is entirely full of
+/// critical events and a new event arrives, the oldest critical is
+/// dropped as a last resort and counted separately so operators can
+/// distinguish "noisy metric loss" from "structural saturation."
 #[derive(Debug, Clone)]
 pub struct PendingAuditEvent {
     pub event_canonical_json: String,
     pub captured_at: SystemTime,
+    pub critical: bool,
 }
 
 /// In-memory ring buffer for events that have not yet been ACK'd by main.
 /// Once main ACKs an event, it's truncated from the WAL. PR 2b adds the
 /// disk-backed half (write-then-IPC, truncate-on-ACK).
+///
+/// Eviction policy (full-sweep #76): when over budget, the buffer drops
+/// the oldest **non-critical** event first, scanning the queue from front
+/// to back. Critical events are preserved as long as any non-critical
+/// event exists ahead of them. Only when the buffer is entirely critical
+/// does the oldest critical entry get evicted, and that case bumps the
+/// dedicated `critical_drop_count` so operators can tell metric-class
+/// pressure from structural saturation.
 #[derive(Debug)]
 pub struct AuditRingBuffer {
     buffer: VecDeque<PendingAuditEvent>,
@@ -48,6 +65,7 @@ pub struct AuditRingBuffer {
     ttl: Duration,
     current_bytes: u64,
     overflow_count: u64,
+    critical_drop_count: u64,
 }
 
 impl AuditRingBuffer {
@@ -58,20 +76,50 @@ impl AuditRingBuffer {
             ttl,
             current_bytes: 0,
             overflow_count: 0,
+            critical_drop_count: 0,
         }
     }
 
-    /// Append a pending event. If the cap is hit, drop oldest first and
-    /// increment the overflow counter (surfaces as wal_overflow audit
-    /// event on next ACK per scope-lock §8).
+    /// Append a pending event. If the cap is hit, drop the oldest
+    /// **non-critical** event first; only fall back to dropping the
+    /// oldest critical event when the buffer holds nothing else (in
+    /// which case bump `critical_drop_count` so the loss is visible to
+    /// operators on the next drain). The total `overflow_count` keeps
+    /// tracking every dropped event regardless of class so existing
+    /// "wal_overflow audit event on next ACK" plumbing still observes
+    /// the same total.
     pub fn append(&mut self, event: PendingAuditEvent) {
         let event_bytes = event.event_canonical_json.len() as u64;
         while self.current_bytes + event_bytes > self.max_bytes && !self.buffer.is_empty() {
-            if let Some(dropped) = self.buffer.pop_front() {
-                self.current_bytes = self
-                    .current_bytes
-                    .saturating_sub(dropped.event_canonical_json.len() as u64);
-                self.overflow_count = self.overflow_count.saturating_add(1);
+            // Prefer dropping the oldest non-critical entry. We scan
+            // front-to-back so "oldest non-critical" wins over "newer
+            // non-critical."
+            let drop_index = self
+                .buffer
+                .iter()
+                .position(|pending| !pending.critical);
+            match drop_index {
+                Some(index) => {
+                    if let Some(dropped) = self.buffer.remove(index) {
+                        self.current_bytes = self
+                            .current_bytes
+                            .saturating_sub(dropped.event_canonical_json.len() as u64);
+                        self.overflow_count = self.overflow_count.saturating_add(1);
+                    }
+                }
+                None => {
+                    // No non-critical events left. Falling back to the
+                    // oldest critical is a last resort. Track this case
+                    // separately so operators know the buffer was
+                    // structurally saturated, not just noisy.
+                    if let Some(dropped) = self.buffer.pop_front() {
+                        self.current_bytes = self
+                            .current_bytes
+                            .saturating_sub(dropped.event_canonical_json.len() as u64);
+                        self.overflow_count = self.overflow_count.saturating_add(1);
+                        self.critical_drop_count = self.critical_drop_count.saturating_add(1);
+                    }
+                }
             }
         }
         self.current_bytes += event_bytes;
@@ -124,6 +172,15 @@ impl AuditRingBuffer {
         self.overflow_count
     }
 
+    /// Count of times a critical event was evicted from a fully-saturated
+    /// critical-only buffer. Distinct from `overflow_count` so operators
+    /// can tell metric-class pressure (which the ring buffer absorbs by
+    /// design) from structural saturation (which means the buffer is
+    /// undersized for the workload). Per full-sweep #76.
+    pub fn critical_drop_count(&self) -> u64 {
+        self.critical_drop_count
+    }
+
     pub fn current_bytes(&self) -> u64 {
         self.current_bytes
     }
@@ -138,9 +195,21 @@ mod tests {
     use super::*;
 
     fn pending(body: &str, t: SystemTime) -> PendingAuditEvent {
+        // Default to non-critical so existing "drop oldest" tests still
+        // exercise the metric-class path. New critical-class tests use
+        // `pending_critical` explicitly.
         PendingAuditEvent {
             event_canonical_json: body.to_string(),
             captured_at: t,
+            critical: false,
+        }
+    }
+
+    fn pending_critical(body: &str, t: SystemTime) -> PendingAuditEvent {
+        PendingAuditEvent {
+            event_canonical_json: body.to_string(),
+            captured_at: t,
+            critical: true,
         }
     }
 
@@ -165,6 +234,9 @@ mod tests {
             .map(|e| e.event_canonical_json.as_str())
             .collect();
         assert!(!bodies.iter().any(|b| b.contains("first")));
+        // A buffer with no critical entries should never bump
+        // critical_drop_count, regardless of total overflow pressure.
+        assert_eq!(buf.critical_drop_count(), 0);
     }
 
     #[test]
@@ -188,6 +260,84 @@ mod tests {
         buf.append(pending("{\"c\":3}", now));
         buf.truncate_through(1);
         assert_eq!(buf.len(), 1);
+    }
+
+    #[test]
+    fn critical_events_survive_when_metric_events_fill_buffer() {
+        // Full-sweep #76: a critical event placed early in the queue
+        // must remain even after later metric-class events flood the
+        // buffer past the cap. The eviction policy walks oldest-first
+        // looking for a non-critical victim and skips the critical.
+        let body_size = 16; // "{\"x\":\"AAAAA\"}" pads to >=16 bytes
+        let cap = body_size as u64 * 2; // room for ~2 bodies at a time
+        let mut buf = AuditRingBuffer::new(cap, Duration::from_secs(60));
+        let now = SystemTime::now();
+
+        // First entry is critical; subsequent entries are metric-class.
+        buf.append(pending_critical("{\"crit\":\"AAA\"}", now));
+        for i in 0..6 {
+            buf.append(pending(
+                &format!("{{\"metric\":\"BBB{i}\"}}"),
+                now,
+            ));
+        }
+
+        let bodies: Vec<&str> = buf
+            .iter()
+            .map(|e| e.event_canonical_json.as_str())
+            .collect();
+        assert!(
+            bodies.iter().any(|b| b.contains("\"crit\"")),
+            "critical event must survive metric-class pressure: {bodies:?}"
+        );
+        assert!(
+            buf.overflow_count() >= 1,
+            "metric pressure should have evicted at least one entry"
+        );
+        assert_eq!(
+            buf.critical_drop_count(),
+            0,
+            "no critical drops while metric events still exist to evict"
+        );
+    }
+
+    #[test]
+    fn critical_events_drop_only_when_buffer_is_entirely_critical() {
+        // Full-sweep #76: when the buffer is wholly populated with
+        // critical events, a new arrival forces the oldest critical
+        // out. That fallback bumps `critical_drop_count` so operators
+        // can distinguish noisy metric loss from structural saturation.
+        let cap: u64 = 24; // enough for ~2 small critical bodies
+        let mut buf = AuditRingBuffer::new(cap, Duration::from_secs(60));
+        let now = SystemTime::now();
+
+        buf.append(pending_critical("{\"crit\":\"A\"}", now));
+        buf.append(pending_critical("{\"crit\":\"B\"}", now));
+        // Saturate further with another critical: oldest critical
+        // (\"A\") must be evicted; \"B\" survives.
+        buf.append(pending_critical("{\"crit\":\"C\"}", now));
+
+        let bodies: Vec<&str> = buf
+            .iter()
+            .map(|e| e.event_canonical_json.as_str())
+            .collect();
+        assert!(
+            !bodies.iter().any(|b| b.contains("\"A\"")),
+            "oldest critical should have been evicted: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|b| b.contains("\"C\"")),
+            "newest critical should be present: {bodies:?}"
+        );
+        assert_eq!(
+            buf.critical_drop_count(),
+            1,
+            "critical_drop_count must increment on critical-only saturation"
+        );
+        assert!(
+            buf.overflow_count() >= 1,
+            "overflow_count must also reflect the dropped critical"
+        );
     }
 }
 
@@ -234,11 +384,22 @@ pub enum WalError {
         expected: Option<String>,
         found: Option<String>,
     },
+    #[error("WAL malformed prior_sha256_hex at seq {seq}: expected 64 lowercase hex chars, found {found:?}")]
+    MalformedPriorHash { seq: u64, found: String },
     #[error("WAL truncate rename failed at {path}: {source_message}; in-memory state unchanged")]
     RenameFailed {
         path: PathBuf,
         source_message: String,
     },
+}
+
+/// True iff `s` is a sequence of exactly 64 lowercase hex chars
+/// (`0-9` and `a-f`). The WAL writes hashes via `sha256_hex` which
+/// emits lowercase; an entry whose `prior_sha256_hex` deviates from
+/// that shape is structurally malformed and cannot be the legitimate
+/// product of an earlier WAL append.
+pub(crate) fn is_canonical_lowercase_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Disk-backed append-only writer. Persists `WalEntry` records to a file
@@ -620,6 +781,22 @@ fn replay_existing(contents: &str) -> Result<(u64, Option<String>, u64), WalErro
             line: line_num,
             source_message: err.to_string(),
         })?;
+        // Reject entries whose `prior_sha256_hex` is structurally
+        // malformed before any chain comparison: the field must be
+        // exactly 64 lowercase hex chars or `None`. A non-conforming
+        // string can never be the legitimate output of an earlier
+        // append (which writes via `sha256_hex`), so accepting it
+        // would smuggle untyped corruption past the chain check
+        // whenever the comparison happened to match by accident.
+        // Per full-sweep #74.
+        if let Some(prior) = entry.prior_sha256_hex.as_deref() {
+            if !is_canonical_lowercase_sha256_hex(prior) {
+                return Err(WalError::MalformedPriorHash {
+                    seq: entry.seq,
+                    found: prior.to_string(),
+                });
+            }
+        }
         // Verify chain integrity. Two valid shapes for the first remaining
         // WAL line: (a) genesis (entry.seq == 0, prior_sha256_hex == None)
         // or (b) post-truncate first entry (entry.seq > 0, prior_sha256_hex
@@ -884,7 +1061,12 @@ mod wal_tests {
         let entry1 = WalEntry {
             seq: 1,
             captured_at_unix_ms: 0u64,
-            prior_sha256_hex: Some("deadbeef".to_string()),
+            // 64 lowercase hex chars (passes the format check from
+            // full-sweep #74) but not the actual SHA-256 of entry0,
+            // so the chain comparison still fails.
+            prior_sha256_hex: Some(
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            ),
             event_canonical_json: "{\"second\":2}".to_string(),
             critical: true,
         };
@@ -895,6 +1077,77 @@ mod wal_tests {
         std::fs::write(&path, content).unwrap();
         let err = WalWriter::open(&path).unwrap_err();
         assert!(matches!(err, WalError::ChainBroken { .. }));
+    }
+
+    #[test]
+    fn open_rejects_prior_hash_with_wrong_length() {
+        // Full-sweep #74: a `prior_sha256_hex` whose length is not 64
+        // hex chars is structurally malformed, regardless of chain
+        // matching. WAL replay must reject before any comparison so
+        // corrupt input cannot be smuggled past by accidental match.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wal.jsonl");
+        let entry0 = WalEntry {
+            seq: 0,
+            captured_at_unix_ms: 0u64,
+            prior_sha256_hex: None,
+            event_canonical_json: "{\"first\":1}".to_string(),
+            critical: true,
+        };
+        let entry1 = WalEntry {
+            seq: 1,
+            captured_at_unix_ms: 0u64,
+            // 8 hex chars: way too short.
+            prior_sha256_hex: Some("deadbeef".to_string()),
+            event_canonical_json: "{\"second\":2}".to_string(),
+            critical: true,
+        };
+        let mut content = serde_json::to_string(&entry0).unwrap();
+        content.push('\n');
+        content.push_str(&serde_json::to_string(&entry1).unwrap());
+        content.push('\n');
+        std::fs::write(&path, content).unwrap();
+        let err = WalWriter::open(&path).unwrap_err();
+        match err {
+            WalError::MalformedPriorHash { seq, found } => {
+                assert_eq!(seq, 1);
+                assert_eq!(found, "deadbeef");
+            }
+            other => panic!("expected MalformedPriorHash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_prior_hash_with_non_hex_chars() {
+        // Full-sweep #74: 64-char string that contains non-hex chars
+        // (e.g. uppercase or punctuation) is rejected as malformed.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wal.jsonl");
+        let entry0 = WalEntry {
+            seq: 0,
+            captured_at_unix_ms: 0u64,
+            prior_sha256_hex: None,
+            event_canonical_json: "{\"first\":1}".to_string(),
+            critical: true,
+        };
+        // Exactly 64 chars but with uppercase letters; canonical
+        // SHA-256 hex is lowercase only.
+        let entry1 = WalEntry {
+            seq: 1,
+            captured_at_unix_ms: 0u64,
+            prior_sha256_hex: Some(
+                "DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF".to_string(),
+            ),
+            event_canonical_json: "{\"second\":2}".to_string(),
+            critical: true,
+        };
+        let mut content = serde_json::to_string(&entry0).unwrap();
+        content.push('\n');
+        content.push_str(&serde_json::to_string(&entry1).unwrap());
+        content.push('\n');
+        std::fs::write(&path, content).unwrap();
+        let err = WalWriter::open(&path).unwrap_err();
+        assert!(matches!(err, WalError::MalformedPriorHash { seq: 1, .. }));
     }
 
     #[test]

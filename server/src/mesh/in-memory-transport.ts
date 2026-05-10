@@ -37,6 +37,50 @@ export type UnicastHandler = (toNodeId: string, message: string) => void;
  * In-memory fan-out: each attached peer sees every broadcast; unicast delivers to
  * exactly the addressed peer. Messages are serialized to JSON strings to ensure
  * the receive path parses canonical wire bytes, not shared object references.
+ *
+ * Handler ordering guarantees (full-sweep #94)
+ * --------------------------------------------
+ * Tests sometimes need to reason about the relative order in which two
+ * subscribed handlers on the same peer observe a single broadcast, or about
+ * the relative order in which two attached peers observe the same broadcast.
+ * The dispatch loop below makes the following guarantees explicit so callers
+ * do not have to read the implementation to know what is contract and what
+ * is incidental:
+ *
+ *   1. **Per-peer handler order = subscription order.** `subscribe` appends
+ *      to a `Set`; iteration over a JavaScript `Set` is insertion-ordered
+ *      (ECMAScript spec). For a given broadcast, the first-subscribed handler
+ *      on a given peer runs strictly before the second-subscribed handler on
+ *      that same peer. Tests may rely on this.
+ *   2. **Cross-peer handler order = attach order.** `attach` populates an
+ *      internal `Map`; iteration over a JavaScript `Map` is also
+ *      insertion-ordered. The first peer attached observes a broadcast
+ *      before the second peer attached observes the same broadcast. Tests
+ *      may rely on this.
+ *   3. **Self-suppression is unconditional.** A peer never receives its own
+ *      broadcast, regardless of subscription order. The `if (peer.nodeId
+ *      === nodeId) continue` guard fires before any handler is invoked.
+ *   4. **Handler invocation is synchronous within `broadcast()`.** Although
+ *      `broadcast` is `async`, the dispatch loop awaits nothing internally;
+ *      every handler runs to completion before the returned promise
+ *      resolves. A handler that throws synchronously will surface that
+ *      error from the `broadcast()` call site.
+ *   5. **Each handler sees a freshly-parsed event object.** The transport
+ *      `JSON.parse`s the wire string per delivery, so two handlers on
+ *      different peers observe distinct object references for the same
+ *      logical event. Mutations made by one handler are not visible to
+ *      another.
+ *   6. **Unsubscribe takes effect on the next broadcast, not mid-broadcast.**
+ *      Calling the unsubscribe function returned by `subscribe` removes the
+ *      handler from the `Set` immediately, but the in-flight `broadcast()`
+ *      call has already snapshotted the iteration target by virtue of
+ *      synchronous iteration. A handler MAY observe one final delivery if
+ *      it unsubscribes itself during dispatch.
+ *
+ * These guarantees are contract for the in-memory transport. The libp2p
+ * adapter does NOT preserve cross-peer attach-order (network delivery is
+ * best-effort and concurrent), so cross-peer tests that depend on (2) will
+ * not port verbatim. Per-peer subscription-order (1) does carry over.
  */
 export class InMemoryTransport {
   private peers = new Map<string, PeerEndpoint>();

@@ -26,6 +26,17 @@ export const COMPOSITION_EVENT_TYPE_PREFIX = "composition_" as const;
 /**
  * Composition event types. These events are emitted by the composition
  * subsystem only when composition is enabled.
+ *
+ * Federation Protocol cross-reference (full-sweep #87):
+ *   The `composition_*` namespace is allocated to this subsystem at
+ *   v1.0 by the Federation Protocol v0.1 spec at §10.3 ("Reserved
+ *   message classes," `server/docs/federation-protocol-v0.1-spec.md`).
+ *   The federation spec names this file as the canonical list. Any
+ *   addition to this array MUST stay additive: existing event types
+ *   are stable wire contract; v1.x extensions MUST NOT collide.
+ *   Symmetry contract (federation §10.6): v0.1 emit-side and
+ *   receive-side both reject reserved namespaces; this list is the
+ *   v1.0 carve-out within `composition_*`.
  */
 export const COMPOSITION_EVENT_TYPES = [
   "composition_receipt_packed",

@@ -186,6 +186,11 @@ impl DaemonHandle {
                     buf.append(crate::audit::PendingAuditEvent {
                         event_canonical_json: event_canonical_json.clone(),
                         captured_at: std::time::SystemTime::now(),
+                        // Per-attempt allow/deny mirrors are the
+                        // high-volume metric stream: drop these first
+                        // when the ring saturates so the audit-truncate /
+                        // recovery / panic events stay (full-sweep #76).
+                        critical: false,
                     });
                 }
                 Ok(EvaluationOutcome {
@@ -238,6 +243,11 @@ impl DaemonHandle {
                     buf.append(crate::audit::PendingAuditEvent {
                         event_canonical_json: fail_closed_canonical_json.clone(),
                         captured_at: std::time::SystemTime::now(),
+                        // Fail-closed audit-WAL-failure mirrors are
+                        // panic-class events per scope-lock §8 and
+                        // must survive ring-buffer saturation
+                        // (full-sweep #76).
+                        critical: true,
                     });
                 }
 
@@ -447,6 +457,9 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         buf.append(crate::audit::PendingAuditEvent {
             event_canonical_json: started_event.clone(),
             captured_at: std::time::SystemTime::now(),
+            // daemon_started is a recovery-class event (boot signal);
+            // preserve through ring-buffer saturation (full-sweep #76).
+            critical: true,
         });
     }
     // Also persist the daemon_started event to the WAL so Sanctuary main
@@ -613,6 +626,9 @@ mod tests {
             buf.append(crate::audit::PendingAuditEvent {
                 event_canonical_json: "x".repeat(1024),
                 captured_at: std::time::SystemTime::now(),
+                // Test-only synthetic event; classify as metric so it
+                // exercises the standard overflow path.
+                critical: false,
             });
         }
         let report = handle.stop().expect("stop");
