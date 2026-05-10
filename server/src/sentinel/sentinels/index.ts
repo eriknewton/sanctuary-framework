@@ -1,14 +1,18 @@
 /**
- * Sanctuary v1.3 WP-V1.3-1 Phi-1 catalog of baseline sentinels.
+ * Sanctuary v1.3 WP-V1.3-1 catalog of baseline sentinels.
  *
  * Each entry is a factory the registry calls per-fortress.
  *
  * Phi-1 ships:
- *   - egress-volume (this file)
+ *   - egress-volume
  *
- * Phi-2 through Phi-5 will register additional entries here:
- *   - credential-usage (Phi-2)
- *   - cross-agent-chatter (Phi-3)
+ * Phi-2 adds:
+ *   - credential-usage
+ *
+ * Phi-3 adds:
+ *   - cross-agent-chatter
+ *
+ * Phi-4 and Phi-5 will register additional entries here:
  *   - suspicious-tool-call (Phi-4)
  *   - anomaly-trigger (Phi-5; meta-sentinel)
  */
@@ -21,6 +25,10 @@ import {
   CrossAgentChatterWatcher,
   CROSS_AGENT_CHATTER_SENTINEL_ID,
 } from "./cross-agent-chatter-watcher.js";
+import {
+  CredentialUsageWatcher,
+  CREDENTIAL_USAGE_SENTINEL_ID,
+} from "./credential-usage-watcher.js";
 import type { SentinelCatalogEntry } from "../sentinel-registry.js";
 
 export const PHI1_BASELINE_CATALOG: SentinelCatalogEntry[] = [
@@ -36,6 +44,12 @@ export const PHI1_BASELINE_CATALOG: SentinelCatalogEntry[] = [
       "Watches inter-agent communication patterns. Surfaces per-pair rate spikes (3 or 6 sigma over the rolling 7-day baseline) and new-partner appearances. Escalates to alert when one source agent picks up 3 or more new partners in 24h.",
     factory: () => new CrossAgentChatterWatcher(),
   },
+  {
+    sentinelId: CREDENTIAL_USAGE_SENTINEL_ID,
+    description:
+      "Watches per-agent credential reads. Surfaces (agent, secret) usage that exceeds a rolling 7-day baseline, and unfamiliar secret combinations the agent uses for the first time in one 24h window.",
+    factory: () => new CredentialUsageWatcher(),
+  },
 ];
 
 export {
@@ -43,4 +57,6 @@ export {
   EGRESS_VOLUME_SENTINEL_ID,
   CrossAgentChatterWatcher,
   CROSS_AGENT_CHATTER_SENTINEL_ID,
+  CredentialUsageWatcher,
+  CREDENTIAL_USAGE_SENTINEL_ID,
 };
