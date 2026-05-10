@@ -240,8 +240,11 @@ export function verifyPrincipalCertificate(
  * If `cert.master_signature` is present, it is ALSO verified against the pinned
  * fortress-master public key — the v1.x-ready hook at v0.1.
  *
- * v0.1 verifier tolerates unknown (reserved) capability bits on otherwise-valid certs
- * — forward-compat for v1.x issuers.
+ * v0.1 verifier tolerates unknown (reserved) capability bits on otherwise-valid
+ * certs (forward-compat for v1.x issuers). Reserved capability bits 3-31 are
+ * accepted on verify (spec S10.2 of Federation Protocol v0.1).
+ * `v01VisibleCapabilities()` masks them off for v0.1-bounded display. Issuance
+ * correctly rejects bits 3-31; only verify is forward-compat.
  */
 export function verifyCertChain(
   cert: NodeIdentityCertificate,

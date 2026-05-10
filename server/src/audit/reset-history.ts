@@ -29,7 +29,7 @@
  * No Concordia or Verascore imports (non-dependency principle).
  */
 
-import { readFile, rm, access } from "node:fs/promises";
+import { readFile, rm, access, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { hashToString } from "../core/hashing.js";
@@ -233,6 +233,16 @@ export async function consumeResetHistoryMarker(
   options: ConsumeOptions
 ): Promise<ConsumeResult> {
   const markerPath = join(options.storagePath, RESET_HISTORY_FILENAME);
+  const consumedPath = markerPath + ".consumed";
+
+  // If a prior consumption succeeded but the marker delete failed, the
+  // `.consumed` sentinel will still exist. Skip re-emission and clean up.
+  if (await fileExists(consumedPath)) {
+    await rm(markerPath, { force: true });
+    await rm(consumedPath, { force: true });
+    return { emitted: 0, markerPath };
+  }
+
   if (!(await fileExists(markerPath))) {
     return { emitted: 0, markerPath };
   }
@@ -260,7 +270,12 @@ export async function consumeResetHistoryMarker(
     });
   }
   await options.auditLog.flush();
+  // Write `.consumed` sentinel BEFORE deleting the marker. If the process
+  // crashes between these two operations, the next boot sees `.consumed`
+  // and skips re-emission (idempotent).
+  await writeFile(consumedPath, "", "utf-8");
   await rm(markerPath, { force: true });
+  await rm(consumedPath, { force: true });
   return { emitted: markers.length, markerHash, markerPath };
 }
 

@@ -76,6 +76,12 @@ export function wrapNodePrivateKey(params: {
     fortress_master_secret: params.fortress_master_secret,
     node_id: params.node_id,
   });
+  // AAD format: "node:" + node_id. v0.1 epoch-free; deterministic HKDF.
+  // v1.x crypto-agility (deferred to v1.4+ Crypto Agility Sprint per priority queue)
+  // will introduce master-key rotation epochs; this AAD MUST update to encode
+  // the wrapping epoch ("node:<node_id>:epoch:<n>"). Without epoch in AAD,
+  // rotation across epochs would surface as silent decrypt failures with
+  // AAD-mismatch as the only signal.
   const aad = stringToBytes("node:" + params.node_id);
   return encrypt(params.node_private_key, wrappingKey, aad);
 }

@@ -138,6 +138,19 @@ export function validateCapability(c: unknown): AgentCardCapability {
         `capability.constraints must be a plain object if present; got ${typeof c.constraints}`
       );
     }
+    if (
+      "per_day_max" in c.constraints &&
+      c.constraints.per_day_max !== undefined
+    ) {
+      const pdm = c.constraints.per_day_max;
+      if (typeof pdm !== "number" || !Number.isInteger(pdm) || pdm <= 0) {
+        throw new AgentCardSchemaError(
+          `capability.constraints.per_day_max must be a positive integer (> 0); ` +
+            `use omission of the capability to ban it instead of zero-cap. ` +
+            `Got ${JSON.stringify(pdm)}`
+        );
+      }
+    }
   }
   const out: AgentCardCapability = {
     kind: c.kind,
