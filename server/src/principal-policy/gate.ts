@@ -33,6 +33,32 @@ export type InjectionAlertCallback = (alert: {
 /** Resolver for proxy tool tiers — provided by the ProxyRouter */
 export type ProxyTierResolver = (toolName: string) => (1 | 2 | 3) | null;
 
+/**
+ * Approval-lifecycle callback. Wired in v1.3 Upsilon-1 by the Cross-
+ * Harness Approval Inbox aggregator. The gate fires this callback before
+ * `channel.requestApproval()` (phase = "requested") and after the channel
+ * resolves or fails (phase = "resolved"). The callback is fire-and-forget;
+ * exceptions are swallowed so a broken aggregator never blocks the gate.
+ *
+ * The callback shape is import-free here so the principal-policy module
+ * keeps no dependency on the aggregator (the aggregator imports the gate,
+ * not vice versa).
+ */
+export type ApprovalEventCallback = (event: {
+  phase: "requested" | "resolved";
+  operation: string;
+  tier: 1 | 2;
+  reason: string;
+  context: Record<string, unknown>;
+  request_timestamp: string;
+  resolution?: {
+    decision: "approve" | "deny";
+    decided_at: string;
+    decided_by: string;
+  };
+  correlation_id: string;
+}) => void;
+
 export class ApprovalGate {
   private policy: PrincipalPolicy;
   private baseline: BaselineTracker;
@@ -40,6 +66,7 @@ export class ApprovalGate {
   private auditLog: AuditLog;
   private injectionDetector: InjectionDetector;
   private onInjectionAlert?: InjectionAlertCallback;
+  private onApprovalEvent?: ApprovalEventCallback;
   private proxyTierResolver?: ProxyTierResolver;
 
   constructor(
@@ -48,7 +75,8 @@ export class ApprovalGate {
     channel: ApprovalChannel,
     auditLog: AuditLog,
     injectionDetector?: InjectionDetector,
-    onInjectionAlert?: InjectionAlertCallback
+    onInjectionAlert?: InjectionAlertCallback,
+    onApprovalEvent?: ApprovalEventCallback
   ) {
     this.policy = policy;
     this.baseline = baseline;
@@ -56,6 +84,17 @@ export class ApprovalGate {
     this.auditLog = auditLog;
     this.injectionDetector = injectionDetector ?? new InjectionDetector();
     this.onInjectionAlert = onInjectionAlert;
+    this.onApprovalEvent = onApprovalEvent;
+  }
+
+  /**
+   * Set the approval-event callback after construction. Used by the
+   * Upsilon-1 wire-up when the aggregator is constructed alongside the
+   * gate. The aggregator subscribes through this setter rather than the
+   * constructor so existing call sites continue to work unchanged.
+   */
+  setApprovalEventCallback(cb: ApprovalEventCallback | undefined): void {
+    this.onApprovalEvent = cb;
   }
 
   /**
@@ -358,25 +397,68 @@ export class ApprovalGate {
     reason: string,
     context: Record<string, unknown>
   ): Promise<GateResult> {
+    const requestTimestamp = new Date().toISOString();
     const request: ApprovalRequest = {
       operation,
       tier,
       reason,
       context,
-      timestamp: new Date().toISOString(),
+      timestamp: requestTimestamp,
     };
+
+    // Fire `requested` lifecycle to the aggregator before the channel
+    // round-trip. The correlation_id pins the resolution to the same
+    // pending entry. Listener exceptions are swallowed (gate stays
+    // load-bearing; aggregator is additive observation).
+    const correlationId = `${requestTimestamp}:${operation}:${Math.random().toString(16).slice(2, 6)}`;
+    if (this.onApprovalEvent) {
+      try {
+        this.onApprovalEvent({
+          phase: "requested",
+          operation,
+          tier,
+          reason,
+          context,
+          request_timestamp: requestTimestamp,
+          correlation_id: correlationId,
+        });
+      } catch {
+        // Never let the aggregator break the gate.
+      }
+    }
 
     let response: ApprovalResponse;
     try {
       response = await this.channel.requestApproval(request);
     } catch (err) {
       const errMessage = err instanceof Error ? err.message : String(err);
+      const decidedAt = new Date().toISOString();
       this.auditLog.append("l2", `gate_deny:${operation}`, "system", {
         tier,
         reason,
         decided_by: "channel_failure",
         channel_error: errMessage,
       });
+      if (this.onApprovalEvent) {
+        try {
+          this.onApprovalEvent({
+            phase: "resolved",
+            operation,
+            tier,
+            reason,
+            context,
+            request_timestamp: requestTimestamp,
+            resolution: {
+              decision: "deny",
+              decided_at: decidedAt,
+              decided_by: "channel_failure",
+            },
+            correlation_id: correlationId,
+          });
+        } catch {
+          // swallow
+        }
+      }
       return {
         allowed: false,
         tier,
@@ -384,7 +466,7 @@ export class ApprovalGate {
         approval_required: true,
         approval_response: {
           decision: "deny",
-          decided_at: new Date().toISOString(),
+          decided_at: decidedAt,
           decided_by: "channel_failure",
         },
       };
@@ -396,6 +478,30 @@ export class ApprovalGate {
       reason,
       decided_by: response.decided_by,
     });
+
+    // Fire `resolved` lifecycle to the aggregator. Castle-walking: the
+    // gate's deny/accept logic is unchanged; this hook adds visibility,
+    // not enforcement.
+    if (this.onApprovalEvent) {
+      try {
+        this.onApprovalEvent({
+          phase: "resolved",
+          operation,
+          tier,
+          reason,
+          context,
+          request_timestamp: requestTimestamp,
+          resolution: {
+            decision: response.decision,
+            decided_at: response.decided_at,
+            decided_by: response.decided_by,
+          },
+          correlation_id: correlationId,
+        });
+      } catch {
+        // swallow
+      }
+    }
 
     // Agent-facing denial reasons MUST NOT leak policy threshold values
     // (Sanctuary Invariant #7). The detailed `reason` flows into the audit
