@@ -193,6 +193,41 @@ This WP gates enterprise pilot demos. Pilot conversations cannot honestly demons
 
 ---
 
+## v1.x: Query-Layer Anonymity (closes Principle 4)
+
+WP-V1.x-QUERY-LAYER-ANONYMITY closes Principle 4 (Opacity at the query layer) of the v3 sovereignty framework. Today the Castle Wall plus substrate selector deliver a partial form: the wall prevents unauthorized egress and the substrate selector routes LLM calls through operator-chosen substrates. What is missing: the agent can still be identified-by-asking when the substrate sees the query, and the query envelope carries operator metadata even when policy permits the call.
+
+This WP ships query-layer anonymity in three tiers:
+
+- **Tier 1, header strip (default-on).** Strip operator-identifying headers from outbound LLM calls before they leave the substrate selector. Client-IP, fingerprint, correlation-ID, User-Agent, cookies, and persistent session tokens are stripped or rotated per-call. Acceptance: outbound LLM calls from a Sanctuary-wrapped agent are byte-for-byte indistinguishable from calls from any other Sanctuary-wrapped agent on the same substrate.
+- **Tier 2, semantic PII rewrite (opt-in).** Operator opt-in per channel. Deterministic PII-rewrite pass replaces names, addresses, account numbers, medical record numbers, and other operator-identifying tokens with stable pseudonymous handles before sending. The substrate processes pseudonymous content; Sanctuary maps handles back locally on the response. Performance budget: under 100ms p99 added to the LLM call round-trip.
+- **Tier 3, mix network or zero-knowledge proof (research; post-v1.x).** Architectural target for network-layer anonymity (Tor-style or Nym-style) plus ZK-proof of authorization without revealing operator identity. Separate research thread; not in scope for this WP.
+
+Ship gate: zero-PII-leakage criterion, mandatory across all tiers and configurations. No personally-identifying data leaves the castle in the query payload unless the operator has explicitly authorized that field in policy. Regression test in CI enforces this against a canonical PII corpus on every release.
+
+No comparator implementation we surveyed ships query-layer anonymity at this strength. This is the genuinely novel claim in the seven-principle framework.
+
+Scoping brief: `Review/Sanctuary/WP-V1.x-Query-Layer-Anonymity_Scoping_Brief_2026-05-10.md`.
+
+---
+
+## v1.x: Recognition Layer (closes Principle 5, recognition arm)
+
+WP-V1.x-RECOGNITION-LAYER closes the recognition arm of Principle 5 (Recognition and portability) of the v3 sovereignty framework. Portability (transport) is already shipped at strength via exit bundle, Concordia receipts, and Verascore reputation. Recognition (standing: the new regime acknowledges the operator's record as the operator's) at the identity layer is partial today. This WP ships the missing piece via three composable adapter paths plus a fourth deferred path.
+
+Four paths, prioritized:
+
+- **Path C primary, `did:web` (FIRST; smallest surface, 2-3 weeks, spawnable now).** Standard W3C DID method. Operator identity at `did:web:<operator-domain>` resolved via HTTPS GET. DID document signed by operator-held Ed25519 keys. Hosted alternative for operators without a domain (`did:web:sanctuary.example/<operator-handle>`; Sanctuary serves the static DID document, operator keys still sign it; composable, not custodial). VC issuance and verification included. This is the first ship because the technical surface is small, ecosystem adoption is real (Microsoft Entra, eIDAS 2.0 implementations, SSI stacks), and no external dependency gates it.
+- **Path B, ERC-8004 composition (parallel; spawnable after product-experience sprint ships).** ERC-8004 Identity adapter: Sanctuary signs Identity registrations with operator-held keys; consumes incoming ERC-8004 Identity attestations from counterparty agents. Verascore writes Reputation attestations from Sanctuary-signed audit data. Gas custody is the structural friction (operator holds the gas wallet; Sanctuary does not).
+- **Path A, DIF KYA-OS adapter (gated on DIF spec stability; window 2026-06 to 2026-08).** Sanctuary Verifier-role module consuming KYA-OS-format agent identity assertions; reciprocal emission. Conformance test suite against KYA-OS reference vectors when DIF publishes them. Contributed upstream as a composition partner artifact, not a Newton-named conformance tier. Gated on the DIF KYA-OS task force publishing a stable spec surface.
+- **Path C secondary, KERI (deferred indefinitely; internal design ideas only).** KERI's design (key event log, witness/watcher, pre-rotation) is technically excellent. The KERI ecosystem has not won commercially and may not. Sanctuary adopts KERI design ideas internally where they help (audit log key-event-log shape, pre-rotation in guardian recovery, witness/watcher patterns in federation attestation) but does not ship a `did:keri` adapter as a critical-path item. If KERI gains traction later, an adapter can be added as a composition partner artifact with no rework of the core Path C surface.
+
+Surface-level simplification: operators do not see DID methods in the dashboard. They see "Your identity," a one-screen view showing operator display name, fortress, and a copy-to-clipboard sharing link. The DID method is plumbing.
+
+Scoping brief: `Review/Sanctuary/WP-V1.x-Recognition-Layer_Scoping_Brief_2026-05-10.md`.
+
+---
+
 ## v1.3: Advanced Sanctuary Intelligence
 
 v1.3 is every Sanctuary-native sovereignty affordance the operator can see, configure, and audit, including the Castle Layer 2 sentinel surface. The library substrate (audit log, policy engine, channel templates, coordination primitives) shipped in v1.0 and v1.1; the substrate selector ships in v1.2; the castle wall ships in v1.x. v1.3 builds the intelligence layer on top.
