@@ -4,6 +4,58 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.4] - 2026-05-09
+
+Patch release bundling 8 PRs merged to main since v1.2.3: Castle Wall macOS Phase 1 expansion, a panic-discipline CI gate, a Mini1 drill fix, two more substrate-hardening waves, a docs hygiene sweep, and v1.3 preview surfaces (concierge memory layer + cross-harness approval inbox). The v1.3 preview routes are additive and non-breaking; v1.3.0 GA waits until WP-V1.3-1/2/7/9/10 all ship.
+
+### Castle Wall expansion
+
+- **macOS Phase 1: packet filter + manifest sync (Alpha-2).** The system extension now consults a manifest snapshot received via IPC, evaluates new flows against an allowlist (deny > allow > prompt > default-deny), caches outcomes per (sourceAppIdentifier, destination, port) in a 1024-entry LRU, and emits `flow_decision_recorded` + `flow_pending_approval` notifications back to Sanctuary main. Refuse-to-load on extension-start IPC failure; fail-closed on mid-flight IPC drop with no cached manifest. PR #156.
+- **Panic-discipline CI gate (full-sweep #58 finalization).** A parser-aware Python gate at `castle-wall-daemon/scripts/check-panic-discipline.py` walks `#[cfg(test)]` mod blocks (skipped) and asserts every remaining `unwrap`/`expect` in production code carries a `// Safety:` annotation in the prior 20 lines. 23 self-tests + a real-tree integration check; wired into the Castle Wall Linux CI workflow before `cargo check`. PR #157.
+
+### Operator-facing fixes
+
+- **Drill finding XXX (P1): malformed-policy validation errors surface to the operator.** `loadPrincipalPolicy()` previously swallowed all read/parse/validation errors and silently substituted `DEFAULT_POLICY`, defeating PR #144's validation intent. The loader now distinguishes ENOENT (generate default, unchanged) from parse/validation/IO errors (throws `MalformedPrincipalPolicyError` with operator-friendly message naming the file path and reason). Three caller sites (`createSanctuaryServer`, `executeExitCommand`, `startStandaloneDashboard`) wrap the load and exit nonzero with the error printed to stderr. PR #159.
+
+### Substrate hardening (waves 4 + 5)
+
+Wave 4 (PR #160) closes 7 full-sweep findings:
+
+- **#75:** reset-history marker idempotent consumption via `.consumed` sentinel.
+- **#81:** capability-bit forward-compat comment with spec §10.2 cross-reference.
+- **#82:** cocoon-binding AAD epoch comment for the v1.4+ crypto-agility sprint.
+- **#84:** `AgentCard` `per_day_max` zero-cap rejected at policy-load validation.
+- **#89:** SHR canonicalization NFC Unicode normalization before signing.
+- **#93:** Key 13 guardian-threshold doc clarification (v1.0.x only).
+- **#95:** `NodeRoster` defensive capability-bit check on add (defense-in-depth).
+
+Wave 5 (PR #163) closes 7 more:
+
+- **#74:** Castle Wall daemon WAL replay rejects entries whose `prior_sha256_hex` is not exactly 64 lowercase hex chars before any chain comparison runs (new `WalError::MalformedPriorHash`).
+- **#76:** Castle Wall daemon `AuditRingBuffer` eviction preserves critical events (audit truncate, key wrap, recovery, panic) under saturation; only metric-class events drop.
+- **#77:** exit-bundle conflict report surfaces specific failure causes (`identity_signature_invalid`, `reputation_bundle_signature_invalid`, `reputation_attestation_signature_invalid`, `reputation_unverifiable_attestations`) instead of collapsing to `other`.
+- **#80:** federation protocol v0.1 spec §10.6 makes the implicit emit/receive symmetry contract for reserved namespaces explicit.
+- **#83, #87, #94:** additional small substrate cleanups; see PR #163 for full detail.
+
+### Docs hygiene
+
+- **Retired-claims sweep:** the last "OpenMLS" reference in federation-protocol §4.1 (WP-MVP-7 chat description) removed. Post-sweep grep for MLS, RFC 9420, UBAI, Universal Basic AI, and DIF MCP-I returns zero hits in scope.
+- **Cross-reference sweep:** all relative `.md` links across operator-facing documentation verified; zero broken references.
+- **Em-dash drift sweep:** em-dashes replaced with commas, semicolons, colons, periods, or parentheses across 25 files per the no-em-dash rule. Code blocks and design-refs CSS/HTML/JSX left intact.
+
+PR #161. 25 files changed, 373 insertions, 373 deletions, zero test surface change.
+
+### v1.3 preview (additive, non-breaking)
+
+The two surfaces below are PR 1 of 5 and PR 1 of 4 respectively for their work packages. New routes and audit events are additive; full v1.3 GA waits until the remaining WPs ship.
+
+- **WP-V1.3-9 Tau-1 concierge memory layer foundation (preview).** Per-fortress, encrypted-at-rest, cocoon-bound concierge conversation thread persistence with operator-tunable retention. AES-256-GCM at-rest encryption keyed via HKDF subkey of the fortress master (info string `concierge-memory-store-v1`), AAD-bound to per-thread `thread_id`. Multi-thread enumeration via storage-prefix scan. Per-thread async lock serializes `appendTurn` calls; turn-id monotonicity preserved under concurrent callers within one process. Retention via per-turn `retention_until` (default 30 days). Wired dual-write into `operator-chat-service.sendConcierge`: each operator + concierge turn pair persists to BOTH the existing v1.2 single-thread chat store AND the new multi-thread memory store. Memory persistence failures do not break the round-trip. New `OperatorChatService` methods (`listConciergeMemoryThreads`, `readConciergeMemoryThread`, `deleteConciergeMemoryThread`) and HTTP routes under `/api/hub/chat/concierge/threads*`. Tau-2 will wire the read-side context-fold into the substrate selector. PR #164.
+- **WP-V1.3-10 Upsilon-1 cross-harness approval inbox aggregator (preview).** Unified inbox routing. New `ApprovalAggregator` module subscribes to the existing `ApprovalGate` lifecycle, persists per-fortress approval records under the encrypted `_approval_aggregator` namespace, and exposes a query + decision surface at `/api/approval-inbox/*`. Dedupes against `(source_harness, source_agent_id, audit_log_entry_id)`. Tracks five lifecycle states (pending, approved, denied, timeout, expired). Stale-pending entries lazily transition to `expired` on next `list()`. Three additive audit events (`cross_harness_approval_aggregated`, `cross_harness_approval_resolved`, `cross_harness_approval_deduped`). Optional `hub_inbox_item_id` cross-link is read-side metadata; hub inbox surface is unchanged. Listener exceptions are swallowed so a broken aggregator never blocks a real approval flow. PR #162.
+
+### Notes
+
+Test baseline floor: 3568 (Linux CI), unchanged on `main` since wave 5 landed.
+
 ## v1.2.3 - Substrate Hardening Wave (2026-05-11)
 
 Bundles 9 substrate fixes shipped across PRs #140-#147. No public MCP tool surface or agent-card schema changes; operators upgrading from v1.2.2 see only the security and friction fixes below. v1.2.2 was deprecated on npm with the bundled-context template path bug; v1.2.3 supersedes both v1.2.1 and v1.2.2.
