@@ -14,15 +14,15 @@ Version 1.0 of the SHR specification is now published. The full spec is availabl
 
 An SHR is a JSON document signed with Ed25519 over canonical form (sorted keys, compact representation). It reports on four sovereignty layers:
 
-**L1 — Cognitive Sovereignty.** What encryption protects state at rest? Who holds the master key? Is the state portable? The reference implementation reports AES-256-GCM encryption with self-custodied keys derived via Argon2id.
+**L1; Cognitive Sovereignty.** What encryption protects state at rest? Who holds the master key? Is the state portable? The reference implementation reports AES-256-GCM encryption with self-custodied keys derived via Argon2id.
 
-**L2 — Operational Isolation.** What computational boundaries exist? Is hardware attestation available? Today, most agents report process-level isolation only — no TEE. The SHR makes this visible instead of assumed.
+**L2 (Operational Isolation.** What computational boundaries exist? Is hardware attestation available? Today, most agents report process-level isolation only) no TEE. The SHR makes this visible instead of assumed.
 
-**L3 — Selective Disclosure.** Can the agent prove claims without full revelation? The reference implementation supports Pedersen commitments, Schnorr proofs, and bit-decomposition range proofs — genuine zero-knowledge primitives, though not yet SNARKs.
+**L3 (Selective Disclosure.** Can the agent prove claims without full revelation? The reference implementation supports Pedersen commitments, Schnorr proofs, and bit-decomposition range proofs) genuine zero-knowledge primitives, though not yet SNARKs.
 
-**L4 — Verifiable Reputation.** Is the agent's reputation portable and verifiable? What attestation format does it use? The reference implementation uses EAS-compatible signed attestations with sovereignty-gated weighting.
+**L4; Verifiable Reputation.** Is the agent's reputation portable and verifiable? What attestation format does it use? The reference implementation uses EAS-compatible signed attestations with sovereignty-gated weighting.
 
-Every SHR also includes a **degradations array** — an honest accounting of known limitations. If an agent reports "process-level isolation only (no TEE)," that's a degradation. If it reports "commitment schemes only (no SNARKs)," that's a degradation. Honest over optimistic.
+Every SHR also includes a **degradations array**: an honest accounting of known limitations. If an agent reports "process-level isolation only (no TEE)," that's a degradation. If it reports "commitment schemes only (no SNARKs)," that's a degradation. Honest over optimistic.
 
 ## Three Functions
 
@@ -30,9 +30,9 @@ The SHR serves three distinct purposes:
 
 **1. Capability advertisement.** An agent presents its SHR to counterparties before transacting. "Here's what I actually provide. Assess whether it meets your requirements."
 
-**2. Mutual verification.** Two Sanctuary agents perform a sovereignty handshake — a nonce challenge-response with SHR exchange. This proves liveness (the SHR was generated for this specific interaction) and establishes mutual trust. After a handshake, both agents know each other's sovereignty posture and have cryptographic proof of the exchange.
+**2. Mutual verification.** Two Sanctuary agents perform a sovereignty handshake, a nonce challenge-response with SHR exchange. This proves liveness (the SHR was generated for this specific interaction) and establishes mutual trust. After a handshake, both agents know each other's sovereignty posture and have cryptographic proof of the exchange.
 
-**3. Compliance artifact.** This is the time-sensitive one. The EU AI Act reaches full enforcement on August 2, 2026 — four months from now. Articles 9 (risk management), 14 (human oversight), 15 (security), 22 (audit trail), and 42 (conformity assessment) all require documentation that an SHR naturally provides. The SHR isn't a conformity assessment itself — it's the machine-readable evidence that a conformity assessor evaluates.
+**3. Compliance artifact.** This is the time-sensitive one. The EU AI Act reaches full enforcement on August 2, 2026 (four months from now. Articles 9 (risk management), 14 (human oversight), 15 (security), 22 (audit trail), and 42 (conformity assessment) all require documentation that an SHR naturally provides. The SHR isn't a conformity assessment itself) it's the machine-readable evidence that a conformity assessor evaluates.
 
 ## Sovereignty-Gated Reputation
 

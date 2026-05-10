@@ -3,12 +3,12 @@ layout: post
 title: "Context Gating: Your Agent's Sovereignty Ends Where the API Call Begins"
 date: 2026-03-31
 author: Erik Newton
-description: "Sanctuary's new L2 Context Gating tools give agents fine-grained control over what information leaves the sovereignty boundary during outbound inference calls. Five new MCP tools, four starter templates, and a recommendation engine — because sovereignty means nothing if your full agent context leaks with every API call."
+description: "Sanctuary's new L2 Context Gating tools give agents fine-grained control over what information leaves the sovereignty boundary during outbound inference calls. Five new MCP tools, four starter templates, and a recommendation engine, because sovereignty means nothing if your full agent context leaks with every API call."
 ---
 
 There's a gap in every "local-first" agent setup that nobody wants to talk about: the outbound inference call.
 
-You can run your agent locally. You can encrypt your state at rest. You can hold your own keys. But the moment your agent calls an LLM provider — OpenAI, Anthropic, Google, Mistral, anyone — it typically sends *everything*. Full conversation history. Internal reasoning traces. Memory. Preferences. Tool results that might contain PII from previous API calls. System prompts that reveal your agent's goals and constraints.
+You can run your agent locally. You can encrypt your state at rest. You can hold your own keys. But the moment your agent calls an LLM provider (OpenAI, Anthropic, Google, Mistral, anyone) it typically sends *everything*. Full conversation history. Internal reasoning traces. Memory. Preferences. Tool results that might contain PII from previous API calls. System prompts that reveal your agent's goals and constraints.
 
 All that sovereignty infrastructure, and then you just... hand it all over.
 
@@ -20,13 +20,13 @@ Today we're shipping the tools.
 
 Sanctuary v0.3.1 now includes five L2 Context Gating tools that give agents and their human principals fine-grained control over what crosses the sovereignty boundary:
 
-**`sanctuary/context_gate_set_policy`** creates a per-provider gating policy. You define which fields are allowed, which are redacted, which are hashed (preserving correlation without revealing values), and which should be summarized (compressed to reduce exposure). One policy can cover multiple provider categories — inference, tool-api, logging, analytics — with different rules for each.
+**`sanctuary/context_gate_set_policy`** creates a per-provider gating policy. You define which fields are allowed, which are redacted, which are hashed (preserving correlation without revealing values), and which should be summarized (compressed to reduce exposure). One policy can cover multiple provider categories (inference, tool-api, logging, analytics) with different rules for each.
 
-**`sanctuary/context_gate_filter`** runs a context object through a policy and returns the safe version. The original content never leaves Sanctuary. You get back a filtered context with per-field decisions, content hashes for audit (SHA-256 of what went in and what came out), and a complete decision log. If any field triggers a `deny` action, the entire request is blocked — you get an explicit error instead of silent data leakage.
+**`sanctuary/context_gate_filter`** runs a context object through a policy and returns the safe version. The original content never leaves Sanctuary. You get back a filtered context with per-field decisions, content hashes for audit (SHA-256 of what went in and what came out), and a complete decision log. If any field triggers a `deny` action, the entire request is blocked, you get an explicit error instead of silent data leakage.
 
 **`sanctuary/context_gate_apply_template`** solves the cold-start problem. Instead of writing a policy from scratch, start with one of four pre-built templates and customize from there.
 
-**`sanctuary/context_gate_recommend`** analyzes a sample of your agent's actual context and recommends a policy. It classifies each field by name pattern — secrets, PII, internal state, IDs, history, task-related — and produces a recommended rule set with confidence levels and warnings. The recommendation is deliberately conservative: when in doubt, it recommends redact. A false redaction is a usability issue; a false allow is a privacy leak.
+**`sanctuary/context_gate_recommend`** analyzes a sample of your agent's actual context and recommends a policy. It classifies each field by name pattern (secrets, PII, internal state, IDs, history, task-related) and produces a recommended rule set with confidence levels and warnings. The recommendation is deliberately conservative: when in doubt, it recommends redact. A false redaction is a usability issue; a false allow is a privacy leak.
 
 **`sanctuary/context_gate_list_policies`** shows what policies are currently configured.
 
@@ -36,7 +36,7 @@ Most agents don't need a custom policy on day one. They need a sensible default 
 
 **Inference Minimal.** Only the current task and query reach the LLM. Everything else is redacted. Maximum privacy, minimum context. For agents that process each request independently.
 
-**Inference Standard.** Task, query, and tool results pass through. Conversation history is flagged for summarization. Secrets, PII, and internal reasoning are redacted. IDs are hashed. This is the balanced default — enough context for multi-step tasks without exposing everything the agent knows.
+**Inference Standard.** Task, query, and tool results pass through. Conversation history is flagged for summarization. Secrets, PII, and internal reasoning are redacted. IDs are hashed. This is the balanced default, enough context for multi-step tasks without exposing everything the agent knows.
 
 **Logging Strict.** Only operation names and timestamps pass through. Everything else is redacted. For telemetry and analytics providers where you want usage metrics without content exposure.
 
@@ -46,9 +46,9 @@ Most agents don't need a custom policy on day one. They need a sensible default 
 
 Context gating is where sovereignty rhetoric meets operational reality.
 
-Every sovereignty framework can encrypt state at rest. That's necessary but insufficient. The harder problem is controlling what leaves the boundary during *active computation* — the inference calls, the API requests, the logging telemetry that flows to external services.
+Every sovereignty framework can encrypt state at rest. That's necessary but insufficient. The harder problem is controlling what leaves the boundary during *active computation*, the inference calls, the API requests, the logging telemetry that flows to external services.
 
-Consider what a typical OpenClaw agent sends to its LLM provider: the full conversation history (containing everything the user has ever said), system prompts (revealing the agent's instructions and constraints), memory files (learned preferences, personal information, relationship context), and tool results (which might include email contents, calendar data, search results containing PII — anything a previous API call returned).
+Consider what a typical OpenClaw agent sends to its LLM provider: the full conversation history (containing everything the user has ever said), system prompts (revealing the agent's instructions and constraints), memory files (learned preferences, personal information, relationship context), and tool results (which might include email contents, calendar data, search results containing PII, anything a previous API call returned).
 
 Sanctuary's context gating doesn't just redact sensitive fields. It creates an auditable record of what was sent, what was filtered, and why. Content hashes (SHA-256 of the original and filtered context) provide a tamper-evident audit trail without storing raw content. If you need to verify later that a particular inference call didn't leak PII, the audit trail tells you.
 

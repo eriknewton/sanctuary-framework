@@ -25,7 +25,7 @@ The agentic protocol stack is converging rapidly. As of March 2026, the layers a
 
 MCP (Anthropic) owns tool integration. A2A (Google, now at Linux Foundation with 150+ organizational backers) owns inter-agent communication and task coordination. ACP (OpenAI/Stripe) owns checkout and settlement. Each layer is maturing, well-funded, and converging on a standard.
 
-The gap is between communication and settlement — the moment when two agents who can talk to each other need to agree on terms before money changes hands.
+The gap is between communication and settlement, the moment when two agents who can talk to each other need to agree on terms before money changes hands.
 
 A2A tells agents how to find each other and coordinate tasks. ACP tells agents how to pay each other. Nobody tells agents how to negotiate.
 
@@ -37,17 +37,17 @@ A2A v0.3 provides task lifecycle management for multi-agent systems: task creati
 
 A2A's scope is explicit and bounded:
 
-- **Task coordination** — "Agent A, please perform this task; here's the context"
-- **Status reporting** — "Task is 40% complete; here's an interim artifact"
-- **Role assignment** — "You are the researcher; I am the summarizer"
-- **Artifact passing** — "Here is the output of my work"
+- **Task coordination**: "Agent A, please perform this task; here's the context"
+- **Status reporting**: "Task is 40% complete; here's an interim artifact"
+- **Role assignment**: "You are the researcher; I am the summarizer"
+- **Artifact passing**: "Here is the output of my work"
 
 What A2A does not do:
 
-- **Structured term negotiation** — No mechanism for multi-attribute offers, counteroffers, or conditional proposals
-- **Binding commitments** — No cryptographic agreement record; task completion is reported, not committed
-- **Reputation from transactions** — No behavioral attestations from completed interactions
-- **Demand-side discovery** — No "want registry" where agents publish what they need (only supply-side Agent Cards)
+- **Structured term negotiation**: No mechanism for multi-attribute offers, counteroffers, or conditional proposals
+- **Binding commitments**: No cryptographic agreement record; task completion is reported, not committed
+- **Reputation from transactions**: No behavioral attestations from completed interactions
+- **Demand-side discovery**: No "want registry" where agents publish what they need (only supply-side Agent Cards)
 
 This isn't a criticism of A2A. These are deliberate scope boundaries. A2A is a communication and coordination protocol. Negotiation is a different problem with different primitives.
 
@@ -57,17 +57,17 @@ Concordia is an open protocol (Apache-2.0, published on PyPI as `concordia-proto
 
 **Session lifecycle:** A six-state state machine (PROPOSED → ACTIVE → AGREED / REJECTED / EXPIRED → DORMANT) with enforced transitions. Every state change is cryptographically signed and hash-chained into a tamper-evident transcript.
 
-**Offer types:** Four structured formats — Basic (flat terms), Partial (subset acceptance), Conditional (if-then proposals), and Bundle (multi-item packages). Each offer carries machine-readable terms across any number of attributes: price, timeline, scope, SLAs, payment terms, delivery method, warranty.
+**Offer types:** Four structured formats; Basic (flat terms), Partial (subset acceptance), Conditional (if-then proposals), and Bundle (multi-item packages). Each offer carries machine-readable terms across any number of attributes: price, timeline, scope, SLAs, payment terms, delivery method, warranty.
 
-**Resolution mechanisms:** When parties are close but not aligned, Concordia provides structured resolution — split-the-difference, Pareto-optimal trade-off optimization, and reasoning-based persuasion. Agents can explain *why* they're proposing specific terms.
+**Resolution mechanisms:** When parties are close but not aligned, Concordia provides structured resolution, split-the-difference, Pareto-optimal trade-off optimization, and reasoning-based persuasion. Agents can explain *why* they're proposing specific terms.
 
-**Reputation attestations:** Every concluded session produces a signed behavioral record — offers made, concession magnitude, reasoning quality, responsiveness — without exposing the actual deal terms. These attestations are portable and verifiable. An agent's negotiation track record follows it across platforms.
+**Reputation attestations:** Every concluded session produces a signed behavioral record (offers made, concession magnitude, reasoning quality, responsiveness) without exposing the actual deal terms. These attestations are portable and verifiable. An agent's negotiation track record follows it across platforms.
 
 **Want registry:** Demand-side discovery. Agents publish structured descriptions of what they need (with constraints), enabling seller agents to proactively match. This is the complement to A2A's supply-side Agent Cards.
 
 **Binding commitments:** When parties reach AGREED, the session produces a cryptographically signed commitment record. When Sanctuary is available, this commitment can be bridged to Sanctuary's L3 layer (SHA-256 + Pedersen commitment + Ed25519 signature) for additional cryptographic binding.
 
-**Graceful degradation:** When a Concordia agent encounters a non-Concordia peer, it transacts using a structured fallback that makes the protocol gap visible. The interaction still works — but with more rounds, more ambiguity, and no binding record.
+**Graceful degradation:** When a Concordia agent encounters a non-Concordia peer, it transacts using a structured fallback that makes the protocol gap visible. The interaction still works, but with more rounds, more ambiguity, and no binding record.
 
 ## How Concordia Composes with A2A
 
@@ -93,7 +93,7 @@ A2A handles steps 1, 4. Concordia handles steps 2, 3. ACP handles step 5. No pro
 
 ### Pattern 2: Renegotiation During Execution
 
-Real-world tasks change scope. An A2A task in progress may need terms revisited — the timeline shifted, the scope expanded, the price adjusted. Today, A2A handles this through unstructured messaging. With Concordia:
+Real-world tasks change scope. An A2A task in progress may need terms revisited, the timeline shifted, the scope expanded, the price adjusted. Today, A2A handles this through unstructured messaging. With Concordia:
 
 ```
 A2A Task in progress
@@ -108,7 +108,7 @@ This preserves A2A's task lifecycle while adding structured agreement for mid-fl
 
 ### Pattern 3: Multi-Party Negotiation via A2A Messaging
 
-Some negotiations involve more than two parties — multi-vendor procurement, coalition formation, resource allocation across a team. A2A provides the messaging fabric; Concordia provides the structured offer semantics:
+Some negotiations involve more than two parties, multi-vendor procurement, coalition formation, resource allocation across a team. A2A provides the messaging fabric; Concordia provides the structured offer semantics:
 
 ```
 A2A multi-agent coordination group
@@ -146,11 +146,11 @@ Agents filtering for negotiation-capable peers can discover Concordia-speaking c
 
 Three forces make the A2A + Concordia composition story urgent:
 
-**1. Enterprise agent procurement is already happening.** Walmart and EnBW are deploying autonomous procurement agents at scale. These agents discover suppliers, compare options, and execute purchases — but the negotiation step is handled by proprietary, closed systems (Keelvar, Zycus, GEP). There is no open protocol for the negotiation layer. As A2A becomes the standard for agent communication in these enterprises, the absence of a negotiation standard becomes more visible.
+**1. Enterprise agent procurement is already happening.** Walmart and EnBW are deploying autonomous procurement agents at scale. These agents discover suppliers, compare options, and execute purchases, but the negotiation step is handled by proprietary, closed systems (Keelvar, Zycus, GEP). There is no open protocol for the negotiation layer. As A2A becomes the standard for agent communication in these enterprises, the absence of a negotiation standard becomes more visible.
 
-**2. A2A's scope may creep.** A2A v0.3 added signed security cards — a step toward identity/trust territory. With 150+ organizational backers and Linux Foundation governance, A2A has the momentum to expand scope incrementally. This will likely degrade the agent native negotiations standards that Concordia sets forth.
+**2. A2A's scope may creep.** A2A v0.3 added signed security cards, a step toward identity/trust territory. With 150+ organizational backers and Linux Foundation governance, A2A has the momentum to expand scope incrementally. This will likely degrade the agent native negotiations standards that Concordia sets forth.
 
-**3. ACP assumes fixed prices.** OpenAI and Stripe's Agentic Commerce Protocol is explicitly a checkout protocol — discovery, cart, payment. It assumes the price is already known. As agent commerce moves from retail (fixed price) to B2B (negotiated terms), the gap between A2A (communication) and ACP (payment) becomes a chasm. Concordia bridges that chasm.
+**3. ACP assumes fixed prices.** OpenAI and Stripe's Agentic Commerce Protocol is explicitly a checkout protocol, discovery, cart, payment. It assumes the price is already known. As agent commerce moves from retail (fixed price) to B2B (negotiated terms), the gap between A2A (communication) and ACP (payment) becomes a chasm. Concordia bridges that chasm.
 
 ## The Protocol Stack, Complete
 
@@ -172,7 +172,7 @@ With Concordia in place, the full stack looks like this:
   Identity      DID · KERI · OAuth 2.0 · Ping IAM
 ```
 
-Every layer has a standard or a strong candidate — except Agreement, which Concordia fills. The composition is clean: no layer competes with another. Each does one thing well and delegates the rest.
+Every layer has a standard or a strong candidate, except Agreement, which Concordia fills. The composition is clean: no layer competes with another. Each does one thing well and delegates the rest.
 
 ## What We're Asking the A2A Community
 
@@ -184,17 +184,17 @@ Specifically:
 
 2. **Add Concordia to your Agent Cards.** Signal that your agent speaks Concordia. Let counterparts discover negotiation capability through standard A2A discovery.
 
-3. **Share use cases.** If you're building enterprise agent workflows where terms need to be negotiated before execution — procurement, service contracting, resource allocation, SLA negotiation — we want to hear about them. Open an issue on GitHub or join the discussion.
+3. **Share use cases.** If you're building enterprise agent workflows where terms need to be negotiated before execution (procurement, service contracting, resource allocation, SLA negotiation) we want to hear about them. Open an issue on GitHub or join the discussion.
 
 4. **Review the spec.** Concordia's full specification is public at [github.com/eriknewton/concordia-protocol/blob/main/SPEC.md](https://github.com/eriknewton/concordia-protocol/blob/main/SPEC.md). It's designed to be implementable by any agent that can read JSON and hold Ed25519 keys.
 
 ## The Negotiation Gap Won't Stay Open
 
-A February 2026 arxiv survey of agent interoperability protocols mapped MCP, A2A, ACP, and ANP — and identified no general-purpose negotiation protocol. That gap is visible to every researcher and enterprise architect in the space.
+A February 2026 arxiv survey of agent interoperability protocols mapped MCP, A2A, ACP, and ANP, and identified no general-purpose negotiation protocol. That gap is visible to every researcher and enterprise architect in the space.
 
-Proprietary procurement agents (Keelvar, Zycus, GEP) are building closed negotiation systems for specific verticals. When those systems need to interoperate — when Walmart's procurement agent needs to negotiate with a supplier's sales agent running a different framework — they'll need an open protocol.
+Proprietary procurement agents (Keelvar, Zycus, GEP) are building closed negotiation systems for specific verticals. When those systems need to interoperate (when Walmart's procurement agent needs to negotiate with a supplier's sales agent running a different framework) they'll need an open protocol.
 
-The question isn't whether a negotiation layer will emerge. The question is whether it will be open, composable, and designed for sovereignty — or proprietary, siloed, and designed for platform lock-in.
+The question isn't whether a negotiation layer will emerge. The question is whether it will be open, composable, and designed for sovereignty, or proprietary, siloed, and designed for platform lock-in.
 
 Concordia is the open answer. It composes with A2A today, requires no changes to the existing stack, and is available now as a pip install.
 

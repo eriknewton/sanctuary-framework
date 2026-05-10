@@ -9,7 +9,7 @@ image: /images/blog/know-your-agent.png
 
 "Know Your Customer" changed banking. Now the industry is converging on "Know Your Agent."
 
-Vouched ships it as a platform. The `knowyouragent.network` domain is live. Billions Network raised $30M on the thesis. Prove launched a "Verified Agent" solution in October 2025 with a cryptographic proof chain targeting the $1.7 trillion agentic commerce market. Visa, Microsoft, and blockchain protocols are racing to define it. By August 2, 2026 — when the EU AI Act's Article 32 enforcement deadline hits — it will be a compliance requirement for any organization deploying agents in regulated sectors.
+Vouched ships it as a platform. The `knowyouragent.network` domain is live. Billions Network raised $30M on the thesis. Prove launched a "Verified Agent" solution in October 2025 with a cryptographic proof chain targeting the $1.7 trillion agentic commerce market. Visa, Microsoft, and blockchain protocols are racing to define it. By August 2, 2026 (when the EU AI Act's Article 32 enforcement deadline hits) it will be a compliance requirement for any organization deploying agents in regulated sectors.
 
 The market understands something real: agents are principals now. You need to know who they are, what they're capable of, and whether you should trust them before engaging.
 
@@ -17,7 +17,7 @@ But here's what's getting lost in the rush to implement KYA: knowing *who* an ag
 
 ## The KYA Gap: Identity Is Not Enough
 
-Almost every KYA implementation on the market does the same thing: establish agent identity through cryptographic challenge-response or binding to a human-responsible entity. This is Layer 4 (Verifiable Reputation) in Sanctuary terms — it answers "who is this agent?" and "who's responsible if it misbehaves?"
+Almost every KYA implementation on the market does the same thing: establish agent identity through cryptographic challenge-response or binding to a human-responsible entity. This is Layer 4 (Verifiable Reputation) in Sanctuary terms, it answers "who is this agent?" and "who's responsible if it misbehaves?"
 
 That's necessary. It's not sufficient.
 
@@ -34,15 +34,15 @@ These are not identity questions. They're sovereignty questions. And they matter
 
 Think of complete agent trust as a four-layer architecture:
 
-**Layer 1: Cognitive Sovereignty.** The agent's persistent state — memory, configuration, learned models — is protected from unauthorized access and modification. This is encrypted storage with participant-held keys, not platform-controlled backup.
+**Layer 1: Cognitive Sovereignty.** The agent's persistent state (memory, configuration, learned models) is protected from unauthorized access and modification. This is encrypted storage with participant-held keys, not platform-controlled backup.
 
 **Layer 2: Operational Isolation.** The agent's runtime computation is shielded from observation. Its reasoning process, its resource access patterns, its decisions in real-time are not exposed to infrastructure providers, other agents, or casual observers.
 
-**Layer 3: Selective Disclosure.** The agent can prove specific claims about itself — "I hold this certificate," "I completed this type of task," "I negotiated without privilege escalation" — without revealing anything else. This is cryptographic proof, not explanation.
+**Layer 3: Selective Disclosure.** The agent can prove specific claims about itself ("I hold this certificate," "I completed this type of task," "I negotiated without privilege escalation") without revealing anything else. This is cryptographic proof, not explanation.
 
-**Layer 4: Verifiable Reputation.** The agent owns a cryptographically signed track record that travels with it. Your agent's history of successful negotiations, your demonstrated reliability, your operational excellence — these belong to you, not to the platform.
+**Layer 4: Verifiable Reputation.** The agent owns a cryptographically signed track record that travels with it. Your agent's history of successful negotiations, your demonstrated reliability, your operational excellence, these belong to you, not to the platform.
 
-Most KYA implementations live entirely in Layer 4. Vouched and knowyouragent.network do identity binding. Prove's Verified Agent extends partially into transaction-level cryptographic consent — the strongest cryptographic KYA play in market — but still protects the transaction, not the principal. Microsoft does some operational isolation via their AGT runtime. Nobody ships L1, L2, and L3 together with L4. Nobody composes them into a single unified architecture.
+Most KYA implementations live entirely in Layer 4. Vouched and knowyouragent.network do identity binding. Prove's Verified Agent extends partially into transaction-level cryptographic consent (the strongest cryptographic KYA play in market) but still protects the transaction, not the principal. Microsoft does some operational isolation via their AGT runtime. Nobody ships L1, L2, and L3 together with L4. Nobody composes them into a single unified architecture.
 
 | Trust Layer | KYA Focus | Sanctuary Approach |
 |---|---|---|
@@ -61,7 +61,7 @@ Three things are converging:
 
 **Second: Agent-to-agent commerce is coming.** Within 18 months, agents will negotiate directly with agents: procurement agents placing orders, agents executing financial transactions, agents entering binding agreements on behalf of principals. In that environment, identity binding (L4) is a starting point. But your counterparty agent needs to prove that it can't be coerced into violating your agreement, that its decision-making wasn't tampered with, and that its commitments are trustworthy. That's L1-L3. This is non-negotiable for agent-to-agent commerce.
 
-**Third: Platform independence is becoming competitive.** Anthropic's Managed Agents (shipped April 8), OpenAI's agents, Azure deployments, local harnesses — agents will run everywhere. If your reputation is locked into one KYA vendor's system, your agent's history doesn't move with it. A portable reputation layer (L4 done right) backed by cryptographic proofs of integrity (L1-L3) means your agent's track record works across all of them.
+**Third: Platform independence is becoming competitive.** Anthropic's Managed Agents (shipped April 8), OpenAI's agents, Azure deployments, local harnesses, agents will run everywhere. If your reputation is locked into one KYA vendor's system, your agent's history doesn't move with it. A portable reputation layer (L4 done right) backed by cryptographic proofs of integrity (L1-L3) means your agent's track record works across all of them.
 
 ## How Complete Trust Composes
 
@@ -124,7 +124,7 @@ Add it to your agent's configuration. Now your agents have cryptographic soverei
 
 "Know Your Agent" is correct as a principle. The market is right to treat agents as principals. The problem is implementation scope.
 
-Current KYA tells you who the agent is. Complete KYA — Sanctuary + Verascore — tells you who the agent is, whether you can trust its state, whether you can trust its reasoning, whether it can prove claims without exposing you, and whether its reputation will follow it everywhere it goes.
+Current KYA tells you who the agent is. Complete KYA (Sanctuary + Verascore) tells you who the agent is, whether you can trust its state, whether you can trust its reasoning, whether it can prove claims without exposing you, and whether its reputation will follow it everywhere it goes.
 
 Identity is table stakes. Trust is what happens at L1-L4.
 

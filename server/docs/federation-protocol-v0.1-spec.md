@@ -5,9 +5,9 @@ author: Erik Newton
 date: 2026-04-21
 ---
 
-# Sanctuary Federation Protocol v0.1 — Spec
+# Sanctuary Federation Protocol v0.1; Spec
 
-**Purpose.** Define the wire protocol that lets a single Sanctuary Console speak to every fortress node in one operator's mesh — local, operator-cloud, sovereign-managed TEE — as a single sovereign fabric. This is intra-operator only. Cross-operator commitment routing is Concordia's lane and is explicitly out of scope.
+**Purpose.** Define the wire protocol that lets a single Sanctuary Console speak to every fortress node in one operator's mesh (local, operator-cloud, sovereign-managed TEE) as a single sovereign fabric. This is intra-operator only. Cross-operator commitment routing is Concordia's lane and is explicitly out of scope.
 
 **Audience.** The build thread that implements WP-MVP-3 (Federation protocol v0.1) per the MVP Scope Lock. Also the build thread that picks up WP-MVP-2 (Console) and any thread that touches multi-node receipt or audit flows.
 
@@ -31,7 +31,7 @@ date: 2026-04-21
 7. **Node lifecycle.** Join, sync, heartbeat, leave (graceful), rejoin-after-offline, revoke (operator-initiated or guardian-initiated).
 8. **Failure handling.** Offline nodes degrade gracefully; compromised nodes are revocable; rollback is detectable via per-node monotonic counters and audit-batch chaining; split-brain is an operator-resolved event with conflict-detection primitives.
 
-### 1.2 Out of scope (v0.1) — hard line
+### 1.2 Out of scope (v0.1), hard line
 
 - **Cross-operator commitment routing.** Concordia v0.4.0 SDK already handles this; federation protocol does not duplicate the surface.
 - **Cross-operator identity verification.** Lives in the DID resolver + Verascore reputation layer; not federation's job.
@@ -80,7 +80,7 @@ NodeIdentityCertificate {
 }
 ```
 
-**HKDF derivation.** The per-node private key is *not* derived from the fortress-master via HKDF in v0.1 — it is a fresh keypair generated locally on the node. What IS HKDF-derived is a **per-node-per-purpose symmetric key** for transport-layer encryption and per-node-bound cryptographic context:
+**HKDF derivation.** The per-node private key is *not* derived from the fortress-master via HKDF in v0.1, it is a fresh keypair generated locally on the node. What IS HKDF-derived is a **per-node-per-purpose symmetric key** for transport-layer encryption and per-node-bound cryptographic context:
 
 ```
 node_transport_key = HKDF(
@@ -98,7 +98,7 @@ node_audit_chain_key = HKDF(
 )
 ```
 
-**Why fresh asymmetric keys but HKDF-derived symmetric keys.** A fresh Ed25519 keypair on the node lets the node sign things even if the fortress-master is offline (e.g., the master is on Erik's laptop, the node is in GCP). The certificate chain anchors trust without requiring the master to be reachable for every signature. HKDF-derived symmetric keys give us deterministic per-node cryptographic context for audit-batch chaining and transport encryption — recoverable from the master under guardian quorum without re-distributing per-node secrets.
+**Why fresh asymmetric keys but HKDF-derived symmetric keys.** A fresh Ed25519 keypair on the node lets the node sign things even if the fortress-master is offline (e.g., the master is on Erik's laptop, the node is in GCP). The certificate chain anchors trust without requiring the master to be reachable for every signature. HKDF-derived symmetric keys give us deterministic per-node cryptographic context for audit-batch chaining and transport encryption, recoverable from the master under guardian quorum without re-distributing per-node secrets.
 
 **Compromise blast radius.** Compromise of a single node's private key compromises only that node's signing surface. The node certificate is revocable (§7). Compromise of the fortress-master is the catastrophic case and triggers cascade recovery (§9.5).
 
@@ -144,7 +144,7 @@ A new node joining the mesh:
 
 Once joined, a node performs an initial sync:
 
-1. **Pull current policy bundle** from the canonical audit node (or any reachable node — policies are signed, source doesn't need to be trusted). Policy bundle = `{ agent_id → (policy_version, signed_policy_blob) }` for every agent the node will host or might route for.
+1. **Pull current policy bundle** from the canonical audit node (or any reachable node, policies are signed, source doesn't need to be trusted). Policy bundle = `{ agent_id → (policy_version, signed_policy_blob) }` for every agent the node will host or might route for.
 2. **Pull current agent-locator table** (§6).
 3. **Pull current node roster** (the set of valid NodeIdentityCertificates; pulled to verify peer signatures going forward).
 4. **Pull or replicate audit log range** if the node is configured as an audit replica (see §5.4); skip if not.
@@ -170,7 +170,7 @@ Heartbeat {
 
 **Heartbeat purpose.** Liveness detection (peers compute `last_heartbeat_age`), version-skew detection (peers see if they are behind on policy or audit), and drain-state propagation. Heartbeat does NOT carry payload data; it is a lightweight pulse.
 
-**Missed heartbeats.** A node missing 3 consecutive heartbeats (90 seconds default) is marked `unreachable` in the local node-roster view of every other node. `unreachable` is presence state #5 (see Q5 lock — the fifth state beyond Q2's four-state agent presence). Console renders this on the global mesh view.
+**Missed heartbeats.** A node missing 3 consecutive heartbeats (90 seconds default) is marked `unreachable` in the local node-roster view of every other node. `unreachable` is presence state #5 (see Q5 lock, the fifth state beyond Q2's four-state agent presence). Console renders this on the global mesh view.
 
 ### 3.4 Leave (graceful)
 
@@ -178,7 +178,7 @@ Operator-initiated graceful departure:
 
 1. Operator clicks "Decommission node" in console; gate prompt fires with plain-English explanation.
 2. Console signs a `node_leave` event with `(node_id, reason: graceful, drain_deadline)` and broadcasts.
-3. The departing node enters `draining` state (heartbeat reflects). It refuses new agent assignments. Existing agents on the node are migrated (operator-driven — out of v0.1 protocol scope, but the agent-locator table updates accordingly per §6) or paused.
+3. The departing node enters `draining` state (heartbeat reflects). It refuses new agent assignments. Existing agents on the node are migrated (operator-driven, out of v0.1 protocol scope, but the agent-locator table updates accordingly per §6) or paused.
 4. After drain, the node emits a final `node_leaving` event acknowledging clean shutdown, then disconnects.
 5. Other nodes mark the node as `left` in the node roster and stop expecting heartbeats.
 
@@ -225,7 +225,7 @@ Per Key 8 + Key 13, guardian M-of-N can initiate revocation when the operator is
 3. Receiving nodes verify each guardian signature against the operator's guardian-roster (which is a fortress-master-signed certificate set, distributed at recovery setup and on changes).
 4. On valid quorum, revocation applies as if operator-initiated.
 
-**This is the hard primitive that makes the federation protocol survive the operator's incapacity** — and it is the same primitive (operator-rooted but guardian-substitutable) that v1.x will extend for guardian-delegated read-across-fortress.
+**This is the hard primitive that makes the federation protocol survive the operator's incapacity**: and it is the same primitive (operator-rooted but guardian-substitutable) that v1.x will extend for guardian-delegated read-across-fortress.
 
 ### 3.7 Bootstrapping the first node
 
@@ -237,7 +237,7 @@ The first node is a special case: there is no canonical audit node yet, no roste
 
 ### 4.1 Transport
 
-All federation traffic rides **libp2p**. We reuse the same libp2p stack already required by WP-MVP-7 (chat, OpenMLS over libp2p), so federation adds no new external dependency.
+All federation traffic rides **libp2p**. We reuse the same libp2p stack already required by WP-MVP-7 (chat over libp2p), so federation adds no new external dependency.
 
 Two libp2p surfaces:
 
@@ -273,7 +273,7 @@ SignedEvent {
 }
 ```
 
-**Why both signatures.** The principal signature attributes the event to a human (or future-agent) principal. The node signature attributes the event to a specific machine on the mesh. These can disagree — e.g., a compromised node forwarding events under a stolen principal-issued payload — and the receiver validates both against the appropriate certificate chain.
+**Why both signatures.** The principal signature attributes the event to a human (or future-agent) principal. The node signature attributes the event to a specific machine on the mesh. These can disagree (e.g., a compromised node forwarding events under a stolen principal-issued payload) and the receiver validates both against the appropriate certificate chain.
 
 ### 4.3 Six message classes (v0.1)
 
@@ -341,11 +341,11 @@ This is the primary forward-compatibility hinge. See §10 for the explicit list 
    ```
 
 3. The batch is sent over a direct stream to the canonical audit node.
-4. The canonical audit node verifies the signature, the hkdf_chain_proof (proves the batch came from a node provisioned with the correct master-derived chain key), and the prev_batch_hash continuity (catches rollback — see §9.3).
+4. The canonical audit node verifies the signature, the hkdf_chain_proof (proves the batch came from a node provisioned with the correct master-derived chain key), and the prev_batch_hash continuity (catches rollback, see §9.3).
 5. On valid batch, the canonical audit node appends the batch's entries to the canonical audit log and ACKs.
 6. On ACK, the emitting node clears its buffer up through the ACKed batch.
 
-**Partition tolerance.** If the canonical audit node is unreachable, the emitting node continues buffering locally. There is no upper buffer limit at v0.1 (operator policy choice — disk space is cheap; data loss on partition is worse). On reconnect, all buffered batches stream to the canonical node in order.
+**Partition tolerance.** If the canonical audit node is unreachable, the emitting node continues buffering locally. There is no upper buffer limit at v0.1 (operator policy choice, disk space is cheap; data loss on partition is worse). On reconnect, all buffered batches stream to the canonical node in order.
 
 **Per-node monotonic batch counter is the rollback canary.** A canonical audit node receiving batch_seq=42 followed by batch_seq=42-with-different-prev_batch_hash from the same node is seeing a node that has rolled back (or been replayed). This is a hard alarm; see §9.3.
 
@@ -382,7 +382,7 @@ hkdf_chain_proof = base64url(
 
 **Why this tightening is load-bearing.** Any divergence in canonicalization rules across implementations produces silent HMAC mismatches that look like a compromised node (the node gets rejected with `MeshChainDiscontinuityError` or `hkdf_chain_proof mismatch`), but is actually an interop bug. The reference implementation in `server/src/mesh/canonical-json.ts` defines the seven rules above and is the normative reference; alternate-language implementations MUST produce byte-identical output for every input the reference implementation accepts.
 
-**Signature over the batch body uses the same canonicalization.** The batch's `signature` field is Ed25519 over `canonical_json({batch_id, emitter_node, batch_seq, prev_batch_hash, entries, hkdf_chain_proof, sealed_at})` — the full batch body excluding the `signature` field itself. Same seven rules. Same byte-stability guarantee.
+**Signature over the batch body uses the same canonicalization.** The batch's `signature` field is Ed25519 over `canonical_json({batch_id, emitter_node, batch_seq, prev_batch_hash, entries, hkdf_chain_proof, sealed_at})`: the full batch body excluding the `signature` field itself. Same seven rules. Same byte-stability guarantee.
 
 ### 5.3 Audit log shape
 
@@ -421,7 +421,7 @@ Per Key 6, every external action emits a signed receipt (Concordia attestation s
 
 Operator can configure additional receipt replicas independently of audit replicas via the `receipt_replicate` direct-stream message. Each replica node gets every receipt streamed.
 
-**Per-receipt addressability.** Receipts are addressable by `(receipt_id, originating_agent_id)`. Any node holding a copy can serve the receipt to a verifier on demand. Verification is by signature, not by source — no node needs to be trusted to serve a receipt.
+**Per-receipt addressability.** Receipts are addressable by `(receipt_id, originating_agent_id)`. Any node holding a copy can serve the receipt to a verifier on demand. Verification is by signature, not by source, no node needs to be trusted to serve a receipt.
 
 **Cold-storage replica.** A common operator pattern (per Q3 lock): designate one always-on minimal node as a cold-storage receipt replica. The console exposes this as "Add cold storage" with a one-click flow. v0.1 ships this as a configuration option; the cold-storage node runs the same Sanctuary stack with a minimal agent count (zero) and a maximal receipt-store retention.
 
@@ -478,7 +478,7 @@ Console resolves routing identically.
 
 ### 7.1 Trust root
 
-The fortress-master Ed25519 public key is the universal trust anchor for the mesh. Every certificate and every signed event ultimately verifies against the master. The master public key is small (32 bytes) and stable for the operator's lifetime barring key compromise (in which case cascade recovery — §9.5 — replaces it).
+The fortress-master Ed25519 public key is the universal trust anchor for the mesh. Every certificate and every signed event ultimately verifies against the master. The master public key is small (32 bytes) and stable for the operator's lifetime barring key compromise (in which case cascade recovery (§9.5) replaces it).
 
 The master public key is distributed to every node at join (in the bootstrap token + first sync). Nodes pin the master pubkey and reject any certificate or event that does not chain to the pinned key.
 
@@ -491,7 +491,7 @@ Per-node keys are revocable at any time without requiring fortress-master rotati
 1. Operator (or guardian quorum) signs `node_revoke` event (§3.6).
 2. Node certificate marked invalid in roster on every receiving node.
 3. Future events bearing the revoked node's signature are rejected.
-4. Past events are still valid (they were signed when the node was authorized; revocation is not retroactive). This is critical for audit integrity — if revocation invalidated past events, every breach would erase the operator's history of what the breached node had done.
+4. Past events are still valid (they were signed when the node was authorized; revocation is not retroactive). This is critical for audit integrity, if revocation invalidated past events, every breach would erase the operator's history of what the breached node had done.
 
 ### 7.3 Per-node key attestation challenges
 
@@ -531,7 +531,7 @@ The federation protocol explicitly anticipates four failure classes. Each has a 
 
 ### 8.2 Node compromised
 
-**Detection.** Multiple signals, none individually decisive — all surface to the operator (via sentinel agents per Key 11) for decision:
+**Detection.** Multiple signals, none individually decisive, all surface to the operator (via sentinel agents per Key 11) for decision:
 
 - Anomalous audit-batch contents (sentinel detects exfiltration patterns).
 - Failure of `key_attestation` challenge (§7.3).
@@ -565,7 +565,7 @@ The federation protocol does not auto-decide. It detects and surfaces.
 
 **Definition.** Two subsets of the mesh are partitioned from each other for an extended period; in the meantime, both subsets receive operator (or guardian) policy/locator updates from different physical operator interactions, producing divergent state.
 
-**Likelihood at v0.1.** Low for single-operator typical setups — the operator is one human, generally interacting with one console at a time. Higher for: (a) multi-principal hierarchies (Key 14) where two principals act independently during a partition; (b) unattended / agent-initiated state changes during a partition.
+**Likelihood at v0.1.** Low for single-operator typical setups, the operator is one human, generally interacting with one console at a time. Higher for: (a) multi-principal hierarchies (Key 14) where two principals act independently during a partition; (b) unattended / agent-initiated state changes during a partition.
 
 **Detection.** On partition healing, the rejoin sync (§3.5) compares policy versions and locator versions. Divergent versions for the same `(agent_id, version)` slot indicate concurrent edits across the partition.
 
@@ -575,8 +575,8 @@ The federation protocol does not auto-decide. It detects and surfaces.
 
 **Defensive design.** The protocol minimizes split-brain blast radius by:
 
-- Single canonical audit node (audit doesn't split-brain — at most, one side's audit ingests pause).
-- Single canonical node per agent (agents don't split-brain — at most, one side runs the agent and the other side waits).
+- Single canonical audit node (audit doesn't split-brain, at most, one side's audit ingests pause).
+- Single canonical node per agent (agents don't split-brain, at most, one side runs the agent and the other side waits).
 - Operator-resolved policy and locator conflicts (clear resolution path, no silent forks).
 
 ### 8.5 Canonical audit node loss
@@ -587,7 +587,7 @@ The federation protocol does not auto-decide. It detects and surfaces.
 
 **Recovery.** Operator promotes a replica to canonical via console gate. Promoted node bulk-streams its audit log to all peers as the new canonical record. If no replica exists, operator promotes any reachable node and accepts that the new canonical's audit log starts from its own local data plus what other nodes can stream from their buffers.
 
-**Why no auto-election in v0.1.** Auto-election requires either a deterministic rule (which can fail if the deterministic next-in-line is also down) or a quorum (which we explicitly reject — single-operator trust). Manual operator promotion is acceptable for v1.0; v1.x can add operator-policy-driven auto-promotion (e.g., "promote in this priority order if canonical is down >24h") via the extension envelope.
+**Why no auto-election in v0.1.** Auto-election requires either a deterministic rule (which can fail if the deterministic next-in-line is also down) or a quorum (which we explicitly reject, single-operator trust). Manual operator promotion is acceptable for v1.0; v1.x can add operator-policy-driven auto-promotion (e.g., "promote in this priority order if canonical is down >24h") via the extension envelope.
 
 ---
 
@@ -612,7 +612,7 @@ Reconstitution per Key 13 happens client-side on the operator's new fortress ins
 3. The new fortress instance issues a `master_rotation` event signed by guardian quorum, distributed to all known nodes (using the last-known node roster).
 4. Existing nodes verify the guardian quorum signature, accept the new master public key, and re-anchor their certificate chains.
 5. The new console issues fresh per-node certificates under the rotated master for any nodes that need re-attestation.
-6. Operator post-recovery first-login prompt (per Key 13 cascade) initiates broker-credential rotation — federation-protocol concern only insofar as the new credentials are distributed to canonical-hosting nodes via standard policy/secret-broker flows.
+6. Operator post-recovery first-login prompt (per Key 13 cascade) initiates broker-credential rotation, federation-protocol concern only insofar as the new credentials are distributed to canonical-hosting nodes via standard policy/secret-broker flows.
 
 ### 9.4 Cascade implications
 
@@ -655,19 +655,19 @@ v0.1 receivers ignore unknown extension keys (forward-compat). v1.x receivers pa
 | 0 | Standard fortress-node (v0.1 default for all nodes) | All v0.1 nodes set this bit. |
 | 1 | Audit-replica-eligible | Operator may designate this node as an audit replica. |
 | 2 | Cold-storage receipt replica | Receipt-replication target only; minimal agent activity. |
-| 3 | RESERVED — cross-fortress read endpoint (v1.x MSP) | Node accepts `cross_fortress_read_query` events under explicit grants. v0.1 nodes MUST NOT set this bit. |
-| 4 | RESERVED — guardian-delegated principal endpoint (v1.x MSP) | Node hosts a guardian-delegated reader principal authorized by another operator. v0.1 nodes MUST NOT set this bit. |
-| 5 | RESERVED — multi-master policy author (v1.x) | Node accepts policy-update events under multi-master CRDT resolution. v0.1 nodes MUST NOT set this bit. |
-| 6 | RESERVED — auto-promote canonical-audit candidate (v1.x) | Node is in the operator-pre-declared canonical-audit promotion order. v0.1 nodes MUST NOT set this bit. |
+| 3 | RESERVED, cross-fortress read endpoint (v1.x MSP) | Node accepts `cross_fortress_read_query` events under explicit grants. v0.1 nodes MUST NOT set this bit. |
+| 4 | RESERVED, guardian-delegated principal endpoint (v1.x MSP) | Node hosts a guardian-delegated reader principal authorized by another operator. v0.1 nodes MUST NOT set this bit. |
+| 5 | RESERVED, multi-master policy author (v1.x) | Node accepts policy-update events under multi-master CRDT resolution. v0.1 nodes MUST NOT set this bit. |
+| 6 | RESERVED, auto-promote canonical-audit candidate (v1.x) | Node is in the operator-pre-declared canonical-audit promotion order. v0.1 nodes MUST NOT set this bit. |
 | 7-31 | Reserved for future allocation | Implementations MUST NOT set these bits at v0.1. |
 
 ### 10.3 Reserved message classes
 
 In addition to the six v0.1 message classes (§4.3), the following class-name prefixes are reserved:
 
-- `EXTENSION_*` — namespace for v1.x message classes; v0.1 receivers ignore unknown event_types.
-- `cross_fortress_*` — namespace specifically for v1.x MSP / Fleet Operator Console flows.
-- `multi_master_*` — namespace for v1.x multi-master policy.
+- `EXTENSION_*`: namespace for v1.x message classes; v0.1 receivers ignore unknown event_types.
+- `cross_fortress_*`: namespace specifically for v1.x MSP / Fleet Operator Console flows.
+- `multi_master_*`: namespace for v1.x multi-master policy.
 
 **Allocated v1.0 namespace (not v1.x extension):** `composition_*` is allocated at v1.0 to the optional Concordia + Verascore composition layer shipped under WP-MVP-10 (PR #47, merged 2026-04-22 at SHA `c2f90fd`). The currently shipped event types in this namespace are `composition_receipt_packed`, `composition_receipt_verified`, `composition_mandate_verified`, `composition_verascore_published`, `composition_sidecar_spawned`, `composition_sidecar_crashed`, `composition_sidecar_recovered`, `composition_degraded`, and `composition_recovered`, emitted by the in-process Python sidecar bridge when an agent invocation crosses a Concordia commitment boundary or the sidecar lifecycle changes state. The canonical list lives at `server/src/composition/constants.ts` (`COMPOSITION_EVENT_TYPES`). Composition is default-off at v1.0; nodes that have not enabled the optional Concordia sidecar do not emit `composition_*` events. v1.x extensions MUST NOT collide with this namespace, and any future addition to the v1.0 set MUST extend the canonical constants array (additive only; existing event types are stable).
 
@@ -675,9 +675,9 @@ In addition to the six v0.1 message classes (§4.3), the following class-name pr
 
 Future-compat fields in `NodeIdentityCertificate` (currently optional or unused in v0.1 but reserved):
 
-- `delegated_grants[]` — list of cross-fortress grants this node honors (v1.x MSP).
-- `attestation_lineage_chain[]` — TCB lineage history (v1.x deeper attestation per Key 7 fourth-badge work).
-- `master_signature` — direct fortress-master signature on the certificate (optional v0.1, REQUIRED v1.x for guardian-delegated read paths to validate certificate provenance independent of any single principal).
+- `delegated_grants[]`: list of cross-fortress grants this node honors (v1.x MSP).
+- `attestation_lineage_chain[]`: TCB lineage history (v1.x deeper attestation per Key 7 fourth-badge work).
+- `master_signature`: direct fortress-master signature on the certificate (optional v0.1, REQUIRED v1.x for guardian-delegated read paths to validate certificate provenance independent of any single principal).
 
 ### 10.5 The MSP / Fleet Operator Console v1.x dependency in narrative
 
@@ -704,7 +704,7 @@ If this extension story does not work cleanly atop the v0.1 protocol, v0.1 has f
 
 These are deliberately unresolved at the spec level. Build thread chooses, surfaces choice in implementation handoff.
 
-1. **libp2p stack pick — go-libp2p vs. js-libp2p vs. rust-libp2p?** Sanctuary server is TypeScript; js-libp2p is the path of least resistance but has historically been the least mature stack. Build thread pick.
+1. **libp2p stack pick, go-libp2p vs. js-libp2p vs. rust-libp2p?** Sanctuary server is TypeScript; js-libp2p is the path of least resistance but has historically been the least mature stack. Build thread pick.
 2. **Bootstrap-token TTL.** Spec defaults 15 minutes; build thread may justify a different default with operator-UX evidence.
 3. **Heartbeat interval and missed-heartbeat threshold defaults.** Spec defaults 30s / 3 missed (90s); build thread may tune.
 4. **Audit batch interval and size defaults.** Spec defaults 5s / 256 entries; build thread may tune based on early field load testing.
@@ -728,7 +728,7 @@ The federation protocol v0.1 implementation passes acceptance when:
 7. A node revoked by either operator or guardian quorum is excluded from the mesh on every reachable peer within one heartbeat cycle.
 8. The four failure modes (node offline, compromised, rollback, split-brain) are detected per §8 and surfaced to the operator with plain-English explanation per the gate principle.
 9. Recovery cascade (Key 13) flows correctly: master rotation under guardian quorum produces a `master_rotation` event accepted by every node, certificate chains re-anchor, audit continuity is preserved.
-10. **The v1.x MSP / Fleet Operator Console extension can be added by setting capability bits, populating extension envelopes, and adding the new message classes — without altering the v0.1 wire format, without re-spec'ing the trust-root model, and without re-issuing existing v0.1 certificates.** This is the hard gate.
+10. **The v1.x MSP / Fleet Operator Console extension can be added by setting capability bits, populating extension envelopes, and adding the new message classes, without altering the v0.1 wire format, without re-spec'ing the trust-root model, and without re-issuing existing v0.1 certificates.** This is the hard gate.
 
 If criterion 10 cannot be demonstrated (via design walkthrough, not via v1.x implementation), v0.1 has failed the hard gate.
 

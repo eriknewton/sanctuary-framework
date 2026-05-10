@@ -1,4 +1,4 @@
-# Deployment Guide — Running Sanctuary as a Persistent Service
+# Deployment Guide; Running Sanctuary as a Persistent Service
 
 This guide covers running Sanctuary as a long-lived MCP server alongside another agent's MCP server. It is written for people who run servers.
 
@@ -15,7 +15,7 @@ This guide covers running Sanctuary as a long-lived MCP server alongside another
 npx @sanctuary-framework/mcp-server
 ```
 
-Always pulls the latest version. Network-dependent on every cold start — bad for systemd restart loops where the process might cycle and hit npm repeatedly.
+Always pulls the latest version. Network-dependent on every cold start, bad for systemd restart loops where the process might cycle and hit npm repeatedly.
 
 ### Global install
 
@@ -150,9 +150,9 @@ systemctl --user start sanctuary-mcp
 
 After installation, run these tools in your first agent session:
 
-1. **`sanctuary_bootstrap`** — Creates an Ed25519 identity, generates a Sovereignty Health Report, and optionally publishes to Verascore. Save the DID it returns.
+1. **`sanctuary_bootstrap`**: Creates an Ed25519 identity, generates a Sovereignty Health Report, and optionally publishes to Verascore. Save the DID it returns.
 
-2. **`sovereignty_audit`** — Runs a four-layer gap analysis and produces a baseline posture score (0–100). Use this to verify everything initialized correctly.
+2. **`sovereignty_audit`**: Runs a four-layer gap analysis and produces a baseline posture score (0–100). Use this to verify everything initialized correctly.
 
 ## Principal Policy for Always-On Agents
 
@@ -186,7 +186,7 @@ Sanctuary's encrypted state remains in `~/.sanctuary/` until manually deleted.
 ## Audit Log Location
 
 Audit log entries are stored as individually encrypted `.enc` files inside the L1
-state store at `~/.sanctuary/state/_audit/` — not a plaintext log directory. You
+state store at `~/.sanctuary/state/_audit/`: not a plaintext log directory. You
 cannot `cat` or `grep` the audit log directly; use the `audit_export_siem` MCP tool
 to decrypt and export entries. The `~/.sanctuary/audit/` path referenced in some
 older documentation does not exist on a running deployment.

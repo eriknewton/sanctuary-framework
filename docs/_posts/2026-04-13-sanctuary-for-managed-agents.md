@@ -7,7 +7,7 @@ author: "Erik Newton"
 
 # Sanctuary for Claude Managed Agents: Quickstart
 
-You've deployed a Managed Agent. Now secure it with cryptographic identity, audit trails, and policy enforcement. Sanctuary Framework v0.7.0 adds 68 tools for security, privacy, and control—published today as an MCP server.
+You've deployed a Managed Agent. Now secure it with cryptographic identity, audit trails, and policy enforcement. Sanctuary Framework v0.7.0 adds 68 tools for security, privacy, and control, published today as an MCP server.
 
 ## Add Sanctuary in 30 Seconds
 
