@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -16,6 +16,14 @@ import {
   verifyExitBundle,
   ExitBundleImportError,
 } from "../../src/exit/index.js";
+import { sign as identitySign } from "../../src/core/identity.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import {
+  canonicalize,
+  canonicalizeToBytes,
+} from "../../src/mesh/canonical-json.js";
+import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
+import { hash as sha256 } from "../../src/core/hashing.js";
 
 interface ToolDef {
   name: string;
@@ -213,7 +221,9 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
 
     const strict = await verifyExitBundle(bundleDir);
     expect(strict.passed).toBe(false);
-    expect(strict.failure_class).toBe("other");
+    // Full-sweep #77 narrowed this from generic "other" to the
+    // specific class so importers can branch without parsing warnings.
+    expect(strict.failure_class).toBe("reputation_unverifiable_attestations");
     expect(strict.reputation?.unverifiable_attestations).toBe(1);
     expect(strict.warnings.some((w) => /accept-unverifiable-attestations/.test(w))).toBe(
       true
@@ -253,6 +263,149 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     expect(importRelaxed.verified).toBe(true);
     expect(importRelaxed.activated).toBe(true);
     expect(importRelaxed.reputation.unverifiable_attestations).toBe(1);
+  });
+
+  // Per full-sweep #77: helpers for tampering with internal artifact
+  // signatures while keeping the per-file artifact hash + manifest
+  // aggregate hash + manifest signature consistent. These tests verify
+  // the verifier surfaces the *specific* failure class instead of the
+  // generic "other".
+  function sha256Hex(bytes: Uint8Array): string {
+    return Array.from(sha256(bytes))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  function jsonBytes(value: unknown): Uint8Array {
+    return stringToBytes(JSON.stringify(value, null, 2) + "\n");
+  }
+
+  async function tamperArtifactInternalField(
+    bundleDir: string,
+    artifactKind: string,
+    mutate: (parsed: Record<string, unknown>) => Record<string, unknown>,
+    source: Awaited<ReturnType<typeof makeHarness>>
+  ): Promise<void> {
+    const manifestPath = join(bundleDir, "manifest.json");
+    const rawManifest = await readFile(manifestPath, "utf8");
+    const manifest = JSON.parse(rawManifest) as {
+      body: {
+        artifacts: Array<{
+          kind: string;
+          path: string;
+          hash_alg: string;
+          hash: string;
+          size_bytes: number;
+        }>;
+        artifacts_aggregate_hash: string;
+      };
+      signature: string;
+    };
+    const entry = manifest.body.artifacts.find(
+      (artifact) => artifact.kind === artifactKind
+    );
+    if (!entry) {
+      throw new Error(
+        `tamperArtifactInternalField: no artifact of kind ${artifactKind}`
+      );
+    }
+    const artifactPath = join(bundleDir, entry.path);
+    const parsed = JSON.parse(await readFile(artifactPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    const tampered = mutate(parsed);
+    const newBytes = jsonBytes(tampered);
+    await writeFile(artifactPath, newBytes);
+    entry.hash = sha256Hex(newBytes);
+    entry.size_bytes = newBytes.length;
+    manifest.body.artifacts_aggregate_hash = sha256Hex(
+      stringToBytes(canonicalize(manifest.body.artifacts))
+    );
+    const identity = source.identityManager.getDefault();
+    if (!identity) throw new Error("no default identity");
+    const identityEncryptionKey = derivePurposeKey(
+      source.masterKey,
+      "identity-encryption"
+    );
+    const signature = identitySign(
+      canonicalizeToBytes(manifest.body),
+      identity.encrypted_private_key,
+      identityEncryptionKey
+    );
+    manifest.signature = toBase64url(signature);
+    await writeFile(manifestPath, jsonBytes(manifest));
+  }
+
+  it("#77: verifier surfaces identity_signature_invalid when public_identity signature is tampered", async () => {
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", { label: "tampered-id" });
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-77-identity-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    // Replace the inner `signature` with a syntactically-valid but
+    // cryptographically-wrong base64url string. The artifact-hash
+    // check still passes because we recompute the artifact hash;
+    // only the signature verification at line ~238 of verifier.ts
+    // should fail, surfacing identity_signature_invalid.
+    await tamperArtifactInternalField(
+      bundleDir,
+      "public_identity",
+      (parsed) => ({
+        ...parsed,
+        signature: toBase64url(new Uint8Array(64)),
+      }),
+      source
+    );
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(result.passed).toBe(false);
+    expect(result.failure_class).toBe("identity_signature_invalid");
+    expect(result.identity?.signature_valid).toBe(false);
+  });
+
+  it("#77: verifier surfaces reputation_bundle_signature_invalid when reputation bundle signature is tampered", async () => {
+    const source = await makeHarness();
+    const created = await callTool(source.tools, "identity_create", {
+      label: "tampered-rep",
+    });
+    const identityId = created.identity_id as string;
+    await callTool(source.tools, "reputation_record", {
+      interaction_id: "rep-tamper-001",
+      counterparty_did: "did:key:counterparty",
+      outcome: {
+        type: "transaction",
+        result: "completed",
+        metrics: { score: 50 },
+      },
+      context: "rep-tamper",
+      identity_id: identityId,
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-77-rep-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    // Replace bundle_signature with a wrong-but-well-formed base64url
+    // value. Per the verifier flow, attestations whose signer DID is
+    // present in publicKeysByDid still verify successfully; only the
+    // bundle-level signature fails, isolating the
+    // reputation_bundle_signature_invalid path.
+    await tamperArtifactInternalField(
+      bundleDir,
+      "reputation_bundle",
+      (parsed) => ({
+        ...parsed,
+        bundle_signature: toBase64url(new Uint8Array(64)),
+      }),
+      source
+    );
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(result.passed).toBe(false);
+    expect(result.failure_class).toBe("reputation_bundle_signature_invalid");
+    expect(result.reputation?.bundle_signature_valid).toBe(false);
   });
 
   it("#55: verifier still passes clean bundles with no unverifiable attestations", async () => {

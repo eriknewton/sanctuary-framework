@@ -184,6 +184,13 @@ impl ServerState {
                     serde_json::to_string(detail).unwrap_or_else(|_| "\"\"".to_string()),
                 ),
                 captured_at: SystemTime::now(),
+                // Every IPC append_audit emit is a control-plane event
+                // (audit-truncate, manifest register/revoke, handshake
+                // outcomes, IPC failure cases). All map to one of
+                // "audit truncate / key wrap / recovery / panic" per
+                // scope-lock §8 and must survive ring-buffer saturation
+                // (full-sweep #76).
+                critical: true,
             });
         }
     }

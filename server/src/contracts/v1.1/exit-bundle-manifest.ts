@@ -239,5 +239,13 @@ export interface ExitBundleVerifierResult {
     | "artifact_path_escapes_root"
     | "archive_contains_symlink"
     | "private_material_present"
+    // Per full-sweep #77: failures from the post-artifact verification
+    // pass (identity / reputation) used to collapse to "other"; surface
+    // the specific cause so importers can branch on it without parsing
+    // the warnings array.
+    | "identity_signature_invalid"
+    | "reputation_bundle_signature_invalid"
+    | "reputation_attestation_signature_invalid"
+    | "reputation_unverifiable_attestations"
     | "other";
 }

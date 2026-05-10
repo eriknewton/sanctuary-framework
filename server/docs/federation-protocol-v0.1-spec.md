@@ -679,6 +679,20 @@ Future-compat fields in `NodeIdentityCertificate` (currently optional or unused 
 - `attestation_lineage_chain[]`: TCB lineage history (v1.x deeper attestation per Key 7 fourth-badge work).
 - `master_signature`: direct fortress-master signature on the certificate (optional v0.1, REQUIRED v1.x for guardian-delegated read paths to validate certificate provenance independent of any single principal).
 
+### 10.6 Emit/receive symmetry contract for reserved namespaces
+
+> **Status:** Added per full-sweep #80 to make explicit a contract that exists in code at the emit boundary but was not previously stated for the receive boundary.
+
+The reserved namespaces in §10.1 (extension envelope keys), §10.2 (capability bits), and §10.3 (message classes) form a closed set at v0.1. The conformance contract has **two halves** that MUST hold symmetrically.
+
+**Emit-side (REQUIRED at v0.1).** A v0.1-conforming sender MUST reject any attempt to construct a `SignedEvent` whose `extension_envelope` carries a reserved key from §10.1, whose `event_type` matches a reserved class prefix from §10.3, or whose surrounding `NodeIdentityCertificate` advertises a reserved capability bit from §10.2 (bits 3-31). The reference implementation enforces this in `packSignedEvent` and `issueNodeIdentityCertificate` at `server/src/mesh/`. The rejection is structural: the API simply has no path through which a v0.1 caller can emit a reserved-namespace event.
+
+**Receive-side (REQUIRED at v0.1).** A v0.1-conforming receiver MUST refuse to process incoming `SignedEvent`s whose `event_type` falls under a §10.3 reserved class prefix, OR whose `extension_envelope` carries a reserved §10.1 key, OR whose signing node's certificate advertises a §10.2-reserved capability bit. The receive-side rejection is the symmetry partner of the emit-side rejection: a peer node that produces a reserved-namespace event is by definition not v0.1-conforming, and processing such an event would smuggle undefined-at-v0.1 semantics into the receiver's audit chain. The rejection MUST be logged as an audit event of class `peer_protocol_violation` and the offending message MUST NOT be forwarded.
+
+**Distinction from forward-compat.** §10.1's "v0.1 receivers ignore unknown extension keys" language refers to genuinely-unknown extension keys that fall **outside** the §10 reserved set. Such keys may be introduced by future minor revisions of v0.x (additive). The reserved namespaces in §10 are not "unknown future"; they are explicitly **reserved for v1.x semantics that v0.1 has no legitimate way to honor**, and a v0.1 node observing them MUST treat them as protocol violations rather than forward-compat extensions.
+
+**Why both halves are required.** If only the emit half were enforced, a malicious or buggy v0.1 peer could send a reserved-namespace event and a conforming receiver would silently accept it; subsequent v1.x deployments would then encounter audit chains that already contain `composition_*` or `cross_fortress_*` events which were never legitimately produced. The receive half closes that loophole and keeps the v0.1 mesh's audit-chain semantics invariant against peer misbehavior.
+
 ### 10.5 The MSP / Fleet Operator Console v1.x dependency in narrative
 
 The v1.x extension this protocol most needs to support cleanly is **Drew's meta-dashboard**: a single console operated by an MSP-class principal who manages a fleet of independent operator fortresses (Drew's clients). The expected shape:

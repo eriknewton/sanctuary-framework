@@ -531,9 +531,9 @@ export async function verifyExitBundle(
     }
   }
 
-  const reputationFailed =
-    reputation?.bundle_signature_valid === false ||
-    (reputation?.invalid_attestations ?? 0) > 0;
+  const reputationBundleFailed = reputation?.bundle_signature_valid === false;
+  const reputationAttestationFailed = (reputation?.invalid_attestations ?? 0) > 0;
+  const reputationFailed = reputationBundleFailed || reputationAttestationFailed;
   const identityFailed = identity ? !identity.signature_valid : false;
   const unverifiableCount = reputation?.unverifiable_attestations ?? 0;
   const unverifiableFailed =
@@ -543,6 +543,25 @@ export async function verifyExitBundle(
       `${unverifiableCount} reputation attestation(s) have unknown signer public keys; ` +
         `pass --accept-unverifiable-attestations to import anyway`
     );
+  }
+
+  // Full-sweep #77: route the specific failure cause so importers and
+  // operators see what went wrong without having to parse the warnings
+  // array. Priority ordering: identity (cryptographic-binding broken)
+  // beats reputation-bundle (provenance broken) beats individual
+  // attestation invalidity beats unverifiable signers (which is
+  // policy-relaxable via the explicit opt-in flag).
+  let detailedFailureClass:
+    | NonNullable<ExitBundleVerifierResult["failure_class"]>
+    | undefined;
+  if (identityFailed) {
+    detailedFailureClass = "identity_signature_invalid";
+  } else if (reputationBundleFailed) {
+    detailedFailureClass = "reputation_bundle_signature_invalid";
+  } else if (reputationAttestationFailed) {
+    detailedFailureClass = "reputation_attestation_signature_invalid";
+  } else if (unverifiableFailed) {
+    detailedFailureClass = "reputation_unverifiable_attestations";
   }
 
   return {
@@ -564,10 +583,7 @@ export async function verifyExitBundle(
     identity,
     audit,
     reputation,
-    failure_class:
-      reputationFailed || identityFailed || unverifiableFailed
-        ? "other"
-        : undefined,
+    failure_class: detailedFailureClass,
   };
 }
 
