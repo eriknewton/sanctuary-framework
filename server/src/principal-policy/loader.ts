@@ -14,7 +14,12 @@
 
 import { readFile, writeFile, chmod } from "node:fs/promises";
 import { join } from "node:path";
-import type { PrincipalPolicy, Tier2Config, ApprovalChannelConfig } from "./types.js";
+import type {
+  PrincipalPolicy,
+  Tier2Config,
+  ApprovalChannelConfig,
+  ApprovalRedirectConfig,
+} from "./types.js";
 
 /** Default Tier 2 anomaly configuration */
 const DEFAULT_TIER2: Tier2Config = {
@@ -32,6 +37,16 @@ const DEFAULT_CHANNEL: ApprovalChannelConfig = {
   timeout_seconds: 300,
   // SEC-002: auto_deny is not configurable. Timeout always denies.
   // Field omitted intentionally — all channels hardcode deny on timeout.
+};
+
+/**
+ * Default approval-redirect config. Off by default — preserves the legacy
+ * one-channel-per-fortress behavior so existing operators see no change
+ * until they explicitly opt in.
+ */
+const DEFAULT_APPROVAL_REDIRECT: ApprovalRedirectConfig = {
+  enabled: false,
+  mode: "replace",
 };
 
 /** Default Principal Policy — provides meaningful protection without configuration */
@@ -132,6 +147,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "compliance_eu_ai_act_annex_iii_classify", // Read-only; rule-based Annex III classifier
   ],
   approval_channel: DEFAULT_CHANNEL,
+  approval_redirect: DEFAULT_APPROVAL_REDIRECT,
 };
 
 /**
@@ -278,7 +294,43 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
       delete merged.auto_deny;
       return merged;
     })(),
+    approval_redirect: parseApprovalRedirect(raw.approval_redirect),
   };
+}
+
+/**
+ * Parse + validate the optional `approval_redirect` block. Unknown / invalid
+ * inputs fall back to the safe default (off, mode `replace`); a malformed
+ * `mode` value is hard-rejected so a typo does not silently disable the
+ * feature.
+ */
+function parseApprovalRedirect(raw: unknown): ApprovalRedirectConfig {
+  if (raw === undefined || raw === null) {
+    return { ...DEFAULT_APPROVAL_REDIRECT };
+  }
+  if (typeof raw !== "object") {
+    return { ...DEFAULT_APPROVAL_REDIRECT };
+  }
+  const obj = raw as Record<string, unknown>;
+  const enabled =
+    typeof obj.enabled === "boolean" ? obj.enabled : DEFAULT_APPROVAL_REDIRECT.enabled;
+  const modeRaw = obj.mode;
+  let mode: "replace" | "notify" = DEFAULT_APPROVAL_REDIRECT.mode;
+  if (modeRaw !== undefined) {
+    if (modeRaw !== "replace" && modeRaw !== "notify") {
+      throw new Error(
+        `approval_redirect.mode must be "replace" or "notify" (got ${JSON.stringify(modeRaw)})`,
+      );
+    }
+    mode = modeRaw;
+  }
+  const result: ApprovalRedirectConfig = { enabled, mode };
+  // per_agent is reserved for v1.4. Accept and persist if present, but do
+  // not validate per-key shape — v1.x ignores the contents.
+  if (obj.per_agent !== undefined && typeof obj.per_agent === "object" && obj.per_agent !== null) {
+    result.per_agent = obj.per_agent as Record<string, never>;
+  }
+  return result;
 }
 
 /**
@@ -397,6 +449,21 @@ tier3_always_allow:
 approval_channel:
   type: stderr
   timeout_seconds: 300
+
+# ─── Approval Redirect (v1.3 WP-V1.3-10 Upsilon-2) ───────────────────────
+# Cross-harness approval-inbox redirect. When enabled, Tier 1/2 approvals
+# resolve via the unified approval inbox at /api/approval-inbox/* instead
+# of (or in addition to) the configured approval_channel above.
+#
+# mode:
+#   replace: bypass the approval_channel entirely; the gate awaits a
+#            decision from the inbox (default once enabled).
+#   notify:  fire BOTH the approval_channel and the inbox; first decision
+#            wins. Right shape for harnesses that cannot fully suppress
+#            their local approval prompt (e.g. Mastra-class).
+approval_redirect:
+  enabled: false
+  mode: replace
 `;
 }
 

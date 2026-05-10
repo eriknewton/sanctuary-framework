@@ -1,16 +1,28 @@
 /**
  * Sanctuary MCP Server — `sanctuary agents` CLI subcommand
  *
- * Read-only inventory for multi-tenant hosts. Three verbs:
+ * Multi-tenant inventory + configuration verbs:
  *
  *   - `list`    human table / JSON listing of every tenant Sanctuary sees.
  *   - `show <tenant>` details for one tenant (paths, keychain service name,
- *               passphrase status, runtime state, last activity).
+ *               passphrase status, runtime state, last activity, approval
+ *               redirect state).
  *   - `status`  one-line-per-tenant summary (running / stopped + counts).
+ *   - `config <tenant> --approval-redirect=<bool>` (v1.3 Upsilon-2)
+ *               Writes principal-policy.yaml on disk for the tenant.
+ *               Takes effect on the tenant's next gate request (no
+ *               restart required for running servers because the policy
+ *               supplier is consulted per request).
  *
  * Everything here is derivable from the filesystem + optional runtime.json
  * files. No tenant secrets or identity private keys are ever decrypted.
+ *
+ * `agent` (singular) is also accepted at the top-level dispatcher as an
+ * alias — see server/src/cli.ts.
  */
+
+import { readFile, writeFile, chmod } from "node:fs/promises";
+import { join } from "node:path";
 
 import {
   discoverTenants,
@@ -18,6 +30,7 @@ import {
   type TenantDescriptor,
 } from "./discovery.js";
 import { probeTenantDashboard, type HealthProbeResult } from "./health.js";
+import { parsePolicy } from "../../principal-policy/loader.js";
 
 export interface AgentsCommandArgs {
   argv: string[];
@@ -88,6 +101,8 @@ export async function runAgentsCommand(
         return await cmdShow(rest, ctx);
       case "status":
         return await cmdStatus(rest, ctx);
+      case "config":
+        return await cmdConfig(rest, ctx);
       default:
         ctx.err.write(`Unknown subcommand: ${sub}\n`);
         printUsage(ctx.err);
@@ -102,10 +117,18 @@ export async function runAgentsCommand(
 
 function printUsage(s: NodeJS.WritableStream): void {
   s.write(`Usage: sanctuary agents <command> [flags]
+       sanctuary agent  <command> [flags]   (alias)
 
   list [--json]                 List every tenant visible on this host.
-  show <tenant> [--json]        Show details for one tenant.
+  show <tenant> [--json]        Show details for one tenant (includes
+                                approval-redirect state).
   status [--json]               One-line-per-tenant running/stopped summary.
+  config <tenant> [opts]        Write tenant principal-policy.yaml fields.
+    --approval-redirect=<bool>    Toggle cross-harness inbox redirect.
+    --approval-redirect-mode=<replace|notify>
+                                  Pick replace (bypass underlying channel)
+                                  or notify (race both paths). Default
+                                  replace when toggled on.
 
 Options:
   --fortress <path>             Scope discovery to a specific storage path
@@ -242,6 +265,7 @@ async function cmdShow(argv: string[], ctx: ResolvedCtx): Promise<number> {
     return 1;
   }
   const probe = await ctx.probe(tenant);
+  const approvalRedirect = await readApprovalRedirectState(tenant);
   const payload = {
     name: tenant.name,
     storage_path: tenant.storage_path,
@@ -256,6 +280,7 @@ async function cmdShow(argv: string[], ctx: ResolvedCtx): Promise<number> {
       status: probe.status,
       reason: probe.reason,
     },
+    approval_redirect: approvalRedirect,
   };
 
   if (hasJsonFlag(argv)) {
@@ -288,7 +313,233 @@ async function cmdShow(argv: string[], ctx: ResolvedCtx): Promise<number> {
   ctx.out.write(
     `probe:             ${probe.running ? "running" : "not-running"}${probe.reason ? ` (${probe.reason})` : ""}\n`
   );
+  ctx.out.write(
+    `approval_redirect: ${approvalRedirect.enabled ? `on (${approvalRedirect.mode})` : "off"}\n`,
+  );
   return 0;
+}
+
+// ── config ──────────────────────────────────────────────────────────
+
+interface ApprovalRedirectState {
+  enabled: boolean;
+  mode: "replace" | "notify";
+}
+
+/**
+ * Read the tenant's persisted approval_redirect state. Falls back to the
+ * defaults when the policy file is absent or lacks the field.
+ *
+ * Returns the safe default `{ enabled: false, mode: "replace" }` on any
+ * read or parse error so a malformed policy never blocks `agents show`
+ * from rendering. The on-disk validation happens at server boot through
+ * the loader, which throws on malformed shape.
+ */
+async function readApprovalRedirectState(
+  tenant: TenantDescriptor,
+): Promise<ApprovalRedirectState> {
+  const policyPath = join(tenant.storage_path, "principal-policy.yaml");
+  try {
+    const content = await readFile(policyPath, "utf-8");
+    const parsed = parsePolicy(content);
+    const cfg = parsed.approval_redirect;
+    if (!cfg) return { enabled: false, mode: "replace" };
+    return {
+      enabled: !!cfg.enabled,
+      mode: cfg.mode === "notify" ? "notify" : "replace",
+    };
+  } catch {
+    return { enabled: false, mode: "replace" };
+  }
+}
+
+function parseBoolFlag(raw: string | undefined): boolean | null {
+  if (raw === undefined) return null;
+  const v = raw.toLowerCase();
+  if (v === "true" || v === "yes" || v === "on" || v === "1") return true;
+  if (v === "false" || v === "no" || v === "off" || v === "0") return false;
+  return null;
+}
+
+function findFlagValue(argv: string[], name: string): string | undefined {
+  // Accept both `--flag=value` and `--flag value`.
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === name) {
+      return argv[i + 1];
+    }
+    const eq = `${name}=`;
+    if (a.startsWith(eq)) {
+      return a.slice(eq.length);
+    }
+  }
+  return undefined;
+}
+
+async function cmdConfig(argv: string[], ctx: ResolvedCtx): Promise<number> {
+  const positional = argv.find((a) => !a.startsWith("--"));
+  if (!positional) {
+    ctx.err.write(
+      "Missing tenant. Usage: sanctuary agents config <tenant> --approval-redirect=<bool>\n",
+    );
+    return 2;
+  }
+  const tenant = await findTenant(positional, ctx.discoverOpts);
+  if (!tenant) {
+    ctx.err.write(`sanctuary agents: unknown tenant "${positional}"\n`);
+    return 1;
+  }
+
+  const redirectFlag = parseBoolFlag(
+    findFlagValue(argv, "--approval-redirect"),
+  );
+  const modeFlag = findFlagValue(argv, "--approval-redirect-mode");
+
+  if (redirectFlag === null && modeFlag === undefined) {
+    ctx.err.write(
+      "sanctuary agents config: nothing to do. Pass --approval-redirect=<bool> or --approval-redirect-mode=<replace|notify>.\n",
+    );
+    return 2;
+  }
+
+  if (modeFlag !== undefined && modeFlag !== "replace" && modeFlag !== "notify") {
+    ctx.err.write(
+      `sanctuary agents config: --approval-redirect-mode must be "replace" or "notify" (got "${modeFlag}")\n`,
+    );
+    return 2;
+  }
+
+  const current = await readApprovalRedirectState(tenant);
+  const next: ApprovalRedirectState = {
+    enabled: redirectFlag !== null ? redirectFlag : current.enabled,
+    mode:
+      modeFlag === "notify" || modeFlag === "replace"
+        ? modeFlag
+        : current.mode,
+  };
+
+  await writeApprovalRedirectToPolicyFile(tenant.storage_path, next);
+
+  if (hasJsonFlag(argv)) {
+    ctx.out.write(
+      JSON.stringify(
+        {
+          tenant: tenant.name,
+          approval_redirect: next,
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+  } else {
+    ctx.out.write(
+      `sanctuary agents config: tenant "${tenant.name}" approval_redirect=${next.enabled ? `on (${next.mode})` : "off"}\n`,
+    );
+    ctx.out.write(
+      `  Takes effect on the next gate request for the running server.\n`,
+    );
+  }
+  return 0;
+}
+
+/**
+ * Write the `approval_redirect` block into the tenant's
+ * principal-policy.yaml. Preserves any other fields and surrounding
+ * comments via targeted line-range replacement; falls back to appending
+ * a fresh block when the file lacks one. Idempotent.
+ *
+ * If the policy file does not exist (tenant not yet booted), creates it
+ * from the loader-default shape and writes the new block. The next
+ * `sanctuary` boot loads the file as written here.
+ */
+async function writeApprovalRedirectToPolicyFile(
+  storagePath: string,
+  state: ApprovalRedirectState,
+): Promise<void> {
+  const policyPath = join(storagePath, "principal-policy.yaml");
+  let content: string;
+  try {
+    content = await readFile(policyPath, "utf-8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== "ENOENT") throw err;
+    // Generate a minimal default shape so this command works on a tenant
+    // that has been wrapped but not yet booted.
+    content = await defaultPolicyTextForBootstrap();
+  }
+
+  const block = renderApprovalRedirectBlock(state);
+  const updated = upsertApprovalRedirectBlock(content, block);
+
+  await writeFile(policyPath, updated, "utf-8");
+  await chmod(policyPath, 0o600);
+}
+
+function renderApprovalRedirectBlock(state: ApprovalRedirectState): string {
+  return [
+    "# Approval Redirect (v1.3 WP-V1.3-10 Upsilon-2)",
+    "approval_redirect:",
+    `  enabled: ${state.enabled ? "true" : "false"}`,
+    `  mode: ${state.mode}`,
+  ].join("\n");
+}
+
+/**
+ * Replace any existing `approval_redirect:` block with `block`, or append
+ * `block` to the end of the file. The simple matcher looks for a line
+ * starting with `approval_redirect:` (no leading whitespace) and treats
+ * subsequent indented lines plus the immediately preceding heading
+ * comment as part of the block.
+ */
+function upsertApprovalRedirectBlock(content: string, block: string): string {
+  const lines = content.split("\n");
+  const startIdx = lines.findIndex((l) => l.startsWith("approval_redirect:"));
+  if (startIdx === -1) {
+    const trimmed = content.endsWith("\n") ? content : content + "\n";
+    return trimmed + "\n" + block + "\n";
+  }
+  // Walk backward absorbing the preceding heading-comment line if any.
+  let blockStart = startIdx;
+  if (
+    blockStart > 0 &&
+    lines[blockStart - 1] !== undefined &&
+    lines[blockStart - 1]!.startsWith("# Approval Redirect")
+  ) {
+    blockStart = blockStart - 1;
+  }
+  // Walk forward to find the end of the block (next non-indented non-empty
+  // line, or EOF).
+  let blockEnd = startIdx + 1;
+  while (blockEnd < lines.length) {
+    const l = lines[blockEnd]!;
+    if (l === "") {
+      blockEnd++;
+      continue;
+    }
+    if (/^[A-Za-z0-9#]/.test(l)) {
+      break;
+    }
+    blockEnd++;
+  }
+  const before = lines.slice(0, blockStart);
+  const after = lines.slice(blockEnd);
+  const replaced = [...before, ...block.split("\n"), ...after].join("\n");
+  return replaced.endsWith("\n") ? replaced : replaced + "\n";
+}
+
+async function defaultPolicyTextForBootstrap(): Promise<string> {
+  // Inline minimal stub matching the loader's required-keys contract.
+  return [
+    "version: 1",
+    "tier1_always_approve:",
+    "  - state_export",
+    "  - state_import",
+    "  - state_delete",
+    "approval_channel:",
+    "  type: stderr",
+    "  timeout_seconds: 300",
+    "",
+  ].join("\n");
 }
 
 // ── status ──────────────────────────────────────────────────────────

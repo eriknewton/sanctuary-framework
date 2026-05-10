@@ -27,6 +27,10 @@ import {
   ApprovalAggregator,
   type ApprovalGateEvent,
 } from "./principal-policy/approval-aggregator.js";
+import {
+  AggregatorBackedChannel,
+  makeRedirectResolverFromPolicySupplier,
+} from "./principal-policy/channels/aggregator-backed-channel.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
@@ -722,14 +726,13 @@ export async function createSanctuaryServer(options?: {
       }
     : undefined;
 
-  const gate = new ApprovalGate(policy, baseline, approvalChannel, auditLog, injectionDetector, onInjectionAlert);
-
   // v1.3 WP-V1.3-10 Upsilon-1: construct the cross-harness approval
-  // aggregator alongside the gate. The aggregator is a passive subscriber
-  // that observes gate lifecycle events but never affects the deny/accept
-  // decision. Wire-up is unconditional so the aggregator persists every
-  // approval request to the encrypted `_approval_aggregator` namespace
-  // and the operator can list them whether or not a dashboard is active.
+  // aggregator BEFORE the gate so Upsilon-2's AggregatorBackedChannel can
+  // wrap the underlying approval channel with aggregator-driven
+  // resolution. The aggregator remains a passive subscriber to gate
+  // lifecycle events; the channel wrap is the additional Upsilon-2
+  // surface that lets operator decisions through the inbox actually
+  // resolve a blocked Tier 1/2 gate call.
   const fortressIdForAggregator = fortressIdFromStoragePath(config.storage_path);
   const aggregatorIdentityId =
     identityManager.getPrimaryIdentityId() ?? `fortress:${config.storage_path}`;
@@ -740,6 +743,30 @@ export async function createSanctuaryServer(options?: {
     identityId: aggregatorIdentityId,
     fortressId: fortressIdForAggregator,
   });
+
+  // v1.3 WP-V1.3-10 Upsilon-2: wrap the approval channel with the
+  // aggregator-backed channel. When `approval_redirect.enabled` is false
+  // (default), the wrapper short-circuits to underlying-passthrough; the
+  // wire-up is unconditional so operators can flip the toggle via
+  // `sanctuary agents config --approval-redirect=true` without restarting
+  // the server. Mode `replace` bypasses the underlying channel; mode
+  // `notify` races both paths (Mastra-class fallback).
+  const wrappedApprovalChannel = new AggregatorBackedChannel({
+    underlying: approvalChannel,
+    aggregator: approvalAggregator,
+    resolveRedirect: makeRedirectResolverFromPolicySupplier(() => policy),
+    replaceModeTimeoutMs: policy.approval_channel.timeout_seconds * 1000,
+  });
+
+  const gate = new ApprovalGate(
+    policy,
+    baseline,
+    wrappedApprovalChannel,
+    auditLog,
+    injectionDetector,
+    onInjectionAlert,
+  );
+
   gate.setApprovalEventCallback((event) => {
     void approvalAggregator.ingest(event as unknown as ApprovalGateEvent);
   });
