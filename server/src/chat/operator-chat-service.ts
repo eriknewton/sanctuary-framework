@@ -71,6 +71,14 @@ import {
   type ContextFetchers,
   type LlmAssistClassifier,
 } from "./concierge-context-router.js";
+import {
+  parseQueryWithLlmAssist,
+  auditSafeSummary,
+  CANONICAL_AUDIT_EVENT_CLASSES,
+  type AgentRegistryView,
+  type LlmAssistGrammarCompletion,
+  type ParsedQuery,
+} from "./concierge-query-grammar.js";
 
 /**
  * Snapshot of fortress state surfaces the concierge consults to
@@ -208,6 +216,26 @@ export interface OperatorChatServiceDeps {
    * Defaults to `DEFAULT_CONCIERGE_DYNAMIC_CONTEXT_BUDGET` (2000).
    */
   conciergeDynamicContextBudget?: number;
+  /**
+   * WP-V1.3-9 Tau-4: read-only registry view consumed by the operator-
+   * query grammar to extract agent-name parameters. Wired from
+   * `HubAgentRegistrySource.list()` at the hub-service layer; absent
+   * services skip agent-name extraction (the grammar still resolves
+   * time ranges and event types). The registry is read at every
+   * `sendConcierge` call so newly-wrapped agents are visible without
+   * service reconstruction.
+   */
+  conciergeAgentRegistry?: AgentRegistryView;
+  /**
+   * WP-V1.3-9 Tau-4: optional LLM-assist completion for low-confidence
+   * grammar parses. When wired alongside the substrate selector, the
+   * service routes the call through the substrate selector at the
+   * `concierge` surface, so the grammar fallback shares the operator's
+   * substrate choice and never opens a new outbound surface. Distinct
+   * from `conciergeContextLlmAssist`, which classifies queries into
+   * fetcher categories; this hook completes structured grammar fields.
+   */
+  conciergeGrammarLlmAssist?: LlmAssistGrammarCompletion;
 }
 
 const DEFAULT_CONCIERGE_MAX_TOKENS = 512;
@@ -294,6 +322,8 @@ export class OperatorChatService {
   private contextFetchers?: ContextFetchers;
   private contextLlmAssist?: LlmAssistClassifier;
   private dynamicContextBudget: number;
+  private agentRegistry?: AgentRegistryView;
+  private grammarLlmAssist?: LlmAssistGrammarCompletion;
   /**
    * In-memory thread_id assigned to the active concierge session.
    * The first sendConcierge call after construction allocates a fresh
@@ -353,6 +383,12 @@ export class OperatorChatService {
       deps.conciergeDynamicContextBudget > 0
         ? deps.conciergeDynamicContextBudget
         : DEFAULT_CONCIERGE_DYNAMIC_CONTEXT_BUDGET;
+    if (deps.conciergeAgentRegistry) {
+      this.agentRegistry = deps.conciergeAgentRegistry;
+    }
+    if (deps.conciergeGrammarLlmAssist) {
+      this.grammarLlmAssist = deps.conciergeGrammarLlmAssist;
+    }
   }
 
   // ── Concierge ─────────────────────────────────────────────────────────
@@ -451,6 +487,14 @@ export class OperatorChatService {
       });
     }
 
+    // WP-V1.3-9 Tau-4: parse the operator query into structured grammar
+    // before the substrate call. Pure modulo the optional LLM-assist
+    // hook; runs unconditionally so the audit emission carries a parse
+    // even when the dynamic-context router is not wired. The hook
+    // routes through the substrate selector at the same `concierge`
+    // surface, holding the no-new-outbound-surface invariant.
+    const parsedGrammar = await this.runGrammarParse(filterResult.filtered);
+
     const start = Date.now();
     let conciergeBody: string;
     let servedBy: SubstrateChoice = "disabled";
@@ -475,6 +519,7 @@ export class OperatorChatService {
         } else {
           const dynamicResult = await this.runDynamicContextFold(
             filterResult.filtered,
+            parsedGrammar,
           );
           dynamicCategoriesIncluded = dynamicResult.categoriesIncluded;
           const context = await this.assembleConciergeContext(
@@ -567,6 +612,7 @@ export class OperatorChatService {
       ...(this.contextFetchers
         ? { dynamic_context_categories: [...dynamicCategoriesIncluded] }
         : {}),
+      parsed_grammar: auditSafeSummary(parsedGrammar),
     };
     this.emit(OPERATOR_CHAT_OPS.CONCIERGE_CHAT, payload, outcome === "ok" ? "success" : "failure");
 
@@ -805,8 +851,15 @@ export class OperatorChatService {
    * proceeds with no fold. Returns the rendered section + the list of
    * categories whose data made it into the section (used for the
    * round-trip audit emission).
+   *
+   * Tau-4: receives the pre-parsed `ParsedQuery` and forwards it as the
+   * `parsed` opt to `foldContext`, so fetchers see the structured
+   * `FetcherHints` derived from it.
    */
-  private async runDynamicContextFold(query: string): Promise<{
+  private async runDynamicContextFold(
+    query: string,
+    parsedGrammar: ParsedQuery,
+  ): Promise<{
     section: string;
     categoriesIncluded: ContextCategory[];
   }> {
@@ -821,8 +874,25 @@ export class OperatorChatService {
       onFetcherFailure: (category, error) => {
         this.emitContextFetcherFailed(category, classifyFetcherError(error));
       },
+      parsed: parsedGrammar,
     });
     return result;
+  }
+
+  /**
+   * WP-V1.3-9 Tau-4: parse the (PII-filtered) operator query into a
+   * `ParsedQuery`. Routes through the LLM-assist completion hook when
+   * configured and the rule-based parse is below
+   * `LLM_ASSIST_THRESHOLD`. Always returns a parse object (never
+   * throws) so the audit emission can carry the result unconditionally.
+   */
+  private async runGrammarParse(query: string): Promise<ParsedQuery> {
+    return parseQueryWithLlmAssist(query, this.grammarLlmAssist, {
+      ...(this.agentRegistry !== undefined
+        ? { registry: this.agentRegistry }
+        : {}),
+      eventClassEnum: CANONICAL_AUDIT_EVENT_CLASSES,
+    });
   }
 
   /**
