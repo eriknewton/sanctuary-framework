@@ -1,0 +1,330 @@
+/**
+ * Sanctuary v1.3 WP-V1.3-2 Chi-1 Anomaly Detection Pipeline.
+ *
+ * Per-fortress dispatcher that drives the anomaly detector tick:
+ *   1. For every registered detector, call evaluate() to extract +
+ *      observe + predict.
+ *   2. Persist updated classifier state via train() (cocoon-unlock
+ *      cadence; same shape as Phi-1 sentinel dispatcher).
+ *   3. Each above-threshold finding routes to:
+ *      - the existing SentinelFindingStore (Phi-1 surface) so the
+ *        operator sees anomaly findings in the same inbox they use
+ *        for Sentinel findings.
+ *      - the audit log (`anomaly_finding_emitted`).
+ *      - in-process subscribers (dashboard SSE wires through this).
+ *   4. Per-detector exceptions log `anomaly_evaluation_failed` and
+ *      the dispatcher continues with the next detector.
+ *
+ * Dispatcher is one-per-fortress. The fortress id is stamped on
+ * every finding before persistence + emission so multi-fortress
+ * isolation holds at both cryptographic + structural layers.
+ *
+ * Castle-walking discipline:
+ *  - No outbound surface. Reads audit log, writes encrypted
+ *    classifier state + Phi-1 finding store + audit log.
+ *  - Substrate selector NOT exercised at v1.3 Chi-1 (statistical
+ *    classifier only). Chi-2+ may opt into substrate when ML scope
+ *    opens.
+ */
+
+import { randomUUID } from "node:crypto";
+
+import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { StorageBackend } from "../storage/interface.js";
+import type { SentinelFindingStore } from "../sentinel/sentinel-finding-store.js";
+import type {
+  AnomalyContext,
+  AnomalyDetector,
+  AnomalyFinding,
+} from "./types.js";
+
+export const ANOMALY_AUDIT_OPS = {
+  DETECTOR_REGISTERED: "anomaly_detector_registered",
+  DETECTOR_UNREGISTERED: "anomaly_detector_unregistered",
+  FINDING_EMITTED: "anomaly_finding_emitted",
+  EVALUATION_FAILED: "anomaly_evaluation_failed",
+  TRAINING_COMPLETED: "anomaly_training_completed",
+  TRAINING_FAILED: "anomaly_training_failed",
+} as const;
+
+export type AnomalyAuditOp =
+  (typeof ANOMALY_AUDIT_OPS)[keyof typeof ANOMALY_AUDIT_OPS];
+
+export type AnomalyDispatcherUnsubscribe = () => void;
+
+export interface AnomalyDispatcherEmit {
+  type: "finding";
+  finding: AnomalyFinding;
+}
+
+export interface AnomalyDispatcherFailureEmit {
+  type: "evaluation_failed";
+  detector_id: string;
+  error_message: string;
+  observed_at: string;
+}
+
+export type AnomalyDispatcherAnyEmit =
+  | AnomalyDispatcherEmit
+  | AnomalyDispatcherFailureEmit;
+
+export interface AnomalyPipelineDispatcherDeps {
+  findingStore: SentinelFindingStore;
+  auditLog: AuditLog;
+  storage: StorageBackend;
+  masterKey: Uint8Array;
+  fortressId: string;
+  identityId: string;
+  now?: () => Date;
+  /** Tick interval, ms. Default 60s. Set to 0 to disable auto-tick. */
+  tickIntervalMs?: number;
+}
+
+const DEFAULT_TICK_INTERVAL_MS = 60_000;
+
+/**
+ * Per-fortress anomaly dispatcher. Mirrors the Phi-1 sentinel
+ * dispatcher's lifecycle shape so server-boot wiring stays uniform.
+ */
+export class AnomalyPipelineDispatcher {
+  private readonly findingStore: SentinelFindingStore;
+  private readonly auditLog: AuditLog;
+  private readonly storage: StorageBackend;
+  private readonly masterKey: Uint8Array;
+  private readonly fortressId: string;
+  private readonly identityId: string;
+  private readonly now: () => Date;
+  private readonly tickIntervalMs: number;
+  private readonly detectors = new Map<string, AnomalyDetector>();
+  private readonly listeners = new Set<
+    (event: AnomalyDispatcherAnyEmit) => void
+  >();
+  private tickTimer: NodeJS.Timeout | null = null;
+  private tickInFlight = false;
+
+  constructor(deps: AnomalyPipelineDispatcherDeps) {
+    this.findingStore = deps.findingStore;
+    this.auditLog = deps.auditLog;
+    this.storage = deps.storage;
+    this.masterKey = deps.masterKey;
+    this.fortressId = deps.fortressId;
+    this.identityId = deps.identityId;
+    this.now = deps.now ?? (() => new Date());
+    this.tickIntervalMs = deps.tickIntervalMs ?? DEFAULT_TICK_INTERVAL_MS;
+  }
+
+  onEvent(
+    listener: (event: AnomalyDispatcherAnyEmit) => void,
+  ): AnomalyDispatcherUnsubscribe {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Register + subscribe a detector to this fortress. Idempotent: a
+   * second call with the same detectorId returns the already-
+   * registered instance without re-subscribing.
+   */
+  async registerDetector(detector: AnomalyDetector): Promise<AnomalyDetector> {
+    const existing = this.detectors.get(detector.detectorId);
+    if (existing) return existing;
+    const context: AnomalyContext = {
+      fortressId: this.fortressId,
+      auditLog: this.auditLog,
+      storage: this.storage,
+      masterKey: this.masterKey,
+      now: this.now,
+    };
+    await detector.subscribe(context);
+    this.detectors.set(detector.detectorId, detector);
+    this.auditLog.append(
+      "l2",
+      ANOMALY_AUDIT_OPS.DETECTOR_REGISTERED,
+      this.identityId,
+      { detector_id: detector.detectorId, fortress_id: this.fortressId },
+    );
+    return detector;
+  }
+
+  /**
+   * Unregister + tear down a detector. Idempotent. Returns true when
+   * an active registration was removed.
+   */
+  async unregisterDetector(detectorId: string): Promise<boolean> {
+    const detector = this.detectors.get(detectorId);
+    if (!detector) return false;
+    try {
+      await detector.unsubscribe();
+    } finally {
+      this.detectors.delete(detectorId);
+    }
+    this.auditLog.append(
+      "l2",
+      ANOMALY_AUDIT_OPS.DETECTOR_UNREGISTERED,
+      this.identityId,
+      { detector_id: detectorId, fortress_id: this.fortressId },
+    );
+    return true;
+  }
+
+  listDetectors(): string[] {
+    return [...this.detectors.keys()];
+  }
+
+  /** Run one evaluation pass over every registered detector. */
+  async tick(): Promise<AnomalyFinding[]> {
+    if (this.tickInFlight) return [];
+    this.tickInFlight = true;
+    try {
+      const findings: AnomalyFinding[] = [];
+      for (const [detectorId, detector] of this.detectors.entries()) {
+        try {
+          const detectorFindings = await detector.evaluate();
+          for (const raw of detectorFindings) {
+            const stamped = await this.routeFinding(detectorId, raw);
+            findings.push(stamped);
+          }
+          try {
+            const trainingResult = await detector.classifier.train();
+            this.auditLog.append(
+              "l2",
+              ANOMALY_AUDIT_OPS.TRAINING_COMPLETED,
+              this.identityId,
+              {
+                detector_id: detectorId,
+                classifier_id: detector.classifier.classifierId,
+                trained_at: trainingResult.trained_at,
+                sample_count: trainingResult.sample_count,
+                agent_count: trainingResult.agent_count,
+                fortress_id: this.fortressId,
+              },
+            );
+          } catch (trainErr) {
+            const message =
+              trainErr instanceof Error ? trainErr.message : String(trainErr);
+            this.auditLog.append(
+              "l2",
+              ANOMALY_AUDIT_OPS.TRAINING_FAILED,
+              this.identityId,
+              {
+                detector_id: detectorId,
+                error_message: message,
+                fortress_id: this.fortressId,
+              },
+              "failure",
+            );
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          const observedAt = this.now().toISOString();
+          this.auditLog.append(
+            "l2",
+            ANOMALY_AUDIT_OPS.EVALUATION_FAILED,
+            this.identityId,
+            {
+              detector_id: detectorId,
+              error_message: message,
+              fortress_id: this.fortressId,
+            },
+            "failure",
+          );
+          this.emit({
+            type: "evaluation_failed",
+            detector_id: detectorId,
+            error_message: message,
+            observed_at: observedAt,
+          });
+        }
+      }
+      return findings;
+    } finally {
+      this.tickInFlight = false;
+    }
+  }
+
+  start(): void {
+    if (this.tickTimer !== null) return;
+    if (this.tickIntervalMs <= 0) return;
+    this.tickTimer = setInterval(() => {
+      void this.tick();
+    }, this.tickIntervalMs);
+    if (typeof this.tickTimer.unref === "function") {
+      this.tickTimer.unref();
+    }
+  }
+
+  stop(): void {
+    if (this.tickTimer === null) return;
+    clearInterval(this.tickTimer);
+    this.tickTimer = null;
+  }
+
+  async dispose(): Promise<void> {
+    this.stop();
+    const ids = [...this.detectors.keys()];
+    for (const id of ids) {
+      try {
+        await this.unregisterDetector(id);
+      } catch {
+        // Continue draining.
+      }
+    }
+    this.listeners.clear();
+  }
+
+  private async routeFinding(
+    detectorId: string,
+    raw: AnomalyFinding,
+  ): Promise<AnomalyFinding> {
+    const stamped: AnomalyFinding = {
+      ...raw,
+      finding_id: raw.finding_id || randomUUID(),
+      fortress_id: this.fortressId,
+      observed_at: raw.observed_at || this.now().toISOString(),
+    };
+    await this.findingStore.saveFinding(stamped);
+    this.auditLog.append(
+      "l2",
+      ANOMALY_AUDIT_OPS.FINDING_EMITTED,
+      this.identityId,
+      {
+        detector_id: detectorId,
+        finding_id: stamped.finding_id,
+        severity: stamped.severity,
+        anomaly_score: (stamped.details["anomaly_score"] as number | undefined) ?? null,
+        ...(stamped.agent_id !== undefined ? { agent_id: stamped.agent_id } : {}),
+        fortress_id: this.fortressId,
+      },
+    );
+    this.emit({ type: "finding", finding: stamped });
+    return stamped;
+  }
+
+  private emit(event: AnomalyDispatcherAnyEmit): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // Listener exceptions never fail the dispatcher tick.
+      }
+    }
+  }
+}
+
+// Re-export the foundation types from one place so consumers import a
+// single module path. AnomalyDetector is exported as both a type and
+// a runtime class so subclasses can extend it.
+export type {
+  FeatureVector,
+  AnomalyContext,
+  AnomalyClassifier,
+  AnomalyPrediction,
+  AnomalyFinding,
+  FeatureContribution,
+  TrainingResult,
+} from "./types.js";
+export {
+  AnomalyDetector,
+  severityFromAnomalyScore,
+  ANOMALY_SENTINEL_ID_PREFIX,
+} from "./types.js";
