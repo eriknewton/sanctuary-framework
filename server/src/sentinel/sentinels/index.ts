@@ -1,22 +1,14 @@
 /**
- * Sanctuary v1.3 WP-V1.3-1 catalog of baseline sentinels.
+ * Sanctuary v1.3 WP-V1.3-1 catalog of baseline sentinels. Closed at
+ * Phi-5; WP-V1.3-1 Sentinel Baseline Pack is complete.
  *
  * Each entry is a factory the registry calls per-fortress.
  *
- * Phi-1 ships:
- *   - egress-volume
- *
- * Phi-2 adds:
- *   - credential-usage
- *
- * Phi-3 adds:
- *   - cross-agent-chatter
- *
- * Phi-4 adds:
- *   - suspicious-tool-call
- *
- * Phi-5 will register the final entry here:
- *   - anomaly-trigger (meta-sentinel)
+ * Phi-1: egress-volume (first-order, audit-log based)
+ * Phi-2: credential-usage (first-order, audit-log based)
+ * Phi-3: cross-agent-chatter (first-order, audit-log based)
+ * Phi-4: suspicious-tool-call (first-order, audit-log based)
+ * Phi-5: anomaly-trigger (meta-sentinel, finding-store based)
  */
 
 import {
@@ -35,6 +27,10 @@ import {
   SuspiciousToolCallDetector,
   SUSPICIOUS_TOOL_CALL_SENTINEL_ID,
 } from "./suspicious-tool-call-detector.js";
+import {
+  AnomalyTriggerWatcher,
+  ANOMALY_TRIGGER_SENTINEL_ID,
+} from "./anomaly-trigger.js";
 import type { SentinelCatalogEntry } from "../sentinel-registry.js";
 
 export const PHI1_BASELINE_CATALOG: SentinelCatalogEntry[] = [
@@ -62,6 +58,12 @@ export const PHI1_BASELINE_CATALOG: SentinelCatalogEntry[] = [
       "Surfaces tool calls whose argument shape, call frequency, or permission combination looks unusual for the fortress's recent history.",
     factory: () => new SuspiciousToolCallDetector(),
   },
+  {
+    sentinelId: ANOMALY_TRIGGER_SENTINEL_ID,
+    description:
+      "Meta-sentinel. Watches for patterns ACROSS other sentinels' findings: compound suspicious behavior on one agent, fortress-wide finding-count spikes, and novel cross-sentinel combinations. Closes WP-V1.3-1 Sentinel Baseline Pack.",
+    factory: () => new AnomalyTriggerWatcher(),
+  },
 ];
 
 export {
@@ -73,4 +75,6 @@ export {
   CREDENTIAL_USAGE_SENTINEL_ID,
   SuspiciousToolCallDetector,
   SUSPICIOUS_TOOL_CALL_SENTINEL_ID,
+  AnomalyTriggerWatcher,
+  ANOMALY_TRIGGER_SENTINEL_ID,
 };
