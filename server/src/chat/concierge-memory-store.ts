@@ -110,6 +110,27 @@ export interface ReadThreadOptions {
   limit?: number;
 }
 
+/**
+ * Stable failure-reason enum for `readThreadStrict` (WP-V1.3-9 Tau-2).
+ * Mirrors the shape carried by `operator_concierge_memory_read_failed`
+ * audit payloads so the service emits the cause verbatim.
+ */
+export type ConciergeMemoryReadFailure =
+  | "decrypt_failed"
+  | "schema_mismatch"
+  | "oversize_bundle"
+  | "io_failed"
+  | "unknown";
+
+/**
+ * Discriminated result for `readThreadStrict`. The fold-read path uses
+ * this so an empty thread (no bundle) does not look the same as a
+ * corrupted bundle (which must trigger graceful degradation).
+ */
+export type ReadThreadStrictResult =
+  | { ok: true; turns: ConciergeTurn[] }
+  | { ok: false; reason: ConciergeMemoryReadFailure };
+
 export interface ListThreadsOptions {
   /** Cap the number of summaries returned. */
   limit?: number;
@@ -200,6 +221,73 @@ export class ConciergeMemoryStore {
       turns = turns.slice(0, opts.limit);
     }
     return turns;
+  }
+
+  /**
+   * Read turns with explicit failure surfacing (WP-V1.3-9 Tau-2). Where
+   * `readThread` collapses every failure mode to an empty array, this
+   * variant returns a discriminated result so the multi-turn fold path
+   * can degrade cleanly + emit `operator_concierge_memory_read_failed`
+   * with a concrete cause.
+   *
+   * - No bundle on disk → `{ ok: true, turns: [] }` (a fresh thread).
+   * - Bundle present, decode + decrypt + schema check pass → ok with turns.
+   * - Bundle present, oversize → `{ ok: false, reason: "oversize_bundle" }`.
+   * - Bundle present, decryption fails → `{ ok: false, reason: "decrypt_failed" }`.
+   * - Bundle present, schema mismatch (version / thread_id) → `schema_mismatch`.
+   * - Storage IO error → `io_failed`.
+   */
+  async readThreadStrict(
+    threadId: string,
+    opts?: ReadThreadOptions,
+  ): Promise<ReadThreadStrictResult> {
+    const key = bundleKey(threadId);
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.storage.read(CONCIERGE_MEMORY_NAMESPACE, key);
+    } catch {
+      return { ok: false, reason: "io_failed" };
+    }
+    if (!raw) return { ok: true, turns: [] };
+    if (raw.length > MAX_BUNDLE_BYTES) {
+      return { ok: false, reason: "oversize_bundle" };
+    }
+
+    let envelope: EncryptedPayload;
+    try {
+      envelope = JSON.parse(bytesToString(raw));
+    } catch {
+      return { ok: false, reason: "schema_mismatch" };
+    }
+
+    let plaintext: Uint8Array;
+    try {
+      const aad = stringToBytes(threadId);
+      plaintext = decrypt(envelope, this.encryptionKey, aad);
+    } catch {
+      return { ok: false, reason: "decrypt_failed" };
+    }
+
+    let parsed: ConciergeThreadBundle;
+    try {
+      parsed = JSON.parse(bytesToString(plaintext)) as ConciergeThreadBundle;
+    } catch {
+      return { ok: false, reason: "schema_mismatch" };
+    }
+    if (parsed.version !== 1) return { ok: false, reason: "schema_mismatch" };
+    if (parsed.thread_id !== threadId) {
+      return { ok: false, reason: "schema_mismatch" };
+    }
+
+    let turns = parsed.turns;
+    if (opts?.sinceTurnId !== undefined) {
+      const cutoff = opts.sinceTurnId;
+      turns = turns.filter((t) => t.turn_id > cutoff);
+    }
+    if (opts?.limit !== undefined) {
+      turns = turns.slice(0, opts.limit);
+    }
+    return { ok: true, turns };
   }
 
   /**

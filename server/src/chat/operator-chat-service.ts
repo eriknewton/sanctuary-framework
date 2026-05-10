@@ -50,6 +50,7 @@ import {
 } from "./operator-chat-types.js";
 import { OperatorChatStore } from "./operator-chat-store.js";
 import type {
+  ConciergeMemoryReadFailure,
   ConciergeMemoryStore,
   ConciergeThreadSummary,
   ConciergeTurn,
@@ -60,6 +61,7 @@ import type {
   OperatorChatAuditPayload,
   OperatorConciergeChatPayload,
   OperatorConciergeHistoryReadPayload,
+  OperatorConciergeMemoryReadFailedPayload,
   OperatorConciergeThreadDeletedPayload,
 } from "../contracts/v1.2/operator-chat-events.js";
 
@@ -133,16 +135,72 @@ export interface OperatorChatServiceDeps {
   /**
    * WP-V1.3-9 Tau-1: optional foundation memory store. When wired,
    * `sendConcierge` dual-writes each operator+concierge turn pair into
-   * the memory store under a session-scoped thread_id. Read-side wiring
-   * (substrate-selector context-fold) lands in Tau-2.
+   * the memory store under a session-scoped thread_id. Tau-2 adds a
+   * read-fold path that surfaces the prior turns to the substrate so
+   * the concierge maintains coherence across a multi-turn session.
    *
    * Omit at construction time to disable memory-side persistence; the
    * existing `OperatorChatStore` write keeps working unchanged.
    */
   conciergeMemory?: ConciergeMemoryStore;
+  /**
+   * WP-V1.3-9 Tau-2: maximum prior turns folded into the substrate
+   * context per round-trip. Defaults to
+   * `DEFAULT_CONCIERGE_HISTORY_WINDOW_TURNS` (10). The current operator
+   * turn is always present; this caps history only.
+   */
+  conciergeHistoryWindowTurns?: number;
+  /**
+   * WP-V1.3-9 Tau-2: prior turns older than this many milliseconds are
+   * excluded from the active fold even when they remain on disk.
+   * Defaults to `DEFAULT_CONCIERGE_HISTORY_FRESHNESS_MS` (24h).
+   */
+  conciergeHistoryFreshnessMs?: number;
+  /**
+   * WP-V1.3-9 Tau-2: rough token budget for the prior-conversation
+   * portion of the substrate context. Estimated as ~4 chars per token.
+   * Defaults to `DEFAULT_CONCIERGE_HISTORY_TOKEN_BUDGET` (500). The
+   * static reference block + fortress sections are NOT subject to this
+   * budget; only the prior-conversation fold is pruned oldest-first.
+   */
+  conciergeHistoryTokenBudget?: number;
+  /**
+   * WP-V1.3-9 Tau-2: how long an active session may stay quiet before
+   * the next `sendConcierge` allocates a fresh thread_id. Defaults to
+   * `DEFAULT_CONCIERGE_SESSION_TTL_MS` (24h). Does not delete the prior
+   * thread; it remains readable through the memory store.
+   */
+  conciergeSessionTtlMs?: number;
+  /**
+   * Optional clock for the session-TTL + freshness checks. Tests inject
+   * a deterministic clock; production lets the default `Date.now`-based
+   * implementation run.
+   */
+  conciergeClock?: () => number;
 }
 
 const DEFAULT_CONCIERGE_MAX_TOKENS = 512;
+
+/**
+ * WP-V1.3-9 Tau-2 defaults. Coordinator-CTO baked: 10-turn window, 24h
+ * freshness, ~500-token history budget, 24h session TTL. Operators tune
+ * via the service-construction options surface (no dashboard knob in
+ * Tau-2; Tau-3+ exposes a config panel).
+ */
+export const DEFAULT_CONCIERGE_HISTORY_WINDOW_TURNS = 10;
+export const DEFAULT_CONCIERGE_HISTORY_FRESHNESS_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_CONCIERGE_HISTORY_TOKEN_BUDGET = 500;
+export const DEFAULT_CONCIERGE_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Approximate-token estimator. The substrate selector does not expose a
+ * tokenizer to consumers; chars / 4 is the canonical proxy used by the
+ * Sanctuary domain reference test (`reference block is within token
+ * budget`) and matches the substrate prompt budget shape.
+ */
+function approxTokenLen(text: string): number {
+  return Math.ceil(text.length / 4);
+}
 
 /**
  * Static Sanctuary domain reference injected into the concierge context
@@ -190,6 +248,11 @@ export class OperatorChatService {
   private piiFilter?: ConciergePiiFilter;
   private conciergeMaxTokens: number;
   private memory?: ConciergeMemoryStore;
+  private historyWindowTurns: number;
+  private historyFreshnessMs: number;
+  private historyTokenBudget: number;
+  private sessionTtlMs: number;
+  private clock: () => number;
   /**
    * In-memory thread_id assigned to the active concierge session.
    * The first sendConcierge call after construction allocates a fresh
@@ -197,6 +260,14 @@ export class OperatorChatService {
    * folds the prior turns into context. Cleared by `resetConciergeMemoryThread`.
    */
   private activeMemoryThreadId?: string;
+  /**
+   * Wall-clock ms of the most recent sendConcierge that touched the
+   * active session thread. Drives the WP-V1.3-9 Tau-2 session-TTL
+   * check: a fresh sendConcierge after `sessionTtlMs` of quiet
+   * allocates a new thread_id even though the prior one is still
+   * readable from the memory store.
+   */
+  private lastInteractionAt?: number;
 
   constructor(deps: OperatorChatServiceDeps) {
     this.store = deps.store;
@@ -210,6 +281,26 @@ export class OperatorChatService {
     this.conciergeMaxTokens =
       deps.conciergeMaxTokens ?? DEFAULT_CONCIERGE_MAX_TOKENS;
     if (deps.conciergeMemory) this.memory = deps.conciergeMemory;
+    this.historyWindowTurns =
+      deps.conciergeHistoryWindowTurns !== undefined &&
+      deps.conciergeHistoryWindowTurns > 0
+        ? deps.conciergeHistoryWindowTurns
+        : DEFAULT_CONCIERGE_HISTORY_WINDOW_TURNS;
+    this.historyFreshnessMs =
+      deps.conciergeHistoryFreshnessMs !== undefined &&
+      deps.conciergeHistoryFreshnessMs > 0
+        ? deps.conciergeHistoryFreshnessMs
+        : DEFAULT_CONCIERGE_HISTORY_FRESHNESS_MS;
+    this.historyTokenBudget =
+      deps.conciergeHistoryTokenBudget !== undefined &&
+      deps.conciergeHistoryTokenBudget > 0
+        ? deps.conciergeHistoryTokenBudget
+        : DEFAULT_CONCIERGE_HISTORY_TOKEN_BUDGET;
+    this.sessionTtlMs =
+      deps.conciergeSessionTtlMs !== undefined && deps.conciergeSessionTtlMs > 0
+        ? deps.conciergeSessionTtlMs
+        : DEFAULT_CONCIERGE_SESSION_TTL_MS;
+    this.clock = deps.conciergeClock ?? (() => Date.now());
   }
 
   // ── Concierge ─────────────────────────────────────────────────────────
@@ -235,6 +326,19 @@ export class OperatorChatService {
       ? this.piiFilter.filter(trimmed)
       : { filtered: trimmed, redactions: 0 };
 
+    // WP-V1.3-9 Tau-2: rotate the active session thread when the prior
+    // round-trip is older than `sessionTtlMs`. Allocation of the fresh
+    // thread_id happens lazily inside `ensureActiveMemoryThread()` once
+    // the rotation cleared the in-memory pointer.
+    const nowMs = this.clock();
+    if (
+      this.activeMemoryThreadId &&
+      this.lastInteractionAt !== undefined &&
+      nowMs - this.lastInteractionAt > this.sessionTtlMs
+    ) {
+      this.activeMemoryThreadId = undefined;
+    }
+
     const operatorMessage: OperatorChatMessage = {
       message_id: randomUUID(),
       surface: "concierge",
@@ -248,17 +352,49 @@ export class OperatorChatService {
       operatorMessage,
     );
 
+    // WP-V1.3-9 Tau-2 read-fold path. Loaded BEFORE the operator turn
+    // hits the memory store so the prior-turn window does not include
+    // the current query. The fold is fail-soft: a corrupted bundle
+    // emits a degradation audit event and the substrate call proceeds
+    // single-turn, never breaking the user-facing query.
+    let priorTurns: ConciergeTurn[] = [];
+    let memoryReadFailureReason: ConciergeMemoryReadFailure | null = null;
+    let activeThreadIdForRound: string | undefined;
+    if (this.memory) {
+      activeThreadIdForRound = this.ensureActiveMemoryThread();
+      // Pull the full bundle (capped by the store's MAX_BUNDLE_BYTES);
+      // freshness + window slicing happen here in the service so the
+      // service-side window stays semantically tied to the freshness
+      // filter (slice newest-first AFTER stale entries drop out).
+      const result = await this.memory
+        .readThreadStrict(activeThreadIdForRound)
+        .catch(() => ({ ok: false as const, reason: "io_failed" as const }));
+      if (result.ok) {
+        const cutoff = nowMs - this.historyFreshnessMs;
+        const fresh = result.turns.filter((t) => {
+          const ts = Date.parse(t.created_at);
+          return Number.isFinite(ts) && ts >= cutoff;
+        });
+        const recent =
+          fresh.length > this.historyWindowTurns
+            ? fresh.slice(fresh.length - this.historyWindowTurns)
+            : fresh;
+        priorTurns = recent;
+      } else {
+        memoryReadFailureReason = result.reason;
+        this.emitMemoryReadFailed(activeThreadIdForRound, result.reason);
+      }
+    }
+
     // WP-V1.3-9 Tau-1: foundation memory write-side. Append the
-    // operator turn to the active session thread, allocating a fresh
-    // thread_id on first use. Tau-2 wires read-side context-fold; this
-    // PR is intentionally write-only.
+    // operator turn to the active session thread.
     if (this.memory) {
       const threadId = this.ensureActiveMemoryThread();
       await this.memory.appendTurn(threadId, "user", trimmed).catch(() => {
         // Memory persistence failure must not break the concierge
         // round-trip. The existing OperatorChatStore write above
         // covers the in-session render; the audit log captures the
-        // event regardless. Tau-2 will surface persistence health to
+        // event regardless. Tau-3 will surface persistence health to
         // the operator.
       });
     }
@@ -284,7 +420,7 @@ export class OperatorChatService {
             "Concierge unavailable. The chosen substrate does not support summarization. Pick a different substrate in the Policy center.";
           outcome = "substrate_disabled";
         } else {
-          const context = await this.assembleConciergeContext();
+          const context = await this.assembleConciergeContext(priorTurns);
           const response = await this.substrateSelector.invokeSummarize(
             "concierge",
             {
@@ -329,15 +465,21 @@ export class OperatorChatService {
     );
 
     // Tau-1 dual-write of the assistant turn. Same memory store, same
-    // session thread_id assigned for the operator turn above.
+    // session thread_id assigned for the operator turn above. The
+    // assistant turn id is captured for the audit payload's
+    // `turn_index` field.
+    let assistantTurnId: number | undefined;
     if (this.memory) {
       const threadId = this.ensureActiveMemoryThread();
-      await this.memory
+      const persisted = await this.memory
         .appendTurn(threadId, "assistant", conciergeBody)
-        .catch(() => {
-          // See operator-turn note above; persistence failure does not
-          // break the concierge round-trip.
-        });
+        .catch(() => undefined);
+      if (persisted) assistantTurnId = persisted.turn_id;
+    }
+
+    // Mark the round-trip's wall-clock for the next session-TTL check.
+    if (this.memory && activeThreadIdForRound) {
+      this.lastInteractionAt = nowMs;
     }
 
     const payload: OperatorConciergeChatPayload = {
@@ -352,6 +494,16 @@ export class OperatorChatService {
       substrate: servedBy,
       latency_ms: latencyMs,
       outcome,
+      ...(activeThreadIdForRound !== undefined
+        ? { thread_id: activeThreadIdForRound }
+        : {}),
+      ...(assistantTurnId !== undefined ? { turn_index: assistantTurnId } : {}),
+      ...(this.memory
+        ? {
+            prior_turns_folded:
+              memoryReadFailureReason === null ? priorTurns.length : 0,
+          }
+        : {}),
     };
     this.emit(OPERATOR_CHAT_OPS.CONCIERGE_CHAT, payload, outcome === "ok" ? "success" : "failure");
 
@@ -361,6 +513,29 @@ export class OperatorChatService {
       display_label: displayLabel,
       outcome,
     };
+  }
+
+  /**
+   * Emit the WP-V1.3-9 Tau-2 graceful-degradation audit event. Pulled
+   * out of `sendConcierge` so the read-fold path stays readable. Emits
+   * with `result: "failure"` since the concierge fell back to
+   * single-turn mode for this round-trip.
+   */
+  private emitMemoryReadFailed(
+    threadId: string,
+    reason: ConciergeMemoryReadFailure,
+  ): void {
+    const payload: OperatorConciergeMemoryReadFailedPayload = {
+      version: "1.2",
+      event_id: makeEventId("conc-memfail"),
+      emitted_at: new Date().toISOString(),
+      identity_id: this.identityId,
+      kind: "operator_concierge_memory_read_failed",
+      surface: "concierge",
+      thread_id: threadId,
+      failure_reason: reason,
+    };
+    this.emit(OPERATOR_CHAT_OPS.CONCIERGE_MEMORY_READ_FAILED, payload, "failure");
   }
 
   /**
@@ -502,6 +677,11 @@ export class OperatorChatService {
    *   ## Sanctuary reference
    *   <static domain reference block>
    *
+   *   ## Prior conversation             ← WP-V1.3-9 Tau-2, when present
+   *   OPERATOR: ...
+   *   CONCIERGE: ...
+   *   ---
+   *
    *   ## Recent activity
    *   <recentActivity output>
    *
@@ -511,19 +691,76 @@ export class OperatorChatService {
    *   ## Open inbox
    *   <openInbox output>
    *   ```
+   *
+   * The substrate selector ships a `context: string` shape (not a
+   * messages array), so multi-turn coherence is folded as a structured
+   * prior-conversation section with explicit OPERATOR / CONCIERGE
+   * boundaries. Coordinator-CTO guidance: prefer messages-array shape
+   * if available; the v1.2 selector does not expose one, so structured
+   * serialization is the canonical path for v1.3.
    */
-  private async assembleConciergeContext(): Promise<string> {
+  private async assembleConciergeContext(
+    priorTurns: ConciergeTurn[] = [],
+  ): Promise<string> {
     const ref = `## Sanctuary reference\n${SANCTUARY_DOMAIN_REFERENCE}`;
+    const priorSection = this.formatPriorTurnsSection(priorTurns);
 
     if (!this.contextProviders) {
-      return `${ref}\n\n## Recent activity\n(no providers wired)\n\n## Wrapped agents\n(no providers wired)\n\n## Open inbox\n(no providers wired)`;
+      return [
+        ref,
+        ...(priorSection ? [priorSection] : []),
+        "## Recent activity\n(no providers wired)",
+        "## Wrapped agents\n(no providers wired)",
+        "## Open inbox\n(no providers wired)",
+      ].join("\n\n");
     }
     const [activity, agents, inbox] = await Promise.all([
       this.contextProviders.recentActivity(),
       this.contextProviders.agentInventory(),
       this.contextProviders.openInbox(),
     ]);
-    return `${ref}\n\n## Recent activity\n${activity}\n\n## Wrapped agents\n${agents}\n\n## Open inbox\n${inbox}`;
+    return [
+      ref,
+      ...(priorSection ? [priorSection] : []),
+      `## Recent activity\n${activity}`,
+      `## Wrapped agents\n${agents}`,
+      `## Open inbox\n${inbox}`,
+    ].join("\n\n");
+  }
+
+  /**
+   * Render the prior-conversation section with token-budget enforcement
+   * (WP-V1.3-9 Tau-2). Drops oldest turns first when the rendered
+   * section exceeds `historyTokenBudget`. Returns an empty string when
+   * the input is empty or when the budget excludes every turn.
+   */
+  private formatPriorTurnsSection(turns: ConciergeTurn[]): string {
+    if (turns.length === 0) return "";
+    const HEADER = "## Prior conversation";
+    // Format every turn into a single block; budget against the lines
+    // joined with their separators.
+    const lines = turns.map(formatPriorTurnLine);
+
+    const headerTokens = approxTokenLen(`${HEADER}\n`);
+    const sepTokens = approxTokenLen("\n");
+    let runningTokens = headerTokens;
+    let runningLines: string[] = [];
+
+    // Walk newest-first so we keep the most recent turns in budget;
+    // reverse the kept list at render time to preserve chronological
+    // order. Older turns drop out first.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]!;
+      const tokens =
+        approxTokenLen(line) + (runningLines.length > 0 ? sepTokens : 0);
+      if (runningTokens + tokens > this.historyTokenBudget) break;
+      runningTokens += tokens;
+      runningLines.push(line);
+    }
+    if (runningLines.length === 0) return "";
+
+    runningLines = runningLines.reverse();
+    return `${HEADER}\n${runningLines.join("\n")}`;
   }
 
   // ── audit helpers ────────────────────────────────────────────────────
@@ -547,6 +784,19 @@ export class OperatorChatService {
 
 function makeEventId(prefix: string): string {
   return `${prefix}-${Date.now()}-${randomUUID().slice(0, 8)}`;
+}
+
+/**
+ * Render a single `ConciergeTurn` as a `OPERATOR:` / `CONCIERGE:` line
+ * for the multi-turn fold (WP-V1.3-9 Tau-2). Coordinator-CTO format
+ * choice: explicit role labels + content on the same logical line so
+ * small local models parse the boundary cleanly. Multi-line content is
+ * preserved (the model sees a literal newline inside the line) because
+ * stripping it would lose the operator's intent.
+ */
+function formatPriorTurnLine(turn: ConciergeTurn): string {
+  const label = turn.role === "user" ? "OPERATOR" : "CONCIERGE";
+  return `${label}: ${turn.content}`;
 }
 
 /**

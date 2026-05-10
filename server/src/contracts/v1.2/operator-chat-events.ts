@@ -85,6 +85,26 @@ export interface OperatorConciergeChatPayload extends OperatorChatAuditPayloadHe
   latency_ms: number;
   /** Whether the substrate call returned a real summary or fell back. */
   outcome: "ok" | "substrate_failure" | "substrate_disabled";
+  /**
+   * Concierge memory thread the round-trip belongs to (WP-V1.3-9 Tau-2).
+   * Present when the foundation memory store is wired; absent on services
+   * that have not opted in to memory-backed concierge sessions.
+   */
+  thread_id?: string;
+  /**
+   * Monotonic turn id of the assistant message that closed the round-trip
+   * (WP-V1.3-9 Tau-2). Operator turn id is `turn_index - 1`. Absent when
+   * the memory store is not wired or when the assistant persistence step
+   * failed.
+   */
+  turn_index?: number;
+  /**
+   * Number of prior turns folded into the substrate context for this
+   * round-trip (WP-V1.3-9 Tau-2). Zero on the first turn of a session,
+   * and zero when memory-backed history was unavailable. Excludes the
+   * current operator query.
+   */
+  prior_turns_folded?: number;
 }
 
 /**
@@ -117,9 +137,32 @@ export interface OperatorConciergeThreadDeletedPayload
 }
 
 /**
+ * Concierge memory read failed during multi-turn fold (WP-V1.3-9 Tau-2).
+ * Emitted when the substrate-context fold path attempts to load the active
+ * thread's prior turns and the load fails (decryption error, schema
+ * mismatch, oversize bundle). The concierge MUST degrade to single-turn
+ * after emitting; this payload records the degradation for forensic
+ * triage. `failure_reason` is a stable enum so dashboards can group by
+ * cause without parsing free-form text.
+ */
+export interface OperatorConciergeMemoryReadFailedPayload
+  extends OperatorChatAuditPayloadHeader {
+  kind: "operator_concierge_memory_read_failed";
+  surface: Extract<Surface, "concierge">;
+  thread_id: string;
+  failure_reason:
+    | "decrypt_failed"
+    | "schema_mismatch"
+    | "oversize_bundle"
+    | "io_failed"
+    | "unknown";
+}
+
+/**
  * Discriminated union of every operator-chat payload shape v1.2 emits.
  */
 export type OperatorChatAuditPayload =
   | OperatorConciergeChatPayload
   | OperatorConciergeHistoryReadPayload
-  | OperatorConciergeThreadDeletedPayload;
+  | OperatorConciergeThreadDeletedPayload
+  | OperatorConciergeMemoryReadFailedPayload;
