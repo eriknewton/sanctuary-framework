@@ -67,7 +67,15 @@ export const MIN_DMSWITCH_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 // Guardian defaults
 // ===================================================================
 
-/** Default M-of-N threshold: 3 of 5 per Key 13 LOCKED. */
+/**
+ * Default guardian threshold M-of-N per Key 13 LOCKED.
+ *
+ * v1.0.x only: human guardian list is operational; auto-recovery
+ * from federation roster (Key 14, v1.1+) is pending. Production multi-guardian
+ * deployments require manual roster maintenance until Key 14 ships.
+ *
+ * See v1.x federation milestones; Key 14 is gated behind WP-V1.x-FEDERATION-ROSTER.
+ */
 export const DEFAULT_GUARDIAN_THRESHOLD_M = 3;
 export const DEFAULT_GUARDIAN_ROSTER_N = 5;
 

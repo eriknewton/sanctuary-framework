@@ -163,5 +163,5 @@ export function deepSortKeys(obj: unknown): unknown {
  * operates on arbitrary objects.
  */
 export function canonicalizeForSigning(body: object): string {
-  return JSON.stringify(deepSortKeys(body));
+  return JSON.stringify(deepSortKeys(body)).normalize("NFC");
 }

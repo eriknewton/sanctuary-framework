@@ -16,7 +16,8 @@
  * (envelope.verifySignedEvent before add/update; verifyCertChain on insertion).
  */
 
-import { DEFAULTS } from "../constants.js";
+import { DEFAULTS, hasReservedCapabilityBits } from "../constants.js";
+import { MeshReservedCapabilityBitError } from "../errors.js";
 import type { NodeIdentityCertificate } from "../types.js";
 import type { NodePresenceState } from "./constants.js";
 import type { DropoutEvent, RosterEntry } from "./types.js";
@@ -62,6 +63,12 @@ export class NodeRoster {
    * (operator-rotated key path; existing roster state preserved).
    */
   add(certificate: NodeIdentityCertificate, nowMs: number = Date.now()): void {
+    // Defense-in-depth: primary cert verification (verifyCertChain) is the
+    // canonical gate for reserved capability bits. This check catches bugs
+    // where a caller bypasses or forgets the chain verification step.
+    if (hasReservedCapabilityBits(certificate.capabilities)) {
+      throw new MeshReservedCapabilityBitError(certificate.capabilities);
+    }
     const existing = this.entries.get(certificate.node_id);
     if (existing) {
       // Cert rotation — preserve presence state and heartbeat history but
