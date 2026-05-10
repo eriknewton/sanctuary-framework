@@ -30,7 +30,8 @@ import {
   consumeResetHistoryMarker,
   ResetHistoryMalformedError,
 } from "./audit/reset-history.js";
-import { loadPrincipalPolicy } from "./principal-policy/loader.js";
+import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
+import type { PrincipalPolicy } from "./principal-policy/types.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
@@ -392,7 +393,16 @@ export async function startStandaloneDashboard(
   }
 
   // 6. Load principal policy and baseline
-  const policy = await loadPrincipalPolicy(config.storage_path);
+  let policy: PrincipalPolicy;
+  try {
+    policy = await loadPrincipalPolicy(config.storage_path);
+  } catch (err) {
+    if (err instanceof MalformedPrincipalPolicyError) {
+      console.error(`\nSanctuary cannot start.\n${err.message}\n`);
+      process.exit(1);
+    }
+    throw err;
+  }
   const baseline = new BaselineTracker(storage, masterKey);
   await baseline.load();
 

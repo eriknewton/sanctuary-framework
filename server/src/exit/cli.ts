@@ -14,7 +14,7 @@ import { StateStore } from "../l1-cognitive/state-store.js";
 import { IdentityManager } from "../l1-cognitive/tools.js";
 import { ReputationStore } from "../l4-reputation/reputation-store.js";
 import { loadConfig } from "../config.js";
-import { loadPrincipalPolicy } from "../principal-policy/loader.js";
+import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "../principal-policy/loader.js";
 import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
 import { bytesToString, fromBase64url, stringToBytes } from "../core/encoding.js";
 import { exportExitBundle, importExitBundle, exitBundleManifestShape } from "./bundle.js";
@@ -245,7 +245,16 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       }
       const config = await loadConfig();
       const ctx = await openExitContext(argv, env);
-      const policy = await loadPrincipalPolicy(ctx.storagePath);
+      let policy;
+      try {
+        policy = await loadPrincipalPolicy(ctx.storagePath);
+      } catch (policyErr) {
+        if (policyErr instanceof MalformedPrincipalPolicyError) {
+          write(err, `\nSanctuary cannot proceed.\n${policyErr.message}\n`);
+          return 1;
+        }
+        throw policyErr;
+      }
       const result = await exportExitBundle({
         bundleDir: outDir,
         storage: ctx.storage,

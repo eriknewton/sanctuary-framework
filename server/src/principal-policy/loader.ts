@@ -1,13 +1,15 @@
 /**
- * Sanctuary MCP Server — Principal Policy Loader
+ * Sanctuary MCP Server -- Principal Policy Loader
  *
  * Loads the Principal Policy from a YAML file at server startup.
- * The policy is immutable at runtime — no MCP tool can modify it.
+ * The policy is immutable at runtime -- no MCP tool can modify it.
  *
  * Security invariant:
  * - The policy is loaded ONCE at startup and frozen.
  * - No code path exists to modify the policy during a session.
  * - If no policy file exists, a sensible default is generated and saved.
+ * - If the policy file exists but is malformed, the server refuses to start
+ *   rather than silently substituting a default (operator intent preservation).
  */
 
 import { readFile, writeFile, chmod } from "node:fs/promises";
@@ -397,28 +399,71 @@ approval_channel:
 }
 
 /**
+ * Thrown when a principal-policy.yaml file exists on disk but cannot be
+ * parsed or validated. Sanctuary refuses to substitute a default policy
+ * when an existing file is present, to avoid silently overriding operator
+ * intent.
+ */
+export class MalformedPrincipalPolicyError extends Error {
+  constructor(
+    public readonly policyPath: string,
+    public readonly reason: string
+  ) {
+    super(
+      `Principal policy at ${policyPath} is malformed and cannot be loaded.\n` +
+        `Reason: ${reason}\n` +
+        `Sanctuary refuses to substitute a default policy when an existing file is present, ` +
+        `to avoid silently overriding operator intent. Fix the file or delete it to regenerate the default.`
+    );
+    this.name = "MalformedPrincipalPolicyError";
+  }
+}
+
+/**
  * Load the Principal Policy from disk.
  * If no policy file exists, generate the default and save it.
- * The returned policy is frozen — immutable at runtime.
+ * If the file exists but is malformed, throw MalformedPrincipalPolicyError.
+ * The returned policy is frozen -- immutable at runtime.
  */
 export async function loadPrincipalPolicy(
   storagePath: string
 ): Promise<PrincipalPolicy> {
   const policyPath = join(storagePath, "principal-policy.yaml");
 
+  let content: string;
   try {
-    const content = await readFile(policyPath, "utf-8");
+    content = await readFile(policyPath, "utf-8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") {
+      // Expected on first boot; generate default
+      const defaultYaml = generateDefaultPolicyYaml();
+      try {
+        await writeFile(policyPath, defaultYaml, "utf-8");
+        await chmod(policyPath, 0o600);
+      } catch (writeErr) {
+        console.warn(
+          `Sanctuary: could not write default principal policy to ${policyPath}: ` +
+            `${(writeErr as Error).message}. Continuing with in-memory default.`
+        );
+      }
+      return Object.freeze({ ...DEFAULT_POLICY });
+    }
+    // I/O error other than missing-file: propagate
+    throw new MalformedPrincipalPolicyError(
+      policyPath,
+      `read failed: ${(err as Error).message}`
+    );
+  }
+
+  // File read succeeded; parse + validate
+  try {
     const policy = parsePolicy(content);
     return Object.freeze(policy);
-  } catch {
-    // No policy file — generate default
-    const defaultYaml = generateDefaultPolicyYaml();
-    try {
-      await writeFile(policyPath, defaultYaml, "utf-8");
-      await chmod(policyPath, 0o600);
-    } catch {
-      // Can't write — use default in memory
-    }
-    return Object.freeze({ ...DEFAULT_POLICY });
+  } catch (parseErr) {
+    throw new MalformedPrincipalPolicyError(
+      policyPath,
+      (parseErr as Error).message
+    );
   }
 }
