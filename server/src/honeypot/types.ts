@@ -27,8 +27,8 @@ import type { SentinelSeverity } from "../sentinel/types.js";
 
 /** Operator-friendly trap class enum. */
 export type TrapClass =
-  | "http_endpoint"   // Pi-1 (this PR)
-  | "filesystem"      // Pi-2
+  | "http_endpoint"   // Pi-1
+  | "filesystem"      // Pi-2 (this PR)
   | "tool_call"       // Pi-3
   | "credential";     // Pi-4
 
@@ -42,21 +42,66 @@ export type TrapClass =
  * boundary).
  */
 export interface HttpEndpointTrigger {
+  kind: "http_endpoint";
   path_pattern: string;
   method?: string;
   expected_caller_types: string[];
 }
 
 /**
+ * Filesystem trap trigger (Pi-2). The runtime monitor observes
+ * filesystem-shaped operations the operator declared sensitive and
+ * fires when a matching operation is reported through
+ * `FilesystemTrapMonitor.observe(...)`. Pi-2 ships the monitor as a
+ * pure observation primitive; specific wiring (proxy-call accesses,
+ * state-store reads, future tool-call instrumentation) attaches in
+ * follow-up PRs by calling the monitor's observe API.
+ *
+ * `ops` declares which operations the operator cares about; an
+ * `observe()` call whose `operation` is not in this set will not
+ * fire the trap.
+ */
+export interface FilesystemTrigger {
+  kind: "filesystem";
+  /**
+   * Filesystem-path glob with `*` (one segment) / `**` (multiple
+   * segments). Anchored at both ends per the Pi-1 glob contract.
+   */
+  path_pattern: string;
+  /** Operations the trap fires on. */
+  ops: FilesystemOp[];
+  /** Operator-recorded metadata; not gated on. */
+  expected_caller_types: string[];
+}
+
+/** Filesystem operations recognized by the monitor. */
+export type FilesystemOp = "read" | "write" | "delete" | "list";
+
+export const FILESYSTEM_OPS: readonly FilesystemOp[] = [
+  "read",
+  "write",
+  "delete",
+  "list",
+] as const;
+
+/**
+ * Discriminated-union trigger keyed by `kind`. The outer `trap_class`
+ * field on TrapSpec keeps the operator-facing taxonomy; the inner
+ * `kind` discriminator on the trigger is what TypeScript narrows on
+ * inside runtime handlers + the registry's matching code.
+ */
+export type TrapTrigger = HttpEndpointTrigger | FilesystemTrigger;
+
+/**
  * One compiled trap. Persisted by the registry, deployed to the
  * runtime route table, and used by the finding emitter when a trap
- * triggers. Pi-1 ships the http_endpoint class only; Pi-2+ extend
- * via the `trigger` discriminator.
+ * triggers. Pi-1 shipped http_endpoint only; Pi-2 adds filesystem
+ * via the `kind`-discriminated trigger union.
  */
 export interface TrapSpec {
   trap_id: string;
   trap_class: TrapClass;
-  trigger: HttpEndpointTrigger;
+  trigger: TrapTrigger;
   finding_severity: SentinelSeverity;
   english_text: string;
   explanation_paragraph: string;
@@ -83,6 +128,12 @@ export interface HoneypotDraft {
  * DEPLOYED:    operator activates the TrapSpec at runtime.
  * TRIGGERED:   trap detected an access. One event per matched call.
  * UNDEPLOYED:  TrapSpec removed from the runtime.
+ * LOADED:      Pi-2 fortress-boot rehydration. Fires once per boot
+ *              when one or more persisted specs are re-deployed into
+ *              the in-memory registry. Carries `trap_count` for the
+ *              soak drill; downstream observers can branch on this
+ *              op to distinguish boot-reload from operator-driven
+ *              deploys.
  */
 export const HONEYPOT_AUDIT_OPS = {
   DRAFTED: "honeypot_drafted",
@@ -90,6 +141,7 @@ export const HONEYPOT_AUDIT_OPS = {
   DEPLOYED: "honeypot_deployed",
   TRIGGERED: "honeypot_triggered",
   UNDEPLOYED: "honeypot_undeployed",
+  LOADED: "honeypot_loaded",
 } as const;
 
 export type HoneypotAuditOp =

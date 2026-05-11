@@ -241,6 +241,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private honeypotOperatorId: string | null = null;
   private honeypotFortressId: string | null = null;
   private honeypotSelector: import("../intelligence/selector.js").SubstrateSelector | null = null;
+  // Pi-2: encrypted at-rest persistence for deployed honeypot traps.
+  // When present, the management API's deploy + undeploy handlers
+  // write through to the store; on fortress boot the host code calls
+  // `store.loadAll()` and re-deploys the persisted specs into the
+  // in-memory registry before this dashboard begins serving.
+  private honeypotStore: import("../honeypot/trap-store.js").TrapStore | null = null;
 
   constructor(config: DashboardConfig) {
     this.config = config;
@@ -382,6 +388,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     operatorId?: string | null;
     fortressId?: string | null;
     selector?: import("../intelligence/selector.js").SubstrateSelector | null;
+    /**
+     * Pi-2: encrypted at-rest persistence for the deployed traps. When
+     * non-null, the management API's deploy + undeploy handlers write
+     * through to the store so the fortress keeps its trap deployment
+     * across restart. Boot rehydration is the host's responsibility:
+     * call `store.loadAll()` and `registry.deploy(spec)` for each
+     * persisted spec BEFORE calling this method.
+     */
+    store?: import("../honeypot/trap-store.js").TrapStore | null;
   }): void {
     this.honeypotRegistry = opts.registry;
     this.honeypotFindingStore = opts.findingStore ?? null;
@@ -389,6 +404,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.honeypotOperatorId = opts.operatorId ?? null;
     this.honeypotFortressId = opts.fortressId ?? null;
     this.honeypotSelector = opts.selector ?? null;
+    this.honeypotStore = opts.store ?? null;
   }
 
   /**
@@ -510,6 +526,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         fortressId: this.honeypotFortressId ?? "fortress_default",
         ...(this.honeypotSelector !== null
           ? { selector: this.honeypotSelector }
+          : {}),
+        ...(this.honeypotStore !== null
+          ? { store: this.honeypotStore }
           : {}),
       },
       req,

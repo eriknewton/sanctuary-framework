@@ -40,6 +40,8 @@ import { HandoffLog } from "./coordination/handoff-log.js";
 import { HandoffEventBridge } from "./coordination/handoff-routes.js";
 import { WorkflowStateTracker } from "./coordination/workflow-state-tracker.js";
 import { TrapRegistry } from "./honeypot/trap-registry.js";
+import { TrapStore } from "./honeypot/trap-store.js";
+import { HONEYPOT_AUDIT_OPS } from "./honeypot/types.js";
 import { PHI1_BASELINE_CATALOG } from "./sentinel/sentinels/index.js";
 import { loadSentinelSubscriptions } from "./sentinel/subscription-store.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
@@ -626,6 +628,16 @@ export async function createSanctuaryServer(options?: {
   let approvalChannel: StderrApprovalChannel | DashboardApprovalChannel | WebhookApprovalChannel;
   let dashboard: DashboardApprovalChannel | undefined;
 
+  // WP-V1.3-5 Pi-2: the Intelligence Substrate Selector is hoisted to
+  // outer function scope so the honeypot wiring below (after the
+  // dashboard/webhook/stderr branch closes) can pass it into
+  // `setHoneypotRegistry`. Pi-1 deferred this forwarding because the
+  // selector was scoped to the `if (config.dashboard.enabled)` block;
+  // the boot-path persistence work in Pi-2 needs the selector in scope
+  // alongside the trap registry + trap store, so the declaration moves
+  // here and the dashboard branch only assigns to it.
+  let intelligenceSelector: SubstrateSelector | undefined;
+
   if (config.dashboard.enabled) {
     // Resolve auth token: "auto" generates a random 32-byte hex token
     let authToken = config.dashboard.auth_token;
@@ -666,7 +678,8 @@ export async function createSanctuaryServer(options?: {
     // fortress storage namespace `_intelligence`, encrypted with the
     // master key. Best-effort: any construction failure degrades to a
     // selector-less binding (Intelligence panel surfaces "not configured").
-    let intelligenceSelector: SubstrateSelector | undefined;
+    // Pi-2: the declaration moved to outer function scope so the honeypot
+    // wiring below can pick it up; the dashboard branch only constructs.
     try {
       intelligenceSelector = new SubstrateSelector({
         storage,
@@ -887,19 +900,59 @@ export async function createSanctuaryServer(options?: {
     });
   }
 
-  // v1.3 WP-V1.3-5 Pi-1: Honeypot Authoring. Construct the per-
-  // fortress trap registry and bind to the dashboard alongside the
-  // existing sentinel finding store + audit log. The substrate
-  // selector wiring for the LLM compile path is deliberately not
-  // forwarded here at boot: `intelligenceSelector` is constructed
-  // inside the v1.1-bindings conditional scope earlier in this file
-  // and is not visible here. Operators who want the LLM compile path
-  // hit the management API via the dashboard (which has the selector
-  // in scope) or run the heuristic compile (Path B); both produce
-  // valid TrapSpecs. Pi-2+ will widen the boot-path selector
-  // forwarding when fortress-config persistence for the LLM compile
-  // surface lands.
+  // v1.3 WP-V1.3-5 Pi-1/Pi-2: Honeypot Authoring. Construct the per-
+  // fortress trap registry, encrypted at-rest trap store, and bind to
+  // the dashboard alongside the existing sentinel finding store +
+  // audit log.
+  //
+  // Pi-2 closes Pi-1's two deferred items:
+  //   (a) Boot-path selector forwarding. `intelligenceSelector` is now
+  //       hoisted to outer function scope and is in scope here; we
+  //       forward it to the management routes so the LLM compile path
+  //       fires from the API surface AND from any embedded caller.
+  //   (b) Fortress-config persistence. A `TrapStore` encrypts deployed
+  //       TrapSpecs under an HKDF subkey of the fortress master key
+  //       (info string `l2-honeypot-trap-v1`, AAD bound to trap_id),
+  //       parallels the Phi-1 SentinelFindingStore shape, and lets the
+  //       fortress restore deployed traps after restart. We call
+  //       `store.loadAll()` to repopulate the in-memory registry
+  //       BEFORE binding to the dashboard so trap dispatch is live
+  //       from the first request the dashboard serves.
+  //
+  // Boot reload is best-effort: a store error (storage corruption,
+  // missing namespace) logs to stderr and the registry stays empty;
+  // operators can re-deploy via the management API. A registry with
+  // no specs is operationally indistinguishable from a fresh fortress.
   const honeypotRegistry = new TrapRegistry();
+  const honeypotStore = new TrapStore({
+    storage,
+    masterKey,
+    fortressId: fortressIdForAggregator,
+  });
+  try {
+    const persistedSpecs = await honeypotStore.loadAll();
+    for (const spec of persistedSpecs) {
+      honeypotRegistry.deploy(spec);
+    }
+    if (persistedSpecs.length > 0) {
+      auditLog.append(
+        "l2",
+        HONEYPOT_AUDIT_OPS.LOADED,
+        aggregatorIdentityId,
+        {
+          fortress_id: fortressIdForAggregator,
+          trap_count: persistedSpecs.length,
+        },
+      );
+    }
+  } catch (err) {
+    // SAFETY: same logging story as the intelligence selector site;
+    // raw stderr until a structured logger lands.
+    console.error(
+      `  Note: honeypot trap store unavailable (${(err as Error).message}). ` +
+        `Deployed traps from prior runs will not be restored; re-deploy via the management API.`,
+    );
+  }
   if (dashboard) {
     dashboard.setHoneypotRegistry({
       registry: honeypotRegistry,
@@ -907,6 +960,8 @@ export async function createSanctuaryServer(options?: {
       auditLog,
       operatorId: aggregatorIdentityId,
       fortressId: fortressIdForAggregator,
+      ...(intelligenceSelector ? { selector: intelligenceSelector } : {}),
+      store: honeypotStore,
     });
   }
 

@@ -32,7 +32,21 @@ import {
   HONEYPOT_SENTINEL_ID_PREFIX,
   type HoneypotDraft,
   type TrapSpec,
+  type TrapTrigger,
 } from "./types.js";
+
+/**
+ * Render the operator-friendly suffix that follows the `path_pattern`
+ * on `sanctuary honeypot compile`'s non-JSON output. Branches on the
+ * trigger's discriminator so the suffix carries the most-relevant
+ * class-specific detail without leaking the union shape to the user.
+ */
+function formatTriggerSuffix(trigger: TrapTrigger): string {
+  if (trigger.kind === "http_endpoint") {
+    return ` (${trigger.method ?? "ANY"})`;
+  }
+  return ` (ops=${trigger.ops.join(",")})`;
+}
 import {
   compileHoneypot,
   hashOfEnglishDraft,
@@ -134,9 +148,10 @@ export async function runHoneypotCli(
     } else {
       write(out, `compiled: ${result.spec.trap_id}\n`);
       write(out, `source: ${result.source}\n`);
+      write(out, `class: ${result.spec.trap_class}\n`);
       write(
         out,
-        `pattern: ${result.spec.trigger.path_pattern} (${result.spec.trigger.method ?? "ANY"})\n`,
+        `pattern: ${result.spec.trigger.path_pattern}${formatTriggerSuffix(result.spec.trigger)}\n`,
       );
       write(out, `severity: ${result.spec.finding_severity}\n`);
       write(out, `explanation: ${result.spec.explanation_paragraph}\n`);
