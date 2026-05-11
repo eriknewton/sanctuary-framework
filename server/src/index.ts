@@ -39,6 +39,7 @@ import { AnomalyPipelineDispatcher } from "./anomaly-detection/anomaly-pipeline.
 import { HandoffLog } from "./coordination/handoff-log.js";
 import { HandoffEventBridge } from "./coordination/handoff-routes.js";
 import { WorkflowStateTracker } from "./coordination/workflow-state-tracker.js";
+import { TrapRegistry } from "./honeypot/trap-registry.js";
 import { PHI1_BASELINE_CATALOG } from "./sentinel/sentinels/index.js";
 import { loadSentinelSubscriptions } from "./sentinel/subscription-store.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
@@ -883,6 +884,29 @@ export async function createSanctuaryServer(options?: {
       auditLog,
       operatorId: aggregatorIdentityId,
       workflowStateTracker,
+    });
+  }
+
+  // v1.3 WP-V1.3-5 Pi-1: Honeypot Authoring. Construct the per-
+  // fortress trap registry and bind to the dashboard alongside the
+  // existing sentinel finding store + audit log. The substrate
+  // selector wiring for the LLM compile path is deliberately not
+  // forwarded here at boot: `intelligenceSelector` is constructed
+  // inside the v1.1-bindings conditional scope earlier in this file
+  // and is not visible here. Operators who want the LLM compile path
+  // hit the management API via the dashboard (which has the selector
+  // in scope) or run the heuristic compile (Path B); both produce
+  // valid TrapSpecs. Pi-2+ will widen the boot-path selector
+  // forwarding when fortress-config persistence for the LLM compile
+  // surface lands.
+  const honeypotRegistry = new TrapRegistry();
+  if (dashboard) {
+    dashboard.setHoneypotRegistry({
+      registry: honeypotRegistry,
+      findingStore: sentinelFindingStore,
+      auditLog,
+      operatorId: aggregatorIdentityId,
+      fortressId: fortressIdForAggregator,
     });
   }
 

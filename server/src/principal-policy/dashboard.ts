@@ -60,6 +60,13 @@ import {
 } from "../coordination/handoff-routes.js";
 import type { ContextTransferExtractorDeps } from "../coordination/context-transfer-extractor.js";
 import type { WorkflowStateTracker } from "../coordination/workflow-state-tracker.js";
+import type { TrapRegistry } from "../honeypot/trap-registry.js";
+import {
+  HONEYPOT_API_PREFIX,
+  handleHoneypotRoute,
+  handleHoneypotTriggerIfMatch,
+} from "../honeypot/runtime-trap-handler.js";
+import type { SentinelFindingStore } from "../sentinel/sentinel-finding-store.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -222,6 +229,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     | import("../l2-operational/audit-log.js").AuditLog
     | null = null;
   private handoffOperatorId: string | null = null;
+  // v1.3 WP-V1.3-5 Pi-1 Honeypot Authoring: per-fortress trap registry
+  // + finding store + audit log + operator id. Front-of-dispatch hook
+  // consults the registry on every request; management routes at
+  // /api/honeypot/* go through the dispatch path.
+  private honeypotRegistry: TrapRegistry | null = null;
+  private honeypotFindingStore: SentinelFindingStore | null = null;
+  private honeypotAuditLog:
+    | import("../l2-operational/audit-log.js").AuditLog
+    | null = null;
+  private honeypotOperatorId: string | null = null;
+  private honeypotFortressId: string | null = null;
+  private honeypotSelector: import("../intelligence/selector.js").SubstrateSelector | null = null;
 
   constructor(config: DashboardConfig) {
     this.config = config;
@@ -342,6 +361,37 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * v1.3 WP-V1.3-5 Pi-1 Honeypot Authoring: bind the per-fortress
+   * trap registry + finding store + audit log + operator id. Once
+   * set, two surfaces activate:
+   *   1. Front-of-dispatch trap-trigger hook: every request runs
+   *      through `handleHoneypotTriggerIfMatch` BEFORE legacy/v1.1/
+   *      sentinel/coordination routing. Matching traps return 404
+   *      and the request never reaches the regular dispatcher.
+   *   2. Management API at /api/honeypot/* routes through
+   *      `handleHoneypotRoute`.
+   *
+   * The optional `selector` opt wires the LLM compile path; absent
+   * selector forces the heuristic compile path (which still produces
+   * a usable TrapSpec with warnings).
+   */
+  setHoneypotRegistry(opts: {
+    registry: TrapRegistry | null;
+    findingStore?: SentinelFindingStore | null;
+    auditLog?: import("../l2-operational/audit-log.js").AuditLog | null;
+    operatorId?: string | null;
+    fortressId?: string | null;
+    selector?: import("../intelligence/selector.js").SubstrateSelector | null;
+  }): void {
+    this.honeypotRegistry = opts.registry;
+    this.honeypotFindingStore = opts.findingStore ?? null;
+    this.honeypotAuditLog = opts.auditLog ?? null;
+    this.honeypotOperatorId = opts.operatorId ?? null;
+    this.honeypotFortressId = opts.fortressId ?? null;
+    this.honeypotSelector = opts.selector ?? null;
+  }
+
+  /**
    * v1.3 WP-V1.3-10 dispatch entry point. Called from `handleRequest`
    * before the legacy approval route table. Returns true when served.
    */
@@ -422,6 +472,80 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         ...(this.workflowStateTracker !== null
           ? { workflowStateTracker: this.workflowStateTracker }
           : {}),
+      },
+      req,
+      res,
+    );
+  }
+
+  /**
+   * v1.3 WP-V1.3-5 Pi-1 dispatch entry point. Routes
+   * `/api/honeypot/*` requests through the honeypot management
+   * router when a registry has been bound. Returns true when served.
+   */
+  private async dispatchHoneypot(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<boolean> {
+    if (
+      !this.honeypotRegistry ||
+      !this.honeypotFindingStore ||
+      !this.honeypotAuditLog
+    ) {
+      return false;
+    }
+    return handleHoneypotRoute(
+      {
+        authConfig: {
+          loopbackAutoAuth: this._autoAuthLocalhost,
+          ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
+        },
+        registry: this.honeypotRegistry,
+        findingStore: this.honeypotFindingStore,
+        auditLog: this.honeypotAuditLog,
+        operatorId:
+          this.honeypotOperatorId ??
+          this.identityManager?.getPrimaryIdentityId() ??
+          "operator_dashboard",
+        fortressId: this.honeypotFortressId ?? "fortress_default",
+        ...(this.honeypotSelector !== null
+          ? { selector: this.honeypotSelector }
+          : {}),
+      },
+      req,
+      res,
+    );
+  }
+
+  /**
+   * v1.3 WP-V1.3-5 Pi-1 front-of-dispatch trap-trigger hook. Examines
+   * every request BEFORE legacy/v1.1/sentinel/coordination routing.
+   * Returns true when a deployed trap matched the request and the
+   * handler emitted the audit event + sentinel finding + plausible
+   * 404 response. Returns false when no trap matched; caller
+   * continues with normal routing.
+   */
+  private async dispatchHoneypotTrap(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<boolean> {
+    if (
+      !this.honeypotRegistry ||
+      !this.honeypotFindingStore ||
+      !this.honeypotAuditLog
+    ) {
+      return false;
+    }
+    return handleHoneypotTriggerIfMatch(
+      {
+        registry: this.honeypotRegistry,
+        findingStore: this.honeypotFindingStore,
+        auditLog: this.honeypotAuditLog,
+        operatorId:
+          this.honeypotOperatorId ??
+          this.identityManager?.getPrimaryIdentityId() ??
+          "operator_dashboard",
+        fortressId: this.honeypotFortressId ?? "fortress_default",
       },
       req,
       res,
@@ -893,6 +1017,65 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (method === "OPTIONS") {
       res.writeHead(204);
       res.end();
+      return;
+    }
+
+    // v1.3 WP-V1.3-5 Pi-1: front-of-dispatch trap-trigger hook. Runs
+    // BEFORE every other dispatch so an operator can deploy a trap at
+    // any path (including paths that would otherwise hit legacy/v1.1
+    // routes). The hook itself short-circuits when the path starts
+    // with /api/honeypot, /api/sentinels, or /api/coordination so
+    // management surfaces never get shadowed.
+    if (this.honeypotRegistry) {
+      this.dispatchHoneypotTrap(req, res)
+        .then((handled) => {
+          if (handled) return;
+          // Continue with normal request handling.
+          this.continueHandleRequest(req, res, url, method, origin, selfOrigin);
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+      return;
+    }
+
+    this.continueHandleRequest(req, res, url, method, origin, selfOrigin);
+  }
+
+  /**
+   * v1.3 WP-V1.3-5 Pi-1: post-honeypot-trap request continuation. The
+   * front-of-dispatch trap-trigger hook may short-circuit a request;
+   * when it does not, this method runs the original dispatch ladder.
+   * Pulled out as a helper so the trap-hook + non-trap paths share
+   * one code path through every downstream dispatcher.
+   */
+  private continueHandleRequest(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+    method: string,
+    _origin: string | undefined,
+    _selfOrigin: string,
+  ): void {
+    // v1.3 WP-V1.3-5 Pi-1 Honeypot management API at /api/honeypot/*.
+    if (
+      this.honeypotRegistry &&
+      url.pathname.startsWith(HONEYPOT_API_PREFIX)
+    ) {
+      this.dispatchHoneypot(req, res)
+        .then((handled) => {
+          if (handled) return;
+          this.handleLegacyRequest(req, res, url, method);
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
       return;
     }
 
