@@ -18,6 +18,7 @@ import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "../principal
 import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
 import { bytesToString, fromBase64url, stringToBytes } from "../core/encoding.js";
 import { exportExitBundle, importExitBundle, exitBundleManifestShape } from "./bundle.js";
+import type { ExitBundleDidWebBinding } from "../contracts/v1.1/exit-bundle-manifest.js";
 import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
 
 export interface ExitCommandArgs {
@@ -255,6 +256,35 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         }
         throw policyErr;
       }
+      // Recognition-Layer Path C primary build 2: optional did:web
+      // binding for the manifest's identity_binding. Operator opts in
+      // by passing --did-web + --did-web-authority-host. The
+      // --include-did-web=false flag exists as a forward-compat
+      // explicit opt-out for the day fortress-config auto-includes a
+      // stored did:web identifier; today, absence of --did-web is the
+      // load-bearing opt-out.
+      const includeDidWebFlag = flagValue(argv, "--include-did-web");
+      const includeDidWebDisabled = includeDidWebFlag === "false";
+      const didWebIdentifier = flagValue(argv, "--did-web");
+      const didWebAuthorityHost = flagValue(argv, "--did-web-authority-host");
+      const didWebPublishedAt = flagValue(argv, "--did-web-published-at");
+      let exportDidWeb: ExitBundleDidWebBinding | undefined;
+      if (!includeDidWebDisabled && didWebIdentifier !== undefined) {
+        if (didWebAuthorityHost === undefined) {
+          write(
+            err,
+            "Error: --did-web requires --did-web-authority-host=<host>\n",
+          );
+          return 2;
+        }
+        exportDidWeb = {
+          identifier: didWebIdentifier,
+          authority_host: didWebAuthorityHost,
+          ...(didWebPublishedAt !== undefined
+            ? { published_at: didWebPublishedAt }
+            : {}),
+        };
+      }
       const result = await exportExitBundle({
         bundleDir: outDir,
         storage: ctx.storage,
@@ -267,6 +297,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         stateStoragePath: ctx.stateStoragePath,
         stateNamespaces: repeatedFlagValues(argv, "--state-namespace"),
         keySource: ctx.keySource,
+        ...(exportDidWeb !== undefined ? { didWeb: exportDidWeb } : {}),
       });
       if (json) write(out, JSON.stringify(result, null, 2) + "\n");
       else {
@@ -349,6 +380,17 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         write(err, "--conflict must be skip, overwrite, or version\n");
         return 2;
       }
+      // Recognition-Layer Path C primary build 2: did:web import-side
+      // flags. --did-web-allowed-host is repeatable; an empty list
+      // means the importer refuses to leave the fortress (no-outbound-
+      // by-default) and surfaces a warning if the manifest carries a
+      // did_web binding. --skip-did-web-verify is the explicit
+      // operator override for accepting the manifest signature alone.
+      const didWebAllowedHosts = repeatedFlagValues(
+        argv,
+        "--did-web-allowed-host",
+      );
+      const skipDidWebVerify = hasFlag(argv, "--skip-did-web-verify");
       let result;
       try {
         result = await importExitBundle({
@@ -365,6 +407,10 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
           sourcePassphrase: flagValue(argv, "--source-passphrase"),
           sourceRecoveryKey: flagValue(argv, "--source-recovery-key"),
           destinationSignerIdentityId: flagValue(argv, "--destination-identity-id"),
+          ...(didWebAllowedHosts.length > 0
+            ? { didWebAllowedHosts }
+            : {}),
+          skipDidWebVerify,
         });
       } catch (e) {
         if (e instanceof InvalidExitBundleError) {

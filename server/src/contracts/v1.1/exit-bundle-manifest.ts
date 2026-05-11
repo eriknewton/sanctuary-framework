@@ -118,6 +118,45 @@ export interface ExitBundleArtifactEntry {
 }
 
 /**
+ * did:web pointer embedded in the identity binding when the operator
+ * has issued a did:web identifier for the source fortress and asked
+ * the exit-bundle exporter to publish that pointer alongside the
+ * manifest (Recognition-Layer Path C primary build 2).
+ *
+ * The bundle does NOT carry the did:web DID Document itself; the
+ * receiving regime resolves the DID Document via standard DNS + TLS
+ * against `authority_host`. That dependency is intentional: it is
+ * the operator's HTTPS infrastructure that publishes the document,
+ * not Sanctuary's, and it is the receiving regime's resolver that
+ * verifies the document, not Sanctuary's. Recognition flows along
+ * the web's existing trust chain without trusting Sanctuary as a
+ * middleman.
+ *
+ * The signature scheme over the manifest body covers this field by
+ * construction (it lives inside `ExitBundleManifestBody`), so an
+ * attacker who substituted the did:web pointer without re-signing
+ * the body would be rejected at the existing manifest-signature
+ * gate.
+ */
+export interface ExitBundleDidWebBinding {
+  /**
+   * The did:web URI string the operator published, e.g.,
+   * `did:web:alice.example.com:fortress:abc123`. The receiving
+   * regime resolves this to fetch the DID Document.
+   */
+  identifier: string;
+  /** Authority host the operator's DID Document is published on. */
+  authority_host: string;
+  /**
+   * Optional ISO 8601 timestamp at which the operator confirmed
+   * HTTPS publication. Surfaces to the verifier as evidence that
+   * the operator believes the document is reachable; the verifier
+   * still re-resolves to confirm.
+   */
+  published_at?: string;
+}
+
+/**
  * Identity binding embedded in the manifest. Carries only public material.
  */
 export interface ExitBundleIdentityBinding {
@@ -129,6 +168,17 @@ export interface ExitBundleIdentityBinding {
   fortress_master_pubkey: string;
   /** Optional DID, when one is bound to this identity. */
   did?: string;
+  /**
+   * Optional did:web pointer (Recognition-Layer Path C primary build 2).
+   * Present only when the operator has issued a did:web identifier
+   * for the source fortress AND has not explicitly opted out at
+   * export time via `--include-did-web=false`. The receiving regime
+   * resolves the pointer via DNS + TLS to verify the bundle's origin
+   * without trusting Sanctuary as intermediary. Absent on bundles
+   * exported before the recognition-layer integration shipped
+   * (backward-compatible).
+   */
+  did_web?: ExitBundleDidWebBinding;
 }
 
 /**
