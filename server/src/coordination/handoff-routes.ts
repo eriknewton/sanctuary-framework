@@ -33,6 +33,12 @@ import {
   type HandoffLog,
   type HandoffEntry,
 } from "./handoff-log.js";
+import {
+  CONTEXT_TRANSFER_AUDIT_OPS,
+  extractContextTransferBreakdown,
+  type ContextTransferBreakdown,
+  type ContextTransferExtractorDeps,
+} from "./context-transfer-extractor.js";
 
 export const COORDINATION_API_PREFIX = "/api/coordination";
 export const COORDINATION_HANDOFFS_PREFIX = "/api/coordination/handoffs";
@@ -48,6 +54,13 @@ export interface HandoffRouterDeps {
   operatorId: string;
   /** In-process SSE event bridge; the route subscribes for fanout. */
   events: HandoffEventBridge;
+  /**
+   * v1.3 WP-V1.3-3 Omega-2 context-transfer extractor deps. Optional;
+   * when provided, the detail route enriches its response with a
+   * `context_transfer_breakdown` field. Backward-compatible: Omega-1
+   * callers that ignore the field still work.
+   */
+  contextTransfer?: ContextTransferExtractorDeps;
 }
 
 /**
@@ -231,7 +244,39 @@ export async function handleCoordinationRoute(
           target_agent_id: detail.entry.target_agent_id,
         },
       );
-      writeJSON(res, 200, { ok: true, data: detail });
+      // v1.3 WP-V1.3-3 Omega-2: enrich the detail response with the
+      // structured context-transfer breakdown when extractor deps are
+      // wired. Backward-compatible: Omega-1 callers that ignore the
+      // field still parse the response. Extractor failure is silent;
+      // the operator still gets the underlying handoff detail.
+      let breakdown: ContextTransferBreakdown | null = null;
+      try {
+        breakdown = await extractContextTransferBreakdown(
+          detail,
+          deps.contextTransfer ?? {},
+        );
+        deps.auditLog.append(
+          "l2",
+          CONTEXT_TRANSFER_AUDIT_OPS.DECODED,
+          deps.operatorId,
+          {
+            fortress_id: deps.handoffLog.getFortressId(),
+            entry_id: detail.entry.entry_id,
+            extractor_path: breakdown.source,
+            confidence: breakdown.confidence,
+            transferred_count: breakdown.transferred.length,
+            withheld_count: breakdown.withheld.length,
+          },
+        );
+      } catch {
+        // Extractor failure is non-fatal; surface the base detail
+        // and skip the audit emission.
+      }
+      const responseData =
+        breakdown !== null
+          ? { ...detail, context_transfer_breakdown: breakdown }
+          : detail;
+      writeJSON(res, 200, { ok: true, data: responseData });
       return true;
     }
 
