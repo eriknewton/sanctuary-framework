@@ -34,9 +34,21 @@ import { deriveMasterKey, derivePurposeKey } from "../src/core/key-derivation.js
 import { createIdentity } from "../src/core/identity.js";
 import { stringToBytes } from "../src/core/encoding.js";
 import type { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
+import { bindWithRetry, randomTestPort } from "./util/port-collision-retry.js";
 
-function randomPort(): number {
-  return 14000 + Math.floor(Math.random() * 30000);
+/**
+ * Sigma-7: retry-safe wrapper around `startStandaloneDashboard`.
+ * DashboardApprovalChannel embeds the port in selfOrigin and one-click
+ * session URLs, so port: 0 ephemeral is not safe here; bindWithRetry is.
+ */
+async function startWithRetry(
+  options: Parameters<typeof startStandaloneDashboard>[0],
+): Promise<{ dashboard: DashboardApprovalChannel; port: number }> {
+  return bindWithRetry(async () => {
+    const port = randomTestPort();
+    const dashboard = await startStandaloneDashboard({ ...options, port });
+    return { dashboard, port };
+  });
 }
 
 /**
@@ -208,10 +220,8 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
 
     let threw: Error | null = null;
     try {
-      dashboard = await startStandaloneDashboard({
-        port: randomPort(),
-        host: "127.0.0.1",
-      });
+      const r = await startWithRetry({ host: "127.0.0.1" });
+      dashboard = r.dashboard;
     } catch (err) {
       threw = err as Error;
     }
@@ -234,12 +244,11 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
     delete process.env.SANCTUARY_STORAGE_PATH;
     delete process.env.SANCTUARY_PASSPHRASE;
 
-    const port = randomPort();
-    dashboard = await startStandaloneDashboard({
+    const { dashboard: d, port } = await startWithRetry({
       tenant: "alpha-tenant",
-      port,
       host: "127.0.0.1",
     });
+    dashboard = d;
 
     // Boot succeeded against the tenant's storage path — confirm by reading
     // /api/status, which only works if the master key derived correctly.
@@ -255,11 +264,11 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
 
     let threw: Error | null = null;
     try {
-      dashboard = await startStandaloneDashboard({
+      const r = await startWithRetry({
         tenant: "does-not-exist",
-        port: randomPort(),
         host: "127.0.0.1",
       });
+      dashboard = r.dashboard;
     } catch (err) {
       threw = err as Error;
     }
@@ -284,11 +293,11 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
     };
 
     try {
-      dashboard = await startStandaloneDashboard({
+      const r = await startWithRetry({
         passphrase: "passphrase-B-WRONG",
-        port: randomPort(),
         host: "127.0.0.1",
       });
+      dashboard = r.dashboard;
     } finally {
       console.error = origError;
     }

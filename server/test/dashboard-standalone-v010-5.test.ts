@@ -27,33 +27,23 @@ import { deriveMasterKey, derivePurposeKey } from "../src/core/key-derivation.js
 import { createIdentity } from "../src/core/identity.js";
 import { stringToBytes } from "../src/core/encoding.js";
 import type { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
-
-function randomPort(): number {
-  return 17000 + Math.floor(Math.random() * 30000);
-}
+import { bindWithRetry, randomTestPort } from "./util/port-collision-retry.js";
 
 /**
  * Retry-safe wrapper around `startStandaloneDashboard` for tests.
- *
- * `dashboard.start()` rejects with `EADDRINUSE` when its bound port collides
- * with another concurrent vitest worker (we share the host's port space and
- * vitest fans tests out over multiple processes). Retry on EADDRINUSE only —
- * any other failure is a real bug and must surface.
+ * Sigma-7: delegates to the canonical `bindWithRetry` + `randomTestPort`
+ * helpers in test/util/port-collision-retry.ts. DashboardApprovalChannel
+ * embeds the port in selfOrigin and one-click session URLs, so we must
+ * know the port before bind (Sigma-6 rule option 2 / bindWithRetry).
  */
 async function startWithRetry(
   options: Parameters<typeof startStandaloneDashboard>[0]
 ): Promise<{ dashboard: DashboardApprovalChannel; port: number }> {
-  for (let attempt = 0; attempt < 6; attempt++) {
-    const port = randomPort();
-    try {
-      const dashboard = await startStandaloneDashboard({ ...options, port });
-      return { dashboard, port };
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EADDRINUSE") continue;
-      throw err;
-    }
-  }
-  throw new Error("startStandaloneDashboard: no free port after 6 attempts");
+  return bindWithRetry(async () => {
+    const port = randomTestPort();
+    const dashboard = await startStandaloneDashboard({ ...options, port });
+    return { dashboard, port };
+  });
 }
 
 async function seedTenant(storagePath: string, passphrase: string): Promise<void> {

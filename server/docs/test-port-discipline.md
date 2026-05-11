@@ -1,4 +1,4 @@
-# Test port discipline (Sigma-6)
+# Test port discipline (Sigma-6 / Sigma-7)
 
 This document describes the rule of thumb every Sanctuary test file
 must follow when binding a TCP listener (HTTP server, websocket, raw
@@ -41,9 +41,59 @@ the same in every incident: the test picked a random port in
 `10000-59999`, and another worker in the vitest pool (or a stale
 process from a prior run) had already bound that port.
 
-The fix landed in this PR rewires `dashboard.test.ts` to use
-`bindWithRetry` (already established for `webhook.test.ts`) and adds
-this regression gate so the pattern can't silently regress.
+The fix landed in Sigma-6 rewired `dashboard.test.ts` to use
+`bindWithRetry` (already established for `webhook.test.ts`) and
+added this regression gate so the pattern could not silently regress.
+
+## Patterns Sigma-7 caught
+
+Iteration-8's Omega-1 CI run hit a NEW EADDRINUSE flake on
+`test/dashboard/api.test.ts:port 35292`. Same structural class,
+different file. The Sigma-6 scanner did not catch it because
+api.test.ts has no syntactic `.listen()` call in its own text: it
+passes a randomly-allocated port into `startDashboardServer({ port:
+randomPort() })`, which calls `.listen()` internally. The scanner
+only inspected `.listen()` text in the test file, so api.test.ts
+slipped past.
+
+The full Sigma-7 audit surfaced five files of the same class. Each
+defined a local `randomPort()` helper and handed the port to a
+constructor or factory function (`startDashboardServer`,
+`new DashboardApprovalChannel`, `createSilentReceiver`) without any
+retry layer:
+
+- `test/dashboard/api.test.ts`: the Omega-1 flake source.
+- `test/dashboard-standalone-v010-4.test.ts`
+- `test/dashboard-standalone-v010-5.test.ts`
+- `test/dashboard-standalone-v010-6.test.ts`
+- `test/security/dashboard-no-query-token.test.ts`
+- `test/security/sec-002-auto-deny-hardcoded.test.ts`: explicitly
+  whitelisted with a `// port-discipline: ignore` comment that
+  referenced a deferred "v1.x housekeeping follow-up." Sigma-7
+  closes that follow-up.
+
+### The Sigma-7 rules
+
+1. **Local `randomPort` helpers are forbidden.** The canonical
+   replacement is `randomTestPort` from
+   `server/test/util/port-collision-retry.ts`. The scanner regex is
+   `/^\s*(?:export\s+)?(?:function|const|let|var)\s+randomPort\b/`.
+   Local declarations are flagged with the canonical-helper hint.
+
+2. **`bindWithRetry` recognition tightened.** Pre-Sigma-7 the
+   scanner matched the bare word anywhere in the file, including
+   comments. A file mentioning `bindWithRetry` in a TODO could
+   satisfy the `.listen(<var>)` check without actually using the
+   retry helper. Sigma-7 requires an actual call site
+   (`/\bbindWithRetry\s*\(/`).
+
+3. **Choosing the right pattern per SUT.** If the system under test
+   reads the actual port back via `server.address()` (e.g.
+   `startDashboardServer`), `port: 0` ephemeral is structurally
+   correct. If the SUT bakes the port into URLs or outbound
+   payloads before bind (e.g. `DashboardApprovalChannel` embeds
+   it in selfOrigin / one-click session URLs; `WebhookApprovalChannel`
+   embeds it in callback metadata), `bindWithRetry` is required.
 
 ## Cross-references
 

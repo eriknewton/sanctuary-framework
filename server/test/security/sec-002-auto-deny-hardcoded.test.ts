@@ -17,10 +17,7 @@ import { WebhookApprovalChannel } from "../../src/principal-policy/webhook.js";
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import { parsePolicy, DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import type { ApprovalRequest } from "../../src/principal-policy/types.js";
-
-function randomPort(): number {
-  return 10000 + Math.floor(Math.random() * 50000);
-}
+import { bindWithRetry, randomTestPort } from "../util/port-collision-retry.js";
 
 const TIER_1_REQUEST: ApprovalRequest = {
   operation: "state_export",
@@ -31,6 +28,11 @@ const TIER_1_REQUEST: ApprovalRequest = {
 };
 
 // ── Mock webhook receiver that never responds (forces timeout) ──────────
+//
+// Sigma-7: start() now handles the listen 'error' event explicitly so
+// EADDRINUSE propagates as a rejected promise. bindWithRetry can then
+// catch it and retry with a fresh port. The pre-Sigma-7 shape only
+// resolved on the listening callback, so EADDRINUSE hung forever.
 
 function createSilentReceiver(port: number) {
   const connections = new Set<import("node:net").Socket>();
@@ -41,12 +43,15 @@ function createSilentReceiver(port: number) {
     connections.add(socket);
     socket.on("close", () => connections.delete(socket));
   });
-  // port-discipline: ignore — caller-supplied port; this file's six randomPort()
-  // sites need a coordinated bindWithRetry refactor (v1.x housekeeping follow-up).
-  // The flake risk is lower than dashboard.test.ts because each receiver/channel
-  // pair only binds two ports per test rather than per-suite churn.
   return {
-    start: () => new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve)),
+    start: () =>
+      new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(port, "127.0.0.1", () => {
+          server.off("error", reject);
+          resolve();
+        });
+      }),
     stop: () => new Promise<void>((resolve) => {
       // Destroy all open connections so close() can complete promptly
       for (const socket of connections) socket.destroy();
@@ -100,23 +105,33 @@ describe("SEC-002: Approval gate timeout always denies", () => {
     }, 15000);
 
     it("denies on timeout even when auto_deny was historically false", async () => {
-      const receiverPort = randomPort();
-      const callbackPort = randomPort();
-
-      receiver = createSilentReceiver(receiverPort);
-      await receiver.start();
-
-      // Before SEC-002 fix, passing auto_deny: false here would
-      // cause timeout to resolve as "approve"
-      webhook = new WebhookApprovalChannel({
-        webhook_url: `http://127.0.0.1:${receiverPort}/webhook`,
-        webhook_secret: "test-secret",
-        callback_port: callbackPort,
-        callback_host: "127.0.0.1",
-        timeout_seconds: 1,
-        auto_deny: false, // Must be ignored
+      // Sigma-7: bindWithRetry coordinates two-port allocation
+      // (receiver + webhook callback). On EADDRINUSE the inner block
+      // tears down any partial state (receiver only when webhook
+      // hasn't been built yet; receiver gets torn down if webhook
+      // fails) before re-throwing.
+      await bindWithRetry(async () => {
+        const receiverPort = randomTestPort();
+        const callbackPort = randomTestPort();
+        receiver = createSilentReceiver(receiverPort);
+        await receiver.start();
+        try {
+          // Before SEC-002 fix, passing auto_deny: false here would
+          // cause timeout to resolve as "approve"
+          webhook = new WebhookApprovalChannel({
+            webhook_url: `http://127.0.0.1:${receiverPort}/webhook`,
+            webhook_secret: "test-secret",
+            callback_port: callbackPort,
+            callback_host: "127.0.0.1",
+            timeout_seconds: 1,
+            auto_deny: false, // Must be ignored
+          });
+          await webhook.start();
+        } catch (err) {
+          await receiver.stop().catch(() => {});
+          throw err;
+        }
       });
-      await webhook.start();
 
       const response = await webhook.requestApproval(TIER_1_REQUEST);
       expect(response.decision).toBe("deny");
@@ -124,20 +139,25 @@ describe("SEC-002: Approval gate timeout always denies", () => {
     }, 10000);
 
     it("denies on timeout with no auto_deny field", async () => {
-      const receiverPort = randomPort();
-      const callbackPort = randomPort();
-
-      receiver = createSilentReceiver(receiverPort);
-      await receiver.start();
-
-      webhook = new WebhookApprovalChannel({
-        webhook_url: `http://127.0.0.1:${receiverPort}/webhook`,
-        webhook_secret: "test-secret",
-        callback_port: callbackPort,
-        callback_host: "127.0.0.1",
-        timeout_seconds: 1,
+      await bindWithRetry(async () => {
+        const receiverPort = randomTestPort();
+        const callbackPort = randomTestPort();
+        receiver = createSilentReceiver(receiverPort);
+        await receiver.start();
+        try {
+          webhook = new WebhookApprovalChannel({
+            webhook_url: `http://127.0.0.1:${receiverPort}/webhook`,
+            webhook_secret: "test-secret",
+            callback_port: callbackPort,
+            callback_host: "127.0.0.1",
+            timeout_seconds: 1,
+          });
+          await webhook.start();
+        } catch (err) {
+          await receiver.stop().catch(() => {});
+          throw err;
+        }
       });
-      await webhook.start();
 
       const response = await webhook.requestApproval(TIER_1_REQUEST);
       expect(response.decision).toBe("deny");
@@ -155,16 +175,22 @@ describe("SEC-002: Approval gate timeout always denies", () => {
     });
 
     it("denies on timeout even when auto_deny was historically false", async () => {
-      const port = randomPort();
-      // Before SEC-002 fix, passing auto_deny: false would cause
-      // timeout to resolve as "approve"
-      dashboard = new DashboardApprovalChannel({
-        port,
-        host: "127.0.0.1",
-        timeout_seconds: 1,
-        auto_deny: false, // Must be ignored
+      // Sigma-7: bindWithRetry handles EADDRINUSE collisions under
+      // parallel vitest workers. DashboardApprovalChannel embeds the
+      // port in selfOrigin and one-click session URLs, so we re-pick
+      // a fresh port and reconstruct the channel on each retry.
+      await bindWithRetry(async () => {
+        const port = randomTestPort();
+        // Before SEC-002 fix, passing auto_deny: false would cause
+        // timeout to resolve as "approve"
+        dashboard = new DashboardApprovalChannel({
+          port,
+          host: "127.0.0.1",
+          timeout_seconds: 1,
+          auto_deny: false, // Must be ignored
+        });
+        await dashboard.start();
       });
-      await dashboard.start();
 
       const response = await dashboard.requestApproval(TIER_1_REQUEST);
       expect(response.decision).toBe("deny");
@@ -172,13 +198,15 @@ describe("SEC-002: Approval gate timeout always denies", () => {
     }, 10000);
 
     it("denies on timeout with no auto_deny field", async () => {
-      const port = randomPort();
-      dashboard = new DashboardApprovalChannel({
-        port,
-        host: "127.0.0.1",
-        timeout_seconds: 1,
+      await bindWithRetry(async () => {
+        const port = randomTestPort();
+        dashboard = new DashboardApprovalChannel({
+          port,
+          host: "127.0.0.1",
+          timeout_seconds: 1,
+        });
+        await dashboard.start();
       });
-      await dashboard.start();
 
       const response = await dashboard.requestApproval(TIER_1_REQUEST);
       expect(response.decision).toBe("deny");
