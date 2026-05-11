@@ -38,6 +38,7 @@ import { SentinelDispatcher } from "./sentinel/sentinel-dispatcher.js";
 import { AnomalyPipelineDispatcher } from "./anomaly-detection/anomaly-pipeline.js";
 import { HandoffLog } from "./coordination/handoff-log.js";
 import { HandoffEventBridge } from "./coordination/handoff-routes.js";
+import { WorkflowStateTracker } from "./coordination/workflow-state-tracker.js";
 import { PHI1_BASELINE_CATALOG } from "./sentinel/sentinels/index.js";
 import { loadSentinelSubscriptions } from "./sentinel/subscription-store.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
@@ -870,12 +871,18 @@ export async function createSanctuaryServer(options?: {
     fortressId: fortressIdForAggregator,
   });
   const handoffEventBridge = new HandoffEventBridge();
+  // v1.3 WP-V1.3-3 Omega-3 workflow state tracker. Per-fortress
+  // instance so transition emissions stay scoped to the fortress that
+  // observed them. The HandoffLog instance is already per-fortress;
+  // the tracker rides the same scope.
+  const workflowStateTracker = new WorkflowStateTracker();
   if (dashboard) {
     dashboard.setHandoffLog({
       handoffLog,
       eventBridge: handoffEventBridge,
       auditLog,
       operatorId: aggregatorIdentityId,
+      workflowStateTracker,
     });
   }
 
