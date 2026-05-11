@@ -153,6 +153,12 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
+  if (args[0] === "anomaly") {
+    const { runAnomalyCommand } = await import("./cli/anomaly.js");
+    const code = await runAnomalyCommand({ argv: args.slice(1) });
+    process.exit(code);
+  }
+
   if (args[0] === "broker-server") {
     const { openBroker } = await import("./l3-disclosure/broker/open.js");
     const { createBrokerMcpServer } = await import("./mcp/broker-server.js");
