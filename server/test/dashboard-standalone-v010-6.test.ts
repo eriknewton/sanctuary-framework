@@ -43,25 +43,21 @@ import { createIdentity } from "../src/core/identity.js";
 import { stringToBytes } from "../src/core/encoding.js";
 import { generateDashboardHTML } from "../src/principal-policy/dashboard-html.js";
 import type { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
+import { bindWithRetry, randomTestPort } from "./util/port-collision-retry.js";
 
-function randomPort(): number {
-  return 17000 + Math.floor(Math.random() * 30000);
-}
-
+/**
+ * Sigma-7: delegates to the canonical bindWithRetry + randomTestPort
+ * helpers. DashboardApprovalChannel embeds the port in selfOrigin and
+ * one-click session URLs, so we must know the port before bind.
+ */
 async function startWithRetry(
   options: Parameters<typeof startStandaloneDashboard>[0]
 ): Promise<{ dashboard: DashboardApprovalChannel; port: number }> {
-  for (let attempt = 0; attempt < 6; attempt++) {
-    const port = randomPort();
-    try {
-      const dashboard = await startStandaloneDashboard({ ...options, port });
-      return { dashboard, port };
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EADDRINUSE") continue;
-      throw err;
-    }
-  }
-  throw new Error("startStandaloneDashboard: no free port after 6 attempts");
+  return bindWithRetry(async () => {
+    const port = randomTestPort();
+    const dashboard = await startStandaloneDashboard({ ...options, port });
+    return { dashboard, port };
+  });
 }
 
 async function seedTenant(storagePath: string, passphrase: string): Promise<void> {

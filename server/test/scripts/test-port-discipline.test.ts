@@ -116,6 +116,66 @@ describe("Sigma-6 test-port-discipline gate — fixture-level checks", () => {
     const violations = scanFile(path);
     expect(violations.length).toBe(0);
   });
+
+  // Sigma-7: detect local randomPort helpers (the api.test.ts class).
+  it("Sigma-7: flags a locally-declared randomPort() function", () => {
+    const path = writeTempTest(
+      `function randomPort(): number {\n` +
+        `  return 10000 + Math.floor(Math.random() * 50000);\n` +
+        `}\n` +
+        `const port = randomPort();\n`,
+    );
+    const violations = scanFile(path);
+    expect(violations.length).toBeGreaterThanOrEqual(1);
+    expect(violations[0]!.reason).toContain("randomTestPort");
+  });
+
+  it("Sigma-7: flags a locally-declared randomPort const", () => {
+    const path = writeTempTest(
+      `const randomPort = () => 10000 + Math.floor(Math.random() * 50000);\n` +
+        `const port = randomPort();\n`,
+    );
+    const violations = scanFile(path);
+    expect(violations.length).toBeGreaterThanOrEqual(1);
+    expect(violations[0]!.reason).toContain("randomTestPort");
+  });
+
+  it("Sigma-7: allows the canonical randomTestPort import + use", () => {
+    const path = writeTempTest(
+      `import { bindWithRetry, randomTestPort } from "../util/port-collision-retry.js";\n` +
+        `await bindWithRetry(async () => {\n` +
+        `  const port = randomTestPort();\n` +
+        `});\n`,
+    );
+    const violations = scanFile(path);
+    expect(violations.length).toBe(0);
+  });
+
+  it("Sigma-7: honors whitelist comment above a local randomPort helper", () => {
+    const path = writeTempTest(
+      `// port-discipline: ignore - fixture-only helper; never binds\n` +
+        `function randomPort(): number {\n` +
+        `  return 1234;\n` +
+        `}\n`,
+    );
+    const violations = scanFile(path);
+    expect(violations.length).toBe(0);
+  });
+
+  it("Sigma-7: bindWithRetry mention in a comment no longer satisfies the .listen(<var>) check", () => {
+    // Pre-Sigma-7 a file could pass the gate just by mentioning the word
+    // "bindWithRetry" in a comment (e.g. as a TODO). Sigma-7 tightens
+    // the recognizer to require an actual call site.
+    const path = writeTempTest(
+      `// TODO: refactor to bindWithRetry in v1.x housekeeping\n` +
+        `import { createServer } from "node:http";\n` +
+        `const port = 12345;\n` +
+        `const s = createServer();\n` +
+        `s.listen(port, "127.0.0.1");\n`,
+    );
+    const violations = scanFile(path);
+    expect(violations.length).toBeGreaterThanOrEqual(1);
+  });
 });
 
 describe("Sigma-6 test-port-discipline gate — repo-level check", () => {

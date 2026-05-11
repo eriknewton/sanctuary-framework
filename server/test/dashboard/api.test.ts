@@ -1,16 +1,18 @@
 /**
- * Dashboard API tests — SSE emission, REST snapshot JSON, and auth-token
- * enforcement. Uses the startDashboardServer helper on a random port.
+ * Dashboard API tests: SSE emission, REST snapshot JSON, and auth-token
+ * enforcement. Uses the startDashboardServer helper.
+ *
+ * Sigma-7: ports are OS-assigned via port: 0. `startDashboardServer`
+ * reads actualPort back via server.address() and constructs the handle
+ * URL from it, so the SUT does not bake the port in. This is Sigma-6
+ * rule option 1 (ephemeral), structurally collision-proof. Replaces a
+ * randomPort() helper that flaked EADDRINUSE on Omega-1 CI.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { startDashboardServer } from "../../src/dashboard/server.js";
 import type { DashboardHandle } from "../../src/dashboard/server.js";
 import type { ActivityEntry, PendingApproval, AggregatorSources } from "../../src/dashboard/aggregator.js";
-
-function randomPort(): number {
-  return 20000 + Math.floor(Math.random() * 40000);
-}
 
 async function startForTest(overrides: {
   authToken?: string;
@@ -26,7 +28,7 @@ async function startForTest(overrides: {
   };
   return startDashboardServer({
     mode: "co-located",
-    port: randomPort(),
+    port: 0,
     sources,
     ...(overrides.authToken ? { authToken: overrides.authToken } : {}),
     ...(overrides.approvals ? { approvals: overrides.approvals } : {}),

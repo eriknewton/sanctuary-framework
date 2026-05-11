@@ -15,10 +15,7 @@
 
 import { describe, it, expect, afterEach } from "vitest";
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
-
-function randomPort(): number {
-  return 10000 + Math.floor(Math.random() * 50000);
-}
+import { bindWithRetry, randomTestPort } from "../util/port-collision-retry.js";
 
 const AUTH_TOKEN = "test-auth-token-sec012-regression";
 
@@ -31,16 +28,22 @@ describe("SEC-012: Dashboard auth token never in URL query string", () => {
     if (dashboard) await dashboard.stop();
   });
 
+  // Sigma-7: DashboardApprovalChannel embeds the port in selfOrigin and
+  // one-click session URLs, so the port must be known before bind. Wrap
+  // construction + start in bindWithRetry so EADDRINUSE collisions under
+  // parallel vitest workers re-pick a fresh port and retry.
   async function createDashboard(): Promise<void> {
-    port = randomPort();
-    baseUrl = `http://127.0.0.1:${port}`;
-    dashboard = new DashboardApprovalChannel({
-      port,
-      host: "127.0.0.1",
-      timeout_seconds: 30,
-      auth_token: AUTH_TOKEN,
+    await bindWithRetry(async () => {
+      port = randomTestPort();
+      baseUrl = `http://127.0.0.1:${port}`;
+      dashboard = new DashboardApprovalChannel({
+        port,
+        host: "127.0.0.1",
+        timeout_seconds: 30,
+        auth_token: AUTH_TOKEN,
+      });
+      await dashboard.start();
     });
-    await dashboard.start();
   }
 
   // ── Test 1: Long-lived token in query string is REJECTED ────────────
