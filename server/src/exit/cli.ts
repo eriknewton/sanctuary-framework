@@ -20,6 +20,7 @@ import { bytesToString, fromBase64url, stringToBytes } from "../core/encoding.js
 import { exportExitBundle, importExitBundle, exitBundleManifestShape } from "./bundle.js";
 import type { ExitBundleDidWebBinding } from "../contracts/v1.1/exit-bundle-manifest.js";
 import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
+import { loadFortressDidWebRecord } from "../recognition/did-web.js";
 
 export interface ExitCommandArgs {
   argv: string[];
@@ -160,9 +161,31 @@ Options:
   --accept-unverifiable-attestations
                                     On import: accept reputation attestations whose
                                     signer DID is not in the bundle (Tier 1 confirmation)
+  --did-web <identifier>            Embed a specific did:web identifier in the export
+                                    manifest. Requires --did-web-authority-host.
+                                    Overrides fortress-config auto-inclusion.
+  --did-web-authority-host <host>   Authority host for --did-web (required with it).
+  --did-web-published-at <iso8601>  Operator's claimed publication time for the DID
+                                    Document (optional; ISO 8601).
+  --no-did-web                      Explicit opt-out: skip did:web inclusion even if
+                                    a fortress-config record exists. (Alias for
+                                    --include-did-web=false.)
+  --did-web-allowed-host <host>     On import: host allowed for outbound did:web
+                                    resolution; repeatable. Empty means refuse to
+                                    resolve (no-outbound-by-default).
+  --skip-did-web-verify             On import: skip did:web resolution entirely.
   --json
   --yes, -y                         Explicit non-interactive Tier 1 approval
   --help, -h
+
+did:web auto-inclusion (build 3):
+  Running "sanctuary did-web issue --authority-host <host>" registers the
+  operator's did:web identifier at <storage>/recognition/did-web.json.
+  Subsequent "sanctuary exit export" runs auto-include this identifier in
+  the manifest's identity_binding without requiring any --did-web flag.
+  Per-fortress isolation is structural: the record lives under the
+  fortress's storage_path, so different fortresses carry different
+  registered identifiers.
 `);
 }
 
@@ -256,20 +279,45 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         }
         throw policyErr;
       }
-      // Recognition-Layer Path C primary build 2: optional did:web
-      // binding for the manifest's identity_binding. Operator opts in
-      // by passing --did-web + --did-web-authority-host. The
-      // --include-did-web=false flag exists as a forward-compat
-      // explicit opt-out for the day fortress-config auto-includes a
-      // stored did:web identifier; today, absence of --did-web is the
-      // load-bearing opt-out.
+      // Recognition-Layer Path C primary did:web binding resolution.
+      //
+      // Build 2 shipped CLI-explicit override: operator passes
+      // --did-web + --did-web-authority-host to embed a did:web
+      // binding in the manifest's identity_binding.
+      //
+      // Build 3 adds fortress-config auto-inclusion: if `did-web issue`
+      // has been run on this fortress, `<storage>/recognition/did-web.json`
+      // exists and is treated as the operator's registered did:web
+      // identifier. Subsequent exit-bundle exports auto-include it
+      // without requiring any --did-web flag.
+      //
+      // Resolution order:
+      //   1. --no-did-web (alias: --include-did-web=false)
+      //        → explicit operator opt-out, no binding embedded.
+      //   2. --did-web <identifier> [--did-web-authority-host <host>]
+      //        → explicit CLI override; bypasses fortress-config.
+      //   3. fortress-config record present
+      //        → auto-include with the registered identifier +
+      //          authority_host. Operator may add
+      //          --did-web-published-at to claim a publication time.
+      //   4. neither flags nor record
+      //        → silent skip (no binding embedded; backward compat).
       const includeDidWebFlag = flagValue(argv, "--include-did-web");
-      const includeDidWebDisabled = includeDidWebFlag === "false";
+      const explicitOptOut =
+        hasFlag(argv, "--no-did-web") || includeDidWebFlag === "false";
       const didWebIdentifier = flagValue(argv, "--did-web");
       const didWebAuthorityHost = flagValue(argv, "--did-web-authority-host");
       const didWebPublishedAt = flagValue(argv, "--did-web-published-at");
       let exportDidWeb: ExitBundleDidWebBinding | undefined;
-      if (!includeDidWebDisabled && didWebIdentifier !== undefined) {
+      let didWebSource:
+        | "cli-override"
+        | "fortress-config"
+        | "opted-out"
+        | "no-record"
+        | undefined;
+      if (explicitOptOut) {
+        didWebSource = "opted-out";
+      } else if (didWebIdentifier !== undefined) {
         if (didWebAuthorityHost === undefined) {
           write(
             err,
@@ -284,6 +332,21 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
             ? { published_at: didWebPublishedAt }
             : {}),
         };
+        didWebSource = "cli-override";
+      } else {
+        const record = await loadFortressDidWebRecord(ctx.storagePath);
+        if (record !== null) {
+          exportDidWeb = {
+            identifier: record.identifier.did,
+            authority_host: record.identifier.authority_host,
+            ...(didWebPublishedAt !== undefined
+              ? { published_at: didWebPublishedAt }
+              : {}),
+          };
+          didWebSource = "fortress-config";
+        } else {
+          didWebSource = "no-record";
+        }
       }
       const result = await exportExitBundle({
         bundleDir: outDir,
@@ -299,10 +362,36 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         keySource: ctx.keySource,
         ...(exportDidWeb !== undefined ? { didWeb: exportDidWeb } : {}),
       });
-      if (json) write(out, JSON.stringify(result, null, 2) + "\n");
-      else {
+      if (json) {
+        write(
+          out,
+          JSON.stringify(
+            { ...result, did_web_source: didWebSource },
+            null,
+            2,
+          ) + "\n",
+        );
+      } else {
         write(out, `exported: ${result.bundle_dir}\n`);
         write(out, `manifest_hash: ${result.manifest_hash}\n`);
+        if (didWebSource === "fortress-config" && exportDidWeb) {
+          write(
+            out,
+            `did:web: auto-included from fortress config (${exportDidWeb.identifier})\n`,
+          );
+        } else if (didWebSource === "cli-override" && exportDidWeb) {
+          write(
+            out,
+            `did:web: included via CLI override (${exportDidWeb.identifier})\n`,
+          );
+        } else if (didWebSource === "opted-out") {
+          write(out, `did:web: skipped (operator opt-out via --no-did-web)\n`);
+        } else if (didWebSource === "no-record") {
+          write(
+            out,
+            `did:web: not included (no fortress config; run "sanctuary did-web issue" to register)\n`,
+          );
+        }
         for (const item of result.unsupported_artifacts) {
           write(out, `unsupported: ${item}\n`);
         }

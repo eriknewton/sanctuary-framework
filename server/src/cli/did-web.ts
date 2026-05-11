@@ -87,6 +87,14 @@ Options:
   --json                    Output as JSON.
   --help, -h                Show this help.
 
+Fortress-config auto-inclusion (build 3): "issue" persists the record
+at <storage>/recognition/did-web.json. This file IS the fortress's
+registered did:web identifier. Subsequent "sanctuary exit export"
+runs auto-include it in the manifest without any --did-web flag.
+Per-fortress isolation is structural (different storage paths carry
+different records). Use "sanctuary exit export --no-did-web" to
+opt out for a specific export without removing the registration.
+
 Castle-walking note: did:web resolution is outbound HTTPS by design.
 This CLI never opens an outbound socket. The opt-in surface is your
 choice to run "did-web issue" with --authority-host; the resulting
@@ -250,7 +258,7 @@ async function cmdIssue(
     write(out, JSON.stringify(record, null, 2) + "\n");
     return 0;
   }
-  write(out, `did:web identifier issued.\n`);
+  write(out, `did:web identifier issued and registered on this fortress.\n`);
   write(out, `  DID:            ${identifier.did}\n`);
   write(out, `  Authority host: ${identifier.authority_host}\n`);
   write(out, `  Created at:     ${identifier.created_at}\n`);
@@ -261,6 +269,9 @@ async function cmdIssue(
   write(out, `  Artifact:    ${join(persistDir, "did.json")}\n`);
   const artifactPath = join(persistDir, "did.json");
   await writeFile(artifactPath, artifact.artifact, { mode: 0o644 });
+  write(out, `\nAuto-inclusion: subsequent "sanctuary exit export" runs will\n`);
+  write(out, `auto-include this identifier in the bundle manifest. Pass\n`);
+  write(out, `"--no-did-web" to opt out for a specific export.\n`);
   write(out, `\nCastle-walking note: this CLI never opens an outbound socket.\n`);
   write(out, `Publishing the DID Document is your operation; serve the artifact\n`);
   write(out, `at the URL above from infrastructure you control.\n`);
@@ -305,11 +316,14 @@ async function cmdShow(
     artifact: { url: string; sha256: string };
   };
   const parsed = JSON.parse(bytes.toString("utf-8")) as Record;
-  write(out, `did:web identifier on this fortress:\n`);
+  write(out, `did:web identifier registered on this fortress:\n`);
   write(out, `  DID:            ${parsed.identifier.did}\n`);
   write(out, `  Authority host: ${parsed.identifier.authority_host}\n`);
   write(out, `  Created at:     ${parsed.identifier.created_at}\n`);
   write(out, `  Publish URL:    ${parsed.artifact.url}\n`);
   write(out, `  SHA-256:        ${parsed.artifact.sha256}\n`);
+  write(out, `\nAuto-inclusion: subsequent "sanctuary exit export" runs auto-include\n`);
+  write(out, `this identifier in the bundle manifest without --did-web. Pass\n`);
+  write(out, `"--no-did-web" to opt out for a specific export.\n`);
   return 0;
 }
