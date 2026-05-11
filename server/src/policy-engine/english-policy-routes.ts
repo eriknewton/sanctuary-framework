@@ -1,0 +1,232 @@
+/**
+ * Sanctuary WP-V1.3-6 Xi-1 English-Authored Policy HTTP routes.
+ *
+ * Mounted under `/api/policy/*`. Mirrors the established Phi-1 /
+ * Chi-3 / Psi-1 sibling-view pattern via existing `authMiddleware`.
+ *
+ *   POST /api/policy/compile          submit English; returns CompiledPolicy
+ *   GET  /api/policy/drafts           list compiled drafts (review surface)
+ *   GET  /api/policy/drafts/:id       full detail
+ *
+ * Activation routes (POST `/drafts/:id/activate`, DELETE `/drafts/:id`)
+ * are deferred to Xi-2; this PR ships review-only.
+ *
+ * Castle-walking: no NEW outbound surface. Substrate selector
+ * (Castle Layer 3 cooperative MCP) is the canonical outbound channel
+ * used by `EnglishPolicyCompiler` for the LLM-assist path. Rho-1's
+ * Tier A header strip applies (it wraps the substrate-client fetch
+ * once in the selector constructor; every outbound call goes
+ * through it). Draft store is in-memory + per-fortress.
+ */
+
+import type { IncomingMessage, ServerResponse } from "node:http";
+
+import {
+  authMiddleware,
+  type AuthConfig,
+} from "../console/auth-middleware.js";
+import {
+  EnglishPolicyCompiler,
+  type CompiledPolicy,
+  type EnglishPolicyDraft,
+} from "./english-policy-compiler.js";
+
+export const ENGLISH_POLICY_API_PREFIX = "/api/policy";
+
+export interface EnglishPolicyRouterDeps {
+  authConfig: AuthConfig;
+  compiler: EnglishPolicyCompiler;
+  store: EnglishPolicyDraftStore;
+  /** Default operator id when the request did not carry an
+   *  X-Operator-Identity header. Falls back to "operator". */
+  defaultOperatorId?: string;
+}
+
+/**
+ * In-memory per-fortress draft store. Persistence is deferred to
+ * Xi-2+ when the activation lifecycle wires this into encrypted
+ * fortress state. Xi-1's review-only surface keeps drafts in
+ * memory; restart drops them (operator re-submits).
+ */
+export class EnglishPolicyDraftStore {
+  private readonly entries = new Map<string, CompiledPolicy>();
+  private readonly maxEntries: number;
+
+  constructor(opts?: { maxEntries?: number }) {
+    this.maxEntries = opts?.maxEntries ?? 1000;
+  }
+
+  put(draft: CompiledPolicy): void {
+    if (this.entries.size >= this.maxEntries) {
+      const oldest = this.entries.keys().next().value as string | undefined;
+      if (oldest !== undefined) this.entries.delete(oldest);
+    }
+    this.entries.set(draft.draft_id, draft);
+  }
+
+  get(draftId: string): CompiledPolicy | null {
+    return this.entries.get(draftId) ?? null;
+  }
+
+  list(opts?: { since?: string; limit?: number }): CompiledPolicy[] {
+    const since = opts?.since !== undefined ? Date.parse(opts.since) : null;
+    const out: CompiledPolicy[] = [];
+    for (const entry of this.entries.values()) {
+      if (since !== null) {
+        const compiledMs = Date.parse(entry.compiled_at);
+        if (!Number.isFinite(compiledMs) || compiledMs < since) continue;
+      }
+      out.push(entry);
+    }
+    return opts?.limit !== undefined ? out.slice(0, opts.limit) : out;
+  }
+
+  size(): number {
+    return this.entries.size;
+  }
+}
+
+function writeJSON(
+  res: ServerResponse,
+  status: number,
+  payload: unknown,
+): void {
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store",
+  });
+  res.end(JSON.stringify(payload));
+}
+
+async function readBody(req: IncomingMessage, maxBytes = 32 * 1024): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    req.on("data", (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(new Error("request body exceeds 32KB"));
+        req.destroy();
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+    req.on("error", reject);
+  });
+}
+
+function matchDetailRoute(path: string): { draftId: string } | null {
+  const prefix = `${ENGLISH_POLICY_API_PREFIX}/drafts/`;
+  if (!path.startsWith(prefix)) return null;
+  const rest = path.slice(prefix.length);
+  if (rest.length === 0 || rest.includes("/")) return null;
+  return { draftId: decodeURIComponent(rest) };
+}
+
+export async function handleEnglishPolicyRoute(
+  deps: EnglishPolicyRouterDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<boolean> {
+  const host = req.headers.host || "localhost";
+  const url = new URL(req.url ?? "/", `http://${host}`);
+  const method = (req.method ?? "GET").toUpperCase();
+  const path = url.pathname;
+
+  if (
+    path !== ENGLISH_POLICY_API_PREFIX &&
+    !path.startsWith(`${ENGLISH_POLICY_API_PREFIX}/`)
+  ) {
+    return false;
+  }
+
+  const checkAuth = authMiddleware(deps.authConfig);
+  if (!checkAuth(req, res, url)) return true;
+
+  try {
+    if (method === "POST" && path === `${ENGLISH_POLICY_API_PREFIX}/compile`) {
+      let body: string;
+      try {
+        body = await readBody(req);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        writeJSON(res, 413, { ok: false, error: "payload_too_large", detail });
+        return true;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        writeJSON(res, 400, { ok: false, error: "invalid_json", detail });
+        return true;
+      }
+      if (!parsed || typeof parsed !== "object") {
+        writeJSON(res, 400, {
+          ok: false,
+          error: "body_not_object",
+        });
+        return true;
+      }
+      const obj = parsed as Record<string, unknown>;
+      const englishText = typeof obj["english_text"] === "string"
+        ? (obj["english_text"] as string)
+        : null;
+      if (englishText === null) {
+        writeJSON(res, 400, {
+          ok: false,
+          error: "missing_english_text",
+        });
+        return true;
+      }
+      const operatorId =
+        (req.headers["x-operator-identity"] as string | undefined) ??
+        (typeof obj["operator_id"] === "string"
+          ? (obj["operator_id"] as string)
+          : (deps.defaultOperatorId ?? "operator"));
+      const draft: EnglishPolicyDraft = {
+        english_text: englishText,
+        observed_at: new Date().toISOString(),
+        operator_id: operatorId,
+      };
+      const compiled = await deps.compiler.compile(draft);
+      deps.store.put(compiled);
+      writeJSON(res, 200, { ok: true, data: { draft: compiled } });
+      return true;
+    }
+
+    if (method === "GET" && path === `${ENGLISH_POLICY_API_PREFIX}/drafts`) {
+      const since = url.searchParams.get("since") ?? undefined;
+      const limitRaw = url.searchParams.get("limit") ?? undefined;
+      const limit =
+        limitRaw !== undefined && !Number.isNaN(Number.parseInt(limitRaw, 10))
+          ? Math.min(Math.max(Number.parseInt(limitRaw, 10), 0), 500)
+          : undefined;
+      const drafts = deps.store.list({
+        ...(since !== undefined ? { since } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+      });
+      writeJSON(res, 200, { ok: true, data: { drafts } });
+      return true;
+    }
+
+    const detailMatch = matchDetailRoute(path);
+    if (detailMatch && method === "GET") {
+      const draft = deps.store.get(detailMatch.draftId);
+      if (!draft) {
+        writeJSON(res, 404, { ok: false, error: "not_found" });
+        return true;
+      }
+      writeJSON(res, 200, { ok: true, data: { draft } });
+      return true;
+    }
+
+    writeJSON(res, 404, { ok: false, error: "not_found", path });
+    return true;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    writeJSON(res, 500, { ok: false, error: "internal", detail });
+    return true;
+  }
+}
