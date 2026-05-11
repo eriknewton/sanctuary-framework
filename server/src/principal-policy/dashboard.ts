@@ -58,6 +58,8 @@ import {
   type HandoffEventBridge,
   handleCoordinationRoute,
 } from "../coordination/handoff-routes.js";
+import type { ContextTransferExtractorDeps } from "../coordination/context-transfer-extractor.js";
+import type { WorkflowStateTracker } from "../coordination/workflow-state-tracker.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -214,6 +216,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private handoffLog: HandoffLog | null = null;
   private handoffEventBridge: HandoffEventBridge | null = null;
+  private handoffContextTransfer: ContextTransferExtractorDeps | null = null;
+  private workflowStateTracker: WorkflowStateTracker | null = null;
   private handoffAuditLog:
     | import("../l2-operational/audit-log.js").AuditLog
     | null = null;
@@ -315,11 +319,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     eventBridge?: HandoffEventBridge | null;
     auditLog?: import("../l2-operational/audit-log.js").AuditLog | null;
     operatorId?: string | null;
+    /**
+     * v1.3 WP-V1.3-3 Omega-2: context-transfer extractor deps. When
+     * provided, the handoff detail route enriches its response with a
+     * `context_transfer_breakdown` field.
+     */
+    contextTransfer?: ContextTransferExtractorDeps | null;
+    /**
+     * v1.3 WP-V1.3-3 Omega-3: workflow state tracker. When provided,
+     * the workflow routes emit `coordination_workflow_state_changed`
+     * audit events as the tracker observes transitions and push them
+     * to SSE subscribers.
+     */
+    workflowStateTracker?: WorkflowStateTracker | null;
   }): void {
     this.handoffLog = opts.handoffLog;
     this.handoffEventBridge = opts.eventBridge ?? null;
     this.handoffAuditLog = opts.auditLog ?? null;
     this.handoffOperatorId = opts.operatorId ?? null;
+    this.handoffContextTransfer = opts.contextTransfer ?? null;
+    this.workflowStateTracker = opts.workflowStateTracker ?? null;
   }
 
   /**
@@ -397,6 +416,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           this.identityManager?.getPrimaryIdentityId() ??
           "operator_dashboard",
         events: this.handoffEventBridge,
+        ...(this.handoffContextTransfer !== null
+          ? { contextTransfer: this.handoffContextTransfer }
+          : {}),
+        ...(this.workflowStateTracker !== null
+          ? { workflowStateTracker: this.workflowStateTracker }
+          : {}),
       },
       req,
       res,

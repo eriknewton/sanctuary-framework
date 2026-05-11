@@ -279,10 +279,32 @@ function crossHarnessSummary(
   return `${sender} -> operator approval`;
 }
 
-/** Audit operations the Coordination view itself emits. v1.3 Omega-1. */
+/** Audit operations the Coordination view itself emits. */
 export const COORDINATION_VIEW_AUDIT_OPS = {
+  /** v1.3 Omega-1: operator opened the chronological handoff list. */
   VIEW_OPENED: "operator_coordination_view_opened",
+  /** v1.3 Omega-1: operator drilled into a single handoff for detail. */
   ENTRY_DRILLED: "operator_handoff_entry_drilled",
+  /**
+   * v1.3 Omega-3: operator opened the Workflows sibling-view (list of
+   * multi-handoff workflows grouped by `workflow-grouper`). Mirrors
+   * VIEW_OPENED's shape so the dashboard activity feed can group both
+   * as "operator coordination surfaces."
+   */
+  WORKFLOW_VIEW_OPENED: "operator_workflow_view_opened",
+  /**
+   * v1.3 Omega-3: operator drilled into a single workflow for its
+   * timeline + member-handoffs detail. Mirrors ENTRY_DRILLED's shape.
+   */
+  WORKFLOW_DRILLED: "operator_workflow_drilled",
+  /**
+   * v1.3 Omega-3: server-side state transition observed on a
+   * workflow (e.g., in_progress -> stalled). Emitted by the route
+   * layer after the state tracker diffs against its prior snapshot.
+   * Distinct from the operator-action events above: this records what
+   * the workflow itself is doing, not what the operator clicked.
+   */
+  WORKFLOW_STATE_CHANGED: "coordination_workflow_state_changed",
 } as const;
 
 export type CoordinationViewAuditOp =
