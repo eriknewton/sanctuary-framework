@@ -24,9 +24,15 @@ import {
 } from "../contracts/v1.1/constants.js";
 import type {
   ExitBundleArtifactEntry,
+  ExitBundleDidWebBinding,
   ExitBundleManifest,
   ExitBundleManifestBody,
 } from "../contracts/v1.1/exit-bundle-manifest.js";
+import {
+  parseDidWeb,
+  resolveDidWeb,
+  type ResolveDidWebOpts,
+} from "../recognition/did-web.js";
 import { canonicalize, canonicalizeToBytes } from "../mesh/canonical-json.js";
 import { hash, hashToString } from "../core/hashing.js";
 import {
@@ -54,6 +60,44 @@ import {
 import { verifyExitBundle, readManifest, loadExitArtifact } from "./verifier.js";
 
 const ARTIFACT_DIR = "artifacts";
+
+/**
+ * Recognition-Layer Path C primary build 2 audit operations.
+ *
+ * EXPORT_INCLUDED fires when the operator's export embeds a did:web
+ * pointer in the manifest's identity_binding.
+ *
+ * IMPORT_VERIFIED fires when the import path resolves the pointer
+ * and reports the outcome via the `outcome` details field:
+ *   - "success":            DID Document fetched + pubkey matched.
+ *   - "mismatch":           DID Document fetched but pubkey did not
+ *                           match the manifest's claimed key. The
+ *                           importer raises ExitBundleImportError
+ *                           with code `did_web_mismatch`; the audit
+ *                           event captures the attempt regardless.
+ *   - "resolution_failure": Network, DNS, or parse failure. The
+ *                           importer treats this as a degraded-
+ *                           confidence import: operator can re-run
+ *                           with --skip-did-web-verify to proceed
+ *                           without the recognition-layer check.
+ *   - "skipped":            Operator passed --skip-did-web-verify;
+ *                           the import proceeds without resolution.
+ *
+ * AUTHORITY_HOST fires alongside IMPORT_VERIFIED to capture the host
+ * that served the DID Document. Operator-visible for audit trails;
+ * matches the manifest's claimed authority_host on success and may
+ * differ from it on resolution failure (the audit captures what
+ * Sanctuary attempted, not what succeeded).
+ */
+export const EXIT_BUNDLE_DID_WEB_AUDIT_OPS = {
+  EXPORT_INCLUDED: "exit_bundle_did_web_export_included",
+  IMPORT_VERIFIED: "exit_bundle_did_web_import_verified",
+  AUTHORITY_HOST: "exit_bundle_did_web_authority_host",
+} as const;
+
+export type ExitBundleDidWebAuditOp =
+  (typeof EXIT_BUNDLE_DID_WEB_AUDIT_OPS)[keyof typeof EXIT_BUNDLE_DID_WEB_AUDIT_OPS];
+
 const EXIT_IMPORT_NAMESPACE = "_exit_imports";
 const EXIT_PUBLIC_IDENTITIES_NAMESPACE = "_exit_public_identities";
 const EXIT_AUDIT_RECEIPTS_NAMESPACE = "_exit_audit_receipts";
@@ -159,6 +203,21 @@ export interface ExportExitBundleOptions {
    * When omitted, the export self-generates an id.
    */
   exportApprovalAuditId?: string;
+  /**
+   * Recognition-Layer Path C primary build 2: optional did:web binding
+   * to embed in the manifest's identity_binding. When provided, the
+   * export validates that the binding's identifier resolves (per the
+   * did:web spec) to a pointer over the same authority host as
+   * `binding.authority_host`, and that the operator's fortress public
+   * key matches the key the did:web identifier was issued against
+   * (the export does NOT re-fetch the published DID Document; that
+   * check is the receiving regime's job at import time).
+   *
+   * Omit to skip did:web embedding entirely. Receiving regimes that
+   * import the bundle treat absence as backward-compatible (no
+   * recognition-layer verification step).
+   */
+  didWeb?: ExitBundleDidWebBinding;
 }
 
 export interface ExportExitBundleResult {
@@ -199,6 +258,40 @@ export interface ImportExitBundleOptions {
    * operator in to an explicit relaxed verdict (Tier 1 confirmation in CLI).
    */
   acceptUnverifiableAttestations?: boolean;
+  /**
+   * Recognition-Layer Path C primary build 2: hosts the importing
+   * operator has explicitly allowed for outbound did:web resolution.
+   * Empty array means resolution refuses to leave the fortress
+   * (preserves no-outbound-by-default). The same allowlist is also
+   * enforced at the kernel level by the operator's Castle Wall egress
+   * filter; this option is the application-level coordinator.
+   *
+   * Absent + did_web present in manifest = the importer surfaces a
+   * warning and proceeds with the manifest-signature check alone
+   * (degraded confidence). The operator can re-run with the
+   * allowlist set or with `skipDidWebVerify: true`.
+   */
+  didWebAllowedHosts?: string[];
+  /**
+   * Recognition-Layer Path C primary build 2: when true, the importer
+   * skips did:web resolution entirely even if the manifest carries a
+   * did_web binding. Operator surface: CLI flag
+   * `--skip-did-web-verify`. Tradeoff is operator-visible: skipping
+   * loses the recognition-layer cross-check that the bundle's claimed
+   * origin matches the published DID Document.
+   */
+  skipDidWebVerify?: boolean;
+  /**
+   * Recognition-Layer Path C primary build 2: optional fetcher
+   * override for tests. Defaults to globalThis.fetch via the did:web
+   * foundation's resolver. Production callers leave undefined.
+   */
+  didWebFetcher?: ResolveDidWebOpts["fetcher"];
+  /**
+   * Recognition-Layer Path C primary build 2: resolution timeout.
+   * Defaults to the did:web foundation's 5000ms default.
+   */
+  didWebTimeoutMs?: number;
 }
 
 /**
@@ -581,6 +674,24 @@ export async function exportExitBundle(
     )
   );
 
+  // Recognition-Layer Path C primary build 2: validate + embed the
+  // did:web pointer when the caller supplied one. Two structural
+  // checks before embedding so a malformed binding fails loudly at
+  // export rather than at the receiving regime's resolver:
+  //
+  //   1. `identifier` parses as a did:web URI under the supplied
+  //      `authority_host` (`parseDidWeb` throws on shape mismatch).
+  //   2. The parsed `authority_host` matches `binding.authority_host`
+  //      (defends against an operator typo where the URI's host and
+  //      the published host diverge).
+  //
+  // Pubkey match is the import-side verifier's job: the receiving
+  // regime is the one that benefits from confirming the operator's
+  // claimed pubkey matches the resolved DID Document. The export
+  // side does not re-fetch the published document; it embeds the
+  // pointer the operator declared.
+  const didWebBinding = validateExportDidWeb(opts.didWeb);
+
   const body: ExitBundleManifestBody = {
     manifest_version: EXIT_BUNDLE_MANIFEST_VERSION,
     exported_at: new Date().toISOString(),
@@ -589,6 +700,7 @@ export async function exportExitBundle(
       fortress_id: identity.did,
       fortress_master_pubkey: identity.public_key,
       did: identity.did,
+      ...(didWebBinding !== undefined ? { did_web: didWebBinding } : {}),
     },
     source_sanctuary_version: opts.config?.version ?? SANCTUARY_VERSION,
     artifacts,
@@ -610,6 +722,23 @@ export async function exportExitBundle(
   };
   const manifestBytes = jsonBytes(manifest);
   await writeFile(join(bundleDir, "manifest.json"), manifestBytes, { mode: 0o600 });
+
+  // Recognition-Layer Path C primary build 2: audit-emit the
+  // did:web inclusion. Fires only when the body embedded the
+  // binding; absent-binding bundles emit nothing (backward-compat
+  // for tooling that filters on this op).
+  if (didWebBinding !== undefined) {
+    opts.auditLog.append(
+      "l1",
+      EXIT_BUNDLE_DID_WEB_AUDIT_OPS.EXPORT_INCLUDED,
+      identity.identity_id,
+      {
+        approval_id: exportApprovalAuditId,
+        identifier: didWebBinding.identifier,
+        authority_host: didWebBinding.authority_host,
+      },
+    );
+  }
   await opts.auditLog.flush();
 
   return {
@@ -620,6 +749,45 @@ export async function exportExitBundle(
     unsupported_artifacts: [
       "audit_receipts: legacy L2 audit entries are manifest-pinned but not individually signed",
     ],
+  };
+}
+
+/**
+ * Validate + normalize the did:web binding supplied to the export
+ * options. Returns undefined when the caller did not supply a binding,
+ * the normalized binding otherwise. Throws Error on a binding that
+ * fails the export-side shape checks (parse, authority-host
+ * coherence).
+ */
+function validateExportDidWeb(
+  binding: ExitBundleDidWebBinding | undefined,
+): ExitBundleDidWebBinding | undefined {
+  if (binding === undefined) return undefined;
+  if (!binding.identifier || typeof binding.identifier !== "string") {
+    throw new Error(
+      "exit-bundle: did_web.identifier must be a non-empty did:web URI",
+    );
+  }
+  if (!binding.authority_host || typeof binding.authority_host !== "string") {
+    throw new Error(
+      "exit-bundle: did_web.authority_host must be a non-empty DNS host",
+    );
+  }
+  // parseDidWeb throws on malformed input; we let that error
+  // propagate verbatim so the operator sees the foundation-side
+  // validation message.
+  const parsed = parseDidWeb(binding.identifier);
+  if (parsed.authority_host.toLowerCase() !== binding.authority_host.toLowerCase()) {
+    throw new Error(
+      `exit-bundle: did_web.identifier authority host '${parsed.authority_host}' does not match did_web.authority_host '${binding.authority_host}'`,
+    );
+  }
+  return {
+    identifier: binding.identifier,
+    authority_host: binding.authority_host,
+    ...(binding.published_at !== undefined
+      ? { published_at: binding.published_at }
+      : {}),
   };
 }
 
@@ -915,6 +1083,114 @@ export async function importExitBundle(
   }
 
   const manifest = await readManifest(opts.bundleDir);
+  const importWarnings: string[] = [];
+
+  // Recognition-Layer Path C primary build 2: did:web cross-check.
+  // The manifest signature has already verified above; the did:web
+  // step is the recognition-layer cross-check that the resolved DID
+  // Document's verificationMethod public key matches the manifest's
+  // claimed fortress_master_pubkey. Three structurally distinct
+  // outcomes feed the audit log:
+  //
+  //   - success: the resolver returned a DID Document whose pubkey
+  //     matched. Import proceeds with recognition-layer confidence.
+  //   - mismatch: the resolver returned a DID Document whose pubkey
+  //     DID NOT match. Import FAILS with ExitBundleImportError code
+  //     `did_web_mismatch`. Receiving regime treats this as a hard
+  //     signal that the bundle's claimed origin is inconsistent with
+  //     the published DID Document.
+  //   - resolution_failure: the resolver could not fetch the document
+  //     (host not in allowlist, network failure, timeout, not_found,
+  //     invalid JSON). Import proceeds with a warning; operator
+  //     decides whether the degraded-confidence import is acceptable
+  //     or re-runs with --skip-did-web-verify to skip the check
+  //     deliberately.
+  const manifestDidWeb = manifest.body.identity_binding.did_web;
+  if (manifestDidWeb !== undefined && !opts.skipDidWebVerify) {
+    const expectedPublicKey = fromBase64url(
+      manifest.body.identity_binding.fortress_master_pubkey,
+    );
+    const resolveOpts: ResolveDidWebOpts = {
+      allowed_hosts: opts.didWebAllowedHosts ?? [],
+      expected_public_key: expectedPublicKey,
+      ...(opts.didWebFetcher !== undefined ? { fetcher: opts.didWebFetcher } : {}),
+      ...(opts.didWebTimeoutMs !== undefined
+        ? { timeout_ms: opts.didWebTimeoutMs }
+        : {}),
+    };
+    const resolution = await resolveDidWeb(
+      manifestDidWeb.identifier,
+      resolveOpts,
+    );
+    const authorityHost = manifestDidWeb.authority_host;
+    opts.auditLog.append(
+      "l1",
+      EXIT_BUNDLE_DID_WEB_AUDIT_OPS.AUTHORITY_HOST,
+      manifest.body.identity_binding.identity_id,
+      { authority_host: authorityHost, identifier: manifestDidWeb.identifier },
+    );
+    if (resolution.ok) {
+      opts.auditLog.append(
+        "l1",
+        EXIT_BUNDLE_DID_WEB_AUDIT_OPS.IMPORT_VERIFIED,
+        manifest.body.identity_binding.identity_id,
+        {
+          outcome: "success",
+          identifier: manifestDidWeb.identifier,
+          authority_host: authorityHost,
+          resolved_url: resolution.url,
+        },
+      );
+    } else if (resolution.failure === "signature_mismatch") {
+      opts.auditLog.append(
+        "l1",
+        EXIT_BUNDLE_DID_WEB_AUDIT_OPS.IMPORT_VERIFIED,
+        manifest.body.identity_binding.identity_id,
+        {
+          outcome: "mismatch",
+          identifier: manifestDidWeb.identifier,
+          authority_host: authorityHost,
+          resolved_url: resolution.url,
+        },
+      );
+      await opts.auditLog.flush();
+      throw new ExitBundleImportError(
+        "did_web_mismatch",
+        `did:web cross-check failed: the DID Document at ${resolution.url} resolved successfully, but the verificationMethod public key did not match the manifest's claimed fortress_master_pubkey. The bundle's claimed origin (${manifestDidWeb.identifier}) is inconsistent with the published DID Document. To proceed anyway with the manifest signature alone, re-run import with --skip-did-web-verify.`,
+      );
+    } else {
+      // host_not_allowed / fetch_failed / timeout / not_found /
+      // invalid_json: surface as a warning, emit resolution_failure
+      // audit, let the import proceed at degraded confidence.
+      opts.auditLog.append(
+        "l1",
+        EXIT_BUNDLE_DID_WEB_AUDIT_OPS.IMPORT_VERIFIED,
+        manifest.body.identity_binding.identity_id,
+        {
+          outcome: "resolution_failure",
+          failure: resolution.failure,
+          identifier: manifestDidWeb.identifier,
+          authority_host: authorityHost,
+          resolved_url: resolution.url,
+        },
+      );
+      importWarnings.push(
+        `did:web resolution failed (${resolution.failure}): ${resolution.message}. Import proceeded with manifest-signature verification alone; recognition-layer cross-check was skipped. Re-run with --did-web-allowed-host=<host> to enable resolution, or --skip-did-web-verify to skip deliberately.`,
+      );
+    }
+  } else if (manifestDidWeb !== undefined && opts.skipDidWebVerify) {
+    opts.auditLog.append(
+      "l1",
+      EXIT_BUNDLE_DID_WEB_AUDIT_OPS.IMPORT_VERIFIED,
+      manifest.body.identity_binding.identity_id,
+      {
+        outcome: "skipped",
+        identifier: manifestDidWeb.identifier,
+        authority_host: manifestDidWeb.authority_host,
+      },
+    );
+  }
+
   const identityArtifact = await loadExitArtifact<ExitPublicIdentityArtifact>(
     opts.bundleDir,
     manifest,
@@ -992,7 +1268,7 @@ export async function importExitBundle(
         unverifiable_attestations: verification.reputation?.unverifiable_attestations ?? 0,
       },
       staged_artifacts: [],
-      warnings: verification.warnings,
+      warnings: [...verification.warnings, ...importWarnings],
       unsupported_artifacts: verification.unsupported_artifacts,
     };
   }
@@ -1188,7 +1464,7 @@ export async function importExitBundle(
     state: stateResult,
     reputation: reputationResult,
     staged_artifacts: stagedArtifacts,
-    warnings: verification.warnings,
+    warnings: [...verification.warnings, ...importWarnings],
     unsupported_artifacts: verification.unsupported_artifacts,
   };
 }
