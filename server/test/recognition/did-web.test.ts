@@ -22,12 +22,17 @@ import { describe, it, expect } from "vitest";
 
 import {
   DID_WEB_AUDIT_OPS,
+  applyDidWebRotationToRecord,
+  buildDidWebHealthSnapshot,
   deriveDidWebFromPrivateKey,
   didToUrl,
+  dropExpiredDidWebKeys,
+  identifierFromFortressDidWebRecord,
   issueDidWeb,
   parseDidWeb,
   publishDidWebDocument,
   resolveDidWeb,
+  rotateDidWebKey,
 } from "../../src/recognition/did-web.js";
 import { generateKeypair } from "../../src/core/identity.js";
 import { toBase64url } from "../../src/core/encoding.js";
@@ -38,7 +43,7 @@ function publicKey(): Uint8Array {
   return generateKeypair().publicKey;
 }
 
-describe("WP-V1.x-RECOGNITION-LAYER did:web — issuance", () => {
+describe("WP-V1.x-RECOGNITION-LAYER did:web - issuance", () => {
   it("issues a fortress-level identifier with the bare did:web:<host> shape", async () => {
     const id = await issueDidWeb({
       fortress_id: "fortress_alpha",
@@ -130,7 +135,7 @@ describe("WP-V1.x-RECOGNITION-LAYER did:web — issuance", () => {
   });
 });
 
-describe("WP-V1.x-RECOGNITION-LAYER did:web — publication", () => {
+describe("WP-V1.x-RECOGNITION-LAYER did:web - publication", () => {
   it("canonical publish path for fortress-level is /.well-known/did.json", async () => {
     const id = await issueDidWeb({
       fortress_id: "fortress_alpha",
@@ -190,7 +195,7 @@ describe("WP-V1.x-RECOGNITION-LAYER did:web — publication", () => {
   });
 });
 
-describe("WP-V1.x-RECOGNITION-LAYER did:web — resolution (Castle-walking opt-in)", () => {
+describe("WP-V1.x-RECOGNITION-LAYER did:web - resolution (Castle-walking opt-in)", () => {
   it("empty allowed_hosts refuses without invoking the fetcher (no-outbound-by-default)", async () => {
     let invoked = false;
     const result = await resolveDidWeb("did:web:alice.example.com", {
@@ -322,7 +327,7 @@ describe("WP-V1.x-RECOGNITION-LAYER did:web — resolution (Castle-walking opt-i
   });
 });
 
-describe("WP-V1.x-RECOGNITION-LAYER did:web — did → URL mapping", () => {
+describe("WP-V1.x-RECOGNITION-LAYER did:web - did -> URL mapping", () => {
   it("fortress-level did:web:<host> maps to /.well-known/did.json", () => {
     const parsed = parseDidWeb("did:web:alice.example.com");
     expect(didToUrl(parsed)).toBe(
@@ -350,7 +355,7 @@ describe("WP-V1.x-RECOGNITION-LAYER did:web — did → URL mapping", () => {
   });
 });
 
-describe("WP-V1.x-RECOGNITION-LAYER did:web — multi-fortress isolation + audit events", () => {
+describe("WP-V1.x-RECOGNITION-LAYER did:web - multi-fortress isolation + audit events", () => {
   it("two fortresses on the same authority host produce distinct agent-scoped DIDs", async () => {
     const a = await issueDidWeb({
       fortress_id: "fortress_alpha",
@@ -372,5 +377,306 @@ describe("WP-V1.x-RECOGNITION-LAYER did:web — multi-fortress isolation + audit
     expect(DID_WEB_AUDIT_OPS.ISSUED).toBe("did_web_issued");
     expect(DID_WEB_AUDIT_OPS.RESOLVED).toBe("did_web_resolved");
     expect(DID_WEB_AUDIT_OPS.PUBLISHED).toBe("did_web_published");
+    expect(DID_WEB_AUDIT_OPS.KEY_ROTATED).toBe("did_web_key_rotated");
+    expect(DID_WEB_AUDIT_OPS.OLD_KEY_DROPPED).toBe("did_web_old_key_dropped");
+    expect(DID_WEB_AUDIT_OPS.HISTORICAL_VERIFICATION_USED).toBe(
+      "did_web_historical_verification_used",
+    );
+  });
+});
+
+describe("WP-V1.x-RECOGNITION-LAYER did:web - build 4 key rotation", () => {
+  async function issued() {
+    return issueDidWeb({
+      fortress_id: "fortress_alpha",
+      authority_host: "alice.example.com",
+      public_key: publicKey(),
+      now: () => FROZEN_TIME,
+    });
+  }
+
+  it("periodic rotation preserves the did:web identifier and makes #key-2 active", async () => {
+    const id = await issued();
+    const rotated = await rotateDidWebKey(id, {
+      reason: "periodic",
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    expect(rotated.did).toBe(id.did);
+    expect(rotated.old_verification_method_id).toBe(`${id.did}#key-1`);
+    expect(rotated.new_verification_method_id).toBe(`${id.did}#key-2`);
+    expect(rotated.new_did_document.authentication).toEqual([`${id.did}#key-2`]);
+    expect(rotated.new_did_document.verificationMethod).toHaveLength(2);
+    expect(rotated.new_did_document.verificationMethod[0]!.status).toBe("previous");
+  });
+
+  it("compromised rotation revokes the old key at the rotation timestamp", async () => {
+    const id = await issued();
+    const rotated = await rotateDidWebKey(id, {
+      reason: "compromised",
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    const old = rotated.new_did_document.verificationMethod[0]!;
+    expect(old.status).toBe("revoked");
+    expect(old.valid_until).toBe("2026-06-01T00:00:00.000Z");
+    expect(old.drop_after).toBe("2026-08-30T00:00:00.000Z");
+  });
+
+  it("manual rotation honors a custom preservation window", async () => {
+    const id = await issued();
+    const rotated = await rotateDidWebKey(id, {
+      reason: "manual",
+      preserve_old_key_for: 30,
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    const old = rotated.new_did_document.verificationMethod[0]!;
+    expect(old.status).toBe("previous");
+    expect(old.valid_until).toBe("2026-07-01T00:00:00.000Z");
+    expect(old.drop_after).toBe("2026-07-01T00:00:00.000Z");
+  });
+
+  it("uses caller-supplied public key so CLI identity rotation and DID rotation stay aligned", async () => {
+    const id = await issued();
+    const key = publicKey();
+    const rotated = await rotateDidWebKey(id, {
+      reason: "manual",
+      new_public_key: key,
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    expect(rotated.new_public_key_b64u).toBe(toBase64url(key));
+  });
+
+  it("rejects invalid preservation windows", async () => {
+    const id = await issued();
+    await expect(
+      rotateDidWebKey(id, {
+        reason: "manual",
+        preserve_old_key_for: -1,
+      }),
+    ).rejects.toThrow(/preserve_old_key_for/);
+  });
+
+  it("resolves a pre-rotation assertion against the historical key", async () => {
+    const id = await issued();
+    const oldKey = id.public_key;
+    const rotated = await rotateDidWebKey(id, {
+      reason: "manual",
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    const result = await resolveDidWeb(id.did, {
+      allowed_hosts: ["alice.example.com"],
+      expected_public_key: oldKey,
+      assertion_time: "2026-05-15T00:00:00.000Z",
+      fetcher: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => rotated.new_did_document,
+      }),
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.selected_verification_method_id).toBe(`${id.did}#key-1`);
+      expect(result.historical_verification_used).toBe(true);
+    }
+  });
+
+  it("resolves a post-rotation assertion against the new active key", async () => {
+    const id = await issued();
+    const newKey = publicKey();
+    const rotated = await rotateDidWebKey(id, {
+      reason: "manual",
+      new_public_key: newKey,
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    const result = await resolveDidWeb(id.did, {
+      allowed_hosts: ["alice.example.com"],
+      expected_public_key: newKey,
+      assertion_time: "2026-06-02T00:00:00.000Z",
+      fetcher: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => rotated.new_did_document,
+      }),
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.selected_verification_method_id).toBe(`${id.did}#key-2`);
+      expect(result.historical_verification_used).toBe(false);
+    }
+  });
+
+  it("compromised rotation rejects old-key assertions after the rotation timestamp", async () => {
+    const id = await issued();
+    const rotated = await rotateDidWebKey(id, {
+      reason: "compromised",
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    const result = await resolveDidWeb(id.did, {
+      allowed_hosts: ["alice.example.com"],
+      expected_public_key: id.public_key,
+      assertion_time: "2026-06-02T00:00:00.000Z",
+      fetcher: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => rotated.new_did_document,
+      }),
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.failure).toBe("signature_mismatch");
+  });
+
+  it("drops expired old keys after the preservation window", async () => {
+    const id = await issued();
+    const rotated = await rotateDidWebKey(id, {
+      reason: "manual",
+      preserve_old_key_for: 1,
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    const out = dropExpiredDidWebKeys(
+      { ...id, did_document: rotated.new_did_document },
+      { now: () => new Date("2026-06-03T00:00:00.000Z") },
+    );
+    expect(out.dropped).toHaveLength(1);
+    expect(out.did_document.verificationMethod).toHaveLength(1);
+    expect(out.did_document.verificationMethod[0]!.id).toBe(`${id.did}#key-2`);
+  });
+
+  it("keeps old keys before the preservation window expires", async () => {
+    const id = await issued();
+    const rotated = await rotateDidWebKey(id, {
+      reason: "manual",
+      preserve_old_key_for: 10,
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    const out = dropExpiredDidWebKeys(
+      { ...id, did_document: rotated.new_did_document },
+      { now: () => new Date("2026-06-03T00:00:00.000Z") },
+    );
+    expect(out.dropped).toHaveLength(0);
+    expect(out.did_document.verificationMethod).toHaveLength(2);
+  });
+
+  it("appends rotation history to the persisted fortress record", async () => {
+    const id = await issued();
+    const artifact = publishDidWebDocument(id);
+    const record = {
+      version: 1 as const,
+      identifier: {
+        did: id.did,
+        created_at: id.created_at,
+        authority_host: id.authority_host,
+        fortress_id: id.fortress_id,
+        did_document: id.did_document,
+      },
+      artifact: {
+        url: artifact.url,
+        publish_path: artifact.publish_path,
+        sha256: artifact.sha256,
+      },
+    };
+    const rotated = await rotateDidWebKey(id, {
+      reason: "periodic",
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    const rotatedIdentifier = { ...id, did_document: rotated.new_did_document };
+    const updated = applyDidWebRotationToRecord(
+      record,
+      rotated,
+      publishDidWebDocument(rotatedIdentifier),
+    );
+    expect(updated.key_history).toHaveLength(1);
+    expect(updated.key_history![0]!.reason).toBe("periodic");
+    expect(identifierFromFortressDidWebRecord(updated).did).toBe(id.did);
+  });
+
+  it("builds dashboard health from last rotation history", async () => {
+    const id = await issued();
+    const artifact = publishDidWebDocument(id);
+    const record = {
+      version: 1 as const,
+      identifier: {
+        did: id.did,
+        created_at: id.created_at,
+        authority_host: id.authority_host,
+        fortress_id: id.fortress_id,
+        did_document: id.did_document,
+      },
+      artifact: {
+        url: artifact.url,
+        publish_path: artifact.publish_path,
+        sha256: artifact.sha256,
+      },
+    };
+    const rotated = await rotateDidWebKey(id, {
+      reason: "manual",
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    const updated = applyDidWebRotationToRecord(
+      record,
+      rotated,
+      publishDidWebDocument({ ...id, did_document: rotated.new_did_document }),
+    );
+    const health = buildDidWebHealthSnapshot(updated, {
+      now: () => new Date("2026-06-11T00:00:00.000Z"),
+    });
+    expect(health.configured).toBe(true);
+    expect(health.last_rotation?.reason).toBe("manual");
+    expect(health.days_until_recommended_rotation).toBe(355);
+  });
+
+  it("increments verification method ids across repeated rotations", async () => {
+    const id = await issued();
+    const first = await rotateDidWebKey(id, {
+      reason: "periodic",
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    const second = await rotateDidWebKey(
+      { ...id, did_document: first.new_did_document },
+      {
+        reason: "manual",
+        now: () => new Date("2026-07-01T00:00:00.000Z"),
+      },
+    );
+    expect(second.new_verification_method_id).toBe(`${id.did}#key-3`);
+    expect(second.new_did_document.authentication).toEqual([`${id.did}#key-3`]);
+  });
+
+  it("published rotated DID Document contains active and historical keys", async () => {
+    const id = await issued();
+    const rotated = await rotateDidWebKey(id, {
+      reason: "periodic",
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    const artifact = publishDidWebDocument({
+      ...id,
+      did_document: rotated.new_did_document,
+    });
+    const parsed = JSON.parse(artifact.artifact) as { verificationMethod: unknown[] };
+    expect(parsed.verificationMethod).toHaveLength(2);
+    expect(artifact.url).toBe("https://alice.example.com/.well-known/did.json");
+  });
+
+  it("Castle-walking invariant holds: rotation itself is local and resolution remains allowlist-gated", async () => {
+    const id = await issued();
+    const rotated = await rotateDidWebKey(id, {
+      reason: "compromised",
+      now: () => new Date("2026-06-01T00:00:00.000Z"),
+    });
+    let invoked = false;
+    const result = await resolveDidWeb(id.did, {
+      allowed_hosts: [],
+      expected_public_key: id.public_key,
+      assertion_time: "2026-05-15T00:00:00.000Z",
+      fetcher: async () => {
+        invoked = true;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => rotated.new_did_document,
+        };
+      },
+    });
+    expect(invoked).toBe(false);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.failure).toBe("host_not_allowed");
   });
 });

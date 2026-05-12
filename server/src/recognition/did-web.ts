@@ -7,17 +7,17 @@
  *
  * Foundation build ships three pure capabilities:
  *
- *   1. issueDidWeb  — generate a W3C-DID-Core-conformant did:web
+ *   1. issueDidWeb  - generate a W3C-DID-Core-conformant did:web
  *      identifier + DID Document bound to a Sanctuary fortress's
  *      existing Ed25519 public key. No outbound; pure construction.
  *
- *   2. resolveDidWeb — HTTPS fetch + JSON parse + verificationMethod
+ *   2. resolveDidWeb - HTTPS fetch + JSON parse + verificationMethod
  *      sanity check for a peer-presented did:web identifier. Outbound
  *      HTTPS by definition; opt-in load-bearing via the caller-supplied
  *      allowed_hosts allowlist. Empty allowlist means resolution
  *      refuses to leave the fortress, preserving no-outbound-by-default.
  *
- *   3. publishDidWebDocument — return the JSON artifact bytes + the
+ *   3. publishDidWebDocument - return the JSON artifact bytes + the
  *      publication URL the operator must serve from their own HTTPS
  *      authority host. Sanctuary does not operate the HTTPS server;
  *      it generates the artifact and tells the operator where to put
@@ -53,8 +53,9 @@ import { join } from "node:path";
 import { sha256 } from "@noble/hashes/sha256";
 import { ed25519 } from "@noble/curves/ed25519";
 
-import { toBase64url, stringToBytes } from "../core/encoding.js";
+import { fromBase64url, toBase64url, stringToBytes } from "../core/encoding.js";
 import { hashToString } from "../core/hashing.js";
+import { generateKeypair } from "../core/identity.js";
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -67,6 +68,17 @@ export interface VerificationMethod {
     crv: "Ed25519";
     x: string;
   };
+  /**
+   * Build 4 rotation metadata. DID Core allows additional verification
+   * method properties; resolvers use these timestamps to select the key
+   * that was valid for a historical assertion without changing the
+   * stable did:web identifier.
+   */
+  status?: "active" | "previous" | "revoked";
+  valid_from?: string;
+  valid_until?: string;
+  drop_after?: string;
+  rotation_reason?: DidWebRotationReason;
 }
 
 export interface DidDocument {
@@ -92,6 +104,68 @@ export interface DidWebIdentifier {
   fortress_id: string;
   /** Optional agent label for agent-scoped identifiers. */
   agent_label?: string;
+}
+
+export type DidWebRotationReason = "periodic" | "compromised" | "manual";
+
+export interface RotationOptions {
+  reason: DidWebRotationReason;
+  /**
+   * Number of days the old verification method remains in the DID
+   * Document for historical verification. Defaults to 90.
+   */
+  preserve_old_key_for?: number;
+  /** Optional deterministic clock for tests. */
+  now?: () => Date;
+  /**
+   * Optional caller-supplied new public key. The CLI supplies this after
+   * rotating the encrypted fortress identity so the DID Document and the
+   * local signing identity stay in lock-step. Pure tests can omit it and
+   * let this module generate the public side of a fresh Ed25519 keypair.
+   */
+  new_public_key?: Uint8Array;
+}
+
+export interface RotationResult {
+  did: string;
+  old_verification_method_id: string;
+  new_verification_method_id: string;
+  old_public_key_b64u: string;
+  new_public_key_b64u: string;
+  new_did_document: DidDocument;
+  rotated_at: string;
+  rotation_reason: DidWebRotationReason;
+  preserve_old_key_for: number;
+}
+
+export interface DidWebRotationHistoryEntry {
+  rotated_at: string;
+  reason: DidWebRotationReason;
+  old_verification_method_id: string;
+  new_verification_method_id: string;
+  old_public_key_b64u: string;
+  new_public_key_b64u: string;
+  preserve_old_key_for: number;
+}
+
+export interface DropExpiredDidWebKeysResult {
+  did_document: DidDocument;
+  dropped: Array<{
+    verification_method_id: string;
+    public_key_b64u: string;
+    dropped_at: string;
+  }>;
+}
+
+export interface DidWebHealthSnapshot {
+  configured: boolean;
+  identifier?: string;
+  authority_host?: string;
+  current_verification_method_id?: string;
+  last_rotation?: DidWebRotationHistoryEntry;
+  key_history: DidWebRotationHistoryEntry[];
+  recommended_periodic_days: number;
+  days_until_recommended_rotation?: number;
 }
 
 export interface IssueDidWebOpts {
@@ -131,10 +205,23 @@ export interface ResolveDidWebOpts {
    * (base64url-encoded). Mismatch returns `signature_mismatch`.
    */
   expected_public_key?: Uint8Array;
+  /**
+   * Signing time of the assertion being checked. When set, resolution
+   * accepts a matching historical key only if its rotation metadata
+   * covers this time.
+   */
+  assertion_time?: string | Date;
 }
 
 export type ResolveResult =
-  | { ok: true; did_document: DidDocument; url: string }
+  | {
+      ok: true;
+      did_document: DidDocument;
+      url: string;
+      verification_methods: VerificationMethod[];
+      selected_verification_method_id?: string;
+      historical_verification_used?: boolean;
+    }
   | {
       ok: false;
       failure:
@@ -176,6 +263,9 @@ export const DID_WEB_AUDIT_OPS = {
   ISSUED: "did_web_issued",
   RESOLVED: "did_web_resolved",
   PUBLISHED: "did_web_published",
+  KEY_ROTATED: "did_web_key_rotated",
+  OLD_KEY_DROPPED: "did_web_old_key_dropped",
+  HISTORICAL_VERIFICATION_USED: "did_web_historical_verification_used",
 } as const;
 
 export type DidWebAuditOp =
@@ -188,6 +278,9 @@ const DID_CONTEXT = [
 ] as const;
 
 const DEFAULT_TIMEOUT_MS = 5000;
+const DEFAULT_PRESERVE_OLD_KEY_DAYS = 90;
+const DEFAULT_RECOMMENDED_PERIODIC_DAYS = 365;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 const HOST_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/i;
 const FORTRESS_LABEL_RE = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -219,6 +312,8 @@ export async function issueDidWeb(
     );
   }
 
+  const now = (opts.now ?? (() => new Date()))();
+  const createdAt = now.toISOString();
   const did = buildDid(opts);
   const verificationMethodId = `${did}#key-1`;
   const verificationMethod: VerificationMethod = {
@@ -230,6 +325,8 @@ export async function issueDidWeb(
       crv: "Ed25519",
       x: toBase64url(opts.public_key),
     },
+    status: "active",
+    valid_from: createdAt,
   };
   const didDocument: DidDocument = {
     "@context": [...DID_CONTEXT],
@@ -239,13 +336,11 @@ export async function issueDidWeb(
     assertionMethod: [verificationMethodId],
   };
 
-  const now = (opts.now ?? (() => new Date()))();
-
   return {
     did,
     did_document: didDocument,
     public_key: opts.public_key,
-    created_at: now.toISOString(),
+    created_at: createdAt,
     authority_host: opts.authority_host,
     fortress_id: opts.fortress_id,
     ...(opts.agent_label !== undefined ? { agent_label: opts.agent_label } : {}),
@@ -267,6 +362,120 @@ export function publishDidWebDocument(
     publish_path: path,
     artifact,
     sha256: hashToString(digest),
+  };
+}
+
+// ── Key rotation ──────────────────────────────────────────────────────
+
+export async function rotateDidWebKey(
+  identifier: DidWebIdentifier,
+  opts: RotationOptions,
+): Promise<RotationResult> {
+  const preserveDays = opts.preserve_old_key_for ?? DEFAULT_PRESERVE_OLD_KEY_DAYS;
+  if (!Number.isFinite(preserveDays) || preserveDays < 0) {
+    throw new Error("did-web: preserve_old_key_for must be a non-negative number of days");
+  }
+  const rotatedAt = (opts.now ?? (() => new Date()))().toISOString();
+  const activeMethodId =
+    identifier.did_document.authentication[0] ??
+    identifier.did_document.assertionMethod[0] ??
+    identifier.did_document.verificationMethod.at(-1)?.id;
+  const activeMethod = identifier.did_document.verificationMethod.find(
+    (vm) => vm.id === activeMethodId,
+  );
+  if (!activeMethod) {
+    throw new Error("did-web: cannot rotate identifier without an active verification method");
+  }
+
+  const generated = opts.new_public_key ? undefined : generateKeypair();
+  const newPublicKey = opts.new_public_key ?? generated!.publicKey;
+  generated?.privateKey.fill(0);
+  if (newPublicKey.length !== 32) {
+    throw new Error(
+      `did-web: new public key must be exactly 32 bytes (Ed25519), got ${newPublicKey.length}`,
+    );
+  }
+
+  const newMethodId = nextVerificationMethodId(identifier.did, identifier.did_document);
+  const dropAfter = addDaysIso(rotatedAt, preserveDays);
+  const oldStatus = opts.reason === "compromised" ? "revoked" : "previous";
+  const oldValidUntil =
+    opts.reason === "compromised" ? rotatedAt : addDaysIso(rotatedAt, preserveDays);
+
+  const demotedOld: VerificationMethod = {
+    ...activeMethod,
+    status: oldStatus,
+    valid_from: activeMethod.valid_from ?? identifier.created_at,
+    valid_until: oldValidUntil,
+    drop_after: dropAfter,
+    rotation_reason: opts.reason,
+  };
+  const newMethod: VerificationMethod = {
+    id: newMethodId,
+    type: "JsonWebKey2020",
+    controller: identifier.did,
+    publicKeyJwk: {
+      kty: "OKP",
+      crv: "Ed25519",
+      x: toBase64url(newPublicKey),
+    },
+    status: "active",
+    valid_from: rotatedAt,
+  };
+  const verificationMethod = identifier.did_document.verificationMethod.map(
+    (vm) => (vm.id === activeMethod.id ? demotedOld : vm),
+  );
+  verificationMethod.push(newMethod);
+
+  const newDidDocument: DidDocument = {
+    ...identifier.did_document,
+    verificationMethod,
+    authentication: [newMethodId],
+    assertionMethod: [newMethodId],
+  };
+
+  return {
+    did: identifier.did,
+    old_verification_method_id: activeMethod.id,
+    new_verification_method_id: newMethodId,
+    old_public_key_b64u: activeMethod.publicKeyJwk.x,
+    new_public_key_b64u: newMethod.publicKeyJwk.x,
+    new_did_document: newDidDocument,
+    rotated_at: rotatedAt,
+    rotation_reason: opts.reason,
+    preserve_old_key_for: preserveDays,
+  };
+}
+
+export function dropExpiredDidWebKeys(
+  identifier: DidWebIdentifier,
+  opts: { now?: () => Date } = {},
+): DropExpiredDidWebKeysResult {
+  const nowMs = (opts.now ?? (() => new Date()))().getTime();
+  const activeIds = new Set([
+    ...identifier.did_document.authentication,
+    ...identifier.did_document.assertionMethod,
+  ]);
+  const dropped: DropExpiredDidWebKeysResult["dropped"] = [];
+  const verificationMethod = identifier.did_document.verificationMethod.filter((vm) => {
+    if (activeIds.has(vm.id)) return true;
+    if (!vm.drop_after) return true;
+    const dropAt = Date.parse(vm.drop_after);
+    if (Number.isNaN(dropAt) || dropAt > nowMs) return true;
+    dropped.push({
+      verification_method_id: vm.id,
+      public_key_b64u: vm.publicKeyJwk.x,
+      dropped_at: new Date(nowMs).toISOString(),
+    });
+    return false;
+  });
+
+  return {
+    did_document: {
+      ...identifier.did_document,
+      verificationMethod,
+    },
+    dropped,
   };
 }
 
@@ -357,8 +566,12 @@ export async function resolveDidWeb(
 
   if (opts.expected_public_key !== undefined) {
     const expectedX = toBase64url(opts.expected_public_key);
-    const actualX = body.verificationMethod[0]?.publicKeyJwk.x;
-    if (actualX !== expectedX) {
+    const selected = selectVerificationMethod(
+      body,
+      expectedX,
+      opts.assertion_time,
+    );
+    if (!selected) {
       return {
         ok: false,
         failure: "signature_mismatch",
@@ -366,9 +579,18 @@ export async function resolveDidWeb(
         url,
       };
     }
+    return {
+      ok: true,
+      did_document: body,
+      url,
+      verification_methods: body.verificationMethod,
+      selected_verification_method_id: selected.id,
+      historical_verification_used:
+        selected.status === "previous" || selected.status === "revoked",
+    };
   }
 
-  return { ok: true, did_document: body, url };
+  return { ok: true, did_document: body, url, verification_methods: body.verificationMethod };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -428,6 +650,68 @@ function canonicalPublishPath(identifier: DidWebIdentifier): string {
     return "/.well-known/did.json";
   }
   return `/fortress/${identifier.fortress_id}/agent/${identifier.agent_label}/did.json`;
+}
+
+function nextVerificationMethodId(did: string, doc: DidDocument): string {
+  let max = 0;
+  for (const vm of doc.verificationMethod) {
+    const prefix = `${did}#key-`;
+    if (!vm.id.startsWith(prefix)) continue;
+    const n = Number.parseInt(vm.id.slice(prefix.length), 10);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return `${did}#key-${max + 1}`;
+}
+
+function addDaysIso(iso: string, days: number): string {
+  return new Date(Date.parse(iso) + days * MS_PER_DAY).toISOString();
+}
+
+function assertionTimeMs(assertionTime: string | Date | undefined): number | undefined {
+  if (assertionTime === undefined) return undefined;
+  const ms =
+    assertionTime instanceof Date
+      ? assertionTime.getTime()
+      : Date.parse(assertionTime);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+function methodCoversAssertionTime(
+  vm: VerificationMethod,
+  timeMs: number | undefined,
+): boolean {
+  if (timeMs === undefined) {
+    return vm.status === undefined || vm.status === "active";
+  }
+  const fromMs = vm.valid_from ? Date.parse(vm.valid_from) : undefined;
+  const untilMs = vm.valid_until ? Date.parse(vm.valid_until) : undefined;
+  if (fromMs !== undefined && !Number.isNaN(fromMs) && timeMs < fromMs) {
+    return false;
+  }
+  if (untilMs !== undefined && !Number.isNaN(untilMs) && timeMs > untilMs) {
+    return false;
+  }
+  return true;
+}
+
+function selectVerificationMethod(
+  doc: DidDocument,
+  expectedPublicKeyB64u: string,
+  assertionTime: string | Date | undefined,
+): VerificationMethod | undefined {
+  const timeMs = assertionTimeMs(assertionTime);
+  const matches = doc.verificationMethod.filter(
+    (vm) =>
+      vm.publicKeyJwk.x === expectedPublicKeyB64u &&
+      methodCoversAssertionTime(vm, timeMs),
+  );
+  if (matches.length === 0) return undefined;
+  const activeIds = new Set([...doc.authentication, ...doc.assertionMethod]);
+  return (
+    matches.find((vm) => activeIds.has(vm.id)) ??
+    matches.find((vm) => vm.status === "previous" || vm.status === "revoked") ??
+    matches[0]
+  );
 }
 
 /**
@@ -516,6 +800,10 @@ export interface FortressDidWebRecord {
     publish_path: string;
     sha256: string;
   };
+  key_history?: DidWebRotationHistoryEntry[];
+  rotation_policy?: {
+    recommended_periodic_days?: number;
+  };
 }
 
 /**
@@ -595,6 +883,97 @@ function isFortressDidWebRecord(value: unknown): value is FortressDidWebRecord {
   if (typeof artifact["publish_path"] !== "string") return false;
   if (typeof artifact["sha256"] !== "string") return false;
   return true;
+}
+
+export function identifierFromFortressDidWebRecord(
+  record: FortressDidWebRecord,
+): DidWebIdentifier {
+  const activeMethodId =
+    record.identifier.did_document.authentication[0] ??
+    record.identifier.did_document.assertionMethod[0];
+  const activeMethod = record.identifier.did_document.verificationMethod.find(
+    (vm) => vm.id === activeMethodId,
+  );
+  const publicKeyB64u =
+    activeMethod?.publicKeyJwk.x ??
+    record.identifier.did_document.verificationMethod[0]?.publicKeyJwk.x;
+  if (!publicKeyB64u) {
+    throw new Error("did-web: fortress-config record has no verification method public key");
+  }
+  return {
+    did: record.identifier.did,
+    did_document: record.identifier.did_document,
+    public_key: fromBase64url(publicKeyB64u),
+    created_at: record.identifier.created_at,
+    authority_host: record.identifier.authority_host,
+    fortress_id: record.identifier.fortress_id,
+    ...(record.identifier.agent_label !== undefined
+      ? { agent_label: record.identifier.agent_label }
+      : {}),
+  };
+}
+
+export function applyDidWebRotationToRecord(
+  record: FortressDidWebRecord,
+  rotation: RotationResult,
+  artifact: PublishedArtifact,
+): FortressDidWebRecord {
+  const historyEntry: DidWebRotationHistoryEntry = {
+    rotated_at: rotation.rotated_at,
+    reason: rotation.rotation_reason,
+    old_verification_method_id: rotation.old_verification_method_id,
+    new_verification_method_id: rotation.new_verification_method_id,
+    old_public_key_b64u: rotation.old_public_key_b64u,
+    new_public_key_b64u: rotation.new_public_key_b64u,
+    preserve_old_key_for: rotation.preserve_old_key_for,
+  };
+  return {
+    ...record,
+    identifier: {
+      ...record.identifier,
+      did_document: rotation.new_did_document,
+    },
+    artifact: {
+      url: artifact.url,
+      publish_path: artifact.publish_path,
+      sha256: artifact.sha256,
+    },
+    key_history: [...(record.key_history ?? []), historyEntry],
+  };
+}
+
+export function buildDidWebHealthSnapshot(
+  record: FortressDidWebRecord | null,
+  opts: { now?: () => Date } = {},
+): DidWebHealthSnapshot {
+  if (!record) {
+    return {
+      configured: false,
+      key_history: [],
+      recommended_periodic_days: DEFAULT_RECOMMENDED_PERIODIC_DAYS,
+    };
+  }
+  const history = record.key_history ?? [];
+  const recommendedDays =
+    record.rotation_policy?.recommended_periodic_days ??
+    DEFAULT_RECOMMENDED_PERIODIC_DAYS;
+  const anchor =
+    history.at(-1)?.rotated_at ?? record.identifier.created_at;
+  const nowMs = (opts.now ?? (() => new Date()))().getTime();
+  const nextMs = Date.parse(anchor) + recommendedDays * MS_PER_DAY;
+  const currentMethodId =
+    record.identifier.did_document.authentication[0] ??
+    record.identifier.did_document.assertionMethod[0];
+  return {
+    configured: true,
+    identifier: record.identifier.did,
+    authority_host: record.identifier.authority_host,
+    current_verification_method_id: currentMethodId,
+    last_rotation: history.at(-1),
+    key_history: history,
+    recommended_periodic_days: recommendedDays,
+    days_until_recommended_rotation: Math.ceil((nextMs - nowMs) / MS_PER_DAY),
+  };
 }
 
 // ── Derivation convenience ───────────────────────────────────────────

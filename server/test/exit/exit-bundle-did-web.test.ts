@@ -44,6 +44,8 @@ import {
 import { ExitBundleImportError } from "../../src/exit/bundle.js";
 import {
   deriveDidWebFromPrivateKey,
+  issueDidWeb,
+  rotateDidWebKey,
   type DidDocument,
 } from "../../src/recognition/did-web.js";
 import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
@@ -684,6 +686,57 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
         (e) => e.operation === EXIT_BUNDLE_DID_WEB_AUDIT_OPS.EXPORT_INCLUDED,
       ),
     ).toBe(false);
+  });
+
+  it("import verifies an old manifest signature against a rotated multi-key DID Document", async () => {
+    const source = await makeHarness();
+    const dir = await makeTempDir();
+    const identity = source.identityManager.getDefault()!;
+    const didUri = manifestDidUri(source);
+    const issued = await issueDidWeb({
+      fortress_id: TEST_FORTRESS_LABEL,
+      authority_host: TEST_AUTHORITY_HOST,
+      agent_label: "default",
+      public_key: fromBase64url(identity.public_key),
+      now: () => new Date("2026-05-09T12:00:00.000Z"),
+    });
+    await exportExitBundle({
+      bundleDir: dir,
+      storage: source.storage,
+      masterKey: source.masterKey,
+      identityManager: source.identityManager,
+      auditLog: source.auditLog,
+      reputationStore: source.reputationStore,
+      policy: DEFAULT_POLICY,
+      didWeb: { identifier: didUri, authority_host: TEST_AUTHORITY_HOST },
+    });
+    const rotated = await rotateDidWebKey(issued, {
+      reason: "manual",
+      now: () => new Date("2026-05-10T00:00:00.000Z"),
+    });
+
+    const receiver = await makeHarness();
+    const result = await importExitBundle({
+      bundleDir: dir,
+      storage: receiver.storage,
+      masterKey: receiver.masterKey,
+      identityManager: receiver.identityManager,
+      auditLog: receiver.auditLog,
+      reputationStore: receiver.reputationStore,
+      didWebAllowedHosts: ALLOWED_HOSTS,
+      didWebFetcher: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => rotated.new_did_document,
+      }),
+    });
+    expect(result.verified).toBe(true);
+    const audit = await receiver.auditLog.query({ layer: "l1", limit: 200 });
+    expect(
+      audit.entries.some(
+        (e) => e.operation === "did_web_historical_verification_used",
+      ),
+    ).toBe(true);
   });
 
   it("Castle-walking: empty allowed_hosts blocks outbound at the application layer (no fetcher invocation)", async () => {

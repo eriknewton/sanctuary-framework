@@ -1113,6 +1113,7 @@ export async function importExitBundle(
     const resolveOpts: ResolveDidWebOpts = {
       allowed_hosts: opts.didWebAllowedHosts ?? [],
       expected_public_key: expectedPublicKey,
+      assertion_time: manifest.body.exported_at,
       ...(opts.didWebFetcher !== undefined ? { fetcher: opts.didWebFetcher } : {}),
       ...(opts.didWebTimeoutMs !== undefined
         ? { timeout_ms: opts.didWebTimeoutMs }
@@ -1139,8 +1140,24 @@ export async function importExitBundle(
           identifier: manifestDidWeb.identifier,
           authority_host: authorityHost,
           resolved_url: resolution.url,
+          ...(resolution.selected_verification_method_id !== undefined
+            ? { verification_method_id: resolution.selected_verification_method_id }
+            : {}),
         },
       );
+      if (resolution.historical_verification_used) {
+        opts.auditLog.append(
+          "l1",
+          "did_web_historical_verification_used",
+          manifest.body.identity_binding.identity_id,
+          {
+            identifier: manifestDidWeb.identifier,
+            authority_host: authorityHost,
+            verification_method_id: resolution.selected_verification_method_id,
+            assertion_time: manifest.body.exported_at,
+          },
+        );
+      }
     } else if (resolution.failure === "signature_mismatch") {
       opts.auditLog.append(
         "l1",

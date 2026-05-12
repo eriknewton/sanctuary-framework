@@ -28,6 +28,8 @@
  */
 
 import { createHash } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 import type { AuditLog } from "../../l2-operational/audit-log.js";
 import {
@@ -61,6 +63,14 @@ import {
   detectorClassForSpan,
 } from "../../l2-operational/privacy-filter.js";
 import { listTemplates } from "../../templates/registry.js";
+import {
+  DID_WEB_AUDIT_OPS,
+  dropExpiredDidWebKeys,
+  identifierFromFortressDidWebRecord,
+  loadFortressDidWebRecord,
+  publishDidWebDocument,
+  type DidWebIdentifier,
+} from "../../recognition/did-web.js";
 
 export interface BuildV11BindingsInputs {
   /** Operator identity id this hub is scoped to. */
@@ -117,6 +127,8 @@ export interface V11Bindings {
   hubService: HubService;
   identityId: string;
   fortressId: string;
+  storagePath?: string;
+  masterKey?: Uint8Array;
   /**
    * Optional Intelligence Substrate Selector. Dispatch layer routes
    * `/api/hub/intelligence/*` here when set; absent means the routes
@@ -130,6 +142,52 @@ export interface V11Bindings {
    * side `recordAgentReply` integration also need the service handle.
    */
   operatorChatService?: OperatorChatService;
+}
+
+async function pruneExpiredDidWebKeysOnUnlock(
+  inputs: BuildV11BindingsInputs,
+): Promise<void> {
+  if (!inputs.storagePath) return;
+  const record = await loadFortressDidWebRecord(inputs.storagePath);
+  if (!record) return;
+  const identifier = identifierFromFortressDidWebRecord(record);
+  const pruned = dropExpiredDidWebKeys(identifier);
+  if (pruned.dropped.length === 0) return;
+
+  const prunedIdentifier: DidWebIdentifier = {
+    ...identifier,
+    did_document: pruned.did_document,
+  };
+  const artifact = publishDidWebDocument(prunedIdentifier);
+  const updated = {
+    ...record,
+    identifier: {
+      ...record.identifier,
+      did_document: pruned.did_document,
+    },
+    artifact: {
+      url: artifact.url,
+      publish_path: artifact.publish_path,
+      sha256: artifact.sha256,
+    },
+  };
+
+  const persistDir = join(inputs.storagePath, "recognition");
+  await mkdir(persistDir, { recursive: true, mode: 0o700 });
+  await writeFile(join(persistDir, "did-web.json"), JSON.stringify(updated, null, 2), {
+    mode: 0o600,
+  });
+  await writeFile(join(persistDir, "did.json"), artifact.artifact, { mode: 0o644 });
+
+  for (const dropped of pruned.dropped) {
+    inputs.auditLog.append("l1", DID_WEB_AUDIT_OPS.OLD_KEY_DROPPED, inputs.identityId, {
+      did: record.identifier.did,
+      verification_method_id: dropped.verification_method_id,
+      public_key_b64u: dropped.public_key_b64u,
+      dropped_at: dropped.dropped_at,
+    });
+  }
+  await inputs.auditLog.flush();
 }
 
 class CapabilityErrorAgentController implements HubAgentController {
@@ -192,6 +250,9 @@ export function buildV11Bindings(
       ? (records: ReturnType<typeof readPersistedLocalAgents>) =>
           writePersistedLocalAgents(storagePath, records)
       : undefined;
+  void pruneExpiredDidWebKeysOnUnlock(inputs).catch(() => {
+    // Best-effort unlock pruning must not block dashboard construction.
+  });
 
   // WP-V1.2-4: construct the operator-chat service when the caller has
   // wired the fortress storage + master key. Concierge surface depends
@@ -279,6 +340,8 @@ export function buildV11Bindings(
     hubService,
     identityId: inputs.identityId,
     fortressId: inputs.fortressId,
+    ...(inputs.storagePath !== undefined ? { storagePath: inputs.storagePath } : {}),
+    ...(inputs.masterKey !== undefined ? { masterKey: inputs.masterKey } : {}),
     ...(inputs.intelligenceSelector
       ? { intelligenceSelector: inputs.intelligenceSelector }
       : {}),
