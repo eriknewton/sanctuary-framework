@@ -51,6 +51,10 @@ import { createHash, randomUUID } from "node:crypto";
 import type { SubstrateSelector } from "../intelligence/selector.js";
 import {
   FILESYSTEM_OPS,
+  type CredentialEmissionPath,
+  type CredentialTrigger,
+  type CredentialType,
+  type CredentialVisibility,
   type FilesystemOp,
   type FilesystemTrigger,
   type HoneypotDraft,
@@ -76,12 +80,12 @@ const DEFAULT_SEVERITY = "alert" as const;
  * compiler can parse + validate. The prompt is deliberately small;
  * the LLM's job is shape-derivation, not creative composition.
  *
- * Pi-3 extends the schema with `tool_call` catalog fields.
+ * Pi-4 extends the schema with `credential` bait fields.
  */
 const COMPILE_PROMPT = `You are compiling a Sanctuary honeypot from an operator's plain-English description.
 Return STRICT JSON with the following shape (no markdown, no commentary):
 {
-  "trap_class": "http_endpoint" | "filesystem" | "tool_call",
+  "trap_class": "http_endpoint" | "filesystem" | "tool_call" | "credential",
   "path_pattern": "string (glob with * or **)",
   "method": "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "ANY",
   "ops": ["read", "write", "delete", "list"],
@@ -91,11 +95,18 @@ Return STRICT JSON with the following shape (no markdown, no commentary):
   "catalog_visibility": "all_wrapped_agents" | "specific_agents",
   "visible_to_agents": ["agent_id"],
   "fake_response": "string or JSON object",
+  "fake_credential_name": "string",
+  "fake_credential_type": "api_key" | "password" | "session_token" | "bearer_token" | "oauth_refresh",
+  "fake_credential_value": "operator-controlled plausible fake credential",
+  "visibility": "all_wrapped_agents" | "specific_agents",
+  "emission_paths": ["secret_broker" | "env_var_export" | "config_file"],
+  "fake_response_on_use": "optional plausible 401/403 response",
+  "monitored_target_hosts": ["api.example.com"],
   "expected_caller_types": ["wrapped_agent" | "operator" | "external"],
   "finding_severity": "warn" | "alert",
   "explanation_paragraph": "one-sentence operator-friendly explanation"
 }
-Default trap_class to "http_endpoint" unless the operator clearly describes filesystem access (file reads/writes, directory access, path-on-disk monitoring) or fake MCP tool/catalog bait. The "method" field applies only to http_endpoint traps; the "ops" field applies only to filesystem traps; fake_tool_* fields apply only to tool_call traps. Match the operator's stated severity if they gave one; otherwise default to "alert". If method is unspecified for http_endpoint, return "ANY". If ops is unspecified for filesystem, return ["read","write","delete","list"]. For tool_call, catalog_visibility defaults to "all_wrapped_agents", fake_tool_schema defaults to {"type":"object","properties":{}}, and fake_response should be clearly operator-controlled bait. If caller-type is unspecified, return ["wrapped_agent"]. Keep the explanation_paragraph under 200 characters.`;
+Default trap_class to "http_endpoint" unless the operator clearly describes filesystem access (file reads/writes, directory access, path-on-disk monitoring), fake MCP tool/catalog bait, or fake credentials/secrets/API keys/tokens/passwords. The "method" field applies only to http_endpoint traps; the "ops" field applies only to filesystem traps; fake_tool_* fields apply only to tool_call traps; fake_credential_* fields apply only to credential traps. Match the operator's stated severity if they gave one; otherwise default to "alert". If method is unspecified for http_endpoint, return "ANY". If ops is unspecified for filesystem, return ["read","write","delete","list"]. For tool_call, catalog_visibility defaults to "all_wrapped_agents", fake_tool_schema defaults to {"type":"object","properties":{}}, and fake_response should be clearly operator-controlled bait. For credential, visibility defaults to "all_wrapped_agents", emission_paths defaults to ["secret_broker"], and fake_response_on_use must look like a real 401 or 403 service response, not a honeypot warning. If caller-type is unspecified, return ["wrapped_agent"]. Keep the explanation_paragraph under 200 characters.`;
 
 export interface CompileResult {
   spec: TrapSpec;
@@ -225,6 +236,11 @@ interface ParseFailure {
     | "invalid_fake_tool_schema"
     | "invalid_catalog_visibility"
     | "invalid_fake_response"
+    | "missing_fake_credential_name"
+    | "invalid_fake_credential_type"
+    | "invalid_fake_credential_value"
+    | "invalid_credential_visibility"
+    | "invalid_credential_emission_paths"
     | "invalid_severity"
     | "invalid_caller_types"
     | "invalid_filesystem_ops";
@@ -270,7 +286,21 @@ function tryParseLlmResponse(text: string): ParseSuccess | ParseFailure {
       ? "filesystem"
       : trapClassRaw === "tool_call"
         ? "tool_call"
-        : "http_endpoint";
+        : trapClassRaw === "credential"
+          ? "credential"
+          : "http_endpoint";
+
+  if (trapClass === "credential") {
+    const parsed = parseCredentialTrigger(obj);
+    if (!parsed.ok) return { ok: false, failure: parsed.failure };
+    return {
+      ok: true,
+      trapClass,
+      trigger: parsed.trigger,
+      severity,
+      explanation,
+    };
+  }
 
   if (trapClass === "tool_call") {
     const parsed = parseToolCallTrigger(obj);
@@ -392,6 +422,104 @@ function parseToolCallTrigger(
   };
 }
 
+type CredentialParseResult =
+  | { ok: true; trigger: CredentialTrigger }
+  | {
+      ok: false;
+      failure:
+        | "missing_fake_credential_name"
+        | "invalid_fake_credential_type"
+        | "invalid_fake_credential_value"
+        | "invalid_credential_visibility"
+        | "invalid_credential_emission_paths";
+    };
+
+const CREDENTIAL_TYPES: readonly CredentialType[] = [
+  "api_key",
+  "password",
+  "session_token",
+  "bearer_token",
+  "oauth_refresh",
+] as const;
+
+const CREDENTIAL_EMISSION_PATHS: readonly CredentialEmissionPath[] = [
+  "secret_broker",
+  "env_var_export",
+  "config_file",
+] as const;
+
+function parseCredentialTrigger(
+  obj: Record<string, unknown>,
+): CredentialParseResult {
+  const name = obj["fake_credential_name"];
+  if (typeof name !== "string" || !isPlausibleCredentialName(name)) {
+    return { ok: false, failure: "missing_fake_credential_name" };
+  }
+  const typeRaw = obj["fake_credential_type"];
+  if (
+    typeof typeRaw !== "string" ||
+    !CREDENTIAL_TYPES.includes(typeRaw as CredentialType)
+  ) {
+    return { ok: false, failure: "invalid_fake_credential_type" };
+  }
+  const type = typeRaw as CredentialType;
+  const value = obj["fake_credential_value"];
+  if (
+    typeof value !== "string" ||
+    !isPlausibleCredentialValue(type, value)
+  ) {
+    return { ok: false, failure: "invalid_fake_credential_value" };
+  }
+  const visibilityRaw = obj["visibility"];
+  if (
+    visibilityRaw !== undefined &&
+    visibilityRaw !== "all_wrapped_agents" &&
+    visibilityRaw !== "specific_agents"
+  ) {
+    return { ok: false, failure: "invalid_credential_visibility" };
+  }
+  const visibility: CredentialVisibility =
+    visibilityRaw === "specific_agents"
+      ? "specific_agents"
+      : "all_wrapped_agents";
+  const visibleToAgents = Array.isArray(obj["visible_to_agents"])
+    ? (obj["visible_to_agents"] as unknown[]).filter(
+        (v): v is string => typeof v === "string" && v.length > 0,
+      )
+    : [];
+  if (visibility === "specific_agents" && visibleToAgents.length === 0) {
+    return { ok: false, failure: "invalid_credential_visibility" };
+  }
+  const emissionPaths = parseCredentialEmissionPaths(obj["emission_paths"]);
+  if (emissionPaths === null) {
+    return { ok: false, failure: "invalid_credential_emission_paths" };
+  }
+  const fakeResponse = obj["fake_response_on_use"];
+  const targetHosts = Array.isArray(obj["monitored_target_hosts"])
+    ? (obj["monitored_target_hosts"] as unknown[]).filter(
+        (v): v is string => typeof v === "string" && v.length > 0,
+      )
+    : [];
+  return {
+    ok: true,
+    trigger: {
+      kind: "credential",
+      fake_credential_name: name,
+      fake_credential_type: type,
+      fake_credential_value: value,
+      visibility,
+      ...(visibility === "specific_agents"
+        ? { visible_to_agents: visibleToAgents }
+        : {}),
+      emission_paths: emissionPaths,
+      ...(typeof fakeResponse === "string" && fakeResponse.length > 0
+        ? { fake_response_on_use: fakeResponse }
+        : {}),
+      ...(targetHosts.length > 0 ? { monitored_target_hosts: targetHosts } : {}),
+    },
+  };
+}
+
 /**
  * Validate the LLM-supplied `ops` field. Accepts the canonical four
  * operations; rejects unknown entries. Missing or empty ops defaults
@@ -410,6 +538,25 @@ function parseFilesystemOps(raw: unknown): FilesystemOp[] | null {
     if (typeof entry !== "string") return null;
     if (!FILESYSTEM_OPS.includes(entry as FilesystemOp)) return null;
     if (!out.includes(entry as FilesystemOp)) out.push(entry as FilesystemOp);
+  }
+  return out;
+}
+
+function parseCredentialEmissionPaths(
+  raw: unknown,
+): CredentialEmissionPath[] | null {
+  if (raw === undefined || raw === null) return ["secret_broker"];
+  if (!Array.isArray(raw)) return null;
+  if (raw.length === 0) return ["secret_broker"];
+  const out: CredentialEmissionPath[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string") return null;
+    if (!CREDENTIAL_EMISSION_PATHS.includes(entry as CredentialEmissionPath)) {
+      return null;
+    }
+    if (!out.includes(entry as CredentialEmissionPath)) {
+      out.push(entry as CredentialEmissionPath);
+    }
   }
   return out;
 }
@@ -472,8 +619,8 @@ const FILESYSTEM_OP_HINTS: Array<{ phrase: RegExp; op: FilesystemOp }> = [
 const TOOL_CALL_CLASS_HINTS = [
   /\btool[-\s]?call\b/i,
   /\bfake\s+(?:mcp\s+)?tool\b/i,
+  /\bfake\s+[A-Za-z_][A-Za-z0-9_:/.-]{2,}\s+tool\b/i,
   /\btool\s+catalog\b/i,
-  /\bvisible\s+to\s+(?:all\s+)?agents\b/i,
   /\bif\s+invoked\b/i,
   /\binvokes?\s+(?:the\s+)?(?:fake\s+)?tool\b/i,
 ];
@@ -484,6 +631,22 @@ const TOOL_NAME_HINTS: RegExp[] = [
   /\bdeploy\s+(?:a\s+)?(?:fake\s+)?([A-Za-z_][A-Za-z0-9_:/.-]{2,})\s+tool\b/i,
   /\binvoked?,?\s+(?:return|then)\b.*?\b([A-Za-z_][A-Za-z0-9_:/.-]{2,})\b/i,
   /\b([A-Za-z_][A-Za-z0-9_:/.-]{2,})\s+tool\b/i,
+];
+
+const CREDENTIAL_CLASS_HINTS = [
+  /\bcredential\b/i,
+  /\bsecret\b/i,
+  /\bapi\s*key\b/i,
+  /\bpassword\b/i,
+  /\bsession\s*token\b/i,
+  /\bbearer\s*token\b/i,
+  /\boauth\s*refresh\b/i,
+];
+
+const CREDENTIAL_NAME_HINTS: RegExp[] = [
+  /\bfake\s+([A-Za-z_][A-Za-z0-9_.-]{2,})\s+(?:api\s*key|secret|token|password|credential)\b/i,
+  /\b(?:secret|credential|api\s*key|token|password)\s+(?:named|called)\s+([A-Za-z_][A-Za-z0-9_.-]{2,})\b/i,
+  /\b([A-Za-z_][A-Za-z0-9_.-]{2,})\s+(?:api\s*key|secret|token|password|credential)\b/i,
 ];
 
 function heuristicCompile(english: string): HeuristicResult {
@@ -510,6 +673,40 @@ function heuristicCompile(english: string): HeuristicResult {
 
   const isFilesystem = FILESYSTEM_CLASS_HINTS.some((re) => re.test(english));
   const isToolCall = TOOL_CALL_CLASS_HINTS.some((re) => re.test(english));
+  const isCredential = CREDENTIAL_CLASS_HINTS.some((re) => re.test(english));
+
+  if (isCredential && !isToolCall) {
+    const credentialType = inferCredentialType(english);
+    const credentialName =
+      extractCredentialName(english) ?? defaultCredentialName(credentialType);
+    const visibleToAgents = extractVisibleAgents(english);
+    const emissionPaths = inferCredentialEmissionPaths(english);
+    const targetHosts = extractTargetHosts(english);
+    const trigger: CredentialTrigger = {
+      kind: "credential",
+      fake_credential_name: credentialName,
+      fake_credential_type: credentialType,
+      fake_credential_value: defaultCredentialValue(credentialType),
+      visibility:
+        visibleToAgents.length > 0
+          ? "specific_agents"
+          : "all_wrapped_agents",
+      ...(visibleToAgents.length > 0
+        ? { visible_to_agents: visibleToAgents }
+        : {}),
+      emission_paths: emissionPaths,
+      fake_response_on_use:
+        "HTTP/1.1 401 Unauthorized\n{\"error\":\"invalid_api_key\"}",
+      ...(targetHosts.length > 0 ? { monitored_target_hosts: targetHosts } : {}),
+    };
+    return {
+      trapClass: "credential",
+      trigger,
+      ...(severity !== undefined ? { severity } : {}),
+      explanation:
+        `Credential honeypot compiled from operator draft via heuristic compile; trap exposes ${credentialName} through ${emissionPaths.join(",")}.`,
+    };
+  }
 
   if (isToolCall) {
     const fakeToolName = extractToolName(english) ?? "admin_password_reader";
@@ -607,6 +804,28 @@ function isPlausibleToolName(value: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_:/.-]{2,127}$/.test(value);
 }
 
+function isPlausibleCredentialName(value: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_.-]{2,127}$/.test(value);
+}
+
+export function isPlausibleCredentialValue(
+  type: CredentialType,
+  value: string,
+): boolean {
+  if (value.length < 12 || value.length > 512) return false;
+  if (/honeypot|trap|fake/i.test(value)) return false;
+  switch (type) {
+    case "api_key":
+      return /^[A-Za-z0-9._-]{16,160}$/.test(value);
+    case "password":
+      return value.length >= 12 && /\d/.test(value) && /[A-Za-z]/.test(value);
+    case "session_token":
+    case "bearer_token":
+    case "oauth_refresh":
+      return /^[A-Za-z0-9._~+/-]{20,512}={0,2}$/.test(value);
+  }
+}
+
 function extractToolName(english: string): string | null {
   for (const re of TOOL_NAME_HINTS) {
     const match = english.match(re);
@@ -624,6 +843,77 @@ function extractVisibleAgents(english: string): string[] {
     .split(/[,\s]+/)
     .map((v) => v.trim())
     .filter((v) => v.length > 0 && !/^(and|if|return)$/i.test(v));
+}
+
+function inferCredentialType(english: string): CredentialType {
+  if (/\bpassword\b/i.test(english)) return "password";
+  if (/\bsession\s*token\b/i.test(english)) return "session_token";
+  if (/\bbearer\s*token\b/i.test(english)) return "bearer_token";
+  if (/\boauth\s*refresh\b/i.test(english)) return "oauth_refresh";
+  return "api_key";
+}
+
+function extractCredentialName(english: string): string | null {
+  for (const re of CREDENTIAL_NAME_HINTS) {
+    const match = english.match(re);
+    const candidate = match?.[1];
+    if (candidate && isPlausibleCredentialName(candidate)) return candidate;
+  }
+  return null;
+}
+
+function defaultCredentialName(type: CredentialType): string {
+  switch (type) {
+    case "password":
+      return "admin_db_password";
+    case "session_token":
+      return "admin_session_token";
+    case "bearer_token":
+      return "prod_bearer_token";
+    case "oauth_refresh":
+      return "oauth_refresh_token";
+    case "api_key":
+      return "admin_api_key";
+  }
+}
+
+function defaultCredentialValue(type: CredentialType): string {
+  switch (type) {
+    case "password":
+      return "V3lv3t-Atlas-91-Ridge";
+    case "session_token":
+      return "sess_liv_7HnF2qKp9TzM4xRb6WcY8vLs3Ea";
+    case "bearer_token":
+      return "brr_live_9aK4mQ7vT2xY8pL5sN3dR6hC1gF0";
+    case "oauth_refresh":
+      return "1//0gXyZpQ9mN7bVcD4eF6hJ8kL2rT5wA3sE";
+    case "api_key":
+      return "ak_live_51N7bVcD4eF6hJ8kL2rT5wA3sE9xQ";
+  }
+}
+
+function inferCredentialEmissionPaths(
+  english: string,
+): CredentialEmissionPath[] {
+  const out: CredentialEmissionPath[] = [];
+  if (/\bsecret\s*broker|broker\b/i.test(english)) out.push("secret_broker");
+  if (/\benv(?:ironment)?\s*(?:var|variable|export)\b/i.test(english)) {
+    out.push("env_var_export");
+  }
+  if (/\bconfig\s*file|configuration\s*file\b/i.test(english)) {
+    out.push("config_file");
+  }
+  return out.length > 0 ? out : ["secret_broker"];
+}
+
+function extractTargetHosts(english: string): string[] {
+  const hosts = new Set<string>();
+  const hostRe = /\b(?:against|to|host)\s+([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/gi;
+  let match: RegExpExecArray | null;
+  while ((match = hostRe.exec(english)) !== null) {
+    if (match[1]) hosts.add(match[1].toLowerCase());
+  }
+  return [...hosts];
 }
 
 function extractFakeResponse(english: string): string {
