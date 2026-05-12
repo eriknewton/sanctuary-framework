@@ -47,6 +47,9 @@
  * existing toBase64url helper covers the JWK `x` field).
  */
 
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+
 import { sha256 } from "@noble/hashes/sha256";
 import { ed25519 } from "@noble/curves/ed25519";
 
@@ -476,6 +479,125 @@ async function defaultFetcher(
     json: () => response.json(),
   };
 }
+
+// ── Fortress-config persistence (build 3) ────────────────────────────
+
+/**
+ * Canonical relative path (inside a fortress's `storage_path`) where
+ * the issued did:web identifier record is persisted. `did-web issue`
+ * writes this file; downstream surfaces (exit-bundle export, status
+ * displays) read it for auto-inclusion / display.
+ *
+ * The act of issuing IS the registration: there is exactly one
+ * fortress-level did:web record per storage path, and per-fortress
+ * isolation is structural (different storage_path means different
+ * file). The companion `did.json` artifact (operator-publishable DID
+ * Document) is colocated at the same directory.
+ */
+export const FORTRESS_DID_WEB_REGISTRY_PATH = "recognition/did-web.json";
+
+/**
+ * Parsed shape of the persisted record `did-web issue` writes. Mirrors
+ * the literal JSON shape the foundation CLI emits; callers should not
+ * depend on extra top-level keys appearing here.
+ */
+export interface FortressDidWebRecord {
+  version: 1;
+  identifier: {
+    did: string;
+    created_at: string;
+    authority_host: string;
+    fortress_id: string;
+    agent_label?: string;
+    did_document: DidDocument;
+  };
+  artifact: {
+    url: string;
+    publish_path: string;
+    sha256: string;
+  };
+}
+
+/**
+ * Load the fortress's persisted did:web record, if any.
+ *
+ * Returns `null` when no record has been issued (file absent). Throws
+ * when the file exists but is malformed; callers that prefer a soft
+ * miss can use `tryLoadFortressDidWebRecord` instead.
+ *
+ * Pure local filesystem read; no outbound network surface. The record
+ * is the operator-sovereign source of truth for "this fortress has a
+ * registered did:web identifier"; auto-inclusion in exit bundles
+ * keys off this file's presence, not off any external registry.
+ */
+export async function loadFortressDidWebRecord(
+  storagePath: string,
+): Promise<FortressDidWebRecord | null> {
+  const persistPath = join(storagePath, FORTRESS_DID_WEB_REGISTRY_PATH);
+  let raw: string;
+  try {
+    raw = await readFile(persistPath, "utf-8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return null;
+    throw err;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    throw new Error(
+      `did-web: fortress-config record at ${persistPath} is not valid JSON: ${message}`,
+    );
+  }
+  if (!isFortressDidWebRecord(parsed)) {
+    throw new Error(
+      `did-web: fortress-config record at ${persistPath} is malformed (expected version: 1 with identifier.did + identifier.authority_host)`,
+    );
+  }
+  return parsed;
+}
+
+/**
+ * Soft-miss variant: returns `null` whether the file is absent OR
+ * malformed. Use only on display paths where surfacing a fortress in
+ * a degraded state is preferable to refusing to render.
+ */
+export async function tryLoadFortressDidWebRecord(
+  storagePath: string,
+): Promise<FortressDidWebRecord | null> {
+  try {
+    return await loadFortressDidWebRecord(storagePath);
+  } catch {
+    return null;
+  }
+}
+
+function isFortressDidWebRecord(value: unknown): value is FortressDidWebRecord {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  if (v["version"] !== 1) return false;
+  const id = v["identifier"] as Record<string, unknown> | undefined;
+  if (!id || typeof id !== "object") return false;
+  if (typeof id["did"] !== "string" || !id["did"].startsWith("did:web:")) {
+    return false;
+  }
+  if (typeof id["authority_host"] !== "string") return false;
+  if (typeof id["fortress_id"] !== "string") return false;
+  if (typeof id["created_at"] !== "string") return false;
+  if (!id["did_document"] || typeof id["did_document"] !== "object") {
+    return false;
+  }
+  const artifact = v["artifact"] as Record<string, unknown> | undefined;
+  if (!artifact || typeof artifact !== "object") return false;
+  if (typeof artifact["url"] !== "string") return false;
+  if (typeof artifact["publish_path"] !== "string") return false;
+  if (typeof artifact["sha256"] !== "string") return false;
+  return true;
+}
+
+// ── Derivation convenience ───────────────────────────────────────────
 
 /**
  * Convenience: derive a DidWebIdentifier from a fortress's Ed25519
