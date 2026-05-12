@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.15] - 2026-05-09
+
+Patch release shipping the iteration-12 and iteration-13 cascade since v1.2.14. **WP-V1.3-5 Honeypot Authoring OPENED and advanced** (Pi-1 foundation plus Pi-2 filesystem trap class and fortress-config persistence). **WP-V1.3-6 English-Authored Policy Gates OPENED end-to-end** (Xi-1 compile-then-activate foundation plus Xi-2 activation lifecycle closes the Xi-1 compile-then-activate scope). **WP-V1.3-7 Auto-Trigger Ladder + Threshold Calibration OPENED** (Nu-1 foundation). **WP-V1.x-RECOGNITION-LAYER advanced again** with did:web build 3 fortress-config auto-inclusion. **WP-V1.x-QUERY-LAYER-ANONYMITY OPENED + Principle 4 closed at the foundation level** by Rho-1 in v1.2.12 and now advances with Rho-2 Tier B basic PII rewrite; smart mode Rho-3 remains queued for iteration-14. After this release, all 9 of 9 v1.3 work packages are at minimum foundation level on main, with v1.3.0-rc.1 timing left to Erik.
+
+### v1.3 preview, WP-V1.3 work-package openings
+
+- **Pi-1 WP-V1.3-5 Honeypot Authoring foundation (OPENS WP-V1.3-5).** Adds the honeypot authoring core: typed trap definitions, deterministic compilation, operator-safe validation, and fortress-local storage primitives for deception surfaces that lure unsafe agent behavior without creating outbound dependencies. The foundation is additive and keeps enforcement separate from authoring so later builds can wire concrete trap classes and activation. PR #208.
+- **Xi-1 WP-V1.3-6 English-Authored Policy Gates foundation (OPENS WP-V1.3-6).** Introduces the compile-then-activate path for English-authored operator policy: policy text compiles into structured gate artifacts before runtime enforcement, preserving the operator-readable source while giving Sanctuary a deterministic activation target. Xi-2 in this release closes the first compile-then-activate lifecycle scope. PR #206.
+- **Nu-1 WP-V1.3-7 Auto-Trigger Ladder + Threshold Calibration foundation (OPENS WP-V1.3-7).** Opens the final v1.3 work package with the threshold configuration store and ladder foundation needed for calibrated automatic escalation. The build establishes the storage and calibration baseline that later Nu builds can surface through dashboard controls and real actions. PR #207.
+
+### v1.3 preview, WP-V1.3 deepening
+
+- **Xi-2 WP-V1.3-6 policy activation lifecycle.** Completes the first end-to-end path for English-authored policy gates by closing Xi-1's compile-then-activate scope: compiled policy artifacts can move through an activation lifecycle rather than remaining static compile output. This makes WP-V1.3-6 OPENED end-to-end in the preview surface while remaining additive to existing policy behavior. PR #209.
+- **Pi-2 WP-V1.3-5 honeypot filesystem trap class + persistence.** Advances Honeypot Authoring beyond foundation with a filesystem trap class, fortress-config persistence, and selector boot wiring. Trap definitions now persist through fortress configuration instead of living only as authored in-memory objects, giving WP-V1.3-5 its first concrete trap class and durable operator configuration path. PR #212.
+
+### v1.x principle-closing work
+
+- **did:web Path C build 3: fortress-config auto-inclusion.** Advances WP-V1.x-RECOGNITION-LAYER by making did:web inclusion automatic from fortress configuration. Build 1 created the issuance/resolution/publication scaffold and build 2 carried did:web through exit bundles; build 3 removes another manual operator step by allowing configured did:web identity to flow into the relevant portability path by default. PR #210.
+- **Rho-2 WP-V1.x-QUERY-LAYER-ANONYMITY Tier B basic PII rewrite.** Advances the query-anonymity work package after Rho-1 opened it and closed Principle 4 at the foundation level. Rho-2 adds the basic Tier B rewrite shape for PII-bearing query content, moving beyond header stripping while keeping the smarter mode explicitly deferred to Rho-3 in iteration-14. PR #211.
+
+### Notes
+
+Test baseline floor: 4249, reflecting the iteration-13 cascade over the v1.2.14 floor. npm latest before this cut is v1.2.14; v1.2.15 is the only new npm publish queued and publish remains Erik-owned because OTP is required.
+
 ## [1.2.14] - 2026-05-09
 
 Patch release shipping the iteration-11 cascade since v1.2.13. One OPENS, one loop-close, one advancement. **WP-V1.3-4 Unified Approval Inbox Bridge OPENED** (Psi-1 brings the full set of operator-attention surfaces (sentinel findings, approvals, blocked egress, privacy events, budget warnings, recovery prompts, agent errors) into one stream). **WP-V1.x-RECOGNITION-LAYER Path C build 2 closes the Recognition + Portability loop at the exit-bundle layer** (did:web build 2 wires did:web identifiers into exit bundles so the receiving regime resolves bundle origin via DNS + TLS + HTTPS without trusting Sanctuary as intermediary; transparency note: this PR's binary already shipped in v1.2.13 due to a merge-order interaction with #204; CHANGELOG documents the source PR for attribution). **WP-V1.3-2 Anomaly Detection Pipeline advances from 3/N to 4/N** (Chi-4 adds cross-agent-timing + tool-call-sequence feature extractors; the catalog auto-lights up against Chi-3's UX). The v1.3 preview routes remain additive and non-breaking; v1.3.0 GA waits until WP-V1.3-2 ships its remaining Chi-N builds plus WP-V1.3-7.
@@ -1251,4 +1275,3 @@ See `docs/MIGRATION_v0.3_to_v0.4.md` for detailed upgrade instructions.
 - **0.7.x:** Tool name cleanup, Cocoon CLI
 - **0.8.x:** EU AI Act compliance, test baseline hardening
 - **0.9.x:** Sovereignty Dashboard, one-command wrap, security hardening, deep-audit polish
-
