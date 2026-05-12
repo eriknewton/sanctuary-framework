@@ -30,6 +30,7 @@ import {
   type CompiledPolicy,
   type EnglishPolicyDraft,
 } from "./english-policy-compiler.js";
+import type { EnglishPolicyActivator } from "./english-policy-activator.js";
 
 export const ENGLISH_POLICY_API_PREFIX = "/api/policy";
 
@@ -37,6 +38,14 @@ export interface EnglishPolicyRouterDeps {
   authConfig: AuthConfig;
   compiler: EnglishPolicyCompiler;
   store: EnglishPolicyDraftStore;
+  /**
+   * Xi-2 activation lifecycle. Optional; when omitted, the
+   * activation / revocation routes return 503. Routes that operate
+   * only on the Xi-1 compile-only surface (compile, drafts list,
+   * drafts detail) work unchanged regardless of whether the
+   * activator is plumbed in.
+   */
+  activator?: EnglishPolicyActivator;
   /** Default operator id when the request did not carry an
    *  X-Operator-Identity header. Falls back to "operator". */
   defaultOperatorId?: string;
@@ -122,6 +131,26 @@ function matchDetailRoute(path: string): { draftId: string } | null {
   const rest = path.slice(prefix.length);
   if (rest.length === 0 || rest.includes("/")) return null;
   return { draftId: decodeURIComponent(rest) };
+}
+
+function matchActivateRoute(path: string): { draftId: string } | null {
+  const prefix = `${ENGLISH_POLICY_API_PREFIX}/drafts/`;
+  if (!path.startsWith(prefix)) return null;
+  const rest = path.slice(prefix.length);
+  if (!rest.endsWith("/activate")) return null;
+  const draftId = rest.slice(0, rest.length - "/activate".length);
+  if (draftId.length === 0 || draftId.includes("/")) return null;
+  return { draftId: decodeURIComponent(draftId) };
+}
+
+function matchStatusRoute(path: string): { draftId: string } | null {
+  const prefix = `${ENGLISH_POLICY_API_PREFIX}/drafts/`;
+  if (!path.startsWith(prefix)) return null;
+  const rest = path.slice(prefix.length);
+  if (!rest.endsWith("/status")) return null;
+  const draftId = rest.slice(0, rest.length - "/status".length);
+  if (draftId.length === 0 || draftId.includes("/")) return null;
+  return { draftId: decodeURIComponent(draftId) };
 }
 
 export async function handleEnglishPolicyRoute(
@@ -211,15 +240,127 @@ export async function handleEnglishPolicyRoute(
       return true;
     }
 
-    const detailMatch = matchDetailRoute(path);
-    if (detailMatch && method === "GET") {
-      const draft = deps.store.get(detailMatch.draftId);
+    const statusMatch = matchStatusRoute(path);
+    if (statusMatch && method === "GET") {
+      if (!deps.activator) {
+        writeJSON(res, 503, {
+          ok: false,
+          error: "activator_not_configured",
+        });
+        return true;
+      }
+      const record = await deps.activator.getRecord(statusMatch.draftId);
+      if (!record) {
+        writeJSON(res, 404, { ok: false, error: "not_found" });
+        return true;
+      }
+      writeJSON(res, 200, { ok: true, data: { record } });
+      return true;
+    }
+
+    const activateMatch = matchActivateRoute(path);
+    if (activateMatch && method === "POST") {
+      if (!deps.activator) {
+        writeJSON(res, 503, {
+          ok: false,
+          error: "activator_not_configured",
+        });
+        return true;
+      }
+      const draft =
+        deps.store.get(activateMatch.draftId) ??
+        (await deps.activator.getRecord(activateMatch.draftId))?.draft ??
+        null;
       if (!draft) {
         writeJSON(res, 404, { ok: false, error: "not_found" });
         return true;
       }
-      writeJSON(res, 200, { ok: true, data: { draft } });
+      const operatorId =
+        (req.headers["x-operator-identity"] as string | undefined) ??
+        (deps.defaultOperatorId ?? "operator");
+      const overrideRaw = url.searchParams.get("override");
+      const overrideLowConfidence =
+        overrideRaw === "true" || overrideRaw === "1";
+      const outcome = await deps.activator.activate(draft, operatorId, {
+        override_low_confidence: overrideLowConfidence,
+      });
+      if (!outcome.ok) {
+        const status =
+          outcome.reason === "low_confidence_refused"
+            ? 409
+            : outcome.reason === "draft_not_found"
+              ? 404
+              : outcome.reason === "already_activated"
+                ? 409
+                : outcome.reason === "invalid_rule"
+                  ? 400
+                  : 500;
+        writeJSON(res, status, {
+          ok: false,
+          error: outcome.reason,
+          detail: outcome.message,
+        });
+        return true;
+      }
+      writeJSON(res, 200, {
+        ok: true,
+        data: {
+          record: outcome.record,
+          updated_policy: outcome.updated_policy,
+        },
+      });
       return true;
+    }
+
+    const detailMatch = matchDetailRoute(path);
+    if (detailMatch) {
+      if (method === "GET") {
+        const draft = deps.store.get(detailMatch.draftId);
+        if (!draft) {
+          writeJSON(res, 404, { ok: false, error: "not_found" });
+          return true;
+        }
+        writeJSON(res, 200, { ok: true, data: { draft } });
+        return true;
+      }
+      if (method === "DELETE") {
+        if (!deps.activator) {
+          writeJSON(res, 503, {
+            ok: false,
+            error: "activator_not_configured",
+          });
+          return true;
+        }
+        const operatorId =
+          (req.headers["x-operator-identity"] as string | undefined) ??
+          (deps.defaultOperatorId ?? "operator");
+        const outcome = await deps.activator.revoke(
+          detailMatch.draftId,
+          operatorId,
+        );
+        if (!outcome.ok) {
+          const status =
+            outcome.reason === "draft_not_found"
+              ? 404
+              : outcome.reason === "not_activated"
+                ? 409
+                : 500;
+          writeJSON(res, status, {
+            ok: false,
+            error: outcome.reason,
+            detail: outcome.message,
+          });
+          return true;
+        }
+        writeJSON(res, 200, {
+          ok: true,
+          data: {
+            record: outcome.record,
+            updated_policy: outcome.updated_policy,
+          },
+        });
+        return true;
+      }
     }
 
     writeJSON(res, 404, { ok: false, error: "not_found", path });
