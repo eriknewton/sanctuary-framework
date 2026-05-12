@@ -1,5 +1,5 @@
 /**
- * Sanctuary MCP Server — L1 Cognitive Sovereignty: Tool Definitions
+ * Sanctuary MCP Server - L1 Cognitive Sovereignty: Tool Definitions
  *
  * MCP tool wrappers for StateStore and IdentityRoot operations.
  * These tools are the public API that agents interact with.
@@ -15,6 +15,7 @@ import {
   verify as identityVerify,
   type StoredIdentity,
   type PublicIdentity,
+  type RotationEvent,
 } from "../core/identity.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import {
@@ -28,7 +29,7 @@ import { bytesToString } from "../core/encoding.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 
 /**
- * Reserved namespace prefixes — used by internal subsystems.
+ * Reserved namespace prefixes - used by internal subsystems.
  * Agent-facing state tools MUST reject reads, writes, deletes, lists, and
  * imports to these namespaces. Internal subsystems access the StateStore
  * directly, bypassing these tool-level checks.
@@ -65,7 +66,7 @@ function getReservedNamespaceViolation(namespace: string): string | null {
   return null;
 }
 
-/** Manages all identities — provides storage and retrieval */
+/** Manages all identities - provides storage and retrieval */
 export class IdentityManager {
   private storage: StorageBackend;
   private masterKey: Uint8Array;
@@ -204,6 +205,17 @@ export class IdentityManager {
       key_protection: si.key_protection,
       rotation_count: si.rotation_history?.length ?? 0,
     }));
+  }
+
+  async rotate(
+    identityId: string,
+    reason: string,
+  ): Promise<{ updatedIdentity: StoredIdentity; rotationEvent: RotationEvent } | null> {
+    const identity = this.identities.get(identityId);
+    if (!identity) return null;
+    const result = rotateKeys(identity, this.encryptionKey, reason);
+    await this.save(result.updatedIdentity);
+    return result;
   }
 }
 
@@ -619,7 +631,7 @@ export function createL1Tools(
     {
       name: "state_list",
       description:
-        "List keys in a namespace (metadata only — no decryption).",
+        "List keys in a namespace (metadata only, no decryption).",
       inputSchema: {
         type: "object",
         properties: {

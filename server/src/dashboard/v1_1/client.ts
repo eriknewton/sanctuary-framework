@@ -97,6 +97,11 @@ const state = {
       applyToAll: true
     }
   },
+  recognition: {
+    health: null,
+    error: null,
+    rotating: false
+  },
   // WP-V1.2-4: operator chat surfaces. Concierge is fortress-wide; direct-
   // agent is per-agent. v1.2.x click-to-chat opens the session
   // synchronously on click (the click IS the affirmative action; no
@@ -1991,6 +1996,33 @@ function renderFortress() {
       }).join("\n")
     : '<p class="muted">No agents wrapped.</p>';
 
+  const recognition = state.recognition.health;
+  let recognitionCard;
+  if (state.recognition.error) {
+    recognitionCard = '<p class="muted">Recognition Layer health unavailable: ' + escHtml(state.recognition.error) + '</p>';
+  } else if (!recognition) {
+    recognitionCard = '<p class="muted">Loading Recognition Layer health.</p>';
+  } else if (!recognition.configured) {
+    recognitionCard = '<p class="muted">No did:web identifier registered. Run <code>sanctuary did-web issue --authority-host &lt;host&gt;</code>.</p>';
+  } else {
+    const last = recognition.last_rotation
+      ? shortTime(recognition.last_rotation.rotated_at) + ' (' + recognition.last_rotation.reason + ')'
+      : 'never';
+    const history = recognition.key_history && recognition.key_history.length
+      ? recognition.key_history.slice().reverse().slice(0, 4).map(function (h) {
+          return '<div class="row"><div class="grow"><span class="mono">' + escHtml(shortTime(h.rotated_at)) + '</span><br><span class="muted">' + escHtml(h.reason) + '</span></div><span class="pill">' + escHtml(h.new_verification_method_id.split("#").pop() || "key") + '</span></div>';
+        }).join("")
+      : '<p class="muted">No rotations yet.</p>';
+    recognitionCard =
+      '<dl class="kv">' +
+      '<dt>Identifier</dt><dd class="mono">' + escHtml(recognition.identifier) + '</dd>' +
+      '<dt>Last rotation</dt><dd>' + escHtml(last) + '</dd>' +
+      '<dt>Next periodic</dt><dd>' + escHtml(recognition.days_until_recommended_rotation) + ' days</dd>' +
+      '</dl>' +
+      '<button class="btn btn-danger" data-action="did-web-rotate-compromised"' + (state.recognition.rotating ? ' disabled' : '') + '>' + (state.recognition.rotating ? 'Rotating...' : 'Compromised rotation') + '</button>' +
+      '<div style="margin-top:8px;">' + history + '</div>';
+  }
+
   fortress.innerHTML = [
     '<section class="card">',
       '<h3>This fortress</h3>',
@@ -2004,6 +2036,7 @@ function renderFortress() {
       '<div class="layer-card"><h4>L4 Verifiable reputation</h4><p>Signed attestations, portable.</p></div>',
     '</section>',
     '<section class="card"><h3>Inbox (' + state.inbox.filter(function (i) { return !i.resolved; }).length + ')</h3>' + inboxRows + '</section>',
+    '<section class="card"><h3>Recognition Layer health</h3>' + recognitionCard + '</section>',
     '<section class="card"><h3>Agents (' + state.agents.length + ')</h3>' + agentsCard + '</section>',
     '<section class="card"><h3>Posture</h3><p class="muted">Local-only. Single operator. Federation: off.</p></section>'
   ].join("");
@@ -2042,6 +2075,13 @@ async function fetchAll() {
     state.autoTrigger.loadError = null;
   } catch (e) {
     state.autoTrigger.loadError = e && e.message ? e.message : "unavailable";
+  }
+  try {
+    const rh = await api("/recognition/did-web");
+    state.recognition.health = rh.data || null;
+    state.recognition.error = null;
+  } catch (e) {
+    state.recognition.error = e.message || "load failed";
   }
   await fetchIntelligenceState();
   await fetchHoneypotState();
@@ -2171,6 +2211,24 @@ async function onExitExportStart() {
     } else {
       toast("Export start failed: " + e.message, "error");
     }
+  }
+}
+
+async function onDidWebCompromisedRotation() {
+  if (state.recognition.rotating) return;
+  state.recognition.rotating = true;
+  rerender();
+  try {
+    const r = await api("/recognition/did-web/rotate-compromised", { method: "POST", body: {} });
+    state.recognition.health = r.data.health;
+    state.recognition.error = null;
+    toast("did:web key rotated. Publish the updated DID Document.", "info");
+  } catch (e) {
+    state.recognition.error = e.message || "rotation failed";
+    toast("did:web rotation failed: " + state.recognition.error, "error");
+  } finally {
+    state.recognition.rotating = false;
+    rerender();
   }
 }
 
@@ -2373,6 +2431,7 @@ document.addEventListener("click", function (ev) {
   // WP-V1.2 reshape click-to-inspect handler ────────────────────────
   if (action === "agent-inspect-open" && agentId) return void onAgentInspectOpen(agentId);
   if (action === "exit-export-start") return void onExitExportStart();
+  if (action === "did-web-rotate-compromised") return void onDidWebCompromisedRotation();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
   if (action === "open-agent" && agentId) { state.selectedAgentId = agentId; location.hash = "agent-detail"; return; }
   // Click-to-inspect from the fortress-column agent rows (PR #100

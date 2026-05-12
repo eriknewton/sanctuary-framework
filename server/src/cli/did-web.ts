@@ -3,11 +3,11 @@
  *
  * Foundation build verbs (Recognition-Layer Path C primary):
  *
- *   issue   — generate a did:web identifier for the operator's fortress.
+ *   issue   - generate a did:web identifier for the operator's fortress.
  *             Requires --authority-host (the HTTPS host the operator
  *             controls and will serve the DID Document from).
  *
- *   show    — display the previously issued did:web identifier +
+ *   show    - display the previously issued did:web identifier +
  *             artifact path. If none issued, prints a helpful
  *             "none configured" message.
  *
@@ -28,6 +28,7 @@ import { Writable } from "node:stream";
 
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../l1-cognitive/tools.js";
+import { AuditLog } from "../l2-operational/audit-log.js";
 import {
   deriveMasterKey,
   type KeyDerivationParams,
@@ -35,9 +36,16 @@ import {
 import { bytesToString, fromBase64url } from "../core/encoding.js";
 import { loadConfig } from "../config.js";
 import {
+  applyDidWebRotationToRecord,
+  buildDidWebHealthSnapshot,
+  DID_WEB_AUDIT_OPS,
+  identifierFromFortressDidWebRecord,
   issueDidWeb,
+  loadFortressDidWebRecord,
   publishDidWebDocument,
+  rotateDidWebKey,
   type DidWebIdentifier,
+  type DidWebRotationReason,
 } from "../recognition/did-web.js";
 
 export interface DidWebCommandArgs {
@@ -76,6 +84,13 @@ Commands:
 
   show [--json]   Display the previously issued did:web identifier.
                   Exits non-zero if none issued.
+
+  rotate-key --reason <periodic|compromised|manual> [--preserve-days <n>] [--json]
+                  Rotate the local fortress identity key and update the
+                  persisted did:web DID Document. Does not publish.
+
+  key-history [--json]
+                  Show did:web key rotation history for this fortress.
 
 Options:
   --authority-host <host>   HTTPS host the operator controls and will
@@ -124,6 +139,12 @@ export async function runDidWebCommand(
   if (command === "show") {
     return await cmdShow(argv.slice(1), out, err, env);
   }
+  if (command === "rotate-key") {
+    return await cmdRotateKey(argv.slice(1), out, err, env);
+  }
+  if (command === "key-history") {
+    return await cmdKeyHistory(argv.slice(1), out, err, env);
+  }
   write(err, `Unknown did-web command: ${command}\n`);
   write(err, `Run "sanctuary did-web --help" for usage.\n`);
   return 2;
@@ -133,6 +154,9 @@ interface IdentitySnapshot {
   publicKey: Uint8Array;
   identityId: string;
   storagePath: string;
+  storage: FilesystemStorage;
+  masterKey: Uint8Array;
+  identityManager: IdentityManager;
 }
 
 async function loadFortressIdentity(
@@ -194,6 +218,9 @@ async function loadFortressIdentity(
     publicKey: fromBase64url(primary.public_key),
     identityId: primary.identity_id,
     storagePath: config.storage_path,
+    storage,
+    masterKey,
+    identityManager,
   };
 }
 
@@ -325,5 +352,150 @@ async function cmdShow(
   write(out, `\nAuto-inclusion: subsequent "sanctuary exit export" runs auto-include\n`);
   write(out, `this identifier in the bundle manifest without --did-web. Pass\n`);
   write(out, `"--no-did-web" to opt out for a specific export.\n`);
+  return 0;
+}
+
+function parseRotationReason(raw: string | undefined): DidWebRotationReason | null {
+  const value = raw ?? "periodic";
+  if (value === "periodic" || value === "compromised" || value === "manual") {
+    return value;
+  }
+  return null;
+}
+
+function parsePreserveDays(raw: string | undefined): number | null {
+  if (raw === undefined) return 90;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n;
+}
+
+async function cmdRotateKey(
+  argv: string[],
+  out: Writable,
+  err: Writable,
+  env: NodeJS.ProcessEnv,
+): Promise<number> {
+  const json = hasFlag(argv, "--json");
+  const reason = parseRotationReason(flagValue(argv, "--reason"));
+  if (!reason) {
+    write(err, "Error: --reason must be periodic, compromised, or manual.\n");
+    return 1;
+  }
+  const preserveDays = parsePreserveDays(flagValue(argv, "--preserve-days"));
+  if (preserveDays === null) {
+    write(err, "Error: --preserve-days must be a non-negative integer.\n");
+    return 1;
+  }
+
+  const snapshot = await loadFortressIdentity(argv, env, err);
+  if (!snapshot) return 1;
+  const record = await loadFortressDidWebRecord(snapshot.storagePath);
+  if (!record) {
+    write(
+      err,
+      `No did:web identifier configured on this fortress.\nRun "sanctuary did-web issue --authority-host <host>" first.\n`,
+    );
+    return 1;
+  }
+  const identityRotation = await snapshot.identityManager.rotate(
+    snapshot.identityId,
+    `did-web:${reason}`,
+  );
+  if (!identityRotation) {
+    write(err, "Error: default identity disappeared before rotation.\n");
+    return 1;
+  }
+
+  const identifier = identifierFromFortressDidWebRecord(record);
+  const rotation = await rotateDidWebKey(identifier, {
+    reason,
+    preserve_old_key_for: preserveDays,
+    now: () => new Date(identityRotation.rotationEvent.rotated_at),
+    new_public_key: fromBase64url(identityRotation.updatedIdentity.public_key),
+  });
+  const rotatedIdentifier: DidWebIdentifier = {
+    ...identifier,
+    did_document: rotation.new_did_document,
+    public_key: fromBase64url(rotation.new_public_key_b64u),
+  };
+  const artifact = publishDidWebDocument(rotatedIdentifier);
+  const updated = applyDidWebRotationToRecord(record, rotation, artifact);
+  const persistDir = join(snapshot.storagePath, "recognition");
+  const persistPath = join(persistDir, "did-web.json");
+  await mkdir(persistDir, { recursive: true, mode: 0o700 });
+  await writeFile(persistPath, JSON.stringify(updated, null, 2), { mode: 0o600 });
+  await writeFile(join(persistDir, "did.json"), artifact.artifact, { mode: 0o644 });
+  const auditLog = new AuditLog(snapshot.storage, snapshot.masterKey);
+  auditLog.append("l1", DID_WEB_AUDIT_OPS.KEY_ROTATED, snapshot.identityId, {
+    did: rotation.did,
+    reason: rotation.rotation_reason,
+    old_verification_method_id: rotation.old_verification_method_id,
+    new_verification_method_id: rotation.new_verification_method_id,
+    old_public_key_b64u: rotation.old_public_key_b64u,
+    new_public_key_b64u: rotation.new_public_key_b64u,
+    preserve_old_key_for: preserveDays,
+  });
+  await auditLog.flush();
+
+  if (json) {
+    write(out, JSON.stringify({ rotation, artifact, record: updated }, null, 2) + "\n");
+    return 0;
+  }
+  write(out, `did:web key rotated.\n`);
+  write(out, `  DID:            ${rotation.did}\n`);
+  write(out, `  Reason:         ${rotation.rotation_reason}\n`);
+  write(out, `  Rotated at:     ${rotation.rotated_at}\n`);
+  write(out, `  Old key:        ${rotation.old_verification_method_id}\n`);
+  write(out, `  New key:        ${rotation.new_verification_method_id}\n`);
+  write(out, `  Persisted:      ${persistPath}\n`);
+  write(out, `  Publish URL:    ${artifact.url}\n`);
+  write(out, `  SHA-256:        ${artifact.sha256}\n`);
+  write(out, `\nCastle-walking note: rotation is local and opens no outbound socket.\n`);
+  write(out, `Publish the updated DID Document from your own HTTPS authority host.\n`);
+  return 0;
+}
+
+async function cmdKeyHistory(
+  argv: string[],
+  out: Writable,
+  err: Writable,
+  _env: NodeJS.ProcessEnv,
+): Promise<number> {
+  const json = hasFlag(argv, "--json");
+  const fortressFlag = flagValue(argv, "--fortress");
+  if (fortressFlag) {
+    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+  }
+  const config = await loadConfig();
+  const record = await loadFortressDidWebRecord(config.storage_path);
+  if (!record) {
+    write(
+      err,
+      `No did:web identifier configured on this fortress.\nRun "sanctuary did-web issue --authority-host <host>" to issue one.\n`,
+    );
+    return 1;
+  }
+  const health = buildDidWebHealthSnapshot(record);
+  if (json) {
+    write(out, JSON.stringify(health, null, 2) + "\n");
+    return 0;
+  }
+  write(out, `did:web key history for ${record.identifier.did}\n`);
+  if (health.last_rotation) {
+    write(out, `Last rotation: ${health.last_rotation.rotated_at} (${health.last_rotation.reason})\n`);
+  } else {
+    write(out, `No rotations recorded yet.\n`);
+  }
+  write(
+    out,
+    `Recommended periodic rotation in: ${health.days_until_recommended_rotation ?? "unknown"} days\n`,
+  );
+  for (const entry of health.key_history) {
+    write(
+      out,
+      `- ${entry.rotated_at} ${entry.reason}: ${entry.old_verification_method_id} -> ${entry.new_verification_method_id}\n`,
+    );
+  }
   return 0;
 }
