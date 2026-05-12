@@ -62,6 +62,13 @@ import type {
   CompiledPolicy,
   CompiledPolicyRule,
 } from "./english-policy-compiler.js";
+import {
+  conflictIds,
+  detectConflicts,
+  hasHighSeverityConflict,
+  principalPolicyToRules,
+  type PolicyConflict,
+} from "./conflict-detector.js";
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -89,11 +96,17 @@ export interface PolicyDraftRecord {
   revoked_by?: string;
   /** True when activation was allowed despite compile_confidence === "low". */
   activation_override?: boolean;
+  /** Conflicts the operator saw and acknowledged before activation. */
+  conflicts_acknowledged?: PolicyConflict[];
+  /** High-severity conflict ids explicitly forced by the operator. */
+  forced_conflict_ids?: string[];
 }
 
 export type ActivationFailure =
   | "draft_not_found"
   | "low_confidence_refused"
+  | "policy_conflicts_unacknowledged"
+  | "policy_conflict_force_required"
   | "already_activated"
   | "invalid_rule"
   | "policy_io_failed";
@@ -105,7 +118,12 @@ export type RevocationFailure =
 
 export type ActivationOutcome =
   | { ok: true; updated_policy: PrincipalPolicy; record: PolicyDraftRecord }
-  | { ok: false; reason: ActivationFailure; message: string };
+  | {
+      ok: false;
+      reason: ActivationFailure;
+      message: string;
+      conflicts?: PolicyConflict[];
+    };
 
 export type RevocationOutcome =
   | { ok: true; updated_policy: PrincipalPolicy; record: PolicyDraftRecord }
@@ -115,6 +133,9 @@ export const ENGLISH_POLICY_ACTIVATION_AUDIT_OPS = {
   ACTIVATED: "english_policy_activated",
   REVOKED: "english_policy_revoked",
   ACTIVATION_REFUSED: "english_policy_activation_refused",
+  CONFLICT_DETECTED: "policy_conflict_detected",
+  CONFLICT_ACKNOWLEDGED: "policy_conflict_acknowledged",
+  FORCE_CONFLICT_USED: "policy_force_conflict_used",
 } as const;
 
 export type EnglishPolicyActivationAuditOp =
@@ -235,6 +256,8 @@ export interface EnglishPolicyActivatorDeps {
 
 export interface ActivateOptions {
   override_low_confidence?: boolean;
+  conflicts_acknowledged?: PolicyConflict[];
+  force_conflict_ids?: string[];
 }
 
 export class EnglishPolicyActivator {
@@ -297,7 +320,7 @@ export class EnglishPolicyActivator {
       };
     }
 
-    // 3. Read current policy + apply the rule.
+    // 3. Read current policy, detect conflicts, then apply the rule.
     let prePolicy: PrincipalPolicy;
     try {
       prePolicy = await this.readPolicy();
@@ -307,6 +330,68 @@ export class EnglishPolicyActivator {
         reason: "policy_io_failed",
         message: err instanceof Error ? err.message : String(err),
       };
+    }
+    const conflicts = detectConflicts(draft, principalPolicyToRules(prePolicy));
+    if (conflicts.length > 0) {
+      this.auditLog.append(
+        "l2",
+        ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.CONFLICT_DETECTED,
+        operatorId,
+        {
+          draft_id: draft.draft_id,
+          conflict_ids: conflictIds(conflicts),
+          severities: conflicts.map((c) => c.severity),
+          fortress_id: this.fortressId,
+        },
+      );
+      const acknowledged = opts.conflicts_acknowledged ?? [];
+      const acknowledgedIds = new Set(acknowledged.map((c) => c.conflict_id));
+      const allAcknowledged = conflicts.every((c) =>
+        acknowledgedIds.has(c.conflict_id)
+      );
+      if (!allAcknowledged) {
+        return {
+          ok: false,
+          reason: "policy_conflicts_unacknowledged",
+          message: "policy conflicts require explicit operator acknowledgment before activation",
+          conflicts,
+        };
+      }
+      this.auditLog.append(
+        "l2",
+        ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.CONFLICT_ACKNOWLEDGED,
+        operatorId,
+        {
+          draft_id: draft.draft_id,
+          conflict_ids: conflictIds(conflicts),
+          fortress_id: this.fortressId,
+        },
+      );
+      if (hasHighSeverityConflict(conflicts)) {
+        const forcedIds = new Set(opts.force_conflict_ids ?? []);
+        const unforcedHigh = conflicts.filter(
+          (c) => c.severity === "high" && !forcedIds.has(c.conflict_id),
+        );
+        if (unforcedHigh.length > 0) {
+          return {
+            ok: false,
+            reason: "policy_conflict_force_required",
+            message: "high-severity policy conflicts require force_conflict_ids before activation",
+            conflicts,
+          };
+        }
+        this.auditLog.append(
+          "l2",
+          ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.FORCE_CONFLICT_USED,
+          operatorId,
+          {
+            draft_id: draft.draft_id,
+            conflict_ids: [...forcedIds],
+            fortress_id: this.fortressId,
+          },
+          "success",
+        );
+      }
     }
     const preHash = canonicalPolicyHash(prePolicy);
     let updatedPolicy: PrincipalPolicy;
@@ -341,6 +426,12 @@ export class EnglishPolicyActivator {
       pre_activation_policy_hash: preHash,
       ...(opts.override_low_confidence === true
         ? { activation_override: true }
+        : {}),
+      ...(conflicts.length > 0
+        ? { conflicts_acknowledged: opts.conflicts_acknowledged ?? [] }
+        : {}),
+      ...((opts.force_conflict_ids ?? []).length > 0
+        ? { forced_conflict_ids: opts.force_conflict_ids }
         : {}),
     };
     await this.store.save(record);
@@ -462,6 +553,28 @@ export class EnglishPolicyActivator {
 
   async listRecords(): Promise<PolicyDraftRecord[]> {
     return this.store.list();
+  }
+
+  async checkConflicts(
+    draft: CompiledPolicy,
+    operatorId = "operator",
+  ): Promise<PolicyConflict[]> {
+    const policy = await this.readPolicy();
+    const conflicts = detectConflicts(draft, principalPolicyToRules(policy));
+    if (conflicts.length > 0) {
+      this.auditLog.append(
+        "l2",
+        ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.CONFLICT_DETECTED,
+        operatorId,
+        {
+          draft_id: draft.draft_id,
+          conflict_ids: conflictIds(conflicts),
+          severities: conflicts.map((c) => c.severity),
+          fortress_id: this.fortressId,
+        },
+      );
+    }
+    return conflicts;
   }
 
   /**
@@ -650,7 +763,7 @@ function assignTier2Field(
     target[field] = value;
     return;
   }
-  // Field not in the closed enum — exhaustiveness check.
+  // Field not in the closed enum: exhaustiveness check.
   throw new Error(`unknown Tier2Config field: ${String(field)}`);
 }
 

@@ -31,6 +31,7 @@ import {
   type EnglishPolicyDraft,
 } from "./english-policy-compiler.js";
 import type { EnglishPolicyActivator } from "./english-policy-activator.js";
+import type { PolicyConflict } from "./conflict-detector.js";
 
 export const ENGLISH_POLICY_API_PREFIX = "/api/policy";
 
@@ -143,6 +144,16 @@ function matchActivateRoute(path: string): { draftId: string } | null {
   return { draftId: decodeURIComponent(draftId) };
 }
 
+function matchCheckConflictsRoute(path: string): { draftId: string } | null {
+  const prefix = `${ENGLISH_POLICY_API_PREFIX}/drafts/`;
+  if (!path.startsWith(prefix)) return null;
+  const rest = path.slice(prefix.length);
+  if (!rest.endsWith("/check-conflicts")) return null;
+  const draftId = rest.slice(0, rest.length - "/check-conflicts".length);
+  if (draftId.length === 0 || draftId.includes("/")) return null;
+  return { draftId: decodeURIComponent(draftId) };
+}
+
 function matchStatusRoute(path: string): { draftId: string } | null {
   const prefix = `${ENGLISH_POLICY_API_PREFIX}/drafts/`;
   if (!path.startsWith(prefix)) return null;
@@ -151,6 +162,14 @@ function matchStatusRoute(path: string): { draftId: string } | null {
   const draftId = rest.slice(0, rest.length - "/status".length);
   if (draftId.length === 0 || draftId.includes("/")) return null;
   return { draftId: decodeURIComponent(draftId) };
+}
+
+async function readOptionalJSONBody<T = Record<string, unknown>>(
+  req: IncomingMessage,
+): Promise<T> {
+  const body = await readBody(req);
+  if (body.trim().length === 0) return {} as T;
+  return JSON.parse(body) as T;
 }
 
 export async function handleEnglishPolicyRoute(
@@ -281,13 +300,43 @@ export async function handleEnglishPolicyRoute(
       const overrideRaw = url.searchParams.get("override");
       const overrideLowConfidence =
         overrideRaw === "true" || overrideRaw === "1";
+      let parsedBody: {
+        conflicts_acknowledged?: PolicyConflict[];
+        force_conflict_ids?: string[];
+        force_conflict?: string;
+      };
+      try {
+        parsedBody = await readOptionalJSONBody(req);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        writeJSON(res, 400, { ok: false, error: "invalid_json", detail });
+        return true;
+      }
+      const forceQuery = url.searchParams.getAll("force_conflict");
+      const forceConflictIds = [
+        ...(Array.isArray(parsedBody.force_conflict_ids)
+          ? parsedBody.force_conflict_ids.filter((id) => typeof id === "string")
+          : []),
+        ...(typeof parsedBody.force_conflict === "string"
+          ? [parsedBody.force_conflict]
+          : []),
+        ...forceQuery,
+      ];
       const outcome = await deps.activator.activate(draft, operatorId, {
         override_low_confidence: overrideLowConfidence,
+        conflicts_acknowledged: Array.isArray(parsedBody.conflicts_acknowledged)
+          ? parsedBody.conflicts_acknowledged
+          : undefined,
+        force_conflict_ids: forceConflictIds,
       });
       if (!outcome.ok) {
         const status =
           outcome.reason === "low_confidence_refused"
             ? 409
+            : outcome.reason === "policy_conflicts_unacknowledged"
+              ? 409
+              : outcome.reason === "policy_conflict_force_required"
+                ? 409
             : outcome.reason === "draft_not_found"
               ? 404
               : outcome.reason === "already_activated"
@@ -299,6 +348,9 @@ export async function handleEnglishPolicyRoute(
           ok: false,
           error: outcome.reason,
           detail: outcome.message,
+          ...(outcome.conflicts !== undefined
+            ? { data: { conflicts: outcome.conflicts } }
+            : {}),
         });
         return true;
       }
@@ -309,6 +361,31 @@ export async function handleEnglishPolicyRoute(
           updated_policy: outcome.updated_policy,
         },
       });
+      return true;
+    }
+
+    const checkConflictsMatch = matchCheckConflictsRoute(path);
+    if (checkConflictsMatch && method === "POST") {
+      if (!deps.activator) {
+        writeJSON(res, 503, {
+          ok: false,
+          error: "activator_not_configured",
+        });
+        return true;
+      }
+      const draft =
+        deps.store.get(checkConflictsMatch.draftId) ??
+        (await deps.activator.getRecord(checkConflictsMatch.draftId))?.draft ??
+        null;
+      if (!draft) {
+        writeJSON(res, 404, { ok: false, error: "not_found" });
+        return true;
+      }
+      const operatorId =
+        (req.headers["x-operator-identity"] as string | undefined) ??
+        (deps.defaultOperatorId ?? "operator");
+      const conflicts = await deps.activator.checkConflicts(draft, operatorId);
+      writeJSON(res, 200, { ok: true, data: { conflicts } });
       return true;
     }
 

@@ -170,6 +170,8 @@ export function aggregatePolicyEditorView(
   return {
     view: "policy_editor",
     templates,
+    draft_tabs: ["compile", "activation", "conflicts"],
+    draft_conflicts: {},
     pinned_policies: {},
   };
 }
