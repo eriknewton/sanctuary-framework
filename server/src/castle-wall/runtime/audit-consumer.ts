@@ -20,6 +20,8 @@ import type {
   CastleWallAuditEvent,
   CastleWallEventType,
 } from "../audit/events.js";
+import type { UnifiedInboxBridge } from "../../principal-policy/unified-inbox-bridge.js";
+import { ingestCastleWallBlockedEgress } from "../../principal-policy/unified-inbox-producers.js";
 
 /** Shape the consumer pushes into; `AuditLog.append` matches structurally. */
 export interface AuditSink {
@@ -143,7 +145,10 @@ export class AuditConsumer {
   private lastAckedSeq: number | null = null;
   private lastEventCanonicalHash: string | null = null;
 
-  constructor(private readonly sink: AuditSink) {}
+  constructor(
+    private readonly sink: AuditSink,
+    private readonly inboxBridge?: UnifiedInboxBridge,
+  ) {}
 
   /**
    * Persist a critical event then invoke the daemon-supplied ACK callback.
@@ -214,6 +219,22 @@ export class AuditConsumer {
       buildDetailsForEvent(envelope.event),
       "success"
     );
+    if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
+      ingestCastleWallBlockedEgress({
+        bridge: this.inboxBridge,
+        event: envelope.event,
+      });
+      this.sink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        "castle_wall_blocked_egress",
+        envelope.event.fortress_id,
+        {
+          event_type: envelope.event.event_type,
+          seq: envelope.event.details.seq,
+        },
+        "success",
+      );
+    }
     await this.sink.flush();
     // Update state BEFORE the ACK call. The event is now durably persisted;
     // a transport-layer ACK failure must NOT leave the consumer's chain view
