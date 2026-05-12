@@ -56,6 +56,7 @@ Every entry in §B and §C below routes through one of these two helpers OR call
 | `sovereignty-profile` | `server/src/sovereignty-profile.ts:79` | `HKDF_DOMAIN` | Encrypts the sovereignty profile store. |
 | `intelligence-substrate-config` | `server/src/intelligence/policy-store.ts:39` | `HKDF_INFO` | Encrypts the intelligence-substrate policy store. |
 | `operator-chat-store-v1` | `server/src/chat/operator-chat-store.ts:40` | `HKDF_INFO` | Encrypts the operator-chat (concierge) store. |
+| `query-anonymity-reverse-mapping-v1` | `server/src/query-anonymity/reverse-mapping-store.ts:20` | `HKDF_INFO` | Encrypts Rho-3 per-query reverse mappings for smart-mode render-time restoration. |
 | `sanctuary-v1.1-coordination-handoffs` | `server/src/coordination/handoff-store.ts:27` | `HANDOFF_PURPOSE_KEY` | Encrypts the v1.1 coordination handoff store. |
 
 ### C. Namespace strings (info to deriveNamespaceKey, salt = sanctuary-namespace-v1)

@@ -16,6 +16,9 @@
  *     first recorded; never cleared.
  *   - `last_toggled_at` (ISO timestamp, optional). Tracks the most
  *     recent `enabled` flip in either direction.
+ *   - `smart_mode_enabled` (boolean, default FALSE). Rho-3 extension:
+ *     when true, Tier B is effective even if the basic `enabled` flag
+ *     is false, because smart mode depends on the Tier B rewrite.
  *
  * Storage layout:
  *   namespace: `_query_anonymity_tier_b`
@@ -52,6 +55,8 @@ const MAX_PAYLOAD_BYTES = 16 * 1024;
 export interface PiiRewriteConfig {
   /** Master toggle. Default false. */
   enabled: boolean;
+  /** Rho-3 smart mode toggle. Default false; implies effective Tier B. */
+  smart_mode_enabled: boolean;
   /** Operator acknowledged the trade-off explainer. Default false. */
   consented_to_trade_off: boolean;
   /** ISO timestamp of first consent. Set once; never overwritten. */
@@ -87,6 +92,7 @@ export function defaultPiiRewriteConfig(
 ): PiiRewriteConfig {
   return {
     enabled: false,
+    smart_mode_enabled: false,
     consented_to_trade_off: false,
     updated_at: now().toISOString(),
   };
@@ -126,7 +132,11 @@ export class PiiConfigStore {
       const persisted = JSON.parse(bytesToString(plaintext)) as PersistedConfig;
       if (persisted.version !== 1) return null;
       if (persisted.fortress_id !== this.fortressId) return null;
-      return persisted.config;
+      return {
+        ...defaultPiiRewriteConfig(this.now),
+        ...persisted.config,
+        smart_mode_enabled: persisted.config.smart_mode_enabled ?? false,
+      };
     } catch {
       return null;
     }
@@ -176,7 +186,10 @@ export class PiiConfigStore {
       ...patch,
       updated_at: this.now().toISOString(),
     };
-    if (merged.enabled && !merged.consented_to_trade_off) {
+    if (
+      (merged.enabled || merged.smart_mode_enabled) &&
+      !merged.consented_to_trade_off
+    ) {
       throw new PiiConsentRequired(
         "cannot enable Tier B without consent_to_trade_off=true",
       );
@@ -188,8 +201,9 @@ export class PiiConfigStore {
       merged.consented_at = this.now().toISOString();
     }
     if (
-      patch.enabled !== undefined &&
-      patch.enabled !== existing.enabled
+      (patch.enabled !== undefined && patch.enabled !== existing.enabled) ||
+      (patch.smart_mode_enabled !== undefined &&
+        patch.smart_mode_enabled !== existing.smart_mode_enabled)
     ) {
       merged.last_toggled_at = this.now().toISOString();
     }
@@ -219,7 +233,27 @@ export class PiiConfigStore {
       }
       return true;
     }
-    return config.enabled;
+    return config.enabled || config.smart_mode_enabled;
+  }
+
+  /**
+   * Whether Rho-3 smart mode should fire for this call. Smart mode is
+   * default-off, and enabling it implies effective Tier B for the
+   * query path while keeping the persisted basic toggle independent.
+   */
+  async shouldRewriteSmartMode(perQueryOverride?: boolean): Promise<boolean> {
+    if (perQueryOverride === false) return false;
+    const config = await this.get();
+    if (!config) return false;
+    if (perQueryOverride === true) {
+      if (!config.consented_to_trade_off) {
+        throw new PiiConsentRequired(
+          "per-query smart-mode opt-in requires recorded consent",
+        );
+      }
+      return true;
+    }
+    return config.smart_mode_enabled;
   }
 }
 

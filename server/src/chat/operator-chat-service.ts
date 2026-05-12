@@ -87,6 +87,16 @@ import {
   type AgentContextSnapshot,
   type ConciergeProactiveStarter,
 } from "./agent-context-cache.js";
+import { classifyQueryIntent, type IntentClassifier } from "../query-anonymity/intent-classifier.js";
+import type { PiiConfigStore } from "../query-anonymity/pii-config-store.js";
+import type { ReverseMappingStore } from "../query-anonymity/reverse-mapping-store.js";
+import {
+  emitReverseMappingUsedAudit,
+  emitSmartModeFallbackAudit,
+  emitSmartRewriteAudit,
+  restoreReverseMappings,
+  smartRewrite,
+} from "../query-anonymity/smart-rewriter.js";
 
 /**
  * Snapshot of fortress state surfaces the concierge consults to
@@ -259,6 +269,17 @@ export interface OperatorChatServiceDeps {
    * section. Defaults to `DEFAULT_CONCIERGE_AGENT_STATE_BUDGET` (400).
    */
   conciergeAgentStateBudget?: number;
+  /**
+   * Rho-3 smart-mode query anonymity. Optional so existing service
+   * wiring remains unchanged; when present and smart mode is enabled,
+   * the operator query is smart-rewritten before the concierge
+   * substrate call, reverse mappings are stored per query id, and the
+   * response is restored server-side before display.
+   */
+  queryAnonymityConfig?: PiiConfigStore;
+  queryAnonymityReverseMappingStore?: ReverseMappingStore;
+  queryAnonymityFortressId?: string;
+  queryAnonymityIntentClassifier?: IntentClassifier;
 }
 
 const DEFAULT_CONCIERGE_MAX_TOKENS = 512;
@@ -356,6 +377,10 @@ export class OperatorChatService {
   private grammarLlmAssist?: LlmAssistGrammarCompletion;
   private agentContextCache?: AgentContextCache;
   private agentStateBudget: number;
+  private queryAnonymityConfig?: PiiConfigStore;
+  private queryAnonymityReverseMappingStore?: ReverseMappingStore;
+  private queryAnonymityFortressId?: string;
+  private queryAnonymityIntentClassifier?: IntentClassifier;
   /**
    * Per-thread guard so the proactive starter fires at most once per
    * fresh thread. Tracks the thread_id the starter was last offered
@@ -436,6 +461,20 @@ export class OperatorChatService {
       deps.conciergeAgentStateBudget > 0
         ? deps.conciergeAgentStateBudget
         : DEFAULT_CONCIERGE_AGENT_STATE_BUDGET;
+    if (deps.queryAnonymityConfig) {
+      this.queryAnonymityConfig = deps.queryAnonymityConfig;
+    }
+    if (deps.queryAnonymityReverseMappingStore) {
+      this.queryAnonymityReverseMappingStore =
+        deps.queryAnonymityReverseMappingStore;
+    }
+    if (deps.queryAnonymityFortressId) {
+      this.queryAnonymityFortressId = deps.queryAnonymityFortressId;
+    }
+    if (deps.queryAnonymityIntentClassifier) {
+      this.queryAnonymityIntentClassifier =
+        deps.queryAnonymityIntentClassifier;
+    }
   }
 
   // ── Concierge ─────────────────────────────────────────────────────────
@@ -489,6 +528,54 @@ export class OperatorChatService {
       CONCIERGE_THREAD_KEY,
       operatorMessage,
     );
+    const queryId = operatorMessage.message_id;
+
+    let substrateQuery = filterResult.filtered;
+    let reverseMappingQueryId: string | null = null;
+    if (
+      this.substrateSelector &&
+      this.queryAnonymityConfig &&
+      this.queryAnonymityReverseMappingStore
+    ) {
+      const smartEnabled = await this.queryAnonymityConfig
+        .shouldRewriteSmartMode()
+        .catch(() => false);
+      if (smartEnabled) {
+        const classifier =
+          this.queryAnonymityIntentClassifier ??
+          ({
+            classify: (input: string) =>
+              classifyQueryIntent(input, this.substrateSelector!),
+          } satisfies IntentClassifier);
+        const result = await smartRewrite(trimmed, {
+          selector: this.substrateSelector,
+          classifier,
+        });
+        substrateQuery = result.rewritten_query;
+        reverseMappingQueryId = queryId;
+        await this.queryAnonymityReverseMappingStore
+          .store(queryId, result.reverse_map)
+          .catch(() => undefined);
+        const fortressId =
+          this.queryAnonymityFortressId ?? "fortress:operator-chat";
+        if (result.fallback_reason) {
+          emitSmartModeFallbackAudit({
+            auditLog: this.auditLog,
+            identityId: this.identityId,
+            fortressId,
+            queryId,
+            reason: result.fallback_reason,
+          });
+        }
+        emitSmartRewriteAudit({
+          auditLog: this.auditLog,
+          identityId: this.identityId,
+          fortressId,
+          queryId,
+          result,
+        });
+      }
+    }
 
     // WP-V1.3-9 Tau-2 read-fold path. Loaded BEFORE the operator turn
     // hits the memory store so the prior-turn window does not include
@@ -543,7 +630,7 @@ export class OperatorChatService {
     // even when the dynamic-context router is not wired. The hook
     // routes through the substrate selector at the same `concierge`
     // surface, holding the no-new-outbound-surface invariant.
-    const parsedGrammar = await this.runGrammarParse(filterResult.filtered);
+    const parsedGrammar = await this.runGrammarParse(substrateQuery);
 
     // WP-V1.3-9 Tau-5: read the agent-context cache snapshot once for
     // this round-trip. Synchronous accessor; returns [] until the
@@ -582,7 +669,7 @@ export class OperatorChatService {
           outcome = "substrate_disabled";
         } else {
           const dynamicResult = await this.runDynamicContextFold(
-            filterResult.filtered,
+            substrateQuery,
             parsedGrammar,
           );
           dynamicCategoriesIncluded = dynamicResult.categoriesIncluded;
@@ -596,7 +683,7 @@ export class OperatorChatService {
             {
               kind: "summarize",
               context,
-              query: filterResult.filtered,
+              query: substrateQuery,
               maxTokens: this.conciergeMaxTokens,
             },
           );
@@ -604,7 +691,10 @@ export class OperatorChatService {
             conciergeBody = `Concierge call failed: ${response.failureClass ?? "unknown"}. The substrate selector logged the failure detail.`;
             outcome = "substrate_failure";
           } else {
-            conciergeBody = response.body.text;
+            conciergeBody = await this.restoreSmartModePlaceholders(
+              response.body.text,
+              reverseMappingQueryId,
+            );
             outcome = "ok";
             servedBy = response.servedBy;
           }
@@ -713,6 +803,45 @@ export class OperatorChatService {
       failure_reason: reason,
     };
     this.emit(OPERATOR_CHAT_OPS.CONCIERGE_MEMORY_READ_FAILED, payload, "failure");
+  }
+
+  private async restoreSmartModePlaceholders(
+    responseText: string,
+    queryId: string | null,
+  ): Promise<string> {
+    if (!queryId || !this.queryAnonymityReverseMappingStore) {
+      return responseText;
+    }
+    const fortressId = this.queryAnonymityFortressId ?? "fortress:operator-chat";
+    let mappings;
+    try {
+      mappings = await this.queryAnonymityReverseMappingStore.get(queryId);
+    } catch {
+      mappings = null;
+    }
+    if (!mappings) {
+      const notice =
+        "\n\n[Query anonymity notice: reverse mapping unavailable; placeholders are shown as received.]";
+      emitReverseMappingUsedAudit({
+        auditLog: this.auditLog,
+        identityId: this.identityId,
+        fortressId,
+        queryId,
+        replacements: 0,
+        fallbackNotice: true,
+      });
+      return `${responseText}${notice}`;
+    }
+    const restored = restoreReverseMappings(responseText, mappings);
+    emitReverseMappingUsedAudit({
+      auditLog: this.auditLog,
+      identityId: this.identityId,
+      fortressId,
+      queryId,
+      replacements: restored.replacements,
+      fallbackNotice: false,
+    });
+    return restored.text;
   }
 
   /**
