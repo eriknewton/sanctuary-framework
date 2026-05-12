@@ -40,6 +40,7 @@ import type {
 } from "./types.js";
 import { CUSUM_CLASSIFIER_ID } from "./classifiers/cusum.js";
 import { PSI_CLASSIFIER_ID } from "./classifiers/psi.js";
+import { AUDIT_EVENT_CLASS_DISTRIBUTION_PSI_CLASSIFIER_ID } from "./detectors/audit-event-class-distribution-detector.js";
 
 export const ANOMALY_AUDIT_OPS = {
   DETECTOR_REGISTERED: "anomaly_detector_registered",
@@ -428,6 +429,9 @@ function classifierSpecificAuditOp(
     return ANOMALY_AUDIT_OPS.CUSUM_DRIFT_DETECTED;
   }
   if (classifierId === PSI_CLASSIFIER_ID) {
+    return ANOMALY_AUDIT_OPS.PSI_DISTRIBUTION_SHIFT_DETECTED;
+  }
+  if (classifierId === AUDIT_EVENT_CLASS_DISTRIBUTION_PSI_CLASSIFIER_ID) {
     return ANOMALY_AUDIT_OPS.PSI_DISTRIBUTION_SHIFT_DETECTED;
   }
   return null;
