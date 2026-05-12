@@ -27,6 +27,7 @@
 import { describe, it, expect } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { Writable } from "node:stream";
 
 import {
   AuditLog,
@@ -56,6 +57,7 @@ import {
   EnglishPolicyDraftStore,
   handleEnglishPolicyRoute,
 } from "../../src/policy-engine/english-policy-routes.js";
+import { runPolicyCommand } from "../../src/cli/policy.js";
 
 const FORTRESS_A = "fortress_a";
 const FORTRESS_B = "fortress_b";
@@ -63,7 +65,11 @@ const OPERATOR = "operator_alpha";
 const OBSERVED_AT = "2026-05-09T12:00:00.000Z";
 
 function clonePolicy(): PrincipalPolicy {
-  return JSON.parse(JSON.stringify(DEFAULT_POLICY));
+  const policy = JSON.parse(JSON.stringify(DEFAULT_POLICY)) as PrincipalPolicy;
+  policy.tier1_always_approve = policy.tier1_always_approve.filter(
+    (op) => op !== "state_export",
+  );
+  return policy;
 }
 
 function buildCompiled(
@@ -121,7 +127,18 @@ async function auditOps(auditLog: AuditLog): Promise<string[]> {
   return result.entries.map((e: AuditEntry) => e.operation);
 }
 
-describe("Xi-2 — applyRule pure function", () => {
+class CollectStream extends Writable {
+  chunks: Buffer[] = [];
+  override _write(chunk: Buffer, _enc: string, cb: () => void): void {
+    this.chunks.push(Buffer.from(chunk));
+    cb();
+  }
+  get text(): string {
+    return Buffer.concat(this.chunks).toString("utf-8");
+  }
+}
+
+describe("Xi-2 - applyRule pure function", () => {
   it("tier1_add_operation appends + dedupes", () => {
     const base = clonePolicy();
     const after = applyRule(base, {
@@ -181,7 +198,7 @@ describe("Xi-2 — applyRule pure function", () => {
   });
 });
 
-describe("Xi-2 — inverseRule symmetry", () => {
+describe("Xi-2 - inverseRule symmetry", () => {
   it("add <-> remove inverses across tier1 and tier3", () => {
     const r: CompiledPolicyRule = {
       kind: "tier1_add_operation",
@@ -194,7 +211,7 @@ describe("Xi-2 — inverseRule symmetry", () => {
   });
 });
 
-describe("Xi-2 — canonicalPolicyHash", () => {
+describe("Xi-2 - canonicalPolicyHash", () => {
   it("is order-stable: tier1 array reordering produces same hash", () => {
     const a = clonePolicy();
     const b = clonePolicy();
@@ -211,7 +228,7 @@ describe("Xi-2 — canonicalPolicyHash", () => {
   });
 });
 
-describe("Xi-2 — PolicyActivationStore round-trip + isolation", () => {
+describe("Xi-2 - PolicyActivationStore round-trip + isolation", () => {
   it("save -> load returns the same record", async () => {
     const storage = new MemoryStorage();
     const masterKey = generateRandomKey();
@@ -284,7 +301,7 @@ describe("Xi-2 — PolicyActivationStore round-trip + isolation", () => {
   });
 });
 
-describe("Xi-2 — EnglishPolicyActivator.activate()", () => {
+describe("Xi-2 - EnglishPolicyActivator.activate()", () => {
   it("activates a high-confidence draft and mutates the live policy", async () => {
     const rig = makeActivatorRig();
     const draft = buildCompiled({
@@ -348,7 +365,90 @@ describe("Xi-2 — EnglishPolicyActivator.activate()", () => {
   });
 });
 
-describe("Xi-2 — EnglishPolicyActivator.revoke()", () => {
+describe("Xi-3 - pre-activation conflict gating", () => {
+  it("checkConflicts returns conflicts and emits policy_conflict_detected", async () => {
+    const rig = makeActivatorRig({ policy: DEFAULT_POLICY });
+    const draft = buildCompiled({
+      kind: "tier1_add_operation",
+      operation: "state_export",
+    });
+    const conflicts = await rig.activator.checkConflicts(draft, OPERATOR);
+    expect(conflicts.length).toBeGreaterThan(0);
+    expect(conflicts.some((c) => c.conflict_type === "direct_override")).toBe(
+      true,
+    );
+    const ops = await auditOps(rig.auditLog);
+    expect(ops).toContain(
+      ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.CONFLICT_DETECTED,
+    );
+  });
+
+  it("HTTP-style activation gate refuses conflicts without acknowledgment", async () => {
+    const rig = makeActivatorRig({ policy: DEFAULT_POLICY });
+    const draft = buildCompiled({
+      kind: "tier1_add_operation",
+      operation: "state_export",
+    });
+    const outcome = await rig.activator.activate(draft, OPERATOR);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("policy_conflicts_unacknowledged");
+      expect(outcome.conflicts?.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("activates low-severity direct overrides after acknowledgment", async () => {
+    const rig = makeActivatorRig({ policy: DEFAULT_POLICY });
+    const draft = buildCompiled({
+      kind: "tier1_add_operation",
+      operation: "state_export",
+    });
+    const conflicts = await rig.activator.checkConflicts(draft, OPERATOR);
+    const outcome = await rig.activator.activate(draft, OPERATOR, {
+      conflicts_acknowledged: conflicts,
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.record.conflicts_acknowledged?.length).toBe(
+        conflicts.length,
+      );
+    }
+    const ops = await auditOps(rig.auditLog);
+    expect(ops).toContain(
+      ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.CONFLICT_ACKNOWLEDGED,
+    );
+  });
+
+  it("hard-blocks high-severity contradictions until the conflict id is forced", async () => {
+    const rig = makeActivatorRig({ policy: DEFAULT_POLICY });
+    const draft = buildCompiled({
+      kind: "tier3_add_operation",
+      operation: "state_export",
+    });
+    const conflicts = await rig.activator.checkConflicts(draft, OPERATOR);
+    const highIds = conflicts
+      .filter((c) => c.severity === "high")
+      .map((c) => c.conflict_id);
+    const blocked = await rig.activator.activate(draft, OPERATOR, {
+      conflicts_acknowledged: conflicts,
+    });
+    expect(blocked.ok).toBe(false);
+    if (!blocked.ok) {
+      expect(blocked.reason).toBe("policy_conflict_force_required");
+    }
+    const forced = await rig.activator.activate(draft, OPERATOR, {
+      conflicts_acknowledged: conflicts,
+      force_conflict_ids: highIds,
+    });
+    expect(forced.ok).toBe(true);
+    const ops = await auditOps(rig.auditLog);
+    expect(ops).toContain(
+      ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.FORCE_CONFLICT_USED,
+    );
+  });
+});
+
+describe("Xi-2 - EnglishPolicyActivator.revoke()", () => {
   it("revokes an activated draft and applies the inverse rule", async () => {
     const rig = makeActivatorRig();
     const draft = buildCompiled({
@@ -405,7 +505,7 @@ describe("Xi-2 — EnglishPolicyActivator.revoke()", () => {
   });
 });
 
-describe("Xi-2 — HTTP routes", () => {
+describe("Xi-2 - HTTP routes", () => {
   async function makeServer(deps: {
     compiler: EnglishPolicyCompiler;
     store: EnglishPolicyDraftStore;
@@ -564,9 +664,157 @@ describe("Xi-2 — HTTP routes", () => {
       await close();
     }
   });
+
+  it("POST /api/policy/drafts/:id/check-conflicts returns conflicts without activating", async () => {
+    const rig = makeActivatorRig({ policy: DEFAULT_POLICY });
+    const compiler = compilerFor(rig.auditLog);
+    const store = new EnglishPolicyDraftStore();
+    const draft = buildCompiled({
+      kind: "tier1_add_operation",
+      operation: "state_export",
+    });
+    store.put(draft);
+    const { base, close } = await makeServer({
+      compiler,
+      store,
+      activator: rig.activator,
+    });
+    try {
+      const res = await fetch(
+        `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}/check-conflicts`,
+        { method: "POST" },
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        data: { conflicts: Array<{ conflict_type: string }> };
+      };
+      expect(body.data.conflicts.length).toBeGreaterThan(0);
+      expect(
+        body.data.conflicts.some((c) => c.conflict_type === "direct_override"),
+      ).toBe(true);
+      expect(rig.livePolicy.current.tier1_always_approve).toContain(
+        "state_export",
+      );
+    } finally {
+      await close();
+    }
+  });
+
+  it("POST .../activate returns 409 without conflict acknowledgment, then proceeds with acknowledgment", async () => {
+    const rig = makeActivatorRig({ policy: DEFAULT_POLICY });
+    const compiler = compilerFor(rig.auditLog);
+    const store = new EnglishPolicyDraftStore();
+    const draft = buildCompiled({
+      kind: "tier1_add_operation",
+      operation: "state_export",
+    });
+    store.put(draft);
+    const { base, close } = await makeServer({
+      compiler,
+      store,
+      activator: rig.activator,
+    });
+    try {
+      const blocked = await fetch(
+        `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}/activate`,
+        { method: "POST" },
+      );
+      expect(blocked.status).toBe(409);
+      const blockedBody = (await blocked.json()) as {
+        data: { conflicts: unknown[] };
+      };
+      expect(blockedBody.data.conflicts.length).toBeGreaterThan(0);
+      const ok = await fetch(
+        `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}/activate`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            conflicts_acknowledged: blockedBody.data.conflicts,
+          }),
+        },
+      );
+      expect(ok.status).toBe(200);
+    } finally {
+      await close();
+    }
+  });
+
+  it("CLI drafts check-conflicts prints server-returned conflicts", async () => {
+    const rig = makeActivatorRig({ policy: DEFAULT_POLICY });
+    const compiler = compilerFor(rig.auditLog);
+    const store = new EnglishPolicyDraftStore();
+    const draft = buildCompiled({
+      kind: "tier1_add_operation",
+      operation: "state_export",
+    });
+    store.put(draft);
+    const { base, close } = await makeServer({
+      compiler,
+      store,
+      activator: rig.activator,
+    });
+    try {
+      const out = new CollectStream();
+      const err = new CollectStream();
+      const code = await runPolicyCommand({
+        argv: [
+          "drafts",
+          "check-conflicts",
+          draft.draft_id,
+          "--api-base",
+          base,
+        ],
+        out,
+        err,
+      });
+      expect(code).toBe(0);
+      expect(out.text).toContain("direct_override");
+      expect(err.text).toBe("");
+    } finally {
+      await close();
+    }
+  });
+
+  it("CLI drafts activate refuses high-severity conflicts without --force-conflict", async () => {
+    const rig = makeActivatorRig({ policy: DEFAULT_POLICY });
+    const compiler = compilerFor(rig.auditLog);
+    const store = new EnglishPolicyDraftStore();
+    const draft = buildCompiled({
+      kind: "tier3_add_operation",
+      operation: "state_export",
+    });
+    store.put(draft);
+    const { base, close } = await makeServer({
+      compiler,
+      store,
+      activator: rig.activator,
+    });
+    try {
+      const out = new CollectStream();
+      const err = new CollectStream();
+      const code = await runPolicyCommand({
+        argv: [
+          "drafts",
+          "activate",
+          draft.draft_id,
+          "--acknowledge-conflicts",
+          "--api-base",
+          base,
+        ],
+        out,
+        err,
+      });
+      expect(code).toBe(1);
+      expect(err.text).toContain("high-severity conflicts require");
+      expect(out.text).toBe("");
+    } finally {
+      await close();
+    }
+  });
 });
 
-describe("Xi-2 — audit emission + Castle-walking", () => {
+describe("Xi-2 - audit emission + Castle-walking", () => {
   it("ACTIVATED audit op fires with the rule_kind + operation in details", async () => {
     const rig = makeActivatorRig();
     const draft = buildCompiled({

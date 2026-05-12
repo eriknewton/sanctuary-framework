@@ -12,6 +12,7 @@ import type { ModeTier } from "../fortress/constants.js";
 import type { TierProfile, TransitionHistoryEntry } from "../fortress/types.js";
 import type { BadgeState } from "../attestation/types.js";
 import type { ChannelTemplateId } from "../policy-engine/constants.js";
+import type { PolicyConflict } from "../policy-engine/conflict-detector.js";
 import type { PresenceState } from "../chat/constants.js";
 import type { CascadeState } from "../recovery/types.js";
 import type { GuardianRoster } from "../mesh/guardian/types.js";
@@ -111,6 +112,8 @@ export interface PolicyCompileResponse {
 export interface PolicyEditorViewContext {
   view: "policy_editor";
   templates: ChannelTemplateInfo[];
+  draft_tabs: Array<"compile" | "activation" | "conflicts">;
+  draft_conflicts: Record<string, PolicyConflict[]>;
   /** Currently pinned policies per agent. */
   pinned_policies: Record<string, {
     agent_id: string;

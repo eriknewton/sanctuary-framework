@@ -1,5 +1,5 @@
 /**
- * Sanctuary Policy Engine — Public surface.
+ * Sanctuary Policy Engine - Public surface.
  *
  * WP-MVP-5 v0.1. Walkthrough Key 10 LOCKED (four canonical slots:
  * memory / credentials / plans / outputs) + Walkthrough Key 11 LOCKED
@@ -7,7 +7,7 @@
  *
  * Consumes the WP-MVP-3 mesh surface via the public API only; never
  * touches server/src/mesh/ internals. The policy_blob shape is
- * authoritative here — the mesh treats it as opaque bytes.
+ * authoritative here; the mesh treats it as opaque bytes.
  */
 
 export * from "./constants.js";
@@ -26,4 +26,5 @@ export * from "./commitment-boundary.js";
 export * from "./egress-gate.js";
 export * from "./budget-gate.js";
 export * from "./retention-sweep.js";
+export * from "./conflict-detector.js";
 export * from "./gates/index.js";
