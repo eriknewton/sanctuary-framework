@@ -59,6 +59,7 @@ const state = {
   templateBinding: { agentId: null, selectedTemplateId: null, pendingItemId: null, error: null },
   privacyEvents: [],
   handoffEvents: [],
+  honeypot: { toolTraps: [], loadError: null },
   topbarPills: { deployment: "local", mode: "solo", attestation: "pending" },
   tier1: {
     lockdown: { state: "idle", inboxItemId: null }
@@ -192,6 +193,20 @@ async function api(path, opts) {
     err.body = body;
     throw err;
   }
+  return body;
+}
+
+async function honeypotApi(path) {
+  const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
+  if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
+  const sep = path.indexOf("?") >= 0 ? "&" : "?";
+  const res = await fetch("/api/honeypot" + path + sep + "_t=" + Date.now(), {
+    headers,
+    cache: "no-store"
+  });
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (!res.ok) throw new Error(body && body.error ? body.error : ("HTTP " + res.status));
   return body;
 }
 
@@ -361,7 +376,7 @@ function setRoute(route) {
   const app = document.getElementById("app");
   if (!app) return;
   app.setAttribute("data-route", route);
-  const fullRoutes = ["agents", "policy", "intelligence", "privacy", "coordination", "health", "exit-drill", "agent-detail"];
+  const fullRoutes = ["agents", "policy", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail"];
   if (fullRoutes.indexOf(route) >= 0) app.classList.add("route-full");
   else app.classList.remove("route-full");
   document.querySelectorAll("#sidebar-nav a").forEach(function (a) {
@@ -503,6 +518,7 @@ function renderMain() {
     case "policy": nextHtml = renderPolicyCenter(); break;
     case "intelligence": nextHtml = renderIntelligenceCenter(); break;
     case "attestation": nextHtml = renderAttestation(); break;
+    case "honeypot": nextHtml = renderHoneypotPage(); break;
     case "privacy": nextHtml = renderPrivacyPage(); break;
     case "coordination": nextHtml = renderCoordinationPage(); break;
     case "health": nextHtml = renderHealthPage(); break;
@@ -847,6 +863,44 @@ function attRow(demoHtml, strong, smallText) {
 function renderAgentAttestationBadgeForState(cls, label) {
   return '<span class="att-agent ' + escHtml(cls) + '" title="Agent attestation"><span class="mark"></span>' + escHtml(label) + '</span>';
 }
+
+function renderHoneypotPage() {
+  const traps = state.honeypot.toolTraps || [];
+  const rows = traps.length ? traps.map(function (trap) {
+    const activations = trap.activations || [];
+    const latest = activations.length ? activations[activations.length - 1] : null;
+    const followups = latest && latest.follow_up_tool_calls ? latest.follow_up_tool_calls : [];
+    const followupText = followups.length
+      ? followups.map(function (f) { return escHtml(f.tool_name) + " at " + escHtml(shortTime(f.called_at)); }).join(", ")
+      : "No follow-up calls in the 5 minute window.";
+    const latestText = latest
+      ? escHtml(latest.caller_identity) + " invoked " + escHtml(trap.fake_tool_name) + " at " + escHtml(shortTime(latest.invoked_at)) + "; received the operator-configured fake response; followed up with " + followups.length + " calls."
+      : "No invocations recorded.";
+    return '<section class="card">' +
+      '<div class="page-head" style="margin-bottom:8px;"><div>' +
+        '<p class="eyebrow">Tool-call trap</p>' +
+        '<h2>' + escHtml(trap.fake_tool_name) + '</h2>' +
+      '</div><span class="label">' + escHtml(trap.catalog_visibility) + '</span></div>' +
+      '<div class="layer-grid">' +
+        '<div class="layer-card"><h4>Invocations</h4><p>' + escHtml(trap.invocation_count) + '</p></div>' +
+        '<div class="layer-card"><h4>Last invocation</h4><p>' + escHtml(trap.last_invocation_at ? shortTime(trap.last_invocation_at) : "never") + '</p></div>' +
+        '<div class="layer-card"><h4>Caller diversity</h4><p>' + escHtml(trap.caller_diversity) + '</p></div>' +
+      '</div>' +
+      '<p class="muted">' + latestText + '</p>' +
+      '<p class="muted">Follow-up correlation: ' + followupText + '</p>' +
+      (latest ? '<pre class="terminal-block">' + escHtml(JSON.stringify(latest.invocation_args || {}, null, 2)) + '</pre>' : '') +
+    '</section>';
+  }).join("") : '<section class="card"><h3>No tool-call traps deployed.</h3><p class="muted">Compile and deploy a tool_call honeypot to see catalog injections and invocations here.</p></section>';
+  const error = state.honeypot.loadError
+    ? '<p class="muted">Honeypot stats unavailable: ' + escHtml(state.honeypot.loadError) + '</p>'
+    : '';
+  return '<div class="page-head"><div>' +
+    '<p class="eyebrow">Honeypots</p>' +
+    '<h1>Tool-call traps.</h1>' +
+    '<p class="sub">Fake MCP tools in the wrapped-agent catalog. Invocations create sentinel findings and correlate the next 5 minutes of tool calls.</p>' +
+  '</div></div>' + error + rows;
+}
+
 function relTimeFromIso(iso) {
   if (!iso) return "";
   const d = new Date(iso);
@@ -1913,10 +1967,21 @@ async function fetchAll() {
     state.handoffEvents = he.data.entries || [];
   } catch (e) { /* tolerate */ }
   await fetchIntelligenceState();
+  await fetchHoneypotState();
   // WP-V1.2 reshape: hydrate the concierge thread on every fetch cycle.
   // The direct-agent surface was removed; the inspect panel is fetched
   // lazily on click rather than maintained in state.
   await fetchConciergeHistory();
+}
+
+async function fetchHoneypotState() {
+  try {
+    const r = await honeypotApi("/tool-traps");
+    state.honeypot.toolTraps = (r.data && r.data.traps) || [];
+    state.honeypot.loadError = null;
+  } catch (e) {
+    state.honeypot.loadError = e && e.message ? e.message : String(e);
+  }
 }
 
 // Tier 1 lockdown click. Two-step: POST returns 202 + inbox_item_id, button

@@ -7,6 +7,7 @@
  *   sanctuary honeypot compile "<English>"     POST /api/honeypot/compile
  *   sanctuary honeypot deploy <trap_id>        POST /api/honeypot/deploy
  *   sanctuary honeypot list                    GET  /api/honeypot/traps
+ *   sanctuary honeypot tool-traps list         list tool-call trap stats
  *   sanctuary honeypot undeploy <trap_id>      DELETE /api/honeypot/traps/:id
  *   sanctuary honeypot findings [--since=...]  GET  /api/honeypot/findings
  *
@@ -45,7 +46,15 @@ function formatTriggerSuffix(trigger: TrapTrigger): string {
   if (trigger.kind === "http_endpoint") {
     return ` (${trigger.method ?? "ANY"})`;
   }
-  return ` (ops=${trigger.ops.join(",")})`;
+  if (trigger.kind === "filesystem") {
+    return ` (ops=${trigger.ops.join(",")})`;
+  }
+  return ` (${trigger.catalog_visibility})`;
+}
+
+function formatTriggerPrimary(trigger: TrapTrigger): string {
+  if (trigger.kind === "tool_call") return trigger.fake_tool_name;
+  return trigger.path_pattern;
 }
 import {
   compileHoneypot,
@@ -67,6 +76,13 @@ export interface HoneypotCliDeps {
    * caller-provided lookup; auto-persistence of compiled specs lands
    * in Pi-2 (fortress-config persistence). */
   resolveSpec?: (trapId: string) => TrapSpec | undefined;
+  toolTrapStats?: () => Array<{
+    trap_id: string;
+    fake_tool_name: string;
+    invocation_count: number;
+    last_invocation_at: string | null;
+    caller_diversity: number;
+  }>;
   now?: () => Date;
 }
 
@@ -113,7 +129,7 @@ export async function runHoneypotCli(
   if (!command || command === "--help" || command === "-h") {
     write(
       out,
-      "Usage: sanctuary honeypot <compile|deploy|list|undeploy|findings>\n",
+      "Usage: sanctuary honeypot <compile|deploy|list|tool-traps|undeploy|findings>\n",
     );
     return command ? 0 : 2;
   }
@@ -149,9 +165,11 @@ export async function runHoneypotCli(
       write(out, `compiled: ${result.spec.trap_id}\n`);
       write(out, `source: ${result.source}\n`);
       write(out, `class: ${result.spec.trap_class}\n`);
+      const label =
+        result.spec.trigger.kind === "tool_call" ? "target" : "pattern";
       write(
         out,
-        `pattern: ${result.spec.trigger.path_pattern}${formatTriggerSuffix(result.spec.trigger)}\n`,
+        `${label}: ${formatTriggerPrimary(result.spec.trigger)}${formatTriggerSuffix(result.spec.trigger)}\n`,
       );
       write(out, `severity: ${result.spec.finding_severity}\n`);
       write(out, `explanation: ${result.spec.explanation_paragraph}\n`);
@@ -185,7 +203,7 @@ export async function runHoneypotCli(
       fortress_id: deps.fortressId,
       trap_id: spec.trap_id,
       trap_class: spec.trap_class,
-      path_pattern: spec.trigger.path_pattern,
+      target: formatTriggerPrimary(spec.trigger),
       was_new: wasNew,
     });
     if (json) {
@@ -206,7 +224,43 @@ export async function runHoneypotCli(
       for (const t of traps) {
         write(
           out,
-          `${t.trap_id}  ${t.trap_class}  ${t.trigger.path_pattern}  severity=${t.finding_severity}\n`,
+          `${t.trap_id}  ${t.trap_class}  ${formatTriggerPrimary(t.trigger)}  severity=${t.finding_severity}\n`,
+        );
+      }
+    }
+    return 0;
+  }
+
+  if (command === "tool-traps") {
+    const sub = argv[1];
+    if (sub !== "list") {
+      write(err, "Usage: sanctuary honeypot tool-traps list\n");
+      return 2;
+    }
+    const traps = deps.toolTrapStats
+      ? deps.toolTrapStats()
+      : deps.registry
+          .list()
+          .filter((t) => t.trigger.kind === "tool_call")
+          .map((t) => ({
+            trap_id: t.trap_id,
+            fake_tool_name:
+              t.trigger.kind === "tool_call"
+                ? t.trigger.fake_tool_name
+                : "",
+            invocation_count: 0,
+            last_invocation_at: null,
+            caller_diversity: 0,
+          }));
+    if (json) {
+      write(out, JSON.stringify({ traps }, null, 2) + "\n");
+    } else if (traps.length === 0) {
+      write(out, "no tool-call honeypot traps deployed\n");
+    } else {
+      for (const t of traps) {
+        write(
+          out,
+          `${t.trap_id}  ${t.fake_tool_name}  invocations=${t.invocation_count}  callers=${t.caller_diversity}  last=${t.last_invocation_at ?? "never"}\n`,
         );
       }
     }
