@@ -64,6 +64,7 @@ import {
   type CompileResult,
 } from "./honeypot-compiler.js";
 import { TrapRegistry } from "./trap-registry.js";
+import type { TrapStore } from "./trap-store.js";
 
 export const HONEYPOT_API_PREFIX = "/api/honeypot";
 
@@ -92,6 +93,14 @@ export interface HoneypotRouterDeps extends HoneypotTriggerDeps {
    * heuristic Path B (still produces a usable spec + warnings).
    */
   selector?: SubstrateSelector;
+  /**
+   * Pi-2: optional encrypted-at-rest trap store. When present, the
+   * deploy and undeploy handlers write through to the store so the
+   * fortress retains its deployed traps across restart. Absent store
+   * keeps Pi-1's in-memory-only behavior (tests rely on this absence
+   * to exercise the registry without a storage backend).
+   */
+  store?: TrapStore;
 }
 
 // ── Front-of-dispatch trap-trigger hook ──────────────────────────────────
@@ -342,14 +351,40 @@ export async function handleHoneypotRoute(
         return true;
       }
       const isNew = deps.registry.deploy(spec);
+      // Pi-2: persist the deployed spec to encrypted at-rest storage
+      // when a store is wired. Best-effort: a store-write failure must
+      // NOT block the operator's deploy (the in-memory registry has
+      // already accepted the spec and the trap fires immediately on
+      // matching traffic). Failures surface in the audit emission.
+      let persistError: string | null = null;
+      if (deps.store) {
+        try {
+          await deps.store.save(spec);
+        } catch (err) {
+          persistError = err instanceof Error ? err.message : String(err);
+        }
+      }
       deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.DEPLOYED, deps.operatorId, {
         fortress_id: deps.fortressId,
         trap_id: spec.trap_id,
         trap_class: spec.trap_class,
         path_pattern: spec.trigger.path_pattern,
         was_new: isNew,
+        ...(persistError !== null
+          ? { persist_error: persistError, persisted: false }
+          : deps.store
+            ? { persisted: true }
+            : {}),
       });
-      writeJSON(res, 200, { ok: true, data: { trap_id: spec.trap_id, was_new: isNew } });
+      writeJSON(res, 200, {
+        ok: true,
+        data: {
+          trap_id: spec.trap_id,
+          was_new: isNew,
+          ...(deps.store ? { persisted: persistError === null } : {}),
+          ...(persistError !== null ? { persist_error: persistError } : {}),
+        },
+      });
       return true;
     }
 
@@ -362,17 +397,43 @@ export async function handleHoneypotRoute(
     const trapMatch = matchTrapIdRoute(path);
     if (method === "DELETE" && trapMatch) {
       const removed = deps.registry.undeploy(trapMatch.trapId);
+      // Pi-2: best-effort remove from encrypted at-rest storage. We
+      // delete unconditionally rather than gating on `removed` because
+      // the persisted layer and in-memory layer can drift (e.g., after
+      // a partial boot reload). Deleting on undeploy is idempotent and
+      // converges the two layers.
+      let persistError: string | null = null;
+      if (deps.store) {
+        try {
+          await deps.store.delete(trapMatch.trapId);
+        } catch (err) {
+          persistError = err instanceof Error ? err.message : String(err);
+        }
+      }
       if (removed) {
         deps.auditLog.append(
           "l2",
           HONEYPOT_AUDIT_OPS.UNDEPLOYED,
           deps.operatorId,
-          { fortress_id: deps.fortressId, trap_id: trapMatch.trapId },
+          {
+            fortress_id: deps.fortressId,
+            trap_id: trapMatch.trapId,
+            ...(persistError !== null
+              ? { persist_error: persistError, persisted: false }
+              : deps.store
+                ? { persisted: true }
+                : {}),
+          },
         );
       }
       writeJSON(res, removed ? 200 : 404, {
         ok: removed,
-        data: { trap_id: trapMatch.trapId, removed },
+        data: {
+          trap_id: trapMatch.trapId,
+          removed,
+          ...(deps.store ? { persisted: persistError === null } : {}),
+          ...(persistError !== null ? { persist_error: persistError } : {}),
+        },
       });
       return true;
     }

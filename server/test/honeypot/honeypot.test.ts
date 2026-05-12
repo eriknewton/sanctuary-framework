@@ -89,6 +89,7 @@ function mkSpec(overrides: Partial<TrapSpec> = {}): TrapSpec {
     trap_id: overrides.trap_id ?? "trap-1",
     trap_class: "http_endpoint",
     trigger: overrides.trigger ?? {
+      kind: "http_endpoint",
       path_pattern: "/admin/secrets",
       expected_caller_types: ["wrapped_agent"],
     },
@@ -202,7 +203,7 @@ describe("WP-V1.3-5 Pi-1 trap registry + glob matching", () => {
 
   it("matchesTrap respects method filter", () => {
     const spec = mkSpec({
-      trigger: { path_pattern: "/admin/*", method: "POST", expected_caller_types: ["wrapped_agent"] },
+      trigger: { kind: "http_endpoint", path_pattern: "/admin/*", method: "POST", expected_caller_types: ["wrapped_agent"] },
     });
     expect(matchesTrap(spec, { path: "/admin/x", method: "POST" })).toBe(true);
     expect(matchesTrap(spec, { path: "/admin/x", method: "GET" })).toBe(false);
@@ -214,7 +215,7 @@ describe("WP-V1.3-5 Pi-1 trap registry + glob matching", () => {
 describe("WP-V1.3-5 Pi-1 runtime trap handler", () => {
   it("matched request emits audit event + sentinel finding + 404", async () => {
     const rig = await makeRig();
-    rig.registry.deploy(mkSpec({ trigger: { path_pattern: "/admin/*", expected_caller_types: ["wrapped_agent"] } }));
+    rig.registry.deploy(mkSpec({ trigger: { kind: "http_endpoint", path_pattern: "/admin/*", expected_caller_types: ["wrapped_agent"] } }));
 
     const { req, res, capture } = makeMockReqRes("GET", "/admin/secrets");
     const handled = await handleHoneypotTriggerIfMatch(
@@ -246,7 +247,7 @@ describe("WP-V1.3-5 Pi-1 runtime trap handler", () => {
 
   it("non-matching request returns false (handler does not intercept)", async () => {
     const rig = await makeRig();
-    rig.registry.deploy(mkSpec({ trigger: { path_pattern: "/admin/*", expected_caller_types: ["wrapped_agent"] } }));
+    rig.registry.deploy(mkSpec({ trigger: { kind: "http_endpoint", path_pattern: "/admin/*", expected_caller_types: ["wrapped_agent"] } }));
     const { req, res, capture } = makeMockReqRes("GET", "/public/index.html");
     const handled = await handleHoneypotTriggerIfMatch(
       {
@@ -265,7 +266,7 @@ describe("WP-V1.3-5 Pi-1 runtime trap handler", () => {
 
   it("trap response body is plausible 404 JSON (no honeypot-leaking content)", async () => {
     const rig = await makeRig();
-    rig.registry.deploy(mkSpec({ trigger: { path_pattern: "/admin/*", expected_caller_types: ["wrapped_agent"] } }));
+    rig.registry.deploy(mkSpec({ trigger: { kind: "http_endpoint", path_pattern: "/admin/*", expected_caller_types: ["wrapped_agent"] } }));
     const { req, res, capture } = makeMockReqRes("GET", "/admin/secrets");
     await handleHoneypotTriggerIfMatch(
       {
@@ -285,7 +286,7 @@ describe("WP-V1.3-5 Pi-1 runtime trap handler", () => {
 
   it("management API path is not self-shadowed by the trap-trigger hook", async () => {
     const rig = await makeRig();
-    rig.registry.deploy(mkSpec({ trigger: { path_pattern: "/**", expected_caller_types: ["wrapped_agent"] } }));
+    rig.registry.deploy(mkSpec({ trigger: { kind: "http_endpoint", path_pattern: "/**", expected_caller_types: ["wrapped_agent"] } }));
     const { req, res } = makeMockReqRes("GET", "/api/honeypot/traps");
     const handled = await handleHoneypotTriggerIfMatch(
       {

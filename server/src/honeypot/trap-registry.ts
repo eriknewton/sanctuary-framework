@@ -88,11 +88,15 @@ export class TrapRegistry {
 }
 
 /**
- * Returns true when `input` matches the trap's `trigger`. Exposed for
- * tests + the runtime path; the registry uses it internally.
+ * Returns true when `input` matches the trap's HTTP trigger. Exposed
+ * for tests + the runtime path; the registry uses it internally.
+ *
+ * Pi-2: narrows on `trigger.kind === "http_endpoint"` so filesystem
+ * traps (which share the registry but route through a different
+ * monitor) never match HTTP request inputs.
  */
 export function matchesTrap(spec: TrapSpec, input: TrapMatchInput): boolean {
-  if (spec.trap_class !== "http_endpoint") return false;
+  if (spec.trigger.kind !== "http_endpoint") return false;
   const trigger = spec.trigger;
   if (trigger.method && trigger.method.toUpperCase() !== input.method.toUpperCase()) {
     return false;
