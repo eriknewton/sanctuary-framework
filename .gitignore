@@ -14,6 +14,7 @@
 # Dependencies
 node_modules/
 sidecars/concordia/.venv/
+.claude/worktrees/
 
 # Build artifacts
 dist/
