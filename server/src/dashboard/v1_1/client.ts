@@ -44,6 +44,7 @@ const CLIENT_SCRIPT = String.raw`
 const cfgEl = document.getElementById("dashboard-config");
 const config = cfgEl ? JSON.parse(cfgEl.textContent || "{}") : {};
 const HUB = config.hubApiBase || "/api/hub";
+const AUTO_TRIGGER = "/api/auto-trigger";
 const STREAM = config.streamUrl || "/api/stream";
 const TOKEN = config.authToken || "";
 const SANCTUARY_VERSION = config.sanctuaryVersion || "";
@@ -56,6 +57,7 @@ const state = {
   inbox: [],
   activity: [],
   policies: [],
+  autoTrigger: { recommendations: [], loadError: null },
   templateBinding: { agentId: null, selectedTemplateId: null, pendingItemId: null, error: null },
   privacyEvents: [],
   handoffEvents: [],
@@ -207,6 +209,32 @@ async function honeypotApi(path) {
   let body = null;
   try { body = await res.json(); } catch (e) { body = null; }
   if (!res.ok) throw new Error(body && body.error ? body.error : ("HTTP " + res.status));
+  return body;
+}
+
+async function autoTriggerApi(path, opts) {
+  const init = Object.assign({ headers: {} }, opts || {});
+  if (TOKEN) init.headers["Authorization"] = "Bearer " + TOKEN;
+  if (init.body && typeof init.body !== "string") {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(init.body);
+  }
+  init.cache = "no-store";
+  init.headers["Cache-Control"] = "no-cache";
+  init.headers["Pragma"] = "no-cache";
+  let url = AUTO_TRIGGER + path;
+  const method = (init.method || "GET").toUpperCase();
+  if (method === "GET") url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
+  const res = await fetch(url, init);
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (!res.ok) {
+    const detail = body && (body.detail || body.error) ? (body.detail || body.error) : ("HTTP " + res.status);
+    const err = new Error(detail);
+    err.status = res.status;
+    err.body = body;
+    throw err;
+  }
   return body;
 }
 
@@ -376,7 +404,7 @@ function setRoute(route) {
   const app = document.getElementById("app");
   if (!app) return;
   app.setAttribute("data-route", route);
-  const fullRoutes = ["agents", "policy", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail"];
+  const fullRoutes = ["agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail"];
   if (fullRoutes.indexOf(route) >= 0) app.classList.add("route-full");
   else app.classList.remove("route-full");
   document.querySelectorAll("#sidebar-nav a").forEach(function (a) {
@@ -516,6 +544,7 @@ function renderMain() {
     case "agents": nextHtml = renderAgentsList(); break;
     case "agent-detail": nextHtml = renderAgentDetail(); break;
     case "policy": nextHtml = renderPolicyCenter(); break;
+    case "auto-trigger": nextHtml = renderAutoTriggerPage(); break;
     case "intelligence": nextHtml = renderIntelligenceCenter(); break;
     case "attestation": nextHtml = renderAttestation(); break;
     case "honeypot": nextHtml = renderHoneypotPage(); break;
@@ -1801,6 +1830,47 @@ function renderPolicyCenter() {
   '</section>';
 }
 
+function renderAutoTriggerPage() {
+  const recs = state.autoTrigger.recommendations || [];
+  const body = recs.length
+    ? '<div class="recommendation-list">' + recs.map(function (r) {
+        const hs = r.history_summary || {};
+        const approval = Math.round(((hs.operator_approval_rate || 0) * 100));
+        const cancel = hs.operator_cancel_rate == null ? null : Math.round(hs.operator_cancel_rate * 100);
+        const revoke = hs.operator_revocation_rate == null ? null : Math.round(hs.operator_revocation_rate * 100);
+        const suppressed = r.suppressed_until ? '<span class="pill tone-degraded">cool-down until ' + escHtml(shortTime(r.suppressed_until)) + '</span>' : '';
+        return '<article class="recommendation-row">' +
+          '<div>' +
+            '<h3>' + escHtml(r.rule_id) + '</h3>' +
+            '<p>' + escHtml(r.recommendation_reason) + '</p>' +
+            '<div class="recommendation-stats">' +
+              '<span class="pill">rung ' + escHtml(r.current_rung) + ' to ' + escHtml(r.recommended_rung) + '</span>' +
+              '<span class="pill">fires ' + escHtml(hs.fires_in_window || 0) + '</span>' +
+              '<span class="pill">approved ' + escHtml(approval) + '%</span>' +
+              (cancel === null ? '' : '<span class="pill">canceled ' + escHtml(cancel) + '%</span>') +
+              (revoke === null ? '' : '<span class="pill">revoked ' + escHtml(revoke) + '%</span>') +
+              '<span class="pill tone-info">' + escHtml(r.confidence) + '</span>' +
+              suppressed +
+            '</div>' +
+          '</div>' +
+          '<div class="recommendation-actions">' +
+            '<button class="btn" data-action="auto-trigger-reject" data-rule-id="' + escHtml(r.rule_id) + '">Reject</button>' +
+            '<button class="btn btn-primary" data-action="auto-trigger-accept" data-rule-id="' + escHtml(r.rule_id) + '">Accept</button>' +
+          '</div>' +
+        '</article>';
+      }).join("") + '</div>'
+    : '<p class="muted">No active recommendations.</p>';
+  const error = state.autoTrigger.loadError
+    ? '<p class="muted">Auto-trigger recommendations unavailable: ' + escHtml(state.autoTrigger.loadError) + '</p>'
+    : '';
+  return '<section class="policy-center">' +
+    '<p class="eyebrow">AUTO-TRIGGER LADDER</p>' +
+    '<h1>Recommendations <span class="pill tone-info">operator controlled</span></h1>' +
+    '<p class="policy-subtitle">Promotion and demotion suggestions are based on local rule history. Accepting is the operator action that changes a rung.</p>' +
+    '<section class="policy-panel"><h2>Recommendations</h2>' + error + body + '</section>' +
+  '</section>';
+}
+
 function renderTemplatePicker(agent) {
   const current = agent.channel_template_id || "";
   const selected = state.templateBinding.selectedTemplateId || current || CHANNEL_TEMPLATES[0].id;
@@ -1966,6 +2036,13 @@ async function fetchAll() {
     const he = await api("/activity?category=handoff");
     state.handoffEvents = he.data.entries || [];
   } catch (e) { /* tolerate */ }
+  try {
+    const at = await autoTriggerApi("/recommendations");
+    state.autoTrigger.recommendations = (at.data && at.data.recommendations) || [];
+    state.autoTrigger.loadError = null;
+  } catch (e) {
+    state.autoTrigger.loadError = e && e.message ? e.message : "unavailable";
+  }
   await fetchIntelligenceState();
   await fetchHoneypotState();
   // WP-V1.2 reshape: hydrate the concierge thread on every fetch cycle.
@@ -1981,6 +2058,22 @@ async function fetchHoneypotState() {
     state.honeypot.loadError = null;
   } catch (e) {
     state.honeypot.loadError = e && e.message ? e.message : String(e);
+  }
+}
+
+async function onAutoTriggerRecommendation(ruleId, action) {
+  try {
+    await autoTriggerApi(
+      "/rules/" + encodeURIComponent(ruleId) + "/" + action + "-recommendation",
+      { method: "POST", body: {} }
+    );
+    const at = await autoTriggerApi("/recommendations");
+    state.autoTrigger.recommendations = (at.data && at.data.recommendations) || [];
+    state.autoTrigger.loadError = null;
+    toast(action === "accept" ? "Recommendation accepted." : "Recommendation rejected.", "info");
+    rerender();
+  } catch (e) {
+    toast("Recommendation action failed: " + (e && e.message ? e.message : "unknown"), "error");
   }
 }
 
@@ -2213,6 +2306,7 @@ document.addEventListener("click", function (ev) {
   if (!action) return;
   const itemId = tgt.getAttribute("data-item-id");
   const agentId = tgt.getAttribute("data-agent-id");
+  const ruleId = tgt.getAttribute("data-rule-id");
   const route = tgt.getAttribute("data-route");
   const intelSurface = tgt.getAttribute("data-intel-surface");
   const intelSubstrate = tgt.getAttribute("data-intel-substrate");
@@ -2257,6 +2351,12 @@ document.addEventListener("click", function (ev) {
       state.intelligence.expandedFailures[intelSurface] = true;
     }
     return rerender();
+  }
+  if (action === "auto-trigger-accept" && ruleId) {
+    return void onAutoTriggerRecommendation(ruleId, "accept");
+  }
+  if (action === "auto-trigger-reject" && ruleId) {
+    return void onAutoTriggerRecommendation(ruleId, "reject");
   }
   // WP-V1.2-4 concierge handlers ──────────────────────────────────
   if (action === "concierge-submit") { ev.preventDefault(); return void onConciergeSend(); }

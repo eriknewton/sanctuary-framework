@@ -36,6 +36,12 @@ import { SentinelFindingStore } from "./sentinel/sentinel-finding-store.js";
 import { SentinelRegistry } from "./sentinel/sentinel-registry.js";
 import { SentinelDispatcher } from "./sentinel/sentinel-dispatcher.js";
 import { AnomalyPipelineDispatcher } from "./anomaly-detection/anomaly-pipeline.js";
+import { ThresholdConfigStore } from "./auto-trigger/threshold-config-store.js";
+import {
+  ActionDispatcher,
+  NotifyOperatorAction,
+} from "./auto-trigger/action-dispatcher.js";
+import { CalibrationSuggester } from "./auto-trigger/calibration-suggester.js";
 import { HandoffLog } from "./coordination/handoff-log.js";
 import { HandoffEventBridge } from "./coordination/handoff-routes.js";
 import { WorkflowStateTracker } from "./coordination/workflow-state-tracker.js";
@@ -783,6 +789,36 @@ export async function createSanctuaryServer(options?: {
     payloadStore: aggregatorPayloadStore,
   });
 
+  // v1.3 WP-V1.3-7 Nu-3: Auto-Trigger Ladder runtime. The promotion
+  // suggester is advisory only; it evaluates local action history and emits
+  // recommendations. Rung changes happen only via operator accept/promote
+  // routes, never from the scheduled tick.
+  const autoTriggerStore = new ThresholdConfigStore({
+    storage,
+    masterKey,
+    fortressId: fortressIdForAggregator,
+  });
+  const autoTriggerAction = new NotifyOperatorAction(
+    auditLog,
+    aggregatorIdentityId,
+    fortressIdForAggregator,
+  );
+  const autoTriggerDispatcher = new ActionDispatcher({
+    store: autoTriggerStore,
+    action: autoTriggerAction,
+    auditLog,
+    fortressId: fortressIdForAggregator,
+    identityId: aggregatorIdentityId,
+  });
+  const autoTriggerSuggester = new CalibrationSuggester({
+    store: autoTriggerStore,
+    dispatcher: autoTriggerDispatcher,
+    auditLog,
+    fortressId: fortressIdForAggregator,
+    identityId: aggregatorIdentityId,
+  });
+  autoTriggerSuggester.start();
+
   // v1.3 WP-V1.3-10 Upsilon-2: wrap the approval channel with the
   // aggregator-backed channel. When `approval_redirect.enabled` is false
   // (default), the wrapper short-circuits to underlying-passthrough; the
@@ -851,8 +887,17 @@ export async function createSanctuaryServer(options?: {
     // Subscription file missing or unreadable: dispatcher starts empty.
   }
   sentinelDispatcher.start();
+  sentinelDispatcher.onEvent((event) => {
+    if (event.type !== "finding") return;
+    void autoTriggerDispatcher.handleFinding(event.finding, "sentinel");
+  });
   if (dashboard) {
     dashboard.setSentinelDispatcher(sentinelDispatcher);
+    dashboard.setAutoTrigger({
+      store: autoTriggerStore,
+      dispatcher: autoTriggerDispatcher,
+      suggester: autoTriggerSuggester,
+    });
   }
 
   // v1.3 WP-V1.3-2 Chi-1: Anomaly Detection Pipeline (Castle Layer 2
@@ -871,6 +916,10 @@ export async function createSanctuaryServer(options?: {
     identityId: aggregatorIdentityId,
   });
   anomalyDispatcher.start();
+  anomalyDispatcher.onEvent((event) => {
+    if (event.type !== "finding") return;
+    void autoTriggerDispatcher.handleFinding(event.finding, "anomaly");
+  });
   // Keep a reference so the GC doesn't collect the dispatcher even
   // when no detectors are registered. Tests that need access mount
   // their own; runtime callers reach the dispatcher via the future

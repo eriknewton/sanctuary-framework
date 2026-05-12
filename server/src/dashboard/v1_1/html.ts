@@ -246,6 +246,12 @@ body {
 .policy-subtitle { max-width: 860px; color: var(--ink-2); font-size: 15px; margin: 0 0 24px; }
 .policy-panel { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--rad-lg); padding: 20px; margin: 18px 0; }
 .policy-panel h2 { font-family: var(--serif); font-size: var(--text-xl); font-weight: 400; margin: 0 0 14px; }
+.recommendation-list { display: grid; gap: var(--space-2); }
+.recommendation-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-3); align-items: center; border: 1px solid var(--rule); border-radius: var(--rad); padding: var(--space-3); background: var(--surface); }
+.recommendation-row h3 { margin: 0 0 4px; font-size: var(--text-base); }
+.recommendation-row p { margin: 0; color: var(--ink-3); font-size: var(--text-sm); }
+.recommendation-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); justify-content: flex-end; }
+.recommendation-stats { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .template-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); }
 .template-card { background: var(--surface-2); border: 1px solid var(--rule); border-radius: var(--rad); padding: 14px; min-height: 132px; }
 .template-card-head { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); margin-bottom: 12px; }
@@ -1222,6 +1228,7 @@ const NAV_ITEMS: Array<{ id: string; label: string }> = [
   { id: "dashboard", label: "Dashboard" },
   { id: "agents", label: "Agents" },
   { id: "policy", label: "Policy" },
+  { id: "auto-trigger", label: "Auto-trigger" },
   { id: "intelligence", label: "Intelligence" },
   { id: "attestation", label: "Attestation" },
   { id: "honeypot", label: "Honeypots" },
@@ -1246,6 +1253,8 @@ const NAV_ICON_PATHS: Record<string, string> = {
     '<circle cx="6" cy="5.5" r="2.3"/><path d="M2 13.5c0-2.2 1.8-4 4-4s4 1.8 4 4"/><circle cx="11.5" cy="6" r="1.8"/><path d="M14 12.5c0-1.7-1.1-2.7-2.5-3"/>',
   policy:
     '<path d="M4 2h5l3 3v9H4z"/><path d="M9 2v3h3"/><path d="M6 9h4M6 11.5h4"/>',
+  "auto-trigger":
+    '<path d="M3 12V4l5-2 5 2v8l-5 2z"/><path d="M8 5v3l2 1"/>',
   intelligence:
     '<rect x="3.5" y="3.5" width="9" height="9" rx="0.5"/><rect x="6" y="6" width="4" height="4"/><path d="M6 1.5v2M10 1.5v2M6 12.5v2M10 12.5v2M1.5 6h2M1.5 10h2M12.5 6h2M12.5 10h2"/>',
   attestation:

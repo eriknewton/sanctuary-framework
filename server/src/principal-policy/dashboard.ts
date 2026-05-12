@@ -67,6 +67,13 @@ import {
   handleHoneypotTriggerIfMatch,
 } from "../honeypot/runtime-trap-handler.js";
 import type { SentinelFindingStore } from "../sentinel/sentinel-finding-store.js";
+import {
+  AUTO_TRIGGER_API_PREFIX,
+  handleAutoTriggerRoute,
+} from "../auto-trigger/auto-trigger-routes.js";
+import type { ThresholdConfigStore } from "../auto-trigger/threshold-config-store.js";
+import type { ActionDispatcher } from "../auto-trigger/action-dispatcher.js";
+import type { CalibrationSuggester } from "../auto-trigger/calibration-suggester.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -250,6 +257,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private honeypotToolCallRuntime:
     | import("../honeypot/tool-call-trap-runtime.js").ToolCallTrapRuntime
     | null = null;
+  private autoTriggerStore: ThresholdConfigStore | null = null;
+  private autoTriggerDispatcher: ActionDispatcher | null = null;
+  private autoTriggerSuggester: CalibrationSuggester | null = null;
 
   constructor(config: DashboardConfig) {
     this.config = config;
@@ -413,6 +423,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * v1.3 WP-V1.3-7 Nu-3 Auto-Trigger recommendation surface. Mounted
+   * additively at `/api/auto-trigger/*`; the scheduled suggester only
+   * emits read-only recommendations. Accept/reject routes are explicit
+   * operator actions.
+   */
+  setAutoTrigger(opts: {
+    store: ThresholdConfigStore | null;
+    dispatcher?: ActionDispatcher | null;
+    suggester?: CalibrationSuggester | null;
+  }): void {
+    this.autoTriggerStore = opts.store;
+    this.autoTriggerDispatcher = opts.dispatcher ?? null;
+    this.autoTriggerSuggester = opts.suggester ?? null;
+  }
+
+  /**
    * v1.3 WP-V1.3-10 dispatch entry point. Called from `handleRequest`
    * before the legacy approval route table. Returns true when served.
    */
@@ -452,6 +478,28 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
         },
         dispatcher: this.sentinelDispatcher,
+      },
+      req,
+      res,
+    );
+  }
+
+  private async dispatchAutoTrigger(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<boolean> {
+    if (!this.autoTriggerStore || !this.autoTriggerDispatcher) return false;
+    return handleAutoTriggerRoute(
+      {
+        authConfig: {
+          loopbackAutoAuth: this._autoAuthLocalhost,
+          ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
+        },
+        store: this.autoTriggerStore,
+        dispatcher: this.autoTriggerDispatcher,
+        ...(this.autoTriggerSuggester
+          ? { suggester: this.autoTriggerSuggester }
+          : {}),
       },
       req,
       res,
@@ -1115,6 +1163,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       url.pathname.startsWith(APPROVAL_INBOX_API_PREFIX)
     ) {
       this.dispatchApprovalInbox(req, res)
+        .then((handled) => {
+          if (handled) return;
+          this.handleLegacyRequest(req, res, url, method);
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+      return;
+    }
+
+    if (
+      this.autoTriggerStore &&
+      this.autoTriggerDispatcher &&
+      url.pathname.startsWith(AUTO_TRIGGER_API_PREFIX)
+    ) {
+      this.dispatchAutoTrigger(req, res)
         .then((handled) => {
           if (handled) return;
           this.handleLegacyRequest(req, res, url, method);

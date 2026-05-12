@@ -204,6 +204,7 @@ export class ThresholdConfigStore {
     patch: {
       threshold_overrides?: ThresholdOverrides;
       cancel_window_seconds?: number;
+      recommendation_suppressed_until?: string | null;
     },
   ): Promise<RuleThresholdConfig> {
     const config = await this.getOrInit(ruleId, ruleType);
@@ -214,8 +215,27 @@ export class ThresholdConfigStore {
       cancel_window_seconds:
         patch.cancel_window_seconds ?? config.cancel_window_seconds,
     };
+    if (patch.recommendation_suppressed_until !== undefined) {
+      if (patch.recommendation_suppressed_until === null) {
+        delete next.recommendation_suppressed_until;
+      } else {
+        next.recommendation_suppressed_until =
+          patch.recommendation_suppressed_until;
+      }
+    }
     await this.set(next);
     return next;
+  }
+
+  /** Set or clear a per-rule recommendation suppression timestamp. */
+  async suppressRecommendation(
+    ruleId: string,
+    ruleType: AutoTriggerRuleType,
+    suppressedUntil: string | null,
+  ): Promise<RuleThresholdConfig> {
+    return this.updateConfig(ruleId, ruleType, {
+      recommendation_suppressed_until: suppressedUntil,
+    });
   }
 
   /**

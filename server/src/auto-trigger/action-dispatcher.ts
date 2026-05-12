@@ -65,6 +65,12 @@ export const AUTO_TRIGGER_AUDIT_OPS = {
   ACTION_PROCEEDED: "auto_action_proceeded",
   /** Operator revoked a past rung-3 (or post-window rung-2) action. */
   ACTION_REVOKED: "auto_action_revoked",
+  /** Nu-3: calibration assistant surfaced a promotion or demotion suggestion. */
+  RECOMMENDATION_GENERATED: "auto_trigger_recommendation_generated",
+  /** Nu-3: operator accepted a recommendation and then changed the rung. */
+  RECOMMENDATION_ACCEPTED: "auto_trigger_recommendation_accepted",
+  /** Nu-3: operator rejected a recommendation and started a cool-down. */
+  RECOMMENDATION_REJECTED: "auto_trigger_recommendation_rejected",
 } as const;
 
 export type AutoTriggerAuditOp =
