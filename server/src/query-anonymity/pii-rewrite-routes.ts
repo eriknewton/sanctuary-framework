@@ -16,7 +16,8 @@
  *
  *   PATCH /api/query-anonymity/pii/config
  *       Update config. Body JSON:
- *         { enabled?: boolean, consented_to_trade_off?: boolean }
+ *         { enabled?: boolean, smart_mode_enabled?: boolean,
+ *           consented_to_trade_off?: boolean }
  *       Refuses (409 consent_required) if asking for enabled=true
  *       without consent_to_trade_off=true in the merged result.
  *
@@ -154,6 +155,7 @@ export async function handlePiiRewriteRoute(
       const body = (await readBody(req)) as
         | {
             enabled?: unknown;
+            smart_mode_enabled?: unknown;
             consented_to_trade_off?: unknown;
           }
         | null;
@@ -161,13 +163,17 @@ export async function handlePiiRewriteRoute(
       if (body && typeof body.enabled === "boolean") {
         patch.enabled = body.enabled;
       }
+      if (body && typeof body.smart_mode_enabled === "boolean") {
+        patch.smart_mode_enabled = body.smart_mode_enabled;
+      }
       if (body && typeof body.consented_to_trade_off === "boolean") {
         patch.consented_to_trade_off = body.consented_to_trade_off;
       }
       if (Object.keys(patch).length === 0) {
         writeJSON(res, 400, {
           ok: false,
-          error: "patch must include enabled and/or consented_to_trade_off",
+          error:
+            "patch must include enabled, smart_mode_enabled, and/or consented_to_trade_off",
         });
         return true;
       }
@@ -200,6 +206,9 @@ export async function handlePiiRewriteRoute(
           {
             fortress_id: deps.fortressId,
             enabled: updated.enabled,
+            smart_mode_enabled: updated.smart_mode_enabled,
+            effective_tier_b_enabled:
+              updated.enabled || updated.smart_mode_enabled,
             consented_to_trade_off: updated.consented_to_trade_off,
             updated_at: updated.updated_at,
           },
