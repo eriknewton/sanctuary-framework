@@ -41,9 +41,16 @@ import { getOrCreatePassphrase } from "../cocoon/passphrase.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 
 import { ThresholdConfigStore } from "../auto-trigger/threshold-config-store.js";
+import { AuditLog } from "../l2-operational/audit-log.js";
+import {
+  ActionDispatcher,
+  NotifyOperatorAction,
+} from "../auto-trigger/action-dispatcher.js";
+import { CalibrationSuggester } from "../auto-trigger/calibration-suggester.js";
 import {
   AutoTriggerError,
   type AutoTriggerRuleType,
+  type ThresholdOverrides,
 } from "../auto-trigger/types.js";
 
 export interface AutoTriggerArgs {
@@ -70,6 +77,8 @@ export async function runAutoTriggerCommand(
     switch (sub) {
       case "rules":
         return await cmdRules(rest, { out, err, args });
+      case "recommendations":
+        return await cmdRecommendations(rest, { out, err, args });
       case "cancel":
         return await cmdCancel(rest, { out, err });
       default:
@@ -93,7 +102,14 @@ function printUsage(s: NodeJS.WritableStream): void {
   rules demote <rule_id> --rule-type <t>    Rung N -> N-1.
   rules set-threshold <rule_id> --rule-type <t>
     [--warn-sigma <n>] [--alert-sigma <n>]
+    [--promotion-fire-count <n>] [--promotion-window-days <n>]
+    [--demotion-cancel-count <n>]
     [--cancel-window <s>]                   Update overrides + window.
+  recommendations list                      List active recommendations.
+  recommendations show <rule_id>            Show a rule recommendation.
+  recommendations accept <rule_id>          Apply operator-accepted change.
+  recommendations reject <rule_id>          Suppress for 24h.
+    [--cooldown-hours <n>]
   cancel <finding_id>                       Cancel a pending rung-2
                                             action (HTTP-delegated to
                                             the local dashboard).
@@ -102,6 +118,87 @@ Rule types: sentinel | anomaly | honeypot
 
 Env (for cancel): SANCTUARY_DASHBOARD_URL, SANCTUARY_DASHBOARD_AUTH_TOKEN
 `);
+}
+
+async function cmdRecommendations(
+  argv: string[],
+  ctx: {
+    out: NodeJS.WritableStream;
+    err: NodeJS.WritableStream;
+    args: AutoTriggerArgs;
+  },
+): Promise<number> {
+  const sub = argv[0];
+  if (!sub) {
+    ctx.err.write("recommendations subcommand required\n");
+    return 2;
+  }
+  const { suggester } = await openCalibration(ctx.args);
+  switch (sub) {
+    case "list": {
+      const recs = await suggester.listRecommendations({
+        includeSuppressed: true,
+      });
+      if (recs.length === 0) {
+        ctx.out.write("(no active auto-trigger recommendations)\n");
+        return 0;
+      }
+      for (const rec of recs) {
+        const suppressed = rec.suppressed_until
+          ? ` suppressed-until=${rec.suppressed_until}`
+          : "";
+        ctx.out.write(
+          `${rec.rule_id} [type: ${rec.rule_type}] ${rec.current_rung}->${rec.recommended_rung} confidence=${rec.confidence}${suppressed}\n`,
+        );
+      }
+      return 0;
+    }
+    case "show": {
+      const ruleId = argv[1];
+      if (!ruleId) {
+        ctx.err.write("recommendations show requires a rule_id\n");
+        return 2;
+      }
+      const rec = await suggester.getRecommendation(ruleId, {
+        includeSuppressed: true,
+        includeNoChange: true,
+      });
+      if (!rec) {
+        ctx.err.write(`rule not found: ${ruleId}\n`);
+        return 1;
+      }
+      ctx.out.write(JSON.stringify(rec, null, 2) + "\n");
+      return 0;
+    }
+    case "accept": {
+      const ruleId = argv[1];
+      if (!ruleId) {
+        ctx.err.write("recommendations accept requires a rule_id\n");
+        return 2;
+      }
+      const result = await suggester.acceptRecommendation(ruleId);
+      ctx.out.write(
+        `Accepted ${ruleId}: rung ${result.recommendation.current_rung} -> ${result.recommendation.recommended_rung}\n`,
+      );
+      return 0;
+    }
+    case "reject": {
+      const ruleId = argv[1];
+      if (!ruleId) {
+        ctx.err.write("recommendations reject requires a rule_id\n");
+        return 2;
+      }
+      const cooldown = parseNumberFlag(argv, "--cooldown-hours");
+      const result = await suggester.rejectRecommendation(ruleId, cooldown);
+      ctx.out.write(
+        `Rejected ${ruleId}: suppressed until ${result.suppressed_until}\n`,
+      );
+      return 0;
+    }
+    default:
+      ctx.err.write(`Unknown recommendations subcommand: ${sub}\n`);
+      return 2;
+  }
 }
 
 async function cmdRules(
@@ -271,10 +368,22 @@ async function cmdRulesSetThreshold(
   }
   const warnSigma = parseNumberFlag(argv, "--warn-sigma");
   const alertSigma = parseNumberFlag(argv, "--alert-sigma");
+  const promotionFireCount = parseNumberFlag(argv, "--promotion-fire-count");
+  const promotionWindowDays = parseNumberFlag(argv, "--promotion-window-days");
+  const demotionCancelCount = parseNumberFlag(argv, "--demotion-cancel-count");
   const cancelWindow = parseNumberFlag(argv, "--cancel-window");
-  const overrides: { warn_sigma?: number; alert_sigma?: number } = {};
+  const overrides: ThresholdOverrides = {};
   if (warnSigma !== undefined) overrides.warn_sigma = warnSigma;
   if (alertSigma !== undefined) overrides.alert_sigma = alertSigma;
+  if (promotionFireCount !== undefined) {
+    overrides.promotion_fire_count = Math.floor(promotionFireCount);
+  }
+  if (promotionWindowDays !== undefined) {
+    overrides.promotion_window_days = Math.floor(promotionWindowDays);
+  }
+  if (demotionCancelCount !== undefined) {
+    overrides.demotion_cancel_count = Math.floor(demotionCancelCount);
+  }
   if (
     Object.keys(overrides).length === 0 &&
     cancelWindow === undefined
@@ -368,7 +477,12 @@ async function resolveStoragePath(args: AutoTriggerArgs): Promise<string> {
 
 async function openStore(
   args: AutoTriggerArgs,
-): Promise<{ store: ThresholdConfigStore }> {
+): Promise<{
+  store: ThresholdConfigStore;
+  storage: FilesystemStorage;
+  masterKey: Uint8Array;
+  fortressId: string;
+}> {
   const storagePath = await resolveStoragePath(args);
   const storage = new FilesystemStorage(`${storagePath}/state`);
   let passphrase = args.passphrase ?? process.env["SANCTUARY_PASSPHRASE"];
@@ -400,5 +514,30 @@ async function openStore(
     masterKey,
     fortressId,
   });
-  return { store };
+  return { store, storage, masterKey, fortressId };
+}
+
+async function openCalibration(
+  args: AutoTriggerArgs,
+): Promise<{ suggester: CalibrationSuggester }> {
+  const { store, storage, masterKey, fortressId } = await openStore(args);
+  const auditLog = new AuditLog(storage, masterKey);
+  const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
+  const action = new NotifyOperatorAction(auditLog, identityId, fortressId);
+  const dispatcher = new ActionDispatcher({
+    store,
+    action,
+    auditLog,
+    fortressId,
+    identityId,
+  });
+  const suggester = new CalibrationSuggester({
+    store,
+    dispatcher,
+    auditLog,
+    fortressId,
+    identityId,
+    tickIntervalMs: 0,
+  });
+  return { suggester };
 }

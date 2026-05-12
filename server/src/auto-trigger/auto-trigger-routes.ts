@@ -46,6 +46,7 @@ import {
 import {
   ActionDispatcher,
 } from "./action-dispatcher.js";
+import type { CalibrationSuggester } from "./calibration-suggester.js";
 import type { ThresholdConfigStore } from "./threshold-config-store.js";
 import {
   AutoTriggerError,
@@ -62,6 +63,7 @@ export interface AutoTriggerRouterDeps {
   authConfig: AuthConfig;
   store: ThresholdConfigStore;
   dispatcher: ActionDispatcher;
+  suggester?: CalibrationSuggester;
 }
 
 function writeJSON(
@@ -149,6 +151,42 @@ function matchRuleDemoteRoute(path: string): { ruleId: string } | null {
   return { ruleId: decodeURIComponent(ruleId) };
 }
 
+function matchRuleRecommendationRoute(
+  path: string,
+): { ruleId: string } | null {
+  const prefix = `${AUTO_TRIGGER_API_PREFIX}/rules/`;
+  if (!path.startsWith(prefix)) return null;
+  const rest = path.slice(prefix.length);
+  if (!rest.endsWith("/recommendation")) return null;
+  const ruleId = rest.slice(0, rest.length - "/recommendation".length);
+  if (ruleId.length === 0 || ruleId.includes("/")) return null;
+  return { ruleId: decodeURIComponent(ruleId) };
+}
+
+function matchAcceptRecommendationRoute(
+  path: string,
+): { ruleId: string } | null {
+  const prefix = `${AUTO_TRIGGER_API_PREFIX}/rules/`;
+  if (!path.startsWith(prefix)) return null;
+  const rest = path.slice(prefix.length);
+  if (!rest.endsWith("/accept-recommendation")) return null;
+  const ruleId = rest.slice(0, rest.length - "/accept-recommendation".length);
+  if (ruleId.length === 0 || ruleId.includes("/")) return null;
+  return { ruleId: decodeURIComponent(ruleId) };
+}
+
+function matchRejectRecommendationRoute(
+  path: string,
+): { ruleId: string } | null {
+  const prefix = `${AUTO_TRIGGER_API_PREFIX}/rules/`;
+  if (!path.startsWith(prefix)) return null;
+  const rest = path.slice(prefix.length);
+  if (!rest.endsWith("/reject-recommendation")) return null;
+  const ruleId = rest.slice(0, rest.length - "/reject-recommendation".length);
+  if (ruleId.length === 0 || ruleId.includes("/")) return null;
+  return { ruleId: decodeURIComponent(ruleId) };
+}
+
 function matchCancelRoute(path: string): { findingId: string } | null {
   const prefix = `${AUTO_TRIGGER_API_PREFIX}/cancel/`;
   if (!path.startsWith(prefix)) return null;
@@ -193,6 +231,44 @@ export async function handleAutoTriggerRoute(
       }
       writeJSON(res, 200, { ok: true, data: { rules } });
       return true;
+    }
+
+    // GET /api/auto-trigger/recommendations
+    if (
+      method === "GET" &&
+      path === `${AUTO_TRIGGER_API_PREFIX}/recommendations`
+    ) {
+      if (!deps.suggester) {
+        writeJSON(res, 503, { ok: false, error: "suggester_not_configured" });
+        return true;
+      }
+      const recommendations = await deps.suggester.listRecommendations({
+        includeSuppressed: true,
+        includeNoChange: false,
+      });
+      writeJSON(res, 200, { ok: true, data: { recommendations } });
+      return true;
+    }
+
+    // GET /api/auto-trigger/rules/:rule_id/recommendation
+    if (method === "GET") {
+      const match = matchRuleRecommendationRoute(path);
+      if (match) {
+        if (!deps.suggester) {
+          writeJSON(res, 503, { ok: false, error: "suggester_not_configured" });
+          return true;
+        }
+        const recommendation = await deps.suggester.getRecommendation(
+          match.ruleId,
+          { includeSuppressed: true, includeNoChange: true },
+        );
+        if (!recommendation) {
+          writeJSON(res, 404, { ok: false, error: "rule_not_found" });
+          return true;
+        }
+        writeJSON(res, 200, { ok: true, data: { recommendation } });
+        return true;
+      }
     }
 
     // GET /api/auto-trigger/rules/:rule_id
@@ -298,6 +374,51 @@ export async function handleAutoTriggerRoute(
         return true;
       }
 
+      const acceptRecommendation = matchAcceptRecommendationRoute(path);
+      if (acceptRecommendation) {
+        if (!deps.suggester) {
+          writeJSON(res, 503, { ok: false, error: "suggester_not_configured" });
+          return true;
+        }
+        try {
+          const accepted = await deps.suggester.acceptRecommendation(
+            acceptRecommendation.ruleId,
+          );
+          writeJSON(res, 200, { ok: true, data: accepted });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          writeJSON(res, 404, { ok: false, error: "recommendation_not_found", message: msg });
+        }
+        return true;
+      }
+
+      const rejectRecommendation = matchRejectRecommendationRoute(path);
+      if (rejectRecommendation) {
+        if (!deps.suggester) {
+          writeJSON(res, 503, { ok: false, error: "suggester_not_configured" });
+          return true;
+        }
+        const body = (await readBody(req)) as
+          | { cooldown_hours?: unknown }
+          | null;
+        const cooldownHours =
+          typeof body?.cooldown_hours === "number" &&
+          Number.isFinite(body.cooldown_hours)
+            ? body.cooldown_hours
+            : undefined;
+        try {
+          const rejected = await deps.suggester.rejectRecommendation(
+            rejectRecommendation.ruleId,
+            cooldownHours,
+          );
+          writeJSON(res, 200, { ok: true, data: rejected });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          writeJSON(res, 404, { ok: false, error: "rule_not_found", message: msg });
+        }
+        return true;
+      }
+
       // POST /api/auto-trigger/cancel/:finding_id
       const cancel = matchCancelRoute(path);
       if (cancel) {
@@ -333,6 +454,27 @@ function sanitizeOverrides(raw: unknown): ThresholdOverrides | null {
     Number.isFinite(obj["alert_sigma"])
   ) {
     out.alert_sigma = obj["alert_sigma"];
+  }
+  if (
+    typeof obj["promotion_fire_count"] === "number" &&
+    Number.isFinite(obj["promotion_fire_count"]) &&
+    obj["promotion_fire_count"] >= 1
+  ) {
+    out.promotion_fire_count = Math.floor(obj["promotion_fire_count"]);
+  }
+  if (
+    typeof obj["promotion_window_days"] === "number" &&
+    Number.isFinite(obj["promotion_window_days"]) &&
+    obj["promotion_window_days"] >= 1
+  ) {
+    out.promotion_window_days = Math.floor(obj["promotion_window_days"]);
+  }
+  if (
+    typeof obj["demotion_cancel_count"] === "number" &&
+    Number.isFinite(obj["demotion_cancel_count"]) &&
+    obj["demotion_cancel_count"] >= 1
+  ) {
+    out.demotion_cancel_count = Math.floor(obj["demotion_cancel_count"]);
   }
   return out;
 }

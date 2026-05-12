@@ -47,6 +47,10 @@ import {
   AUTO_TRIGGER_AUDIT_OPS,
   deriveRuleId,
 } from "../../src/auto-trigger/action-dispatcher.js";
+import { CalibrationSuggester } from "../../src/auto-trigger/calibration-suggester.js";
+import {
+  evaluatePromotion,
+} from "../../src/auto-trigger/promotion-criteria.js";
 import {
   ThresholdConfigStore,
   AUTO_TRIGGER_RULES_NAMESPACE,
@@ -133,7 +137,44 @@ function makeRig(opts?: { fortressId?: string }) {
     identityId: IDENTITY,
     schedule: scheduler.schedule,
   });
-  return { storage, masterKey, auditLog, store, dispatcher, scheduler, fortressId };
+  const suggester = new CalibrationSuggester({
+    store,
+    dispatcher,
+    auditLog,
+    fortressId,
+    identityId: IDENTITY,
+    tickIntervalMs: 0,
+  });
+  return { storage, masterKey, auditLog, store, dispatcher, scheduler, fortressId, suggester };
+}
+
+const FIXED_NOW = new Date("2026-05-09T12:00:00.000Z");
+
+function historyEntries(
+  count: number,
+  opts: {
+    rung: 1 | 2 | 3;
+    outcome: ActionHistoryEntry["outcome"];
+    daysBack?: number;
+    prefix?: string;
+  },
+): ActionHistoryEntry[] {
+  const observed = new Date(
+    FIXED_NOW.getTime() - (opts.daysBack ?? 1) * 86_400_000,
+  ).toISOString();
+  return Array.from({ length: count }, (_, i) => ({
+    observed_at: observed,
+    rung_at_action: opts.rung,
+    action_type:
+      opts.rung === 1
+        ? "inbox_only"
+        : opts.rung === 2
+          ? "auto_with_cancel"
+          : "auto_immediate",
+    outcome: opts.outcome,
+    finding_id: `${opts.prefix ?? "f"}-${i}`,
+    severity: "warn",
+  }));
 }
 
 function makeFinding(
@@ -523,6 +564,265 @@ describe("Nu-1: ActionDispatcher routing per rung", () => {
   });
 });
 
+describe("Nu-3: auto-promotion criteria and calibration suggester", () => {
+  it("rung 1 -> 2 recommends after 20 fires with 100 percent approval", () => {
+    const rec = evaluatePromotion(
+      "r1",
+      historyEntries(20, { rung: 1, outcome: "operator_approved" }),
+      7,
+      { currentRung: 1, now: () => FIXED_NOW },
+    );
+    expect(rec.recommended_rung).toBe(2);
+    expect(rec.confidence).toBe("high");
+    expect(rec.history_summary.operator_approval_rate).toBe(1);
+  });
+
+  it("rung 1 -> 2 stays put below the fire threshold", () => {
+    const rec = evaluatePromotion(
+      "r1",
+      historyEntries(19, { rung: 1, outcome: "operator_approved" }),
+      7,
+      { currentRung: 1, now: () => FIXED_NOW },
+    );
+    expect(rec.recommended_rung).toBe(1);
+  });
+
+  it("rung 1 -> 2 respects the evaluation window", () => {
+    const old = historyEntries(20, {
+      rung: 1,
+      outcome: "operator_approved",
+      daysBack: 9,
+    });
+    const rec = evaluatePromotion("r1", old, 7, {
+      currentRung: 1,
+      now: () => FIXED_NOW,
+    });
+    expect(rec.history_summary.fires_in_window).toBe(0);
+    expect(rec.recommended_rung).toBe(1);
+  });
+
+  it("rung 2 -> 3 recommends after clean cancel-window history", () => {
+    const rec = evaluatePromotion(
+      "r2",
+      historyEntries(20, { rung: 2, outcome: "auto_proceeded" }),
+      7,
+      { currentRung: 2, now: () => FIXED_NOW },
+    );
+    expect(rec.recommended_rung).toBe(3);
+    expect(rec.history_summary.operator_cancel_rate).toBe(0);
+  });
+
+  it("rung 2 -> 3 is blocked by one cancellation", () => {
+    const history = [
+      ...historyEntries(19, { rung: 2, outcome: "auto_proceeded" }),
+      ...historyEntries(1, { rung: 2, outcome: "operator_canceled", prefix: "c" }),
+    ];
+    const rec = evaluatePromotion("r2", history, 7, {
+      currentRung: 2,
+      now: () => FIXED_NOW,
+    });
+    expect(rec.recommended_rung).toBe(2);
+  });
+
+  it("rung 2 -> 3 is blocked by operator revocation activity", () => {
+    const history = [
+      ...historyEntries(20, { rung: 2, outcome: "auto_proceeded" }),
+      ...historyEntries(1, { rung: 3, outcome: "operator_revoked", prefix: "rv" }),
+    ];
+    const rec = evaluatePromotion("r2", history, 7, {
+      currentRung: 2,
+      now: () => FIXED_NOW,
+    });
+    expect(rec.recommended_rung).toBe(2);
+  });
+
+  it("rung 3 revocation recommends demotion to rung 2", () => {
+    const rec = evaluatePromotion(
+      "r3",
+      historyEntries(1, { rung: 3, outcome: "operator_revoked" }),
+      7,
+      { currentRung: 3, now: () => FIXED_NOW },
+    );
+    expect(rec.recommended_rung).toBe(2);
+  });
+
+  it("rung 2 repeated cancellation recommends demotion to rung 1", () => {
+    const rec = evaluatePromotion(
+      "r2",
+      historyEntries(2, { rung: 2, outcome: "operator_canceled" }),
+      7,
+      { currentRung: 2, now: () => FIXED_NOW },
+    );
+    expect(rec.recommended_rung).toBe(1);
+  });
+
+  it("operator-tunable fire-count override lowers promotion threshold", async () => {
+    const rig = makeRig();
+    await rig.store.set({
+      ...defaultRuleConfig("override-fire", "sentinel", FORTRESS_A, () => FIXED_NOW),
+      threshold_overrides: { promotion_fire_count: 3 },
+      history: historyEntries(3, { rung: 1, outcome: "operator_approved" }),
+    });
+    const suggester = new CalibrationSuggester({
+      store: rig.store,
+      dispatcher: rig.dispatcher,
+      auditLog: rig.auditLog,
+      fortressId: FORTRESS_A,
+      identityId: IDENTITY,
+      now: () => FIXED_NOW,
+      tickIntervalMs: 0,
+    });
+    const rec = await suggester.getRecommendation("override-fire");
+    expect(rec?.recommended_rung).toBe(2);
+  });
+
+  it("operator-tunable window override includes older qualifying history", async () => {
+    const rig = makeRig();
+    await rig.store.set({
+      ...defaultRuleConfig("override-window", "sentinel", FORTRESS_A, () => FIXED_NOW),
+      threshold_overrides: { promotion_fire_count: 3, promotion_window_days: 10 },
+      history: historyEntries(3, {
+        rung: 1,
+        outcome: "operator_approved",
+        daysBack: 9,
+      }),
+    });
+    const suggester = new CalibrationSuggester({
+      store: rig.store,
+      dispatcher: rig.dispatcher,
+      auditLog: rig.auditLog,
+      fortressId: FORTRESS_A,
+      identityId: IDENTITY,
+      now: () => FIXED_NOW,
+      tickIntervalMs: 0,
+    });
+    const rec = await suggester.getRecommendation("override-window");
+    expect(rec?.history_summary.fires_in_window).toBe(3);
+    expect(rec?.recommended_rung).toBe(2);
+  });
+
+  it("scheduled tick never auto-promotes without operator acceptance", async () => {
+    const rig = makeRig();
+    await rig.store.set({
+      ...defaultRuleConfig("no-auto", "sentinel", FORTRESS_A, () => FIXED_NOW),
+      history: historyEntries(20, { rung: 1, outcome: "operator_approved" }),
+    });
+    const suggester = new CalibrationSuggester({
+      store: rig.store,
+      dispatcher: rig.dispatcher,
+      auditLog: rig.auditLog,
+      fortressId: FORTRESS_A,
+      identityId: IDENTITY,
+      now: () => FIXED_NOW,
+      tickIntervalMs: 0,
+    });
+    await suggester.tick();
+    const config = await rig.store.get("no-auto");
+    expect(config?.current_rung).toBe(1);
+  });
+
+  it("acceptRecommendation is the explicit operator path that changes rung", async () => {
+    const rig = makeRig();
+    await rig.store.set({
+      ...defaultRuleConfig("accept-me", "sentinel", FORTRESS_A, () => FIXED_NOW),
+      history: historyEntries(20, { rung: 1, outcome: "operator_approved" }),
+    });
+    const suggester = new CalibrationSuggester({
+      store: rig.store,
+      dispatcher: rig.dispatcher,
+      auditLog: rig.auditLog,
+      fortressId: FORTRESS_A,
+      identityId: IDENTITY,
+      now: () => FIXED_NOW,
+      tickIntervalMs: 0,
+    });
+    await suggester.acceptRecommendation("accept-me");
+    const config = await rig.store.get("accept-me");
+    expect(config?.current_rung).toBe(2);
+  });
+
+  it("rejectRecommendation suppresses re-recommendation for the default cool-down", async () => {
+    const rig = makeRig();
+    await rig.store.set({
+      ...defaultRuleConfig("reject-me", "sentinel", FORTRESS_A, () => FIXED_NOW),
+      history: historyEntries(20, { rung: 1, outcome: "operator_approved" }),
+    });
+    const suggester = new CalibrationSuggester({
+      store: rig.store,
+      dispatcher: rig.dispatcher,
+      auditLog: rig.auditLog,
+      fortressId: FORTRESS_A,
+      identityId: IDENTITY,
+      now: () => FIXED_NOW,
+      tickIntervalMs: 0,
+    });
+    await suggester.rejectRecommendation("reject-me");
+    expect(await suggester.getRecommendation("reject-me")).toBeNull();
+    const shown = await suggester.getRecommendation("reject-me", {
+      includeSuppressed: true,
+    });
+    expect(shown?.suppressed_until).toBeDefined();
+  });
+
+  it("multi-fortress isolation keeps recommendations scoped to each store", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const storeA = new ThresholdConfigStore({ storage, masterKey, fortressId: FORTRESS_A });
+    const storeB = new ThresholdConfigStore({ storage, masterKey, fortressId: FORTRESS_B });
+    await storeA.set({
+      ...defaultRuleConfig("shared", "sentinel", FORTRESS_A, () => FIXED_NOW),
+      history: historyEntries(20, { rung: 1, outcome: "operator_approved" }),
+    });
+    expect(await storeB.get("shared")).toBeNull();
+  });
+
+  it("tick emits auto_trigger_recommendation_generated audit", async () => {
+    const rig = makeRig();
+    await rig.store.set({
+      ...defaultRuleConfig("audit-generated", "sentinel", FORTRESS_A, () => FIXED_NOW),
+      history: historyEntries(20, { rung: 1, outcome: "operator_approved" }),
+    });
+    await new CalibrationSuggester({
+      store: rig.store,
+      dispatcher: rig.dispatcher,
+      auditLog: rig.auditLog,
+      fortressId: FORTRESS_A,
+      identityId: IDENTITY,
+      now: () => FIXED_NOW,
+      tickIntervalMs: 0,
+    }).tick();
+    const audit = await rig.auditLog.query({ layer: "l2", limit: 50 });
+    expect(audit.entries.some((e) => e.operation === AUTO_TRIGGER_AUDIT_OPS.RECOMMENDATION_GENERATED)).toBe(true);
+  });
+
+  it("accept emits auto_trigger_recommendation_accepted audit", async () => {
+    const rig = makeRig();
+    await rig.store.set({
+      ...defaultRuleConfig("audit-accepted", "sentinel", FORTRESS_A, () => FIXED_NOW),
+      history: historyEntries(20, { rung: 1, outcome: "operator_approved" }),
+    });
+    await new CalibrationSuggester({
+      store: rig.store,
+      dispatcher: rig.dispatcher,
+      auditLog: rig.auditLog,
+      fortressId: FORTRESS_A,
+      identityId: IDENTITY,
+      now: () => FIXED_NOW,
+      tickIntervalMs: 0,
+    }).acceptRecommendation("audit-accepted");
+    const audit = await rig.auditLog.query({ layer: "l2", limit: 50 });
+    expect(audit.entries.some((e) => e.operation === AUTO_TRIGGER_AUDIT_OPS.RECOMMENDATION_ACCEPTED)).toBe(true);
+  });
+
+  it("reject emits auto_trigger_recommendation_rejected audit", async () => {
+    const rig = makeRig();
+    await rig.store.set(defaultRuleConfig("audit-rejected", "sentinel", FORTRESS_A, () => FIXED_NOW));
+    await rig.suggester.rejectRecommendation("audit-rejected");
+    const audit = await rig.auditLog.query({ layer: "l2", limit: 50 });
+    expect(audit.entries.some((e) => e.operation === AUTO_TRIGGER_AUDIT_OPS.RECOMMENDATION_REJECTED)).toBe(true);
+  });
+});
+
 describe("Nu-1: HTTP routes", () => {
   async function makeServer(rig: ReturnType<typeof makeRig>): Promise<{
     base: string;
@@ -534,6 +834,7 @@ describe("Nu-1: HTTP routes", () => {
           authConfig: { loopbackAutoAuth: true },
           store: rig.store,
           dispatcher: rig.dispatcher,
+          suggester: rig.suggester,
         },
         req,
         res,
@@ -723,6 +1024,52 @@ describe("Nu-1: HTTP routes", () => {
         `${base}${AUTO_TRIGGER_API_PREFIX}/rules/does-not-exist`,
       );
       expect(missing.status).toBe(404);
+    } finally {
+      await close();
+    }
+  });
+
+  it("recommendation routes list, show, accept, and reject through operator endpoints", async () => {
+    const rig = makeRig();
+    await rig.store.set({
+      ...defaultRuleConfig("http-rec", "sentinel", FORTRESS_A, () => FIXED_NOW),
+      history: historyEntries(20, { rung: 1, outcome: "operator_approved" }),
+    });
+    const { base, close } = await makeServer(rig);
+    try {
+      const list = await fetch(`${base}${AUTO_TRIGGER_API_PREFIX}/recommendations`);
+      expect(list.status).toBe(200);
+      const listBody = (await list.json()) as {
+        data: { recommendations: Array<{ rule_id: string }> };
+      };
+      expect(listBody.data.recommendations[0]?.rule_id).toBe("http-rec");
+
+      const show = await fetch(
+        `${base}${AUTO_TRIGGER_API_PREFIX}/rules/http-rec/recommendation`,
+      );
+      expect(show.status).toBe(200);
+
+      const accept = await fetch(
+        `${base}${AUTO_TRIGGER_API_PREFIX}/rules/http-rec/accept-recommendation`,
+        { method: "POST" },
+      );
+      expect(accept.status).toBe(200);
+      expect((await rig.store.get("http-rec"))?.current_rung).toBe(2);
+
+      await rig.store.set({
+        ...defaultRuleConfig("http-reject", "sentinel", FORTRESS_A, () => FIXED_NOW),
+        history: historyEntries(20, { rung: 1, outcome: "operator_approved" }),
+      });
+      const reject = await fetch(
+        `${base}${AUTO_TRIGGER_API_PREFIX}/rules/http-reject/reject-recommendation`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cooldown_hours: 24 }),
+        },
+      );
+      expect(reject.status).toBe(200);
+      expect((await rig.store.get("http-reject"))?.recommendation_suppressed_until).toBeDefined();
     } finally {
       await close();
     }

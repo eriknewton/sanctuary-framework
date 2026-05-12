@@ -56,6 +56,12 @@ export type AutoTriggerOutcome =
 export interface ThresholdOverrides {
   warn_sigma?: number;
   alert_sigma?: number;
+  /** Minimum qualifying fires before a promotion recommendation is surfaced. */
+  promotion_fire_count?: number;
+  /** Evaluation window in days for promotion and demotion recommendations. */
+  promotion_window_days?: number;
+  /** Repeated rung-2 cancellations before a demotion recommendation is surfaced. */
+  demotion_cancel_count?: number;
 }
 
 /** Default cancel-window for new rung-2 rules. */
@@ -86,6 +92,11 @@ export interface RuleThresholdConfig {
   cancel_window_seconds: number;
   last_promoted_at?: string;
   last_demoted_at?: string;
+  /**
+   * Operator rejection cool-down. When set in the future, Nu-3 hides
+   * recommendations for this rule until the timestamp passes.
+   */
+  recommendation_suppressed_until?: string;
   /** Bounded ring buffer of recent actions. Older drop. */
   history: ActionHistoryEntry[];
   /** ISO timestamp of the last config update; used for staleness checks. */
