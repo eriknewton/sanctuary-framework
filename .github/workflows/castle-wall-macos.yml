@@ -61,8 +61,49 @@ jobs:
         # "Scheme is not currently configured for the test action."
         # `swift test` is the canonical SwiftPM test runner and works
         # against the same Package.swift on macos-latest. Running without
-        # a filter exercises both CastleWallIPCTests (Alpha-1) and
+        # a filter exercises CastleWallIPCTests (Alpha-1 wire vectors) +
         # CastleWallExtensionTests (Alpha-2 manifest store + allowlist
         # evaluator + flow cache + IPC bridge notifications + filter
-        # provider verdict glue).
+        # provider verdict glue + Alpha-3 ExtensionDispatcher).
         run: swift test
+
+      - name: assemble unsigned .app bundle (CI parity with operator build)
+        working-directory: castle-wall-macos
+        # The build-signed.sh script's signing path is intentionally
+        # skipped in CI: macos-latest runners do not have the operator's
+        # Developer-ID Application cert in their keychain, and shipping
+        # the cert into CI would expose it to the workflow's broad
+        # action permissions. CI runs only assembly + structure checks;
+        # codesign verification happens in operator-side release builds
+        # via build-signed.sh.
+        run: |
+          swift build -c release
+          BUILT_EXEC="$(swift build -c release --show-bin-path)/CastleWallExtension"
+          test -x "$BUILT_EXEC" || { echo "missing built executable" >&2; exit 1; }
+          mkdir -p build/CastleWallExtension.app/Contents/MacOS
+          cp "$BUILT_EXEC" build/CastleWallExtension.app/Contents/MacOS/CastleWallExtension
+          cp Sources/CastleWallExtension/Info.plist build/CastleWallExtension.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable CastleWallExtension" \
+            build/CastleWallExtension.app/Contents/Info.plist || true
+
+      - name: verify .app bundle structure + entitlements + adhoc sign
+        working-directory: castle-wall-macos
+        # Structure invariants the operator can run independently:
+        # Info.plist parses, executable is Mach-O, the NetworkExtension
+        # entitlement is on disk for the signing step the operator's
+        # release build performs. Adhoc-signing the assembled bundle
+        # exercises the structural codesign invariants (CodeResources
+        # presence, _CodeSignature layout) in CI without exposing any
+        # operator signing material to the workflow.
+        run: |
+          plutil -lint build/CastleWallExtension.app/Contents/Info.plist
+          file build/CastleWallExtension.app/Contents/MacOS/CastleWallExtension | grep -q "Mach-O" \
+            || { echo "executable is not Mach-O" >&2; exit 1; }
+          plutil -lint Sources/CastleWallExtension/CastleWallExtension.entitlements
+          /usr/libexec/PlistBuddy -c \
+            "Print :com.apple.developer.networking.networkextension" \
+            Sources/CastleWallExtension/CastleWallExtension.entitlements | \
+            grep -q "content-filter-provider-systemextension" \
+            || { echo "missing content-filter-provider-systemextension entitlement" >&2; exit 1; }
+          codesign --force --sign - --timestamp=none build/CastleWallExtension.app
+          codesign --verify --deep --strict --verbose=2 build/CastleWallExtension.app

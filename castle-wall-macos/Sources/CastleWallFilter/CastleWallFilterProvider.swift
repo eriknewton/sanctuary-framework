@@ -50,6 +50,11 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
     /// up).
     private let engine: FlowEvaluatorEngine
     private var ipcClient: IPCClient?
+    /// Alpha-3 dispatcher that wires the verdict path to IPC notifications.
+    /// Nil until `startFilter` completes the handshake successfully; the
+    /// FilterProvider's verdict path still runs against the engine even
+    /// when the dispatcher is absent (refuse-to-load fallback).
+    private var dispatcher: ExtensionDispatcher?
 
     // MARK: - Init
 
@@ -96,17 +101,15 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
             pinnedPublicKey: pinnedKey
         )
         self.ipcClient = client
+        let dispatcher = ExtensionDispatcher(engine: engine, ipcClient: client)
+        self.dispatcher = dispatcher
 
         Task.detached { [weak self] in
-            do {
-                _ = try await client.start()
-                CastleWallLog.lifecycle.info("ipc handshake completed; manifest subscribe deferred to dispatcher wiring")
-                _ = self
-            } catch {
-                CastleWallLog.lifecycle.notice(
-                    "ipc handshake failed (refuse-to-load fallback): \(String(describing: error))"
-                )
-            }
+            let started = await dispatcher.start()
+            CastleWallLog.lifecycle.info(
+                "ExtensionDispatcher.start completed; live=\(started)"
+            )
+            _ = self
         }
 
         completionHandler(nil)
@@ -117,6 +120,8 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
         completionHandler: @escaping () -> Void
     ) {
         CastleWallLog.lifecycle.info("CastleWallFilterProvider.stopFilter reason=\(reason.rawValue)")
+        dispatcher?.stop()
+        dispatcher = nil
         ipcClient?.close()
         ipcClient = nil
         completionHandler()
@@ -135,6 +140,11 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
             return NEFilterNewFlowVerdict.allow()
         }
         let outcome = engine.evaluate(descriptor)
+        // Fire-and-forget IPC notification AFTER computing the verdict.
+        // The verdict path itself never waits on IPC liveness; this call
+        // hops onto the IPC client's internal queue. A slow / broken IPC
+        // channel preserves the <10ms-p99 verdict latency invariant.
+        dispatcher?.notifyVerdict(outcome, for: descriptor)
         return CastleWallFilterProvider.verdict(for: outcome)
     }
 
