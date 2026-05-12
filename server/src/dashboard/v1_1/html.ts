@@ -1224,6 +1224,7 @@ const NAV_ITEMS: Array<{ id: string; label: string }> = [
   { id: "policy", label: "Policy" },
   { id: "intelligence", label: "Intelligence" },
   { id: "attestation", label: "Attestation" },
+  { id: "honeypot", label: "Honeypots" },
   { id: "privacy", label: "Privacy" },
   { id: "coordination", label: "Coordination" },
   { id: "health", label: "Health" },
@@ -1249,6 +1250,8 @@ const NAV_ICON_PATHS: Record<string, string> = {
     '<rect x="3.5" y="3.5" width="9" height="9" rx="0.5"/><rect x="6" y="6" width="4" height="4"/><path d="M6 1.5v2M10 1.5v2M6 12.5v2M10 12.5v2M1.5 6h2M1.5 10h2M12.5 6h2M12.5 10h2"/>',
   attestation:
     '<circle cx="8" cy="8" r="5.5"/><circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8h1.5M13 8h1.5"/>',
+  honeypot:
+    '<path d="M8 1.5l5 2v4.5c0 3.1-2.1 5.2-5 6.5-2.9-1.3-5-3.4-5-6.5V3.5z"/><path d="M6 7.5h4M6.5 10h3"/>',
   privacy:
     '<path d="M8 1.5L3 3v4.5c0 3 2.2 5.4 5 7 2.8-1.6 5-4 5-7V3z"/><path d="M6 8l1.5 1.5L10.5 6"/>',
   coordination:

@@ -65,6 +65,7 @@ import {
 } from "./honeypot-compiler.js";
 import { TrapRegistry } from "./trap-registry.js";
 import type { TrapStore } from "./trap-store.js";
+import type { ToolCallTrapRuntime } from "./tool-call-trap-runtime.js";
 
 export const HONEYPOT_API_PREFIX = "/api/honeypot";
 
@@ -101,6 +102,8 @@ export interface HoneypotRouterDeps extends HoneypotTriggerDeps {
    * to exercise the registry without a storage backend).
    */
   store?: TrapStore;
+  /** Pi-3 tool-call trap runtime for stats + invocation drilldown. */
+  toolCallRuntime?: ToolCallTrapRuntime;
 }
 
 // ── Front-of-dispatch trap-trigger hook ──────────────────────────────────
@@ -200,7 +203,11 @@ function buildSummary(
   path: string,
   method: string,
 ): string {
-  return `honeypot ${spec.trap_id} triggered: ${method} ${path} from ${callerIdentity} (severity ${spec.finding_severity}, pattern ${spec.trigger.path_pattern})`;
+  const pattern =
+    spec.trigger.kind === "http_endpoint"
+      ? spec.trigger.path_pattern
+      : "(non-http)";
+  return `honeypot ${spec.trap_id} triggered: ${method} ${path} from ${callerIdentity} (severity ${spec.finding_severity}, pattern ${pattern})`;
 }
 
 /**
@@ -368,7 +375,7 @@ export async function handleHoneypotRoute(
         fortress_id: deps.fortressId,
         trap_id: spec.trap_id,
         trap_class: spec.trap_class,
-        path_pattern: spec.trigger.path_pattern,
+        ...deployAuditTriggerDetails(spec),
         was_new: isNew,
         ...(persistError !== null
           ? { persist_error: persistError, persisted: false }
@@ -391,6 +398,12 @@ export async function handleHoneypotRoute(
     if (method === "GET" && path === `${HONEYPOT_API_PREFIX}/traps`) {
       const traps = deps.registry.list();
       writeJSON(res, 200, { ok: true, data: { traps } });
+      return true;
+    }
+
+    if (method === "GET" && path === `${HONEYPOT_API_PREFIX}/tool-traps`) {
+      const stats = deps.toolCallRuntime?.stats() ?? [];
+      writeJSON(res, 200, { ok: true, data: { traps: stats } });
       return true;
     }
 
@@ -469,6 +482,17 @@ export async function handleHoneypotRoute(
 
 function isValidSeverity(value: string | undefined): value is SentinelSeverity {
   return value === "info" || value === "warn" || value === "alert";
+}
+
+function deployAuditTriggerDetails(spec: TrapSpec): Record<string, unknown> {
+  if (spec.trigger.kind === "tool_call") {
+    return {
+      fake_tool_name: spec.trigger.fake_tool_name,
+      catalog_visibility: spec.trigger.catalog_visibility,
+      visible_to_agents: spec.trigger.visible_to_agents ?? [],
+    };
+  }
+  return { path_pattern: spec.trigger.path_pattern };
 }
 
 function parseLimit(

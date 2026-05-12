@@ -16,6 +16,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { createRequire } from "node:module";
 import type { ApprovalGate } from "./principal-policy/gate.js";
+import type { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
 
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
@@ -37,6 +38,10 @@ export interface ToolDefinition {
 export interface ServerOptions {
   /** Approval gate — if provided, every tool call is evaluated before execution */
   gate?: ApprovalGate;
+  /** Pi-3 honeypot runtime for server-local fake tool catalog injection. */
+  toolCallTrapRuntime?: ToolCallTrapRuntime;
+  /** Current wrapped-agent id for per-agent catalog visibility. */
+  currentAgentId?: () => string | undefined;
 }
 
 // ── Schema Validation ──────────────────────────────────────────────────
@@ -195,8 +200,13 @@ export function createServer(
 
   // Register tool listing
   server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const honeypotTools =
+      options?.toolCallTrapRuntime?.listCatalogTools(
+        options.currentAgentId?.(),
+      ) ?? [];
+    const catalog = [...tools, ...honeypotTools];
     return {
-      tools: tools.map((t) => ({
+      tools: catalog.map((t) => ({
         name: t.name,
         description: t.description,
         inputSchema: t.inputSchema,
@@ -208,6 +218,30 @@ export function createServer(
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     const typedArgs = (args ?? {}) as Record<string, unknown>;
+    const currentAgentId = options?.currentAgentId?.();
+    const callerIdentity = currentAgentId
+      ? `agent:${currentAgentId}`
+      : "agent:unknown";
+
+    const trapInvoke = await options?.toolCallTrapRuntime?.invokeIfTrap(
+      name,
+      typedArgs,
+      callerIdentity,
+    );
+    if (trapInvoke?.handled) {
+      const response = trapInvoke.response;
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              typeof response === "string"
+                ? response
+                : JSON.stringify(response, null, 2),
+          },
+        ],
+      };
+    }
 
     const tool = tools.find((t) => t.name === name);
     if (!tool) {
@@ -277,7 +311,13 @@ export function createServer(
     }
 
     try {
-      return await tool.handler(typedArgs);
+      const result = await tool.handler(typedArgs);
+      options?.toolCallTrapRuntime?.recordToolCall(
+        name,
+        typedArgs,
+        callerIdentity,
+      );
+      return result;
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Unknown error";

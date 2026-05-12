@@ -41,6 +41,7 @@ import { HandoffEventBridge } from "./coordination/handoff-routes.js";
 import { WorkflowStateTracker } from "./coordination/workflow-state-tracker.js";
 import { TrapRegistry } from "./honeypot/trap-registry.js";
 import { TrapStore } from "./honeypot/trap-store.js";
+import { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
 import { HONEYPOT_AUDIT_OPS } from "./honeypot/types.js";
 import { PHI1_BASELINE_CATALOG } from "./sentinel/sentinels/index.js";
 import { loadSentinelSubscriptions } from "./sentinel/subscription-store.js";
@@ -929,6 +930,13 @@ export async function createSanctuaryServer(options?: {
     masterKey,
     fortressId: fortressIdForAggregator,
   });
+  const toolCallTrapRuntime = new ToolCallTrapRuntime({
+    registry: honeypotRegistry,
+    findingStore: sentinelFindingStore,
+    auditLog,
+    operatorId: aggregatorIdentityId,
+    fortressId: fortressIdForAggregator,
+  });
   try {
     const persistedSpecs = await honeypotStore.loadAll();
     for (const spec of persistedSpecs) {
@@ -962,6 +970,7 @@ export async function createSanctuaryServer(options?: {
       fortressId: fortressIdForAggregator,
       ...(intelligenceSelector ? { selector: intelligenceSelector } : {}),
       store: honeypotStore,
+      toolCallRuntime: toolCallTrapRuntime,
     });
   }
 
@@ -1155,7 +1164,11 @@ export async function createSanctuaryServer(options?: {
   }
 
   // 19. Create MCP server with approval gate (proxy tools are included in allTools)
-  const server = createServer(allTools, { gate });
+  const server = createServer(allTools, {
+    gate,
+    toolCallTrapRuntime,
+    currentAgentId: () => process.env.SANCTUARY_AGENT_ID,
+  });
 
   // 20. Save config if this is first run
   await saveConfig(config);

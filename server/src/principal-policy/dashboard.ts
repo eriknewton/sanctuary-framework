@@ -247,6 +247,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   // `store.loadAll()` and re-deploys the persisted specs into the
   // in-memory registry before this dashboard begins serving.
   private honeypotStore: import("../honeypot/trap-store.js").TrapStore | null = null;
+  private honeypotToolCallRuntime:
+    | import("../honeypot/tool-call-trap-runtime.js").ToolCallTrapRuntime
+    | null = null;
 
   constructor(config: DashboardConfig) {
     this.config = config;
@@ -397,6 +400,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
      * persisted spec BEFORE calling this method.
      */
     store?: import("../honeypot/trap-store.js").TrapStore | null;
+    toolCallRuntime?: import("../honeypot/tool-call-trap-runtime.js").ToolCallTrapRuntime | null;
   }): void {
     this.honeypotRegistry = opts.registry;
     this.honeypotFindingStore = opts.findingStore ?? null;
@@ -405,6 +409,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.honeypotFortressId = opts.fortressId ?? null;
     this.honeypotSelector = opts.selector ?? null;
     this.honeypotStore = opts.store ?? null;
+    this.honeypotToolCallRuntime = opts.toolCallRuntime ?? null;
   }
 
   /**
@@ -529,6 +534,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           : {}),
         ...(this.honeypotStore !== null
           ? { store: this.honeypotStore }
+          : {}),
+        ...(this.honeypotToolCallRuntime !== null
+          ? { toolCallRuntime: this.honeypotToolCallRuntime }
           : {}),
       },
       req,

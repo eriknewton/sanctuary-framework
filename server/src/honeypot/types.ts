@@ -84,13 +84,36 @@ export const FILESYSTEM_OPS: readonly FilesystemOp[] = [
   "list",
 ] as const;
 
+export type ToolCallCatalogVisibility =
+  | "all_wrapped_agents"
+  | "specific_agents";
+
+/**
+ * Tool-call trap trigger (Pi-3). The runtime injects a fake tool into
+ * the MCP list_tools response seen by wrapped agents. Invoking the fake
+ * tool fires a honeypot finding and returns the operator-controlled
+ * fake response.
+ */
+export interface ToolCallTrigger {
+  kind: "tool_call";
+  fake_tool_name: string;
+  fake_tool_description: string;
+  fake_tool_schema: Record<string, unknown>;
+  catalog_visibility: ToolCallCatalogVisibility;
+  visible_to_agents?: string[];
+  fake_response: string | Record<string, unknown>;
+}
+
 /**
  * Discriminated-union trigger keyed by `kind`. The outer `trap_class`
  * field on TrapSpec keeps the operator-facing taxonomy; the inner
  * `kind` discriminator on the trigger is what TypeScript narrows on
  * inside runtime handlers + the registry's matching code.
  */
-export type TrapTrigger = HttpEndpointTrigger | FilesystemTrigger;
+export type TrapTrigger =
+  | HttpEndpointTrigger
+  | FilesystemTrigger
+  | ToolCallTrigger;
 
 /**
  * One compiled trap. Persisted by the registry, deployed to the
@@ -127,6 +150,9 @@ export interface HoneypotDraft {
  * COMPILED:    compiler returns a TrapSpec (success or fallback).
  * DEPLOYED:    operator activates the TrapSpec at runtime.
  * TRIGGERED:   trap detected an access. One event per matched call.
+ * FOLLOW_UP_CORRELATED:
+ *              Pi-3 tool-call trap follow-up within the 5-minute
+ *              activation window.
  * UNDEPLOYED:  TrapSpec removed from the runtime.
  * LOADED:      Pi-2 fortress-boot rehydration. Fires once per boot
  *              when one or more persisted specs are re-deployed into
@@ -140,6 +166,7 @@ export const HONEYPOT_AUDIT_OPS = {
   COMPILED: "honeypot_compiled",
   DEPLOYED: "honeypot_deployed",
   TRIGGERED: "honeypot_triggered",
+  FOLLOW_UP_CORRELATED: "honeypot_follow_up_correlated",
   UNDEPLOYED: "honeypot_undeployed",
   LOADED: "honeypot_loaded",
 } as const;

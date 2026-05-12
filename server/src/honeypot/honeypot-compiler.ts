@@ -13,8 +13,8 @@
  *     shape, and validates against the schema. Path A produces
  *     `explanation_paragraph` from the LLM response. The LLM is
  *     allowed to return `trap_class: "filesystem"` along with an
- *     `ops` array; the parser routes to a FilesystemTrigger in that
- *     case and otherwise produces an HttpEndpointTrigger (default).
+ *     `ops` array, or `trap_class: "tool_call"` with fake-tool
+ *     catalog metadata.
  *
  *   Path B (heuristic fallback): runs when no selector is wired OR
  *     Path A's LLM response fails schema validation. Extracts a
@@ -55,6 +55,8 @@ import {
   type FilesystemTrigger,
   type HoneypotDraft,
   type HttpEndpointTrigger,
+  type ToolCallCatalogVisibility,
+  type ToolCallTrigger,
   type TrapClass,
   type TrapSpec,
   type TrapTrigger,
@@ -74,22 +76,26 @@ const DEFAULT_SEVERITY = "alert" as const;
  * compiler can parse + validate. The prompt is deliberately small;
  * the LLM's job is shape-derivation, not creative composition.
  *
- * Pi-2 extends the schema: an optional `trap_class` field lets the
- * LLM declare a filesystem trap. When `trap_class` is "filesystem",
- * the `ops` array narrows which filesystem operations fire the trap.
+ * Pi-3 extends the schema with `tool_call` catalog fields.
  */
 const COMPILE_PROMPT = `You are compiling a Sanctuary honeypot from an operator's plain-English description.
 Return STRICT JSON with the following shape (no markdown, no commentary):
 {
-  "trap_class": "http_endpoint" | "filesystem",
+  "trap_class": "http_endpoint" | "filesystem" | "tool_call",
   "path_pattern": "string (glob with * or **)",
   "method": "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "ANY",
   "ops": ["read", "write", "delete", "list"],
+  "fake_tool_name": "string",
+  "fake_tool_description": "string",
+  "fake_tool_schema": {"type":"object","properties":{}},
+  "catalog_visibility": "all_wrapped_agents" | "specific_agents",
+  "visible_to_agents": ["agent_id"],
+  "fake_response": "string or JSON object",
   "expected_caller_types": ["wrapped_agent" | "operator" | "external"],
   "finding_severity": "warn" | "alert",
   "explanation_paragraph": "one-sentence operator-friendly explanation"
 }
-Default trap_class to "http_endpoint" unless the operator clearly describes filesystem access (file reads/writes, directory access, path-on-disk monitoring). The "method" field applies only to http_endpoint traps; the "ops" field applies only to filesystem traps. Match the operator's stated severity if they gave one; otherwise default to "alert". If method is unspecified for http_endpoint, return "ANY". If ops is unspecified for filesystem, return ["read","write","delete","list"]. If caller-type is unspecified, return ["wrapped_agent"]. Keep the explanation_paragraph under 200 characters.`;
+Default trap_class to "http_endpoint" unless the operator clearly describes filesystem access (file reads/writes, directory access, path-on-disk monitoring) or fake MCP tool/catalog bait. The "method" field applies only to http_endpoint traps; the "ops" field applies only to filesystem traps; fake_tool_* fields apply only to tool_call traps. Match the operator's stated severity if they gave one; otherwise default to "alert". If method is unspecified for http_endpoint, return "ANY". If ops is unspecified for filesystem, return ["read","write","delete","list"]. For tool_call, catalog_visibility defaults to "all_wrapped_agents", fake_tool_schema defaults to {"type":"object","properties":{}}, and fake_response should be clearly operator-controlled bait. If caller-type is unspecified, return ["wrapped_agent"]. Keep the explanation_paragraph under 200 characters.`;
 
 export interface CompileResult {
   spec: TrapSpec;
@@ -215,6 +221,10 @@ interface ParseFailure {
   failure:
     | "invalid_json"
     | "missing_path_pattern"
+    | "missing_fake_tool_name"
+    | "invalid_fake_tool_schema"
+    | "invalid_catalog_visibility"
+    | "invalid_fake_response"
     | "invalid_severity"
     | "invalid_caller_types"
     | "invalid_filesystem_ops";
@@ -233,10 +243,6 @@ function tryParseLlmResponse(text: string): ParseSuccess | ParseFailure {
     return { ok: false, failure: "invalid_json" };
   }
   const obj = body as Record<string, unknown>;
-  const pathPattern = obj["path_pattern"];
-  if (typeof pathPattern !== "string" || pathPattern.length === 0) {
-    return { ok: false, failure: "missing_path_pattern" };
-  }
   const callerTypes = Array.isArray(obj["expected_caller_types"])
     ? (obj["expected_caller_types"] as unknown[]).filter(
         (v): v is string => typeof v === "string" && v.length > 0,
@@ -260,7 +266,28 @@ function tryParseLlmResponse(text: string): ParseSuccess | ParseFailure {
 
   const trapClassRaw = obj["trap_class"];
   const trapClass: TrapClass =
-    trapClassRaw === "filesystem" ? "filesystem" : "http_endpoint";
+    trapClassRaw === "filesystem"
+      ? "filesystem"
+      : trapClassRaw === "tool_call"
+        ? "tool_call"
+        : "http_endpoint";
+
+  if (trapClass === "tool_call") {
+    const parsed = parseToolCallTrigger(obj);
+    if (!parsed.ok) return { ok: false, failure: parsed.failure };
+    return {
+      ok: true,
+      trapClass,
+      trigger: parsed.trigger,
+      severity,
+      explanation,
+    };
+  }
+
+  const pathPattern = obj["path_pattern"];
+  if (typeof pathPattern !== "string" || pathPattern.length === 0) {
+    return { ok: false, failure: "missing_path_pattern" };
+  }
 
   if (trapClass === "filesystem") {
     const opsParsed = parseFilesystemOps(obj["ops"]);
@@ -285,6 +312,84 @@ function tryParseLlmResponse(text: string): ParseSuccess | ParseFailure {
     expected_caller_types: callerTypes,
   };
   return { ok: true, trapClass, trigger, severity, explanation };
+}
+
+type ToolCallParseResult =
+  | { ok: true; trigger: ToolCallTrigger }
+  | {
+      ok: false;
+      failure:
+        | "missing_fake_tool_name"
+        | "invalid_fake_tool_schema"
+        | "invalid_catalog_visibility"
+        | "invalid_fake_response";
+    };
+
+function parseToolCallTrigger(
+  obj: Record<string, unknown>,
+): ToolCallParseResult {
+  const name = obj["fake_tool_name"];
+  if (typeof name !== "string" || !isPlausibleToolName(name)) {
+    return { ok: false, failure: "missing_fake_tool_name" };
+  }
+  const description =
+    typeof obj["fake_tool_description"] === "string" &&
+    obj["fake_tool_description"].length > 0
+      ? obj["fake_tool_description"]
+      : `Operator-controlled diagnostic tool ${name}.`;
+  const schema = obj["fake_tool_schema"];
+  if (
+    schema !== undefined &&
+    (!schema || typeof schema !== "object" || Array.isArray(schema))
+  ) {
+    return { ok: false, failure: "invalid_fake_tool_schema" };
+  }
+  const visibilityRaw = obj["catalog_visibility"];
+  if (
+    visibilityRaw !== undefined &&
+    visibilityRaw !== "all_wrapped_agents" &&
+    visibilityRaw !== "specific_agents"
+  ) {
+    return { ok: false, failure: "invalid_catalog_visibility" };
+  }
+  const visibility: ToolCallCatalogVisibility =
+    visibilityRaw === "specific_agents"
+      ? "specific_agents"
+      : "all_wrapped_agents";
+  const visibleToAgents = Array.isArray(obj["visible_to_agents"])
+    ? (obj["visible_to_agents"] as unknown[]).filter(
+        (v): v is string => typeof v === "string" && v.length > 0,
+      )
+    : [];
+  if (visibility === "specific_agents" && visibleToAgents.length === 0) {
+    return { ok: false, failure: "invalid_catalog_visibility" };
+  }
+  const fakeResponse = obj["fake_response"];
+  if (
+    typeof fakeResponse !== "string" &&
+    (!fakeResponse ||
+      typeof fakeResponse !== "object" ||
+      Array.isArray(fakeResponse))
+  ) {
+    return { ok: false, failure: "invalid_fake_response" };
+  }
+  return {
+    ok: true,
+    trigger: {
+      kind: "tool_call",
+      fake_tool_name: name,
+      fake_tool_description: description,
+      fake_tool_schema:
+        schema && typeof schema === "object" && !Array.isArray(schema)
+          ? (schema as Record<string, unknown>)
+          : { type: "object", properties: {} },
+      catalog_visibility: visibility,
+      ...(visibility === "specific_agents"
+        ? { visible_to_agents: visibleToAgents }
+        : {}),
+      fake_response: fakeResponse as string | Record<string, unknown>,
+    },
+  };
 }
 
 /**
@@ -364,6 +469,23 @@ const FILESYSTEM_OP_HINTS: Array<{ phrase: RegExp; op: FilesystemOp }> = [
   { phrase: /\b(?:list|listing|enumerate|enumeration|directory\s+listing)/i, op: "list" },
 ];
 
+const TOOL_CALL_CLASS_HINTS = [
+  /\btool[-\s]?call\b/i,
+  /\bfake\s+(?:mcp\s+)?tool\b/i,
+  /\btool\s+catalog\b/i,
+  /\bvisible\s+to\s+(?:all\s+)?agents\b/i,
+  /\bif\s+invoked\b/i,
+  /\binvokes?\s+(?:the\s+)?(?:fake\s+)?tool\b/i,
+];
+
+const TOOL_NAME_HINTS: RegExp[] = [
+  /\bfake\s+(?:tool\s+)?([A-Za-z_][A-Za-z0-9_:/.-]{2,})\s+tool\b/i,
+  /\btool\s+(?:named|called)\s+([A-Za-z_][A-Za-z0-9_:/.-]{2,})\b/i,
+  /\bdeploy\s+(?:a\s+)?(?:fake\s+)?([A-Za-z_][A-Za-z0-9_:/.-]{2,})\s+tool\b/i,
+  /\binvoked?,?\s+(?:return|then)\b.*?\b([A-Za-z_][A-Za-z0-9_:/.-]{2,})\b/i,
+  /\b([A-Za-z_][A-Za-z0-9_:/.-]{2,})\s+tool\b/i,
+];
+
 function heuristicCompile(english: string): HeuristicResult {
   let pathPattern: string | null = null;
   for (const re of HEURISTIC_PATH_PATTERNS) {
@@ -387,6 +509,43 @@ function heuristicCompile(english: string): HeuristicResult {
   }
 
   const isFilesystem = FILESYSTEM_CLASS_HINTS.some((re) => re.test(english));
+  const isToolCall = TOOL_CALL_CLASS_HINTS.some((re) => re.test(english));
+
+  if (isToolCall) {
+    const fakeToolName = extractToolName(english) ?? "admin_password_reader";
+    const fakeResponse = extractFakeResponse(english);
+    const visibleToAgents = extractVisibleAgents(english);
+    const trigger: ToolCallTrigger = {
+      kind: "tool_call",
+      fake_tool_name: fakeToolName,
+      fake_tool_description:
+        `Read protected administrative material for ${fakeToolName}.`,
+      fake_tool_schema: {
+        type: "object",
+        properties: {
+          reason: {
+            type: "string",
+            description: "Reason the caller needs the protected material.",
+          },
+        },
+      },
+      catalog_visibility:
+        visibleToAgents.length > 0
+          ? "specific_agents"
+          : "all_wrapped_agents",
+      ...(visibleToAgents.length > 0
+        ? { visible_to_agents: visibleToAgents }
+        : {}),
+      fake_response: fakeResponse,
+    };
+    return {
+      trapClass: "tool_call",
+      trigger,
+      ...(severity !== undefined ? { severity } : {}),
+      explanation:
+        `Tool-call honeypot compiled from operator draft via heuristic compile; trap injects ${fakeToolName} into the wrapped-agent MCP catalog.`,
+    };
+  }
 
   if (isFilesystem) {
     const ops: FilesystemOp[] = [];
@@ -442,6 +601,38 @@ function heuristicCompile(english: string): HeuristicResult {
         }
       : {}),
   };
+}
+
+function isPlausibleToolName(value: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_:/.-]{2,127}$/.test(value);
+}
+
+function extractToolName(english: string): string | null {
+  for (const re of TOOL_NAME_HINTS) {
+    const match = english.match(re);
+    const candidate = match?.[1];
+    if (candidate && isPlausibleToolName(candidate)) return candidate;
+  }
+  return null;
+}
+
+function extractVisibleAgents(english: string): string[] {
+  const match = english.match(/\bvisible\s+to\s+agents?\s+([A-Za-z0-9_,:\s.-]+)/i);
+  if (!match?.[1]) return [];
+  if (/\ball\b/i.test(match[1])) return [];
+  return match[1]
+    .split(/[,\s]+/)
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0 && !/^(and|if|return)$/i.test(v));
+}
+
+function extractFakeResponse(english: string): string {
+  const quoted = english.match(/return\s+["']([^"']+)["']/i);
+  if (quoted?.[1]) return quoted[1];
+  if (/password/i.test(english)) {
+    return "TRAP_ONLY_FAKE_PASSWORD_DO_NOT_USE";
+  }
+  return "TRAP_ONLY_FAKE_RESPONSE";
 }
 
 // ── Public helper: hash an English draft for audit emission ──────────────
