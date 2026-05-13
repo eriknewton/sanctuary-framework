@@ -74,6 +74,16 @@ import {
 import type { ThresholdConfigStore } from "../auto-trigger/threshold-config-store.js";
 import type { ActionDispatcher } from "../auto-trigger/action-dispatcher.js";
 import type { CalibrationSuggester } from "../auto-trigger/calibration-suggester.js";
+import type { UnifiedInboxBridge } from "./unified-inbox-bridge.js";
+import {
+  handleUnifiedInboxRoute,
+  UNIFIED_INBOX_API_PREFIX,
+  UNIFIED_INBOX_RETENTION_API_PREFIX,
+} from "./unified-inbox-routes.js";
+import {
+  UnifiedInboxRetentionPolicy,
+  type UnifiedInboxRetentionPolicyStore,
+} from "./unified-inbox-retention-policy.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -263,6 +273,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private autoTriggerStore: ThresholdConfigStore | null = null;
   private autoTriggerDispatcher: ActionDispatcher | null = null;
   private autoTriggerSuggester: CalibrationSuggester | null = null;
+  private unifiedInboxBridge: UnifiedInboxBridge | null = null;
+  private unifiedInboxRetentionPolicy: UnifiedInboxRetentionPolicy | null = null;
+  private unifiedInboxRetentionPolicyStore: UnifiedInboxRetentionPolicyStore | null = null;
+  private unifiedInboxFortressId: string | null = null;
+  private unifiedInboxIdentityId: string | null = null;
 
   constructor(config: DashboardConfig) {
     this.config = config;
@@ -443,6 +458,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.autoTriggerSuggester = opts.suggester ?? null;
   }
 
+  setUnifiedInbox(opts: {
+    bridge: UnifiedInboxBridge | null;
+    retentionPolicy?: UnifiedInboxRetentionPolicy | null;
+    retentionPolicyStore?: UnifiedInboxRetentionPolicyStore | null;
+    fortressId?: string | null;
+    identityId?: string | null;
+  }): void {
+    this.unifiedInboxBridge = opts.bridge;
+    this.unifiedInboxRetentionPolicy =
+      opts.retentionPolicy ?? new UnifiedInboxRetentionPolicy();
+    this.unifiedInboxRetentionPolicyStore =
+      opts.retentionPolicyStore ?? null;
+    this.unifiedInboxFortressId = opts.fortressId ?? null;
+    this.unifiedInboxIdentityId = opts.identityId ?? null;
+  }
+
   /**
    * v1.3 WP-V1.3-10 dispatch entry point. Called from `handleRequest`
    * before the legacy approval route table. Returns true when served.
@@ -504,6 +535,39 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         dispatcher: this.autoTriggerDispatcher,
         ...(this.autoTriggerSuggester
           ? { suggester: this.autoTriggerSuggester }
+          : {}),
+      },
+      req,
+      res,
+    );
+  }
+
+  private async dispatchUnifiedInbox(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<boolean> {
+    if (!this.unifiedInboxBridge) return false;
+    return handleUnifiedInboxRoute(
+      {
+        authConfig: {
+          loopbackAutoAuth: this._autoAuthLocalhost,
+          ...(this.authToken !== undefined ? { authToken: this.authToken } : {}),
+        },
+        bridge: this.unifiedInboxBridge,
+        ...(this.unifiedInboxRetentionPolicy
+          ? { retentionPolicy: this.unifiedInboxRetentionPolicy }
+          : {}),
+        ...(this.unifiedInboxRetentionPolicyStore
+          ? { retentionPolicyStore: this.unifiedInboxRetentionPolicyStore }
+          : {}),
+        ...(this.auditLog
+          ? { auditLog: this.auditLog }
+          : {}),
+        ...(this.unifiedInboxIdentityId
+          ? { identityId: this.unifiedInboxIdentityId }
+          : {}),
+        ...(this.unifiedInboxFortressId
+          ? { fortressId: this.unifiedInboxFortressId }
           : {}),
       },
       req,
@@ -1174,6 +1238,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       url.pathname.startsWith(APPROVAL_INBOX_API_PREFIX)
     ) {
       this.dispatchApprovalInbox(req, res)
+        .then((handled) => {
+          if (handled) return;
+          this.handleLegacyRequest(req, res, url, method);
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+      return;
+    }
+
+    if (
+      this.unifiedInboxBridge &&
+      (url.pathname.startsWith(UNIFIED_INBOX_API_PREFIX) ||
+        url.pathname.startsWith(UNIFIED_INBOX_RETENTION_API_PREFIX))
+    ) {
+      this.dispatchUnifiedInbox(req, res)
         .then((handled) => {
           if (handled) return;
           this.handleLegacyRequest(req, res, url, method);

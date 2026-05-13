@@ -30,12 +30,24 @@ import {
   type UnifiedInboxSeverity,
   type UnifiedInboxSourceClass,
 } from "./unified-inbox-bridge.js";
+import {
+  INBOX_RETENTION_AUDIT_OPS,
+  type RetentionPolicy,
+  UnifiedInboxRetentionPolicy,
+  type UnifiedInboxRetentionPolicyStore,
+} from "./unified-inbox-retention-policy.js";
 
 export const UNIFIED_INBOX_API_PREFIX = "/api/inbox/unified";
+export const UNIFIED_INBOX_RETENTION_API_PREFIX = "/api/inbox/retention";
 
 export interface UnifiedInboxRouterDeps {
   authConfig: AuthConfig;
   bridge: UnifiedInboxBridge;
+  retentionPolicy?: UnifiedInboxRetentionPolicy;
+  retentionPolicyStore?: UnifiedInboxRetentionPolicyStore;
+  auditLog?: import("../l2-operational/audit-log.js").AuditLog;
+  identityId?: string;
+  fortressId?: string;
 }
 
 const LIST_DEFAULT_LIMIT = 100;
@@ -130,7 +142,9 @@ export async function handleUnifiedInboxRoute(
 
   if (
     path !== UNIFIED_INBOX_API_PREFIX &&
-    !path.startsWith(`${UNIFIED_INBOX_API_PREFIX}/`)
+    !path.startsWith(`${UNIFIED_INBOX_API_PREFIX}/`) &&
+    path !== UNIFIED_INBOX_RETENTION_API_PREFIX &&
+    !path.startsWith(`${UNIFIED_INBOX_RETENTION_API_PREFIX}/`)
   ) {
     return false;
   }
@@ -246,6 +260,63 @@ export async function handleUnifiedInboxRoute(
       }
     }
 
+    if (path === UNIFIED_INBOX_RETENTION_API_PREFIX && method === "GET") {
+      const policy = deps.retentionPolicy ?? new UnifiedInboxRetentionPolicy();
+      writeJSON(res, 200, {
+        ok: true,
+        data: {
+          defaults: {
+            archived: 90,
+            dismissed: 30,
+          },
+          policies: policy.list(),
+        },
+      });
+      return true;
+    }
+
+    if (
+      method === "PATCH" &&
+      path.startsWith(`${UNIFIED_INBOX_RETENTION_API_PREFIX}/`)
+    ) {
+      const match = matchRetentionPath(path);
+      if (!match) {
+        writeJSON(res, 404, { ok: false, error: "not_found", path });
+        return true;
+      }
+      const body = await readJsonBody(req);
+      const retainForDays = Number(body.retain_for_days);
+      if (!Number.isFinite(retainForDays) || retainForDays < 0) {
+        writeJSON(res, 400, {
+          ok: false,
+          error: "retain_for_days must be a non-negative number",
+        });
+        return true;
+      }
+      const policy = deps.retentionPolicy ?? new UnifiedInboxRetentionPolicy();
+      const updated: RetentionPolicy = {
+        source_class: match.sourceClass,
+        state: match.state,
+        retain_for_days: Math.floor(retainForDays),
+      };
+      policy.set(updated);
+      await deps.retentionPolicyStore?.save(policy);
+      deps.auditLog?.append(
+        "l2",
+        INBOX_RETENTION_AUDIT_OPS.POLICY_UPDATED,
+        deps.identityId ?? "operator",
+        {
+          fortress_id: deps.fortressId,
+          source_class: updated.source_class,
+          state: updated.state,
+          retain_for_days: updated.retain_for_days,
+          changed_at: new Date().toISOString(),
+        },
+      );
+      writeJSON(res, 200, { ok: true, data: { policy: updated } });
+      return true;
+    }
+
     if (method === "POST" && path === `${UNIFIED_INBOX_API_PREFIX}/batch`) {
       const body = await readJsonBody(req);
       const ids = Array.isArray(body.entry_ids)
@@ -291,6 +362,28 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   } catch {
     return {};
   }
+}
+
+function matchRetentionPath(path: string): {
+  sourceClass: UnifiedInboxSourceClass;
+  state: RetentionPolicy["state"];
+} | null {
+  const prefix = `${UNIFIED_INBOX_RETENTION_API_PREFIX}/`;
+  if (!path.startsWith(prefix)) return null;
+  const parts = path.slice(prefix.length).split("/");
+  if (parts.length !== 2) return null;
+  const sourceClass = decodeURIComponent(parts[0] ?? "");
+  const state = decodeURIComponent(parts[1] ?? "");
+  if (!VALID_SOURCE_CLASSES.has(sourceClass as UnifiedInboxSourceClass)) {
+    return null;
+  }
+  if (state !== "archived" && state !== "dismissed") {
+    return null;
+  }
+  return {
+    sourceClass: sourceClass as UnifiedInboxSourceClass,
+    state,
+  };
 }
 
 async function handleSse(

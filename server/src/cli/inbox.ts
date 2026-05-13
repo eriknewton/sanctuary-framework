@@ -28,7 +28,7 @@ export async function runInboxCommand(args: InboxCliArgs): Promise<number> {
       case "snooze":
         return await snooze(rest, out, err);
       case "retention":
-        return retention(rest, out, err);
+        return await retention(rest, out, err);
       default:
         err.write(`Unknown inbox subcommand: ${sub}\n`);
         printUsage(err);
@@ -121,14 +121,15 @@ async function snooze(
   return 0;
 }
 
-function retention(
+async function retention(
   argv: string[],
   out: NodeJS.WritableStream,
   err: NodeJS.WritableStream,
-): number {
+): Promise<number> {
   const sub = argv[0];
   if (sub === "show") {
-    out.write("Default retention: archived=90 days, dismissed=30 days. Active and snoozed entries are not auto-deleted.\n");
+    const body = await request("/api/inbox/retention");
+    out.write(JSON.stringify(body.data ?? body, null, 2) + "\n");
     return 0;
   }
   if (sub === "set") {
@@ -139,7 +140,14 @@ function retention(
       err.write("retention set requires --source-class, --state, and --days\n");
       return 2;
     }
-    out.write(`Retention override accepted locally: ${sourceClass} ${state} ${days} days\n`);
+    const body = await request(
+      `/api/inbox/retention/${encodeURIComponent(sourceClass)}/${encodeURIComponent(state)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ retain_for_days: Number(days) }),
+      },
+    );
+    out.write(JSON.stringify(body.data?.policy ?? body, null, 2) + "\n");
     return 0;
   }
   err.write("Unknown retention subcommand\n");

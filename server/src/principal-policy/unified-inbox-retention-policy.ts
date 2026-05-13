@@ -1,4 +1,12 @@
 import type { AuditLog } from "../l2-operational/audit-log.js";
+import { bytesToString, stringToBytes } from "../core/encoding.js";
+import {
+  decrypt,
+  encrypt,
+  type EncryptedPayload,
+} from "../core/encryption.js";
+import { derivePurposeKey } from "../core/key-derivation.js";
+import type { StorageBackend } from "../storage/interface.js";
 import type {
   UnifiedInboxBridge,
   UnifiedInboxEntryState,
@@ -23,8 +31,19 @@ export const INBOX_RETENTION_AUDIT_OPS = {
   POLICY_UPDATED: "inbox_retention_policy_updated",
 } as const;
 
+export const UNIFIED_INBOX_RETENTION_POLICY_NAMESPACE = "_unified_inbox";
+export const UNIFIED_INBOX_RETENTION_POLICY_KEY = "retention-policy.v1";
+
 const DEFAULT_ARCHIVED_DAYS = 90;
 const DEFAULT_DISMISSED_DAYS = 30;
+const HKDF_INFO = "principal-policy-unified-inbox-retention-policy-v1";
+const MAX_POLICY_BYTES = 64 * 1024;
+
+interface PersistedRetentionPolicyEnvelope {
+  version: 1;
+  fortress_id: string;
+  policies: RetentionPolicy[];
+}
 
 export class UnifiedInboxRetentionPolicy {
   private readonly overrides = new Map<string, RetentionPolicy>();
@@ -60,6 +79,66 @@ export class UnifiedInboxRetentionPolicy {
       this.overrides.get(keyFor(sourceClass, state))?.retain_for_days ??
       (state === "archived" ? DEFAULT_ARCHIVED_DAYS : DEFAULT_DISMISSED_DAYS)
     );
+  }
+}
+
+export class UnifiedInboxRetentionPolicyStore {
+  private readonly encryptionKey: Uint8Array;
+
+  constructor(
+    private readonly opts: {
+      storage: StorageBackend;
+      masterKey: Uint8Array;
+      fortressId: string;
+    },
+  ) {
+    this.encryptionKey = derivePurposeKey(opts.masterKey, HKDF_INFO);
+  }
+
+  async load(): Promise<UnifiedInboxRetentionPolicy> {
+    const raw = await this.opts.storage.read(
+      UNIFIED_INBOX_RETENTION_POLICY_NAMESPACE,
+      UNIFIED_INBOX_RETENTION_POLICY_KEY,
+    );
+    if (!raw || raw.length > MAX_POLICY_BYTES) {
+      return new UnifiedInboxRetentionPolicy();
+    }
+    try {
+      const encrypted = JSON.parse(bytesToString(raw)) as EncryptedPayload;
+      const plaintext = decrypt(encrypted, this.encryptionKey, this.aad());
+      const persisted = JSON.parse(
+        bytesToString(plaintext),
+      ) as PersistedRetentionPolicyEnvelope;
+      if (persisted.version !== 1) return new UnifiedInboxRetentionPolicy();
+      if (persisted.fortress_id !== this.opts.fortressId) {
+        return new UnifiedInboxRetentionPolicy();
+      }
+      return new UnifiedInboxRetentionPolicy(persisted.policies);
+    } catch {
+      return new UnifiedInboxRetentionPolicy();
+    }
+  }
+
+  async save(policy: UnifiedInboxRetentionPolicy): Promise<void> {
+    const persisted: PersistedRetentionPolicyEnvelope = {
+      version: 1,
+      fortress_id: this.opts.fortressId,
+      policies: policy.list(),
+    };
+    const encrypted = encrypt(
+      stringToBytes(JSON.stringify(persisted)),
+      this.encryptionKey,
+      this.aad(),
+    );
+    await this.opts.storage.write(
+      UNIFIED_INBOX_RETENTION_POLICY_NAMESPACE,
+      UNIFIED_INBOX_RETENTION_POLICY_KEY,
+      stringToBytes(JSON.stringify(encrypted)),
+    );
+  }
+
+  private aad(): Uint8Array {
+    return stringToBytes(`${this.opts.fortressId}|retention-policy.v1`);
   }
 }
 

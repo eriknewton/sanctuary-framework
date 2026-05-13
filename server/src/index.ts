@@ -42,6 +42,12 @@ import {
   AutoTriggerActionRegistry,
 } from "./auto-trigger/action-dispatcher.js";
 import { CalibrationSuggester } from "./auto-trigger/calibration-suggester.js";
+import { UnifiedInboxBridge } from "./principal-policy/unified-inbox-bridge.js";
+import { UnifiedInboxStore } from "./principal-policy/unified-inbox-store.js";
+import {
+  UnifiedInboxRetentionPolicyStore,
+} from "./principal-policy/unified-inbox-retention-policy.js";
+import { UnifiedInboxScheduler } from "./principal-policy/unified-inbox-scheduler.js";
 import { HandoffLog } from "./coordination/handoff-log.js";
 import { HandoffEventBridge } from "./coordination/handoff-routes.js";
 import { WorkflowStateTracker } from "./coordination/workflow-state-tracker.js";
@@ -820,6 +826,31 @@ export async function createSanctuaryServer(options?: {
   });
   autoTriggerSuggester.start();
 
+  const unifiedInboxStore = new UnifiedInboxStore({
+    storage,
+    masterKey,
+    fortressId: fortressIdForAggregator,
+  });
+  const unifiedInboxBridge = new UnifiedInboxBridge({
+    auditLog,
+    identityId: aggregatorIdentityId,
+    fortressId: fortressIdForAggregator,
+    store: unifiedInboxStore,
+  });
+  await unifiedInboxBridge.rehydratePendingFromStore();
+  const unifiedInboxRetentionPolicyStore =
+    new UnifiedInboxRetentionPolicyStore({
+      storage,
+      masterKey,
+      fortressId: fortressIdForAggregator,
+    });
+  const unifiedInboxRetentionPolicy =
+    await unifiedInboxRetentionPolicyStore.load();
+  const unifiedInboxScheduler = new UnifiedInboxScheduler({
+    bridge: unifiedInboxBridge,
+  });
+  unifiedInboxScheduler.start();
+
   // v1.3 WP-V1.3-10 Upsilon-2: wrap the approval channel with the
   // aggregator-backed channel. When `approval_redirect.enabled` is false
   // (default), the wrapper short-circuits to underlying-passthrough; the
@@ -848,6 +879,13 @@ export async function createSanctuaryServer(options?: {
   });
   if (dashboard) {
     dashboard.setApprovalAggregator(approvalAggregator);
+    dashboard.setUnifiedInbox({
+      bridge: unifiedInboxBridge,
+      retentionPolicy: unifiedInboxRetentionPolicy,
+      retentionPolicyStore: unifiedInboxRetentionPolicyStore,
+      fortressId: fortressIdForAggregator,
+      identityId: aggregatorIdentityId,
+    });
   }
 
   // v1.3 WP-V1.3-1 Phi-1: Sentinel Baseline Pack (Castle Layer 2 anchor).

@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 
 import { AuditLog, type AuditEntry } from "../../src/l2-operational/audit-log.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { runInboxCommand } from "../../src/cli/inbox.js";
 import {
   UNIFIED_INBOX_AUDIT_OPS,
   UnifiedInboxBridge,
@@ -11,8 +14,11 @@ import { UnifiedInboxStore } from "../../src/principal-policy/unified-inbox-stor
 import {
   INBOX_RETENTION_AUDIT_OPS,
   UnifiedInboxRetentionPolicy,
+  UnifiedInboxRetentionPolicyStore,
   sweepUnifiedInboxRetention,
 } from "../../src/principal-policy/unified-inbox-retention-policy.js";
+import { UnifiedInboxScheduler } from "../../src/principal-policy/unified-inbox-scheduler.js";
+import { handleUnifiedInboxRoute } from "../../src/principal-policy/unified-inbox-routes.js";
 
 const FORTRESS = "fortress_psi3";
 const IDENTITY = "identity_psi3";
@@ -63,6 +69,51 @@ function seed(bridge: UnifiedInboxBridge) {
     observed_at: "2026-05-12T11:00:00.000Z",
   })!;
   return { a, b, c };
+}
+
+async function makeInboxServer(opts: {
+  bridge: UnifiedInboxBridge;
+  auditLog: AuditLog;
+  policy: UnifiedInboxRetentionPolicy;
+  policyStore: UnifiedInboxRetentionPolicyStore;
+  fortressId?: string;
+}): Promise<{ base: string; close: () => Promise<void> }> {
+  const server: Server = createServer(async (req, res) => {
+    const handled = await handleUnifiedInboxRoute(
+      {
+        authConfig: { loopbackAutoAuth: true },
+        bridge: opts.bridge,
+        retentionPolicy: opts.policy,
+        retentionPolicyStore: opts.policyStore,
+        auditLog: opts.auditLog,
+        identityId: IDENTITY,
+        fortressId: opts.fortressId ?? FORTRESS,
+      },
+      req,
+      res,
+    );
+    if (!handled) res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address() as AddressInfo;
+  return {
+    base: `http://127.0.0.1:${addr.port}`,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+async function withDashboardUrl<T>(base: string, fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.SANCTUARY_DASHBOARD_URL;
+  process.env.SANCTUARY_DASHBOARD_URL = base;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.SANCTUARY_DASHBOARD_URL;
+    } else {
+      process.env.SANCTUARY_DASHBOARD_URL = previous;
+    }
+  }
 }
 
 describe("Psi-3 unified inbox query API", () => {
@@ -158,6 +209,18 @@ describe("Psi-3 batch actions and snooze", () => {
     expect(bridge.queryInbox().map((e) => e.inbox_id)).toContain(a.inbox_id);
     expect(bridge.unsnooze(b.inbox_id)?.state).toBe("active");
   });
+
+  it("scheduler tick auto-resurfaces due snoozes through production wiring", () => {
+    const { bridge } = rig();
+    const { a } = seed(bridge);
+    bridge.snoozeBatch([a.inbox_id], "2026-05-13T11:59:00.000Z");
+    const scheduler = new UnifiedInboxScheduler({
+      bridge,
+      now: () => new Date("2026-05-13T12:00:00.000Z"),
+    });
+    expect(scheduler.tick()).toBe(1);
+    expect(bridge.queryInbox().map((e) => e.inbox_id)).toContain(a.inbox_id);
+  });
 });
 
 describe("Psi-3 retention and isolation", () => {
@@ -205,6 +268,94 @@ describe("Psi-3 retention and isolation", () => {
       now: new Date("2026-05-15T12:00:01.000Z"),
     });
     expect(result.deleted).toBe(1);
+  });
+
+  it("CLI retention set persists across retention policy reload", async () => {
+    const { storage, masterKey, auditLog, bridge } = rig();
+    const policyStore = new UnifiedInboxRetentionPolicyStore({
+      storage,
+      masterKey,
+      fortressId: FORTRESS,
+    });
+    const server = await makeInboxServer({
+      bridge,
+      auditLog,
+      policy: await policyStore.load(),
+      policyStore,
+    });
+    try {
+      const out = { write: () => true } as unknown as NodeJS.WritableStream;
+      const err = { write: () => true } as unknown as NodeJS.WritableStream;
+      const code = await withDashboardUrl(server.base, () =>
+        runInboxCommand({
+          argv: [
+            "retention",
+            "set",
+            "--source-class",
+            "blocked_egress",
+            "--state",
+            "archived",
+            "--days",
+            "7",
+          ],
+          out,
+          err,
+        }),
+      );
+      expect(code).toBe(0);
+
+      const reloaded = await policyStore.load();
+      expect(reloaded.daysFor("blocked_egress", "archived")).toBe(7);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("CLI retention set emits inbox_retention_policy_updated audit", async () => {
+    const { storage, masterKey, auditLog, bridge } = rig();
+    const policyStore = new UnifiedInboxRetentionPolicyStore({
+      storage,
+      masterKey,
+      fortressId: FORTRESS,
+    });
+    const server = await makeInboxServer({
+      bridge,
+      auditLog,
+      policy: await policyStore.load(),
+      policyStore,
+    });
+    try {
+      const out = { write: () => true } as unknown as NodeJS.WritableStream;
+      const err = { write: () => true } as unknown as NodeJS.WritableStream;
+      const code = await withDashboardUrl(server.base, () =>
+        runInboxCommand({
+          argv: [
+            "retention",
+            "set",
+            "--source-class",
+            "budget_warning",
+            "--state",
+            "dismissed",
+            "--days",
+            "14",
+          ],
+          out,
+          err,
+        }),
+      );
+      expect(code).toBe(0);
+      const updated = (await auditEntries(auditLog)).find(
+        (e) => e.operation === INBOX_RETENTION_AUDIT_OPS.POLICY_UPDATED,
+      );
+      expect(updated?.details).toMatchObject({
+        fortress_id: FORTRESS,
+        source_class: "budget_warning",
+        state: "dismissed",
+        retain_for_days: 14,
+      });
+    } finally {
+      await server.close();
+    }
   });
 
   it("retention sweep emits one summary audit event per fortress", async () => {
