@@ -66,6 +66,7 @@ import {
 import { TrapRegistry } from "./trap-registry.js";
 import type { TrapStore } from "./trap-store.js";
 import type { ToolCallTrapRuntime } from "./tool-call-trap-runtime.js";
+import type { CredentialTrapRuntime } from "./credential-trap-runtime.js";
 
 export const HONEYPOT_API_PREFIX = "/api/honeypot";
 
@@ -83,6 +84,8 @@ export interface HoneypotTriggerDeps {
   fortressId: string;
   /** Wall-clock provider for tests. */
   now?: () => Date;
+  /** Pi-4 credential trap runtime for credential-use front-of-dispatch checks. */
+  credentialRuntime?: CredentialTrapRuntime;
 }
 
 /** Management-route dependencies (superset of trigger deps). */
@@ -104,6 +107,8 @@ export interface HoneypotRouterDeps extends HoneypotTriggerDeps {
   store?: TrapStore;
   /** Pi-3 tool-call trap runtime for stats + invocation drilldown. */
   toolCallRuntime?: ToolCallTrapRuntime;
+  /** Pi-4 credential trap runtime for stats + read/use drilldown. */
+  credentialRuntime?: CredentialTrapRuntime;
 }
 
 // ── Front-of-dispatch trap-trigger hook ──────────────────────────────────
@@ -143,6 +148,16 @@ export async function handleHoneypotTriggerIfMatch(
   if (path.startsWith(HONEYPOT_API_PREFIX)) return false;
   if (path.startsWith("/api/sentinels")) return false;
   if (path.startsWith("/api/coordination")) return false;
+
+  const credentialUse = await deps.credentialRuntime?.detectHttpUseAttempt(req);
+  if (credentialUse?.handled) {
+    res.writeHead(credentialUse.statusCode, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+    });
+    res.end(credentialUse.responseBody);
+    return true;
+  }
 
   const match = deps.registry.findMatching({ path, method });
   if (!match) return false;
@@ -407,6 +422,12 @@ export async function handleHoneypotRoute(
       return true;
     }
 
+    if (method === "GET" && path === `${HONEYPOT_API_PREFIX}/credential-traps`) {
+      const stats = deps.credentialRuntime?.stats() ?? [];
+      writeJSON(res, 200, { ok: true, data: { traps: stats } });
+      return true;
+    }
+
     const trapMatch = matchTrapIdRoute(path);
     if (method === "DELETE" && trapMatch) {
       const removed = deps.registry.undeploy(trapMatch.trapId);
@@ -490,6 +511,16 @@ function deployAuditTriggerDetails(spec: TrapSpec): Record<string, unknown> {
       fake_tool_name: spec.trigger.fake_tool_name,
       catalog_visibility: spec.trigger.catalog_visibility,
       visible_to_agents: spec.trigger.visible_to_agents ?? [],
+    };
+  }
+  if (spec.trigger.kind === "credential") {
+    return {
+      fake_credential_name: spec.trigger.fake_credential_name,
+      fake_credential_type: spec.trigger.fake_credential_type,
+      visibility: spec.trigger.visibility,
+      visible_to_agents: spec.trigger.visible_to_agents ?? [],
+      emission_paths: spec.trigger.emission_paths,
+      monitored_target_hosts: spec.trigger.monitored_target_hosts ?? [],
     };
   }
   return { path_pattern: spec.trigger.path_pattern };

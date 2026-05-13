@@ -48,6 +48,7 @@ import { WorkflowStateTracker } from "./coordination/workflow-state-tracker.js";
 import { TrapRegistry } from "./honeypot/trap-registry.js";
 import { TrapStore } from "./honeypot/trap-store.js";
 import { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
+import { CredentialTrapRuntime } from "./honeypot/credential-trap-runtime.js";
 import { HONEYPOT_AUDIT_OPS } from "./honeypot/types.js";
 import { PHI1_BASELINE_CATALOG } from "./sentinel/sentinels/index.js";
 import { loadSentinelSubscriptions } from "./sentinel/subscription-store.js";
@@ -986,6 +987,13 @@ export async function createSanctuaryServer(options?: {
     operatorId: aggregatorIdentityId,
     fortressId: fortressIdForAggregator,
   });
+  const credentialTrapRuntime = new CredentialTrapRuntime({
+    registry: honeypotRegistry,
+    findingStore: sentinelFindingStore,
+    auditLog,
+    operatorId: aggregatorIdentityId,
+    fortressId: fortressIdForAggregator,
+  });
   try {
     const persistedSpecs = await honeypotStore.loadAll();
     for (const spec of persistedSpecs) {
@@ -1020,6 +1028,7 @@ export async function createSanctuaryServer(options?: {
       ...(intelligenceSelector ? { selector: intelligenceSelector } : {}),
       store: honeypotStore,
       toolCallRuntime: toolCallTrapRuntime,
+      credentialRuntime: credentialTrapRuntime,
     });
   }
 

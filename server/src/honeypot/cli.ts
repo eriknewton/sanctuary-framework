@@ -8,6 +8,7 @@
  *   sanctuary honeypot deploy <trap_id>        POST /api/honeypot/deploy
  *   sanctuary honeypot list                    GET  /api/honeypot/traps
  *   sanctuary honeypot tool-traps list         list tool-call trap stats
+ *   sanctuary honeypot credential-traps list   list credential trap stats
  *   sanctuary honeypot undeploy <trap_id>      DELETE /api/honeypot/traps/:id
  *   sanctuary honeypot findings [--since=...]  GET  /api/honeypot/findings
  *
@@ -49,11 +50,15 @@ function formatTriggerSuffix(trigger: TrapTrigger): string {
   if (trigger.kind === "filesystem") {
     return ` (ops=${trigger.ops.join(",")})`;
   }
+  if (trigger.kind === "credential") {
+    return ` (${trigger.fake_credential_type}; paths=${trigger.emission_paths.join(",")})`;
+  }
   return ` (${trigger.catalog_visibility})`;
 }
 
 function formatTriggerPrimary(trigger: TrapTrigger): string {
   if (trigger.kind === "tool_call") return trigger.fake_tool_name;
+  if (trigger.kind === "credential") return trigger.fake_credential_name;
   return trigger.path_pattern;
 }
 import {
@@ -81,6 +86,14 @@ export interface HoneypotCliDeps {
     fake_tool_name: string;
     invocation_count: number;
     last_invocation_at: string | null;
+    caller_diversity: number;
+  }>;
+  credentialTrapStats?: () => Array<{
+    trap_id: string;
+    fake_credential_name: string;
+    read_count: number;
+    use_attempt_count: number;
+    last_access_at: string | null;
     caller_diversity: number;
   }>;
   now?: () => Date;
@@ -129,7 +142,7 @@ export async function runHoneypotCli(
   if (!command || command === "--help" || command === "-h") {
     write(
       out,
-      "Usage: sanctuary honeypot <compile|deploy|list|tool-traps|undeploy|findings>\n",
+      "Usage: sanctuary honeypot <compile|deploy|list|tool-traps|credential-traps|undeploy|findings>\n",
     );
     return command ? 0 : 2;
   }
@@ -166,7 +179,10 @@ export async function runHoneypotCli(
       write(out, `source: ${result.source}\n`);
       write(out, `class: ${result.spec.trap_class}\n`);
       const label =
-        result.spec.trigger.kind === "tool_call" ? "target" : "pattern";
+        result.spec.trigger.kind === "tool_call" ||
+        result.spec.trigger.kind === "credential"
+          ? "target"
+          : "pattern";
       write(
         out,
         `${label}: ${formatTriggerPrimary(result.spec.trigger)}${formatTriggerSuffix(result.spec.trigger)}\n`,
@@ -261,6 +277,43 @@ export async function runHoneypotCli(
         write(
           out,
           `${t.trap_id}  ${t.fake_tool_name}  invocations=${t.invocation_count}  callers=${t.caller_diversity}  last=${t.last_invocation_at ?? "never"}\n`,
+        );
+      }
+    }
+    return 0;
+  }
+
+  if (command === "credential-traps") {
+    const sub = argv[1];
+    if (sub !== "list") {
+      write(err, "Usage: sanctuary honeypot credential-traps list\n");
+      return 2;
+    }
+    const traps = deps.credentialTrapStats
+      ? deps.credentialTrapStats()
+      : deps.registry
+          .list()
+          .filter((t) => t.trigger.kind === "credential")
+          .map((t) => ({
+            trap_id: t.trap_id,
+            fake_credential_name:
+              t.trigger.kind === "credential"
+                ? t.trigger.fake_credential_name
+                : "",
+            read_count: 0,
+            use_attempt_count: 0,
+            last_access_at: null,
+            caller_diversity: 0,
+          }));
+    if (json) {
+      write(out, JSON.stringify({ traps }, null, 2) + "\n");
+    } else if (traps.length === 0) {
+      write(out, "no credential honeypot traps deployed\n");
+    } else {
+      for (const t of traps) {
+        write(
+          out,
+          `${t.trap_id}  ${t.fake_credential_name}  reads=${t.read_count}  uses=${t.use_attempt_count}  callers=${t.caller_diversity}  last=${t.last_access_at ?? "never"}\n`,
         );
       }
     }

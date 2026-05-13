@@ -61,7 +61,7 @@ const state = {
   templateBinding: { agentId: null, selectedTemplateId: null, pendingItemId: null, error: null },
   privacyEvents: [],
   handoffEvents: [],
-  honeypot: { toolTraps: [], loadError: null },
+  honeypot: { toolTraps: [], credentialTraps: [], loadError: null },
   topbarPills: { deployment: "local", mode: "solo", attestation: "pending" },
   tier1: {
     lockdown: { state: "idle", inboxItemId: null }
@@ -903,8 +903,9 @@ function renderAgentAttestationBadgeForState(cls, label) {
 }
 
 function renderHoneypotPage() {
-  const traps = state.honeypot.toolTraps || [];
-  const rows = traps.length ? traps.map(function (trap) {
+  const toolTraps = state.honeypot.toolTraps || [];
+  const credentialTraps = state.honeypot.credentialTraps || [];
+  const toolRows = toolTraps.length ? toolTraps.map(function (trap) {
     const activations = trap.activations || [];
     const latest = activations.length ? activations[activations.length - 1] : null;
     const followups = latest && latest.follow_up_tool_calls ? latest.follow_up_tool_calls : [];
@@ -929,14 +930,40 @@ function renderHoneypotPage() {
       (latest ? '<pre class="terminal-block">' + escHtml(JSON.stringify(latest.invocation_args || {}, null, 2)) + '</pre>' : '') +
     '</section>';
   }).join("") : '<section class="card"><h3>No tool-call traps deployed.</h3><p class="muted">Compile and deploy a tool_call honeypot to see catalog injections and invocations here.</p></section>';
+  const credentialRows = credentialTraps.length ? credentialTraps.map(function (trap) {
+    const accesses = trap.accesses || [];
+    const attempts = trap.use_attempts || [];
+    const latestAccess = accesses.length ? accesses[accesses.length - 1] : null;
+    const latestAttempt = attempts.length ? attempts[attempts.length - 1] : null;
+    const latestText = latestAccess
+      ? escHtml(latestAccess.caller_identity) + " read " + escHtml(trap.fake_credential_name) + " from " + escHtml(latestAccess.emission_path) + " at " + escHtml(shortTime(latestAccess.accessed_at)) + "."
+      : "No reads recorded.";
+    const attemptText = latestAttempt
+      ? escHtml(latestAttempt.caller_identity) + " attempted use against " + escHtml(latestAttempt.target_host) + " at " + escHtml(shortTime(latestAttempt.attempted_at)) + ". Castle Wall blocked the egress."
+      : "No use attempts recorded.";
+    return '<section class="card">' +
+      '<div class="page-head" style="margin-bottom:8px;"><div>' +
+        '<p class="eyebrow">Credential trap</p>' +
+        '<h2>' + escHtml(trap.fake_credential_name) + '</h2>' +
+      '</div><span class="label">' + escHtml(trap.visibility) + '</span></div>' +
+      '<div class="layer-grid">' +
+        '<div class="layer-card"><h4>Reads</h4><p>' + escHtml(trap.read_count) + '</p></div>' +
+        '<div class="layer-card"><h4>Use attempts</h4><p>' + escHtml(trap.use_attempt_count) + '</p></div>' +
+        '<div class="layer-card"><h4>Caller diversity</h4><p>' + escHtml(trap.caller_diversity) + '</p></div>' +
+      '</div>' +
+      '<p class="muted">Emission paths: ' + escHtml((trap.emission_paths || []).join(", ")) + '</p>' +
+      '<p class="muted">' + latestText + '</p>' +
+      '<p class="muted">' + attemptText + '</p>' +
+    '</section>';
+  }).join("") : '<section class="card"><h3>No credential traps deployed.</h3><p class="muted">Compile and deploy a credential honeypot to see broker, env, config, and use-attempt detections here.</p></section>';
   const error = state.honeypot.loadError
     ? '<p class="muted">Honeypot stats unavailable: ' + escHtml(state.honeypot.loadError) + '</p>'
     : '';
   return '<div class="page-head"><div>' +
     '<p class="eyebrow">Honeypots</p>' +
-    '<h1>Tool-call traps.</h1>' +
-    '<p class="sub">Fake MCP tools in the wrapped-agent catalog. Invocations create sentinel findings and correlate the next 5 minutes of tool calls.</p>' +
-  '</div></div>' + error + rows;
+    '<h1>Honeypot traps.</h1>' +
+    '<p class="sub">Fake tools and fake credentials. Reads, invocations, and attempted credential use create sentinel findings without revealing the trap.</p>' +
+  '</div></div>' + error + credentialRows + toolRows;
 }
 
 function relTimeFromIso(iso) {
@@ -2140,8 +2167,10 @@ async function fetchAll() {
 
 async function fetchHoneypotState() {
   try {
-    const r = await honeypotApi("/tool-traps");
-    state.honeypot.toolTraps = (r.data && r.data.traps) || [];
+    const tool = await honeypotApi("/tool-traps");
+    const credential = await honeypotApi("/credential-traps");
+    state.honeypot.toolTraps = (tool.data && tool.data.traps) || [];
+    state.honeypot.credentialTraps = (credential.data && credential.data.traps) || [];
     state.honeypot.loadError = null;
   } catch (e) {
     state.honeypot.loadError = e && e.message ? e.message : String(e);

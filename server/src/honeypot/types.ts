@@ -88,6 +88,22 @@ export type ToolCallCatalogVisibility =
   | "all_wrapped_agents"
   | "specific_agents";
 
+export type CredentialVisibility =
+  | "all_wrapped_agents"
+  | "specific_agents";
+
+export type CredentialType =
+  | "api_key"
+  | "password"
+  | "session_token"
+  | "bearer_token"
+  | "oauth_refresh";
+
+export type CredentialEmissionPath =
+  | "secret_broker"
+  | "env_var_export"
+  | "config_file";
+
 /**
  * Tool-call trap trigger (Pi-3). The runtime injects a fake tool into
  * the MCP list_tools response seen by wrapped agents. Invoking the fake
@@ -105,6 +121,23 @@ export interface ToolCallTrigger {
 }
 
 /**
+ * Credential trap trigger (Pi-4). The runtime exposes an operator-
+ * controlled fake credential through broker/env/config-shaped read
+ * surfaces and fires when a wrapped agent reads or attempts to use it.
+ */
+export interface CredentialTrigger {
+  kind: "credential";
+  fake_credential_name: string;
+  fake_credential_type: CredentialType;
+  fake_credential_value: string;
+  visibility: CredentialVisibility;
+  visible_to_agents?: string[];
+  emission_paths: CredentialEmissionPath[];
+  fake_response_on_use?: string;
+  monitored_target_hosts?: string[];
+}
+
+/**
  * Discriminated-union trigger keyed by `kind`. The outer `trap_class`
  * field on TrapSpec keeps the operator-facing taxonomy; the inner
  * `kind` discriminator on the trigger is what TypeScript narrows on
@@ -113,7 +146,8 @@ export interface ToolCallTrigger {
 export type TrapTrigger =
   | HttpEndpointTrigger
   | FilesystemTrigger
-  | ToolCallTrigger;
+  | ToolCallTrigger
+  | CredentialTrigger;
 
 /**
  * One compiled trap. Persisted by the registry, deployed to the

@@ -257,6 +257,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private honeypotToolCallRuntime:
     | import("../honeypot/tool-call-trap-runtime.js").ToolCallTrapRuntime
     | null = null;
+  private honeypotCredentialRuntime:
+    | import("../honeypot/credential-trap-runtime.js").CredentialTrapRuntime
+    | null = null;
   private autoTriggerStore: ThresholdConfigStore | null = null;
   private autoTriggerDispatcher: ActionDispatcher | null = null;
   private autoTriggerSuggester: CalibrationSuggester | null = null;
@@ -411,6 +414,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
      */
     store?: import("../honeypot/trap-store.js").TrapStore | null;
     toolCallRuntime?: import("../honeypot/tool-call-trap-runtime.js").ToolCallTrapRuntime | null;
+    credentialRuntime?: import("../honeypot/credential-trap-runtime.js").CredentialTrapRuntime | null;
   }): void {
     this.honeypotRegistry = opts.registry;
     this.honeypotFindingStore = opts.findingStore ?? null;
@@ -420,6 +424,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.honeypotSelector = opts.selector ?? null;
     this.honeypotStore = opts.store ?? null;
     this.honeypotToolCallRuntime = opts.toolCallRuntime ?? null;
+    this.honeypotCredentialRuntime = opts.credentialRuntime ?? null;
   }
 
   /**
@@ -586,6 +591,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         ...(this.honeypotToolCallRuntime !== null
           ? { toolCallRuntime: this.honeypotToolCallRuntime }
           : {}),
+        ...(this.honeypotCredentialRuntime !== null
+          ? { credentialRuntime: this.honeypotCredentialRuntime }
+          : {}),
       },
       req,
       res,
@@ -621,6 +629,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           this.identityManager?.getPrimaryIdentityId() ??
           "operator_dashboard",
         fortressId: this.honeypotFortressId ?? "fortress_default",
+        ...(this.honeypotCredentialRuntime !== null
+          ? { credentialRuntime: this.honeypotCredentialRuntime }
+          : {}),
       },
       req,
       res,
