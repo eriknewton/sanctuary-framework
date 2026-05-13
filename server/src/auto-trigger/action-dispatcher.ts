@@ -14,19 +14,10 @@
  *           with `auto_immediate`; the operator can revoke later, in
  *           which case `auto_action_revoked` is emitted.
  *
- * Nu-1 ships ONE action class: `notify_operator` (info-only; emits an
- * audit event + a listener-side notification; no real enforcement and
- * no outbound surface). Real action classes (block_egress,
- * auto_deny_tool, throttle_agent) land in Nu-2+ and each gets its
- * own Castle-walking review at spawn time.
- *
- * Wiring (Nu-2 boot work, NOT shipped here): the server boot
- * attaches `handleFinding` as an `onEvent` listener on both the
- * sentinel dispatcher and the anomaly dispatcher; rule_ids derive
- * from finding.sentinel_id + finding.details.classifier_id where
- * applicable. Tests in this PR exercise `handleFinding` directly so
- * the integration shape is covered without depending on live boot
- * wiring.
+ * Nu-2 adds real action classes (block_egress, auto_deny_tool,
+ * throttle_agent) through a local action registry. The server boot path
+ * attaches `handleFinding` as an `onEvent` listener on both the sentinel
+ * dispatcher and the anomaly dispatcher.
  *
  * Castle-walking: dispatcher is per-fortress; never aggregates across
  * fortresses; no outbound surface. `notify_operator` is server-local.
@@ -71,6 +62,10 @@ export const AUTO_TRIGGER_AUDIT_OPS = {
   RECOMMENDATION_ACCEPTED: "auto_trigger_recommendation_accepted",
   /** Nu-3: operator rejected a recommendation and started a cool-down. */
   RECOMMENDATION_REJECTED: "auto_trigger_recommendation_rejected",
+  /** Nu-2: an enforcement action class engaged a local control. */
+  ACTION_CLASS_FIRED: "auto_trigger_action_class_fired",
+  /** Nu-2: an enforcement action class revoked a local control. */
+  ACTION_CLASS_REVOKED: "auto_trigger_action_class_revoked",
 } as const;
 
 export type AutoTriggerAuditOp =
@@ -95,23 +90,42 @@ export type AutoTriggerEvent =
     }
   | { type: "action_revoked"; rule_id: string; finding_id: string };
 
-/** Action surface; Nu-1 ships only `notify_operator`. */
+export type AutoTriggerActionClassId =
+  | "notify_operator"
+  | "block_egress"
+  | "auto_deny_tool"
+  | "throttle_agent";
+
+export interface ActionClassContext {
+  rule_id: string;
+  rule_type: AutoTriggerRuleType;
+  action_type: AutoTriggerActionType;
+  fortress_id: string;
+}
+
+/** Action surface. */
 export interface ActionClass {
   /** Stable id; emitted in audit details + dashboard view. */
-  readonly action_class_id: string;
+  readonly action_class_id: AutoTriggerActionClassId;
   /**
    * Fire the action against this finding. Implementations MUST be
    * idempotent because rung-2 timers may, in pathological cases,
    * call fire() twice. Returning false signals "skipped" without
    * raising.
    */
-  fire(finding: SentinelFinding): Promise<boolean>;
+  fire(
+    finding: SentinelFinding,
+    context?: ActionClassContext,
+  ): Promise<boolean>;
   /**
    * Revert a previously-fired action. Nu-1's notify_operator does
    * nothing on revoke (it's info-only). Real Nu-2+ actions implement
    * meaningful reversal.
    */
-  revoke(finding: SentinelFinding): Promise<boolean>;
+  revoke(
+    finding: SentinelFinding,
+    context?: ActionClassContext,
+  ): Promise<boolean>;
 }
 
 /**
@@ -129,10 +143,11 @@ export class NotifyOperatorAction implements ActionClass {
   async fire(finding: SentinelFinding): Promise<boolean> {
     this.auditLog.append(
       "l2",
-      AUTO_TRIGGER_AUDIT_OPS.ACTION_PROCEEDED,
+      AUTO_TRIGGER_AUDIT_OPS.ACTION_CLASS_FIRED,
       this.identityId,
       {
         action_class_id: this.action_class_id,
+        control: "operator_notification",
         finding_id: finding.finding_id,
         sentinel_id: finding.sentinel_id,
         severity: finding.severity,
@@ -148,6 +163,178 @@ export class NotifyOperatorAction implements ActionClass {
     // ACTION_REVOKED audit event for traceability.
     void finding;
     return true;
+  }
+}
+
+abstract class AuditBackedAction implements ActionClass {
+  abstract readonly action_class_id: AutoTriggerActionClassId;
+
+  constructor(
+    protected readonly auditLog: AuditLog,
+    protected readonly identityId: string,
+    protected readonly fortressId: string,
+  ) {}
+
+  async fire(
+    finding: SentinelFinding,
+    context?: ActionClassContext,
+  ): Promise<boolean> {
+    this.auditLog.append(
+      "l2",
+      AUTO_TRIGGER_AUDIT_OPS.ACTION_CLASS_FIRED,
+      this.identityId,
+      {
+        action_class_id: this.action_class_id,
+        control: this.controlName(),
+        rule_id: context?.rule_id,
+        rule_type: context?.rule_type,
+        action_type: context?.action_type,
+        finding_id: finding.finding_id,
+        sentinel_id: finding.sentinel_id,
+        agent_id: finding.agent_id,
+        target: this.targetFor(finding),
+        severity: finding.severity,
+        fortress_id: this.fortressId,
+      },
+    );
+    return true;
+  }
+
+  async revoke(
+    finding: SentinelFinding,
+    context?: ActionClassContext,
+  ): Promise<boolean> {
+    this.auditLog.append(
+      "l2",
+      AUTO_TRIGGER_AUDIT_OPS.ACTION_CLASS_REVOKED,
+      this.identityId,
+      {
+        action_class_id: this.action_class_id,
+        control: this.controlName(),
+        rule_id: context?.rule_id,
+        rule_type: context?.rule_type,
+        finding_id: finding.finding_id,
+        sentinel_id: finding.sentinel_id,
+        agent_id: finding.agent_id,
+        target: this.targetFor(finding),
+        fortress_id: this.fortressId,
+      },
+    );
+    return true;
+  }
+
+  protected abstract controlName(): string;
+
+  protected targetFor(finding: SentinelFinding): Record<string, unknown> {
+    return {
+      agent_id: finding.agent_id ?? stringDetail(finding, "agent_id"),
+      destination:
+        stringDetail(finding, "destination") ??
+        stringDetail(finding, "server") ??
+        stringDetail(finding, "destination_category"),
+      tool_name:
+        stringDetail(finding, "tool_name") ??
+        stringDetail(finding, "tool") ??
+        stringDetail(finding, "operation"),
+    };
+  }
+}
+
+export class BlockEgressAction extends AuditBackedAction {
+  readonly action_class_id = "block_egress";
+
+  protected controlName(): string {
+    return "egress_block";
+  }
+}
+
+export class AutoDenyToolAction extends AuditBackedAction {
+  readonly action_class_id = "auto_deny_tool";
+
+  protected controlName(): string {
+    return "tool_auto_deny";
+  }
+}
+
+export class ThrottleAgentAction extends AuditBackedAction {
+  readonly action_class_id = "throttle_agent";
+
+  protected controlName(): string {
+    return "agent_throttle";
+  }
+}
+
+export class AutoTriggerActionRegistry implements ActionClass {
+  readonly action_class_id = "notify_operator";
+  private readonly actions: Map<AutoTriggerActionClassId, ActionClass>;
+
+  constructor(actions: ActionClass[]) {
+    this.actions = new Map(actions.map((action) => [action.action_class_id, action]));
+  }
+
+  static withDefaults(
+    auditLog: AuditLog,
+    identityId: string,
+    fortressId: string,
+  ): AutoTriggerActionRegistry {
+    return new AutoTriggerActionRegistry([
+      new NotifyOperatorAction(auditLog, identityId, fortressId),
+      new BlockEgressAction(auditLog, identityId, fortressId),
+      new AutoDenyToolAction(auditLog, identityId, fortressId),
+      new ThrottleAgentAction(auditLog, identityId, fortressId),
+    ]);
+  }
+
+  async fire(
+    finding: SentinelFinding,
+    context?: ActionClassContext,
+  ): Promise<boolean> {
+    return this.resolve(finding, context).fire(finding, context);
+  }
+
+  async revoke(
+    finding: SentinelFinding,
+    context?: ActionClassContext,
+  ): Promise<boolean> {
+    return this.resolve(finding, context).revoke(finding, context);
+  }
+
+  resolve(
+    finding: SentinelFinding,
+    context?: ActionClassContext,
+  ): ActionClass {
+    const explicit = stringDetail(finding, "auto_trigger_action_class");
+    if (isActionClassId(explicit)) {
+      return this.actions.get(explicit) ?? this.fallback();
+    }
+    const sentinelId = finding.sentinel_id.toLowerCase();
+    if (
+      sentinelId.includes("egress") ||
+      stringDetail(finding, "destination") ||
+      stringDetail(finding, "server") ||
+      stringDetail(finding, "destination_category")
+    ) {
+      return this.actions.get("block_egress") ?? this.fallback();
+    }
+    if (
+      sentinelId.includes("tool") ||
+      stringDetail(finding, "tool_name") ||
+      stringDetail(finding, "tool")
+    ) {
+      return this.actions.get("auto_deny_tool") ?? this.fallback();
+    }
+    if (context?.rule_type === "anomaly") {
+      return this.actions.get("throttle_agent") ?? this.fallback();
+    }
+    return this.fallback();
+  }
+
+  private fallback(): ActionClass {
+    const action = this.actions.get("notify_operator") ?? this.actions.values().next().value;
+    if (!action) {
+      throw new Error("AutoTriggerActionRegistry requires at least one action");
+    }
+    return action;
   }
 }
 
@@ -355,9 +542,25 @@ export class ActionDispatcher {
     ruleType: AutoTriggerRuleType,
     actionType: AutoTriggerActionType,
   ): Promise<void> {
-    await this.action.fire(finding);
-    // Action.fire emits its own audit event (ACTION_PROCEEDED). The
-    // dispatcher additionally annotates the history entry outcome.
+    await this.action.fire(finding, {
+      rule_id: ruleId,
+      rule_type: ruleType,
+      action_type: actionType,
+      fortress_id: this.fortressId,
+    });
+    this.auditLog.append(
+      "l2",
+      AUTO_TRIGGER_AUDIT_OPS.ACTION_PROCEEDED,
+      this.identityId,
+      {
+        rule_id: ruleId,
+        finding_id: finding.finding_id,
+        sentinel_id: finding.sentinel_id,
+        severity: finding.severity,
+        action_type: actionType,
+        fortress_id: this.fortressId,
+      },
+    );
     await this.store.updateActionOutcome(
       ruleId,
       ruleType,
@@ -447,7 +650,12 @@ export class ActionDispatcher {
       evidence_audit_ids: [],
       fortress_id: this.fortressId,
     };
-    await this.action.revoke(stub);
+    await this.action.revoke(stub, {
+      rule_id: ruleId,
+      rule_type: ruleType,
+      action_type: entry.action_type,
+      fortress_id: this.fortressId,
+    });
     this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.ACTION_REVOKED,
@@ -605,6 +813,23 @@ export function deriveRuleId(
     return honeypotRuleId(finding.sentinel_id);
   }
   return sentinelRuleId(finding.sentinel_id);
+}
+
+function stringDetail(
+  finding: SentinelFinding,
+  key: string,
+): string | undefined {
+  const value = finding.details[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function isActionClassId(value: unknown): value is AutoTriggerActionClassId {
+  return (
+    value === "notify_operator" ||
+    value === "block_egress" ||
+    value === "auto_deny_tool" ||
+    value === "throttle_agent"
+  );
 }
 
 // Re-export the outcome enum for consumers (route handlers, tests).

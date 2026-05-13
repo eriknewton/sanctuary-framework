@@ -39,7 +39,7 @@ import { AnomalyPipelineDispatcher } from "./anomaly-detection/anomaly-pipeline.
 import { ThresholdConfigStore } from "./auto-trigger/threshold-config-store.js";
 import {
   ActionDispatcher,
-  NotifyOperatorAction,
+  AutoTriggerActionRegistry,
 } from "./auto-trigger/action-dispatcher.js";
 import { CalibrationSuggester } from "./auto-trigger/calibration-suggester.js";
 import { HandoffLog } from "./coordination/handoff-log.js";
@@ -798,7 +798,7 @@ export async function createSanctuaryServer(options?: {
     masterKey,
     fortressId: fortressIdForAggregator,
   });
-  const autoTriggerAction = new NotifyOperatorAction(
+  const autoTriggerAction = AutoTriggerActionRegistry.withDefaults(
     auditLog,
     aggregatorIdentityId,
     fortressIdForAggregator,

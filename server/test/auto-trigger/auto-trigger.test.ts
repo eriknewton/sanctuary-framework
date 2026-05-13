@@ -43,6 +43,7 @@ import type { SentinelFinding } from "../../src/sentinel/types.js";
 
 import {
   ActionDispatcher,
+  AutoTriggerActionRegistry,
   NotifyOperatorAction,
   AUTO_TRIGGER_AUDIT_OPS,
   deriveRuleId,
@@ -376,6 +377,76 @@ describe("Nu-1: ThresholdConfigStore lifecycle", () => {
 });
 
 describe("Nu-1: ActionDispatcher routing per rung", () => {
+  it("Nu-2 real action registry maps egress findings to block_egress", async () => {
+    const { auditLog, store, scheduler, fortressId } = makeRig();
+    const dispatcher = new ActionDispatcher({
+      store,
+      action: AutoTriggerActionRegistry.withDefaults(auditLog, IDENTITY, fortressId),
+      auditLog,
+      fortressId,
+      identityId: IDENTITY,
+      schedule: scheduler.schedule,
+    });
+    const finding = makeFinding({
+      finding_id: "egress-action-1",
+      sentinel_id: "egress-volume-watcher",
+      agent_id: "agent-a",
+      details: { server: "api.example.test" },
+    });
+    await store.promote(deriveRuleId(finding, "sentinel"), "sentinel");
+    await store.promote(deriveRuleId(finding, "sentinel"), "sentinel");
+
+    await dispatcher.handleFinding(finding, "sentinel");
+    await auditLog.flush();
+
+    const entries = await auditLog.query({
+      operation_type: AUTO_TRIGGER_AUDIT_OPS.ACTION_CLASS_FIRED,
+      limit: 10,
+    });
+    expect(entries.entries.at(-1)?.details?.action_class_id).toBe("block_egress");
+    expect(entries.entries.at(-1)?.details?.control).toBe("egress_block");
+  });
+
+  it("Nu-2 real action registry maps tool findings and anomalies to concrete classes", async () => {
+    const { auditLog, store, scheduler, fortressId } = makeRig();
+    const dispatcher = new ActionDispatcher({
+      store,
+      action: AutoTriggerActionRegistry.withDefaults(auditLog, IDENTITY, fortressId),
+      auditLog,
+      fortressId,
+      identityId: IDENTITY,
+      schedule: scheduler.schedule,
+    });
+    const toolFinding = makeFinding({
+      finding_id: "tool-action-1",
+      sentinel_id: "suspicious-tool-call-detector",
+      details: { tool_name: "shell" },
+    });
+    const anomalyFinding = makeFinding({
+      finding_id: "anomaly-action-1",
+      sentinel_id: "chi-detector",
+      details: { detector_id: "chi-detector", classifier_id: "rolling" },
+    });
+    for (const [finding, type] of [
+      [toolFinding, "sentinel"],
+      [anomalyFinding, "anomaly"],
+    ] as const) {
+      const ruleId = deriveRuleId(finding, type);
+      await store.promote(ruleId, type);
+      await store.promote(ruleId, type);
+      await dispatcher.handleFinding(finding, type);
+    }
+    await auditLog.flush();
+
+    const entries = await auditLog.query({
+      operation_type: AUTO_TRIGGER_AUDIT_OPS.ACTION_CLASS_FIRED,
+      limit: 10,
+    });
+    const classes = entries.entries.map((entry) => entry.details?.action_class_id);
+    expect(classes).toContain("auto_deny_tool");
+    expect(classes).toContain("throttle_agent");
+  });
+
   it("rung 1 (default): handleFinding emits NO action_pending and records history pending", async () => {
     const { dispatcher, auditLog, store } = makeRig();
     const finding = makeFinding({ sentinel_id: "stub" });

@@ -57,7 +57,7 @@ const state = {
   inbox: [],
   activity: [],
   policies: [],
-  autoTrigger: { recommendations: [], loadError: null },
+  autoTrigger: { rules: [], recommendations: [], loadError: null, savingRuleId: null },
   templateBinding: { agentId: null, selectedTemplateId: null, pendingItemId: null, error: null },
   privacyEvents: [],
   handoffEvents: [],
@@ -147,6 +147,10 @@ function escHtml(v) {
   return String(v).replace(/[&<>"']/g, function (c) {
     return ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"})[c];
   });
+}
+
+function escCssAttr(v) {
+  return String(v || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 function shortTime(iso) {
@@ -1836,7 +1840,11 @@ function renderPolicyCenter() {
 }
 
 function renderAutoTriggerPage() {
+  const rules = state.autoTrigger.rules || [];
   const recs = state.autoTrigger.recommendations || [];
+  const summary = rules.length
+    ? '<div class="auto-trigger-rule-list">' + rules.map(renderAutoTriggerRuleRow).join("") + '</div>'
+    : '<p class="muted">No auto-trigger rules have fired yet. Rules appear here after a sentinel, anomaly detector, or honeypot records its first finding.</p>';
   const body = recs.length
     ? '<div class="recommendation-list">' + recs.map(function (r) {
         const hs = r.history_summary || {};
@@ -1870,10 +1878,51 @@ function renderAutoTriggerPage() {
     : '';
   return '<section class="policy-center">' +
     '<p class="eyebrow">AUTO-TRIGGER LADDER</p>' +
-    '<h1>Recommendations <span class="pill tone-info">operator controlled</span></h1>' +
-    '<p class="policy-subtitle">Promotion and demotion suggestions are based on local rule history. Accepting is the operator action that changes a rung.</p>' +
+    '<h1>Calibration <span class="pill tone-info">operator controlled</span></h1>' +
+    '<p class="policy-subtitle">Each rule starts operator-approved. Thresholds, cancel windows, and rung changes stay local to this fortress and write an audit receipt.</p>' +
+    '<section class="policy-panel"><h2>Rules</h2>' + error + summary + '</section>' +
     '<section class="policy-panel"><h2>Recommendations</h2>' + error + body + '</section>' +
   '</section>';
+}
+
+function renderAutoTriggerRuleRow(rule) {
+  const o = rule.threshold_overrides || {};
+  const history = (rule.history || []).slice(-30);
+  const recent = history.slice(-6).reverse();
+  const trend = renderAutoTriggerTrend(history);
+  const saving = state.autoTrigger.savingRuleId === rule.rule_id;
+  const recentHtml = recent.length
+    ? recent.map(function (h) {
+        return '<span class="history-chip ' + escHtml(h.outcome) + '" title="' + escHtml(shortTime(h.observed_at)) + '">' + escHtml(h.outcome) + '</span>';
+      }).join("")
+    : '<span class="muted">No recent action attempts.</span>';
+  return '<article class="auto-trigger-rule-row">' +
+    '<div class="auto-trigger-rule-head">' +
+      '<div><h3>' + escHtml(rule.rule_id) + '</h3><p>' + escHtml(rule.rule_type) + ' rule. Updated ' + escHtml(shortTime(rule.updated_at)) + '.</p></div>' +
+      '<span class="rung-badge">rung ' + escHtml(rule.current_rung) + '</span>' +
+    '</div>' +
+    '<div class="auto-trigger-rule-grid">' +
+      '<div class="auto-trigger-trend" aria-label="last 30 action attempts">' + trend + '</div>' +
+      '<div class="history-strip">' + recentHtml + '</div>' +
+    '</div>' +
+    '<div class="auto-trigger-form">' +
+      '<label>Warn sigma<input data-action="auto-trigger-input" data-rule-id="' + escHtml(rule.rule_id) + '" data-field="warn_sigma" type="number" step="0.1" min="0" value="' + escHtml(o.warn_sigma == null ? "" : o.warn_sigma) + '"></label>' +
+      '<label>Alert sigma<input data-action="auto-trigger-input" data-rule-id="' + escHtml(rule.rule_id) + '" data-field="alert_sigma" type="number" step="0.1" min="0" value="' + escHtml(o.alert_sigma == null ? "" : o.alert_sigma) + '"></label>' +
+      '<label>Promotion fires<input data-action="auto-trigger-input" data-rule-id="' + escHtml(rule.rule_id) + '" data-field="promotion_fire_count" type="number" step="1" min="1" value="' + escHtml(o.promotion_fire_count == null ? "" : o.promotion_fire_count) + '"></label>' +
+      '<label>Window days<input data-action="auto-trigger-input" data-rule-id="' + escHtml(rule.rule_id) + '" data-field="promotion_window_days" type="number" step="1" min="1" value="' + escHtml(o.promotion_window_days == null ? "" : o.promotion_window_days) + '"></label>' +
+      '<label>Cancel seconds<input data-action="auto-trigger-input" data-rule-id="' + escHtml(rule.rule_id) + '" data-field="cancel_window_seconds" type="number" step="1" min="1" max="3600" value="' + escHtml(rule.cancel_window_seconds || 60) + '"></label>' +
+      '<button class="btn btn-primary" data-action="auto-trigger-threshold-save" data-rule-id="' + escHtml(rule.rule_id) + '"' + (saving ? ' disabled' : '') + '>Save</button>' +
+    '</div>' +
+  '</article>';
+}
+
+function renderAutoTriggerTrend(history) {
+  if (!history.length) return '<span class="muted">No 30-day trend yet.</span>';
+  return history.slice(-30).map(function (h) {
+    const cls = h.outcome === "auto_proceeded" || h.outcome === "operator_approved" ? "good" :
+      h.outcome === "operator_canceled" || h.outcome === "operator_revoked" ? "warn" : "pending";
+    return '<span class="trend-bar ' + cls + '" title="' + escHtml(h.outcome + " at " + shortTime(h.observed_at)) + '"></span>';
+  }).join("");
 }
 
 function renderTemplatePicker(agent) {
@@ -2070,9 +2119,7 @@ async function fetchAll() {
     state.handoffEvents = he.data.entries || [];
   } catch (e) { /* tolerate */ }
   try {
-    const at = await autoTriggerApi("/recommendations");
-    state.autoTrigger.recommendations = (at.data && at.data.recommendations) || [];
-    state.autoTrigger.loadError = null;
+    await fetchAutoTriggerState();
   } catch (e) {
     state.autoTrigger.loadError = e && e.message ? e.message : "unavailable";
   }
@@ -2107,14 +2154,66 @@ async function onAutoTriggerRecommendation(ruleId, action) {
       "/rules/" + encodeURIComponent(ruleId) + "/" + action + "-recommendation",
       { method: "POST", body: {} }
     );
-    const at = await autoTriggerApi("/recommendations");
-    state.autoTrigger.recommendations = (at.data && at.data.recommendations) || [];
-    state.autoTrigger.loadError = null;
+    await fetchAutoTriggerState();
     toast(action === "accept" ? "Recommendation accepted." : "Recommendation rejected.", "info");
     rerender();
   } catch (e) {
     toast("Recommendation action failed: " + (e && e.message ? e.message : "unknown"), "error");
   }
+}
+
+async function onAutoTriggerThresholdSave(ruleId) {
+  const rule = (state.autoTrigger.rules || []).find(function (r) { return r.rule_id === ruleId; });
+  if (!rule) return toast("Rule not loaded.", "error");
+  const inputs = Array.prototype.slice.call(document.querySelectorAll('input[data-action="auto-trigger-input"][data-rule-id="' + escCssAttr(ruleId) + '"]'));
+  const overrides = {};
+  let cancelWindow = null;
+  for (let i = 0; i < inputs.length; i++) {
+    const el = inputs[i];
+    const field = el.getAttribute("data-field");
+    const raw = String(el.value || "").trim();
+    if (!raw) continue;
+    const num = Number(raw);
+    if (!Number.isFinite(num) || num < 0) return toast("Threshold values must be positive numbers.", "error");
+    if (field === "cancel_window_seconds") {
+      if (num < 1 || num > 3600) return toast("Cancel window must be 1 to 3600 seconds.", "error");
+      cancelWindow = Math.floor(num);
+    } else {
+      overrides[field] = field === "warn_sigma" || field === "alert_sigma" ? num : Math.floor(num);
+    }
+  }
+  try {
+    state.autoTrigger.savingRuleId = ruleId;
+    rerender();
+    const body = { rule_type: rule.rule_type, threshold_overrides: overrides };
+    if (cancelWindow !== null) body.cancel_window_seconds = cancelWindow;
+    await autoTriggerApi("/rules/" + encodeURIComponent(ruleId), { method: "PATCH", body: body });
+    await fetchAutoTriggerState();
+    toast("Thresholds saved.", "info");
+  } catch (e) {
+    toast("Threshold save failed: " + (e && e.message ? e.message : "unknown"), "error");
+  } finally {
+    state.autoTrigger.savingRuleId = null;
+    rerender();
+  }
+}
+
+async function fetchAutoTriggerState() {
+  const rules = await autoTriggerApi("/rules");
+  const list = (rules.data && rules.data.rules) || [];
+  const hydrated = [];
+  for (let i = 0; i < list.length; i++) {
+    try {
+      const detail = await autoTriggerApi("/rules/" + encodeURIComponent(list[i].rule_id));
+      hydrated.push((detail.data && detail.data.rule) || list[i]);
+    } catch (e) {
+      hydrated.push(list[i]);
+    }
+  }
+  state.autoTrigger.rules = hydrated;
+  const at = await autoTriggerApi("/recommendations");
+  state.autoTrigger.recommendations = (at.data && at.data.recommendations) || [];
+  state.autoTrigger.loadError = null;
 }
 
 // Tier 1 lockdown click. Two-step: POST returns 202 + inbox_item_id, button
@@ -2276,6 +2375,10 @@ function connectStream() {
         state.activity = [e].concat(state.activity).slice(0, 200);
         if (e.category === "privacy") state.privacyEvents = [e].concat(state.privacyEvents).slice(0, 200);
         if (e.category === "handoff") state.handoffEvents = [e].concat(state.handoffEvents).slice(0, 200);
+        if (String(e.display_template_id || "").indexOf("auto_trigger") >= 0 || String(e.display_template_id || "").indexOf("auto_action") >= 0) {
+          void fetchAutoTriggerState().then(rerender);
+          return;
+        }
         rerender();
       } catch (err) { /* ignore */ }
     });
@@ -2415,6 +2518,9 @@ document.addEventListener("click", function (ev) {
   }
   if (action === "auto-trigger-reject" && ruleId) {
     return void onAutoTriggerRecommendation(ruleId, "reject");
+  }
+  if (action === "auto-trigger-threshold-save" && ruleId) {
+    return void onAutoTriggerThresholdSave(ruleId);
   }
   // WP-V1.2-4 concierge handlers ──────────────────────────────────
   if (action === "concierge-submit") { ev.preventDefault(); return void onConciergeSend(); }
