@@ -55,7 +55,25 @@ import {
   saveAnomalySubscriptions,
 } from "../../src/anomaly-detection/anomaly-subscription-store.js";
 import { PER_AGENT_ACTIVITY_DETECTOR_ID } from "../../src/anomaly-detection/detectors/per-agent-activity-detector.js";
-import { ROLLING_BASELINE_CLASSIFIER_ID } from "../../src/anomaly-detection/classifiers/rolling-baseline.js";
+import {
+  DEFAULT_MIN_SAMPLES_FOR_PREDICTION,
+  ROLLING_BASELINE_CLASSIFIER_ID,
+} from "../../src/anomaly-detection/classifiers/rolling-baseline.js";
+import {
+  CrossAgentTimingDetector,
+  CROSS_AGENT_TIMING_DETECTOR_ID,
+} from "../../src/anomaly-detection/detectors/cross-agent-timing-detector.js";
+import {
+  ToolCallSequenceDetector,
+  TOOL_CALL_SEQUENCE_DETECTOR_ID,
+} from "../../src/anomaly-detection/detectors/tool-call-sequence-detector.js";
+import {
+  AuditEventClassDistributionDetector,
+  AUDIT_EVENT_CLASS_DISTRIBUTION_DETECTOR_ID,
+  AUDIT_EVENT_CLASS_DISTRIBUTION_PSI_CLASSIFIER_ID,
+  DEFAULT_AUDIT_EVENT_CLASS_PSI_THRESHOLD,
+  DEFAULT_BASELINE_SAMPLE_COUNT,
+} from "../../src/anomaly-detection/detectors/audit-event-class-distribution-detector.js";
 import { ClassifierStateStore } from "../../src/anomaly-detection/classifier-state-store.js";
 import { runAnomalyCommand } from "../../src/cli/anomaly.js";
 
@@ -148,6 +166,49 @@ describe("Chi-3 — catalog + subscription store", () => {
           e.classifierId === ROLLING_BASELINE_CLASSIFIER_ID,
       ),
     ).toBe(true);
+  });
+
+  it("ANOMALY_CATALOG exposes Chi-4 and Chi-5 detector classifier tuples", () => {
+    const expected = [
+      {
+        detectorId: CROSS_AGENT_TIMING_DETECTOR_ID,
+        classifierId: ROLLING_BASELINE_CLASSIFIER_ID,
+        ctor: CrossAgentTimingDetector,
+        tunables: [
+          "minSamplesForPrediction",
+          String(DEFAULT_MIN_SAMPLES_FOR_PREDICTION),
+        ],
+      },
+      {
+        detectorId: TOOL_CALL_SEQUENCE_DETECTOR_ID,
+        classifierId: ROLLING_BASELINE_CLASSIFIER_ID,
+        ctor: ToolCallSequenceDetector,
+        tunables: [
+          "minSamplesForPrediction",
+          String(DEFAULT_MIN_SAMPLES_FOR_PREDICTION),
+        ],
+      },
+      {
+        detectorId: AUDIT_EVENT_CLASS_DISTRIBUTION_DETECTOR_ID,
+        classifierId: AUDIT_EVENT_CLASS_DISTRIBUTION_PSI_CLASSIFIER_ID,
+        ctor: AuditEventClassDistributionDetector,
+        tunables: [
+          "psiThreshold",
+          String(DEFAULT_AUDIT_EVENT_CLASS_PSI_THRESHOLD),
+          "baselineSampleCount",
+          String(DEFAULT_BASELINE_SAMPLE_COUNT),
+        ],
+      },
+    ];
+
+    for (const row of expected) {
+      const entry = findCatalogEntry(row.detectorId, row.classifierId);
+      expect(entry).toBeDefined();
+      expect(entry!.factory()).toBeInstanceOf(row.ctor);
+      for (const tunable of row.tunables) {
+        expect(entry!.description).toContain(tunable);
+      }
+    }
   });
 
   it("catalogKey + findCatalogEntry helpers work", () => {

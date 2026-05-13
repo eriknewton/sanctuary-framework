@@ -23,7 +23,25 @@ import {
   PerAgentActivityDetector,
   PER_AGENT_ACTIVITY_DETECTOR_ID,
 } from "./detectors/per-agent-activity-detector.js";
-import { ROLLING_BASELINE_CLASSIFIER_ID } from "./classifiers/rolling-baseline.js";
+import {
+  CrossAgentTimingDetector,
+  CROSS_AGENT_TIMING_DETECTOR_ID,
+} from "./detectors/cross-agent-timing-detector.js";
+import {
+  ToolCallSequenceDetector,
+  TOOL_CALL_SEQUENCE_DETECTOR_ID,
+} from "./detectors/tool-call-sequence-detector.js";
+import {
+  AuditEventClassDistributionDetector,
+  AUDIT_EVENT_CLASS_DISTRIBUTION_DETECTOR_ID,
+  AUDIT_EVENT_CLASS_DISTRIBUTION_PSI_CLASSIFIER_ID,
+  DEFAULT_AUDIT_EVENT_CLASS_PSI_THRESHOLD,
+  DEFAULT_BASELINE_SAMPLE_COUNT,
+} from "./detectors/audit-event-class-distribution-detector.js";
+import {
+  DEFAULT_MIN_SAMPLES_FOR_PREDICTION,
+  ROLLING_BASELINE_CLASSIFIER_ID,
+} from "./classifiers/rolling-baseline.js";
 import type { AnomalyDetector } from "./types.js";
 
 /**
@@ -63,6 +81,27 @@ export const ANOMALY_CATALOG: AnomalyCatalogEntry[] = [
     description:
       "Per-agent statistical drift detector: tool-call count, egress volume, credential-use rate, audit-event count, recent-receipt count over a 24h rolling window. Welford running mean + variance baseline per agent.",
     factory: () => new PerAgentActivityDetector(),
+  },
+  {
+    detectorId: CROSS_AGENT_TIMING_DETECTOR_ID,
+    classifierId: ROLLING_BASELINE_CLASSIFIER_ID,
+    description:
+      `Cross-agent timing detector: per-agent-pair co-fire rate, inter-event time distribution, and Pearson correlation strength. Operator tunable: minSamplesForPrediction default ${DEFAULT_MIN_SAMPLES_FOR_PREDICTION}.`,
+    factory: () => new CrossAgentTimingDetector(),
+  },
+  {
+    detectorId: TOOL_CALL_SEQUENCE_DETECTOR_ID,
+    classifierId: ROLLING_BASELINE_CLASSIFIER_ID,
+    description:
+      `Tool-call sequence detector: per-agent distinct-tools-used, max sequence length, 3-gram Shannon entropy, and 2-gram repeat-pattern score. Operator tunable: minSamplesForPrediction default ${DEFAULT_MIN_SAMPLES_FOR_PREDICTION}.`,
+    factory: () => new ToolCallSequenceDetector(),
+  },
+  {
+    detectorId: AUDIT_EVENT_CLASS_DISTRIBUTION_DETECTOR_ID,
+    classifierId: AUDIT_EVENT_CLASS_DISTRIBUTION_PSI_CLASSIFIER_ID,
+    description:
+      `Audit-event class distribution detector: per-agent categorical PSI over audit operation mix, with top per-class drift attribution. Operator tunables: psiThreshold default ${DEFAULT_AUDIT_EVENT_CLASS_PSI_THRESHOLD}, baselineSampleCount default ${DEFAULT_BASELINE_SAMPLE_COUNT}.`,
+    factory: () => new AuditEventClassDistributionDetector(),
   },
 ];
 
