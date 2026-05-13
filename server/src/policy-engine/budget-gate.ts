@@ -1,5 +1,5 @@
 /**
- * Sanctuary Policy Engine — Budget gate + tracker (WP-MVP-6).
+ * Sanctuary Policy Engine - Budget gate + tracker (WP-MVP-6).
  *
  * Per-agent spend budgets with daily (rolling 24h) and monthly (rolling 30d)
  * windows. Budget consumption is tracked against usage events from the
@@ -58,12 +58,26 @@ export interface BudgetCheckResult {
   monthly_consumed?: number;
 }
 
+export type BudgetThresholdCallback = (event: {
+  agent_id: string;
+  threshold_name: "soft_warn" | "hard_stop";
+  current_value: number;
+  limit: number;
+  window: "daily" | "monthly";
+  observed_at: string;
+}) => void;
+
 /**
  * In-memory budget tracker. Production wires a persistent store; this
  * in-memory implementation is sufficient for v1.0 per-agent tracking.
  */
 export class BudgetTracker {
   private agents = new Map<string, AgentBudgetState>();
+
+  constructor(private readonly opts: {
+    onThresholdCross?: BudgetThresholdCallback;
+    now?: () => Date;
+  } = {}) {}
 
   /** Get or create budget state for an agent. */
   private getState(agent_id: string): AgentBudgetState {
@@ -162,12 +176,24 @@ export class BudgetTracker {
       : undefined;
 
     // Hard stop takes precedence.
-    if (dailyResult?.level === "hard_stop") return dailyResult;
-    if (monthlyResult?.level === "hard_stop") return monthlyResult;
+    if (dailyResult?.level === "hard_stop") {
+      this.emitThreshold(agent_id, dailyResult, budgetPolicy.daily!.amount, "daily");
+      return dailyResult;
+    }
+    if (monthlyResult?.level === "hard_stop") {
+      this.emitThreshold(agent_id, monthlyResult, budgetPolicy.monthly!.amount, "monthly");
+      return monthlyResult;
+    }
 
     // Soft warn.
-    if (dailyResult?.level === "soft_warn") return dailyResult;
-    if (monthlyResult?.level === "soft_warn") return monthlyResult;
+    if (dailyResult?.level === "soft_warn") {
+      this.emitThreshold(agent_id, dailyResult, budgetPolicy.daily!.amount, "daily");
+      return dailyResult;
+    }
+    if (monthlyResult?.level === "soft_warn") {
+      this.emitThreshold(agent_id, monthlyResult, budgetPolicy.monthly!.amount, "monthly");
+      return monthlyResult;
+    }
 
     // Within limits.
     return {
@@ -236,6 +262,25 @@ export class BudgetTracker {
   /** Get raw state for an agent. Used in tests. */
   getAgentState(agent_id: string): AgentBudgetState | undefined {
     return this.agents.get(agent_id);
+  }
+
+  private emitThreshold(
+    agent_id: string,
+    result: BudgetCheckResult,
+    limit: number,
+    window: "daily" | "monthly",
+  ): void {
+    const consumed =
+      window === "daily" ? result.daily_consumed : result.monthly_consumed;
+    if (consumed === undefined) return;
+    this.opts.onThresholdCross?.({
+      agent_id,
+      threshold_name: result.level === "hard_stop" ? "hard_stop" : "soft_warn",
+      current_value: consumed,
+      limit,
+      window,
+      observed_at: (this.opts.now?.() ?? new Date()).toISOString(),
+    });
   }
 }
 

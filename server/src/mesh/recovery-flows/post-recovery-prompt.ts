@@ -31,6 +31,8 @@ import {
 } from "../failure-modes/alerts.js";
 import { recoveryCapabilityTarget } from "../failure-modes/constants.js";
 import type { CeremonyId } from "./constants.js";
+import type { UnifiedInboxBridge } from "../../principal-policy/unified-inbox-bridge.js";
+import { ingestRecoveryPrompt } from "../../principal-policy/unified-inbox-producers.js";
 
 export interface FirePostRecoveryPromptParams {
   store: PostRecoveryPromptStore;
@@ -42,6 +44,8 @@ export interface FirePostRecoveryPromptParams {
   broker: BrokerCredentialLister;
   /** Optional label suffix distinguishing multiple prompts for the same rotated_at. */
   prompt_key_suffix?: string;
+  /** Psi-2 optional unified-inbox publisher. */
+  inbox_bridge?: UnifiedInboxBridge;
 }
 
 /**
@@ -73,6 +77,15 @@ export async function firePostRecoveryPrompt(
     rotated_at: key,
   };
   params.store.put(annotated);
+  if (params.inbox_bridge) {
+    ingestRecoveryPrompt({
+      bridge: params.inbox_bridge,
+      recovery_class: "other",
+      action_required: true,
+      observed_at: params.rotated_at,
+      source_event_id: `${params.ceremony_type}:${params.ceremony_id}:post_recovery_prompt`,
+    });
+  }
   return annotated;
 }
 
@@ -103,7 +116,7 @@ export function acknowledgePostRecoveryPrompt(params: {
   emit_ctx: AlertEmitContext;
   ceremony_id: string;
   /**
-   * Operator's note — non-empty. Renders in the emitted gate_approved event
+   * Operator's note - non-empty. Renders in the emitted gate_approved event
    * for auditability.
    */
   note: string;

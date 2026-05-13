@@ -6,7 +6,7 @@
  * aggregator's single stream. Psi-1 extends that bridge to cover the
  * FULL set of operator-attention surfaces: blocked egress, privacy
  * events, budget warnings, recovery prompts, agent errors. All flow
- * through one unified stream the operator already checks — no more
+ * through one unified stream the operator already checks - no more
  * three views to know what needs attention.
  *
  * Architecture:
@@ -48,6 +48,10 @@
 import { randomUUID, createHash } from "node:crypto";
 
 import type { AuditLog } from "../l2-operational/audit-log.js";
+import type {
+  PersistedInboxEntry,
+  UnifiedInboxStore,
+} from "./unified-inbox-store.js";
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -70,18 +74,18 @@ export interface UnifiedInboxEntry {
   /**
    * Stable per-source identifier the bridge uses for deduplication.
    * Format conventions per class:
-   *   approval         — aggregator entry's audit_log_entry_id
-   *   sentinel_finding — finding_id
-   *   blocked_egress   — `<audit-timestamp>:<decision_id>`
-   *   privacy_event    — `<audit-timestamp>:<aggregation-window>`
-   *   budget_warning   — `<bucket>:<threshold-iso>`
-   *   recovery_prompt  — `<ceremony_id>:<recovery_class>`
-   *   agent_error      — `<audit-timestamp>:<agent_id>:<error_class>`
+   *   approval         - aggregator entry's audit_log_entry_id
+   *   sentinel_finding - finding_id
+   *   blocked_egress   - `<audit-timestamp>:<decision_id>`
+   *   privacy_event    - `<audit-timestamp>:<aggregation-window>`
+   *   budget_warning   - `<bucket>:<threshold-iso>`
+   *   recovery_prompt  - `<ceremony_id>:<recovery_class>`
+   *   agent_error      - `<audit-timestamp>:<agent_id>:<error_class>`
    */
   source_event_id: string;
   /** Optional agent attribution for per-agent entries. */
   agent_id?: string;
-  /** Severity tier — `critical` is rare; reserved for hard-cap / lockdown class. */
+  /** Severity tier - `critical` is rare; reserved for hard-cap / lockdown class. */
   severity: UnifiedInboxSeverity;
   /** Operator-friendly one-line summary. Bounded at 240 chars on persist. */
   summary: string;
@@ -197,14 +201,20 @@ export interface RecoveryPromptIngest {
     | "config_backup_restore"
     | "exit_drill"
     | "other";
+  agent_id?: string;
+  action_required?: boolean;
+  deadline?: string;
   observed_at: string;
 }
 
 export interface AgentErrorIngest {
   source_event_id: string;
   agent_id: string;
+  harness_name?: string;
+  error_message?: string;
   error_class: string;
   agent_still_active: boolean;
+  repeated_in_24h?: boolean;
   observed_at: string;
 }
 
@@ -224,6 +234,8 @@ export interface UnifiedInboxBridgeDeps {
    * dashboard root override this.
    */
   detailsUrlBase?: string;
+  /** Optional encrypted durable layer. Psi-2 keeps the map as hot cache. */
+  store?: UnifiedInboxStore;
 }
 
 const DEFAULT_MAX_ENTRIES = 1000;
@@ -236,6 +248,7 @@ export class UnifiedInboxBridge {
   private readonly now: () => Date;
   private readonly maxEntries: number;
   private readonly detailsUrlBase: string;
+  private readonly store?: UnifiedInboxStore;
   /** Insertion-ordered entries; map key is the dedup key. */
   private readonly entriesByKey = new Map<string, UnifiedInboxEntry>();
   /** inbox_id -> dedup key lookup for resolve / get-by-id paths. */
@@ -243,6 +256,7 @@ export class UnifiedInboxBridge {
   private readonly listeners = new Set<
     (event: UnifiedInboxBridgeEvent) => void
   >();
+  private readonly pendingStoreWrites = new Set<Promise<unknown>>();
 
   constructor(deps: UnifiedInboxBridgeDeps) {
     this.auditLog = deps.auditLog;
@@ -251,6 +265,24 @@ export class UnifiedInboxBridge {
     this.now = deps.now ?? (() => new Date());
     this.maxEntries = deps.maxEntries ?? DEFAULT_MAX_ENTRIES;
     this.detailsUrlBase = deps.detailsUrlBase ?? DEFAULT_DETAILS_URL_BASE;
+    this.store = deps.store;
+  }
+
+  async rehydratePendingFromStore(limit = this.maxEntries): Promise<number> {
+    if (!this.store) return 0;
+    const entries = await this.store.list({ status: "pending", limit });
+    let loaded = 0;
+    for (const persisted of entries.reverse()) {
+      this.cachePersistedEntry(persisted);
+      loaded += 1;
+    }
+    return loaded;
+  }
+
+  async flushPersistence(): Promise<void> {
+    while (this.pendingStoreWrites.size > 0) {
+      await Promise.allSettled([...this.pendingStoreWrites]);
+    }
   }
 
   onEvent(
@@ -330,7 +362,7 @@ export class UnifiedInboxBridge {
     const severity: UnifiedInboxSeverity =
       input.used_fraction >= 1
         ? "critical"
-        : input.used_fraction >= 0.8
+        : input.used_fraction >= 0.9
           ? "alert"
           : "warn";
     const summary = truncateSummary(
@@ -350,21 +382,29 @@ export class UnifiedInboxBridge {
     const summary = truncateSummary(
       `Recovery prompt: ${input.recovery_class.replace(/_/g, " ")}`,
     );
+    const severity: UnifiedInboxSeverity = input.deadline
+      ? "critical"
+      : input.action_required === false
+        ? "warn"
+        : "alert";
     return this.ingest({
       source_class: "recovery_prompt",
       source_event_id: input.source_event_id,
-      severity: "alert",
+      severity,
       summary,
       observed_at: input.observed_at,
+      ...(input.agent_id !== undefined ? { agent_id: input.agent_id } : {}),
     });
   }
 
   ingestAgentError(input: AgentErrorIngest): UnifiedInboxEntry | null {
-    const severity: UnifiedInboxSeverity = input.agent_still_active
-      ? "warn"
-      : "critical";
+    const severity: UnifiedInboxSeverity = !input.agent_still_active
+      ? "critical"
+      : input.repeated_in_24h
+        ? "alert"
+        : "warn";
     const summary = truncateSummary(
-      `Agent ${input.agent_id} reported error (${input.error_class})${input.agent_still_active ? "" : " — agent inactive"}`,
+      `Agent ${input.agent_id} reported error (${input.error_class})${input.agent_still_active ? "" : " - agent inactive"}`,
     );
     return this.ingest({
       source_class: "agent_error",
@@ -436,6 +476,9 @@ export class UnifiedInboxBridge {
         fortress_id: this.fortressId,
       },
     );
+    if (this.store) {
+      this.trackStoreWrite(this.store.resolve(updated.inbox_id, resolvedBy));
+    }
     this.emit({ type: "resolved", entry: updated });
     return updated;
   }
@@ -502,6 +545,9 @@ export class UnifiedInboxBridge {
     };
     this.entriesByKey.set(dedupKey, entry);
     this.keyByInboxId.set(inboxId, dedupKey);
+    if (this.store) {
+      this.trackStoreWrite(this.store.upsert(entry));
+    }
     this.auditLog.append(
       "l2",
       UNIFIED_INBOX_AUDIT_OPS.AGGREGATED,
@@ -519,6 +565,36 @@ export class UnifiedInboxBridge {
     return entry;
   }
 
+  private cachePersistedEntry(entry: PersistedInboxEntry): void {
+    const dedupKey = `${entry.source_class}|${entry.source_event_id}`;
+    if (this.entriesByKey.has(dedupKey)) return;
+    if (this.entriesByKey.size >= this.maxEntries) {
+      const oldestKey = this.entriesByKey.keys().next().value as
+        | string
+        | undefined;
+      if (oldestKey !== undefined) {
+        const evicted = this.entriesByKey.get(oldestKey);
+        this.entriesByKey.delete(oldestKey);
+        if (evicted) this.keyByInboxId.delete(evicted.inbox_id);
+      }
+    }
+    const cached: UnifiedInboxEntry = {
+      inbox_id: entry.inbox_id,
+      source_class: entry.source_class,
+      source_event_id: entry.source_event_id,
+      severity: entry.severity,
+      summary: entry.summary,
+      details_url: entry.details_url,
+      observed_at: entry.observed_at,
+      fortress_id: entry.fortress_id,
+      ...(entry.agent_id !== undefined ? { agent_id: entry.agent_id } : {}),
+      ...(entry.resolved_at !== undefined ? { resolved_at: entry.resolved_at } : {}),
+      ...(entry.resolved_by !== undefined ? { resolved_by: entry.resolved_by } : {}),
+    };
+    this.entriesByKey.set(dedupKey, cached);
+    this.keyByInboxId.set(cached.inbox_id, dedupKey);
+  }
+
   private emit(event: UnifiedInboxBridgeEvent): void {
     for (const listener of this.listeners) {
       try {
@@ -527,6 +603,11 @@ export class UnifiedInboxBridge {
         // Listener exceptions never fail the bridge.
       }
     }
+  }
+
+  private trackStoreWrite(promise: Promise<unknown>): void {
+    this.pendingStoreWrites.add(promise);
+    void promise.finally(() => this.pendingStoreWrites.delete(promise));
   }
 }
 

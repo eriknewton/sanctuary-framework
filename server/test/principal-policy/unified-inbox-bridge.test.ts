@@ -166,7 +166,7 @@ describe("Psi-1 — per-source-class ingest", () => {
     const alert = bridge.ingestBudgetWarning({
       source_event_id: "budget-2",
       bucket: "daily",
-      used_fraction: 0.85,
+      used_fraction: 0.9,
       observed_at: OBSERVED_AT,
     });
     const critical = bridge.ingestBudgetWarning({
