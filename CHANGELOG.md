@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.0-rc.1] - 2026-05-13
+
+Preview release for the Castle Architecture stack. This RC moves the v1.3 line onto the npm `next` channel while keeping npm `latest` on the v1.2 stable line. Operators can install the preview with `npm install @sanctuary-framework/mcp-server@next`; default installs continue to resolve to the latest v1.2.x stable.
+
+### Castle Layer 1 enforcement
+
+- **Castle Wall Linux Phase 1 remains the production enforcement baseline.** The Linux packet-filtering path is the current real Layer 1 enforcement surface for wrapped agents.
+- **Castle Wall macOS Phase 1 joins the RC window.** PR #219 adds the macOS packet-filter path so Phase 1 enforcement has a production-grade macOS surface in the v1.3 preview channel.
+
+### Castle Layer 2 observation
+
+- **WP-V1.3-1 Sentinel Baseline Pack is structurally complete.** Phi-1 through Phi-5 ship the sentinel framework, encrypted finding store, opt-in catalog, egress-volume watcher, credential-usage watcher, cross-agent-chatter watcher, suspicious-tool-call detector, and anomaly-trigger meta-sentinel.
+- **WP-V1.3-2 Anomaly Detection Pipeline is at 5 of N.** Chi-1 through Chi-5 ship local classifier state, rolling baselines, operator registration UX, activity and sequence extractors, and the audit-event-class distribution drift detector with categorical PSI attribution.
+
+### Castle Layer 3 cooperative MCP
+
+- **WP-V1.3-3 Coordination Handoff Visualization is structurally complete.** Omega-1 through Omega-3 ship the handoff graph, dashboard visualization, and operator-facing drill-through for coordination state.
+- **WP-V1.3-4 Unified Inbox Bridge is at 2 of N.** Psi-1 and Psi-2 aggregate approvals, sentinel findings, blocked egress, privacy events, budget warnings, recovery prompts, and agent errors into one operator stream, with producer wiring and encrypted at-rest persistence.
+- **WP-V1.3-9 Concierge Depth is structurally complete.** Tau-1 through Tau-5 ship memory, multi-turn context, dynamic coordination context, grammar-aware rendering, and current-agent awareness for the operator concierge.
+- **WP-V1.3-10 Cross-Harness Approval Inbox is structurally complete.** Upsilon-1 through Upsilon-4 ship cross-harness approval aggregation and resolution paths for wrapped-agent approval surfaces.
+
+### Castle Layer 3 authoring and safety
+
+- **WP-V1.3-5 Honeypot Authoring is at 4 of N.** Pi-1 through Pi-4 ship typed trap authoring, deterministic compilation, fortress-local persistence, and concrete `http_endpoint`, `filesystem`, `tool_call`, and credential trap classes.
+- **WP-V1.3-6 English-Authored Policy Gates is structurally complete.** Xi-1 through Xi-3 ship compile-then-activate policy artifacts, activation lifecycle, and pre-activation conflict detection.
+- **WP-V1.3-7 Auto-Trigger Ladder + Threshold Calibration is structurally complete.** Nu-1 through Nu-3 ship threshold storage, encrypted ladder state, dashboard calibration, action-class registry surface, and operator-driven auto-promotion criteria. The preview keeps promotion explicit and operator accepted.
+
+### v1.x principle-closing work
+
+- **WP-V1.x-QUERY-LAYER-ANONYMITY is structurally complete.** Rho-1 through Rho-3 close Principle 4 across Tier A header stripping and Tier B basic plus smart-mode PII rewriting, including the operator-side reverse-mapping memo.
+- **WP-V1.x-RECOGNITION-LAYER is at 4 of N on Path C.** did:web builds 1 through 4 ship issuance, resolution, publication scaffold, exit-bundle integration, fortress-config auto-inclusion, and key rotation.
+
+### Infrastructure and hardening
+
+- **Sigma hardening waves are included.** The RC carries the test-discipline, console-discipline, port-discipline, concurrency-discipline, and hardening work that stabilized the v1.2 to v1.3 cascade.
+- **Concordia v0.5.1 integration is included.** The preview carries RFC 8785 canonicalization, `mandate_verification`, and `DISPUTE_RESOLVED` composition semantics through the Herald layer.
+
+### Notes
+
+This is an opt-in preview, not the v1.3.0 GA cut. v1.3.0 GA remains gated on RC soak plus the coordinator's remaining work-package closeout criteria. npm publish for this RC must use `--tag next`; Erik owns the publish step because npm web-based 2FA binds the approval window to his foreground terminal.
+
 ## [1.2.17] - 2026-05-13
 
 Patch release shipping the iteration-15 cascade since v1.2.16. **WP-V1.3-4 Unified Approval Inbox Bridge advances to 2 of N** with Psi-2 producer wiring plus at-rest inbox persistence. **WP-V1.3-2 Anomaly Detection Pipeline advances to 5 of N** with Chi-5 audit-event class distribution drift detection. **WP-V1.3-5 Honeypot Authoring advances to 4 of N** with Pi-4 credential honeypot traps. **WP-V1.3-7 Auto-Trigger Ladder + Threshold Calibration gains operator-facing action-class wiring** with Nu-2 dashboard calibration and action registry surfaces on top of the v1.2.16 structural closure. v1.3.0-rc.1 is cleared to cut immediately after v1.2.17 ships.
