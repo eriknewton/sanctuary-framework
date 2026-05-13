@@ -80,6 +80,7 @@ import {
   UNIFIED_INBOX_API_PREFIX,
   UNIFIED_INBOX_RETENTION_API_PREFIX,
 } from "./unified-inbox-routes.js";
+import type { UnifiedInboxPrefsStore } from "./unified-inbox-prefs-store.js";
 import {
   UnifiedInboxRetentionPolicy,
   type UnifiedInboxRetentionPolicyStore,
@@ -276,6 +277,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private unifiedInboxBridge: UnifiedInboxBridge | null = null;
   private unifiedInboxRetentionPolicy: UnifiedInboxRetentionPolicy | null = null;
   private unifiedInboxRetentionPolicyStore: UnifiedInboxRetentionPolicyStore | null = null;
+  private unifiedInboxPrefsStore: UnifiedInboxPrefsStore | null = null;
   private unifiedInboxFortressId: string | null = null;
   private unifiedInboxIdentityId: string | null = null;
 
@@ -462,6 +464,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     bridge: UnifiedInboxBridge | null;
     retentionPolicy?: UnifiedInboxRetentionPolicy | null;
     retentionPolicyStore?: UnifiedInboxRetentionPolicyStore | null;
+    prefsStore?: UnifiedInboxPrefsStore | null;
     fortressId?: string | null;
     identityId?: string | null;
   }): void {
@@ -470,6 +473,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       opts.retentionPolicy ?? new UnifiedInboxRetentionPolicy();
     this.unifiedInboxRetentionPolicyStore =
       opts.retentionPolicyStore ?? null;
+    this.unifiedInboxPrefsStore = opts.prefsStore ?? null;
     this.unifiedInboxFortressId = opts.fortressId ?? null;
     this.unifiedInboxIdentityId = opts.identityId ?? null;
   }
@@ -559,6 +563,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           : {}),
         ...(this.unifiedInboxRetentionPolicyStore
           ? { retentionPolicyStore: this.unifiedInboxRetentionPolicyStore }
+          : {}),
+        ...(this.unifiedInboxPrefsStore
+          ? { prefsStore: this.unifiedInboxPrefsStore }
           : {}),
         ...(this.auditLog
           ? { auditLog: this.auditLog }

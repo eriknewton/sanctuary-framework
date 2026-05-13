@@ -17,6 +17,7 @@ import {
   UnifiedInboxRetentionPolicyStore,
   sweepUnifiedInboxRetention,
 } from "../../src/principal-policy/unified-inbox-retention-policy.js";
+import { UnifiedInboxPrefsStore } from "../../src/principal-policy/unified-inbox-prefs-store.js";
 import { UnifiedInboxScheduler } from "../../src/principal-policy/unified-inbox-scheduler.js";
 import { handleUnifiedInboxRoute } from "../../src/principal-policy/unified-inbox-routes.js";
 
@@ -76,6 +77,7 @@ async function makeInboxServer(opts: {
   auditLog: AuditLog;
   policy: UnifiedInboxRetentionPolicy;
   policyStore: UnifiedInboxRetentionPolicyStore;
+  prefsStore?: UnifiedInboxPrefsStore;
   fortressId?: string;
 }): Promise<{ base: string; close: () => Promise<void> }> {
   const server: Server = createServer(async (req, res) => {
@@ -85,6 +87,7 @@ async function makeInboxServer(opts: {
         bridge: opts.bridge,
         retentionPolicy: opts.policy,
         retentionPolicyStore: opts.policyStore,
+        ...(opts.prefsStore ? { prefsStore: opts.prefsStore } : {}),
         auditLog: opts.auditLog,
         identityId: IDENTITY,
         fortressId: opts.fortressId ?? FORTRESS,
@@ -380,6 +383,80 @@ describe("Psi-3 retention and isolation", () => {
     a.bridge.archiveBatch([entryA.inbox_id]);
     expect(a.bridge.queryInbox({ state: ["archived"] })).toHaveLength(1);
     expect(b.bridge.queryInbox({ state: ["archived"] })).toHaveLength(0);
+  });
+
+  it("persists dashboard inbox filters in fortress-local encrypted prefs", async () => {
+    const { storage, masterKey, auditLog, bridge } = rig();
+    const policyStore = new UnifiedInboxRetentionPolicyStore({
+      storage,
+      masterKey,
+      fortressId: FORTRESS,
+    });
+    const prefsStore = new UnifiedInboxPrefsStore({
+      storage,
+      masterKey,
+      fortressId: FORTRESS,
+      operatorId: IDENTITY,
+    });
+    const server = await makeInboxServer({
+      bridge,
+      auditLog,
+      policy: await policyStore.load(),
+      policyStore,
+      prefsStore,
+    });
+    try {
+      const save = await fetch(`${server.base}/api/inbox/unified/prefs`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filters: {
+            search: "budget",
+            source: "budget_warning",
+            severity: "alert",
+            agent: "agent-b",
+            from: "2026-05-13",
+            to: "2026-05-14",
+          },
+        }),
+      });
+      expect(save.status).toBe(200);
+
+      const reloadedStore = new UnifiedInboxPrefsStore({
+        storage,
+        masterKey,
+        fortressId: FORTRESS,
+        operatorId: IDENTITY,
+      });
+      await server.close();
+
+      const restarted = await makeInboxServer({
+        bridge,
+        auditLog,
+        policy: await policyStore.load(),
+        policyStore,
+        prefsStore: reloadedStore,
+      });
+      try {
+        const loaded = await fetch(`${restarted.base}/api/inbox/unified/prefs`);
+        expect(loaded.status).toBe(200);
+        const body = await loaded.json() as {
+          data: { filters: Record<string, string> };
+        };
+        expect(body.data.filters).toMatchObject({
+          search: "budget",
+          source: "budget_warning",
+          severity: "alert",
+          agent: "agent-b",
+          from: "2026-05-13",
+          to: "2026-05-14",
+        });
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      await server.close().catch(() => undefined);
+    }
   });
 
   it("Castle-walking remains pure local operations", async () => {

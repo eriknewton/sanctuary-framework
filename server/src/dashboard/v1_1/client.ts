@@ -45,6 +45,7 @@ const cfgEl = document.getElementById("dashboard-config");
 const config = cfgEl ? JSON.parse(cfgEl.textContent || "{}") : {};
 const HUB = config.hubApiBase || "/api/hub";
 const AUTO_TRIGGER = "/api/auto-trigger";
+const INBOX_PREFS = "/api/inbox/unified/prefs";
 const STREAM = config.streamUrl || "/api/stream";
 const TOKEN = config.authToken || "";
 const SANCTUARY_VERSION = config.sanctuaryVersion || "";
@@ -2015,21 +2016,39 @@ function renderExitDrill() {
 }
 
 // ── Render: fortress column ───────────────────────────────────────────
-function inboxPrefsKey() {
-  return "sanctuary-v11-inbox-prefs:" + (config.fortressId || "local") + ":" + (config.identityId || "operator");
+function normalizeInboxPrefs(raw) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  return {
+    search: typeof source.search === "string" ? source.search : "",
+    source: typeof source.source === "string" ? source.source : "",
+    severity: typeof source.severity === "string" ? source.severity : "",
+    agent: typeof source.agent === "string" ? source.agent : "",
+    from: typeof source.from === "string" ? source.from : "",
+    to: typeof source.to === "string" ? source.to : ""
+  };
 }
 
-function loadInboxPrefs() {
+async function loadInboxPrefs() {
   try {
-    const raw = sessionStorage.getItem(inboxPrefsKey());
-    if (raw) return Object.assign({ search: "", source: "", severity: "", agent: "", from: "", to: "" }, JSON.parse(raw));
+    const res = await fetch(INBOX_PREFS, {
+      headers: TOKEN ? { "Authorization": "Bearer " + TOKEN } : {},
+      cache: "no-store"
+    });
+    if (!res.ok) return;
+    const body = await res.json();
+    state.inboxOps.filters = normalizeInboxPrefs(body && body.data && body.data.filters);
   } catch (_) {}
-  return { search: "", source: "", severity: "", agent: "", from: "", to: "" };
 }
-state.inboxOps.filters = loadInboxPrefs();
 
-function saveInboxPrefs() {
-  sessionStorage.setItem(inboxPrefsKey(), JSON.stringify(state.inboxOps.filters));
+async function saveInboxPrefs() {
+  try {
+    await fetch(INBOX_PREFS, {
+      method: "PUT",
+      headers: Object.assign({ "Content-Type": "application/json" }, TOKEN ? { "Authorization": "Bearer " + TOKEN } : {}),
+      cache: "no-store",
+      body: JSON.stringify({ filters: normalizeInboxPrefs(state.inboxOps.filters) })
+    });
+  } catch (_) {}
 }
 
 function inboxOption(value, bucket) {
@@ -2869,7 +2888,9 @@ if (mq) mq.addEventListener("change", function (e) {
 });
 
 // Boot.
-fetchAll().then(function () { rerender(); });
+loadInboxPrefs().then(function () {
+  return fetchAll();
+}).then(function () { rerender(); });
 bindHashRoute();
 connectStream();
 `;

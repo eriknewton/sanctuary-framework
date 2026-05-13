@@ -36,15 +36,21 @@ import {
   UnifiedInboxRetentionPolicy,
   type UnifiedInboxRetentionPolicyStore,
 } from "./unified-inbox-retention-policy.js";
+import {
+  normalizePrefs,
+  type UnifiedInboxPrefsStore,
+} from "./unified-inbox-prefs-store.js";
 
 export const UNIFIED_INBOX_API_PREFIX = "/api/inbox/unified";
 export const UNIFIED_INBOX_RETENTION_API_PREFIX = "/api/inbox/retention";
+export const UNIFIED_INBOX_PREFS_API_PATH = `${UNIFIED_INBOX_API_PREFIX}/prefs`;
 
 export interface UnifiedInboxRouterDeps {
   authConfig: AuthConfig;
   bridge: UnifiedInboxBridge;
   retentionPolicy?: UnifiedInboxRetentionPolicy;
   retentionPolicyStore?: UnifiedInboxRetentionPolicyStore;
+  prefsStore?: UnifiedInboxPrefsStore;
   auditLog?: import("../l2-operational/audit-log.js").AuditLog;
   identityId?: string;
   fortressId?: string;
@@ -153,6 +159,38 @@ export async function handleUnifiedInboxRoute(
   if (!checkAuth(req, res, url)) return true;
 
   try {
+    if (path === UNIFIED_INBOX_PREFS_API_PATH) {
+      if (!deps.prefsStore) {
+        writeJSON(res, 503, {
+          ok: false,
+          error: "prefs_store_not_configured",
+        });
+        return true;
+      }
+      if (method === "GET") {
+        writeJSON(res, 200, {
+          ok: true,
+          data: { filters: await deps.prefsStore.load() },
+        });
+        return true;
+      }
+      if (method === "PUT") {
+        const body = await readJsonBody(req);
+        const filters = normalizePrefs(
+          typeof body.filters === "object" && body.filters !== null
+            ? body.filters
+            : body,
+        );
+        writeJSON(res, 200, {
+          ok: true,
+          data: { filters: await deps.prefsStore.save(filters) },
+        });
+        return true;
+      }
+      writeJSON(res, 405, { ok: false, error: "method_not_allowed" });
+      return true;
+    }
+
     if (method === "GET" && path === UNIFIED_INBOX_API_PREFIX) {
       const sourceClassRaw =
         url.searchParams.get("source_class") ?? undefined;

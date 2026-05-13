@@ -43,6 +43,7 @@ import {
 } from "./auto-trigger/action-dispatcher.js";
 import { CalibrationSuggester } from "./auto-trigger/calibration-suggester.js";
 import { UnifiedInboxBridge } from "./principal-policy/unified-inbox-bridge.js";
+import { UnifiedInboxPrefsStore } from "./principal-policy/unified-inbox-prefs-store.js";
 import { UnifiedInboxStore } from "./principal-policy/unified-inbox-store.js";
 import {
   UnifiedInboxRetentionPolicyStore,
@@ -846,6 +847,12 @@ export async function createSanctuaryServer(options?: {
     });
   const unifiedInboxRetentionPolicy =
     await unifiedInboxRetentionPolicyStore.load();
+  const unifiedInboxPrefsStore = new UnifiedInboxPrefsStore({
+    storage,
+    masterKey,
+    fortressId: fortressIdForAggregator,
+    operatorId: aggregatorIdentityId,
+  });
   const unifiedInboxScheduler = new UnifiedInboxScheduler({
     bridge: unifiedInboxBridge,
   });
@@ -883,6 +890,7 @@ export async function createSanctuaryServer(options?: {
       bridge: unifiedInboxBridge,
       retentionPolicy: unifiedInboxRetentionPolicy,
       retentionPolicyStore: unifiedInboxRetentionPolicyStore,
+      prefsStore: unifiedInboxPrefsStore,
       fortressId: fortressIdForAggregator,
       identityId: aggregatorIdentityId,
     });
