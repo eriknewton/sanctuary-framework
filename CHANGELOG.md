@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.17] - 2026-05-13
+
+Patch release shipping the iteration-15 cascade since v1.2.16. **WP-V1.3-4 Unified Approval Inbox Bridge advances to 2 of N** with Psi-2 producer wiring plus at-rest inbox persistence. **WP-V1.3-2 Anomaly Detection Pipeline advances to 5 of N** with Chi-5 audit-event class distribution drift detection. **WP-V1.3-5 Honeypot Authoring advances to 4 of N** with Pi-4 credential honeypot traps. **WP-V1.3-7 Auto-Trigger Ladder + Threshold Calibration gains operator-facing action-class wiring** with Nu-2 dashboard calibration and action registry surfaces on top of the v1.2.16 structural closure. v1.3.0-rc.1 is cleared to cut immediately after v1.2.17 ships.
+
+### v1.3 preview, WP-V1.3-4 Unified Approval Inbox Bridge (1 of N to 2 of N)
+
+- **Psi-2 WP-V1.3-4 inbox bridge producer wiring plus at-rest persistence.** Adds `UnifiedInboxStore` with HKDF-AES-GCM encryption and AAD bound to `fortress_id|inbox_id`, optional durable storage for `UnifiedInboxBridge`, boot rehydration, retention pruning, and multi-fortress isolation. Five producer adapters now feed the unified inbox from Castle Wall blocked egress, Rho daily privacy aggregation, budget threshold warnings, recovery prompts, and wrapped-agent errors. Eleven new regression tests cover encryption round-trip, AAD tamper rejection, restart rehydration, retention prune, fortress isolation, and all five producer classes. PR #223.
+
+### v1.3 preview, WP-V1.3-2 Anomaly Detection Pipeline (4 of N to 5 of N)
+
+- **Chi-5 WP-V1.3-2 audit-event class distribution drift detector.** Adds detector-local categorical PSI classifier id `audit-event-class-distribution:psi`, deliberately collision-safe with Chi-2's generic PSI classifier. The detector supports 7-day audit-history baseline priming, online warmup fallback, and top-class drift attribution so operators can see which audit event classes drove a finding. Eighteen new regression tests cover detector registration, priming, warmup, PSI computation, attribution, threshold alerting, deterministic tie-breaking, fortress isolation, no-state-mutation-on-finding, and castle-walking purity. PR #221.
+
+### v1.3 preview, WP-V1.3-5 Honeypot Authoring (3 of N to 4 of N)
+
+- **Pi-4 WP-V1.3-5 credential honeypot trap class.** Adds operator-authored fake credentials that can surface through `secret_broker`, `env_var_export`, and `config_file` emission paths. Use-attempt detection emits both a read finding and a use finding through the existing Castle Wall `egress_blocked` audit path, while plausible 401/403 responses avoid disclosing honeypot status. The trap class remains server-local and introduces no new outbound allow path. PR #222.
+
+### v1.3 preview, WP-V1.3-7 Auto-Trigger Ladder + Threshold Calibration wiring
+
+- **Nu-2 WP-V1.3-7 action-class registry plus dashboard calibration wiring.** Adds the registry surface for three named action classes, `block_egress`, `auto_deny_tool`, and `throttle_agent`, and exposes the auto-trigger ladder calibration view in the existing v1.1 dashboard route. The action classes ship as forward-compatible contract IDs; enforcement bodies remain reserved for Castle Wall macOS Phase 1 and subsequent enforcement work. WP-V1.3-7 structural closure shipped in v1.2.16 through Nu-1 foundation plus Nu-3 auto-promotion criteria, and Nu-2 adds the operator-facing wiring on top. PR #224.
+
+### Notes
+
+v1.3.0-rc.1 is cleared to cut immediately after v1.2.17 ships; the release engineering prompt lives at `Review/Sanctuary/V1.3.0_RC1_Release_Engineering_Spawn_Prompt_2026-05-13.md`. npm publish remains Erik-owned because npm web-based 2FA binds browser approval to his foreground terminal context.
+
 ## [1.2.16] - 2026-05-09
 
 Patch release shipping the iteration-14 cascade since v1.2.15. **WP-V1.x-QUERY-LAYER-ANONYMITY STRUCTURALLY COMPLETE** (Rho-3 Tier B smart mode: intent classifier, reverse-mapping memo, and concierge render-time mapping ship; with Rho-1 Tier A header strip in v1.2.12 plus Rho-2 Tier B basic in v1.2.15, Principle 4 (Opacity at the query layer) is now closed end-to-end, both tiers shipped). **WP-V1.3-6 English-Authored Policy Gates advances to 3 of N** (Xi-3 pre-activation conflict detection). **WP-V1.3-7 Auto-Trigger Ladder + Threshold Calibration advances to 3 of N** (Nu-3 auto-promotion criteria plus calibration recommendations, operator-driven, never autonomous). **WP-V1.3-5 Honeypot Authoring advances to 3 of N** (Pi-3 tool-call honeypot class completes the http_endpoint plus filesystem plus tool_call trio). **WP-V1.x-RECOGNITION-LAYER advances again** with did:web build 4 key rotation, a production-credibility step toward did:web operating as a real recognition surface across rotations. The v1.3 preview routes remain additive and non-breaking; v1.3.0 GA continues to wait on remaining Chi-N anomaly-pipeline builds in WP-V1.3-2.
