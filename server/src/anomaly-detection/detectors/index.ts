@@ -37,6 +37,10 @@ import {
   ToolCallSequenceDetector,
   TOOL_CALL_SEQUENCE_DETECTOR_ID,
 } from "./tool-call-sequence-detector.js";
+import {
+  AuditEventClassDistributionDetector,
+  AUDIT_EVENT_CLASS_DISTRIBUTION_DETECTOR_ID,
+} from "./audit-event-class-distribution-detector.js";
 import type { AnomalyDetector } from "../types.js";
 
 export interface AnomalyDetectorCatalogEntry {
@@ -64,6 +68,12 @@ export const ANOMALY_DETECTOR_CATALOG: AnomalyDetectorCatalogEntry[] = [
       "Per-agent tool-call sequence shape: distinct tools used, max sequence length, 3-gram Shannon entropy, 2-gram repeat-pattern score. Catches data-exfiltration-shaped repeats.",
     factory: () => new ToolCallSequenceDetector(),
   },
+  {
+    detectorId: AUDIT_EVENT_CLASS_DISTRIBUTION_DETECTOR_ID,
+    description:
+      "Per-agent audit-event class distribution PSI over the operation mix, with top per-class drift attribution. Catches behavioral-mix shifts at stable event volume.",
+    factory: () => new AuditEventClassDistributionDetector(),
+  },
 ];
 
 export {
@@ -73,4 +83,6 @@ export {
   CROSS_AGENT_TIMING_DETECTOR_ID,
   ToolCallSequenceDetector,
   TOOL_CALL_SEQUENCE_DETECTOR_ID,
+  AuditEventClassDistributionDetector,
+  AUDIT_EVENT_CLASS_DISTRIBUTION_DETECTOR_ID,
 };
