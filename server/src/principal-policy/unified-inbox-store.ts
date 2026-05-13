@@ -153,6 +153,13 @@ export class UnifiedInboxStore {
     });
   }
 
+  async delete(inbox_id: string): Promise<boolean> {
+    return await this.storage.delete(
+      UNIFIED_INBOX_NAMESPACE,
+      entryKey(inbox_id),
+    );
+  }
+
   async pruneExpired(now?: Date): Promise<{ pruned: number }> {
     const cutoff = (now ?? this.now()).toISOString();
     const metas = await this.storage.list(
