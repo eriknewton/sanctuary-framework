@@ -65,6 +65,11 @@ export type UnifiedInboxSourceClass =
   | "agent_error";
 
 export type UnifiedInboxSeverity = "info" | "warn" | "alert" | "critical";
+export type UnifiedInboxEntryState =
+  | "active"
+  | "archived"
+  | "snoozed"
+  | "dismissed";
 
 export interface UnifiedInboxEntry {
   /** Stable per-fortress inbox id (UUID v4). */
@@ -97,6 +102,12 @@ export interface UnifiedInboxEntry {
   resolved_at?: string;
   /** Operator identity that resolved this entry, when applicable. */
   resolved_by?: string;
+  /** Operator workflow state. Missing values from Psi-1/Psi-2 read as active. */
+  state?: UnifiedInboxEntryState;
+  /** ISO 8601 deadline. Snoozed entries re-enter active queries after this. */
+  snoozed_until?: string;
+  archived_at?: string;
+  dismissed_at?: string;
   /** Stable fortress id stamped at emit. Multi-fortress isolation pivot. */
   fortress_id: string;
 }
@@ -109,6 +120,12 @@ export const UNIFIED_INBOX_AUDIT_OPS = {
   AGGREGATED: "unified_inbox_entry_aggregated",
   RESOLVED: "unified_inbox_entry_resolved",
   DEDUPED: "unified_inbox_entry_deduped",
+  ARCHIVED: "inbox_entry_archived",
+  DISMISSED: "inbox_entry_dismissed",
+  SNOOZED: "inbox_entry_snoozed",
+  UNSNOOZED: "inbox_entry_unsnoozed",
+  DELETED: "inbox_entry_deleted",
+  BATCH_ACTION: "inbox_batch_action",
 } as const;
 
 export type UnifiedInboxAuditOp =
@@ -131,6 +148,24 @@ export type UnifiedInboxBridgeEvent =
   | UnifiedInboxResolveEvent;
 
 export type UnifiedInboxUnsubscribe = () => void;
+
+export interface InboxQuery {
+  source_class?: UnifiedInboxSourceClass | UnifiedInboxSourceClass[];
+  severity?: UnifiedInboxSeverity[];
+  agent_id?: string | string[];
+  time_range?: { from: string; to: string };
+  state?: UnifiedInboxEntryState[];
+  full_text?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface BatchActionResult {
+  batch_correlation_id: string;
+  requested: number;
+  affected: number;
+  missing: string[];
+}
 
 // ── Ingest payload shapes ────────────────────────────────────────────
 
@@ -425,20 +460,74 @@ export class UnifiedInboxBridge {
     includeResolved?: boolean;
     limit?: number;
   }): UnifiedInboxEntry[] {
-    const since = opts?.since !== undefined ? Date.parse(opts.since) : null;
+    return this.queryInbox({
+      ...(opts?.sourceClass !== undefined ? { source_class: opts.sourceClass } : {}),
+      ...(opts?.severity !== undefined ? { severity: [opts.severity] } : {}),
+      ...(opts?.since !== undefined
+        ? {
+            time_range: {
+              from: opts.since,
+              to: new Date(8_640_000_000_000_000).toISOString(),
+            },
+          }
+        : {}),
+      state: opts?.includeResolved === true
+        ? ["active", "archived", "snoozed", "dismissed"]
+        : ["active"],
+      ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
+    });
+  }
+
+  /**
+   * Query reads the bridge hot cache and filters in memory. This is a
+   * deliberate Psi-3 tradeoff for filesystem-backed encrypted KV storage:
+   * it is simple and local-only, but should grow an index if operator
+   * inboxes exceed roughly 10k entries or this path becomes hot.
+   */
+  queryInbox(query: InboxQuery = {}): UnifiedInboxEntry[] {
+    const sourceClasses = asSet(query.source_class);
+    const severities = asSet(query.severity);
+    const agentIds = asSet(query.agent_id);
+    const states = new Set(query.state ?? ["active"]);
+    const text = query.full_text?.trim().toLowerCase();
+    const from = query.time_range ? Date.parse(query.time_range.from) : null;
+    const to = query.time_range ? Date.parse(query.time_range.to) : null;
+    const nowMs = this.now().getTime();
     const out: UnifiedInboxEntry[] = [];
+
     for (const entry of this.entriesByKey.values()) {
-      if (opts?.sourceClass !== undefined && entry.source_class !== opts.sourceClass) continue;
-      if (opts?.severity !== undefined && entry.severity !== opts.severity) continue;
-      if (opts?.includeResolved !== true && entry.resolved_at !== undefined) continue;
-      if (since !== null) {
+      const state = this.effectiveState(entry, nowMs);
+      if (!states.has(state)) continue;
+      if (sourceClasses && !sourceClasses.has(entry.source_class)) continue;
+      if (severities && !severities.has(entry.severity)) continue;
+      if (agentIds && !agentIds.has(entry.agent_id ?? "")) continue;
+      if (from !== null || to !== null) {
         const observedMs = Date.parse(entry.observed_at);
-        if (!Number.isFinite(observedMs) || observedMs < since) continue;
+        if (!Number.isFinite(observedMs)) continue;
+        if (from !== null && Number.isFinite(from) && observedMs < from) continue;
+        if (to !== null && Number.isFinite(to) && observedMs > to) continue;
       }
-      out.push(entry);
+      if (text) {
+        const haystack = [
+          entry.summary,
+          entry.details_url,
+          entry.source_event_id,
+          entry.agent_id ?? "",
+        ].join(" ").toLowerCase();
+        if (!haystack.includes(text)) continue;
+      }
+      out.push(this.withEffectiveState(entry, state));
     }
-    const limit = opts?.limit ?? out.length;
-    return out.slice(0, limit);
+
+    out.sort((a, b) => (a.observed_at < b.observed_at ? 1 : -1));
+    const offset = Math.max(0, query.offset ?? 0);
+    const limit = query.limit !== undefined ? Math.max(0, query.limit) : out.length;
+    return out.slice(offset, offset + limit);
+  }
+
+  countInbox(query: InboxQuery = {}): number {
+    const { limit: _limit, offset: _offset, ...withoutPaging } = query;
+    return this.queryInbox(withoutPaging).length;
   }
 
   get(inboxId: string): UnifiedInboxEntry | null {
@@ -483,6 +572,68 @@ export class UnifiedInboxBridge {
     return updated;
   }
 
+  archiveBatch(entryIds: string[]): BatchActionResult {
+    return this.applyBatch("archive", entryIds);
+  }
+
+  dismissBatch(entryIds: string[]): BatchActionResult {
+    return this.applyBatch("dismiss", entryIds);
+  }
+
+  snoozeBatch(entryIds: string[], until: string): BatchActionResult {
+    if (!Number.isFinite(Date.parse(until))) {
+      throw new Error("snooze until must be an ISO 8601 timestamp");
+    }
+    return this.applyBatch("snooze", entryIds, until);
+  }
+
+  deleteBatch(entryIds: string[]): BatchActionResult {
+    return this.applyBatch("delete", entryIds);
+  }
+
+  unsnooze(entryId: string): UnifiedInboxEntry | null {
+    const located = this.locate(entryId);
+    if (!located) return null;
+    if (this.effectiveState(located.entry) !== "snoozed") {
+      return this.withEffectiveState(located.entry);
+    }
+    const updated: UnifiedInboxEntry = {
+      ...located.entry,
+      state: "active",
+      snoozed_until: undefined,
+    };
+    this.entriesByKey.set(located.key, updated);
+    this.persistEntry(updated);
+    this.auditEntry(UNIFIED_INBOX_AUDIT_OPS.UNSNOOZED, updated, {
+      batch_correlation_id: randomUUID(),
+    });
+    this.emit({ type: "resolved", entry: updated });
+    return updated;
+  }
+
+  resurfaceDueSnoozes(now: Date = this.now()): number {
+    const nowMs = now.getTime();
+    let resurfaced = 0;
+    for (const [key, entry] of this.entriesByKey) {
+      if (entry.state !== "snoozed") continue;
+      const untilMs = Date.parse(entry.snoozed_until ?? "");
+      if (!Number.isFinite(untilMs) || untilMs > nowMs) continue;
+      const updated: UnifiedInboxEntry = {
+        ...entry,
+        state: "active",
+        snoozed_until: undefined,
+      };
+      this.entriesByKey.set(key, updated);
+      this.persistEntry(updated);
+      this.auditEntry(UNIFIED_INBOX_AUDIT_OPS.UNSNOOZED, updated, {
+        auto_resurfaced: true,
+      });
+      this.emit({ type: "resolved", entry: updated });
+      resurfaced += 1;
+    }
+    return resurfaced;
+  }
+
   // ── helpers / private ──────────────────────────────────────────────
 
   /**
@@ -491,6 +642,149 @@ export class UnifiedInboxBridge {
    */
   size(): number {
     return this.entriesByKey.size;
+  }
+
+  private applyBatch(
+    action: "archive" | "dismiss" | "snooze" | "delete",
+    entryIds: string[],
+    until?: string,
+  ): BatchActionResult {
+    const batchCorrelationId = randomUUID();
+    const missing: string[] = [];
+    let affected = 0;
+    this.auditLog.append(
+      "l2",
+      UNIFIED_INBOX_AUDIT_OPS.BATCH_ACTION,
+      this.identityId,
+      {
+        action,
+        requested: entryIds.length,
+        batch_correlation_id: batchCorrelationId,
+        fortress_id: this.fortressId,
+        ...(until !== undefined ? { until } : {}),
+      },
+    );
+
+    for (const entryId of entryIds) {
+      const located = this.locate(entryId);
+      if (!located) {
+        missing.push(entryId);
+        continue;
+      }
+      if (action === "delete") {
+        this.entriesByKey.delete(located.key);
+        this.keyByInboxId.delete(entryId);
+        if (this.store) {
+          this.trackStoreWrite(this.store.delete(entryId));
+        }
+        this.auditEntry(UNIFIED_INBOX_AUDIT_OPS.DELETED, located.entry, {
+          batch_correlation_id: batchCorrelationId,
+        });
+        affected += 1;
+        continue;
+      }
+
+      const timestamp = this.now().toISOString();
+      const updated: UnifiedInboxEntry =
+        action === "archive"
+          ? {
+              ...located.entry,
+              state: "archived",
+              archived_at: located.entry.archived_at ?? timestamp,
+              snoozed_until: undefined,
+            }
+          : action === "dismiss"
+            ? {
+                ...located.entry,
+                state: "dismissed",
+                dismissed_at: located.entry.dismissed_at ?? timestamp,
+                snoozed_until: undefined,
+              }
+            : {
+                ...located.entry,
+                state: "snoozed",
+                snoozed_until: until,
+              };
+      this.entriesByKey.set(located.key, updated);
+      this.persistEntry(updated);
+      this.auditEntry(
+        action === "archive"
+          ? UNIFIED_INBOX_AUDIT_OPS.ARCHIVED
+          : action === "dismiss"
+            ? UNIFIED_INBOX_AUDIT_OPS.DISMISSED
+            : UNIFIED_INBOX_AUDIT_OPS.SNOOZED,
+        updated,
+        {
+          batch_correlation_id: batchCorrelationId,
+          ...(until !== undefined ? { until } : {}),
+        },
+      );
+      this.emit({ type: "resolved", entry: updated });
+      affected += 1;
+    }
+
+    return {
+      batch_correlation_id: batchCorrelationId,
+      requested: entryIds.length,
+      affected,
+      missing,
+    };
+  }
+
+  private locate(inboxId: string): { key: string; entry: UnifiedInboxEntry } | null {
+    const key = this.keyByInboxId.get(inboxId);
+    if (key === undefined) return null;
+    const entry = this.entriesByKey.get(key);
+    if (entry === undefined) return null;
+    return { key, entry };
+  }
+
+  private persistEntry(entry: UnifiedInboxEntry): void {
+    if (this.store) {
+      this.trackStoreWrite(this.store.upsert(entry));
+    }
+  }
+
+  private auditEntry(
+    operation: UnifiedInboxAuditOp,
+    entry: UnifiedInboxEntry,
+    extra?: Record<string, unknown>,
+  ): void {
+    this.auditLog.append("l2", operation, this.identityId, {
+      inbox_id: entry.inbox_id,
+      source_class: entry.source_class,
+      source_event_id: entry.source_event_id,
+      state: this.effectiveState(entry),
+      fortress_id: this.fortressId,
+      ...(entry.agent_id !== undefined ? { agent_id: entry.agent_id } : {}),
+      ...extra,
+    });
+  }
+
+  private effectiveState(
+    entry: UnifiedInboxEntry,
+    nowMs = this.now().getTime(),
+  ): UnifiedInboxEntryState {
+    const state = entry.resolved_at && (entry.state === undefined || entry.state === "active")
+      ? "dismissed"
+      : (entry.state ?? "active");
+    if (state !== "snoozed") return state;
+    const untilMs = Date.parse(entry.snoozed_until ?? "");
+    if (!Number.isFinite(untilMs) || untilMs <= nowMs) return "active";
+    return "snoozed";
+  }
+
+  private withEffectiveState(
+    entry: UnifiedInboxEntry,
+    state = this.effectiveState(entry),
+  ): UnifiedInboxEntry {
+    if (entry.state === state && (state !== "active" || entry.snoozed_until === undefined)) {
+      return entry;
+    }
+    if (state === "active" && entry.state === "snoozed") {
+      return { ...entry, state: "active", snoozed_until: undefined };
+    }
+    return { ...entry, state };
   }
 
   private ingest(input: {
@@ -540,6 +834,7 @@ export class UnifiedInboxBridge {
       summary: truncateSummary(input.summary),
       details_url: `${this.detailsUrlBase}/${inboxId}`,
       observed_at: input.observed_at,
+      state: "active",
       fortress_id: this.fortressId,
       ...(input.agent_id !== undefined ? { agent_id: input.agent_id } : {}),
     };
@@ -590,6 +885,10 @@ export class UnifiedInboxBridge {
       ...(entry.agent_id !== undefined ? { agent_id: entry.agent_id } : {}),
       ...(entry.resolved_at !== undefined ? { resolved_at: entry.resolved_at } : {}),
       ...(entry.resolved_by !== undefined ? { resolved_by: entry.resolved_by } : {}),
+      ...(entry.state !== undefined ? { state: entry.state } : {}),
+      ...(entry.snoozed_until !== undefined ? { snoozed_until: entry.snoozed_until } : {}),
+      ...(entry.archived_at !== undefined ? { archived_at: entry.archived_at } : {}),
+      ...(entry.dismissed_at !== undefined ? { dismissed_at: entry.dismissed_at } : {}),
     };
     this.entriesByKey.set(dedupKey, cached);
     this.keyByInboxId.set(cached.inbox_id, dedupKey);
@@ -614,6 +913,11 @@ export class UnifiedInboxBridge {
 function truncateSummary(s: string): string {
   if (s.length <= UNIFIED_INBOX_SUMMARY_MAX_CHARS) return s;
   return s.slice(0, UNIFIED_INBOX_SUMMARY_MAX_CHARS - 3) + "...";
+}
+
+function asSet<T extends string>(value?: T | T[]): Set<T> | null {
+  if (value === undefined) return null;
+  return new Set(Array.isArray(value) ? value : [value]);
 }
 
 /**

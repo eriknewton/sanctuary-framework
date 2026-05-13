@@ -55,6 +55,11 @@ const state = {
   route: "dashboard",
   agents: [],
   inbox: [],
+  inboxOps: {
+    selected: {},
+    filters: { search: "", source: "", severity: "", agent: "", from: "", to: "" },
+    snoozeDialog: null
+  },
   activity: [],
   policies: [],
   autoTrigger: { rules: [], recommendations: [], loadError: null, savingRuleId: null },
@@ -2010,10 +2015,95 @@ function renderExitDrill() {
 }
 
 // ── Render: fortress column ───────────────────────────────────────────
+function inboxPrefsKey() {
+  return "sanctuary-v11-inbox-prefs:" + (config.fortressId || "local") + ":" + (config.identityId || "operator");
+}
+
+function loadInboxPrefs() {
+  try {
+    const raw = sessionStorage.getItem(inboxPrefsKey());
+    if (raw) return Object.assign({ search: "", source: "", severity: "", agent: "", from: "", to: "" }, JSON.parse(raw));
+  } catch (_) {}
+  return { search: "", source: "", severity: "", agent: "", from: "", to: "" };
+}
+state.inboxOps.filters = loadInboxPrefs();
+
+function saveInboxPrefs() {
+  sessionStorage.setItem(inboxPrefsKey(), JSON.stringify(state.inboxOps.filters));
+}
+
+function inboxOption(value, bucket) {
+  const selected = (bucket === "severity" ? state.inboxOps.filters.severity : state.inboxOps.filters.source) === value;
+  return '<option value="' + escHtml(value) + '"' + (selected ? ' selected' : '') + '>' + escHtml(value) + '</option>';
+}
+
+function inboxAgentOptions() {
+  const seen = {};
+  state.inbox.forEach(function (i) {
+    if (i.agent_id) seen[i.agent_id] = true;
+    if (i.display_template_args && i.display_template_args.agent_id) seen[i.display_template_args.agent_id] = true;
+  });
+  return Object.keys(seen).sort().map(function (agent) {
+    return '<option value="' + escHtml(agent) + '"' + (state.inboxOps.filters.agent === agent ? ' selected' : '') + '>' + escHtml(agent) + '</option>';
+  }).join("");
+}
+
+function filterInbox(items) {
+  const f = state.inboxOps.filters;
+  const q = f.search.trim().toLowerCase();
+  const fromMs = f.from ? Date.parse(f.from + "T00:00:00.000Z") : null;
+  const toMs = f.to ? Date.parse(f.to + "T23:59:59.999Z") : null;
+  return items.filter(function (i) {
+    const args = i.display_template_args || {};
+    const agent = i.agent_id || args.agent_id || "";
+    const severity = i.severity || args.severity || "";
+    const source = i.source_class || i.kind || "";
+    const when = Date.parse(i.created_at || i.observed_at || i.timestamp || "");
+    const text = (renderTemplate(i.display_template_id, args) + " " + JSON.stringify(args)).toLowerCase();
+    if (f.source && source !== f.source) return false;
+    if (f.severity && severity !== f.severity) return false;
+    if (f.agent && agent !== f.agent) return false;
+    if (fromMs !== null && Number.isFinite(when) && when < fromMs) return false;
+    if (toMs !== null && Number.isFinite(when) && when > toMs) return false;
+    if (q && text.indexOf(q) < 0) return false;
+    return true;
+  });
+}
+
 function renderFortress() {
   const fortress = document.getElementById("fortress");
   if (!fortress) return;
-  const visibleInbox = state.inbox.filter(function (i) { return !i.resolved; });
+  const visibleInbox = filterInbox(state.inbox.filter(function (i) { return !i.resolved; }));
+  const selectedIds = Object.keys(state.inboxOps.selected).filter(function (id) { return state.inboxOps.selected[id]; });
+  const batchToolbar = selectedIds.length
+    ? '<div class="toolbar" style="margin-bottom:8px;">' +
+        '<span class="pill">' + selectedIds.length + ' selected</span>' +
+        '<button class="btn" data-action="inbox-batch-archive">Archive</button>' +
+        '<button class="btn" data-action="inbox-batch-dismiss">Dismiss</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze-open">Snooze</button>' +
+        '<button class="btn btn-danger" data-action="inbox-batch-delete">Delete</button>' +
+      '</div>'
+    : "";
+  const snoozeDialog = state.inboxOps.snoozeDialog
+    ? '<div class="modal-backdrop"><div class="modal"><h3>Snooze</h3><div class="toolbar">' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="3600000">1h</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="14400000">4h</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="86400000">1d</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="604800000">1w</button>' +
+        '<input class="input" data-action="inbox-snooze-custom" type="datetime-local">' +
+        '<button class="btn" data-action="inbox-batch-snooze-custom">Custom</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze-close">Cancel</button>' +
+      '</div></div></div>'
+    : "";
+  const filterPanel =
+    '<div class="toolbar" style="align-items:flex-end;flex-wrap:wrap;margin-bottom:8px;">' +
+      '<label>Search<br><input class="input" data-action="inbox-filter-search" value="' + escHtml(state.inboxOps.filters.search) + '"></label>' +
+      '<label>Source<br><select class="input" data-action="inbox-filter-source"><option value="">Any</option>' + inboxOption("blocked_egress") + inboxOption("privacy_event") + inboxOption("budget_warning") + inboxOption("recovery_prompt") + inboxOption("agent_error") + inboxOption("approval") + inboxOption("sentinel_finding") + '</select></label>' +
+      '<label>Severity<br><select class="input" data-action="inbox-filter-severity"><option value="">Any</option>' + inboxOption("info", "severity") + inboxOption("warn", "severity") + inboxOption("alert", "severity") + inboxOption("critical", "severity") + '</select></label>' +
+      '<label>Agent<br><select class="input" data-action="inbox-filter-agent"><option value="">Any</option>' + inboxAgentOptions() + '</select></label>' +
+      '<label>From<br><input class="input" data-action="inbox-filter-from" type="date" value="' + escHtml(state.inboxOps.filters.from) + '"></label>' +
+      '<label>To<br><input class="input" data-action="inbox-filter-to" type="date" value="' + escHtml(state.inboxOps.filters.to) + '"></label>' +
+    '</div>';
   const inboxRows = visibleInbox.length
     ? visibleInbox.map(function (i) {
         const text = renderTemplate(i.display_template_id, i.display_template_args);
@@ -2030,8 +2120,10 @@ function renderFortress() {
           : '<span class="pill">' + escHtml(i.kind) + '</span>';
         return '<div class="row" data-inbox-row="' + escHtml(i.item_id) + '" data-inbox-kind="' + escHtml(i.kind) + '"' +
           (i.kind === "approval_pending" ? ' data-inbox-tier="' + escHtml(i.tier) + '"' : '') + '>' +
+          '<input type="checkbox" data-action="inbox-select" data-item-id="' + escHtml(i.item_id) + '"' + (state.inboxOps.selected[i.item_id] ? ' checked' : '') + '>' +
           '<div class="grow">' + escHtml(text) + '</div>' +
           tierBadge +
+          '<button class="btn" data-action="inbox-snooze-menu" data-item-id="' + escHtml(i.item_id) + '" title="Snooze">...</button>' +
           '<div style="display:flex;gap:4px;">' + buttons + '</div>' +
           '</div>';
       }).join("\n")
@@ -2111,7 +2203,7 @@ function renderFortress() {
       '<div class="layer-card"><h4>L3 Selective disclosure</h4><p>Commitments without revealing values.</p></div>',
       '<div class="layer-card"><h4>L4 Verifiable reputation</h4><p>Signed attestations, portable.</p></div>',
     '</section>',
-    '<section class="card"><h3>Inbox (' + state.inbox.filter(function (i) { return !i.resolved; }).length + ')</h3>' + inboxRows + '</section>',
+    '<section class="card"><h3>Inbox (' + state.inbox.filter(function (i) { return !i.resolved; }).length + ')</h3>' + filterPanel + batchToolbar + inboxRows + snoozeDialog + '</section>',
     '<section class="card"><h3>Recognition Layer health</h3>' + recognitionCard + '</section>',
     '<section class="card"><h3>Agents (' + state.agents.length + ')</h3>' + agentsCard + '</section>',
     '<section class="card"><h3>Posture</h3><p class="muted">Local-only. Single operator. Federation: off.</p></section>'
@@ -2325,6 +2417,29 @@ async function onInboxAction(itemId, action) {
     } else {
       toast("Inbox action failed: " + e.message, "error");
     }
+  }
+}
+
+async function onInboxBatchAction(action, until) {
+  const ids = Object.keys(state.inboxOps.selected).filter(function (id) { return state.inboxOps.selected[id]; });
+  if (ids.length === 0) return;
+  try {
+    if (action === "archive" || action === "delete" || action === "snooze") {
+      await fetch("/api/inbox/unified/batch", {
+        method: "POST",
+        headers: Object.assign({ "Content-Type": "application/json" }, TOKEN ? { "Authorization": "Bearer " + TOKEN } : {}),
+        body: JSON.stringify({ action: action, entry_ids: ids, until: until })
+      });
+    }
+    if (action === "dismiss") {
+      for (const id of ids) await onInboxAction(id, "dismiss");
+    }
+    state.inboxOps.selected = {};
+    state.inboxOps.snoozeDialog = null;
+    await fetchAll();
+    rerender();
+  } catch (e) {
+    toast("Inbox batch action failed.", "error");
   }
 }
 
@@ -2616,6 +2731,36 @@ document.addEventListener("click", function (ev) {
     if (i) toast("Template: " + i.display_template_id);
     return;
   }
+  if (action === "inbox-select" && itemId) {
+    state.inboxOps.selected[itemId] = tgt.checked;
+    return rerender();
+  }
+  if (action === "inbox-batch-archive") return void onInboxBatchAction("archive");
+  if (action === "inbox-batch-dismiss") return void onInboxBatchAction("dismiss");
+  if (action === "inbox-batch-delete") return void onInboxBatchAction("delete");
+  if (action === "inbox-batch-snooze-open") {
+    state.inboxOps.snoozeDialog = true;
+    return rerender();
+  }
+  if (action === "inbox-snooze-menu" && itemId) {
+    state.inboxOps.selected = {};
+    state.inboxOps.selected[itemId] = true;
+    state.inboxOps.snoozeDialog = true;
+    return rerender();
+  }
+  if (action === "inbox-batch-snooze-close") {
+    state.inboxOps.snoozeDialog = null;
+    return rerender();
+  }
+  if (action === "inbox-batch-snooze") {
+    const ms = Number(tgt.getAttribute("data-snooze-ms") || "0");
+    return void onInboxBatchAction("snooze", new Date(Date.now() + ms).toISOString());
+  }
+  if (action === "inbox-batch-snooze-custom") {
+    const input = document.querySelector('[data-action="inbox-snooze-custom"]');
+    const raw = input && input.value ? input.value : "";
+    return void onInboxBatchAction("snooze", raw ? new Date(raw).toISOString() : new Date(Date.now() + 3600000).toISOString());
+  }
   if (action.indexOf("inbox-") === 0 && itemId) {
     const sub = action.slice("inbox-".length);
     return void onInboxAction(itemId, sub);
@@ -2665,7 +2810,31 @@ document.addEventListener("input", function (ev) {
     // Mirror composer text into state without rerender so keystrokes
     // do not clobber the input element's value or caret position.
     state.chat.concierge.composer = tgt.value;
+  } else if (action === "inbox-filter-search") {
+    state.inboxOps.filters.search = tgt.value;
+    saveInboxPrefs();
+    rerender();
+  } else if (action === "inbox-filter-from") {
+    state.inboxOps.filters.from = tgt.value;
+    saveInboxPrefs();
+    rerender();
+  } else if (action === "inbox-filter-to") {
+    state.inboxOps.filters.to = tgt.value;
+    saveInboxPrefs();
+    rerender();
   }
+});
+
+document.addEventListener("change", function (ev) {
+  const tgt = ev.target;
+  if (!(tgt instanceof Element) || tgt.tagName !== "SELECT") return;
+  const action = tgt.getAttribute("data-action");
+  if (action === "inbox-filter-source") state.inboxOps.filters.source = tgt.value;
+  else if (action === "inbox-filter-severity") state.inboxOps.filters.severity = tgt.value;
+  else if (action === "inbox-filter-agent") state.inboxOps.filters.agent = tgt.value;
+  else return;
+  saveInboxPrefs();
+  rerender();
 });
 
 // v1.1.7: chat composer submit handler removed alongside the half-built
