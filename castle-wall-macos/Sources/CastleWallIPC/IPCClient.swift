@@ -349,6 +349,8 @@ public final class IPCClient {
         switch envelope.params {
         case .handshakeChallenge(let nonceB64url):
             handleHandshakeChallenge(nonceB64url: nonceB64url)
+        case .handshakeResponse:
+            handleHandshakeResponse(envelope.params)
         default:
             // Post-handshake routing. Before the handshake completes,
             // any non-challenge frame is a protocol error and rejected.
@@ -369,28 +371,45 @@ public final class IPCClient {
     }
 
     private func handleHandshakeChallenge(nonceB64url: String) {
-        // Foundation scope: this client is the *extension* side, which
-        // verifies a counterparty signature. The current foundation build
-        // only RECEIVES the challenge; signing happens on the Sanctuary
-        // main side. We surface the nonce up to the lifecycle layer for
-        // future builds to wire the verifier path. For now we treat the
-        // arrival of a valid challenge as the handshake-complete signal.
-        do {
-            let nonce = try Base64URL.decode(nonceB64url)
-            pendingChallengeNonce = nonce
-            CastleWallLog.auth.info("handshake challenge received; awaiting paired response in Alpha-2")
-        } catch {
-            failHandshake(IPCClientError.handshakeRejected("invalid challenge nonce: \(error)"))
+        guard handshakeIdentity == nil else {
+            CastleWallLog.auth.notice("duplicate handshake challenge after authentication; dropping")
             return
         }
+        do {
+            let nonce = try Base64URL.decode(nonceB64url)
+            guard nonce.count == CastleWallConstants.challengeNonceBytes else {
+                failHandshake(IPCClientError.handshakeRejected(
+                    "invalid challenge nonce length: expected \(CastleWallConstants.challengeNonceBytes), got \(nonce.count)"
+                ))
+                return
+            }
+            pendingChallengeNonce = nonce
+            CastleWallLog.auth.info("handshake challenge received; awaiting signed response")
+        } catch {
+            failHandshake(IPCClientError.handshakeRejected("invalid challenge nonce: \(error)"))
+        }
+    }
 
-        // Foundation: signal completion now. Alpha-2 will replace this with
-        // a true response-verification round-trip.
-        let identity = HandshakeIdentity(
-            fortressId: "<pending Alpha-2>",
-            signingKeyId: "<pending Alpha-2>"
-        )
-        completeHandshake(identity)
+    private func handleHandshakeResponse(_ response: IpcMessage) {
+        guard handshakeIdentity == nil else {
+            CastleWallLog.auth.notice("duplicate handshake response after authentication; dropping")
+            return
+        }
+        guard let nonce = pendingChallengeNonce else {
+            failHandshake(IPCClientError.handshakeRejected("handshake response before challenge"))
+            return
+        }
+        do {
+            let identity = try Auth.verifyHandshakeResponse(
+                response,
+                expectedNonce: nonce,
+                pinnedPublicKey: pinnedPublicKey
+            )
+            pendingChallengeNonce = nil
+            completeHandshake(identity)
+        } catch {
+            failHandshake(IPCClientError.handshakeRejected("invalid handshake response: \(error)"))
+        }
     }
 
     private func completeHandshake(_ identity: HandshakeIdentity) {
@@ -404,6 +423,13 @@ public final class IPCClient {
 
     private func failHandshake(_ error: Error) {
         cancelHandshakeDeadline()
+        pendingChallengeNonce = nil
+        receiveSource?.cancel()
+        receiveSource = nil
+        if socketFD != -1 {
+            _ = Darwin.close(socketFD)
+            socketFD = -1
+        }
         if let cont = handshakeContinuation {
             handshakeContinuation = nil
             cont.resume(throwing: error)
