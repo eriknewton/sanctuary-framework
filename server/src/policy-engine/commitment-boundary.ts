@@ -120,8 +120,10 @@ export function evaluateCommitmentBoundary(
     );
   }
 
+  const counterparty = req.counterparty?.trim();
+
   // Condition 2.
-  if (!req.counterparty || req.counterparty.length === 0) {
+  if (!counterparty || !isSpecificCounterparty(counterparty)) {
     return emit(
       "deny",
       GATE_REASON_CODES.COMMITMENT_BOUNDARY_NO_COUNTERPARTY,
@@ -133,12 +135,12 @@ export function evaluateCommitmentBoundary(
   const bs = req.bounded_scope;
   if (
     !bs ||
-    !bs.deliverable ||
-    !bs.deadline_or_terminal ||
-    !bs.budget_ref ||
-    bs.deliverable.length === 0 ||
-    bs.deadline_or_terminal.length === 0 ||
-    bs.budget_ref.length === 0
+    typeof bs.deliverable !== "string" ||
+    typeof bs.deadline_or_terminal !== "string" ||
+    typeof bs.budget_ref !== "string" ||
+    bs.deliverable.trim().length === 0 ||
+    bs.deadline_or_terminal.trim().length === 0 ||
+    bs.budget_ref.trim().length === 0
   ) {
     return emit(
       "deny",
@@ -163,6 +165,28 @@ export function evaluateCommitmentBoundary(
   return emit(
     "allow",
     GATE_REASON_CODES.COMMITMENT_BOUNDARY_ALLOW,
-    `all four §7.1 conditions satisfied; ${req.agent_id} may emit "${req.commitment_class}" commitment to ${req.counterparty}`
+    `all four §7.1 conditions satisfied; ${req.agent_id} may emit "${req.commitment_class}" commitment to ${counterparty}`
   );
+}
+
+function isSpecificCounterparty(value: string): boolean {
+  if (value === "*" || value === "." || value === "-") return false;
+  if (/,|;|\s+and\s+|\s+or\s+/i.test(value)) return false;
+  if (/^(all|any|everyone|broadcast|all_wrapped_agents|all_agents)$/i.test(value)) {
+    return false;
+  }
+  if (value.startsWith("did:")) return isDid(value);
+  return isAgentId(value) || isPeerAgentId(value) || isDid(value);
+}
+
+function isAgentId(value: string): boolean {
+  return /^(?:agent:)?[A-Za-z][A-Za-z0-9_.:-]{1,127}$/.test(value);
+}
+
+function isPeerAgentId(value: string): boolean {
+  return /^peer:[A-Za-z0-9_.:-]{2,127}$/.test(value);
+}
+
+function isDid(value: string): boolean {
+  return /^did:[a-z0-9]+:[A-Za-z0-9._:%-]+$/i.test(value);
 }

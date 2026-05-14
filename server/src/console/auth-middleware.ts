@@ -18,7 +18,7 @@ import { AuthGateError } from "./errors.js";
 export interface AuthConfig {
   /** When true, loopback (127.0.0.1 / ::1) requests bypass auth. */
   loopbackAutoAuth: boolean;
-  /** Bearer token for non-loopback. If undefined, all requests pass. */
+  /** Bearer token for non-loopback. If undefined, non-loopback fails closed. */
   authToken?: string;
 }
 
@@ -48,9 +48,8 @@ export function enforceAuth(
     return true;
   }
 
-  // No token configured: allow all (single-user localhost default)
   if (!config.authToken) {
-    return true;
+    throw new AuthGateError("missing configured authentication token");
   }
 
   // Extract token from Authorization header or ?token= query param

@@ -109,6 +109,10 @@ export class ToolCallTrapRuntime {
     if (!spec) return { handled: false };
 
     const trigger = spec.trigger;
+    if (!isVisibleToAgent(trigger, callerAgentId(callerIdentity))) {
+      return { handled: false };
+    }
+
     const now = this.now();
     const argHash = hashJson(args);
     const findingId = randomUUID();
@@ -248,6 +252,12 @@ function isVisibleToAgent(
   if (trigger.catalog_visibility === "all_wrapped_agents") return true;
   if (!agentId) return false;
   return (trigger.visible_to_agents ?? []).includes(agentId);
+}
+
+function callerAgentId(callerIdentity: string): string {
+  return callerIdentity.startsWith("agent:")
+    ? callerIdentity.slice("agent:".length)
+    : callerIdentity;
 }
 
 function hashJson(value: unknown): string {
