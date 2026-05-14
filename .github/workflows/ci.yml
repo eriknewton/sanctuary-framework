@@ -62,6 +62,10 @@ jobs:
         working-directory: server
         run: npm run build
 
+      - name: Install libsecret + Secret Service backend
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-linux-secret-service
+
       - name: Run tests
         working-directory: server
         run: npm test
