@@ -64,7 +64,14 @@ async function makeServer() {
     grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],
     principalIdentityId: "did:sanctuary:1",
   });
-  const server = createBrokerMcpServer(broker, { agentId: "nsa", identityId: "did:sanctuary:1" });
+  const server = createBrokerMcpServer(broker, {
+    skill: "gmail-triage",
+    agentId: "nsa",
+    identityId: "did:sanctuary:1",
+    tenantId: "tenant-alpha",
+    fortressId: "fortress-alpha",
+    audience: "sanctuary-broker",
+  });
   return { server, broker, auditLog };
 }
 
@@ -134,6 +141,36 @@ describe("Broker MCP Server", () => {
       expect(result.isError).toBe(true);
       const body = parseContent(result);
       expect(body.error).toBe("Broker denied");
+    });
+
+    it("denies impersonation when request skill does not match verified caller skill", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const broker = new Broker({
+        backend: makeFakeBackend({ gmail_oauth: "SECRET-VALUE-XYZ" }),
+        auditLog,
+        grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],
+        principalIdentityId: "did:sanctuary:1",
+      });
+      const server = createBrokerMcpServer(broker, {
+        skill: "ungranted-skill",
+        agentId: "nsa",
+        identityId: "did:sanctuary:1",
+        tenantId: "tenant-alpha",
+        fortressId: "fortress-alpha",
+        audience: "sanctuary-broker",
+      });
+
+      const result = await callTool(server, "broker/request_token", {
+        skill: "gmail-triage",
+        secret: "gmail_oauth",
+      });
+
+      expect(result.isError).toBe(true);
+      expect(parseContent(result).error).toBe("Broker denied");
+      const audit = await auditLog.query({ operation_type: BROKER_OPS.TOKEN_DENIED, layer: "l3" });
+      expect(audit.entries[0]!.details?.reason).toBe("caller_skill_mismatch");
     });
 
     it("denies when scope exceeds grant", async () => {

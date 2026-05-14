@@ -180,10 +180,20 @@ async function main(): Promise<void> {
   if (args[0] === "broker-server") {
     const { openBroker } = await import("./l3-disclosure/broker/open.js");
     const { createBrokerMcpServer } = await import("./mcp/broker-server.js");
+    const { loadConfig } = await import("./config.js");
+    const { fortressIdFromStoragePath } = await import("./dashboard/v1_1/wiring.js");
+    const config = await loadConfig();
+    const agentId = process.env.SANCTUARY_AGENT_ID ?? "mcp-host";
+    const fortressId =
+      process.env.SANCTUARY_FORTRESS_ID ?? fortressIdFromStoragePath(config.storage_path);
     const { broker } = await openBroker();
     const server = createBrokerMcpServer(broker, {
-      agentId: process.env.SANCTUARY_AGENT_ID ?? "mcp-host",
+      skill: process.env.SANCTUARY_BROKER_SKILL ?? process.env.SANCTUARY_SKILL_NAME ?? agentId,
+      agentId,
       identityId: process.env.SANCTUARY_IDENTITY_ID ?? "sanctuary-broker",
+      tenantId: process.env.SANCTUARY_TENANT_ID ?? config.storage_path,
+      fortressId,
+      audience: process.env.SANCTUARY_BROKER_AUDIENCE ?? "sanctuary-broker",
     });
     const transport = new StdioServerTransport();
     await server.connect(transport);

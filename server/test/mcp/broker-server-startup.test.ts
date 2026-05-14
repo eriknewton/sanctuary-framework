@@ -70,8 +70,12 @@ describe("broker-server startup — rc.2 require-path regression", () => {
       principalIdentityId: "did:sanctuary:test",
     });
     const server = createBrokerMcpServer(broker, {
+      skill: "test",
       agentId: "test",
       identityId: "did:sanctuary:test",
+      tenantId: "tenant-test",
+      fortressId: "fortress-test",
+      audience: "sanctuary-broker",
     });
     const info = (server as unknown as { _serverInfo: { name: string; version: string } })
       ._serverInfo;

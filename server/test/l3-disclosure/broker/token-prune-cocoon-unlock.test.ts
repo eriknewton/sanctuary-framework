@@ -98,8 +98,14 @@ describe("token expiry pruning fires on cocoon-unlock (finding #86)", () => {
       secret: "api-key",
       requestedScope: "read",
       ttlSeconds: 60,
-      agent: "test-agent",
-      identity_id: "test-principal",
+      caller: {
+        skill: "test",
+        agent: "test-agent",
+        identity_id: "test-principal",
+        tenant_id: "test-tenant",
+        fortress_id: "test-fortress",
+        audience: "sanctuary-broker",
+      },
     });
     expect(binding.token).toBeTruthy();
     expect(broker.liveTokenCount()).toBe(1);
