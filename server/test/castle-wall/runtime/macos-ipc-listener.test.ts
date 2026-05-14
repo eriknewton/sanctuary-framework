@@ -226,7 +226,7 @@ async function newHarness(rules: AllowlistRule[] = [SAMPLE_RULE]): Promise<Harne
   const listener = new MacOSFlowIpcListener({
     socketPath,
     consumer,
-    generateNonce: () => new Uint8Array(16),
+    generateNonce: () => new Uint8Array(32),
   });
   await listener.start();
   return { socketPath, consumer, listener, audit, approvals };
@@ -289,6 +289,51 @@ describe("MacOSFlowIpcListener", () => {
     expect((challenge as { type: string; nonce_b64url: string }).nonce_b64url).toBeTypeOf("string");
     expect(h.listener.getStats().handshakesSent).toBe(1);
     expect(h.listener.getStats().activeConnections).toBe(1);
+  });
+
+  it("sends a signed handshake_response when a signer is configured", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cw-macos-listener-"));
+    tmpDirs.push(dir);
+    const audit = makeAuditSink();
+    const approvals = makeApprovalQueue();
+    const consumer = new MacOSFlowEventConsumer({
+      manifestProvider: makeManifestProvider([SAMPLE_RULE]),
+      approvalQueue: approvals.queue,
+      auditSink: audit.sink,
+      defaultApprovalTimeoutSeconds: 30,
+    });
+    let signedNonce: Uint8Array | null = null;
+    const listener = new MacOSFlowIpcListener({
+      socketPath: join(dir, "castle.sock"),
+      consumer,
+      generateNonce: () => new Uint8Array(32).fill(0x5a),
+      handshakeSigner: {
+        fortressId: "fortress-test",
+        signingKeyId: "identity-v1",
+        signNonce: (nonce) => {
+          signedNonce = nonce;
+          return new Uint8Array(64).fill(0x7b);
+        },
+      },
+    });
+    await listener.start();
+    liveListeners.push(listener);
+
+    const { socket, buf } = await connectClient(join(dir, "castle.sock"));
+    track(socket);
+    const challenge = await nextMessage(buf);
+    const response = await nextMessage(buf);
+
+    expect(challenge.type).toBe("handshake_challenge");
+    expect(response).toMatchObject({
+      type: "handshake_response",
+      fortress_id: "fortress-test",
+      signing_key_id: "identity-v1",
+    });
+    expect((response as { nonce_signature_b64url: string }).nonce_signature_b64url).toBe(
+      Buffer.from(new Uint8Array(64).fill(0x7b)).toString("base64url"),
+    );
+    expect(signedNonce).toEqual(new Uint8Array(32).fill(0x5a));
   });
 
   it("emits an immediate manifest_updated in response to manifest_subscribe", async () => {
@@ -436,7 +481,7 @@ describe("MacOSFlowIpcListener", () => {
     const listener2 = new MacOSFlowIpcListener({
       socketPath: h.socketPath,
       consumer: consumer2,
-      generateNonce: () => new Uint8Array(16),
+      generateNonce: () => new Uint8Array(32),
     });
     await listener2.start();
     liveListeners.push(listener2);
@@ -517,7 +562,7 @@ describe("MacOSFlowIpcListener", () => {
       socketPath: join(dir, "castle.sock"),
       consumer,
       maxConnections: 2,
-      generateNonce: () => new Uint8Array(16),
+      generateNonce: () => new Uint8Array(32),
     });
     await listener.start();
     liveListeners.push(listener);

@@ -14,11 +14,10 @@
  *  - bind() + accept() - `net.createServer` on a Unix domain socket at
  *    the resolved Castle Wall path.
  *  - Outbound `handshake_challenge` on every new connection. Phase 2
- *    sends the raw nonce envelope; the foundation-scope Swift client
- *    treats arrival of the challenge as handshake-complete (the
- *    server-side signature over the nonce + extension-side verification
- *    against the pinned key are hardening items deferred to a follow-up
- *    PR that fixes the existing foundation-scope round-trip gap).
+ *    sends the raw nonce envelope and, when configured with a handshake
+ *    signer, immediately follows with a signed `handshake_response`.
+ *    The Swift client does not trust post-handshake frames until that
+ *    response verifies against the pinned public key.
  *  - Inbound frame routing - manifest_subscribe / flow_decision_recorded
  *    / flow_pending_approval dispatch to the existing
  *    `MacOSFlowEventConsumer` handlers.
@@ -27,9 +26,6 @@
  *
  * Out of scope (deferred to follow-up):
  *
- *  - Full handshake signature round-trip hardening (the Swift IPCClient
- *    is still at foundation-scope; signing the challenge on the server
- *    side ships once the Swift verifier path lands).
  *  - decision_response operator-resume envelope on the server-to-extension
  *    direction (gates on uncertain-flow `resumeFlow(_:with:)` wiring in
  *    Alpha-4 install scope).
@@ -48,14 +44,12 @@ import { createServer, type Server, type Socket } from "node:net";
 import { unlink, chmod } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 
-import {
-  CASTLE_WALL_IPC_NAMESPACE,
-  CASTLE_WALL_REQUEST_ID_NONCE_BYTES,
-} from "../constants.js";
+import { CASTLE_WALL_IPC_NAMESPACE } from "../constants.js";
 import { frame, parseFrame } from "../ipc/framing.js";
 import type {
   CastleWallMessage,
   FlowDecisionRecordedNotification,
+  HandshakeResponse,
   FlowPendingApprovalNotification,
   ManifestSubscribeRequest,
   ManifestUpdatedNotification,
@@ -97,6 +91,14 @@ export interface MacOSFlowIpcListenerOptions {
    * golden-vector assertions.
    */
   generateNonce?: () => Uint8Array;
+  /** Signs the connection nonce so the extension can authenticate main. */
+  handshakeSigner?: MacOSHandshakeSigner;
+}
+
+export interface MacOSHandshakeSigner {
+  fortressId: string;
+  signingKeyId: string;
+  signNonce(nonce: Uint8Array): Uint8Array;
 }
 
 /** Per-connection bookkeeping. */
@@ -160,6 +162,7 @@ export class MacOSFlowIpcListener {
   private readonly socketMode: number;
   private readonly maxConnections: number;
   private readonly generateNonce: () => Uint8Array;
+  private readonly handshakeSigner: MacOSHandshakeSigner | null;
   private server: Server | null = null;
   private connections = new Map<string, ConnectionState>();
   private stats: MacOSFlowIpcListenerStats = {
@@ -176,6 +179,7 @@ export class MacOSFlowIpcListener {
     this.socketMode = opts.socketMode ?? 0o600;
     this.maxConnections = opts.maxConnections ?? 8;
     this.generateNonce = opts.generateNonce ?? defaultNonceBytes;
+    this.handshakeSigner = opts.handshakeSigner ?? null;
   }
 
   /** Bind the UDS socket and start accepting connections. */
@@ -285,16 +289,23 @@ export class MacOSFlowIpcListener {
     });
     state.registered = true;
 
-    // Send the handshake challenge. Foundation-scope: nonce-only.
-    // Hardening pass adds the server's signature over the nonce + the
-    // extension verifies against the pinned public key before treating
-    // the connection as authenticated.
+    // Send the handshake challenge, then prove possession of the pinned
+    // fortress key when the runtime supplied signing material.
     const nonceBytes = this.generateNonce();
     const challenge: CastleWallMessage = {
       type: "handshake_challenge",
       nonce_b64url: toBase64url(nonceBytes),
     };
     this.writeMessage(state, challenge);
+    if (this.handshakeSigner) {
+      const response: HandshakeResponse = {
+        type: "handshake_response",
+        fortress_id: this.handshakeSigner.fortressId,
+        signing_key_id: this.handshakeSigner.signingKeyId,
+        nonce_signature_b64url: toBase64url(this.handshakeSigner.signNonce(nonceBytes)),
+      };
+      this.writeMessage(state, response);
+    }
     this.stats.handshakesSent += 1;
   }
 
@@ -424,7 +435,7 @@ function randomSubscriberId(): string {
 }
 
 function defaultNonceBytes(): Uint8Array {
-  return new Uint8Array(randomBytes(CASTLE_WALL_REQUEST_ID_NONCE_BYTES));
+  return new Uint8Array(randomBytes(32));
 }
 
 function toBase64url(bytes: Uint8Array): string {
