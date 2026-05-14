@@ -200,6 +200,7 @@ export class NodeRevokeCeremony {
     try {
       // 1. Broadcast node_revoke with quorum signatures attached. MeshNode.
       //    revokePeer handles signing + broadcast + local roster mark.
+      this.ctx.node.registerGuardianRoster(this.ctx.pinned_roster);
       const revokeEvent = await this.ctx.node.revokePeer({
         target_node_id: this.proposal.target_node_id,
         reason: this.proposal.reason,

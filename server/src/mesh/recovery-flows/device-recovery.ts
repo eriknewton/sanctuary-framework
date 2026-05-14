@@ -196,10 +196,12 @@ export class DeviceRecoveryCeremony {
           return { guardian_pubkey: g.public_key, signature: s.signature };
         }
       );
+      this.ctx.node.registerGuardianRoster(this.ctx.pinned_roster);
       await this.ctx.node.revokePeer({
         target_node_id: this.proposal.lost_node_id,
         reason: "device_loss_recovery",
         quorum_signatures: quorumSignaturesForRevoke,
+        guardian_quorum_verified_by_ceremony: true,
       });
 
       // 2. Admit the replacement cert so roster state knows about it.

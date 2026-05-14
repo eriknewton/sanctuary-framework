@@ -39,6 +39,10 @@ import {
   issueNodeIdentityCertificate,
   issuePrincipalCertificate,
 } from "../../src/mesh/trust-root.js";
+import {
+  issueGuardianRoster,
+  signMasterRotationAsGuardian,
+} from "../../src/mesh/guardian/index.js";
 import { InMemoryTransport } from "../../src/mesh/in-memory-transport.js";
 import {
   AuditBuffer,
@@ -66,9 +70,11 @@ import {
 } from "../../src/mesh/lifecycle/index.js";
 import type {
   FortressMasterPublicKey,
+  NodeRevokePayload,
   PrincipalCertificate,
   SignedEvent,
 } from "../../src/mesh/types.js";
+import type { MasterRotationQuorumInput } from "../../src/mesh/guardian/types.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Helpers
@@ -166,6 +172,55 @@ function signHostileHeartbeat(params: {
     node_signature: toBase64url(
       ed25519.sign(canonicalizeToBytes(body), params.node_private_key)
     ),
+  };
+}
+
+function signNodeRevokeWithoutPrincipal(params: {
+  emitter_node: string;
+  emitter_principal: string;
+  fortress_id: string;
+  monotonic_seq: number;
+  node_private_key: Uint8Array;
+  payload: NodeRevokePayload;
+}): SignedEvent<NodeRevokePayload> {
+  const body = {
+    protocol_version: "0.1",
+    event_type: "node_revoke",
+    event_id: toBase64url(randomBytes(16)),
+    emitter_node: params.emitter_node,
+    emitter_principal: params.emitter_principal,
+    fortress_id: params.fortress_id,
+    causal_parents: [] as string[],
+    payload: params.payload,
+    payload_hash: toBase64url(sha256(canonicalizeToBytes(params.payload))),
+    emitted_at: "2026-05-14T00:00:00.000Z",
+    monotonic_seq: params.monotonic_seq,
+    extension_envelope: {},
+  };
+  return {
+    ...body,
+    node_signature: toBase64url(
+      ed25519.sign(canonicalizeToBytes(body), params.node_private_key)
+    ),
+  };
+}
+
+function revokeQuorumInput(
+  payload: Pick<NodeRevokePayload, "node_id" | "reason">,
+  fortressId: string
+): MasterRotationQuorumInput {
+  const initiatedAt = "revoke:" + payload.node_id;
+  return {
+    old_master_pubkey: "node:" + payload.node_id,
+    new_master_pubkey: {
+      public_key: toBase64url(
+        new TextEncoder().encode("revoke|" + payload.reason)
+      ),
+      fortress_id: fortressId,
+      created_at: initiatedAt,
+    },
+    rotated_at: initiatedAt,
+    fortress_id: fortressId,
   };
 }
 
@@ -791,6 +846,8 @@ describe("lifecycle/mesh-node — bootstrap → join → revoke", () => {
     await first.node.revokePeer({
       target_node_id: "node-2",
       reason: "key compromise (test)",
+      emitter_principal: first.bootstrap.root_principal_certificate.principal_id,
+      principal_private_key: first.bootstrap.root_principal_private_key,
     });
 
     expect(first.node.getRoster().presenceOf("node-2")).toBe("revoked");
@@ -806,6 +863,130 @@ describe("lifecycle/mesh-node — bootstrap → join → revoke", () => {
     // Heartbeat was broadcast but rejected at envelope verify on the
     // canonical side because node-2 is now revoked in its roster.
     expect(after).toBe(before);
+  });
+
+  it("rejects a compromised node-signed revoke without principal or guardian authorization", async () => {
+    const first = await bootstrapFirstNode({ transport: hub });
+    const hostileKeypair = generateKeypair();
+    const victimKeypair = generateKeypair();
+    const hostileCert = issueNodeIdentityCertificate({
+      node_id: "compromised-node",
+      node_pubkey: hostileKeypair.publicKey,
+      node_mode: "local",
+      fortress_id: first.bootstrap.master_public.fortress_id,
+      capabilities: CAP_STANDARD_FORTRESS_NODE,
+      parent_chain: {
+        fortress_master_pubkey: first.bootstrap.master_public.public_key,
+        principal_id: first.bootstrap.root_principal_certificate.principal_id,
+        principal_pubkey:
+          first.bootstrap.root_principal_certificate.principal_pubkey,
+      },
+      principal_private_key: first.bootstrap.root_principal_private_key,
+    });
+    const victimCert = issueNodeIdentityCertificate({
+      node_id: "victim-node",
+      node_pubkey: victimKeypair.publicKey,
+      node_mode: "local",
+      fortress_id: first.bootstrap.master_public.fortress_id,
+      capabilities: CAP_STANDARD_FORTRESS_NODE,
+      parent_chain: {
+        fortress_master_pubkey: first.bootstrap.master_public.public_key,
+        principal_id: first.bootstrap.root_principal_certificate.principal_id,
+        principal_pubkey:
+          first.bootstrap.root_principal_certificate.principal_pubkey,
+      },
+      principal_private_key: first.bootstrap.root_principal_private_key,
+    });
+    first.node.getRoster().add(hostileCert);
+    first.node.getRoster().add(victimCert);
+
+    const rejected: Error[] = [];
+    first.node.onEnvelopeRejected = ({ error }) => rejected.push(error);
+    const beforeAuditEntries = first.node.snapshot().pending_audit_entries;
+    await hub.attach("compromised-node").broadcast(
+      signNodeRevokeWithoutPrincipal({
+        emitter_node: "compromised-node",
+        emitter_principal:
+          first.bootstrap.root_principal_certificate.principal_id,
+        fortress_id: first.bootstrap.master_public.fortress_id,
+        monotonic_seq: 1,
+        node_private_key: hostileKeypair.privateKey,
+        payload: {
+          node_id: "victim-node",
+          reason: "spoofed revoke",
+          effective_at: "2026-05-14T00:00:00.000Z",
+        },
+      })
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(first.node.getRoster().presenceOf("victim-node")).not.toBe("revoked");
+    expect(first.node.snapshot().pending_audit_entries).toBe(
+      beforeAuditEntries + 1
+    );
+    expect(rejected[0]?.message).toContain("node_revoke denied");
+  });
+
+  it("accepts guardian-quorum node revocation when the pinned roster verifies", async () => {
+    const first = await bootstrapFirstNode({ transport: hub });
+    const victimKeypair = generateKeypair();
+    const victimCert = issueNodeIdentityCertificate({
+      node_id: "guardian-victim",
+      node_pubkey: victimKeypair.publicKey,
+      node_mode: "local",
+      fortress_id: first.bootstrap.master_public.fortress_id,
+      capabilities: CAP_STANDARD_FORTRESS_NODE,
+      parent_chain: {
+        fortress_master_pubkey: first.bootstrap.master_public.public_key,
+        principal_id: first.bootstrap.root_principal_certificate.principal_id,
+        principal_pubkey:
+          first.bootstrap.root_principal_certificate.principal_pubkey,
+      },
+      principal_private_key: first.bootstrap.root_principal_private_key,
+    });
+    first.node.getRoster().add(victimCert);
+
+    const guardianKeys = [generateKeypair(), generateKeypair(), generateKeypair()];
+    const guardians = guardianKeys.map((kp, i) => ({
+      guardian_id: `guardian-${i + 1}`,
+      public_key: toBase64url(kp.publicKey),
+      kind: "human",
+      invited_at: "2026-05-14T00:00:00.000Z",
+    }));
+    const roster = issueGuardianRoster({
+      m: 2,
+      n: 3,
+      guardians,
+      fortress_id: first.bootstrap.master_public.fortress_id,
+      version: 1,
+      master_private_key: first.bootstrap.master_private_key,
+    });
+    first.node.registerGuardianRoster(roster);
+
+    const reason = "guardian quorum revoke";
+    const input = revokeQuorumInput(
+      { node_id: "guardian-victim", reason },
+      first.bootstrap.master_public.fortress_id
+    );
+    const guardianProof = guardianKeys.slice(0, 2).map((kp, i) =>
+      signMasterRotationAsGuardian({
+        input,
+        guardian_id: guardians[i].guardian_id,
+        guardian_private_key: kp.privateKey,
+      })
+    );
+
+    const evt = await first.node.revokePeer({
+      target_node_id: "guardian-victim",
+      reason,
+      quorum_signatures: guardianProof.map((sig, i) => ({
+        guardian_pubkey: guardians[i].public_key,
+        signature: sig.signature,
+      })),
+    });
+
+    expect(evt.principal_signature).toBeUndefined();
+    expect(first.node.getRoster().presenceOf("guardian-victim")).toBe("revoked");
   });
 });
 
