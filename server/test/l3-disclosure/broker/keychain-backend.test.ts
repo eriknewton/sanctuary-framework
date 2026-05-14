@@ -19,7 +19,12 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync, rmSync, mkdtempSync } from "node:fs";
-import { KeychainBackend } from "../../../src/l3-disclosure/broker/keychain-backend.js";
+import {
+  brokerAccountForSecret,
+  brokerKeychainIdentityFor,
+  KeychainBackend,
+  legacyBrokerKeychainIdentity,
+} from "../../../src/l3-disclosure/broker/keychain-backend.js";
 import {
   BackendLockedError,
   BackendUnavailableError,
@@ -127,6 +132,73 @@ describeIfDarwin("KeychainBackend (macOS integration)", () => {
     });
     await expect(fresh.ensureInitialized("")).rejects.toThrow();
     rmSync(tempDir, { recursive: true, force: true });
+  });
+});
+
+describe("Broker keychain tenant identity", () => {
+  it("keeps the legacy global backend only for the default storage path", () => {
+    const home = join(tmpdir(), "sanctuary-home");
+    const identity = brokerKeychainIdentityFor(join(home, ".sanctuary"), home);
+
+    expect(identity).toEqual(legacyBrokerKeychainIdentity(home));
+    expect(identity.service).toBe("sanctuary-broker");
+    expect(brokerAccountForSecret("github_pat", identity.accountNamespace)).toBe(
+      "github_pat"
+    );
+  });
+
+  it("derives keychain path, service, and account namespace from non-default storage path", () => {
+    const home = join(tmpdir(), "sanctuary-home");
+    const storagePath = join(home, "fortresses", "alpha");
+    const identity = brokerKeychainIdentityFor(storagePath, home);
+
+    expect(identity.keychainPath).toMatch(
+      /Library\/Keychains\/sanctuary-broker-[0-9a-f]{16}\.keychain-db$/
+    );
+    expect(identity.service).toMatch(/^sanctuary-broker-[0-9a-f]{16}$/);
+    expect(identity.accountNamespace).toMatch(/^[0-9a-f]{16}$/);
+    expect(identity.service).toBe(`sanctuary-broker-${identity.accountNamespace}`);
+    expect(brokerAccountForSecret("github_pat", identity.accountNamespace)).toBe(
+      `${identity.accountNamespace}:github_pat`
+    );
+  });
+
+  it("canonicalizes cosmetic storage path differences to the same identity", () => {
+    const home = join(tmpdir(), "sanctuary-home");
+    const first = brokerKeychainIdentityFor(
+      join(home, "fortresses", "alpha"),
+      home
+    );
+    const second = brokerKeychainIdentityFor(
+      join(home, "fortresses", "nested", "..", "alpha", "."),
+      home
+    );
+
+    expect(second).toEqual(first);
+  });
+
+  it("isolates two fortresses that use the same broker secret name", () => {
+    const home = join(tmpdir(), "sanctuary-home");
+    const alpha = brokerKeychainIdentityFor(join(home, "alpha"), home);
+    const beta = brokerKeychainIdentityFor(join(home, "beta"), home);
+    const key = (identity: typeof alpha, name: string) =>
+      [
+        identity.keychainPath,
+        identity.service,
+        brokerAccountForSecret(name, identity.accountNamespace),
+      ].join("|");
+    const store = new Map<string, string>();
+
+    store.set(key(alpha, "shared_api_token"), "alpha-secret");
+    store.set(key(beta, "shared_api_token"), "beta-secret");
+
+    expect(alpha.keychainPath).not.toBe(beta.keychainPath);
+    expect(alpha.service).not.toBe(beta.service);
+    expect(brokerAccountForSecret("shared_api_token", alpha.accountNamespace)).not.toBe(
+      brokerAccountForSecret("shared_api_token", beta.accountNamespace)
+    );
+    expect(store.get(key(alpha, "shared_api_token"))).toBe("alpha-secret");
+    expect(store.get(key(beta, "shared_api_token"))).toBe("beta-secret");
   });
 });
 

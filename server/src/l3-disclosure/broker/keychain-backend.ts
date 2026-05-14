@@ -19,9 +19,11 @@
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { DEFAULT_STORAGE_DIR } from "../../paths.js";
 import {
   type Backend,
   BackendLockedError,
@@ -32,10 +34,28 @@ import {
 const SECURITY_BIN = "/usr/bin/security";
 /** Service prefix for every item stored by the broker. */
 const SERVICE = "sanctuary-broker";
+const LEGACY_KEYCHAIN_BASENAME = "sanctuary.keychain-db";
+
+export interface BrokerKeychainIdentity {
+  keychainPath: string;
+  service: string;
+  accountNamespace: string;
+}
 
 export interface KeychainBackendOptions {
   /** Absolute path to the keychain file. Defaults to ~/Library/Keychains/sanctuary.keychain-db. */
   keychainPath?: string;
+  /**
+   * Fortress storage path used to derive the tenant-scoped keychain path,
+   * service, and account namespace. Omit for legacy single-tenant behavior.
+   */
+  storagePath?: string;
+  /** Home directory override for tests. */
+  home?: string;
+  /** Service override for tests and explicit migrations. */
+  service?: string;
+  /** Account namespace override for tests and explicit migrations. */
+  accountNamespace?: string;
 }
 
 interface SpawnResult {
@@ -82,14 +102,20 @@ async function runSecurity(args: string[], input?: string): Promise<SpawnResult>
 
 export class KeychainBackend implements Backend {
   private readonly keychainPath: string;
+  private readonly service: string;
+  private readonly accountNamespace: string;
   /** In-process unlock flag. Represents our belief about keychain state; a
    * separate `security unlock-keychain` call is still issued on init. */
   private unlocked = false;
 
   constructor(opts?: KeychainBackendOptions) {
-    this.keychainPath =
-      opts?.keychainPath ??
-      join(homedir(), "Library", "Keychains", "sanctuary.keychain-db");
+    const identity =
+      opts?.storagePath !== undefined
+        ? brokerKeychainIdentityFor(opts.storagePath, opts.home)
+        : legacyBrokerKeychainIdentity(opts?.home);
+    this.keychainPath = opts?.keychainPath ?? identity.keychainPath;
+    this.service = opts?.service ?? identity.service;
+    this.accountNamespace = opts?.accountNamespace ?? identity.accountNamespace;
   }
 
   async ensureInitialized(passphrase: string): Promise<void> {
@@ -164,6 +190,7 @@ export class KeychainBackend implements Backend {
   async addSecret(name: string, value: string): Promise<void> {
     this.assertUnlocked();
     validateSecretName(name);
+    const account = brokerAccountForSecret(name, this.accountNamespace);
     // Check existence first to preserve explicit "rotate required" semantics.
     const existing = await this.findGeneric(name, { returnValue: false });
     if (existing !== null) {
@@ -174,9 +201,9 @@ export class KeychainBackend implements Backend {
     const res = await runSecurity([
       "add-generic-password",
       "-s",
-      SERVICE,
+      this.service,
       "-a",
-      name,
+      account,
       "-w",
       value,
       this.keychainPath,
@@ -201,6 +228,7 @@ export class KeychainBackend implements Backend {
   async rotateSecret(name: string, newValue: string): Promise<void> {
     this.assertUnlocked();
     validateSecretName(name);
+    const account = brokerAccountForSecret(name, this.accountNamespace);
     const existing = await this.findGeneric(name, { returnValue: false });
     if (existing === null) {
       throw new SecretNotFoundError(name);
@@ -211,9 +239,9 @@ export class KeychainBackend implements Backend {
     const res = await runSecurity([
       "add-generic-password",
       "-s",
-      SERVICE,
+      this.service,
       "-a",
-      name,
+      account,
       "-w",
       newValue,
       this.keychainPath,
@@ -231,9 +259,9 @@ export class KeychainBackend implements Backend {
     const res = await runSecurity([
       "delete-generic-password",
       "-s",
-      SERVICE,
+      this.service,
       "-a",
-      name,
+      brokerAccountForSecret(name, this.accountNamespace),
       this.keychainPath,
     ]);
     if (res.code !== 0) {
@@ -256,9 +284,13 @@ export class KeychainBackend implements Backend {
     const names: string[] = [];
     const blocks = res.stdout.split(/^keychain: /m);
     for (const block of blocks) {
-      if (!block.includes(`"svce"<blob>="${SERVICE}"`)) continue;
+      if (!block.includes(`"svce"<blob>="${this.service}"`)) continue;
       const match = block.match(/"acct"<blob>="([^"]+)"/);
-      if (match && match[1]) names.push(match[1]);
+      const secretName =
+        match && match[1]
+          ? secretNameFromBrokerAccount(match[1], this.accountNamespace)
+          : null;
+      if (secretName) names.push(secretName);
     }
     // Dedupe just in case.
     return Array.from(new Set(names));
@@ -285,9 +317,9 @@ export class KeychainBackend implements Backend {
     const args = [
       "find-generic-password",
       "-s",
-      SERVICE,
+      this.service,
       "-a",
-      name,
+      brokerAccountForSecret(name, this.accountNamespace),
     ];
     if (opts.returnValue) args.push("-w");
     args.push(this.keychainPath);
@@ -311,6 +343,68 @@ export class KeychainBackend implements Backend {
     }
     return "";
   }
+}
+
+export function legacyBrokerKeychainIdentity(
+  home: string = homedir()
+): BrokerKeychainIdentity {
+  return {
+    keychainPath: join(home, "Library", "Keychains", LEGACY_KEYCHAIN_BASENAME),
+    service: SERVICE,
+    accountNamespace: "",
+  };
+}
+
+/**
+ * Derive the broker's macOS Keychain identity from the canonical fortress
+ * storage path. The default storage path keeps the pre-existing global
+ * backend identity as an explicit migration fallback; non-default fortress
+ * paths get a separate keychain file, service, and account namespace.
+ */
+export function brokerKeychainIdentityFor(
+  storagePath: string,
+  home: string = homedir()
+): BrokerKeychainIdentity {
+  const canonicalStorage = resolve(storagePath);
+  const canonicalDefault = resolve(join(home, DEFAULT_STORAGE_DIR));
+  if (canonicalStorage === canonicalDefault) {
+    return legacyBrokerKeychainIdentity(home);
+  }
+
+  const suffix = storagePathDigest(canonicalStorage);
+  return {
+    keychainPath: join(
+      home,
+      "Library",
+      "Keychains",
+      `sanctuary-broker-${suffix}.keychain-db`
+    ),
+    service: `${SERVICE}-${suffix}`,
+    accountNamespace: suffix,
+  };
+}
+
+export function brokerAccountForSecret(
+  name: string,
+  accountNamespace: string
+): string {
+  return accountNamespace ? `${accountNamespace}:${name}` : name;
+}
+
+function secretNameFromBrokerAccount(
+  account: string,
+  accountNamespace: string
+): string | null {
+  if (!accountNamespace) return account;
+  const prefix = `${accountNamespace}:`;
+  return account.startsWith(prefix) ? account.slice(prefix.length) : null;
+}
+
+function storagePathDigest(canonicalStorage: string): string {
+  return createHash("sha256")
+    .update(canonicalStorage, "utf8")
+    .digest("hex")
+    .slice(0, 16);
 }
 
 /**
