@@ -105,7 +105,9 @@ The exit drill passes only if all of the following are true:
 
 - The source platform can be disconnected after migration.
 - The destination agent retains a verifiable identity.
-- Audit and reputation records remain inspectable.
+- Audit receipts remain inspectable as an archive artifact. Imported audit
+  receipts are not replayed into the destination `_audit/*.enc` namespace and
+  are not returned by normal `AuditLog.query()` reads.
 - Failed verification is surfaced explicitly.
 - No private key or passphrase appears in exported public bundles.
 - Every irreversible operation required human approval.
@@ -115,6 +117,9 @@ The exit drill passes only if all of the following are true:
 - Dashboard does not yet guide the operator through the drill.
 - Legacy L2 audit log entries are not individually signed; the exit verifier
   pins audit receipts by signed manifest hash and reports that limitation.
+- Audit receipt import is archive-only. The importer stages
+  `artifacts/audit_receipts.json` under `_exit_audit_receipts` for inspection;
+  it does not reconstruct per-entry encrypted `_audit/*.enc` continuity.
 - Import stages principal policy for inspection instead of overwriting the
   destination policy file automatically.
 - State re-keying requires source key material and a destination signing

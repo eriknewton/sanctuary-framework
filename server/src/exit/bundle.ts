@@ -155,6 +155,8 @@ export interface ExitAuditReceiptsArtifact {
   format: "SANCTUARY_AUDIT_RECEIPTS_V1";
   exported_at: string;
   total: number;
+  recovery_semantics: "archive_only";
+  normal_audit_query_continuity: false;
   individual_entry_signatures: false;
   entries: AuditEntry[];
 }
@@ -504,6 +506,8 @@ async function exportAuditReceipts(
     format: "SANCTUARY_AUDIT_RECEIPTS_V1",
     exported_at: new Date().toISOString(),
     total: result.total,
+    recovery_semantics: "archive_only",
+    normal_audit_query_continuity: false,
     individual_entry_signatures: false,
     entries: result.entries,
   };

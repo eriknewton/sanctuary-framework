@@ -491,6 +491,18 @@ describe("v1.1 acceptance drill - Pillar 4: portability + exit", () => {
       for (const artifact of verifyResult.artifact_results) {
         expect(artifact.hash_passed).toBe(true);
       }
+      const auditReceipts = JSON.parse(
+        await readFile(join(bundleDir, "artifacts", "audit_receipts.json"), "utf8"),
+      ) as {
+        recovery_semantics: string;
+        normal_audit_query_continuity: boolean;
+        entries: Array<{ operation: string }>;
+      };
+      expect(auditReceipts.recovery_semantics).toBe("archive_only");
+      expect(auditReceipts.normal_audit_query_continuity).toBe(false);
+      expect(auditReceipts.entries.map((entry) => entry.operation)).toContain(
+        "drill_exit_seed",
+      );
 
       // ─── Negative: tamper one byte of an artifact, re-verify must fail.
       const targetArtifact = exported.manifest.body.artifacts[0]!;
@@ -575,6 +587,7 @@ describe("v1.1 acceptance drill - Pillar 4: portability + exit", () => {
     expect(imported.state.status).toBe("rekeyed");
     expect(imported.state.imported_keys).toBeGreaterThan(0);
     expect(imported.reputation.imported_attestations).toBe(1);
+    expect(imported.staged_artifacts).toContain("audit_receipts");
 
     // Continuity: read state on destination under destination master key.
     const read = await destination.stateStore.read("agent-memory", "handoff");
@@ -594,6 +607,16 @@ describe("v1.1 acceptance drill - Pillar 4: portability + exit", () => {
     expect(finalManifest.body.identity_binding.fortress_id).not.toBe(
       destIdentityId,
     );
+
+    const stagedAuditReceiptEntries = await destination.storage.list(
+      "_exit_audit_receipts",
+    );
+    expect(stagedAuditReceiptEntries.length).toBe(1);
+    const importedNormalAudit = await destination.auditLog.query({
+      operation_type: "drill_exit_seed",
+      limit: 10,
+    });
+    expect(importedNormalAudit.total).toBe(0);
 
     // ─── (i) VERIFY: re-import without explicit forceRebind refuses to
     // replace the existing fortress public identity (full-sweep #54). The

@@ -72,14 +72,15 @@ describe("Fortress View", () => {
     expect(html).toContain("servers-list");
   });
 
-  it("includes the Pause Agent button", () => {
+  it("does not render non-enforcing pause controls", () => {
     const html = generateFortressViewHTML({
       serverVersion: "0.7.0",
       upstreamServerCount: 1,
     });
 
-    expect(html).toContain("Pause Agent");
-    expect(html).toContain("pause-btn");
+    expect(html).not.toContain("Pause Agent");
+    expect(html).not.toContain("pause-btn");
+    expect(html).not.toContain("/api/cocoon/pause");
   });
 
   it("includes SSE connection for proxy-call events", () => {
