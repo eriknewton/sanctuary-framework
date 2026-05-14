@@ -27,6 +27,9 @@ jobs:
         working-directory: server
         run: npm ci
 
+      - name: Release dependency pin check
+        run: npm run check:release-dependency-pins
+
       - name: Set up Python 3.12 for Concordia sidecar
         uses: actions/setup-python@v6
         with:
