@@ -36,7 +36,7 @@ export interface AuditSink {
     identityId: string,
     details?: Record<string, unknown>,
     result?: "success" | "failure"
-  ): void;
+  ): void | Promise<void>;
   /** Block until all in-flight `append` calls have settled. */
   flush(): Promise<void>;
 }
@@ -61,6 +61,8 @@ export interface AuditConsumerStats {
    * duplicate path closes the loop.
    */
   ackFailures: number;
+  /** Count of critical events withheld from ACK because persistence failed. */
+  persistenceFailures: number;
 }
 
 export class AuditChainError extends Error {
@@ -141,6 +143,7 @@ export class AuditConsumer {
     rejectedEvents: 0,
     duplicatesDropped: 0,
     ackFailures: 0,
+    persistenceFailures: 0,
   };
   private lastAckedSeq: number | null = null;
   private lastEventCanonicalHash: string | null = null;
@@ -176,13 +179,14 @@ export class AuditConsumer {
     const reason = validateEvent(envelope.event);
     if (reason) {
       this.stats.rejectedEvents += 1;
-      this.sink.append(
+      await this.sink.append(
         CASTLE_WALL_AUDIT_LAYER,
         "audit_event_rejected",
         envelope.event.fortress_id ?? "unknown",
         { reason, event_canonical: canonicalize(envelope.event) },
         "failure"
       );
+      await this.sink.flush();
       // ACK rejected events too; the daemon should not re-deliver malformed.
       await this.tryAck(envelope, "audit_event_rejected");
       return;
@@ -193,7 +197,7 @@ export class AuditConsumer {
       // ACK never landed. Drop the payload silently (no double-append) and
       // record the diagnostic entry so an auditor can see why the chain has a
       // marker without a duplicate event.
-      this.sink.append(
+      await this.sink.append(
         CASTLE_WALL_AUDIT_LAYER,
         "critical_event_duplicate_dropped",
         envelope.event.fortress_id,
@@ -212,30 +216,35 @@ export class AuditConsumer {
       await this.emitVerificationFailure(chainOutcome.reason, envelope.event);
       throw new AuditChainError(chainOutcome.reason);
     }
-    this.sink.append(
-      CASTLE_WALL_AUDIT_LAYER,
-      envelope.event.event_type,
-      envelope.event.fortress_id,
-      buildDetailsForEvent(envelope.event),
-      "success"
-    );
-    if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
-      ingestCastleWallBlockedEgress({
-        bridge: this.inboxBridge,
-        event: envelope.event,
-      });
-      this.sink.append(
+    try {
+      await this.sink.append(
         CASTLE_WALL_AUDIT_LAYER,
-        "castle_wall_blocked_egress",
+        envelope.event.event_type,
         envelope.event.fortress_id,
-        {
-          event_type: envelope.event.event_type,
-          seq: envelope.event.details.seq,
-        },
-        "success",
+        buildDetailsForEvent(envelope.event),
+        "success"
       );
+      if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
+        ingestCastleWallBlockedEgress({
+          bridge: this.inboxBridge,
+          event: envelope.event,
+        });
+        await this.sink.append(
+          CASTLE_WALL_AUDIT_LAYER,
+          "castle_wall_blocked_egress",
+          envelope.event.fortress_id,
+          {
+            event_type: envelope.event.event_type,
+            seq: envelope.event.details.seq,
+          },
+          "success",
+        );
+      }
+      await this.sink.flush();
+    } catch (err) {
+      await this.emitPersistenceFailure(err, envelope.event);
+      throw err;
     }
-    await this.sink.flush();
     // Update state BEFORE the ACK call. The event is now durably persisted;
     // a transport-layer ACK failure must NOT leave the consumer's chain view
     // out of sync with what is actually on disk.
@@ -259,7 +268,7 @@ export class AuditConsumer {
       await envelope.ack();
     } catch (err) {
       this.stats.ackFailures += 1;
-      this.sink.append(
+      await this.sink.append(
         CASTLE_WALL_AUDIT_LAYER,
         "critical_event_ack_failed",
         envelope.event.fortress_id ?? "unknown",
@@ -360,7 +369,7 @@ export class AuditConsumer {
     event: CastleWallAuditEvent
   ): Promise<void> {
     this.stats.rejectedEvents += 1;
-    this.sink.append(
+    await this.sink.append(
       CASTLE_WALL_AUDIT_LAYER,
       "wal_chain_verification_failed",
       event.fortress_id ?? "unknown",
@@ -368,6 +377,31 @@ export class AuditConsumer {
       "failure"
     );
     await this.sink.flush();
+  }
+
+  private async emitPersistenceFailure(
+    err: unknown,
+    event: CastleWallAuditEvent
+  ): Promise<void> {
+    this.stats.persistenceFailures += 1;
+    try {
+      await this.sink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        "critical_event_persistence_failed",
+        event.fortress_id ?? "unknown",
+        {
+          seq: event.details?.seq,
+          event_type: event.event_type,
+          reason: err instanceof Error ? err.message : String(err),
+        },
+        "failure"
+      );
+      await this.sink.flush();
+    } catch {
+      // The primary safety property is fail-closed: no ACK and no chain
+      // advance. If the audit sink itself is unavailable, surface the
+      // original persistence failure to the caller.
+    }
   }
 }
 

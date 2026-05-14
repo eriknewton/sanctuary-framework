@@ -45,6 +45,21 @@ class RecordingSink implements AuditSink {
   }
 }
 
+class FaultingCriticalSink extends RecordingSink {
+  async append(
+    layer: "l1",
+    operation: string,
+    identityId: string,
+    details?: Record<string, unknown>,
+    result: "success" | "failure" = "success"
+  ): Promise<void> {
+    if (operation === "egress_allowed") {
+      throw new Error("audit disk unavailable");
+    }
+    super.append(layer, operation, identityId, details, result);
+  }
+}
+
 function eventHash(event: CastleWallAuditEvent): string {
   return createHash("sha256").update(canonicalizeAuditEvent(event), "utf8").digest("hex");
 }
@@ -239,6 +254,32 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     expect(sink.entries.length).toBe(2);
     expect(consumer.getWalChainState().lastAckedSeq).toBe(6);
     expect(consumer.getWalChainState().lastEventCanonicalHash).toBe(eventHash(eventSeq6));
+  });
+
+  it("does not ACK or advance chain when critical persistence fails (#104)", async () => {
+    const faultingSink = new FaultingCriticalSink();
+    const faultingConsumer = new AuditConsumer(faultingSink);
+    const eventSeq5 = chainedEvent(5, null);
+    let acked = false;
+
+    await expect(
+      faultingConsumer.ingestCritical({
+        event: eventSeq5,
+        ack: async () => {
+          acked = true;
+        },
+      })
+    ).rejects.toThrow("audit disk unavailable");
+
+    expect(acked).toBe(false);
+    expect(faultingConsumer.getWalChainState().lastAckedSeq).toBeNull();
+    expect(faultingConsumer.getWalChainState().lastEventCanonicalHash).toBeNull();
+    expect(faultingConsumer.getStats().acceptedCriticalEvents).toBe(0);
+    expect(faultingConsumer.getStats().persistenceFailures).toBe(1);
+    expect(faultingSink.entries).toHaveLength(1);
+    expect(faultingSink.entries[0]!.operation).toBe("critical_event_persistence_failed");
+    expect(faultingSink.entries[0]!.result).toBe("failure");
+    expect(faultingSink.entries[0]!.details?.seq).toBe(5);
   });
 
   // ─── #92 ACK failure handling + duplicate replay ────────────────────────

@@ -15,7 +15,11 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { AuditLog, BROKER_OPS } from "../../src/l2-operational/audit-log.js";
+import {
+  AuditLog,
+  AuditLogPersistenceError,
+  BROKER_OPS,
+} from "../../src/l2-operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 
@@ -25,6 +29,15 @@ class SlowMemoryStorage extends MemoryStorage {
   }
   async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
     await new Promise((r) => setTimeout(r, this.writeDelayMs));
+    return super.write(namespace, key, data);
+  }
+}
+
+class FaultingWriteStorage extends MemoryStorage {
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    if (namespace === "_audit") {
+      throw new Error("audit disk unavailable");
+    }
     return super.write(namespace, key, data);
   }
 }
@@ -92,5 +105,17 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     await log.flush();
     const entries = await storage.list("_audit");
     expect(entries.length).toBe(1);
+  });
+
+  it("flush() rejects when audit persistence fails and no entry is durable", async () => {
+    const storage = new FaultingWriteStorage();
+    const log = new AuditLog(storage, generateRandomKey());
+
+    log.append("l1", "egress_allowed", "fortress-1", { seq: 0 });
+
+    await expect(log.flush()).rejects.toThrow(AuditLogPersistenceError);
+    await expect(log.flush()).resolves.toBeUndefined();
+    const entries = await storage.list("_audit");
+    expect(entries).toHaveLength(0);
   });
 });
