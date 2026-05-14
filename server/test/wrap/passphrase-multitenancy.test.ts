@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile, access } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile, access } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -196,6 +196,35 @@ describe("getOrCreatePassphrase — per-tenant isolation", () => {
     expect(Buffer.compare(rawA, rawB)).not.toBe(0);
 
     expect(first.value).not.toBe(second.value);
+  });
+
+  it("rejects a fallback ciphertext copied into another tenant path before identity decrypt", async () => {
+    const { exec } = makeExec();
+
+    const first = await getOrCreatePassphrase({
+      home,
+      storagePath: tenantA,
+      platformOverride: "linux",
+      exec,
+    });
+    await getOrCreatePassphrase({
+      home,
+      storagePath: tenantB,
+      platformOverride: "linux",
+      exec,
+    });
+
+    const rawA = await readFile(first.location);
+    await writeFile(fallbackFilePath(home, tenantB), rawA);
+
+    await expect(
+      getOrCreatePassphrase({
+        home,
+        storagePath: tenantB,
+        platformOverride: "linux",
+        exec,
+      }),
+    ).rejects.toThrow(/could not be decrypted/);
   });
 
   it("a tenant reading another tenant's Keychain service gets nothing back", async () => {

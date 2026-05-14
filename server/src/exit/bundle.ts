@@ -313,6 +313,8 @@ export interface ExitBundleConflictReport {
   reputation_conflicts: string[];
   policy_set_exists: boolean;
   audit_receipts_exist: boolean;
+  commitments_exist?: boolean;
+  import_record_exists?: boolean;
 }
 
 export interface ImportExitBundleResult {
@@ -835,7 +837,29 @@ async function conflictReport(
     reputation_conflicts: reputationConflicts,
     policy_set_exists: await storage.exists(EXIT_POLICY_SETS_NAMESPACE, importId),
     audit_receipts_exist: await storage.exists(EXIT_AUDIT_RECEIPTS_NAMESPACE, importId),
+    commitments_exist: await storage.exists(EXIT_COMMITMENTS_NAMESPACE, importId),
+    import_record_exists: await storage.exists(EXIT_IMPORT_NAMESPACE, importId),
   };
+}
+
+function stagedArtifactConflicts(
+  conflicts: ExitBundleConflictReport,
+  importId: string,
+): Array<{ namespace: string; key: string }> {
+  const artifactConflicts: Array<{ namespace: string; key: string }> = [];
+  if (conflicts.policy_set_exists) {
+    artifactConflicts.push({ namespace: EXIT_POLICY_SETS_NAMESPACE, key: importId });
+  }
+  if (conflicts.audit_receipts_exist) {
+    artifactConflicts.push({ namespace: EXIT_AUDIT_RECEIPTS_NAMESPACE, key: importId });
+  }
+  if (conflicts.commitments_exist) {
+    artifactConflicts.push({ namespace: EXIT_COMMITMENTS_NAMESPACE, key: importId });
+  }
+  if (conflicts.import_record_exists) {
+    artifactConflicts.push({ namespace: EXIT_IMPORT_NAMESPACE, key: importId });
+  }
+  return artifactConflicts;
 }
 
 function importIdForManifest(manifest: ExitBundleManifest): string {
@@ -1062,6 +1086,8 @@ export async function importExitBundle(
         reputation_conflicts: [],
         policy_set_exists: false,
         audit_receipts_exist: false,
+        commitments_exist: false,
+        import_record_exists: false,
       },
       state: {
         status: "not_requested",
@@ -1311,6 +1337,31 @@ export async function importExitBundle(
   }
 
   const importId = importIdForManifest(manifest);
+  const stagedConflicts = stagedArtifactConflicts(conflicts, importId);
+  const allowStagedOverwrite =
+    opts.conflictResolution === "overwrite" || opts.forceRebind === true;
+  if (stagedConflicts.length > 0 && !allowStagedOverwrite) {
+    throw new ExitBundleImportError(
+      "STAGED_ARTIFACT_CONFLICT",
+      "Importing this exit bundle would overwrite existing staged exit artifacts. " +
+        `Conflicts: ${stagedConflicts
+          .map((conflict) => `${conflict.namespace}/${conflict.key}`)
+          .join(", ")}. ` +
+        "Pass conflictResolution: \"overwrite\" to confirm explicit replacement."
+    );
+  }
+  if (stagedConflicts.length > 0 && allowStagedOverwrite) {
+    opts.auditLog.append(
+      "l1",
+      "exit_bundle_staged_artifact_overwrite",
+      identityArtifact?.json.bundle.identity_id ??
+        manifest.body.identity_binding.identity_id,
+      {
+        import_id: importId,
+        conflicts: stagedConflicts,
+      }
+    );
+  }
   const stagedArtifacts: string[] = [];
   // Hardening wave 6 finding #78: track every staged storage location so
   // a re-key failure can roll back the partial import. Each entry is a

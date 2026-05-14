@@ -64,6 +64,27 @@ const DEFAULT_PENDING_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const DEFAULT_MAX_LIST_LIMIT = 200;
 const DEFAULT_LIST_PAGE_SIZE = 50;
 
+function canonicalJson(value: unknown): string {
+  if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+    return "null";
+  }
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value) ?? "null";
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .filter((key) => {
+      const item = record[key];
+      return item !== undefined && typeof item !== "function" && typeof item !== "symbol";
+    })
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(",")}}`;
+}
+
 /**
  * Lifecycle status of an aggregated approval entry.
  *  - `pending`: ingest fired, gate is awaiting a channel decision.
@@ -952,13 +973,12 @@ export class ApprovalAggregator {
   }
 
   /**
-   * Canonical SHA-256 of the request context. Sorted-keys serialization so
-   * identical payloads always hash the same, even when key insertion order
-   * varies. Defends against payload-replay smuggling (the aggregator can
-   * tell the same payload was seen twice without storing it cleartext).
+   * Canonical SHA-256 of the request context. Recursive sorted-keys
+   * serialization so nested payloads cannot collide through top-level-only
+   * JSON.stringify replacer behavior.
    */
   private hashPayload(payload: unknown): string {
-    const canonical = JSON.stringify(payload, Object.keys(payload as object).sort());
+    const canonical = canonicalJson(payload);
     return createHash("sha256").update(canonical).digest("hex");
   }
 
@@ -1006,7 +1026,8 @@ export class ApprovalAggregator {
 
   private async persist(entry: AggregatedApproval): Promise<void> {
     const serialized = stringToBytes(JSON.stringify(entry));
-    const encrypted = encrypt(serialized, this.encryptionKey);
+    const aad = stringToBytes(entry.aggregator_id);
+    const encrypted = encrypt(serialized, this.encryptionKey, aad);
     await this.storage.write(
       APPROVAL_AGGREGATOR_NAMESPACE,
       entry.aggregator_id,
@@ -1027,8 +1048,18 @@ export class ApprovalAggregator {
         if (!raw) continue;
         try {
           const encrypted: EncryptedPayload = JSON.parse(bytesToString(raw));
-          const decrypted = decrypt(encrypted, this.encryptionKey);
+          let decrypted: Uint8Array;
+          try {
+            decrypted = decrypt(
+              encrypted,
+              this.encryptionKey,
+              stringToBytes(meta.key),
+            );
+          } catch {
+            decrypted = decrypt(encrypted, this.encryptionKey);
+          }
           const entry: AggregatedApproval = JSON.parse(bytesToString(decrypted));
+          if (entry.aggregator_id !== meta.key) continue;
           this.entries.set(entry.aggregator_id, entry);
           const dedupKey = `${entry.source_harness}|${entry.source_agent_id}|${entry.audit_log_entry_id}`;
           this.dedupIndex.set(dedupKey, entry.aggregator_id);

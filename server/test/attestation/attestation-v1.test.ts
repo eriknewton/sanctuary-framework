@@ -543,6 +543,82 @@ describe("AC6: Signed-event envelope binding", () => {
     expect(fromSignedEvent(fakeSignedEvent)).toBeNull();
   });
 
+  it("fromSignedEvent rejects unknown attestation-prefixed event types", () => {
+    const event = createAttestationEvent({
+      event_type: "attestation_state_change",
+      target_layer: "global",
+      scope_id: "test-fortress",
+      resulting_state: "yellow",
+      explanation: "Test state change",
+    });
+    const fakeSignedEvent = {
+      protocol_version: "0.1",
+      event_type: "attestation_foo",
+      event_id: "test",
+      emitter_node: "node-1",
+      emitter_principal: "system",
+      fortress_id: "fort-1",
+      causal_parents: [],
+      payload: { ...event, event_type: "attestation_foo" },
+      payload_hash: "test",
+      emitted_at: new Date().toISOString(),
+      monotonic_seq: 1,
+      extension_envelope: {},
+      node_signature: "test",
+    };
+    expect(fromSignedEvent(fakeSignedEvent)).toBeNull();
+  });
+
+  it("fromSignedEvent rejects retry-reset and malformed attestation payloads", () => {
+    const event = createAttestationEvent({
+      event_type: "attestation_state_change",
+      target_layer: "global",
+      scope_id: "test-fortress",
+      resulting_state: "yellow",
+      explanation: "Test state change",
+    });
+    const baseSignedEvent = {
+      protocol_version: "0.1",
+      event_type: "attestation_state_change",
+      event_id: "test",
+      emitter_node: "node-1",
+      emitter_principal: "system",
+      fortress_id: "fort-1",
+      causal_parents: [],
+      payload: event,
+      payload_hash: "test",
+      emitted_at: new Date().toISOString(),
+      monotonic_seq: 1,
+      extension_envelope: {},
+      node_signature: "test",
+    };
+    expect(
+      fromSignedEvent({
+        ...baseSignedEvent,
+        event_type: "attestation_retry_state_reset",
+        payload: { scope_id: "test-fortress" },
+      }),
+    ).toBeNull();
+    expect(
+      fromSignedEvent({
+        ...baseSignedEvent,
+        payload: { ...event, target_layer: "bad-layer" },
+      }),
+    ).toBeNull();
+    expect(
+      fromSignedEvent({
+        ...baseSignedEvent,
+        payload: { ...event, resulting_state: "purple" },
+      }),
+    ).toBeNull();
+    expect(
+      fromSignedEvent({
+        ...baseSignedEvent,
+        payload: { ...event, signature_scheme: "ed25519-v2" },
+      }),
+    ).toBeNull();
+  });
+
   it("every attestation event carries signature_scheme", () => {
     for (const eventType of ATTESTATION_EVENT_TYPES) {
       const event = createAttestationEvent({

@@ -21,6 +21,7 @@ import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 
 import {
+  APPROVAL_AGGREGATOR_NAMESPACE,
   APPROVAL_AGGREGATOR_AUDIT_OPS,
   ApprovalAggregator,
   type ApprovalGateEvent,
@@ -160,6 +161,51 @@ describe("WP-V1.3-10 Upsilon-1 ApprovalAggregator", () => {
     expect(listed[0]?.policy_rule_id).toBe("tier1:state_export");
     expect(listed[0]?.action_summary).toBe("state_export (tier 1)");
     expect(listed[0]?.request_payload_hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("hashes nested request context canonically", async () => {
+    const { aggregator } = makeAggregator();
+    const first = await aggregator.ingest(
+      makeRequestedEvent({
+        context: { nested: { risk: "low", scope: { path: "/a" } } },
+        request_timestamp: "2026-05-09T12:00:00.000Z",
+        correlation_id: "corr-nested-1",
+      }),
+    );
+    const second = await aggregator.ingest(
+      makeRequestedEvent({
+        context: { nested: { risk: "low", scope: { path: "/b" } } },
+        request_timestamp: "2026-05-09T12:00:01.000Z",
+        correlation_id: "corr-nested-2",
+      }),
+    );
+    expect(first?.request_payload_hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(second?.request_payload_hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(first?.request_payload_hash).not.toBe(second?.request_payload_hash);
+  });
+
+  it("drops renamed encrypted metadata records whose storage key does not match aggregator_id", async () => {
+    const { storage, masterKey, aggregator } = makeAggregator();
+    const entry = await aggregator.ingest(makeRequestedEvent());
+    expect(entry).not.toBeNull();
+    const raw = await storage.read(
+      APPROVAL_AGGREGATOR_NAMESPACE,
+      entry!.aggregator_id,
+    );
+    expect(raw).not.toBeNull();
+    await storage.write(APPROVAL_AGGREGATOR_NAMESPACE, "agg-renamed", raw!);
+
+    const restarted = new ApprovalAggregator({
+      storage,
+      masterKey,
+      auditLog: new AuditLog(storage, masterKey),
+      identityId: IDENTITY,
+      fortressId: FORTRESS,
+    });
+    const listed = await restarted.list();
+    expect(listed.map((candidate) => candidate.aggregator_id)).not.toContain(
+      "agg-renamed",
+    );
   });
 
   // 2. dedup

@@ -59,6 +59,7 @@ import {
   DEFAULT_MIN_SAMPLES_FOR_PREDICTION,
   ROLLING_BASELINE_CLASSIFIER_ID,
 } from "../../src/anomaly-detection/classifiers/rolling-baseline.js";
+import { CUSUM_CLASSIFIER_ID } from "../../src/anomaly-detection/classifiers/cusum.js";
 import {
   CrossAgentTimingDetector,
   CROSS_AGENT_TIMING_DETECTOR_ID,
@@ -300,6 +301,40 @@ describe("Chi-3 — HTTP routes", () => {
       const ops = audit.entries.map((e) => e.operation);
       expect(ops).toContain(ANOMALY_AUDIT_OPS.DETECTOR_REGISTERED);
       expect(ops).toContain(ANOMALY_AUDIT_OPS.DETECTOR_UNREGISTERED);
+    } finally {
+      await close();
+    }
+  });
+
+  it("unsubscribes one classifier tuple without disabling siblings on the same detector", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const rolling = await fetch(
+        `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe?classifier=${ROLLING_BASELINE_CLASSIFIER_ID}`,
+        { method: "POST" },
+      );
+      expect(rolling.status).toBe(200);
+      const cusum = await fetch(
+        `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe?classifier=${CUSUM_CLASSIFIER_ID}`,
+        { method: "POST" },
+      );
+      expect(cusum.status).toBe(200);
+      expect(
+        rig.dispatcher.listDetectorClassifiers(PER_AGENT_ACTIVITY_DETECTOR_ID),
+      ).toEqual([ROLLING_BASELINE_CLASSIFIER_ID, CUSUM_CLASSIFIER_ID]);
+
+      const unsubCusum = await fetch(
+        `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe?classifier=${CUSUM_CLASSIFIER_ID}`,
+        { method: "DELETE" },
+      );
+      expect(unsubCusum.status).toBe(200);
+      expect(
+        rig.dispatcher.listDetectorClassifiers(PER_AGENT_ACTIVITY_DETECTOR_ID),
+      ).toEqual([ROLLING_BASELINE_CLASSIFIER_ID]);
+      expect(rig.dispatcher.listDetectors()).toContain(
+        PER_AGENT_ACTIVITY_DETECTOR_ID,
+      );
     } finally {
       await close();
     }

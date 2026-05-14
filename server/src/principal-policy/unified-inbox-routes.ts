@@ -107,6 +107,10 @@ function parseLimit(
   return Math.min(parsed, max);
 }
 
+function hasHardDeleteConfirmation(body: Record<string, unknown>): boolean {
+  return body.confirm_delete === true;
+}
+
 function matchEntryPath(path: string): {
   inboxId: string;
   action: "get" | "resolve" | "archive" | "dismiss" | "snooze" | "unsnooze" | "delete";
@@ -281,6 +285,16 @@ export async function handleUnifiedInboxRoute(
       }
       if (method === "POST" && entryMatch.action !== "get") {
         const body = await readJsonBody(req);
+        if (
+          entryMatch.action === "delete" &&
+          !hasHardDeleteConfirmation(body)
+        ) {
+          writeJSON(res, 400, {
+            ok: false,
+            error: "delete_confirmation_required",
+          });
+          return true;
+        }
         const until = typeof body.until === "string" ? body.until : undefined;
         const id = entryMatch.inboxId;
         const result =
@@ -361,6 +375,13 @@ export async function handleUnifiedInboxRoute(
         ? body.entry_ids.filter((v: unknown): v is string => typeof v === "string")
         : [];
       const action = body.action;
+      if (action === "delete" && !hasHardDeleteConfirmation(body)) {
+        writeJSON(res, 400, {
+          ok: false,
+          error: "delete_confirmation_required",
+        });
+        return true;
+      }
       const result =
         action === "archive"
           ? deps.bridge.archiveBatch(ids)

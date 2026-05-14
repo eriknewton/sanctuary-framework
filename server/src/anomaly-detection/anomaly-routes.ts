@@ -198,7 +198,13 @@ export async function handleAnomalyRoute(
 
     if (method === "GET" && path === `${ANOMALY_API_PREFIX}/subscribed`) {
       const subscribed = deps.dispatcher.listDetectors();
-      writeJSON(res, 200, { ok: true, data: { subscribed } });
+      const tuples = subscribed.flatMap((detectorId) =>
+        deps.dispatcher.listDetectorClassifiers(detectorId).map((classifierId) => ({
+          detector_id: detectorId,
+          classifier_id: classifierId,
+        })),
+      );
+      writeJSON(res, 200, { ok: true, data: { subscribed, tuples } });
       return true;
     }
 
@@ -352,13 +358,32 @@ export async function handleAnomalyRoute(
       }
       if (method === "POST") {
         try {
-          await deps.dispatcher.registerDetector(entry.factory());
+          let classifierIds = deps.dispatcher.listDetectorClassifiers(entry.detectorId);
+          if (classifierIds.length === 0) {
+            await deps.dispatcher.registerDetector(entry.factory());
+            classifierIds = deps.dispatcher.listDetectorClassifiers(entry.detectorId);
+          }
+          if (!classifierIds.includes(entry.classifierId)) {
+            if (!entry.classifierFactory) {
+              writeJSON(res, 409, {
+                ok: false,
+                error: "classifier_not_attachable",
+              });
+              return true;
+            }
+            await deps.dispatcher.addClassifierToDetector(
+              entry.detectorId,
+              entry.classifierFactory,
+            );
+            classifierIds = deps.dispatcher.listDetectorClassifiers(entry.detectorId);
+          }
           writeJSON(res, 200, {
             ok: true,
             data: {
               detector_id: entry.detectorId,
               classifier_id: entry.classifierId,
               subscribed: true,
+              subscribed_classifiers: classifierIds,
             },
           });
         } catch (err) {
@@ -368,15 +393,34 @@ export async function handleAnomalyRoute(
         return true;
       }
       if (method === "DELETE") {
-        const removed = await deps.dispatcher.unregisterDetector(
-          entry.detectorId,
-        );
+        const classifierIds = deps.dispatcher.listDetectorClassifiers(entry.detectorId);
+        let removed = false;
+        if (classifierIds.includes(entry.classifierId)) {
+          const primaryClassifierId = classifierIds[0];
+          if (entry.classifierId === primaryClassifierId) {
+            if (classifierIds.length > 1) {
+              writeJSON(res, 409, {
+                ok: false,
+                error: "primary_classifier_has_dependents",
+              });
+              return true;
+            }
+            removed = await deps.dispatcher.unregisterDetector(entry.detectorId);
+          } else {
+            removed = await deps.dispatcher.removeClassifierFromDetector(
+              entry.detectorId,
+              entry.classifierId,
+            );
+          }
+        }
         writeJSON(res, 200, {
           ok: true,
           data: {
             detector_id: entry.detectorId,
             classifier_id: entry.classifierId,
-            subscribed: false,
+            subscribed: deps.dispatcher
+              .listDetectorClassifiers(entry.detectorId)
+              .includes(entry.classifierId),
             removed,
           },
         });

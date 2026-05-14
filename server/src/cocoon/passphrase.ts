@@ -27,12 +27,15 @@ import { gcm } from "@noble/ciphers/aes.js";
 import { hkdf } from "@noble/hashes/hkdf";
 import { sha256 } from "@noble/hashes/sha256";
 import { resolveStoragePath, DEFAULT_STORAGE_DIR } from "../paths.js";
+import { fromBase64url, toBase64url } from "../core/encoding.js";
 
 // ── Constants ───────────────────────────────────────────────────────
 
 const KEYCHAIN_ACCOUNT = "sanctuary";
 /** Legacy single-tenant Keychain service name — kept for backward compat. */
 const KEYCHAIN_SERVICE_DEFAULT = "sanctuary-passphrase";
+const FALLBACK_FILE_VERSION = 2;
+const FALLBACK_FILE_ALG = "aes-256-gcm";
 /** Human-readable label for Linux Secret Service items (shown in Seahorse,
  * KeePassXC, KDE KWalletManager). Invisible on macOS. */
 const KEYCHAIN_LABEL = "Sanctuary Passphrase";
@@ -123,7 +126,7 @@ export class PassphraseUnreadableError extends Error {
 
 /** Outcome of reading the fallback passphrase file. */
 type FallbackReadResult =
-  | { status: "ok"; value: string }
+  | { status: "ok"; value: string; legacy: boolean }
   | { status: "not-found" }
   | { status: "unreadable"; reason: string };
 
@@ -184,6 +187,9 @@ export async function getOrCreatePassphrase(
   const fallback = fallbackFilePath(home, storagePath);
   const fromFile = await readFromFallbackFile(fallback, home, derive);
   if (fromFile.status === "ok") {
+    if (fromFile.legacy) {
+      await writeToFallbackFile(fallback, fromFile.value, home, derive);
+    }
     return {
       value: fromFile.value,
       source: "fallback-file",
@@ -258,6 +264,9 @@ export async function readStoredPassphrase(
   const fallback = fallbackFilePath(home, storagePath);
   const fromFile = await readFromFallbackFile(fallback, home, derive);
   if (fromFile.status === "ok") {
+    if (fromFile.legacy) {
+      await writeToFallbackFile(fallback, fromFile.value, home, derive);
+    }
     return {
       value: fromFile.value,
       source: "fallback-file",
@@ -525,15 +534,29 @@ async function readFromFallbackFile(
   }
   try {
     const raw = await readFile(path);
+    const parsed = parseFallbackEnvelope(raw);
+    const key = derive(home);
+    if (parsed) {
+      const cipher = gcm(key, parsed.nonce, fallbackFileAad(path));
+      const plain = cipher.decrypt(parsed.ciphertext);
+      return {
+        status: "ok",
+        value: Buffer.from(plain).toString("utf-8"),
+        legacy: false,
+      };
+    }
     if (raw.length < 13) {
       return { status: "unreadable", reason: "file too short to contain a valid nonce + ciphertext" };
     }
     const nonce = raw.subarray(0, 12);
     const ciphertext = raw.subarray(12);
-    const key = derive(home);
     const cipher = gcm(key, nonce);
     const plain = cipher.decrypt(ciphertext);
-    return { status: "ok", value: Buffer.from(plain).toString("utf-8") };
+    return {
+      status: "ok",
+      value: Buffer.from(plain).toString("utf-8"),
+      legacy: true,
+    };
   } catch (err) {
     return {
       status: "unreadable",
@@ -555,10 +578,48 @@ async function writeToFallbackFile(
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const nonce = randomBytes(12);
   const key = derive(home);
-  const cipher = gcm(key, nonce);
+  const cipher = gcm(key, nonce, fallbackFileAad(path));
   const ciphertext = cipher.encrypt(Buffer.from(value, "utf-8"));
-  const payload = Buffer.concat([nonce, Buffer.from(ciphertext)]);
+  const payload = Buffer.from(
+    JSON.stringify({
+      v: FALLBACK_FILE_VERSION,
+      alg: FALLBACK_FILE_ALG,
+      aad: "storage-path",
+      nonce: toBase64url(nonce),
+      ct: toBase64url(ciphertext),
+    }),
+    "utf-8",
+  );
   await writeFile(path, payload, { mode: 0o600 });
+}
+
+function fallbackFileAad(path: string): Uint8Array {
+  return Buffer.from(`sanctuary-passphrase:${resolve(dirname(path))}`, "utf-8");
+}
+
+function parseFallbackEnvelope(raw: Buffer): {
+  nonce: Uint8Array;
+  ciphertext: Uint8Array;
+} | null {
+  if (raw[0] !== 0x7b) return null;
+  try {
+    const parsed = JSON.parse(raw.toString("utf-8")) as Record<string, unknown>;
+    if (
+      parsed.v !== FALLBACK_FILE_VERSION ||
+      parsed.alg !== FALLBACK_FILE_ALG ||
+      parsed.aad !== "storage-path" ||
+      typeof parsed.nonce !== "string" ||
+      typeof parsed.ct !== "string"
+    ) {
+      return null;
+    }
+    return {
+      nonce: fromBase64url(parsed.nonce),
+      ciphertext: fromBase64url(parsed.ct),
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**

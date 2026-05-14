@@ -184,6 +184,10 @@ export class AnomalyPipelineDispatcher {
     return [...this.detectors.keys()];
   }
 
+  listDetectorClassifiers(detectorId: string): string[] {
+    return this.detectors.get(detectorId)?.listClassifierIds() ?? [];
+  }
+
   /** Run one evaluation pass over every registered detector. */
   async tick(): Promise<AnomalyFinding[]> {
     if (this.tickInFlight) return [];
