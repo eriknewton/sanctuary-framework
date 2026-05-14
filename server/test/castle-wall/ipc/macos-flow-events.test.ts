@@ -38,6 +38,7 @@ import {
   type MacOSSubscriber,
 } from "../../../src/castle-wall/runtime/index.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
+import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
 
 const SAMPLE_RULE: AllowlistRule = {
   id: "rule-anthropic",
@@ -108,9 +109,29 @@ function makeManifestProvider(rules: AllowlistRule[], signature: string | null =
   return {
     currentSnapshot() {
       return {
-        manifest_signature_b64url: signature,
+        signed_manifest: makeSignedManifest(rules, signature ?? ""),
         rules,
       };
+    },
+  };
+}
+
+function makeSignedManifest(rules: AllowlistRule[], signature: string): SignedManifest {
+  return {
+    manifest: {
+      schema_version: 1,
+      fortress_id: "fortress-test",
+      issued_at: "2026-05-14T00:00:00Z",
+      rules: rules.map((rule) => ({
+        rule_id: rule.id,
+        file: `${rule.id}.json`,
+        sha256: "0".repeat(64),
+      })),
+    },
+    signature: {
+      signature_scheme: "ed25519-v1",
+      signing_key_id: "test-key",
+      signature_b64url: signature,
     },
   };
 }
@@ -162,7 +183,7 @@ describe("MacOSFlowEventConsumer : manifest subscribe + broadcast", () => {
     const notification = await consumer.handleManifestSubscribe(request, "ext-1");
 
     expect(notification.type).toBe("manifest_updated");
-    expect(notification.manifest_signature_b64url).toBe("sigA");
+    expect(notification.signature.signature_b64url).toBe("sigA");
     expect(notification.rules).toEqual([SAMPLE_RULE]);
     expect(emitted).toHaveLength(1);
     expect(emitted[0]).toEqual(notification);
@@ -192,7 +213,7 @@ describe("MacOSFlowEventConsumer : manifest subscribe + broadcast", () => {
     expect(emittedCount).toBe(2);
     expect(a.emitted).toHaveLength(1);
     expect(b.emitted).toHaveLength(1);
-    expect(a.emitted[0]?.manifest_signature_b64url).toBe("sigB");
+    expect(a.emitted[0]?.signature.signature_b64url).toBe("sigB");
     expect(b.emitted[0]?.rules).toEqual([SAMPLE_RULE]);
   });
 

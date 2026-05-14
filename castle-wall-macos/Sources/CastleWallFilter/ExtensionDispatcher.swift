@@ -89,6 +89,11 @@ public final class ExtensionDispatcher {
     /// `isStarted` to know whether the IPC channel is live.
     @discardableResult
     public func start() async -> Bool {
+        _ = IPCBridgeNotifications.recoverPersistedManifest(
+            store: manifestStore,
+            cache: flowCache,
+            pinnedPublicKey: ipcClient.pinnedPublicKeyBytes
+        )
         do {
             _ = try await ipcClient.start()
         } catch {
@@ -161,7 +166,8 @@ public final class ExtensionDispatcher {
             _ = IPCBridgeNotifications.applyManifestUpdated(
                 message: message,
                 store: manifestStore,
-                cache: flowCache
+                cache: flowCache,
+                pinnedPublicKey: ipcClient.pinnedPublicKeyBytes
             )
         case .decisionResponse:
             // Operator-approval / -deny resume path; round-trip wiring

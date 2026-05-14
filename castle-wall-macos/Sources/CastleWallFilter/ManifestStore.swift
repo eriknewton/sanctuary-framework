@@ -47,8 +47,24 @@ public final class ManifestStore {
     private var snapshot: ManifestSnapshot?
     private var observers: [(UUID, ManifestChangeObserver)] = []
     private var lock = os_unfair_lock_s()
+    public let lastValidManifestURL: URL?
 
-    public init() {}
+    public init(lastValidManifestURL: URL? = nil) {
+        self.lastValidManifestURL = lastValidManifestURL
+    }
+
+    public static func defaultLastValidManifestURL() -> URL? {
+        guard let base = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            return nil
+        }
+        return base
+            .appendingPathComponent("Sanctuary", isDirectory: true)
+            .appendingPathComponent("CastleWall", isDirectory: true)
+            .appendingPathComponent("last-valid-manifest.json")
+    }
 
     /// Replace the active snapshot. Notifies every registered observer
     /// after releasing the internal lock so observer callbacks may safely
@@ -62,6 +78,32 @@ public final class ManifestStore {
         for observer in observersCopy {
             observer(snapshot)
         }
+    }
+
+    public func persistLastValidManifest(_ body: ManifestUpdatedBody) throws {
+        guard let url = lastValidManifestURL else {
+            return
+        }
+        let dir = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: dir,
+            withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(body)
+        try data.write(to: url, options: [.atomic])
+    }
+
+    public func loadPersistedManifest() throws -> ManifestUpdatedBody? {
+        guard let url = lastValidManifestURL else {
+            return nil
+        }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(ManifestUpdatedBody.self, from: data)
     }
 
     /// Read the current snapshot. Returns `nil` until the first update.

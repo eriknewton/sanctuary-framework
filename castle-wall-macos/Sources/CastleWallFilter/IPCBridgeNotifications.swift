@@ -95,16 +95,72 @@ public enum IPCBridgeNotifications {
         message: IpcMessage,
         store: ManifestStore,
         cache: FlowCache,
+        pinnedPublicKey: Data,
         now: Date = Date()
     ) -> ManifestSnapshot? {
         guard case .manifestUpdated(let body) = message else {
             return nil
         }
-        let snapshot = ManifestSnapshot(
-            signatureB64url: body.manifestSignatureB64url,
-            rules: body.rules,
-            updatedAt: now
-        )
+        let snapshot: ManifestSnapshot
+        do {
+            snapshot = try SignedManifestVerifier.verifiedSnapshot(
+                from: body,
+                pinnedPublicKey: pinnedPublicKey,
+                now: now
+            )
+        } catch {
+            CastleWallLog.ipc.notice(
+                "manifest_updated rejected by extension verifier: \(String(describing: error))"
+            )
+            return nil
+        }
+        do {
+            try store.persistLastValidManifest(body)
+        } catch {
+            CastleWallLog.ipc.notice(
+                "last valid manifest persistence failed: \(String(describing: error))"
+            )
+        }
+        store.update(snapshot)
+        cache.clear()
+        return snapshot
+    }
+
+    /// Recover the last persisted valid manifest after extension restart.
+    /// Returns nil and leaves the active snapshot empty when no valid
+    /// persisted manifest exists, preserving fail-closed startup.
+    @discardableResult
+    public static func recoverPersistedManifest(
+        store: ManifestStore,
+        cache: FlowCache,
+        pinnedPublicKey: Data,
+        now: Date = Date()
+    ) -> ManifestSnapshot? {
+        let body: ManifestUpdatedBody?
+        do {
+            body = try store.loadPersistedManifest()
+        } catch {
+            CastleWallLog.ipc.notice(
+                "last valid manifest load failed: \(String(describing: error))"
+            )
+            return nil
+        }
+        guard let body else {
+            return nil
+        }
+        let snapshot: ManifestSnapshot
+        do {
+            snapshot = try SignedManifestVerifier.verifiedSnapshot(
+                from: body,
+                pinnedPublicKey: pinnedPublicKey,
+                now: now
+            )
+        } catch {
+            CastleWallLog.ipc.notice(
+                "persisted manifest rejected by extension verifier: \(String(describing: error))"
+            )
+            return nil
+        }
         store.update(snapshot)
         cache.clear()
         return snapshot
