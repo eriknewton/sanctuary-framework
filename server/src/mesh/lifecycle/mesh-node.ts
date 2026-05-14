@@ -24,6 +24,7 @@ import {
 } from "../constants.js";
 import {
   MeshError,
+  MeshChainError,
   MeshReservedCapabilityBitError,
   MeshReservedEventTypeError,
   MeshReservedExtensionKeyError,
@@ -900,14 +901,15 @@ export class MeshNode {
     }
     const acceptedLifecycleEvents: SignedEvent<NodeLifecyclePayload>[] = [];
     for (const evt of payload.node_lifecycle_events ?? []) {
-      // For lifecycle events, we may not yet have the joining node's cert
-      // in the roster — for `node_join` events, ingest the certificate
-      // first, then verify the envelope.
       if (evt.event_type === "node_join") {
-        const join = evt as SignedEvent<NodeJoinPayload>;
+        const join = this.verifyNodeJoinBeforeRosterMutation(
+          evt as SignedEvent<NodeJoinPayload>
+        );
         this.roster.add(join.payload.certificate);
+      } else {
+        this.verifyOrThrow(evt);
       }
-      this.verifyOrThrow(evt);
+      this.lifecycleLog.append(evt);
       if (evt.event_type === "node_revoke") {
         const rev = evt as SignedEvent<NodeRevokePayload>;
         try {
@@ -924,7 +926,6 @@ export class MeshNode {
         }
         this.roster.markRevoked(rev.payload.node_id);
       }
-      this.lifecycleLog.append(evt);
       if (evt.event_type === "node_leave") {
         const lv = evt as SignedEvent<NodeLeavePayload>;
         this.roster.markLeft(lv.payload.node_id);
@@ -1278,16 +1279,10 @@ export class MeshNode {
     // verification looks the emitter cert up in the roster.
     if (evt.event_type === "node_join") {
       try {
-        const join = evt as SignedEvent<NodeJoinPayload>;
-        const principalCert = this.principalRoster.get(evt.emitter_principal);
-        if (principalCert) {
-          verifyCertChain(
-            join.payload.certificate,
-            principalCert,
-            this.config.pinned_master_pubkey
-          );
-          this.roster.add(join.payload.certificate);
-        }
+        const join = this.verifyNodeJoinBeforeRosterMutation(
+          evt as SignedEvent<NodeJoinPayload>
+        );
+        this.roster.add(join.payload.certificate);
       } catch {
         return;
       }
@@ -1504,14 +1499,41 @@ export class MeshNode {
 
   private verifyOrThrow(evt: SignedEvent): SignedEvent {
     // For envelope verification we use lookupActiveNodeCert so revoked nodes
-    // are rejected immediately. The exception is `node_join` events whose
-    // emitter is the joining node itself — those are admitted via the
-    // applySync path, which adds the cert to the roster before verifying.
+    // are rejected immediately. New node_join events are verified through a
+    // temporary lookup before roster mutation.
     const result = verifySignedEvent(evt, {
       pinnedMasterPubkey: this.config.pinned_master_pubkey,
       lookupNodeCert: (id) => this.roster.lookupActiveNodeCert(id),
       lookupPrincipalCert: (id) => this.principalRoster.get(id),
     });
     return result.event;
+  }
+
+  private verifyNodeJoinBeforeRosterMutation(
+    evt: SignedEvent<NodeJoinPayload>
+  ): SignedEvent<NodeJoinPayload> {
+    const certificate = evt.payload.certificate;
+    const issuerPrincipalCert = this.principalRoster.get(
+      certificate.parent_chain.principal_id
+    );
+    if (!issuerPrincipalCert) {
+      throw new MeshChainError(
+        `node_join certificate issuer principal ${certificate.parent_chain.principal_id} is not in local roster`
+      );
+    }
+    verifyCertChain(
+      certificate,
+      issuerPrincipalCert,
+      this.config.pinned_master_pubkey
+    );
+    const result = verifySignedEvent(evt, {
+      pinnedMasterPubkey: this.config.pinned_master_pubkey,
+      lookupNodeCert: (id) => {
+        if (id === certificate.node_id) return certificate;
+        return this.roster.lookupActiveNodeCert(id);
+      },
+      lookupPrincipalCert: (id) => this.principalRoster.get(id),
+    });
+    return result.event as SignedEvent<NodeJoinPayload>;
   }
 }

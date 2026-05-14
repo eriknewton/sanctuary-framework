@@ -29,6 +29,7 @@ import { generateKeypair } from "../../src/core/identity.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { randomBytes } from "../../src/core/random.js";
 import { canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
+import { packSignedEvent } from "../../src/mesh/envelope.js";
 import {
   CAP_STANDARD_FORTRESS_NODE,
   DEFAULTS,
@@ -1112,6 +1113,48 @@ describe("lifecycle/sync — initial sync pulls policy + locator + audit", () =>
     expect(response.kind).toBe("agent_state_transfer");
     expect(response.policy_updates).toBeUndefined();
     expect(response.locator_updates).toBeUndefined();
+  });
+
+  it("rejects sync node_join certificates that do not chain to the pinned master", async () => {
+    const hub = new InMemoryTransport();
+    const first = await bootstrapFirstNode({ transport: hub });
+    const attackerFortress = bootFortress();
+    const attackerNodeKeypair = generateKeypair();
+    const attackerCert = issueNodeIdentityCertificate({
+      node_id: "attacker-node",
+      node_pubkey: attackerNodeKeypair.publicKey,
+      node_mode: "local",
+      fortress_id: attackerFortress.master_public.fortress_id,
+      capabilities: CAP_STANDARD_FORTRESS_NODE,
+      parent_chain: {
+        fortress_master_pubkey: attackerFortress.master_public.public_key,
+        principal_id: attackerFortress.root_principal_cert.principal_id,
+        principal_pubkey: attackerFortress.root_principal_cert.principal_pubkey,
+      },
+      principal_private_key: attackerFortress.root_principal_keypair.privateKey,
+    });
+    const hostileJoin = packSignedEvent({
+      event_type: "node_join",
+      emitter_node: attackerCert.node_id,
+      emitter_principal: "system",
+      fortress_id: first.bootstrap.master_public.fortress_id,
+      payload: { certificate: attackerCert },
+      monotonic_seq: 1,
+      node_private_key: attackerNodeKeypair.privateKey,
+    });
+
+    const beforeRosterSize = first.node.snapshot().roster_size;
+    await expect(
+      first.node.applySync({
+        kind: "initial_sync",
+        node_lifecycle_events: [hostileJoin],
+      })
+    ).rejects.toThrow();
+
+    expect(first.node.snapshot().roster_size).toBe(beforeRosterSize);
+    expect(
+      first.node.getRoster().presenceOf(attackerCert.node_id)
+    ).toBeUndefined();
   });
 });
 
