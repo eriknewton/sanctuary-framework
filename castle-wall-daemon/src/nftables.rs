@@ -38,6 +38,8 @@ pub const CASTLE_TABLE: &str = "sanctuary-castle";
 
 /// The nftables table family. `inet` covers both IPv4 and IPv6.
 pub const CASTLE_FAMILY: &str = "inet";
+const NFT_CHAIN_MAX_LEN: usize = 256;
+const AGENT_CHAIN_PREFIX: &str = "agent_";
 
 /// A single nftables rule fragment generated from a PolicySnapshot rule.
 #[derive(Debug, Clone)]
@@ -132,20 +134,10 @@ pub fn build_agent_jump_rule(
 }
 
 /// Derive a sanitized chain name from an agent id.
-fn agent_chain_name(agent_id: &str) -> String {
-    // nftables chain names allow alphanumeric, underscore, hyphen, period.
-    // Replace anything else with underscore.
-    let sanitized: String = agent_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("agent_{sanitized}")
+pub(crate) fn agent_chain_name(agent_id: &str) -> String {
+    let max_component_len = NFT_CHAIN_MAX_LEN - AGENT_CHAIN_PREFIX.len();
+    let encoded = crate::identity::encode_agent_component(agent_id, max_component_len);
+    format!("{AGENT_CHAIN_PREFIX}{encoded}")
 }
 
 // ---- Linux implementations ------------------------------------------------
@@ -251,9 +243,7 @@ mod linux {
     ) -> Result<(), NftablesError> {
         let chain_name = agent_chain_name(&id.agent_id);
         // Ensure the per-agent chain exists.
-        let create = format!(
-            "add chain {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name}\n"
-        );
+        let create = format!("add chain {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name}\n");
         let _ = run_nft_stdin(&create);
         // Apply the ruleset script (atomic replace on the per-agent chain).
         run_nft_stdin(ruleset_script)?;
@@ -312,8 +302,7 @@ mod linux {
         {
             Ok(s) => s,
             Err(NftablesError::InvocationFailed(msg))
-                if msg.contains("No such file or directory")
-                    || msg.contains("does not exist") =>
+                if msg.contains("No such file or directory") || msg.contains("does not exist") =>
             {
                 // Base chain absent (table was deleted or never installed).
                 // Treat as zero matching rules.
@@ -400,8 +389,7 @@ mod linux {
         match run_nft(&["list", "table", CASTLE_FAMILY, CASTLE_TABLE]) {
             Ok(_) => Ok(true),
             Err(NftablesError::InvocationFailed(msg))
-                if msg.contains("No such file or directory")
-                    || msg.contains("does not exist") =>
+                if msg.contains("No such file or directory") || msg.contains("does not exist") =>
             {
                 Ok(false)
             }
@@ -551,9 +539,7 @@ pub fn table_exists() -> Result<bool, NftablesError> {
 /// on the NFQUEUE verdict path where the daemon can evaluate the resolved host
 /// against the signed policy. Only rules without any host axis are safe to
 /// lower directly into nftables.
-pub fn rule_to_nft_expr(
-    rule: &crate::policy::AllowlistRule,
-) -> Vec<NftRuleFragment> {
+pub fn rule_to_nft_expr(rule: &crate::policy::AllowlistRule) -> Vec<NftRuleFragment> {
     let mut frags = Vec::new();
     let disposition_expr = match rule.disposition {
         crate::policy::RuleDisposition::Allow => "accept",
@@ -630,7 +616,26 @@ mod tests {
     #[test]
     fn agent_chain_name_sanitizes() {
         assert_eq!(agent_chain_name("my-agent"), "agent_my-agent");
-        assert_eq!(agent_chain_name("agent/with spaces"), "agent_agent_with_spaces");
+        assert_eq!(
+            agent_chain_name("agent/with spaces"),
+            "agent_agent_x2f_with_x20_spaces"
+        );
+    }
+
+    #[test]
+    fn agent_chain_name_does_not_collapse_colliding_agent_ids() {
+        let slash_agent = agent_chain_name("agent/a");
+        let underscore_agent = agent_chain_name("agent_a");
+        assert_ne!(slash_agent, underscore_agent);
+        assert_eq!(slash_agent, "agent_agent_x2f_a");
+        assert_eq!(underscore_agent, "agent_agent_a");
+    }
+
+    #[test]
+    fn agent_chain_name_stays_within_nft_budget() {
+        let chain = agent_chain_name(&format!("agent/{}", "x".repeat(400)));
+        assert!(chain.len() <= NFT_CHAIN_MAX_LEN);
+        assert!(chain.starts_with(AGENT_CHAIN_PREFIX));
     }
 
     #[test]
@@ -672,9 +677,8 @@ mod tests {
             3,
             &frags,
         );
-        assert!(script.contains(
-            "level 3 \"system.slice/parent.service/sanctuary-agent-nested.service\""
-        ));
+        assert!(script
+            .contains("level 3 \"system.slice/parent.service/sanctuary-agent-nested.service\""));
         assert!(!script.contains("level 2"));
     }
 
@@ -732,7 +736,13 @@ mod tests {
 
     #[test]
     fn rule_to_nft_expr_deny_no_host() {
-        let r = make_rule("r2", None, Some(vec![80, 8080]), Some("tcp"), RuleDisposition::Deny);
+        let r = make_rule(
+            "r2",
+            None,
+            Some(vec![80, 8080]),
+            Some("tcp"),
+            RuleDisposition::Deny,
+        );
         let frags = rule_to_nft_expr(&r);
         assert_eq!(frags.len(), 1);
         assert!(frags[0].nft_expr.contains("drop"));
@@ -770,7 +780,13 @@ mod tests {
 
     #[test]
     fn rule_to_nft_expr_host_pattern_stays_on_nfqueue() {
-        let mut r = make_rule("r5", None, Some(vec![443]), Some("tcp"), RuleDisposition::Deny);
+        let mut r = make_rule(
+            "r5",
+            None,
+            Some(vec![443]),
+            Some("tcp"),
+            RuleDisposition::Deny,
+        );
         r.match_clause.host_pattern = Some(".example.com".to_string());
         let frags = rule_to_nft_expr(&r);
         assert!(
@@ -787,11 +803,7 @@ mod tests {
         // under system.slice, single-segment agent id. This is what the
         // base output chain needs to route packets from the agent's cgroup
         // into the per-agent chain.
-        let rule = build_agent_jump_rule(
-            "alpha",
-            2,
-            "system.slice/sanctuary-agent-alpha.service",
-        );
+        let rule = build_agent_jump_rule("alpha", 2, "system.slice/sanctuary-agent-alpha.service");
         assert_eq!(
             rule,
             "add rule inet sanctuary-castle output \
@@ -837,9 +849,9 @@ mod tests {
             3,
             "system.slice/parent.service/sanctuary-agent-nested.service",
         );
-        assert!(rule.contains(
-            "level 3 \"system.slice/parent.service/sanctuary-agent-nested.service\""
-        ));
+        assert!(
+            rule.contains("level 3 \"system.slice/parent.service/sanctuary-agent-nested.service\"")
+        );
         assert!(!rule.contains("level 2"));
     }
 

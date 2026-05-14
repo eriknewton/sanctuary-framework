@@ -19,6 +19,10 @@
 
 use std::path::{Path, PathBuf};
 
+const SYSTEMD_UNIT_MAX_LEN: usize = 256;
+const SCOPE_UNIT_PREFIX: &str = "sanctuary-agent-";
+const SCOPE_UNIT_SUFFIX: &str = ".service";
+
 /// Errors emitted by the cgroup module.
 #[derive(Debug, thiserror::Error)]
 pub enum CgroupError {
@@ -60,19 +64,10 @@ pub struct ScopeHandle {
 /// to work around systemd 255 rejecting `--remain-after-exit` in `--scope`
 /// mode.
 pub fn scope_unit_name(agent_id: &str) -> String {
-    // Sanitize: systemd unit names allow alphanumeric, hyphen, underscore,
-    // period, backslash, colon. Replace anything else with underscore.
-    let sanitized: String = agent_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("sanctuary-agent-{sanitized}.service")
+    let max_component_len =
+        SYSTEMD_UNIT_MAX_LEN - SCOPE_UNIT_PREFIX.len() - SCOPE_UNIT_SUFFIX.len();
+    let encoded = crate::identity::encode_agent_component(agent_id, max_component_len);
+    format!("{SCOPE_UNIT_PREFIX}{encoded}{SCOPE_UNIT_SUFFIX}")
 }
 
 /// Resolve the cgroup v2 path for a systemd transient unit.
@@ -262,11 +257,7 @@ mod linux {
     pub fn resolve_cgroup_id(cgroup_path: &Path) -> Result<u64, CgroupError> {
         use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(cgroup_path).map_err(|e| {
-            CgroupError::IdResolutionFailed(format!(
-                "{}: {}",
-                cgroup_path.display(),
-                e
-            ))
+            CgroupError::IdResolutionFailed(format!("{}: {}", cgroup_path.display(), e))
         })?;
         Ok(meta.ino())
     }
@@ -396,8 +387,24 @@ mod tests {
         );
         assert_eq!(
             scope_unit_name("agent/with spaces"),
-            "sanctuary-agent-agent_with_spaces.service"
+            "sanctuary-agent-agent_x2f_with_x20_spaces.service"
         );
+    }
+
+    #[test]
+    fn scope_unit_name_does_not_collapse_colliding_agent_ids() {
+        let slash_agent = scope_unit_name("agent/a");
+        let underscore_agent = scope_unit_name("agent_a");
+        assert_ne!(slash_agent, underscore_agent);
+        assert_eq!(slash_agent, "sanctuary-agent-agent_x2f_a.service");
+        assert_eq!(underscore_agent, "sanctuary-agent-agent_a.service");
+    }
+
+    #[test]
+    fn scope_unit_name_stays_within_systemd_budget() {
+        let unit = scope_unit_name(&format!("agent/{}", "x".repeat(400)));
+        assert!(unit.len() <= SYSTEMD_UNIT_MAX_LEN);
+        assert!(unit.ends_with(SCOPE_UNIT_SUFFIX));
     }
 
     #[test]
@@ -421,10 +428,7 @@ mod tests {
 
     #[test]
     fn cgroup_relative_path_strips_canonical_prefix() {
-        let h = make_scope_handle(
-            "/sys/fs/cgroup/system.slice/sanctuary-agent-foo.service",
-            2,
-        );
+        let h = make_scope_handle("/sys/fs/cgroup/system.slice/sanctuary-agent-foo.service", 2);
         let rel = cgroup_relative_path(&h).expect("relative path");
         assert_eq!(rel, "system.slice/sanctuary-agent-foo.service");
     }

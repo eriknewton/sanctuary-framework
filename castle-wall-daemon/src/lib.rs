@@ -23,6 +23,7 @@ pub mod cgroup;
 pub mod config;
 pub mod daemon;
 pub mod failure;
+pub(crate) mod identity;
 pub mod ipc;
 pub mod manifest;
 pub mod nfqueue;
@@ -30,7 +31,9 @@ pub mod nftables;
 pub mod policy;
 
 pub use config::DaemonConfig;
-pub use daemon::{boot, AttemptError, DaemonError, DaemonExitReport, DaemonHandle, EvaluationOutcome};
+pub use daemon::{
+    boot, AttemptError, DaemonError, DaemonExitReport, DaemonHandle, EvaluationOutcome,
+};
 pub use ipc::framing::{frame, parse_frame, ParseStep};
 pub use ipc::messages::{IpcMessage, MessageEnvelope};
 pub use manifest::verify::verify_manifest_signature;
