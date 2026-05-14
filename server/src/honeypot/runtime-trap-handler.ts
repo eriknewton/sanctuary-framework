@@ -63,6 +63,7 @@ import {
   hashOfEnglishDraft,
   type CompileResult,
 } from "./honeypot-compiler.js";
+import { validateTrapSpec } from "./trap-spec-validation.js";
 import { TrapRegistry } from "./trap-registry.js";
 import type { TrapStore } from "./trap-store.js";
 import type { ToolCallTrapRuntime } from "./tool-call-trap-runtime.js";
@@ -370,6 +371,15 @@ export async function handleHoneypotRoute(
           : null;
       if (!spec || typeof spec.trap_id !== "string" || spec.trap_id.length === 0) {
         writeJSON(res, 400, { ok: false, error: "spec.trap_id required" });
+        return true;
+      }
+      const validation = validateTrapSpec(spec);
+      if (!validation.ok) {
+        writeJSON(res, 400, {
+          ok: false,
+          error: "invalid_trap_spec",
+          details: validation.errors,
+        });
         return true;
       }
       const isNew = deps.registry.deploy(spec);

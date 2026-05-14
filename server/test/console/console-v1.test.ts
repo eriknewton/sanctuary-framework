@@ -470,6 +470,32 @@ describe("AC11: Auth gate enforced on every /api/console/* route", () => {
     expect(() => enforceAuth(config, mockReq, url)).toThrow(AuthGateError);
   });
 
+  it("enforceAuth fails closed for non-loopback when no dashboard token is configured", () => {
+    const config: AuthConfig = {
+      loopbackAutoAuth: true,
+    };
+    const mockReq = {
+      socket: { remoteAddress: "192.168.1.100" },
+      headers: {},
+    } as unknown as IncomingMessage;
+    const url = new URL("http://localhost/api/console/fortress/mode");
+
+    expect(() => enforceAuth(config, mockReq, url)).toThrow(AuthGateError);
+  });
+
+  it("enforceAuth still permits loopback auto-auth when no dashboard token is configured", () => {
+    const config: AuthConfig = {
+      loopbackAutoAuth: true,
+    };
+    const mockReq = {
+      socket: { remoteAddress: "127.0.0.1" },
+      headers: {},
+    } as unknown as IncomingMessage;
+    const url = new URL("http://localhost/api/console/fortress/mode");
+
+    expect(enforceAuth(config, mockReq, url)).toBe(true);
+  });
+
   it("enforceAuth passes for non-loopback with valid token", () => {
     const config: AuthConfig = {
       loopbackAutoAuth: false,

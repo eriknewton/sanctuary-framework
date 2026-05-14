@@ -82,6 +82,28 @@ describe("policy-engine/commitment-boundary — four-condition rule", () => {
     expect(r.reason_code).toBe(GATE_REASON_CODES.COMMITMENT_BOUNDARY_NO_COUNTERPARTY);
   });
 
+  it("denies weak or broadcast-like counterparties", () => {
+    const f = buildFortress();
+    const policy = compileFixturePolicy({
+      agent_id: "a1",
+      fortress_id: f.master.public.fortress_id,
+      policy_version: 1,
+      source_english:
+        "Agent a1 may emit commitments of class research-findings.",
+    });
+    const ctx = ctxFor(f, policy);
+    for (const counterparty of ["*", "all", "broadcast", "a2,a3", "did:"]) {
+      const r = evaluateCommitmentBoundary(ctx, {
+        ...validReq,
+        counterparty,
+      });
+      expect(r.decision, counterparty).toBe("deny");
+      expect(r.reason_code, counterparty).toBe(
+        GATE_REASON_CODES.COMMITMENT_BOUNDARY_NO_COUNTERPARTY,
+      );
+    }
+  });
+
   it("denies when condition 3 fails (scope is not bounded)", () => {
     const f = buildFortress();
     const policy = compileFixturePolicy({
@@ -98,6 +120,32 @@ describe("policy-engine/commitment-boundary — four-condition rule", () => {
     });
     expect(r.decision).toBe("deny");
     expect(r.reason_code).toBe(GATE_REASON_CODES.COMMITMENT_BOUNDARY_UNBOUNDED_SCOPE);
+  });
+
+  it("denies blank bounded-scope fields after trimming", () => {
+    const f = buildFortress();
+    const policy = compileFixturePolicy({
+      agent_id: "a1",
+      fortress_id: f.master.public.fortress_id,
+      policy_version: 1,
+      source_english:
+        "Agent a1 may emit commitments of class research-findings.",
+    });
+    const ctx = ctxFor(f, policy);
+    for (const bounded_scope of [
+      { ...validReq.bounded_scope!, deliverable: " " },
+      { ...validReq.bounded_scope!, deadline_or_terminal: " " },
+      { ...validReq.bounded_scope!, budget_ref: " " },
+    ]) {
+      const r = evaluateCommitmentBoundary(ctx, {
+        ...validReq,
+        bounded_scope,
+      });
+      expect(r.decision).toBe("deny");
+      expect(r.reason_code).toBe(
+        GATE_REASON_CODES.COMMITMENT_BOUNDARY_UNBOUNDED_SCOPE,
+      );
+    }
   });
 
   it("denies when condition 4 fails (missing commitment class capability)", () => {

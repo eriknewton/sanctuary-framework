@@ -65,6 +65,7 @@ import {
   type TrapSpec,
   type TrapTrigger,
 } from "./types.js";
+import { validateTrapSpec } from "./trap-spec-validation.js";
 
 /** Surface the compile call rides on. */
 const COMPILE_SURFACE = "template-suggestion" as const;
@@ -213,6 +214,11 @@ export async function compileHoneypot(
     explanation_paragraph: explanation,
     compiled_at: now().toISOString(),
   };
+
+  const validation = validateTrapSpec(spec);
+  if (!validation.ok) {
+    warnings.push(`compiled TrapSpec failed validation: ${validation.errors.join("; ")}`);
+  }
 
   return { spec, source, warnings };
 }

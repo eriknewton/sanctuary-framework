@@ -494,8 +494,8 @@ describe("WP-V1.3-10 Upsilon-1 ApprovalAggregator HTTP routes", () => {
     expect(body.data.entries[0]?.status).toBe("pending");
   });
 
-  // 16. detail route returns request_payload
-  it("returns the entry plus the original request payload via GET /:id", async () => {
+  // 16. detail route returns request_payload through the audited accessor
+  it("returns the original request payload via GET /:id and emits payload-decrypted audit", async () => {
     const entry = await rig.aggregator.ingest({
       phase: "requested",
       operation: "state_export",
@@ -519,6 +519,12 @@ describe("WP-V1.3-10 Upsilon-1 ApprovalAggregator HTTP routes", () => {
     };
     expect(body.data.entry.aggregator_id).toBe(entry?.aggregator_id);
     expect(body.data.request_payload.path).toBe("/etc");
+
+    const audit = await rig.aggregator.getAuditTrail(entry!.aggregator_id, "operator_test");
+    const decrypted = audit.filter(
+      (event) => event.operation === APPROVAL_AGGREGATOR_AUDIT_OPS.PAYLOAD_DECRYPTED,
+    );
+    expect(decrypted.length).toBe(1);
   });
 
   // 17. POST /:id/approve route flips status

@@ -16,7 +16,7 @@
  *   GET    /api/approval-inbox/revision              (current revision int; Upsilon-4)
  *   GET    /api/approval-inbox/sync                  (delta since revision; Upsilon-4)
  *   GET    /api/approval-inbox/stream                (SSE stream of new entries)
- *   GET    /api/approval-inbox/:aggregator_id        (full detail incl. payload)
+ *   GET    /api/approval-inbox/:aggregator_id        (full detail incl. audited payload)
  *   GET    /api/approval-inbox/:aggregator_id/audit-trail  (Upsilon-3)
  *   GET    /api/approval-inbox/:aggregator_id/payload      (Upsilon-3)
  *   POST   /api/approval-inbox/:aggregator_id/approve
@@ -324,8 +324,10 @@ export async function handleApprovalInboxRoute(
         writeJSON(res, 404, { ok: false, error: "not_found" });
         return true;
       }
-      const payload = await deps.aggregator.getFullPayload(
+      const operatorId = deps.operatorId ?? APPROVAL_INBOX_OPERATOR_DEFAULT;
+      const payload = await deps.aggregator.getFullPayloadWithAudit(
         entryMatch.aggregatorId,
+        operatorId,
       );
       writeJSON(res, 200, { ok: true, data: { entry, request_payload: payload } });
       return true;

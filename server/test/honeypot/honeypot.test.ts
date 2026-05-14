@@ -380,6 +380,75 @@ describe("WP-V1.3-5 Pi-1 management routes", () => {
     }
   });
 
+  it("POST /api/honeypot/deploy rejects malformed TrapSpecs before registry mutation", async () => {
+    const cases: Array<{ name: string; spec: unknown }> = [
+      {
+        name: "malformed trigger",
+        spec: {
+          ...mkSpec(),
+          trigger: { kind: "http_endpoint", path_pattern: "", expected_caller_types: ["wrapped_agent"] },
+        },
+      },
+      {
+        name: "real-looking credential",
+        spec: {
+          ...mkSpec({ trap_id: "cred-real" }),
+          trap_class: "credential",
+          trigger: {
+            kind: "credential",
+            fake_credential_name: "github_pat",
+            fake_credential_type: "api_key",
+            fake_credential_value: "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ",
+            visibility: "all_wrapped_agents",
+            emission_paths: ["secret_broker"],
+          },
+        },
+      },
+      {
+        name: "invalid visibility",
+        spec: {
+          ...mkSpec({ trap_id: "tool-visibility" }),
+          trap_class: "tool_call",
+          trigger: {
+            kind: "tool_call",
+            fake_tool_name: "billing_token_reader",
+            fake_tool_description: "Read billing tokens.",
+            fake_tool_schema: { type: "object", properties: {} },
+            catalog_visibility: "specific_agents",
+            visible_to_agents: [],
+            fake_response: "TRAP_ONLY_FAKE_TOKEN",
+          },
+        },
+      },
+      {
+        name: "class mismatch",
+        spec: {
+          ...mkSpec({ trap_id: "mismatch" }),
+          trap_class: "filesystem",
+          trigger: { kind: "http_endpoint", path_pattern: "/admin", expected_caller_types: ["wrapped_agent"] },
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const rig = await makeRig();
+      const { base, close } = await makeServer(rig);
+      try {
+        const res = await fetch(`${base}${HONEYPOT_API_PREFIX}/deploy`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ spec: testCase.spec }),
+        });
+        expect(res.status, testCase.name).toBe(400);
+        const body = (await res.json()) as { error: string };
+        expect(body.error, testCase.name).toBe("invalid_trap_spec");
+        expect(rig.registry.list(), testCase.name).toEqual([]);
+      } finally {
+        await close();
+      }
+    }
+  });
+
   it("GET /api/honeypot/traps returns the deployed list", async () => {
     const rig = await makeRig();
     rig.registry.deploy(mkSpec());

@@ -206,6 +206,37 @@ describe("WP-V1.3-5 Pi-3 runtime catalog injection", () => {
 });
 
 describe("WP-V1.3-5 Pi-3 trap activation on invoke", () => {
+  it("does not return hidden fake responses to agents outside specific_agents visibility", async () => {
+    const rig = await makeRig();
+    rig.registry.deploy(
+      mkToolSpec({
+        trigger: {
+          kind: "tool_call",
+          fake_tool_name: "billing_token_reader",
+          fake_tool_description: "Read billing tokens.",
+          fake_tool_schema: { type: "object", properties: {} },
+          catalog_visibility: "specific_agents",
+          visible_to_agents: ["cline"],
+          fake_response: { token: "TRAP_ONLY_FAKE_TOKEN" },
+        },
+      }),
+    );
+
+    const hidden = await rig.runtime.invokeIfTrap(
+      "billing_token_reader",
+      {},
+      "agent:other",
+    );
+    expect(hidden.handled).toBe(false);
+
+    const visible = await rig.runtime.invokeIfTrap(
+      "billing_token_reader",
+      {},
+      "agent:cline",
+    );
+    expect(visible.handled).toBe(true);
+  });
+
   it("returns fake_response and emits sentinel finding", async () => {
     const rig = await makeRig();
     rig.registry.deploy(mkToolSpec());
