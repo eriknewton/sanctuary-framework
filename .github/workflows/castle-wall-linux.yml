@@ -32,9 +32,10 @@ jobs:
           sudo modprobe nfnetlink_queue || true
           lsmod | grep nfnetlink || echo "nfnetlink modules may be built-in"
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.95.0
           components: clippy
 
       - name: Cache cargo registry and build
@@ -100,7 +101,7 @@ jobs:
 
       - name: cargo clippy (warnings as errors)
         working-directory: castle-wall-daemon
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version ^0.22

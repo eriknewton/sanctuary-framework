@@ -48,7 +48,9 @@ messages.
 
 ## Local setup
 
-Requires Rust stable 1.74 or newer (Cargo.toml `rust-version`).
+Requires Rust stable 1.74 or newer (Cargo.toml `rust-version`). Local
+developer checks and CI use the pinned toolchain in `rust-toolchain.toml`
+so clippy diagnostics stay stable across Rust releases.
 
 Linux build dependencies:
 
@@ -62,6 +64,7 @@ Build and run unit tests on any platform:
 cd castle-wall-daemon
 cargo build
 cargo test
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 The Linux integration tests under `tests/` need root because they install
@@ -93,7 +96,7 @@ Two GitHub Actions workflows guard this crate.
 
 1. **`Castle Wall Linux Integration`** at
    `.github/workflows/castle-wall-linux.yml`. Runs `cargo check`,
-   `cargo clippy --all-targets -- -D warnings`, and the full
+   `cargo clippy --all-targets --all-features -- -D warnings`, and the full
    `cargo test --all-targets` suite (lib unittests plus integration) on
    `ubuntu-24.04` as root with `CAP_NET_ADMIN`. Fires on every PR to main
    and every push to main.
