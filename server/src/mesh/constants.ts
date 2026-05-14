@@ -73,7 +73,7 @@ export function isV01EventType(s: string): s is V01EventType {
 
 /**
  * Reserved event_type namespaces for v1.x. v0.1 emitters MUST NOT emit these.
- * v0.1 receivers verify signatures and then silently drop at dispatch.
+ * v0.1 receivers verify signatures and then reject before dispatch.
  *
  * Spec: §10.3, hard-gate walkthrough §2.3.
  *
@@ -97,7 +97,8 @@ export function isReservedEventType(s: string): boolean {
 
 /**
  * Reserved extension envelope keys for v1.x. v0.1 emitters MUST NOT populate these.
- * v0.1 receivers MUST ignore them (forward-compat).
+ * v0.1 receivers MUST reject them before undefined future semantics enter
+ * verified state. Non-reserved unknown keys remain forward-compatible.
  *
  * Spec: §10.1, hard-gate walkthrough §2.1.
  */
@@ -126,7 +127,8 @@ export function isReservedExtensionKey(
  * Bit 0: standard_fortress_node (v0.1 default, set on every v0.1 node).
  * Bit 1: audit_replica_eligible (v0.1 operator opt-in).
  * Bit 2: cold_storage_receipt_replica (v0.1 operator opt-in).
- * Bits 3-31: RESERVED for v1.x. v0.1 issuers MUST NOT set. v0.1 verifiers tolerate.
+ * Bits 3-31: RESERVED for v1.x. v0.1 issuers and event receivers MUST NOT set
+ * or accept them.
  *
  * Spec: §10.2, hard-gate walkthrough §2.2.
  */

@@ -23,9 +23,12 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
+import { sha256 } from "@noble/hashes/sha256";
 import { generateKeypair } from "../../src/core/identity.js";
-import { stringToBytes } from "../../src/core/encoding.js";
+import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { randomBytes } from "../../src/core/random.js";
+import { canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
 import {
   CAP_STANDARD_FORTRESS_NODE,
   DEFAULTS,
@@ -33,6 +36,7 @@ import {
 } from "../../src/mesh/constants.js";
 import {
   generateFortressMaster,
+  issueNodeIdentityCertificate,
   issuePrincipalCertificate,
 } from "../../src/mesh/trust-root.js";
 import { InMemoryTransport } from "../../src/mesh/in-memory-transport.js";
@@ -131,6 +135,38 @@ async function bootstrapFirstNode(opts: {
     })
   );
   return result;
+}
+
+function signHostileHeartbeat(params: {
+  event_type: string;
+  emitter_node: string;
+  emitter_principal: string;
+  fortress_id: string;
+  monotonic_seq: number;
+  extension_envelope?: Record<string, unknown>;
+  node_private_key: Uint8Array;
+}): SignedEvent {
+  const payload = { node_state: "active" };
+  const body = {
+    protocol_version: "0.1",
+    event_type: params.event_type,
+    event_id: toBase64url(randomBytes(16)),
+    emitter_node: params.emitter_node,
+    emitter_principal: params.emitter_principal,
+    fortress_id: params.fortress_id,
+    causal_parents: [] as string[],
+    payload,
+    payload_hash: toBase64url(sha256(canonicalizeToBytes(payload))),
+    emitted_at: "2026-05-14T00:00:00.000Z",
+    monotonic_seq: params.monotonic_seq,
+    extension_envelope: params.extension_envelope ?? {},
+  };
+  return {
+    ...body,
+    node_signature: toBase64url(
+      ed25519.sign(canonicalizeToBytes(body), params.node_private_key)
+    ),
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -548,6 +584,49 @@ describe("lifecycle/mesh-node — bootstrap → join → revoke", () => {
     expect(snap.is_canonical_audit).toBe(true);
     expect(snap.cert_present).toBe(true);
     expect(snap.roster_size).toBe(1); // self
+  });
+
+  it("audits and drops a reserved-namespace event received from a valid peer", async () => {
+    const first = await bootstrapFirstNode({ transport: hub });
+    const peerKeypair = generateKeypair();
+    const peerCert = issueNodeIdentityCertificate({
+      node_id: "hostile-peer",
+      node_pubkey: peerKeypair.publicKey,
+      node_mode: "local",
+      fortress_id: first.bootstrap.master_public.fortress_id,
+      capabilities: CAP_STANDARD_FORTRESS_NODE,
+      parent_chain: {
+        fortress_master_pubkey: first.bootstrap.master_public.public_key,
+        principal_id: first.bootstrap.root_principal_certificate.principal_id,
+        principal_pubkey:
+          first.bootstrap.root_principal_certificate.principal_pubkey,
+      },
+      principal_private_key: first.bootstrap.root_principal_private_key,
+    });
+    first.node.getRoster().add(peerCert);
+
+    const rejected: Error[] = [];
+    first.node.onEnvelopeRejected = ({ error }) => rejected.push(error);
+    const hostileTransport = hub.attach("hostile-peer");
+    const beforeAuditEntries = first.node.snapshot().pending_audit_entries;
+    const beforeReceived = first.node.getReceivedLog().length;
+    await hostileTransport.broadcast(
+      signHostileHeartbeat({
+        event_type: "cross_fortress_read_query",
+        emitter_node: peerCert.node_id,
+        emitter_principal: "system",
+        fortress_id: first.bootstrap.master_public.fortress_id,
+        monotonic_seq: 1,
+        node_private_key: peerKeypair.privateKey,
+      })
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(first.node.getReceivedLog()).toHaveLength(beforeReceived);
+    expect(first.node.snapshot().pending_audit_entries).toBe(
+      beforeAuditEntries + 1
+    );
+    expect(rejected[0]?.name).toBe("MeshReservedEventTypeError");
   });
 
   it("completes the bootstrap → join handshake and admits a second node", async () => {

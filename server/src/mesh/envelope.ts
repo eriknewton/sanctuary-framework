@@ -7,8 +7,10 @@
  * Hard-gate invariants enforced here:
  * - Reserved extension_envelope keys (§10.1) rejected at pack time.
  * - Reserved event_type namespaces (§10.3) rejected at pack time.
+ * - Reserved extension_envelope keys (§10.1) rejected at verify time.
+ * - Reserved event_type namespaces (§10.3) rejected at verify time.
+ * - Reserved capability bits (§10.2) rejected at verify time.
  * - Unknown extension_envelope keys IGNORED at verify time (forward-compat).
- * - Unknown event_types IGNORED at dispatch time (forward-compat at router layer).
  * - Signatures cover extension_envelope bit-for-bit so v1.x-authored events
  *   with extension content verify on v0.1 receivers.
  *
@@ -23,9 +25,11 @@ import { canonicalizeToBytes } from "./canonical-json.js";
 import {
   isReservedEventType,
   isReservedExtensionKey,
+  hasReservedCapabilityBits,
   PROTOCOL_VERSION,
 } from "./constants.js";
 import {
+  MeshReservedCapabilityBitError,
   MeshReservedEventTypeError,
   MeshReservedExtensionKeyError,
   MeshSignatureError,
@@ -155,10 +159,9 @@ export interface VerifyResult {
 /**
  * Verify a v0.1 SignedEvent against the pinned trust root.
  *
- * Throws MeshSignatureError on any failure. Forward-compat:
- * - Unknown extension_envelope keys are recorded and returned, not rejected.
- * - Unknown event_types (reserved-namespace) are allowed through signature
- *   validation — the router layer drops them at dispatch.
+ * Throws a named MeshEnvelopeError / MeshCertificateError subclass on failure.
+ * Unknown extension_envelope keys that are not in the reserved set pass through
+ * silently; reserved namespaces and capability bits are receive-side hard gates.
  */
 export function verifySignedEvent(
   evt: SignedEvent,
@@ -195,6 +198,9 @@ export function verifySignedEvent(
     throw new MeshSignatureError(
       `emitter_node ${evt.emitter_node} is not in local roster`
     );
+  }
+  if (hasReservedCapabilityBits(nodeCert.capabilities)) {
+    throw new MeshReservedCapabilityBitError(nodeCert.capabilities);
   }
   const principalCert = ctx.lookupPrincipalCert(evt.emitter_principal);
   if (
@@ -252,13 +258,17 @@ export function verifySignedEvent(
     }
   }
 
-  // Forward-compat: record (but do not reject) keys that ARE in the reserved
-  // set, allowing forward-compat consumers to detect them; keys not in the
-  // reserved set are silently passed through per spec §10.1.
+  if (isReservedEventType(evt.event_type)) {
+    throw new MeshReservedEventTypeError(evt.event_type);
+  }
+
+  // Forward-compat: keys not in the reserved set are silently passed through.
+  // Reserved keys are hard-gated on receive so future semantics never enter
+  // verified v0.1 state.
   const recognized_reserved_extension_keys: string[] = [];
   for (const key of Object.keys(evt.extension_envelope ?? {})) {
     if (isReservedExtensionKey(key)) {
-      recognized_reserved_extension_keys.push(key);
+      throw new MeshReservedExtensionKeyError(key);
     }
   }
 

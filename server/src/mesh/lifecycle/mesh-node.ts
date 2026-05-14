@@ -22,7 +22,12 @@ import {
   DEFAULTS,
   type NodeMode,
 } from "../constants.js";
-import { MeshError } from "../errors.js";
+import {
+  MeshError,
+  MeshReservedCapabilityBitError,
+  MeshReservedEventTypeError,
+  MeshReservedExtensionKeyError,
+} from "../errors.js";
 import { packSignedEvent } from "../envelope.js";
 import { verifySignedEvent } from "../envelope.js";
 import { receiveAuditBatch, type MeshTransport } from "../in-memory-transport.js";
@@ -1230,6 +1235,11 @@ export class MeshNode {
     try {
       this.verifyOrThrow(evt);
     } catch (e) {
+      this.auditPeerProtocolViolation({
+        error: e instanceof Error ? e : new Error(String(e)),
+        event_type: evt.event_type,
+        emitter_node: evt.emitter_node,
+      });
       this.onEnvelopeRejected({
         error: e instanceof Error ? e : new Error(String(e)),
         event_type: evt.event_type,
@@ -1246,6 +1256,42 @@ export class MeshNode {
       at: Date.now(),
     });
     this.router.dispatch(evt);
+  }
+
+  private auditPeerProtocolViolation(info: {
+    error: Error;
+    event_type: string;
+    emitter_node?: string;
+  }): void {
+    if (
+      !(info.error instanceof MeshReservedEventTypeError) &&
+      !(info.error instanceof MeshReservedExtensionKeyError) &&
+      !(info.error instanceof MeshReservedCapabilityBitError)
+    ) {
+      return;
+    }
+    if (!this.nodePrivateKey) {
+      return;
+    }
+    const entry = sealAuditEntry({
+      emitter_node: this.config.node_id,
+      emitter_agent: "mesh",
+      emitter_principal: this.config.system_principal_id ?? "system",
+      policy_version: 0,
+      attestation_state: "peer_protocol_violation",
+      payload: {
+        operation: "peer_protocol_violation",
+        event_type: info.event_type,
+        peer_node: info.emitter_node,
+        error_name: info.error.name,
+        reason: info.error.message,
+      },
+      node_private_key: this.nodePrivateKey,
+    });
+    if (this.oldestPendingEntryAt === null) {
+      this.oldestPendingEntryAt = Date.now();
+    }
+    this.auditBuffer.push(entry);
   }
 
   private async handleIncomingUnicast(message: string): Promise<void> {

@@ -8,9 +8,7 @@
  * v1.x consumer can detect them), not keys that are unknown.
  *
  * If a future refactor reverts the name or repurposes the field to "keys not
- * in the reserved set," this test fails loudly. The structural-behavior leg
- * (same envelope produces the same recognized-reserved set as before the
- * rename) is the load-bearing guard.
+ * in the reserved set," this test fails loudly.
  */
 
 import { describe, it, expect, beforeAll } from "vitest";
@@ -21,6 +19,9 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { sha256 } from "@noble/hashes/sha256";
 import { canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
 import { CAP_STANDARD_FORTRESS_NODE } from "../../src/mesh/constants.js";
+import {
+  MeshReservedExtensionKeyError,
+} from "../../src/mesh/errors.js";
 import {
   packSignedEvent,
   verifySignedEvent,
@@ -105,7 +106,7 @@ describe("mesh/envelope extension-keys field naming (full-sweep #66)", () => {
     expect(res.recognized_reserved_extension_keys).toEqual([]);
   });
 
-  it("collects RESERVED extension keys (not non-reserved ones) so v1.x consumers can detect forward-compat payloads", () => {
+  it("rejects RESERVED extension keys instead of treating them as non-reserved unknown keys", () => {
     const v1xPayload = { node_state: "active" };
     const v1xBody = {
       protocol_version: "0.1",
@@ -129,11 +130,8 @@ describe("mesh/envelope extension-keys field naming (full-sweep #66)", () => {
       ...v1xBody,
       node_signature: toBase64url(sig),
     };
-    const res = verifySignedEvent(v1xEvt, contextFor(f));
-    expect(res.ok).toBe(true);
-    // The field is non-empty exactly when a reserved key rides the envelope.
-    // Inverted semantics (collecting non-reserved keys) would put the wrong
-    // value here.
-    expect(res.recognized_reserved_extension_keys).toEqual(["cross_fortress_read_query"]);
+    expect(() => verifySignedEvent(v1xEvt, contextFor(f))).toThrow(
+      MeshReservedExtensionKeyError
+    );
   });
 });
