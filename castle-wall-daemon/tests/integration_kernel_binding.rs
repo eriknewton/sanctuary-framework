@@ -359,6 +359,104 @@ fn nftables_load_agent_ruleset_idempotent_under_reload() {
     cleanup_castle_table();
 }
 
+#[test]
+fn nftables_scope_recreation_refresh_fails_closed_then_restores_queue() {
+    cleanup_castle_table();
+    nftables::install_castle_table().expect("install");
+
+    let agent_id = "refresh-test";
+    let first_scope = cgroup::create_agent_scope(agent_id).expect("create first scope");
+    let first_relative = cgroup::cgroup_relative_path(&first_scope).expect("first relative");
+    let id = AgentRulesetId {
+        agent_id: agent_id.to_string(),
+        cgroup_path: first_scope.cgroup_path.clone(),
+    };
+    let frags = vec![NftRuleFragment {
+        rule_id: "r-refresh".to_string(),
+        nft_expr: "tcp dport 443 accept".to_string(),
+    }];
+    let first_script = nftables::build_agent_ruleset(
+        agent_id,
+        &first_relative,
+        first_scope.cgroup_level,
+        &frags,
+    );
+    nftables::load_agent_ruleset(
+        &id,
+        &first_script,
+        first_scope.cgroup_level,
+        &first_relative,
+    )
+    .expect("load first ruleset");
+
+    cgroup::destroy_agent_scope(&first_scope).expect("destroy first scope");
+    let refreshed_scope = cgroup::create_agent_scope(agent_id).expect("create refreshed scope");
+    let refreshed_relative =
+        cgroup::cgroup_relative_path(&refreshed_scope).expect("refreshed relative");
+    let refreshed_id = AgentRulesetId {
+        agent_id: agent_id.to_string(),
+        cgroup_path: refreshed_scope.cgroup_path.clone(),
+    };
+
+    nftables::load_agent_fail_closed_ruleset(
+        &refreshed_id,
+        refreshed_scope.cgroup_level,
+        &refreshed_relative,
+    )
+    .expect("install fail-closed refreshed jump");
+    let fail_closed_chain =
+        nft_cmd(&["list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "agent_refresh-test"]);
+    assert!(
+        fail_closed_chain.contains("drop"),
+        "refresh stage must fail closed before restoring policy: {fail_closed_chain}"
+    );
+    assert!(
+        !fail_closed_chain.contains("queue"),
+        "fail-closed stage must not queue unmatched traffic: {fail_closed_chain}"
+    );
+
+    let refreshed_script = nftables::build_agent_ruleset(
+        agent_id,
+        &refreshed_relative,
+        refreshed_scope.cgroup_level,
+        &frags,
+    );
+    nftables::load_agent_ruleset(
+        &refreshed_id,
+        &refreshed_script,
+        refreshed_scope.cgroup_level,
+        &refreshed_relative,
+    )
+    .expect("restore refreshed ruleset");
+    let output_listing =
+        nft_cmd(&["-a", "list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "output"]);
+    assert_eq!(
+        output_listing.matches("goto agent_refresh-test").count(),
+        1,
+        "refresh must leave exactly one jump for the agent: {output_listing}"
+    );
+    assert!(
+        output_listing.contains(&refreshed_relative),
+        "jump must point at refreshed cgroup path: {output_listing}"
+    );
+    if first_scope.cgroup_id != refreshed_scope.cgroup_id {
+        assert!(
+            !output_listing.contains(&first_relative),
+            "stale cgroup jump must be removed after refresh: {output_listing}"
+        );
+    }
+    let restored_chain =
+        nft_cmd(&["list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "agent_refresh-test"]);
+    assert!(
+        restored_chain.contains("queue to 0"),
+        "normal policy must be restored after fail-closed stage: {restored_chain}"
+    );
+
+    nftables::remove_agent_ruleset(&refreshed_id).expect("remove refreshed ruleset");
+    let _ = cgroup::destroy_agent_scope(&refreshed_scope);
+    cleanup_castle_table();
+}
+
 // ---- cgroup tests ---------------------------------------------------------
 
 #[test]
