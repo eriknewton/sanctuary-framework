@@ -13,6 +13,8 @@
 //! loop) is the next-checkpoint scope; this module is the in-process
 //! decision engine those bindings drive.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::constants::{AUDIT_LAYER, SCHEMA_VERSION_V1};
@@ -56,12 +58,7 @@ impl RuleMatch {
     ///   case where dest is a raw IP).
     /// - `port`: exact match against any entry. Absent = "any port."
     /// - `protocol`: case-insensitive exact match. Absent = "any protocol."
-    pub fn matches(
-        &self,
-        dest_host: Option<&str>,
-        dest_port: u16,
-        dest_protocol: &str,
-    ) -> bool {
+    pub fn matches(&self, dest_host: Option<&str>, dest_port: u16, dest_protocol: &str) -> bool {
         if !self.matches_host(dest_host) {
             return false;
         }
@@ -101,10 +98,7 @@ impl RuleMatch {
 
         if exact_present {
             if let Some(hosts) = self.host.as_ref() {
-                if hosts
-                    .iter()
-                    .any(|h| h.to_ascii_lowercase() == host_lower)
-                {
+                if hosts.iter().any(|h| h.to_ascii_lowercase() == host_lower) {
                     return true;
                 }
             }
@@ -156,12 +150,7 @@ impl RuleScope {
         if scoped_by_agent && self.agent_ids.iter().any(|id| id == agent_id) {
             return true;
         }
-        if scoped_by_template
-            && self
-                .template_ids
-                .iter()
-                .any(|tpl| tpl == agent_template)
-        {
+        if scoped_by_template && self.template_ids.iter().any(|tpl| tpl == agent_template) {
             return true;
         }
         false
@@ -250,7 +239,10 @@ pub enum PolicySnapshotError {
     #[error("rule file {file} not present in loaded manifest's rule_files")]
     RuleFileMissing { file: String },
     #[error("rule file {file} could not be parsed as JSON: {source_message}")]
-    RuleParse { file: String, source_message: String },
+    RuleParse {
+        file: String,
+        source_message: String,
+    },
     #[error(
         "rule file {file} declares rule_id {file_rule_id} but the manifest entry binds it to {manifest_rule_id}"
     )]
@@ -265,6 +257,15 @@ pub enum PolicySnapshotError {
         found: u32,
         expected: u32,
     },
+    #[error(
+        "agent ids {left_agent_id} and {right_agent_id} collide for {resource_kind} identity {resource_name}"
+    )]
+    AgentIdentityCollision {
+        resource_kind: &'static str,
+        resource_name: String,
+        left_agent_id: String,
+        right_agent_id: String,
+    },
 }
 
 impl PolicySnapshot {
@@ -276,12 +277,11 @@ impl PolicySnapshot {
     pub fn from_loaded_manifest(loaded: &LoadedManifest) -> Result<Self, PolicySnapshotError> {
         let mut rules = Vec::with_capacity(loaded.signed.manifest.rules.len());
         for entry in &loaded.signed.manifest.rules {
-            let bytes = loaded
-                .rule_files
-                .get(&entry.file)
-                .ok_or_else(|| PolicySnapshotError::RuleFileMissing {
+            let bytes = loaded.rule_files.get(&entry.file).ok_or_else(|| {
+                PolicySnapshotError::RuleFileMissing {
                     file: entry.file.clone(),
-                })?;
+                }
+            })?;
             let rule: AllowlistRule =
                 serde_json::from_slice(bytes).map_err(|err| PolicySnapshotError::RuleParse {
                     file: entry.file.clone(),
@@ -303,6 +303,7 @@ impl PolicySnapshot {
             }
             rules.push(rule);
         }
+        validate_agent_identity_collisions(&rules)?;
         Ok(Self {
             rules,
             manifest_signature_b64url: Some(loaded.manifest_signature_b64url.clone()),
@@ -348,6 +349,52 @@ impl PolicySnapshot {
             reason: DeniedReason::DefaultDeny,
         }
     }
+}
+
+fn validate_agent_identity_collisions(rules: &[AllowlistRule]) -> Result<(), PolicySnapshotError> {
+    let mut agent_ids = HashSet::new();
+    for rule in rules {
+        for agent_id in &rule.scope.agent_ids {
+            agent_ids.insert(agent_id.as_str());
+        }
+    }
+
+    let mut systemd_units: HashMap<String, &str> = HashMap::new();
+    let mut nft_chains: HashMap<String, &str> = HashMap::new();
+    for agent_id in agent_ids {
+        reject_identity_collision(
+            &mut systemd_units,
+            "systemd unit",
+            crate::cgroup::scope_unit_name(agent_id),
+            agent_id,
+        )?;
+        reject_identity_collision(
+            &mut nft_chains,
+            "nft chain",
+            crate::nftables::agent_chain_name(agent_id),
+            agent_id,
+        )?;
+    }
+    Ok(())
+}
+
+fn reject_identity_collision<'a>(
+    seen: &mut HashMap<String, &'a str>,
+    resource_kind: &'static str,
+    resource_name: String,
+    agent_id: &'a str,
+) -> Result<(), PolicySnapshotError> {
+    if let Some(existing) = seen.insert(resource_name.clone(), agent_id) {
+        if existing != agent_id {
+            return Err(PolicySnapshotError::AgentIdentityCollision {
+                resource_kind,
+                resource_name,
+                left_agent_id: existing.to_string(),
+                right_agent_id: agent_id.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Operation tag that maps to the existing Sanctuary `AuditEntry.operation`
@@ -438,10 +485,7 @@ pub fn build_audit_event_canonical_json(
         );
     }
     if let Some(ip) = request.dest_ip.as_ref() {
-        details.insert(
-            "dest_ip".to_string(),
-            serde_json::Value::String(ip.clone()),
-        );
+        details.insert("dest_ip".to_string(), serde_json::Value::String(ip.clone()));
     }
     details.insert(
         "dest_port".to_string(),
@@ -487,10 +531,7 @@ pub fn build_audit_event_canonical_json(
         "result".to_string(),
         serde_json::Value::String(result_for_verdict(verdict).to_string()),
     );
-    entry.insert(
-        "details".to_string(),
-        serde_json::Value::Object(details),
-    );
+    entry.insert("details".to_string(), serde_json::Value::Object(details));
 
     canonicalize(&serde_json::Value::Object(entry))
 }
@@ -942,6 +983,46 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_accepts_agent_ids_that_used_to_sanitize_collide() {
+        let r1 = rule(
+            "uuid-slash",
+            RuleMatch {
+                host: None,
+                host_pattern: None,
+                port: Some(vec![443]),
+                protocol: Some("tcp".to_string()),
+            },
+            RuleScope {
+                agent_ids: vec!["agent/a".to_string()],
+                template_ids: Vec::new(),
+            },
+            RuleDisposition::Allow,
+        );
+        let r2 = rule(
+            "uuid-underscore",
+            RuleMatch {
+                host: None,
+                host_pattern: None,
+                port: Some(vec![8443]),
+                protocol: Some("tcp".to_string()),
+            },
+            RuleScope {
+                agent_ids: vec!["agent_a".to_string()],
+                template_ids: Vec::new(),
+            },
+            RuleDisposition::Deny,
+        );
+        let loaded = synthetic_loaded(vec![
+            ("rule-0.json".to_string(), r1.clone()),
+            ("rule-1.json".to_string(), r2.clone()),
+        ]);
+
+        let snap = PolicySnapshot::from_loaded_manifest(&loaded).expect("snapshot");
+
+        assert_eq!(snap.rules, vec![r1, r2]);
+    }
+
+    #[test]
     fn snapshot_rejects_rule_id_mismatch() {
         let r = rule(
             "uuid-real",
@@ -1065,8 +1146,7 @@ mod tests {
             rule_id: "r1".to_string(),
         };
         let request = req(Some("api.anthropic.com"), 443, "tcp");
-        let body =
-            build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
+        let body = build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
         let parsed = parse_canonical(&body);
         assert_eq!(parsed["layer"], json!("l1"));
         assert_eq!(parsed["operation"], json!("egress_approved"));
@@ -1079,8 +1159,26 @@ mod tests {
         assert_eq!(parsed["details"]["agent_id"], json!("agent-1"));
         assert_eq!(parsed["details"]["agent_template"], json!("claude-code"));
         assert_eq!(parsed["details"]["rule_id_matched"], json!("r1"));
-        assert_eq!(parsed["details"]["decision_provenance"], json!("static_rule"));
+        assert_eq!(
+            parsed["details"]["decision_provenance"],
+            json!("static_rule")
+        );
         assert_eq!(parsed["details"]["opaque"], json!(false));
+    }
+
+    #[test]
+    fn audit_preserves_raw_agent_id_for_kernel_encoded_names() {
+        let v = Verdict::Deny {
+            reason: DeniedReason::DefaultDeny,
+        };
+        let mut request = req(Some("api.example.com"), 443, "tcp");
+        request.agent_id = "agent/a".to_string();
+
+        let body = build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
+        let parsed = parse_canonical(&body);
+
+        assert_eq!(parsed["identity_id"], json!("agent/a"));
+        assert_eq!(parsed["details"]["agent_id"], json!("agent/a"));
     }
 
     #[test]
@@ -1089,13 +1187,18 @@ mod tests {
             reason: DeniedReason::DefaultDeny,
         };
         let request = req(Some("api.evil.com"), 443, "tcp");
-        let body =
-            build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
+        let body = build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
         let parsed = parse_canonical(&body);
         assert_eq!(parsed["operation"], json!("egress_blocked"));
         assert_eq!(parsed["result"], json!("failure"));
-        assert_eq!(parsed["details"]["decision_provenance"], json!("default_deny"));
-        assert_eq!(parsed["details"]["rule_id_matched"], serde_json::Value::Null);
+        assert_eq!(
+            parsed["details"]["decision_provenance"],
+            json!("default_deny")
+        );
+        assert_eq!(
+            parsed["details"]["rule_id_matched"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -1106,11 +1209,13 @@ mod tests {
             },
         };
         let request = req(Some("pastebin.com"), 443, "tcp");
-        let body =
-            build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
+        let body = build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
         let parsed = parse_canonical(&body);
         assert_eq!(parsed["operation"], json!("egress_blocked"));
-        assert_eq!(parsed["details"]["decision_provenance"], json!("static_rule"));
+        assert_eq!(
+            parsed["details"]["decision_provenance"],
+            json!("static_rule")
+        );
         assert_eq!(parsed["details"]["rule_id_matched"], json!("r-deny"));
     }
 
@@ -1120,8 +1225,7 @@ mod tests {
             rule_id: "r-prompt".to_string(),
         };
         let request = req(Some("api.example.com"), 443, "tcp");
-        let body =
-            build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
+        let body = build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
         let parsed = parse_canonical(&body);
         assert_eq!(parsed["operation"], json!("egress_pending"));
         assert_eq!(parsed["result"], json!("success"));
@@ -1142,8 +1246,7 @@ mod tests {
             dest_protocol: "tcp".to_string(),
             opaque: true,
         };
-        let body =
-            build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
+        let body = build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
         let parsed = parse_canonical(&body);
         assert!(parsed["details"].get("dest_host").is_none());
         assert_eq!(parsed["details"]["dest_ip"], json!("203.0.113.10"));
@@ -1159,10 +1262,8 @@ mod tests {
             rule_id: "r1".to_string(),
         };
         let request = req(Some("api.anthropic.com"), 443, "tcp");
-        let a =
-            build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
-        let b =
-            build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
+        let a = build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
+        let b = build_audit_event_canonical_json(&v, &request, "2026-05-05T01:02:03Z").unwrap();
         assert_eq!(a, b);
         // Same shape under canonical-JSON byte serialization.
         let bytes_a = canonicalize_to_bytes(&serde_json::from_str(&a).unwrap()).unwrap();
