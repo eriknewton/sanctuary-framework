@@ -48,7 +48,7 @@ export async function openBroker(opts: OpenBrokerOptions = {}): Promise<{
   // 2. Resolve passphrase — same resolution the wrap CLI uses.
   let passphrase = opts.passphrase ?? process.env.SANCTUARY_PASSPHRASE;
   if (!passphrase) {
-    const resolved = await getOrCreatePassphrase();
+    const resolved = await getOrCreatePassphrase({ storagePath });
     passphrase = resolved.value;
   }
 
@@ -76,7 +76,7 @@ export async function openBroker(opts: OpenBrokerOptions = {}): Promise<{
   const auditLog = new AuditLog(storage, masterKey);
 
   // 5. Keychain backend (macOS only; throws BackendUnavailableError elsewhere).
-  const backend = opts.backend ?? new KeychainBackend();
+  const backend = opts.backend ?? new KeychainBackend({ storagePath });
   await backend.ensureInitialized(passphrase);
 
   // 6. Load broker grants from policy file if present.
