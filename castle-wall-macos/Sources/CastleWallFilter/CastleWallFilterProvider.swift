@@ -136,8 +136,9 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
     /// `FlowEvaluatorEngine.evaluate(_:)` directly.
     public override func handleNewFlow(_ flow: NEFilterFlow) -> NEFilterNewFlowVerdict {
         guard let descriptor = makeDescriptor(from: flow) else {
-            CastleWallLog.lifecycle.notice("flow shape unrecognized; passing without verdict")
-            return NEFilterNewFlowVerdict.allow()
+            return CastleWallFilterProvider.verdictForUnsupportedFlow(
+                flowType: String(describing: type(of: flow))
+            )
         }
         let outcome = engine.evaluate(descriptor)
         // Fire-and-forget IPC notification AFTER computing the verdict.
@@ -166,6 +167,30 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
         case .uncertain:
             return NEFilterNewFlowVerdict.pause()
         }
+    }
+
+    /// Unknown/future NetworkExtension flow subclasses must fail closed.
+    /// The diagnostic intentionally names only the framework flow type so
+    /// operators can debug compatibility without leaking destination data.
+    public static func verdictForUnsupportedFlow(
+        flowType: String
+    ) -> NEFilterNewFlowVerdict {
+        return verdictForUnsupportedFlow(
+            flowType: flowType,
+            emitDiagnostic: CastleWallFilterProvider.emitUnsupportedFlowDiagnostic
+        )
+    }
+
+    public static func verdictForUnsupportedFlow(
+        flowType: String,
+        emitDiagnostic: (String) -> Void
+    ) -> NEFilterNewFlowVerdict {
+        emitDiagnostic("unsupported flow shape denied: \(flowType)")
+        return NEFilterNewFlowVerdict.drop()
+    }
+
+    private static func emitUnsupportedFlowDiagnostic(_ message: String) {
+        CastleWallLog.lifecycle.notice("\(message)")
     }
 
     /// Extract the substrate the evaluator needs from the framework flow.
