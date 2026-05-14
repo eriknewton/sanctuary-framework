@@ -6,12 +6,56 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import type { ApprovalRequest, ApprovalResponse } from "../../src/principal-policy/types.js";
 import {
   bindWithRetry,
   randomTestPort,
 } from "../util/port-collision-retry.js";
+
+async function requestNoKeepAlive(
+  url: string,
+  options: { method?: string; headers?: Record<string, string> } = {},
+): Promise<{ status: number; headers: IncomingHttpHeaders; body: string }> {
+  const target = new URL(url);
+
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        hostname: target.hostname,
+        port: target.port,
+        path: `${target.pathname}${target.search}`,
+        method: options.method ?? "GET",
+        headers: {
+          ...options.headers,
+          Connection: "close",
+        },
+        agent: false,
+      },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          body += chunk;
+        });
+        res.on("end", () => {
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers,
+            body,
+          });
+        });
+      },
+    );
+
+    req.setTimeout(5000, () => {
+      req.destroy(new Error(`Timed out requesting ${target.href}`));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
 
 describe("Principal Dashboard", () => {
   let dashboard: DashboardApprovalChannel;
@@ -134,7 +178,7 @@ describe("Principal Dashboard", () => {
     });
 
     it("returns 404 for non-existent request ID", async () => {
-      const res = await fetch(
+      const res = await requestNoKeepAlive(
         `http://127.0.0.1:${port}/api/approve/nonexistent`,
         { method: "POST" }
       );
@@ -228,7 +272,7 @@ describe("Principal Dashboard", () => {
       const text = decoder.decode(value);
       expect(text).toContain("event: init");
 
-      reader.cancel();
+      await reader.cancel();
     });
 
     it("tracks connected clients", async () => {
@@ -242,7 +286,7 @@ describe("Principal Dashboard", () => {
       await new Promise((r) => setTimeout(r, 50));
       expect(dashboard.clientCount).toBe(1);
 
-      reader.cancel();
+      await reader.cancel();
     });
   });
 
@@ -271,7 +315,7 @@ describe("Principal Dashboard", () => {
       expect(text).toContain("event: audit-entry");
       expect(text).toContain("state_write");
 
-      reader.cancel();
+      await reader.cancel();
     });
   });
 
@@ -443,7 +487,7 @@ describe("Principal Dashboard", () => {
       const text = decoder.decode(value);
       expect(text).toContain("event: init");
 
-      reader.cancel();
+      await reader.cancel();
     });
   });
 
