@@ -78,6 +78,7 @@ pub fn build_agent_ruleset(
     rules: &[NftRuleFragment],
 ) -> String {
     let chain_name = agent_chain_name(agent_id);
+    let agent_mark = crate::nfqueue::register_agent_mark(agent_id);
     let mut script = String::new();
     // Atomic replace: flush the chain then re-add all rules.
     script.push_str(&format!(
@@ -96,7 +97,8 @@ pub fn build_agent_ruleset(
     // Per scope-lock section 1: `queue num 0` without `bypass` flag.
     script.push_str(&format!(
         "add rule {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name} \
-         socket cgroupv2 level {cgroup_level} \"{cgroup_relative_path}\" queue num 0\n"
+         socket cgroupv2 level {cgroup_level} \"{cgroup_relative_path}\" \
+         meta mark set 0x{agent_mark:08x} queue num 0\n"
     ));
     script
 }
@@ -725,6 +727,7 @@ mod tests {
         assert!(script.contains("flush chain"));
         assert!(script.contains("tcp dport 443 accept"));
         assert!(script.contains("queue num 0"));
+        assert!(script.contains("meta mark set"));
         // Path is quoted, comes after the level, no leading slash. Level 2
         // is the canonical depth for `/system.slice/<unit>`; nested
         // deployments pass higher values, hence the rule encoding the level.
@@ -752,6 +755,25 @@ mod tests {
         assert!(script
             .contains("level 3 \"system.slice/parent.service/sanctuary-agent-nested.service\""));
         assert!(!script.contains("level 2"));
+    }
+
+    #[test]
+    fn build_agent_ruleset_registers_mark_for_nfqueue_attribution() {
+        let script = build_agent_ruleset(
+            "attributed-agent",
+            "system.slice/sanctuary-agent-attributed-agent.service",
+            2,
+            &[],
+        );
+        let mark = crate::nfqueue::agent_mark("attributed-agent");
+        assert!(
+            script.contains(&format!("meta mark set 0x{mark:08x} queue num 0")),
+            "catchall must set a per-agent mark before NFQUEUE: {script}"
+        );
+        assert_eq!(
+            crate::nfqueue::resolve_agent_mark(mark),
+            Some("attributed-agent".to_string())
+        );
     }
 
     #[test]

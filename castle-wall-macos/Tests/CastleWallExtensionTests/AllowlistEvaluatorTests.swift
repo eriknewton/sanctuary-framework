@@ -122,12 +122,40 @@ final class AllowlistEvaluatorTests: XCTestCase {
         )
     }
 
+    func testHostPatternRequiresDotBoundary() {
+        let r = rule(hostPattern: "*.anthropic.com", disposition: "allow")
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: "evil-anthropic.com"), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+    }
+
     func testHostPatternRejectsBareSuffixMatch() {
         // `*.anthropic.com` should match `foo.anthropic.com` but NOT
         // `anthropic.com` itself.
         let r = rule(hostPattern: "*.anthropic.com", disposition: "allow")
         XCTAssertEqual(
             AllowlistEvaluator.evaluate(flow: flow(host: "anthropic.com"), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+    }
+
+    func testExactHostOrHostPatternMatchWhenBothPresent() {
+        let r = rule(
+            host: .single("api.anthropic.com"),
+            hostPattern: "*.anthropic.com",
+            disposition: "allow"
+        )
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: "api.anthropic.com"), rules: [r]),
+            .allow(matchedRuleId: "r-1")
+        )
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: "console.anthropic.com"), rules: [r]),
+            .allow(matchedRuleId: "r-1")
+        )
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: "evil-anthropic.com"), rules: [r]),
             .drop(matchedRuleId: nil)
         )
     }

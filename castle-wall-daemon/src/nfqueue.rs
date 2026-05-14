@@ -13,8 +13,10 @@
 //! All kernel-touching code is `#[cfg(target_os = "linux")]`-gated.
 //! The nfq crate dependency is Linux-only in Cargo.toml.
 
+use std::collections::HashMap;
+use std::net::Ipv6Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// Errors emitted by the nfqueue module.
@@ -92,7 +94,13 @@ impl std::fmt::Debug for QueueHandle {
 pub struct PendingPacket {
     /// Kernel-assigned packet id for verdict reply.
     pub packet_id: u32,
-    /// Source cgroup id (from the socket's owning cgroup).
+    /// Packet mark set by the per-agent nftables chain before queueing.
+    pub nfmark: u32,
+    /// Wrapped agent identity resolved from the packet mark.
+    pub source_agent_id: Option<String>,
+    /// Legacy numeric attribution field. Linux NFQUEUE does not expose the
+    /// socket cgroup id through this binding, so Phase 1 stores `nfmark`
+    /// here for callers that still log the numeric source field.
     pub source_cgroup_id: u64,
     /// Destination IP address (IPv4 or IPv6 string).
     pub dest_ip: Option<String>,
@@ -116,8 +124,54 @@ pub enum NfVerdict {
 
 /// Verdict callback type. The NFQUEUE loop calls this for each packet,
 /// receives a verdict, and applies it to the kernel queue.
-pub type VerdictCallback =
-    Box<dyn Fn(&PendingPacket) -> NfVerdict + Send + Sync + 'static>;
+pub type VerdictCallback = Box<dyn Fn(&PendingPacket) -> NfVerdict + Send + Sync + 'static>;
+
+static AGENT_MARK_REGISTRY: OnceLock<Mutex<HashMap<u32, Option<String>>>> = OnceLock::new();
+
+fn agent_mark_registry() -> &'static Mutex<HashMap<u32, Option<String>>> {
+    AGENT_MARK_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Deterministic nonzero mark used to carry the agent chain identity through
+/// NFQUEUE. A registry collision is treated as unverifiable attribution.
+pub fn agent_mark(agent_id: &str) -> u32 {
+    let mut hash: u32 = 0x811c9dc5;
+    for byte in agent_id.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
+/// Register the mark emitted by nftables for an agent. If two raw agent IDs
+/// ever collide on the same 32-bit mark, the mark becomes intentionally
+/// unresolvable and the NFQUEUE callback fails closed.
+pub fn register_agent_mark(agent_id: &str) -> u32 {
+    let mark = agent_mark(agent_id);
+    if let Ok(mut guard) = agent_mark_registry().lock() {
+        match guard.get(&mark) {
+            Some(Some(existing)) if existing != agent_id => {
+                guard.insert(mark, None);
+            }
+            Some(None) => {}
+            _ => {
+                guard.insert(mark, Some(agent_id.to_string()));
+            }
+        }
+    }
+    mark
+}
+
+pub fn resolve_agent_mark(mark: u32) -> Option<String> {
+    agent_mark_registry()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&mark).cloned().flatten())
+}
 
 /// Parse an IPv4 header to extract destination IP, port, and protocol.
 /// Public so integration tests can verify the parsing independently.
@@ -127,8 +181,10 @@ pub fn parse_ip_header(payload: &[u8]) -> (Option<String>, u16, u8) {
     }
 
     let version = (payload[0] >> 4) & 0x0F;
+    if version == 6 {
+        return parse_ipv6_header(payload);
+    }
     if version != 4 {
-        // IPv6 handling deferred to Checkpoint 4; return raw info.
         return (None, 0, 0);
     }
 
@@ -147,6 +203,66 @@ pub fn parse_ip_header(payload: &[u8]) -> (Option<String>, u16, u8) {
     };
 
     (Some(dest_ip), dest_port, protocol)
+}
+
+fn parse_ipv6_header(payload: &[u8]) -> (Option<String>, u16, u8) {
+    if payload.len() < 40 {
+        return (None, 0, 0);
+    }
+
+    let dest_ip = Ipv6Addr::from([
+        payload[24],
+        payload[25],
+        payload[26],
+        payload[27],
+        payload[28],
+        payload[29],
+        payload[30],
+        payload[31],
+        payload[32],
+        payload[33],
+        payload[34],
+        payload[35],
+        payload[36],
+        payload[37],
+        payload[38],
+        payload[39],
+    ])
+    .to_string();
+
+    let mut next_header = payload[6];
+    let mut offset = 40usize;
+    loop {
+        match next_header {
+            0 | 43 | 60 => {
+                if payload.len() < offset + 2 {
+                    return (Some(dest_ip), 0, next_header);
+                }
+                let header_len = (usize::from(payload[offset + 1]) + 1) * 8;
+                next_header = payload[offset];
+                offset = offset.saturating_add(header_len);
+                if payload.len() < offset {
+                    return (Some(dest_ip), 0, next_header);
+                }
+            }
+            44 => {
+                if payload.len() < offset + 8 {
+                    return (Some(dest_ip), 0, next_header);
+                }
+                next_header = payload[offset];
+                offset += 8;
+            }
+            _ => break,
+        }
+    }
+
+    let dest_port = if payload.len() >= offset + 4 && (next_header == 6 || next_header == 17) {
+        u16::from_be_bytes([payload[offset + 2], payload[offset + 3]])
+    } else {
+        0
+    };
+
+    (Some(dest_ip), dest_port, next_header)
 }
 
 // ---- Linux NFQUEUE implementation -----------------------------------------
@@ -188,8 +304,8 @@ pub fn run_verdict_loop_impl(
 ) -> Result<(), NfqueueError> {
     use nfq::Queue;
 
-    let mut queue = Queue::open()
-        .map_err(|e| NfqueueError::BindFailed(format!("Queue::open: {e}")))?;
+    let mut queue =
+        Queue::open().map_err(|e| NfqueueError::BindFailed(format!("Queue::open: {e}")))?;
 
     queue
         .bind(config.queue_number)
@@ -226,9 +342,12 @@ pub fn run_verdict_loop_impl(
         let payload = msg.get_payload();
         let (dest_ip, dest_port, protocol) = parse_ip_header(payload);
 
+        let nfmark = msg.get_nfmark();
         let pending = PendingPacket {
-            packet_id: msg.get_nfmark(),
-            source_cgroup_id: 0,
+            packet_id: nfmark,
+            nfmark,
+            source_agent_id: resolve_agent_mark(nfmark),
+            source_cgroup_id: u64::from(nfmark),
             dest_ip,
             dest_port,
             protocol,
@@ -291,10 +410,12 @@ pub fn run_verdict_loop(
 /// 2. Calls evaluate_attempt on the shared DaemonHandle.
 /// 3. Maps Verdict::Allow -> NfVerdict::Accept, all else -> NfVerdict::Drop.
 /// 4. The audit event is emitted inside evaluate_attempt (WAL + ring buffer).
-pub fn build_verdict_callback(
-    daemon_handle: Arc<crate::daemon::DaemonHandle>,
-) -> VerdictCallback {
+pub fn build_verdict_callback(daemon_handle: Arc<crate::daemon::DaemonHandle>) -> VerdictCallback {
     Box::new(move |packet: &PendingPacket| {
+        let Some(agent_id) = packet.source_agent_id.clone() else {
+            return NfVerdict::Drop;
+        };
+
         let protocol_str = match packet.protocol {
             6 => "tcp".to_string(),
             17 => "udp".to_string(),
@@ -302,7 +423,7 @@ pub fn build_verdict_callback(
         };
 
         let request = crate::policy::EvaluationRequest {
-            agent_id: format!("cgroup-{}", packet.source_cgroup_id),
+            agent_id,
             agent_template: "unknown".to_string(),
             dest_host: None,
             dest_ip: packet.dest_ip.clone(),
@@ -329,7 +450,10 @@ mod tests {
     #[test]
     fn default_config_has_fail_open_off() {
         let cfg = NfqueueConfig::default();
-        assert!(!cfg.fail_open, "FAIL_OPEN must be false per scope-lock section 7 E7.1");
+        assert!(
+            !cfg.fail_open,
+            "FAIL_OPEN must be false per scope-lock section 7 E7.1"
+        );
     }
 
     #[test]
@@ -358,8 +482,12 @@ mod tests {
         let mut pkt = vec![0u8; 24];
         pkt[0] = 0x45; // version=4, ihl=5 (20 bytes)
         pkt[9] = 6; // protocol = TCP
-        pkt[16] = 10; pkt[17] = 0; pkt[18] = 0; pkt[19] = 1; // dest IP 10.0.0.1
-        pkt[22] = 0x01; pkt[23] = 0xBB; // dest port 443
+        pkt[16] = 10;
+        pkt[17] = 0;
+        pkt[18] = 0;
+        pkt[19] = 1; // dest IP 10.0.0.1
+        pkt[22] = 0x01;
+        pkt[23] = 0xBB; // dest port 443
         let (ip, port, proto) = parse_ip_header(&pkt);
         assert_eq!(ip, Some("10.0.0.1".to_string()));
         assert_eq!(port, 443);
@@ -371,8 +499,12 @@ mod tests {
         let mut pkt = vec![0u8; 28];
         pkt[0] = 0x45;
         pkt[9] = 17; // UDP
-        pkt[16] = 8; pkt[17] = 8; pkt[18] = 8; pkt[19] = 8; // 8.8.8.8
-        pkt[22] = 0x00; pkt[23] = 0x35; // port 53
+        pkt[16] = 8;
+        pkt[17] = 8;
+        pkt[18] = 8;
+        pkt[19] = 8; // 8.8.8.8
+        pkt[22] = 0x00;
+        pkt[23] = 0x35; // port 53
         let (ip, port, proto) = parse_ip_header(&pkt);
         assert_eq!(ip, Some("8.8.8.8".to_string()));
         assert_eq!(port, 53);
@@ -389,11 +521,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_ip_header_ipv6_returns_none() {
-        let mut pkt = vec![0u8; 40];
+    fn parse_ip_header_ipv6_tcp_dest() {
+        let mut pkt = vec![0u8; 60];
         pkt[0] = 0x60; // version=6
-        let (ip, _port, _proto) = parse_ip_header(&pkt);
-        assert_eq!(ip, None);
+        pkt[6] = 6; // TCP
+        pkt[39] = 1; // ::1
+        pkt[42] = 0x01;
+        pkt[43] = 0xBB;
+        let (ip, port, proto) = parse_ip_header(&pkt);
+        assert_eq!(ip, Some("::1".to_string()));
+        assert_eq!(port, 443);
+        assert_eq!(proto, 6);
+    }
+
+    #[test]
+    fn parse_ip_header_ipv6_udp_dest() {
+        let mut pkt = vec![0u8; 48];
+        pkt[0] = 0x60;
+        pkt[6] = 17; // UDP
+        pkt[24] = 0x20;
+        pkt[25] = 0x01;
+        pkt[26] = 0x0d;
+        pkt[27] = 0xb8;
+        pkt[39] = 0x42;
+        pkt[42] = 0x00;
+        pkt[43] = 0x35;
+        let (ip, port, proto) = parse_ip_header(&pkt);
+        assert_eq!(ip, Some("2001:db8::42".to_string()));
+        assert_eq!(port, 53);
+        assert_eq!(proto, 17);
+    }
+
+    #[test]
+    fn agent_mark_registry_resolves_registered_agent() {
+        let mark = register_agent_mark("agent-attribution-test");
+        assert_eq!(
+            resolve_agent_mark(mark),
+            Some("agent-attribution-test".to_string())
+        );
+        assert_ne!(mark, 0);
     }
 
     #[cfg(target_os = "linux")]

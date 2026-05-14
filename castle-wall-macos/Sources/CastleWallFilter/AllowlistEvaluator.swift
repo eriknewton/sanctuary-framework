@@ -95,12 +95,19 @@ public enum AllowlistEvaluator {
             return false
         }
 
-        if let host = match.host, !hostMatches(spec: host, flow: flow) {
-            return false
-        }
-
-        if let pattern = match.hostPattern, !hostPatternMatches(pattern: pattern, flow: flow) {
-            return false
+        let hasExactHost = match.host != nil
+        let hasHostPattern = match.hostPattern?.isEmpty == false
+        if hasExactHost || hasHostPattern {
+            var hostAxisMatches = false
+            if let host = match.host, hostMatches(spec: host, flow: flow) {
+                hostAxisMatches = true
+            }
+            if let pattern = match.hostPattern, hostPatternMatches(pattern: pattern, flow: flow) {
+                hostAxisMatches = true
+            }
+            if !hostAxisMatches {
+                return false
+            }
         }
 
         return true
@@ -136,8 +143,10 @@ public enum AllowlistEvaluator {
             if suffix.isEmpty {
                 return false
             }
-            return host.lowercased().hasSuffix(suffix.lowercased())
-                && host.lowercased() != suffix.lowercased()
+            let hostLower = host.lowercased()
+            let suffixLower = suffix.lowercased()
+            return hostLower.hasSuffix("." + suffixLower)
+                && hostLower != suffixLower
         }
         return host.caseInsensitiveCompare(pattern) == .orderedSame
     }
