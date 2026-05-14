@@ -33,6 +33,7 @@ import type { SignedEvent } from "../../mesh/types.js";
 import type {
   AgentCard,
   AgentCardCapability,
+  AgentIdentityBinding,
   HarnessEnvelope,
   LifecycleEvent,
   UsageEvent,
@@ -98,6 +99,8 @@ export interface TierBAdapterParams {
   attestation_endpoint: string;
   /** Shared agent key store — adapter unwraps agent seed through this. */
   key_store: AgentKeyStore;
+  /** Binding record produced by bindAgentIdentity for this agent. */
+  agent_identity_binding: AgentIdentityBinding;
   /** Fortress-master secret — needed to unwrap the agent seed transiently. */
   fortress_master_secret: Uint8Array;
   /** Node signing context for envelope emission. */
@@ -226,6 +229,24 @@ export abstract class TierBAdapter {
       fortress_master_secret: this.params.fortress_master_secret,
       store: this.params.key_store,
     });
+    const storePubkey = toBase64url(pub);
+    if (this.params.agent_identity_binding.agent_id !== this.params.agent_id) {
+      throw new TierBInvariantError(
+        `Tier B adapter ${this.harnessId} identity binding is for agent ${this.params.agent_identity_binding.agent_id}, expected ${this.params.agent_id}`
+      );
+    }
+    if (
+      this.params.agent_identity_binding.fortress_id !== this.params.fortress_id
+    ) {
+      throw new TierBInvariantError(
+        `Tier B adapter ${this.harnessId} identity binding fortress ${this.params.agent_identity_binding.fortress_id} does not match ${this.params.fortress_id}`
+      );
+    }
+    if (this.params.agent_identity_binding.agent_pubkey !== storePubkey) {
+      throw new TierBInvariantError(
+        `Tier B adapter ${this.harnessId} identity binding public key does not match key store for agent ${this.params.agent_id}`
+      );
+    }
     const issue: IssueAgentCardParams = {
       agent_id: this.params.agent_id,
       fortress_id: this.params.fortress_id,
@@ -233,7 +254,7 @@ export abstract class TierBAdapter {
       harness_id: this.harnessId,
       model_provider: this.params.model_provider,
       model_id: this.params.model_id,
-      agent_pubkey: toBase64url(pub),
+      agent_identity_binding: this.params.agent_identity_binding,
       capabilities: this.params.capabilities,
       policy_version: this.params.policy_version,
       policy_blob_bytes: this.params.policy_blob_bytes,

@@ -802,6 +802,93 @@ describe("lifecycle/mesh-node — bootstrap → join → revoke", () => {
     expect(result.denial_reason).toBe("policy-violation");
   });
 
+  it("rejects join when bootstrap token intended_node_mode does not match the request", async () => {
+    const first = await bootstrapFirstNode({ transport: hub });
+    const joiningNode = new MeshNode(
+      {
+        node_id: "node-mode-escalation",
+        node_mode: "operator_cloud",
+        fortress_id: first.bootstrap.master_public.fortress_id,
+        pinned_master_pubkey: first.bootstrap.master_public,
+      },
+      {
+        transport: hub.attach("node-mode-escalation"),
+        approver: createAutoApproveJoinApprover({
+          pinned_master_pubkey: first.bootstrap.master_public,
+          issuing_principal_cert: first.bootstrap.root_principal_certificate,
+          issuing_principal_private_key:
+            first.bootstrap.root_principal_private_key,
+        }),
+        key_store: new InMemoryNodeKeyStore(),
+        fortress_master_secret: first.bootstrap.master_private_key,
+      }
+    );
+    joiningNode.registerPrincipal(first.bootstrap.root_principal_certificate);
+
+    const localOnlyToken = first.node.issueBootstrapToken({
+      intended_node_id: "node-mode-escalation",
+      intended_node_mode: "local",
+      issuing_principal: first.bootstrap.root_principal_certificate.principal_id,
+      principal_private_key: first.bootstrap.root_principal_private_key,
+    });
+    const request = await joiningNode.prepareJoinRequest({
+      bootstrap_token: localOnlyToken,
+    });
+    const result = await first.node.acceptJoinRequest(request);
+    expect(result.approved).toBe(false);
+    expect(result.denial_reason).toContain("intended_node_mode local");
+  });
+
+  it("rejects replayed or non-monotonic policy events from the same emitter", async () => {
+    const first = await bootstrapFirstNode({ transport: hub });
+    const peerKeypair = generateKeypair();
+    const peerCert = issueNodeIdentityCertificate({
+      node_id: "policy-peer",
+      node_pubkey: peerKeypair.publicKey,
+      node_mode: "local",
+      fortress_id: first.bootstrap.master_public.fortress_id,
+      capabilities: CAP_STANDARD_FORTRESS_NODE,
+      parent_chain: {
+        fortress_master_pubkey: first.bootstrap.master_public.public_key,
+        principal_id: first.bootstrap.root_principal_certificate.principal_id,
+        principal_pubkey:
+          first.bootstrap.root_principal_certificate.principal_pubkey,
+      },
+      principal_private_key: first.bootstrap.root_principal_private_key,
+    });
+    first.node.getRoster().add(peerCert);
+    first.node.registerPrincipal(first.bootstrap.root_principal_certificate);
+    const peerTransport = hub.attach("policy-peer");
+    const rejected: Error[] = [];
+    first.node.onEnvelopeRejected = ({ error }) => rejected.push(error);
+
+    const eventAt = (policyVersion: number, seq: number) =>
+      packSignedEvent({
+        event_type: "policy_update",
+        emitter_node: peerCert.node_id,
+        emitter_principal:
+          first.bootstrap.root_principal_certificate.principal_id,
+        fortress_id: first.bootstrap.master_public.fortress_id,
+        payload: {
+          agent_id: "agent-replay",
+          policy_version: policyVersion,
+          policy_blob: "policy-" + policyVersion,
+        },
+        monotonic_seq: seq,
+        node_private_key: peerKeypair.privateKey,
+        principal_private_key: first.bootstrap.root_principal_private_key,
+      });
+
+    await peerTransport.broadcast(eventAt(1, 5));
+    await new Promise((r) => setTimeout(r, 0));
+    const afterFirst = first.node.getReceivedLog().length;
+    await peerTransport.broadcast(eventAt(2, 5));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(first.node.getReceivedLog()).toHaveLength(afterFirst);
+    expect(rejected[0]?.name).toBe("MeshRollbackDetectedError");
+  });
+
   it("revoke marks a peer revoked and rejects subsequent envelopes from that peer", async () => {
     const first = await bootstrapFirstNode({ transport: hub });
 

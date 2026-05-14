@@ -61,7 +61,7 @@ async function buildHermesAdapterParams(
 ) {
   const f = buildTestFortress();
   const store = new InMemoryAgentKeyStore();
-  await bindAgentIdentity({
+  const binding = await bindAgentIdentity({
     agent_id: "agent-hermes",
     fortress_id: f.master.public.fortress_id,
     fortress_master_secret: f.fortressMasterSecret,
@@ -84,6 +84,7 @@ async function buildHermesAdapterParams(
     policy_blob_bytes: buildPolicyBlobBytes(1),
     attestation_endpoint: "http://127.0.0.1:3501/att",
     key_store: store,
+    agent_identity_binding: binding,
     fortress_master_secret: f.fortressMasterSecret,
     emitter_node: f.nodeCert.node_id,
     emitter_principal: f.principalCert.principal_id,

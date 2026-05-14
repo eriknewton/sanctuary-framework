@@ -83,17 +83,18 @@ export function packSignedEvent<Payload>(
 
   const payloadBytes = canonicalizeToBytes(params.payload);
   const payload_hash = toBase64url(sha256(payloadBytes));
+  const emitted_at = new Date().toISOString();
   const body: Omit<SignedEvent<Payload>, "node_signature" | "principal_signature"> = {
     protocol_version: PROTOCOL_VERSION,
     event_type: params.event_type,
-    event_id: generateEventId(),
+    event_id: generateEventId(params.emitter_node, emitted_at),
     emitter_node: params.emitter_node,
     emitter_principal: params.emitter_principal,
     fortress_id: params.fortress_id,
     causal_parents: params.causal_parents ?? [],
     payload: params.payload,
     payload_hash,
-    emitted_at: new Date().toISOString(),
+    emitted_at,
     monotonic_seq: params.monotonic_seq,
     extension_envelope: ext,
   };
@@ -110,11 +111,61 @@ export function packSignedEvent<Payload>(
   return evt;
 }
 
-function generateEventId(): string {
-  const bytes = randomBytes(16);
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  return hex;
+const ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const lastUlidByEmitter = new Map<string, { timestampMs: number; random: Uint8Array }>();
+
+function generateEventId(emitterNode: string, emittedAt: string): string {
+  const parsedMs = Date.parse(emittedAt);
+  const nowMs = Number.isFinite(parsedMs) ? parsedMs : Date.now();
+  const previous = lastUlidByEmitter.get(emitterNode);
+  const timestampMs =
+    previous && nowMs <= previous.timestampMs ? previous.timestampMs : nowMs;
+  const entropy =
+    previous && timestampMs === previous.timestampMs
+      ? incrementUlidRandom(previous.random)
+      : randomBytes(10);
+  lastUlidByEmitter.set(emitterNode, {
+    timestampMs,
+    random: new Uint8Array(entropy),
+  });
+  return encodeUlid(timestampMs, entropy);
+}
+
+function incrementUlidRandom(previous: Uint8Array): Uint8Array {
+  const next = new Uint8Array(previous);
+  for (let i = next.length - 1; i >= 0; i--) {
+    next[i] = (next[i] + 1) & 0xff;
+    if (next[i] !== 0) return next;
+  }
+  throw new Error("ULID random component exhausted for emitter in one millisecond");
+}
+
+function encodeUlid(timestampMs: number, random: Uint8Array): string {
+  if (timestampMs < 0 || timestampMs > 0xffffffffffff) {
+    throw new Error(`ULID timestamp out of range: ${timestampMs}`);
+  }
+  let time = Math.floor(timestampMs);
+  const chars = new Array<string>(26);
+  for (let i = 9; i >= 0; i--) {
+    chars[i] = ULID_ALPHABET[time & 31];
+    time = Math.floor(time / 32);
+  }
+
+  let bitBuffer = 0;
+  let bitCount = 0;
+  let out = 10;
+  for (const byte of random) {
+    bitBuffer = (bitBuffer << 8) | byte;
+    bitCount += 8;
+    while (bitCount >= 5) {
+      bitCount -= 5;
+      chars[out++] = ULID_ALPHABET[(bitBuffer >> bitCount) & 31];
+    }
+  }
+  if (bitCount > 0) {
+    chars[out++] = ULID_ALPHABET[(bitBuffer << (5 - bitCount)) & 31];
+  }
+  return chars.join("");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
