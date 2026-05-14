@@ -53,6 +53,17 @@ export const BROKER_OPS = {
 
 export type BrokerOp = (typeof BROKER_OPS)[keyof typeof BROKER_OPS];
 
+export class AuditLogPersistenceError extends Error {
+  constructor(readonly failures: readonly unknown[]) {
+    const message =
+      failures.length === 1
+        ? failureMessage(failures[0])
+        : `${failures.length} audit persistence writes failed`;
+    super(message);
+    this.name = "AuditLogPersistenceError";
+  }
+}
+
 export class AuditLog {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
@@ -75,12 +86,13 @@ export class AuditLog {
    *
    * The on-disk persist is async and tracked via `pendingWrites`. Long-lived
    * callers (the main MCP server) can ignore that tracking and let writes
-   * drain naturally. Short-lived callers — the `sanctuary secrets` CLI which
-   * `process.exit()`s immediately after returning from a broker mutation —
-   * MUST await `flush()` before exiting, or in-flight writes get killed
-   * with the event loop and the entry is silently lost. That was the
-   * v0.10.0-rc.2 soak failure mode where `secrets audit` returned empty
-   * after a clean 7-verb lifecycle.
+   * drain naturally. Callers whose correctness depends on durability may
+   * either await the returned write promise or call `flush()`. Short-lived
+   * callers — the `sanctuary secrets` CLI which `process.exit()`s immediately
+   * after returning from a broker mutation — MUST await `flush()` before
+   * exiting, or in-flight writes get killed with the event loop and the entry
+   * is silently lost. That was the v0.10.0-rc.2 soak failure mode where
+   * `secrets audit` returned empty after a clean 7-verb lifecycle.
    */
   append(
     layer: AuditEntry["layer"],
@@ -88,7 +100,7 @@ export class AuditLog {
     identityId: string,
     details?: Record<string, unknown>,
     result: "success" | "failure" = "success"
-  ): void {
+  ): Promise<void> {
     const entry: AuditEntry = {
       timestamp: new Date().toISOString(),
       layer,
@@ -100,24 +112,33 @@ export class AuditLog {
 
     this.entries.push(entry);
 
-    const writePromise = this.persistEntry(entry).catch(() => {
-      // Persistence failure is non-fatal at the call site; flush() callers
-      // see a settled promise either way.
-    });
+    const writePromise = this.persistEntry(entry);
     this.pendingWrites.add(writePromise);
-    void writePromise.finally(() => this.pendingWrites.delete(writePromise));
+    void writePromise.then(
+      () => this.pendingWrites.delete(writePromise),
+      () => this.pendingWrites.delete(writePromise)
+    );
+    return writePromise;
   }
 
   /**
    * Wait for every in-flight `append()` persist (and its rotation pass) to
-   * settle. Safe to call multiple times — newly-appended entries during a
+   * settle. Rejects with `AuditLogPersistenceError` if any tracked persist
+   * failed. Safe to call multiple times — newly-appended entries during a
    * flush are also awaited. Re-entrant only at the granularity of "drain
    * everything queued so far". Short-lived CLIs MUST call this before
    * `process.exit()` to keep audit writes durable.
    */
   async flush(): Promise<void> {
+    const failures: unknown[] = [];
     while (this.pendingWrites.size > 0) {
-      await Promise.allSettled([...this.pendingWrites]);
+      const results = await Promise.allSettled([...this.pendingWrites]);
+      for (const result of results) {
+        if (result.status === "rejected") failures.push(result.reason);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AuditLogPersistenceError(failures);
     }
   }
 
@@ -256,4 +277,11 @@ export class AuditLog {
   get size(): number {
     return this.entries.length;
   }
+}
+
+function failureMessage(failure: unknown): string {
+  if (failure instanceof Error && failure.message.length > 0) {
+    return `audit persistence write failed: ${failure.message}`;
+  }
+  return `audit persistence write failed: ${String(failure)}`;
 }
