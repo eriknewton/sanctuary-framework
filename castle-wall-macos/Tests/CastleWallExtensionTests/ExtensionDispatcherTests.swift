@@ -28,6 +28,7 @@
 //
 
 import XCTest
+import CryptoKit
 @testable import CastleWallFilter
 import CastleWallIPC
 
@@ -81,51 +82,50 @@ final class ExtensionDispatcherTests: XCTestCase {
     /// Build an IPC client that points at a non-existent UDS path. Tests
     /// drive `handleInbound` and `notifyVerdict` directly without
     /// starting the client; the path is never opened.
-    func makeFloatingClient() -> IPCClient {
+    func makeFloatingClient(pinnedPublicKey: Data = Data(repeating: 0, count: 32)) -> IPCClient {
         let opts = IPCClientOptions(
             path: "/tmp/castle-wall-test-no-such-socket.sock"
         )
         return IPCClient(
             options: opts,
-            pinnedPublicKey: Data(repeating: 0, count: 32)
+            pinnedPublicKey: pinnedPublicKey
         )
     }
 
     // MARK: - Inbound: manifest_updated applies snapshot + clears cache
 
-    func test_handleInbound_manifestUpdated_appliesToEngineStore() {
+    func test_handleInbound_manifestUpdated_appliesToEngineStore() throws {
         let engine = FlowEvaluatorEngine()
+        let rule = makeRule(id: "r-1", host: "api.anthropic.com", port: 443, disposition: "allow")
+        let signed = try makeSignedManifestUpdatedBody(rules: [rule])
         let dispatcher = ExtensionDispatcher(
             engine: engine,
-            ipcClient: makeFloatingClient()
+            ipcClient: makeFloatingClient(pinnedPublicKey: signed.publicKey)
         )
 
         XCTAssertFalse(engine.manifestStore.hasSnapshot)
 
-        let rule = makeRule(id: "r-1", host: "api.anthropic.com", port: 443, disposition: "allow")
-        let body = ManifestUpdatedBody(
-            manifestSignatureB64url: "sig-1",
-            rules: [rule]
-        )
-        dispatcher.handleInbound(.manifestUpdated(body))
+        dispatcher.handleInbound(.manifestUpdated(signed.body))
 
         XCTAssertTrue(engine.manifestStore.hasSnapshot)
         XCTAssertEqual(engine.manifestStore.currentRules().count, 1)
         XCTAssertEqual(engine.manifestStore.currentRules().first?.id, "r-1")
     }
 
-    func test_handleInbound_manifestUpdated_clearsFlowCacheOnReplace() {
+    func test_handleInbound_manifestUpdated_clearsFlowCacheOnReplace() throws {
         let engine = FlowEvaluatorEngine()
+        let allowRule = makeRule(id: "r-allow", host: "api.anthropic.com", port: 443, disposition: "allow")
+        let denyRule = makeRule(id: "r-deny", host: "api.anthropic.com", port: 443, disposition: "deny")
+        let key = Curve25519.Signing.PrivateKey()
+        let signedAllow = try makeSignedManifestUpdatedBody(rules: [allowRule], privateKey: key)
+        let signedDeny = try makeSignedManifestUpdatedBody(rules: [denyRule], privateKey: key)
         let dispatcher = ExtensionDispatcher(
             engine: engine,
-            ipcClient: makeFloatingClient()
+            ipcClient: makeFloatingClient(pinnedPublicKey: signedAllow.publicKey)
         )
 
         // Seed snapshot A and evaluate to populate the cache.
-        let allowRule = makeRule(id: "r-allow", host: "api.anthropic.com", port: 443, disposition: "allow")
-        dispatcher.handleInbound(.manifestUpdated(
-            ManifestUpdatedBody(manifestSignatureB64url: "sig-A", rules: [allowRule])
-        ))
+        dispatcher.handleInbound(.manifestUpdated(signedAllow.body))
         let flow = makeFlow()
         let outcomeA = engine.evaluate(flow)
         XCTAssertEqual(outcomeA, .allow(matchedRuleId: "r-allow"))
@@ -133,10 +133,7 @@ final class ExtensionDispatcherTests: XCTestCase {
 
         // Replace with snapshot B (deny). Cache MUST be cleared so the
         // next evaluate consults the new rules, not the cached allow.
-        let denyRule = makeRule(id: "r-deny", host: "api.anthropic.com", port: 443, disposition: "deny")
-        dispatcher.handleInbound(.manifestUpdated(
-            ManifestUpdatedBody(manifestSignatureB64url: "sig-B", rules: [denyRule])
-        ))
+        dispatcher.handleInbound(.manifestUpdated(signedDeny.body))
         XCTAssertEqual(engine.flowCache.count, 0, "cache must clear on manifest replace")
         let outcomeB = engine.evaluate(flow)
         XCTAssertEqual(outcomeB, .drop(matchedRuleId: "r-deny"))
@@ -144,12 +141,8 @@ final class ExtensionDispatcherTests: XCTestCase {
 
     // MARK: - Hot-reload latency invariant
 
-    func test_handleInbound_manifestUpdated_hotReload_under_100ms() {
+    func test_handleInbound_manifestUpdated_hotReload_under_100ms() throws {
         let engine = FlowEvaluatorEngine()
-        let dispatcher = ExtensionDispatcher(
-            engine: engine,
-            ipcClient: makeFloatingClient()
-        )
 
         // Build a manifest with 1000 rules to exercise a non-trivial
         // load. 100ms is loose enough to be deterministic across CI
@@ -162,14 +155,14 @@ final class ExtensionDispatcherTests: XCTestCase {
                 disposition: "allow"
             )
         }
-
-        let body = ManifestUpdatedBody(
-            manifestSignatureB64url: "sig-bulk",
-            rules: rules
+        let signed = try makeSignedManifestUpdatedBody(rules: rules)
+        let dispatcher = ExtensionDispatcher(
+            engine: engine,
+            ipcClient: makeFloatingClient(pinnedPublicKey: signed.publicKey)
         )
 
         let start = DispatchTime.now()
-        dispatcher.handleInbound(.manifestUpdated(body))
+        dispatcher.handleInbound(.manifestUpdated(signed.body))
         let elapsedNs = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
         let elapsedMs = Double(elapsedNs) / 1_000_000.0
 
@@ -192,17 +185,16 @@ final class ExtensionDispatcherTests: XCTestCase {
         )
     }
 
-    func test_failClosed_emptyRulesSnapshot_answersDrop() {
+    func test_failClosed_emptyRulesSnapshot_answersDrop() throws {
         let engine = FlowEvaluatorEngine()
+        let signed = try makeSignedManifestUpdatedBody(rules: [])
         let dispatcher = ExtensionDispatcher(
             engine: engine,
-            ipcClient: makeFloatingClient()
+            ipcClient: makeFloatingClient(pinnedPublicKey: signed.publicKey)
         )
         // Apply an explicit EMPTY manifest. The engine still answers
         // .drop because no allow rule matches.
-        dispatcher.handleInbound(.manifestUpdated(
-            ManifestUpdatedBody(manifestSignatureB64url: nil, rules: [])
-        ))
+        dispatcher.handleInbound(.manifestUpdated(signed.body))
         let outcome = engine.evaluate(makeFlow())
         XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
     }

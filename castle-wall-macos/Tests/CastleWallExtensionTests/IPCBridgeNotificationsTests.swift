@@ -42,7 +42,8 @@ final class IPCBridgeNotificationsTests: XCTestCase {
             disposition: "allow",
             timeWindow: nil
         )
-        let body = ManifestUpdatedBody(manifestSignatureB64url: "sigA", rules: [rule])
+        let signed = try makeSignedManifestUpdatedBody(rules: [rule])
+        let body = signed.body
         let original = IpcMessage.manifestUpdated(body)
         let encoded = try JSONEncoder().encode(original)
         let decoded = try JSONDecoder().decode(IpcMessage.self, from: encoded)
@@ -50,7 +51,7 @@ final class IPCBridgeNotificationsTests: XCTestCase {
 
         let json = String(data: encoded, encoding: .utf8) ?? ""
         XCTAssertTrue(json.contains("\"type\":\"manifest_updated\""))
-        XCTAssertTrue(json.contains("\"manifest_signature_b64url\":\"sigA\""))
+        XCTAssertTrue(json.contains("\"signature_b64url\""))
         XCTAssertTrue(json.contains("\"rule-1\""))
     }
 
@@ -217,7 +218,7 @@ final class IPCBridgeNotificationsTests: XCTestCase {
 
     // MARK: - applyManifestUpdated wiring
 
-    func testApplyManifestUpdatedWritesStoreAndClearsCache() {
+    func testApplyManifestUpdatedWritesStoreAndClearsCache() throws {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)
         cache.put(
@@ -246,18 +247,133 @@ final class IPCBridgeNotificationsTests: XCTestCase {
             disposition: "allow",
             timeWindow: nil
         )
-        let body = ManifestUpdatedBody(manifestSignatureB64url: "sigB", rules: [rule])
+        let signed = try makeSignedManifestUpdatedBody(rules: [rule])
         let snapshot = IPCBridgeNotifications.applyManifestUpdated(
-            message: .manifestUpdated(body),
+            message: .manifestUpdated(signed.body),
             store: store,
-            cache: cache
+            cache: cache,
+            pinnedPublicKey: signed.publicKey
         )
 
         XCTAssertNotNil(snapshot)
-        XCTAssertEqual(snapshot?.signatureB64url, "sigB")
+        XCTAssertEqual(snapshot?.signatureB64url, signed.body.manifestSignatureB64url)
         XCTAssertEqual(snapshot?.rules.count, 1)
-        XCTAssertEqual(store.currentSnapshot()?.signatureB64url, "sigB")
+        XCTAssertEqual(store.currentSnapshot()?.signatureB64url, signed.body.manifestSignatureB64url)
         XCTAssertEqual(cache.count, 0)
+    }
+
+    func testApplyManifestUpdatedRejectsInvalidSignatureAndKeepsPriorSnapshot() throws {
+        let store = ManifestStore()
+        let cache = FlowCache(capacity: 8)
+        let rule = ManifestRule(
+            id: "r-valid",
+            schemaVersion: 1,
+            createdAt: "2026-05-11T00:00:00Z",
+            description: nil,
+            match: ManifestRuleMatch(
+                host: .single("api.anthropic.com"),
+                hostPattern: nil,
+                port: .single(443),
+                protocolName: "tcp"
+            ),
+            scope: ManifestRuleScope(agentIds: nil, templateIds: nil),
+            disposition: "allow",
+            timeWindow: nil
+        )
+        let signed = try makeSignedManifestUpdatedBody(rules: [rule])
+        XCTAssertNotNil(IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(signed.body),
+            store: store,
+            cache: cache,
+            pinnedPublicKey: signed.publicKey
+        ))
+
+        let badSignature = ManifestSignatureEnvelope(
+            signatureScheme: CastleWallConstants.signatureSchemeV1,
+            signingKeyId: "test-key",
+            signatureB64url: Base64URL.encode(Data(repeating: 1, count: 64))
+        )
+        let tampered = ManifestUpdatedBody(
+            manifest: signed.body.manifest!,
+            signature: badSignature,
+            rules: []
+        )
+        let rejected = IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(tampered),
+            store: store,
+            cache: cache,
+            pinnedPublicKey: signed.publicKey
+        )
+        XCTAssertNil(rejected)
+        XCTAssertEqual(store.currentRules().map(\.id), ["r-valid"])
+    }
+
+    func testRecoverPersistedManifestRestoresLastValidSnapshot() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathComponent("last-valid-manifest.json")
+        let store = ManifestStore(lastValidManifestURL: url)
+        let cache = FlowCache(capacity: 8)
+        let rule = ManifestRule(
+            id: "r-persisted",
+            schemaVersion: 1,
+            createdAt: "2026-05-11T00:00:00Z",
+            description: nil,
+            match: ManifestRuleMatch(
+                host: .single("api.anthropic.com"),
+                hostPattern: nil,
+                port: .single(443),
+                protocolName: "tcp"
+            ),
+            scope: ManifestRuleScope(agentIds: nil, templateIds: nil),
+            disposition: "allow",
+            timeWindow: nil
+        )
+        let signed = try makeSignedManifestUpdatedBody(rules: [rule])
+        XCTAssertNotNil(IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(signed.body),
+            store: store,
+            cache: cache,
+            pinnedPublicKey: signed.publicKey
+        ))
+
+        let restartedStore = ManifestStore(lastValidManifestURL: url)
+        let recovered = IPCBridgeNotifications.recoverPersistedManifest(
+            store: restartedStore,
+            cache: FlowCache(capacity: 8),
+            pinnedPublicKey: signed.publicKey
+        )
+        XCTAssertNotNil(recovered)
+        XCTAssertEqual(restartedStore.currentRules().map(\.id), ["r-persisted"])
+    }
+
+    func testApplyManifestUpdatedRejectsSchemaVersionDrift() throws {
+        let store = ManifestStore()
+        let cache = FlowCache(capacity: 8)
+        let rule = ManifestRule(
+            id: "r-drift",
+            schemaVersion: 1,
+            createdAt: "2026-05-11T00:00:00Z",
+            description: nil,
+            match: ManifestRuleMatch(
+                host: .single("api.anthropic.com"),
+                hostPattern: nil,
+                port: .single(443),
+                protocolName: "tcp"
+            ),
+            scope: ManifestRuleScope(agentIds: nil, templateIds: nil),
+            disposition: "allow",
+            timeWindow: nil
+        )
+        let signed = try makeSignedManifestUpdatedBody(rules: [rule], schemaVersion: 99)
+        let snapshot = IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(signed.body),
+            store: store,
+            cache: cache,
+            pinnedPublicKey: signed.publicKey
+        )
+        XCTAssertNil(snapshot)
+        XCTAssertFalse(store.hasSnapshot)
     }
 
     func testApplyManifestUpdatedReturnsNilForOtherMessageTypes() {
@@ -266,7 +382,8 @@ final class IPCBridgeNotificationsTests: XCTestCase {
         let snapshot = IPCBridgeNotifications.applyManifestUpdated(
             message: .manifestSubscribe(requestId: "x"),
             store: store,
-            cache: cache
+            cache: cache,
+            pinnedPublicKey: Data(repeating: 0, count: 32)
         )
         XCTAssertNil(snapshot)
         XCTAssertNil(store.currentSnapshot())

@@ -63,7 +63,11 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
     /// targets do NOT instantiate this class; they use
     /// `FlowEvaluatorEngine` directly.
     public override init() {
-        self.engine = FlowEvaluatorEngine()
+        self.engine = FlowEvaluatorEngine(
+            manifestStore: ManifestStore(
+                lastValidManifestURL: ManifestStore.defaultLastValidManifestURL()
+            )
+        )
         super.init()
     }
 

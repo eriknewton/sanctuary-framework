@@ -82,6 +82,13 @@ public final class IPCClient {
         self.queue = DispatchQueue(label: "ai.sanctuaryprotocol.castle-wall.ipc-client")
     }
 
+    /// Raw Ed25519 public key bytes pinned for the fortress identity.
+    /// The dispatcher also uses this key to verify signed manifest
+    /// snapshots before the extension trusts IPC-delivered rules.
+    public var pinnedPublicKeyBytes: Data {
+        return pinnedPublicKey
+    }
+
     /// Register a post-handshake inbound message listener. The callback
     /// fires for every decoded `IpcMessage` received AFTER the handshake
     /// completes (handshake frames are consumed internally). Idempotent;

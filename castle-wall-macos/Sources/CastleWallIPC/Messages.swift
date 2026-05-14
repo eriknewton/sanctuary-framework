@@ -694,21 +694,127 @@ public struct ManifestRuleTimeWindow: Codable, Equatable {
     }
 }
 
-/// `manifest_updated` notification body. Phase 1 ships full-snapshot rules.
-public struct ManifestUpdatedBody: Codable, Equatable {
-    public let type: String
-    public let manifestSignatureB64url: String?
-    public let rules: [ManifestRule]
+/// One entry in the signed manifest body the extension verifies locally.
+/// `sha256` is the hex SHA-256 of the canonical JSON rule bytes shipped in
+/// the same `manifest_updated` notification.
+public struct ManifestRuleDigestEntry: Codable, Equatable {
+    public let ruleId: String
+    public let file: String
+    public let sha256: String
 
-    public init(manifestSignatureB64url: String?, rules: [ManifestRule]) {
-        self.type = "manifest_updated"
-        self.manifestSignatureB64url = manifestSignatureB64url
+    public init(ruleId: String, file: String, sha256: String) {
+        self.ruleId = ruleId
+        self.file = file
+        self.sha256 = sha256
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ruleId = "rule_id"
+        case file
+        case sha256
+    }
+}
+
+/// Signed allowlist manifest body. The extension verifies the Ed25519
+/// signature over canonical JSON of this exact shape before trusting rules.
+public struct ManifestSignedBody: Codable, Equatable {
+    public let schemaVersion: UInt32
+    public let fortressId: String
+    public let issuedAt: String
+    public let rules: [ManifestRuleDigestEntry]
+
+    public init(
+        schemaVersion: UInt32,
+        fortressId: String,
+        issuedAt: String,
+        rules: [ManifestRuleDigestEntry]
+    ) {
+        self.schemaVersion = schemaVersion
+        self.fortressId = fortressId
+        self.issuedAt = issuedAt
         self.rules = rules
     }
 
     enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case fortressId = "fortress_id"
+        case issuedAt = "issued_at"
+        case rules
+    }
+}
+
+/// Ed25519 signature envelope for a `ManifestSignedBody`.
+public struct ManifestSignatureEnvelope: Codable, Equatable {
+    public let signatureScheme: String
+    public let signingKeyId: String
+    public let signatureB64url: String
+
+    public init(
+        signatureScheme: String,
+        signingKeyId: String,
+        signatureB64url: String
+    ) {
+        self.signatureScheme = signatureScheme
+        self.signingKeyId = signingKeyId
+        self.signatureB64url = signatureB64url
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case signatureScheme = "signature_scheme"
+        case signingKeyId = "signing_key_id"
+        case signatureB64url = "signature_b64url"
+    }
+}
+
+/// `manifest_updated` notification body. The rules remain a full parsed
+/// snapshot, but the snapshot is accepted only when `manifest` + `signature`
+/// verify against the pinned fortress key.
+public struct ManifestUpdatedBody: Codable, Equatable {
+    public let type: String
+    public let manifest: ManifestSignedBody?
+    public let signature: ManifestSignatureEnvelope?
+    public let rules: [ManifestRule]
+
+    public init(manifestSignatureB64url: String?, rules: [ManifestRule]) {
+        self.type = "manifest_updated"
+        if let manifestSignatureB64url {
+            self.manifest = ManifestSignedBody(
+                schemaVersion: CastleWallConstants.schemaVersionV1,
+                fortressId: "legacy-unsigned",
+                issuedAt: "",
+                rules: []
+            )
+            self.signature = ManifestSignatureEnvelope(
+                signatureScheme: CastleWallConstants.signatureSchemeV1,
+                signingKeyId: "legacy-unsigned",
+                signatureB64url: manifestSignatureB64url
+            )
+        } else {
+            self.manifest = nil
+            self.signature = nil
+        }
+        self.rules = rules
+    }
+
+    public init(
+        manifest: ManifestSignedBody,
+        signature: ManifestSignatureEnvelope,
+        rules: [ManifestRule]
+    ) {
+        self.type = "manifest_updated"
+        self.manifest = manifest
+        self.signature = signature
+        self.rules = rules
+    }
+
+    public var manifestSignatureB64url: String? {
+        return signature?.signatureB64url
+    }
+
+    enum CodingKeys: String, CodingKey {
         case type
-        case manifestSignatureB64url = "manifest_signature_b64url"
+        case manifest
+        case signature
         case rules
     }
 }

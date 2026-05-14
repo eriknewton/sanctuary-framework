@@ -19,6 +19,7 @@
  */
 
 import type { CastleWallAuditEvent } from "../audit/events.js";
+import type { AllowlistManifest, ManifestSignature } from "../allowlist/manifest.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 
 /** JSON-RPC 2.0 request id. The daemon and main both generate these as 16-byte hex. */
@@ -207,7 +208,8 @@ export interface ManifestSubscribeRequest {
  */
 export interface ManifestUpdatedNotification {
   type: "manifest_updated";
-  manifest_signature_b64url: string | null;
+  manifest: AllowlistManifest;
+  signature: ManifestSignature;
   rules: AllowlistRule[];
 }
 

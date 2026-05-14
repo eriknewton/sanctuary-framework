@@ -26,6 +26,7 @@
  */
 
 import type { AllowlistRule } from "../allowlist/schema.js";
+import type { SignedManifest } from "../allowlist/manifest.js";
 import { CASTLE_WALL_AUDIT_LAYER } from "../constants.js";
 import type {
   FlowDecisionRecordedNotification,
@@ -48,13 +49,13 @@ export interface MacOSSubscriber {
 /** The shape the manifest provider exposes to the consumer. */
 export interface MacOSManifestProvider {
   /**
-   * Snapshot of the current allowlist rules plus the manifest signature
-   * (or null when no manifest has been published yet). The runtime calls
-   * this on subscribe and on every change. Phase 1 ships a full snapshot
-   * each time; a delta variant is reserved for v1.x.
+   * Snapshot of the current allowlist rules plus the signed manifest
+   * envelope. The runtime calls this on subscribe and on every change.
+   * Phase 1 ships a full snapshot each time; a delta variant is reserved
+   * for v1.x.
    */
   currentSnapshot(): {
-    manifest_signature_b64url: string | null;
+    signed_manifest: SignedManifest;
     rules: AllowlistRule[];
   };
 }
@@ -159,7 +160,8 @@ export class MacOSFlowEventConsumer {
     const snapshot = this.manifestProvider.currentSnapshot();
     const notification: ManifestUpdatedNotification = {
       type: "manifest_updated",
-      manifest_signature_b64url: snapshot.manifest_signature_b64url,
+      manifest: snapshot.signed_manifest.manifest,
+      signature: snapshot.signed_manifest.signature,
       rules: snapshot.rules,
     };
     await subscriber.emitManifestUpdate(notification);
@@ -176,7 +178,8 @@ export class MacOSFlowEventConsumer {
     const snapshot = this.manifestProvider.currentSnapshot();
     const notification: ManifestUpdatedNotification = {
       type: "manifest_updated",
-      manifest_signature_b64url: snapshot.manifest_signature_b64url,
+      manifest: snapshot.signed_manifest.manifest,
+      signature: snapshot.signed_manifest.signature,
       rules: snapshot.rules,
     };
     let emitted = 0;

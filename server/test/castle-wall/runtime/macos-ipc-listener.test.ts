@@ -44,6 +44,7 @@ import {
   type MacOSManifestProvider,
 } from "../../../src/castle-wall/runtime/index.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
+import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
 
 const SAMPLE_RULE: AllowlistRule = {
   id: "rule-allow-anthropic",
@@ -95,9 +96,29 @@ function makeManifestProvider(rules: AllowlistRule[]): MacOSManifestProvider {
   return {
     currentSnapshot() {
       return {
-        manifest_signature_b64url: "sig-test",
+        signed_manifest: makeSignedManifest(rules, "sig-test"),
         rules,
       };
+    },
+  };
+}
+
+function makeSignedManifest(rules: AllowlistRule[], signature: string): SignedManifest {
+  return {
+    manifest: {
+      schema_version: 1,
+      fortress_id: "fortress-test",
+      issued_at: "2026-05-14T00:00:00Z",
+      rules: rules.map((rule) => ({
+        rule_id: rule.id,
+        file: `${rule.id}.json`,
+        sha256: "0".repeat(64),
+      })),
+    },
+    signature: {
+      signature_scheme: "ed25519-v1",
+      signing_key_id: "test-key",
+      signature_b64url: signature,
     },
   };
 }
@@ -353,10 +374,14 @@ describe("MacOSFlowIpcListener", () => {
 
     const reply = await nextMessage(buf);
     expect(reply.type).toBe("manifest_updated");
-    const updated = reply as { type: string; rules: AllowlistRule[]; manifest_signature_b64url: string | null };
+    const updated = reply as {
+      type: string;
+      rules: AllowlistRule[];
+      signature: { signature_b64url: string };
+    };
     expect(updated.rules).toHaveLength(1);
     expect(updated.rules[0]?.id).toBe(SAMPLE_RULE.id);
-    expect(updated.manifest_signature_b64url).toBe("sig-test");
+    expect(updated.signature.signature_b64url).toBe("sig-test");
   });
 
   it("dispatches flow_decision_recorded into the consumer's audit sink", async () => {
