@@ -16,6 +16,7 @@ import { generateKeypair } from "../../src/core/identity.js";
 import { toBase64url } from "../../src/core/encoding.js";
 import { randomBytes } from "../../src/core/random.js";
 import { CAP_STANDARD_FORTRESS_NODE } from "../../src/mesh/constants.js";
+import { MeshReservedEventTypeError } from "../../src/mesh/errors.js";
 import {
   packSignedEvent,
   verifySignedEvent,
@@ -183,7 +184,7 @@ describe("mesh — policy_update distributed across three-mode mesh (§12 criter
     expect(teePolicies.get("governed-harness-a")?.policy_version).toBe(2);
   });
 
-  it("router silently drops reserved-namespace event_type after signature passes (forward-compat §10.3)", async () => {
+  it("receiver rejects reserved-namespace event_type before router dispatch (§10.3)", async () => {
     const fortress = buildFortress();
     const local = addNode(fortress, "local-1", "local");
     const cloud = addNode(fortress, "cloud-1", "operator_cloud");
@@ -242,20 +243,10 @@ describe("mesh — policy_update distributed across three-mode mesh (§12 criter
       principal_signature: toBase64url(principalSig),
     };
 
-    // v0.1 receiver verifies (passes — signature correct, chain valid),
-    // but router drops at dispatch because event_type is in reserved namespace.
-    const res = verifySignedEvent(v1xEvt, verifyCtx);
-    expect(res.ok).toBe(true);
-    expect(res.recognized_reserved_extension_keys).toContain("cross_fortress_read_query");
-
-    const router = new MeshRouter();
-    let handlerCalled = false;
-    // No handler registered for cross_fortress_read_query (it's not even a
-    // legal v0.1 event type; register() would throw if we tried).
-    const dispatched = router.dispatch(res.event);
-    expect(dispatched).toBe(false);
-    expect(router.stats().dropped_reserved).toBe(1);
-    expect(router.stats().dispatched).toBe(0);
-    expect(handlerCalled).toBe(false);
+    // v0.1 receiver verifies signature material, then hard-gates the reserved
+    // event namespace before it can enter router dispatch.
+    expect(() => verifySignedEvent(v1xEvt, verifyCtx)).toThrow(
+      MeshReservedEventTypeError
+    );
   });
 });

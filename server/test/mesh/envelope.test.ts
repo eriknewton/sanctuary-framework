@@ -15,6 +15,7 @@ import { sha256 } from "@noble/hashes/sha256";
 import { canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
 import { CAP_STANDARD_FORTRESS_NODE } from "../../src/mesh/constants.js";
 import {
+  MeshReservedCapabilityBitError,
   MeshReservedEventTypeError,
   MeshReservedExtensionKeyError,
   MeshSignatureError,
@@ -77,6 +78,43 @@ function contextFor(f: TestFortress): VerifyContext {
     lookupNodeCert: (id) => (id === f.nodeCert.node_id ? f.nodeCert : undefined),
     lookupPrincipalCert: (id) =>
       id === f.principalCert.principal_id ? f.principalCert : undefined,
+  };
+}
+
+function signEventBody(
+  body: Omit<SignedEvent, "node_signature" | "principal_signature">,
+  privateKey: Uint8Array
+): SignedEvent {
+  return {
+    ...body,
+    node_signature: toBase64url(
+      ed25519.sign(canonicalizeToBytes(body), privateKey)
+    ),
+  };
+}
+
+function signNodeCertWithCapabilities(
+  cert: NodeIdentityCertificate,
+  capabilities: number,
+  principalPrivateKey: Uint8Array
+): NodeIdentityCertificate {
+  const body = {
+    node_id: cert.node_id,
+    node_pubkey: cert.node_pubkey,
+    node_mode: cert.node_mode,
+    fortress_id: cert.fortress_id,
+    joined_at: cert.joined_at,
+    capabilities,
+    parent_chain: cert.parent_chain,
+    tee_attestation_hash: cert.tee_attestation_hash,
+    delegated_grants: cert.delegated_grants ?? [],
+    attestation_lineage_chain: cert.attestation_lineage_chain ?? [],
+  };
+  return {
+    ...body,
+    principal_signature: toBase64url(
+      ed25519.sign(canonicalizeToBytes(body), principalPrivateKey)
+    ),
   };
 }
 
@@ -206,10 +244,10 @@ describe("mesh/envelope — hard-gate reservations (§10.1, §10.3)", () => {
     }
   });
 
-  it("receiver accepts envelope with unknown extension keys (forward-compat)", () => {
+  it("receiver rejects reserved extension keys even with a valid signature", () => {
     // Simulate a v1.x emitter: hand-craft an envelope with a reserved extension
-    // key and a valid signature. v0.1 receiver MUST accept and return the key
-    // list so a v1.x dispatcher can handle it.
+    // key and a valid signature. v0.1 receivers must reject before undefined
+    // future semantics enter verified state.
     const v1xPayload = { node_state: "active" };
     const v1xBody = {
       protocol_version: "0.1",
@@ -230,22 +268,17 @@ describe("mesh/envelope — hard-gate reservations (§10.1, §10.3)", () => {
         },
       },
     };
-    const v1xBytes = canonicalizeToBytes(v1xBody);
-    const sig = ed25519.sign(v1xBytes, f.nodeKeypair.privateKey);
-    const v1xEvt: SignedEvent = {
-      ...v1xBody,
-      node_signature: toBase64url(sig),
-    };
-    const res = verifySignedEvent(v1xEvt, contextFor(f));
-    expect(res.ok).toBe(true);
-    expect(res.recognized_reserved_extension_keys).toContain("cross_fortress_read_query");
+    const v1xEvt = signEventBody(v1xBody, f.nodeKeypair.privateKey);
+    expect(() => verifySignedEvent(v1xEvt, contextFor(f))).toThrow(
+      MeshReservedExtensionKeyError
+    );
   });
 
-  it("signature validates across extension-envelope forward-compat boundary", () => {
+  it("signature validates across non-reserved extension-envelope forward-compat boundary", () => {
     // The signature was generated over canonicalize(body including extension_envelope).
     // If canonicalization is deterministic, a v0.1 verifier re-canonicalizes the same
-    // bytes and signature verification succeeds — even though v0.1 doesn't "understand"
-    // the extension key content.
+    // bytes and signature verification succeeds for extension keys outside the
+    // reserved namespace.
     const v1xPayload = { node_state: "active" };
     const body = {
       protocol_version: "0.1",
@@ -260,7 +293,7 @@ describe("mesh/envelope — hard-gate reservations (§10.1, §10.3)", () => {
       emitted_at: "2026-04-21T12:00:00.000Z",
       monotonic_seq: 42,
       extension_envelope: {
-        cross_fortress_read_response: {
+        partner_observer_note: {
           arbitrary: "v1.x content",
           nested: { a: 1, b: [2, 3] },
         },
@@ -274,6 +307,59 @@ describe("mesh/envelope — hard-gate reservations (§10.1, §10.3)", () => {
     const evt: SignedEvent = { ...body, node_signature: toBase64url(sig) };
     const res = verifySignedEvent(evt, contextFor(f));
     expect(res.ok).toBe(true);
+  });
+
+  it("receiver rejects reserved-namespace event types even with a valid signature", () => {
+    const payload = { node_state: "active" };
+    const body = {
+      protocol_version: "0.1",
+      event_type: "cross_fortress_read_query",
+      event_id: "reserved-event-id",
+      emitter_node: f.nodeCert.node_id,
+      emitter_principal: "system",
+      fortress_id: f.master.public.fortress_id,
+      causal_parents: [] as string[],
+      payload,
+      payload_hash: toBase64url(sha256(canonicalizeToBytes(payload))),
+      emitted_at: "2026-05-14T00:00:00.000Z",
+      monotonic_seq: 43,
+      extension_envelope: {},
+    };
+    const evt = signEventBody(body, f.nodeKeypair.privateKey);
+    expect(() => verifySignedEvent(evt, contextFor(f))).toThrow(
+      MeshReservedEventTypeError
+    );
+  });
+
+  it("receiver rejects node certificates with reserved capability bits", () => {
+    const payload = { node_state: "active" };
+    const body = {
+      protocol_version: "0.1",
+      event_type: "heartbeat",
+      event_id: "reserved-capability-id",
+      emitter_node: f.nodeCert.node_id,
+      emitter_principal: "system",
+      fortress_id: f.master.public.fortress_id,
+      causal_parents: [] as string[],
+      payload,
+      payload_hash: toBase64url(sha256(canonicalizeToBytes(payload))),
+      emitted_at: "2026-05-14T00:00:00.000Z",
+      monotonic_seq: 44,
+      extension_envelope: {},
+    };
+    const evt = signEventBody(body, f.nodeKeypair.privateKey);
+    const certWithReservedCapability = signNodeCertWithCapabilities(
+      f.nodeCert,
+      CAP_STANDARD_FORTRESS_NODE | 0x08,
+      f.principalKeypair.privateKey
+    );
+    expect(() =>
+      verifySignedEvent(evt, {
+        ...contextFor(f),
+        lookupNodeCert: (id) =>
+          id === f.nodeCert.node_id ? certWithReservedCapability : undefined,
+      })
+    ).toThrow(MeshReservedCapabilityBitError);
   });
 
   it("receiver rejects envelope whose fortress_id does not match pinned fortress (§10.5)", () => {
