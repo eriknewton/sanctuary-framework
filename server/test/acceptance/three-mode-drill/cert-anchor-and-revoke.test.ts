@@ -87,6 +87,8 @@ describe("three-mode-drill §12.7 — node_revoke propagates within one heartbea
       await drill.nodeA.revokePeer({
         target_node_id: drill.nodeIdB,
         reason: "drill: §12.7 revoke test",
+        emitter_principal: drill.root_principal_cert.principal_id,
+        principal_private_key: drill.root_principal_keypair.privateKey,
       });
       expect(drill.nodeA.getRoster().presenceOf(drill.nodeIdB)).toBe("revoked");
 

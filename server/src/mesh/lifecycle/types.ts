@@ -18,6 +18,7 @@ import type {
   PolicyUpdatePayload,
   SignedEvent,
 } from "../types.js";
+import type { GuardianRoster } from "../guardian/types.js";
 import type { MeshNodeState, NodePresenceState, SyncKind } from "./constants.js";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -236,6 +237,8 @@ export interface MeshNodeConfig {
   fortress_id: string;
   /** Operator's pinned fortress-master public key (for verifying chain walks). */
   pinned_master_pubkey: FortressMasterPublicKey;
+  /** Optional pinned guardian roster for guardian-quorum recovery actions. */
+  pinned_guardian_roster?: GuardianRoster;
   /** Default-principal id used as `emitter_principal` on system-originated events. */
   system_principal_id?: string;
   /** Is this node the canonical audit node? Operator-designated at bootstrap. */

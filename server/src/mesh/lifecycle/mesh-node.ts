@@ -30,6 +30,13 @@ import {
 } from "../errors.js";
 import { packSignedEvent } from "../envelope.js";
 import { verifySignedEvent } from "../envelope.js";
+import {
+  verifyGuardianQuorum,
+  verifyGuardianRoster,
+  type GuardianQuorumProof,
+  type GuardianRoster,
+  type MasterRotationQuorumInput,
+} from "../guardian/index.js";
 import { receiveAuditBatch, type MeshTransport } from "../in-memory-transport.js";
 import { MeshRouter } from "../router.js";
 import {
@@ -136,6 +143,7 @@ export class MeshNode {
   private readonly locatorTable = new LocatorTableStore();
   private readonly lifecycleLog = new NodeLifecycleEventLog();
   private readonly principalRoster = new Map<string, PrincipalCertificate>();
+  private guardianRoster: GuardianRoster | null = null;
   private readonly router = new MeshRouter();
   private readonly auditBuffer: AuditBuffer;
   private readonly canonicalAudit?: CanonicalAuditLog;
@@ -205,6 +213,7 @@ export class MeshNode {
     this.keyStore = deps.key_store;
     this.counters = deps.counters ?? new InMemoryCounterStore();
     this.fortressMasterSecret = deps.fortress_master_secret;
+    this.guardianRoster = config.pinned_guardian_roster ?? null;
     this.auditBuffer = new AuditBuffer({
       audit_batch_interval_ms: config.audit_batch_interval_ms,
       audit_batch_max_entries: config.audit_batch_max_entries,
@@ -604,6 +613,12 @@ export class MeshNode {
     this.principalRoster.set(principal.principal_id, principal);
   }
 
+  /** Pin or refresh the guardian roster used to verify guardian revokes. */
+  registerGuardianRoster(roster: GuardianRoster): void {
+    verifyGuardianRoster(roster, this.config.pinned_master_pubkey);
+    this.guardianRoster = roster;
+  }
+
   // ═════════════════════════════════════════════════════════════════════
   // HEARTBEAT (§3.3)
   // ═════════════════════════════════════════════════════════════════════
@@ -665,16 +680,30 @@ export class MeshNode {
   async revokePeer(params: {
     target_node_id: string;
     reason: string;
+    principal_private_key?: Uint8Array;
+    emitter_principal?: string;
+    guardian_quorum_verified_by_ceremony?: boolean;
     quorum_signatures?: NodeRevokePayload["quorum_signatures"];
   }): Promise<SignedEvent<NodeRevokePayload>> {
     this.requireKeyed();
+    if (!params.principal_private_key && !params.quorum_signatures?.length) {
+      throw new MeshError(
+        "node_revoke requires either an operator principal signature or guardian quorum signatures"
+      );
+    }
     const payload: NodeRevokePayload = {
       node_id: params.target_node_id,
       reason: params.reason,
       effective_at: new Date().toISOString(),
       quorum_signatures: params.quorum_signatures,
     };
-    const evt = await this.emitLifecycleEvent("node_revoke", payload);
+    const evt = await this.emitLifecycleEvent("node_revoke", payload, {
+      emitter_principal: params.emitter_principal,
+      principal_private_key: params.principal_private_key,
+    });
+    if (!params.guardian_quorum_verified_by_ceremony) {
+      this.assertNodeRevokeAuthorized(evt as SignedEvent<NodeRevokePayload>);
+    }
     this.lifecycleLog.append(evt as SignedEvent<NodeLifecyclePayload>);
     this.roster.markRevoked(params.target_node_id);
     return evt as SignedEvent<NodeRevokePayload>;
@@ -869,6 +898,7 @@ export class MeshNode {
     for (const evt of payload.locator_updates ?? []) {
       this.verifyOrThrow(evt);
     }
+    const acceptedLifecycleEvents: SignedEvent<NodeLifecyclePayload>[] = [];
     for (const evt of payload.node_lifecycle_events ?? []) {
       // For lifecycle events, we may not yet have the joining node's cert
       // in the roster — for `node_join` events, ingest the certificate
@@ -878,17 +908,33 @@ export class MeshNode {
         this.roster.add(join.payload.certificate);
       }
       this.verifyOrThrow(evt);
-      this.lifecycleLog.append(evt);
       if (evt.event_type === "node_revoke") {
         const rev = evt as SignedEvent<NodeRevokePayload>;
+        try {
+          this.assertNodeRevokeAuthorized(rev);
+        } catch (e) {
+          const error = e instanceof Error ? e : new Error(String(e));
+          this.auditNodeRevokeDenied(rev, error);
+          this.onEnvelopeRejected({
+            error,
+            event_type: rev.event_type,
+            emitter_node: rev.emitter_node,
+          });
+          continue;
+        }
         this.roster.markRevoked(rev.payload.node_id);
       }
+      this.lifecycleLog.append(evt);
       if (evt.event_type === "node_leave") {
         const lv = evt as SignedEvent<NodeLeavePayload>;
         this.roster.markLeft(lv.payload.node_id);
       }
+      acceptedLifecycleEvents.push(evt);
     }
-    const result = applySyncResponse(payload, {
+    const result = applySyncResponse({
+      ...payload,
+      node_lifecycle_events: acceptedLifecycleEvents,
+    }, {
       policy_bundle: this.policyBundle,
       locator_table: this.locatorTable,
       lifecycle_log: this.lifecycleLog,
@@ -1129,17 +1175,22 @@ export class MeshNode {
       | "node_attestation_refresh"
       | "canonical_audit_change"
       | "master_rotation",
-    payload: NodeLifecyclePayload
+    payload: NodeLifecyclePayload,
+    auth: {
+      principal_private_key?: Uint8Array;
+      emitter_principal?: string;
+    } = {}
   ): Promise<SignedEvent<NodeLifecyclePayload>> {
     const evt = packSignedEvent<NodeLifecyclePayload>({
       event_type: eventType,
       emitter_node: this.config.node_id,
       emitter_principal:
-        this.config.system_principal_id ?? "system",
+        auth.emitter_principal ?? this.config.system_principal_id ?? "system",
       fortress_id: this.config.fortress_id,
       payload,
       monotonic_seq: this.counters.next("envelope_monotonic_seq"),
       node_private_key: this.nodePrivateKey!,
+      principal_private_key: auth.principal_private_key,
     });
     this.onLifecycleEvent(evt, "emitted");
     await this.transport.broadcast(evt);
@@ -1190,6 +1241,18 @@ export class MeshNode {
     });
     this.router.register("node_revoke", (evt) => {
       const rev = evt as SignedEvent<NodeRevokePayload>;
+      try {
+        this.assertNodeRevokeAuthorized(rev);
+      } catch (e) {
+        const error = e instanceof Error ? e : new Error(String(e));
+        this.auditNodeRevokeDenied(rev, error);
+        this.onEnvelopeRejected({
+          error,
+          event_type: rev.event_type,
+          emitter_node: rev.emitter_node,
+        });
+        return;
+      }
       this.roster.markRevoked(rev.payload.node_id);
       this.lifecycleLog.append(rev as SignedEvent<NodeLifecyclePayload>);
       this.onLifecycleEvent(rev as SignedEvent<NodeLifecyclePayload>, "received");
@@ -1256,6 +1319,96 @@ export class MeshNode {
       at: Date.now(),
     });
     this.router.dispatch(evt);
+  }
+
+  private assertNodeRevokeAuthorized(
+    evt: SignedEvent<NodeRevokePayload>
+  ): void {
+    if (evt.principal_signature) {
+      return;
+    }
+
+    const quorumSignatures = evt.payload.quorum_signatures ?? [];
+    if (quorumSignatures.length === 0) {
+      throw new MeshError(
+        "node_revoke denied: missing operator principal signature or guardian quorum"
+      );
+    }
+    if (!this.guardianRoster) {
+      throw new MeshError(
+        "node_revoke denied: guardian quorum present but no pinned guardian roster is installed"
+      );
+    }
+
+    const signatures = quorumSignatures.map((sig) => {
+      const guardian = this.guardianRoster!.guardians.find(
+        (g) => g.public_key === sig.guardian_pubkey
+      );
+      if (!guardian) {
+        throw new MeshError(
+          `node_revoke denied: unknown guardian pubkey ${sig.guardian_pubkey}`
+        );
+      }
+      return {
+        guardian_id: guardian.guardian_id,
+        signature: sig.signature,
+      };
+    });
+    const proof: GuardianQuorumProof = {
+      roster_version: this.guardianRoster.version,
+      signatures,
+    };
+    verifyGuardianQuorum({
+      input: this.nodeRevokeQuorumInput(evt.payload),
+      proof,
+      pinned_roster: this.guardianRoster,
+    });
+  }
+
+  private nodeRevokeQuorumInput(
+    payload: NodeRevokePayload
+  ): MasterRotationQuorumInput {
+    const initiatedAt = "revoke:" + payload.node_id;
+    return {
+      old_master_pubkey: "node:" + payload.node_id,
+      new_master_pubkey: {
+        public_key: toBase64url(
+          new TextEncoder().encode("revoke|" + payload.reason)
+        ),
+        fortress_id: this.config.fortress_id,
+        created_at: initiatedAt,
+      },
+      rotated_at: initiatedAt,
+      fortress_id: this.config.fortress_id,
+    };
+  }
+
+  private auditNodeRevokeDenied(
+    evt: SignedEvent<NodeRevokePayload>,
+    error: Error
+  ): void {
+    if (!this.nodePrivateKey) {
+      return;
+    }
+    const entry = sealAuditEntry({
+      emitter_node: this.config.node_id,
+      emitter_agent: "mesh",
+      emitter_principal: this.config.system_principal_id ?? "system",
+      policy_version: 0,
+      attestation_state: "peer_protocol_violation",
+      payload: {
+        operation: "node_revoke_denied",
+        event_type: evt.event_type,
+        peer_node: evt.emitter_node,
+        target_node: evt.payload.node_id,
+        reason: error.message,
+      },
+      node_private_key: this.nodePrivateKey,
+    });
+    if (this.oldestPendingEntryAt === null) {
+      this.oldestPendingEntryAt = Date.now();
+    }
+    this.auditBuffer.push(entry);
   }
 
   private auditPeerProtocolViolation(info: {
