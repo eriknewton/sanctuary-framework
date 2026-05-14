@@ -19,6 +19,17 @@ Publish intent is separate from tag intent. Tag pushes do not publish; manual wo
 - Input version empty or does not match `server/package.json` at ref: job fails at the verify step. Fix the input or the ref, rerun.
 - `NPM_TOKEN` missing or expired: `npm publish` step fails. Rotate the token and rerun.
 - Tests or typecheck fail: treat as a real failure, do not bypass. Fix on a branch, merge, rerun dispatch.
+- Release dependency pin check fails: a direct release-critical dependency uses a range or its lockfile root does not match the manifest. Pin the direct dependency to the exact version being released, regenerate the relevant lockfile, and rerun `npm run check:release-dependency-pins`.
+
+## Dependency refresh procedure
+
+Release-critical dependency updates are intentional release inputs, not incidental installer behavior.
+
+1. Refresh only the dependency being updated. Do not run broad upgrades for a release-candidate fix.
+2. For the server package, update `server/package.json` direct `dependencies` and `devDependencies` to exact versions, then run `npm install --package-lock-only` from `server/`.
+3. For the menubar approval surface, update `menubar/package.json` direct Tauri/Vite/TypeScript dependencies to exact versions, then run `npm install --package-lock-only` from `menubar/`.
+4. For Rust-side menubar dependencies, update `menubar/src-tauri/Cargo.toml` direct release-critical crates with exact `=` requirements and refresh `menubar/src-tauri/Cargo.lock` only when the resolved version changes.
+5. Run `npm run check:release-dependency-pins`, `cd server && npm test`, and the menubar build checks available without release signing before opening the release PR.
 
 ## Rollback
 
