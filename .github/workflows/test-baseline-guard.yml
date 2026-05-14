@@ -92,6 +92,10 @@ jobs:
         working-directory: server
         run: npm run typecheck
 
+      - name: Install libsecret + Secret Service backend
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-linux-secret-service
+
       # ── Gate 2: npm test + transform/collection error detection ───
       #
       # Captures vitest output in one invocation so all three checks
