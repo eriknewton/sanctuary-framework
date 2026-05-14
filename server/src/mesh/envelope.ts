@@ -203,19 +203,22 @@ export function verifySignedEvent(
     throw new MeshReservedCapabilityBitError(nodeCert.capabilities);
   }
   const principalCert = ctx.lookupPrincipalCert(evt.emitter_principal);
-  if (
-    !principalCert &&
-    evt.emitter_principal !== "system" &&
-    evt.principal_signature
-  ) {
+  if (evt.principal_signature && !principalCert) {
     throw new MeshSignatureError(
       `emitter_principal ${evt.emitter_principal} is not in local roster but a principal_signature is present`
     );
   }
-  // Chain-validate node cert (also walks principal → master).
-  if (principalCert) {
-    verifyCertChain(nodeCert, principalCert, ctx.pinnedMasterPubkey);
+  // Chain-validate every node cert, including system-principal events. The
+  // certificate's issuer is authoritative for the node → principal hop.
+  const issuerPrincipalCert = ctx.lookupPrincipalCert(
+    nodeCert.parent_chain.principal_id
+  );
+  if (!issuerPrincipalCert) {
+    throw new MeshSignatureError(
+      `node cert issuer principal ${nodeCert.parent_chain.principal_id} is not in local roster`
+    );
   }
+  verifyCertChain(nodeCert, issuerPrincipalCert, ctx.pinnedMasterPubkey);
 
   // Rebuild the canonical body that was signed.
   const body: Omit<SignedEvent, "node_signature" | "principal_signature"> = {
