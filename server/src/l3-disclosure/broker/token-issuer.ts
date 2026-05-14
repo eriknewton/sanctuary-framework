@@ -32,8 +32,31 @@ export interface SkillSecretGrant {
   secret: string;
   /** Maximum scope this skill can request for this secret. */
   scope: SecretScope;
+  /** Optional caller agent constraint. */
+  agent?: string;
+  /** Optional tenant constraint. */
+  tenant_id?: string;
+  /** Optional fortress constraint. */
+  fortress_id?: string;
+  /** Optional token audience constraint. */
+  audience?: string;
   /** Default TTL (seconds) when the skill does not specify one. */
   ttlSeconds?: number;
+}
+
+export interface VerifiedBrokerCallerClaims {
+  /** Verified harness/session skill name. Never sourced from MCP args. */
+  skill: string;
+  /** Verified caller agent id. */
+  agent: string;
+  /** Sanctuary identity id of the principal that approved issuance. */
+  identity_id: string;
+  /** Tenant scope this caller is bound to. */
+  tenant_id: string;
+  /** Fortress scope this caller is bound to. */
+  fortress_id: string;
+  /** Intended token audience. */
+  audience: string;
 }
 
 export interface TokenBinding {
@@ -44,6 +67,9 @@ export interface TokenBinding {
   agent: string;
   /** Sanctuary identity id of the principal that approved issuance. */
   identity_id: string;
+  tenant_id: string;
+  fortress_id: string;
+  audience: string;
   issued_at: string;
   expires_at: string;
 }
@@ -55,10 +81,8 @@ export interface IssueTokenRequest {
   requestedScope?: SecretScope;
   /** Requested TTL (seconds); capped at MAX_TOKEN_TTL_SECONDS. */
   ttlSeconds?: number;
-  /** Caller agent id (opaque; for audit). */
-  agent: string;
-  /** Identity id of the principal authorizing this issuance (for audit). */
-  identity_id: string;
+  /** Verified harness/session claims authorizing this issuance. */
+  caller: VerifiedBrokerCallerClaims;
 }
 
 export class BrokerDeniedError extends Error {
@@ -146,20 +170,65 @@ export class TokenIssuer {
    * denial is recorded in the audit log but not returned to the caller.
    */
   async issueToken(req: IssueTokenRequest): Promise<TokenBinding> {
-    const grant = this.grants.get(grantKey(req.skill, req.secret));
     const requestedScope: SecretScope = req.requestedScope ?? "read";
+    if (req.skill !== req.caller.skill) {
+      this.auditLog.append(
+        "l3",
+        BROKER_OPS.TOKEN_DENIED,
+        req.caller.identity_id,
+        {
+          skill: req.skill,
+          verified_skill: req.caller.skill,
+          secret: req.secret,
+          requested_scope: requestedScope,
+          reason: "caller_skill_mismatch",
+          agent: req.caller.agent,
+          tenant_id: req.caller.tenant_id,
+          fortress_id: req.caller.fortress_id,
+          audience: req.caller.audience,
+        },
+        "failure"
+      );
+      throw new BrokerDeniedError();
+    }
+
+    const grant = this.grants.get(grantKey(req.caller.skill, req.secret));
 
     if (!grant) {
       this.auditLog.append(
         "l3",
         BROKER_OPS.TOKEN_DENIED,
-        req.identity_id,
+        req.caller.identity_id,
         {
-          skill: req.skill,
+          skill: req.caller.skill,
           secret: req.secret,
           requested_scope: requestedScope,
           reason: "no_grant",
-          agent: req.agent,
+          agent: req.caller.agent,
+          tenant_id: req.caller.tenant_id,
+          fortress_id: req.caller.fortress_id,
+          audience: req.caller.audience,
+        },
+        "failure"
+      );
+      throw new BrokerDeniedError();
+    }
+    const claimMismatch = grantClaimMismatch(grant, req.caller);
+    if (claimMismatch) {
+      this.auditLog.append(
+        "l3",
+        BROKER_OPS.TOKEN_DENIED,
+        req.caller.identity_id,
+        {
+          skill: req.caller.skill,
+          secret: req.secret,
+          requested_scope: requestedScope,
+          reason: "caller_claim_mismatch",
+          claim: claimMismatch,
+          agent: req.caller.agent,
+          tenant_id: req.caller.tenant_id,
+          fortress_id: req.caller.fortress_id,
+          audience: req.caller.audience,
         },
         "failure"
       );
@@ -169,14 +238,17 @@ export class TokenIssuer {
       this.auditLog.append(
         "l3",
         BROKER_OPS.TOKEN_DENIED,
-        req.identity_id,
+        req.caller.identity_id,
         {
-          skill: req.skill,
+          skill: req.caller.skill,
           secret: req.secret,
           requested_scope: requestedScope,
           granted_scope: grant.scope,
           reason: "scope_exceeds_grant",
-          agent: req.agent,
+          agent: req.caller.agent,
+          tenant_id: req.caller.tenant_id,
+          fortress_id: req.caller.fortress_id,
+          audience: req.caller.audience,
         },
         "failure"
       );
@@ -191,11 +263,14 @@ export class TokenIssuer {
     const token = randomBytes(32).toString("base64url");
     const binding: TokenBinding = {
       token,
-      skill: req.skill,
+      skill: req.caller.skill,
       secret: req.secret,
       scope: requestedScope,
-      agent: req.agent,
-      identity_id: req.identity_id,
+      agent: req.caller.agent,
+      identity_id: req.caller.identity_id,
+      tenant_id: req.caller.tenant_id,
+      fortress_id: req.caller.fortress_id,
+      audience: req.caller.audience,
       issued_at: new Date(nowMs).toISOString(),
       expires_at: new Date(nowMs + ttl * 1000).toISOString(),
     };
@@ -203,12 +278,15 @@ export class TokenIssuer {
     this.auditLog.append(
       "l3",
       BROKER_OPS.TOKEN_ISSUED,
-      req.identity_id,
+      req.caller.identity_id,
       {
-        skill: req.skill,
+        skill: req.caller.skill,
         secret: req.secret,
         scope: requestedScope,
-        agent: req.agent,
+        agent: req.caller.agent,
+        tenant_id: req.caller.tenant_id,
+        fortress_id: req.caller.fortress_id,
+        audience: req.caller.audience,
         expires_at: binding.expires_at,
         ttl_seconds: ttl,
       },
@@ -248,6 +326,9 @@ export class TokenIssuer {
           secret: binding.secret,
           scope: binding.scope,
           agent: binding.agent,
+          tenant_id: binding.tenant_id,
+          fortress_id: binding.fortress_id,
+          audience: binding.audience,
           reason: "token_expired",
         },
         "failure"
@@ -268,6 +349,9 @@ export class TokenIssuer {
           secret: binding.secret,
           scope: binding.scope,
           agent: binding.agent,
+          tenant_id: binding.tenant_id,
+          fortress_id: binding.fortress_id,
+          audience: binding.audience,
           reason: grant ? "scope_exceeds_current_grant" : "grant_revoked",
         },
         "failure"
@@ -287,6 +371,9 @@ export class TokenIssuer {
           secret: binding.secret,
           scope: binding.scope,
           agent: binding.agent,
+          tenant_id: binding.tenant_id,
+          fortress_id: binding.fortress_id,
+          audience: binding.audience,
         },
         "success"
       );
@@ -301,6 +388,9 @@ export class TokenIssuer {
           secret: binding.secret,
           scope: binding.scope,
           agent: binding.agent,
+          tenant_id: binding.tenant_id,
+          fortress_id: binding.fortress_id,
+          audience: binding.audience,
           reason: "backend_error",
           error: errorName(err),
         },
@@ -339,6 +429,19 @@ export class TokenIssuer {
 
 function grantKey(skill: string, secret: string): string {
   return `${skill}\u0000${secret}`;
+}
+
+function grantClaimMismatch(
+  grant: SkillSecretGrant,
+  caller: VerifiedBrokerCallerClaims
+): "agent" | "tenant_id" | "fortress_id" | "audience" | null {
+  if (grant.agent !== undefined && grant.agent !== caller.agent) return "agent";
+  if (grant.tenant_id !== undefined && grant.tenant_id !== caller.tenant_id) return "tenant_id";
+  if (grant.fortress_id !== undefined && grant.fortress_id !== caller.fortress_id) {
+    return "fortress_id";
+  }
+  if (grant.audience !== undefined && grant.audience !== caller.audience) return "audience";
+  return null;
 }
 
 function clampTtl(requested: number, max: number): number {

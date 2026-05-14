@@ -28,6 +28,7 @@ import {
   BrokerDeniedError,
   BrokerTokenExpiredError,
   BrokerTokenUnknownError,
+  type VerifiedBrokerCallerClaims,
 } from "../l3-disclosure/broker/token-issuer.js";
 
 // Re-export the shared package version. v0.10.0-rc.2 had an inlined local
@@ -41,10 +42,18 @@ import {
 const PKG_VERSION = SANCTUARY_VERSION;
 
 export interface BrokerServerOptions {
+  /** Verified harness/session skill identity. Never read from MCP args. */
+  skill: string;
   /** Caller agent id surfaced in every audit entry. */
   agentId: string;
   /** Sanctuary identity_id — the principal authorizing issuance. */
   identityId: string;
+  /** Tenant claim verified by the wrapping harness/session. */
+  tenantId: string;
+  /** Fortress claim verified by the wrapping harness/session. */
+  fortressId: string;
+  /** Intended token audience verified by the wrapping harness/session. */
+  audience: string;
 }
 
 function ok(payload: unknown) {
@@ -79,7 +88,7 @@ export function createBrokerMcpServer(
       {
         name: "broker/request_token",
         description:
-          "Request a scoped ephemeral token for a named secret. Skill must be granted access in broker-policy.json. Returns {token, expires_at} on success; generic error on denial.",
+          "Request a scoped ephemeral token for a named secret. The requested skill must match the verified caller skill and have a broker-policy.json grant. Returns {token, expires_at} on success; generic error on denial.",
         inputSchema: {
           type: "object",
           properties: {
@@ -147,16 +156,16 @@ export function createBrokerMcpServer(
     try {
       switch (name) {
         case "broker/request_token": {
-          const skill = requireString(args, "skill");
+          const claimedSkill = requireString(args, "skill");
           const secret = requireString(args, "secret");
           const scopeRaw = optionalString(args, "scope");
           const scope = scopeRaw === "rotate" ? "rotate" : scopeRaw === "read" ? "read" : undefined;
           const ttl = optionalNumber(args, "ttl_seconds");
+          const caller = verifiedCallerClaims(opts);
           const binding = await broker.issueToken({
-            skill,
+            skill: claimedSkill,
             secret,
-            agent: opts.agentId,
-            identity_id: opts.identityId,
+            caller,
             requestedScope: scope,
             ttlSeconds: ttl,
           });
@@ -178,6 +187,10 @@ export function createBrokerMcpServer(
             skill: g.skill,
             secret: g.secret,
             scope: g.scope,
+            agent: g.agent ?? null,
+            tenant_id: g.tenant_id ?? null,
+            fortress_id: g.fortress_id ?? null,
+            audience: g.audience ?? null,
             ttl_seconds: g.ttlSeconds ?? null,
           }));
           return ok({ grants });
@@ -227,4 +240,15 @@ function optionalString(args: Record<string, unknown>, key: string): string | un
 function optionalNumber(args: Record<string, unknown>, key: string): number | undefined {
   const v = args[key];
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+function verifiedCallerClaims(opts: BrokerServerOptions): VerifiedBrokerCallerClaims {
+  return {
+    skill: opts.skill,
+    agent: opts.agentId,
+    identity_id: opts.identityId,
+    tenant_id: opts.tenantId,
+    fortress_id: opts.fortressId,
+    audience: opts.audience,
+  };
 }

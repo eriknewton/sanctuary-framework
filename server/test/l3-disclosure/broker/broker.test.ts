@@ -126,8 +126,14 @@ describe("Broker", () => {
     const binding = await broker.issueToken({
       skill: "gmail-triage",
       secret: "gmail_oauth",
-      agent: "nsa",
-      identity_id: "did:sanctuary:principal",
+      caller: {
+        skill: "gmail-triage",
+        agent: "nsa",
+        identity_id: "did:sanctuary:principal",
+        tenant_id: "tenant-alpha",
+        fortress_id: "fortress-alpha",
+        audience: "sanctuary-broker",
+      },
     });
     expect(await broker.readViaToken(binding.token)).toBe("value-abc");
 
