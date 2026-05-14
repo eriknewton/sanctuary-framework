@@ -439,7 +439,7 @@ fn nftables_scope_recreation_refresh_fails_closed_then_restores_queue() {
         output_listing.contains(&refreshed_relative),
         "jump must point at refreshed cgroup path: {output_listing}"
     );
-    if first_scope.cgroup_id != refreshed_scope.cgroup_id {
+    if first_scope.cgroup_id != refreshed_scope.cgroup_id && first_relative != refreshed_relative {
         assert!(
             !output_listing.contains(&first_relative),
             "stale cgroup jump must be removed after refresh: {output_listing}"

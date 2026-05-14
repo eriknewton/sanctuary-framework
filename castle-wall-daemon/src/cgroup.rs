@@ -290,7 +290,7 @@ mod linux {
     /// path, e.g. `/system.slice/sanctuary-agent-foo.service`.
     pub fn query_scope_handle(agent_id: &str, unit: &str) -> Result<ScopeHandle, CgroupError> {
         let show = Command::new("systemctl")
-            .args(["show", &unit, "--property=ControlGroup", "--value"])
+            .args(["show", unit, "--property=ControlGroup", "--value"])
             .output()
             .map_err(|e| {
                 CgroupError::InvocationFailed(format!("systemctl show ControlGroup: {e}"))
