@@ -158,6 +158,18 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
     expect(verified.unsupported_artifacts.join("\n")).toContain(
       "legacy L2 audit log"
     );
+    const auditReceipts = JSON.parse(
+      await readFile(join(bundleDir, "artifacts", "audit_receipts.json"), "utf8")
+    ) as {
+      recovery_semantics: string;
+      normal_audit_query_continuity: boolean;
+      entries: Array<{ operation: string }>;
+    };
+    expect(auditReceipts.recovery_semantics).toBe("archive_only");
+    expect(auditReceipts.normal_audit_query_continuity).toBe(false);
+    expect(auditReceipts.entries.map((entry) => entry.operation)).toContain(
+      "exit_drill_source_unwrap"
+    );
 
     const destination = await makeHarness();
     const destinationIdentity = await callTool(
@@ -221,6 +233,11 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
     expect(publicIdentityEntries.map((entry) => entry.key)).toContain(sourceIdentityId);
     const auditReceiptEntries = await destination.storage.list("_exit_audit_receipts");
     expect(auditReceiptEntries.length).toBe(1);
+    const importedSourceAudit = await destination.auditLog.query({
+      operation_type: "exit_drill_source_unwrap",
+      limit: 10,
+    });
+    expect(importedSourceAudit.total).toBe(0);
 
     destination.auditLog.append("l1", "exit_drill_destination_wrap", destinationIdentityId, {
       imported_identity_id: sourceIdentityId,

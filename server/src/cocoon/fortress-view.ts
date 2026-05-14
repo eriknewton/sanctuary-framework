@@ -106,20 +106,6 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
       background: var(--surface-raised);
     }
 
-    .header-actions .pause-btn {
-      border-color: var(--red-dim);
-      color: var(--red);
-    }
-
-    .header-actions .pause-btn:hover {
-      background: rgba(248, 81, 73, 0.1);
-    }
-
-    .header-actions .pause-btn.paused {
-      background: var(--red-dim);
-      color: white;
-    }
-
     /* ── Tab bar ─────────────────────────────────────────────── */
     .tab-bar {
       display: flex;
@@ -419,7 +405,6 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
       </div>
     </div>
     <div class="header-actions">
-      <button class="pause-btn" id="pause-btn" title="Pause agent — requires approval for all operations">Pause Agent</button>
       <button id="advanced-btn">Advanced</button>
     </div>
   </div>
@@ -505,7 +490,6 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
     let blockedCalls = 0;
     let pendingApprovals = [];
     let upstreamServers = [];
-    let paused = false;
 
     // ── SSE Connection ──────────────────────────────────────────────
     function connectSSE() {
@@ -714,12 +698,7 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
       const hasPending = pendingApprovals.length > 0;
       const hasBlocked = blockedCalls > 0;
 
-      if (paused) {
-        indicator.className = 'status-indicator red';
-        indicator.innerHTML = '&#x23F8;';
-        title.textContent = 'Agent Paused';
-        subtitle.textContent = 'All operations require approval. Click Resume to restore normal mode.';
-      } else if (hasErrors) {
+      if (hasErrors) {
         indicator.className = 'status-indicator red';
         indicator.innerHTML = '&#x26A0;';
         title.textContent = 'Connection Issues';
@@ -737,21 +716,6 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
         subtitle.textContent = serverCount + ' server' + (serverCount !== 1 ? 's' : '') + ' monitored. All systems nominal.';
       }
     }
-
-    // ── Pause/Resume ──────────────────────────────────────────────
-    document.getElementById('pause-btn').addEventListener('click', () => {
-      paused = !paused;
-      const btn = document.getElementById('pause-btn');
-      if (paused) {
-        btn.textContent = 'Resume Agent';
-        btn.classList.add('paused');
-      } else {
-        btn.textContent = 'Pause Agent';
-        btn.classList.remove('paused');
-      }
-      updateStatus();
-      // TODO: POST to /api/cocoon/pause to set all tiers to 1
-    });
 
     // ── Tab switching ─────────────────────────────────────────────
     document.getElementById('advanced-btn').addEventListener('click', () => {

@@ -57,6 +57,13 @@ Filtering is in memory. The supported filters are `since`, `layer`, `operation_t
 
 Operator-facing read paths use this same API. The `monitor_audit_log` MCP tool calls `AuditLog.query()` directly. The `audit_export_siem` tool also queries the audit log, then applies additional export filters and formats results as CEF or OCSF. Broker-specific `secrets audit` opens the same fortress storage and queries broker operation entries through the L3 broker wrapper.
 
+Exit-bundle import does not add recovered audit receipts to `_audit`. The
+exported `artifacts/audit_receipts.json` file is a signed-manifest-pinned
+archive artifact with `recovery_semantics: "archive_only"` and
+`normal_audit_query_continuity: false`. On import it is staged under
+`_exit_audit_receipts` for inspection, so normal audit queries on the
+destination only return entries written by that destination fortress.
+
 ## 6. Tamper Model
 
 The local audit log resists offline tampering by an attacker who can edit files but does not have the fortress master key. Modifying an existing `.enc` file or inventing a new one without the audit key causes AES-GCM authentication failure, and `loadPersistedEntries()` skips the corrupted file.
