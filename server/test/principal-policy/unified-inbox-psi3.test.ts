@@ -203,6 +203,48 @@ describe("Psi-3 batch actions and snooze", () => {
     await expect(store.get(b.inbox_id)).resolves.not.toBeNull();
   });
 
+  it("batch delete route requires explicit confirmation and leaves audit untouched when missing", async () => {
+    const { storage, masterKey, bridge, auditLog } = rig();
+    const { a } = seed(bridge);
+    const policy = new UnifiedInboxRetentionPolicy();
+    const policyStore = new UnifiedInboxRetentionPolicyStore({
+      storage,
+      masterKey,
+      fortressId: FORTRESS,
+    });
+    const { base, close } = await makeInboxServer({
+      bridge,
+      auditLog,
+      policy,
+      policyStore,
+    });
+    try {
+      const before = await auditEntries(auditLog);
+      const res = await fetch(`${base}/api/inbox/unified/batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "delete", entry_ids: [a.inbox_id] }),
+      });
+      expect(res.status).toBe(400);
+      expect(bridge.get(a.inbox_id)).not.toBeNull();
+      expect(await auditEntries(auditLog)).toHaveLength(before.length);
+
+      const confirmed = await fetch(`${base}/api/inbox/unified/batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "delete",
+          entry_ids: [a.inbox_id],
+          confirm_delete: true,
+        }),
+      });
+      expect(confirmed.status).toBe(200);
+      expect(bridge.get(a.inbox_id)).toBeNull();
+    } finally {
+      await close();
+    }
+  });
+
   it("auto-resurfaces due snoozes and manual unsnooze clears a future snooze", () => {
     const { bridge } = rig();
     const { a, b } = seed(bridge);
@@ -223,6 +265,21 @@ describe("Psi-3 batch actions and snooze", () => {
     });
     expect(scheduler.tick()).toBe(1);
     expect(bridge.queryInbox().map((e) => e.inbox_id)).toContain(a.inbox_id);
+  });
+
+  it("scheduler start and stop are idempotent lifecycle operations", () => {
+    const { bridge } = rig();
+    const scheduler = new UnifiedInboxScheduler({
+      bridge,
+      intervalMs: 10_000,
+    });
+    expect(scheduler.isRunning()).toBe(false);
+    scheduler.start();
+    scheduler.start();
+    expect(scheduler.isRunning()).toBe(true);
+    scheduler.stop();
+    scheduler.stop();
+    expect(scheduler.isRunning()).toBe(false);
   });
 });
 

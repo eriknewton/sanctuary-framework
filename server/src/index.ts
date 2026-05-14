@@ -1279,6 +1279,7 @@ export async function createSanctuaryServer(options?: {
 
   // 21. Register baseline save and proxy shutdown on process exit
   const cleanup = () => {
+    unifiedInboxScheduler.stop();
     baseline.save().catch(() => {});
     if (clientManager) {
       clientManager.shutdown().catch(() => {});

@@ -33,6 +33,9 @@ export class UnifiedInboxScheduler {
     this.timer = setInterval(() => {
       this.tick();
     }, this.opts.intervalMs ?? UNIFIED_INBOX_SCHEDULER_INTERVAL_MS);
+    if (typeof this.timer.unref === "function") {
+      this.timer.unref();
+    }
   }
 
   stop(): void {

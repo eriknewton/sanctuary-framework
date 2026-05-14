@@ -244,4 +244,74 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
     expect(shape.artifacts).toContain("public_identity");
     expect(shape.artifacts).toContain("placeholder_vault_metadata");
   });
+
+  it("refuses staged _exit artifact conflicts without explicit overwrite", async () => {
+    const source = await makeHarness();
+    const sourceIdentity = await callTool(source.tools, "identity_create", {
+      label: "source-agent",
+    });
+    const sourceIdentityId = sourceIdentity.identity_id as string;
+    await callTool(source.tools, "state_write", {
+      namespace: "agent-memory",
+      key: "handoff",
+      value: "durable state survives exit",
+      identity_id: sourceIdentityId,
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-repeat-"));
+    tempDirs.push(bundleDir);
+    await exportExitBundle({
+      bundleDir,
+      storage: source.storage,
+      masterKey: source.masterKey,
+      identityManager: source.identityManager,
+      auditLog: source.auditLog,
+      reputationStore: source.reputationStore,
+      policy: DEFAULT_POLICY,
+      config: defaultConfig(),
+      stateNamespaces: ["agent-memory"],
+      keySource: "recovery-key",
+    });
+    const manifest = JSON.parse(
+      await readFile(join(bundleDir, "manifest.json"), "utf8"),
+    ) as {
+      body: {
+        exported_at: string;
+        identity_binding: { identity_id: string };
+      };
+    };
+    const importId = `${manifest.body.identity_binding.identity_id}-${manifest.body.exported_at.replace(/[^0-9a-zA-Z_.-]/g, "_")}`;
+
+    const destination = await makeHarness();
+    await destination.storage.write(
+      "_exit_policy_sets",
+      importId,
+      new TextEncoder().encode("{}"),
+    );
+    const commonImport = {
+      bundleDir,
+      storage: destination.storage,
+      masterKey: destination.masterKey,
+      identityManager: destination.identityManager,
+      auditLog: destination.auditLog,
+      reputationStore: destination.reputationStore,
+      activate: true,
+      sourceMasterKey: source.masterKey,
+    };
+    await expect(importExitBundle(commonImport)).rejects.toMatchObject({
+      code: "STAGED_ARTIFACT_CONFLICT",
+    });
+    const destinationIdentity = await callTool(destination.tools, "identity_create", {
+      label: "destination-import-signer",
+    });
+    await expect(
+      importExitBundle({
+        ...commonImport,
+        forceRebind: true,
+        conflictResolution: "overwrite",
+        destinationSignerIdentityId: destinationIdentity.identity_id as string,
+      }),
+    ).resolves.toMatchObject({ activated: true });
+    expect((await destination.storage.list("_exit_policy_sets")).length).toBe(1);
+  });
 });

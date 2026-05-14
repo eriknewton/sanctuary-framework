@@ -9,10 +9,14 @@
  */
 
 import { randomBytes } from "../core/random.js";
-import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
 import type { SignedEvent } from "../mesh/types.js";
 import {
   ATTESTATION_EVENT_TYPE_PREFIX,
+  BADGE_STATES,
+  FAILURE_MODE_CODES,
+  LAYER_TYPES,
+  SIGNATURE_SCHEME_V1,
+  isAttestationEventType,
   type AttestationEventType,
   type BadgeStateColor,
   type FailureModeCode,
@@ -159,6 +163,63 @@ export function fromSignedEvent(
   ) {
     return null;
   }
-  // The payload is the AttestationEvent
-  return evt.payload as AttestationEvent;
+  if (!isAttestationEventType(evt.event_type)) {
+    return null;
+  }
+  const payload = evt.payload;
+  if (!isValidAttestationEvent(payload)) {
+    return null;
+  }
+  if (payload.event_type !== evt.event_type) {
+    return null;
+  }
+  return payload;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function isValidAttestationEvent(value: unknown): value is AttestationEvent {
+  if (!isRecord(value)) return false;
+  if (!isNonEmptyString(value.event_id)) return false;
+  if (
+    typeof value.event_type !== "string" ||
+    !isAttestationEventType(value.event_type)
+  ) {
+    return false;
+  }
+  if (value.signature_scheme !== SIGNATURE_SCHEME_V1) return false;
+  if (
+    typeof value.target_layer !== "string" ||
+    !(LAYER_TYPES as readonly string[]).includes(value.target_layer)
+  ) {
+    return false;
+  }
+  if (!isNonEmptyString(value.scope_id)) return false;
+  if (
+    typeof value.resulting_state !== "string" ||
+    !(BADGE_STATES as readonly string[]).includes(value.resulting_state)
+  ) {
+    return false;
+  }
+  if (
+    value.failure_mode !== undefined &&
+    (typeof value.failure_mode !== "string" ||
+      !(FAILURE_MODE_CODES as readonly string[]).includes(value.failure_mode))
+  ) {
+    return false;
+  }
+  if (!isIsoTimestamp(value.emitted_at)) return false;
+  if (!isNonEmptyString(value.explanation)) return false;
+  if (value.metadata !== undefined && !isRecord(value.metadata)) return false;
+  return true;
 }

@@ -42,7 +42,10 @@ import {
   DEFAULT_MIN_SAMPLES_FOR_PREDICTION,
   ROLLING_BASELINE_CLASSIFIER_ID,
 } from "./classifiers/rolling-baseline.js";
-import type { AnomalyDetector } from "./types.js";
+import { CUSUM_CLASSIFIER_ID, CusumClassifier } from "./classifiers/cusum.js";
+import { PSI_CLASSIFIER_ID, PsiClassifier } from "./classifiers/psi.js";
+import { ClassifierStateStore } from "./classifier-state-store.js";
+import type { AnomalyClassifier, AnomalyContext, AnomalyDetector } from "./types.js";
 
 /**
  * One detector + classifier combination. The detectorId + classifierId
@@ -58,6 +61,11 @@ export interface AnomalyCatalogEntry {
   description: string;
   /** Factory producing a fresh detector instance on each subscribe. */
   factory: () => AnomalyDetector;
+  /**
+   * Factory for classifier-specific subscriptions when the detector is
+   * already active under another classifier tuple.
+   */
+  classifierFactory?: (context: AnomalyContext) => AnomalyClassifier;
 }
 
 /**
@@ -81,6 +89,38 @@ export const ANOMALY_CATALOG: AnomalyCatalogEntry[] = [
     description:
       "Per-agent statistical drift detector: tool-call count, egress volume, credential-use rate, audit-event count, recent-receipt count over a 24h rolling window. Welford running mean + variance baseline per agent.",
     factory: () => new PerAgentActivityDetector(),
+  },
+  {
+    detectorId: PER_AGENT_ACTIVITY_DETECTOR_ID,
+    classifierId: CUSUM_CLASSIFIER_ID,
+    description:
+      "Per-agent CUSUM drift detector over the same per-agent activity feature stream. Catches slow mean shifts that single-sample baselines may miss.",
+    factory: () => new PerAgentActivityDetector(),
+    classifierFactory: (context) =>
+      new CusumClassifier({
+        stateStore: new ClassifierStateStore({
+          storage: context.storage,
+          masterKey: context.masterKey,
+          fortressId: context.fortressId,
+          now: context.now,
+        }),
+      }),
+  },
+  {
+    detectorId: PER_AGENT_ACTIVITY_DETECTOR_ID,
+    classifierId: PSI_CLASSIFIER_ID,
+    description:
+      "Per-agent PSI distribution-shift detector over the same per-agent activity feature stream. Catches feature-shape drift independent of mean movement.",
+    factory: () => new PerAgentActivityDetector(),
+    classifierFactory: (context) =>
+      new PsiClassifier({
+        stateStore: new ClassifierStateStore({
+          storage: context.storage,
+          masterKey: context.masterKey,
+          fortressId: context.fortressId,
+          now: context.now,
+        }),
+      }),
   },
   {
     detectorId: CROSS_AGENT_TIMING_DETECTOR_ID,
