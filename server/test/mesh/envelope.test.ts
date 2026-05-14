@@ -149,6 +149,53 @@ describe("mesh/envelope — basic pack + verify round-trip", () => {
     expect(res.recognized_reserved_extension_keys).toEqual([]);
   });
 
+  it("emits monotonic ULID event IDs per emitter", () => {
+    const payload: PolicyUpdatePayload = {
+      agent_id: "agent-x",
+      policy_version: 1,
+      policy_blob: "base64url-of-compiled-policy",
+    };
+    const events = [1, 2, 3].map((seq) =>
+      packSignedEvent<PolicyUpdatePayload>({
+        event_type: "policy_update",
+        emitter_node: f.nodeCert.node_id,
+        emitter_principal: f.principalCert.principal_id,
+        fortress_id: f.master.public.fortress_id,
+        payload: { ...payload, policy_version: seq },
+        monotonic_seq: seq,
+        node_private_key: f.nodeKeypair.privateKey,
+        principal_private_key: f.principalKeypair.privateKey,
+      })
+    );
+    expect(events[0].event_id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    expect(events[1].event_id > events[0].event_id).toBe(true);
+    expect(events[2].event_id > events[1].event_id).toBe(true);
+  });
+
+  it("still verifies legacy stored events with non-ULID event IDs", () => {
+    const payload: PolicyUpdatePayload = {
+      agent_id: "agent-x",
+      policy_version: 4,
+      policy_blob: "base64url-of-compiled-policy",
+    };
+    const body = {
+      protocol_version: "0.1",
+      event_type: "policy_update",
+      event_id: "0123456789abcdef0123456789abcdef",
+      emitter_node: f.nodeCert.node_id,
+      emitter_principal: f.principalCert.principal_id,
+      fortress_id: f.master.public.fortress_id,
+      causal_parents: [] as string[],
+      payload,
+      payload_hash: toBase64url(sha256(canonicalizeToBytes(payload))),
+      emitted_at: "2026-05-14T00:00:00.000Z",
+      monotonic_seq: 4,
+      extension_envelope: {},
+    };
+    const legacy = signEventBody(body, f.nodeKeypair.privateKey);
+    expect(verifySignedEvent(legacy, contextFor(f)).ok).toBe(true);
+  });
+
   it("rejects envelope whose payload has been tampered after signing", () => {
     const evt = packSignedEvent({
       event_type: "heartbeat",

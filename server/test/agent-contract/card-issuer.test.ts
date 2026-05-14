@@ -22,7 +22,24 @@ import { MeshSignatureError } from "../../src/mesh/errors.js";
 import { SIGNATURE_SCHEME_V1 } from "../../src/mesh/constants.js";
 import { buildPolicyBlobBytes, buildTestFortress } from "./fixture.js";
 import type { SignedEvent } from "../../src/mesh/types.js";
-import type { AgentCard } from "../../src/agent-contract/types.js";
+import type {
+  AgentCard,
+  AgentIdentityBinding,
+} from "../../src/agent-contract/types.js";
+
+function agentBinding(params: {
+  agent_id: string;
+  fortress_id: string;
+  fill?: number;
+}): AgentIdentityBinding {
+  return {
+    agent_id: params.agent_id,
+    fortress_id: params.fortress_id,
+    agent_pubkey: toBase64url(new Uint8Array(32).fill(params.fill ?? 7)),
+    derived_subkey_purposes: [],
+    bound_at: "2026-05-14T00:00:00.000Z",
+  };
+}
 
 describe("Agent Card issuance + verification (§3)", () => {
   it("round-trips a signed Agent Card through real mesh crypto", () => {
@@ -35,7 +52,10 @@ describe("Agent Card issuance + verification (§3)", () => {
       harness_id: "cline",
       model_provider: "anthropic",
       model_id: "claude-opus-4-7",
-      agent_pubkey: toBase64url(new Uint8Array(32).fill(7)),
+      agent_identity_binding: agentBinding({
+        agent_id: "agent-alpha",
+        fortress_id: f.master.public.fortress_id,
+      }),
       capabilities: [
         { kind: "read-slot", target: "memory" },
         { kind: "tool-call", target: "filesystem/read*" },
@@ -68,7 +88,10 @@ describe("Agent Card issuance + verification (§3)", () => {
       harness_id: "cline",
       model_provider: "anthropic",
       model_id: "claude-opus-4-7",
-      agent_pubkey: toBase64url(new Uint8Array(32).fill(7)),
+      agent_identity_binding: agentBinding({
+        agent_id: "agent-alpha",
+        fortress_id: f.master.public.fortress_id,
+      }),
       capabilities: [{ kind: "read-slot", target: "memory" }],
       policy_version: 1,
       policy_blob_bytes: policy,
@@ -104,7 +127,10 @@ describe("Agent Card issuance + verification (§3)", () => {
       harness_id: "cline",
       model_provider: "anthropic",
       model_id: "claude-opus-4-7",
-      agent_pubkey: toBase64url(new Uint8Array(32).fill(7)),
+      agent_identity_binding: agentBinding({
+        agent_id: "a",
+        fortress_id: f.master.public.fortress_id,
+      }),
       capabilities: [],
       policy_version: 0,
       policy_blob_bytes: policy,
@@ -130,7 +156,10 @@ describe("Agent Card issuance + verification (§3)", () => {
       harness_id: "cline",
       model_provider: "anthropic",
       model_id: "claude-opus-4-7",
-      agent_pubkey: toBase64url(new Uint8Array(32).fill(7)),
+      agent_identity_binding: agentBinding({
+        agent_id: "a",
+        fortress_id: f.master.public.fortress_id,
+      }),
       capabilities: [],
       policy_version: 0,
       policy_blob_bytes: policy,
@@ -174,7 +203,39 @@ describe("Agent Card issuance + verification (§3)", () => {
         // even bypassing the adapter constructor, the issuance gate refuses.
         model_provider: "openai",
         model_id: "gpt-5",
-        agent_pubkey: toBase64url(new Uint8Array(32).fill(9)),
+        agent_identity_binding: agentBinding({
+          agent_id: "agent-pinned",
+          fortress_id: f.master.public.fortress_id,
+          fill: 9,
+        }),
+        capabilities: [{ kind: "read-slot", target: "memory" }],
+        policy_version: 1,
+        policy_blob_bytes: policy,
+        attestation_endpoint: "http://127.0.0.1:3501/att",
+        emitter_node: f.nodeCert.node_id,
+        emitter_principal: f.principalCert.principal_id,
+        node_private_key: f.nodeKeypair.privateKey,
+        monotonic_seq: 0,
+      })
+    ).toThrow(AgentCardSchemaError);
+  });
+
+  it("rejects Agent Card issuance when the identity binding belongs to a different agent", () => {
+    const f = buildTestFortress();
+    const policy = buildPolicyBlobBytes(1);
+    expect(() =>
+      issueAgentCard({
+        agent_id: "agent-alpha",
+        fortress_id: f.master.public.fortress_id,
+        tier: "B",
+        harness_id: "cline",
+        model_provider: "anthropic",
+        model_id: "claude-opus-4-7",
+        agent_identity_binding: agentBinding({
+          agent_id: "agent-beta",
+          fortress_id: f.master.public.fortress_id,
+          fill: 9,
+        }),
         capabilities: [{ kind: "read-slot", target: "memory" }],
         policy_version: 1,
         policy_blob_bytes: policy,
@@ -197,7 +258,11 @@ describe("Agent Card issuance + verification (§3)", () => {
       harness_id: "claude-code",
       model_provider: "anthropic",
       model_id: "claude-opus-4-7",
-      agent_pubkey: toBase64url(new Uint8Array(32).fill(11)),
+      agent_identity_binding: agentBinding({
+        agent_id: "agent-pinned-ok",
+        fortress_id: f.master.public.fortress_id,
+        fill: 11,
+      }),
       capabilities: [{ kind: "read-slot", target: "memory" }],
       policy_version: 1,
       policy_blob_bytes: policy,
@@ -223,7 +288,11 @@ describe("Agent Card issuance + verification (§3)", () => {
       harness_id: "hermes",
       model_provider: "openai",
       model_id: "gpt-5",
-      agent_pubkey: toBase64url(new Uint8Array(32).fill(13)),
+      agent_identity_binding: agentBinding({
+        agent_id: "agent-hermes",
+        fortress_id: f.master.public.fortress_id,
+        fill: 13,
+      }),
       capabilities: [{ kind: "read-slot", target: "memory" }],
       policy_version: 1,
       policy_blob_bytes: policy,
@@ -246,7 +315,11 @@ describe("Agent Card issuance + verification (§3)", () => {
       harness_id: "openclaw",
       model_provider: "anthropic",
       model_id: "claude-opus-4-7",
-      agent_pubkey: toBase64url(new Uint8Array(32).fill(3)),
+      agent_identity_binding: agentBinding({
+        agent_id: "agent-a",
+        fortress_id: f.master.public.fortress_id,
+        fill: 3,
+      }),
       capabilities: [{ kind: "read-slot", target: "memory" }],
       policy_version: 1,
       policy_blob_bytes: policy,

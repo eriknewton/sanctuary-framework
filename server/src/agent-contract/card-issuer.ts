@@ -33,7 +33,11 @@ import {
 } from "./constants.js";
 import { AgentCardSchemaError, AgentCardVerificationError } from "./errors.js";
 import { validateAgentCard } from "./schema.js";
-import type { AgentCard, AgentCardCapability } from "./types.js";
+import type {
+  AgentCard,
+  AgentCardCapability,
+  AgentIdentityBinding,
+} from "./types.js";
 
 export const AGENT_CARD_ISSUED_EVENT_TYPE: AgentContractEventType =
   "agent_card_issued";
@@ -45,7 +49,7 @@ export interface IssueAgentCardParams {
   harness_id: string;
   model_provider: AgentCard["model_provider"];
   model_id: string;
-  agent_pubkey: string;
+  agent_identity_binding: AgentIdentityBinding;
   capabilities: AgentCardCapability[];
   /** Pinned policy at launch — integer version + opaque blob (same bytes the policy engine emitted). */
   policy_version: number;
@@ -92,6 +96,16 @@ export function issueAgentCard(
       `harness_id="${params.harness_id}" requires model_provider="${requiredProvider}"; got "${params.model_provider}"`
     );
   }
+  if (params.agent_identity_binding.agent_id !== params.agent_id) {
+    throw new AgentCardSchemaError(
+      `agent identity binding agent_id="${params.agent_identity_binding.agent_id}" does not match issuance agent_id="${params.agent_id}"`
+    );
+  }
+  if (params.agent_identity_binding.fortress_id !== params.fortress_id) {
+    throw new AgentCardSchemaError(
+      `agent identity binding fortress_id="${params.agent_identity_binding.fortress_id}" does not match issuance fortress_id="${params.fortress_id}"`
+    );
+  }
   const issued_at = params.issued_at ?? new Date().toISOString();
   const policy_version_hash = toBase64url(sha256(params.policy_blob_bytes));
   const card: AgentCard = {
@@ -103,7 +117,7 @@ export function issueAgentCard(
     harness_id: params.harness_id,
     model_provider: params.model_provider,
     model_id: params.model_id,
-    agent_pubkey: params.agent_pubkey,
+    agent_pubkey: params.agent_identity_binding.agent_pubkey,
     policy_version_hash,
     policy_version: params.policy_version,
     attestation_endpoint: params.attestation_endpoint,

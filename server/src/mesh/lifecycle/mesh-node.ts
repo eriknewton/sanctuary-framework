@@ -28,6 +28,7 @@ import {
   MeshReservedCapabilityBitError,
   MeshReservedEventTypeError,
   MeshReservedExtensionKeyError,
+  MeshRollbackDetectedError,
 } from "../errors.js";
 import { packSignedEvent } from "../envelope.js";
 import { verifySignedEvent } from "../envelope.js";
@@ -144,6 +145,7 @@ export class MeshNode {
   private readonly locatorTable = new LocatorTableStore();
   private readonly lifecycleLog = new NodeLifecycleEventLog();
   private readonly principalRoster = new Map<string, PrincipalCertificate>();
+  private readonly lastReceivedMonotonicSeq = new Map<string, number>();
   private guardianRoster: GuardianRoster | null = null;
   private readonly router = new MeshRouter();
   private readonly auditBuffer: AuditBuffer;
@@ -500,6 +502,12 @@ export class MeshNode {
       expected_fortress_id: this.config.fortress_id,
       issuing_principal_cert: issuingPrincipal,
     });
+    if (request.node_mode !== request.bootstrap_token.intended_node_mode) {
+      return {
+        approved: false,
+        denial_reason: `node_mode ${request.node_mode} does not match bootstrap token intended_node_mode ${request.bootstrap_token.intended_node_mode}`,
+      };
+    }
     const expectedTransportKey = deriveNodeTransportKey({
       fortress_master_secret: this.fortressMasterSecret,
       node_id: request.bootstrap_token.intended_node_id,
@@ -1292,6 +1300,7 @@ export class MeshNode {
     // keys; the router drops at dispatch.
     try {
       this.verifyOrThrow(evt);
+      this.enforceReceivedMonotonicSeq(evt);
     } catch (e) {
       this.auditPeerProtocolViolation({
         error: e instanceof Error ? e : new Error(String(e)),
@@ -1314,6 +1323,17 @@ export class MeshNode {
       at: Date.now(),
     });
     this.router.dispatch(evt);
+  }
+
+  private enforceReceivedMonotonicSeq(evt: SignedEvent): void {
+    const last = this.lastReceivedMonotonicSeq.get(evt.emitter_node);
+    if (last !== undefined && evt.monotonic_seq <= last) {
+      throw new MeshRollbackDetectedError(
+        evt.emitter_node,
+        `non-monotonic envelope monotonic_seq (got ${evt.monotonic_seq}, last seen ${last})`
+      );
+    }
+    this.lastReceivedMonotonicSeq.set(evt.emitter_node, evt.monotonic_seq);
   }
 
   private assertNodeRevokeAuthorized(
