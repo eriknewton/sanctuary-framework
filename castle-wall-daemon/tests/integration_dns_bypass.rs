@@ -215,12 +215,7 @@ fn policy_blocks_doh_to_unallowed_provider_emits_egress_blocked_default_deny() {
     // host-name match misses the curated allow entry; default-deny fires.
     let (handle, _dir) = boot_with_only_example_com_443_allowed();
     let outcome = handle
-        .evaluate_attempt(&dns_request(
-            Some("dns.google"),
-            "8.8.8.8",
-            443,
-            "tcp",
-        ))
+        .evaluate_attempt(&dns_request(Some("dns.google"), "8.8.8.8", 443, "tcp"))
         .expect("evaluate DoH dns.google");
     assert!(matches!(
         outcome.verdict,
@@ -288,12 +283,7 @@ fn policy_blocks_dot_to_quad9_resolver() {
     // provider mentioned in operator briefings.
     let (handle, _dir) = boot_with_only_example_com_443_allowed();
     let outcome = handle
-        .evaluate_attempt(&dns_request(
-            Some("dns.quad9.net"),
-            "9.9.9.9",
-            853,
-            "tcp",
-        ))
+        .evaluate_attempt(&dns_request(Some("dns.quad9.net"), "9.9.9.9", 853, "tcp"))
         .expect("evaluate DoT quad9");
     assert!(matches!(
         outcome.verdict,
@@ -351,18 +341,11 @@ fn policy_allows_explicitly_listed_destination_alongside_bypass_denials() {
         Verdict::Allow { rule_id } => assert_eq!(rule_id, "rule-allow-example"),
         other => panic!("expected Allow for example.com:443; got {other:?}"),
     }
-    assert!(allowed
-        .event_canonical_json
-        .contains("\"egress_approved\""));
+    assert!(allowed.event_canonical_json.contains("\"egress_approved\""));
 
     // Bypass path (DoH).
     let denied = handle
-        .evaluate_attempt(&dns_request(
-            Some("dns.google"),
-            "8.8.8.8",
-            443,
-            "tcp",
-        ))
+        .evaluate_attempt(&dns_request(Some("dns.google"), "8.8.8.8", 443, "tcp"))
         .expect("evaluate DoH bypass");
     assert!(matches!(
         denied.verdict,
@@ -423,8 +406,7 @@ impl KernelBypassFixture {
         nftables::install_castle_table().expect("install_castle_table");
 
         let scope = cgroup::create_agent_scope(agent_id).expect("create_agent_scope");
-        let cgroup_relative =
-            cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+        let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
 
         // Production ruleset: real `socket cgroupv2 level <N> "<path>"` match.
         // The allow rule covers example.com (93.184.216.34) at 443/tcp;
@@ -433,23 +415,14 @@ impl KernelBypassFixture {
             rule_id: "allow-example".to_string(),
             nft_expr: "ip daddr 93.184.216.34 tcp dport 443 accept".to_string(),
         }];
-        let script = nftables::build_agent_ruleset(
-            agent_id,
-            &cgroup_relative,
-            scope.cgroup_level,
-            &frags,
-        );
+        let script =
+            nftables::build_agent_ruleset(agent_id, &cgroup_relative, scope.cgroup_level, &frags);
         let ruleset_id = AgentRulesetId {
             agent_id: agent_id.to_string(),
             cgroup_path: scope.cgroup_path.clone(),
         };
-        nftables::load_agent_ruleset(
-            &ruleset_id,
-            &script,
-            scope.cgroup_level,
-            &cgroup_relative,
-        )
-        .expect("load_agent_ruleset");
+        nftables::load_agent_ruleset(&ruleset_id, &script, scope.cgroup_level, &cgroup_relative)
+            .expect("load_agent_ruleset");
 
         let captured: Arc<Mutex<Vec<PendingPacket>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
@@ -547,13 +520,19 @@ impl KernelBypassFixture {
             .iter()
             .find(|pkt| pkt.protocol == proto_byte && pkt.dest_port == fallback_port);
 
-        let (dest_ip, dest_port, protocol_str) = match chosen {
+        let (agent_id, dest_ip, dest_port, protocol_str) = match chosen {
             Some(pkt) => (
-                pkt.dest_ip.clone().unwrap_or_else(|| fallback_dest_ip.to_string()),
+                pkt.source_agent_id
+                    .clone()
+                    .unwrap_or_else(|| "missing-agent-attribution".to_string()),
+                pkt.dest_ip
+                    .clone()
+                    .unwrap_or_else(|| fallback_dest_ip.to_string()),
                 pkt.dest_port,
                 fallback_protocol.to_string(),
             ),
             None => (
+                self.agent_id.clone(),
                 fallback_dest_ip.to_string(),
                 fallback_port,
                 fallback_protocol.to_string(),
@@ -561,7 +540,7 @@ impl KernelBypassFixture {
         };
 
         let req = EvaluationRequest {
-            agent_id: self.agent_id.clone(),
+            agent_id,
             agent_template: "claude-code".to_string(),
             dest_host: fallback_dest_host.map(|h| h.to_string()),
             dest_ip: Some(dest_ip),
@@ -658,6 +637,10 @@ fn kernel_drops_plain_dns_to_unallowed_resolver() {
          or the subprocess did not enter the cgroup."
     );
     assert!(
+        audit_json.contains("\"agent_id\":\"dns-bypass-test\""),
+        "audit must attribute NFQUEUE packet to wrapped agent; got: {audit_json}"
+    );
+    assert!(
         audit_json.contains("\"egress_blocked\""),
         "audit must record egress_blocked; got: {audit_json}"
     );
@@ -705,17 +688,17 @@ fn kernel_drops_doh_to_unallowed_provider() {
         "python3 -c \"import socket;s=socket.socket();s.settimeout(1.5);s.connect_ex(('8.8.8.8',443))\" || true",
     );
 
-    let (captured_count, audit_json) = fixture.drive_audit_for_first_capture(
-        "tcp",
-        443,
-        "8.8.8.8",
-        Some("dns.google"),
-    );
+    let (captured_count, audit_json) =
+        fixture.drive_audit_for_first_capture("tcp", 443, "8.8.8.8", Some("dns.google"));
 
     assert!(
         captured_count >= 1,
         "expected at least one packet in NFQUEUE for DoH bypass; got 0. \
          This suggests the production cgroupv2 match did not fire."
+    );
+    assert!(
+        audit_json.contains("\"agent_id\":\"doh-bypass-test\""),
+        "audit must attribute NFQUEUE packet to wrapped agent; got: {audit_json}"
     );
     assert!(
         audit_json.contains("\"egress_blocked\""),
@@ -753,17 +736,17 @@ fn kernel_drops_dot_to_unallowed_resolver() {
         "python3 -c \"import socket;s=socket.socket();s.settimeout(1.5);s.connect_ex(('1.1.1.1',853))\" || true",
     );
 
-    let (captured_count, audit_json) = fixture.drive_audit_for_first_capture(
-        "tcp",
-        853,
-        "1.1.1.1",
-        Some("cloudflare-dns.com"),
-    );
+    let (captured_count, audit_json) =
+        fixture.drive_audit_for_first_capture("tcp", 853, "1.1.1.1", Some("cloudflare-dns.com"));
 
     assert!(
         captured_count >= 1,
         "expected at least one packet in NFQUEUE for DoT bypass; got 0. \
          This suggests the production cgroupv2 match did not fire."
+    );
+    assert!(
+        audit_json.contains("\"agent_id\":\"dot-bypass-test\""),
+        "audit must attribute NFQUEUE packet to wrapped agent; got: {audit_json}"
     );
     assert!(
         audit_json.contains("\"egress_blocked\""),
