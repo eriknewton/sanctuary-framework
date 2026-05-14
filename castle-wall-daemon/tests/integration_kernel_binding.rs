@@ -545,7 +545,10 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         disposition: RuleDisposition::Allow,
     };
     let frags = rule_to_nft_expr(&test_rule);
-    assert!(!frags.is_empty());
+    assert!(
+        frags.is_empty(),
+        "host allow rules must stay on the NFQUEUE verdict path"
+    );
 
     // End-to-end policy + audit flow with the production cgroupv2 match.
     // Create a real agent scope so nft's path lookup at rule-load succeeds.
@@ -572,8 +575,18 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
 
     // Verify rules installed.
     let output = nft_cmd(&["list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "agent_test-e2e"]);
-    assert!(output.contains("443"));
-    assert!(output.contains("queue"));
+    assert!(
+        output.contains("queue"),
+        "host allow chain should route packets to NFQUEUE: {output}"
+    );
+    assert!(
+        !output.contains("accept"),
+        "host allow must not install a static port-wide accept: {output}"
+    );
+    assert!(
+        !output.contains("dport 443"),
+        "host allow must not install a static TCP/443 match: {output}"
+    );
 
     // Evaluate: allowed destination.
     let req_allowed = EvaluationRequest {
@@ -607,6 +620,31 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     ));
     assert!(outcome_denied.event_canonical_json.contains("\"egress_blocked\""));
 
+    // Live kernel regression for full-sweep #99: with only a hostname allow
+    // installed, raw TCP/443 traffic to an unlisted IP reaches NFQUEUE and
+    // defaults closed instead of being accepted by a static dport rule.
+    let req_raw_ip_denied = EvaluationRequest {
+        agent_id: "test-e2e".to_string(),
+        agent_template: "claude-code".to_string(),
+        dest_host: None,
+        dest_ip: Some("198.51.100.99".to_string()),
+        dest_port: 443,
+        dest_protocol: "tcp".to_string(),
+        opaque: true,
+    };
+    let outcome_raw_ip_denied = handle
+        .evaluate_attempt(&req_raw_ip_denied)
+        .expect("evaluate raw ip denied");
+    assert!(matches!(
+        outcome_raw_ip_denied.verdict,
+        Verdict::Deny { reason: castle_wall_daemon::DeniedReason::DefaultDeny }
+    ));
+    assert!(
+        outcome_raw_ip_denied
+            .event_canonical_json
+            .contains("\"egress_blocked\"")
+    );
+
     // Verify WAL has both events.
     let wal = handle.wal_writer().expect("wal");
     let mut wal_guard = wal.lock().unwrap();
@@ -614,7 +652,7 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     let approved = snapshot.iter().filter(|e| e.event_canonical_json.contains("\"egress_approved\"")).count();
     let blocked = snapshot.iter().filter(|e| e.event_canonical_json.contains("\"egress_blocked\"")).count();
     assert!(approved >= 1);
-    assert!(blocked >= 1);
+    assert!(blocked >= 2);
     drop(wal_guard);
 
     let _ = handle.stop();

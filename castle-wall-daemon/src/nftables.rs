@@ -544,8 +544,13 @@ pub fn table_exists() -> Result<bool, NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
-/// Translate a single AllowlistRule into an nft rule expression fragment.
-/// Handles host exact-match, suffix-glob, port sets, and protocol match.
+/// Translate a single AllowlistRule into nft rule expression fragments.
+///
+/// Host-constrained rules deliberately do not emit static nft accept/drop
+/// verdicts: nft cannot verify hostname context, so those decisions must stay
+/// on the NFQUEUE verdict path where the daemon can evaluate the resolved host
+/// against the signed policy. Only rules without any host axis are safe to
+/// lower directly into nftables.
 pub fn rule_to_nft_expr(
     rule: &crate::policy::AllowlistRule,
 ) -> Vec<NftRuleFragment> {
@@ -577,41 +582,19 @@ pub fn rule_to_nft_expr(
         .unwrap_or("tcp")
         .to_ascii_lowercase();
 
-    // Build exact-host rules.
-    if let Some(hosts) = rule.match_clause.host.as_ref() {
-        for host in hosts {
-            // nftables does not do DNS resolution in rules. For hostname-based
-            // allowlisting, the NFQUEUE verdict path handles DNS-resolved
-            // matching. Static nft rules use IP-based matching only. We emit
-            // a comment-tagged placeholder that the NFQUEUE handler
-            // recognizes. In production the DNS resolver populates IP sets.
-            let mut expr = proto.to_string();
-            if !port_expr.is_empty() {
-                expr.push_str(&format!(" {port_expr}"));
-            }
-            // nft syntax: comment must follow the verdict, not precede it.
-            expr.push_str(&format!(" {disposition_expr} comment \"host={host}\""));
-            frags.push(NftRuleFragment {
-                rule_id: rule.id.clone(),
-                nft_expr: expr,
-            });
-        }
+    if rule.match_clause.host.is_some() || rule.match_clause.host_pattern.is_some() {
+        return frags;
     }
 
-    // If no hosts specified, emit an unconstrained rule.
-    if rule.match_clause.host.is_none()
-        && rule.match_clause.host_pattern.is_none()
-    {
-        let mut expr = proto.to_string();
-        if !port_expr.is_empty() {
-            expr.push_str(&format!(" {port_expr}"));
-        }
-        expr.push_str(&format!(" {disposition_expr}"));
-        frags.push(NftRuleFragment {
-            rule_id: rule.id.clone(),
-            nft_expr: expr,
-        });
+    let mut expr = proto.to_string();
+    if !port_expr.is_empty() {
+        expr.push_str(&format!(" {port_expr}"));
     }
+    expr.push_str(&format!(" {disposition_expr}"));
+    frags.push(NftRuleFragment {
+        rule_id: rule.id.clone(),
+        nft_expr: expr,
+    });
 
     frags
 }
@@ -732,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_to_nft_expr_allow_with_host_and_port() {
+    fn rule_to_nft_expr_allow_with_host_and_port_stays_on_nfqueue() {
         let r = make_rule(
             "r1",
             Some(vec!["api.anthropic.com"]),
@@ -741,11 +724,10 @@ mod tests {
             RuleDisposition::Allow,
         );
         let frags = rule_to_nft_expr(&r);
-        assert_eq!(frags.len(), 1);
-        assert!(frags[0].nft_expr.contains("tcp"));
-        assert!(frags[0].nft_expr.contains("dport 443"));
-        assert!(frags[0].nft_expr.contains("accept"));
-        assert!(frags[0].nft_expr.contains("api.anthropic.com"));
+        assert!(
+            frags.is_empty(),
+            "host allow rules must not become static port-wide nft accepts"
+        );
     }
 
     #[test]
@@ -771,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_to_nft_expr_multiple_hosts() {
+    fn rule_to_nft_expr_multiple_hosts_stays_on_nfqueue() {
         let r = make_rule(
             "r4",
             Some(vec!["a.com", "b.com"]),
@@ -780,9 +762,21 @@ mod tests {
             RuleDisposition::Allow,
         );
         let frags = rule_to_nft_expr(&r);
-        assert_eq!(frags.len(), 2);
-        assert!(frags[0].nft_expr.contains("a.com"));
-        assert!(frags[1].nft_expr.contains("b.com"));
+        assert!(
+            frags.is_empty(),
+            "multi-host rules must not emit comment-only static verdicts"
+        );
+    }
+
+    #[test]
+    fn rule_to_nft_expr_host_pattern_stays_on_nfqueue() {
+        let mut r = make_rule("r5", None, Some(vec![443]), Some("tcp"), RuleDisposition::Deny);
+        r.match_clause.host_pattern = Some(".example.com".to_string());
+        let frags = rule_to_nft_expr(&r);
+        assert!(
+            frags.is_empty(),
+            "host-pattern rules must not become static port-wide nft drops"
+        );
     }
 
     // ---- build_agent_jump_rule pure-helper tests --------------------------
