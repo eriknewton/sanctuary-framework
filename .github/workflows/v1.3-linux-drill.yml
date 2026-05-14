@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install prerequisites
         run: |
@@ -26,7 +26,7 @@ jobs:
           sudo modprobe nfnetlink_queue || true
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '22'
 
@@ -41,7 +41,7 @@ jobs:
 
       - name: Upload drill report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: v1.3-linux-drill-report-${{ github.run_id }}
           path: /tmp/v1.3-linux-drill-report.md
