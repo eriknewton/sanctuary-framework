@@ -133,6 +133,21 @@ pub fn build_agent_jump_rule(
     )
 }
 
+/// Build a fail-closed per-agent chain body for a refreshed cgroup.
+///
+/// During systemd scope recreation there is a short interval where the old
+/// base-chain jump points at an obsolete cgroup identity and the new cgroup
+/// identity is not yet wired. This ruleset is the first stage of refresh:
+/// replace the per-agent chain with a single drop verdict, then wire the
+/// refreshed cgroup jump to it before the normal policy rules are restored.
+pub fn build_agent_fail_closed_ruleset(agent_id: &str) -> String {
+    let chain_name = agent_chain_name(agent_id);
+    format!(
+        "flush chain {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name}\n\
+         add rule {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name} drop\n"
+    )
+}
+
 /// Derive a sanitized chain name from an agent id.
 pub(crate) fn agent_chain_name(agent_id: &str) -> String {
     let max_component_len = NFT_CHAIN_MAX_LEN - AGENT_CHAIN_PREFIX.len();
@@ -235,7 +250,7 @@ mod linux {
         Ok(())
     }
 
-    pub fn load_agent_ruleset_impl(
+    fn replace_agent_chain_and_jump_impl(
         id: &AgentRulesetId,
         ruleset_script: &str,
         cgroup_level: u32,
@@ -245,14 +260,50 @@ mod linux {
         // Ensure the per-agent chain exists.
         let create = format!("add chain {CASTLE_FAMILY} {CASTLE_TABLE} {chain_name}\n");
         let _ = run_nft_stdin(&create);
-        // Apply the ruleset script (atomic replace on the per-agent chain).
-        run_nft_stdin(ruleset_script)?;
-        // Wire the base output chain to this per-agent chain so kernel
-        // packets actually traverse the per-agent rules. Without this jump,
-        // the per-agent chain is a dead chain and packets bypass enforcement
-        // entirely. Idempotent: any existing jump rule for this agent is
-        // removed before the new one is added (supports policy reload).
-        install_agent_jump_rule_impl(id, cgroup_level, cgroup_relative_path)
+
+        let listing = match run_nft(&["-a", "list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "output"])
+        {
+            Ok(s) => s,
+            Err(NftablesError::InvocationFailed(msg))
+                if msg.contains("No such file or directory") || msg.contains("does not exist") =>
+            {
+                String::new()
+            }
+            Err(e) => return Err(e),
+        };
+        let handles = parse_jump_rule_handles(&listing, &chain_name);
+
+        let mut script = String::new();
+        script.push_str(ruleset_script);
+        for handle in handles {
+            script.push_str(&format!(
+                "delete rule {CASTLE_FAMILY} {CASTLE_TABLE} output handle {handle}\n"
+            ));
+        }
+        let rule = build_agent_jump_rule(&id.agent_id, cgroup_level, cgroup_relative_path);
+        script.push_str(&format!("{rule}\n"));
+        run_nft_stdin(&script)
+    }
+
+    pub fn load_agent_ruleset_impl(
+        id: &AgentRulesetId,
+        ruleset_script: &str,
+        cgroup_level: u32,
+        cgroup_relative_path: &str,
+    ) -> Result<(), NftablesError> {
+        // Atomically replace the per-agent chain body and the base output
+        // jump that reaches it. This keeps policy reloads and cgroup refresh
+        // from leaking a stale jump to an old cgroup identity.
+        replace_agent_chain_and_jump_impl(id, ruleset_script, cgroup_level, cgroup_relative_path)
+    }
+
+    pub fn load_agent_fail_closed_ruleset_impl(
+        id: &AgentRulesetId,
+        cgroup_level: u32,
+        cgroup_relative_path: &str,
+    ) -> Result<(), NftablesError> {
+        let ruleset_script = build_agent_fail_closed_ruleset(&id.agent_id);
+        replace_agent_chain_and_jump_impl(id, &ruleset_script, cgroup_level, cgroup_relative_path)
     }
 
     pub fn remove_agent_ruleset_impl(id: &AgentRulesetId) -> Result<(), NftablesError> {
@@ -438,6 +489,27 @@ pub fn load_agent_ruleset(
 pub fn load_agent_ruleset(
     _id: &AgentRulesetId,
     _ruleset: &str,
+    _cgroup_level: u32,
+    _cgroup_relative_path: &str,
+) -> Result<(), NftablesError> {
+    Err(NftablesError::NotAvailableOnPlatform)
+}
+
+/// Replace an agent ruleset with a fail-closed drop chain and atomically wire
+/// the refreshed cgroup jump to that chain. Used during scope recreation
+/// before the normal policy ruleset is restored.
+#[cfg(target_os = "linux")]
+pub fn load_agent_fail_closed_ruleset(
+    id: &AgentRulesetId,
+    cgroup_level: u32,
+    cgroup_relative_path: &str,
+) -> Result<(), NftablesError> {
+    linux::load_agent_fail_closed_ruleset_impl(id, cgroup_level, cgroup_relative_path)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn load_agent_fail_closed_ruleset(
+    _id: &AgentRulesetId,
     _cgroup_level: u32,
     _cgroup_relative_path: &str,
 ) -> Result<(), NftablesError> {
@@ -869,6 +941,17 @@ mod tests {
                  agent={agent_id} chain={chain} rule={rule}"
             );
         }
+    }
+
+    #[test]
+    fn build_agent_fail_closed_ruleset_drops_everything_in_chain() {
+        let script = build_agent_fail_closed_ruleset("refresh-agent");
+        assert!(script.contains("flush chain inet sanctuary-castle agent_refresh-agent"));
+        assert!(script.contains("add rule inet sanctuary-castle agent_refresh-agent drop"));
+        assert!(
+            !script.contains("queue"),
+            "refresh fail-closed stage must drop rather than queue: {script}"
+        );
     }
 
     // ---- parse_jump_rule_handles tests ------------------------------------
