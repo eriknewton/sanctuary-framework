@@ -189,4 +189,18 @@ final class FilterProviderTests: XCTestCase {
         // Allow vs drop verdicts must not be the same object reference.
         XCTAssertFalse(allow === drop)
     }
+
+    func testUnsupportedFlowVerdictFailsClosedWithDiagnostic() {
+        var diagnostics: [String] = []
+
+        let verdict = CastleWallFilterProvider.verdictForUnsupportedFlow(
+            flowType: "NEFilterBrowserFlow"
+        ) { message in
+            diagnostics.append(message)
+        }
+
+        XCTAssertNotNil(verdict)
+        XCTAssertEqual(diagnostics, ["unsupported flow shape denied: NEFilterBrowserFlow"])
+        XCTAssertFalse(verdict === CastleWallFilterProvider.verdict(for: .allow(matchedRuleId: "r-allow")))
+    }
 }
