@@ -127,7 +127,7 @@ curl -X POST "http://localhost:3501/api/templates/<template-name>/init" \
   }'
 ```
 
-Substitute `<template-name>` with the archetype the operator picked (`research-assistant`, `coding-assistant`, etc.). The `agent_name` must match an already-wrapped harness; `template init` rejects an orphan `agent_id` with no cocoon behind it and points the operator at `sanctuary wrap`. Confirm the response includes a `signed_policy_event_id` and an `attestation_panel_url`. Open that URL in the operator's browser.
+Substitute `<template-name>` with the archetype the operator picked (`research-assistant`, `coding-assistant`, etc.). The `agent_name` must match an already-wrapped harness; `template init` rejects an orphan `agent_id` with no Mantle behind it and points the operator at `sanctuary wrap`. Confirm the response includes a `signed_policy_event_id` and an `attestation_panel_url`. Open that URL in the operator's browser.
 
 ### Step 5: Hand back to the operator
 

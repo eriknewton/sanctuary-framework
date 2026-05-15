@@ -4,9 +4,9 @@ Use Sanctuary's sovereignty infrastructure with Hermes Agent, the open-source se
 
 ## Overview
 
-Hermes Agent has native MCP support — Sanctuary's 67+ MCP tools work seamlessly via Hermes's configuration layer. Hermes's multi-level memory, subagent isolation, and scheduled automations compose naturally with Sanctuary's four sovereignty layers.
+Hermes Agent has native MCP support - Sanctuary's 67+ MCP tools work seamlessly via Hermes's configuration layer. Hermes's multi-level memory, subagent isolation, and scheduled automations compose naturally with Sanctuary's four sovereignty layers.
 
-What you get: encrypted state (L1), process isolation with Sanctuary attestation (L2), selective disclosure (L3), and verifiable reputation (L4) — plus Hermes's native features like memory encryption, subagent sandboxing, and automated sovereignty audits on a cron schedule.
+What you get: encrypted state (L1), process isolation with Sanctuary attestation (L2), selective disclosure (L3), and verifiable reputation (L4) - plus Hermes's native features like memory encryption, subagent sandboxing, and automated sovereignty audits on a cron schedule.
 
 **New in v0.5.16:** Cocoon mode turns Sanctuary into an MCP proxy that wraps all upstream MCP servers through an enforcement chain (injection scan → gate → context gate → governor → forward → audit). Hermes agents can route all their MCP traffic through Sanctuary for runtime governance without changing any upstream server configs.
 
@@ -63,7 +63,7 @@ hermes run hermes_config.yaml
 
 Your agent now has full Sanctuary integration. All 67+ tools are available as native Hermes capabilities.
 
-## Cocoon Mode — MCP Proxy for Runtime Governance
+## Cocoon Mode - MCP Proxy for Runtime Governance
 
 Cocoon mode is Sanctuary's MCP proxy. Instead of each Hermes agent connecting directly to upstream MCP servers, Sanctuary sits in front and enforces security on every tool call.
 
@@ -97,9 +97,9 @@ mcps:
       - "@sanctuary-framework/mcp-server"
     transport: "stdio"
     env:
-      SANCTUARY_STORAGE_PATH: "~/.sanctuary/hermes-cocoon"
+      SANCTUARY_STORAGE_PATH: "~/.sanctuary/hermes-mantle"
 
-  # DO NOT connect upstream servers here — Sanctuary proxies them
+  # DO NOT connect upstream servers here - Sanctuary proxies them
 
 capabilities:
   tools:
@@ -130,7 +130,7 @@ Register upstream MCP servers with Sanctuary's proxy:
 
 3. Call sanctuary/proxy_discover_tools to discover all proxied tools
 
-Now use proxy/web-search/search and proxy/filesystem/read_file —
+Now use proxy/web-search/search and proxy/filesystem/read_file -
 every call passes through Sanctuary's enforcement chain.
 """
 ```
@@ -140,7 +140,7 @@ every call passes through Sanctuary's enforcement chain.
 - **Prompt injection via MCP responses:** Unicode invisible characters, homoglyph attacks, base64-encoded payloads, and token budget attacks are stripped before responses reach the agent
 - **Secret exfiltration:** Outbound content is scanned for 20+ secret patterns (API keys, tokens, connection strings), markdown exfiltration attempts, and internal path/IP leaks
 - **Runaway tool calls:** The Call Governor enforces volume limits (200 calls/10min), rate detection (20/min per tool), SHA-256 duplicate caching, and a lifetime hard stop (1000 calls)
-- **Unauthorized operations:** Every proxied call passes through the approval gate — Tier 1 ops require human confirmation, Tier 2 triggers on anomalies
+- **Unauthorized operations:** Every proxied call passes through the approval gate - Tier 1 ops require human confirmation, Tier 2 triggers on anomalies
 
 ### Governor status
 
@@ -154,7 +154,7 @@ Monitor and manage the Call Governor at runtime:
 - Duplicate cache hits
 - Time until rate window resets"""
 
-# Reset governor counters (Tier 1 — requires approval)
+# Reset governor counters (Tier 1 - requires approval)
 """Call sanctuary/governor_reset to clear all counters and rate limits"""
 ```
 
@@ -361,7 +361,7 @@ Publish your agent's Sovereignty Health Report to [Verascore](https://verascore.
 """
 ```
 
-This gives your Hermes agent a public reputation profile that other agents and humans can verify — the "LinkedIn for agents" layer.
+This gives your Hermes agent a public reputation profile that other agents and humans can verify - the "LinkedIn for agents" layer.
 
 ### Portable Reputation Across Subagents (L4)
 
@@ -478,17 +478,17 @@ Sanctuary and Concordia compose but neither depends on the other. Use either alo
 
 All Sanctuary tools are exposed as Hermes capabilities. Key categories:
 
-**L1 — Cognitive Sovereignty:** `state_read`, `state_write`, `state_list`, `state_export`, `state_import`, `state_delete`
+**L1 - Cognitive Sovereignty:** `state_read`, `state_write`, `state_list`, `state_export`, `state_import`, `state_delete`
 
-**L1 — Identity:** `identity_create`, `identity_list`, `identity_sign`, `identity_verify`, `identity_rotate`
+**L1 - Identity:** `identity_create`, `identity_list`, `identity_sign`, `identity_verify`, `identity_rotate`
 
-**L2 — Operational Isolation:** `exec_attest`, `principal_policy_view`, `principal_baseline_view`, `monitor_health`, `monitor_audit_log`
+**L2 - Operational Isolation:** `exec_attest`, `principal_policy_view`, `principal_baseline_view`, `monitor_health`, `monitor_audit_log`
 
-**L2 — Context Gating:** `context_gate_set_policy`, `context_gate_apply_template`, `context_gate_recommend`, `context_gate_filter`, `context_gate_list_policies`
+**L2 - Context Gating:** `context_gate_set_policy`, `context_gate_apply_template`, `context_gate_recommend`, `context_gate_filter`, `context_gate_list_policies`
 
-**L3 — Selective Disclosure:** `proof_commitment`, `proof_reveal`, `disclosure_set_policy`, `disclosure_evaluate`, `zk_commit`, `zk_prove`, `zk_verify`, `zk_range_prove`, `zk_range_verify`
+**L3 - Selective Disclosure:** `proof_commitment`, `proof_reveal`, `disclosure_set_policy`, `disclosure_evaluate`, `zk_commit`, `zk_prove`, `zk_verify`, `zk_range_prove`, `zk_range_verify`
 
-**L4 — Verifiable Reputation:** `reputation_record`, `reputation_query`, `reputation_query_weighted`, `reputation_export`, `reputation_import`, `reputation_publish`, `bootstrap_create_escrow`, `bootstrap_provide_guarantee`
+**L4 - Verifiable Reputation:** `reputation_record`, `reputation_query`, `reputation_query_weighted`, `reputation_export`, `reputation_import`, `reputation_publish`, `bootstrap_create_escrow`, `bootstrap_provide_guarantee`
 
 **Sovereignty Health:** `shr_generate`, `shr_verify`, `sovereignty_audit`
 
@@ -516,9 +516,9 @@ All Sanctuary tools are exposed as Hermes capabilities. Key categories:
 
 See the `examples/` directory for complete working code:
 
-- `examples/sovereign_agent.py` — Single Hermes agent with Sanctuary identity, state encryption, and context gating
-- `examples/multi_agent_sovereignty.py` — Multiple Hermes subagents with separate sovereign identities, trust handshakes, and reputation tracking
-- `examples/cocoon_mode.py` — Cocoon mode: Sanctuary as MCP proxy wrapping upstream servers with injection hardening and runtime governance
+- `examples/sovereign_agent.py` - Single Hermes agent with Sanctuary identity, state encryption, and context gating
+- `examples/multi_agent_sovereignty.py` - Multiple Hermes subagents with separate sovereign identities, trust handshakes, and reputation tracking
+- `examples/mantle_mode.py` - Mantle mode: Sanctuary as MCP proxy wrapping upstream servers with injection hardening and runtime governance
 
 ## License
 
