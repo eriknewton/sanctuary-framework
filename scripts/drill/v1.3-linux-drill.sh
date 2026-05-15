@@ -220,22 +220,30 @@ action_1() {
   local code=0
   # shellcheck disable=SC2016
   write_steps "$steps" \
-    'sanctuary init --fortress drill' \
-    'sanctuary wrap --agent agent-a --harness cli' \
-    'sanctuary wrap --agent agent-b --harness cli' \
-    'sanctuary wrap --agent agent-c --harness cli' \
-    'sanctuary agents list --json'
-  printf 'CI adaptation: uses absolute fortress path plus --force --no-confirm for noninteractive runner init.' > "$DRILL_ROOT/action-1.deviation"
-  run_logged "init" "sanctuary init --fortress '$FORTRESS_PATH' --force --no-confirm" "$out" "$err" || code=1
-  run_logged "wrap-agent-a" "sanctuary wrap --agent agent-a --harness cli --fortress '$FORTRESS_PATH' --no-dashboard --no-open" "$out" "$err" || code=1
-  run_logged "wrap-agent-b" "sanctuary wrap --agent agent-b --harness cli --fortress '$FORTRESS_PATH' --no-dashboard --no-open" "$out" "$err" || code=1
-  run_logged "wrap-agent-c" "sanctuary wrap --agent agent-c --harness cli --fortress '$FORTRESS_PATH' --no-dashboard --no-open" "$out" "$err" || code=1
+    'sanctuary init --fortress drill/agent-a' \
+    'sanctuary init --fortress drill/agent-b' \
+    'sanctuary init --fortress drill/agent-c' \
+    'sanctuary wrap --wrap agent-a-mcp.json --fortress drill/agent-a' \
+    'sanctuary wrap --wrap agent-b-mcp.json --fortress drill/agent-b' \
+    'sanctuary wrap --wrap agent-c-mcp.json --fortress drill/agent-c' \
+    'sanctuary agents list --fortress drill --json'
+  printf 'CI adaptation: uses absolute per-agent fortress paths plus --force --no-confirm for noninteractive runner init.' > "$DRILL_ROOT/action-1.deviation"
+  printf '{}\n' > "$STATE_DIR/agent-a-mcp.json"
+  printf '{}\n' > "$STATE_DIR/agent-b-mcp.json"
+  printf '{}\n' > "$STATE_DIR/agent-c-mcp.json"
+  run_logged "init-agent-a" "sanctuary init --fortress '$FORTRESS_PATH/agent-a' --force --no-confirm" "$out" "$err" || code=1
+  run_logged "init-agent-b" "sanctuary init --fortress '$FORTRESS_PATH/agent-b' --force --no-confirm" "$out" "$err" || code=1
+  run_logged "init-agent-c" "sanctuary init --fortress '$FORTRESS_PATH/agent-c' --force --no-confirm" "$out" "$err" || code=1
+  run_logged "wrap-agent-a" "SANCTUARY_STORAGE_PATH='$FORTRESS_PATH/agent-a' sanctuary wrap --wrap '$STATE_DIR/agent-a-mcp.json' --fortress '$FORTRESS_PATH/agent-a' --no-dashboard --no-open" "$out" "$err" || code=1
+  run_logged "wrap-agent-b" "SANCTUARY_STORAGE_PATH='$FORTRESS_PATH/agent-b' sanctuary wrap --wrap '$STATE_DIR/agent-b-mcp.json' --fortress '$FORTRESS_PATH/agent-b' --no-dashboard --no-open" "$out" "$err" || code=1
+  run_logged "wrap-agent-c" "SANCTUARY_STORAGE_PATH='$FORTRESS_PATH/agent-c' sanctuary wrap --wrap '$STATE_DIR/agent-c-mcp.json' --fortress '$FORTRESS_PATH/agent-c' --no-dashboard --no-open" "$out" "$err" || code=1
   local agents_json="$STATE_DIR/agents.json"
-  run_logged "agents-list" "sanctuary agents list --json > '$agents_json'" "$out" "$err" || code=1
+  run_logged "agents-list" "sanctuary agents list --fortress '$FORTRESS_PATH' --json > '$agents_json'" "$out" "$err" || code=1
   if [[ "$DRY_RUN" == "0" ]] && ! json_array_len "$agents_json" '((if type == "array" then . else (.agents // .data.agents // []) end) | length) == 3'; then
     printf 'agents list did not contain exactly 3 agents\n' >> "$err"
     code=1
   fi
+  run_logged "init-dashboard-fortress" "sanctuary init --fortress '$FORTRESS_PATH' --force --no-confirm" "$out" "$err" || code=1
   start_dashboard "$out" "$err" || code=1
   return "$code"
 }
@@ -343,17 +351,13 @@ action_6() {
   local err="$3"
   local code=0
   write_steps "$steps" \
-    "sanctuary policy gate create \\" \
-    "  --name block-etc-writes \\" \
-    "  --description \"block any agent from writing to /etc\" \\" \
-    "  --substrate-selector '{\"action_class\":\"filesystem_write\",\"path_prefix\":\"/etc\"}' \\" \
-    '  --action deny' \
-    'sanctuary policy list --json'
-  run_logged "policy-gate-create" "sanctuary policy gate create --name block-etc-writes --description 'block any agent from writing to /etc' --substrate-selector '{\"action_class\":\"filesystem_write\",\"path_prefix\":\"/etc\"}' --action deny" "$out" "$err" || code=1
-  local policy_json="$STATE_DIR/policy-list.json"
-  run_logged "policy-list" "sanctuary policy list --json > '$policy_json'" "$out" "$err" || code=1
-  if [[ "$DRY_RUN" == "0" ]] && ! jq -e 'tostring | test("block-etc-writes") and test("filesystem_write") and test("/etc")' "$policy_json" >/dev/null 2>&1; then
-    printf 'policy gate not found in active policy list\n' >> "$err"
+    'sanctuary policy compile "always require approval for state_export"' \
+    'sanctuary policy drafts list'
+  local policy_json="$STATE_DIR/policy-compile.txt"
+  run_logged "policy-compile" "sanctuary policy compile 'always require approval for state_export' > '$policy_json'" "$out" "$err" || code=1
+  run_logged "policy-drafts-list" "sanctuary policy drafts list" "$out" "$err" || code=1
+  if [[ "$DRY_RUN" == "0" ]] && ! grep -Eq 'tier1_add_operation|state_export' "$policy_json"; then
+    printf 'policy compile did not emit the expected tier1 state_export rule\n' >> "$err"
     code=1
   fi
   return "$code"
@@ -388,27 +392,12 @@ action_8() {
   local code=0
   write_steps "$steps" \
     '# Tighten egress-rate alert threshold' \
-    'sanctuary auto-trigger rules list --json' \
-    "RULE_ID=\$(sanctuary auto-trigger rules list --json | jq -r '.[] | select(.name==\"egress-rate-alert\") | .id')" \
-    "sanctuary auto-trigger rules patch --id \"\$RULE_ID\" --threshold 50" \
-    "sanctuary auto-trigger rules get --id \"\$RULE_ID\" --json" \
-    'sanctuary audit query --action auto-trigger-rule-patch --json'
-  local rules_json="$STATE_DIR/auto-trigger-rules.json"
-  run_logged "auto-trigger-list" "sanctuary auto-trigger rules list --json > '$rules_json'" "$out" "$err" || code=1
-  local rule_id=""
-  if [[ "$DRY_RUN" == "1" ]]; then
-    rule_id="egress-rate-alert"
-  elif [[ -s "$rules_json" ]]; then
-    rule_id="$(jq -r '(.rules // .data.rules // . // []) | .[]? | select(.name=="egress-rate-alert" or .id=="egress-rate-alert") | .id' "$rules_json" 2>/dev/null | head -n 1 || true)"
-  fi
-  if [[ -z "$rule_id" ]]; then
-    printf 'egress-rate-alert rule not found\n' >> "$err"
-    return 1
-  fi
-  run_logged "auto-trigger-patch" "sanctuary auto-trigger rules patch --id '$rule_id' --threshold 50" "$out" "$err" || code=1
+    'sanctuary auto-trigger rules set-threshold egress-rate-alert --rule-type sentinel --warn-sigma 50' \
+    'sanctuary auto-trigger rules show egress-rate-alert'
+  local rule_id="egress-rate-alert"
+  run_logged "auto-trigger-set-threshold" "sanctuary auto-trigger rules set-threshold '$rule_id' --rule-type sentinel --warn-sigma 50" "$out" "$err" || code=1
   local rule_json="$STATE_DIR/auto-trigger-rule.json"
-  run_logged "auto-trigger-get" "sanctuary auto-trigger rules get --id '$rule_id' --json > '$rule_json'" "$out" "$err" || code=1
-  run_logged "audit-auto-trigger" "sanctuary audit query --action auto-trigger-rule-patch --json" "$out" "$err" || code=1
+  run_logged "auto-trigger-show" "sanctuary auto-trigger rules show '$rule_id' > '$rule_json'" "$out" "$err" || code=1
   if [[ "$DRY_RUN" == "0" ]] && ! jq -e 'tostring | test("50")' "$rule_json" >/dev/null 2>&1; then
     printf 'auto-trigger threshold did not persist at 50\n' >> "$err"
     code=1
