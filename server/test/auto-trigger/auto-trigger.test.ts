@@ -127,7 +127,12 @@ function makeRig(opts?: { fortressId?: string }) {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const auditLog = new AuditLog(storage, masterKey);
-  const store = new ThresholdConfigStore({ storage, masterKey, fortressId });
+  const store = new ThresholdConfigStore({
+    storage,
+    masterKey,
+    fortressId,
+    now: () => FIXED_NOW,
+  });
   const action = new NotifyOperatorAction(auditLog, IDENTITY, fortressId);
   const scheduler = new FakeScheduler();
   const dispatcher = new ActionDispatcher({
@@ -144,6 +149,7 @@ function makeRig(opts?: { fortressId?: string }) {
     auditLog,
     fortressId,
     identityId: IDENTITY,
+    now: () => FIXED_NOW,
     tickIntervalMs: 0,
   });
   return { storage, masterKey, auditLog, store, dispatcher, scheduler, fortressId, suggester };

@@ -37,6 +37,8 @@ function runCliUntilStarted(fortressPath: string): Promise<{
   stderr: string;
 }> {
   return new Promise((resolve, reject) => {
+    let sawStarted = false;
+    let settled = false;
     const child = spawn(process.execPath, [CLI_PATH], {
       env: {
         ...process.env,
@@ -49,26 +51,40 @@ function runCliUntilStarted(fortressPath: string): Promise<{
     let stderr = "";
     const timeout = setTimeout(() => {
       child.kill("SIGTERM");
-      reject(new Error(`MCP child did not start. stderr:\n${stderr}`));
+      if (!settled) {
+        settled = true;
+        reject(new Error(`MCP child did not start. stderr:\n${stderr}`));
+      }
     }, 5000);
 
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString("utf-8");
       if (stderr.includes("Sanctuary MCP Server") && stderr.includes("running")) {
         clearTimeout(timeout);
+        sawStarted = true;
         child.kill("SIGTERM");
-        resolve({ stderr });
       }
     });
     child.on("error", (err) => {
       clearTimeout(timeout);
-      reject(err);
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
     });
     child.on("close", (code) => {
-      if (!stderr.includes("Sanctuary MCP Server")) {
-        clearTimeout(timeout);
-        reject(new Error(`MCP child exited early with ${code}. stderr:\n${stderr}`));
+      clearTimeout(timeout);
+      if (settled) return;
+      settled = true;
+      if (sawStarted) {
+        resolve({ stderr });
+        return;
       }
+      if (!stderr.includes("Sanctuary MCP Server")) {
+        reject(new Error(`MCP child exited early with ${code}. stderr:\n${stderr}`));
+        return;
+      }
+      resolve({ stderr });
     });
   });
 }
