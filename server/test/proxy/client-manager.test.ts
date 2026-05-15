@@ -7,7 +7,11 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { ClientManager } from "../../src/proxy/client-manager.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  buildUpstreamStdioEnv,
+  ClientManager,
+} from "../../src/proxy/client-manager.js";
 import type { UpstreamServer } from "../../src/sovereignty-profile.js";
 
 // Mock the MCP SDK transports to prevent real process spawning
@@ -40,6 +44,40 @@ function makeServer(name: string, overrides?: Partial<UpstreamServer>): Upstream
     transport: { type: "stdio", command: "node", args: ["server.js"] },
     ...overrides,
   } as UpstreamServer;
+}
+
+async function waitForConnectionAttempt(): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, 0));
+}
+
+function latestStdioEnv(): Record<string, string> {
+  const mock = vi.mocked(StdioClientTransport);
+  const lastCall = mock.mock.calls.at(-1);
+  expect(lastCall).toBeDefined();
+  return lastCall![0].env as Record<string, string>;
+}
+
+async function withProcessEnv(
+  values: Record<string, string>,
+  run: () => Promise<void>
+): Promise<void> {
+  const previous: Record<string, string | undefined> = {};
+  for (const key of Object.keys(values)) {
+    previous[key] = process.env[key];
+    process.env[key] = values[key];
+  }
+
+  try {
+    await run();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
 }
 
 describe("ClientManager", () => {
@@ -142,6 +180,112 @@ describe("ClientManager", () => {
     it("rejects call to unconfigured server", async () => {
       const cm = new ClientManager();
       await expect(cm.callTool("nope", "tool", {})).rejects.toThrow();
+    });
+  });
+
+  describe("stdio environment isolation", () => {
+    it("does not pass Sanctuary or generic API key values from the parent process env", async () => {
+      await withProcessEnv(
+        {
+          SANCTUARY_PASSPHRASE: "parent-passphrase",
+          SANCTUARY_DASHBOARD_AUTH_TOKEN: "parent-dashboard-token",
+          SANCTUARY_CUSTOM_SETTING: "parent-sanctuary-value",
+          THIRD_PARTY_API_KEY: "parent-api-key",
+        },
+        async () => {
+          const cm = new ClientManager();
+          vi.mocked(StdioClientTransport).mockClear();
+
+          await cm.configure([makeServer("env-isolated")]);
+          await waitForConnectionAttempt();
+
+          const env = latestStdioEnv();
+          expect(env.SANCTUARY_PASSPHRASE).toBeUndefined();
+          expect(env.SANCTUARY_DASHBOARD_AUTH_TOKEN).toBeUndefined();
+          expect(env.SANCTUARY_CUSTOM_SETTING).toBeUndefined();
+          expect(env.THIRD_PARTY_API_KEY).toBeUndefined();
+          expect(Object.keys(env).every(key => !key.startsWith("SANCTUARY_"))).toBe(true);
+          await cm.shutdown();
+        }
+      );
+    });
+
+    it("passes explicit operator configured env vars after deny filtering", async () => {
+      const cm = new ClientManager();
+      vi.mocked(StdioClientTransport).mockClear();
+
+      await cm.configure([
+        makeServer("operator-env", {
+          transport: {
+            type: "stdio",
+            command: "node",
+            args: ["server.js"],
+            env: {
+              OPERATOR_CONFIGURED_MODE: "enabled",
+              SAFE_UPSTREAM_LABEL: "filesystem",
+              SANCTUARY_PASSPHRASE: "must-not-pass",
+              SERVICE_API_KEY: "must-not-pass",
+              OPENAI_PROJECT: "must-not-pass",
+            },
+          },
+        }),
+      ]);
+      await waitForConnectionAttempt();
+
+      const env = latestStdioEnv();
+      expect(env.OPERATOR_CONFIGURED_MODE).toBe("enabled");
+      expect(env.SAFE_UPSTREAM_LABEL).toBe("filesystem");
+      expect(env.SANCTUARY_PASSPHRASE).toBeUndefined();
+      expect(env.SERVICE_API_KEY).toBeUndefined();
+      expect(env.OPENAI_PROJECT).toBeUndefined();
+      await cm.shutdown();
+    });
+  });
+
+  describe("buildUpstreamStdioEnv", () => {
+    it("uses the default allowlist plus explicit safe config and drops adversarial names", () => {
+      const env = buildUpstreamStdioEnv(
+        {
+          SAFE_FEATURE_FLAG: "true",
+          "BAD-NAME": "bad",
+          SANCTUARY_PUBLIC_VALUE: "bad",
+          TOOL_API_KEY: "bad",
+          SESSION_TOKEN: "bad",
+          CLIENT_SECRET: "bad",
+          DB_PASSWORD: "bad",
+          VAULT_PASSPHRASE: "bad",
+          AWS_REGION: "bad",
+          GCP_PROJECT: "bad",
+          AZURE_TENANT: "bad",
+          OPENAI_ORG_ID: "bad",
+          ANTHROPIC_VERSION: "bad",
+          GOOGLE_APPLICATION_CREDENTIALS: "bad",
+        },
+        {
+          PATH: "/usr/bin",
+          HOME: "/tmp/home",
+          LANG: "en_US.UTF-8",
+          LC_ALL: "C",
+          LC_CTYPE: "UTF-8",
+          TZ: "UTC",
+          TMPDIR: "/tmp",
+          USER: "operator",
+          SHELL: "/bin/zsh",
+          THIRD_PARTY_API_KEY: "parent-secret",
+          SANCTUARY_PASSPHRASE: "parent-secret",
+        }
+      );
+
+      expect(env).toEqual({
+        PATH: "/usr/bin",
+        HOME: "/tmp/home",
+        LANG: "en_US.UTF-8",
+        LC_ALL: "C",
+        LC_CTYPE: "UTF-8",
+        TZ: "UTC",
+        TMPDIR: "/tmp",
+        SAFE_FEATURE_FLAG: "true",
+      });
     });
   });
 });
