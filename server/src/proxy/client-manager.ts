@@ -51,6 +51,60 @@ const MAX_RETRIES = 5;
 const BASE_BACKOFF_MS = 1000; // 1 second
 const MAX_BACKOFF_MS = 30_000; // 30 seconds
 const MAX_UPSTREAM_SERVERS = 20;
+const DEFAULT_STDIO_ENV_ALLOWLIST = [
+  "PATH",
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+  "TMPDIR",
+] as const;
+
+function isDeniedUpstreamEnvName(name: string): boolean {
+  const normalized = name.toUpperCase();
+  return (
+    normalized.startsWith("SANCTUARY_") ||
+    normalized.endsWith("_API_KEY") ||
+    normalized.endsWith("_TOKEN") ||
+    normalized.endsWith("_SECRET") ||
+    normalized.endsWith("_PASSWORD") ||
+    normalized.endsWith("_PASSPHRASE") ||
+    normalized.startsWith("AWS_") ||
+    normalized.startsWith("GCP_") ||
+    normalized.startsWith("AZURE_") ||
+    normalized.startsWith("OPENAI_") ||
+    normalized.startsWith("ANTHROPIC_") ||
+    normalized.startsWith("GOOGLE_")
+  );
+}
+
+function isValidEnvName(name: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
+}
+
+export function buildUpstreamStdioEnv(
+  configuredEnv: Record<string, string> | undefined,
+  parentEnv: NodeJS.ProcessEnv = process.env
+): Record<string, string> {
+  const safeEnv: Record<string, string> = {};
+
+  for (const key of DEFAULT_STDIO_ENV_ALLOWLIST) {
+    const value = parentEnv[key];
+    if (value !== undefined && !isDeniedUpstreamEnvName(key)) {
+      safeEnv[key] = value;
+    }
+  }
+
+  for (const [key, value] of Object.entries(configuredEnv ?? {})) {
+    if (!isValidEnvName(key) || isDeniedUpstreamEnvName(key)) {
+      continue;
+    }
+    safeEnv[key] = value;
+  }
+
+  return safeEnv;
+}
 
 // ── Client Manager ─────────────────────────────────────────────────────
 
@@ -250,26 +304,8 @@ export class ClientManager {
           }
         }
 
-        // SEC-045: Filter blocked environment variables
-        const ENV_BLOCKLIST = new Set([
-          'PATH', 'HOME', 'USER', 'SHELL', 'NODE_OPTIONS', 'NODE_PATH',
-          'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES',
-          'PYTHONPATH', 'RUBYLIB', 'PERL5LIB',
-          'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
-          'http_proxy', 'https_proxy', 'no_proxy',
-        ]);
-
-        let transportEnv: Record<string, string> | undefined;
-        if (conn.server.transport.env) {
-          const safeEnv = { ...process.env } as Record<string, string>;
-          for (const [key, value] of Object.entries(conn.server.transport.env)) {
-            if (!ENV_BLOCKLIST.has(key)) {
-              safeEnv[key] = value as string;
-            }
-            // Silently drop blocked env vars (logged via audit)
-          }
-          transportEnv = safeEnv;
-        }
+        // SEC-045: Upstream MCP servers get a minimal, deny-filtered env.
+        const transportEnv = buildUpstreamStdioEnv(conn.server.transport.env);
 
         transport = new StdioClientTransport({
           command: conn.server.transport.command,
