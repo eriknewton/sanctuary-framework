@@ -16,6 +16,11 @@ import { encrypt, decrypt, type EncryptedPayload } from "./encryption.js";
 import { hash } from "./hashing.js";
 import { randomBytes } from "./random.js";
 
+const BASE58BTC_ALPHABET =
+  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const ED25519_MULTICODEC_PREFIX = new Uint8Array([0xed, 0x01]);
+const ED25519_PUBLIC_KEY_LENGTH = 32;
+
 /** Public identity information (safe to share) */
 export interface PublicIdentity {
   identity_id: string;
@@ -68,12 +73,66 @@ export function generateKeypair(): {
  * Uses the did:key method with the Ed25519 multicodec prefix (0xed01).
  */
 export function publicKeyToDid(publicKey: Uint8Array): string {
-  // Multicodec prefix for Ed25519: 0xed 0x01
-  const multicodec = new Uint8Array([0xed, 0x01, ...publicKey]);
-  // did:key uses base58btc multibase encoding, but for simplicity
-  // we use the base64url representation which is equally valid
-  // in the broader DID ecosystem
+  assertEd25519PublicKey(publicKey);
+  const multicodec = new Uint8Array([
+    ...ED25519_MULTICODEC_PREFIX,
+    ...publicKey,
+  ]);
+  return `did:key:z${base58btcEncode(multicodec)}`;
+}
+
+/**
+ * Previous Sanctuary DID encoding for persisted identity migration.
+ * This helper preserves the old invalid shape: "z" multibase prefix with
+ * base64url payload bytes. New callers must use publicKeyToDid instead.
+ */
+export function legacyPublicKeyToDid(publicKey: Uint8Array): string {
+  assertEd25519PublicKey(publicKey);
+  const multicodec = new Uint8Array([
+    ...ED25519_MULTICODEC_PREFIX,
+    ...publicKey,
+  ]);
   return `did:key:z${toBase64url(multicodec)}`;
+}
+
+function assertEd25519PublicKey(publicKey: Uint8Array): void {
+  if (publicKey.length !== ED25519_PUBLIC_KEY_LENGTH) {
+    throw new RangeError(
+      `Ed25519 public key must be ${ED25519_PUBLIC_KEY_LENGTH} bytes`
+    );
+  }
+}
+
+function base58btcEncode(bytes: Uint8Array): string {
+  if (bytes.length === 0) return "";
+
+  let leadingZeroes = 0;
+  while (leadingZeroes < bytes.length && bytes[leadingZeroes] === 0) {
+    leadingZeroes++;
+  }
+  if (leadingZeroes === bytes.length) {
+    return "1".repeat(leadingZeroes);
+  }
+
+  const digits = [0];
+  for (let i = leadingZeroes; i < bytes.length; i++) {
+    let carry = bytes[i]!;
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j]! << 8;
+      digits[j] = carry % 58;
+      carry = Math.floor(carry / 58);
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = Math.floor(carry / 58);
+    }
+  }
+
+  let encoded = "1".repeat(leadingZeroes);
+  for (let i = digits.length - 1; i >= 0; i--) {
+    encoded += BASE58BTC_ALPHABET[digits[i]!]!;
+  }
+  return encoded;
 }
 
 /**
