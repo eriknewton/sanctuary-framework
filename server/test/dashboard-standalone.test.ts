@@ -323,6 +323,16 @@ describe("Standalone Dashboard", () => {
 
       await first.dashboard.stop();
 
+      // The warning under test is specifically about identity decrypt
+      // failures. With fail-closed profile loading, the profile must be
+      // valid under the second boot key so startup can reach that identity
+      // diagnostic path instead of stopping at profile authentication.
+      await storage.delete("_sovereignty_profile", "active", false);
+      const { key: mkB } = await deriveMasterKey("tenant-passphrase-B-WRONG", params);
+      const { SovereigntyProfileStore } = await import("../src/sovereignty-profile.js");
+      const profileStore = new SovereigntyProfileStore(storage, mkB);
+      await profileStore.load();
+
       // Second boot supplies a WRONG passphrase — encrypted identities exist
       // on disk, but the master key derived here cannot decrypt any of them.
       const second = await startDashboardOnFreePort({
