@@ -370,7 +370,7 @@ For AI coding agents handling install failures, here are the common cases.
 - Confirm `npm bin -g` is on the PATH. On macOS with nvm, this typically lives at `~/.nvm/versions/node/<version>/bin/`.
 
 **Existing harness config overwritten:**
-- The original is at `~/.sanctuary/backup/<harness>-config-<timestamp>.bak`. Restore with `sanctuary unwrap --<harness>`.
+- The original is at `~/.sanctuary/backup/config-backup-<timestamp>.json`. Restore with `sanctuary wrap --unwrap` from the same fortress/storage context.
 
 For anything not on this list, run `sovereignty_audit` and surface the report to the operator.
 

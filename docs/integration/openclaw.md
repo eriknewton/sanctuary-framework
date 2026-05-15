@@ -3,14 +3,14 @@
 > Add sovereign identity, encrypted audit trails, and verifiable reputation
 > to your OpenClaw agent in under 60 seconds.
 
-Verified working on Mac Mini M4 running OpenClaw 2026.4.2 + Sanctuary v0.7.0.
+Verified working on Mac Mini M4 running OpenClaw 2026.4.2 + Sanctuary v1.3.0-rc.1.
 68 tools registered, sovereignty handshakes completed, Verascore publish proven.
 
 ## Prerequisites
 
 - OpenClaw installed and running
-- Node.js 18+
-- Sanctuary: `npm install @sanctuary-framework/mcp-server@0.7.0`
+- Node.js 22+
+- Sanctuary: `npm install @sanctuary-framework/mcp-server@1.3.0-rc.1`
   (or use `npx` for zero-install)
 
 ## Step 1: Add Sanctuary to Your Config
@@ -23,7 +23,7 @@ Edit `~/.openclaw/openclaw.json` (or `~/.openclaw/agents/{agent}/config.json`):
     "servers": {
       "sanctuary": {
         "command": "npx",
-        "args": ["@sanctuary-framework/mcp-server@0.7.0"],
+        "args": ["@sanctuary-framework/mcp-server@1.3.0-rc.1"],
         "env": {
           "SANCTUARY_PASSPHRASE": "your-passphrase-here"
         }
@@ -81,10 +81,10 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 ## OpenClaw-Specific Notes
 
 **Tool naming.** OpenClaw namespaces all MCP tools as `{server}__{tool}`.
-With Sanctuary v0.7.0 (unprefixed tools), you get clean names like
-`sanctuary__manifest`, `sanctuary__identity_create`. Prior to v0.7.0, the old
-`sanctuary/` prefix caused double-mangling (`sanctuary__sanctuary-manifest`).
-Always use v0.7.0+.
+With Sanctuary v1.3.0-rc.1, you get clean names like `sanctuary__manifest`,
+`sanctuary__identity_create`. Older pre-0.7 releases used a `sanctuary/`
+prefix that caused double-mangling (`sanctuary__sanctuary-manifest`).
+Always use the current release.
 
 **No `--dashboard` flag.** Do NOT add `"--dashboard"` to the args array. The
 dashboard opens an HTTP listener inside the stdio subprocess, breaking
@@ -93,7 +93,7 @@ needed:
 
 ```bash
 # Dashboard as separate process (optional)
-npx @sanctuary-framework/mcp-server@0.7.0 --dashboard --dashboard-port 3501 &
+npx @sanctuary-framework/mcp-server@1.3.0-rc.1 dashboard --port 3501 &
 ```
 
 **Environment variables.** OpenClaw passes only the `env` vars defined in the
@@ -103,8 +103,8 @@ encrypted audit trails. Do NOT include `SANCTUARY_DASHBOARD_ENABLED` or
 
 **One-command wrap.** `sanctuary wrap --openclaw` auto-generates a passphrase,
 wraps all upstream MCP servers through Sanctuary's enforcement chain, and opens
-the Sovereignty Dashboard in your browser. Runs in v0.9+. For production, the
-direct config (above) remains the stable path.
+the Sovereignty Dashboard in your browser. For production, the direct config
+(above) remains the stable path.
 
 **Adding Concordia alongside Sanctuary.** Both can run as separate MCP servers:
 
@@ -114,7 +114,7 @@ direct config (above) remains the stable path.
     "servers": {
       "sanctuary": {
         "command": "npx",
-        "args": ["@sanctuary-framework/mcp-server@0.7.0"],
+        "args": ["@sanctuary-framework/mcp-server@1.3.0-rc.1"],
         "env": { "SANCTUARY_PASSPHRASE": "your-passphrase" }
       },
       "concordia": {
@@ -130,12 +130,12 @@ direct config (above) remains the stable path.
 ## Troubleshooting
 
 **Double tool name prefix (`sanctuary__sanctuary-manifest`)**
-You're on Sanctuary < v0.7.0. Upgrade:
-`npm install @sanctuary-framework/mcp-server@0.7.0`
+You're on an older Sanctuary release. Upgrade:
+`npm install @sanctuary-framework/mcp-server@1.3.0-rc.1`
 
 **"MCP server failed to initialize" / subprocess crash**
 Remove `--dashboard` from args. This is the most common cause. Check
-`node --version >= 18`. Run `npx @sanctuary-framework/mcp-server@0.7.0`
+`node --version >= 22`. Run `npx @sanctuary-framework/mcp-server@1.3.0-rc.1`
 manually in a terminal to verify it starts.
 
 **Env vars not reaching Sanctuary**
@@ -143,7 +143,7 @@ Verify they're in the `"env"` block of the server config, not at the top level
 of `openclaw.json`. OpenClaw passes only what's in `env`.
 
 **Tools not appearing in agent**
-Run `npx @sanctuary-framework/mcp-server@0.7.0` manually to verify it starts.
+Run `npx @sanctuary-framework/mcp-server@1.3.0-rc.1` manually to verify it starts.
 Check OpenClaw logs at `~/.openclaw/logs/`.
 
 **Tools show "Not connected" when called**
@@ -152,7 +152,7 @@ namespaced tool names (`sanctuary__manifest`, not `manifest`). If the problem
 persists, restart OpenClaw — the MCP subprocess may need a clean reconnection.
 
 **`sanctuary wrap --openclaw` drops servers**
-Fixed in v0.9. If you're on an older version, use the direct config (Step 1
+Fixed in the current release. If you're on an older version, use the direct config (Step 1
 above) — it works reliably across versions.
 
 **OpenClaw update breaks dependencies**
