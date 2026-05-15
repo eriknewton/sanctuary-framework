@@ -37,7 +37,10 @@ jobs:
         env:
           REPORT_PATH: /tmp/v1.3-linux-drill-report.md
           SANCTUARY_VERSION: ${{ inputs.sanctuary_version || 'next' }}
-        run: bash scripts/drill/v1.3-linux-drill.sh
+        run: |
+          export PS4='+ ${BASH_SOURCE:-workflow}:${LINENO}: '
+          set -x
+          bash -x scripts/drill/v1.3-linux-drill.sh
 
       - name: Upload drill report
         if: always()
