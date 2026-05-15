@@ -46,6 +46,14 @@ jobs:
           name: v1.3-linux-drill-report-${{ github.run_id }}
           path: /tmp/v1.3-linux-drill-report.md
 
+      - name: Upload drill debug archive
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: v1.3-linux-drill-debug-${{ github.run_id }}
+          path: /tmp/v1.3-linux-drill-debug.tgz
+          if-no-files-found: warn
+
       - name: Fail if drill did not pass
         run: |
           if [ ! -f /tmp/v1.3-linux-drill-report.md ]; then exit 1; fi
