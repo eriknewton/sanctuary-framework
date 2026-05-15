@@ -14,6 +14,7 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createSanctuaryServer } from "./index.js";
+import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusal.js";
 import { checkForUpdate } from "./update-check.js";
 import { createRequire } from "node:module";
 
@@ -221,6 +222,8 @@ async function main(): Promise<void> {
       process.exit(0);
     }
   }
+
+  await refuseMissingMcpChildFortressOrExit();
 
   const { server, config } = await createSanctuaryServer({ passphrase });
 
