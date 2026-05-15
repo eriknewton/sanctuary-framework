@@ -37,6 +37,10 @@ cleanup() {
   if [[ -n "$DASHBOARD_PID" ]]; then
     kill "$DASHBOARD_PID" >/dev/null 2>&1 || true
   fi
+  if [[ -n "${DRILL_ROOT:-}" && -d "$DRILL_ROOT" ]]; then
+    local debug_archive="${DRILL_DEBUG_ARCHIVE:-/tmp/v1.3-linux-drill-debug.tgz}"
+    tar czf "$debug_archive" -C "$(dirname "$DRILL_ROOT")" "$(basename "$DRILL_ROOT")" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -89,17 +93,13 @@ run_logged() {
   local command="$2"
   local stdout_file="$3"
   local stderr_file="$4"
-  {
-    printf '$ %s\n' "$command"
-  } >> "$stdout_file"
+  printf '$ %s\n' "$command" >> "$stdout_file"
   if [[ "$DRY_RUN" == "1" ]]; then
     printf 'dry-run: skipped\n' >> "$stdout_file"
     return 0
   fi
-  set +e
-  bash -lc "$command" >> "$stdout_file" 2>> "$stderr_file"
-  local code=$?
-  set -e
+  local code=0
+  bash -lc "$command" >> "$stdout_file" 2>> "$stderr_file" || code=$?
   printf '%s exit_code=%s\n' "$label" "$code" >> "$stdout_file"
   return "$code"
 }
