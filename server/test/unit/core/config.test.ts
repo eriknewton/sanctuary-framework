@@ -7,7 +7,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { loadConfig, defaultConfig, SANCTUARY_VERSION } from "../../../src/config.js";
-import { writeFile, mkdir, rm } from "node:fs/promises";
+import { writeFile, mkdir, rm, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -34,6 +34,8 @@ describe("loadConfig", () => {
     delete process.env.SANCTUARY_PRIVACY_FILTER_FAIL_MODE;
     delete process.env.SANCTUARY_PRIVACY_FILTER_COMMAND;
     delete process.env.SANCTUARY_PRIVACY_FILTER_TIMEOUT_MS;
+    vi.restoreAllMocks();
+    vi.doUnmock("node:fs/promises");
 
     // Clean up temp dir
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
@@ -150,6 +152,52 @@ describe("loadConfig", () => {
 
       expect(config.dashboard.enabled).toBe(true);
       expect(config.http_port).toBe(5000);
+    });
+  });
+
+  describe("Fail-closed config loading", () => {
+    it("throws with recovery guidance and quarantines malformed JSON", async () => {
+      const configFile = join(tempDir, "malformed.json");
+      await writeFile(configFile, "{ not json");
+
+      await expect(loadConfig(configFile)).rejects.toMatchObject({
+        name: "ConfigLoadError",
+        classification: "corrupted",
+        path: configFile,
+        message: expect.stringContaining("Recovery:"),
+      });
+
+      await expect(readFile(configFile, "utf-8")).rejects.toMatchObject({ code: "ENOENT" });
+      const files = await readdir(tempDir);
+      const quarantine = files.find((file) => file.startsWith("malformed.json.corrupted."));
+      expect(quarantine).toBeTruthy();
+      expect(await readFile(join(tempDir, quarantine!), "utf-8")).toBe("{ not json");
+    });
+
+    it("throws on permission errors instead of continuing with defaults", async () => {
+      const configFile = join(tempDir, "unreadable.json");
+      await writeFile(configFile, JSON.stringify(defaultConfig()));
+
+      vi.resetModules();
+      vi.doMock("node:fs/promises", async (importOriginal) => {
+        const actual = await importOriginal<typeof import("node:fs/promises")>();
+        const permissionDenied = Object.assign(new Error("permission denied"), {
+          code: "EACCES",
+        });
+        return {
+          ...actual,
+          readFile: vi.fn(async () => {
+            throw permissionDenied;
+          }),
+        };
+      });
+
+      const { loadConfig: mockedLoadConfig } = await import("../../../src/config.js");
+      await expect(mockedLoadConfig(configFile)).rejects.toMatchObject({
+        name: "ConfigLoadError",
+        classification: "unreadable",
+        path: configFile,
+      });
     });
   });
 

@@ -4,10 +4,11 @@
  * Loads and validates server configuration from file or environment variables.
  */
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
+import { ConfigLoadError } from "./errors/config-error.js";
 
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
@@ -178,19 +179,54 @@ export async function loadConfig(
   try {
     const raw = await readFile(path, "utf-8");
     const fileConfig = JSON.parse(raw);
+    if (fileConfig === null || typeof fileConfig !== "object" || Array.isArray(fileConfig)) {
+      throw new Error("Sanctuary config field \"$root\" must be an object");
+    }
     config = deepMerge(config, fileConfig);
     // Catch shape regressions from a malformed user-supplied JSON
     // (e.g. `dashboard: "not-an-object"`) before downstream code casts.
     assertSanctuaryConfigShape(config as unknown as Record<string, unknown>);
+    validateConfig(config);
   } catch (err) {
-    // Re-throw validation errors — only swallow file-not-found
-    if (err instanceof Error && err.message.includes("unimplemented features")) {
-      throw err;
+    if (isErrno(err, "ENOENT")) {
+      // No config file: first-run defaults are allowed.
+    } else if (err instanceof SyntaxError) {
+      const quarantinedPath = await quarantineConfigFile(path);
+      throw new ConfigLoadError({
+        path,
+        classification: "corrupted",
+        detail: "The config file is not valid JSON. Wrong-key is not applicable to plaintext config.",
+        recovery: "Inspect the quarantined copy, restore a known-good config, or intentionally create a new config before retrying.",
+        quarantinedPath,
+        cause: err,
+      });
+    } else if (isConfigSchemaError(err)) {
+      const quarantinedPath = await quarantineConfigFile(path);
+      throw new ConfigLoadError({
+        path,
+        classification: "schema-mismatch",
+        detail: `${err instanceof Error ? err.message : "The config schema is invalid."} Wrong-key is not applicable to plaintext config.`,
+        recovery: "Update the config to match the current Sanctuary schema or restore a compatible backup before retrying.",
+        quarantinedPath,
+        cause: err,
+      });
+    } else if (isErrno(err, "EACCES") || isErrno(err, "EPERM")) {
+      throw new ConfigLoadError({
+        path,
+        classification: "unreadable",
+        detail: "Sanctuary could not read the config file because the operating system denied access. Corruption cannot be determined until the file is readable.",
+        recovery: "Fix file ownership or permissions, then retry. Sanctuary did not continue with defaults.",
+        cause: err,
+      });
+    } else {
+      throw new ConfigLoadError({
+        path,
+        classification: "unreadable",
+        detail: `Sanctuary could not read the config file. Corruption cannot be determined. ${err instanceof Error ? err.message : String(err)}`,
+        recovery: "Resolve the read failure, then retry. Sanctuary did not continue with defaults.",
+        cause: err,
+      });
     }
-    if (err instanceof Error && err.message.startsWith("Sanctuary config field")) {
-      throw err;
-    }
-    // No config file — continue with defaults
   }
 
   // Phase 2: Apply env var overrides ON TOP of file config (env always wins)
@@ -286,6 +322,30 @@ export async function loadConfig(
 
   validateConfig(config);
   return config;
+}
+
+function isErrno(err: unknown, code: string): boolean {
+  return (
+    err instanceof Error &&
+    "code" in err &&
+    (err as NodeJS.ErrnoException).code === code
+  );
+}
+
+function isConfigSchemaError(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    (
+      err.message.includes("Sanctuary configuration references unimplemented features") ||
+      err.message.startsWith("Sanctuary config field")
+    )
+  );
+}
+
+async function quarantineConfigFile(path: string): Promise<string> {
+  const quarantinedPath = `${path}.corrupted.${new Date().toISOString()}`;
+  await rename(path, quarantinedPath);
+  return quarantinedPath;
 }
 
 /**
