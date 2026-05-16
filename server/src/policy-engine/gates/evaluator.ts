@@ -11,6 +11,11 @@
  *   1. If policy is null → hermetic deny (null_policy_hermetic_deny).
  *   2. Sentinel check: if this agent is_sentinel and counterparty != self →
  *      deny (sentinel_inward_restriction).
+ *   2b. Subscriber handshake gate: if action is "subscribe" and the
+ *       counterparty's sovereignty handshake is not verified →
+ *       deny (subscriber_handshake_not_verified). Self-subscriptions
+ *       always pass. Injected via context callback; when absent, step
+ *       is a no-op (backward compatible).
  *   3. Auto-trigger ladder: honeypot / threshold / ml in that order. Any
  *      fire short-circuits the gate with the ladder's terminal decision.
  *   4. Slot rule lookup:
@@ -42,6 +47,23 @@ import type { GateContext, GateRequest, GateResult, SlotGrant } from "../types.j
  */
 const GENERIC_DENY_EXPLANATION = "operation not permitted";
 
+/**
+ * Subscriber handshake gate callback. Returns `{ permitted: true }` when
+ * the counterparty's sovereignty handshake state allows subscription, or
+ * `{ permitted: false }` with the observed state for audit logging.
+ *
+ * Defined as a callback (not a direct import) so the gates module's
+ * import graph stays free of network/handshake modules.
+ */
+export interface SubscriberHandshakeGateResult {
+  permitted: boolean;
+  state: string;
+  is_self: boolean;
+}
+export type SubscriberHandshakeGateCallback = (
+  counterpartyId: string
+) => SubscriberHandshakeGateResult;
+
 export interface SlotGateExtendedContext extends GateContext {
   /** Optional upstream threshold signal the ladder's tier 2 evaluates against. */
   threshold_signal?: string;
@@ -49,6 +71,13 @@ export interface SlotGateExtendedContext extends GateContext {
   ml_signal?: string;
   /** Injectable clock for deterministic receipts in tests. */
   now?: () => Date;
+  /**
+   * Subscriber handshake gate. When set and the request action is
+   * "subscribe", the gate checks whether the counterparty has completed
+   * the sovereignty handshake before evaluating policy grants.
+   * Absent = no handshake gating (backward compatible).
+   */
+  subscriberHandshakeGate?: SubscriberHandshakeGateCallback;
 }
 
 function findMatchingGrant(
@@ -121,6 +150,36 @@ export function evaluateSlotGate(
       receipt,
       explanation: GENERIC_DENY_EXPLANATION,
     };
+  }
+
+  // Step 2b: subscriber handshake gate (subscribe actions only).
+  if (
+    req.action === "subscribe" &&
+    ctx.subscriberHandshakeGate
+  ) {
+    const hsGate = ctx.subscriberHandshakeGate(req.counterparty);
+    if (!hsGate.permitted && !hsGate.is_self) {
+      const receipt = issueGateReceipt({
+        decision: "deny",
+        slot,
+        agent_id: req.agent_id,
+        counterparty: req.counterparty,
+        action: req.action,
+        invoked_skill_id: req.invoked_skill_id,
+        policy_version: policy.policy_version,
+        reason_code: GATE_REASON_CODES.SUBSCRIBER_HANDSHAKE_NOT_VERIFIED,
+        fortress_id: ctx.fortressId,
+        evaluating_node_id: ctx.nodeId,
+        node_signing_key: ctx.nodeSigningKey,
+        now: ctx.now,
+      });
+      return {
+        decision: "deny",
+        reason_code: GATE_REASON_CODES.SUBSCRIBER_HANDSHAKE_NOT_VERIFIED,
+        receipt,
+        explanation: GENERIC_DENY_EXPLANATION,
+      };
+    }
   }
 
   // Step 3: auto-trigger ladder (honeypot / threshold / ml).
