@@ -24,7 +24,7 @@ import {
   stringToBytes,
 } from "../core/encoding.js";
 import type { StorageBackend } from "../storage/interface.js";
-import { encrypt, decrypt } from "../core/encryption.js";
+import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
 import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
 
@@ -79,6 +79,16 @@ export interface InternalIdentitySigningHelpers {
     payload: InternalReceiptSigningPayload,
     options?: InternalSigningOptions
   ) => Promise<InternalSigningResult>;
+}
+
+export const IDENTITY_OVERWRITE_DENIAL =
+  "Identity operation refused: routine identity creation and import cannot replace an existing identity.";
+
+export class IdentityOverwriteRefusedError extends Error {
+  constructor() {
+    super(IDENTITY_OVERWRITE_DENIAL);
+    this.name = "IdentityOverwriteRefusedError";
+  }
 }
 
 /**
@@ -216,6 +226,110 @@ function requireOneOf<T extends string>(
     throw new Error(`${name}.${key} must be one of: ${allowed.join(", ")}.`);
   }
   return field as T;
+}
+
+function requireEncryptedPayload(
+  value: Record<string, unknown>,
+  key: string,
+  name: string
+): EncryptedPayload {
+  const payload = assertPlainRecord(value[key], `${name}.${key}`);
+  assertKnownKeys(payload, ["v", "alg", "iv", "ct", "ts"], `${name}.${key}`);
+  if (payload.v !== 1) {
+    throw new Error(`${name}.${key}.v must be 1.`);
+  }
+  if (payload.alg !== "aes-256-gcm") {
+    throw new Error(`${name}.${key}.alg must be aes-256-gcm.`);
+  }
+  return {
+    v: 1,
+    alg: "aes-256-gcm",
+    iv: requireNonEmptyString(payload, "iv", `${name}.${key}`),
+    ct: requireNonEmptyString(payload, "ct", `${name}.${key}`),
+    ts: requireNonEmptyString(payload, "ts", `${name}.${key}`),
+  };
+}
+
+function requireRotationHistory(value: Record<string, unknown>, name: string) {
+  const history = value.rotation_history;
+  if (!Array.isArray(history)) {
+    throw new Error(`${name}.rotation_history must be an array.`);
+  }
+  return history.map((item, index) => {
+    const record = assertPlainRecord(item, `${name}.rotation_history[${index}]`);
+    assertKnownKeys(
+      record,
+      ["old_public_key", "new_public_key", "rotation_event", "rotated_at"],
+      `${name}.rotation_history[${index}]`
+    );
+    return {
+      old_public_key: requireNonEmptyString(
+        record,
+        "old_public_key",
+        `${name}.rotation_history[${index}]`
+      ),
+      new_public_key: requireNonEmptyString(
+        record,
+        "new_public_key",
+        `${name}.rotation_history[${index}]`
+      ),
+      rotation_event: requireNonEmptyString(
+        record,
+        "rotation_event",
+        `${name}.rotation_history[${index}]`
+      ),
+      rotated_at: requireNonEmptyString(
+        record,
+        "rotated_at",
+        `${name}.rotation_history[${index}]`
+      ),
+    };
+  });
+}
+
+function normalizeImportedIdentity(payload: unknown): StoredIdentity {
+  const record = assertPlainRecord(payload, "identity_import.identity");
+  assertKnownKeys(
+    record,
+    [
+      "identity_id",
+      "label",
+      "public_key",
+      "did",
+      "created_at",
+      "key_type",
+      "key_protection",
+      "encrypted_private_key",
+      "rotation_history",
+    ],
+    "identity_import.identity"
+  );
+
+  return {
+    identity_id: requireNonEmptyString(record, "identity_id", "identity_import.identity"),
+    label: requireNonEmptyString(record, "label", "identity_import.identity"),
+    public_key: requireNonEmptyString(record, "public_key", "identity_import.identity"),
+    did: requireNonEmptyString(record, "did", "identity_import.identity"),
+    created_at: requireNonEmptyString(record, "created_at", "identity_import.identity"),
+    key_type: requireOneOf(
+      record,
+      "key_type",
+      ["ed25519"],
+      "identity_import.identity"
+    ),
+    key_protection: requireOneOf(
+      record,
+      "key_protection",
+      ["passphrase", "hardware-key", "recovery-key"],
+      "identity_import.identity"
+    ),
+    encrypted_private_key: requireEncryptedPayload(
+      record,
+      "encrypted_private_key",
+      "identity_import.identity"
+    ),
+    rotation_history: requireRotationHistory(record, "identity_import.identity"),
+  };
 }
 
 function normalizeAuditEventSigningPayload(
@@ -378,6 +492,23 @@ export class IdentityManager {
       this.primaryIdentityId = identity.identity_id;
       this.savePrimaryIdentityId();
     }
+  }
+
+  hasIdentityConflict(identity: StoredIdentity): boolean {
+    return Array.from(this.identities.values()).some(
+      (existing) =>
+        existing.identity_id === identity.identity_id ||
+        existing.did === identity.did ||
+        existing.public_key === identity.public_key
+    );
+  }
+
+  /** Save a newly-created/imported identity without allowing overwrite. */
+  async saveNew(identity: StoredIdentity): Promise<void> {
+    if (this.hasIdentityConflict(identity)) {
+      throw new IdentityOverwriteRefusedError();
+    }
+    await this.save(identity);
   }
 
   /** Set which identity is the default/primary identity */
@@ -543,6 +674,22 @@ async function recordCriticalAudit(
   });
 }
 
+async function refuseIdentityOverwrite(
+  auditLog: AuditLog | undefined,
+  operation: "identity_create" | "identity_import",
+  attemptedIdentityId: string
+): Promise<never> {
+  await recordCriticalAudit(
+    auditLog,
+    "l1",
+    `${operation}_overwrite_refused`,
+    attemptedIdentityId,
+    { attempted_operation: operation },
+    "failure"
+  );
+  throw new IdentityOverwriteRefusedError();
+}
+
 /**
  * Create all L1 tool definitions.
  */
@@ -605,10 +752,17 @@ export function createL1Tools(
           identityEncKey,
           keyProtection
         );
+        if (identityMgr.hasIdentityConflict(storedIdentity)) {
+          await refuseIdentityOverwrite(
+            auditLog,
+            "identity_create",
+            publicIdentity.identity_id
+          );
+        }
         await recordCriticalAudit(auditLog, "l1", "identity_create", publicIdentity.identity_id, {
           label,
         });
-        await identityMgr.save(storedIdentity);
+        await identityMgr.saveNew(storedIdentity);
 
         // If key_protection is "none", generate and show recovery key
         // (In practice, the recovery key is the master key itself,
@@ -621,6 +775,51 @@ export function createL1Tools(
           key_type: publicIdentity.key_type,
           key_protection: publicIdentity.key_protection,
           backed_up: false,
+        });
+      },
+    },
+
+    {
+      name: "identity_import",
+      description:
+        "Import a sovereign identity record without exposing private key material. " +
+        "Routine imports refuse to replace any existing identity.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          identity: {
+            type: "object",
+            description: "Stored identity record with encrypted private key payload.",
+          },
+        },
+        required: ["identity"],
+      },
+      handler: async (args) => {
+        const storedIdentity = normalizeImportedIdentity(args.identity);
+        if (identityMgr.hasIdentityConflict(storedIdentity)) {
+          await refuseIdentityOverwrite(
+            auditLog,
+            "identity_import",
+            storedIdentity.identity_id
+          );
+        }
+        await recordCriticalAudit(
+          auditLog,
+          "l1",
+          "identity_import",
+          storedIdentity.identity_id,
+          { imported: true }
+        );
+        await identityMgr.saveNew(storedIdentity);
+
+        return toolResult({
+          identity_id: storedIdentity.identity_id,
+          public_key: storedIdentity.public_key,
+          did: storedIdentity.did,
+          created_at: storedIdentity.created_at,
+          key_type: storedIdentity.key_type,
+          key_protection: storedIdentity.key_protection,
+          imported: true,
         });
       },
     },
