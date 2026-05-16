@@ -14,7 +14,9 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import type { AuditEntryInput } from "../l2-operational/audit-log.js";
 import type { UpstreamServer } from "../sovereignty-profile.js";
+import { validateUpstreamSseUrl } from "./ssrf-validator.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -44,6 +46,10 @@ export type ConnectionStateCallback = (
   toolCount: number,
   error?: string
 ) => void;
+
+export interface ProxyAuditLog {
+  appendCritical(entry: AuditEntryInput): Promise<void>;
+}
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -111,10 +117,12 @@ export function buildUpstreamStdioEnv(
 export class ClientManager {
   private connections: Map<string, UpstreamConnection> = new Map();
   private onStateChange?: ConnectionStateCallback;
+  private auditLog?: ProxyAuditLog;
   private shutdownRequested = false;
 
-  constructor(options?: { onStateChange?: ConnectionStateCallback }) {
+  constructor(options?: { onStateChange?: ConnectionStateCallback; auditLog?: ProxyAuditLog }) {
     this.onStateChange = options?.onStateChange;
+    this.auditLog = options?.auditLog;
   }
 
   /**
@@ -318,12 +326,26 @@ export class ClientManager {
         }
 
         // SEC-052: Validate SSE URL scheme and prevent SSRF
-        const ssrfUrl = new URL(conn.server.transport.url);
-        if (ssrfUrl.protocol !== "http:" && ssrfUrl.protocol !== "https:") {
-          throw new Error("SSE transport URL must use http or https scheme");
+        const validation = await validateUpstreamSseUrl(conn.server.transport.url, {
+          allowPrivateNetworks: conn.server.transport.allow_private_networks === true,
+        });
+        if (!validation.ok) {
+          throw new Error(`SSE transport URL rejected by SSRF validator: ${validation.reason}`);
+        }
+        if (conn.server.transport.allow_private_networks === true) {
+          await this.auditLog?.appendCritical({
+            layer: "l2",
+            operation: "proxy_ssrf_escape_hatch_used",
+            identity_id: "system",
+            result: "success",
+            details: {
+              event_type: "proxy.ssrf.escape_hatch_used",
+              server: conn.server.name,
+            },
+          });
         }
 
-        transport = new SSEClientTransport(ssrfUrl);
+        transport = new SSEClientTransport(new URL(conn.server.transport.url));
       }
 
       // Create MCP client

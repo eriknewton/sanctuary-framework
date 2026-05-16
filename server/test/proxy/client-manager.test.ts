@@ -8,6 +8,7 @@
 
 import { describe, it, expect, vi } from "vitest";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import {
   buildUpstreamStdioEnv,
   ClientManager,
@@ -34,6 +35,15 @@ vi.mock("@modelcontextprotocol/sdk/client/sse.js", () => ({
   SSEClientTransport: vi.fn().mockImplementation(() => ({
     close: vi.fn(async () => {}),
   })),
+}));
+
+vi.mock("node:dns/promises", () => ({
+  lookup: vi.fn(async (host: string) => {
+    if (host === "localhost") {
+      return [{ address: "127.0.0.1", family: 4 }];
+    }
+    return [{ address: "93.184.216.34", family: 4 }];
+  }),
 }));
 
 function makeServer(name: string, overrides?: Partial<UpstreamServer>): UpstreamServer {
@@ -180,6 +190,58 @@ describe("ClientManager", () => {
     it("rejects call to unconfigured server", async () => {
       const cm = new ClientManager();
       await expect(cm.callTool("nope", "tool", {})).rejects.toThrow();
+    });
+  });
+
+  describe("sse SSRF validation", () => {
+    it("rejects localhost SSE upstream URLs before constructing transport", async () => {
+      const cm = new ClientManager();
+      vi.mocked(SSEClientTransport).mockClear();
+
+      await cm.configure([
+        makeServer("local-sse", {
+          transport: { type: "sse", url: "http://localhost:3000/sse" },
+        }),
+      ]);
+      await waitForConnectionAttempt();
+
+      const [status] = cm.getStatus();
+      expect(status!.state).toBe("error");
+      expect(status!.error).toContain("SSE transport URL rejected by SSRF validator");
+      expect(status!.error).toContain("dns_resolved_to_blocked");
+      expect(SSEClientTransport).not.toHaveBeenCalled();
+      await cm.shutdown();
+    });
+
+    it("connects to private-network SSE upstreams only when the escape hatch is enabled", async () => {
+      const auditLog = { appendCritical: vi.fn(async () => {}) };
+      const cm = new ClientManager({ auditLog });
+      vi.mocked(SSEClientTransport).mockClear();
+
+      await cm.configure([
+        makeServer("private-sse", {
+          transport: {
+            type: "sse",
+            url: "http://10.0.0.8:3000/sse",
+            allow_private_networks: true,
+          },
+        }),
+      ]);
+      await waitForConnectionAttempt();
+
+      const [status] = cm.getStatus();
+      expect(status!.state).toBe("connected");
+      expect(SSEClientTransport).toHaveBeenCalledOnce();
+      expect(auditLog.appendCritical).toHaveBeenCalledWith(
+        expect.objectContaining({
+          operation: "proxy_ssrf_escape_hatch_used",
+          details: expect.objectContaining({
+            event_type: "proxy.ssrf.escape_hatch_used",
+            server: "private-sse",
+          }),
+        })
+      );
+      await cm.shutdown();
     });
   });
 

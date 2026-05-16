@@ -34,6 +34,7 @@ export interface UpstreamServer {
     args?: string[];      // For stdio: command arguments
     url?: string;         // For SSE: the server URL
     env?: Record<string, string>; // Environment variables to pass
+    allow_private_networks?: boolean; // For SSE: auditable SSRF escape hatch
   };
   enabled: boolean;
   default_tier: 1 | 2 | 3;  // Default tier for all tools from this server
@@ -276,6 +277,12 @@ export class SovereigntyProfileStore {
         if (server.transport.type === "sse" && !server.transport.url) {
           throw new Error("sse transport requires a url");
         }
+        if (
+          server.transport.allow_private_networks !== undefined &&
+          typeof server.transport.allow_private_networks !== "boolean"
+        ) {
+          throw new Error("transport.allow_private_networks must be a boolean");
+        }
         if (typeof server.enabled !== "boolean") {
           throw new Error("Each upstream server must have enabled as a boolean");
         }
@@ -502,6 +509,12 @@ function assertUpstreamServersShape(value: unknown): asserts value is UpstreamSe
     }
     if (transport.type === "sse" && typeof transport.url !== "string") {
       throw new ProfileSchemaError("sse upstream server transport requires a url");
+    }
+    if (
+      transport.allow_private_networks !== undefined &&
+      typeof transport.allow_private_networks !== "boolean"
+    ) {
+      throw new ProfileSchemaError("upstream server transport.allow_private_networks must be a boolean");
     }
     if (typeof s.enabled !== "boolean") {
       throw new ProfileSchemaError("each upstream server must have enabled as a boolean");
