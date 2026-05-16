@@ -49,15 +49,20 @@ export async function emitCastleWallBlockedEgress(params: {
 }): Promise<UnifiedInboxEntry | null> {
   const entry = ingestCastleWallBlockedEgress(params);
   if (entry && params.auditLog) {
-    params.auditLog.append("l1", PSI2_AUDIT_OPS.CASTLE_WALL_BLOCKED_EGRESS, params.identityId, {
-      inbox_id: entry.inbox_id,
-      agent_id: entry.agent_id,
-      target_host: params.event.destination?.host ?? null,
-      decision_reason: params.event.details.reason ?? params.event.details.block_reason_class ?? null,
-      observed_at: params.event.timestamp,
-      fortress_id: params.event.fortress_id,
+    await params.auditLog.appendCritical({
+      layer: "l1",
+      operation: PSI2_AUDIT_OPS.CASTLE_WALL_BLOCKED_EGRESS,
+      identity_id: params.identityId,
+      result: "failure",
+      details: {
+        inbox_id: entry.inbox_id,
+        agent_id: entry.agent_id,
+        target_host: params.event.destination?.host ?? null,
+        decision_reason: params.event.details.reason ?? params.event.details.block_reason_class ?? null,
+        observed_at: params.event.timestamp,
+        fortress_id: params.event.fortress_id,
+      },
     });
-    await params.auditLog.flush();
   }
   return entry;
 }

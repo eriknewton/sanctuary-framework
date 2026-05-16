@@ -197,12 +197,18 @@ export function createBridgeTools(
         // Persist the commitment and outcome for later verification/attestation
         await bridgeStore.save(bridgeCommitment, outcome);
 
-        auditLog.append("l3", "bridge_commit", identity.identity_id, {
-          bridge_commitment_id: bridgeCommitment.bridge_commitment_id,
-          session_id: outcome.session_id,
-          counterparty: outcome.proposer_did === identity.did
-            ? outcome.acceptor_did
-            : outcome.proposer_did,
+        await auditLog.appendCritical({
+          layer: "l3",
+          operation: "bridge_commit",
+          identity_id: identity.identity_id,
+          result: "success",
+          details: {
+            bridge_commitment_id: bridgeCommitment.bridge_commitment_id,
+            session_id: outcome.session_id,
+            counterparty: outcome.proposer_did === identity.did
+              ? outcome.acceptor_did
+              : outcome.proposer_did,
+          },
         });
 
         return toolResult({
@@ -390,12 +396,18 @@ export function createBridgeTools(
           tier
         );
 
-        auditLog.append("l4", "bridge_attest", identity.identity_id, {
-          bridge_commitment_id: commitmentId,
-          session_id: outcome.session_id,
-          attestation_id: attestation.attestation.attestation_id,
-          counterparty_did: counterpartyDid,
-          sovereignty_tier: tier,
+        await auditLog.appendCritical({
+          layer: "l4",
+          operation: "bridge_attest",
+          identity_id: identity.identity_id,
+          result: "success",
+          details: {
+            bridge_commitment_id: commitmentId,
+            session_id: outcome.session_id,
+            attestation_id: attestation.attestation.attestation_id,
+            counterparty_did: counterpartyDid,
+            sovereignty_tier: tier,
+          },
         });
 
         const weight = TIER_WEIGHTS[tier];

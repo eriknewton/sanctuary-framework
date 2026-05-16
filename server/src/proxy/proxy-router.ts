@@ -167,13 +167,19 @@ export class ProxyRouter {
         // Step 1: Injection detection
         const injectionResult = this.injectionDetector.scan(proxyName, args);
         if (injectionResult.flagged && injectionResult.recommendation === "block") {
-          this.auditLog.append("l2", `proxy_injection_blocked:${proxyName}`, "system", {
-            server: serverName,
-            tool: toolName,
-            tier,
-            confidence: injectionResult.confidence,
-            latency_ms: Date.now() - start,
-          }, "failure");
+          await this.auditLog.appendCritical({
+            layer: "l2",
+            operation: `proxy_injection_blocked:${proxyName}`,
+            identity_id: "system",
+            result: "failure",
+            details: {
+              server: serverName,
+              tool: toolName,
+              tier,
+              confidence: injectionResult.confidence,
+              latency_ms: Date.now() - start,
+            },
+          });
 
           this.notifyProxyCall(proxyName, serverName, "blocked", "injection_detected", tier);
           return toolResult({
@@ -208,13 +214,19 @@ export class ProxyRouter {
           const govResult = this.options.governor.check(serverName, toolName, filteredArgs);
 
           if (!govResult.allowed) {
-            this.auditLog.append("l2", `proxy_governor_blocked:${proxyName}`, "system", {
-              server: serverName,
-              tool: toolName,
-              tier,
-              reason: govResult.reason,
-              latency_ms: Date.now() - start,
-            }, "failure");
+            await this.auditLog.appendCritical({
+              layer: "l2",
+              operation: `proxy_governor_blocked:${proxyName}`,
+              identity_id: "system",
+              result: "failure",
+              details: {
+                server: serverName,
+                tool: toolName,
+                tier,
+                reason: govResult.reason,
+                latency_ms: Date.now() - start,
+              },
+            });
 
             this.notifyProxyCall(proxyName, serverName, "blocked", govResult.reason, tier);
             return toolResult({
@@ -272,13 +284,19 @@ export class ProxyRouter {
           });
 
           if (decision.status === "denied") {
-            this.auditLog.append("l2", `proxy_privacy_denied:${proxyName}`, "system", {
-              server: serverName,
-              tool: toolName,
-              tier,
-              denial_reason_class: decision.audit_payload.denial_reason_class,
-              latency_ms: Date.now() - start,
-            }, "failure");
+            await this.auditLog.appendCritical({
+              layer: "l2",
+              operation: `proxy_privacy_denied:${proxyName}`,
+              identity_id: "system",
+              result: "failure",
+              details: {
+                server: serverName,
+                tool: toolName,
+                tier,
+                denial_reason_class: decision.audit_payload.denial_reason_class,
+                latency_ms: Date.now() - start,
+              },
+            });
             this.notifyProxyCall(
               proxyName,
               serverName,

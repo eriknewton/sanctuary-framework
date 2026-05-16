@@ -28,6 +28,17 @@ import { AuditLog, BROKER_OPS } from "../../../src/l2-operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 
+class FailingAuditStorage extends MemoryStorage {
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    if (namespace === "_audit") {
+      const err = new Error("audit storage full") as NodeJS.ErrnoException;
+      err.code = "ENOSPC";
+      throw err;
+    }
+    return super.write(namespace, key, data);
+  }
+}
+
 function makeFakeBackend(secrets: Record<string, string>): Backend {
   const store = new Map(Object.entries(secrets));
   return {
@@ -117,6 +128,27 @@ describe("TokenIssuer", () => {
       expect(audit.entries[0]!.result).toBe("success");
       expect(audit.entries[0]!.details?.skill).toBe("gmail-triage");
       expect(audit.entries[0]!.details?.secret).toBe("gmail_oauth");
+    });
+
+    it("does not issue a live token when critical audit persistence fails", async () => {
+      const auditLog = new AuditLog(new FailingAuditStorage(), generateRandomKey());
+      const issuer = new TokenIssuer({
+        backend: makeFakeBackend({ gmail_oauth: "secret-value-xyz" }),
+        auditLog,
+        grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],
+      });
+
+      await expect(
+        issuer.issueToken({
+          skill: "gmail-triage",
+          secret: "gmail_oauth",
+          caller: caller("gmail-triage"),
+        })
+      ).rejects.toMatchObject({
+        name: "AuditPersistenceError",
+        classification: "storage_full",
+      });
+      expect(issuer.liveTokenCount()).toBe(0);
     });
 
     it("denies when no grant exists and audits the denial", async () => {

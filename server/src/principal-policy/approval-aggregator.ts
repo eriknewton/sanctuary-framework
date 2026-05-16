@@ -798,11 +798,12 @@ export class ApprovalAggregator {
     entry.resolved_by = operatorId;
     entry.last_modified_revision = this.nextRevision();
     await this.persist(entry);
-    this.auditLog.append(
-      "l2",
-      APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED,
-      this.identityId,
-      {
+    await this.auditLog.appendCritical({
+      layer: "l2",
+      operation: APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED,
+      identity_id: this.identityId,
+      result: decision === "approved" ? "success" : "failure",
+      details: {
         aggregator_id: entry.aggregator_id,
         source_harness: entry.source_harness,
         source_agent_id: entry.source_agent_id,
@@ -812,7 +813,7 @@ export class ApprovalAggregator {
         decided_by: operatorId,
         decided_at: entry.resolved_at,
       },
-    );
+    });
     this.emit({ type: "resolved", entry: { ...entry } });
     return entry;
   }
@@ -891,11 +892,12 @@ export class ApprovalAggregator {
         // simply degrades for this entry.
       }
     }
-    this.auditLog.append(
-      "l2",
-      APPROVAL_AGGREGATOR_AUDIT_OPS.AGGREGATED,
-      this.identityId,
-      {
+    await this.auditLog.appendCritical({
+      layer: "l2",
+      operation: APPROVAL_AGGREGATOR_AUDIT_OPS.AGGREGATED,
+      identity_id: this.identityId,
+      result: "success",
+      details: {
         aggregator_id: id,
         source_harness: ctx.source_harness,
         source_agent_id: ctx.source_agent_id,
@@ -903,7 +905,7 @@ export class ApprovalAggregator {
         policy_rule_id: entry.policy_rule_id,
         ...(hubInboxId !== undefined ? { hub_inbox_item_id: hubInboxId } : {}),
       },
-    );
+    });
     this.emit({ type: "aggregated", entry: { ...entry } });
     return entry;
   }
@@ -932,11 +934,12 @@ export class ApprovalAggregator {
     entry.resolved_by = event.resolution.decided_by;
     entry.last_modified_revision = this.nextRevision();
     await this.persist(entry);
-    this.auditLog.append(
-      "l2",
-      APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED,
-      this.identityId,
-      {
+    await this.auditLog.appendCritical({
+      layer: "l2",
+      operation: APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED,
+      identity_id: this.identityId,
+      result: status === "approved" ? "success" : "failure",
+      details: {
         aggregator_id: id,
         source_harness: entry.source_harness,
         source_agent_id: entry.source_agent_id,
@@ -947,7 +950,7 @@ export class ApprovalAggregator {
         decided_at: entry.resolved_at,
         fail_closed: failClosed,
       },
-    );
+    });
     this.emit({ type: "resolved", entry: { ...entry } });
     return entry;
   }
@@ -1005,11 +1008,12 @@ export class ApprovalAggregator {
       entry.resolved_by = "system_ttl";
       entry.last_modified_revision = this.nextRevision();
       await this.persist(entry);
-      this.auditLog.append(
-        "l2",
-        APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED,
-        this.identityId,
-        {
+      await this.auditLog.appendCritical({
+        layer: "l2",
+        operation: APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED,
+        identity_id: this.identityId,
+        result: "failure",
+        details: {
           aggregator_id: entry.aggregator_id,
           source_harness: entry.source_harness,
           source_agent_id: entry.source_agent_id,
@@ -1019,7 +1023,7 @@ export class ApprovalAggregator {
           decided_by: "system_ttl",
           decided_at: entry.resolved_at,
         },
-      );
+      });
       this.emit({ type: "resolved", entry: { ...entry } });
     }
   }

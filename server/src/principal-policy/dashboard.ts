@@ -1868,12 +1868,30 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
         // Audit log the dashboard-initiated change
         if (this.auditLog) {
-          this.auditLog.append("l2", "sovereignty_profile_update_dashboard", "dashboard", {
-            changes: updates,
-            features_enabled: Object.entries(updated.features)
-              .filter(([, v]) => v.enabled)
-              .map(([k]) => k),
-          });
+          try {
+            await this.auditLog.appendCritical({
+              layer: "l2",
+              operation: "sovereignty_profile_update_dashboard",
+              identity_id: "dashboard",
+              result: "success",
+              details: {
+                changes: updates,
+                features_enabled: Object.entries(updated.features)
+                  .filter(([, v]) => v.enabled)
+                  .map(([k]) => k),
+              },
+            });
+          } catch {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              error: "Audit persistence failed",
+              profile_updated: true,
+              audit_failed: true,
+              profile: updated,
+              system_prompt: prompt,
+            }));
+            return;
+          }
         }
 
         // Broadcast to SSE clients
@@ -1950,15 +1968,32 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
         // Audit log the dashboard-initiated change
         if (this.auditLog) {
-          this.auditLog.append("l2", "proxy_servers_update_dashboard", "dashboard", {
-            server_count: upstream_servers.length,
-            servers: upstream_servers.map(s => ({
-              name: s.name,
-              type: s.transport.type,
-              enabled: s.enabled,
-              tier: s.default_tier,
-            })),
-          });
+          try {
+            await this.auditLog.appendCritical({
+              layer: "l2",
+              operation: "proxy_servers_update_dashboard",
+              identity_id: "dashboard",
+              result: "success",
+              details: {
+                server_count: upstream_servers.length,
+                servers: upstream_servers.map(s => ({
+                  name: s.name,
+                  type: s.transport.type,
+                  enabled: s.enabled,
+                  tier: s.default_tier,
+                })),
+              },
+            });
+          } catch {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              error: "Audit persistence failed",
+              profile_updated: true,
+              audit_failed: true,
+              servers: updated.upstream_servers ?? [],
+            }));
+            return;
+          }
         }
 
         // Reconfigure client manager if available

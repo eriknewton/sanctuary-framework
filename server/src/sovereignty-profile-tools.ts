@@ -135,11 +135,17 @@ export function createSovereigntyProfileTools(
 
         const updated = await profileStore.update(updates);
 
-        auditLog.append("l2", "sovereignty_profile_update", "system", {
-          changes: updates,
-          features_enabled: Object.entries(updated.features)
-            .filter(([, v]) => v.enabled)
-            .map(([k]) => k),
+        await auditLog.appendCritical({
+          layer: "l2",
+          operation: "sovereignty_profile_update",
+          identity_id: "system",
+          result: "success",
+          details: {
+            changes: updates,
+            features_enabled: Object.entries(updated.features)
+              .filter(([, v]) => v.enabled)
+              .map(([k]) => k),
+          },
         });
 
         return toolResult({

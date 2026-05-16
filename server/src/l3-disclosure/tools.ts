@@ -68,9 +68,15 @@ export function createL3Tools(
         // Store the commitment encrypted for reference
         const commitmentId = await commitmentStore.store(commitment, value);
 
-        auditLog.append("l3", "proof_commitment", "system", {
-          commitment_id: commitmentId,
-          commitment_hash: commitment.commitment,
+        await auditLog.appendCritical({
+          layer: "l3",
+          operation: "proof_commitment",
+          identity_id: "system",
+          result: "success",
+          details: {
+            commitment_id: commitmentId,
+            commitment_hash: commitment.commitment,
+          },
         });
 
         return toolResult({
@@ -199,10 +205,16 @@ export function createL3Tools(
           identityId
         );
 
-        auditLog.append("l3", "disclosure_set_policy", identityId ?? "system", {
-          policy_id: policy.policy_id,
-          policy_name: policyName,
-          rules_count: rules.length,
+        await auditLog.appendCritical({
+          layer: "l3",
+          operation: "disclosure_set_policy",
+          identity_id: identityId ?? "system",
+          result: "success",
+          details: {
+            policy_id: policy.policy_id,
+            policy_name: policyName,
+            rules_count: rules.length,
+          },
         });
 
         return toolResult({
@@ -328,8 +340,14 @@ export function createL3Tools(
 
         const commitment = createPedersenCommitment(value);
 
-        auditLog.append("l3", "zk_commit", "system", {
-          commitment_hash: commitment.commitment.slice(0, 16) + "...",
+        await auditLog.appendCritical({
+          layer: "l3",
+          operation: "zk_commit",
+          identity_id: "system",
+          result: "success",
+          details: {
+            commitment_hash: commitment.commitment.slice(0, 16) + "...",
+          },
         });
 
         return toolResult({

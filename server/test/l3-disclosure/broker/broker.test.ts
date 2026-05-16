@@ -15,6 +15,17 @@ import { AuditLog, BROKER_OPS } from "../../../src/l2-operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 
+class FailingAuditStorage extends MemoryStorage {
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    if (namespace === "_audit") {
+      const err = new Error("audit storage full") as NodeJS.ErrnoException;
+      err.code = "ENOSPC";
+      throw err;
+    }
+    return super.write(namespace, key, data);
+  }
+}
+
 function makeFakeBackend(seed: Record<string, string> = {}): Backend {
   const store = new Map(Object.entries(seed));
   let unlocked = true;
@@ -73,6 +84,24 @@ describe("Broker", () => {
     expect(audit.entries).toHaveLength(1);
     expect(audit.entries[0]!.details?.secret).toBe("gmail_oauth");
     expect(audit.entries[0]!.identity_id).toBe("did:sanctuary:principal");
+  });
+
+  it("surfaces committed secret mutations when critical audit persistence fails", async () => {
+    const storage = new FailingAuditStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const backend = makeFakeBackend();
+    const broker = new Broker({
+      backend,
+      auditLog,
+      principalIdentityId: "did:sanctuary:principal",
+    });
+
+    await expect(broker.addSecret("gmail_oauth", "xyz")).rejects.toMatchObject({
+      name: "AuditPersistenceError",
+      classification: "storage_full",
+    });
+    expect(await broker.listSecretNames()).toEqual(["gmail_oauth"]);
   });
 
   it("audit entries never contain secret values", async () => {

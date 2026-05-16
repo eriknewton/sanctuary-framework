@@ -22,6 +22,17 @@ import { AuditLog } from "../../src/l2-operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 
+class FailingAuditStorage extends MemoryStorage {
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    if (namespace === "_audit") {
+      const err = new Error("audit storage full") as NodeJS.ErrnoException;
+      err.code = "ENOSPC";
+      throw err;
+    }
+    return super.write(namespace, key, data);
+  }
+}
+
 function createTestPolicy(overrides?: Partial<PrincipalPolicy>): PrincipalPolicy {
   return {
     version: 1,
@@ -72,6 +83,19 @@ describe("Approval Gate", () => {
       expect(result.tier).toBe(1);
       expect(result.allowed).toBe(true); // AutoApprove always approves
       expect(result.approval_required).toBe(true);
+    });
+
+    it("fails closed when approval decision audit persistence fails", async () => {
+      const failingStorage = new FailingAuditStorage();
+      const failingAuditLog = new AuditLog(failingStorage, masterKey);
+      const policy = createTestPolicy();
+      const channel = new AutoApproveChannel();
+      const gate = new ApprovalGate(policy, baseline, channel, failingAuditLog);
+
+      await expect(gate.evaluate("state_export", {})).rejects.toMatchObject({
+        name: "AuditPersistenceError",
+        classification: "storage_full",
+      });
     });
 
     it("denies Tier 1 operations when channel denies", async () => {
@@ -226,6 +250,22 @@ describe("Approval Gate", () => {
       expect(result.tier).toBe(3);
       expect(result.allowed).toBe(true);
       expect(result.approval_required).toBe(false);
+    });
+
+    it("fails closed when Tier 3 allow audit persistence fails", async () => {
+      const failingStorage = new FailingAuditStorage();
+      const failingAuditLog = new AuditLog(failingStorage, masterKey);
+      const policy = createTestPolicy();
+      await baseline.save();
+      const baseline2 = new BaselineTracker(storage, masterKey);
+      await baseline2.load();
+      const channel = new AutoApproveChannel();
+      const gate = new ApprovalGate(policy, baseline2, channel, failingAuditLog);
+
+      await expect(gate.evaluate("state_read", {})).rejects.toMatchObject({
+        name: "AuditPersistenceError",
+        classification: "storage_full",
+      });
     });
 
     it("allows monitor_health without approval", async () => {

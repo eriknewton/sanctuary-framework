@@ -58,6 +58,7 @@ function createMockInjectionDetector(flagged = false) {
 function createMockAuditLog() {
   return {
     append: vi.fn(),
+    appendCritical: vi.fn().mockResolvedValue(undefined),
     query: vi.fn().mockResolvedValue([]),
   };
 }
