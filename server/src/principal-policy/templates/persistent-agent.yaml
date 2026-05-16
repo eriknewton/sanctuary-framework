@@ -4,6 +4,7 @@
 #
 # Tier 1 (always require human approval):
 #   - state_export, state_import (data portability — irreversible if imported over existing)
+#   - identity_sign (raw arbitrary commitment with managed identity)
 #   - identity_rotate (key rotation — old key destroyed)
 #   - state_delete with secure_delete (3-pass overwrite — unrecoverable)
 #   - reputation_import (external trust injection)
@@ -15,7 +16,7 @@
 #
 # Tier 3 (auto-allow with audit logging):
 #   - Everything else: state_read, state_write, state_list, identity_create,
-#     identity_sign, identity_verify, identity_list, identity_set_primary,
+#     identity_verify, identity_list, identity_set_primary,
 #     all context_gate_* tools, all handshake_* tools, shr_generate, shr_verify,
 #     sovereignty_audit, all disclosure_* tools, all proof_* tools, all zk_* tools,
 #     reputation_query, reputation_query_weighted, reputation_publish,
@@ -34,6 +35,7 @@ tiers:
     operations:
       - state_export
       - state_import
+      - identity_sign
       - identity_rotate
       - governor_reset
     rules:

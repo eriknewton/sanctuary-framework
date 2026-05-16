@@ -12,6 +12,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
+import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import {
   AutoApproveChannel,
   CallbackApprovalChannel,
@@ -87,6 +88,29 @@ describe("Approval Gate", () => {
       expect(result.tier).toBe(1);
       expect(result.allowed).toBe(false);
       expect(result.approval_required).toBe(true);
+    });
+
+    it("sends raw identity_sign through the approval path under the default policy", async () => {
+      const approvals: ApprovalRequest[] = [];
+      const channel = new CallbackApprovalChannel(async (request) => {
+        approvals.push(request);
+        return {
+          decision: "deny",
+          decided_at: new Date().toISOString(),
+          decided_by: "human",
+        };
+      });
+      const gate = new ApprovalGate(DEFAULT_POLICY, baseline, channel, auditLog);
+
+      const result = await gate.evaluate("identity_sign", {
+        payload: "externally meaningful commitment",
+      });
+
+      expect(result.tier).toBe(1);
+      expect(result.allowed).toBe(false);
+      expect(result.approval_required).toBe(true);
+      expect(approvals).toHaveLength(1);
+      expect(approvals[0]!.operation).toBe("identity_sign");
     });
   });
 

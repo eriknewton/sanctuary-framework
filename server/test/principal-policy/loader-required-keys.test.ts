@@ -5,6 +5,8 @@
  * the policy file. Silent default substitution hides operator intent.
  *
  * tier2_anomaly and tier3_always_allow may be omitted (merge from defaults).
+ * Raw identity_sign is always forced into Tier 1 even when the operator
+ * starts from a smaller explicit list.
  */
 
 import { describe, it, expect } from "vitest";
@@ -86,18 +88,22 @@ approval_channel:
   timeout_seconds: 120
 `;
     const policy = parsePolicy(yaml);
-    expect(policy.tier1_always_approve).toEqual(["state_export", "state_import"]);
+    expect(policy.tier1_always_approve).toEqual([
+      "state_export",
+      "state_import",
+      "identity_sign",
+    ]);
     expect(policy.approval_channel.type).toBe("stderr");
   });
 
-  it("accepts empty tier1_always_approve list", () => {
+  it("accepts empty tier1_always_approve list while preserving forced raw signing gate", () => {
     const json = JSON.stringify({
       version: 1,
       tier1_always_approve: [],
       approval_channel: { type: "stderr" },
     });
     const policy = parsePolicy(json);
-    expect(policy.tier1_always_approve).toEqual([]);
+    expect(policy.tier1_always_approve).toEqual(["identity_sign"]);
   });
 
   it("accepts empty approval_channel object", () => {

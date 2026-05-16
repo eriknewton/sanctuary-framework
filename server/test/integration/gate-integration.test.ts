@@ -8,7 +8,7 @@
  *   1. Agent tries state_export → blocked (Tier 1 always-approve, auto-deny)
  *   2. Agent tries reading an unfamiliar namespace → blocked (Tier 2 anomaly)
  *   3. Agent does normal state_read on a known namespace → allowed (Tier 3)
- *   4. Agent floods identity_sign → blocked after exceeding frequency limit
+ *   4. Agent tries raw identity_sign → blocked by explicit approval gate
  *   5. Agent tries reputation_import → blocked (Tier 1)
  *   6. Agent tries new counterparty interaction → blocked (Tier 2)
  *
@@ -146,23 +146,16 @@ describe("Gate Integration — Prompt Injection Defense", () => {
     expect(lastApproval.request.reason).toContain("did:attacker:eve");
   });
 
-  it("blocks signing frequency spike (Tier 2 max_signs_per_minute)", async () => {
-    // Flood identity_sign to exceed the default limit (10/min)
-    const results = [];
-    for (let i = 0; i < 12; i++) {
-      results.push(
-        await gate.evaluate("identity_sign", {
-          payload: `message-${i}`,
-        })
-      );
-    }
+  it("blocks raw identity_sign through the Tier 1 approval path", async () => {
+    const result = await gate.evaluate("identity_sign", {
+      payload: "externally meaningful commitment",
+    });
 
-    // The first calls should be allowed, but once the limit is exceeded...
-    const blocked = results.filter((r) => !r.allowed);
-    expect(blocked.length).toBeGreaterThan(0);
-
-    const blockedResult = blocked[0]!;
-    expect(blockedResult.tier).toBe(2);
+    expect(result.allowed).toBe(false);
+    expect(result.tier).toBe(1);
+    expect(result.approval_required).toBe(true);
+    const lastApproval = approvalDecisions[approvalDecisions.length - 1]!;
+    expect(lastApproval.request.operation).toBe("identity_sign");
   });
 
   // ── Tier 3: Normal operations allowed ──────────────────────────────────

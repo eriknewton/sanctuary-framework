@@ -28,6 +28,59 @@ import { encrypt, decrypt } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 
+export const AUDIT_EVENT_SIGNING_DOMAIN = "sanctuary.audit.v1";
+export const INTERNAL_RECEIPT_SIGNING_DOMAIN = "sanctuary.receipt.v1";
+
+export type InternalSigningDomain =
+  | typeof AUDIT_EVENT_SIGNING_DOMAIN
+  | typeof INTERNAL_RECEIPT_SIGNING_DOMAIN;
+
+export interface AuditEventSigningPayload {
+  event_id: string;
+  layer: string;
+  operation: string;
+  actor: string;
+  timestamp: string;
+  event_hash: string;
+  previous_event_hash?: string;
+}
+
+export interface InternalReceiptSigningPayload {
+  receipt_id: string;
+  receipt_type: "approval" | "tool_call" | "state_write" | "handoff" | "internal";
+  subject: string;
+  issued_at: string;
+  status: "issued" | "approved" | "denied" | "completed" | "failed";
+  body_hash: string;
+  expires_at?: string;
+}
+
+export interface InternalSigningOptions {
+  identity_id?: string;
+}
+
+export interface InternalSigningResult {
+  identity_id: string;
+  public_key: string;
+  signature: string;
+  algorithm: "Ed25519";
+  domain: InternalSigningDomain;
+  signed_payload: string;
+  payload_encoding: "domain-separated-canonical-json-v1";
+  signed_at: string;
+}
+
+export interface InternalIdentitySigningHelpers {
+  audit_event_sign: (
+    payload: AuditEventSigningPayload,
+    options?: InternalSigningOptions
+  ) => InternalSigningResult;
+  internal_receipt_sign: (
+    payload: InternalReceiptSigningPayload,
+    options?: InternalSigningOptions
+  ) => InternalSigningResult;
+}
+
 /**
  * Reserved namespace prefixes - used by internal subsystems.
  * Agent-facing state tools MUST reject reads, writes, deletes, lists, and
@@ -64,6 +117,187 @@ function getReservedNamespaceViolation(namespace: string): string | null {
     }
   }
   return null;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+
+  const record = value as Record<string, unknown>;
+  const entries = Object.keys(record)
+    .sort()
+    .filter((key) => record[key] !== undefined)
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`);
+  return `{${entries.join(",")}}`;
+}
+
+export function domainSeparatedSigningBytes(
+  domain: InternalSigningDomain,
+  payload: Record<string, unknown>
+): Uint8Array {
+  return stringToBytes(`${domain}\n${canonicalJson(payload)}`);
+}
+
+function assertPlainRecord(value: unknown, name: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${name} must be an object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function assertKnownKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  name: string
+): void {
+  const allowedSet = new Set(allowed);
+  for (const key of Object.keys(value)) {
+    if (!allowedSet.has(key)) {
+      throw new Error(`${name} contains unsupported field: ${key}`);
+    }
+  }
+}
+
+function requireNonEmptyString(
+  value: Record<string, unknown>,
+  key: string,
+  name: string
+): string {
+  const field = value[key];
+  if (typeof field !== "string" || field.trim() === "") {
+    throw new Error(`${name}.${key} must be a non-empty string.`);
+  }
+  return field;
+}
+
+function optionalNonEmptyString(
+  value: Record<string, unknown>,
+  key: string,
+  name: string
+): string | undefined {
+  if (value[key] === undefined) return undefined;
+  return requireNonEmptyString(value, key, name);
+}
+
+function requireSha256Digest(
+  value: Record<string, unknown>,
+  key: string,
+  name: string
+): string {
+  const digest = requireNonEmptyString(value, key, name);
+  if (!/^sha256:[a-f0-9]{64}$/.test(digest)) {
+    throw new Error(`${name}.${key} must be a sha256:<64 hex> digest.`);
+  }
+  return digest;
+}
+
+function optionalSha256Digest(
+  value: Record<string, unknown>,
+  key: string,
+  name: string
+): string | undefined {
+  if (value[key] === undefined) return undefined;
+  return requireSha256Digest(value, key, name);
+}
+
+function requireOneOf<T extends string>(
+  value: Record<string, unknown>,
+  key: string,
+  allowed: readonly T[],
+  name: string
+): T {
+  const field = requireNonEmptyString(value, key, name);
+  if (!(allowed as readonly string[]).includes(field)) {
+    throw new Error(`${name}.${key} must be one of: ${allowed.join(", ")}.`);
+  }
+  return field as T;
+}
+
+function normalizeAuditEventSigningPayload(
+  payload: AuditEventSigningPayload
+): AuditEventSigningPayload {
+  const record = assertPlainRecord(payload, "audit_event_sign payload");
+  assertKnownKeys(
+    record,
+    [
+      "event_id",
+      "layer",
+      "operation",
+      "actor",
+      "timestamp",
+      "event_hash",
+      "previous_event_hash",
+    ],
+    "audit_event_sign payload"
+  );
+  return {
+    event_id: requireNonEmptyString(record, "event_id", "audit_event_sign payload"),
+    layer: requireNonEmptyString(record, "layer", "audit_event_sign payload"),
+    operation: requireNonEmptyString(record, "operation", "audit_event_sign payload"),
+    actor: requireNonEmptyString(record, "actor", "audit_event_sign payload"),
+    timestamp: requireNonEmptyString(record, "timestamp", "audit_event_sign payload"),
+    event_hash: requireSha256Digest(record, "event_hash", "audit_event_sign payload"),
+    ...(optionalSha256Digest(record, "previous_event_hash", "audit_event_sign payload")
+      ? {
+          previous_event_hash: optionalSha256Digest(
+            record,
+            "previous_event_hash",
+            "audit_event_sign payload"
+          ),
+        }
+      : {}),
+  };
+}
+
+function normalizeInternalReceiptSigningPayload(
+  payload: InternalReceiptSigningPayload
+): InternalReceiptSigningPayload {
+  const record = assertPlainRecord(payload, "internal_receipt_sign payload");
+  assertKnownKeys(
+    record,
+    [
+      "receipt_id",
+      "receipt_type",
+      "subject",
+      "issued_at",
+      "status",
+      "body_hash",
+      "expires_at",
+    ],
+    "internal_receipt_sign payload"
+  );
+  return {
+    receipt_id: requireNonEmptyString(record, "receipt_id", "internal_receipt_sign payload"),
+    receipt_type: requireOneOf(
+      record,
+      "receipt_type",
+      ["approval", "tool_call", "state_write", "handoff", "internal"],
+      "internal_receipt_sign payload"
+    ),
+    subject: requireNonEmptyString(record, "subject", "internal_receipt_sign payload"),
+    issued_at: requireNonEmptyString(record, "issued_at", "internal_receipt_sign payload"),
+    status: requireOneOf(
+      record,
+      "status",
+      ["issued", "approved", "denied", "completed", "failed"],
+      "internal_receipt_sign payload"
+    ),
+    body_hash: requireSha256Digest(record, "body_hash", "internal_receipt_sign payload"),
+    ...(optionalNonEmptyString(record, "expires_at", "internal_receipt_sign payload")
+      ? {
+          expires_at: optionalNonEmptyString(
+            record,
+            "expires_at",
+            "internal_receipt_sign payload"
+          ),
+        }
+      : {}),
+  };
 }
 
 /** Manages all identities - provides storage and retrieval */
@@ -219,6 +453,76 @@ export class IdentityManager {
   }
 }
 
+function resolveInternalSigningIdentity(
+  identityMgr: IdentityManager,
+  identityId?: string
+): StoredIdentity {
+  const identity = identityId
+    ? identityMgr.get(identityId)
+    : identityMgr.getDefault();
+  if (!identity) {
+    throw new Error(
+      identityId
+        ? `Identity not found: ${identityId}`
+        : "No default identity available for internal signing."
+    );
+  }
+  return identity;
+}
+
+export function createInternalIdentitySigningHelpers(
+  identityMgr: IdentityManager,
+  masterKey: Uint8Array,
+  auditLog?: AuditLog
+): InternalIdentitySigningHelpers {
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+
+  function signTypedPayload(
+    operation: "audit_event_sign" | "internal_receipt_sign",
+    domain: InternalSigningDomain,
+    payload: Record<string, unknown>,
+    identityId?: string
+  ): InternalSigningResult {
+    const identity = resolveInternalSigningIdentity(identityMgr, identityId);
+    const signedPayload = domainSeparatedSigningBytes(domain, payload);
+    const signature = identitySign(
+      signedPayload,
+      identity.encrypted_private_key,
+      identityEncKey
+    );
+
+    auditLog?.append("l1", operation, identity.identity_id, { domain });
+
+    return {
+      identity_id: identity.identity_id,
+      public_key: identity.public_key,
+      signature: toBase64url(signature),
+      algorithm: "Ed25519",
+      domain,
+      signed_payload: toBase64url(signedPayload),
+      payload_encoding: "domain-separated-canonical-json-v1",
+      signed_at: new Date().toISOString(),
+    };
+  }
+
+  return {
+    audit_event_sign: (payload, options = {}) =>
+      signTypedPayload(
+        "audit_event_sign",
+        AUDIT_EVENT_SIGNING_DOMAIN,
+        normalizeAuditEventSigningPayload(payload) as unknown as Record<string, unknown>,
+        options.identity_id
+      ),
+    internal_receipt_sign: (payload, options = {}) =>
+      signTypedPayload(
+        "internal_receipt_sign",
+        INTERNAL_RECEIPT_SIGNING_DOMAIN,
+        normalizeInternalReceiptSigningPayload(payload) as unknown as Record<string, unknown>,
+        options.identity_id
+      ),
+  };
+}
+
 /**
  * Create all L1 tool definitions.
  */
@@ -228,9 +532,18 @@ export function createL1Tools(
   masterKey: Uint8Array,
   keyProtection: "passphrase" | "hardware-key" | "recovery-key",
   auditLog?: AuditLog
-): { tools: ToolDefinition[]; identityManager: IdentityManager } {
+): {
+  tools: ToolDefinition[];
+  identityManager: IdentityManager;
+  internalSigning: InternalIdentitySigningHelpers;
+} {
   const identityMgr = new IdentityManager(storage, masterKey);
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  const internalSigning = createInternalIdentitySigningHelpers(
+    identityMgr,
+    masterKey,
+    auditLog
+  );
 
   // Helper to get identity or throw
   function resolveIdentity(identityId?: string): StoredIdentity {
@@ -322,7 +635,7 @@ export function createL1Tools(
     {
       name: "identity_sign",
       description:
-        "Sign data with a managed identity. " +
+        "Sign data with a managed identity after operator approval. " +
         "The private key is decrypted in memory only during signing.",
       inputSchema: {
         type: "object",
@@ -766,5 +1079,5 @@ export function createL1Tools(
     },
   ];
 
-  return { tools, identityManager: identityMgr };
+  return { tools, identityManager: identityMgr, internalSigning };
 }
