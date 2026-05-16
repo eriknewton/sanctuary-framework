@@ -25,6 +25,12 @@ import { generateRandomKey } from "../src/core/random.js";
 import { encrypt } from "../src/core/encryption.js";
 import { derivePurposeKey } from "../src/core/key-derivation.js";
 import { stringToBytes } from "../src/core/encoding.js";
+import { AuditLog } from "../src/l2-operational/audit-log.js";
+import {
+  bindContextGateEnforcerToProfileStore,
+  createContextGateTools,
+} from "../src/l2-operational/context-gate-tools.js";
+import { createSovereigntyProfileTools } from "../src/sovereignty-profile-tools.js";
 
 function createStore(): { store: SovereigntyProfileStore; storage: MemoryStorage; masterKey: Uint8Array } {
   const storage = new MemoryStorage();
@@ -303,6 +309,35 @@ describe("SovereigntyProfileStore", () => {
       });
       expect(updated.features.context_gating.enabled).toBe(true);
       expect(updated.features.context_gating.policy_id).toBe("cg-test-123");
+    });
+
+    it("syncs context_gating toggles to the live enforcer and audits the toggle", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new SovereigntyProfileStore(storage, masterKey);
+      await store.load();
+      const auditLog = new AuditLog(storage, masterKey);
+      const { enforcer } = createContextGateTools(storage, masterKey, auditLog);
+      bindContextGateEnforcerToProfileStore(store, auditLog, enforcer);
+      const { tools } = createSovereigntyProfileTools(store, auditLog);
+      const tool = tools.find((candidate) => candidate.name === "sovereignty_profile_update")!;
+
+      await tool.handler({ context_gating: { enabled: true, policy_id: "cg-live" } });
+
+      expect(store.get().features.context_gating.enabled).toBe(true);
+      expect(enforcer.getStatus()).toMatchObject({
+        enabled: true,
+        default_policy_id: "cg-live",
+      });
+
+      const audit = await auditLog.query({ operation_type: "context_gate.toggled" });
+      expect(audit.entries).toHaveLength(1);
+      expect(audit.entries[0]!.details).toMatchObject({
+        event_type: "context_gate.toggled",
+        old_state: false,
+        new_state: true,
+        new_policy_id: "cg-live",
+      });
     });
 
     it("updates updated_at timestamp", async () => {

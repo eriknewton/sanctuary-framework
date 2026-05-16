@@ -82,6 +82,7 @@ export interface EnforcerStatus {
   enabled: boolean;
   log_only: boolean;
   default_policy_id: string | null;
+  last_filter_success_at: string | null;
   stats: {
     calls_inspected: number;
     calls_bypassed: number;
@@ -107,6 +108,7 @@ export class ContextGateEnforcer {
     fields_blocked: 0,
     calls_blocked: 0,
   };
+  private lastFilterSuccessAt: string | null = null;
 
   constructor(
     policyStore: ContextGatePolicyStore,
@@ -172,6 +174,57 @@ export class ContextGateEnforcer {
         );
       }
     };
+  }
+
+  /**
+   * Apply context gating to arguments without executing a tool handler.
+   *
+   * Proxy routing needs a pre-forward filter because the upstream call happens
+   * inside ProxyRouter, before the normal wrapped handler can see the final
+   * outbound payload. This method shares the same filtering path as wrapHandler
+   * but returns the filtered arguments directly.
+   */
+  async filterArgs(
+    toolName: string,
+    args: Record<string, unknown>,
+    options: { respectBypass?: boolean } = {}
+  ): Promise<Record<string, unknown>> {
+    if (!this.config.enabled) return args;
+    if (options.respectBypass !== false && !this.shouldFilter(toolName)) {
+      this.stats.calls_bypassed++;
+      return args;
+    }
+
+    let filteredArgs = args;
+    const capture: ToolHandler = async (nextArgs) => {
+      filteredArgs = nextArgs;
+      return toolResult({ ok: true });
+    };
+
+    await this.wrapHandlerForFilter(toolName, capture, args);
+    return filteredArgs;
+  }
+
+  private async wrapHandlerForFilter(
+    toolName: string,
+    originalHandler: ToolHandler,
+    args: Record<string, unknown>
+  ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    if (!this.config.enabled) {
+      return originalHandler(args);
+    }
+
+    this.stats.calls_inspected++;
+
+    const policy = this.config.default_policy_id
+      ? await this.policyStore.get(this.config.default_policy_id)
+      : null;
+
+    if (policy) {
+      return this.filterWithPolicy(toolName, args, originalHandler, policy);
+    }
+
+    return this.filterWithBuiltinPatterns(toolName, args, originalHandler);
   }
 
   /**
@@ -248,6 +301,7 @@ export class ContextGateEnforcer {
       this.stats.fields_redacted += result.fields_redacted;
       this.stats.fields_hashed += result.fields_hashed;
       this.stats.fields_blocked += deniedFields.length;
+      this.markFilterSuccess();
 
       return originalHandler(args);
     }
@@ -274,6 +328,7 @@ export class ContextGateEnforcer {
     this.stats.fields_redacted += result.fields_redacted;
     this.stats.fields_hashed += result.fields_hashed;
     this.stats.fields_blocked += deniedFields.length;
+    this.markFilterSuccess();
 
     return originalHandler(privacyFiltered.value as Record<string, unknown>);
   }
@@ -320,6 +375,7 @@ export class ContextGateEnforcer {
               original_context_hash: originalHash,
             }
           );
+          this.markFilterSuccess();
           return originalHandler(args);
         }
 
@@ -332,11 +388,12 @@ export class ContextGateEnforcer {
             privacy_findings: privacyFiltered.findings.length,
             privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
             original_context_hash: originalHash,
-            filtered_context_hash: filteredHash,
-          }
-        );
-        return originalHandler(privacyFiltered.value as Record<string, unknown>);
-      }
+          filtered_context_hash: filteredHash,
+        }
+      );
+      this.markFilterSuccess();
+      return originalHandler(privacyFiltered.value as Record<string, unknown>);
+    }
 
       // No sensitive fields detected — pass through
       this.auditLog.append(
@@ -348,6 +405,7 @@ export class ContextGateEnforcer {
           reason: "No sensitive field patterns detected",
         }
       );
+      this.markFilterSuccess();
       return originalHandler(args);
     }
 
@@ -383,6 +441,7 @@ export class ContextGateEnforcer {
         }
       );
       this.stats.fields_redacted += fieldsToRedact.length;
+      this.markFilterSuccess();
       return originalHandler(args);
     }
 
@@ -403,6 +462,7 @@ export class ContextGateEnforcer {
     );
 
     this.stats.fields_redacted += fieldsToRedact.length;
+    this.markFilterSuccess();
 
     return originalHandler(privacyFiltered.value as Record<string, unknown>);
   }
@@ -498,6 +558,7 @@ export class ContextGateEnforcer {
       enabled: this.config.enabled,
       log_only: this.config.log_only,
       default_policy_id: this.config.default_policy_id ?? null,
+      last_filter_success_at: this.lastFilterSuccessAt,
       stats: { ...this.stats },
     };
   }
@@ -507,6 +568,14 @@ export class ContextGateEnforcer {
    */
   setEnabled(enabled: boolean): void {
     this.config.enabled = enabled;
+  }
+
+  /**
+   * Apply profile-backed runtime config in one place.
+   */
+  configureFromProfile(config: { enabled: boolean; policy_id?: string }): void {
+    this.config.enabled = config.enabled;
+    this.config.default_policy_id = config.policy_id;
   }
 
   /**
@@ -528,6 +597,11 @@ export class ContextGateEnforcer {
       fields_blocked: 0,
       calls_blocked: 0,
     };
+    this.lastFilterSuccessAt = null;
+  }
+
+  private markFilterSuccess(): void {
+    this.lastFilterSuccessAt = new Date().toISOString();
   }
 }
 

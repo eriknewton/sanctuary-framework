@@ -8,9 +8,14 @@
 
 import { describe, it, expect } from "vitest";
 import { createContextGateTools } from "../../src/l2-operational/context-gate-tools.js";
+import {
+  buildContextGateCombinedStatus,
+  initializeContextGateEnforcerFromProfile,
+} from "../../src/l2-operational/context-gate-tools.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { createDefaultProfile } from "../../src/sovereignty-profile.js";
 
 function setup() {
   const storage = new MemoryStorage();
@@ -177,6 +182,71 @@ describe("Context Gate Tools", () => {
       });
       const text = result.content[0].text;
       expect(text).toContain("error");
+    });
+  });
+
+  describe("profile-backed enforcer status", () => {
+    it("reports inactive when the profile source disables context gating", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const profile = createDefaultProfile();
+      const { tools } = createContextGateTools(storage, masterKey, auditLog, {
+        getProfile: () => profile,
+      });
+
+      const statusTool = tools.find(t => t.name === "context_gate_enforcer_status")!;
+      const result = await statusTool.handler({});
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.combined_status.status).toBe("inactive");
+      expect(parsed.combined_status.evidence).toContain("context_gating.enabled is false");
+    });
+
+    it("reports degraded when profile says enabled but the enforcer is disabled", () => {
+      const profile = createDefaultProfile();
+      profile.features.context_gating.enabled = true;
+
+      const status = buildContextGateCombinedStatus(profile, {
+        enabled: false,
+        log_only: false,
+        default_policy_id: null,
+        last_filter_success_at: null,
+        stats: {
+          calls_inspected: 0,
+          calls_bypassed: 0,
+          fields_redacted: 0,
+          fields_hashed: 0,
+          fields_blocked: 0,
+          calls_blocked: 0,
+        },
+      });
+
+      expect(status.status).toBe("degraded");
+      expect(status.evidence).toContain("runtime enforcer is disabled");
+    });
+
+    it("reports active only after both profile and enforcer are enabled and filtering succeeds", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const profile = createDefaultProfile();
+      profile.features.context_gating.enabled = true;
+      const { tools, enforcer } = createContextGateTools(storage, masterKey, auditLog, {
+        getProfile: () => profile,
+      });
+      initializeContextGateEnforcerFromProfile(enforcer, profile);
+
+      await enforcer.filterArgs("proxy/test/call", { api_key: "secret", task: "ok" }, {
+        respectBypass: false,
+      });
+
+      const statusTool = tools.find(t => t.name === "context_gate_enforcer_status")!;
+      const result = await statusTool.handler({});
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.combined_status.status).toBe("active");
+      expect(parsed.combined_status.last_filter_success_at).toEqual(expect.any(String));
     });
   });
 });
