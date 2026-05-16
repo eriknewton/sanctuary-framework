@@ -20,6 +20,7 @@ import { toolResult } from "../router.js";
 import type { AuditLog } from "./audit-log.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { SanctuaryConfig } from "../config.js";
+import type { SovereigntyProfile, SovereigntyProfileStore } from "../sovereignty-profile.js";
 import {
   ContextGatePolicyStore,
   filterContext,
@@ -37,6 +38,7 @@ import {
 import { recommendPolicy } from "./context-gate-recommend.js";
 import {
   ContextGateEnforcer,
+  type EnforcerStatus,
   type EnforcerConfig,
 } from "./context-gate-enforcer.js";
 import {
@@ -48,6 +50,120 @@ import {
   type PrivacyFilterRuntimeConfig,
 } from "./privacy-filter-runner.js";
 
+export type ContextGateEvidenceStatus =
+  | "active"
+  | "inactive"
+  | "degraded"
+  | "not_configured"
+  | "unknown";
+
+export interface ContextGateCombinedStatus {
+  status: ContextGateEvidenceStatus;
+  evidence: string;
+  profile_enabled: boolean;
+  enforcer_enabled: boolean;
+  policy_id: string | null;
+  last_filter_success_at: string | null;
+}
+
+export function initializeContextGateEnforcerFromProfile(
+  enforcer: ContextGateEnforcer,
+  profile: SovereigntyProfile
+): void {
+  enforcer.configureFromProfile({
+    enabled: profile.features.context_gating.enabled,
+    policy_id: profile.features.context_gating.policy_id,
+  });
+}
+
+export function buildContextGateCombinedStatus(
+  profile: SovereigntyProfile,
+  enforcerStatus: EnforcerStatus
+): ContextGateCombinedStatus {
+  const profileEnabled = profile.features.context_gating.enabled;
+  const enforcerEnabled = enforcerStatus.enabled;
+  const policyId = profile.features.context_gating.policy_id ?? enforcerStatus.default_policy_id;
+
+  if (!profileEnabled) {
+    return {
+      status: "inactive",
+      evidence: "profile context_gating.enabled is false",
+      profile_enabled: false,
+      enforcer_enabled: enforcerEnabled,
+      policy_id: policyId ?? null,
+      last_filter_success_at: enforcerStatus.last_filter_success_at,
+    };
+  }
+
+  if (!enforcerEnabled) {
+    return {
+      status: "degraded",
+      evidence: "profile context_gating.enabled is true but the runtime enforcer is disabled",
+      profile_enabled: true,
+      enforcer_enabled: false,
+      policy_id: policyId ?? null,
+      last_filter_success_at: enforcerStatus.last_filter_success_at,
+    };
+  }
+
+  if (enforcerStatus.last_filter_success_at) {
+    return {
+      status: "active",
+      evidence: `profile and enforcer enabled; last successful filter at ${enforcerStatus.last_filter_success_at}`,
+      profile_enabled: true,
+      enforcer_enabled: true,
+      policy_id: policyId ?? null,
+      last_filter_success_at: enforcerStatus.last_filter_success_at,
+    };
+  }
+
+  return {
+    status: "degraded",
+    evidence: "profile and enforcer are enabled, but no successful filter call has been observed",
+    profile_enabled: true,
+    enforcer_enabled: true,
+    policy_id: policyId ?? null,
+    last_filter_success_at: null,
+  };
+}
+
+export function bindContextGateEnforcerToProfileStore(
+  profileStore: SovereigntyProfileStore,
+  auditLog: AuditLog,
+  enforcer: ContextGateEnforcer
+): void {
+  const updateProfile = profileStore.update.bind(profileStore);
+
+  profileStore.update = async (updates) => {
+    const before = profileStore.get();
+    const oldContextGate = { ...before.features.context_gating };
+    const updated = await updateProfile(updates);
+
+    if (updates.context_gating !== undefined) {
+      initializeContextGateEnforcerFromProfile(enforcer, updated);
+
+      const nextContextGate = updated.features.context_gating;
+      if (oldContextGate.enabled !== nextContextGate.enabled) {
+        await auditLog.appendCritical({
+          layer: "l2",
+          operation: "context_gate.toggled",
+          identity_id: "system",
+          result: "success",
+          details: {
+            event_type: "context_gate.toggled",
+            old_state: oldContextGate.enabled,
+            new_state: nextContextGate.enabled,
+            old_policy_id: oldContextGate.policy_id ?? null,
+            new_policy_id: nextContextGate.policy_id ?? null,
+          },
+        });
+      }
+    }
+
+    return updated;
+  };
+}
+
 /**
  * Create the context-gating MCP tools.
  */
@@ -55,7 +171,10 @@ export function createContextGateTools(
   storage: StorageBackend,
   masterKey: Uint8Array,
   auditLog: AuditLog,
-  options: { privacyFilter?: SanctuaryConfig["privacy_filter"] } = {}
+  options: {
+    privacyFilter?: SanctuaryConfig["privacy_filter"];
+    getProfile?: () => SovereigntyProfile;
+  } = {}
 ): {
   tools: ToolDefinition[];
   policyStore: ContextGatePolicyStore;
@@ -612,6 +731,16 @@ export function createContextGateTools(
       },
       handler: async () => {
         const status = enforcer.getStatus();
+        const combinedStatus = options.getProfile
+          ? buildContextGateCombinedStatus(options.getProfile(), status)
+          : {
+              status: "unknown" as const,
+              evidence: "sovereignty profile source is not bound to context gate tools",
+              profile_enabled: false,
+              enforcer_enabled: status.enabled,
+              policy_id: status.default_policy_id,
+              last_filter_success_at: status.last_filter_success_at,
+            };
 
         auditLog.append(
           "l2",
@@ -621,17 +750,21 @@ export function createContextGateTools(
             enabled: status.enabled,
             log_only: status.log_only,
             default_policy_id: status.default_policy_id,
+            combined_status: combinedStatus.status,
           }
         );
 
         return toolResult({
           enforcer_status: status,
+          combined_status: combinedStatus,
           description:
-            "The enforcer is " +
-            (status.enabled ? "enabled" : "disabled") +
+            "Context gating is " +
+            combinedStatus.status +
+            ". " +
+            combinedStatus.evidence +
             ". " +
             (status.log_only
-              ? "Currently in log_only mode — filtering is logged but not applied."
+              ? "Currently in log_only mode, filtering is logged but not applied."
               : "Filtering is actively applied to tool arguments."),
           guidance:
             status.stats.calls_inspected > 0

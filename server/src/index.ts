@@ -72,7 +72,11 @@ import {
   ResetHistoryMalformedError,
 } from "./audit/reset-history.js";
 import { createSIEMTools } from "./audit/siem-tools.js";
-import { createContextGateTools } from "./l2-operational/context-gate-tools.js";
+import {
+  bindContextGateEnforcerToProfileStore,
+  createContextGateTools,
+  initializeContextGateEnforcerFromProfile,
+} from "./l2-operational/context-gate-tools.js";
 import { createL2HardeningTools } from "./l2-operational/hardening-tools.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
 import { createSovereigntyProfileTools } from "./sovereignty-profile-tools.js";
@@ -587,18 +591,26 @@ export async function createSanctuaryServer(options?: {
   // 14d2. Create SIEM Export tools (Tier 2 — CEF and OCSF export)
   const { tools: siemTools } = createSIEMTools(auditLog);
 
-  // 14e. Create Context Gating tools (L2 outbound context control)
+  // 14e. Initialize Sovereignty Profile store. Its context_gating subsection is
+  // the persisted source of truth for the runtime context gate enforcer.
+  const profileStore = new SovereigntyProfileStore(storage, masterKey);
+  const loadedProfile = await profileStore.load();
+
+  // 14f. Create Context Gating tools (L2 outbound context control) and bind
+  // the live enforcer to the persisted profile state before any proxy tools are
+  // registered.
   const { tools: contextGateTools, enforcer: contextGateEnforcer } =
     createContextGateTools(storage, masterKey, auditLog, {
       privacyFilter: config.privacy_filter,
+      getProfile: () => profileStore.get(),
     });
+  initializeContextGateEnforcerFromProfile(contextGateEnforcer, loadedProfile);
+  bindContextGateEnforcerToProfileStore(profileStore, auditLog, contextGateEnforcer);
 
-  // 14f. Create L2 Process Hardening tools
+  // 14g. Create L2 Process Hardening tools
   const hardeningTools = createL2HardeningTools(config.storage_path, auditLog);
 
-  // 14g. Initialize Sovereignty Profile store and create tools
-  const profileStore = new SovereigntyProfileStore(storage, masterKey);
-  await profileStore.load();
+  // 14h. Create Sovereignty Profile tools
   const { tools: profileTools } = createSovereigntyProfileTools(profileStore, auditLog);
 
   // 15. Load Principal Policy and create approval gate
@@ -1180,12 +1192,11 @@ export async function createSanctuaryServer(options?: {
         auditLog,
         {
           contextGateFilter: async (_toolName, args) => {
-            // Use the context gate enforcer if context gating is active
             const activeProfile = profileStore.get();
             if (activeProfile.features.context_gating.enabled) {
-              // For proxy calls, we pass through the enforcer's filtering
-              // The enforcer wraps the handler, but for proxy we need pre-call filtering
-              return args; // Context gate wrapping handles this via the handler wrapper below
+              return contextGateEnforcer.filterArgs(_toolName, args, {
+                respectBypass: false,
+              });
             }
             return args;
           },
