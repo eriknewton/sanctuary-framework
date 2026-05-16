@@ -30,6 +30,7 @@ import type {
 } from "../contracts/v1.1/local-agent-records.js";
 import type { ChannelTemplateId } from "../policy-engine/constants.js";
 import type { OperatorChatService } from "../chat/operator-chat-service.js";
+import type { ConciergeService } from "../concierge/index.js";
 
 // -----------------------------------------------------------------------
 // Agent control
@@ -344,6 +345,8 @@ export interface HubServiceDeps {
    * (2026-04-30); the field name is retained for source compatibility.
    */
   operatorChat?: OperatorChatService;
+  /** Optional operator-only concierge service. This is hub/CLI only, never MCP-exposed. */
+  concierge?: ConciergeService;
 }
 
 /**
