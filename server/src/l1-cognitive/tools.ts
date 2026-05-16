@@ -7,7 +7,7 @@
 
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
-import { StateStore } from "./state-store.js";
+import { StateStore, StateVerificationError } from "./state-store.js";
 import {
   createIdentity,
   rotateKeys,
@@ -937,12 +937,25 @@ export function createL1Tools(
           });
         }
 
-        const result = await stateStore.read(
-          args.namespace as string,
-          args.key as string,
-          undefined, // Skip signature verification for now (would need writer's pubkey)
-          args.verify_integrity as boolean ?? true
-        );
+        let result;
+        try {
+          result = await stateStore.read(
+            args.namespace as string,
+            args.key as string,
+            (args.verify_integrity as boolean | undefined) ?? true
+          );
+        } catch (error) {
+          if (error instanceof StateVerificationError) {
+            return toolResult({
+              error: "state_verification_failed",
+              classification: error.classification,
+              message: error.message,
+              namespace: args.namespace,
+              key: args.key,
+            });
+          }
+          throw error;
+        }
 
         if (!result) {
           return toolResult({
