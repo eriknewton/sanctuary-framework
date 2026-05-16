@@ -35,3 +35,14 @@ export class IpcFramingError extends CastleWallError {
     this.name = "IpcFramingError";
   }
 }
+
+export class FrameOversizeError extends CastleWallError {
+  readonly declaredLength: number;
+  readonly maxAllowed: number;
+  constructor(declaredLength: number, maxAllowed: number) {
+    super(`frame exceeds max bytes: ${declaredLength} > ${maxAllowed}`);
+    this.name = "FrameOversizeError";
+    this.declaredLength = declaredLength;
+    this.maxAllowed = maxAllowed;
+  }
+}

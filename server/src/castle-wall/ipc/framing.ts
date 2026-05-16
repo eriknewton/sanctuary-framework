@@ -12,6 +12,24 @@
 import { CASTLE_WALL_IPC_CONTENT_LENGTH_HEADER } from "../constants.js";
 import { IpcFramingError } from "../errors.js";
 
+const DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024; // 16 MB
+const MIN_MAX_FRAME_BYTES = 1024;
+const MAX_MAX_FRAME_BYTES = 1024 * 1024 * 1024; // 1 GB
+
+function loadMaxFrameBytes(): number {
+  const env = process.env.SANCTUARY_MAX_FRAME_BYTES;
+  if (env == null || env === "") return DEFAULT_MAX_FRAME_BYTES;
+  const parsed = Number(env);
+  if (!Number.isInteger(parsed) || parsed < MIN_MAX_FRAME_BYTES || parsed > MAX_MAX_FRAME_BYTES) {
+    throw new Error(
+      `SANCTUARY_MAX_FRAME_BYTES must be an integer between ${MIN_MAX_FRAME_BYTES} and ${MAX_MAX_FRAME_BYTES}, got: ${env}`
+    );
+  }
+  return parsed;
+}
+
+export const MAX_FRAME_BYTES = loadMaxFrameBytes();
+
 const HEADER_END = "\r\n\r\n";
 const HEADER_END_BYTES = new TextEncoder().encode(HEADER_END);
 
@@ -34,7 +52,20 @@ export function frame(jsonBody: string): Uint8Array {
 export type ParseStep =
   | { kind: "complete"; body: string; consumedBytes: number }
   | { kind: "need_more" }
-  | { kind: "error"; reason: string };
+  | {
+      kind: "error";
+      reason: string;
+      /**
+       * Set when the error is specifically an oversize-frame rejection. Lets
+       * callers distinguish the resource-bound rejection from other framing
+       * errors without inspecting the reason string. Audit emission for this
+       * surface is intentionally not done here; the IPC layer is a privileged
+       * daemon -> userspace channel and audit events flow through the Castle
+       * Wall typed event surface (see castle-wall/audit/events.ts) in a
+       * separate scope.
+       */
+      oversize?: { declaredLength: number; maxAllowed: number };
+    };
 
 /** Find the byte offset of the header terminator within `buf`, or -1. */
 function findHeaderEnd(buf: Uint8Array): number {
@@ -80,6 +111,14 @@ export function parseFrame(buf: Uint8Array): ParseStep {
   }
   if (contentLength === null) {
     return { kind: "error", reason: "missing Content-Length header" };
+  }
+
+  if (contentLength > MAX_FRAME_BYTES) {
+    return {
+      kind: "error",
+      reason: `frame exceeds max bytes: ${contentLength} > ${MAX_FRAME_BYTES}`,
+      oversize: { declaredLength: contentLength, maxAllowed: MAX_FRAME_BYTES },
+    };
   }
 
   const bodyStart = headerEnd + HEADER_END_BYTES.length;
