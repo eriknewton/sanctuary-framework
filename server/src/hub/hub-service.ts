@@ -239,16 +239,36 @@ export class HubService {
       operation_category: "other",
     };
 
-    this.inboxStore.enqueueTier1(item, async () => {
-      this.deps.activitySources.auditLog.append(
-        "l2",
-        "task.review_approval_resolved",
-        this.deps.identityId,
-        {
-          task_id: task.id,
-          actor,
-        },
+    this.inboxStore.enqueueTier1(item, async (_item, decision) => {
+      const taskService = this.requireTaskService();
+      const matchingTask = (await taskService.list()).find(
+        (candidate) => candidate.approval_request_id === item.item_id,
       );
+      if (!matchingTask) {
+        throw new HubNotFoundError(`task for inbox item ${item.item_id}`);
+      }
+
+      // A denied review means the task needs revision, so return it to work.
+      const nextStatus = decision === "approve" ? "completed" : "in_progress";
+      await taskService.updateStatus(matchingTask.id, {
+        status: nextStatus,
+        actor: this.deps.identityId,
+      });
+
+      await this.deps.activitySources.auditLog.appendCritical({
+        layer: "l2",
+        operation: "task.review_approval_resolved",
+        identity_id: this.deps.identityId,
+        result: "success",
+        details: {
+          task_id: matchingTask.id,
+          actor: this.deps.identityId,
+          review_actor: actor,
+          decision,
+          new_status: nextStatus,
+          approval_request_id: item.item_id,
+        },
+      });
     });
     return itemId;
   }
