@@ -1,5 +1,7 @@
 # Castle Wall macOS - operator deploy guide
 
+Trust claims for macOS egress enforcement are tracked in [../../ASSURANCE_MATRIX.md](../../ASSURANCE_MATRIX.md).
+
 This guide covers installing and verifying the Castle Wall macOS system
 extension. Castle Wall is the Castle Layer 1 enforcement piece: a
 kernel-level egress filter that blocks unauthorized network calls from

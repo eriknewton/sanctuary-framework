@@ -38,6 +38,8 @@ Current capability summary:
 | Sovereign-managed TEE and hardware secure elements | v2 roadmap |
 | Post-quantum and next-generation messaging-layer-security cryptographic upgrades | v1.4+ roadmap |
 
+Trust and security claims are tracked in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md).
+
 Roadmap shape: v1.1 completes the local sovereignty harness; v1.2 adds the phone as the operator companion; v1.3 opens public federation for cross-operator agent interaction; v1.4+ carries fleet, payments, compliance, generalized transport interception, operator-cloud, and advanced cryptography. See [ROADMAP.md](ROADMAP.md).
 
 ---
