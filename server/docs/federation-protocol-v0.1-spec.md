@@ -52,7 +52,7 @@ If a build-thread implementation choice closes the door on this v1.x extension, 
 
 ### 2.1 Trust root
 
-The operator's **fortress-master key** is the root of trust for the mesh. It is an Ed25519 keypair generated at first-fortress-bootstrap, held in the operator's cocoon, unlocked by Argon2id passphrase (per v0.10.0 unified-passphrase decision), and recoverable via M-of-N guardian quorum (Key 13).
+The operator's **fortress-master key** is the root of trust for the mesh. It is an Ed25519 keypair generated at first-fortress-bootstrap, held under the operator's mantle binding, unlocked by Argon2id passphrase (per v0.10.0 unified-passphrase decision), and recoverable via M-of-N guardian quorum (Key 13).
 
 **The fortress-master signs:**
 
@@ -501,7 +501,7 @@ Any node may challenge any other node to re-prove possession of its certificate'
 2. Challenged node signs `(challenger_node_id, nonce, current_timestamp)` with its per-node private key.
 3. Challenger verifies the signature against the certificate.
 
-This catches a stolen certificate paired with a missing private key (e.g., if an attacker copied the certificate from disk but couldn't decrypt the cocoon-protected private-key store). Challenge frequency is operator-policy-driven, defaulted to once per hour per-peer in v0.1.
+This catches a stolen certificate paired with a missing private key (e.g., if an attacker copied the certificate from disk but couldn't decrypt the private-key store protected by the mantle binding). Challenge frequency is operator-policy-driven, defaulted to once per hour per-peer in v0.1.
 
 ### 7.4 Per-node key rotation (planned, not under-attack)
 
@@ -723,9 +723,9 @@ These are deliberately unresolved at the spec level. Build thread chooses, surfa
 3. **Heartbeat interval and missed-heartbeat threshold defaults.** Spec defaults 30s / 3 missed (90s); build thread may tune.
 4. **Audit batch interval and size defaults.** Spec defaults 5s / 256 entries; build thread may tune based on early field load testing.
 5. **`max_offline_window` default.** Spec defaults 30 days; build thread may select different default after consultation with Key 13 estate-planning research ticket (long-dormant-but-legitimate node case).
-6. **State-transfer mechanism for agent migration (§6.3).** Spec ships a basic checkpoint-and-resume; build thread picks the actual checkpoint format (probably aligned with the cocoon state-snapshot format already shipped in v0.10.x).
+6. **State-transfer mechanism for agent migration (§6.3).** Spec ships a basic checkpoint-and-resume; build thread picks the actual checkpoint format (probably aligned with the mantle binding state-snapshot format already shipped in v0.10.x).
 7. **Fortress-id format.** Spec assumes a fortress-id exists; build thread defines (proposed: 128-bit ULID generated at fortress-bootstrap, never re-used).
-8. **Cocoon binding.** Per-node private keys are stored where? Spec assumes per-node cocoon-equivalent; build thread confirms the per-node secret-storage model aligns with the master cocoon model.
+8. **Mantle binding.** Per-node private keys are stored where? Spec assumes a per-node mantle binding equivalent; build thread confirms the per-node secret-storage model aligns with the master mantle binding model.
 
 ---
 

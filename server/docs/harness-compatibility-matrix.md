@@ -16,7 +16,7 @@ This matrix covers local-fortress `sanctuary wrap` behavior for every `LocalHarn
 | Other MCP-compatible harness | `other` via `--wrap <path>` | fixture-tested through Generic MCP | fixture-tested through Generic MCP | fixture-tested through Generic MCP | fixture-tested through Generic MCP | first-unlock | first-unlock | fixture-tested through Generic MCP |
 | LangGraph | v1.1+ planned through `generic_mcp` | fixture-tested through Generic MCP | fixture-tested through Generic MCP | fixture-tested through Generic MCP | fixture-tested through Generic MCP | first-unlock | first-unlock | fixture-tested through Generic MCP |
 
-**Cell legend:** "fixture-tested" = covered by `harness-compatibility.test.ts` against temp configs. "first-unlock" = NOT a `runWrap` effect; initialized on first cocoon-unlock when `createSanctuaryServer()` or `startStandaloneDashboard()` derive the master key from the persisted passphrase. This is the lazy-init pattern that PR #61 (`reset-passphrase`) and PR #68 (reset-history continuity) both rely on.
+**Cell legend:** "fixture-tested" = covered by `harness-compatibility.test.ts` against temp configs. "first-unlock" = NOT a `runWrap` effect; initialized on first unlock after mantle binding when `createSanctuaryServer()` or `startStandaloneDashboard()` derive the master key from the persisted passphrase. This is the lazy-init pattern that PR #61 (`reset-passphrase`) and PR #68 (reset-history continuity) both rely on.
 
 ## Negative Coverage
 
@@ -34,8 +34,8 @@ README wrap targets are OpenClaw, Hermes Agent, Claude Code, Cursor, Cline, and 
 
 ## Observed Gaps
 
-The current `runWrap` implementation (`server/src/cocoon/cli.ts:153`) detects/bootstraps the agent config, persists/resolves the passphrase (Keychain or fallback file), creates the storage directory, writes the sovereignty profile, backs up the config, and rewrites the agent config to point at Sanctuary. It does NOT generate an Ed25519 identity keypair or write an audit genesis entry, those are deferred to first cocoon-unlock per the lazy-init pattern (server boot via `createSanctuaryServer()` or dashboard boot via `startStandaloneDashboard()` derives the master key from the persisted passphrase, then initializes identity + audit on first run).
+The current `runWrap` implementation (`server/src/cocoon/cli.ts:153`) detects/bootstraps the agent config, persists/resolves the passphrase (Keychain or fallback file), creates the storage directory, writes the sovereignty profile, backs up the config, and rewrites the agent config to point at Sanctuary. It does NOT generate an Ed25519 identity keypair or write an audit genesis entry, those are deferred to first unlock after mantle binding per the lazy-init pattern (server boot via `createSanctuaryServer()` or dashboard boot via `startStandaloneDashboard()` derives the master key from the persisted passphrase, then initializes identity + audit on first run).
 
 This is correct architecture (passphrase resolution must precede key derivation; the master key cannot exist at wrap-time when the passphrase may not yet be entered). The matrix's "first-unlock" label captures the actual pattern.
 
-**README parity follow-up:** README copy that implies identity creation + audit init are wrap-time effects should be corrected in a separate v1.0.x housekeeping pass to read "initialized on first cocoon-unlock after wrap." Filed as v1.0.2 backlog item (l).
+**README parity follow-up:** README copy that implies identity creation + audit init are wrap-time effects should be corrected in a separate v1.0.x housekeeping pass to read "initialized on first unlock after mantle binding." Filed as v1.0.2 backlog item (l).
