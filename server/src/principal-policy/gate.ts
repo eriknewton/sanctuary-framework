@@ -143,11 +143,17 @@ export class ApprovalGate {
       }
 
       if (injectionResult.recommendation === "block") {
-        this.auditLog.append("l2", `gate_injection_block:${operation}`, "system", {
-          tier: 1,
-          operation,
-          injection_confidence: injectionResult.confidence,
-          signal_count: injectionResult.signals.length,
+        await this.auditLog.appendCritical({
+          layer: "l2",
+          operation: `gate_injection_block:${operation}`,
+          identity_id: "system",
+          result: "failure",
+          details: {
+            tier: 1,
+            operation,
+            injection_confidence: injectionResult.confidence,
+            signal_count: injectionResult.signals.length,
+          },
         });
         return {
           allowed: false,
@@ -198,10 +204,16 @@ export class ApprovalGate {
         }
 
         // Tier 2 with no anomaly or Tier 3: allow with audit logging
-        this.auditLog.append("l2", `gate_allow_proxy:${toolName}`, "system", {
-          tier: proxyTier,
-          operation: toolName,
-          proxy: true,
+        await this.auditLog.appendCritical({
+          layer: "l2",
+          operation: `gate_allow_proxy:${toolName}`,
+          identity_id: "system",
+          result: "success",
+          details: {
+            tier: proxyTier,
+            operation: toolName,
+            proxy: true,
+          },
         });
 
         return {
@@ -229,9 +241,15 @@ export class ApprovalGate {
 
     // ── Tier 3: Allow with audit logging (only for explicitly listed operations)
     if (this.policy.tier3_always_allow.includes(operation)) {
-      this.auditLog.append("l2", `gate_allow:${operation}`, "system", {
-        tier: 3,
-        operation,
+      await this.auditLog.appendCritical({
+        layer: "l2",
+        operation: `gate_allow:${operation}`,
+        identity_id: "system",
+        result: "success",
+        details: {
+          tier: 3,
+          operation,
+        },
       });
 
       return {
@@ -245,10 +263,16 @@ export class ApprovalGate {
     // ── Unlisted operation: default to Tier 1 (require approval) ─────
     // SEC-011: Operations not classified in any tier must not auto-allow.
     // Safe default is to require human approval.
-    this.auditLog.append("l2", `gate_unclassified:${operation}`, "system", {
-      tier: 1,
-      operation,
-      warning: "Operation is not classified in any policy tier, defaulting to Tier 1 (require approval)",
+    await this.auditLog.appendCritical({
+      layer: "l2",
+      operation: `gate_unclassified:${operation}`,
+      identity_id: "system",
+      result: "success",
+      details: {
+        tier: 1,
+        operation,
+        warning: "Operation is not classified in any policy tier, defaulting to Tier 1 (require approval)",
+      },
     });
 
     return this.requestApproval(
@@ -433,11 +457,17 @@ export class ApprovalGate {
     } catch (err) {
       const errMessage = err instanceof Error ? err.message : String(err);
       const decidedAt = new Date().toISOString();
-      this.auditLog.append("l2", `gate_deny:${operation}`, "system", {
-        tier,
-        reason,
-        decided_by: "channel_failure",
-        channel_error: errMessage,
+      await this.auditLog.appendCritical({
+        layer: "l2",
+        operation: `gate_deny:${operation}`,
+        identity_id: "system",
+        result: "failure",
+        details: {
+          tier,
+          reason,
+          decided_by: "channel_failure",
+          channel_error: errMessage,
+        },
       });
       if (this.onApprovalEvent) {
         try {
@@ -473,10 +503,16 @@ export class ApprovalGate {
     }
 
     // Audit log the decision
-    this.auditLog.append("l2", `gate_${response.decision}:${operation}`, "system", {
-      tier,
-      reason,
-      decided_by: response.decided_by,
+    await this.auditLog.appendCritical({
+      layer: "l2",
+      operation: `gate_${response.decision}:${operation}`,
+      identity_id: "system",
+      result: response.decision === "approve" ? "success" : "failure",
+      details: {
+        tier,
+        reason,
+        decided_by: response.decided_by,
+      },
     });
 
     // Fire `resolved` lifecycle to the aggregator. Castle-walking: the

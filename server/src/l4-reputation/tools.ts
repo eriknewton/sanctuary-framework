@@ -123,12 +123,18 @@ export function createL4Tools(
           tierMeta.sovereignty_tier
         );
 
-        auditLog.append("l4", "reputation_record", identity.identity_id, {
-          interaction_id: args.interaction_id,
-          outcome_type: outcome.type,
-          outcome_result: outcome.result,
-          context,
-          sovereignty_tier: tierMeta.sovereignty_tier,
+        await auditLog.appendCritical({
+          layer: "l4",
+          operation: "reputation_record",
+          identity_id: identity.identity_id,
+          result: "success",
+          details: {
+            interaction_id: args.interaction_id,
+            outcome_type: outcome.type,
+            outcome_result: outcome.result,
+            context,
+            sovereignty_tier: tierMeta.sovereignty_tier,
+          },
         });
 
         return toolResult({
@@ -248,11 +254,17 @@ export function createL4Tools(
           new TextEncoder().encode(bundleJson)
         );
 
-        auditLog.append("l4", "reputation_export", identity.identity_id, {
-          attestation_count: bundle.attestations.length,
-          contexts: Array.from(
-            new Set(bundle.attestations.map((a) => a.data.context))
-          ),
+        await auditLog.appendCritical({
+          layer: "l4",
+          operation: "reputation_export",
+          identity_id: identity.identity_id,
+          result: "success",
+          details: {
+            attestation_count: bundle.attestations.length,
+            contexts: Array.from(
+              new Set(bundle.attestations.map((a) => a.data.context))
+            ),
+          },
         });
 
         const { hashToString } = await import("../core/hashing.js");
@@ -319,10 +331,16 @@ export function createL4Tools(
           publicKeys
         );
 
-        auditLog.append("l4", "reputation_import", "system", {
-          imported: result.imported,
-          invalid: result.invalid,
-          contexts: result.contexts,
+        await auditLog.appendCritical({
+          layer: "l4",
+          operation: "reputation_import",
+          identity_id: "system",
+          result: result.invalid > 0 ? "failure" : "success",
+          details: {
+            imported: result.imported,
+            invalid: result.invalid,
+            contexts: result.contexts,
+          },
         });
 
         return toolResult({
@@ -462,10 +480,16 @@ export function createL4Tools(
           args.collateral_amount as number | undefined
         );
 
-        auditLog.append("l4", "bootstrap_create_escrow", identity.identity_id, {
-          escrow_id: escrow.escrow_id,
-          counterparty_did: args.counterparty_did,
-          timeout_seconds: args.timeout_seconds,
+        await auditLog.appendCritical({
+          layer: "l4",
+          operation: "bootstrap_create_escrow",
+          identity_id: identity.identity_id,
+          result: "success",
+          details: {
+            escrow_id: escrow.escrow_id,
+            counterparty_did: args.counterparty_did,
+            timeout_seconds: args.timeout_seconds,
+          },
         });
 
         return toolResult({
@@ -544,16 +568,17 @@ export function createL4Tools(
           args.max_liability as number | undefined
         );
 
-        auditLog.append(
-          "l4",
-          "bootstrap_provide_guarantee",
-          principalIdentity.identity_id,
-          {
+        await auditLog.appendCritical({
+          layer: "l4",
+          operation: "bootstrap_provide_guarantee",
+          identity_id: principalIdentity.identity_id,
+          result: "success",
+          details: {
             guarantee_id: guarantee.guarantee_id,
             agent_did: agentIdentity.did,
             scope: args.scope,
-          }
-        );
+          },
+        });
 
         return toolResult({
           guarantee_id: guarantee.guarantee_id,
@@ -733,12 +758,18 @@ export function createL4Tools(
 
           const result = (await response.json()) as Record<string, unknown>;
 
-          auditLog.append("l4", "reputation_publish", identity.identity_id, {
-            type: publishType,
-            verascore_agent_id: agentId,
-            verascore_url: veracoreUrl,
-            status: response.status,
-            success: (result.success as boolean) ?? false,
+          await auditLog.appendCritical({
+            layer: "l4",
+            operation: "reputation_publish",
+            identity_id: identity.identity_id,
+            result: response.ok ? "success" : "failure",
+            details: {
+              type: publishType,
+              verascore_agent_id: agentId,
+              verascore_url: veracoreUrl,
+              status: response.status,
+              success: (result.success as boolean) ?? false,
+            },
           });
 
           if (!response.ok) {
@@ -760,10 +791,16 @@ export function createL4Tools(
         } catch (fetchError) {
           const errorMessage = fetchError instanceof Error ? fetchError.message : String(fetchError);
 
-          auditLog.append("l4", "reputation_publish", identity.identity_id, {
-            type: publishType,
-            verascore_agent_id: agentId,
-            error: errorMessage,
+          await auditLog.appendCritical({
+            layer: "l4",
+            operation: "reputation_publish",
+            identity_id: identity.identity_id,
+            result: "failure",
+            details: {
+              type: publishType,
+              verascore_agent_id: agentId,
+              error: errorMessage,
+            },
           });
 
           return toolResult({

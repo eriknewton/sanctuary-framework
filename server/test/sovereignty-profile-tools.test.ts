@@ -16,6 +16,17 @@ import { MemoryStorage } from "../src/storage/memory.js";
 import { AuditLog } from "../src/l2-operational/audit-log.js";
 import { generateRandomKey } from "../src/core/random.js";
 
+class FailingAuditStorage extends MemoryStorage {
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    if (namespace === "_audit") {
+      const err = new Error("audit storage full") as NodeJS.ErrnoException;
+      err.code = "ENOSPC";
+      throw err;
+    }
+    return super.write(namespace, key, data);
+  }
+}
+
 async function createTestContext() {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
@@ -156,6 +167,22 @@ describe("Sovereignty Profile Tools", () => {
       const result = await tool.handler({});
       const data = parseToolResult(result);
       expect(data).toHaveProperty("profile");
+    });
+
+    it("surfaces committed profile updates when critical audit persistence fails", async () => {
+      const storage = new FailingAuditStorage();
+      const masterKey = generateRandomKey();
+      const profileStore = new SovereigntyProfileStore(storage, masterKey);
+      await profileStore.load();
+      const auditLog = new AuditLog(storage, masterKey);
+      const { tools } = createSovereigntyProfileTools(profileStore, auditLog);
+      const tool = tools.find((candidate) => candidate.name === "sovereignty_profile_update")!;
+
+      await expect(tool.handler({ zk_proofs: { enabled: true } })).rejects.toMatchObject({
+        name: "AuditPersistenceError",
+        classification: "storage_full",
+      });
+      expect(profileStore.get().features.zk_proofs.enabled).toBe(true);
     });
 
     it("persists changes across get calls", async () => {

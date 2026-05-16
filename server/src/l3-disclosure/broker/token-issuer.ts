@@ -172,11 +172,12 @@ export class TokenIssuer {
   async issueToken(req: IssueTokenRequest): Promise<TokenBinding> {
     const requestedScope: SecretScope = req.requestedScope ?? "read";
     if (req.skill !== req.caller.skill) {
-      this.auditLog.append(
-        "l3",
-        BROKER_OPS.TOKEN_DENIED,
-        req.caller.identity_id,
-        {
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.TOKEN_DENIED,
+        identity_id: req.caller.identity_id,
+        result: "failure",
+        details: {
           skill: req.skill,
           verified_skill: req.caller.skill,
           secret: req.secret,
@@ -187,19 +188,19 @@ export class TokenIssuer {
           fortress_id: req.caller.fortress_id,
           audience: req.caller.audience,
         },
-        "failure"
-      );
+      });
       throw new BrokerDeniedError();
     }
 
     const grant = this.grants.get(grantKey(req.caller.skill, req.secret));
 
     if (!grant) {
-      this.auditLog.append(
-        "l3",
-        BROKER_OPS.TOKEN_DENIED,
-        req.caller.identity_id,
-        {
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.TOKEN_DENIED,
+        identity_id: req.caller.identity_id,
+        result: "failure",
+        details: {
           skill: req.caller.skill,
           secret: req.secret,
           requested_scope: requestedScope,
@@ -209,17 +210,17 @@ export class TokenIssuer {
           fortress_id: req.caller.fortress_id,
           audience: req.caller.audience,
         },
-        "failure"
-      );
+      });
       throw new BrokerDeniedError();
     }
     const claimMismatch = grantClaimMismatch(grant, req.caller);
     if (claimMismatch) {
-      this.auditLog.append(
-        "l3",
-        BROKER_OPS.TOKEN_DENIED,
-        req.caller.identity_id,
-        {
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.TOKEN_DENIED,
+        identity_id: req.caller.identity_id,
+        result: "failure",
+        details: {
           skill: req.caller.skill,
           secret: req.secret,
           requested_scope: requestedScope,
@@ -230,16 +231,16 @@ export class TokenIssuer {
           fortress_id: req.caller.fortress_id,
           audience: req.caller.audience,
         },
-        "failure"
-      );
+      });
       throw new BrokerDeniedError();
     }
     if (!scopeSatisfies(requestedScope, grant.scope)) {
-      this.auditLog.append(
-        "l3",
-        BROKER_OPS.TOKEN_DENIED,
-        req.caller.identity_id,
-        {
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.TOKEN_DENIED,
+        identity_id: req.caller.identity_id,
+        result: "failure",
+        details: {
           skill: req.caller.skill,
           secret: req.secret,
           requested_scope: requestedScope,
@@ -250,8 +251,7 @@ export class TokenIssuer {
           fortress_id: req.caller.fortress_id,
           audience: req.caller.audience,
         },
-        "failure"
-      );
+      });
       throw new BrokerDeniedError();
     }
 
@@ -274,12 +274,12 @@ export class TokenIssuer {
       issued_at: new Date(nowMs).toISOString(),
       expires_at: new Date(nowMs + ttl * 1000).toISOString(),
     };
-    this.tokens.set(token, binding);
-    this.auditLog.append(
-      "l3",
-      BROKER_OPS.TOKEN_ISSUED,
-      req.caller.identity_id,
-      {
+    await this.auditLog.appendCritical({
+      layer: "l3",
+      operation: BROKER_OPS.TOKEN_ISSUED,
+      identity_id: req.caller.identity_id,
+      result: "success",
+      details: {
         skill: req.caller.skill,
         secret: req.secret,
         scope: requestedScope,
@@ -290,8 +290,8 @@ export class TokenIssuer {
         expires_at: binding.expires_at,
         ttl_seconds: ttl,
       },
-      "success"
-    );
+    });
+    this.tokens.set(token, binding);
     return binding;
   }
 
@@ -305,23 +305,24 @@ export class TokenIssuer {
     const binding = this.tokens.get(token);
     if (!binding) {
       // No principal known, so log against "unknown" identity.
-      this.auditLog.append(
-        "l3",
-        BROKER_OPS.SECRET_READ,
-        "unknown",
-        { reason: "token_unknown" },
-        "failure"
-      );
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SECRET_READ,
+        identity_id: "unknown",
+        result: "failure",
+        details: { reason: "token_unknown" },
+      });
       throw new BrokerTokenUnknownError();
     }
     const nowMs = this.now();
     if (nowMs >= Date.parse(binding.expires_at)) {
       this.tokens.delete(token);
-      this.auditLog.append(
-        "l3",
-        BROKER_OPS.SECRET_READ,
-        binding.identity_id,
-        {
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SECRET_READ,
+        identity_id: binding.identity_id,
+        result: "failure",
+        details: {
           skill: binding.skill,
           secret: binding.secret,
           scope: binding.scope,
@@ -331,8 +332,7 @@ export class TokenIssuer {
           audience: binding.audience,
           reason: "token_expired",
         },
-        "failure"
-      );
+      });
       throw new BrokerTokenExpiredError();
     }
 
@@ -340,11 +340,12 @@ export class TokenIssuer {
     const grant = this.grants.get(grantKey(binding.skill, binding.secret));
     if (!grant || !scopeSatisfies(binding.scope, grant.scope)) {
       this.tokens.delete(token);
-      this.auditLog.append(
-        "l3",
-        BROKER_OPS.SECRET_READ,
-        binding.identity_id,
-        {
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SECRET_READ,
+        identity_id: binding.identity_id,
+        result: "failure",
+        details: {
           skill: binding.skill,
           secret: binding.secret,
           scope: binding.scope,
@@ -354,19 +355,19 @@ export class TokenIssuer {
           audience: binding.audience,
           reason: grant ? "scope_exceeds_current_grant" : "grant_revoked",
         },
-        "failure"
-      );
+      });
       throw new BrokerDeniedError();
     }
 
     // Read from backend. Errors propagate; we audit but do not leak the value.
     try {
       const value = await this.backend.readSecret(binding.secret);
-      this.auditLog.append(
-        "l3",
-        BROKER_OPS.SECRET_READ,
-        binding.identity_id,
-        {
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SECRET_READ,
+        identity_id: binding.identity_id,
+        result: "success",
+        details: {
           skill: binding.skill,
           secret: binding.secret,
           scope: binding.scope,
@@ -375,15 +376,15 @@ export class TokenIssuer {
           fortress_id: binding.fortress_id,
           audience: binding.audience,
         },
-        "success"
-      );
+      });
       return value;
     } catch (err) {
-      this.auditLog.append(
-        "l3",
-        BROKER_OPS.SECRET_READ,
-        binding.identity_id,
-        {
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SECRET_READ,
+        identity_id: binding.identity_id,
+        result: "failure",
+        details: {
           skill: binding.skill,
           secret: binding.secret,
           scope: binding.scope,
@@ -394,8 +395,7 @@ export class TokenIssuer {
           reason: "backend_error",
           error: errorName(err),
         },
-        "failure"
-      );
+      });
       throw err;
     }
   }

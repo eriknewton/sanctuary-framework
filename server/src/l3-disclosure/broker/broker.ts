@@ -116,48 +116,51 @@ export class Broker {
   /** Ensure backend is initialized and unlocked. Audits the unlock. */
   async ensureUnlocked(passphrase: string): Promise<void> {
     await this.backend.ensureInitialized(passphrase);
-    this.auditLog.append(
-      "l3",
-      BROKER_OPS.BACKEND_UNLOCKED,
-      this.principalIdentityId,
-      { backend: this.backend.constructor.name },
-      "success"
-    );
+    await this.auditLog.appendCritical({
+      layer: "l3",
+      operation: BROKER_OPS.BACKEND_UNLOCKED,
+      identity_id: this.principalIdentityId,
+      result: "success",
+      details: { backend: this.backend.constructor.name },
+    });
   }
 
   async addSecret(name: string, value: string): Promise<void> {
     await this.withNameLock(name, async () => {
       await this.backend.addSecret(name, value);
-      this.auditLog.append(
-        "l3",
-        BROKER_OPS.SECRET_ADDED,
-        this.principalIdentityId,
-        { secret: name }
-      );
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SECRET_ADDED,
+        identity_id: this.principalIdentityId,
+        result: "success",
+        details: { secret: name },
+      });
     });
   }
 
   async rotateSecret(name: string, newValue: string): Promise<void> {
     await this.withNameLock(name, async () => {
       await this.backend.rotateSecret(name, newValue);
-      this.auditLog.append(
-        "l3",
-        BROKER_OPS.SECRET_ROTATED,
-        this.principalIdentityId,
-        { secret: name }
-      );
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SECRET_ROTATED,
+        identity_id: this.principalIdentityId,
+        result: "success",
+        details: { secret: name },
+      });
     });
   }
 
   async deleteSecret(name: string): Promise<void> {
     await this.withNameLock(name, async () => {
       await this.backend.deleteSecret(name);
-      this.auditLog.append(
-        "l3",
-        BROKER_OPS.SECRET_DELETED,
-        this.principalIdentityId,
-        { secret: name }
-      );
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SECRET_DELETED,
+        identity_id: this.principalIdentityId,
+        result: "success",
+        details: { secret: name },
+      });
     });
   }
 

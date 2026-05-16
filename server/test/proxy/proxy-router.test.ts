@@ -71,6 +71,7 @@ function defaultScanResult() {
 function createMockAuditLog() {
   return {
     append: vi.fn(),
+    appendCritical: vi.fn().mockResolvedValue(undefined),
     query: vi.fn().mockResolvedValue([]),
   };
 }
@@ -211,13 +212,40 @@ describe("ProxyRouter", () => {
 
       expect(result.content[0]!.text).toContain("Operation not permitted");
       expect(mockClientManager.callTool).not.toHaveBeenCalled();
-      expect(mockAuditLog.append).toHaveBeenCalledWith(
-        "l2",
-        expect.stringContaining("proxy_injection_blocked"),
-        "system",
-        expect.objectContaining({ confidence: 0.95 }),
-        "failure"
+      expect(mockAuditLog.appendCritical).toHaveBeenCalledWith(
+        expect.objectContaining({
+          layer: "l2",
+          operation: expect.stringContaining("proxy_injection_blocked"),
+          identity_id: "system",
+          result: "failure",
+          details: expect.objectContaining({ confidence: 0.95 }),
+        })
       );
+    });
+
+    it("fails closed before forwarding when proxy block audit persistence fails", async () => {
+      mockInjectionDetector = createMockInjectionDetector();
+      mockInjectionDetector.scan.mockReturnValue({
+        flagged: true,
+        confidence: 0.95,
+        signals: ["prompt_injection"],
+        recommendation: "block",
+      });
+      mockAuditLog.appendCritical.mockRejectedValue(new Error("audit down"));
+
+      router = new ProxyRouter(
+        mockClientManager as any,
+        mockInjectionDetector as any,
+        mockAuditLog as any
+      );
+
+      const tools = router.getProxiedTools();
+      const result = await tools[0]!.handler({});
+      const parsed = JSON.parse(result.content[0]!.text);
+
+      expect(parsed.proxy).toBe(true);
+      expect(mockClientManager.callTool).not.toHaveBeenCalled();
+      expect(mockAuditLog.appendCritical).toHaveBeenCalled();
     });
 
     it("logs escalation but continues when injection detector recommends escalate", async () => {
@@ -322,12 +350,14 @@ describe("ProxyRouter", () => {
       expect(result.content[0]!.text).toContain("Operation not permitted");
       expect(result.content[0]!.text).toContain("rate_exceeded");
       expect(mockClientManager.callTool).not.toHaveBeenCalled();
-      expect(mockAuditLog.append).toHaveBeenCalledWith(
-        "l2",
-        expect.stringContaining("proxy_governor_blocked"),
-        "system",
-        expect.objectContaining({ reason: "rate_exceeded" }),
-        "failure"
+      expect(mockAuditLog.appendCritical).toHaveBeenCalledWith(
+        expect.objectContaining({
+          layer: "l2",
+          operation: expect.stringContaining("proxy_governor_blocked"),
+          identity_id: "system",
+          result: "failure",
+          details: expect.objectContaining({ reason: "rate_exceeded" }),
+        })
       );
     });
 
