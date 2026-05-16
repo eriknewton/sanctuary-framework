@@ -1,0 +1,8 @@
+{
+  "fixture": "schema2-rollback-target",
+  "schema": 2,
+  "namespace": "policies",
+  "key": "active-policy",
+  "value": "schema2 rollback target value",
+  "version": 2
+}

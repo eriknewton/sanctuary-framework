@@ -1,0 +1,8 @@
+{
+  "fixture": "schema2-corrupt-signature",
+  "schema": 2,
+  "namespace": "reputation-bundle",
+  "key": "corrupt-signature",
+  "value": "schema2 corrupt signature value",
+  "corruption": "signature_mismatch"
+}

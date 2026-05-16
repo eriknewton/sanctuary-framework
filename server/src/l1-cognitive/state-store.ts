@@ -392,17 +392,25 @@ export class StateStore {
     await this.saveJsonRecord(STATE_ENVELOPE_PUBLIC_KEYS_KEY, registry);
   }
 
-  private async resolveWriterPublicKey(kid: string): Promise<Uint8Array | null> {
+  private async resolveStoredIdentity(kid: string): Promise<StoredIdentity | null> {
     try {
       const raw = await this.storage.read("_identities", kid);
       if (raw) {
         const encrypted = JSON.parse(bytesToString(raw)) as EncryptedPayload;
         const decrypted = decrypt(encrypted, this.identityEncryptionKey);
-        const identity = JSON.parse(bytesToString(decrypted)) as StoredIdentity;
-        return fromBase64url(identity.public_key);
+        return JSON.parse(bytesToString(decrypted)) as StoredIdentity;
       }
     } catch {
       return null;
+    }
+
+    return null;
+  }
+
+  private async resolveWriterPublicKey(kid: string): Promise<Uint8Array | null> {
+    const identity = await this.resolveStoredIdentity(kid);
+    if (identity) {
+      return fromBase64url(identity.public_key);
     }
 
     const registry = await this.loadJsonRecord(STATE_ENVELOPE_PUBLIC_KEYS_KEY);
@@ -753,6 +761,47 @@ export class StateStore {
     return { verified: true };
   }
 
+  private async migrateLegacyEntryToSchema2(
+    entry: StateEntry,
+    namespace: string,
+    key: string
+  ): Promise<StateEntry> {
+    if (entry.v !== 1) return entry;
+
+    const identity = await this.resolveStoredIdentity(entry.kid);
+    if (!identity) return entry;
+
+    const metadata: StateEntry["metadata"] = {
+      ...entry.metadata,
+      schema_version: STATE_ENVELOPE_SCHEMA_VERSION,
+    };
+    const envelope = buildSignedEnvelope({
+      namespace,
+      key,
+      version: entry.ver,
+      kid: entry.kid,
+      metadata,
+      integrityHash: entry.integrity_hash,
+      payload: entry.payload,
+    });
+    const envelopeSignature = sign(
+      stateEnvelopeSigningBytes(envelope),
+      identity.encrypted_private_key,
+      this.identityEncryptionKey
+    );
+    const migrated: StateEntry = {
+      ...entry,
+      v: STATE_ENVELOPE_SCHEMA_VERSION,
+      envelope,
+      envelope_sig: toBase64url(envelopeSignature),
+      metadata,
+    };
+
+    await this.storage.write(namespace, key, stringToBytes(JSON.stringify(migrated)));
+    await this.rememberWriterPublicKey(entry.kid, fromBase64url(identity.public_key));
+    return migrated;
+  }
+
   private async readInternal(
     namespace: string,
     key: string,
@@ -815,6 +864,10 @@ export class StateStore {
         "integrity_hash_mismatch",
         `Integrity hash mismatch for ${namespace}/${key}: computed ${computedHash}, stored ${stateEntry.integrity_hash}`
       );
+    }
+
+    if (options.verifySignature && stateEntry.v === 1) {
+      stateEntry = await this.migrateLegacyEntryToSchema2(stateEntry, namespace, key);
     }
 
     // Merkle proof verification

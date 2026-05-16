@@ -1,0 +1,8 @@
+{
+  "fixture": "schema2-corrupt-payload",
+  "schema": 2,
+  "namespace": "agent-state",
+  "key": "corrupt-payload",
+  "value": "schema2 corrupt payload value",
+  "corruption": "integrity_hash_mismatch"
+}
