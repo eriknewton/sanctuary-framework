@@ -23,6 +23,10 @@ export interface AuditEntry {
   details?: Record<string, unknown>;
 }
 
+export type AuditEntryInput = Omit<AuditEntry, "timestamp"> & {
+  timestamp?: string;
+};
+
 export interface AuditLogConfig {
   /** Maximum total size of stored audit entries in bytes. Default: 100 MB. */
   maxTotalSizeBytes?: number;
@@ -53,13 +57,37 @@ export const BROKER_OPS = {
 
 export type BrokerOp = (typeof BROKER_OPS)[keyof typeof BROKER_OPS];
 
-export class AuditLogPersistenceError extends Error {
+export type AuditPersistenceFailureClassification =
+  | "storage_full"
+  | "disk_failure"
+  | "permission_denied"
+  | "partial_write"
+  | "unknown"
+  | "multiple";
+
+export class AuditPersistenceError extends Error {
+  readonly classification: AuditPersistenceFailureClassification;
+  override readonly cause?: unknown;
+
+  constructor(
+    message: string,
+    classification: AuditPersistenceFailureClassification = "unknown",
+    cause?: unknown
+  ) {
+    super(message);
+    this.name = "AuditPersistenceError";
+    this.classification = classification;
+    this.cause = cause;
+  }
+}
+
+export class AuditLogPersistenceError extends AuditPersistenceError {
   constructor(readonly failures: readonly unknown[]) {
     const message =
       failures.length === 1
         ? failureMessage(failures[0])
         : `${failures.length} audit persistence writes failed`;
-    super(message);
+    super(message, failures.length === 1 ? classifyFailure(failures[0]) : "multiple");
     this.name = "AuditLogPersistenceError";
   }
 }
@@ -82,17 +110,16 @@ export class AuditLog {
   }
 
   /**
-   * Append an audit entry.
+   * Append a best-effort audit entry for low-risk telemetry.
    *
-   * The on-disk persist is async and tracked via `pendingWrites`. Long-lived
-   * callers (the main MCP server) can ignore that tracking and let writes
-   * drain naturally. Callers whose correctness depends on durability may
-   * either await the returned write promise or call `flush()`. Short-lived
-   * callers — the `sanctuary secrets` CLI which `process.exit()`s immediately
-   * after returning from a broker mutation — MUST await `flush()` before
-   * exiting, or in-flight writes get killed with the event loop and the entry
-   * is silently lost. That was the v0.10.0-rc.2 soak failure mode where
-   * `secrets audit` returned empty after a clean 7-verb lifecycle.
+   * The on-disk persist is async and tracked via `pendingWrites`, but callers
+   * are allowed to proceed without awaiting it. Use this only for read-path
+   * observations, health/heartbeat events, low-resolution metrics, and other
+   * telemetry where losing the entry must not change the trust decision.
+   *
+   * Critical state changes, approval decisions, identity/key operations,
+   * policy changes, egress denials, and export/exit operations MUST use
+   * `appendCritical()` instead.
    */
   append(
     layer: AuditEntry["layer"],
@@ -101,24 +128,40 @@ export class AuditLog {
     details?: Record<string, unknown>,
     result: "success" | "failure" = "success"
   ): Promise<void> {
-    const entry: AuditEntry = {
-      timestamp: new Date().toISOString(),
+    const entry = this.normalizeEntry({
       layer,
       operation,
       identity_id: identityId,
       result,
       details,
-    };
+    });
 
     this.entries.push(entry);
 
-    const writePromise = this.persistEntry(entry);
+    const writePromise = this.persistEntry(entry, { verifyDurability: false });
     this.pendingWrites.add(writePromise);
     void writePromise.then(
       () => this.pendingWrites.delete(writePromise),
       () => this.pendingWrites.delete(writePromise)
     );
     return writePromise;
+  }
+
+  /**
+   * Append a critical audit entry and resolve only after the storage backend
+   * has accepted and round-trip verified the exact encrypted bytes.
+   *
+   * Filesystem durability depends on the configured StorageBackend. The
+   * current backend contract exposes `write()` but not a portable fsync hook,
+   * so this method treats a completed write plus exact read-after-write
+   * verification as the backend-equivalent durability barrier. Storage
+   * failures, disk-full conditions, permission failures, and partial/torn
+   * writes throw `AuditPersistenceError` with a classification.
+   */
+  async appendCritical(entry: AuditEntryInput): Promise<void> {
+    const normalized = this.normalizeEntry(entry);
+    await this.persistEntry(normalized, { verifyDurability: true });
+    this.entries.push(normalized);
   }
 
   /**
@@ -142,21 +185,62 @@ export class AuditLog {
     }
   }
 
-  private async persistEntry(entry: AuditEntry): Promise<void> {
+  private async persistEntry(
+    entry: AuditEntry,
+    options: { verifyDurability: boolean }
+  ): Promise<void> {
     const key = `${Date.now()}-${this.counter++}`;
     const serialized = stringToBytes(JSON.stringify(entry));
     const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
-      "_audit",
-      key,
-      stringToBytes(JSON.stringify(encrypted))
-    );
+    const encryptedBytes = stringToBytes(JSON.stringify(encrypted));
+    try {
+      await this.storage.write("_audit", key, encryptedBytes);
+
+      if (options.verifyDurability) {
+        await this.verifyPersistedBytes(key, encryptedBytes);
+      }
+    } catch (err) {
+      throw toAuditPersistenceError(err);
+    }
 
     // Rotation runs as part of the same tracked promise so flush() also
     // covers any prune-driven deletes.
     await this.maybeRotate().catch(() => {
       // Rotation failure is non-fatal
     });
+  }
+
+  private normalizeEntry(entry: AuditEntryInput): AuditEntry {
+    return {
+      timestamp: entry.timestamp ?? new Date().toISOString(),
+      layer: entry.layer,
+      operation: entry.operation,
+      identity_id: entry.identity_id,
+      result: entry.result,
+      details: entry.details,
+    };
+  }
+
+  private async verifyPersistedBytes(
+    key: string,
+    expected: Uint8Array
+  ): Promise<void> {
+    let stored: Uint8Array | null;
+    try {
+      stored = await this.storage.read("_audit", key);
+    } catch (err) {
+      throw new AuditPersistenceError(
+        failureMessage(err),
+        classifyFailure(err),
+        err
+      );
+    }
+    if (!stored || !bytesEqual(stored, expected)) {
+      throw new AuditPersistenceError(
+        "audit persistence write failed: persisted bytes did not round-trip",
+        "partial_write"
+      );
+    }
   }
 
   /**
@@ -284,4 +368,31 @@ function failureMessage(failure: unknown): string {
     return `audit persistence write failed: ${failure.message}`;
   }
   return `audit persistence write failed: ${String(failure)}`;
+}
+
+function toAuditPersistenceError(err: unknown): AuditPersistenceError {
+  if (err instanceof AuditPersistenceError) return err;
+  return new AuditPersistenceError(failureMessage(err), classifyFailure(err), err);
+}
+
+function classifyFailure(err: unknown): AuditPersistenceFailureClassification {
+  if (err instanceof AuditPersistenceError) return err.classification;
+  const code =
+    err instanceof Error && "code" in err
+      ? String((err as NodeJS.ErrnoException).code)
+      : "";
+  if (code === "ENOSPC" || code === "EDQUOT") return "storage_full";
+  if (code === "EACCES" || code === "EPERM") return "permission_denied";
+  if (code === "EIO" || code === "EROFS" || code === "ENODEV") {
+    return "disk_failure";
+  }
+  return "unknown";
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }

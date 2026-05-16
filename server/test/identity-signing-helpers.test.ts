@@ -83,10 +83,10 @@ describe("internal identity signing helpers", () => {
       label: "internal-signer",
     });
 
-    const auditSigned = internalSigning.audit_event_sign(auditPayload, {
+    const auditSigned = await internalSigning.audit_event_sign(auditPayload, {
       identity_id: identity.identity_id as string,
     });
-    const receiptSigned = internalSigning.internal_receipt_sign(receiptPayload, {
+    const receiptSigned = await internalSigning.internal_receipt_sign(receiptPayload, {
       identity_id: identity.identity_id as string,
     });
 
@@ -121,7 +121,7 @@ describe("internal identity signing helpers", () => {
       label: "domain-separation",
     });
 
-    const signed = internalSigning.audit_event_sign(auditPayload, {
+    const signed = await internalSigning.audit_event_sign(auditPayload, {
       identity_id: identity.identity_id as string,
     });
     const signature = fromBase64url(signed.signature);
