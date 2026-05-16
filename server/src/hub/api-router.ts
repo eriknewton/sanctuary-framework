@@ -50,6 +50,10 @@ import {
   HubValidationError,
 } from "./errors.js";
 import type { HubService } from "./hub-service.js";
+import {
+  TASK_STATUSES,
+  type TaskStatus,
+} from "../l2-operational/task-coordination/index.js";
 
 export interface HubRouterDeps {
   authConfig: AuthConfig;
@@ -217,6 +221,24 @@ function matchInboxRoute(path: string): {
   return { itemId: decodeURIComponent(itemId), action };
 }
 
+function matchTaskRoute(path: string): {
+  taskId: string;
+  action: string | null;
+} | null {
+  const prefix = `${HUB_API_PREFIX}/tasks/`;
+  if (!path.startsWith(prefix)) return null;
+  const rest = path.slice(prefix.length);
+  if (rest.length === 0) return null;
+  const parts = rest.split("/");
+  if (parts.length > 2) return null;
+  const [taskId, action] = parts;
+  if (!taskId) return null;
+  return {
+    taskId: decodeURIComponent(taskId),
+    action: action ?? null,
+  };
+}
+
 function isHubInboxAction(value: string): value is HubInboxAction {
   return (HUB_INBOX_ACTIONS as readonly string[]).includes(value);
 }
@@ -225,6 +247,10 @@ function isHubAgentControlAction(
   value: string,
 ): value is HubAgentControlAction {
   return (HUB_AGENT_CONTROL_ACTIONS as readonly string[]).includes(value);
+}
+
+function isTaskStatus(value: string): value is TaskStatus {
+  return (TASK_STATUSES as readonly string[]).includes(value);
 }
 
 function parseHarnessFilter(
@@ -287,6 +313,129 @@ export async function handleHubRoute(
       );
       writeJSON(res, 200, { ok: true, data: { item } });
       return true;
+    }
+
+    // ── GET /api/hub/tasks ──────────────────────────────────────────
+    if (method === "GET" && path === `${HUB_API_PREFIX}/tasks`) {
+      const rawStatus = url.searchParams.get("status");
+      if (rawStatus !== null && !isTaskStatus(rawStatus)) {
+        throw new HubValidationError(
+          `status must be one of: ${TASK_STATUSES.join(", ")}`,
+        );
+      }
+      const tasks = await deps.service.listTasks({
+        ...(rawStatus ? { status: rawStatus } : {}),
+        ...(url.searchParams.get("assignee")
+          ? { assignee: url.searchParams.get("assignee")! }
+          : {}),
+        ...(url.searchParams.get("creator")
+          ? { creator: url.searchParams.get("creator")! }
+          : {}),
+      });
+      writeJSON(res, 200, { ok: true, data: { tasks } });
+      return true;
+    }
+
+    // ── POST /api/hub/tasks ─────────────────────────────────────────
+    if (method === "POST" && path === `${HUB_API_PREFIX}/tasks`) {
+      const body = await readJSONBody<{
+        title?: unknown;
+        description?: unknown;
+        creator?: unknown;
+        assignee?: unknown;
+        parent_task_id?: unknown;
+        metadata?: unknown;
+      }>(req);
+      if (typeof body.title !== "string") {
+        throw new HubValidationError("title required");
+      }
+      if (typeof body.creator !== "string") {
+        throw new HubValidationError("creator required");
+      }
+      const task = await deps.service.createTask({
+        title: body.title,
+        creator: body.creator,
+        ...(typeof body.description === "string"
+          ? { description: body.description }
+          : {}),
+        ...(typeof body.assignee === "string" ? { assignee: body.assignee } : {}),
+        ...(typeof body.parent_task_id === "string"
+          ? { parent_task_id: body.parent_task_id }
+          : {}),
+        ...(body.metadata &&
+        typeof body.metadata === "object" &&
+        !Array.isArray(body.metadata)
+          ? { metadata: body.metadata as Record<string, unknown> }
+          : {}),
+      });
+      writeJSON(res, 201, { ok: true, data: { task } });
+      return true;
+    }
+
+    // ── /api/hub/tasks/:id and /api/hub/tasks/:id/<action> ──────────
+    const taskMatch = matchTaskRoute(path);
+    if (taskMatch) {
+      if (method === "GET" && taskMatch.action === null) {
+        const task = await deps.service.getTask(taskMatch.taskId);
+        writeJSON(res, 200, { ok: true, data: { task } });
+        return true;
+      }
+
+      if (method === "PATCH" && taskMatch.action === null) {
+        const body = await readJSONBody<{
+          status?: unknown;
+          actor?: unknown;
+        }>(req);
+        if (typeof body.status !== "string" || !isTaskStatus(body.status)) {
+          throw new HubValidationError(
+            `status must be one of: ${TASK_STATUSES.join(", ")}`,
+          );
+        }
+        if (typeof body.actor !== "string") {
+          throw new HubValidationError("actor required");
+        }
+        const task = await deps.service.updateTaskStatus(taskMatch.taskId, {
+          status: body.status,
+          actor: body.actor,
+        });
+        writeJSON(res, 200, { ok: true, data: { task } });
+        return true;
+      }
+
+      if (method === "POST" && taskMatch.action === "assign") {
+        const body = await readJSONBody<{
+          assignee?: unknown;
+          actor?: unknown;
+        }>(req);
+        if (typeof body.assignee !== "string") {
+          throw new HubValidationError("assignee required");
+        }
+        if (typeof body.actor !== "string") {
+          throw new HubValidationError("actor required");
+        }
+        const task = await deps.service.assignTask(taskMatch.taskId, {
+          assignee: body.assignee,
+          actor: body.actor,
+        });
+        writeJSON(res, 200, { ok: true, data: { task } });
+        return true;
+      }
+
+      if (method === "POST" && taskMatch.action === "cancel") {
+        const body = await readJSONBody<{
+          reason?: unknown;
+          actor?: unknown;
+        }>(req);
+        if (typeof body.actor !== "string") {
+          throw new HubValidationError("actor required");
+        }
+        const task = await deps.service.cancelTask(taskMatch.taskId, {
+          actor: body.actor,
+          ...(typeof body.reason === "string" ? { reason: body.reason } : {}),
+        });
+        writeJSON(res, 200, { ok: true, data: { task } });
+        return true;
+      }
     }
 
     // ── POST /api/hub/fortress/lockdown ─────────────────────────────
