@@ -12,7 +12,19 @@
 import type { StorageBackend } from "../storage/interface.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import { stringToBytes, bytesToString } from "../core/encoding.js";
+import { stringToBytes, bytesToString, toBase64url, fromBase64url } from "../core/encoding.js";
+import {
+  AUDIT_CHAIN_GENESIS,
+  AUDIT_CHAIN_SCHEMA_VERSION,
+  AUDIT_CHECKPOINT_SCHEMA_VERSION,
+  type AuditCheckpointRecord,
+  type AuditCheckpointSignature,
+  type AuditCheckpointSigningPayload,
+  computeAuditEntryHash,
+  computeAuditRoot,
+  sha256Hex,
+  verifyCheckpointSignature,
+} from "../audit/chain.js";
 
 export interface AuditEntry {
   timestamp: string;
@@ -27,15 +39,61 @@ export type AuditEntryInput = Omit<AuditEntry, "timestamp"> & {
   timestamp?: string;
 };
 
+export interface PersistedAuditEnvelopeV2 {
+  schema_version: typeof AUDIT_CHAIN_SCHEMA_VERSION;
+  sequence: number;
+  prev_hash: string;
+  entry_hash: string;
+  timestamp: string;
+  encrypted_payload_bytes: string;
+}
+
+export type AuditIntegrityFindingKind =
+  | "storage_unavailable"
+  | "entry_unreadable"
+  | "entry_malformed"
+  | "entry_hash_mismatch"
+  | "entry_decrypt_failed"
+  | "sequence_gap_or_reorder"
+  | "prev_hash_mismatch"
+  | "legacy_anchor_missing"
+  | "legacy_anchor_mismatch"
+  | "checkpoint_malformed"
+  | "checkpoint_root_mismatch"
+  | "checkpoint_signature_mismatch"
+  | "checkpoint_signature_unverifiable";
+
+export interface AuditIntegrityFinding {
+  kind: AuditIntegrityFindingKind;
+  message: string;
+  key?: string;
+  sequence?: number;
+  expected?: string | number;
+  actual?: string | number;
+}
+
 export interface AuditLogConfig {
   /** Maximum total size of stored audit entries in bytes. Default: 100 MB. */
   maxTotalSizeBytes?: number;
   /** Maximum number of stored audit entry files to retain. Default: 100_000. */
   maxEntries?: number;
+  /** Verify chain failures by throwing (strict) or surfacing findings (lenient). */
+  integrityMode?: "strict" | "lenient";
+  /** Write a checkpoint after this many critical appends. Default: 100. */
+  checkpointInterval?: number;
+  /** Optional typed identity signing bridge for checkpoint records. */
+  checkpointSigner?: (
+    payload: AuditCheckpointSigningPayload
+  ) => Promise<AuditCheckpointSignature | null>;
+  /** Resolve a known checkpoint signing key by signer_kid. */
+  checkpointPublicKeyResolver?: (signerKid: string) => string | Uint8Array | undefined;
 }
 
 const DEFAULT_MAX_TOTAL_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_MAX_ENTRIES = 100_000;
+const DEFAULT_CHECKPOINT_INTERVAL = 100;
+const AUDIT_NAMESPACE = "_audit";
+const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
 
 /**
  * Operation-name constants for the v0.10.0 Secret Broker (L3 Selective
@@ -92,21 +150,57 @@ export class AuditLogPersistenceError extends AuditPersistenceError {
   }
 }
 
+export class AuditIntegrityError extends Error {
+  constructor(readonly findings: readonly AuditIntegrityFinding[]) {
+    super(
+      findings.length === 1
+        ? findings[0]!.message
+        : `${findings.length} audit integrity findings detected`
+    );
+    this.name = "AuditIntegrityError";
+  }
+}
+
 export class AuditLog {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
   private entries: AuditEntry[] = [];
+  private chainEntries: Array<{ sequence: number; entry_hash: string }> = [];
   private counter = 0;
   private readonly maxTotalSizeBytes: number;
   private readonly maxEntries: number;
+  private readonly integrityMode: "strict" | "lenient";
+  private readonly checkpointInterval: number;
+  private readonly checkpointSigner?: (
+    payload: AuditCheckpointSigningPayload
+  ) => Promise<AuditCheckpointSignature | null>;
+  private readonly checkpointPublicKeyResolver?: (
+    signerKid: string
+  ) => string | Uint8Array | undefined;
   private rotationInFlight = false;
   private readonly pendingWrites = new Set<Promise<void>>();
+  private pendingVisibleEntries = 0;
+  private appendQueue: Promise<void> = Promise.resolve();
+  private loaded = false;
+  private integrityFindings: AuditIntegrityFinding[] = [];
+  private nextSequence = 1;
+  private lastEntryHash = AUDIT_CHAIN_GENESIS;
+  private checkpointSpanStartSequence = 1;
+  private hashesSinceCheckpoint: string[] = [];
+  private lastCheckpointSequence = 0;
+  private criticalAppendsSinceCheckpoint = 0;
+  private checkpointInFlight = false;
 
   constructor(storage: StorageBackend, masterKey: Uint8Array, config?: AuditLogConfig) {
     this.storage = storage;
     this.encryptionKey = derivePurposeKey(masterKey, "audit-log");
     this.maxTotalSizeBytes = config?.maxTotalSizeBytes ?? DEFAULT_MAX_TOTAL_SIZE_BYTES;
     this.maxEntries = config?.maxEntries ?? DEFAULT_MAX_ENTRIES;
+    this.integrityMode = config?.integrityMode ?? "strict";
+    this.checkpointInterval =
+      config?.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL;
+    this.checkpointSigner = config?.checkpointSigner;
+    this.checkpointPublicKeyResolver = config?.checkpointPublicKeyResolver;
   }
 
   /**
@@ -128,17 +222,14 @@ export class AuditLog {
     details?: Record<string, unknown>,
     result: "success" | "failure" = "success"
   ): Promise<void> {
-    const entry = this.normalizeEntry({
+    this.pendingVisibleEntries++;
+    const writePromise = this.enqueueAppend({
       layer,
       operation,
       identity_id: identityId,
       result,
       details,
-    });
-
-    this.entries.push(entry);
-
-    const writePromise = this.persistEntry(entry, { verifyDurability: false });
+    }, { verifyDurability: false, critical: false });
     this.pendingWrites.add(writePromise);
     void writePromise.then(
       () => this.pendingWrites.delete(writePromise),
@@ -159,9 +250,7 @@ export class AuditLog {
    * writes throw `AuditPersistenceError` with a classification.
    */
   async appendCritical(entry: AuditEntryInput): Promise<void> {
-    const normalized = this.normalizeEntry(entry);
-    await this.persistEntry(normalized, { verifyDurability: true });
-    this.entries.push(normalized);
+    await this.enqueueAppend(entry, { verifyDurability: true, critical: true });
   }
 
   /**
@@ -183,31 +272,93 @@ export class AuditLog {
     if (failures.length > 0) {
       throw new AuditLogPersistenceError(failures);
     }
+    await this.appendQueue;
+    await this.writeCheckpointIfNeeded("graceful-shutdown");
   }
 
-  private async persistEntry(
-    entry: AuditEntry,
-    options: { verifyDurability: boolean }
+  private enqueueAppend(
+    entry: AuditEntryInput,
+    options: { verifyDurability: boolean; critical: boolean }
   ): Promise<void> {
-    const key = `${Date.now()}-${this.counter++}`;
-    const serialized = stringToBytes(JSON.stringify(entry));
-    const encrypted = encrypt(serialized, this.encryptionKey);
-    const encryptedBytes = stringToBytes(JSON.stringify(encrypted));
+    const task = this.appendQueue
+      .catch(() => {
+        // Keep later appends from inheriting a prior append failure.
+      })
+      .then(() => this.persistChainedEntry(entry, options));
+    this.appendQueue = task.then(
+      () => undefined,
+      () => undefined
+    );
+    return task;
+  }
+
+  private async persistChainedEntry(
+    entry: AuditEntryInput,
+    options: { verifyDurability: boolean; critical: boolean }
+  ): Promise<void> {
     try {
-      await this.storage.write("_audit", key, encryptedBytes);
+      await this.ensureLoaded();
+      const normalized = this.normalizeEntry(entry);
+      const serialized = stringToBytes(JSON.stringify(normalized));
+      const encrypted = encrypt(serialized, this.encryptionKey);
+      const encryptedBytes = stringToBytes(JSON.stringify(encrypted));
+      const encryptedPayloadBytes = toBase64url(encryptedBytes);
+      const sequence = this.nextSequence;
+      const prevHash = this.lastEntryHash;
+      const entryHash = computeAuditEntryHash({
+        sequence,
+        prev_hash: prevHash,
+        timestamp: normalized.timestamp,
+        encrypted_payload_bytes: encryptedPayloadBytes,
+        schema_version: AUDIT_CHAIN_SCHEMA_VERSION,
+      });
+      const envelope: PersistedAuditEnvelopeV2 = {
+        schema_version: AUDIT_CHAIN_SCHEMA_VERSION,
+        sequence,
+        prev_hash: prevHash,
+        entry_hash: entryHash,
+        timestamp: normalized.timestamp,
+        encrypted_payload_bytes: encryptedPayloadBytes,
+      };
+      const key = `entry-${String(sequence).padStart(20, "0")}-${Date.now()}-${this.counter++}`;
+      const persistedBytes = stringToBytes(JSON.stringify(envelope));
+      try {
+        await this.storage.write(AUDIT_NAMESPACE, key, persistedBytes);
 
-      if (options.verifyDurability) {
-        await this.verifyPersistedBytes(key, encryptedBytes);
+        if (options.verifyDurability) {
+          await this.verifyPersistedBytes(key, persistedBytes);
+        }
+      } catch (err) {
+        throw toAuditPersistenceError(err);
       }
-    } catch (err) {
-      throw toAuditPersistenceError(err);
-    }
 
-    // Rotation runs as part of the same tracked promise so flush() also
-    // covers any prune-driven deletes.
-    await this.maybeRotate().catch(() => {
-      // Rotation failure is non-fatal
-    });
+      this.entries.push(normalized);
+      this.chainEntries.push({ sequence, entry_hash: entryHash });
+      this.nextSequence = sequence + 1;
+      this.lastEntryHash = entryHash;
+      this.hashesSinceCheckpoint.push(entryHash);
+      if (options.critical) {
+        this.criticalAppendsSinceCheckpoint++;
+      }
+
+      if (
+        options.critical &&
+        this.checkpointInterval > 0 &&
+        this.criticalAppendsSinceCheckpoint >= this.checkpointInterval
+      ) {
+        await this.writeCheckpointIfNeeded("critical-interval");
+      }
+
+      // Rotation runs as part of the same tracked promise so flush() also
+      // covers any prune-driven deletes.
+      await this.maybeRotate().catch(() => {
+        // Rotation failure is non-fatal
+      });
+    } finally {
+      if (!options.critical && this.pendingVisibleEntries > 0) {
+        this.pendingVisibleEntries--;
+      }
+    }
   }
 
   private normalizeEntry(entry: AuditEntryInput): AuditEntry {
@@ -227,7 +378,7 @@ export class AuditLog {
   ): Promise<void> {
     let stored: Uint8Array | null;
     try {
-      stored = await this.storage.read("_audit", key);
+      stored = await this.storage.read(AUDIT_NAMESPACE, key);
     } catch (err) {
       throw new AuditPersistenceError(
         failureMessage(err),
@@ -251,7 +402,7 @@ export class AuditLog {
     if (this.rotationInFlight) return;
     this.rotationInFlight = true;
     try {
-      const metas = await this.storage.list("_audit");
+      const metas = await this.storage.list(AUDIT_NAMESPACE);
       if (metas.length === 0) return;
 
       // Sort by key ascending (oldest first — keys are timestamp-prefixed)
@@ -276,7 +427,7 @@ export class AuditLog {
 
       // Delete oldest entries
       for (let i = 0; i < toDelete; i++) {
-        await this.storage.delete("_audit", metas[i]!.key);
+        await this.storage.delete(AUDIT_NAMESPACE, metas[i]!.key);
       }
     } finally {
       this.rotationInFlight = false;
@@ -291,9 +442,14 @@ export class AuditLog {
     layer?: AuditEntry["layer"];
     operation_type?: string;
     limit?: number;
-  }): Promise<{ entries: AuditEntry[]; total: number }> {
+  }): Promise<{
+    entries: AuditEntry[];
+    total: number;
+    integrity_findings: AuditIntegrityFinding[];
+  }> {
+    await this.appendQueue;
     // First, try to load persisted entries we don't have in memory
-    await this.loadPersistedEntries();
+    await this.ensureLoaded();
 
     let filtered = this.entries;
 
@@ -316,50 +472,461 @@ export class AuditLog {
     const limit = options.limit ?? 50;
     const entries = filtered.slice(-limit); // Most recent entries
 
-    return { entries, total };
+    return { entries, total, integrity_findings: [...this.integrityFindings] };
+  }
+
+  private async ensureLoaded(): Promise<void> {
+    if (this.loaded) return;
+    await this.loadPersistedEntries();
+    this.loaded = true;
+    if (this.integrityMode === "strict" && this.integrityFindings.length > 0) {
+      throw new AuditIntegrityError(this.integrityFindings);
+    }
   }
 
   private async loadPersistedEntries(): Promise<void> {
+    const findings: AuditIntegrityFinding[] = [];
+    const legacyRawEntries: Array<{ key: string; raw: Uint8Array; entry: AuditEntry }> = [];
+    const chainedEntries: Array<{
+      key: string;
+      envelope: PersistedAuditEnvelopeV2;
+      entry: AuditEntry;
+    }> = [];
+
     try {
-      const storedEntries = await this.storage.list("_audit");
+      const storedEntries = await this.storage.list(AUDIT_NAMESPACE);
       for (const meta of storedEntries) {
-        const raw = await this.storage.read("_audit", meta.key);
-        if (!raw) continue;
+        let raw: Uint8Array | null;
         try {
-          const encrypted: EncryptedPayload = JSON.parse(bytesToString(raw));
+          raw = await this.storage.read(AUDIT_NAMESPACE, meta.key);
+        } catch (err) {
+          findings.push({
+            kind: "entry_unreadable",
+            key: meta.key,
+            message: `audit entry ${meta.key} could not be read: ${failureMessage(err)}`,
+          });
+          continue;
+        }
+        if (!raw) {
+          findings.push({
+            kind: "entry_unreadable",
+            key: meta.key,
+            message: `audit entry ${meta.key} disappeared during load`,
+          });
+          continue;
+        }
+
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(bytesToString(raw));
+        } catch {
+          findings.push({
+            kind: "entry_malformed",
+            key: meta.key,
+            message: `audit entry ${meta.key} is not valid JSON`,
+          });
+          continue;
+        }
+
+        if (isPersistedAuditEnvelopeV2(parsed)) {
+          const expectedHash = computeAuditEntryHash({
+            sequence: parsed.sequence,
+            prev_hash: parsed.prev_hash,
+            timestamp: parsed.timestamp,
+            encrypted_payload_bytes: parsed.encrypted_payload_bytes,
+            schema_version: parsed.schema_version,
+          });
+          if (expectedHash !== parsed.entry_hash) {
+            findings.push({
+              kind: "entry_hash_mismatch",
+              key: meta.key,
+              sequence: parsed.sequence,
+              expected: expectedHash,
+              actual: parsed.entry_hash,
+              message: `audit entry ${meta.key} hash mismatch at sequence ${parsed.sequence}`,
+            });
+          }
+
+          try {
+            const encryptedBytes = fromBase64url(parsed.encrypted_payload_bytes);
+            const encrypted: EncryptedPayload = JSON.parse(bytesToString(encryptedBytes));
+            const decrypted = decrypt(encrypted, this.encryptionKey);
+            const entry: AuditEntry = JSON.parse(bytesToString(decrypted));
+            chainedEntries.push({ key: meta.key, envelope: parsed, entry });
+          } catch {
+            findings.push({
+              kind: "entry_decrypt_failed",
+              key: meta.key,
+              sequence: parsed.sequence,
+              message: `audit entry ${meta.key} could not be decrypted at sequence ${parsed.sequence}`,
+            });
+          }
+          continue;
+        }
+
+        try {
+          const encrypted = parsed as EncryptedPayload;
           const decrypted = decrypt(encrypted, this.encryptionKey);
           const entry: AuditEntry = JSON.parse(bytesToString(decrypted));
-
-          // Deduplicate (check if we already have this timestamp+operation)
-          const isDuplicate = this.entries.some(
-            (e) =>
-              e.timestamp === entry.timestamp &&
-              e.operation === entry.operation &&
-              e.identity_id === entry.identity_id
-          );
-          if (!isDuplicate) {
-            this.entries.push(entry);
-          }
+          legacyRawEntries.push({ key: meta.key, raw, entry });
         } catch {
-          // Skip corrupted entries
+          findings.push({
+            kind: "entry_decrypt_failed",
+            key: meta.key,
+            message: `legacy audit entry ${meta.key} could not be decrypted`,
+          });
         }
       }
 
-      // Sort by timestamp
-      this.entries.sort(
-        (a, b) =>
-          new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      const legacyHashes = legacyRawEntries.map((legacy, index) =>
+        sha256Hex(
+          JSON.stringify({
+            schema_version: 1,
+            sequence: index + 1,
+            key: legacy.key,
+            encrypted_payload_bytes: toBase64url(legacy.raw),
+          })
+        )
       );
-    } catch {
-      // Storage not available yet — that's fine
+      const legacyAnchorHash =
+        legacyHashes.length > 0 ? computeAuditRoot(legacyHashes) : AUDIT_CHAIN_GENESIS;
+
+      await this.verifyAndMaybeWriteLegacyAnchor(
+        legacyRawEntries.length,
+        legacyAnchorHash,
+        findings
+      );
+
+      this.verifyChainedEntries(
+        chainedEntries,
+        legacyRawEntries.length,
+        legacyAnchorHash,
+        findings
+      );
+
+      await this.verifyCheckpoints(
+        legacyRawEntries.length,
+        legacyAnchorHash,
+        chainedEntries.map((item) => item.envelope),
+        findings
+      );
+
+      this.entries = [
+        ...legacyRawEntries.map((item) => item.entry),
+        ...chainedEntries.map((item) => item.entry),
+      ];
+      this.chainEntries = chainedEntries.map((item) => ({
+        sequence: item.envelope.sequence,
+        entry_hash: item.envelope.entry_hash,
+      }));
+      this.nextSequence = legacyRawEntries.length + chainedEntries.length + 1;
+      this.lastEntryHash =
+        chainedEntries.at(-1)?.envelope.entry_hash ?? legacyAnchorHash;
+      this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
+      this.checkpointSpanStartSequence =
+        this.lastCheckpointSequence > 0
+          ? this.lastCheckpointSequence + 1
+          : legacyRawEntries.length + 1;
+      this.integrityFindings = findings;
+    } catch (err) {
+      findings.push({
+        kind: "storage_unavailable",
+        message: `audit storage could not be listed: ${failureMessage(err)}`,
+      });
+      this.integrityFindings = findings;
     }
+  }
+
+  private async verifyAndMaybeWriteLegacyAnchor(
+    legacyCount: number,
+    legacyAnchorHash: string,
+    findings: AuditIntegrityFinding[]
+  ): Promise<void> {
+    if (legacyCount === 0) return;
+    const existing = await this.readCheckpoints("legacy-anchor", findings);
+    if (existing.length === 0) {
+      await this.writeCheckpointRecord({
+        checkpoint_kind: "legacy-anchor",
+        checkpoint_sequence: legacyCount,
+        from_sequence: 1,
+        root_hash: legacyAnchorHash,
+        previous_checkpoint_sequence: 0,
+        signed_at: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const anchor = existing.at(-1)!;
+    this.verifyCheckpointRecordSignature(anchor, findings);
+    if (
+      anchor.checkpoint_sequence !== legacyCount ||
+      anchor.root_hash !== legacyAnchorHash
+    ) {
+      findings.push({
+        kind: "legacy_anchor_mismatch",
+        expected: anchor.root_hash,
+        actual: legacyAnchorHash,
+        message: "legacy audit anchor does not match the current legacy entries",
+      });
+    }
+  }
+
+  private verifyChainedEntries(
+    entries: Array<{
+      key: string;
+      envelope: PersistedAuditEnvelopeV2;
+      entry: AuditEntry;
+    }>,
+    legacyCount: number,
+    legacyAnchorHash: string,
+    findings: AuditIntegrityFinding[]
+  ): void {
+    let expectedSequence = legacyCount + 1;
+    let expectedPrevHash =
+      legacyCount > 0 ? legacyAnchorHash : AUDIT_CHAIN_GENESIS;
+
+    for (const item of entries) {
+      const envelope = item.envelope;
+      if (envelope.sequence !== expectedSequence) {
+        findings.push({
+          kind: "sequence_gap_or_reorder",
+          key: item.key,
+          sequence: envelope.sequence,
+          expected: expectedSequence,
+          actual: envelope.sequence,
+          message: `audit sequence break at ${item.key}: expected ${expectedSequence}, found ${envelope.sequence}`,
+        });
+      }
+      if (envelope.prev_hash !== expectedPrevHash) {
+        findings.push({
+          kind: "prev_hash_mismatch",
+          key: item.key,
+          sequence: envelope.sequence,
+          expected: expectedPrevHash,
+          actual: envelope.prev_hash,
+          message: `audit prev_hash mismatch at sequence ${envelope.sequence}`,
+        });
+      }
+      expectedSequence++;
+      expectedPrevHash = envelope.entry_hash;
+    }
+  }
+
+  private async verifyCheckpoints(
+    legacyCount: number,
+    legacyAnchorHash: string,
+    entries: PersistedAuditEnvelopeV2[],
+    findings: AuditIntegrityFinding[]
+  ): Promise<void> {
+    const checkpoints = await this.readCheckpoints("audit-checkpoint", findings);
+    const entryBySequence = new Map(entries.map((entry) => [entry.sequence, entry]));
+    let highestCheckpoint = 0;
+
+    for (const checkpoint of checkpoints) {
+      if (checkpoint.checkpoint_sequence > highestCheckpoint) {
+        highestCheckpoint = checkpoint.checkpoint_sequence;
+      }
+
+      const hashes: string[] = [];
+      for (
+        let sequence = checkpoint.from_sequence;
+        sequence <= checkpoint.checkpoint_sequence;
+        sequence++
+      ) {
+        if (sequence <= legacyCount) {
+          if (checkpoint.from_sequence === 1 && checkpoint.checkpoint_sequence === legacyCount) {
+            hashes.push(legacyAnchorHash);
+            break;
+          }
+          findings.push({
+            kind: "checkpoint_root_mismatch",
+            sequence,
+            message: `checkpoint includes legacy sequence ${sequence} outside the legacy anchor`,
+          });
+          continue;
+        }
+        const entry = entryBySequence.get(sequence);
+        if (!entry) {
+          findings.push({
+            kind: "checkpoint_root_mismatch",
+            sequence,
+            message: `checkpoint references missing audit sequence ${sequence}`,
+          });
+          continue;
+        }
+        hashes.push(entry.entry_hash);
+      }
+
+      const expectedRoot = computeAuditRoot(hashes);
+      if (checkpoint.root_hash !== expectedRoot) {
+        findings.push({
+          kind: "checkpoint_root_mismatch",
+          sequence: checkpoint.checkpoint_sequence,
+          expected: expectedRoot,
+          actual: checkpoint.root_hash,
+          message: `checkpoint root mismatch at sequence ${checkpoint.checkpoint_sequence}`,
+        });
+      }
+
+      this.verifyCheckpointRecordSignature(checkpoint, findings);
+    }
+
+    this.lastCheckpointSequence = highestCheckpoint;
+  }
+
+  private verifyCheckpointRecordSignature(
+    checkpoint: AuditCheckpointRecord,
+    findings: AuditIntegrityFinding[]
+  ): void {
+    if (checkpoint.unsigned) return;
+    if (!checkpoint.signer_kid || !checkpoint.signature) {
+      findings.push({
+        kind: "checkpoint_signature_mismatch",
+        sequence: checkpoint.checkpoint_sequence,
+        message: `checkpoint ${checkpoint.checkpoint_sequence} is marked signed but lacks signer data`,
+      });
+      return;
+    }
+
+    const publicKey =
+      this.checkpointPublicKeyResolver?.(checkpoint.signer_kid) ??
+      checkpoint.public_key;
+    if (!publicKey) {
+      findings.push({
+        kind: "checkpoint_signature_unverifiable",
+        sequence: checkpoint.checkpoint_sequence,
+        message: `checkpoint signer ${checkpoint.signer_kid} has no known public key`,
+      });
+      return;
+    }
+
+    const valid = verifyCheckpointSignature(
+      checkpointPayload(checkpoint),
+      checkpoint.signature,
+      publicKey
+    );
+    if (!valid) {
+      findings.push({
+        kind: "checkpoint_signature_mismatch",
+        sequence: checkpoint.checkpoint_sequence,
+        message: `checkpoint signature mismatch at sequence ${checkpoint.checkpoint_sequence}`,
+      });
+    }
+  }
+
+  private async readCheckpoints(
+    kind: "audit-checkpoint" | "legacy-anchor",
+    findings: AuditIntegrityFinding[]
+  ): Promise<AuditCheckpointRecord[]> {
+    const records: AuditCheckpointRecord[] = [];
+    let metas;
+    try {
+      metas = await this.storage.list(AUDIT_CHECKPOINT_NAMESPACE, `${kind}-`);
+    } catch (err) {
+      findings.push({
+        kind: "storage_unavailable",
+        message: `audit checkpoints could not be listed: ${failureMessage(err)}`,
+      });
+      return records;
+    }
+
+    for (const meta of metas) {
+      const raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, meta.key);
+      if (!raw) {
+        findings.push({
+          kind: "checkpoint_malformed",
+          key: meta.key,
+          message: `audit checkpoint ${meta.key} disappeared during load`,
+        });
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(bytesToString(raw));
+        if (!isAuditCheckpointRecord(parsed) || parsed.checkpoint_kind !== kind) {
+          throw new Error("invalid checkpoint shape");
+        }
+        records.push(parsed);
+      } catch {
+        findings.push({
+          kind: "checkpoint_malformed",
+          key: meta.key,
+          message: `audit checkpoint ${meta.key} is malformed`,
+        });
+      }
+    }
+
+    return records.sort(
+      (a, b) => a.checkpoint_sequence - b.checkpoint_sequence
+    );
+  }
+
+  private collectHashesSinceLastCheckpoint(): string[] {
+    if (this.lastCheckpointSequence <= 0) {
+      return this.chainEntries.map((entry) => entry.entry_hash);
+    }
+    return this.chainEntries
+      .filter((entry) => entry.sequence > this.lastCheckpointSequence)
+      .map((entry) => entry.entry_hash);
+  }
+
+  private async writeCheckpointIfNeeded(_reason: string): Promise<void> {
+    if (this.checkpointInFlight || this.hashesSinceCheckpoint.length === 0) return;
+    this.checkpointInFlight = true;
+    try {
+      const checkpointSequence = this.nextSequence - 1;
+      await this.writeCheckpointRecord({
+        checkpoint_kind: "audit-checkpoint",
+        checkpoint_sequence: checkpointSequence,
+        from_sequence: this.checkpointSpanStartSequence,
+        root_hash: computeAuditRoot(this.hashesSinceCheckpoint),
+        previous_checkpoint_sequence: this.lastCheckpointSequence,
+        signed_at: new Date().toISOString(),
+      });
+      this.lastCheckpointSequence = checkpointSequence;
+      this.checkpointSpanStartSequence = checkpointSequence + 1;
+      this.hashesSinceCheckpoint = [];
+      this.criticalAppendsSinceCheckpoint = 0;
+    } finally {
+      this.checkpointInFlight = false;
+    }
+  }
+
+  private async writeCheckpointRecord(
+    payload: AuditCheckpointSigningPayload
+  ): Promise<void> {
+    let signed: AuditCheckpointSignature | null = null;
+    try {
+      signed = (await this.checkpointSigner?.(payload)) ?? null;
+    } catch {
+      signed = null;
+    }
+
+    const record: AuditCheckpointRecord = {
+      schema_version: AUDIT_CHECKPOINT_SCHEMA_VERSION,
+      ...payload,
+      signer_kid: signed?.signer_kid ?? null,
+      signature: signed?.signature ?? null,
+      signature_algorithm: signed ? "Ed25519" : null,
+      payload_encoding: "domain-separated-canonical-json-v1",
+      unsigned: !signed,
+      ...(signed?.public_key ? { public_key: signed.public_key } : {}),
+      ...(!signed
+        ? { unsigned_reason: "no signing identity available at checkpoint time" }
+        : {}),
+    };
+    const key = `${payload.checkpoint_kind}-${String(payload.checkpoint_sequence).padStart(20, "0")}`;
+    await this.storage.write(
+      AUDIT_CHECKPOINT_NAMESPACE,
+      key,
+      stringToBytes(JSON.stringify(record))
+    );
   }
 
   /**
    * Get total number of entries.
    */
   get size(): number {
-    return this.entries.length;
+    return this.entries.length + this.pendingVisibleEntries;
   }
 }
 
@@ -395,4 +962,62 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
     if (a[i] !== b[i]) return false;
   }
   return true;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isPersistedAuditEnvelopeV2(
+  value: unknown
+): value is PersistedAuditEnvelopeV2 {
+  return (
+    isRecord(value) &&
+    value.schema_version === AUDIT_CHAIN_SCHEMA_VERSION &&
+    typeof value.sequence === "number" &&
+    Number.isSafeInteger(value.sequence) &&
+    value.sequence > 0 &&
+    typeof value.prev_hash === "string" &&
+    typeof value.entry_hash === "string" &&
+    /^[0-9a-f]{64}$/.test(value.entry_hash) &&
+    typeof value.timestamp === "string" &&
+    typeof value.encrypted_payload_bytes === "string"
+  );
+}
+
+function isAuditCheckpointRecord(value: unknown): value is AuditCheckpointRecord {
+  return (
+    isRecord(value) &&
+    value.schema_version === AUDIT_CHECKPOINT_SCHEMA_VERSION &&
+    (value.checkpoint_kind === "audit-checkpoint" ||
+      value.checkpoint_kind === "legacy-anchor") &&
+    typeof value.checkpoint_sequence === "number" &&
+    Number.isSafeInteger(value.checkpoint_sequence) &&
+    typeof value.from_sequence === "number" &&
+    Number.isSafeInteger(value.from_sequence) &&
+    typeof value.root_hash === "string" &&
+    /^[0-9a-f]{64}$/.test(value.root_hash) &&
+    typeof value.previous_checkpoint_sequence === "number" &&
+    Number.isSafeInteger(value.previous_checkpoint_sequence) &&
+    typeof value.signed_at === "string" &&
+    (typeof value.signer_kid === "string" || value.signer_kid === null) &&
+    (typeof value.signature === "string" || value.signature === null) &&
+    (value.signature_algorithm === "Ed25519" ||
+      value.signature_algorithm === null) &&
+    value.payload_encoding === "domain-separated-canonical-json-v1" &&
+    typeof value.unsigned === "boolean"
+  );
+}
+
+function checkpointPayload(
+  checkpoint: AuditCheckpointRecord
+): AuditCheckpointSigningPayload {
+  return {
+    checkpoint_kind: checkpoint.checkpoint_kind,
+    checkpoint_sequence: checkpoint.checkpoint_sequence,
+    from_sequence: checkpoint.from_sequence,
+    root_hash: checkpoint.root_hash,
+    previous_checkpoint_sequence: checkpoint.previous_checkpoint_sequence,
+    signed_at: checkpoint.signed_at,
+  };
 }
