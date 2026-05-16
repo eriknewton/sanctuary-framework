@@ -334,17 +334,21 @@ export async function createSanctuaryServer(options?: {
         },
       },
       handler: async () => {
-        const degradations: string[] = [];
-
-        // L2 is self-reported in MVS
-        degradations.push(
-          "L2 isolation is process-level only; no TEE available"
-        );
-
-        // L3: Schnorr proofs + Pedersen commitments + range proofs are genuine ZK.
-        // No L3 degradation — selective disclosure is fully operational.
+        const { buildHealthEvidenceReport } = await import("./health/evidence.js");
+        const evidence = buildHealthEvidenceReport({
+          config,
+          identityCount: identityManager.list().length,
+          storageBackendName: storage.constructor.name,
+        });
 
         return toolResult({
+          sanctuary_version: evidence.sanctuary_version,
+          mcp_sdk_version: evidence.mcp_sdk_version,
+          castle_wall: evidence.castle_wall,
+          audit: evidence.audit,
+          state: evidence.state,
+          egress: evidence.egress,
+          layers: evidence.layers,
           attestation: {
             environment_type: config.execution.environment,
             hardware: {
@@ -355,23 +359,25 @@ export async function createSanctuaryServer(options?: {
             software: {
               os: `${process.platform}-${process.arch}`,
               runtime: `node-${process.version}`,
-              sanctuary_version: config.version,
-              mcp_sdk_version: "1.26.0",
+              sanctuary_version: evidence.sanctuary_version,
+              mcp_sdk_version: evidence.mcp_sdk_version,
             },
             network: {
-              internet_accessible: true, // Conservative assumption
+              internet_accessible: "unknown",
               listening_ports: [],
-              egress_restricted: false,
+              egress_restricted: evidence.egress.enforcement,
+              evidence: evidence.egress.evidence,
             },
             isolation_level: "process",
             sovereignty_assessment: {
               l1_state_encrypted: true,
-              l2_execution_isolated: false,
+              l1_status: evidence.layers.l1.status,
+              l2_execution_isolated: evidence.layers.l2.status,
               l2_isolation_type: "process-level",
               l3_proofs_available: true,
-              l4_reputation_active: true,
+              l4_reputation_status: evidence.layers.l4.status,
               overall_level: "mvs",
-              degradations,
+              degradations: evidence.degradations.map((d) => d.description),
             },
           },
           attested_at: new Date().toISOString(),
@@ -385,58 +391,29 @@ export async function createSanctuaryServer(options?: {
         "Sanctuary Health Report (SHR) — standardized sovereignty status.",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
+        const { buildHealthEvidenceReport } = await import("./health/evidence.js");
         const storageSizeBytes = await storage.totalSize();
-        const degradations: Array<{
-          layer: string;
-          description: string;
-          severity: string;
-          mitigation: string;
-        }> = [];
-
-        degradations.push({
-          layer: "l2",
-          description: "Process-level isolation only (no TEE)",
-          severity: "warning",
-          mitigation: "TEE support planned for a future release",
+        const evidence = buildHealthEvidenceReport({
+          config,
+          identityCount: identityManager.list().length,
+          storageBackendName: storage.constructor.name,
         });
 
-        // L3: No degradation. Schnorr + Pedersen + range proofs are genuine ZK.
-
         return toolResult({
-          status: degradations.some((d) => d.severity === "critical")
+          status: evidence.degradations.some((d) => d.severity === "critical")
             ? "compromised"
-            : degradations.some((d) => d.severity === "warning")
+            : evidence.degradations.some((d) => d.severity === "warning")
               ? "degraded"
               : "healthy",
+          sanctuary_version: evidence.sanctuary_version,
+          mcp_sdk_version: evidence.mcp_sdk_version,
+          castle_wall: evidence.castle_wall,
+          audit: evidence.audit,
+          state: evidence.state,
+          egress: evidence.egress,
           storage_bytes: storageSizeBytes,
-          layers: {
-            l1: {
-              status: "active",
-              encryption_algorithm: "aes-256-gcm",
-              key_count: identityManager.list().length,
-              state_integrity: "verified",
-              last_integrity_check: new Date().toISOString(),
-            },
-            l2: {
-              status: "degraded",
-              isolation_type: "process-level",
-              attestation_available: true,
-              last_attestation: new Date().toISOString(),
-            },
-            l3: {
-              status: "active",
-              proof_system: config.disclosure.proof_system,
-              circuits_loaded: 0,
-              proofs_generated_total: 0,
-            },
-            l4: {
-              status: "active",
-              mode: config.reputation.mode,
-              interaction_count: 0, // TODO: track from reputation store
-              reputation_exportable: true,
-            },
-          },
-          degradations,
+          layers: evidence.layers,
+          degradations: evidence.degradations,
           checked_at: new Date().toISOString(),
         });
       },
