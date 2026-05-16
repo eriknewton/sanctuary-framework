@@ -26,13 +26,11 @@ export function getMcpSdkVersion(): string {
 }
 
 export function packageVersion(pkg: unknown, source: string): string {
-  if (
-    pkg &&
-    typeof pkg === "object" &&
-    "version" in pkg &&
-    typeof (pkg as PackageJson).version === "string"
-  ) {
-    return (pkg as PackageJson).version;
+  if (pkg && typeof pkg === "object" && "version" in pkg) {
+    const value = (pkg as { version: unknown }).version;
+    if (typeof value === "string") {
+      return value;
+    }
   }
   return `unknown (${source} has no version)`;
 }
