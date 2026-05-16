@@ -45,6 +45,8 @@ The fix landed in Sigma-6 rewired `dashboard.test.ts` to use
 `bindWithRetry` (already established for `webhook.test.ts`) and
 added this regression gate so the pattern could not silently regress.
 
+On 2026-05-14, `test/integration/multi-instance-isolation.test.ts` saw the same port-allocation flake class on Node 22 and cleared on `gh run rerun --failed`.
+
 ## Patterns Sigma-7 caught
 
 Iteration-8's Omega-1 CI run hit a NEW EADDRINUSE flake on
