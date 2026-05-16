@@ -17,6 +17,7 @@
 import { describe, it, expect } from "vitest";
 import {
   AuditLog,
+  AuditPersistenceError,
   AuditLogPersistenceError,
   BROKER_OPS,
 } from "../../src/l2-operational/audit-log.js";
@@ -37,6 +38,30 @@ class FaultingWriteStorage extends MemoryStorage {
   async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
     if (namespace === "_audit") {
       throw new Error("audit disk unavailable");
+    }
+    return super.write(namespace, key, data);
+  }
+}
+
+class ClassifiedFailureStorage extends MemoryStorage {
+  constructor(private readonly code: string) {
+    super();
+  }
+
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    if (namespace === "_audit") {
+      const err = new Error(`simulated ${this.code}`) as NodeJS.ErrnoException;
+      err.code = this.code;
+      throw err;
+    }
+    return super.write(namespace, key, data);
+  }
+}
+
+class PartialWriteStorage extends MemoryStorage {
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    if (namespace === "_audit") {
+      return super.write(namespace, key, data.slice(0, Math.max(0, data.length - 1)));
     }
     return super.write(namespace, key, data);
   }
@@ -117,5 +142,84 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     await expect(log.flush()).resolves.toBeUndefined();
     const entries = await storage.list("_audit");
     expect(entries).toHaveLength(0);
+  });
+
+  it("appendCritical resolves only after the entry round-trips from storage", async () => {
+    const storage = new SlowMemoryStorage(40);
+    const log = new AuditLog(storage, generateRandomKey());
+    const started = Date.now();
+
+    await log.appendCritical({
+      layer: "l1",
+      operation: "state_write",
+      identity_id: "id",
+      result: "success",
+      details: { namespace: "memory", key: "k" },
+    });
+
+    expect(Date.now() - started).toBeGreaterThanOrEqual(35);
+    const entries = await storage.list("_audit");
+    expect(entries).toHaveLength(1);
+  });
+
+  it("appendCritical classifies storage-full failures", async () => {
+    const log = new AuditLog(new ClassifiedFailureStorage("ENOSPC"), generateRandomKey());
+
+    await expect(
+      log.appendCritical({
+        layer: "l1",
+        operation: "state_write",
+        identity_id: "id",
+        result: "success",
+      })
+    ).rejects.toMatchObject({
+      name: "AuditPersistenceError",
+      classification: "storage_full",
+    } satisfies Partial<AuditPersistenceError>);
+  });
+
+  it("appendCritical classifies fsync-style disk failures", async () => {
+    const log = new AuditLog(new ClassifiedFailureStorage("EIO"), generateRandomKey());
+
+    await expect(
+      log.appendCritical({
+        layer: "l1",
+        operation: "state_delete",
+        identity_id: "id",
+        result: "success",
+      })
+    ).rejects.toMatchObject({
+      name: "AuditPersistenceError",
+      classification: "disk_failure",
+    } satisfies Partial<AuditPersistenceError>);
+  });
+
+  it("appendCritical rejects partial writes", async () => {
+    const log = new AuditLog(new PartialWriteStorage(), generateRandomKey());
+
+    await expect(
+      log.appendCritical({
+        layer: "l1",
+        operation: "state_write",
+        identity_id: "id",
+        result: "success",
+      })
+    ).rejects.toMatchObject({
+      name: "AuditPersistenceError",
+      classification: "partial_write",
+    } satisfies Partial<AuditPersistenceError>);
+  });
+
+  it("telemetry-class append() failures do not block the caller", async () => {
+    const storage = new FaultingWriteStorage();
+    const log = new AuditLog(storage, generateRandomKey());
+
+    const callerResult = (() => {
+      log.append("l1", "state_read", "id", { namespace: "memory", key: "k" });
+      return "continued";
+    })();
+
+    expect(callerResult).toBe("continued");
+    await expect(log.flush()).rejects.toThrow(AuditLogPersistenceError);
   });
 });

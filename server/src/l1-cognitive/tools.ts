@@ -26,7 +26,7 @@ import {
 import type { StorageBackend } from "../storage/interface.js";
 import { encrypt, decrypt } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
 
 export const AUDIT_EVENT_SIGNING_DOMAIN = "sanctuary.audit.v1";
 export const INTERNAL_RECEIPT_SIGNING_DOMAIN = "sanctuary.receipt.v1";
@@ -74,11 +74,11 @@ export interface InternalIdentitySigningHelpers {
   audit_event_sign: (
     payload: AuditEventSigningPayload,
     options?: InternalSigningOptions
-  ) => InternalSigningResult;
+  ) => Promise<InternalSigningResult>;
   internal_receipt_sign: (
     payload: InternalReceiptSigningPayload,
     options?: InternalSigningOptions
-  ) => InternalSigningResult;
+  ) => Promise<InternalSigningResult>;
 }
 
 /**
@@ -477,12 +477,12 @@ export function createInternalIdentitySigningHelpers(
 ): InternalIdentitySigningHelpers {
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
 
-  function signTypedPayload(
+  async function signTypedPayload(
     operation: "audit_event_sign" | "internal_receipt_sign",
     domain: InternalSigningDomain,
     payload: Record<string, unknown>,
     identityId?: string
-  ): InternalSigningResult {
+  ): Promise<InternalSigningResult> {
     const identity = resolveInternalSigningIdentity(identityMgr, identityId);
     const signedPayload = domainSeparatedSigningBytes(domain, payload);
     const signature = identitySign(
@@ -491,7 +491,9 @@ export function createInternalIdentitySigningHelpers(
       identityEncKey
     );
 
-    auditLog?.append("l1", operation, identity.identity_id, { domain });
+    await recordCriticalAudit(auditLog, "l1", operation, identity.identity_id, {
+      domain,
+    });
 
     return {
       identity_id: identity.identity_id,
@@ -521,6 +523,24 @@ export function createInternalIdentitySigningHelpers(
         options.identity_id
       ),
   };
+}
+
+async function recordCriticalAudit(
+  auditLog: AuditLog | undefined,
+  layer: AuditEntry["layer"],
+  operation: string,
+  identityId: string,
+  details?: Record<string, unknown>,
+  result: AuditEntry["result"] = "success"
+): Promise<void> {
+  if (!auditLog) return;
+  await auditLog.appendCritical({
+    layer,
+    operation,
+    identity_id: identityId,
+    result,
+    details,
+  });
 }
 
 /**
@@ -585,11 +605,10 @@ export function createL1Tools(
           identityEncKey,
           keyProtection
         );
-        await identityMgr.save(storedIdentity);
-
-        auditLog?.append("l1", "identity_create", publicIdentity.identity_id, {
+        await recordCriticalAudit(auditLog, "l1", "identity_create", publicIdentity.identity_id, {
           label,
         });
+        await identityMgr.save(storedIdentity);
 
         // If key_protection is "none", generate and show recovery key
         // (In practice, the recovery key is the master key itself,
@@ -666,7 +685,7 @@ export function createL1Tools(
           identityEncKey
         );
 
-        auditLog?.append("l1", "identity_sign", identity.identity_id);
+        await recordCriticalAudit(auditLog, "l1", "identity_sign", identity.identity_id);
 
         return toolResult({
           signature: toBase64url(signature),
@@ -758,11 +777,10 @@ export function createL1Tools(
           identityEncKey,
           reason
         );
-        await identityMgr.save(updatedIdentity);
-
-        auditLog?.append("l1", "identity_rotate", identity.identity_id, {
+        await recordCriticalAudit(auditLog, "l1", "identity_rotate", identity.identity_id, {
           reason,
         });
+        await identityMgr.save(updatedIdentity);
 
         return toolResult({
           identity_id: updatedIdentity.identity_id,
@@ -801,16 +819,18 @@ export function createL1Tools(
           });
         }
 
+        const previousPrimary = identityMgr.getPrimaryIdentityId();
+
+        await recordCriticalAudit(auditLog, "l1", "identity_set_primary", identityId, {
+          previous_primary: previousPrimary,
+        });
+
         const success = await identityMgr.setPrimary(identityId);
         if (!success) {
           return toolResult({
             error: `Failed to set primary identity to "${identityId}".`,
           });
         }
-
-        auditLog?.append("l1", "identity_set_primary", identityId, {
-          previous_primary: identityMgr.getPrimaryIdentityId(),
-        });
 
         return toolResult({
           primary_identity_id: identityId,
@@ -870,6 +890,11 @@ export function createL1Tools(
           tags?: string[];
         } | undefined;
 
+        await recordCriticalAudit(auditLog, "l1", "state_write", identity.identity_id, {
+          namespace: args.namespace,
+          key: args.key,
+        });
+
         const result = await stateStore.write(
           args.namespace as string,
           args.key as string,
@@ -883,11 +908,6 @@ export function createL1Tools(
             tags: metadata?.tags,
           }
         );
-
-        auditLog?.append("l1", "state_write", identity.identity_id, {
-          namespace: args.namespace,
-          key: args.key,
-        });
 
         return toolResult(result);
       },
@@ -1001,16 +1021,16 @@ export function createL1Tools(
           });
         }
 
-        const result = await stateStore.delete(
-          args.namespace as string,
-          args.key as string
-        );
-
-        auditLog?.append("l1", "state_delete", "principal", {
+        await recordCriticalAudit(auditLog, "l1", "state_delete", "principal", {
           namespace: args.namespace,
           key: args.key,
           reason: args.reason,
         });
+
+        const result = await stateStore.delete(
+          args.namespace as string,
+          args.key as string
+        );
 
         return toolResult(result);
       },
@@ -1032,7 +1052,7 @@ export function createL1Tools(
           args.namespace as string | undefined
         );
 
-        auditLog?.append("l1", "state_export", "principal", {
+        await recordCriticalAudit(auditLog, "l1", "state_export", "principal", {
           namespaces: result.namespaces,
         });
 
@@ -1063,16 +1083,18 @@ export function createL1Tools(
           return fromBase64url(identity.public_key);
         };
 
+        await recordCriticalAudit(auditLog, "l1", "state_import", "principal", {
+          conflict_resolution:
+            (args.conflict_resolution as "skip" | "overwrite" | "version") ??
+            "skip",
+        });
+
         const result = await stateStore.import(
           args.bundle as string,
           (args.conflict_resolution as "skip" | "overwrite" | "version") ??
             "skip",
           publicKeyResolver
         );
-
-        auditLog?.append("l1", "state_import", "principal", {
-          imported_keys: result.imported_keys,
-        });
 
         return toolResult(result);
       },
