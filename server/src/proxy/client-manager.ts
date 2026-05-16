@@ -37,6 +37,7 @@ export interface UpstreamConnection {
   error?: string;
   retryCount: number;
   retryTimer?: ReturnType<typeof setTimeout>;
+  manualClose?: boolean;
 }
 
 /** Callback for state changes */
@@ -46,6 +47,27 @@ export type ConnectionStateCallback = (
   toolCount: number,
   error?: string
 ) => void;
+
+export type ToolListChangedCallback = (
+  serverName: string,
+  tools: UpstreamTool[],
+  state: ConnectionState
+) => void;
+
+export class UpstreamUnavailableError extends Error {
+  readonly code = "upstream_unavailable";
+  readonly serverName: string;
+  readonly toolName?: string;
+  readonly state?: ConnectionState;
+
+  constructor(serverName: string, message: string, options?: { toolName?: string; state?: ConnectionState }) {
+    super(message);
+    this.name = "UpstreamUnavailableError";
+    this.serverName = serverName;
+    this.toolName = options?.toolName;
+    this.state = options?.state;
+  }
+}
 
 export interface ProxyAuditLog {
   appendCritical(entry: AuditEntryInput): Promise<void>;
@@ -117,11 +139,17 @@ export function buildUpstreamStdioEnv(
 export class ClientManager {
   private connections: Map<string, UpstreamConnection> = new Map();
   private onStateChange?: ConnectionStateCallback;
+  private onToolListChanged?: ToolListChangedCallback;
   private auditLog?: ProxyAuditLog;
   private shutdownRequested = false;
 
-  constructor(options?: { onStateChange?: ConnectionStateCallback; auditLog?: ProxyAuditLog }) {
+  constructor(options?: {
+    onStateChange?: ConnectionStateCallback;
+    onToolListChanged?: ToolListChangedCallback;
+    auditLog?: ProxyAuditLog;
+  }) {
     this.onStateChange = options?.onStateChange;
+    this.onToolListChanged = options?.onToolListChanged;
     this.auditLog = options?.auditLog;
   }
 
@@ -205,7 +233,7 @@ export class ClientManager {
       name: conn.server.name,
       state: conn.state,
       transport_type: conn.server.transport.type,
-      tool_count: conn.tools.length,
+      tool_count: conn.state === "connected" ? conn.tools.length : 0,
       error: conn.error,
     }));
   }
@@ -227,10 +255,25 @@ export class ClientManager {
   ): Promise<{ content: Array<{ type: string; text?: string; [key: string]: unknown }> }> {
     const conn = this.connections.get(serverName);
     if (!conn) {
-      throw new Error(`Upstream server "${serverName}" is not configured`);
+      throw new UpstreamUnavailableError(
+        serverName,
+        `Upstream server "${serverName}" is not configured`,
+        { toolName }
+      );
     }
     if (conn.state !== "connected" || !conn.client) {
-      throw new Error(`Upstream server "${serverName}" is not connected (state: ${conn.state})`);
+      throw new UpstreamUnavailableError(
+        serverName,
+        `Upstream server "${serverName}" is not connected (state: ${conn.state})`,
+        { toolName, state: conn.state }
+      );
+    }
+    if (!conn.tools.some((tool) => tool.name === toolName)) {
+      throw new UpstreamUnavailableError(
+        serverName,
+        `Upstream tool "${toolName}" is not currently available on "${serverName}"`,
+        { toolName, state: conn.state }
+      );
     }
 
     const result = await conn.client.callTool({
@@ -356,6 +399,12 @@ export class ClientManager {
 
       // Connect
       await client.connect(transport);
+      client.onclose = () => {
+        this.handleConnectionClosed(conn);
+      };
+      client.onerror = (error) => {
+        conn.error = error.message;
+      };
 
       conn.client = client;
       conn.transport = transport;
@@ -373,7 +422,12 @@ export class ClientManager {
       conn.error = message;
       conn.client = null;
       conn.transport = null;
+      const hadTools = conn.tools.length > 0;
+      conn.tools = [];
       this.notifyStateChange(conn);
+      if (hadTools) {
+        this.notifyToolListChanged(conn);
+      }
 
       // Schedule retry if not at max
       this.scheduleRetry(conn);
@@ -385,6 +439,7 @@ export class ClientManager {
    */
   private async discoverTools(conn: UpstreamConnection): Promise<void> {
     if (!conn.client || conn.state !== "connected") return;
+    const previous = toolsFingerprint(conn.tools);
 
     try {
       const result = await conn.client.listTools();
@@ -396,6 +451,9 @@ export class ClientManager {
     } catch {
       // Tool discovery failed — server is connected but no tools available
       conn.tools = [];
+    }
+    if (toolsFingerprint(conn.tools) !== previous) {
+      this.notifyToolListChanged(conn);
     }
   }
 
@@ -431,6 +489,7 @@ export class ClientManager {
   private async disconnectServer(name: string): Promise<void> {
     const conn = this.connections.get(name);
     if (!conn) return;
+    conn.manualClose = true;
 
     // Cancel any pending retry
     if (conn.retryTimer) {
@@ -457,6 +516,7 @@ export class ClientManager {
     }
 
     this.connections.delete(name);
+    this.notifyToolListChanged(conn);
   }
 
   /**
@@ -465,10 +525,49 @@ export class ClientManager {
   private notifyStateChange(conn: UpstreamConnection): void {
     if (this.onStateChange) {
       try {
-        this.onStateChange(conn.server.name, conn.state, conn.tools.length, conn.error);
+        const toolCount = conn.state === "connected" ? conn.tools.length : 0;
+        this.onStateChange(conn.server.name, conn.state, toolCount, conn.error);
       } catch {
         // Listener errors must not propagate
       }
     }
   }
+
+  private notifyToolListChanged(conn: UpstreamConnection): void {
+    if (this.onToolListChanged) {
+      try {
+        this.onToolListChanged(
+          conn.server.name,
+          conn.state === "connected" ? conn.tools : [],
+          conn.state
+        );
+      } catch {
+        // Listener errors must not propagate
+      }
+    }
+  }
+
+  private handleConnectionClosed(conn: UpstreamConnection): void {
+    if (this.shutdownRequested || conn.manualClose) return;
+    if (this.connections.get(conn.server.name) !== conn) return;
+
+    conn.state = "disconnected";
+    conn.client = null;
+    conn.transport = null;
+    conn.error = "Upstream connection closed";
+    const hadTools = conn.tools.length > 0;
+    conn.tools = [];
+    this.notifyStateChange(conn);
+    if (hadTools) {
+      this.notifyToolListChanged(conn);
+    }
+    this.scheduleRetry(conn);
+  }
+}
+
+function toolsFingerprint(tools: UpstreamTool[]): string {
+  return tools
+    .map((tool) => `${tool.name}\u0000${JSON.stringify(tool.inputSchema)}`)
+    .sort()
+    .join("\u0001");
 }

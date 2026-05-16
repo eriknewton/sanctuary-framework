@@ -404,14 +404,18 @@ describe("ProxyRouter", () => {
         { path: "/test.txt" }
       );
       expect(result.content[0]!.text).toBe("result");
-      expect(mockAuditLog.append).toHaveBeenCalledWith(
-        "l2",
-        "proxy_call:proxy/test-server/read_file",
-        "system",
+      expect(mockAuditLog.appendCritical).toHaveBeenCalledWith(
         expect.objectContaining({
-          decision: "allowed",
-          server: "test-server",
-          tool: "read_file",
+          layer: "l2",
+          operation: "proxy_call:proxy/test-server/read_file",
+          identity_id: "system",
+          result: "success",
+          details: expect.objectContaining({
+            decision: "allowed",
+            event_type: "proxy.call",
+            server: "test-server",
+            tool: "read_file",
+          }),
         })
       );
     });
@@ -453,12 +457,18 @@ describe("ProxyRouter", () => {
       expect(parsed.proxy).toBe(true);
       expect(parsed.server).toBe("test-server");
 
-      expect(mockAuditLog.append).toHaveBeenCalledWith(
-        "l2",
-        expect.stringContaining("proxy_call:"),
-        "system",
-        expect.objectContaining({ decision: "error", error: "Connection refused" }),
-        "failure"
+      expect(mockAuditLog.appendCritical).toHaveBeenCalledWith(
+        expect.objectContaining({
+          layer: "l2",
+          operation: expect.stringContaining("proxy_call:"),
+          identity_id: "system",
+          result: "failure",
+          details: expect.objectContaining({
+            decision: "error",
+            error: "Connection refused",
+            event_type: "proxy.call",
+          }),
+        })
       );
     });
 

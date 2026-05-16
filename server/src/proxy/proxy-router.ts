@@ -18,6 +18,7 @@
 import type { ToolDefinition, ToolHandler } from "../router.js";
 import { toolResult } from "../router.js";
 import type { ClientManager } from "./client-manager.js";
+import { UpstreamUnavailableError } from "./client-manager.js";
 import type { InjectionDetector } from "../security/injection-detector.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 import type { CallGovernor } from "../l2-operational/call-governor.js";
@@ -333,12 +334,19 @@ export class ProxyRouter {
         }
 
         // Step 6: Audit log the successful call
-        this.auditLog.append("l2", `proxy_call:${proxyName}`, "system", {
-          server: serverName,
-          tool: toolName,
-          tier,
-          decision: "allowed",
-          latency_ms: latencyMs,
+        await this.auditLog.appendCritical({
+          layer: "l2",
+          operation: `proxy_call:${proxyName}`,
+          identity_id: "system",
+          result: "success",
+          details: {
+            event_type: "proxy.call",
+            server: serverName,
+            tool: toolName,
+            tier,
+            decision: "allowed",
+            latency_ms: latencyMs,
+          },
         });
 
         this.notifyProxyCall(proxyName, serverName, "allowed", undefined, tier);
@@ -374,6 +382,7 @@ export class ProxyRouter {
       } catch (err) {
         const latencyMs = Date.now() - start;
         const rawErrorMessage = err instanceof Error ? err.message : "Unknown upstream error";
+        const upstreamUnavailable = err instanceof UpstreamUnavailableError;
 
         // SEC-050: Sanitize upstream error messages to prevent info disclosure
         const sanitizeError = (msg: string): string => {
@@ -388,15 +397,26 @@ export class ProxyRouter {
 
         const errorMessage = sanitizeError(rawErrorMessage);
 
-        // Audit log the failure
-        this.auditLog.append("l2", `proxy_call:${proxyName}`, "system", {
-          server: serverName,
-          tool: toolName,
-          tier,
-          decision: "error",
-          error: errorMessage,
-          latency_ms: latencyMs,
-        }, "failure");
+        try {
+          await this.auditLog.appendCritical({
+            layer: "l2",
+            operation: `proxy_call:${proxyName}`,
+            identity_id: "system",
+            result: "failure",
+            details: {
+              event_type: "proxy.call",
+              server: serverName,
+              tool: toolName,
+              tier,
+              decision: "error",
+              error: errorMessage,
+              error_type: upstreamUnavailable ? "UpstreamUnavailableError" : "upstream_error",
+              latency_ms: latencyMs,
+            },
+          });
+        } catch {
+          // Fail closed: never forward or retry after critical audit failure.
+        }
 
         this.notifyProxyCall(proxyName, serverName, "error", errorMessage, tier);
 
@@ -406,6 +426,7 @@ export class ProxyRouter {
             type: "text" as const,
             text: JSON.stringify({
               error: errorMessage,
+              code: upstreamUnavailable ? "upstream_unavailable" : "upstream_error",
               proxy: true,
               server: serverName,
               tool: toolName,

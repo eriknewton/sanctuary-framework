@@ -83,6 +83,10 @@ import { createSovereigntyProfileTools } from "./sovereignty-profile-tools.js";
 import { InjectionDetector } from "./security/injection-detector.js";
 import { ClientManager } from "./proxy/client-manager.js";
 import { ProxyRouter } from "./proxy/proxy-router.js";
+import {
+  DynamicProxyToolRegistry,
+  enableToolListChangedNotifications,
+} from "./proxy/dynamic-proxy.js";
 import { CallGovernor } from "./l2-operational/call-governor.js";
 import { createGovernorTools } from "./l2-operational/governor-tools.js";
 import { createSanctuaryTools } from "./sanctuary-tools.js";
@@ -1155,6 +1159,8 @@ export async function createSanctuaryServer(options?: {
   // 17a. Initialize proxy layer for upstream MCP servers (if configured)
   let clientManager: ClientManager | undefined;
   let proxyRouter: ProxyRouter | undefined;
+  let refreshProxyTools: (() => void) | undefined;
+  let notifyProxyToolListChanged: (() => Promise<void>) | undefined;
   const governor = new CallGovernor();
 
   // 17a. Create governor tools
@@ -1183,6 +1189,9 @@ export async function createSanctuaryServer(options?: {
             tool_count: toolCount,
             error,
           });
+        },
+        onToolListChanged: () => {
+          refreshProxyTools?.();
         },
       });
 
@@ -1216,16 +1225,6 @@ export async function createSanctuaryServer(options?: {
         console.error(`[Sanctuary] Failed to configure upstream servers: ${err instanceof Error ? err.message : "unknown error"}`);
       });
 
-      // Wait briefly for initial connections to establish, then discover tools
-      // Use a short delay to allow connections to complete before tool registration
-      await new Promise(resolve => setTimeout(resolve, 2000));
-
-      // Register discovered upstream tools as proxy/* tools
-      const proxiedTools = proxyRouter.getProxiedTools();
-      if (proxiedTools.length > 0) {
-        allTools.push(...proxiedTools);
-      }
-
       // Wire client manager to dashboard for SSE status updates
       if (dashboard) {
         dashboard.setDependencies({
@@ -1246,6 +1245,21 @@ export async function createSanctuaryServer(options?: {
     handler: contextGateEnforcer.wrapHandler(tool.name, tool.handler),
   }));
 
+  let dynamicProxyRegistry: DynamicProxyToolRegistry | undefined;
+  if (proxyRouter) {
+    dynamicProxyRegistry = new DynamicProxyToolRegistry({
+      tools: allTools,
+      proxyRouter,
+      notifyListChanged: async () => {
+        await notifyProxyToolListChanged?.();
+      },
+    });
+    refreshProxyTools = () => {
+      dynamicProxyRegistry?.refresh();
+    };
+    refreshProxyTools();
+  }
+
   // 18. Wire proxy tier resolver into the approval gate
   if (proxyRouter) {
     gate.setProxyTierResolver((toolName: string) => {
@@ -1261,6 +1275,12 @@ export async function createSanctuaryServer(options?: {
     toolCallTrapRuntime,
     currentAgentId: () => process.env.SANCTUARY_AGENT_ID,
   });
+  if (proxyRouter) {
+    enableToolListChangedNotifications(server);
+    notifyProxyToolListChanged = async () => {
+      await server.sendToolListChanged();
+    };
+  }
 
   // 20. Save config if this is first run
   await saveConfig(config);
