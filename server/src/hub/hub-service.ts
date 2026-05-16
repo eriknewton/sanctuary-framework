@@ -69,6 +69,22 @@ import type {
   ListThreadsOptions,
   ReadThreadOptions,
 } from "../chat/concierge-memory-store.js";
+import {
+  TaskNotFoundError,
+  TaskService,
+  TaskStateTransitionError,
+  TaskValidationError,
+  type AssignTaskInput,
+  type CancelTaskInput,
+  type CreateTaskInput,
+  type ListTasksFilter,
+  type Task,
+  type UpdateTaskStatusInput,
+} from "../l2-operational/task-coordination/index.js";
+
+type HubServiceTaskDeps = HubServiceDeps & {
+  taskService?: TaskService;
+};
 
 function isTier1ControlAction(
   action: HubAgentControlAction,
@@ -110,10 +126,12 @@ function snapshotForRecord(
 export class HubService {
   private deps: HubServiceDeps;
   private inboxStore: HubInboxStore;
+  private taskService?: TaskService;
 
-  constructor(deps: HubServiceDeps) {
+  constructor(deps: HubServiceTaskDeps) {
     this.deps = deps;
     this.inboxStore = new HubInboxStore();
+    this.taskService = deps.taskService;
   }
 
   // ── Internal helpers ────────────────────────────────────────────────
@@ -150,6 +168,105 @@ export class HubService {
     // Tier 1 hub-enqueued items already live in the store regardless.
     aggregateInbox(this.deps.inboxSources, this.inboxStore);
     return this.inboxStore.resolve(itemId, action, this.nowIso());
+  }
+
+  // ── Tasks ──────────────────────────────────────────────────────────
+
+  setTaskService(taskService: TaskService): void {
+    this.taskService = taskService;
+  }
+
+  async createTask(input: CreateTaskInput): Promise<Task> {
+    return this.withTaskErrors(() => this.requireTaskService().create(input));
+  }
+
+  async listTasks(filter?: ListTasksFilter): Promise<Task[]> {
+    return this.withTaskErrors(() => this.requireTaskService().list(filter));
+  }
+
+  async getTask(taskId: string): Promise<Task> {
+    return this.withTaskErrors(() => this.requireTaskService().get(taskId));
+  }
+
+  async updateTaskStatus(
+    taskId: string,
+    input: UpdateTaskStatusInput,
+  ): Promise<Task> {
+    return this.withTaskErrors(() =>
+      this.requireTaskService().updateStatus(taskId, input),
+    );
+  }
+
+  async assignTask(taskId: string, input: AssignTaskInput): Promise<Task> {
+    return this.withTaskErrors(() =>
+      this.requireTaskService().assign(taskId, input),
+    );
+  }
+
+  async cancelTask(taskId: string, input: CancelTaskInput): Promise<Task> {
+    return this.withTaskErrors(() =>
+      this.requireTaskService().cancel(taskId, input),
+    );
+  }
+
+  enqueueTaskReviewApproval(task: Task, actor: string): string {
+    const itemId = `task.review.${task.id}.${randomUUID()}`;
+    const item: HubApprovalPendingItem = {
+      version: "1.1",
+      item_id: itemId,
+      kind: "approval_pending",
+      created_at: this.nowIso(),
+      identity_id: this.deps.identityId,
+      ...(task.assignee ? { agent_id: task.assignee } : {}),
+      display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.approval_pending}.task.ready_for_review`,
+      display_template_args: [
+        { kind: "identity_id", value: this.deps.identityId },
+        { kind: "tier", value: "tier2" },
+        ...(task.assignee
+          ? [{ kind: "agent_id" as const, value: task.assignee }]
+          : []),
+      ],
+      resolved: false,
+      tier: "tier2",
+      operation_category: "other",
+    };
+
+    this.inboxStore.enqueueTier1(item, async () => {
+      this.deps.activitySources.auditLog.append(
+        "l2",
+        "task.review_approval_resolved",
+        this.deps.identityId,
+        {
+          task_id: task.id,
+          actor,
+        },
+      );
+    });
+    return itemId;
+  }
+
+  private requireTaskService(): TaskService {
+    if (!this.taskService) {
+      throw new HubCapabilityError("task_service_not_configured");
+    }
+    return this.taskService;
+  }
+
+  private async withTaskErrors<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err instanceof TaskNotFoundError) {
+        throw new HubNotFoundError(err.message);
+      }
+      if (err instanceof TaskStateTransitionError) {
+        throw new HubConflictError(err.message);
+      }
+      if (err instanceof TaskValidationError) {
+        throw new HubValidationError(err.message);
+      }
+      throw err;
+    }
   }
 
   // ── Agents ──────────────────────────────────────────────────────────
