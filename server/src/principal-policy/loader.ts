@@ -49,6 +49,8 @@ const DEFAULT_APPROVAL_REDIRECT: ApprovalRedirectConfig = {
   mode: "replace",
 };
 
+const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
+
 /** Default Principal Policy — provides meaningful protection without configuration */
 export const DEFAULT_POLICY: PrincipalPolicy = {
   version: 1,
@@ -56,6 +58,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "state_export",
     "state_import",
     "state_delete",
+    "identity_sign", // Raw arbitrary commitments require explicit operator approval.
     "identity_rotate",
     "reputation_import",
     "reputation_export",
@@ -89,7 +92,6 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "state_list",
     "identity_create",
     "identity_list",
-    "identity_sign",
     "identity_verify",
     "proof_commitment",
     "proof_reveal",
@@ -274,11 +276,18 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
   const userTier3 = (raw.tier3_always_allow as string[]) ?? [];
   const mergedTier3 = [
     ...new Set([...userTier3, ...DEFAULT_POLICY.tier3_always_allow]),
+  ].filter((op) => op !== RAW_IDENTITY_SIGN_OPERATION);
+
+  const mergedTier1 = [
+    ...new Set([
+      ...(raw.tier1_always_approve as string[]),
+      RAW_IDENTITY_SIGN_OPERATION,
+    ]),
   ];
 
   return {
     version: (raw.version as number) ?? 1,
-    tier1_always_approve: raw.tier1_always_approve as string[],
+    tier1_always_approve: mergedTier1,
     tier2_anomaly: {
       ...DEFAULT_TIER2,
       ...((raw.tier2_anomaly as Record<string, unknown>) ?? {}),
@@ -356,6 +365,7 @@ tier1_always_approve:
   - state_export
   - state_import
   - state_delete
+  - identity_sign
   - identity_rotate
   - reputation_import
   - reputation_export
@@ -391,7 +401,6 @@ tier3_always_allow:
   - state_list
   - identity_create
   - identity_list
-  - identity_sign
   - identity_verify
   - proof_commitment
   - proof_reveal

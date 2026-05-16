@@ -34,6 +34,7 @@ tier2_anomaly:
 tier3_always_allow:
   - state_read
   - state_write
+  - identity_sign
 approval_channel:
   type: stderr
   timeout_seconds: 120
@@ -42,7 +43,11 @@ approval_channel:
       const policy = parsePolicy(yaml);
 
       expect(policy.version).toBe(1);
-      expect(policy.tier1_always_approve).toEqual(["state_export", "identity_rotate"]);
+      expect(policy.tier1_always_approve).toEqual([
+        "state_export",
+        "identity_rotate",
+        "identity_sign",
+      ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("approve");
       expect(policy.tier2_anomaly.new_counterparty).toBe("log");
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(3);
@@ -51,6 +56,7 @@ approval_channel:
       // User's tier3 entries are preserved, and defaults are merged in
       expect(policy.tier3_always_allow).toContain("state_read");
       expect(policy.tier3_always_allow).toContain("state_write");
+      expect(policy.tier3_always_allow).not.toContain("identity_sign");
       // Defaults merged from DEFAULT_POLICY (upgrade-safe)
       expect(policy.tier3_always_allow).toContain("sovereignty_audit");
       expect(policy.tier3_always_allow).toContain("shr_generate");
@@ -72,7 +78,11 @@ approval_channel:
 `;
       const policy = parsePolicy(yaml);
       expect(policy.version).toBe(1);
-      expect(policy.tier1_always_approve).toEqual(["state_export", "identity_rotate"]);
+      expect(policy.tier1_always_approve).toEqual([
+        "state_export",
+        "identity_rotate",
+        "identity_sign",
+      ]);
     });
 
     it("fills optional fields with defaults when required keys present", () => {
@@ -86,7 +96,10 @@ approval_channel:
       const policy = parsePolicy(yaml);
 
       expect(policy.version).toBe(2);
-      expect(policy.tier1_always_approve).toEqual(["state_export"]);
+      expect(policy.tier1_always_approve).toEqual([
+        "state_export",
+        "identity_sign",
+      ]);
       // Tier 2 should have defaults
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(5);
       expect(policy.tier2_anomaly.max_signs_per_minute).toBe(10);
@@ -113,7 +126,10 @@ approval_channel:
       const policy = parsePolicy(json);
 
       expect(policy.version).toBe(1);
-      expect(policy.tier1_always_approve).toEqual(["state_export"]);
+      expect(policy.tier1_always_approve).toEqual([
+        "state_export",
+        "identity_sign",
+      ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("log");
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(8);
       // Defaults filled in
@@ -134,8 +150,13 @@ approval_channel:
     it("has standard tier 3 operations", () => {
       expect(DEFAULT_POLICY.tier3_always_allow).toContain("state_read");
       expect(DEFAULT_POLICY.tier3_always_allow).toContain("state_write");
-      expect(DEFAULT_POLICY.tier3_always_allow).toContain("identity_sign");
       expect(DEFAULT_POLICY.tier3_always_allow).toContain("monitor_health");
+      expect(DEFAULT_POLICY.tier3_always_allow).toContain("identity_verify");
+      expect(DEFAULT_POLICY.tier3_always_allow).not.toContain("identity_sign");
+    });
+
+    it("classifies raw identity_sign as Tier 1", () => {
+      expect(DEFAULT_POLICY.tier1_always_approve).toContain("identity_sign");
     });
 
     it("does not include auto_deny (SEC-002: hardcoded deny)", () => {
