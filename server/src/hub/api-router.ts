@@ -372,6 +372,30 @@ export async function handleHubRoute(
       return true;
     }
 
+    // ── POST /api/hub/concierge/ask ────────────────────────────────
+    if (method === "POST" && path === `${HUB_API_PREFIX}/concierge/ask`) {
+      const body = await readJSONBody<{
+        question?: unknown;
+        stream?: unknown;
+        includePayloads?: unknown;
+      }>(req);
+      const question = checkChatMessage(body.question);
+      const response = await deps.service.askConcierge({
+        question,
+        stream: body.stream === true,
+        includePayloads: body.includePayloads === true,
+      });
+      writeJSON(res, 200, { ok: true, data: { response } });
+      return true;
+    }
+
+    // ── GET /api/hub/concierge/status ──────────────────────────────
+    if (method === "GET" && path === `${HUB_API_PREFIX}/concierge/status`) {
+      const status = await deps.service.getConciergeStatus();
+      writeJSON(res, 200, { ok: true, data: { status } });
+      return true;
+    }
+
     // ── /api/hub/tasks/:id and /api/hub/tasks/:id/<action> ──────────
     const taskMatch = matchTaskRoute(path);
     if (taskMatch) {

@@ -64,6 +64,12 @@ import type {
   OperatorChatMessage,
 } from "../chat/operator-chat-types.js";
 import type {
+  ConciergeAskRequest,
+  ConciergeAskResponse,
+  ConciergeService,
+  ConciergeStatus,
+} from "../concierge/index.js";
+import type {
   ConciergeThreadSummary,
   ConciergeTurn,
   ListThreadsOptions,
@@ -127,11 +133,13 @@ export class HubService {
   private deps: HubServiceDeps;
   private inboxStore: HubInboxStore;
   private taskService?: TaskService;
+  private concierge?: ConciergeService;
 
   constructor(deps: HubServiceTaskDeps) {
     this.deps = deps;
     this.inboxStore = new HubInboxStore();
     this.taskService = deps.taskService;
+    this.concierge = deps.concierge;
   }
 
   // ── Internal helpers ────────────────────────────────────────────────
@@ -267,6 +275,26 @@ export class HubService {
       }
       throw err;
     }
+  }
+
+  // ── Concierge ─────────────────────────────────────────────────────
+
+  setConciergeService(concierge: ConciergeService): void {
+    this.concierge = concierge;
+  }
+
+  async askConcierge(input: ConciergeAskRequest): Promise<ConciergeAskResponse> {
+    if (!this.concierge) {
+      throw new HubCapabilityError("concierge_service_not_configured");
+    }
+    return this.concierge.ask(input);
+  }
+
+  async getConciergeStatus(): Promise<ConciergeStatus> {
+    if (!this.concierge) {
+      throw new HubCapabilityError("concierge_service_not_configured");
+    }
+    return this.concierge.status();
   }
 
   // ── Agents ──────────────────────────────────────────────────────────
