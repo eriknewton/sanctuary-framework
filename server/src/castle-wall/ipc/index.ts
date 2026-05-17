@@ -26,4 +26,4 @@ export type {
 } from "./messages.js";
 
 export type { ParseStep } from "./framing.js";
-export { frame, parseFrame, parseSingleFrame } from "./framing.js";
+export { frame, parseFrame, parseSingleFrame, MAX_FRAME_BYTES } from "./framing.js";
