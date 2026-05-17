@@ -734,6 +734,7 @@ export async function runWrap(
   // success banner. Updated below when the substrate selector loads.
   let intelligenceHealthy: boolean | undefined;
   let intelligenceError: string | undefined;
+  let wrapAuditLog: AuditLog | undefined;
 
   // Start the dashboard in-process.
   const authToken = generateAuthToken();
@@ -805,7 +806,7 @@ export async function runWrap(
           stringToBytes(JSON.stringify(derived.params)),
         );
       }
-      const wrapAuditLog = new AuditLog(v11Storage, derived.key);
+      wrapAuditLog = new AuditLog(v11Storage, derived.key);
 
       // v1.2.1 (Finding NNN): auto-create default identity at wrap time.
       try {
@@ -935,6 +936,10 @@ export async function runWrap(
     } catch {
       /* best-effort — user can still copy the URL */
     }
+  }
+
+  if (wrapAuditLog) {
+    await wrapAuditLog.flush();
   }
 
   printWrapSuccess({
