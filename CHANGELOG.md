@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.0-rc.2] - 2026-05-17
+
+Second opt-in preview on npm `next`. Default `npm install` continues pulling v1.2.17 on `latest`. The substrate trust surface is materially tighter than rc.1: 4 ASSURANCE_MATRIX rows promoted or strengthened across the 2026-05-16 cascade (8 PRs merged to main).
+
+### Castle Wall
+
+No functional change since rc.1. Phase 1 Linux and macOS enforcement surfaces remain the production baseline.
+
+### Charter (cooperative MCP, substrate trust path)
+
+- **Audit chain: external standalone verifier shipped.** `audit-chain-verify.ts` imports only `@noble/curves`, `@noble/hashes`, and Node `fs`. External verification no longer depends on server runtime. PR #290.
+- **State envelope: migration drill across legacy + schema-2 + rollback paths.** Representative legacy entries auto-migrate on first verified read when local writer identity is available. PR #296.
+- **Query anonymity: provider-matrix privacy drill (84 cases) promotes the row to proven.** Next-proof-needed reduced to drill-on-add discipline. PR #291.
+- **Identity signing: tool-registry raw-signing guard prevents regression on the Tier 1 `identity_sign` surface.** PR #292.
+- **parseFrame: MAX_FRAME_BYTES cap closes a DoS surface; ParseStep API tightened.** PR #289.
+- **Subscriber: pre-handshake gating closes a registration-window race.** PR #293.
+- **Finding RRR: identity-overwrite guard prevents principal-id displacement on concurrent registration.** PR #294.
+
+### Mantle
+
+Phase 2 docs sweep landed (vocabulary and architecture refs). Phase 3 archive markers still pending, tracked separately.
+
+### Heralds
+
+No change. Concordia v0.5.1 on PyPI; v0.6 predicate primitive on Concordia main. v0.6.0 PyPI cut tracked separately.
+
+### Infrastructure and hygiene
+
+- wrap-cli `_audit` ENOTEMPTY cleanup race closed.
+- Linux baseline-guard pre-existing failure resolved as side-effect.
+- Test baseline bumped 4641 to 4760 post-cascade.
+
+### Notes
+
+This is an opt-in preview, not the v1.3.0 GA cut. v1.3.0 GA remains gated on a 2-week RC soak with no critical findings. npm publish for this RC must use `--tag next`.
+
 ## [1.3.0-rc.1] - 2026-05-13
 
 Preview release for the Castle Architecture stack. This RC moves the v1.3 line onto the npm `next` channel while keeping npm `latest` on the v1.2 stable line. Operators can install the preview with `npm install @sanctuary-framework/mcp-server@next`; default installs continue to resolve to the latest v1.2.x stable.
