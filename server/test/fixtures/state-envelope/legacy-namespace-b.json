@@ -1,0 +1,7 @@
+{
+  "fixture": "legacy-namespace-b",
+  "schema": 1,
+  "namespace": "reputation-bundle",
+  "key": "score",
+  "value": "legacy reputation value"
+}

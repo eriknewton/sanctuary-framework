@@ -1,0 +1,7 @@
+{
+  "fixture": "schema2-namespace-a",
+  "schema": 2,
+  "namespace": "agent-state",
+  "key": "schema2-profile",
+  "value": "schema2 agent-state value"
+}

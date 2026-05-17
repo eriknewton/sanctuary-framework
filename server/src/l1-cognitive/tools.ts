@@ -1145,10 +1145,22 @@ export function createL1Tools(
           );
         } catch (error) {
           if (error instanceof StateVerificationError) {
+            await recordCriticalAudit(
+              auditLog,
+              "l1",
+              "state_read_verification_failed",
+              "state-store",
+              {
+                namespace: args.namespace,
+                key: args.key,
+                classification: error.classification,
+              },
+              "failure"
+            );
             return toolResult({
               error: "state_verification_failed",
               classification: error.classification,
-              message: error.message,
+              message: "State verification failed.",
               namespace: args.namespace,
               key: args.key,
             });

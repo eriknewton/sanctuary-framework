@@ -1,0 +1,7 @@
+{
+  "fixture": "schema2-namespace-b",
+  "schema": 2,
+  "namespace": "reputation-bundle",
+  "key": "schema2-score",
+  "value": "schema2 reputation value"
+}

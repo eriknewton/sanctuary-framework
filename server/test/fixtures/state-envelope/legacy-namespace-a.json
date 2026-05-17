@@ -1,0 +1,7 @@
+{
+  "fixture": "legacy-namespace-a",
+  "schema": 1,
+  "namespace": "agent-state",
+  "key": "profile",
+  "value": "legacy agent-state value"
+}
