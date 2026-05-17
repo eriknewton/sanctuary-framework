@@ -77,7 +77,7 @@ These derivations bypass the high-level helpers because they need a salt other t
 | `fortress_id` | `sanctuary-fed-v0.1-transport` `\|\| node_id \|\| node_mode` | `server/src/mesh/trust-root.ts:362` | Per-node transport subkey for federation v0.1. |
 | `fortress_id` | `sanctuary-fed-v0.1-audit-chain` `\|\| node_id` | `server/src/mesh/trust-root.ts:388` | Per-node audit-chain subkey for federation v0.1. |
 | `fortress_id` | `sanctuary-fed-v0.1-lifecycle-agent-state-transfer` | `server/src/mesh/lifecycle/sync.ts:122` | Sync-envelope encryption for agent-state transfer between mesh nodes. |
-| `fortress_id` | `sanctuary-fed-v0.1-lifecycle-node-key-wrap` | `server/src/mesh/lifecycle/cocoon-binding.ts:56` | AES-256-GCM wrap of per-node Ed25519 keys (cocoon-binding). |
+| `fortress_id` | `sanctuary-fed-v0.1-lifecycle-node-key-wrap` | `server/src/mesh/lifecycle/cocoon-binding.ts:56` | AES-256-GCM wrap of per-node Ed25519 keys (mantle binding; implementation file name preserved). |
 | `fortress_id` | `sanctuary-agent-contract-v0.1` `\|\| <agent_subkey_id>` | `server/src/agent-contract/identity-bind.ts:55,79` | Per-agent identity-binding subkeys. |
 | `fortress_id` | `sanctuary-composition-v1.0-sidecar-signing-key` | `server/src/composition/sidecar-signing-key.ts:77` | Composition sidecar's Ed25519 signing keypair. See `composition/constants.ts:HKDF_COMPOSITION_SIDECAR_SIGNING_INFO`. |
 | `fortress_id` | `sanctuary-recovery-flows-v0.1-master-rotation-bundle` `\|\| <bundle_id>` | `server/src/mesh/recovery-flows/secret-bundle.ts:78` | Recovery-flow master-rotation bundle wrap. |

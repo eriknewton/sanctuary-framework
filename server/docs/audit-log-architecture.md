@@ -6,7 +6,7 @@ Sanctuary's current local audit log is a per-fortress append-only set of individ
 
 ## 2. On-Disk Layout
 
-The default fortress storage path is `~/.sanctuary`, overridable with `SANCTUARY_STORAGE_PATH` or the cocoon `--fortress` path. Runtime code constructs the storage backend at `<storage_path>/state`, so local audit files live at:
+The default fortress storage path is `~/.sanctuary`, overridable with `SANCTUARY_STORAGE_PATH` or the wrap `--fortress` path. Runtime code constructs the storage backend at `<storage_path>/state`, so local audit files live at:
 
 ```text
 <storage_path>/state/_audit/<timestamp-ms>-<counter>.enc
@@ -20,7 +20,7 @@ Retention is local and prune-based. `AuditLog` defaults to retaining at most 100
 
 ## 3. Encryption Shape
 
-The master key is derived from the fortress passphrase with Argon2id in `core/key-derivation.ts`. The stored key-derivation parameters live in `_meta/key-params`; recovery-key flows can also provide a raw 32-byte master key. The cocoon passphrase itself is resolved from `SANCTUARY_PASSPHRASE`, macOS Keychain, or an encrypted fallback `passphrase.enc` file, but that passphrase storage is separate from audit-entry encryption.
+The master key is derived from the fortress passphrase with Argon2id in `core/key-derivation.ts`. The stored key-derivation parameters live in `_meta/key-params`; recovery-key flows can also provide a raw 32-byte master key. The mantle binding passphrase itself is resolved from `SANCTUARY_PASSPHRASE`, macOS Keychain, or an encrypted fallback `passphrase.enc` file, but that passphrase storage is separate from audit-entry encryption.
 
 The audit encryption key is:
 
@@ -84,7 +84,7 @@ The current local chain is symmetric:
 - HKDF-SHA256 derives the `audit-log` purpose key.
 - AES-256-GCM encrypts each entry.
 
-HKDF-SHA256 and AES-256-GCM remain the relevant symmetric primitives in the post-quantum threat model. The more sensitive migration surfaces are passphrase strength and KDF parameters, envelope versioning for encrypted payloads, and any future asymmetric wrapping layer added around fortress-master material. If the cocoon later introduces asymmetric master-key wrapping, that wrapping layer is where ML-KEM-768 belongs. It is not an audit-entry migration and should not be implemented as local audit-entry signatures.
+HKDF-SHA256 and AES-256-GCM remain the relevant symmetric primitives in the post-quantum threat model. The more sensitive migration surfaces are passphrase strength and KDF parameters, envelope versioning for encrypted payloads, and any future asymmetric wrapping layer added around fortress-master material. If the mantle binding later introduces asymmetric master-key wrapping, that wrapping layer is where ML-KEM-768 belongs. It is not an audit-entry migration and should not be implemented as local audit-entry signatures.
 
 Because the current encrypted payload schema has `v: 1` and `alg: "aes-256-gcm"` but no key-wrap metadata, a crypto-agility pass should design explicit envelope metadata before changing algorithms or adding KEM-wrapped key material.
 

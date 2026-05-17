@@ -134,7 +134,7 @@ Every on-disk artifact lives under the agent's storage path:
 
 ```
 $SANCTUARY_STORAGE_PATH/
-├── cocoon-profile.json           # sovereignty profile snapshot (0600)
+├── cocoon-profile.json           # sovereignty profile snapshot (0600; historical filename)
 ├── principal-policy.yaml         # runtime-frozen policy (0600)
 ├── passphrase.enc                # fallback passphrase file if Keychain unavailable
 ├── sanctuary.json                # config overrides (optional)
@@ -145,7 +145,7 @@ $SANCTUARY_STORAGE_PATH/
 │   ├── _context_gate_policies/   # L2 context-gating policies
 │   └── <user-namespace>/*.enc    # state_write values
 └── backup/
-    ├── cocoon-meta.json          # unwrap pointer
+    ├── cocoon-meta.json          # unwrap pointer (historical filename)
     └── config-backup-*.json      # original agent config
 ```
 
@@ -235,7 +235,7 @@ cd server && npm test -- --run test/integration/multi-instance-isolation.test.ts
 Once you have two or more wrapped tenants on a host, `sanctuary agents`
 gives you a read-only inventory without needing any tenant's passphrase.
 It discovers tenants by scanning `~/.sanctuary/` for sub-directories that
-look initialized (have a `state/` dir and/or a `cocoon-profile.json`), plus
+look initialized (have a `state/` dir and/or the historical `cocoon-profile.json` filename), plus
 any extras you register via `SANCTUARY_AGENTS_EXTRA_PATHS` or an
 `~/.sanctuary/agents-extra.json` file.
 
