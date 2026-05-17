@@ -56,6 +56,8 @@ export const GATE_REASON_CODES = {
     "threshold_rule_operator_approval_required",
   ML_ANOMALY_OPERATOR_APPROVAL_REQUIRED:
     "ml_anomaly_operator_approval_required",
+  SUBSCRIBER_HANDSHAKE_NOT_VERIFIED:
+    "subscriber_handshake_not_verified",
 } as const;
 
 export type GateReasonCode =

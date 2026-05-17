@@ -20,7 +20,11 @@ export { evaluateMemoryGate } from "./memory.js";
 export { evaluateCredentialsGate } from "./credentials.js";
 export { evaluatePlansGate } from "./plans.js";
 export { evaluateOutputsGate } from "./outputs.js";
-export type { SlotGateExtendedContext } from "./evaluator.js";
+export type {
+  SlotGateExtendedContext,
+  SubscriberHandshakeGateCallback,
+  SubscriberHandshakeGateResult,
+} from "./evaluator.js";
 
 /** Route a gate call by slot. Throws on an unknown slot (schema-impossible at v0.1). */
 export function evaluateGate(
