@@ -190,6 +190,30 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
+  if (args[0] === "audit-chain") {
+    const verb = args[1];
+    if (verb === "export") {
+      const { parseExportArgs, runExport } = await import("./cli/audit-chain-export.js");
+      const opts = parseExportArgs(args.slice(2), process.env);
+      await runExport(opts);
+      process.exit(0);
+    } else if (verb === "verify") {
+      const { parseVerifyArgs, runVerify } = await import("./cli/audit-chain-verify.js");
+      const opts = parseVerifyArgs(args.slice(2));
+      await runVerify(opts);
+      process.exit(0);
+    } else {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
+      console.error(`Usage: sanctuary audit-chain <export|verify> [options]
+
+Commands:
+  export   Dump audit chain to JSONL (--output <path>, --storage-path <path>)
+  verify   Verify a JSONL export  (--input <path>, --public-key <key>, --no-strict)
+`);
+      process.exit(1);
+    }
+  }
+
   if (args[0] === "broker-server") {
     const { openBroker } = await import("./l3-disclosure/broker/open.js");
     const { createBrokerMcpServer } = await import("./mcp/broker-server.js");
