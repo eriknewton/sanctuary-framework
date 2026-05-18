@@ -361,41 +361,12 @@ describe("Standalone Dashboard", () => {
   // v1.3 cycle 2: standalone dashboard must wire TaskService so
   // `sanctuary task create/list/show/update` CLI commands work.
   // Pre-fix, these hit /api/hub/tasks/* and got task_service_not_configured.
+  // The standalone boot path now creates a fortress-local identity if none
+  // exists, so this works on a fresh fortress (matching the drill flow).
   it("v1.3: task API endpoints work in standalone mode", async () => {
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-task";
 
-    // First boot: create an identity so the second boot can wire TaskService.
-    // This matches the drill flow where `sanctuary init` runs before the
-    // dashboard, creating the fortress identity that TaskService needs.
-    const seed = await startDashboardOnFreePort({
-      passphrase: "test-passphrase-task",
-      host: "127.0.0.1",
-    });
-
-    const { IdentityManager } = await import("../src/l1-cognitive/tools.js");
-    const { FilesystemStorage } = await import("../src/storage/filesystem.js");
-    const { deriveMasterKey, derivePurposeKey } = await import(
-      "../src/core/key-derivation.js"
-    );
-    const { createIdentity } = await import("../src/core/identity.js");
-    const { bytesToString } = await import("../src/core/encoding.js");
-    const storage = new FilesystemStorage(`${tempDir}/state`);
-    const rawParams = await storage.read("_meta", "key-params");
-    const params = rawParams ? JSON.parse(bytesToString(rawParams)) : undefined;
-    const { key: mk } = await deriveMasterKey("test-passphrase-task", params);
-    const idEncKey = derivePurposeKey(mk, "identity-encryption");
-    const idMgr = new IdentityManager(storage, mk);
-    await idMgr.load();
-    const { storedIdentity } = createIdentity(
-      "task-test-identity",
-      idEncKey,
-      "passphrase"
-    );
-    await idMgr.save(storedIdentity);
-    await seed.dashboard.stop();
-
-    // Second boot: with the identity on disk, TaskService should be wired.
     const result = await startDashboardOnFreePort({
       passphrase: "test-passphrase-task",
       host: "127.0.0.1",

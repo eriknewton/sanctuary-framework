@@ -39,6 +39,7 @@ import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
 import { IdentityManager } from "./l1-cognitive/tools.js";
 import { StateStore } from "./l1-cognitive/state-store.js";
+import { createIdentity } from "./core/identity.js";
 import { TaskService } from "./l2-operational/task-coordination/index.js";
 import type { HandshakeResult } from "./handshake/types.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
@@ -509,17 +510,29 @@ export async function startStandaloneDashboard(
 
   // v1.3 cycle 2: wire TaskService into the hub so `sanctuary task`
   // CLI commands (which hit /api/hub/tasks/*) work in standalone mode.
-  // All deps are already in scope from the boot path above.
-  const defaultIdentity = identityManager.getDefault();
-  if (defaultIdentity) {
+  // TaskService needs a signing identity; if none exists yet (fresh
+  // fortress from `sanctuary init` with no prior MCP session), create
+  // a fortress-local identity so TaskService can function immediately.
+  const idEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  let signingIdentity = identityManager.getDefault();
+  if (!signingIdentity) {
+    const { storedIdentity } = createIdentity(
+      `fortress:${config.storage_path}`,
+      idEncKey,
+      passphrase ? "passphrase" : "recovery-key",
+    );
+    await identityManager.save(storedIdentity);
+    signingIdentity = storedIdentity;
+  }
+  {
     const stateStore = new StateStore(storage, masterKey);
     const taskService = new TaskService({
       stateStore,
       auditLog,
       fortressId: config.storage_path,
       identityId: hubIdentityId,
-      signingIdentity: defaultIdentity,
-      identityEncryptionKey: derivePurposeKey(masterKey, "identity-encryption"),
+      signingIdentity,
+      identityEncryptionKey: idEncKey,
     });
     v11Bindings.hubService.setTaskService(taskService);
   }

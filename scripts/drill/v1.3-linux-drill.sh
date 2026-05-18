@@ -296,16 +296,20 @@ action_2() {
     'sanctuary sentinel subscribe egress-volume' \
     'sanctuary sentinel subscribe credential-usage' \
     'sanctuary sentinel subscribe cross-agent-chatter' \
-    'sanctuary sentinel list --json'
-  printf 'Cycle 2: drill updated to use shipped Phi-1 baseline catalog sentinel IDs (egress-volume, credential-usage, cross-agent-chatter) instead of aspirational IDs.' > "$DRILL_ROOT/action-2.deviation"
+    'sanctuary sentinel list-subscribed'
+  printf 'Cycle 2: drill updated to use shipped Phi-1 baseline catalog sentinel IDs (egress-volume, credential-usage, cross-agent-chatter) instead of aspirational IDs. Validation uses list-subscribed (plain text) instead of list --json (not supported).' > "$DRILL_ROOT/action-2.deviation"
   run_logged "sentinel-egress-volume" "sanctuary sentinel subscribe egress-volume" "$out" "$err" || code=1
   run_logged "sentinel-credential-usage" "sanctuary sentinel subscribe credential-usage" "$out" "$err" || code=1
   run_logged "sentinel-cross-agent-chatter" "sanctuary sentinel subscribe cross-agent-chatter" "$out" "$err" || code=1
-  local subscriptions_json="$STATE_DIR/sentinels.json"
-  run_logged "sentinels-list" "sanctuary sentinel list --json > '$subscriptions_json'" "$out" "$err" || code=1
-  if [[ "$DRY_RUN" == "0" ]] && ! jq -e 'walk(if type == "object" then . else . end)' "$subscriptions_json" >/dev/null 2>&1; then
-    printf 'sentinels list did not produce valid JSON\n' >> "$err"
-    code=1
+  local subscriptions_out="$STATE_DIR/sentinels-subscribed.txt"
+  run_logged "sentinels-list-subscribed" "sanctuary sentinel list-subscribed > '$subscriptions_out'" "$out" "$err" || code=1
+  if [[ "$DRY_RUN" == "0" ]]; then
+    for expected_id in egress-volume credential-usage cross-agent-chatter; do
+      if ! grep -q "$expected_id" "$subscriptions_out" 2>/dev/null; then
+        printf 'sentinel %s not found in subscribed list\n' "$expected_id" >> "$err"
+        code=1
+      fi
+    done
   fi
   return "$code"
 }
