@@ -44,6 +44,12 @@ function bijectiveEncode(name: string): string {
   );
 }
 
+function bijectiveDecode(encoded: string): string {
+  return encoded.replace(/!([0-9A-Fa-f]{2})/g, (_match, hex) =>
+    String.fromCharCode(parseInt(hex, 16))
+  );
+}
+
 // Legacy whitelist sanitizers, used ONLY for read-fallback against fortresses
 // written before full-sweep #41. write() never produces these paths.
 function legacyNamespaceSanitize(name: string): string {
@@ -176,7 +182,8 @@ export class FilesystemStorage implements StorageBackend {
       for (const file of files) {
         if (!file.endsWith(".enc")) continue;
 
-        const key = file.slice(0, -4); // Remove .enc extension
+        const encodedKey = file.slice(0, -4); // Remove .enc extension
+        const key = bijectiveDecode(encodedKey);
         if (prefix && !key.startsWith(prefix)) continue;
 
         const filePath = join(dirPath, file);

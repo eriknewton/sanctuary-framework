@@ -357,4 +357,94 @@ describe("Standalone Dashboard", () => {
       console.error = origError;
     }
   });
+
+  // v1.3 cycle 2: standalone dashboard must wire TaskService so
+  // `sanctuary task create/list/show/update` CLI commands work.
+  // Pre-fix, these hit /api/hub/tasks/* and got task_service_not_configured.
+  // The standalone boot path now creates a fortress-local identity if none
+  // exists, so this works on a fresh fortress (matching the drill flow).
+  it("v1.3: task API endpoints work in standalone mode", async () => {
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-task";
+
+    const result = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-task",
+      host: "127.0.0.1",
+    });
+    dashboard = result.dashboard;
+
+    const base = `http://127.0.0.1:${result.port}`;
+    const headers = {
+      Authorization: "Bearer test-token-task",
+      "Content-Type": "application/json",
+    };
+
+    // POST /api/hub/tasks - create a task
+    const createRes = await fetch(`${base}/api/hub/tasks`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        title: "Standalone TaskService test",
+        creator: "drill-test",
+      }),
+    });
+    // Must not return task_service_not_configured (which would be 500 or 400).
+    // Accept 200/201 as success.
+    const createBody = await createRes.json();
+    if (createRes.status >= 300) {
+      throw new Error(`task create returned ${createRes.status}: ${JSON.stringify(createBody)}`);
+    }
+    const taskId =
+      createBody.data?.task?.id ?? createBody.id ?? createBody.task_id;
+    expect(taskId).toBeTruthy();
+
+    // GET /api/hub/tasks/:id - retrieve the created task
+    const showRes = await fetch(`${base}/api/hub/tasks/${taskId}`, { headers });
+    expect(showRes.status).toBe(200);
+    const showBody = await showRes.json();
+    const fetchedTask = showBody.data?.task ?? showBody;
+    expect(fetchedTask.title).toBe("Standalone TaskService test");
+
+    // Full approval flow: in_progress -> ready_for_review -> approve
+    const ipRes = await fetch(`${base}/api/hub/tasks/${taskId}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ status: "in_progress", actor: "test" }),
+    });
+    expect(ipRes.status).toBe(200);
+
+    const rfrRes = await fetch(`${base}/api/hub/tasks/${taskId}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ status: "ready_for_review", actor: "test" }),
+    });
+    expect(rfrRes.status).toBe(200);
+    const rfrBody = await rfrRes.json();
+    const approvalRequestId =
+      rfrBody.data?.task?.approval_request_id ?? rfrBody.approval_request_id;
+    expect(approvalRequestId).toBeTruthy();
+
+    // List inbox - should contain the approval
+    const inboxRes = await fetch(`${base}/api/hub/inbox`, { headers });
+    expect(inboxRes.status).toBe(200);
+    const inboxBody = await inboxRes.json();
+    const items = inboxBody.data?.items ?? [];
+    const matchingItem = items.find(
+      (i: any) => i.item_id === approvalRequestId,
+    );
+    expect(matchingItem).toBeTruthy();
+
+    // Approve the item
+    const approveRes = await fetch(
+      `${base}/api/hub/inbox/${encodeURIComponent(approvalRequestId)}/approve`,
+      { method: "POST", headers, body: JSON.stringify({}) },
+    );
+    if (approveRes.status >= 400) {
+      const errBody = await approveRes.json();
+      throw new Error(
+        `approve returned ${approveRes.status}: ${JSON.stringify(errBody)}`,
+      );
+    }
+    expect(approveRes.status).toBe(200);
+  });
 });
