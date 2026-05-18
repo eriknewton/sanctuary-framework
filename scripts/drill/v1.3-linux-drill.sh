@@ -355,7 +355,7 @@ action_3() {
   if [[ "$DRY_RUN" == "1" ]]; then
     approval_id="$approval_request_id"
   else
-    approval_id="$(jq -r --arg approval_request_id "$approval_request_id" '(.items // .data.items // .approvals // .data.approvals // (if type == "array" then . else [] end))[] | select((.item_id // .id // .approval_id // "") == $approval_request_id) | .item_id // .id // .approval_id // empty' "$approvals_json" 2>/dev/null | head -n 1 || true)"
+    approval_id="$(jq -r --arg approval_request_id "$approval_request_id" '(if type == "array" then . else (.items // .data.items // .approvals // .data.approvals // []) end)[] | select((.item_id // .id // .approval_id // "") == $approval_request_id) | .item_id // .id // .approval_id // empty' "$approvals_json" 2>/dev/null | head -n 1 || true)"
   fi
   if [[ -z "$approval_id" ]]; then
     printf 'inbox approvals list did not contain the task approval request\n' >> "$err"

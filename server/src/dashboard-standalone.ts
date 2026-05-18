@@ -530,7 +530,7 @@ export async function startStandaloneDashboard(
     const taskService = new TaskService({
       stateStore,
       auditLog,
-      fortressId: config.storage_path,
+      fortressId: fortressIdFromStoragePath(config.storage_path),
       identityId: hubIdentityId,
       signingIdentity,
       identityEncryptionKey: idEncKey,
