@@ -526,6 +526,7 @@ export async function startStandaloneDashboard(
   }
   {
     const stateStore = new StateStore(storage, masterKey);
+    const { hubService } = v11Bindings;
     const taskService = new TaskService({
       stateStore,
       auditLog,
@@ -533,8 +534,10 @@ export async function startStandaloneDashboard(
       identityId: hubIdentityId,
       signingIdentity,
       identityEncryptionKey: idEncKey,
+      enqueueReviewApproval: (task, actor) =>
+        hubService.enqueueTaskReviewApproval(task, actor),
     });
-    v11Bindings.hubService.setTaskService(taskService);
+    hubService.setTaskService(taskService);
   }
 
   // v0.10.2 — loopback auto-auth: the passphrase that unlocked at least
