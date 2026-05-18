@@ -288,15 +288,15 @@ action_2() {
   local code=0
   # shellcheck disable=SC2016
   write_steps "$steps" \
-    'sanctuary sentinels subscribe blocked-egress' \
-    'sanctuary sentinels subscribe per-agent-activity-drift' \
-    'sanctuary sentinels subscribe audit-event-class-distribution-drift' \
-    'sanctuary sentinels list --json'
-  run_logged "sentinel-blocked-egress" "sanctuary sentinels subscribe blocked-egress" "$out" "$err" || code=1
-  run_logged "sentinel-agent-drift" "sanctuary sentinels subscribe per-agent-activity-drift" "$out" "$err" || code=1
-  run_logged "sentinel-audit-drift" "sanctuary sentinels subscribe audit-event-class-distribution-drift" "$out" "$err" || code=1
+    'sanctuary sentinel subscribe blocked-egress' \
+    'sanctuary sentinel subscribe per-agent-activity-drift' \
+    'sanctuary sentinel subscribe audit-event-class-distribution-drift' \
+    'sanctuary sentinel list --json'
+  run_logged "sentinel-blocked-egress" "sanctuary sentinel subscribe blocked-egress" "$out" "$err" || code=1
+  run_logged "sentinel-agent-drift" "sanctuary sentinel subscribe per-agent-activity-drift" "$out" "$err" || code=1
+  run_logged "sentinel-audit-drift" "sanctuary sentinel subscribe audit-event-class-distribution-drift" "$out" "$err" || code=1
   local subscriptions_json="$STATE_DIR/sentinels.json"
-  run_logged "sentinels-list" "sanctuary sentinels list --json > '$subscriptions_json'" "$out" "$err" || code=1
+  run_logged "sentinels-list" "sanctuary sentinel list --json > '$subscriptions_json'" "$out" "$err" || code=1
   if [[ "$DRY_RUN" == "0" ]] && ! jq -e 'walk(if type == "object" then . else . end)' "$subscriptions_json" >/dev/null 2>&1; then
     printf 'sentinels list did not produce valid JSON\n' >> "$err"
     code=1

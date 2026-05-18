@@ -99,31 +99,31 @@ async function main(): Promise<void> {
   if (args[0] === "secrets") {
     const { runSecretsCommand } = await import("./cli/secrets.js");
     const code = await runSecretsCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "template") {
     const { runTemplateCommand } = await import("./templates/cli.js");
     const code = await runTemplateCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "identity") {
     const { runIdentityCommand } = await import("./cli/identity.js");
     const code = await runIdentityCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "agents" || args[0] === "agent") {
     const { runAgentsCommand } = await import("./cli/agents/index.js");
     const code = await runAgentsCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "exit") {
     const { runExitCommand } = await import("./exit/index.js");
     const code = await runExitCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "reset-passphrase") {
@@ -131,7 +131,7 @@ async function main(): Promise<void> {
       "./cli/reset-passphrase.js"
     );
     const code = await runResetPassphraseCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "intelligence") {
@@ -139,55 +139,55 @@ async function main(): Promise<void> {
       "./cli/intelligence.js"
     );
     const code = await runIntelligenceCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "sentinel") {
     const { runSentinelCommand } = await import("./cli/sentinel.js");
     const code = await runSentinelCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "did-web") {
     const { runDidWebCommand } = await import("./cli/did-web.js");
     const code = await runDidWebCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "anomaly") {
     const { runAnomalyCommand } = await import("./cli/anomaly.js");
     const code = await runAnomalyCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "policy") {
     const { runPolicyCommand } = await import("./cli/policy.js");
     const code = await runPolicyCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "auto-trigger") {
     const { runAutoTriggerCommand } = await import("./cli/auto-trigger.js");
     const code = await runAutoTriggerCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "inbox") {
     const { runInboxCommand } = await import("./cli/inbox.js");
     const code = await runInboxCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "task") {
     const { runTaskCommand } = await import("./cli/task.js");
     const code = await runTaskCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "concierge") {
     const { runConciergeCommand } = await import("./cli/concierge.js");
     const code = await runConciergeCommand({ argv: args.slice(1) });
-    process.exit(code);
+    drainAndExit(code);
   }
 
   if (args[0] === "audit-chain") {
@@ -571,6 +571,21 @@ Examples:
 
   # macOS launchd: add to ~/Library/LaunchAgents/ for auto-start
 `);
+}
+
+/**
+ * Drain stdout then exit. process.exit() can lose buffered writes when
+ * stdout is a pipe or file redirect (e.g. `sanctuary task create --json > out.json`).
+ * Writing an empty string and waiting for the callback ensures all prior
+ * writes have been flushed to the OS before termination.
+ */
+function drainAndExit(code: number): void {
+  if (!process.stdout.writable) {
+    process.exit(code);
+    return;
+  }
+  process.exitCode = code;
+  process.stdout.write("", () => process.exit(code));
 }
 
 main().catch((err) => {

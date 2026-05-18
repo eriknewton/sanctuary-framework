@@ -31,7 +31,13 @@ jobs:
           node-version: '22'
 
       - name: Install Sanctuary
-        run: npm install -g @sanctuary-framework/mcp-server@${{ inputs.sanctuary_version || 'next' }}
+        run: |
+          VERSION="${{ inputs.sanctuary_version || 'next' }}"
+          if [ "$VERSION" = "local" ]; then
+            cd server && npm ci && npm run build && npm install -g .
+          else
+            npm install -g "@sanctuary-framework/mcp-server@$VERSION"
+          fi
 
       - name: Run drill
         env:
