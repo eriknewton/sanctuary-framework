@@ -34,10 +34,12 @@ import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-
 import type { PrincipalPolicy } from "./principal-policy/types.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
-import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
+import { deriveMasterKey, derivePurposeKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
 import { IdentityManager } from "./l1-cognitive/tools.js";
+import { StateStore } from "./l1-cognitive/state-store.js";
+import { TaskService } from "./l2-operational/task-coordination/index.js";
 import type { HandshakeResult } from "./handshake/types.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
 import { writeTenantRuntime, clearTenantRuntime } from "./cli/agents/runtime.js";
@@ -485,26 +487,42 @@ export async function startStandaloneDashboard(
     );
     intelligenceSelector = undefined;
   }
-  dashboard.setV11Bindings(
-    buildV11Bindings({
-      identityId: hubIdentityId,
-      fortressId: fortressIdFromStoragePath(config.storage_path),
+  const v11Bindings = buildV11Bindings({
+    identityId: hubIdentityId,
+    fortressId: fortressIdFromStoragePath(config.storage_path),
+    auditLog,
+    // v1.1.5 (Finding Z): rehydrate the hub agent registry from
+    // `<storagePath>/state/_hub/local-agents.json` so the standalone
+    // dashboard surfaces wraps performed by prior `sanctuary wrap`
+    // invocations against this same fortress.
+    storagePath: config.storage_path,
+    ...(intelligenceSelector ? { intelligenceSelector } : {}),
+    // WP-V1.2-4: forward the storage backend + master key so
+    // buildV11Bindings constructs the operator chat service. The
+    // chat surfaces (concierge + direct-agent) depend on these for
+    // encrypted at-rest persistence under the reserved `_chat`
+    // namespace.
+    storage,
+    masterKey,
+  });
+  dashboard.setV11Bindings(v11Bindings);
+
+  // v1.3 cycle 2: wire TaskService into the hub so `sanctuary task`
+  // CLI commands (which hit /api/hub/tasks/*) work in standalone mode.
+  // All deps are already in scope from the boot path above.
+  const defaultIdentity = identityManager.getDefault();
+  if (defaultIdentity) {
+    const stateStore = new StateStore(storage, masterKey);
+    const taskService = new TaskService({
+      stateStore,
       auditLog,
-      // v1.1.5 (Finding Z): rehydrate the hub agent registry from
-      // `<storagePath>/state/_hub/local-agents.json` so the standalone
-      // dashboard surfaces wraps performed by prior `sanctuary wrap`
-      // invocations against this same fortress.
-      storagePath: config.storage_path,
-      ...(intelligenceSelector ? { intelligenceSelector } : {}),
-      // WP-V1.2-4: forward the storage backend + master key so
-      // buildV11Bindings constructs the operator chat service. The
-      // chat surfaces (concierge + direct-agent) depend on these for
-      // encrypted at-rest persistence under the reserved `_chat`
-      // namespace.
-      storage,
-      masterKey,
-    }),
-  );
+      fortressId: config.storage_path,
+      identityId: hubIdentityId,
+      signingIdentity: defaultIdentity,
+      identityEncryptionKey: derivePurposeKey(masterKey, "identity-encryption"),
+    });
+    v11Bindings.hubService.setTaskService(taskService);
+  }
 
   // v0.10.2 — loopback auto-auth: the passphrase that unlocked at least
   // one identity above is strictly stronger than the dashboard bearer

@@ -357,4 +357,81 @@ describe("Standalone Dashboard", () => {
       console.error = origError;
     }
   });
+
+  // v1.3 cycle 2: standalone dashboard must wire TaskService so
+  // `sanctuary task create/list/show/update` CLI commands work.
+  // Pre-fix, these hit /api/hub/tasks/* and got task_service_not_configured.
+  it("v1.3: task API endpoints work in standalone mode", async () => {
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-task";
+
+    // First boot: create an identity so the second boot can wire TaskService.
+    // This matches the drill flow where `sanctuary init` runs before the
+    // dashboard, creating the fortress identity that TaskService needs.
+    const seed = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-task",
+      host: "127.0.0.1",
+    });
+
+    const { IdentityManager } = await import("../src/l1-cognitive/tools.js");
+    const { FilesystemStorage } = await import("../src/storage/filesystem.js");
+    const { deriveMasterKey, derivePurposeKey } = await import(
+      "../src/core/key-derivation.js"
+    );
+    const { createIdentity } = await import("../src/core/identity.js");
+    const { bytesToString } = await import("../src/core/encoding.js");
+    const storage = new FilesystemStorage(`${tempDir}/state`);
+    const rawParams = await storage.read("_meta", "key-params");
+    const params = rawParams ? JSON.parse(bytesToString(rawParams)) : undefined;
+    const { key: mk } = await deriveMasterKey("test-passphrase-task", params);
+    const idEncKey = derivePurposeKey(mk, "identity-encryption");
+    const idMgr = new IdentityManager(storage, mk);
+    await idMgr.load();
+    const { storedIdentity } = createIdentity(
+      "task-test-identity",
+      idEncKey,
+      "passphrase"
+    );
+    await idMgr.save(storedIdentity);
+    await seed.dashboard.stop();
+
+    // Second boot: with the identity on disk, TaskService should be wired.
+    const result = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-task",
+      host: "127.0.0.1",
+    });
+    dashboard = result.dashboard;
+
+    const base = `http://127.0.0.1:${result.port}`;
+    const headers = {
+      Authorization: "Bearer test-token-task",
+      "Content-Type": "application/json",
+    };
+
+    // POST /api/hub/tasks - create a task
+    const createRes = await fetch(`${base}/api/hub/tasks`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        title: "Standalone TaskService test",
+        creator: "drill-test",
+      }),
+    });
+    // Must not return task_service_not_configured (which would be 500 or 400).
+    // Accept 200/201 as success.
+    const createBody = await createRes.json();
+    if (createRes.status >= 300) {
+      throw new Error(`task create returned ${createRes.status}: ${JSON.stringify(createBody)}`);
+    }
+    const taskId =
+      createBody.data?.task?.id ?? createBody.id ?? createBody.task_id;
+    expect(taskId).toBeTruthy();
+
+    // GET /api/hub/tasks/:id - retrieve the created task
+    const showRes = await fetch(`${base}/api/hub/tasks/${taskId}`, { headers });
+    expect(showRes.status).toBe(200);
+    const showBody = await showRes.json();
+    const fetchedTask = showBody.data?.task ?? showBody;
+    expect(fetchedTask.title).toBe("Standalone TaskService test");
+  });
 });
