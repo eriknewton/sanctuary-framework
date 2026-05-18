@@ -404,5 +404,47 @@ describe("Standalone Dashboard", () => {
     const showBody = await showRes.json();
     const fetchedTask = showBody.data?.task ?? showBody;
     expect(fetchedTask.title).toBe("Standalone TaskService test");
+
+    // Full approval flow: in_progress -> ready_for_review -> approve
+    const ipRes = await fetch(`${base}/api/hub/tasks/${taskId}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ status: "in_progress", actor: "test" }),
+    });
+    expect(ipRes.status).toBe(200);
+
+    const rfrRes = await fetch(`${base}/api/hub/tasks/${taskId}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ status: "ready_for_review", actor: "test" }),
+    });
+    expect(rfrRes.status).toBe(200);
+    const rfrBody = await rfrRes.json();
+    const approvalRequestId =
+      rfrBody.data?.task?.approval_request_id ?? rfrBody.approval_request_id;
+    expect(approvalRequestId).toBeTruthy();
+
+    // List inbox - should contain the approval
+    const inboxRes = await fetch(`${base}/api/hub/inbox`, { headers });
+    expect(inboxRes.status).toBe(200);
+    const inboxBody = await inboxRes.json();
+    const items = inboxBody.data?.items ?? [];
+    const matchingItem = items.find(
+      (i: any) => i.item_id === approvalRequestId,
+    );
+    expect(matchingItem).toBeTruthy();
+
+    // Approve the item
+    const approveRes = await fetch(
+      `${base}/api/hub/inbox/${encodeURIComponent(approvalRequestId)}/approve`,
+      { method: "POST", headers, body: JSON.stringify({}) },
+    );
+    if (approveRes.status >= 400) {
+      const errBody = await approveRes.json();
+      throw new Error(
+        `approve returned ${approveRes.status}: ${JSON.stringify(errBody)}`,
+      );
+    }
+    expect(approveRes.status).toBe(200);
   });
 });

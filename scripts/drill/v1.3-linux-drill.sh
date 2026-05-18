@@ -581,7 +581,7 @@ action_10() {
   else
     for request_id in "${expected_approvals[@]}"; do
       local approval_id
-      approval_id="$(jq -r --arg request_id "$request_id" '(.items // .data.items // .approvals // .data.approvals // (if type == "array" then . else [] end))[] | select((.item_id // .id // .approval_id // "") == $request_id) | .item_id // .id // .approval_id // empty' "$approvals_json" 2>/dev/null | head -n 1 || true)"
+      approval_id="$(jq -r --arg request_id "$request_id" '(if type == "array" then . else (.items // .data.items // .approvals // .data.approvals // []) end)[] | select((.item_id // .id // .approval_id // "") == $request_id) | .item_id // .id // .approval_id // empty' "$approvals_json" 2>/dev/null | head -n 1 || true)"
       if [[ -n "$approval_id" ]]; then
         approval_ids+=("$approval_id")
       fi
