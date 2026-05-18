@@ -362,10 +362,9 @@ action_3() {
     return 1
   fi
   run_logged "task-approval-approve" "sanctuary inbox approvals approve '$approval_id' --json > '$STATE_DIR/task-approval-approved.json'" "$out" "$err" || code=1
-  # Current shipped behavior records task.review_approval_resolved but does
-  # not complete the task. Complete via the shipped lifecycle surface so the
-  # drill verifies an end-to-end completed task without patching CLI code.
-  run_logged "task-complete" "sanctuary task update '$task_id' --status completed --json > '$STATE_DIR/task-completed.json'" "$out" "$err" || code=1
+  # The Tier1 resolution handler auto-completes the task on approve, so no
+  # explicit `task update --status completed` is needed. Attempting it would
+  # fail with "illegal transition: completed to completed".
   local status_json="$STATE_DIR/task-status.json"
   run_logged "task-show" "sanctuary task show '$task_id' --json > '$status_json'" "$out" "$err" || code=1
   if [[ "$DRY_RUN" == "0" ]] && ! jq -e '(.status // .data.status // .task.status // .data.task.status // "") == "completed"' "$status_json" >/dev/null 2>&1; then
@@ -594,9 +593,8 @@ action_10() {
   for approval_id in "${approval_ids[@]}"; do
     run_logged "approval-$approval_id" "sanctuary inbox approvals approve '$approval_id' --json > '$STATE_DIR/approval-$approval_id-approved.json'" "$out" "$err" || code=1
   done
-  for task_id in "${task_ids[@]}"; do
-    run_logged "approval-task-$task_id-complete" "sanctuary task update '$task_id' --status completed --json > '$STATE_DIR/approval-task-$task_id-completed.json'" "$out" "$err" || code=1
-  done
+  # The Tier1 resolution handler auto-completes tasks on approve, so no
+  # explicit `task update --status completed` loop is needed.
   local receipts_json="$STATE_DIR/approval-activity-receipts.json"
   run_logged "approval-receipts" "curl -fsS -H 'Authorization: Bearer $DASHBOARD_TOKEN' '$DASHBOARD_URL/api/hub/activity?category=approval&limit=100' > '$receipts_json'" "$out" "$err" || code=1
   if [[ "$DRY_RUN" == "0" ]] && ! jq -e '(.data.entries // .entries // []) | map(select((.display_template_id // "") | contains("task.review_approval_resolved"))) | length >= 3' "$receipts_json" >/dev/null 2>&1; then
