@@ -39,9 +39,9 @@ Restart OpenClaw. Sanctuary tools load automatically.
 
 ## Step 2: Verify Sanctuary Is Active
 
-Call `sanctuary__manifest` from your agent. You should see 68 tools listed.
+Call `sanctuary__manifest` from your agent. You should see the full Sanctuary tool surface listed.
 
-Note the `sanctuary__` prefix — OpenClaw namespaces MCP tools as
+Note the `sanctuary__` prefix: OpenClaw namespaces MCP tools as
 `{server}__{tool}`. So `manifest` becomes `sanctuary__manifest`,
 `identity_create` becomes `sanctuary__identity_create`, etc.
 
@@ -149,11 +149,11 @@ Check OpenClaw logs at `~/.openclaw/logs/`.
 **Tools show "Not connected" when called**
 Known issue with some OpenClaw versions. Verify the agent is using the correct
 namespaced tool names (`sanctuary__manifest`, not `manifest`). If the problem
-persists, restart OpenClaw — the MCP subprocess may need a clean reconnection.
+persists, restart OpenClaw; the MCP subprocess may need a clean reconnection.
 
 **`sanctuary wrap --openclaw` drops servers**
 Fixed in the current release. If you're on an older version, use the direct config (Step 1
-above) — it works reliably across versions.
+above); it works reliably across versions.
 
 **OpenClaw update breaks dependencies**
 OpenClaw 2026.4.5 had missing peer dependencies. If an update breaks, roll

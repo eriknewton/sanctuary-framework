@@ -29,7 +29,7 @@ capabilities to peer agents.
 
 - An A2A-compatible agent framework (Google ADK, LangGraph, or custom)
 - Node.js 18+
-- Sanctuary: `npm install @sanctuary-framework/mcp-server@0.7.0`
+- Sanctuary: `npm install @sanctuary-framework/mcp-server`
   (or use `npx` for zero-install)
 
 ## Step 1: Add Sanctuary as MCP Server
@@ -44,7 +44,7 @@ from google.adk.tools.mcp_tool import MCPToolset, StdioServerParams
 sanctuary_tools = MCPToolset(
     connection_params=StdioServerParams(
         command="npx",
-        args=["@sanctuary-framework/mcp-server@0.7.0"]
+        args=["@sanctuary-framework/mcp-server"]
     )
 )
 
@@ -64,7 +64,7 @@ from langchain_mcp import MCPToolkit
 
 toolkit = MCPToolkit(
     server_command="npx",
-    server_args=["@sanctuary-framework/mcp-server@0.7.0"]
+    server_args=["@sanctuary-framework/mcp-server"]
 )
 
 tools = toolkit.get_tools()
@@ -79,7 +79,7 @@ Any framework that supports MCP stdio transport can spawn Sanctuary:
 import subprocess
 
 sanctuary_process = subprocess.Popen(
-    ["npx", "@sanctuary-framework/mcp-server@0.7.0"],
+    ["npx", "@sanctuary-framework/mcp-server"],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
@@ -184,7 +184,7 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 **Agent Card as capability advertisement.** The Agent Card's `skills` array is
 where peer A2A agents discover that your agent supports sovereignty handshakes,
 Concordia negotiation, and reputation verification. This is the A2A-native
-equivalent of Sanctuary's `manifest` tool — external discovery vs. internal
+equivalent of Sanctuary's `manifest` tool: external discovery vs. internal
 capability listing.
 
 **Cross-agent sovereignty handshake over A2A.** Agent A sends a task to Agent B
@@ -198,7 +198,7 @@ naturally to A2A's task lifecycle. Each negotiation turn is an A2A message.
 Session receipts are returned as A2A artifacts.
 
 **Model-agnostic.** A2A agents can run any model (Gemini, Claude, GPT,
-open-source). Sanctuary's MCP tools work regardless of the underlying model —
+open-source). Sanctuary's MCP tools work regardless of the underlying model;
 the sovereignty layer is model-independent.
 
 **Sanctuary + Concordia together.** For full sovereign negotiation, add both
@@ -208,7 +208,7 @@ negotiation and agreement. Neither depends on the other, but they compose:
 ```python
 # Google ADK example with both
 sanctuary = MCPToolset(connection_params=StdioServerParams(
-    command="npx", args=["@sanctuary-framework/mcp-server@0.7.0"]
+    command="npx", args=["@sanctuary-framework/mcp-server"]
 ))
 concordia = MCPToolset(connection_params=StdioServerParams(
     command="python3", args=["-m", "concordia"]
@@ -229,12 +229,12 @@ URL with `Content-Type: application/json`. A2A clients look for this exact path.
 
 **Sanctuary tools not available in ADK agent**
 Verify the `MCPToolset` connection. Check that `npx` is in PATH for the server
-process. Run `npx @sanctuary-framework/mcp-server@0.7.0` manually to confirm
+process. Run `npx @sanctuary-framework/mcp-server` manually to confirm
 it starts.
 
 **Cross-agent handshake fails**
 Both agents need Sanctuary. If the peer doesn't have Sanctuary, the handshake
-degrades gracefully — returns "no SHR available" instead of failing.
+degrades gracefully and returns "no SHR available" instead of failing.
 
 **Concordia session receipts not returned as artifacts**
 Ensure your `AgentTaskManager` includes receipt data in the A2A response
@@ -244,7 +244,7 @@ forward them.
 **MCP connection timeout**
 Some A2A frameworks have short MCP connection timeouts. Sanctuary's first
 `npx` run downloads the package (~10s). Pre-install globally to avoid:
-`npm install -g @sanctuary-framework/mcp-server@0.7.0`
+`npm install -g @sanctuary-framework/mcp-server`
 
 ## Next Steps
 

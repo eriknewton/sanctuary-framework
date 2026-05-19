@@ -96,4 +96,4 @@ GitHub: [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewto
 
 ---
 
-*Erik Newton is the creator of Sanctuary Framework and Concordia Protocol, and co-founder of the California Institute for Machine Consciousness (CIMC.ai).*
+*Erik Newton is the sole author of Sanctuary Framework and Concordia Protocol.*

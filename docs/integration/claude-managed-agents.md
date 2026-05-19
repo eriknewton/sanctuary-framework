@@ -84,7 +84,7 @@ not across sessions. For durable identity across sessions:
 - Or use a deterministic seed so the same DID regenerates each time
 
 **Multi-agent.** If using `callable_agents`, each thread agent can independently
-run Sanctuary — one identity per thread agent, or a shared identity via seed.
+run Sanctuary: one identity per thread agent, or a shared identity via seed.
 
 **SIEM export.** Use `audit_export_siem` to push CEF/OCSF-formatted audit
 events to your SIEM (Datadog, Splunk, Chronicle) from inside the container.
@@ -100,7 +100,7 @@ Check environment network access rules. `verascore.ai` must be in the
 outbound allowlist.
 
 **Identity lost between sessions**
-Expected behavior — container filesystems are ephemeral. Export the identity
+Expected behavior: container filesystems are ephemeral. Export the identity
 keypair at session end, or use a deterministic seed for consistent DID
 generation.
 

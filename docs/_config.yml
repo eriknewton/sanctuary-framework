@@ -1,5 +1,5 @@
 title: Sanctuary Protocol
-description: Your agent, your machine, your keys — an MCP server that adds encrypted state, approval gates, and a portable identity to any AI agent.
+description: A kernel-level firewall and sovereignty substrate for AI agents. Real egress enforcement, encrypted state, approval gates, and portable receipts. One MCP server, runnable with npx.
 url: "https://sanctuaryprotocol.ai"
 baseurl: ""
 
