@@ -34,6 +34,7 @@
     "test:conformance": "vitest run test/conformance",
     "test:zero-pii-regression": "vitest run test/query-anonymity/zero-pii-regression.test.ts",
     "test:qla-perf-budget": "vitest run test/query-anonymity/performance-budget.test.ts",
+    "synthetic-coverage": "tsx ../scripts/synthetic-coverage/run.ts",
     "test:e2e": "playwright test",
     "test:e2e:chromium": "playwright test --project=chromium",
     "test:e2e:webkit": "playwright test --project=webkit",
@@ -74,6 +75,7 @@
     "@types/node": "22.19.18",
     "@types/pg": "8.20.0",
     "tsup": "8.5.1",
+    "tsx": "4.8.1",
     "typescript": "5.9.3",
     "vitest": "3.2.4"
   },
