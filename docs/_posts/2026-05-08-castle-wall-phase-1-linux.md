@@ -4,7 +4,13 @@ date: 2026-05-08
 description: "Cooperative gates do not stop a prompt-injected agent. Kernel-level enforcement does. Castle Wall Phase 1 shipped this week on Linux: 203 Rust tests against a real kernel binding, with plain-DNS, DoH, and DoT bypass coverage verified end-to-end on real cgroups."
 author: "Erik Newton"
 image: /images/blog/castle-wall-phase-1-linux.jpg
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 # The Castle Wall, Live on Linux
 

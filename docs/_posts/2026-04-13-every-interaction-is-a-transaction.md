@@ -4,7 +4,13 @@ date: 2026-04-13
 description: "The agentic economy is missing its agreement layer. An open standard is filling the gap, and an ecosystem is forming around it."
 author: "Erik Newton"
 image: /images/blog/every-interaction-is-a-transaction.png
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 # Every Interaction Is a Transaction
 

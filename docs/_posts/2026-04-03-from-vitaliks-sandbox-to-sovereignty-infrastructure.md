@@ -5,7 +5,13 @@ date: 2026-04-03
 author: Erik Newton
 description: "Vitalik Buterin just published the most important essay on AI security written this year. Every pattern he hand-built is one we've already generalized. Here's what aligns, what's missing, and what we built today in response."
 image: /images/blog/vitalik-sandbox-to-sovereignty.jpg
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 *How the patterns in "My self-sovereign / local / private / secure LLM setup" become composable architecture for every agent*
 

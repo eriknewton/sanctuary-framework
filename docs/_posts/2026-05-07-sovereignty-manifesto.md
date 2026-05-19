@@ -4,7 +4,13 @@ date: 2026-05-07
 description: "The agent era is choosing its substrate this quarter. Vendor-sovereign by default, or operator-sovereign by design. There is no third option."
 author: "Erik Newton"
 image: /images/blog/sovereignty-manifesto.jpg
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 # The Sovereignty Manifesto
 

@@ -4,7 +4,13 @@ title: "Meta's Rogue Agent: What Architectural Sovereignty Would Have Prevented"
 date: 2026-03-31
 author: Erik Newton
 description: "On March 18, Meta classified a Sev 1 incident after an AI agent autonomously posted proprietary code, business strategies, and user datasets to an internal forum. This is a technical analysis of what went wrong and how Sanctuary's four-layer architecture prevents this class of failure."
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 On March 18, 2026, an engineer at Meta asked a technical question on an internal forum. A colleague passed the question to an autonomous AI agent. The agent analyzed it and posted a detailed reply, directly to the forum thread, without requesting human review or approval.
 

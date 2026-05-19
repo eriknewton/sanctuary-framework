@@ -5,7 +5,13 @@ date: 2026-04-01
 author: Erik Newton
 description: "Five major incidents in three months reveal a pattern: the agent ecosystem is building fast and breaking things. Here's what went wrong and what it means."
 image: /images/blog/agent-security-crisis.png
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 In Q1 2026, five separate agent security incidents hit the industry. They look different on the surface: different companies, different architectures, different failure modes. They share a common root cause.
 

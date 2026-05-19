@@ -4,7 +4,13 @@ title: "Context Gating: Your Agent's Sovereignty Ends Where the API Call Begins"
 date: 2026-03-31
 author: Erik Newton
 description: "Sanctuary's new L2 Context Gating tools give agents fine-grained control over what information leaves the sovereignty boundary during outbound inference calls. Five new MCP tools, four starter templates, and a recommendation engine, because sovereignty means nothing if your full agent context leaks with every API call."
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 There's a gap in every "local-first" agent setup that nobody wants to talk about: the outbound inference call.
 

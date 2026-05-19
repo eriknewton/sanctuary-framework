@@ -5,7 +5,13 @@ date: 2026-04-06
 author: Erik Newton
 description: "An agent's model, weights, data, context, and runtime are all fungible. The only thing that persists is the reputation attached to its key. In the agentic economy, reputation isn't metadata, it is identity. And identity has value."
 image: /images/blog/reputation-is-identity.jpg
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 When we talk about identity in the human world, we mean something rooted in a body. A face, a fingerprint, a social security number. These are hard to forge because they're tied to a physical substrate that doesn't change. Your body is, in the ways that matter for identification, the same body it was yesterday.
 
