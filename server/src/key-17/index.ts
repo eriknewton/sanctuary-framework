@@ -22,3 +22,11 @@ export {
   type Erc8004Registration,
   type SignedErc8004Registration,
 } from "./erc8004-identity-signer.js";
+
+export {
+  signAp2Mandate,
+  verifyAp2Mandate,
+  deriveAp2Key,
+  type Ap2Mandate,
+  type SignedAp2Mandate,
+} from "./ap2-mandate-signer.js";
