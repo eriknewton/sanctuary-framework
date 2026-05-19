@@ -47,6 +47,10 @@ import {
   type DidWebIdentifier,
   type DidWebRotationReason,
 } from "../recognition/did-web.js";
+import {
+  DidWebHostedRegistry,
+  validateHandle,
+} from "../recognition/did-web-hosted-registry.js";
 
 export interface DidWebCommandArgs {
   argv: string[];
@@ -91,6 +95,12 @@ Commands:
 
   key-history [--json]
                   Show did:web key rotation history for this fortress.
+
+  register-hosted <handle> [--json]
+                  Register this fortress's did:web DID Document under a
+                  Sanctuary-hosted handle. The document will be served at
+                  identity.sanctuaryprotocol.ai/<handle>/.well-known/did.json.
+                  Operator keys sign the document; Sanctuary only hosts it.
 
 Options:
   --authority-host <host>   HTTPS host the operator controls and will
@@ -144,6 +154,9 @@ export async function runDidWebCommand(
   }
   if (command === "key-history") {
     return await cmdKeyHistory(argv.slice(1), out, err, env);
+  }
+  if (command === "register-hosted") {
+    return await cmdRegisterHosted(argv.slice(1), out, err, env);
   }
   write(err, `Unknown did-web command: ${command}\n`);
   write(err, `Run "sanctuary did-web --help" for usage.\n`);
@@ -497,5 +510,111 @@ async function cmdKeyHistory(
       `- ${entry.rotated_at} ${entry.reason}: ${entry.old_verification_method_id} -> ${entry.new_verification_method_id}\n`,
     );
   }
+  return 0;
+}
+
+const HOSTED_AUTHORITY_HOST = "identity.sanctuaryprotocol.ai";
+
+async function cmdRegisterHosted(
+  argv: string[],
+  out: Writable,
+  err: Writable,
+  env: NodeJS.ProcessEnv,
+): Promise<number> {
+  const json = hasFlag(argv, "--json");
+  const handle = argv.find((a) => !a.startsWith("--"));
+  if (!handle) {
+    write(err, "Error: <handle> is required.\n");
+    write(
+      err,
+      'Example: sanctuary did-web register-hosted my-operator\n',
+    );
+    return 1;
+  }
+  const handleError = validateHandle(handle);
+  if (handleError) {
+    write(err, `Error: ${handleError}\n`);
+    return 1;
+  }
+
+  const snapshot = await loadFortressIdentity(argv, env, err);
+  if (!snapshot) return 1;
+
+  let identifier: DidWebIdentifier;
+  try {
+    identifier = await issueDidWeb({
+      fortress_id: snapshot.identityId,
+      authority_host: HOSTED_AUTHORITY_HOST,
+      public_key: snapshot.publicKey,
+    });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    write(err, `Error: ${message}\n`);
+    return 1;
+  }
+
+  const hostedDid = `did:web:${HOSTED_AUTHORITY_HOST}:${handle}`;
+  const didDocument = {
+    ...identifier.did_document,
+    id: hostedDid,
+    verificationMethod: identifier.did_document.verificationMethod.map((vm) => ({
+      ...vm,
+      id: `${hostedDid}#${vm.id.split("#")[1]}`,
+      controller: hostedDid,
+    })),
+    authentication: identifier.did_document.authentication.map((a) =>
+      `${hostedDid}#${a.split("#")[1]}`,
+    ),
+    assertionMethod: identifier.did_document.assertionMethod.map((a) =>
+      `${hostedDid}#${a.split("#")[1]}`,
+    ),
+  };
+
+  const registry = new DidWebHostedRegistry({
+    storage: snapshot.storage,
+    masterKey: snapshot.masterKey,
+    fortressId: snapshot.identityId,
+  });
+
+  const entry = await registry.set(handle, didDocument);
+
+  const auditLog = new AuditLog(snapshot.storage, snapshot.masterKey);
+  auditLog.append("l1", DID_WEB_AUDIT_OPS.PUBLISHED, snapshot.identityId, {
+    did: hostedDid,
+    operator_handle: handle,
+    authority_host: HOSTED_AUTHORITY_HOST,
+    hosted: true,
+  });
+  await auditLog.flush();
+
+  if (json) {
+    write(
+      out,
+      JSON.stringify(
+        {
+          did: hostedDid,
+          operator_handle: handle,
+          authority_host: HOSTED_AUTHORITY_HOST,
+          published_at: entry.published_at,
+          did_document: didDocument,
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    return 0;
+  }
+  write(out, `did:web identifier registered under Sanctuary-hosted handle.\n`);
+  write(out, `  DID:            ${hostedDid}\n`);
+  write(out, `  Handle:         ${handle}\n`);
+  write(out, `  Authority host: ${HOSTED_AUTHORITY_HOST}\n`);
+  write(out, `  Published at:   ${entry.published_at}\n`);
+  write(out, `\nThe DID Document will be served at:\n`);
+  write(
+    out,
+    `  https://${HOSTED_AUTHORITY_HOST}/${handle}/.well-known/did.json\n`,
+  );
+  write(out, `\nCastle-walking note: your signing key never leaves the fortress.\n`);
+  write(out, `Sanctuary hosts the document; you control the keys.\n`);
   return 0;
 }
