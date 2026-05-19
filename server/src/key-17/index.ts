@@ -13,3 +13,12 @@ export {
   type X402Request,
   type SignedX402Request,
 } from "./x402-signer.js";
+
+export {
+  signErc8004Registration,
+  verifyErc8004Registration,
+  deriveErc8004Key,
+  publicKeyToAddress,
+  type Erc8004Registration,
+  type SignedErc8004Registration,
+} from "./erc8004-identity-signer.js";
