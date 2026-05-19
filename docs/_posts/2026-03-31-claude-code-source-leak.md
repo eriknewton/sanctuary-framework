@@ -5,7 +5,13 @@ date: 2026-03-31
 author: Erik Newton
 description: "On March 31, Anthropic accidentally shipped a source map in their npm package that exposed 512,000 lines of Claude Code source code. This is the third major agentic infrastructure failure in two weeks, and it maps to the same architectural gap."
 image: /images/blog/claude-code-source-leak.png
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 On March 31, 2026, security researcher Chaofan Shou discovered that the entire source code of Claude Code (Anthropic's flagship agentic coding tool) was sitting in plain sight on the npm registry. A 59.8 MB source map file, bundled into version 2.1.88 of the @anthropic-ai/claude-code package, contained the full, unobfuscated TypeScript source. 1,900 files. 512,000 lines. Everything.
 

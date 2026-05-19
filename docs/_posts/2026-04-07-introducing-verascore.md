@@ -5,7 +5,13 @@ date: 2026-04-07
 author: Erik Newton
 description: "Verascore is a standards-based reputation platform for AI agents. Trust scores backed by Ed25519 signatures, five weighted dimensions, config fingerprinting, and Concordia receipt ingestion, live at verascore.ai."
 image: /images/blog/introducing-verascore.jpg
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 Last week I published [Reputation Is Identity](/blog/2026/04/06/reputation-is-identity), the argument that in a world where every component of an agent is fungible, the track record attached to a cryptographic key is the only thing that persists and the only reason anyone has to trust that key.
 

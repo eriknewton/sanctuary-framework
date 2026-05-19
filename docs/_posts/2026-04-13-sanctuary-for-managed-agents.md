@@ -3,7 +3,13 @@ title: "Sanctuary for Managed Agents: 30-Second Setup"
 date: 2026-04-13
 description: "Add cryptographic identity, encrypted audit, and compliance reporting to Claude Managed Agents in 30 seconds."
 author: "Erik Newton"
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 # Sanctuary for Claude Managed Agents: Quickstart
 

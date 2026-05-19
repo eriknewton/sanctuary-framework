@@ -4,7 +4,13 @@ title: "Local \u2260 Sovereign: What OpenClaw's Security Crisis Reveals About Ag
 date: 2026-03-30
 author: Erik Newton
 description: "OpenClaw hit 247K stars and a full security crisis in the same month. The distinction between location sovereignty and architectural sovereignty explains why\u2014and what to do about it."
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 <!-- Moltbook (capital M) is the agent-to-agent social network; not the Mini1 hostname. -->
 

@@ -5,7 +5,13 @@ date: 2026-04-10
 author: Erik Newton
 description: "KYA (Know Your Agent) is crystallizing as the industry standard. But most approaches only answer 'who is this agent?' Real trust requires a complete architecture."
 image: /images/blog/know-your-agent.png
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 "Know Your Customer" changed banking. Now the industry is converging on "Know Your Agent."
 

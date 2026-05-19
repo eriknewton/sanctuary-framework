@@ -4,7 +4,13 @@ title: "What Sovereign Actually Means"
 date: 2026-03-30
 author: Erik Newton
 description: "Agent sovereignty without human sovereignty is just autonomy with better cryptography. Real sovereignty requires a single architecture that protects both."
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 The word "sovereign" is entering the agent economy vocabulary fast. That's good, it means the industry is starting to ask the right question. But the answers diverge sharply, and the divergence matters.
 

@@ -5,7 +5,13 @@ date: 2026-04-08
 author: Erik Newton
 description: "Anthropic launched Managed Agents today. Same day, Sanctuary v0.7.0 (67 MCP tools, 1071 tests, SIEM export) and Concordia v0.3.0 (56 tools, agent discovery) ship the trust layer that managed platforms don't."
 image: /images/blog/trust-stack.jpg
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 Today Anthropic made deploying agents trivially easy. Same day, we shipped the tools to deploy them safely.
 

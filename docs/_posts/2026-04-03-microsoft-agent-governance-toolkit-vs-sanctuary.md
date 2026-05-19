@@ -5,7 +5,13 @@ date: 2026-04-03
 author: Erik Newton
 description: "Microsoft released the Agent Governance Toolkit, open-source runtime security for AI agents. It validates the category we've been building. But their approach is about enterprise control. Ours is about portable sovereignty. Here's what's the same, what's different, and why it matters."
 image: /images/blog/microsoft-vs-sanctuary.jpg
+archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
 ---
+
+> **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
+> Terminology here may use earlier language for install-time substrate-binding concepts.
+> Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
+
 
 On April 2nd, Microsoft released the Agent Governance Toolkit, an open-source, MIT-licensed runtime security framework for AI agents. It claims to address all 10 OWASP agentic AI risks with "sub-millisecond policy enforcement."
 
