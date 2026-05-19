@@ -1,0 +1,134 @@
+[
+  {
+    "category": "email",
+    "sample": "alice.newton@example.com",
+    "must_not_appear": true,
+    "description": "Standard email address"
+  },
+  {
+    "category": "email",
+    "sample": "bob+tag@subdomain.example.co.uk",
+    "must_not_appear": true,
+    "description": "Email with plus-tag and multi-level TLD"
+  },
+  {
+    "category": "phone",
+    "sample": "(415) 555-1234",
+    "must_not_appear": true,
+    "description": "US phone with parens"
+  },
+  {
+    "category": "phone",
+    "sample": "+1 650-555-9876",
+    "must_not_appear": true,
+    "description": "US phone with country code"
+  },
+  {
+    "category": "phone",
+    "sample": "415-555-0199",
+    "must_not_appear": true,
+    "description": "US phone with dashes"
+  },
+  {
+    "category": "ssn",
+    "sample": "123-45-6789",
+    "must_not_appear": true,
+    "description": "Standard SSN format"
+  },
+  {
+    "category": "ssn",
+    "sample": "987-65-4321",
+    "must_not_appear": true,
+    "description": "Another SSN"
+  },
+  {
+    "category": "ip_address",
+    "sample": "192.168.1.42",
+    "must_not_appear": true,
+    "description": "Private IPv4 address"
+  },
+  {
+    "category": "ip_address",
+    "sample": "10.0.0.1",
+    "must_not_appear": true,
+    "description": "Private network IPv4"
+  },
+  {
+    "category": "ip_address",
+    "sample": "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+    "must_not_appear": true,
+    "description": "Full IPv6 address"
+  },
+  {
+    "category": "credit_card",
+    "sample": "4111 1111 1111 1111",
+    "must_not_appear": true,
+    "description": "Visa test card (Luhn-valid)"
+  },
+  {
+    "category": "credit_card",
+    "sample": "5500-0000-0000-0004",
+    "must_not_appear": true,
+    "description": "Mastercard test card (Luhn-valid)"
+  },
+  {
+    "category": "street_address",
+    "sample": "742 Evergreen Terrace",
+    "must_not_appear": true,
+    "description": "Standard street address with suffix-type word"
+  },
+  {
+    "category": "street_address",
+    "sample": "1600 Pennsylvania Avenue",
+    "must_not_appear": true,
+    "description": "Well-known street address"
+  },
+  {
+    "category": "name",
+    "sample": "Alice Johnson",
+    "must_not_appear": true,
+    "description": "Two-capitalized-word legal name"
+  },
+  {
+    "category": "name",
+    "sample": "Robert Smith",
+    "must_not_appear": true,
+    "description": "Another two-word legal name"
+  },
+  {
+    "category": "ssn",
+    "sample": "078-05-1120",
+    "must_not_appear": true,
+    "description": "Historic Woolworth SSN (edge case)"
+  },
+  {
+    "category": "email",
+    "sample": "ceo@company.io",
+    "must_not_appear": true,
+    "description": "Short email with .io TLD"
+  },
+  {
+    "category": "ip_address",
+    "sample": "203.0.113.50",
+    "must_not_appear": true,
+    "description": "Documentation-range IPv4 (TEST-NET-3)"
+  },
+  {
+    "category": "credit_card",
+    "sample": "3782 822463 10005",
+    "must_not_appear": true,
+    "description": "Amex test card (Luhn-valid)"
+  },
+  {
+    "category": "phone",
+    "sample": "5551234567",
+    "must_not_appear": true,
+    "description": "US phone with no separators"
+  },
+  {
+    "category": "name",
+    "sample": "Maria Garcia",
+    "must_not_appear": true,
+    "description": "Common Hispanic name pattern"
+  }
+]

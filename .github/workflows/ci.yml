@@ -73,3 +73,7 @@ jobs:
       - name: Run security tests
         working-directory: server
         run: npm run test:security
+
+      - name: Zero-PII regression gate
+        working-directory: server
+        run: npm run test:zero-pii-regression
