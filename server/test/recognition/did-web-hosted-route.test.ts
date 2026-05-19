@@ -89,15 +89,19 @@ function createMockResponse(): ServerResponse & {
   res._statusCode = 0;
   res._headers = {};
   res._body = "";
-  res.writeHead = vi.fn((status: number, headers?: Record<string, string>) => {
-    res._statusCode = status;
-    if (headers) res._headers = { ...res._headers, ...headers };
+  const origWriteHead = res.writeHead.bind(res);
+  res.writeHead = vi.fn((...args: unknown[]) => {
+    res._statusCode = args[0] as number;
+    const headerArg = args.length === 3 ? args[2] : args[1];
+    if (headerArg && typeof headerArg === "object") {
+      res._headers = { ...res._headers, ...(headerArg as Record<string, string>) };
+    }
     return res;
-  });
-  res.end = vi.fn((body?: string) => {
-    if (body) res._body = body;
+  }) as unknown as typeof res.writeHead;
+  res.end = vi.fn((body?: unknown) => {
+    if (typeof body === "string") res._body = body;
     return res;
-  });
+  }) as unknown as typeof res.end;
   return res;
 }
 
