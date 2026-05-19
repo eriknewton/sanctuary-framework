@@ -1,6 +1,5 @@
 /**
- * Sanctuary v1.3 WP-V1.3-1 catalog of baseline sentinels. Closed at
- * Phi-5; WP-V1.3-1 Sentinel Baseline Pack is complete.
+ * Sanctuary v1.3 sentinel catalog.
  *
  * Each entry is a factory the registry calls per-fortress.
  *
@@ -9,6 +8,7 @@
  * Phi-3: cross-agent-chatter (first-order, audit-log based)
  * Phi-4: suspicious-tool-call (first-order, audit-log based)
  * Phi-5: anomaly-trigger (meta-sentinel, finding-store based)
+ * Phi-6: ebpf-syscall-watcher (kernel observation, Linux only)
  */
 
 import {
@@ -31,6 +31,10 @@ import {
   AnomalyTriggerWatcher,
   ANOMALY_TRIGGER_SENTINEL_ID,
 } from "./anomaly-trigger.js";
+import {
+  EbpfSyscallWatcher,
+  EBPF_SYSCALL_SENTINEL_ID,
+} from "./ebpf-syscall-watcher.js";
 import type { SentinelCatalogEntry } from "../sentinel-registry.js";
 
 export const PHI1_BASELINE_CATALOG: SentinelCatalogEntry[] = [
@@ -64,6 +68,12 @@ export const PHI1_BASELINE_CATALOG: SentinelCatalogEntry[] = [
       "Meta-sentinel. Watches for patterns ACROSS other sentinels' findings: compound suspicious behavior on one agent, fortress-wide finding-count spikes, and novel cross-sentinel combinations. Closes WP-V1.3-1 Sentinel Baseline Pack.",
     factory: () => new AnomalyTriggerWatcher(),
   },
+  {
+    sentinelId: EBPF_SYSCALL_SENTINEL_ID,
+    description:
+      "Observes process spawn, file access, and unfiltered outbound connect syscalls via eBPF (Linux only). Stub mode on non-Linux platforms.",
+    factory: () => new EbpfSyscallWatcher(),
+  },
 ];
 
 export {
@@ -77,4 +87,6 @@ export {
   SUSPICIOUS_TOOL_CALL_SENTINEL_ID,
   AnomalyTriggerWatcher,
   ANOMALY_TRIGGER_SENTINEL_ID,
+  EbpfSyscallWatcher,
+  EBPF_SYSCALL_SENTINEL_ID,
 };

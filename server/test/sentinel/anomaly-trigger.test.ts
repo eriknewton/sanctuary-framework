@@ -512,8 +512,8 @@ describe("WP-V1.3-1 Phi-5 catalog + registry integration", () => {
     expect(ids).toContain(CROSS_AGENT_CHATTER_SENTINEL_ID);
     expect(ids).toContain(SUSPICIOUS_TOOL_CALL_SENTINEL_ID);
     expect(ids).toContain(ANOMALY_TRIGGER_SENTINEL_ID);
-    // WP-V1.3-1 closes with exactly five baseline sentinels.
-    expect(ids.length).toBe(5);
+    // Baseline pack (5) + observation sentinels added post-baseline.
+    expect(ids.length).toBe(6);
   });
 
   it("subscribes + unsubscribes via the Phi-1 registry surface", async () => {
