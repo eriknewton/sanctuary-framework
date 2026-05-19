@@ -77,3 +77,7 @@ jobs:
       - name: Zero-PII regression gate
         working-directory: server
         run: npm run test:zero-pii-regression
+
+      - name: QLA performance budget gate
+        working-directory: server
+        run: npm run test:qla-perf-budget

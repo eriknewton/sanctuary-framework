@@ -33,6 +33,7 @@
     "test:integration": "vitest run test/integration",
     "test:conformance": "vitest run test/conformance",
     "test:zero-pii-regression": "vitest run test/query-anonymity/zero-pii-regression.test.ts",
+    "test:qla-perf-budget": "vitest run test/query-anonymity/performance-budget.test.ts",
     "test:e2e": "playwright test",
     "test:e2e:chromium": "playwright test --project=chromium",
     "test:e2e:webkit": "playwright test --project=webkit",
