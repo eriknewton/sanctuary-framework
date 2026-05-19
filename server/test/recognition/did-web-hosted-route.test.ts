@@ -74,34 +74,33 @@ function createMockRequest(method: string, path: string): IncomingMessage {
   return req;
 }
 
-function createMockResponse(): ServerResponse & {
-  _statusCode: number;
-  _headers: Record<string, string>;
+interface MockResponse extends ServerResponse {
   _body: string;
-} {
+  _capturedStatus: number;
+  _capturedHeaders: Record<string, string>;
+}
+
+function createMockResponse(): MockResponse {
   const socket = new Socket();
   const req = new IncomingMessage(socket);
-  const res = new ServerResponse(req) as ServerResponse & {
-    _statusCode: number;
-    _headers: Record<string, string>;
-    _body: string;
-  };
-  res._statusCode = 0;
-  res._headers = {};
+  const res = new ServerResponse(req) as MockResponse;
   res._body = "";
-  const origWriteHead = res.writeHead.bind(res);
-  res.writeHead = vi.fn((...args: unknown[]) => {
-    res._statusCode = args[0] as number;
-    const headerArg = args.length === 3 ? args[2] : args[1];
+  res._capturedStatus = 0;
+  res._capturedHeaders = {};
+  // Spy on writeHead to capture status + headers without writing to socket
+  vi.spyOn(res, "writeHead").mockImplementation((...args: unknown[]) => {
+    res._capturedStatus = args[0] as number;
+    // writeHead(status, headers) or writeHead(status, msg, headers)
+    const headerArg = args.length >= 3 ? args[2] : args[1];
     if (headerArg && typeof headerArg === "object") {
-      res._headers = { ...res._headers, ...(headerArg as Record<string, string>) };
+      Object.assign(res._capturedHeaders, headerArg as Record<string, string>);
     }
     return res;
-  }) as unknown as typeof res.writeHead;
-  res.end = vi.fn((body?: unknown) => {
-    if (typeof body === "string") res._body = body;
+  });
+  vi.spyOn(res, "end").mockImplementation((...args: unknown[]) => {
+    if (typeof args[0] === "string") res._body = args[0];
     return res;
-  }) as unknown as typeof res.end;
+  });
   return res;
 }
 
@@ -250,7 +249,7 @@ describe("did-web-hosted-route", () => {
       "/my-op/.well-known/did.json",
     );
     expect(handled).toBe(true);
-    expect(res._statusCode).toBe(200);
+    expect(res._capturedStatus).toBe(200);
     const body = JSON.parse(res._body);
     expect(body.id).toBe("did:web:identity.sanctuaryprotocol.ai:my-op");
   });
@@ -261,7 +260,7 @@ describe("did-web-hosted-route", () => {
       "GET",
       "/header-test/.well-known/did.json",
     );
-    expect(res._headers["Content-Type"]).toBe(
+    expect(res._capturedHeaders["Content-Type"]).toBe(
       "application/did+json; charset=utf-8",
     );
   });
@@ -272,7 +271,7 @@ describe("did-web-hosted-route", () => {
       "GET",
       "/cache-test/.well-known/did.json",
     );
-    expect(res._headers["Cache-Control"]).toBe(
+    expect(res._capturedHeaders["Cache-Control"]).toBe(
       "public, max-age=300, must-revalidate",
     );
   });
@@ -283,7 +282,7 @@ describe("did-web-hosted-route", () => {
       "/unknown/.well-known/did.json",
     );
     expect(handled).toBe(true);
-    expect(res._statusCode).toBe(404);
+    expect(res._capturedStatus).toBe(404);
     const body = JSON.parse(res._body);
     expect(body.error).toBe("not_found");
   });
