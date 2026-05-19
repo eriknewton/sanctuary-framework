@@ -9,6 +9,7 @@
  * Phi-4: suspicious-tool-call (first-order, audit-log based)
  * Phi-5: anomaly-trigger (meta-sentinel, finding-store based)
  * Phi-6: ebpf-syscall-watcher (kernel observation, Linux only)
+ * Phi-7: auditd-tail-watcher (cross-platform audit log observation)
  */
 
 import {
@@ -35,6 +36,10 @@ import {
   EbpfSyscallWatcher,
   EBPF_SYSCALL_SENTINEL_ID,
 } from "./ebpf-syscall-watcher.js";
+import {
+  AuditdTailWatcher,
+  AUDITD_TAIL_SENTINEL_ID,
+} from "./auditd-tail-watcher.js";
 import type { SentinelCatalogEntry } from "../sentinel-registry.js";
 
 export const PHI1_BASELINE_CATALOG: SentinelCatalogEntry[] = [
@@ -74,6 +79,12 @@ export const PHI1_BASELINE_CATALOG: SentinelCatalogEntry[] = [
       "Observes process spawn, file access, and unfiltered outbound connect syscalls via eBPF (Linux only). Stub mode on non-Linux platforms.",
     factory: () => new EbpfSyscallWatcher(),
   },
+  {
+    sentinelId: AUDITD_TAIL_SENTINEL_ID,
+    description:
+      "Tails platform audit log as cross-platform fallback for kernel observation when eBPF is unavailable.",
+    factory: () => new AuditdTailWatcher(),
+  },
 ];
 
 export {
@@ -89,4 +100,6 @@ export {
   ANOMALY_TRIGGER_SENTINEL_ID,
   EbpfSyscallWatcher,
   EBPF_SYSCALL_SENTINEL_ID,
+  AuditdTailWatcher,
+  AUDITD_TAIL_SENTINEL_ID,
 };
