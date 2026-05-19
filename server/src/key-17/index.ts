@@ -30,3 +30,21 @@ export {
   type Ap2Mandate,
   type SignedAp2Mandate,
 } from "./ap2-mandate-signer.js";
+
+export {
+  OperatorKeyService,
+  type OperatorKeyInterface,
+  type OperatorKeyServiceConfig,
+} from "./operator-key-interface.js";
+
+export {
+  DefaultPolicyGate,
+  SigningDeniedError,
+  type PolicyGate,
+  type PolicyGateConfig,
+  type ProtocolPolicy,
+  type CounterpartyRule,
+  type PolicyDecision,
+  type SigningApprovalRequest,
+  type SigningAuditEvent,
+} from "./policy-gate.js";
