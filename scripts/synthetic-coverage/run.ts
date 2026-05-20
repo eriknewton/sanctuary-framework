@@ -1,5 +1,10 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import "./fixtures/substrate-trust/attestation-envelope.js";
+import "./fixtures/substrate-trust/audit-chain-checkpoint.js";
+import "./fixtures/substrate-trust/certificate-to-key.js";
+import "./fixtures/substrate-trust/custody-key-isolation.js";
+import "./fixtures/substrate-trust/identity-signing.js";
 import { buildReport, renderMarkdownSummary } from "./report.js";
 
 function findRepoRoot(start = process.cwd()): string {

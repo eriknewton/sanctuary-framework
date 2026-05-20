@@ -1,11 +1,11 @@
 {
   "extends": "../../server/tsconfig.json",
   "compilerOptions": {
-    "rootDir": ".",
+    "rootDir": "../..",
     "noEmit": true,
     "types": ["node"],
     "typeRoots": ["../../server/node_modules/@types"]
   },
-  "include": ["*.ts"],
+  "include": ["*.ts", "fixtures/**/*.ts"],
   "exclude": [".out", "test"]
 }
