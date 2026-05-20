@@ -86,4 +86,4 @@ Because sovereign doesn't mean local. And it doesn't mean autonomous. It means a
 
 ---
 
-*Erik Newton is the sole author of Sanctuary Framework and Concordia Protocol, open infrastructure for the agentic economy. He is a licensed California attorney.*
+*Erik Newton is the author of Sanctuary Framework and Concordia Protocol, open infrastructure for the agentic economy.*

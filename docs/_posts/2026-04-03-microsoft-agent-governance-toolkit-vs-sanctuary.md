@@ -96,4 +96,4 @@ GitHub: [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewto
 
 ---
 
-*Erik Newton is the sole author of Sanctuary Framework and Concordia Protocol.*
+*Erik Newton is the author of Sanctuary Framework and Concordia Protocol, open infrastructure for the agentic economy.*

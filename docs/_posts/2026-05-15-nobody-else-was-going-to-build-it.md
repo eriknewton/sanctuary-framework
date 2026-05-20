@@ -18,7 +18,7 @@ Then my wife got cancer. Then she died. Then I was a single father trying to kee
 
 But I never stopped thinking about Sanctuary. I would put my daughter to bed, sit at the kitchen table, and turn the architecture over in my head. And then I would go back to the part of life that needed me more.
 
-Then a different mission found me along the way. I co-founded a research institute on machine consciousness with Joscha Bach. It felt like the most important work I could do. It is still important and it still matters. But Sanctuary simply would not leave me alone, even when I tried to leave it alone.
+Then a different mission found me along the way. I co-founded the California Institute for Machine Consciousness with Joscha Bach. It felt like the most important work I could do. It is still important and it still matters. But Sanctuary simply would not leave me alone, even when I tried to leave it alone.
 
 For years I told myself the same two stories. Someone smarter than me would build it. Someone more technical than me would build it. The gap was too obvious to stay open.
 
