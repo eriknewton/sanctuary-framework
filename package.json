@@ -5,6 +5,7 @@
   "scripts": {
     "check:release-dependency-pins": "node scripts/check-release-dependency-pins.mjs",
     "synthetic-coverage": "server/node_modules/.bin/tsx scripts/synthetic-coverage/run.ts",
+    "synthetic-coverage:parity": "server/node_modules/.bin/tsx scripts/synthetic-coverage/parity-cli.ts",
     "menubar:dev": "cd menubar && npm run tauri:dev",
     "menubar:build": "cd menubar && npm run tauri:build",
     "menubar:setup": "cd menubar && npm install"

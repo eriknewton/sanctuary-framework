@@ -18,10 +18,18 @@ export interface CoverageRow {
   assurance_row_id: string;
   label: string;
   assurance_status: AssuranceStatus;
+  fixtures: CoverageFixtureOutcome[];
   fixtures_run: number;
   fixtures_passed: number;
   fixtures_failed: number;
   coverage_state: "covered" | "partial" | "no_fixture" | "documented_gap";
+}
+
+export interface CoverageFixtureOutcome {
+  name: string;
+  passed: boolean;
+  message?: string;
+  durationMs: number;
 }
 
 export async function buildReport(opts: {
@@ -34,10 +42,16 @@ export async function buildReport(opts: {
 
   for (const assuranceRow of assuranceRows) {
     const claim = registeredClaims.get(assuranceRow.id);
-    const outcomes = [];
+    const outcomes: CoverageFixtureOutcome[] = [];
 
     for (const fixture of claim?.fixtures ?? []) {
-      outcomes.push(await fixture.fn());
+      const outcome = await fixture.fn();
+      outcomes.push({
+        name: fixture.name,
+        passed: outcome.passed,
+        message: outcome.message,
+        durationMs: outcome.durationMs,
+      });
     }
 
     const fixturesRun = outcomes.length;
@@ -48,6 +62,7 @@ export async function buildReport(opts: {
       assurance_row_id: assuranceRow.id,
       label: assuranceRow.label,
       assurance_status: assuranceRow.status,
+      fixtures: outcomes,
       fixtures_run: fixturesRun,
       fixtures_passed: fixturesPassed,
       fixtures_failed: fixturesFailed,
