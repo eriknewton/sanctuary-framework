@@ -5,6 +5,11 @@ import "./fixtures/substrate-trust/audit-chain-checkpoint.js";
 import "./fixtures/substrate-trust/certificate-to-key.js";
 import "./fixtures/substrate-trust/custody-key-isolation.js";
 import "./fixtures/substrate-trust/identity-signing.js";
+import "./fixtures/castle-wall/boundary-admission.js";
+import "./fixtures/castle-wall/custody-key-gate.js";
+import "./fixtures/castle-wall/deny-by-default.js";
+import "./fixtures/castle-wall/identity-signing-tool-registry-guard.js";
+import "./fixtures/castle-wall/sentinel-registration.js";
 import { buildReport, renderMarkdownSummary } from "./report.js";
 
 function findRepoRoot(start = process.cwd()): string {
