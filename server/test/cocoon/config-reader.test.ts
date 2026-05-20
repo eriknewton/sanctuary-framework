@@ -18,6 +18,7 @@ import {
   findLatestBackup,
   rewriteConfigForCocoon,
 } from "../../src/cocoon/config-reader.js";
+import { detectHarnessSchema } from "../../src/cocoon/harness-schema.js";
 
 describe("Config Reader", () => {
   let tmpDir: string;
@@ -36,6 +37,47 @@ describe("Config Reader", () => {
   // ── Config parsing ──────────────────────────────────────────────
 
   describe("config parsing", () => {
+    it("detects OpenClaw schema from an explicit wrap path", async () => {
+      const configPath = join(tmpDir, "openclaw.json");
+      const config = {
+        mcp: {
+          servers: {
+            filesystem: { command: "node", args: ["fs-server.js"] },
+          },
+        },
+      };
+      await writeFile(configPath, JSON.stringify(config));
+
+      expect(detectHarnessSchema(configPath, config)).toEqual({
+        kind: "openclaw",
+        nativeKey: "mcp.servers",
+      });
+
+      const result = await detectAgentConfig(undefined, configPath);
+      expect(result).not.toBeNull();
+      expect(result!.platform).toBe("openclaw");
+      expect(result!.servers[0]!.name).toBe("filesystem");
+    });
+
+    it("detects Claude Code schema from a Claude fixture", async () => {
+      const configPath = join(tmpDir, ".claude.json");
+      const config = {
+        mcpServers: {
+          filesystem: { command: "node", args: ["fs-server.js"] },
+        },
+      };
+      await writeFile(configPath, JSON.stringify(config));
+
+      expect(detectHarnessSchema(configPath, config)).toEqual({
+        kind: "claude-code",
+        nativeKey: "mcpServers",
+      });
+
+      const result = await detectAgentConfig(undefined, configPath);
+      expect(result).not.toBeNull();
+      expect(result!.platform).toBe("claude-code");
+    });
+
     it("reads OpenClaw-style mcpServers config", async () => {
       const configPath = join(tmpDir, "config.json");
       await writeFile(configPath, JSON.stringify({
@@ -116,6 +158,21 @@ describe("Config Reader", () => {
       const result = await detectAgentConfig("openclaw", configPath);
       expect(result).not.toBeNull();
       expect(result!.servers).toHaveLength(0);
+    });
+
+    it("falls back to generic schema for explicit unknown configs", async () => {
+      const configPath = join(tmpDir, "custom-agent.json");
+      const config = { theme: "dark" };
+      await writeFile(configPath, JSON.stringify(config));
+
+      expect(detectHarnessSchema(configPath, config)).toEqual({
+        kind: "generic",
+        nativeKey: "mcpServers",
+      });
+
+      const result = await detectAgentConfig(undefined, configPath);
+      expect(result).not.toBeNull();
+      expect(result!.platform).toBe("generic");
     });
 
     it("skips sanctuary entries in claude-code config", async () => {
@@ -314,6 +371,89 @@ describe("Config Reader", () => {
       expect(rewritten.mcp.servers.concordia.command).toBe("python");
       expect(rewritten.mcp.servers.concordia.env).toEqual({ CONCORDIA_KEY: "secret123" });
       expect(rewritten.mcp.servers.filesystem).toBeDefined();
+    });
+
+    it("writes explicit OpenClaw wrap paths to mcp.servers, not mcpServers", async () => {
+      const configPath = join(tmpDir, "openclaw-drill.json");
+      const original = {
+        mcp: {
+          servers: {
+            filesystem: { command: "node", args: ["fs-server.js"] },
+          },
+        },
+      };
+      await writeFile(configPath, JSON.stringify(original));
+
+      const agentConfig = await detectAgentConfig(undefined, configPath);
+      expect(agentConfig).not.toBeNull();
+      expect(agentConfig!.platform).toBe("openclaw");
+
+      await rewriteConfigForCocoon(
+        agentConfig!,
+        "npx",
+        ["@sanctuary-framework/mcp-server"],
+        { SANCTUARY_PASSPHRASE: "test" }
+      );
+
+      const rewritten = JSON.parse(await readFile(configPath, "utf-8"));
+      expect(rewritten.mcp.servers.sanctuary).toBeDefined();
+      expect(rewritten.mcp.servers.filesystem).toBeDefined();
+      expect(rewritten.mcpServers).toBeUndefined();
+    });
+
+    it("removes stale flat sanctuary entries when rewriting OpenClaw configs", async () => {
+      const configPath = join(tmpDir, "openclaw.json");
+      const original = {
+        mcp: {
+          servers: {
+            filesystem: { command: "node", args: ["fs-server.js"] },
+          },
+        },
+        mcpServers: {
+          sanctuary: {
+            command: "node",
+            args: ["/tmp/v12-drill-fortress/deleted.js"],
+          },
+        },
+      };
+      await writeFile(configPath, JSON.stringify(original));
+
+      const agentConfig = await detectAgentConfig(undefined, configPath);
+      expect(agentConfig).not.toBeNull();
+
+      await rewriteConfigForCocoon(
+        agentConfig!,
+        "npx",
+        ["@sanctuary-framework/mcp-server"],
+        { SANCTUARY_PASSPHRASE: "test" }
+      );
+
+      const rewritten = JSON.parse(await readFile(configPath, "utf-8"));
+      expect(rewritten.mcp.servers.sanctuary.command).toBe("npx");
+      expect(rewritten.mcp.servers.sanctuary.args).toEqual([
+        "@sanctuary-framework/mcp-server",
+      ]);
+      expect(rewritten.mcpServers).toBeUndefined();
+    });
+
+    it("writes generic explicit wrap paths to mcpServers", async () => {
+      const configPath = join(tmpDir, "custom-agent.json");
+      await writeFile(configPath, JSON.stringify({ theme: "dark" }));
+
+      const agentConfig = await detectAgentConfig(undefined, configPath);
+      expect(agentConfig).not.toBeNull();
+      expect(agentConfig!.platform).toBe("generic");
+
+      await rewriteConfigForCocoon(
+        agentConfig!,
+        "npx",
+        ["@sanctuary-framework/mcp-server"],
+        { SANCTUARY_PASSPHRASE: "test" }
+      );
+
+      const rewritten = JSON.parse(await readFile(configPath, "utf-8"));
+      expect(rewritten.mcpServers.sanctuary).toBeDefined();
+      expect(rewritten.mcp).toBeUndefined();
     });
 
     it("preserves existing servers in flat mcpServers format", async () => {

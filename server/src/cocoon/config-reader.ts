@@ -12,6 +12,7 @@ import { readFile, writeFile, mkdir, copyFile, access } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { resolveStoragePath } from "../paths.js";
+import { detectHarnessSchema } from "./harness-schema.js";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -244,7 +245,7 @@ export async function detectAgentConfigWithDiagnostics(
   // If explicit path given, try to read it
   if (configPath) {
     pathsChecked.push(configPath);
-    const { config, error } = await readConfigFileWithError(configPath, platform ?? "generic");
+    const { config, error } = await readConfigFileWithError(configPath, platform);
     if (error) errors.push({ path: configPath, error });
     return { config, pathsChecked, errors };
   }
@@ -278,7 +279,7 @@ export async function detectAgentConfigWithDiagnostics(
 
 async function readConfigFileWithError(
   path: string,
-  platform: AgentPlatform
+  platform?: AgentPlatform
 ): Promise<{ config: AgentConfig | null; error?: string }> {
   try {
     await access(path);
@@ -300,8 +301,13 @@ async function readConfigFileWithError(
     return { config: null, error: `Invalid JSON: ${(err as Error).message}` };
   }
 
-  const servers = extractServers(config, platform);
-  return { config: { platform, configPath: path, servers, rawConfig: config } };
+  const detectedPlatform =
+    platform ??
+    (config && typeof config === "object"
+      ? detectHarnessSchema(path, config).kind
+      : "generic");
+  const servers = extractServers(config, detectedPlatform);
+  return { config: { platform: detectedPlatform, configPath: path, servers, rawConfig: config } };
 }
 
 /**
