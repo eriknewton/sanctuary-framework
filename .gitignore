@@ -50,3 +50,6 @@ castle-wall-daemon/Cargo.lock
 castle-wall-macos/.build/
 castle-wall-macos/build/
 castle-wall-macos/Package.resolved
+
+# Per-machine Claude Code permissions; never commit
+.claude/settings.local.json
