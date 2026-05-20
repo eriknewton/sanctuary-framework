@@ -210,10 +210,15 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       return 0;
     }
 
-    if (command === "verify") {
+    if (command === "verify" || command === "verify-exit-bundle") {
       const dir = argv[1];
       if (!dir) {
-        write(err, "Usage: sanctuary exit verify <dir>\n");
+        write(
+          err,
+          command === "verify-exit-bundle"
+            ? "Usage: sanctuary verify-exit-bundle <dir>\n"
+            : "Usage: sanctuary exit verify <dir>\n",
+        );
         return 2;
       }
       let result;
@@ -232,8 +237,16 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         throw e;
       }
       if (json) {
-        write(out, JSON.stringify(result, null, 2) + "\n");
+        write(
+          out,
+          JSON.stringify(
+            { verdict: result.passed ? "PASS" : "FAIL", ...result },
+            null,
+            2,
+          ) + "\n",
+        );
       } else {
+        write(out, `verdict: ${result.passed ? "PASS" : "FAIL"}\n`);
         write(out, `manifest: ${result.passed ? "verified" : "failed"}\n`);
         write(out, `identity: ${result.manifest_summary.identity_id}\n`);
         write(out, `artifacts: ${result.manifest_summary.artifact_count}\n`);
@@ -399,10 +412,15 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       return 0;
     }
 
-    if (command === "import") {
+    if (command === "import" || command === "import-exit-bundle") {
       const dir = argv[1];
       if (!dir) {
-        write(err, "Usage: sanctuary exit import <dir> [--activate]\n");
+        write(
+          err,
+          command === "import-exit-bundle"
+            ? "Usage: sanctuary import-exit-bundle <dir> [--activate]\n"
+            : "Usage: sanctuary exit import <dir> [--activate]\n",
+        );
         return 2;
       }
 
@@ -508,8 +526,17 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         }
         throw e;
       }
-      if (json) write(out, JSON.stringify(result, null, 2) + "\n");
-      else {
+      if (json) {
+        write(
+          out,
+          JSON.stringify(
+            { verdict: result.verified ? "PASS" : "FAIL", ...result },
+            null,
+            2,
+          ) + "\n",
+        );
+      } else {
+        write(out, `verdict: ${result.verified ? "PASS" : "FAIL"}\n`);
         write(out, `verified: ${result.verified}\n`);
         write(out, `activated: ${result.activated}\n`);
         write(out, `state_conflicts: ${result.conflicts.state_conflicts.length}\n`);
@@ -532,4 +559,3 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
     return 1;
   }
 }
-

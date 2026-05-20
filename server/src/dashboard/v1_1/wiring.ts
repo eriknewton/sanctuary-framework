@@ -27,11 +27,14 @@
  *     after Tier 1 approval.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { defaultConfig, type SanctuaryConfig } from "../../config.js";
+import { exportExitBundle } from "../../exit/bundle.js";
 import type { AuditLog } from "../../l2-operational/audit-log.js";
+import { IdentityManager } from "../../l1-cognitive/tools.js";
 import {
   HubService,
   InMemoryLocalAgentRegistry,
@@ -45,6 +48,9 @@ import {
 import type { ChannelTemplateId } from "../../policy-engine/constants.js";
 import type { HubAgentStatus } from "../../contracts/v1.1/constants.js";
 import type { SubstrateSelector } from "../../intelligence/selector.js";
+import type { ReputationStore } from "../../l4-reputation/reputation-store.js";
+import { loadPrincipalPolicy } from "../../principal-policy/loader.js";
+import type { PrincipalPolicy } from "../../principal-policy/types.js";
 import type { StorageBackend } from "../../storage/interface.js";
 import {
   ConciergeMemoryStore,
@@ -115,6 +121,14 @@ export interface BuildV11BindingsInputs {
    * Omit and the chat service is not constructed.
    */
   masterKey?: Uint8Array;
+  /** Optional loaded identity manager for fortress-scope export wiring. */
+  identityManager?: IdentityManager;
+  /** Optional loaded reputation store for fortress-scope export wiring. */
+  reputationStore?: ReputationStore;
+  /** Optional already-loaded principal policy for fortress-scope export. */
+  policy?: PrincipalPolicy;
+  /** Optional loaded config for fortress-scope export metadata. */
+  config?: SanctuaryConfig;
   /**
    * Operator-tunable retention window for the WP-V1.3-9 Tau-1 concierge
    * memory store. Defaults to 30 days when omitted. Wired through from
@@ -334,6 +348,57 @@ export function buildV11Bindings(
       listBudgetSummaries: () => [],
     },
     agentController: new CapabilityErrorAgentController(),
+    ...(inputs.storage && inputs.masterKey && inputs.storagePath
+      ? {
+          fortressExportBundle: async (approvalAuditId?: string) => {
+            const storage = inputs.storage!;
+            const masterKey = inputs.masterKey!;
+            const storagePath = inputs.storagePath!;
+            const identityManager =
+              inputs.identityManager ??
+              new IdentityManager(storage, masterKey);
+            if (!inputs.identityManager) await identityManager.load();
+            const policy =
+              inputs.policy ?? (await loadPrincipalPolicy(storagePath));
+            const config =
+              inputs.config ??
+              {
+                ...defaultConfig(),
+                storage_path: storagePath,
+              };
+            const stamp = new Date()
+              .toISOString()
+              .replace(/[:.]/g, "-");
+            const bundleDir = join(
+              storagePath,
+              "exit-bundles",
+              `${stamp}-${randomUUID()}`,
+            );
+            const exported = await exportExitBundle({
+              bundleDir,
+              storage,
+              masterKey,
+              identityManager,
+              auditLog: inputs.auditLog,
+              ...(inputs.reputationStore
+                ? { reputationStore: inputs.reputationStore }
+                : {}),
+              policy,
+              config,
+              stateStoragePath: join(storagePath, "state"),
+              keySource: "unknown",
+              ...(approvalAuditId !== undefined
+                ? { exportApprovalAuditId: approvalAuditId }
+                : {}),
+            });
+            return {
+              bundle_dir: exported.bundle_dir,
+              manifest_hash: exported.manifest_hash,
+              artifact_count: exported.artifact_count,
+            };
+          },
+        }
+      : {}),
     ...(operatorChatService ? { operatorChat: operatorChatService } : {}),
   });
   return {

@@ -505,6 +505,9 @@ export async function startStandaloneDashboard(
     // namespace.
     storage,
     masterKey,
+    identityManager,
+    policy,
+    config,
   });
   dashboard.setV11Bindings(v11Bindings);
 

@@ -17,13 +17,21 @@ import { createSanctuaryServer } from "./index.js";
 import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusal.js";
 import { checkForUpdate } from "./update-check.js";
 import { createRequire } from "node:module";
+import { basename } from "node:path";
 
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
 
 async function main(): Promise<void> {
   // Parse CLI flags
-  const args = process.argv.slice(2);
+  const invokedAs = basename(process.argv[1] ?? "");
+  let args = process.argv.slice(2);
+  if (
+    invokedAs === "verify-exit-bundle" ||
+    invokedAs === "import-exit-bundle"
+  ) {
+    args = [invokedAs, ...args];
+  }
   let passphrase = process.env.SANCTUARY_PASSPHRASE;
 
   // v1.1.2 hotfix (Finding W): the MCP-server-boot path documents
@@ -123,6 +131,15 @@ async function main(): Promise<void> {
   if (args[0] === "exit") {
     const { runExitCommand } = await import("./exit/index.js");
     const code = await runExitCommand({ argv: args.slice(1) });
+    drainAndExit(code);
+  }
+
+  if (
+    args[0] === "verify-exit-bundle" ||
+    args[0] === "import-exit-bundle"
+  ) {
+    const { runExitCommand } = await import("./exit/index.js");
+    const code = await runExitCommand({ argv: args });
     drainAndExit(code);
   }
 

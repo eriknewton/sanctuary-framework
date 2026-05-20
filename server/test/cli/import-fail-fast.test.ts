@@ -51,7 +51,7 @@ describe("exit import fail-fast", () => {
     // error from openExitContext. Post-fix, it should fail with a
     // bundle-not-found error before any passphrase check.
     const code = await runExitCommand({
-      argv: ["import", nonexistent],
+      argv: ["import-exit-bundle", nonexistent],
       out,
       err,
       env: {},

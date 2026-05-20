@@ -475,16 +475,18 @@ describe("v1.1 acceptance drill - Pillar 4: portability + exit", () => {
       const verifyOut = new StringSink();
       const verifyErr = new StringSink();
       const verifyCode = await runExitCommand({
-        argv: ["verify", bundleDir, "--json"],
+        argv: ["verify-exit-bundle", bundleDir, "--json"],
         out: verifyOut,
         err: verifyErr,
       });
       expect(verifyCode).toBe(0);
       const verifyResult = JSON.parse(verifyOut.buffer) as {
+        verdict: string;
         passed: boolean;
         manifest_summary: { artifact_count: number; identity_id: string };
         artifact_results: Array<{ kind: string; hash_passed: boolean }>;
       };
+      expect(verifyResult.verdict).toBe("PASS");
       expect(verifyResult.passed).toBe(true);
       expect(verifyResult.manifest_summary.artifact_count).toBeGreaterThan(0);
       expect(verifyResult.manifest_summary.identity_id).toBe(sourceIdentityId);
