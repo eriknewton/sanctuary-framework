@@ -10,6 +10,8 @@ import "./fixtures/castle-wall/custody-key-gate.js";
 import "./fixtures/castle-wall/deny-by-default.js";
 import "./fixtures/castle-wall/identity-signing-tool-registry-guard.js";
 import "./fixtures/castle-wall/sentinel-registration.js";
+import "./fixtures/audit-and-envelope/audit-chain-verifier.js";
+import "./fixtures/audit-and-envelope/state-envelope-migration.js";
 import { buildReport, renderMarkdownSummary } from "./report.js";
 
 function findRepoRoot(start = process.cwd()): string {
