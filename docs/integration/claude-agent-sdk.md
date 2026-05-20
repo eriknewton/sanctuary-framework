@@ -7,8 +7,8 @@
 
 - Python 3.10+ with `anthropic` package, or Node.js 18+ with `@anthropic-ai/sdk`
 - `ANTHROPIC_API_KEY` set in your environment
-- Sanctuary: `npm install @sanctuary-framework/mcp-server@0.7.0`
-  (or use `npx` for zero-install — it downloads on first run)
+- Sanctuary: `npm install @sanctuary-framework/mcp-server`
+  (or use `npx` for zero-install; it downloads on first run)
 
 ## Step 1: Add Sanctuary to Your Agent
 
@@ -36,7 +36,7 @@ response = client.messages.create(
             }
         }
     ],
-    # Sanctuary as MCP server — spawned automatically as a subprocess
+    # Sanctuary as MCP server, spawned automatically as a subprocess
     # Configure via the Claude Agent SDK's MCP server support
     messages=[{"role": "user", "content": "Check your sovereignty status."}]
 )
@@ -54,7 +54,7 @@ async for message in query(
         mcp_servers={
             "sanctuary": {
                 "command": "npx",
-                "args": ["@sanctuary-framework/mcp-server@0.7.0"]
+                "args": ["@sanctuary-framework/mcp-server"]
             }
         }
     ),
@@ -75,7 +75,7 @@ for await (const message of query({
     mcpServers: {
       sanctuary: {
         command: "npx",
-        args: ["@sanctuary-framework/mcp-server@0.7.0"]
+        args: ["@sanctuary-framework/mcp-server"]
       }
     }
   }
@@ -91,7 +91,7 @@ for await (const message of query({
   "mcpServers": {
     "sanctuary": {
       "command": "npx",
-      "args": ["@sanctuary-framework/mcp-server@0.7.0"]
+      "args": ["@sanctuary-framework/mcp-server"]
     }
   }
 }
@@ -99,7 +99,7 @@ for await (const message of query({
 
 ## Step 2: Verify Sanctuary Is Active
 
-Ask your agent to call `manifest`. You should see 68 Sanctuary tools listed.
+Ask your agent to call `manifest`. You should see the full Sanctuary tool surface listed.
 
 ## Step 3: Bind an Identity
 
@@ -110,7 +110,7 @@ Create a new identity with identity_create, then set it as primary
 with identity_set_primary.
 ```
 
-The agent receives a DID like `did:key:z6Mk...` — a W3C-standard
+The agent receives a DID like `did:key:z6Mk...`, a W3C-standard
 decentralized identifier backed by an Ed25519 keypair.
 
 ## Step 4: Run a Sovereignty Health Report
@@ -144,10 +144,10 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 ## Runtime Notes
 
 - Agent SDK spawns Sanctuary as a stdio subprocess automatically via `mcp_servers`
-- No port conflicts — stdio transport, not HTTP
+- No port conflicts (stdio transport, not HTTP)
 - Works on macOS, Linux, WSL2. Node.js 18+ required for the Sanctuary subprocess.
 - If using subagents (`Agent` tool), each subagent can independently declare
-  Sanctuary — or inherit from the parent
+  Sanctuary, or inherit from the parent
 - Session resumption preserves MCP server state (identity persists across turns
   within a session)
 - Sanctuary stores keys and state at `~/.sanctuary/`. Ensure the user running
@@ -156,14 +156,14 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 ## Troubleshooting
 
 **"MCP server failed to start"**
-Check `node --version` (need 18+). Run `npx @sanctuary-framework/mcp-server@0.7.0`
+Check `node --version` (need 18+). Run `npx @sanctuary-framework/mcp-server`
 manually to verify it starts and prints tool definitions to stdout.
 
 **Sanctuary tools not appearing**
 Verify `mcp_servers` is inside `ClaudeAgentOptions`, not at the top level of `query()`.
 
 **Tool search deferring Sanctuary tools**
-Agent SDK enables tool search by default for large tool sets. Sanctuary's 68
+Agent SDK enables tool search by default for large tool sets. Sanctuary's
 tools may be deferred. The agent loads them on demand, but if you need specific
 tools immediately, reference them by name in the prompt (e.g., "call `manifest`").
 
@@ -174,7 +174,7 @@ Ensure the process user has write access to that directory.
 **First run is slow**
 `npx` downloads the package on first invocation (~10s). Subsequent runs use
 the cached version. For faster cold starts, install globally:
-`npm install -g @sanctuary-framework/mcp-server@0.7.0`
+`npm install -g @sanctuary-framework/mcp-server`
 
 ## Next Steps
 

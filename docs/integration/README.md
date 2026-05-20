@@ -3,7 +3,7 @@
 > **One sovereignty layer, any runtime.**
 
 Sanctuary Framework is the portable trust layer for AI agents. It composes
-onto any MCP-compatible runtime as a standard MCP server — no custom integration
+onto any MCP-compatible runtime as a standard MCP server. No custom integration
 code, no vendor lock-in.
 
 | Runtime | Guide | Status |
@@ -18,11 +18,11 @@ code, no vendor lock-in.
 
 Every runtime gets the same capabilities:
 
-- **Ed25519 Identity** — Cryptographic keypair + W3C DID per agent
-- **Encrypted Audit Trail** — Tamper-proof CEF/OCSF logs
-- **Sovereignty Health Report** — Real-time L1-L4 status
-- **Verascore Profile** — Portable, verifiable reputation
-- **Sovereignty Handshake** — Mutual trust verification between agents
+- **Ed25519 Identity**: Cryptographic keypair + W3C DID per agent
+- **Encrypted Audit Trail**: Tamper-proof CEF/OCSF logs
+- **Sovereignty Health Report**: Real-time L1-L4 status
+- **Verascore Profile**: Portable, verifiable reputation
+- **Sovereignty Handshake**: Mutual trust verification between agents
 
 ## Quick Start (any runtime)
 

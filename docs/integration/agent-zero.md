@@ -5,13 +5,13 @@
 
 Agent Zero supports MCP servers natively since v0.9.x, including stdio and
 streamable HTTP transports. Sanctuary integrates as a standard MCP server
-connection — no plugins, no custom code.
+connection: no plugins, no custom code.
 
 ## Prerequisites
 
 - Agent Zero 0.9.3+ installed and running
-- Node.js 18+ (in the Agent Zero environment — host or Docker)
-- Sanctuary: `npm install @sanctuary-framework/mcp-server@0.7.0`
+- Node.js 18+ (in the Agent Zero environment, host or Docker)
+- Sanctuary: `npm install @sanctuary-framework/mcp-server`
   (or use `npx` for zero-install)
 
 ## Step 1: Add Sanctuary to Your Config
@@ -25,7 +25,7 @@ Edit your Agent Zero MCP server configuration:
   "mcp_servers": {
     "sanctuary": {
       "command": "npx",
-      "args": ["@sanctuary-framework/mcp-server@0.7.0"],
+      "args": ["@sanctuary-framework/mcp-server"],
       "env": {
         "SANCTUARY_PASSPHRASE": "your-passphrase-here"
       }
@@ -41,7 +41,7 @@ Edit your Agent Zero MCP server configuration:
 3. Add new server:
    - **Name:** `sanctuary`
    - **Command:** `npx`
-   - **Args:** `@sanctuary-framework/mcp-server@0.7.0`
+   - **Args:** `@sanctuary-framework/mcp-server`
    - **Environment:** `SANCTUARY_PASSPHRASE=your-passphrase`
 4. Save and restart
 
@@ -96,11 +96,11 @@ additional configuration.
 
 **Multi-agent.** Agent Zero supports subordinate agents. Each subordinate can
 independently connect to Sanctuary MCP, getting its own identity and audit
-trail — or share the parent's identity.
+trail, or share the parent's identity.
 
 **Agent Zero as MCP server.** Agent Zero can also expose itself as an MCP
 server (v0.9.3+). An Agent Zero instance running Sanctuary can be consumed by
-Claude Agent SDK, Managed Agents, or any other MCP client — creating a
+Claude Agent SDK, Managed Agents, or any other MCP client, creating a
 sovereignty-enabled Agent Zero bridge. Note: Sanctuary tools are NOT
 automatically re-exported through Agent Zero's MCP server interface. For tool
 passthrough, wrap the agent with `sanctuary wrap` so all calls flow through
@@ -111,7 +111,7 @@ is available in the container:
 
 ```dockerfile
 # Add to your Agent Zero Dockerfile
-RUN npm install -g @sanctuary-framework/mcp-server@0.7.0
+RUN npm install -g @sanctuary-framework/mcp-server
 ```
 
 This pre-installs Sanctuary globally, avoiding `npx` download delays on
@@ -128,7 +128,7 @@ shows Sanctuary tools in the "Available Tools" panel. Ask the agent:
   "mcp_servers": {
     "sanctuary": {
       "command": "npx",
-      "args": ["@sanctuary-framework/mcp-server@0.7.0"],
+      "args": ["@sanctuary-framework/mcp-server"],
       "env": { "SANCTUARY_PASSPHRASE": "your-passphrase" }
     },
     "concordia": {
@@ -145,13 +145,13 @@ shows Sanctuary tools in the "Available Tools" panel. Ask the agent:
 **"npx not found" in Docker**
 Add `RUN apt-get update && apt-get install -y nodejs npm` to your Dockerfile,
 or use a Node.js base image. Alternatively, install globally:
-`RUN npm install -g @sanctuary-framework/mcp-server@0.7.0`
+`RUN npm install -g @sanctuary-framework/mcp-server`
 
 **MCP server timeout on startup**
 Agent Zero has a connection timeout for MCP servers. Sanctuary's first `npx`
 run downloads the package (~10s). Subsequent runs use the cached version. If
 timeout occurs, pre-install globally:
-`npm install -g @sanctuary-framework/mcp-server@0.7.0`
+`npm install -g @sanctuary-framework/mcp-server`
 
 **Tool count seems low**
 Agent Zero may use tool search or lazy loading for large tool sets. Ask the

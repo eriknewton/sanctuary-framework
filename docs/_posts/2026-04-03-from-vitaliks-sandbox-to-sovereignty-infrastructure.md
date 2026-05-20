@@ -106,4 +106,4 @@ The sovereign transaction stack is ready. Let's build on it.
 
 ---
 
-*Erik Newton is a licensed California attorney, co-founder of the California Institute for Machine Consciousness, and the creator of Sanctuary Framework and Concordia Protocol.*
+*Erik Newton is the author of Sanctuary Framework and Concordia Protocol, open infrastructure for the agentic economy.*

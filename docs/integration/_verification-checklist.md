@@ -12,12 +12,12 @@ confirms a layer of the sovereignty stack is operational.
 
 ### 1. Manifest (confirms MCP connection)
 
-Call `manifest` and verify the response lists 68 tools across these categories:
+Call `manifest` and verify the response lists the full Sanctuary tool surface across these categories:
 
-- L1 — Cognitive Sovereignty (state, identity, encryption)
-- L2 — Operational Isolation (principal policy, context gating, call governor)
-- L3 — Selective Disclosure (commitments, proofs, attestations)
-- L4 — Verifiable Reputation (reputation, federation, handshake)
+- L1: Cognitive Sovereignty (state, identity, encryption)
+- L2: Operational Isolation (principal policy, context gating, call governor)
+- L3: Selective Disclosure (commitments, proofs, attestations)
+- L4: Verifiable Reputation (reputation, federation, handshake)
 - Concordia Bridge, Dashboard, Sovereignty Audit, SIEM Export, etc.
 
 If you see 0 tools, the MCP server failed to start. Check the runtime-specific
@@ -50,7 +50,7 @@ Expect: A structured report with four layers:
 
 Typical first-run results:
 - L1: FULL (identity created, state encrypted)
-- L2: DEGRADED (no TEE — normal for local/cloud deployments)
+- L2: DEGRADED (no TEE, which is normal for local/cloud deployments)
 - L3: FULL (Schnorr + Pedersen proofs available)
 - L4: FULL after publishing to Verascore; DEGRADED before
 
