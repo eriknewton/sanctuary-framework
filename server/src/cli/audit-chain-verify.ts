@@ -169,6 +169,8 @@ export type ExportRecord = EntryExportRecord | CheckpointExportRecord | LegacyAn
 // ---- Verification report types ----------------------------------------------
 
 export type RecordFindingKind =
+  | "empty_input"
+  | "malformed_input"
   | "entry_hash_mismatch"
   | "prev_hash_mismatch"
   | "sequence_gap"
@@ -223,6 +225,26 @@ export function verifyAuditChainRecords(
   const legacyAnchors = records
     .filter((r): r is LegacyAnchorExportRecord => r.type === "legacy_anchor")
     .sort((a, b) => a.checkpoint_sequence - b.checkpoint_sequence);
+
+  if (
+    entries.length === 0 &&
+    checkpoints.length === 0 &&
+    legacyAnchors.length === 0
+  ) {
+    return {
+      verdict: "FAIL",
+      entries_verified: 0,
+      checkpoints_verified: 0,
+      legacy_anchors_verified: 0,
+      findings: [
+        {
+          kind: "empty_input",
+          message:
+            "audit chain export is empty (0 bytes); chain must contain at least one entry or checkpoint",
+        },
+      ],
+    };
+  }
 
   // Step 1 + 2: Verify entry hashes and chain linkage
   let expectedSeq = 1;
@@ -401,6 +423,55 @@ export function parseJsonl(content: string): ExportRecord[] {
     });
 }
 
+export function emptyInputReport(): VerifyReport {
+  return {
+    verdict: "FAIL",
+    entries_verified: 0,
+    checkpoints_verified: 0,
+    legacy_anchors_verified: 0,
+    findings: [
+      {
+        kind: "empty_input",
+        message:
+          "audit chain export is empty (0 bytes); chain must contain at least one entry or checkpoint",
+      },
+    ],
+  };
+}
+
+export function malformedInputReport(err: unknown): VerifyReport {
+  return {
+    verdict: "FAIL",
+    entries_verified: 0,
+    checkpoints_verified: 0,
+    legacy_anchors_verified: 0,
+    findings: [
+      {
+        kind: "malformed_input",
+        message: `audit chain export is not valid JSONL: ${String(err)}`,
+      },
+    ],
+  };
+}
+
+export function verifyAuditChainContent(
+  content: string,
+  opts: { publicKey?: string; strict?: boolean } = {}
+): VerifyReport {
+  if (content.length === 0) {
+    return emptyInputReport();
+  }
+
+  let records: ExportRecord[];
+  try {
+    records = parseJsonl(content);
+  } catch (err) {
+    return malformedInputReport(err);
+  }
+
+  return verifyAuditChainRecords(records, opts);
+}
+
 // ---- CLI entry point --------------------------------------------------------
 
 export interface VerifyArgs {
@@ -430,22 +501,14 @@ export async function runVerify(args: VerifyArgs): Promise<void> {
     process.exit(1);
   }
 
-  let records: ExportRecord[];
-  try {
-    records = parseJsonl(content);
-  } catch (err) {
-    process.stderr.write(`Error parsing JSONL: ${String(err)}\n`);
-    process.exit(1);
-  }
-
-  const report = verifyAuditChainRecords(records, {
+  const report = verifyAuditChainContent(content, {
     publicKey: args.publicKey,
     strict: args.strict,
   });
 
   process.stdout.write(JSON.stringify(report, null, 2) + "\n");
 
-  if (args.strict && report.findings.length > 0) {
+  if (args.strict && report.verdict === "FAIL") {
     process.exit(1);
   }
 }
