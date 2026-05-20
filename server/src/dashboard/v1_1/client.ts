@@ -1999,8 +1999,8 @@ function renderExitDrill() {
     ? '<dl class="kv"><dt>Bundle dir</dt><dd class="mono">' + escHtml(state.exitDrill.bundleResult.bundle_dir || "") + '</dd>' +
       '<dt>Manifest hash</dt><dd class="mono">' + escHtml((state.exitDrill.bundleResult.manifest_hash || "").slice(0, 32) + "...") + '</dd></dl>'
     : '<span class="muted">Bundle artifacts will be listed here once packaging completes.</span>';
-  const verifyCmd = "npx @sanctuary-framework/mcp-server verify-exit-bundle &lt;bundle_dir&gt;";
-  const importCmd = "npx @sanctuary-framework/mcp-server import-exit-bundle &lt;bundle_dir&gt;";
+  const verifyCmd = "sanctuary verify-exit-bundle &lt;bundle_dir&gt;";
+  const importCmd = "sanctuary import-exit-bundle &lt;bundle_dir&gt;";
   const step4Body = '<p class="muted">Run on a fresh shell:</p><pre class="code-block">' + verifyCmd + '</pre>' +
     '<button class="btn" data-action="exit-mark-verified">Mark verified</button>';
   const step5Body = '<p class="muted">Run this command on the destination fortress, not on this one. The destination will prompt for the bundle source passphrase or recovery key.</p><pre class="code-block">' + importCmd + '</pre>';

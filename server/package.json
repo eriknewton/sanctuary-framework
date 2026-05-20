@@ -8,7 +8,9 @@
   "types": "dist/index.d.ts",
   "bin": {
     "sanctuary-mcp-server": "dist/cli.js",
-    "sanctuary": "dist/cli.js"
+    "sanctuary": "dist/cli.js",
+    "verify-exit-bundle": "dist/cli.js",
+    "import-exit-bundle": "dist/cli.js"
   },
   "exports": {
     ".": {

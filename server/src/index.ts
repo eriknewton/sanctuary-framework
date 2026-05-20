@@ -719,6 +719,10 @@ export async function createSanctuaryServer(options?: {
         // constructed and the /api/hub/chat/* routes light up.
         storage,
         masterKey,
+        identityManager,
+        reputationStore,
+        policy,
+        config,
       }),
     );
     await dashboard.start();
