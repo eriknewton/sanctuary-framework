@@ -16,6 +16,7 @@
 
 import { createWriteStream } from "node:fs";
 import { Writable } from "node:stream";
+import { basename, join } from "node:path";
 import type { StorageBackend } from "../storage/interface.js";
 import { bytesToString } from "../core/encoding.js";
 import type { PersistedAuditEnvelopeV2 } from "../l2-operational/audit-log.js";
@@ -157,28 +158,31 @@ export async function exportAuditChain(
 export interface ExportArgs {
   output?: string;
   storagePath?: string;
+  fortressPath?: string;
   argv: string[];
   env?: NodeJS.ProcessEnv;
 }
 
 export function parseExportArgs(argv: string[], env?: NodeJS.ProcessEnv): ExportArgs {
   const output = flagValue(argv, "--output") ?? flagValue(argv, "-o");
-  const storagePath =
-    flagValue(argv, "--storage-path") ??
+  const fortressPath =
+    flagValue(argv, "--fortress") ??
+    flagValue(argv, "--fortress-path") ??
     env?.SANCTUARY_STORAGE_PATH ??
     env?.SANCTUARY_FORTRESS_PATH;
-  return { output, storagePath, argv, env };
+  const storagePath = flagValue(argv, "--storage-path");
+  return { output, storagePath, fortressPath, argv, env };
 }
 
 export async function runExport(args: ExportArgs): Promise<void> {
   const { default: os } = await import("node:os");
-  const { join } = await import("node:path");
 
-  const storagePath =
-    args.storagePath ??
-    process.env.SANCTUARY_STORAGE_PATH ??
+  const fortressPath =
+    args.fortressPath ??
     process.env.SANCTUARY_FORTRESS_PATH ??
+    process.env.SANCTUARY_STORAGE_PATH ??
     join(os.homedir(), ".sanctuary");
+  const storagePath = args.storagePath ?? resolveAuditStoragePath(fortressPath);
 
   const { FilesystemStorage } = await import("../storage/filesystem.js");
   const storage = new FilesystemStorage(storagePath);
@@ -194,6 +198,10 @@ export async function runExport(args: ExportArgs): Promise<void> {
   } else {
     await exportAuditChain(storage, process.stdout);
   }
+}
+
+export function resolveAuditStoragePath(path: string): string {
+  return basename(path) === "state" ? path : join(path, "state");
 }
 
 // --- Type guards (duplicated from audit-log.ts to avoid server-runtime imports) ---
