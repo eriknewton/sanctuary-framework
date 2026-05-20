@@ -3,6 +3,7 @@ name: Synthetic Coverage
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -92,7 +93,7 @@ jobs:
   parity:
     needs: coverage
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
 
     steps:
       - uses: actions/checkout@v6
@@ -170,7 +171,7 @@ jobs:
   gate-a:
     needs: parity
     runs-on: ubuntu-latest
-    if: always() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main')
+    if: always() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
 
     steps:
       - uses: actions/checkout@v6
@@ -204,8 +205,21 @@ jobs:
           name: synthetic-coverage-parity
           path: artifacts/parity
 
-      - name: Run synthetic coverage gate (a)
-        run: npm run synthetic-coverage:gate-a -- artifacts/ubuntu/report.json artifacts/macos/report.json artifacts/parity/parity.json
+      - name: Run synthetic coverage gate (a) (informational on push/PR; gating on release tag)
+        id: gate_a
+        run: |
+          set -o pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "Release-tag event detected; gate-a is in GATING mode (will fail on gate_a_red)."
+            npm run synthetic-coverage:gate-a -- artifacts/ubuntu/report.json artifacts/macos/report.json artifacts/parity/parity.json
+          else
+            echo "Non-tag event (${GITHUB_EVENT_NAME} on ${GITHUB_REF}); gate-a is in INFORMATIONAL mode."
+            npm run synthetic-coverage:gate-a -- artifacts/ubuntu/report.json artifacts/macos/report.json artifacts/parity/parity.json || {
+              EXIT=$?
+              echo "::warning::gate-a reported non-green state (exit code ${EXIT}); see artifact + PR comment for violations. Not failing CI in informational mode."
+              exit 0
+            }
+          fi
 
       - name: Upload synthetic coverage gate (a) artifact
         if: always()

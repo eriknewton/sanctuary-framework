@@ -109,6 +109,16 @@ Parity is always blocking. If the parity report is `diverged` or `incomplete`, t
 
 `gate_a_red` means the artifact is still useful: it names the exact rows that need fixture work or matrix reclassification before the gate can close green.
 
+### Gating Mode
+
+The `gate-a` GitHub Actions job runs in two modes depending on the trigger event:
+
+- **Informational mode** (push to main, pull_request): the job always passes the check. The gate-a artifact and the PR comment surface the gap inventory: which ASSURANCE_MATRIX rows are `proven` without fixtures, and which rows show cross-platform parity divergence. Coordinators use the informational artifact to scope follow-up fixture work in v1.x.
+
+- **Gating mode** (release-tag push matching `v*`): the job exits non-zero on `gate_a_red`. This is the v1.3 GA safety lock. Cutting a release tag when the rollup reports any blocking violation will fail the publish workflow and halt the release. The fix path is either covering the violating rows with fixtures or reclassifying their `assurance_status` in `ASSURANCE_MATRIX.md` from `proven` to `partial` with a documented rationale.
+
+The CLI (`scripts/synthetic-coverage/rollup-cli.ts`) always exits 2 on `gate_a_red`; the workflow handles the event-conditional behavior.
+
 ## Release Verification
 
 The canonical gate (a) evidence for a release is the `synthetic-coverage-gate-a` artifact from the GitHub Actions run on the release tag or the merge commit used for that release.
