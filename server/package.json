@@ -35,6 +35,7 @@
     "test:zero-pii-regression": "vitest run test/query-anonymity/zero-pii-regression.test.ts",
     "test:qla-perf-budget": "vitest run test/query-anonymity/performance-budget.test.ts",
     "synthetic-coverage": "tsx ../scripts/synthetic-coverage/run.ts",
+    "synthetic-coverage:parity": "tsx ../scripts/synthetic-coverage/parity-cli.ts",
     "test:e2e": "playwright test",
     "test:e2e:chromium": "playwright test --project=chromium",
     "test:e2e:webkit": "playwright test --project=webkit",
