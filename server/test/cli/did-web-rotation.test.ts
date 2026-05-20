@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { Writable } from "node:stream";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { runDidWebCommand } from "../../src/cli/did-web.js";
+import { writeLockdownStatus } from "../../src/lockdown/status.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -54,5 +58,52 @@ describe("sanctuary did-web key rotation CLI", () => {
     });
     expect(code).toBe(1);
     expect(err.text).toContain("--preserve-days must be a non-negative integer");
+  });
+
+  it("show prints a lockdown banner when the fortress is locked", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-did-web-lockdown-"));
+    const recognition = join(fortress, "recognition");
+    await mkdir(recognition, { recursive: true });
+    await writeFile(
+      join(recognition, "did-web.json"),
+      JSON.stringify({
+        version: 1,
+        identifier: {
+          did: "did:web:example.com",
+          authority_host: "example.com",
+          created_at: "2026-05-19T11:00:00.000Z",
+          did_document: {},
+        },
+        artifact: {
+          url: "https://example.com/.well-known/did.json",
+          sha256: "0".repeat(64),
+        },
+      }),
+    );
+    await writeLockdownStatus(fortress, {
+      active: true,
+      activated_at: "2026-05-19T12:00:00.000Z",
+      reason: "operator_lockdown",
+    });
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const prior = process.env.SANCTUARY_STORAGE_PATH;
+    try {
+      const code = await runDidWebCommand({
+        argv: ["show", "--fortress", fortress],
+        out,
+        err,
+      });
+      expect(code).toBe(0);
+      expect(out.text).toContain(
+        "Fortress is LOCKED (since 2026-05-19T12:00:00.000Z). Reads permitted; writes blocked.",
+      );
+      expect(out.text).toContain("did:web identifier registered");
+    } finally {
+      if (prior === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+      else process.env.SANCTUARY_STORAGE_PATH = prior;
+      await rm(fortress, { recursive: true, force: true });
+    }
   });
 });

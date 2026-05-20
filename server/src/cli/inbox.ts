@@ -1,4 +1,5 @@
 import { readTenantRuntime } from "./agents/runtime.js";
+import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 
 export interface InboxCliArgs {
   argv: string[];
@@ -11,6 +12,7 @@ const DEFAULT_DASHBOARD_URL = "http://127.0.0.1:3502";
 interface InboxCliContext {
   argv: string[];
   dashboardUrl?: string;
+  fortressPath?: string;
 }
 
 export async function runInboxCommand(args: InboxCliArgs): Promise<number> {
@@ -243,10 +245,12 @@ async function approvalsList(
   const json = hasFlag(argv, "--json");
   const body = await request("/api/hub/inbox", undefined, ctx);
   const items = (body.data?.items ?? []).filter(isPendingApproval);
+  const lockdown_status = await readLockdownStatus(ctx.fortressPath);
   if (json) {
-    out.write(JSON.stringify(items, null, 2) + "\n");
+    out.write(JSON.stringify({ lockdown_status, items }, null, 2) + "\n");
     return 0;
   }
+  out.write(lockdownBanner(lockdown_status));
   writeApprovalTable(out, items);
   return 0;
 }
@@ -319,7 +323,13 @@ async function resolveContext(
   err: NodeJS.WritableStream,
 ): Promise<InboxCliContext | null> {
   const fortressIdx = argv.indexOf("--fortress");
-  if (fortressIdx < 0) return { argv };
+  if (fortressIdx < 0) {
+    return {
+      argv,
+      fortressPath:
+        process.env.SANCTUARY_STORAGE_PATH ?? process.env.SANCTUARY_FORTRESS_PATH,
+    };
+  }
   const fortress = argv[fortressIdx + 1];
   if (!fortress) {
     err.write("inbox --fortress requires a path\n");
@@ -334,6 +344,7 @@ async function resolveContext(
   return {
     argv: filtered,
     dashboardUrl: `http://${runtime.dashboard_host}:${runtime.dashboard_port}`,
+    fortressPath: fortress,
   };
 }
 

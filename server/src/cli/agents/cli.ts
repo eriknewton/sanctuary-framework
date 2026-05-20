@@ -31,6 +31,7 @@ import {
 } from "./discovery.js";
 import { probeTenantDashboard, type HealthProbeResult } from "./health.js";
 import { parsePolicy } from "../../principal-policy/loader.js";
+import { readLockdownStatus } from "../../lockdown/status.js";
 
 export interface AgentsCommandArgs {
   argv: string[];
@@ -185,18 +186,32 @@ async function cmdList(argv: string[], ctx: ResolvedCtx): Promise<number> {
 
   if (json) {
     const rows = await Promise.all(
-      tenants.map(async (t) => ({
-        name: t.name,
-        storage_path: t.storage_path,
-        initialized: t.initialized,
-        passphrase_status: t.passphrase_status,
-        keychain_service: t.keychain_service,
-        dashboard_port: t.runtime?.dashboard_port ?? null,
-        webhook_callback_port: t.runtime?.webhook_callback_port ?? null,
-        pid: t.runtime?.pid ?? null,
-        running: (await ctx.probe(t)).running,
-        last_activity: t.last_activity,
-      }))
+      tenants.map(async (t) => {
+        const [probe, lockdown_status] = await Promise.all([
+          ctx.probe(t),
+          readLockdownStatus(t.storage_path),
+        ]);
+        return {
+          name: t.name,
+          storage_path: t.storage_path,
+          initialized: t.initialized,
+          passphrase_status: t.passphrase_status,
+          keychain_service: t.keychain_service,
+          dashboard_port: t.runtime?.dashboard_port ?? null,
+          webhook_callback_port: t.runtime?.webhook_callback_port ?? null,
+          pid: t.runtime?.pid ?? null,
+          running: probe.running,
+          status: lockdown_status.active
+            ? "LOCKED"
+            : probe.running
+              ? "running"
+              : t.initialized
+                ? "stopped"
+                : "empty",
+          lockdown_status,
+          last_activity: t.last_activity,
+        };
+      })
     );
     ctx.out.write(JSON.stringify(rows, null, 2) + "\n");
     return 0;
@@ -208,9 +223,13 @@ async function cmdList(argv: string[], ctx: ResolvedCtx): Promise<number> {
   }
 
   const probes = await Promise.all(tenants.map((t) => ctx.probe(t)));
+  const lockdownStatuses = await Promise.all(
+    tenants.map((t) => readLockdownStatus(t.storage_path)),
+  );
   const rows = tenants.map((t, i) => ({
     tenant: t,
     probe: probes[i]!,
+    lockdown: lockdownStatuses[i]!,
   }));
 
   const nameW = Math.max(4, ...rows.map((r) => r.tenant.name.length));
@@ -225,8 +244,14 @@ async function cmdList(argv: string[], ctx: ResolvedCtx): Promise<number> {
     padRight("STORAGE", pathW);
   ctx.out.write(header + "\n");
 
-  for (const { tenant, probe } of rows) {
-    const status = probe.running ? "running" : tenant.initialized ? "stopped" : "empty";
+  for (const { tenant, probe, lockdown } of rows) {
+    const status = lockdown.active
+      ? "LOCKED"
+      : probe.running
+        ? "running"
+        : tenant.initialized
+          ? "stopped"
+          : "empty";
     const dashboard =
       tenant.runtime?.dashboard_port != null
         ? String(tenant.runtime.dashboard_port)

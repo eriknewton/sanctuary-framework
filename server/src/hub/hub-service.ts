@@ -47,6 +47,7 @@ import {
 } from "./errors.js";
 import { aggregateInbox } from "./inbox-aggregator.js";
 import { HubInboxStore } from "./inbox-store.js";
+import { writeLockdownStatus } from "../lockdown/status.js";
 import { aggregateActivity } from "./activity-feed.js";
 import type {
   HubAgentControlResult,
@@ -705,6 +706,13 @@ export class HubService {
           failed_count: failed.length,
         },
       );
+      if (this.deps.storagePath) {
+        await writeLockdownStatus(this.deps.storagePath, {
+          active: true,
+          activated_at: this.nowIso(),
+          reason: "operator_lockdown",
+        });
+      }
       // One agent_error inbox item per per-agent failure; the operator
       // sees both the fortress success AND the failed agents.
       for (const f of failed) {

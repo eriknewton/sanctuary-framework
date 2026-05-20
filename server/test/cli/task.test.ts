@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Writable } from "node:stream";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { runTaskCommand } from "../../src/cli/task.js";
 import type { Task } from "../../src/l2-operational/task-coordination/index.js";
+import { writeLockdownStatus } from "../../src/lockdown/status.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -57,18 +61,23 @@ describe("sanctuary task CLI", () => {
   let originalFetch: typeof globalThis.fetch;
   let originalDashboardUrl: string | undefined;
   let originalOperatorId: string | undefined;
+  let originalStoragePath: string | undefined;
+  let fortressPath: string;
   let tasks: Task[];
 
-  beforeEach(() => {
+  beforeEach(async () => {
     originalFetch = globalThis.fetch;
     originalDashboardUrl = process.env.SANCTUARY_DASHBOARD_URL;
     originalOperatorId = process.env.SANCTUARY_OPERATOR_ID;
+    originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+    fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-task-lockdown-"));
     process.env.SANCTUARY_DASHBOARD_URL = "http://127.0.0.1:3919";
     process.env.SANCTUARY_OPERATOR_ID = "operator-test";
+    process.env.SANCTUARY_STORAGE_PATH = fortressPath;
     tasks = [task("task-1")];
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     globalThis.fetch = originalFetch;
     if (originalDashboardUrl === undefined) {
       delete process.env.SANCTUARY_DASHBOARD_URL;
@@ -80,6 +89,12 @@ describe("sanctuary task CLI", () => {
     } else {
       process.env.SANCTUARY_OPERATOR_ID = originalOperatorId;
     }
+    if (originalStoragePath === undefined) {
+      delete process.env.SANCTUARY_STORAGE_PATH;
+    } else {
+      process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
+    }
+    await rm(fortressPath, { recursive: true, force: true });
     vi.restoreAllMocks();
   });
 
@@ -189,6 +204,23 @@ describe("sanctuary task CLI", () => {
       "http://127.0.0.1:3919/api/hub/tasks/task-1/cancel",
       expect.objectContaining({ method: "POST" }),
     );
+  });
+
+  it("prints a lockdown banner for task list reads", async () => {
+    installTaskFetch();
+    await writeLockdownStatus(fortressPath, {
+      active: true,
+      activated_at: "2026-05-19T12:00:00.000Z",
+      reason: "operator_lockdown",
+    });
+
+    const listed = await run(["list"]);
+
+    expect(listed.code).toBe(0);
+    expect(listed.out.text).toContain(
+      "Fortress is LOCKED (since 2026-05-19T12:00:00.000Z). Reads permitted; writes blocked.",
+    );
+    expect(listed.out.text).toContain("task-1");
   });
 
   it("validates required arguments and documents the surface", async () => {

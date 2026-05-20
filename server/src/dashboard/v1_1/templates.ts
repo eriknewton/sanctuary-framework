@@ -93,7 +93,7 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
   "approval_pending.tier1.lockdown": (a) =>
     `Lock down agent ${arg(a, "agent_id")}. This stops all egress and freezes gates.`,
   "approval_pending.tier1.fortress_lockdown": () =>
-    "Lock down the entire fortress (all agents pause, egress blocks).",
+    "Lockdown approval pending. Approving locks the entire fortress: writes are blocked, reads continue with LOCKED posture signals, active operations may fail, and agent workflows stop until the operator recovers or restarts them.",
   "approval_pending.tier1.fortress_exit_bundle_export": () =>
     "Export the entire fortress as a portable exit bundle.",
   "approval_pending.tier1.unwrap": (a) =>

@@ -48,6 +48,7 @@ import type {
 import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
 import type { HubAgentStatus } from "../../src/contracts/v1.1/constants.js";
 import type { AuthConfig } from "../../src/console/auth-middleware.js";
+import { readLockdownStatus } from "../../src/lockdown/status.js";
 
 const IDENTITY_ID = "operator-fortress-001";
 const FORTRESS_ID = "fortress-test-fortress-001";
@@ -144,6 +145,7 @@ interface TestRig {
   controller: StubAgentController;
   auditLog: AuditLog;
   authToken: string;
+  storagePath: string;
   fortressExportCalls: number;
   fortressExportResult: HubFortressExportResult;
   stop: () => Promise<void>;
@@ -157,6 +159,7 @@ interface RigOptions {
 
 async function startRig(options: RigOptions = {}): Promise<TestRig> {
   const storage = new MemoryStorage();
+  const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-lockdown-"));
   const masterKey = randomBytes(32);
   const auditLog = new AuditLog(storage, masterKey);
 
@@ -179,6 +182,7 @@ async function startRig(options: RigOptions = {}): Promise<TestRig> {
   const service = new HubService({
     identityId: IDENTITY_ID,
     fortressId: FORTRESS_ID,
+    storagePath,
     agentRegistry: registry,
     inboxSources: emptyInboxSources(),
     activitySources: { auditLog, identityId: IDENTITY_ID },
@@ -245,14 +249,17 @@ async function startRig(options: RigOptions = {}): Promise<TestRig> {
     controller,
     auditLog,
     authToken,
+    storagePath,
     get fortressExportCalls() {
       return fortressExportCalls;
     },
     fortressExportResult: defaultExportResult,
-    stop: () =>
-      new Promise<void>((resolve, reject) => {
+    stop: async () => {
+      await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
-      }),
+      });
+      await rm(storagePath, { recursive: true, force: true });
+    },
   };
   return rig;
 }
@@ -342,6 +349,10 @@ describe("Fortress lockdown happy path (Test 1)", () => {
       expect(record.status).toBe("locked_down");
       expect(record.status_reason_class).toBe("operator_lockdown");
     }
+    await expect(readLockdownStatus(rig.storagePath)).resolves.toMatchObject({
+      active: true,
+      reason: "operator_lockdown",
+    });
 
     // Exactly ONE fortress-level activity entry emitted (not three per-agent).
     await rig.auditLog.flush();

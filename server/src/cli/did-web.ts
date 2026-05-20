@@ -51,6 +51,7 @@ import {
   DidWebHostedRegistry,
   validateHandle,
 } from "../recognition/did-web-hosted-registry.js";
+import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 
 export interface DidWebCommandArgs {
   argv: string[];
@@ -330,6 +331,7 @@ async function cmdShow(
     process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
   }
   const config = await loadConfig();
+  const lockdown_status = await readLockdownStatus(config.storage_path);
   const persistPath = join(config.storage_path, "recognition", "did-web.json");
   let bytes: Buffer;
   try {
@@ -342,8 +344,17 @@ async function cmdShow(
     return 1;
   }
   if (json) {
-    write(out, bytes.toString("utf-8"));
-    if (!bytes.toString("utf-8").endsWith("\n")) write(out, "\n");
+    write(
+      out,
+      JSON.stringify(
+        {
+          lockdown_status,
+          record: JSON.parse(bytes.toString("utf-8")),
+        },
+        null,
+        2,
+      ) + "\n",
+    );
     return 0;
   }
   type Record = {
@@ -356,6 +367,7 @@ async function cmdShow(
     artifact: { url: string; sha256: string };
   };
   const parsed = JSON.parse(bytes.toString("utf-8")) as Record;
+  write(out, lockdownBanner(lockdown_status));
   write(out, `did:web identifier registered on this fortress:\n`);
   write(out, `  DID:            ${parsed.identifier.did}\n`);
   write(out, `  Authority host: ${parsed.identifier.authority_host}\n`);
