@@ -128,8 +128,11 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: synthetic-coverage-parity
-          path: scripts/synthetic-coverage/.out/parity.*
+          path: |
+            scripts/synthetic-coverage/.out/parity.json
+            scripts/synthetic-coverage/.out/parity.md
           if-no-files-found: error
+          include-hidden-files: true
 
       - name: Post PR parity summary
         if: github.event_name == 'pull_request'
