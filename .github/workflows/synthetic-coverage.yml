@@ -3,6 +3,7 @@ name: Synthetic Coverage
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -92,7 +93,7 @@ jobs:
   parity:
     needs: coverage
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
 
     steps:
       - uses: actions/checkout@v6
@@ -142,6 +143,106 @@ jobs:
             const fs = require("fs");
             const marker = `<!-- synthetic-coverage:parity -->`;
             const report = fs.readFileSync("scripts/synthetic-coverage/.out/parity.md", "utf8");
+            const body = `${marker}\n${report}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+            });
+            const existing = comments.find((comment) => comment.body?.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
+
+  gate-a:
+    needs: parity
+    runs-on: ubuntu-latest
+    if: always() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Download Linux synthetic coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: synthetic-coverage-ubuntu-latest
+          path: artifacts/ubuntu
+
+      - name: Download macOS synthetic coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: synthetic-coverage-macos-latest
+          path: artifacts/macos
+
+      - name: Download synthetic coverage parity report
+        uses: actions/download-artifact@v4
+        with:
+          name: synthetic-coverage-parity
+          path: artifacts/parity
+
+      - name: Run synthetic coverage gate (a) (informational on push/PR; gating on release tag)
+        id: gate_a
+        run: |
+          set -o pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "Release-tag event detected; gate-a is in GATING mode (will fail on gate_a_red)."
+            npm run synthetic-coverage:gate-a -- artifacts/ubuntu/report.json artifacts/macos/report.json artifacts/parity/parity.json
+          else
+            echo "Non-tag event (${GITHUB_EVENT_NAME} on ${GITHUB_REF}); gate-a is in INFORMATIONAL mode."
+            npm run synthetic-coverage:gate-a -- artifacts/ubuntu/report.json artifacts/macos/report.json artifacts/parity/parity.json || {
+              EXIT=$?
+              echo "::warning::gate-a reported non-green state (exit code ${EXIT}); see artifact + PR comment for violations. Not failing CI in informational mode."
+              exit 0
+            }
+          fi
+
+      - name: Upload synthetic coverage gate (a) artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: synthetic-coverage-gate-a
+          path: |
+            scripts/synthetic-coverage/.out/gate-a-artifact.json
+            scripts/synthetic-coverage/.out/gate-a-artifact.md
+          if-no-files-found: error
+          include-hidden-files: true
+
+      - name: Post PR gate (a) verdict
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const marker = `<!-- synthetic-coverage:gate-a -->`;
+            let report = "Gate (a) artifact was not produced.";
+            if (fs.existsSync("scripts/synthetic-coverage/.out/gate-a-artifact.md")) {
+              report = fs.readFileSync("scripts/synthetic-coverage/.out/gate-a-artifact.md", "utf8");
+            }
             const body = `${marker}\n${report}`;
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
