@@ -13,6 +13,7 @@ import { Writable } from "node:stream";
 import { runAgentsCommand } from "../../src/cli/agents/cli.js";
 import type { HealthProbeResult } from "../../src/cli/agents/health.js";
 import type { TenantDescriptor } from "../../src/cli/agents/discovery.js";
+import { writeLockdownStatus } from "../../src/lockdown/status.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -55,6 +56,7 @@ describe("sanctuary agents list --fortress", () => {
   let home: string;
   let defaultRoot: string;
   let isolatedRoot: string;
+  let isolatedTenant: string;
 
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), "sanctuary-agents-fortress-"));
@@ -67,7 +69,7 @@ describe("sanctuary agents list --fortress", () => {
     // One isolated tenant at a different path.
     isolatedRoot = await mkdtemp(join(tmpdir(), "sanctuary-isolated-"));
     await mkdir(isolatedRoot, { recursive: true, mode: 0o700 });
-    await makeTenant(isolatedRoot, "isolated-tenant");
+    isolatedTenant = await makeTenant(isolatedRoot, "isolated-tenant");
   });
 
   afterEach(async () => {
@@ -109,6 +111,46 @@ describe("sanctuary agents list --fortress", () => {
     expect(names).toContain("isolated-tenant");
     expect(names).not.toContain("tenant-a");
     expect(names).not.toContain("tenant-b");
+  });
+
+  it("shows LOCKED status and JSON lockdown_status when the tenant is locked", async () => {
+    await writeLockdownStatus(isolatedTenant, {
+      active: true,
+      activated_at: "2026-05-19T12:00:00.000Z",
+      reason: "operator_lockdown",
+    });
+
+    const humanOut = new StringWritable();
+    const humanErr = new StringWritable();
+    const humanCode = await runAgentsCommand({
+      argv: ["list", "--fortress", isolatedRoot],
+      out: humanOut,
+      err: humanErr,
+      home,
+      probe: async () => ({ running: true, status: 200, reason: null }),
+    });
+    expect(humanCode).toBe(0);
+    expect(humanOut.text).toContain("LOCKED");
+    expect(humanOut.text).not.toContain("running");
+
+    const jsonOut = new StringWritable();
+    const jsonErr = new StringWritable();
+    const jsonCode = await runAgentsCommand({
+      argv: ["list", "--fortress", isolatedRoot, "--json"],
+      out: jsonOut,
+      err: jsonErr,
+      home,
+      probe: async () => ({ running: true, status: 200, reason: null }),
+    });
+    expect(jsonCode).toBe(0);
+    const rows = JSON.parse(jsonOut.text) as Array<{
+      status: string;
+      lockdown_status: { active: boolean };
+    }>;
+    expect(rows[0]).toMatchObject({
+      status: "LOCKED",
+      lockdown_status: { active: true },
+    });
   });
 
   it("help text documents --fortress", async () => {

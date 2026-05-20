@@ -45,6 +45,7 @@ describe("v1.1 dashboard template registry", () => {
       "exit_bundle_rekey",
       "policy_change",
       "lockdown",
+      "fortress_lockdown",
       "unwrap",
       "other",
     ];
@@ -109,5 +110,13 @@ describe("v1.1 dashboard template registry", () => {
       { kind: "agent_id", value: "secret-agent-xyz" },
     ]);
     expect(out).not.toContain("secret-agent-xyz");
+  });
+
+  it("renders the fortress lockdown approval template with consequences", () => {
+    const out = renderTemplate("approval_pending.tier1.fortress_lockdown", []);
+    expect(out).toContain("Lockdown approval pending");
+    expect(out).toContain("writes are blocked");
+    expect(out).toContain("reads continue");
+    expect(out).not.toContain("[unrecognized template");
   });
 });

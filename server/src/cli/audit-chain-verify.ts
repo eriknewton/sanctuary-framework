@@ -25,6 +25,7 @@
 import { readFileSync } from "node:fs";
 import { ed25519 } from "@noble/curves/ed25519";
 import { sha256 } from "@noble/hashes/sha256";
+import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 
 // ---- Minimal canonical-JSON implementation (no server imports) ---------------
 
@@ -478,13 +479,18 @@ export interface VerifyArgs {
   input: string;
   strict: boolean;
   publicKey?: string;
+  storagePath?: string;
 }
 
-export function parseVerifyArgs(argv: string[]): VerifyArgs {
+export function parseVerifyArgs(argv: string[], env?: NodeJS.ProcessEnv): VerifyArgs {
   const input = flagValue(argv, "--input") ?? flagValue(argv, "-i") ?? "";
   const strict = !argv.includes("--no-strict");
   const publicKey = flagValue(argv, "--public-key");
-  return { input, strict, publicKey };
+  const storagePath =
+    flagValue(argv, "--storage-path") ??
+    env?.SANCTUARY_STORAGE_PATH ??
+    env?.SANCTUARY_FORTRESS_PATH;
+  return { input, strict, publicKey, storagePath };
 }
 
 export async function runVerify(args: VerifyArgs): Promise<void> {
@@ -506,6 +512,8 @@ export async function runVerify(args: VerifyArgs): Promise<void> {
     strict: args.strict,
   });
 
+  const banner = lockdownBanner(await readLockdownStatus(args.storagePath));
+  if (banner) process.stderr.write(banner);
   process.stdout.write(JSON.stringify(report, null, 2) + "\n");
 
   if (args.strict && report.verdict === "FAIL") {

@@ -3,6 +3,7 @@ import {
   TASK_STATUSES,
   type Task,
 } from "../l2-operational/task-coordination/index.js";
+import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 
 export interface TaskCliArgs {
   argv: string[];
@@ -13,6 +14,7 @@ export interface TaskCliArgs {
 interface TaskCliContext {
   argv: string[];
   dashboardUrl?: string;
+  fortressPath?: string;
 }
 
 const DEFAULT_DASHBOARD_URL = "http://127.0.0.1:3502";
@@ -119,10 +121,12 @@ async function list(
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
   const body = await request(`/api/hub/tasks${suffix}`, undefined, ctx);
   const tasks = body.data?.tasks ?? [];
+  const lockdown_status = await readLockdownStatus(ctx.fortressPath);
   if (json) {
-    out.write(JSON.stringify(tasks, null, 2) + "\n");
+    out.write(JSON.stringify({ lockdown_status, tasks }, null, 2) + "\n");
     return 0;
   }
+  out.write(lockdownBanner(lockdown_status));
   writeTaskTable(out, tasks);
   return 0;
 }
@@ -245,7 +249,13 @@ async function resolveContext(
   err: NodeJS.WritableStream,
 ): Promise<TaskCliContext | null> {
   const fortressIdx = argv.indexOf("--fortress");
-  if (fortressIdx < 0) return { argv };
+  if (fortressIdx < 0) {
+    return {
+      argv,
+      fortressPath:
+        process.env.SANCTUARY_STORAGE_PATH ?? process.env.SANCTUARY_FORTRESS_PATH,
+    };
+  }
   const fortress = argv[fortressIdx + 1];
   if (!fortress) {
     err.write("task --fortress requires a path\n");
@@ -260,6 +270,7 @@ async function resolveContext(
   return {
     argv: filtered,
     dashboardUrl: `http://${runtime.dashboard_host}:${runtime.dashboard_port}`,
+    fortressPath: fortress,
   };
 }
 

@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Writable } from "node:stream";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { runInboxCommand } from "../../src/cli/inbox.js";
+import { writeLockdownStatus } from "../../src/lockdown/status.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -75,15 +79,20 @@ describe("sanctuary inbox approvals CLI", () => {
   let originalFetch: typeof globalThis.fetch;
   let originalDashboardUrl: string | undefined;
   let originalOperatorId: string | undefined;
+  let originalStoragePath: string | undefined;
+  let fortressPath: string;
   let items: MockInboxItem[];
   let auditEvents: Array<{ action: string; approval_id: string }>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     originalFetch = globalThis.fetch;
     originalDashboardUrl = process.env.SANCTUARY_DASHBOARD_URL;
     originalOperatorId = process.env.SANCTUARY_OPERATOR_ID;
+    originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+    fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-inbox-lockdown-"));
     process.env.SANCTUARY_DASHBOARD_URL = "http://127.0.0.1:3909";
     process.env.SANCTUARY_OPERATOR_ID = "operator-test";
+    process.env.SANCTUARY_STORAGE_PATH = fortressPath;
     const blocked = pendingItem("blocked-1");
     blocked.kind = "blocked_egress";
     delete blocked.operation_category;
@@ -95,7 +104,7 @@ describe("sanctuary inbox approvals CLI", () => {
     auditEvents = [];
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     globalThis.fetch = originalFetch;
     if (originalDashboardUrl === undefined) {
       delete process.env.SANCTUARY_DASHBOARD_URL;
@@ -107,6 +116,12 @@ describe("sanctuary inbox approvals CLI", () => {
     } else {
       process.env.SANCTUARY_OPERATOR_ID = originalOperatorId;
     }
+    if (originalStoragePath === undefined) {
+      delete process.env.SANCTUARY_STORAGE_PATH;
+    } else {
+      process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
+    }
+    await rm(fortressPath, { recursive: true, force: true });
     vi.restoreAllMocks();
   });
 
@@ -155,7 +170,7 @@ describe("sanctuary inbox approvals CLI", () => {
     expect(out.text).not.toContain("blocked-1");
   });
 
-  it("approvals list --json returns a parseable array", async () => {
+  it("approvals list --json returns items with lockdown_status", async () => {
     installInboxFetch();
 
     const { code, out, err } = await run(["approvals", "list", "--json"]);
@@ -163,8 +178,8 @@ describe("sanctuary inbox approvals CLI", () => {
     expect(code).toBe(0);
     expect(err.text).toBe("");
     const parsed = JSON.parse(out.text);
-    expect(Array.isArray(parsed)).toBe(true);
-    expect(parsed.map((item: MockInboxItem) => item.item_id)).toEqual([
+    expect(parsed.lockdown_status).toMatchObject({ active: false });
+    expect(parsed.items.map((item: MockInboxItem) => item.item_id)).toEqual([
       "approval-1",
     ]);
   });
@@ -178,7 +193,24 @@ describe("sanctuary inbox approvals CLI", () => {
     expect(approved.code).toBe(0);
     expect(approved.out.text).toBe("approval: approval-1 approved by operator-test\n");
     expect(items.find((item) => item.item_id === "approval-1")?.resolved).toBe(true);
-    expect(JSON.parse(listed.out.text)).toEqual([]);
+    expect(JSON.parse(listed.out.text).items).toEqual([]);
+  });
+
+  it("approvals list prints a lockdown banner when the fortress is locked", async () => {
+    installInboxFetch();
+    await writeLockdownStatus(fortressPath, {
+      active: true,
+      activated_at: "2026-05-19T12:00:00.000Z",
+      reason: "operator_lockdown",
+    });
+
+    const { code, out } = await run(["approvals", "list"]);
+
+    expect(code).toBe(0);
+    expect(out.text).toContain(
+      "Fortress is LOCKED (since 2026-05-19T12:00:00.000Z). Reads permitted; writes blocked.",
+    );
+    expect(out.text).toContain("approval-1");
   });
 
   it("approvals approve <id> emits the existing approval receipt through the approve route", async () => {

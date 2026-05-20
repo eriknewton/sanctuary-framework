@@ -216,7 +216,7 @@ async function main(): Promise<void> {
       process.exit(0);
     } else if (verb === "verify") {
       const { parseVerifyArgs, runVerify } = await import("./cli/audit-chain-verify.js");
-      const opts = parseVerifyArgs(args.slice(2));
+      const opts = parseVerifyArgs(args.slice(2), process.env);
       await runVerify(opts);
       process.exit(0);
     } else {

@@ -331,6 +331,7 @@ export function buildV11Bindings(
     agentRegistry: registry,
     ...(readPersisted ? { readPersistedLocalAgents: readPersisted } : {}),
     ...(writePersisted ? { writePersistedLocalAgents: writePersisted } : {}),
+    ...(inputs.storagePath !== undefined ? { storagePath: inputs.storagePath } : {}),
     inboxSources: {
       listPendingApprovals: () => [],
       listRecentBlockedEgress: () => [],

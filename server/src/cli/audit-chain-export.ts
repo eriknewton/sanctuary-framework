@@ -21,6 +21,7 @@ import type { StorageBackend } from "../storage/interface.js";
 import { bytesToString } from "../core/encoding.js";
 import type { PersistedAuditEnvelopeV2 } from "../l2-operational/audit-log.js";
 import type { AuditCheckpointRecord } from "../audit/chain.js";
+import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 
 export const AUDIT_EXPORT_NAMESPACE = "_audit";
 export const AUDIT_EXPORT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
@@ -186,6 +187,8 @@ export async function runExport(args: ExportArgs): Promise<void> {
 
   const { FilesystemStorage } = await import("../storage/filesystem.js");
   const storage = new FilesystemStorage(storagePath);
+  const banner = lockdownBanner(await readLockdownStatus(storagePath));
+  if (banner) process.stderr.write(banner);
 
   if (args.output) {
     const stream = createWriteStream(args.output, { encoding: "utf8" });

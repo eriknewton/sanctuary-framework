@@ -303,6 +303,12 @@ export interface HubServiceDeps {
    * registry-local fields that should survive refresh and restart.
    */
   writePersistedLocalAgents?: (records: LocalAgentRecord[]) => void;
+  /**
+   * Optional fortress storage path. When supplied, fortress-scope lockdown
+   * approval writes a plaintext posture marker so read-only CLI surfaces can
+   * signal LOCKED state without decrypting tenant data.
+   */
+  storagePath?: string;
   /** Inbox aggregation sources. */
   inboxSources: HubInboxSources;
   /** Activity feed sources. */
