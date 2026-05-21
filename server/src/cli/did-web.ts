@@ -52,6 +52,7 @@ import {
   validateHandle,
 } from "../recognition/did-web-hosted-registry.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
+import { readStoredPassphrase } from "../cocoon/passphrase.js";
 
 export interface DidWebCommandArgs {
   argv: string[];
@@ -182,15 +183,30 @@ async function loadFortressIdentity(
   if (fortressFlag) {
     process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
   }
-  const passphrase =
+  let passphrase: string | undefined =
     flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
   const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
   if (!passphrase && !recoveryKey) {
-    write(
-      err,
-      "Error: sanctuary did-web requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY.\n",
-    );
-    return null;
+    // Auto-discover from Keychain / fallback file (same precedence as
+    // sanctuary wrap and other CLI commands that resolve the passphrase).
+    try {
+      const stored = await readStoredPassphrase({
+        storagePath: fortressFlag ?? undefined,
+      });
+      if (stored) {
+        passphrase = stored.value;
+      }
+    } catch {
+      // Keychain unavailable or fallback unreadable — fall through to error.
+    }
+    if (!passphrase) {
+      write(
+        err,
+        "Error: sanctuary did-web requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY.\n" +
+        "       Keychain auto-discovery also failed. Ensure the fortress passphrase is stored in your OS keychain.\n",
+      );
+      return null;
+    }
   }
   const config = await loadConfig();
   await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
