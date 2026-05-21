@@ -966,11 +966,17 @@ function renderHoneypotPage() {
   const error = state.honeypot.loadError
     ? '<p class="muted">Honeypot stats unavailable: ' + escHtml(state.honeypot.loadError) + '</p>'
     : '';
+  const hasTraps = toolTraps.length > 0 || credentialTraps.length > 0;
+  const createCta = !hasTraps
+    ? '<section class="card"><h3>No honeypot traps deployed yet.</h3>' +
+      '<p class="muted">Coming in v1.4: full create UI from this tab. For now, deploy honeypots via the auto-trigger ladder (<code>sanctuary auto-trigger promote --rule-type honeypot</code>) or by adding trap definitions to your fortress config.</p>' +
+      '</section>'
+    : '';
   return '<div class="page-head"><div>' +
     '<p class="eyebrow">Honeypots</p>' +
     '<h1>Honeypot traps.</h1>' +
     '<p class="sub">Fake tools and fake credentials. Reads, invocations, and attempted credential use create sentinel findings without revealing the trap.</p>' +
-  '</div></div>' + error + credentialRows + toolRows;
+  '</div></div>' + error + createCta + credentialRows + toolRows;
 }
 
 function relTimeFromIso(iso) {
@@ -1215,7 +1221,10 @@ function renderPrivacyPage() {
   // only as opaque hex with a tooltip; no raw_path, no raw_value, no
   // source bytes.
   const events = state.privacyEvents.slice(0, 50);
-  if (!events.length) return '<h1>Privacy</h1><p class="muted">No privacy events recorded yet.</p>';
+  if (!events.length) return '<h1>Privacy</h1>' +
+    '<section class="card"><h3>No privacy events recorded yet.</h3>' +
+    '<p class="muted">Privacy events appear when the privacy filter redacts, denies, or logs an outbound payload. Wrap an agent with a privacy-minimization policy to start seeing events here.</p>' +
+    '</section>';
   const rows = events.map(function (e) {
     const payload = e.payload || {};
     const hashShort = payload.outbound_payload_hash ? String(payload.outbound_payload_hash).slice(0, 12) + "..." : "n/a";
@@ -1231,13 +1240,16 @@ function renderPrivacyPage() {
   return '<h1>Privacy</h1>' +
     '<p class="muted">Events show only safe metadata. Raw values never leave the privacy filter.</p>' +
     '<div class="card">' + rows + '</div>' +
-    '<p class="muted">Per-agent toggles are read-only at v1.1. <a href="#policy">Edit via Policy center</a>.</p>';
+    '<p class="muted">Per-agent toggles are read-only. <a href="#policy">Edit via Policy center</a>.</p>';
 }
 
 // ── Render: coordination ──────────────────────────────────────────────
 function renderCoordinationPage() {
   const events = state.handoffEvents.slice(0, 100);
-  if (!events.length) return '<h1>Coordination</h1><p class="muted">No internal handoffs yet.</p>';
+  if (!events.length) return '<h1>Coordination</h1>' +
+    '<section class="card"><h3>No coordination flows recorded yet.</h3>' +
+    '<p class="muted">Coordination flows appear when wrapped agents hand off tasks to each other inside this fortress. Wrap two or more agents and initiate a handoff to see events here.</p>' +
+    '</section>';
   const rows = events.map(function (e) {
     const p = e.payload || {};
     return '<div class="row">' +
@@ -1248,9 +1260,8 @@ function renderCoordinationPage() {
       '</div>';
   }).join("\n");
   return '<h1>Coordination</h1>' +
-    '<p class="muted">Internal-only handoffs inside this fortress. Cross-fortress coordination lands in v1.3.</p>' +
-    '<div class="card">' + rows + '</div>' +
-    '<button class="btn" disabled title="Operator-initiated handoff arrives in v1.2.">New shared workflow</button>';
+    '<p class="muted">Internal-only handoffs inside this fortress.</p>' +
+    '<div class="card">' + rows + '</div>';
 }
 
 // ── Render: health ─────────────────────────────────────────────────────
@@ -1260,7 +1271,7 @@ function renderHealthPage() {
   const errored = state.agents.filter(function (a) { return a.status === "error"; }).length;
   const recentDenials = state.activity.filter(function (e) { return e.category === "denial"; }).length;
   return '<h1>Health</h1>' +
-    '<p class="muted">Projected from existing data. A dedicated health endpoint lands in v1.2.</p>' +
+    '<p class="muted">Projected from existing data.</p>' +
     '<div class="card"><h3>Fortress at a glance</h3>' +
       '<dl class="kv">' +
       '<dt>Wrapped agents</dt><dd>' + escHtml(totalAgents) + '</dd>' +
@@ -1269,7 +1280,7 @@ function renderHealthPage() {
       '<dt>Denials in feed</dt><dd>' + escHtml(recentDenials) + '</dd>' +
       '</dl>' +
     '</div>' +
-    '<button class="btn" disabled title="Manual audit landing in v1.2.">Run full audit</button>';
+    '<button class="btn" data-action="run-full-audit">Run full audit</button>';
 }
 
 // ── Render: intelligence ───────────────────────────────────────────────
@@ -1873,9 +1884,9 @@ function renderPolicyCenter() {
     : '<tr><td colspan="7" class="muted">No wrapped agents yet.</td></tr>';
   return '<section class="policy-center">' +
     '<p class="eyebrow">POLICY CENTER</p>' +
-    '<h1>One screen for every rule <span class="pill tone-verified">v1.1</span></h1>' +
+    '<h1>One screen for every rule</h1>' +
     '<p class="policy-subtitle">Templates, per-agent rules, egress allowlists, retention, budgets, and privacy-minimization settings. Edits write a signed receipt; agents pick up changes within one tool-call cycle.</p>' +
-    '<section class="policy-panel"><h2>Channel templates · 6 shipped</h2><div class="template-grid">' + tmplCards + '</div></section>' +
+    '<section class="policy-panel"><h2>Channel templates · ' + CHANNEL_TEMPLATES.length + ' shipped</h2><div class="template-grid">' + tmplCards + '</div></section>' +
     '<section class="policy-panel"><h2>Per-agent rules</h2>' +
       '<div class="rules-scroll"><table class="rules-table">' +
       '<thead><tr><th>AGENT</th><th>TEMPLATE</th><th>ALLOW / BLOCK</th><th>BUDGET</th><th>RETENTION</th><th>MINIMIZE</th><th>APPROVALS</th></tr></thead>' +
@@ -1889,7 +1900,7 @@ function renderAutoTriggerPage() {
   const recs = state.autoTrigger.recommendations || [];
   const summary = rules.length
     ? '<div class="auto-trigger-rule-list">' + rules.map(renderAutoTriggerRuleRow).join("") + '</div>'
-    : '<p class="muted">No auto-trigger rules have fired yet. Rules appear here after a sentinel, anomaly detector, or honeypot records its first finding.</p>';
+    : '<p class="muted">No auto-trigger ladders configured. Ladders appear here after a sentinel, anomaly detector, or honeypot records its first finding. Use <code>sanctuary auto-trigger promote</code> to create one.</p>';
   const body = recs.length
     ? '<div class="recommendation-list">' + recs.map(function (r) {
         const hs = r.history_summary || {};
@@ -2135,30 +2146,38 @@ function renderFortress() {
       '<label>From<br><input class="input" data-action="inbox-filter-from" type="date" value="' + escHtml(state.inboxOps.filters.from) + '"></label>' +
       '<label>To<br><input class="input" data-action="inbox-filter-to" type="date" value="' + escHtml(state.inboxOps.filters.to) + '"></label>' +
     '</div>';
-  const inboxRows = visibleInbox.length
-    ? visibleInbox.map(function (i) {
-        const text = renderTemplate(i.display_template_id, i.display_template_args);
-        const actions = inboxActions(i);
-        const buttons = actions.map(function (act) {
-          const apiAction = (act === "approve" || act === "deny" || act === "dismiss") ? act : null;
-          if (apiAction) {
-            return '<button class="btn" data-action="inbox-' + apiAction + '" data-item-id="' + escHtml(i.item_id) + '">' + INBOX_ACTION_LABEL[act] + '</button>';
-          }
-          return '<button class="btn" data-action="inbox-' + act + '" data-item-id="' + escHtml(i.item_id) + '">' + INBOX_ACTION_LABEL[act] + '</button>';
-        }).join("");
-        const tierBadge = i.kind === "approval_pending"
-          ? '<span class="pill">' + escHtml(i.tier) + '</span>'
-          : '<span class="pill">' + escHtml(i.kind) + '</span>';
-        return '<div class="row" data-inbox-row="' + escHtml(i.item_id) + '" data-inbox-kind="' + escHtml(i.kind) + '"' +
-          (i.kind === "approval_pending" ? ' data-inbox-tier="' + escHtml(i.tier) + '"' : '') + '>' +
-          '<input type="checkbox" data-action="inbox-select" data-item-id="' + escHtml(i.item_id) + '"' + (state.inboxOps.selected[i.item_id] ? ' checked' : '') + '>' +
-          '<div class="grow">' + escHtml(text) + '</div>' +
-          tierBadge +
-          '<button class="btn" data-action="inbox-snooze-menu" data-item-id="' + escHtml(i.item_id) + '" title="Snooze">...</button>' +
-          '<div style="display:flex;gap:4px;">' + buttons + '</div>' +
-          '</div>';
-      }).join("\n")
-    : '<p class="muted">Nothing pending.</p>';
+  var inboxRows;
+  if (!visibleInbox.length) {
+    inboxRows = '<p class="muted">Nothing pending.</p>';
+  } else {
+    // Group by tier/kind for visual hierarchy (VVVVV restore).
+    var tier1Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier1"; });
+    var tier2Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier2"; });
+    var otherItems = visibleInbox.filter(function (i) { return i.kind !== "approval_pending" || (i.tier !== "tier1" && i.tier !== "tier2"); });
+    function renderInboxRow(i) {
+      var text = renderTemplate(i.display_template_id, i.display_template_args);
+      var actions = inboxActions(i);
+      var buttons = actions.map(function (act) {
+        return '<button class="btn" data-action="inbox-' + act + '" data-item-id="' + escHtml(i.item_id) + '">' + INBOX_ACTION_LABEL[act] + '</button>';
+      }).join("");
+      var tierBadge = i.kind === "approval_pending"
+        ? '<span class="pill">' + escHtml(i.tier) + '</span>'
+        : '<span class="pill">' + escHtml(i.kind) + '</span>';
+      return '<div class="row" data-inbox-row="' + escHtml(i.item_id) + '" data-inbox-kind="' + escHtml(i.kind) + '"' +
+        (i.kind === "approval_pending" ? ' data-inbox-tier="' + escHtml(i.tier) + '"' : '') + '>' +
+        '<input type="checkbox" data-action="inbox-select" data-item-id="' + escHtml(i.item_id) + '"' + (state.inboxOps.selected[i.item_id] ? ' checked' : '') + '>' +
+        '<div class="grow">' + escHtml(text) + '</div>' +
+        tierBadge +
+        '<button class="btn" data-action="inbox-snooze-menu" data-item-id="' + escHtml(i.item_id) + '" title="Snooze">...</button>' +
+        '<div style="display:flex;gap:4px;">' + buttons + '</div>' +
+        '</div>';
+    }
+    var sections = [];
+    if (tier1Items.length) sections.push('<h4 class="inbox-group-head">Tier 1 approvals</h4>' + tier1Items.map(renderInboxRow).join("\n"));
+    if (tier2Items.length) sections.push('<h4 class="inbox-group-head">Tier 2 approvals</h4>' + tier2Items.map(renderInboxRow).join("\n"));
+    if (otherItems.length) sections.push((tier1Items.length || tier2Items.length ? '<h4 class="inbox-group-head">Other</h4>' : '') + otherItems.map(renderInboxRow).join("\n"));
+    inboxRows = sections.join("\n");
+  }
 
   const agentsCard = state.agents.length
     ? state.agents.slice(0, 8).map(function (a) {
@@ -2271,7 +2290,7 @@ async function fetchAll() {
   try {
     await fetchAutoTriggerState();
   } catch (e) {
-    state.autoTrigger.loadError = e && e.message ? e.message : "unavailable";
+    state.autoTrigger.loadError = e && e.message && e.message !== "Not Found" ? e.message : null;
   }
   try {
     const rh = await api("/recognition/did-web");
@@ -2471,6 +2490,26 @@ async function onInboxBatchAction(action, until) {
     rerender();
   } catch (e) {
     toast("Inbox batch action failed.", "error");
+  }
+}
+
+async function onRunFullAudit() {
+  try {
+    toast("Running audit-chain export + verify...");
+    const r = await api("/audit-chain/verify", { method: "POST", body: {} });
+    const verdict = r.data && r.data.verdict ? r.data.verdict : "unknown";
+    const entries = r.data && r.data.entries_checked ? r.data.entries_checked : "?";
+    if (verdict === "PASS") {
+      toast("Audit chain verified: " + entries + " entries, verdict PASS", "success");
+    } else {
+      toast("Audit chain verdict: " + verdict + " (" + entries + " entries checked)", "error");
+    }
+  } catch (e) {
+    if (e.status === 404) {
+      toast("Audit-chain verify endpoint not available. Run manually: sanctuary audit-chain export | sanctuary audit-chain verify --input -", "error");
+    } else {
+      toast("Audit failed: " + (e.message || "unknown error"), "error");
+    }
   }
 }
 
@@ -2711,6 +2750,7 @@ document.addEventListener("click", function (ev) {
   }
   // WP-V1.2 reshape click-to-inspect handler ────────────────────────
   if (action === "agent-inspect-open" && agentId) return void onAgentInspectOpen(agentId);
+  if (action === "run-full-audit") return void onRunFullAudit();
   if (action === "exit-export-start") return void onExitExportStart();
   if (action === "did-web-rotate-compromised") return void onDidWebCompromisedRotation();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }

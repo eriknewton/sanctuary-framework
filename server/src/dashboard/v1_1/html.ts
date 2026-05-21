@@ -199,6 +199,7 @@ body {
 .row { display: flex; align-items: center; gap: var(--space-2); padding: 6px 0; border-bottom: 1px dashed var(--rule); }
 .row:last-child { border-bottom: 0; }
 .row .grow { flex: 1; min-width: 0; }
+.inbox-group-head { font-size: var(--text-sm); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.05em; margin: 12px 0 4px; padding: 0; }
 .agent-row { flex-direction: column; align-items: stretch; gap: 6px; }
 .agent-row-head { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
 .agent-row-head .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
