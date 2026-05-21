@@ -9,7 +9,8 @@
     "synthetic-coverage:gate-a": "server/node_modules/.bin/tsx scripts/synthetic-coverage/rollup-cli.ts",
     "menubar:dev": "cd menubar && npm run tauri:dev",
     "menubar:build": "cd menubar && npm run tauri:build",
-    "menubar:setup": "cd menubar && npm install"
+    "menubar:setup": "cd menubar && npm install",
+    "cli-audit-inventory": "server/node_modules/.bin/tsx server/scripts/cli-audit-write-inventory.ts"
   },
   "engines": {
     "node": ">=20"
