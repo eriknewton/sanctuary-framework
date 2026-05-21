@@ -209,14 +209,42 @@ async function main(): Promise<void> {
 
   if (args[0] === "audit-chain") {
     const verb = args[1];
+    const subArgs = args.slice(2);
+    const wantsHelp = verb === "--help" || verb === "-h" ||
+      subArgs.includes("--help") || subArgs.includes("-h");
     if (verb === "export") {
+      if (wantsHelp) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
+        console.error(`Usage: sanctuary audit-chain export [options]
+
+Options:
+  --output <path>        Write JSONL to file (default: stdout)
+  --fortress <path>      Override fortress path
+  --storage-path <path>  Override state directory
+  --help, -h             Show this help
+`);
+        process.exit(0);
+      }
       const { parseExportArgs, runExport } = await import("./cli/audit-chain-export.js");
-      const opts = parseExportArgs(args.slice(2), process.env);
+      const opts = parseExportArgs(subArgs, process.env);
       await runExport(opts);
       process.exit(0);
     } else if (verb === "verify") {
+      if (wantsHelp) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
+        console.error(`Usage: sanctuary audit-chain verify [options]
+
+Options:
+  --input <path>         JSONL file to verify (required)
+  --public-key <key>     Ed25519 public key for signature check (base64url)
+  --no-strict            Continue on verification failures
+  --storage-path <path>  Override state directory
+  --help, -h             Show this help
+`);
+        process.exit(0);
+      }
       const { parseVerifyArgs, runVerify } = await import("./cli/audit-chain-verify.js");
-      const opts = parseVerifyArgs(args.slice(2), process.env);
+      const opts = parseVerifyArgs(subArgs, process.env);
       await runVerify(opts);
       process.exit(0);
     } else {
@@ -227,7 +255,7 @@ Commands:
   export   Dump audit chain to JSONL (--output <path>, --storage-path <path>)
   verify   Verify a JSONL export  (--input <path>, --public-key <key>, --no-strict)
 `);
-      process.exit(1);
+      process.exit(wantsHelp ? 0 : 1);
     }
   }
 
