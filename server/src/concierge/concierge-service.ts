@@ -8,7 +8,7 @@ import {
   type ConciergeStatus,
   type VeniceClientLike,
 } from "./concierge-types.js";
-import { buildConciergePrompt } from "./prompt-builder.js";
+import { buildConciergePrompt, isSummarizationQuery } from "./prompt-builder.js";
 
 export interface ConciergeContextReaderLike {
   readContext(request: ConciergeAskRequest): Promise<ConciergeContextBundle>;
@@ -52,6 +52,23 @@ export class ConciergeService {
       throw new ConciergeReadError("concierge could not read sanctuary state", cause);
     }
 
+    // ZZZZ: deterministic short-circuit for summarization queries against
+    // empty context. When the operator asks "summarize fortress activity"
+    // and the context contains zero concrete events, return a factual
+    // "no activity" response without invoking the LLM. This prevents
+    // Phi-4 from filling the void with plausible-sounding fabrications.
+    if (isSummarizationQuery(question) && isEmptyContext(context)) {
+      const answer = "No fortress activity recorded in the requested window.";
+      if (onToken) onToken(answer);
+      return {
+        answer,
+        model: "deterministic",
+        provider: "venice",
+        read_surfaces: context.read_surfaces,
+        context,
+      };
+    }
+
     try {
       const answer = await this.venice.complete({
         messages: buildConciergePrompt({ question, context }),
@@ -78,4 +95,17 @@ export class ConciergeService {
   configuredReadSurfaces(): string[] {
     return [...CONCIERGE_READ_SURFACES];
   }
+}
+
+/**
+ * ZZZZ: check whether the context bundle contains zero concrete events.
+ * A context is "empty" when the audit log has no entries, the inbox has
+ * no pending items, and the task state has no tasks.
+ */
+function isEmptyContext(context: ConciergeContextBundle): boolean {
+  return (
+    context.audit_log.entries.length === 0 &&
+    context.approval_inbox.pending_count === 0 &&
+    context.task_state.total === 0
+  );
 }
