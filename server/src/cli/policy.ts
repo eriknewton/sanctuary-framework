@@ -50,6 +50,9 @@ import {
 import type { PolicyConflict } from "../policy-engine/conflict-detector.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { resolveStoragePath } from "../paths.js";
+import { loadConfig } from "../config.js";
+import { getOrCreatePassphrase } from "../cocoon/passphrase.js";
+import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 
 export interface PolicyArgs {
   argv: string[];
@@ -289,6 +292,38 @@ async function cmdDraftsActivate(
     }
   }
 
+  // Audit BEFORE the HTTP call so a partial-failure (audit succeeds but
+  // HTTP fails) still leaves a record of the intent.
+  let auditLog: AuditLog | null = null;
+  let auditIdentityId = "cli";
+  try {
+    const config = await loadConfig();
+    const storagePath = config.storage_path;
+    const storage = new FilesystemStorage(`${storagePath}/state`);
+    let passphrase = process.env["SANCTUARY_PASSPHRASE"];
+    if (!passphrase) {
+      const resolved = await getOrCreatePassphrase();
+      passphrase = resolved.value;
+    }
+    let existingParams: KeyDerivationParams | undefined;
+    try {
+      const raw = await storage.read("_meta", "key-params");
+      if (raw) existingParams = JSON.parse(bytesToString(raw));
+    } catch { /* no key-params yet */ }
+    const { key: masterKey, params } = await deriveMasterKey(passphrase, existingParams);
+    if (!existingParams) {
+      await storage.write("_meta", "key-params", stringToBytes(JSON.stringify(params)));
+    }
+    auditLog = new AuditLog(storage, masterKey);
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    auditIdentityId = `fortress:${fortressId}`;
+    auditLog.append("l2", "policy.drafts.activate", auditIdentityId, {
+      draft_id: parsed.draftId,
+      api_base: base,
+      conflicts_count: conflicts.length,
+    });
+  } catch { /* audit best-effort */ }
+
   const res = await fetch(
     `${base}/api/policy/drafts/${encodeURIComponent(parsed.draftId)}/activate`,
     {
@@ -309,6 +344,14 @@ async function cmdDraftsActivate(
     data?: { record?: { status?: string } };
   };
   if (!res.ok || !body.ok) {
+    if (auditLog) {
+      auditLog.append("l2", "policy.drafts.activate", auditIdentityId, {
+        draft_id: parsed.draftId,
+        api_base: base,
+        http_status: res.status,
+        error: body.error ?? res.statusText,
+      }, "failure");
+    }
     ctx.err.write(`activation failed: ${body.error ?? res.statusText}\n`);
     if (body.detail) ctx.err.write(`${body.detail}\n`);
     return 1;

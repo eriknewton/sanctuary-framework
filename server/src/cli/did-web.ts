@@ -311,6 +311,15 @@ async function cmdIssue(
     mode: 0o600,
   });
 
+  const auditLog = new AuditLog(snapshot.storage, snapshot.masterKey);
+  auditLog.append("l1", "did-web.issue", snapshot.identityId, {
+    did: identifier.did,
+    authority_host: identifier.authority_host,
+    ...(identifier.agent_label !== undefined
+      ? { agent_label: identifier.agent_label }
+      : {}),
+  });
+
   if (json) {
     write(out, JSON.stringify(record, null, 2) + "\n");
     return 0;
