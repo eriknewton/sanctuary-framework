@@ -133,7 +133,7 @@ async function cmdRecommendations(
     ctx.err.write("recommendations subcommand required\n");
     return 2;
   }
-  const { suggester } = await openCalibration(ctx.args);
+  const { suggester, auditLog, identityId } = await openCalibration(ctx.args);
   switch (sub) {
     case "list": {
       const recs = await suggester.listRecommendations({
@@ -177,6 +177,13 @@ async function cmdRecommendations(
         return 2;
       }
       const result = await suggester.acceptRecommendation(ruleId);
+      auditLog.append("l2", "auto-trigger.recommendations.accept", identityId, {
+        rule_id: ruleId,
+        rule_type: result.recommendation.rule_type,
+        current_rung: result.recommendation.current_rung,
+        recommended_rung: result.recommendation.recommended_rung,
+        confidence: result.recommendation.confidence,
+      });
       ctx.out.write(
         `Accepted ${ruleId}: rung ${result.recommendation.current_rung} -> ${result.recommendation.recommended_rung}\n`,
       );
@@ -190,6 +197,11 @@ async function cmdRecommendations(
       }
       const cooldown = parseNumberFlag(argv, "--cooldown-hours");
       const result = await suggester.rejectRecommendation(ruleId, cooldown);
+      auditLog.append("l2", "auto-trigger.recommendations.reject", identityId, {
+        rule_id: ruleId,
+        suppressed_until: result.suppressed_until,
+        cooldown_hours: cooldown ?? 24,
+      });
       ctx.out.write(
         `Rejected ${ruleId}: suppressed until ${result.suppressed_until}\n`,
       );
@@ -298,9 +310,18 @@ async function cmdRulesPromote(
     );
     return 2;
   }
-  const { store } = await openStore(ctx.args);
+  const { store, storage, masterKey, fortressId } = await openStore(ctx.args);
+  const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
   try {
+    const before = await store.get(ruleId);
     const after = await store.promote(ruleId, ruleType);
+    const auditLog = new AuditLog(storage, masterKey);
+    auditLog.append("l2", "auto-trigger.rules.promote", identityId, {
+      rule_id: ruleId,
+      rule_type: ruleType,
+      before_rung: before?.current_rung ?? null,
+      after_rung: after.current_rung,
+    });
     ctx.out.write(`Promoted ${ruleId} -> rung ${after.current_rung}\n`);
     return 0;
   } catch (err) {
@@ -332,9 +353,18 @@ async function cmdRulesDemote(
     );
     return 2;
   }
-  const { store } = await openStore(ctx.args);
+  const { store, storage, masterKey, fortressId } = await openStore(ctx.args);
+  const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
   try {
+    const before = await store.get(ruleId);
     const after = await store.demote(ruleId, ruleType);
+    const auditLog = new AuditLog(storage, masterKey);
+    auditLog.append("l2", "auto-trigger.rules.demote", identityId, {
+      rule_id: ruleId,
+      rule_type: ruleType,
+      before_rung: before?.current_rung ?? null,
+      after_rung: after.current_rung,
+    });
     ctx.out.write(`Demoted ${ruleId} -> rung ${after.current_rung}\n`);
     return 0;
   } catch (err) {
@@ -393,11 +423,26 @@ async function cmdRulesSetThreshold(
     );
     return 2;
   }
-  const { store } = await openStore(ctx.args);
+  const { store, storage, masterKey, fortressId } = await openStore(ctx.args);
+  const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
   const patch: Parameters<typeof store.updateConfig>[2] = {};
   if (Object.keys(overrides).length > 0) patch.threshold_overrides = overrides;
   if (cancelWindow !== undefined) patch.cancel_window_seconds = cancelWindow;
+  const before = await store.get(ruleId);
   const after = await store.updateConfig(ruleId, ruleType, patch);
+  const auditLog = new AuditLog(storage, masterKey);
+  auditLog.append("l2", "auto-trigger.rules.set-threshold", identityId, {
+    rule_id: ruleId,
+    rule_type: ruleType,
+    before: {
+      threshold_overrides: before?.threshold_overrides ?? {},
+      cancel_window_seconds: before?.cancel_window_seconds ?? null,
+    },
+    after: {
+      threshold_overrides: after.threshold_overrides,
+      cancel_window_seconds: after.cancel_window_seconds,
+    },
+  });
   ctx.out.write(
     `Updated ${ruleId}: overrides=${JSON.stringify(after.threshold_overrides)} cancel-window=${after.cancel_window_seconds}s\n`,
   );
@@ -519,7 +564,7 @@ async function openStore(
 
 async function openCalibration(
   args: AutoTriggerArgs,
-): Promise<{ suggester: CalibrationSuggester }> {
+): Promise<{ suggester: CalibrationSuggester; auditLog: AuditLog; identityId: string }> {
   const { store, storage, masterKey, fortressId } = await openStore(args);
   const auditLog = new AuditLog(storage, masterKey);
   const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
@@ -539,5 +584,5 @@ async function openCalibration(
     identityId,
     tickIntervalMs: 0,
   });
-  return { suggester };
+  return { suggester, auditLog, identityId };
 }
