@@ -105,20 +105,20 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   // ---- sentinel ----
   "sentinel list":           { classification: "read-only" },
   "sentinel list-subscribed": { classification: "read-only" },
-  "sentinel subscribe":      { classification: "mutator", auditOverride: false, notes: "writes subscription file but no audit entry" },
-  "sentinel unsubscribe":    { classification: "mutator", auditOverride: false, notes: "writes subscription file but no audit entry" },
+  "sentinel subscribe":      { classification: "mutator", auditOverride: true, notes: "AuditLog.append in subscribe handler (ZZZZZ batch 5b)" },
+  "sentinel unsubscribe":    { classification: "mutator", auditOverride: true, notes: "AuditLog.append in unsubscribe handler (ZZZZZ batch 5b)" },
   "sentinel findings":       { classification: "read-only" },
 
   // ---- anomaly ----
   "anomaly detectors":       { classification: "read-only" },
   "anomaly list-subscribed": { classification: "read-only" },
-  "anomaly subscribe":       { classification: "mutator", auditOverride: false, notes: "writes subscription file but no audit entry" },
-  "anomaly unsubscribe":     { classification: "mutator", auditOverride: false, notes: "writes subscription file but no audit entry" },
+  "anomaly subscribe":       { classification: "mutator", auditOverride: true, notes: "AuditLog.append in subscribe handler (ZZZZZ batch 5b)" },
+  "anomaly unsubscribe":     { classification: "mutator", auditOverride: true, notes: "AuditLog.append in unsubscribe handler (ZZZZZ batch 5b)" },
   "anomaly findings":        { classification: "read-only" },
   "anomaly classifier-state": { classification: "read-only" },
 
   // ---- did-web ----
-  "did-web issue":           { classification: "mutator", auditOverride: false, notes: "writes did-web.json but no AuditLog.append in issue handler" },
+  "did-web issue":           { classification: "mutator", auditOverride: true, notes: "AuditLog.append in issue handler (ZZZZZ batch 5b)" },
   "did-web show":            { classification: "read-only" },
   "did-web rotate-key":      { classification: "mutator", auditOverride: true, notes: "AuditLog.append + flush in rotate-key handler" },
   "did-web key-history":     { classification: "read-only" },
@@ -127,15 +127,15 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   // ---- auto-trigger rules (nested subcommands) ----
   "auto-trigger rules list":          { classification: "read-only" },
   "auto-trigger rules show":          { classification: "read-only" },
-  "auto-trigger rules promote":       { classification: "mutator", auditOverride: false, notes: "updates ThresholdConfigStore but no audit entry" },
-  "auto-trigger rules demote":        { classification: "mutator", auditOverride: false, notes: "updates ThresholdConfigStore but no audit entry" },
-  "auto-trigger rules set-threshold": { classification: "mutator", auditOverride: false, notes: "updates ThresholdConfigStore but no audit entry" },
+  "auto-trigger rules promote":       { classification: "mutator", auditOverride: true, notes: "AuditLog.append with before/after rung (ZZZZZ batch 5b)" },
+  "auto-trigger rules demote":        { classification: "mutator", auditOverride: true, notes: "AuditLog.append with before/after rung (ZZZZZ batch 5b)" },
+  "auto-trigger rules set-threshold": { classification: "mutator", auditOverride: true, notes: "AuditLog.append with before/after threshold values (ZZZZZ batch 5b)" },
 
   // ---- auto-trigger recommendations (nested) ----
   "auto-trigger recommendations list":   { classification: "read-only" },
   "auto-trigger recommendations show":   { classification: "read-only" },
-  "auto-trigger recommendations accept": { classification: "mutator", auditOverride: false, notes: "applies calibration change but no audit entry" },
-  "auto-trigger recommendations reject": { classification: "mutator", auditOverride: false, notes: "suppresses recommendation but no audit entry" },
+  "auto-trigger recommendations accept": { classification: "mutator", auditOverride: true, notes: "AuditLog.append with recommendation detail (ZZZZZ batch 5b)" },
+  "auto-trigger recommendations reject": { classification: "mutator", auditOverride: true, notes: "AuditLog.append with suppression detail (ZZZZZ batch 5b)" },
 
   // ---- auto-trigger cancel ----
   "auto-trigger cancel": { classification: "mutator", auditOverride: true, notes: "dashboard-delegated POST (audits server-side)" },
@@ -162,7 +162,7 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   "policy drafts list":          { classification: "read-only" },
   "policy drafts show":          { classification: "read-only" },
   "policy drafts check-conflicts": { classification: "read-only", notes: "queries server for conflicts, no state change" },
-  "policy drafts activate":      { classification: "mutator", auditOverride: false, notes: "activates policy via HTTP POST but no local audit" },
+  "policy drafts activate":      { classification: "mutator", auditOverride: true, notes: "AuditLog.append before HTTP POST + failure audit (ZZZZZ batch 5b)" },
 
   // ---- concierge ----
   "concierge ask":    { classification: "read-only" },
@@ -172,7 +172,7 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   "agents list":   { classification: "read-only" },
   "agents show":   { classification: "read-only" },
   "agents status": { classification: "read-only" },
-  "agents config": { classification: "mutator", auditOverride: false, notes: "writes principal-policy.yaml but no audit entry" },
+  "agents config": { classification: "mutator", auditOverride: true, notes: "AuditLog.append with before/after approval_redirect (ZZZZZ batch 5b)" },
 
   // ---- audit-chain (the export and verify surfaces) ----
   "audit-chain export": { classification: "read-only", notes: "exports chain data, no state change" },
@@ -198,7 +198,7 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
 
   // ---- template ----
   "template list": { classification: "read-only" },
-  "template init": { classification: "mutator", auditOverride: false, notes: "writes template files but no audit entry" },
+  "template init": { classification: "mutator", auditOverride: true, notes: "AuditLog.append with template + agent detail (ZZZZZ batch 5b)" },
 };
 
 // ---- Subcommand extraction ------------------------------------------------

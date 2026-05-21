@@ -76,14 +76,14 @@ describe("CLI audit-write inventory", () => {
     expect(rotateKey!.audits_currently).toBe(true);
   });
 
-  it("classifies sanctuary anomaly subscribe as mutator without audit", () => {
+  it("classifies sanctuary anomaly subscribe as mutator with audit (ZZZZZ batch 5b closed)", () => {
     const entries = loadInventory();
     const sub = entries.find(
       (e) => e.subcommand === "sanctuary anomaly subscribe",
     );
     expect(sub).toBeDefined();
     expect(sub!.classification).toBe("mutator");
-    expect(sub!.audits_currently).toBe(false);
+    expect(sub!.audits_currently).toBe(true);
   });
 
   it("has no uncertain/unclassified entries", () => {
@@ -92,12 +92,11 @@ describe("CLI audit-write inventory", () => {
     expect(uncertain).toHaveLength(0);
   });
 
-  it("mutator-no-audit gap count is below 20", () => {
+  it("all mutators now audit (ZZZZZ batch 5b closure)", () => {
     const entries = loadInventory();
     const gaps = entries.filter(
       (e) => e.classification === "mutator" && e.audits_currently === false,
     );
-    expect(gaps.length).toBeLessThan(20);
-    expect(gaps.length).toBeGreaterThan(0); // We know gaps exist
+    expect(gaps.length).toBe(0);
   });
 });

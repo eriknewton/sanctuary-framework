@@ -32,6 +32,15 @@ import {
 import { probeTenantDashboard, type HealthProbeResult } from "./health.js";
 import { parsePolicy } from "../../principal-policy/loader.js";
 import { readLockdownStatus } from "../../lockdown/status.js";
+import { AuditLog } from "../../l2-operational/audit-log.js";
+import { FilesystemStorage } from "../../storage/filesystem.js";
+import {
+  deriveMasterKey,
+  type KeyDerivationParams,
+} from "../../core/key-derivation.js";
+import { stringToBytes, bytesToString } from "../../core/encoding.js";
+import { readStoredPassphrase } from "../../cocoon/passphrase.js";
+import { fortressIdFromStoragePath } from "../../dashboard/v1_1/wiring.js";
 
 export interface AgentsCommandArgs {
   argv: string[];
@@ -444,6 +453,33 @@ async function cmdConfig(argv: string[], ctx: ResolvedCtx): Promise<number> {
   };
 
   await writeApprovalRedirectToPolicyFile(tenant.storage_path, next);
+
+  try {
+    const fortressId = fortressIdFromStoragePath(tenant.storage_path);
+    const storage = new FilesystemStorage(`${tenant.storage_path}/state`);
+    let passphrase = ctx.env.SANCTUARY_PASSPHRASE;
+    if (!passphrase) {
+      const stored = await readStoredPassphrase({ storagePath: tenant.storage_path });
+      if (stored) passphrase = stored.value;
+    }
+    if (passphrase) {
+      let existingParams: KeyDerivationParams | undefined;
+      try {
+        const raw = await storage.read("_meta", "key-params");
+        if (raw) existingParams = JSON.parse(bytesToString(raw));
+      } catch { /* no key-params yet */ }
+      const { key: masterKey, params } = await deriveMasterKey(passphrase, existingParams);
+      if (!existingParams) {
+        await storage.write("_meta", "key-params", stringToBytes(JSON.stringify(params)));
+      }
+      const auditLog = new AuditLog(storage, masterKey);
+      auditLog.append("l2", "agents.config", `fortress:${fortressId}`, {
+        tenant: tenant.name,
+        approval_redirect: next,
+        previous: current,
+      });
+    }
+  } catch { /* audit best-effort; do not block config write */ }
 
   if (hasJsonFlag(argv)) {
     ctx.out.write(

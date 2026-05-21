@@ -15,6 +15,13 @@ import { listTemplates, getTemplate, TEMPLATE_NAMES, isTemplateName } from "./re
 import { buildCompiledPolicyFromTemplate } from "./init.js";
 import { encodePolicyBlob } from "../policy-engine/canonical-policy.js";
 import { findTenant } from "../cli/agents/discovery.js";
+import { AuditLog } from "../l2-operational/audit-log.js";
+import { FilesystemStorage } from "../storage/filesystem.js";
+import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
+import { stringToBytes, bytesToString } from "../core/encoding.js";
+import { loadConfig } from "../config.js";
+import { getOrCreatePassphrase } from "../cocoon/passphrase.js";
+import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 
 export interface TemplateCommandArgs {
   argv: string[];
@@ -178,6 +185,36 @@ async function cmdInit(
 
   // Encode the policy blob for display
   const blob = encodePolicyBlob(compiled);
+
+  // Best-effort audit write
+  try {
+    const config = await loadConfig();
+    const storagePath = config.storage_path;
+    const storage = new FilesystemStorage(`${storagePath}/state`);
+    let passphrase = process.env["SANCTUARY_PASSPHRASE"];
+    if (!passphrase) {
+      const resolved = await getOrCreatePassphrase();
+      passphrase = resolved.value;
+    }
+    let existingParams: KeyDerivationParams | undefined;
+    try {
+      const raw = await storage.read("_meta", "key-params");
+      if (raw) existingParams = JSON.parse(bytesToString(raw));
+    } catch { /* no key-params yet */ }
+    const { key: masterKey, params } = await deriveMasterKey(passphrase, existingParams);
+    if (!existingParams) {
+      await storage.write("_meta", "key-params", stringToBytes(JSON.stringify(params)));
+    }
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const auditLog = new AuditLog(storage, masterKey);
+    auditLog.append("l2", "template.init", `fortress:${fortressId}`, {
+      template_name: templateName,
+      agent_id: agentId,
+      fortress_id: fortressId,
+      channel: bundle.metadata.channel,
+      tier: bundle.metadata.tier,
+    });
+  } catch { /* audit best-effort; do not block template init output */ }
 
   out.write("\nTemplate initialized successfully.\n");
   out.write("=".repeat(60) + "\n\n");
