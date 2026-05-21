@@ -718,6 +718,62 @@ export async function runWrap(
     // dashboard server, the v1.1 binding, the runtime advertisement,
     // and the auto-open browser path; print a concise success line that
     // points operators at the persistent dashboard.
+
+    // v1.3.0 (WWWWW, NNN regression): --no-dashboard wraps previously
+    // skipped identity bootstrap because the creation lived after the
+    // dashboard startup path. Derive the master key and create a default
+    // identity so CLI surfaces (exit export, identity show) work
+    // immediately after wrap without launching the dashboard first.
+    if (passphraseValue !== undefined) {
+      try {
+        const ndStorage = new FilesystemStorage(`${storagePath}/state`);
+        let existingParams: KeyDerivationParams | undefined;
+        try {
+          const raw = await ndStorage.read("_meta", "key-params");
+          if (raw) {
+            existingParams = JSON.parse(bytesToString(raw)) as KeyDerivationParams;
+          }
+        } catch {
+          // No existing params; deriveMasterKey will pick fresh params.
+        }
+        const ndDerived = await deriveMasterKey(passphraseValue, existingParams);
+        if (!existingParams) {
+          await ndStorage.write(
+            "_meta",
+            "key-params",
+            stringToBytes(JSON.stringify(ndDerived.params)),
+          );
+        }
+        const ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
+
+        const { IdentityManager } = await import("../l1-cognitive/tools.js");
+        const { createIdentity } = await import("../core/identity.js");
+        const { derivePurposeKey } = await import("../core/key-derivation.js");
+        const identityMgr = new IdentityManager(ndStorage, ndDerived.key);
+        const loadResult = await identityMgr.load();
+        if (loadResult.loaded === 0) {
+          const identityEncKey = derivePurposeKey(ndDerived.key, "identity-encryption");
+          const { storedIdentity, publicIdentity } = createIdentity(
+            "default",
+            identityEncKey,
+            "passphrase",
+          );
+          await identityMgr.save(storedIdentity);
+          ndAuditLog.append("l1", "identity_create", publicIdentity.identity_id, {
+            label: "default",
+            source: "wrap-auto",
+          });
+        }
+        await ndAuditLog.flush();
+      } catch (err) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel.
+        console.error(
+          `  Note: default identity not created at wrap time ` +
+            `(${(err as Error).message}).`,
+        );
+      }
+    }
+
     const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
     printWrapSuccessNoDashboard({
       toolName,
