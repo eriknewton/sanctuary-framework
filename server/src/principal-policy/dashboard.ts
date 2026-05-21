@@ -1092,8 +1092,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * v1.3.0 (XXXXX): loopback addresses are exempt from rate limiting.
+   * The operator's local browser, autonomous tooling, and drill-via-curl
+   * flows should never be locked out of their own dashboard.
+   */
+  private isLoopbackAddr(addr: string): boolean {
+    return addr === "127.0.0.1" || addr === "::1";
+  }
+
+  /**
    * Check rate limit for a request. Returns true if allowed, false if rate-limited.
    * When rate-limited, sends a 429 response.
+   *
+   * v1.3.0 (XXXXX): loopback addresses bypass rate limiting entirely.
    */
   private checkRateLimit(
     req: IncomingMessage,
@@ -1101,6 +1112,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     type: "general" | "decisions"
   ): boolean {
     const addr = this.getRemoteAddr(req);
+
+    // v1.3.0 (XXXXX): loopback is always allowed. Operator-local requests
+    // (browser polling, autonomous tooling, drill-via-curl) must never 429.
+    if (this.isLoopbackAddr(addr)) return true;
+
     const now = Date.now();
     const windowStart = now - RATE_LIMIT_WINDOW_MS;
 
@@ -1367,6 +1383,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     url: URL,
     method: string,
   ): void {
+    // v1.3.0 (XXXXX): /api/health is exempt from auth AND rate limiting.
+    // Health checks must always respond so the multi-aggregator health probe
+    // pattern (multi-server.ts) and external monitoring work reliably.
+    if (method === "GET" && url.pathname === "/api/health") {
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify({ ok: true, mode: "principal-policy" }));
+      return;
+    }
+
     // SEC-012: Session exchange does its own auth (header-only) — let it through before checkAuth
     if (method === "POST" && url.pathname === "/auth/session") {
       if (!this.checkRateLimit(req, res, "general")) return;
