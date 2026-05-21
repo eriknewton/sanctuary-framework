@@ -34,6 +34,7 @@ import {
 } from "../sentinel/subscription-store.js";
 import { PHI1_BASELINE_CATALOG } from "../sentinel/sentinels/index.js";
 import type { SentinelSeverity } from "../sentinel/types.js";
+import { AuditLog } from "../l2-operational/audit-log.js";
 
 export interface SentinelArgs {
   argv: string[];
@@ -145,14 +146,24 @@ async function cmdSubscribe(
     ctx.err.write("subscribe requires a sentinel-id\n");
     return 2;
   }
+  const storagePath = await resolveStoragePath(ctx.args);
   const known = PHI1_BASELINE_CATALOG.find(
     (entry) => entry.sentinelId === sentinelId,
   );
   if (!known) {
+    try {
+      const masterKey = await deriveSentinelMasterKey(ctx.args);
+      const storage = new FilesystemStorage(`${storagePath}/state`);
+      const fortressId = fortressIdFromStoragePath(storagePath);
+      const auditLog = new AuditLog(storage, masterKey);
+      auditLog.append("l2", "sentinel.subscribe", `fortress:${fortressId}`, {
+        sentinel_id: sentinelId,
+        subscription_path: `${storagePath}/sentinel-subscriptions.json`,
+      }, "failure");
+    } catch { /* audit best-effort */ }
     ctx.err.write(`Unknown sentinel: ${sentinelId}\n`);
     return 2;
   }
-  const storagePath = await resolveStoragePath(ctx.args);
   const subscribed = await loadSentinelSubscriptions(storagePath);
   if (subscribed.has(sentinelId)) {
     ctx.out.write(`Already subscribed: ${sentinelId}\n`);
@@ -160,6 +171,14 @@ async function cmdSubscribe(
   }
   subscribed.add(sentinelId);
   await saveSentinelSubscriptions(storagePath, subscribed);
+  const masterKey = await deriveSentinelMasterKey(ctx.args);
+  const storage = new FilesystemStorage(`${storagePath}/state`);
+  const fortressId = fortressIdFromStoragePath(storagePath);
+  const auditLog = new AuditLog(storage, masterKey);
+  auditLog.append("l2", "sentinel.subscribe", `fortress:${fortressId}`, {
+    sentinel_id: sentinelId,
+    subscription_path: `${storagePath}/sentinel-subscriptions.json`,
+  });
   ctx.out.write(
     `Subscribed: ${sentinelId}\nRestart Sanctuary or wait for the next dispatcher tick to begin evaluation.\n`,
   );
@@ -187,6 +206,14 @@ async function cmdUnsubscribe(
   }
   subscribed.delete(sentinelId);
   await saveSentinelSubscriptions(storagePath, subscribed);
+  const masterKey = await deriveSentinelMasterKey(ctx.args);
+  const storage = new FilesystemStorage(`${storagePath}/state`);
+  const fortressId = fortressIdFromStoragePath(storagePath);
+  const auditLog = new AuditLog(storage, masterKey);
+  auditLog.append("l2", "sentinel.unsubscribe", `fortress:${fortressId}`, {
+    sentinel_id: sentinelId,
+    subscription_path: `${storagePath}/sentinel-subscriptions.json`,
+  });
   ctx.out.write(`Unsubscribed: ${sentinelId}\n`);
   return 0;
 }
@@ -288,4 +315,33 @@ async function resolveStoragePath(args: SentinelArgs): Promise<string> {
   if (args.storagePath) return args.storagePath;
   const config = await loadConfig();
   return config.storage_path;
+}
+
+async function deriveSentinelMasterKey(args: SentinelArgs): Promise<Uint8Array> {
+  const storagePath = await resolveStoragePath(args);
+  const storage = new FilesystemStorage(`${storagePath}/state`);
+  let passphrase = args.passphrase ?? process.env["SANCTUARY_PASSPHRASE"];
+  if (!passphrase) {
+    const resolved = await getOrCreatePassphrase();
+    passphrase = resolved.value;
+  }
+  let existingParams: KeyDerivationParams | undefined;
+  try {
+    const raw = await storage.read("_meta", "key-params");
+    if (raw) existingParams = JSON.parse(bytesToString(raw));
+  } catch {
+    /* first run; nothing to read */
+  }
+  const { key: masterKey, params } = await deriveMasterKey(
+    passphrase,
+    existingParams,
+  );
+  if (!existingParams) {
+    await storage.write(
+      "_meta",
+      "key-params",
+      stringToBytes(JSON.stringify(params)),
+    );
+  }
+  return masterKey;
 }
