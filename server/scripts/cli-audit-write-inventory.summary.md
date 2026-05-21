@@ -1,14 +1,14 @@
 # CLI Audit-Write Completeness Inventory
 
-Generated: 2026-05-21T21:02:10.724Z
+Generated: 2026-05-21T21:48:37.862Z
 
 ## Summary
 
 | Metric | Count |
 |--------|-------|
-| Total CLI subcommands inventoried | 69 |
-| Mutators | 33 |
-| Read-only | 36 |
+| Total CLI subcommands inventoried | 71 |
+| Mutators | 34 |
+| Read-only | 37 |
 | Pure-UI | 0 |
 | **Mutators that do NOT audit (Batch 5b targets)** | **0** |
 | Uncertain (operator review needed) | 0 |
@@ -44,6 +44,8 @@ Generated: 2026-05-21T21:02:10.724Z
 | `sanctuary did-web register-hosted` | mutator | yes | src/cli/did-web.ts | 160 |
 | `sanctuary did-web rotate-key` | mutator | yes | src/cli/did-web.ts | 154 |
 | `sanctuary did-web show` | read-only | n/a | src/cli/did-web.ts | 151 |
+| `sanctuary erc8004 register` | mutator | yes | src/cli/erc8004.ts | 115 |
+| `sanctuary erc8004 status` | read-only | n/a | src/cli/erc8004.ts | 118 |
 | `sanctuary exit export` | mutator | yes | src/exit/cli.ts | 267 |
 | `sanctuary exit manifest-shape` | read-only | n/a | src/exit/cli.ts | 208 |
 | `sanctuary honeypot compile` | read-only | n/a | src/honeypot/cli.ts | 150 |

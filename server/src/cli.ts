@@ -189,6 +189,12 @@ async function main(): Promise<void> {
     drainAndExit(code);
   }
 
+  if (args[0] === "erc8004") {
+    const { runErc8004Command } = await import("./cli/erc8004.js");
+    const code = await runErc8004Command({ argv: args.slice(1) });
+    drainAndExit(code);
+  }
+
   if (args[0] === "inbox") {
     const { runInboxCommand } = await import("./cli/inbox.js");
     const code = await runInboxCommand({ argv: args.slice(1) });

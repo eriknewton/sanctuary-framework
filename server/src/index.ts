@@ -92,6 +92,8 @@ import { createGovernorTools } from "./l2-operational/governor-tools.js";
 import { createSanctuaryTools } from "./sanctuary-tools.js";
 import { createMemoryAttestTools } from "./l1-cognitive/memory-attest.js";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
+import { createErc8004Tools } from "./key-17/erc8004-tools.js";
+import { DefaultPolicyGate } from "./key-17/policy-gate.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
@@ -1137,6 +1139,24 @@ export async function createSanctuaryServer(options?: {
     });
   }
 
+  // 16b. ERC-8004 Identity Registry operator UX (Key 17 PR 3)
+  const erc8004PolicyGate = new DefaultPolicyGate({
+    global_default: "operator_approval_required",
+    erc8004: {
+      default_decision: "operator_approval_required",
+      counterparty_rules: [],
+    },
+  });
+  const { tools: erc8004Tools } = createErc8004Tools({
+    masterKey,
+    policyGate: erc8004PolicyGate,
+    auditLog,
+    identityId: aggregatorIdentityId,
+    operatorId: aggregatorIdentityId,
+    inboxBridge: unifiedInboxBridge,
+    fortressId: fortressIdForAggregator,
+  });
+
   // 17. Assemble all tools
   let allTools: ToolDefinition[] = [
     ...l1Tools,
@@ -1157,6 +1177,7 @@ export async function createSanctuaryServer(options?: {
     ...sanctuaryMetaTools,
     ...memoryAttestTools,
     ...complianceTools,
+    ...erc8004Tools,
     manifestTool,
   ];
 

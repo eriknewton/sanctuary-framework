@@ -117,6 +117,10 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   "anomaly findings":        { classification: "read-only" },
   "anomaly classifier-state": { classification: "read-only" },
 
+  // ---- erc8004 ----
+  "erc8004 register":        { classification: "mutator", auditOverride: true, notes: "AuditLog.append via handleErc8004Request (PR 3)" },
+  "erc8004 status":          { classification: "read-only" },
+
   // ---- did-web ----
   "did-web issue":           { classification: "mutator", auditOverride: true, notes: "AuditLog.append in issue handler (ZZZZZ batch 5b)" },
   "did-web show":            { classification: "read-only" },
@@ -215,6 +219,7 @@ function deriveParentCommand(filePath: string): string | null {
   if (base.endsWith("cli/secrets")) return "secrets";
   if (base.endsWith("cli/sentinel")) return "sentinel";
   if (base.endsWith("cli/anomaly")) return "anomaly";
+  if (base.endsWith("cli/erc8004")) return "erc8004";
   if (base.endsWith("cli/did-web")) return "did-web";
   if (base.endsWith("cli/auto-trigger")) return "auto-trigger";
   if (base.endsWith("cli/identity")) return "identity";
