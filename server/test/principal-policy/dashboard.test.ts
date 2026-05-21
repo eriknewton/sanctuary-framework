@@ -502,49 +502,32 @@ describe("Principal Dashboard", () => {
   });
 
   // ── Rate Limiting ────────────────────────────────────────────────────
+  //
+  // v1.3.0 (XXXXX): loopback addresses (127.0.0.1, ::1) are now exempt
+  // from rate limiting. Since these tests run against 127.0.0.1, they
+  // verify the EXEMPTION — rapid loopback bursts must never 429.
+  // Rate limiting for non-loopback addresses is structurally preserved
+  // in the code path but cannot be integration-tested without a
+  // non-loopback bind address.
 
   describe("Rate Limiting", () => {
-    it("returns 429 when general rate limit is exceeded", async () => {
-      // Send 121 requests rapidly (limit is 120 per minute)
+    it("loopback is exempt: 125 rapid API requests never return 429 (XXXXX)", async () => {
+      // v1.3.0 (XXXXX): loopback exemption. Previously this test expected
+      // 429 after 120 requests. Now loopback is always allowed.
       const results: number[] = [];
       for (let i = 0; i < 125; i++) {
         const res = await fetch(`http://127.0.0.1:${port}/api/status`);
         results.push(res.status);
-        if (res.status === 429) break;
       }
-      expect(results).toContain(429);
-    });
-
-    it("returns Retry-After header on 429 response", async () => {
-      // Exhaust the general rate limit
-      for (let i = 0; i < 121; i++) {
-        const res = await fetch(`http://127.0.0.1:${port}/api/status`);
-        if (res.status === 429) {
-          expect(res.headers.get("retry-after")).toBeTruthy();
-          const body = await res.json();
-          expect(body.error).toContain("Rate limit");
-          expect(body.retry_after_seconds).toBeGreaterThan(0);
-          return;
-        }
-      }
-      // If we get here, rate limiting didn't kick in
-      expect.fail("Expected 429 response but never received one");
+      expect(results).not.toContain(429);
+      expect(results.every((s) => s === 200)).toBe(true);
     });
 
     // v0.10.0-rc.2 regression guard: exempt HTML/SSE view routes from the
     // general rate limit so the operator can never 429 themselves out of
-    // their own dashboard on a normal browser refresh. See the soak report
-    // for v0.10.0-rc.1 for the original failure mode.
-    //
-    // Request counts are kept just above the 120 general limit — enough to
-    // prove exemption without exhausting sockets on CI runners. Each test
-    // retries once on beforeEach port collisions (rare but observed).
+    // their own dashboard on a normal browser refresh. These tests still
+    // hold under the XXXXX loopback exemption.
     it("does NOT rate-limit HTML view route `/v1.0` (rc.2 regression, v1.1.7 path-flip)", { retry: 2 }, async () => {
-      // v1.1.7: legacy dashboard moved from `/` to `/v1.0`. Rate-limit
-      // exemption applies to the legacy view route at its new path; the
-      // root path is now claimed by the v1.1 SPA via dispatchV11 in
-      // production wiring (this rig is bare so legacy is the active
-      // surface).
       const results: number[] = [];
       for (let i = 0; i < 125; i++) {
         const res = await fetch(`http://127.0.0.1:${port}/v1.0`);
@@ -563,9 +546,11 @@ describe("Principal Dashboard", () => {
       expect(results).not.toContain(429);
     });
 
-    it("still rate-limits API routes while view routes are exempt (rc.2 regression)", { retry: 2 }, async () => {
-      // View routes stay green, API routes still get throttled — proves the
-      // exemption is scoped, not a blanket disable.
+    it("loopback is exempt: rapid API requests stay 200 while views also stay 200 (XXXXX, rc.2 update)", { retry: 2 }, async () => {
+      // Previously this test expected API routes to 429 while view routes
+      // stayed green, proving scoped exemption. With XXXXX loopback
+      // exemption, both stay green from loopback. The rate limiter's
+      // view/API distinction is preserved for non-loopback addresses.
       const viewResults: number[] = [];
       const apiResults: number[] = [];
       for (let i = 0; i < 125; i++) {
@@ -575,14 +560,14 @@ describe("Principal Dashboard", () => {
       for (let i = 0; i < 125; i++) {
         const r = await fetch(`http://127.0.0.1:${port}/api/status`);
         apiResults.push(r.status);
-        if (r.status === 429) break;
       }
       expect(viewResults).not.toContain(429);
-      expect(apiResults).toContain(429);
+      expect(apiResults).not.toContain(429);
     });
 
-    it("rate-limits decision endpoints more tightly", async () => {
-      // Create many pending requests
+    it("loopback is exempt: rapid decision approvals never return 429 (XXXXX)", async () => {
+      // Previously tested tight rate limit on decisions (20/min). With
+      // XXXXX loopback exemption, decisions from loopback are always allowed.
       const promises: Promise<unknown>[] = [];
       for (let i = 0; i < 25; i++) {
         promises.push(
@@ -596,12 +581,10 @@ describe("Principal Dashboard", () => {
         );
       }
 
-      // Get the pending IDs
       const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
       const pending = await listRes.json();
       expect(pending.length).toBeGreaterThan(20);
 
-      // Try to approve them all rapidly (limit is 20 per minute)
       const results: number[] = [];
       for (const p of pending) {
         const res = await fetch(
@@ -610,7 +593,7 @@ describe("Principal Dashboard", () => {
         );
         results.push(res.status);
       }
-      expect(results).toContain(429);
+      expect(results).not.toContain(429);
     });
   });
 
@@ -635,6 +618,44 @@ describe("Principal Dashboard", () => {
       const response = await approvalPromise;
       expect(response.decision).toBe("deny");
       expect(response.decided_by).toBe("auto");
+    });
+  });
+
+  // ── XXXXX: Rate limit loopback exemption + /api/health ──────────────
+
+  describe("XXXXX: rate limit + health endpoint", () => {
+    it("/api/health returns 200 without auth (XXXXX)", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.ok).toBe(true);
+      expect(data.mode).toBe("principal-policy");
+    });
+
+    it("/api/health has no-store cache header (XXXXX)", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+    });
+
+    it("60 rapid loopback requests to /api/health never return 429 (XXXXX)", async () => {
+      // All requests come from 127.0.0.1 (loopback). With XXXXX fix,
+      // loopback is exempt from rate limiting, so this must never 429.
+      const results = await Promise.all(
+        Array.from({ length: 60 }, () =>
+          fetch(`http://127.0.0.1:${port}/api/health`).then((r) => r.status),
+        ),
+      );
+      expect(results.every((s) => s === 200)).toBe(true);
+    });
+
+    it("rapid loopback requests to /api/status never return 429 (XXXXX)", async () => {
+      // Loopback exemption applies to all API endpoints, not just health.
+      const results = await Promise.all(
+        Array.from({ length: 60 }, () =>
+          fetch(`http://127.0.0.1:${port}/api/status`).then((r) => r.status),
+        ),
+      );
+      expect(results.every((s) => s === 200)).toBe(true);
     });
   });
 });
