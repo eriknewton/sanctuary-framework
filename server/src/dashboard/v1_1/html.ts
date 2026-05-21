@@ -31,6 +31,8 @@ export interface DashboardV11HtmlOptions {
   identityId?: string;
   /** Stable fortress id surfaced in the top bar. */
   fortressId?: string;
+  /** Human-friendly tenant name (directory basename), consistent with CLI output. */
+  tenantName?: string;
   /**
    * Server build-time binary version (read from package.json at module
    * load). Surfaced as a topbar pill so operators can verify the running
@@ -1326,6 +1328,7 @@ export function renderDashboardV11Html(
   const streamUrl = options.streamUrl ?? "/api/stream";
   const identityId = options.identityId ?? "operator";
   const fortressId = options.fortressId ?? "fortress";
+  const tenantName = options.tenantName ?? "";
   const sanctuaryVersion = options.sanctuaryVersion ?? SANCTUARY_VERSION;
   const embedClient = options.embedClient !== false;
 
@@ -1347,6 +1350,7 @@ export function renderDashboardV11Html(
     streamUrl,
     identityId,
     fortressId,
+    tenantName,
     sanctuaryVersion,
   }).replace(/</g, "\\u003c");
 
@@ -1371,7 +1375,7 @@ export function renderDashboardV11Html(
       </nav>
     </aside>
     <header class="topbar">
-      <span class="brand mono">${escHtml(fortressId)}</span>
+      <span class="brand mono">${tenantName ? `${escHtml(tenantName)} ` : ""}${escHtml(fortressId)}</span>
       <div class="pills" id="topbar-pills">
         <span class="pill" data-pill="version">v${escHtml(sanctuaryVersion)}</span>
         <span class="pill" data-pill="deployment">deployment: local</span>
