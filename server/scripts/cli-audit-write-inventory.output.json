@@ -216,6 +216,22 @@
     "notes": "read-only; audit not required"
   },
   {
+    "subcommand": "sanctuary erc8004 register",
+    "file_path": "src/cli/erc8004.ts",
+    "line_number": 115,
+    "classification": "mutator",
+    "audits_currently": true,
+    "notes": "AuditLog.append via handleErc8004Request (PR 3)"
+  },
+  {
+    "subcommand": "sanctuary erc8004 status",
+    "file_path": "src/cli/erc8004.ts",
+    "line_number": 118,
+    "classification": "read-only",
+    "audits_currently": null,
+    "notes": "read-only; audit not required"
+  },
+  {
     "subcommand": "sanctuary exit export",
     "file_path": "src/exit/cli.ts",
     "line_number": 267,
