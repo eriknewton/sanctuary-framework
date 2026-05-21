@@ -2,10 +2,10 @@
  * Sanctuary WP-V1.3-6 Xi-1 `sanctuary policy` CLI subcommand.
  *
  * Operator-facing surface for the English-Authored Policy Compiler.
- * Compile path runs the deterministic matcher in-process; the
- * LLM-assist fallback is OFF in CLI mode (substrate selector
- * requires a running server). Operators who need LLM-assist run
- * the equivalent HTTP route through the running fortress.
+ * v1.3.0 (BBBBB): compile path now loads the intelligence substrate
+ * selector from the operator's fortress when SANCTUARY_PASSPHRASE
+ * is set and intelligence is configured. Falls back to deterministic-
+ * only when the fortress or substrate is not available.
  *
  * Subcommands:
  *   compile "<English text>"          Returns CompiledPolicy JSON
@@ -32,14 +32,24 @@
  * drafts under encrypted fortress state and the CLI can read them.
  */
 
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { AuditLog } from "../l2-operational/audit-log.js";
 import { MemoryStorage } from "../storage/memory.js";
+import { FilesystemStorage } from "../storage/filesystem.js";
 import { generateRandomKey } from "../core/random.js";
+import {
+  deriveMasterKey,
+  type KeyDerivationParams,
+} from "../core/key-derivation.js";
+import { bytesToString, stringToBytes } from "../core/encoding.js";
 import {
   EnglishPolicyCompiler,
   type CompiledPolicy,
 } from "../policy-engine/english-policy-compiler.js";
 import type { PolicyConflict } from "../policy-engine/conflict-detector.js";
+import { SubstrateSelector } from "../intelligence/selector.js";
+import { resolveStoragePath } from "../paths.js";
 
 export interface PolicyArgs {
   argv: string[];
@@ -80,8 +90,9 @@ function printUsage(s: NodeJS.WritableStream): void {
 
   compile "<English text>"        Compile an operator policy statement
                                   to a structured rule + explanation.
-                                  CLI mode runs deterministic matcher
-                                  only; LLM-assist is server-only.
+                                  Uses LLM-assist when SANCTUARY_PASSPHRASE
+                                  is set and intelligence is configured;
+                                  otherwise falls back to deterministic.
   drafts list                     Placeholder for Xi-2 persistence.
   drafts show <draft_id>          Placeholder for Xi-2 persistence.
   drafts check-conflicts <draft_id> [--api-base <url>]
@@ -96,6 +107,55 @@ that talk to a running fortress.
 `);
 }
 
+/**
+ * v1.3.0 (BBBBB): attempt to load the intelligence substrate selector from
+ * the operator's fortress. Returns null when the fortress is not accessible,
+ * passphrase is unavailable, or intelligence is not configured.
+ */
+async function tryLoadSubstrateSelector(): Promise<{
+  selector: SubstrateSelector;
+  auditLog: AuditLog;
+  fortressId: string;
+} | null> {
+  try {
+    const storagePath = resolveStoragePath();
+    const intelligenceDir = resolve(storagePath, "state", "_intelligence");
+    if (!existsSync(intelligenceDir)) return null;
+
+    const passphrase = process.env["SANCTUARY_PASSPHRASE"];
+    if (!passphrase) {
+      // Don't attempt keychain resolution in a compile-preview command;
+      // require the env var for non-interactive substrate access.
+      return null;
+    }
+
+    const storage = new FilesystemStorage(`${storagePath}/state`);
+    let existingParams: KeyDerivationParams | undefined;
+    try {
+      const raw = await storage.read("_meta", "key-params");
+      if (raw) existingParams = JSON.parse(bytesToString(raw));
+    } catch { /* first run */ }
+
+    const { key: masterKey, params } = await deriveMasterKey(passphrase, existingParams);
+    if (!existingParams) {
+      await storage.write("_meta", "key-params", stringToBytes(JSON.stringify(params)));
+    }
+
+    const fortressId = `fortress:${storagePath}`;
+    const auditLog = new AuditLog(storage, masterKey);
+    const selector = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: fortressId,
+    });
+    await selector.load();
+    return { selector, auditLog, fortressId };
+  } catch {
+    return null;
+  }
+}
+
 async function cmdCompile(
   argv: string[],
   ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream },
@@ -106,19 +166,40 @@ async function cmdCompile(
     ctx.err.write('  sanctuary policy compile "always require approval for state_export"\n');
     return 2;
   }
-  const storage = new MemoryStorage();
-  const masterKey = generateRandomKey();
-  const auditLog = new AuditLog(storage, masterKey);
+
+  // v1.3.0 (BBBBB): try to load the intelligence substrate so LLM-assist
+  // is available when the fortress is configured. Falls back to
+  // deterministic-only when not available.
+  const fortress = await tryLoadSubstrateSelector();
+
+  const storage = fortress ? undefined : new MemoryStorage();
+  const masterKey = fortress ? undefined : generateRandomKey();
+  const auditLog = fortress?.auditLog ?? new AuditLog(storage!, masterKey!);
+  const fortressId = fortress?.fortressId ?? "cli-local";
+
   const compiler = new EnglishPolicyCompiler({
     auditLog,
-    fortressId: "cli-local",
-    selector: null,
+    fortressId,
+    selector: fortress?.selector ?? null,
   });
   const compiled = await compiler.compile({
     english_text: englishText,
     observed_at: new Date().toISOString(),
     operator_id: "cli-operator",
   });
+
+  // v1.3.0 (BBBBB): surface a clearer message when LLM-assist is unavailable.
+  if (
+    !fortress?.selector &&
+    compiled.compile_warnings?.some((w: string) => w.includes("LLM-assist disabled"))
+  ) {
+    ctx.err.write(
+      "LLM-assist requires intelligence substrate. " +
+        "Set SANCTUARY_PASSPHRASE and ensure intelligence is configured:\n" +
+        "  sanctuary intelligence configure --substrate local\n",
+    );
+  }
+
   ctx.out.write(formatCompiledHumanReadable(compiled) + "\n");
   return 0;
 }

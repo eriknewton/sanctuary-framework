@@ -423,6 +423,52 @@ describe("Xi-1 — CLI subcommands", () => {
     expect(code).toBe(2);
     expect(err.text).toContain("compile requires the English text");
   });
+
+  it("no-substrate compile surfaces clearer LLM-assist message (BBBBB)", async () => {
+    // Without SANCTUARY_PASSPHRASE, the CLI falls back to deterministic-only.
+    // Non-deterministic English should produce a low-confidence result with
+    // the improved message naming the bootstrap command.
+    const savedPassphrase = process.env["SANCTUARY_PASSPHRASE"];
+    delete process.env["SANCTUARY_PASSPHRASE"];
+    try {
+      const out = new CollectStream();
+      const err = new CollectStream();
+      const code = await runPolicyCommand({
+        argv: ["compile", "whenever the agent seems confused, pause and ask me"],
+        out,
+        err,
+      });
+      expect(code).toBe(0);
+      // Output should contain low confidence (no deterministic match, no LLM)
+      expect(out.text).toContain("compile_confidence: low");
+      // Stderr should contain the improved message
+      expect(err.text).toContain("intelligence substrate");
+      expect(err.text).toContain("sanctuary intelligence configure");
+    } finally {
+      if (savedPassphrase !== undefined) {
+        process.env["SANCTUARY_PASSPHRASE"] = savedPassphrase;
+      }
+    }
+  });
+
+  it("deterministic templates still return high confidence without substrate (BBBBB regression)", async () => {
+    // Templates that match deterministically must continue to work without
+    // LLM-assist. This is the regression guard: wiring LLM-assist must
+    // not break the existing template path.
+    const out = new CollectStream();
+    const err = new CollectStream();
+    const code = await runPolicyCommand({
+      argv: ["compile", "always require approval for state_export"],
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    expect(out.text).toContain("compile_confidence: high");
+    expect(out.text).toContain("tier1_add_operation");
+    expect(out.text).toContain("state_export");
+    // No LLM-assist message for deterministic matches
+    expect(err.text).not.toContain("intelligence substrate");
+  });
 });
 
 // ── Audit emission ──────────────────────────────────────────────────
