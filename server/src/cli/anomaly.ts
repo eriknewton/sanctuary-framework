@@ -50,6 +50,7 @@ import {
 } from "../anomaly-detection/anomaly-subscription-store.js";
 import { ClassifierStateStore } from "../anomaly-detection/classifier-state-store.js";
 import { ANOMALY_SENTINEL_ID_PREFIX } from "../anomaly-detection/types.js";
+import { AuditLog } from "../l2-operational/audit-log.js";
 
 export interface AnomalyArgs {
   argv: string[];
@@ -182,14 +183,25 @@ async function cmdSubscribe(
     ctx.err.write("subscribe requires --classifier <id>\n");
     return 2;
   }
+  const storagePath = await resolveStoragePath(ctx.args);
   const entry = findCatalogEntry(detectorId, classifierId);
   if (!entry) {
+    try {
+      const masterKey = await deriveFortressMasterKey(ctx);
+      const storage = new FilesystemStorage(`${storagePath}/state`);
+      const fortressId = fortressIdFromStoragePath(storagePath);
+      const auditLog = new AuditLog(storage, masterKey);
+      auditLog.append("l2", "anomaly.subscribe", `fortress:${fortressId}`, {
+        detector_id: detectorId,
+        classifier_id: classifierId,
+        subscription_path: `${storagePath}/anomaly-subscriptions.json`,
+      }, "failure");
+    } catch { /* audit best-effort; do not mask the original error */ }
     ctx.err.write(
       `Unknown detector/classifier pair: ${detectorId} / ${classifierId}\n`,
     );
     return 2;
   }
-  const storagePath = await resolveStoragePath(ctx.args);
   const subscribed = await loadAnomalySubscriptions(storagePath);
   const exists = subscribed.some(
     (t) =>
@@ -203,6 +215,15 @@ async function cmdSubscribe(
   }
   subscribed.push({ detector_id: detectorId, classifier_id: classifierId });
   await saveAnomalySubscriptions(storagePath, subscribed);
+  const masterKey = await deriveFortressMasterKey(ctx);
+  const storage = new FilesystemStorage(`${storagePath}/state`);
+  const fortressId = fortressIdFromStoragePath(storagePath);
+  const auditLog = new AuditLog(storage, masterKey);
+  auditLog.append("l2", "anomaly.subscribe", `fortress:${fortressId}`, {
+    detector_id: detectorId,
+    classifier_id: classifierId,
+    subscription_path: `${storagePath}/anomaly-subscriptions.json`,
+  });
   ctx.out.write(
     `Subscribed: ${detectorId} [classifier: ${classifierId}]\nRestart Sanctuary or wait for the next dispatcher tick.\n`,
   );
@@ -240,6 +261,15 @@ async function cmdUnsubscribe(
     return 0;
   }
   await saveAnomalySubscriptions(storagePath, filtered);
+  const masterKey = await deriveFortressMasterKey(ctx);
+  const storage = new FilesystemStorage(`${storagePath}/state`);
+  const fortressId = fortressIdFromStoragePath(storagePath);
+  const auditLog = new AuditLog(storage, masterKey);
+  auditLog.append("l2", "anomaly.unsubscribe", `fortress:${fortressId}`, {
+    detector_id: detectorId,
+    classifier_id: classifierId,
+    subscription_path: `${storagePath}/anomaly-subscriptions.json`,
+  });
   ctx.out.write(
     `Unsubscribed: ${detectorId} [classifier: ${classifierId}]\n`,
   );
