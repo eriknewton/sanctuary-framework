@@ -1362,8 +1362,10 @@ function renderIntelligenceCenter() {
   if (state.intelligence.notConfigured) {
     return '<section class="intel-center">' +
       '<p class="eyebrow">INTELLIGENCE</p>' +
-      '<h1>Substrate selector not configured</h1>' +
-      '<p class="intel-subtitle">This dashboard binding does not include an Intelligence Substrate Selector. Run <code>sanctuary dashboard</code> against an unlocked fortress to bind one. See the WP-V1.2-5 release notes for setup details.</p>' +
+      '<h1>No intelligence substrate configured</h1>' +
+      '<p class="intel-subtitle">No Intelligence Substrate Selector is bound to this dashboard. Configure one with:</p>' +
+      '<div class="code-block">sanctuary intelligence configure --substrate local</div>' +
+      '<p class="intel-subtitle muted">Options: <code>--substrate local</code> (privacy, runs on device), <code>--substrate hosted</code> (capability, uses Venice.ai), <code>--substrate hybrid</code> (per-surface routing). Then re-launch the dashboard.</p>' +
     '</section>';
   }
   if (state.intelligence.loadError) {
@@ -1371,6 +1373,7 @@ function renderIntelligenceCenter() {
       '<p class="eyebrow">INTELLIGENCE</p>' +
       '<h1>Could not load substrate status</h1>' +
       '<p class="intel-subtitle error-text">' + escHtml(state.intelligence.loadError) + '</p>' +
+      '<p class="intel-subtitle muted">If this is a new fortress, configure a substrate first: <code>sanctuary intelligence configure --substrate local</code> (or <code>--substrate hosted</code>, <code>--substrate hybrid</code>).</p>' +
       '<button class="btn" data-action="intel-reload">Retry</button>' +
     '</section>';
   }
@@ -1614,6 +1617,10 @@ async function fetchIntelligenceState() {
       state.intelligence.config = null;
       return;
     }
+    if (e.status === 401) {
+      state.intelligence.loadError = "Dashboard authentication required. Reload the page or re-launch the dashboard with: sanctuary dashboard --fortress <path>";
+      return;
+    }
     state.intelligence.loadError = e.message;
     return;
   }
@@ -1623,6 +1630,10 @@ async function fetchIntelligenceState() {
   } catch (e) {
     if (e.status === 503) {
       state.intelligence.notConfigured = true;
+      return;
+    }
+    if (e.status === 401) {
+      state.intelligence.loadError = "Dashboard authentication required. Reload the page or re-launch the dashboard with: sanctuary dashboard --fortress <path>";
       return;
     }
     state.intelligence.loadError = e.message;

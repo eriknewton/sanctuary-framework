@@ -157,3 +157,52 @@ describe("Intelligence panel — sidebar nav welcome card link", () => {
     expect(client).toContain('href="#intelligence"');
   });
 });
+
+describe("Intelligence panel — CCCC first-load render + substrate-missing wording", () => {
+  it("notConfigured empty-state names the missing config and gives the exact command (NNNNN pattern)", () => {
+    const client = getClientScript();
+    expect(client).toContain("No intelligence substrate configured");
+    expect(client).toContain("sanctuary intelligence configure --substrate local");
+  });
+
+  it("notConfigured empty-state lists all three substrate options (local, hosted, hybrid)", () => {
+    const client = getClientScript();
+    // The notConfigured block should reference all three substrate choices
+    // so the operator knows what their options are.
+    expect(client).toContain("--substrate local");
+    expect(client).toContain("--substrate hosted");
+    expect(client).toContain("--substrate hybrid");
+  });
+
+  it("loadError state shows substrate-configuration guidance for new fortresses", () => {
+    const client = getClientScript();
+    expect(client).toContain("If this is a new fortress, configure a substrate first");
+    expect(client).toContain("sanctuary intelligence configure --substrate local");
+  });
+
+  it("fetchIntelligenceState handles 401 with a dashboard-auth-specific message, not raw 'unauthorized'", () => {
+    const client = getClientScript();
+    // The client must NOT surface the raw "unauthorized" string from the
+    // auth middleware as the loadError. Instead, it must provide an
+    // actionable message naming the auth issue and how to fix it.
+    expect(client).toContain("e.status === 401");
+    expect(client).toContain("Dashboard authentication required");
+    expect(client).toContain("sanctuary dashboard --fortress");
+  });
+
+  it("pre-fix code path (substrate-missing showing raw 'unauthorized') no longer fires", () => {
+    const client = getClientScript();
+    // The fetchIntelligenceState function must intercept 401 errors
+    // BEFORE the generic loadError assignment, so the raw "unauthorized"
+    // string from auth-middleware never reaches state.intelligence.loadError.
+    const fetchFn = client.slice(
+      client.indexOf("async function fetchIntelligenceState()"),
+      client.indexOf("async function onIntelPickerOpen(")
+    );
+    // 401 check must appear before the generic loadError fallback
+    const idx401 = fetchFn.indexOf("e.status === 401");
+    const idxGeneric = fetchFn.indexOf("state.intelligence.loadError = e.message");
+    expect(idx401).toBeGreaterThan(0);
+    expect(idxGeneric).toBeGreaterThan(idx401);
+  });
+});
