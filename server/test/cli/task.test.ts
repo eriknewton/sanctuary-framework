@@ -223,6 +223,49 @@ describe("sanctuary task CLI", () => {
     expect(listed.out.text).toContain("task-1");
   });
 
+  it("YYYYY regression: task create succeeds without SANCTUARY_DASHBOARD_AUTH_TOKEN when dashboard is loopback (co-resolved by WWWWW #321)", async () => {
+    // YYYYY (2026-05-19 drill): `sanctuary task create` returned
+    // "sanctuary task: unauthorized" on a wrap+identity-bootstrapped
+    // fortress. The root cause was WWWWW (broken wrap-time identity
+    // bootstrap) which prevented the dashboard from launching with
+    // loopback auto-auth. With WWWWW fixed (#321), the dashboard
+    // starts correctly, loopback auto-auth is enabled, and the task
+    // CLI's request to 127.0.0.1 passes auth without a token.
+    //
+    // This test verifies that task create sends no Authorization
+    // header when SANCTUARY_DASHBOARD_AUTH_TOKEN is unset, which is
+    // the code path that relies on the dashboard's loopback auto-auth.
+    const origToken = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+    delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+
+    let capturedHeaders: Headers | undefined;
+    const fetchSpy = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      capturedHeaders = new Headers(init?.headers);
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      return okJson({
+        ok: true,
+        data: { task: task("task-yyyyy", { title: body.title }) },
+      }, 201);
+    });
+    globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+
+    const { code, err } = await run([
+      "create",
+      "--title",
+      "yyyyy verification",
+    ]);
+
+    expect(code).toBe(0);
+    expect(err.text).toBe("");
+    // Verify no Authorization header was sent (loopback auto-auth path)
+    expect(capturedHeaders?.get("Authorization")).toBeNull();
+    expect(fetchSpy).toHaveBeenCalledOnce();
+
+    if (origToken !== undefined) {
+      process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = origToken;
+    }
+  });
+
   it("validates required arguments and documents the surface", async () => {
     const help = await run(["--help"]);
     const missingTitle = await run(["create"]);
