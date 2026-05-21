@@ -2244,6 +2244,7 @@ function renderFortress() {
   fortress.innerHTML = [
     '<section class="card">',
       '<h3>This fortress</h3>',
+      (config.tenantName ? '<p><strong>' + escHtml(config.tenantName) + '</strong></p>' : ''),
       '<p class="muted mono">' + escHtml(config.fortressId || "(local)") + '</p>',
       '<p class="muted">Operator: ' + escHtml(config.identityId || "(unknown)") + '</p>',
     '</section>',

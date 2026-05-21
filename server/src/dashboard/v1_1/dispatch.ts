@@ -20,6 +20,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { basename } from "node:path";
 
 import { handleHubRoute } from "../../hub/api-router.js";
 import { handleDashboardV11Route } from "./index.js";
@@ -213,6 +214,7 @@ export async function dispatchV11Request(
       {
         identityId: bindings.identityId,
         fortressId: bindings.fortressId,
+        ...(bindings.storagePath ? { tenantName: tenantNameFromStoragePath(bindings.storagePath) } : {}),
         ...(authToken !== undefined ? { authToken } : {}),
       },
       req,
@@ -288,4 +290,15 @@ export async function dispatchV11Request(
   }
 
   return false;
+}
+
+/**
+ * Derive a human-friendly tenant name from the storage path. Uses the
+ * directory basename (e.g. ".sanctuary" -> "default", "my-fortress" ->
+ * "my-fortress"). Matches the naming convention from `discoverTenants()`
+ * in `cli/agents/discover.ts`.
+ */
+function tenantNameFromStoragePath(storagePath: string): string {
+  const name = basename(storagePath);
+  return name === ".sanctuary" ? "default" : name;
 }
