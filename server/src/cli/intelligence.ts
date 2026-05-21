@@ -13,13 +13,19 @@ interface IntelligenceCommandOpts {
   argv: string[];
 }
 
+function flagValue(argv: string[], name: string): string | undefined {
+  const index = argv.indexOf(name);
+  if (index === -1) return undefined;
+  return argv[index + 1];
+}
+
 export async function runIntelligenceCommand(
   opts: IntelligenceCommandOpts,
 ): Promise<number> {
   const subcommand = opts.argv[0];
 
   if (subcommand === "diagnose" || subcommand === undefined) {
-    return runDiagnose();
+    return runDiagnose(opts.argv.slice(subcommand === "diagnose" ? 1 : 0));
   }
 
   if (subcommand === "--help" || subcommand === "-h") {
@@ -44,9 +50,11 @@ Subcommands:
 `);
 }
 
-async function runDiagnose(): Promise<number> {
+async function runDiagnose(argv: string[] = []): Promise<number> {
+  const fortressFlag = flagValue(argv, "--fortress") ?? flagValue(argv, "--fortress-path");
   const storagePath = resolve(
-    process.env.SANCTUARY_STORAGE_PATH ??
+    fortressFlag ??
+      process.env.SANCTUARY_STORAGE_PATH ??
       process.env.SANCTUARY_FORTRESS_PATH ??
       `${process.env.HOME}/.sanctuary`,
   );
