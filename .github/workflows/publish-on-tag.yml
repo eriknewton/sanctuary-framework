@@ -18,10 +18,10 @@
 # any future tag push, including rc cuts the maintainer did not
 # intend to release. Requiring workflow_dispatch closes that gap.
 #
-# Required repo secret:
-#   NPM_TOKEN  npm automation token with publish access for the
-#              @sanctuary-framework scope. Add at
-#              Settings, Secrets and variables, Actions.
+# Authentication: npm Trusted Publishing (OIDC). No static NPM_TOKEN
+# secret required. The GitHub Actions OIDC token is exchanged for a
+# short-lived npm publish token at publish time. Configure the trusted
+# publisher link at npmjs.com/package/@sanctuary-framework/mcp-server/access.
 #
 # See .github/RELEASING.md for the full release procedure.
 
@@ -158,5 +158,3 @@ jobs:
       - name: Publish to npm
         working-directory: server
         run: npm publish --access public --tag "${{ steps.dist-tag.outputs.tag }}"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
