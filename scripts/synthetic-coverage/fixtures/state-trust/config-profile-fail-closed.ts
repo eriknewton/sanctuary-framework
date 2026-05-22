@@ -89,7 +89,7 @@ registerFixture(
 registerFixture(
   CLAIM_ID,
   CLAIM_LABEL,
-  "config-profile-fail-closed: corrupted sovereignty profile quarantined plus fail-closed",
+  "config-profile-fail-closed: corrupted sovereignty profile preserved plus fail-closed",
   async () => {
     const started = performance.now();
     const storage = new MemoryStorage();
@@ -100,16 +100,16 @@ registerFixture(
     const active = await storage.read("_sovereignty_profile", "active");
     const entries = await storage.list("_sovereignty_profile");
     const quarantine = entries.find((entry) => entry.key.startsWith("active.corrupted."));
-    const quarantinedRaw = quarantine ? await storage.read("_sovereignty_profile", quarantine.key) : null;
     const passed =
       err instanceof Error &&
       err.name === "ProfileLoadError" &&
       "classification" in err &&
       err.classification === "corrupted" &&
-      active === null &&
-      quarantinedRaw !== null &&
-      new TextDecoder().decode(quarantinedRaw) === new TextDecoder().decode(originalRaw);
-    return outcome(started, passed, "expected corrupted profile quarantine and ProfileLoadError");
+      err.message.includes("The file has NOT been modified") &&
+      quarantine === undefined &&
+      active !== null &&
+      new TextDecoder().decode(active) === new TextDecoder().decode(originalRaw);
+    return outcome(started, passed, "expected corrupted profile preservation and ProfileLoadError");
   }
 );
 

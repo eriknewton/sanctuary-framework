@@ -39,18 +39,16 @@ function createStore(): { store: SovereigntyProfileStore; storage: MemoryStorage
   return { store, storage, masterKey };
 }
 
-async function expectQuarantinedProfile(
+async function expectProfilePreserved(
   storage: MemoryStorage,
   originalRaw: Uint8Array
 ): Promise<void> {
-  expect(await storage.read("_sovereignty_profile", "active")).toBeNull();
+  expect(await storage.read("_sovereignty_profile", "active")).toEqual(originalRaw);
   const entries = await storage.list("_sovereignty_profile");
   const quarantine = entries.find((entry) =>
     /^active\.corrupted\.\d{4}-\d{2}-\d{2}T/.test(entry.key)
   );
-  expect(quarantine).toBeTruthy();
-  const quarantinedRaw = await storage.read("_sovereignty_profile", quarantine!.key);
-  expect(quarantinedRaw).toEqual(originalRaw);
+  expect(quarantine).toBeUndefined();
 }
 
 describe("SovereigntyProfileStore", () => {
@@ -129,7 +127,7 @@ describe("SovereigntyProfileStore", () => {
       expect(parsed).toHaveProperty("iv");
     });
 
-    it("throws and quarantines truncated encrypted profile bytes", async () => {
+    it("throws without modifying truncated encrypted profile bytes", async () => {
       const { store, storage } = createStore();
       const originalRaw = stringToBytes('{"v":1,"alg":"aes-256-gcm","iv"');
       await storage.write("_sovereignty_profile", "active", originalRaw);
@@ -139,10 +137,10 @@ describe("SovereigntyProfileStore", () => {
         classification: "corrupted",
         path: "_sovereignty_profile/active",
       });
-      await expectQuarantinedProfile(storage, originalRaw);
+      await expectProfilePreserved(storage, originalRaw);
     });
 
-    it("renames truncated filesystem profile bytes into a corrupted file", async () => {
+    it("leaves truncated filesystem profile bytes in place", async () => {
       const tempDir = join(
         tmpdir(),
         `sanctuary-profile-fs-${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -159,13 +157,13 @@ describe("SovereigntyProfileStore", () => {
           classification: "corrupted",
         });
 
-        expect(await storage.read("_sovereignty_profile", "active")).toBeNull();
+        expect(await storage.read("_sovereignty_profile", "active")).toEqual(originalRaw);
         const files = await readdir(join(tempDir, "_sovereignty_profile"));
         const quarantine = files.find((file) =>
           file.startsWith("active.corrupted.") && file.endsWith(".enc")
         );
-        expect(quarantine).toBeTruthy();
-        expect(await readFile(join(tempDir, "_sovereignty_profile", quarantine!))).toEqual(
+        expect(quarantine).toBeUndefined();
+        expect(await readFile(join(tempDir, "_sovereignty_profile", "active.enc"))).toEqual(
           Buffer.from(originalRaw)
         );
       } finally {
@@ -173,7 +171,7 @@ describe("SovereigntyProfileStore", () => {
       }
     });
 
-    it("throws and quarantines schema-invalid decrypted profile data", async () => {
+    it("throws without modifying schema-invalid decrypted profile data", async () => {
       const { store, storage, masterKey } = createStore();
       const invalidProfile = {
         ...createDefaultProfile(),
@@ -194,7 +192,7 @@ describe("SovereigntyProfileStore", () => {
         classification: "schema-mismatch",
         path: "_sovereignty_profile/active",
       });
-      await expectQuarantinedProfile(storage, originalRaw);
+      await expectProfilePreserved(storage, originalRaw);
     });
   });
 
@@ -218,7 +216,7 @@ describe("SovereigntyProfileStore", () => {
       expect(loaded.features.audit_logging.enabled).toBe(true); // Still default
     });
 
-    it("rejects and quarantines profile encrypted with a different key", async () => {
+    it("rejects and preserves profile encrypted with a different key", async () => {
       const storage = new MemoryStorage();
       const masterKey1 = generateRandomKey();
       const masterKey2 = generateRandomKey();
@@ -236,7 +234,60 @@ describe("SovereigntyProfileStore", () => {
         classification: "wrong-key",
         path: "_sovereignty_profile/active",
       });
-      await expectQuarantinedProfile(storage, originalRaw!);
+      await expectProfilePreserved(storage, originalRaw!);
+    });
+
+    it("reports that wrong-key failures do not modify the profile file", async () => {
+      const storage = new MemoryStorage();
+      const masterKey1 = generateRandomKey();
+      const masterKey2 = generateRandomKey();
+      const store1 = new SovereigntyProfileStore(storage, masterKey1);
+      await store1.load();
+
+      const store2 = new SovereigntyProfileStore(storage, masterKey2);
+      await expect(store2.load()).rejects.toThrow("The file has NOT been modified");
+    });
+
+    it("scopes profile operations to the configured filesystem storage path", async () => {
+      const rootDir = join(
+        tmpdir(),
+        `sanctuary-profile-scope-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      );
+      const hostStateDir = join(rootDir, "host", "state");
+      const fortressStateDir = join(rootDir, "fortress", "state");
+      await mkdir(hostStateDir, { recursive: true });
+      await mkdir(fortressStateDir, { recursive: true });
+      try {
+        const hostStorage = new FilesystemStorage(hostStateDir);
+        const fortressStorage = new FilesystemStorage(fortressStateDir);
+        const hostKey = generateRandomKey();
+        const fortressKey = generateRandomKey();
+
+        await new SovereigntyProfileStore(hostStorage, hostKey).load();
+        await new SovereigntyProfileStore(fortressStorage, fortressKey).load();
+        const hostRaw = await hostStorage.read("_sovereignty_profile", "active");
+        const fortressRaw = await fortressStorage.read("_sovereignty_profile", "active");
+        expect(hostRaw).not.toBeNull();
+        expect(fortressRaw).not.toBeNull();
+
+        const wrongFortressStore = new SovereigntyProfileStore(
+          fortressStorage,
+          generateRandomKey()
+        );
+        await expect(wrongFortressStore.load()).rejects.toMatchObject({
+          name: "ProfileLoadError",
+          classification: "wrong-key",
+        });
+
+        expect(await hostStorage.read("_sovereignty_profile", "active")).toEqual(hostRaw);
+        expect(await fortressStorage.read("_sovereignty_profile", "active")).toEqual(
+          fortressRaw
+        );
+        expect(await hostStorage.list("_sovereignty_profile")).toHaveLength(1);
+        expect(await fortressStorage.list("_sovereignty_profile")).toHaveLength(1);
+      } finally {
+        await rm(rootDir, { recursive: true, force: true });
+      }
     });
   });
 

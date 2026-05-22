@@ -16,8 +16,6 @@
  * - All changes are audit-logged
  */
 
-import { rename as renameFile } from "node:fs/promises";
-import { join } from "node:path";
 import type { StorageBackend } from "./storage/interface.js";
 import { encrypt, decrypt, type EncryptedPayload } from "./core/encryption.js";
 import { derivePurposeKey } from "./core/key-derivation.js";
@@ -146,13 +144,11 @@ export class SovereigntyProfileStore {
         return this.profile!;
       } catch (err) {
         const classification = classifyProfileLoadFailure(err);
-        const quarantinedPath = await this.quarantineProfile(raw);
         throw new ProfileLoadError({
           path: profileStoragePath(),
           classification,
           detail: profileFailureDetail(classification, err),
-          recovery: "Inspect the quarantined bytes, verify the passphrase or key material, restore a known-good profile, or intentionally create a new profile before retrying.",
-          quarantinedPath,
+          recovery: `The encrypted sovereignty profile at ${profileStoragePath()} could not be decrypted. This usually means the wrong passphrase was supplied. The file has NOT been modified. Verify your passphrase and try again.`,
           cause: err,
         });
       }
@@ -317,66 +313,10 @@ export class SovereigntyProfileStore {
       stringToBytes(JSON.stringify(encrypted))
     );
   }
-
-  private async quarantineProfile(raw: Uint8Array): Promise<string> {
-    const quarantineKey = `${PROFILE_KEY}.corrupted.${new Date().toISOString()}`;
-    const filesystemQuarantinePath = await quarantineFilesystemProfile(
-      this.storage,
-      quarantineKey
-    );
-    if (filesystemQuarantinePath) {
-      return filesystemQuarantinePath;
-    }
-    await this.storage.write(NAMESPACE, quarantineKey, raw);
-    await this.storage.delete(NAMESPACE, PROFILE_KEY, false);
-    return `${NAMESPACE}/${quarantineKey}`;
-  }
 }
 
 function profileStoragePath(): string {
   return `${NAMESPACE}/${PROFILE_KEY}`;
-}
-
-async function quarantineFilesystemProfile(
-  storage: StorageBackend,
-  quarantineKey: string
-): Promise<string | null> {
-  const basePath = filesystemBasePath(storage);
-  if (!basePath) return null;
-  const sourcePath = filesystemEntryPath(basePath, NAMESPACE, PROFILE_KEY);
-  const quarantinePath = filesystemEntryPath(basePath, NAMESPACE, quarantineKey);
-  try {
-    await renameFile(sourcePath, quarantinePath);
-    return quarantinePath;
-  } catch (err) {
-    if (isErrno(err, "ENOENT")) return null;
-    throw err;
-  }
-}
-
-function filesystemBasePath(storage: StorageBackend): string | null {
-  const candidate = (storage as { basePath?: unknown }).basePath;
-  return typeof candidate === "string" ? candidate : null;
-}
-
-function filesystemEntryPath(basePath: string, namespace: string, key: string): string {
-  return join(basePath, bijectiveEncode(namespace), `${bijectiveEncode(key)}.enc`);
-}
-
-const SAFE_CHARS = /[^A-Za-z0-9_.\-]/g;
-
-function bijectiveEncode(name: string): string {
-  return name.replace(SAFE_CHARS, (ch) =>
-    "!" + ch.charCodeAt(0).toString(16).padStart(2, "0").toUpperCase()
-  );
-}
-
-function isErrno(err: unknown, code: string): boolean {
-  return (
-    err instanceof Error &&
-    "code" in err &&
-    (err as NodeJS.ErrnoException).code === code
-  );
 }
 
 function classifyProfileLoadFailure(err: unknown): ProfileFailureClassification {
