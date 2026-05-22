@@ -1518,6 +1518,10 @@ export async function importExitBundle(
         `(${importedRekeyEntries.length} re-keyed entries plus ${stagedLocations.length} staged artifacts; ` +
         `${cleanup.failed.length} cleanup deletes failed).`
     );
+  } finally {
+    if (sourceMasterKey instanceof Uint8Array) {
+      sourceMasterKey.fill(0);
+    }
   }
 
   opts.auditLog.append("l1", "exit_bundle_import_activate", manifest.body.identity_binding.identity_id, {

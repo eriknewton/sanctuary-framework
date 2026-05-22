@@ -235,7 +235,7 @@ menubar notification fire within ~50ms of the block.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `sanctuary castle-wall status` shows `listener: not active` on macOS | Sanctuary main did not start the macOS listener (e.g. on Linux that is expected) | confirm platform is darwin; check the runtime startup logs for `MacOSFlowIpcListener` |
-| Extension fails to load with "no pinned key" | `~/.sanctuary/castle-pinned-pubkey.bin` is missing | run `sanctuary castle-wall provision-pin` (Alpha-4 surface) |
+| Extension loaded but every flow is default-denied; logs show "no pinned key" | `~/.sanctuary/castle-pinned-pubkey.bin` is missing | run `sanctuary castle-wall provision-pin` to provision the pin and activate enforcement |
 | Codesign fails with "unable to read identity" | Developer-ID cert not in keychain | run `security find-identity -v -p codesigning` and import the cert from the Apple Developer portal |
 | Build succeeds but `spctl assess` reports `rejected` | unnotarized bundle | run `xcrun notarytool submit` (operator step) |
 | Latency spikes under load | Flow cache eviction churn | inspect `FlowCache.count` via the engine's debug surface; cap defaults to 1024 entries |

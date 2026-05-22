@@ -95,10 +95,15 @@ mkdir -p "${BUILD_DIR}/Contents/MacOS"
 cp "${BUILT_EXEC}" "${BUILD_DIR}/Contents/MacOS/${EXECUTABLE_NAME}"
 cp "${INFO_PLIST}" "${BUILD_DIR}/Contents/Info.plist"
 # Substitute Info.plist token placeholders that Xcode would normally fill.
-/usr/libexec/PlistBuddy -c "Set :CFBundleExecutable ${EXECUTABLE_NAME}" "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1 || true
-/usr/libexec/PlistBuddy -c "Set :CFBundleName ${EXECUTABLE_NAME}" "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1 || true
+/usr/libexec/PlistBuddy -c "Set :CFBundleExecutable ${EXECUTABLE_NAME}" "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1
+/usr/libexec/PlistBuddy -c "Set :CFBundleName ${EXECUTABLE_NAME}" "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1
 /usr/libexec/PlistBuddy -c "Set :NSExtension:NSExtensionPrincipalClass CastleWallFilter.CastleWallFilterProvider" \
-    "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1 || true
+    "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1
+if grep -E '\$\([A-Z_]+\)' "${BUILD_DIR}/Contents/Info.plist" > /dev/null; then
+    echo "ERROR: Info.plist still contains unresolved \$(...) tokens after PlistBuddy substitution" >&2
+    grep -E '\$\([A-Z_]+\)' "${BUILD_DIR}/Contents/Info.plist" >&2
+    exit 1
+fi
 echo "[build-signed]     assembled at ${BUILD_DIR}"
 
 # 3. codesign with Developer ID + hardened runtime + entitlements.
