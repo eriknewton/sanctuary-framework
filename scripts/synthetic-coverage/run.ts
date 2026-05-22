@@ -12,6 +12,8 @@ import "./fixtures/castle-wall/identity-signing-tool-registry-guard.js";
 import "./fixtures/castle-wall/sentinel-registration.js";
 import "./fixtures/audit-and-envelope/audit-chain-verifier.js";
 import "./fixtures/audit-and-envelope/state-envelope-migration.js";
+import "./fixtures/outbound-trust/context-gate-source-of-truth.js";
+import "./fixtures/outbound-trust/query-anonymity.js";
 import "./fixtures/state-trust/config-profile-fail-closed.js";
 import "./fixtures/state-trust/critical-audit-durability.js";
 import "./fixtures/state-trust/exit-bundle.js";
