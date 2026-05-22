@@ -94,8 +94,12 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
             pinnedKey = try Auth.loadPinnedPublicKey(at: pinnedPath)
         } catch {
             CastleWallLog.auth.notice(
-                "pinned public key not yet provisioned (refuse-to-load fallback): \(String(describing: error))"
+                "pinned public key not yet provisioned (default-deny fallback): \(String(describing: error))"
             )
+            // When pinned key is missing, the extension loads with no IPC client and an empty
+            // manifest. The engine then default-denies every flow (fail-closed invariant).
+            // The operator provisions the pin via `sanctuary castle-wall provision-pin` to
+            // activate enforcement.
             completionHandler(nil)
             return
         }
