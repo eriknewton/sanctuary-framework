@@ -139,7 +139,7 @@ async function openExitContext(
   };
 }
 
-function printUsage(out: Writable): void {
+export function printExitHelp(out: Writable = process.stdout): void {
   write(out, `
 Usage: sanctuary exit <command> [options]
 
@@ -197,7 +197,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
   const env = args.env ?? process.env;
 
   if (argv.length === 0 || hasFlag(argv, "--help") || hasFlag(argv, "-h")) {
-    printUsage(out);
+    printExitHelp(out);
     return 0;
   }
 

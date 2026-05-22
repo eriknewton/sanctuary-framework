@@ -28,4 +28,8 @@ export {
   type TenantRuntimeState,
 } from "./runtime.js";
 
-export { runAgentsCommand, type AgentsCommandArgs } from "./cli.js";
+export {
+  runAgentsCommand,
+  printAgentsHelp,
+  type AgentsCommandArgs,
+} from "./cli.js";

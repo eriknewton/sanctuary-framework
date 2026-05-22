@@ -99,7 +99,7 @@ export async function runAgentsCommand(
   const [sub, ...rest] = args.argv;
 
   if (!sub || sub === "--help" || sub === "-h" || sub === "help") {
-    printUsage(ctx.out);
+    printAgentsHelp(ctx.out);
     return 0;
   }
 
@@ -115,7 +115,7 @@ export async function runAgentsCommand(
         return await cmdConfig(rest, ctx);
       default:
         ctx.err.write(`Unknown subcommand: ${sub}\n`);
-        printUsage(ctx.err);
+        printAgentsHelp(ctx.err);
         return 2;
     }
   } catch (e) {
@@ -125,7 +125,7 @@ export async function runAgentsCommand(
   }
 }
 
-function printUsage(s: NodeJS.WritableStream): void {
+export function printAgentsHelp(s: NodeJS.WritableStream = process.stdout): void {
   s.write(`Usage: sanctuary agents <command> [flags]
        sanctuary agent  <command> [flags]   (alias)
 

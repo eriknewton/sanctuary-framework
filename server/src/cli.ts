@@ -32,6 +32,9 @@ async function main(): Promise<void> {
   ) {
     args = [invokedAs, ...args];
   }
+  if (await handleHelpEarly(args)) {
+    process.exit(0);
+  }
   let passphrase = process.env.SANCTUARY_PASSPHRASE;
 
   // v1.1.2 hotfix (Finding W): the MCP-server-boot path documents
@@ -439,21 +442,7 @@ async function runExportPassphrase(args: string[]): Promise<void> {
   for (const a of args) {
     if (a === "--yes" || a === "-y") assumeYes = true;
     else if (a === "--help" || a === "-h") {
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.log(`
-  sanctuary export-passphrase. Print the stored passphrase to stdout.
-
-  Usage:
-    sanctuary export-passphrase [--yes]
-
-  Options:
-    --yes, -y    Skip confirmation prompt (for scripts)
-    --help, -h   Show this help
-
-  The passphrase derives every encryption key in ~/.sanctuary. Anyone who
-  has it can decrypt your state. Store the output in a password manager
-  and clear your terminal history afterwards.
-`);
+      printExportPassphraseHelp();
       process.exit(0);
     }
   }
@@ -621,6 +610,122 @@ Examples:
   sanctuary-mcp-server dashboard --port 8080
 
   # macOS launchd: add to ~/Library/LaunchAgents/ for auto-start
+`);
+}
+
+async function handleHelpEarly(args: string[]): Promise<boolean> {
+  if (!args.includes("--help") && !args.includes("-h")) {
+    return false;
+  }
+
+  const command = args[0];
+  if (!command || command === "--help" || command === "-h") {
+    printHelp();
+    return true;
+  }
+
+  switch (command) {
+    case "dashboard":
+      printDashboardHelp();
+      return true;
+    case "wrap":
+    case "cocoon":
+      printWrapHelpEarly();
+      return true;
+    case "init": {
+      const { printInitHelp } = await import("./cocoon/init.js");
+      printInitHelp();
+      return true;
+    }
+    case "agents":
+    case "agent": {
+      const { printAgentsHelp } = await import("./cli/agents/index.js");
+      printAgentsHelp();
+      return true;
+    }
+    case "exit":
+    case "verify-exit-bundle":
+    case "import-exit-bundle": {
+      const { printExitHelp } = await import("./exit/index.js");
+      printExitHelp();
+      return true;
+    }
+    case "export-passphrase":
+      printExportPassphraseHelp();
+      return true;
+    default:
+      return false;
+  }
+}
+
+function printExportPassphraseHelp(): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.log(`
+  sanctuary export-passphrase. Print the stored passphrase to stdout.
+
+  Usage:
+    sanctuary export-passphrase [--yes]
+
+  Options:
+    --yes, -y    Skip confirmation prompt (for scripts)
+    --help, -h   Show this help
+
+  The passphrase derives every encryption key in ~/.sanctuary. Anyone who
+  has it can decrypt your state. Store the output in a password manager
+  and clear your terminal history afterwards.
+`);
+}
+
+function printWrapHelpEarly(): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.log(`
+  sanctuary wrap. Wrap any agent in Sanctuary protection.
+
+  Usage:
+    sanctuary wrap --openclaw          Wrap OpenClaw
+    sanctuary wrap --hermes            Wrap Hermes Agent (NousResearch)
+    sanctuary wrap --claude-code       Wrap Claude Code
+    sanctuary wrap --cursor            Wrap Cursor
+    sanctuary wrap --cline             Wrap Cline (VS Code extension)
+    sanctuary wrap --wrap <path>       Wrap a specific MCP config file
+    sanctuary wrap --unwrap            Restore original config
+
+  Options:
+    --openclaw         Auto-detect and wrap OpenClaw
+    --hermes           Auto-detect and wrap Hermes Agent
+    --claude-code      Auto-detect and wrap Claude Code
+    --cursor           Auto-detect and wrap Cursor
+    --cline            Auto-detect and wrap Cline (VS Code extension)
+    --wrap <path>      Wrap a specific MCP config file
+    --unwrap           Restore original config from backup
+    --passphrase <p>   Override the stored passphrase (one-off)
+    --fortress <path>  Fortress directory (default: ~/.sanctuary). Honors
+                       SANCTUARY_FORTRESS_PATH env var when the flag is
+                       absent. Use to keep multiple fortresses isolated
+                       on one host.
+    --port <port>      Preferred dashboard port (default: 3501)
+    --dry-run          Show what would happen without making changes
+    --no-open          Do not auto-open the dashboard in a browser
+    --no-dashboard     Do not spawn a per-call dashboard server. Wrap still
+                       persists the agent record so a separately-running
+                       \`sanctuary dashboard\` (or a later wrap) sees the
+                       harness. Use this for the clean operator setup
+                       (one persistent dashboard + many wraps).
+    --dev-dist <path>  Dogfood path. Point the harness MCP entries at a
+                       local Sanctuary build (\`node <path>\` instead of
+                       \`npx @sanctuary-framework/mcp-server\`). Required
+                       when testing an unpublished branch; the published
+                       version doesn't have new subcommands yet, and
+                       npx pulls from the registry, not your checkout.
+                       Pass the absolute path to dist/cli.js.
+    --help, -h         Show this help
+
+  What happens:
+    1. Reads your agent's MCP config
+    2. Generates a passphrase (stored in Keychain on macOS, encrypted file elsewhere)
+    3. Backs up and rewrites the config so calls route through Sanctuary
+    4. Starts the Sovereignty Dashboard and opens it in your browser
+    5. Every tool call is logged, scanned, and tier-gated
 `);
 }
 
