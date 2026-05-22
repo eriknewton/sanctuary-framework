@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.0] - 2026-05-22
+
+v1.3.0 GA: the Castle Architecture ships. Real Castle Layer 1 enforcement on Linux and macOS, four-layer architecture (Castle Wall + Sentinels + Cooperative MCP + Concordia/Verascore receipts and reputation), Mantle install-time substrate binding, synthetic-coverage harness with gate_a_green across 17 of 20 assurance rows.
+
+Full release notes: [docs/releases/v1.3.0-ga.md](docs/releases/v1.3.0-ga.md).
+
 ## [1.3.0-rc.2] - 2026-05-17
 
 Second opt-in preview on npm `next`. Default `npm install` continues pulling v1.2.17 on `latest`. The substrate trust surface is materially tighter than rc.1: 4 ASSURANCE_MATRIX rows promoted or strengthened across the 2026-05-16 cascade (8 PRs merged to main).
