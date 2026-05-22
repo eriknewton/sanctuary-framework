@@ -5,6 +5,7 @@
  * Dashboard wizard work consumes the same module APIs later.
  */
 
+import { createReadStream, openSync } from "node:fs";
 import { access, readFile as fsReadFile, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -63,20 +64,41 @@ function repeatedFlagValues(argv: string[], name: string): string[] {
   return values;
 }
 
-async function confirmTier1(
+export async function confirmTier1(
   prompt: string,
   assumeYes: boolean,
-  stdin: NodeJS.ReadableStream,
+  _stdin: NodeJS.ReadableStream,
   err: Writable
 ): Promise<boolean> {
   if (assumeYes) return true;
+
+  // SEC: Tier 1 approval must come from the operator's terminal, not stdin.
+  let input: NodeJS.ReadableStream;
+  try {
+    const fd = openSync("/dev/tty", "r");
+    input = createReadStream("/dev/tty", {
+      fd,
+      autoClose: true,
+      encoding: "utf8",
+    });
+  } catch {
+    write(err, "\nTier 1 approval required but no interactive terminal available.\n");
+    write(err, "Use --yes flag for explicit non-interactive approval.\n");
+    return false;
+  }
+
   const readline = await import("node:readline/promises");
   const rl = readline.createInterface({
-    input: stdin as Readable,
+    input: input as Readable,
     output: err,
   });
-  const answer = await rl.question(`${prompt} [y/N] `);
-  rl.close();
+  let answer: string;
+  try {
+    answer = await rl.question(`${prompt} [y/N] `);
+  } finally {
+    rl.close();
+    (input as Readable).destroy();
+  }
   return /^y(es)?$/i.test(answer.trim());
 }
 
