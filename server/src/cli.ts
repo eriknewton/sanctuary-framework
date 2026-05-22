@@ -32,6 +32,9 @@ async function main(): Promise<void> {
   ) {
     args = [invokedAs, ...args];
   }
+  if (await handleHelpEarly(args)) {
+    process.exit(0);
+  }
   let passphrase = process.env.SANCTUARY_PASSPHRASE;
 
   // v1.1.2 hotfix (Finding W): the MCP-server-boot path documents
@@ -439,21 +442,7 @@ async function runExportPassphrase(args: string[]): Promise<void> {
   for (const a of args) {
     if (a === "--yes" || a === "-y") assumeYes = true;
     else if (a === "--help" || a === "-h") {
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.log(`
-  sanctuary export-passphrase. Print the stored passphrase to stdout.
-
-  Usage:
-    sanctuary export-passphrase [--yes]
-
-  Options:
-    --yes, -y    Skip confirmation prompt (for scripts)
-    --help, -h   Show this help
-
-  The passphrase derives every encryption key in ~/.sanctuary. Anyone who
-  has it can decrypt your state. Store the output in a password manager
-  and clear your terminal history afterwards.
-`);
+      printExportPassphraseHelp();
       process.exit(0);
     }
   }
@@ -621,6 +610,71 @@ Examples:
   sanctuary-mcp-server dashboard --port 8080
 
   # macOS launchd: add to ~/Library/LaunchAgents/ for auto-start
+`);
+}
+
+async function handleHelpEarly(args: string[]): Promise<boolean> {
+  if (!args.includes("--help") && !args.includes("-h")) {
+    return false;
+  }
+
+  const command = args[0];
+  if (!command || command === "--help" || command === "-h") {
+    printHelp();
+    return true;
+  }
+
+  switch (command) {
+    case "dashboard":
+      printDashboardHelp();
+      return true;
+    case "wrap":
+    case "cocoon": {
+      const { printWrapHelp } = await import("./cocoon/cli.js");
+      printWrapHelp();
+      return true;
+    }
+    case "init": {
+      const { printInitHelp } = await import("./cocoon/init.js");
+      printInitHelp();
+      return true;
+    }
+    case "agents":
+    case "agent": {
+      const { printAgentsHelp } = await import("./cli/agents/index.js");
+      printAgentsHelp();
+      return true;
+    }
+    case "exit":
+    case "verify-exit-bundle":
+    case "import-exit-bundle": {
+      const { printExitHelp } = await import("./exit/index.js");
+      printExitHelp();
+      return true;
+    }
+    case "export-passphrase":
+      printExportPassphraseHelp();
+      return true;
+    default:
+      return false;
+  }
+}
+
+function printExportPassphraseHelp(): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.log(`
+  sanctuary export-passphrase. Print the stored passphrase to stdout.
+
+  Usage:
+    sanctuary export-passphrase [--yes]
+
+  Options:
+    --yes, -y    Skip confirmation prompt (for scripts)
+    --help, -h   Show this help
+
+  The passphrase derives every encryption key in ~/.sanctuary. Anyone who
+  has it can decrypt your state. Store the output in a password manager
+  and clear your terminal history afterwards.
 `);
 }
 

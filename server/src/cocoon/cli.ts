@@ -1588,7 +1588,7 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
 /** Backward-compat alias for the old function name. */
 export const parseCocoonArgs = parseWrapArgs;
 
-function printWrapHelp(): void {
+export function printWrapHelp(): void {
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.log(`
   sanctuary wrap. Wrap any agent in Sanctuary protection.

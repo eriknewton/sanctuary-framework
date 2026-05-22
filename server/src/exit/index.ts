@@ -24,4 +24,4 @@ export {
   type VerifyExitBundleOptions,
 } from "./verifier.js";
 
-export { runExitCommand, type ExitCommandArgs } from "./cli.js";
+export { runExitCommand, printExitHelp, type ExitCommandArgs } from "./cli.js";
