@@ -154,6 +154,8 @@ Options:
   --source-passphrase <value>       Source passphrase for state re-key on import
   --source-recovery-key <value>     Source recovery key for state re-key on import
   --destination-identity-id <id>    Destination signer for re-keyed state
+  --import-state                    Import encrypted state during activation.
+                                    Requires --activate and source credentials.
   --state-namespace <name>          Export a namespace; repeatable
   --conflict <skip|overwrite|version>
   --force-rebind                    On import: explicitly replace an existing fortress
@@ -447,11 +449,25 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       }
 
       const activate = hasFlag(argv, "--activate");
+      const importState = hasFlag(argv, "--import-state");
       const forceRebind = hasFlag(argv, "--force-rebind");
       const acceptUnverifiableAttestations = hasFlag(
         argv,
         "--accept-unverifiable-attestations"
       );
+      const sourcePassphrase = flagValue(argv, "--source-passphrase");
+      const sourceRecoveryKey = flagValue(argv, "--source-recovery-key");
+      if (importState && !activate) {
+        write(err, "--import-state requires --activate\n");
+        return 2;
+      }
+      if (!importState && (sourcePassphrase || sourceRecoveryKey)) {
+        write(
+          err,
+          "--source-passphrase and --source-recovery-key require --import-state\n"
+        );
+        return 2;
+      }
       if (activate) {
         const prompt = forceRebind
           ? "Tier 1 approval required: activate verified imported exit bundle AND replace the existing fortress public identity (force-rebind)?"
@@ -511,8 +527,12 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
           forceRebind,
           acceptUnverifiableAttestations,
           conflictResolution: conflict,
-          sourcePassphrase: flagValue(argv, "--source-passphrase"),
-          sourceRecoveryKey: flagValue(argv, "--source-recovery-key"),
+          ...(importState && sourcePassphrase
+            ? { sourcePassphrase }
+            : {}),
+          ...(importState && sourceRecoveryKey
+            ? { sourceRecoveryKey }
+            : {}),
           destinationSignerIdentityId: flagValue(argv, "--destination-identity-id"),
           ...(didWebAllowedHosts.length > 0
             ? { didWebAllowedHosts }
@@ -548,6 +568,23 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         for (const item of result.unsupported_artifacts) {
           write(out, `unsupported: ${item}\n`);
         }
+      }
+      if (
+        activate &&
+        result.activated &&
+        result.state.status === "not_requested" &&
+        result.state.imported_keys === 0
+      ) {
+        write(
+          err,
+          [
+            "WARNING: Bundle activated but NO STATE was imported to the target fortress.",
+            "Identity, audit chain, and did-web entries were NOT transferred.",
+            "To import state, re-run with: sanctuary exit import <dir> --activate --import-state",
+            "Without --import-state, only the manifest binding is activated.",
+            "",
+          ].join("\n")
+        );
       }
       return result.verified ? 0 : 1;
     }
