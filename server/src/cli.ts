@@ -629,11 +629,9 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
       printDashboardHelp();
       return true;
     case "wrap":
-    case "cocoon": {
-      const { printWrapHelp } = await import("./cocoon/cli.js");
-      printWrapHelp();
+    case "cocoon":
+      printWrapHelpEarly();
       return true;
-    }
     case "init": {
       const { printInitHelp } = await import("./cocoon/init.js");
       printInitHelp();
@@ -675,6 +673,59 @@ function printExportPassphraseHelp(): void {
   The passphrase derives every encryption key in ~/.sanctuary. Anyone who
   has it can decrypt your state. Store the output in a password manager
   and clear your terminal history afterwards.
+`);
+}
+
+function printWrapHelpEarly(): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.log(`
+  sanctuary wrap. Wrap any agent in Sanctuary protection.
+
+  Usage:
+    sanctuary wrap --openclaw          Wrap OpenClaw
+    sanctuary wrap --hermes            Wrap Hermes Agent (NousResearch)
+    sanctuary wrap --claude-code       Wrap Claude Code
+    sanctuary wrap --cursor            Wrap Cursor
+    sanctuary wrap --cline             Wrap Cline (VS Code extension)
+    sanctuary wrap --wrap <path>       Wrap a specific MCP config file
+    sanctuary wrap --unwrap            Restore original config
+
+  Options:
+    --openclaw         Auto-detect and wrap OpenClaw
+    --hermes           Auto-detect and wrap Hermes Agent
+    --claude-code      Auto-detect and wrap Claude Code
+    --cursor           Auto-detect and wrap Cursor
+    --cline            Auto-detect and wrap Cline (VS Code extension)
+    --wrap <path>      Wrap a specific MCP config file
+    --unwrap           Restore original config from backup
+    --passphrase <p>   Override the stored passphrase (one-off)
+    --fortress <path>  Fortress directory (default: ~/.sanctuary). Honors
+                       SANCTUARY_FORTRESS_PATH env var when the flag is
+                       absent. Use to keep multiple fortresses isolated
+                       on one host.
+    --port <port>      Preferred dashboard port (default: 3501)
+    --dry-run          Show what would happen without making changes
+    --no-open          Do not auto-open the dashboard in a browser
+    --no-dashboard     Do not spawn a per-call dashboard server. Wrap still
+                       persists the agent record so a separately-running
+                       \`sanctuary dashboard\` (or a later wrap) sees the
+                       harness. Use this for the clean operator setup
+                       (one persistent dashboard + many wraps).
+    --dev-dist <path>  Dogfood path. Point the harness MCP entries at a
+                       local Sanctuary build (\`node <path>\` instead of
+                       \`npx @sanctuary-framework/mcp-server\`). Required
+                       when testing an unpublished branch; the published
+                       version doesn't have new subcommands yet, and
+                       npx pulls from the registry, not your checkout.
+                       Pass the absolute path to dist/cli.js.
+    --help, -h         Show this help
+
+  What happens:
+    1. Reads your agent's MCP config
+    2. Generates a passphrase (stored in Keychain on macOS, encrypted file elsewhere)
+    3. Backs up and rewrites the config so calls route through Sanctuary
+    4. Starts the Sovereignty Dashboard and opens it in your browser
+    5. Every tool call is logged, scanned, and tier-gated
 `);
 }
 
