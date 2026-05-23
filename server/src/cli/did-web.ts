@@ -139,13 +139,17 @@ export async function runDidWebCommand(
   const err = args.err ?? process.stderr;
   const env = args.env ?? process.env;
 
-  if (argv.length === 0 || hasFlag(argv, "--help") || hasFlag(argv, "-h")) {
+  if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
     printUsage(out);
     return 0;
   }
 
   const command = argv[0]!;
   if (command === "issue") {
+    if (hasFlag(argv.slice(1), "--help") || hasFlag(argv.slice(1), "-h")) {
+      printDidWebIssueHelp(out);
+      return 0;
+    }
     return await cmdIssue(argv.slice(1), out, err, env);
   }
   if (command === "show") {
@@ -163,6 +167,34 @@ export async function runDidWebCommand(
   write(err, `Unknown did-web command: ${command}\n`);
   write(err, `Run "sanctuary did-web --help" for usage.\n`);
   return 2;
+}
+
+export function printDidWebIssueHelp(out: Writable = process.stdout): void {
+  write(
+    out,
+    `sanctuary did-web issue. Generate and register a did:web identifier for this fortress.
+
+Usage:
+  sanctuary did-web issue --authority-host <host> [--agent-label <label>] [--json]
+
+Description:
+  Creates a did:web identifier bound to the fortress Ed25519 public key, writes
+  the local recognition record, and emits publication instructions. This command
+  does not publish or resolve outbound HTTPS.
+
+Options:
+  --authority-host <host>  HTTPS host that will serve /.well-known/did.json.
+  --agent-label <label>    Optional agent-scoped label.
+  --fortress <path>        Override the storage path.
+  --passphrase <val>       Passphrase for master-key derivation.
+  --json                   Output as JSON.
+  --help, -h               Show this help.
+
+Examples:
+  sanctuary did-web issue --authority-host alice.example.com
+  sanctuary did-web issue --authority-host example.com --agent-label claude --json
+`,
+  );
 }
 
 interface IdentitySnapshot {

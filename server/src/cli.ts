@@ -110,31 +110,31 @@ async function main(): Promise<void> {
   if (args[0] === "secrets") {
     const { runSecretsCommand } = await import("./cli/secrets.js");
     const code = await runSecretsCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "template") {
     const { runTemplateCommand } = await import("./templates/cli.js");
     const code = await runTemplateCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "identity") {
     const { runIdentityCommand } = await import("./cli/identity.js");
     const code = await runIdentityCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "agents" || args[0] === "agent") {
     const { runAgentsCommand } = await import("./cli/agents/index.js");
     const code = await runAgentsCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "exit") {
     const { runExitCommand } = await import("./exit/index.js");
     const code = await runExitCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (
@@ -143,7 +143,7 @@ async function main(): Promise<void> {
   ) {
     const { runExitCommand } = await import("./exit/index.js");
     const code = await runExitCommand({ argv: args });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "reset-passphrase") {
@@ -151,7 +151,7 @@ async function main(): Promise<void> {
       "./cli/reset-passphrase.js"
     );
     const code = await runResetPassphraseCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "intelligence") {
@@ -159,61 +159,61 @@ async function main(): Promise<void> {
       "./cli/intelligence.js"
     );
     const code = await runIntelligenceCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "sentinel") {
     const { runSentinelCommand } = await import("./cli/sentinel.js");
     const code = await runSentinelCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "did-web") {
     const { runDidWebCommand } = await import("./cli/did-web.js");
     const code = await runDidWebCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "anomaly") {
     const { runAnomalyCommand } = await import("./cli/anomaly.js");
     const code = await runAnomalyCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "policy") {
     const { runPolicyCommand } = await import("./cli/policy.js");
     const code = await runPolicyCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "auto-trigger") {
     const { runAutoTriggerCommand } = await import("./cli/auto-trigger.js");
     const code = await runAutoTriggerCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "erc8004") {
     const { runErc8004Command } = await import("./cli/erc8004.js");
     const code = await runErc8004Command({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "inbox") {
     const { runInboxCommand } = await import("./cli/inbox.js");
     const code = await runInboxCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "task") {
     const { runTaskCommand } = await import("./cli/task.js");
     const code = await runTaskCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "concierge") {
     const { runConciergeCommand } = await import("./cli/concierge.js");
     const code = await runConciergeCommand({ argv: args.slice(1) });
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "audit-chain") {
@@ -224,13 +224,19 @@ async function main(): Promise<void> {
     if (verb === "export") {
       if (wantsHelp) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
-        console.error(`Usage: sanctuary audit-chain export [options]
+        console.error(`sanctuary audit-chain export. Dump audit chain records to JSONL.
+
+Usage: sanctuary audit-chain export [--output <path>] [--fortress <path>]
 
 Options:
   --output <path>        Write JSONL to file (default: stdout)
   --fortress <path>      Override fortress path
   --storage-path <path>  Override state directory
   --help, -h             Show this help
+
+Examples:
+  sanctuary audit-chain export
+  sanctuary audit-chain export --output chain.jsonl --fortress ~/.sanctuary-work
 `);
         process.exit(0);
       }
@@ -241,7 +247,9 @@ Options:
     } else if (verb === "verify") {
       if (wantsHelp) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
-        console.error(`Usage: sanctuary audit-chain verify [options]
+        console.error(`sanctuary audit-chain verify. Verify an exported Sanctuary audit chain.
+
+Usage: sanctuary audit-chain verify --input <path> [--public-key <key>] [--no-strict]
 
 Options:
   --input <path>         JSONL file to verify (required)
@@ -249,6 +257,10 @@ Options:
   --no-strict            Continue on verification failures
   --storage-path <path>  Override state directory
   --help, -h             Show this help
+
+Examples:
+  sanctuary audit-chain verify --input chain.jsonl
+  sanctuary audit-chain verify --input chain.jsonl --public-key AbCd...
 `);
         process.exit(0);
       }
@@ -639,11 +651,23 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
     }
     case "agents":
     case "agent": {
-      const { printAgentsHelp } = await import("./cli/agents/index.js");
-      printAgentsHelp();
+      const { printAgentsHelp, printAgentsListHelp } = await import("./cli/agents/index.js");
+      if (args[1] === "list") {
+        printAgentsListHelp();
+      } else {
+        printAgentsHelp();
+      }
       return true;
     }
-    case "exit":
+    case "exit": {
+      const { printExitExportHelp, printExitHelp } = await import("./exit/index.js");
+      if (args[1] === "export") {
+        printExitExportHelp();
+      } else {
+        printExitHelp();
+      }
+      return true;
+    }
     case "verify-exit-bundle":
     case "import-exit-bundle": {
       const { printExitHelp } = await import("./exit/index.js");

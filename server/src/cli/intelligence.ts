@@ -25,7 +25,12 @@ export async function runIntelligenceCommand(
   const subcommand = opts.argv[0];
 
   if (subcommand === "diagnose" || subcommand === undefined) {
-    return runDiagnose(opts.argv.slice(subcommand === "diagnose" ? 1 : 0));
+    const rest = opts.argv.slice(subcommand === "diagnose" ? 1 : 0);
+    if (subcommand === "diagnose" && wantsHelp(rest)) {
+      printIntelligenceDiagnoseHelp();
+      return 0;
+    }
+    return runDiagnose(rest);
   }
 
   if (subcommand === "--help" || subcommand === "-h") {
@@ -39,6 +44,10 @@ export async function runIntelligenceCommand(
   return 2;
 }
 
+function wantsHelp(argv: string[]): boolean {
+  return argv.includes("--help") || argv.includes("-h");
+}
+
 function printHelp(): void {
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`
@@ -47,6 +56,31 @@ Usage: sanctuary intelligence <subcommand>
 Subcommands:
   diagnose    Print intelligence substrate config and last error.
   --help      Show this help.
+`);
+}
+
+export function printIntelligenceDiagnoseHelp(): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.error(`
+sanctuary intelligence diagnose. Print local intelligence substrate diagnostics.
+
+Usage:
+  sanctuary intelligence diagnose [--fortress <path>]
+  sanctuary intelligence diagnose [--fortress-path <path>]
+
+Description:
+  Checks the local fortress intelligence config directory, recent audit
+  filenames, and relevant substrate environment variables. This command does
+  not require a passphrase.
+
+Options:
+  --fortress <path>       Override the fortress path.
+  --fortress-path <path>  Alias for --fortress.
+  --help, -h              Show this help.
+
+Examples:
+  sanctuary intelligence diagnose
+  sanctuary intelligence diagnose --fortress ~/.sanctuary-work
 `);
 }
 

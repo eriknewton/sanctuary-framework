@@ -213,6 +213,39 @@ did:web auto-inclusion (build 3):
 `);
 }
 
+export function printExitExportHelp(out: Writable = process.stdout): void {
+  write(out, `sanctuary exit export. Create a SANCTUARY_EXIT_BUNDLE_V1 directory.
+
+Usage:
+  sanctuary exit export --out <dir> [options]
+
+Description:
+  Exports identity, audit receipts, reputation data, policy metadata, optional
+  encrypted state namespaces, and optional did:web binding into a portable exit
+  bundle. Export requires Tier 1 approval unless --yes is supplied.
+
+Options:
+  --out <dir>                       Destination bundle directory.
+  --passphrase <value>              Current fortress passphrase.
+  --state-namespace <name>          Export a namespace; repeatable.
+  --did-web <identifier>            Embed a specific did:web identifier.
+  --did-web-authority-host <host>   Required with --did-web.
+  --did-web-published-at <iso8601>  Claimed DID Document publication time.
+  --no-did-web                      Skip did:web auto-inclusion.
+  --json                            Output as JSON.
+  --yes, -y                         Explicit non-interactive Tier 1 approval.
+  --help, -h                        Show this help.
+
+Environment:
+  SANCTUARY_PASSPHRASE    Current fortress passphrase.
+  SANCTUARY_RECOVERY_KEY  Recovery key alternative to passphrase.
+
+Examples:
+  sanctuary exit export --out ./exit-bundle
+  sanctuary exit export --out ./exit-bundle --state-namespace memories --yes
+`);
+}
+
 export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
   const argv = args.argv;
   const out = args.out ?? process.stdout;
@@ -220,7 +253,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
   const stdin = args.stdin ?? process.stdin;
   const env = args.env ?? process.env;
 
-  if (argv.length === 0 || hasFlag(argv, "--help") || hasFlag(argv, "-h")) {
+  if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
     printExitHelp(out);
     return 0;
   }
@@ -289,6 +322,10 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
     }
 
     if (command === "export") {
+      if (hasFlag(argv.slice(1), "--help") || hasFlag(argv.slice(1), "-h")) {
+        printExitExportHelp(out);
+        return 0;
+      }
       const outDir = flagValue(argv, "--out");
       if (!outDir) {
         write(err, "Usage: sanctuary exit export --out <dir>\n");

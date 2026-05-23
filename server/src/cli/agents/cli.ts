@@ -106,6 +106,10 @@ export async function runAgentsCommand(
   try {
     switch (sub) {
       case "list":
+        if (rest.includes("--help") || rest.includes("-h")) {
+          printAgentsListHelp(ctx.out);
+          return 0;
+        }
         return await cmdList(rest, ctx);
       case "show":
         return await cmdShow(rest, ctx);
@@ -123,6 +127,29 @@ export async function runAgentsCommand(
     ctx.err.write(`sanctuary agents: ${msg}\n`);
     return 1;
   }
+}
+
+export function printAgentsListHelp(s: NodeJS.WritableStream = process.stdout): void {
+  s.write(`sanctuary agents list. List every Sanctuary tenant visible on this host.
+
+Usage:
+  sanctuary agents list [--json] [--fortress <path>]
+  sanctuary agent list [--json] [--fortress <path>]
+
+Description:
+  Discovers tenants by scanning the default Sanctuary root, configured extra
+  paths, or a single fortress path when --fortress is supplied. Human output
+  includes status, dashboard port, webhook port, passphrase source, and storage.
+
+Options:
+  --json              Output tenant rows as JSON.
+  --fortress <path>   Scope discovery to a specific storage path.
+  --help, -h          Show this help.
+
+Examples:
+  sanctuary agents list
+  sanctuary agents list --fortress ~/.sanctuary-work --json
+`);
 }
 
 export function printAgentsHelp(s: NodeJS.WritableStream = process.stdout): void {

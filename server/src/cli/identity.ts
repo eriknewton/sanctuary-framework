@@ -76,7 +76,7 @@ export async function runIdentityCommand(
   const err = args.err ?? process.stderr;
   const env = args.env ?? process.env;
 
-  if (argv.length === 0 || hasFlag(argv, "--help") || hasFlag(argv, "-h")) {
+  if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
     printUsage(out);
     return 0;
   }
@@ -84,12 +84,46 @@ export async function runIdentityCommand(
   const command = argv[0]!;
 
   if (command === "show") {
+    if (hasFlag(argv.slice(1), "--help") || hasFlag(argv.slice(1), "-h")) {
+      printIdentityShowHelp(out);
+      return 0;
+    }
     return await cmdShow(argv.slice(1), out, err, env);
   }
 
   write(err, `Unknown identity command: ${command}\n`);
   write(err, `Run "sanctuary identity --help" for usage.\n`);
   return 2;
+}
+
+export function printIdentityShowHelp(out: Writable = process.stdout): void {
+  write(
+    out,
+    `sanctuary identity show. Display the active identity for a fortress.
+
+Usage:
+  sanctuary identity show [--fortress <path>] [--json]
+
+Description:
+  Decrypts and prints the active identity DID, identity_id, public key, and
+  storage path. Identity data is encrypted at rest, so a passphrase or recovery
+  key is required for normal execution.
+
+Options:
+  --fortress <path>   Override the storage path.
+  --passphrase <val>  Passphrase for master-key derivation.
+  --json              Output as JSON.
+  --help, -h          Show this help.
+
+Environment:
+  SANCTUARY_PASSPHRASE    Key derivation passphrase.
+  SANCTUARY_RECOVERY_KEY  Recovery key alternative to passphrase.
+
+Examples:
+  sanctuary identity show
+  sanctuary identity show --fortress ~/.sanctuary-work --json
+`
+  );
 }
 
 async function cmdShow(

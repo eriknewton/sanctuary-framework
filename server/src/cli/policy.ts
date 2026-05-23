@@ -73,6 +73,10 @@ export async function runPolicyCommand(args: PolicyArgs): Promise<number> {
   try {
     switch (sub) {
       case "compile":
+        if (wantsHelp(rest)) {
+          printPolicyCompileHelp(out);
+          return 0;
+        }
         return await cmdCompile(rest, { out, err });
       case "drafts":
         return await cmdDrafts(rest, { out, err });
@@ -86,6 +90,39 @@ export async function runPolicyCommand(args: PolicyArgs): Promise<number> {
     err.write(`sanctuary policy: ${msg}\n`);
     return 1;
   }
+}
+
+function wantsHelp(argv: string[]): boolean {
+  return argv.includes("--help") || argv.includes("-h");
+}
+
+export function printPolicyCompileHelp(
+  s: NodeJS.WritableStream = process.stdout,
+): void {
+  s.write(`sanctuary policy compile. Compile English policy text into a structured policy preview.
+
+Usage:
+  sanctuary policy compile "<English text>"
+
+Description:
+  Compiles an operator-authored policy statement to a structured rule and
+  explanation. Uses LLM-assist when SANCTUARY_PASSPHRASE is set and an
+  intelligence substrate is configured; otherwise falls back to deterministic
+  compilation.
+
+Arguments:
+  <English text>      Policy statement as a single shell argument.
+
+Options:
+  --help, -h          Show this help.
+
+Environment:
+  SANCTUARY_PASSPHRASE  Enables fortress-backed intelligence substrate lookup.
+
+Examples:
+  sanctuary policy compile "always require approval for state_export"
+  SANCTUARY_PASSPHRASE=... sanctuary policy compile "deny external disclosure"
+`);
 }
 
 function printUsage(s: NodeJS.WritableStream): void {

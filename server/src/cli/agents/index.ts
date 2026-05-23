@@ -31,5 +31,6 @@ export {
 export {
   runAgentsCommand,
   printAgentsHelp,
+  printAgentsListHelp,
   type AgentsCommandArgs,
 } from "./cli.js";
