@@ -107,6 +107,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "castle-wall") {
+    const code = runCastleWallCommand(args.slice(1));
+    drainAndExit(code);
+  }
+
   if (args[0] === "secrets") {
     const { runSecretsCommand } = await import("./cli/secrets.js");
     const code = await runSecretsCommand({ argv: args.slice(1) });
@@ -537,6 +542,9 @@ Subcommands:
   export-passphrase    Print the stored passphrase to stdout after
                        confirmation. Use this to back up or migrate.
 
+  castle-wall          Inspect Castle Wall CLI commands.
+                       Use "sanctuary castle-wall --help" for options.
+
   reset-passphrase     Recover a fortress whose passphrase has been lost
                        or corrupted. Three modes: shares (M-of-N
                        reconstruction), guardian (federation quorum), or
@@ -653,9 +661,41 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
     case "export-passphrase":
       printExportPassphraseHelp();
       return true;
+    case "castle-wall":
+      printCastleWallHelp();
+      return true;
     default:
       return false;
   }
+}
+
+function runCastleWallCommand(args: string[]): number {
+  const command = args[0];
+  if (!command || command === "--help" || command === "-h") {
+    printCastleWallHelp();
+    return 0;
+  }
+
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.error(
+    `Unknown subcommand: ${command}. Try: sanctuary castle-wall --help`
+  );
+  return 2;
+}
+
+function printCastleWallHelp(): void {
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.log(`
+  sanctuary castle-wall. Castle Wall command surface.
+
+  Usage:
+    sanctuary castle-wall [--help]
+
+  Options:
+    --help, -h   Show this help
+
+  Status inspection is not available in this release.
+`);
 }
 
 function printExportPassphraseHelp(): void {
