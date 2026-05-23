@@ -266,6 +266,71 @@ describe("sanctuary task CLI", () => {
     }
   });
 
+  it("task create names network/connection failures with a remediation hint", async () => {
+    globalThis.fetch = vi.fn(async () => {
+      throw new TypeError("fetch failed", { cause: new Error("ECONNREFUSED") });
+    }) as unknown as typeof globalThis.fetch;
+
+    const { code, out, err } = await run([
+      "create",
+      "--title",
+      "Classify failure",
+    ]);
+
+    expect(code).toBe(1);
+    expect(out.text).toBe("");
+    expect(err.text).toContain("sanctuary task: network/connection failure: fetch failed");
+    expect(err.text).toContain("ECONNREFUSED");
+    expect(err.text).toContain("Hint: start the Sanctuary dashboard");
+  });
+
+  it.each([
+    [
+      "404",
+      404,
+      { ok: false, detail: "route missing" },
+      "endpoint not implemented in this build (HTTP 404): route missing",
+      "verify the dashboard exposes /api/hub/tasks",
+    ],
+    [
+      "401",
+      401,
+      { ok: false, detail: "unauthorized" },
+      "auth/policy denied (HTTP 401): unauthorized",
+      "check SANCTUARY_DASHBOARD_AUTH_TOKEN",
+    ],
+    [
+      "403",
+      403,
+      { ok: false, detail: "policy denied" },
+      "auth/policy denied (HTTP 403): policy denied",
+      "operator authorization",
+    ],
+    [
+      "503",
+      503,
+      { ok: false, detail: "unavailable" },
+      "server error (HTTP 503): unavailable",
+      "inspect the dashboard logs",
+    ],
+  ])(
+    "task create names HTTP %s failure class",
+    async (_label, status, payload, expectedClass, expectedHint) => {
+      globalThis.fetch = vi.fn(async () => okJson(payload, status)) as unknown as typeof globalThis.fetch;
+
+      const { code, out, err } = await run([
+        "create",
+        "--title",
+        "Classify failure",
+      ]);
+
+      expect(code).toBe(1);
+      expect(out.text).toBe("");
+      expect(err.text).toContain(`sanctuary task: ${expectedClass}`);
+      expect(err.text).toContain(expectedHint);
+    },
+  );
+
   it("validates required arguments and documents the surface", async () => {
     const help = await run(["--help"]);
     const missingTitle = await run(["create"]);
