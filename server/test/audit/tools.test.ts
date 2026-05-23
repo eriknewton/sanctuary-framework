@@ -8,6 +8,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { createAuditTools } from "../../src/audit/tools.js";
 import type { SanctuaryConfig } from "../../src/config.js";
+import { AuditIntegrityError } from "../../src/l2-operational/audit-log.js";
 
 // Mock the detector and analyzer modules
 vi.mock("../../src/audit/detector.js", () => ({
@@ -88,6 +89,40 @@ describe("Sovereignty Audit Tool", () => {
     const tool = tools.find(t => t.name === "sovereignty_audit")!;
     await tool.handler({ deep_scan: false });
     expect(detectEnvironment).toHaveBeenCalledWith(expect.anything(), false);
+  });
+
+  it("passes strict-mode audit integrity failures into the sovereignty analysis", async () => {
+    const { analyzeSovereignty } = await import("../../src/audit/analyzer.js");
+    const auditLog = {
+      query: vi.fn(async () => {
+        throw new AuditIntegrityError([
+          {
+            kind: "sequence_gap_or_reorder",
+            sequence: 7,
+            expected: 6,
+            actual: 7,
+            message: "audit sequence break",
+          },
+        ]);
+      }),
+    };
+    const { tools } = createAuditTools(minimalConfig(), auditLog);
+    const tool = tools.find(t => t.name === "sovereignty_audit")!;
+
+    await tool.handler({});
+
+    expect(analyzeSovereignty).toHaveBeenCalledWith(
+      expect.objectContaining({
+        audit_subsystem_health: {
+          integrity_findings: [
+            expect.objectContaining({ kind: "sequence_gap_or_reorder" }),
+          ],
+          exit_export_aborted_by_integrity_gate: true,
+          mcp_tools_bricked_by_integrity_gate: true,
+        },
+      }),
+      expect.anything()
+    );
   });
 
   it("registers exactly one tool", () => {

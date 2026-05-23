@@ -51,6 +51,18 @@ const L4_SIGNED_ATTESTATIONS = 6;
 const L4_SYBIL_DETECTION = 4;
 const L4_SOVEREIGNTY_GATED = 4;
 
+const AUDIT_INTEGRITY_FINDING_PENALTY = 20;
+const AUDIT_INTEGRITY_FINDING_PENALTY_CAP = 70;
+const AUDIT_EXIT_EXPORT_ABORTED_PENALTY = 25;
+const AUDIT_MCP_TOOLS_BRICKED_PENALTY = 25;
+const AUDIT_HEALTH_DEDUCTED_KINDS = new Set([
+  "sequence_gap",
+  "sequence_gap_or_reorder",
+  "prev_hash_mismatch",
+  "entry_hash_mismatch",
+  "checkpoint_root_mismatch",
+]);
+
 // Severity ordering for gap sorting
 const SEVERITY_ORDER: Record<string, number> = {
   critical: 0,
@@ -131,7 +143,9 @@ export function analyzeSovereignty(
   const l3Score = scoreL3(l3);
   const l4Score = scoreL4(l4);
 
-  const overallScore = l1Score + l2Score + l3Score + l4Score;
+  const baseScore = l1Score + l2Score + l3Score + l4Score;
+  const auditHealthPenalty = scoreAuditHealthPenalty(env);
+  const overallScore = Math.max(0, baseScore - auditHealthPenalty);
 
   const sovereigntyLevel = overallScore >= 80
     ? "full"
@@ -401,6 +415,25 @@ function scoreL4(l4: L4AuditResult): number {
   return score;
 }
 
+function scoreAuditHealthPenalty(env: EnvironmentFingerprint): number {
+  const health = env.audit_subsystem_health;
+  if (!health) return 0;
+
+  const deductedFindings = health.integrity_findings.filter((finding) =>
+    AUDIT_HEALTH_DEDUCTED_KINDS.has(finding.kind)
+  );
+  const findingsPenalty = Math.min(
+    deductedFindings.length * AUDIT_INTEGRITY_FINDING_PENALTY,
+    AUDIT_INTEGRITY_FINDING_PENALTY_CAP
+  );
+
+  return (
+    findingsPenalty +
+    (health.exit_export_aborted_by_integrity_gate ? AUDIT_EXIT_EXPORT_ABORTED_PENALTY : 0) +
+    (health.mcp_tools_bricked_by_integrity_gate ? AUDIT_MCP_TOOLS_BRICKED_PENALTY : 0)
+  );
+}
+
 // ── Gap Generation ──────────────────────────────────────────────────────
 
 function generateGaps(
@@ -412,6 +445,62 @@ function generateGaps(
 ): SovereigntyGap[] {
   const gaps: SovereigntyGap[] = [];
   const oc = env.openclaw_config;
+  const auditHealth = env.audit_subsystem_health;
+
+  const deductedAuditFindings = auditHealth?.integrity_findings.filter((finding) =>
+    AUDIT_HEALTH_DEDUCTED_KINDS.has(finding.kind)
+  ) ?? [];
+
+  if (deductedAuditFindings.length > 0) {
+    gaps.push({
+      id: "GAP-AUDIT-001",
+      layer: "cross-cutting",
+      severity: "critical",
+      title: "Audit chain integrity is compromised",
+      description:
+        `${deductedAuditFindings.length} audit-chain integrity finding(s) were detected. ` +
+        "A sovereignty score cannot be full while the audit trail has sequence, hash, " +
+        "or checkpoint-root failures.",
+      openclaw_relevance: null,
+      sanctuary_solution:
+        "Treat the fortress as degraded, preserve the audit store for investigation, " +
+        "repair or restore the audit chain, and rerun sovereignty_audit before trusting " +
+        "operator-facing health signals.",
+    });
+  }
+
+  if (auditHealth?.exit_export_aborted_by_integrity_gate) {
+    gaps.push({
+      id: "GAP-AUDIT-002",
+      layer: "cross-cutting",
+      severity: "critical",
+      title: "Exit export blocked by audit-integrity gate",
+      description:
+        "The fortress is not fully portable while sanctuary exit export is aborting " +
+        "because audit-integrity findings block the export path.",
+      openclaw_relevance: null,
+      sanctuary_solution:
+        "Resolve the audit-integrity findings before relying on exit portability. " +
+        "Until export succeeds, report sovereignty as degraded.",
+    });
+  }
+
+  if (auditHealth?.mcp_tools_bricked_by_integrity_gate) {
+    gaps.push({
+      id: "GAP-AUDIT-003",
+      layer: "cross-cutting",
+      severity: "critical",
+      title: "MCP tools blocked by audit-integrity gate",
+      description:
+        "One or more MCP tool calls are refusing to run because the audit-integrity " +
+        "gate is fail-closed. A fortress with bricked operations must never report " +
+        "a perfect sovereignty score.",
+      openclaw_relevance: null,
+      sanctuary_solution:
+        "Keep the integrity gate fail-closed, repair or restore the audit chain, " +
+        "then verify that MCP tool calls and sovereignty_audit agree on health.",
+    });
+  }
 
   // L1 gaps
   if (oc && !oc.memory_encrypted) {
@@ -634,6 +723,18 @@ function generateRecommendations(
 ): Recommendation[] {
   const recs: Recommendation[] = [];
 
+  if (env.audit_subsystem_health?.integrity_findings.some((finding) =>
+    AUDIT_HEALTH_DEDUCTED_KINDS.has(finding.kind)
+  )) {
+    recs.push({
+      priority: 1,
+      action: "Repair or restore the audit chain before trusting sovereignty health",
+      tool: "monitor_audit_log",
+      effort: "immediate",
+      impact: "critical",
+    });
+  }
+
   if (!l1.identity_cryptographic) {
     recs.push({
       priority: 1,
@@ -702,7 +803,7 @@ function generateRecommendations(
     });
   }
 
-  return recs;
+  return recs.sort((a, b) => a.priority - b.priority);
 }
 
 // ── Report Formatting ───────────────────────────────────────────────────

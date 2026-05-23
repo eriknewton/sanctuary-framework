@@ -135,6 +135,71 @@ describe("Sovereignty Audit", () => {
       const criticalGaps = result.gaps.filter((g) => g.severity === "critical");
       expect(criticalGaps).toHaveLength(0);
     });
+
+    it("subtracts at least 20 points for a single audit sequence gap", () => {
+      const env = makeFingerprint({
+        audit_subsystem_health: {
+          integrity_findings: [
+            {
+              kind: "sequence_gap",
+              sequence: 4,
+              expected: 3,
+              actual: 4,
+              message: "audit sequence break",
+            },
+          ],
+          exit_export_aborted_by_integrity_gate: false,
+          mcp_tools_bricked_by_integrity_gate: false,
+        },
+      });
+
+      const result = analyzeSovereignty(env, config);
+
+      expect(result.overall_score).toBeLessThanOrEqual(80);
+      expect(result.overall_score).toBeLessThan(100);
+      expect(result.gaps.map((g) => g.id)).toContain("GAP-AUDIT-001");
+    });
+
+    it("subtracts proportionally for audit integrity findings and never reports 100 on a broken fortress", () => {
+      const env = makeFingerprint({
+        audit_subsystem_health: {
+          integrity_findings: [
+            { kind: "sequence_gap_or_reorder", sequence: 2 },
+            { kind: "prev_hash_mismatch", sequence: 3 },
+            { kind: "entry_hash_mismatch", sequence: 4 },
+            { kind: "checkpoint_root_mismatch", sequence: 4 },
+          ],
+          exit_export_aborted_by_integrity_gate: false,
+          mcp_tools_bricked_by_integrity_gate: false,
+        },
+      });
+
+      const result = analyzeSovereignty(env, config);
+
+      expect(result.overall_score).toBe(30);
+      expect(result.sovereignty_level).toBe("minimal");
+      expect(result.gaps.map((g) => g.id)).toContain("GAP-AUDIT-001");
+    });
+
+    it("subtracts additional severe penalties for exit export aborts and bricked MCP tools", () => {
+      const env = makeFingerprint({
+        audit_subsystem_health: {
+          integrity_findings: [
+            { kind: "sequence_gap_or_reorder", sequence: 2 },
+          ],
+          exit_export_aborted_by_integrity_gate: true,
+          mcp_tools_bricked_by_integrity_gate: true,
+        },
+      });
+
+      const result = analyzeSovereignty(env, config);
+
+      expect(result.overall_score).toBe(30);
+      expect(result.overall_score).toBeLessThan(100);
+      expect(result.gaps.map((g) => g.id)).toEqual(
+        expect.arrayContaining(["GAP-AUDIT-001", "GAP-AUDIT-002", "GAP-AUDIT-003"])
+      );
+    });
   });
 
   describe("OpenClaw Memory Detection", () => {
