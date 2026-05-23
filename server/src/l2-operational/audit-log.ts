@@ -570,7 +570,13 @@ export class AuditLog {
     await this.loadPersistedEntries();
     this.loaded = true;
     await this.reportIntegrityFindingsIfAny();
-    if (this.integrityMode === "strict" && this.integrityFindings.length > 0) {
+    const contextAllowsIntegrityFindings =
+      auditIntegrityContext.getStore()?.allowIntegrityFindings === true;
+    if (
+      this.integrityMode === "strict" &&
+      this.integrityFindings.length > 0 &&
+      !contextAllowsIntegrityFindings
+    ) {
       throw new AuditIntegrityError(this.integrityFindings);
     }
   }
