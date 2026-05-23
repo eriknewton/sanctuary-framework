@@ -56,6 +56,26 @@ describe("CLI help routing", () => {
     expect(stdout).not.toContain("Sovereignty infrastructure for agents");
   });
 
+  it("sanctuary castle-wall prints castle-wall help instead of starting MCP", async () => {
+    const { code, stdout, stderr } = await runCli("castle-wall");
+
+    expect(code).toBe(0);
+    expect(stdout).toContain("Usage:");
+    expect(stdout).toContain("sanctuary castle-wall [--help]");
+    expect(stderr).not.toContain("Sanctuary MCP Server");
+  });
+
+  it("sanctuary castle-wall status rejects explicitly", async () => {
+    const { code, stdout, stderr } = await runCli("castle-wall", "status");
+
+    expect(code).not.toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).toContain(
+      "Unknown subcommand: status. Try: sanctuary castle-wall --help"
+    );
+    expect(stderr).not.toContain("Sanctuary MCP Server");
+  });
+
   it("sanctuary --help still prints top-level help", async () => {
     const { code, stdout } = await runCli("--help");
 
