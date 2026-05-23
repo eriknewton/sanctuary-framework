@@ -71,6 +71,12 @@ export interface DashboardHandle {
    * caller has independently authenticated the operator.
    */
   setV11LoopbackAutoAuth: (enabled: boolean) => void;
+  /**
+   * Merge newly-available live sources into the snapshot aggregator.
+   * Wrap-auto starts HTTP before the fortress key is resolved, then
+   * supplies the loaded identity manager and audit log through this hook.
+   */
+  updateSources: (sources: Partial<AggregatorSources>) => void;
 }
 
 const DEFAULT_PORT = 3501;
@@ -95,6 +101,9 @@ export async function startDashboardServer(
         // listener failures shouldn't break others
       }
     }
+  };
+  const updateSources = (sources: Partial<AggregatorSources>): void => {
+    Object.assign(options.sources, sources);
   };
 
   // v1.1.2 hotfix (Finding V): mutable per-server state for the v1.1
@@ -166,5 +175,6 @@ export async function startDashboardServer(
     setV11LoopbackAutoAuth: (enabled: boolean) => {
       v11LoopbackAutoAuth = enabled;
     },
+    updateSources,
   };
 }

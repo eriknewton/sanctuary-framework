@@ -121,6 +121,7 @@ export async function startDashboard(
       pending.push(approval);
       handle.publishApproval(approval);
     },
+    updateSources: handle.updateSources,
   };
 
   return wrapped;
