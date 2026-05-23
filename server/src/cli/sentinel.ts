@@ -156,7 +156,7 @@ async function cmdSubscribe(
       const storage = new FilesystemStorage(`${storagePath}/state`);
       const fortressId = fortressIdFromStoragePath(storagePath);
       const auditLog = new AuditLog(storage, masterKey);
-      auditLog.append("l2", "sentinel.subscribe", `fortress:${fortressId}`, {
+      await auditLog.append("l2", "sentinel.subscribe", `fortress:${fortressId}`, {
         sentinel_id: sentinelId,
         subscription_path: `${storagePath}/sentinel-subscriptions.json`,
       }, "failure");
@@ -175,7 +175,7 @@ async function cmdSubscribe(
   const storage = new FilesystemStorage(`${storagePath}/state`);
   const fortressId = fortressIdFromStoragePath(storagePath);
   const auditLog = new AuditLog(storage, masterKey);
-  auditLog.append("l2", "sentinel.subscribe", `fortress:${fortressId}`, {
+  await auditLog.append("l2", "sentinel.subscribe", `fortress:${fortressId}`, {
     sentinel_id: sentinelId,
     subscription_path: `${storagePath}/sentinel-subscriptions.json`,
   });
@@ -210,7 +210,7 @@ async function cmdUnsubscribe(
   const storage = new FilesystemStorage(`${storagePath}/state`);
   const fortressId = fortressIdFromStoragePath(storagePath);
   const auditLog = new AuditLog(storage, masterKey);
-  auditLog.append("l2", "sentinel.unsubscribe", `fortress:${fortressId}`, {
+  await auditLog.append("l2", "sentinel.unsubscribe", `fortress:${fortressId}`, {
     sentinel_id: sentinelId,
     subscription_path: `${storagePath}/sentinel-subscriptions.json`,
   });

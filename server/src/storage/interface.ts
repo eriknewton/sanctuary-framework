@@ -57,3 +57,16 @@ export interface StorageBackend {
    */
   totalSize(): Promise<number>;
 }
+
+/** Optional filesystem capabilities used by code that must coordinate across processes. */
+export interface FilesystemStorageCapabilities {
+  /**
+   * Return the absolute on-disk directory for a storage namespace, creating
+   * callers' own files there only when they are intentionally outside the
+   * normal encrypted key/value contract.
+   */
+  namespacePath(namespace: string): string;
+
+  /** Write bytes and fsync the file before resolving. */
+  writeDurable(namespace: string, key: string, data: Uint8Array): Promise<void>;
+}

@@ -228,7 +228,7 @@ async function cmdSubscribe(
       const storage = new FilesystemStorage(`${storagePath}/state`);
       const fortressId = fortressIdFromStoragePath(storagePath);
       const auditLog = new AuditLog(storage, masterKey);
-      auditLog.append("l2", "anomaly.subscribe", `fortress:${fortressId}`, {
+      await auditLog.append("l2", "anomaly.subscribe", `fortress:${fortressId}`, {
         detector_id: detectorId,
         classifier_id: classifierId,
         subscription_path: `${storagePath}/anomaly-subscriptions.json`,
@@ -256,7 +256,7 @@ async function cmdSubscribe(
   const storage = new FilesystemStorage(`${storagePath}/state`);
   const fortressId = fortressIdFromStoragePath(storagePath);
   const auditLog = new AuditLog(storage, masterKey);
-  auditLog.append("l2", "anomaly.subscribe", `fortress:${fortressId}`, {
+  await auditLog.append("l2", "anomaly.subscribe", `fortress:${fortressId}`, {
     detector_id: detectorId,
     classifier_id: classifierId,
     subscription_path: `${storagePath}/anomaly-subscriptions.json`,
@@ -302,7 +302,7 @@ async function cmdUnsubscribe(
   const storage = new FilesystemStorage(`${storagePath}/state`);
   const fortressId = fortressIdFromStoragePath(storagePath);
   const auditLog = new AuditLog(storage, masterKey);
-  auditLog.append("l2", "anomaly.unsubscribe", `fortress:${fortressId}`, {
+  await auditLog.append("l2", "anomaly.unsubscribe", `fortress:${fortressId}`, {
     detector_id: detectorId,
     classifier_id: classifierId,
     subscription_path: `${storagePath}/anomaly-subscriptions.json`,

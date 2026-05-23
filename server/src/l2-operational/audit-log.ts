@@ -9,7 +9,12 @@
  * can inspect what their agent has done.
  */
 
-import type { StorageBackend } from "../storage/interface.js";
+import { mkdir, open, rm } from "node:fs/promises";
+import { join } from "node:path";
+import type {
+  FilesystemStorageCapabilities,
+  StorageBackend,
+} from "../storage/interface.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString, toBase64url, fromBase64url } from "../core/encoding.js";
@@ -87,13 +92,32 @@ export interface AuditLogConfig {
   ) => Promise<AuditCheckpointSignature | null>;
   /** Resolve a known checkpoint signing key by signer_kid. */
   checkpointPublicKeyResolver?: (signerKid: string) => string | Uint8Array | undefined;
+  /** Optional in-process subscribers notified when audit-chain integrity fails. */
+  integrityAnomalySubscribers?: AuditIntegrityAnomalySubscriber[];
 }
+
+export interface AuditIntegrityAnomalyEvent {
+  type: "audit_integrity_finding";
+  severity: "P1";
+  finding_count: number;
+  findings: AuditIntegrityFinding[];
+  observed_at: string;
+}
+
+export type AuditIntegrityAnomalySubscriber = (
+  event: AuditIntegrityAnomalyEvent
+) => void | Promise<void>;
 
 const DEFAULT_MAX_TOTAL_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_MAX_ENTRIES = 100_000;
 const DEFAULT_CHECKPOINT_INTERVAL = 100;
 const AUDIT_NAMESPACE = "_audit";
 const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
+const AUDIT_INTEGRITY_ALERT_NAMESPACE = "_audit_integrity_alert";
+const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
+const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
+const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
+const AUDIT_WRITE_LOCK_RETRY_MS = 100;
 
 /**
  * Operation-name constants for the v0.10.0 Secret Broker (L3 Selective
@@ -139,6 +163,15 @@ export class AuditPersistenceError extends Error {
   }
 }
 
+export class AuditLockContentionError extends Error {
+  constructor(readonly lockPath: string) {
+    super(
+      `audit write blocked: another writer held the lock for >5s; check for stuck processes; inspect with: lsof ${lockPath}`
+    );
+    this.name = "AuditLockContentionError";
+  }
+}
+
 export class AuditLogPersistenceError extends AuditPersistenceError {
   constructor(readonly failures: readonly unknown[]) {
     const message =
@@ -177,6 +210,10 @@ export class AuditLog {
   private readonly checkpointPublicKeyResolver?: (
     signerKid: string
   ) => string | Uint8Array | undefined;
+  private readonly integrityAnomalySubscribers: AuditIntegrityAnomalySubscriber[];
+  private readonly filesystemCapabilities?: FilesystemStorageCapabilities;
+  private readonly auditWriteLockPath?: string;
+  private lastIntegrityAlertSignature: string | null = null;
   private rotationInFlight = false;
   private readonly pendingWrites = new Set<Promise<void>>();
   private pendingVisibleEntries = 0;
@@ -185,7 +222,6 @@ export class AuditLog {
   private integrityFindings: AuditIntegrityFinding[] = [];
   private nextSequence = 1;
   private lastEntryHash = AUDIT_CHAIN_GENESIS;
-  private checkpointSpanStartSequence = 1;
   private hashesSinceCheckpoint: string[] = [];
   private lastCheckpointSequence = 0;
   private criticalAppendsSinceCheckpoint = 0;
@@ -201,6 +237,21 @@ export class AuditLog {
       config?.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL;
     this.checkpointSigner = config?.checkpointSigner;
     this.checkpointPublicKeyResolver = config?.checkpointPublicKeyResolver;
+    this.integrityAnomalySubscribers = config?.integrityAnomalySubscribers ?? [];
+    this.filesystemCapabilities = asFilesystemCapabilities(storage);
+    if (this.filesystemCapabilities) {
+      this.auditWriteLockPath = join(
+        this.filesystemCapabilities.namespacePath(AUDIT_NAMESPACE),
+        AUDIT_WRITE_LOCK_FILE
+      );
+      // SAFETY: one-time startup announcement of the audit-write coordination
+      // mechanism. Operators need to see this so they can locate the lock file
+      // and inspect lsof on it if writes appear stuck. Goes to stderr-equivalent
+      // console.info, which is operator-facing diagnostic surface, not telemetry.
+      console.info(
+        `[audit-log] cross-process file locking enabled: ${this.auditWriteLockPath}`
+      );
+    }
   }
 
   /**
@@ -297,49 +348,52 @@ export class AuditLog {
     options: { verifyDurability: boolean; critical: boolean }
   ): Promise<void> {
     try {
-      await this.ensureLoaded();
       const normalized = this.normalizeEntry(entry);
       const serialized = stringToBytes(JSON.stringify(normalized));
       const encrypted = encrypt(serialized, this.encryptionKey);
       const encryptedBytes = stringToBytes(JSON.stringify(encrypted));
       const encryptedPayloadBytes = toBase64url(encryptedBytes);
-      const sequence = this.nextSequence;
-      const prevHash = this.lastEntryHash;
-      const entryHash = computeAuditEntryHash({
-        sequence,
-        prev_hash: prevHash,
-        timestamp: normalized.timestamp,
-        encrypted_payload_bytes: encryptedPayloadBytes,
-        schema_version: AUDIT_CHAIN_SCHEMA_VERSION,
-      });
-      const envelope: PersistedAuditEnvelopeV2 = {
-        schema_version: AUDIT_CHAIN_SCHEMA_VERSION,
-        sequence,
-        prev_hash: prevHash,
-        entry_hash: entryHash,
-        timestamp: normalized.timestamp,
-        encrypted_payload_bytes: encryptedPayloadBytes,
-      };
-      const key = `entry-${String(sequence).padStart(20, "0")}-${Date.now()}-${this.counter++}`;
-      const persistedBytes = stringToBytes(JSON.stringify(envelope));
-      try {
-        await this.storage.write(AUDIT_NAMESPACE, key, persistedBytes);
+      await this.withAuditWriteLock(async () => {
+        await this.ensureLoaded();
+        await this.freshenChainStateFromDisk();
+        const sequence = this.nextSequence;
+        const prevHash = this.lastEntryHash;
+        const entryHash = computeAuditEntryHash({
+          sequence,
+          prev_hash: prevHash,
+          timestamp: normalized.timestamp,
+          encrypted_payload_bytes: encryptedPayloadBytes,
+          schema_version: AUDIT_CHAIN_SCHEMA_VERSION,
+        });
+        const envelope: PersistedAuditEnvelopeV2 = {
+          schema_version: AUDIT_CHAIN_SCHEMA_VERSION,
+          sequence,
+          prev_hash: prevHash,
+          entry_hash: entryHash,
+          timestamp: normalized.timestamp,
+          encrypted_payload_bytes: encryptedPayloadBytes,
+        };
+        const key = `entry-${String(sequence).padStart(20, "0")}-${Date.now()}-${this.counter++}`;
+        const persistedBytes = stringToBytes(JSON.stringify(envelope));
+        try {
+          await this.writeAuditEntryBytes(key, persistedBytes);
 
-        if (options.verifyDurability) {
-          await this.verifyPersistedBytes(key, persistedBytes);
+          if (options.verifyDurability) {
+            await this.verifyPersistedBytes(key, persistedBytes);
+          }
+        } catch (err) {
+          throw toAuditPersistenceError(err);
         }
-      } catch (err) {
-        throw toAuditPersistenceError(err);
-      }
 
-      this.entries.push(normalized);
-      this.chainEntries.push({ sequence, entry_hash: entryHash });
-      this.nextSequence = sequence + 1;
-      this.lastEntryHash = entryHash;
-      this.hashesSinceCheckpoint.push(entryHash);
-      if (options.critical) {
-        this.criticalAppendsSinceCheckpoint++;
-      }
+        this.entries.push(normalized);
+        this.chainEntries.push({ sequence, entry_hash: entryHash });
+        this.nextSequence = sequence + 1;
+        this.lastEntryHash = entryHash;
+        this.hashesSinceCheckpoint.push(entryHash);
+        if (options.critical) {
+          this.criticalAppendsSinceCheckpoint++;
+        }
+      });
 
       if (
         options.critical &&
@@ -448,8 +502,12 @@ export class AuditLog {
     integrity_findings: AuditIntegrityFinding[];
   }> {
     await this.appendQueue;
-    // First, try to load persisted entries we don't have in memory
-    await this.ensureLoaded();
+    // Re-scan so read-class operations fail loud as soon as corruption appears.
+    // Reads do NOT take the cross-process write lock: stale reads are tolerable,
+    // and acquiring the write lock here would create the audit namespace dir as
+    // a side effect for fortresses that have never written, breaking
+    // non-recursive cleanup in tests that only construct an AuditLog.
+    await this.reloadPersistedEntries();
 
     let filtered = this.entries;
 
@@ -479,9 +537,123 @@ export class AuditLog {
     if (this.loaded) return;
     await this.loadPersistedEntries();
     this.loaded = true;
+    await this.reportIntegrityFindingsIfAny();
     if (this.integrityMode === "strict" && this.integrityFindings.length > 0) {
       throw new AuditIntegrityError(this.integrityFindings);
     }
+  }
+
+  private async reloadPersistedEntries(): Promise<void> {
+    await this.loadPersistedEntries();
+    this.loaded = true;
+    await this.reportIntegrityFindingsIfAny();
+    if (this.integrityMode === "strict" && this.integrityFindings.length > 0) {
+      throw new AuditIntegrityError(this.integrityFindings);
+    }
+  }
+
+  private async withAuditWriteLock<T>(operation: () => Promise<T>): Promise<T> {
+    if (!this.auditWriteLockPath) return operation();
+
+    await mkdir(this.filesystemCapabilities!.namespacePath(AUDIT_NAMESPACE), {
+      recursive: true,
+      mode: 0o700,
+    });
+    const started = Date.now();
+    let acquired = false;
+    while (!acquired) {
+      try {
+        const handle = await open(this.auditWriteLockPath, "wx", 0o600);
+        try {
+          await handle.writeFile(
+            JSON.stringify({
+              pid: process.pid,
+              acquired_at: new Date().toISOString(),
+            })
+          );
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        acquired = true;
+      } catch (err) {
+        const code =
+          err instanceof Error && "code" in err
+            ? String((err as NodeJS.ErrnoException).code)
+            : "";
+        if (code !== "EEXIST") throw err;
+        if (Date.now() - started >= AUDIT_WRITE_LOCK_TIMEOUT_MS) {
+          throw new AuditLockContentionError(this.auditWriteLockPath);
+        }
+        await sleep(AUDIT_WRITE_LOCK_RETRY_MS);
+      }
+    }
+
+    try {
+      return await operation();
+    } finally {
+      await rm(this.auditWriteLockPath, { force: true });
+    }
+  }
+
+  private async freshenChainStateFromDisk(): Promise<void> {
+    const latest = await this.readLatestPersistedChainState();
+    if (!latest) return;
+    if (latest.nextSequence > this.nextSequence) {
+      this.nextSequence = latest.nextSequence;
+      this.lastEntryHash = latest.lastEntryHash;
+    } else if (
+      latest.nextSequence === this.nextSequence &&
+      this.lastEntryHash !== latest.lastEntryHash
+    ) {
+      this.lastEntryHash = latest.lastEntryHash;
+    }
+  }
+
+  private async readLatestPersistedChainState(): Promise<{
+    nextSequence: number;
+    lastEntryHash: string;
+  } | null> {
+    const metas = await this.storage.list(AUDIT_NAMESPACE, "entry-");
+    let latest: PersistedAuditEnvelopeV2 | null = null;
+    for (const meta of metas) {
+      const raw = await this.storage.read(AUDIT_NAMESPACE, meta.key);
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(bytesToString(raw));
+        if (!isPersistedAuditEnvelopeV2(parsed)) continue;
+        if (
+          latest === null ||
+          parsed.sequence > latest.sequence ||
+          (parsed.sequence === latest.sequence &&
+            parsed.timestamp.localeCompare(latest.timestamp) > 0)
+        ) {
+          latest = parsed;
+        }
+      } catch {
+        // Full integrity verification reports malformed entries separately.
+      }
+    }
+    if (!latest) return null;
+    return {
+      nextSequence: latest.sequence + 1,
+      lastEntryHash: latest.entry_hash,
+    };
+  }
+
+  private async writeAuditEntryBytes(
+    key: string,
+    persistedBytes: Uint8Array
+  ): Promise<void> {
+    if (this.filesystemCapabilities) {
+      await this.filesystemCapabilities.writeDurable(
+        AUDIT_NAMESPACE,
+        key,
+        persistedBytes
+      );
+      return;
+    }
+    await this.storage.write(AUDIT_NAMESPACE, key, persistedBytes);
   }
 
   private async loadPersistedEntries(): Promise<void> {
@@ -623,10 +795,6 @@ export class AuditLog {
       this.lastEntryHash =
         chainedEntries.at(-1)?.envelope.entry_hash ?? legacyAnchorHash;
       this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
-      this.checkpointSpanStartSequence =
-        this.lastCheckpointSequence > 0
-          ? this.lastCheckpointSequence + 1
-          : legacyRawEntries.length + 1;
       this.integrityFindings = findings;
     } catch (err) {
       findings.push({
@@ -873,22 +1041,85 @@ export class AuditLog {
     if (this.checkpointInFlight || this.hashesSinceCheckpoint.length === 0) return;
     this.checkpointInFlight = true;
     try {
-      const checkpointSequence = this.nextSequence - 1;
-      await this.writeCheckpointRecord({
-        checkpoint_kind: "audit-checkpoint",
-        checkpoint_sequence: checkpointSequence,
-        from_sequence: this.checkpointSpanStartSequence,
-        root_hash: computeAuditRoot(this.hashesSinceCheckpoint),
-        previous_checkpoint_sequence: this.lastCheckpointSequence,
-        signed_at: new Date().toISOString(),
+      await this.withAuditWriteLock(async () => {
+        await this.freshenChainStateFromDisk();
+        const previousCheckpointSequence =
+          await this.readHighestAuditCheckpointSequence();
+        const checkpointSequence = this.nextSequence - 1;
+        const fromSequence = previousCheckpointSequence + 1;
+        const hashes = await this.collectPersistedEntryHashes(
+          fromSequence,
+          checkpointSequence
+        );
+        if (hashes.length === 0) return;
+        await this.writeCheckpointRecord({
+          checkpoint_kind: "audit-checkpoint",
+          checkpoint_sequence: checkpointSequence,
+          from_sequence: fromSequence,
+          root_hash: computeAuditRoot(hashes),
+          previous_checkpoint_sequence: previousCheckpointSequence,
+          signed_at: new Date().toISOString(),
+        });
+        this.lastCheckpointSequence = checkpointSequence;
+        this.hashesSinceCheckpoint = [];
+        this.criticalAppendsSinceCheckpoint = 0;
       });
-      this.lastCheckpointSequence = checkpointSequence;
-      this.checkpointSpanStartSequence = checkpointSequence + 1;
-      this.hashesSinceCheckpoint = [];
-      this.criticalAppendsSinceCheckpoint = 0;
     } finally {
       this.checkpointInFlight = false;
     }
+  }
+
+  private async readHighestAuditCheckpointSequence(): Promise<number> {
+    const metas = await this.storage.list(
+      AUDIT_CHECKPOINT_NAMESPACE,
+      "audit-checkpoint-"
+    );
+    let highest = 0;
+    for (const meta of metas) {
+      const raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, meta.key);
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(bytesToString(raw));
+        if (
+          isAuditCheckpointRecord(parsed) &&
+          parsed.checkpoint_kind === "audit-checkpoint" &&
+          parsed.checkpoint_sequence > highest
+        ) {
+          highest = parsed.checkpoint_sequence;
+        }
+      } catch {
+        // Full verification reports malformed checkpoints.
+      }
+    }
+    return highest;
+  }
+
+  private async collectPersistedEntryHashes(
+    fromSequence: number,
+    toSequence: number
+  ): Promise<string[]> {
+    const metas = await this.storage.list(AUDIT_NAMESPACE, "entry-");
+    const bySequence = new Map<number, string>();
+    for (const meta of metas) {
+      const raw = await this.storage.read(AUDIT_NAMESPACE, meta.key);
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(bytesToString(raw));
+        if (isPersistedAuditEnvelopeV2(parsed)) {
+          bySequence.set(parsed.sequence, parsed.entry_hash);
+        }
+      } catch {
+        // Full verification reports malformed entries.
+      }
+    }
+
+    const hashes: string[] = [];
+    for (let sequence = fromSequence; sequence <= toSequence; sequence++) {
+      const hash = bySequence.get(sequence);
+      if (!hash) break;
+      hashes.push(hash);
+    }
+    return hashes;
   }
 
   private async writeCheckpointRecord(
@@ -919,6 +1150,75 @@ export class AuditLog {
       AUDIT_CHECKPOINT_NAMESPACE,
       key,
       stringToBytes(JSON.stringify(record))
+    );
+  }
+
+  private async reportIntegrityFindingsIfAny(): Promise<void> {
+    if (this.integrityFindings.length === 0) return;
+    const signature = JSON.stringify(
+      this.integrityFindings.map((finding) => ({
+        kind: finding.kind,
+        key: finding.key,
+        sequence: finding.sequence,
+        expected: finding.expected,
+        actual: finding.actual,
+      }))
+    );
+    if (signature === this.lastIntegrityAlertSignature) return;
+    this.lastIntegrityAlertSignature = signature;
+
+    const event: AuditIntegrityAnomalyEvent = {
+      type: "audit_integrity_finding",
+      severity: "P1",
+      finding_count: this.integrityFindings.length,
+      findings: [...this.integrityFindings],
+      observed_at: new Date().toISOString(),
+    };
+
+    for (const subscriber of this.integrityAnomalySubscribers) {
+      try {
+        await subscriber(event);
+      } catch {
+        // Alert subscribers must not mask the integrity failure itself.
+      }
+    }
+
+    await this.writeIntegrityAlertLog(event).catch(() => {
+      // The caller still gets AuditIntegrityError in strict mode.
+    });
+  }
+
+  private async writeIntegrityAlertLog(
+    event: AuditIntegrityAnomalyEvent
+  ): Promise<void> {
+    const line = `${JSON.stringify({
+      observed_at: event.observed_at,
+      severity: event.severity,
+      finding_count: event.finding_count,
+      findings: event.findings.map((finding) => ({
+        kind: finding.kind,
+        key: finding.key,
+        sequence: finding.sequence,
+      })),
+    })}\n`;
+    const existing = await this.storage.read(
+      AUDIT_INTEGRITY_ALERT_NAMESPACE,
+      AUDIT_INTEGRITY_ALERT_KEY
+    );
+    const next =
+      (existing ? bytesToString(existing) : "") + line;
+    if (this.filesystemCapabilities) {
+      await this.filesystemCapabilities.writeDurable(
+        AUDIT_INTEGRITY_ALERT_NAMESPACE,
+        AUDIT_INTEGRITY_ALERT_KEY,
+        stringToBytes(next)
+      );
+      return;
+    }
+    await this.storage.write(
+      AUDIT_INTEGRITY_ALERT_NAMESPACE,
+      AUDIT_INTEGRITY_ALERT_KEY,
+      stringToBytes(next)
     );
   }
 
@@ -962,6 +1262,23 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
     if (a[i] !== b[i]) return false;
   }
   return true;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function asFilesystemCapabilities(
+  storage: StorageBackend
+): FilesystemStorageCapabilities | undefined {
+  const candidate = storage as Partial<FilesystemStorageCapabilities>;
+  if (
+    typeof candidate.namespacePath === "function" &&
+    typeof candidate.writeDurable === "function"
+  ) {
+    return candidate as FilesystemStorageCapabilities;
+  }
+  return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
