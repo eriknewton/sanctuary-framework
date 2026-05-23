@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 
 import { confirmTier1, runExitCommand } from "../../src/exit/cli.js";
+
+const CLI_PATH = join(__dirname, "../../dist/cli.js");
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -60,10 +64,38 @@ describe("Tier 1 CLI approval terminal binding", () => {
       env: { SANCTUARY_PASSPHRASE: "unused-because-approval-denies-first" },
     });
 
-    expect(code).toBe(1);
+    expect(code).toBe(78);
     expect(out.text).toBe("");
     expect(err.text).toContain("no interactive terminal available");
     expect(err.text).toContain("--yes");
     expect(err.text).toContain("Aborted.");
+  });
+
+  it("exits non-zero for piped exit export approval denial", () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        CLI_PATH,
+        "exit",
+        "export",
+        "--out",
+        "/tmp/sanctuary-f-ga-5-denied-process",
+      ],
+      {
+        input: "y\n",
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          NODE_NO_WARNINGS: "1",
+          SANCTUARY_PASSPHRASE: "unused-because-approval-denies-first",
+        },
+      },
+    );
+
+    expect(result.status).toBe(78);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("no interactive terminal available");
+    expect(result.stderr).toContain("--yes");
+    expect(result.stderr).toContain("Aborted.");
   });
 });
