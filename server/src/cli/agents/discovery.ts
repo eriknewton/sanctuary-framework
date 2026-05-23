@@ -9,9 +9,10 @@
  *      `cocoon-profile.json` or `passphrase.enc`).
  *   2. Each immediate sub-directory of the default root that itself looks
  *      initialized — included as a tenant named after its directory basename.
- *   3. Any additional paths listed in `SANCTUARY_AGENTS_EXTRA_PATHS`
- *      (colon-separated) OR in `<default-root>/agents-extra.json`. These let
- *      users register tenants whose storage lives outside `~/.sanctuary/`.
+ *   3. Any additional paths listed in `SANCTUARY_AGENTS_EXTRA_PATHS`,
+ *      `<default-root>/agents-extra.json`, or the wrap-maintained
+ *      `<default-root>/tenants.json`. These let users register tenants whose
+ *      storage lives outside `~/.sanctuary/`.
  *
  * The `TenantDescriptor` never contains secrets. The `keychain_service` is
  * a stable hash of the path (same function `passphrase.keychainServiceFor`
@@ -28,6 +29,7 @@ import {
   readTenantRuntime,
   type TenantRuntimeState,
 } from "./runtime.js";
+import { readHostTenantRegistry } from "./tenant-registry.js";
 
 export type PassphraseStatus =
   | "keychain"
@@ -139,7 +141,8 @@ async function newestAuditMtime(storagePath: string): Promise<string | null> {
 
 async function readExtraPaths(
   root: string,
-  env: NodeJS.ProcessEnv
+  env: NodeJS.ProcessEnv,
+  options: { home: string; root: string }
 ): Promise<string[]> {
   const out: string[] = [];
   const fromEnv = env.SANCTUARY_AGENTS_EXTRA_PATHS;
@@ -159,6 +162,17 @@ async function readExtraPaths(
     }
   } catch {
     // no extras file — fine.
+  }
+  try {
+    const registry = await readHostTenantRegistry(options);
+    for (const tenant of registry.tenants) {
+      if (tenant.storage_path.trim().length > 0) {
+        out.push(resolve(tenant.storage_path));
+      }
+    }
+  } catch {
+    // Bad registry state should not break discovery; describeTenant below
+    // still filters entries to real Sanctuary-looking directories.
   }
   // De-duplicate.
   return Array.from(new Set(out));
@@ -228,7 +242,7 @@ export async function discoverTenants(
   }
 
   // 3. Extras (env + file).
-  const extras = await readExtraPaths(root, env);
+  const extras = await readExtraPaths(root, env, { home, root });
   for (const extra of extras) {
     if (tenants.some((t) => t.storage_path === extra)) continue;
     const desc = await describeTenant(basename(extra), extra, home);

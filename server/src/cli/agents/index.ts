@@ -29,6 +29,15 @@ export {
 } from "./runtime.js";
 
 export {
+  registerHostTenant,
+  readHostTenantRegistry,
+  TENANTS_REGISTRY_FILE_NAME,
+  type HostTenantRegistry,
+  type HostTenantRegistryEntry,
+  type HostTenantRegistryOptions,
+} from "./tenant-registry.js";
+
+export {
   runAgentsCommand,
   printAgentsHelp,
   type AgentsCommandArgs,

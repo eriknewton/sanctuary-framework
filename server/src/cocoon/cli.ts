@@ -72,6 +72,10 @@ import { SANCTUARY_VERSION } from "../config.js";
 import { resolveStoragePath, resolveDashboardPort } from "../paths.js";
 import { writeTenantRuntime, clearTenantRuntime } from "../cli/agents/runtime.js";
 import {
+  registerHostTenant,
+  TENANTS_REGISTRY_FILE_NAME,
+} from "../cli/agents/tenant-registry.js";
+import {
   disclosePassphrase,
   PassphraseConfirmationDeclinedError,
   PassphraseConfirmationNonInteractiveError,
@@ -694,6 +698,17 @@ export async function runWrap(
   // config is already rewritten and operational; a missing dashboard
   // record is a UX degradation, not a security one). The error is
   // surfaced on stderr so operators can re-run later if needed.
+  try {
+    await registerHostTenant(storagePath);
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Note: host tenant registry not updated ` +
+        `(${(err as Error).message}). ` +
+        `Re-run \`sanctuary wrap\` to retry, or check permissions on ~/.sanctuary/${TENANTS_REGISTRY_FILE_NAME}.`,
+    );
+  }
+
   try {
     upsertPersistedLocalAgent(
       storagePath,

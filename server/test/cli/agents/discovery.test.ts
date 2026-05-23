@@ -15,6 +15,7 @@ import {
   findTenant,
 } from "../../../src/cli/agents/discovery.js";
 import { writeTenantRuntime } from "../../../src/cli/agents/runtime.js";
+import { registerHostTenant } from "../../../src/cli/agents/tenant-registry.js";
 
 async function makeTenantLayout(
   root: string,
@@ -169,6 +170,30 @@ describe("cli/agents/discovery", () => {
     try {
       const tenants = await discoverTenants({ home, env: {} });
       expect(tenants.map((t) => t.name)).toContain("file-agent");
+    } finally {
+      await rm(extraHome, { recursive: true, force: true });
+    }
+  });
+
+  it("includes wrapped tenants from tenants.json", async () => {
+    const extraHome = await mkdtemp(join(tmpdir(), "sanctuary-registry-"));
+    const alphaPath = join(extraHome, "alpha-fortress");
+    const bravoPath = join(extraHome, "bravo-fortress");
+    await makeTenantLayout(extraHome, "alpha-fortress", { withState: true });
+    await makeTenantLayout(extraHome, "bravo-fortress", { withState: true });
+    try {
+      await registerHostTenant(alphaPath, { home });
+      await registerHostTenant(bravoPath, { home });
+
+      const tenants = await discoverTenants({ home, env: {} });
+      expect(tenants.map((t) => t.name)).toEqual([
+        "alpha-fortress",
+        "bravo-fortress",
+      ]);
+      expect(tenants.map((t) => t.storage_path)).toEqual([
+        alphaPath,
+        bravoPath,
+      ]);
     } finally {
       await rm(extraHome, { recursive: true, force: true });
     }
