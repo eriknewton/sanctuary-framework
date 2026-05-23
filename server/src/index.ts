@@ -1191,6 +1191,7 @@ export async function createSanctuaryServer(options?: {
   // 17a. Create governor tools
   const { tools: governorTools } = createGovernorTools(governor, auditLog);
   allTools.push(...governorTools);
+  allTools = classifyMcpTools(allTools);
 
   const profile = profileStore.get();
   if (profile.upstream_servers && profile.upstream_servers.length > 0) {
@@ -1297,6 +1298,7 @@ export async function createSanctuaryServer(options?: {
   // 19. Create MCP server with approval gate (proxy tools are included in allTools)
   const server = createServer(allTools, {
     gate,
+    auditLog,
     toolCallTrapRuntime,
     currentAgentId: () => process.env.SANCTUARY_AGENT_ID,
   });
@@ -1343,6 +1345,108 @@ export async function createSanctuaryServer(options?: {
     auditLog,
     policy,
   };
+}
+
+const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
+  "audit_export_siem",
+  "bootstrap_create_escrow",
+  "bootstrap_provide_guarantee",
+  "bridge_attest",
+  "bridge_commit",
+  "compliance_generate_eu_ai_act_bundle",
+  "context_gate_apply_template",
+  "context_gate_enforcer_configure",
+  "context_gate_filter",
+  "context_gate_set_policy",
+  "dashboard_open",
+  "disclosure_evaluate",
+  "disclosure_set_policy",
+  "federation_trust_evaluate",
+  "governor_reset",
+  "handshake_abort",
+  "handshake_complete",
+  "handshake_exchange",
+  "handshake_initiate",
+  "handshake_respond",
+  "handshake_verify_attestation",
+  "identity_create",
+  "identity_import",
+  "identity_rotate",
+  "identity_set_primary",
+  "identity_sign",
+  "memory_attest",
+  "proof_reveal",
+  "reputation_export",
+  "reputation_import",
+  "reputation_publish",
+  "reputation_record",
+  "sanctuary/sign_erc8004_identity",
+  "sanctuary_bootstrap",
+  "sanctuary_export_identity_bundle",
+  "sanctuary_link_to_human",
+  "sanctuary_sign_challenge",
+  "shr_gateway_export",
+  "shr_generate",
+  "state_delete",
+  "state_export",
+  "state_import",
+  "state_write",
+  "sovereignty_profile_generate_prompt",
+  "sovereignty_profile_update",
+  "zk_commit",
+  "zk_prove",
+  "zk_range_prove",
+] as const);
+
+const READ_MCP_TOOLS: ReadonlySet<string> = new Set([
+  "bridge_verify",
+  "compliance_eu_ai_act_annex_iii_classify",
+  "context_gate_enforcer_status",
+  "context_gate_list_policies",
+  "context_gate_recommend",
+  "exec_attest",
+  "federation_peers",
+  "federation_status",
+  "governor_status",
+  "handshake_status",
+  "identity_list",
+  "identity_verify",
+  "l2_hardening_status",
+  "l2_verify_isolation",
+  "manifest",
+  "monitor_audit_log",
+  "monitor_health",
+  "principal_baseline_view",
+  "principal_policy_view",
+  "proof_commitment",
+  "reputation_query",
+  "reputation_query_weighted",
+  "sanctuary_policy_status",
+  "shr_verify",
+  "sovereignty_audit",
+  "sovereignty_profile_get",
+  "state_list",
+  "state_read",
+  "zk_range_verify",
+  "zk_verify",
+] as const);
+
+function classifyMcpTools(tools: ToolDefinition[]): ToolDefinition[] {
+  return tools.map((tool) => {
+    if (tool.name.startsWith("proxy/")) {
+      return { ...tool, tool_class: "write" };
+    }
+    if (WRITE_MCP_TOOLS.has(tool.name)) {
+      return { ...tool, tool_class: "write" };
+    }
+    if (READ_MCP_TOOLS.has(tool.name)) {
+      return { ...tool, tool_class: "read" };
+    }
+    if (tool.tool_class === "read" || tool.tool_class === "write") {
+      return tool;
+    }
+    throw new Error(`No MCP tool_class classification for registered tool: ${tool.name}`);
+  });
 }
 
 export { loadConfig, type SanctuaryConfig } from "./config.js";

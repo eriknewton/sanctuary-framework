@@ -17,6 +17,7 @@ import {
 import { createRequire } from "node:module";
 import type { ApprovalGate } from "./principal-policy/gate.js";
 import type { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
+import type { AuditLog } from "./l2-operational/audit-log.js";
 
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
@@ -30,6 +31,7 @@ export type ToolHandler = (
 export interface ToolDefinition {
   name: string;
   description: string;
+  tool_class?: "read" | "write";
   inputSchema: Record<string, unknown>;
   handler: ToolHandler;
 }
@@ -42,6 +44,8 @@ export interface ServerOptions {
   toolCallTrapRuntime?: ToolCallTrapRuntime;
   /** Current wrapped-agent id for per-agent catalog visibility. */
   currentAgentId?: () => string | undefined;
+  /** Audit log used to enforce MCP read/write behavior on broken chains. */
+  auditLog?: AuditLog;
 }
 
 // ── Schema Validation ──────────────────────────────────────────────────
@@ -78,7 +82,8 @@ interface ValidationError {
  */
 function validateArgs(
   args: Record<string, unknown>,
-  schema: Record<string, unknown>
+  schema: Record<string, unknown>,
+  extraAllowedFields: Record<string, SchemaProperty> = {}
 ): ValidationError[] {
   const errors: ValidationError[] = [];
   const properties = (schema.properties ?? {}) as Record<string, SchemaProperty>;
@@ -92,7 +97,10 @@ function validateArgs(
   }
 
   // Check for unknown fields (reject extra fields not in schema)
-  const knownFields = new Set(Object.keys(properties));
+  const knownFields = new Set([
+    ...Object.keys(properties),
+    ...Object.keys(extraAllowedFields),
+  ]);
   for (const field of Object.keys(args)) {
     if (!knownFields.has(field)) {
       errors.push({ field, message: `Unknown field "${field}"` });
@@ -102,7 +110,7 @@ function validateArgs(
   // Type-check and size-check each provided field
   for (const [field, value] of Object.entries(args)) {
     if (value === undefined || value === null) continue;
-    const propSchema = properties[field];
+    const propSchema = properties[field] ?? extraAllowedFields[field];
     if (!propSchema) continue; // Already flagged as unknown above
 
     const typeError = checkType(field, value, propSchema);
@@ -176,6 +184,17 @@ function checkType(
   return null;
 }
 
+export function assertToolClasses(tools: readonly ToolDefinition[]): void {
+  const missing = tools
+    .filter((tool) => tool.tool_class !== "read" && tool.tool_class !== "write")
+    .map((tool) => tool.name);
+  if (missing.length > 0) {
+    throw new Error(
+      `Registered MCP tools missing tool_class: ${missing.join(", ")}`
+    );
+  }
+}
+
 /**
  * Create the MCP server with all Sanctuary tools registered.
  * If an ApprovalGate is provided, it wraps every tool call.
@@ -185,6 +204,7 @@ export function createServer(
   options?: ServerOptions
 ): Server {
   const gate = options?.gate;
+  assertToolClasses(tools);
 
   const server = new Server(
     {
@@ -259,7 +279,13 @@ export function createServer(
     // ── Schema Validation ────────────────────────────────────────────
     // Validate arguments against the tool's declared inputSchema.
     // This runs BEFORE the gate so that the gate sees normalized args.
-    const validationErrors = validateArgs(typedArgs, tool.inputSchema);
+    const validationErrors = validateArgs(
+      typedArgs,
+      tool.inputSchema,
+      tool.tool_class === "write"
+        ? { accept_broken_chain: { type: "boolean", default: false } }
+        : {}
+    );
     if (validationErrors.length > 0) {
       return {
         content: [
@@ -311,7 +337,50 @@ export function createServer(
     }
 
     try {
-      const result = await tool.handler(typedArgs);
+      const findings = await options?.auditLog?.getIntegrityFindings();
+      const hasIntegrityFindings = (findings?.length ?? 0) > 0;
+      const acceptBrokenChain = typedArgs.accept_broken_chain === true;
+
+      if (tool.tool_class === "write" && hasIntegrityFindings && !acceptBrokenChain) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                error: `${findings!.length} audit integrity findings detected`,
+                audit_integrity_findings: findings,
+                accept_broken_chain_required: true,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const runHandler = async () => {
+        if (tool.tool_class === "write" && hasIntegrityFindings && acceptBrokenChain) {
+          await options?.auditLog?.appendCritical({
+            layer: "l2",
+            operation: "mcp_accept_broken_chain_override",
+            identity_id: callerIdentity,
+            result: "success",
+            details: {
+              tool: name,
+              finding_count: findings!.length,
+              findings,
+            },
+          });
+        }
+        return tool.handler(typedArgs);
+      };
+
+      const shouldBypassAuditIntegrity =
+        tool.tool_class === "read" ||
+        (tool.tool_class === "write" && hasIntegrityFindings && acceptBrokenChain);
+      const result =
+        shouldBypassAuditIntegrity && options?.auditLog
+          ? await options.auditLog.runAllowingIntegrityFindings(runHandler)
+          : await runHandler();
       options?.toolCallTrapRuntime?.recordToolCall(
         name,
         typedArgs,

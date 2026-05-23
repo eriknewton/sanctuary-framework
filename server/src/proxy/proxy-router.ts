@@ -110,6 +110,7 @@ export class ProxyRouter {
         tools.push({
           name: proxyName,
           description: `[via ${serverName}] ${upstreamTool.description}`,
+          tool_class: "write",
           inputSchema: upstreamTool.inputSchema,
           handler: this.createHandler(serverName, upstreamTool.name),
         });
