@@ -244,6 +244,10 @@ export class AuditLog {
         this.filesystemCapabilities.namespacePath(AUDIT_NAMESPACE),
         AUDIT_WRITE_LOCK_FILE
       );
+      // SAFETY: one-time startup announcement of the audit-write coordination
+      // mechanism. Operators need to see this so they can locate the lock file
+      // and inspect lsof on it if writes appear stuck. Goes to stderr-equivalent
+      // console.info, which is operator-facing diagnostic surface, not telemetry.
       console.info(
         `[audit-log] cross-process file locking enabled: ${this.auditWriteLockPath}`
       );
