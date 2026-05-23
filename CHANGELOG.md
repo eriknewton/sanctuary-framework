@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.2] - 2026-05-22
+
+Patch release. Closes the v1.3.1 Mini1 drill findings: F-1.3.1-N-001 (P0 audit-chain seq-duplication race under concurrent writes), F-1.3.1-N-004 (P0 MCP read tools refused to run on a fortress with audit integrity findings), plus F-GA-3, F-GA-4, F-GA-6, F-GA-8, F-GA-9, F-GA-10/11/12, F-1.3.1-N-002, F-1.3.1-N-005, F-1.3.1-N-006. The audit chain now holds under concurrent dashboard + CLI write load, and a fortress whose chain has accumulated integrity findings remains introspectable through read-class MCP tools.
+
+Full release notes: [docs/releases/v1.3.2.md](docs/releases/v1.3.2.md).
+
+## [1.3.1] - 2026-05-22
+
+Autonomous patch cascade closing five v1.3.0 GA Mini1 drill findings: F-GA-1 (P0 destructive `--fortress` quarantine), F-GA-2 (subcommand `--help` SANCTUARY_PASSPHRASE requirement), F-GA-3 (per-subcommand help — partial, 2 of 10 subcommands), F-GA-5 (Tier 1 OOB approval accepting stdin-piped `y`), F-GA-7 (import-exit-bundle silent state-skip warning). Released via OIDC Trusted Publishing.
+
 ## [1.3.0] - 2026-05-22
 
 v1.3.0 GA: the Castle Architecture ships. Real Castle Layer 1 enforcement on Linux and macOS, four-layer architecture (Castle Wall + Sentinels + Cooperative MCP + Concordia/Verascore receipts and reputation), Mantle install-time substrate binding, synthetic-coverage harness with gate_a_green across 17 of 20 assurance rows.
