@@ -23,6 +23,8 @@ import type { ExitBundleDidWebBinding } from "../contracts/v1.1/exit-bundle-mani
 import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
 import { loadFortressDidWebRecord } from "../recognition/did-web.js";
 
+const EXIT_EXPORT_ABORTED_EXIT_CODE = 78;
+
 export interface ExitCommandArgs {
   argv: string[];
   out?: Writable;
@@ -302,7 +304,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       );
       if (!approved) {
         write(err, "Aborted.\n");
-        return 1;
+        return EXIT_EXPORT_ABORTED_EXIT_CODE;
       }
       const config = await loadConfig();
       const ctx = await openExitContext(argv, env);
