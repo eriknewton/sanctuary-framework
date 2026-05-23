@@ -894,11 +894,15 @@ export async function runWrap(
             "passphrase",
           );
           await identityMgr.save(storedIdentity);
-          wrapAuditLog.append("l1", "identity_create", publicIdentity.identity_id, {
+          await wrapAuditLog.append("l1", "identity_create", publicIdentity.identity_id, {
             label: "default",
             source: "wrap-auto",
           });
         }
+        dashboard.updateSources?.({
+          auditLog: wrapAuditLog,
+          identityManager: identityMgr,
+        });
       } catch (err) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
