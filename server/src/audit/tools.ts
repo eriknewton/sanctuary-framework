@@ -10,11 +10,18 @@
 
 import type { ToolDefinition } from "../router.js";
 import type { SanctuaryConfig } from "../config.js";
+import {
+  AuditIntegrityError,
+  type AuditIntegrityFinding,
+  type AuditLog,
+} from "../l2-operational/audit-log.js";
 import { detectEnvironment } from "./detector.js";
 import { analyzeSovereignty, formatAuditReport } from "./analyzer.js";
+import type { AuditSubsystemHealth } from "./types.js";
 
 export function createAuditTools(
-  config: SanctuaryConfig
+  config: SanctuaryConfig,
+  auditLog?: Pick<AuditLog, "query">
 ): { tools: ToolDefinition[] } {
   const tools: ToolDefinition[] = [
     {
@@ -40,6 +47,7 @@ export function createAuditTools(
 
         // Detect environment (read-only)
         const env = await detectEnvironment(config, deepScan);
+        env.audit_subsystem_health = await detectAuditSubsystemHealth(auditLog);
 
         // Analyze sovereignty posture
         const result = analyzeSovereignty(env, config);
@@ -58,4 +66,38 @@ export function createAuditTools(
   ];
 
   return { tools };
+}
+
+async function detectAuditSubsystemHealth(
+  auditLog?: Pick<AuditLog, "query">
+): Promise<AuditSubsystemHealth | undefined> {
+  if (!auditLog) return undefined;
+
+  try {
+    const result = await auditLog.query({ limit: 0 });
+    return {
+      integrity_findings: result.integrity_findings,
+      exit_export_aborted_by_integrity_gate: false,
+      mcp_tools_bricked_by_integrity_gate: false,
+    };
+  } catch (err) {
+    if (err instanceof AuditIntegrityError) {
+      const findings = [...err.findings] as AuditIntegrityFinding[];
+      return {
+        integrity_findings: findings,
+        exit_export_aborted_by_integrity_gate: hasScoreDeductedFinding(findings),
+        mcp_tools_bricked_by_integrity_gate: hasScoreDeductedFinding(findings),
+      };
+    }
+    throw err;
+  }
+}
+
+function hasScoreDeductedFinding(findings: AuditIntegrityFinding[]): boolean {
+  return findings.some((finding) =>
+    finding.kind === "sequence_gap_or_reorder" ||
+    finding.kind === "prev_hash_mismatch" ||
+    finding.kind === "entry_hash_mismatch" ||
+    finding.kind === "checkpoint_root_mismatch"
+  );
 }

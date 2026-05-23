@@ -592,7 +592,7 @@ export async function createSanctuaryServer(options?: {
   );
 
   // 14d. Create Sovereignty Audit tools (read-only diagnostic)
-  const { tools: auditTools } = createAuditTools(config);
+  const { tools: auditTools } = createAuditTools(config, auditLog);
 
   // 14d2. Create SIEM Export tools (Tier 2 — CEF and OCSF export)
   const { tools: siemTools } = createSIEMTools(auditLog);

@@ -31,8 +31,32 @@ export interface EnvironmentFingerprint {
   openclaw_detected: boolean;
   openclaw_version: string | null;
   openclaw_config: OpenClawConfigAudit | null;
+  audit_subsystem_health?: AuditSubsystemHealth;
   node_version: string;
   platform: string;
+}
+
+export type AuditSubsystemFindingKind =
+  | "sequence_gap"
+  | "sequence_gap_or_reorder"
+  | "prev_hash_mismatch"
+  | "entry_hash_mismatch"
+  | "checkpoint_root_mismatch"
+  | string;
+
+export interface AuditSubsystemFinding {
+  kind: AuditSubsystemFindingKind;
+  message?: string;
+  key?: string;
+  sequence?: number;
+  expected?: string | number;
+  actual?: string | number;
+}
+
+export interface AuditSubsystemHealth {
+  integrity_findings: AuditSubsystemFinding[];
+  exit_export_aborted_by_integrity_gate: boolean;
+  mcp_tools_bricked_by_integrity_gate: boolean;
 }
 
 export interface OpenClawConfigAudit {
