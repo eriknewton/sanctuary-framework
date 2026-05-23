@@ -503,7 +503,11 @@ export class AuditLog {
   }> {
     await this.appendQueue;
     // Re-scan so read-class operations fail loud as soon as corruption appears.
-    await this.withAuditWriteLock(() => this.reloadPersistedEntries());
+    // Reads do NOT take the cross-process write lock: stale reads are tolerable,
+    // and acquiring the write lock here would create the audit namespace dir as
+    // a side effect for fortresses that have never written, breaking
+    // non-recursive cleanup in tests that only construct an AuditLog.
+    await this.reloadPersistedEntries();
 
     let filtered = this.entries;
 
