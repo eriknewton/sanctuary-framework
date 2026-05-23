@@ -44,6 +44,7 @@ describe("CLI help routing", () => {
     expect(code).toBe(0);
     expect(stdout).toContain("sanctuary wrap. Wrap any agent");
     expect(stdout).toContain("--openclaw");
+    expect(stdout).toContain("--dashboard-port <port>");
     expect(stdout).not.toContain("Sovereignty infrastructure for agents");
   });
 

@@ -1482,6 +1482,7 @@ const WRAP_VALUE_FLAGS = new Set([
   "--wrap",
   "--passphrase",
   "--port",
+  "--dashboard-port",
   "--fortress",
   "--dev-dist",
   "--write-passphrase-backup",
@@ -1504,6 +1505,21 @@ const WRAP_BOOLEAN_FLAGS = new Set([
 
 /** Known harness flags (for "did you mean" suggestions). */
 const WRAP_HARNESS_FLAGS = ["--openclaw", "--hermes", "--claude-code", "--cursor", "--cline"];
+
+function parseDashboardPortFlag(flag: string, value: string | undefined): number {
+  if (value === undefined || value.startsWith("-")) {
+    throw new Error(`${flag} requires a port value (1024-65535).`);
+  }
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${flag} must be a positive integer from 1024 to 65535.`);
+  }
+
+  const port = Number(value);
+  if (!Number.isSafeInteger(port) || port < 1024 || port > 65535) {
+    throw new Error(`${flag} must be a positive integer from 1024 to 65535.`);
+  }
+  return port;
+}
 
 export function parseWrapArgs(argv: string[]): WrapOptions {
   const options: WrapOptions = {};
@@ -1555,7 +1571,8 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         options.passphrase = argv[++i];
         break;
       case "--port":
-        options.port = parseInt(argv[++i]!, 10);
+      case "--dashboard-port":
+        options.port = parseDashboardPortFlag(arg, argv[++i]);
         break;
       case "--dry-run":
         options.dryRun = true;
@@ -1616,6 +1633,9 @@ function printWrapHelp(): void {
                        absent. Use to keep multiple fortresses isolated
                        on one host.
     --port <port>      Preferred dashboard port (default: 3501)
+    --dashboard-port <port>
+                       Preferred dashboard port (1024-65535). Overrides
+                       SANCTUARY_DASHBOARD_PORT when both are set.
     --dry-run          Show what would happen without making changes
     --no-open          Do not auto-open the dashboard in a browser
     --no-dashboard     Do not spawn a per-call dashboard server. Wrap still
