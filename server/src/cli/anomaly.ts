@@ -79,6 +79,10 @@ export async function runAnomalyCommand(
       case "list-subscribed":
         return await cmdListSubscribed({ out, args });
       case "subscribe":
+        if (wantsHelp(rest)) {
+          printAnomalySubscribeHelp(out);
+          return 0;
+        }
         return await cmdSubscribe(rest, { out, err, args });
       case "unsubscribe":
         return await cmdUnsubscribe(rest, { out, err, args });
@@ -96,6 +100,36 @@ export async function runAnomalyCommand(
     err.write(`sanctuary anomaly: ${msg}\n`);
     return 1;
   }
+}
+
+function wantsHelp(argv: string[]): boolean {
+  return argv.includes("--help") || argv.includes("-h");
+}
+
+export function printAnomalySubscribeHelp(
+  s: NodeJS.WritableStream = process.stdout,
+): void {
+  s.write(`sanctuary anomaly subscribe. Opt a fortress into an anomaly detector/classifier tuple.
+
+Usage:
+  sanctuary anomaly subscribe <detector-id> --classifier <id>
+
+Description:
+  Adds the detector/classifier tuple to this fortress's anomaly subscription
+  file. The running server picks up the subscription on boot or the next
+  dispatcher tick.
+
+Arguments:
+  <detector-id>        Detector identifier from "sanctuary anomaly detectors list".
+
+Options:
+  --classifier <id>   Classifier identifier paired with the detector.
+  --help, -h          Show this help.
+
+Examples:
+  sanctuary anomaly detectors list
+  sanctuary anomaly subscribe psi-drift --classifier baseline
+`);
 }
 
 function printUsage(s: NodeJS.WritableStream): void {
