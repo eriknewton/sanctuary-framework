@@ -31,10 +31,14 @@
  *   pairs; they are forward-only by design.
  */
 
-import { mkdir, readFile, writeFile, unlink, readdir, stat } from "node:fs/promises";
+import { mkdir, open, readFile, writeFile, unlink, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { randomBytes } from "../core/random.js";
-import type { StorageBackend, StorageEntryMeta } from "./interface.js";
+import type {
+  FilesystemStorageCapabilities,
+  StorageBackend,
+  StorageEntryMeta,
+} from "./interface.js";
 
 const SAFE_CHARS = /[^A-Za-z0-9_.\-]/g;
 
@@ -59,7 +63,7 @@ function legacyKeySanitize(name: string): string {
   return name.replace(/[^a-zA-Z0-9_.-]/g, "_");
 }
 
-export class FilesystemStorage implements StorageBackend {
+export class FilesystemStorage implements StorageBackend, FilesystemStorageCapabilities {
   private basePath: string;
 
   constructor(basePath: string) {
@@ -72,7 +76,7 @@ export class FilesystemStorage implements StorageBackend {
     return join(this.basePath, safeNamespace, `${safeKey}.enc`);
   }
 
-  private namespacePath(namespace: string): string {
+  namespacePath(namespace: string): string {
     return join(this.basePath, bijectiveEncode(namespace));
   }
 
@@ -99,6 +103,24 @@ export class FilesystemStorage implements StorageBackend {
 
     // Write file with restrictive permissions (owner read/write only)
     await writeFile(filePath, data, { mode: 0o600 });
+  }
+
+  async writeDurable(
+    namespace: string,
+    key: string,
+    data: Uint8Array
+  ): Promise<void> {
+    const dirPath = this.namespacePath(namespace);
+    const filePath = this.entryPath(namespace, key);
+
+    await mkdir(dirPath, { recursive: true, mode: 0o700 });
+    const handle = await open(filePath, "w", 0o600);
+    try {
+      await handle.writeFile(data);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
   }
 
   async read(namespace: string, key: string): Promise<Uint8Array | null> {
