@@ -1,4 +1,5 @@
 import { readTenantRuntime } from "./agents/runtime.js";
+import { dashboardRequest } from "./dashboard-request.js";
 import {
   TASK_STATUSES,
   type Task,
@@ -16,8 +17,6 @@ interface TaskCliContext {
   dashboardUrl?: string;
   fortressPath?: string;
 }
-
-const DEFAULT_DASHBOARD_URL = "http://127.0.0.1:3502";
 
 export async function runTaskCommand(args: TaskCliArgs): Promise<number> {
   const out = args.out ?? process.stdout;
@@ -219,30 +218,7 @@ async function cancel(
   return 0;
 }
 
-async function request(
-  path: string,
-  init?: RequestInit,
-  ctx?: TaskCliContext,
-): Promise<any> {
-  const base = (ctx?.dashboardUrl ?? process.env.SANCTUARY_DASHBOARD_URL ?? DEFAULT_DASHBOARD_URL).replace(/\/$/, "");
-  const token = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN ?? "";
-  const headers = new Headers(init?.headers);
-  headers.set("Accept", "application/json");
-  if (init?.body) headers.set("Content-Type", "application/json");
-  if (token) headers.set("Authorization", `Bearer ${token}`);
-  const res = await fetch(`${base}${path}`, { ...init, headers });
-  const body = (await res.json().catch(() => ({}))) as {
-    ok?: boolean;
-    error?: unknown;
-    detail?: unknown;
-  };
-  if (!res.ok || body.ok === false) {
-    throw new Error(
-      body.detail ? String(body.detail) : body.error ? String(body.error) : `HTTP ${res.status}`,
-    );
-  }
-  return body;
-}
+const request = dashboardRequest;
 
 async function resolveContext(
   argv: string[],

@@ -235,8 +235,65 @@ describe("sanctuary inbox approvals CLI", () => {
 
     expect(code).toBe(1);
     expect(out.text).toBe("");
-    expect(err.text).toContain("sanctuary inbox: not_found");
+    expect(err.text).toContain("sanctuary inbox: endpoint not implemented in this build (HTTP 404): not_found");
   });
+
+  it("approvals list names network/connection failures with a remediation hint", async () => {
+    globalThis.fetch = vi.fn(async () => {
+      throw new TypeError("fetch failed", { cause: new Error("ECONNREFUSED") });
+    }) as unknown as typeof globalThis.fetch;
+
+    const { code, out, err } = await run(["approvals", "list"]);
+
+    expect(code).toBe(1);
+    expect(out.text).toBe("");
+    expect(err.text).toContain("sanctuary inbox: network/connection failure: fetch failed");
+    expect(err.text).toContain("ECONNREFUSED");
+    expect(err.text).toContain("Hint: start the Sanctuary dashboard");
+  });
+
+  it.each([
+    [
+      "404",
+      404,
+      { ok: false, error: "route missing" },
+      "endpoint not implemented in this build (HTTP 404): route missing",
+      "verify the dashboard exposes /api/hub/inbox",
+    ],
+    [
+      "401",
+      401,
+      { ok: false, error: "unauthorized" },
+      "auth/policy denied (HTTP 401): unauthorized",
+      "check SANCTUARY_DASHBOARD_AUTH_TOKEN",
+    ],
+    [
+      "403",
+      403,
+      { ok: false, error: "policy denied" },
+      "auth/policy denied (HTTP 403): policy denied",
+      "operator authorization",
+    ],
+    [
+      "500",
+      500,
+      { ok: false, error: "boom" },
+      "server error (HTTP 500): boom",
+      "inspect the dashboard logs",
+    ],
+  ])(
+    "approvals list names HTTP %s failure class",
+    async (_label, status, payload, expectedClass, expectedHint) => {
+      globalThis.fetch = vi.fn(async () => okJson(payload, status)) as unknown as typeof globalThis.fetch;
+
+      const { code, out, err } = await run(["approvals", "list"]);
+
+      expect(code).toBe(1);
+      expect(out.text).toBe("");
+      expect(err.text).toContain(`sanctuary inbox: ${expectedClass}`);
+      expect(err.text).toContain(expectedHint);
+    },
+  );
 
   it("documents the approvals subcommands in help", async () => {
     const { code, out, err } = await run(["--help"]);
