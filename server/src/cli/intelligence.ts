@@ -19,6 +19,10 @@ function flagValue(argv: string[], name: string): string | undefined {
   return argv[index + 1];
 }
 
+function hasFlag(argv: string[], name: string): boolean {
+  return argv.includes(name);
+}
+
 export async function runIntelligenceCommand(
   opts: IntelligenceCommandOpts,
 ): Promise<number> {
@@ -85,6 +89,7 @@ Examples:
 }
 
 async function runDiagnose(argv: string[] = []): Promise<number> {
+  const json = hasFlag(argv, "--json");
   const fortressFlag = flagValue(argv, "--fortress") ?? flagValue(argv, "--fortress-path");
   const storagePath = resolve(
     fortressFlag ??
@@ -93,13 +98,83 @@ async function runDiagnose(argv: string[] = []): Promise<number> {
       `${process.env.HOME}/.sanctuary`,
   );
 
+  const intelligenceDir = resolve(storagePath, "state", "_intelligence");
+  const auditDir = resolve(storagePath, "state", "_audit");
+  const environment = [
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "VENICE_API_KEY",
+    "OLLAMA_HOST",
+  ].map((key) => {
+    const value = process.env[key];
+    return {
+      key,
+      set: Boolean(value),
+      prefix: value ? `${value.slice(0, 4)}...` : null,
+    };
+  });
+
+  if (json) {
+    let intelligenceEntries: string[] = [];
+    let intelligenceReadError: string | null = null;
+    let auditFiles: string[] = [];
+    let auditTotal = 0;
+    let auditReadError: string | null = null;
+
+    if (existsSync(intelligenceDir)) {
+      try {
+        intelligenceEntries = readdirSync(intelligenceDir);
+      } catch (error) {
+        intelligenceReadError =
+          error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    if (existsSync(auditDir)) {
+      try {
+        const files = readdirSync(auditDir).sort().reverse();
+        auditTotal = files.length;
+        auditFiles = files.slice(0, 20);
+      } catch (error) {
+        auditReadError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    const initialized = existsSync(intelligenceDir);
+    // SAFETY: stdout is the requested machine-readable CLI channel for --json.
+    console.log(
+      JSON.stringify(
+        {
+          ok: initialized && intelligenceReadError === null,
+          fortress: storagePath,
+          intelligence: {
+            directory: intelligenceDir,
+            exists: initialized,
+            entries: intelligenceEntries,
+            read_error: intelligenceReadError,
+          },
+          audit: {
+            directory: auditDir,
+            exists: existsSync(auditDir),
+            recent_entries: auditFiles,
+            total_entries: auditTotal,
+            read_error: auditReadError,
+          },
+          environment,
+        },
+        null,
+        2,
+      ),
+    );
+    return initialized ? 0 : 1;
+  }
+
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`Intelligence substrate diagnostics`);
   console.error(`Fortress: ${storagePath}`);
   console.error("");
 
   // Check for intelligence config in the state directory
-  const intelligenceDir = resolve(storagePath, "state", "_intelligence");
   if (!existsSync(intelligenceDir)) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
@@ -134,7 +209,6 @@ async function runDiagnose(argv: string[] = []): Promise<number> {
   }
 
   // Check audit log for intelligence failures
-  const auditDir = resolve(storagePath, "state", "_audit");
   if (existsSync(auditDir)) {
     try {
       const auditFiles = readdirSync(auditDir).sort().reverse();
