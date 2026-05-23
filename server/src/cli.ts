@@ -768,6 +768,9 @@ function printWrapHelpEarly(): void {
                        absent. Use to keep multiple fortresses isolated
                        on one host.
     --port <port>      Preferred dashboard port (default: 3501)
+    --dashboard-port <port>
+                       Preferred dashboard port (1024-65535). Overrides
+                       SANCTUARY_DASHBOARD_PORT when both are set.
     --dry-run          Show what would happen without making changes
     --no-open          Do not auto-open the dashboard in a browser
     --no-dashboard     Do not spawn a per-call dashboard server. Wrap still
