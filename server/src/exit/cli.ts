@@ -255,7 +255,12 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
   const stdin = args.stdin ?? process.stdin;
   const env = args.env ?? process.env;
 
-  if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
+  if (
+    argv.length === 0 ||
+    argv[0] === "help" ||
+    hasFlag(argv, "--help") ||
+    hasFlag(argv, "-h")
+  ) {
     printExitHelp(out);
     return 0;
   }

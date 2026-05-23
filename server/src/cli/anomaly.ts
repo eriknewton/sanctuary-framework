@@ -16,6 +16,7 @@
  *   list-subscribed                           Detector + classifier
  *                                             tuples this fortress
  *                                             has subscribed.
+ *   status                                    Alias for list-subscribed.
  *   subscribe <detector-id> --classifier <id>
  *   unsubscribe <detector-id> --classifier <id>
  *   findings [opts]                           Read anomaly findings
@@ -77,6 +78,7 @@ export async function runAnomalyCommand(
       case "detectors":
         return cmdDetectors(rest, { out });
       case "list-subscribed":
+      case "status":
         return await cmdListSubscribed({ out, args });
       case "subscribe":
         if (wantsHelp(rest)) {
@@ -138,6 +140,7 @@ function printUsage(s: NodeJS.WritableStream): void {
   detectors list                          Catalog of available
                                           detector + classifier tuples.
   list-subscribed                         Subscriptions on this fortress.
+  status                                  Alias for list-subscribed.
   subscribe <detector-id> --classifier <id>
                                           Opt in. Writes the
                                           subscription file; the server
