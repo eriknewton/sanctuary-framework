@@ -11,6 +11,7 @@
 
 import { mkdir, open, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type {
   FilesystemStorageCapabilities,
   StorageBackend,
@@ -194,6 +195,10 @@ export class AuditIntegrityError extends Error {
   }
 }
 
+const auditIntegrityContext = new AsyncLocalStorage<{
+  allowIntegrityFindings: boolean;
+}>();
+
 export class AuditLog {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
@@ -302,6 +307,16 @@ export class AuditLog {
    */
   async appendCritical(entry: AuditEntryInput): Promise<void> {
     await this.enqueueAppend(entry, { verifyDurability: true, critical: true });
+  }
+
+  async runAllowingIntegrityFindings<T>(fn: () => Promise<T>): Promise<T> {
+    return auditIntegrityContext.run({ allowIntegrityFindings: true }, fn);
+  }
+
+  async getIntegrityFindings(): Promise<AuditIntegrityFinding[]> {
+    await this.appendQueue;
+    await this.ensureLoaded({ allowIntegrityFindings: true });
+    return [...this.integrityFindings];
   }
 
   /**
@@ -533,12 +548,20 @@ export class AuditLog {
     return { entries, total, integrity_findings: [...this.integrityFindings] };
   }
 
-  private async ensureLoaded(): Promise<void> {
-    if (this.loaded) return;
-    await this.loadPersistedEntries();
-    this.loaded = true;
+  private async ensureLoaded(options?: { allowIntegrityFindings?: boolean }): Promise<void> {
+    if (!this.loaded) {
+      await this.loadPersistedEntries();
+      this.loaded = true;
+    }
     await this.reportIntegrityFindingsIfAny();
-    if (this.integrityMode === "strict" && this.integrityFindings.length > 0) {
+    const contextAllowsIntegrityFindings =
+      auditIntegrityContext.getStore()?.allowIntegrityFindings === true;
+    if (
+      this.integrityMode === "strict" &&
+      this.integrityFindings.length > 0 &&
+      options?.allowIntegrityFindings !== true &&
+      !contextAllowsIntegrityFindings
+    ) {
       throw new AuditIntegrityError(this.integrityFindings);
     }
   }
@@ -547,7 +570,13 @@ export class AuditLog {
     await this.loadPersistedEntries();
     this.loaded = true;
     await this.reportIntegrityFindingsIfAny();
-    if (this.integrityMode === "strict" && this.integrityFindings.length > 0) {
+    const contextAllowsIntegrityFindings =
+      auditIntegrityContext.getStore()?.allowIntegrityFindings === true;
+    if (
+      this.integrityMode === "strict" &&
+      this.integrityFindings.length > 0 &&
+      !contextAllowsIntegrityFindings
+    ) {
       throw new AuditIntegrityError(this.integrityFindings);
     }
   }
