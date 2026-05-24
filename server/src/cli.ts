@@ -108,7 +108,7 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "castle-wall") {
-    const code = runCastleWallCommand(args.slice(1));
+    const code = await runCastleWallCommand(args.slice(1));
     drainAndExit(code);
   }
 
@@ -693,11 +693,21 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
   }
 }
 
-function runCastleWallCommand(args: string[]): number {
+async function runCastleWallCommand(args: string[]): Promise<number> {
   const command = args[0];
   if (!command || command === "--help" || command === "-h") {
     printCastleWallHelp();
     return 0;
+  }
+
+  if (command === "provision-pin") {
+    const { runProvisionPin } = await import("./cli/castle-wall.js");
+    return runProvisionPin();
+  }
+
+  if (command === "status") {
+    const { runStatus } = await import("./cli/castle-wall.js");
+    return runStatus();
   }
 
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -713,12 +723,15 @@ function printCastleWallHelp(): void {
   sanctuary castle-wall. Castle Wall command surface.
 
   Usage:
+    sanctuary castle-wall <subcommand>
     sanctuary castle-wall [--help]
+
+  Subcommands:
+    provision-pin    Generate and pin the local Castle Wall keypair.
+    status           Show pinned-key fingerprint and sysext status.
 
   Options:
     --help, -h   Show this help
-
-  Status inspection is not available in this release.
 `);
 }
 

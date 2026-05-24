@@ -62,18 +62,14 @@ describe("CLI help routing", () => {
 
     expect(code).toBe(0);
     expect(stdout).toContain("Usage:");
-    expect(stdout).toContain("sanctuary castle-wall [--help]");
+    expect(stdout).toContain("sanctuary castle-wall");
     expect(stderr).not.toContain("Sanctuary MCP Server");
   });
 
-  it("sanctuary castle-wall status rejects explicitly", async () => {
+  it("sanctuary castle-wall status runs without starting MCP", async () => {
     const { code, stdout, stderr } = await runCli("castle-wall", "status");
 
-    expect(code).not.toBe(0);
-    expect(stdout).toBe("");
-    expect(stderr).toContain(
-      "Unknown subcommand: status. Try: sanctuary castle-wall --help"
-    );
+    expect(code).toBe(0);
     expect(stderr).not.toContain("Sanctuary MCP Server");
   });
 
