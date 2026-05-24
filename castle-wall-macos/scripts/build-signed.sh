@@ -25,6 +25,7 @@
 # Usage:
 #
 #   ./scripts/build-signed.sh                        # uses default identity match
+#   ./scripts/build-signed.sh --wrapped              # also assemble/sign outer host .app
 #   SIGNING_IDENTITY="Developer ID Application: Erik Newton (YFQSWQ9BJN)" \
 #     ./scripts/build-signed.sh
 #   BUILD_DIR=/tmp/cw-build ./scripts/build-signed.sh
@@ -52,11 +53,50 @@ SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Erik Newton (YFQ
 EXECUTABLE_NAME="CastleWallExtension"
 INFO_PLIST="${PKG_DIR}/Sources/CastleWallExtension/Info.plist"
 ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallExtension/CastleWallExtension.entitlements"
+WRAPPED=false
+WRAPPED_APP_DIR="${WRAPPED_APP_DIR:-${PKG_DIR}/build/Sanctuary-CastleWall.app}"
+SYSTEM_EXTENSION_DIRNAME="ai.sanctuaryprotocol.macos.castle-wall.systemextension"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--wrapped]
+
+Options:
+  --wrapped   Assemble nested .systemextension host app and sign:
+              1) inner .systemextension
+              2) outer .app (deep sign)
+  -h, --help  Show this help
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --wrapped)
+            WRAPPED=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "[build-signed] ERROR: unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+TOTAL_STEPS=4
+if [ "${WRAPPED}" = true ]; then
+    TOTAL_STEPS=5
+fi
 
 echo "[build-signed] castle-wall-macos package: ${PKG_DIR}"
 echo "[build-signed] swift build config: ${SWIFT_BUILD_CONFIG}"
 echo "[build-signed] target .app bundle: ${BUILD_DIR}"
 echo "[build-signed] signing identity:   ${SIGNING_IDENTITY}"
+echo "[build-signed] wrapped mode:        ${WRAPPED}"
 
 # Preflight: Xcode + SDK + signing identity reachable.
 if ! command -v xcodebuild >/dev/null 2>&1; then
@@ -75,7 +115,7 @@ if ! security find-identity -v -p codesigning | grep -qF "${SIGNING_IDENTITY}"; 
 fi
 
 # 1. swift build (release; native arch).
-echo "[build-signed] step 1/4 - swift build -c ${SWIFT_BUILD_CONFIG}"
+echo "[build-signed] step 1/${TOTAL_STEPS} - swift build -c ${SWIFT_BUILD_CONFIG}"
 (
     cd "${PKG_DIR}" && \
     swift build -c "${SWIFT_BUILD_CONFIG}"
@@ -89,7 +129,7 @@ fi
 echo "[build-signed]     built: ${BUILT_EXEC}"
 
 # 2. Assemble .app bundle.
-echo "[build-signed] step 2/4 - assemble .app bundle"
+echo "[build-signed] step 2/${TOTAL_STEPS} - assemble .app bundle"
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}/Contents/MacOS"
 cp "${BUILT_EXEC}" "${BUILD_DIR}/Contents/MacOS/${EXECUTABLE_NAME}"
@@ -107,7 +147,7 @@ fi
 echo "[build-signed]     assembled at ${BUILD_DIR}"
 
 # 3. codesign with Developer ID + hardened runtime + entitlements.
-echo "[build-signed] step 3/4 - codesign (hardened runtime + entitlements)"
+echo "[build-signed] step 3/${TOTAL_STEPS} - codesign (hardened runtime + entitlements)"
 codesign \
     --force \
     --options runtime \
@@ -117,7 +157,7 @@ codesign \
     "${BUILD_DIR}"
 
 # 4. Verify the signature + entitlements + hardened-runtime flag.
-echo "[build-signed] step 4/4 - verify signature"
+echo "[build-signed] step 4/${TOTAL_STEPS} - verify signature"
 codesign -dvvv --entitlements - "${BUILD_DIR}" 2>&1 | head -40
 
 # spctl assess against the developer-id rule. The unnotarized bundle
@@ -137,6 +177,52 @@ else
     else
         echo "[build-signed]     spctl returned unexpected status; see /tmp/cw-spctl.log" >&2
     fi
+fi
+
+if [ "${WRAPPED}" = true ]; then
+    WRAPPED_SCRIPT="${PKG_DIR}/scripts/build-wrapped.sh"
+    INNER_SYSTEM_EXTENSION="${WRAPPED_APP_DIR}/Contents/Library/SystemExtensions/${SYSTEM_EXTENSION_DIRNAME}"
+
+    if [ ! -x "${WRAPPED_SCRIPT}" ]; then
+        echo "[build-signed] ERROR: wrapped build script not executable: ${WRAPPED_SCRIPT}" >&2
+        exit 1
+    fi
+
+    echo "[build-signed] step 5/${TOTAL_STEPS} - build wrapped app and sign inner->outer"
+    SWIFT_BUILD_CONFIG="${SWIFT_BUILD_CONFIG}" \
+    WRAPPED_APP_DIR="${WRAPPED_APP_DIR}" \
+    bash "${WRAPPED_SCRIPT}"
+
+    if [ ! -d "${INNER_SYSTEM_EXTENSION}" ]; then
+        echo "[build-signed] ERROR: nested .systemextension missing at ${INNER_SYSTEM_EXTENSION}" >&2
+        exit 1
+    fi
+    if [ ! -d "${WRAPPED_APP_DIR}" ]; then
+        echo "[build-signed] ERROR: wrapped host app missing at ${WRAPPED_APP_DIR}" >&2
+        exit 1
+    fi
+
+    echo "[build-signed]     signing inner .systemextension with Developer ID"
+    codesign \
+        --force \
+        --options runtime \
+        --timestamp \
+        --sign "${SIGNING_IDENTITY}" \
+        --entitlements "${ENTITLEMENTS}" \
+        "${INNER_SYSTEM_EXTENSION}"
+
+    echo "[build-signed]     signing outer .app with Developer ID (deep)"
+    codesign \
+        --force \
+        --deep \
+        --options runtime \
+        --timestamp \
+        --sign "${SIGNING_IDENTITY}" \
+        "${WRAPPED_APP_DIR}"
+
+    echo "[build-signed]     verifying wrapped .app signature"
+    codesign --verify --deep --strict "${WRAPPED_APP_DIR}"
+    echo "[build-signed] wrapped signed bundle: ${WRAPPED_APP_DIR}"
 fi
 
 echo "[build-signed] DONE"
