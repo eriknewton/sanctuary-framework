@@ -46,6 +46,10 @@ let package = Package(
             name: "CastleWallExtension",
             targets: ["CastleWallExtension"]
         ),
+        .executable(
+            name: "CastleWallHostApp",
+            targets: ["CastleWallHostApp"]
+        ),
     ],
     targets: [
         .target(
@@ -72,6 +76,19 @@ let package = Package(
                 .linkedFramework("NetworkExtension"),
             ]
         ),
+        .executableTarget(
+            name: "CastleWallHostApp",
+            dependencies: ["CastleWallIPC"],
+            path: "Sources/CastleWallHostApp",
+            exclude: [
+                "Info.plist",
+                "CastleWallHostApp.entitlements",
+            ],
+            linkerSettings: [
+                .linkedFramework("SystemExtensions"),
+                .linkedFramework("SwiftUI"),
+            ]
+        ),
         .testTarget(
             name: "CastleWallIPCTests",
             dependencies: ["CastleWallIPC"],
@@ -81,6 +98,11 @@ let package = Package(
             name: "CastleWallExtensionTests",
             dependencies: ["CastleWallIPC", "CastleWallFilter"],
             path: "Tests/CastleWallExtensionTests"
+        ),
+        .testTarget(
+            name: "CastleWallHostAppTests",
+            dependencies: ["CastleWallHostApp"],
+            path: "Tests/CastleWallHostAppTests"
         ),
     ]
 )
