@@ -42,6 +42,10 @@ let package = Package(
             name: "CastleWallFilter",
             targets: ["CastleWallFilter"]
         ),
+        .library(
+            name: "AgentDetector",
+            targets: ["AgentDetector"]
+        ),
         .executable(
             name: "CastleWallExtension",
             targets: ["CastleWallExtension"]
@@ -55,6 +59,10 @@ let package = Package(
         .target(
             name: "CastleWallIPC",
             path: "Sources/CastleWallIPC"
+        ),
+        .target(
+            name: "AgentDetector",
+            path: "Sources/AgentDetector"
         ),
         .target(
             name: "CastleWallFilter",
@@ -78,7 +86,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "CastleWallHostApp",
-            dependencies: ["CastleWallIPC"],
+            dependencies: ["CastleWallIPC", "AgentDetector"],
             path: "Sources/CastleWallHostApp",
             exclude: [
                 "Info.plist",
@@ -101,7 +109,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CastleWallHostAppTests",
-            dependencies: ["CastleWallHostApp"],
+            dependencies: ["CastleWallHostApp", "AgentDetector"],
             path: "Tests/CastleWallHostAppTests"
         ),
     ]

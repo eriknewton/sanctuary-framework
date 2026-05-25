@@ -38,11 +38,11 @@ describe("CLI help routing", () => {
     expect(stdout).not.toContain("passphrase required");
   });
 
-  it("sanctuary wrap --help prints wrap-specific help", async () => {
+  it("sanctuary wrap --help prints protect-specific help (wrap is alias for protect)", async () => {
     const { code, stdout } = await runCli("wrap", "--help");
 
     expect(code).toBe(0);
-    expect(stdout).toContain("sanctuary wrap. Wrap any agent");
+    expect(stdout).toContain("sanctuary protect. Protect any agent");
     expect(stdout).toContain("--openclaw");
     expect(stdout).toContain("--dashboard-port <port>");
     expect(stdout).not.toContain("Sovereignty infrastructure for agents");

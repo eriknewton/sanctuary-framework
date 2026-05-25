@@ -51,7 +51,7 @@ describe("Dashboard copy sweep — Tier 4", () => {
 
   it("MMMM: coordination empty state explains what populates the tab", () => {
     expect(script).toContain("No coordination flows recorded yet.");
-    expect(script).toContain("wrapped agents hand off tasks");
+    expect(script).toContain("protected agents hand off tasks");
   });
 
   // HHHH: Template count is dynamic, not hardcoded "6"
