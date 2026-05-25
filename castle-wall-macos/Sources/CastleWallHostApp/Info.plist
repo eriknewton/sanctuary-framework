@@ -5,7 +5,7 @@
     <key>CFBundleIdentifier</key>
     <string>ai.sanctuaryprotocol.macos</string>
     <key>CFBundleName</key>
-    <string>CastleWallHostApp</string>
+    <string>Sanctuary</string>
     <key>CFBundleExecutable</key>
     <string>CastleWallHostApp</string>
     <key>CFBundleVersion</key>

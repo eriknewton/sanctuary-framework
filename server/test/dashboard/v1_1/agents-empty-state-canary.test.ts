@@ -91,8 +91,8 @@ describe("v1.1 Agents empty-state canary (Finding Z regression)", () => {
     expect(script).toMatch(
       /function renderAgentsList\(\)\s*\{[^}]*if\s*\(\s*!state\.agents\.length\s*\)\s*return\s*['"]<h1>Agents<\/h1>/,
     );
-    // Pin the negation: the empty-state copy points operators at wrap.
-    expect(script).toContain("No wrapped agents yet.");
+    // Pin the negation: the empty-state copy points operators at protect.
+    expect(script).toContain("No protected agents yet.");
   });
 
   describe("populated registry path (proves Z's persistence is intact)", () => {

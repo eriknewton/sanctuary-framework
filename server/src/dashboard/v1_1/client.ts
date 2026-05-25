@@ -335,7 +335,7 @@ function renderTemplate(id, args) {
 
 // ── Status mapping ─────────────────────────────────────────────────────
 const STATUS_MAP = {
-  active: { label: "Running", glyph: "online" },
+  active: { label: "Protected", glyph: "online" },
   paused: { label: "Paused", glyph: "idle" },
   restarting: { label: "Restarting", glyph: "idle" },
   locked_down: { label: "Locked down", glyph: "offline" },
@@ -360,7 +360,7 @@ const CHANNEL_TEMPLATES = [
     id: "request-approve-act",
     severity: "MEDIUM",
     title: "Request -> approve -> act",
-    description: "Operator sends a task. Agent proposes writes, pauses for approval, then executes. Most wrapped agents live here."
+    description: "Operator sends a task. Agent proposes writes, pauses for approval, then executes. Most protected agents live here."
   },
   {
     id: "read-then-report",
@@ -643,7 +643,7 @@ function renderMain() {
 //   last response's served_by + display_label.
 const CONCIERGE_SUGGESTIONS = [
   { id: "summarize-hour", category: "Summarize", label: "summarize the last hour", query: "Summarize what happened in this fortress in the last hour." },
-  { id: "agent-touched", category: "Inspect", label: "what has each agent touched today", query: "What has each wrapped agent done today? Group by agent." },
+  { id: "agent-touched", category: "Inspect", label: "what has each agent touched today", query: "What has each protected agent done today? Group by agent." },
   { id: "open-approvals", category: "Approvals", label: "any open approvals?", query: "Are there any open Tier 1 approvals or pending inbox items I should look at?" }
 ];
 
@@ -763,7 +763,7 @@ function agentStateClass(status) {
 function renderAgentAttestationBadge(status) {
   let cls;
   let label;
-  if (status === "active") { cls = "verified"; label = "verified"; }
+  if (status === "active") { cls = "verified"; label = "protected"; }
   else if (status === "locked_down") { cls = "unverified"; label = "locked"; }
   else if (status === "error") { cls = "unverified"; label = "unverified"; }
   else { cls = "degraded"; label = "degraded"; }
@@ -997,12 +997,12 @@ function renderAgentsList() {
   if (!state.agents.length) return '<h1>Agents</h1>' +
     '<div class="agents-empty">' +
       '<div class="icon-frame"><div class="core"></div></div>' +
-      '<h2>No wrapped agents yet.</h2>' +
-      '<p>Wrap an agent to give it a portable identity, a charter, and approval gates. Run <code>sanctuary wrap</code> in any project where your agent lives.</p>' +
-      '<div class="terminal-block"><span class="cmd"><span class="prompt">$</span>sanctuary wrap</span></div>' +
+      '<h2>No protected agents yet.</h2>' +
+      '<p>Protect an agent to give it a portable identity, a charter, and approval gates. Run <code>sanctuary protect</code> in any project where your agent lives.</p>' +
+      '<div class="terminal-block"><span class="cmd"><span class="prompt">$</span>sanctuary protect</span></div>' +
     '</div>';
   const count = state.agents.length;
-  const subCopy = count + ' wrapped. Click one to inspect its activity, policy, and pending approvals.';
+  const subCopy = count + ' protected. Click one to inspect its activity, policy, and pending approvals.';
   const rows = state.agents.map(function (a) {
     const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
     const dotCls = agentStateClass(a.status);
@@ -1185,7 +1185,7 @@ function renderAgentInspectPanel(agent) {
           '<div class="policy-line"><span class="k">Agent id</span><span class="v">' + escHtml(agent.agent_id) + '</span></div>' +
           '<div class="policy-line"><span class="k">Harness</span><span class="v">' + escHtml(agent.harness) + '</span></div>' +
           modelLine +
-          '<div class="policy-line"><span class="k">Wrapped at</span><span class="v">' + escHtml(shortTime(agent.wrapped_at)) + '</span></div>' +
+          '<div class="policy-line"><span class="k">Protected since</span><span class="v">' + escHtml(shortTime(agent.wrapped_at)) + '</span></div>' +
         '</div>' +
         '<p class="muted" style="margin-top:10px;font-size:12px;">' +
           '<a href="#activity?agent=' + escHtml(agent.agent_id) + '">View full activity</a> · ' +
@@ -1223,7 +1223,7 @@ function renderPrivacyPage() {
   const events = state.privacyEvents.slice(0, 50);
   if (!events.length) return '<h1>Privacy</h1>' +
     '<section class="card"><h3>No privacy events recorded yet.</h3>' +
-    '<p class="muted">Privacy events appear when the privacy filter redacts, denies, or logs an outbound payload. Wrap an agent with a privacy-minimization policy to start seeing events here.</p>' +
+    '<p class="muted">Privacy events appear when the privacy filter redacts, denies, or logs an outbound payload. Protect an agent with a privacy-minimization policy to start seeing events here.</p>' +
     '</section>';
   const rows = events.map(function (e) {
     const payload = e.payload || {};
@@ -1248,7 +1248,7 @@ function renderCoordinationPage() {
   const events = state.handoffEvents.slice(0, 100);
   if (!events.length) return '<h1>Coordination</h1>' +
     '<section class="card"><h3>No coordination flows recorded yet.</h3>' +
-    '<p class="muted">Coordination flows appear when wrapped agents hand off tasks to each other inside this fortress. Wrap two or more agents and initiate a handoff to see events here.</p>' +
+    '<p class="muted">Coordination flows appear when protected agents hand off tasks to each other inside this fortress. Protect two or more agents and initiate a handoff to see events here.</p>' +
     '</section>';
   const rows = events.map(function (e) {
     const p = e.payload || {};
@@ -1274,7 +1274,7 @@ function renderHealthPage() {
     '<p class="muted">Projected from existing data.</p>' +
     '<div class="card"><h3>Fortress at a glance</h3>' +
       '<dl class="kv">' +
-      '<dt>Wrapped agents</dt><dd>' + escHtml(totalAgents) + '</dd>' +
+      '<dt>Protected agents</dt><dd>' + escHtml(totalAgents) + '</dd>' +
       '<dt>Locked down</dt><dd>' + escHtml(lockedDown) + '</dd>' +
       '<dt>Errored</dt><dd>' + escHtml(errored) + '</dd>' +
       '<dt>Denials in feed</dt><dd>' + escHtml(recentDenials) + '</dd>' +
@@ -1881,7 +1881,7 @@ function renderPolicyCenter() {
           '<td>T1, T2</td>' +
         '</tr>';
       }).join("\n")
-    : '<tr><td colspan="7" class="muted">No wrapped agents yet.</td></tr>';
+    : '<tr><td colspan="7" class="muted">No protected agents yet.</td></tr>';
   return '<section class="policy-center">' +
     '<p class="eyebrow">POLICY CENTER</p>' +
     '<h1>One screen for every rule</h1>' +
@@ -2027,7 +2027,7 @@ function renderExitDrill() {
   const step4Body = '<p class="muted">Run on a fresh shell:</p><pre class="code-block">' + verifyCmd + '</pre>' +
     '<button class="btn" data-action="exit-mark-verified">Mark verified</button>';
   const step5Body = '<p class="muted">Run this command on the destination fortress, not on this one. The destination will prompt for the bundle source passphrase or recovery key.</p><pre class="code-block">' + importCmd + '</pre>';
-  const step6Body = '<p class="muted">Optional. Re-wrap the destination harness using <code>sanctuary wrap</code>. See <a href="#" data-action="open-harness-doc">harness compatibility matrix</a>.</p>';
+  const step6Body = '<p class="muted">Optional. Re-protect the destination harness using <code>sanctuary protect</code>. See <a href="#" data-action="open-harness-doc">harness compatibility matrix</a>.</p>';
   return '<h1>Exit drill</h1>' +
     '<p class="muted">Six-step wizard. Verify and import are run out-of-band on the operator shell. The dashboard does not call the verifier in-process.</p>' +
     stepBlock(1, "Snapshot the fortress", step1Body, step === 1, exportDone) +
@@ -2212,7 +2212,7 @@ function renderFortress() {
           '<div class="agent-row-actions">' + buttons + '</div>' +
           '</div>';
       }).join("\n")
-    : '<p class="muted">No agents wrapped.</p>';
+    : '<p class="muted">No agents protected.</p>';
 
   const recognition = state.recognition.health;
   let recognitionCard;

@@ -58,7 +58,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (args[0] === "wrap") {
+  if (args[0] === "protect" || args[0] === "wrap") {
     const { parseWrapArgs, runWrap } = await import("./wrap/cli.js");
     const opts = parseWrapArgs(args.slice(1));
     await runWrap(opts);
@@ -86,7 +86,7 @@ async function main(): Promise<void> {
     // Hidden deprecated alias. One-release grace period before removal.
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
-      `\n  Note: \`cocoon\` is renamed to \`wrap\`. Use \`sanctuary wrap\` next time.\n`
+      `\n  Note: \`cocoon\` is deprecated. Use \`sanctuary protect\` instead.\n`
     );
     const { parseWrapArgs, runWrap } = await import("./wrap/cli.js");
     const opts = parseWrapArgs(args.slice(1));
@@ -516,7 +516,8 @@ Usage:
   sanctuary [options]                     # MCP server (stdio)
   sanctuary init [opts]                   # Create a fresh fortress
   sanctuary dashboard [opts]              # Standalone dashboard
-  sanctuary wrap [opts]                   # Wrap an agent in one command
+  sanctuary protect [opts]                 # Protect an agent in one command
+  sanctuary wrap [opts]                   # (alias for protect)
   sanctuary export-passphrase             # Print stored passphrase
 
 Options:
@@ -530,9 +531,11 @@ Subcommands:
                        isolated on one host.
                        Use "sanctuary init --help" for options.
 
-  wrap                 Wrap an agent and start the dashboard in one command.
+  protect              Protect an agent and start the dashboard in one command.
                        Auto-generates a passphrase, auto-opens the browser.
-                       Use "sanctuary wrap --help" for options.
+                       Use "sanctuary protect --help" for options.
+
+  wrap                 (alias for protect)
 
   dashboard            Start the dashboard as a standalone HTTP server.
                        Reads from the same storage as the MCP server.
@@ -563,7 +566,7 @@ Subcommands:
                        nuke (destroys all state, fresh start).
                        Use "sanctuary reset-passphrase --help" for options.
 
-  cocoon               (deprecated, use "wrap")
+  cocoon               (deprecated, use "protect")
 
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
@@ -648,6 +651,7 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
     case "dashboard":
       printDashboardHelp();
       return true;
+    case "protect":
     case "wrap":
     case "cocoon":
       printWrapHelpEarly();
@@ -756,16 +760,18 @@ function printExportPassphraseHelp(): void {
 function printWrapHelpEarly(): void {
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.log(`
-  sanctuary wrap. Wrap any agent in Sanctuary protection.
+  sanctuary protect. Protect any agent with Sanctuary.
 
   Usage:
-    sanctuary wrap --openclaw          Wrap OpenClaw
-    sanctuary wrap --hermes            Wrap Hermes Agent (NousResearch)
-    sanctuary wrap --claude-code       Wrap Claude Code
-    sanctuary wrap --cursor            Wrap Cursor
-    sanctuary wrap --cline             Wrap Cline (VS Code extension)
-    sanctuary wrap --wrap <path>       Wrap a specific MCP config file
-    sanctuary wrap --unwrap            Restore original config
+    sanctuary protect --openclaw       Protect OpenClaw
+    sanctuary protect --hermes         Protect Hermes Agent (NousResearch)
+    sanctuary protect --claude-code    Protect Claude Code
+    sanctuary protect --cursor         Protect Cursor
+    sanctuary protect --cline          Protect Cline (VS Code extension)
+    sanctuary protect --wrap <path>    Protect a specific MCP config file
+    sanctuary protect --unwrap         Restore original config
+
+  "sanctuary wrap" is a deprecated alias that still works.
 
   Options:
     --openclaw         Auto-detect and wrap OpenClaw
