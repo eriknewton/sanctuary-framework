@@ -53,6 +53,9 @@ SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Erik Newton (YFQ
 EXECUTABLE_NAME="CastleWallExtension"
 INFO_PLIST="${PKG_DIR}/Sources/CastleWallExtension/Info.plist"
 ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallExtension/CastleWallExtension.entitlements"
+HOST_ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallHostApp/CastleWallHostApp.entitlements"
+PROVISIONING_PROFILE="${PROVISIONING_PROFILE:-${HOME}/Documents/Sanctuary_Castle_Wall_macOS.provisionprofile}"
+EXT_PROVISIONING_PROFILE="${EXT_PROVISIONING_PROFILE:-${HOME}/Documents/Sanctuary_Castle_Wall_Extension.provisionprofile}"
 WRAPPED=false
 WRAPPED_APP_DIR="${WRAPPED_APP_DIR:-${PKG_DIR}/build/Sanctuary-CastleWall.app}"
 SYSTEM_EXTENSION_DIRNAME="ai.sanctuaryprotocol.macos.castle-wall.systemextension"
@@ -202,6 +205,21 @@ if [ "${WRAPPED}" = true ]; then
         exit 1
     fi
 
+    if [ -f "${PROVISIONING_PROFILE}" ]; then
+        echo "[build-signed]     embedding provisioning profile"
+        cp "${PROVISIONING_PROFILE}" "${WRAPPED_APP_DIR}/Contents/embedded.provisionprofile"
+    else
+        echo "[build-signed] WARNING: no provisioning profile at ${PROVISIONING_PROFILE}" >&2
+        echo "[build-signed]          restricted entitlements will fail AMFI without a profile" >&2
+    fi
+
+    if [ -f "${EXT_PROVISIONING_PROFILE}" ]; then
+        echo "[build-signed]     embedding extension provisioning profile"
+        cp "${EXT_PROVISIONING_PROFILE}" "${INNER_SYSTEM_EXTENSION}/Contents/embedded.provisionprofile"
+    else
+        echo "[build-signed] WARNING: no extension provisioning profile at ${EXT_PROVISIONING_PROFILE}" >&2
+    fi
+
     echo "[build-signed]     signing inner .systemextension with Developer ID"
     codesign \
         --force \
@@ -211,13 +229,13 @@ if [ "${WRAPPED}" = true ]; then
         --entitlements "${ENTITLEMENTS}" \
         "${INNER_SYSTEM_EXTENSION}"
 
-    echo "[build-signed]     signing outer .app with Developer ID (deep)"
+    echo "[build-signed]     signing outer .app with Developer ID + host entitlements"
     codesign \
         --force \
-        --deep \
         --options runtime \
         --timestamp \
         --sign "${SIGNING_IDENTITY}" \
+        --entitlements "${HOST_ENTITLEMENTS}" \
         "${WRAPPED_APP_DIR}"
 
     echo "[build-signed]     verifying wrapped .app signature"

@@ -14,5 +14,7 @@
     <string>1.0</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>NSSystemExtensionUsageDescription</key>
+    <string>Sanctuary uses a system extension to enforce network security policies for AI agents.</string>
 </dict>
 </plist>

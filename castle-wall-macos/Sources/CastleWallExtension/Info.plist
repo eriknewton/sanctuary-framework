@@ -20,6 +20,16 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>NSSystemExtensionUsageDescription</key>
+    <string>Sanctuary uses a system extension to enforce network security policies for AI agents.</string>
+    <key>NetworkExtension</key>
+    <dict>
+        <key>NEProviderClasses</key>
+        <dict>
+            <key>com.apple.networkextension.filter-data</key>
+            <string>CastleWallFilter.CastleWallFilterProvider</string>
+        </dict>
+    </dict>
     <key>NSExtension</key>
     <dict>
         <key>NSExtensionPointIdentifier</key>
