@@ -32,7 +32,7 @@ import {
   keychainServiceFor,
   isOsKeyringLocation,
   OS_KEYRING_LOCATION_LINUX,
-} from "../src/cocoon/passphrase.js";
+} from "../src/wrap/passphrase.js";
 
 // ── Skip-unless-real-backend guard ──────────────────────────────────
 

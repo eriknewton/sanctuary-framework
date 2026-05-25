@@ -17,7 +17,7 @@ import {
   type DashboardStarter,
   type RunWrapDeps,
   type WrapOptions,
-} from "../../src/cocoon/cli.js";
+} from "../../src/wrap/cli.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 
 const __filename = fileURLToPath(import.meta.url);

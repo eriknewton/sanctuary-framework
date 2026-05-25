@@ -10,7 +10,7 @@ import type { DashboardApprovalChannel } from "../src/principal-policy/dashboard
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { persistUserProvidedPassphrase } from "../src/cocoon/passphrase.js";
+import { persistUserProvidedPassphrase } from "../src/wrap/passphrase.js";
 import {
   bindWithRetry,
   randomTestPort,

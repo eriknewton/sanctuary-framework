@@ -9,7 +9,7 @@ import { bytesToString, concatBytes, fromBase64url, stringToBytes } from "../cor
 import { encrypt } from "../core/encryption.js";
 import { randomBytes } from "../core/random.js";
 import { resolveStoragePath } from "../paths.js";
-import { getOrCreatePassphrase } from "../cocoon/passphrase.js";
+import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";

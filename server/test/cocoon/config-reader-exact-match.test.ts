@@ -19,7 +19,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { writeFile, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { detectAgentConfig } from "../../src/cocoon/config-reader.js";
+import { detectAgentConfig } from "../../src/wrap/config-reader.js";
 
 describe("extractServers — exact-match Sanctuary filter (finding B)", () => {
   let tmpDir: string;

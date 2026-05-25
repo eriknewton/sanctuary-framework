@@ -14,7 +14,7 @@ import { describe, it, expect } from "vitest";
 import {
   keychainServiceFor,
   legacyKeychainServiceFor,
-} from "../../src/cocoon/passphrase.js";
+} from "../../src/wrap/passphrase.js";
 
 describe("keychainServiceFor -- collision bound (#62)", () => {
   const home = "/home/test";

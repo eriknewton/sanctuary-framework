@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { generateFortressViewHTML } from "../../src/cocoon/fortress-view.js";
+import { generateFortressViewHTML } from "../../src/wrap/fortress-view.js";
 
 describe("Fortress View", () => {
   it("generates valid HTML with version", () => {

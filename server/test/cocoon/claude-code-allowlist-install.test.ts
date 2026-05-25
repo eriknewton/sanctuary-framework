@@ -39,7 +39,7 @@ import {
   removeClaudeCodeAllowlist,
   SANCTUARY_BROKER_ALLOWLIST_ENTRIES,
   SANCTUARY_SETTINGS_BACKUP_SUFFIX,
-} from "../../src/cocoon/claude-code-allowlist.js";
+} from "../../src/wrap/claude-code-allowlist.js";
 
 async function pathExists(p: string): Promise<boolean> {
   try {

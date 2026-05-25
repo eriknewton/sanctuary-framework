@@ -97,7 +97,7 @@ import { DefaultPolicyGate } from "./key-17/policy-gate.js";
 import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
 import { generateRandomKey } from "./core/random.js";
 import { toBase64url } from "./core/encoding.js";
-import { discloseRecoveryKey } from "./cocoon/recovery-key-disclosure.js";
+import { discloseRecoveryKey } from "./wrap/recovery-key-disclosure.js";
 import {
   buildV11Bindings,
   fortressIdFromStoragePath,

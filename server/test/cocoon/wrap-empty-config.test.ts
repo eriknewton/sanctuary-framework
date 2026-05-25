@@ -20,7 +20,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { writeFile, mkdir, readFile, rm, access } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { runWrap } from "../../src/cocoon/cli.js";
+import { runWrap } from "../../src/wrap/cli.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 
 describe("Wrap — empty Claude Code config (finding A)", () => {

@@ -38,7 +38,7 @@ import {
   type DashboardStarter,
   type RunWrapDeps,
   type WrapOptions,
-} from "../../src/cocoon/cli.js";
+} from "../../src/wrap/cli.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 import { readPersistedLocalAgents } from "../../src/hub/agent-registry-persistence.js";
 

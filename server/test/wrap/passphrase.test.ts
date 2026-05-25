@@ -19,7 +19,7 @@ import {
   fallbackFilePath,
   PassphraseUnreadableError,
   type ExecResult,
-} from "../../src/cocoon/passphrase.js";
+} from "../../src/wrap/passphrase.js";
 
 /**
  * Deterministic key deriver with a caller-chosen seed — used by the SEC-062

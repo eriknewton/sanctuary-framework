@@ -18,7 +18,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   parseWrapArgs,
   promoteFortressToStoragePath,
-} from "../../src/cocoon/cli.js";
+} from "../../src/wrap/cli.js";
 
 describe("parseWrapArgs --fortress capture", () => {
   it("captures --fortress <path> into WrapOptions", () => {

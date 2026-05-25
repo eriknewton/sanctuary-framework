@@ -17,7 +17,7 @@ import {
   COCOON_GOVERNOR_DEFAULTS,
   type DashboardStarter,
   type RunWrapDeps,
-} from "../../src/cocoon/cli.js";
+} from "../../src/wrap/cli.js";
 
 describe("parseWrapArgs", () => {
   it("parses --openclaw flag", () => {

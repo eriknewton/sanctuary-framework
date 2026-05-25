@@ -52,7 +52,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
 import { resolveStoragePath } from "../paths.js";
-import { keychainServiceFor } from "../cocoon/passphrase.js";
+import { keychainServiceFor } from "../wrap/passphrase.js";
 
 // ── Types ───────────────────────────────────────────────────────────
 

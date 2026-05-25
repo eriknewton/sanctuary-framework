@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { runInit } from "../../src/cocoon/init.js";
+import { runInit } from "../../src/wrap/init.js";
 
 const CLI_PATH = join(process.cwd(), "dist", "cli.js");
 

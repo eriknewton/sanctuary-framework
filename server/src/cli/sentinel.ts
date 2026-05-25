@@ -25,7 +25,7 @@ import { loadConfig } from "../config.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../core/encoding.js";
-import { getOrCreatePassphrase } from "../cocoon/passphrase.js";
+import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { SentinelFindingStore } from "../sentinel/sentinel-finding-store.js";
 import {

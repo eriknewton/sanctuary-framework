@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runWrap, type DashboardStarter, type RunWrapDeps } from "../../src/cocoon/cli.js";
+import { runWrap, type DashboardStarter, type RunWrapDeps } from "../../src/wrap/cli.js";
 import { AuditLog } from "../../src/l2-operational/audit-log.js";
 
 describe("wrap CLI cleanup", () => {

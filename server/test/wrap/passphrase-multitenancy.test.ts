@@ -21,7 +21,7 @@ import {
   fallbackFilePath,
   keychainServiceFor,
   type ExecResult,
-} from "../../src/cocoon/passphrase.js";
+} from "../../src/wrap/passphrase.js";
 
 // Simulate a Keychain where each (account, service) pair is an isolated cell —
 // mirroring how the real `security` CLI behaves. Two instances with distinct

@@ -20,7 +20,7 @@ import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startStandaloneDashboard } from "../src/dashboard-standalone.js";
-import { persistUserProvidedPassphrase } from "../src/cocoon/passphrase.js";
+import { persistUserProvidedPassphrase } from "../src/wrap/passphrase.js";
 import { IdentityManager } from "../src/l1-cognitive/tools.js";
 import { FilesystemStorage } from "../src/storage/filesystem.js";
 import { deriveMasterKey, derivePurposeKey } from "../src/core/key-derivation.js";

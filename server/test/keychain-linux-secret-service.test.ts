@@ -33,7 +33,7 @@ import {
   isOsKeyringLocation,
   OS_KEYRING_LOCATION_LINUX,
   type ExecResult,
-} from "../src/cocoon/passphrase.js";
+} from "../src/wrap/passphrase.js";
 
 type ExecCall = { cmd: string; args: string[]; input?: string };
 

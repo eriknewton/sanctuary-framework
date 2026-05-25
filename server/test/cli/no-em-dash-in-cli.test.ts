@@ -16,7 +16,7 @@ import { join } from "node:path";
 
 const CLI_SOURCES = [
   join(__dirname, "..", "..", "src", "cli.ts"),
-  join(__dirname, "..", "..", "src", "cocoon", "cli.ts"),
+  join(__dirname, "..", "..", "src", "wrap", "cli.ts"),
   join(__dirname, "..", "..", "src", "update-check.ts"),
 ];
 

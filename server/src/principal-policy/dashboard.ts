@@ -36,7 +36,7 @@ import type { HandshakeResult } from "../handshake/types.js";
 // SignedSHR type available via shr/types if needed in future
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
 import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
-import { generateFortressViewHTML } from "../cocoon/fortress-view.js";
+import { generateFortressViewHTML } from "../wrap/fortress-view.js";
 import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer } from "../sovereignty-profile.js";
 import { generateSystemPrompt } from "../system-prompt-generator.js";
 import type { ClientManager } from "../proxy/client-manager.js";

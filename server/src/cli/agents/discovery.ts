@@ -24,7 +24,7 @@ import { stat, readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, basename, resolve } from "node:path";
 import { DEFAULT_STORAGE_DIR } from "../../paths.js";
-import { keychainServiceFor } from "../../cocoon/passphrase.js";
+import { keychainServiceFor } from "../../wrap/passphrase.js";
 import {
   readTenantRuntime,
   type TenantRuntimeState,

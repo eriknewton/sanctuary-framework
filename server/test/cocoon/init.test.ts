@@ -24,8 +24,8 @@ import {
   printInitHelp,
   resolveFortressPath,
   runInit,
-} from "../../src/cocoon/init.js";
-import { RECOVERY_KEY_FILENAME } from "../../src/cocoon/recovery-key-disclosure.js";
+} from "../../src/wrap/init.js";
+import { RECOVERY_KEY_FILENAME } from "../../src/wrap/recovery-key-disclosure.js";
 
 describe("resolveFortressPath", () => {
   it("returns ~/.sanctuary when no flag or env var is set", () => {

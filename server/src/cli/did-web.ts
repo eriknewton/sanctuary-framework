@@ -52,7 +52,7 @@ import {
   validateHandle,
 } from "../recognition/did-web-hosted-registry.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
-import { readStoredPassphrase } from "../cocoon/passphrase.js";
+import { readStoredPassphrase } from "../wrap/passphrase.js";
 
 export interface DidWebCommandArgs {
   argv: string[];

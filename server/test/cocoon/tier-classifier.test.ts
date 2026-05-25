@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { classifyTool, classifyServerTools, tierDescription } from "../../src/cocoon/tier-classifier.js";
+import { classifyTool, classifyServerTools, tierDescription } from "../../src/wrap/tier-classifier.js";
 
 describe("Tier Classifier", () => {
   // ── Tier 1: Destructive / sensitive operations ───────────────────

@@ -26,7 +26,7 @@ import {
   writeRecoveryKeyFile,
   RecoveryKeyConfirmationDeclinedError,
   RECOVERY_KEY_FILENAME,
-} from "../../src/cocoon/recovery-key-disclosure.js";
+} from "../../src/wrap/recovery-key-disclosure.js";
 
 const FIXTURE_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 

@@ -6,7 +6,7 @@ import {
   parseWrapArgs,
   runWrap,
   type DashboardStarter,
-} from "../../src/cocoon/cli.js";
+} from "../../src/wrap/cli.js";
 
 describe("sanctuary wrap --dashboard-port", () => {
   let tempHome: string;

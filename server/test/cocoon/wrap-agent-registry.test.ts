@@ -67,7 +67,7 @@ import {
   type DashboardStarter,
   type RunWrapDeps,
   type WrapOptions,
-} from "../../src/cocoon/cli.js";
+} from "../../src/wrap/cli.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
 import { randomBytes } from "node:crypto";

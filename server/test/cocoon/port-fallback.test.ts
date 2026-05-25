@@ -22,8 +22,8 @@ import { describe, it, expect } from "vitest";
 import {
   PORT_FALLBACK_ATTEMPTS,
   startDashboardWithFallback,
-} from "../../src/cocoon/cli.js";
-import type { DashboardStarter } from "../../src/cocoon/cli.js";
+} from "../../src/wrap/cli.js";
+import type { DashboardStarter } from "../../src/wrap/cli.js";
 
 function makeStarter(busyPorts: number[]): {
   starter: DashboardStarter;

@@ -21,8 +21,8 @@ import { tmpdir } from "node:os";
 import {
   detectAgentConfigWithDiagnostics,
   getPlatformPaths,
-} from "../../src/cocoon/config-reader.js";
-import { runWrap } from "../../src/cocoon/cli.js";
+} from "../../src/wrap/config-reader.js";
+import { runWrap } from "../../src/wrap/cli.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 
 describe("Claude Code config path probing (finding C)", () => {

@@ -17,8 +17,8 @@ import {
   saveCocoonMeta,
   findLatestBackup,
   rewriteConfigForCocoon,
-} from "../../src/cocoon/config-reader.js";
-import { detectHarnessSchema } from "../../src/cocoon/harness-schema.js";
+} from "../../src/wrap/config-reader.js";
+import { detectHarnessSchema } from "../../src/wrap/harness-schema.js";
 
 describe("Config Reader", () => {
   let tmpDir: string;

@@ -51,7 +51,7 @@ import type { PolicyConflict } from "../policy-engine/conflict-detector.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { resolveStoragePath } from "../paths.js";
 import { loadConfig } from "../config.js";
-import { getOrCreatePassphrase } from "../cocoon/passphrase.js";
+import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 
 export interface PolicyArgs {

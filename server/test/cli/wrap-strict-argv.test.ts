@@ -3,7 +3,7 @@
  * Unknown positionals and unknown flags must be rejected.
  */
 import { describe, it, expect } from "vitest";
-import { parseWrapArgs } from "../../src/cocoon/cli.js";
+import { parseWrapArgs } from "../../src/wrap/cli.js";
 
 describe("sanctuary wrap strict argv parsing (Finding EEE)", () => {
   it("rejects unknown positional argument with suggestion", () => {

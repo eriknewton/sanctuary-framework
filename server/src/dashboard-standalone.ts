@@ -48,12 +48,12 @@ import {
   readStoredPassphrase,
   keychainServiceFor,
   PassphraseUnreadableError,
-} from "./cocoon/passphrase.js";
+} from "./wrap/passphrase.js";
 import {
   discloseRecoveryKey,
   RecoveryKeyConfirmationDeclinedError,
   RecoveryKeyConfirmationNonInteractiveError,
-} from "./cocoon/recovery-key-disclosure.js";
+} from "./wrap/recovery-key-disclosure.js";
 import {
   discoverTenants,
   findTenant,

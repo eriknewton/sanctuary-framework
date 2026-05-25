@@ -26,8 +26,8 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { runWrap } from "../../src/cocoon/cli.js";
-import { PASSPHRASE_BACKUP_FILENAME } from "../../src/cocoon/recovery-key-disclosure.js";
+import { runWrap } from "../../src/wrap/cli.js";
+import { PASSPHRASE_BACKUP_FILENAME } from "../../src/wrap/recovery-key-disclosure.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 
 const FIXTURE_GENERATED_PASSPHRASE = "drill-canonical-passphrase-test-fixture-001";

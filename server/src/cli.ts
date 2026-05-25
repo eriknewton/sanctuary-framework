@@ -59,7 +59,7 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "wrap") {
-    const { parseWrapArgs, runWrap } = await import("./cocoon/cli.js");
+    const { parseWrapArgs, runWrap } = await import("./wrap/cli.js");
     const opts = parseWrapArgs(args.slice(1));
     await runWrap(opts);
     return;
@@ -67,7 +67,7 @@ async function main(): Promise<void> {
 
   if (args[0] === "init") {
     const { parseInitArgs, runInit, printInitHelp } = await import(
-      "./cocoon/init.js"
+      "./wrap/init.js"
     );
     const opts = parseInitArgs(args.slice(1));
     if (opts.helpRequested) {
@@ -88,7 +88,7 @@ async function main(): Promise<void> {
     console.error(
       `\n  Note: \`cocoon\` is renamed to \`wrap\`. Use \`sanctuary wrap\` next time.\n`
     );
-    const { parseWrapArgs, runWrap } = await import("./cocoon/cli.js");
+    const { parseWrapArgs, runWrap } = await import("./wrap/cli.js");
     const opts = parseWrapArgs(args.slice(1));
     await runWrap(opts);
     return;
@@ -465,7 +465,7 @@ async function runExportPassphrase(args: string[]): Promise<void> {
   }
 
   const { readStoredPassphrase, PassphraseUnreadableError } = await import(
-    "./cocoon/passphrase.js"
+    "./wrap/passphrase.js"
   );
   let stored: Awaited<ReturnType<typeof readStoredPassphrase>> = null;
   try {
@@ -653,7 +653,7 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
       printWrapHelpEarly();
       return true;
     case "init": {
-      const { printInitHelp } = await import("./cocoon/init.js");
+      const { printInitHelp } = await import("./wrap/init.js");
       printInitHelp();
       return true;
     }

@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { rewriteConfigForCocoon, type AgentConfig } from "../../src/cocoon/config-reader.js";
+import { rewriteConfigForCocoon, type AgentConfig } from "../../src/wrap/config-reader.js";
 
 describe("Cocoon env-var preservation", () => {
   let tmpDir: string;

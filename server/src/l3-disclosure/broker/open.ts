@@ -19,7 +19,7 @@ import { loadConfig } from "../../config.js";
 import { deriveMasterKey, type KeyDerivationParams } from "../../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../../core/encoding.js";
 import { AuditLog } from "../../l2-operational/audit-log.js";
-import { getOrCreatePassphrase } from "../../cocoon/passphrase.js";
+import { getOrCreatePassphrase } from "../../wrap/passphrase.js";
 import { KeychainBackend } from "./keychain-backend.js";
 import { Broker } from "./broker.js";
 import { parseBrokerPolicy } from "./policy.js";

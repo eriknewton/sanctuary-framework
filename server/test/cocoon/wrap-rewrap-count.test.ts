@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { formatMcpServerCount } from "../../src/cocoon/cli.js";
+import { formatMcpServerCount } from "../../src/wrap/cli.js";
 
 describe("formatMcpServerCount", () => {
   it("first wrap against an empty config: 0 servers, no Sanctuary entry", () => {

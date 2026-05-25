@@ -20,7 +20,7 @@ import {
   legacyKeychainServiceFor,
   keychainServiceFor,
   type ExecResult,
-} from "../../src/cocoon/passphrase.js";
+} from "../../src/wrap/passphrase.js";
 
 /**
  * Build a mock exec that simulates macOS Keychain with per-(account,service) isolation.

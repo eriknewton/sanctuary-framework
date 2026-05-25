@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { parseCocoonArgs, COCOON_GOVERNOR_DEFAULTS } from "../../src/cocoon/cli.js";
+import { parseCocoonArgs, COCOON_GOVERNOR_DEFAULTS } from "../../src/wrap/cli.js";
 
 describe("Cocoon CLI", () => {
   // ── Argument parser ─────────────────────────────────────────────

@@ -37,7 +37,7 @@ import {
 } from "../key-17/erc8004-tools.js";
 import type { Erc8004Registration } from "../key-17/erc8004-identity-signer.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
-import { readStoredPassphrase } from "../cocoon/passphrase.js";
+import { readStoredPassphrase } from "../wrap/passphrase.js";
 
 export interface Erc8004CommandArgs {
   argv: string[];

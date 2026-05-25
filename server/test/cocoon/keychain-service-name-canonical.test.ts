@@ -12,7 +12,7 @@
 
 import { describe, it, expect } from "vitest";
 import { join } from "node:path";
-import { keychainServiceFor } from "../../src/cocoon/passphrase.js";
+import { keychainServiceFor } from "../../src/wrap/passphrase.js";
 
 describe("keychainServiceFor -- canonical path comparison (#59)", () => {
   const home = "/home/test";
