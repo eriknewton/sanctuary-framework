@@ -51,14 +51,21 @@ every fixture in the parity test.
 
 Order of resolution:
 
-1. `SANCTUARY_CASTLE_SOCKET` environment variable (explicit override).
-2. **Linux**: `/run/sanctuary/<fortress-id>/filter.sock` (root daemon path).
-3. **macOS**: `${SANCTUARY_FORTRESS_PATH}/castle.sock` if set.
-4. **macOS**: `~/.sanctuary/castle.sock` if `HOME` is set.
-5. **macOS**: `/var/run/sanctuary-castle.sock` (last resort; only writable as root).
+1. **macOS**: `/tmp/sanctuary-castle-active.json` when present, valid,
+   and either missing `pid` or pointing at a live daemon process.
+2. `SANCTUARY_CASTLE_SOCKET` environment variable (explicit override).
+3. **Linux**: `/run/sanctuary/<fortress-id>/filter.sock` (root daemon path).
+4. **macOS**: `${SANCTUARY_FORTRESS_PATH}/castle.sock` if set.
+5. **macOS**: `~/.sanctuary/castle.sock` if `HOME` is set.
+6. **macOS**: `/var/run/sanctuary-castle.sock` (last resort; only writable as root).
 
 macOS rootless protections block `/var/run` for unprivileged processes,
 which is why the per-fortress and home-default fallbacks come first.
+The active discovery file is intentionally first because the system
+extension does not inherit the `sanctuary wrap` environment. The file is
+written atomically with mode `0644`; `/tmp` remains world-writable in this
+first integration and is slated for hardening to `/Library/Application
+Support/Sanctuary/active.json`.
 
 ## Architectural decisions
 

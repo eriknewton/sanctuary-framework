@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 import { bytesToString, toBase64url } from "../../core/encoding.js";
 import { sign as identitySign } from "../../core/identity.js";
@@ -21,7 +21,10 @@ import {
 } from "./manifest-publisher.js";
 import { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
-import { resolveCastleWallSocketPath } from "./socket-path.js";
+import {
+  CASTLE_WALL_ACTIVE_CONFIG_PATH,
+  resolveCastleWallSocketPath,
+} from "./socket-path.js";
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
@@ -36,6 +39,7 @@ export interface MacOSCastleWallDaemonInput {
   auditLog: AuditLog;
   platform?: NodeJS.Platform;
   socketPath?: string;
+  activeConfigPath?: string;
   listenerFactory?: (options: MacOSCastleWallListenerOptions) => MacOSCastleWallListenerHandle;
 }
 
@@ -65,6 +69,13 @@ interface LoadedSigningKey extends ManifestSigningKey {
   publicKey: Uint8Array;
 }
 
+interface ActiveCastleWallConfig {
+  socket_path: string;
+  fortress_id: string;
+  pid: number;
+  started_at: string;
+}
+
 export async function startMacOSCastleWallDaemon(
   input: MacOSCastleWallDaemonInput,
 ): Promise<MacOSCastleWallDaemonHandle> {
@@ -75,7 +86,9 @@ export async function startMacOSCastleWallDaemon(
       fortressId: input.fortressId,
       fortressPath: input.fortressPath,
     }).path;
+  const activeConfigPath = input.activeConfigPath ?? CASTLE_WALL_ACTIVE_CONFIG_PATH;
 
+  await assertActiveConfigNotOwnedByLiveProcess(activeConfigPath);
   await assertSocketNotOwnedByLiveProcess(socketPath);
   await mkdir(join(input.fortressPath, "policy", "egress", "rules"), {
     recursive: true,
@@ -150,15 +163,31 @@ export async function startMacOSCastleWallDaemon(
     ? input.listenerFactory(listenerOptions)
     : new MacOSFlowIpcListener(listenerOptions);
 
-  await listener.start();
-  await input.auditLog.append(
-    "l1",
-    "filter_started",
-    input.fortressId,
-    { socket_path: socketPath, source: "sanctuary-wrap" },
-    "success",
-  );
-  await input.auditLog.flush();
+  let activeConfigWritten = false;
+  try {
+    await listener.start();
+    await writeActiveConfig(activeConfigPath, {
+      socket_path: socketPath,
+      fortress_id: input.fortressId,
+      pid: process.pid,
+      started_at: new Date().toISOString(),
+    });
+    activeConfigWritten = true;
+    await input.auditLog.append(
+      "l1",
+      "filter_started",
+      input.fortressId,
+      { socket_path: socketPath, source: "sanctuary-wrap" },
+      "success",
+    );
+    await input.auditLog.flush();
+  } catch (err) {
+    if (activeConfigWritten) {
+      await removeActiveConfigIfCurrent(activeConfigPath, socketPath, input.fortressId);
+    }
+    await listener.stop().catch(() => undefined);
+    throw err;
+  }
 
   async function reloadPolicy(
     request?: PolicyReloadRequest,
@@ -213,15 +242,19 @@ export async function startMacOSCastleWallDaemon(
     socketPath,
     reloadPolicy,
     async stop() {
-      await listener.stop();
-      await input.auditLog.append(
-        "l1",
-        "filter_stopped",
-        input.fortressId,
-        { socket_path: socketPath, source: "sanctuary-wrap" },
-        "success",
-      );
-      await input.auditLog.flush();
+      try {
+        await listener.stop();
+        await input.auditLog.append(
+          "l1",
+          "filter_stopped",
+          input.fortressId,
+          { socket_path: socketPath, source: "sanctuary-wrap" },
+          "success",
+        );
+        await input.auditLog.flush();
+      } finally {
+        await removeActiveConfigIfCurrent(activeConfigPath, socketPath, input.fortressId);
+      }
     },
   };
 }
@@ -304,5 +337,94 @@ async function assertSocketNotOwnedByLiveProcess(socketPath: string): Promise<vo
       : undefined;
     if (code === "ENOENT") return;
     throw err;
+  }
+}
+
+async function assertActiveConfigNotOwnedByLiveProcess(configPath: string): Promise<void> {
+  const config = await readActiveConfig(configPath);
+  if (!config) return;
+  if (isPidAlive(config.pid)) {
+    throw new Error(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
+  }
+}
+
+async function writeActiveConfig(
+  configPath: string,
+  config: ActiveCastleWallConfig,
+): Promise<void> {
+  await mkdir(dirname(configPath), { recursive: true, mode: 0o755 });
+  const tempPath = `${configPath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  await writeFile(tempPath, `${JSON.stringify(config)}\n`, {
+    encoding: "utf8",
+    mode: 0o644,
+  });
+  await rename(tempPath, configPath);
+}
+
+async function removeActiveConfigIfCurrent(
+  configPath: string,
+  socketPath: string,
+  fortressId: string,
+): Promise<void> {
+  const config = await readActiveConfig(configPath);
+  if (
+    config &&
+    config.pid === process.pid &&
+    config.socket_path === socketPath &&
+    config.fortress_id === fortressId
+  ) {
+    await unlink(configPath).catch((err: unknown) => {
+      const code = err instanceof Error && "code" in err
+        ? (err as NodeJS.ErrnoException).code
+        : undefined;
+      if (code !== "ENOENT") throw err;
+    });
+  }
+}
+
+async function readActiveConfig(configPath: string): Promise<ActiveCastleWallConfig | null> {
+  let raw: string;
+  try {
+    raw = await readFile(configPath, "utf8");
+  } catch (err) {
+    const code = err instanceof Error && "code" in err
+      ? (err as NodeJS.ErrnoException).code
+      : undefined;
+    if (code === "ENOENT") return null;
+    throw err;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<ActiveCastleWallConfig>;
+    if (
+      typeof parsed.socket_path !== "string" ||
+      typeof parsed.fortress_id !== "string" ||
+      typeof parsed.pid !== "number" ||
+      !Number.isInteger(parsed.pid) ||
+      typeof parsed.started_at !== "string"
+    ) {
+      return null;
+    }
+    return {
+      socket_path: parsed.socket_path,
+      fortress_id: parsed.fortress_id,
+      pid: parsed.pid,
+      started_at: parsed.started_at,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = err instanceof Error && "code" in err
+      ? (err as NodeJS.ErrnoException).code
+      : undefined;
+    return code === "EPERM";
   }
 }

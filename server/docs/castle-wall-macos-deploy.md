@@ -78,10 +78,13 @@ Sanctuary main process                       macOS NEFilterDataProvider
          └──────────────────────────────────────────────┘
 ```
 
-The UDS path is resolved by `resolveCastleWallSocketPath`. On macOS
-the default is `<storage_path>/castle.sock` when
-`SANCTUARY_FORTRESS_PATH` is set, otherwise
-`$HOME/.sanctuary/castle.sock`.
+The daemon binds the UDS path resolved by `resolveCastleWallSocketPath`.
+After bind, it atomically writes `/tmp/sanctuary-castle-active.json` with
+the active `socket_path`, `fortress_id`, daemon `pid`, and `started_at`.
+The system extension checks that file before environment-driven fallbacks
+because it does not inherit the `sanctuary wrap` environment. The file is
+mode `0644` under world-writable `/tmp` for this first integration; Phase 3
+hardens the location to `/Library/Application Support/Sanctuary/active.json`.
 
 ## Build the signed `.app`
 
