@@ -22,6 +22,7 @@
 import { mkdir, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, isAbsolute, resolve } from "node:path";
+import { Writable } from "node:stream";
 
 import { tightenStoragePermissions } from "../storage/permissions.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
@@ -34,6 +35,7 @@ import {
   RecoveryKeyConfirmationNonInteractiveError,
 } from "./recovery-key-disclosure.js";
 import { DEFAULT_STORAGE_DIR } from "../paths.js";
+import { runProvisionPin } from "../cli/castle-wall.js";
 
 export interface InitOptions {
   /** Operator-supplied fortress path. Wins over env + default. */
@@ -119,6 +121,18 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
   const recoveryKey = toBase64url(masterKey);
   const keyHash = hashToString(masterKey);
   await storage.write("_meta", "recovery-key-hash", stringToBytes(keyHash));
+
+  const pinResult = await runProvisionPin({
+    out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+    env: {
+      ...process.env,
+      SANCTUARY_STORAGE_PATH: fortressPath,
+      SANCTUARY_RECOVERY_KEY: recoveryKey,
+    },
+  });
+  if (pinResult !== 0) {
+    throw new Error("Castle Wall provision-pin auto-bootstrap failed");
+  }
 
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`\n  Sanctuary init`);

@@ -1,16 +1,25 @@
 import { execSync as nodeExecSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createConnection } from "node:net";
+import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
 import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
-import { bytesToString, concatBytes, fromBase64url, stringToBytes } from "../core/encoding.js";
+import { bytesToString, fromBase64url, stringToBytes } from "../core/encoding.js";
 import { encrypt } from "../core/encryption.js";
 import { randomBytes } from "../core/random.js";
 import { resolveStoragePath } from "../paths.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import { AuditLog, type AuditEntry } from "../l2-operational/audit-log.js";
+import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
+import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+import type {
+  CastleWallMessage,
+  DecisionResponse,
+  PolicyReloadResponse,
+} from "../castle-wall/ipc/messages.js";
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
@@ -21,6 +30,13 @@ export interface CastleWallCommandContext {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   execSyncFn?: (command: string) => string;
+}
+
+export interface CastleWallParsedArgs {
+  fortress?: string;
+  since?: string;
+  scope?: "once" | "session" | "always";
+  requestId?: string;
 }
 
 function write(stream: Writable, text: string): void {
@@ -121,8 +137,7 @@ export async function runProvisionPin(
     const masterKey = await resolveMasterKey(storagePath, env);
     const privateSeed = randomBytes(32);
     const publicKey = ed25519.getPublicKey(privateSeed);
-    const privateKey = concatBytes(privateSeed, publicKey);
-    const encryptedPrivateKey = encrypt(privateKey, masterKey);
+    const encryptedPrivateKey = encrypt(privateSeed, masterKey);
     const fingerprint = fingerprintFromPublicKey(publicKey);
 
     await writeFile(pubPath, publicKey, { mode: 0o600 });
@@ -133,7 +148,6 @@ export async function runProvisionPin(
     await chmod(privPath, 0o600);
 
     privateSeed.fill(0);
-    privateKey.fill(0);
     masterKey.fill(0);
 
     write(out, `${fingerprint}\n`);
@@ -205,4 +219,259 @@ export async function runStatus(
 
   write(out, `Castle Wall sysext: ${sysextState}\n`);
   return 0;
+}
+
+export async function runReload(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {}
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+  const socketPath = resolveCastleWallSocketPath({
+    platform: ctx.platform ?? process.platform,
+    fortressPath,
+  }).path;
+
+  try {
+    const reply = await sendCastleWallMessage<PolicyReloadResponse>(
+      socketPath,
+      {
+        type: "policy_reload_request",
+        request_id: nodeRandomBytes(16).toString("hex"),
+        manifest_path: join(fortressPath, "policy", "egress", "manifest.json"),
+      },
+      "policy_reload_response",
+    );
+    if (!reply.ok) {
+      write(err, `Error: ${reply.error ?? "policy reload failed"}\n`);
+      return 1;
+    }
+    write(out, `Castle Wall policy reloaded (${reply.loaded_rule_count} rules).\n`);
+    return 0;
+  } catch (error) {
+    if (isSocketUnavailable(error)) {
+      write(
+        out,
+        `No Castle Wall daemon running for fortress ${fortressIdLabel(fortressPath)}. Run 'sanctuary wrap' to start one.\n`,
+      );
+      return 0;
+    }
+    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}
+
+export async function runApprove(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {}
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  const requestId = parsed.requestId;
+  if (!requestId) {
+    write(err, "Error: castle-wall approve requires <request_id>\n");
+    return 2;
+  }
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+  const socketPath = resolveCastleWallSocketPath({
+    platform: ctx.platform ?? process.platform,
+    fortressPath,
+  }).path;
+  const scope = parsed.scope ?? "once";
+  const message: DecisionResponse = {
+    type: "decision_response",
+    request_id: requestId,
+    decision:
+      scope === "always"
+        ? "allow_always"
+        : "allow_once",
+    ...(scope === "session"
+      ? { learn: { granularity: "per_template_domain" as const } }
+      : {}),
+  };
+
+  try {
+    const reply = await sendCastleWallMessage<CastleWallMessage>(
+      socketPath,
+      message,
+      "decision_response_ack",
+    );
+    if ("ok" in reply && reply.ok === true) {
+      write(out, `Castle Wall request ${requestId} approved (${scope}).\n`);
+      return 0;
+    }
+    write(err, `Error: no pending request matches ${requestId}\n`);
+    return 1;
+  } catch (error) {
+    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}
+
+export async function runAuditDump(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {}
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+  const sinceIso = parsed.since
+    ? new Date(Date.now() - parseDurationMs(parsed.since)).toISOString()
+    : undefined;
+
+  try {
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveMasterKey(fortressPath, env);
+    const auditLog = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const query = await auditLog.query({
+      ...(sinceIso ? { since: sinceIso } : {}),
+      layer: "l1",
+      limit: 100_000,
+    });
+    for (const entry of query.entries.filter(isCastleWallAuditEntry)) {
+      write(out, JSON.stringify(entry) + "\n");
+    }
+    return 0;
+  } catch (error) {
+    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}
+
+export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
+  const parsed: CastleWallParsedArgs = {};
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--fortress") {
+      parsed.fortress = argv[++i];
+    } else if (arg === "--since") {
+      parsed.since = argv[++i];
+    } else if (arg.startsWith("--scope=")) {
+      parsed.scope = parseScope(arg.slice("--scope=".length));
+    } else if (arg === "--scope") {
+      parsed.scope = parseScope(argv[++i]);
+    } else if (!arg.startsWith("-") && !parsed.requestId) {
+      parsed.requestId = arg;
+    }
+  }
+  return parsed;
+}
+
+function parseScope(value: string | undefined): "once" | "session" | "always" {
+  if (value === "session" || value === "always" || value === "once") return value;
+  throw new Error("--scope must be once, session, or always");
+}
+
+function resolveFortressArg(
+  fortress: string | undefined,
+  env: NodeJS.ProcessEnv,
+): string {
+  if (!fortress) return resolveStoragePath(env);
+  return isAbsolute(fortress) ? fortress : resolve(process.cwd(), fortress);
+}
+
+function fortressIdLabel(fortressPath: string): string {
+  return fortressPath;
+}
+
+function parseDurationMs(value: string): number {
+  const match = /^(\d+)([mhd])$/.exec(value);
+  if (!match) throw new Error("--since must use forms like 5m, 1h, or 2d");
+  const amount = Number(match[1]);
+  const unit = match[2];
+  const multiplier = unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000;
+  return amount * multiplier;
+}
+
+function isCastleWallAuditEntry(entry: AuditEntry): boolean {
+  return CASTLE_WALL_AUDIT_OPERATIONS.has(entry.operation);
+}
+
+const CASTLE_WALL_AUDIT_OPERATIONS = new Set([
+  "egress_allowed",
+  "egress_blocked",
+  "operator_decision",
+  "policy_loaded",
+  "policy_validation_failed",
+  "filter_started",
+  "filter_stopped",
+  "filter_crashed",
+  "queue_saturated",
+  "no_wall_engaged",
+  "no_wall_expired",
+  "wal_overflow",
+  "external_firewall_clobber",
+  "flow_decision_rejected",
+  "flow_pending_approval_rejected",
+]);
+
+async function sendCastleWallMessage<T extends CastleWallMessage>(
+  socketPath: string,
+  message: CastleWallMessage,
+  expectedType: T["type"],
+): Promise<T> {
+  return await new Promise<T>((resolvePromise, reject) => {
+    const socket = createConnection(socketPath);
+    let inbound = new Uint8Array(0);
+    let settled = false;
+    const timer = setTimeout(() => {
+      finish(new Error("Castle Wall IPC request timed out"));
+    }, 5_000);
+    const finish = (result: T | Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (result instanceof Error) reject(result);
+      else resolvePromise(result);
+    };
+    socket.on("connect", () => {
+      socket.write(frame(JSON.stringify({
+        jsonrpc: "2.0",
+        method: `castle-wall.${message.type}`,
+        params: message,
+      })));
+    });
+    socket.on("data", (chunk: Buffer) => {
+      const merged = new Uint8Array(inbound.length + chunk.length);
+      merged.set(inbound, 0);
+      merged.set(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.length), inbound.length);
+      inbound = merged;
+      while (inbound.length > 0) {
+        const parsed = parseFrame(inbound);
+        if (parsed.kind === "need_more") break;
+        if (parsed.kind === "error") {
+          finish(new Error(`Castle Wall IPC framing error: ${parsed.reason}`));
+          return;
+        }
+        inbound = inbound.slice(parsed.consumedBytes);
+        try {
+          const envelope = JSON.parse(parsed.body) as { params?: CastleWallMessage };
+          if (envelope.params?.type === expectedType) {
+            finish(envelope.params as T);
+            return;
+          }
+        } catch {
+          // Ignore malformed frames from non-admin peers until timeout.
+        }
+      }
+    });
+    socket.on("error", finish);
+  });
+}
+
+function isSocketUnavailable(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    ((error as NodeJS.ErrnoException).code === "ENOENT" ||
+      (error as NodeJS.ErrnoException).code === "ECONNREFUSED")
+  );
 }

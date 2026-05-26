@@ -33,6 +33,7 @@
 
 import { writeFile, readFile, mkdir, access } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
+import { Writable } from "node:stream";
 import { platform } from "node:os";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -81,6 +82,8 @@ import {
   PassphraseConfirmationNonInteractiveError,
 } from "./recovery-key-disclosure.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
+import { runProvisionPin } from "../cli/castle-wall.js";
+import type { MacOSCastleWallDaemonHandle } from "../castle-wall/runtime/index.js";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -520,6 +523,42 @@ export async function runWrap(
   // above (honours SANCTUARY_STORAGE_PATH for multi-agent hosts).
   await mkdir(storagePath, { recursive: true, mode: 0o700 });
 
+  if (passphraseValue !== undefined) {
+    const pinResult = await runProvisionPin({
+      out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+      env: {
+        ...process.env,
+        SANCTUARY_STORAGE_PATH: storagePath,
+        SANCTUARY_PASSPHRASE: passphraseValue,
+      },
+    });
+    if (pinResult !== 0) {
+      throw new Error("Castle Wall provision-pin auto-bootstrap failed");
+    }
+  }
+
+  let castleWallDaemon: MacOSCastleWallDaemonHandle | undefined;
+  const registerCastleWallCleanup = () => {
+    if (!castleWallDaemon) return;
+    const stop = () => {
+      castleWallDaemon?.stop().catch(() => {});
+    };
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+    process.once("exit", stop);
+  };
+  const startCastleWallForWrap = async (auditLog: AuditLog, masterKey: Uint8Array) => {
+    if (castleWallDaemon) return;
+    const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
+    castleWallDaemon = await startMacOSCastleWallDaemon({
+      fortressPath: storagePath,
+      fortressId: fortressIdFromStoragePath(storagePath),
+      masterKey,
+      auditLog,
+    });
+    registerCastleWallCleanup();
+  };
+
   // v1.2.1 (Finding GGG): plaintext passphrase backup file is now opt-in.
   // Default: Keychain-only on macOS. The plaintext file is written ONLY when
   // --write-passphrase-backup <path> is supplied. The stderr banner still
@@ -760,6 +799,7 @@ export async function runWrap(
           );
         }
         const ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
+        await startCastleWallForWrap(ndAuditLog, ndDerived.key);
 
         const { IdentityManager } = await import("../l1-cognitive/tools.js");
         const { createIdentity } = await import("../core/identity.js");
@@ -878,6 +918,7 @@ export async function runWrap(
         );
       }
       wrapAuditLog = new AuditLog(v11Storage, derived.key);
+      await startCastleWallForWrap(wrapAuditLog, derived.key);
 
       // v1.2.1 (Finding NNN): auto-create default identity at wrap time.
       try {

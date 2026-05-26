@@ -714,6 +714,21 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runStatus();
   }
 
+  if (command === "reload") {
+    const { runReload } = await import("./cli/castle-wall.js");
+    return runReload(args.slice(1));
+  }
+
+  if (command === "audit-dump") {
+    const { runAuditDump } = await import("./cli/castle-wall.js");
+    return runAuditDump(args.slice(1));
+  }
+
+  if (command === "approve") {
+    const { runApprove } = await import("./cli/castle-wall.js");
+    return runApprove(args.slice(1));
+  }
+
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `Unknown subcommand: ${command}. Try: sanctuary castle-wall --help`
@@ -733,6 +748,9 @@ function printCastleWallHelp(): void {
   Subcommands:
     provision-pin    Generate and pin the local Castle Wall keypair.
     status           Show pinned-key fingerprint and sysext status.
+    reload           Reload policy in the running fortress daemon.
+    audit-dump       Emit Castle Wall audit events as JSONL.
+    approve          Approve a pending Castle Wall request.
 
   Options:
     --help, -h   Show this help

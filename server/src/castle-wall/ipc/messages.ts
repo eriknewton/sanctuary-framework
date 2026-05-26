@@ -33,6 +33,7 @@ export type CastleWallMessage =
   | PolicyReloadResponse
   | DecisionRequest
   | DecisionResponse
+  | DecisionResponseAck
   | AuditEmitNotification
   | AuditEmitMetricBatchNotification
   | UnlockNotification
@@ -130,6 +131,14 @@ export interface DecisionResponse {
   learn?: {
     granularity: LearnedGranularity;
   };
+}
+
+/** Response from main/listener to CLI confirming operator decision delivery. */
+export interface DecisionResponseAck {
+  type: "decision_response_ack";
+  request_id: IpcRequestId;
+  ok: boolean;
+  error?: string;
 }
 
 /** One-way notification from daemon to main: "block / allow / decision happened; log it." */
