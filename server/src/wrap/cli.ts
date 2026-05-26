@@ -33,6 +33,7 @@
 
 import { writeFile, readFile, mkdir, access } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
+import { Writable } from "node:stream";
 import { platform } from "node:os";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -81,6 +82,8 @@ import {
   PassphraseConfirmationNonInteractiveError,
 } from "./recovery-key-disclosure.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
+import { runProvisionPin } from "../cli/castle-wall.js";
+import type { MacOSCastleWallDaemonHandle } from "../castle-wall/runtime/index.js";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -520,6 +523,60 @@ export async function runWrap(
   // above (honours SANCTUARY_STORAGE_PATH for multi-agent hosts).
   await mkdir(storagePath, { recursive: true, mode: 0o700 });
 
+  if (passphraseValue !== undefined) {
+    // Auto-bootstrap pinned-key state for the IPC handshake. Failures here
+    // warn but do not abort wrap: a missing pin surfaces cleanly at handshake
+    // time (sysext refuses connection) rather than as a wrap-startup abort.
+    // First-integration discipline: do no harm to the wrap critical path.
+    try {
+      const pinResult = await runProvisionPin({
+        out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+        err: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+        env: {
+          ...process.env,
+          SANCTUARY_STORAGE_PATH: storagePath,
+          SANCTUARY_PASSPHRASE: passphraseValue,
+        },
+      });
+      if (pinResult !== 0) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `\n  Sanctuary wrap: Castle Wall provision-pin auto-bootstrap exited ${pinResult}.` +
+          `\n  Wrap continues; run 'sanctuary castle-wall provision-pin' manually if IPC handshake fails.`
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Sanctuary wrap: Castle Wall provision-pin auto-bootstrap threw (${msg}).` +
+        `\n  Wrap continues; run 'sanctuary castle-wall provision-pin' manually if IPC handshake fails.`
+      );
+    }
+  }
+
+  let castleWallDaemon: MacOSCastleWallDaemonHandle | undefined;
+  const registerCastleWallCleanup = () => {
+    if (!castleWallDaemon) return;
+    const stop = () => {
+      castleWallDaemon?.stop().catch(() => {});
+    };
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+    process.once("exit", stop);
+  };
+  const startCastleWallForWrap = async (auditLog: AuditLog, masterKey: Uint8Array) => {
+    if (castleWallDaemon) return;
+    const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
+    castleWallDaemon = await startMacOSCastleWallDaemon({
+      fortressPath: storagePath,
+      fortressId: fortressIdFromStoragePath(storagePath),
+      masterKey,
+      auditLog,
+    });
+    registerCastleWallCleanup();
+  };
+
   // v1.2.1 (Finding GGG): plaintext passphrase backup file is now opt-in.
   // Default: Keychain-only on macOS. The plaintext file is written ONLY when
   // --write-passphrase-backup <path> is supplied. The stderr banner still
@@ -760,6 +817,18 @@ export async function runWrap(
           );
         }
         const ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
+        // Best-effort: daemon failure does not block identity bootstrap.
+        // See parallel block below (line ~939) for full rationale.
+        try {
+          await startCastleWallForWrap(ndAuditLog, ndDerived.key);
+        } catch (err) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Note: Castle Wall daemon did not start ` +
+              `(${(err as Error).message}). ` +
+              `Wrap continues; sysext IPC unavailable until the daemon starts.`,
+          );
+        }
 
         const { IdentityManager } = await import("../l1-cognitive/tools.js");
         const { createIdentity } = await import("../core/identity.js");
@@ -878,6 +947,22 @@ export async function runWrap(
         );
       }
       wrapAuditLog = new AuditLog(v11Storage, derived.key);
+      // Best-effort: a Castle Wall daemon startup failure (e.g. EACCES on
+      // Linux when the fortress-scoped socket dir requires root, or any
+      // platform where the pinned key is unavailable) does not fail wrap.
+      // The agent harness still gets wrapped; the IPC daemon will surface
+      // its absence at handshake time. This mirrors the surrounding
+      // best-effort discipline for v1.1 dashboard wiring.
+      try {
+        await startCastleWallForWrap(wrapAuditLog, derived.key);
+      } catch (err) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Note: Castle Wall daemon did not start ` +
+            `(${(err as Error).message}). ` +
+            `Wrap continues; sysext IPC unavailable until the daemon starts.`,
+        );
+      }
 
       // v1.2.1 (Finding NNN): auto-create default identity at wrap time.
       try {

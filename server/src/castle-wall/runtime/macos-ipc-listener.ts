@@ -53,6 +53,9 @@ import type {
   FlowPendingApprovalNotification,
   ManifestSubscribeRequest,
   ManifestUpdatedNotification,
+  PolicyReloadRequest,
+  PolicyReloadResponse,
+  DecisionResponse,
 } from "../ipc/messages.js";
 import type { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 
@@ -93,12 +96,19 @@ export interface MacOSFlowIpcListenerOptions {
   generateNonce?: () => Uint8Array;
   /** Signs the connection nonce so the extension can authenticate main. */
   handshakeSigner?: MacOSHandshakeSigner;
+  /** Optional local-admin command handler used by the CLI verbs. */
+  adminHandler?: MacOSFlowIpcAdminHandler;
 }
 
 export interface MacOSHandshakeSigner {
   fortressId: string;
   signingKeyId: string;
   signNonce(nonce: Uint8Array): Uint8Array;
+}
+
+export interface MacOSFlowIpcAdminHandler {
+  reloadPolicy(request: PolicyReloadRequest): Promise<PolicyReloadResponse>;
+  handleDecision(response: DecisionResponse): Promise<{ ok: boolean; error?: string }>;
 }
 
 /** Per-connection bookkeeping. */
@@ -163,6 +173,7 @@ export class MacOSFlowIpcListener {
   private readonly maxConnections: number;
   private readonly generateNonce: () => Uint8Array;
   private readonly handshakeSigner: MacOSHandshakeSigner | null;
+  private readonly adminHandler: MacOSFlowIpcAdminHandler | null;
   private server: Server | null = null;
   private connections = new Map<string, ConnectionState>();
   private stats: MacOSFlowIpcListenerStats = {
@@ -180,6 +191,7 @@ export class MacOSFlowIpcListener {
     this.maxConnections = opts.maxConnections ?? 8;
     this.generateNonce = opts.generateNonce ?? defaultNonceBytes;
     this.handshakeSigner = opts.handshakeSigner ?? null;
+    this.adminHandler = opts.adminHandler ?? null;
   }
 
   /** Bind the UDS socket and start accepting connections. */
@@ -240,6 +252,17 @@ export class MacOSFlowIpcListener {
    */
   async broadcastManifestUpdate(): Promise<number> {
     return await this.consumer.broadcastManifestUpdate();
+  }
+
+  /** Fan an operator decision response to active extension subscribers. */
+  async broadcastDecisionResponse(response: DecisionResponse): Promise<number> {
+    let emitted = 0;
+    for (const conn of this.connections.values()) {
+      if (!conn.registered) continue;
+      this.writeMessage(conn, response);
+      emitted += 1;
+    }
+    return emitted;
   }
 
   /** Snapshot listener counters. */
@@ -363,6 +386,12 @@ export class MacOSFlowIpcListener {
       case "manifest_subscribe":
         await this.handleSubscribe(state, message);
         return;
+      case "policy_reload_request":
+        await this.handlePolicyReload(state, message as PolicyReloadRequest);
+        return;
+      case "decision_response":
+        await this.handleDecisionResponse(state, message as DecisionResponse);
+        return;
       case "flow_decision_recorded":
         await this.consumer.handleFlowDecisionRecorded(
           message as FlowDecisionRecordedNotification,
@@ -386,6 +415,39 @@ export class MacOSFlowIpcListener {
     request: ManifestSubscribeRequest,
   ): Promise<void> {
     await this.consumer.handleManifestSubscribe(request, state.subscriberId);
+  }
+
+  private async handlePolicyReload(
+    state: ConnectionState,
+    request: PolicyReloadRequest,
+  ): Promise<void> {
+    if (!this.adminHandler) {
+      this.writeMessage(state, {
+        type: "policy_reload_response",
+        request_id: request.request_id,
+        ok: false,
+        loaded_manifest_signature_b64url: null,
+        loaded_rule_count: 0,
+        error: "policy reload handler unavailable",
+      });
+      return;
+    }
+    this.writeMessage(state, await this.adminHandler.reloadPolicy(request));
+  }
+
+  private async handleDecisionResponse(
+    state: ConnectionState,
+    response: DecisionResponse,
+  ): Promise<void> {
+    const result = this.adminHandler
+      ? await this.adminHandler.handleDecision(response)
+      : { ok: false, error: "decision handler unavailable" };
+    this.writeMessage(state, {
+      type: "decision_response_ack",
+      request_id: response.request_id,
+      ok: result.ok,
+      ...(result.error ? { error: result.error } : {}),
+    });
   }
 
   private writeMessage(state: ConnectionState, message: CastleWallMessage): void {

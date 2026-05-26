@@ -21,3 +21,4 @@ export * from "./ipc-client.js";
 export * from "./lifecycle.js";
 export * from "./macos-flow-events.js";
 export * from "./macos-ipc-listener.js";
+export * from "./macos-daemon.js";
