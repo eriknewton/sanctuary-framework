@@ -817,7 +817,18 @@ export async function runWrap(
           );
         }
         const ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
-        await startCastleWallForWrap(ndAuditLog, ndDerived.key);
+        // Best-effort: daemon failure does not block identity bootstrap.
+        // See parallel block below (line ~939) for full rationale.
+        try {
+          await startCastleWallForWrap(ndAuditLog, ndDerived.key);
+        } catch (err) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Note: Castle Wall daemon did not start ` +
+              `(${(err as Error).message}). ` +
+              `Wrap continues; sysext IPC unavailable until the daemon starts.`,
+          );
+        }
 
         const { IdentityManager } = await import("../l1-cognitive/tools.js");
         const { createIdentity } = await import("../core/identity.js");
@@ -936,7 +947,22 @@ export async function runWrap(
         );
       }
       wrapAuditLog = new AuditLog(v11Storage, derived.key);
-      await startCastleWallForWrap(wrapAuditLog, derived.key);
+      // Best-effort: a Castle Wall daemon startup failure (e.g. EACCES on
+      // Linux when the fortress-scoped socket dir requires root, or any
+      // platform where the pinned key is unavailable) does not fail wrap.
+      // The agent harness still gets wrapped; the IPC daemon will surface
+      // its absence at handshake time. This mirrors the surrounding
+      // best-effort discipline for v1.1 dashboard wiring.
+      try {
+        await startCastleWallForWrap(wrapAuditLog, derived.key);
+      } catch (err) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Note: Castle Wall daemon did not start ` +
+            `(${(err as Error).message}). ` +
+            `Wrap continues; sysext IPC unavailable until the daemon starts.`,
+        );
+      }
 
       // v1.2.1 (Finding NNN): auto-create default identity at wrap time.
       try {
