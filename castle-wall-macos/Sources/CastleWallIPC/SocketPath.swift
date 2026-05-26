@@ -12,8 +12,10 @@
 //
 
 import Foundation
+import Darwin
 
 public enum SocketPathSource: String, Equatable {
+    case macosActiveConfig = "macos_active_config"
     case explicitOverride = "explicit_override"
     case linuxPerFortress = "linux_per_fortress"
     case macosRootDaemon = "macos_root_daemon"
@@ -32,8 +34,10 @@ public struct ResolvedSocketPath: Equatable {
 }
 
 public enum SocketPath {
+    public static let activeConfigPath = "/tmp/sanctuary-castle-active.json"
+
     /// Resolve the UDS socket path the macOS extension or the Linux client
-    /// should connect to. Pure: no I/O, no syscalls.
+    /// should connect to.
     ///
     /// `platform` should be one of "darwin", "linux", or any other lowercase
     /// platform identifier. Unknown platforms degrade to the macOS fallback
@@ -43,8 +47,14 @@ public enum SocketPath {
         fortressId: String? = nil,
         fortressPath: String? = nil,
         homeDir: String? = nil,
-        explicitOverride: String? = nil
+        explicitOverride: String? = nil,
+        activeConfigPath: String = SocketPath.activeConfigPath
     ) -> ResolvedSocketPath {
+        if platform == "darwin",
+           let active = resolveActiveConfigSocketPath(configPath: activeConfigPath) {
+            return active
+        }
+
         if let override = explicitOverride, !override.isEmpty {
             return ResolvedSocketPath(path: override, source: .explicitOverride)
         }
@@ -84,6 +94,28 @@ public enum SocketPath {
             path: "/var/run/sanctuary-castle.sock",
             source: .macosRootDaemon
         )
+    }
+
+    private static func resolveActiveConfigSocketPath(configPath: String) -> ResolvedSocketPath? {
+        guard let data = FileManager.default.contents(atPath: configPath) else {
+            return nil
+        }
+        guard
+            let parsed = try? JSONSerialization.jsonObject(with: data),
+            let object = parsed as? [String: Any],
+            let socketPath = object["socket_path"] as? String,
+            !socketPath.isEmpty,
+            let pid = object["pid"] as? Int,
+            pid > 0,
+            isPidAlive(pid)
+        else {
+            return nil
+        }
+        return ResolvedSocketPath(path: socketPath, source: .macosActiveConfig)
+    }
+
+    private static func isPidAlive(_ pid: Int) -> Bool {
+        kill(pid_t(pid), 0) == 0 || errno == EPERM
     }
 
     private static func stripTrailingSlash(_ value: String) -> String {

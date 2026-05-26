@@ -34,6 +34,8 @@ export interface SocketPathInput {
   explicitOverride?: string;
 }
 
+export const CASTLE_WALL_ACTIVE_CONFIG_PATH = "/tmp/sanctuary-castle-active.json";
+
 /** The resolved socket path plus a tag describing which fallback won. */
 export interface ResolvedSocketPath {
   path: string;

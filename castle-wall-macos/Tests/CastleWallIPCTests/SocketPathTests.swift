@@ -11,6 +11,83 @@ import XCTest
 @testable import CastleWallIPC
 
 final class SocketPathTests: XCTestCase {
+    private var tempFiles: [String] = []
+
+    override func tearDown() {
+        for file in tempFiles {
+            try? FileManager.default.removeItem(atPath: file)
+        }
+        tempFiles.removeAll()
+        super.tearDown()
+    }
+
+    private func writeActiveConfig(_ contents: String) throws -> String {
+        let path = "\(NSTemporaryDirectory())socket-path-\(UUID().uuidString).json"
+        try contents.write(toFile: path, atomically: true, encoding: .utf8)
+        tempFiles.append(path)
+        return path
+    }
+
+    func testActiveConfigTakesPrecedenceOverExplicitOverrideOnMacOS() throws {
+        let configPath = try writeActiveConfig("""
+        {"socket_path":"/tmp/from-active-config.sock","fortress_id":"fortress-test","pid":\(getpid()),"started_at":"2026-05-25T00:00:00.000Z"}
+        """)
+        let out = SocketPath.resolve(
+            platform: "darwin",
+            explicitOverride: "/tmp/from-env.sock",
+            activeConfigPath: configPath
+        )
+        XCTAssertEqual(out.path, "/tmp/from-active-config.sock")
+        XCTAssertEqual(out.source, .macosActiveConfig)
+    }
+
+    func testActiveConfigFallsThroughWhenAbsent() {
+        let out = SocketPath.resolve(
+            platform: "darwin",
+            homeDir: "/Users/op",
+            activeConfigPath: "\(NSTemporaryDirectory())missing-\(UUID().uuidString).json"
+        )
+        XCTAssertEqual(out.path, "/Users/op/.sanctuary/castle.sock")
+        XCTAssertEqual(out.source, .macosHomeDefault)
+    }
+
+    func testMalformedActiveConfigFallsThrough() throws {
+        let configPath = try writeActiveConfig("{bad-json")
+        let out = SocketPath.resolve(
+            platform: "darwin",
+            homeDir: "/Users/op",
+            activeConfigPath: configPath
+        )
+        XCTAssertEqual(out.path, "/Users/op/.sanctuary/castle.sock")
+        XCTAssertEqual(out.source, .macosHomeDefault)
+    }
+
+    func testActiveConfigWithoutPidFallsThrough() throws {
+        let configPath = try writeActiveConfig("""
+        {"socket_path":"/tmp/no-pid.sock","fortress_id":"fortress-test","started_at":"2026-05-25T00:00:00.000Z"}
+        """)
+        let out = SocketPath.resolve(
+            platform: "darwin",
+            homeDir: "/Users/op",
+            activeConfigPath: configPath
+        )
+        XCTAssertEqual(out.path, "/Users/op/.sanctuary/castle.sock")
+        XCTAssertEqual(out.source, .macosHomeDefault)
+    }
+
+    func testActiveConfigWithDeadPidFallsThrough() throws {
+        let configPath = try writeActiveConfig("""
+        {"socket_path":"/tmp/stale.sock","fortress_id":"fortress-test","pid":999999,"started_at":"2026-05-25T00:00:00.000Z"}
+        """)
+        let out = SocketPath.resolve(
+            platform: "darwin",
+            homeDir: "/Users/op",
+            activeConfigPath: configPath
+        )
+        XCTAssertEqual(out.path, "/Users/op/.sanctuary/castle.sock")
+        XCTAssertEqual(out.source, .macosHomeDefault)
+    }
+
     func testExplicitOverrideTakesPrecedenceOverPlatform() {
         let out = SocketPath.resolve(
             platform: "linux",
