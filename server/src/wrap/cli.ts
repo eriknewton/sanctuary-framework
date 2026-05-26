@@ -524,16 +524,34 @@ export async function runWrap(
   await mkdir(storagePath, { recursive: true, mode: 0o700 });
 
   if (passphraseValue !== undefined) {
-    const pinResult = await runProvisionPin({
-      out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
-      env: {
-        ...process.env,
-        SANCTUARY_STORAGE_PATH: storagePath,
-        SANCTUARY_PASSPHRASE: passphraseValue,
-      },
-    });
-    if (pinResult !== 0) {
-      throw new Error("Castle Wall provision-pin auto-bootstrap failed");
+    // Auto-bootstrap pinned-key state for the IPC handshake. Failures here
+    // warn but do not abort wrap: a missing pin surfaces cleanly at handshake
+    // time (sysext refuses connection) rather than as a wrap-startup abort.
+    // First-integration discipline: do no harm to the wrap critical path.
+    try {
+      const pinResult = await runProvisionPin({
+        out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+        err: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+        env: {
+          ...process.env,
+          SANCTUARY_STORAGE_PATH: storagePath,
+          SANCTUARY_PASSPHRASE: passphraseValue,
+        },
+      });
+      if (pinResult !== 0) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `\n  Sanctuary wrap: Castle Wall provision-pin auto-bootstrap exited ${pinResult}.` +
+          `\n  Wrap continues; run 'sanctuary castle-wall provision-pin' manually if IPC handshake fails.`
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Sanctuary wrap: Castle Wall provision-pin auto-bootstrap threw (${msg}).` +
+        `\n  Wrap continues; run 'sanctuary castle-wall provision-pin' manually if IPC handshake fails.`
+      );
     }
   }
 

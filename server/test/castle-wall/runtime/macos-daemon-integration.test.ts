@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 
@@ -30,7 +31,7 @@ describe("Castle Wall macOS daemon integration", () => {
   });
 
   async function provisionFortress() {
-    const fortressPath = await mkdtemp("/private/tmp/cw-daemon-");
+    const fortressPath = await mkdtemp(join(tmpdir(), "cw-daemon-"));
     tempDirs.push(fortressPath);
     const masterKey = generateRandomKey();
     const recoveryKey = toBase64url(masterKey);
