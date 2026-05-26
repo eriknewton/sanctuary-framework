@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.3] - 2026-05-26
+
+Castle Wall macOS Phase 2.5 retail UX + Track 4A IPC integration + Track 4A.2 sysext socket-path discovery. The macOS host app gains agent detection (Track 1 AgentDetector covers OpenClaw, Claude Desktop, Claude Code, Codex CLI, Hermes, Cursor, Cline), a tabbed protect/unprotect UI (Track 2), first-run welcome screen with batch protect (Track 3), plain-English activity log (Track 4B), and vocabulary normalization to `protected` across CLI + dashboard surfaces (Track 4C). Track 4A wires the Castle Wall server-side IPC daemon into `sanctuary wrap` startup so the daemon binds its UDS socket fortress-scoped, with three new CLI verbs (`sanctuary castle-wall reload`, `audit-dump`, `approve`) and auto-bootstrap of `provision-pin` at `sanctuary init`. Track 4A.2 closes the path-agreement gap between daemon and sysext via a shared discovery file at `/tmp/sanctuary-castle-active.json` with atomic-write semantics and PID-liveness checks on both sides.
+
+Operationalizing the end-to-end IPC round-trip requires a fresh sysext bundle build + deploy to operator machines so the sysext-side Swift discovery code becomes active. The npm package ships the daemon-side discovery code immediately.
+
+PRs: [#361](https://github.com/eriknewton/sanctuary-framework/pull/361) (Tracks 1-3 + 4B + 4C), [#362](https://github.com/eriknewton/sanctuary-framework/pull/362) (Track 4A integration), [#364](https://github.com/eriknewton/sanctuary-framework/pull/364) (Track 4A.2 sysext discovery).
+
+Full release notes: [docs/releases/v1.3.3.md](docs/releases/v1.3.3.md).
+
 ## [1.3.2] - 2026-05-22
 
 Patch release. Closes the v1.3.1 Mini1 drill findings: F-1.3.1-N-001 (P0 audit-chain seq-duplication race under concurrent writes), F-1.3.1-N-004 (P0 MCP read tools refused to run on a fortress with audit integrity findings), plus F-GA-3, F-GA-4, F-GA-6, F-GA-8, F-GA-9, F-GA-10/11/12, F-1.3.1-N-002, F-1.3.1-N-005, F-1.3.1-N-006. The audit chain now holds under concurrent dashboard + CLI write load, and a fortress whose chain has accumulated integrity findings remains introspectable through read-class MCP tools.
