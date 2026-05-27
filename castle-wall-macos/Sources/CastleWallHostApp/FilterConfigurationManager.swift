@@ -77,6 +77,18 @@ final class FilterConfigurationManager: NSObject, ObservableObject {
                     NEFilterManager.shared().localizedDescription = self.localizedDescription
                 }
 
+                // Preserve existing TCP connections across the startFilter
+                // arming window. Without this (default false), every socket
+                // open at the moment the filter starts is forcibly closed by
+                // the kernel -- including SSH from a remote console, which
+                // makes drill iteration impossible. Set via KVC because the
+                // property is exposed publicly on the configuration class on
+                // recent macOS but not always surfaced in older SDK headers.
+                NEFilterManager.shared().providerConfiguration?.setValue(
+                    true,
+                    forKey: "preserveExistingConnections"
+                )
+
                 NEFilterManager.shared().isEnabled = true
                 NEFilterManager.shared().saveToPreferences { [weak self] saveError in
                     DispatchQueue.main.async {
