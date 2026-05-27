@@ -6,42 +6,35 @@ Your agent. Your machine. Your keys.
 
 This document is the public milestone view. Shipped history lives in `CHANGELOG.md`. Interface specs live in `server/docs/`. Architecture decisions live in `server/rfcs/`. Scope documentation is maintained privately and released to the public repo on version bumps.
 
-Last updated: 2026-04-30.
+Last updated: 2026-05-27.
 
 ---
 
 ## Architecture: the Castle
 
-Sanctuary's enforcement model is the Castle Architecture, codified at `server/rfcs/RFC-0003-castle-architecture.md`. Four layers, each with a distinct enforcement contract.
+Sanctuary's enforcement model is the Castle Architecture, codified at `server/rfcs/RFC-0003-castle-architecture.md`. Five named layers, each with a distinct enforcement contract.
 
-- **Layer 1, Castle Wall.** OS-level egress filtering at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass.
-- **Layer 2, Sentinels.** Internal observation via process introspection and behavioral baselining. Anomalies surface to the operator via menubar plus notifications. Observation, not enforcement.
-- **Layer 3, Cooperative MCP.** Additive sovereignty surface for compliant agents. Encrypted state, signed audit, mandate primitives, four canonical policy slots, substrate selector, Concordia receipt integration, Verascore reputation hooks.
-- **Layer 4, Cryptographic Receipts and Reputation.** Concordia receipts for cross-castle commitments, Verascore reputation aggregating across operators. Cross-castle accountability post-action.
+- **Castle Wall.** OS-level egress filtering at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass.
+- **Sentinels.** Internal observation via process introspection and behavioral baselining. Anomalies surface to the operator via menubar plus notifications. Observation, not enforcement.
+- **Charter (Cooperative MCP).** Additive sovereignty surface for compliant agents. Encrypted state, signed audit, mandate primitives, four canonical policy slots, substrate selector, Concordia receipt integration, Verascore reputation hooks.
+- **Heralds.** Concordia receipts for cross-castle commitments, Verascore reputation aggregating across operators. Cross-castle accountability post-action.
+- **Mantle.** Install-time substrate-binding. The check that locks Sanctuary to the operator's machine at install time and rejects orphan agent identifiers not bound to a wrapped harness.
 
-Castle-walking principle: real enforcement AND delightful UX. Both sides critical. Hard enforcement at the wall AND approval response under 2 seconds. Default-deny outbound AND smart always-allow rules. Sentinels observe AND do not surface noise. Cooperative MCP path remains additive and fully usable. Composition with agent runtimes is preserved because the runtime sees a normal operating environment with constrained egress.
+Castle-walking principle: real enforcement AND delightful UX. Both sides critical. Hard enforcement at the wall AND approval response under 2 seconds. Default-deny outbound AND smart always-allow rules. Sentinels observe AND do not surface noise. The Charter path remains additive and fully usable. Composition with agent runtimes is preserved because the runtime sees a normal operating environment with constrained egress.
 
 ---
 
 ## Scope Thesis
 
-v1.0 is the operator-sovereign fortress in final acceptance.
+v1.0 through v1.3 are shipped. The operator-sovereign fortress runs locally, wraps any MCP-compatible harness, gates every tool call through three-tier policy, encrypts every byte of state, signs every audit entry, and exports a portable bundle the operator owns. The Castle Wall enforces structurally on Linux. The Castle Wall macOS sysext is signed, notarized, activated, and IPC-connected as of v1.3.3; active enforcement (NEFilterManager arming) shipped on main post-v1.3.3 and is awaiting end-to-end Mini1 drill PASS to close the macOS thesis-gate.
 
-v1.1 ships the foundation that makes the local sovereignty harness real: identity, keys, persistence, signed audit, recovery, encrypted state, fortress-local hub APIs, internal coordination, portable exit.
+Current focus is the Castle Wall macOS thesis-gate: until a Mini1 drill proves a wrapped agent's outbound packets are intercepted at the kernel layer and routed through Castle Wall policy with full audit evidence, the structural-enforcement claim is honest only for Linux. Once that drill clears, Sanctuary's security claims trace to drill evidence on both platforms that matter to operators today.
 
-v1.2 ships the operator-facing surfaces and the intelligence substrate selector that make the fortress usable as a daily product: menubar status app, OS notifications, concierge chat, substrate selector, channel-template binding, Tier 1 inline approval, audit feed, exit-bundle drill, operator-friendly tool-error text in MCP gate responses.
+After the thesis-gate closes, Wave 1 lands the parity and federation-ready API surface that lets multiple operators federate without giving up custody: API parity catalog, CLI MVP, federation Wave 1 hardening (per the 2026-05-26 Federation Security RFC), and the federation-across-operator-machines demo. Wave 2 audits the cooperative feature surface and the agent-native surface. Wave 3 lands the plugin architecture and observability. Wave 4 closes the advocacy loop.
 
-v1.x ships the Castle Wall: OS-level egress enforcement at the operator-external boundary. This is the load-bearing piece that makes Sanctuary's security claims structural, not cooperative-only. Phase 1 (macOS plus Linux) ships within 4-8 weeks of v1.2 shipping. Without the wall, the cooperative MCP path is a polite fiction; with it, the substrate is honest under engineer-grade scrutiny.
+The Castle Wall Windows backend, the PWA mobile companion, the operator-cloud and sovereign-managed deployment modes, fleet, payment-rail composition, breach-feed aggregation, the EU AI Act compliance pack, NIST AI RMF alignment, and the Crypto Agility Sprint (post-quantum signing migration) all sit beyond the current Wave window. They are sequenced after thesis-gate closure on principle: ship the load-bearing enforcement first, then expand surface.
 
-v1.3 ships advanced Sanctuary intelligence: sentinels (the Castle Layer 2 observation surface), anomaly detection, conversational sovereignty depth, cross-harness approval inbox, English-authored policy gates, honeypot authoring, auto-trigger ladder.
-
-v1.4 extends the fortress beyond the local single-operator deployment: PWA mobile companion, public federation across operators, sovereign data warehouse.
-
-v1.5+ expands into fleet operator console, Agent Vault payment-rail composition, Bootstrap bundle, Agent Registry Federation, breach-feed aggregation, EU AI Act compliance pack, NIST AI RMF alignment, Crypto Agility Sprint (post-quantum migration), operator cloud, sovereign-managed TEE, container or microVM isolation for highest-assurance enterprises.
-
-The current sequencing deliberately delays public federation, fleet management, payment rails, compliance packs, and cryptographic migration until the local operator experience is complete and the operator owns the durable record. The local harness is the product center: attach agents, communicate with them, coordinate them, filter what leaves at the OS-level wall, record what happened, hold that record where the operator owns it, and leave with that record intact.
-
-The published agent-stack standards are anti-lock-in on paper. In practice, lock-in returns at the integration layer, when mandate primitives are minted through one vendor's API, on-chain registry entries are anchored through one vendor's wallet, and identity assertions are issued by one vendor's identity provider. The operator's data is portable in theory and coupled in practice. Sanctuary's substrate position is the layer that turns paper-portability into practical portability. The fortress holds operator identity and durable record on the operator's side of every integration.
+The published agent-stack standards are anti-lock-in on paper. In practice, lock-in returns at the integration layer, when mandate primitives are minted through one vendor's API, on-chain registry entries are anchored through one vendor's wallet, and identity assertions are issued by one vendor's identity provider. The operator's data is portable in theory and coupled in practice. Sanctuary's substrate position is the layer that turns paper-portability into practical portability. The fortress holds operator identity and the durable record on the operator's side of every integration.
 
 ---
 
@@ -50,64 +43,41 @@ The published agent-stack standards are anti-lock-in on paper. In practice, lock
 The agent stack is publicly composed across four ecosystem layers. Sanctuary lives in the operator-sovereign substrate position.
 
 ```
-Ecosystem layer 4: Operator-sovereign substrate    Sanctuary (you are here)
-    Castle Architecture (Wall, Sentinels, Cooperative MCP, Receipts plus Reputation)
+Operator-sovereign substrate (Sanctuary; you are here)
+    Castle Architecture: Castle Wall, Sentinels, Charter (Cooperative MCP), Heralds, Mantle
     Composes with: ERC-8004, DIF KYA-OS, AIVS, A2A
 
-Ecosystem layer 3: Mandates and commerce            Concordia, Google AP2, A2A extensions
+Mandates and commerce      Concordia, Google AP2, A2A extensions
     Mandate primitives, session receipts, commitment binding
 
-Ecosystem layer 2: Runtime security                 Open-source runtime egress filters
+Runtime security           Open-source runtime egress filters
     Per-host policy, request filtering, sandboxing
 
-Ecosystem layer 1: Payments                         Coinbase x402, Agentic.Market
+Payments                   Coinbase x402, Agentic.Market
     Sovereign-signer adapter on Sanctuary
 ```
 
-Composition partners are named where Sanctuary explicitly composes with them. Layers without named partners are referenced as categories.
-
-Note on layer naming: the ecosystem layers above (1-4) describe Sanctuary's position within the broader agent stack. Within Sanctuary itself, the Castle Architecture defines four enforcement layers (also Layer 1-4). To avoid confusion, references to Castle Layers always include the prefix "Castle" (e.g., Castle Layer 1, Castle Layer 2). References to ecosystem layers always include "Ecosystem" (e.g., Ecosystem Layer 4).
+Composition partners are named where Sanctuary explicitly composes with them. Categories without named partners are referenced as categories.
 
 ---
 
-## v1.0 GA: Freeze And Acceptance
+## v1.0 GA: Operator-Sovereign Fortress (SHIPPED)
 
-v1.0 is the operator-sovereign fortress in final acceptance. The remaining work is validation and blocker removal, not new feature surface.
+v1.0 shipped as the operator-sovereign fortress. The GA gate cleared on the cooperative-MCP path: an external pilot operator could stand up a fortress, wrap two or three Tier B agents, run a local multi-agent workflow, approve or deny risky actions, and complete a recovery drill.
 
-Shipped foundation:
+Shipped at v1.0:
 
 - Local `sanctuary wrap` for existing harnesses
 - Dashboard (configuration plus inspection surface)
-- Cooperative MCP gates (Castle Layer 3): Principal Policy, three-tier approval, four canonical policy slots
+- Charter (Cooperative MCP) gates: Principal Policy, three-tier approval, four canonical policy slots
 - Encrypted state and signed audit trail
 - Five channel-shape governance templates
 - Federation Protocol v0.1 foundation
 - Agent Contract v0.1
-- Egress controls (cooperative; structural enforcement ships in v1.x), budgets, retention, and recovery flows
+- Egress controls at the cooperative layer (structural OS-level enforcement ships at the Castle Wall, see below), budgets, retention, and recovery flows
 - Concordia and Verascore optional composition, default off
 - Template library starter set
-- Tier B harness adapter coverage at v1.0: OpenClaw, Claude Code, Cursor, Hermes, Cline, plus a generic adapter shape
-
-GA gate:
-
-An external pilot operator, not the maintainer, can stand up a fortress, wrap two or three Tier B agents, communicate with them, run a local multi-agent workflow, approve or deny risky actions, and complete a recovery drill in under 60 minutes with no help.
-
-Allowed v1.0 work:
-
-- Fix pilot blockers
-- Align README, ROADMAP, package metadata, and agent context docs
-- Harden install diagnostics
-- Add harness compatibility smoke tests for every README-supported harness
-- Add CI coverage for tool policy tier declarations and outbound network declarations
-
-Explicitly deferred:
-
-- Castle Wall (egress enforcement); ships in v1.x
-- Sentinels (anomaly detection); ships in v1.3
-- Mobile companion; ships in v1.4
-- Payment adapters; ships in v1.5+
-- Compliance packs; ships in v1.5+
-- Post-quantum or next-generation messaging-layer-security migration; ships in v1.5+
+- Tier B harness adapter coverage: OpenClaw, Claude Code, Cursor, Hermes, Cline, plus a generic adapter shape
 
 ---
 
@@ -130,19 +100,19 @@ An operator who hits a normal install, keychain, dashboard, or recovery failure 
 
 ---
 
-## v1.1: Local Sovereignty Harness Foundation (shipped or in flight)
+## v1.1: Local Sovereignty Harness Foundation (SHIPPED)
 
-v1.1 ships the foundation that makes the local sovereignty harness real: identity, keys, persistence, signed audit, recovery, encrypted state, fortress-local hub APIs, query privacy, internal coordination, portable exit. Detailed pillar descriptions are preserved in `server/docs/v1.1-acceptance-checklist.md`.
+v1.1 shipped the foundation that makes the local sovereignty harness real: identity, keys, persistence, signed audit, recovery, encrypted state, fortress-local hub APIs, query privacy, internal coordination, portable exit. Detailed pillar descriptions are preserved in `server/docs/v1.1-acceptance-checklist.md`.
 
-v1.1 acceptance gate:
+v1.1 acceptance gate (cleared):
 
 An operator can wrap two or three agents, communicate with them locally, coordinate a local multi-agent workflow, anonymize or pseudonymize outbound queries, approve / deny / pause / resume / lockdown agents, inspect audit and privacy events, and export and import the durable record onto a fresh machine or harness.
 
 ---
 
-## v1.2: Operator-Facing Surfaces, Intelligence Substrate, Castle UX
+## v1.2: Operator-Facing Surfaces, Intelligence Substrate, Castle UX (SHIPPED through v1.3.3)
 
-v1.2 lights up the operator-facing surfaces v1.1 wired but never powered, plus introduces the substrate selector and the menubar plus notification UX that becomes the operator's daily-driver interface.
+v1.2 lit up the operator-facing surfaces v1.1 wired but never powered, plus introduced the substrate selector and the menubar plus notification UX that becomes the operator's daily-driver interface. The Phase 2.5 retail UX work (agent detection, tabbed protect / unprotect UI, first-run welcome, plain-English activity log, vocabulary normalization to `protected` and `wrap` across CLI and dashboard surfaces) landed across v1.2.x and v1.3.x.
 
 Per the v1.2 build pivot 2026-04-30 evening, direct-agent chat (operator-to-wrapped-agent) is dropped from v1.2 and from the roadmap entirely. Direct chat with the wrapped agent happens in the harness; Sanctuary's job is the substrate, not the harness chat surface. Concierge chat (operator-to-Sanctuary) remains; Sanctuary's runtime is ours, so the safety-prior fight does not apply to that surface.
 
@@ -163,33 +133,31 @@ An operator wraps two harnesses, picks an intelligence substrate (any of the fou
 
 ---
 
-## v1.x: Castle Wall Enforcement (load-bearing)
+## Castle Wall Enforcement (load-bearing; current focus)
 
-v1.x ships the Castle Wall: OS-level egress enforcement at the operator-external boundary. This is the structural enforcement layer that makes Sanctuary's security claims real, not cooperative-only. Without the wall, the substrate is a polite fiction; with it, the architecture is honest under engineer-grade scrutiny.
+The Castle Wall is OS-level egress enforcement at the operator-external boundary. This is the structural enforcement layer that makes Sanctuary's security claims real, not cooperative-only. Without the wall, the substrate is a polite fiction; with it, the architecture is honest under engineer-grade scrutiny. This work is gated by a thesis-gate: the structural-enforcement claim is honest on a platform only after a clean Mini1-class drill proves a wrapped agent's outbound packets are intercepted at the kernel layer with full audit evidence.
 
-Single work package: WP-V1.x-CASTLE-WALL.
+### Phase 1: Linux (SHIPPED 2026-05-06)
 
-Phase 1 (target 4-8 weeks of execution after v1.2 ships): macOS plus Linux.
+Linux backend ships with netfilter / NFQUEUE plus per-process cgroup or namespace routing. ASSURANCE_MATRIX row `Egress enforcement: Linux (Castle Wall Phase 1)` status: `proven`. CI exercises the kernel-binding and DNS-bypass integration tests on every push.
 
-- Cross-platform abstraction layer with platform-specific backends
-- Linux backend: netfilter / NFQUEUE plus per-process cgroup or namespace routing
-- macOS backend: Network Extension framework (long-term path) plus pf-based interim
-- Per-process policy integration (extends the four canonical slots with a fifth slot: egress)
-- Notification UX integration (consumes v1.2 menubar plus OS notification surfaces)
-- Agent-side error text (consumes v1.2 operator-friendly tool-error text)
-- First-run wizard for default-deny posture plus common-developer-endpoint pre-allow
-- Cross-platform compatibility matrix (corporate VPNs, Tailscale, common firewalls)
-- Audit and reporting integration (egress decisions feed the existing audit log; events feed Layer 2 sentinels)
+### Phase 2: macOS Network Extension (SHIPPED in v1.3.3 sysext + activation; active enforcement SHIPPED on main post-v1.3.3)
 
-Phase 2 (target 4-6 weeks after Phase 1): Windows Filtering Platform backend.
+macOS backend ships as a signed, notarized system extension under the `NEFilterDataProvider` content-filter category, packaged inside a host app. PR #361 landed the retail UX (agent detection, protect / unprotect UI, first-run welcome, plain-English activity log, vocabulary normalization). PR #362 wired the server-side IPC daemon into `sanctuary wrap` startup, with new CLI verbs `sanctuary castle-wall reload`, `audit-dump`, and `approve`. PR #364 closed the path-agreement gap between daemon and sysext via the `/tmp/sanctuary-castle-active.json` discovery file with atomic-write semantics and PID-liveness checks. PR #365 (post-v1.3.3) wires `NEFilterManager` into the host-app launch flow (the load-bearing fix that arms the sysext as an active content filter with the OS), aligns the `os_log` subsystem so future drills can self-debug, and documents the wrap-only fortress workaround. All three changes are on main.
 
-Phase 3 (target post-Phase 2, gated on operator demand): container or microVM isolation for highest-assurance enterprises.
+Thesis-gate status: macOS active enforcement code is complete on main; operationalization (sysext rebuild + notarize + redeploy to Mini1; Track 4A drill re-fire) is the remaining step before the macOS structural-enforcement claim traces to drill evidence. Until that drill clears, the claim is honest only for Linux.
 
-Acceptance gate:
+### Phase 3: Windows (roadmapped)
+
+Windows Filtering Platform backend. Sequenced after the macOS thesis-gate closes.
+
+### Phase 4: Container or microVM isolation (gated on operator demand)
+
+Highest-assurance enterprises. Sequenced after Windows.
+
+### Acceptance gate (per platform)
 
 A wrapped agent on a clean Sanctuary install, given a prompt-injection payload designed to exfiltrate data via curl, fails to make the unauthorized network call. The menubar notification fires. The operator approves or denies in under 10 seconds. The audit log records the attempt and the decision. Performance overhead under 10ms p99 on allowed traffic.
-
-This WP gates enterprise pilot demos. Pilot conversations cannot honestly demonstrate Sanctuary's security claims without the wall in place.
 
 ---
 
@@ -230,14 +198,14 @@ Scoping brief: `Review/Sanctuary/WP-V1.x-Recognition-Layer_Scoping_Brief_2026-05
 
 ## v1.3: Advanced Sanctuary Intelligence
 
-v1.3 is every Sanctuary-native sovereignty affordance the operator can see, configure, and audit, including the Castle Layer 2 sentinel surface. The library substrate (audit log, policy engine, channel templates, coordination primitives) shipped in v1.0 and v1.1; the substrate selector ships in v1.2; the castle wall ships in v1.x. v1.3 builds the intelligence layer on top.
+v1.3 is every Sanctuary-native sovereignty affordance the operator can see, configure, and audit, including the Sentinels observation surface. The library substrate (audit log, policy engine, channel templates, coordination primitives) shipped in v1.0 and v1.1; the substrate selector shipped in v1.2; the Castle Wall ships per the Castle Wall section above. v1.3 (the Wave 3 intelligence layer; not to be confused with the v1.3.x release line which carries Castle Wall macOS) builds the intelligence layer on top.
 
 Per the build coordinator pivot 2026-04-30 evening, WP-V1.3-8 (autonomous wake mechanism spec) drops entirely. WP-V1.3-1 through WP-V1.3-7 stay and get sharper. Two new work packages added: WP-V1.3-9 (conversational sovereignty depth) and WP-V1.3-10 (cross-harness approval inbox).
 
 Nine work packages in v1.3:
 
-- **WP-V1.3-1 Sentinel Baseline Pack (Castle Layer 2).** Five baseline sentinels (egress-volume watcher, credential-usage watcher, cross-agent-chatter watcher, suspicious-tool-call detector, anomaly-trigger). Each ships as a default-installable agent that uses the substrate selector. Operator subscribes via the Sanctuary dashboard; sentinels are inward-facing only (no external network access) and surface findings to the unified inbox.
-- **WP-V1.3-2 Anomaly Detection Pipeline (Castle Layer 2).** Per-agent feature classifier with local pattern learning, drift detection, and operator-visible alerts. Sovereignty-critical: ML training stays on the operator's machine; never centrally aggregated.
+- **WP-V1.3-1 Sentinel Baseline Pack.** Five baseline sentinels (egress-volume watcher, credential-usage watcher, cross-agent-chatter watcher, suspicious-tool-call detector, anomaly-trigger). Each ships as a default-installable agent that uses the substrate selector. Operator subscribes via the Sanctuary dashboard; sentinels are inward-facing only (no external network access) and surface findings to the unified inbox.
+- **WP-V1.3-2 Anomaly Detection Pipeline.** Per-agent feature classifier with local pattern learning, drift detection, and operator-visible alerts. Sovereignty-critical: ML training stays on the operator's machine; never centrally aggregated.
 - **WP-V1.3-3 Coordination Handoff Visualization.** Read-only Coordination view rendering handoff log, per-handoff context-transfer breakdown (transferred vs withheld), and workflow state.
 - **WP-V1.3-4 Unified Approval Inbox Bridge.** Bridges legacy ApprovalGate and v1.1 hub inbox with unified provenance. Operator sees approvals, blocked egress, privacy events, budget warnings, recovery prompts, agent errors, and sentinel findings in one stream.
 - **WP-V1.3-5 Honeypot Authoring.** Operator writes a honeypot in plain English; LLM compiles to a runtime trap; integrates with the sentinel layer. Uses the substrate selector.
@@ -318,7 +286,7 @@ Cross-cutting, not tied to a single version. Sanctuary engages standards bodies 
 - AAIF Security Working Group participation
 - MCP Registry governance proposal
 - Reputation Portability Standard
-- DIF KYA-OS Task Force, Verifier-role reference implementation against the Layer 2 conformance tier
+- DIF KYA-OS Task Force, Verifier-role reference implementation against the published conformance tier
 - DIF Delegatable Attenuated Authorization Task Force, observer posture aligned to Concordia Protocol composition
 - ERC-8004 ecosystem alignment
 

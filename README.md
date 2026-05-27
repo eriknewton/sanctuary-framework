@@ -14,33 +14,33 @@ The conversation UI is the easy part. Sanctuary is the version where you own the
 
 ## Release status
 
-`main` is the development branch. The current release candidate is `v1.0.0-rc.2` on the npm `next` tag. The default npm `latest` channel remains `0.10.6` until the v1.0 pilot acceptance drill clears.
+`main` is the development branch. The current stable release is **v1.3.3** on the npm `latest` channel (shipped 2026-05-26). v1.3.3 lands Castle Wall macOS Phase 2.5 retail UX, the Track 4A server-to-sysext IPC integration, and the Track 4A.2 sysext socket-path discovery file. See the [v1.3.3 release notes](docs/releases/v1.3.3.md) and [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ```bash
-# Current stable channel
+# Stable channel (v1.3.3)
 npm install -g @sanctuary-framework/mcp-server
-
-# v1.0 release-candidate channel
-npm install -g @sanctuary-framework/mcp-server@next
 ```
 
 Current capability summary:
 
 | Surface | Current status |
 |---|---|
-| Local `sanctuary wrap`, dashboard, policy gates, encrypted state, audit trail | Shipped / in v1.0 acceptance |
-| Context gating and sensitive-field redaction | Shipped foundation; v1.1 query minimization / Anonymized Query Mode completion remains open |
-| Portable identity, state export/import, reputation bundles, Concordia composition | Shipped foundation; polished exit workflow remains open |
-| Operator-agent communication and local multi-agent coordination | Shipped foundation; complete local sovereignty harness is v1.1 |
-| Mobile operator companion | v1.2 roadmap |
-| Public federation | Federation v0.1 foundation shipped; public cross-operator coordination is v1.3 |
-| Fleet, payments, compliance, operator-cloud, generalized transport interception | v1.4+ roadmap |
-| Sovereign-managed TEE and hardware secure elements | v2 roadmap |
-| Post-quantum and next-generation messaging-layer-security cryptographic upgrades | v1.4+ roadmap |
+| Local `sanctuary wrap`, dashboard, policy gates, encrypted state, audit trail, signed exit bundle | Shipped (v1.0 through v1.3) |
+| Cooperative MCP gates: three-tier approval, four canonical policy slots, channel templates | Shipped |
+| Context gating, sensitive-field redaction, query-layer anonymity (Tier 1 + Tier 2) | Shipped |
+| Portable identity, state export/import, recovery flows, reputation bundles | Shipped |
+| Local multi-agent coordination, fortress-local hub APIs, signed audit chain | Shipped |
+| Federation Protocol v0.1 foundation | Shipped; cross-operator federation hardening underway per Wave 1 design (2026-05-26) |
+| Concordia composition (negotiation receipts) and Verascore composition (reputation) | Optional, default off; both shipped |
+| Castle Wall (OS-level egress enforcement): Linux | Shipped (Phase 1, 2026-05-06) |
+| Castle Wall macOS: signed sysext, host app, Phase 2.5 retail UX, IPC integration | Sysext + activation wiring shipped in v1.3.3; macOS active enforcement (NEFilterManager arming) shipped on main post-v1.3.3; end-to-end Mini1 drill PASS pending |
+| Castle Wall Windows | Roadmapped |
+| Mobile (PWA) operator companion | Roadmapped |
+| Fleet console, operator-cloud deployment, sovereign-managed TEE, post-quantum migration | Roadmapped |
 
-Trust and security claims are tracked in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md).
+Trust and security claims are tracked in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md). Public-facing claims trace to `proven` or `partial` rows in that matrix; the platform, gap, and next-proof limits named on each row are preserved.
 
-Roadmap shape: v1.1 completes the local sovereignty harness; v1.2 adds the phone as the operator companion; v1.3 opens public federation for cross-operator agent interaction; v1.4+ carries fleet, payments, compliance, generalized transport interception, operator-cloud, and advanced cryptography. See [ROADMAP.md](ROADMAP.md).
+Roadmap shape: the current focus is closing the Mac Castle Wall thesis-gate (sysext rebuild + Track 4A drill PASS on Mini1) so the structural-enforcement claim is honest on both Linux and macOS. After that, Wave 1 (API parity + CLI MVP + federation) and the Castle Wall Windows backend. See [ROADMAP.md](ROADMAP.md).
 
 ---
 
@@ -129,7 +129,7 @@ curl -X POST "http://localhost:3501/api/templates/<template-name>/init" \
   }'
 ```
 
-Substitute `<template-name>` with the archetype the operator picked (`research-assistant`, `coding-assistant`, etc.). The `agent_name` must match an already-wrapped harness; `template init` rejects an orphan `agent_id` with no Mantle behind it and points the operator at `sanctuary wrap`. Confirm the response includes a `signed_policy_event_id` and an `attestation_panel_url`. Open that URL in the operator's browser.
+Substitute `<template-name>` with the archetype the operator picked (`research-assistant`, `coding-assistant`, etc.). The `agent_name` must match an already-wrapped harness; `template init` rejects an orphan `agent_id` that is not bound to a wrapped harness (the install-time check that locks Sanctuary to the operator's machine) and points the operator at `sanctuary wrap`. Confirm the response includes a `signed_policy_event_id` and an `attestation_panel_url`. Open that URL in the operator's browser.
 
 ### Step 5: Hand back to the operator
 
@@ -278,18 +278,19 @@ The operator holds the keys in every mode. The sovereign-managed mode will requi
 
 ---
 
-## The four-layer architecture
+## The Castle Architecture
 
-A fortress. Walls separate the inside from the outside. Gates let specific things through under specific conditions. The drawbridge handles the outside world deliberately, and lockdown drops it under attack. The chronicle keeps the permanent record.
+A fortress. Five named layers, each with its own enforcement contract. None of them depends on a vendor knowing your business.
 
 | Layer | What it does |
 |---|---|
-| **L1: Cognitive Sovereignty** (walls) | Operator-rooted cryptographic identity. Per-agent HKDF-derived keys. Ed25519 signing. AES-256-GCM state at rest. No vendor holds the root. |
-| **L2: Operational Isolation** (gates) | Policy compiled to a deterministic rule engine, signed and pinned to the agent before it runs. Egress proxy enforces rate limits, budgets, retention, and sensitive-topic gates. Tool calls pass approval gates scoped by policy. |
-| **L3: Selective Disclosure** (drawbridge) | Every external contact (A2A message, MCP tool call, x402 payment, ERC-8004 attestation, AP2 mandate) goes out through a disclosure envelope signed by the agent's derived key. The envelope carries only what policy permits. Lockdown drops egress mid-flight under attack. |
-| **L4: Verifiable Reputation** (chronicle) | Portable, append-only, signed audit trail. Travels with the agent across machines. Every action, every commitment, every attestation, recorded and verifiable. |
+| **Castle Wall** | OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend shipped; macOS backend (signed system extension + content-filter provider) shipped in v1.3.3 with active enforcement now wired through `NEFilterManager`; Windows on the roadmap. |
+| **Sentinels** | Internal observation via process introspection and behavioral baselining. Anomalies surface to the operator through the menubar or notifications. Observation, not enforcement. |
+| **Charter (Cooperative MCP)** | The additive sovereignty surface for compliant agents. Operator-rooted cryptographic identity (Ed25519 signing, Argon2id passphrase unlock, per-purpose HKDF subkeys). Per-agent encrypted state at rest (AES-256-GCM). Three-tier Principal Policy gates with channel-template binding. Signed audit chain with rollback detection. |
+| **Heralds** | Concordia (structured negotiation with binding commitments) and Verascore (portable reputation) composition. Receipts and reputation attestations assemble into a single audit trail that travels with the agent across machines. Default off; both compositions are optional. |
+| **Mantle** | Install-time substrate-binding. The check that locks Sanctuary to the operator's machine at install time and rejects orphan agent identifiers that are not bound to a wrapped harness. |
 
-**Today:** Ed25519 signing, Argon2id passphrase unlock, and per-purpose HKDF subkeys. **Crypto-agility:** every audit entry embeds a scheme identifier so hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) can land without breaking historical receipts. Hardware-backed secure elements are on the v2 roadmap.
+**Today:** Ed25519 signing, Argon2id passphrase unlock, and per-purpose HKDF subkeys. **Crypto-agility:** every audit entry embeds a scheme identifier so hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) can land without breaking historical receipts. Hardware-backed secure elements are on the roadmap.
 
 ---
 
