@@ -7,6 +7,7 @@ final class SystemExtensionManager: NSObject, ObservableObject {
         case unknown
         case activating
         case activated
+        case activatedRequiresReboot
         case deactivating
         case deactivated
         case needsUserApproval
@@ -20,6 +21,8 @@ final class SystemExtensionManager: NSObject, ObservableObject {
                 return "Activating"
             case .activated:
                 return "Activated"
+            case .activatedRequiresReboot:
+                return "Activated (reboot required)"
             case .deactivating:
                 return "Deactivating"
             case .deactivated:
@@ -68,13 +71,26 @@ final class SystemExtensionManager: NSObject, ObservableObject {
     }
 
     func handleRequestFinished() {
+        handleRequestFinished(result: .completed)
+    }
+
+    func handleRequestFinished(result: OSSystemExtensionRequest.Result) {
+        // The request was submitted with `queue: .main`, so this callback
+        // already runs on the main queue.
         defer { pendingOperation = nil }
         switch pendingOperation {
         case .activation:
-            extensionState = .activated
+            switch result {
+            case .completed:
+                extensionState = .activated
+            case .willCompleteAfterReboot:
+                extensionState = .activatedRequiresReboot
+            @unknown default:
+                extensionState = .error("Unknown activation result")
+            }
         case .deactivation:
             extensionState = .deactivated
-        case nil:
+        case .none:
             extensionState = .unknown
         }
     }
@@ -98,7 +114,7 @@ extension SystemExtensionManager: OSSystemExtensionRequestDelegate {
         _ request: OSSystemExtensionRequest,
         didFinishWithResult result: OSSystemExtensionRequest.Result
     ) {
-        handleRequestFinished()
+        handleRequestFinished(result: result)
     }
 
     func request(

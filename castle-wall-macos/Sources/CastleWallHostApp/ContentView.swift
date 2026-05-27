@@ -3,6 +3,7 @@ import AgentDetector
 
 struct ContentView: View {
     @ObservedObject var systemExtensionManager: SystemExtensionManager
+    @ObservedObject var filterConfigurationManager: FilterConfigurationManager
     @StateObject private var agentDetector = AgentDetector()
     @StateObject private var serverBridge = SanctuaryServerBridge()
 
@@ -51,6 +52,13 @@ struct ContentView: View {
             await agentDetector.scan()
             await serverBridge.checkServerHealth()
         }
+        .onChange(of: systemExtensionManager.extensionState) { newState in
+            if newState == .activated,
+               filterConfigurationManager.filterState != .enabled,
+               filterConfigurationManager.filterState != .enabling {
+                filterConfigurationManager.enableFilter()
+            }
+        }
         .alert("Restart Required", isPresented: .init(
             get: { showRestartWarning != nil },
             set: { if !$0 { showRestartWarning = nil } }
@@ -88,46 +96,64 @@ struct ContentView: View {
     private var sysextStatusBadge: some View {
         HStack(spacing: 6) {
             Circle()
-                .fill(sysextColor)
+                .fill(protectionColor)
                 .frame(width: 8, height: 8)
-            Text(sysextLabel)
+            Text(protectionLabel)
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
-        .background(sysextColor.opacity(0.1))
+        .background(protectionColor.opacity(0.1))
         .cornerRadius(12)
     }
 
-    private var sysextColor: Color {
-        switch systemExtensionManager.extensionState {
-        case .activated:
+    private var protectionColor: Color {
+        if systemExtensionManager.extensionState == .activated,
+           filterConfigurationManager.filterState == .enabled {
             return .green
-        case .activating, .needsUserApproval:
-            return .yellow
-        case .error:
-            return .red
-        default:
-            return .gray
         }
+        if case .error = systemExtensionManager.extensionState { return .red }
+        if case .error = filterConfigurationManager.filterState { return .red }
+        if systemExtensionManager.extensionState == .needsUserApproval ||
+            filterConfigurationManager.filterState == .needsUserApproval {
+            return .yellow
+        }
+        if systemExtensionManager.extensionState == .activatedRequiresReboot {
+            return .yellow
+        }
+        if systemExtensionManager.extensionState == .activating ||
+            filterConfigurationManager.filterState == .enabling {
+            return .yellow
+        }
+        return .gray
     }
 
-    private var sysextLabel: String {
-        switch systemExtensionManager.extensionState {
-        case .activated:
+    private var protectionLabel: String {
+        if systemExtensionManager.extensionState == .activated,
+           filterConfigurationManager.filterState == .enabled {
             return "Protection Active"
-        case .activating:
-            return "Activating..."
-        case .needsUserApproval:
-            return "Needs Approval"
-        case .deactivated, .unknown:
-            return "Protection Off"
-        case .deactivating:
-            return "Deactivating..."
-        case .error(let msg):
-            return "Error: \(msg)"
         }
+        if systemExtensionManager.extensionState == .activatedRequiresReboot {
+            return "Reboot Required"
+        }
+        if systemExtensionManager.extensionState == .needsUserApproval {
+            return "Needs Sysext Approval"
+        }
+        if filterConfigurationManager.filterState == .needsUserApproval {
+            return "Needs Filter Approval"
+        }
+        if case let .error(msg) = systemExtensionManager.extensionState {
+            return "Sysext Error: \(msg)"
+        }
+        if case let .error(msg) = filterConfigurationManager.filterState {
+            return "Filter Error: \(msg)"
+        }
+        if systemExtensionManager.extensionState == .activating ||
+            filterConfigurationManager.filterState == .enabling {
+            return "Activating..."
+        }
+        return "Protection Off"
     }
 
     // MARK: - Tab bar

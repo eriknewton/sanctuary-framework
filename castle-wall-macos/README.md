@@ -152,3 +152,25 @@ identity binding is the load-bearing trust anchor.
 
 Phase 2 (Windows) and Phase 3 (container/microVM) are out of scope for
 the macOS work package.
+
+## Known issue: do not run `sanctuary init` followed by `sanctuary wrap`
+
+`sanctuary init` and `sanctuary wrap` currently derive the fortress master
+key from different sources:
+
+- `init` derives from a random recovery key.
+- `wrap` derives from a passphrase and does not consume `SANCTUARY_RECOVERY_KEY`.
+
+Running `init` and then `wrap` against the same fortress can produce
+`aes/gcm: invalid ghash tag` when the daemon decrypts the pinned IPC keypair.
+
+Current workaround:
+
+- Skip `init`.
+- Use `sanctuary wrap` only. It creates the fortress, generates the passphrase,
+  and derives the master key in one consistent pass.
+
+Tracking reference: Newton Wiki session `sanctuary-castle-wall-mac-phase-2-5-track-4a-ipc-drill-mini1-2026-05-26.md` (operator-local; not part of this repo).
+
+A future PR will either deprecate `init` for filesystem-only Castle Wall
+fortresses or wire recovery-key consumption through `wrap`.
