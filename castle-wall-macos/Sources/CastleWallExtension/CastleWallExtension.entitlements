@@ -6,9 +6,5 @@
     <array>
         <string>content-filter-provider-systemextension</string>
     </array>
-    <key>com.apple.security.app-sandbox</key>
-    <true/>
-    <key>com.apple.security.network.client</key>
-    <true/>
 </dict>
 </plist>

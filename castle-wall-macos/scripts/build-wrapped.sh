@@ -134,7 +134,8 @@ cp "${EXT_INFO_SRC}" "${EXT_INFO_DST}"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName Sanctuary-CastleWall" "${HOST_INFO_DST}" >/dev/null 2>&1 || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable ${EXT_EXECUTABLE_NAME}" "${EXT_INFO_DST}" >/dev/null 2>&1
 /usr/libexec/PlistBuddy -c "Set :CFBundleName ${EXT_EXECUTABLE_NAME}" "${EXT_INFO_DST}" >/dev/null 2>&1
-/usr/libexec/PlistBuddy -c "Set :NSExtension:NSExtensionPrincipalClass CastleWallFilter.CastleWallFilterProvider" "${EXT_INFO_DST}" >/dev/null 2>&1
+/usr/libexec/PlistBuddy -c "Set :NSExtension:NSExtensionPrincipalClass CastleWallFilterProvider" "${EXT_INFO_DST}" >/dev/null 2>&1
+/usr/libexec/PlistBuddy -c "Set :NetworkExtension:NEProviderClasses:com.apple.networkextension.filter-data CastleWallFilterProvider" "${EXT_INFO_DST}" >/dev/null 2>&1
 
 if grep -E '\$\([A-Z_]+\)' "${HOST_INFO_DST}" >/dev/null 2>&1; then
     fail "host Info.plist contains unresolved \$(...) tokens: ${HOST_INFO_DST}"
