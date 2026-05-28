@@ -289,6 +289,33 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     expect(entry?.operation).toBe("egress_blocked");
     expect(entry?.details?.rule_id).toBeNull();
     expect(consumer.getStats().decisionsRecorded).toBe(1);
+    expect(consumer.getStats().decisionsRejected).toBe(0);
+  });
+
+  it("translates absent matched_rule_id to audit event with null rule_id", async () => {
+    const { consumer, auditSinkBundle } = buildConsumer();
+    const notification: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: {
+        host: "api.anthropic.com",
+        ip: "104.18.32.10",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: "agent-7", template: "coding-assistant" },
+      recorded_at: "2026-05-11T12:00:00Z",
+    };
+    await consumer.handleFlowDecisionRecorded(notification);
+
+    expect(auditSinkBundle.entries).toHaveLength(1);
+    const entry = auditSinkBundle.entries[0];
+    expect(entry?.operation).toBe("egress_allowed");
+    expect(entry?.details?.rule_id).toBeNull();
+    expect(consumer.getStats().decisionsRecorded).toBe(1);
+    expect(consumer.getStats().decisionsRejected).toBe(0);
   });
 
   it("rejects malformed flow_decision_recorded with a rejected audit entry", async () => {
@@ -336,6 +363,15 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
       recorded_at: "2026-05-11T12:00:00Z",
     };
     expect(validateFlowDecisionRecorded(valid)).toBeNull();
+    expect(validateFlowDecisionRecorded({ ...valid, matched_rule_id: null })).toBeNull();
+    const withoutMatchedRuleId: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "drop",
+      destination: valid.destination,
+      agent: valid.agent,
+      recorded_at: valid.recorded_at,
+    };
+    expect(validateFlowDecisionRecorded(withoutMatchedRuleId)).toBeNull();
     expect(
       validateFlowDecisionRecorded({ ...valid, decision: "x" as never })
     ).toMatch(/decision/);
@@ -348,6 +384,12 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         agent: { id: "", template: "research-assistant" },
       })
     ).toMatch(/agent/);
+    expect(
+      validateFlowDecisionRecorded({
+        ...valid,
+        matched_rule_id: 42 as never,
+      })
+    ).toMatch(/matched_rule_id/);
   });
 });
 
