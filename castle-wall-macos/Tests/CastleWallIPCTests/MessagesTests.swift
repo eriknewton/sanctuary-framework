@@ -87,6 +87,55 @@ final class MessagesTests: XCTestCase {
         XCTAssertFalse(json.contains("granularity"))
     }
 
+    func testFlowDecisionRecordedEncodesNilMatchedRuleIdAsNull() throws {
+        let nilRuleBody = FlowDecisionRecordedBody(
+            decision: "drop",
+            destination: IpcDestination(
+                host: nil,
+                ip: "203.0.113.4",
+                port: 8080,
+                protocolName: "tcp",
+                hostnameSource: nil,
+                opaque: true
+            ),
+            agent: IpcAgentAttribution(id: "agent-9", template: "ops-runner"),
+            matchedRuleId: nil,
+            recordedAt: "2026-05-11T12:01:00Z"
+        )
+        let nilRuleMessage = IpcMessage.flowDecisionRecorded(nilRuleBody)
+        let nilRuleEncoded = try JSONEncoder().encode(nilRuleMessage)
+        let nilRuleObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: nilRuleEncoded) as? [String: Any]
+        )
+        XCTAssertTrue(nilRuleObject.keys.contains("matched_rule_id"))
+        XCTAssertTrue(nilRuleObject["matched_rule_id"] is NSNull)
+        XCTAssertEqual(
+            try JSONDecoder().decode(IpcMessage.self, from: nilRuleEncoded),
+            nilRuleMessage
+        )
+
+        let matchedRuleBody = FlowDecisionRecordedBody(
+            decision: "allow",
+            destination: IpcDestination(
+                host: "api.anthropic.com",
+                ip: "104.18.32.10",
+                port: 443,
+                protocolName: "tcp",
+                hostnameSource: "sni",
+                opaque: false
+            ),
+            agent: IpcAgentAttribution(id: "agent-7", template: "coding-assistant"),
+            matchedRuleId: "rule-anthropic",
+            recordedAt: "2026-05-11T12:00:00Z"
+        )
+        let matchedRuleMessage = IpcMessage.flowDecisionRecorded(matchedRuleBody)
+        let matchedRuleEncoded = try JSONEncoder().encode(matchedRuleMessage)
+        XCTAssertEqual(
+            try JSONDecoder().decode(IpcMessage.self, from: matchedRuleEncoded),
+            matchedRuleMessage
+        )
+    }
+
     func testUnknownTypeFailsToDecode() {
         let raw = "{\"type\":\"bogus\",\"x\":1}".data(using: .utf8)!
         XCTAssertThrowsError(try JSONDecoder().decode(IpcMessage.self, from: raw))

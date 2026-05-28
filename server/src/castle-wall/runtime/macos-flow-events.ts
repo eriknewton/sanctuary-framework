@@ -223,7 +223,7 @@ export class MacOSFlowEventConsumer {
         agent: notification.agent,
         destination: notification.destination,
         decision: notification.decision,
-        rule_id: notification.matched_rule_id,
+        rule_id: notification.matched_rule_id ?? null,
         recorded_at: notification.recorded_at,
         source: "macos_extension",
       },
@@ -296,10 +296,8 @@ export function validateFlowDecisionRecorded(
   if (typeof notification.recorded_at !== "string" || notification.recorded_at.length === 0) {
     return "missing recorded_at";
   }
-  if (
-    notification.matched_rule_id !== null &&
-    typeof notification.matched_rule_id !== "string"
-  ) {
+  const matchedRuleId = notification.matched_rule_id;
+  if (matchedRuleId !== undefined && matchedRuleId !== null && typeof matchedRuleId !== "string") {
     return "matched_rule_id must be string or null";
   }
   return null;

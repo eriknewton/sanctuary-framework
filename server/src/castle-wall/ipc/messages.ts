@@ -235,7 +235,7 @@ export interface FlowDecisionRecordedNotification {
   decision: "allow" | "drop";
   destination: IpcDestination;
   agent: IpcAgentAttribution;
-  matched_rule_id: string | null;
+  matched_rule_id?: string | null;
   recorded_at: string;
 }
 

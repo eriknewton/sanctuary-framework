@@ -851,6 +851,16 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
         case matchedRuleId = "matched_rule_id"
         case recordedAt = "recorded_at"
     }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(type, forKey: .type)
+        try container.encode(decision, forKey: .decision)
+        try container.encode(destination, forKey: .destination)
+        try container.encode(agent, forKey: .agent)
+        try container.encode(matchedRuleId, forKey: .matchedRuleId)
+        try container.encode(recordedAt, forKey: .recordedAt)
+    }
 }
 
 /// `flow_pending_approval` notification body.
