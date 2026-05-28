@@ -375,7 +375,14 @@ export class MacOSFlowIpcListener {
     }
     const message = envelope.params as CastleWallMessage;
     this.stats.framesDecoded += 1;
-    void this.routeMessage(state, message);
+    void this.routeMessage(state, message).catch((error) => {
+      // SAFETY: listener route failures must surface in daemon stderr.
+      console.error(
+        `[castle-wall] listener routeMessage failed for type=${message.type}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
   }
 
   private async routeMessage(

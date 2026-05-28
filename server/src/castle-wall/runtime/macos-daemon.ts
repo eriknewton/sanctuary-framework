@@ -1,5 +1,5 @@
-import { randomBytes } from "node:crypto";
-import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { bytesToString, toBase64url } from "../../core/encoding.js";
@@ -28,6 +28,8 @@ import {
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
+const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = "/Library/Application Support/Sanctuary";
+const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
 
 export const CASTLE_WALL_ALREADY_RUNNING_MESSAGE =
   "Castle Wall daemon already running for this fortress (PID <pid>). Multi-wrap-per-fortress is Phase 3.";
@@ -74,6 +76,7 @@ interface ActiveCastleWallConfig {
   fortress_id: string;
   pid: number;
   started_at: string;
+  pinned_pubkey_sha256?: string;
 }
 
 export async function startMacOSCastleWallDaemon(
@@ -96,6 +99,8 @@ export async function startMacOSCastleWallDaemon(
   });
 
   const signingKey = await loadSigningKey(input.fortressPath, input.masterKey);
+  await writeSystemPinnedPublicKey(signingKey.publicKey);
+  const pinnedPublicKeySha256 = sha256Hex(signingKey.publicKey);
   let manifestState = await loadManifestState({
     fortressPath: input.fortressPath,
     fortressId: input.fortressId,
@@ -171,6 +176,7 @@ export async function startMacOSCastleWallDaemon(
       fortress_id: input.fortressId,
       pid: process.pid,
       started_at: new Date().toISOString(),
+      pinned_pubkey_sha256: pinnedPublicKeySha256,
     });
     activeConfigWritten = true;
     await input.auditLog.append(
@@ -286,6 +292,22 @@ async function loadSigningKey(
     encryptionKey: masterKey,
     publicKey,
   };
+}
+
+async function writeSystemPinnedPublicKey(publicKey: Uint8Array): Promise<void> {
+  try {
+    await mkdir(CASTLE_GLOBAL_PINNED_PUBKEY_DIR, {
+      recursive: true,
+      mode: 0o755,
+    });
+    await writeFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, publicKey, { mode: 0o644 });
+    await chmod(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, 0o644);
+  } catch (error) {
+    // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+    console.warn(
+      `[castle-wall] warning: unable to write shared pinned public key at ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 async function loadManifestState(input: {
@@ -405,15 +427,28 @@ async function readActiveConfig(configPath: string): Promise<ActiveCastleWallCon
     ) {
       return null;
     }
+    if (
+      parsed.pinned_pubkey_sha256 !== undefined &&
+      typeof parsed.pinned_pubkey_sha256 !== "string"
+    ) {
+      return null;
+    }
     return {
       socket_path: parsed.socket_path,
       fortress_id: parsed.fortress_id,
       pid: parsed.pid,
       started_at: parsed.started_at,
+      ...(parsed.pinned_pubkey_sha256 !== undefined
+        ? { pinned_pubkey_sha256: parsed.pinned_pubkey_sha256 }
+        : {}),
     };
   } catch {
     return null;
   }
+}
+
+function sha256Hex(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 function isPidAlive(pid: number): boolean {

@@ -46,16 +46,34 @@ public final class ExtensionDispatcher {
     /// Closure type the IPC client returns on send failures.
     public typealias SendErrorHandler = (IPCClientError) -> Void
 
+    public enum ConnectionState: Equatable {
+        case disconnected
+        case handshaking
+        case connected
+        case retrying
+        case deadChannel
+    }
+
     private let engine: FlowEvaluatorEngine
     private let ipcClient: IPCClient
     private let manifestStore: ManifestStore
     private let flowCache: FlowCache
     private let sendErrorHandler: SendErrorHandler
 
-    /// Optional override for tests that want to observe the listener
-    /// without exercising the live IPC client. Production callers leave
-    /// this nil.
-    private var inboundListenerOverride: IPCMessageListener?
+    private let stateQueue = DispatchQueue(
+        label: "ai.sanctuaryprotocol.castle-wall.extension-dispatcher.state"
+    )
+    private var connectionStateValue: ConnectionState = .disconnected
+    private var retryDelaySeconds: TimeInterval = 1.0
+    private var retryTimer: DispatchSourceTimer?
+    private var listenersInstalled = false
+    private var isStopping = false
+    private var verdictsDroppedDeadChannel = 0
+    private var lastVerdictDropLogAt = Date.distantPast
+
+    private static let initialRetryDelaySeconds: TimeInterval = 1.0
+    private static let maxRetryDelaySeconds: TimeInterval = 30.0
+    private static let retryJitterPercent: Double = 0.15
 
     public init(
         engine: FlowEvaluatorEngine,
@@ -72,21 +90,39 @@ public final class ExtensionDispatcher {
     /// Default send-error handler logs to the IPC subsystem and swallows
     /// the error. The verdict path must NEVER block on IPC liveness.
     public static let defaultSendErrorHandler: SendErrorHandler = { error in
-        CastleWallLog.ipc.notice(
-            "ExtensionDispatcher send failed (non-fatal): \(String(describing: error))"
-        )
+        switch error {
+        case .sendBeforeHandshake:
+            CastleWallLog.ipc.notice("ExtensionDispatcher send failed: sendBeforeHandshake")
+        case .transportClosed:
+            CastleWallLog.ipc.notice("ExtensionDispatcher send failed: transportClosed")
+        case .sendFailed(let reason):
+            CastleWallLog.ipc.notice("ExtensionDispatcher send failed: sendFailed reason=\(reason)")
+        case .notStarted:
+            CastleWallLog.ipc.notice("ExtensionDispatcher send failed: notStarted")
+        case .alreadyStarted:
+            CastleWallLog.ipc.notice("ExtensionDispatcher send failed: alreadyStarted")
+        case .connectFailed(let reason):
+            CastleWallLog.ipc.notice("ExtensionDispatcher send failed: connectFailed reason=\(reason)")
+        case .framingError(let reason):
+            CastleWallLog.ipc.notice("ExtensionDispatcher send failed: framingError reason=\(reason)")
+        case .envelopeMalformed(let reason):
+            CastleWallLog.ipc.notice("ExtensionDispatcher send failed: envelopeMalformed reason=\(reason)")
+        case .handshakeTimeout:
+            CastleWallLog.ipc.notice("ExtensionDispatcher send failed: handshakeTimeout")
+        case .handshakeRejected(let reason):
+            CastleWallLog.ipc.notice("ExtensionDispatcher send failed: handshakeRejected reason=\(reason)")
+        case .socketPathTooLong(let maxBytes, let actual):
+            CastleWallLog.ipc.notice(
+                "ExtensionDispatcher send failed: socketPathTooLong actual=\(actual) max=\(maxBytes)"
+            )
+        }
     }
 
     // MARK: - Lifecycle
 
     /// Complete the IPC handshake, register the inbound listener, and
     /// send the initial `manifest_subscribe` request. Returns once the
-    /// handshake has completed; the subscribe request is fire-and-forget.
-    ///
-    /// On handshake failure the dispatcher does NOT throw; the
-    /// FilterProvider keeps a refuse-to-load fallback and evaluates
-    /// against an empty manifest (fail-closed). Callers may inspect
-    /// `isStarted` to know whether the IPC channel is live.
+    /// handshake attempt has completed.
     @discardableResult
     public func start() async -> Bool {
         _ = IPCBridgeNotifications.recoverPersistedManifest(
@@ -94,38 +130,36 @@ public final class ExtensionDispatcher {
             cache: flowCache,
             pinnedPublicKey: ipcClient.pinnedPublicKeyBytes
         )
-        do {
-            _ = try await ipcClient.start()
-        } catch {
-            CastleWallLog.lifecycle.notice(
-                "ExtensionDispatcher start failed: \(String(describing: error))"
-            )
-            return false
+
+        stateQueue.sync {
+            isStopping = false
         }
-        ipcClient.setMessageListener { [weak self] message in
-            self?.handleInbound(message)
-        }
-        // Initial subscribe so the server immediately pushes the current
-        // manifest snapshot. Fire-and-forget; if it fails, the listener
-        // is still installed and a later manifest_updated push will land.
-        ipcClient.send(
-            IPCBridgeNotifications.buildSubscribeRequest(),
-            onError: sendErrorHandler
-        )
-        isStartedFlag = true
-        return true
+        installClientListenersIfNeeded()
+
+        return await attemptStartAndSubscribe(trigger: "initial")
     }
 
     /// True once `start()` has completed the handshake successfully.
-    public private(set) var isStartedFlag: Bool = false
+    public var isStarted: Bool {
+        return connectionState == .connected
+    }
 
-    public var isStarted: Bool { isStartedFlag }
+    public var connectionState: ConnectionState {
+        return stateQueue.sync { connectionStateValue }
+    }
 
     /// Close the underlying IPC client. Idempotent.
     public func stop() {
+        stateQueue.sync {
+            isStopping = true
+            retryTimer?.cancel()
+            retryTimer = nil
+            connectionStateValue = .disconnected
+            retryDelaySeconds = Self.initialRetryDelaySeconds
+        }
+        ipcClient.setTransportClosedListener(nil)
         ipcClient.setMessageListener(nil)
         ipcClient.close()
-        isStartedFlag = false
     }
 
     // MARK: - Outbound (called from FilterProvider verdict path)
@@ -140,6 +174,12 @@ public final class ExtensionDispatcher {
         _ outcome: EvaluationOutcome,
         for flow: FilterFlowDescriptor
     ) {
+        let state = connectionState
+        guard state == .connected else {
+            recordDroppedVerdict(state: state)
+            return
+        }
+
         switch outcome {
         case .allow, .drop:
             guard let message = IPCBridgeNotifications.buildFlowDecisionRecorded(
@@ -148,10 +188,10 @@ public final class ExtensionDispatcher {
             ) else {
                 return
             }
-            ipcClient.send(message, onError: sendErrorHandler)
+            ipcClient.send(message, onError: handleSendError)
         case .uncertain:
             let message = IPCBridgeNotifications.buildFlowPendingApproval(flow: flow)
-            ipcClient.send(message, onError: sendErrorHandler)
+            ipcClient.send(message, onError: handleSendError)
         }
     }
 
@@ -173,10 +213,7 @@ public final class ExtensionDispatcher {
             // Operator-approval / -deny resume path; round-trip wiring
             // for uncertain-flow resume lands in the Alpha-4 install
             // scope alongside `resumeFlow(_:with:)` on NEFilterDataProvider.
-            // Today the dispatcher records receipt for observability and
-            // drops; the FilterProvider's `.uncertain` flows already use
-            // `pause()` per the existing translation.
-            CastleWallLog.lifecycle.info(
+            CastleWallLog.lifecycle.notice(
                 "decision_response received; resume path lands in Alpha-4"
             )
         default:
@@ -186,6 +223,164 @@ public final class ExtensionDispatcher {
             CastleWallLog.ipc.notice(
                 "unhandled inbound message type; dropping"
             )
+        }
+    }
+
+    private func installClientListenersIfNeeded() {
+        let shouldInstall = stateQueue.sync { () -> Bool in
+            if listenersInstalled { return false }
+            listenersInstalled = true
+            return true
+        }
+        guard shouldInstall else { return }
+
+        ipcClient.setMessageListener { [weak self] message in
+            self?.handleInbound(message)
+        }
+        ipcClient.setTransportClosedListener { [weak self] error in
+            self?.handleTransportClosed(error)
+        }
+    }
+
+    private func attemptStartAndSubscribe(trigger: String) async -> Bool {
+        let shouldStop = stateQueue.sync { isStopping }
+        guard !shouldStop else {
+            return false
+        }
+
+        updateConnectionState(.handshaking)
+        do {
+            _ = try await ipcClient.start()
+            stateQueue.sync {
+                retryDelaySeconds = Self.initialRetryDelaySeconds
+                retryTimer?.cancel()
+                retryTimer = nil
+                connectionStateValue = .connected
+            }
+            ipcClient.send(
+                IPCBridgeNotifications.buildSubscribeRequest(),
+                onError: handleSendError
+            )
+            CastleWallLog.lifecycle.notice("ExtensionDispatcher connected; trigger=\(trigger)")
+            return true
+        } catch {
+            let ipcError = normalizeError(error)
+            logStartFailure(ipcError)
+            updateConnectionState(.deadChannel)
+            scheduleReconnect(reason: "start failure (\(trigger))")
+            return false
+        }
+    }
+
+    private func logStartFailure(_ error: IPCClientError) {
+        switch error {
+        case .alreadyStarted:
+            CastleWallLog.lifecycle.error("ExtensionDispatcher start failed: alreadyStarted")
+        case .notStarted:
+            CastleWallLog.lifecycle.error("ExtensionDispatcher start failed: notStarted")
+        case .transportClosed:
+            CastleWallLog.lifecycle.error("ExtensionDispatcher start failed: transportClosed")
+        case .connectFailed(let reason):
+            CastleWallLog.lifecycle.error("ExtensionDispatcher start failed: connectFailed reason=\(reason)")
+        case .framingError(let reason):
+            CastleWallLog.lifecycle.error("ExtensionDispatcher start failed: framingError reason=\(reason)")
+        case .envelopeMalformed(let reason):
+            CastleWallLog.lifecycle.error("ExtensionDispatcher start failed: envelopeMalformed reason=\(reason)")
+        case .handshakeTimeout:
+            CastleWallLog.lifecycle.error("ExtensionDispatcher start failed: handshakeTimeout")
+        case .handshakeRejected(let reason):
+            CastleWallLog.lifecycle.error("ExtensionDispatcher start failed: handshakeRejected reason=\(reason)")
+        case .socketPathTooLong(let maxBytes, let actual):
+            CastleWallLog.lifecycle.error(
+                "ExtensionDispatcher start failed: socketPathTooLong actual=\(actual) max=\(maxBytes)"
+            )
+        case .sendFailed(let reason):
+            CastleWallLog.lifecycle.error("ExtensionDispatcher start failed: sendFailed reason=\(reason)")
+        case .sendBeforeHandshake:
+            CastleWallLog.lifecycle.error("ExtensionDispatcher start failed: sendBeforeHandshake")
+        }
+    }
+
+    private func normalizeError(_ error: Error) -> IPCClientError {
+        if let ipcError = error as? IPCClientError {
+            return ipcError
+        }
+        return .sendFailed(String(describing: error))
+    }
+
+    private func handleTransportClosed(_ error: IPCClientError) {
+        let shouldStop = stateQueue.sync { isStopping }
+        guard !shouldStop else { return }
+
+        updateConnectionState(.deadChannel)
+        CastleWallLog.lifecycle.error(
+            "ExtensionDispatcher transport dropped; scheduling reconnect reason=\(String(describing: error))"
+        )
+        scheduleReconnect(reason: "transport dropped")
+    }
+
+    private func handleSendError(_ error: IPCClientError) {
+        sendErrorHandler(error)
+        switch error {
+        case .transportClosed, .sendFailed:
+            ipcClient.close()
+            handleTransportClosed(error)
+        default:
+            return
+        }
+    }
+
+    private func scheduleReconnect(reason: String) {
+        stateQueue.async {
+            guard !self.isStopping else { return }
+
+            self.retryTimer?.cancel()
+            self.retryTimer = nil
+
+            let base = self.retryDelaySeconds
+            let jitterRange = base * Self.retryJitterPercent
+            let jitter = Double.random(in: -jitterRange...jitterRange)
+            let delay = max(0.5, min(Self.maxRetryDelaySeconds, base + jitter))
+            self.retryDelaySeconds = min(Self.maxRetryDelaySeconds, max(base * 2.0, 1.0))
+            self.connectionStateValue = .retrying
+
+            let delayText = String(format: "%.2f", delay)
+            CastleWallLog.lifecycle.notice(
+                "ExtensionDispatcher reconnect scheduled in \(delayText)s; reason=\(reason)"
+            )
+
+            let timer = DispatchSource.makeTimerSource(queue: self.stateQueue)
+            timer.schedule(deadline: .now() + delay)
+            timer.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.retryTimer = nil
+                Task {
+                    _ = await self.attemptStartAndSubscribe(trigger: "retry")
+                }
+            }
+            self.retryTimer = timer
+            timer.resume()
+        }
+    }
+
+    private func updateConnectionState(_ newValue: ConnectionState) {
+        stateQueue.sync {
+            connectionStateValue = newValue
+        }
+    }
+
+    private func recordDroppedVerdict(state: ConnectionState) {
+        stateQueue.async {
+            self.verdictsDroppedDeadChannel += 1
+            let now = Date()
+            guard now.timeIntervalSince(self.lastVerdictDropLogAt) >= 60 else {
+                return
+            }
+            CastleWallLog.ipc.notice(
+                "ExtensionDispatcher dropped \(self.verdictsDroppedDeadChannel) verdict notifications while state=\(String(describing: state))"
+            )
+            self.lastVerdictDropLogAt = now
+            self.verdictsDroppedDeadChannel = 0
         }
     }
 }

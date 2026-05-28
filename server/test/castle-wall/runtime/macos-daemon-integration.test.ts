@@ -157,6 +157,7 @@ describe("Castle Wall macOS daemon integration", () => {
       fortress_id: string;
       pid: number;
       started_at: string;
+      pinned_pubkey_sha256?: string;
     };
     expect(config).toMatchObject({
       socket_path: join(fortressPath, "castle.sock"),
@@ -164,6 +165,7 @@ describe("Castle Wall macOS daemon integration", () => {
       pid: process.pid,
     });
     expect(Number.isNaN(Date.parse(config.started_at))).toBe(false);
+    expect(config.pinned_pubkey_sha256).toMatch(/^[0-9a-f]{64}$/);
 
     await handle.stop();
     await expect(stat(configPath)).rejects.toMatchObject({ code: "ENOENT" });

@@ -23,6 +23,8 @@ import type {
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
+const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = "/Library/Application Support/Sanctuary";
+const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
 
 export interface CastleWallCommandContext {
   out?: Writable;
@@ -117,6 +119,7 @@ export async function runProvisionPin(
           `Pinned public key at ${pubPath} must be 32 bytes (found ${existingPub.length}).`
         );
       }
+      await writeGlobalPinnedPublicKey(existingPub);
       const fingerprint = fingerprintFromPublicKey(existingPub);
       write(out, `${fingerprint}\n`);
       write(
@@ -142,6 +145,7 @@ export async function runProvisionPin(
 
     await writeFile(pubPath, publicKey, { mode: 0o600 });
     await chmod(pubPath, 0o600);
+    await writeGlobalPinnedPublicKey(publicKey);
     await writeFile(privPath, JSON.stringify(encryptedPrivateKey), {
       mode: 0o600,
     });
@@ -160,6 +164,23 @@ export async function runProvisionPin(
       }\n`
     );
     return 1;
+  }
+}
+
+async function writeGlobalPinnedPublicKey(
+  publicKey: Uint8Array,
+): Promise<void> {
+  try {
+    await mkdir(CASTLE_GLOBAL_PINNED_PUBKEY_DIR, { recursive: true, mode: 0o755 });
+    await writeFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, publicKey, { mode: 0o644 });
+    await chmod(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, 0o644);
+  } catch (error) {
+    // SAFETY: provision-pin warnings are operator-facing CLI stderr output.
+    console.warn(
+      `[castle-wall] warning: unable to write shared pinned key at ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
   }
 }
 

@@ -20,9 +20,9 @@ final class IPCClientHandshakeTests: XCTestCase {
         }
         defer { server.stop() }
 
-        let client = IPCClient(
-            options: IPCClientOptions(path: server.path, handshakeTimeoutSeconds: 0.2),
-            pinnedPublicKey: signing.publicKey.rawRepresentation
+        let client = try server.makeClient(
+            pinnedPublicKey: signing.publicKey.rawRepresentation,
+            handshakeTimeoutSeconds: 0.2
         )
         var receivedManifest = false
         client.setMessageListener { message in
@@ -37,8 +37,11 @@ final class IPCClientHandshakeTests: XCTestCase {
             XCTFail("unsigned peer must not complete handshake")
         } catch IPCClientError.handshakeTimeout {
             // expected
+        } catch IPCClientError.transportClosed {
+            // Also fail-closed: the unauthenticated peer disconnected
+            // before the handshake deadline fired.
         } catch {
-            XCTFail("expected handshakeTimeout, got \(error)")
+            XCTFail("expected handshakeTimeout or transportClosed, got \(error)")
         }
         XCTAssertFalse(receivedManifest)
     }
@@ -59,9 +62,9 @@ final class IPCClientHandshakeTests: XCTestCase {
         }
         defer { server.stop() }
 
-        let client = IPCClient(
-            options: IPCClientOptions(path: server.path, handshakeTimeoutSeconds: 1.0),
-            pinnedPublicKey: pinned.publicKey.rawRepresentation
+        let client = try server.makeClient(
+            pinnedPublicKey: pinned.publicKey.rawRepresentation,
+            handshakeTimeoutSeconds: 1.0
         )
         var receivedManifest = false
         client.setMessageListener { message in
@@ -97,9 +100,9 @@ final class IPCClientHandshakeTests: XCTestCase {
         }
         defer { server.stop() }
 
-        let client = IPCClient(
-            options: IPCClientOptions(path: server.path, handshakeTimeoutSeconds: 1.0),
-            pinnedPublicKey: signing.publicKey.rawRepresentation
+        let client = try server.makeClient(
+            pinnedPublicKey: signing.publicKey.rawRepresentation,
+            handshakeTimeoutSeconds: 1.0
         )
         let manifestReceived = expectation(description: "manifest delivered after authentication")
         client.setMessageListener { message in
@@ -156,61 +159,48 @@ final class IPCClientHandshakeTests: XCTestCase {
 
 private final class RogueUDSServer {
     let path: String
-    private let listenFD: Int32
+    private var clientFD: Int32
     private let queue = DispatchQueue(label: "ai.sanctuaryprotocol.castle-wall.rogue-uds-test")
 
     init(handler: @escaping (Int32) throws -> Void) throws {
-        self.path = "/tmp/cw-ipc-\(UUID().uuidString).sock"
-        self.listenFD = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard listenFD >= 0 else {
+        self.path = "socketpair://cw-ipc-\(UUID().uuidString)"
+        var fds = [Int32](repeating: -1, count: 2)
+        guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = Array(path.utf8)
-        guard pathBytes.count + 1 <= 104 else {
-            throw IPCClientError.socketPathTooLong(maxBytes: 103, actual: pathBytes.count)
-        }
-        withUnsafeMutableBytes(of: &addr.sun_path) { rawBuffer in
-            for (index, byte) in pathBytes.enumerated() {
-                rawBuffer[index] = byte
-            }
-            rawBuffer[pathBytes.count] = 0
-        }
-        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-
-        let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-                Darwin.bind(listenFD, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard bindResult == 0 else {
-            let savedErrno = errno
-            _ = Darwin.close(listenFD)
-            throw POSIXError(POSIXErrorCode(rawValue: savedErrno) ?? .EIO)
-        }
-        guard Darwin.listen(listenFD, 1) == 0 else {
-            let savedErrno = errno
-            _ = Darwin.close(listenFD)
-            throw POSIXError(POSIXErrorCode(rawValue: savedErrno) ?? .EIO)
-        }
-
-        queue.async { [listenFD] in
-            let fd = Darwin.accept(listenFD, nil, nil)
-            guard fd >= 0 else { return }
-            defer { _ = Darwin.close(fd) }
+        self.clientFD = fds[0]
+        let serverFD = fds[1]
+        queue.async {
+            defer { _ = Darwin.close(serverFD) }
             do {
-                try handler(fd)
+                try handler(serverFD)
             } catch {
                 XCTFail("rogue UDS server failed: \(error)")
             }
         }
     }
 
+    func makeClient(
+        pinnedPublicKey: Data,
+        handshakeTimeoutSeconds: TimeInterval
+    ) throws -> IPCClient {
+        guard clientFD >= 0 else {
+            throw IPCClientError.transportClosed
+        }
+        let fd = clientFD
+        clientFD = -1
+        return IPCClient(
+            options: IPCClientOptions(path: path, handshakeTimeoutSeconds: handshakeTimeoutSeconds),
+            pinnedPublicKey: pinnedPublicKey,
+            socketConnector: { _ in fd }
+        )
+    }
+
     func stop() {
-        _ = Darwin.close(listenFD)
-        _ = Darwin.unlink(path)
+        if clientFD >= 0 {
+            _ = Darwin.close(clientFD)
+            clientFD = -1
+        }
     }
 
     deinit {

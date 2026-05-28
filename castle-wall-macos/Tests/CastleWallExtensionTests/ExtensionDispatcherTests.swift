@@ -199,19 +199,14 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
     }
 
-    // MARK: - Outbound: notifyVerdict produces the right wire message
+    // MARK: - Outbound: notifyVerdict drops while disconnected
 
-    func test_notifyVerdict_allow_attemptsSendBeforeHandshake() {
-        // The dispatcher uses an IPCClient that has never started. The
-        // send path catches that and surfaces .sendBeforeHandshake via
-        // the error handler. The test captures the handler invocation,
-        // proving the dispatcher built a message and attempted to send.
+    func test_notifyVerdict_allow_dropsWhileDisconnected() {
         let engine = FlowEvaluatorEngine()
-        let expectation = self.expectation(description: "send error fired")
-        var capturedError: IPCClientError?
-        let handler: ExtensionDispatcher.SendErrorHandler = { err in
-            capturedError = err
-            expectation.fulfill()
+        let sendError = self.expectation(description: "send error not fired")
+        sendError.isInverted = true
+        let handler: ExtensionDispatcher.SendErrorHandler = { _ in
+            sendError.fulfill()
         }
         let dispatcher = ExtensionDispatcher(
             engine: engine,
@@ -219,45 +214,40 @@ final class ExtensionDispatcherTests: XCTestCase {
             sendErrorHandler: handler
         )
         dispatcher.notifyVerdict(.allow(matchedRuleId: "r-1"), for: makeFlow())
-        wait(for: [expectation], timeout: 1.0)
-        XCTAssertEqual(capturedError, .sendBeforeHandshake)
+        wait(for: [sendError], timeout: 0.1)
+        XCTAssertEqual(dispatcher.connectionState, .disconnected)
     }
 
-    func test_notifyVerdict_drop_attemptsSendBeforeHandshake() {
+    func test_notifyVerdict_drop_dropsWhileDisconnected() {
         let engine = FlowEvaluatorEngine()
-        let expectation = self.expectation(description: "send error fired")
-        var capturedError: IPCClientError?
+        let sendError = self.expectation(description: "send error not fired")
+        sendError.isInverted = true
         let dispatcher = ExtensionDispatcher(
             engine: engine,
             ipcClient: makeFloatingClient(),
-            sendErrorHandler: { err in
-                capturedError = err
-                expectation.fulfill()
+            sendErrorHandler: { _ in
+                sendError.fulfill()
             }
         )
         dispatcher.notifyVerdict(.drop(matchedRuleId: "r-2"), for: makeFlow())
-        wait(for: [expectation], timeout: 1.0)
-        XCTAssertEqual(capturedError, .sendBeforeHandshake)
+        wait(for: [sendError], timeout: 0.1)
+        XCTAssertEqual(dispatcher.connectionState, .disconnected)
     }
 
-    func test_notifyVerdict_uncertain_attemptsSendBeforeHandshake() {
-        // Uncertain outcomes route through flow_pending_approval, which
-        // also goes via IPCClient.send and surfaces .sendBeforeHandshake
-        // in the pre-handshake state.
+    func test_notifyVerdict_uncertain_dropsWhileDisconnected() {
         let engine = FlowEvaluatorEngine()
-        let expectation = self.expectation(description: "send error fired")
-        var capturedError: IPCClientError?
+        let sendError = self.expectation(description: "send error not fired")
+        sendError.isInverted = true
         let dispatcher = ExtensionDispatcher(
             engine: engine,
             ipcClient: makeFloatingClient(),
-            sendErrorHandler: { err in
-                capturedError = err
-                expectation.fulfill()
+            sendErrorHandler: { _ in
+                sendError.fulfill()
             }
         )
         dispatcher.notifyVerdict(.uncertain, for: makeFlow())
-        wait(for: [expectation], timeout: 1.0)
-        XCTAssertEqual(capturedError, .sendBeforeHandshake)
+        wait(for: [sendError], timeout: 0.1)
+        XCTAssertEqual(dispatcher.connectionState, .disconnected)
     }
 
     // MARK: - Outbound message-shape correctness via the builder

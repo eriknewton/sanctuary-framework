@@ -105,7 +105,10 @@ let package = Package(
         .testTarget(
             name: "CastleWallExtensionTests",
             dependencies: ["CastleWallIPC", "CastleWallFilter"],
-            path: "Tests/CastleWallExtensionTests"
+            path: "Tests/CastleWallExtensionTests",
+            resources: [
+                .copy("Fixtures"),
+            ]
         ),
         .testTarget(
             name: "CastleWallHostAppTests",
