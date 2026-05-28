@@ -1,0 +1,62 @@
+{
+  "manifest_signed_body": {
+    "schema_version": 1,
+    "fortress_id": "fortress-parity",
+    "issued_at": "2026-05-27T00:02:00.000Z",
+    "rules": [
+      {
+        "rule_id": "allow-anthropic",
+        "file": "allow-anthropic.json",
+        "sha256": "7f9b70cf09a465d4c305075fa2472bb3d572a3a0e3bbce05455e76d323c33819"
+      },
+      {
+        "rule_id": "prompt-generic-https",
+        "file": "prompt-generic-https.json",
+        "sha256": "4c86819d1ee9aca2f8e9fe6e0b5781201c11312e4c6681e5b31667b6ec7e745c"
+      }
+    ]
+  },
+  "rules": [
+    {
+      "id": "allow-anthropic",
+      "schema_version": 1,
+      "created_at": "2026-05-27T00:00:00.000Z",
+      "description": "Allow Anthropic API over TLS",
+      "match": {
+        "host": [
+          "api.anthropic.com",
+          "auth.anthropic.com"
+        ],
+        "port": [
+          443
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {
+        "template_ids": [
+          "coding-assistant"
+        ]
+      },
+      "disposition": "allow"
+    },
+    {
+      "id": "prompt-generic-https",
+      "schema_version": 1,
+      "created_at": "2026-05-27T00:01:00.000Z",
+      "match": {
+        "host_pattern": "*.example.org",
+        "port": 443
+      },
+      "scope": {},
+      "disposition": "prompt",
+      "time_window": {
+        "start": "09:00",
+        "end": "17:00"
+      }
+    }
+  ],
+  "expected_canonical_json_b64": "eyJmb3J0cmVzc19pZCI6ImZvcnRyZXNzLXBhcml0eSIsImlzc3VlZF9hdCI6IjIwMjYtMDUtMjdUMDA6MDI6MDAuMDAwWiIsInJ1bGVzIjpbeyJmaWxlIjoiYWxsb3ctYW50aHJvcGljLmpzb24iLCJydWxlX2lkIjoiYWxsb3ctYW50aHJvcGljIiwic2hhMjU2IjoiN2Y5YjcwY2YwOWE0NjVkNGMzMDUwNzVmYTI0NzJiYjNkNTcyYTNhMGUzYmJjZTA1NDU1ZTc2ZDMyM2MzMzgxOSJ9LHsiZmlsZSI6InByb21wdC1nZW5lcmljLWh0dHBzLmpzb24iLCJydWxlX2lkIjoicHJvbXB0LWdlbmVyaWMtaHR0cHMiLCJzaGEyNTYiOiI0Yzg2ODE5ZDFlZTlhY2EyZjhlOWZlNmUwYjU3ODEyMDFjMTEzMTJlNGM2NjgxZTViMzE2NjdiNmVjN2U3NDVjIn1dLCJzY2hlbWFfdmVyc2lvbiI6MX0=",
+  "expected_canonical_json_hex": "7b22666f7274726573735f6964223a22666f7274726573732d706172697479222c226973737565645f6174223a22323032362d30352d32375430303a30323a30302e3030305a222c2272756c6573223a5b7b2266696c65223a22616c6c6f772d616e7468726f7069632e6a736f6e222c2272756c655f6964223a22616c6c6f772d616e7468726f706963222c22736861323536223a2237663962373063663039613436356434633330353037356661323437326262336435373261336130653362626365303534353565373664333233633333383139227d2c7b2266696c65223a2270726f6d70742d67656e657269632d68747470732e6a736f6e222c2272756c655f6964223a2270726f6d70742d67656e657269632d6874747073222c22736861323536223a2234633836383139643165653961636132663865396665366530623537383132303163313133313265346336363831653562333136363762366563376537343563227d5d2c22736368656d615f76657273696f6e223a317d",
+  "test_public_key_b64url": "cSZR9FC6BbY4mLme9fe6RWMujiUn9_cVzWcexAJMxR4",
+  "test_signature_b64url": "1c2_AuNYPkYsIL3jC0nFfOjqfVRlXK6wwTPGX2hOLnAknb4Wi0cscnGjc3tEtC4eD0PU20CvYonYrOzj8gwfBg"
+}

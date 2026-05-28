@@ -75,11 +75,27 @@ public final class IPCClient {
     private var handshakeDeadline: DispatchSourceTimer?
     private var pendingChallengeNonce: Data?
     private var messageListener: IPCMessageListener?
+    private var transportClosedListener: ((IPCClientError) -> Void)?
+    private let socketConnector: (String) throws -> Int32
 
     public init(options: IPCClientOptions, pinnedPublicKey: Data) {
         self.options = options
         self.pinnedPublicKey = pinnedPublicKey
         self.queue = DispatchQueue(label: "ai.sanctuaryprotocol.castle-wall.ipc-client")
+        self.socketConnector = { path in
+            try IPCClient.connectUDS(path: path)
+        }
+    }
+
+    init(
+        options: IPCClientOptions,
+        pinnedPublicKey: Data,
+        socketConnector: @escaping (String) throws -> Int32
+    ) {
+        self.options = options
+        self.pinnedPublicKey = pinnedPublicKey
+        self.queue = DispatchQueue(label: "ai.sanctuaryprotocol.castle-wall.ipc-client")
+        self.socketConnector = socketConnector
     }
 
     /// Raw Ed25519 public key bytes pinned for the fortress identity.
@@ -97,6 +113,14 @@ public final class IPCClient {
     public func setMessageListener(_ listener: IPCMessageListener?) {
         queue.async {
             self.messageListener = listener
+        }
+    }
+
+    /// Register a callback invoked when a previously-connected transport
+    /// drops after handshake completion.
+    public func setTransportClosedListener(_ listener: ((IPCClientError) -> Void)?) {
+        queue.async {
+            self.transportClosedListener = listener
         }
     }
 
@@ -189,7 +213,7 @@ public final class IPCClient {
             throw IPCClientError.alreadyStarted
         }
 
-        let fd = try connectUDS(path: options.path)
+        let fd = try socketConnector(options.path)
         socketFD = fd
 
         return try await withCheckedThrowingContinuation { continuation in
@@ -205,27 +229,25 @@ public final class IPCClient {
     /// Close the connection and reject any in-flight handshake.
     public func close() {
         queue.async {
-            self.cancelHandshakeDeadline()
-            self.receiveSource?.cancel()
-            self.receiveSource = nil
-            if self.socketFD != -1 {
-                _ = Darwin.close(self.socketFD)
-                self.socketFD = -1
-            }
-            if let cont = self.handshakeContinuation {
-                self.handshakeContinuation = nil
-                cont.resume(throwing: IPCClientError.transportClosed)
+            let continuation = self.handshakeContinuation
+            self.handshakeContinuation = nil
+            self.resetConnectionState()
+            if let continuation {
+                continuation.resume(throwing: IPCClientError.transportClosed)
             }
         }
     }
 
     // MARK: - Internals
 
-    private func connectUDS(path: String) throws -> Int32 {
+    private static func connectUDS(path: String) throws -> Int32 {
         let pathBytes = Array(path.utf8)
         // sockaddr_un.sun_path is 104 bytes on Darwin.
         let maxPathLen = 104
         guard pathBytes.count + 1 <= maxPathLen else {
+            CastleWallLog.lifecycle.error(
+                "ipc socket path too long; path_length=\(pathBytes.count) max=\(maxPathLen - 1)"
+            )
             throw IPCClientError.socketPathTooLong(maxBytes: maxPathLen - 1, actual: pathBytes.count)
         }
 
@@ -286,8 +308,8 @@ public final class IPCClient {
             guard let self else { return }
             self.drainSocket(fd: fd)
         }
-        source.setCancelHandler {
-            // Real fd close is owned by `close()`.
+        source.setCancelHandler { [fd] in
+            _ = Darwin.close(fd)
         }
         source.resume()
         receiveSource = source
@@ -422,6 +444,9 @@ public final class IPCClient {
     private func completeHandshake(_ identity: HandshakeIdentity) {
         cancelHandshakeDeadline()
         handshakeIdentity = identity
+        CastleWallLog.auth.notice(
+            "handshake complete; fortress=\(identity.fortressId) signingKeyId=\(identity.signingKeyId)"
+        )
         if let cont = handshakeContinuation {
             handshakeContinuation = nil
             cont.resume(returning: identity)
@@ -429,17 +454,70 @@ public final class IPCClient {
     }
 
     private func failHandshake(_ error: Error) {
-        cancelHandshakeDeadline()
-        pendingChallengeNonce = nil
-        receiveSource?.cancel()
-        receiveSource = nil
-        if socketFD != -1 {
-            _ = Darwin.close(socketFD)
-            socketFD = -1
+        let normalizedError = normalizeError(error)
+        logHandshakeFailure(normalizedError)
+        let continuation = handshakeContinuation
+        let hadAuthenticatedSession = handshakeIdentity != nil
+        handshakeContinuation = nil
+        resetConnectionState()
+        if let continuation {
+            continuation.resume(throwing: normalizedError)
+            return
         }
-        if let cont = handshakeContinuation {
-            handshakeContinuation = nil
-            cont.resume(throwing: error)
+        if hadAuthenticatedSession {
+            transportClosedListener?(normalizedError)
         }
     }
+
+    private func resetConnectionState() {
+        cancelHandshakeDeadline()
+        pendingChallengeNonce = nil
+        handshakeIdentity = nil
+        inbound.removeAll(keepingCapacity: false)
+        let source = receiveSource
+        receiveSource = nil
+        if let source {
+            source.cancel()
+        } else if socketFD != -1 {
+            _ = Darwin.close(socketFD)
+        }
+        socketFD = -1
+    }
+
+    private func normalizeError(_ error: Error) -> IPCClientError {
+        if let ipcError = error as? IPCClientError {
+            return ipcError
+        }
+        return .sendFailed(String(describing: error))
+    }
+
+    private func logHandshakeFailure(_ error: IPCClientError) {
+        switch error {
+        case .alreadyStarted:
+            CastleWallLog.auth.error("handshake failed: alreadyStarted")
+        case .notStarted:
+            CastleWallLog.auth.error("handshake failed: notStarted")
+        case .transportClosed:
+            CastleWallLog.auth.error("handshake failed: transportClosed")
+        case .connectFailed(let reason):
+            CastleWallLog.auth.error("handshake failed: connectFailed reason=\(reason)")
+        case .framingError(let reason):
+            CastleWallLog.auth.error("handshake failed: framingError reason=\(reason)")
+        case .envelopeMalformed(let reason):
+            CastleWallLog.auth.error("handshake failed: envelopeMalformed reason=\(reason)")
+        case .handshakeTimeout:
+            CastleWallLog.auth.error("handshake failed: handshakeTimeout")
+        case .handshakeRejected(let reason):
+            CastleWallLog.auth.error("handshake failed: handshakeRejected reason=\(reason)")
+        case .socketPathTooLong(let maxBytes, let actual):
+            CastleWallLog.auth.error(
+                "handshake failed: socketPathTooLong actual=\(actual) max=\(maxBytes)"
+            )
+        case .sendFailed(let reason):
+            CastleWallLog.auth.error("handshake failed: sendFailed reason=\(reason)")
+        case .sendBeforeHandshake:
+            CastleWallLog.auth.error("handshake failed: sendBeforeHandshake")
+        }
+    }
+
 }

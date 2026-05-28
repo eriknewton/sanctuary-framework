@@ -123,6 +123,7 @@ public enum IPCBridgeNotifications {
         }
         store.update(snapshot)
         cache.clear()
+        CastleWallLog.ipc.notice("manifest applied; rule_count=\(snapshot.rules.count)")
         return snapshot
     }
 

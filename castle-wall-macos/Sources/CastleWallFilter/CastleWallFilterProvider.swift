@@ -31,6 +31,7 @@
 import Foundation
 import NetworkExtension
 import CastleWallIPC
+import Darwin
 
 /// Hook the test target uses to inject a fake (agentId, templateId) mapper.
 /// Phase 1 default returns `(sourceAppIdentifier, "unknown")` so a wrapped
@@ -55,6 +56,11 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
     /// FilterProvider's verdict path still runs against the engine even
     /// when the dispatcher is absent (refuse-to-load fallback).
     private var dispatcher: ExtensionDispatcher?
+    private let bootstrapQueue = DispatchQueue(
+        label: "ai.sanctuaryprotocol.castle-wall.provider-bootstrap"
+    )
+    private var bootstrapTimer: DispatchSourceTimer?
+    private var bootstrapRetryDelaySeconds: TimeInterval = 1.0
 
     // MARK: - Init
 
@@ -77,49 +83,7 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
         completionHandler: @escaping (Error?) -> Void
     ) {
         CastleWallLog.lifecycle.info("CastleWallFilterProvider.startFilter invoked")
-
-        let resolved = SocketPath.resolve(
-            platform: "darwin",
-            fortressPath: ProcessInfo.processInfo.environment["SANCTUARY_FORTRESS_PATH"],
-            homeDir: NSHomeDirectory(),
-            explicitOverride: ProcessInfo.processInfo.environment["SANCTUARY_CASTLE_SOCKET"]
-        )
-        CastleWallLog.lifecycle.info("ipc socket path resolved: \(resolved.path) (\(resolved.source.rawValue))")
-
-        let pinnedPath = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(".sanctuary")
-            .appendingPathComponent("castle-pinned-pubkey.bin")
-        let pinnedKey: Data
-        do {
-            pinnedKey = try Auth.loadPinnedPublicKey(at: pinnedPath)
-        } catch {
-            CastleWallLog.auth.notice(
-                "pinned public key not yet provisioned (default-deny fallback): \(String(describing: error))"
-            )
-            // When pinned key is missing, the extension loads with no IPC client and an empty
-            // manifest. The engine then default-denies every flow (fail-closed invariant).
-            // The operator provisions the pin via `sanctuary castle-wall provision-pin` to
-            // activate enforcement.
-            completionHandler(nil)
-            return
-        }
-
-        let client = IPCClient(
-            options: IPCClientOptions(path: resolved.path),
-            pinnedPublicKey: pinnedKey
-        )
-        self.ipcClient = client
-        let dispatcher = ExtensionDispatcher(engine: engine, ipcClient: client)
-        self.dispatcher = dispatcher
-
-        Task.detached { [weak self] in
-            let started = await dispatcher.start()
-            CastleWallLog.lifecycle.info(
-                "ExtensionDispatcher.start completed; live=\(started)"
-            )
-            _ = self
-        }
-
+        bootstrapDispatcherIfNeeded(reason: "startFilter")
         completionHandler(nil)
     }
 
@@ -128,11 +92,150 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
         completionHandler: @escaping () -> Void
     ) {
         CastleWallLog.lifecycle.info("CastleWallFilterProvider.stopFilter reason=\(reason.rawValue)")
+        bootstrapQueue.sync {
+            bootstrapTimer?.cancel()
+            bootstrapTimer = nil
+            bootstrapRetryDelaySeconds = 1.0
+        }
         dispatcher?.stop()
         dispatcher = nil
         ipcClient?.close()
         ipcClient = nil
         completionHandler()
+    }
+
+    private func bootstrapDispatcherIfNeeded(reason: String) {
+        bootstrapQueue.async { [weak self] in
+            guard let self else { return }
+            guard self.dispatcher == nil else { return }
+
+            let resolved = SocketPath.resolve(
+                platform: "darwin",
+                fortressPath: ProcessInfo.processInfo.environment["SANCTUARY_FORTRESS_PATH"],
+                homeDir: NSHomeDirectory(),
+                explicitOverride: ProcessInfo.processInfo.environment["SANCTUARY_CASTLE_SOCKET"]
+            )
+            CastleWallLog.lifecycle.notice(
+                "ipc socket path resolved: \(resolved.path) (\(resolved.source.rawValue)); bootstrap_reason=\(reason)"
+            )
+
+            let keyLoad: (path: URL, key: Data)
+            do {
+                keyLoad = try self.loadPinnedPublicKey()
+            } catch {
+                CastleWallLog.auth.notice(
+                    "pinned public key not yet provisioned (default-deny fallback): \(String(describing: error))"
+                )
+                self.scheduleBootstrapRetry(reason: "pinned key unavailable")
+                return
+            }
+            CastleWallLog.auth.notice("using pinned public key path: \(keyLoad.path.path)")
+
+            let loadedFingerprint = SignedManifestVerifier.sha256Hex(keyLoad.key).lowercased()
+            if let activeConfig = Self.activeConfigFingerprint(forSocketPath: resolved.path),
+               activeConfig.pinnedPubkeySha256 != loadedFingerprint {
+                CastleWallLog.auth.error(
+                    "pinned key fingerprint mismatch: active-config fortress=\(activeConfig.fortressId) expects=\(Self.shortFingerprint(activeConfig.pinnedPubkeySha256)) loaded=\(Self.shortFingerprint(loadedFingerprint)); refusing stale key, will retry"
+                )
+                self.scheduleBootstrapRetry(reason: "pinned key fingerprint mismatch")
+                return
+            }
+
+            self.bootstrapTimer?.cancel()
+            self.bootstrapTimer = nil
+            self.bootstrapRetryDelaySeconds = 1.0
+
+            let client = IPCClient(
+                options: IPCClientOptions(path: resolved.path),
+                pinnedPublicKey: keyLoad.key
+            )
+            self.ipcClient = client
+            let dispatcher = ExtensionDispatcher(engine: self.engine, ipcClient: client)
+            self.dispatcher = dispatcher
+
+            Task.detached {
+                let started = await dispatcher.start()
+                CastleWallLog.lifecycle.notice(
+                    "ExtensionDispatcher.start completed; live=\(started)"
+                )
+            }
+        }
+    }
+
+    private func scheduleBootstrapRetry(reason: String) {
+        bootstrapQueue.async { [weak self] in
+            guard let self else { return }
+            guard self.dispatcher == nil else { return }
+
+            self.bootstrapTimer?.cancel()
+            self.bootstrapTimer = nil
+
+            let delay = min(30.0, max(1.0, self.bootstrapRetryDelaySeconds))
+            self.bootstrapRetryDelaySeconds = min(30.0, self.bootstrapRetryDelaySeconds * 2.0)
+            CastleWallLog.lifecycle.notice(
+                "dispatcher bootstrap retry scheduled in \(String(format: "%.2f", delay))s; reason=\(reason)"
+            )
+
+            let timer = DispatchSource.makeTimerSource(queue: self.bootstrapQueue)
+            timer.schedule(deadline: .now() + delay)
+            timer.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.bootstrapTimer = nil
+                self.bootstrapDispatcherIfNeeded(reason: "bootstrap retry")
+            }
+            self.bootstrapTimer = timer
+            timer.resume()
+        }
+    }
+
+    private func loadPinnedPublicKey() throws -> (path: URL, key: Data) {
+        let globalPath = URL(fileURLWithPath: "/Library/Application Support/Sanctuary")
+            .appendingPathComponent("castle-pinned-pubkey.bin")
+        if FileManager.default.fileExists(atPath: globalPath.path) {
+            return (path: globalPath, key: try Auth.loadPinnedPublicKey(at: globalPath))
+        }
+
+        let homePath = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".sanctuary")
+            .appendingPathComponent("castle-pinned-pubkey.bin")
+        return (path: homePath, key: try Auth.loadPinnedPublicKey(at: homePath))
+    }
+
+    private struct ActiveConfigFingerprint {
+        let fortressId: String
+        let pinnedPubkeySha256: String
+    }
+
+    private static func activeConfigFingerprint(forSocketPath socketPath: String) -> ActiveConfigFingerprint? {
+        guard let data = FileManager.default.contents(atPath: SocketPath.activeConfigPath) else {
+            return nil
+        }
+        guard
+            let parsed = try? JSONSerialization.jsonObject(with: data),
+            let object = parsed as? [String: Any],
+            let activeSocketPath = object["socket_path"] as? String,
+            activeSocketPath == socketPath,
+            let fortressId = object["fortress_id"] as? String,
+            let pid = object["pid"] as? Int,
+            pid > 0,
+            isPidAlive(pid),
+            let fingerprint = object["pinned_pubkey_sha256"] as? String,
+            !fingerprint.isEmpty
+        else {
+            return nil
+        }
+        return ActiveConfigFingerprint(
+            fortressId: fortressId,
+            pinnedPubkeySha256: fingerprint.lowercased()
+        )
+    }
+
+    private static func isPidAlive(_ pid: Int) -> Bool {
+        return kill(pid_t(pid), 0) == 0 || errno == EPERM
+    }
+
+    private static func shortFingerprint(_ full: String) -> String {
+        return String(full.prefix(12))
     }
 
     // MARK: - Verdict path
