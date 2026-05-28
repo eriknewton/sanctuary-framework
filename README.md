@@ -1,14 +1,48 @@
-# Sanctuary Framework
+# Sanctuary
 
-**Your agent. Your machine. Your keys.**
+**Your Agent. Your Machine. Your Keys.**
 
-Sanctuary puts cryptographic walls around every AI agent in your life and gives you the keys. Your agents run on your machines today, with operator-cloud and sovereign-managed deployment modes on the roadmap. Every action an agent takes is signed with a per-agent identity rooted in keys you hold, gated by policy you control, and logged to a portable audit trail. You don't have to give up the tools you already use: `sanctuary wrap` adds sovereignty underneath your existing harness, invisibly.
+Sanctuary wraps any AI agent harness in a substrate that protects you at the kernel, signs every action with keys you hold, and keeps the data and reputation your agents accumulate on your hardware. Whether you run one agent or a fleet, the substrate stays yours.
 
-### Why this matters
+Sovereignty used to be embodied. In the physical world, your body provided the perimeter, the custody, the memory, and the audit trail by default. When you act through an AI agent, the substrate around the agent has to do that job, and almost always doesn't. Sanctuary is what does. The same architecture serves any sovereign acting through agents: a person, a company, eventually an agent itself.
 
-Most AI infrastructure monetizes something the operator cannot take with them: platform lock-in, inference margin, managed-cloud rent, training-data extraction, or custodial settlement. Operator-owned keys undermine every one of those revenue models. That is the business-model wedge. Features get copied; a business model that runs against the vendor's own does not.
+Today: cryptographic identity you hold, kernel-level enforcement that holds even when the agent doesn't cooperate (Linux proven; macOS in flight), and a portable audit trail that travels across machines and vendors. In scope: the Sovereign Data Warehouse (your working data, query history, and document corpus on your substrate, not a vendor's silo) and federation across your own machines.
 
-The conversation UI is the easy part. Sanctuary is the version where you own the keys, every message is signed with the agent's cryptographic identity rooted in yours, and you can move agents between machines without losing the audit trail or commitment records.
+Already running OpenClaw, Hermes, Claude Code, Cursor, or Cline?
+
+```bash
+npx @sanctuary-framework/mcp-server protect --openclaw
+```
+
+---
+
+## Install
+
+Already running OpenClaw, Hermes, Claude Code, Cursor, or Cline? One command wraps it.
+
+```bash
+npx @sanctuary-framework/mcp-server protect --openclaw
+```
+
+Or substitute `--hermes`, `--claude-code`, `--cursor`, `--cline`, or `--wrap <path-to-config>` for any other MCP-compatible harness. Compatibility for the named harnesses is exercised on every release; other MCP-compatible harnesses work via the `--wrap` flag and are covered as drills extend the matrix. See the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md) for the current per-harness status. You keep using the harness you already like. Sanctuary adds the substrate underneath, invisibly.
+
+What happens when you run protect:
+
+1. A passphrase is generated and stored in the macOS Keychain (or an encrypted fallback file on Linux/Windows).
+2. Your existing harness config is backed up to `~/.sanctuary/backup/`.
+3. The config is rewritten so every tool call routes through Sanctuary.
+4. The Sovereignty Dashboard starts on `http://localhost:3501` (or the next free port up to 3510) and opens in your browser with a one-click auth token.
+5. Every call is logged and policy-gated. Sensitive-content redaction and query-layer anonymity (Tiers 1 and 2) layer on top per the Assurance Matrix. Dangerous operations require your approval.
+
+Useful flags: `--dry-run` previews changes without touching anything. `--no-open` runs headless for CI. `--unwrap` restores the original harness config.
+
+**Back up your passphrase:**
+
+```bash
+sanctuary export-passphrase
+```
+
+Prints the passphrase to stdout after a confirmation prompt. Store it in a password manager. If you lose it, encrypted state cannot be recovered.
 
 ---
 
@@ -17,7 +51,6 @@ The conversation UI is the easy part. Sanctuary is the version where you own the
 `main` is the development branch. The current stable release is **v1.3.3** on the npm `latest` channel (shipped 2026-05-26). v1.3.3 lands Castle Wall macOS Phase 2.5 retail UX, the Track 4A server-to-sysext IPC integration, and the Track 4A.2 sysext socket-path discovery file. See the [v1.3.3 release notes](docs/releases/v1.3.3.md) and [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ```bash
-# Stable channel (v1.3.3)
 npm install -g @sanctuary-framework/mcp-server
 ```
 
@@ -25,31 +58,32 @@ Current capability summary:
 
 | Surface | Current status |
 |---|---|
-| Local `sanctuary wrap`, dashboard, policy gates, encrypted state, audit trail, signed exit bundle | Shipped (v1.0 through v1.3) |
+| Local `sanctuary protect` (alias `wrap`), dashboard, policy gates, encrypted state, audit trail, signed exit bundle | Shipped (v1.0 through v1.3) |
 | Cooperative MCP gates: three-tier approval, four canonical policy slots, channel templates | Shipped |
 | Context gating, sensitive-field redaction, query-layer anonymity (Tier 1 + Tier 2) | Shipped |
 | Portable identity, state export/import, recovery flows, reputation bundles | Shipped |
 | Local multi-agent coordination, fortress-local hub APIs, signed audit chain | Shipped |
 | Federation Protocol v0.1 foundation | Shipped; cross-operator federation hardening underway per Wave 1 design (2026-05-26) |
-| Concordia composition (negotiation receipts) and Verascore composition (reputation) | Optional, default off; both shipped |
+| Concordia composition (negotiation receipts), Verascore composition (reputation) | Optional, default off; both shipped |
 | Castle Wall (OS-level egress enforcement): Linux | Shipped (Phase 1, 2026-05-06) |
-| Castle Wall macOS: signed sysext, host app, Phase 2.5 retail UX, IPC integration | Sysext + activation wiring shipped in v1.3.3; macOS active enforcement (NEFilterManager arming) shipped on main post-v1.3.3; end-to-end Mini1 drill PASS pending |
+| Castle Wall macOS: signed sysext, host app, Phase 2.5 retail UX, IPC integration | Sysext + activation wiring shipped in v1.3.3; active enforcement code (NEFilterManager arming) on main post-v1.3.3; end-to-end Mini1 drill PASS pending |
 | Castle Wall Windows | Roadmapped |
 | Mobile (PWA) operator companion | Roadmapped |
 | Fleet console, operator-cloud deployment, sovereign-managed TEE, post-quantum migration | Roadmapped |
 
 Trust and security claims are tracked in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md). Public-facing claims trace to `proven` or `partial` rows in that matrix; the platform, gap, and next-proof limits named on each row are preserved.
 
-Roadmap shape: the current focus is closing the Mac Castle Wall thesis-gate (sysext rebuild + Track 4A drill PASS on Mini1) so the structural-enforcement claim is honest on both Linux and macOS. After that, Wave 1 (API parity + CLI MVP + federation) and the Castle Wall Windows backend. See [ROADMAP.md](ROADMAP.md).
+Roadmap shape: the current focus is closing the Mac Castle Wall thesis-gate (sysext rebuild + Track 4A drill PASS on Mini1) so the structural-enforcement claim is honest on both Linux and macOS. After that, Wave 1 (API parity + CLI MVP + federation-ready API) and the Castle Wall Windows backend. See [ROADMAP.md](ROADMAP.md).
 
 ---
 
 ## For AI coding agents installing Sanctuary on behalf of an operator
 
-If you are an LLM-powered coding agent (OpenClaw, Hermes Agent, Claude Code, Cursor, Cline, Codex, or any other harness with shell access) and an operator has asked you to install Sanctuary, follow this section first. Humans can skip to "Wrap any harness in one command" below; you will arrive at the same commands.
+If you are an LLM-powered coding agent (OpenClaw, Hermes Agent, Claude Code, Cursor, Cline, Codex, or any other harness with shell access) and an operator has asked you to install Sanctuary, follow this section. Humans can skip to "Installation reference" below; you will arrive at the same commands.
 
 **Operator-facing summary first.** Before running anything, give the operator one paragraph:
-> "Sanctuary will wrap your existing AI agent so every action it takes is signed with keys you hold and logged to a portable audit trail. Install takes about a minute. I will: (1) detect which agent harness you are running, (2) run one wrap command, (3) confirm the dashboard is live, (4) optionally scaffold your first sub-agent template. Approve to proceed."
+
+> "Sanctuary will wrap your existing AI agent so every action it takes is signed with keys you hold and logged to a portable audit trail. Install takes about a minute. I will: (1) detect which agent harness you are running, (2) run one protect command, (3) confirm the dashboard is live, (4) optionally scaffold your first sub-agent template. Approve to proceed."
 
 ### Step 1: Detect the operator's harness
 
@@ -74,10 +108,10 @@ test -d "$HOME/Library/Application Support/Code/User/globalStorage/saoudrizwan.c
 
 If multiple match, ask the operator which one to wrap. If none match, the operator does not have a recognized harness installed; offer to install one or use the raw MCP server path (Step 4 below).
 
-### Step 2: Run the wrap command
+### Step 2: Run the protect command
 
 ```bash
-npx @sanctuary-framework/mcp-server wrap --<harness>
+npx @sanctuary-framework/mcp-server protect --<harness>
 ```
 
 Substitute `<harness>` with the value detected in Step 1: `openclaw`, `hermes`, `claude-code`, `cursor`, or `cline`. For any harness not in that list, see Step 4.
@@ -92,7 +126,7 @@ Note the port (it may be 3501-3510 if 3501 is taken).
 
 ### Step 3: Verify the install
 
-After Step 2 (wrap succeeds), the dashboard is running. Verify the install:
+After Step 2 (protect succeeds), the dashboard is running. Verify the install:
 
 ```bash
 # (a) Dashboard responds
@@ -102,7 +136,7 @@ curl -fsS "http://localhost:3501/api/health" | grep -q '"status":"ok"' && echo "
 security find-generic-password -s "sanctuary-passphrase" >/dev/null 2>&1 && echo "passphrase=ok"
 ```
 
-The first time you open the Sovereignty Dashboard in your browser, Sanctuary derives your master key from the keychain-stored passphrase, creates your fortress's Ed25519 identity, and writes the audit log genesis. Wrap configures these on disk; the first dashboard unlock initializes them. Verify after first unlock:
+The first time you open the Sovereignty Dashboard in your browser, Sanctuary derives your master key from the keychain-stored passphrase, creates your fortress's Ed25519 identity, and writes the audit log genesis. The protect command configures these on disk; the first dashboard unlock initializes them. Verify after first unlock:
 
 ```bash
 # (c) Identities loaded (run after opening the dashboard once)
@@ -116,7 +150,7 @@ If any check fails, see "Troubleshooting" near the bottom of this README.
 
 ### Step 4: Scaffold the operator's first governed harness (recommended)
 
-After the wrap succeeds, ask the operator: "Which channel shape do you want on this harness? I have one-click archetypes for research-assistant, coding-assistant, ops-runner, planner, and handoff-coordinator. Or I can skip this step."
+After the protect succeeds, ask the operator: "Which channel shape do you want on this harness? I have one-click archetypes for research-assistant, coding-assistant, ops-runner, planner, and handoff-coordinator. Or I can skip this step."
 
 If they pick an archetype, run:
 
@@ -129,7 +163,7 @@ curl -X POST "http://localhost:3501/api/templates/<template-name>/init" \
   }'
 ```
 
-Substitute `<template-name>` with the archetype the operator picked (`research-assistant`, `coding-assistant`, etc.). The `agent_name` must match an already-wrapped harness; `template init` rejects an orphan `agent_id` that is not bound to a wrapped harness (the install-time check that locks Sanctuary to the operator's machine) and points the operator at `sanctuary wrap`. Confirm the response includes a `signed_policy_event_id` and an `attestation_panel_url`. Open that URL in the operator's browser.
+Substitute `<template-name>` with the archetype the operator picked (`research-assistant`, `coding-assistant`, etc.). The `agent_name` must match an already-wrapped harness; `template init` rejects an orphan `agent_id` that is not bound to a wrapped harness (the install-time check that locks Sanctuary to the operator's machine) and points the operator at `sanctuary protect`. Confirm the response includes a `signed_policy_event_id` and an `attestation_panel_url`. Open that URL in the operator's browser.
 
 ### Step 5: Hand back to the operator
 
@@ -159,43 +193,11 @@ Generate the passphrase with `openssl rand -base64 32` and store it in the opera
 
 ---
 
-## Wrap any harness in one command
-
-Already running an agent on OpenClaw, Hermes, Claude Code, Cursor, or Cline? One command wraps it in Sanctuary's policy gates and audit trail (the audit log writes its genesis on your first dashboard unlock), starts the Sovereignty Dashboard, and opens it in your browser.
-
-```bash
-npx @sanctuary-framework/mcp-server wrap --openclaw
-```
-
-Or substitute `--hermes`, `--claude-code`, `--cursor`, `--cline`, or `--wrap <path-to-config>` for any other MCP-compatible harness.
-
-You keep using the harness you already like. Sanctuary adds sovereignty underneath, invisibly.
-
-What happens when you run wrap:
-
-1. A passphrase is generated and stored in the macOS Keychain (or an encrypted fallback file on Linux/Windows).
-2. Your existing harness config is backed up to `~/.sanctuary/backup/`.
-3. The config is rewritten so every tool call routes through Sanctuary.
-4. The Sovereignty Dashboard starts on `http://localhost:3501` (or the next free port up to 3510) and opens in your browser with a one-click auth token.
-5. Every call is logged, scanned for injection, and policy-gated. Dangerous operations require your approval.
-
-Useful flags: `--dry-run` previews changes without touching anything; `--no-open` runs headless for CI; `--unwrap` restores the original harness config.
-
-**Back up your passphrase:**
-
-```bash
-sanctuary export-passphrase
-```
-
-Prints the passphrase to stdout after a confirmation prompt. Store it in a password manager. If you lose it, encrypted state cannot be recovered.
-
----
-
 ## Installation reference
 
 **Requirements:** Node.js >= 22.0.0, npm >= 10.0.0.
 
-The canonical install path is `sanctuary wrap` (above). The sections below are reference for less common situations.
+The canonical install path is `sanctuary protect` (above). The sections below are reference for less common situations.
 
 ### Persistent install
 
@@ -240,9 +242,9 @@ Scores your setup 0-100 across security, isolation, and privacy. Detects problem
 
 ## First agent after install: scaffold a template
 
-After `wrap`, the dashboard exposes a one-click template picker. Click "Add agent" on the Agents view, pick a template, fill in a name and model provider, click Scaffold. The template provisions sensible defaults for egress allowed-hosts, budgets, retention windows, and policy gates.
+After `protect`, the dashboard exposes a one-click template picker. Click "Add agent" on the Agents view, pick a template, fill in a name and model provider, click Scaffold. The template provisions sensible defaults for egress allowed-hosts, budgets, retention windows, and policy gates.
 
-Channel-shape archetypes that ship with v1.0:
+Channel-shape archetypes that ship with Sanctuary:
 
 | Archetype | Channel shape | Reads from | Recommended model |
 |---|---|---|---|
@@ -252,7 +254,7 @@ Channel-shape archetypes that ship with v1.0:
 | **planner** | Generates plans without executing them | none | any |
 | **handoff-coordinator** | Coordinates work across multiple agents | inter-agent only | any |
 
-Sanctuary ships channel-shape governance templates (policy, egress, budgets, retention) rather than named-agent runtimes. Operators bring their own harnesses and wrap them; `template init` binds a channel shape to an already-wrapped harness.
+Sanctuary ships channel-shape governance templates (policy, egress, budgets, retention) rather than named-agent runtimes. Operators bring their own harnesses and protect them; `template init` binds a channel shape to an already-wrapped harness.
 
 Operator authoring beyond this list: copy any template directory under `~/.sanctuary/templates/`, edit `template.json`, `defaults.json`, `policy.md`, `commitments.json`, and `onboarding.md`, then run `sanctuary template init <your-template>`.
 
@@ -266,13 +268,13 @@ sanctuary template init research-assistant --name my-agent --provider anthropic
 
 ## Deployment modes
 
-Sanctuary is designed to run the same rights substrate in three places. The local mode is the v1.0 acceptance surface and v1.1 completion surface; operator-cloud and sovereign-managed TEE modes are later roadmap surfaces that build on the same federation and policy foundations.
+Sanctuary is designed to run the same rights substrate in three places. Local mode is shipping today; operator-cloud and sovereign-managed TEE modes are roadmap surfaces that build on the same federation and policy foundations.
 
 | Mode | Status | What it is | Who picks this |
 |---|---|---|---|
-| **On your machines** (Local) | v1.0 acceptance | Runs on the Macs, Linux boxes, or Windows machines you already own. Nothing leaves your house unless you tell it to. | Self-hosters, privacy-maximalists, anyone who already runs a homelab. |
-| **In your cloud** (Operator cloud) | v1.4+ roadmap | Runs in your own GCP / Azure / AWS account. Same code, same keys, on rented hardware you control. | Prosumers, small businesses, operators with light IT but no rack at home. |
-| **In a sealed cloud box we manage** (Sovereign-managed TEE) | v2 roadmap | Runs on hardware Sanctuary operates, but the hardware proves to your console that even Sanctuary cannot see what's inside. You hold the keys; we hold the metal. | Regulated industries, operators who want sovereignty without operational burden. |
+| **On your machines** (Local) | Shipping | Runs on the Macs, Linux boxes, or Windows machines you already own. Nothing leaves your house unless you tell it to. | Self-hosters, privacy-maximalists, anyone who already runs a homelab. |
+| **In your cloud** (Operator cloud) | Roadmapped | Runs in your own GCP / Azure / AWS account. Same code, same keys, on rented hardware you control. | Prosumers, small businesses, operators with light IT but no rack at home. |
+| **In a sealed cloud box we manage** (Sovereign-managed TEE) | Roadmapped (v2) | Runs on hardware Sanctuary operates, but the hardware proves to your console that even Sanctuary cannot see what's inside. You hold the keys; we hold the metal. | Regulated industries, operators who want sovereignty without operational burden. |
 
 The operator holds the keys in every mode. The sovereign-managed mode will require hardware attestation before it is treated as shipped.
 
@@ -280,15 +282,17 @@ The operator holds the keys in every mode. The sovereign-managed mode will requi
 
 ## The Castle Architecture
 
-A fortress. Five named layers, each with its own enforcement contract. None of them depends on a vendor knowing your business.
+Sanctuary installs the substrate sovereignty used to come with. Architecturally it ships as five named mechanisms.
 
-| Layer | What it does |
-|---|---|
-| **Castle Wall** | OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend shipped; macOS backend (signed system extension + content-filter provider) shipped in v1.3.3 with active enforcement now wired through `NEFilterManager`; Windows on the roadmap. |
-| **Sentinels** | Internal observation via process introspection and behavioral baselining. Anomalies surface to the operator through the menubar or notifications. Observation, not enforcement. |
-| **Charter (Cooperative MCP)** | The additive sovereignty surface for compliant agents. Operator-rooted cryptographic identity (Ed25519 signing, Argon2id passphrase unlock, per-purpose HKDF subkeys). Per-agent encrypted state at rest (AES-256-GCM). Three-tier Principal Policy gates with channel-template binding. Signed audit chain with rollback detection. |
-| **Heralds** | Concordia (structured negotiation with binding commitments) and Verascore (portable reputation) composition. Receipts and reputation attestations assemble into a single audit trail that travels with the agent across machines. Default off; both compositions are optional. |
-| **Mantle** | Install-time substrate-binding. The check that locks Sanctuary to the operator's machine at install time and rejects orphan agent identifiers that are not bound to a wrapped harness. |
+**Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend shipped (Phase 1, 2026-05-06). macOS backend (signed system extension + content-filter provider) shipped in v1.3.3; active enforcement code on main awaiting end-to-end Mini1 drill PASS. Windows on the roadmap.
+
+**Sentinels: the nerves.** What surfaces what's happening to your awareness. Internal observation via process introspection and behavioral baselining. Anomalies surface through the menubar or notifications. Observation, not enforcement.
+
+**Charter: the will.** What you train your agent to choose voluntarily. The additive cooperative MCP surface for compliant agents. Operator-rooted cryptographic identity (Ed25519 signing, Argon2id passphrase unlock, per-purpose HKDF subkeys). Per-agent encrypted state at rest (AES-256-GCM). Three-tier Principal Policy gates with channel-template binding. Signed audit chain with rollback detection.
+
+**Heralds: the voice.** How you speak to and are recognized by other sovereigns. Optional composition surface (Concordia for structured negotiation, Verascore for portable reputation). Receipts and reputation attestations assemble into a single audit trail that travels with the agent across machines. Default off; both compositions are optional.
+
+**Mantle: the unique-substrate-binding.** What makes this install yours, not someone else's. Install-time check that locks Sanctuary to the operator's machine at install time and rejects orphan agent identifiers that are not bound to a wrapped harness.
 
 **Today:** Ed25519 signing, Argon2id passphrase unlock, and per-purpose HKDF subkeys. **Crypto-agility:** every audit entry embeds a scheme identifier so hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) can land without breaking historical receipts. Hardware-backed secure elements are on the roadmap.
 
@@ -296,7 +300,7 @@ A fortress. Five named layers, each with its own enforcement contract. None of t
 
 ## The rights you hold by default
 
-Rights that normally only ship to enterprises with dedicated identity and security teams, embedded in an open-source product every operator can run. The four-layer architecture enforces them; this is what they mean for the operator.
+The substrate enforces rights that normally only ship to enterprises with dedicated identity and security teams. What they mean for you:
 
 - **Identity.** Your agent has a key you own. No provider can impersonate you or revoke your agent. You can prove the agent is yours without asking anyone's permission.
 - **Data.** Your agent's state is encrypted against the provider running it. The platform sees the calls going out; it does not see your life going in. Your conversations, your memory, and your plans stay yours.
@@ -310,21 +314,21 @@ Sanctuary ships the rights substrate. Access (compute, devices, bandwidth, liter
 
 ## Works with
 
-Sanctuary wraps any MCP-compatible harness:
+Sanctuary wraps MCP-compatible harnesses. The named harnesses below are exercised on every release; other MCP-compatible harnesses work via the `--wrap` flag or direct MCP config and gain release-tested coverage as drills extend the [Assurance Matrix](ASSURANCE_MATRIX.md).
 
-- **OpenClaw** (`sanctuary wrap --openclaw`)
-- **Hermes Agent** (`sanctuary wrap --hermes`)
-- **Claude Code** (`sanctuary wrap --claude-code`)
-- **Cursor** (`sanctuary wrap --cursor`)
-- **Cline** (`sanctuary wrap --cline`)
-- **Mastra**, **LangGraph**, and custom harnesses (`sanctuary wrap --wrap <path>`)
+- **OpenClaw** (`sanctuary protect --openclaw`)
+- **Hermes Agent** (`sanctuary protect --hermes`)
+- **Claude Code** (`sanctuary protect --claude-code`)
+- **Cursor** (`sanctuary protect --cursor`)
+- **Cline** (`sanctuary protect --cline`)
+- **Mastra**, **LangGraph**, and custom harnesses (`sanctuary protect --wrap <path>`)
 - Any other MCP-compatible harness via direct MCP config
 
 ---
 
 ## Composes with Concordia Protocol
 
-When your agent needs to negotiate or make deals, **Concordia Protocol** adds structured negotiation with binding commitments and portable reputation.
+When your agent needs to negotiate or make deals, **Concordia Protocol** adds structured negotiation with binding commitments. Sanctuary also composes with **Verascore** for portable agent reputation.
 
 **Sanctuary never requires Concordia, and Concordia never requires Sanctuary.** They compose powerfully when both are deployed: Concordia commitment receipts flow through Sanctuary envelopes, and reputation attestations assemble into a single audit trail. Each ships, runs, and wins on its own. This is a structural commitment, not a tagline. Neither repo imports the other.
 
@@ -341,10 +345,10 @@ pip install concordia-protocol
 
 Sanctuary composes with the existing open ecosystem.
 
-- **Identity:** W3C DIDs, KERI, Verifiable Credentials
-- **Execution:** Trusted Execution Environments (Intel TDX, AMD SEV-SNP, ARM CCA) on the v2 roadmap
-- **Cryptography:** Ed25519 today; NIST Post-Quantum Cryptography (ML-DSA / FIPS 204, ML-KEM / FIPS 203) on the migration path; hybrid signing planned after the local sovereignty harness is complete
-- **Settlement:** x402 (Coinbase micropayments), AP2 (Google Agent Payments Protocol), ACP
+- **Identity:** W3C DIDs, KERI, Verifiable Credentials.
+- **Execution:** Trusted Execution Environments (Intel TDX, AMD SEV-SNP, ARM CCA) on the v2 roadmap.
+- **Cryptography:** Ed25519 today; NIST Post-Quantum Cryptography (ML-DSA / FIPS 204, ML-KEM / FIPS 203) on the migration path; hybrid signing planned after the local sovereignty harness is complete.
+- **Settlement:** x402 (Coinbase micropayments), AP2 (Google Agent Payments Protocol), ACP.
 
 ---
 
@@ -354,26 +358,26 @@ For AI coding agents handling install failures, here are the common cases.
 
 **Install Step 3 (a) "dashboard=ok" check fails:**
 - Wait 10 seconds and retry. Dashboard takes a moment to bind on first launch.
-- If still failing, check `lsof -i :3501-3510` to confirm the dashboard chose a port. The wrap output line `Sovereignty Dashboard ready: http://localhost:<port>` is authoritative; use that port.
+- If still failing, check `lsof -i :3501-3510` to confirm the dashboard chose a port. The protect output line `Sovereignty Dashboard ready: http://localhost:<port>` is authoritative; use that port.
 
-**Install Step 3 (b) "identities=ok" check fails:**
-- Confirm `wrap` completed without error. If it did, check `~/.sanctuary/identities/` for `.enc` files. If absent, the wrap command exited early; rerun with `--dry-run` to see what it would do, then without to retry.
+**Install Step 3 (b) "passphrase=ok" check fails on macOS:**
+- The protect command may have failed to write to the Keychain (typically a permissions prompt the operator dismissed). Rerun the protect command and approve the Keychain prompt when it appears.
 
-**Install Step 3 (c) "passphrase=ok" check fails on macOS:**
-- The wrap command may have failed to write to the Keychain (typically a permissions prompt the operator dismissed). Rerun the wrap command and approve the Keychain prompt when it appears.
-
-**Install Step 3 (c) on Linux or Windows:**
+**Install Step 3 (b) on Linux or Windows:**
 - The keychain check is macOS-specific. On Linux, Sanctuary uses Secret Service when available and falls back to an encrypted file at `~/.sanctuary/passphrase.enc`. Windows Credential Manager support is queued on the v1.0.x patch track. Test the fallback with `test -f ~/.sanctuary/passphrase.enc && echo "passphrase=ok"`.
 
+**Install Step 3 (c) "identities=ok" check fails:**
+- Confirm protect completed without error. If it did, check `~/.sanctuary/identities/` for `.enc` files. If absent, the protect command exited early; rerun with `--dry-run` to see what it would do, then without to retry.
+
 **Install Step 3 (d) "audit=ok" check fails:**
-- Confirm `~/.sanctuary/` exists and is writable by the current user. If it doesn't exist, the wrap did not complete; rerun.
+- Confirm `~/.sanctuary/` exists and is writable by the current user. If it doesn't exist, the protect did not complete; rerun.
 - Audit entries are stored encrypted under `~/.sanctuary/state/_audit/`, not as plaintext JSONL. Use `audit_export_siem` when you need a decrypted export.
 
 **`sanctuary` CLI not found after `npm install -g`:**
 - Confirm `npm bin -g` is on the PATH. On macOS with nvm, this typically lives at `~/.nvm/versions/node/<version>/bin/`.
 
 **Existing harness config overwritten:**
-- The original is at `~/.sanctuary/backup/config-backup-<timestamp>.json`. Restore with `sanctuary wrap --unwrap` from the same fortress/storage context.
+- The original is at `~/.sanctuary/backup/config-backup-<timestamp>.json`. Restore with `sanctuary protect --unwrap` from the same fortress/storage context.
 
 For anything not on this list, run `sovereignty_audit` and surface the report to the operator.
 
@@ -383,28 +387,28 @@ For anything not on this list, run `sovereignty_audit` and surface the report to
 
 Three audiences, three pointers each.
 
-**Operator track:** what this feels like to use:
-- ["What Sovereign Actually Means"](https://sanctuaryprotocol.ai/2026/03/30/what-sovereign-actually-means.html): the plain-English version
-- ["Local ≠ Sovereign"](https://sanctuaryprotocol.ai/2026/03/30/local-not-sovereign.html): why running on your laptop isn't enough on its own
-- [sanctuaryprotocol.ai](https://sanctuaryprotocol.ai): ongoing posts in the same voice
+**Operator track:** what this feels like to use.
+- ["What Sovereign Actually Means"](https://sanctuaryprotocol.ai/2026/03/30/what-sovereign-actually-means.html): the plain-English version.
+- ["Local ≠ Sovereign"](https://sanctuaryprotocol.ai/2026/03/30/local-not-sovereign.html): why running on your laptop isn't enough on its own.
+- [sanctuaryprotocol.ai](https://sanctuaryprotocol.ai): ongoing posts in the same voice.
 
-**Developer track:** how it works:
-- [CLAUDE.md](CLAUDE.md): complete architecture, security invariants, and threat model
-- [SHR_SPEC.md](docs/SHR_SPEC.md): Sovereignty Health Report format
-- [federation-v0.1-hard-gate-walkthrough.md](server/docs/federation-v0.1-hard-gate-walkthrough.md): federation protocol v0.1 design record
-- [DID_ENCODING.md](docs/DID_ENCODING.md): agent DID encoding and the base64url deviation from `did:key`
-- [security audit](docs/audit/): structured review artifacts and remediation history
+**Developer track:** how it works.
+- [CLAUDE.md](CLAUDE.md): complete architecture, security invariants, and threat model.
+- [SHR_SPEC.md](docs/SHR_SPEC.md): Sovereignty Health Report format.
+- [federation-v0.1-hard-gate-walkthrough.md](server/docs/federation-v0.1-hard-gate-walkthrough.md): federation protocol v0.1 design record.
+- [DID_ENCODING.md](docs/DID_ENCODING.md): agent DID encoding (base58btc-compliant `did:key` with legacy base64url migration notes).
+- [security audit](docs/audit/): structured review artifacts and remediation history.
 
-**Standards / research track:** where this composes:
-- Sanctuary Agent Contract (v0.1 spec, W3C AIVS track, shipping)
-- Concordia composition (receipts, negotiation, binding commitments; see the Concordia repo)
-- Verascore composition (reputation scoring on top of ERC-8004; see the Verascore repo)
+**Standards / research track:** where this composes.
+- Sanctuary Agent Contract (v0.1 spec, W3C AIVS track, shipping).
+- Concordia composition (receipts, negotiation, binding commitments; see the Concordia repo).
+- Verascore composition (portable agent reputation; see the Verascore repo).
 
 ---
 
 ## Interop note: agent DIDs
 
-Sanctuary identifies agents with a `did:key`-style DID derived from the agent's Ed25519 public key. The encoding uses **base64url** under the `z` multibase prefix rather than base58btc, a deliberate departure from the W3C `did:key` specification. To verify a signature against a Sanctuary DID or transcode to strict `did:key` form, see [`docs/DID_ENCODING.md`](docs/DID_ENCODING.md). It includes the byte layout, JavaScript and Python decoder snippets, and a round-trip verification test.
+Sanctuary identifies agents with a `did:key`-style DID derived from the agent's Ed25519 public key, encoded as **base58btc** under the `z` multibase prefix per the W3C `did:key` specification (PR #268). Historical identities created before the base58btc migration may still use the legacy base64url encoding locally; see [`docs/DID_ENCODING.md`](docs/DID_ENCODING.md) for migration notes, the byte layout, and JavaScript and Python decoder snippets with a round-trip verification test.
 
 ---
 

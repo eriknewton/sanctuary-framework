@@ -352,7 +352,7 @@ describe("harness README parity", () => {
     expect(readme).toContain("LangGraph");
     expect(readme).toContain("custom harnesses");
     expect(readme).toContain("Any other MCP-compatible harness");
-    expect(readme).toContain("sanctuary wrap --wrap <path>");
+    expect(readme).toContain("sanctuary protect --wrap <path>");
     expect(records).toContain("LangGraph wraps land via the generic");
   });
 });
