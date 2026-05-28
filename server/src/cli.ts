@@ -714,6 +714,11 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runStatus();
   }
 
+  if (command === "setup-shared-dir") {
+    const { runSetupSharedDir } = await import("./cli/castle-wall.js");
+    return runSetupSharedDir();
+  }
+
   if (command === "reload") {
     const { runReload } = await import("./cli/castle-wall.js");
     return runReload(args.slice(1));
@@ -748,6 +753,7 @@ function printCastleWallHelp(): void {
   Subcommands:
     provision-pin    Generate and pin the local Castle Wall keypair.
     status           Show pinned-key fingerprint and sysext status.
+    setup-shared-dir Create the privileged shared dir for the pinned key (run with sudo, macOS).
     reload           Reload policy in the running fortress daemon.
     audit-dump       Emit Castle Wall audit events as JSONL.
     approve          Approve a pending Castle Wall request.

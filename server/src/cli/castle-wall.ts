@@ -32,6 +32,7 @@ export interface CastleWallCommandContext {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   execSyncFn?: (command: string) => string;
+  getuid?: () => number;
 }
 
 export interface CastleWallParsedArgs {
@@ -58,6 +59,10 @@ function parseCastleWallState(raw: string): "[activated enabled]" | "[activated 
     return "[activated waiting for user]";
   }
   return "not loaded";
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 async function resolveMasterKey(
@@ -239,6 +244,70 @@ export async function runStatus(
   }
 
   write(out, `Castle Wall sysext: ${sysextState}\n`);
+  return 0;
+}
+
+export async function runSetupSharedDir(
+  ctx: CastleWallCommandContext = {}
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const platform = ctx.platform ?? process.platform;
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
+  const execSyncFn =
+    ctx.execSyncFn ??
+    ((command: string) =>
+      nodeExecSync(`sh -lc '${command.replace(/'/g, "'\\''")}'`, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim());
+
+  if (platform !== "darwin") {
+    write(out, "Castle Wall shared dir: not applicable (non-macOS)\n");
+    return 0;
+  }
+
+  if (getuid?.() !== 0) {
+    write(
+      err,
+      "setup-shared-dir must run as root. Re-run: sudo sanctuary castle-wall setup-shared-dir\n",
+    );
+    return 1;
+  }
+
+  const sudoUser = env.SUDO_USER;
+  if (!sudoUser) {
+    write(
+      err,
+      "Cannot determine the operator account (SUDO_USER unset). Run via sudo, not as a raw root shell.\n",
+    );
+    return 1;
+  }
+
+  if (!/^[a-zA-Z0-9._-]+$/.test(sudoUser)) {
+    write(
+      err,
+      "Invalid SUDO_USER value; refusing to build a shell command from it.\n",
+    );
+    return 1;
+  }
+
+  try {
+    const dir = shellQuote(CASTLE_GLOBAL_PINNED_PUBKEY_DIR);
+    execSyncFn(`mkdir -p ${dir}`);
+    execSyncFn(`chown ${shellQuote(`${sudoUser}:admin`)} ${dir}`);
+    execSyncFn(`chmod 0755 ${dir}`);
+  } catch (error) {
+    write(err, `${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+
+  write(out, `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}\n`);
+  write(
+    out,
+    "Shared dir ready. Re-run 'sanctuary castle-wall provision-pin' (or restart the daemon) to populate the pinned key; no per-fortress sudo cp needed.\n",
+  );
   return 0;
 }
 

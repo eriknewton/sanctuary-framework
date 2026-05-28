@@ -14,6 +14,7 @@ import {
   runProvisionPin,
   runAuditDump,
   runReload,
+  runSetupSharedDir,
   runStatus,
 } from "../../src/cli/castle-wall.js";
 import { runInit } from "../../src/wrap/init.js";
@@ -225,5 +226,101 @@ describe("castle-wall CLI verbs", () => {
     });
     expect(code).toBe(0);
     expect(out.text()).toContain("Pinned key fingerprint:");
+  });
+});
+
+describe("castle-wall setup-shared-dir", () => {
+  it("is a no-op on non-macOS platforms", async () => {
+    const out = new CaptureStream();
+    const execCommands: string[] = [];
+    const code = await runSetupSharedDir({
+      out,
+      platform: "linux",
+      execSyncFn: (command) => {
+        execCommands.push(command);
+        return "";
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("not applicable");
+    expect(execCommands).toEqual([]);
+  });
+
+  it("refuses to run unprivileged on macOS", async () => {
+    const err = new CaptureStream();
+    const execCommands: string[] = [];
+    const code = await runSetupSharedDir({
+      err,
+      platform: "darwin",
+      getuid: () => 501,
+      execSyncFn: (command) => {
+        execCommands.push(command);
+        return "";
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("sudo sanctuary castle-wall setup-shared-dir");
+    expect(execCommands).toEqual([]);
+  });
+
+  it("requires SUDO_USER when running as root", async () => {
+    const err = new CaptureStream();
+    const code = await runSetupSharedDir({
+      err,
+      env: {},
+      platform: "darwin",
+      getuid: () => 0,
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("SUDO_USER unset");
+  });
+
+  it("creates, owns, and chmods the shared dir for the sudo operator", async () => {
+    const out = new CaptureStream();
+    const execCommands: string[] = [];
+    const code = await runSetupSharedDir({
+      out,
+      env: { SUDO_USER: "agentmac" },
+      platform: "darwin",
+      getuid: () => 0,
+      execSyncFn: (command) => {
+        execCommands.push(command);
+        return "";
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(execCommands).toHaveLength(3);
+    expect(execCommands[0]).toContain("mkdir -p");
+    expect(execCommands[0]).toContain("/Library/Application Support/Sanctuary");
+    expect(execCommands[1]).toContain("chown");
+    expect(execCommands[1]).toContain("agentmac:admin");
+    expect(execCommands[1]).toContain("/Library/Application Support/Sanctuary");
+    expect(execCommands[2]).toContain("chmod 0755");
+    expect(execCommands[2]).toContain("/Library/Application Support/Sanctuary");
+    expect(out.text()).toContain("/Library/Application Support/Sanctuary");
+    expect(out.text()).toContain("Shared dir ready");
+  });
+
+  it("rejects shell metacharacters in SUDO_USER", async () => {
+    const err = new CaptureStream();
+    const execCommands: string[] = [];
+    const code = await runSetupSharedDir({
+      err,
+      env: { SUDO_USER: "bad;rm -rf" },
+      platform: "darwin",
+      getuid: () => 0,
+      execSyncFn: (command) => {
+        execCommands.push(command);
+        return "";
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("Invalid SUDO_USER");
+    expect(execCommands).toEqual([]);
   });
 });
