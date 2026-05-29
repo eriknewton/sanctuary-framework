@@ -117,6 +117,41 @@ if ! security find-identity -v -p codesigning | grep -qF "${SIGNING_IDENTITY}"; 
     exit 1
 fi
 
+# Preflight: keychain access for unattended codesign.
+# This script signs multiple bundles in sequence (host app, system extension,
+# wrapped nested app). codesign reaches into the login keychain for the
+# Developer ID private key on every sign call, and without a partition-list
+# grant macOS pops a "codesign wants to use key" dialog once per call. An
+# autonomous build thread cannot click those dialogs, so the build appears to
+# hang and the operator gets prompted repeatedly.
+#
+# The durable fix is a one-time operator grant (run interactively, password
+# prompts, never lands in shell history):
+#   security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+#     "${HOME}/Library/Keychains/login.keychain-db"
+#
+# This block makes the build self-heal when SANCTUARY_KEYCHAIN_PW is exported
+# for the session (re-asserts the grant + unlocks the keychain so a sleep/
+# timeout lock does not reintroduce prompts). When the env var is not set, it
+# verifies nothing and just advises, relying on the prior one-time grant.
+SIGNING_KEYCHAIN="${SANCTUARY_SIGNING_KEYCHAIN:-${HOME}/Library/Keychains/login.keychain-db}"
+if [ -n "${SANCTUARY_KEYCHAIN_PW:-}" ]; then
+    echo "[build-signed] keychain preflight: unlock + assert partition list (SANCTUARY_KEYCHAIN_PW set)"
+    if ! security unlock-keychain -p "${SANCTUARY_KEYCHAIN_PW}" "${SIGNING_KEYCHAIN}"; then
+        echo "[build-signed] ERROR: keychain unlock failed (wrong SANCTUARY_KEYCHAIN_PW?)" >&2
+        exit 1
+    fi
+    if ! security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "${SANCTUARY_KEYCHAIN_PW}" "${SIGNING_KEYCHAIN}" >/dev/null 2>&1; then
+        echo "[build-signed] WARN: set-key-partition-list returned non-zero; codesign may still prompt" >&2
+    fi
+else
+    echo "[build-signed] keychain preflight: SANCTUARY_KEYCHAIN_PW not set; relying on prior one-time partition-list grant"
+    echo "[build-signed]   If codesign prompts repeatedly, run ONCE (interactive; password prompts, not in history):"
+    echo "[build-signed]     security set-key-partition-list -S apple-tool:,apple:,codesign: -s \"${SIGNING_KEYCHAIN}\""
+    echo "[build-signed]   Or export SANCTUARY_KEYCHAIN_PW for this session so the build self-heals."
+fi
+
 # 1. swift build (release; native arch).
 echo "[build-signed] step 1/${TOTAL_STEPS} - swift build -c ${SWIFT_BUILD_CONFIG}"
 (
