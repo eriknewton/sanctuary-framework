@@ -4,9 +4,10 @@
  * Loads and validates server configuration from file or environment variables.
  */
 
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { ConfigLoadError } from "./errors/config-error.js";
 
@@ -178,15 +179,26 @@ export async function loadConfig(
 
   try {
     const raw = await readFile(path, "utf-8");
-    const fileConfig = JSON.parse(raw);
-    if (fileConfig === null || typeof fileConfig !== "object" || Array.isArray(fileConfig)) {
-      throw new Error("Sanctuary config field \"$root\" must be an object");
+    // An empty or whitespace-only file is not corruption: it is almost always
+    // the truncate-before-write window of a concurrent writer (saveConfig from
+    // another process, or a parallel test that shares a config path). The
+    // non-atomic writeFile in saveConfig truncates to zero bytes before it
+    // rewrites, so a reader can momentarily observe "". JSON.parse("") throws
+    // SyntaxError, which would otherwise route to the corruption-quarantine
+    // branch below and destructively rename a file that is about to be valid
+    // again. Treat it like a missing file and fall back to defaults. Non-empty
+    // invalid JSON still quarantines as genuine corruption.
+    if (raw.trim() !== "") {
+      const fileConfig = JSON.parse(raw);
+      if (fileConfig === null || typeof fileConfig !== "object" || Array.isArray(fileConfig)) {
+        throw new Error("Sanctuary config field \"$root\" must be an object");
+      }
+      config = deepMerge(config, fileConfig);
+      // Catch shape regressions from a malformed user-supplied JSON
+      // (e.g. `dashboard: "not-an-object"`) before downstream code casts.
+      assertSanctuaryConfigShape(config as unknown as Record<string, unknown>);
+      validateConfig(config);
     }
-    config = deepMerge(config, fileConfig);
-    // Catch shape regressions from a malformed user-supplied JSON
-    // (e.g. `dashboard: "not-an-object"`) before downstream code casts.
-    assertSanctuaryConfigShape(config as unknown as Record<string, unknown>);
-    validateConfig(config);
   } catch (err) {
     if (isErrno(err, "ENOENT")) {
       // No config file: first-run defaults are allowed.
@@ -342,14 +354,31 @@ function isConfigSchemaError(err: unknown): boolean {
   );
 }
 
-async function quarantineConfigFile(path: string): Promise<string> {
+async function quarantineConfigFile(path: string): Promise<string | undefined> {
   const quarantinedPath = `${path}.corrupted.${new Date().toISOString()}`;
-  await rename(path, quarantinedPath);
-  return quarantinedPath;
+  try {
+    await rename(path, quarantinedPath);
+    return quarantinedPath;
+  } catch {
+    // Best-effort. A concurrent reader may have already quarantined or removed
+    // the file, or the rename may be denied. Either way the config is
+    // unavailable/corrupt from our perspective, so the caller still surfaces a
+    // typed ConfigLoadError (just without a quarantine pointer). Never let a
+    // raw fs error escape the corruption path.
+    return undefined;
+  }
 }
 
 /**
  * Save configuration to file.
+ *
+ * Writes atomically: serialize to a temp file in the same directory (so the
+ * rename stays on one filesystem), then rename into place. POSIX rename is
+ * atomic, so a concurrent loadConfig reader always observes either the old
+ * complete file or the new complete file, never a truncated/empty/partial
+ * state. This is the root-cause fix for the config-load race that surfaced as
+ * "SyntaxError: Unexpected end of JSON input" under parallel test runs; the
+ * empty-read tolerance in loadConfig is the defense-in-depth half.
  */
 export async function saveConfig(
   config: SanctuaryConfig,
@@ -357,7 +386,18 @@ export async function saveConfig(
 ): Promise<void> {
   const path =
     configPath ?? join(config.storage_path, "sanctuary.json");
-  await writeFile(path, JSON.stringify(config, null, 2), { mode: 0o600 });
+  const tmpPath = `${path}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
+  try {
+    // Create the temp file 0o600 from the start so the secret-bearing config
+    // is never briefly world-readable.
+    await writeFile(tmpPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+    await rename(tmpPath, path);
+  } catch (err) {
+    // Never leave a partial temp file behind, on a write OR a rename failure
+    // (e.g. ENOSPC mid-write). Cleanup is itself best-effort.
+    await rm(tmpPath, { force: true }).catch(() => {});
+    throw err;
+  }
 }
 
 /**

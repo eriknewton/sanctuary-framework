@@ -64,6 +64,46 @@ async function writeMinimalPolicy(tenantDir: string): Promise<void> {
   await writeFile(join(tenantDir, "principal-policy.yaml"), yaml);
 }
 
+/**
+ * Per-test config isolation for the did-web issue test.
+ *
+ * `did-web issue` calls `loadConfig()`, which (absent a --fortress flag)
+ * resolves the config path from process.env.SANCTUARY_STORAGE_PATH / HOME.
+ * Without isolation the test reads the shared ~/.sanctuary/sanctuary.json;
+ * under full parallel `npm test` a worker can observe that file mid-write
+ * (truncated to empty) from another worker, surfacing as
+ * "SyntaxError: Unexpected end of JSON input" from loadConfig. Pointing HOME +
+ * storage at a unique temp dir gives the test no shared config file to race on
+ * AND makes it hermetic: with no passphrase resolvable from the empty fortress
+ * it returns code 1 (identity error) deterministically, which is exactly what
+ * the assertion below checks — without writing into the operator's real
+ * ~/.sanctuary.
+ *
+ * Only `did-web issue` is isolated here. The template-init and policy verbs
+ * also call loadConfig but block when no passphrase resolves from an empty
+ * HOME (their flows are not designed for a bare fortress), so isolating them
+ * would hang. They are instead covered by loadConfig's transient-empty-read
+ * resilience (see src/config.ts), which is the half of this fix that protects
+ * every caller regardless of test setup.
+ */
+async function isolateConfigHome(): Promise<{ restore: () => Promise<void> }> {
+  const home = await mkdtemp(join(tmpdir(), "sanctuary-singleton-audit-home-"));
+  const originalHome = process.env.HOME;
+  const originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+  process.env.HOME = home;
+  process.env.SANCTUARY_STORAGE_PATH = join(home, ".sanctuary");
+  return {
+    restore: async () => {
+      if (originalHome !== undefined) process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (originalStoragePath !== undefined)
+        process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
+      else delete process.env.SANCTUARY_STORAGE_PATH;
+      await rm(home, { recursive: true, force: true });
+    },
+  };
+}
+
 describe("agents config audit writes (ZZZZZ pr 3/3)", () => {
   let home: string;
   let defaultRoot: string;
@@ -112,13 +152,22 @@ describe("agents config audit writes (ZZZZZ pr 3/3)", () => {
 
 describe("did-web issue audit writes (ZZZZZ pr 3/3)", () => {
   let appendSpy: ReturnType<typeof vi.spyOn>;
+  let isolation: Awaited<ReturnType<typeof isolateConfigHome>>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    isolation = await isolateConfigHome();
     appendSpy = vi.spyOn(AuditLog.prototype, "append").mockImplementation(() => {});
   });
 
-  afterEach(() => {
-    appendSpy.mockRestore();
+  afterEach(async () => {
+    // Guard against a partial beforeEach (e.g. isolateConfigHome throwing
+    // before appendSpy is assigned): teardown must never mask the real error,
+    // and the env/temp-dir restore must always run.
+    try {
+      appendSpy?.mockRestore();
+    } finally {
+      await isolation?.restore();
+    }
   });
 
   it("did-web issue writes an audit entry on success", async () => {
