@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { loadConfig, defaultConfig, SANCTUARY_VERSION } from "../../../src/config.js";
+import { loadConfig, saveConfig, defaultConfig, SANCTUARY_VERSION } from "../../../src/config.js";
 import { writeFile, mkdir, rm, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -152,6 +152,78 @@ describe("loadConfig", () => {
 
       expect(config.dashboard.enabled).toBe(true);
       expect(config.http_port).toBe(5000);
+    });
+  });
+
+  describe("Empty / partial config file — transient-write race", () => {
+    // A concurrent writer (saveConfig in another process, or a parallel test
+    // sharing a config path) truncates to zero bytes before rewriting. A
+    // reader that hits that window sees "". This MUST fall back to defaults,
+    // not be treated as corruption — quarantining a file that is about to be
+    // valid again is destructive and itself racy. Regression for the
+    // "SyntaxError: Unexpected end of JSON input" flake in
+    // test/cli/singleton-audit-writes.test.ts.
+    it("treats an empty config file as defaults without quarantining", async () => {
+      const configFile = join(tempDir, "empty.json");
+      await writeFile(configFile, "");
+
+      const config = await loadConfig(configFile);
+
+      // Falls back to defaults rather than throwing.
+      expect(config.transport).toBe("stdio");
+      expect(config.dashboard.enabled).toBe(false);
+      expect(config.dashboard.port).toBe(3501);
+      // The file is left untouched — NOT renamed to *.corrupted.*
+      expect(await readFile(configFile, "utf-8")).toBe("");
+      const files = await readdir(tempDir);
+      expect(files.some((file) => file.includes(".corrupted."))).toBe(false);
+    });
+
+    it("treats a whitespace-only config file as defaults without quarantining", async () => {
+      const configFile = join(tempDir, "whitespace.json");
+      await writeFile(configFile, "  \n\t\r\n  ");
+
+      const config = await loadConfig(configFile);
+
+      expect(config.transport).toBe("stdio");
+      const files = await readdir(tempDir);
+      expect(files.some((file) => file.includes(".corrupted."))).toBe(false);
+    });
+
+    it("still quarantines a non-empty malformed config file", async () => {
+      // The empty-file carve-out must not weaken genuine-corruption handling:
+      // partial-but-non-empty JSON is still treated as corruption.
+      const configFile = join(tempDir, "partial.json");
+      await writeFile(configFile, '{ "transport": "std');
+
+      await expect(loadConfig(configFile)).rejects.toMatchObject({
+        name: "ConfigLoadError",
+        classification: "corrupted",
+      });
+      const files = await readdir(tempDir);
+      expect(files.some((file) => file.startsWith("partial.json.corrupted."))).toBe(true);
+    });
+  });
+
+  describe("Atomic save — root cause of the truncate-before-write race", () => {
+    // saveConfig writes to a temp file then renames into place, so a
+    // concurrent loadConfig never observes an empty or partial file. This is
+    // the source-side half of the race fix; the loadConfig empty-read
+    // tolerance above is the reader-side defense-in-depth.
+    it("round-trips config and leaves no temp file behind", async () => {
+      const configFile = join(tempDir, "atomic.json");
+      const cfg = defaultConfig();
+      cfg.dashboard.port = 4321;
+
+      await saveConfig(cfg, configFile);
+
+      const loaded = await loadConfig(configFile);
+      expect(loaded.dashboard.port).toBe(4321);
+
+      const files = await readdir(tempDir);
+      expect(files).toContain("atomic.json");
+      // The temp file used during the atomic write must not be left behind.
+      expect(files.some((file) => file.includes("atomic.json.tmp."))).toBe(false);
     });
   });
 
