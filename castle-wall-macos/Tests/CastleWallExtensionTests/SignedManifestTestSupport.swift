@@ -6,7 +6,8 @@ import CryptoKit
 func makeSignedManifestUpdatedBody(
     rules: [ManifestRule],
     privateKey: Curve25519.Signing.PrivateKey = Curve25519.Signing.PrivateKey(),
-    schemaVersion: UInt32 = CastleWallConstants.schemaVersionV1
+    schemaVersion: UInt32 = CastleWallConstants.schemaVersionV1,
+    agentOrigin: AgentOriginWire? = nil
 ) throws -> (body: ManifestUpdatedBody, publicKey: Data) {
     let entries = try rules.map { rule -> ManifestRuleDigestEntry in
         let ruleBytes = try SignedManifestVerifier.canonicalJSONData(rule)
@@ -20,7 +21,8 @@ func makeSignedManifestUpdatedBody(
         schemaVersion: schemaVersion,
         fortressId: "fortress-test",
         issuedAt: "2026-05-14T00:00:00Z",
-        rules: entries
+        rules: entries,
+        agentOrigin: agentOrigin
     )
     let manifestBytes = try SignedManifestVerifier.canonicalJSONData(manifest)
     let signature = try privateKey.signature(for: manifestBytes)

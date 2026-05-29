@@ -154,6 +154,78 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
     expect(entry.sha256).toBe(sha256Hex(file.bytes));
   });
 
+  // --- agent_origin descriptor (2026-05-29 origin-classifier foundation) ---
+
+  it("signs a valid agent_origin into the body and the parser still verifies", () => {
+    const { signed } = buildSignedManifest({
+      fortressId: "f",
+      issuedAt: "t",
+      rules: [makeRule("rule-1", "api.anthropic.com")],
+      signingKey,
+      agentOrigin: {
+        mode: "uid",
+        agent_uid: 600,
+        system_uid_allow_ceiling: 500,
+      },
+    });
+    expect(signed.manifest.agent_origin).toEqual({
+      mode: "uid",
+      agent_uid: 600,
+      system_uid_allow_ceiling: 500,
+    });
+    // The descriptor is part of the signed body: signature still verifies.
+    expect(verifyManifestSignature(signed, pinnedPublicKey).ok).toBe(true);
+  });
+
+  it("tampering with agent_origin AFTER signing breaks verification", () => {
+    const { signed } = buildSignedManifest({
+      fortressId: "f",
+      issuedAt: "t",
+      rules: [makeRule("rule-1", "api.anthropic.com")],
+      signingKey,
+      agentOrigin: {
+        mode: "uid",
+        agent_uid: 600,
+        system_uid_allow_ceiling: 500,
+      },
+    });
+    // Attacker flips the agent uid post-signing.
+    const tampered = {
+      ...signed,
+      manifest: {
+        ...signed.manifest,
+        agent_origin: { mode: "uid" as const, agent_uid: 0, system_uid_allow_ceiling: 500 },
+      },
+    };
+    expect(verifyManifestSignature(tampered, pinnedPublicKey).ok).toBe(false);
+  });
+
+  it("omits agent_origin entirely when absent (byte-identical to no-field build)", () => {
+    const withoutField = buildSignedManifest({
+      fortressId: "f",
+      issuedAt: "t",
+      rules: [makeRule("rule-1", "api.anthropic.com")],
+      signingKey,
+    });
+    expect(withoutField.signed.manifest).not.toHaveProperty("agent_origin");
+    // Canonical bytes carry no agent_origin key.
+    const bytes = renderSignedManifest(withoutField.signed);
+    expect(new TextDecoder().decode(bytes)).not.toContain("agent_origin");
+  });
+
+  it("drops a malformed agent_origin candidate (field omitted, never half-built)", () => {
+    const { signed } = buildSignedManifest({
+      fortressId: "f",
+      issuedAt: "t",
+      rules: [makeRule("rule-1", "api.anthropic.com")],
+      signingKey,
+      // UID mode with no agent_uid is unusable -> dropped.
+      agentOrigin: { mode: "uid", system_uid_allow_ceiling: 500 },
+    });
+    expect(signed.manifest).not.toHaveProperty("agent_origin");
+    expect(verifyManifestSignature(signed, pinnedPublicKey).ok).toBe(true);
+  });
+
   it("verifyAndParseRules accepts the bytes the publisher produced", () => {
     const rule = makeRule("rule-1", "api.anthropic.com");
     const { signed, ruleFiles } = buildSignedManifest({

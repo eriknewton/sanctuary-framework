@@ -28,6 +28,7 @@ import type {
   ManifestSignature,
   SignedManifest,
 } from "../allowlist/manifest.js";
+import { validateAgentOrigin } from "../allowlist/agent-origin.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { RuntimeManifestPublishError } from "./errors.js";
 
@@ -56,6 +57,14 @@ export interface BuildSignedManifestInput {
   issuedAt: string;
   rules: ReadonlyArray<AllowlistRule>;
   signingKey: ManifestSigningKey;
+  /**
+   * Optional, unvalidated agent-origin candidate (config / fixture). It is
+   * run through `validateAgentOrigin`; a malformed candidate is dropped (the
+   * field is omitted entirely) rather than emitted half-built. This foundation
+   * build sources it from config/fixtures only -- no account provisioning or
+   * runtime launch happens here.
+   */
+  agentOrigin?: unknown;
 }
 
 /** Compute SHA-256 hex of UTF-8 bytes. */
@@ -108,6 +117,16 @@ export function buildSignedManifest(input: BuildSignedManifestInput): {
     issued_at: input.issuedAt,
     rules: entries,
   };
+
+  // Additive agent-origin descriptor. A malformed candidate is dropped (field
+  // omitted) so a half-built descriptor is never signed. Omitting the field
+  // keeps the canonical-JSON bytes identical to a manifest built without it.
+  if (input.agentOrigin !== undefined) {
+    const validated = validateAgentOrigin(input.agentOrigin);
+    if (validated !== null) {
+      manifest.agent_origin = validated;
+    }
+  }
 
   let signatureBytes: Uint8Array;
   try {

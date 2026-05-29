@@ -40,6 +40,37 @@ public struct FilterFlowDescriptor: Equatable {
     public let hostnameSource: String?
     public let opaqueDestination: Bool
 
+    // MARK: - Typed origin fields (2026-05-29 origin-classifier foundation)
+    //
+    // Decoded from `NEFilterFlow.sourceAppAuditToken` by the provider.
+    // The raw hex token (`sourceAppIdentifier`, above) is retained for audit
+    // provenance only; classification reads these typed fields instead.
+    //
+    // FAIL-CLOSED CONTRACT: `sourceUnattributed == true` means the provider
+    // could NOT positively decode the origin (nil token, decode failure,
+    // errSecCSUnsigned, EPERM/FB12057582, ESRCH, etc.). The classifier MUST
+    // map any such descriptor to `.unattributed`, which routes to the
+    // default-deny + allowlist path. There is no path from `sourceUnattributed`
+    // to operator-allow.
+
+    /// Real user id of the flow's source process, from `audit_token_to_ruid`.
+    /// Meaningful only when `sourceUnattributed == false`.
+    public let sourceRuid: uid_t
+    /// Process id of the flow's source process, from `audit_token_to_pid`.
+    public let sourcePid: pid_t
+    /// PID-generation counter, from `audit_token_to_pidversion`; defeats
+    /// PID-reuse confusion. Meaningful only when `sourceUnattributed == false`.
+    public let sourcePidVersion: Int32
+    /// Code-signing identity (`SigningID`) resolved via
+    /// `SecCodeCopyGuestWithAttributes` + `SecCodeCopySigningInformation`,
+    /// when available. `nil` when unresolved (NOT a positive signal).
+    public let sourceSigningId: String?
+    /// Code-signing Team identifier, when available. `nil` when unresolved.
+    public let sourceTeamId: String?
+    /// True when the provider could not POSITIVELY attribute the origin.
+    /// Fail-closed: forces `.unattributed` -> deny side.
+    public let sourceUnattributed: Bool
+
     public init(
         sourceAppIdentifier: String,
         agentId: String,
@@ -49,7 +80,13 @@ public struct FilterFlowDescriptor: Equatable {
         destinationPort: Int,
         networkProtocol: FlowProtocol,
         hostnameSource: String?,
-        opaqueDestination: Bool
+        opaqueDestination: Bool,
+        sourceRuid: uid_t = 0,
+        sourcePid: pid_t = 0,
+        sourcePidVersion: Int32 = 0,
+        sourceSigningId: String? = nil,
+        sourceTeamId: String? = nil,
+        sourceUnattributed: Bool = true
     ) {
         self.sourceAppIdentifier = sourceAppIdentifier
         self.agentId = agentId
@@ -60,6 +97,12 @@ public struct FilterFlowDescriptor: Equatable {
         self.networkProtocol = networkProtocol
         self.hostnameSource = hostnameSource
         self.opaqueDestination = opaqueDestination
+        self.sourceRuid = sourceRuid
+        self.sourcePid = sourcePid
+        self.sourcePidVersion = sourcePidVersion
+        self.sourceSigningId = sourceSigningId
+        self.sourceTeamId = sourceTeamId
+        self.sourceUnattributed = sourceUnattributed
     }
 }
 

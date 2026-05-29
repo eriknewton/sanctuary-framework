@@ -715,6 +715,57 @@ public struct ManifestRuleDigestEntry: Codable, Equatable {
     }
 }
 
+/// Install mode of the agent-origin descriptor. Mirrors the TS
+/// `AgentOriginMode` union in `server/src/castle-wall/ipc/messages.ts`.
+public enum AgentOriginModeWire: String, Codable, Equatable {
+    case nat
+    case uid
+}
+
+/// Additive, optional descriptor (2026-05-29 origin-classifier foundation)
+/// telling the sysext how to recognise agent-originated flows. Carried
+/// INSIDE `ManifestSignedBody`, so it rides under the existing pinned-key
+/// Ed25519 signature; an unsigned or replayed envelope can never inject it.
+///
+/// Backward compatible: when absent it encodes to nothing (so legacy/unsigned
+/// manifests stay byte-identical and the rule-digest check is unaffected),
+/// and a newer sysext with no descriptor present classifies everything
+/// `.agent` (machine-wide default-deny preserved). An older sysext simply
+/// ignores the field.
+public struct AgentOriginWire: Codable, Equatable {
+    public let mode: AgentOriginModeWire
+    public let egressHelperSigningId: String?
+    public let egressHelperTeamId: String?
+    public let agentRuntimePortRange: [Int]?
+    public let agentUid: UInt32?
+    public let systemUidAllowCeiling: UInt32
+
+    public init(
+        mode: AgentOriginModeWire,
+        egressHelperSigningId: String? = nil,
+        egressHelperTeamId: String? = nil,
+        agentRuntimePortRange: [Int]? = nil,
+        agentUid: UInt32? = nil,
+        systemUidAllowCeiling: UInt32
+    ) {
+        self.mode = mode
+        self.egressHelperSigningId = egressHelperSigningId
+        self.egressHelperTeamId = egressHelperTeamId
+        self.agentRuntimePortRange = agentRuntimePortRange
+        self.agentUid = agentUid
+        self.systemUidAllowCeiling = systemUidAllowCeiling
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case mode
+        case egressHelperSigningId = "egress_helper_signing_id"
+        case egressHelperTeamId = "egress_helper_team_id"
+        case agentRuntimePortRange = "agent_runtime_port_range"
+        case agentUid = "agent_uid"
+        case systemUidAllowCeiling = "system_uid_allow_ceiling"
+    }
+}
+
 /// Signed allowlist manifest body. The extension verifies the Ed25519
 /// signature over canonical JSON of this exact shape before trusting rules.
 public struct ManifestSignedBody: Codable, Equatable {
@@ -722,17 +773,22 @@ public struct ManifestSignedBody: Codable, Equatable {
     public let fortressId: String
     public let issuedAt: String
     public let rules: [ManifestRuleDigestEntry]
+    /// Additive, optional agent-origin descriptor. `nil` encodes to absent so
+    /// legacy/unsigned bodies stay byte-identical. Covered by the signature.
+    public let agentOrigin: AgentOriginWire?
 
     public init(
         schemaVersion: UInt32,
         fortressId: String,
         issuedAt: String,
-        rules: [ManifestRuleDigestEntry]
+        rules: [ManifestRuleDigestEntry],
+        agentOrigin: AgentOriginWire? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.fortressId = fortressId
         self.issuedAt = issuedAt
         self.rules = rules
+        self.agentOrigin = agentOrigin
     }
 
     enum CodingKeys: String, CodingKey {
@@ -740,6 +796,7 @@ public struct ManifestSignedBody: Codable, Equatable {
         case fortressId = "fortress_id"
         case issuedAt = "issued_at"
         case rules
+        case agentOrigin = "agent_origin"
     }
 }
 

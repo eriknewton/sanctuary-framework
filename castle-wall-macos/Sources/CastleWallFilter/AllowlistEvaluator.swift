@@ -28,6 +28,41 @@ import CastleWallIPC
 
 public enum AllowlistEvaluator {
 
+    /// The synthetic matched-rule id stamped on an operator-passthrough
+    /// allow. Distinct from any real rule id so the audit log can tell an
+    /// operator fast-path allow apart from a rule-matched allow, and so the
+    /// legacy `"unknown"` templateId can never be confused with it.
+    public static let operatorPassthroughRuleId = "operator_passthrough"
+
+    /// Origin-gated evaluation (2026-05-29 fail-closed origin classifier).
+    ///
+    /// FAIL-CLOSED INVARIANT: ONLY a `.operator` classification earns the
+    /// allow fast-path. `.agent` AND `.unattributed` BOTH fall through to the
+    /// existing default-deny + allowlist path. There is NO code path here
+    /// where "could not determine origin" (`.unattributed`) reaches
+    /// operator-allow.
+    public static func evaluate(
+        flow: FilterFlowDescriptor,
+        rules: [ManifestRule],
+        agentOrigin: AgentOriginDescriptor?
+    ) -> EvaluationOutcome {
+        let origin = OriginClassifier.originClass(
+            descriptor: flow,
+            agentOrigin: agentOrigin
+        )
+
+        // Operator fast-path: ONLY a POSITIVE operator determination passes
+        // here. This gate sits BEFORE the rule loop. `.agent` and
+        // `.unattributed` deliberately do NOT take it.
+        if origin == .operator {
+            return .allow(matchedRuleId: operatorPassthroughRuleId)
+        }
+
+        // `.agent` and `.unattributed` route to the unchanged default-deny +
+        // allowlist evaluation. Default-deny on no match is preserved.
+        return evaluate(flow: flow, rules: rules)
+    }
+
     /// Evaluate a flow against the current manifest snapshot.
     public static func evaluate(
         flow: FilterFlowDescriptor,

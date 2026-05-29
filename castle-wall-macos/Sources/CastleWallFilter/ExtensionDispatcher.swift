@@ -128,7 +128,8 @@ public final class ExtensionDispatcher {
         _ = IPCBridgeNotifications.recoverPersistedManifest(
             store: manifestStore,
             cache: flowCache,
-            pinnedPublicKey: ipcClient.pinnedPublicKeyBytes
+            pinnedPublicKey: ipcClient.pinnedPublicKeyBytes,
+            engine: engine
         )
 
         stateQueue.sync {
@@ -207,7 +208,8 @@ public final class ExtensionDispatcher {
                 message: message,
                 store: manifestStore,
                 cache: flowCache,
-                pinnedPublicKey: ipcClient.pinnedPublicKeyBytes
+                pinnedPublicKey: ipcClient.pinnedPublicKeyBytes,
+                engine: engine
             )
         case .decisionResponse:
             // Operator-approval / -deny resume path; round-trip wiring

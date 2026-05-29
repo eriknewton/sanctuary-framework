@@ -80,10 +80,14 @@ public enum SignedManifestVerifier {
         }
 
         try verifyRuleDigests(manifest: manifest, rules: body.rules)
+        // `manifest.agentOrigin` is part of the canonical bytes just verified
+        // against the pinned key, so it is trusted iff the signature passed.
+        // An unsigned / replayed envelope can never inject it.
         return ManifestSnapshot(
             signatureB64url: signature.signatureB64url,
             rules: body.rules,
-            updatedAt: now
+            updatedAt: now,
+            agentOrigin: manifest.agentOrigin
         )
     }
 

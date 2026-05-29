@@ -30,11 +30,22 @@ public struct ManifestSnapshot: Equatable {
     public let signatureB64url: String?
     public let rules: [ManifestRule]
     public let updatedAt: Date
+    /// The agent-origin descriptor carried in this signed manifest body, if
+    /// any. `nil` when the (verified) body did not include one. Surfaced so
+    /// the IPC bridge can install it on the engine after signature
+    /// verification (2026-05-29 origin-classifier foundation).
+    public let agentOrigin: AgentOriginWire?
 
-    public init(signatureB64url: String?, rules: [ManifestRule], updatedAt: Date) {
+    public init(
+        signatureB64url: String?,
+        rules: [ManifestRule],
+        updatedAt: Date,
+        agentOrigin: AgentOriginWire? = nil
+    ) {
         self.signatureB64url = signatureB64url
         self.rules = rules
         self.updatedAt = updatedAt
+        self.agentOrigin = agentOrigin
     }
 }
 
