@@ -9,7 +9,7 @@ on:
 jobs:
   e2e:
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v6
@@ -46,24 +46,16 @@ jobs:
 
       - name: Install Playwright browsers
         working-directory: server
-        # `timeout-minutes` is the hard backstop; the per-attempt `timeout`
-        # plus a single retry recover from a stuck CDN without waiting out the
-        # ~6h job limit (this step hung 110+ min on the 2026-05-29 run,
-        # workflow run 26653595266). On a cache hit the browser download is
-        # skipped, so the command finishes in seconds.
-        timeout-minutes: 14
-        run: |
-          set -e
-          for attempt in 1 2; do
-            if timeout -k 30 360 npx playwright install --with-deps chromium webkit; then
-              echo "Playwright browsers installed (attempt $attempt)."
-              exit 0
-            fi
-            echo "::warning::Playwright install attempt $attempt failed or timed out; retrying in 10s..."
-            sleep 10
-          done
-          echo "::error::Playwright install failed after 2 attempts."
-          exit 1
+        # Step-level `timeout-minutes` is the fail-fast backstop. A cold
+        # `--with-deps chromium webkit` install (browser download plus apt
+        # system libs) runs about 8 to 12 minutes, so 18 leaves healthy
+        # headroom while killing the kind of CDN hang that ran 110+ min on the
+        # 2026-05-29 run (workflow run 26653595266). On a cache hit the browser
+        # download is skipped and this finishes in seconds. No inner retry: a
+        # healthy install must not be cut short, and the cache plus a re-run
+        # cover a transient CDN blip.
+        timeout-minutes: 18
+        run: npx playwright install --with-deps chromium webkit
 
       - name: Run Playwright e2e tests
         working-directory: server
