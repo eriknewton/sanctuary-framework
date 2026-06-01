@@ -9,6 +9,15 @@ on:
 jobs:
   e2e:
     runs-on: ubuntu-22.04
+    # Run inside the official Playwright image so chromium/webkit are pre-baked
+    # and version-matched to @playwright/test 1.59.1. This eliminates the
+    # cdn.playwright.dev browser download that reliably stalled in CI (3x480s
+    # all timed out on the chromium zip), so there is no install or cache step:
+    # the browsers ship in the image and Playwright finds them via the image's
+    # PLAYWRIGHT_BROWSERS_PATH. Keep this tag in lockstep with the
+    # @playwright/test version in server/package.json.
+    container:
+      image: mcr.microsoft.com/playwright:v1.59.1-noble
     timeout-minutes: 30
 
     steps:
@@ -35,36 +44,6 @@ jobs:
           python3 -m venv sidecars/concordia/.venv
           sidecars/concordia/.venv/bin/pip install --upgrade pip
           sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('server/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-playwright-
-
-      - name: Install Playwright browsers
-        working-directory: server
-        # CDN stalls on the webkit/chromium download are transient. Each attempt
-        # gets its own 480s (8 min) hard timeout so a single hung download is
-        # killed and retried instead of consuming the whole step budget; the
-        # earlier no-retry version failed the job on one transient hang. Three
-        # attempts at 8 min each = 24 min worst case, under the 26-min step cap
-        # and the 30-min job cap. The browser cache makes a warm run finish in
-        # seconds, so the retry budget is only ever spent on a genuine cold stall.
-        timeout-minutes: 26
-        run: |
-          for attempt in 1 2 3; do
-            echo "Playwright install attempt ${attempt}/3"
-            if timeout 480 npx playwright install --with-deps chromium webkit; then
-              echo "Playwright install succeeded on attempt ${attempt}"
-              exit 0
-            fi
-            echo "Attempt ${attempt} timed out or failed (up to 480s); retrying"
-          done
-          echo "Playwright install failed after 3 attempts"
-          exit 1
 
       - name: Run Playwright e2e tests
         working-directory: server
