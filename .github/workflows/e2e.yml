@@ -9,6 +9,16 @@ on:
 jobs:
   e2e:
     runs-on: ubuntu-22.04
+    # Run inside the official Playwright image so chromium/webkit are pre-baked
+    # and version-matched to @playwright/test 1.59.1. This eliminates the
+    # cdn.playwright.dev browser download that reliably stalled in CI (3x480s
+    # all timed out on the chromium zip), so there is no install or cache step:
+    # the browsers ship in the image and Playwright finds them via the image's
+    # PLAYWRIGHT_BROWSERS_PATH. Keep this tag in lockstep with the
+    # @playwright/test version in server/package.json.
+    container:
+      image: mcr.microsoft.com/playwright:v1.59.1-noble
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v6
@@ -34,10 +44,6 @@ jobs:
           python3 -m venv sidecars/concordia/.venv
           sidecars/concordia/.venv/bin/pip install --upgrade pip
           sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
-
-      - name: Install Playwright browsers
-        working-directory: server
-        run: npx playwright install --with-deps chromium webkit
 
       - name: Run Playwright e2e tests
         working-directory: server
