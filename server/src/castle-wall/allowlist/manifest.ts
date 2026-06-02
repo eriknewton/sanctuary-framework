@@ -22,6 +22,44 @@ export interface ManifestRuleEntry {
 }
 
 /**
+ * Install mode of the agent-origin descriptor (2026-05-29 origin-classifier
+ * foundation). Mirrors the Swift `AgentOriginModeWire` enum.
+ *
+ * - `nat`: agent runs inside a Sanctuary-owned NAT runtime; its egress helper
+ *   has a distinct code-signing identity. Recommended (default).
+ * - `uid`: agent runs under its own dedicated macOS user account. Fallback.
+ */
+export type AgentOriginMode = "nat" | "uid";
+
+/**
+ * Additive, optional descriptor telling the macOS sysext how to recognise
+ * agent-originated flows. Carried INSIDE the signed manifest body so it rides
+ * under the existing pinned-key Ed25519 signature; an unsigned or replayed
+ * envelope can never inject it.
+ *
+ * FAIL-CLOSED: when this field is absent, the sysext classifies every flow as
+ * `.agent` (machine-wide default-deny preserved); it NEVER infers operator.
+ * The daemon must emit a fully-formed descriptor or omit the field entirely:
+ * a half-built descriptor is never written (see `validateAgentOrigin`).
+ *
+ * Field shapes are mode-specific but the type is a single object so the signed
+ * body stays a flat document:
+ * - `nat`: at least one of `egress_helper_signing_id` / `egress_helper_team_id`
+ *   must be present; `agent_runtime_port_range` is an optional [lo, hi] pair.
+ * - `uid`: `agent_uid` (the dedicated account uid) must be present.
+ * - both: `system_uid_allow_ceiling` is required (uids strictly below it are
+ *   treated as system daemons on the conceded operator low-UID path).
+ */
+export interface AgentOrigin {
+  mode: AgentOriginMode;
+  egress_helper_signing_id?: string;
+  egress_helper_team_id?: string;
+  agent_runtime_port_range?: [number, number];
+  agent_uid?: number;
+  system_uid_allow_ceiling: number;
+}
+
+/**
  * The unsigned manifest. Canonical-JSON of this structure is the signing input.
  */
 export interface AllowlistManifest {
@@ -29,6 +67,13 @@ export interface AllowlistManifest {
   fortress_id: string;
   issued_at: string;
   rules: ManifestRuleEntry[];
+  /**
+   * Optional agent-origin descriptor. Omitted (NOT null) when absent so the
+   * canonical-JSON bytes stay identical to a manifest built without it; both
+   * the TS canonicalizer and the Swift `JSONEncoder` drop the field, keeping
+   * the signature byte-compatible across versions.
+   */
+  agent_origin?: AgentOrigin;
 }
 
 /**

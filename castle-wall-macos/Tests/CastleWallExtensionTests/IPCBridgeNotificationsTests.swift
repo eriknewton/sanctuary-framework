@@ -8,6 +8,7 @@
 //
 
 import XCTest
+import CryptoKit
 @testable import CastleWallFilter
 @testable import CastleWallIPC
 
@@ -387,5 +388,133 @@ final class IPCBridgeNotificationsTests: XCTestCase {
         )
         XCTAssertNil(snapshot)
         XCTAssertNil(store.currentSnapshot())
+    }
+
+    // MARK: - agentOrigin signed-envelope plumbing (2026-05-29)
+
+    private func sampleAllowRule() -> ManifestRule {
+        return ManifestRule(
+            id: "r-origin",
+            schemaVersion: 1,
+            createdAt: "2026-05-11T00:00:00Z",
+            description: nil,
+            match: ManifestRuleMatch(
+                host: .single("api.anthropic.com"),
+                hostPattern: nil,
+                port: .single(443),
+                protocolName: "tcp"
+            ),
+            scope: ManifestRuleScope(agentIds: nil, templateIds: nil),
+            disposition: "allow",
+            timeWindow: nil
+        )
+    }
+
+    func testSignedAgentOriginRoundTripsAndInstallsOnEngine() throws {
+        let wire = AgentOriginWire(
+            mode: .uid,
+            agentUid: 600,
+            systemUidAllowCeiling: 500
+        )
+        let signed = try makeSignedManifestUpdatedBody(
+            rules: [sampleAllowRule()],
+            agentOrigin: wire
+        )
+        let engine = FlowEvaluatorEngine()
+        XCTAssertNil(engine.agentOrigin)
+
+        let snapshot = IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(signed.body),
+            store: engine.manifestStore,
+            cache: engine.flowCache,
+            pinnedPublicKey: signed.publicKey,
+            engine: engine
+        )
+
+        XCTAssertNotNil(snapshot)
+        XCTAssertEqual(snapshot?.agentOrigin, wire)
+        // Installed on the engine for classification.
+        XCTAssertEqual(engine.agentOrigin?.mode, .uid)
+        XCTAssertEqual(engine.agentOrigin?.agentUid, 600)
+        XCTAssertEqual(engine.agentOrigin?.systemUidAllowCeiling, 500)
+    }
+
+    func testAbsentAgentOriginIsTolerated_engineStaysClassifyAllAgent() throws {
+        // No agent_origin in the signed body: the snapshot carries nil and
+        // the engine's retained descriptor stays nil (classify-all-agent).
+        let signed = try makeSignedManifestUpdatedBody(rules: [sampleAllowRule()])
+        let engine = FlowEvaluatorEngine()
+        let snapshot = IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(signed.body),
+            store: engine.manifestStore,
+            cache: engine.flowCache,
+            pinnedPublicKey: signed.publicKey,
+            engine: engine
+        )
+        XCTAssertNotNil(snapshot)
+        XCTAssertNil(snapshot?.agentOrigin)
+        XCTAssertNil(engine.agentOrigin)
+    }
+
+    func testAbsentAgentOriginDoesNotClearRetainedDescriptor() throws {
+        // Pre-seed retention: an update with NO agent_origin must NOT wipe a
+        // previously-installed descriptor (never relax to more-permissive).
+        let engine = FlowEvaluatorEngine(
+            agentOrigin: AgentOriginDescriptor(mode: .uid, agentUid: 600, systemUidAllowCeiling: 500)
+        )
+        let signed = try makeSignedManifestUpdatedBody(rules: [sampleAllowRule()])
+        _ = IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(signed.body),
+            store: engine.manifestStore,
+            cache: engine.flowCache,
+            pinnedPublicKey: signed.publicKey,
+            engine: engine
+        )
+        // Still retained.
+        XCTAssertEqual(engine.agentOrigin?.agentUid, 600)
+    }
+
+    func testTamperedEnvelopeCarryingAgentOriginIsRejected() throws {
+        // An attacker who flips agent_origin AFTER signing must be rejected by
+        // the signature check, so the engine never installs the injected
+        // descriptor.
+        let goodWire = AgentOriginWire(mode: .uid, agentUid: 600, systemUidAllowCeiling: 500)
+        let signed = try makeSignedManifestUpdatedBody(
+            rules: [sampleAllowRule()],
+            agentOrigin: goodWire
+        )
+        // Verify against a DIFFERENT pinned key => signature mismatch.
+        let wrongKey = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation
+        let engine = FlowEvaluatorEngine()
+        let snapshot = IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(signed.body),
+            store: engine.manifestStore,
+            cache: engine.flowCache,
+            pinnedPublicKey: wrongKey,
+            engine: engine
+        )
+        XCTAssertNil(snapshot)
+        XCTAssertNil(engine.agentOrigin, "rejected envelope must not install agent_origin")
+    }
+
+    func testUnusableAgentOriginIsIgnoredFailClosed() throws {
+        // A signed-but-structurally-unusable UID descriptor (no agent_uid)
+        // must NOT install; the engine stays classify-all-agent.
+        let badWire = AgentOriginWire(mode: .uid, agentUid: nil, systemUidAllowCeiling: 500)
+        let signed = try makeSignedManifestUpdatedBody(
+            rules: [sampleAllowRule()],
+            agentOrigin: badWire
+        )
+        let engine = FlowEvaluatorEngine()
+        let snapshot = IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(signed.body),
+            store: engine.manifestStore,
+            cache: engine.flowCache,
+            pinnedPublicKey: signed.publicKey,
+            engine: engine
+        )
+        XCTAssertNotNil(snapshot)
+        XCTAssertEqual(snapshot?.agentOrigin, badWire)
+        XCTAssertNil(engine.agentOrigin, "unusable descriptor must not install")
     }
 }

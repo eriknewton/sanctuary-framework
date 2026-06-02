@@ -22,20 +22,56 @@ public final class FlowEvaluatorEngine {
     public let flowCache: FlowCache
     public let agentResolver: AgentResolver
 
+    /// The last signed `agentOrigin` descriptor delivered over IPC, retained
+    /// across daemon restarts (pre-seed retention). `nil` means none has been
+    /// delivered yet => the classifier treats EVERYTHING as `.agent` (machine
+    /// -wide default-deny). A daemon crash therefore leaves the sysext
+    /// fail-closed: it keeps the last descriptor (or, if it never had one,
+    /// classify-all-agent). It is NEVER cleared to a more-permissive state on
+    /// IPC loss.
+    private let agentOriginLock = NSLock()
+    private var _agentOrigin: AgentOriginDescriptor?
+
     public init(
         manifestStore: ManifestStore = ManifestStore(),
         flowCache: FlowCache = FlowCache(),
-        agentResolver: @escaping AgentResolver = FlowEvaluatorEngine.defaultAgentResolver
+        agentResolver: @escaping AgentResolver = FlowEvaluatorEngine.defaultAgentResolver,
+        agentOrigin: AgentOriginDescriptor? = nil
     ) {
         self.manifestStore = manifestStore
         self.flowCache = flowCache
         self.agentResolver = agentResolver
+        self._agentOrigin = agentOrigin
         // When the manifest store changes, evict cached outcomes wholesale
         // so a deny rule that arrives after a flow was allowed cannot keep
         // serving stale verdicts.
         self.manifestStore.addObserver { [weak self] _ in
             self?.flowCache.clear()
         }
+    }
+
+    /// The currently-retained agent-origin descriptor (thread-safe read).
+    public var agentOrigin: AgentOriginDescriptor? {
+        agentOriginLock.lock()
+        defer { agentOriginLock.unlock() }
+        return _agentOrigin
+    }
+
+    /// Install a freshly-verified `agentOrigin` descriptor delivered over the
+    /// signed IPC envelope. Evicts the flow cache so prior verdicts computed
+    /// under the old descriptor cannot serve a now-stale operator/agent
+    /// decision.
+    ///
+    /// FAIL-CLOSED: callers MUST only pass descriptors that have already
+    /// passed signed-envelope verification. A `nil` here would relax to
+    /// classify-all-agent; the IPC layer never forwards `nil` on a transient
+    /// drop -- it simply stops delivering, and the last descriptor is
+    /// retained.
+    public func updateAgentOrigin(_ descriptor: AgentOriginDescriptor) {
+        agentOriginLock.lock()
+        _agentOrigin = descriptor
+        agentOriginLock.unlock()
+        flowCache.clear()
     }
 
     public static let defaultAgentResolver: AgentResolver = { sourceAppId in
@@ -54,7 +90,8 @@ public final class FlowEvaluatorEngine {
         }
         let outcome = AllowlistEvaluator.evaluate(
             flow: descriptor,
-            rules: manifestStore.currentRules()
+            rules: manifestStore.currentRules(),
+            agentOrigin: agentOrigin
         )
         switch outcome {
         case .allow, .drop:

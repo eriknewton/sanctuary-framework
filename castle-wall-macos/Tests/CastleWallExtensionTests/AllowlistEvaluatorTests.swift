@@ -252,4 +252,169 @@ final class AllowlistEvaluatorTests: XCTestCase {
             .allow(matchedRuleId: "r-1")
         )
     }
+
+    // MARK: - Origin-gated evaluation (2026-05-29 fail-closed classifier)
+    //
+    // These exercise the additive `evaluate(flow:rules:agentOrigin:)` path.
+    // The single thing under test: ONLY `.operator` earns the allow
+    // fast-path; `.agent` and `.unattributed` fall through to default-deny +
+    // allowlist.
+
+    /// Attributed descriptor with the given ruid/signing identity.
+    private func originFlow(
+        ruid: uid_t = 501,
+        signingId: String? = nil,
+        teamId: String? = nil,
+        host: String? = "api.anthropic.com",
+        port: Int = 443,
+        unattributed: Bool = false
+    ) -> FilterFlowDescriptor {
+        return FilterFlowDescriptor(
+            sourceAppIdentifier: "deadbeef",
+            agentId: "deadbeef",
+            templateId: "unknown",
+            destinationHost: host,
+            destinationIp: "104.18.32.10",
+            destinationPort: port,
+            networkProtocol: .tcp,
+            hostnameSource: host != nil ? "sni" : nil,
+            opaqueDestination: host == nil,
+            sourceRuid: ruid,
+            sourcePid: 4242,
+            sourcePidVersion: 1,
+            sourceSigningId: signingId,
+            sourceTeamId: teamId,
+            sourceUnattributed: unattributed
+        )
+    }
+
+    private func uidOrigin() -> AgentOriginDescriptor {
+        return AgentOriginDescriptor(mode: .uid, agentUid: 600, systemUidAllowCeiling: 500)
+    }
+
+    private func natOrigin() -> AgentOriginDescriptor {
+        return AgentOriginDescriptor(
+            mode: .nat,
+            egressHelperSigningId: "ai.sanctuaryprotocol.egress-helper",
+            systemUidAllowCeiling: 500
+        )
+    }
+
+    // UID mode
+
+    func testUidMode_agentFlowNonAllowlistedDrops() {
+        // agent-UID flow, no matching rule => default-deny (NOT operator).
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 600),
+            rules: [],
+            agentOrigin: uidOrigin()
+        )
+        XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
+    }
+
+    func testUidMode_agentFlowAllowlistedAllowsWithRuleId() {
+        let r = rule(host: .single("api.anthropic.com"), disposition: "allow")
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 600),
+            rules: [r],
+            agentOrigin: uidOrigin()
+        )
+        // Rule-matched allow, NOT operator_passthrough.
+        XCTAssertEqual(outcome, .allow(matchedRuleId: "r-1"))
+    }
+
+    func testUidMode_operatorFlowFastPathAllows() {
+        // operator-UID (high uid != agent) => operator_passthrough, even with
+        // an empty ruleset that would otherwise default-deny.
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 501),
+            rules: [],
+            agentOrigin: uidOrigin()
+        )
+        XCTAssertEqual(outcome, .allow(matchedRuleId: AllowlistEvaluator.operatorPassthroughRuleId))
+    }
+
+    func testUidMode_systemLowUidFastPathAllows() {
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 1),
+            rules: [],
+            agentOrigin: uidOrigin()
+        )
+        XCTAssertEqual(outcome, .allow(matchedRuleId: AllowlistEvaluator.operatorPassthroughRuleId))
+    }
+
+    func testUidMode_unattributedDropsFailClosed() {
+        // Undecodable token => unattributed => deny side, even though its
+        // (meaningless) ruid value would be a system/operator uid.
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 0, unattributed: true),
+            rules: [],
+            agentOrigin: uidOrigin()
+        )
+        XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
+    }
+
+    // NAT mode
+
+    func testNatMode_egressHelperIsAgentDenyUnlessAllowlisted() {
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(signingId: "ai.sanctuaryprotocol.egress-helper"),
+            rules: [],
+            agentOrigin: natOrigin()
+        )
+        XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
+    }
+
+    func testNatMode_nonMatchingSigningIdFastPathAllows() {
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(signingId: "com.apple.Safari"),
+            rules: [],
+            agentOrigin: natOrigin()
+        )
+        XCTAssertEqual(outcome, .allow(matchedRuleId: AllowlistEvaluator.operatorPassthroughRuleId))
+    }
+
+    func testNatMode_unresolvedSigningIdDropsFailClosed() {
+        // Decoded but no signing identity => unattributed => deny side.
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(signingId: nil, teamId: nil),
+            rules: [],
+            agentOrigin: natOrigin()
+        )
+        XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
+    }
+
+    // No agentOrigin: everything is agent (machine-wide default-deny)
+
+    func testNoAgentOrigin_everythingClassifiesAgentDefaultDeny() {
+        // Even a low operator-looking uid: with no descriptor, treat as agent.
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 1),
+            rules: [],
+            agentOrigin: nil
+        )
+        XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
+    }
+
+    func testNoAgentOrigin_allowlistStillApplies() {
+        let r = rule(host: .single("api.anthropic.com"), disposition: "allow")
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 1),
+            rules: [r],
+            agentOrigin: nil
+        )
+        XCTAssertEqual(outcome, .allow(matchedRuleId: "r-1"))
+    }
+
+    /// The legacy "unknown" templateId must never be confused with the
+    /// operator passthrough allow: an unattributed flow whose agent/template
+    /// resolved to "unknown" still drops on an empty ruleset.
+    func testUnknownTemplateNeverReachesOperatorAllow() {
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 0, host: nil, unattributed: true),
+            rules: [],
+            agentOrigin: natOrigin()
+        )
+        XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
+    }
 }

@@ -70,6 +70,10 @@ let package = Package(
             path: "Sources/CastleWallFilter",
             linkerSettings: [
                 .linkedFramework("NetworkExtension"),
+                .linkedFramework("Security"),
+                // libbsm provides audit_token_to_pid/ruid/pidversion used by
+                // AuditTokenDecode for typed origin classification.
+                .linkedLibrary("bsm"),
             ]
         ),
         .executableTarget(

@@ -310,23 +310,31 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
     ///
     /// Source-app attribution: macOS exposes
     /// `sourceAppAuditToken: Data?` (a 32-byte audit-token kernel
-    /// structure) as the canonical per-flow attribution surface. We
-    /// hex-encode the bytes into a stable identifier the agent resolver
-    /// can map to a Sanctuary `(agentId, templateId)` pair. Production
-    /// attribution will additionally decode the audit token via
-    /// `SecCodeCopyGuestWithAttributes` to surface the signing identity;
-    /// that wiring lands with the wrapped-agent registry surface.
+    /// structure) as the canonical per-flow attribution surface. We retain
+    /// the hex-encoded bytes as a stable identifier for audit provenance
+    /// (`sourceAppIdentifier`), AND decode the token into typed fields
+    /// (`ruid`, `pid`, `pidVersion`, signing identity) that the fail-closed
+    /// origin classifier consumes.
+    ///
+    /// FAIL-CLOSED: if the token is nil or undecodable, the descriptor is
+    /// marked `sourceUnattributed = true`, which the classifier maps to
+    /// `.unattributed` => deny side. The decode never throws the flow open.
     public func makeDescriptor(from flow: NEFilterFlow) -> FilterFlowDescriptor? {
         guard let socketFlow = flow as? NEFilterSocketFlow else {
             return nil
         }
+        let tokenData = flow.sourceAppAuditToken
         let sourceAppId: String
-        if let token = flow.sourceAppAuditToken {
-            sourceAppId = token.map { String(format: "%02x", $0) }.joined()
+        if let tokenData {
+            sourceAppId = tokenData.map { String(format: "%02x", $0) }.joined()
         } else {
             sourceAppId = "unknown"
         }
         let agent = engine.agentResolver(sourceAppId)
+
+        // Typed decode for origin classification. Any failure path yields a
+        // `sourceUnattributed = true` descriptor (deny side).
+        let decoded = AuditTokenDecode.decode(tokenData: tokenData)
 
         let host: String? = socketFlow.remoteHostname
         let endpoint = socketFlow.remoteEndpoint as? NWHostEndpoint
@@ -355,7 +363,13 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
             destinationPort: port,
             networkProtocol: proto,
             hostnameSource: hostnameSource,
-            opaqueDestination: opaque
+            opaqueDestination: opaque,
+            sourceRuid: decoded.ruid,
+            sourcePid: decoded.pid,
+            sourcePidVersion: decoded.pidVersion,
+            sourceSigningId: decoded.signingId,
+            sourceTeamId: decoded.teamId,
+            sourceUnattributed: decoded.unattributed
         )
     }
 }

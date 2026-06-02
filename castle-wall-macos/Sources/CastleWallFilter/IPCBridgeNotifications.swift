@@ -96,7 +96,8 @@ public enum IPCBridgeNotifications {
         store: ManifestStore,
         cache: FlowCache,
         pinnedPublicKey: Data,
-        now: Date = Date()
+        now: Date = Date(),
+        engine: FlowEvaluatorEngine? = nil
     ) -> ManifestSnapshot? {
         guard case .manifestUpdated(let body) = message else {
             return nil
@@ -123,8 +124,35 @@ public enum IPCBridgeNotifications {
         }
         store.update(snapshot)
         cache.clear()
+        installAgentOriginIfPresent(snapshot: snapshot, engine: engine)
         CastleWallLog.ipc.notice("manifest applied; rule_count=\(snapshot.rules.count)")
         return snapshot
+    }
+
+    /// Install a verified `agentOrigin` descriptor onto the engine, when the
+    /// signed snapshot carried a usable one.
+    ///
+    /// FAIL-CLOSED: when the snapshot carries NO descriptor, the existing
+    /// retained descriptor is left untouched (pre-seed retention) -- it is
+    /// NEVER cleared to a more-permissive state on a manifest update that
+    /// happens to omit the field. A structurally-unusable wire descriptor
+    /// (`AgentOriginDescriptor(wire:)` returns nil) is likewise ignored, so
+    /// a half-built descriptor cannot mis-resolve a flow as operator.
+    static func installAgentOriginIfPresent(
+        snapshot: ManifestSnapshot,
+        engine: FlowEvaluatorEngine?
+    ) {
+        guard let engine, let wire = snapshot.agentOrigin else {
+            return
+        }
+        guard let descriptor = AgentOriginDescriptor(wire: wire) else {
+            CastleWallLog.ipc.notice(
+                "agent_origin present but structurally unusable; ignoring (fail-closed)"
+            )
+            return
+        }
+        engine.updateAgentOrigin(descriptor)
+        CastleWallLog.ipc.notice("agent_origin installed; mode=\(descriptor.mode.rawValue)")
     }
 
     /// Recover the last persisted valid manifest after extension restart.
@@ -135,7 +163,8 @@ public enum IPCBridgeNotifications {
         store: ManifestStore,
         cache: FlowCache,
         pinnedPublicKey: Data,
-        now: Date = Date()
+        now: Date = Date(),
+        engine: FlowEvaluatorEngine? = nil
     ) -> ManifestSnapshot? {
         let body: ManifestUpdatedBody?
         do {
@@ -164,6 +193,7 @@ public enum IPCBridgeNotifications {
         }
         store.update(snapshot)
         cache.clear()
+        installAgentOriginIfPresent(snapshot: snapshot, engine: engine)
         return snapshot
     }
 
