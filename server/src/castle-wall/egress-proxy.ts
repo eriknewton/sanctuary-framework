@@ -43,6 +43,10 @@ export interface EgressProxyResolver {
 export interface EgressProxyOptions {
   rules: AllowlistRule[];
   resolver?: EgressProxyResolver;
+  /** Override the public-routability check (for testing with local upstreams). */
+  isRoutable?: (address: string) => boolean;
+  /** Called after every CONNECT decision, before the response is sent. */
+  onDecision?: (authority: string, decision: EgressProxyDecision) => void;
 }
 
 export function canonicalizeConnectAuthority(input: string): CanonicalConnectAuthority {
@@ -147,7 +151,8 @@ export async function decideEgressProxyConnect(
   const addresses = target.isIpLiteral
     ? [target.host]
     : await (options.resolver ?? defaultResolver).resolve(target.host);
-  const publicAddress = addresses.find(isPublicRoutableIp);
+  const routableCheck = options.isRoutable ?? isPublicRoutableIp;
+  const publicAddress = addresses.find(routableCheck);
   if (!publicAddress) {
     return { disposition: "deny", reason: "non_public_resolved_address" };
   }
@@ -168,7 +173,9 @@ async function handleConnect(
   head: Buffer,
   options: EgressProxyOptions
 ): Promise<void> {
-  const decision = await decideEgressProxyConnect(request.url ?? "", options);
+  const authority = request.url ?? "";
+  const decision = await decideEgressProxyConnect(authority, options);
+  options.onDecision?.(authority, decision);
   if (decision.disposition === "deny") {
     clientSocket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
     return;

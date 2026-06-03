@@ -21,6 +21,8 @@ public enum SanctuaryVMMCLI {
         switch command {
         case "guest-exec":
             return try await handleGuestExec(args: Array(args.dropFirst()))
+        case "run-box":
+            return try await handleRunBox(args: Array(args.dropFirst()))
         case "hash":
             return try handleHash(args: Array(args.dropFirst()))
         default:
@@ -35,7 +37,8 @@ public enum SanctuaryVMMCLI {
         Usage: sanctuary-vmm <command> [options]
 
         Commands:
-          guest-exec --json <request>   Execute a process in a no-network VM
+          guest-exec --json <request>   Execute a process in a no-network VM (no egress)
+          run-box    --json <request>   Boot a no-network VM with egress bridge wired
           hash       --path <file>      Compute SHA-256 of a file
 
         \n
@@ -105,6 +108,84 @@ public enum SanctuaryVMMCLI {
         return result.exitCode
     }
 
+    // MARK: - run-box
+
+    private static func handleRunBox(args: [String]) async throws -> Int32 {
+        guard let jsonIdx = args.firstIndex(of: "--json"),
+              jsonIdx + 1 < args.count else {
+            fputs("run-box requires --json <request>\n", stderr)
+            return 1
+        }
+
+        let jsonString = args[jsonIdx + 1]
+        guard let jsonData = jsonString.data(using: .utf8) else {
+            fputs("Invalid JSON encoding\n", stderr)
+            return 1
+        }
+
+        let request: RunBoxCLIRequest
+        do {
+            request = try JSONDecoder().decode(RunBoxCLIRequest.self, from: jsonData)
+        } catch {
+            fputs("Failed to parse run-box request JSON: \(error)\n", stderr)
+            return 1
+        }
+
+        guard request.egressProxyPort > 0 else {
+            fputs("run-box requires egressProxyPort > 0\n", stderr)
+            return 1
+        }
+
+        let containerConfig = SanctuaryContainerConfig(
+            kernelPath: request.kernelPath,
+            initfsReference: request.initfsReference ?? "ghcr.io/apple/containerization/vminit:0.33.3",
+            ociImageReference: request.ociImageReference,
+            rootfsSizeBytes: request.rootfsSizeBytes ?? 2 * 1024 * 1024 * 1024,
+            cpuCount: request.cpuCount ?? 2,
+            memoryBytes: request.memoryBytes ?? 512 * 1024 * 1024,
+            rootfsPins: request.rootfsPins ?? [],
+            egressVsockPort: request.egressVsockPort ?? 0x0FFF_0001
+        )
+
+        let egressConfig = SanctuaryVsockEgressConfig(
+            hostPort: request.egressVsockPort ?? 0x0FFF_0001,
+            guestSocketPath: request.egressGuestSocketPath ?? "/run/sanctuary-egress.sock",
+            proxyListenAddress: request.egressProxyHost ?? "127.0.0.1",
+            proxyListenPort: request.egressProxyPort
+        )
+
+        let launcher = SanctuaryContainerLauncher(config: containerConfig)
+        let containerId = "sanctuary-\(ProcessInfo.processInfo.processIdentifier)"
+
+        let execRequest = SanctuaryGuestExecRequest(
+            command: request.command,
+            args: request.args,
+            cwd: request.cwd,
+            env: request.env
+        )
+
+        fputs("[run-box] booting with egress bridge: vsock 0x\(String(format: "%08X", egressConfig.hostPort)) -> \(egressConfig.proxyListenAddress):\(egressConfig.proxyListenPort)\n", stderr)
+
+        let result = try await launcher.launchWithEgress(
+            containerId: containerId,
+            request: execRequest,
+            egressConfig: egressConfig
+        )
+
+        // Output result as JSON
+        let output = GuestExecCLIOutput(
+            exitCode: result.exitCode,
+            stdout: result.stdout,
+            stderr: result.stderr
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let outputData = try encoder.encode(output)
+        print(String(data: outputData, encoding: .utf8) ?? "{}")
+
+        return result.exitCode
+    }
+
     // MARK: - hash
 
     private static func handleHash(args: [String]) throws -> Int32 {
@@ -133,6 +214,24 @@ struct GuestExecCLIRequest: Codable {
     let memoryBytes: UInt64?
     let rootfsPins: [SanctuaryArtifactPin]?
     let egressVsockPort: UInt32?
+    let command: String
+    let args: [String]
+    let cwd: String
+    let env: [String: String]
+}
+
+struct RunBoxCLIRequest: Codable {
+    let kernelPath: String
+    let initfsReference: String?
+    let ociImageReference: String
+    let rootfsSizeBytes: UInt64?
+    let cpuCount: Int?
+    let memoryBytes: UInt64?
+    let rootfsPins: [SanctuaryArtifactPin]?
+    let egressVsockPort: UInt32?
+    let egressProxyHost: String?
+    let egressProxyPort: UInt16
+    let egressGuestSocketPath: String?
     let command: String
     let args: [String]
     let cwd: String

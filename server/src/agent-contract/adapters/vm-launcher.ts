@@ -33,6 +33,29 @@ export interface VMGuestExecRequest {
   };
 }
 
+export interface VMRunBoxRequest {
+  /** Harness identifier (e.g. "claude-code"). */
+  harnessId: "claude-code";
+  /** Full CLI request JSON for sanctuary-vmm run-box. */
+  cliRequest: {
+    kernelPath: string;
+    ociImageReference: string;
+    command: string;
+    args: string[];
+    cwd: string;
+    env: Record<string, string>;
+    initfsReference?: string;
+    rootfsSizeBytes?: number;
+    cpuCount?: number;
+    memoryBytes?: number;
+    egressVsockPort?: number;
+    egressProxyHost?: string;
+    egressProxyPort: number;
+    egressGuestSocketPath?: string;
+    rootfsPins?: Array<{ sha256: string; artifact: string }>;
+  };
+}
+
 export interface VMGuestExecHandle {
   launchId: string;
   pid?: number;
@@ -61,6 +84,33 @@ export class SanctuaryVMMCliLauncher implements VMManagedLauncher {
 
     const child = spawn(binary, args, {
       stdio: "ignore",
+      detached: true,
+      env: filterLauncherEnv(process.env),
+    });
+
+    return await new Promise<VMGuestExecHandle>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("spawn", () => {
+        child.unref();
+        resolve({
+          launchId: `sanctuary-vmm:${child.pid ?? "unknown"}`,
+          pid: child.pid,
+        });
+      });
+    });
+  }
+
+  async launchRunBox(request: VMRunBoxRequest): Promise<VMGuestExecHandle> {
+    const binary = this.options.binary ?? "sanctuary-vmm";
+    const args = [
+      ...(this.options.extraArgs ?? []),
+      "run-box",
+      "--json",
+      JSON.stringify(request.cliRequest),
+    ];
+
+    const child = spawn(binary, args, {
+      stdio: ["ignore", "pipe", "pipe"],
       detached: true,
       env: filterLauncherEnv(process.env),
     });

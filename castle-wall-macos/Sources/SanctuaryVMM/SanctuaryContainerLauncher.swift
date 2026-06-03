@@ -79,6 +79,7 @@ public enum SanctuaryContainerLauncherError: Error {
     case integrityCheckFailed(underlying: Error)
     case containerizationUnavailable
     case bootFailed(underlying: Error)
+    case egressBridgeSetupFailed(reason: String)
 }
 
 /// Launches agent processes inside a no-network Linux VM using
@@ -165,11 +166,137 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
         )
     }
 
+    /// Boot the container with the egress bridge wired, then execute the
+    /// given process. The bridge runs concurrently with the guest process
+    /// and is torn down after the process exits.
+    ///
+    /// Lifecycle:
+    ///   1. Create container (VM boots, network: nil, networking: false)
+    ///   2. Assert 0 NICs
+    ///   3. Register VsockListener on the egress port (host side)
+    ///   4. Tell vminitd to proxyVsock: guest UDS → vsock port
+    ///   5. Start bridge serve (concurrent task)
+    ///   6. Start guest process
+    ///   7. Wait for guest exit
+    ///   8. Tear down bridge + container
+    public func launchWithEgress(
+        containerId: String,
+        request: SanctuaryGuestExecRequest,
+        egressConfig: SanctuaryVsockEgressConfig
+    ) async throws -> SanctuaryGuestExecResult {
+        var manager = try await ContainerManager(
+            kernel: Kernel(
+                path: URL(fileURLWithPath: config.kernelPath),
+                platform: .linuxArm
+            ),
+            initfsReference: config.initfsReference,
+            network: nil
+        )
+
+        defer {
+            try? manager.delete(containerId)
+        }
+
+        let stdoutCapture = CaptureWriter()
+        let stderrCapture = CaptureWriter()
+
+        let launchConfig = self.config
+        let container = try await manager.create(
+            containerId,
+            reference: launchConfig.ociImageReference,
+            rootfsSizeInBytes: launchConfig.rootfsSizeBytes,
+            networking: false
+        ) { @Sendable cfg in
+            cfg.cpus = launchConfig.cpuCount
+            cfg.memoryInBytes = launchConfig.memoryBytes
+            cfg.process.arguments = [request.command] + request.args
+            cfg.process.workingDirectory = request.cwd
+            for (key, value) in request.env {
+                cfg.process.environmentVariables.append("\(key)=\(value)")
+            }
+            cfg.process.stdout = stdoutCapture
+            cfg.process.stderr = stderrCapture
+        }
+
+        // HOST-SIDE ASSERTION: 0 network devices configured.
+        let nicCount = container.interfaces.count
+        guard nicCount == 0 else {
+            throw SanctuaryContainerLauncherError.networkAttachmentDetected(count: nicCount)
+        }
+
+        // Boot the VM (sets up rootfs, mounts, agent).
+        try await container.create()
+
+        // Register ONE VsockListener on the egress port (host side).
+        // This must happen BEFORE the guest process starts.
+        let egressListener = try await container.withVirtualMachineInstance { vm in
+            try vm.listen(egressConfig.hostPort)
+        }
+
+        // Tell vminitd to create a guest-side UDS that proxies to our
+        // vsock port. Guest processes connect to this UDS for egress.
+        try await container.withVirtualMachineInstance { vm in
+            let agent = try await vm.dialAgent()
+            do {
+                guard let relayAgent = agent as? SocketRelayAgent else {
+                    throw SanctuaryContainerLauncherError.egressBridgeSetupFailed(
+                        reason: "VM agent does not support socket relay (proxyVsock)")
+                }
+                let socketConfig = UnixSocketConfiguration(
+                    source: URL(fileURLWithPath: "/dev/null"),
+                    destination: URL(fileURLWithPath: egressConfig.guestSocketPath),
+                    direction: .into
+                )
+                try await relayAgent.relaySocket(
+                    port: egressConfig.hostPort,
+                    configuration: socketConfig
+                )
+                try await agent.close()
+            } catch {
+                try? await agent.close()
+                throw error
+            }
+        }
+
+        // Start the bridge: accept vsock connections and pipe each to
+        // the host-side egress proxy (HTTP CONNECT on localhost).
+        let bridge = SanctuaryVsockEgressBridge(config: egressConfig)
+        let bridgeTask = Task {
+            await bridge.serve(listener: egressListener)
+        }
+
+        // Now start the guest process and wait for it to exit.
+        try await container.start()
+        let exitStatus = try await container.wait()
+
+        // Tear down the bridge and container.
+        bridge.stop()
+        try? egressListener.finish()
+        bridgeTask.cancel()
+        _ = await bridgeTask.value
+
+        try await container.stop()
+
+        return SanctuaryGuestExecResult(
+            exitCode: exitStatus.exitCode,
+            stdout: stdoutCapture.text,
+            stderr: stderrCapture.text
+        )
+    }
+
     #else
 
     public func launchAndExec(
         containerId: String,
         request: SanctuaryGuestExecRequest
+    ) async throws -> SanctuaryGuestExecResult {
+        throw SanctuaryContainerLauncherError.containerizationUnavailable
+    }
+
+    public func launchWithEgress(
+        containerId: String,
+        request: SanctuaryGuestExecRequest,
+        egressConfig: SanctuaryVsockEgressConfig
     ) async throws -> SanctuaryGuestExecResult {
         throw SanctuaryContainerLauncherError.containerizationUnavailable
     }
