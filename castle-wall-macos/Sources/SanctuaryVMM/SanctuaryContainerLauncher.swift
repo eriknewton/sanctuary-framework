@@ -15,14 +15,12 @@ public struct SanctuaryContainerConfig: Sendable {
     public let cpuCount: Int
     public let memoryBytes: UInt64
     public let rootfsPins: [SanctuaryArtifactPin]
-    /// Vsock port for the egress proxy (host-side VsockListener).
-    /// Must be in the 0x1000_0000+ range to avoid collision with
-    /// Apple Containerization's internal port allocation
-    /// (LinuxPod.swift:238-239: both hostVsockPorts and guestVsockPorts
-    /// start at 0x1000_0000).
-    ///
-    /// We use a port BELOW the 0x1000_0000 range (e.g. 0x0FFF_0001)
-    /// so there is no collision with Apple's ascending allocation.
+    /// RESERVED. Under the `.into` Unix-socket relay (see
+    /// `SanctuaryVsockEgressConfig`), Apple's `LinuxContainer` allocates the
+    /// egress vsock port itself from its internal `hostVsockPorts` allocator
+    /// (LinuxContainer.swift relayUnixSocket), so this value is no longer used
+    /// to register a listener. It is retained as a reserved, below-range
+    /// (< 0x1000_0000) constant for forward compatibility and is harmless.
     public let egressVsockPort: UInt32
 
     public init(
@@ -166,19 +164,27 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
         )
     }
 
-    /// Boot the container with the egress bridge wired, then execute the
-    /// given process. The bridge runs concurrently with the guest process
-    /// and is torn down after the process exits.
+    /// Boot the container with a single egress path wired to the host-side
+    /// allowlist proxy, then execute the given process.
+    ///
+    /// Mechanism (Apple Containerization `.into` Unix-socket relay):
+    ///   The container is created with one `UnixSocketConfiguration(.into)` whose
+    ///   `source` is the host proxy's Unix socket and whose `destination` is the
+    ///   in-guest socket path. Apple's `LinuxContainer` then, on boot:
+    ///     1. allocates a vsock port and a host-side `VsockListener`,
+    ///     2. creates a guest UDS at a staging path and BIND-MOUNTS it into the
+    ///        container rootfs at `guestSocketPath` (the step that makes the
+    ///        socket visible to the guest process), and
+    ///     3. relays guest `connect(guestSocketPath)` -> vsock ->
+    ///        host `connect(hostProxyUdsPath)`.
     ///
     /// Lifecycle:
-    ///   1. Create container (VM boots, network: nil, networking: false)
-    ///   2. Assert 0 NICs
-    ///   3. Register VsockListener on the egress port (host side)
-    ///   4. Tell vminitd to proxyVsock: guest UDS → vsock port
-    ///   5. Start bridge serve (concurrent task)
-    ///   6. Start guest process
-    ///   7. Wait for guest exit
-    ///   8. Tear down bridge + container
+    ///   1. Create container with the `.into` egress socket (network: nil,
+    ///      networking: false)
+    ///   2. Assert 0 NICs (host-side)
+    ///   3. Boot the VM (Apple sets up the relay + bind-mount)
+    ///   4. Start the guest process
+    ///   5. Wait for guest exit; tear down container
     public func launchWithEgress(
         containerId: String,
         request: SanctuaryGuestExecRequest,
@@ -201,6 +207,7 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
         let stderrCapture = CaptureWriter()
 
         let launchConfig = self.config
+        let egress = egressConfig
         let container = try await manager.create(
             containerId,
             reference: launchConfig.ociImageReference,
@@ -216,65 +223,33 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
             }
             cfg.process.stdout = stdoutCapture
             cfg.process.stderr = stderrCapture
+
+            // EGRESS: share the host-side allowlist proxy's Unix socket INTO the
+            // guest. Apple relays guest UDS -> vsock -> host UDS and bind-mounts
+            // the guest socket into the container rootfs at guestSocketPath. This
+            // is the guest's ONLY path to the outside world.
+            cfg.sockets.append(
+                UnixSocketConfiguration(
+                    source: URL(fileURLWithPath: egress.hostProxyUdsPath),
+                    destination: URL(fileURLWithPath: egress.guestSocketPath),
+                    direction: .into
+                )
+            )
         }
 
-        // HOST-SIDE ASSERTION: 0 network devices configured.
+        // HOST-SIDE ASSERTION: 0 network devices configured. A `.into` socket
+        // relay is a vsock UDS relay, not a VZNetworkDeviceConfiguration, so the
+        // interface count must still be exactly 0.
         let nicCount = container.interfaces.count
         guard nicCount == 0 else {
             throw SanctuaryContainerLauncherError.networkAttachmentDetected(count: nicCount)
         }
 
-        // Boot the VM (sets up rootfs, mounts, agent).
+        // Boot the VM. Apple's LinuxContainer sets up the .into socket relay and
+        // bind-mounts the guest egress socket into the rootfs during create().
         try await container.create()
-
-        // Register ONE VsockListener on the egress port (host side).
-        // This must happen BEFORE the guest process starts.
-        let egressListener = try await container.withVirtualMachineInstance { vm in
-            try vm.listen(egressConfig.hostPort)
-        }
-
-        // Tell vminitd to create a guest-side UDS that proxies to our
-        // vsock port. Guest processes connect to this UDS for egress.
-        try await container.withVirtualMachineInstance { vm in
-            let agent = try await vm.dialAgent()
-            do {
-                guard let relayAgent = agent as? SocketRelayAgent else {
-                    throw SanctuaryContainerLauncherError.egressBridgeSetupFailed(
-                        reason: "VM agent does not support socket relay (proxyVsock)")
-                }
-                let socketConfig = UnixSocketConfiguration(
-                    source: URL(fileURLWithPath: "/dev/null"),
-                    destination: URL(fileURLWithPath: egressConfig.guestSocketPath),
-                    direction: .into
-                )
-                try await relayAgent.relaySocket(
-                    port: egressConfig.hostPort,
-                    configuration: socketConfig
-                )
-                try await agent.close()
-            } catch {
-                try? await agent.close()
-                throw error
-            }
-        }
-
-        // Start the bridge: accept vsock connections and pipe each to
-        // the host-side egress proxy (HTTP CONNECT on localhost).
-        let bridge = SanctuaryVsockEgressBridge(config: egressConfig)
-        let bridgeTask = Task {
-            await bridge.serve(listener: egressListener)
-        }
-
-        // Now start the guest process and wait for it to exit.
         try await container.start()
         let exitStatus = try await container.wait()
-
-        // Tear down the bridge and container.
-        bridge.stop()
-        try? egressListener.finish()
-        bridgeTask.cancel()
-        _ = await bridgeTask.value
-
         try await container.stop()
 
         return SanctuaryGuestExecResult(

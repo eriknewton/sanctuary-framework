@@ -131,8 +131,8 @@ public enum SanctuaryVMMCLI {
             return 1
         }
 
-        guard request.egressProxyPort > 0 else {
-            fputs("run-box requires egressProxyPort > 0\n", stderr)
+        guard !request.egressProxyUdsPath.isEmpty else {
+            fputs("run-box requires egressProxyUdsPath\n", stderr)
             return 1
         }
 
@@ -148,10 +148,8 @@ public enum SanctuaryVMMCLI {
         )
 
         let egressConfig = SanctuaryVsockEgressConfig(
-            hostPort: request.egressVsockPort ?? 0x0FFF_0001,
-            guestSocketPath: request.egressGuestSocketPath ?? "/run/sanctuary-egress.sock",
-            proxyListenAddress: request.egressProxyHost ?? "127.0.0.1",
-            proxyListenPort: request.egressProxyPort
+            hostProxyUdsPath: request.egressProxyUdsPath,
+            guestSocketPath: request.egressGuestSocketPath ?? "/run/sanctuary-egress.sock"
         )
 
         let launcher = SanctuaryContainerLauncher(config: containerConfig)
@@ -164,7 +162,7 @@ public enum SanctuaryVMMCLI {
             env: request.env
         )
 
-        fputs("[run-box] booting with egress bridge: vsock 0x\(String(format: "%08X", egressConfig.hostPort)) -> \(egressConfig.proxyListenAddress):\(egressConfig.proxyListenPort)\n", stderr)
+        fputs("[run-box] booting with egress: guest \(egressConfig.guestSocketPath) -> host UDS \(egressConfig.hostProxyUdsPath)\n", stderr)
 
         let result = try await launcher.launchWithEgress(
             containerId: containerId,
@@ -229,8 +227,7 @@ struct RunBoxCLIRequest: Codable {
     let memoryBytes: UInt64?
     let rootfsPins: [SanctuaryArtifactPin]?
     let egressVsockPort: UInt32?
-    let egressProxyHost: String?
-    let egressProxyPort: UInt16
+    let egressProxyUdsPath: String
     let egressGuestSocketPath: String?
     let command: String
     let args: [String]

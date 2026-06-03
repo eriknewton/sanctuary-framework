@@ -49,8 +49,12 @@ export interface VMRunBoxRequest {
     cpuCount?: number;
     memoryBytes?: number;
     egressVsockPort?: number;
-    egressProxyHost?: string;
-    egressProxyPort: number;
+    /**
+     * Host-side Unix socket path the egress allowlist proxy (egress-proxy.ts)
+     * listens on. The guest reaches it via Apple's `.into` socket relay
+     * (guest UDS -> vsock -> this host UDS); see SanctuaryVsockEgressConfig.
+     */
+    egressProxyUdsPath: string;
     egressGuestSocketPath?: string;
     rootfsPins?: Array<{ sha256: string; artifact: string }>;
   };
