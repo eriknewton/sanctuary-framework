@@ -20,3 +20,4 @@ export * from "./decision/index.js";
 export * from "./failure/index.js";
 export * from "./approval/index.js";
 export * from "./runtime/index.js";
+export * from "./egress-proxy.js";
