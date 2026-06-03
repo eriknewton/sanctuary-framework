@@ -47,7 +47,7 @@ import { gatherReputationEvidence } from "../shr/tools.js";
 import { ReputationStore } from "../reputation/reputation-store.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { RecognitionReputationEvidence } from "./posture.js";
-import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
+import { generateDashboardHTML, generateLoginHTML, generateFleetSwitcherHTML } from "./dashboard-html.js";
 import { generateFortressViewHTML } from "../wrap/fortress-view.js";
 import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer } from "../sovereignty-profile.js";
 import { generateSystemPrompt } from "../system-prompt-generator.js";
@@ -206,6 +206,13 @@ export interface DashboardConfig {
   };
   /** Auto-open the dashboard in the default browser on startup. Default: true for localhost. */
   auto_open?: boolean;
+  /**
+   * C1: Allow plaintext HTTP on non-loopback interfaces. Default: false.
+   * When false (default), non-loopback binding requires TLS. Set to true
+   * ONLY for tailnet or other encrypted-transport environments where the
+   * network layer already provides encryption.
+   */
+  allow_plaintext_remote?: boolean;
 }
 
 interface PendingRequest {
@@ -317,6 +324,7 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     path === "/dashboard" ||
     path === "/v1.0" ||
     path === "/fortress" ||
+    path === "/fleet" ||
     path === "/events" ||
     path === POSTURE_HOME_PATH ||
     // The posture SSE live-refresh stream is a single long-lived connection per
@@ -2537,9 +2545,46 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * C1: is this dashboard binding to a non-loopback interface?
+   */
+  private isRemoteBinding(): boolean {
+    const h = this.config.host;
+    return h !== "127.0.0.1" && h !== "::1" && h !== "localhost";
+  }
+
+  /**
    * Start the HTTP(S) server for the dashboard.
    */
   async start(): Promise<void> {
+    // C1: enforce TLS for non-loopback bindings. Plaintext approve/deny
+    // over the wire is a credential-theft vector. The operator can opt
+    // out via allow_plaintext_remote for tailnet/VPN environments where
+    // the network layer already encrypts.
+    if (this.isRemoteBinding() && !this.useTLS && !this.config.allow_plaintext_remote) {
+      throw new Error(
+        `Sanctuary Dashboard: refusing to start on non-loopback interface ` +
+        `${this.config.host} without TLS.\n\n` +
+        `  Approve/deny decisions over plaintext HTTP expose the auth token\n` +
+        `  and operator decisions to network observers.\n\n` +
+        `  Options:\n` +
+        `    1. Configure TLS: set dashboard.tls.cert_path + dashboard.tls.key_path\n` +
+        `       (for Tailscale: tailscale cert <hostname>)\n` +
+        `    2. Set dashboard.allow_plaintext_remote: true if the network\n` +
+        `       layer already encrypts (e.g. Tailscale, WireGuard)\n` +
+        `    3. Bind to 127.0.0.1 (localhost only)\n`
+      );
+    }
+
+    // C1: enforce auth token for non-loopback bindings. Without a token,
+    // anyone who can reach the interface can approve/deny agent operations.
+    if (this.isRemoteBinding() && !this.authToken) {
+      this.authToken = randomBytes(32).toString("hex");
+      process.stderr.write(
+        `\n  C1: Non-loopback binding requires authentication.\n` +
+        `  Auto-generated auth token (use this to connect from remote machines).\n\n`
+      );
+    }
+
     const handler = (req: IncomingMessage, res: ServerResponse) => this.handleRequest(req, res);
 
     let server;
@@ -3024,12 +3069,29 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const method = req.method ?? "GET";
 
-    // CORS headers - restrict to same-origin; the dashboard is served by this server
+    // CORS headers - restrict to same-origin; the dashboard is served by this server.
+    // C1: when bound to a non-loopback or wildcard interface, the browser's
+    // Origin will use the IP/hostname it connected to, which may differ from
+    // config.host (e.g. config.host=0.0.0.0 but browser sees 100.x.y.z).
+    // For authenticated requests from non-loopback origins, reflect the
+    // Origin since the auth layer already gates access.
     const origin = req.headers.origin;
     const protocol = this.useTLS ? "https" : "http";
     const selfOrigin = `${protocol}://${this.config.host}:${this.config.port}`;
     if (origin === selfOrigin) {
       res.setHeader("Access-Control-Allow-Origin", origin);
+    } else if (origin && this.isRemoteBinding()) {
+      // C1: for non-loopback bindings, the browser may connect via a
+      // different IP/hostname than config.host. Auth gates access, so
+      // reflecting the origin for same-port requests is safe.
+      try {
+        const originUrl = new URL(origin);
+        if (originUrl.port === String(this.config.port) || (!originUrl.port && this.config.port === (this.useTLS ? 443 : 80))) {
+          res.setHeader("Access-Control-Allow-Origin", origin);
+        }
+      } catch {
+        // Invalid origin - no CORS header
+      }
     }
     // When no origin header (same-origin requests), no CORS header needed
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -3523,7 +3585,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     try {
-      if (method === "GET" && url.pathname === "/fortress") {
+      if (method === "GET" && url.pathname === "/fleet") {
+        this.serveFleetSwitcher(res);
+      } else if (method === "GET" && url.pathname === "/fortress") {
         this.serveFortressView(res);
       } else if (method === "GET" && url.pathname === "/v1.0") {
         // v1.1.7: legacy v1.0 dashboard preserved at /v1.0. Root serves the
@@ -4271,6 +4335,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         res.end(JSON.stringify({ error: "Invalid request" }));
       }
     });
+  }
+
+  // ── Fleet Switcher (C1) ─────────────────────────────────────────────
+
+  /**
+   * C1: Serve the fleet switcher page. Client-side localStorage manages
+   * the saved list of machine endpoints; no server-side state.
+   */
+  private serveFleetSwitcher(res: ServerResponse): void {
+    const protocol = this.useTLS ? "https" : "http";
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+    });
+    res.end(generateFleetSwitcherHTML({
+      serverVersion: PKG_VERSION,
+      protocol,
+      currentHost: this.config.host,
+      currentPort: this.config.port,
+    }));
   }
 
   // ── SSE Broadcasting ────────────────────────────────────────────────
