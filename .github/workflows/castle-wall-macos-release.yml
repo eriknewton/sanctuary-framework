@@ -12,7 +12,13 @@ on:
 
 jobs:
   build-sign-notarize:
-    runs-on: macos-latest
+    # macOS 26 runner required: castle-wall-macos/Package.swift declares
+    # .macOS("26.0") + tools 6.2 and depends on Apple's Containerization library
+    # (README: macOS 26). Older runners (macos-15 / Xcode 16.x ship Swift 6.1 +
+    # the macOS 15 SDK) fail at toolchain resolution and cannot compile against
+    # the macOS 26 SDK, regardless of an installed toolchain. Matches the
+    # PR-check workflow (castle-wall-macos.yml, PR #376) and COWORK lesson #78.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
