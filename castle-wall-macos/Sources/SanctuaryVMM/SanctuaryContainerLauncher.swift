@@ -129,18 +129,19 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
         let stdoutCapture = CaptureWriter()
         let stderrCapture = CaptureWriter()
 
+        let launchConfig = self.config
         let container = try await manager.create(
             containerId,
-            reference: config.ociImageReference,
-            rootfsSizeInBytes: Int(config.rootfsSizeBytes),
+            reference: launchConfig.ociImageReference,
+            rootfsSizeInBytes: launchConfig.rootfsSizeBytes,
             networking: false
-        ) { [config] @Sendable cfg in
-            cfg.cpus = config.cpuCount
-            cfg.memoryInBytes = UInt64(config.memoryBytes)
+        ) { @Sendable cfg in
+            cfg.cpus = launchConfig.cpuCount
+            cfg.memoryInBytes = launchConfig.memoryBytes
             cfg.process.arguments = [request.command] + request.args
             cfg.process.workingDirectory = request.cwd
             for (key, value) in request.env {
-                cfg.process.environment[key] = value
+                cfg.process.environmentVariables.append("\(key)=\(value)")
             }
             cfg.process.stdout = stdoutCapture
             cfg.process.stderr = stderrCapture

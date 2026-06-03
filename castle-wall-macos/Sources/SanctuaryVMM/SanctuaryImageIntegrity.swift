@@ -16,7 +16,7 @@ public enum SanctuaryImageIntegrityError: Error, Equatable {
 ///   - Post-unpack, pre-VM-boot: hash the assembled rootfs.ext4
 ///   - The OCI content-addressing already verified per-layer digests
 ///   - We verify the whole-image digest to catch tampering between unpack and boot
-public struct SanctuaryArtifactPin: Equatable, Codable {
+public struct SanctuaryArtifactPin: Equatable, Codable, Sendable {
     public let sha256: String
     public let artifact: String
 
