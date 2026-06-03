@@ -28,7 +28,12 @@ on:
 
 jobs:
   castle-wall-macos:
-    runs-on: macos-latest
+    # macOS 26 runner required: castle-wall-macos/Package.swift declares
+    # .macOS("26.0") and depends on Apple's Containerization library (README:
+    # macOS 26, Swift tools 6.2). Older runners (macos-15 / Xcode 16.x ship
+    # Swift 6.1 + the macOS 15 SDK) cannot resolve the 6.2 tools version nor
+    # compile against the macOS 26 SDK, regardless of an installed toolchain.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
@@ -38,21 +43,13 @@ jobs:
           xcodebuild -version
           swift --version
 
-      - name: xcodebuild list (verify SwiftPM scheme generation)
+      # Compile-check via SwiftPM (lesson #77: swift build --build-tests + swift
+      # test is the canonical gate; xcodebuild scheme builds are not used —
+      # SwiftPM auto-generated executable schemes are not test-action-configured,
+      # and the 6.2 tools version needs Xcode 26's toolchain anyway).
+      - name: swift build (compile all targets + tests)
         working-directory: castle-wall-macos
-        run: xcodebuild -list
-
-      - name: xcodebuild build (CastleWallExtension scheme)
-        working-directory: castle-wall-macos
-        run: |
-          xcodebuild build \
-            -scheme CastleWallExtension \
-            -destination 'platform=macOS' \
-            -derivedDataPath build \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            ONLY_ACTIVE_ARCH=YES
+        run: swift build --build-tests
 
       - name: swift test (run XCTest suites via SwiftPM)
         working-directory: castle-wall-macos
@@ -70,7 +67,7 @@ jobs:
       - name: assemble unsigned .app bundle (CI parity with operator build)
         working-directory: castle-wall-macos
         # The build-signed.sh script's signing path is intentionally
-        # skipped in CI: macos-latest runners do not have the operator's
+        # skipped in CI: macos-26 runners do not have the operator's
         # Developer-ID Application cert in their keychain, and shipping
         # the cert into CI would expose it to the workflow's broad
         # action permissions. CI runs only assembly + structure checks;
