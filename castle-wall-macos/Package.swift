@@ -144,5 +144,10 @@ let package = Package(
             dependencies: ["SanctuaryVMM"],
             path: "Tests/SanctuaryVMMTests"
         ),
-    ]
+    ],
+    // Tools 6.2 (required by apple/containerization 0.33.3) defaults to Swift 6
+    // strict-concurrency-as-error; pin to Swift 5 mode so the pre-existing
+    // CastleWall targets compile as they did on main (the B1 tools-version bump
+    // otherwise breaks CastleWallIPC et al.).
+    swiftLanguageModes: [.v5]
 )
