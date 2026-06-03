@@ -15,6 +15,7 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { AuditLog, type AuditEntry } from "../l2-operational/audit-log.js";
 import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
 import type {
   CastleWallMessage,
   DecisionResponse,
@@ -428,6 +429,87 @@ export async function runAuditDump(
     for (const entry of query.entries.filter(isCastleWallAuditEntry)) {
       write(out, JSON.stringify(entry) + "\n");
     }
+    return 0;
+  } catch (error) {
+    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}
+
+export async function runConfigureOrigin(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {}
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+  const originPath = join(fortressPath, "policy", "egress", "agent-origin.json");
+
+  // Parse remaining positional args: configure-origin <mode> [options]
+  // Usage:
+  //   castle-wall configure-origin uid --agent-uid=502 [--ceiling=500]
+  //   castle-wall configure-origin nat --signing-id=ai.sanctuaryprotocol.egress-helper [--team-id=YFQSWQ9BJN] [--ceiling=500]
+  const modeArg = argv.find((a) => a === "uid" || a === "nat");
+  if (!modeArg) {
+    write(err, "Usage: castle-wall configure-origin <uid|nat> [options]\n");
+    write(err, "  uid mode: --agent-uid=<uid> [--ceiling=<uid>]\n");
+    write(err, "  nat mode: --signing-id=<id> [--team-id=<id>] [--ceiling=<uid>]\n");
+    return 2;
+  }
+
+  const getFlag = (name: string): string | undefined => {
+    const prefix = `--${name}=`;
+    const match = argv.find((a) => a.startsWith(prefix));
+    return match ? match.slice(prefix.length) : undefined;
+  };
+
+  const candidate: Record<string, unknown> = {
+    mode: modeArg,
+    system_uid_allow_ceiling: parseInt(getFlag("ceiling") ?? "500", 10),
+  };
+
+  if (modeArg === "uid") {
+    const uidStr = getFlag("agent-uid");
+    if (!uidStr) {
+      write(err, "Error: uid mode requires --agent-uid=<uid>\n");
+      return 2;
+    }
+    candidate.agent_uid = parseInt(uidStr, 10);
+  } else {
+    const signingId = getFlag("signing-id");
+    const teamId = getFlag("team-id");
+    if (!signingId && !teamId) {
+      write(err, "Error: nat mode requires --signing-id=<id> and/or --team-id=<id>\n");
+      return 2;
+    }
+    if (signingId) candidate.egress_helper_signing_id = signingId;
+    if (teamId) candidate.egress_helper_team_id = teamId;
+    const portRange = getFlag("port-range");
+    if (portRange) {
+      const parts = portRange.split("-").map(Number);
+      if (parts.length === 2) candidate.agent_runtime_port_range = parts;
+    }
+  }
+
+  const validated = validateAgentOrigin(candidate);
+  if (validated === null) {
+    write(err, "Error: agent-origin descriptor is structurally invalid.\n");
+    return 1;
+  }
+
+  try {
+    await mkdir(join(fortressPath, "policy", "egress"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    await writeFile(originPath, JSON.stringify(validated, null, 2) + "\n", {
+      mode: 0o600,
+    });
+    write(out, `Agent origin configured: mode=${validated.mode}\n`);
+    write(out, `Written to: ${originPath}\n`);
+    write(out, "Run 'sanctuary castle-wall reload' to apply.\n");
     return 0;
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);

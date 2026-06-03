@@ -215,6 +215,11 @@ export class MacOSFlowEventConsumer {
     }
     const eventType =
       notification.decision === "allow" ? "egress_allowed" : "egress_blocked";
+    // SECURITY (property #11): rule_id is NEVER written to the agent-accessible
+    // audit log. An agent that can query audit entries must not learn which rules
+    // matched (operator_passthrough, specific rule ids) -- that would let it map
+    // the essentials list by probing. Per-rule detail is available to the operator
+    // via the sysext's os_log trail and Castle Wall CLI diagnostics.
     this.auditSink.append(
       CASTLE_WALL_AUDIT_LAYER,
       eventType,
@@ -223,7 +228,7 @@ export class MacOSFlowEventConsumer {
         agent: notification.agent,
         destination: notification.destination,
         decision: notification.decision,
-        rule_id: notification.matched_rule_id ?? null,
+        rule_id: null,
         recorded_at: notification.recorded_at,
         source: "macos_extension",
       },

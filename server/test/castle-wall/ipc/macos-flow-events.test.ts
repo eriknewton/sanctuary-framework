@@ -259,7 +259,9 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     expect(entry?.operation).toBe("egress_allowed");
     expect(entry?.identityId).toBe("agent-7");
     expect(entry?.result).toBe("success");
-    expect(entry?.details?.rule_id).toBe("rule-anthropic");
+    // Property #11: rule_id is ALWAYS redacted from audit entries to prevent
+    // agents from mapping the essentials list by probing.
+    expect(entry?.details?.rule_id).toBeNull();
     expect(entry?.details?.source).toBe("macos_extension");
     expect(consumer.getStats().decisionsRecorded).toBe(1);
     expect(consumer.getStats().decisionsRejected).toBe(0);

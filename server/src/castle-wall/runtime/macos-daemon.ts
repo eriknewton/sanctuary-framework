@@ -8,6 +8,7 @@ import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.j
 import type { AuditLog } from "../../l2-operational/audit-log.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { validateRule } from "../allowlist/schema.js";
+import { validateAgentOrigin } from "../allowlist/agent-origin.js";
 import { verifyManifestSignature } from "../allowlist/parse.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
 import type {
@@ -43,6 +44,13 @@ export interface MacOSCastleWallDaemonInput {
   socketPath?: string;
   activeConfigPath?: string;
   listenerFactory?: (options: MacOSCastleWallListenerOptions) => MacOSCastleWallListenerHandle;
+  /**
+   * Optional agent-origin descriptor (config / test fixture). When absent,
+   * the daemon loads `policy/egress/agent-origin.json` from the fortress
+   * directory. When BOTH are absent, the manifest omits the field and the
+   * sysext classifies every flow as `.agent` (machine-wide default-deny).
+   */
+  agentOrigin?: unknown;
 }
 
 export type MacOSCastleWallListenerOptions = ConstructorParameters<
@@ -101,10 +109,12 @@ export async function startMacOSCastleWallDaemon(
   const signingKey = await loadSigningKey(input.fortressPath, input.masterKey);
   await writeSystemPinnedPublicKey(signingKey.publicKey);
   const pinnedPublicKeySha256 = sha256Hex(signingKey.publicKey);
+  const agentOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
   let manifestState = await loadManifestState({
     fortressPath: input.fortressPath,
     fortressId: input.fortressId,
     signingKey,
+    agentOrigin,
   });
   const pendingRequests = new Set<string>();
   let listener: MacOSCastleWallListenerHandle;
@@ -199,10 +209,12 @@ export async function startMacOSCastleWallDaemon(
     request?: PolicyReloadRequest,
   ): Promise<PolicyReloadResponse> {
     try {
+      const reloadedOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
       manifestState = await loadManifestState({
         fortressPath: input.fortressPath,
         fortressId: input.fortressId,
         signingKey,
+        agentOrigin: reloadedOrigin,
       });
       const emitted = await listener.broadcastManifestUpdate();
       await input.auditLog.append(
@@ -265,6 +277,43 @@ export async function startMacOSCastleWallDaemon(
   };
 }
 
+const AGENT_ORIGIN_FILENAME = "agent-origin.json";
+
+/**
+ * Resolve the agent-origin descriptor from config: prefer the explicit input,
+ * fall back to `policy/egress/agent-origin.json` in the fortress. Returns
+ * `undefined` when no descriptor is available (manifest omits the field =>
+ * sysext classifies everything `.agent`).
+ */
+async function resolveAgentOrigin(
+  fortressPath: string,
+  explicitInput: unknown,
+): Promise<unknown> {
+  if (explicitInput !== undefined) {
+    return explicitInput;
+  }
+  const filePath = join(fortressPath, "policy", "egress", AGENT_ORIGIN_FILENAME);
+  try {
+    const raw = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    const validated = validateAgentOrigin(parsed);
+    if (validated === null) {
+      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+      console.warn(
+        `[castle-wall] warning: ${AGENT_ORIGIN_FILENAME} is structurally invalid; ignoring (classify-all-agent fallback)`,
+      );
+      return undefined;
+    }
+    return validated;
+  } catch (err) {
+    const code = err instanceof Error && "code" in err
+      ? (err as NodeJS.ErrnoException).code
+      : undefined;
+    if (code === "ENOENT") return undefined;
+    throw err;
+  }
+}
+
 async function loadSigningKey(
   fortressPath: string,
   masterKey: Uint8Array,
@@ -314,6 +363,7 @@ async function loadManifestState(input: {
   fortressPath: string;
   fortressId: string;
   signingKey: LoadedSigningKey;
+  agentOrigin?: unknown;
 }): Promise<ManifestState> {
   const rulesDir = join(input.fortressPath, "policy", "egress", "rules");
   const rules: AllowlistRule[] = [];
@@ -341,6 +391,7 @@ async function loadManifestState(input: {
     issuedAt: new Date().toISOString(),
     rules,
     signingKey: input.signingKey,
+    agentOrigin: input.agentOrigin,
   });
   const verifyResult = verifyManifestSignature(signed, input.signingKey.publicKey);
   if (!verifyResult.ok) {
