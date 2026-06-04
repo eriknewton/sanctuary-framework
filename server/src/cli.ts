@@ -739,6 +739,11 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runConfigureOrigin(args.slice(1));
   }
 
+  if (command === "daemon") {
+    const { runDaemon } = await import("./cli/castle-wall.js");
+    return runDaemon();
+  }
+
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `Unknown subcommand: ${command}. Try: sanctuary castle-wall --help`
@@ -763,6 +768,7 @@ function printCastleWallHelp(): void {
     audit-dump       Emit Castle Wall audit events as JSONL.
     approve          Approve a pending Castle Wall request.
     configure-origin Configure the agent-origin descriptor for origin-differential enforcement.
+    daemon           Start the enforcement daemon standalone (existing fortress key); foreground until Ctrl-C.
 
   Options:
     --help, -h   Show this help
