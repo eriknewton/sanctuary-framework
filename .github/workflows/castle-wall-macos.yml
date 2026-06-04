@@ -28,12 +28,14 @@ on:
 
 jobs:
   castle-wall-macos:
-    # macOS 26 runner required: castle-wall-macos/Package.swift declares
-    # .macOS("26.0") and depends on Apple's Containerization library (README:
-    # macOS 26, Swift tools 6.2). Older runners (macos-15 / Xcode 16.x ship
-    # Swift 6.1 + the macOS 15 SDK) cannot resolve the 6.2 tools version nor
-    # compile against the macOS 26 SDK, regardless of an installed toolchain.
-    runs-on: macos-26
+    # The enforcement package (sysext, host app, packet filter, IPC library)
+    # has a macOS-13 floor and NO Apple Containerization dependency (that VM
+    # runtime now lives in the sibling `castle-wall-vmm` package, built on
+    # macos-26 by castle-wall-vmm.yml). Building here on macos-latest is the
+    # regression guard for the floor itself: it proves the shipped sysext still
+    # compiles on the Xcode/Swift toolchain operators actually run, so the
+    # macOS-26-only build bug (A1 drill, 2026-06-04) cannot recur.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
 
