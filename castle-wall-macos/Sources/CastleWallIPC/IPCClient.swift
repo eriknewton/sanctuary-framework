@@ -77,25 +77,42 @@ public final class IPCClient {
     private var messageListener: IPCMessageListener?
     private var transportClosedListener: ((IPCClientError) -> Void)?
     private let socketConnector: (String) throws -> Int32
+    /// Optional closure that re-resolves the daemon socket path on EVERY
+    /// `start()`. The macOS daemon writes its authoritative socket path to the
+    /// active-config file only once it is up; on a fresh boot the sysext starts
+    /// first and would otherwise freeze a stale (home-default) path for the
+    /// connection's lifetime, so the reconnect loop spins forever against a
+    /// socket that never appears and audit telemetry never reaches the daemon
+    /// (Finding B, A1 drill 2026-06-04). Re-resolving per attempt lets the
+    /// reconnect loop converge on the daemon's real path once it appears. When
+    /// nil, `options.path` is used (the legacy fixed-path behavior).
+    private let pathResolver: (() -> String)?
 
-    public init(options: IPCClientOptions, pinnedPublicKey: Data) {
+    public init(
+        options: IPCClientOptions,
+        pinnedPublicKey: Data,
+        pathResolver: (() -> String)? = nil
+    ) {
         self.options = options
         self.pinnedPublicKey = pinnedPublicKey
         self.queue = DispatchQueue(label: "ai.sanctuaryprotocol.castle-wall.ipc-client")
         self.socketConnector = { path in
             try IPCClient.connectUDS(path: path)
         }
+        self.pathResolver = pathResolver
     }
 
     init(
         options: IPCClientOptions,
         pinnedPublicKey: Data,
-        socketConnector: @escaping (String) throws -> Int32
+        socketConnector: @escaping (String) throws -> Int32,
+        pathResolver: (() -> String)? = nil
     ) {
         self.options = options
         self.pinnedPublicKey = pinnedPublicKey
         self.queue = DispatchQueue(label: "ai.sanctuaryprotocol.castle-wall.ipc-client")
         self.socketConnector = socketConnector
+        self.pathResolver = pathResolver
     }
 
     /// Raw Ed25519 public key bytes pinned for the fortress identity.
@@ -213,7 +230,17 @@ public final class IPCClient {
             throw IPCClientError.alreadyStarted
         }
 
-        let fd = try socketConnector(options.path)
+        // Re-resolve the socket path on every attempt so a reconnect after the
+        // daemon (re)starts converges on its newly-published path instead of a
+        // path frozen at first bootstrap (Finding B).
+        let bootstrapPath = options.path
+        let path = pathResolver?() ?? bootstrapPath
+        if path != bootstrapPath {
+            CastleWallLog.lifecycle.notice(
+                "ipc start re-resolved socket path: \(path) (bootstrap path was \(bootstrapPath))"
+            )
+        }
+        let fd = try socketConnector(path)
         socketFD = fd
 
         return try await withCheckedThrowingContinuation { continuation in

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
-import { createConnection, type Socket } from "node:net";
+import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -222,6 +222,62 @@ describe("Castle Wall macOS daemon integration", () => {
         listenerFactory: fakeListenerFactory,
       }),
     ).rejects.toThrow(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
+  });
+
+  it("unlinks a stale socket left by a crash/reboot and starts (Finding A)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const configPath = activeConfigPath(fortressPath);
+    const socketPath = join(fortressPath, "castle.sock");
+    // A reboot or `kill -9` leaves the socket path on disk with no live owner
+    // (the graceful SIGTERM unlink never ran). The old guard refused on
+    // file-existence alone, wedging every restart; the daemon must now detect
+    // the absence of a live listener, unlink the stale path, and start.
+    await writeFile(socketPath, "");
+
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      auditLog,
+      platform: "darwin",
+      socketPath,
+      activeConfigPath: configPath,
+      listenerFactory: fakeListenerFactory,
+    });
+
+    expect(handle.socketPath).toBe(socketPath);
+    await handle.stop();
+  });
+
+  it("refuses to start when a live process is listening on the socket (Finding A)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const configPath = activeConfigPath(fortressPath);
+    const socketPath = join(fortressPath, "castle.sock");
+    // A genuine running daemon accepts connections on the socket; startup must
+    // still refuse in that case (liveness, not file-existence, is the signal).
+    const liveServer = createServer((socket) => socket.destroy());
+    await new Promise<void>((resolve, reject) => {
+      liveServer.once("error", reject);
+      // port-discipline: ignore — socketPath is a unix-domain socket path, not a TCP port
+      liveServer.listen(socketPath, () => resolve());
+    });
+
+    try {
+      await expect(
+        startMacOSCastleWallDaemon({
+          fortressPath,
+          fortressId: "fortress-test",
+          masterKey,
+          auditLog,
+          platform: "darwin",
+          socketPath,
+          activeConfigPath: configPath,
+          listenerFactory: fakeListenerFactory,
+        }),
+      ).rejects.toThrow(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
+    } finally {
+      await new Promise<void>((resolve) => liveServer.close(() => resolve()));
+    }
   });
 
   it("lets a sysext-style client read active config, connect, and receive handshake", async () => {
