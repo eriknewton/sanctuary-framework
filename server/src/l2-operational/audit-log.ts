@@ -9,8 +9,9 @@
  * can inspect what their agent has done.
  */
 
-import { mkdir, open, rm } from "node:fs/promises";
+import { mkdir, open, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { uptime as osUptime } from "node:os";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type {
   FilesystemStorageCapabilities,
@@ -119,6 +120,23 @@ const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
 const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
+
+/** True iff `pid` names a live process this user could signal. Used to detect a
+ * stale audit-write lock left by a crashed/killed holder. */
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code =
+      err instanceof Error && "code" in err
+        ? (err as NodeJS.ErrnoException).code
+        : undefined;
+    // EPERM: the process exists but belongs to another user — still alive.
+    return code === "EPERM";
+  }
+}
 
 /**
  * Operation-name constants for the v0.10.0 Secret Broker (L3 Selective
@@ -611,6 +629,14 @@ export class AuditLog {
             ? String((err as NodeJS.ErrnoException).code)
             : "";
         if (code !== "EEXIST") throw err;
+        // The lock file exists. A non-graceful exit (crash / kill -9 / reboot)
+        // strands it with a dead holder — the graceful `rm` below never ran — so
+        // the next daemon would block the full timeout and fail to (re)start.
+        // Break a PROVABLY-stale lock and retry immediately; never break a lock
+        // a live process holds.
+        if (await this.breakStaleAuditLock(this.auditWriteLockPath)) {
+          continue;
+        }
         if (Date.now() - started >= AUDIT_WRITE_LOCK_TIMEOUT_MS) {
           throw new AuditLockContentionError(this.auditWriteLockPath);
         }
@@ -623,6 +649,58 @@ export class AuditLog {
     } finally {
       await rm(this.auditWriteLockPath, { force: true });
     }
+  }
+
+  /**
+   * Break the audit-write lock iff it is PROVABLY stale, returning true when a
+   * stale lock was removed. Staleness is proven two ways, both robust:
+   *
+   *   - The lock's `acquired_at` predates the current system boot. A lock that
+   *     survived a reboot is definitionally orphaned, and this is immune to PID
+   *     reuse (the recorded PID may now belong to an unrelated process).
+   *   - The recorded holder PID is not alive. Covers a same-boot crash / kill
+   *     before the PID has been reused.
+   *
+   * A lock held by a live process acquired during this boot is left untouched
+   * (legitimate contention). An unreadable / corrupt / pid-less lock cannot be
+   * proven stale, so it is also left untouched (fail-safe: never break a lock we
+   * cannot prove is dead). Fixes the daemon-cannot-restart-after-reboot defect
+   * surfaced by the A1 acceptance drill (2026-06-04, reboot 2).
+   */
+  private async breakStaleAuditLock(lockPath: string): Promise<boolean> {
+    let holderPid: number | undefined;
+    let acquiredAtMs: number | undefined;
+    try {
+      const raw = await readFile(lockPath, "utf8");
+      const parsed = JSON.parse(raw) as { pid?: unknown; acquired_at?: unknown };
+      if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid)) {
+        holderPid = parsed.pid;
+      }
+      if (typeof parsed.acquired_at === "string") {
+        const t = Date.parse(parsed.acquired_at);
+        if (!Number.isNaN(t)) acquiredAtMs = t;
+      }
+    } catch (err) {
+      const code =
+        err instanceof Error && "code" in err
+          ? String((err as NodeJS.ErrnoException).code)
+          : "";
+      // Vanished between open() and read(): another writer released it; retry.
+      if (code === "ENOENT") return true;
+      // Unreadable / corrupt content: cannot prove staleness — do not break.
+      return false;
+    }
+
+    if (holderPid === process.pid) return false;
+
+    const bootTimeMs = Date.now() - osUptime() * 1000;
+    const predatesBoot = acquiredAtMs !== undefined && acquiredAtMs < bootTimeMs;
+    const holderDead = holderPid !== undefined && !isProcessAlive(holderPid);
+    if (!predatesBoot && !holderDead) return false;
+
+    // Best-effort removal; ignore a race where another writer already cleared it.
+    await rm(lockPath, { force: true });
+    return true;
   }
 
   private async freshenChainStateFromDisk(): Promise<void> {
