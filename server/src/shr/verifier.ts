@@ -10,7 +10,7 @@
 
 import type { SignedSHR, SHRVerificationResult, SHRBody } from "./types.js";
 import { canonicalizeForSigning } from "./types.js";
-import { verify } from "../core/identity.js";
+import { verify, generateIdentityId } from "../core/identity.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
 
@@ -74,6 +74,19 @@ export function verifySHR(
     const signatureValid = verify(payload, signatureBytes, publicKey);
     if (!signatureValid) {
       errors.push("Invalid signature — SHR may have been tampered with");
+    }
+
+    // 3a. Identity binding (HS-1 fix): instance_id MUST be the
+    // self-certifying commitment to signed_by. instance_id is defined as
+    // generateIdentityId(pubkey) = SHA-256(pubkey)[:16] hex (core/identity.ts,
+    // shr/generator.ts:261). A signed-but-self-issued SHR claiming someone
+    // else's instance_id therefore fails here: an attacker would need a key
+    // whose SHA-256[:16] equals the victim's id (128-bit second preimage).
+    const expectedId = generateIdentityId(publicKey);
+    if (expectedId !== shr.body.instance_id) {
+      errors.push(
+        "instance_id is not bound to signed_by — SHR identity is not self-certifying"
+      );
     }
   } catch (e) {
     errors.push(`Signature verification failed: ${(e as Error).message}`);

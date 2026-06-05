@@ -71,6 +71,7 @@ function makeHandshakeResult(overrides: Partial<HandshakeResult> = {}): Handshak
     completed_at: new Date().toISOString(),
     expires_at: new Date(Date.now() + 3600000).toISOString(),
     errors: [],
+    liveness_proven: true,
     ...overrides,
   };
 }

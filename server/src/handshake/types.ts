@@ -65,6 +65,14 @@ export interface HandshakeResult {
   completed_at: string;
   expires_at: string;         // Validity window (from SHR expiry)
   errors: string[];
+  /**
+   * True only when the counterparty proved key-control + liveness via the
+   * nonce-bearing 4-step protocol. The one-shot `handshake_exchange` is a
+   * structural preview only and ALWAYS sets this false — federation
+   * registration requires liveness_proven:true so a preview can never be
+   * promoted to a trusted peer (HS-2 / HS-3 defense in depth).
+   */
+  liveness_proven: boolean;
 }
 
 /**
@@ -73,11 +81,19 @@ export interface HandshakeResult {
 export interface HandshakeSession {
   session_id: string;
   role: "initiator" | "responder";
-  state: "initiated" | "responded" | "completed" | "failed";
+  state: "initiated" | "responded" | "completed" | "failed" | "expired";
   our_nonce: string;
   their_nonce?: string;
   our_shr: SignedSHR;
   their_shr?: SignedSHR;
   initiated_at: string;
+  /**
+   * Server-anchored expiry. Set to (server receipt time + TTL) when the
+   * session is created/advanced — NOT derived from any counterparty-supplied
+   * timestamp, which a malicious initiator could set in the future to defeat
+   * the TTL (HS-2). After this instant the session is single-use-terminal:
+   * `expired`, and the nonce can never be reused.
+   */
+  expires_at: string;         // ISO 8601, server-time anchored
   result?: HandshakeResult;
 }

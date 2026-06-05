@@ -5,14 +5,23 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { generateRandomKey } from "../../src/core/random.js";
+import { generateRandomKey, randomBytes } from "../../src/core/random.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
-import { createIdentity } from "../../src/core/identity.js";
+import {
+  createIdentity,
+  generateIdentityId,
+} from "../../src/core/identity.js";
 import { generateSHR } from "../../src/shr/generator.js";
 import { verifySHR } from "../../src/shr/verifier.js";
 import { canonicalizeForSigning } from "../../src/shr/types.js";
 import { SIGNATURE_SCHEME_V1 } from "../../src/mesh/constants.js";
+import {
+  toBase64url,
+  fromBase64url,
+  stringToBytes,
+} from "../../src/core/encoding.js";
 import type { SignedSHR } from "../../src/shr/types.js";
 import type { SanctuaryConfig } from "../../src/config.js";
 import { defaultConfig } from "../../src/config.js";
@@ -233,6 +242,101 @@ describe("Sovereignty Health Report (SHR)", () => {
 
       // MVS has degraded L2 and L3, so overall should be "degraded"
       expect(result.sovereignty_level).toBe("degraded");
+    });
+  });
+
+  // ─── HS-1: instance_id ⇄ signed_by binding (forged-peer remediation) ──
+  describe("Identity binding (HS-1)", () => {
+    /**
+     * Forge an SHR: take a real, valid SHR, RE-SIGN its (unchanged) body with
+     * a brand-new keypair, and set signed_by to the fresh pubkey — but leave
+     * the victim's instance_id in the body. The signature is cryptographically
+     * valid against the fresh key, yet generateIdentityId(freshKey) !==
+     * instance_id, so verifySHR MUST reject it.
+     */
+    function forgeWithFreshKey(victim: SignedSHR): SignedSHR {
+      const freshPriv = randomBytes(32);
+      const freshPub = ed25519.getPublicKey(freshPriv);
+      const canonical = canonicalizeForSigning(victim.body);
+      const sig = ed25519.sign(stringToBytes(canonical), freshPriv);
+      return {
+        ...victim,
+        signed_by: toBase64url(freshPub), // attacker's key
+        signature: toBase64url(sig), // valid sig over the SAME body
+        // body (incl. victim instance_id) is left untouched
+      };
+    }
+
+    it("rejects an SHR whose instance_id is not generateIdentityId(signed_by)", () => {
+      const victim = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+      }) as SignedSHR;
+
+      const forged = forgeWithFreshKey(victim);
+
+      // The forged signature DOES verify against its own (fresh) key, so the
+      // ONLY check that can reject it is the identity binding: the fresh key's
+      // derived id differs from the victim instance_id left in the body.
+      const forgedKeyId = generateIdentityId(fromBase64url(forged.signed_by));
+      expect(forgedKeyId).not.toBe(forged.body.instance_id);
+
+      const result = verifySHR(forged);
+      expect(result.valid).toBe(false);
+      expect(
+        result.errors.some((e) => e.includes("not bound to signed_by"))
+      ).toBe(true);
+    });
+
+    it("accepts an SHR whose instance_id correctly derives from signed_by", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+      }) as SignedSHR;
+
+      // Self-consistent by construction (generator sets instance_id =
+      // identity.identity_id = generateIdentityId(pubkey)).
+      const result = verifySHR(shr);
+      expect(result.valid).toBe(true);
+      expect(
+        result.errors.some((e) => e.includes("not bound to signed_by"))
+      ).toBe(false);
+    });
+
+    it("rejects a self-minted SHR claiming a victim's instance_id", () => {
+      // Attacker mints their own self-consistent identity, then swaps in the
+      // victim's instance_id while signing with the attacker key.
+      const victim = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+      }) as SignedSHR;
+      const victimId = victim.body.instance_id;
+
+      // Attacker's own fresh keypair + SHR over a body claiming victimId.
+      const attackerPriv = randomBytes(32);
+      const attackerPub = ed25519.getPublicKey(attackerPriv);
+      const forgedBody = { ...victim.body, instance_id: victimId };
+      const canonical = canonicalizeForSigning(forgedBody);
+      const sig = ed25519.sign(stringToBytes(canonical), attackerPriv);
+
+      const forged: SignedSHR = {
+        body: forgedBody,
+        signed_by: toBase64url(attackerPub),
+        signature: toBase64url(sig),
+        signature_scheme: SIGNATURE_SCHEME_V1,
+      };
+
+      // The attacker would need a key whose SHA-256[:16] equals victimId.
+      expect(generateIdentityId(attackerPub)).not.toBe(victimId);
+
+      const result = verifySHR(forged);
+      expect(result.valid).toBe(false);
+      expect(
+        result.errors.some((e) => e.includes("not bound to signed_by"))
+      ).toBe(true);
     });
   });
 

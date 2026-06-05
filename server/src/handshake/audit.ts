@@ -44,6 +44,7 @@ export type HandshakeFailureReason =
   | "no_signing_identity"
   | "session_unknown"
   | "session_state_mismatch"
+  | "session_expired"
   | "other";
 
 /** Reasons a handshake may be aborted (operator or transport). */
