@@ -54,6 +54,20 @@ let package = Package(
             name: "CastleWallHostApp",
             targets: ["CastleWallHostApp"]
         ),
+        // A2/B2 helper-as-signer: a root SMAppService daemon owns the signing
+        // key; a code-signed shim relays the daemon's sign requests over XPC.
+        .library(
+            name: "CastleWallSigner",
+            targets: ["CastleWallSigner"]
+        ),
+        .executable(
+            name: "CastleWallSignerHelper",
+            targets: ["CastleWallSignerHelper"]
+        ),
+        .executable(
+            name: "CastleWallSignerClient",
+            targets: ["CastleWallSignerClient"]
+        ),
     ],
     targets: [
         .target(
@@ -100,6 +114,36 @@ let package = Package(
                 .linkedFramework("SystemExtensions"),
                 .linkedFramework("SwiftUI"),
             ]
+        ),
+        // A2/B2 helper-as-signer targets. CastleWallSigner is the shared,
+        // unit-testable core (key gen, raw Ed25519 sign/verify over OPAQUE
+        // bytes, root-only key + pin storage, code-requirement string, peer
+        // audit-token decode). It is deliberately macOS-13-compatible (no
+        // macOS-26-only symbol) so it stays on the macos-latest CI floor.
+        .target(
+            name: "CastleWallSigner",
+            path: "Sources/CastleWallSigner",
+            linkerSettings: [
+                // SecRequirementCreateWithString for the caller code-requirement.
+                .linkedFramework("Security"),
+                // audit_token_to_ruid/pid/pidversion for peer decode.
+                .linkedLibrary("bsm"),
+            ]
+        ),
+        .executableTarget(
+            name: "CastleWallSignerHelper",
+            dependencies: ["CastleWallSigner"],
+            path: "Sources/CastleWallSignerHelper"
+        ),
+        .executableTarget(
+            name: "CastleWallSignerClient",
+            dependencies: ["CastleWallSigner"],
+            path: "Sources/CastleWallSignerClient"
+        ),
+        .testTarget(
+            name: "CastleWallSignerTests",
+            dependencies: ["CastleWallSigner"],
+            path: "Tests/CastleWallSignerTests"
         ),
         .testTarget(
             name: "CastleWallIPCTests",
