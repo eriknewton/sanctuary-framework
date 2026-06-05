@@ -162,6 +162,38 @@ describe("Sovereignty-Gated Reputation Tiers", () => {
       expect(score).toBeGreaterThan(70);
       // Without weighting, average would be 58
     });
+
+    it("fails closed on an unknown/imported-invalid tier (no NaN poisoning)", () => {
+      const attestations: TieredAttestation[] = [
+        { value: 100, tier: "verified-sovereign" },
+        // Simulates an imported attestation whose tier is not in TIER_WEIGHTS.
+        { value: 9999, tier: "totally-bogus-tier" as unknown as TieredAttestation["tier"] },
+      ];
+      // The bogus-tier attestation contributes 0 weight and is skipped; the
+      // score must be the valid attestation's value, never NaN.
+      const score = computeWeightedScore(attestations);
+      expect(score).toBe(100);
+      expect(Number.isNaN(score as number)).toBe(false);
+    });
+
+    it("fails closed on a non-finite metric value (no NaN/Infinity poisoning)", () => {
+      const attestations: TieredAttestation[] = [
+        { value: 100, tier: "verified-sovereign" },
+        { value: Infinity, tier: "verified-sovereign" },
+        { value: NaN, tier: "unverified" },
+      ];
+      const score = computeWeightedScore(attestations)!;
+      expect(score).toBe(100);
+      expect(Number.isFinite(score)).toBe(true);
+    });
+
+    it("returns null when every attestation is invalid", () => {
+      const attestations: TieredAttestation[] = [
+        { value: Infinity, tier: "verified-sovereign" },
+        { value: 5, tier: "nope" as unknown as TieredAttestation["tier"] },
+      ];
+      expect(computeWeightedScore(attestations)).toBeNull();
+    });
   });
 
   describe("tierDistribution", () => {

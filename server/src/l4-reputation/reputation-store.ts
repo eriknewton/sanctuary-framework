@@ -172,7 +172,9 @@ function aggregateMetrics(
   for (const name of names) {
     const values = attestations
       .map((a) => a.attestation.data.metrics[name])
-      .filter((v): v is number => v !== undefined);
+      // Fail closed: a non-finite metric (Infinity/-Infinity/NaN, e.g. an
+      // imported attestation carrying 1e309) must not poison the aggregate.
+      .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
 
     if (values.length === 0) {
       result[name] = { mean: 0, median: 0, min: 0, max: 0, count: 0 };
