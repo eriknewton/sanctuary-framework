@@ -60,6 +60,19 @@ WRAPPED=false
 WRAPPED_APP_DIR="${WRAPPED_APP_DIR:-${PKG_DIR}/build/Sanctuary-CastleWall.app}"
 SYSTEM_EXTENSION_DIRNAME="ai.sanctuaryprotocol.macos.castle-wall.systemextension"
 
+# A2/B2 signer helper + shim. Pinned designated identifiers (the helper's caller
+# requirement checks the shim's identifier — Sources/CastleWallSigner/CodeRequirement.swift).
+SIGNER_HELPER_ID="ai.sanctuaryprotocol.macos.castle-wall.signer-helper"
+SIGNER_CLIENT_ID="ai.sanctuaryprotocol.macos.castle-wall.signer-client"
+SIGNER_HELPER_DST="${WRAPPED_APP_DIR}/Contents/MacOS/castle-wall-signer-helper"
+SIGNER_CLIENT_DST="${WRAPPED_APP_DIR}/Contents/MacOS/castle-wall-signer-client"
+SIGNER_HELPER_ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallSignerHelper/CastleWallSignerHelper.entitlements"
+SIGNER_CLIENT_ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallSignerClient/CastleWallSignerClient.entitlements"
+# Notarization: set NOTARYTOOL_PROFILE (a `notarytool store-credentials` keychain
+# profile) to notarize + staple automatically. Apps that bundle a LaunchDaemon
+# MUST be notarized or SMAppService stays stuck at .requiresApproval/.notFound.
+NOTARYTOOL_PROFILE="${NOTARYTOOL_PROFILE:-}"
+
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [--wrapped]
@@ -271,6 +284,32 @@ if [ "${WRAPPED}" = true ]; then
         --entitlements "${ENTITLEMENTS}" \
         "${INNER_SYSTEM_EXTENSION}"
 
+    # A2/B2: sign the bundled signer helper + shim with pinned designated
+    # identifiers BEFORE the outer app. The outer app is signed non-deep (below),
+    # so these nested signatures are preserved; --deep verify then validates them.
+    if [ -x "${SIGNER_HELPER_DST}" ] && [ -x "${SIGNER_CLIENT_DST}" ]; then
+        echo "[build-signed]     signing signer helper (${SIGNER_HELPER_ID})"
+        codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --identifier "${SIGNER_HELPER_ID}" \
+            --sign "${SIGNING_IDENTITY}" \
+            --entitlements "${SIGNER_HELPER_ENTITLEMENTS}" \
+            "${SIGNER_HELPER_DST}"
+        echo "[build-signed]     signing signer-client shim (${SIGNER_CLIENT_ID})"
+        codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --identifier "${SIGNER_CLIENT_ID}" \
+            --sign "${SIGNING_IDENTITY}" \
+            --entitlements "${SIGNER_CLIENT_ENTITLEMENTS}" \
+            "${SIGNER_CLIENT_DST}"
+    else
+        echo "[build-signed]     WARN: signer helper/shim not present in bundle; skipping (pre-A2 layout)" >&2
+    fi
+
     echo "[build-signed]     signing outer .app with Developer ID + host entitlements"
     codesign \
         --force \
@@ -283,6 +322,32 @@ if [ "${WRAPPED}" = true ]; then
     echo "[build-signed]     verifying wrapped .app signature"
     codesign --verify --deep --strict "${WRAPPED_APP_DIR}"
     echo "[build-signed] wrapped signed bundle: ${WRAPPED_APP_DIR}"
+
+    # Notarization. An app bundling a LaunchDaemon will leave SMAppService stuck
+    # at .requiresApproval/.notFound until the app is notarized + stapled
+    # (§9 step 0 precheck). Automate when a notarytool keychain profile is set;
+    # otherwise print the exact operator commands.
+    if [ -n "${NOTARYTOOL_PROFILE}" ]; then
+        echo "[build-signed]     notarizing (profile ${NOTARYTOOL_PROFILE})"
+        NOTARIZE_ZIP="${WRAPPED_APP_DIR%.app}-notarize.zip"
+        /usr/bin/ditto -c -k --keepParent "${WRAPPED_APP_DIR}" "${NOTARIZE_ZIP}"
+        xcrun notarytool submit "${NOTARIZE_ZIP}" \
+            --keychain-profile "${NOTARYTOOL_PROFILE}" --wait
+        echo "[build-signed]     stapling"
+        xcrun stapler staple "${WRAPPED_APP_DIR}"
+        xcrun stapler validate "${WRAPPED_APP_DIR}"
+        echo "[build-signed]     spctl assess (post-notarization)"
+        spctl -a -vvv -t exec "${WRAPPED_APP_DIR}" || true
+        rm -f "${NOTARIZE_ZIP}"
+    else
+        echo "[build-signed]     NOTARIZATION DEFERRED (NOTARYTOOL_PROFILE unset)."
+        echo "[build-signed]     Apps with a bundled LaunchDaemon MUST be notarized for SMAppService."
+        echo "[build-signed]     Operator commands:"
+        echo "[build-signed]       ditto -c -k --keepParent \"${WRAPPED_APP_DIR}\" /tmp/cw-notarize.zip"
+        echo "[build-signed]       xcrun notarytool submit /tmp/cw-notarize.zip --keychain-profile <profile> --wait"
+        echo "[build-signed]       xcrun stapler staple \"${WRAPPED_APP_DIR}\""
+        echo "[build-signed]       xcrun stapler validate \"${WRAPPED_APP_DIR}\""
+    fi
 fi
 
 echo "[build-signed] DONE"

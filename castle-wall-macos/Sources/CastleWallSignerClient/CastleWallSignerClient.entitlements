@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the code-signed XPC shim the TS daemon spawns.
+
+  Minimal: a Developer-ID client connecting to a LaunchDaemon mach service needs
+  no special entitlement. Hardened runtime is applied via
+  `codesign --options runtime`. The shim's designated identifier
+  (ai.sanctuaryprotocol.macos.castle-wall.signer-client) is pinned at sign time
+  via `codesign --identifier`, which the helper's caller requirement checks.
+-->
+<plist version="1.0">
+<dict>
+</dict>
+</plist>

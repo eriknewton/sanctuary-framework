@@ -104,7 +104,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "CastleWallHostApp",
-            dependencies: ["CastleWallIPC", "AgentDetector"],
+            dependencies: ["CastleWallIPC", "AgentDetector", "CastleWallSigner"],
             path: "Sources/CastleWallHostApp",
             exclude: [
                 "Info.plist",
@@ -113,6 +113,8 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("SystemExtensions"),
                 .linkedFramework("SwiftUI"),
+                // SMAppService (register the root signer helper) — A2/B2.
+                .linkedFramework("ServiceManagement"),
             ]
         ),
         // A2/B2 helper-as-signer targets. CastleWallSigner is the shared,
@@ -133,12 +135,19 @@ let package = Package(
         .executableTarget(
             name: "CastleWallSignerHelper",
             dependencies: ["CastleWallSigner"],
-            path: "Sources/CastleWallSignerHelper"
+            path: "Sources/CastleWallSignerHelper",
+            exclude: [
+                "CastleWallSignerHelper.entitlements",
+                "ai.sanctuaryprotocol.macos.castle-wall.signer-helper.plist",
+            ]
         ),
         .executableTarget(
             name: "CastleWallSignerClient",
             dependencies: ["CastleWallSigner"],
-            path: "Sources/CastleWallSignerClient"
+            path: "Sources/CastleWallSignerClient",
+            exclude: [
+                "CastleWallSignerClient.entitlements",
+            ]
         ),
         .testTarget(
             name: "CastleWallSignerTests",
