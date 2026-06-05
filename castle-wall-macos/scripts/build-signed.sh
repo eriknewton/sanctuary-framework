@@ -243,6 +243,11 @@ if [ "${WRAPPED}" = true ]; then
     if [ -f "${PROVISIONING_PROFILE}" ]; then
         echo "[build-signed]     embedding provisioning profile"
         cp "${PROVISIONING_PROFILE}" "${WRAPPED_APP_DIR}/Contents/embedded.provisionprofile"
+        # F2: profiles copied from ~/Documents carry com.apple.quarantine, which
+        # survives into the signed sysext and causes a first-attempt
+        # codeSignatureInvalid (SIP protects the files after signing, so it
+        # cannot be stripped later). Strip it before signing; ignore if absent.
+        xattr -d com.apple.quarantine "${WRAPPED_APP_DIR}/Contents/embedded.provisionprofile" 2>/dev/null || true
     else
         echo "[build-signed] WARNING: no provisioning profile at ${PROVISIONING_PROFILE}" >&2
         echo "[build-signed]          restricted entitlements will fail AMFI without a profile" >&2
@@ -251,6 +256,8 @@ if [ "${WRAPPED}" = true ]; then
     if [ -f "${EXT_PROVISIONING_PROFILE}" ]; then
         echo "[build-signed]     embedding extension provisioning profile"
         cp "${EXT_PROVISIONING_PROFILE}" "${INNER_SYSTEM_EXTENSION}/Contents/embedded.provisionprofile"
+        # F2: same quarantine strip for the extension profile (see above).
+        xattr -d com.apple.quarantine "${INNER_SYSTEM_EXTENSION}/Contents/embedded.provisionprofile" 2>/dev/null || true
     else
         echo "[build-signed] WARNING: no extension provisioning profile at ${EXT_PROVISIONING_PROFILE}" >&2
     fi
