@@ -145,9 +145,23 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
             self.bootstrapTimer = nil
             self.bootstrapRetryDelaySeconds = 1.0
 
+            // Re-resolve the socket path on every (re)connect, not just at
+            // bootstrap. On a fresh boot the sysext starts before the daemon,
+            // so `resolved.path` here is the home-default fallback; once the
+            // daemon comes up and writes its active-config, this closure lets
+            // the reconnect loop pick up the real fortress path and the audit
+            // back-channel reconnects (Finding B, A1 drill 2026-06-04).
             let client = IPCClient(
                 options: IPCClientOptions(path: resolved.path),
-                pinnedPublicKey: keyLoad.key
+                pinnedPublicKey: keyLoad.key,
+                pathResolver: {
+                    SocketPath.resolve(
+                        platform: "darwin",
+                        fortressPath: ProcessInfo.processInfo.environment["SANCTUARY_FORTRESS_PATH"],
+                        homeDir: NSHomeDirectory(),
+                        explicitOverride: ProcessInfo.processInfo.environment["SANCTUARY_CASTLE_SOCKET"]
+                    ).path
+                }
             )
             self.ipcClient = client
             let dispatcher = ExtensionDispatcher(engine: self.engine, ipcClient: client)

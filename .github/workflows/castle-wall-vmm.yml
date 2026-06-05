@@ -1,0 +1,47 @@
+name: Castle Wall VMM
+
+# Builds and unit-tests the Castle Wall VMM package — the Apple
+# Containerization-based VM launcher (SanctuaryVMM + sanctuary-vmm CLI). Split
+# out of castle-wall-macos on 2026-06-04 so the enforcement sysext can keep a
+# macOS-13 floor; this package requires macOS 26 + Swift tools 6.2 because of
+# the Containerization dependency.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "castle-wall-vmm/**"
+      - ".github/workflows/castle-wall-vmm.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "castle-wall-vmm/**"
+      - ".github/workflows/castle-wall-vmm.yml"
+
+jobs:
+  castle-wall-vmm:
+    # macOS 26 runner required: castle-wall-vmm/Package.swift declares
+    # .macOS("26.0") and depends on Apple's Containerization library (README:
+    # macOS 26, Swift tools 6.2). Older runners (macos-15 / Xcode 16.x ship
+    # Swift 6.1 + the macOS 15 SDK) cannot resolve the 6.2 tools version nor
+    # compile against the macOS 26 SDK. GitHub does provision macos-26;
+    # building Containerization from source adds ~10 min.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      # Compile-check via SwiftPM (lesson #77: swift build --build-tests + swift
+      # test is the canonical gate; xcodebuild scheme builds are not used).
+      - name: swift build (compile all targets + tests)
+        working-directory: castle-wall-vmm
+        run: swift build --build-tests
+
+      - name: swift test (run XCTest suites via SwiftPM)
+        working-directory: castle-wall-vmm
+        run: swift test

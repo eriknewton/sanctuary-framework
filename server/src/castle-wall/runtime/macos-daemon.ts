@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 
 import { bytesToString, toBase64url } from "../../core/encoding.js";
@@ -8,6 +9,7 @@ import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.j
 import type { AuditLog } from "../../l2-operational/audit-log.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { validateRule } from "../allowlist/schema.js";
+import { validateAgentOrigin } from "../allowlist/agent-origin.js";
 import { verifyManifestSignature } from "../allowlist/parse.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
 import type {
@@ -43,6 +45,13 @@ export interface MacOSCastleWallDaemonInput {
   socketPath?: string;
   activeConfigPath?: string;
   listenerFactory?: (options: MacOSCastleWallListenerOptions) => MacOSCastleWallListenerHandle;
+  /**
+   * Optional agent-origin descriptor (config / test fixture). When absent,
+   * the daemon loads `policy/egress/agent-origin.json` from the fortress
+   * directory. When BOTH are absent, the manifest omits the field and the
+   * sysext classifies every flow as `.agent` (machine-wide default-deny).
+   */
+  agentOrigin?: unknown;
 }
 
 export type MacOSCastleWallListenerOptions = ConstructorParameters<
@@ -101,10 +110,12 @@ export async function startMacOSCastleWallDaemon(
   const signingKey = await loadSigningKey(input.fortressPath, input.masterKey);
   await writeSystemPinnedPublicKey(signingKey.publicKey);
   const pinnedPublicKeySha256 = sha256Hex(signingKey.publicKey);
+  const agentOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
   let manifestState = await loadManifestState({
     fortressPath: input.fortressPath,
     fortressId: input.fortressId,
     signingKey,
+    agentOrigin,
   });
   const pendingRequests = new Set<string>();
   let listener: MacOSCastleWallListenerHandle;
@@ -199,10 +210,12 @@ export async function startMacOSCastleWallDaemon(
     request?: PolicyReloadRequest,
   ): Promise<PolicyReloadResponse> {
     try {
+      const reloadedOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
       manifestState = await loadManifestState({
         fortressPath: input.fortressPath,
         fortressId: input.fortressId,
         signingKey,
+        agentOrigin: reloadedOrigin,
       });
       const emitted = await listener.broadcastManifestUpdate();
       await input.auditLog.append(
@@ -265,6 +278,43 @@ export async function startMacOSCastleWallDaemon(
   };
 }
 
+const AGENT_ORIGIN_FILENAME = "agent-origin.json";
+
+/**
+ * Resolve the agent-origin descriptor from config: prefer the explicit input,
+ * fall back to `policy/egress/agent-origin.json` in the fortress. Returns
+ * `undefined` when no descriptor is available (manifest omits the field =>
+ * sysext classifies everything `.agent`).
+ */
+async function resolveAgentOrigin(
+  fortressPath: string,
+  explicitInput: unknown,
+): Promise<unknown> {
+  if (explicitInput !== undefined) {
+    return explicitInput;
+  }
+  const filePath = join(fortressPath, "policy", "egress", AGENT_ORIGIN_FILENAME);
+  try {
+    const raw = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    const validated = validateAgentOrigin(parsed);
+    if (validated === null) {
+      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+      console.warn(
+        `[castle-wall] warning: ${AGENT_ORIGIN_FILENAME} is structurally invalid; ignoring (classify-all-agent fallback)`,
+      );
+      return undefined;
+    }
+    return validated;
+  } catch (err) {
+    const code = err instanceof Error && "code" in err
+      ? (err as NodeJS.ErrnoException).code
+      : undefined;
+    if (code === "ENOENT") return undefined;
+    throw err;
+  }
+}
+
 async function loadSigningKey(
   fortressPath: string,
   masterKey: Uint8Array,
@@ -314,6 +364,7 @@ async function loadManifestState(input: {
   fortressPath: string;
   fortressId: string;
   signingKey: LoadedSigningKey;
+  agentOrigin?: unknown;
 }): Promise<ManifestState> {
   const rulesDir = join(input.fortressPath, "policy", "egress", "rules");
   const rules: AllowlistRule[] = [];
@@ -341,6 +392,7 @@ async function loadManifestState(input: {
     issuedAt: new Date().toISOString(),
     rules,
     signingKey: input.signingKey,
+    agentOrigin: input.agentOrigin,
   });
   const verifyResult = verifyManifestSignature(signed, input.signingKey.publicKey);
   if (!verifyResult.ok) {
@@ -350,9 +402,17 @@ async function loadManifestState(input: {
 }
 
 async function assertSocketNotOwnedByLiveProcess(socketPath: string): Promise<void> {
+  // A socket FILE existing is not proof of a live daemon. A non-graceful exit
+  // (crash, `kill -9`, or a reboot — the SIGTERM cleanup that unlinks the
+  // socket never runs) leaves a stale `castle.sock` behind, which would
+  // otherwise wedge every subsequent start (notably the launchd auto-start
+  // after a reboot). Decide on LIVENESS, not file-existence: a genuine daemon
+  // accepts a connection; a stale socket refuses it. If no live process
+  // answers, unlink the stale socket so the listener can rebind cleanly. The
+  // companion active-config guard (`assertActiveConfigNotOwnedByLiveProcess`)
+  // is already PID-liveness-aware; this brings the socket check in line.
   try {
     await stat(socketPath);
-    throw new Error(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
   } catch (err) {
     const code = err instanceof Error && "code" in err
       ? (err as NodeJS.ErrnoException).code
@@ -360,6 +420,40 @@ async function assertSocketNotOwnedByLiveProcess(socketPath: string): Promise<vo
     if (code === "ENOENT") return;
     throw err;
   }
+
+  if (await socketHasLiveListener(socketPath)) {
+    throw new Error(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
+  }
+
+  await unlink(socketPath).catch((err: unknown) => {
+    const code = err instanceof Error && "code" in err
+      ? (err as NodeJS.ErrnoException).code
+      : undefined;
+    if (code !== "ENOENT") throw err;
+  });
+}
+
+/**
+ * Resolve true iff a live process is currently accepting connections on the
+ * unix socket at `socketPath`. A successful connect proves a live listener; a
+ * connection error (ECONNREFUSED on a stale socket, ENOTSOCK on a leftover
+ * plain file, ENOENT on a vanished path) proves there is not one. The probe
+ * is bounded by a short timeout so a wedged peer cannot hang startup.
+ */
+function socketHasLiveListener(socketPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const socket = createConnection({ path: socketPath });
+    const finish = (alive: boolean): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(alive);
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.setTimeout(1000, () => finish(false));
+  });
 }
 
 async function assertActiveConfigNotOwnedByLiveProcess(configPath: string): Promise<void> {

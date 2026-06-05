@@ -51,5 +51,10 @@ castle-wall-macos/.build/
 castle-wall-macos/build/
 castle-wall-macos/Package.resolved
 
+# Castle Wall VMM Swift package artifacts (split out of castle-wall-macos)
+castle-wall-vmm/.build/
+castle-wall-vmm/build/
+castle-wall-vmm/Package.resolved
+
 # Per-machine Claude Code permissions; never commit
 .claude/settings.local.json

@@ -21,13 +21,62 @@ final class SanctuaryServerBridge: ObservableObject {
 
     // MARK: - Binary resolution
 
-    /// Resolve the `sanctuary` binary via `which`. Validates ownership
-    /// to prevent PATH hijacking.
+    /// Resolve the `sanctuary` CLI binary.
+    ///
+    /// A Finder- or `open`-launched app does NOT inherit the login shell PATH
+    /// (it gets a bare `/usr/bin:/bin:/usr/sbin:/sbin`), so the old
+    /// `/usr/bin/which sanctuary` found nothing and the whole host app —
+    /// Protect, status, audit viewer — went inert when launched normally
+    /// (Finding C, A1 drill 2026-06-04). Probe the common npm/Homebrew install
+    /// locations directly, then fall back to asking the user's login shell to
+    /// resolve it (handles nvm / a custom `npm prefix`). Every candidate is
+    /// ownership-validated to prevent PATH hijacking.
     func resolveSanctuaryBinary() {
+        sanctuaryPath = Self.resolveSanctuaryBinary(
+            candidates: Self.candidateSanctuaryPaths(),
+            isValidBinary: Self.isOwnerTrustedExecutable
+        )
+    }
+
+    /// Pure selection: the first candidate that passes `isValidBinary`.
+    /// Factored out so the priority ordering can be tested without touching the
+    /// filesystem or spawning a shell.
+    static func resolveSanctuaryBinary(
+        candidates: [String],
+        isValidBinary: (String) -> Bool
+    ) -> String? {
+        for candidate in candidates where isValidBinary(candidate) {
+            return candidate
+        }
+        return nil
+    }
+
+    /// Candidate locations for the `sanctuary` CLI, highest priority first: the
+    /// common npm/Homebrew install dirs (no subprocess), then whatever the
+    /// user's login shell resolves.
+    static func candidateSanctuaryPaths() -> [String] {
+        let home = NSHomeDirectory()
+        var candidates = [
+            "\(home)/.npm-global/bin/sanctuary",
+            "/opt/homebrew/bin/sanctuary",
+            "/usr/local/bin/sanctuary",
+            "\(home)/.local/bin/sanctuary",
+        ]
+        if let viaShell = resolveViaLoginShell() {
+            candidates.append(viaShell)
+        }
+        return candidates
+    }
+
+    /// Ask the user's login shell to resolve `sanctuary` from its full PATH
+    /// (`$SHELL -lc 'command -v sanctuary'`). Returns nil on any failure. This
+    /// runs the user's own shell rc, exactly as a terminal would.
+    static func resolveViaLoginShell() -> String? {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         let pipe = Pipe()
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        process.arguments = ["sanctuary"]
+        process.executableURL = URL(fileURLWithPath: shell)
+        process.arguments = ["-l", "-c", "command -v sanctuary"]
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
 
@@ -35,37 +84,35 @@ final class SanctuaryServerBridge: ObservableObject {
             try process.run()
             process.waitUntilExit()
         } catch {
-            sanctuaryPath = nil
-            return
+            return nil
         }
 
-        guard process.terminationStatus == 0 else {
-            sanctuaryPath = nil
-            return
-        }
+        guard process.terminationStatus == 0 else { return nil }
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard let path = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
             !path.isEmpty else {
-            sanctuaryPath = nil
-            return
+            return nil
         }
+        return path
+    }
 
-        // Validate ownership: must be owned by root or current user
+    /// True iff `path` is an existing regular file owned by root or the current
+    /// user. The ownership gate prevents PATH hijacking via a binary an
+    /// attacker dropped in a world-writable directory.
+    static func isOwnerTrustedExecutable(_ path: String) -> Bool {
         let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else {
+            return false
+        }
         guard let attrs = try? fm.attributesOfItem(atPath: path),
               let ownerUID = attrs[.ownerAccountID] as? NSNumber else {
-            sanctuaryPath = nil
-            return
+            return false
         }
-
         let currentUID = getuid()
-        if ownerUID.uint32Value == 0 || ownerUID.uint32Value == currentUID {
-            sanctuaryPath = path
-        } else {
-            sanctuaryPath = nil
-        }
+        return ownerUID.uint32Value == 0 || ownerUID.uint32Value == currentUID
     }
 
     // MARK: - Server health check

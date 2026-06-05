@@ -15,6 +15,8 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { AuditLog, type AuditEntry } from "../l2-operational/audit-log.js";
 import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
+import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import type {
   CastleWallMessage,
   DecisionResponse,
@@ -247,6 +249,124 @@ export async function runStatus(
   return 0;
 }
 
+/**
+ * Start the Castle Wall enforcement daemon standalone, using the EXISTING
+ * fortress signing key, without wrapping a live agent. This is the
+ * acceptance-drill bring-up path (A1/B2): `sanctuary wrap` couples the daemon
+ * to a wrapped agent's MCP-server lifetime, which is unsuitable for a
+ * multi-step, multi-reboot armed-wall drill.
+ *
+ * Safety: the daemon loads the pinned signing key (`castle-pinned-privkey.enc`)
+ * with the derived master key. A wrong passphrase fails to decrypt and the
+ * daemon refuses to start — so a successful start proves the signing key
+ * matches the pin (no silent mismatched-key arm). This verb additionally
+ * refuses to mint a fresh passphrase (which could never match the pin) and
+ * requires an existing fortress (key-params present).
+ *
+ * Runs in the foreground until SIGINT/SIGTERM, then tears the daemon down.
+ */
+export async function runDaemon(
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const platform = ctx.platform ?? process.platform;
+
+  if (platform !== "darwin") {
+    write(err, "castle-wall daemon is macOS-only.\n");
+    return 1;
+  }
+
+  const storagePath = resolveStoragePath(env);
+
+  // Read + print the pin fingerprint: the value the daemon's signing key must
+  // match. A successful daemon start (below) proves the match by construction.
+  const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
+  let pinFingerprint: string;
+  try {
+    const publicKey = await readFile(pubPath);
+    if (publicKey.length !== 32) {
+      write(err, `Pinned public key at ${pubPath} must be 32 bytes (found ${publicKey.length}).\n`);
+      return 1;
+    }
+    pinFingerprint = fingerprintFromPublicKey(publicKey);
+  } catch {
+    write(err, `No pinned key at ${pubPath}. Run 'sanctuary castle-wall provision-pin' first.\n`);
+    return 1;
+  }
+  write(out, `Pinned key fingerprint: ${pinFingerprint}\n`);
+
+  // Resolve the EXISTING fortress passphrase. Refuse to generate a fresh one:
+  // a new key could never match the pin, and arming with it would fail-closed
+  // the whole machine to deny-all.
+  let passphrase: string;
+  if (env.SANCTUARY_PASSPHRASE) {
+    passphrase = env.SANCTUARY_PASSPHRASE;
+  } else {
+    const resolved = await getOrCreatePassphrase({ storagePath });
+    if (resolved.source === "generated") {
+      write(err, "Refusing to start: no existing fortress passphrase found (would mint a new key that cannot match the pin). Run where the fortress Keychain entry is unlocked, or set SANCTUARY_PASSPHRASE.\n");
+      return 1;
+    }
+    passphrase = resolved.value;
+  }
+
+  // Require existing key-derivation params (an already-provisioned fortress).
+  const storage = new FilesystemStorage(join(storagePath, "state"));
+  let existingParams: KeyDerivationParams | undefined;
+  try {
+    const raw = await storage.read("_meta", "key-params");
+    if (raw) {
+      existingParams = JSON.parse(bytesToString(raw)) as KeyDerivationParams;
+    }
+  } catch {
+    // none
+  }
+  if (!existingParams) {
+    write(err, "Refusing to start: no existing key-params under the fortress (nothing provisioned to bring up).\n");
+    return 1;
+  }
+
+  const derived = await deriveMasterKey(passphrase, existingParams);
+  const auditLog = new AuditLog(storage, derived.key);
+
+  const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
+  let daemon: { socketPath: string; stop: () => Promise<void> };
+  try {
+    daemon = await startMacOSCastleWallDaemon({
+      fortressPath: storagePath,
+      fortressId: fortressIdFromStoragePath(storagePath),
+      masterKey: derived.key,
+      auditLog,
+    });
+  } catch (error) {
+    write(err, `Daemon failed to start: ${(error as Error).message}\n`);
+    write(err, "If this is a decrypt/signing-key error, the passphrase does not match the pinned key. Refusing to arm with a mismatched key.\n");
+    return 1;
+  }
+
+  write(out, `Castle Wall daemon listening on ${daemon.socketPath}\n`);
+  write(out, `Signing key loaded and matches pin ${pinFingerprint} (pinned key decryption succeeded).\n`);
+  write(out, "Daemon running in the foreground. Ctrl-C (SIGINT) or SIGTERM to stop.\n");
+
+  await new Promise<void>((resolveWait) => {
+    let stopping = false;
+    const stop = () => {
+      if (stopping) return;
+      stopping = true;
+      write(err, "\nStopping Castle Wall daemon...\n");
+      void daemon
+        .stop()
+        .catch(() => undefined)
+        .finally(() => resolveWait());
+    };
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+  });
+  return 0;
+}
+
 export async function runSetupSharedDir(
   ctx: CastleWallCommandContext = {}
 ): Promise<number> {
@@ -428,6 +548,87 @@ export async function runAuditDump(
     for (const entry of query.entries.filter(isCastleWallAuditEntry)) {
       write(out, JSON.stringify(entry) + "\n");
     }
+    return 0;
+  } catch (error) {
+    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}
+
+export async function runConfigureOrigin(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {}
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+  const originPath = join(fortressPath, "policy", "egress", "agent-origin.json");
+
+  // Parse remaining positional args: configure-origin <mode> [options]
+  // Usage:
+  //   castle-wall configure-origin uid --agent-uid=502 [--ceiling=500]
+  //   castle-wall configure-origin nat --signing-id=ai.sanctuaryprotocol.egress-helper [--team-id=YFQSWQ9BJN] [--ceiling=500]
+  const modeArg = argv.find((a) => a === "uid" || a === "nat");
+  if (!modeArg) {
+    write(err, "Usage: castle-wall configure-origin <uid|nat> [options]\n");
+    write(err, "  uid mode: --agent-uid=<uid> [--ceiling=<uid>]\n");
+    write(err, "  nat mode: --signing-id=<id> [--team-id=<id>] [--ceiling=<uid>]\n");
+    return 2;
+  }
+
+  const getFlag = (name: string): string | undefined => {
+    const prefix = `--${name}=`;
+    const match = argv.find((a) => a.startsWith(prefix));
+    return match ? match.slice(prefix.length) : undefined;
+  };
+
+  const candidate: Record<string, unknown> = {
+    mode: modeArg,
+    system_uid_allow_ceiling: parseInt(getFlag("ceiling") ?? "500", 10),
+  };
+
+  if (modeArg === "uid") {
+    const uidStr = getFlag("agent-uid");
+    if (!uidStr) {
+      write(err, "Error: uid mode requires --agent-uid=<uid>\n");
+      return 2;
+    }
+    candidate.agent_uid = parseInt(uidStr, 10);
+  } else {
+    const signingId = getFlag("signing-id");
+    const teamId = getFlag("team-id");
+    if (!signingId && !teamId) {
+      write(err, "Error: nat mode requires --signing-id=<id> and/or --team-id=<id>\n");
+      return 2;
+    }
+    if (signingId) candidate.egress_helper_signing_id = signingId;
+    if (teamId) candidate.egress_helper_team_id = teamId;
+    const portRange = getFlag("port-range");
+    if (portRange) {
+      const parts = portRange.split("-").map(Number);
+      if (parts.length === 2) candidate.agent_runtime_port_range = parts;
+    }
+  }
+
+  const validated = validateAgentOrigin(candidate);
+  if (validated === null) {
+    write(err, "Error: agent-origin descriptor is structurally invalid.\n");
+    return 1;
+  }
+
+  try {
+    await mkdir(join(fortressPath, "policy", "egress"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    await writeFile(originPath, JSON.stringify(validated, null, 2) + "\n", {
+      mode: 0o600,
+    });
+    write(out, `Agent origin configured: mode=${validated.mode}\n`);
+    write(out, `Written to: ${originPath}\n`);
+    write(out, "Run 'sanctuary castle-wall reload' to apply.\n");
     return 0;
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
