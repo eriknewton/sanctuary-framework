@@ -89,6 +89,9 @@ describe("Castle Wall macOS daemon — helper signing path (B2)", () => {
       auditLog,
       platform: "darwin",
       activeConfigPath: join(fortressPath, "active.json"),
+      // Isolate the F-A2-1 #4 pin cross-check from any pin installed on the build
+      // host: point it at a nonexistent path so the (additive) check is skipped.
+      globalPinnedPublicKeyPath: join(fortressPath, "no-such-global-pin.bin"),
       socketPath: join(fortressPath, "castle.sock"),
       listenerFactory: fakeListenerFactory,
       signerClientInvoke: helper.invoke,
@@ -114,6 +117,9 @@ describe("Castle Wall macOS daemon — helper signing path (B2)", () => {
         auditLog,
         platform: "darwin",
         activeConfigPath: join(fortressPath, "active.json"),
+      // Isolate the F-A2-1 #4 pin cross-check from any pin installed on the build
+      // host: point it at a nonexistent path so the (additive) check is skipped.
+      globalPinnedPublicKeyPath: join(fortressPath, "no-such-global-pin.bin"),
         socketPath: join(fortressPath, "castle.sock"),
         listenerFactory: fakeListenerFactory,
         signerClientInvoke: brokenInvoke,
@@ -131,6 +137,9 @@ describe("Castle Wall macOS daemon — helper signing path (B2)", () => {
         auditLog,
         platform: "darwin",
         activeConfigPath: join(fortressPath, "active.json"),
+      // Isolate the F-A2-1 #4 pin cross-check from any pin installed on the build
+      // host: point it at a nonexistent path so the (additive) check is skipped.
+      globalPinnedPublicKeyPath: join(fortressPath, "no-such-global-pin.bin"),
         socketPath: join(fortressPath, "castle.sock"),
         listenerFactory: fakeListenerFactory,
         // no localSign, no signerClientInvoke, no signerClientPath
@@ -149,6 +158,9 @@ describe("Castle Wall macOS daemon — helper signing path (B2)", () => {
       auditLog,
       platform: "darwin",
       activeConfigPath: join(fortressPath, "active.json"),
+      // Isolate the F-A2-1 #4 pin cross-check from any pin installed on the build
+      // host: point it at a nonexistent path so the (additive) check is skipped.
+      globalPinnedPublicKeyPath: join(fortressPath, "no-such-global-pin.bin"),
       socketPath,
       signerClientInvoke: helper.invoke,
     });

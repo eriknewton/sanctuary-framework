@@ -85,6 +85,13 @@ export interface MacOSCastleWallDaemonInput {
   signerClientPath?: string;
   /** Override the shim runner (tests). */
   signerClientInvoke?: ShimInvoker;
+  /**
+   * Override the root-owned global pin path used for the F-A2-1 #4
+   * defense-in-depth cross-check (helper mode). Defaults to the production
+   * custody path; tests point it at a nonexistent temp path to isolate from any
+   * pin installed on the build host.
+   */
+  globalPinnedPublicKeyPath?: string;
 }
 
 export type MacOSCastleWallListenerOptions = ConstructorParameters<
@@ -151,6 +158,9 @@ export async function startMacOSCastleWallDaemon(
     fortressId: input.fortressId,
     signer,
     agentOrigin,
+    ...(input.globalPinnedPublicKeyPath
+      ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
+      : {}),
   });
   const pendingRequests = new Set<string>();
   let listener: MacOSCastleWallListenerHandle;
@@ -217,15 +227,23 @@ export async function startMacOSCastleWallDaemon(
     : new MacOSFlowIpcListener(listenerOptions);
 
   let activeConfigWritten = false;
+  // The path active-config was actually written to (the protected path, or the
+  // operator-writable fallback when the custody dir is root-owned). Cleanup must
+  // target the SAME file, so we thread the resolved path rather than assume it.
+  let writtenActiveConfigPath = activeConfigPath;
   try {
     await listener.start();
-    await writeActiveConfig(activeConfigPath, {
-      socket_path: socketPath,
-      fortress_id: input.fortressId,
-      pid: process.pid,
-      started_at: new Date().toISOString(),
-      pinned_pubkey_sha256: pinnedPublicKeySha256,
-    });
+    writtenActiveConfigPath = await writeActiveConfig(
+      activeConfigPath,
+      {
+        socket_path: socketPath,
+        fortress_id: input.fortressId,
+        pid: process.pid,
+        started_at: new Date().toISOString(),
+        pinned_pubkey_sha256: pinnedPublicKeySha256,
+      },
+      legacyActiveConfigPath,
+    );
     activeConfigWritten = true;
     await input.auditLog.append(
       "l1",
@@ -237,7 +255,7 @@ export async function startMacOSCastleWallDaemon(
     await input.auditLog.flush();
   } catch (err) {
     if (activeConfigWritten) {
-      await removeActiveConfigIfCurrent(activeConfigPath, socketPath, input.fortressId);
+      await removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
     }
     await listener.stop().catch(() => undefined);
     throw err;
@@ -253,6 +271,9 @@ export async function startMacOSCastleWallDaemon(
         fortressId: input.fortressId,
         signer,
         agentOrigin: reloadedOrigin,
+        ...(input.globalPinnedPublicKeyPath
+          ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
+          : {}),
       });
       const emitted = await listener.broadcastManifestUpdate();
       await input.auditLog.append(
@@ -309,7 +330,7 @@ export async function startMacOSCastleWallDaemon(
         );
         await input.auditLog.flush();
       } finally {
-        await removeActiveConfigIfCurrent(activeConfigPath, socketPath, input.fortressId);
+        await removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
       }
     },
   };
@@ -461,12 +482,73 @@ async function writeSystemPinnedPublicKey(signer: DaemonSigner): Promise<void> {
   }
 }
 
+/**
+ * F-A2-1 #4 defense-in-depth: in helper mode the ROOT-OWNED global pin on disk
+ * MUST equal the live helper key. The daemon already verifies every manifest
+ * against the helper's live `getPublicKey()`; this adds an independent
+ * cross-check against the persisted trust anchor so a coordinated key+pin swap
+ * — one that might fool either check alone — is still caught (fail closed).
+ *
+ * Only a root-owned pin is authoritative: a non-root-owned pin is ignored here
+ * (the sysext's own owner-gate rejects it, F-A2-2), so this never false-positives
+ * on a dev box where the global pin is operator-owned. A missing or unreadable
+ * pin is also skipped — it is purely additive defense over the live-key check.
+ */
+/**
+ * Pure trust decision for the F-A2-1 #4 cross-check. Extracted so the policy is
+ * unit-testable without a root-owned file on disk:
+ *   - no pin on disk            -> "skip"  (additive over the live-key check)
+ *   - pin not root-owned        -> "skip"  (untrusted; the sysext gate rejects it)
+ *   - root-owned, bytes equal   -> "match"
+ *   - root-owned, bytes differ  -> "mismatch" (coordinated swap / stale pin)
+ */
+export function evaluateGlobalPinTrust(
+  pin: { uid: number; bytes: Uint8Array } | null,
+  liveKey: Uint8Array,
+): "skip" | "match" | "mismatch" {
+  if (!pin) return "skip";
+  if (pin.uid !== 0) return "skip";
+  const onDisk = Buffer.from(pin.bytes);
+  const live = Buffer.from(liveKey);
+  return onDisk.length === live.length && Buffer.compare(onDisk, live) === 0
+    ? "match"
+    : "mismatch";
+}
+
+async function assertGlobalPinMatchesLiveKey(
+  livePublicKey: Uint8Array,
+  pinPath: string,
+): Promise<void> {
+  let pin: { uid: number; bytes: Uint8Array } | null = null;
+  try {
+    const uid = (await stat(pinPath)).uid;
+    const bytes = await readFile(pinPath);
+    pin = { uid, bytes };
+  } catch {
+    pin = null; // absent / unreadable — additive check, skip
+  }
+  if (evaluateGlobalPinTrust(pin, livePublicKey) === "mismatch") {
+    throw new Error(
+      "Castle Wall trust-anchor mismatch: the root-owned global pin does not match the live signer helper key. Refusing to start; run 'sanctuary castle-wall re-pin' to re-establish the trust anchor.",
+    );
+  }
+}
+
 async function loadManifestState(input: {
   fortressPath: string;
   fortressId: string;
   signer: DaemonSigner;
   agentOrigin?: unknown;
+  globalPinnedPublicKeyPath?: string;
 }): Promise<ManifestState> {
+  // Defense-in-depth: cross-check the persisted root-owned pin against the live
+  // helper key before trusting this signer to sign a manifest (F-A2-1 #4).
+  if (input.signer.mode === "helper") {
+    await assertGlobalPinMatchesLiveKey(
+      input.signer.publicKey,
+      input.globalPinnedPublicKeyPath ?? CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
+    );
+  }
   const rulesDir = join(input.fortressPath, "policy", "egress", "rules");
   const rules: AllowlistRule[] = [];
   let filenames: string[] = [];
@@ -571,17 +653,62 @@ async function assertActiveConfigNotOwnedByLiveProcess(
   }
 }
 
-async function writeActiveConfig(
+/**
+ * Write the active-config discovery file, returning the path actually written.
+ *
+ * A2/B2: under helper-as-signer the custody directory is root-owned, so the
+ * operator-UID daemon CANNOT write its discovery file there (and must never
+ * CREATE that directory operator-owned — F-A2-1). When the protected path is
+ * unwritable (root-owned: EACCES/EPERM) or its directory does not exist yet
+ * (ENOENT — only the helper creates it), fall back to the operator-writable
+ * legacy discovery path. This is socket DISCOVERY only: the IPC handshake binds
+ * the pinned key, and the sysext's fingerprint gate ignores any non-root-owned
+ * active-config (F-A2-4), so a discovery file is not a trust gate.
+ */
+export async function writeActiveConfig(
   configPath: string,
   config: ActiveCastleWallConfig,
-): Promise<void> {
-  await mkdir(dirname(configPath), { recursive: true, mode: 0o755 });
+  fallbackPath?: string,
+): Promise<string> {
+  // Never create the root-owned custody directory operator-owned (F-A2-1): only
+  // the helper owns it. For test/dev paths outside that directory, create it.
+  const createDir = dirname(configPath) !== CASTLE_GLOBAL_PINNED_PUBKEY_DIR;
+  try {
+    return await writeActiveConfigAt(configPath, config, createDir);
+  } catch (error) {
+    const code =
+      error instanceof Error && "code" in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+    if (
+      fallbackPath &&
+      (code === "EACCES" || code === "EPERM" || code === "EROFS" || code === "ENOENT")
+    ) {
+      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+      console.error(
+        `[castle-wall] custody dir is root-owned (A2); writing discovery active-config to ${fallbackPath} (${code}). Socket discovery only — the handshake binds the pinned key.`,
+      );
+      return await writeActiveConfigAt(fallbackPath, config, true);
+    }
+    throw error;
+  }
+}
+
+async function writeActiveConfigAt(
+  configPath: string,
+  config: ActiveCastleWallConfig,
+  createDir: boolean,
+): Promise<string> {
+  if (createDir) {
+    await mkdir(dirname(configPath), { recursive: true, mode: 0o755 });
+  }
   const tempPath = `${configPath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(config)}\n`, {
     encoding: "utf8",
     mode: 0o644,
   });
   await rename(tempPath, configPath);
+  return configPath;
 }
 
 async function removeActiveConfigIfCurrent(

@@ -82,6 +82,30 @@ final class SignerListenerDelegate: NSObject, NSXPCListenerDelegate {
 
 let service = SignerService(audit: auditLine)
 
+// A2/B2 custody bring-up: ensure the protected directory exists ROOT-OWNED and
+// not group/other-writable BEFORE any key/pin I/O (F-A2-1). If an operator-owned
+// directory was planted first, fail closed (exit non-zero) rather than adopt it —
+// a 0600 key inside an operator-writable dir can still be unlinked + swapped by
+// same-UID malware. launchd (KeepAlive) respawns us and re-surfaces the fault
+// until the operator repairs ownership.
+do {
+    try service.ensureCustodyDirectory()
+    auditLine("signer_custody_ok", ["dir": SignerConstants.protectedDirectory])
+} catch {
+    auditLine("signer_custody_fault", [
+        "dir": SignerConstants.protectedDirectory,
+        "detail": "directory is not root-owned or is group/other-writable",
+    ])
+    FileHandle.standardError.write(Data((
+        "[castle-wall-signer] FATAL: custody directory "
+        + "\(SignerConstants.protectedDirectory) must be root-owned and not "
+        + "group/other-writable. Refusing to serve. Repair with: "
+        + "sudo chown -R root:wheel '\(SignerConstants.protectedDirectory)' && "
+        + "sudo chmod 755 '\(SignerConstants.protectedDirectory)'\n"
+    ).utf8))
+    exit(1)
+}
+
 // Touch the key store at startup so the keypair exists before the first signing
 // request and any storage/permission fault surfaces in the launchd log early.
 service.publicKey { pub, err in

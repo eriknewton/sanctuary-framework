@@ -7,6 +7,7 @@
 //
 
 import XCTest
+import CastleWallIPC
 @testable import CastleWallSigner
 
 final class SignerServiceTests: XCTestCase {
@@ -18,10 +19,15 @@ final class SignerServiceTests: XCTestCase {
     override func setUpWithError() throws {
         tempDir = NSTemporaryDirectory() + "castle-signer-svc-" + UUID().uuidString
         try FileManager.default.createDirectory(
-            atPath: tempDir, withIntermediateDirectories: true
+            atPath: tempDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755]
         )
-        keyStore = SignerKeyStore(directory: tempDir, filename: "privkey.bin")
-        pinStore = PinStore(directory: tempDir, filename: "pin.bin")
+        // CI runs unprivileged: inject a root-simulating probe so the service's
+        // key + pin I/O exercises the happy custody path without root.
+        let custody = FileCustody(probe: FileCustody.rootSimulating())
+        keyStore = SignerKeyStore(directory: tempDir, filename: "privkey.bin", custody: custody)
+        pinStore = PinStore(directory: tempDir, filename: "pin.bin", custody: custody)
         service = SignerService(keyStore: keyStore, pinStore: pinStore)
     }
 

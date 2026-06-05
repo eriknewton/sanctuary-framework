@@ -203,9 +203,20 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
     }
 
     private func loadPinnedPublicKey() throws -> (path: URL, key: Data) {
-        let globalPath = URL(fileURLWithPath: "/Library/Application Support/Sanctuary")
+        let globalDir = "/Library/Application Support/Sanctuary"
+        let globalPath = URL(fileURLWithPath: globalDir)
             .appendingPathComponent("castle-pinned-pubkey.bin")
         if FileManager.default.fileExists(atPath: globalPath.path) {
+            // F-A2-2: the global pin is the A2/B2 root-owned trust anchor. Assert
+            // the custody chain (root-owned file in a root-owned, non-group/other-
+            // writable dir) and FAIL CLOSED on a violation — do NOT fall through
+            // to the home pin, which would let an attacker delete the global pin
+            // and substitute a planted home-dir key (the swap path B2 closes).
+            try FileCustody().assertFile(
+                globalPath.path,
+                directory: globalDir,
+                forbiddenFileBits: 0o022
+            )
             return (path: globalPath, key: try Auth.loadPinnedPublicKey(at: globalPath))
         }
 
@@ -215,19 +226,49 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
         return (path: homePath, key: try Auth.loadPinnedPublicKey(at: homePath))
     }
 
-    private struct ActiveConfigFingerprint {
+    struct ActiveConfigFingerprint: Equatable {
         let fortressId: String
         let pinnedPubkeySha256: String
     }
 
-    private static func activeConfigFingerprint(forSocketPath socketPath: String) -> ActiveConfigFingerprint? {
-        // Protected path first (A2/B2 relocation), then the legacy /tmp location
-        // for a half-migrated box.
-        let data = FileManager.default.contents(atPath: SocketPath.activeConfigPath)
-            ?? FileManager.default.contents(atPath: SocketPath.legacyActiveConfigPath)
-        guard let data else {
+    static func activeConfigFingerprint(
+        forSocketPath socketPath: String,
+        configPath: String = SocketPath.activeConfigPath,
+        custody: FileCustody = FileCustody(),
+        loadData: (String) -> Data? = { FileManager.default.contents(atPath: $0) },
+        isPidAliveFn: (Int) -> Bool = CastleWallFilterProvider.isPidAlive
+    ) -> ActiveConfigFingerprint? {
+        // F-A2-4: ONLY a ROOT-OWNED protected active-config may drive the
+        // fingerprint trust-gate. The legacy world-writable /tmp path (and any
+        // operator-owned file) is NOT consumed here — otherwise any local user
+        // could plant a config with a live pid + bogus `pinned_pubkey_sha256` and
+        // force a perpetual fingerprint-mismatch retry, wedging the wall's
+        // bootstrap (a default-deny DoS). When the protected config is absent or
+        // not root-owned, advertise NO fingerprint -> the gate is skipped and
+        // bootstrap proceeds; the IPC handshake still binds the pinned key.
+        // (Socket *discovery* keeps its /tmp read-fallback in SocketPath.resolve;
+        // discovery is handshake-protected, so it is not a trust gate.)
+        guard custody.fileIsRootOwned(configPath) else {
             return nil
         }
+        guard let data = loadData(configPath) else {
+            return nil
+        }
+        return parseActiveConfigFingerprint(
+            data: data,
+            forSocketPath: socketPath,
+            isPidAliveFn: isPidAliveFn
+        )
+    }
+
+    /// Pure parse of an active-config blob into a fingerprint, with no I/O and no
+    /// ownership decision (the caller gates ownership). Extracted so the parsing
+    /// invariants are unit-testable against planted bytes.
+    static func parseActiveConfigFingerprint(
+        data: Data,
+        forSocketPath socketPath: String,
+        isPidAliveFn: (Int) -> Bool = CastleWallFilterProvider.isPidAlive
+    ) -> ActiveConfigFingerprint? {
         guard
             let parsed = try? JSONSerialization.jsonObject(with: data),
             let object = parsed as? [String: Any],
@@ -236,7 +277,7 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
             let fortressId = object["fortress_id"] as? String,
             let pid = object["pid"] as? Int,
             pid > 0,
-            isPidAlive(pid),
+            isPidAliveFn(pid),
             let fingerprint = object["pinned_pubkey_sha256"] as? String,
             !fingerprint.isEmpty
         else {
@@ -248,7 +289,7 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
         )
     }
 
-    private static func isPidAlive(_ pid: Int) -> Bool {
+    static func isPidAlive(_ pid: Int) -> Bool {
         return kill(pid_t(pid), 0) == 0 || errno == EPERM
     }
 

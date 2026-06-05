@@ -25,6 +25,7 @@
 
 import Foundation
 import CryptoKit
+import CastleWallIPC
 
 /// Errors from key generation, storage, and signing.
 public enum SignerKeyError: Error, Equatable {
@@ -112,13 +113,19 @@ public struct SignerKey {
 public struct SignerKeyStore {
     public let directory: String
     public let filename: String
+    /// Root-ownership custody enforcer (A2/B2). Default checks the real
+    /// filesystem; tests inject a probe so the read/write logic runs without
+    /// root. See FileCustody.
+    public let custody: FileCustody
 
     public init(
         directory: String = SignerConstants.protectedDirectory,
-        filename: String = SignerConstants.signerPrivateKeyFilename
+        filename: String = SignerConstants.signerPrivateKeyFilename,
+        custody: FileCustody = FileCustody()
     ) {
         self.directory = directory
         self.filename = filename
+        self.custody = custody
     }
 
     public var path: String { "\(directory)/\(filename)" }
@@ -139,60 +146,43 @@ public struct SignerKeyStore {
         return key
     }
 
-    /// Persist the key as raw 32 bytes with 0600 permissions. Creates the
-    /// directory (0755) if absent. The helper runs as root, so files it creates
-    /// are root-owned; ownership is not chowned here.
+    /// Persist the key as raw 32 bytes, 0600. Ensures the custody directory
+    /// exists ROOT-OWNED and not group/other-writable BEFORE writing — and FAILS
+    /// CLOSED if it already exists operator-owned (F-A2-1): a 0600 key inside an
+    /// operator-writable directory can still be unlinked + swapped by same-UID
+    /// malware (POSIX governs unlink/rename by directory write permission). The
+    /// helper runs as root, so a freshly created dir + file are root-owned.
     public func save(_ key: SignerKey) throws {
-        let fm = FileManager.default
         do {
-            try fm.createDirectory(
-                atPath: directory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o755]
+            // Root-owned 0755: owner(root) writes; group/other read+traverse but
+            // cannot create/unlink/rename here, which is what protects the key.
+            try custody.ensureDirectory(directory, mode: 0o755)
+        } catch {
+            throw SignerKeyError.storageIO("custody dir: \(error)")
+        }
+        // F-A2-3: create the temp at 0600 BEFORE any bytes are observable, then
+        // atomically rename. Never materializes key bytes at a looser mode.
+        do {
+            try FileCustody.writeAtomicallyPrivate(
+                key.rawPrivateKey,
+                to: path,
+                mode: mode_t(0o600)
             )
         } catch {
-            throw SignerKeyError.storageIO("create dir: \(error)")
-        }
-        // Write to a temp sibling then rename, so a reader never sees a
-        // half-written key. Set 0600 BEFORE the rename so the key bytes are
-        // never group/other-readable, even transiently.
-        let tempPath = "\(path).tmp"
-        let data = key.rawPrivateKey
-        do {
-            try data.write(to: URL(fileURLWithPath: tempPath), options: [.atomic])
-            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tempPath)
-            // Replace destination atomically.
-            if fm.fileExists(atPath: path) {
-                try fm.removeItem(atPath: path)
-            }
-            try fm.moveItem(atPath: tempPath, toPath: path)
-            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
-        } catch {
-            try? fm.removeItem(atPath: tempPath)
             throw SignerKeyError.storageIO("write key: \(error)")
         }
     }
 
-    /// Load the key, refusing to proceed if the file is group/other-readable
-    /// (fail-closed: a private key with loose permissions is a defect, not a
-    /// thing to silently use).
+    /// Load the key, asserting the ROOT-OWNS-THE-CUSTODY-CHAIN invariant
+    /// (F-A2-1/F-A2-2): the key file must be owned by root and no
+    /// group/other-accessible, AND its parent directory must be root-owned and
+    /// not group/other-writable. A 0600 file owned by an operator (uid 501) is
+    /// rejected exactly like a loose-mode one — owner, not just mode, is checked.
+    /// Fail-closed: a custody violation is a defect, not a thing to silently use.
     public func load() throws -> SignerKey {
-        let fm = FileManager.default
-        let attrs: [FileAttributeKey: Any]
-        do {
-            attrs = try fm.attributesOfItem(atPath: path)
-        } catch {
-            throw SignerKeyError.storageIO("stat key: \(error)")
-        }
-        if let perms = attrs[.posixPermissions] as? NSNumber {
-            let mode = perms.uint16Value
-            if (mode & 0o077) != 0 {
-                throw SignerKeyError.insecurePermissions(
-                    "private key \(path) is group/other-accessible (mode \(String(mode, radix: 8)))"
-                )
-            }
-        }
-        guard let data = fm.contents(atPath: path) else {
+        // Secret material: forbid ANY group/other access (0o077).
+        try custody.assertFile(path, directory: directory, forbiddenFileBits: 0o077)
+        guard let data = FileManager.default.contents(atPath: path) else {
             throw SignerKeyError.storageIO("read key: empty/absent at \(path)")
         }
         return try SignerKey(rawPrivateKey: data)

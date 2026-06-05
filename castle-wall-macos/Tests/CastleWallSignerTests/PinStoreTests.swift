@@ -7,6 +7,7 @@
 //
 
 import XCTest
+import CastleWallIPC
 @testable import CastleWallSigner
 
 final class PinStoreTests: XCTestCase {
@@ -14,8 +15,12 @@ final class PinStoreTests: XCTestCase {
 
     override func setUpWithError() throws {
         tempDir = NSTemporaryDirectory() + "castle-pin-" + UUID().uuidString
+        // Explicit 0o755 so the custody (not group/other-writable) assertion is
+        // deterministic regardless of the CI umask.
         try FileManager.default.createDirectory(
-            atPath: tempDir, withIntermediateDirectories: true
+            atPath: tempDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755]
         )
     }
 
@@ -23,8 +28,15 @@ final class PinStoreTests: XCTestCase {
         try? FileManager.default.removeItem(atPath: tempDir)
     }
 
+    // CI runs unprivileged, so the temp dir is operator-owned. Inject a
+    // root-simulating probe (real mode, forced uid 0) so the write/read LOGIC is
+    // exercised on the happy custody path without actually running as root.
     private func makeStore() -> PinStore {
-        PinStore(directory: tempDir, filename: "pin.bin")
+        PinStore(
+            directory: tempDir,
+            filename: "pin.bin",
+            custody: FileCustody(probe: FileCustody.rootSimulating())
+        )
     }
 
     func testWriteReadRoundTrip() throws {

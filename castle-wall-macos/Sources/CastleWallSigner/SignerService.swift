@@ -34,6 +34,15 @@ public final class SignerService: NSObject, CastleWallSignerXPCProtocol {
         self.audit = audit
     }
 
+    /// Ensure the root-owned custody directory exists + is custodial BEFORE any
+    /// key/pin I/O (F-A2-1). Creates it root-owned-restrictive on first run; if
+    /// it already exists but is NOT root-owned (uid 0) or is group/other-writable,
+    /// throws so the helper can fail closed — never silently adopt an
+    /// operator-owned custody directory a non-root process may have planted.
+    public func ensureCustodyDirectory() throws {
+        try keyStore.custody.ensureDirectory(keyStore.directory, mode: 0o755)
+    }
+
     public func sign(
         payload: Data,
         purpose: String,

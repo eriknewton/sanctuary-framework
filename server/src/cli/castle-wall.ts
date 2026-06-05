@@ -187,7 +187,12 @@ async function writeGlobalPinnedPublicKey(
   publicKey: Uint8Array,
 ): Promise<void> {
   try {
-    await mkdir(CASTLE_GLOBAL_PINNED_PUBKEY_DIR, { recursive: true, mode: 0o755 });
+    // A2/B2 (F-A2-1): do NOT `mkdir` the custody directory here. This runs as the
+    // operator-UID provision-pin CLI; creating the directory operator-owned is
+    // exactly the gap the helper-as-signer design closes (an operator-owned dir
+    // lets same-UID malware swap the key + pin). The root signer helper creates
+    // + owns the directory. Best-effort write only IF the dir already exists
+    // root-owned (it will EACCES, handled below) — never bring it into being.
     await writeFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, publicKey, { mode: 0o644 });
     await chmod(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, 0o644);
   } catch (error) {
@@ -197,12 +202,12 @@ async function writeGlobalPinnedPublicKey(
         : undefined;
     // SAFETY: provision-pin diagnostics are operator-facing CLI stderr output.
     // Under A2 the global pin is root:wheel 0644 and owned by the signer helper;
-    // an operator-UID provision-pin CANNOT (and must not) overwrite it. Make
-    // that explicit and actionable rather than a vague warn — the trust anchor
-    // is migrated via `castle-wall re-pin`, not provision-pin.
-    if (code === "EACCES" || code === "EPERM") {
+    // an operator-UID provision-pin CANNOT (and must not) overwrite it, and the
+    // directory may not exist yet (ENOENT) because only the helper creates it.
+    // Both are expected — the trust anchor is migrated via `castle-wall re-pin`.
+    if (code === "EACCES" || code === "EPERM" || code === "ENOENT") {
       console.warn(
-        `[castle-wall] global pin ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH} is root-owned (A2); provision-pin does not write it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
+        `[castle-wall] global pin ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH} is owned by the root signer helper (A2); provision-pin does not write it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
       );
       return;
     }
@@ -638,7 +643,13 @@ export async function runSetupSharedDir(
   try {
     const dir = shellQuote(CASTLE_GLOBAL_PINNED_PUBKEY_DIR);
     execSyncFn(`mkdir -p ${dir}`);
-    execSyncFn(`chown ${shellQuote(`${sudoUser}:admin`)} ${dir}`);
+    // A2/B2 (F-A2-1): the custody directory holds the root-owned signing key +
+    // trust-anchor pin. It MUST be owned by root and not group/other-writable,
+    // or an operator-UID process could unlink + substitute those files (POSIX
+    // governs unlink/rename by DIRECTORY write permission). Chown to root:wheel,
+    // NOT to the operator. SUDO_USER above is validated only to confirm a real
+    // sudo invocation; it is no longer interpolated into a privileged command.
+    execSyncFn(`chown root:wheel ${dir}`);
     execSyncFn(`chmod 0755 ${dir}`);
   } catch (error) {
     write(err, `${error instanceof Error ? error.message : String(error)}\n`);
@@ -648,7 +659,7 @@ export async function runSetupSharedDir(
   write(out, `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}\n`);
   write(
     out,
-    "Shared dir ready. Re-run 'sanctuary castle-wall provision-pin' (or restart the daemon) to populate the pinned key; no per-fortress sudo cp needed.\n",
+    "Shared dir ready (root:wheel 0755). The signer helper owns the key + pin inside it; run 'sanctuary castle-wall re-pin' to install the trust anchor.\n",
   );
   return 0;
 }

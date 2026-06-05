@@ -8,6 +8,7 @@
 
 import XCTest
 import CryptoKit
+import CastleWallIPC
 @testable import CastleWallSigner
 
 final class SignerKeyTests: XCTestCase {
@@ -88,8 +89,12 @@ final class SignerKeyStoreTests: XCTestCase {
     override func setUpWithError() throws {
         tempDir = NSTemporaryDirectory()
             + "castle-signer-store-" + UUID().uuidString
+        // Explicit 0o755 so the custody (not group/other-writable) assertion is
+        // deterministic regardless of the CI umask.
         try FileManager.default.createDirectory(
-            atPath: tempDir, withIntermediateDirectories: true
+            atPath: tempDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755]
         )
     }
 
@@ -97,8 +102,14 @@ final class SignerKeyStoreTests: XCTestCase {
         try? FileManager.default.removeItem(atPath: tempDir)
     }
 
+    // CI runs unprivileged: inject a root-simulating probe (real mode, forced
+    // uid 0) so save/load exercise the happy custody path without root.
     private func makeStore() -> SignerKeyStore {
-        SignerKeyStore(directory: tempDir, filename: "privkey.bin")
+        SignerKeyStore(
+            directory: tempDir,
+            filename: "privkey.bin",
+            custody: FileCustody(probe: FileCustody.rootSimulating())
+        )
     }
 
     func testLoadOrCreateGeneratesThenPersists() throws {
@@ -122,13 +133,14 @@ final class SignerKeyStoreTests: XCTestCase {
     func testLoadRejectsGroupOtherReadableKey() throws {
         let store = makeStore()
         _ = try store.loadOrCreate()
-        // Loosen the permissions and confirm the store fails closed.
+        // Loosen the permissions and confirm the store fails closed. The private
+        // key forbids ANY group/other access (0o077), so a 0o644 key is rejected.
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o644], ofItemAtPath: store.path
         )
         XCTAssertThrowsError(try store.load()) { err in
-            guard case SignerKeyError.insecurePermissions = err else {
-                return XCTFail("expected insecurePermissions, got \(err)")
+            guard case FileCustodyError.fileTooPermissive = err else {
+                return XCTFail("expected fileTooPermissive, got \(err)")
             }
         }
     }

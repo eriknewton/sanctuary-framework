@@ -124,6 +124,9 @@ let package = Package(
         // macOS-26-only symbol) so it stays on the macos-latest CI floor.
         .target(
             name: "CastleWallSigner",
+            // FileCustody (root-ownership custody checks, A2/B2) is shared with
+            // the sysext side, so it lives in the pure CastleWallIPC library.
+            dependencies: ["CastleWallIPC"],
             path: "Sources/CastleWallSigner",
             linkerSettings: [
                 // SecRequirementCreateWithString for the caller code-requirement.
