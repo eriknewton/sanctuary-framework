@@ -123,7 +123,11 @@ export function computeWeightedScore(
   let totalWeight = 0;
 
   for (const a of attestations) {
-    const weight = TIER_WEIGHTS[a.tier];
+    // Fail closed: an unknown/imported-invalid tier (weight undefined) or a
+    // non-finite value must not poison the aggregate into NaN. A weight-0 tier
+    // already contributes nothing, so skipping it is behavior-preserving.
+    const weight = TIER_WEIGHTS[a.tier] ?? 0;
+    if (weight <= 0 || !Number.isFinite(a.value)) continue;
     weightedSum += a.value * weight;
     totalWeight += weight;
   }
