@@ -12,6 +12,8 @@ import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
+import { publicKeyToDid } from "../core/identity.js";
+import { fromBase64url } from "../core/encoding.js";
 import { FederationRegistry } from "./registry.js";
 
 export function createFederationTools(
@@ -43,7 +45,10 @@ export function createFederationTools(
           },
           peer_did: {
             type: "string",
-            description: "Peer DID (required for register)",
+            description:
+              "Peer DID. Optional: defaults to the did:key derived from the " +
+              "public key that signed the handshake SHR. If supplied, it MUST " +
+              "match that derived DID — a mismatched label is rejected.",
           },
           active_only: {
             type: "boolean",
@@ -81,11 +86,11 @@ export function createFederationTools(
 
           case "register": {
             const peerId = args.peer_id as string;
-            const peerDid = args.peer_did as string;
+            const suppliedDid = args.peer_did as string | undefined;
 
-            if (!peerId || !peerDid) {
+            if (!peerId) {
               return toolResult({
-                error: "Both peer_id and peer_did are required for registration.",
+                error: "peer_id is required for registration.",
               });
             }
 
@@ -105,6 +110,47 @@ export function createFederationTools(
               });
             }
 
+            // HS-3 fix part 1: a federation peer may ONLY be bound from a
+            // handshake that proved counterparty liveness via the nonce-bearing
+            // 4-step protocol. A `handshake_exchange` preview result
+            // (liveness_proven:false) can never be promoted to a trusted peer,
+            // even if somehow marked verified.
+            if (!hsResult.liveness_proven) {
+              return toolResult({
+                error:
+                  `Handshake with "${peerId}" did not prove liveness. ` +
+                  "Only a live 4-step handshake (handshake_initiate / respond / " +
+                  "complete) can establish a federation peer; a one-shot " +
+                  "handshake_exchange preview is not sufficient.",
+              });
+            }
+
+            // HS-3 fix part 2: bind peer_did to the key that actually signed
+            // the handshake SHR. Derive the DID from signed_by; if the caller
+            // supplied a DID, it MUST equal the derived one — preventing an
+            // arbitrary/impersonating label from being attached to a verified
+            // peer.
+            let derivedDid: string;
+            try {
+              const pubKey = fromBase64url(hsResult.counterparty_shr.signed_by);
+              derivedDid = publicKeyToDid(pubKey);
+            } catch (e) {
+              return toolResult({
+                error:
+                  `Could not derive peer DID from the handshake SHR: ${(e as Error).message}`,
+              });
+            }
+
+            if (suppliedDid && suppliedDid !== derivedDid) {
+              return toolResult({
+                error:
+                  "peer_did does not match the key that signed the handshake. " +
+                  "Omit peer_did to use the derived DID, or supply the correct one.",
+              });
+            }
+
+            const peerDid = derivedDid;
+
             const peer = registry.registerFromHandshake(hsResult, peerDid);
 
             auditLog.append("l4", "federation_peer_register", "system", {
@@ -116,6 +162,7 @@ export function createFederationTools(
             return toolResult({
               registered: true,
               peer_id: peer.peer_id,
+              peer_did: peer.peer_did,
               trust_tier: peer.trust_tier,
               active: peer.active,
               capabilities: peer.capabilities,

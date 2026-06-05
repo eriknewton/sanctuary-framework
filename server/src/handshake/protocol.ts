@@ -23,6 +23,48 @@ import { randomBytes } from "../core/random.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import type { IdentityManager } from "../l1-cognitive/tools.js";
 
+/**
+ * Handshake session time-to-live, in milliseconds.
+ *
+ * HS-2 (replay) defense: a handshake nonce is only valid for a short window.
+ * The window is anchored to the SERVER's own receipt/respond time
+ * (`new Date()` when the session is created), NOT to any counterparty-supplied
+ * timestamp such as `challenge.initiated_at` — a malicious initiator could set
+ * `initiated_at` in the future to defeat the TTL. The handshake is an
+ * interactive / relayed exchange, not human-paced, so 120 s is generous.
+ */
+export const HANDSHAKE_SESSION_TTL_MS = 120_000;
+
+/** Terminal session states — a session in any of these is single-use-spent. */
+export const TERMINAL_SESSION_STATES: ReadonlySet<HandshakeSession["state"]> =
+  new Set(["completed", "failed", "expired"]);
+
+/**
+ * Compute the server-anchored expiry for a session created/advanced now.
+ * @param now - current server time (defaults to new Date())
+ */
+export function sessionExpiry(now: Date = new Date()): string {
+  return new Date(now.getTime() + HANDSHAKE_SESSION_TTL_MS).toISOString();
+}
+
+/**
+ * Is the session past its server-anchored TTL?
+ *
+ * Fails closed (LOW#6): a session with a missing or unparseable expires_at is
+ * treated as EXPIRED, not permissive. All sessions created by the current code
+ * set a valid expires_at, so this is unreachable today — but any future session
+ * persistence/migration that drops the field must not silently disable the TTL.
+ */
+export function isSessionExpired(
+  session: HandshakeSession,
+  now: Date = new Date()
+): boolean {
+  if (!session.expires_at) return true;
+  const exp = new Date(session.expires_at);
+  if (isNaN(exp.getTime())) return true;
+  return now.getTime() > exp.getTime();
+}
+
 /** Generate a cryptographic nonce for handshake */
 function generateNonce(): string {
   const nonce = randomBytes(32);
@@ -41,12 +83,13 @@ export function initiateHandshake(
 ): { challenge: HandshakeChallenge; session: HandshakeSession } {
   const nonce = generateNonce();
   const sessionId = toBase64url(randomBytes(16));
+  const now = new Date();
 
   const challenge: HandshakeChallenge = {
     protocol_version: "1.0",
     shr: ourSHR,
     nonce,
-    initiated_at: new Date().toISOString(),
+    initiated_at: now.toISOString(),
   };
 
   const session: HandshakeSession = {
@@ -56,6 +99,8 @@ export function initiateHandshake(
     our_nonce: nonce,
     our_shr: ourSHR,
     initiated_at: challenge.initiated_at,
+    // HS-2: expiry anchored to OUR server clock, never to a peer-supplied value.
+    expires_at: sessionExpiry(now),
   };
 
   return { challenge, session };
@@ -102,13 +147,14 @@ export function respondToHandshake(
   );
 
   const responderNonce = generateNonce();
+  const now = new Date();
 
   const response: HandshakeResponse = {
     protocol_version: "1.0",
     shr: ourSHR,
     responder_nonce: responderNonce,
     initiator_nonce_signature: toBase64url(nonceSignature),
-    responded_at: new Date().toISOString(),
+    responded_at: now.toISOString(),
   };
 
   const session: HandshakeSession = {
@@ -120,6 +166,9 @@ export function respondToHandshake(
     our_shr: ourSHR,
     their_shr: challenge.shr,
     initiated_at: challenge.initiated_at,
+    // HS-2: expiry anchored to OUR receipt time, NOT challenge.initiated_at
+    // (which the initiator controls and could set in the future).
+    expires_at: sessionExpiry(now),
   };
 
   return { response, session };
@@ -200,6 +249,9 @@ export function completeHandshake(
     completed_at: now,
     expires_at: shrResult.expires_at,
     errors: [],
+    // 4-step path: reached only after the responder's nonce signature
+    // verified against signed_by — key-control + liveness are proven.
+    liveness_proven: true,
   };
 
   return { completion, result };
@@ -224,6 +276,7 @@ export function verifyCompletion(
       completed_at: completion.completed_at,
       expires_at: new Date().toISOString(),
       errors: [`Unsupported protocol version: ${(completion as { protocol_version: string }).protocol_version}`],
+      liveness_proven: false,
     };
   }
 
@@ -239,6 +292,7 @@ export function verifyCompletion(
       completed_at: completion.completed_at,
       expires_at: new Date().toISOString(),
       errors: ["No initiator SHR in session state"],
+      liveness_proven: false,
     };
   }
 
@@ -277,6 +331,9 @@ export function verifyCompletion(
     completed_at: completion.completed_at,
     expires_at: session.their_shr.body.expires_at,
     errors,
+    // Responder side: reached only after the initiator's nonce signature over
+    // OUR nonce verified — liveness is proven exactly when verified.
+    liveness_proven: verified,
   };
 }
 

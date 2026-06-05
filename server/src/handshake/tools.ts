@@ -23,6 +23,8 @@ import {
   respondToHandshake,
   completeHandshake,
   verifyCompletion,
+  isSessionExpired,
+  TERMINAL_SESSION_STATES,
 } from "./protocol.js";
 import {
   generateAttestation,
@@ -317,6 +319,21 @@ export function createHandshakeTools(
           });
           return toolResult({ error: `No handshake session found: ${sessionId}` });
         }
+        // HS-2: reject a session past its server-anchored TTL. Mark it
+        // `expired` (single-use terminal) so the nonce can never be reused.
+        if (isSessionExpired(session)) {
+          session.state = "expired";
+          auditHandshakeFailed(auditLog, {
+            session_id: sessionId,
+            role: "initiator",
+            identity_id: session.our_shr.body.instance_id,
+            reason: "session_expired",
+            error: "Handshake session expired",
+          });
+          return toolResult({ error: "Handshake session expired" });
+        }
+        // HS-2: single-use. Only a fresh `initiated` session can be completed;
+        // any terminal/advanced state is spent and must not be reusable.
         if (session.state !== "initiated") {
           auditHandshakeFailed(auditLog, {
             session_id: sessionId,
@@ -407,7 +424,32 @@ export function createHandshakeTools(
           return toolResult({ error: `No handshake session found: ${sessionId}` });
         }
 
-        // If completion is provided, verify it (responder side)
+        // HS-2: a completion against an expired session is rejected. Mark the
+        // session `expired` (single-use terminal) before any verification so a
+        // stale nonce cannot be reused. Only applies when actually verifying a
+        // completion; bare status reads on an expired session still surface the
+        // expired state below.
+        if (
+          completion &&
+          session.role === "responder" &&
+          !TERMINAL_SESSION_STATES.has(session.state) &&
+          isSessionExpired(session)
+        ) {
+          session.state = "expired";
+          auditHandshakeFailed(auditLog, {
+            session_id: session.session_id,
+            role: "responder",
+            identity_id: session.our_shr.body.instance_id,
+            reason: "session_expired",
+            error: "Handshake session expired",
+          });
+          return toolResult({ error: "Handshake session expired" });
+        }
+
+        // If completion is provided, verify it (responder side).
+        // The `state === "responded"` guard enforces single-use: once the
+        // completion is verified the session advances to completed/failed and
+        // can never be re-verified (replay of the completion message).
         if (completion && session.role === "responder" && session.state === "responded") {
           const result = verifyCompletion(completion, session);
           session.state = result.verified ? "completed" : "failed";
@@ -512,30 +554,45 @@ export function createHandshakeTools(
           return toolResult({ error: attestation.error });
         }
 
-        // 4. Store as a handshake result for tier resolution
+        // 4. Store as a handshake result for tier resolution.
+        //
+        // HS-1 / HS-2 fix: handshake_exchange is a STRUCTURAL PREVIEW ONLY.
+        // It performs no nonce challenge-response, so it proves neither
+        // counterparty key-control nor liveness — a captured SHR replays
+        // directly. Therefore it must NEVER write a `verified:true` result or
+        // a verified-sovereign / verified-degraded trust tier. It is barred
+        // from producing any trust label above `unverified`. Trust-establishing
+        // handshakes MUST go through the nonce-bearing 4-step protocol
+        // (handshake_initiate → respond → complete), which is the only path
+        // that can set liveness_proven:true.
         if (verificationResult.valid) {
           const sovereigntyLevel = verificationResult.sovereignty_level as
             | "full"
             | "degraded"
             | "minimal"
             | "unverified";
-          const trustTier =
-            sovereigntyLevel === "full"
-              ? "verified-sovereign"
-              : sovereigntyLevel === "degraded"
-                ? "verified-degraded"
-                : "unverified";
 
-          handshakeResults.set(verificationResult.counterparty_id, {
-            counterparty_id: verificationResult.counterparty_id,
-            counterparty_shr: counterpartySHR,
-            verified: true,
-            sovereignty_level: sovereigntyLevel,
-            trust_tier: trustTier as "verified-sovereign" | "verified-degraded" | "unverified",
-            completed_at: new Date().toISOString(),
-            expires_at: verificationResult.expires_at,
-            errors: [],
-          });
+          // MEDIUM#3: a structural preview must never DOWNGRADE an already
+          // established peer. If a verified / liveness-proven result already
+          // exists for this counterparty (from the 4-step protocol), leave it
+          // intact — otherwise a captured SHR replayed through the preview path
+          // would silently demote a live peer (downgrade DoS).
+          const existing = handshakeResults.get(
+            verificationResult.counterparty_id
+          );
+          if (!existing || (!existing.verified && !existing.liveness_proven)) {
+            handshakeResults.set(verificationResult.counterparty_id, {
+              counterparty_id: verificationResult.counterparty_id,
+              counterparty_shr: counterpartySHR,
+              verified: false,
+              sovereignty_level: sovereigntyLevel,
+              trust_tier: "unverified",
+              completed_at: new Date().toISOString(),
+              expires_at: verificationResult.expires_at,
+              errors: [],
+              liveness_proven: false,
+            });
+          }
         }
 
         auditLog.append("l4", "handshake_exchange", ourSHR.body.instance_id);
@@ -547,14 +604,20 @@ export function createHandshakeTools(
             counterparty_valid: verificationResult.valid,
             counterparty_sovereignty: verificationResult.sovereignty_level,
             counterparty_id: verificationResult.counterparty_id,
+            liveness_proven: false,
+            trust_tier: "unverified",
             errors: verificationResult.errors,
             warnings: verificationResult.warnings,
           },
           instructions:
+            "STRUCTURAL CHECK ONLY — counterparty liveness is NOT proven, so this " +
+            "is not a verified peer and cannot be used for federation. " +
             "The 'attestation' object is a signed, portable sovereignty verification artifact. " +
             "Share it with the counterparty or post attestation.summary publicly. " +
             "The counterparty can verify the attestation signature using your public key. " +
-            "Our SHR is included so the counterparty can perform their own verification of us.",
+            "Our SHR is included so the counterparty can perform their own verification of us. " +
+            "To establish a trusted peer, use the 4-step handshake_initiate / handshake_respond / " +
+            "handshake_complete protocol, which proves liveness via a nonce challenge.",
           _content_trust: "external",
         });
       },

@@ -41,6 +41,14 @@ export interface AttestationBody {
     subject_shr_valid: boolean;
     subject_sovereignty_level: SovereigntyLevel;
     subject_trust_tier: TrustTier;
+    /**
+     * Whether the subject's liveness was proven (nonce challenge-response).
+     * The one-shot exchange path performs NO liveness check, so it is false
+     * there; only the 4-step handshake can set it true. A verified trust tier
+     * (verified-sovereign / verified-degraded) is only legitimate when this is
+     * true — see deriveTrustTier gating below.
+     */
+    liveness_proven: boolean;
     /** Whether subject also verified attester (mutual exchange) */
     mutual: boolean;
     errors: string[];
@@ -86,6 +94,14 @@ export interface AttestationOptions {
   verificationResult: SHRVerificationResult;
   /** Whether this is a mutual exchange (both sides verify) */
   mutual?: boolean;
+  /**
+   * Whether the subject's liveness was proven via a nonce challenge-response.
+   * Defaults to false. When false, the attestation's trust tier is capped at
+   * `unverified` regardless of the subject's structural sovereignty level — a
+   * structural SHR check alone (e.g. handshake_exchange) can never confer a
+   * verified tier, because a captured/forged SHR replays without liveness.
+   */
+  livenessProven?: boolean;
   /** Identity manager for signing */
   identityManager: IdentityManager;
   /** Master key for key derivation */
@@ -109,6 +125,7 @@ export function generateAttestation(
     subjectSHR,
     verificationResult,
     mutual = false,
+    livenessProven = false,
     identityManager,
     masterKey,
     identityId,
@@ -132,6 +149,14 @@ export function generateAttestation(
     ? (verificationResult.sovereignty_level as SovereigntyLevel)
     : "unverified";
 
+  // A verified trust tier requires proven liveness. Without it, the structural
+  // sovereignty level is still reported honestly, but the tier is capped at
+  // `unverified` so consumers of the attestation cannot be misled into trusting
+  // a counterparty that was never liveness-checked (HIGH#2 fix).
+  const trustTier: TrustTier = livenessProven
+    ? deriveTrustTier(sovereigntyLevel)
+    : "unverified";
+
   const body: AttestationBody = {
     attestation_version: ATTESTATION_VERSION,
     attester_id: attesterSHR.body.instance_id,
@@ -141,7 +166,8 @@ export function generateAttestation(
     verification: {
       subject_shr_valid: verificationResult.valid,
       subject_sovereignty_level: sovereigntyLevel,
-      subject_trust_tier: deriveTrustTier(sovereigntyLevel),
+      subject_trust_tier: trustTier,
+      liveness_proven: livenessProven,
       mutual,
       errors: verificationResult.errors,
       warnings: verificationResult.warnings,
@@ -295,12 +321,19 @@ export function verifyAttestation(
     errors.push(`Signature verification error: ${(e as Error).message}`);
   }
 
+  // Refuse to surface a verified tier unless the signed body explicitly proves
+  // liveness. This fails closed for legacy/forged artifacts that lack the field
+  // (undefined !== true) and defends against a body that claims a verified tier
+  // while admitting liveness_proven:false (HIGH#2 defense in depth).
+  const livenessProven =
+    attestation.body.verification?.liveness_proven === true;
+
   return {
     valid: errors.length === 0,
     errors,
     attester_id: attestation.body.attester_id ?? "unknown",
     subject_id: attestation.body.subject_id ?? "unknown",
-    trust_tier: errors.length === 0
+    trust_tier: errors.length === 0 && livenessProven
       ? attestation.body.verification.subject_trust_tier
       : "unverified",
     expired,

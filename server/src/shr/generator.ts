@@ -14,9 +14,10 @@ import type {
   DegradationCode,
   LayerStatus,
 } from "./types.js";
+import type { SHRRotationEvent } from "./types.js";
 import { canonicalizeForSigning } from "./types.js";
 import { sign } from "../core/identity.js";
-import { toBase64url, stringToBytes } from "../core/encoding.js";
+import { toBase64url, stringToBytes, fromBase64url, bytesToString } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
 import type { SovereigntyTier } from "../l4-reputation/tiers.js";
@@ -297,6 +298,18 @@ export function generateSHR(
     },
     degradations,
   };
+
+  // Carry the key-rotation chain so a rotated identity's SHR can still bind
+  // its current signing key back to the stable instance_id. The stored
+  // rotation_event blob is the canonical signed RotationEvent JSON; decode it
+  // into the structured proof the verifier walks. Only attach when the
+  // identity has actually rotated, so never-rotated SHRs are unchanged.
+  if (identity.rotation_history.length > 0) {
+    body.key_rotation_proof = identity.rotation_history.map(
+      (h) =>
+        JSON.parse(bytesToString(fromBase64url(h.rotation_event))) as SHRRotationEvent
+    );
+  }
 
   // Canonical serialization for signing
   const canonical = canonicalizeForSigning(body);

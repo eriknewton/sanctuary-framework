@@ -5,14 +5,26 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { generateRandomKey } from "../../src/core/random.js";
+import { generateRandomKey, randomBytes } from "../../src/core/random.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
-import { createIdentity } from "../../src/core/identity.js";
+import {
+  createIdentity,
+  generateIdentityId,
+  rotateKeys,
+} from "../../src/core/identity.js";
+import type { StoredIdentity } from "../../src/core/identity.js";
+import type { SHRRotationEvent } from "../../src/shr/types.js";
 import { generateSHR } from "../../src/shr/generator.js";
 import { verifySHR } from "../../src/shr/verifier.js";
 import { canonicalizeForSigning } from "../../src/shr/types.js";
 import { SIGNATURE_SCHEME_V1 } from "../../src/mesh/constants.js";
+import {
+  toBase64url,
+  fromBase64url,
+  stringToBytes,
+} from "../../src/core/encoding.js";
 import type { SignedSHR } from "../../src/shr/types.js";
 import type { SanctuaryConfig } from "../../src/config.js";
 import { defaultConfig } from "../../src/config.js";
@@ -233,6 +245,321 @@ describe("Sovereignty Health Report (SHR)", () => {
 
       // MVS has degraded L2 and L3, so overall should be "degraded"
       expect(result.sovereignty_level).toBe("degraded");
+    });
+  });
+
+  // ─── HS-1: instance_id ⇄ signed_by binding (forged-peer remediation) ──
+  describe("Identity binding (HS-1)", () => {
+    /**
+     * Forge an SHR: take a real, valid SHR, RE-SIGN its (unchanged) body with
+     * a brand-new keypair, and set signed_by to the fresh pubkey — but leave
+     * the victim's instance_id in the body. The signature is cryptographically
+     * valid against the fresh key, yet generateIdentityId(freshKey) !==
+     * instance_id, so verifySHR MUST reject it.
+     */
+    function forgeWithFreshKey(victim: SignedSHR): SignedSHR {
+      const freshPriv = randomBytes(32);
+      const freshPub = ed25519.getPublicKey(freshPriv);
+      const canonical = canonicalizeForSigning(victim.body);
+      const sig = ed25519.sign(stringToBytes(canonical), freshPriv);
+      return {
+        ...victim,
+        signed_by: toBase64url(freshPub), // attacker's key
+        signature: toBase64url(sig), // valid sig over the SAME body
+        // body (incl. victim instance_id) is left untouched
+      };
+    }
+
+    it("rejects an SHR whose instance_id is not generateIdentityId(signed_by)", () => {
+      const victim = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+      }) as SignedSHR;
+
+      const forged = forgeWithFreshKey(victim);
+
+      // The forged signature DOES verify against its own (fresh) key, so the
+      // ONLY check that can reject it is the identity binding: the fresh key's
+      // derived id differs from the victim instance_id left in the body.
+      const forgedKeyId = generateIdentityId(fromBase64url(forged.signed_by));
+      expect(forgedKeyId).not.toBe(forged.body.instance_id);
+
+      const result = verifySHR(forged);
+      expect(result.valid).toBe(false);
+      expect(
+        result.errors.some((e) => e.includes("not bound to signed_by"))
+      ).toBe(true);
+    });
+
+    it("accepts an SHR whose instance_id correctly derives from signed_by", () => {
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+      }) as SignedSHR;
+
+      // Self-consistent by construction (generator sets instance_id =
+      // identity.identity_id = generateIdentityId(pubkey)).
+      const result = verifySHR(shr);
+      expect(result.valid).toBe(true);
+      expect(
+        result.errors.some((e) => e.includes("not bound to signed_by"))
+      ).toBe(false);
+    });
+
+    it("rejects a self-minted SHR claiming a victim's instance_id", () => {
+      // Attacker mints their own self-consistent identity, then swaps in the
+      // victim's instance_id while signing with the attacker key.
+      const victim = generateSHR(undefined, {
+        config,
+        identityManager: identityManager as any,
+        masterKey,
+      }) as SignedSHR;
+      const victimId = victim.body.instance_id;
+
+      // Attacker's own fresh keypair + SHR over a body claiming victimId.
+      const attackerPriv = randomBytes(32);
+      const attackerPub = ed25519.getPublicKey(attackerPriv);
+      const forgedBody = { ...victim.body, instance_id: victimId };
+      const canonical = canonicalizeForSigning(forgedBody);
+      const sig = ed25519.sign(stringToBytes(canonical), attackerPriv);
+
+      const forged: SignedSHR = {
+        body: forgedBody,
+        signed_by: toBase64url(attackerPub),
+        signature: toBase64url(sig),
+        signature_scheme: SIGNATURE_SCHEME_V1,
+      };
+
+      // The attacker would need a key whose SHA-256[:16] equals victimId.
+      expect(generateIdentityId(attackerPub)).not.toBe(victimId);
+
+      const result = verifySHR(forged);
+      expect(result.valid).toBe(false);
+      expect(
+        result.errors.some((e) => e.includes("not bound to signed_by"))
+      ).toBe(true);
+    });
+  });
+
+  // ─── HIGH#1: rotation-aware identity binding ──────────────────────────
+  describe("Identity binding with key rotation (HIGH#1)", () => {
+    const encKeyFor = (mk: Uint8Array) =>
+      derivePurposeKey(mk, "identity-encryption");
+
+    /**
+     * Build an identity, rotate its keys `times`, and return a manager that
+     * serves the rotated identity as default — plus the origin key id.
+     */
+    function rotatedAgent(times: number) {
+      const mk = generateRandomKey();
+      const encKey = encKeyFor(mk);
+      const { storedIdentity } = createIdentity("rot", encKey, "recovery-key");
+      const originId = storedIdentity.identity_id; // == generateIdentityId(origin pubkey)
+
+      let current: StoredIdentity = storedIdentity;
+      for (let i = 0; i < times; i++) {
+        current = rotateKeys(current, encKey, `rotation-${i}`).updatedIdentity;
+      }
+      const rotated = current;
+
+      const manager = {
+        get: (id: string) => (id === rotated.identity_id ? rotated : undefined),
+        getDefault: () => rotated,
+        list: () => [rotated],
+      };
+      return { mk, manager, rotated, originId };
+    }
+
+    function shrOf(times: number) {
+      const { mk, manager, rotated, originId } = rotatedAgent(times);
+      const shr = generateSHR(undefined, {
+        config,
+        identityManager: manager as any,
+        masterKey: mk,
+      });
+      if (typeof shr === "string") throw new Error(shr);
+      return { shr, rotated, originId };
+    }
+
+    it("accepts a rotated identity's SHR via a valid rotation chain", () => {
+      const { shr, originId } = shrOf(1);
+
+      // The signing key no longer derives instance_id directly...
+      expect(generateIdentityId(fromBase64url(shr.signed_by))).not.toBe(
+        shr.body.instance_id
+      );
+      // ...but instance_id is the STABLE origin id, and the chain is carried.
+      expect(shr.body.instance_id).toBe(originId);
+      expect(shr.body.key_rotation_proof).toBeDefined();
+      expect(shr.body.key_rotation_proof!.length).toBe(1);
+
+      const result = verifySHR(shr);
+      expect(result.valid).toBe(true);
+      expect(
+        result.errors.some((e) => e.includes("not bound to signed_by"))
+      ).toBe(false);
+    });
+
+    it("accepts a multi-hop rotation chain", () => {
+      const { shr } = shrOf(3);
+      expect(shr.body.key_rotation_proof!.length).toBe(3);
+      const result = verifySHR(shr);
+      expect(result.valid).toBe(true);
+    });
+
+    it("rejects a rotated SHR whose proof is stripped (proof is load-bearing)", () => {
+      const { shr } = shrOf(1);
+      // Drop the proof but keep the rotated signing key + stable instance_id.
+      // The SHR signature is unchanged here, but without the chain the binding
+      // can no longer be established → fail closed.
+      const stripped: SignedSHR = {
+        ...shr,
+        body: { ...shr.body, key_rotation_proof: undefined },
+      };
+      const result = verifySHR(stripped);
+      expect(result.valid).toBe(false);
+      expect(
+        result.errors.some((e) => e.includes("not self-certifying"))
+      ).toBe(true);
+    });
+
+    it("rejects a fabricated chain whose origin does not derive instance_id", () => {
+      // Attacker claims a victim instance_id and fabricates a chain starting
+      // from a key they control. generateIdentityId(theirOrigin) !== victimId,
+      // which a 128-bit preimage would be required to satisfy.
+      const victimId = "deadbeefdeadbeefdeadbeefdeadbeef"; // arbitrary 32-hex id
+      const attackerPriv = randomBytes(32);
+      const attackerPub = ed25519.getPublicKey(attackerPriv);
+      const attackerPubB64 = toBase64url(attackerPub);
+
+      // A self-signed (by attacker) rotation event — structurally complete.
+      const rotated_at = new Date().toISOString();
+      const eventData = JSON.stringify({
+        old_public_key: attackerPubB64,
+        new_public_key: attackerPubB64,
+        identity_id: victimId,
+        reason: "forged",
+        rotated_at,
+      });
+      const evSig = ed25519.sign(stringToBytes(eventData), attackerPriv);
+      const proof: SHRRotationEvent[] = [
+        {
+          old_public_key: attackerPubB64,
+          new_public_key: attackerPubB64,
+          identity_id: victimId,
+          reason: "forged",
+          rotated_at,
+          signature: toBase64url(evSig),
+        },
+      ];
+
+      const base = shrOf(0).shr;
+      const forgedBody = {
+        ...base.body,
+        instance_id: victimId,
+        key_rotation_proof: proof,
+      };
+      const sig = ed25519.sign(
+        stringToBytes(canonicalizeForSigning(forgedBody)),
+        attackerPriv
+      );
+      const forged: SignedSHR = {
+        body: forgedBody,
+        signed_by: attackerPubB64,
+        signature: toBase64url(sig),
+        signature_scheme: SIGNATURE_SCHEME_V1,
+      };
+
+      const result = verifySHR(forged);
+      expect(result.valid).toBe(false);
+      expect(
+        result.errors.some((e) =>
+          e.includes("origin key does not derive instance_id")
+        )
+      ).toBe(true);
+    });
+
+    it("rejects a chain whose terminus is redirected to an attacker key", () => {
+      // Take a legitimately rotated SHR, then redirect the final event's
+      // new_public_key to an attacker key and re-sign the SHR body with that
+      // key. The per-event signature (made by the real origin over the real
+      // new key) no longer matches the tampered event data → rejected.
+      const { shr } = shrOf(1);
+      const attackerPriv = randomBytes(32);
+      const attackerPub = ed25519.getPublicKey(attackerPriv);
+      const attackerPubB64 = toBase64url(attackerPub);
+
+      const tamperedProof = shr.body.key_rotation_proof!.map((e) => ({ ...e }));
+      tamperedProof[tamperedProof.length - 1]!.new_public_key = attackerPubB64;
+
+      const forgedBody = { ...shr.body, key_rotation_proof: tamperedProof };
+      const sig = ed25519.sign(
+        stringToBytes(canonicalizeForSigning(forgedBody)),
+        attackerPriv
+      );
+      const forged: SignedSHR = {
+        body: forgedBody,
+        signed_by: attackerPubB64,
+        signature: toBase64url(sig),
+        signature_scheme: SIGNATURE_SCHEME_V1,
+      };
+
+      const result = verifySHR(forged);
+      expect(result.valid).toBe(false);
+      expect(
+        result.errors.some((e) =>
+          e.includes("key_rotation_proof event signature is invalid")
+        )
+      ).toBe(true);
+    });
+  });
+
+  // ─── LOW#5: malformed SHR (missing layers) fails closed ───────────────
+  describe("Malformed SHR fails closed (LOW#5)", () => {
+    it("rejects an SHR with a valid signature but no layers (no throw)", () => {
+      const priv = randomBytes(32);
+      const pub = ed25519.getPublicKey(priv);
+
+      // Body omitting `layers` entirely, signed consistently so the only thing
+      // that can reject it is the layer-completeness guard — and it must not
+      // throw an uncaught TypeError dereferencing layers.l1.
+      const body: any = {
+        shr_version: "1.0",
+        implementation: {
+          sanctuary_version: "test",
+          node_version: "test",
+          generated_by: "sanctuary-mcp-server",
+        },
+        instance_id: generateIdentityId(pub),
+        generated_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 3600_000).toISOString(),
+        capabilities: {
+          handshake: true,
+          shr_exchange: true,
+          reputation_verify: true,
+          encrypted_channel: false,
+        },
+        degradations: [],
+        // layers intentionally omitted
+      };
+      const sig = ed25519.sign(stringToBytes(canonicalizeForSigning(body)), priv);
+      const shr: SignedSHR = {
+        body,
+        signed_by: toBase64url(pub),
+        signature: toBase64url(sig),
+        signature_scheme: SIGNATURE_SCHEME_V1,
+      };
+
+      let result!: ReturnType<typeof verifySHR>;
+      expect(() => {
+        result = verifySHR(shr);
+      }).not.toThrow();
+      expect(result.valid).toBe(false);
+      expect(
+        result.errors.some((e) => e.includes("Missing one or more layer"))
+      ).toBe(true);
     });
   });
 
