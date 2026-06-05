@@ -208,4 +208,34 @@ describe("exit import state warning", () => {
     expect(imported?.value).toBe("durable state survives CLI import");
     expect(imported?.written_by).toBe(destination.identity.identity_id);
   });
+
+  it("rejects --import-state without source credentials, fail-closed", async () => {
+    // F-1.3.1-N-003 follow-through: encrypted source state can only be
+    // re-keyed with a source credential, so --import-state alone can never
+    // import. The gate must reject up front rather than silently no-op.
+    const source = await bootstrapFortress(SOURCE_PASSPHRASE, "source");
+    cleanup.push(source.storagePath);
+    const bundleDir = await exportBundle(source);
+
+    const destination = await mkdtemp(join(tmpdir(), "sanctuary-cli-dest-"));
+    cleanup.push(destination);
+    process.env.SANCTUARY_STORAGE_PATH = destination;
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runExitCommand({
+      argv: ["import", bundleDir, "--activate", "--import-state", "--yes"],
+      out,
+      err,
+      env: { SANCTUARY_PASSPHRASE: DESTINATION_PASSPHRASE },
+    });
+
+    expect(code).toBe(2);
+    expect(err.text).toContain(
+      "--import-state requires --source-passphrase or --source-recovery-key",
+    );
+    // The gate fires before any import/activation work runs.
+    expect(out.text).not.toContain("verdict:");
+    expect(err.text).not.toContain("NO STATE was imported");
+  });
 });

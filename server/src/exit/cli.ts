@@ -534,6 +534,22 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         );
         return 2;
       }
+      // F-1.3.1-N-003 follow-through: --import-state without source
+      // credentials can never import (the exported state is encrypted under
+      // the source master key, which only --source-passphrase /
+      // --source-recovery-key supply). Without this gate the request silently
+      // ends in `staged_requires_source_key` (no resume path exists) or, for a
+      // stateless bundle, the post-activate WARNING tells the operator to
+      // "re-run with --import-state" — which they already did. Fail closed
+      // with actionable guidance instead.
+      if (importState && !sourcePassphrase && !sourceRecoveryKey) {
+        write(
+          err,
+          "--import-state requires --source-passphrase or --source-recovery-key " +
+            "(the source fortress credentials that decrypt the exported state)\n"
+        );
+        return 2;
+      }
       if (activate) {
         const prompt = forceRebind
           ? "Tier 1 approval required: activate verified imported exit bundle AND replace the existing fortress public identity (force-rebind)?"
