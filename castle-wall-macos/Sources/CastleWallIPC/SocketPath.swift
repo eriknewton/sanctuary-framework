@@ -34,7 +34,15 @@ public struct ResolvedSocketPath: Equatable {
 }
 
 public enum SocketPath {
-    public static let activeConfigPath = "/tmp/sanctuary-castle-active.json"
+    // Active-config discovery file. Relocated out of world-writable /tmp into the
+    // root-protected Castle Wall directory (A2/B2). MUST match the TS mirror
+    // (server/src/castle-wall/runtime/socket-path.ts).
+    public static let activeConfigPath =
+        "/Library/Application Support/Sanctuary/castle-active.json"
+
+    // Legacy /tmp location, read-fallback only (half-migrated box). Nothing
+    // writes here anymore.
+    public static let legacyActiveConfigPath = "/tmp/sanctuary-castle-active.json"
 
     /// Resolve the UDS socket path the macOS extension or the Linux client
     /// should connect to.
@@ -50,9 +58,18 @@ public enum SocketPath {
         explicitOverride: String? = nil,
         activeConfigPath: String = SocketPath.activeConfigPath
     ) -> ResolvedSocketPath {
-        if platform == "darwin",
-           let active = resolveActiveConfigSocketPath(configPath: activeConfigPath) {
-            return active
+        if platform == "darwin" {
+            if let active = resolveActiveConfigSocketPath(configPath: activeConfigPath) {
+                return active
+            }
+            // Legacy /tmp read-fallback ONLY for the production default path, so a
+            // test passing an explicit (hermetic) configPath is not perturbed by
+            // a stray /tmp file from a real daemon.
+            if activeConfigPath == SocketPath.activeConfigPath,
+               let legacyActive = resolveActiveConfigSocketPath(
+                   configPath: SocketPath.legacyActiveConfigPath) {
+                return legacyActive
+            }
         }
 
         if let override = explicitOverride, !override.isEmpty {

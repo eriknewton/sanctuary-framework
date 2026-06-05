@@ -739,6 +739,11 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runConfigureOrigin(args.slice(1));
   }
 
+  if (command === "re-pin") {
+    const { runRePin } = await import("./cli/castle-wall.js");
+    return runRePin();
+  }
+
   if (command === "daemon") {
     const { runDaemon } = await import("./cli/castle-wall.js");
     return runDaemon();
@@ -768,6 +773,7 @@ function printCastleWallHelp(): void {
     audit-dump       Emit Castle Wall audit events as JSONL.
     approve          Approve a pending Castle Wall request.
     configure-origin Configure the agent-origin descriptor for origin-differential enforcement.
+    re-pin           Migrate the trust anchor to the root signer helper's key (one-time, operator-approved).
     daemon           Start the enforcement daemon standalone (existing fortress key); foreground until Ctrl-C.
 
   Options:

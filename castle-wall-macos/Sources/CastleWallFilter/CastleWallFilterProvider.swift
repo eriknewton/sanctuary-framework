@@ -221,7 +221,11 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
     }
 
     private static func activeConfigFingerprint(forSocketPath socketPath: String) -> ActiveConfigFingerprint? {
-        guard let data = FileManager.default.contents(atPath: SocketPath.activeConfigPath) else {
+        // Protected path first (A2/B2 relocation), then the legacy /tmp location
+        // for a half-migrated box.
+        let data = FileManager.default.contents(atPath: SocketPath.activeConfigPath)
+            ?? FileManager.default.contents(atPath: SocketPath.legacyActiveConfigPath)
+        guard let data else {
             return nil
         }
         guard

@@ -4,7 +4,6 @@ import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 
 import { bytesToString, toBase64url } from "../../core/encoding.js";
-import { sign as identitySign } from "../../core/identity.js";
 import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.js";
 import type { AuditLog } from "../../l2-operational/audit-log.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
@@ -19,12 +18,14 @@ import type {
 } from "../ipc/messages.js";
 import {
   buildSignedManifest,
-  type ManifestSigningKey,
+  localManifestSigner,
 } from "./manifest-publisher.js";
+import { HelperSignerClient, type ShimInvoker } from "./helper-signer.js";
 import { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
 import {
   CASTLE_WALL_ACTIVE_CONFIG_PATH,
+  CASTLE_WALL_ACTIVE_CONFIG_LEGACY_PATH,
   resolveCastleWallSocketPath,
 } from "./socket-path.js";
 
@@ -32,6 +33,21 @@ const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
 const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = "/Library/Application Support/Sanctuary";
 const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
+
+/**
+ * Signing handle used by the daemon. B2: the production default routes both
+ * manifest and handshake-nonce signing through the root helper (`mode: "helper"`),
+ * so no private key reaches this process. The local path (`mode: "local"`) is a
+ * dev/test fallback gated behind an explicit flag; it must be OFF for the P1
+ * key-non-extraction drill.
+ */
+export interface DaemonSigner {
+  mode: "helper" | "local";
+  signingKeyId: string;
+  publicKey: Uint8Array;
+  signManifest(canonicalBytes: Uint8Array): Promise<Uint8Array>;
+  signNonce(nonce: Uint8Array): Promise<Uint8Array>;
+}
 
 export const CASTLE_WALL_ALREADY_RUNNING_MESSAGE =
   "Castle Wall daemon already running for this fortress (PID <pid>). Multi-wrap-per-fortress is Phase 3.";
@@ -52,6 +68,23 @@ export interface MacOSCastleWallDaemonInput {
    * sysext classifies every flow as `.agent` (machine-wide default-deny).
    */
   agentOrigin?: unknown;
+  /**
+   * Explicit signing handle. When provided it is used verbatim (tests inject a
+   * fake). When absent the daemon builds one via the helper path (default) or
+   * the local path (`localSign`).
+   */
+  signer?: DaemonSigner;
+  /**
+   * Force the LOCAL (dev/test) signing path: decrypt the on-disk private key
+   * with the master key and sign in-process. Default is the helper path. The
+   * P1 key-non-extraction drill REQUIRES this to be OFF (the proof is void if a
+   * local key can sign). Also honored via env `SANCTUARY_CASTLE_LOCAL_SIGN=1`.
+   */
+  localSign?: boolean;
+  /** Absolute path to the `castle-wall-signer-client` shim (helper path). */
+  signerClientPath?: string;
+  /** Override the shim runner (tests). */
+  signerClientInvoke?: ShimInvoker;
 }
 
 export type MacOSCastleWallListenerOptions = ConstructorParameters<
@@ -76,10 +109,6 @@ interface ManifestState {
   rules: AllowlistRule[];
 }
 
-interface LoadedSigningKey extends ManifestSigningKey {
-  publicKey: Uint8Array;
-}
-
 interface ActiveCastleWallConfig {
   socket_path: string;
   fortress_id: string;
@@ -99,22 +128,28 @@ export async function startMacOSCastleWallDaemon(
       fortressPath: input.fortressPath,
     }).path;
   const activeConfigPath = input.activeConfigPath ?? CASTLE_WALL_ACTIVE_CONFIG_PATH;
+  // Legacy /tmp read-fallback only applies to the production default path, so a
+  // test passing an explicit (hermetic) activeConfigPath is never perturbed by a
+  // stray /tmp file from a real daemon.
+  const legacyActiveConfigPath = input.activeConfigPath
+    ? undefined
+    : CASTLE_WALL_ACTIVE_CONFIG_LEGACY_PATH;
 
-  await assertActiveConfigNotOwnedByLiveProcess(activeConfigPath);
+  await assertActiveConfigNotOwnedByLiveProcess(activeConfigPath, legacyActiveConfigPath);
   await assertSocketNotOwnedByLiveProcess(socketPath);
   await mkdir(join(input.fortressPath, "policy", "egress", "rules"), {
     recursive: true,
     mode: 0o700,
   });
 
-  const signingKey = await loadSigningKey(input.fortressPath, input.masterKey);
-  await writeSystemPinnedPublicKey(signingKey.publicKey);
-  const pinnedPublicKeySha256 = sha256Hex(signingKey.publicKey);
+  const signer = input.signer ?? (await loadSigningKey(input));
+  await writeSystemPinnedPublicKey(signer);
+  const pinnedPublicKeySha256 = sha256Hex(signer.publicKey);
   const agentOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
   let manifestState = await loadManifestState({
     fortressPath: input.fortressPath,
     fortressId: input.fortressId,
-    signingKey,
+    signer,
     agentOrigin,
   });
   const pendingRequests = new Set<string>();
@@ -143,9 +178,11 @@ export async function startMacOSCastleWallDaemon(
     consumer,
     handshakeSigner: {
       fortressId: input.fortressId,
-      signingKeyId: signingKey.signingKeyId,
+      signingKeyId: signer.signingKeyId,
+      // B2: delegate nonce signing to the helper (or local dev path), symmetric
+      // with manifest signing. Async — the listener awaits it.
       signNonce(nonce) {
-        return identitySign(nonce, signingKey.encryptedPrivateKey, signingKey.encryptionKey);
+        return signer.signNonce(nonce);
       },
     },
     adminHandler: {
@@ -214,7 +251,7 @@ export async function startMacOSCastleWallDaemon(
       manifestState = await loadManifestState({
         fortressPath: input.fortressPath,
         fortressId: input.fortressId,
-        signingKey,
+        signer,
         agentOrigin: reloadedOrigin,
       });
       const emitted = await listener.broadcastManifestUpdate();
@@ -315,10 +352,54 @@ async function resolveAgentOrigin(
   }
 }
 
-async function loadSigningKey(
+/**
+ * Build the daemon's signing handle. B2 default = helper path: the public key is
+ * fetched from the root helper over the shim and signing is delegated to it, so
+ * NO private key is read or decrypted in this process (P1, P3 — no passphrase
+ * needed to sign). The local path (dev/test, explicit opt-in) preserves the old
+ * decrypt-in-process behavior.
+ */
+async function loadSigningKey(input: MacOSCastleWallDaemonInput): Promise<DaemonSigner> {
+  const localSign =
+    input.localSign === true ||
+    (input.localSign === undefined &&
+      process.env.SANCTUARY_CASTLE_LOCAL_SIGN === "1");
+
+  if (localSign) {
+    return loadLocalSigningKey(input.fortressPath, input.masterKey);
+  }
+
+  const clientBinaryPath =
+    input.signerClientPath ?? process.env.SANCTUARY_CASTLE_SIGNER_CLIENT;
+  if (!clientBinaryPath && !input.signerClientInvoke) {
+    // Fail-closed: helper signing is the default and we have no way to reach the
+    // helper. Refuse rather than silently degrading to a local key.
+    throw new Error(
+      "Castle Wall helper signing is unavailable: set SANCTUARY_CASTLE_SIGNER_CLIENT to the signer-client shim path (or SANCTUARY_CASTLE_LOCAL_SIGN=1 for the dev local-sign path).",
+    );
+  }
+  const client = new HelperSignerClient({
+    clientBinaryPath: clientBinaryPath ?? "castle-wall-signer-client",
+    ...(input.signerClientInvoke ? { invoke: input.signerClientInvoke } : {}),
+  });
+  const publicKey = await client.getPublicKey();
+  if (publicKey.length !== 32) {
+    throw new Error(`Helper public key must be 32 bytes (found ${publicKey.length}).`);
+  }
+  return {
+    mode: "helper",
+    signingKeyId: `castle-wall:${toBase64url(publicKey)}`,
+    publicKey,
+    signManifest: (bytes) => client.signManifest(bytes),
+    signNonce: (nonce) => client.signNonce(nonce),
+  };
+}
+
+/** Dev/test local-sign path: decrypt the on-disk private key with the master key. */
+async function loadLocalSigningKey(
   fortressPath: string,
   masterKey: Uint8Array,
-): Promise<LoadedSigningKey> {
+): Promise<DaemonSigner> {
   const publicKey = await readFile(join(fortressPath, CASTLE_PINNED_PUBKEY));
   if (publicKey.length !== 32) {
     throw new Error(`Pinned public key must be 32 bytes (found ${publicKey.length}).`);
@@ -336,21 +417,41 @@ async function loadSigningKey(
   } finally {
     privateKey.fill(0);
   }
-  return {
+  const signer = localManifestSigner({
     signingKeyId: `castle-wall:${toBase64url(publicKey)}`,
     encryptedPrivateKey,
     encryptionKey: masterKey,
-    publicKey,
+  });
+  return {
+    mode: "local",
+    signingKeyId: signer.signingKeyId,
+    publicKey: new Uint8Array(publicKey),
+    signManifest: async (bytes) => signer.sign(bytes),
+    signNonce: async (nonce) => signer.sign(nonce),
   };
 }
 
-async function writeSystemPinnedPublicKey(publicKey: Uint8Array): Promise<void> {
+/**
+ * Write the global trust-anchor pin. Under A2 the helper owns the pin file
+ * (root:wheel 0644) and writes it during re-pin — so in helper mode the daemon
+ * must NOT write it (it lacks root and would only EACCES). It is explicit, not a
+ * silent warn. In the local dev/test path the daemon still best-effort writes it
+ * so a developer box without the helper still has a readable pin.
+ */
+async function writeSystemPinnedPublicKey(signer: DaemonSigner): Promise<void> {
+  if (signer.mode === "helper") {
+    // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+    console.error(
+      "[castle-wall] pin is owned by the root signer helper (A2); daemon does not write it.",
+    );
+    return;
+  }
   try {
     await mkdir(CASTLE_GLOBAL_PINNED_PUBKEY_DIR, {
       recursive: true,
       mode: 0o755,
     });
-    await writeFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, publicKey, { mode: 0o644 });
+    await writeFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, signer.publicKey, { mode: 0o644 });
     await chmod(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, 0o644);
   } catch (error) {
     // SAFETY: daemon startup diagnostics are operator-facing stderr output.
@@ -363,7 +464,7 @@ async function writeSystemPinnedPublicKey(publicKey: Uint8Array): Promise<void> 
 async function loadManifestState(input: {
   fortressPath: string;
   fortressId: string;
-  signingKey: LoadedSigningKey;
+  signer: DaemonSigner;
   agentOrigin?: unknown;
 }): Promise<ManifestState> {
   const rulesDir = join(input.fortressPath, "policy", "egress", "rules");
@@ -387,14 +488,17 @@ async function loadManifestState(input: {
     }
     rules.push(parsed);
   }
-  const { signed } = buildSignedManifest({
+  const { signed } = await buildSignedManifest({
     fortressId: input.fortressId,
     issuedAt: new Date().toISOString(),
     rules,
-    signingKey: input.signingKey,
+    signer: {
+      signingKeyId: input.signer.signingKeyId,
+      sign: (bytes) => input.signer.signManifest(bytes),
+    },
     agentOrigin: input.agentOrigin,
   });
-  const verifyResult = verifyManifestSignature(signed, input.signingKey.publicKey);
+  const verifyResult = verifyManifestSignature(signed, input.signer.publicKey);
   if (!verifyResult.ok) {
     throw new Error(`manifest signature verification failed: ${verifyResult.error}`);
   }
@@ -456,8 +560,11 @@ function socketHasLiveListener(socketPath: string): Promise<boolean> {
   });
 }
 
-async function assertActiveConfigNotOwnedByLiveProcess(configPath: string): Promise<void> {
-  const config = await readActiveConfig(configPath);
+async function assertActiveConfigNotOwnedByLiveProcess(
+  configPath: string,
+  legacyConfigPath?: string,
+): Promise<void> {
+  const config = await readActiveConfig(configPath, legacyConfigPath);
   if (!config) return;
   if (isPidAlive(config.pid)) {
     throw new Error(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
@@ -498,7 +605,10 @@ async function removeActiveConfigIfCurrent(
   }
 }
 
-async function readActiveConfig(configPath: string): Promise<ActiveCastleWallConfig | null> {
+async function readActiveConfig(
+  configPath: string,
+  legacyConfigPath?: string,
+): Promise<ActiveCastleWallConfig | null> {
   let raw: string;
   try {
     raw = await readFile(configPath, "utf8");
@@ -506,7 +616,14 @@ async function readActiveConfig(configPath: string): Promise<ActiveCastleWallCon
     const code = err instanceof Error && "code" in err
       ? (err as NodeJS.ErrnoException).code
       : undefined;
-    if (code === "ENOENT") return null;
+    if (code === "ENOENT") {
+      // Migration: a daemon from before the active-config relocation may still
+      // have its discovery file under the legacy /tmp path. Read it so a
+      // half-migrated box still resolves liveness; writes only ever go to the
+      // protected path.
+      if (legacyConfigPath) return readActiveConfig(legacyConfigPath);
+      return null;
+    }
     throw err;
   }
 
