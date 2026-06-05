@@ -559,10 +559,23 @@ export class ApprovalGate {
    * Strips potentially large values to keep the prompt readable.
    */
   private summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
+    // Hard Constraint #1: the approval context built from these args can be
+    // sent to an external webhook / dashboard BEFORE approval, so it must
+    // carry operation METADATA only, never secret content. Redact
+    // secret-named fields, and summarize objects/arrays to shape so a nested
+    // secret (e.g. an identity object's encrypted_private_key) cannot leak.
+    const SENSITIVE_ARG_NAME =
+      /pass(phrase|word)|secret|private_key|recovery_key|master_key|seed_phrase|mnemonic|credential/i;
     const summary: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(args)) {
-      if (typeof value === "string" && value.length > 100) {
-        summary[key] = value.slice(0, 100) + "...";
+      if (SENSITIVE_ARG_NAME.test(key)) {
+        summary[key] = "[redacted]";
+      } else if (typeof value === "string") {
+        summary[key] = value.length > 100 ? value.slice(0, 100) + "..." : value;
+      } else if (value !== null && typeof value === "object") {
+        summary[key] = Array.isArray(value)
+          ? `[array(${value.length})]`
+          : `[object(${Object.keys(value as Record<string, unknown>).length} keys)]`;
       } else {
         summary[key] = value;
       }
