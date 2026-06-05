@@ -119,7 +119,7 @@ describe("Sovereignty Attestation Artifacts", () => {
       expect(attestation.body.subject_shr.body.instance_id).toBe(shrB.body.instance_id);
     });
 
-    it("sets correct sovereignty level for MVS agents", () => {
+    it("sets correct sovereignty level for MVS agents (liveness proven)", () => {
       const agentA = makeAgent();
       const agentB = makeAgent();
 
@@ -131,6 +131,7 @@ describe("Sovereignty Attestation Artifacts", () => {
         attesterSHR: shrA,
         subjectSHR: shrB,
         verificationResult: verification,
+        livenessProven: true, // 4-step protocol path: liveness was proven
         identityManager: agentA.identityManager as any,
         masterKey: agentA.masterKey,
       });
@@ -140,6 +141,39 @@ describe("Sovereignty Attestation Artifacts", () => {
       // MVS has L2 degraded (no TEE), so overall is degraded
       expect(attestation.body.verification.subject_sovereignty_level).toBe("degraded");
       expect(attestation.body.verification.subject_trust_tier).toBe("verified-degraded");
+      expect(attestation.body.verification.liveness_proven).toBe(true);
+    });
+
+    it("caps the trust tier at unverified when liveness is not proven (default)", () => {
+      // HIGH#2: a structural attestation (no nonce challenge-response) must
+      // never confer a verified tier, even for a fully-sovereign subject. The
+      // sovereignty level is still reported honestly.
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const verification = verifySHR(shrB);
+
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verification,
+        // livenessProven omitted → defaults to false
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      expect(attestation.body.verification.liveness_proven).toBe(false);
+      expect(attestation.body.verification.subject_trust_tier).toBe("unverified");
+      // Structural level is still honest.
+      expect(attestation.body.verification.subject_sovereignty_level).toBe("degraded");
+      // The signed artifact verifies, but consumers see only `unverified`.
+      const result = verifyAttestation(attestation);
+      expect(result.valid).toBe(true);
+      expect(result.trust_tier).toBe("unverified");
     });
 
     it("marks mutual exchanges correctly", () => {
@@ -232,6 +266,7 @@ describe("Sovereignty Attestation Artifacts", () => {
         attesterSHR: shrA,
         subjectSHR: shrB,
         verificationResult: verification,
+        livenessProven: true, // verified tier requires proven liveness
         identityManager: agentA.identityManager as any,
         masterKey: agentA.masterKey,
       });
@@ -246,6 +281,34 @@ describe("Sovereignty Attestation Artifacts", () => {
       expect(result.subject_id).toBe(shrB.body.instance_id);
       expect(result.trust_tier).toBe("verified-degraded");
       expect(result.expired).toBe(false);
+    });
+
+    it("refuses a verified tier when the body admits liveness_proven:false", () => {
+      // HIGH#2 defense in depth: even if an attestation body claims a verified
+      // tier, verifyAttestation must cap it to unverified unless liveness is
+      // explicitly proven in the signed body.
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const verification = verifySHR(shrB);
+
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verification,
+        // no liveness → tier is capped at generation time
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      const result = verifyAttestation(attestation);
+      // Signature is valid, but liveness was never proven → unverified.
+      expect(result.valid).toBe(true);
+      expect(result.trust_tier).toBe("unverified");
     });
 
     it("detects tampered attestation body", () => {
@@ -402,6 +465,7 @@ describe("Sovereignty Attestation Artifacts", () => {
         attesterSHR: shrA,
         subjectSHR: shrB,
         verificationResult: verification,
+        livenessProven: true,
         identityManager: agentA.identityManager as any,
         masterKey: agentA.masterKey,
       });

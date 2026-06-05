@@ -572,17 +572,27 @@ export function createHandshakeTools(
             | "minimal"
             | "unverified";
 
-          handshakeResults.set(verificationResult.counterparty_id, {
-            counterparty_id: verificationResult.counterparty_id,
-            counterparty_shr: counterpartySHR,
-            verified: false,
-            sovereignty_level: sovereigntyLevel,
-            trust_tier: "unverified",
-            completed_at: new Date().toISOString(),
-            expires_at: verificationResult.expires_at,
-            errors: [],
-            liveness_proven: false,
-          });
+          // MEDIUM#3: a structural preview must never DOWNGRADE an already
+          // established peer. If a verified / liveness-proven result already
+          // exists for this counterparty (from the 4-step protocol), leave it
+          // intact — otherwise a captured SHR replayed through the preview path
+          // would silently demote a live peer (downgrade DoS).
+          const existing = handshakeResults.get(
+            verificationResult.counterparty_id
+          );
+          if (!existing || (!existing.verified && !existing.liveness_proven)) {
+            handshakeResults.set(verificationResult.counterparty_id, {
+              counterparty_id: verificationResult.counterparty_id,
+              counterparty_shr: counterpartySHR,
+              verified: false,
+              sovereignty_level: sovereigntyLevel,
+              trust_tier: "unverified",
+              completed_at: new Date().toISOString(),
+              expires_at: verificationResult.expires_at,
+              errors: [],
+              liveness_proven: false,
+            });
+          }
         }
 
         auditLog.append("l4", "handshake_exchange", ourSHR.body.instance_id);

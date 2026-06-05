@@ -49,16 +49,19 @@ export function sessionExpiry(now: Date = new Date()): string {
 
 /**
  * Is the session past its server-anchored TTL?
- * Returns false for sessions with no/invalid expiry (treated as not-yet-set,
- * caller should not have created such a session post-fix).
+ *
+ * Fails closed (LOW#6): a session with a missing or unparseable expires_at is
+ * treated as EXPIRED, not permissive. All sessions created by the current code
+ * set a valid expires_at, so this is unreachable today — but any future session
+ * persistence/migration that drops the field must not silently disable the TTL.
  */
 export function isSessionExpired(
   session: HandshakeSession,
   now: Date = new Date()
 ): boolean {
-  if (!session.expires_at) return false;
+  if (!session.expires_at) return true;
   const exp = new Date(session.expires_at);
-  if (isNaN(exp.getTime())) return false;
+  if (isNaN(exp.getTime())) return true;
   return now.getTime() > exp.getTime();
 }
 

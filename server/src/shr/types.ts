@@ -86,6 +86,26 @@ export interface SHRCapabilities {
 }
 
 /**
+ * A single key-rotation event, carried in the SHR so a verifier can bind a
+ * rotated signing key back to a stable `instance_id`.
+ *
+ * Each event is signed by `old_public_key` over the canonical event data
+ * (the five fields below, in declaration order — matching `rotateKeys` in
+ * core/identity.ts). The chain is self-authenticating: forging a link
+ * requires the prior key's private key, so an attacker cannot fabricate a
+ * chain that terminates at a key they control while originating from a
+ * victim's `instance_id`.
+ */
+export interface SHRRotationEvent {
+  old_public_key: string; // base64url
+  new_public_key: string; // base64url
+  identity_id: string; // stable instance_id (constant across rotations)
+  reason: string;
+  rotated_at: string; // ISO 8601
+  signature: string; // base64url, by old_public_key over the event data
+}
+
+/**
  * The SHR body — the content that gets signed.
  * Canonical form: JSON with sorted keys, no whitespace.
  */
@@ -107,6 +127,15 @@ export interface SHRBody {
   };
   capabilities: SHRCapabilities;
   degradations: SHRDegradation[];
+  /**
+   * Optional key-rotation chain. Present only when the signing identity has
+   * rotated its keys at least once. Lets a verifier accept an SHR whose
+   * `signed_by` no longer derives `instance_id` directly, provided the chain
+   * links the origin key (which does derive `instance_id`) to `signed_by`.
+   * Absent for never-rotated identities, keeping their canonical form
+   * byte-identical to pre-rotation SHRs.
+   */
+  key_rotation_proof?: SHRRotationEvent[];
 }
 
 /**

@@ -8,11 +8,96 @@
  * - Sovereignty level assessment
  */
 
-import type { SignedSHR, SHRVerificationResult, SHRBody } from "./types.js";
+import type { SignedSHR, SHRVerificationResult, SHRBody, SHRRotationEvent } from "./types.js";
 import { canonicalizeForSigning } from "./types.js";
 import { verify, generateIdentityId } from "../core/identity.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
+
+/**
+ * Upper bound on rotation-chain length. A legitimate identity rotates rarely;
+ * a bound keeps an attacker from forcing unbounded verification work with a
+ * long crafted chain (each link costs an Ed25519 verify).
+ */
+const MAX_ROTATION_CHAIN = 64;
+
+/**
+ * Verify that a key-rotation chain links the identity origin (whose key
+ * derives `instanceId`) to `signedBy`. Returns an error string on any failure,
+ * or null when the chain is valid.
+ *
+ * The chain is self-authenticating: every event must be signed by its
+ * `old_public_key`, and links forward (event[i].new == event[i+1].old). An
+ * attacker cannot forge a chain terminating at a key they control because the
+ * first link requires the victim origin key's signature, which they do not
+ * hold.
+ */
+function verifyRotationChain(
+  proof: SHRRotationEvent[] | undefined,
+  signedBy: string,
+  instanceId: string
+): string | null {
+  if (!Array.isArray(proof) || proof.length === 0) {
+    return "instance_id is not bound to signed_by — SHR identity is not self-certifying";
+  }
+  if (proof.length > MAX_ROTATION_CHAIN) {
+    return "key_rotation_proof exceeds the maximum chain length";
+  }
+
+  // 1. The origin key must commit to instance_id.
+  let originPub: Uint8Array;
+  try {
+    originPub = fromBase64url(proof[0]!.old_public_key);
+  } catch {
+    return "key_rotation_proof origin key is malformed";
+  }
+  if (generateIdentityId(originPub) !== instanceId) {
+    return "key_rotation_proof origin key does not derive instance_id";
+  }
+
+  // 2. Walk the chain: each event signed by its old key, linking forward, and
+  //    referencing the stable instance_id.
+  let prevNewKey = proof[0]!.old_public_key;
+  for (let i = 0; i < proof.length; i++) {
+    const ev = proof[i]!;
+    if (ev.old_public_key !== prevNewKey) {
+      return "key_rotation_proof chain is not contiguous";
+    }
+    if (ev.identity_id !== instanceId) {
+      return "key_rotation_proof event references a different identity";
+    }
+    let oldPub: Uint8Array;
+    let sig: Uint8Array;
+    try {
+      oldPub = fromBase64url(ev.old_public_key);
+      sig = fromBase64url(ev.signature);
+      fromBase64url(ev.new_public_key); // validate encoding
+    } catch {
+      return "key_rotation_proof contains a malformed event";
+    }
+    // Reconstruct the signed event data — field order MUST match rotateKeys
+    // (core/identity.ts): old_public_key, new_public_key, identity_id, reason,
+    // rotated_at.
+    const eventData = JSON.stringify({
+      old_public_key: ev.old_public_key,
+      new_public_key: ev.new_public_key,
+      identity_id: ev.identity_id,
+      reason: ev.reason,
+      rotated_at: ev.rotated_at,
+    });
+    if (!verify(stringToBytes(eventData), sig, oldPub)) {
+      return "key_rotation_proof event signature is invalid";
+    }
+    prevNewKey = ev.new_public_key;
+  }
+
+  // 3. The chain must terminate at the key that signed this SHR.
+  if (prevNewKey !== signedBy) {
+    return "key_rotation_proof does not terminate at signed_by";
+  }
+
+  return null;
+}
 
 /**
  * Verify a signed SHR.
@@ -79,22 +164,35 @@ export function verifySHR(
     // 3a. Identity binding (HS-1 fix): instance_id MUST be the
     // self-certifying commitment to signed_by. instance_id is defined as
     // generateIdentityId(pubkey) = SHA-256(pubkey)[:16] hex (core/identity.ts,
-    // shr/generator.ts:261). A signed-but-self-issued SHR claiming someone
+    // shr/generator.ts). A signed-but-self-issued SHR claiming someone
     // else's instance_id therefore fails here: an attacker would need a key
     // whose SHA-256[:16] equals the victim's id (128-bit second preimage).
+    //
+    // Rotation-aware (HIGH#1 fix): rotateKeys keeps instance_id STABLE while
+    // changing the signing key, so a rotated identity's signed_by no longer
+    // derives instance_id directly. In that case accept the SHR iff it carries
+    // a valid key_rotation_proof chain from the origin key (which DOES derive
+    // instance_id) to signed_by. The chain is cryptographically verified, so
+    // this does not weaken the forged-peer protection.
     const expectedId = generateIdentityId(publicKey);
     if (expectedId !== shr.body.instance_id) {
-      errors.push(
-        "instance_id is not bound to signed_by — SHR identity is not self-certifying"
+      const chainError = verifyRotationChain(
+        shr.body.key_rotation_proof,
+        shr.signed_by,
+        shr.body.instance_id
       );
+      if (chainError) {
+        errors.push(chainError);
+      }
     }
   } catch (e) {
     errors.push(`Signature verification failed: ${(e as Error).message}`);
   }
 
-  // 4. Layer completeness check
+  // 4. Layer completeness check (fail closed: a missing `layers` object is a
+  // malformed SHR, not a pass — guard before dereferencing).
   const { layers } = shr.body;
-  if (!layers.l1 || !layers.l2 || !layers.l3 || !layers.l4) {
+  if (!layers || !layers.l1 || !layers.l2 || !layers.l3 || !layers.l4) {
     errors.push("Missing one or more layer definitions");
   }
 
@@ -124,6 +222,16 @@ export function verifySHR(
 function assessSovereigntyLevel(
   body: SHRBody
 ): "full" | "degraded" | "minimal" {
+  // Fail closed: a malformed SHR missing any layer cannot assert sovereignty.
+  if (
+    !body.layers ||
+    !body.layers.l1 ||
+    !body.layers.l2 ||
+    !body.layers.l3 ||
+    !body.layers.l4
+  ) {
+    return "minimal";
+  }
   const { l1, l2, l3, l4 } = body.layers;
 
   // All active = full

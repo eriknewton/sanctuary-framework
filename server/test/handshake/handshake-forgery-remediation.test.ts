@@ -27,6 +27,7 @@ import { AuditLog } from "../../src/l2-operational/audit-log.js";
 import { createL1Tools } from "../../src/l1-cognitive/tools.js";
 import { createHandshakeTools } from "../../src/handshake/tools.js";
 import { createFederationTools } from "../../src/federation/tools.js";
+import { verifyAttestation } from "../../src/handshake/attestation.js";
 import { generateSHR } from "../../src/shr/generator.js";
 import {
   createIdentity,
@@ -138,6 +139,17 @@ describe("M2: handshake_exchange can never produce a verified peer", () => {
     expect(out.verification.liveness_proven).toBe(false);
     expect(out.verification.trust_tier).toBe("unverified");
 
+    // HIGH#2: the PRIMARY output — the signed attestation artifact — must NOT
+    // smuggle a verified tier out the side door. Pre-fix it stamped
+    // verified-sovereign here even though the verification block said unverified.
+    expect(out.attestation.body.verification.liveness_proven).toBe(false);
+    expect(out.attestation.body.verification.subject_trust_tier).toBe("unverified");
+    expect(out.attestation.body.verification.subject_trust_tier).not.toBe(
+      "verified-sovereign"
+    );
+    // And verifyAttestation must agree: no verified tier without liveness.
+    expect(verifyAttestation(out.attestation).trust_tier).toBe("unverified");
+
     // The stored result must NOT be verified, regardless of sovereignty level.
     const stored = handshakeResults.get(counterpartySHR.body.instance_id);
     expect(stored).toBeDefined();
@@ -146,6 +158,44 @@ describe("M2: handshake_exchange can never produce a verified peer", () => {
     expect(stored!.trust_tier).toBe("unverified");
     expect(stored!.trust_tier).not.toBe("verified-sovereign");
     expect(stored!.trust_tier).not.toBe("verified-degraded");
+  });
+
+  it("does not downgrade an already-established live peer (MEDIUM#3)", async () => {
+    const agent = makeAgent();
+    await createIdentityFor(agent);
+    const { tools, handshakeResults } = createHandshakeTools(
+      agent.config,
+      agent.identityManager,
+      agent.masterKey,
+      agent.auditLog
+    );
+
+    const counterpartySHR = fullSovereignSHR(shrFor(agent));
+    const peerId = counterpartySHR.body.instance_id;
+
+    // Simulate an established, liveness-proven peer (as the 4-step protocol
+    // would leave it in the results map).
+    handshakeResults.set(peerId, {
+      counterparty_id: peerId,
+      counterparty_shr: counterpartySHR,
+      verified: true,
+      sovereignty_level: "full",
+      trust_tier: "verified-sovereign",
+      completed_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 3600_000).toISOString(),
+      errors: [],
+      liveness_proven: true,
+    });
+
+    // A subsequent structural preview of a (captured) SHR for the same peer
+    // must NOT clobber the established entry down to unverified.
+    const exchange = tools.find((t) => t.name === "handshake_exchange")!;
+    await exchange.handler({ counterparty_shr: counterpartySHR });
+
+    const stored = handshakeResults.get(peerId);
+    expect(stored!.verified).toBe(true);
+    expect(stored!.liveness_proven).toBe(true);
+    expect(stored!.trust_tier).toBe("verified-sovereign");
   });
 
   it("a replayed (captured) valid SHR via exchange yields only unverified", async () => {
@@ -330,6 +380,26 @@ describe("M3: federation register binds peer_did to the signing key", () => {
 // ──────────────────────────────────────────────────────────────────────────
 
 describe("M4: 4-step nonce session TTL + single-use", () => {
+  it("isSessionExpired fails closed for missing/invalid expires_at (LOW#6)", async () => {
+    const { isSessionExpired } = await import("../../src/handshake/protocol.js");
+    // A session with no expiry must be treated as EXPIRED, not permissive.
+    expect(
+      isSessionExpired({ expires_at: undefined } as unknown as HandshakeSession)
+    ).toBe(true);
+    expect(
+      isSessionExpired({ expires_at: "" } as unknown as HandshakeSession)
+    ).toBe(true);
+    expect(
+      isSessionExpired({ expires_at: "not-a-date" } as unknown as HandshakeSession)
+    ).toBe(true);
+    // A valid, far-future expiry is still not expired.
+    expect(
+      isSessionExpired({
+        expires_at: new Date(Date.now() + 3600_000).toISOString(),
+      } as unknown as HandshakeSession)
+    ).toBe(false);
+  });
+
   // Drive the initiator side end to end so a real session exists in the map.
   async function setupInitiatedSession() {
     const initiator = makeAgent();
