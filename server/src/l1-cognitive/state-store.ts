@@ -1036,11 +1036,19 @@ export class StateStore {
   }> {
     const namespacesToExport: string[] = [];
 
+    // F6: never export internal `_`-prefixed namespaces — import() rejects them
+    // (so they cannot round-trip) and they are internal-subsystem state external
+    // export must not expose. Filter HERE (not mid-loop) so the serialized
+    // `namespaces` metadata and `data` stay consistent: the bundle never lists a
+    // namespace it does not actually contain.
     if (namespace) {
-      namespacesToExport.push(namespace);
+      if (!namespace.startsWith("_")) {
+        namespacesToExport.push(namespace);
+      }
     } else {
       // Discover all namespaces from the content hash cache
       for (const ns of this.contentHashes.keys()) {
+        if (ns.startsWith("_")) continue;
         namespacesToExport.push(ns);
       }
     }
@@ -1118,8 +1126,12 @@ export class StateStore {
     for (const [ns, entries] of Object.entries(
       bundle.data as Record<string, Array<{ key: string; entry: StateEntry }>>
     )) {
-      // Namespace firewall: skip reserved namespaces during import
-      if (RESERVED_NAMESPACE_PREFIXES.some(
+      // Namespace firewall: skip reserved namespaces during import.
+      // F6: reject ALL underscore-prefixed (internal) namespaces, not just the
+      // curated RESERVED_NAMESPACE_PREFIXES list. Export never emits a
+      // `_`-prefixed namespace, so any in a bundle is crafted; the curated list
+      // could miss a newer internal `_`-namespace and let a bundle write into it.
+      if (ns.startsWith("_") || RESERVED_NAMESPACE_PREFIXES.some(
         (prefix) => ns === prefix || ns.startsWith(prefix + "/")
       )) {
         skippedKeys += (entries as Array<{ key: string; entry: StateEntry }>).length;

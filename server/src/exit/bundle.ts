@@ -411,7 +411,10 @@ async function exportEncryptedState(
   );
   const entries: ExitEncryptedStateBundle["entries"] = [];
   for (const namespace of [...namespaceSet].sort()) {
-    if (isReservedNamespace(namespace)) continue;
+    // F6: never export internal `_`-prefixed namespaces — the rekey/import path
+    // rejects them, so exporting one (e.g. an explicit `--state-namespace _x`)
+    // would silently fail to round-trip. Symmetric with the import guard.
+    if (namespace.startsWith("_") || isReservedNamespace(namespace)) continue;
     const metas = await opts.storage.list(namespace);
     for (const meta of metas) {
       const raw = await opts.storage.read(namespace, meta.key);
@@ -938,7 +941,12 @@ async function rekeyState(
   let conflicts = 0;
 
   for (const item of encryptedState.entries) {
-    if (isReservedNamespace(item.namespace)) {
+    // F6: reject ALL underscore-prefixed (internal) namespaces on import, not
+    // just the curated reserved list. Export only ever emits non-`_` namespaces
+    // (see discoverFilesystemStateNamespaces / exportEncryptedState), so any
+    // `_`-namespace in a bundle is crafted; the curated isReservedNamespace list
+    // could miss a newer internal `_`-namespace and let a bundle rekey into it.
+    if (item.namespace.startsWith("_") || isReservedNamespace(item.namespace)) {
       skipped++;
       continue;
     }

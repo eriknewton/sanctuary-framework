@@ -121,10 +121,17 @@ const RESERVED_NAMESPACE_PREFIXES = [
  * Returns the matching reserved prefix, or null if the namespace is safe.
  */
 function getReservedNamespaceViolation(namespace: string): string | null {
-  for (const prefix of RESERVED_NAMESPACE_PREFIXES) {
-    if (namespace === prefix || namespace.startsWith(prefix + "/")) {
-      return prefix;
+  // F6: ALL underscore-prefixed namespaces are reserved for internal subsystems;
+  // external callers must not write/read/list/delete them. The curated list below
+  // enumerates the known internal namespaces (used for a precise violation label),
+  // but the `_` prefix is the contract — a non-curated `_foo` is still reserved.
+  if (namespace.startsWith("_")) {
+    for (const prefix of RESERVED_NAMESPACE_PREFIXES) {
+      if (namespace === prefix || namespace.startsWith(prefix + "/")) {
+        return prefix;
+      }
     }
+    return namespace;
   }
   return null;
 }

@@ -219,4 +219,35 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
     const reservedEntries = await freshStorage.list("_identities");
     expect(reservedEntries).toHaveLength(0);
   });
+
+  it("should skip non-curated underscore-prefixed namespaces during import (F6)", async () => {
+    // `_escrows` (plural) is NOT in RESERVED_NAMESPACE_PREFIXES (which lists the
+    // singular `_escrow`), so the curated check alone missed it. Export never
+    // emits a `_`-prefixed namespace, so any in a bundle is crafted and must be
+    // rejected regardless of the curated list. Pre-F6 this entry was imported.
+    const validBundle = await createValidBundle([
+      { ns: "notes", key: "legit", value: "legit value" },
+    ]);
+
+    const decoded = decodeBundle(validBundle);
+    decoded.data["_escrows"] = [
+      {
+        key: "injected",
+        entry: decoded.data["notes"]![0]!.entry,
+      },
+    ];
+    decoded.namespaces.push("_escrows");
+
+    const modifiedBundle = encodeBundle(decoded);
+
+    const freshStorage = new MemoryStorage();
+    const freshStore = new StateStore(freshStorage, masterKey);
+
+    const result = await freshStore.import(modifiedBundle, "skip", resolver);
+
+    expect(result.imported_keys).toBe(1);
+    expect(result.skipped_keys).toBeGreaterThanOrEqual(1);
+    const injected = await freshStorage.list("_escrows");
+    expect(injected).toHaveLength(0);
+  });
 });
