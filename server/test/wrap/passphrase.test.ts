@@ -61,12 +61,14 @@ function makeExec(): {
       if (value) return { stdout: value + "\n", stderr: "", code: 0 };
       return { stdout: "", stderr: "not found", code: 44 };
     }
-    if (cmd === "security" && args[0] === "add-generic-password") {
-      const wIdx = args.indexOf("-w");
-      if (wIdx < 0 || !args[wIdx + 1]) {
+    if (cmd === "security" && args[0] === "-i") {
+      // F5: writes now arrive as a `security -i` batch script on stdin so the
+      // value never appears in argv. Parse the escaped value out of the script.
+      const m = input?.match(/-w "((?:[^"\\]|\\.)*)"/);
+      if (!m) {
         return { stdout: "", stderr: "missing -w", code: 1 };
       }
-      stored.set(key, args[wIdx + 1]!);
+      stored.set(key, m[1].replace(/\\(.)/g, "$1"));
       return { stdout: "", stderr: "", code: 0 };
     }
     return { stdout: "", stderr: "unknown", code: 1 };
@@ -389,7 +391,9 @@ describe("persistUserProvidedPassphrase", () => {
       cmd: string,
       args: string[]
     ): Promise<ExecResult> => {
-      if (cmd === "security" && args[0] === "add-generic-password") {
+      // F5: the keychain write is now a `security -i` batch script; simulate a
+      // locked keychain by failing that invocation.
+      if (cmd === "security" && args[0] === "-i") {
         return { stdout: "", stderr: "keychain locked", code: 1 };
       }
       return { stdout: "", stderr: "", code: 0 };

@@ -198,16 +198,20 @@ export class KeychainBackend implements Backend {
     }
     // `add-generic-password` with -U would update; we intentionally don't use -U
     // to keep add/rotate distinct.
-    const res = await runSecurity([
-      "add-generic-password",
-      "-s",
-      this.service,
-      "-a",
-      account,
-      "-w",
-      value,
-      this.keychainPath,
-    ]);
+    //
+    // F5 (HIGH): deliver the secret via a `security -i` batch script on stdin,
+    // never as an argv element (process argv is world-readable on macOS via
+    // `ps`). Matches the create-keychain/unlock-keychain pattern above. A batch
+    // script is line-delimited, so reject values containing a newline.
+    if (/[\r\n]/.test(value)) {
+      throw new Error("Secret value must not contain newline characters");
+    }
+    const res = await runSecurity(
+      ["-i"],
+      `add-generic-password -s "${escapeForSecurity(this.service)}" ` +
+        `-a "${escapeForSecurity(account)}" -w "${escapeForSecurity(value)}" ` +
+        `"${escapeForSecurity(this.keychainPath)}"\n`
+    );
     if (res.code !== 0) {
       throw new Error(
         `Failed to add secret: ${redactSecurityError(res.stderr)}`
@@ -233,19 +237,22 @@ export class KeychainBackend implements Backend {
     if (existing === null) {
       throw new SecretNotFoundError(name);
     }
+    // F5 (HIGH): reject newline values BEFORE the destructive delete below (the
+    // `security -i` batch script is line-delimited and cannot carry a newline).
+    if (/[\r\n]/.test(newValue)) {
+      throw new Error("Secret value must not contain newline characters");
+    }
     // Delete then re-add atomically. If re-add fails, callers will see
     // the secret as missing — strictly safer than leaving stale value.
     await this.deleteSecret(name);
-    const res = await runSecurity([
-      "add-generic-password",
-      "-s",
-      this.service,
-      "-a",
-      account,
-      "-w",
-      newValue,
-      this.keychainPath,
-    ]);
+    // F5 (HIGH): value travels via the `security -i` batch script on stdin, not
+    // argv (world-readable on macOS via `ps`).
+    const res = await runSecurity(
+      ["-i"],
+      `add-generic-password -s "${escapeForSecurity(this.service)}" ` +
+        `-a "${escapeForSecurity(account)}" -w "${escapeForSecurity(newValue)}" ` +
+        `"${escapeForSecurity(this.keychainPath)}"\n`
+    );
     if (res.code !== 0) {
       throw new Error(
         `Failed to rotate secret: ${redactSecurityError(res.stderr)}`
