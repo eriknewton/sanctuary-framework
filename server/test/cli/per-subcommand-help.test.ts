@@ -1,37 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { execFile } from "node:child_process";
-import { join } from "node:path";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
-const CLI_PATH = join(__dirname, "../../dist/cli.js");
-
-async function runCli(
-  ...args: string[]
-): Promise<{ code: number; output: string; stdout: string; stderr: string }> {
-  const env = { ...process.env, NODE_NO_WARNINGS: "1" };
-  delete env.SANCTUARY_PASSPHRASE;
-
-  try {
-    const result = await execFileAsync("node", [CLI_PATH, ...args], {
-      timeout: 10000,
-      env,
-    });
-    return {
-      code: 0,
-      output: `${result.stdout}${result.stderr}`,
-      stdout: result.stdout,
-      stderr: result.stderr,
-    };
-  } catch (err: any) {
-    return {
-      code: err.code ?? 1,
-      output: `${err.stdout ?? ""}${err.stderr ?? ""}`,
-      stdout: err.stdout ?? "",
-      stderr: err.stderr ?? "",
-    };
-  }
-}
+import { runCli, CLI_SUBPROCESS_TEST_TIMEOUT_MS } from "./helpers/run-cli";
 
 const cases: Array<{
   name: string;
@@ -90,15 +58,19 @@ const cases: Array<{
 ];
 
 describe("per-subcommand help routing (F-GA-3)", () => {
-  it.each(cases)("$name --help prints subcommand-specific help", async (testCase) => {
-    const topLevel = await runCli("--help");
-    const result = await runCli(...testCase.args);
+  it.each(cases)(
+    "$name --help prints subcommand-specific help",
+    async (testCase) => {
+      const topLevel = await runCli("--help");
+      const result = await runCli(...testCase.args);
 
-    expect(result.code).toBe(0);
-    expect(result.output.trim().length).toBeGreaterThan(0);
-    expect(result.output).not.toBe(topLevel.output);
-    expect(result.output).not.toContain("Sovereignty infrastructure for agents");
-    expect(result.output).toContain(testCase.summary);
-    expect(result.output).toContain(testCase.flag);
-  });
+      expect(result.code).toBe(0);
+      expect(result.output.trim().length).toBeGreaterThan(0);
+      expect(result.output).not.toBe(topLevel.output);
+      expect(result.output).not.toContain("Sovereignty infrastructure for agents");
+      expect(result.output).toContain(testCase.summary);
+      expect(result.output).toContain(testCase.flag);
+    },
+    CLI_SUBPROCESS_TEST_TIMEOUT_MS,
+  );
 });
