@@ -7,6 +7,10 @@
  *  - publishSignedManifest performs writes-then-rename per scope-lock §4
  *    atomicity;
  *  - orphaned rule files are removed only AFTER the manifest is in place.
+ *
+ * B2: buildSignedManifest now takes an async `ManifestSigner` handle instead of
+ * raw key material. These tests use `localManifestSigner` to wrap a local key —
+ * the production daemon uses a helper-backed signer (no key bytes in-process).
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
@@ -17,8 +21,9 @@ import {
   renderRuleFile,
   renderSignedManifest,
   sha256Hex,
+  localManifestSigner,
   type ManifestStorage,
-  type ManifestSigningKey,
+  type ManifestSigner,
 } from "../../../src/castle-wall/runtime/manifest-publisher.js";
 import {
   verifyAndParseRules,
@@ -74,7 +79,7 @@ function makeRule(id: string, host: string): AllowlistRule {
 }
 
 describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
-  let signingKey: ManifestSigningKey;
+  let signer: ManifestSigner;
   let pinnedPublicKey: Uint8Array;
 
   beforeEach(() => {
@@ -85,20 +90,20 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
       identityEncKey,
       "passphrase"
     );
-    signingKey = {
+    signer = localManifestSigner({
       signingKeyId: storedIdentity.identity_id,
       encryptedPrivateKey: storedIdentity.encrypted_private_key,
       encryptionKey: identityEncKey,
-    };
+    });
     pinnedPublicKey = fromBase64url(publicIdentity.public_key);
   });
 
-  it("produces a signed manifest the PR-1 parser verifies", () => {
-    const { signed } = buildSignedManifest({
+  it("produces a signed manifest the PR-1 parser verifies", async () => {
+    const { signed } = await buildSignedManifest({
       fortressId: "deadbeef",
       issuedAt: "2026-05-04T00:00:00Z",
       rules: [makeRule("rule-1", "api.anthropic.com")],
-      signingKey,
+      signer,
     });
 
     expect(signed.signature.signature_scheme).toBe(CASTLE_WALL_SIGNATURE_SCHEME_V1);
@@ -108,8 +113,8 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("orders rules by rule_id deterministically", () => {
-    const { signed } = buildSignedManifest({
+  it("orders rules by rule_id deterministically", async () => {
+    const { signed } = await buildSignedManifest({
       fortressId: "f",
       issuedAt: "t",
       rules: [
@@ -117,21 +122,21 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
         makeRule("rule-a", "a.example"),
         makeRule("rule-b", "b.example"),
       ],
-      signingKey,
+      signer,
     });
     const ids = signed.manifest.rules.map((r) => r.rule_id);
     expect(ids).toEqual(["rule-a", "rule-b", "rule-c"]);
   });
 
-  it("rejects duplicate rule ids", () => {
-    expect(() =>
+  it("rejects duplicate rule ids", async () => {
+    await expect(
       buildSignedManifest({
         fortressId: "f",
         issuedAt: "t",
         rules: [makeRule("dup", "a"), makeRule("dup", "b")],
-        signingKey,
+        signer,
       })
-    ).toThrow(/duplicate rule id/);
+    ).rejects.toThrow(/duplicate rule id/);
   });
 
   it("renderRuleFile emits canonical-JSON bytes", () => {
@@ -141,13 +146,13 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
     expect(sha256Hex(bytes)).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("manifest entries use sha256 of the rule file bytes the publisher emitted", () => {
+  it("manifest entries use sha256 of the rule file bytes the publisher emitted", async () => {
     const rule = makeRule("rule-1", "api.anthropic.com");
-    const { signed, ruleFiles } = buildSignedManifest({
+    const { signed, ruleFiles } = await buildSignedManifest({
       fortressId: "f",
       issuedAt: "t",
       rules: [rule],
-      signingKey,
+      signer,
     });
     const entry = signed.manifest.rules[0]!;
     const file = ruleFiles[0]!;
@@ -156,12 +161,12 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
 
   // --- agent_origin descriptor (2026-05-29 origin-classifier foundation) ---
 
-  it("signs a valid agent_origin into the body and the parser still verifies", () => {
-    const { signed } = buildSignedManifest({
+  it("signs a valid agent_origin into the body and the parser still verifies", async () => {
+    const { signed } = await buildSignedManifest({
       fortressId: "f",
       issuedAt: "t",
       rules: [makeRule("rule-1", "api.anthropic.com")],
-      signingKey,
+      signer,
       agentOrigin: {
         mode: "uid",
         agent_uid: 600,
@@ -177,12 +182,12 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
     expect(verifyManifestSignature(signed, pinnedPublicKey).ok).toBe(true);
   });
 
-  it("tampering with agent_origin AFTER signing breaks verification", () => {
-    const { signed } = buildSignedManifest({
+  it("tampering with agent_origin AFTER signing breaks verification", async () => {
+    const { signed } = await buildSignedManifest({
       fortressId: "f",
       issuedAt: "t",
       rules: [makeRule("rule-1", "api.anthropic.com")],
-      signingKey,
+      signer,
       agentOrigin: {
         mode: "uid",
         agent_uid: 600,
@@ -200,12 +205,12 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
     expect(verifyManifestSignature(tampered, pinnedPublicKey).ok).toBe(false);
   });
 
-  it("omits agent_origin entirely when absent (byte-identical to no-field build)", () => {
-    const withoutField = buildSignedManifest({
+  it("omits agent_origin entirely when absent (byte-identical to no-field build)", async () => {
+    const withoutField = await buildSignedManifest({
       fortressId: "f",
       issuedAt: "t",
       rules: [makeRule("rule-1", "api.anthropic.com")],
-      signingKey,
+      signer,
     });
     expect(withoutField.signed.manifest).not.toHaveProperty("agent_origin");
     // Canonical bytes carry no agent_origin key.
@@ -213,12 +218,12 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
     expect(new TextDecoder().decode(bytes)).not.toContain("agent_origin");
   });
 
-  it("drops a malformed agent_origin candidate (field omitted, never half-built)", () => {
-    const { signed } = buildSignedManifest({
+  it("drops a malformed agent_origin candidate (field omitted, never half-built)", async () => {
+    const { signed } = await buildSignedManifest({
       fortressId: "f",
       issuedAt: "t",
       rules: [makeRule("rule-1", "api.anthropic.com")],
-      signingKey,
+      signer,
       // UID mode with no agent_uid is unusable -> dropped.
       agentOrigin: { mode: "uid", system_uid_allow_ceiling: 500 },
     });
@@ -226,23 +231,40 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
     expect(verifyManifestSignature(signed, pinnedPublicKey).ok).toBe(true);
   });
 
-  it("verifyAndParseRules accepts the bytes the publisher produced", () => {
+  it("verifyAndParseRules accepts the bytes the publisher produced", async () => {
     const rule = makeRule("rule-1", "api.anthropic.com");
-    const { signed, ruleFiles } = buildSignedManifest({
+    const { signed, ruleFiles } = await buildSignedManifest({
       fortressId: "f",
       issuedAt: "t",
       rules: [rule],
-      signingKey,
+      signer,
     });
     const map = new Map<string, Uint8Array>();
     for (const f of ruleFiles) map.set(f.filename, f.bytes);
     const result = verifyAndParseRules(signed, map);
     expect(result.ok).toBe(true);
   });
+
+  it("propagates a signer failure as a publish error (fail-closed)", async () => {
+    const failingSigner: ManifestSigner = {
+      signingKeyId: "broken",
+      sign() {
+        throw new Error("helper unreachable");
+      },
+    };
+    await expect(
+      buildSignedManifest({
+        fortressId: "f",
+        issuedAt: "t",
+        rules: [makeRule("rule-1", "a")],
+        signer: failingSigner,
+      })
+    ).rejects.toThrow(/manifest signing failed/);
+  });
 });
 
 describe("castle-wall/runtime/manifest-publisher : publishSignedManifest", () => {
-  let signingKey: ManifestSigningKey;
+  let signer: ManifestSigner;
 
   beforeEach(() => {
     const masterKey = generateRandomKey();
@@ -252,11 +274,11 @@ describe("castle-wall/runtime/manifest-publisher : publishSignedManifest", () =>
       identityEncKey,
       "passphrase"
     );
-    signingKey = {
+    signer = localManifestSigner({
       signingKeyId: storedIdentity.identity_id,
       encryptedPrivateKey: storedIdentity.encrypted_private_key,
       encryptionKey: identityEncKey,
-    };
+    });
   });
 
   it("writes rule files BEFORE the atomic manifest rename", async () => {
@@ -266,7 +288,7 @@ describe("castle-wall/runtime/manifest-publisher : publishSignedManifest", () =>
         fortressId: "f",
         issuedAt: "t",
         rules: [makeRule("rule-a", "a")],
-        signingKey,
+        signer,
       },
       storage
     );
@@ -285,7 +307,7 @@ describe("castle-wall/runtime/manifest-publisher : publishSignedManifest", () =>
         fortressId: "f",
         issuedAt: "t",
         rules: [makeRule("rule-a", "a")],
-        signingKey,
+        signer,
       },
       storage
     );
@@ -304,7 +326,7 @@ describe("castle-wall/runtime/manifest-publisher : publishSignedManifest", () =>
         fortressId: "f",
         issuedAt: "t",
         rules: [makeRule("rule-a", "a")],
-        signingKey,
+        signer,
       },
       storage
     );
@@ -313,12 +335,12 @@ describe("castle-wall/runtime/manifest-publisher : publishSignedManifest", () =>
     ).toBe(false);
   });
 
-  it("renderSignedManifest produces non-empty bytes", () => {
-    const { signed } = buildSignedManifest({
+  it("renderSignedManifest produces non-empty bytes", async () => {
+    const { signed } = await buildSignedManifest({
       fortressId: "f",
       issuedAt: "t",
       rules: [makeRule("rule-1", "a")],
-      signingKey,
+      signer,
     });
     const bytes = renderSignedManifest(signed);
     expect(bytes.byteLength).toBeGreaterThan(0);

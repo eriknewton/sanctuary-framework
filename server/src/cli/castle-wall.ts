@@ -6,9 +6,14 @@ import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
 import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
-import { bytesToString, fromBase64url, stringToBytes } from "../core/encoding.js";
-import { encrypt } from "../core/encryption.js";
+import { bytesToString, fromBase64url, stringToBytes, toBase64url } from "../core/encoding.js";
+import { encrypt, type EncryptedPayload } from "../core/encryption.js";
+import { sign as identitySign, type RotationEvent } from "../core/identity.js";
 import { randomBytes } from "../core/random.js";
+import {
+  HelperSignerClient,
+  type ShimInvoker,
+} from "../castle-wall/runtime/helper-signer.js";
 import { resolveStoragePath } from "../paths.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
@@ -35,6 +40,10 @@ export interface CastleWallCommandContext {
   platform?: NodeJS.Platform;
   execSyncFn?: (command: string) => string;
   getuid?: () => number;
+  /** Path to the signer-client shim (re-pin). Defaults to env. */
+  signerClientPath?: string;
+  /** Override the shim runner (tests drive re-pin without a real helper). */
+  signerClientInvoke?: ShimInvoker;
 }
 
 export interface CastleWallParsedArgs {
@@ -178,16 +187,206 @@ async function writeGlobalPinnedPublicKey(
   publicKey: Uint8Array,
 ): Promise<void> {
   try {
-    await mkdir(CASTLE_GLOBAL_PINNED_PUBKEY_DIR, { recursive: true, mode: 0o755 });
+    // A2/B2 (F-A2-1): do NOT `mkdir` the custody directory here. This runs as the
+    // operator-UID provision-pin CLI; creating the directory operator-owned is
+    // exactly the gap the helper-as-signer design closes (an operator-owned dir
+    // lets same-UID malware swap the key + pin). The root signer helper creates
+    // + owns the directory. Best-effort write only IF the dir already exists
+    // root-owned (it will EACCES, handled below) — never bring it into being.
     await writeFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, publicKey, { mode: 0o644 });
     await chmod(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, 0o644);
   } catch (error) {
-    // SAFETY: provision-pin warnings are operator-facing CLI stderr output.
+    const code =
+      error instanceof Error && "code" in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+    // SAFETY: provision-pin diagnostics are operator-facing CLI stderr output.
+    // Under A2 the global pin is root:wheel 0644 and owned by the signer helper;
+    // an operator-UID provision-pin CANNOT (and must not) overwrite it, and the
+    // directory may not exist yet (ENOENT) because only the helper creates it.
+    // Both are expected — the trust anchor is migrated via `castle-wall re-pin`.
+    if (code === "EACCES" || code === "EPERM" || code === "ENOENT") {
+      console.warn(
+        `[castle-wall] global pin ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH} is owned by the root signer helper (A2); provision-pin does not write it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
+      );
+      return;
+    }
     console.warn(
       `[castle-wall] warning: unable to write shared pinned key at ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH}: ${
         error instanceof Error ? error.message : String(error)
       }`,
     );
+  }
+}
+
+/**
+ * Build the audit-continuity rotation proof binding the OLD pin key to the new
+ * helper key (§4.5 step 4). The OLD key signs the binding, proving the holder of
+ * the retiring key authorized the migration. Reuses the `RotationEvent` shape
+ * from core/identity.ts (already "signature over the event by the OLD key").
+ */
+export function buildPinRotationProof(opts: {
+  oldPublicKey: Uint8Array;
+  oldEncryptedPrivateKey: EncryptedPayload;
+  encryptionKey: Uint8Array;
+  newPublicKey: Uint8Array;
+  rotatedAt: string;
+}): RotationEvent {
+  const oldB64 = toBase64url(opts.oldPublicKey);
+  const newB64 = toBase64url(opts.newPublicKey);
+  const identityId = `castle-wall:${oldB64}`;
+  const reason = "castle-wall-pin-rotation-a2-b2";
+  // Match identity.ts rotateKeys: sign the JSON of the 5 fields (no signature).
+  const eventData = JSON.stringify({
+    old_public_key: oldB64,
+    new_public_key: newB64,
+    identity_id: identityId,
+    reason,
+    rotated_at: opts.rotatedAt,
+  });
+  const signature = identitySign(
+    stringToBytes(eventData),
+    opts.oldEncryptedPrivateKey,
+    opts.encryptionKey,
+  );
+  return {
+    old_public_key: oldB64,
+    new_public_key: newB64,
+    identity_id: identityId,
+    reason,
+    rotated_at: opts.rotatedAt,
+    signature: toBase64url(signature),
+  };
+}
+
+/**
+ * One-time, operator-approved trust-anchor migration (A2/B2 re-pin). Tells the
+ * root signer helper to (re)write the global pin with ITS key (K_helper), then
+ * records a rotation proof signed by the retiring passphrase-derived key
+ * (K_old). Idempotent: when the global pin already holds K_helper, this
+ * re-asserts state rather than rotating again.
+ *
+ * This is a Tier-1-class irreversible op (hard constraint #3): it runs only when
+ * the operator is present and has just approved the helper — never silently,
+ * never agent-triggerable.
+ */
+export async function runRePin(
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const platform = ctx.platform ?? process.platform;
+
+  if (platform !== "darwin") {
+    write(err, "castle-wall re-pin is macOS-only.\n");
+    return 1;
+  }
+
+  const storagePath = resolveStoragePath(env);
+  const clientBinaryPath = ctx.signerClientPath ?? env.SANCTUARY_CASTLE_SIGNER_CLIENT;
+  if (!clientBinaryPath && !ctx.signerClientInvoke) {
+    write(
+      err,
+      "Cannot re-pin: signer-client shim path unknown. Set SANCTUARY_CASTLE_SIGNER_CLIENT or install the Castle Wall app (which bundles it).\n",
+    );
+    return 1;
+  }
+
+  const client = new HelperSignerClient({
+    clientBinaryPath: clientBinaryPath ?? "castle-wall-signer-client",
+    ...(ctx.signerClientInvoke ? { invoke: ctx.signerClientInvoke } : {}),
+  });
+
+  try {
+    // Ask the helper to (re)write the root-owned pin with K_helper and return it.
+    const helperPub = await client.installPin();
+    if (helperPub.length !== 32) {
+      write(err, `Helper returned a ${helperPub.length}-byte key (expected 32).\n`);
+      return 1;
+    }
+    const helperFingerprint = fingerprintFromPublicKey(helperPub);
+
+    // Read the retiring K_old (the passphrase-derived key provision-pin minted).
+    // Its presence lets us emit the old-signs-new rotation proof for audit
+    // continuity. If it is already gone (a prior re-pin retired it), treat this
+    // as an idempotent re-assert.
+    const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
+    const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
+    let oldPub: Uint8Array | null = null;
+    let oldEnc: EncryptedPayload | null = null;
+    try {
+      oldPub = await readFile(pubPath);
+      oldEnc = JSON.parse(await readFile(privPath, "utf8")) as EncryptedPayload;
+    } catch {
+      oldPub = null;
+      oldEnc = null;
+    }
+
+    const storage = new FilesystemStorage(join(storagePath, "state"));
+    const masterKey = await resolveMasterKey(storagePath, env);
+    const auditLog = new AuditLog(storage, masterKey);
+
+    if (oldPub && oldPub.length === 32 && oldEnc) {
+      const oldFingerprint = fingerprintFromPublicKey(oldPub);
+      if (oldFingerprint === helperFingerprint) {
+        // Already migrated (K_old already equals K_helper would be unusual, but
+        // re-running after a prior re-pin where the helper key is now the pin is
+        // the idempotent case handled below). Treat equal fingerprints as a
+        // no-op re-assert.
+        write(out, `${helperFingerprint}\n`);
+        write(out, "Pin already holds the helper key; re-asserted (no rotation).\n");
+        return 0;
+      }
+      const proof = buildPinRotationProof({
+        oldPublicKey: oldPub,
+        oldEncryptedPrivateKey: oldEnc,
+        encryptionKey: masterKey,
+        newPublicKey: helperPub,
+        rotatedAt: new Date().toISOString(),
+      });
+      await auditLog.append(
+        "l1",
+        "policy_loaded",
+        fortressIdFromStoragePath(storagePath),
+        {
+          source: "castle-wall-re-pin",
+          rotation_proof: proof,
+          old_pin_fingerprint: oldFingerprint,
+          new_pin_fingerprint: helperFingerprint,
+        },
+        "success",
+      );
+      await auditLog.flush();
+      write(out, `${helperFingerprint}\n`);
+      write(
+        out,
+        `Trust anchor migrated to the signer helper (was ${oldFingerprint}). Rotation proof recorded in the audit log.\n`,
+      );
+      masterKey.fill(0);
+      return 0;
+    }
+
+    // No retiring key on disk: idempotent re-assert (already migrated earlier).
+    await auditLog.append(
+      "l1",
+      "policy_loaded",
+      fortressIdFromStoragePath(storagePath),
+      {
+        source: "castle-wall-re-pin",
+        new_pin_fingerprint: helperFingerprint,
+        note: "re-assert (no retiring key present)",
+      },
+      "success",
+    );
+    await auditLog.flush();
+    masterKey.fill(0);
+    write(out, `${helperFingerprint}\n`);
+    write(out, "Pin re-asserted to the helper key (no retiring key to rotate).\n");
+    return 0;
+  } catch (error) {
+    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
   }
 }
 
@@ -256,12 +455,15 @@ export async function runStatus(
  * to a wrapped agent's MCP-server lifetime, which is unsuitable for a
  * multi-step, multi-reboot armed-wall drill.
  *
- * Safety: the daemon loads the pinned signing key (`castle-pinned-privkey.enc`)
- * with the derived master key. A wrong passphrase fails to decrypt and the
- * daemon refuses to start — so a successful start proves the signing key
- * matches the pin (no silent mismatched-key arm). This verb additionally
- * refuses to mint a fresh passphrase (which could never match the pin) and
- * requires an existing fortress (key-params present).
+ * B2: by default the daemon signs via the root signer helper, so signing no
+ * longer needs the passphrase at all. The derived master key is still required
+ * to open the encrypted audit log (residual R2 — a boot-time daemon still needs
+ * it; that is F1's problem, not closed here). The legacy local-sign path
+ * (`SANCTUARY_CASTLE_LOCAL_SIGN=1`) still decrypts `castle-pinned-privkey.enc`
+ * and proves the passphrase matches the pin by construction.
+ *
+ * This verb refuses to mint a fresh passphrase (which could never open the
+ * existing audit log) and requires an existing fortress (key-params present).
  *
  * Runs in the foreground until SIGINT/SIGTERM, then tears the daemon down.
  */
@@ -279,20 +481,33 @@ export async function runDaemon(
   }
 
   const storagePath = resolveStoragePath(env);
+  const localSign = env.SANCTUARY_CASTLE_LOCAL_SIGN === "1";
 
-  // Read + print the pin fingerprint: the value the daemon's signing key must
-  // match. A successful daemon start (below) proves the match by construction.
+  // Report the active pin fingerprint. In helper mode the trust anchor is the
+  // root-owned global pin (K_helper); in local mode it is the per-fortress key.
   const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
   let pinFingerprint: string;
   try {
-    const publicKey = await readFile(pubPath);
+    let publicKey: Uint8Array;
+    if (!localSign) {
+      try {
+        publicKey = await readFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH);
+      } catch {
+        publicKey = await readFile(pubPath);
+      }
+    } else {
+      publicKey = await readFile(pubPath);
+    }
     if (publicKey.length !== 32) {
-      write(err, `Pinned public key at ${pubPath} must be 32 bytes (found ${publicKey.length}).\n`);
+      write(err, `Pinned public key must be 32 bytes (found ${publicKey.length}).\n`);
       return 1;
     }
     pinFingerprint = fingerprintFromPublicKey(publicKey);
   } catch {
-    write(err, `No pinned key at ${pubPath}. Run 'sanctuary castle-wall provision-pin' first.\n`);
+    write(
+      err,
+      `No pinned key found. Run 'sanctuary castle-wall provision-pin' (local) or 'sanctuary castle-wall re-pin' (helper) first.\n`,
+    );
     return 1;
   }
   write(out, `Pinned key fingerprint: ${pinFingerprint}\n`);
@@ -339,15 +554,27 @@ export async function runDaemon(
       fortressId: fortressIdFromStoragePath(storagePath),
       masterKey: derived.key,
       auditLog,
+      ...(localSign ? { localSign: true } : {}),
+      ...(env.SANCTUARY_CASTLE_SIGNER_CLIENT
+        ? { signerClientPath: env.SANCTUARY_CASTLE_SIGNER_CLIENT }
+        : {}),
     });
   } catch (error) {
     write(err, `Daemon failed to start: ${(error as Error).message}\n`);
-    write(err, "If this is a decrypt/signing-key error, the passphrase does not match the pinned key. Refusing to arm with a mismatched key.\n");
+    if (localSign) {
+      write(err, "Local-sign mode: a decrypt error means the passphrase does not match the pinned key. Refusing to arm with a mismatched key.\n");
+    } else {
+      write(err, "Helper-sign mode: the signer helper is unreachable. Confirm the helper is installed + approved and SANCTUARY_CASTLE_SIGNER_CLIENT points at the shim. Refusing to arm without a signer (fail-closed).\n");
+    }
     return 1;
   }
 
   write(out, `Castle Wall daemon listening on ${daemon.socketPath}\n`);
-  write(out, `Signing key loaded and matches pin ${pinFingerprint} (pinned key decryption succeeded).\n`);
+  if (localSign) {
+    write(out, `Signing via the local key; matches pin ${pinFingerprint} (decryption succeeded).\n`);
+  } else {
+    write(out, `Signing via the root signer helper (no passphrase used for signing); pin ${pinFingerprint}.\n`);
+  }
   write(out, "Daemon running in the foreground. Ctrl-C (SIGINT) or SIGTERM to stop.\n");
 
   await new Promise<void>((resolveWait) => {
@@ -416,7 +643,13 @@ export async function runSetupSharedDir(
   try {
     const dir = shellQuote(CASTLE_GLOBAL_PINNED_PUBKEY_DIR);
     execSyncFn(`mkdir -p ${dir}`);
-    execSyncFn(`chown ${shellQuote(`${sudoUser}:admin`)} ${dir}`);
+    // A2/B2 (F-A2-1): the custody directory holds the root-owned signing key +
+    // trust-anchor pin. It MUST be owned by root and not group/other-writable,
+    // or an operator-UID process could unlink + substitute those files (POSIX
+    // governs unlink/rename by DIRECTORY write permission). Chown to root:wheel,
+    // NOT to the operator. SUDO_USER above is validated only to confirm a real
+    // sudo invocation; it is no longer interpolated into a privileged command.
+    execSyncFn(`chown root:wheel ${dir}`);
     execSyncFn(`chmod 0755 ${dir}`);
   } catch (error) {
     write(err, `${error instanceof Error ? error.message : String(error)}\n`);
@@ -426,7 +659,7 @@ export async function runSetupSharedDir(
   write(out, `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}\n`);
   write(
     out,
-    "Shared dir ready. Re-run 'sanctuary castle-wall provision-pin' (or restart the daemon) to populate the pinned key; no per-fortress sudo cp needed.\n",
+    "Shared dir ready (root:wheel 0755). The signer helper owns the key + pin inside it; run 'sanctuary castle-wall re-pin' to install the trust anchor.\n",
   );
   return 0;
 }

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchDaemon plist for the Castle Wall root signer helper (A2/B2).
+
+  Bundled inside Sanctuary-CastleWall.app at:
+    Contents/Library/LaunchDaemons/ai.sanctuaryprotocol.macos.castle-wall.signer-helper.plist
+
+  Registered via SMAppService.daemon(plistName:) by the host app; the operator
+  approves it once in System Settings > General > Login Items (background item).
+
+  MachServices publishes the signing mach service the shim connects to. The plist
+  name's basename MUST equal Label (SMAppService requirement). RunAtLoad +
+  KeepAlive so launchd brings the helper up at registration and respawns it if it
+  exits (helper-restart resilience — §9 step 7).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.sanctuaryprotocol.macos.castle-wall.signer-helper</string>
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/castle-wall-signer-helper</string>
+    <key>MachServices</key>
+    <dict>
+        <key>ai.sanctuaryprotocol.macos.castle-wall.signer</key>
+        <true/>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>ai.sanctuaryprotocol.macos</string>
+    </array>
+</dict>
+</plist>

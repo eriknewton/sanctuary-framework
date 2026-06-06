@@ -103,7 +103,13 @@ export interface MacOSFlowIpcListenerOptions {
 export interface MacOSHandshakeSigner {
   fortressId: string;
   signingKeyId: string;
-  signNonce(nonce: Uint8Array): Uint8Array;
+  /**
+   * Sign the handshake nonce. May be async: under B2 the daemon delegates this
+   * to the root helper over the XPC shim, so the signature arrives a tick later.
+   * A synchronous (local dev) signer is still supported and emits the response
+   * inline (preserving prior timing for existing tests).
+   */
+  signNonce(nonce: Uint8Array): Uint8Array | Promise<Uint8Array>;
 }
 
 export interface MacOSFlowIpcAdminHandler {
@@ -320,16 +326,36 @@ export class MacOSFlowIpcListener {
       nonce_b64url: toBase64url(nonceBytes),
     };
     this.writeMessage(state, challenge);
-    if (this.handshakeSigner) {
-      const response: HandshakeResponse = {
-        type: "handshake_response",
-        fortress_id: this.handshakeSigner.fortressId,
-        signing_key_id: this.handshakeSigner.signingKeyId,
-        nonce_signature_b64url: toBase64url(this.handshakeSigner.signNonce(nonceBytes)),
-      };
-      this.writeMessage(state, response);
-    }
     this.stats.handshakesSent += 1;
+    if (this.handshakeSigner) {
+      const signed = this.handshakeSigner.signNonce(nonceBytes);
+      if (signed instanceof Promise) {
+        // Helper path: emit the response once the helper returns the signature.
+        // Fail closed — if signing is unavailable, tear the connection down
+        // rather than completing an unsigned handshake (hard constraint #5).
+        void signed.then(
+          (sig) => this.writeHandshakeResponse(state, sig),
+          () => {
+            this.stats.framesRejected += 1;
+            state.socket.destroy();
+          },
+        );
+      } else {
+        // Local path: preserve inline (synchronous) emission timing.
+        this.writeHandshakeResponse(state, signed);
+      }
+    }
+  }
+
+  private writeHandshakeResponse(state: ConnectionState, signature: Uint8Array): void {
+    if (!this.handshakeSigner) return;
+    const response: HandshakeResponse = {
+      type: "handshake_response",
+      fortress_id: this.handshakeSigner.fortressId,
+      signing_key_id: this.handshakeSigner.signingKeyId,
+      nonce_signature_b64url: toBase64url(signature),
+    };
+    this.writeMessage(state, response);
   }
 
   private handleData(state: ConnectionState, chunk: Buffer): void {

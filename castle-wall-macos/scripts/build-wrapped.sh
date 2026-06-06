@@ -32,6 +32,17 @@ EXT_BUNDLE_DST="${WRAPPED_APP_DIR}/Contents/Library/SystemExtensions/${SYSTEM_EX
 EXT_EXEC_DST="${EXT_BUNDLE_DST}/Contents/MacOS/${EXT_EXECUTABLE_NAME}"
 EXT_INFO_DST="${EXT_BUNDLE_DST}/Contents/Info.plist"
 
+# A2/B2 root signer helper + XPC shim + LaunchDaemon plist. The helper binary is
+# placed in Contents/MacOS with the on-disk name the plist BundleProgram expects.
+SIGNER_HELPER_TARGET="CastleWallSignerHelper"
+SIGNER_HELPER_EXE_NAME="CastleWallSignerHelper"
+SIGNER_HELPER_DST="${WRAPPED_APP_DIR}/Contents/MacOS/castle-wall-signer-helper"
+SIGNER_CLIENT_TARGET="CastleWallSignerClient"
+SIGNER_CLIENT_EXE_NAME="CastleWallSignerClient"
+SIGNER_CLIENT_DST="${WRAPPED_APP_DIR}/Contents/MacOS/castle-wall-signer-client"
+SIGNER_PLIST_SRC="${PKG_DIR}/Sources/CastleWallSignerHelper/ai.sanctuaryprotocol.macos.castle-wall.signer-helper.plist"
+SIGNER_PLIST_DST="${WRAPPED_APP_DIR}/Contents/Library/LaunchDaemons/ai.sanctuaryprotocol.macos.castle-wall.signer-helper.plist"
+
 log() {
     echo "[build-wrapped] $*"
 }
@@ -94,18 +105,23 @@ log "wrapped app target: ${WRAPPED_APP_DIR}"
 log "step 1/5 - build release artifacts"
 (
     cd "${PKG_DIR}"
-    swift build -c "${SWIFT_BUILD_CONFIG}" --target "${EXT_TARGET}"
+    # Build ALL products in one pass. `swift build --target <exe>` does not
+    # reliably materialize an executable target's top-level binary into the bin
+    # dir; a full product build does. All targets (ext, host, signer helper +
+    # shim) compile, so a single build is both correct and simpler.
     if target_exists "${HOST_TARGET}"; then
-        log "detected target '${HOST_TARGET}', building host target"
-        swift build -c "${SWIFT_BUILD_CONFIG}" --target "${HOST_TARGET}"
+        swift build -c "${SWIFT_BUILD_CONFIG}"
     else
-        log "target '${HOST_TARGET}' not present yet; using fallback host executable"
+        log "target '${HOST_TARGET}' not present yet; building extension only"
+        swift build -c "${SWIFT_BUILD_CONFIG}" --target "${EXT_TARGET}"
     fi
 )
 
 BIN_DIR="$(swift build -c "${SWIFT_BUILD_CONFIG}" --package-path "${PKG_DIR}" --show-bin-path)"
 EXT_EXEC_SRC="${BIN_DIR}/${EXT_EXECUTABLE_NAME}"
 HOST_EXEC_SRC="${BIN_DIR}/${HOST_EXECUTABLE_NAME}"
+SIGNER_HELPER_SRC="${BIN_DIR}/${SIGNER_HELPER_EXE_NAME}"
+SIGNER_CLIENT_SRC="${BIN_DIR}/${SIGNER_CLIENT_EXE_NAME}"
 
 [ -x "${EXT_EXEC_SRC}" ] || fail "extension executable not found at ${EXT_EXEC_SRC}"
 
@@ -121,6 +137,19 @@ else
     cp "${EXT_EXEC_SRC}" "${HOST_EXEC_DST}"
 fi
 chmod +x "${HOST_EXEC_DST}" "${EXT_EXEC_DST}"
+
+# Bundle the A2/B2 signer helper + shim + LaunchDaemon plist when present.
+if [ -x "${SIGNER_HELPER_SRC}" ] && [ -x "${SIGNER_CLIENT_SRC}" ]; then
+    log "bundling signer helper + shim + LaunchDaemon plist"
+    mkdir -p "$(dirname "${SIGNER_PLIST_DST}")"
+    cp "${SIGNER_HELPER_SRC}" "${SIGNER_HELPER_DST}"
+    cp "${SIGNER_CLIENT_SRC}" "${SIGNER_CLIENT_DST}"
+    chmod +x "${SIGNER_HELPER_DST}" "${SIGNER_CLIENT_DST}"
+    cp "${SIGNER_PLIST_SRC}" "${SIGNER_PLIST_DST}"
+    plutil -lint "${SIGNER_PLIST_DST}" >/dev/null || fail "signer LaunchDaemon plist failed lint"
+else
+    log "signer helper/shim binaries not built; LaunchDaemon not bundled (pre-A2 layout)"
+fi
 
 log "step 3/5 - install Info.plist files"
 if [ -f "${HOST_INFO_SRC}" ]; then
@@ -144,8 +173,18 @@ if grep -E '\$\([A-Z_]+\)' "${EXT_INFO_DST}" >/dev/null 2>&1; then
     fail "extension Info.plist contains unresolved \$(...) tokens: ${EXT_INFO_DST}"
 fi
 
-log "step 4/5 - ad-hoc sign nested extension then outer host app"
+log "step 4/5 - ad-hoc sign nested extension, signer helper/shim, then outer host app"
 codesign --force --sign - --timestamp=none "${EXT_BUNDLE_DST}"
+if [ -x "${SIGNER_HELPER_DST}" ] && [ -x "${SIGNER_CLIENT_DST}" ]; then
+    # Ad-hoc with pinned identifiers so the structure mirrors the Dev-ID build;
+    # the real Developer-ID signing (with entitlements) happens in build-signed.sh.
+    codesign --force --sign - --timestamp=none \
+        --identifier ai.sanctuaryprotocol.macos.castle-wall.signer-helper \
+        "${SIGNER_HELPER_DST}"
+    codesign --force --sign - --timestamp=none \
+        --identifier ai.sanctuaryprotocol.macos.castle-wall.signer-client \
+        "${SIGNER_CLIENT_DST}"
+fi
 codesign --force --sign - --timestamp=none "${WRAPPED_APP_DIR}"
 
 log "step 5/5 - verify structure and signatures"

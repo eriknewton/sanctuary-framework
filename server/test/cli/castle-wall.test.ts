@@ -278,7 +278,7 @@ describe("castle-wall setup-shared-dir", () => {
     expect(err.text()).toContain("SUDO_USER unset");
   });
 
-  it("creates, owns, and chmods the shared dir for the sudo operator", async () => {
+  it("creates the shared dir root-owned (root:wheel), not operator-owned (A2/B2)", async () => {
     const out = new CaptureStream();
     const execCommands: string[] = [];
     const code = await runSetupSharedDir({
@@ -296,8 +296,12 @@ describe("castle-wall setup-shared-dir", () => {
     expect(execCommands).toHaveLength(3);
     expect(execCommands[0]).toContain("mkdir -p");
     expect(execCommands[0]).toContain("/Library/Application Support/Sanctuary");
-    expect(execCommands[1]).toContain("chown");
-    expect(execCommands[1]).toContain("agentmac:admin");
+    // F-A2-1: the custody dir must be root-owned so an operator-UID process
+    // cannot unlink + swap the signing key / trust-anchor pin inside it. The
+    // operator account name must NOT appear in the chown target.
+    expect(execCommands[1]).toContain("chown root:wheel");
+    expect(execCommands[1]).not.toContain("agentmac");
+    expect(execCommands[1]).not.toContain(":admin");
     expect(execCommands[1]).toContain("/Library/Application Support/Sanctuary");
     expect(execCommands[2]).toContain("chmod 0755");
     expect(execCommands[2]).toContain("/Library/Application Support/Sanctuary");

@@ -34,7 +34,23 @@ export interface SocketPathInput {
   explicitOverride?: string;
 }
 
-export const CASTLE_WALL_ACTIVE_CONFIG_PATH = "/tmp/sanctuary-castle-active.json";
+/**
+ * Active-config discovery file. Relocated out of world-writable `/tmp` into the
+ * root-protected Castle Wall directory (A2/B2) to reduce local-DoS / owner-
+ * confusion (any user could previously clobber the `/tmp` file). This is NOT a
+ * MITM fix — the Ed25519 handshake already covers that. The Swift mirror
+ * (`Sources/CastleWallIPC/SocketPath.swift`) MUST keep this path identical.
+ */
+export const CASTLE_WALL_ACTIVE_CONFIG_PATH =
+  "/Library/Application Support/Sanctuary/castle-active.json";
+
+/**
+ * Legacy `/tmp` location, kept ONLY as a read-fallback so a half-migrated box
+ * (a daemon from before the relocation still has its discovery file there) still
+ * resolves. Nothing writes here anymore.
+ */
+export const CASTLE_WALL_ACTIVE_CONFIG_LEGACY_PATH =
+  "/tmp/sanctuary-castle-active.json";
 
 /** The resolved socket path plus a tag describing which fallback won. */
 export interface ResolvedSocketPath {

@@ -16,7 +16,8 @@ import { ed25519 } from "@noble/curves/ed25519";
 
 import {
   buildSignedManifest,
-  type ManifestSigningKey,
+  localManifestSigner,
+  type ManifestSigner,
 } from "../../../src/castle-wall/runtime/manifest-publisher.js";
 import {
   verifyManifestSignature,
@@ -26,33 +27,35 @@ import { randomBytes } from "../../../src/core/random.js";
 import { MacOSFlowEventConsumer } from "../../../src/castle-wall/runtime/macos-flow-events.js";
 import type { FlowDecisionRecordedNotification } from "../../../src/castle-wall/ipc/messages.js";
 
-function makeSigningKey(): ManifestSigningKey & { publicKey: Uint8Array } {
+function makeSigningKey(): { signer: ManifestSigner; publicKey: Uint8Array } {
   const seed = randomBytes(32);
   const publicKey = ed25519.getPublicKey(seed);
   const masterKey = randomBytes(32);
   const encryptedPrivateKey = encrypt(seed, masterKey);
   return {
-    signingKeyId: "test-key",
-    encryptedPrivateKey,
-    encryptionKey: masterKey,
+    signer: localManifestSigner({
+      signingKeyId: "test-key",
+      encryptedPrivateKey,
+      encryptionKey: masterKey,
+    }),
     publicKey,
   };
 }
 
 describe("castle-wall/runtime/daemon-agent-origin", () => {
   describe("agent-origin in signed manifest", () => {
-    it("includes a valid uid-mode agent-origin in the signed manifest body", () => {
+    it("includes a valid uid-mode agent-origin in the signed manifest body", async () => {
       const signingKey = makeSigningKey();
       const agentOrigin = {
         mode: "uid",
         agent_uid: 502,
         system_uid_allow_ceiling: 500,
       };
-      const { signed } = buildSignedManifest({
+      const { signed } = await buildSignedManifest({
         fortressId: "test-fortress",
         issuedAt: new Date().toISOString(),
         rules: [],
-        signingKey,
+        signer: signingKey.signer,
         agentOrigin,
       });
       expect(signed.manifest.agent_origin).toEqual(agentOrigin);
@@ -60,41 +63,41 @@ describe("castle-wall/runtime/daemon-agent-origin", () => {
       expect(result.ok).toBe(true);
     });
 
-    it("includes a valid nat-mode agent-origin in the signed manifest body", () => {
+    it("includes a valid nat-mode agent-origin in the signed manifest body", async () => {
       const signingKey = makeSigningKey();
       const agentOrigin = {
         mode: "nat",
         egress_helper_signing_id: "ai.sanctuaryprotocol.egress-helper",
         system_uid_allow_ceiling: 500,
       };
-      const { signed } = buildSignedManifest({
+      const { signed } = await buildSignedManifest({
         fortressId: "test-fortress",
         issuedAt: new Date().toISOString(),
         rules: [],
-        signingKey,
+        signer: signingKey.signer,
         agentOrigin,
       });
       expect(signed.manifest.agent_origin).toEqual(agentOrigin);
     });
 
-    it("omits agent-origin when not provided (fail-closed classify-all-agent)", () => {
+    it("omits agent-origin when not provided (fail-closed classify-all-agent)", async () => {
       const signingKey = makeSigningKey();
-      const { signed } = buildSignedManifest({
+      const { signed } = await buildSignedManifest({
         fortressId: "test-fortress",
         issuedAt: new Date().toISOString(),
         rules: [],
-        signingKey,
+        signer: signingKey.signer,
       });
       expect(signed.manifest.agent_origin).toBeUndefined();
     });
 
-    it("omits agent-origin when candidate is malformed (fail-closed)", () => {
+    it("omits agent-origin when candidate is malformed (fail-closed)", async () => {
       const signingKey = makeSigningKey();
-      const { signed } = buildSignedManifest({
+      const { signed } = await buildSignedManifest({
         fortressId: "test-fortress",
         issuedAt: new Date().toISOString(),
         rules: [],
-        signingKey,
+        signer: signingKey.signer,
         agentOrigin: { mode: "uid" }, // missing agent_uid
       });
       expect(signed.manifest.agent_origin).toBeUndefined();

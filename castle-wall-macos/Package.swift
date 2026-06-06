@@ -54,6 +54,20 @@ let package = Package(
             name: "CastleWallHostApp",
             targets: ["CastleWallHostApp"]
         ),
+        // A2/B2 helper-as-signer: a root SMAppService daemon owns the signing
+        // key; a code-signed shim relays the daemon's sign requests over XPC.
+        .library(
+            name: "CastleWallSigner",
+            targets: ["CastleWallSigner"]
+        ),
+        .executable(
+            name: "CastleWallSignerHelper",
+            targets: ["CastleWallSignerHelper"]
+        ),
+        .executable(
+            name: "CastleWallSignerClient",
+            targets: ["CastleWallSignerClient"]
+        ),
     ],
     targets: [
         .target(
@@ -90,7 +104,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "CastleWallHostApp",
-            dependencies: ["CastleWallIPC", "AgentDetector"],
+            dependencies: ["CastleWallIPC", "AgentDetector", "CastleWallSigner"],
             path: "Sources/CastleWallHostApp",
             exclude: [
                 "Info.plist",
@@ -99,7 +113,49 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("SystemExtensions"),
                 .linkedFramework("SwiftUI"),
+                // SMAppService (register the root signer helper) — A2/B2.
+                .linkedFramework("ServiceManagement"),
             ]
+        ),
+        // A2/B2 helper-as-signer targets. CastleWallSigner is the shared,
+        // unit-testable core (key gen, raw Ed25519 sign/verify over OPAQUE
+        // bytes, root-only key + pin storage, code-requirement string, peer
+        // audit-token decode). It is deliberately macOS-13-compatible (no
+        // macOS-26-only symbol) so it stays on the macos-latest CI floor.
+        .target(
+            name: "CastleWallSigner",
+            // FileCustody (root-ownership custody checks, A2/B2) is shared with
+            // the sysext side, so it lives in the pure CastleWallIPC library.
+            dependencies: ["CastleWallIPC"],
+            path: "Sources/CastleWallSigner",
+            linkerSettings: [
+                // SecRequirementCreateWithString for the caller code-requirement.
+                .linkedFramework("Security"),
+                // audit_token_to_ruid/pid/pidversion for peer decode.
+                .linkedLibrary("bsm"),
+            ]
+        ),
+        .executableTarget(
+            name: "CastleWallSignerHelper",
+            dependencies: ["CastleWallSigner"],
+            path: "Sources/CastleWallSignerHelper",
+            exclude: [
+                "CastleWallSignerHelper.entitlements",
+                "ai.sanctuaryprotocol.macos.castle-wall.signer-helper.plist",
+            ]
+        ),
+        .executableTarget(
+            name: "CastleWallSignerClient",
+            dependencies: ["CastleWallSigner"],
+            path: "Sources/CastleWallSignerClient",
+            exclude: [
+                "CastleWallSignerClient.entitlements",
+            ]
+        ),
+        .testTarget(
+            name: "CastleWallSignerTests",
+            dependencies: ["CastleWallSigner"],
+            path: "Tests/CastleWallSignerTests"
         ),
         .testTarget(
             name: "CastleWallIPCTests",
