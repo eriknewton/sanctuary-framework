@@ -839,6 +839,26 @@ export class StateStore {
       );
     }
 
+    // F1: a legacy (v1) entry must never ADVANCE the version past an established
+    // anchor. The current write schema is v2, so every legitimate version bump is
+    // written as v2 — a v1 entry claiming a version above the persisted anchor can
+    // only be a downgrade/replay forgery. The v1 signature binds the ciphertext
+    // ONLY (not the version/namespace/key), so the signature check below cannot
+    // catch this; the persisted anchor is the discriminator. (A genuine
+    // pre-migration v1 entry sits at or below the anchor it established, or lives
+    // on a never-anchored fortress where the anchor is 0.) NOTE: this depends on
+    // the version-anchor file surviving; authenticating that file against
+    // deletion/rollback (it is currently unsigned) is a separate hardening.
+    if (options.enforceRollback && stateEntry.v === 1) {
+      const anchoredVersion = await this.getAnchoredVersion(namespace, key);
+      if (anchoredVersion > 0 && stateEntry.ver > anchoredVersion) {
+        throw new StateVerificationError(
+          "rollback_detected",
+          `Rollback detected for ${namespace}/${key}: a legacy (v1) entry at version ${stateEntry.ver} cannot exceed the established anchor ${anchoredVersion} (legitimate advances are written as schema v2)`
+        );
+      }
+    }
+
     let signatureVerified = false;
     let warnings: LegacyEnvelopeWarningInfo[] | undefined;
     if (options.verifySignature) {
