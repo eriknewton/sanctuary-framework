@@ -15,7 +15,7 @@ import type { StorageBackend } from "../storage/interface.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
 import { ReputationStore } from "../l4-reputation/reputation-store.js";
-import { resolveTier, TIER_WEIGHTS, type TierMetadata } from "../l4-reputation/tiers.js";
+import { resolveTierByDid, TIER_WEIGHTS, type TierMetadata } from "../l4-reputation/tiers.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
@@ -371,7 +371,7 @@ export function createBridgeTools(
         const hasSanctuaryIdentity = identityManager.list().some(
           (id) => identityManager.get(id.identity_id)?.did === counterpartyDid
         );
-        const tierMeta: TierMetadata = resolveTier(counterpartyDid, hsResults, hasSanctuaryIdentity);
+        const tierMeta: TierMetadata = resolveTierByDid(counterpartyDid, hsResults, hasSanctuaryIdentity);
         const tier = tierMeta.sovereignty_tier;
 
         // Include bridge-specific metrics alongside user-provided ones

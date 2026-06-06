@@ -17,6 +17,8 @@
  */
 
 import type { HandshakeResult, TrustTier } from "../handshake/types.js";
+import { publicKeyToDid } from "../core/identity.js";
+import { fromBase64url } from "../core/encoding.js";
 
 // ── Tier Types ──────────────────────────────────────────────────────
 
@@ -78,6 +80,39 @@ export function resolveTier(
   }
 
   return { sovereignty_tier: "unverified" };
+}
+
+/**
+ * Resolve the sovereignty tier when the caller holds a counterparty DID rather
+ * than its handshake instance_id. The handshake map is keyed by instance_id, so
+ * a DID lookup would always miss and silently under-credit a genuinely verified
+ * peer. Match the DID against each handshake's current signing key
+ * (`counterparty_shr.signed_by`) via the injective publicKeyToDid mapping, then
+ * delegate to resolveTier with the matched instance_id.
+ *
+ * Fail-safe by construction: publicKeyToDid is 1:1, so a DID matches at most one
+ * handshake (never the wrong one — no over-crediting); a miss (including a
+ * counterparty whose signing key has rotated away from the DID) falls through to
+ * the original instance_id lookup, preserving today's behavior.
+ */
+export function resolveTierByDid(
+  counterpartyDid: string,
+  handshakeResults: Map<string, HandshakeResult>,
+  hasSanctuaryIdentity: boolean
+): TierMetadata {
+  for (const [instanceId, result] of handshakeResults) {
+    try {
+      const did = publicKeyToDid(fromBase64url(result.counterparty_shr.signed_by));
+      if (did === counterpartyDid) {
+        return resolveTier(instanceId, handshakeResults, hasSanctuaryIdentity);
+      }
+    } catch {
+      // Skip a handshake whose signing key cannot be decoded.
+    }
+  }
+  // No DID match — preserve the original behavior (the instance_id lookup misses
+  // for a DID key and falls to self-attested/unverified).
+  return resolveTier(counterpartyDid, handshakeResults, hasSanctuaryIdentity);
 }
 
 /**
