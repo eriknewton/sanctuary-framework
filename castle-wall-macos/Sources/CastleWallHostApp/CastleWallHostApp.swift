@@ -10,7 +10,8 @@ struct CastleWallHostApp: App {
         WindowGroup {
             ContentView(
                 systemExtensionManager: systemExtensionManager,
-                filterConfigurationManager: filterConfigurationManager
+                filterConfigurationManager: filterConfigurationManager,
+                signerHelperManager: signerHelperManager
             )
             .onAppear {
                 ensureSignerHelper()

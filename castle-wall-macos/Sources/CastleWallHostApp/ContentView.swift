@@ -4,8 +4,11 @@ import AgentDetector
 struct ContentView: View {
     @ObservedObject var systemExtensionManager: SystemExtensionManager
     @ObservedObject var filterConfigurationManager: FilterConfigurationManager
+    @ObservedObject var signerHelperManager: SignerHelperManager
     @StateObject private var agentDetector = AgentDetector()
     @StateObject private var serverBridge = SanctuaryServerBridge()
+
+    @Environment(\.scenePhase) private var scenePhase
 
     @AppStorage("hasCompletedFirstRun") private var hasCompletedFirstRun = false
     @State private var selectedTab: Tab = .agents
@@ -25,6 +28,11 @@ struct ContentView: View {
             headerBar
 
             Divider()
+
+            // One-time root-helper approval path (drill blocker fix): when the
+            // helper is registered-but-unapproved, guide the operator to the
+            // System Settings toggle instead of silently doing nothing.
+            helperStatusBanner
 
             if !hasCompletedFirstRun {
                 FirstRunView(
@@ -51,6 +59,13 @@ struct ContentView: View {
         .task {
             await agentDetector.scan()
             await serverBridge.checkServerHealth()
+        }
+        .onChange(of: scenePhase) { newPhase in
+            // Re-read helper status when the app reactivates so the approval
+            // banner clears the moment the operator flips the toggle and returns.
+            if newPhase == .active {
+                signerHelperManager.refreshStatus()
+            }
         }
         .onChange(of: systemExtensionManager.extensionState) { newState in
             if newState == .activated,
@@ -108,13 +123,27 @@ struct ContentView: View {
         .cornerRadius(12)
     }
 
+    /// True only when the helper can sign (ready), the sysext is activated, and
+    /// the filter is enabled. Gates the green "Protection Active" state so a bare
+    /// filter toggle (no helper/pin) never reads as fully protected.
+    private var protectionActive: Bool {
+        SignerHelperManager.isProtectionActive(
+            isReady: signerHelperManager.isReady,
+            sysextActivated: systemExtensionManager.extensionState == .activated,
+            filterEnabled: filterConfigurationManager.filterState == .enabled
+        )
+    }
+
     private var protectionColor: Color {
-        if systemExtensionManager.extensionState == .activated,
-           filterConfigurationManager.filterState == .enabled {
+        if protectionActive {
             return .green
         }
+        if case .error = signerHelperManager.helperState { return .red }
         if case .error = systemExtensionManager.extensionState { return .red }
         if case .error = filterConfigurationManager.filterState { return .red }
+        if signerHelperManager.helperState == .requiresApproval {
+            return .yellow
+        }
         if systemExtensionManager.extensionState == .needsUserApproval ||
             filterConfigurationManager.filterState == .needsUserApproval {
             return .yellow
@@ -130,9 +159,14 @@ struct ContentView: View {
     }
 
     private var protectionLabel: String {
-        if systemExtensionManager.extensionState == .activated,
-           filterConfigurationManager.filterState == .enabled {
+        if protectionActive {
             return "Protection Active"
+        }
+        if signerHelperManager.helperState == .requiresApproval {
+            return "Needs Helper Approval"
+        }
+        if case let .error(msg) = signerHelperManager.helperState {
+            return "Helper Error: \(msg)"
         }
         if systemExtensionManager.extensionState == .activatedRequiresReboot {
             return "Reboot Required"
@@ -154,6 +188,64 @@ struct ContentView: View {
             return "Activating..."
         }
         return "Protection Off"
+    }
+
+    // MARK: - Helper approval banner
+
+    @ViewBuilder
+    private var helperStatusBanner: some View {
+        switch signerHelperManager.helperState {
+        case .requiresApproval:
+            helperBanner(
+                icon: "exclamationmark.shield.fill",
+                tint: .yellow,
+                title: "Approve Sanctuary background helper",
+                detail: "Enable Sanctuary-CastleWall under Allow in the Background, authenticate as admin.",
+                actionLabel: "Open Settings"
+            ) {
+                signerHelperManager.openApprovalSettings()
+            }
+        case let .error(msg):
+            helperBanner(
+                icon: "xmark.octagon.fill",
+                tint: .red,
+                title: "Background helper error",
+                detail: msg,
+                actionLabel: "Retry"
+            ) {
+                signerHelperManager.register()
+            }
+        default:
+            EmptyView()
+        }
+    }
+
+    private func helperBanner(
+        icon: String,
+        tint: Color,
+        title: String,
+        detail: String,
+        actionLabel: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .foregroundColor(tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Button(actionLabel, action: action)
+                .font(.subheadline)
+        }
+        .padding(12)
+        .background(tint.opacity(0.12))
     }
 
     // MARK: - Tab bar
