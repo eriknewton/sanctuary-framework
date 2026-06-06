@@ -73,6 +73,7 @@ async function writeLegacyEntry(args: {
   namespace: string;
   key: string;
   value: string;
+  ver?: number;
 }): Promise<void> {
   const plaintext = stringToBytes(args.value);
   const payload = encrypt(
@@ -88,7 +89,7 @@ async function writeLegacyEntry(args: {
   const entry: StateEntry = {
     v: 1,
     payload,
-    ver: 1,
+    ver: args.ver ?? 1,
     sig: toBase64url(signature),
     kid: args.identity.storedIdentity.identity_id,
     integrity_hash: hashToString(plaintext),
@@ -256,6 +257,63 @@ describe("state envelope integrity", () => {
 
     expect(read.error).toBe("state_verification_failed");
     expect(read.classification).toBe("schema_mismatch");
+  });
+
+  it("rejects a legacy (v1) entry that leapfrogs an established anchor (F1)", async () => {
+    const { storage, masterKey, stateStore, identity, identityEncKey } = makeStateRig();
+
+    // Establish an anchor with a genuine v2 write.
+    await stateStore.write(
+      "memory",
+      "balance",
+      "current-v2",
+      identity.storedIdentity.identity_id,
+      identity.storedIdentity.encrypted_private_key,
+      identityEncKey
+    );
+    await stateStore.read("memory", "balance"); // persists the version anchor
+
+    // Forge a v1 entry replaying OLD state at a version ABOVE the anchor. Its
+    // legacy signature covers only the ciphertext, so the signature check would
+    // pass — the version-anchor guard is what must catch it.
+    await writeLegacyEntry({
+      storage,
+      masterKey,
+      identity,
+      identityEncKey,
+      namespace: "memory",
+      key: "balance",
+      value: "OLD-SECRET",
+      ver: 11,
+    });
+
+    const freshStore = new StateStore(storage, masterKey);
+    await expect(freshStore.read("memory", "balance")).rejects.toMatchObject({
+      name: "StateVerificationError",
+      classification: "rollback_detected",
+    } satisfies Partial<StateVerificationError>);
+  });
+
+  it("still re-reads a genuine legacy (v1) entry at its own anchor (no over-rejection)", async () => {
+    const { storage, masterKey, identity, identityEncKey } = makeStateRig();
+    await writeLegacyEntry({
+      storage,
+      masterKey,
+      identity,
+      identityEncKey,
+      namespace: "legacy",
+      key: "k",
+      value: "legacy value",
+    });
+
+    // First read establishes the anchor at the v1 entry's own version (1).
+    const first = await new StateStore(storage, masterKey).read("legacy", "k");
+    expect(first?.value).toBe("legacy value");
+
+    // A subsequent read with the anchor now set (== the entry's version) must
+    // still succeed — the F1 guard only rejects a v1 entry ABOVE the anchor.
+    const second = await new StateStore(storage, masterKey).read("legacy", "k");
+    expect(second?.value).toBe("legacy value");
   });
 
   it("readUnverified works for explicit legacy migration paths", async () => {
