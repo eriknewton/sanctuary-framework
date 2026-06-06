@@ -98,6 +98,20 @@ export interface ZKRangeProof {
     announcement: string;
     response: string;
   };
+  /**
+   * Upper-bound bit commitments for (max - value). Required: without this
+   * second decomposition the bit budget only bounds (value - min) to the next
+   * power of two, letting a prover prove a value above max when range+1 is not
+   * a power of two. The two non-negativity proofs intersect to exactly [min,max].
+   */
+  upper_bit_commitments: string[];
+  /** Proofs that each upper bit commitment is 0 or 1 */
+  upper_bit_proofs: ZKRangeProof["bit_proofs"];
+  /** Sum proof binding (max - value) to (max*G - C) */
+  upper_sum_proof: {
+    announcement: string;
+    response: string;
+  };
   /** Proof generated at */
   generated_at: string;
 }
@@ -305,6 +319,14 @@ export function verifyProofOfKnowledge(proof: ZKProofOfKnowledge): boolean {
  * @param min - Minimum value (inclusive)
  * @param max - Maximum value (inclusive)
  */
+/**
+ * Defensive cap on the bit width of a range. Every legitimate range derived
+ * from JS numbers needs <= 53 bits; capping at 64 bounds proof size (anti-DoS)
+ * and keeps 2*(2^numBits - 1) far below the Ristretto group order L, which is
+ * what rules out a scalar-wraparound attack on the dual-decomposition bound.
+ */
+export const MAX_RANGE_BITS = 64;
+
 export function createRangeProof(
   value: number,
   blindingFactor: string,
@@ -312,19 +334,26 @@ export function createRangeProof(
   min: number,
   max: number
 ): ZKRangeProof | { error: string } {
+  if (!Number.isInteger(value) || !Number.isInteger(min) || !Number.isInteger(max)) {
+    return { error: `value, min and max must be integers` };
+  }
   if (value < min || value > max) {
     return { error: `Value ${value} is not in range [${min}, ${max}]` };
   }
 
   const range = max - min;
   const numBits = Math.ceil(Math.log2(range + 1));
+  if (numBits > MAX_RANGE_BITS) {
+    return { error: `Range too wide: ${numBits} bits exceeds cap ${MAX_RANGE_BITS}` };
+  }
   const shifted = value - min;
   const b = bytesToBigint(fromBase64url(blindingFactor));
 
-  // Decompose shifted value into bits
+  // Decompose the shifted value into bits. Use BigInt shifts: JS `>>` coerces to
+  // a signed 32-bit int and would corrupt any range wider than 31 bits.
   const bits: number[] = [];
   for (let i = 0; i < numBits; i++) {
-    bits.push((shifted >> i) & 1);
+    bits.push(Number((BigInt(shifted) >> BigInt(i)) & 1n));
   }
 
   // Create bit commitments with random blinding factors
@@ -364,6 +393,43 @@ export function createRangeProof(
   );
   const s_sum = mod(r_sum + e_sum * blindingDiff);
 
+  // ── Upper bound: prove (max - value) ∈ [0, 2^numBits - 1], i.e. value ≤ max.
+  // The lower decomposition above only bounds (value - min) to the next power of
+  // two; on its own that lets a prover prove a value above max whenever range+1
+  // is not a power of two. This mirror decomposition closes that gap — the two
+  // non-negativity proofs intersect to exactly [min, max].
+  const upperShifted = max - value; // = range - shifted, in [0, range]
+  const upperBits: number[] = [];
+  for (let i = 0; i < numBits; i++) {
+    upperBits.push(Number((BigInt(upperShifted) >> BigInt(i)) & 1n));
+  }
+
+  const upperBitBlindings: bigint[] = [];
+  const upperBitCommitments: string[] = [];
+  const upperBitProofs: ZKRangeProof["bit_proofs"] = [];
+  for (let i = 0; i < numBits; i++) {
+    const ubit_b = randomScalar();
+    upperBitBlindings.push(ubit_b);
+    const U_i = safeMultiply(G, mod(BigInt(upperBits[i]!))).add(safeMultiply(H, ubit_b));
+    upperBitCommitments.push(toBase64url(U_i.toRawBytes()));
+    upperBitProofs.push(createBitProof(upperBits[i]!, ubit_b, U_i));
+  }
+
+  // Upper sum proof: (max*G - C) - sum(2^i * U_i) has blinding factor -(b + sumBlinding_upper).
+  const upperSumBlinding = upperBitBlindings.reduce(
+    (acc, bi, i) => mod(acc + mod(BigInt(1) << BigInt(i)) * bi),
+    0n
+  );
+  const blindingDiffUpper = mod(-b - upperSumBlinding);
+  const r_upper = randomScalar();
+  const R_upper = safeMultiply(H, r_upper);
+  const e_upper = fiatShamirChallenge(
+    "sanctuary-zk-range-upper-v1",
+    fromBase64url(commitment),
+    R_upper.toRawBytes()
+  );
+  const s_upper = mod(r_upper + e_upper * blindingDiffUpper);
+
   return {
     type: "range-pedersen-ristretto255",
     commitment,
@@ -375,55 +441,101 @@ export function createRangeProof(
       announcement: toBase64url(R_sum.toRawBytes()),
       response: toBase64url(bigintToBytes(s_sum)),
     },
+    upper_bit_commitments: upperBitCommitments,
+    upper_bit_proofs: upperBitProofs,
+    upper_sum_proof: {
+      announcement: toBase64url(R_upper.toRawBytes()),
+      response: toBase64url(bigintToBytes(s_upper)),
+    },
     generated_at: new Date().toISOString(),
   };
 }
 
 /**
- * Verify a ZK range proof.
+ * Verify one bit-decomposition: every bit commitment opens to {0,1}, and the
+ * sum proof shows `anchor - sum(2^i * bitCommitment_i)` has no G-component
+ * (i.e. the bit-sum equals the value encoded by `anchor`). Shared by the lower
+ * (anchor = C - min*G) and upper (anchor = max*G - C) decompositions.
+ */
+function verifyBitDecomposition(
+  anchor: InstanceType<typeof RistrettoPoint>,
+  bitCommitments: string[],
+  bitProofs: ZKRangeProof["bit_proofs"],
+  sumProof: { announcement: string; response: string },
+  commitmentB64: string,
+  domain: string,
+  numBits: number
+): boolean {
+  if (bitCommitments.length !== numBits) return false;
+  if (bitProofs.length !== numBits) return false;
+
+  let reconstructed = RistrettoPoint.ZERO;
+  for (let i = 0; i < numBits; i++) {
+    const C_i = RistrettoPoint.fromHex(fromBase64url(bitCommitments[i]!));
+    if (!verifyBitProof(bitProofs[i]!, C_i)) return false;
+    reconstructed = reconstructed.add(safeMultiply(C_i, mod(BigInt(1) << BigInt(i))));
+  }
+
+  const diff = anchor.subtract(reconstructed);
+  const R = RistrettoPoint.fromHex(fromBase64url(sumProof.announcement));
+  const s = bytesToBigint(fromBase64url(sumProof.response));
+  const e = fiatShamirChallenge(domain, fromBase64url(commitmentB64), fromBase64url(sumProof.announcement));
+  return safeMultiply(H, s).equals(R.add(safeMultiply(diff, e)));
+}
+
+/**
+ * Verify a ZK range proof. BOTH the lower decomposition (value - min ≥ 0) and
+ * the upper decomposition (max - value ≥ 0) must verify; their intersection is
+ * exactly [min, max]. The upper proof is mandatory — a proof lacking it (legacy
+ * or forged) is rejected, fail closed.
  */
 export function verifyRangeProof(proof: ZKRangeProof): boolean {
   try {
+    if (!Number.isInteger(proof.min) || !Number.isInteger(proof.max) || proof.max < proof.min) {
+      return false;
+    }
     const C = RistrettoPoint.fromHex(fromBase64url(proof.commitment));
     const range = proof.max - proof.min;
     const numBits = Math.ceil(Math.log2(range + 1));
+    if (numBits > MAX_RANGE_BITS) return false;
 
-    if (proof.bit_commitments.length !== numBits) return false;
-    if (proof.bit_proofs.length !== numBits) return false;
-
-    // Verify each bit proof
-    for (let i = 0; i < numBits; i++) {
-      const C_i = RistrettoPoint.fromHex(fromBase64url(proof.bit_commitments[i]!));
-      if (!verifyBitProof(proof.bit_proofs[i]!, C_i)) {
-        return false;
-      }
+    if (!proof.upper_bit_commitments || !proof.upper_bit_proofs || !proof.upper_sum_proof) {
+      return false;
     }
 
-    // Verify sum proof: sum(2^i * C_i) + blindingDiff*H == C - min*G
-    // Reconstruct: sum(2^i * C_i)
-    let reconstructed = RistrettoPoint.ZERO;
-    for (let i = 0; i < numBits; i++) {
-      const C_i = RistrettoPoint.fromHex(fromBase64url(proof.bit_commitments[i]!));
-      const weight = mod(BigInt(1) << BigInt(i));
-      reconstructed = reconstructed.add(safeMultiply(C_i, weight));
+    // Lower: value - min ∈ [0, 2^numBits-1]; anchor = C - min*G
+    const lowerAnchor = C.subtract(safeMultiply(G, mod(BigInt(proof.min))));
+    if (
+      !verifyBitDecomposition(
+        lowerAnchor,
+        proof.bit_commitments,
+        proof.bit_proofs,
+        proof.sum_proof,
+        proof.commitment,
+        "sanctuary-zk-range-sum-v1",
+        numBits
+      )
+    ) {
+      return false;
     }
 
-    // The difference: C - min*G - reconstructed should be blindingDiff*H
-    const diff = C.subtract(safeMultiply(G, mod(BigInt(proof.min)))).subtract(reconstructed);
+    // Upper: max - value ∈ [0, 2^numBits-1]; anchor = max*G - C
+    const upperAnchor = safeMultiply(G, mod(BigInt(proof.max))).subtract(C);
+    if (
+      !verifyBitDecomposition(
+        upperAnchor,
+        proof.upper_bit_commitments,
+        proof.upper_bit_proofs,
+        proof.upper_sum_proof,
+        proof.commitment,
+        "sanctuary-zk-range-upper-v1",
+        numBits
+      )
+    ) {
+      return false;
+    }
 
-    // Verify the sum proof for diff
-    const R_sum = RistrettoPoint.fromHex(fromBase64url(proof.sum_proof.announcement));
-    const s_sum = bytesToBigint(fromBase64url(proof.sum_proof.response));
-    const e_sum = fiatShamirChallenge(
-      "sanctuary-zk-range-sum-v1",
-      fromBase64url(proof.commitment),
-      fromBase64url(proof.sum_proof.announcement)
-    );
-
-    // Check: s_sum*H == R_sum + e_sum*diff
-    const lhs = safeMultiply(H, s_sum);
-    const rhs = R_sum.add(safeMultiply(diff, e_sum));
-    return lhs.equals(rhs);
+    return true;
   } catch {
     return false;
   }
