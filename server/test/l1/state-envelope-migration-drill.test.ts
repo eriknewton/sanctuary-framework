@@ -320,8 +320,11 @@ describe("state envelope migration drill", () => {
       value: target.value,
       version: 2,
     });
+    // F1: the version-anchor record is now MAC-authenticated; the per-key
+    // versions live under `.data` of the `{marker, data, mac}` envelope.
     const anchors = JSON.parse(bytesToString((await storage.read("_meta", ANCHORS_KEY))!));
-    expect(anchors[`${target.namespace}/${target.key}`]).toBe(2);
+    expect(anchors.__sanctuary_meta_mac_v1).toBe(true);
+    expect(anchors.data[`${target.namespace}/${target.key}`]).toBe(2);
 
     await writeEntry(storage, stale.namespace, stale.key, staleEntry);
     const { auditLog, tools } = makeTools(storage, new StateStore(storage, MASTER_KEY));
