@@ -40,21 +40,27 @@ function makeExec(): {
 
   const exec = async (
     cmd: string,
-    args: string[]
+    args: string[],
+    input?: string
   ): Promise<ExecResult> => {
     if (cmd !== "security") return { stdout: "", stderr: "unknown", code: 1 };
-    const key = keyFor(args);
     if (args[0] === "find-generic-password") {
-      const value = stored.get(key);
+      const value = stored.get(keyFor(args));
       if (value) return { stdout: value + "\n", stderr: "", code: 0 };
       return { stdout: "", stderr: "not found", code: 44 };
     }
-    if (args[0] === "add-generic-password") {
-      const wIdx = args.indexOf("-w");
-      if (wIdx < 0 || !args[wIdx + 1]) {
-        return { stdout: "", stderr: "missing -w", code: 1 };
-      }
-      stored.set(key, args[wIdx + 1]!);
+    if (args[0] === "-i") {
+      // F5: writes arrive as a `security -i` batch script on stdin; account,
+      // service, and value all live in the script (not argv).
+      const unescape = (s: string) => s.replace(/\\(.)/g, "$1");
+      const wm = input?.match(/-w "((?:[^"\\]|\\.)*)"/);
+      if (!wm) return { stdout: "", stderr: "missing -w", code: 1 };
+      const am = input?.match(/-a "((?:[^"\\]|\\.)*)"/);
+      const sm = input?.match(/-s "((?:[^"\\]|\\.)*)"/);
+      stored.set(
+        `${am ? unescape(am[1]) : ""}:${sm ? unescape(sm[1]) : ""}`,
+        unescape(wm[1])
+      );
       return { stdout: "", stderr: "", code: 0 };
     }
     return { stdout: "", stderr: "unknown", code: 1 };

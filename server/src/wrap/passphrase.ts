@@ -351,23 +351,37 @@ async function readFromKeychain(
   }
 }
 
+/**
+ * Escape a value for a double-quoted token in a `security -i` batch script.
+ * The security binary treats backslash as an escape inside quoted strings, so
+ * backslash and double-quote must be escaped.
+ */
+function escapeForSecurity(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
 async function writeToKeychain(
   value: string,
   exec: (cmd: string, args: string[], input?: string) => Promise<ExecResult>,
   service: string = KEYCHAIN_SERVICE_DEFAULT
 ): Promise<boolean> {
+  // F5 (HIGH): never pass the secret as an argv element. Process argv is
+  // world-readable on macOS (`ps -ww`), so `add-generic-password -w <value>`
+  // would leak the master passphrase to any other local user. Deliver the
+  // value through a `security -i` batch script on stdin, where it never appears
+  // in argv. (`security`'s own `-w` prompt reads /dev/tty, not stdin, so batch
+  // mode is the only argv-safe non-interactive path.) Mirrors the broker
+  // keychain backend's create/unlock pattern.
+  //
+  // A batch script is line-delimited, so a value containing a newline cannot be
+  // embedded; reject it rather than truncating or falling back to a leaky form.
+  if (/[\r\n]/.test(value)) return false;
   try {
     // -U updates in place if the item already exists.
-    const result = await exec(
-      "security",
-      [
-        "add-generic-password",
-        "-U",
-        "-a", KEYCHAIN_ACCOUNT,
-        "-s", service,
-        "-w", value,
-      ]
-    );
+    const batch =
+      `add-generic-password -U -a "${escapeForSecurity(KEYCHAIN_ACCOUNT)}" ` +
+      `-s "${escapeForSecurity(service)}" -w "${escapeForSecurity(value)}"\n`;
+    const result = await exec("security", ["-i"], batch);
     return result.code === 0;
   } catch {
     return false;
