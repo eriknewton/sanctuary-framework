@@ -822,12 +822,7 @@ export async function runWrap(
         try {
           await startCastleWallForWrap(ndAuditLog, ndDerived.key);
         } catch (err) {
-          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-          console.error(
-            `  Note: Castle Wall daemon did not start ` +
-              `(${(err as Error).message}). ` +
-              `Wrap continues; sysext IPC unavailable until the daemon starts.`,
-          );
+          warnCastleWallDaemonNotStarted(err);
         }
 
         const { IdentityManager } = await import("../l1-cognitive/tools.js");
@@ -956,12 +951,7 @@ export async function runWrap(
       try {
         await startCastleWallForWrap(wrapAuditLog, derived.key);
       } catch (err) {
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          `  Note: Castle Wall daemon did not start ` +
-            `(${(err as Error).message}). ` +
-            `Wrap continues; sysext IPC unavailable until the daemon starts.`,
-        );
+        warnCastleWallDaemonNotStarted(err);
       }
 
       // v1.2.1 (Finding NNN): auto-create default identity at wrap time.
@@ -1409,6 +1399,54 @@ async function unwrap(): Promise<void> {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Operator-facing warning when the Castle Wall enforcement daemon fails to
+ * start during `wrap`. Wrap is best-effort with respect to the daemon (a start
+ * failure never blocks wrapping the agent), but a silent "Note:" let an
+ * upgrade quietly leave a previously-armed host UNARMED. This makes the
+ * not-armed state loud, and — on macOS, when the failure is the A2/B2
+ * helper-signing default having no reachable signer — prints the exact
+ * migration path (install the helper + point at the shim, or opt back into the
+ * legacy local-signing key). See the A2/B2 re-drill verdict's migration caveat.
+ */
+function warnCastleWallDaemonNotStarted(err: unknown): void {
+  const message = err instanceof Error ? err.message : String(err);
+  const helperMigration =
+    process.platform === "darwin" &&
+    /helper signing is unavailable|signer helper is unreachable|without a signer/i.test(
+      message,
+    );
+  const lines = [
+    "",
+    "  ====================================================================",
+    "  WARNING: Castle Wall is NOT armed. Your agent is wrapped, but the",
+    "  enforcement wall did not start, so outbound traffic is NOT filtered.",
+    `  Reason: ${message}`,
+  ];
+  if (helperMigration) {
+    lines.push(
+      "",
+      "  Castle Wall now signs through a root helper by default (A2/B2). To",
+      "  arm the wall, do ONE of:",
+      '    1. Install the Castle Wall app (one-time "Allow background item"',
+      "       approval), then set SANCTUARY_CASTLE_SIGNER_CLIENT to its shim:",
+      "       /Applications/Sanctuary-CastleWall.app/Contents/MacOS/castle-wall-signer-client",
+      "    2. To keep the legacy local-signing key, set SANCTUARY_CASTLE_LOCAL_SIGN=1",
+      "  then re-run 'sanctuary wrap'.",
+    );
+  } else {
+    lines.push(
+      "  Wrap continues; the IPC daemon will surface its absence at handshake.",
+    );
+  }
+  lines.push(
+    "  ====================================================================",
+    "",
+  );
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.error(lines.join("\n"));
+}
 
 function convertToUpstreamServers(
   servers: MCPServerEntry[]
