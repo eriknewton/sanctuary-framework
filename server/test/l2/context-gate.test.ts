@@ -20,6 +20,9 @@ import {
   filterContext,
   ContextGatePolicyStore,
   MAX_CONTEXT_FIELDS,
+  MAX_CONTEXT_DEPTH,
+  MAX_POLICY_RULES,
+  MAX_PATTERNS_PER_ARRAY,
   type ContextGatePolicy,
   type ContextGateRule,
 } from "../../src/l2-operational/context-gate.js";
@@ -596,6 +599,178 @@ describe("L2 Context Gating", () => {
       // Logging: everything redacted
       const loggingResult = evaluateField(policy, "logging", "task_description");
       expect(loggingResult.action).toBe("redact");
+    });
+  });
+
+  // ── Nested-field recursion (closes the nested-exfiltration gap, T4) ──
+  describe("nested-field filtering", () => {
+    const nestedPolicy = (overrides: Partial<ContextGateRule> = {}) =>
+      makePolicy([
+        {
+          provider: "inference",
+          allow: ["metadata", "note", "tags", "users", "current_query"],
+          redact: ["api_key", "secret_*", "ssn"],
+          hash: ["user_id"],
+          summarize: [],
+          ...overrides,
+        },
+      ]);
+
+    it("redacts a secret nested under an allowed container (the leak)", () => {
+      const context = {
+        metadata: { api_key: "sk-secret-12345", note: "safe to share" },
+      };
+      const result = filterContext(nestedPolicy(), "inference", context);
+
+      // The nested api_key is caught by the same redact rule as a top-level one.
+      const decision = result.decisions.find((d) => d.field === "metadata.api_key");
+      expect(decision?.action).toBe("redact");
+      const noteDecision = result.decisions.find((d) => d.field === "metadata.note");
+      expect(noteDecision?.action).toBe("allow");
+      expect(result.fields_redacted).toBe(1);
+    });
+
+    it("the filtered output no longer carries the nested secret value", () => {
+      const context = {
+        metadata: { api_key: "sk-secret-12345", note: "safe to share" },
+      };
+      const before = filterContext(nestedPolicy(), "inference", context);
+      // Rebuild the same shape the filter would emit and confirm the secret is gone.
+      // (We assert via the filtered hash differing from the original and the
+      //  redact decision; the value itself never appears in any decision.)
+      expect(before.original_context_hash).not.toBe(before.filtered_context_hash);
+      const serialized = JSON.stringify(before.decisions);
+      expect(serialized).not.toContain("sk-secret-12345");
+    });
+
+    it("catches a nested secret via a wildcard pattern", () => {
+      const context = { metadata: { secret_token: "ghp_xxx", note: "ok" } };
+      const result = filterContext(nestedPolicy(), "inference", context);
+      const decision = result.decisions.find((d) => d.field === "metadata.secret_token");
+      expect(decision?.action).toBe("redact");
+    });
+
+    it("an unallowed container is redacted wholesale, not examined", () => {
+      // `blob` is not in the allow list -> whole subtree redacted (fail-closed);
+      // its inner `note` (which WOULD be allowed at the top level) never leaks.
+      const context = { blob: { note: "would-be-allowed", api_key: "sk-x" } };
+      const result = filterContext(nestedPolicy(), "inference", context);
+      const blob = result.decisions.find((d) => d.field === "blob");
+      expect(blob?.action).toBe("redact");
+      // No nested decision was produced because we did not recurse into it.
+      expect(result.decisions.some((d) => d.field.startsWith("blob."))).toBe(false);
+    });
+
+    it("redacts secrets nested inside an allowed array of objects", () => {
+      const context = {
+        users: [
+          { user_id: "u1", ssn: "111-11-1111" },
+          { user_id: "u2", ssn: "222-22-2222" },
+        ],
+      };
+      const result = filterContext(nestedPolicy(), "inference", context);
+      expect(result.decisions.find((d) => d.field === "users[0].ssn")?.action).toBe("redact");
+      expect(result.decisions.find((d) => d.field === "users[1].ssn")?.action).toBe("redact");
+      expect(result.decisions.find((d) => d.field === "users[0].user_id")?.action).toBe("hash");
+    });
+
+    it("primitive elements of an allowed array pass through", () => {
+      const context = { tags: ["alpha", "beta"] };
+      const result = filterContext(nestedPolicy(), "inference", context);
+      expect(result.decisions.find((d) => d.field === "tags")?.action).toBe("allow");
+    });
+
+    it("hashes a nested field when the rule says so", () => {
+      const context = { metadata: { user_id: "abc-123", note: "ok" } };
+      const result = filterContext(nestedPolicy(), "inference", context);
+      const d = result.decisions.find((x) => x.field === "metadata.user_id");
+      expect(d?.action).toBe("hash");
+      expect(d?.hash_value).toBeDefined();
+    });
+
+    it("flat contexts are unchanged by recursion (backward compatible)", () => {
+      const context = {
+        current_query: "hello",
+        api_key: "sk-x",
+        user_id: "u-1",
+      };
+      const result = filterContext(nestedPolicy(), "inference", context);
+      expect(result.fields_allowed).toBe(1);
+      expect(result.fields_redacted).toBe(1);
+      expect(result.fields_hashed).toBe(1);
+    });
+  });
+
+  // ── Fail-closed on hostile shapes ────────────────────────────────────
+  describe("recursion fail-closed guards", () => {
+    const allowAll = makePolicy([
+      { provider: "*", allow: ["*"], redact: [], hash: [], summarize: [] },
+    ]);
+
+    it("redacts beyond the max nesting depth instead of overflowing", () => {
+      let nested: Record<string, unknown> = { value: "deep-secret" };
+      for (let i = 0; i < MAX_CONTEXT_DEPTH + 10; i++) {
+        nested = { child: nested };
+      }
+      const context = { root: nested };
+
+      let result!: ReturnType<typeof filterContext>;
+      expect(() => {
+        result = filterContext(allowAll, "inference", context);
+      }).not.toThrow();
+      // Somewhere at the cap the over-deep subtree is redacted (fail-closed).
+      expect(
+        result.decisions.some((d) => /exceeds max nesting depth/.test(d.reason))
+      ).toBe(true);
+    });
+
+    it("redacts a cyclic reference instead of looping forever", () => {
+      const a: Record<string, unknown> = { inner: {} };
+      (a.inner as Record<string, unknown>).back = a;
+
+      let result!: ReturnType<typeof filterContext>;
+      expect(() => {
+        result = filterContext(allowAll, "inference", { wrapper: a });
+      }).not.toThrow();
+      expect(
+        result.decisions.some((d) => /cyclic reference/.test(d.reason))
+      ).toBe(true);
+    });
+
+    it("counts nested fields toward the total-field cap", () => {
+      const bag: Record<string, unknown> = {};
+      for (let i = 0; i < MAX_CONTEXT_FIELDS + 5; i++) {
+        bag[`f${i}`] = "x";
+      }
+      expect(() => filterContext(allowAll, "inference", { bag })).toThrow(
+        /exceeding limit/
+      );
+    });
+  });
+
+  // ── Policy-store size validation (defense in depth, T3) ──────────────
+  describe("policy store size validation", () => {
+    it("rejects a policy with too many rules", async () => {
+      const store = new ContextGatePolicyStore(new MemoryStorage(), generateRandomKey());
+      const rules: ContextGateRule[] = [];
+      for (let i = 0; i <= MAX_POLICY_RULES; i++) {
+        rules.push({ provider: "inference", allow: [], redact: [], hash: [], summarize: [] });
+      }
+      await expect(store.create("too-many", rules, "redact")).rejects.toThrow(
+        /exceeding limit/
+      );
+    });
+
+    it("rejects a rule with too many patterns", async () => {
+      const store = new ContextGatePolicyStore(new MemoryStorage(), generateRandomKey());
+      const allow: string[] = [];
+      for (let i = 0; i <= MAX_PATTERNS_PER_ARRAY; i++) allow.push(`f${i}`);
+      const rules: ContextGateRule[] = [
+        { provider: "inference", allow, redact: [], hash: [], summarize: [] },
+      ];
+      await expect(store.create("too-wide", rules, "redact")).rejects.toThrow(
+        /exceeding limit/
+      );
     });
   });
 });
