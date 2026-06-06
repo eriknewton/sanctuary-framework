@@ -7,6 +7,7 @@
 import { describe, it, expect } from "vitest";
 import {
   resolveTier,
+  resolveTierByDid,
   computeWeightedScore,
   tierDistribution,
   TIER_WEIGHTS,
@@ -15,6 +16,8 @@ import {
 } from "../../src/l4-reputation/tiers.js";
 import type { HandshakeResult } from "../../src/handshake/types.js";
 import type { SignedSHR } from "../../src/shr/types.js";
+import { publicKeyToDid } from "../../src/core/identity.js";
+import { toBase64url } from "../../src/core/encoding.js";
 
 // Minimal mock SHR for handshake results
 const mockSHR: SignedSHR = {
@@ -117,6 +120,61 @@ describe("Sovereignty-Gated Reputation Tiers", () => {
 
       const tier = resolveTier("cp-1", results, false);
       expect(tier.sovereignty_tier).toBe("unverified");
+    });
+  });
+
+  describe("resolveTierByDid (DID-keyed lookup, F2)", () => {
+    const pubkey = new Uint8Array(32).fill(7);
+    const did = publicKeyToDid(pubkey);
+    const signedByB64 = toBase64url(pubkey);
+
+    function verifiedByDidMap(): Map<string, HandshakeResult> {
+      const results = new Map<string, HandshakeResult>();
+      results.set(
+        "instance-xyz",
+        makeHandshakeResult({
+          counterparty_id: "instance-xyz",
+          trust_tier: "verified-sovereign",
+          counterparty_shr: { ...mockSHR, signed_by: signedByB64 },
+        })
+      );
+      return results;
+    }
+
+    it("credits a verified peer looked up by DID (resolveTier would miss it)", () => {
+      const results = verifiedByDidMap();
+      // The old path keyed the DID into an instance_id-keyed map → always missed.
+      expect(resolveTier(did, results, false).sovereignty_tier).toBe("unverified");
+      // The DID-aware path matches via counterparty_shr.signed_by and credits it.
+      expect(resolveTierByDid(did, results, false).sovereignty_tier).toBe("verified-sovereign");
+    });
+
+    it("falls through to the default when no handshake matches the DID (fail-safe)", () => {
+      const results = verifiedByDidMap();
+      const otherDid = publicKeyToDid(new Uint8Array(32).fill(9));
+      expect(resolveTierByDid(otherDid, results, false).sovereignty_tier).toBe("unverified");
+      expect(resolveTierByDid(otherDid, results, true).sovereignty_tier).toBe("self-attested");
+    });
+
+    it("never over-credits: a different DID cannot borrow a verified peer's tier", () => {
+      const results = verifiedByDidMap();
+      const otherDid = publicKeyToDid(new Uint8Array(32).fill(3));
+      expect(resolveTierByDid(otherDid, results, false).sovereignty_tier).not.toBe(
+        "verified-sovereign"
+      );
+    });
+
+    it("skips a handshake whose signing key cannot be decoded (no throw)", () => {
+      const results = new Map<string, HandshakeResult>();
+      results.set(
+        "bad",
+        makeHandshakeResult({
+          counterparty_id: "bad",
+          counterparty_shr: { ...mockSHR, signed_by: "!!!not-base64!!!" },
+        })
+      );
+      expect(() => resolveTierByDid(did, results, false)).not.toThrow();
+      expect(resolveTierByDid(did, results, false).sovereignty_tier).toBe("unverified");
     });
   });
 

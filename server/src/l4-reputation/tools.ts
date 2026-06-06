@@ -15,7 +15,7 @@ import type { HandshakeResult } from "../handshake/types.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
 import {
-  resolveTier,
+  resolveTierByDid,
   computeWeightedScore,
   tierDistribution,
   TIER_WEIGHTS,
@@ -110,7 +110,7 @@ export function createL4Tools(
         const hasSanctuaryIdentity = identityManager.list().some(
           (id) => identityManager.get(id.identity_id)?.did === counterpartyDid
         );
-        const tierMeta = resolveTier(counterpartyDid, hsResults, hasSanctuaryIdentity);
+        const tierMeta = resolveTierByDid(counterpartyDid, hsResults, hasSanctuaryIdentity);
 
         const stored = await reputationStore.record(
           args.interaction_id as string,
