@@ -119,6 +119,37 @@ export const MAX_POLICY_RULES = 50;
 /** Maximum number of patterns in a single rule array (allow, redact, hash, summarize) */
 export const MAX_PATTERNS_PER_ARRAY = 500;
 
+/**
+ * Maximum nesting depth examined during recursive filtering. Structures deeper
+ * than this fail closed (the over-deep subtree is redacted, never emitted
+ * unexamined). Also bounds recursion so a hostile deeply-nested context cannot
+ * exhaust the stack.
+ */
+export const MAX_CONTEXT_DEPTH = 64;
+
+/**
+ * JSON-serialize for the audit hash without crashing on a cyclic context. A
+ * hostile agent could send a self-referential object; the filter must still
+ * produce a deterministic fingerprint rather than throw on the outbound
+ * enforcement path. Non-cyclic inputs use plain JSON.stringify (no behavior
+ * change); only a structure that actually throws falls back to the
+ * circular-safe replacer.
+ */
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    const seen = new WeakSet<object>();
+    return JSON.stringify(value, (_key, val) => {
+      if (typeof val === "object" && val !== null) {
+        if (seen.has(val)) return "[Circular]";
+        seen.add(val);
+      }
+      return val;
+    });
+  }
+}
+
 // ── Policy Evaluation ───────────────────────────────────────────────────
 
 /**
@@ -196,77 +227,156 @@ export function evaluateField(
 
 /**
  * Filter a full context object against a policy for a given provider.
- * Returns per-field decisions and content hashes for the audit trail.
+ *
+ * Recurses into nested objects and arrays. A value is only emitted if EVERY
+ * field on its path is explicitly allowed: an allowed container is examined
+ * recursively and each nested field is evaluated independently by its own key
+ * name. So a secret nested under an allowed field (e.g. `metadata.api_key`) is
+ * caught by the same `api_key` / `secret_*` patterns that protect a top-level
+ * field, instead of riding through verbatim inside its parent. Anything not
+ * explicitly allowed falls to the policy default (redact / deny) all the way
+ * down. This closes the nested-field exfiltration gap where a redact rule on a
+ * top-level key did nothing for the same key nested one level deeper.
+ *
+ * Fails closed on hostile shapes: total field count across the whole tree is
+ * capped (MAX_CONTEXT_FIELDS), nesting depth is capped (MAX_CONTEXT_DEPTH), and
+ * cyclic references are redacted rather than followed.
+ *
+ * Returns per-field decisions (nested fields use dotted / `[index]` paths) and
+ * content hashes for the audit trail.
  */
 export function filterContext(
   policy: ContextGatePolicy,
   provider: ProviderCategory | string,
   context: Record<string, unknown>
 ): ContextFilterResult {
-  const fields = Object.keys(context);
-  if (fields.length > MAX_CONTEXT_FIELDS) {
-    throw new Error(
-      `Context object has ${fields.length} fields, exceeding limit of ${MAX_CONTEXT_FIELDS}`
-    );
-  }
   const decisions: FieldFilterResult[] = [];
   let allowed = 0;
   let redacted = 0;
   let hashed = 0;
   let summarized = 0;
   let denied = 0;
+  let totalFields = 0;
+  const seen = new WeakSet<object>();
 
-  for (const field of fields) {
-    const result = evaluateField(policy, provider, field);
+  /** Sentinel returned for a denied field so the caller drops it entirely. */
+  const OMIT = Symbol("omit");
 
-    // If hash action, compute the hash
-    if (result.action === "hash") {
-      const value = typeof context[field] === "string"
-        ? context[field] as string
-        : JSON.stringify(context[field]);
-      result.hash_value = hashToString(stringToBytes(value));
-    }
+  const isContainer = (v: unknown): v is Record<string, unknown> | unknown[] =>
+    typeof v === "object" && v !== null;
 
-    decisions.push(result);
-
-    switch (result.action) {
+  const record = (decision: FieldFilterResult): void => {
+    decisions.push(decision);
+    switch (decision.action) {
       case "allow": allowed++; break;
       case "redact": redacted++; break;
       case "hash": hashed++; break;
       case "summarize": summarized++; break;
       case "deny": denied++; break;
     }
-  }
+  };
 
-  // Compute content hashes for audit trail
-  const originalHash = hashToString(
-    stringToBytes(JSON.stringify(context))
-  );
+  const failClosed = (path: string, reason: string): string => {
+    record({ field: path, action: "redact", reason });
+    return "[REDACTED]";
+  };
 
-  // Build filtered output for hash computation
-  const filteredOutput: Record<string, unknown> = {};
-  for (const decision of decisions) {
-    switch (decision.action) {
-      case "allow":
-        filteredOutput[decision.field] = context[decision.field];
-        break;
-      case "redact":
-        filteredOutput[decision.field] = "[REDACTED]";
-        break;
-      case "hash":
-        filteredOutput[decision.field] = `[HASH:${decision.hash_value}]`;
-        break;
-      case "summarize":
-        filteredOutput[decision.field] = "[SUMMARIZE]";
-        break;
-      case "deny":
-        // Field excluded entirely
-        break;
+  /**
+   * Evaluate one field (key + value) at `path`, returning the value to emit in
+   * the filtered output, or OMIT to drop it. Recurses into allowed containers.
+   */
+  const filterField = (
+    key: string,
+    value: unknown,
+    path: string,
+    depth: number
+  ): unknown | typeof OMIT => {
+    totalFields++;
+    if (totalFields > MAX_CONTEXT_FIELDS) {
+      throw new Error(
+        `Context object has more than ${MAX_CONTEXT_FIELDS} fields (including nested), exceeding limit of ${MAX_CONTEXT_FIELDS}`
+      );
     }
-  }
-  const filteredHash = hashToString(
-    stringToBytes(JSON.stringify(filteredOutput))
-  );
+
+    const decision: FieldFilterResult = {
+      ...evaluateField(policy, provider, key),
+      field: path,
+    };
+
+    switch (decision.action) {
+      case "redact":
+        record(decision);
+        return "[REDACTED]";
+      case "deny":
+        record(decision);
+        return OMIT;
+      case "hash": {
+        const v = typeof value === "string" ? value : JSON.stringify(value);
+        decision.hash_value = hashToString(stringToBytes(v));
+        record(decision);
+        return `[HASH:${decision.hash_value}]`;
+      }
+      case "summarize":
+        record(decision);
+        return "[SUMMARIZE]";
+      case "allow":
+        if (isContainer(value)) {
+          if (seen.has(value)) {
+            return failClosed(path, `Field "${path}" is a cyclic reference; redacted (fail-closed)`);
+          }
+          if (depth >= MAX_CONTEXT_DEPTH) {
+            return failClosed(path, `Field "${path}" exceeds max nesting depth ${MAX_CONTEXT_DEPTH}; redacted (fail-closed)`);
+          }
+          // The container itself is allowed; its children are evaluated below.
+          record(decision);
+          return filterContainer(value, path, depth + 1);
+        }
+        record(decision);
+        return value;
+      default:
+        return failClosed(path, `Field "${path}" produced an unknown action; redacted (fail-closed)`);
+    }
+  };
+
+  const filterContainer = (
+    container: Record<string, unknown> | unknown[],
+    basePath: string,
+    depth: number
+  ): unknown => {
+    seen.add(container);
+    if (Array.isArray(container)) {
+      const out: unknown[] = [];
+      for (let i = 0; i < container.length; i++) {
+        const el = container[i];
+        const elPath = `${basePath}[${i}]`;
+        if (isContainer(el)) {
+          if (seen.has(el)) {
+            out.push(failClosed(elPath, `Field "${elPath}" is a cyclic reference; redacted (fail-closed)`));
+          } else if (depth >= MAX_CONTEXT_DEPTH) {
+            out.push(failClosed(elPath, `Field "${elPath}" exceeds max nesting depth ${MAX_CONTEXT_DEPTH}; redacted (fail-closed)`));
+          } else {
+            out.push(filterContainer(el, elPath, depth + 1));
+          }
+        } else {
+          // A primitive element of an allowed array passes through unchanged.
+          out.push(el);
+        }
+      }
+      return out;
+    }
+    const out: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(container)) {
+      const childPath = basePath ? `${basePath}.${key}` : key;
+      const emitted = filterField(key, val, childPath, depth);
+      if (emitted !== OMIT) out[key] = emitted;
+    }
+    return out;
+  };
+
+  const filteredOutput = filterContainer(context, "", 1) as Record<string, unknown>;
+
+  const originalHash = hashToString(stringToBytes(safeStringify(context)));
+  const filteredHash = hashToString(stringToBytes(safeStringify(filteredOutput)));
 
   return {
     policy_id: policy.policy_id,
@@ -329,6 +439,24 @@ export class ContextGatePolicyStore {
     defaultAction: "redact" | "deny",
     identityId?: string
   ): Promise<ContextGatePolicy> {
+    // Defense in depth: the context_gate_set_policy tool already enforces these
+    // caps, but the store must not trust callers — an unbounded policy turns
+    // every later filter into an O(fields x patterns) DoS sink.
+    if (rules.length > MAX_POLICY_RULES) {
+      throw new Error(
+        `Policy has ${rules.length} rules, exceeding limit of ${MAX_POLICY_RULES}`
+      );
+    }
+    for (const rule of rules) {
+      for (const arr of [rule.allow, rule.redact, rule.hash, rule.summarize]) {
+        if (Array.isArray(arr) && arr.length > MAX_PATTERNS_PER_ARRAY) {
+          throw new Error(
+            `A rule pattern array has ${arr.length} patterns, exceeding limit of ${MAX_PATTERNS_PER_ARRAY}`
+          );
+        }
+      }
+    }
+
     const policyId = `cg-${Date.now()}-${toBase64url(randomBytes(8))}`;
     const now = new Date().toISOString();
 
