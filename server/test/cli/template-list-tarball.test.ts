@@ -8,6 +8,7 @@ import { mkdtemp, rm, readdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { CLI_SUBPROCESS_TEST_TIMEOUT_MS } from "./helpers/run-cli";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const serverDir = join(__dirname, "..", "..");
@@ -42,5 +43,8 @@ describe("template-list tarball (Finding HHH)", () => {
     expect(raFiles).toContain("defaults.json");
 
     await rm(tmpDir, { recursive: true, force: true });
-  }, 30_000);
+    // `npm pack` boots a fresh npm + tars dist/; under the full suite's parallel
+    // load on a constrained machine that can exceed the old 30s budget. Use the
+    // same generous timeout as the other CLI-subprocess tests.
+  }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);
 });
