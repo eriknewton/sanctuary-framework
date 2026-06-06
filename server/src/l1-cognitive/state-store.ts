@@ -24,6 +24,7 @@ import {
 } from "../core/encryption.js";
 import {
   hashToString,
+  hmacSha256,
   computeMerkleRoot,
   generateMerkleProof,
   verifyMerkleProof,
@@ -44,6 +45,20 @@ const STATE_ENVELOPE_SCHEMA_VERSION = 2;
 const STATE_ENVELOPE_SIGNING_DOMAIN = "sanctuary.state-envelope.v1\n";
 const STATE_ENVELOPE_PUBLIC_KEYS_KEY = "state-envelope-public-keys-v1";
 const STATE_ENVELOPE_VERSION_ANCHORS_KEY = "state-envelope-version-anchors-v1";
+// F1: domain-separated MAC over the version-anchor record (the rollback floor),
+// which is stored plaintext. Without authentication a filesystem adversary could
+// silently EDIT/LOWER a key's floor to defeat the #391 leapfrog gate; the MAC
+// makes such an edit detectable (verification fails -> the read is rejected). The
+// MAC binds the `_meta` key so the record cannot be replayed under another key.
+// Scope note: this authenticates the version anchor only. The writer-public-key
+// registry (`state-envelope-public-keys-v1`) is a separate plaintext `_meta`
+// record; authenticating it (to close kid->key injection when an identity is
+// resolved from the registry rather than `_identities`) is a related but
+// distinct hardening, tracked separately — it is NOT covered here.
+const STATE_META_MAC_DOMAIN = "sanctuary.meta-record-mac.v1\n";
+// Distinctive envelope marker so a MAC'd record is unambiguously distinguished
+// from a legacy bare record (legacy keys are versionKeys, never this).
+const STATE_META_MAC_MARKER = "__sanctuary_meta_mac_v1";
 
 export type StateVerificationClassification =
   | "signature_mismatch"
@@ -223,6 +238,16 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(canonicalize(value));
 }
 
+/** Constant-time byte comparison for MAC verification (avoids timing leaks). */
+function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i]! ^ b[i]!;
+  }
+  return diff === 0;
+}
+
 function stateEnvelopeSigningBytes(envelope: SignedStateEnvelope): Uint8Array {
   return stringToBytes(STATE_ENVELOPE_SIGNING_DOMAIN + canonicalJson(envelope));
 }
@@ -380,6 +405,125 @@ export class StateStore {
     await this.storage.write("_meta", key, stringToBytes(JSON.stringify(record)));
   }
 
+  /**
+   * MAC over the version-anchor record, keyed from the master key and bound to
+   * the record key (so it cannot be replayed under another `_meta` key).
+   */
+  private metaRecordMacBytes(
+    key: string,
+    record: Record<string, unknown>
+  ): Uint8Array {
+    const macKey = derivePurposeKey(this.masterKey, "state-meta-mac");
+    return hmacSha256(
+      macKey,
+      stringToBytes(STATE_META_MAC_DOMAIN + key + "\n" + canonicalJson(record))
+    );
+  }
+
+  /**
+   * Load the MAC-authenticated version-anchor record (the persistent rollback
+   * floor — F1). Stored as a `{ marker, data, mac }` envelope:
+   *   - MAC present + valid    -> return the authenticated floor.
+   *   - MAC present + invalid  -> edited in place; reject (the attacker cannot
+   *     silently LOWER a key's floor).
+   *   - no marker (bare / marker-stripped) OR absent -> NO trusted floor
+   *     (return {}). We deliberately do NOT trust or re-MAC a bare record:
+   *     re-MACing it would let a filesystem adversary bypass authentication by
+   *     stripping the marker and rewriting the values. Instead the floor
+   *     re-establishes from the *authenticated* v2 entries via observeVersion,
+   *     so a stripped/legacy anchor self-heals on the next read/write without
+   *     ever trusting attacker-supplied values.
+   *
+   * Residual (documented, not closed here): deleting the anchor AND replacing a
+   * key's entry with an older validly-signed v2 entry resets that key's floor
+   * (a replay). Closing it needs a floor that does not live in a single
+   * deletable file (boot-anchored / externally-attested) — out of scope for F1.
+   */
+  private async loadVersionAnchors(): Promise<Record<string, unknown>> {
+    const raw = await this.storage.read(
+      "_meta",
+      STATE_ENVELOPE_VERSION_ANCHORS_KEY
+    );
+    if (!raw) return {};
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytesToString(raw));
+    } catch {
+      throw new StateVerificationError(
+        "schema_mismatch",
+        `State metadata record is corrupted: _meta/${STATE_ENVELOPE_VERSION_ANCHORS_KEY}`
+      );
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new StateVerificationError(
+        "schema_mismatch",
+        `State metadata record is corrupted: _meta/${STATE_ENVELOPE_VERSION_ANCHORS_KEY}`
+      );
+    }
+    const obj = parsed as Record<string, unknown>;
+
+    if (obj[STATE_META_MAC_MARKER] !== true) {
+      // Bare / marker-stripped / legacy: untrusted. Ignore (no floor); it
+      // re-derives from authenticated entries via observeVersion.
+      return {};
+    }
+
+    const data = obj.data;
+    const mac = obj.mac;
+    if (
+      !data ||
+      typeof data !== "object" ||
+      Array.isArray(data) ||
+      typeof mac !== "string"
+    ) {
+      throw new StateVerificationError(
+        "schema_mismatch",
+        `Version-anchor record is malformed: _meta/${STATE_ENVELOPE_VERSION_ANCHORS_KEY}`
+      );
+    }
+    const record = data as Record<string, unknown>;
+    let providedMac: Uint8Array;
+    try {
+      providedMac = fromBase64url(mac);
+    } catch {
+      throw new StateVerificationError(
+        "integrity_hash_mismatch",
+        `Version-anchor MAC is malformed: _meta/${STATE_ENVELOPE_VERSION_ANCHORS_KEY}`
+      );
+    }
+    if (
+      !constantTimeEqual(
+        providedMac,
+        this.metaRecordMacBytes(STATE_ENVELOPE_VERSION_ANCHORS_KEY, record)
+      )
+    ) {
+      throw new StateVerificationError(
+        "integrity_hash_mismatch",
+        `Version-anchor record failed authentication (tampered or wrong key): _meta/${STATE_ENVELOPE_VERSION_ANCHORS_KEY}`
+      );
+    }
+    return record;
+  }
+
+  /** Persist the version-anchor record in a MAC-authenticated envelope (F1). */
+  private async saveVersionAnchors(
+    record: Record<string, unknown>
+  ): Promise<void> {
+    const envelope = {
+      [STATE_META_MAC_MARKER]: true,
+      data: record,
+      mac: toBase64url(
+        this.metaRecordMacBytes(STATE_ENVELOPE_VERSION_ANCHORS_KEY, record)
+      ),
+    };
+    await this.storage.write(
+      "_meta",
+      STATE_ENVELOPE_VERSION_ANCHORS_KEY,
+      stringToBytes(JSON.stringify(envelope))
+    );
+  }
+
   private async rememberWriterPublicKey(
     kid: string,
     publicKey: Uint8Array
@@ -428,7 +572,7 @@ export class StateStore {
     namespace: string,
     key: string
   ): Promise<number> {
-    const anchors = await this.loadJsonRecord(STATE_ENVELOPE_VERSION_ANCHORS_KEY);
+    const anchors = await this.loadVersionAnchors();
     const anchored = anchors[this.versionKey(namespace, key)];
     return typeof anchored === "number" && Number.isSafeInteger(anchored)
       ? anchored
@@ -440,7 +584,7 @@ export class StateStore {
     key: string,
     version: number
   ): Promise<void> {
-    const anchors = await this.loadJsonRecord(STATE_ENVELOPE_VERSION_ANCHORS_KEY);
+    const anchors = await this.loadVersionAnchors();
     const vk = this.versionKey(namespace, key);
     const anchored = anchors[vk];
     const lastSeen =
@@ -457,7 +601,7 @@ export class StateStore {
 
     if (version > lastSeen) {
       anchors[vk] = version;
-      await this.saveJsonRecord(STATE_ENVELOPE_VERSION_ANCHORS_KEY, anchors);
+      await this.saveVersionAnchors(anchors);
     }
   }
 
@@ -523,6 +667,16 @@ export class StateStore {
 
     // Encrypt the value
     const payload = encrypt(plaintext, namespaceKey);
+
+    // F1: the version-anchor record is untrusted unless MAC-valid (a bare /
+    // marker-stripped anchor is ignored — see loadVersionAnchors), so it cannot
+    // be the sole monotonic floor: otherwise the first post-upgrade write to an
+    // existing key on a cold process (empty cache + ignored bare anchor) would
+    // reset its version to 1, clobbering a higher on-disk version. Populate
+    // versionCache from the persisted entries first so the floor reflects the
+    // real on-disk version. (getNamespaceHashes is memoized per namespace, so
+    // the later call at the end of write() reuses this.)
+    await this.getNamespaceHashes(namespace);
 
     // Determine version number (monotonically increasing)
     const vk = this.versionKey(namespace, key);
@@ -843,12 +997,21 @@ export class StateStore {
     // anchor. The current write schema is v2, so every legitimate version bump is
     // written as v2 — a v1 entry claiming a version above the persisted anchor can
     // only be a downgrade/replay forgery. The v1 signature binds the ciphertext
-    // ONLY (not the version/namespace/key), so the signature check below cannot
-    // catch this; the persisted anchor is the discriminator. (A genuine
-    // pre-migration v1 entry sits at or below the anchor it established, or lives
-    // on a never-anchored fortress where the anchor is 0.) NOTE: this depends on
-    // the version-anchor file surviving; authenticating that file against
-    // deletion/rollback (it is currently unsigned) is a separate hardening.
+    // ONLY (not version/namespace/key), so the signature check below cannot catch
+    // this; the persisted anchor is the discriminator. The anchor record is now
+    // MAC-authenticated (loadVersionAnchors), so it can no longer be silently
+    // EDITED/LOWERED to defeat this gate (an edit fails the MAC and the read is
+    // rejected).
+    //
+    // RESIDUAL (documented, not closed here): a bare/absent anchor is treated as
+    // "no trusted floor" (anchored 0), so this gate does not fire. A filesystem
+    // adversary can therefore RESET the floor by deleting/stripping the anchors
+    // record and then replay a forged high-version v1 entry. Closing the
+    // deletion variant requires distrusting v1 on the enforced read path entirely
+    // (verified:false unless re-migrated), which breaks reads of legitimate
+    // un-migrated pre-v2 fortresses — a backward-compat migration decision left
+    // as a follow-up. (A genuine pre-migration v1 entry sits at/below its anchor;
+    // on a bare-anchor fortress it reads normally because the gate is skipped.)
     if (options.enforceRollback && stateEntry.v === 1) {
       const anchoredVersion = await this.getAnchoredVersion(namespace, key);
       if (anchoredVersion > 0 && stateEntry.ver > anchoredVersion) {

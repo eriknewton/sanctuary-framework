@@ -316,6 +316,128 @@ describe("state envelope integrity", () => {
     expect(second?.value).toBe("legacy value");
   });
 
+  it("rejects an in-place LOWERING of the MAC-authenticated version anchor (F1)", async () => {
+    const { storage, masterKey, stateStore, identity, identityEncKey } = makeStateRig();
+    // Two v2 writes -> balance at version 2, MAC'd anchor = 2.
+    await stateStore.write(
+      "memory",
+      "balance",
+      "v2-a",
+      identity.storedIdentity.identity_id,
+      identity.storedIdentity.encrypted_private_key,
+      identityEncKey
+    );
+    await stateStore.write(
+      "memory",
+      "balance",
+      "v2-b",
+      identity.storedIdentity.identity_id,
+      identity.storedIdentity.encrypted_private_key,
+      identityEncKey
+    );
+    await stateStore.read("memory", "balance"); // persists the MAC'd anchor (=2)
+
+    // Filesystem adversary edits the anchor IN PLACE to lower the floor (so an
+    // older entry could later read as "current"), keeping the now-stale MAC.
+    const anchorsKey = "state-envelope-version-anchors-v1";
+    const obj = JSON.parse(
+      bytesToString((await storage.read("_meta", anchorsKey))!)
+    ) as { __sanctuary_meta_mac_v1: boolean; data: Record<string, number>; mac: string };
+    obj.data["memory/balance"] = 1; // lower the floor; the stored MAC is now stale
+    await storage.write("_meta", anchorsKey, stringToBytes(JSON.stringify(obj)));
+
+    // The edit is detected on load (recomputed MAC over the new data != stored MAC).
+    const freshStore = new StateStore(storage, masterKey);
+    await expect(freshStore.read("memory", "balance")).rejects.toMatchObject({
+      name: "StateVerificationError",
+      classification: "integrity_hash_mismatch",
+    } satisfies Partial<StateVerificationError>);
+  });
+
+  it("ignores a marker-stripped version-anchor record — its bogus floor is not trusted (F1)", async () => {
+    const { storage, masterKey, identity, identityEncKey } = makeStateRig();
+    const seed = new StateStore(storage, masterKey);
+    // Existing key at version 2.
+    await seed.write(
+      "memory",
+      "balance",
+      "v2-a",
+      identity.storedIdentity.identity_id,
+      identity.storedIdentity.encrypted_private_key,
+      identityEncKey
+    );
+    await seed.write(
+      "memory",
+      "balance",
+      "v2-b",
+      identity.storedIdentity.identity_id,
+      identity.storedIdentity.encrypted_private_key,
+      identityEncKey
+    );
+
+    // Attacker strips the marker and writes a BOGUS inflated floor (99), trying
+    // to influence version computation. A marker-stripped record is untrusted:
+    // its value must be ignored (and it must not be blessed with a MAC).
+    const anchorsKey = "state-envelope-version-anchors-v1";
+    await storage.write(
+      "_meta",
+      anchorsKey,
+      stringToBytes(JSON.stringify({ "memory/balance": 99 }))
+    );
+
+    // A fresh-process legit write derives the floor from the authenticated
+    // on-disk entry (version 2), NOT the bogus 99 -> the next version is 3.
+    const freshStore = new StateStore(storage, masterKey);
+    const result = await freshStore.write(
+      "memory",
+      "balance",
+      "v2-c",
+      identity.storedIdentity.identity_id,
+      identity.storedIdentity.encrypted_private_key,
+      identityEncKey
+    );
+    expect(result.version).toBe(3);
+  });
+
+  it("preserves the monotonic version on a cold-process write with a legacy/ignored anchor (F1 upgrade path)", async () => {
+    const { storage, masterKey, identity, identityEncKey } = makeStateRig();
+    const seed = new StateStore(storage, masterKey);
+    for (const v of ["a", "b", "c"]) {
+      await seed.write(
+        "memory",
+        "counter",
+        v,
+        identity.storedIdentity.identity_id,
+        identity.storedIdentity.encrypted_private_key,
+        identityEncKey
+      );
+    }
+    // Downgrade the anchor record to the legacy bare format (pre-F1 fortress).
+    const anchorsKey = "state-envelope-version-anchors-v1";
+    const wrapped = JSON.parse(
+      bytesToString((await storage.read("_meta", anchorsKey))!)
+    ) as { data: Record<string, unknown> };
+    await storage.write(
+      "_meta",
+      anchorsKey,
+      stringToBytes(JSON.stringify(wrapped.data))
+    );
+
+    // Fresh process (cold cache) + bare (ignored) anchor: a write to the
+    // existing key must NOT reset the version. It reads the on-disk version (3)
+    // and advances to 4, never clobbering the higher version with 1.
+    const freshStore = new StateStore(storage, masterKey);
+    const result = await freshStore.write(
+      "memory",
+      "counter",
+      "d",
+      identity.storedIdentity.identity_id,
+      identity.storedIdentity.encrypted_private_key,
+      identityEncKey
+    );
+    expect(result.version).toBe(4);
+  });
+
   it("readUnverified works for explicit legacy migration paths", async () => {
     const { storage, stateStore, identity, identityEncKey } = makeStateRig();
 
