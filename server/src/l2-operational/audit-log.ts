@@ -19,6 +19,7 @@ import type {
 } from "../storage/interface.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
+import { hmacSha256 } from "../core/hashing.js";
 import { stringToBytes, bytesToString, toBase64url, fromBase64url } from "../core/encoding.js";
 import {
   AUDIT_CHAIN_GENESIS,
@@ -27,6 +28,7 @@ import {
   type AuditCheckpointRecord,
   type AuditCheckpointSignature,
   type AuditCheckpointSigningPayload,
+  canonicalJson,
   computeAuditEntryHash,
   computeAuditRoot,
   sha256Hex,
@@ -65,6 +67,8 @@ export type AuditIntegrityFindingKind =
   | "prev_hash_mismatch"
   | "legacy_anchor_missing"
   | "legacy_anchor_mismatch"
+  | "rotation_anchor_missing"
+  | "rotation_anchor_invalid"
   | "checkpoint_malformed"
   | "checkpoint_root_mismatch"
   | "checkpoint_signature_mismatch"
@@ -115,6 +119,20 @@ const DEFAULT_MAX_ENTRIES = 100_000;
 const DEFAULT_CHECKPOINT_INTERVAL = 100;
 const AUDIT_NAMESPACE = "_audit";
 const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
+// F3: reserved storage key for the single MAC-authenticated rotation checkpoint.
+// Stored alongside the (optionally-signed) checkpoint records but addressed by a
+// fixed key that does NOT match the `audit-checkpoint-`/`legacy-anchor-` prefixes
+// the checkpoint readers list on, so it never collides with those scans.
+const AUDIT_ROTATION_ANCHOR_KEY = "__rotation_anchor";
+// Distinctive envelope marker so a MAC'd rotation anchor is unambiguously
+// distinguished from a bare/marker-stripped record (mirrors F1's state-meta MAC).
+const AUDIT_ROTATION_ANCHOR_MARKER = "__sanctuary_audit_rotation_anchor_v1";
+// Domain-separated MAC over the rotation-anchor record. The anchor records the
+// authenticated lowest-surviving sequence + its prev_hash after a prune, so a
+// post-cut deletion is still detectable while a legitimate rotation verifies
+// cleanly. The MAC ALWAYS authenticates (master-key derived) — unlike the
+// optional Ed25519 checkpoint signer, which may be null.
+const AUDIT_ROTATION_ANCHOR_MAC_DOMAIN = "sanctuary.audit-rotation-anchor.v1\n";
 const AUDIT_INTEGRITY_ALERT_NAMESPACE = "_audit_integrity_alert";
 const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
@@ -220,6 +238,7 @@ const auditIntegrityContext = new AsyncLocalStorage<{
 export class AuditLog {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
+  private rotationAnchorMacKey: Uint8Array;
   private entries: AuditEntry[] = [];
   private chainEntries: Array<{ sequence: number; entry_hash: string }> = [];
   private counter = 0;
@@ -253,6 +272,9 @@ export class AuditLog {
   constructor(storage: StorageBackend, masterKey: Uint8Array, config?: AuditLogConfig) {
     this.storage = storage;
     this.encryptionKey = derivePurposeKey(masterKey, "audit-log");
+    // F3: derive the rotation-anchor MAC key up front and never retain the raw
+    // master key (mirrors how encryptionKey is derived here, per F1's pattern).
+    this.rotationAnchorMacKey = derivePurposeKey(masterKey, "audit-rotation-anchor");
     this.maxTotalSizeBytes = config?.maxTotalSizeBytes ?? DEFAULT_MAX_TOTAL_SIZE_BYTES;
     this.maxEntries = config?.maxEntries ?? DEFAULT_MAX_ENTRIES;
     this.integrityMode = config?.integrityMode ?? "strict";
@@ -481,6 +503,28 @@ export class AuditLog {
     }
   }
 
+  /** Number of oldest entries to prune to bring `metas` (key-sorted ascending)
+   * back under the count and size limits. 0 when within budget. */
+  private rotationDeleteCount(metas: readonly { size_bytes: number }[]): number {
+    const totalSize = metas.reduce((sum, m) => sum + m.size_bytes, 0);
+    let toDelete = 0;
+    if (metas.length > this.maxEntries) {
+      toDelete = metas.length - this.maxEntries;
+    }
+    if (totalSize > this.maxTotalSizeBytes) {
+      let runningSize = totalSize;
+      for (
+        let i = toDelete;
+        i < metas.length && runningSize > this.maxTotalSizeBytes;
+        i++
+      ) {
+        runningSize -= metas[i]!.size_bytes;
+        toDelete = i + 1;
+      }
+    }
+    return toDelete;
+  }
+
   /**
    * Prune oldest audit entries when storage exceeds configured limits.
    * Entries are sorted by key (timestamp-based) so oldest are pruned first.
@@ -489,36 +533,354 @@ export class AuditLog {
     if (this.rotationInFlight) return;
     this.rotationInFlight = true;
     try {
-      const metas = await this.storage.list(AUDIT_NAMESPACE);
-      if (metas.length === 0) return;
+      // Cheap lock-free pre-check: only pay the cross-process lock cost when a
+      // prune is actually due. storage.list() returns key-sorted entries.
+      const preMetas = await this.storage.list(AUDIT_NAMESPACE);
+      if (this.rotationDeleteCount(preMetas) <= 0) return;
 
-      // Sort by key ascending (oldest first — keys are timestamp-prefixed)
-      metas.sort((a, b) => a.key.localeCompare(b.key));
+      // F3: serialize the anchor write + prune under the SAME cross-process lock
+      // the append path uses. Without this, two AuditLog instances rotating the
+      // same namespace race their cut points: a late finisher could write a
+      // stale (lower) base_sequence after another process already pruned farther,
+      // leaving a MAC-valid anchor pointing at a non-surviving entry — strict
+      // readers would then throw on a legitimate concurrent rotation. The lock is
+      // a no-op for non-filesystem backends. maybeRotate is called from
+      // persistChainedEntry AFTER its own lock has been released, so this
+      // re-acquisition cannot deadlock (mirrors writeCheckpointIfNeeded).
+      await this.withAuditWriteLock(async () => {
+        // Re-list INSIDE the lock: another rotator may have pruned since the
+        // pre-check, so recompute the cut against the authoritative state.
+        const metas = await this.storage.list(AUDIT_NAMESPACE);
+        metas.sort((a, b) => a.key.localeCompare(b.key));
+        // Always keep at least one entry as the surviving anchor base — even
+        // under degenerate caps (maxEntries: 0, or maxTotalSizeBytes smaller than
+        // a single entry, where rotationDeleteCount would otherwise return
+        // metas.length). Capping rather than aborting lets rotation still make
+        // progress (prune as much as possible) instead of growing without bound.
+        const toDelete = Math.min(
+          this.rotationDeleteCount(metas),
+          metas.length - 1
+        );
+        if (toDelete <= 0) return;
 
-      const totalSize = metas.reduce((sum, m) => sum + m.size_bytes, 0);
-      let toDelete = 0;
-
-      // Check entry count limit
-      if (metas.length > this.maxEntries) {
-        toDelete = metas.length - this.maxEntries;
-      }
-
-      // Check total size limit — prune until under budget
-      if (totalSize > this.maxTotalSizeBytes) {
-        let runningSize = totalSize;
-        for (let i = toDelete; i < metas.length && runningSize > this.maxTotalSizeBytes; i++) {
-          runningSize -= metas[i]!.size_bytes;
-          toDelete = i + 1;
+        // Authenticate the cut BEFORE pruning. The new lowest-surviving entry is
+        // metas[toDelete] (v2 keys are zero-padded by sequence; legacy v1 keys —
+        // `${epochMs}-${n}` — are digit-prefixed and sort BEFORE `entry-`, so
+        // they prune first and never interleave). Only prune once we have either
+        // (a) written a MAC anchor for a v2 cut, or (b) confirmed the cut lands on
+        // a legacy/non-v2 entry (the legacy-anchor path covers that prefix). If we
+        // cannot read/parse the new base, or the anchor write fails, ABORT the
+        // prune: deleting without an authenticated anchor would let the next load
+        // silently TOFU-re-anchor an unauthenticated cut, defeating the
+        // fail-closed guarantee. Rotation retries on the next append.
+        let safeToPrune = false;
+        try {
+          const newBaseRaw = await this.storage.read(
+            AUDIT_NAMESPACE,
+            metas[toDelete]!.key
+          );
+          if (newBaseRaw) {
+            const parsed = JSON.parse(bytesToString(newBaseRaw));
+            if (isPersistedAuditEnvelopeV2(parsed)) {
+              await this.writeRotationAnchor(parsed.sequence, parsed.prev_hash);
+            }
+            // Reached only if the v2 anchor was written, or the cut is legacy/
+            // non-v2 (no chained anchor needed) — both are safe to prune.
+            safeToPrune = true;
+          }
+        } catch {
+          safeToPrune = false;
         }
-      }
+        if (!safeToPrune) return;
 
-      // Delete oldest entries
-      for (let i = 0; i < toDelete; i++) {
-        await this.storage.delete(AUDIT_NAMESPACE, metas[i]!.key);
-      }
+        for (let i = 0; i < toDelete; i++) {
+          await this.storage.delete(AUDIT_NAMESPACE, metas[i]!.key);
+        }
+      });
     } finally {
       this.rotationInFlight = false;
     }
+  }
+
+  /**
+   * F3: persist the single MAC-authenticated rotation anchor, overwriting any
+   * prior one as the cut moves forward. The MAC is keyed from the master key
+   * (always available) — NOT the optional Ed25519 checkpoint signer — so the
+   * cut is always authenticated.
+   *
+   * Uses the durable (fsync) write barrier on filesystem backends, mirroring
+   * audit-entry persistence. The caller (maybeRotate) prunes entries immediately
+   * after this resolves; without the fsync, a power loss after the deletes reach
+   * disk but before the anchor flushes would leave a post-F3 rotation with no
+   * authenticated cut, reloading through the anchor-absent TOFU path.
+   */
+  private async writeRotationAnchor(
+    baseSequence: number,
+    basePrevHash: string
+  ): Promise<void> {
+    const data = { base_sequence: baseSequence, base_prev_hash: basePrevHash };
+    const envelope = {
+      [AUDIT_ROTATION_ANCHOR_MARKER]: true,
+      data,
+      mac: toBase64url(this.rotationAnchorMacBytes(data)),
+    };
+    const bytes = stringToBytes(JSON.stringify(envelope));
+    if (this.filesystemCapabilities) {
+      await this.filesystemCapabilities.writeDurable(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_ROTATION_ANCHOR_KEY,
+        bytes
+      );
+      return;
+    }
+    await this.storage.write(
+      AUDIT_CHECKPOINT_NAMESPACE,
+      AUDIT_ROTATION_ANCHOR_KEY,
+      bytes
+    );
+  }
+
+  /** Domain-separated master-key MAC over the rotation-anchor `data` record. */
+  private rotationAnchorMacBytes(data: {
+    base_sequence: number;
+    base_prev_hash: string;
+  }): Uint8Array {
+    return hmacSha256(
+      this.rotationAnchorMacKey,
+      stringToBytes(AUDIT_ROTATION_ANCHOR_MAC_DOMAIN + canonicalJson(data))
+    );
+  }
+
+  /**
+   * F3: load + MAC-verify the rotation anchor.
+   *   - `valid`   : marker present, well-formed, MAC matches → authenticated cut.
+   *   - `invalid` : marker present but malformed / MAC mismatch / unreadable →
+   *     tampered or forged; the caller fails closed with a finding.
+   *   - `absent`  : no record, or a bare/marker-stripped record (untrusted, like
+   *     F1) → the caller's trust-on-first-use migration path applies.
+   */
+  private async loadRotationAnchor(
+    findings: AuditIntegrityFinding[]
+  ): Promise<
+    | { status: "valid"; base_sequence: number; base_prev_hash: string }
+    | { status: "absent" }
+    | { status: "invalid" }
+  > {
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.storage.read(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_ROTATION_ANCHOR_KEY
+      );
+    } catch (err) {
+      findings.push({
+        kind: "storage_unavailable",
+        message: `audit rotation anchor could not be read: ${failureMessage(err)}`,
+      });
+      // Cannot read it → cannot prove the cut → fail closed (not "absent").
+      return { status: "invalid" };
+    }
+    if (!raw) return { status: "absent" };
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytesToString(raw));
+    } catch {
+      return { status: "invalid" };
+    }
+    if (!isRecord(parsed) || parsed[AUDIT_ROTATION_ANCHOR_MARKER] !== true) {
+      // Bare / marker-stripped / legacy: untrusted, treated as no anchor so the
+      // TOFU migration path re-establishes it from the surviving chain.
+      return { status: "absent" };
+    }
+
+    const data = parsed.data;
+    const mac = parsed.mac;
+    if (
+      !isRecord(data) ||
+      typeof mac !== "string" ||
+      typeof data.base_sequence !== "number" ||
+      !Number.isSafeInteger(data.base_sequence) ||
+      data.base_sequence <= 0 ||
+      typeof data.base_prev_hash !== "string"
+    ) {
+      return { status: "invalid" };
+    }
+    let providedMac: Uint8Array;
+    try {
+      providedMac = fromBase64url(mac);
+    } catch {
+      return { status: "invalid" };
+    }
+    if (
+      !constantTimeEqual(
+        providedMac,
+        this.rotationAnchorMacBytes({
+          base_sequence: data.base_sequence,
+          base_prev_hash: data.base_prev_hash,
+        })
+      )
+    ) {
+      return { status: "invalid" };
+    }
+    return {
+      status: "valid",
+      base_sequence: data.base_sequence,
+      base_prev_hash: data.base_prev_hash,
+    };
+  }
+
+  /**
+   * F3: resolve the seed (expected first sequence + prev_hash) for the chained
+   * walk, accounting for rotation. Three regimes:
+   *   - lowest chained == legacyCount+1 → no rotation in the chained region; seed
+   *     genesis / legacy anchor as before (a stale anchor, if any, is ignored).
+   *   - lowest chained  > legacyCount+1 → the head was pruned; REQUIRE a MAC-valid
+   *     rotation anchor whose base_sequence == the lowest survivor. Absent /
+   *     invalid / mismatched → finding (fail closed), except the TOFU case below.
+   *   - no chained entries → if an anchor still exists, the whole post-cut chain
+   *     was truncated → finding.
+   *
+   * Trust-on-first-use migration: a pre-F3 log that rotated before this change
+   * has lowest > legacyCount+1 and NO anchor. If its surviving chain is internally
+   * contiguous, accept it once and write the authenticated anchor; thereafter it
+   * is MAC-protected. A non-contiguous (genuinely truncated) chain still flags via
+   * the forward walk. This mirrors F1's one-time self-heal residual.
+   */
+  private async resolveChainSeed(
+    chainedEntries: Array<{
+      key: string;
+      envelope: PersistedAuditEnvelopeV2;
+      entry: AuditEntry;
+    }>,
+    legacyCount: number,
+    legacyAnchorHash: string,
+    findings: AuditIntegrityFinding[]
+  ): Promise<{ expectedSequence: number; expectedPrevHash: string }> {
+    const defaultSeedSequence = legacyCount + 1;
+    const defaultSeedPrevHash =
+      legacyCount > 0 ? legacyAnchorHash : AUDIT_CHAIN_GENESIS;
+    const defaultSeed = {
+      expectedSequence: defaultSeedSequence,
+      expectedPrevHash: defaultSeedPrevHash,
+    };
+
+    if (chainedEntries.length === 0) {
+      // No chained entries to walk. If a rotation anchor is present it references
+      // a base entry that no longer survives — i.e. the entire post-cut chain was
+      // removed. That is a truncation, not a legitimate empty/legacy-only log.
+      const anchor = await this.loadRotationAnchor(findings);
+      if (anchor.status !== "absent") {
+        findings.push({
+          kind: "rotation_anchor_invalid",
+          message:
+            "audit rotation anchor is present but no chained entries survive (the post-cut chain may have been truncated)",
+        });
+      }
+      return defaultSeed;
+    }
+
+    const head = chainedEntries[0]!.envelope;
+    const lowestChainedSeq = head.sequence;
+
+    // No rotation in the chained region: the head sits exactly where the legacy
+    // prefix (or genesis) leaves off. (lowestChainedSeq can only be < the default
+    // when a legacy entry was pruned — a pre-existing, out-of-F3-scope edge; the
+    // legacy-anchor path reports that separately. Seed as before either way.)
+    if (lowestChainedSeq <= defaultSeedSequence) {
+      return defaultSeed;
+    }
+
+    const anchor = await this.loadRotationAnchor(findings);
+
+    if (anchor.status === "valid") {
+      if (anchor.base_sequence === lowestChainedSeq) {
+        // Seed from the AUTHENTICATED anchor; the forward walk verifies cleanly.
+        return {
+          expectedSequence: anchor.base_sequence,
+          expectedPrevHash: anchor.base_prev_hash,
+        };
+      }
+      // The authenticated base does not match the lowest survivor — the head was
+      // truncated (deleted) or a lower entry was reintroduced. Fail closed with a
+      // single clear finding; seed from the head so the walk does not pile on a
+      // cascade of gap findings down to base_sequence.
+      findings.push({
+        kind: "rotation_anchor_invalid",
+        sequence: lowestChainedSeq,
+        expected: anchor.base_sequence,
+        actual: lowestChainedSeq,
+        message: `audit rotation anchor base_sequence ${anchor.base_sequence} does not match the lowest surviving sequence ${lowestChainedSeq} (entries may have been truncated)`,
+      });
+      return {
+        expectedSequence: lowestChainedSeq,
+        expectedPrevHash: head.prev_hash,
+      };
+    }
+
+    if (anchor.status === "invalid") {
+      findings.push({
+        kind: "rotation_anchor_invalid",
+        sequence: lowestChainedSeq,
+        message:
+          "audit rotation anchor is present but failed authentication (tampered, forged, or wrong key)",
+      });
+      return {
+        expectedSequence: lowestChainedSeq,
+        expectedPrevHash: head.prev_hash,
+      };
+    }
+
+    // anchor.status === "absent": pre-F3 already-rotated log OR truncation.
+    if (this.isChainInternallyContiguous(chainedEntries)) {
+      // TOFU: accept the current surviving chain once and authenticate it.
+      //
+      // RESIDUAL (documented, not closed here — F3 design ratified 2026-06-06,
+      // consistent with F1 #394): a filesystem-level adversary who deletes BOTH
+      // this anchor file AND the current lowest-surviving (head) entry leaves a
+      // still-contiguous suffix that is indistinguishable from a legitimate
+      // pre-F3 rotation, so this branch re-accepts it and re-anchors at the new
+      // head — a head truncation hidden as migration. This is the same class as
+      // F1's "delete the MAC'd floor file + one more op" replay residual, and the
+      // filesystem-adversary threat model is explicitly not fully specified
+      // (see CLAUDE.md "Known Complexity" #6). Closing it requires a floor that
+      // does not live in a single deletable file (boot-anchored / externally
+      // attested), which is out of scope for F3.
+      await this.writeRotationAnchor(lowestChainedSeq, head.prev_hash);
+      return {
+        expectedSequence: lowestChainedSeq,
+        expectedPrevHash: head.prev_hash,
+      };
+    }
+    // Non-contiguous: a genuine internal truncation. Flag it; the forward walk
+    // also localizes the exact break.
+    findings.push({
+      kind: "rotation_anchor_missing",
+      sequence: lowestChainedSeq,
+      message: `audit chain starts at sequence ${lowestChainedSeq} (above ${defaultSeedSequence}) with no rotation anchor and is not internally contiguous (entries may have been truncated)`,
+    });
+    return {
+      expectedSequence: lowestChainedSeq,
+      expectedPrevHash: head.prev_hash,
+    };
+  }
+
+  /**
+   * True iff the chained entries form an unbroken run: each sequence is exactly
+   * one above its predecessor and each prev_hash equals the predecessor's
+   * entry_hash. Used to decide whether an anchor-less rotated log is a legitimate
+   * pre-F3 prune (TOFU-acceptable) versus a truncated chain.
+   */
+  private isChainInternallyContiguous(
+    chainedEntries: Array<{ envelope: PersistedAuditEnvelopeV2 }>
+  ): boolean {
+    for (let i = 1; i < chainedEntries.length; i++) {
+      const prev = chainedEntries[i - 1]!.envelope;
+      const curr = chainedEntries[i]!.envelope;
+      if (curr.sequence !== prev.sequence + 1) return false;
+      if (curr.prev_hash !== prev.entry_hash) return false;
+    }
+    return true;
   }
 
   /**
@@ -876,10 +1238,18 @@ export class AuditLog {
         findings
       );
 
-      this.verifyChainedEntries(
+      // F3: derive the chain-walk seed, honoring an authenticated rotation cut
+      // (async: it reads + MAC-verifies the rotation anchor and may TOFU-write).
+      const chainSeed = await this.resolveChainSeed(
         chainedEntries,
         legacyRawEntries.length,
         legacyAnchorHash,
+        findings
+      );
+      this.verifyChainedEntries(
+        chainedEntries,
+        chainSeed.expectedSequence,
+        chainSeed.expectedPrevHash,
         findings
       );
 
@@ -898,7 +1268,13 @@ export class AuditLog {
         sequence: item.envelope.sequence,
         entry_hash: item.envelope.entry_hash,
       }));
-      this.nextSequence = legacyRawEntries.length + chainedEntries.length + 1;
+      // F3: continue from the HIGHEST surviving sequence, not the entry count.
+      // After rotation prunes a contiguous prefix, count != highest sequence, and
+      // a count-based nextSequence would re-issue an already-used sequence and
+      // break the chain. (Identical to count+1 when nothing was pruned.)
+      const highestChainedSeq =
+        chainedEntries.at(-1)?.envelope.sequence ?? legacyRawEntries.length;
+      this.nextSequence = highestChainedSeq + 1;
       this.lastEntryHash =
         chainedEntries.at(-1)?.envelope.entry_hash ?? legacyAnchorHash;
       this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
@@ -952,13 +1328,14 @@ export class AuditLog {
       envelope: PersistedAuditEnvelopeV2;
       entry: AuditEntry;
     }>,
-    legacyCount: number,
-    legacyAnchorHash: string,
+    expectedSequenceSeed: number,
+    expectedPrevHashSeed: string,
     findings: AuditIntegrityFinding[]
   ): void {
-    let expectedSequence = legacyCount + 1;
-    let expectedPrevHash =
-      legacyCount > 0 ? legacyAnchorHash : AUDIT_CHAIN_GENESIS;
+    // Seed is resolved by resolveChainSeed (genesis, legacy anchor, or an
+    // authenticated rotation anchor). The contiguous forward walk is unchanged.
+    let expectedSequence = expectedSequenceSeed;
+    let expectedPrevHash = expectedPrevHashSeed;
 
     for (const item of entries) {
       const envelope = item.envelope;
@@ -997,50 +1374,73 @@ export class AuditLog {
     const entryBySequence = new Map(entries.map((entry) => [entry.sequence, entry]));
     let highestCheckpoint = 0;
 
+    // F3: the lowest surviving chained sequence. Entries below this floor (but
+    // above the legacy region) were legitimately pruned by rotation. A checkpoint
+    // written before that rotation still references those now-gone sequences; its
+    // root cannot be re-derived from entries that no longer exist. (When legacy
+    // entries survive, no chained rotation has occurred — legacy keys prune first
+    // — so the floor is legacyCount+1 and nothing is skipped.)
+    const rotationFloor = entries[0]?.sequence ?? legacyCount + 1;
+
     for (const checkpoint of checkpoints) {
       if (checkpoint.checkpoint_sequence > highestCheckpoint) {
         highestCheckpoint = checkpoint.checkpoint_sequence;
       }
 
-      const hashes: string[] = [];
-      for (
-        let sequence = checkpoint.from_sequence;
-        sequence <= checkpoint.checkpoint_sequence;
-        sequence++
-      ) {
-        if (sequence <= legacyCount) {
-          if (checkpoint.from_sequence === 1 && checkpoint.checkpoint_sequence === legacyCount) {
-            hashes.push(legacyAnchorHash);
-            break;
-          }
-          findings.push({
-            kind: "checkpoint_root_mismatch",
-            sequence,
-            message: `checkpoint includes legacy sequence ${sequence} outside the legacy anchor`,
-          });
-          continue;
-        }
-        const entry = entryBySequence.get(sequence);
-        if (!entry) {
-          findings.push({
-            kind: "checkpoint_root_mismatch",
-            sequence,
-            message: `checkpoint references missing audit sequence ${sequence}`,
-          });
-          continue;
-        }
-        hashes.push(entry.entry_hash);
-      }
+      // A checkpoint whose range dips below the surviving floor spans
+      // rotated-out entries. Skip the root re-derivation (it would always
+      // mismatch — the leaves are gone), but still verify its signature below.
+      // The CURRENT chain's integrity is anchored by the MAC'd rotation anchor +
+      // the forward walk, not by these historical checkpoints, so skipping the
+      // root recomputation here is not a fail-open for the protected property.
+      const spansRotatedEntries =
+        checkpoint.from_sequence > legacyCount &&
+        checkpoint.from_sequence < rotationFloor;
 
-      const expectedRoot = computeAuditRoot(hashes);
-      if (checkpoint.root_hash !== expectedRoot) {
-        findings.push({
-          kind: "checkpoint_root_mismatch",
-          sequence: checkpoint.checkpoint_sequence,
-          expected: expectedRoot,
-          actual: checkpoint.root_hash,
-          message: `checkpoint root mismatch at sequence ${checkpoint.checkpoint_sequence}`,
-        });
+      if (!spansRotatedEntries) {
+        const hashes: string[] = [];
+        for (
+          let sequence = checkpoint.from_sequence;
+          sequence <= checkpoint.checkpoint_sequence;
+          sequence++
+        ) {
+          if (sequence <= legacyCount) {
+            if (
+              checkpoint.from_sequence === 1 &&
+              checkpoint.checkpoint_sequence === legacyCount
+            ) {
+              hashes.push(legacyAnchorHash);
+              break;
+            }
+            findings.push({
+              kind: "checkpoint_root_mismatch",
+              sequence,
+              message: `checkpoint includes legacy sequence ${sequence} outside the legacy anchor`,
+            });
+            continue;
+          }
+          const entry = entryBySequence.get(sequence);
+          if (!entry) {
+            findings.push({
+              kind: "checkpoint_root_mismatch",
+              sequence,
+              message: `checkpoint references missing audit sequence ${sequence}`,
+            });
+            continue;
+          }
+          hashes.push(entry.entry_hash);
+        }
+
+        const expectedRoot = computeAuditRoot(hashes);
+        if (checkpoint.root_hash !== expectedRoot) {
+          findings.push({
+            kind: "checkpoint_root_mismatch",
+            sequence: checkpoint.checkpoint_sequence,
+            expected: expectedRoot,
+            actual: checkpoint.root_hash,
+            message: `checkpoint root mismatch at sequence ${checkpoint.checkpoint_sequence}`,
+          });
+        }
       }
 
       this.verifyCheckpointRecordSignature(checkpoint, findings);
@@ -1369,6 +1769,16 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
     if (a[i] !== b[i]) return false;
   }
   return true;
+}
+
+/** Constant-time byte comparison for MAC verification (avoids timing leaks). */
+function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i]! ^ b[i]!;
+  }
+  return diff === 0;
 }
 
 function sleep(ms: number): Promise<void> {
