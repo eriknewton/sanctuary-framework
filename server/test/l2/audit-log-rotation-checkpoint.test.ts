@@ -17,7 +17,12 @@ import {
   AuditLog,
   type PersistedAuditEnvelopeV2,
 } from "../../src/l2-operational/audit-log.js";
-import { bytesToString, stringToBytes } from "../../src/core/encoding.js";
+import {
+  bytesToString,
+  fromBase64url,
+  stringToBytes,
+  toBase64url,
+} from "../../src/core/encoding.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import type {
@@ -198,8 +203,19 @@ describe("AuditLog F3 rotation checkpoint", () => {
     const { storage, masterKey } = await rotatedLog(5, 12);
 
     const anchor = await readAnchor(storage);
-    const mac = anchor.mac;
-    anchor.mac = mac.slice(0, -1) + (mac.endsWith("A") ? "B" : "A");
+    // Flip a whole MAC byte deterministically: decode the base64url MAC, XOR
+    // the first byte (all 8 bits significant), and re-encode. This guarantees
+    // the forged anchor ALWAYS decodes to different MAC bytes than the
+    // original. A last-character A<->B swap is NOT deterministic: the MAC is a
+    // 32-byte HMAC encoded to 43 base64url chars, and the final char carries
+    // only 4 significant bits plus 2 trailing padding bits. 'A' (000000) and
+    // 'B' (000001) differ solely in a padding bit, so they decode to identical
+    // bytes whenever the original MAC's last char is 'A' (~1/16 of random
+    // MACs). In that case the "flip" is a no-op, the MAC still verifies, and
+    // the forgery goes undetected — the source of the ~1/16 CI flake.
+    const macBytes = fromBase64url(anchor.mac);
+    macBytes[0] ^= 0xff;
+    anchor.mac = toBase64url(macBytes);
     await writeAnchor(storage, anchor);
 
     const reader = new AuditLog(storage, masterKey);
