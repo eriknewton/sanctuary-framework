@@ -157,7 +157,7 @@ this machine and decrypted on another."
 > identity isolation.
 
 The source comment at `server/src/wrap/passphrase.ts` (around the
-`deriveMachineKey` helper near line 518) cross-references this section so a
+`deriveMachineKey` helper near line 650) cross-references this section so a
 future maintainer touching the derivation does not lose the threat-model
 context.
 
