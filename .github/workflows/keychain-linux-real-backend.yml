@@ -1,7 +1,7 @@
 name: Keychain Linux Real-Backend Integration
 
 # Exercises the production secret-tool shell-out path in
-# server/src/cocoon/passphrase.ts against a real libsecret-compatible
+# server/src/wrap/passphrase.ts against a real libsecret-compatible
 # Secret Service backend on every push and pull request that touches the
 # Linux keychain code. Closes the v0.10.1 / v1.0.2 backlog item (b) CI
 # gap diagnosed in PR #151 and tracked in issue #153.
@@ -33,7 +33,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "server/src/cocoon/passphrase.ts"
+      - "server/src/wrap/passphrase.ts"
       - "server/test/keychain-linux-real-backend-integration.test.ts"
       - "server/test/keychain-linux-secret-service.test.ts"
       - "server/package.json"
@@ -42,7 +42,7 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - "server/src/cocoon/passphrase.ts"
+      - "server/src/wrap/passphrase.ts"
       - "server/test/keychain-linux-real-backend-integration.test.ts"
       - "server/test/keychain-linux-secret-service.test.ts"
       - "server/package.json"
