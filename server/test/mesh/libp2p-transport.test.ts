@@ -751,6 +751,222 @@ describe("libp2p-transport: FileCounterStore persistence", () => {
   it("rejects unsafe nodeId at construction time", () => {
     expect(() => new FileCounterStore("/tmp", "../../evil")).toThrow();
   });
+
+  it("rejects unsafe integers via set() (mirrors in-memory fail-closed)", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      const c = new FileCounterStore(tmpdir, "nodeX");
+      await c.init();
+      expect(() =>
+        c.set("audit_batch_seq", Number.MAX_SAFE_INTEGER + 100)
+      ).toThrow(/non-negative safe integer/);
+      // Largest safe integer is still admitted.
+      expect(() =>
+        c.set("audit_batch_seq", Number.MAX_SAFE_INTEGER)
+      ).not.toThrow();
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// FileCounterStore.init() fails CLOSED on a present-but-invalid persisted
+// counter (§8.3 rollback canary). A silently-skipped entry would resolve via
+// `?? 0` and RESTART at 0 — the exact rollback the counter exists to detect.
+// Only a genuinely absent store (ENOENT) is a legitimate clean first boot.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("libp2p-transport: FileCounterStore.init() fail-closed", () => {
+  async function writeCounterFile(
+    tmpdir: string,
+    nodeId: string,
+    raw: string
+  ): Promise<void> {
+    // Mirror the store's on-disk layout: counters-{nodeId}.json under dir.
+    await fs.mkdir(tmpdir, { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(tmpdir, `counters-${nodeId}.json`), raw, "utf8");
+  }
+
+  it("clean first boot when the store is genuinely absent (ENOENT)", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      const c = new FileCounterStore(tmpdir, "nodeFresh");
+      await expect(c.init()).resolves.toBeUndefined();
+      // First boot starts clean at 0.
+      expect(c.peek("audit_batch_seq")).toBe(0);
+      expect(c.next("audit_batch_seq")).toBe(0);
+      expect(c.peek("audit_batch_seq")).toBe(1);
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  it("loads a valid persisted store without throwing", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      await writeCounterFile(
+        tmpdir,
+        "nodeOk",
+        JSON.stringify({ audit_batch_seq: 42, heartbeat_seq: 7 })
+      );
+      const c = new FileCounterStore(tmpdir, "nodeOk");
+      await c.init();
+      expect(c.peek("audit_batch_seq")).toBe(42);
+      expect(c.peek("heartbeat_seq")).toBe(7);
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  it("throws on a tampered negative counter (not skip-and-reset)", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      await writeCounterFile(
+        tmpdir,
+        "nodeNeg",
+        JSON.stringify({ audit_batch_seq: -5 })
+      );
+      const c = new FileCounterStore(tmpdir, "nodeNeg");
+      await expect(c.init()).rejects.toThrow(/refusing to start|rolled-back/);
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  it("throws on a NaN-as-null counter", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      // JSON.stringify(NaN) === "null"; a NaN that round-tripped through JSON
+      // lands as null on disk. The prior code skipped it; we must reject.
+      await writeCounterFile(
+        tmpdir,
+        "nodeNan",
+        '{"audit_batch_seq":null}'
+      );
+      const c = new FileCounterStore(tmpdir, "nodeNan");
+      await expect(c.init()).rejects.toThrow(/refusing to start|rolled-back/);
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  it("throws on a non-integer (float) counter", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      await writeCounterFile(
+        tmpdir,
+        "nodeFloat",
+        JSON.stringify({ heartbeat_seq: 3.5 })
+      );
+      const c = new FileCounterStore(tmpdir, "nodeFloat");
+      await expect(c.init()).rejects.toThrow(/refusing to start|rolled-back/);
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  it("throws on a string-typed counter (truncated/tampered field)", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      await writeCounterFile(
+        tmpdir,
+        "nodeStr",
+        '{"audit_batch_seq":"12"}'
+      );
+      const c = new FileCounterStore(tmpdir, "nodeStr");
+      await expect(c.init()).rejects.toThrow(/refusing to start|rolled-back/);
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  it("throws on an unsafe-integer counter (> 2^53)", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      // Number.MAX_SAFE_INTEGER + 100 serialized as a JSON number literal.
+      await writeCounterFile(
+        tmpdir,
+        "nodeUnsafe",
+        `{"audit_batch_seq":${Number.MAX_SAFE_INTEGER + 100}}`
+      );
+      const c = new FileCounterStore(tmpdir, "nodeUnsafe");
+      await expect(c.init()).rejects.toThrow(/refusing to start|rolled-back/);
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  it("throws on a present-but-empty store ({}) — not a clean first boot", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      // A genuine persisted store always carries at least one counter; an empty
+      // object on disk is truncation/tampering, distinct from an absent file.
+      await writeCounterFile(tmpdir, "nodeEmpty", "{}");
+      const c = new FileCounterStore(tmpdir, "nodeEmpty");
+      await expect(c.init()).rejects.toThrow(/empty|refusing to start/);
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  it("throws on a present store that parses to a primitive (42)", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      await writeCounterFile(tmpdir, "nodePrim", "42");
+      const c = new FileCounterStore(tmpdir, "nodePrim");
+      await expect(c.init()).rejects.toThrow(
+        /not a counter object|refusing to start/
+      );
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  it("throws on a present store that parses to an array ([])", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      await writeCounterFile(tmpdir, "nodeArr", "[]");
+      const c = new FileCounterStore(tmpdir, "nodeArr");
+      await expect(c.init()).rejects.toThrow(
+        /not a counter object|refusing to start/
+      );
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  it("throws on an unknown/tampered counter key with a valid number value", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      // A bogus key carrying a value while real counters default to 0 is itself
+      // a silent reset — must halt the boot, not load-and-ignore.
+      await writeCounterFile(
+        tmpdir,
+        "nodeUnknownKey",
+        '{"old_or_tampered_name":100}'
+      );
+      const c = new FileCounterStore(tmpdir, "nodeUnknownKey");
+      await expect(c.init()).rejects.toThrow(
+        /unknown counter key|refusing to start/
+      );
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  it("next() refuses to advance a persisted counter past the safe-integer ceiling", async () => {
+    const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
+    try {
+      const c = new FileCounterStore(tmpdir, "nodeCeil");
+      await c.init();
+      c.set("audit_batch_seq", Number.MAX_SAFE_INTEGER);
+      expect(() => c.next("audit_batch_seq")).toThrow(/safe-integer ceiling/);
+      expect(c.peek("audit_batch_seq")).toBe(Number.MAX_SAFE_INTEGER);
+    } finally {
+      await fs.rm(tmpdir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════
