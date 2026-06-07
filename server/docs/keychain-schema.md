@@ -41,7 +41,7 @@ who has it can decrypt all of that tenant's state.
 
 The `<16hex>` suffix is the first 16 hex characters (64 bits) of
 `SHA-256(canonical_storage_path)` computed by `keychainServiceFor()` in
-[`src/cocoon/passphrase.ts`](../src/cocoon/passphrase.ts). The storage path
+[`src/wrap/passphrase.ts`](../src/wrap/passphrase.ts). The storage path
 is canonicalized via `path.resolve()` before hashing, so cosmetic path
 differences (trailing slashes, `.` segments, `..` segments, doubled
 separators) always resolve to the same service name. It is **derived from
@@ -156,7 +156,7 @@ this machine and decrypted on another."
 > keyring still get encryption-at-rest, not so multi-user environments get
 > identity isolation.
 
-The source comment at `server/src/cocoon/passphrase.ts` (around the
+The source comment at `server/src/wrap/passphrase.ts` (around the
 `deriveMachineKey` helper near line 518) cross-references this section so a
 future maintainer touching the derivation does not lose the threat-model
 context.
@@ -429,7 +429,7 @@ cd server && npm test -- keychain-linux-real-backend-integration
 The `Keychain Linux Real-Backend Integration` workflow at
 `.github/workflows/keychain-linux-real-backend.yml` runs the suite in
 automated CI on every push and pull request that touches
-`server/src/cocoon/passphrase.ts`, the keychain test files, or the
+`server/src/wrap/passphrase.ts`, the keychain test files, or the
 workflow itself. The workflow stands up `pass-secret-service` (a
 libsecret-compatible Secret Service implementation backed by `pass`,
 GPG-encrypted password store) on a `dbus-run-session` session bus so the

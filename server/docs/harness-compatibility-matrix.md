@@ -34,7 +34,7 @@ README wrap targets are OpenClaw, Hermes Agent, Claude Code, Cursor, Cline, and 
 
 ## Observed Gaps
 
-The current `runWrap` implementation (`server/src/cocoon/cli.ts:153`) detects/bootstraps the agent config, persists/resolves the passphrase (Keychain or fallback file), creates the storage directory, writes the sovereignty profile, backs up the config, and rewrites the agent config to point at Sanctuary. It does NOT generate an Ed25519 identity keypair or write an audit genesis entry, those are deferred to first unlock after mantle binding per the lazy-init pattern (server boot via `createSanctuaryServer()` or dashboard boot via `startStandaloneDashboard()` derives the master key from the persisted passphrase, then initializes identity + audit on first run).
+The current `runWrap` implementation (`server/src/wrap/cli.ts:153`) detects/bootstraps the agent config, persists/resolves the passphrase (Keychain or fallback file), creates the storage directory, writes the sovereignty profile, backs up the config, and rewrites the agent config to point at Sanctuary. It does NOT generate an Ed25519 identity keypair or write an audit genesis entry, those are deferred to first unlock after mantle binding per the lazy-init pattern (server boot via `createSanctuaryServer()` or dashboard boot via `startStandaloneDashboard()` derives the master key from the persisted passphrase, then initializes identity + audit on first run).
 
 This is correct architecture (passphrase resolution must precede key derivation; the master key cannot exist at wrap-time when the passphrase may not yet be entered). The matrix's "first-unlock" label captures the actual pattern.
 

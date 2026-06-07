@@ -124,8 +124,8 @@ Primary implementation files inspected:
 - `server/src/index.ts`
 - `server/src/config.ts`
 - `server/src/paths.ts`
-- `server/src/cocoon/passphrase.ts`
-- `server/src/cocoon/cli.ts`
+- `server/src/wrap/passphrase.ts`
+- `server/src/wrap/cli.ts`
 - `server/src/l3-disclosure/broker/open.ts`
 - `server/src/cli/secrets.ts`
 - `server/src/audit/siem-tools.ts`

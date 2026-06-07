@@ -47,8 +47,8 @@ merging:
 `console.log` of structured output (JSON, version strings, --help text)
 or `console.error` of operator-facing diagnostic output from a CLI
 entrypoint. stdout/stderr is the operator interface here, not a log
-sink. CLI code lives under `server/src/cli/`, `server/src/cocoon/cli.ts`,
-`server/src/cocoon/init.ts`,
+sink. CLI code lives under `server/src/cli/`, `server/src/wrap/cli.ts`,
+`server/src/wrap/init.ts`,
 `server/src/compliance/eu_ai_act/cli.ts`, and
 `server/src/dashboard-standalone.ts`. Annotate with:
 
@@ -79,7 +79,7 @@ These run in the browser, not the server. The gate's lexer strips
 template-literal contents before scanning, so these sites are
 automatically excluded. No annotation needed. Files affected today:
 `server/src/principal-policy/dashboard-html.ts` (10 calls in HTML
-template),`server/src/cocoon/fortress-view.ts` (1 call in HTML
+template),`server/src/wrap/fortress-view.ts` (1 call in HTML
 template).
 
 ### Category D. Residual debug
