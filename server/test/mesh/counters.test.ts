@@ -24,7 +24,7 @@ describe("InMemoryCounterStore: set() validation", () => {
     const counters = new InMemoryCounterStore();
 
     expect(() => counters.set("heartbeat_seq", 1.5)).toThrow(
-      /non-negative integer/
+      /non-negative safe integer/
     );
   });
 
@@ -32,7 +32,7 @@ describe("InMemoryCounterStore: set() validation", () => {
     const counters = new InMemoryCounterStore();
 
     expect(() => counters.set("audit_batch_seq", -1)).toThrow(
-      /non-negative integer/
+      /non-negative safe integer/
     );
   });
 
@@ -40,40 +40,72 @@ describe("InMemoryCounterStore: set() validation", () => {
     const counters = new InMemoryCounterStore();
 
     expect(() => counters.set("envelope_monotonic_seq", NaN)).toThrow(
-      /non-negative integer/
+      /non-negative safe integer/
     );
   });
 });
 
-describe("InMemoryCounterStore: unsafe-integer boundary (latent gap)", () => {
+describe("InMemoryCounterStore: unsafe-integer boundary (fail-closed)", () => {
   /*
-   * Characterization tests, not approval tests.
+   * Regression tests for the §8.3 rollback canary.
    *
-   * These document a latent production gap surfaced by adversarial review:
-   * the current production validator in src/mesh/lifecycle/counters.ts uses
-   * Number.isInteger(value) and value < 0, so it admits unsafe integers. The
-   * real fix site is that validator, tracked separately.
+   * The validator uses Number.isSafeInteger (not Number.isInteger), so set()
+   * fails CLOSED on any integer above 2^53. Such a value would otherwise pass
+   * Number.isInteger but lose precision under next()'s `current + 1`, collapsing
+   * two distinct sequence values onto one representable double — a silent
+   * rollback-canary defeat. set() must reject it outright; there is no value
+   * stored to collide.
    */
-  it("admits unsafe integers through set()", () => {
+  it("rejects unsafe integers through set()", () => {
     const counters = new InMemoryCounterStore();
     const unsafeValue = Number.MAX_SAFE_INTEGER + 100;
 
-    expect(() => counters.set("heartbeat_seq", unsafeValue)).not.toThrow();
-    expect(Number.isSafeInteger(counters.peek("heartbeat_seq"))).toBe(false);
+    expect(() => counters.set("heartbeat_seq", unsafeValue)).toThrow(
+      /non-negative safe integer/
+    );
+    // Rejected, so the counter is untouched (still at its default 0).
+    expect(counters.peek("heartbeat_seq")).toBe(0);
   });
 
-  it("can collide sequence values after precision loss past 2^53", () => {
+  it("does not collide sequence values: unsafe set() is rejected before any next()", () => {
     const counters = new InMemoryCounterStore();
     const unsafeValue = Number.MAX_SAFE_INTEGER + 100;
 
-    counters.set("audit_batch_seq", unsafeValue);
+    expect(() => counters.set("audit_batch_seq", unsafeValue)).toThrow(
+      /non-negative safe integer/
+    );
 
-    // Above 2^53, integer spacing is wider than 1, so current + 1 can round
-    // back to the same representable double instead of advancing.
+    // Nothing was stored, so next() advances cleanly from 0 — no precision
+    // loss, no collision.
     const first = counters.next("audit_batch_seq");
     const second = counters.next("audit_batch_seq");
 
-    expect(second).toBe(first);
+    expect(first).toBe(0);
+    expect(second).toBe(1);
+    expect(second).not.toBe(first);
+  });
+
+  it("admits the largest safe integer (boundary stays open for legit values)", () => {
+    const counters = new InMemoryCounterStore();
+
+    expect(() =>
+      counters.set("heartbeat_seq", Number.MAX_SAFE_INTEGER)
+    ).not.toThrow();
+    expect(counters.peek("heartbeat_seq")).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it("next() refuses to advance past the safe-integer ceiling (no collision)", () => {
+    const counters = new InMemoryCounterStore();
+
+    // set() admits MAX_SAFE_INTEGER, but next() must not push current + 1 into
+    // unsafe territory where two sequence values would collide.
+    counters.set("audit_batch_seq", Number.MAX_SAFE_INTEGER);
+
+    expect(() => counters.next("audit_batch_seq")).toThrow(
+      /safe-integer ceiling/
+    );
+    // The counter is unchanged; the canary holds rather than silently colliding.
+    expect(counters.peek("audit_batch_seq")).toBe(Number.MAX_SAFE_INTEGER);
   });
 });
 

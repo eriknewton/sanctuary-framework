@@ -37,6 +37,7 @@ import {
 import * as path from "node:path";
 import type { EncryptedPayload } from "../../core/encryption.js";
 import type { CounterName, CounterStore, NodeKeyStore } from "./types.js";
+import { COUNTER_NAMES, wouldOverflowOnNext } from "./counters.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // FileNodeKeyStore — per-node Ed25519 private key at-rest wrap
@@ -144,11 +145,59 @@ export class FileCounterStore implements CounterStore {
     await fs.mkdir(this.dir, { recursive: true, mode: 0o700 });
     try {
       const bytes = await fs.readFile(this.file, "utf8");
-      const parsed = JSON.parse(bytes) as Partial<Record<CounterName, number>>;
-      for (const [name, v] of Object.entries(parsed)) {
-        if (typeof v === "number" && Number.isInteger(v) && v >= 0) {
-          this.values.set(name as CounterName, v);
+      const parsed: unknown = JSON.parse(bytes);
+
+      // Fail CLOSED on a present-but-malformed store. A genuine persisted store
+      // is always a non-empty plain object (every next()/set() persists the
+      // full snapshot, which carries at least the one counter just touched).
+      // A present file that parses to a primitive, an array, or an empty object
+      // is therefore corruption/truncation/tampering — NOT a clean first boot.
+      // Only an absent store (ENOENT, handled below) starts clean. Booting such
+      // a file would let every real counter resolve via `?? 0` and RESTART at 0
+      // — the exact rollback the counter exists to detect (§8.3).
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed)
+      ) {
+        throw new Error(
+          `FileCounterStore.init: persisted store is not a counter object ` +
+            `(${JSON.stringify(parsed)}); refusing to start — a reset counter ` +
+            `is indistinguishable from a rolled-back node (§8.3). The store at ` +
+            `${this.file} may be corrupt or tampered.`
+        );
+      }
+      const entries = Object.entries(parsed as Record<string, unknown>);
+      if (entries.length === 0) {
+        throw new Error(
+          `FileCounterStore.init: persisted store is empty; refusing to start ` +
+            `— an empty store is indistinguishable from a wiped/rolled-back ` +
+            `node (§8.3). The store at ${this.file} may be corrupt or tampered.`
+        );
+      }
+
+      for (const [name, v] of entries) {
+        // Fail CLOSED on any present-but-invalid persisted counter, including
+        // an unknown/tampered key. A bogus key (e.g. a renamed or stale field)
+        // that carries a value while the real counters default to 0 is itself a
+        // silent reset and must halt the boot.
+        if (!COUNTER_NAMES.has(name as CounterName)) {
+          throw new Error(
+            `FileCounterStore.init: persisted store has unknown counter key ` +
+              `${JSON.stringify(name)}; refusing to start — an unrecognized ` +
+              `field is a corruption/tamper signal (§8.3). The store at ` +
+              `${this.file} may be corrupt or tampered.`
+          );
         }
+        if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) {
+          throw new Error(
+            `FileCounterStore.init: persisted counter ${name} is invalid ` +
+              `(${JSON.stringify(v)}); refusing to start — a reset counter is ` +
+              `indistinguishable from a rolled-back node (§8.3). The store at ` +
+              `${this.file} may be corrupt or tampered.`
+          );
+        }
+        this.values.set(name as CounterName, v);
       }
     } catch (e) {
       if (!isNotFound(e)) throw e;
@@ -171,6 +220,17 @@ export class FileCounterStore implements CounterStore {
   next(name: CounterName): number {
     this.requireLoaded();
     const current = this.values.get(name) ?? 0;
+    if (wouldOverflowOnNext(current)) {
+      // Refuse to cross 2^53: see InMemoryCounterStore.next. Past the safe-
+      // integer ceiling, current + 1 collides onto an already-issued value
+      // (§8.3), and the persisted value would also be rejected by init() on
+      // the next restart.
+      throw new Error(
+        `FileCounterStore.next: ${name} is at the safe-integer ceiling ` +
+          `(${current}); refusing to advance — incrementing past 2^53 would ` +
+          `collide two sequence values and defeat the rollback canary (§8.3).`
+      );
+    }
     const nextValue = current + 1;
     this.values.set(name, nextValue);
     this.persistSync();
@@ -184,9 +244,11 @@ export class FileCounterStore implements CounterStore {
 
   set(name: CounterName, value: number): void {
     this.requireLoaded();
-    if (!Number.isInteger(value) || value < 0) {
+    // Number.isSafeInteger (not Number.isInteger): see InMemoryCounterStore.set
+    // — integers above 2^53 collide under next()'s `current + 1`. Fail closed.
+    if (!Number.isSafeInteger(value) || value < 0) {
       throw new Error(
-        `FileCounterStore.set: value must be non-negative integer; got ${value}`
+        `FileCounterStore.set: value must be non-negative safe integer; got ${value}`
       );
     }
     const prior = this.values.get(name) ?? 0;
