@@ -73,7 +73,7 @@ These derivations bypass the high-level helpers because they need a salt other t
 
 | Salt | Info | Owner module | Purpose |
 |---|---|---|---|
-| undefined (passphrase context) | `sanctuary-passphrase-v1` | `server/src/wrap/passphrase.ts:656` | Final master-key derivation step in the passphrase flow. The Argon2id output is fed to HKDF with this info string to produce the 32-byte master key. |
+| undefined (passphrase context) | `sanctuary-passphrase-v1` | `server/src/wrap/passphrase.ts:656` | Derives the 32-byte machine-bound key for the no-OS-keyring fallback file from local machine identity material; it does not use Argon2id or passphrase input and is not the passphrase master key. |
 | `fortress_id` | `sanctuary-fed-v0.1-transport` `\|\| node_id \|\| node_mode` | `server/src/mesh/trust-root.ts:362` | Per-node transport subkey for federation v0.1. |
 | `fortress_id` | `sanctuary-fed-v0.1-audit-chain` `\|\| node_id` | `server/src/mesh/trust-root.ts:388` | Per-node audit-chain subkey for federation v0.1. |
 | `fortress_id` | `sanctuary-fed-v0.1-lifecycle-agent-state-transfer` | `server/src/mesh/lifecycle/sync.ts:122` | Sync-envelope encryption for agent-state transfer between mesh nodes. |
