@@ -2,7 +2,7 @@
  * Linux Secret Service real-backend integration test.
  *
  * Exercises the production Secret Service shell-out path in
- * server/src/cocoon/passphrase.ts against a real `secret-tool` CLI plus a
+ * server/src/wrap/passphrase.ts against a real `secret-tool` CLI plus a
  * real gnome-keyring-daemon running on a dbus-run-session-managed session
  * bus. Closes full-sweep finding #45 (P1) and v0.10.1 / v1.0.2 backlog
  * item (b): mock-only coverage, carried since v0.10.1 PR #60, did not
