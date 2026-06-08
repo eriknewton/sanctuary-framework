@@ -272,11 +272,18 @@ describe("policy drafts activate audit writes (ZZZZZ pr 3/3)", () => {
       const { runPolicyCommand } = await import("../../src/cli/policy.js");
       const out = new StringWritable();
       const err = new StringWritable();
+      const prevToken = process.env["SANCTUARY_POLICY_API_TOKEN"];
+      process.env["SANCTUARY_POLICY_API_TOKEN"] = "operator-test-token";
       const code = await runPolicyCommand({
         argv: ["drafts", "activate", "test-draft", "--api-base", apiBase],
         out,
         err,
       });
+      if (prevToken === undefined) {
+        delete process.env["SANCTUARY_POLICY_API_TOKEN"];
+      } else {
+        process.env["SANCTUARY_POLICY_API_TOKEN"] = prevToken;
+      }
 
       expect(code).toBe(1);
       // May report "activation failed" or wrap in "sanctuary policy:" depending on error path.

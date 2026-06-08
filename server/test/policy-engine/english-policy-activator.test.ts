@@ -62,6 +62,7 @@ import { runPolicyCommand } from "../../src/cli/policy.js";
 const FORTRESS_A = "fortress_a";
 const FORTRESS_B = "fortress_b";
 const OPERATOR = "operator_alpha";
+const OPERATOR_TOKEN = "operator-token";
 const OBSERVED_AT = "2026-05-09T12:00:00.000Z";
 
 function clonePolicy(): PrincipalPolicy {
@@ -514,7 +515,7 @@ describe("Xi-2 - HTTP routes", () => {
     const server: Server = createServer(async (req, res) => {
       const handled = await handleEnglishPolicyRoute(
         {
-          authConfig: { loopbackAutoAuth: true },
+          authConfig: { loopbackAutoAuth: true, authToken: OPERATOR_TOKEN },
           compiler: deps.compiler,
           store: deps.store,
           activator: deps.activator,
@@ -533,6 +534,10 @@ describe("Xi-2 - HTTP routes", () => {
       close: () =>
         new Promise<void>((resolve) => server.close(() => resolve())),
     };
+  }
+
+  function operatorHeaders(extra?: HeadersInit): HeadersInit {
+    return { Authorization: `Bearer ${OPERATOR_TOKEN}`, ...(extra ?? {}) };
   }
 
   function compilerFor(auditLog: AuditLog): EnglishPolicyCompiler {
@@ -560,14 +565,43 @@ describe("Xi-2 - HTTP routes", () => {
     try {
       const res = await fetch(
         `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}/activate`,
-        { method: "POST" },
+        { method: "POST", headers: operatorHeaders() },
       );
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
-        data: { record: { status: string }; updated_policy: PrincipalPolicy };
+        data: { status: string; updated_policy?: PrincipalPolicy; record?: unknown };
       };
-      expect(body.data.record.status).toBe("activated");
-      expect(body.data.updated_policy.tier1_always_approve).toContain(
+      expect(body.data.status).toBe("activated");
+      expect(body.data.updated_policy).toBeUndefined();
+      expect(body.data.record).toBeUndefined();
+    } finally {
+      await close();
+    }
+  });
+
+  it("POST /api/policy/drafts/:id/activate refuses a non-operator caller before mutation", async () => {
+    const rig = makeActivatorRig();
+    const compiler = compilerFor(rig.auditLog);
+    const store = new EnglishPolicyDraftStore();
+    const draft = buildCompiled({
+      kind: "tier1_add_operation",
+      operation: "state_export",
+    });
+    store.put(draft);
+    const { base, close } = await makeServer({
+      compiler,
+      store,
+      activator: rig.activator,
+    });
+    try {
+      const res = await fetch(
+        `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}/activate`,
+        { method: "POST" },
+      );
+      expect(res.status).toBe(403);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("operator_auth_required");
+      expect(rig.livePolicy.current.tier1_always_approve).not.toContain(
         "state_export",
       );
     } finally {
@@ -592,12 +626,20 @@ describe("Xi-2 - HTTP routes", () => {
     try {
       const res = await fetch(
         `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}/activate`,
-        { method: "POST" },
+        { method: "POST", headers: operatorHeaders() },
       );
       expect(res.status).toBe(409);
+      const body = (await res.json()) as {
+        error: string;
+        detail?: string;
+        data?: { conflicts?: unknown[] };
+      };
+      expect(body.error).toBe("activation_refused");
+      expect(body.detail).toBeUndefined();
+      expect(body.data?.conflicts).toBeUndefined();
       const okOverride = await fetch(
         `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}/activate?override=true`,
-        { method: "POST" },
+        { method: "POST", headers: operatorHeaders() },
       );
       expect(okOverride.status).toBe(200);
     } finally {
@@ -623,13 +665,15 @@ describe("Xi-2 - HTTP routes", () => {
     try {
       const res = await fetch(
         `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}`,
-        { method: "DELETE" },
+        { method: "DELETE", headers: operatorHeaders() },
       );
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
-        data: { record: { status: string } };
+        data: { status: string; updated_policy?: PrincipalPolicy; record?: unknown };
       };
-      expect(body.data.record.status).toBe("revoked");
+      expect(body.data.status).toBe("revoked");
+      expect(body.data.updated_policy).toBeUndefined();
+      expect(body.data.record).toBeUndefined();
     } finally {
       await close();
     }
@@ -653,13 +697,14 @@ describe("Xi-2 - HTTP routes", () => {
     try {
       const res = await fetch(
         `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}/status`,
+        { headers: operatorHeaders() },
       );
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
-        data: { record: { status: string; activated_by: string } };
+        data: { status: string; record?: unknown };
       };
-      expect(body.data.record.status).toBe("activated");
-      expect(body.data.record.activated_by).toBe(OPERATOR);
+      expect(body.data.status).toBe("activated");
+      expect(body.data.record).toBeUndefined();
     } finally {
       await close();
     }
@@ -682,16 +727,14 @@ describe("Xi-2 - HTTP routes", () => {
     try {
       const res = await fetch(
         `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}/check-conflicts`,
-        { method: "POST" },
+        { method: "POST", headers: operatorHeaders() },
       );
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
-        data: { conflicts: Array<{ conflict_type: string }> };
+        data: { status: string; conflicts?: unknown[] };
       };
-      expect(body.data.conflicts.length).toBeGreaterThan(0);
-      expect(
-        body.data.conflicts.some((c) => c.conflict_type === "direct_override"),
-      ).toBe(true);
+      expect(body.data.status).toBe("review_recorded");
+      expect(body.data.conflicts).toBeUndefined();
       expect(rig.livePolicy.current.tier1_always_approve).toContain(
         "state_export",
       );
@@ -717,20 +760,24 @@ describe("Xi-2 - HTTP routes", () => {
     try {
       const blocked = await fetch(
         `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}/activate`,
-        { method: "POST" },
+        { method: "POST", headers: operatorHeaders() },
       );
       expect(blocked.status).toBe(409);
       const blockedBody = (await blocked.json()) as {
-        data: { conflicts: unknown[] };
+        error: string;
+        detail?: string;
+        data?: { conflicts?: unknown[] };
       };
-      expect(blockedBody.data.conflicts.length).toBeGreaterThan(0);
+      expect(blockedBody.error).toBe("activation_refused");
+      expect(blockedBody.detail).toBeUndefined();
+      expect(blockedBody.data?.conflicts).toBeUndefined();
       const ok = await fetch(
         `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}/activate`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: operatorHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({
-            conflicts_acknowledged: blockedBody.data.conflicts,
+            acknowledge_conflicts: true,
           }),
         },
       );
@@ -757,6 +804,8 @@ describe("Xi-2 - HTTP routes", () => {
     try {
       const out = new CollectStream();
       const err = new CollectStream();
+      const prevToken = process.env["SANCTUARY_POLICY_API_TOKEN"];
+      process.env["SANCTUARY_POLICY_API_TOKEN"] = OPERATOR_TOKEN;
       const code = await runPolicyCommand({
         argv: [
           "drafts",
@@ -768,8 +817,13 @@ describe("Xi-2 - HTTP routes", () => {
         out,
         err,
       });
+      if (prevToken === undefined) {
+        delete process.env["SANCTUARY_POLICY_API_TOKEN"];
+      } else {
+        process.env["SANCTUARY_POLICY_API_TOKEN"] = prevToken;
+      }
       expect(code).toBe(0);
-      expect(out.text).toContain("direct_override");
+      expect(out.text).toContain("conflict review: review_recorded");
       expect(err.text).toBe("");
     } finally {
       await close();
@@ -793,6 +847,8 @@ describe("Xi-2 - HTTP routes", () => {
     try {
       const out = new CollectStream();
       const err = new CollectStream();
+      const prevToken = process.env["SANCTUARY_POLICY_API_TOKEN"];
+      process.env["SANCTUARY_POLICY_API_TOKEN"] = OPERATOR_TOKEN;
       const code = await runPolicyCommand({
         argv: [
           "drafts",
@@ -805,8 +861,13 @@ describe("Xi-2 - HTTP routes", () => {
         out,
         err,
       });
+      if (prevToken === undefined) {
+        delete process.env["SANCTUARY_POLICY_API_TOKEN"];
+      } else {
+        process.env["SANCTUARY_POLICY_API_TOKEN"] = prevToken;
+      }
       expect(code).toBe(1);
-      expect(err.text).toContain("high-severity conflicts require");
+      expect(err.text).toContain("activation failed: activation_refused");
       expect(out.text).toBe("");
     } finally {
       await close();
