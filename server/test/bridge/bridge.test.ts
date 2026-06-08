@@ -10,14 +10,24 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { createIdentity } from "../../src/core/identity.js";
-import { toBase64url, fromBase64url, stringToBytes } from "../../src/core/encoding.js";
+import {
+  toBase64url,
+  fromBase64url,
+  stringToBytes,
+  bytesToString,
+} from "../../src/core/encoding.js";
 import { hash } from "../../src/core/hashing.js";
+import { encrypt, decrypt, type EncryptedPayload } from "../../src/core/encryption.js";
+import { IdentityManager } from "../../src/l1-cognitive/tools.js";
+import { createBridgeTools } from "../../src/bridge/tools.js";
 import {
   createBridgeCommitment,
   verifyBridgeCommitment,
   canonicalize,
 } from "../../src/bridge/bridge.js";
 import type { ConcordiaOutcome, BridgeCommitment } from "../../src/bridge/types.js";
+import type { AuditLog } from "../../src/l2-operational/audit-log.js";
+import type { ToolDefinition } from "../../src/router.js";
 
 // ─── Test Helpers ────────────────────────────────────────────────────────
 
@@ -38,15 +48,78 @@ function makeOutcome(overrides?: Partial<ConcordiaOutcome>): ConcordiaOutcome {
   };
 }
 
+function parseToolResult(result: Awaited<ReturnType<ToolDefinition["handler"]>>): Record<string, unknown> {
+  return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+}
+
+function stubAuditLog(): AuditLog {
+  return {
+    append: () => {},
+    appendCritical: async () => {},
+  } as unknown as AuditLog;
+}
+
+async function makeBridgeHarness() {
+  const storage = new MemoryStorage();
+  const masterKey = generateRandomKey();
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  const identityManager = new IdentityManager(storage, masterKey);
+  const signer = createIdentity("bridge-tool-signer", identityEncKey, "recovery-key");
+  const counterparty = createIdentity("bridge-tool-counterparty", identityEncKey, "recovery-key");
+  const outsider = createIdentity("bridge-tool-outsider", identityEncKey, "recovery-key");
+
+  await identityManager.save(signer.storedIdentity);
+  await identityManager.save(counterparty.storedIdentity);
+  await identityManager.save(outsider.storedIdentity);
+  await identityManager.setPrimary(signer.storedIdentity.identity_id);
+
+  const { tools } = createBridgeTools(
+    storage,
+    masterKey,
+    identityManager,
+    stubAuditLog()
+  );
+
+  const byName = (name: string): ToolDefinition => {
+    const tool = tools.find((t) => t.name === name);
+    if (!tool) throw new Error(`Missing tool: ${name}`);
+    return tool;
+  };
+
+  return {
+    storage,
+    masterKey,
+    byName,
+    signer,
+    counterparty,
+    outsider,
+  };
+}
+
 /** Same stable stringify used in the bridge module */
 function stableStringify(value: unknown): string {
-  if (value === null || value === undefined) return JSON.stringify(value);
+  if (value === null) return "null";
+  if (value === undefined) {
+    throw new Error("Cannot canonicalize undefined");
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error("Cannot canonicalize non-finite number");
+    }
+    if (Object.is(value, -0)) {
+      throw new Error("Cannot canonicalize negative zero");
+    }
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new Error("Cannot canonicalize unsafe integer");
+    }
+    return JSON.stringify(value);
+  }
   if (typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) {
     return "[" + value.map((v) => stableStringify(v)).join(",") + "]";
   }
   const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
+  const keys = Object.keys(obj).filter((k) => obj[k] !== undefined).sort();
   const pairs = keys.map((k) => JSON.stringify(k) + ":" + stableStringify(obj[k]));
   return "{" + pairs.join(",") + "}";
 }
@@ -111,6 +184,40 @@ describe("Concordia Bridge", () => {
       expect(toBase64url(canonicalize(outcome1))).toBe(
         toBase64url(canonicalize(outcome2))
       );
+    });
+
+    it("omits undefined optional properties before canonicalization to match Concordia bytes", () => {
+      const outcomeWithAssignedUndefined = makeOutcome({
+        session_receipt: undefined,
+      });
+      const outcomeWithAbsentOptional = makeOutcome();
+
+      const canonical = bytesToString(canonicalize(outcomeWithAssignedUndefined));
+      const absentCanonical = bytesToString(canonicalize(outcomeWithAbsentOptional));
+
+      // Concordia's signing.py canonical_json omits absent optionals before
+      // json.dumps(sort_keys=True, separators=(",", ":")); these bytes mirror
+      // that Python canonical_json output for the same logical outcome.
+      const expectedConcordiaBytes =
+        '{"accepted_at":"2026-03-28T12:00:00.000Z",' +
+        '"acceptor_did":"did:sanctuary:acceptor456",' +
+        '"proposer_did":"did:sanctuary:proposer123",' +
+        '"protocol_version":"concordia-v1",' +
+        '"rounds":3,' +
+        '"session_id":"concordia-session-001",' +
+        '"terms":{"currency":"USD","delivery":"2026-04-15","price":100},' +
+        `"terms_hash":"${outcomeWithAbsentOptional.terms_hash}"}`;
+
+      expect(canonical).toBe(absentCanonical);
+      expect(canonical).toBe(expectedConcordiaBytes);
+      expect(canonical).not.toContain("session_receipt");
+      expect(canonical).not.toContain(":null");
+    });
+
+    it("rejects integers outside JavaScript's safe range", () => {
+      expect(() =>
+        canonicalize({ ...makeOutcome(), rounds: Number.MAX_SAFE_INTEGER + 1 })
+      ).toThrow(/unsafe integer/i);
     });
   });
 
@@ -437,6 +544,114 @@ describe("Concordia Bridge", () => {
       // SHA-256 fails because terms_hash is part of the canonical serialization
       expect(result.checks.sha256_match).toBe(false);
       expect(result.checks.terms_hash_match).toBe(false);
+    });
+  });
+
+  // ── Bridge Tools ───────────────────────────────────────────────────────
+
+  describe("bridge tools", () => {
+    it("bridge_verify checks a revealed outcome instead of only stored provenance", async () => {
+      const { byName, signer, counterparty } = await makeBridgeHarness();
+      const outcome = makeOutcome({
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+      });
+      const commit = byName("bridge_commit");
+      const verify = byName("bridge_verify");
+
+      const committed = parseToolResult(await commit.handler({
+        ...outcome,
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+
+      const revealed = makeOutcome({
+        ...outcome,
+        rounds: outcome.rounds + 1,
+      });
+      const result = parseToolResult(await verify.handler({
+        bridge_commitment_id: committed.bridge_commitment_id,
+        outcome: revealed,
+      }));
+
+      expect(result.valid).toBe(false);
+      expect((result.checks as Record<string, unknown>).sha256_match).toBe(false);
+    });
+
+    it("bridge_verify rejects an external public key that does not derive the committer DID", async () => {
+      const { byName, signer, counterparty, outsider } = await makeBridgeHarness();
+      const outcome = makeOutcome({
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+      });
+      const committed = parseToolResult(await byName("bridge_commit").handler({
+        ...outcome,
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+
+      const result = parseToolResult(await byName("bridge_verify").handler({
+        bridge_commitment_id: committed.bridge_commitment_id,
+        committer_public_key: outsider.publicIdentity.public_key,
+        outcome,
+      }));
+
+      expect(result.error).toMatch(/committer_public_key resolves to/);
+      expect(result.signature_valid).toBe(false);
+    });
+
+    it("bridge_attest refuses identities that are not negotiation parties", async () => {
+      const { byName, signer, counterparty, outsider } = await makeBridgeHarness();
+      const outcome = makeOutcome({
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+      });
+      const committed = parseToolResult(await byName("bridge_commit").handler({
+        ...outcome,
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+
+      const result = parseToolResult(await byName("bridge_attest").handler({
+        bridge_commitment_id: committed.bridge_commitment_id,
+        outcome_result: "completed",
+        identity_id: outsider.publicIdentity.identity_id,
+      }));
+
+      expect(result.error).toMatch(/neither the proposer nor the acceptor/);
+    });
+
+    it("bridge_attest refuses records whose stored outcome fails commitment verification", async () => {
+      const { storage, masterKey, byName, signer, counterparty } = await makeBridgeHarness();
+      const outcome = makeOutcome({
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+      });
+      const committed = parseToolResult(await byName("bridge_commit").handler({
+        ...outcome,
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+
+      const commitmentId = committed.bridge_commitment_id as string;
+      const encryptedRaw = await storage.read("_bridge", commitmentId);
+      expect(encryptedRaw).not.toBeNull();
+      const bridgeKey = derivePurposeKey(masterKey, "bridge-commitments");
+      const encrypted = JSON.parse(bytesToString(encryptedRaw!)) as EncryptedPayload;
+      const record = JSON.parse(
+        bytesToString(decrypt(encrypted, bridgeKey))
+      ) as { commitment: BridgeCommitment; outcome: ConcordiaOutcome };
+      record.outcome = { ...record.outcome, rounds: record.outcome.rounds + 1 };
+      await storage.write(
+        "_bridge",
+        commitmentId,
+        stringToBytes(JSON.stringify(encrypt(stringToBytes(JSON.stringify(record)), bridgeKey)))
+      );
+
+      const result = parseToolResult(await byName("bridge_attest").handler({
+        bridge_commitment_id: commitmentId,
+        outcome_result: "completed",
+        identity_id: counterparty.publicIdentity.identity_id,
+      }));
+
+      expect(result.error).toMatch(/failed verification/);
+      expect((result.verification as Record<string, unknown>).valid).toBe(false);
     });
   });
 

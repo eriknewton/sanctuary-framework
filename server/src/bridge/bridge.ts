@@ -47,12 +47,18 @@ export function canonicalize(outcome: ConcordiaOutcome): Uint8Array {
  *
  * Security hardening: rejects non-finite numbers (NaN, Infinity, -Infinity)
  * which are not representable in JSON and would produce `null`, breaking
- * commitment determinism. Also rejects `undefined` values in arrays
- * (object `undefined` values are already excluded by Object.keys).
+ * commitment determinism. Omits object properties whose value is `undefined`
+ * to match JSON/Python absent-optional semantics, and rejects `undefined`
+ * anywhere else.
  */
 function stableStringify(value: unknown): string {
   if (value === null) return "null";
-  if (value === undefined) return "null";
+  if (value === undefined) {
+    throw new Error(
+      "Cannot canonicalize undefined outside an object property. " +
+      "Omit absent optional values before canonicalization."
+    );
+  }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) {
       throw new Error(
@@ -66,6 +72,12 @@ function stableStringify(value: unknown): string {
         "Use 0 instead for deterministic cross-language serialization."
       );
     }
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new Error(
+        `Cannot canonicalize unsafe integer: ${value}. ` +
+        "Use a string for integers outside JavaScript's safe range."
+      );
+    }
     return JSON.stringify(value);
   }
   if (typeof value !== "object") return JSON.stringify(value);
@@ -73,7 +85,7 @@ function stableStringify(value: unknown): string {
     return "[" + value.map((v) => stableStringify(v)).join(",") + "]";
   }
   const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
+  const keys = Object.keys(obj).filter((k) => obj[k] !== undefined).sort();
   const pairs = keys.map((k) => JSON.stringify(k) + ":" + stableStringify(obj[k]));
   return "{" + pairs.join(",") + "}";
 }

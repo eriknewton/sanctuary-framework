@@ -20,7 +20,7 @@ import { derivePurposeKey } from "../core/key-derivation.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
-import type { StoredIdentity } from "../core/identity.js";
+import { publicKeyToDid, type StoredIdentity } from "../core/identity.js";
 
 import {
   createBridgeCommitment,
@@ -98,6 +98,31 @@ export function createBridgeTools(
       );
     }
     return id;
+  }
+
+  function localPublicKeyForDid(did: string): Uint8Array | null {
+    const match = identityManager.list().find((i) => i.did === did);
+    return match ? fromBase64url(match.public_key) : null;
+  }
+
+  function outcomeFromArgs(value: unknown): ConcordiaOutcome | null {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return null;
+    }
+    const input = value as Record<string, unknown>;
+    return {
+      session_id: input.session_id as string,
+      protocol_version: input.protocol_version as string,
+      proposer_did: input.proposer_did as string,
+      acceptor_did: input.acceptor_did as string,
+      terms: input.terms as Record<string, unknown>,
+      terms_hash: input.terms_hash as string,
+      rounds: input.rounds as number,
+      accepted_at: input.accepted_at as string,
+      ...(input.session_receipt !== undefined
+        ? { session_receipt: input.session_receipt as string }
+        : {}),
+    };
   }
 
   const tools: ToolDefinition[] = [
@@ -253,12 +278,19 @@ export function createBridgeTools(
               "Required if verifying a counterparty's commitment. " +
               "Omit to auto-resolve from local identities.",
           },
+          outcome: {
+            type: "object",
+            description:
+              "Revealed ConcordiaOutcome to verify against the commitment. " +
+              "If omitted, the stored outcome is used for backward-compatible local checks.",
+          },
         },
         required: ["bridge_commitment_id"],
       },
       handler: async (args) => {
         const commitmentId = args.bridge_commitment_id as string;
         const externalPublicKey = args.committer_public_key as string | undefined;
+        const revealedOutcome = outcomeFromArgs(args.outcome);
 
         // Load the stored commitment and outcome
         const record = await bridgeStore.get(commitmentId);
@@ -268,23 +300,34 @@ export function createBridgeTools(
           });
         }
 
-        const { commitment: storedCommitment, outcome } = record;
+        const { commitment: storedCommitment, outcome: storedOutcome } = record;
+        const outcome = revealedOutcome ?? storedOutcome;
 
         // Resolve the committer's public key
         let publicKey: Uint8Array;
         if (externalPublicKey) {
           publicKey = fromBase64url(externalPublicKey);
+          const derivedDid = publicKeyToDid(publicKey);
+          if (derivedDid !== storedCommitment.committer_did) {
+            return toolResult({
+              error:
+                `committer_public_key resolves to "${derivedDid}", ` +
+                `but commitment names "${storedCommitment.committer_did}"`,
+              bridge_commitment_id: commitmentId,
+              signature_valid: false,
+              _content_trust: "external",
+            });
+          }
         } else {
           // Try to find the committer in local identities
-          const localIdentities = identityManager.list();
-          const match = localIdentities.find((i) => i.did === storedCommitment.committer_did);
-          if (!match) {
+          const localPublicKey = localPublicKeyForDid(storedCommitment.committer_did);
+          if (!localPublicKey) {
             return toolResult({
               error: `Cannot resolve public key for committer "${storedCommitment.committer_did}". ` +
                 "Provide committer_public_key for external verification.",
             });
           }
-          publicKey = fromBase64url(match.public_key);
+          publicKey = localPublicKey;
         }
 
         const result = verifyBridgeCommitment(storedCommitment, outcome, publicKey);
@@ -357,8 +400,34 @@ export function createBridgeTools(
           });
         }
 
-        const { outcome } = record;
+        const { commitment, outcome } = record;
         const identity = resolveIdentity(identityId);
+
+        if (identity.did !== outcome.proposer_did && identity.did !== outcome.acceptor_did) {
+          return toolResult({
+            error:
+              `Identity "${identity.did}" cannot attest bridge commitment "${commitmentId}" ` +
+              "because it is neither the proposer nor the acceptor.",
+          });
+        }
+
+        const committerPublicKey = localPublicKeyForDid(commitment.committer_did);
+        if (!committerPublicKey) {
+          return toolResult({
+            error:
+              `Cannot verify bridge commitment "${commitmentId}" before attestation: ` +
+              `no local public key for committer "${commitment.committer_did}".`,
+          });
+        }
+
+        const verification = verifyBridgeCommitment(commitment, outcome, committerPublicKey);
+        if (!verification.valid) {
+          return toolResult({
+            error:
+              `Bridge commitment "${commitmentId}" failed verification and cannot be attested.`,
+            verification,
+          });
+        }
 
         // Determine counterparty DID
         const counterpartyDid =
