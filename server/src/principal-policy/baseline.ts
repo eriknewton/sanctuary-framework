@@ -114,6 +114,15 @@ export class BaselineTracker {
    * Record a namespace access.
    * @returns true if this is a new namespace (not in baseline)
    */
+  isNewNamespace(namespace: string): boolean {
+    // Non-mutating mirror of recordNamespaceAccess: would this namespace be
+    // new? Internal (`_`-prefixed) namespaces are never "new". The gate uses
+    // this to request approval WITHOUT committing, so a denied approval cannot
+    // poison the baseline (the namespace is committed only on approval).
+    if (namespace.startsWith("_")) return false;
+    return !this.profile.known_namespaces.includes(namespace);
+  }
+
   recordNamespaceAccess(namespace: string): boolean {
     // Skip internal namespaces — these are Sanctuary's own storage
     if (namespace.startsWith("_")) return false;
@@ -151,6 +160,11 @@ export class BaselineTracker {
    * Record a counterparty DID interaction.
    * @returns true if this is a new counterparty (not in baseline)
    */
+  isNewCounterparty(did: string): boolean {
+    // Non-mutating mirror of recordCounterparty (see isNewNamespace).
+    return !this.profile.known_counterparties.includes(did);
+  }
+
   recordCounterparty(did: string): boolean {
     const isNew = !this.profile.known_counterparties.includes(did);
     if (isNew) {
@@ -203,6 +217,14 @@ export class BaselineTracker {
 
   /** Get a read-only view of the current profile */
   getProfile(): SessionProfile {
-    return { ...this.profile };
+    // Snapshot the arrays, not just the top-level object. Callers (e.g. the
+    // gate's anomaly context) capture these; if they held the live references,
+    // a later recordNamespaceAccess/recordCounterparty (now deferred to the
+    // post-approval commit) would mutate an already-captured/hashed payload.
+    return {
+      ...this.profile,
+      known_namespaces: [...this.profile.known_namespaces],
+      known_counterparties: [...this.profile.known_counterparties],
+    };
   }
 }

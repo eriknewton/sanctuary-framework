@@ -199,7 +199,7 @@ export class ApprovalGate {
             return this.requestApproval(operation, 2, `Proxy: ${anomaly.reason}`, {
               ...anomaly.context,
               proxy: true,
-            });
+            }, anomaly.commit);
           }
         }
 
@@ -236,7 +236,7 @@ export class ApprovalGate {
     // ── Tier 2: Behavioral anomaly detection ──────────────────────────
     const anomaly = this.detectAnomaly(operation, args);
     if (anomaly) {
-      return this.requestApproval(operation, 2, anomaly.reason, anomaly.context);
+      return this.requestApproval(operation, 2, anomaly.reason, anomaly.context, anomaly.commit);
     }
 
     // ── Tier 3: Allow with audit logging (only for explicitly listed operations)
@@ -289,7 +289,7 @@ export class ApprovalGate {
   private detectAnomaly(
     operation: string,
     args: Record<string, unknown>
-  ): { reason: string; context: Record<string, unknown> } | null {
+  ): { reason: string; context: Record<string, unknown>; commit?: () => void } | null {
     const config = this.policy.tier2_anomaly;
 
     // ── First session check ───────────────────────────────────────────
@@ -306,18 +306,22 @@ export class ApprovalGate {
     // ── New namespace access ──────────────────────────────────────────
     if (config.new_namespace_access === "approve") {
       const namespace = args.namespace as string | undefined;
-      if (namespace) {
-        const isNew = this.baseline.recordNamespaceAccess(namespace);
-        if (isNew) {
-          return {
-            reason: `First access to namespace "${namespace}" (not in session baseline)`,
-            context: {
-              operation,
-              namespace,
-              known_namespaces: this.baseline.getProfile().known_namespaces,
-            },
-          };
-        }
+      if (namespace && this.baseline.isNewNamespace(namespace)) {
+        // Non-mutating check: do NOT record yet. The namespace is committed to
+        // the baseline only if the operator APPROVES (see requestApproval's
+        // onApprove). A denied probe must not poison the baseline and suppress
+        // future anomaly detection for this namespace.
+        return {
+          reason: `First access to namespace "${namespace}" (not in session baseline)`,
+          context: {
+            operation,
+            namespace,
+            known_namespaces: this.baseline.getProfile().known_namespaces,
+          },
+          commit: () => {
+            this.baseline.recordNamespaceAccess(namespace);
+          },
+        };
       }
     } else if (config.new_namespace_access === "log") {
       const namespace = args.namespace as string | undefined;
@@ -330,18 +334,20 @@ export class ApprovalGate {
     if (config.new_counterparty === "approve") {
       const counterpartyDid =
         (args.counterparty_did as string) ?? (args.agent_identity_id as string);
-      if (counterpartyDid) {
-        const isNew = this.baseline.recordCounterparty(counterpartyDid);
-        if (isNew) {
-          return {
-            reason: `First interaction with counterparty "${counterpartyDid}"`,
-            context: {
-              operation,
-              counterparty_did: counterpartyDid,
-              known_counterparties: this.baseline.getProfile().known_counterparties,
-            },
-          };
-        }
+      if (counterpartyDid && this.baseline.isNewCounterparty(counterpartyDid)) {
+        // Non-mutating check; commit the counterparty only on approval (see the
+        // namespace branch) so a denied probe cannot poison the baseline.
+        return {
+          reason: `First interaction with counterparty "${counterpartyDid}"`,
+          context: {
+            operation,
+            counterparty_did: counterpartyDid,
+            known_counterparties: this.baseline.getProfile().known_counterparties,
+          },
+          commit: () => {
+            this.baseline.recordCounterparty(counterpartyDid);
+          },
+        };
       }
     } else if (config.new_counterparty === "log") {
       const counterpartyDid = args.counterparty_did as string;
@@ -419,7 +425,8 @@ export class ApprovalGate {
     operation: string,
     tier: 1 | 2,
     reason: string,
-    context: Record<string, unknown>
+    context: Record<string, unknown>,
+    onApprove?: () => void
   ): Promise<GateResult> {
     const requestTimestamp = new Date().toISOString();
     const request: ApprovalRequest = {
@@ -536,6 +543,18 @@ export class ApprovalGate {
         });
       } catch {
         // swallow
+      }
+    }
+
+    // Commit deferred baseline state ONLY on approval. detectAnomaly computes
+    // "is new" without mutating; the namespace/counterparty is recorded here so
+    // a DENIED approval cannot poison the baseline and suppress future anomaly
+    // detection. Wrapped so a baseline error can never alter the gate verdict.
+    if (response.decision === "approve" && onApprove) {
+      try {
+        onApprove();
+      } catch {
+        // Baseline commit is best-effort; never let it change the gate result.
       }
     }
 

@@ -161,13 +161,13 @@ describe("Gate Integration — Prompt Injection Defense", () => {
   // ── Tier 3: Normal operations allowed ──────────────────────────────────
 
   it("allows normal state_read on known namespace (Tier 3)", async () => {
-    // Establish the namespace first
-    await gate.evaluate("state_read", {
-      namespace: "my-data",
-      key: "key-1",
-    });
+    // Establish the namespace as already-known in the baseline. Note: this must
+    // be a genuine baseline entry, NOT a prior denied probe — a denied probe no
+    // longer poisons the baseline (that is the anomaly-poisoning fix). This
+    // channel denies, so a first access would correctly stay flagged.
+    baseline.recordNamespaceAccess("my-data");
 
-    // Subsequent reads on the same namespace should be allowed
+    // Reads on the known namespace are allowed (Tier 3).
     const result = await gate.evaluate("state_read", {
       namespace: "my-data",
       key: "key-2",
