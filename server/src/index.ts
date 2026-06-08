@@ -1109,36 +1109,6 @@ export async function createSanctuaryServer(options?: {
     policy,
   });
 
-  // 16c. Dashboard open tool — generates a pre-authenticated URL
-  const dashboardTools: ToolDefinition[] = [];
-  if (dashboard) {
-    dashboardTools.push({
-      name: "dashboard_open",
-      description:
-        "Generate a one-click URL to open the Principal Dashboard in a browser. " +
-        "Returns a pre-authenticated link — no manual token entry needed.",
-      inputSchema: {
-        type: "object",
-        properties: {},
-      },
-      handler: async () => {
-        const url = dashboard!.createSessionUrl();
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                dashboard_url: url,
-                base_url: dashboard!.getBaseUrl(),
-                note: "Click the dashboard_url to open the Principal Dashboard. The session is pre-authenticated.",
-              }, null, 2),
-            },
-          ],
-        };
-      },
-    });
-  }
-
   // 16b. ERC-8004 Identity Registry operator UX (Key 17 PR 3)
   const erc8004PolicyGate = new DefaultPolicyGate({
     global_default: "operator_approval_required",
@@ -1173,7 +1143,6 @@ export async function createSanctuaryServer(options?: {
     ...contextGateTools,
     ...hardeningTools,
     ...profileTools,
-    ...dashboardTools,
     ...sanctuaryMetaTools,
     ...memoryAttestTools,
     ...complianceTools,
@@ -1358,7 +1327,6 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   "context_gate_enforcer_configure",
   "context_gate_filter",
   "context_gate_set_policy",
-  "dashboard_open",
   "disclosure_evaluate",
   "disclosure_set_policy",
   "federation_trust_evaluate",

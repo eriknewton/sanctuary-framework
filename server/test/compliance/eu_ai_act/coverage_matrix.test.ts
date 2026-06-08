@@ -254,7 +254,6 @@ describe("EU AI Act coverage matrix v1", () => {
       "context_gate_list_policies",
       "context_gate_recommend",
       "context_gate_set_policy",
-      "dashboard_open",
       "disclosure_evaluate",
       "disclosure_set_policy",
       "exec_attest",
