@@ -12,7 +12,7 @@ import { FilesystemStorage } from "./storage/filesystem.js";
 import type { StorageBackend } from "./storage/interface.js";
 import { StateStore } from "./l1-cognitive/state-store.js";
 import { createL1Tools } from "./l1-cognitive/tools.js";
-import { AuditLog } from "./l2-operational/audit-log.js";
+import { AuditLog, type AuditEntry } from "./l2-operational/audit-log.js";
 import { createL3Tools } from "./l3-disclosure/tools.js";
 import { createL4Tools } from "./l4-reputation/tools.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
@@ -105,6 +105,44 @@ import {
 import { SubstrateSelector } from "./intelligence/selector.js";
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
+
+const AUDIT_AGENT_REDACTED = "[redacted]";
+const AUDIT_AGENT_REDACT_DETAIL_KEYS = new Set([
+  "decided_by",
+  "operatorId",
+  "operator_id",
+  "resolved_by",
+  "policy_rule_id",
+  "policy_match",
+  "policy_decision",
+  "policy_tier",
+  "tier",
+]);
+
+function redactAuditValueForAgent(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactAuditValueForAgent(item));
+  }
+  if (value && typeof value === "object") {
+    const redacted: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      redacted[key] = AUDIT_AGENT_REDACT_DETAIL_KEYS.has(key)
+        ? AUDIT_AGENT_REDACTED
+        : redactAuditValueForAgent(nested);
+    }
+    return redacted;
+  }
+  return value;
+}
+
+function redactAuditEntryForAgent(entry: AuditEntry): AuditEntry {
+  return {
+    ...entry,
+    details: entry.details
+      ? (redactAuditValueForAgent(entry.details) as Record<string, unknown>)
+      : undefined,
+  };
+}
 
 export interface SanctuaryServer {
   server: Server;
@@ -451,7 +489,10 @@ export async function createSanctuaryServer(options?: {
           operation_type: args.operation_type as string | undefined,
           limit: (args.limit as number) ?? 50,
         });
-        return toolResult(result);
+        return toolResult({
+          ...result,
+          entries: result.entries.map((entry) => redactAuditEntryForAgent(entry)),
+        });
       },
     },
   ];

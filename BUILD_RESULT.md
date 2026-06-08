@@ -1,28 +1,32 @@
-# English-Policy Fix-Before-Mount Hardening
+# Build Result
 
-## What changed
+Date: 2026-06-08
+Branch: harden/cred-return-tier1
+Base verified: a9c1c6d8e9345d3b7b0b0ef610d119e66a8a77eb
 
-- Hardened English-policy activation lifecycle HTTP routes so activation, revocation, status, and conflict-review paths require an explicit operator bearer token instead of relying on loopback auto-auth.
-- Scoped the lifecycle operator credential check to `Authorization: Bearer` only. These routes now reject `?token=` URL credentials even when the token matches, while dashboard token behavior elsewhere remains unchanged.
-- Removed live policy and raw conflict data from activation lifecycle responses. The HTTP boundary now returns generic success/failure status plus an operator-facing audit reference.
-- Updated the policy CLI draft lifecycle commands to require `SANCTUARY_POLICY_API_TOKEN` and stop printing raw conflict objects from the server.
+## Audit Findings Verified
 
-## Tests
+- P1 `sovereignty_profile_get`: confirmed current main returned the full profile, including upstream transport and tier-policy fields. Fixed by returning an agent-facing profile summary that omits `transport.url`, `transport.env`, `default_tier`, and `tool_overrides`.
+- P2 `context_gate_set_policy` / `context_gate_apply_template`: confirmed current main classified them Tier 3 and returned live rules/default actions. Fixed by force-migrating both tools to Tier 1 and returning only policy IDs/metadata/rule counts from mutation handlers.
+- P3 `monitor_audit_log`: confirmed current main returned raw audit entries. Fixed by redacting operator handles and tier/policy metadata from agent-facing audit-log reads.
+- #413 invariants checked: `principal_policy_view`, `principal_baseline_view`, and `sanctuary_policy_status` remain forced Tier 1 and pruned from Tier 3.
 
-- `cd server && npm run typecheck` — passed.
-- `cd server && npm test` — passed: 5458 passed, 8 skipped, 5466 total.
-- Baseline floor: `.test-baseline` is 5423; passing count did not drop below baseline.
+## Verification
 
-## Focused coverage added/updated
+- `cd server && npm run typecheck`: passed
+- Focused regression tests:
+  - `test/sovereignty-profile-tools.test.ts`
+  - `test/l2/context-gate-tools.test.ts`
+  - `test/principal-policy/policy-loader.test.ts`
+  - `test/principal-policy/loader-required-keys.test.ts`
+  - `test/security/cred-return-hardening.test.ts`
+  - `test/system-prompt-generator-v2.test.ts`
+- `cd server && npm test`: passed
+  - Test files: 445 passed, 1 skipped
+  - Tests: 5465 passed, 8 skipped
+  - `.test-baseline`: 5423
 
-- `server/test/policy-engine/english-policy-activator.test.ts`
-  - Activation route refuses a non-operator caller before policy mutation.
-  - Activation route refuses `POST /api/policy/drafts/:id/activate?token=<operator-token>` when no bearer header is present.
-  - Activation, revocation, status, and conflict-review route responses do not return `updated_policy`, full records, or raw conflicts.
-  - Activation failures return generic `activation_refused` without detailed policy/conflict data.
-- `server/test/cli/singleton-audit-writes.test.ts`
-  - Existing activation failure audit test now supplies the required operator API token.
+## Notes
 
-## Assumptions
-
-- The operator-auth primitive for this latent `/api/policy` surface is the existing dashboard/console bearer token. For mutation lifecycle routes, this change intentionally fails closed when no bearer token is configured, even if loopback auto-auth is enabled.
+- No push or merge performed.
+- First full test run exposed two stale exact expectations in `loader-required-keys.test.ts`; those were updated to include the new forced Tier 1 operations before the passing full run.

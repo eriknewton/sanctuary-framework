@@ -54,6 +54,8 @@ approval_channel:
         "principal_policy_view",
         "principal_baseline_view",
         "sanctuary_policy_status",
+        "context_gate_set_policy",
+        "context_gate_apply_template",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("approve");
       expect(policy.tier2_anomaly.new_counterparty).toBe("log");
@@ -101,6 +103,28 @@ approval_channel:
       }
     });
 
+    it("migrates context-gate mutation tools out of Tier 3 on upgrade", () => {
+      const yaml = `
+version: 1
+tier1_always_approve:
+  - state_export
+tier3_always_allow:
+  - state_read
+  - context_gate_set_policy
+  - context_gate_apply_template
+approval_channel:
+  type: stderr
+`;
+      const policy = parsePolicy(yaml);
+      for (const op of [
+        "context_gate_set_policy",
+        "context_gate_apply_template",
+      ]) {
+        expect(policy.tier1_always_approve).toContain(op);
+        expect(policy.tier3_always_allow).not.toContain(op);
+      }
+    });
+
     it("handles comments in YAML", () => {
       const yaml = `
 version: 1 # policy version
@@ -119,6 +143,8 @@ approval_channel:
         "principal_policy_view",
         "principal_baseline_view",
         "sanctuary_policy_status",
+        "context_gate_set_policy",
+        "context_gate_apply_template",
       ]);
     });
 
@@ -139,6 +165,8 @@ approval_channel:
         "principal_policy_view",
         "principal_baseline_view",
         "sanctuary_policy_status",
+        "context_gate_set_policy",
+        "context_gate_apply_template",
       ]);
       // Tier 2 should have defaults
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(5);
@@ -172,6 +200,8 @@ approval_channel:
         "principal_policy_view",
         "principal_baseline_view",
         "sanctuary_policy_status",
+        "context_gate_set_policy",
+        "context_gate_apply_template",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("log");
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(8);
@@ -215,6 +245,18 @@ approval_channel:
       }
     });
 
+    it("classifies context-gate mutation tools as Tier 1, not Tier 3", () => {
+      const mutationTools = [
+        "context_gate_set_policy",
+        "context_gate_apply_template",
+      ];
+
+      for (const tool of mutationTools) {
+        expect(DEFAULT_POLICY.tier1_always_approve).toContain(tool);
+        expect(DEFAULT_POLICY.tier3_always_allow).not.toContain(tool);
+      }
+    });
+
     it("does not include auto_deny (SEC-002: hardcoded deny)", () => {
       // SEC-002: auto_deny is no longer in the default policy
       expect(DEFAULT_POLICY.approval_channel.auto_deny).toBeUndefined();
@@ -222,19 +264,21 @@ approval_channel:
   });
 
   describe("generated default policy YAML", () => {
-    it("places policy-read tools in Tier 1, not Tier 3", async () => {
+    it("places forced Tier 1 tools in Tier 1, not Tier 3", async () => {
       const dir = await mkdtemp(join(tmpdir(), "sanctuary-policy-loader-"));
       try {
         await loadPrincipalPolicy(dir);
         const yaml = await readFile(join(dir, "principal-policy.yaml"), "utf-8");
         const policy = parsePolicy(yaml);
-        const policyReadTools = [
+        const forcedTier1Tools = [
           "principal_policy_view",
           "principal_baseline_view",
           "sanctuary_policy_status",
+          "context_gate_set_policy",
+          "context_gate_apply_template",
         ];
 
-        for (const tool of policyReadTools) {
+        for (const tool of forcedTier1Tools) {
           expect(policy.tier1_always_approve).toContain(tool);
           expect(policy.tier3_always_allow).not.toContain(tool);
         }

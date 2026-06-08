@@ -109,6 +109,65 @@ describe("Sovereignty Profile Tools", () => {
       const data = parseToolResult(result);
       expect(data).toHaveProperty("message");
     });
+
+    it("redacts upstream transport credentials and tier policy from agent-facing profile", async () => {
+      const { profileStore, findTool } = await createTestContext();
+      await profileStore.update({
+        upstream_servers: [
+          {
+            name: "filesystem",
+            transport: {
+              type: "stdio",
+              command: "node",
+              args: ["server.js"],
+              env: { API_TOKEN: "secret-token" },
+            },
+            enabled: true,
+            default_tier: 2,
+            tool_overrides: { read_file: { tier: 3 } },
+          },
+          {
+            name: "remote",
+            transport: {
+              type: "sse",
+              url: "https://token@example.test/sse",
+            },
+            enabled: false,
+            default_tier: 1,
+          },
+        ],
+      });
+
+      const result = await findTool("sovereignty_profile_get").handler({});
+      const data = parseToolResult(result);
+      const text = result.content[0]!.text;
+      const profile = data.profile as {
+        upstream_servers: Array<Record<string, unknown>>;
+      };
+
+      expect(profile.upstream_servers).toEqual([
+        {
+          name: "filesystem",
+          enabled: true,
+          transport_type: "stdio",
+          privacy_policy_bound: false,
+          privacy_identity_bound: false,
+        },
+        {
+          name: "remote",
+          enabled: false,
+          transport_type: "sse",
+          privacy_policy_bound: false,
+          privacy_identity_bound: false,
+        },
+      ]);
+      expect(text).not.toContain("secret-token");
+      expect(text).not.toContain("https://token@example.test/sse");
+      expect(text).not.toContain("default_tier");
+      expect(text).not.toContain("tool_overrides");
+      expect(text).not.toContain("\"env\"");
+      expect(text).not.toContain("\"url\"");
+    });
   });
 
   // ── sovereignty_profile_update ────────────────────────────────────

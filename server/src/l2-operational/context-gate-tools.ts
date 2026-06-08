@@ -348,8 +348,7 @@ export function createContextGateTools(
         return toolResult({
           policy_id: policy.policy_id,
           policy_name: policy.policy_name,
-          rules: policy.rules,
-          default_action: policy.default_action,
+          rule_count: policy.rules.length,
           created_at: policy.created_at,
           message:
             "Context-gating policy created. Use context_gate_filter " +
@@ -418,8 +417,7 @@ export function createContextGateTools(
           policy_name: template.name,
           description: template.description,
           use_when: template.use_when,
-          rules: policy.rules,
-          default_action: policy.default_action,
+          rule_count: policy.rules.length,
           created_at: policy.created_at,
           message:
             "Template applied. Use context_gate_filter with this " +

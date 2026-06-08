@@ -95,6 +95,8 @@ approval_channel:
       "principal_policy_view",
       "principal_baseline_view",
       "sanctuary_policy_status",
+      "context_gate_set_policy",
+      "context_gate_apply_template",
     ]);
     expect(policy.approval_channel.type).toBe("stderr");
   });
@@ -111,6 +113,8 @@ approval_channel:
       "principal_policy_view",
       "principal_baseline_view",
       "sanctuary_policy_status",
+      "context_gate_set_policy",
+      "context_gate_apply_template",
     ]);
   });
 
