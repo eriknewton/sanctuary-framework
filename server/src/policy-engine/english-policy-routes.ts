@@ -27,7 +27,6 @@ import {
 } from "../console/auth-middleware.js";
 import {
   constantTimeEquals,
-  extractToken,
 } from "../dashboard/api.js";
 import {
   EnglishPolicyCompiler,
@@ -222,9 +221,11 @@ function requireOperatorCredential(
   authConfig: AuthConfig,
   req: IncomingMessage,
   res: ServerResponse,
-  url: URL,
 ): boolean {
-  const token = extractToken(req, url);
+  const header = req.headers.authorization;
+  const token = header?.startsWith("Bearer ")
+    ? header.slice(7).trim()
+    : null;
   if (
     authConfig.authToken === undefined ||
     token === null ||
@@ -325,7 +326,7 @@ export async function handleEnglishPolicyRoute(
 
     const statusMatch = matchStatusRoute(path);
     if (statusMatch && method === "GET") {
-      if (!requireOperatorCredential(deps.authConfig, req, res, url)) {
+      if (!requireOperatorCredential(deps.authConfig, req, res)) {
         return true;
       }
       if (!deps.activator) {
@@ -357,7 +358,7 @@ export async function handleEnglishPolicyRoute(
 
     const activateMatch = matchActivateRoute(path);
     if (activateMatch && method === "POST") {
-      if (!requireOperatorCredential(deps.authConfig, req, res, url)) {
+      if (!requireOperatorCredential(deps.authConfig, req, res)) {
         return true;
       }
       if (!deps.activator) {
@@ -449,7 +450,7 @@ export async function handleEnglishPolicyRoute(
 
     const checkConflictsMatch = matchCheckConflictsRoute(path);
     if (checkConflictsMatch && method === "POST") {
-      if (!requireOperatorCredential(deps.authConfig, req, res, url)) {
+      if (!requireOperatorCredential(deps.authConfig, req, res)) {
         return true;
       }
       if (!deps.activator) {
@@ -496,7 +497,7 @@ export async function handleEnglishPolicyRoute(
         return true;
       }
       if (method === "DELETE") {
-        if (!requireOperatorCredential(deps.authConfig, req, res, url)) {
+        if (!requireOperatorCredential(deps.authConfig, req, res)) {
           return true;
         }
         if (!deps.activator) {

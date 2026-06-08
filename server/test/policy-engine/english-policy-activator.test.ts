@@ -609,6 +609,36 @@ describe("Xi-2 - HTTP routes", () => {
     }
   });
 
+  it("POST /api/policy/drafts/:id/activate refuses query-token credentials without a bearer header", async () => {
+    const rig = makeActivatorRig();
+    const compiler = compilerFor(rig.auditLog);
+    const store = new EnglishPolicyDraftStore();
+    const draft = buildCompiled({
+      kind: "tier1_add_operation",
+      operation: "state_export",
+    });
+    store.put(draft);
+    const { base, close } = await makeServer({
+      compiler,
+      store,
+      activator: rig.activator,
+    });
+    try {
+      const res = await fetch(
+        `${base}${ENGLISH_POLICY_API_PREFIX}/drafts/${draft.draft_id}/activate?token=${encodeURIComponent(OPERATOR_TOKEN)}`,
+        { method: "POST" },
+      );
+      expect(res.status).toBe(403);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("operator_auth_required");
+      expect(rig.livePolicy.current.tier1_always_approve).not.toContain(
+        "state_export",
+      );
+    } finally {
+      await close();
+    }
+  });
+
   it("POST .../activate without override returns 409 on a low-confidence draft", async () => {
     const rig = makeActivatorRig();
     const compiler = compilerFor(rig.auditLog);
