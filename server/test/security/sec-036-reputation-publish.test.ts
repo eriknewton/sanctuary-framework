@@ -11,7 +11,21 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { createSanctuaryServer } from "../../src/index.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+
+async function listTools(server: Awaited<ReturnType<typeof createSanctuaryServer>>["server"]) {
+  const request = {
+    method: "tools/list" as const,
+    params: {},
+  };
+  const handler = (server as unknown as { _requestHandlers: Map<string, Function> })._requestHandlers.get(
+    "tools/list"
+  );
+  if (!handler) throw new Error("tools/list handler not registered");
+  return await handler(request, {});
+}
 
 describe("SEC-036/037/039: reputation_publish security", () => {
   // Phase D: reputation_publish was moved to Tier 3 (auto-allow with audit).
@@ -26,9 +40,20 @@ describe("SEC-036/037/039: reputation_publish security", () => {
     expect(DEFAULT_POLICY.tier1_always_approve).not.toContain("reputation_publish");
   });
 
-  // SEC-039: dashboard_open classification
-  it("dashboard_open is classified as Tier 3", () => {
-    expect(DEFAULT_POLICY.tier3_always_allow).toContain("dashboard_open");
+  // SEC-039 hardening: dashboard_open must not be agent-reachable.
+  it("dashboard_open is not classified as Tier 3", () => {
+    expect(DEFAULT_POLICY.tier3_always_allow).not.toContain("dashboard_open");
+  });
+
+  it("dashboard_open is not advertised in the agent MCP tool catalog", async () => {
+    const { server } = await createSanctuaryServer({
+      storage: new MemoryStorage(),
+      passphrase: "dashboard-open-regression",
+    });
+    const result = await listTools(server);
+    const names = (result.tools as Array<{ name: string }>).map((tool) => tool.name);
+
+    expect(names).not.toContain("dashboard_open");
   });
 
   // SEC-037: URL validation
