@@ -84,15 +84,20 @@ export function decodeExportBundleNamespaces(bundleBase64: string): string[] {
     namespaces?: unknown;
     data?: unknown;
   };
+  const actualNamespaces =
+    bundle.data && typeof bundle.data === "object" && !Array.isArray(bundle.data)
+      ? Object.keys(bundle.data).sort()
+      : [];
   if (Array.isArray(bundle.namespaces)) {
-    return bundle.namespaces
-      .filter((namespace): namespace is string => typeof namespace === "string")
-      .sort();
+    if (!bundle.namespaces.every((namespace) => typeof namespace === "string")) {
+      throw new Error("export bundle namespace metadata is invalid");
+    }
+    const declaredNamespaces = [...bundle.namespaces].sort();
+    if (declaredNamespaces.join("\0") !== actualNamespaces.join("\0")) {
+      throw new Error("export bundle namespace metadata does not match data");
+    }
   }
-  if (bundle.data && typeof bundle.data === "object" && !Array.isArray(bundle.data)) {
-    return Object.keys(bundle.data).sort();
-  }
-  return [];
+  return actualNamespaces;
 }
 
 export class LegacyEnvelopeWarning extends Error {
@@ -1315,6 +1320,7 @@ export class StateStore {
     const bundleBytes = fromBase64url(bundleBase64);
     const bundleJson = bytesToString(bundleBytes);
     const bundle = JSON.parse(bundleJson);
+    decodeExportBundleNamespaces(bundleBase64);
 
     let importedKeys = 0;
     let skippedKeys = 0;

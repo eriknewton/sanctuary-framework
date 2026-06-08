@@ -44,13 +44,19 @@ Phase 1 safety base only.
 ### Review Findings Closure: Phase 1 Ownership/Confused-Deputy Fixes
 
 - Closed the omitted-namespace `state_export` ownership hole:
-  - active sessions no longer enumerate every cached namespace
-  - active-session export is restricted to that session's owned opaque memory handle
-  - cross-owner cached `mem_*` handles cause a fixed denial before bundle creation
+  - active sessions derive the export target list from the actual cached exportable namespaces
+  - active-session export includes the session's owned opaque memory handle and its non-opaque/public namespaces
+  - known cross-owner cached `mem_*` handles are excluded from omitted-namespace export
+  - ambiguous opaque `mem_*` ownership fails closed before bundle creation
 - Closed the `state_import` pre-write ownership hole:
-  - import handlers decode bundle namespaces before writing
+  - import handlers derive target namespaces from actual bundle `data` entries before writing
+  - declared `bundle.namespaces` metadata must exactly match actual `bundle.data` namespaces when present
+  - mismatched declared-vs-actual bundle namespaces fail closed before any bundle entry is committed
   - importing into another session's opaque memory handle is denied before any bundle entry is committed
   - import audit details include the target namespaces
+- Closed the `state_export` approval binding gap:
+  - omitted-namespace export approval/preflight target resources now bind the actual exported namespace set
+  - router gate evaluation uses tool-supplied canonical approval target args while preserving the primitive handler args
 - Closed omitted-identity confused-deputy behavior:
   - `resolveIdentity(undefined)` resolves to the active session identity when a valid active session is bound
   - ambiguous/invalid active session bindings fail closed
@@ -59,7 +65,8 @@ Phase 1 safety base only.
   - moved router argument validation/normalization into `server/src/tool-args.ts`
   - router execution and `classifyApprovalRequest(...)` now use the same schema path
   - preflight strips approval metadata before hashing/classification, rejects unknown/missing/oversized args, and rejects malformed import bundles before target binding
-  - `state_import` target resources bind concrete bundle namespaces instead of only `state_import`
+  - `state_import` target resources bind actual bundle data namespaces instead of metadata-only or bare `state_import`
+  - `state_export` target resources bind actual omitted-export namespaces instead of bare `state_export`
 
 ## Tests Added
 
@@ -77,8 +84,10 @@ Coverage includes:
 - unbound session failure for opaque handles
 - indistinguishable absent/unowned denial fields
 - coarse `retry_after` values
-- omitted-namespace cross-agent export refusal
+- omitted-namespace export excludes other agents' opaque handles without dropping the active session's public namespaces
 - import into another session's opaque handle refusal before writing
+- mismatched declared-vs-actual import bundle namespaces are rejected before writing
+- omitted `state_export` approval target resources bind the actual exported namespace set
 - omitted identity write/sign resolves to the session identity, not default
 - ambiguous active session bindings fail closed for omitted identity write/sign
 - preflight validation rejects unknown, missing, oversized, and malformed bundle args through the shared execution schema path
@@ -88,7 +97,7 @@ Coverage includes:
 
 - `cd server && npm run typecheck`: passed.
 - `cd server && npm test`: passed.
-  - Test result: 5,465 passed, 8 skipped.
+  - Test result: 5,468 passed, 8 skipped.
   - `.test-baseline`: 5,423.
   - No transform or collection errors.
 

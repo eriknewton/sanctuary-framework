@@ -777,16 +777,21 @@ export function createL1Tools(
     if (!binding) return stateStore.listCachedExportableNamespaces();
     const active = resolveActiveSessionIdentity(binding);
     const namespaces = stateStore.listCachedExportableNamespaces();
-    const owned = namespaceRegistry.getHandleForIdentity(active.identity_id);
+    const exportable: string[] = [];
     for (const namespace of namespaces) {
-      if (
-        namespaceRegistry.isOpaqueMemoryHandle(namespace) &&
-        namespaceRegistry.getOwner(namespace) !== active.identity_id
-      ) {
-        throw new Error("namespace_unavailable");
+      if (!namespaceRegistry.isOpaqueMemoryHandle(namespace)) {
+        exportable.push(namespace);
+        continue;
+      }
+      const owner = namespaceRegistry.getOwner(namespace);
+      if (!owner) {
+        throw new Error("namespace_ownership_ambiguous");
+      }
+      if (owner === active.identity_id) {
+        exportable.push(namespace);
       }
     }
-    return owned && namespaces.includes(owned) ? [owned] : [];
+    return exportable.sort();
   }
 
   function assertIdentityMatchesSession(identityId: string | undefined, operation: string): void {
@@ -1368,7 +1373,12 @@ export function createL1Tools(
           format: { type: "string", default: "sanctuary-v1" },
         },
       },
+      approvalTargetArgs: (args) =>
+        typeof args.namespace === "string"
+          ? args
+          : { ...args, namespaces: sessionOwnedExportNamespaces() },
       handler: async (args) => {
+        let namespaces: string[] | undefined;
         if (typeof args.namespace === "string") {
           try {
             assertOpaqueNamespaceOwned(args.namespace);
@@ -1377,16 +1387,18 @@ export function createL1Tools(
           }
         } else if (options?.currentSessionBinding?.()) {
           try {
-            sessionOwnedExportNamespaces();
+            namespaces = sessionOwnedExportNamespaces();
           } catch {
             return denyNamespaceAccess("state_export", "state_export");
           }
+        } else {
+          namespaces = sessionOwnedExportNamespaces();
         }
 
         const result =
           typeof args.namespace === "string"
             ? await stateStore.export(args.namespace)
-            : await stateStore.exportNamespaces(sessionOwnedExportNamespaces());
+            : await stateStore.exportNamespaces(namespaces);
 
         await recordCriticalAudit(auditLog, "l1", "state_export", "principal", {
           namespaces: result.namespaces,
@@ -1411,6 +1423,10 @@ export function createL1Tools(
         },
         required: ["bundle"],
       },
+      approvalTargetArgs: (args) => ({
+        ...args,
+        namespaces: decodeExportBundleNamespaces(args.bundle as string),
+      }),
       handler: async (args) => {
         let targetNamespaces: string[];
         try {

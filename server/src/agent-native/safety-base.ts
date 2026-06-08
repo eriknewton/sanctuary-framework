@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 import type { ToolDefinition } from "../router.js";
-import { fromBase64url, bytesToString } from "../core/encoding.js";
+import { decodeExportBundleNamespaces } from "../l1-cognitive/state-store.js";
 import {
   normalizeToolArgsForValidation,
   ToolArgumentValidationError,
@@ -223,20 +223,7 @@ export function deriveTargetResource(
 }
 
 export function decodeStateBundleNamespaces(bundleBase64: string): string[] {
-  const bundleBytes = fromBase64url(bundleBase64);
-  const bundle = JSON.parse(bytesToString(bundleBytes)) as {
-    namespaces?: unknown;
-    data?: unknown;
-  };
-  if (Array.isArray(bundle.namespaces)) {
-    return bundle.namespaces
-      .filter((namespace): namespace is string => typeof namespace === "string")
-      .sort();
-  }
-  if (bundle.data && typeof bundle.data === "object" && !Array.isArray(bundle.data)) {
-    return Object.keys(bundle.data).sort();
-  }
-  return [];
+  return decodeExportBundleNamespaces(bundleBase64);
 }
 
 export async function classifyApprovalRequest(params: {
@@ -263,6 +250,11 @@ export async function classifyApprovalRequest(params: {
       throw new Error(FIXED_DENIAL_MESSAGE);
     }
     throw error;
+  }
+  try {
+    handlerArgs = tool.approvalTargetArgs?.(handlerArgs) ?? handlerArgs;
+  } catch {
+    throw new Error(FIXED_DENIAL_MESSAGE);
   }
   const active = resolveActiveSessionIdentity(params.session);
   const riskTier = params.classifyTier(params.operation, handlerArgs);

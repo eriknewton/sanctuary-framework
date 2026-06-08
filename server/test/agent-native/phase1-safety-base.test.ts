@@ -203,7 +203,7 @@ describe("agent-native Phase 1 safety base", () => {
     });
   });
 
-  it("refuses omitted-namespace export when another session owns cached opaque memory", async () => {
+  it("excludes another session's cached opaque memory from omitted-namespace export", async () => {
     const storage = new MemoryStorage();
     const masterKey = generateRandomKey();
     const auditLog = new AuditLog(storage, masterKey);
@@ -238,8 +238,8 @@ describe("agent-native Phase 1 safety base", () => {
 
     active = session(bobId);
     const result = await callTool(tools, "state_export", {});
-    expect(result.denied).toBe(true);
-    expect(result.message).toBe("This action is not available in the current context.");
+    expect(result.namespaces).not.toContain(aliceHandle);
+    expect(result.namespaces).toEqual([]);
   });
 
   it("refuses import into another session's opaque memory handle before writing", async () => {
@@ -296,6 +296,120 @@ describe("agent-native Phase 1 safety base", () => {
       key: "private",
     });
     expect(missing.denied).toBe(true);
+  });
+
+  it("rejects import bundles whose declared namespaces differ from data namespaces", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const stateStore = new StateStore(storage, masterKey);
+    const namespaceRegistry = new OpaqueNamespaceRegistry();
+    let active: SessionBinding | undefined;
+    const { tools, identityManager } = createL1Tools(
+      stateStore,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog,
+      {
+        namespaceRegistry,
+        currentSessionBinding: () => active,
+      }
+    );
+    await identityManager.load();
+    const alice = await callTool(tools, "identity_create", { label: "alice" });
+    const aliceId = alice.identity_id as string;
+    const aliceHandle = namespaceRegistry.issueMemoryHandle(aliceId);
+
+    active = session(aliceId);
+    await callTool(tools, "state_write", {
+      namespace: aliceHandle,
+      key: "private",
+      value: "alice-only",
+      identity_id: aliceId,
+    });
+    const exported = await callTool(tools, "state_export", {
+      namespace: aliceHandle,
+    });
+    const decoded = JSON.parse(
+      Buffer.from(exported.bundle as string, "base64url").toString("utf8")
+    ) as Record<string, unknown>;
+    decoded.namespaces = ["shared"];
+    const mismatchedBundle = Buffer.from(
+      JSON.stringify(decoded),
+      "utf8"
+    ).toString("base64url");
+
+    await callTool(tools, "state_delete", {
+      namespace: aliceHandle,
+      key: "private",
+    });
+    const imported = await callTool(tools, "state_import", {
+      bundle: mismatchedBundle,
+      conflict_resolution: "overwrite",
+    });
+    expect(imported.denied).toBe(true);
+
+    const missing = await callTool(tools, "state_read", {
+      namespace: aliceHandle,
+      key: "private",
+    });
+    expect(missing.denied).toBe(true);
+  });
+
+  it("exports all active-session owned namespaces while excluding other opaque handles", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const stateStore = new StateStore(storage, masterKey);
+    const namespaceRegistry = new OpaqueNamespaceRegistry();
+    let active: SessionBinding | undefined;
+    const { tools, identityManager } = createL1Tools(
+      stateStore,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog,
+      {
+        namespaceRegistry,
+        currentSessionBinding: () => active,
+      }
+    );
+    await identityManager.load();
+    const alice = await callTool(tools, "identity_create", { label: "alice" });
+    const bob = await callTool(tools, "identity_create", { label: "bob" });
+    const aliceId = alice.identity_id as string;
+    const bobId = bob.identity_id as string;
+    const aliceHandle = namespaceRegistry.issueMemoryHandle(aliceId);
+    const bobHandle = namespaceRegistry.issueMemoryHandle(bobId);
+
+    active = session(aliceId);
+    await callTool(tools, "state_write", {
+      namespace: aliceHandle,
+      key: "private",
+      value: "alice-only",
+      identity_id: aliceId,
+    });
+    await callTool(tools, "state_write", {
+      namespace: "shared",
+      key: "public",
+      value: "alice-shared",
+      identity_id: aliceId,
+    });
+
+    active = session(bobId);
+    await callTool(tools, "state_write", {
+      namespace: bobHandle,
+      key: "private",
+      value: "bob-only",
+      identity_id: bobId,
+    });
+
+    active = session(aliceId);
+    const exported = await callTool(tools, "state_export", {});
+    expect(exported.namespaces).toContain(aliceHandle);
+    expect(exported.namespaces).toContain("shared");
+    expect(exported.namespaces).not.toContain(bobHandle);
   });
 
   it("resolves omitted identity write and sign to the active session identity", async () => {
@@ -479,6 +593,56 @@ describe("agent-native Phase 1 safety base", () => {
       classifyTier: () => 1,
       auditLog,
     })).rejects.toThrow("This action is not available in the current context.");
+  });
+
+  it("binds omitted state_export approval targets to the actual exported namespaces", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const stateStore = new StateStore(storage, masterKey);
+    const namespaceRegistry = new OpaqueNamespaceRegistry();
+    let active: SessionBinding | undefined;
+    const { tools, identityManager } = createL1Tools(
+      stateStore,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog,
+      {
+        namespaceRegistry,
+        currentSessionBinding: () => active,
+      }
+    );
+    await identityManager.load();
+    const alice = await callTool(tools, "identity_create", { label: "alice" });
+    const aliceId = alice.identity_id as string;
+    const aliceHandle = namespaceRegistry.issueMemoryHandle(aliceId);
+
+    active = session(aliceId);
+    await callTool(tools, "state_write", {
+      namespace: aliceHandle,
+      key: "private",
+      value: "alice-only",
+      identity_id: aliceId,
+    });
+    await callTool(tools, "state_write", {
+      namespace: "shared",
+      key: "public",
+      value: "alice-shared",
+      identity_id: aliceId,
+    });
+
+    const preflight = await classifyApprovalRequest({
+      operation: "state_export",
+      args: {},
+      session: active,
+      tools,
+      classifyTier: () => 1,
+      auditLog,
+    });
+    expect(preflight.target_resource).toBe(
+      `state_export:${[aliceHandle, "shared"].sort().join(",")}`
+    );
   });
 
   it("uses only coarse retry_after values in fixed denials", () => {

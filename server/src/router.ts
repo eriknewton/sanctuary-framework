@@ -38,6 +38,7 @@ export interface ToolDefinition {
   description: string;
   tool_class?: "read" | "write";
   inputSchema: Record<string, unknown>;
+  approvalTargetArgs?: (args: Record<string, unknown>) => Record<string, unknown>;
   handler: ToolHandler;
 }
 
@@ -179,9 +180,24 @@ export function createServer(
     // If a gate is configured, every tool call must pass through it.
     // Denied calls return the fixed coarse schema; details stay in audit.
     if (gate) {
+      let gateArgs: Record<string, unknown>;
+      try {
+        gateArgs = tool.approvalTargetArgs?.(handlerArgs) ?? handlerArgs;
+      } catch {
+        const errorPayload = fixedDenial(`audit:gate:${name}`, "try_lower_scope", null);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(errorPayload),
+            },
+          ],
+          isError: true,
+        };
+      }
       const result = await gate.evaluate(
         name,
-        handlerArgs,
+        gateArgs,
         approvalRef ? { approval_ref: approvalRef } : undefined
       );
       if (!result.allowed) {
