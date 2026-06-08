@@ -150,9 +150,10 @@ describe("sanctuary meta-tools", () => {
       expect(Array.isArray(result.tier3)).toBe(true);
       expect((result.tier1 as string[])).toContain("state_export");
       expect((result.tier1 as string[])).toContain("sanctuary_bootstrap");
+      expect((result.tier1 as string[])).toContain("sanctuary_policy_status");
       expect((result.tier3 as string[])).toContain("state_read");
       expect((result.tier3 as string[])).toContain("reputation_publish");
-      expect((result.tier3 as string[])).toContain("sanctuary_policy_status");
+      expect((result.tier3 as string[])).not.toContain("sanctuary_policy_status");
       const counts = result.counts as { tier1: number; tier3: number };
       expect(counts.tier1).toBe((result.tier1 as string[]).length);
       expect(counts.tier3).toBe((result.tier3 as string[]).length);

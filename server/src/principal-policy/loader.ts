@@ -51,6 +51,25 @@ const DEFAULT_APPROVAL_REDIRECT: ApprovalRedirectConfig = {
 
 const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
 
+/**
+ * Operations that MUST always require approval (Tier 1) and must never sit in
+ * Tier 3, regardless of what an existing on-disk policy file says. validatePolicy
+ * force-adds these to merged Tier 1 and prunes them from merged Tier 3 so the
+ * invariant holds on upgrade, not just for freshly generated defaults.
+ *
+ * - identity_sign: raw arbitrary commitments require explicit operator approval.
+ * - principal_policy_view / principal_baseline_view / sanctuary_policy_status:
+ *   reading the Principal Policy or its baseline must never be a silent
+ *   agent-auto-allowed operation (no-read invariant; an agent that can read the
+ *   policy can plan to evade it).
+ */
+const FORCED_TIER1_OPERATIONS = [
+  RAW_IDENTITY_SIGN_OPERATION,
+  "principal_policy_view",
+  "principal_baseline_view",
+  "sanctuary_policy_status",
+] as const;
+
 /** Default Principal Policy — provides meaningful protection without configuration */
 export const DEFAULT_POLICY: PrincipalPolicy = {
   version: 1,
@@ -80,6 +99,9 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "policy_change", // Operator-driven policy bind on a wrapped agent.
     "lockdown", // Operator-driven hard-stop of a wrapped agent.
     "unwrap", // Operator-driven removal of the Sanctuary wrap from an agent.
+    "principal_policy_view", // Reads Principal Policy; always requires approval.
+    "principal_baseline_view", // Reads Principal Policy baseline; always requires approval.
+    "sanctuary_policy_status", // Reads Principal Policy status; always requires approval.
     // WP-MVP-2 Operator Console: federation-node-join requires explicit
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
@@ -104,8 +126,6 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "monitor_health",
     "monitor_audit_log",
     "manifest",
-    "principal_policy_view",
-    "principal_baseline_view",
     "shr_generate",
     "shr_verify",
     "handshake_initiate",
@@ -142,7 +162,6 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sovereignty_profile_generate_prompt", // Agent needs its own config to generate system prompt
     "governor_status",
     "reputation_publish", // Auto-allow: publishing sovereignty data to Verascore is routine
-    "sanctuary_policy_status", // Read-only policy summary
     "identity_set_primary", // One-time set, persists via _meta storage — safe at Tier 3
     "memory_attest", // Read-only audit attestation — records that a memory op happened
     "compliance_generate_eu_ai_act_bundle", // Read-only; emits signed compliance documents from existing state
@@ -274,14 +293,15 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
   // This ensures upgrades automatically include new read-only tools
   // without requiring operators to manually edit their policy file.
   const userTier3 = (raw.tier3_always_allow as string[]) ?? [];
+  const forcedTier1 = new Set<string>(FORCED_TIER1_OPERATIONS);
   const mergedTier3 = [
     ...new Set([...userTier3, ...DEFAULT_POLICY.tier3_always_allow]),
-  ].filter((op) => op !== RAW_IDENTITY_SIGN_OPERATION);
+  ].filter((op) => !forcedTier1.has(op));
 
   const mergedTier1 = [
     ...new Set([
       ...(raw.tier1_always_approve as string[]),
-      RAW_IDENTITY_SIGN_OPERATION,
+      ...FORCED_TIER1_OPERATIONS,
     ]),
   ];
 
@@ -381,6 +401,9 @@ tier1_always_approve:
   - policy_change
   - lockdown
   - unwrap
+  - principal_policy_view
+  - principal_baseline_view
+  - sanctuary_policy_status
 
 # ─── Tier 2: Behavioral Anomaly Detection ────────────────────────────────
 # Triggers approval when agent behavior deviates from its baseline.
@@ -413,8 +436,6 @@ tier3_always_allow:
   - monitor_health
   - monitor_audit_log
   - manifest
-  - principal_policy_view
-  - principal_baseline_view
   - shr_generate
   - shr_verify
   - handshake_initiate
@@ -448,7 +469,6 @@ tier3_always_allow:
   - sovereignty_profile_get
   - governor_status
   - reputation_publish
-  - sanctuary_policy_status
   - memory_attest
   - compliance_generate_eu_ai_act_bundle
   - compliance_eu_ai_act_annex_iii_classify

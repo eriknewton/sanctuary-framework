@@ -6,7 +6,7 @@
  *   sanctuary_export_identity_bundle → Tier 1 (always approve)
  *   sanctuary_link_to_human          → Tier 2 (anomaly-gated; NOT tier 3)
  *   sanctuary_sign_challenge         → Tier 2 (anomaly-gated; NOT tier 3)
- *   sanctuary_policy_status          → Tier 3 (auto-allow with audit)
+ *   sanctuary_policy_status          → Tier 1 (always approve)
  *
  * Tier 2 = "not in tier1, not in tier3". This test is the canonical
  * guard: if a future change flips link_to_human or sign_challenge into
@@ -46,8 +46,11 @@ describe("DELTA-17: principal policy tier alignment", () => {
     );
   });
 
-  it("sanctuary_policy_status is Tier 3", () => {
-    expect(DEFAULT_POLICY.tier3_always_allow).toContain(
+  it("sanctuary_policy_status is Tier 1", () => {
+    expect(DEFAULT_POLICY.tier1_always_approve).toContain(
+      "sanctuary_policy_status"
+    );
+    expect(DEFAULT_POLICY.tier3_always_allow).not.toContain(
       "sanctuary_policy_status"
     );
   });

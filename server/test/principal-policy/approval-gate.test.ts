@@ -36,7 +36,14 @@ class FailingAuditStorage extends MemoryStorage {
 function createTestPolicy(overrides?: Partial<PrincipalPolicy>): PrincipalPolicy {
   return {
     version: 1,
-    tier1_always_approve: ["state_export", "state_delete", "identity_rotate"],
+    tier1_always_approve: [
+      "state_export",
+      "state_delete",
+      "identity_rotate",
+      "principal_policy_view",
+      "principal_baseline_view",
+      "sanctuary_policy_status",
+    ],
     tier2_anomaly: {
       new_namespace_access: "approve",
       new_counterparty: "approve",
@@ -48,7 +55,7 @@ function createTestPolicy(overrides?: Partial<PrincipalPolicy>): PrincipalPolicy
     tier3_always_allow: [
       "state_read", "state_write", "state_list",
       "identity_create", "identity_list", "identity_sign", "identity_verify",
-      "monitor_health", "principal_policy_view", "principal_baseline_view",
+      "monitor_health",
     ],
     approval_channel: {
       type: "stderr",
@@ -135,6 +142,32 @@ describe("Approval Gate", () => {
       expect(result.approval_required).toBe(true);
       expect(approvals).toHaveLength(1);
       expect(approvals[0]!.operation).toBe("identity_sign");
+    });
+
+    it("requires approval for policy-read tools under the default policy", async () => {
+      const policyReadTools = [
+        "principal_policy_view",
+        "principal_baseline_view",
+        "sanctuary_policy_status",
+      ];
+
+      for (const tool of policyReadTools) {
+        expect(DEFAULT_POLICY.tier1_always_approve).toContain(tool);
+        expect(DEFAULT_POLICY.tier3_always_allow).not.toContain(tool);
+
+        const channel = new CallbackApprovalChannel(async () => ({
+          decision: "deny",
+          decided_at: new Date().toISOString(),
+          decided_by: "human",
+        }));
+        const gate = new ApprovalGate(DEFAULT_POLICY, baseline, channel, auditLog);
+
+        const result = await gate.evaluate(tool, {});
+
+        expect(result.tier).toBe(1);
+        expect(result.allowed).toBe(false);
+        expect(result.approval_required).toBe(true);
+      }
     });
   });
 
