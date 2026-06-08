@@ -1,0 +1,239 @@
+import { createHash, randomBytes } from "node:crypto";
+import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { ToolDefinition } from "../router.js";
+
+export type RiskTier = 1 | 2 | 3;
+export type RemediationClass = "request_review" | "try_lower_scope" | "wait";
+export type RetryAfterBucket = null | "later" | "minutes" | "hours";
+
+export interface FixedDenial {
+  denied: true;
+  message: "This action is not available in the current context.";
+  remediation_class: RemediationClass;
+  retry_after: RetryAfterBucket;
+  audit_ref: string;
+}
+
+export const FIXED_DENIAL_MESSAGE =
+  "This action is not available in the current context." as const;
+
+export function fixedDenial(
+  auditRef: string,
+  remediationClass: RemediationClass = "request_review",
+  retryAfter: RetryAfterBucket = null
+): FixedDenial {
+  return {
+    denied: true,
+    message: FIXED_DENIAL_MESSAGE,
+    remediation_class: remediationClass,
+    retry_after: retryAfter,
+    audit_ref: auditRef,
+  };
+}
+
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .filter((key) => record[key] !== undefined)
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(",")}}`;
+}
+
+export function sha256(value: string): `sha256:${string}` {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+export function normalizedArgsHash(args: Record<string, unknown>): `sha256:${string}` {
+  return sha256(canonicalJson(args));
+}
+
+export interface CanonicalApprovalEnvelope {
+  tool_name: string;
+  normalized_args_hash: `sha256:${string}`;
+  requester_identity_fingerprint: `sha256:${string}`;
+  target_resource: string;
+  risk_tier: RiskTier;
+  expires_at: string;
+  nonce: string;
+  audit_id: string;
+}
+
+export function approvalEnvelopeHash(
+  envelope: CanonicalApprovalEnvelope
+): `sha256:${string}` {
+  return sha256(canonicalJson(envelope));
+}
+
+export interface ApprovalRecord {
+  approval_ref: string;
+  envelope: CanonicalApprovalEnvelope;
+  envelope_hash: `sha256:${string}`;
+  decision: "approved" | "denied";
+  consumed: boolean;
+  created_at: string;
+}
+
+export class ApprovalProofStore {
+  private records = new Map<string, ApprovalRecord>();
+
+  createApproved(envelope: CanonicalApprovalEnvelope): ApprovalRecord {
+    const record: ApprovalRecord = {
+      approval_ref: `approval:${randomBytes(16).toString("hex")}`,
+      envelope,
+      envelope_hash: approvalEnvelopeHash(envelope),
+      decision: "approved",
+      consumed: false,
+      created_at: new Date().toISOString(),
+    };
+    this.records.set(record.approval_ref, record);
+    return record;
+  }
+
+  get(approvalRef: string): ApprovalRecord | undefined {
+    return this.records.get(approvalRef);
+  }
+
+  consumeIfUnconsumed(approvalRef: string): ApprovalRecord | null {
+    const record = this.records.get(approvalRef);
+    if (!record || record.consumed) return null;
+    record.consumed = true;
+    return record;
+  }
+}
+
+export interface SessionBinding {
+  identity_id?: string;
+  requester_identity_fingerprint?: `sha256:${string}`;
+  expires_at?: string;
+  delegated_scopes?: string[];
+}
+
+export interface ActiveSessionIdentity {
+  identity_id: string;
+  requester_identity_fingerprint: `sha256:${string}`;
+}
+
+export class SessionIdentityError extends Error {
+  constructor(message = FIXED_DENIAL_MESSAGE) {
+    super(message);
+    this.name = "SessionIdentityError";
+  }
+}
+
+export function fingerprintIdentityId(identityId: string): `sha256:${string}` {
+  return sha256(`identity:${identityId}`);
+}
+
+export function resolveActiveSessionIdentity(
+  binding: SessionBinding | undefined
+): ActiveSessionIdentity {
+  if (!binding?.identity_id || !binding.requester_identity_fingerprint) {
+    throw new SessionIdentityError();
+  }
+  if (binding.expires_at && Date.parse(binding.expires_at) <= Date.now()) {
+    throw new SessionIdentityError();
+  }
+  if (
+    binding.requester_identity_fingerprint !==
+    fingerprintIdentityId(binding.identity_id)
+  ) {
+    throw new SessionIdentityError();
+  }
+  return {
+    identity_id: binding.identity_id,
+    requester_identity_fingerprint: binding.requester_identity_fingerprint,
+  };
+}
+
+export class OpaqueNamespaceRegistry {
+  private handleToIdentity = new Map<string, string>();
+  private identityToHandle = new Map<string, string>();
+
+  issueMemoryHandle(identityId: string): string {
+    const existing = this.identityToHandle.get(identityId);
+    if (existing) return existing;
+    const handle = `mem_${randomBytes(16).toString("hex")}`;
+    this.identityToHandle.set(identityId, handle);
+    this.handleToIdentity.set(handle, identityId);
+    return handle;
+  }
+
+  isOpaqueMemoryHandle(namespace: string): boolean {
+    return namespace.startsWith("mem_");
+  }
+
+  assertOwned(namespace: string, binding: SessionBinding | undefined): void {
+    if (!this.isOpaqueMemoryHandle(namespace)) return;
+    const active = resolveActiveSessionIdentity(binding);
+    if (this.handleToIdentity.get(namespace) !== active.identity_id) {
+      throw new SessionIdentityError();
+    }
+  }
+}
+
+export interface ApprovalPreflightResult {
+  tool_name: string;
+  normalized_args_hash: `sha256:${string}`;
+  requester_identity_fingerprint: `sha256:${string}`;
+  target_resource: string;
+  risk_tier: RiskTier;
+  audit_id: string;
+}
+
+export function deriveTargetResource(
+  toolName: string,
+  args: Record<string, unknown>
+): string {
+  const namespace = typeof args.namespace === "string" ? args.namespace : "";
+  const key = typeof args.key === "string" ? args.key : "";
+  if (namespace && key) return `${toolName}:${namespace}/${key}`;
+  if (namespace) return `${toolName}:${namespace}`;
+  return toolName;
+}
+
+export async function classifyApprovalRequest(params: {
+  operation: string;
+  args: Record<string, unknown>;
+  session: SessionBinding | undefined;
+  tools: ToolDefinition[];
+  classifyTier: (toolName: string, args: Record<string, unknown>) => RiskTier;
+  auditLog: AuditLog;
+}): Promise<ApprovalPreflightResult> {
+  const tool = params.tools.find((t) => t.name === params.operation);
+  if (!tool) {
+    throw new Error(FIXED_DENIAL_MESSAGE);
+  }
+  const active = resolveActiveSessionIdentity(params.session);
+  const riskTier = params.classifyTier(params.operation, params.args);
+  const auditId = `audit:approval_request:${randomBytes(12).toString("hex")}`;
+  await params.auditLog.appendCritical({
+    layer: "l2",
+    operation: `approval_preflight:${params.operation}`,
+    identity_id: active.identity_id,
+    result: "success",
+    details: {
+      audit_id: auditId,
+      tool_name: params.operation,
+      normalized_args_hash: normalizedArgsHash(params.args),
+      target_resource: deriveTargetResource(params.operation, params.args),
+      risk_tier: riskTier,
+    },
+  });
+  return {
+    tool_name: params.operation,
+    normalized_args_hash: normalizedArgsHash(params.args),
+    requester_identity_fingerprint: active.requester_identity_fingerprint,
+    target_resource: deriveTargetResource(params.operation, params.args),
+    risk_tier: riskTier,
+    audit_id: auditId,
+  };
+}

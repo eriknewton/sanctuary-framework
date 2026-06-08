@@ -18,6 +18,7 @@ import { createRequire } from "node:module";
 import type { ApprovalGate } from "./principal-policy/gate.js";
 import type { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
 import type { AuditLog } from "./l2-operational/audit-log.js";
+import { fixedDenial, type SessionBinding } from "./agent-native/safety-base.js";
 
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
@@ -46,6 +47,8 @@ export interface ServerOptions {
   currentAgentId?: () => string | undefined;
   /** Audit log used to enforce MCP read/write behavior on broken chains. */
   auditLog?: AuditLog;
+  /** Active session identity binding for agent-native approval/namespace checks. */
+  currentSessionBinding?: () => SessionBinding | undefined;
 }
 
 // ── Schema Validation ──────────────────────────────────────────────────
@@ -279,12 +282,22 @@ export function createServer(
     // ── Schema Validation ────────────────────────────────────────────
     // Validate arguments against the tool's declared inputSchema.
     // This runs BEFORE the gate so that the gate sees normalized args.
+    const approvalRef =
+      typeof typedArgs.approval_ref === "string"
+        ? typedArgs.approval_ref
+        : undefined;
+    const handlerArgs = { ...typedArgs };
+    delete handlerArgs.approval_ref;
+
     const validationErrors = validateArgs(
       typedArgs,
       tool.inputSchema,
-      tool.tool_class === "write"
-        ? { accept_broken_chain: { type: "boolean", default: false } }
-        : {}
+      {
+        ...(tool.tool_class === "write"
+          ? { accept_broken_chain: { type: "boolean", default: false } }
+          : {}),
+        approval_ref: { type: "string" },
+      }
     );
     if (validationErrors.length > 0) {
       return {
@@ -304,26 +317,19 @@ export function createServer(
 
     // ── Approval Gate ──────────────────────────────────────────────
     // If a gate is configured, every tool call must pass through it.
-    // Denied calls return a generic error that does not reveal policy.
-    // When the block is approval-pending (Tier 1), the response carries
-    // a plain-English `operator_message` the agent's LLM can relay to
-    // the operator naturally. WP-V1.2 reshape: gives operators a second
-    // channel beyond the dashboard for noticing pending approvals.
+    // Denied calls return the fixed coarse schema; details stay in audit.
     if (gate) {
-      const result = await gate.evaluate(name, typedArgs);
+      const result = await gate.evaluate(
+        name,
+        handlerArgs,
+        approvalRef ? { approval_ref: approvalRef } : undefined
+      );
       if (!result.allowed) {
-        const errorPayload: {
-          error: string;
-          approval_required: boolean;
-          operator_message?: string;
-        } = {
-          error: "Operation not permitted",
-          approval_required: result.approval_required,
-        };
-        if (result.approval_required) {
-          errorPayload.operator_message =
-            "This action requires your operator's approval. Sanctuary has logged this request for your operator to review. You can pause and ask your operator to check Sanctuary, or retry in a few seconds.";
-        }
+        const errorPayload = fixedDenial(
+          `audit:gate:${name}`,
+          result.approval_required ? "request_review" : "try_lower_scope",
+          null
+        );
         return {
           content: [
             {
@@ -339,7 +345,7 @@ export function createServer(
     try {
       const findings = await options?.auditLog?.getIntegrityFindings();
       const hasIntegrityFindings = (findings?.length ?? 0) > 0;
-      const acceptBrokenChain = typedArgs.accept_broken_chain === true;
+      const acceptBrokenChain = handlerArgs.accept_broken_chain === true;
 
       if (tool.tool_class === "write" && hasIntegrityFindings && !acceptBrokenChain) {
         return {
@@ -371,7 +377,7 @@ export function createServer(
             },
           });
         }
-        return tool.handler(typedArgs);
+        return tool.handler(handlerArgs);
       };
 
       const shouldBypassAuditIntegrity =
@@ -383,7 +389,7 @@ export function createServer(
           : await runHandler();
       options?.toolCallTrapRuntime?.recordToolCall(
         name,
-        typedArgs,
+        handlerArgs,
         callerIdentity,
       );
       return result;
