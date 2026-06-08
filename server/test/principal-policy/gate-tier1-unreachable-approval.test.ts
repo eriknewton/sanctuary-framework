@@ -27,7 +27,14 @@ import { generateRandomKey } from "../../src/core/random.js";
 function createTestPolicy(): PrincipalPolicy {
   return {
     version: 1,
-    tier1_always_approve: ["state_export", "state_delete", "identity_rotate"],
+    tier1_always_approve: [
+      "state_export",
+      "state_delete",
+      "identity_rotate",
+      "principal_policy_view",
+      "principal_baseline_view",
+      "sanctuary_policy_status",
+    ],
     tier2_anomaly: {
       new_namespace_access: "approve",
       new_counterparty: "approve",
@@ -39,7 +46,7 @@ function createTestPolicy(): PrincipalPolicy {
     tier3_always_allow: [
       "state_read", "state_write", "state_list",
       "identity_create", "identity_list", "identity_sign", "identity_verify",
-      "monitor_health", "principal_policy_view", "principal_baseline_view",
+      "monitor_health",
     ],
     approval_channel: {
       type: "stderr",

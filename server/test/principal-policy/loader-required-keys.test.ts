@@ -92,6 +92,9 @@ approval_channel:
       "state_export",
       "state_import",
       "identity_sign",
+      "principal_policy_view",
+      "principal_baseline_view",
+      "sanctuary_policy_status",
     ]);
     expect(policy.approval_channel.type).toBe("stderr");
   });
@@ -103,7 +106,12 @@ approval_channel:
       approval_channel: { type: "stderr" },
     });
     const policy = parsePolicy(json);
-    expect(policy.tier1_always_approve).toEqual(["identity_sign"]);
+    expect(policy.tier1_always_approve).toEqual([
+      "identity_sign",
+      "principal_policy_view",
+      "principal_baseline_view",
+      "sanctuary_policy_status",
+    ]);
   });
 
   it("accepts empty approval_channel object", () => {

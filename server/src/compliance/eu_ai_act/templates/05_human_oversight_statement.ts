@@ -58,9 +58,12 @@ interruption requires additional controls outside Sanctuary.
 
 The full Principal Policy is machine-readable via
 \`principal_policy_view\`. The baseline tracker state is exposed via
-\`principal_baseline_view\`. Both tools are Tier 3 (read-only) and
-can be invoked by an auditor against a live Sanctuary instance to
-independently verify every value above.
+\`principal_baseline_view\`. Both tools are read-only and classified
+Tier 1 (always require out-of-band operator approval): the agent
+cannot read the policy or its baseline without an explicit human
+approval, so an auditor invokes them through the approval channel
+against a live Sanctuary instance to independently verify every
+value above.
 
 ---
 
