@@ -77,6 +77,24 @@ export class StateVerificationError extends Error {
   }
 }
 
+export function decodeExportBundleNamespaces(bundleBase64: string): string[] {
+  const bundleBytes = fromBase64url(bundleBase64);
+  const bundleJson = bytesToString(bundleBytes);
+  const bundle = JSON.parse(bundleJson) as {
+    namespaces?: unknown;
+    data?: unknown;
+  };
+  if (Array.isArray(bundle.namespaces)) {
+    return bundle.namespaces
+      .filter((namespace): namespace is string => typeof namespace === "string")
+      .sort();
+  }
+  if (bundle.data && typeof bundle.data === "object" && !Array.isArray(bundle.data)) {
+    return Object.keys(bundle.data).sort();
+  }
+  return [];
+}
+
 export class LegacyEnvelopeWarning extends Error {
   readonly classification = "legacy_schema_1";
 
@@ -1197,6 +1215,26 @@ export class StateStore {
     bundle_hash: string;
     exported_at: string;
   }> {
+    return this.exportNamespaces(
+      namespace === undefined ? undefined : [namespace]
+    );
+  }
+
+  listCachedExportableNamespaces(): string[] {
+    return [...this.contentHashes.keys()]
+      .filter((namespace) => !namespace.startsWith("_"))
+      .sort();
+  }
+
+  async exportNamespaces(
+    requestedNamespaces?: string[]
+  ): Promise<{
+    bundle: string;
+    namespaces: string[];
+    total_keys: number;
+    bundle_hash: string;
+    exported_at: string;
+  }> {
     const namespacesToExport: string[] = [];
 
     // F6: never export internal `_`-prefixed namespaces — import() rejects them
@@ -1204,16 +1242,15 @@ export class StateStore {
     // export must not expose. Filter HERE (not mid-loop) so the serialized
     // `namespaces` metadata and `data` stay consistent: the bundle never lists a
     // namespace it does not actually contain.
-    if (namespace) {
-      if (!namespace.startsWith("_")) {
-        namespacesToExport.push(namespace);
+    if (requestedNamespaces) {
+      for (const namespace of requestedNamespaces) {
+        if (!namespace.startsWith("_") && !namespacesToExport.includes(namespace)) {
+          namespacesToExport.push(namespace);
+        }
       }
     } else {
       // Discover all namespaces from the content hash cache
-      for (const ns of this.contentHashes.keys()) {
-        if (ns.startsWith("_")) continue;
-        namespacesToExport.push(ns);
-      }
+      namespacesToExport.push(...this.listCachedExportableNamespaces());
     }
 
     const exportData: Record<

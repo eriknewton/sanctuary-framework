@@ -1,6 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 import type { ToolDefinition } from "../router.js";
+import { fromBase64url, bytesToString } from "../core/encoding.js";
+import {
+  normalizeToolArgsForValidation,
+  ToolArgumentValidationError,
+} from "../tool-args.js";
 
 export type RiskTier = 1 | 2 | 3;
 export type RemediationClass = "request_review" | "try_lower_scope" | "wait";
@@ -171,6 +176,14 @@ export class OpaqueNamespaceRegistry {
     return namespace.startsWith("mem_");
   }
 
+  getOwner(namespace: string): string | undefined {
+    return this.handleToIdentity.get(namespace);
+  }
+
+  getHandleForIdentity(identityId: string): string | undefined {
+    return this.identityToHandle.get(identityId);
+  }
+
   assertOwned(namespace: string, binding: SessionBinding | undefined): void {
     if (!this.isOpaqueMemoryHandle(namespace)) return;
     const active = resolveActiveSessionIdentity(binding);
@@ -195,9 +208,35 @@ export function deriveTargetResource(
 ): string {
   const namespace = typeof args.namespace === "string" ? args.namespace : "";
   const key = typeof args.key === "string" ? args.key : "";
+  const bundleNamespaces =
+    toolName === "state_import" && typeof args.bundle === "string"
+      ? decodeStateBundleNamespaces(args.bundle)
+      : [];
+  const namespaces =
+    Array.isArray(args.namespaces) && args.namespaces.every((ns) => typeof ns === "string")
+      ? [...args.namespaces].sort()
+      : bundleNamespaces;
   if (namespace && key) return `${toolName}:${namespace}/${key}`;
   if (namespace) return `${toolName}:${namespace}`;
+  if (namespaces.length > 0) return `${toolName}:${namespaces.join(",")}`;
   return toolName;
+}
+
+export function decodeStateBundleNamespaces(bundleBase64: string): string[] {
+  const bundleBytes = fromBase64url(bundleBase64);
+  const bundle = JSON.parse(bytesToString(bundleBytes)) as {
+    namespaces?: unknown;
+    data?: unknown;
+  };
+  if (Array.isArray(bundle.namespaces)) {
+    return bundle.namespaces
+      .filter((namespace): namespace is string => typeof namespace === "string")
+      .sort();
+  }
+  if (bundle.data && typeof bundle.data === "object" && !Array.isArray(bundle.data)) {
+    return Object.keys(bundle.data).sort();
+  }
+  return [];
 }
 
 export async function classifyApprovalRequest(params: {
@@ -212,9 +251,29 @@ export async function classifyApprovalRequest(params: {
   if (!tool) {
     throw new Error(FIXED_DENIAL_MESSAGE);
   }
+  let handlerArgs: Record<string, unknown>;
+  try {
+    ({ handlerArgs } = normalizeToolArgsForValidation({
+      args: params.args,
+      schema: tool.inputSchema,
+      toolClass: tool.tool_class,
+    }));
+  } catch (error) {
+    if (error instanceof ToolArgumentValidationError) {
+      throw new Error(FIXED_DENIAL_MESSAGE);
+    }
+    throw error;
+  }
   const active = resolveActiveSessionIdentity(params.session);
-  const riskTier = params.classifyTier(params.operation, params.args);
+  const riskTier = params.classifyTier(params.operation, handlerArgs);
   const auditId = `audit:approval_request:${randomBytes(12).toString("hex")}`;
+  const argsHash = normalizedArgsHash(handlerArgs);
+  let targetResource: string;
+  try {
+    targetResource = deriveTargetResource(params.operation, handlerArgs);
+  } catch {
+    throw new Error(FIXED_DENIAL_MESSAGE);
+  }
   await params.auditLog.appendCritical({
     layer: "l2",
     operation: `approval_preflight:${params.operation}`,
@@ -223,16 +282,16 @@ export async function classifyApprovalRequest(params: {
     details: {
       audit_id: auditId,
       tool_name: params.operation,
-      normalized_args_hash: normalizedArgsHash(params.args),
-      target_resource: deriveTargetResource(params.operation, params.args),
+      normalized_args_hash: argsHash,
+      target_resource: targetResource,
       risk_tier: riskTier,
     },
   });
   return {
     tool_name: params.operation,
-    normalized_args_hash: normalizedArgsHash(params.args),
+    normalized_args_hash: argsHash,
     requester_identity_fingerprint: active.requester_identity_fingerprint,
-    target_resource: deriveTargetResource(params.operation, params.args),
+    target_resource: targetResource,
     risk_tier: riskTier,
     audit_id: auditId,
   };

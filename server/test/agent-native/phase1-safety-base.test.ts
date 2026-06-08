@@ -111,7 +111,14 @@ describe("agent-native Phase 1 safety base", () => {
       {
         name: "state_delete",
         description: "delete",
-        inputSchema: { type: "object", properties: {} },
+        inputSchema: {
+          type: "object",
+          properties: {
+            namespace: { type: "string" },
+            key: { type: "string" },
+          },
+          required: ["namespace", "key"],
+        },
         handler: async () => {
           executed = true;
           return { content: [{ type: "text", text: "{}" }] };
@@ -194,6 +201,284 @@ describe("agent-native Phase 1 safety base", () => {
       remediation_class: replayedHandle.remediation_class,
       retry_after: replayedHandle.retry_after,
     });
+  });
+
+  it("refuses omitted-namespace export when another session owns cached opaque memory", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const stateStore = new StateStore(storage, masterKey);
+    const namespaceRegistry = new OpaqueNamespaceRegistry();
+    let active: SessionBinding | undefined;
+    const { tools, identityManager } = createL1Tools(
+      stateStore,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog,
+      {
+        namespaceRegistry,
+        currentSessionBinding: () => active,
+      }
+    );
+    await identityManager.load();
+    const alice = await callTool(tools, "identity_create", { label: "alice" });
+    const bob = await callTool(tools, "identity_create", { label: "bob" });
+    const aliceId = alice.identity_id as string;
+    const bobId = bob.identity_id as string;
+    const aliceHandle = namespaceRegistry.issueMemoryHandle(aliceId);
+
+    active = session(aliceId);
+    await callTool(tools, "state_write", {
+      namespace: aliceHandle,
+      key: "private",
+      value: "alice-only",
+      identity_id: aliceId,
+    });
+
+    active = session(bobId);
+    const result = await callTool(tools, "state_export", {});
+    expect(result.denied).toBe(true);
+    expect(result.message).toBe("This action is not available in the current context.");
+  });
+
+  it("refuses import into another session's opaque memory handle before writing", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const stateStore = new StateStore(storage, masterKey);
+    const namespaceRegistry = new OpaqueNamespaceRegistry();
+    let active: SessionBinding | undefined;
+    const { tools, identityManager } = createL1Tools(
+      stateStore,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog,
+      {
+        namespaceRegistry,
+        currentSessionBinding: () => active,
+      }
+    );
+    await identityManager.load();
+    const alice = await callTool(tools, "identity_create", { label: "alice" });
+    const bob = await callTool(tools, "identity_create", { label: "bob" });
+    const aliceId = alice.identity_id as string;
+    const bobId = bob.identity_id as string;
+    const aliceHandle = namespaceRegistry.issueMemoryHandle(aliceId);
+
+    active = session(aliceId);
+    await callTool(tools, "state_write", {
+      namespace: aliceHandle,
+      key: "private",
+      value: "alice-only",
+      identity_id: aliceId,
+    });
+    const exported = await callTool(tools, "state_export", {
+      namespace: aliceHandle,
+    });
+
+    await callTool(tools, "state_delete", {
+      namespace: aliceHandle,
+      key: "private",
+    });
+
+    active = session(bobId);
+    const imported = await callTool(tools, "state_import", {
+      bundle: exported.bundle,
+      conflict_resolution: "overwrite",
+    });
+    expect(imported.denied).toBe(true);
+
+    active = session(aliceId);
+    const missing = await callTool(tools, "state_read", {
+      namespace: aliceHandle,
+      key: "private",
+    });
+    expect(missing.denied).toBe(true);
+  });
+
+  it("resolves omitted identity write and sign to the active session identity", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const stateStore = new StateStore(storage, masterKey);
+    let active: SessionBinding | undefined;
+    const { tools, identityManager } = createL1Tools(
+      stateStore,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog,
+      { currentSessionBinding: () => active }
+    );
+    await identityManager.load();
+    const alice = await callTool(tools, "identity_create", { label: "alice-default" });
+    const bob = await callTool(tools, "identity_create", { label: "bob-session" });
+    const aliceId = alice.identity_id as string;
+    const bobId = bob.identity_id as string;
+
+    active = session(bobId);
+    await callTool(tools, "state_write", {
+      namespace: "shared",
+      key: "owner",
+      value: "bob",
+    });
+    const read = await callTool(tools, "state_read", {
+      namespace: "shared",
+      key: "owner",
+    });
+    expect(read.written_by).toBe(bobId);
+    expect(read.written_by).not.toBe(aliceId);
+
+    const signed = await callTool(tools, "identity_sign", {
+      payload: "hello",
+    });
+    expect(signed.public_key).toBe(bob.public_key);
+    expect(signed.public_key).not.toBe(alice.public_key);
+  });
+
+  it("fails closed on omitted identity write and sign when active binding is ambiguous", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const stateStore = new StateStore(storage, masterKey);
+    let active: SessionBinding | undefined;
+    const { tools, identityManager } = createL1Tools(
+      stateStore,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog,
+      { currentSessionBinding: () => active }
+    );
+    await identityManager.load();
+    const alice = await callTool(tools, "identity_create", { label: "alice" });
+    active = { identity_id: alice.identity_id as string };
+
+    const write = await callTool(tools, "state_write", {
+      namespace: "shared",
+      key: "owner",
+      value: "alice",
+    });
+    const signed = await callTool(tools, "identity_sign", {
+      payload: "hello",
+    });
+    expect(write.denied).toBe(true);
+    expect(signed.denied).toBe(true);
+  });
+
+  it("validates and canonicalizes approval preflight args through the execution schema path", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const active = session("agent-a");
+    const tools: ToolDefinition[] = [
+      {
+        name: "state_write",
+        description: "write",
+        tool_class: "write",
+        inputSchema: {
+          type: "object",
+          properties: {
+            namespace: { type: "string" },
+            key: { type: "string" },
+            value: { type: "string" },
+          },
+          required: ["namespace", "key", "value"],
+        },
+        handler: async () => ({ content: [{ type: "text", text: "{}" }] }),
+      },
+    ];
+    const classify = (toolName: string, args: Record<string, unknown>) => {
+      expect(toolName).toBe("state_write");
+      expect(args).toEqual({ namespace: "memory", key: "k", value: "v" });
+      return 3 as const;
+    };
+
+    const ok = await classifyApprovalRequest({
+      operation: "state_write",
+      args: {
+        namespace: "memory",
+        key: "k",
+        value: "v",
+        approval_ref: "approval:test",
+      },
+      session: active,
+      tools,
+      classifyTier: classify,
+      auditLog,
+    });
+    expect(ok.target_resource).toBe("state_write:memory/k");
+
+    await expect(classifyApprovalRequest({
+      operation: "state_write",
+      args: { namespace: "memory", key: "k", value: "v", extra: true },
+      session: active,
+      tools,
+      classifyTier: classify,
+      auditLog,
+    })).rejects.toThrow("This action is not available in the current context.");
+
+    await expect(classifyApprovalRequest({
+      operation: "state_write",
+      args: { namespace: "memory", key: "k" },
+      session: active,
+      tools,
+      classifyTier: classify,
+      auditLog,
+    })).rejects.toThrow("This action is not available in the current context.");
+
+    await expect(classifyApprovalRequest({
+      operation: "state_write",
+      args: { namespace: "memory", key: "k", value: "x".repeat(1_048_577) },
+      session: active,
+      tools,
+      classifyTier: classify,
+      auditLog,
+    })).rejects.toThrow("This action is not available in the current context.");
+
+    const importTools: ToolDefinition[] = [
+      {
+        name: "state_import",
+        description: "import",
+        tool_class: "write",
+        inputSchema: {
+          type: "object",
+          properties: {
+            bundle: { type: "string" },
+            conflict_resolution: {
+              type: "string",
+              enum: ["skip", "overwrite", "version"],
+            },
+          },
+          required: ["bundle"],
+        },
+        handler: async () => ({ content: [{ type: "text", text: "{}" }] }),
+      },
+    ];
+    const bundle = Buffer.from(JSON.stringify({
+      namespaces: ["mem_target"],
+      data: { mem_target: [] },
+    }), "utf8").toString("base64url");
+    const importPreflight = await classifyApprovalRequest({
+      operation: "state_import",
+      args: { bundle, conflict_resolution: "skip" },
+      session: active,
+      tools: importTools,
+      classifyTier: () => 1,
+      auditLog,
+    });
+    expect(importPreflight.target_resource).toBe("state_import:mem_target");
+
+    await expect(classifyApprovalRequest({
+      operation: "state_import",
+      args: { bundle: "not-json" },
+      session: active,
+      tools: importTools,
+      classifyTier: () => 1,
+      auditLog,
+    })).rejects.toThrow("This action is not available in the current context.");
   });
 
   it("uses only coarse retry_after values in fixed denials", () => {

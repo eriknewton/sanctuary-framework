@@ -19,6 +19,10 @@ import type { ApprovalGate } from "./principal-policy/gate.js";
 import type { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
 import type { AuditLog } from "./l2-operational/audit-log.js";
 import { fixedDenial, type SessionBinding } from "./agent-native/safety-base.js";
+import {
+  normalizeToolArgsForValidation,
+  ToolArgumentValidationError,
+} from "./tool-args.js";
 
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
@@ -49,142 +53,6 @@ export interface ServerOptions {
   auditLog?: AuditLog;
   /** Active session identity binding for agent-native approval/namespace checks. */
   currentSessionBinding?: () => SessionBinding | undefined;
-}
-
-// ── Schema Validation ──────────────────────────────────────────────────
-// Lightweight JSON Schema validation for tool arguments.
-// Enforces: required fields, type checks, unknown field rejection,
-// and size caps on string arguments (defense against DoS via oversized payloads).
-
-/** Maximum byte length for any single string argument (1 MB) */
-const MAX_STRING_BYTES = 1_048_576;
-
-/** Maximum byte length for base64 bundle arguments (5 MB) */
-const MAX_BUNDLE_BYTES = 5_242_880;
-
-/** Fields known to carry base64 bundles — get the larger size cap */
-const BUNDLE_FIELDS = new Set(["bundle"]);
-
-interface SchemaProperty {
-  type?: string;
-  properties?: Record<string, SchemaProperty>;
-  required?: string[];
-  items?: SchemaProperty;
-  enum?: unknown[];
-  default?: unknown;
-}
-
-interface ValidationError {
-  field: string;
-  message: string;
-}
-
-/**
- * Validate tool arguments against the tool's declared inputSchema.
- * Returns an array of validation errors (empty = valid).
- */
-function validateArgs(
-  args: Record<string, unknown>,
-  schema: Record<string, unknown>,
-  extraAllowedFields: Record<string, SchemaProperty> = {}
-): ValidationError[] {
-  const errors: ValidationError[] = [];
-  const properties = (schema.properties ?? {}) as Record<string, SchemaProperty>;
-  const required = (schema.required ?? []) as string[];
-
-  // Check required fields
-  for (const field of required) {
-    if (args[field] === undefined || args[field] === null) {
-      errors.push({ field, message: `Required field "${field}" is missing` });
-    }
-  }
-
-  // Check for unknown fields (reject extra fields not in schema)
-  const knownFields = new Set([
-    ...Object.keys(properties),
-    ...Object.keys(extraAllowedFields),
-  ]);
-  for (const field of Object.keys(args)) {
-    if (!knownFields.has(field)) {
-      errors.push({ field, message: `Unknown field "${field}"` });
-    }
-  }
-
-  // Type-check and size-check each provided field
-  for (const [field, value] of Object.entries(args)) {
-    if (value === undefined || value === null) continue;
-    const propSchema = properties[field] ?? extraAllowedFields[field];
-    if (!propSchema) continue; // Already flagged as unknown above
-
-    const typeError = checkType(field, value, propSchema);
-    if (typeError) {
-      errors.push(typeError);
-      continue;
-    }
-
-    // String size caps
-    if (typeof value === "string") {
-      const maxBytes = BUNDLE_FIELDS.has(field) ? MAX_BUNDLE_BYTES : MAX_STRING_BYTES;
-      // Use byte length, not string length, for accurate size checking
-      const byteLength = new TextEncoder().encode(value).length;
-      if (byteLength > maxBytes) {
-        errors.push({
-          field,
-          message: `Field "${field}" exceeds maximum size (${byteLength} bytes > ${maxBytes} bytes)`,
-        });
-      }
-    }
-
-    // Enum validation
-    if (propSchema.enum && !propSchema.enum.includes(value)) {
-      errors.push({
-        field,
-        message: `Field "${field}" must be one of: ${propSchema.enum.join(", ")}`,
-      });
-    }
-  }
-
-  return errors;
-}
-
-/**
- * Check whether a value matches the declared JSON Schema type.
- */
-function checkType(
-  field: string,
-  value: unknown,
-  schema: SchemaProperty
-): ValidationError | null {
-  if (!schema.type) return null;
-
-  switch (schema.type) {
-    case "string":
-      if (typeof value !== "string") {
-        return { field, message: `Expected string for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "number":
-      if (typeof value !== "number") {
-        return { field, message: `Expected number for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "boolean":
-      if (typeof value !== "boolean") {
-        return { field, message: `Expected boolean for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "object":
-      if (typeof value !== "object" || Array.isArray(value)) {
-        return { field, message: `Expected object for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "array":
-      if (!Array.isArray(value)) {
-        return { field, message: `Expected array for "${field}", got ${typeof value}` };
-      }
-      break;
-  }
-  return null;
 }
 
 export function assertToolClasses(tools: readonly ToolDefinition[]): void {
@@ -282,24 +150,16 @@ export function createServer(
     // ── Schema Validation ────────────────────────────────────────────
     // Validate arguments against the tool's declared inputSchema.
     // This runs BEFORE the gate so that the gate sees normalized args.
-    const approvalRef =
-      typeof typedArgs.approval_ref === "string"
-        ? typedArgs.approval_ref
-        : undefined;
-    const handlerArgs = { ...typedArgs };
-    delete handlerArgs.approval_ref;
-
-    const validationErrors = validateArgs(
-      typedArgs,
-      tool.inputSchema,
-      {
-        ...(tool.tool_class === "write"
-          ? { accept_broken_chain: { type: "boolean", default: false } }
-          : {}),
-        approval_ref: { type: "string" },
-      }
-    );
-    if (validationErrors.length > 0) {
+    let approvalRef: string | undefined;
+    let handlerArgs: Record<string, unknown>;
+    try {
+      ({ approvalRef, handlerArgs } = normalizeToolArgsForValidation({
+        args: typedArgs,
+        schema: tool.inputSchema,
+        toolClass: tool.tool_class,
+      }));
+    } catch (error) {
+      if (!(error instanceof ToolArgumentValidationError)) throw error;
       return {
         content: [
           {
@@ -307,7 +167,7 @@ export function createServer(
             text: JSON.stringify({
               error: "validation_failed",
               message: "Tool arguments failed schema validation",
-              violations: validationErrors,
+              violations: error.violations,
             }),
           },
         ],

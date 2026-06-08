@@ -41,6 +41,26 @@ Phase 1 safety base only.
   - scoped `state_export`
 - Made absent/unowned opaque namespace read denials share the same fixed message, remediation class, and coarse retry behavior.
 
+### Review Findings Closure: Phase 1 Ownership/Confused-Deputy Fixes
+
+- Closed the omitted-namespace `state_export` ownership hole:
+  - active sessions no longer enumerate every cached namespace
+  - active-session export is restricted to that session's owned opaque memory handle
+  - cross-owner cached `mem_*` handles cause a fixed denial before bundle creation
+- Closed the `state_import` pre-write ownership hole:
+  - import handlers decode bundle namespaces before writing
+  - importing into another session's opaque memory handle is denied before any bundle entry is committed
+  - import audit details include the target namespaces
+- Closed omitted-identity confused-deputy behavior:
+  - `resolveIdentity(undefined)` resolves to the active session identity when a valid active session is bound
+  - ambiguous/invalid active session bindings fail closed
+  - `state_write` and `identity_sign` no longer fall through to the global default identity under an active session
+- Closed approval preflight validation drift:
+  - moved router argument validation/normalization into `server/src/tool-args.ts`
+  - router execution and `classifyApprovalRequest(...)` now use the same schema path
+  - preflight strips approval metadata before hashing/classification, rejects unknown/missing/oversized args, and rejects malformed import bundles before target binding
+  - `state_import` target resources bind concrete bundle namespaces instead of only `state_import`
+
 ## Tests Added
 
 Added `server/test/agent-native/phase1-safety-base.test.ts`.
@@ -57,16 +77,22 @@ Coverage includes:
 - unbound session failure for opaque handles
 - indistinguishable absent/unowned denial fields
 - coarse `retry_after` values
+- omitted-namespace cross-agent export refusal
+- import into another session's opaque handle refusal before writing
+- omitted identity write/sign resolves to the session identity, not default
+- ambiguous active session bindings fail closed for omitted identity write/sign
+- preflight validation rejects unknown, missing, oversized, and malformed bundle args through the shared execution schema path
+- import preflight target resources bind decoded bundle namespaces
 
 ## Gates
 
 - `cd server && npm run typecheck`: passed.
 - `cd server && npm test`: passed.
-  - Test result: 5,460 passed, 8 skipped.
+  - Test result: 5,465 passed, 8 skipped.
   - `.test-baseline`: 5,423.
   - No transform or collection errors.
 
-Note: the first focused Vitest run hit sandbox `EPERM` writing Vite temp config under `server/node_modules/.vite-temp`; reruns used the approved test execution path. One full-suite run exposed a misplaced namespace check inside `identity_sign`; that was fixed, the affected tests passed, and the final full suite passed cleanly.
+Note: focused Vitest runs hit sandbox `EPERM` writing Vite temp config under `server/node_modules/.vite-temp`; reruns used the approved test execution path. The final full suite passed cleanly after the review-finding fixes.
 
 ## Semantic Interpretations
 
