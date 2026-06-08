@@ -26,12 +26,16 @@ import {
   type AuthConfig,
 } from "../console/auth-middleware.js";
 import {
+  constantTimeEquals,
+} from "../dashboard/api.js";
+import {
   EnglishPolicyCompiler,
   type CompiledPolicy,
   type EnglishPolicyDraft,
 } from "./english-policy-compiler.js";
 import type { EnglishPolicyActivator } from "./english-policy-activator.js";
 import type { PolicyConflict } from "./conflict-detector.js";
+import { ENGLISH_POLICY_ACTIVATION_AUDIT_OPS } from "./english-policy-activator.js";
 
 export const ENGLISH_POLICY_API_PREFIX = "/api/policy";
 
@@ -172,6 +176,67 @@ async function readOptionalJSONBody<T = Record<string, unknown>>(
   return JSON.parse(body) as T;
 }
 
+function auditRef(operation: string, draftId: string): {
+  operation: string;
+  draft_id: string;
+} {
+  return { operation, draft_id: draftId };
+}
+
+function writeGenericActivationFailure(
+  res: ServerResponse,
+  status: number,
+  draftId: string,
+): void {
+  writeJSON(res, status, {
+    ok: false,
+    error: "activation_refused",
+    data: {
+      audit_ref: auditRef(
+        ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.ACTIVATION_REFUSED,
+        draftId,
+      ),
+    },
+  });
+}
+
+function writeGenericRevocationFailure(
+  res: ServerResponse,
+  status: number,
+  draftId: string,
+): void {
+  writeJSON(res, status, {
+    ok: false,
+    error: "revocation_refused",
+    data: {
+      audit_ref: auditRef(
+        ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.REVOKED,
+        draftId,
+      ),
+    },
+  });
+}
+
+function requireOperatorCredential(
+  authConfig: AuthConfig,
+  req: IncomingMessage,
+  res: ServerResponse,
+): boolean {
+  const header = req.headers.authorization;
+  const token = header?.startsWith("Bearer ")
+    ? header.slice(7).trim()
+    : null;
+  if (
+    authConfig.authToken === undefined ||
+    token === null ||
+    !constantTimeEquals(token, authConfig.authToken)
+  ) {
+    writeJSON(res, 403, { ok: false, error: "operator_auth_required" });
+    return false;
+  }
+  return true;
+}
+
 export async function handleEnglishPolicyRoute(
   deps: EnglishPolicyRouterDeps,
   req: IncomingMessage,
@@ -261,6 +326,9 @@ export async function handleEnglishPolicyRoute(
 
     const statusMatch = matchStatusRoute(path);
     if (statusMatch && method === "GET") {
+      if (!requireOperatorCredential(deps.authConfig, req, res)) {
+        return true;
+      }
       if (!deps.activator) {
         writeJSON(res, 503, {
           ok: false,
@@ -273,12 +341,26 @@ export async function handleEnglishPolicyRoute(
         writeJSON(res, 404, { ok: false, error: "not_found" });
         return true;
       }
-      writeJSON(res, 200, { ok: true, data: { record } });
+      writeJSON(res, 200, {
+        ok: true,
+        data: {
+          status: record.status,
+          audit_ref: auditRef(
+            record.status === "revoked"
+              ? ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.REVOKED
+              : ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.ACTIVATED,
+            statusMatch.draftId,
+          ),
+        },
+      });
       return true;
     }
 
     const activateMatch = matchActivateRoute(path);
     if (activateMatch && method === "POST") {
+      if (!requireOperatorCredential(deps.authConfig, req, res)) {
+        return true;
+      }
       if (!deps.activator) {
         writeJSON(res, 503, {
           ok: false,
@@ -302,14 +384,14 @@ export async function handleEnglishPolicyRoute(
         overrideRaw === "true" || overrideRaw === "1";
       let parsedBody: {
         conflicts_acknowledged?: PolicyConflict[];
+        acknowledge_conflicts?: boolean;
         force_conflict_ids?: string[];
         force_conflict?: string;
       };
       try {
         parsedBody = await readOptionalJSONBody(req);
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        writeJSON(res, 400, { ok: false, error: "invalid_json", detail });
+        writeJSON(res, 400, { ok: false, error: "invalid_json" });
         return true;
       }
       const forceQuery = url.searchParams.getAll("force_conflict");
@@ -322,11 +404,17 @@ export async function handleEnglishPolicyRoute(
           : []),
         ...forceQuery,
       ];
+      const conflictsForAcknowledgment =
+        parsedBody.acknowledge_conflicts === true
+          ? await deps.activator.checkConflicts(draft, operatorId)
+          : undefined;
       const outcome = await deps.activator.activate(draft, operatorId, {
         override_low_confidence: overrideLowConfidence,
-        conflicts_acknowledged: Array.isArray(parsedBody.conflicts_acknowledged)
-          ? parsedBody.conflicts_acknowledged
-          : undefined,
+        conflicts_acknowledged:
+          conflictsForAcknowledgment ??
+          (Array.isArray(parsedBody.conflicts_acknowledged)
+            ? parsedBody.conflicts_acknowledged
+            : undefined),
         force_conflict_ids: forceConflictIds,
       });
       if (!outcome.ok) {
@@ -344,21 +432,17 @@ export async function handleEnglishPolicyRoute(
                 : outcome.reason === "invalid_rule"
                   ? 400
                   : 500;
-        writeJSON(res, status, {
-          ok: false,
-          error: outcome.reason,
-          detail: outcome.message,
-          ...(outcome.conflicts !== undefined
-            ? { data: { conflicts: outcome.conflicts } }
-            : {}),
-        });
+        writeGenericActivationFailure(res, status, activateMatch.draftId);
         return true;
       }
       writeJSON(res, 200, {
         ok: true,
         data: {
-          record: outcome.record,
-          updated_policy: outcome.updated_policy,
+          status: outcome.record.status,
+          audit_ref: auditRef(
+            ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.ACTIVATED,
+            activateMatch.draftId,
+          ),
         },
       });
       return true;
@@ -366,6 +450,9 @@ export async function handleEnglishPolicyRoute(
 
     const checkConflictsMatch = matchCheckConflictsRoute(path);
     if (checkConflictsMatch && method === "POST") {
+      if (!requireOperatorCredential(deps.authConfig, req, res)) {
+        return true;
+      }
       if (!deps.activator) {
         writeJSON(res, 503, {
           ok: false,
@@ -384,8 +471,17 @@ export async function handleEnglishPolicyRoute(
       const operatorId =
         (req.headers["x-operator-identity"] as string | undefined) ??
         (deps.defaultOperatorId ?? "operator");
-      const conflicts = await deps.activator.checkConflicts(draft, operatorId);
-      writeJSON(res, 200, { ok: true, data: { conflicts } });
+      await deps.activator.checkConflicts(draft, operatorId);
+      writeJSON(res, 200, {
+        ok: true,
+        data: {
+          status: "review_recorded",
+          audit_ref: auditRef(
+            ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.CONFLICT_DETECTED,
+            checkConflictsMatch.draftId,
+          ),
+        },
+      });
       return true;
     }
 
@@ -401,6 +497,9 @@ export async function handleEnglishPolicyRoute(
         return true;
       }
       if (method === "DELETE") {
+        if (!requireOperatorCredential(deps.authConfig, req, res)) {
+          return true;
+        }
         if (!deps.activator) {
           writeJSON(res, 503, {
             ok: false,
@@ -422,18 +521,17 @@ export async function handleEnglishPolicyRoute(
               : outcome.reason === "not_activated"
                 ? 409
                 : 500;
-          writeJSON(res, status, {
-            ok: false,
-            error: outcome.reason,
-            detail: outcome.message,
-          });
+          writeGenericRevocationFailure(res, status, detailMatch.draftId);
           return true;
         }
         writeJSON(res, 200, {
           ok: true,
           data: {
-            record: outcome.record,
-            updated_policy: outcome.updated_policy,
+            status: outcome.record.status,
+            audit_ref: auditRef(
+              ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.REVOKED,
+              detailMatch.draftId,
+            ),
           },
         });
         return true;
@@ -443,8 +541,7 @@ export async function handleEnglishPolicyRoute(
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", detail });
+    writeJSON(res, 500, { ok: false, error: "internal" });
     return true;
   }
 }

@@ -47,7 +47,6 @@ import {
   EnglishPolicyCompiler,
   type CompiledPolicy,
 } from "../policy-engine/english-policy-compiler.js";
-import type { PolicyConflict } from "../policy-engine/conflict-detector.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { resolveStoragePath } from "../paths.js";
 import { loadConfig } from "../config.js";
@@ -142,7 +141,8 @@ function printUsage(s: NodeJS.WritableStream): void {
                                   Activate through /api/policy.
 
 Set SANCTUARY_POLICY_API_BASE or pass --api-base for drafts commands
-that talk to a running fortress.
+that talk to a running fortress. Mutation lifecycle commands also require
+SANCTUARY_POLICY_API_TOKEN.
 
 `);
 }
@@ -293,8 +293,10 @@ async function cmdDraftsCheckConflicts(
   }
   const base = resolveApiBase(parsed, ctx.err);
   if (!base) return 2;
-  const conflicts = await fetchConflicts(base, parsed.draftId);
-  ctx.out.write(formatConflicts(conflicts) + "\n");
+  const token = resolveApiToken(ctx.err);
+  if (!token) return 2;
+  const result = await fetchConflictReview(base, parsed.draftId, token);
+  ctx.out.write(`conflict review: ${result.status ?? "recorded"}\n`);
   return 0;
 }
 
@@ -309,25 +311,8 @@ async function cmdDraftsActivate(
   }
   const base = resolveApiBase(parsed, ctx.err);
   if (!base) return 2;
-
-  const conflicts = await fetchConflicts(base, parsed.draftId);
-  const hasHigh = conflicts.some((c) => c.severity === "high");
-  if (conflicts.length > 0 && !parsed.acknowledgeConflicts) {
-    ctx.err.write(formatConflicts(conflicts) + "\n");
-    ctx.err.write("activation refused: pass --acknowledge-conflicts to activate with conflicts\n");
-    return 1;
-  }
-  if (hasHigh) {
-    const forced = new Set(parsed.forceConflictIds);
-    const missing = conflicts.filter(
-      (c) => c.severity === "high" && !forced.has(c.conflict_id),
-    );
-    if (missing.length > 0) {
-      ctx.err.write(formatConflicts(conflicts) + "\n");
-      ctx.err.write("activation refused: high-severity conflicts require --force-conflict <conflict_id>\n");
-      return 1;
-    }
-  }
+  const token = resolveApiToken(ctx.err);
+  if (!token) return 2;
 
   // Audit BEFORE the HTTP call so a partial-failure (audit succeeds but
   // HTTP fails) still leaves a record of the intent.
@@ -357,7 +342,7 @@ async function cmdDraftsActivate(
     auditLog.append("l2", "policy.drafts.activate", auditIdentityId, {
       draft_id: parsed.draftId,
       api_base: base,
-      conflicts_count: conflicts.length,
+      acknowledge_conflicts: parsed.acknowledgeConflicts,
     });
   } catch { /* audit best-effort */ }
 
@@ -365,11 +350,12 @@ async function cmdDraftsActivate(
     `${base}/api/policy/drafts/${encodeURIComponent(parsed.draftId)}/activate`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({
-        conflicts_acknowledged: parsed.acknowledgeConflicts
-          ? conflicts
-          : undefined,
+        acknowledge_conflicts: parsed.acknowledgeConflicts,
         force_conflict_ids: parsed.forceConflictIds,
       }),
     },
@@ -441,35 +427,37 @@ function resolveApiBase(
   return raw.replace(/\/+$/, "");
 }
 
-async function fetchConflicts(
+function resolveApiToken(err: NodeJS.WritableStream): string | null {
+  const token = process.env["SANCTUARY_POLICY_API_TOKEN"];
+  if (!token) {
+    err.write("drafts command requires SANCTUARY_POLICY_API_TOKEN for operator authentication\n");
+    return null;
+  }
+  return token;
+}
+
+async function fetchConflictReview(
   base: string,
   draftId: string,
-): Promise<PolicyConflict[]> {
+  token: string,
+): Promise<{ status?: string }> {
   const res = await fetch(
     `${base}/api/policy/drafts/${encodeURIComponent(draftId)}/check-conflicts`,
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    },
   );
   const body = await res.json() as {
     ok: boolean;
     error?: string;
     detail?: string;
-    data?: { conflicts?: PolicyConflict[] };
+    data?: { status?: string };
   };
   if (!res.ok || !body.ok) {
     throw new Error(body.detail ?? body.error ?? `HTTP ${res.status}`);
   }
-  return body.data?.conflicts ?? [];
-}
-
-function formatConflicts(conflicts: PolicyConflict[]): string {
-  if (conflicts.length === 0) return "conflicts: none";
-  const lines = [`conflicts: ${conflicts.length}`];
-  for (const c of conflicts) {
-    lines.push(
-      `- ${c.conflict_id} [${c.severity}/${c.conflict_type}] ${c.affected_capability}: ${c.explanation}`,
-    );
-  }
-  return lines.join("\n");
+  return body.data ?? {};
 }
 
 export function formatCompiledHumanReadable(c: CompiledPolicy): string {
