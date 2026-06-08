@@ -191,6 +191,94 @@ describe("Approval Gate", () => {
       expect(result.approval_required).toBe(true);
     });
 
+    it("does NOT poison the baseline when a new-namespace probe is denied", async () => {
+      // Regression: a denied anomaly probe must not record the namespace, or a
+      // retry would be treated as "known" and skip approval (anomaly suppression).
+      const policy = createTestPolicy();
+      await baseline.save();
+      const baseline2 = new BaselineTracker(storage, masterKey);
+      await baseline2.load();
+
+      const denyChannel = new CallbackApprovalChannel(async () => ({
+        decision: "deny",
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      }));
+      const gate = new ApprovalGate(policy, baseline2, denyChannel, auditLog);
+
+      const first = await gate.evaluate("state_read", { namespace: "probe-ns" });
+      expect(first.tier).toBe(2);
+      expect(first.approval_required).toBe(true);
+      expect(first.allowed).toBe(false);
+
+      // Denied -> not committed to the baseline.
+      expect(baseline2.getProfile().known_namespaces).not.toContain("probe-ns");
+
+      // Retry is STILL flagged (not suppressed by the denied probe).
+      const second = await gate.evaluate("state_read", { namespace: "probe-ns" });
+      expect(second.tier).toBe(2);
+      expect(second.approval_required).toBe(true);
+      expect(second.allowed).toBe(false);
+    });
+
+    it("commits a new namespace to the baseline only after approval", async () => {
+      const policy = createTestPolicy();
+      await baseline.save();
+      const baseline2 = new BaselineTracker(storage, masterKey);
+      await baseline2.load();
+
+      const gate = new ApprovalGate(policy, baseline2, new AutoApproveChannel(), auditLog);
+
+      const first = await gate.evaluate("state_read", { namespace: "approved-ns" });
+      expect(first.tier).toBe(2);
+      expect(first.allowed).toBe(true);
+
+      // Approved -> now part of the baseline.
+      expect(baseline2.getProfile().known_namespaces).toContain("approved-ns");
+    });
+
+    it("does NOT poison the baseline when a new-counterparty probe is denied", async () => {
+      const policy = createTestPolicy();
+      await baseline.save();
+      const baseline2 = new BaselineTracker(storage, masterKey);
+      await baseline2.load();
+
+      const denyChannel = new CallbackApprovalChannel(async () => ({
+        decision: "deny",
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      }));
+      const gate = new ApprovalGate(policy, baseline2, denyChannel, auditLog);
+
+      const first = await gate.evaluate("reputation_record", {
+        counterparty_did: "did:sanctuary:probe",
+      });
+      expect(first.approval_required).toBe(true);
+      expect(first.allowed).toBe(false);
+      expect(baseline2.getProfile().known_counterparties).not.toContain("did:sanctuary:probe");
+
+      const second = await gate.evaluate("reputation_record", {
+        counterparty_did: "did:sanctuary:probe",
+      });
+      expect(second.tier).toBe(2);
+      expect(second.approval_required).toBe(true);
+    });
+
+    it("commits a new counterparty to the baseline only after approval", async () => {
+      const policy = createTestPolicy();
+      await baseline.save();
+      const baseline2 = new BaselineTracker(storage, masterKey);
+      await baseline2.load();
+
+      const gate = new ApprovalGate(policy, baseline2, new AutoApproveChannel(), auditLog);
+
+      const first = await gate.evaluate("reputation_record", {
+        counterparty_did: "did:sanctuary:approved",
+      });
+      expect(first.allowed).toBe(true);
+      expect(baseline2.getProfile().known_counterparties).toContain("did:sanctuary:approved");
+    });
+
     it("flags excessive signing", async () => {
       const policy = createTestPolicy();
       // Not first session
