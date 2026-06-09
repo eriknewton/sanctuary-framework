@@ -153,7 +153,7 @@ describe("SDW grammar and AAD vectors", () => {
     const keys = [
       catalogKey(),
       stateKey("task", "state-ABC123"),
-      queryKey("20260606T223104.123Z", "query-ABC123"),
+      queryKey("00000000000000000001", "query-ABC123"),
       documentKey("doc-ABC123"),
       documentChunkKey("doc-ABC123", "000001", "chunk-ABC123"),
       vectorKey("vec-ABC123"),

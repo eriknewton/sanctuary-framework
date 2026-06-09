@@ -2,7 +2,7 @@ import type { StorageBackend } from "../storage/interface.js";
 import { hashToString } from "../core/hashing.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { stringToBytes } from "../core/encoding.js";
-import { queryKey } from "./grammar.js";
+import { padQuerySequence, queryKey } from "./grammar.js";
 import type { SdwTransactional } from "./lmdb-backend.js";
 import {
   SDW_QUERY_HISTORY_HKDF_INFO,
@@ -68,7 +68,7 @@ export class SdwQueryHistoryStore {
     await transactional.sdwTransaction(async (txn) => {
       const head = await this.readChainHeadFromTxn(txn);
       const sequence = head.latest_sequence + 1;
-      const storageKey = queryStorageKey(event.occurred_at, event.query_id);
+      const storageKey = queryStorageKey(sequence, event.query_id);
       const withoutHash: Omit<SdwQueryHistoryRecord, "record_hash"> = {
         kind: "query_history",
         version: 1,
@@ -220,7 +220,7 @@ export class SdwQueryHistoryStore {
       let latestSequence = 0;
       for (const event of events) {
         latestSequence += 1;
-        const storageKey = queryStorageKey(event.occurred_at, event.query_id);
+        const storageKey = queryStorageKey(latestSequence, event.query_id);
         const withoutHash: Omit<SdwQueryHistoryRecord, "record_hash"> = {
           kind: "query_history",
           version: 1,
@@ -314,7 +314,7 @@ export class SdwQueryHistoryStore {
       fortressId: this.fortressId,
       encryptionKey: this.encryptionKey,
       expectedKind: "query_history",
-      verifyIdentity: (record) => storageKey === queryStorageKey(record.occurred_at, record.query_id),
+      verifyIdentity: (record) => storageKey === queryStorageKey(record.sequence, record.query_id),
     });
   }
 
@@ -334,12 +334,8 @@ export function chainHeadKey(fortressId: string): string {
   return `chain-head.${fortressId}`;
 }
 
-export function queryStorageKey(occurredAt: string, queryId: string): string {
-  return queryKey(normalizeQueryTimestamp(occurredAt), queryId);
-}
-
-export function normalizeQueryTimestamp(occurredAt: string): string {
-  return occurredAt.replace(/[-:]/g, "");
+export function queryStorageKey(sequence: number, queryId: string): string {
+  return queryKey(padQuerySequence(sequence), queryId);
 }
 
 export function queryRecordHash(record: Omit<SdwQueryHistoryRecord, "record_hash">): string {

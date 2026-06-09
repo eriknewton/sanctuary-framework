@@ -3,6 +3,8 @@ import { hash } from "../core/hashing.js";
 import { SdwValidationError } from "./errors.js";
 
 export const SDW_IDENTIFIER_PATTERN = /^[A-Za-z0-9._:@+-]{1,256}$/;
+export const QUERY_SEQUENCE_KEY_WIDTH = 20;
+const QUERY_SEQUENCE_KEY_PATTERN = /^\d{20}$/;
 
 export function assertSdwIdentifier(value: string, label: string): string {
   if (!isSdwIdentifier(value)) {
@@ -82,10 +84,26 @@ export function stateKey(scope: string, stateId: string): string {
   return `state.${scope}.${stateId}`;
 }
 
-export function queryKey(normalizedTimestamp: string, queryId: string): string {
-  assertSdwIdentifier(normalizedTimestamp, "normalized_timestamp");
+export function queryKey(paddedSequence: string, queryId: string): string {
+  assertQueryKeySequence(paddedSequence);
   assertSdwIdentifier(queryId, "query_id");
-  return `query.${normalizedTimestamp}.${queryId}`;
+  return `query.${paddedSequence}.${queryId}`;
+}
+
+export function padQuerySequence(sequence: number): string {
+  if (!Number.isSafeInteger(sequence) || sequence < 0) {
+    throw new SdwValidationError("invalid_identifier", "Invalid SDW identifier: query_sequence");
+  }
+  const padded = String(sequence).padStart(QUERY_SEQUENCE_KEY_WIDTH, "0");
+  assertQueryKeySequence(padded);
+  return padded;
+}
+
+function assertQueryKeySequence(paddedSequence: string): string {
+  if (!QUERY_SEQUENCE_KEY_PATTERN.test(paddedSequence)) {
+    throw new SdwValidationError("invalid_identifier", "Invalid SDW identifier: query_sequence");
+  }
+  return assertSdwIdentifier(paddedSequence, "query_sequence");
 }
 
 export function documentKey(documentId: string): string {

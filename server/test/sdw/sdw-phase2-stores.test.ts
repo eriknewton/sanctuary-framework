@@ -78,10 +78,10 @@ describe("SDW Phase 2 query-history store", () => {
     expect(firstRecord.sequence).toBe(1);
     expect(secondRecord.sequence).toBe(2);
     expect(secondRecord.previous_record_hash).toBe(firstRecord.record_hash);
-    expect(secondRecord.previous_query_key).toBe(queryStorageKey(first.occurred_at, first.query_id));
+    expect(secondRecord.previous_query_key).toBe(queryStorageKey(1, first.query_id));
     await expect(store.readChainHead()).resolves.toMatchObject({
       latest_sequence: 2,
-      latest_query_key: queryStorageKey(second.occurred_at, second.query_id),
+      latest_query_key: queryStorageKey(2, second.query_id),
     });
     await expect(readReplayAnchor(storage, MASTER_KEY)).resolves.toMatchObject({
       status: "valid",
@@ -109,28 +109,69 @@ describe("SDW Phase 2 query-history store", () => {
 
     await storage.rawEncryptedWrite(
       SDW_QUERY_HISTORY_NAMESPACE,
-      queryStorageKey(first.occurred_at, first.query_id),
+      queryStorageKey(1, first.query_id),
       { ...queryRecordFixture(first), sequence: 9, record_hash: "bad-hash" },
       SDW_QUERY_HISTORY_HKDF_INFO,
     );
     await expect(store.verifyChain()).resolves.toMatchObject({
-      tampered: [queryStorageKey(first.occurred_at, first.query_id)],
+      tampered: [queryStorageKey(1, first.query_id)],
     });
     await expect(store.reconcileFromAudit([first, second])).resolves.toEqual({
       rebuilt: 2,
-      tampered: [queryStorageKey(first.occurred_at, first.query_id)],
+      tampered: [queryStorageKey(1, first.query_id)],
     });
     await expect(store.verifyChain()).resolves.toMatchObject({ tampered: [] });
 
     const unsupported = { ...queryRecordFixture(auditEvent("audit-3", "query-3", "2026-06-08T00:00:02.000Z")), version: 2 };
     await storage.rawEncryptedWrite(
       SDW_QUERY_HISTORY_NAMESPACE,
-      queryStorageKey("2026-06-08T00:00:02.000Z", "query-3"),
+      queryStorageKey(3, "query-3"),
       unsupported,
       SDW_QUERY_HISTORY_HKDF_INFO,
     );
-    await expect(store.getByKey(queryStorageKey("2026-06-08T00:00:02.000Z", "query-3"))).rejects.toBeInstanceOf(UnsupportedRecordVersion);
+    await expect(store.getByKey(queryStorageKey(3, "query-3"))).rejects.toBeInstanceOf(UnsupportedRecordVersion);
     expect(await storage.exists(SDW_QUERY_HISTORY_NAMESPACE, chainHeadKey(FORTRESS_ID))).toBe(true);
+  });
+
+  it("blinds the plaintext query key timestamp while retaining timestamps in the encrypted body", async () => {
+    const storage = new TxMemoryStorage();
+    const store = new SdwQueryHistoryStore({ storage, masterKey: MASTER_KEY, fortressId: FORTRESS_ID });
+    const event = auditEvent("audit-1", "query-opaque", "2026-06-08T12:34:56.789Z");
+
+    await store.appendFromAudit(event);
+
+    const [entry] = await storage.list(SDW_QUERY_HISTORY_NAMESPACE, "query.");
+    expect(entry?.key).toMatch(/^query\.\d{20}\.query-opaque$/);
+    expect(entry?.key).toBe(queryStorageKey(1, event.query_id));
+    expect(entry?.key).not.toContain(event.occurred_at);
+    expect(entry?.key).not.toContain(event.occurred_at.replace(/[-:]/g, ""));
+    expect(entry?.key).not.toContain("T");
+    expect(entry?.key).not.toContain("Z");
+
+    const record = await store.getByKey(entry!.key);
+    expect(record).toMatchObject({
+      occurred_at: event.occurred_at,
+      created_at: event.occurred_at,
+    });
+  });
+
+  it("keeps append order equal to lexical query-key order", async () => {
+    const storage = new TxMemoryStorage();
+    const store = new SdwQueryHistoryStore({ storage, masterKey: MASTER_KEY, fortressId: FORTRESS_ID });
+    const events = [
+      auditEvent("audit-1", "query-1", "2026-06-08T00:00:03.000Z"),
+      auditEvent("audit-2", "query-2", "2026-06-08T00:00:01.000Z"),
+      auditEvent("audit-3", "query-3", "2026-06-08T00:00:02.000Z"),
+    ];
+
+    for (const event of events) await store.appendFromAudit(event);
+
+    const keys = (await storage.list(SDW_QUERY_HISTORY_NAMESPACE, "query.")).map((entry) => entry.key);
+    expect(keys).toEqual([
+      queryStorageKey(1, "query-1"),
+      queryStorageKey(2, "query-2"),
+      queryStorageKey(3, "query-3"),
+    ]);
   });
 
   it("fails closed when a replayed chain head regresses below the meta replay floor", async () => {
@@ -150,8 +191,8 @@ describe("SDW Phase 2 query-history store", () => {
     await store.appendFromAudit(events[5]!);
     await store.appendFromAudit(events[6]!);
     storage.rawWriteForTest(SDW_QUERY_HISTORY_NAMESPACE, chainHeadKey(FORTRESS_ID), capturedHead!);
-    await storage.delete(SDW_QUERY_HISTORY_NAMESPACE, queryStorageKey(events[5]!.occurred_at, events[5]!.query_id));
-    await storage.delete(SDW_QUERY_HISTORY_NAMESPACE, queryStorageKey(events[6]!.occurred_at, events[6]!.query_id));
+    await storage.delete(SDW_QUERY_HISTORY_NAMESPACE, queryStorageKey(6, events[5]!.query_id));
+    await storage.delete(SDW_QUERY_HISTORY_NAMESPACE, queryStorageKey(7, events[6]!.query_id));
 
     await expect(store.readChainHead()).rejects.toMatchObject({
       category: "replay_detected",
