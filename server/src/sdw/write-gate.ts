@@ -4,6 +4,7 @@ import { bytesToString, stringToBytes, toBase64url } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { hashToString, hmacSha256 } from "../core/hashing.js";
 import { sdwAad, assertSdwIdentifier } from "./grammar.js";
+import { assertTainted, type Tainted } from "./provenance.js";
 import {
   SDW_CATALOG_NAMESPACE,
   SDW_DOCUMENT_CORPUS_NAMESPACE,
@@ -35,6 +36,11 @@ export type Taint =
 
 export interface Untrusted<T extends SdwRecord> {
   readonly value: T;
+  /**
+   * Legacy caller-asserted entry for records whose origin is already statically
+   * clean. Crown-jewel material must enter through mintPersistableFromProvenance
+   * so the source-carried taint cannot be relabeled by the caller.
+   */
   readonly taint?: Taint;
 }
 
@@ -82,6 +88,21 @@ export function mintPersistable<T extends SdwRecord>(
     aad,
     taint: input.taint,
   };
+}
+
+export function mintPersistableFromProvenance<T extends SdwRecord>(
+  carrier: Tainted<T>,
+  namespace: SdwNamespace,
+  storageKey: string,
+  fortressId: string,
+): Persistable<T> {
+  assertTainted(carrier);
+  return mintPersistable(
+    { value: carrier.value, taint: carrier.taint },
+    namespace,
+    storageKey,
+    fortressId,
+  );
 }
 
 export async function sdwBackendWrite<T extends SdwRecord>(
@@ -458,20 +479,47 @@ function assertOneOf<T extends string>(
 }
 
 function classifyRecord(record: SdwRecord): void {
-  const text = collectText(record).join("\n");
+  const text = canonicalClassifierText(record);
   if (text.length === 0) return;
-  // This text scan is defense in depth only. The enforced persistence control is
-  // the structural taint allow-list plus persistable/raw-write authorization.
+  // This text scan is defense in depth only. The enforced persistence control for
+  // source-known crown jewels is provenance taint plus persistable/raw-write
+  // authorization; classifier hits still fail closed, but classifier passes are
+  // never a guarantee that arbitrary free text contains no secret.
+  const normalized = normalizeClassifierText(text);
+  // Split-marker reassembly must run over field VALUES ONLY. canonicalClassifierText
+  // interleaves key-path tokens between values, which would wedge between a "PRIVATE"
+  // in one field and a "KEY" in another and defeat the compact PRIVATEKEY match. The
+  // values-only compact reassembles a marker fragmented across non-adjacent fields.
+  const compact = collectClassifierValues(record).replace(/[^A-Za-z0-9]+/g, "");
   const probes: readonly RegExp[] = [
     /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/i,
+    /\bBEGIN [A-Z0-9 ]*PRIVATE KEY\b/i,
     /principal[_ -]?policy/i,
     /\brecovery[_ -]?key\b/i,
     /\bed25519\b.{0,80}\b(private|secret)\b/i,
     /\bSANCTUARY_RECOVERY_KEY\b/i,
   ];
-  if (probes.some((probe) => probe.test(text)) || containsEncodedEd25519Pkcs8PrivateKey(text)) {
+  if (
+    probes.some((probe) => probe.test(text) || probe.test(normalized)) ||
+    containsSplitPrivateKeyMarker(compact) ||
+    containsEncodedEd25519Pkcs8PrivateKey(text) ||
+    containsKnownSecretToken(text) ||
+    containsJwt(text) ||
+    containsUrlCredential(text) ||
+    containsKeywordGatedHighEntropySecret(text)
+  ) {
     throw new SdwValidationError("classifier_reject", "SDW classifier rejected sensitive material");
   }
+}
+
+function containsSplitPrivateKeyMarker(compactText: string): boolean {
+  const beginIndex = compactText.search(/BEGIN/i);
+  const privateKeyIndex = compactText.search(/PRIVATEKEY/i);
+  return (
+    beginIndex !== -1 &&
+    privateKeyIndex !== -1 &&
+    Math.abs(beginIndex - privateKeyIndex) <= 4096
+  );
 }
 
 function containsEncodedEd25519Pkcs8PrivateKey(text: string): boolean {
@@ -481,7 +529,36 @@ function containsEncodedEd25519Pkcs8PrivateKey(text: string): boolean {
   return compact.toLowerCase().includes(hexPrefix) || compact.includes(base64Prefix);
 }
 
-function collectText(value: SdwRecord): string[] {
+function canonicalClassifierText(value: SdwRecord): string {
+  const out: string[] = [];
+  const visit = (item: unknown, keyPath = ""): void => {
+    if (keyPath !== "") out.push(keyPath);
+    if (typeof item === "string") {
+      out.push(item);
+      return;
+    }
+    if (Array.isArray(item)) {
+      item.forEach((child, index) => visit(child, `${keyPath}[${index}]`));
+      return;
+    }
+    if (item !== null && typeof item === "object") {
+      const object = item as { readonly [key: string]: unknown };
+      for (const key of Object.keys(object).sort()) {
+        visit(object[key], keyPath === "" ? key : `${keyPath}.${key}`);
+      }
+    }
+  };
+  visit(value);
+  return out.join("\n");
+}
+
+function normalizeClassifierText(text: string): string {
+  return text.replace(/[^A-Za-z0-9_-]+/g, " ");
+}
+
+// Field string values only (no key-path tokens), in canonical sorted order. Used
+// by the split-marker reassembly so fragments in non-adjacent fields sit adjacent.
+function collectClassifierValues(value: SdwRecord): string {
   const out: string[] = [];
   const visit = (item: unknown): void => {
     if (typeof item === "string") {
@@ -494,11 +571,136 @@ function collectText(value: SdwRecord): string[] {
     }
     if (item !== null && typeof item === "object") {
       const object = item as { readonly [key: string]: unknown };
-      for (const key of Object.keys(object)) visit(object[key]);
+      for (const key of Object.keys(object).sort()) visit(object[key]);
     }
   };
   visit(value);
+  return out.join("");
+}
+
+function containsKnownSecretToken(text: string): boolean {
+  return (
+    containsGitHubToken(text) ||
+    /\b(?:sk|sk-ant|rk)_(?:live|test|proj)?_[A-Za-z0-9_-]{20,}\b/.test(text) ||
+    /\bsk-[A-Za-z0-9_-]{20,}\b/.test(text) ||
+    /\bAKIA[0-9A-Z]{16}\b/.test(text) ||
+    /\bASIA[0-9A-Z]{16}\b/.test(text) ||
+    /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/.test(text) ||
+    /\bAIza[0-9A-Za-z_-]{35}\b/.test(text) ||
+    /\bglpat-[0-9A-Za-z_-]{20,}\b/.test(text) ||
+    /\bnpm_[0-9A-Za-z]{36,}\b/.test(text) ||
+    /\b(?:stripe|slack|google|github|aws|npm)[_-]?(?:token|key|secret)\b/i.test(text) &&
+      /\b[A-Za-z0-9_-]{32,}\b/.test(text)
+  );
+}
+
+// Deliberate FP-control trade-off (documented in README "known false negatives"):
+// a gh*_/github_pat_ token is flagged only when its trailing CRC32-base62 checksum
+// validates. Malformed/legacy-format tokens may pass — this is defense-in-depth, not
+// the enforced boundary (provenance is). Tightening it belongs in consumer-integration.
+function containsGitHubToken(text: string): boolean {
+  const tokenPattern = /\b(?:gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{40,})\b/g;
+  for (const match of text.matchAll(tokenPattern)) {
+    const token = match[0];
+    if (hasValidGitHubChecksum(token)) return true;
+  }
+  return false;
+}
+
+function hasValidGitHubChecksum(token: string): boolean {
+  const body = token.slice(0, -6);
+  const checksum = token.slice(-6);
+  if (!/^[0-9A-Za-z]{6}$/.test(checksum) || body.length === 0) return false;
+  return base62Crc32(body).padStart(6, "0").slice(-6) === checksum;
+}
+
+function base62Crc32(value: string): string {
+  const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  let n = crc32(value);
+  if (n === 0) return "0";
+  let out = "";
+  while (n > 0) {
+    out = alphabet[n % 62] + out;
+    n = Math.floor(n / 62);
+  }
   return out;
+}
+
+function crc32(value: string): number {
+  let crc = 0xffffffff;
+  for (let index = 0; index < value.length; index += 1) {
+    crc ^= value.charCodeAt(index);
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function containsJwt(text: string): boolean {
+  const jwtPattern = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+  for (const match of text.matchAll(jwtPattern)) {
+    try {
+      const header = JSON.parse(Buffer.from(match[0].split(".")[0] ?? "", "base64url").toString("utf8")) as {
+        readonly alg?: unknown;
+        readonly typ?: unknown;
+      };
+      if (typeof header.alg === "string" && (header.typ === undefined || header.typ === "JWT")) return true;
+    } catch {
+      // Malformed JWT-shaped text is ignored by this heuristic.
+    }
+  }
+  return false;
+}
+
+function containsUrlCredential(text: string): boolean {
+  return /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]{1,128}:[^/\s:@]{8,128}@/i.test(text);
+}
+
+function containsKeywordGatedHighEntropySecret(text: string): boolean {
+  if (!/\b(?:api[_-]?key|access[_-]?key|auth|authorization|bearer|credential|password|private[_-]?key|secret|token)\b/i.test(text)) {
+    return false;
+  }
+  const candidates = [
+    ...text.matchAll(/\b[A-Fa-f0-9]{32,128}\b/g),
+    ...text.matchAll(/\b[A-Za-z0-9+/=]{32,128}\b/g),
+    ...text.matchAll(/\b[A-Za-z0-9_-]{32,128}\b/g),
+  ];
+  for (const match of candidates) {
+    const candidate = match[0];
+    if (isAllowedPlaceholder(candidate) || isKnownHashLength(candidate)) continue;
+    const threshold = /^[A-Fa-f0-9]+$/.test(candidate) ? 3.2 : 4.5;
+    if (shannonEntropy(candidate) >= threshold) return true;
+  }
+  return false;
+}
+
+function isAllowedPlaceholder(value: string): boolean {
+  return (
+    /^(?:x+|0+|1+|a+|A+|example|placeholder|redacted|dummy)$/i.test(value) ||
+    value === "AKIAIOSFODNN7EXAMPLE" ||
+    value.toLowerCase().includes("example") ||
+    value.toLowerCase().includes("redacted")
+  );
+}
+
+// Deliberate FP-control trade-off (documented in README "known false negatives"):
+// canonical hash lengths (md5/sha1/sha256 hex) are skipped by the entropy heuristic to
+// avoid flagging content hashes/ids that legitimately appear in records. A secret that
+// is exactly a hash length may pass even with a nearby keyword. Defense-in-depth only.
+function isKnownHashLength(value: string): boolean {
+  return /^[A-Fa-f0-9]+$/.test(value) && (value.length === 32 || value.length === 40 || value.length === 64);
+}
+
+function shannonEntropy(value: string): number {
+  const counts = new Map<string, number>();
+  for (const char of value) counts.set(char, (counts.get(char) ?? 0) + 1);
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const probability = count / value.length;
+    entropy -= probability * Math.log2(probability);
+  }
+  return entropy;
 }
 
 export function encryptedEnvelopeContains(raw: Uint8Array, forbidden: string): boolean {
