@@ -1,22 +1,28 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import type { StorageBackend } from "../storage/interface.js";
 import { encrypt } from "../core/encryption.js";
-import { bytesToString, stringToBytes } from "../core/encoding.js";
+import { bytesToString, stringToBytes, toBase64url } from "../core/encoding.js";
+import { derivePurposeKey } from "../core/key-derivation.js";
+import { hmacSha256 } from "../core/hashing.js";
 import { sdwAad, assertSdwIdentifier } from "./grammar.js";
 import {
   SDW_CATALOG_NAMESPACE,
   SDW_DOCUMENT_CORPUS_NAMESPACE,
   SDW_META_NAMESPACE,
+  SDW_REPLAY_ANCHOR_KEY,
   SDW_QUERY_HISTORY_NAMESPACE,
   SDW_VECTOR_MEMORY_NAMESPACE,
   SDW_WORKING_STATE_NAMESPACE,
   type SdwNamespace,
+  type SdwReplayAnchorData,
   type SdwRecord,
 } from "./records.js";
 import { SdwValidationError } from "./errors.js";
 
 const PERSISTABLE_BRAND: unique symbol = Symbol("sanctuary.sdw.persistable");
 const MAX_RECORD_BYTES = 1024 * 1024;
+const SDW_REPLAY_MAC_DOMAIN = "sanctuary.sdw-replay-anchor-mac.v1\n";
+const SDW_REPLAY_MAC_MARKER = "__sanctuary_sdw_replay_anchor_mac_v1";
+const SDW_REPLAY_MAC_INFO = "sdw-replay-anchor-mac";
 
 export type Taint =
   | "user_content"
@@ -47,7 +53,12 @@ interface PreparedSdwWrite {
   readonly data: Uint8Array;
 }
 
-const sdwWriteAuthority = new AsyncLocalStorage<boolean>();
+interface AuthorizedSdwPayload {
+  readonly namespace: SdwNamespace;
+  readonly storageKey: string;
+}
+
+const authorizedSdwPayloads = new WeakMap<Uint8Array, AuthorizedSdwPayload>();
 
 export function mintPersistable<T extends SdwRecord>(
   input: Untrusted<T>,
@@ -79,9 +90,7 @@ export async function sdwBackendWrite<T extends SdwRecord>(
   fortressId: string,
 ): Promise<void> {
   const prepared = prepareSdwBackendWrite(persistable, encryptionKey, fortressId);
-  await runWithSdwWriteAuthority(() =>
-    backend.write(prepared.namespace, prepared.storageKey, prepared.data),
-  );
+  await backend.write(prepared.namespace, prepared.storageKey, prepared.data);
 }
 
 export function prepareSdwBackendWrite<T extends SdwRecord>(
@@ -107,26 +116,43 @@ export function prepareSdwBackendWrite<T extends SdwRecord>(
     encryptionKey,
     aad,
   );
-  return {
+  return authorizePreparedSdwPayload({
     namespace,
     storageKey,
     data: stringToBytes(JSON.stringify(envelope)),
-  };
+  });
 }
 
-export async function sdwBackendWriteAuthenticatedMeta(
+export async function writeReplayAnchor(
   backend: StorageBackend,
-  namespace: typeof SDW_META_NAMESPACE,
+  masterKey: Uint8Array,
+  data: SdwReplayAnchorData,
+): Promise<void> {
+  const envelope = {
+    marker: SDW_REPLAY_MAC_MARKER,
+    data,
+    mac: sdwReplayAnchorMac(masterKey, data),
+  };
+  const prepared = authorizePreparedSdwPayload({
+    namespace: SDW_META_NAMESPACE,
+    storageKey: SDW_REPLAY_ANCHOR_KEY,
+    data: stringToBytes(JSON.stringify(envelope)),
+  });
+  await backend.write(prepared.namespace, prepared.storageKey, prepared.data);
+}
+
+export function assertSdwRawWriteAuthorized(
+  namespace: string,
   storageKey: string,
   data: Uint8Array,
-): Promise<void> {
-  assertSdwIdentifier(namespace, "namespace");
-  assertSdwIdentifier(storageKey, "storage_key");
-  await runWithSdwWriteAuthority(() => backend.write(namespace, storageKey, data));
-}
-
-export function assertSdwRawWriteAuthorized(namespace: string): void {
-  if (isSdwNamespace(namespace) && sdwWriteAuthority.getStore() !== true) {
+): void {
+  if (!isSdwNamespace(namespace)) return;
+  const authorized = authorizedSdwPayloads.get(data);
+  if (
+    authorized === undefined ||
+    authorized.namespace !== namespace ||
+    authorized.storageKey !== storageKey
+  ) {
     throw new SdwValidationError(
       "raw_sdw_write_forbidden",
       "SDW namespace writes must pass through the SDW write gate",
@@ -143,10 +169,6 @@ export function isSdwNamespace(namespace: string): namespace is SdwNamespace {
     namespace === SDW_DOCUMENT_CORPUS_NAMESPACE ||
     namespace === SDW_VECTOR_MEMORY_NAMESPACE
   );
-}
-
-export async function runWithSdwWriteAuthority<T>(fn: () => Promise<T>): Promise<T> {
-  return sdwWriteAuthority.run(true, fn);
 }
 
 export function assertAllowedTaint(taint: Taint | undefined): asserts taint is
@@ -356,4 +378,37 @@ function collectText(value: SdwRecord): string[] {
 
 export function encryptedEnvelopeContains(raw: Uint8Array, forbidden: string): boolean {
   return bytesToString(raw).includes(forbidden);
+}
+
+function authorizePreparedSdwPayload(prepared: PreparedSdwWrite): PreparedSdwWrite {
+  authorizedSdwPayloads.set(prepared.data, {
+    namespace: prepared.namespace,
+    storageKey: prepared.storageKey,
+  });
+  return prepared;
+}
+
+function sdwReplayAnchorMac(masterKey: Uint8Array, data: SdwReplayAnchorData): string {
+  const macKey = derivePurposeKey(masterKey, SDW_REPLAY_MAC_INFO);
+  const payload = SDW_REPLAY_MAC_DOMAIN +
+    SDW_REPLAY_ANCHOR_KEY +
+    "\n" +
+    canonicalJson(data);
+  return toBase64url(hmacSha256(macKey, stringToBytes(payload)));
+}
+
+function canonicalize(value: unknown): unknown {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => canonicalize(item));
+  const object = value as { readonly [key: string]: unknown };
+  const out: { [key: string]: unknown } = {};
+  for (const key of Object.keys(object).sort()) {
+    const item = object[key];
+    if (item !== undefined) out[key] = canonicalize(item);
+  }
+  return out;
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalize(value));
 }

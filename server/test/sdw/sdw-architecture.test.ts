@@ -10,45 +10,54 @@ describe("SDW architecture write gate", () => {
     expect(barrel).not.toHaveProperty("sdwBackendWriteAuthenticatedMeta");
   });
 
-  it("keeps SDW backend writes centralized in the write gate", async () => {
+  it("keeps all source-wide SDW raw writes behind the gate", async () => {
     const root = join(process.cwd(), "src");
     const offenders: string[] = [];
     for (const file of await listTsFiles(root)) {
       const path = relative(root, file);
+      const source = await readFile(file, "utf8");
+
+      if (importsForbiddenRawWriteHelper(source)) {
+        offenders.push(`${path}: imports a raw SDW write authority helper`);
+      }
+      if (importsLmdbBackendWrite(source)) {
+        offenders.push(`${path}: imports LmdbStorageBackend.write directly`);
+      }
+
       if (path === join("sdw", "write-gate.ts")) {
+        offenders.push(...findWriteGateOffenders(source, path));
         continue;
       }
-      const source = await readFile(file, "utf8");
       if (path === join("sdw", "lmdb-backend.ts")) {
         offenders.push(...findLmdbWriteGateOffenders(source, path));
         continue;
       }
 
-      if (callsSdwRawWrite(source)) {
-        offenders.push(`${path}: raw SDW namespace write outside the SDW write gate`);
+      const aliases = sdwNamespaceAliases(source);
+      if (callsSdwRawWrite(source, aliases)) {
+        offenders.push(`${path}: direct backend.write/SdwTxn.write to an SDW namespace`);
       }
       if (writesLmdbCompositeKey(source)) {
         offenders.push(`${path}: direct LMDB composite-key write outside the SDW backend`);
       }
-      if (importsPublicSdwBarrel(source)) {
-        if (callsForbiddenSdwAuthority(source)) {
-          offenders.push(`${path}: imports public SDW barrel and calls raw write authority`);
-        }
-        if (callsSdwRawWrite(source)) {
-          offenders.push(`${path}: imports public SDW barrel and writes directly to an SDW namespace`);
-        }
+      if (callsForbiddenSdwAuthority(source)) {
+        offenders.push(`${path}: calls raw SDW write authority directly`);
       }
     }
     expect(offenders).toEqual([]);
   });
 });
 
-function callsSdwRawWrite(source: string): boolean {
+function callsSdwRawWrite(source: string, aliases = new Set<string>()): boolean {
+  const namespaceTargets = [
+    `["'\\\`]_sdw_`,
+    String.raw`SDW_[A-Z_]+_NAMESPACE\b`,
+    ...[...aliases].map(escapeRegExp).map((alias) => `${alias}\\b`),
+  ];
+  const namespacePattern = `(?:${namespaceTargets.join("|")})`;
   return [
-    /\b(?:storage|backend|txn|this\.storage|this\.backend)\.write\s*\(\s*["'`]_sdw_/,
-    /\bwrite\s*\(\s*["'`]_sdw_/,
-    /\b(?:storage|backend|txn|this\.storage|this\.backend)\.write\s*\(\s*SDW_[A-Z_]+_NAMESPACE\b/,
-    /\bwrite\s*\(\s*SDW_[A-Z_]+_NAMESPACE\b/,
+    new RegExp(String.raw`\b(?:storage|backend|txn|this\.storage|this\.backend)\.write\s*\(\s*${namespacePattern}`),
+    new RegExp(String.raw`\bwrite\s*\(\s*${namespacePattern}`),
   ].some((pattern) => pattern.test(source));
 }
 
@@ -56,12 +65,37 @@ function writesLmdbCompositeKey(source: string): boolean {
   return /\bput(?:Sync)?\s*\(\s*compositeKey\s*\(/.test(source);
 }
 
-function importsPublicSdwBarrel(source: string): boolean {
-  return /from\s+["'][^"']*(?:\/sdw|\/sdw\/index\.js)["']/.test(source);
+function importsForbiddenRawWriteHelper(source: string): boolean {
+  return /import\s*\{[^}]*\b(?:runWithSdwWriteAuthority|sdwBackendWriteAuthenticatedMeta)\b[^}]*\}\s*from\s+["'](?:[^"']*\/sdw\/(?:write-gate|index)|\.{1,2}\/(?:write-gate|index))\.js["']/.test(source);
+}
+
+function importsLmdbBackendWrite(source: string): boolean {
+  return /import\s*\{[^}]*\bwrite\b[^}]*\}\s*from\s+["'](?:[^"']*\/sdw\/lmdb-backend|\.{1,2}\/lmdb-backend)\.js["']/.test(source);
 }
 
 function callsForbiddenSdwAuthority(source: string): boolean {
   return /\b(?:runWithSdwWriteAuthority|sdwBackendWriteAuthenticatedMeta)\s*\(/.test(source);
+}
+
+function sdwNamespaceAliases(source: string): Set<string> {
+  const aliases = new Set<string>();
+  const declaration =
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:["'`]_sdw_[^"'`]+["'`]|SDW_[A-Z_]+_NAMESPACE)\b/g;
+  for (const match of source.matchAll(declaration)) {
+    aliases.add(match[1]!);
+  }
+  return aliases;
+}
+
+function findWriteGateOffenders(source: string, path: string): string[] {
+  const offenders: string[] = [];
+  if (/\bexport\s+(?:async\s+)?function\s+runWithSdwWriteAuthority\b/.test(source)) {
+    offenders.push(`${path}: exports raw SDW write authority`);
+  }
+  if (/\bexport\s+(?:async\s+)?function\s+sdwBackendWriteAuthenticatedMeta\b/.test(source)) {
+    offenders.push(`${path}: exports raw authenticated meta byte writer`);
+  }
+  return offenders;
 }
 
 function findLmdbWriteGateOffenders(source: string, path: string): string[] {
@@ -97,22 +131,28 @@ function findLmdbWriteGateOffenders(source: string, path: string): string[] {
 }
 
 function writeBlockChecksBeforeRawPut(block: string): boolean {
-  const guardIndex = block.indexOf("assertSdwRawWriteAuthorized(namespace)");
+  const guardIndex = block.indexOf("assertSdwRawWriteAuthorized(namespace, key, data)");
   const putIndex = block.search(/\bput(?:Sync)?\s*\(\s*compositeKey\s*\(\s*namespace\s*,\s*key\s*\)/);
   return guardIndex >= 0 && putIndex >= 0 && guardIndex < putIndex;
 }
 
 function persistableBlockUsesPreparedAuthority(block: string): boolean {
   const prepareIndex = block.indexOf("prepareSdwBackendWrite(persistable, encryptionKey, fortressId)");
-  const authorityIndex = block.indexOf("runWithSdwWriteAuthority");
+  const guardIndex = block.indexOf(
+    "assertSdwRawWriteAuthorized(prepared.namespace, prepared.storageKey, prepared.data)",
+  );
   const putPreparedIndex = block.search(
     /\bputSync\s*\(\s*compositeKey\s*\(\s*prepared\.namespace\s*,\s*prepared\.storageKey\s*\)/,
   );
   return (
     prepareIndex >= 0 &&
-    authorityIndex > prepareIndex &&
-    putPreparedIndex > authorityIndex
+    guardIndex > prepareIndex &&
+    putPreparedIndex > guardIndex
   );
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function extractBalancedBlock(source: string, signature: RegExp): string | null {

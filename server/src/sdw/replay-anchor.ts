@@ -9,7 +9,7 @@ import {
   type SdwReplayAnchorRecord,
 } from "./records.js";
 import { SdwReplayAnchorError } from "./errors.js";
-import { sdwBackendWriteAuthenticatedMeta } from "./write-gate.js";
+export { writeReplayAnchor } from "./write-gate.js";
 
 const SDW_REPLAY_MAC_DOMAIN = "sanctuary.sdw-replay-anchor-mac.v1\n";
 const SDW_REPLAY_MAC_MARKER = "__sanctuary_sdw_replay_anchor_mac_v1";
@@ -49,20 +49,6 @@ export function createReplayAnchorRecord(
   };
 }
 
-export async function writeReplayAnchor(
-  storage: StorageBackend,
-  masterKey: Uint8Array,
-  data: SdwReplayAnchorData,
-): Promise<void> {
-  const envelope = replayAnchorEnvelope(masterKey, data);
-  await sdwBackendWriteAuthenticatedMeta(
-    storage,
-    SDW_META_NAMESPACE,
-    SDW_REPLAY_ANCHOR_KEY,
-    stringToBytes(JSON.stringify(envelope)),
-  );
-}
-
 export async function readReplayAnchor(
   storage: StorageBackend,
   masterKey: Uint8Array,
@@ -91,17 +77,6 @@ export function assertCatalogNotRolledBack(
   if (anchor.status === "valid" && recordSeq < anchor.data.catalog) {
     throw new SdwReplayAnchorError("replay_detected", "SDW catalog rollback detected");
   }
-}
-
-function replayAnchorEnvelope(
-  masterKey: Uint8Array,
-  data: SdwReplayAnchorData,
-): ReplayAnchorEnvelope {
-  return {
-    marker: SDW_REPLAY_MAC_MARKER,
-    data,
-    mac: replayAnchorMac(masterKey, data),
-  };
 }
 
 function replayAnchorMac(masterKey: Uint8Array, data: SdwReplayAnchorData): string {
