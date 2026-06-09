@@ -106,6 +106,9 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
     "federation_node_join",
+    "sanctuary_forget",
+    "sanctuary_compound_execute",
+    "sanctuary_audit_search_widen",
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [
@@ -165,6 +168,16 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "memory_attest", // Read-only audit attestation — records that a memory op happened
     "compliance_generate_eu_ai_act_bundle", // Read-only; emits signed compliance documents from existing state
     "compliance_eu_ai_act_annex_iii_classify", // Read-only; rule-based Annex III classifier
+    "sanctuary_remember",
+    "sanctuary_recall",
+    "sanctuary_hide",
+    "sanctuary_help",
+    "sanctuary_who_am_i",
+    "sanctuary_active_protections",
+    "sanctuary_events_open_cursor",
+    "sanctuary_events_read",
+    "sanctuary_events_close",
+    "sanctuary_audit_search",
   ],
   approval_channel: DEFAULT_CHANNEL,
   approval_redirect: DEFAULT_APPROVAL_REDIRECT,

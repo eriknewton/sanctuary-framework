@@ -1,28 +1,56 @@
-# English-Policy Fix-Before-Mount Hardening
+# Agent-Native Surface Phase 2 Build Result
 
-## What changed
+Date: 2026-06-08
+Branch: feat/agent-native-surface-phase2
+Base confirmed: origin/main at `1ee1bd94 feat(agent-native): Phase 1 safety base (gate verify-mode, preflight, opaque-handle ownership) (#417)`
 
-- Hardened English-policy activation lifecycle HTTP routes so activation, revocation, status, and conflict-review paths require an explicit operator bearer token instead of relying on loopback auto-auth.
-- Scoped the lifecycle operator credential check to `Authorization: Bearer` only. These routes now reject `?token=` URL credentials even when the token matches, while dashboard token behavior elsewhere remains unchanged.
-- Removed live policy and raw conflict data from activation lifecycle responses. The HTTP boundary now returns generic success/failure status plus an operator-facing audit reference.
-- Updated the policy CLI draft lifecycle commands to require `SANCTUARY_POLICY_API_TOKEN` and stop printing raw conflict objects from the server.
+## What Changed
 
-## Tests
+- Added the Phase 2 cooperative facade tools in `server/src/agent-native/cooperative-surface.ts`:
+  - `sanctuary_remember` expands to `state_write`.
+  - `sanctuary_recall` expands to `state_read` and returns compact `{ value, verified, audit_ref }` by default.
+  - `sanctuary_hide` records version/content-hash-bound hidden markers behind the reserved `_facade/hidden` namespace contract.
+  - `sanctuary_forget` expands to `state_delete` and is enrolled as Tier 1.
+  - `sanctuary_help` uses a deterministic suppressive classifier for ordinary/sensitive/gated intents, including encoded and multi-intent probes.
+  - `sanctuary_who_am_i` returns only disclosable identity fields.
+  - `sanctuary_active_protections` returns positive-only coarse guarantees.
+  - `sanctuary_events_open_cursor/read/close` implement local pull cursors with redacted, identity-bound reads and no callback/URL surface.
+  - `sanctuary_audit_search` implements own-scope derived audit search with integrity fail-closed behavior.
+  - `sanctuary_compound_execute` implements plan-hash construction and fail-closed pre-step denial when required approvals are not reserved.
+- Extended router/preflight support so facade tools can declare `approvalTargetToolName`; the gate and approval preflight bind to the expanded primitive tool name and args instead of the friendly facade name.
+- Registered the Phase 2 tools in server startup using the Phase 1 L1 namespace registry, preserving opaque-handle ownership state.
+- Reserved `_facade` as an internal namespace prefix.
+- Enrolled ordinary/read facade verbs in Tier 3 and secure/widening compound verbs in Tier 1.
 
-- `cd server && npm run typecheck` — passed.
-- `cd server && npm test` — passed: 5458 passed, 8 skipped, 5466 total.
-- Baseline floor: `.test-baseline` is 5423; passing count did not drop below baseline.
+## Tests Added
 
-## Focused coverage added/updated
+- `server/test/agent-native/phase2-cooperative-surface.test.ts`
+  - Expanded primitive approval target binding.
+  - Verification-preserving compact recall.
+  - Hide-marker hidden recall and secure-forget marker removal/recreate behavior.
+  - Help suppression for paraphrase, multi-intent, encoded, and callback-pretext gated intents.
+  - Positive-only active protections.
+  - Disclosable-only who-am-I response shape.
+  - Pull-only event cursor denial for callbacks, redacted event reads, and coarse rate denial.
+  - Own-scope audit search and widened-scope denial.
+  - Compound plan short-circuit before step one when required approval is missing.
 
-- `server/test/policy-engine/english-policy-activator.test.ts`
-  - Activation route refuses a non-operator caller before policy mutation.
-  - Activation route refuses `POST /api/policy/drafts/:id/activate?token=<operator-token>` when no bearer header is present.
-  - Activation, revocation, status, and conflict-review route responses do not return `updated_policy`, full records, or raw conflicts.
-  - Activation failures return generic `activation_refused` without detailed policy/conflict data.
-- `server/test/cli/singleton-audit-writes.test.ts`
-  - Existing activation failure audit test now supplies the required operator API token.
+## Gate Results
 
-## Assumptions
+- `cd server && npm run typecheck`: passed.
+- `cd server && npm test`: passed.
+  - Test files: 446 passed, 1 skipped.
+  - Tests: 5,477 passed, 8 skipped.
+  - Baseline: `.test-baseline` is 5,423, so the run is above baseline.
+  - No transform or collection errors.
 
-- The operator-auth primitive for this latent `/api/policy` surface is the existing dashboard/console bearer token. For mutation lifecycle routes, this change intentionally fails closed when no bearer token is configured, even if loopback auto-auth is enabled.
+## Design Semantics Interpreted
+
+- The facade uses the Phase 1 router/gate binding path by declaring expanded primitive approval targets; handlers then execute the matching primitive tool with the same server-expanded args.
+- Hide markers are implemented as server-owned facade metadata and are not exposed through agent-facing state primitives. The marker binding uses target version plus a content hash derived from the verified read value because the primitive read result does not expose the internal state envelope integrity hash.
+- Audit search is implemented as a derived own-history view over `AuditLog.query`, with integrity findings returning the fixed denial schema. The explicit Tier-1 widening placeholder is policy-enrolled but no widening tool is exposed in this phase.
+- Compound execution implements the ratified fail-closed pre-step reservation behavior for missing required approvals; it does not claim rollback semantics.
+
+## Stop Point
+
+Committed locally only. No push. No merge.

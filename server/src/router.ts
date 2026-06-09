@@ -38,6 +38,7 @@ export interface ToolDefinition {
   description: string;
   tool_class?: "read" | "write";
   inputSchema: Record<string, unknown>;
+  approvalTargetToolName?: string;
   approvalTargetArgs?: (args: Record<string, unknown>) => Record<string, unknown>;
   handler: ToolHandler;
 }
@@ -196,7 +197,7 @@ export function createServer(
         };
       }
       const result = await gate.evaluate(
-        name,
+        tool.approvalTargetToolName ?? name,
         gateArgs,
         approvalRef ? { approval_ref: approvalRef } : undefined
       );
