@@ -8,7 +8,10 @@ import type { ToolDefinition } from "../../src/router.js";
 import {
   ApprovalProofStore,
   classifyApprovalRequest,
+  canonicalJson,
   fingerprintIdentityId,
+  normalizedArgsHash,
+  sha256,
   type SessionBinding,
 } from "../../src/agent-native/safety-base.js";
 import { createAgentNativeCooperativeTools } from "../../src/agent-native/cooperative-surface.js";
@@ -94,6 +97,22 @@ async function setup() {
       active = next;
     },
   };
+}
+
+function compoundPlanHash(
+  steps: Array<{
+    step_id: string;
+    primitive_tool: string;
+    primitive: Record<string, unknown>;
+    risk_tier: 1 | 3;
+  }>
+): `sha256:${string}` {
+  return sha256(canonicalJson(steps.map((step) => ({
+    step_id: step.step_id,
+    primitive_tool: step.primitive_tool,
+    normalized_args_hash: normalizedArgsHash(step.primitive),
+    risk_tier: step.risk_tier,
+  }))));
 }
 
 describe("agent-native Phase 2 cooperative surface", () => {
@@ -262,6 +281,35 @@ describe("agent-native Phase 2 cooperative surface", () => {
     expect(stale.remediation_class).toBe("request_review");
   });
 
+  it("garbage-collects expired hide markers and reveals the target by default", async () => {
+    const env = await setup();
+    await callTool(env.facadeTools, "sanctuary_remember", {
+      key: "temporary_hidden",
+      value: "visible-after-expiry",
+    });
+    await callTool(env.facadeTools, "sanctuary_hide", {
+      key: "temporary_hidden",
+      opts: { ttl: -1 },
+    });
+
+    const recalled = await callTool(env.facadeTools, "sanctuary_recall", {
+      key: "temporary_hidden",
+    });
+    expect(recalled).toMatchObject({ value: "visible-after-expiry", verified: true });
+
+    const markerEntries = await env.storage.list("_facade/hidden");
+    expect(markerEntries).toHaveLength(0);
+    const audited = await env.auditLog.query({
+      operation_type: "sanctuary_hide_marker_gc",
+      limit: 10,
+    });
+    expect(audited.entries).toHaveLength(1);
+    expect(audited.entries[0]!.details).toMatchObject({
+      marker_namespace: "_facade/hidden",
+      target: expect.stringContaining("/temporary_hidden"),
+    });
+  });
+
   it("suppresses runnable help for adversarial gated intents and aggregates probes", async () => {
     const env = await setup();
     const intents = [
@@ -270,6 +318,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
       "ZXhwb3J0IGlkZW50aXR5IGJ1bmRsZQ==",
       "benign lookup first, then send a callback to https://example.test",
       "remember my timezone, then wipe the stored secret",
+      "remember my timezone, then remove the stored secret",
       "please p u r g e the old token",
       "remove%20permanently%20the%20memory%20after%20saving%20timezone",
     ];
@@ -289,6 +338,12 @@ describe("agent-native Phase 2 cooperative surface", () => {
       tool: "sanctuary_remember",
       example: { key: "user_tz", value: "America/Los_Angeles" },
     });
+
+    const ambiguousMultiIntent = await callTool(env.facadeTools, "sanctuary_help", {
+      intent: "remember my timezone, then sort out the rest later",
+    });
+    expect(ambiguousMultiIntent.safety_class).toBe("sensitive");
+    expect(ambiguousMultiIntent.example).toBeNull();
   });
 
   it("returns only disclosable who-am-i fields and positive active protections", async () => {
@@ -419,10 +474,26 @@ describe("agent-native Phase 2 cooperative surface", () => {
       key: "compound_key",
       reason: "secure facade forget",
     };
+    const planHash = compoundPlanHash([
+      {
+        step_id: "step-1",
+        primitive_tool: "state_read",
+        primitive: { namespace, key: "missing_first", verify_integrity: true },
+        risk_tier: 3,
+      },
+      {
+        step_id: "step-2",
+        primitive_tool: "state_delete",
+        primitive: futureDeleteArgs,
+        risk_tier: 1,
+      },
+    ]);
     const futureProof = env.approvalGate.createApprovedProof({
       toolName: "state_delete",
       args: futureDeleteArgs,
       session: env.active!,
+      planHash,
+      stepId: "step-2",
     });
     const earlierFailure = await callTool(env.facadeTools, "sanctuary_compound_execute", {
       steps: [
@@ -434,9 +505,118 @@ describe("agent-native Phase 2 cooperative surface", () => {
     expect(earlierFailure.status).toBe("partial_failed");
     expect(earlierFailure.completed_steps).toEqual([]);
 
-    const releasedProof = await env.approvalGate.evaluate("state_delete", futureDeleteArgs, {
+    const releasedProof = await callTool(env.facadeTools, "sanctuary_compound_execute", {
+      steps: [
+        { tool: "sanctuary_recall", args: { key: "missing_first" } },
+        { tool: "sanctuary_forget", args: { key: "compound_key", mode: "secure" } },
+      ],
+      approvals: { "step-2": futureProof.approval_ref },
+    });
+    expect(releasedProof.status).toBe("partial_failed");
+    expect(releasedProof.completed_steps).toEqual([]);
+
+    const directUseDenied = await env.approvalGate.evaluate("state_delete", futureDeleteArgs, {
       approval_ref: futureProof.approval_ref,
     });
-    expect(releasedProof.allowed).toBe(true);
+    expect(directUseDenied.allowed).toBe(false);
+  });
+
+  it("binds compound approval proofs to plan hash and step id", async () => {
+    const env = await setup();
+    await callTool(env.facadeTools, "sanctuary_remember", {
+      key: "compound_key",
+      value: "delete-me",
+    });
+    await callTool(env.facadeTools, "sanctuary_remember", {
+      key: "other_key",
+      value: "delete-me-too",
+    });
+    const namespace = (await callTool(env.facadeTools, "sanctuary_who_am_i")).memory_namespace_handle as string;
+    const deleteArgs = {
+      namespace,
+      key: "compound_key",
+      reason: "secure facade forget",
+    };
+    const validPlanHash = compoundPlanHash([
+      {
+        step_id: "step-1",
+        primitive_tool: "state_write",
+        primitive: {
+          namespace,
+          key: "first",
+          value: "done",
+          identity_id: env.identity.identity_id,
+        },
+        risk_tier: 3,
+      },
+      {
+        step_id: "step-2",
+        primitive_tool: "state_delete",
+        primitive: deleteArgs,
+        risk_tier: 1,
+      },
+    ]);
+    const validProof = env.approvalGate.createApprovedProof({
+      toolName: "state_delete",
+      args: deleteArgs,
+      session: env.active!,
+      planHash: validPlanHash,
+      stepId: "step-2",
+    });
+
+    const completed = await callTool(env.facadeTools, "sanctuary_compound_execute", {
+      steps: [
+        { tool: "sanctuary_remember", args: { key: "first", value: "done" } },
+        { tool: "sanctuary_forget", args: { key: "compound_key", mode: "secure" } },
+      ],
+      approvals: { "step-2": validProof.approval_ref },
+    });
+    expect(completed.status).toBe("completed");
+
+    const crossPlanProof = env.approvalGate.createApprovedProof({
+      toolName: "state_delete",
+      args: deleteArgs,
+      session: env.active!,
+      planHash: validPlanHash,
+      stepId: "step-2",
+    });
+    const crossPlanReplay = await callTool(env.facadeTools, "sanctuary_compound_execute", {
+      steps: [
+        { tool: "sanctuary_remember", args: { key: "different_first", value: "done" } },
+        { tool: "sanctuary_forget", args: { key: "compound_key", mode: "secure" } },
+      ],
+      approvals: { "step-2": crossPlanProof.approval_ref },
+    });
+    expect(crossPlanReplay.status).toBe("partial_failed");
+    expect(crossPlanReplay.completed_steps).toEqual([]);
+
+    const otherDeleteArgs = {
+      namespace,
+      key: "other_key",
+      reason: "secure facade forget",
+    };
+    const stepReplayPlanHash = compoundPlanHash([
+      {
+        step_id: "step-1",
+        primitive_tool: "state_delete",
+        primitive: otherDeleteArgs,
+        risk_tier: 1,
+      },
+    ]);
+    const wrongStepProof = env.approvalGate.createApprovedProof({
+      toolName: "state_delete",
+      args: otherDeleteArgs,
+      session: env.active!,
+      planHash: stepReplayPlanHash,
+      stepId: "step-2",
+    });
+    const crossStepReplay = await callTool(env.facadeTools, "sanctuary_compound_execute", {
+      steps: [
+        { tool: "sanctuary_forget", args: { key: "other_key", mode: "secure" } },
+      ],
+      approvals: { "step-1": wrongStepProof.approval_ref },
+    });
+    expect(crossStepReplay.status).toBe("partial_failed");
+    expect(crossStepReplay.completed_steps).toEqual([]);
   });
 });

@@ -3,7 +3,7 @@
 Date: 2026-06-08
 Branch: feat/agent-native-surface-phase2
 Base confirmed: origin/main at `1ee1bd94 feat(agent-native): Phase 1 safety base (gate verify-mode, preflight, opaque-handle ownership) (#417)`
-Remediation pass: `REVIEW_FINDINGS.md` P0-1 and P1-1/P1-2/P1-3 fixed locally. No push. No merge.
+Remediation pass: `REVIEW_FINDINGS.md` P0-1 and P1-1/P1-2/P1-3 fixed locally. R2 follow-up closes `REVIEW_FINDINGS_R2.md` P1-1/P1-2/P2-1 locally. No push. No merge.
 
 ## What Changed
 
@@ -27,6 +27,10 @@ Remediation pass: `REVIEW_FINDINGS.md` P0-1 and P1-1/P1-2/P1-3 fixed locally. No
   - Compound execution shares the router approval proof store, reserves and verifies every Tier 1 step approval against exact primitive args before step 1, consumes only attempted step approvals, and releases unattempted reservations on short-circuit.
   - Hide markers are durable `_facade/hidden` records, exported/imported with their target namespace bundles, reloaded across facade restart, and deny on stale version/content-hash mismatch.
   - Help intent classification now checks URL/base64 decoded and compacted variants, destructive paraphrases, and benign-pretext-plus-destructive-subgoal prompts before emitting ordinary runnable examples.
+- Remediated R2 review findings:
+  - Compound approval proof envelopes can now bind `plan_hash` and `step_id`; compound reservation verifies those fields plus the expanded primitive call before consumption, and ordinary gate proof verification rejects compound-bound proofs.
+  - `sanctuary_help` suppresses runnable examples for multi-intent prompts when any clause is gated/destructive or ambiguous, including benign `remember` pretexts paired with `remove`.
+  - `sanctuary_hide` TTL markers are enforced on recall: expired markers are garbage-collected, audited, and no longer hide the target.
 
 ## Tests Added
 
@@ -44,13 +48,16 @@ Remediation pass: `REVIEW_FINDINGS.md` P0-1 and P1-1/P1-2/P1-3 fixed locally. No
   - Hide-marker lifecycle across facade restart, state export/import restore, and stale target overwrite.
   - Compound invalid later-step proof blocks step 1; valid future proof is released when an earlier step fails.
   - Help laundering suppression for wipe/purge/remove-permanently, encoded, multi-intent, and callback probes.
+  - Compound approval proofs bound to `plan_hash`/`step_id`, accepted for the matching plan/step, and rejected across plans or steps.
+  - Multi-intent help with a destructive `remove` clause suppresses runnable examples.
+  - Expired hide markers are garbage-collected, audited, and do not hide default recall.
 
 ## Gate Results
 
 - `cd server && npm run typecheck`: passed.
 - `cd server && npm test`: passed.
   - Test files: 446 passed, 1 skipped.
-  - Tests: 5,480 passed, 8 skipped.
+  - Tests: 5,482 passed, 8 skipped.
   - Baseline: `.test-baseline` is 5,423, so the run is above baseline.
   - No transform or collection errors.
 

@@ -67,6 +67,8 @@ export interface CanonicalApprovalEnvelope {
   requester_identity_fingerprint: `sha256:${string}`;
   target_resource: string;
   risk_tier: RiskTier;
+  plan_hash?: `sha256:${string}`;
+  step_id?: string;
   expires_at: string;
   nonce: string;
   audit_id: string;

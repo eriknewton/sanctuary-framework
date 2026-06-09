@@ -136,12 +136,22 @@ export function createAgentNativeCooperativeTools(
   async function loadHiddenMarker(namespace: string, key: string): Promise<HiddenMarker | "invalid" | undefined> {
     const cacheKey = hiddenKey(namespace, key);
     const cached = hidden.get(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      if (isHiddenMarkerExpired(cached)) {
+        await garbageCollectExpiredHiddenMarker(cached);
+        return undefined;
+      }
+      return cached;
+    }
     if (!options.storage) return undefined;
     const raw = await options.storage.read(FACADE_HIDDEN_MARKER_NAMESPACE, hiddenStorageKey(namespace, key));
     if (!raw) return undefined;
     const marker = decodeMarker(raw);
     if (!marker || marker.namespace !== namespace || marker.key !== key) return "invalid";
+    if (isHiddenMarkerExpired(marker)) {
+      await garbageCollectExpiredHiddenMarker(marker);
+      return undefined;
+    }
     hidden.set(cacheKey, marker);
     return marker;
   }
@@ -168,6 +178,20 @@ export function createAgentNativeCooperativeTools(
     }
   }
 
+  function isHiddenMarkerExpired(marker: HiddenMarker): boolean {
+    return marker.ttl_expires_at !== undefined && Date.parse(marker.ttl_expires_at) <= Date.now();
+  }
+
+  async function garbageCollectExpiredHiddenMarker(marker: HiddenMarker): Promise<void> {
+    await deleteHiddenMarker(marker.namespace, marker.key);
+    await audit("sanctuary_hide_marker_gc", {
+      marker_namespace: FACADE_HIDDEN_MARKER_NAMESPACE,
+      marker_hash: sha256(canonicalJson(marker)),
+      target: `${marker.namespace}/${marker.key}`,
+      expired_at: marker.ttl_expires_at,
+    });
+  }
+
   function stateContentHash(read: Record<string, unknown>): `sha256:${string}` {
     return sha256(String(read.value ?? ""));
   }
@@ -179,6 +203,8 @@ export function createAgentNativeCooperativeTools(
   function reserveApprovalForStep(params: {
     approval_ref: string;
     reservation_id: string;
+    plan_hash: `sha256:${string}`;
+    step_id: string;
     primitive_tool: string;
     primitive: Record<string, unknown>;
     risk_tier: 1 | 2 | 3;
@@ -193,6 +219,8 @@ export function createAgentNativeCooperativeTools(
       requester_identity_fingerprint: activeIdentity.requester_identity_fingerprint,
       target_resource: deriveTargetResource(params.primitive_tool, params.primitive),
       risk_tier: params.risk_tier,
+      plan_hash: params.plan_hash,
+      step_id: params.step_id,
     };
     const matches =
       approvalEnvelopeHash(rebuilt) === record.envelope_hash &&
@@ -202,7 +230,9 @@ export function createAgentNativeCooperativeTools(
       rebuilt.requester_identity_fingerprint === record.envelope.requester_identity_fingerprint &&
       rebuilt.nonce === record.envelope.nonce &&
       rebuilt.target_resource === record.envelope.target_resource &&
-      rebuilt.tool_name === record.envelope.tool_name;
+      rebuilt.tool_name === record.envelope.tool_name &&
+      rebuilt.plan_hash === record.envelope.plan_hash &&
+      rebuilt.step_id === record.envelope.step_id;
     if (!matches) return false;
     return approvalProofStore.reserveIfUnconsumed(params.approval_ref, params.reservation_id) !== null;
   }
@@ -319,6 +349,7 @@ export function createAgentNativeCooperativeTools(
       "erase",
       "wipe",
       "purge",
+      "remove",
       "remove permanently",
       "removepermanently",
       "destroy",
@@ -344,11 +375,48 @@ export function createAgentNativeCooperativeTools(
       "priorsession",
       "widen",
     ];
+    const isOrdinaryClause = (value: string): boolean =>
+      /\b(remember|store|save|recall|read|lookup|get)\b/.test(value);
+    const clauseHasGatedNeedle = (value: string): string | undefined => {
+      const compact = value.replace(/[^a-z0-9:/._-]/g, "");
+      return gated.find((needle) => value.includes(needle) || compact.includes(needle));
+    };
+    const clauses = normalized
+      .split(/\b(?:then|and|also|after|before|while)\b|[,;]+/i)
+      .map((clause) => clause.toLowerCase().trim())
+      .filter((clause) => clause.length > 0);
+    if (clauses.length > 1) {
+      for (const clause of clauses) {
+        const gatedClause = clauseHasGatedNeedle(clause);
+        if (gatedClause) {
+          return {
+            safety_class: "gated",
+            tool: ["forget", "delete", "erase", "wipe", "purge", "remove", "remove permanently", "removepermanently"].some((needle) =>
+              clause.includes(needle) || clause.replace(/[^a-z0-9:/._-]/g, "").includes(needle)
+            ) ? "sanctuary_forget" : null,
+            example: { args: "<operator-approved placeholders only>" },
+            why_sanctuary: "This request may need operator review before execution.",
+            remediation_class: "request_review",
+            probe_key: gatedClause,
+          };
+        }
+        if (!isOrdinaryClause(clause)) {
+          return {
+            safety_class: "sensitive",
+            tool: null,
+            example: null,
+            why_sanctuary: "The request is ambiguous, so runnable guidance is suppressed.",
+            remediation_class: "try_lower_scope",
+            probe_key: "multi_intent",
+          };
+        }
+      }
+    }
     const matchedGated = gated.find((needle) => haystack.includes(needle) || compactHaystack.includes(needle));
     if (matchedGated) {
       return {
         safety_class: "gated",
-        tool: ["forget", "delete", "erase", "wipe", "purge", "remove permanently", "removepermanently"].some((needle) =>
+        tool: ["forget", "delete", "erase", "wipe", "purge", "remove", "remove permanently", "removepermanently"].some((needle) =>
           haystack.includes(needle) || compactHaystack.includes(needle)
         ) ? "sanctuary_forget" : null,
         example: { args: "<operator-approved placeholders only>" },
@@ -881,6 +949,8 @@ export function createAgentNativeCooperativeTools(
               const approvalReserved = typeof approvalRef === "string" && reserveApprovalForStep({
                 approval_ref: approvalRef,
                 reservation_id: reservationId,
+                plan_hash: planHash,
+                step_id: step.step_id,
                 primitive_tool: step.primitive_tool,
                 primitive: step.primitive,
                 risk_tier: step.risk_tier,
