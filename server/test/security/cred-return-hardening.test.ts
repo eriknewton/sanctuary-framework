@@ -18,6 +18,19 @@ async function callTool(
   }, {});
 }
 
+async function listTools(
+  server: Awaited<ReturnType<typeof createSanctuaryServer>>["server"]
+) {
+  const handler = (server as unknown as { _requestHandlers: Map<string, Function> })._requestHandlers.get(
+    "tools/list"
+  );
+  if (!handler) throw new Error("tools/list handler not registered");
+  return await handler({
+    method: "tools/list" as const,
+    params: {},
+  }, {});
+}
+
 function parseToolResult(result: { content: Array<{ type: string; text: string }> }) {
   return JSON.parse(result.content[0]!.text);
 }
@@ -38,6 +51,20 @@ describe("credential/policy return hardening", () => {
     }
   });
 
+  it("removes context-gate mutation tools from the agent MCP catalog", async () => {
+    const { server } = await createSanctuaryServer({
+      storage: new MemoryStorage(),
+      passphrase: "cred-return-context-gate-catalog",
+    });
+    const result = await listTools(server);
+    const names = (result.tools as Array<{ name: string }>).map((tool) => tool.name);
+
+    expect(names).not.toContain("context_gate_set_policy");
+    expect(names).not.toContain("context_gate_apply_template");
+    expect(names).toContain("context_gate_filter");
+    expect(names).toContain("context_gate_list_policies");
+  });
+
   it("redacts operator handles and tier/policy metadata from monitor_audit_log", async () => {
     const { server, auditLog } = await createSanctuaryServer({
       storage: new MemoryStorage(),
@@ -52,6 +79,7 @@ describe("credential/policy return hardening", () => {
         aggregator_id: "agg-1",
         decision: "approved",
         decided_by: "operator@example.test",
+        identity_id: "operator-top-detail",
         policy_rule_id: "tier1:state_export",
         tier: 1,
         nested: {
@@ -69,12 +97,16 @@ describe("credential/policy return hardening", () => {
         candidate.operation === "cross_harness_approval_resolved"
     );
 
+    expect(entry.identity_id).toBe("[redacted]");
     expect(entry.details.decided_by).toBe("[redacted]");
+    expect(entry.details.identity_id).toBe("[redacted]");
     expect(entry.details.policy_rule_id).toBe("[redacted]");
     expect(entry.details.tier).toBe("[redacted]");
     expect(entry.details.nested.operator_id).toBe("[redacted]");
     expect(entry.details.nested.policy_match).toBe("[redacted]");
     expect(text).not.toContain("operator@example.test");
+    expect(text).not.toContain("approval-aggregator");
+    expect(text).not.toContain("operator-top-detail");
     expect(text).not.toContain("operator-2");
     expect(text).not.toContain("tier1:state_export");
     expect(text).not.toContain("tier1_always_approve");

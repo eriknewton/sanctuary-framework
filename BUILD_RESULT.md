@@ -11,6 +11,13 @@ Base verified: a9c1c6d8e9345d3b7b0b0ef610d119e66a8a77eb
 - P3 `monitor_audit_log`: confirmed current main returned raw audit entries. Fixed by redacting operator handles and tier/policy metadata from agent-facing audit-log reads.
 - #413 invariants checked: `principal_policy_view`, `principal_baseline_view`, and `sanctuary_policy_status` remain forced Tier 1 and pruned from Tier 3.
 
+## Remaining Review Findings Closed
+
+- P1 `context_gate_set_policy` / `context_gate_apply_template`: removed both mutation tools from the agent-visible MCP catalog and from `WRITE_MCP_TOOLS`. They remain registered as operator-terminal-only write tools so legitimate terminal/internal use still works.
+- P1 `monitor_audit_log`: redacts top-level `identity_id` and nested `identity_id`/operator-handle fields from agent-facing audit-log responses.
+- P2 `context_gate_list_policies`: redacts live policy posture from the agent-facing response. Agents can see policy IDs, names, rule counts, and timestamps, but not rules, providers, default actions, or identity bindings.
+- #413 invariants rechecked: `principal_policy_view`, `principal_baseline_view`, and `sanctuary_policy_status` remain Tier 1 and out of Tier 3.
+
 ## Verification
 
 - `cd server && npm run typecheck`: passed
@@ -23,10 +30,14 @@ Base verified: a9c1c6d8e9345d3b7b0b0ef610d119e66a8a77eb
   - `test/system-prompt-generator-v2.test.ts`
 - `cd server && npm test`: passed
   - Test files: 445 passed, 1 skipped
-  - Tests: 5465 passed, 8 skipped
+  - Tests: 5467 passed, 8 skipped
+  - `.test-baseline`: 5423
+- `cd server && npm run typecheck && npm test`: passed
+  - Test files: 445 passed, 1 skipped
+  - Tests: 5467 passed, 8 skipped
   - `.test-baseline`: 5423
 
 ## Notes
 
 - No push or merge performed.
-- First full test run exposed two stale exact expectations in `loader-required-keys.test.ts`; those were updated to include the new forced Tier 1 operations before the passing full run.
+- The first sandboxed full run completed typecheck/build but Vitest could not write `server/node_modules/.vite-temp`; the same command passed when rerun with approved escalation.

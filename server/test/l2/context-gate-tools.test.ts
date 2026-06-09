@@ -151,6 +151,42 @@ describe("Context Gate Tools", () => {
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.policies.length).toBeGreaterThanOrEqual(1);
     });
+
+    it("does not disclose live policy posture in the agent-facing list response", async () => {
+      const { findTool } = setup();
+      const setPolicyTool = findTool("context_gate_set_policy");
+      await setPolicyTool.handler({
+        policy_name: "strict-agent-redaction",
+        rules: [
+          {
+            provider: "inference",
+            allow: ["task_description"],
+            redact: ["secret_context"],
+          },
+        ],
+        default_action: "deny",
+        identity_id: "operator@example.test",
+      });
+
+      const listTool = findTool("context_gate_list_policies");
+      const result = await listTool.handler({});
+      const parsed = JSON.parse(result.content[0].text);
+      const listed = parsed.policies.find(
+        (policy: { policy_name: string }) =>
+          policy.policy_name === "strict-agent-redaction"
+      );
+
+      expect(listed).toBeDefined();
+      expect(listed.policy_id).toBeDefined();
+      expect(listed.rule_count).toBe(1);
+      expect(listed.rules).toBeUndefined();
+      expect(listed.providers).toBeUndefined();
+      expect(listed.default_action).toBeUndefined();
+      expect(listed.identity_id).toBeUndefined();
+      expect(result.content[0].text).not.toContain("secret_context");
+      expect(result.content[0].text).not.toContain("\"deny\"");
+      expect(result.content[0].text).not.toContain("operator@example.test");
+    });
   });
 
   describe("context_gate_filter", () => {

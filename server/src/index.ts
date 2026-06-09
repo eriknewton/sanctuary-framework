@@ -109,6 +109,7 @@ import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 const AUDIT_AGENT_REDACTED = "[redacted]";
 const AUDIT_AGENT_REDACT_DETAIL_KEYS = new Set([
   "decided_by",
+  "identity_id",
   "operatorId",
   "operator_id",
   "resolved_by",
@@ -138,6 +139,7 @@ function redactAuditValueForAgent(value: unknown): unknown {
 function redactAuditEntryForAgent(entry: AuditEntry): AuditEntry {
   return {
     ...entry,
+    identity_id: AUDIT_AGENT_REDACTED,
     details: entry.details
       ? (redactAuditValueForAgent(entry.details) as Record<string, unknown>)
       : undefined,
@@ -1364,10 +1366,8 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   "bridge_attest",
   "bridge_commit",
   "compliance_generate_eu_ai_act_bundle",
-  "context_gate_apply_template",
   "context_gate_enforcer_configure",
   "context_gate_filter",
-  "context_gate_set_policy",
   "disclosure_evaluate",
   "disclosure_set_policy",
   "federation_trust_evaluate",
@@ -1405,6 +1405,11 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   "zk_commit",
   "zk_prove",
   "zk_range_prove",
+] as const);
+
+const OPERATOR_TERMINAL_ONLY_MCP_TOOLS: ReadonlySet<string> = new Set([
+  "context_gate_apply_template",
+  "context_gate_set_policy",
 ] as const);
 
 const READ_MCP_TOOLS: ReadonlySet<string> = new Set([
@@ -1446,6 +1451,9 @@ function classifyMcpTools(tools: ToolDefinition[]): ToolDefinition[] {
       return { ...tool, tool_class: "write" };
     }
     if (WRITE_MCP_TOOLS.has(tool.name)) {
+      return { ...tool, tool_class: "write" };
+    }
+    if (OPERATOR_TERMINAL_ONLY_MCP_TOOLS.has(tool.name)) {
       return { ...tool, tool_class: "write" };
     }
     if (READ_MCP_TOOLS.has(tool.name)) {
