@@ -18,6 +18,11 @@ import { createRequire } from "node:module";
 import type { ApprovalGate } from "./principal-policy/gate.js";
 import type { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
 import type { AuditLog } from "./l2-operational/audit-log.js";
+import { fixedDenial, type SessionBinding } from "./agent-native/safety-base.js";
+import {
+  normalizeToolArgsForValidation,
+  ToolArgumentValidationError,
+} from "./tool-args.js";
 
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
@@ -33,6 +38,7 @@ export interface ToolDefinition {
   description: string;
   tool_class?: "read" | "write";
   inputSchema: Record<string, unknown>;
+  approvalTargetArgs?: (args: Record<string, unknown>) => Record<string, unknown>;
   handler: ToolHandler;
 }
 
@@ -46,142 +52,8 @@ export interface ServerOptions {
   currentAgentId?: () => string | undefined;
   /** Audit log used to enforce MCP read/write behavior on broken chains. */
   auditLog?: AuditLog;
-}
-
-// ── Schema Validation ──────────────────────────────────────────────────
-// Lightweight JSON Schema validation for tool arguments.
-// Enforces: required fields, type checks, unknown field rejection,
-// and size caps on string arguments (defense against DoS via oversized payloads).
-
-/** Maximum byte length for any single string argument (1 MB) */
-const MAX_STRING_BYTES = 1_048_576;
-
-/** Maximum byte length for base64 bundle arguments (5 MB) */
-const MAX_BUNDLE_BYTES = 5_242_880;
-
-/** Fields known to carry base64 bundles — get the larger size cap */
-const BUNDLE_FIELDS = new Set(["bundle"]);
-
-interface SchemaProperty {
-  type?: string;
-  properties?: Record<string, SchemaProperty>;
-  required?: string[];
-  items?: SchemaProperty;
-  enum?: unknown[];
-  default?: unknown;
-}
-
-interface ValidationError {
-  field: string;
-  message: string;
-}
-
-/**
- * Validate tool arguments against the tool's declared inputSchema.
- * Returns an array of validation errors (empty = valid).
- */
-function validateArgs(
-  args: Record<string, unknown>,
-  schema: Record<string, unknown>,
-  extraAllowedFields: Record<string, SchemaProperty> = {}
-): ValidationError[] {
-  const errors: ValidationError[] = [];
-  const properties = (schema.properties ?? {}) as Record<string, SchemaProperty>;
-  const required = (schema.required ?? []) as string[];
-
-  // Check required fields
-  for (const field of required) {
-    if (args[field] === undefined || args[field] === null) {
-      errors.push({ field, message: `Required field "${field}" is missing` });
-    }
-  }
-
-  // Check for unknown fields (reject extra fields not in schema)
-  const knownFields = new Set([
-    ...Object.keys(properties),
-    ...Object.keys(extraAllowedFields),
-  ]);
-  for (const field of Object.keys(args)) {
-    if (!knownFields.has(field)) {
-      errors.push({ field, message: `Unknown field "${field}"` });
-    }
-  }
-
-  // Type-check and size-check each provided field
-  for (const [field, value] of Object.entries(args)) {
-    if (value === undefined || value === null) continue;
-    const propSchema = properties[field] ?? extraAllowedFields[field];
-    if (!propSchema) continue; // Already flagged as unknown above
-
-    const typeError = checkType(field, value, propSchema);
-    if (typeError) {
-      errors.push(typeError);
-      continue;
-    }
-
-    // String size caps
-    if (typeof value === "string") {
-      const maxBytes = BUNDLE_FIELDS.has(field) ? MAX_BUNDLE_BYTES : MAX_STRING_BYTES;
-      // Use byte length, not string length, for accurate size checking
-      const byteLength = new TextEncoder().encode(value).length;
-      if (byteLength > maxBytes) {
-        errors.push({
-          field,
-          message: `Field "${field}" exceeds maximum size (${byteLength} bytes > ${maxBytes} bytes)`,
-        });
-      }
-    }
-
-    // Enum validation
-    if (propSchema.enum && !propSchema.enum.includes(value)) {
-      errors.push({
-        field,
-        message: `Field "${field}" must be one of: ${propSchema.enum.join(", ")}`,
-      });
-    }
-  }
-
-  return errors;
-}
-
-/**
- * Check whether a value matches the declared JSON Schema type.
- */
-function checkType(
-  field: string,
-  value: unknown,
-  schema: SchemaProperty
-): ValidationError | null {
-  if (!schema.type) return null;
-
-  switch (schema.type) {
-    case "string":
-      if (typeof value !== "string") {
-        return { field, message: `Expected string for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "number":
-      if (typeof value !== "number") {
-        return { field, message: `Expected number for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "boolean":
-      if (typeof value !== "boolean") {
-        return { field, message: `Expected boolean for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "object":
-      if (typeof value !== "object" || Array.isArray(value)) {
-        return { field, message: `Expected object for "${field}", got ${typeof value}` };
-      }
-      break;
-    case "array":
-      if (!Array.isArray(value)) {
-        return { field, message: `Expected array for "${field}", got ${typeof value}` };
-      }
-      break;
-  }
-  return null;
+  /** Active session identity binding for agent-native approval/namespace checks. */
+  currentSessionBinding?: () => SessionBinding | undefined;
 }
 
 export function assertToolClasses(tools: readonly ToolDefinition[]): void {
@@ -279,14 +151,16 @@ export function createServer(
     // ── Schema Validation ────────────────────────────────────────────
     // Validate arguments against the tool's declared inputSchema.
     // This runs BEFORE the gate so that the gate sees normalized args.
-    const validationErrors = validateArgs(
-      typedArgs,
-      tool.inputSchema,
-      tool.tool_class === "write"
-        ? { accept_broken_chain: { type: "boolean", default: false } }
-        : {}
-    );
-    if (validationErrors.length > 0) {
+    let approvalRef: string | undefined;
+    let handlerArgs: Record<string, unknown>;
+    try {
+      ({ approvalRef, handlerArgs } = normalizeToolArgsForValidation({
+        args: typedArgs,
+        schema: tool.inputSchema,
+        toolClass: tool.tool_class,
+      }));
+    } catch (error) {
+      if (!(error instanceof ToolArgumentValidationError)) throw error;
       return {
         content: [
           {
@@ -294,7 +168,7 @@ export function createServer(
             text: JSON.stringify({
               error: "validation_failed",
               message: "Tool arguments failed schema validation",
-              violations: validationErrors,
+              violations: error.violations,
             }),
           },
         ],
@@ -304,26 +178,34 @@ export function createServer(
 
     // ── Approval Gate ──────────────────────────────────────────────
     // If a gate is configured, every tool call must pass through it.
-    // Denied calls return a generic error that does not reveal policy.
-    // When the block is approval-pending (Tier 1), the response carries
-    // a plain-English `operator_message` the agent's LLM can relay to
-    // the operator naturally. WP-V1.2 reshape: gives operators a second
-    // channel beyond the dashboard for noticing pending approvals.
+    // Denied calls return the fixed coarse schema; details stay in audit.
     if (gate) {
-      const result = await gate.evaluate(name, typedArgs);
-      if (!result.allowed) {
-        const errorPayload: {
-          error: string;
-          approval_required: boolean;
-          operator_message?: string;
-        } = {
-          error: "Operation not permitted",
-          approval_required: result.approval_required,
+      let gateArgs: Record<string, unknown>;
+      try {
+        gateArgs = tool.approvalTargetArgs?.(handlerArgs) ?? handlerArgs;
+      } catch {
+        const errorPayload = fixedDenial(`audit:gate:${name}`, "try_lower_scope", null);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(errorPayload),
+            },
+          ],
+          isError: true,
         };
-        if (result.approval_required) {
-          errorPayload.operator_message =
-            "This action requires your operator's approval. Sanctuary has logged this request for your operator to review. You can pause and ask your operator to check Sanctuary, or retry in a few seconds.";
-        }
+      }
+      const result = await gate.evaluate(
+        name,
+        gateArgs,
+        approvalRef ? { approval_ref: approvalRef } : undefined
+      );
+      if (!result.allowed) {
+        const errorPayload = fixedDenial(
+          `audit:gate:${name}`,
+          result.approval_required ? "request_review" : "try_lower_scope",
+          null
+        );
         return {
           content: [
             {
@@ -339,7 +221,7 @@ export function createServer(
     try {
       const findings = await options?.auditLog?.getIntegrityFindings();
       const hasIntegrityFindings = (findings?.length ?? 0) > 0;
-      const acceptBrokenChain = typedArgs.accept_broken_chain === true;
+      const acceptBrokenChain = handlerArgs.accept_broken_chain === true;
 
       if (tool.tool_class === "write" && hasIntegrityFindings && !acceptBrokenChain) {
         return {
@@ -371,7 +253,7 @@ export function createServer(
             },
           });
         }
-        return tool.handler(typedArgs);
+        return tool.handler(handlerArgs);
       };
 
       const shouldBypassAuditIntegrity =
@@ -383,7 +265,7 @@ export function createServer(
           : await runHandler();
       options?.toolCallTrapRuntime?.recordToolCall(
         name,
-        typedArgs,
+        handlerArgs,
         callerIdentity,
       );
       return result;

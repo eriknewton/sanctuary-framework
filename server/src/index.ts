@@ -62,6 +62,10 @@ import { loadSentinelSubscriptions } from "./sentinel/subscription-store.js";
 import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
+import {
+  fingerprintIdentityId,
+  type SessionBinding,
+} from "./agent-native/safety-base.js";
 import { createSHRTools } from "./shr/tools.js";
 import { createHandshakeTools } from "./handshake/tools.js";
 import { createFederationTools } from "./federation/tools.js";
@@ -291,6 +295,14 @@ export async function createSanctuaryServer(options?: {
 
   // 6. Initialize state store
   const stateStore = new StateStore(storage, masterKey);
+  const currentSessionBinding = (): SessionBinding | undefined => {
+    const identityId = process.env.SANCTUARY_SESSION_IDENTITY_ID;
+    if (!identityId) return undefined;
+    return {
+      identity_id: identityId,
+      requester_identity_fingerprint: fingerprintIdentityId(identityId),
+    };
+  };
 
   // 7. Create L1 tools
   const { tools: l1Tools, identityManager } = createL1Tools(
@@ -298,7 +310,8 @@ export async function createSanctuaryServer(options?: {
     storage,
     masterKey,
     keyProtection,
-    auditLog
+    auditLog,
+    { currentSessionBinding }
   );
 
   // 8. Load existing identities
@@ -878,6 +891,8 @@ export async function createSanctuaryServer(options?: {
     auditLog,
     injectionDetector,
     onInjectionAlert,
+    undefined,
+    { currentSessionBinding }
   );
 
   gate.setApprovalEventCallback((event) => {
@@ -1270,6 +1285,7 @@ export async function createSanctuaryServer(options?: {
     auditLog,
     toolCallTrapRuntime,
     currentAgentId: () => process.env.SANCTUARY_AGENT_ID,
+    currentSessionBinding,
   });
   if (proxyRouter) {
     enableToolListChangedNotifications(server);

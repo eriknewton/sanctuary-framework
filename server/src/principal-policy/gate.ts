@@ -15,6 +15,7 @@
  * - All gate decisions (approve, deny, allow) are audit-logged.
  */
 
+import { randomBytes } from "node:crypto";
 import type { PrincipalPolicy, GateResult, ApprovalRequest, ApprovalResponse } from "./types.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import { BaselineTracker } from "./baseline.js";
@@ -22,6 +23,17 @@ import { extractOperationName } from "./loader.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 import { InjectionDetector, type DetectionResult } from "../security/injection-detector.js";
 import { AGENT_VISIBLE_DENY_REASONS } from "./deny-vocabulary.js";
+import {
+  ApprovalProofStore,
+  approvalEnvelopeHash,
+  deriveTargetResource,
+  normalizedArgsHash,
+  resolveActiveSessionIdentity,
+  type ApprovalRecord,
+  type CanonicalApprovalEnvelope,
+  type RiskTier,
+  type SessionBinding,
+} from "../agent-native/safety-base.js";
 
 /** Callback invoked when an injection is detected, for dashboard broadcasting */
 export type InjectionAlertCallback = (alert: {
@@ -68,6 +80,8 @@ export class ApprovalGate {
   private onInjectionAlert?: InjectionAlertCallback;
   private onApprovalEvent?: ApprovalEventCallback;
   private proxyTierResolver?: ProxyTierResolver;
+  private approvalProofStore: ApprovalProofStore;
+  private currentSessionBinding?: () => SessionBinding | undefined;
 
   constructor(
     policy: PrincipalPolicy,
@@ -76,7 +90,11 @@ export class ApprovalGate {
     auditLog: AuditLog,
     injectionDetector?: InjectionDetector,
     onInjectionAlert?: InjectionAlertCallback,
-    onApprovalEvent?: ApprovalEventCallback
+    onApprovalEvent?: ApprovalEventCallback,
+    options?: {
+      approvalProofStore?: ApprovalProofStore;
+      currentSessionBinding?: () => SessionBinding | undefined;
+    }
   ) {
     this.policy = policy;
     this.baseline = baseline;
@@ -85,6 +103,8 @@ export class ApprovalGate {
     this.injectionDetector = injectionDetector ?? new InjectionDetector();
     this.onInjectionAlert = onInjectionAlert;
     this.onApprovalEvent = onApprovalEvent;
+    this.approvalProofStore = options?.approvalProofStore ?? new ApprovalProofStore();
+    this.currentSessionBinding = options?.currentSessionBinding;
   }
 
   /**
@@ -113,7 +133,8 @@ export class ApprovalGate {
    */
   async evaluate(
     toolName: string,
-    args: Record<string, unknown>
+    args: Record<string, unknown>,
+    approval?: { approval_ref: string }
   ): Promise<GateResult> {
     const operation = extractOperationName(toolName);
 
@@ -225,22 +246,47 @@ export class ApprovalGate {
       }
     }
 
+    const classification = this.classifyOperation(toolName, args);
+
+    if (approval) {
+      return this.verifyApprovalProof(toolName, args, approval.approval_ref, classification);
+    }
+
     // ── Tier 1: Always requires approval ──────────────────────────────
-    if (this.policy.tier1_always_approve.includes(operation)) {
-      return this.requestApproval(operation, 1, `"${operation}" is a Tier 1 operation (always requires approval)`, {
+    if (classification.tier === 1) {
+      if (classification.unclassified) {
+        await this.auditLog.appendCritical({
+          layer: "l2",
+          operation: `gate_unclassified:${operation}`,
+          identity_id: "system",
+          result: "success",
+          details: {
+            tier: 1,
+            operation,
+            warning: "Operation is not classified in any policy tier, defaulting to Tier 1 (require approval)",
+          },
+        });
+      }
+      return this.requestApproval(operation, 1, classification.reason, {
         operation,
         args_summary: this.summarizeArgs(args),
+        ...(classification.unclassified ? { unclassified: true } : {}),
       });
     }
 
     // ── Tier 2: Behavioral anomaly detection ──────────────────────────
-    const anomaly = this.detectAnomaly(operation, args);
-    if (anomaly) {
-      return this.requestApproval(operation, 2, anomaly.reason, anomaly.context, anomaly.commit);
+    if (classification.tier === 2 && classification.anomaly) {
+      return this.requestApproval(
+        operation,
+        2,
+        classification.anomaly.reason,
+        classification.anomaly.context,
+        classification.anomaly.commit
+      );
     }
 
     // ── Tier 3: Allow with audit logging (only for explicitly listed operations)
-    if (this.policy.tier3_always_allow.includes(operation)) {
+    if (classification.tier === 3) {
       await this.auditLog.appendCritical({
         layer: "l2",
         operation: `gate_allow:${operation}`,
@@ -260,27 +306,165 @@ export class ApprovalGate {
       };
     }
 
-    // ── Unlisted operation: default to Tier 1 (require approval) ─────
-    // SEC-011: Operations not classified in any tier must not auto-allow.
-    // Safe default is to require human approval.
+    return this.requestApproval(operation, 1, classification.reason, {
+      operation,
+      unclassified: true,
+    });
+  }
+
+  classifyRiskTier(toolName: string, args: Record<string, unknown>): RiskTier {
+    return this.classifyOperation(toolName, args, { dryRun: true }).tier;
+  }
+
+  createApprovedProof(params: {
+    toolName: string;
+    args: Record<string, unknown>;
+    session: SessionBinding;
+    expiresAt?: string;
+    auditId?: string;
+  }): ApprovalRecord {
+    const active = resolveActiveSessionIdentity(params.session);
+    const riskTier = this.classifyRiskTier(params.toolName, params.args);
+    const envelope: CanonicalApprovalEnvelope = {
+      tool_name: extractOperationName(params.toolName),
+      normalized_args_hash: normalizedArgsHash(params.args),
+      requester_identity_fingerprint: active.requester_identity_fingerprint,
+      target_resource: deriveTargetResource(extractOperationName(params.toolName), params.args),
+      risk_tier: riskTier,
+      expires_at: params.expiresAt ?? new Date(Date.now() + 5 * 60_000).toISOString(),
+      nonce: randomBytes(16).toString("hex"),
+      audit_id: params.auditId ?? `audit:approval:${Date.now()}`,
+    };
+    return this.approvalProofStore.createApproved(envelope);
+  }
+
+  private classifyOperation(
+    toolName: string,
+    args: Record<string, unknown>,
+    options: { dryRun?: boolean } = {}
+  ): {
+    tier: RiskTier;
+    reason: string;
+    anomaly?: { reason: string; context: Record<string, unknown>; commit?: () => void };
+    unclassified?: boolean;
+  } {
+    const operation = extractOperationName(toolName);
+
+    if (this.policy.tier1_always_approve.includes(operation)) {
+      return {
+        tier: 1,
+        reason: `"${operation}" is a Tier 1 operation (always requires approval)`,
+      };
+    }
+
+    const anomaly = this.detectAnomaly(operation, args, options);
+    if (anomaly) {
+      return { tier: 2, reason: anomaly.reason, anomaly };
+    }
+
+    if (this.policy.tier3_always_allow.includes(operation)) {
+      return { tier: 3, reason: "Operation allowed (Tier 3)" };
+    }
+
+    return {
+      tier: 1,
+      reason: `"${operation}" is not classified in any policy tier — requires approval (SEC-011 safe default)`,
+      unclassified: true,
+    };
+  }
+
+  private async verifyApprovalProof(
+    toolName: string,
+    args: Record<string, unknown>,
+    approvalRef: string,
+    classification: { tier: RiskTier }
+  ): Promise<GateResult> {
+    let active;
+    try {
+      active = resolveActiveSessionIdentity(this.currentSessionBinding?.());
+    } catch {
+      return this.denyProof(toolName, args, classification.tier);
+    }
+
+    const record = this.approvalProofStore.get(approvalRef);
+    if (!record) {
+      return this.denyProof(toolName, args, classification.tier);
+    }
+
+    const rebuilt: CanonicalApprovalEnvelope = {
+      ...record.envelope,
+      tool_name: extractOperationName(toolName),
+      normalized_args_hash: normalizedArgsHash(args),
+      requester_identity_fingerprint: active.requester_identity_fingerprint,
+      target_resource: deriveTargetResource(extractOperationName(toolName), args),
+      risk_tier: classification.tier,
+    };
+
+    const proofMatches =
+      approvalEnvelopeHash(rebuilt) === record.envelope_hash &&
+      record.decision === "approved" &&
+      Date.parse(record.envelope.expires_at) > Date.now() &&
+      rebuilt.requester_identity_fingerprint === record.envelope.requester_identity_fingerprint &&
+      rebuilt.nonce === record.envelope.nonce &&
+      rebuilt.target_resource === record.envelope.target_resource &&
+      rebuilt.tool_name === record.envelope.tool_name;
+
+    if (!proofMatches) {
+      return this.denyProof(toolName, args, classification.tier);
+    }
+
+    const consumed = this.approvalProofStore.consumeIfUnconsumed(approvalRef);
+    if (!consumed) {
+      return this.denyProof(toolName, args, classification.tier);
+    }
+
     await this.auditLog.appendCritical({
       layer: "l2",
-      operation: `gate_unclassified:${operation}`,
-      identity_id: "system",
+      operation: `gate_approval_proof:${extractOperationName(toolName)}`,
+      identity_id: active.identity_id,
       result: "success",
       details: {
-        tier: 1,
-        operation,
-        warning: "Operation is not classified in any policy tier, defaulting to Tier 1 (require approval)",
+        tier: classification.tier,
+        approval_ref: approvalRef,
+        envelope_hash: record.envelope_hash,
       },
     });
 
-    return this.requestApproval(
-      operation,
-      1,
-      `"${operation}" is not classified in any policy tier — requires approval (SEC-011 safe default)`,
-      { operation, unclassified: true }
-    );
+    return {
+      allowed: true,
+      tier: classification.tier,
+      reason: "Approval proof verified",
+      approval_required: classification.tier !== 3,
+      approval_response: {
+        decision: "approve",
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      },
+    };
+  }
+
+  private async denyProof(
+    toolName: string,
+    args: Record<string, unknown>,
+    tier: RiskTier
+  ): Promise<GateResult> {
+    await this.auditLog.appendCritical({
+      layer: "l2",
+      operation: `gate_deny:${extractOperationName(toolName)}`,
+      identity_id: "system",
+      result: "failure",
+      details: {
+        tier,
+        approval_proof: "invalid",
+        args_hash: normalizedArgsHash(args),
+      },
+    });
+    return {
+      allowed: false,
+      tier,
+      reason: AGENT_VISIBLE_DENY_REASONS.NOT_PERMITTED,
+      approval_required: tier !== 3,
+    };
   }
 
   /**
@@ -288,7 +472,8 @@ export class ApprovalGate {
    */
   private detectAnomaly(
     operation: string,
-    args: Record<string, unknown>
+    args: Record<string, unknown>,
+    options: { dryRun?: boolean } = {}
   ): { reason: string; context: Record<string, unknown>; commit?: () => void } | null {
     const config = this.policy.tier2_anomaly;
 
@@ -358,7 +543,7 @@ export class ApprovalGate {
 
     // ── Signing frequency ─────────────────────────────────────────────
     if (operation === "identity_sign") {
-      const signCount = this.baseline.recordSign();
+      const signCount = options.dryRun ? 0 : this.baseline.recordSign();
       if (signCount > config.max_signs_per_minute) {
         return {
           reason: `Signing frequency (${signCount}/min) exceeds limit (${config.max_signs_per_minute}/min)`,
@@ -375,7 +560,7 @@ export class ApprovalGate {
     if (operation === "state_read") {
       const namespace = args.namespace as string | undefined;
       if (namespace) {
-        const readCount = this.baseline.recordNamespaceRead(namespace);
+        const readCount = options.dryRun ? 0 : this.baseline.recordNamespaceRead(namespace);
         if (readCount > config.bulk_read_threshold) {
           return {
             reason: `Bulk read detected: ${readCount} reads from "${namespace}" in 60 seconds (threshold: ${config.bulk_read_threshold})`,

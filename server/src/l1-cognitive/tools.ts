@@ -7,7 +7,11 @@
 
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
-import { StateStore, StateVerificationError } from "./state-store.js";
+import {
+  decodeExportBundleNamespaces,
+  StateStore,
+  StateVerificationError,
+} from "./state-store.js";
 import {
   createIdentity,
   rotateKeys,
@@ -27,6 +31,12 @@ import type { StorageBackend } from "../storage/interface.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
 import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
+import {
+  fixedDenial,
+  OpaqueNamespaceRegistry,
+  resolveActiveSessionIdentity,
+  type SessionBinding,
+} from "../agent-native/safety-base.js";
 
 export const AUDIT_EVENT_SIGNING_DOMAIN = "sanctuary.audit.v1";
 export const INTERNAL_RECEIPT_SIGNING_DOMAIN = "sanctuary.receipt.v1";
@@ -705,13 +715,19 @@ export function createL1Tools(
   storage: StorageBackend,
   masterKey: Uint8Array,
   keyProtection: "passphrase" | "hardware-key" | "recovery-key",
-  auditLog?: AuditLog
+  auditLog?: AuditLog,
+  options?: {
+    namespaceRegistry?: OpaqueNamespaceRegistry;
+    currentSessionBinding?: () => SessionBinding | undefined;
+  }
 ): {
   tools: ToolDefinition[];
   identityManager: IdentityManager;
   internalSigning: InternalIdentitySigningHelpers;
+  namespaceRegistry: OpaqueNamespaceRegistry;
 } {
   const identityMgr = new IdentityManager(storage, masterKey);
+  const namespaceRegistry = options?.namespaceRegistry ?? new OpaqueNamespaceRegistry();
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
   const internalSigning = createInternalIdentitySigningHelpers(
     identityMgr,
@@ -721,17 +737,70 @@ export function createL1Tools(
 
   // Helper to get identity or throw
   function resolveIdentity(identityId?: string): StoredIdentity {
-    const id = identityId
-      ? identityMgr.get(identityId)
+    const binding = options?.currentSessionBinding?.();
+    const idToResolve = identityId ?? (binding
+      ? resolveActiveSessionIdentity(binding).identity_id
+      : undefined);
+    const id = idToResolve
+      ? identityMgr.get(idToResolve)
       : identityMgr.getDefault();
     if (!id) {
       throw new Error(
-        identityId
-          ? `Identity not found: ${identityId}`
+        idToResolve
+          ? `Identity not found: ${idToResolve}`
           : "No default identity. Create one with sanctuary/identity_create."
       );
     }
     return id;
+  }
+
+  async function denyNamespaceAccess(operation: string, namespace: string) {
+    await recordCriticalAudit(auditLog, "l1", operation, "system", {
+      namespace,
+      denial_class: "namespace_unavailable",
+    }, "failure");
+    return toolResult(fixedDenial(`audit:${operation}`));
+  }
+
+  function assertOpaqueNamespaceOwned(namespace: string): void {
+    namespaceRegistry.assertOwned(namespace, options?.currentSessionBinding?.());
+  }
+
+  function assertOpaqueNamespacesOwned(namespaces: string[]): void {
+    for (const namespace of namespaces) {
+      namespaceRegistry.assertOwned(namespace, options?.currentSessionBinding?.());
+    }
+  }
+
+  function sessionOwnedExportNamespaces(): string[] {
+    const binding = options?.currentSessionBinding?.();
+    if (!binding) return stateStore.listCachedExportableNamespaces();
+    const active = resolveActiveSessionIdentity(binding);
+    const namespaces = stateStore.listCachedExportableNamespaces();
+    const exportable: string[] = [];
+    for (const namespace of namespaces) {
+      if (!namespaceRegistry.isOpaqueMemoryHandle(namespace)) {
+        exportable.push(namespace);
+        continue;
+      }
+      const owner = namespaceRegistry.getOwner(namespace);
+      if (!owner) {
+        throw new Error("namespace_ownership_ambiguous");
+      }
+      if (owner === active.identity_id) {
+        exportable.push(namespace);
+      }
+    }
+    return exportable.sort();
+  }
+
+  function assertIdentityMatchesSession(identityId: string | undefined, operation: string): void {
+    const binding = options?.currentSessionBinding?.();
+    if (!binding) return;
+    const active = resolveActiveSessionIdentity(binding);
+    if (identityId && identityId !== active.identity_id) {
+      throw new Error(`${operation}: identity binding unavailable`);
+    }
   }
 
   const tools: ToolDefinition[] = [
@@ -874,6 +943,11 @@ export function createL1Tools(
         required: ["payload"],
       },
       handler: async (args) => {
+        try {
+          assertIdentityMatchesSession(args.identity_id as string | undefined, "identity_sign");
+        } catch {
+          return toolResult(fixedDenial("audit:identity_sign"));
+        }
         const identity = resolveIdentity(args.identity_id as string | undefined);
         const payloadStr = args.payload as string;
 
@@ -1089,6 +1163,13 @@ export function createL1Tools(
           });
         }
 
+        try {
+          assertOpaqueNamespaceOwned(args.namespace as string);
+          assertIdentityMatchesSession(args.identity_id as string | undefined, "state_write");
+        } catch {
+          return denyNamespaceAccess("state_write", args.namespace as string);
+        }
+
         const identity = resolveIdentity(args.identity_id as string | undefined);
         const metadata = args.metadata as {
           content_type?: string;
@@ -1143,6 +1224,12 @@ export function createL1Tools(
           });
         }
 
+        try {
+          assertOpaqueNamespaceOwned(args.namespace as string);
+        } catch {
+          return denyNamespaceAccess("state_read", args.namespace as string);
+        }
+
         let result;
         try {
           result = await stateStore.read(
@@ -1176,11 +1263,7 @@ export function createL1Tools(
         }
 
         if (!result) {
-          return toolResult({
-            error: "not_found",
-            namespace: args.namespace,
-            key: args.key,
-          });
+          return toolResult(fixedDenial("audit:state_read"));
         }
 
         auditLog?.append("l1", "state_read", result.written_by, {
@@ -1215,6 +1298,12 @@ export function createL1Tools(
             error: "namespace_reserved",
             message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot list reserved namespaces.`,
           });
+        }
+
+        try {
+          assertOpaqueNamespaceOwned(args.namespace as string);
+        } catch {
+          return denyNamespaceAccess("state_list", args.namespace as string);
         }
 
         const result = await stateStore.list(
@@ -1252,6 +1341,12 @@ export function createL1Tools(
           });
         }
 
+        try {
+          assertOpaqueNamespaceOwned(args.namespace as string);
+        } catch {
+          return denyNamespaceAccess("state_delete", args.namespace as string);
+        }
+
         await recordCriticalAudit(auditLog, "l1", "state_delete", "principal", {
           namespace: args.namespace,
           key: args.key,
@@ -1278,10 +1373,32 @@ export function createL1Tools(
           format: { type: "string", default: "sanctuary-v1" },
         },
       },
+      approvalTargetArgs: (args) =>
+        typeof args.namespace === "string"
+          ? args
+          : { ...args, namespaces: sessionOwnedExportNamespaces() },
       handler: async (args) => {
-        const result = await stateStore.export(
-          args.namespace as string | undefined
-        );
+        let namespaces: string[] | undefined;
+        if (typeof args.namespace === "string") {
+          try {
+            assertOpaqueNamespaceOwned(args.namespace);
+          } catch {
+            return denyNamespaceAccess("state_export", args.namespace);
+          }
+        } else if (options?.currentSessionBinding?.()) {
+          try {
+            namespaces = sessionOwnedExportNamespaces();
+          } catch {
+            return denyNamespaceAccess("state_export", "state_export");
+          }
+        } else {
+          namespaces = sessionOwnedExportNamespaces();
+        }
+
+        const result =
+          typeof args.namespace === "string"
+            ? await stateStore.export(args.namespace)
+            : await stateStore.exportNamespaces(namespaces);
 
         await recordCriticalAudit(auditLog, "l1", "state_export", "principal", {
           namespaces: result.namespaces,
@@ -1306,7 +1423,19 @@ export function createL1Tools(
         },
         required: ["bundle"],
       },
+      approvalTargetArgs: (args) => ({
+        ...args,
+        namespaces: decodeExportBundleNamespaces(args.bundle as string),
+      }),
       handler: async (args) => {
+        let targetNamespaces: string[];
+        try {
+          targetNamespaces = decodeExportBundleNamespaces(args.bundle as string);
+          assertOpaqueNamespacesOwned(targetNamespaces);
+        } catch {
+          return denyNamespaceAccess("state_import", "state_import");
+        }
+
         // Wire public key resolver for signature verification (SEC-005)
         const publicKeyResolver = (kid: string): Uint8Array | null => {
           const identity = identityMgr.get(kid);
@@ -1318,6 +1447,7 @@ export function createL1Tools(
           conflict_resolution:
             (args.conflict_resolution as "skip" | "overwrite" | "version") ??
             "skip",
+          namespaces: targetNamespaces,
         });
 
         const result = await stateStore.import(
@@ -1332,5 +1462,5 @@ export function createL1Tools(
     },
   ];
 
-  return { tools, identityManager: identityMgr, internalSigning };
+  return { tools, identityManager: identityMgr, internalSigning, namespaceRegistry };
 }

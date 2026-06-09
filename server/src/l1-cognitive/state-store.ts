@@ -77,6 +77,29 @@ export class StateVerificationError extends Error {
   }
 }
 
+export function decodeExportBundleNamespaces(bundleBase64: string): string[] {
+  const bundleBytes = fromBase64url(bundleBase64);
+  const bundleJson = bytesToString(bundleBytes);
+  const bundle = JSON.parse(bundleJson) as {
+    namespaces?: unknown;
+    data?: unknown;
+  };
+  const actualNamespaces =
+    bundle.data && typeof bundle.data === "object" && !Array.isArray(bundle.data)
+      ? Object.keys(bundle.data).sort()
+      : [];
+  if (Array.isArray(bundle.namespaces)) {
+    if (!bundle.namespaces.every((namespace) => typeof namespace === "string")) {
+      throw new Error("export bundle namespace metadata is invalid");
+    }
+    const declaredNamespaces = [...bundle.namespaces].sort();
+    if (declaredNamespaces.join("\0") !== actualNamespaces.join("\0")) {
+      throw new Error("export bundle namespace metadata does not match data");
+    }
+  }
+  return actualNamespaces;
+}
+
 export class LegacyEnvelopeWarning extends Error {
   readonly classification = "legacy_schema_1";
 
@@ -1197,6 +1220,26 @@ export class StateStore {
     bundle_hash: string;
     exported_at: string;
   }> {
+    return this.exportNamespaces(
+      namespace === undefined ? undefined : [namespace]
+    );
+  }
+
+  listCachedExportableNamespaces(): string[] {
+    return [...this.contentHashes.keys()]
+      .filter((namespace) => !namespace.startsWith("_"))
+      .sort();
+  }
+
+  async exportNamespaces(
+    requestedNamespaces?: string[]
+  ): Promise<{
+    bundle: string;
+    namespaces: string[];
+    total_keys: number;
+    bundle_hash: string;
+    exported_at: string;
+  }> {
     const namespacesToExport: string[] = [];
 
     // F6: never export internal `_`-prefixed namespaces — import() rejects them
@@ -1204,16 +1247,15 @@ export class StateStore {
     // export must not expose. Filter HERE (not mid-loop) so the serialized
     // `namespaces` metadata and `data` stay consistent: the bundle never lists a
     // namespace it does not actually contain.
-    if (namespace) {
-      if (!namespace.startsWith("_")) {
-        namespacesToExport.push(namespace);
+    if (requestedNamespaces) {
+      for (const namespace of requestedNamespaces) {
+        if (!namespace.startsWith("_") && !namespacesToExport.includes(namespace)) {
+          namespacesToExport.push(namespace);
+        }
       }
     } else {
       // Discover all namespaces from the content hash cache
-      for (const ns of this.contentHashes.keys()) {
-        if (ns.startsWith("_")) continue;
-        namespacesToExport.push(ns);
-      }
+      namespacesToExport.push(...this.listCachedExportableNamespaces());
     }
 
     const exportData: Record<
@@ -1278,6 +1320,7 @@ export class StateStore {
     const bundleBytes = fromBase64url(bundleBase64);
     const bundleJson = bytesToString(bundleBytes);
     const bundle = JSON.parse(bundleJson);
+    decodeExportBundleNamespaces(bundleBase64);
 
     let importedKeys = 0;
     let skippedKeys = 0;
