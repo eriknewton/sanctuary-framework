@@ -62,12 +62,16 @@ const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
  *   reading the Principal Policy or its baseline must never be a silent
  *   agent-auto-allowed operation (no-read invariant; an agent that can read the
  *   policy can plan to evade it).
+ * - context_gate_set_policy / context_gate_apply_template: policy-adjacent
+ *   enforcement mutations must not be silently agent-auto-allowed.
  */
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
   "principal_policy_view",
   "principal_baseline_view",
   "sanctuary_policy_status",
+  "context_gate_set_policy",
+  "context_gate_apply_template",
 ] as const;
 
 /** Default Principal Policy — provides meaningful protection without configuration */
@@ -102,6 +106,8 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "principal_policy_view", // Reads Principal Policy; always requires approval.
     "principal_baseline_view", // Reads Principal Policy baseline; always requires approval.
     "sanctuary_policy_status", // Reads Principal Policy status; always requires approval.
+    "context_gate_set_policy", // Policy-adjacent enforcement mutation; always requires approval.
+    "context_gate_apply_template", // Policy-adjacent enforcement mutation; always requires approval.
     // WP-MVP-2 Operator Console: federation-node-join requires explicit
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
@@ -144,8 +150,6 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "zk_verify",
     "zk_range_prove",
     "zk_range_verify",
-    "context_gate_set_policy",
-    "context_gate_apply_template",
     "context_gate_recommend",
     "context_gate_filter",
     "context_gate_list_policies",
@@ -403,6 +407,8 @@ tier1_always_approve:
   - principal_policy_view
   - principal_baseline_view
   - sanctuary_policy_status
+  - context_gate_set_policy
+  - context_gate_apply_template
 
 # ─── Tier 2: Behavioral Anomaly Detection ────────────────────────────────
 # Triggers approval when agent behavior deviates from its baseline.
@@ -453,8 +459,6 @@ tier3_always_allow:
   - zk_verify
   - zk_range_prove
   - zk_range_verify
-  - context_gate_set_policy
-  - context_gate_apply_template
   - context_gate_recommend
   - context_gate_filter
   - context_gate_list_policies

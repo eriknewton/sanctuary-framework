@@ -86,7 +86,10 @@ describe("generateSystemPrompt — v2 (Enhanced)", () => {
     it("mentions all relevant tool names", () => {
       const prompt = generateSystemPrompt(allFeaturesOn());
       expect(prompt).toContain("context_gate_filter");
-      expect(prompt).toContain("context_gate_set_policy");
+      expect(prompt).toContain("context_gate_recommend");
+      expect(prompt).toContain("context_gate_list_policies");
+      expect(prompt).not.toContain("context_gate_set_policy");
+      expect(prompt).not.toContain("context_gate_apply_template");
       expect(prompt).toContain("zk_commit");
       expect(prompt).toContain("zk_prove");
       expect(prompt).toContain("proof_commitment");

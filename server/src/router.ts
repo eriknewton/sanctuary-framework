@@ -42,6 +42,11 @@ export interface ToolDefinition {
   handler: ToolHandler;
 }
 
+const AGENT_CATALOG_HIDDEN_TOOLS = new Set([
+  "context_gate_set_policy",
+  "context_gate_apply_template",
+]);
+
 /** Options for server creation */
 export interface ServerOptions {
   /** Approval gate — if provided, every tool call is evaluated before execution */
@@ -96,7 +101,9 @@ export function createServer(
       options?.toolCallTrapRuntime?.listCatalogTools(
         options.currentAgentId?.(),
       ) ?? [];
-    const catalog = [...tools, ...honeypotTools];
+    const catalog = [...tools, ...honeypotTools].filter(
+      (tool) => !AGENT_CATALOG_HIDDEN_TOOLS.has(tool.name)
+    );
     return {
       tools: catalog.map((t) => ({
         name: t.name,

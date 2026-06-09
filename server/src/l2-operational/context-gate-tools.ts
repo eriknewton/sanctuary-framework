@@ -348,8 +348,7 @@ export function createContextGateTools(
         return toolResult({
           policy_id: policy.policy_id,
           policy_name: policy.policy_name,
-          rules: policy.rules,
-          default_action: policy.default_action,
+          rule_count: policy.rules.length,
           created_at: policy.created_at,
           message:
             "Context-gating policy created. Use context_gate_filter " +
@@ -418,8 +417,7 @@ export function createContextGateTools(
           policy_name: template.name,
           description: template.description,
           use_when: template.use_when,
-          rules: policy.rules,
-          default_action: policy.default_action,
+          rule_count: policy.rules.length,
           created_at: policy.created_at,
           message:
             "Template applied. Use context_gate_filter with this " +
@@ -684,7 +682,7 @@ export function createContextGateTools(
       name: "context_gate_list_policies",
       description:
         "List all configured context-gating policies. Returns policy IDs, " +
-        "names, rule summaries, and default actions.",
+        "names, and selector-safe metadata.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -701,9 +699,6 @@ export function createContextGateTools(
             policy_id: p.policy_id,
             policy_name: p.policy_name,
             rule_count: p.rules.length,
-            providers: p.rules.map((r) => r.provider),
-            default_action: p.default_action,
-            identity_id: p.identity_id ?? null,
             created_at: p.created_at,
             updated_at: p.updated_at,
           })),
@@ -711,7 +706,7 @@ export function createContextGateTools(
           message:
             policies.length === 0
               ? "No context-gating policies configured. Use " +
-                "context_gate_set_policy to create one."
+                "operator terminal policy tools to create one."
               : `${policies.length} context-gating ${policies.length === 1 ? "policy" : "policies"} configured.`,
         });
       },

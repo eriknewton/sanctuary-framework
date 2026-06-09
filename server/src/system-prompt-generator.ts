@@ -43,11 +43,9 @@ const FEATURE_INFO: Record<string, FeaturePromptInfo> = {
   context_gating: {
     name: "Context Gating",
     activeDescription:
-      "Before sending context to any external API (LLM inference, tool APIs, logging services), call context_gate_filter to strip sensitive fields. Use context_gate_set_policy to define filtering rules, or context_gate_apply_template for presets.",
+      "Before sending context to any external API (LLM inference, tool APIs, logging services), call context_gate_filter to strip sensitive fields. Use context_gate_list_policies to find operator-approved policies, or context_gate_recommend to draft a recommendation for operator review.",
     toolNames: [
       "context_gate_filter",
-      "context_gate_set_policy",
-      "context_gate_apply_template",
       "context_gate_recommend",
       "context_gate_list_policies",
     ],

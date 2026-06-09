@@ -47,6 +47,30 @@ describe("Context Gate Tools", () => {
       expect(parsed.rules || parsed.rule_count !== undefined).toBeTruthy();
     });
 
+    it("does not return live rules or default action after creating a policy", async () => {
+      const { findTool } = setup();
+      const tool = findTool("context_gate_set_policy");
+      const result = await tool.handler({
+        policy_name: "redaction-test",
+        rules: [
+          {
+            provider: "inference",
+            allow: ["model"],
+            redact: ["secret_context"],
+          },
+        ],
+        default_action: "deny",
+      });
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.policy_id).toBeDefined();
+      expect(parsed.rule_count).toBe(1);
+      expect(parsed.rules).toBeUndefined();
+      expect(parsed.default_action).toBeUndefined();
+      expect(result.content[0].text).not.toContain("secret_context");
+      expect(result.content[0].text).not.toContain("\"deny\"");
+    });
+
     it("rejects policy with too many rules", async () => {
       const { findTool } = setup();
       const tool = findTool("context_gate_set_policy");
@@ -67,6 +91,18 @@ describe("Context Gate Tools", () => {
       const result = await tool.handler({ template_id: "inference-minimal" });
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.template_applied).toBe("inference-minimal");
+    });
+
+    it("does not return template rules or default action after applying a template", async () => {
+      const { findTool } = setup();
+      const tool = findTool("context_gate_apply_template");
+      const result = await tool.handler({ template_id: "inference-minimal" });
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.policy_id).toBeDefined();
+      expect(parsed.rule_count).toBeGreaterThan(0);
+      expect(parsed.rules).toBeUndefined();
+      expect(parsed.default_action).toBeUndefined();
     });
 
     it("rejects unknown template", async () => {
@@ -114,6 +150,42 @@ describe("Context Gate Tools", () => {
       const result = await listTool.handler({});
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.policies.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("does not disclose live policy posture in the agent-facing list response", async () => {
+      const { findTool } = setup();
+      const setPolicyTool = findTool("context_gate_set_policy");
+      await setPolicyTool.handler({
+        policy_name: "strict-agent-redaction",
+        rules: [
+          {
+            provider: "inference",
+            allow: ["task_description"],
+            redact: ["secret_context"],
+          },
+        ],
+        default_action: "deny",
+        identity_id: "operator@example.test",
+      });
+
+      const listTool = findTool("context_gate_list_policies");
+      const result = await listTool.handler({});
+      const parsed = JSON.parse(result.content[0].text);
+      const listed = parsed.policies.find(
+        (policy: { policy_name: string }) =>
+          policy.policy_name === "strict-agent-redaction"
+      );
+
+      expect(listed).toBeDefined();
+      expect(listed.policy_id).toBeDefined();
+      expect(listed.rule_count).toBe(1);
+      expect(listed.rules).toBeUndefined();
+      expect(listed.providers).toBeUndefined();
+      expect(listed.default_action).toBeUndefined();
+      expect(listed.identity_id).toBeUndefined();
+      expect(result.content[0].text).not.toContain("secret_context");
+      expect(result.content[0].text).not.toContain("\"deny\"");
+      expect(result.content[0].text).not.toContain("operator@example.test");
     });
   });
 

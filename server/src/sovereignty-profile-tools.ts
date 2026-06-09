@@ -12,8 +12,28 @@
 import type { ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
 import type { AuditLog } from "./l2-operational/audit-log.js";
-import type { SovereigntyProfileStore, SovereigntyProfileUpdate } from "./sovereignty-profile.js";
+import type {
+  SovereigntyProfile,
+  SovereigntyProfileStore,
+  SovereigntyProfileUpdate,
+} from "./sovereignty-profile.js";
 import { generateSystemPrompt } from "./system-prompt-generator.js";
+
+function summarizeProfileForAgent(profile: SovereigntyProfile) {
+  return {
+    version: profile.version,
+    features: profile.features,
+    upstream_servers: (profile.upstream_servers ?? []).map((server) => ({
+      name: server.name,
+      enabled: server.enabled,
+      transport_type: server.transport.type,
+      destination_category: server.destination_category,
+      privacy_policy_bound: server.privacy_policy_id !== undefined,
+      privacy_identity_bound: server.privacy_identity_id !== undefined,
+    })),
+    updated_at: profile.updated_at,
+  };
+}
 
 /**
  * Create the sovereignty profile MCP tools.
@@ -44,8 +64,10 @@ export function createSovereigntyProfileTools(
         });
 
         return toolResult({
-          profile,
-          message: "Current Sovereignty Profile. Use sovereignty_profile_update to change settings.",
+          profile: summarizeProfileForAgent(profile),
+          message:
+            "Current Sovereignty Profile summary. Operator-only connection " +
+            "details and tier policy are not returned through this agent-facing view.",
         });
       },
     },
