@@ -1,38 +1,136 @@
 import { readFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { relative, join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 describe("SDW architecture write gate", () => {
+  it("does not expose raw write authority from the public SDW barrel", async () => {
+    const barrel = await import("../../src/sdw/index.js");
+
+    expect(barrel).not.toHaveProperty("runWithSdwWriteAuthority");
+    expect(barrel).not.toHaveProperty("sdwBackendWriteAuthenticatedMeta");
+  });
+
   it("keeps SDW backend writes centralized in the write gate", async () => {
-    const root = join(process.cwd(), "src", "sdw");
+    const root = join(process.cwd(), "src");
     const offenders: string[] = [];
     for (const file of await listTsFiles(root)) {
-      const relative = file.slice(root.length + 1);
-      if (relative === "write-gate.ts") {
+      const path = relative(root, file);
+      if (path === join("sdw", "write-gate.ts")) {
         continue;
       }
       const source = await readFile(file, "utf8");
-      if (relative === "lmdb-backend.ts") {
-        if (!source.includes("assertSdwRawWriteAuthorized(namespace);")) {
-          offenders.push(`${relative}: missing raw SDW namespace guard`);
-        }
-        if (!source.includes("prepareSdwBackendWrite(persistable, encryptionKey, fortressId)")) {
-          offenders.push(`${relative}: missing transactional write gate`);
-        }
+      if (path === join("sdw", "lmdb-backend.ts")) {
+        offenders.push(...findLmdbWriteGateOffenders(source, path));
         continue;
       }
-      const directWritePatterns = [
-        /\b(?:storage|backend|txn|this\.storage|this\.backend)\.write\s*\(/,
-        /\bwrite\s*\(\s*["']_sdw_/,
-        /\bput(?:Sync)?\s*\(\s*compositeKey\s*\(/,
-      ];
-      if (directWritePatterns.some((pattern) => pattern.test(source))) {
-        offenders.push(`${relative}: raw write call`);
+
+      if (callsSdwRawWrite(source)) {
+        offenders.push(`${path}: raw SDW namespace write outside the SDW write gate`);
+      }
+      if (writesLmdbCompositeKey(source)) {
+        offenders.push(`${path}: direct LMDB composite-key write outside the SDW backend`);
+      }
+      if (importsPublicSdwBarrel(source)) {
+        if (callsForbiddenSdwAuthority(source)) {
+          offenders.push(`${path}: imports public SDW barrel and calls raw write authority`);
+        }
+        if (callsSdwRawWrite(source)) {
+          offenders.push(`${path}: imports public SDW barrel and writes directly to an SDW namespace`);
+        }
       }
     }
     expect(offenders).toEqual([]);
   });
 });
+
+function callsSdwRawWrite(source: string): boolean {
+  return [
+    /\b(?:storage|backend|txn|this\.storage|this\.backend)\.write\s*\(\s*["'`]_sdw_/,
+    /\bwrite\s*\(\s*["'`]_sdw_/,
+    /\b(?:storage|backend|txn|this\.storage|this\.backend)\.write\s*\(\s*SDW_[A-Z_]+_NAMESPACE\b/,
+    /\bwrite\s*\(\s*SDW_[A-Z_]+_NAMESPACE\b/,
+  ].some((pattern) => pattern.test(source));
+}
+
+function writesLmdbCompositeKey(source: string): boolean {
+  return /\bput(?:Sync)?\s*\(\s*compositeKey\s*\(/.test(source);
+}
+
+function importsPublicSdwBarrel(source: string): boolean {
+  return /from\s+["'][^"']*(?:\/sdw|\/sdw\/index\.js)["']/.test(source);
+}
+
+function callsForbiddenSdwAuthority(source: string): boolean {
+  return /\b(?:runWithSdwWriteAuthority|sdwBackendWriteAuthenticatedMeta)\s*\(/.test(source);
+}
+
+function findLmdbWriteGateOffenders(source: string, path: string): string[] {
+  const offenders: string[] = [];
+  const publicWrite = extractBalancedBlock(
+    source,
+    /async\s+write\s*\(\s*namespace:\s*string,\s*key:\s*string,\s*data:\s*Uint8Array\s*\)/,
+  );
+  if (publicWrite === null) {
+    offenders.push(`${path}: missing public backend write implementation`);
+  } else if (!writeBlockChecksBeforeRawPut(publicWrite)) {
+    offenders.push(`${path}: public backend write can reach LMDB without the raw SDW guard`);
+  }
+
+  const txnWrite = extractBalancedBlock(source, /write:\s*async\s*\(\s*namespace,\s*key,\s*data\s*\)\s*=>/);
+  if (txnWrite === null) {
+    offenders.push(`${path}: missing transactional raw write implementation`);
+  } else if (!writeBlockChecksBeforeRawPut(txnWrite)) {
+    offenders.push(`${path}: transactional raw write can reach LMDB without the raw SDW guard`);
+  }
+
+  const txnPersistable = extractBalancedBlock(
+    source,
+    /writePersistable:\s*async\s*\(\s*persistable,\s*encryptionKey,\s*fortressId\s*\)\s*=>/,
+  );
+  if (txnPersistable === null) {
+    offenders.push(`${path}: missing transactional persistable write implementation`);
+  } else if (!persistableBlockUsesPreparedAuthority(txnPersistable)) {
+    offenders.push(`${path}: transactional persistable write does not use the SDW prepare/authority path`);
+  }
+
+  return offenders;
+}
+
+function writeBlockChecksBeforeRawPut(block: string): boolean {
+  const guardIndex = block.indexOf("assertSdwRawWriteAuthorized(namespace)");
+  const putIndex = block.search(/\bput(?:Sync)?\s*\(\s*compositeKey\s*\(\s*namespace\s*,\s*key\s*\)/);
+  return guardIndex >= 0 && putIndex >= 0 && guardIndex < putIndex;
+}
+
+function persistableBlockUsesPreparedAuthority(block: string): boolean {
+  const prepareIndex = block.indexOf("prepareSdwBackendWrite(persistable, encryptionKey, fortressId)");
+  const authorityIndex = block.indexOf("runWithSdwWriteAuthority");
+  const putPreparedIndex = block.search(
+    /\bputSync\s*\(\s*compositeKey\s*\(\s*prepared\.namespace\s*,\s*prepared\.storageKey\s*\)/,
+  );
+  return (
+    prepareIndex >= 0 &&
+    authorityIndex > prepareIndex &&
+    putPreparedIndex > authorityIndex
+  );
+}
+
+function extractBalancedBlock(source: string, signature: RegExp): string | null {
+  const match = signature.exec(source);
+  if (match === null) return null;
+  const openIndex = source.indexOf("{", match.index + match[0].length);
+  if (openIndex < 0) return null;
+  let depth = 0;
+  for (let index = openIndex; index < source.length; index++) {
+    const char = source[index];
+    if (char === "{") depth++;
+    if (char === "}") {
+      depth--;
+      if (depth === 0) return source.slice(openIndex, index + 1);
+    }
+  }
+  return null;
+}
 
 async function listTsFiles(root: string): Promise<string[]> {
   const out: string[] = [];

@@ -12,6 +12,7 @@ Branch: `feat/sdw-phase1-foundation`
 - Added the D3 write gate: branded `Persistable<T>`, single `mintPersistable` brand factory, taint enforcement, size/schema checks, grammar checks, AAD construction, defense-in-depth classifier, and centralized `sdwBackendWrite`.
 - Closed adversarial review P1s: `sdwBackendWrite` now revalidates the runtime persistable at the actual write boundary, including taint, schema, namespace, storage key, fortress id, classifier, and recomputed AAD. The TypeScript brand remains a compile-time aid, not the load-bearing persistence guarantee.
 - Closed raw SDW write bypasses: `LmdbStorageBackend.write` and transactional `SdwTxn.write` reject direct SDW namespace writes unless the SDW write gate has opened the write authority for that call; transactions now expose `writePersistable` for gated encrypted SDW writes.
+- Closed R2 P1 public-barrel bypass: `server/src/sdw/index.ts` now explicitly re-exports only public write-gate APIs and does not expose `runWithSdwWriteAuthority` or `sdwBackendWriteAuthenticatedMeta`; callers cannot import the public SDW barrel to open raw LMDB write authority or perform arbitrary `_sdw_meta` writes.
 - Added catalog store support for `_sdw_catalog/catalog.environment` under `sdw-catalog-v1`, including fortress binding and fail-closed open behavior.
 - Added the MAC-authenticated replay anchor at `_sdw_meta/sdw-replay-anchors-v1`, following the existing `{ marker, data, mac }` anchor pattern.
 - Added typed `UnsupportedRecordVersion` behavior: direct read throws; list rehydration skips with accounting.
@@ -45,13 +46,13 @@ Branch: `feat/sdw-phase1-foundation`
   - catalog missing/mismatched fortress behavior fails closed;
   - replay anchor valid/invalid/stripped semantics are covered;
   - unknown-newer direct read throws `UnsupportedRecordVersion`, while list rehydration skips with accounting, including non-primary `catalog.*` keys.
-- Architecture test in `server/test/sdw/sdw-architecture.test.ts` fails if SDW files call backend or transaction writes outside `write-gate.ts`, and checks the LMDB backend keeps both the raw namespace guard and transactional gated write path.
+- Architecture test in `server/test/sdw/sdw-architecture.test.ts` fails if the public SDW barrel exports raw write authority helpers, if any `server/src` file directly writes to an `_sdw_*` namespace outside the gated path, if any source file imports the public SDW barrel and attempts raw authority/direct SDW writes, or if LMDB's allowed write sites lose the reachable guard/prepare/authority sequence.
 
 ## Verification
 
 - `cd server && npm run typecheck`: passed.
-- `cd server && npm test`: passed.
-- Final test summary: `446 passed | 1 skipped` test files; `5471 passed | 8 skipped` tests.
+- `cd server && npm test`: passed with sandbox escalation after the managed sandbox blocked local TCP/Unix socket binds and macOS keychain/global backup paths.
+- Final test summary: `446 passed | 1 skipped` test files; `5472 passed | 8 skipped` tests.
 - `.test-baseline`: `5423`; final passing count is above baseline.
 - No transform or collection errors in the final Vitest summary.
 

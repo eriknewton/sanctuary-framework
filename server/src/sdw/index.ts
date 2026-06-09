@@ -4,4 +4,14 @@ export * from "./grammar.js";
 export * from "./lmdb-backend.js";
 export * from "./records.js";
 export * from "./replay-anchor.js";
-export * from "./write-gate.js";
+export {
+  assertAllowedTaint,
+  combineTaint,
+  isSdwNamespace,
+  mintPersistable,
+  prepareSdwBackendWrite,
+  sdwBackendWrite,
+  type Persistable,
+  type Taint,
+  type Untrusted,
+} from "./write-gate.js";
