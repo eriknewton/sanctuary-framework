@@ -19,10 +19,12 @@ import {
   SdwWorkingStateStore,
 } from "../../src/sdw/index.js";
 import {
+  SDW_META_NAMESPACE,
   SDW_DOCUMENT_CORPUS_HKDF_INFO,
   SDW_DOCUMENT_CORPUS_NAMESPACE,
   SDW_QUERY_HISTORY_HKDF_INFO,
   SDW_QUERY_HISTORY_NAMESPACE,
+  SDW_REPLAY_ANCHOR_KEY,
   SDW_WORKING_STATE_HKDF_INFO,
   SDW_WORKING_STATE_NAMESPACE,
   type SdwDocumentChunkRecord,
@@ -31,7 +33,8 @@ import {
   type SdwWorkingStateRecord,
 } from "../../src/sdw/records.js";
 import { assertSdwRawWriteAuthorized, encryptedEnvelopeContains } from "../../src/sdw/write-gate.js";
-import { SdwValidationError, UnsupportedRecordVersion } from "../../src/sdw/errors.js";
+import { readReplayAnchor } from "../../src/sdw/replay-anchor.js";
+import { SdwReplayAnchorError, SdwValidationError, UnsupportedRecordVersion } from "../../src/sdw/errors.js";
 
 const FORTRESS_ID = "fortress:test";
 const MASTER_KEY = new Uint8Array(32).fill(8);
@@ -80,6 +83,12 @@ describe("SDW Phase 2 query-history store", () => {
       latest_sequence: 2,
       latest_query_key: queryStorageKey(second.occurred_at, second.query_id),
     });
+    await expect(readReplayAnchor(storage, MASTER_KEY)).resolves.toMatchObject({
+      status: "valid",
+      data: {
+        chain_head: [{ id: FORTRESS_ID, seq: 2 }],
+      },
+    });
 
     const rebuiltStorage = new TxMemoryStorage();
     const rebuiltStore = new SdwQueryHistoryStore({ storage: rebuiltStorage, masterKey: MASTER_KEY, fortressId: FORTRESS_ID });
@@ -122,6 +131,44 @@ describe("SDW Phase 2 query-history store", () => {
     );
     await expect(store.getByKey(queryStorageKey("2026-06-08T00:00:02.000Z", "query-3"))).rejects.toBeInstanceOf(UnsupportedRecordVersion);
     expect(await storage.exists(SDW_QUERY_HISTORY_NAMESPACE, chainHeadKey(FORTRESS_ID))).toBe(true);
+  });
+
+  it("fails closed when a replayed chain head regresses below the meta replay floor", async () => {
+    const storage = new TxMemoryStorage();
+    const store = new SdwQueryHistoryStore({ storage, masterKey: MASTER_KEY, fortressId: FORTRESS_ID });
+    const events = Array.from({ length: 7 }, (_, index) =>
+      auditEvent(
+        `audit-${index + 1}`,
+        `query-${index + 1}`,
+        `2026-06-08T00:00:0${index}.000Z`,
+      ),
+    );
+
+    for (const event of events.slice(0, 5)) await store.appendFromAudit(event);
+    const capturedHead = await storage.read(SDW_QUERY_HISTORY_NAMESPACE, chainHeadKey(FORTRESS_ID));
+    expect(capturedHead).not.toBeNull();
+    await store.appendFromAudit(events[5]!);
+    await store.appendFromAudit(events[6]!);
+    storage.rawWriteForTest(SDW_QUERY_HISTORY_NAMESPACE, chainHeadKey(FORTRESS_ID), capturedHead!);
+    await storage.delete(SDW_QUERY_HISTORY_NAMESPACE, queryStorageKey(events[5]!.occurred_at, events[5]!.query_id));
+    await storage.delete(SDW_QUERY_HISTORY_NAMESPACE, queryStorageKey(events[6]!.occurred_at, events[6]!.query_id));
+
+    await expect(store.readChainHead()).rejects.toMatchObject({
+      category: "replay_detected",
+    });
+    await expect(store.verifyChain()).rejects.toBeInstanceOf(SdwReplayAnchorError);
+  });
+
+  it("fails closed when an established query-history chain loses its meta anchor", async () => {
+    const storage = new TxMemoryStorage();
+    const store = new SdwQueryHistoryStore({ storage, masterKey: MASTER_KEY, fortressId: FORTRESS_ID });
+    await store.appendFromAudit(auditEvent("audit-1", "query-1", "2026-06-08T00:00:00.000Z"));
+
+    storage.rawWriteForTest(SDW_META_NAMESPACE, SDW_REPLAY_ANCHOR_KEY, stringToBytes("{}"));
+
+    await expect(store.readChainHead()).rejects.toMatchObject({
+      category: "replay_anchor_invalid",
+    });
   });
 });
 

@@ -217,7 +217,7 @@ describe("SDW catalog and replay anchor", () => {
     });
   });
 
-  it("detects invalid replay-anchor edits and treats stripped anchors as no trusted floor", async () => {
+  it("detects invalid replay-anchor edits and fails closed when an established catalog loses its anchor", async () => {
     const storage = new MemoryStorage();
     await writeReplayAnchor(storage, MASTER_KEY, { ...emptyReplayAnchorData(), catalog: 2 });
     await expect(readReplayAnchor(storage, MASTER_KEY)).resolves.toMatchObject({
@@ -235,6 +235,49 @@ describe("SDW catalog and replay anchor", () => {
     storage.rawWriteForTest(SDW_META_NAMESPACE, "sdw-replay-anchors-v1", stringToBytes("{}"));
     await expect(readReplayAnchor(storage, MASTER_KEY)).resolves.toEqual({
       status: "stripped",
+    });
+
+    const established = new MemoryStorage();
+    const store = new SdwCatalogStore({
+      storage: established,
+      masterKey: MASTER_KEY,
+      fortressId: FORTRESS_ID,
+    });
+    await store.initialize("env-1", "2026-06-08T00:00:00.000Z");
+    established.rawWriteForTest(SDW_META_NAMESPACE, "sdw-replay-anchors-v1", stringToBytes("{}"));
+    await expect(store.openExisting()).rejects.toMatchObject({
+      category: "replay_anchor_invalid",
+    });
+
+    const emptyStore = new SdwCatalogStore({
+      storage: new MemoryStorage(),
+      masterKey: MASTER_KEY,
+      fortressId: FORTRESS_ID,
+    });
+    await expect(emptyStore.openExisting()).rejects.toMatchObject({
+      category: "empty_environment",
+    });
+  });
+
+  it("surfaces catalog authentication failures separately from benign list skips", async () => {
+    const storage = new MemoryStorage();
+    const store = new SdwCatalogStore({
+      storage,
+      masterKey: MASTER_KEY,
+      fortressId: FORTRESS_ID,
+    });
+    await store.initialize("env-1", "2026-06-08T00:00:00.000Z");
+    tamperCatalogCiphertext(storage, catalogKey());
+
+    await expect(store.loadCatalogList()).resolves.toMatchObject({
+      records: [],
+      accounting: {
+        loaded: 0,
+        auth_failed: 1,
+        auth_failed_keys: [catalogKey()],
+        unsupported_version: 0,
+        skipped: [],
+      },
     });
   });
 
@@ -397,6 +440,14 @@ async function overwriteCatalogVersion(
   await storage.write(SDW_CATALOG_NAMESPACE, storageKey, stringToBytes(JSON.stringify(envelope)));
 }
 
+function tamperCatalogCiphertext(storage: MemoryStorage, storageKey: string): void {
+  const composite = storage.readSync(SDW_CATALOG_NAMESPACE, storageKey);
+  const envelope = JSON.parse(bytesToString(composite!)) as { ct: string };
+  const replacement = envelope.ct.endsWith("A") ? "B" : "A";
+  envelope.ct = `${envelope.ct.slice(0, -1)}${replacement}`;
+  storage.rawWriteForTest(SDW_CATALOG_NAMESPACE, storageKey, stringToBytes(JSON.stringify(envelope)));
+}
+
 class MemoryStorage implements StorageBackend {
   private readonly data = new Map<string, Uint8Array>();
 
@@ -409,6 +460,10 @@ class MemoryStorage implements StorageBackend {
   }
 
   async read(namespace: string, key: string): Promise<Uint8Array | null> {
+    return this.data.get(this.composite(namespace, key)) ?? null;
+  }
+
+  readSync(namespace: string, key: string): Uint8Array | null {
     return this.data.get(this.composite(namespace, key)) ?? null;
   }
 

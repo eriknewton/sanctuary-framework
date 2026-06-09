@@ -40,10 +40,10 @@ export class SdwCatalogError extends Error {
 }
 
 export class SdwReplayAnchorError extends Error {
-  readonly category: "invalid_mac" | "malformed" | "replay_detected";
+  readonly category: "invalid_mac" | "malformed" | "replay_anchor_invalid" | "replay_detected";
 
   constructor(
-    category: "invalid_mac" | "malformed" | "replay_detected",
+    category: "invalid_mac" | "malformed" | "replay_anchor_invalid" | "replay_detected",
     message: string,
   ) {
     super(message);

@@ -12,7 +12,15 @@ import {
 } from "./records.js";
 import { mintPersistable, type Taint } from "./write-gate.js";
 import { canonicalJson, decodeSdwRecord } from "./store-codec.js";
-import { SdwValidationError } from "./errors.js";
+import { SdwReplayAnchorError, SdwValidationError } from "./errors.js";
+import {
+  assertReplayAnchorPresentForEstablishedStore,
+  emptyReplayAnchorData,
+  prepareReplayAnchorWrite,
+  readReplayAnchor,
+  replayAnchorCounterSeq,
+  upsertReplayAnchorCounter,
+} from "./replay-anchor.js";
 
 export interface SdwQueryHistoryAuditEvent {
   readonly audit_event_id: string;
@@ -40,11 +48,13 @@ export interface SdwQueryHistoryReconcileResult {
 
 export class SdwQueryHistoryStore {
   private readonly storage: StorageBackend;
+  private readonly masterKey: Uint8Array;
   private readonly encryptionKey: Uint8Array;
   private readonly fortressId: string;
 
   constructor(options: SdwQueryHistoryStoreOptions) {
     this.storage = options.storage;
+    this.masterKey = options.masterKey;
     this.encryptionKey = derivePurposeKey(options.masterKey, SDW_QUERY_HISTORY_HKDF_INFO);
     this.fortressId = options.fortressId;
   }
@@ -107,6 +117,7 @@ export class SdwQueryHistoryStore {
         this.encryptionKey,
         this.fortressId,
       );
+      await this.writeChainHeadAnchor(txn, sequence);
       written = record;
     });
     return written!;
@@ -140,7 +151,14 @@ export class SdwQueryHistoryStore {
   async readChainHead(): Promise<SdwQueryHistoryChainHeadRecord> {
     const raw = await this.storage.read(SDW_QUERY_HISTORY_NAMESPACE, chainHeadKey(this.fortressId));
     if (raw === null) return emptyChainHead(this.fortressId);
-    return this.decodeChainHead(raw);
+    const head = this.decodeChainHead(raw);
+    const anchor = await readReplayAnchor(this.storage, this.masterKey);
+    assertReplayAnchorPresentForEstablishedStore(anchor, true, "query-history chain");
+    if (anchor.status !== "valid") {
+      throw new SdwReplayAnchorError("replay_anchor_invalid", "SDW replay anchor missing");
+    }
+    this.assertChainHeadNotRolledBack(head, anchor.data);
+    return head;
   }
 
   async verifyChain(): Promise<{ readonly auditEventIds: ReadonlySet<string>; readonly tampered: readonly string[] }> {
@@ -181,7 +199,14 @@ export class SdwQueryHistoryStore {
   private async readChainHeadFromTxn(txn: { read(namespace: string, key: string): Promise<Uint8Array | null> }): Promise<SdwQueryHistoryChainHeadRecord> {
     const raw = await txn.read(SDW_QUERY_HISTORY_NAMESPACE, chainHeadKey(this.fortressId));
     if (raw === null) return emptyChainHead(this.fortressId);
-    return this.decodeChainHead(raw);
+    const head = this.decodeChainHead(raw);
+    const anchor = await readReplayAnchor(txn, this.masterKey);
+    assertReplayAnchorPresentForEstablishedStore(anchor, true, "query-history chain");
+    if (anchor.status !== "valid") {
+      throw new SdwReplayAnchorError("replay_anchor_invalid", "SDW replay anchor missing");
+    }
+    this.assertChainHeadNotRolledBack(head, anchor.data);
+    return head;
   }
 
   private async rebuildFromAudit(events: readonly SdwQueryHistoryAuditEvent[]): Promise<void> {
@@ -252,7 +277,34 @@ export class SdwQueryHistoryStore {
         this.encryptionKey,
         this.fortressId,
       );
+      await this.writeChainHeadAnchor(txn, latestSequence);
     });
+  }
+
+  private assertChainHeadNotRolledBack(
+    head: SdwQueryHistoryChainHeadRecord,
+    anchorData: { readonly chain_head: readonly { readonly id: string; readonly seq: number }[] },
+  ): void {
+    const floor = replayAnchorCounterSeq(anchorData.chain_head, this.fortressId);
+    if (head.latest_sequence < floor) {
+      throw new SdwReplayAnchorError(
+        "replay_detected",
+        "SDW query-history chain-head rollback detected",
+      );
+    }
+  }
+
+  private async writeChainHeadAnchor(
+    txn: { read(namespace: string, key: string): Promise<Uint8Array | null>; write(namespace: string, key: string, data: Uint8Array): Promise<void> },
+    sequence: number,
+  ): Promise<void> {
+    const anchor = await readReplayAnchor(txn, this.masterKey);
+    const base = anchor.status === "valid" ? anchor.data : emptyReplayAnchorData();
+    const prepared = prepareReplayAnchorWrite(this.masterKey, {
+      ...base,
+      chain_head: upsertReplayAnchorCounter(base.chain_head, this.fortressId, sequence),
+    });
+    await txn.write(prepared.namespace, prepared.storageKey, prepared.data);
   }
 
   private decodeQuery(raw: Uint8Array, storageKey: string): SdwQueryHistoryRecord {
