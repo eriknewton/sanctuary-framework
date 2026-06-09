@@ -138,6 +138,7 @@ export function prepareReplayAnchorWrite(
   masterKey: Uint8Array,
   data: SdwReplayAnchorData,
 ): PreparedSdwWrite {
+  assertReplayAnchorData(data);
   const envelope = {
     marker: SDW_REPLAY_MAC_MARKER,
     data,
@@ -206,7 +207,21 @@ export function combineTaint(a: Taint, b: Taint): Taint {
     "secret",
     "identity_key",
   ];
-  return rank.indexOf(a) >= rank.indexOf(b) ? a : b;
+  const aRank = rank.indexOf(a);
+  const bRank = rank.indexOf(b);
+  return aRank >= bRank ? a : b;
+}
+
+function assertReplayAnchorData(data: SdwReplayAnchorData): void {
+  const record: SdwRecord = {
+    kind: "replay_anchor",
+    version: 1,
+    fortress_id: "sdw:replay-anchor",
+    data,
+    updated_at: "1970-01-01T00:00:00.000Z",
+  };
+  validateRecord(record);
+  classifyRecord(record);
 }
 
 function validateRecord(record: SdwRecord): void {
@@ -229,6 +244,7 @@ function validateRecord(record: SdwRecord): void {
     case "replay_anchor":
       assertVersion(record.version);
       assertSdwIdentifier(record.fortress_id, "fortress_id");
+      assertReplayAnchorDataShape(record.data);
       assertNonNegativeInteger(record.data.catalog, "catalog");
       assertNonNegativeInteger(record.data.export_state, "export_state");
       for (const counter of [
@@ -402,6 +418,29 @@ function assertNonNegativeInteger(value: number, label: string): void {
   }
 }
 
+function assertReplayAnchorDataShape(value: unknown): asserts value is SdwReplayAnchorData {
+  if (value === null || typeof value !== "object") {
+    throw new SdwValidationError("schema_mismatch", "Invalid SDW replay-anchor data");
+  }
+  const data = value as { readonly [key: string]: unknown };
+  for (const label of ["chain_head", "manifests", "tombstones"] as const) {
+    const counters = data[label];
+    if (!Array.isArray(counters)) {
+      throw new SdwValidationError("schema_mismatch", `Invalid SDW replay-anchor data: ${label}`);
+    }
+    for (const counter of counters) {
+      if (
+        counter === null ||
+        typeof counter !== "object" ||
+        typeof (counter as { readonly id?: unknown }).id !== "string" ||
+        typeof (counter as { readonly seq?: unknown }).seq !== "number"
+      ) {
+        throw new SdwValidationError("schema_mismatch", `Invalid SDW replay-anchor data: ${label}`);
+      }
+    }
+  }
+}
+
 function assertHashString(value: string, label: string): void {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
     throw new SdwValidationError("schema_mismatch", `Invalid SDW hash: ${label}`);
@@ -430,9 +469,16 @@ function classifyRecord(record: SdwRecord): void {
     /\bed25519\b.{0,80}\b(private|secret)\b/i,
     /\bSANCTUARY_RECOVERY_KEY\b/i,
   ];
-  if (probes.some((probe) => probe.test(text))) {
+  if (probes.some((probe) => probe.test(text)) || containsEncodedEd25519Pkcs8PrivateKey(text)) {
     throw new SdwValidationError("classifier_reject", "SDW classifier rejected sensitive material");
   }
+}
+
+function containsEncodedEd25519Pkcs8PrivateKey(text: string): boolean {
+  const compact = text.replace(/[\s"'`,;:]+/g, "");
+  const hexPrefix = "302e020100300506032b657004220420";
+  const base64Prefix = "MC4CAQAwBQYDK2VwBCIEI";
+  return compact.toLowerCase().includes(hexPrefix) || compact.includes(base64Prefix);
 }
 
 function collectText(value: SdwRecord): string[] {
