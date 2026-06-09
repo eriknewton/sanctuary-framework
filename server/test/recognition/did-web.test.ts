@@ -28,6 +28,7 @@ import {
   didToUrl,
   dropExpiredDidWebKeys,
   identifierFromFortressDidWebRecord,
+  isPublicIpAddress,
   issueDidWeb,
   parseDidWeb,
   publishDidWebDocument,
@@ -212,6 +213,31 @@ describe("WP-V1.x-RECOGNITION-LAYER did:web - resolution (Castle-walking opt-in)
     }
   });
 
+  it("rejects IP-literal and metadata hosts before invoking the fetcher, even when allowlisted", async () => {
+    const dangerousHosts = [
+      "169.254.169.254",
+      "127.0.0.1",
+      "10.0.0.1",
+      "0x7f.0.0.1",
+      "metadata.google.internal",
+    ];
+    for (const host of dangerousHosts) {
+      let invoked = false;
+      const result = await resolveDidWeb(`did:web:${host}:fortress:abc123:agent:default`, {
+        allowed_hosts: [host],
+        fetcher: async () => {
+          invoked = true;
+          return { ok: true, status: 200, json: async () => ({}) };
+        },
+      });
+      expect(invoked).toBe(false);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.failure).toBe("host_not_allowed");
+      }
+    }
+  });
+
   it("allowed authority host invokes the fetcher and returns the parsed DID Document on 200", async () => {
     const key = publicKey();
     const id = await issueDidWeb({
@@ -272,6 +298,67 @@ describe("WP-V1.x-RECOGNITION-LAYER did:web - resolution (Castle-walking opt-in)
     });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.failure).toBe("invalid_json");
+  });
+
+  it("oversize Content-Length is rejected before JSON buffering", async () => {
+    const result = await resolveDidWeb("did:web:alice.example.com", {
+      allowed_hosts: ["alice.example.com"],
+      fetcher: async () =>
+        new Response("{}", {
+          status: 200,
+          headers: { "content-length": String(256 * 1024 + 1) },
+        }),
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.failure).toBe("invalid_json");
+      expect(result.message).toMatch(/exceeds/);
+    }
+  });
+
+  it("chunked oversize response bodies are rejected while streaming", async () => {
+    const encoder = new TextEncoder();
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(encoder.encode("x".repeat(128 * 1024)));
+      },
+      cancel() {
+        pulls = Math.max(pulls, 2);
+      },
+    });
+    const result = await resolveDidWeb("did:web:alice.example.com", {
+      allowed_hosts: ["alice.example.com"],
+      fetcher: async () => new Response(body, { status: 200 }),
+    });
+    expect(result.ok).toBe(false);
+    expect(pulls).toBeGreaterThanOrEqual(2);
+    if (!result.ok) {
+      expect(result.failure).toBe("invalid_json");
+      expect(result.message).toMatch(/exceeds/);
+    }
+  });
+
+  it("small Response-compatible bodies still resolve normally", async () => {
+    const key = publicKey();
+    const id = await issueDidWeb({
+      fortress_id: "fortress_alpha",
+      authority_host: "alice.example.com",
+      public_key: key,
+    });
+    const result = await resolveDidWeb(id.did, {
+      allowed_hosts: ["alice.example.com"],
+      fetcher: async () =>
+        new Response(JSON.stringify(id.did_document), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.did_document.id).toBe(id.did);
+    }
   });
 
   it("body that does not look like a DID Document for the requested DID returns invalid_json", async () => {
@@ -352,6 +439,21 @@ describe("WP-V1.x-RECOGNITION-LAYER did:web - did -> URL mapping", () => {
     expect(() =>
       parseDidWeb("did:web:alice.example.com:something:else"),
     ).toThrow(/does not match the supported shapes/);
+  });
+
+  it("parseDidWeb rejects unsafe fortress_id and agent_label path segments", () => {
+    const unsafeDids = [
+      "did:web:alice.example.com:fortress:abc?x:agent:default",
+      "did:web:alice.example.com:fortress:abc#x:agent:default",
+      "did:web:alice.example.com:fortress:abc/x:agent:default",
+      "did:web:alice.example.com:fortress:%2e%2e:agent:default",
+      "did:web:alice.example.com:fortress:abc123:agent:default?x",
+      "did:web:alice.example.com:fortress:abc123:agent:default#x",
+      "did:web:alice.example.com:fortress:abc123:agent:default/x",
+    ];
+    for (const did of unsafeDids) {
+      expect(() => parseDidWeb(did)).toThrow(/is not a valid label/);
+    }
   });
 });
 
@@ -678,5 +780,44 @@ describe("WP-V1.x-RECOGNITION-LAYER did:web - build 4 key rotation", () => {
     expect(invoked).toBe(false);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.failure).toBe("host_not_allowed");
+  });
+});
+
+describe("isPublicIpAddress SSRF classifier (incl. IPv4-mapped IPv6 + NAT64)", () => {
+  it("rejects loopback / private / link-local / metadata, mapped-v6 and NAT64; allows real public", () => {
+    const nonPublic = [
+      "127.0.0.1",
+      "10.0.0.1",
+      "169.254.169.254",
+      "172.16.0.1",
+      "192.168.1.1",
+      "::1",
+      "fe80::1",
+      "fc00::1",
+      // IPv4-mapped IPv6 of non-public addresses (the classifier hole this closes):
+      "::ffff:127.0.0.1",
+      "::ffff:169.254.169.254",
+      "::ffff:10.0.0.1",
+      "::ffff:192.168.1.1",
+      "::ffff:7f00:1", // all-hex mapped form of 127.0.0.1
+      "::ffff:a9fe:a9fe", // all-hex mapped form of 169.254.169.254
+      "::127.0.0.1", // deprecated IPv4-compatible form
+      // NAT64 prefix wrapping a private/loopback v4:
+      "64:ff9b::7f00:1",
+      "64:ff9b::8.8.8.8",
+    ];
+    const publicAddrs = [
+      "8.8.8.8",
+      "1.1.1.1",
+      "::ffff:8.8.8.8", // mapped form of a genuinely public v4 stays public
+      "2001:4860:4860::8888",
+      "2606:4700:4700::1111",
+    ];
+    for (const addr of nonPublic) {
+      expect(isPublicIpAddress(addr)).toBe(false);
+    }
+    for (const addr of publicAddrs) {
+      expect(isPublicIpAddress(addr)).toBe(true);
+    }
   });
 });

@@ -1145,6 +1145,32 @@ export async function importExitBundle(
   //     deliberately.
   const manifestDidWeb = manifest.body.identity_binding.did_web;
   if (manifestDidWeb !== undefined && !opts.skipDidWebVerify) {
+    const parsedDidWeb = parseDidWeb(manifestDidWeb.identifier);
+    const authorityHost = parsedDidWeb.authority_host;
+    if (authorityHost.toLowerCase() !== manifestDidWeb.authority_host.toLowerCase()) {
+      opts.auditLog.append(
+        "l1",
+        EXIT_BUNDLE_DID_WEB_AUDIT_OPS.AUTHORITY_HOST,
+        manifest.body.identity_binding.identity_id,
+        { authority_host: authorityHost, identifier: manifestDidWeb.identifier },
+      );
+      opts.auditLog.append(
+        "l1",
+        EXIT_BUNDLE_DID_WEB_AUDIT_OPS.IMPORT_VERIFIED,
+        manifest.body.identity_binding.identity_id,
+        {
+          outcome: "mismatch",
+          identifier: manifestDidWeb.identifier,
+          authority_host: authorityHost,
+          manifest_authority_host: manifestDidWeb.authority_host,
+        },
+      );
+      await opts.auditLog.flush();
+      throw new ExitBundleImportError(
+        "did_web_mismatch",
+        `did:web cross-check failed: identifier authority host '${authorityHost}' does not match manifest authority_host '${manifestDidWeb.authority_host}'.`,
+      );
+    }
     const expectedPublicKey = fromBase64url(
       manifest.body.identity_binding.fortress_master_pubkey,
     );
@@ -1161,7 +1187,6 @@ export async function importExitBundle(
       manifestDidWeb.identifier,
       resolveOpts,
     );
-    const authorityHost = manifestDidWeb.authority_host;
     opts.auditLog.append(
       "l1",
       EXIT_BUNDLE_DID_WEB_AUDIT_OPS.AUTHORITY_HOST,
