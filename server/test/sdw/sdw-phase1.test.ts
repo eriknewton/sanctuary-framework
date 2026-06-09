@@ -12,6 +12,7 @@ import {
   SDW_CATALOG_HKDF_INFO,
   SDW_CATALOG_NAMESPACE,
   SDW_META_NAMESPACE,
+  SDW_WORKING_STATE_HKDF_INFO,
   defaultSdwStoreDescriptors,
   type SdwCatalogRecord,
   type SdwWorkingStateRecord,
@@ -100,10 +101,49 @@ describe("SDW Phase 1 write gate", () => {
       stateKey("task", record.state_id),
       FORTRESS_ID,
     );
-    await sdwBackendWrite(storage, persistable, derivePurposeKey(MASTER_KEY, "sdw-working-state-v1"));
+    await sdwBackendWrite(
+      storage,
+      persistable,
+      derivePurposeKey(MASTER_KEY, SDW_WORKING_STATE_HKDF_INFO),
+      FORTRESS_ID,
+    );
     const raw = await storage.read("_sdw_working_state", stateKey("task", record.state_id));
     expect(raw).not.toBeNull();
     expect(encryptedEnvelopeContains(raw!, "plain operator note")).toBe(false);
+  });
+
+  it("revalidates forged persistables at the write boundary", async () => {
+    const storage = new MemoryStorage();
+    const safeRecord = workingStateRecord("state1", "safe note");
+    const persistable = mintPersistable(
+      { value: safeRecord, taint: "user_content" },
+      "_sdw_working_state",
+      stateKey("task", safeRecord.state_id),
+      FORTRESS_ID,
+    );
+    const forgedSecret = {
+      ...persistable,
+      record: workingStateRecord("state2", "SANCTUARY_RECOVERY_KEY=abcd"),
+      storageKey: stateKey("task", "state2"),
+    } as any;
+    await expect(
+      sdwBackendWrite(
+        storage,
+        forgedSecret,
+        derivePurposeKey(MASTER_KEY, SDW_WORKING_STATE_HKDF_INFO),
+        FORTRESS_ID,
+      ),
+    ).rejects.toMatchObject({ category: "classifier_reject" });
+
+    const forgedTaint = { ...persistable, taint: "secret" } as any;
+    await expect(
+      sdwBackendWrite(
+        storage,
+        forgedTaint,
+        derivePurposeKey(MASTER_KEY, SDW_WORKING_STATE_HKDF_INFO),
+        FORTRESS_ID,
+      ),
+    ).rejects.toMatchObject({ category: "forbidden_taint" });
   });
 });
 
@@ -216,6 +256,31 @@ describe("SDW catalog and replay anchor", () => {
       },
     });
   });
+
+  it("uses the listed catalog key when accounting unsupported versions", async () => {
+    const storage = new MemoryStorage();
+    const store = new SdwCatalogStore({
+      storage,
+      masterKey: MASTER_KEY,
+      fortressId: FORTRESS_ID,
+    });
+    await store.initialize("env-1", "2026-06-08T00:00:00.000Z");
+    await overwriteCatalogVersion(storage, 2, "catalog.future");
+    await expect(store.loadCatalogList()).resolves.toMatchObject({
+      records: [
+        {
+          kind: "catalog",
+          version: 1,
+          environment_id: "env-1",
+        },
+      ],
+      accounting: {
+        loaded: 1,
+        unsupported_version: 1,
+        skipped: ["catalog.future"],
+      },
+    });
+  });
 });
 
 describe("LmdbStorageBackend", () => {
@@ -225,22 +290,39 @@ describe("LmdbStorageBackend", () => {
     const dir = await mkdtemp(join(tmpdir(), "sanctuary-sdw-lmdb-"));
     const backend = await LmdbStorageBackend.open({ path: dir });
     try {
-      await backend.write("_sdw_catalog", "catalog.environment", new Uint8Array([1, 2, 3]));
-      await backend.write("_sdw_catalog", "catalog.other", new Uint8Array([4]));
-      await backend.write("_sdw_meta", "sdw-replay-anchors-v1", new Uint8Array([9]));
-      await expect(backend.read("_sdw_catalog", "catalog.environment")).resolves.toEqual(
+      await backend.write("ordinary", "catalog.environment", new Uint8Array([1, 2, 3]));
+      await backend.write("ordinary", "catalog.other", new Uint8Array([4]));
+      await backend.write("other", "sdw-replay-anchors-v1", new Uint8Array([9]));
+      await expect(backend.read("ordinary", "catalog.environment")).resolves.toEqual(
         new Uint8Array([1, 2, 3]),
       );
-      await expect(backend.list("_sdw_catalog", "catalog.")).resolves.toHaveLength(2);
-      await expect(backend.exists("_sdw_meta", "sdw-replay-anchors-v1")).resolves.toBe(true);
-      await expect(backend.delete("_sdw_catalog", "catalog.other", true)).resolves.toBe(true);
-      await expect(backend.exists("_sdw_catalog", "catalog.other")).resolves.toBe(false);
+      await expect(backend.list("ordinary", "catalog.")).resolves.toHaveLength(2);
+      await expect(backend.exists("other", "sdw-replay-anchors-v1")).resolves.toBe(true);
+      await expect(backend.delete("ordinary", "catalog.other", true)).resolves.toBe(true);
+      await expect(backend.exists("ordinary", "catalog.other")).resolves.toBe(false);
+      await expect(
+        backend.write("_sdw_catalog", "catalog.raw", new Uint8Array([5])),
+      ).rejects.toBeInstanceOf(SdwValidationError);
       await backend.sdwTransaction(async (txn) => {
-        await txn.write("_sdw_catalog", "catalog.txn", new Uint8Array([5]));
+        await expect(
+          txn.write("_sdw_catalog", "catalog.txn.raw", new Uint8Array([5])),
+        ).rejects.toBeInstanceOf(SdwValidationError);
+        const record = workingStateRecord("state-txn", "transactional note");
+        const persistable = mintPersistable(
+          { value: record, taint: "user_content" },
+          "_sdw_working_state",
+          stateKey("task", record.state_id),
+          FORTRESS_ID,
+        );
+        await txn.writePersistable(
+          persistable,
+          derivePurposeKey(MASTER_KEY, SDW_WORKING_STATE_HKDF_INFO),
+          FORTRESS_ID,
+        );
       });
-      await expect(backend.read("_sdw_catalog", "catalog.txn")).resolves.toEqual(
-        new Uint8Array([5]),
-      );
+      const raw = await backend.read("_sdw_working_state", stateKey("task", "state-txn"));
+      expect(raw).not.toBeNull();
+      expect(encryptedEnvelopeContains(raw!, "transactional note")).toBe(false);
     } finally {
       await backend.close();
       await rm(dir, { recursive: true, force: true });
@@ -287,7 +369,11 @@ function workingStateRecord(stateId: string, summary: string): SdwWorkingStateRe
   };
 }
 
-async function overwriteCatalogVersion(storage: StorageBackend, version: number): Promise<void> {
+async function overwriteCatalogVersion(
+  storage: StorageBackend,
+  version: number,
+  storageKey = catalogKey(),
+): Promise<void> {
   const key = derivePurposeKey(MASTER_KEY, SDW_CATALOG_HKDF_INFO);
   const record = {
     kind: "catalog",
@@ -301,9 +387,9 @@ async function overwriteCatalogVersion(storage: StorageBackend, version: number)
   const envelope = encrypt(
     stringToBytes(JSON.stringify(record)),
     key,
-    stringToBytes(sdwAadDebugString(FORTRESS_ID, SDW_CATALOG_NAMESPACE, catalogKey())),
+    stringToBytes(sdwAadDebugString(FORTRESS_ID, SDW_CATALOG_NAMESPACE, storageKey)),
   );
-  await storage.write(SDW_CATALOG_NAMESPACE, catalogKey(), stringToBytes(JSON.stringify(envelope)));
+  await storage.write(SDW_CATALOG_NAMESPACE, storageKey, stringToBytes(JSON.stringify(envelope)));
 }
 
 class MemoryStorage implements StorageBackend {

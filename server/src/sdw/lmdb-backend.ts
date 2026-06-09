@@ -1,9 +1,21 @@
 import { mkdir } from "node:fs/promises";
 import type * as Lmdb from "lmdb";
 import type { StorageBackend, StorageEntryMeta } from "../storage/interface.js";
+import type { SdwRecord } from "./records.js";
+import {
+  assertSdwRawWriteAuthorized,
+  prepareSdwBackendWrite,
+  runWithSdwWriteAuthority,
+  type Persistable,
+} from "./write-gate.js";
 
 export interface SdwTxn {
   write(namespace: string, key: string, data: Uint8Array): Promise<void>;
+  writePersistable<T extends SdwRecord>(
+    persistable: Persistable<T>,
+    encryptionKey: Uint8Array,
+    fortressId: string,
+  ): Promise<void>;
   read(namespace: string, key: string): Promise<Uint8Array | null>;
   delete(namespace: string, key: string): Promise<boolean>;
 }
@@ -44,6 +56,7 @@ export class LmdbStorageBackend implements StorageBackend, SdwTransactional {
   }
 
   async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    assertSdwRawWriteAuthorized(namespace);
     await this.db.put(compositeKey(namespace, key), this.lmdb.asBinary(data));
   }
 
@@ -92,7 +105,17 @@ export class LmdbStorageBackend implements StorageBackend, SdwTransactional {
     await this.db.transaction(async () => {
       const txn: SdwTxn = {
         write: async (namespace, key, data) => {
+          assertSdwRawWriteAuthorized(namespace);
           this.db.putSync(compositeKey(namespace, key), this.lmdb.asBinary(data));
+        },
+        writePersistable: async (persistable, encryptionKey, fortressId) => {
+          const prepared = prepareSdwBackendWrite(persistable, encryptionKey, fortressId);
+          await runWithSdwWriteAuthority(async () => {
+            this.db.putSync(
+              compositeKey(prepared.namespace, prepared.storageKey),
+              this.lmdb.asBinary(prepared.data),
+            );
+          });
         },
         read: async (namespace, key) => this.read(namespace, key),
         delete: async (namespace, key) => this.db.removeSync(compositeKey(namespace, key)),

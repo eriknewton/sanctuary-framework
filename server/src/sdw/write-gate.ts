@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { StorageBackend } from "../storage/interface.js";
 import { encrypt } from "../core/encryption.js";
 import { bytesToString, stringToBytes } from "../core/encoding.js";
@@ -37,7 +38,16 @@ export interface Persistable<T extends SdwRecord> {
   readonly namespace: SdwNamespace;
   readonly storageKey: string;
   readonly aad: Uint8Array;
+  readonly taint: "user_content" | "agent_derived_clean" | "system_generated";
 }
+
+interface PreparedSdwWrite {
+  readonly namespace: SdwNamespace;
+  readonly storageKey: string;
+  readonly data: Uint8Array;
+}
+
+const sdwWriteAuthority = new AsyncLocalStorage<boolean>();
 
 export function mintPersistable<T extends SdwRecord>(
   input: Untrusted<T>,
@@ -58,6 +68,7 @@ export function mintPersistable<T extends SdwRecord>(
     namespace,
     storageKey,
     aad,
+    taint: input.taint,
   };
 }
 
@@ -65,17 +76,42 @@ export async function sdwBackendWrite<T extends SdwRecord>(
   backend: StorageBackend,
   persistable: Persistable<T>,
   encryptionKey: Uint8Array,
+  fortressId: string,
 ): Promise<void> {
+  const prepared = prepareSdwBackendWrite(persistable, encryptionKey, fortressId);
+  await runWithSdwWriteAuthority(() =>
+    backend.write(prepared.namespace, prepared.storageKey, prepared.data),
+  );
+}
+
+export function prepareSdwBackendWrite<T extends SdwRecord>(
+  persistable: Persistable<T>,
+  encryptionKey: Uint8Array,
+  fortressId: string,
+): PreparedSdwWrite {
+  assertRuntimePersistable(persistable);
+  const namespace = persistable.namespace;
+  const storageKey = persistable.storageKey;
+  assertSdwNamespace(namespace);
+  assertSdwIdentifier(namespace, "namespace");
+  assertSdwIdentifier(storageKey, "storage_key");
+  assertSdwIdentifier(fortressId, "fortress_id");
+  assertAllowedTaint(persistable.taint);
+  assertSdwRecord(persistable.record);
+  validateRecord(persistable.record);
+  assertNamespaceForRecord(namespace, persistable.record);
+  classifyRecord(persistable.record);
+  const aad = sdwAad(fortressId, namespace, storageKey);
   const envelope = encrypt(
     stringToBytes(JSON.stringify(persistable.record)),
     encryptionKey,
-    persistable.aad,
+    aad,
   );
-  await backend.write(
-    persistable.namespace,
-    persistable.storageKey,
-    stringToBytes(JSON.stringify(envelope)),
-  );
+  return {
+    namespace,
+    storageKey,
+    data: stringToBytes(JSON.stringify(envelope)),
+  };
 }
 
 export async function sdwBackendWriteAuthenticatedMeta(
@@ -86,7 +122,31 @@ export async function sdwBackendWriteAuthenticatedMeta(
 ): Promise<void> {
   assertSdwIdentifier(namespace, "namespace");
   assertSdwIdentifier(storageKey, "storage_key");
-  await backend.write(namespace, storageKey, data);
+  await runWithSdwWriteAuthority(() => backend.write(namespace, storageKey, data));
+}
+
+export function assertSdwRawWriteAuthorized(namespace: string): void {
+  if (isSdwNamespace(namespace) && sdwWriteAuthority.getStore() !== true) {
+    throw new SdwValidationError(
+      "raw_sdw_write_forbidden",
+      "SDW namespace writes must pass through the SDW write gate",
+    );
+  }
+}
+
+export function isSdwNamespace(namespace: string): namespace is SdwNamespace {
+  return (
+    namespace === SDW_CATALOG_NAMESPACE ||
+    namespace === SDW_META_NAMESPACE ||
+    namespace === SDW_WORKING_STATE_NAMESPACE ||
+    namespace === SDW_QUERY_HISTORY_NAMESPACE ||
+    namespace === SDW_DOCUMENT_CORPUS_NAMESPACE ||
+    namespace === SDW_VECTOR_MEMORY_NAMESPACE
+  );
+}
+
+export async function runWithSdwWriteAuthority<T>(fn: () => Promise<T>): Promise<T> {
+  return sdwWriteAuthority.run(true, fn);
 }
 
 export function assertAllowedTaint(taint: Taint | undefined): asserts taint is
@@ -199,6 +259,32 @@ function validateRecord(record: SdwRecord): void {
       assertSdwIdentifier(record.vector_id, "vector_id");
       assertNonNegativeInteger(record.epoch, "epoch");
       return;
+    default:
+      throw new SdwValidationError("schema_mismatch", "Unknown SDW record kind");
+  }
+}
+
+function assertRuntimePersistable<T extends SdwRecord>(
+  persistable: Persistable<T>,
+): void {
+  if (
+    persistable === null ||
+    typeof persistable !== "object" ||
+    persistable[PERSISTABLE_BRAND] !== true
+  ) {
+    throw new SdwValidationError("untrusted_persistable", "Untrusted SDW persistable");
+  }
+}
+
+function assertSdwRecord(record: unknown): asserts record is SdwRecord {
+  if (record === null || typeof record !== "object" || typeof (record as { kind?: unknown }).kind !== "string") {
+    throw new SdwValidationError("schema_mismatch", "Invalid SDW record");
+  }
+}
+
+function assertSdwNamespace(namespace: string): asserts namespace is SdwNamespace {
+  if (!isSdwNamespace(namespace)) {
+    throw new SdwValidationError("namespace_mismatch", "Unknown SDW namespace");
   }
 }
 

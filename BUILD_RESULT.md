@@ -10,9 +10,12 @@ Branch: `feat/sdw-phase1-foundation`
 - Added the SDW v1 identifier grammar, length-prefixed AAD construction, generated storage-key helpers, and `source_ref_id` derivation so raw `source.uri` never enters keys or AAD.
 - Added the closed `SdwRecord` union for Phase 1 and referenced later protected record types without raw JSON escape hatches in the union.
 - Added the D3 write gate: branded `Persistable<T>`, single `mintPersistable` brand factory, taint enforcement, size/schema checks, grammar checks, AAD construction, defense-in-depth classifier, and centralized `sdwBackendWrite`.
+- Closed adversarial review P1s: `sdwBackendWrite` now revalidates the runtime persistable at the actual write boundary, including taint, schema, namespace, storage key, fortress id, classifier, and recomputed AAD. The TypeScript brand remains a compile-time aid, not the load-bearing persistence guarantee.
+- Closed raw SDW write bypasses: `LmdbStorageBackend.write` and transactional `SdwTxn.write` reject direct SDW namespace writes unless the SDW write gate has opened the write authority for that call; transactions now expose `writePersistable` for gated encrypted SDW writes.
 - Added catalog store support for `_sdw_catalog/catalog.environment` under `sdw-catalog-v1`, including fortress binding and fail-closed open behavior.
 - Added the MAC-authenticated replay anchor at `_sdw_meta/sdw-replay-anchors-v1`, following the existing `{ marker, data, mac }` anchor pattern.
 - Added typed `UnsupportedRecordVersion` behavior: direct read throws; list rehydration skips with accounting.
+- Closed catalog list rehydration P3: listed `catalog.*` keys now derive AAD from the listed key, so future unsupported catalog records account as `unsupported_version`.
 - Added SDW supply-chain documentation in `server/docs/sdw/supply-chain.md`.
 
 ## Dependency / Native Binary Pin
@@ -33,20 +36,22 @@ Branch: `feat/sdw-phase1-foundation`
   - `SdwRecord` rejects raw/unknown payload members.
 - Runtime tests in `server/test/sdw/sdw-phase1.test.ts`:
   - forbidden and missing taints are rejected;
+  - forged/mutated persistables are revalidated at write time and rejected for secret classifier hits or forbidden taint;
   - Principal-Policy, Ed25519 private-key, and recovery-key fixtures are rejected without echoing matched material;
   - SDW writes persist encrypted envelope bytes, not plaintext;
+  - direct LMDB and transactional raw writes to SDW namespaces are rejected, while transactional `writePersistable` writes encrypted bytes through the gate;
   - key/AAD grammar vectors cover catalog, working-state, query-history, document, chunk, vector, map, and segment keys;
   - hostile `source.uri` stays out of storage keys and AAD;
   - catalog missing/mismatched fortress behavior fails closed;
   - replay anchor valid/invalid/stripped semantics are covered;
-  - unknown-newer direct read throws `UnsupportedRecordVersion`, while list rehydration skips with accounting.
-- Architecture test in `server/test/sdw/sdw-architecture.test.ts` fails if SDW files call backend writes outside `write-gate.ts`.
+  - unknown-newer direct read throws `UnsupportedRecordVersion`, while list rehydration skips with accounting, including non-primary `catalog.*` keys.
+- Architecture test in `server/test/sdw/sdw-architecture.test.ts` fails if SDW files call backend or transaction writes outside `write-gate.ts`, and checks the LMDB backend keeps both the raw namespace guard and transactional gated write path.
 
 ## Verification
 
 - `cd server && npm run typecheck`: passed.
 - `cd server && npm test`: passed.
-- Final test summary: `446 passed | 1 skipped` test files; `5469 passed | 8 skipped` tests.
+- Final test summary: `446 passed | 1 skipped` test files; `5471 passed | 8 skipped` tests.
 - `.test-baseline`: `5423`; final passing count is above baseline.
 - No transform or collection errors in the final Vitest summary.
 

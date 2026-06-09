@@ -61,7 +61,7 @@ export class SdwCatalogStore {
       catalogKey(),
       this.fortressId,
     );
-    await sdwBackendWrite(this.storage, persistable, this.encryptionKey);
+    await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId);
     return record;
   }
 
@@ -75,7 +75,7 @@ export class SdwCatalogStore {
       );
     }
     const anchor = await readReplayAnchor(this.storage, this.masterKey);
-    const record = this.decodeDirect(raw);
+    const record = this.decodeDirect(raw, catalogKey());
     if (record.fortress_id !== this.fortressId) {
       throw new SdwCatalogError("fortress_mismatch", "SDW catalog fortress mismatch");
     }
@@ -95,7 +95,7 @@ export class SdwCatalogStore {
       const raw = await this.storage.read(SDW_CATALOG_NAMESPACE, meta.key);
       if (raw === null) continue;
       try {
-        records.push(this.decodeDirect(raw));
+        records.push(this.decodeDirect(raw, meta.key));
       } catch (error) {
         skipped.push(meta.key);
         if (error instanceof UnsupportedRecordVersion) unsupported++;
@@ -111,9 +111,8 @@ export class SdwCatalogStore {
     };
   }
 
-  private decodeDirect(raw: Uint8Array): SdwCatalogRecord {
+  private decodeDirect(raw: Uint8Array, storageKey: string): SdwCatalogRecord {
     try {
-      const storageKey = catalogKey();
       const aad = sdwAad(this.fortressId, SDW_CATALOG_NAMESPACE, storageKey);
       const envelope = JSON.parse(bytesToString(raw)) as EncryptedPayload;
       const plaintext = decrypt(envelope, this.encryptionKey, aad);
