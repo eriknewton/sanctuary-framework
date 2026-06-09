@@ -25,17 +25,20 @@
  */
 
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
+import { canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { StateStore } from "../../src/l1-cognitive/state-store.js";
 import { createL1Tools } from "../../src/l1-cognitive/tools.js";
 import { AuditLog, type AuditEntry } from "../../src/l2-operational/audit-log.js";
 import { createL4Tools } from "../../src/l4-reputation/tools.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
+import type { ExitBundleManifest } from "../../src/contracts/v1.1/exit-bundle-manifest.js";
 import {
   exportExitBundle,
   importExitBundle,
@@ -48,6 +51,7 @@ import {
   rotateDidWebKey,
   type DidDocument,
 } from "../../src/recognition/did-web.js";
+import { sign as identitySign } from "../../src/core/identity.js";
 import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
 
 const TEST_AUTHORITY_HOST = "alice.example.com";
@@ -184,6 +188,28 @@ function lastAuditEntry(
   return [...audit].reverse().find((e) => e.operation === op);
 }
 
+async function rewriteManifestDidWeb(
+  h: TestHarness,
+  bundleDir: string,
+  didWeb: { identifier: string; authority_host: string },
+): Promise<void> {
+  const identity = h.identityManager.getDefault();
+  if (!identity) throw new Error("test fixture: identity not loaded");
+  const manifestPath = join(bundleDir, "manifest.json");
+  const manifest = JSON.parse(
+    await readFile(manifestPath, "utf8"),
+  ) as ExitBundleManifest;
+  manifest.body.identity_binding.did_web = didWeb;
+  manifest.signature = toBase64url(
+    identitySign(
+      canonicalizeToBytes(manifest.body),
+      identity.encrypted_private_key,
+      derivePurposeKey(h.masterKey, "identity-encryption"),
+    ),
+  );
+  await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+}
+
 describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integration", () => {
   const tempDirs: string[] = [];
   afterEach(async () => {
@@ -300,6 +326,52 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
         },
       }),
     ).rejects.toThrow(/authority host .* does not match/);
+  });
+
+  it("import rejects a signed manifest whose parsed did:web host differs from manifest authority_host", async () => {
+    const h = await makeHarness();
+    const dir = await makeTempDir();
+    const didUri = manifestDidUri(h);
+    await exportWithDidWeb(h, dir, didUri);
+    const parsedHost = "other.example.com";
+    const tamperedDid = `did:web:${parsedHost}:fortress:${TEST_FORTRESS_LABEL}:agent:default`;
+    await rewriteManifestDidWeb(h, dir, {
+      identifier: tamperedDid,
+      authority_host: TEST_AUTHORITY_HOST,
+    });
+
+    let fetcherInvoked = false;
+    const receiver = await makeHarness();
+    let thrown: unknown;
+    try {
+      await importExitBundle({
+        bundleDir: dir,
+        storage: receiver.storage,
+        masterKey: receiver.masterKey,
+        identityManager: receiver.identityManager,
+        auditLog: receiver.auditLog,
+        reputationStore: receiver.reputationStore,
+        didWebAllowedHosts: [TEST_AUTHORITY_HOST, parsedHost],
+        didWebFetcher: async () => {
+          fetcherInvoked = true;
+          return { ok: true, status: 200, json: async () => ({}) };
+        },
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(fetcherInvoked).toBe(false);
+    expect(thrown).toBeInstanceOf(ExitBundleImportError);
+    expect((thrown as ExitBundleImportError).code).toBe("did_web_mismatch");
+    const q = await receiver.auditLog.query({ layer: "l1", limit: 200 });
+    const hostEvt = lastAuditEntry(
+      q.entries,
+      EXIT_BUNDLE_DID_WEB_AUDIT_OPS.AUTHORITY_HOST,
+    );
+    expect(hostEvt).toBeDefined();
+    expect(hostEvt!.details?.authority_host).toBe(parsedHost);
+    expect(hostEvt!.details?.identifier).toBe(tamperedDid);
   });
 
   it("import succeeds end-to-end when resolver returns DID Document with matching pubkey", async () => {
@@ -588,7 +660,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     ).toBe(false);
   });
 
-  it("import emits authority_host audit op with the manifest-declared host on every did:web check", async () => {
+  it("import emits authority_host audit op with the parsed identifier host on every did:web check", async () => {
     const h = await makeHarness();
     const dir = await makeTempDir();
     const didUri = manifestDidUri(h);

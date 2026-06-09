@@ -47,7 +47,9 @@
  * existing toBase64url helper covers the JWK `x` field).
  */
 
+import { lookup } from "node:dns/promises";
 import { readFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import { join } from "node:path";
 
 import { sha256 } from "@noble/hashes/sha256";
@@ -197,7 +199,10 @@ export interface ResolveDidWebOpts {
   fetcher?: (url: string, init?: { signal?: AbortSignal }) => Promise<{
     ok: boolean;
     status: number;
-    json: () => Promise<unknown>;
+    headers?: { get(name: string): string | null };
+    body?: ReadableStream<Uint8Array> | null;
+    text?: () => Promise<string>;
+    json?: () => Promise<unknown>;
   }>;
   /**
    * Optional expected Ed25519 public key. When set, the resolved
@@ -278,6 +283,7 @@ const DID_CONTEXT = [
 ] as const;
 
 const DEFAULT_TIMEOUT_MS = 5000;
+const MAX_DID_DOC_BYTES = 256 * 1024;
 const DEFAULT_PRESERVE_OLD_KEY_DAYS = 90;
 const DEFAULT_RECOMMENDED_PERIODIC_DAYS = 365;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -285,6 +291,10 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const HOST_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/i;
 const FORTRESS_LABEL_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 const AGENT_LABEL_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+const METADATA_AUTHORITY_HOSTS = new Set([
+  "metadata.google.internal",
+  "metadata.goog",
+]);
 
 // ── Issuance ─────────────────────────────────────────────────────────
 
@@ -487,6 +497,15 @@ export async function resolveDidWeb(
 ): Promise<ResolveResult> {
   const parsed = parseDidWeb(did);
   const url = didToUrl(parsed);
+  const unsafeHost = unsafeAuthorityHostReason(parsed.authority_host);
+  if (unsafeHost !== undefined) {
+    return {
+      ok: false,
+      failure: "host_not_allowed",
+      message: `did-web: authority_host '${parsed.authority_host}' is not allowed for resolution (${unsafeHost})`,
+      url,
+    };
+  }
 
   if (!opts.allowed_hosts.includes(parsed.authority_host)) {
     return {
@@ -497,12 +516,31 @@ export async function resolveDidWeb(
     };
   }
 
+  if (opts.fetcher === undefined) {
+    const resolvedHostFailure = await resolvedHostNotPublicReason(parsed.authority_host);
+    if (resolvedHostFailure !== undefined) {
+      return {
+        ok: false,
+        failure: "host_not_allowed",
+        message: `did-web: authority_host '${parsed.authority_host}' is not allowed for resolution (${resolvedHostFailure})`,
+        url,
+      };
+    }
+  }
+
   const timeoutMs = opts.timeout_ms ?? DEFAULT_TIMEOUT_MS;
   const fetcher = opts.fetcher ?? defaultFetcher;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  let response: { ok: boolean; status: number; json: () => Promise<unknown> };
+  let response: {
+    ok: boolean;
+    status: number;
+    headers?: { get(name: string): string | null };
+    body?: ReadableStream<Uint8Array> | null;
+    text?: () => Promise<string>;
+    json?: () => Promise<unknown>;
+  };
   try {
     response = await fetcher(url, { signal: controller.signal });
   } catch (err) {
@@ -544,7 +582,7 @@ export async function resolveDidWeb(
 
   let body: unknown;
   try {
-    body = await response.json();
+    body = await readCappedJsonResponse(response);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return {
@@ -622,8 +660,20 @@ export function parseDidWeb(did: string): ParsedDidWeb {
     segments[1] === "fortress" &&
     segments[3] === "agent"
   ) {
-    parsed.fortress_id = segments[2];
-    parsed.agent_label = segments[4];
+    const fortressId = segments[2]!;
+    const agentLabel = segments[4]!;
+    if (!FORTRESS_LABEL_RE.test(fortressId)) {
+      throw new Error(
+        `did-web: fortress_id '${fortressId}' is not a valid label`,
+      );
+    }
+    if (!AGENT_LABEL_RE.test(agentLabel)) {
+      throw new Error(
+        `did-web: agent_label '${agentLabel}' is not a valid label`,
+      );
+    }
+    parsed.fortress_id = fortressId;
+    parsed.agent_label = agentLabel;
     return parsed;
   }
   throw new Error(
@@ -755,13 +805,145 @@ function isDidDocument(value: unknown, expectedDid: string): value is DidDocumen
 async function defaultFetcher(
   url: string,
   init?: { signal?: AbortSignal },
-): Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }> {
-  const response = await fetch(url, init);
-  return {
-    ok: response.ok,
-    status: response.status,
-    json: () => response.json(),
-  };
+): Promise<Response> {
+  return fetch(url, init);
+}
+
+async function readCappedJsonResponse(response: {
+  headers?: { get(name: string): string | null };
+  body?: ReadableStream<Uint8Array> | null;
+  text?: () => Promise<string>;
+  json?: () => Promise<unknown>;
+}): Promise<unknown> {
+  const contentLength = response.headers?.get("content-length");
+  if (contentLength !== undefined && contentLength !== null) {
+    const parsedLength = Number.parseInt(contentLength, 10);
+    if (Number.isFinite(parsedLength) && parsedLength > MAX_DID_DOC_BYTES) {
+      throw new Error(
+        `response body exceeds ${MAX_DID_DOC_BYTES} byte did:web document limit`,
+      );
+    }
+  }
+
+  if (response.body !== undefined && response.body !== null) {
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value === undefined) continue;
+        total += value.byteLength;
+        if (total > MAX_DID_DOC_BYTES) {
+          await reader.cancel();
+          throw new Error(
+            `response body exceeds ${MAX_DID_DOC_BYTES} byte did:web document limit`,
+          );
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return JSON.parse(new TextDecoder().decode(bytes));
+  }
+
+  if (response.text !== undefined) {
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_DID_DOC_BYTES) {
+      throw new Error(
+        `response body exceeds ${MAX_DID_DOC_BYTES} byte did:web document limit`,
+      );
+    }
+    return JSON.parse(text);
+  }
+
+  if (response.json !== undefined) {
+    return response.json();
+  }
+
+  throw new Error("response body is not readable");
+}
+
+function unsafeAuthorityHostReason(authorityHost: string): string | undefined {
+  const host = authorityHost.toLowerCase();
+  if (METADATA_AUTHORITY_HOSTS.has(host)) {
+    return "metadata authority host";
+  }
+
+  const normalized = normalizeIpLiteral(authorityHost);
+  if (normalized !== undefined && isIP(normalized) !== 0) {
+    return "IP literal authority host";
+  }
+  return undefined;
+}
+
+async function resolvedHostNotPublicReason(
+  authorityHost: string,
+): Promise<string | undefined> {
+  let addresses: Array<{ address: string }> = [];
+  try {
+    addresses = await lookup(authorityHost, { all: true, verbatim: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return `DNS resolution failed: ${message}`;
+  }
+  if (addresses.length === 0) return "DNS resolution returned no addresses";
+  for (const { address } of addresses) {
+    if (!isPublicIpAddress(address)) {
+      return `DNS resolved to non-public address ${address}`;
+    }
+  }
+  return undefined;
+}
+
+function normalizeIpLiteral(authorityHost: string): string | undefined {
+  try {
+    const parsed = new URL(`http://${authorityHost}`);
+    return parsed.hostname.replace(/^\[/, "").replace(/\]$/, "");
+  } catch {
+    return undefined;
+  }
+}
+
+function isPublicIpAddress(address: string): boolean {
+  const version = isIP(address);
+  if (version === 4) return isPublicIpv4(address);
+  if (version === 6) return isPublicIpv6(address);
+  return false;
+}
+
+function isPublicIpv4(address: string): boolean {
+  const octets = address.split(".").map((part) => Number.parseInt(part, 10));
+  if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part))) {
+    return false;
+  }
+  const [a, b] = octets;
+  if (a === 10) return false;
+  if (a === 127) return false;
+  if (a === 169 && b === 254) return false;
+  if (a === 172 && b >= 16 && b <= 31) return false;
+  if (a === 192 && b === 168) return false;
+  if (a === 0) return false;
+  if (a >= 224) return false;
+  return true;
+}
+
+function isPublicIpv6(address: string): boolean {
+  const lower = address.toLowerCase();
+  if (lower === "::1") return false;
+  if (lower === "::") return false;
+  if (lower.startsWith("fe80:")) return false;
+  const firstHextet = Number.parseInt(lower.split(":")[0] || "0", 16);
+  if ((firstHextet & 0xfe00) === 0xfc00) return false;
+  return true;
 }
 
 // ── Fortress-config persistence (build 3) ────────────────────────────
