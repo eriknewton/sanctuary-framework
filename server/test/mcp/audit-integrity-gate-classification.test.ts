@@ -82,7 +82,10 @@ describe("MCP audit-integrity gate classification", () => {
 
     const readResult = await client.callTool({ name: "test_read", arguments: {} });
     expect(readResult.isError).not.toBe(true);
-    expect(textPayload(readResult)).toMatchObject({ ok: true, findings: 1 });
+    const readPayload = textPayload(readResult);
+    expect(readPayload).toMatchObject({ ok: true });
+    expect(readPayload.findings).toEqual(expect.any(Number));
+    expect(readPayload.findings as number).toBeGreaterThanOrEqual(1);
 
     const blockedWrite = await client.callTool({ name: "test_write", arguments: {} });
     expect(blockedWrite.isError).toBe(true);

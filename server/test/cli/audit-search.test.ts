@@ -7,7 +7,7 @@ import { runAuditCommand, parseSearchOptions } from "../../src/cli/audit.js";
 import { AuditLog } from "../../src/l2-operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { deriveMasterKey } from "../../src/core/key-derivation.js";
-import { stringToBytes } from "../../src/core/encoding.js";
+import { bytesToString, stringToBytes } from "../../src/core/encoding.js";
 
 class Capture extends Writable {
   chunks: string[] = [];
@@ -106,6 +106,36 @@ describe("sanctuary audit search", () => {
     const parsed = JSON.parse(out.text());
     expect(parsed.total).toBe(1);
     expect(parsed.entries[0].operation).toBe("identity_create");
+  });
+
+  it("reports audit integrity findings instead of silently returning search results", async () => {
+    const fortress = await makeFortress();
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    const [entryMeta] = await storage.list("_audit", "entry-");
+    if (!entryMeta) throw new Error("missing audit fixture entry");
+    const raw = await storage.read("_audit", entryMeta.key);
+    if (!raw) throw new Error("missing audit fixture bytes");
+    const envelope = JSON.parse(bytesToString(raw)) as { entry_hash: string };
+    envelope.entry_hash = "0".repeat(64);
+    await storage.write("_audit", entryMeta.key, stringToBytes(JSON.stringify(envelope)));
+
+    const out = new Capture();
+    const err = new Capture();
+    const code = await runAuditCommand({
+      argv: ["search", "--fortress", fortress, "--json"],
+      out,
+      err,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("AUDIT INTEGRITY WARNING");
+    const parsed = JSON.parse(out.text());
+    expect(parsed.integrity_findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "entry_hash_mismatch" }),
+      ])
+    );
   });
 
   it("prints a clean empty result and exits 0", async () => {

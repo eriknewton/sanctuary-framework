@@ -1,3 +1,7 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   AuditIntegrityError,
@@ -15,6 +19,7 @@ import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encodi
 import { createIdentity, sign as identitySign } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 
 const MASTER_KEY = () => generateRandomKey();
@@ -101,6 +106,77 @@ describe("AuditLog tamper-evident chain", () => {
     await storage.delete("_audit", keys[1]!);
 
     await expectStrictFinding(storage, masterKey, "sequence_gap_or_reorder");
+  });
+
+  it("detects tail truncation below the MAC'd head floor", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = MASTER_KEY();
+    const writer = new AuditLog(storage, masterKey, { checkpointInterval: 0 });
+    await appendCritical(writer, "one");
+    await appendCritical(writer, "two");
+    await appendCritical(writer, "three");
+
+    const keys = await auditKeys(storage);
+    await storage.delete("_audit", keys[2]!);
+
+    await expectStrictFinding(storage, masterKey, "tail_anchor_invalid");
+  });
+
+  it("fails closed when truncation is left behind with a fake in-progress writer marker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sanctuary-audit-fake-marker-"));
+    try {
+      const storage = new FilesystemStorage(join(root, "state"));
+      const masterKey = MASTER_KEY();
+      const writer = new AuditLog(storage, masterKey, { checkpointInterval: 0 });
+      await appendCritical(writer, "one");
+      await appendCritical(writer, "two");
+      await appendCritical(writer, "three");
+
+      const keys = (await storage.list("_audit")).map((entry) => entry.key);
+      await storage.delete("_audit", keys.at(-1)!);
+
+      const auditDir = storage.namespacePath("_audit");
+      await mkdir(auditDir, { recursive: true, mode: 0o700 });
+      await writeFile(join(auditDir, ".audit-write.lock"), "not-json", { mode: 0o600 });
+
+      const reader = new AuditLog(storage, masterKey);
+      await expect(reader.query({ limit: 100 })).rejects.toMatchObject({
+        name: "AuditIntegrityError",
+        findings: expect.arrayContaining([
+          expect.objectContaining({ kind: "tail_anchor_invalid" }),
+        ]),
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    }
+  });
+
+  it("allows a genuinely fresh empty log with no prior head anchor", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = MASTER_KEY();
+    const reader = new AuditLog(storage, masterKey);
+
+    const result = await reader.query({ limit: 100 });
+
+    expect(result.total).toBe(0);
+    expect(result.integrity_findings).toEqual([]);
+  });
+
+  it("detects whole-log deletion on an established audit store", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = MASTER_KEY();
+    const writer = new AuditLog(storage, masterKey);
+    await appendCritical(writer, "one");
+    await appendCritical(writer, "two");
+
+    for (const meta of await storage.list("_audit")) {
+      await storage.delete(meta.namespace, meta.key);
+    }
+    for (const meta of await storage.list("_audit_checkpoints")) {
+      await storage.delete(meta.namespace, meta.key);
+    }
+
+    await expectStrictFinding(storage, masterKey, "tail_anchor_missing");
   });
 
   it("detects a single entry byte modification", async () => {

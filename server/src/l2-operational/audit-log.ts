@@ -69,6 +69,8 @@ export type AuditIntegrityFindingKind =
   | "legacy_anchor_mismatch"
   | "rotation_anchor_missing"
   | "rotation_anchor_invalid"
+  | "tail_anchor_missing"
+  | "tail_anchor_invalid"
   | "checkpoint_malformed"
   | "checkpoint_root_mismatch"
   | "checkpoint_signature_mismatch"
@@ -124,20 +126,34 @@ const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
 // fixed key that does NOT match the `audit-checkpoint-`/`legacy-anchor-` prefixes
 // the checkpoint readers list on, so it never collides with those scans.
 const AUDIT_ROTATION_ANCHOR_KEY = "__rotation_anchor";
+const AUDIT_HEAD_ANCHOR_KEY = "__head_anchor";
+const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
 // Distinctive envelope marker so a MAC'd rotation anchor is unambiguously
 // distinguished from a bare/marker-stripped record (mirrors F1's state-meta MAC).
 const AUDIT_ROTATION_ANCHOR_MARKER = "__sanctuary_audit_rotation_anchor_v1";
+const AUDIT_HEAD_ANCHOR_MARKER = "__sanctuary_audit_head_anchor_v1";
 // Domain-separated MAC over the rotation-anchor record. The anchor records the
 // authenticated lowest-surviving sequence + its prev_hash after a prune, so a
 // post-cut deletion is still detectable while a legitimate rotation verifies
 // cleanly. The MAC ALWAYS authenticates (master-key derived) — unlike the
 // optional Ed25519 checkpoint signer, which may be null.
 const AUDIT_ROTATION_ANCHOR_MAC_DOMAIN = "sanctuary.audit-rotation-anchor.v1\n";
+const AUDIT_HEAD_ANCHOR_MAC_DOMAIN = "sanctuary.audit-head-anchor.v1\n";
 const AUDIT_INTEGRITY_ALERT_NAMESPACE = "_audit_integrity_alert";
 const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
 const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
+// Read-consistency backstop. A reader does NOT take the write lock (audit reads
+// must work even if a crashed writer stranded a lock, and must never be blockable
+// by a planted lock file), so it can observe a torn cut while a rotation is
+// mid-flight. We retry through such transients, but the budget is a bounded
+// wall-clock DEADLINE rather than a fixed tick count: a legitimately slow
+// rotation on a loaded CI host can outrun any small fixed ceiling (the original
+// false-fail), while an attacker who keeps the store permanently mid-update still
+// fails closed once the deadline passes.
+const AUDIT_READ_CONSISTENCY_MAX_MS = 2_000;
+const AUDIT_READ_CONSISTENCY_RETRY_MS = 10;
 
 /** True iff `pid` names a live process this user could signal. Used to detect a
  * stale audit-write lock left by a crashed/killed holder. */
@@ -239,6 +255,7 @@ export class AuditLog {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
   private rotationAnchorMacKey: Uint8Array;
+  private headAnchorMacKey: Uint8Array;
   private entries: AuditEntry[] = [];
   private chainEntries: Array<{ sequence: number; entry_hash: string }> = [];
   private counter = 0;
@@ -275,6 +292,7 @@ export class AuditLog {
     // F3: derive the rotation-anchor MAC key up front and never retain the raw
     // master key (mirrors how encryptionKey is derived here, per F1's pattern).
     this.rotationAnchorMacKey = derivePurposeKey(masterKey, "audit-rotation-anchor");
+    this.headAnchorMacKey = derivePurposeKey(masterKey, "audit-head-anchor");
     this.maxTotalSizeBytes = config?.maxTotalSizeBytes ?? DEFAULT_MAX_TOTAL_SIZE_BYTES;
     this.maxEntries = config?.maxEntries ?? DEFAULT_MAX_ENTRIES;
     this.integrityMode = config?.integrityMode ?? "strict";
@@ -436,6 +454,7 @@ export class AuditLog {
           if (options.verifyDurability) {
             await this.verifyPersistedBytes(key, persistedBytes);
           }
+          await this.writeHeadAnchor(sequence, entryHash);
         } catch (err) {
           throw toAuditPersistenceError(err);
         }
@@ -730,6 +749,191 @@ export class AuditLog {
     };
   }
 
+  private async writeHeadAnchor(
+    highestSequence: number,
+    headHash: string
+  ): Promise<void> {
+    const data = { highest_sequence: highestSequence, head_hash: headHash };
+    const envelope = {
+      [AUDIT_HEAD_ANCHOR_MARKER]: true,
+      data,
+      mac: toBase64url(this.headAnchorMacBytes(data)),
+    };
+    const bytes = stringToBytes(JSON.stringify(envelope));
+    if (this.filesystemCapabilities) {
+      await this.filesystemCapabilities.writeDurable(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_HEAD_ANCHOR_KEY,
+        bytes
+      );
+    } else {
+      await this.storage.write(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_HEAD_ANCHOR_KEY,
+        bytes
+      );
+    }
+    await this.storage.write(
+      "_meta",
+      AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY,
+      stringToBytes("1")
+    );
+  }
+
+  private headAnchorMacBytes(data: {
+    highest_sequence: number;
+    head_hash: string;
+  }): Uint8Array {
+    return hmacSha256(
+      this.headAnchorMacKey,
+      stringToBytes(AUDIT_HEAD_ANCHOR_MAC_DOMAIN + canonicalJson(data))
+    );
+  }
+
+  private async loadHeadAnchor(
+    findings: AuditIntegrityFinding[]
+  ): Promise<
+    | { status: "valid"; highest_sequence: number; head_hash: string }
+    | { status: "absent" }
+    | { status: "invalid" }
+  > {
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.storage.read(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_HEAD_ANCHOR_KEY
+      );
+    } catch (err) {
+      findings.push({
+        kind: "storage_unavailable",
+        message: `audit head anchor could not be read: ${failureMessage(err)}`,
+      });
+      return { status: "invalid" };
+    }
+    if (!raw) return { status: "absent" };
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytesToString(raw));
+    } catch {
+      return { status: "invalid" };
+    }
+    if (!isRecord(parsed) || parsed[AUDIT_HEAD_ANCHOR_MARKER] !== true) {
+      return { status: "absent" };
+    }
+
+    const data = parsed.data;
+    const mac = parsed.mac;
+    if (
+      !isRecord(data) ||
+      typeof mac !== "string" ||
+      typeof data.highest_sequence !== "number" ||
+      !Number.isSafeInteger(data.highest_sequence) ||
+      data.highest_sequence <= 0 ||
+      typeof data.head_hash !== "string" ||
+      !/^[0-9a-f]{64}$/.test(data.head_hash)
+    ) {
+      return { status: "invalid" };
+    }
+    let providedMac: Uint8Array;
+    try {
+      providedMac = fromBase64url(mac);
+    } catch {
+      return { status: "invalid" };
+    }
+    if (
+      !constantTimeEqual(
+        providedMac,
+        this.headAnchorMacBytes({
+          highest_sequence: data.highest_sequence,
+          head_hash: data.head_hash,
+        })
+      )
+    ) {
+      return { status: "invalid" };
+    }
+    return {
+      status: "valid",
+      highest_sequence: data.highest_sequence,
+      head_hash: data.head_hash,
+    };
+  }
+
+  private async verifyHeadAnchor(
+    highestChainedSeq: number,
+    highestChainedHash: string,
+    hasLegacyEntries: boolean,
+    hasChainedEntries: boolean,
+    findings: AuditIntegrityFinding[]
+  ): Promise<void> {
+    const anchor = await this.loadHeadAnchor(findings);
+    if (anchor.status === "valid") {
+      if (highestChainedSeq < anchor.highest_sequence) {
+        findings.push({
+          kind: "tail_anchor_invalid",
+          sequence: highestChainedSeq,
+          expected: anchor.highest_sequence,
+          actual: highestChainedSeq,
+          message: `audit head anchor floor ${anchor.highest_sequence} exceeds highest surviving sequence ${highestChainedSeq} (tail truncation or replay detected)`,
+        });
+        return;
+      }
+      if (
+        highestChainedSeq === anchor.highest_sequence &&
+        highestChainedHash !== anchor.head_hash
+      ) {
+        findings.push({
+          kind: "tail_anchor_invalid",
+          sequence: highestChainedSeq,
+          expected: anchor.head_hash,
+          actual: highestChainedHash,
+          message: `audit head anchor hash does not match the surviving head at sequence ${highestChainedSeq}`,
+        });
+      }
+      return;
+    }
+
+    if (anchor.status === "invalid") {
+      findings.push({
+        kind: "tail_anchor_invalid",
+        message:
+          "audit head anchor is present but failed authentication (tampered, forged, or wrong key)",
+      });
+      return;
+    }
+
+    if (hasLegacyEntries && !hasChainedEntries && highestChainedSeq > 0) {
+      await this.writeHeadAnchor(highestChainedSeq, highestChainedHash);
+      return;
+    }
+
+    if (await this.isEstablishedAuditStore(hasLegacyEntries || hasChainedEntries)) {
+      // First boot is legitimately anchorless. Once audit bytes or the
+      // audit-established marker exist, stripping the tail floor makes rollback
+      // indistinguishable from an empty log and must fail closed.
+      findings.push({
+        kind: "tail_anchor_missing",
+        message:
+          "audit head anchor missing for established audit store (tail truncation or whole-log deletion may have occurred)",
+      });
+    }
+  }
+
+  private async isEstablishedAuditStore(hasAuditEntries: boolean): Promise<boolean> {
+    if (hasAuditEntries) return true;
+    if (
+      await this.storage
+        .exists("_meta", AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)
+        .catch(() => false)
+    ) {
+      return true;
+    }
+    const checkpointMetas = await this.storage
+      .list(AUDIT_CHECKPOINT_NAMESPACE)
+      .catch(() => []);
+    return checkpointMetas.length > 0;
+  }
+
   /**
    * F3: resolve the seed (expected first sequence + prev_hash) for the chained
    * walk, accounting for rotation. Three regimes:
@@ -930,7 +1134,7 @@ export class AuditLog {
 
   private async ensureLoaded(options?: { allowIntegrityFindings?: boolean }): Promise<void> {
     if (!this.loaded) {
-      await this.loadPersistedEntries();
+      await this.loadPersistedEntriesWithReadConsistency();
       this.loaded = true;
     }
     await this.reportIntegrityFindingsIfAny();
@@ -947,7 +1151,7 @@ export class AuditLog {
   }
 
   private async reloadPersistedEntries(): Promise<void> {
-    await this.loadPersistedEntries();
+    await this.loadPersistedEntriesWithReadConsistency();
     this.loaded = true;
     await this.reportIntegrityFindingsIfAny();
     const contextAllowsIntegrityFindings =
@@ -959,6 +1163,83 @@ export class AuditLog {
     ) {
       throw new AuditIntegrityError(this.integrityFindings);
     }
+  }
+
+  private async loadPersistedEntriesWithReadConsistency(): Promise<void> {
+    const deadline = Date.now() + AUDIT_READ_CONSISTENCY_MAX_MS;
+    let lastSignature: string | null = null;
+    for (;;) {
+      await this.loadPersistedEntries();
+      if (this.integrityFindings.length === 0) {
+        return; // clean read
+      }
+      if (Date.now() >= deadline) {
+        return; // bounded backstop; surfaced in strict mode by the caller
+      }
+      // Give-up discriminator (attacker safety) is STORE STABILITY, not the
+      // finding kind. Retry only while the store is DEMONSTRABLY mid-mutation:
+      // a writer marker is currently held, OR the entry listing changed since the
+      // previous attempt. The listing-changed signal is essential — a bursty
+      // writer releases the cross-process marker between appends, so an
+      // instantaneous marker check alone gives up mid-burst and surfaces a
+      // legitimate rotation tear (the CI false-fail). A STATIC store with findings
+      // is real tamper (truncation, byte edit, forged anchor) and falls through to
+      // fail closed within a single retry — discriminating on stability rather
+      // than on finding-kind means ALL torn-read shapes (anchor floor ahead of a
+      // pruned listing, entries pruned out from under a scan, a half-updated
+      // checkpoint root) are tolerated WITHOUT ever classifying a genuine tamper
+      // signal as "transient". The first attempt with findings always retries once
+      // to establish the listing baseline. The wall-clock deadline above bounds an
+      // attacker who keeps the store permanently churning.
+      const signature = await this.auditEntryListingSignature();
+      const hadBaseline = lastSignature !== null;
+      const listingChanged = hadBaseline && signature !== lastSignature;
+      lastSignature = signature;
+      const storeIsMutating =
+        listingChanged || (await this.isAuditWriterInProgress());
+      if (hadBaseline && !storeIsMutating) {
+        return; // static store with findings → fail closed (no masking)
+      }
+      await sleep(AUDIT_READ_CONSISTENCY_RETRY_MS);
+    }
+  }
+
+  /**
+   * Cheap mutation fingerprint of the audit entry namespace: count + lowest +
+   * highest key. A concurrent append (new highest key / higher count) or a prune
+   * (new lowest key / lower count) changes it; a static store does not. Used only
+   * on the read-consistency retry path to decide whether a present integrity
+   * finding is worth retrying (active mutation) or should fail closed (static).
+   */
+  private async auditEntryListingSignature(): Promise<string> {
+    try {
+      const metas = await this.storage.list(AUDIT_NAMESPACE);
+      if (metas.length === 0) return "0";
+      metas.sort((a, b) => a.key.localeCompare(b.key));
+      return `${metas.length}:${metas[0]!.key}:${metas[metas.length - 1]!.key}`;
+    } catch {
+      // A listing error is itself a sign of concurrent mutation; return a
+      // sentinel distinct from any real signature so the next attempt compares
+      // unequal and retries (bounded by the deadline).
+      return "list-error";
+    }
+  }
+
+  private async isAuditWriterInProgress(): Promise<boolean> {
+    if (!this.auditWriteLockPath) return false;
+    try {
+      await readFile(this.auditWriteLockPath, "utf8");
+    } catch (err) {
+      const code =
+        err instanceof Error && "code" in err
+          ? String((err as NodeJS.ErrnoException).code)
+          : "";
+      return code !== "ENOENT" && code !== "ENOTDIR";
+    }
+    if (await this.breakStaleAuditLock(this.auditWriteLockPath)) {
+      return false;
+    }
+    return true;
   }
 
   private async withAuditWriteLock<T>(operation: () => Promise<T>): Promise<T> {
@@ -1055,8 +1336,11 @@ export class AuditLog {
 
     if (holderPid === process.pid) return false;
 
-    const bootTimeMs = Date.now() - osUptime() * 1000;
-    const predatesBoot = acquiredAtMs !== undefined && acquiredAtMs < bootTimeMs;
+    const bootTimeMs = currentBootTimeMs();
+    const predatesBoot =
+      acquiredAtMs !== undefined &&
+      bootTimeMs !== undefined &&
+      acquiredAtMs < bootTimeMs;
     const holderDead = holderPid !== undefined && !isProcessAlive(holderPid);
     if (!predatesBoot && !holderDead) return false;
 
@@ -1274,9 +1558,17 @@ export class AuditLog {
       // break the chain. (Identical to count+1 when nothing was pruned.)
       const highestChainedSeq =
         chainedEntries.at(-1)?.envelope.sequence ?? legacyRawEntries.length;
-      this.nextSequence = highestChainedSeq + 1;
-      this.lastEntryHash =
+      const highestChainedHash =
         chainedEntries.at(-1)?.envelope.entry_hash ?? legacyAnchorHash;
+      await this.verifyHeadAnchor(
+        highestChainedSeq,
+        highestChainedHash,
+        legacyRawEntries.length > 0,
+        chainedEntries.length > 0,
+        findings
+      );
+      this.nextSequence = highestChainedSeq + 1;
+      this.lastEntryHash = highestChainedHash;
       this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
       this.integrityFindings = findings;
     } catch (err) {
@@ -1783,6 +2075,16 @@ function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function currentBootTimeMs(): number | undefined {
+  try {
+    return Date.now() - osUptime() * 1000;
+  } catch {
+    // Some sandboxed child processes cannot call uv_uptime. In that case the
+    // lock is not proven stale by boot time; PID liveness can still prove it.
+    return undefined;
+  }
 }
 
 function asFilesystemCapabilities(

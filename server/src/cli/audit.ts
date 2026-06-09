@@ -7,7 +7,12 @@
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { AuditLog, type AuditEntry } from "../l2-operational/audit-log.js";
+import {
+  AuditIntegrityError,
+  AuditLog,
+  type AuditEntry,
+  type AuditIntegrityFinding,
+} from "../l2-operational/audit-log.js";
 import {
   deriveMasterKey,
   type KeyDerivationParams,
@@ -57,44 +62,86 @@ export async function runAuditCommand(args: AuditCommandArgs): Promise<number> {
     return 0;
   }
 
+  let opts: SearchOptions | undefined;
+  let masterKey: Uint8Array | undefined;
   try {
-    const opts = parseSearchOptions(rest);
+    opts = parseSearchOptions(rest);
+    const searchOpts = opts;
     const env = args.env ?? process.env;
-    const storagePath = opts.fortress ?? resolveStoragePath(env);
+    const storagePath = searchOpts.fortress ?? resolveStoragePath(env);
     const storage = new FilesystemStorage(join(storagePath, "state"));
-    const masterKey = await resolveMasterKey(storage, opts, env);
+    masterKey = await resolveMasterKey(storage, searchOpts, env);
     const auditLog = new AuditLog(storage, masterKey);
     const result = await auditLog.query({
-      ...(opts.since ? { since: opts.since } : {}),
+      ...(searchOpts.since ? { since: searchOpts.since } : {}),
       limit: Number.MAX_SAFE_INTEGER,
     });
-    masterKey.fill(0);
 
-    const untilMs = opts.until ? Date.parse(opts.until) : undefined;
+    const untilMs = searchOpts.until ? Date.parse(searchOpts.until) : undefined;
     let entries = result.entries;
-    if (opts.types.length > 0) {
-      const wanted = new Set(opts.types);
+    if (searchOpts.types.length > 0) {
+      const wanted = new Set(searchOpts.types);
       entries = entries.filter((entry) => wanted.has(entry.operation));
     }
     if (untilMs !== undefined) {
       entries = entries.filter((entry) => Date.parse(entry.timestamp) <= untilMs);
     }
-    if (opts.actor) {
-      entries = entries.filter((entry) => entry.identity_id === opts.actor);
+    if (searchOpts.actor) {
+      entries = entries.filter((entry) => entry.identity_id === searchOpts.actor);
     }
     const total = entries.length;
-    entries = entries.slice(-opts.limit);
+    entries = entries.slice(-searchOpts.limit);
 
-    if (opts.json) {
-      write(out, JSON.stringify({ entries, total }, null, 2) + "\n");
+    const findings = result.integrity_findings;
+    if (findings.length > 0) {
+      printIntegrityWarning(err, findings);
+    }
+
+    if (searchOpts.json) {
+      write(
+        out,
+        JSON.stringify(
+          {
+            entries,
+            total,
+            ...(findings.length > 0 ? { integrity_findings: findings } : {}),
+          },
+          null,
+          2
+        ) + "\n"
+      );
     } else {
       printTable(out, entries);
     }
-    return 0;
+    return findings.length > 0 ? 1 : 0;
   } catch (error) {
+    if (error instanceof AuditIntegrityError) {
+      printIntegrityWarning(err, error.findings);
+      if (opts?.json) {
+        write(
+          out,
+          JSON.stringify({ entries: [], total: 0, integrity_findings: error.findings }, null, 2) +
+            "\n"
+        );
+      }
+      return 1;
+    }
     write(err, `sanctuary audit search: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
+  } finally {
+    masterKey?.fill(0);
   }
+}
+
+function printIntegrityWarning(
+  err: Writable,
+  findings: readonly AuditIntegrityFinding[]
+): void {
+  const kinds = [...new Set(findings.map((finding) => finding.kind))].join(", ");
+  write(
+    err,
+    `AUDIT INTEGRITY WARNING: ${findings.length} finding(s) detected (${kinds}); results may be incomplete or tampered.\n`
+  );
 }
 
 export function parseSearchOptions(argv: string[]): SearchOptions {

@@ -27,7 +27,11 @@ export const AUDIT_EXPORT_NAMESPACE = "_audit";
 export const AUDIT_EXPORT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
 
 /** Record types in a JSONL export file. */
-export type ExportRecord = EntryExportRecord | CheckpointExportRecord | LegacyAnchorExportRecord;
+export type ExportRecord =
+  | EntryExportRecord
+  | CheckpointExportRecord
+  | LegacyAnchorExportRecord
+  | RotationAnchorExportRecord;
 
 export interface EntryExportRecord {
   type: "entry";
@@ -65,6 +69,12 @@ export interface LegacyAnchorExportRecord {
   signature: string | null;
   public_key?: string;
   unsigned: boolean;
+}
+
+export interface RotationAnchorExportRecord {
+  type: "rotation_anchor";
+  base_sequence: number;
+  base_prev_hash: string;
 }
 
 /**
@@ -118,6 +128,15 @@ export async function exportAuditChain(
     try {
       parsed = JSON.parse(bytesToString(raw));
     } catch {
+      continue;
+    }
+    if (isRotationAnchorRecord(parsed)) {
+      const record: RotationAnchorExportRecord = {
+        type: "rotation_anchor",
+        base_sequence: parsed.data.base_sequence,
+        base_prev_hash: parsed.data.base_prev_hash,
+      };
+      out.write(JSON.stringify(record) + "\n");
       continue;
     }
     if (!isAuditCheckpointRecord(parsed)) continue;
@@ -243,6 +262,20 @@ function isAuditCheckpointRecord(value: unknown): value is AuditCheckpointRecord
     (typeof value.signer_kid === "string" || value.signer_kid === null) &&
     (typeof value.signature === "string" || value.signature === null) &&
     typeof value.unsigned === "boolean"
+  );
+}
+
+function isRotationAnchorRecord(
+  value: unknown
+): value is { data: { base_sequence: number; base_prev_hash: string } } {
+  return (
+    isRecord(value) &&
+    value.__sanctuary_audit_rotation_anchor_v1 === true &&
+    isRecord(value.data) &&
+    typeof value.data.base_sequence === "number" &&
+    Number.isSafeInteger(value.data.base_sequence) &&
+    value.data.base_sequence > 0 &&
+    typeof value.data.base_prev_hash === "string"
   );
 }
 

@@ -165,7 +165,17 @@ export interface LegacyAnchorExportRecord {
   unsigned: boolean;
 }
 
-export type ExportRecord = EntryExportRecord | CheckpointExportRecord | LegacyAnchorExportRecord;
+export interface RotationAnchorExportRecord {
+  type: "rotation_anchor";
+  base_sequence: number;
+  base_prev_hash: string;
+}
+
+export type ExportRecord =
+  | EntryExportRecord
+  | CheckpointExportRecord
+  | LegacyAnchorExportRecord
+  | RotationAnchorExportRecord;
 
 // ---- Verification report types ----------------------------------------------
 
@@ -179,6 +189,7 @@ export type RecordFindingKind =
   | "checkpoint_signature_invalid"
   | "checkpoint_signature_missing_key"
   | "legacy_anchor_mismatch"
+  | "rotation_anchor_mismatch"
   | "schema_error";
 
 export interface RecordFinding {
@@ -226,11 +237,15 @@ export function verifyAuditChainRecords(
   const legacyAnchors = records
     .filter((r): r is LegacyAnchorExportRecord => r.type === "legacy_anchor")
     .sort((a, b) => a.checkpoint_sequence - b.checkpoint_sequence);
+  const rotationAnchors = records
+    .filter((r): r is RotationAnchorExportRecord => r.type === "rotation_anchor")
+    .sort((a, b) => a.base_sequence - b.base_sequence);
 
   if (
     entries.length === 0 &&
     checkpoints.length === 0 &&
-    legacyAnchors.length === 0
+    legacyAnchors.length === 0 &&
+    rotationAnchors.length === 0
   ) {
     return {
       verdict: "FAIL",
@@ -257,6 +272,22 @@ export function verifyAuditChainRecords(
     // Legacy entries would have been migrated; v2 entries start at legacy_count+1
     expectedSeq = legacyAnchor.checkpoint_sequence + 1;
     expectedPrevHash = legacyAnchor.root_hash;
+  }
+  const rotationAnchor = rotationAnchors.at(-1);
+  if (rotationAnchor && entries.length > 0) {
+    const firstSeq = entries[0]!.seq;
+    if (rotationAnchor.base_sequence !== firstSeq) {
+      findings.push({
+        kind: "rotation_anchor_mismatch",
+        seq: firstSeq,
+        expected: rotationAnchor.base_sequence,
+        actual: firstSeq,
+        message: `Rotation anchor base_sequence ${rotationAnchor.base_sequence} does not match first exported entry ${firstSeq}`,
+      });
+    } else {
+      expectedSeq = rotationAnchor.base_sequence;
+      expectedPrevHash = rotationAnchor.base_prev_hash;
+    }
   }
 
   const entryHashBySeq = new Map<number, string>();
@@ -317,31 +348,35 @@ export function verifyAuditChainRecords(
   // Step 3 + 4: Verify checkpoints
   for (const cp of checkpoints) {
     // Collect hashes for this checkpoint span
-    const hashes: string[] = [];
-    let rootOk = true;
-    for (let seq = cp.from_sequence; seq <= cp.checkpoint_sequence; seq++) {
-      const h = entryHashBySeq.get(seq);
-      if (h == null) {
-        findings.push({
-          kind: "checkpoint_root_mismatch",
-          seq: cp.checkpoint_sequence,
-          message: `Checkpoint at seq ${cp.checkpoint_sequence} references missing entry seq ${seq}`,
-        });
-        rootOk = false;
-        break;
+    const spansRotatedEntries =
+      rotationAnchor !== undefined && cp.from_sequence < rotationAnchor.base_sequence;
+    if (!spansRotatedEntries) {
+      const hashes: string[] = [];
+      let rootOk = true;
+      for (let seq = cp.from_sequence; seq <= cp.checkpoint_sequence; seq++) {
+        const h = entryHashBySeq.get(seq);
+        if (h == null) {
+          findings.push({
+            kind: "checkpoint_root_mismatch",
+            seq: cp.checkpoint_sequence,
+            message: `Checkpoint at seq ${cp.checkpoint_sequence} references missing entry seq ${seq}`,
+          });
+          rootOk = false;
+          break;
+        }
+        hashes.push(h);
       }
-      hashes.push(h);
-    }
-    if (rootOk) {
-      const expectedRoot = computeAuditRoot(hashes);
-      if (expectedRoot !== cp.root_hash) {
-        findings.push({
-          kind: "checkpoint_root_mismatch",
-          seq: cp.checkpoint_sequence,
-          expected: expectedRoot,
-          actual: cp.root_hash,
-          message: `Checkpoint root mismatch at seq ${cp.checkpoint_sequence}`,
-        });
+      if (rootOk) {
+        const expectedRoot = computeAuditRoot(hashes);
+        if (expectedRoot !== cp.root_hash) {
+          findings.push({
+            kind: "checkpoint_root_mismatch",
+            seq: cp.checkpoint_sequence,
+            expected: expectedRoot,
+            actual: cp.root_hash,
+            message: `Checkpoint root mismatch at seq ${cp.checkpoint_sequence}`,
+          });
+        }
       }
     }
 
