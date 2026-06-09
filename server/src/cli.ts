@@ -18,6 +18,7 @@ import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusa
 import { checkForUpdate } from "./update-check.js";
 import { createRequire } from "node:module";
 import { basename } from "node:path";
+export { TOP_LEVEL_SUBCOMMANDS } from "./cli/subcommands.js";
 
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
@@ -97,6 +98,30 @@ async function main(): Promise<void> {
   if (args[0] === "export-passphrase") {
     await runExportPassphrase(args.slice(1));
     return;
+  }
+
+  if (args[0] === "doctor") {
+    const { runDoctorCommand } = await import("./cli/doctor.js");
+    const code = await runDoctorCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "completion") {
+    const { runCompletionCommand } = await import("./cli/completion.js");
+    const code = await runCompletionCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "audit") {
+    const { runAuditCommand } = await import("./cli/audit.js");
+    const code = await runAuditCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "generate") {
+    const { runGenerateCommand } = await import("./cli/generate.js");
+    const code = await runGenerateCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
   }
 
   if (args[0] === "compliance") {
@@ -516,6 +541,10 @@ Usage:
   sanctuary [options]                     # MCP server (stdio)
   sanctuary init [opts]                   # Create a fresh fortress
   sanctuary dashboard [opts]              # Standalone dashboard
+  sanctuary doctor [opts]                 # Local environment diagnostic
+  sanctuary completion <bash|zsh|fish>    # Emit shell completion
+  sanctuary audit search [opts]           # Search local audit log
+  sanctuary generate systemd [opts]       # Emit systemd service unit
   sanctuary protect [opts]                 # Protect an agent in one command
   sanctuary wrap [opts]                   # (alias for protect)
   sanctuary export-passphrase             # Print stored passphrase
@@ -541,6 +570,17 @@ Subcommands:
                        Reads from the same storage as the MCP server.
                        Use "sanctuary dashboard --help" for options.
                        Pass --multi to render the multi-tenant overview.
+
+  doctor               Run read-only local health diagnostics.
+                       Use "sanctuary doctor --help" for options.
+
+  completion           Emit shell completion for bash, zsh, or fish.
+
+  audit                Search local audit history.
+                       Use "sanctuary audit --help" for options.
+
+  generate             Emit local deployment templates.
+                       Use "sanctuary generate --help" for options.
 
   identity             Inspect the active identity (DID, public key).
                        Use "sanctuary identity --help" for options.
