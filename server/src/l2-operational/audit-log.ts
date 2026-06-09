@@ -144,7 +144,15 @@ const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
 const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
-const AUDIT_READ_CONSISTENCY_RETRIES = 5;
+// Read-consistency backstop. A reader does NOT take the write lock (audit reads
+// must work even if a crashed writer stranded a lock, and must never be blockable
+// by a planted lock file), so it can observe a torn cut while a rotation is
+// mid-flight. We retry through such transients, but the budget is a bounded
+// wall-clock DEADLINE rather than a fixed tick count: a legitimately slow
+// rotation on a loaded CI host can outrun any small fixed ceiling (the original
+// false-fail), while an attacker who keeps the store permanently mid-update still
+// fails closed once the deadline passes.
+const AUDIT_READ_CONSISTENCY_MAX_MS = 2_000;
 const AUDIT_READ_CONSISTENCY_RETRY_MS = 10;
 
 /** True iff `pid` names a live process this user could signal. Used to detect a
@@ -1158,57 +1166,63 @@ export class AuditLog {
   }
 
   private async loadPersistedEntriesWithReadConsistency(): Promise<void> {
-    for (let attempt = 0; attempt <= AUDIT_READ_CONSISTENCY_RETRIES; attempt++) {
+    const deadline = Date.now() + AUDIT_READ_CONSISTENCY_MAX_MS;
+    let lastSignature: string | null = null;
+    for (;;) {
       await this.loadPersistedEntries();
-      if (!this.hasReadConsistencyTransientFindings(this.integrityFindings)) {
-        return;
+      if (this.integrityFindings.length === 0) {
+        return; // clean read
       }
-      if (!(await this.isAuditWriterInProgress())) {
-        return;
+      if (Date.now() >= deadline) {
+        return; // bounded backstop; surfaced in strict mode by the caller
       }
-      if (attempt === AUDIT_READ_CONSISTENCY_RETRIES) {
-        return;
+      // Give-up discriminator (attacker safety) is STORE STABILITY, not the
+      // finding kind. Retry only while the store is DEMONSTRABLY mid-mutation:
+      // a writer marker is currently held, OR the entry listing changed since the
+      // previous attempt. The listing-changed signal is essential — a bursty
+      // writer releases the cross-process marker between appends, so an
+      // instantaneous marker check alone gives up mid-burst and surfaces a
+      // legitimate rotation tear (the CI false-fail). A STATIC store with findings
+      // is real tamper (truncation, byte edit, forged anchor) and falls through to
+      // fail closed within a single retry — discriminating on stability rather
+      // than on finding-kind means ALL torn-read shapes (anchor floor ahead of a
+      // pruned listing, entries pruned out from under a scan, a half-updated
+      // checkpoint root) are tolerated WITHOUT ever classifying a genuine tamper
+      // signal as "transient". The first attempt with findings always retries once
+      // to establish the listing baseline. The wall-clock deadline above bounds an
+      // attacker who keeps the store permanently churning.
+      const signature = await this.auditEntryListingSignature();
+      const hadBaseline = lastSignature !== null;
+      const listingChanged = hadBaseline && signature !== lastSignature;
+      lastSignature = signature;
+      const storeIsMutating =
+        listingChanged || (await this.isAuditWriterInProgress());
+      if (hadBaseline && !storeIsMutating) {
+        return; // static store with findings → fail closed (no masking)
       }
-      // Security argument: retry is allowed only while the writer-owned marker
-      // is presently held, and only for findings that match an in-flight append
-      // or rotation tear. The retry budget is deliberately tiny and finite; once
-      // it expires, the final inconsistent read is reported in strict mode. A
-      // truncation attacker without the live marker fails immediately, and an
-      // attacker who leaves the store permanently looking mid-write still fails
-      // closed after this bounded ceiling.
       await sleep(AUDIT_READ_CONSISTENCY_RETRY_MS);
     }
   }
 
-  private hasReadConsistencyTransientFindings(
-    findings: readonly AuditIntegrityFinding[]
-  ): boolean {
-    if (findings.length === 0) return false;
-    return findings.every((finding) => {
-      if (finding.kind === "entry_malformed") return true;
-      if (
-        finding.kind === "entry_unreadable" &&
-        finding.message.includes("disappeared during load")
-      ) {
-        return true;
-      }
-      if (
-        finding.kind === "rotation_anchor_invalid" &&
-        typeof finding.expected === "number" &&
-        typeof finding.actual === "number"
-      ) {
-        return true;
-      }
-      if (finding.kind === "tail_anchor_missing") return true;
-      if (
-        finding.kind === "tail_anchor_invalid" &&
-        typeof finding.expected === "number" &&
-        typeof finding.actual === "number"
-      ) {
-        return true;
-      }
-      return false;
-    });
+  /**
+   * Cheap mutation fingerprint of the audit entry namespace: count + lowest +
+   * highest key. A concurrent append (new highest key / higher count) or a prune
+   * (new lowest key / lower count) changes it; a static store does not. Used only
+   * on the read-consistency retry path to decide whether a present integrity
+   * finding is worth retrying (active mutation) or should fail closed (static).
+   */
+  private async auditEntryListingSignature(): Promise<string> {
+    try {
+      const metas = await this.storage.list(AUDIT_NAMESPACE);
+      if (metas.length === 0) return "0";
+      metas.sort((a, b) => a.key.localeCompare(b.key));
+      return `${metas.length}:${metas[0]!.key}:${metas[metas.length - 1]!.key}`;
+    } catch {
+      // A listing error is itself a sign of concurrent mutation; return a
+      // sentinel distinct from any real signature so the next attempt compares
+      // unequal and retries (bounded by the deadline).
+      return "list-error";
+    }
   }
 
   private async isAuditWriterInProgress(): Promise<boolean> {

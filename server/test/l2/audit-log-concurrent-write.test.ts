@@ -8,6 +8,7 @@ import { AuditLog, type PersistedAuditEnvelopeV2 } from "../../src/l2-operationa
 import { bytesToString } from "../../src/core/encoding.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import type { StorageEntryMeta } from "../../src/storage/interface.js";
 import { toHex } from "./audit-log-test-encoding.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -117,6 +118,72 @@ describe("AuditLog cross-process concurrent writes", () => {
       const finalResult = await finalReader.query({ limit: 100 });
       expect(finalResult.integrity_findings).toEqual([]);
       expect(finalResult.total).toBeLessThanOrEqual(5);
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    }
+  }, 30_000);
+
+  // S-1 store-stability retry (deterministic, not timing-dependent). Reproduces a
+  // torn read: the reader's FIRST entry listing comes back empty (as if a
+  // concurrent rotation pruned every listed key before it could read them) while
+  // the on-disk anchors/checkpoints still record the real head. That torn view
+  // yields integrity findings (a head-anchor floor above zero surviving entries,
+  // and checkpoint-root mismatches). Because the listing then CHANGES on the next
+  // attempt (the store was mid-mutation), the reader must retry and recover —
+  // never fail closed. This proves the retry discriminates on store stability,
+  // not finding kind: even non-"transient" kinds (checkpoint_root_mismatch) are
+  // ridden through while the store is actively changing. The companion fail-closed
+  // case (a STATIC torn store + fake writer marker) is covered in
+  // audit-log-chain.test.ts.
+  it("retries through a transient torn listing during rotation instead of false-flagging", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sanctuary-audit-torn-read-"));
+    try {
+      const storagePath = join(root, "state");
+      const masterKey = generateRandomKey();
+      const seeder = new AuditLog(new FilesystemStorage(storagePath), masterKey, {
+        maxEntries: 1000,
+        checkpointInterval: 3,
+      });
+      for (let i = 0; i < 6; i++) {
+        await seeder.appendCritical({
+          layer: "l2",
+          operation: "seed",
+          identity_id: "seeder",
+          result: "success",
+          details: { i },
+        });
+      }
+      await seeder.flush();
+
+      let auditListCalls = 0;
+      class TornListingStorage extends FilesystemStorage {
+        override async list(
+          namespace: string,
+          prefix?: string
+        ): Promise<StorageEntryMeta[]> {
+          // Only the reader's FIRST unprefixed entry scan is decimated; the
+          // signature probe and the retry see the real (recovered) set, so the
+          // listing "changes" between attempts and the read is retried.
+          if (
+            namespace === "_audit" &&
+            prefix === undefined &&
+            auditListCalls++ === 0
+          ) {
+            return [];
+          }
+          return super.list(namespace, prefix);
+        }
+      }
+
+      const reader = new AuditLog(new TornListingStorage(storagePath), masterKey, {
+        maxEntries: 1000,
+        checkpointInterval: 3,
+      });
+      const result = await reader.query({ limit: 100 });
+
+      expect(auditListCalls).toBeGreaterThan(1); // proves at least one retry
+      expect(result.integrity_findings).toEqual([]);
+      expect(result.total).toBe(6);
     } finally {
       await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     }
