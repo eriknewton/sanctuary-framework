@@ -25,6 +25,7 @@ pub mod daemon;
 pub mod failure;
 pub(crate) mod identity;
 pub mod ipc;
+pub mod jail;
 pub mod manifest;
 pub mod nfqueue;
 pub mod nftables;
