@@ -3,6 +3,7 @@
 Date: 2026-06-08
 Branch: feat/agent-native-surface-phase2
 Base confirmed: origin/main at `1ee1bd94 feat(agent-native): Phase 1 safety base (gate verify-mode, preflight, opaque-handle ownership) (#417)`
+Remediation pass: `REVIEW_FINDINGS.md` P0-1 and P1-1/P1-2/P1-3 fixed locally. No push. No merge.
 
 ## What Changed
 
@@ -21,6 +22,11 @@ Base confirmed: origin/main at `1ee1bd94 feat(agent-native): Phase 1 safety base
 - Registered the Phase 2 tools in server startup using the Phase 1 L1 namespace registry, preserving opaque-handle ownership state.
 - Reserved `_facade` as an internal namespace prefix.
 - Enrolled ordinary/read facade verbs in Tier 3 and secure/widening compound verbs in Tier 1.
+- Remediated review findings:
+  - Convenience verbs now default to the active opaque memory handle and reject non-opaque or non-owned explicit namespaces before primitive expansion.
+  - Compound execution shares the router approval proof store, reserves and verifies every Tier 1 step approval against exact primitive args before step 1, consumes only attempted step approvals, and releases unattempted reservations on short-circuit.
+  - Hide markers are durable `_facade/hidden` records, exported/imported with their target namespace bundles, reloaded across facade restart, and deny on stale version/content-hash mismatch.
+  - Help intent classification now checks URL/base64 decoded and compacted variants, destructive paraphrases, and benign-pretext-plus-destructive-subgoal prompts before emitting ordinary runnable examples.
 
 ## Tests Added
 
@@ -34,22 +40,27 @@ Base confirmed: origin/main at `1ee1bd94 feat(agent-native): Phase 1 safety base
   - Pull-only event cursor denial for callbacks, redacted event reads, and coarse rate denial.
   - Own-scope audit search and widened-scope denial.
   - Compound plan short-circuit before step one when required approval is missing.
+  - Cross-namespace convenience verb denial for another identity's opaque handle and legacy non-opaque namespaces.
+  - Hide-marker lifecycle across facade restart, state export/import restore, and stale target overwrite.
+  - Compound invalid later-step proof blocks step 1; valid future proof is released when an earlier step fails.
+  - Help laundering suppression for wipe/purge/remove-permanently, encoded, multi-intent, and callback probes.
 
 ## Gate Results
 
 - `cd server && npm run typecheck`: passed.
 - `cd server && npm test`: passed.
   - Test files: 446 passed, 1 skipped.
-  - Tests: 5,477 passed, 8 skipped.
+  - Tests: 5,480 passed, 8 skipped.
   - Baseline: `.test-baseline` is 5,423, so the run is above baseline.
   - No transform or collection errors.
 
 ## Design Semantics Interpreted
 
 - The facade uses the Phase 1 router/gate binding path by declaring expanded primitive approval targets; handlers then execute the matching primitive tool with the same server-expanded args.
-- Hide markers are implemented as server-owned facade metadata and are not exposed through agent-facing state primitives. The marker binding uses target version plus a content hash derived from the verified read value because the primitive read result does not expose the internal state envelope integrity hash.
+- Explicit facade namespaces are intentionally narrower than legacy L1 state namespaces: they must be opaque `mem_...` handles owned by the active session, otherwise the facade fails closed.
+- Hide markers are implemented as server-owned facade metadata and are not exposed through agent-facing state primitives. The marker binding uses target version plus a content hash derived from the verified read value because the primitive read result does not expose the internal state envelope integrity hash. State export/import carries matching marker records only for exported target namespaces so hidden state remains hidden after round-trip restore.
 - Audit search is implemented as a derived own-history view over `AuditLog.query`, with integrity findings returning the fixed denial schema. The explicit Tier-1 widening placeholder is policy-enrolled but no widening tool is exposed in this phase.
-- Compound execution implements the ratified fail-closed pre-step reservation behavior for missing required approvals; it does not claim rollback semantics.
+- Compound execution implements the ratified fail-closed pre-step reservation behavior for missing, invalid, expired, mismatched, or already-reserved approvals; it does not claim rollback semantics.
 
 ## Stop Point
 

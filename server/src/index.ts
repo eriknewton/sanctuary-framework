@@ -63,6 +63,7 @@ import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
 import {
+  ApprovalProofStore,
   fingerprintIdentityId,
   type SessionBinding,
 } from "./agent-native/safety-base.js";
@@ -885,6 +886,7 @@ export async function createSanctuaryServer(options?: {
     replaceModeTimeoutMs: policy.approval_channel.timeout_seconds * 1000,
   });
 
+  const approvalProofStore = new ApprovalProofStore();
   const gate = new ApprovalGate(
     policy,
     baseline,
@@ -893,7 +895,7 @@ export async function createSanctuaryServer(options?: {
     injectionDetector,
     onInjectionAlert,
     undefined,
-    { currentSessionBinding }
+    { currentSessionBinding, approvalProofStore }
   );
 
   gate.setApprovalEventCallback((event) => {
@@ -1149,6 +1151,8 @@ export async function createSanctuaryServer(options?: {
     auditLog,
     currentSessionBinding,
     primitiveTools: l1Tools,
+    storage,
+    approvalProofStore,
   });
 
   // 17. Assemble all tools

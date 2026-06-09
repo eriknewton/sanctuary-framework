@@ -2,8 +2,12 @@ import { randomBytes } from "node:crypto";
 import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
 import type { IdentityManager } from "../l1-cognitive/tools.js";
 import { toolResult, type ToolDefinition } from "../router.js";
+import type { StorageBackend } from "../storage/interface.js";
 import {
+  ApprovalProofStore,
+  approvalEnvelopeHash,
   canonicalJson,
+  deriveTargetResource,
   fixedDenial,
   FIXED_DENIAL_MESSAGE,
   normalizedArgsHash,
@@ -12,6 +16,8 @@ import {
   sha256,
   type SessionBinding,
 } from "./safety-base.js";
+
+const FACADE_HIDDEN_MARKER_NAMESPACE = "_facade/hidden";
 
 type PrimitiveCaller = (
   name: string,
@@ -49,6 +55,8 @@ export interface CooperativeSurfaceOptions {
   auditLog: AuditLog;
   currentSessionBinding: () => SessionBinding | undefined;
   primitiveTools: ToolDefinition[];
+  storage?: StorageBackend;
+  approvalProofStore?: ApprovalProofStore;
 }
 
 export function createAgentNativeCooperativeTools(
@@ -57,6 +65,7 @@ export function createAgentNativeCooperativeTools(
   const hidden = new Map<string, HiddenMarker>();
   const cursors = new Map<string, EventCursor>();
   const helpProbeSummaries = new Map<string, HelpProbeSummary>();
+  const approvalProofStore = options.approvalProofStore ?? new ApprovalProofStore();
 
   const callPrimitive: PrimitiveCaller = async (name, args) => {
     const tool = options.primitiveTools.find((candidate) => candidate.name === name);
@@ -73,8 +82,90 @@ export function createAgentNativeCooperativeTools(
     return options.namespaceRegistry.issueMemoryHandle(active().identity_id);
   }
 
+  function facadeMemoryNamespace(args: Record<string, unknown>): string {
+    const requested = (args.opts as Record<string, unknown> | undefined)?.namespace;
+    if (requested === undefined) return activeMemoryNamespace();
+    if (typeof requested !== "string" || !options.namespaceRegistry.isOpaqueMemoryHandle(requested)) {
+      throw new Error(FIXED_DENIAL_MESSAGE);
+    }
+    options.namespaceRegistry.assertOwned(requested, options.currentSessionBinding());
+    return requested;
+  }
+
   function hiddenKey(namespace: string, key: string): string {
     return `${active().requester_identity_fingerprint}:${namespace}:${key}`;
+  }
+
+  function hiddenStorageKey(namespace: string, key: string): string {
+    return sha256(hiddenKey(namespace, key)).replace("sha256:", "");
+  }
+
+  function encodeMarker(marker: HiddenMarker): Uint8Array {
+    return Buffer.from(canonicalJson(marker), "utf8");
+  }
+
+  function decodeMarker(raw: Uint8Array): HiddenMarker | null {
+    try {
+      const parsed = JSON.parse(Buffer.from(raw).toString("utf8")) as Record<string, unknown>;
+      if (
+        typeof parsed.namespace !== "string" ||
+        typeof parsed.key !== "string" ||
+        typeof parsed.version !== "number" ||
+        typeof parsed.content_hash !== "string" ||
+        !parsed.content_hash.startsWith("sha256:") ||
+        typeof parsed.hidden_at !== "string"
+      ) {
+        return null;
+      }
+      if (parsed.ttl_expires_at !== undefined && typeof parsed.ttl_expires_at !== "string") {
+        return null;
+      }
+      return {
+        namespace: parsed.namespace,
+        key: parsed.key,
+        version: parsed.version,
+        content_hash: parsed.content_hash as `sha256:${string}`,
+        hidden_at: parsed.hidden_at,
+        ...(parsed.ttl_expires_at ? { ttl_expires_at: parsed.ttl_expires_at } : {}),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async function loadHiddenMarker(namespace: string, key: string): Promise<HiddenMarker | "invalid" | undefined> {
+    const cacheKey = hiddenKey(namespace, key);
+    const cached = hidden.get(cacheKey);
+    if (cached) return cached;
+    if (!options.storage) return undefined;
+    const raw = await options.storage.read(FACADE_HIDDEN_MARKER_NAMESPACE, hiddenStorageKey(namespace, key));
+    if (!raw) return undefined;
+    const marker = decodeMarker(raw);
+    if (!marker || marker.namespace !== namespace || marker.key !== key) return "invalid";
+    hidden.set(cacheKey, marker);
+    return marker;
+  }
+
+  async function storeHiddenMarker(marker: HiddenMarker): Promise<void> {
+    hidden.set(hiddenKey(marker.namespace, marker.key), marker);
+    if (options.storage) {
+      await options.storage.write(
+        FACADE_HIDDEN_MARKER_NAMESPACE,
+        hiddenStorageKey(marker.namespace, marker.key),
+        encodeMarker(marker)
+      );
+    }
+  }
+
+  async function deleteHiddenMarker(namespace: string, key: string): Promise<void> {
+    hidden.delete(hiddenKey(namespace, key));
+    if (options.storage) {
+      await options.storage.delete(
+        FACADE_HIDDEN_MARKER_NAMESPACE,
+        hiddenStorageKey(namespace, key),
+        true
+      );
+    }
   }
 
   function stateContentHash(read: Record<string, unknown>): `sha256:${string}` {
@@ -83,6 +174,45 @@ export function createAgentNativeCooperativeTools(
 
   function isVerifiedRead(read: Record<string, unknown>): boolean {
     return read.integrity_verified === true && read.signature_verified === true;
+  }
+
+  function reserveApprovalForStep(params: {
+    approval_ref: string;
+    reservation_id: string;
+    primitive_tool: string;
+    primitive: Record<string, unknown>;
+    risk_tier: 1 | 2 | 3;
+  }): boolean {
+    const record = approvalProofStore.get(params.approval_ref);
+    if (!record) return false;
+    const activeIdentity = active();
+    const rebuilt = {
+      ...record.envelope,
+      tool_name: params.primitive_tool,
+      normalized_args_hash: normalizedArgsHash(params.primitive),
+      requester_identity_fingerprint: activeIdentity.requester_identity_fingerprint,
+      target_resource: deriveTargetResource(params.primitive_tool, params.primitive),
+      risk_tier: params.risk_tier,
+    };
+    const matches =
+      approvalEnvelopeHash(rebuilt) === record.envelope_hash &&
+      record.decision === "approved" &&
+      !record.consumed &&
+      Date.parse(record.envelope.expires_at) > Date.now() &&
+      rebuilt.requester_identity_fingerprint === record.envelope.requester_identity_fingerprint &&
+      rebuilt.nonce === record.envelope.nonce &&
+      rebuilt.target_resource === record.envelope.target_resource &&
+      rebuilt.tool_name === record.envelope.tool_name;
+    if (!matches) return false;
+    return approvalProofStore.reserveIfUnconsumed(params.approval_ref, params.reservation_id) !== null;
+  }
+
+  function releaseReservedApprovals(
+    reserved: Array<{ approval_ref: string; reservation_id: string }>
+  ): void {
+    for (const approval of reserved) {
+      approvalProofStore.releaseReservation(approval.approval_ref, approval.reservation_id);
+    }
   }
 
   async function audit(
@@ -116,10 +246,7 @@ export function createAgentNativeCooperativeTools(
   }
 
   function rememberPrimitiveArgs(args: Record<string, unknown>): Record<string, unknown> {
-    const namespace =
-      typeof (args.opts as Record<string, unknown> | undefined)?.namespace === "string"
-        ? ((args.opts as Record<string, unknown>).namespace as string)
-        : activeMemoryNamespace();
+    const namespace = facadeMemoryNamespace(args);
     const opts = (args.opts as Record<string, unknown> | undefined) ?? {};
     const metadata: Record<string, unknown> = {};
     if (typeof opts.ttl === "number") metadata.ttl_seconds = opts.ttl;
@@ -134,18 +261,12 @@ export function createAgentNativeCooperativeTools(
   }
 
   function recallPrimitiveArgs(args: Record<string, unknown>): Record<string, unknown> {
-    const namespace =
-      typeof (args.opts as Record<string, unknown> | undefined)?.namespace === "string"
-        ? ((args.opts as Record<string, unknown>).namespace as string)
-        : activeMemoryNamespace();
+    const namespace = facadeMemoryNamespace(args);
     return { namespace, key: args.key, verify_integrity: true };
   }
 
   function deletePrimitiveArgs(args: Record<string, unknown>): Record<string, unknown> {
-    const namespace =
-      typeof (args.opts as Record<string, unknown> | undefined)?.namespace === "string"
-        ? ((args.opts as Record<string, unknown>).namespace as string)
-        : activeMemoryNamespace();
+    const namespace = facadeMemoryNamespace(args);
     return {
       namespace,
       key: args.key,
@@ -163,26 +284,54 @@ export function createAgentNativeCooperativeTools(
   } {
     const normalized = intent.normalize("NFKC");
     const lower = normalized.toLowerCase();
-    const decoded: string[] = [];
-    for (const token of normalized.split(/[^a-z0-9+/=_-]+/i)) {
+    const decoded = new Set<string>();
+    try {
+      decoded.add(decodeURIComponent(normalized).toLowerCase());
+    } catch {
+      // Not URL-encoded.
+    }
+    for (const token of normalized.split(/[^a-z0-9%+/=_-]+/i)) {
+      if (token.includes("%")) {
+        try {
+          decoded.add(decodeURIComponent(token).toLowerCase());
+        } catch {
+          // Not URL-encoded.
+        }
+      }
       if (token.length >= 8 && /^[a-z0-9+/=_-]+$/i.test(token)) {
         try {
-          decoded.push(Buffer.from(token, "base64").toString("utf8").toLowerCase());
+          decoded.add(Buffer.from(token, "base64").toString("utf8").toLowerCase());
         } catch {
           // Not base64.
         }
       }
     }
-    const haystack = [lower, lower.replace(/0/g, "o").replace(/1/g, "i").replace(/3/g, "e").replace(/4/g, "a").replace(/@/g, "a"), ...decoded].join(" ");
+    const variants = [
+      lower,
+      lower.replace(/0/g, "o").replace(/1/g, "i").replace(/3/g, "e").replace(/4/g, "a").replace(/@/g, "a"),
+      ...decoded,
+    ];
+    const haystack = variants.join(" ");
+    const compactHaystack = variants.map((value) => value.replace(/[^a-z0-9:/._-]/g, "")).join(" ");
     const gated = [
       "delete",
       "forget",
       "erase",
+      "wipe",
+      "purge",
+      "remove permanently",
+      "removepermanently",
+      "destroy",
+      "shred",
+      "drop",
       "export",
       "import",
       "identity bundle",
+      "identitybundle",
       "private key",
+      "secret key",
       "sign",
+      "signature",
       "approval",
       "policy",
       "webhook",
@@ -190,17 +339,22 @@ export function createAgentNativeCooperativeTools(
       "http://",
       "https://",
       "other agent",
+      "otheragent",
       "prior session",
+      "priorsession",
       "widen",
     ];
-    if (gated.some((needle) => haystack.includes(needle))) {
+    const matchedGated = gated.find((needle) => haystack.includes(needle) || compactHaystack.includes(needle));
+    if (matchedGated) {
       return {
         safety_class: "gated",
-        tool: haystack.includes("forget") || haystack.includes("delete") ? "sanctuary_forget" : null,
+        tool: ["forget", "delete", "erase", "wipe", "purge", "remove permanently", "removepermanently"].some((needle) =>
+          haystack.includes(needle) || compactHaystack.includes(needle)
+        ) ? "sanctuary_forget" : null,
         example: { args: "<operator-approved placeholders only>" },
         why_sanctuary: "This request may need operator review before execution.",
         remediation_class: "request_review",
-        probe_key: gated.find((needle) => haystack.includes(needle)),
+        probe_key: matchedGated,
       };
     }
     if (/\b(remember|store|save)\b/.test(haystack)) {
@@ -297,7 +451,8 @@ export function createAgentNativeCooperativeTools(
         try {
           const primitiveArgs = rememberPrimitiveArgs(args);
           const result = await callPrimitive("state_write", primitiveArgs);
-          await audit("sanctuary_remember", {
+          if (result.denied || result.error) return deny("audit:sanctuary_remember", "try_lower_scope");
+          const auditRef = await audit("sanctuary_remember", {
             primitive_tool: "state_write",
             primitive_args_hash: normalizedArgsHash(primitiveArgs),
             facade_call: { key: args.key },
@@ -305,7 +460,7 @@ export function createAgentNativeCooperativeTools(
           return toolResult({
             key: result.key,
             namespace_handle: result.namespace,
-            audit_ref: "audit:sanctuary_remember",
+            audit_ref: auditRef,
           });
         } catch {
           return deny("audit:sanctuary_remember", "try_lower_scope");
@@ -335,11 +490,15 @@ export function createAgentNativeCooperativeTools(
       handler: async (args) => {
         try {
           const primitiveArgs = recallPrimitiveArgs(args);
-          const marker = hidden.get(hiddenKey(primitiveArgs.namespace as string, primitiveArgs.key as string));
+          const marker = await loadHiddenMarker(
+            primitiveArgs.namespace as string,
+            primitiveArgs.key as string
+          );
           const read = await callPrimitive("state_read", primitiveArgs);
           if (read.denied) return toolResult(read);
           if (!isVerifiedRead(read)) return deny("audit:sanctuary_recall");
           if (marker) {
+            if (marker === "invalid") return deny("audit:sanctuary_recall", "request_review");
             const markerMatches =
               marker.version === read.version &&
               marker.content_hash === stateContentHash(read);
@@ -398,9 +557,9 @@ export function createAgentNativeCooperativeTools(
             hidden_at: new Date().toISOString(),
             ...(ttl ? { ttl_expires_at: new Date(Date.now() + ttl * 1000).toISOString() } : {}),
           };
-          hidden.set(hiddenKey(marker.namespace, marker.key), marker);
+          await storeHiddenMarker(marker);
           const auditRef = await audit("sanctuary_hide", {
-            marker_namespace: "_facade/hidden",
+            marker_namespace: FACADE_HIDDEN_MARKER_NAMESPACE,
             marker_hash: sha256(canonicalJson(marker)),
             target: `${marker.namespace}/${marker.key}`,
           });
@@ -441,7 +600,10 @@ export function createAgentNativeCooperativeTools(
         try {
           const primitiveArgs = deletePrimitiveArgs(args);
           const result = await callPrimitive("state_delete", primitiveArgs);
-          hidden.delete(hiddenKey(primitiveArgs.namespace as string, primitiveArgs.key as string));
+          await deleteHiddenMarker(
+            primitiveArgs.namespace as string,
+            primitiveArgs.key as string
+          );
           const auditRef = await audit("sanctuary_forget", {
             primitive_tool: "state_delete",
             primitive_args_hash: normalizedArgsHash(primitiveArgs),
@@ -699,7 +861,7 @@ export function createAgentNativeCooperativeTools(
               primitive_tool: primitiveTool,
               normalized_args_hash: normalizedArgsHash(primitive),
               primitive,
-              risk_tier: primitiveTool === "state_delete" ? 1 : 3,
+              risk_tier: (primitiveTool === "state_delete" ? 1 : 3) as 1 | 3,
             };
           });
           const planHash = sha256(canonicalJson(planSteps.map((step) => ({
@@ -711,8 +873,27 @@ export function createAgentNativeCooperativeTools(
           const approvals = (args.approvals && typeof args.approvals === "object" && !Array.isArray(args.approvals))
             ? args.approvals as Record<string, unknown>
             : {};
+          const reservedApprovals: Array<{ step_id: string; approval_ref: string; reservation_id: string }> = [];
           for (const step of planSteps) {
-            if (step.risk_tier === 1 && typeof approvals[step.step_id] !== "string") {
+            if (step.risk_tier === 1) {
+              const approvalRef = approvals[step.step_id];
+              const reservationId = `compound:${planHash}:${step.step_id}:${randomBytes(8).toString("hex")}`;
+              const approvalReserved = typeof approvalRef === "string" && reserveApprovalForStep({
+                approval_ref: approvalRef,
+                reservation_id: reservationId,
+                primitive_tool: step.primitive_tool,
+                primitive: step.primitive,
+                risk_tier: step.risk_tier,
+              });
+              if (approvalReserved && typeof approvalRef === "string") {
+                reservedApprovals.push({
+                  step_id: step.step_id,
+                  approval_ref: approvalRef,
+                  reservation_id: reservationId,
+                });
+                continue;
+              }
+              releaseReservedApprovals(reservedApprovals);
               const auditRef = await audit("sanctuary_compound_execute", {
                 plan_hash: planHash,
                 failed_step: step.step_id,
@@ -730,11 +911,23 @@ export function createAgentNativeCooperativeTools(
           }
           const completed: string[] = [];
           for (const step of planSteps) {
+            const reserved = reservedApprovals.find((approval) => approval.step_id === step.step_id);
+            if (reserved && !approvalProofStore.consumeReserved(reserved.approval_ref, reserved.reservation_id)) {
+              releaseReservedApprovals(reservedApprovals.filter((approval) => approval.step_id !== step.step_id));
+              const auditRef = await audit("sanctuary_compound_execute", {
+                plan_hash: planHash,
+                completed_steps: completed,
+                failed_step: step.step_id,
+                release_not_consume: true,
+              }, "failure");
+              return toolResult({ status: "partial_failed", completed_steps: completed, failed_step: step.step_id, audit_ref: auditRef });
+            }
             const result =
               step.tool === "sanctuary_remember" ? await callPrimitive("state_write", step.primitive) :
               step.tool === "sanctuary_recall" || step.tool === "sanctuary_hide" ? await callPrimitive("state_read", step.primitive) :
               await callPrimitive("state_delete", step.primitive);
             if (result.denied || result.error) {
+              releaseReservedApprovals(reservedApprovals.filter((approval) => approval.step_id !== step.step_id));
               const auditRef = await audit("sanctuary_compound_execute", {
                 plan_hash: planHash,
                 completed_steps: completed,

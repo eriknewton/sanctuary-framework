@@ -84,6 +84,7 @@ export interface ApprovalRecord {
   envelope_hash: `sha256:${string}`;
   decision: "approved" | "denied";
   consumed: boolean;
+  reserved_by?: string;
   created_at: string;
 }
 
@@ -107,9 +108,31 @@ export class ApprovalProofStore {
     return this.records.get(approvalRef);
   }
 
+  reserveIfUnconsumed(approvalRef: string, reservationId: string): ApprovalRecord | null {
+    const record = this.records.get(approvalRef);
+    if (!record || record.consumed || record.reserved_by) return null;
+    record.reserved_by = reservationId;
+    return record;
+  }
+
+  releaseReservation(approvalRef: string, reservationId: string): boolean {
+    const record = this.records.get(approvalRef);
+    if (!record || record.reserved_by !== reservationId || record.consumed) return false;
+    delete record.reserved_by;
+    return true;
+  }
+
+  consumeReserved(approvalRef: string, reservationId: string): ApprovalRecord | null {
+    const record = this.records.get(approvalRef);
+    if (!record || record.consumed || record.reserved_by !== reservationId) return null;
+    record.consumed = true;
+    delete record.reserved_by;
+    return record;
+  }
+
   consumeIfUnconsumed(approvalRef: string): ApprovalRecord | null {
     const record = this.records.get(approvalRef);
-    if (!record || record.consumed) return null;
+    if (!record || record.consumed || record.reserved_by) return null;
     record.consumed = true;
     return record;
   }
