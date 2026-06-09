@@ -5,11 +5,12 @@ import { hmacSha256 } from "../core/hashing.js";
 import {
   SDW_META_NAMESPACE,
   SDW_REPLAY_ANCHOR_KEY,
+  type ReplayAnchorCounter,
   type SdwReplayAnchorData,
   type SdwReplayAnchorRecord,
 } from "./records.js";
 import { SdwReplayAnchorError } from "./errors.js";
-export { writeReplayAnchor } from "./write-gate.js";
+export { prepareReplayAnchorWrite, writeReplayAnchor } from "./write-gate.js";
 
 const SDW_REPLAY_MAC_DOMAIN = "sanctuary.sdw-replay-anchor-mac.v1\n";
 const SDW_REPLAY_MAC_MARKER = "__sanctuary_sdw_replay_anchor_mac_v1";
@@ -50,7 +51,7 @@ export function createReplayAnchorRecord(
 }
 
 export async function readReplayAnchor(
-  storage: StorageBackend,
+  storage: Pick<StorageBackend, "read">,
   masterKey: Uint8Array,
 ): Promise<ReplayAnchorStatus> {
   const raw = await storage.read(SDW_META_NAMESPACE, SDW_REPLAY_ANCHOR_KEY);
@@ -77,6 +78,42 @@ export function assertCatalogNotRolledBack(
   if (anchor.status === "valid" && recordSeq < anchor.data.catalog) {
     throw new SdwReplayAnchorError("replay_detected", "SDW catalog rollback detected");
   }
+}
+
+export function assertReplayAnchorPresentForEstablishedStore(
+  anchor: ReplayAnchorStatus,
+  established: boolean,
+  label: string,
+): void {
+  // First boot is legitimately anchorless. Once any SDW bytes exist, stripping
+  // the replay anchor removes the only monotonic floor and must fail closed.
+  if (established && anchor.status === "stripped") {
+    throw new SdwReplayAnchorError(
+      "replay_anchor_invalid",
+      `SDW replay anchor missing for established ${label}`,
+    );
+  }
+}
+
+export function replayAnchorCounterSeq(
+  counters: readonly ReplayAnchorCounter[],
+  id: string,
+): number {
+  return counters.find((counter) => counter.id === id)?.seq ?? 0;
+}
+
+export function upsertReplayAnchorCounter(
+  counters: readonly ReplayAnchorCounter[],
+  id: string,
+  seq: number,
+): readonly ReplayAnchorCounter[] {
+  let found = false;
+  const next = counters.map((counter) => {
+    if (counter.id !== id) return counter;
+    found = true;
+    return { id, seq };
+  });
+  return found ? next : [...next, { id, seq }];
 }
 
 function replayAnchorMac(masterKey: Uint8Array, data: SdwReplayAnchorData): string {

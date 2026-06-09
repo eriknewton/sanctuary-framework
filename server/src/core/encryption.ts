@@ -26,7 +26,7 @@ export interface EncryptedPayload {
   /** Ciphertext (base64url) */
   ct: string;
   /** Authentication tag (base64url) — included in ciphertext by @noble/ciphers */
-  /** Timestamp */
+  /** Timestamp. Plain envelope metadata only; never use for security decisions. */
   ts: string;
 }
 

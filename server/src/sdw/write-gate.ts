@@ -47,7 +47,7 @@ export interface Persistable<T extends SdwRecord> {
   readonly taint: "user_content" | "agent_derived_clean" | "system_generated";
 }
 
-interface PreparedSdwWrite {
+export interface PreparedSdwWrite {
   readonly namespace: SdwNamespace;
   readonly storageKey: string;
   readonly data: Uint8Array;
@@ -130,17 +130,24 @@ export async function writeReplayAnchor(
   masterKey: Uint8Array,
   data: SdwReplayAnchorData,
 ): Promise<void> {
+  const prepared = prepareReplayAnchorWrite(masterKey, data);
+  await backend.write(prepared.namespace, prepared.storageKey, prepared.data);
+}
+
+export function prepareReplayAnchorWrite(
+  masterKey: Uint8Array,
+  data: SdwReplayAnchorData,
+): PreparedSdwWrite {
   const envelope = {
     marker: SDW_REPLAY_MAC_MARKER,
     data,
     mac: sdwReplayAnchorMac(masterKey, data),
   };
-  const prepared = authorizePreparedSdwPayload({
+  return authorizePreparedSdwPayload({
     namespace: SDW_META_NAMESPACE,
     storageKey: SDW_REPLAY_ANCHOR_KEY,
     data: new Uint8Array(stringToBytes(JSON.stringify(envelope))),
   });
-  await backend.write(prepared.namespace, prepared.storageKey, prepared.data);
 }
 
 export function assertSdwRawWriteAuthorized(
@@ -414,6 +421,8 @@ function assertOneOf<T extends string>(
 function classifyRecord(record: SdwRecord): void {
   const text = collectText(record).join("\n");
   if (text.length === 0) return;
+  // This text scan is defense in depth only. The enforced persistence control is
+  // the structural taint allow-list plus persistable/raw-write authorization.
   const probes: readonly RegExp[] = [
     /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/i,
     /principal[_ -]?policy/i,

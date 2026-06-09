@@ -13,6 +13,7 @@ import { mintPersistable, sdwBackendWrite } from "./write-gate.js";
 import { SdwCatalogError, UnsupportedRecordVersion } from "./errors.js";
 import {
   assertCatalogNotRolledBack,
+  assertReplayAnchorPresentForEstablishedStore,
   emptyReplayAnchorData,
   readReplayAnchor,
   writeReplayAnchor,
@@ -26,6 +27,8 @@ export interface SdwCatalogStoreOptions {
 
 export interface SdwListAccounting {
   readonly loaded: number;
+  readonly auth_failed: number;
+  readonly auth_failed_keys: readonly string[];
   readonly unsupported_version: number;
   readonly skipped: readonly string[];
 }
@@ -75,6 +78,7 @@ export class SdwCatalogStore {
       );
     }
     const anchor = await readReplayAnchor(this.storage, this.masterKey);
+    assertReplayAnchorPresentForEstablishedStore(anchor, (await this.storage.totalSize()) > 0, "catalog store");
     const record = this.decodeDirect(raw, catalogKey());
     if (record.fortress_id !== this.fortressId) {
       throw new SdwCatalogError("fortress_mismatch", "SDW catalog fortress mismatch");
@@ -90,6 +94,7 @@ export class SdwCatalogStore {
     const metas = await this.storage.list(SDW_CATALOG_NAMESPACE, "catalog.");
     const records: SdwCatalogRecord[] = [];
     const skipped: string[] = [];
+    const authFailedKeys: string[] = [];
     let unsupported = 0;
     for (const meta of metas) {
       const raw = await this.storage.read(SDW_CATALOG_NAMESPACE, meta.key);
@@ -97,14 +102,20 @@ export class SdwCatalogStore {
       try {
         records.push(this.decodeDirect(raw, meta.key));
       } catch (error) {
-        skipped.push(meta.key);
-        if (error instanceof UnsupportedRecordVersion) unsupported++;
+        if (error instanceof SdwCatalogError && error.category === "auth_failed") {
+          authFailedKeys.push(meta.key);
+        } else {
+          skipped.push(meta.key);
+          if (error instanceof UnsupportedRecordVersion) unsupported++;
+        }
       }
     }
     return {
       records,
       accounting: {
         loaded: records.length,
+        auth_failed: authFailedKeys.length,
+        auth_failed_keys: authFailedKeys,
         unsupported_version: unsupported,
         skipped,
       },
