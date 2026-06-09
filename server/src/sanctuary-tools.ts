@@ -405,9 +405,15 @@ export function createSanctuaryTools(
           });
         }
 
-        auditLog.append("l1", "sanctuary_export_identity_bundle", identity.identity_id, {
-          did: identity.did,
-          attestation_count: attestations.length,
+        await auditLog.appendCritical({
+          layer: "l1",
+          operation: "sanctuary_export_identity_bundle",
+          identity_id: identity.identity_id,
+          result: "success",
+          details: {
+            did: identity.did,
+            attestation_count: attestations.length,
+          },
         });
 
         return toolResult({

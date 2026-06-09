@@ -338,11 +338,17 @@ export function createContextGateTools(
           identityId
         );
 
-        auditLog.append("l2", "context_gate_set_policy", identityId ?? "system", {
-          policy_id: policy.policy_id,
-          policy_name: policyName,
-          rule_count: rules.length,
-          default_action: defaultAction,
+        await auditLog.appendCritical({
+          layer: "l2",
+          operation: "context_gate_set_policy",
+          identity_id: identityId ?? "system",
+          result: "success",
+          details: {
+            policy_id: policy.policy_id,
+            policy_name: policyName,
+            rule_count: rules.length,
+            default_action: defaultAction,
+          },
         });
 
         return toolResult({
@@ -554,11 +560,17 @@ export function createContextGateTools(
         // Check for any denied fields — if so, the entire request should be blocked
         const deniedFields = result.decisions.filter((d) => d.action === "deny");
         if (deniedFields.length > 0) {
-          auditLog.append("l2", "context_gate_deny", policy.identity_id ?? "system", {
-            policy_id: policyId,
-            provider,
-            denied_fields: deniedFields.map((d) => d.field),
-            original_context_hash: result.original_context_hash,
+          await auditLog.appendCritical({
+            layer: "l2",
+            operation: "context_gate_deny",
+            identity_id: policy.identity_id ?? "system",
+            result: "failure",
+            details: {
+              policy_id: policyId,
+              provider,
+              denied_fields: deniedFields.map((d) => d.field),
+              original_context_hash: result.original_context_hash,
+            },
           });
 
           return toolResult({

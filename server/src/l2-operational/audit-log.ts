@@ -69,6 +69,8 @@ export type AuditIntegrityFindingKind =
   | "legacy_anchor_mismatch"
   | "rotation_anchor_missing"
   | "rotation_anchor_invalid"
+  | "tail_anchor_missing"
+  | "tail_anchor_invalid"
   | "checkpoint_malformed"
   | "checkpoint_root_mismatch"
   | "checkpoint_signature_mismatch"
@@ -124,15 +126,19 @@ const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
 // fixed key that does NOT match the `audit-checkpoint-`/`legacy-anchor-` prefixes
 // the checkpoint readers list on, so it never collides with those scans.
 const AUDIT_ROTATION_ANCHOR_KEY = "__rotation_anchor";
+const AUDIT_HEAD_ANCHOR_KEY = "__head_anchor";
+const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
 // Distinctive envelope marker so a MAC'd rotation anchor is unambiguously
 // distinguished from a bare/marker-stripped record (mirrors F1's state-meta MAC).
 const AUDIT_ROTATION_ANCHOR_MARKER = "__sanctuary_audit_rotation_anchor_v1";
+const AUDIT_HEAD_ANCHOR_MARKER = "__sanctuary_audit_head_anchor_v1";
 // Domain-separated MAC over the rotation-anchor record. The anchor records the
 // authenticated lowest-surviving sequence + its prev_hash after a prune, so a
 // post-cut deletion is still detectable while a legitimate rotation verifies
 // cleanly. The MAC ALWAYS authenticates (master-key derived) — unlike the
 // optional Ed25519 checkpoint signer, which may be null.
 const AUDIT_ROTATION_ANCHOR_MAC_DOMAIN = "sanctuary.audit-rotation-anchor.v1\n";
+const AUDIT_HEAD_ANCHOR_MAC_DOMAIN = "sanctuary.audit-head-anchor.v1\n";
 const AUDIT_INTEGRITY_ALERT_NAMESPACE = "_audit_integrity_alert";
 const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
@@ -239,6 +245,7 @@ export class AuditLog {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
   private rotationAnchorMacKey: Uint8Array;
+  private headAnchorMacKey: Uint8Array;
   private entries: AuditEntry[] = [];
   private chainEntries: Array<{ sequence: number; entry_hash: string }> = [];
   private counter = 0;
@@ -275,6 +282,7 @@ export class AuditLog {
     // F3: derive the rotation-anchor MAC key up front and never retain the raw
     // master key (mirrors how encryptionKey is derived here, per F1's pattern).
     this.rotationAnchorMacKey = derivePurposeKey(masterKey, "audit-rotation-anchor");
+    this.headAnchorMacKey = derivePurposeKey(masterKey, "audit-head-anchor");
     this.maxTotalSizeBytes = config?.maxTotalSizeBytes ?? DEFAULT_MAX_TOTAL_SIZE_BYTES;
     this.maxEntries = config?.maxEntries ?? DEFAULT_MAX_ENTRIES;
     this.integrityMode = config?.integrityMode ?? "strict";
@@ -436,6 +444,7 @@ export class AuditLog {
           if (options.verifyDurability) {
             await this.verifyPersistedBytes(key, persistedBytes);
           }
+          await this.writeHeadAnchor(sequence, entryHash);
         } catch (err) {
           throw toAuditPersistenceError(err);
         }
@@ -728,6 +737,191 @@ export class AuditLog {
       base_sequence: data.base_sequence,
       base_prev_hash: data.base_prev_hash,
     };
+  }
+
+  private async writeHeadAnchor(
+    highestSequence: number,
+    headHash: string
+  ): Promise<void> {
+    const data = { highest_sequence: highestSequence, head_hash: headHash };
+    const envelope = {
+      [AUDIT_HEAD_ANCHOR_MARKER]: true,
+      data,
+      mac: toBase64url(this.headAnchorMacBytes(data)),
+    };
+    const bytes = stringToBytes(JSON.stringify(envelope));
+    if (this.filesystemCapabilities) {
+      await this.filesystemCapabilities.writeDurable(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_HEAD_ANCHOR_KEY,
+        bytes
+      );
+    } else {
+      await this.storage.write(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_HEAD_ANCHOR_KEY,
+        bytes
+      );
+    }
+    await this.storage.write(
+      "_meta",
+      AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY,
+      stringToBytes("1")
+    );
+  }
+
+  private headAnchorMacBytes(data: {
+    highest_sequence: number;
+    head_hash: string;
+  }): Uint8Array {
+    return hmacSha256(
+      this.headAnchorMacKey,
+      stringToBytes(AUDIT_HEAD_ANCHOR_MAC_DOMAIN + canonicalJson(data))
+    );
+  }
+
+  private async loadHeadAnchor(
+    findings: AuditIntegrityFinding[]
+  ): Promise<
+    | { status: "valid"; highest_sequence: number; head_hash: string }
+    | { status: "absent" }
+    | { status: "invalid" }
+  > {
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.storage.read(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_HEAD_ANCHOR_KEY
+      );
+    } catch (err) {
+      findings.push({
+        kind: "storage_unavailable",
+        message: `audit head anchor could not be read: ${failureMessage(err)}`,
+      });
+      return { status: "invalid" };
+    }
+    if (!raw) return { status: "absent" };
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytesToString(raw));
+    } catch {
+      return { status: "invalid" };
+    }
+    if (!isRecord(parsed) || parsed[AUDIT_HEAD_ANCHOR_MARKER] !== true) {
+      return { status: "absent" };
+    }
+
+    const data = parsed.data;
+    const mac = parsed.mac;
+    if (
+      !isRecord(data) ||
+      typeof mac !== "string" ||
+      typeof data.highest_sequence !== "number" ||
+      !Number.isSafeInteger(data.highest_sequence) ||
+      data.highest_sequence <= 0 ||
+      typeof data.head_hash !== "string" ||
+      !/^[0-9a-f]{64}$/.test(data.head_hash)
+    ) {
+      return { status: "invalid" };
+    }
+    let providedMac: Uint8Array;
+    try {
+      providedMac = fromBase64url(mac);
+    } catch {
+      return { status: "invalid" };
+    }
+    if (
+      !constantTimeEqual(
+        providedMac,
+        this.headAnchorMacBytes({
+          highest_sequence: data.highest_sequence,
+          head_hash: data.head_hash,
+        })
+      )
+    ) {
+      return { status: "invalid" };
+    }
+    return {
+      status: "valid",
+      highest_sequence: data.highest_sequence,
+      head_hash: data.head_hash,
+    };
+  }
+
+  private async verifyHeadAnchor(
+    highestChainedSeq: number,
+    highestChainedHash: string,
+    hasLegacyEntries: boolean,
+    hasChainedEntries: boolean,
+    findings: AuditIntegrityFinding[]
+  ): Promise<void> {
+    const anchor = await this.loadHeadAnchor(findings);
+    if (anchor.status === "valid") {
+      if (highestChainedSeq < anchor.highest_sequence) {
+        findings.push({
+          kind: "tail_anchor_invalid",
+          sequence: highestChainedSeq,
+          expected: anchor.highest_sequence,
+          actual: highestChainedSeq,
+          message: `audit head anchor floor ${anchor.highest_sequence} exceeds highest surviving sequence ${highestChainedSeq} (tail truncation or replay detected)`,
+        });
+        return;
+      }
+      if (
+        highestChainedSeq === anchor.highest_sequence &&
+        highestChainedHash !== anchor.head_hash
+      ) {
+        findings.push({
+          kind: "tail_anchor_invalid",
+          sequence: highestChainedSeq,
+          expected: anchor.head_hash,
+          actual: highestChainedHash,
+          message: `audit head anchor hash does not match the surviving head at sequence ${highestChainedSeq}`,
+        });
+      }
+      return;
+    }
+
+    if (anchor.status === "invalid") {
+      findings.push({
+        kind: "tail_anchor_invalid",
+        message:
+          "audit head anchor is present but failed authentication (tampered, forged, or wrong key)",
+      });
+      return;
+    }
+
+    if (hasLegacyEntries && !hasChainedEntries && highestChainedSeq > 0) {
+      await this.writeHeadAnchor(highestChainedSeq, highestChainedHash);
+      return;
+    }
+
+    if (await this.isEstablishedAuditStore(hasLegacyEntries || hasChainedEntries)) {
+      // First boot is legitimately anchorless. Once audit bytes or the
+      // audit-established marker exist, stripping the tail floor makes rollback
+      // indistinguishable from an empty log and must fail closed.
+      findings.push({
+        kind: "tail_anchor_missing",
+        message:
+          "audit head anchor missing for established audit store (tail truncation or whole-log deletion may have occurred)",
+      });
+    }
+  }
+
+  private async isEstablishedAuditStore(hasAuditEntries: boolean): Promise<boolean> {
+    if (hasAuditEntries) return true;
+    if (
+      await this.storage
+        .exists("_meta", AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)
+        .catch(() => false)
+    ) {
+      return true;
+    }
+    const checkpointMetas = await this.storage
+      .list(AUDIT_CHECKPOINT_NAMESPACE)
+      .catch(() => []);
+    return checkpointMetas.length > 0;
   }
 
   /**
@@ -1274,9 +1468,17 @@ export class AuditLog {
       // break the chain. (Identical to count+1 when nothing was pruned.)
       const highestChainedSeq =
         chainedEntries.at(-1)?.envelope.sequence ?? legacyRawEntries.length;
-      this.nextSequence = highestChainedSeq + 1;
-      this.lastEntryHash =
+      const highestChainedHash =
         chainedEntries.at(-1)?.envelope.entry_hash ?? legacyAnchorHash;
+      await this.verifyHeadAnchor(
+        highestChainedSeq,
+        highestChainedHash,
+        legacyRawEntries.length > 0,
+        chainedEntries.length > 0,
+        findings
+      );
+      this.nextSequence = highestChainedSeq + 1;
+      this.lastEntryHash = highestChainedHash;
       this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
       this.integrityFindings = findings;
     } catch (err) {

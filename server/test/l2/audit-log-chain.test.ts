@@ -103,6 +103,48 @@ describe("AuditLog tamper-evident chain", () => {
     await expectStrictFinding(storage, masterKey, "sequence_gap_or_reorder");
   });
 
+  it("detects tail truncation below the MAC'd head floor", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = MASTER_KEY();
+    const writer = new AuditLog(storage, masterKey, { checkpointInterval: 0 });
+    await appendCritical(writer, "one");
+    await appendCritical(writer, "two");
+    await appendCritical(writer, "three");
+
+    const keys = await auditKeys(storage);
+    await storage.delete("_audit", keys[2]!);
+
+    await expectStrictFinding(storage, masterKey, "tail_anchor_invalid");
+  });
+
+  it("allows a genuinely fresh empty log with no prior head anchor", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = MASTER_KEY();
+    const reader = new AuditLog(storage, masterKey);
+
+    const result = await reader.query({ limit: 100 });
+
+    expect(result.total).toBe(0);
+    expect(result.integrity_findings).toEqual([]);
+  });
+
+  it("detects whole-log deletion on an established audit store", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = MASTER_KEY();
+    const writer = new AuditLog(storage, masterKey);
+    await appendCritical(writer, "one");
+    await appendCritical(writer, "two");
+
+    for (const meta of await storage.list("_audit")) {
+      await storage.delete(meta.namespace, meta.key);
+    }
+    for (const meta of await storage.list("_audit_checkpoints")) {
+      await storage.delete(meta.namespace, meta.key);
+    }
+
+    await expectStrictFinding(storage, masterKey, "tail_anchor_missing");
+  });
+
   it("detects a single entry byte modification", async () => {
     const storage = new MemoryStorage();
     const masterKey = MASTER_KEY();

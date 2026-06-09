@@ -68,6 +68,59 @@ describe("AuditLog cross-process concurrent writes", () => {
       await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     }
   }, 30_000);
+
+  it("keeps reader views consistent while rotation is pruning", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sanctuary-audit-rotation-read-"));
+    try {
+      const storagePath = join(root, "state");
+      const storage = new FilesystemStorage(storagePath);
+      const masterKey = generateRandomKey();
+      const writer = new AuditLog(storage, masterKey, {
+        maxEntries: 5,
+        checkpointInterval: 3,
+      });
+      const reader = new AuditLog(new FilesystemStorage(storagePath), masterKey, {
+        maxEntries: 5,
+        checkpointInterval: 3,
+      });
+      const failures: unknown[] = [];
+
+      const reading = (async () => {
+        for (let i = 0; i < 100; i++) {
+          try {
+            const result = await reader.query({ limit: 100 });
+            expect(result.integrity_findings).toEqual([]);
+          } catch (err) {
+            failures.push(err);
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+      })();
+
+      for (let i = 0; i < 40; i++) {
+        await writer.appendCritical({
+          layer: "l2",
+          operation: "rotation_reader_fuzz",
+          identity_id: "writer",
+          result: "success",
+          details: { i },
+        });
+      }
+      await writer.flush();
+      await reading;
+
+      expect(failures).toEqual([]);
+      const finalReader = new AuditLog(storage, masterKey, {
+        maxEntries: 5,
+        checkpointInterval: 3,
+      });
+      const finalResult = await finalReader.query({ limit: 100 });
+      expect(finalResult.integrity_findings).toEqual([]);
+      expect(finalResult.total).toBeLessThanOrEqual(5);
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    }
+  }, 30_000);
 });
 
 function runWorker(

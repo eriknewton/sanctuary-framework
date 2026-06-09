@@ -99,4 +99,30 @@ describe("CLI audit-write inventory", () => {
     );
     expect(gaps.length).toBe(0);
   });
+
+  it("routes policy changes, egress denials, and identity exports through appendCritical", () => {
+    const contextGateTools = readFileSync(
+      resolve(import.meta.dirname, "..", "..", "src", "l2-operational", "context-gate-tools.ts"),
+      "utf-8",
+    );
+    const sanctuaryTools = readFileSync(
+      resolve(import.meta.dirname, "..", "..", "src", "sanctuary-tools.ts"),
+      "utf-8",
+    );
+
+    for (const operation of ["context_gate_set_policy", "context_gate_deny"]) {
+      expect(contextGateTools).toMatch(
+        new RegExp(`appendCritical\\(\\{[\\s\\S]*operation: "${operation}"`),
+      );
+      expect(contextGateTools).not.toMatch(
+        new RegExp(`append\\("l2", "${operation}"`),
+      );
+    }
+    expect(sanctuaryTools).toMatch(
+      /appendCritical\(\{[\s\S]*operation: "sanctuary_export_identity_bundle"/,
+    );
+    expect(sanctuaryTools).not.toMatch(
+      /append\("l1", "sanctuary_export_identity_bundle"/,
+    );
+  });
 });

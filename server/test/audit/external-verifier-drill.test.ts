@@ -171,6 +171,40 @@ describe("external-verifier-drill: happy path", () => {
     expect(report.entries_verified).toBe(25);
     expect(report.findings).toHaveLength(0);
   });
+
+  it("exports a rotated chain with its rotation anchor and verifies it as PASS", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const log = new AuditLog(storage, masterKey, {
+      maxEntries: 5,
+      checkpointInterval: 3,
+    });
+    for (let i = 0; i < 12; i++) {
+      await log.appendCritical({
+        layer: "l1",
+        operation: `rotated_op_${i}`,
+        identity_id: "drill-identity",
+        result: "success",
+      });
+    }
+    await log.flush();
+
+    const jsonl = await collectExport(storage);
+    const records = parseJsonl(jsonl);
+
+    expect(records.filter((r) => r.type === "entry")).toHaveLength(5);
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "rotation_anchor",
+          base_sequence: 8,
+        }),
+      ])
+    );
+    const report = verifyAuditChainRecords(records);
+    expect(report.verdict).toBe("PASS");
+    expect(report.findings).toHaveLength(0);
+  });
 });
 
 // ---------------------------------------------------------------------------
