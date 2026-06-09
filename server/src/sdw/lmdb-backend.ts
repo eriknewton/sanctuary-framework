@@ -55,8 +55,8 @@ export class LmdbStorageBackend implements StorageBackend, SdwTransactional {
   }
 
   async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
-    assertSdwRawWriteAuthorized(namespace, key, data);
-    await this.db.put(compositeKey(namespace, key), this.lmdb.asBinary(data));
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    await this.db.put(compositeKey(namespace, key), this.lmdb.asBinary(checkedData));
   }
 
   async read(namespace: string, key: string): Promise<Uint8Array | null> {
@@ -104,15 +104,19 @@ export class LmdbStorageBackend implements StorageBackend, SdwTransactional {
     await this.db.transaction(async () => {
       const txn: SdwTxn = {
         write: async (namespace, key, data) => {
-          assertSdwRawWriteAuthorized(namespace, key, data);
-          this.db.putSync(compositeKey(namespace, key), this.lmdb.asBinary(data));
+          const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+          this.db.putSync(compositeKey(namespace, key), this.lmdb.asBinary(checkedData));
         },
         writePersistable: async (persistable, encryptionKey, fortressId) => {
           const prepared = prepareSdwBackendWrite(persistable, encryptionKey, fortressId);
-          assertSdwRawWriteAuthorized(prepared.namespace, prepared.storageKey, prepared.data);
+          const checkedData = assertSdwRawWriteAuthorized(
+            prepared.namespace,
+            prepared.storageKey,
+            prepared.data,
+          );
           this.db.putSync(
             compositeKey(prepared.namespace, prepared.storageKey),
-            this.lmdb.asBinary(prepared.data),
+            this.lmdb.asBinary(checkedData),
           );
         },
         read: async (namespace, key) => this.read(namespace, key),

@@ -2,7 +2,7 @@ import type { StorageBackend } from "../storage/interface.js";
 import { encrypt } from "../core/encryption.js";
 import { bytesToString, stringToBytes, toBase64url } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import { hmacSha256 } from "../core/hashing.js";
+import { hashToString, hmacSha256 } from "../core/hashing.js";
 import { sdwAad, assertSdwIdentifier } from "./grammar.js";
 import {
   SDW_CATALOG_NAMESPACE,
@@ -56,6 +56,7 @@ interface PreparedSdwWrite {
 interface AuthorizedSdwPayload {
   readonly namespace: SdwNamespace;
   readonly storageKey: string;
+  readonly digest: string;
 }
 
 const authorizedSdwPayloads = new WeakMap<Uint8Array, AuthorizedSdwPayload>();
@@ -116,10 +117,11 @@ export function prepareSdwBackendWrite<T extends SdwRecord>(
     encryptionKey,
     aad,
   );
+  const data = stringToBytes(JSON.stringify(envelope));
   return authorizePreparedSdwPayload({
     namespace,
     storageKey,
-    data: stringToBytes(JSON.stringify(envelope)),
+    data: new Uint8Array(data),
   });
 }
 
@@ -136,7 +138,7 @@ export async function writeReplayAnchor(
   const prepared = authorizePreparedSdwPayload({
     namespace: SDW_META_NAMESPACE,
     storageKey: SDW_REPLAY_ANCHOR_KEY,
-    data: stringToBytes(JSON.stringify(envelope)),
+    data: new Uint8Array(stringToBytes(JSON.stringify(envelope))),
   });
   await backend.write(prepared.namespace, prepared.storageKey, prepared.data);
 }
@@ -145,19 +147,22 @@ export function assertSdwRawWriteAuthorized(
   namespace: string,
   storageKey: string,
   data: Uint8Array,
-): void {
-  if (!isSdwNamespace(namespace)) return;
+): Uint8Array {
+  const snapshot = new Uint8Array(data);
+  if (!isSdwNamespace(namespace)) return snapshot;
   const authorized = authorizedSdwPayloads.get(data);
   if (
     authorized === undefined ||
     authorized.namespace !== namespace ||
-    authorized.storageKey !== storageKey
+    authorized.storageKey !== storageKey ||
+    authorized.digest !== hashToString(snapshot)
   ) {
     throw new SdwValidationError(
       "raw_sdw_write_forbidden",
-      "SDW namespace writes must pass through the SDW write gate",
+      "SDW namespace writes must pass through the SDW write gate with unmodified prepared bytes",
     );
   }
+  return snapshot;
 }
 
 export function isSdwNamespace(namespace: string): namespace is SdwNamespace {
@@ -381,11 +386,17 @@ export function encryptedEnvelopeContains(raw: Uint8Array, forbidden: string): b
 }
 
 function authorizePreparedSdwPayload(prepared: PreparedSdwWrite): PreparedSdwWrite {
-  authorizedSdwPayloads.set(prepared.data, {
+  const data = new Uint8Array(prepared.data);
+  authorizedSdwPayloads.set(data, {
     namespace: prepared.namespace,
     storageKey: prepared.storageKey,
+    digest: hashToString(data),
   });
-  return prepared;
+  return {
+    namespace: prepared.namespace,
+    storageKey: prepared.storageKey,
+    data,
+  };
 }
 
 function sdwReplayAnchorMac(masterKey: Uint8Array, data: SdwReplayAnchorData): string {

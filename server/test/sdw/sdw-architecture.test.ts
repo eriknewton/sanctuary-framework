@@ -1,6 +1,21 @@
 import { readFile, readdir } from "node:fs/promises";
 import { relative, join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { stateKey } from "../../src/sdw/grammar.js";
+import {
+  SDW_WORKING_STATE_HKDF_INFO,
+  type SdwWorkingStateRecord,
+} from "../../src/sdw/records.js";
+import { SdwValidationError } from "../../src/sdw/errors.js";
+import {
+  mintPersistable,
+  prepareSdwBackendWrite,
+} from "../../src/sdw/write-gate.js";
+
+const FORTRESS_ID = "fortress:test";
+const MASTER_KEY = new Uint8Array(32).fill(7);
 
 describe("SDW architecture write gate", () => {
   it("does not expose raw write authority from the public SDW barrel", async () => {
@@ -30,8 +45,9 @@ describe("SDW architecture write gate", () => {
       }
       if (path === join("sdw", "lmdb-backend.ts")) {
         offenders.push(...findLmdbWriteGateOffenders(source, path));
-        continue;
       }
+      offenders.push(...findStorageBackendImplementationOffenders(source, path));
+      if (path === join("sdw", "lmdb-backend.ts")) continue;
 
       const aliases = sdwNamespaceAliases(source);
       if (callsSdwRawWrite(source, aliases)) {
@@ -45,6 +61,26 @@ describe("SDW architecture write gate", () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  it("rejects prepared SDW payloads mutated after authorization", async () => {
+    const storage = new MemoryStorage();
+    const record = workingStateRecord("state-mutable", "benign prepared content");
+    const prepared = prepareSdwBackendWrite(
+      mintPersistable(
+        { value: record, taint: "user_content" },
+        "_sdw_working_state",
+        stateKey("task", record.state_id),
+        FORTRESS_ID,
+      ),
+      derivePurposeKey(MASTER_KEY, SDW_WORKING_STATE_HKDF_INFO),
+      FORTRESS_ID,
+    );
+
+    prepared.data.fill(0);
+    await expect(
+      storage.write(prepared.namespace, prepared.storageKey, prepared.data),
+    ).rejects.toBeInstanceOf(SdwValidationError);
   });
 });
 
@@ -102,7 +138,7 @@ function findLmdbWriteGateOffenders(source: string, path: string): string[] {
   const offenders: string[] = [];
   const publicWrite = extractBalancedBlock(
     source,
-    /async\s+write\s*\(\s*namespace:\s*string,\s*key:\s*string,\s*data:\s*Uint8Array\s*\)/,
+    /async\s+write\s*\(\s*namespace:\s*string\s*,\s*key:\s*string\s*,\s*data:\s*Uint8Array\s*\)/,
   );
   if (publicWrite === null) {
     offenders.push(`${path}: missing public backend write implementation`);
@@ -130,24 +166,55 @@ function findLmdbWriteGateOffenders(source: string, path: string): string[] {
   return offenders;
 }
 
-function writeBlockChecksBeforeRawPut(block: string): boolean {
+function findStorageBackendImplementationOffenders(source: string, path: string): string[] {
+  const offenders: string[] = [];
+  if (!source.includes("StorageBackend")) return offenders;
+
+  const rawWrite = extractBalancedBlock(
+    source,
+    /async\s+write\s*\(\s*namespace:\s*string\s*,\s*key:\s*string\s*,\s*data:\s*Uint8Array\s*\)/,
+  );
+  if (rawWrite !== null && !storageWriteBlockUsesSdwGuard(rawWrite)) {
+    offenders.push(`${path}: StorageBackend.write does not enforce the SDW raw-write gate`);
+  }
+
+  const durableWrite = extractBalancedBlock(
+    source,
+    /async\s+writeDurable\s*\(\s*namespace:\s*string\s*,\s*key:\s*string\s*,\s*data:\s*Uint8Array\s*\)/,
+  );
+  if (durableWrite !== null && !storageWriteBlockUsesSdwGuard(durableWrite)) {
+    offenders.push(`${path}: writeDurable does not enforce the SDW raw-write gate`);
+  }
+
+  return offenders;
+}
+
+function storageWriteBlockUsesSdwGuard(block: string): boolean {
   const guardIndex = block.indexOf("assertSdwRawWriteAuthorized(namespace, key, data)");
+  const checkedDataIndex = block.indexOf("checkedData");
+  return guardIndex >= 0 && checkedDataIndex >= 0;
+}
+
+function writeBlockChecksBeforeRawPut(block: string): boolean {
+  const guardIndex = block.indexOf("assertSdwRawWriteAuthorized(");
+  const checkedDataIndex = block.indexOf("checkedData");
   const putIndex = block.search(/\bput(?:Sync)?\s*\(\s*compositeKey\s*\(\s*namespace\s*,\s*key\s*\)/);
-  return guardIndex >= 0 && putIndex >= 0 && guardIndex < putIndex;
+  return guardIndex >= 0 && checkedDataIndex >= 0 && putIndex > guardIndex;
 }
 
 function persistableBlockUsesPreparedAuthority(block: string): boolean {
   const prepareIndex = block.indexOf("prepareSdwBackendWrite(persistable, encryptionKey, fortressId)");
-  const guardIndex = block.indexOf(
-    "assertSdwRawWriteAuthorized(prepared.namespace, prepared.storageKey, prepared.data)",
-  );
+  const guardIndex = block.indexOf("assertSdwRawWriteAuthorized(");
+  const checkedDataIndex = block.indexOf("checkedData");
   const putPreparedIndex = block.search(
     /\bputSync\s*\(\s*compositeKey\s*\(\s*prepared\.namespace\s*,\s*prepared\.storageKey\s*\)/,
   );
   return (
     prepareIndex >= 0 &&
     guardIndex > prepareIndex &&
-    putPreparedIndex > guardIndex
+    checkedDataIndex >= 0 &&
+    putPreparedIndex > guardIndex &&
+    block.includes("asBinary(checkedData)")
   );
 }
 
@@ -183,4 +250,23 @@ async function listTsFiles(root: string): Promise<string[]> {
     }
   }
   return out;
+}
+
+function workingStateRecord(stateId: string, summary: string): SdwWorkingStateRecord {
+  return {
+    kind: "working_state",
+    version: 1,
+    state_id: stateId,
+    scope: "task",
+    owner_ref: "owner-1",
+    status: "active",
+    created_at: "2026-06-08T00:00:00.000Z",
+    updated_at: "2026-06-08T00:00:00.000Z",
+    content_type: "application/json",
+    state: {
+      kind: "task_checkpoint",
+      task_ref: "task-1",
+      summary,
+    },
+  };
 }

@@ -34,6 +34,7 @@
 import { mkdir, open, readFile, writeFile, unlink, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { randomBytes } from "../core/random.js";
+import { assertSdwRawWriteAuthorized } from "../sdw/write-gate.js";
 import type {
   FilesystemStorageCapabilities,
   StorageBackend,
@@ -95,6 +96,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     key: string,
     data: Uint8Array
   ): Promise<void> {
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const dirPath = this.namespacePath(namespace);
     const filePath = this.entryPath(namespace, key);
 
@@ -102,7 +104,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     await mkdir(dirPath, { recursive: true, mode: 0o700 });
 
     // Write file with restrictive permissions (owner read/write only)
-    await writeFile(filePath, data, { mode: 0o600 });
+    await writeFile(filePath, checkedData, { mode: 0o600 });
   }
 
   async writeDurable(
@@ -110,13 +112,14 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     key: string,
     data: Uint8Array
   ): Promise<void> {
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const dirPath = this.namespacePath(namespace);
     const filePath = this.entryPath(namespace, key);
 
     await mkdir(dirPath, { recursive: true, mode: 0o700 });
     const handle = await open(filePath, "w", 0o600);
     try {
-      await handle.writeFile(data);
+      await handle.writeFile(checkedData);
       await handle.sync();
     } finally {
       await handle.close();

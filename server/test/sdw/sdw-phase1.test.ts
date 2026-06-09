@@ -31,6 +31,7 @@ import {
   vectorSegmentKey,
 } from "../../src/sdw/grammar.js";
 import {
+  assertSdwRawWriteAuthorized,
   encryptedEnvelopeContains,
   mintPersistable,
   sdwBackendWrite,
@@ -223,7 +224,7 @@ describe("SDW catalog and replay anchor", () => {
       status: "valid",
     });
     const raw = await storage.read(SDW_META_NAMESPACE, "sdw-replay-anchors-v1");
-    await storage.write(
+    storage.rawWriteForTest(
       SDW_META_NAMESPACE,
       "sdw-replay-anchors-v1",
       stringToBytes(bytesToString(raw!).replace('"catalog":2', '"catalog":0')),
@@ -231,7 +232,7 @@ describe("SDW catalog and replay anchor", () => {
     await expect(readReplayAnchor(storage, MASTER_KEY)).rejects.toBeInstanceOf(
       SdwReplayAnchorError,
     );
-    await storage.write(SDW_META_NAMESPACE, "sdw-replay-anchors-v1", stringToBytes("{}"));
+    storage.rawWriteForTest(SDW_META_NAMESPACE, "sdw-replay-anchors-v1", stringToBytes("{}"));
     await expect(readReplayAnchor(storage, MASTER_KEY)).resolves.toEqual({
       status: "stripped",
     });
@@ -389,6 +390,10 @@ async function overwriteCatalogVersion(
     key,
     stringToBytes(sdwAadDebugString(FORTRESS_ID, SDW_CATALOG_NAMESPACE, storageKey)),
   );
+  if (storage instanceof MemoryStorage) {
+    storage.rawWriteForTest(SDW_CATALOG_NAMESPACE, storageKey, stringToBytes(JSON.stringify(envelope)));
+    return;
+  }
   await storage.write(SDW_CATALOG_NAMESPACE, storageKey, stringToBytes(JSON.stringify(envelope)));
 }
 
@@ -396,6 +401,10 @@ class MemoryStorage implements StorageBackend {
   private readonly data = new Map<string, Uint8Array>();
 
   async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    this.rawWriteForTest(namespace, key, assertSdwRawWriteAuthorized(namespace, key, data));
+  }
+
+  rawWriteForTest(namespace: string, key: string, data: Uint8Array): void {
     this.data.set(this.composite(namespace, key), new Uint8Array(data));
   }
 
