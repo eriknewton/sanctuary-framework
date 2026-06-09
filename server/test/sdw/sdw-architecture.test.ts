@@ -2,6 +2,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { relative, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { stateKey } from "../../src/sdw/grammar.js";
 import {
@@ -47,11 +48,15 @@ describe("SDW architecture write gate", () => {
         offenders.push(...findLmdbWriteGateOffenders(source, path));
       }
       offenders.push(...findStorageBackendImplementationOffenders(source, path));
+      offenders.push(...findSdwNamespacePathExposureOffenders(source, path));
       if (path === join("sdw", "lmdb-backend.ts")) continue;
 
       const aliases = sdwNamespaceAliases(source);
       if (callsSdwRawWrite(source, aliases)) {
         offenders.push(`${path}: direct backend.write/SdwTxn.write to an SDW namespace`);
+      }
+      if (callsSdwNamespacePathExposure(source, aliases)) {
+        offenders.push(`${path}: exposes a filesystem path/dir/handle for an SDW namespace`);
       }
       if (writesLmdbCompositeKey(source)) {
         offenders.push(`${path}: direct LMDB composite-key write outside the SDW backend`);
@@ -61,6 +66,15 @@ describe("SDW architecture write gate", () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  it("does not expose filesystem paths for SDW namespaces", () => {
+    const storage = new FilesystemStorage("/tmp/sanctuary-sdw-path-exposure-test");
+
+    expect(() => storage.namespacePath("_sdw_catalog")).toThrow(
+      "Filesystem paths for SDW namespaces are not exposed",
+    );
+    expect(storage.namespacePath("_audit")).toContain("_audit");
   });
 
   it("rejects prepared SDW payloads mutated after authorization", async () => {
@@ -95,6 +109,21 @@ function callsSdwRawWrite(source: string, aliases = new Set<string>()): boolean 
     new RegExp(String.raw`\b(?:storage|backend|txn|this\.storage|this\.backend)\.write\s*\(\s*${namespacePattern}`),
     new RegExp(String.raw`\bwrite\s*\(\s*${namespacePattern}`),
   ].some((pattern) => pattern.test(source));
+}
+
+function callsSdwNamespacePathExposure(
+  source: string,
+  aliases = new Set<string>(),
+): boolean {
+  const namespaceTargets = [
+    `["'\\\`]_sdw_`,
+    String.raw`SDW_[A-Z_]+_NAMESPACE\b`,
+    ...[...aliases].map(escapeRegExp).map((alias) => `${alias}\\b`),
+  ];
+  const namespacePattern = `(?:${namespaceTargets.join("|")})`;
+  return new RegExp(
+    String.raw`\b(?:namespace(?:Path|Dir|Directory|Handle)|pathForNamespace|dirForNamespace|handleForNamespace)\s*\(\s*${namespacePattern}`,
+  ).test(source);
 }
 
 function writesLmdbCompositeKey(source: string): boolean {
@@ -168,31 +197,56 @@ function findLmdbWriteGateOffenders(source: string, path: string): string[] {
 
 function findStorageBackendImplementationOffenders(source: string, path: string): string[] {
   const offenders: string[] = [];
-  if (!source.includes("StorageBackend")) return offenders;
+  if (!/\bimplements\s+[^{]*\bStorageBackend\b/.test(source)) return offenders;
 
-  const rawWrite = extractBalancedBlock(
+  const rawWriteBlocks = extractBalancedBlocks(
     source,
-    /async\s+write\s*\(\s*namespace:\s*string\s*,\s*key:\s*string\s*,\s*data:\s*Uint8Array\s*\)/,
+    /\basync\s+write\s*\([^)]*\)\s*(?::\s*Promise<void>)?/g,
   );
-  if (rawWrite !== null && !storageWriteBlockUsesSdwGuard(rawWrite)) {
-    offenders.push(`${path}: StorageBackend.write does not enforce the SDW raw-write gate`);
+  for (const rawWrite of rawWriteBlocks) {
+    if (!storageWriteBlockUsesSdwGuard(rawWrite)) {
+      offenders.push(`${path}: StorageBackend.write does not enforce the SDW raw-write gate`);
+    }
   }
 
-  const durableWrite = extractBalancedBlock(
+  const durableWriteBlocks = extractBalancedBlocks(
     source,
-    /async\s+writeDurable\s*\(\s*namespace:\s*string\s*,\s*key:\s*string\s*,\s*data:\s*Uint8Array\s*\)/,
+    /\basync\s+writeDurable\s*\([^)]*\)\s*(?::\s*Promise<void>)?/g,
   );
-  if (durableWrite !== null && !storageWriteBlockUsesSdwGuard(durableWrite)) {
-    offenders.push(`${path}: writeDurable does not enforce the SDW raw-write gate`);
+  for (const durableWrite of durableWriteBlocks) {
+    if (!storageWriteBlockUsesSdwGuard(durableWrite)) {
+      offenders.push(`${path}: writeDurable does not enforce the SDW raw-write gate`);
+    }
   }
 
   return offenders;
 }
 
+function findSdwNamespacePathExposureOffenders(source: string, path: string): string[] {
+  if (path === join("sdw", "write-gate.ts")) return [];
+  const offenders: string[] = [];
+  const exposureBlocks = extractNamedBalancedBlocks(
+    source,
+    /(?:^|\n)\s*(?:export\s+)?(?:async\s+)?(?:function\s+)?(namespace(?:Path|Dir|Directory|Handle)|pathForNamespace|dirForNamespace|handleForNamespace)\s*\([^)]*\)\s*(?::[^{;]+)?(?=\s*\{)/g,
+  );
+  for (const { name, block } of exposureBlocks) {
+    if (!namespaceExposureRejectsSdw(block)) {
+      offenders.push(`${path}: ${name} does not reject SDW namespace path exposure`);
+    }
+  }
+  return offenders;
+}
+
 function storageWriteBlockUsesSdwGuard(block: string): boolean {
-  const guardIndex = block.indexOf("assertSdwRawWriteAuthorized(namespace, key, data)");
-  const checkedDataIndex = block.indexOf("checkedData");
-  return guardIndex >= 0 && checkedDataIndex >= 0;
+  const assignment = /\b(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*assertSdwRawWriteAuthorized\s*\(/.exec(block);
+  if (assignment === null) return false;
+  const checkedBytesName = assignment[1]!;
+  const afterGuard = block.slice((assignment.index ?? 0) + assignment[0].length);
+  return new RegExp(String.raw`\b${escapeRegExp(checkedBytesName)}\b`).test(afterGuard);
+}
+
+function namespaceExposureRejectsSdw(block: string): boolean {
+  return /\bif\s*\(\s*isSdwNamespace\s*\([^)]*\)\s*\)\s*\{\s*throw\b/s.test(block);
 }
 
 function writeBlockChecksBeforeRawPut(block: string): boolean {
@@ -237,6 +291,33 @@ function extractBalancedBlock(source: string, signature: RegExp): string | null 
     }
   }
   return null;
+}
+
+function extractBalancedBlocks(source: string, signature: RegExp): string[] {
+  const blocks: string[] = [];
+  const flags = signature.flags.includes("g") ? signature.flags : `${signature.flags}g`;
+  const globalSignature = new RegExp(signature.source, flags);
+  for (const match of source.matchAll(globalSignature)) {
+    const block = extractBalancedBlock(source.slice(match.index), globalSignatureWithoutGlobal(signature));
+    if (block !== null) blocks.push(block);
+  }
+  return blocks;
+}
+
+function extractNamedBalancedBlocks(
+  source: string,
+  signature: RegExp,
+): Array<{ name: string; block: string }> {
+  const blocks: Array<{ name: string; block: string }> = [];
+  for (const match of source.matchAll(signature)) {
+    const block = extractBalancedBlock(source.slice(match.index), globalSignatureWithoutGlobal(signature));
+    if (block !== null) blocks.push({ name: match[1]!, block });
+  }
+  return blocks;
+}
+
+function globalSignatureWithoutGlobal(signature: RegExp): RegExp {
+  return new RegExp(signature.source, signature.flags.replace("g", ""));
 }
 
 async function listTsFiles(root: string): Promise<string[]> {

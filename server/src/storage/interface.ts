@@ -63,7 +63,8 @@ export interface FilesystemStorageCapabilities {
   /**
    * Return the absolute on-disk directory for a storage namespace, creating
    * callers' own files there only when they are intentionally outside the
-   * normal encrypted key/value contract.
+   * normal encrypted key/value contract. SDW namespaces are not exposed through
+   * this capability.
    */
   namespacePath(namespace: string): string;
 

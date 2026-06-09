@@ -34,7 +34,10 @@
 import { mkdir, open, readFile, writeFile, unlink, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { randomBytes } from "../core/random.js";
-import { assertSdwRawWriteAuthorized } from "../sdw/write-gate.js";
+import {
+  assertSdwRawWriteAuthorized,
+  isSdwNamespace,
+} from "../sdw/write-gate.js";
 import type {
   FilesystemStorageCapabilities,
   StorageBackend,
@@ -64,6 +67,10 @@ function legacyKeySanitize(name: string): string {
   return name.replace(/[^a-zA-Z0-9_.-]/g, "_");
 }
 
+function encodedNamespacePath(basePath: string, namespace: string): string {
+  return join(basePath, bijectiveEncode(namespace));
+}
+
 export class FilesystemStorage implements StorageBackend, FilesystemStorageCapabilities {
   private basePath: string;
 
@@ -78,7 +85,10 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   }
 
   namespacePath(namespace: string): string {
-    return join(this.basePath, bijectiveEncode(namespace));
+    if (isSdwNamespace(namespace)) {
+      throw new Error("Filesystem paths for SDW namespaces are not exposed");
+    }
+    return encodedNamespacePath(this.basePath, namespace);
   }
 
   // Legacy on-disk paths produced by the pre-#41 sanitizer. Returned for
@@ -97,7 +107,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     data: Uint8Array
   ): Promise<void> {
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
-    const dirPath = this.namespacePath(namespace);
+    const dirPath = encodedNamespacePath(this.basePath, namespace);
     const filePath = this.entryPath(namespace, key);
 
     // Create namespace directory with restrictive permissions
@@ -113,7 +123,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     data: Uint8Array
   ): Promise<void> {
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
-    const dirPath = this.namespacePath(namespace);
+    const dirPath = encodedNamespacePath(this.basePath, namespace);
     const filePath = this.entryPath(namespace, key);
 
     await mkdir(dirPath, { recursive: true, mode: 0o700 });
@@ -198,7 +208,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   }
 
   async list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
-    const dirPath = this.namespacePath(namespace);
+    const dirPath = encodedNamespacePath(this.basePath, namespace);
 
     try {
       const files = await readdir(dirPath);
