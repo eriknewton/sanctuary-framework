@@ -106,10 +106,24 @@ export interface SdwQueryHistoryRecord {
   readonly record_hash: string;
   readonly audit_event_id: string;
   readonly occurred_at: string;
+  readonly actor: {
+    readonly kind: "operator" | "agent" | "system";
+    readonly principal_ref?: string;
+    readonly agent_ref?: string;
+  };
+  readonly channel: "mcp" | "cli" | "dashboard" | "internal";
   readonly operation: string;
   readonly prompt_or_query: string;
+  readonly normalized_query?: string;
+  readonly result_summary?: string;
+  readonly result_refs?: readonly SdwQueryResultRef[];
   readonly policy_visibility: "not_included";
   readonly created_at: string;
+}
+
+export interface SdwQueryResultRef {
+  readonly kind: "working_state" | "document" | "document_chunk" | "vector" | "audit_event";
+  readonly ref: string;
 }
 
 export interface SdwQueryHistoryChainHeadRecord {
@@ -135,8 +149,12 @@ export interface SdwDocumentRecord {
   };
   readonly content_hash: string;
   readonly chunk_count: number;
+  readonly byte_length?: number;
   readonly created_at: string;
   readonly updated_at: string;
+  readonly indexed_at?: string;
+  readonly tags?: readonly string[];
+  readonly metadata?: readonly SdwDocumentMetadata[];
 }
 
 export interface SdwDocumentChunkRecord {
@@ -147,7 +165,16 @@ export interface SdwDocumentChunkRecord {
   readonly chunk_ordinal: number;
   readonly text: string;
   readonly content_hash: string;
+  readonly char_start?: number;
+  readonly char_end?: number;
+  readonly token_count?: number;
+  readonly vector_refs?: readonly string[];
   readonly created_at: string;
+}
+
+export interface SdwDocumentMetadata {
+  readonly key: string;
+  readonly value: string;
 }
 
 export interface SdwVectorRecord {
