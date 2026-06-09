@@ -28,6 +28,7 @@ import {
   didToUrl,
   dropExpiredDidWebKeys,
   identifierFromFortressDidWebRecord,
+  isPublicIpAddress,
   issueDidWeb,
   parseDidWeb,
   publishDidWebDocument,
@@ -779,5 +780,44 @@ describe("WP-V1.x-RECOGNITION-LAYER did:web - build 4 key rotation", () => {
     expect(invoked).toBe(false);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.failure).toBe("host_not_allowed");
+  });
+});
+
+describe("isPublicIpAddress SSRF classifier (incl. IPv4-mapped IPv6 + NAT64)", () => {
+  it("rejects loopback / private / link-local / metadata, mapped-v6 and NAT64; allows real public", () => {
+    const nonPublic = [
+      "127.0.0.1",
+      "10.0.0.1",
+      "169.254.169.254",
+      "172.16.0.1",
+      "192.168.1.1",
+      "::1",
+      "fe80::1",
+      "fc00::1",
+      // IPv4-mapped IPv6 of non-public addresses (the classifier hole this closes):
+      "::ffff:127.0.0.1",
+      "::ffff:169.254.169.254",
+      "::ffff:10.0.0.1",
+      "::ffff:192.168.1.1",
+      "::ffff:7f00:1", // all-hex mapped form of 127.0.0.1
+      "::ffff:a9fe:a9fe", // all-hex mapped form of 169.254.169.254
+      "::127.0.0.1", // deprecated IPv4-compatible form
+      // NAT64 prefix wrapping a private/loopback v4:
+      "64:ff9b::7f00:1",
+      "64:ff9b::8.8.8.8",
+    ];
+    const publicAddrs = [
+      "8.8.8.8",
+      "1.1.1.1",
+      "::ffff:8.8.8.8", // mapped form of a genuinely public v4 stays public
+      "2001:4860:4860::8888",
+      "2606:4700:4700::1111",
+    ];
+    for (const addr of nonPublic) {
+      expect(isPublicIpAddress(addr)).toBe(false);
+    }
+    for (const addr of publicAddrs) {
+      expect(isPublicIpAddress(addr)).toBe(true);
+    }
   });
 });

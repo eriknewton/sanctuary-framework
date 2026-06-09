@@ -913,7 +913,9 @@ function normalizeIpLiteral(authorityHost: string): string | undefined {
   }
 }
 
-function isPublicIpAddress(address: string): boolean {
+// Exported for SSRF regression tests (pure classifier; no I/O). Returns false for
+// any non-public destination, including IPv4-mapped/compatible IPv6 and NAT64.
+export function isPublicIpAddress(address: string): boolean {
   const version = isIP(address);
   if (version === 4) return isPublicIpv4(address);
   if (version === 6) return isPublicIpv6(address);
@@ -938,12 +940,34 @@ function isPublicIpv4(address: string): boolean {
 
 function isPublicIpv6(address: string): boolean {
   const lower = address.toLowerCase();
-  if (lower === "::1") return false;
-  if (lower === "::") return false;
-  if (lower.startsWith("fe80:")) return false;
+  if (lower === "::1") return false; // loopback
+  if (lower === "::") return false; // unspecified
+  if (lower.startsWith("fe80:")) return false; // link-local
+  // NAT64 well-known (64:ff9b::/96) + local-use (64:ff9b:1::/48): an embedded
+  // IPv4 reached via a translator must not be treated as a public destination.
+  if (lower.startsWith("64:ff9b:")) return false;
+  // IPv4-mapped (::ffff:a.b.c.d / ::ffff:hhhh:hhhh) and IPv4-compatible (::a.b.c.d):
+  // re-classify the embedded IPv4 so a mapped loopback/private/link-local/metadata
+  // address is rejected instead of slipping through as "public IPv6".
+  const embedded = embeddedIpv4(lower);
+  if (embedded !== null) return isPublicIpv4(embedded);
   const firstHextet = Number.parseInt(lower.split(":")[0] || "0", 16);
-  if ((firstHextet & 0xfe00) === 0xfc00) return false;
+  if ((firstHextet & 0xfe00) === 0xfc00) return false; // ULA fc00::/7
   return true;
+}
+
+// Extract an embedded IPv4 from an IPv4-mapped or IPv4-compatible IPv6 address,
+// else null. Handles ::ffff:a.b.c.d, ::a.b.c.d, and the all-hex ::ffff:hhhh:hhhh.
+function embeddedIpv4(lower: string): string | null {
+  const dotted = lower.match(/^::(?:ffff:)?((?:\d{1,3}\.){3}\d{1,3})$/);
+  if (dotted && isIP(dotted[1]) === 4) return dotted[1];
+  const hex = lower.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (hex) {
+    const hi = Number.parseInt(hex[1], 16);
+    const lo = Number.parseInt(hex[2], 16);
+    return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+  }
+  return null;
 }
 
 // ── Fortress-config persistence (build 3) ────────────────────────────
