@@ -237,11 +237,52 @@ function validateRecord(record: SdwRecord): void {
       assertVersion(record.version);
       assertSdwIdentifier(record.state_id, "state_id");
       assertSdwIdentifier(record.owner_ref, "owner_ref");
+      assertOneOf(record.scope, ["task", "thread", "tool", "session", "other"], "scope");
+      assertOneOf(record.status, ["active", "superseded", "completed", "failed"], "status");
+      if (record.content_type !== "application/json") {
+        throw new SdwValidationError("schema_mismatch", "Invalid SDW content_type");
+      }
+      switch (record.state.kind) {
+        case "retrieval_context":
+          assertSdwIdentifier(record.state.query_ref, "query_ref");
+          for (const ref of record.state.selected_refs) assertSdwIdentifier(ref, "selected_ref");
+          break;
+        case "tool_result_summary":
+          assertSdwIdentifier(record.state.tool_name, "tool_name");
+          assertSdwIdentifier(record.state.invocation_ref, "invocation_ref");
+          for (const ref of record.state.artifact_refs ?? []) assertSdwIdentifier(ref, "artifact_ref");
+          break;
+        case "task_checkpoint":
+          assertSdwIdentifier(record.state.task_ref, "task_ref");
+          break;
+        default:
+          throw new SdwValidationError("schema_mismatch", "Unknown SDW working-state payload");
+      }
+      for (const sourceRef of record.source_refs ?? []) {
+        assertOneOf(sourceRef.kind, ["query", "document_chunk", "vector", "tool_call", "external"], "source_ref.kind");
+        assertSdwIdentifier(sourceRef.ref, "source_ref.ref");
+      }
       return;
     case "query_history":
       assertVersion(record.version);
       assertSdwIdentifier(record.query_id, "query_id");
+      assertSdwIdentifier(record.audit_event_id, "audit_event_id");
+      assertSdwIdentifier(record.operation, "operation");
+      assertOneOf(record.actor.kind, ["operator", "agent", "system"], "actor.kind");
+      if (record.actor.principal_ref !== undefined) assertSdwIdentifier(record.actor.principal_ref, "principal_ref");
+      if (record.actor.agent_ref !== undefined) assertSdwIdentifier(record.actor.agent_ref, "agent_ref");
+      assertOneOf(record.channel, ["mcp", "cli", "dashboard", "internal"], "channel");
       assertNonNegativeInteger(record.sequence, "sequence");
+      if (record.previous_record_hash !== null) assertHashString(record.previous_record_hash, "previous_record_hash");
+      if (record.previous_query_key !== null) assertSdwIdentifier(record.previous_query_key, "previous_query_key");
+      assertHashString(record.record_hash, "record_hash");
+      if (record.policy_visibility !== "not_included") {
+        throw new SdwValidationError("schema_mismatch", "Invalid SDW policy_visibility");
+      }
+      for (const resultRef of record.result_refs ?? []) {
+        assertOneOf(resultRef.kind, ["working_state", "document", "document_chunk", "vector", "audit_event"], "result_ref.kind");
+        assertSdwIdentifier(resultRef.ref, "result_ref.ref");
+      }
       return;
     case "query_history_chain_head":
       assertVersion(record.version);
@@ -252,13 +293,21 @@ function validateRecord(record: SdwRecord): void {
     case "document":
       assertVersion(record.version);
       assertSdwIdentifier(record.document_id, "document_id");
+      assertOneOf(record.source.kind, ["file", "url", "paste", "tool_output", "internal"], "source.kind");
       assertNonNegativeInteger(record.chunk_count, "chunk_count");
+      if (record.byte_length !== undefined) assertNonNegativeInteger(record.byte_length, "byte_length");
+      for (const tag of record.tags ?? []) assertSdwIdentifier(tag, "tag");
+      for (const item of record.metadata ?? []) assertSdwIdentifier(item.key, "metadata.key");
       return;
     case "document_chunk":
       assertVersion(record.version);
       assertSdwIdentifier(record.document_id, "document_id");
       assertSdwIdentifier(record.chunk_id, "chunk_id");
       assertNonNegativeInteger(record.chunk_ordinal, "chunk_ordinal");
+      if (record.char_start !== undefined) assertNonNegativeInteger(record.char_start, "char_start");
+      if (record.char_end !== undefined) assertNonNegativeInteger(record.char_end, "char_end");
+      if (record.token_count !== undefined) assertNonNegativeInteger(record.token_count, "token_count");
+      for (const ref of record.vector_refs ?? []) assertSdwIdentifier(ref, "vector_ref");
       return;
     case "vector_record":
       assertVersion(record.version);
@@ -343,6 +392,22 @@ function assertVersion(version: number): void {
 function assertNonNegativeInteger(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new SdwValidationError("schema_mismatch", `Invalid SDW integer: ${label}`);
+  }
+}
+
+function assertHashString(value: string, label: string): void {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    throw new SdwValidationError("schema_mismatch", `Invalid SDW hash: ${label}`);
+  }
+}
+
+function assertOneOf<T extends string>(
+  value: string,
+  allowed: readonly T[],
+  label: string,
+): asserts value is T {
+  if (!(allowed as readonly string[]).includes(value)) {
+    throw new SdwValidationError("schema_mismatch", `Invalid SDW enum: ${label}`);
   }
 }
 
