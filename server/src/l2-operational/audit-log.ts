@@ -144,6 +144,8 @@ const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
 const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
+const AUDIT_READ_CONSISTENCY_RETRIES = 5;
+const AUDIT_READ_CONSISTENCY_RETRY_MS = 10;
 
 /** True iff `pid` names a live process this user could signal. Used to detect a
  * stale audit-write lock left by a crashed/killed holder. */
@@ -1124,7 +1126,7 @@ export class AuditLog {
 
   private async ensureLoaded(options?: { allowIntegrityFindings?: boolean }): Promise<void> {
     if (!this.loaded) {
-      await this.loadPersistedEntries();
+      await this.loadPersistedEntriesWithReadConsistency();
       this.loaded = true;
     }
     await this.reportIntegrityFindingsIfAny();
@@ -1141,7 +1143,7 @@ export class AuditLog {
   }
 
   private async reloadPersistedEntries(): Promise<void> {
-    await this.loadPersistedEntries();
+    await this.loadPersistedEntriesWithReadConsistency();
     this.loaded = true;
     await this.reportIntegrityFindingsIfAny();
     const contextAllowsIntegrityFindings =
@@ -1153,6 +1155,77 @@ export class AuditLog {
     ) {
       throw new AuditIntegrityError(this.integrityFindings);
     }
+  }
+
+  private async loadPersistedEntriesWithReadConsistency(): Promise<void> {
+    for (let attempt = 0; attempt <= AUDIT_READ_CONSISTENCY_RETRIES; attempt++) {
+      await this.loadPersistedEntries();
+      if (!this.hasReadConsistencyTransientFindings(this.integrityFindings)) {
+        return;
+      }
+      if (!(await this.isAuditWriterInProgress())) {
+        return;
+      }
+      if (attempt === AUDIT_READ_CONSISTENCY_RETRIES) {
+        return;
+      }
+      // Security argument: retry is allowed only while the writer-owned marker
+      // is presently held, and only for findings that match an in-flight append
+      // or rotation tear. The retry budget is deliberately tiny and finite; once
+      // it expires, the final inconsistent read is reported in strict mode. A
+      // truncation attacker without the live marker fails immediately, and an
+      // attacker who leaves the store permanently looking mid-write still fails
+      // closed after this bounded ceiling.
+      await sleep(AUDIT_READ_CONSISTENCY_RETRY_MS);
+    }
+  }
+
+  private hasReadConsistencyTransientFindings(
+    findings: readonly AuditIntegrityFinding[]
+  ): boolean {
+    if (findings.length === 0) return false;
+    return findings.every((finding) => {
+      if (finding.kind === "entry_malformed") return true;
+      if (
+        finding.kind === "entry_unreadable" &&
+        finding.message.includes("disappeared during load")
+      ) {
+        return true;
+      }
+      if (
+        finding.kind === "rotation_anchor_invalid" &&
+        typeof finding.expected === "number" &&
+        typeof finding.actual === "number"
+      ) {
+        return true;
+      }
+      if (finding.kind === "tail_anchor_missing") return true;
+      if (
+        finding.kind === "tail_anchor_invalid" &&
+        typeof finding.expected === "number" &&
+        typeof finding.actual === "number"
+      ) {
+        return true;
+      }
+      return false;
+    });
+  }
+
+  private async isAuditWriterInProgress(): Promise<boolean> {
+    if (!this.auditWriteLockPath) return false;
+    try {
+      await readFile(this.auditWriteLockPath, "utf8");
+    } catch (err) {
+      const code =
+        err instanceof Error && "code" in err
+          ? String((err as NodeJS.ErrnoException).code)
+          : "";
+      return code !== "ENOENT" && code !== "ENOTDIR";
+    }
+    if (await this.breakStaleAuditLock(this.auditWriteLockPath)) {
+      return false;
+    }
+    return true;
   }
 
   private async withAuditWriteLock<T>(operation: () => Promise<T>): Promise<T> {
@@ -1249,8 +1322,11 @@ export class AuditLog {
 
     if (holderPid === process.pid) return false;
 
-    const bootTimeMs = Date.now() - osUptime() * 1000;
-    const predatesBoot = acquiredAtMs !== undefined && acquiredAtMs < bootTimeMs;
+    const bootTimeMs = currentBootTimeMs();
+    const predatesBoot =
+      acquiredAtMs !== undefined &&
+      bootTimeMs !== undefined &&
+      acquiredAtMs < bootTimeMs;
     const holderDead = holderPid !== undefined && !isProcessAlive(holderPid);
     if (!predatesBoot && !holderDead) return false;
 
@@ -1985,6 +2061,16 @@ function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function currentBootTimeMs(): number | undefined {
+  try {
+    return Date.now() - osUptime() * 1000;
+  } catch {
+    // Some sandboxed child processes cannot call uv_uptime. In that case the
+    // lock is not proven stale by boot time; PID liveness can still prove it.
+    return undefined;
+  }
 }
 
 function asFilesystemCapabilities(

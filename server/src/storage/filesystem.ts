@@ -31,8 +31,8 @@
  *   pairs; they are forward-only by design.
  */
 
-import { mkdir, open, readFile, writeFile, unlink, readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, open, readFile, writeFile, unlink, readdir, rename, stat } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { randomBytes } from "../core/random.js";
 import {
   assertSdwRawWriteAuthorized,
@@ -110,11 +110,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const dirPath = encodedNamespacePath(this.basePath, namespace);
     const filePath = this.entryPath(namespace, key);
 
-    // Create namespace directory with restrictive permissions
     await mkdir(dirPath, { recursive: true, mode: 0o700 });
-
-    // Write file with restrictive permissions (owner read/write only)
-    await writeFile(filePath, checkedData, { mode: 0o600 });
+    await this.atomicWriteFile(filePath, checkedData, false);
   }
 
   async writeDurable(
@@ -127,12 +124,47 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const filePath = this.entryPath(namespace, key);
 
     await mkdir(dirPath, { recursive: true, mode: 0o700 });
-    const handle = await open(filePath, "w", 0o600);
+    await this.atomicWriteFile(filePath, checkedData, true);
+  }
+
+  private async atomicWriteFile(
+    filePath: string,
+    data: Uint8Array,
+    syncFile: boolean
+  ): Promise<void> {
+    const dirPath = dirname(filePath);
+    const tempPath = join(
+      dirPath,
+      `.${basename(filePath)}.${process.pid}.${Date.now()}.${Math.random()
+        .toString(16)
+        .slice(2)}.tmp`
+    );
+    const handle = await open(tempPath, "wx", 0o600);
     try {
-      await handle.writeFile(checkedData);
-      await handle.sync();
+      await handle.writeFile(data);
+      if (syncFile) await handle.sync();
     } finally {
       await handle.close();
+    }
+    try {
+      await rename(tempPath, filePath);
+      if (syncFile) await this.fsyncDirectory(dirPath);
+    } catch (err) {
+      await unlink(tempPath).catch(() => undefined);
+      throw err;
+    }
+  }
+
+  private async fsyncDirectory(dirPath: string): Promise<void> {
+    let handle;
+    try {
+      handle = await open(dirPath, "r");
+      await handle.sync();
+    } catch {
+      // Directory fsync is best-effort across platforms/filesystems. The file
+      // itself has already been fsynced before the atomic rename.
+    } finally {
+      await handle?.close().catch(() => undefined);
     }
   }
 

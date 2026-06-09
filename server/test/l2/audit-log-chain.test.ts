@@ -1,3 +1,7 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   AuditIntegrityError,
@@ -15,6 +19,7 @@ import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encodi
 import { createIdentity, sign as identitySign } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 
 const MASTER_KEY = () => generateRandomKey();
@@ -115,6 +120,35 @@ describe("AuditLog tamper-evident chain", () => {
     await storage.delete("_audit", keys[2]!);
 
     await expectStrictFinding(storage, masterKey, "tail_anchor_invalid");
+  });
+
+  it("fails closed when truncation is left behind with a fake in-progress writer marker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sanctuary-audit-fake-marker-"));
+    try {
+      const storage = new FilesystemStorage(join(root, "state"));
+      const masterKey = MASTER_KEY();
+      const writer = new AuditLog(storage, masterKey, { checkpointInterval: 0 });
+      await appendCritical(writer, "one");
+      await appendCritical(writer, "two");
+      await appendCritical(writer, "three");
+
+      const keys = (await storage.list("_audit")).map((entry) => entry.key);
+      await storage.delete("_audit", keys.at(-1)!);
+
+      const auditDir = storage.namespacePath("_audit");
+      await mkdir(auditDir, { recursive: true, mode: 0o700 });
+      await writeFile(join(auditDir, ".audit-write.lock"), "not-json", { mode: 0o600 });
+
+      const reader = new AuditLog(storage, masterKey);
+      await expect(reader.query({ limit: 100 })).rejects.toMatchObject({
+        name: "AuditIntegrityError",
+        findings: expect.arrayContaining([
+          expect.objectContaining({ kind: "tail_anchor_invalid" }),
+        ]),
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    }
   });
 
   it("allows a genuinely fresh empty log with no prior head anchor", async () => {

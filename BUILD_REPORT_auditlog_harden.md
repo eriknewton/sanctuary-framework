@@ -3,7 +3,7 @@
 Date: 2026-06-09
 Branch: `v1.x-audit-log-tail-hardening-2026-06-09`
 Base observed: `65c05575`
-Status: stopped before commit due S-1 reader-during-rotation tear
+Status: fixed locally, committed branch only, no push/PR/merge
 
 ## Findings
 
@@ -55,29 +55,36 @@ Export now includes a `rotation_anchor` JSONL record with:
 
 The standalone verifier consumes that record to seed chain verification for rotated exports and skips checkpoint root recomputation for checkpoint spans whose leaves were legitimately pruned below the rotation floor. Signature verification still runs for those checkpoints.
 
-### S-1: reader during rotation
+### S-1: reader during rotation/read consistency
 
-Added a focused concurrent reader/rotation fuzz test in `server/test/l2/audit-log-concurrent-write.test.ts`.
+Implemented the read-consistency fix for the three confirmed concurrent-reader tears:
 
-Result: the test revealed real transient reader tears. Per the prompt, I stopped rather than guessing a locking change.
+- `entry_malformed`: filesystem writes now publish through temp-file plus atomic `rename()`; durable writes fsync the temp file before publish and best-effort fsync the directory after publish.
+- `rotation_anchor_invalid`: readers treat anchor-ahead/lowest-survivor mismatches as retryable only while the writer-owned `_audit/.audit-write.lock` marker is presently held.
+- `tail_anchor_missing`: readers treat first-establishment anchor gaps as retryable only under the same live writer marker.
 
-Observed failures included:
+The retry design is attacker-safe:
 
-- `tail_anchor_missing` while the first append/head-anchor establishment was in flight.
-- `entry_malformed` from a reader observing an entry file mid-write.
-- `rotation_anchor_invalid` where the reader saw a newer rotation anchor before the corresponding prune completed, e.g. anchor `base_sequence 3` with lowest surviving sequence `2`.
+- The reader does not retry just because sequence numbers look transient. It retries only when the observable writer marker exists.
+- The retry budget is bounded to five 10 ms sleeps. If the store remains inconsistent after that ceiling, strict mode throws the integrity finding.
+- If no writer marker is present, truncation findings fail immediately.
+- If an attacker leaves truncation plus a fake/corrupt marker, the bounded ceiling expires and the tail-floor violation still fails closed.
 
-This means the suspected race is confirmed enough to require a deliberate read consistency design, not a blind patch.
+Added regression coverage for that attacker-safety property in `server/test/l2/audit-log-chain.test.ts`.
+
+Also hardened stale-lock recovery: if `os.uptime()` is unavailable in a sandboxed child process, boot-time staleness is not assumed; the code falls back to the PID-liveness proof and never breaks an unprovable lock.
 
 ## Files Changed
 
 - `server/src/l2-operational/audit-log.ts`
+- `server/src/storage/filesystem.ts`
 - `server/src/cli/audit.ts`
 - `server/src/l2-operational/context-gate-tools.ts`
 - `server/src/sanctuary-tools.ts`
 - `server/src/cli/audit-chain-export.ts`
 - `server/src/cli/audit-chain-verify.ts`
 - `server/test/l2/audit-log-chain.test.ts`
+- `server/test/mcp/audit-integrity-gate-classification.test.ts`
 - `server/test/cli/audit-search.test.ts`
 - `server/test/cli/cli-audit-write-inventory.test.ts`
 - `server/test/audit/external-verifier-drill.test.ts`
@@ -94,25 +101,32 @@ npm run typecheck
 Passed:
 
 ```text
-npm test -- test/l2/audit-log-chain.test.ts test/cli/audit-search.test.ts test/cli/cli-audit-write-inventory.test.ts test/audit/external-verifier-drill.test.ts
+npm test -- test/l2/audit-log-chain.test.ts test/l2/audit-log-concurrent-write.test.ts test/l2/audit-log-rotation-checkpoint.test.ts
 ```
 
-Result: 4 files passed, 36 tests passed.
+Result: 3 files passed, 25 tests passed.
 
-Failed by design as blocker evidence:
+Passed:
 
 ```text
-npm test -- test/l2/audit-log-concurrent-write.test.ts
+npm test -- test/l2/audit-log-*.test.ts test/cli/audit-search.test.ts test/audit/external-verifier-drill.test.ts
 ```
 
-Result: 1 failed, 1 passed. The new reader-during-rotation test failed with transient integrity findings, confirming S-1 needs a separate lock/read-consistency fix.
+Result: 9 files passed, 59 tests passed.
+
+Passed for S-1 flake confidence:
+
+```text
+for i in 1 2 3 4 5 6 7 8 9 10; do npx vitest run test/l2/audit-log-concurrent-write.test.ts >/tmp/audit-log-concurrent-$i.log || exit 1; done
+```
+
+Result: 10 consecutive green runs of the concurrent writer/reader rotation test.
 
 Not run:
 
 - Full macOS suite.
-- `.test-baseline` update. The build is stopped before commit because S-1 exposed a real tear.
+- `.test-baseline` update was not needed; the root `.test-baseline` remained unchanged.
 
 ## Deviations
 
-- No commit was created. The prompt explicitly said to stop and report if the S-1 test revealed a real tear.
 - No push, PR, or merge was performed.
