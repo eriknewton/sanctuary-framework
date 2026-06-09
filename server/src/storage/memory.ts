@@ -6,6 +6,7 @@
  */
 
 import type { StorageBackend, StorageEntryMeta } from "./interface.js";
+import { assertSdwRawWriteAuthorized } from "../sdw/write-gate.js";
 
 export class MemoryStorage implements StorageBackend {
   private store = new Map<string, { data: Uint8Array; modified_at: string }>();
@@ -19,8 +20,9 @@ export class MemoryStorage implements StorageBackend {
     key: string,
     data: Uint8Array
   ): Promise<void> {
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     this.store.set(this.storageKey(namespace, key), {
-      data: new Uint8Array(data), // Copy to prevent external mutation
+      data: checkedData,
       modified_at: new Date().toISOString(),
     });
   }

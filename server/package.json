@@ -68,6 +68,7 @@
     "it-length-prefixed": "9.1.1",
     "it-pipe": "3.0.1",
     "libp2p": "2.10.0",
+    "lmdb": "3.4.2",
     "pg": "8.20.0",
     "pgvector": "0.2.1",
     "uint8arraylist": "2.4.9",
