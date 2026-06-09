@@ -59,6 +59,7 @@ const STATE_META_MAC_DOMAIN = "sanctuary.meta-record-mac.v1\n";
 // Distinctive envelope marker so a MAC'd record is unambiguously distinguished
 // from a legacy bare record (legacy keys are versionKeys, never this).
 const STATE_META_MAC_MARKER = "__sanctuary_meta_mac_v1";
+const FACADE_HIDDEN_MARKER_NAMESPACE = "_facade/hidden";
 
 export type StateVerificationClassification =
   | "signature_mismatch"
@@ -98,6 +99,16 @@ export function decodeExportBundleNamespaces(bundleBase64: string): string[] {
     }
   }
   return actualNamespaces;
+}
+
+function parseFacadeHiddenMarker(raw: Uint8Array): { namespace: string; key: string } | null {
+  try {
+    const marker = JSON.parse(bytesToString(raw)) as Record<string, unknown>;
+    if (typeof marker.namespace !== "string" || typeof marker.key !== "string") return null;
+    return { namespace: marker.namespace, key: marker.key };
+  } catch {
+    return null;
+  }
 }
 
 export class LegacyEnvelopeWarning extends Error {
@@ -1262,6 +1273,7 @@ export class StateStore {
       string,
       Array<{ key: string; entry: StateEntry }>
     > = {};
+    const facadeHiddenMarkers: Array<{ key: string; marker: unknown }> = [];
     let totalKeys = 0;
 
     for (const ns of namespacesToExport) {
@@ -1282,11 +1294,26 @@ export class StateStore {
       }
     }
 
+    const markerEntries = await this.storage.list(FACADE_HIDDEN_MARKER_NAMESPACE);
+    for (const entry of markerEntries) {
+      const raw = await this.storage.read(FACADE_HIDDEN_MARKER_NAMESPACE, entry.key);
+      if (!raw) continue;
+      const marker = parseFacadeHiddenMarker(raw);
+      if (!marker || !namespacesToExport.includes(marker.namespace)) continue;
+      facadeHiddenMarkers.push({
+        key: entry.key,
+        marker: JSON.parse(bytesToString(raw)) as unknown,
+      });
+    }
+
     const bundleJson = JSON.stringify({
       sanctuary_export_version: 1,
       exported_at: new Date().toISOString(),
       namespaces: namespacesToExport,
       data: exportData,
+      ...(facadeHiddenMarkers.length > 0
+        ? { facade_hidden_markers: facadeHiddenMarkers }
+        : {}),
     });
 
     const bundleBytes = stringToBytes(bundleJson);
@@ -1444,6 +1471,30 @@ export class StateStore {
         this.versionCache.set(vk, entry.ver);
         const nsHashes = await this.getNamespaceHashes(ns);
         nsHashes.set(key, entry.integrity_hash);
+      }
+    }
+
+    if (Array.isArray(bundle.facade_hidden_markers)) {
+      const importedNamespaceSet = new Set(namespaces);
+      for (const item of bundle.facade_hidden_markers) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        const record = item as Record<string, unknown>;
+        if (typeof record.key !== "string" || record.key.includes("/") || record.key.length > 256) continue;
+        const marker = record.marker;
+        if (!marker || typeof marker !== "object" || Array.isArray(marker)) continue;
+        const markerRecord = marker as Record<string, unknown>;
+        if (
+          typeof markerRecord.namespace !== "string" ||
+          typeof markerRecord.key !== "string" ||
+          !importedNamespaceSet.has(markerRecord.namespace)
+        ) {
+          continue;
+        }
+        await this.storage.write(
+          FACADE_HIDDEN_MARKER_NAMESPACE,
+          record.key,
+          stringToBytes(JSON.stringify(markerRecord))
+        );
       }
     }
 

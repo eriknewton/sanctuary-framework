@@ -63,9 +63,11 @@ import { createPrincipalPolicyTools } from "./principal-policy/tools.js";
 import { createServer, type ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
 import {
+  ApprovalProofStore,
   fingerprintIdentityId,
   type SessionBinding,
 } from "./agent-native/safety-base.js";
+import { createAgentNativeCooperativeTools } from "./agent-native/cooperative-surface.js";
 import { createSHRTools } from "./shr/tools.js";
 import { createHandshakeTools } from "./handshake/tools.js";
 import { createFederationTools } from "./federation/tools.js";
@@ -345,7 +347,7 @@ export async function createSanctuaryServer(options?: {
   };
 
   // 7. Create L1 tools
-  const { tools: l1Tools, identityManager } = createL1Tools(
+  const { tools: l1Tools, identityManager, namespaceRegistry } = createL1Tools(
     stateStore,
     storage,
     masterKey,
@@ -927,6 +929,7 @@ export async function createSanctuaryServer(options?: {
     replaceModeTimeoutMs: policy.approval_channel.timeout_seconds * 1000,
   });
 
+  const approvalProofStore = new ApprovalProofStore();
   const gate = new ApprovalGate(
     policy,
     baseline,
@@ -935,7 +938,7 @@ export async function createSanctuaryServer(options?: {
     injectionDetector,
     onInjectionAlert,
     undefined,
-    { currentSessionBinding }
+    { currentSessionBinding, approvalProofStore }
   );
 
   gate.setApprovalEventCallback((event) => {
@@ -1185,6 +1188,16 @@ export async function createSanctuaryServer(options?: {
     fortressId: fortressIdForAggregator,
   });
 
+  const { tools: agentNativeTools } = createAgentNativeCooperativeTools({
+    identityManager,
+    namespaceRegistry,
+    auditLog,
+    currentSessionBinding,
+    primitiveTools: l1Tools,
+    storage,
+    approvalProofStore,
+  });
+
   // 17. Assemble all tools
   let allTools: ToolDefinition[] = [
     ...l1Tools,
@@ -1205,6 +1218,7 @@ export async function createSanctuaryServer(options?: {
     ...memoryAttestTools,
     ...complianceTools,
     ...erc8004Tools,
+    ...agentNativeTools,
     manifestTool,
   ];
 

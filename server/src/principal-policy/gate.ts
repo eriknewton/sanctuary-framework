@@ -320,6 +320,8 @@ export class ApprovalGate {
     toolName: string;
     args: Record<string, unknown>;
     session: SessionBinding;
+    planHash?: `sha256:${string}`;
+    stepId?: string;
     expiresAt?: string;
     auditId?: string;
   }): ApprovalRecord {
@@ -331,6 +333,8 @@ export class ApprovalGate {
       requester_identity_fingerprint: active.requester_identity_fingerprint,
       target_resource: deriveTargetResource(extractOperationName(params.toolName), params.args),
       risk_tier: riskTier,
+      ...(params.planHash ? { plan_hash: params.planHash } : {}),
+      ...(params.stepId ? { step_id: params.stepId } : {}),
       expires_at: params.expiresAt ?? new Date(Date.now() + 5 * 60_000).toISOString(),
       nonce: randomBytes(16).toString("hex"),
       audit_id: params.auditId ?? `audit:approval:${Date.now()}`,
@@ -403,6 +407,8 @@ export class ApprovalGate {
     const proofMatches =
       approvalEnvelopeHash(rebuilt) === record.envelope_hash &&
       record.decision === "approved" &&
+      record.envelope.plan_hash === undefined &&
+      record.envelope.step_id === undefined &&
       Date.parse(record.envelope.expires_at) > Date.now() &&
       rebuilt.requester_identity_fingerprint === record.envelope.requester_identity_fingerprint &&
       rebuilt.nonce === record.envelope.nonce &&

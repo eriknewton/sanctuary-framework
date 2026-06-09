@@ -67,6 +67,8 @@ export interface CanonicalApprovalEnvelope {
   requester_identity_fingerprint: `sha256:${string}`;
   target_resource: string;
   risk_tier: RiskTier;
+  plan_hash?: `sha256:${string}`;
+  step_id?: string;
   expires_at: string;
   nonce: string;
   audit_id: string;
@@ -84,6 +86,7 @@ export interface ApprovalRecord {
   envelope_hash: `sha256:${string}`;
   decision: "approved" | "denied";
   consumed: boolean;
+  reserved_by?: string;
   created_at: string;
 }
 
@@ -107,9 +110,31 @@ export class ApprovalProofStore {
     return this.records.get(approvalRef);
   }
 
+  reserveIfUnconsumed(approvalRef: string, reservationId: string): ApprovalRecord | null {
+    const record = this.records.get(approvalRef);
+    if (!record || record.consumed || record.reserved_by) return null;
+    record.reserved_by = reservationId;
+    return record;
+  }
+
+  releaseReservation(approvalRef: string, reservationId: string): boolean {
+    const record = this.records.get(approvalRef);
+    if (!record || record.reserved_by !== reservationId || record.consumed) return false;
+    delete record.reserved_by;
+    return true;
+  }
+
+  consumeReserved(approvalRef: string, reservationId: string): ApprovalRecord | null {
+    const record = this.records.get(approvalRef);
+    if (!record || record.consumed || record.reserved_by !== reservationId) return null;
+    record.consumed = true;
+    delete record.reserved_by;
+    return record;
+  }
+
   consumeIfUnconsumed(approvalRef: string): ApprovalRecord | null {
     const record = this.records.get(approvalRef);
-    if (!record || record.consumed) return null;
+    if (!record || record.consumed || record.reserved_by) return null;
     record.consumed = true;
     return record;
   }
@@ -256,13 +281,14 @@ export async function classifyApprovalRequest(params: {
   } catch {
     throw new Error(FIXED_DENIAL_MESSAGE);
   }
+  const approvalToolName = tool.approvalTargetToolName ?? params.operation;
   const active = resolveActiveSessionIdentity(params.session);
-  const riskTier = params.classifyTier(params.operation, handlerArgs);
+  const riskTier = params.classifyTier(approvalToolName, handlerArgs);
   const auditId = `audit:approval_request:${randomBytes(12).toString("hex")}`;
   const argsHash = normalizedArgsHash(handlerArgs);
   let targetResource: string;
   try {
-    targetResource = deriveTargetResource(params.operation, handlerArgs);
+    targetResource = deriveTargetResource(approvalToolName, handlerArgs);
   } catch {
     throw new Error(FIXED_DENIAL_MESSAGE);
   }
@@ -273,14 +299,14 @@ export async function classifyApprovalRequest(params: {
     result: "success",
     details: {
       audit_id: auditId,
-      tool_name: params.operation,
+      tool_name: approvalToolName,
       normalized_args_hash: argsHash,
       target_resource: targetResource,
       risk_tier: riskTier,
     },
   });
   return {
-    tool_name: params.operation,
+    tool_name: approvalToolName,
     normalized_args_hash: argsHash,
     requester_identity_fingerprint: active.requester_identity_fingerprint,
     target_resource: targetResource,
