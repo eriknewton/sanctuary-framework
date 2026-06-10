@@ -111,4 +111,43 @@ describe("credential/policy return hardening", () => {
     expect(text).not.toContain("tier1:state_export");
     expect(text).not.toContain("tier1_always_approve");
   });
+
+  it("redacts the Castle Wall matched rule_id from monitor_audit_log (#381, property #11)", async () => {
+    const { server, auditLog } = await createSanctuaryServer({
+      storage: new MemoryStorage(),
+      passphrase: "cred-return-rule-id-redaction",
+    });
+    // The macOS flow-event consumer writes the matched rule id into the stored
+    // entry so the operator can attribute the flow (#381). The agent-facing
+    // read boundary must still strip it so an agent cannot map the essentials
+    // list by probing (property #11, no-policy-inference).
+    await auditLog.appendCritical({
+      layer: "l1",
+      operation: "egress_allowed",
+      identity_id: "castle-wall-agent",
+      result: "success",
+      details: {
+        decision: "allow",
+        rule_id: "allow-anthropic-api",
+        source: "macos_extension",
+      },
+    });
+
+    const result = await callTool(server, "monitor_audit_log", { limit: 10, layer: "l1" });
+    const parsed = parseToolResult(result);
+    const text = result.content[0]!.text;
+    const entry = parsed.entries.find(
+      (candidate: { operation: string }) => candidate.operation === "egress_allowed"
+    );
+
+    expect(entry.details.rule_id).toBe("[redacted]");
+    expect(entry.details.decision).toBe("allow");
+    expect(text).not.toContain("allow-anthropic-api");
+
+    // The operator path (raw audit query, no agent redaction) still sees the
+    // rule id -- that is the whole point of #381.
+    const raw = await auditLog.query({ layer: "l1", limit: 10 });
+    const rawEntry = raw.entries.find((e) => e.operation === "egress_allowed");
+    expect(rawEntry?.details?.rule_id).toBe("allow-anthropic-api");
+  });
 });

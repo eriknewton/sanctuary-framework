@@ -215,11 +215,20 @@ export class MacOSFlowEventConsumer {
     }
     const eventType =
       notification.decision === "allow" ? "egress_allowed" : "egress_blocked";
-    // SECURITY (property #11): rule_id is NEVER written to the agent-accessible
-    // audit log. An agent that can query audit entries must not learn which rules
-    // matched (operator_passthrough, specific rule ids) -- that would let it map
-    // the essentials list by probing. Per-rule detail is available to the operator
-    // via the sysext's os_log trail and Castle Wall CLI diagnostics.
+    // OPERATOR ATTRIBUTION (#381): the matched rule id is written into the
+    // stored audit entry so the operator -- who owns the policy -- can attribute
+    // each flow to the specific rule that decided it (a specific allow/deny rule
+    // id, `operator_passthrough` for the baseline-allow fast path, or null for a
+    // baseline default-deny that matched no rule). It is null only when the
+    // sysext reported no matched rule.
+    //
+    // SECURITY (property #11, no-policy-inference): `rule_id` is an operator-only
+    // key. It is redacted at every agent-facing read boundary -- `monitor_audit_log`
+    // strips it via AUDIT_AGENT_REDACT_DETAIL_KEYS (server/src/index.ts), the SIEM
+    // formatters never project it, and the cooperative-surface pull/search tools
+    // never return raw details. So an agent that can query audit entries still
+    // cannot learn which rules matched and map the essentials list by probing.
+    // The operator reads the unredacted entry via the Castle Wall CLI / dashboard.
     this.auditSink.append(
       CASTLE_WALL_AUDIT_LAYER,
       eventType,
@@ -228,7 +237,7 @@ export class MacOSFlowEventConsumer {
         agent: notification.agent,
         destination: notification.destination,
         decision: notification.decision,
-        rule_id: null,
+        rule_id: notification.matched_rule_id ?? null,
         recorded_at: notification.recorded_at,
         source: "macos_extension",
       },
