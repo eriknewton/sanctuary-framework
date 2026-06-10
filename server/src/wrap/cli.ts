@@ -610,10 +610,10 @@ export async function runWrap(
   }
 
   const profile = createWrapProfile(upstreamServers);
-  // Filename is frozen for compatibility: existing installs are discovered by
-  // this exact on-disk name (see cli/agents/discovery.ts). Vocabulary-sweep
-  // exempt; do not rename without a read-both migration.
-  const profilePath = join(storagePath, "cocoon-profile.json");
+  // Read-both, write-new: new wraps write this canonical name; tenant
+  // discovery (cli/agents/discovery.ts) also recognizes the legacy
+  // pre-vocabulary-sweep filename so existing installs keep working.
+  const profilePath = join(storagePath, "wrap-profile.json");
   await writeFile(profilePath, JSON.stringify(profile, null, 2), {
     mode: 0o600,
   });

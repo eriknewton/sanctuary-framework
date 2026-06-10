@@ -171,7 +171,7 @@ describe("harness compatibility matrix", () => {
         const backupDir = join(storagePath(), "backup");
         const backupNames = await readdir(backupDir);
         expect(backupNames.some((name) => name.startsWith("config-backup-"))).toBe(true);
-        expect(JSON.parse(await readFile(join(backupDir, "cocoon-meta.json"), "utf-8"))).toMatchObject({
+        expect(JSON.parse(await readFile(join(backupDir, "wrap-meta.json"), "utf-8"))).toMatchObject({
           originalPath: configPath,
         });
         expect(extractSanctuaryEntry(JSON.parse(await readFile(configPath, "utf-8")), harness.serversKey)).toMatchObject({

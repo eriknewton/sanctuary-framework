@@ -37,7 +37,7 @@ async function buildMockTenant(
   await mkdir(join(dir, "state", "_identities"), { recursive: true });
   await mkdir(join(dir, "state", "_audit"), { recursive: true });
   await writeFile(join(dir, "state", "_audit", "0.enc"), "");
-  await writeFile(join(dir, "cocoon-profile.json"), JSON.stringify({ version: 1 }));
+  await writeFile(join(dir, "wrap-profile.json"), JSON.stringify({ version: 1 }));
   const server = createServer((req, res) => {
     if (req.url === "/api/health") {
       res.writeHead(200, { "Content-Type": "application/json" });

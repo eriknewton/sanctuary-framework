@@ -6,7 +6,7 @@
  *
  *   1. The default storage root (`~/.sanctuary/`) itself — included as the
  *      tenant named "default" if it looks initialized (has `state/` or
- *      `cocoon-profile.json` or `passphrase.enc`).
+ *      a wrap profile or `passphrase.enc`).
  *   2. Each immediate sub-directory of the default root that itself looks
  *      initialized — included as a tenant named after its directory basename.
  *   3. Any additional paths listed in `SANCTUARY_AGENTS_EXTRA_PATHS`,
@@ -45,7 +45,7 @@ export interface TenantDescriptor {
   exists: true;
   /** Has `state/` subdirectory — i.e. encrypted artifacts live here. */
   initialized: boolean;
-  /** `cocoon-profile.json` present (plaintext sovereignty profile written at wrap time). */
+  /** Wrap profile present (plaintext sovereignty profile written at wrap time). */
   has_profile: boolean;
   /** Keychain service name (stable hash of storage path on macOS). */
   keychain_service: string;
@@ -77,17 +77,28 @@ export interface DiscoveryOptions {
 
 const EXTRAS_FILE_NAME = "agents-extra.json";
 
+/**
+ * Wrap-profile filenames that mark a directory as a wrapped tenant.
+ * Read-both, write-new: `wrap-profile.json` is what current wraps write;
+ * the legacy pre-vocabulary-sweep name is still recognized so installs
+ * wrapped by earlier releases stay discoverable. This module is the only
+ * permitted carrier of the legacy literal (enforced by
+ * test/vocabulary/no-retired-vocabulary.test.ts).
+ */
+const PROFILE_FILENAMES = ["wrap-profile.json", "cocoon-profile.json"];
+
 /** Return true when path looks like an initialized Sanctuary tenant dir. */
 async function isTenantDir(path: string): Promise<{
   initialized: boolean;
   hasProfile: boolean;
   passphraseStatus: PassphraseStatus;
 }> {
-  const [hasState, hasProfile, hasFallback] = await Promise.all([
+  const [hasState, profileChecks, hasFallback] = await Promise.all([
     dirExists(join(path, "state")),
-    fileExists(join(path, "cocoon-profile.json")),
+    Promise.all(PROFILE_FILENAMES.map((name) => fileExists(join(path, name)))),
     fileExists(join(path, "passphrase.enc")),
   ]);
+  const hasProfile = profileChecks.some(Boolean);
   const initialized = hasState;
   // Passphrase status is best-effort: we can check for the fallback file
   // directly; a Keychain-stored passphrase is not directly observable from

@@ -31,7 +31,7 @@ describe("default tenant collision (#44)", () => {
       recursive: true,
     });
     await writeFile(
-      join(sanctuaryRoot, "cocoon-profile.json"),
+      join(sanctuaryRoot, "wrap-profile.json"),
       JSON.stringify({ version: 1 })
     );
 
@@ -41,7 +41,7 @@ describe("default tenant collision (#44)", () => {
       recursive: true,
     });
     await writeFile(
-      join(collisionDir, "cocoon-profile.json"),
+      join(collisionDir, "wrap-profile.json"),
       JSON.stringify({ version: 1 })
     );
 
@@ -62,7 +62,7 @@ describe("default tenant collision (#44)", () => {
       recursive: true,
     });
     await writeFile(
-      join(sanctuaryRoot, "cocoon-profile.json"),
+      join(sanctuaryRoot, "wrap-profile.json"),
       JSON.stringify({ version: 1 })
     );
 
@@ -70,7 +70,7 @@ describe("default tenant collision (#44)", () => {
     const workDir = join(sanctuaryRoot, "work");
     await mkdir(join(workDir, "state", "_identities"), { recursive: true });
     await writeFile(
-      join(workDir, "cocoon-profile.json"),
+      join(workDir, "wrap-profile.json"),
       JSON.stringify({ version: 1 })
     );
 

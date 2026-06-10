@@ -59,7 +59,7 @@ export async function runTemplateCommand(args: TemplateCommandArgs): Promise<num
 /**
  * Default orphan-check. An agent counts as wrapped when tenant discovery
  * finds a tenant with that name and the tenant is initialized (state dir
- * or cocoon-profile.json present).
+ * or wrap profile present).
  */
 async function defaultIsAgentWrapped(agentId: string): Promise<boolean> {
   const tenant = await findTenant(agentId);
