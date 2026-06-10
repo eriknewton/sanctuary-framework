@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { loadAssuranceMatrix } from "../assurance-matrix.js";
 
 describe("loadAssuranceMatrix", () => {
-  it("parses the canonical 21 row matrix", () => {
+  it("parses the canonical 22 row matrix", () => {
     const rows = loadAssuranceMatrix();
 
     expect(rows).toHaveLength(22);

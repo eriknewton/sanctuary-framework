@@ -1,5 +1,5 @@
 /**
- * Synthetic fixtures for assurance row 21: verifiable transparency
+ * Synthetic fixtures for assurance row 22: verifiable transparency
  * checkpoints. Exercises the standalone offline verifier
  * (server/src/transparency/verify.ts) against a synthetic signed chain and
  * its adversarial mutations: forged signature, counter gap, duplicate
@@ -21,7 +21,7 @@ import {
   type TransparencyFindingKind,
 } from "../../../../server/src/transparency/verify.js";
 
-const CLAIM_ID = "21";
+const CLAIM_ID = "22";
 const CLAIM_LABEL =
   "Verifiable transparency checkpoints (signed enforcement evidence)";
 
