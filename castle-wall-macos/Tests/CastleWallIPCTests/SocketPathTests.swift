@@ -88,6 +88,45 @@ final class SocketPathTests: XCTestCase {
         XCTAssertEqual(out.source, .macosHomeDefault)
     }
 
+    // MARK: - activeDaemonPresent (F-UX-2 arm gate probe)
+
+    /// The arm gate's "daemon up with policy" signal: an active-config naming
+    /// a live pid. (Local-only probe — `activeDaemonPresent` has no TS mirror;
+    /// the resolve fixtures above stay the cross-language parity set.)
+    func testActiveDaemonPresentWithLivePid() throws {
+        let configPath = try writeActiveConfig("""
+        {"socket_path":"/tmp/live.sock","fortress_id":"fortress-test","pid":\(getpid()),"started_at":"2026-05-25T00:00:00.000Z"}
+        """)
+        XCTAssertTrue(SocketPath.activeDaemonPresent(activeConfigPath: configPath))
+    }
+
+    /// A stale active-config (dead pid) must read as daemon-down — arming on a
+    /// leftover discovery file would fail-close the machine (the B2 lesson).
+    func testActiveDaemonAbsentWithDeadPid() throws {
+        let configPath = try writeActiveConfig("""
+        {"socket_path":"/tmp/stale.sock","fortress_id":"fortress-test","pid":999999,"started_at":"2026-05-25T00:00:00.000Z"}
+        """)
+        XCTAssertFalse(SocketPath.activeDaemonPresent(activeConfigPath: configPath))
+    }
+
+    func testActiveDaemonAbsentWhenFileMissing() {
+        XCTAssertFalse(
+            SocketPath.activeDaemonPresent(
+                activeConfigPath: "\(NSTemporaryDirectory())missing-\(UUID().uuidString).json"
+            )
+        )
+    }
+
+    func testActiveDaemonAbsentWhenConfigMalformedOrPidless() throws {
+        let malformed = try writeActiveConfig("{bad-json")
+        XCTAssertFalse(SocketPath.activeDaemonPresent(activeConfigPath: malformed))
+
+        let pidless = try writeActiveConfig("""
+        {"socket_path":"/tmp/no-pid.sock","fortress_id":"fortress-test","started_at":"2026-05-25T00:00:00.000Z"}
+        """)
+        XCTAssertFalse(SocketPath.activeDaemonPresent(activeConfigPath: pidless))
+    }
+
     func testExplicitOverrideTakesPrecedenceOverPlatform() {
         let out = SocketPath.resolve(
             platform: "linux",

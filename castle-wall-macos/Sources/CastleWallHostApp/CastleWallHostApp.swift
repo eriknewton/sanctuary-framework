@@ -15,7 +15,10 @@ struct CastleWallHostApp: App {
             )
             .onAppear {
                 ensureSignerHelper()
-                autoArmProtection()
+                // Arming (auto + manual) lives in ContentView (F-UX-2): it
+                // re-evaluates on scene activation, helper-state changes, and
+                // a periodic status tick — not only at this first onAppear.
+                filterConfigurationManager.refresh()
             }
         }
     }
@@ -28,30 +31,6 @@ struct CastleWallHostApp: App {
         switch signerHelperManager.helperState {
         case .notRegistered, .notFound, .unknown:
             signerHelperManager.register()
-        default:
-            break
-        }
-    }
-
-    private func autoArmProtection() {
-        filterConfigurationManager.refresh()
-
-        // Helper-as-signer precondition: a daemon cannot sign a policy without
-        // the helper + the trust-anchor pin, so arming before both are ready
-        // would fail-closed the machine to deny-all. Gate on readiness.
-        guard signerHelperManager.isReady else {
-            return
-        }
-
-        switch systemExtensionManager.extensionState {
-        case .activated:
-            if filterConfigurationManager.filterState != .enabled {
-                filterConfigurationManager.enableFilter()
-            }
-        case .activatedRequiresReboot:
-            break
-        case .unknown, .deactivated:
-            systemExtensionManager.activate()
         default:
             break
         }

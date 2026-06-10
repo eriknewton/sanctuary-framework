@@ -91,6 +91,37 @@ public enum SocketPath {
         return resolveDarwinFallback(fortressPath: fortressPath, homeDir: homeDir)
     }
 
+    /// F-UX-2 (manual arm gate): true iff an active-config discovery file names
+    /// a LIVE daemon pid. The daemon writes its active-config only AFTER the
+    /// IPC listener is up and the signed policy manifest is loaded
+    /// (`server/src/castle-wall/runtime/macos-daemon.ts`), so this is the host
+    /// app's "daemon up with policy" readiness probe for arming. Arming without
+    /// it would fail-close the machine to deny-all (the B2 lesson).
+    ///
+    /// Discovery/readiness ONLY — never a trust gate. The IPC handshake binds
+    /// the pinned key; the sysext's fingerprint gate ignores non-root-owned
+    /// active-config (F-A2-4). A forged file can light up an Arm button, but it
+    /// cannot make the wall trust an impostor daemon.
+    ///
+    /// The legacy /tmp fallback is consulted only for the production default
+    /// path (same hermetic-test semantics as `resolve`); under A2 the
+    /// root-owned custody dir forces the operator-UID daemon to write its
+    /// discovery file to the legacy path, so skipping it would read a healthy
+    /// A2 box as daemon-down.
+    public static func activeDaemonPresent(
+        activeConfigPath: String = SocketPath.activeConfigPath
+    ) -> Bool {
+        if resolveActiveConfigSocketPath(configPath: activeConfigPath) != nil {
+            return true
+        }
+        if activeConfigPath == SocketPath.activeConfigPath,
+           resolveActiveConfigSocketPath(
+               configPath: SocketPath.legacyActiveConfigPath) != nil {
+            return true
+        }
+        return false
+    }
+
     private static func resolveDarwinFallback(
         fortressPath: String?,
         homeDir: String?

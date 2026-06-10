@@ -1,5 +1,6 @@
 import SwiftUI
 import AgentDetector
+import CastleWallIPC
 
 struct ContentView: View {
     @ObservedObject var systemExtensionManager: SystemExtensionManager
@@ -11,6 +12,23 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @AppStorage("hasCompletedFirstRun") private var hasCompletedFirstRun = false
+
+    /// F-UX-2 operator-disarm latch: set by the Disarm button, cleared by the
+    /// Arm button. Persisted so a manual disarm survives an app relaunch —
+    /// auto-arm must never silently undo the operator's explicit decision.
+    @AppStorage("operatorDisarmed") private var operatorDisarmed = false
+
+    /// F-UX-2 arm gate input: true iff the daemon's active-config names a live
+    /// pid (written only after its listener + signed policy are up). Refreshed
+    /// on scene activation and on the periodic status tick.
+    @State private var daemonUpWithPolicy = false
+
+    /// Periodic status tick (F-UX-2): keeps the Arm gate + helper status live
+    /// while the app sits open, so "start the daemon, watch the Arm button
+    /// light up" works without bouncing the app. Both probes are cheap (one
+    /// stat+kill(0), one SMAppService status read).
+    private let statusTick = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
     @State private var selectedTab: Tab = .agents
     @State private var protectingAgent: String?
     @State private var protectedAgents: Set<String> = []
@@ -57,20 +75,42 @@ struct ContentView: View {
         }
         .frame(minWidth: 520, minHeight: 400)
         .task {
+            refreshProtectionInputs()
+            evaluateAutoArm()
             await agentDetector.scan()
             await serverBridge.checkServerHealth()
         }
         .onChange(of: scenePhase) { newPhase in
-            // Re-read helper status when the app reactivates so the approval
-            // banner clears the moment the operator flips the toggle and returns.
+            // Re-read helper + daemon status when the app reactivates so the
+            // approval banner clears the moment the operator flips the toggle
+            // and returns — and re-evaluate auto-arm on the same path (F-UX-2:
+            // arming is no longer a one-shot at first onAppear).
             if newPhase == .active {
-                signerHelperManager.refreshStatus()
+                refreshProtectionInputs()
+                evaluateAutoArm()
+            }
+        }
+        .onReceive(statusTick) { _ in
+            refreshProtectionInputs()
+            evaluateAutoArm()
+        }
+        .onChange(of: signerHelperManager.helperState) { newState in
+            // The moment the operator approves the helper (state flips to
+            // .enabled), re-evaluate arming — no relaunch required.
+            if newState == .enabled {
+                evaluateAutoArm()
             }
         }
         .onChange(of: systemExtensionManager.extensionState) { newState in
+            // Final arming step once sysext activation lands. Re-checked
+            // against the full fail-closed gate: the helper/daemon state may
+            // have changed while activation was in flight, and an operator
+            // disarm during that window must win.
             if newState == .activated,
                filterConfigurationManager.filterState != .enabled,
-               filterConfigurationManager.filterState != .enabling {
+               filterConfigurationManager.filterState != .enabling,
+               !operatorDisarmed,
+               canArm {
                 filterConfigurationManager.enableFilter()
             }
         }
@@ -95,17 +135,140 @@ struct ContentView: View {
     // MARK: - Header
 
     private var headerBar: some View {
-        HStack {
-            Text("Sanctuary")
-                .font(.title2)
-                .fontWeight(.semibold)
+        VStack(spacing: 4) {
+            HStack {
+                Text("Sanctuary")
+                    .font(.title2)
+                    .fontWeight(.semibold)
 
-            Spacer()
+                Spacer()
 
-            sysextStatusBadge
+                protectionControl
+
+                sysextStatusBadge
+            }
+
+            // A blocked Arm must never be silent (F-UX-2): name the missing
+            // precondition right under the control.
+            if !isArmed, let reason = armBlockedReason {
+                HStack {
+                    Spacer()
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    // MARK: - Arm / Disarm (F-UX-2)
+
+    /// Armed = the content filter is on (or coming up). The sysext being
+    /// activated alone is not armed — only the filter actually intercepts
+    /// flows.
+    private var isArmed: Bool {
+        filterConfigurationManager.filterState == .enabled ||
+            filterConfigurationManager.filterState == .enabling
+    }
+
+    private var canArm: Bool {
+        ProtectionGate.canArm(
+            helperReady: signerHelperManager.isReady,
+            daemonUpWithPolicy: daemonUpWithPolicy
+        )
+    }
+
+    private var armBlockedReason: String? {
+        ProtectionGate.armBlockedReason(
+            helperReady: signerHelperManager.isReady,
+            daemonUpWithPolicy: daemonUpWithPolicy
+        )
+    }
+
+    /// The manual control: Disarm whenever armed (ALWAYS enabled — the
+    /// operator can stand the wall down unconditionally), Arm otherwise
+    /// (enabled only when the fail-closed gate passes).
+    @ViewBuilder
+    private var protectionControl: some View {
+        if isArmed {
+            Button("Disarm") {
+                disarmProtection()
+            }
+            .disabled(!ProtectionGate.canDisarm())
+            .help("Turn the Castle Wall off. Always available.")
+        } else {
+            Button("Arm") {
+                armProtection()
+            }
+            .disabled(!canArm)
+            .help(armBlockedReason ?? "Turn the Castle Wall on.")
+        }
+    }
+
+    /// Refresh the inputs the arm gate + banners read: helper status and
+    /// daemon liveness. Cheap; called on scene activation and the status tick.
+    private func refreshProtectionInputs() {
+        signerHelperManager.refreshStatus()
+        daemonUpWithPolicy = SocketPath.activeDaemonPresent()
+    }
+
+    /// Auto-arm, re-evaluated on every refresh path (F-UX-2) — not a one-shot.
+    /// Only acts from a settled "filter off" state so transient states
+    /// (.loading at startup, .enabling mid-arm) and sticky ones
+    /// (.needsUserApproval, .error — which need the operator) never loop.
+    private func evaluateAutoArm() {
+        guard filterConfigurationManager.filterState == .disabled else { return }
+        // Auto-arm only drives from clean sysext states. In-flight, error,
+        // needs-approval, and reboot-gated states are operator territory — a
+        // 5s re-submit loop into a persistent error would churn forever.
+        switch systemExtensionManager.extensionState {
+        case .unknown, .deactivated, .activated:
+            break
+        default:
+            return
+        }
+        guard ProtectionGate.shouldAutoArm(
+            canArm: canArm,
+            alreadyArmed: isArmed,
+            operatorDisarmed: operatorDisarmed
+        ) else { return }
+        armProtection()
+    }
+
+    /// Arm the wall. Fail-closed: re-probe the daemon at gesture time and bail
+    /// (never partially arm) if the gate no longer passes.
+    private func armProtection() {
+        daemonUpWithPolicy = SocketPath.activeDaemonPresent()
+        guard canArm else { return }
+
+        operatorDisarmed = false
+
+        switch systemExtensionManager.extensionState {
+        case .activated:
+            if filterConfigurationManager.filterState != .enabled,
+               filterConfigurationManager.filterState != .enabling {
+                filterConfigurationManager.enableFilter()
+            }
+        case .activating, .deactivating, .activatedRequiresReboot, .needsUserApproval:
+            // In-flight, reboot-gated, or parked on the System Settings sysext
+            // approval: nothing sensible to re-submit now. The
+            // onChange(extensionState) hook finishes arming when activation
+            // lands.
+            break
+        case .unknown, .deactivated, .error:
+            // .error reachable only via the manual Arm button (auto-arm skips
+            // it) — an explicit operator retry.
+            systemExtensionManager.activate()
+        }
+    }
+
+    /// Disarm the wall. Unconditional, and sticky: sets the operator-disarm
+    /// latch so auto-arm does not immediately re-arm.
+    private func disarmProtection() {
+        operatorDisarmed = true
+        filterConfigurationManager.disableFilter()
     }
 
     private var sysextStatusBadge: some View {
@@ -141,7 +304,8 @@ struct ContentView: View {
         if case .error = signerHelperManager.helperState { return .red }
         if case .error = systemExtensionManager.extensionState { return .red }
         if case .error = filterConfigurationManager.filterState { return .red }
-        if signerHelperManager.helperState == .requiresApproval {
+        if signerHelperManager.helperState == .requiresApproval ||
+            signerHelperManager.helperState == .registering {
             return .yellow
         }
         if systemExtensionManager.extensionState == .needsUserApproval ||
@@ -164,6 +328,9 @@ struct ContentView: View {
         }
         if signerHelperManager.helperState == .requiresApproval {
             return "Needs Helper Approval"
+        }
+        if signerHelperManager.helperState == .registering {
+            return "Registering Helper…"
         }
         if case let .error(msg) = signerHelperManager.helperState {
             return "Helper Error: \(msg)"
@@ -195,6 +362,18 @@ struct ContentView: View {
     @ViewBuilder
     private var helperStatusBanner: some View {
         switch signerHelperManager.helperState {
+        case .registering:
+            // F-UX-1: the post-register settle window. Visible (not an
+            // EmptyView race) so the operator sees registration in progress.
+            helperBanner(
+                icon: "hourglass",
+                tint: .blue,
+                title: "Registering Sanctuary background helper…",
+                detail: "Waiting for macOS to accept the helper registration (a few seconds).",
+                actionLabel: "Open Settings"
+            ) {
+                signerHelperManager.openApprovalSettings()
+            }
         case .requiresApproval:
             helperBanner(
                 icon: "exclamationmark.shield.fill",
@@ -205,13 +384,34 @@ struct ContentView: View {
             ) {
                 signerHelperManager.openApprovalSettings()
             }
+        case .notRegistered, .notFound:
+            // F-UX-1: post-register fallthrough. If a register attempt was
+            // made and BTM still reports nothing, give the operator an
+            // explicit path (retry + the settings pane) instead of nothing.
+            if signerHelperManager.hasAttemptedRegister {
+                helperBanner(
+                    icon: "exclamationmark.shield.fill",
+                    tint: .yellow,
+                    title: "Background helper not registered",
+                    detail: "macOS did not accept the helper registration yet. Retry, then enable Sanctuary-CastleWall under Allow in the Background.",
+                    actionLabel: "Retry",
+                    secondaryActionLabel: "Open Settings",
+                    secondaryAction: { signerHelperManager.openApprovalSettings() }
+                ) {
+                    signerHelperManager.register()
+                }
+            } else {
+                EmptyView()
+            }
         case let .error(msg):
             helperBanner(
                 icon: "xmark.octagon.fill",
                 tint: .red,
                 title: "Background helper error",
                 detail: msg,
-                actionLabel: "Retry"
+                actionLabel: "Retry",
+                secondaryActionLabel: "Open Settings",
+                secondaryAction: { signerHelperManager.openApprovalSettings() }
             ) {
                 signerHelperManager.register()
             }
@@ -226,6 +426,8 @@ struct ContentView: View {
         title: String,
         detail: String,
         actionLabel: String,
+        secondaryActionLabel: String? = nil,
+        secondaryAction: (() -> Void)? = nil,
         action: @escaping () -> Void
     ) -> some View {
         HStack(spacing: 12) {
@@ -241,6 +443,10 @@ struct ContentView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
+            if let secondaryActionLabel, let secondaryAction {
+                Button(secondaryActionLabel, action: secondaryAction)
+                    .font(.subheadline)
+            }
             Button(actionLabel, action: action)
                 .font(.subheadline)
         }
