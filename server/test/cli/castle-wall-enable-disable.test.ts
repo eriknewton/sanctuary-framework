@@ -121,7 +121,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     ]);
   });
 
-  it("enable writes an operator_decision audit entry corroborating the arm", async () => {
+  it("enable writes a wall_armed audit entry corroborating the arm", async () => {
     const { fortressPath, hostAppPath, env, recoveryKey } = await makeFixture();
     const { invoke } = makeInvoker({
       enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
@@ -142,12 +142,42 @@ describe("castle-wall enable/disable CLI verbs", () => {
     const storage = new FilesystemStorage(join(fortressPath, "state"));
     const auditLog = new AuditLog(storage, fromBase64url(recoveryKey));
     const query = await auditLog.query({ layer: "l1", limit: 100 });
-    const entry = query.entries.find((e) => e.operation === "operator_decision");
+    const entry = query.entries.find((e) => e.operation === "wall_armed");
     expect(entry).toBeDefined();
     expect(entry?.details).toMatchObject({
       source: "castle-wall-cli",
       action: "enable",
       verified_state: "enabled",
+      forced: false,
+    });
+  });
+
+  it("disable writes a wall_disarmed audit entry corroborating the disarm", async () => {
+    const { fortressPath, hostAppPath, env, recoveryKey } = await makeFixture();
+    const { invoke } = makeInvoker({
+      disable: { stdout: reportLine("disable", "disabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+    });
+
+    const code = await runDisable([], {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+    });
+    expect(code).toBe(0);
+
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const auditLog = new AuditLog(storage, fromBase64url(recoveryKey));
+    const query = await auditLog.query({ layer: "l1", limit: 100 });
+    const entry = query.entries.find((e) => e.operation === "wall_disarmed");
+    expect(entry).toBeDefined();
+    expect(entry?.details).toMatchObject({
+      source: "castle-wall-cli",
+      action: "disable",
+      verified_state: "disabled",
       forced: false,
     });
   });
