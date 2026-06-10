@@ -799,6 +799,11 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runAuditDump(args.slice(1));
   }
 
+  if (command === "audit-findings") {
+    const { runAuditFindings } = await import("./cli/castle-wall.js");
+    return runAuditFindings(args.slice(1));
+  }
+
   if (command === "approve") {
     const { runApprove } = await import("./cli/castle-wall.js");
     return runApprove(args.slice(1));
@@ -811,12 +816,12 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
 
   if (command === "re-pin") {
     const { runRePin } = await import("./cli/castle-wall.js");
-    return runRePin();
+    return runRePin(args.slice(1));
   }
 
   if (command === "daemon") {
     const { runDaemon } = await import("./cli/castle-wall.js");
-    return runDaemon();
+    return runDaemon(args.slice(1));
   }
 
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -844,13 +849,18 @@ function printCastleWallHelp(): void {
     setup-shared-dir Create the privileged shared dir for the pinned key (run with sudo, macOS).
     reload           Reload policy in the running fortress daemon.
     audit-dump       Emit Castle Wall audit events as JSONL.
+    audit-findings   List audit-chain integrity findings for the fortress (read-only diagnostic).
     approve          Approve a pending Castle Wall request.
     configure-origin Configure the agent-origin descriptor for origin-differential enforcement.
     re-pin           Migrate the trust anchor to the root signer helper's key (one-time, operator-approved).
     daemon           Start the enforcement daemon standalone (existing fortress key); foreground until Ctrl-C.
 
   Options:
-    --help, -h   Show this help
+    --help, -h              Show this help
+    --accept-broken-chain   (daemon, re-pin) Proceed past audit integrity findings,
+                            recording an audited override entry first. Without it,
+                            a fortress with findings fail-closes (default). Inspect
+                            findings with 'sanctuary castle-wall audit-findings'.
 `);
 }
 

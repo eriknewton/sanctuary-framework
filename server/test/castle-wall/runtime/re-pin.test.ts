@@ -117,7 +117,7 @@ describe("castle-wall re-pin : runRePin", () => {
 
       const helper = makeMockHelper();
       const out = capture();
-      const rc = await runRePin({
+      const rc = await runRePin([], {
         out: out.stream,
         err: silent,
         env,
@@ -163,7 +163,7 @@ describe("castle-wall re-pin : runRePin", () => {
 
       const helper = makeMockHelper();
       const out = capture();
-      const rc = await runRePin({
+      const rc = await runRePin([], {
         out: out.stream,
         err: silent,
         env,
@@ -179,7 +179,7 @@ describe("castle-wall re-pin : runRePin", () => {
 
   it("fails when no signer-client is configured", async () => {
     const err = capture();
-    const rc = await runRePin({
+    const rc = await runRePin([], {
       out: silent,
       err: err.stream,
       env: { SANCTUARY_STORAGE_PATH: "/tmp/does-not-matter" },

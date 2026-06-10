@@ -5,19 +5,27 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Writable } from "node:stream";
 
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { ed25519 } from "@noble/curves/ed25519";
+
+import {
+  AuditLog,
+  type PersistedAuditEnvelopeV2,
+} from "../../src/l2-operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { toBase64url } from "../../src/core/encoding.js";
+import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import {
   parseCastleWallArgs,
   runProvisionPin,
+  runRePin,
   runAuditDump,
+  runAuditFindings,
   runReload,
   runSetupSharedDir,
   runStatus,
   type HostAppInvoker,
 } from "../../src/cli/castle-wall.js";
+import type { ShimInvoker } from "../../src/castle-wall/runtime/helper-signer.js";
 import { runInit } from "../../src/wrap/init.js";
 
 class CaptureStream extends Writable {
@@ -529,5 +537,285 @@ describe("castle-wall setup-shared-dir", () => {
     expect(code).toBe(1);
     expect(err.text()).toContain("Invalid SUDO_USER");
     expect(execCommands).toEqual([]);
+  });
+});
+
+describe("castle-wall audit-chain operator override", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  async function makeFortress() {
+    const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-override-"));
+    tempDirs.push(fortressPath);
+    const masterKey = generateRandomKey();
+    const recoveryKey = toBase64url(masterKey);
+    return { fortressPath, masterKey, recoveryKey };
+  }
+
+  /** Mirrors the re-pin test's mock signer helper (helper key + nonce signing). */
+  function makeMockHelper() {
+    const seed = ed25519.utils.randomPrivateKey();
+    const pub = ed25519.getPublicKey(seed);
+    const invoke: ShimInvoker = async (args, stdin) => {
+      const mode = args[0];
+      if (mode === "get-pubkey" || mode === "re-pin") {
+        return { stdout: toBase64url(pub), stderr: "", code: 0 };
+      }
+      const sig = ed25519.sign(stdin ?? new Uint8Array(0), seed);
+      return { stdout: toBase64url(sig), stderr: "", code: 0 };
+    };
+    return { pub, invoke };
+  }
+
+  /**
+   * Seed a fortress audit chain that fails integrity verification: append a real
+   * critical entry, then corrupt its stored `entry_hash` so a reload reports an
+   * `entry_hash_mismatch`. The payload still decrypts, so the entry stays in the
+   * chain and later appends land at a fresh sequence (no overwrite).
+   */
+  async function seedBrokenChain(
+    fortressPath: string,
+    masterKey: Uint8Array,
+  ): Promise<void> {
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const writer = new AuditLog(storage, masterKey);
+    await writer.appendCritical({
+      layer: "l1",
+      operation: "filter_started",
+      identity_id: "seed",
+      result: "success",
+      details: { seed: true },
+    });
+    await writer.flush();
+
+    const metas = await storage.list("_audit");
+    let corrupted = false;
+    for (const meta of metas) {
+      const raw = await storage.read("_audit", meta.key);
+      if (!raw) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(bytesToString(raw));
+      } catch {
+        continue;
+      }
+      const env = parsed as Partial<PersistedAuditEnvelopeV2>;
+      if (
+        typeof env.entry_hash === "string" &&
+        typeof env.encrypted_payload_bytes === "string" &&
+        typeof env.sequence === "number"
+      ) {
+        env.entry_hash =
+          env.entry_hash.slice(0, -1) +
+          (env.entry_hash.endsWith("a") ? "b" : "a");
+        await storage.write(
+          "_audit",
+          meta.key,
+          stringToBytes(JSON.stringify(env)),
+        );
+        corrupted = true;
+        break;
+      }
+    }
+    if (!corrupted) throw new Error("seedBrokenChain: no chain entry to corrupt");
+  }
+
+  async function auditChainKeys(fortressPath: string): Promise<string[]> {
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    return (await storage.list("_audit")).map((m) => m.key).sort();
+  }
+
+  async function readAuditOperations(
+    fortressPath: string,
+    masterKey: Uint8Array,
+  ): Promise<Array<{ sequence: number; operation: string }>> {
+    const reader = new AuditLog(
+      new FilesystemStorage(join(fortressPath, "state")),
+      masterKey,
+      { integrityMode: "lenient" },
+    );
+    const q = await reader.query({ limit: 1000 });
+    return q.entries.map((e, i) => ({
+      sequence: typeof e.sequence === "number" ? e.sequence : i,
+      operation: e.operation,
+    }));
+  }
+
+  it("re-pin refuses on a broken chain without --accept-broken-chain (unchanged default)", async () => {
+    const { fortressPath, masterKey, recoveryKey } = await makeFortress();
+    const env = {
+      SANCTUARY_STORAGE_PATH: fortressPath,
+      SANCTUARY_RECOVERY_KEY: recoveryKey,
+    };
+    expect(
+      await runProvisionPin({ out: new CaptureStream(), err: new CaptureStream(), env }),
+    ).toBe(0);
+    await seedBrokenChain(fortressPath, masterKey);
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const helper = makeMockHelper();
+    const code = await runRePin([], {
+      out,
+      err,
+      env,
+      platform: "darwin",
+      signerClientInvoke: helper.invoke,
+    });
+
+    expect(code).not.toBe(0);
+    expect(err.text()).toContain("audit integrity findings");
+    // No override entry was written — the fail-closed default did not consent.
+    const ops = await readAuditOperations(fortressPath, masterKey);
+    expect(
+      ops.some((o) => o.operation === "castle_wall_accept_broken_chain_override"),
+    ).toBe(false);
+    // No rotation proof either: the privileged action never ran.
+    expect(ops.some((o) => o.operation === "policy_loaded")).toBe(false);
+  });
+
+  it("re-pin with --accept-broken-chain writes an audited override entry THEN proceeds", async () => {
+    const { fortressPath, masterKey, recoveryKey } = await makeFortress();
+    const env = {
+      SANCTUARY_STORAGE_PATH: fortressPath,
+      SANCTUARY_RECOVERY_KEY: recoveryKey,
+    };
+    expect(
+      await runProvisionPin({ out: new CaptureStream(), err: new CaptureStream(), env }),
+    ).toBe(0);
+    await seedBrokenChain(fortressPath, masterKey);
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const helper = makeMockHelper();
+    const code = await runRePin(["--accept-broken-chain"], {
+      out,
+      err,
+      env,
+      platform: "darwin",
+      signerClientInvoke: helper.invoke,
+    });
+
+    expect(code).toBe(0);
+    // The override is loud on stderr and names the finding count.
+    expect(err.text()).toMatch(/--accept-broken-chain/);
+    expect(err.text()).toMatch(/integrity finding/);
+    // Re-pin proceeded: the rotation proof was recorded.
+    expect(out.text()).toMatch(/migrated to the signer helper/);
+
+    const ops = await readAuditOperations(fortressPath, masterKey);
+    const overrideOp = ops.find(
+      (o) => o.operation === "castle_wall_accept_broken_chain_override",
+    );
+    const rotationOp = ops.find((o) => o.operation === "policy_loaded");
+    expect(overrideOp).toBeTruthy();
+    expect(rotationOp).toBeTruthy();
+    // Consent landed BEFORE the privileged action (override seq < rotation seq).
+    expect(overrideOp!.sequence).toBeLessThan(rotationOp!.sequence);
+  });
+
+  it("re-pin with --accept-broken-chain writes no override entry on a clean chain", async () => {
+    const { fortressPath, masterKey, recoveryKey } = await makeFortress();
+    const env = {
+      SANCTUARY_STORAGE_PATH: fortressPath,
+      SANCTUARY_RECOVERY_KEY: recoveryKey,
+    };
+    expect(
+      await runProvisionPin({ out: new CaptureStream(), err: new CaptureStream(), env }),
+    ).toBe(0);
+    // No seedBrokenChain: the chain is clean.
+
+    const helper = makeMockHelper();
+    const code = await runRePin(["--accept-broken-chain"], {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      env,
+      platform: "darwin",
+      signerClientInvoke: helper.invoke,
+    });
+
+    expect(code).toBe(0);
+    const ops = await readAuditOperations(fortressPath, masterKey);
+    // The rotation proof is recorded, but NO spurious override entry.
+    expect(ops.some((o) => o.operation === "policy_loaded")).toBe(true);
+    expect(
+      ops.some((o) => o.operation === "castle_wall_accept_broken_chain_override"),
+    ).toBe(false);
+  });
+
+  it("audit-findings lists integrity findings on a broken chain and is read-only", async () => {
+    const { fortressPath, masterKey, recoveryKey } = await makeFortress();
+    await seedBrokenChain(fortressPath, masterKey);
+
+    const before = await auditChainKeys(fortressPath);
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const code = await runAuditFindings(["--fortress", fortressPath], {
+      out,
+      err,
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+    });
+
+    expect(code).toBe(0);
+    const lines = out.text().trim().split("\n").filter(Boolean);
+    expect(lines.length).toBeGreaterThan(0);
+    const parsed = lines.map((l) => JSON.parse(l) as { index: number; kind: string });
+    expect(parsed[0]!.index).toBe(0);
+    expect(parsed.some((p) => p.kind === "entry_hash_mismatch")).toBe(true);
+    expect(err.text()).toMatch(/audit integrity finding/);
+
+    // Read-only: the audit chain key set is unchanged, and no override or other
+    // entry was appended by inspecting findings.
+    const after = await auditChainKeys(fortressPath);
+    expect(after).toEqual(before);
+    const ops = await readAuditOperations(fortressPath, masterKey);
+    expect(
+      ops.some((o) => o.operation === "castle_wall_accept_broken_chain_override"),
+    ).toBe(false);
+  });
+
+  it("audit-findings reports a clean chain", async () => {
+    const { fortressPath, masterKey, recoveryKey } = await makeFortress();
+    // Write a normal, uncorrupted entry so the store exists and verifies clean.
+    const writer = new AuditLog(
+      new FilesystemStorage(join(fortressPath, "state")),
+      masterKey,
+    );
+    await writer.appendCritical({
+      layer: "l1",
+      operation: "filter_started",
+      identity_id: "seed",
+      result: "success",
+    });
+    await writer.flush();
+
+    const out = new CaptureStream();
+    const code = await runAuditFindings(["--fortress", fortressPath], {
+      out,
+      err: new CaptureStream(),
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("No audit integrity findings");
+  });
+
+  it("parses --accept-broken-chain", () => {
+    expect(parseCastleWallArgs(["--accept-broken-chain"]).acceptBrokenChain).toBe(
+      true,
+    );
+    expect(parseCastleWallArgs([]).acceptBrokenChain).toBeUndefined();
   });
 });
