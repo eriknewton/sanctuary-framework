@@ -208,3 +208,10 @@ the daemon is supervised out-of-band. `disable` deliberately has no
 preconditions. Both verbs append a best-effort audit entry (`wall_armed` /
 `wall_disarmed`, source `castle-wall-cli`) and re-verify the live state
 through `--headless status` before reporting success.
+
+`sanctuary castle-wall status` also uses the probe: when the host-app binary
+is installed, it appends a `Content filter: enabled|disabled` line reporting
+the live NE filter state. The sysext line alone is not that signal:
+`[activated enabled]` means the extension is installed and approved, not that
+the content filter is armed. When the binary is absent the line is omitted;
+when the probe fails it prints `Content filter: unknown (<reason>)`.

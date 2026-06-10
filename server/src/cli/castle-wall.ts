@@ -470,6 +470,42 @@ export async function runStatus(
   }
 
   write(out, `Castle Wall sysext: ${sysextState}\n`);
+
+  // Sysext "[activated enabled]" only means installed, not filtering. When the
+  // host-app binary is present, corroborate the live NE filter state through
+  // its --headless status probe. Binary absent → stay silent so output is
+  // unchanged on machines without the app (and on non-Mac CI).
+  const resolved = await resolveHostAppBinary(env, ctx);
+  if (!("error" in resolved)) {
+    const invoke = ctx.hostAppInvoke ?? makeHostAppInvoke(STATUS_PROBE_TIMEOUT_MS);
+    try {
+      const result = await invoke(resolved.path, ["--headless", "status"]);
+      const report = parseHeadlessReport(result.stdout);
+      if (
+        result.exitCode === 0 &&
+        report?.ok &&
+        (report.state === "enabled" || report.state === "disabled")
+      ) {
+        write(out, `Content filter: ${report.state}\n`);
+      } else {
+        const reason =
+          report?.error ??
+          (report && report.state !== "enabled" && report.state !== "disabled"
+            ? `host app reported state '${report.state}'`
+            : undefined) ??
+          (result.stderr.trim() ||
+            `host app exited with code ${result.exitCode}`);
+        write(out, `Content filter: unknown (${reason})\n`);
+      }
+    } catch (error) {
+      write(
+        out,
+        `Content filter: unknown (${
+          error instanceof Error ? error.message : String(error)
+        })\n`,
+      );
+    }
+  }
   return 0;
 }
 
@@ -959,29 +995,41 @@ async function resolveHostAppBinary(
   };
 }
 
-function defaultHostAppInvoke(
-  binaryPath: string,
-  args: string[],
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  return new Promise((resolvePromise) => {
-    nodeExecFile(
-      binaryPath,
-      args,
-      { encoding: "utf8", timeout: 90_000 },
-      (error, stdout, stderr) => {
-        let exitCode = 0;
-        if (error) {
-          exitCode =
-            typeof error.code === "number"
-              ? error.code
-              : // Spawn failure (ENOENT/EACCES/timeout kill): no exit code exists.
-                -1;
-        }
-        resolvePromise({ stdout: stdout ?? "", stderr: stderr ?? "", exitCode });
-      },
-    );
-  });
+function makeHostAppInvoke(timeoutMs: number): HostAppInvoker {
+  return (binaryPath, args) =>
+    new Promise((resolvePromise) => {
+      nodeExecFile(
+        binaryPath,
+        args,
+        { encoding: "utf8", timeout: timeoutMs },
+        (error, stdout, stderr) => {
+          let exitCode = 0;
+          let stderrOut = stderr ?? "";
+          if (error) {
+            exitCode =
+              typeof error.code === "number"
+                ? error.code
+                : // Spawn failure (ENOENT/EACCES/timeout kill): no exit code exists.
+                  -1;
+            if (error.killed && !stderrOut.trim()) {
+              stderrOut = `host app did not respond within ${timeoutMs}ms`;
+            }
+          }
+          resolvePromise({ stdout: stdout ?? "", stderr: stderrOut, exitCode });
+        },
+      );
+    });
 }
+
+const defaultHostAppInvoke = makeHostAppInvoke(90_000);
+
+/**
+ * `status` is a read-only quick check; never let it hang behind a wedged
+ * NE-preferences read (observed: --headless status can stall minutes on a
+ * host where the filter configuration is in a bad state). 10s is orders of
+ * magnitude above the healthy-path latency (~0.1s).
+ */
+const STATUS_PROBE_TIMEOUT_MS = 10_000;
 
 function parseHeadlessReport(stdout: string): HeadlessReport | null {
   const lines = stdout
