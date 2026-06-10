@@ -13,12 +13,15 @@
  *  - Archive/        — historical record, exempt per the canonical memo.
  *  - CHANGELOG.md    — release notes describe past releases under the names
  *                      they shipped with; rewriting them would falsify history.
- *  - Frozen literals — on-disk filenames written by earlier releases
- *                      (profile + unwrap-meta files) that discovery and
- *                      unwrap must keep reading, and the removed legacy
- *                      export names asserted absent by wrap-cli tests.
- *                      Stripped before scanning so they can be referenced
- *                      by compat code, fixtures, and layout docs.
+ *  - Frozen literals — the removed legacy export names asserted absent by
+ *                      wrap-cli tests and the retired dashboard route
+ *                      asserted absent by fortress-view tests. Stripped
+ *                      before scanning, repo-wide.
+ *  - Legacy filenames — on-disk filenames written by earlier releases
+ *                      (profile + unwrap-meta files). New writes use the
+ *                      wrap-* names; the legacy names survive ONLY in the
+ *                      fallback-read modules (read-both, write-new) and
+ *                      their compat tests, allowlisted per-file below.
  */
 
 import { describe, it, expect } from "vitest";
@@ -54,20 +57,33 @@ const EXEMPT_FILES = new Set([
 ]);
 
 /**
- * Frozen literals stripped from content before scanning. These are the ONLY
- * permissible carriers of the retired term in current artifacts:
- *  - the two on-disk filenames earlier releases wrote (compat reads, test
- *    fixtures simulating existing installs, and layout docs describing them);
+ * Frozen literals stripped from content before scanning, repo-wide:
  *  - the removed legacy export names, asserted absent by tests;
  *  - the retired dashboard route, asserted absent by fortress-view tests.
  */
 const FROZEN_LITERALS = [
-  "cocoon-profile.json",
-  "cocoon-meta.json",
   "parseCocoonArgs",
   "runCocoon",
   "/api/cocoon/pause",
 ];
+
+/**
+ * Legacy on-disk filenames written by pre-sweep releases. The read-both,
+ * write-new migration confines each literal to its fallback-read module
+ * and the compat test that proves legacy installs still work. Any other
+ * file referencing these names fails the gate — new code must use
+ * `wrap-profile.json` / `wrap-meta.json`.
+ */
+const LEGACY_FILENAME_ALLOWLIST: Record<string, ReadonlySet<string>> = {
+  "cocoon-profile.json": new Set([
+    "server/src/cli/agents/discovery.ts",
+    "server/test/wrap/legacy-filename-compat.test.ts",
+  ]),
+  "cocoon-meta.json": new Set([
+    "server/src/wrap/config-reader.ts",
+    "server/test/wrap/legacy-filename-compat.test.ts",
+  ]),
+};
 
 /** Text file extensions worth scanning. */
 const TEXT_EXTS = new Set([
@@ -104,14 +120,21 @@ describe("retired-vocabulary gate", () => {
 
     const offenders: string[] = [];
     for (const file of files) {
+      const rel = relative(REPO_ROOT, file).split(sep).join("/");
       let content = await readFile(file, "utf-8").catch(() => "");
       for (const literal of FROZEN_LITERALS) {
         content = content.split(literal).join("");
       }
+      for (const [literal, allowedFiles] of Object.entries(
+        LEGACY_FILENAME_ALLOWLIST
+      )) {
+        if (allowedFiles.has(rel)) {
+          content = content.split(literal).join("");
+        }
+      }
       const lines = content.split("\n");
       for (let i = 0; i < lines.length; i++) {
         if (/cocoon/i.test(lines[i])) {
-          const rel = relative(REPO_ROOT, file).split(sep).join("/");
           offenders.push(`${rel}:${i + 1}: ${lines[i].trim().slice(0, 120)}`);
         }
       }

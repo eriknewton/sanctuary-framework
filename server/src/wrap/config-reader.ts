@@ -177,24 +177,39 @@ export async function restoreConfig(backupPath: string, targetPath: string): Pro
   await copyFile(backupPath, targetPath);
 }
 
+/** Canonical unwrap-meta filename — all new wraps write this. */
+const WRAP_META_FILENAME = "wrap-meta.json";
+
+/**
+ * Legacy unwrap-meta filename written by releases before the vocabulary
+ * sweep. Read-only fallback: agents wrapped by those releases must stay
+ * unwrappable. This module is the only permitted carrier of the legacy
+ * literal (enforced by test/vocabulary/no-retired-vocabulary.test.ts).
+ */
+const LEGACY_WRAP_META_FILENAME = "cocoon-meta.json";
+
 /**
  * Find the most recent backup.
+ *
+ * Read-both, write-new: prefers the canonical meta filename, then falls
+ * back to the legacy name so installs wrapped by earlier releases can
+ * still unwrap.
  */
 export async function findLatestBackup(): Promise<{ backupPath: string; originalPath: string } | null> {
-  // Filename is frozen for compatibility: unwrap of agents wrapped by earlier
-  // releases reads this exact on-disk name. Vocabulary-sweep exempt; do not
-  // rename without a read-both migration.
-  const metaPath = join(backupDir(), "cocoon-meta.json");
-  try {
-    const raw = await readFile(metaPath, "utf-8");
-    const meta = JSON.parse(raw);
-    return {
-      backupPath: meta.backupPath,
-      originalPath: meta.originalPath,
-    };
-  } catch {
-    return null;
+  for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
+    const metaPath = join(backupDir(), filename);
+    try {
+      const raw = await readFile(metaPath, "utf-8");
+      const meta = JSON.parse(raw);
+      return {
+        backupPath: meta.backupPath,
+        originalPath: meta.originalPath,
+      };
+    } catch {
+      // Missing or unreadable — try the next candidate.
+    }
   }
+  return null;
 }
 
 /**
@@ -208,8 +223,7 @@ export async function saveWrapMeta(meta: {
 }): Promise<void> {
   const dir = backupDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
-  // Frozen legacy filename; see findLatestBackup() above.
-  const metaPath = join(dir, "cocoon-meta.json");
+  const metaPath = join(dir, WRAP_META_FILENAME);
   await writeFile(metaPath, JSON.stringify(meta, null, 2), { mode: 0o600 });
 }
 

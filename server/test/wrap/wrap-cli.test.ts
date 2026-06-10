@@ -516,7 +516,7 @@ describe("runWrap — v0.10.0 WP1 multi-tenancy env vars", () => {
     await rm(tempHome, { recursive: true, force: true });
   });
 
-  it("writes cocoon-profile.json under SANCTUARY_STORAGE_PATH when set", async () => {
+  it("writes wrap-profile.json under SANCTUARY_STORAGE_PATH when set", async () => {
     const tenantDir = join(tempHome, "tenant-a");
     process.env.SANCTUARY_STORAGE_PATH = tenantDir;
 
@@ -536,7 +536,7 @@ describe("runWrap — v0.10.0 WP1 multi-tenancy env vars", () => {
     );
 
     const profile = JSON.parse(
-      await readFile(join(tenantDir, "cocoon-profile.json"), "utf-8")
+      await readFile(join(tenantDir, "wrap-profile.json"), "utf-8")
     );
     expect(profile.version).toBe(1);
   });
@@ -667,9 +667,9 @@ describe("runWrap — v0.10.0 WP1 multi-tenancy env vars", () => {
       }
     );
 
-    // The backup dir and cocoon-meta.json live inside the tenant root.
+    // The backup dir and wrap-meta.json live inside the tenant root.
     const meta = JSON.parse(
-      await readFile(join(tenantDir, "backup", "cocoon-meta.json"), "utf-8")
+      await readFile(join(tenantDir, "backup", "wrap-meta.json"), "utf-8")
     );
     expect(meta.originalPath).toBe(configPath);
     expect(meta.backupPath.startsWith(join(tenantDir, "backup"))).toBe(true);

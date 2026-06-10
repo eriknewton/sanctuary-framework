@@ -275,14 +275,14 @@ A typical multi-tenant install on macOS looks like this:
 
   alpha/                                 ← sub-tenant 'alpha'
     passphrase.enc                       ← (or keychain entry sanctuary-passphrase-<sha(alpha-path)[:16]>)
-    cocoon-profile.json
+    wrap-profile.json
     state/
       _identities/<id-3>.enc
       _meta/key-params
 
   beta/                                  ← sub-tenant 'beta'
     passphrase.enc
-    cocoon-profile.json
+    wrap-profile.json
     state/
       _identities/<id-4>.enc
       _meta/key-params

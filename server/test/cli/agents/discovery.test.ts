@@ -35,7 +35,7 @@ async function makeTenantLayout(
   }
   if (opts.withProfile) {
     await writeFile(
-      join(dir, "cocoon-profile.json"),
+      join(dir, "wrap-profile.json"),
       JSON.stringify({ version: 1 })
     );
   }

@@ -47,7 +47,7 @@ async function makeTenant(root: string, name: string): Promise<string> {
   await mkdir(join(dir, "state", "_audit"), { recursive: true });
   await writeFile(join(dir, "state", "_audit", "00.enc"), "");
   await writeFile(
-    join(dir, "cocoon-profile.json"),
+    join(dir, "wrap-profile.json"),
     JSON.stringify({ version: 1 }),
   );
   return dir;
