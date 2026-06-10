@@ -44,6 +44,13 @@ import { dispatchV11Request } from "../dashboard/v1_1/dispatch.js";
 import type { V11Bindings } from "../dashboard/v1_1/wiring.js";
 import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
+import {
+  V1IdempotencyStore,
+  type V1AgentsDeps,
+  type UnprotectOutcome,
+} from "../v1/agents.js";
+import { HubNotFoundError, HubCapabilityError } from "../hub/errors.js";
+import { fromBase64url } from "../core/encoding.js";
 import type { ApprovalAggregator } from "./approval-aggregator.js";
 import {
   APPROVAL_INBOX_API_PREFIX,
@@ -226,6 +233,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * check, never bypasses).
    */
   private v1Sessions: V1SessionService;
+
+  /**
+   * Federation PR-A2: per-channel idempotency cache for the Tier 1 agent
+   * write endpoints (/v1/agents/protect|unprotect). One instance for the
+   * life of the channel so a retried, validly-signed write returns its
+   * first result instead of enqueuing a second approval.
+   */
+  private v1Idempotency = new V1IdempotencyStore();
 
   /**
    * v1.3 WP-V1.3-10 Cross-Harness Approval Inbox aggregator. Mounted
@@ -801,6 +816,71 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * Federation PR-A2: dependency bundle for the /v1/agents endpoints. Reads
+   * the live hub binding + operator identity each request so post-unlock
+   * wiring is always observed. Degrades fail-closed:
+   *   - no hub bound  ⇒ empty roster; unprotect returns `unavailable`.
+   *   - no operator id ⇒ `resolveOperatorPublicKey` returns null, which
+   *     forces every signed write to the generic 403 (never fails open).
+   */
+  private buildV1AgentsDeps(): V1AgentsDeps {
+    const nodeId =
+      this.v11Bindings?.fortressId ??
+      this.identityManager?.getPrimaryIdentityId() ??
+      "local";
+    return {
+      nodeId,
+      listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
+      resolveOperatorPublicKey: () => {
+        // Prefer the HUB-BOUND identity's key over the current default: the
+        // hub lists/controls agents for `v11Bindings.identityId`, so if the
+        // process default identity later changes, a write signed by the new
+        // default must not act on the old identity's agents (codex finding,
+        // multi-identity isolation). But `v11Bindings.identityId` may be a
+        // SYNTHETIC fortress-scoped id (`fortress:<path>`) on a fresh
+        // standalone boot, where the real signing identity only exists as the
+        // default — in that case `get()` returns undefined and we fall back
+        // to the default so valid signed writes are not rejected (codex
+        // finding). The hub is single-operator in v1.1, so this fallback does
+        // not widen authority; true per-identity binding is gated on the
+        // hub's own v1.2 multi-identity work.
+        const hubIdentityId = this.v11Bindings?.identityId;
+        const identity =
+          (hubIdentityId ? this.identityManager?.get(hubIdentityId) : undefined) ??
+          this.identityManager?.getDefault();
+        if (!identity?.public_key) return null;
+        try {
+          const key = fromBase64url(identity.public_key);
+          return key.length === 32 ? key : null;
+        } catch {
+          return null;
+        }
+      },
+      enqueueUnprotect: async (agentId): Promise<UnprotectOutcome> => {
+        const hub = this.v11Bindings?.hubService;
+        if (!hub) return { ok: false, reason: "unavailable" };
+        try {
+          const result = await hub.controlAgent(agentId, "unwrap");
+          // unwrap is a Tier 1 action ⇒ always the enqueued-result branch,
+          // never the synchronous control-result branch.
+          if ("inbox_item_id" in result) {
+            return { ok: true, result };
+          }
+          // Defensive: a non-Tier-1 result for unwrap should not happen.
+          return { ok: false, reason: "unsupported" };
+        } catch (err) {
+          if (err instanceof HubNotFoundError) return { ok: false, reason: "not_found" };
+          if (err instanceof HubCapabilityError) return { ok: false, reason: "unsupported" };
+          // HubLocalOnlyError (foreign identity) and validation errors map
+          // to not-found: the agent is not addressable by this operator.
+          return { ok: false, reason: "not_found" };
+        }
+      },
+      idempotency: this.v1Idempotency,
+    };
+  }
+
+  /**
    * v0.10.2: enable (or disable) the loopback auto-auth fast path. See
    * {@link _autoAuthLocalhost} for the rationale and threat model. Callers
    * should gate this on both (a) the dashboard host being a loopback
@@ -1312,6 +1392,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           isLoopbackRequest: (r) => this.isLoopbackRequest(r),
           buildFullStatus: () => this.buildV1FullStatus(),
           version: PKG_VERSION,
+          agents: this.buildV1AgentsDeps(),
         },
         req,
         res,

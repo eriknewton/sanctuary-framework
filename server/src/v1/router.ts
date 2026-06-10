@@ -27,9 +27,18 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { V1SessionService, V1SessionClaims } from "./session-service.js";
 import { V1_CAPABILITY_STATUS_READ } from "./session-service.js";
-
-/** Request bodies above this size are rejected before parsing. */
-const MAX_BODY_BYTES = 16 * 1024;
+import {
+  writeJson,
+  denyUnauthorized,
+  denyForbidden,
+  denyNotFound,
+  readJsonBody,
+} from "./http.js";
+import {
+  handleAgentsRequest,
+  isAgentsPath,
+  type V1AgentsDeps,
+} from "./agents.js";
 
 export interface V1RouterContext {
   sessions: V1SessionService;
@@ -39,42 +48,13 @@ export interface V1RouterContext {
   buildFullStatus(): Record<string, unknown>;
   /** Server version string for the PUBLIC minimal status variant. */
   version: string;
-}
-
-function writeJson(res: ServerResponse, status: number, payload: unknown): void {
-  res.writeHead(status, {
-    "Content-Type": "application/json",
-    "Cache-Control": "no-store",
-  });
-  res.end(JSON.stringify(payload));
-}
-
-/** One generic denial for every authentication failure (constraint 7). */
-function denyUnauthorized(res: ServerResponse): void {
-  writeJson(res, 401, { error: "unauthorized" });
-}
-
-/** One generic denial for every capability failure. */
-function denyForbidden(res: ServerResponse): void {
-  writeJson(res, 403, { error: "forbidden" });
-}
-
-async function readJsonBody(req: IncomingMessage): Promise<unknown | undefined> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buf = chunk as Buffer;
-    size += buf.length;
-    if (size > MAX_BODY_BYTES) return undefined;
-    chunks.push(buf);
-  }
-  const text = Buffer.concat(chunks).toString("utf-8");
-  if (!text) return undefined;
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return undefined;
-  }
+  /**
+   * PR-A2 agent endpoints (GET /v1/agents, POST /v1/agents/protect,
+   * POST /v1/agents/unprotect). Always wired in production; when the hub
+   * is unbound the deps degrade gracefully (empty roster, writes fail
+   * closed). Optional so PR-A1's minimal test rigs still construct.
+   */
+  agents?: V1AgentsDeps;
 }
 
 /**
@@ -176,11 +156,21 @@ export async function handleV1Request(
   }
 
   // ── Everything else under /v1: fail closed ─────────────────────────
+  // A valid SESSION_TOKEN is required for every remaining path. Only an
+  // authenticated caller can distinguish a real route from a 404, so the
+  // route map stays opaque to unauthenticated probes.
   const claims = sessionClaims(ctx, req);
   if (!claims) {
     denyUnauthorized(res);
     return true;
   }
-  writeJson(res, 404, { error: "not found" });
+
+  // PR-A2 agent endpoints. Writes (protect/unprotect) layer OPERATOR_SIGNED
+  // verification on top of the session inside the handler.
+  if (ctx.agents && isAgentsPath(url.pathname)) {
+    return handleAgentsRequest(ctx.agents, req, res, url, method, claims);
+  }
+
+  denyNotFound(res);
   return true;
 }
