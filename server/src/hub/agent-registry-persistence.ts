@@ -21,9 +21,9 @@
  *
  * Layer boundary preserved: this is the v1.1 hub registry only. The L1
  * cognitive identity layer at `~/.sanctuary/state/_identities/` stays
- * lazy by design (created on first cocoon-unlock; see `cli.ts:588-593`).
+ * lazy by design (created on first fortress-unlock; see `cli.ts:588-593`).
  * The two layers describe different concerns: hub registry tracks what
- * wrap registered; L1 identity tracks the cocoon-derived Ed25519 keys.
+ * wrap registered; L1 identity tracks the master-key-derived Ed25519 keys.
  *
  * File: `<storagePath>/state/_hub/local-agents.json`, mode 0600,
  * atomic write via `.tmp` rename. Best-effort read on rehydrate (parse

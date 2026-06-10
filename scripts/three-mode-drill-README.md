@@ -10,7 +10,7 @@ The drill brings up three processes on your laptop, each acting as a Sanctuary n
 - **Node B, operator cloud mode.** The "sovereign-managed" role. In production this would be a Confidential VM in a cloud region of your choosing, attesting to the fortress-master before it joins. The drill simulates the deployment shape with a loopback process; the cryptographic posture is identical.
 - **Node C, sovereign TEE mode.** The "sealed hardware" role. In production, this runs inside a TEE (GCP Confidential VMs, Azure Confidential Computing, or similar) and carries a measured-attestation hash on its certificate. The drill uses a mock attestation so the chain of trust is demonstrable without TEE hardware.
 
-All three are members of the same fortress, all three certificates chain back to one fortress-master that never leaves your cocoon. When the drill reports steady state, every node has:
+All three are members of the same fortress, all three certificates chain back to one fortress-master that never leaves your encrypted state store. When the drill reports steady state, every node has:
 
 - Verified every other node's certificate chain against the pinned fortress-master.
 - Joined the shared gossipsub channel used for broadcast federation.
@@ -60,7 +60,7 @@ Before the script exits, everything is in the `.sanctuary-drill/` directory at t
   nodeA/
     node.json         Node A's id, mode, certificate
     multiaddr.txt     libp2p multiaddr A was listening on
-    nodekeys/         FileNodeKeyStore (cocoon-wrapped private key)
+    nodekeys/         FileNodeKeyStore (master-key-wrapped private key)
     counters/         FileCounterStore (monotonic counters)
   nodeB/ (same shape, operator_cloud mode)
   nodeC/ (same shape, sovereign_tee mode)
@@ -92,7 +92,7 @@ The goal is to prove the protocol on one host so an operator can see it work wit
 
 1. **All three processes run on 127.0.0.1.** Production places node B in a cloud region and node C on TEE hardware. The drill uses loopback so a pilot operator can run it on a laptop without provisioning any infrastructure. The wire protocol, the certificates, and the peer-id pinning are identical either way.
 2. **The TEE attestation is mocked.** Node C presents a constant `tee_attestation_hash` seeded from a well-known string. Real TEE integration (GCP Confidential VMs AMD SEV-SNP, Azure Confidential Computing, or similar) produces a live measurement that a verifier rejects if the node is running tampered code. That hardware integration is Phase 2 on the product roadmap.
-3. **The fortress-master and per-node seeds are written to disk unencrypted.** A production pilot generates the master inside a cocoon and never writes it to the filesystem; the drill writes `fortress/master.bin` and `nodeX/seed.bin` so the per-node runtime can pick them up without a passphrase prompt. Treat `.sanctuary-drill/` as ephemeral demo material, not a fortress you would actually run agents in.
+3. **The fortress-master and per-node seeds are written to disk unencrypted.** A production pilot generates the master inside the encrypted state store and never writes it to the filesystem; the drill writes `fortress/master.bin` and `nodeX/seed.bin` so the per-node runtime can pick them up without a passphrase prompt. Treat `.sanctuary-drill/` as ephemeral demo material, not a fortress you would actually run agents in.
 4. **mDNS and the Kademlia DHT are disabled.** The drill uses static-peer discovery only. mDNS works on a real LAN and is exercised by the underlying transport tests; the drill sequences bring-up deterministically to keep the onboarding reliable.
 5. **No agents are launched.** The drill proves the federation layer (nodes, certificates, roster convergence). Launching a Tier-A harness on top of the fortress is a separate WP-MVP scope.
 

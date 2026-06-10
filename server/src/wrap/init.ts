@@ -16,7 +16,7 @@
  *     the operator-friendly alias for SANCTUARY_STORAGE_PATH.
  *
  * Honors --force, --no-confirm. The recovery key is fully disclosed via
- * the shared helper at server/src/cocoon/recovery-key-disclosure.ts.
+ * the shared helper at server/src/wrap/recovery-key-disclosure.ts.
  */
 
 import { mkdir, readdir } from "node:fs/promises";

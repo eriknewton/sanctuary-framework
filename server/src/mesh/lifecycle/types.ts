@@ -153,19 +153,19 @@ export interface CounterStore {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Node-key storage (Q8 cocoon binding)
+// Node-key storage (Q8 node-key binding)
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
  * Store for a node's at-rest wrapped private key.
  *
- * Q8 pick: per-node cocoon-equivalent. The per-node Ed25519 private key is
+ * Q8 pick: per-node wrapped key. The per-node Ed25519 private key is
  * wrapped via AES-256-GCM under an HKDF-derived key from the fortress-master
  * secret + node_id (see `wrapNodePrivateKey` / `unwrapNodePrivateKey`). The
  * wrapped blob lives here. The master secret is surfaced only transiently
  * at unlock time (through the existing broker flow).
  *
- * No cocoon-schema change: the master cocoon stores the fortress-master
+ * No store-schema change: the encrypted state store holds the fortress-master
  * secret exactly as today. The per-node wrapped private key is a separate
  * lifecycle-owned artifact that lives alongside the node certificate on the
  * node's local disk in production — in this thread, we ship the in-memory
@@ -208,7 +208,7 @@ export interface SyncResponsePayload {
   /**
    * Q6 agent-state-transfer payload. Encrypted under an HKDF-derived key from
    * (fortress_master_secret, source_node_id, destination_node_id, agent_id,
-   * authorizing_locator_version). Opaque to the transport layer; the cocoon
+   * authorizing_locator_version). Opaque to the transport layer; the encrypted state store
    * on the destination side unwraps it using its existing snapshot format.
    */
   agent_state_wrapped?: EncryptedPayload;

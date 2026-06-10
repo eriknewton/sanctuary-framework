@@ -1,6 +1,6 @@
 /**
- * Cocoon env-var preservation tests — verifies that running
- * `cocoon --openclaw` / `wrap --openclaw` preserves the three
+ * Wrap env-var preservation tests — verifies that running
+ * `wrap --openclaw` preserves the three
  * critical env vars in the rewritten config.
  */
 
@@ -8,9 +8,9 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { rewriteConfigForCocoon, type AgentConfig } from "../../src/wrap/config-reader.js";
+import { rewriteConfigForWrap, type AgentConfig } from "../../src/wrap/config-reader.js";
 
-describe("Cocoon env-var preservation", () => {
+describe("Wrap env-var preservation", () => {
   let tmpDir: string;
   let configPath: string;
 
@@ -23,7 +23,7 @@ describe("Cocoon env-var preservation", () => {
   ] as const;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), "cocoon-env-test-"));
+    tmpDir = await mkdtemp(join(tmpdir(), "wrap-env-test-"));
     configPath = join(tmpDir, "openclaw.json");
     for (const key of ENV_KEYS) {
       savedEnv[key] = process.env[key];
@@ -47,7 +47,7 @@ describe("Cocoon env-var preservation", () => {
     };
     await writeFile(configPath, JSON.stringify(config.rawConfig), { mode: 0o600 });
 
-    await rewriteConfigForCocoon(config, "npx", ["@sanctuary-framework/mcp-server"], {
+    await rewriteConfigForWrap(config, "npx", ["@sanctuary-framework/mcp-server"], {
       SANCTUARY_PASSPHRASE: "test-pass",
       SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok-123",
       SANCTUARY_DASHBOARD_ENABLED: "true",
@@ -73,7 +73,7 @@ describe("Cocoon env-var preservation", () => {
     };
     await writeFile(configPath, JSON.stringify(config.rawConfig), { mode: 0o600 });
 
-    await rewriteConfigForCocoon(config, "npx", ["@sanctuary-framework/mcp-server"]);
+    await rewriteConfigForWrap(config, "npx", ["@sanctuary-framework/mcp-server"]);
 
     const result = JSON.parse(await readFile(configPath, "utf-8"));
     const env = result.mcp.servers.sanctuary.env;
@@ -112,7 +112,7 @@ describe("Cocoon env-var preservation", () => {
     };
     await writeFile(configPath, JSON.stringify(rawConfig), { mode: 0o600 });
 
-    await rewriteConfigForCocoon(config, "npx", ["@sanctuary-framework/mcp-server"]);
+    await rewriteConfigForWrap(config, "npx", ["@sanctuary-framework/mcp-server"]);
 
     const result = JSON.parse(await readFile(configPath, "utf-8"));
     const env = result.mcp.servers.sanctuary.env;
@@ -134,7 +134,7 @@ describe("Cocoon env-var preservation", () => {
     };
     await writeFile(configPath, JSON.stringify(config.rawConfig), { mode: 0o600 });
 
-    await rewriteConfigForCocoon(config, "npx", ["@sanctuary-framework/mcp-server"]);
+    await rewriteConfigForWrap(config, "npx", ["@sanctuary-framework/mcp-server"]);
 
     const result = JSON.parse(await readFile(configPath, "utf-8"));
     const sanctuaryEntry = result.mcp.servers.sanctuary;

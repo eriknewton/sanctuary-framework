@@ -1,12 +1,12 @@
 /**
  * Disk-backed NodeKeyStore + CounterStore (WP-MVP-3 follow-up #2 pairing item).
  *
- * In-memory implementations ship in `cocoon-binding.ts` and `counters.ts` for
+ * In-memory implementations ship in `node-key-binding.ts` and `counters.ts` for
  * tests. Production libp2p nodes MUST survive process restart with:
  *
- *   - The per-node Ed25519 private key re-derivable (stored as a cocoon-
+ *   - The per-node Ed25519 private key re-derivable (stored as a master-key-
  *     wrapped AES-256-GCM blob under `AAD = "node:<node_id>"`, matching the
- *     Q8 binding that `cocoon-binding.ts` establishes). A lost key means the
+ *     Q8 binding that `node-key-binding.ts` establishes). A lost key means the
  *     node cannot re-authenticate to the mesh; a silently-recreated key means
  *     the peer-id shifts, which the remote noise handshake rejects.
  *
@@ -23,7 +23,7 @@
  * three in one `tmpdir`.
  *
  * Spec: §2.2, §3.5, §8.3. Hard rules: no Concordia imports, crypto reuse
- * via `cocoon-binding.ts`.
+ * via `node-key-binding.ts`.
  */
 
 import {
@@ -44,9 +44,9 @@ import { COUNTER_NAMES, wouldOverflowOnNext } from "./counters.js";
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
- * File-backed NodeKeyStore. Stores the cocoon-wrapped `EncryptedPayload` as
+ * File-backed NodeKeyStore. Stores the master-key-wrapped `EncryptedPayload` as
  * a JSON file per node_id under the fortress directory. The wrap itself uses
- * AAD `"node:<node_id>"` (see `wrapNodePrivateKey` in cocoon-binding.ts),
+ * AAD `"node:<node_id>"` (see `wrapNodePrivateKey` in node-key-binding.ts),
  * which is what prevents an attacker who reads the file off one disk from
  * substituting it onto a different node.
  *

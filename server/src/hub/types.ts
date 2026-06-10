@@ -114,7 +114,7 @@ export interface HubAgentController {
   /**
    * Apply an operator-approved unwrap. Called only after a Tier 1
    * approval lands through the inbox flow. Implementations SHOULD treat
-   * unwrap as durable (cocoon teardown + registry deregister).
+   * unwrap as durable (fortress teardown + registry deregister).
    */
   unwrap(agentId: string): Promise<HubAgentStatus>;
   /**

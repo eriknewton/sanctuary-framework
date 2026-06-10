@@ -223,7 +223,7 @@ export interface CommitmentProposal {
 /**
  * Per-agent identity record — holds the agent's Ed25519 public key plus the
  * enumerated HKDF-derived subkey purposes. The raw private key is never
- * stored in this shape; it is encrypted by the cocoon layer and unwrapped
+ * stored in this shape; it is encrypted by the state-store layer and unwrapped
  * transiently for signing.
  */
 export interface AgentIdentityBinding {

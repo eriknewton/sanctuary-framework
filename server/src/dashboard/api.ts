@@ -44,7 +44,7 @@ export interface APIDeps {
   fortressId?: string;
   /**
    * Override the orphan-check for template init. Returns true when a
-   * cocoon is bound to the given agent_id. Default: resolves against
+   * fortress is bound to the given agent_id. Default: resolves against
    * tenant discovery (`findTenant`).
    */
   isAgentWrapped?: (agentId: string) => Promise<boolean>;
@@ -315,7 +315,7 @@ export async function handleRequest(
       }
 
       // Orphan-reject: a channel-shape template binds to an already-wrapped
-      // harness. A template init against an agent_id with no cocoon behind
+      // harness. A template init against an agent_id with no fortress behind
       // it would author a policy artifact bound to nothing, which is the
       // runtime-drift surface the v1.0.0-rc.2 back-out closed. Sanctuary
       // ships channel-shape governance templates, not named-agent runtimes.
@@ -323,7 +323,7 @@ export async function handleRequest(
         deps.isAgentWrapped ?? (async (agentId: string) => {
           const tenant = await findTenant(agentId);
           if (!tenant) return false;
-          return tenant.initialized || tenant.has_cocoon_profile;
+          return tenant.initialized || tenant.has_profile;
         });
       if (!(await isAgentWrapped(body.agent_name))) {
         writeJSON(res, 400, {

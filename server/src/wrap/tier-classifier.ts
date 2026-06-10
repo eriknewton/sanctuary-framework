@@ -1,9 +1,9 @@
 /**
- * Sanctuary Cocoon — Tool Tier Auto-Classifier
+ * Sanctuary Wrap — Tool Tier Auto-Classifier
  *
  * Heuristic classification of upstream MCP tools into approval tiers
  * based on tool name patterns. This is the zero-config protection layer
- * that makes Cocoon safe out of the box.
+ * that makes wrapped agents safe out of the box.
  *
  * Tier 1 (requires approval): destructive, executable, or sensitive operations
  * Tier 2 (anomaly-monitored): default for unclassified tools

@@ -487,7 +487,7 @@ describe("OperatorChatService — Tau-2 multi-turn coherence", () => {
 
     const ctx2 = contexts[1]!;
     // Prior fold contains the unredacted operator turn (operator
-    // confidentiality stays inside the cocoon; the substrate already
+    // confidentiality stays inside the fortress; the substrate already
     // saw a redacted query for THAT turn).
     expect(ctx2).toContain("OPERATOR: the SECRET is hidden");
   });

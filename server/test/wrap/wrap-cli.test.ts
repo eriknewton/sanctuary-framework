@@ -11,10 +11,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseWrapArgs,
-  parseCocoonArgs,
   formatWrapSuccess,
   runWrap,
-  COCOON_GOVERNOR_DEFAULTS,
+  WRAP_GOVERNOR_DEFAULTS,
   type DashboardStarter,
   type RunWrapDeps,
 } from "../../src/wrap/cli.js";
@@ -83,16 +82,18 @@ describe("parseWrapArgs", () => {
     expect(parseWrapArgs([])).toEqual({});
   });
 
-  it("is aliased as parseCocoonArgs for backward compat", () => {
-    expect(parseCocoonArgs).toBe(parseWrapArgs);
+  it("no longer exports the retired legacy aliases", async () => {
+    const mod = await import("../../src/wrap/cli.js");
+    expect("parseCocoonArgs" in mod).toBe(false);
+    expect("runCocoon" in mod).toBe(false);
   });
 });
 
-describe("COCOON_GOVERNOR_DEFAULTS", () => {
-  it("are preserved from the old cocoon CLI", () => {
-    expect(COCOON_GOVERNOR_DEFAULTS.volume_limit).toBe(200);
-    expect(COCOON_GOVERNOR_DEFAULTS.rate_limit_per_tool).toBe(20);
-    expect(COCOON_GOVERNOR_DEFAULTS.lifetime_limit).toBe(1000);
+describe("WRAP_GOVERNOR_DEFAULTS", () => {
+  it("are unchanged from the original defaults", () => {
+    expect(WRAP_GOVERNOR_DEFAULTS.volume_limit).toBe(200);
+    expect(WRAP_GOVERNOR_DEFAULTS.rate_limit_per_tool).toBe(20);
+    expect(WRAP_GOVERNOR_DEFAULTS.lifetime_limit).toBe(1000);
   });
 });
 
@@ -244,7 +245,7 @@ describe("port fallback", () => {
 //
 // End-to-end-lite test: invoke `runWrap` against a temp config file and assert
 // that a user-supplied `--passphrase` value is never passed to the config
-// rewrite. See docs/audit/DELTA_REVIEW_V0.9.0_RC1.md SEC-061 / CLEAN-018.
+// rewrite. See Archive/DELTA_REVIEW_V0.9.0_RC1.md SEC-061 / CLEAN-018.
 
 describe("runWrap — SEC-061 passphrase leak regression", () => {
   let tempHome: string;

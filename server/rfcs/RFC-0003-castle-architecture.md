@@ -14,7 +14,7 @@ Proposed. On Erik approval, becomes canonical for v1.x onward. Every spec, PR, a
 
 ## Context
 
-Sanctuary's enforcement story drifted between the original cocoon/sandbox concept and the current v1.x implementation. The drift collapsed the enforcement layer into "voluntary MCP-gate" cooperative security, where agents that voluntarily route their tool calls through Sanctuary's MCP get the full sovereignty surface (encrypted state, signed audit, mandate primitives, four canonical policy slots), and agents that bypass the MCP get nothing.
+Sanctuary's enforcement story drifted between the original proxy-sandbox concept and the current v1.x implementation. The drift collapsed the enforcement layer into "voluntary MCP-gate" cooperative security, where agents that voluntarily route their tool calls through Sanctuary's MCP get the full sovereignty surface (encrypted state, signed audit, mandate primitives, four canonical policy slots), and agents that bypass the MCP get nothing.
 
 An engineer friend reviewing the architecture observed correctly: an MCP-based implementation offers no guarantees. The agent voluntarily uses Sanctuary's MCP; nothing prevents it from acting outside the MCP's view. Prompt-injected agents, jailbroken agents, or agents whose harness simply does not bother with sovereignty primitives all bypass the cooperative path. Verascore-as-eventual-catch is empty as deterrence at the moment of action because agents do not reason about reputation consequences.
 

@@ -268,7 +268,7 @@ export function updateActionBadge(
  *
  * Emission path: callers wire `auditSink` to whatever audit channel they
  * have available (signed-event-stream broadcast on the dashboard side, an
- * AuditLog.append call on a fully-cocooned host, an SSE named event for a
+ * AuditLog.append call on a fully-wrapped host, an SSE named event for a
  * thinner surface). The attestation module is pure logic and does not own
  * an AuditLog reference; routing decisions stay with the caller.
  *
@@ -290,7 +290,7 @@ export interface ResetScopeRetryStateOptions {
   /**
    * Optional sink for the `attestation_retry_state_reset` audit event.
    * Callers that own an AuditLog (the dashboard's signed-event-stream, a
-   * cocooned host's L2 audit log) inject a thin adapter; pure-logic tests
+   * wrapped host's L2 audit log) inject a thin adapter; pure-logic tests
    * pass an array-pusher to assert emission.
    *
    * The sink is invoked synchronously after scope-id validation succeeds

@@ -46,7 +46,7 @@ export interface TenantDescriptor {
   /** Has `state/` subdirectory — i.e. encrypted artifacts live here. */
   initialized: boolean;
   /** `cocoon-profile.json` present (plaintext sovereignty profile written at wrap time). */
-  has_cocoon_profile: boolean;
+  has_profile: boolean;
   /** Keychain service name (stable hash of storage path on macOS). */
   keychain_service: string;
   /** Whether a passphrase is stored in keychain vs encrypted fallback file vs unknown. */
@@ -91,7 +91,7 @@ async function isTenantDir(path: string): Promise<{
   const initialized = hasState;
   // Passphrase status is best-effort: we can check for the fallback file
   // directly; a Keychain-stored passphrase is not directly observable from
-  // the filesystem, so we treat "has cocoon-profile but no fallback file" as
+  // the filesystem, so we treat "has profile file but no fallback file" as
   // likely-keychain. If neither present → not-initialized.
   let passphraseStatus: PassphraseStatus;
   if (hasFallback) passphraseStatus = "fallback-file";
@@ -197,7 +197,7 @@ async function describeTenant(
     storage_path: storagePath,
     exists: true,
     initialized,
-    has_cocoon_profile: hasProfile,
+    has_profile: hasProfile,
     keychain_service: keychainServiceFor(storagePath, home),
     passphrase_status: passphraseStatus,
     last_activity,

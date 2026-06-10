@@ -3,7 +3,7 @@
  *
  * Per-agent allowlist of outbound destinations. Compiled from plain-English
  * operator policy; pinned as a signed policy_update. Enforced at the egress
- * chokepoint — the same boundary the cocoon/wrap pipeline uses for outbound
+ * chokepoint — the same boundary the wrap pipeline uses for outbound
  * network calls.
  *
  * Denials emit `egress_blocked` usage events (existing event_class).

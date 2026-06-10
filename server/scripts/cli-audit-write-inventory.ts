@@ -2,7 +2,7 @@
  * CLI audit-write completeness inventory.
  *
  * Walks every CLI surface under server/src/cli/ (and the top-level cli.ts
- * for surfaces routed there: exit, honeypot, cocoon/wrap, compliance,
+ * for surfaces routed there: exit, honeypot, wrap, compliance,
  * template) and classifies each subcommand as:
  *
  *   - mutator:   changes fortress state (identity, policy, subscriptions,
@@ -234,7 +234,7 @@ function deriveParentCommand(filePath: string): string | null {
   if (base.endsWith("exit/cli")) return "exit";
   if (base.endsWith("honeypot/cli")) return "honeypot";
   if (base.endsWith("templates/cli")) return "template";
-  // Skip cocoon/cli, compliance cli - they parse flags in case statements
+  // Skip wrap/cli, compliance cli - they parse flags in case statements
   return null;
 }
 

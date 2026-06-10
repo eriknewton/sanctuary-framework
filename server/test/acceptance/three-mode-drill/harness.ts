@@ -10,7 +10,7 @@
  *
  * Every node runs the real `Libp2pMeshTransport` (PR #34) over loopback TCP
  * with real Noise handshake + real gossipsub; per-node Ed25519 keys are
- * cocoon-wrapped onto real `FileNodeKeyStore` + monotonic counters persist via
+ * master-key-wrapped onto real `FileNodeKeyStore` + monotonic counters persist via
  * real `FileCounterStore`. The only mock in the harness is the TEE attestation
  * hash on node C's certificate (real TEE hardware integration is Phase 2 per
  * the MVP scope lock).

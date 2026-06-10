@@ -331,7 +331,7 @@ async function cmdShow(argv: string[], ctx: ResolvedCtx): Promise<number> {
     name: tenant.name,
     storage_path: tenant.storage_path,
     initialized: tenant.initialized,
-    has_cocoon_profile: tenant.has_cocoon_profile,
+    has_profile: tenant.has_profile,
     keychain_service: tenant.keychain_service,
     passphrase_status: tenant.passphrase_status,
     last_activity: tenant.last_activity,
@@ -352,7 +352,7 @@ async function cmdShow(argv: string[], ctx: ResolvedCtx): Promise<number> {
   ctx.out.write(`tenant:            ${tenant.name}\n`);
   ctx.out.write(`storage_path:      ${tenant.storage_path}\n`);
   ctx.out.write(`initialized:       ${tenant.initialized ? "yes" : "no"}\n`);
-  ctx.out.write(`cocoon-profile:    ${tenant.has_cocoon_profile ? "present" : "absent"}\n`);
+  ctx.out.write(`profile:           ${tenant.has_profile ? "present" : "absent"}\n`);
   ctx.out.write(`keychain_service:  ${tenant.keychain_service}\n`);
   ctx.out.write(`passphrase:        ${passphraseLabel(tenant)}\n`);
   ctx.out.write(

@@ -213,9 +213,9 @@ export class Broker {
   /**
    * Drop expired tokens from the in-memory issuer map. Hardening wave 6
    * finding #86: previously expiry pruning depended on opportunistic
-   * `pruneExpired()` calls; now the cocoon-unlock initialization path
+   * `pruneExpired()` calls; now the fortress-unlock initialization path
    * (openBroker -> after backend.ensureInitialized -> after Broker
-   * construction) fires this once so each cocoon-unlock cycle drops
+   * construction) fires this once so each fortress-unlock cycle drops
    * stale bindings before any operator interaction.
    *
    * Returns the number of tokens removed. Safe to call repeatedly; idempotent.

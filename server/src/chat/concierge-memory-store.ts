@@ -1,7 +1,7 @@
 /**
  * Sanctuary MCP Server — Concierge Memory Store (WP-V1.3-9 Tau-1)
  *
- * Per-fortress, encrypted-at-rest, cocoon-bound persistence for
+ * Per-fortress, encrypted-at-rest, fortress-bound persistence for
  * concierge conversation turns. Distinct from the v1.2 OperatorChatStore
  * (single fortress-scoped thread, capped FIFO, no retention) — this
  * store is the foundation for v1.3 conversational sovereignty depth:
@@ -25,7 +25,7 @@
  * Each turn carries an ISO-8601 `retention_until`. `pruneExpired()`
  * iterates threads and drops turns whose retention_until is in the
  * past. Empty bundles are deleted entirely. Caller wires this into
- * the cocoon-unlock initialization path (the wiring layer fires it
+ * the fortress-unlock initialization path (the wiring layer fires it
  * once the store is constructed).
  *
  * Multi-fortress isolation:

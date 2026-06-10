@@ -21,7 +21,7 @@ import type { NodeMode, SignatureScheme, V01EventType } from "./constants.js";
 
 /**
  * Public form of the fortress-master key.
- * Private form is held in the operator's cocoon, unlocked by Argon2id passphrase.
+ * Private form is held in the operator's encrypted state store, unlocked by Argon2id passphrase.
  * It is never serialized in any wire protocol message.
  */
 export interface FortressMasterPublicKey {

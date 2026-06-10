@@ -83,7 +83,7 @@ interface TransportServices extends Record<string, unknown> {
 /**
  * Constructor arguments. The transport does NOT generate the Ed25519 seed —
  * it is handed the per-node seed unwrapped from the `NodeKeyStore` (Q8
- * cocoon binding) by the lifecycle orchestrator. This keeps key material
+ * node-key binding) by the lifecycle orchestrator. This keeps key material
  * on one path through the system.
  */
 export interface Libp2pMeshTransportParams {

@@ -97,7 +97,7 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
   "approval_pending.tier1.fortress_exit_bundle_export": () =>
     "Export the entire fortress as a portable exit bundle.",
   "approval_pending.tier1.unwrap": (a) =>
-    `Unwrap agent ${arg(a, "agent_id")}. Cocoon and registry binding will be removed.`,
+    `Unwrap agent ${arg(a, "agent_id")}. Protection and registry binding will be removed.`,
   "approval_pending.tier1.policy_change": (a) =>
     `Bind agent ${arg(a, "agent_id")} to policy ${arg(a, "policy_id")}.`,
   "approval_pending.tier1.policy_change_template": (a) =>
@@ -165,7 +165,7 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
 
   // ── recovery_prompt.* ───────────────────────────────────────────────
   "recovery_prompt.passphrase_reset": () =>
-    `Recommended: rotate the cocoon passphrase.`,
+    `Recommended: rotate the fortress passphrase.`,
   "recovery_prompt.keychain_rebind": () =>
     `Recommended: rebind the keychain entry for this fortress.`,
   "recovery_prompt.config_backup_restore": () =>

@@ -3,7 +3,7 @@
  *
  * Hero shield + four layer cards + live activity feed + approval queue +
  * audit trail. Vanilla HTML/CSS/JS in one string, matching the convention
- * established by server/src/cocoon/fortress-view.ts.
+ * established by server/src/wrap/fortress-view.ts.
  *
  * The initial snapshot is embedded server-side so the page renders
  * correctly without JavaScript. Live updates layer on via SSE + REST.

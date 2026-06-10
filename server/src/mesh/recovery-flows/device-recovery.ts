@@ -4,7 +4,7 @@
  * Spec §9 (recovery cascade), Architecture Walk Key 8 (operator-in-the-loop),
  * Key 13 (recovery cascade integration), §3.6.1 (guardian-initiated path).
  *
- * Scenario: operator's primary node (phone stolen, laptop bricked, cocoon
+ * Scenario: operator's primary node (phone stolen, laptop bricked, state store
  * unreadable) is gone. Operator authenticates to any surviving node, holds
  * the guardian-quorum recovery bundle, and drives this ceremony:
  *   1. `propose` — operator names the lost node_id + the replacement's

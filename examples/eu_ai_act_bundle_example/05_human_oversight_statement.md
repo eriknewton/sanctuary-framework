@@ -80,7 +80,7 @@ the Sanctuary oversight gate recorded the following activity:
 | Outcome | Count |
 |---|---|
 | Gate allow (Tier 3 auto-allow or approved Tier 1/2) | 24 |
-| Gate allow_proxy (Cocoon MCP-proxy pass-through) | 12 |
+| Gate allow_proxy (MCP-proxy pass-through) | 12 |
 | Gate deny (approval denied or timeout) | 3 |
 | Gate escalate (Tier 2 anomaly raised for human review) | 0 |
 | Gate unclassified (no matching rule, default behaviour applied) | 0 |

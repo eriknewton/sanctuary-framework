@@ -11,7 +11,7 @@
  *   - PolicyBundleStore + LocatorTableStore + NodeLifecycleEventLog:
  *     replicated state shipped via sync.
  *   - JoinApprover: gate-wrapping abstraction for the operator-decision step.
- *   - Per-node cocoon binding (Q8): wrap/unwrap per-node Ed25519 private keys.
+ *   - Per-node key binding (Q8): wrap/unwrap per-node Ed25519 private keys.
  *   - Sync RPC + Q6 agent-state-transfer wrapping.
  *
  * The lifecycle module is additive on top of the mesh foundation. It does not
@@ -29,7 +29,7 @@ export {
   wrapNodePrivateKey,
   unwrapNodePrivateKey,
   InMemoryNodeKeyStore,
-} from "./cocoon-binding.js";
+} from "./node-key-binding.js";
 export {
   FileNodeKeyStore,
   FileCounterStore,

@@ -348,9 +348,9 @@ Four canonical policy slots:
 - outputs: governs what the agent may emit to external surfaces (files, APIs, messages).
 
 Key concepts:
-- Fortress: the operator-owned sovereignty harness. All state is encrypted at rest under the cocoon.
-- Cocoon: master-key-wrapped storage derived from the operator's passphrase via Argon2id.
-- Identity: Ed25519 keypair with a DID, owned by the operator. Private keys never leave the cocoon.
+- Fortress: the operator-owned sovereignty harness. All state is encrypted at rest under the master key.
+- Encrypted state store: master-key-wrapped storage derived from the operator's passphrase via Argon2id.
+- Identity: Ed25519 keypair with a DID, owned by the operator. Private keys never leave the encrypted state store.
 - Audit log: append-only encrypted blobs, sequential, recording every gate decision and tool call.
 - Wrapped agent: any agent runtime that connects to Sanctuary as an MCP client. Tier A (native), Tier B (adapter-wrapped), Tier C (escape hatch).
 

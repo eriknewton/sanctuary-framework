@@ -83,18 +83,6 @@ async function main(): Promise<void> {
     }
   }
 
-  if (args[0] === "cocoon") {
-    // Hidden deprecated alias. One-release grace period before removal.
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      `\n  Note: \`cocoon\` is deprecated. Use \`sanctuary protect\` instead.\n`
-    );
-    const { parseWrapArgs, runWrap } = await import("./wrap/cli.js");
-    const opts = parseWrapArgs(args.slice(1));
-    await runWrap(opts);
-    return;
-  }
-
   if (args[0] === "export-passphrase") {
     await runExportPassphrase(args.slice(1));
     return;
@@ -606,8 +594,6 @@ Subcommands:
                        nuke (destroys all state, fresh start).
                        Use "sanctuary reset-passphrase --help" for options.
 
-  cocoon               (deprecated, use "protect")
-
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
   SANCTUARY_FORTRESS_PATH           Operator-friendly alias for STORAGE_PATH
@@ -693,7 +679,6 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
       return true;
     case "protect":
     case "wrap":
-    case "cocoon":
       printWrapHelpEarly();
       return true;
     case "init": {

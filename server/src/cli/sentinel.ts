@@ -92,7 +92,7 @@ function printUsage(s: NodeJS.WritableStream): void {
   unsubscribe <sentinel-id>           Opt out.
   findings [opts]                     Read recent findings. Decrypts the
                                       sentinel findings store (uses the
-                                      same passphrase as the cocoon master
+                                      same passphrase as the fortress master
                                       key).
     --since <iso>                       Filter observed_at >= iso.
     --severity <info|warn|alert>        Filter by severity.

@@ -76,7 +76,7 @@ echo "outbound-audit: smoke fortress at $SMOKE_FORTRESS"
 echo "outbound-audit: soak window ${SOAK_SECONDS}s, platform $PLATFORM"
 
 # Boot Sanctuary against the smoke fortress. SANCTUARY_PASSPHRASE is set
-# inline so the cocoon unlocks without prompting; the smoke run is
+# inline so the fortress unlocks without prompting; the smoke run is
 # disposable, so the passphrase value does not matter beyond entropy.
 export SANCTUARY_STORAGE_PATH="$SMOKE_FORTRESS"
 export SANCTUARY_PASSPHRASE="audit-smoke-passphrase-$(date +%s)"

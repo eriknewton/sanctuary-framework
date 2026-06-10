@@ -1563,7 +1563,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
-   * Enable Fortress View (Cocoon mode) with the given upstream server count.
+   * Enable Fortress View (proxy mode) with the given upstream server count.
    * Once enabled, the root path `/` serves the Fortress View instead of the
    * standard dashboard. The standard dashboard remains available at `/dashboard`.
    */
