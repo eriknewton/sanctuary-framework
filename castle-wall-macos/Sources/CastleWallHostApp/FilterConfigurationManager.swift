@@ -33,10 +33,36 @@ final class FilterConfigurationManager: NSObject, ObservableObject {
         }
     }
 
-    private let extensionBundleIdentifier = "ai.sanctuaryprotocol.macos.castle-wall"
-    private let localizedDescription = "Sanctuary Castle Wall"
+    static let extensionBundleIdentifier = "ai.sanctuaryprotocol.macos.castle-wall"
+    static let localizedDescription = "Sanctuary Castle Wall"
 
     @Published var filterState: FilterState = .unknown
+
+    /// Single source of truth for the desired provider configuration, shared
+    /// by the GUI enable path and the headless CLI (HeadlessFilterCLI) so the
+    /// two arming surfaces cannot drift.
+    static func applyDesiredProviderConfiguration(to manager: NEFilterManager) {
+        if manager.providerConfiguration == nil {
+            let config = NEFilterProviderConfiguration()
+            config.filterPackets = false
+            config.filterSockets = true
+            config.filterDataProviderBundleIdentifier = extensionBundleIdentifier
+            manager.providerConfiguration = config
+            manager.localizedDescription = localizedDescription
+        }
+
+        // Preserve existing TCP connections across the startFilter
+        // arming window. Without this (default false), every socket
+        // open at the moment the filter starts is forcibly closed by
+        // the kernel -- including SSH from a remote console, which
+        // makes drill iteration impossible. Set via KVC because the
+        // property is exposed publicly on the configuration class on
+        // recent macOS but not always surfaced in older SDK headers.
+        manager.providerConfiguration?.setValue(
+            true,
+            forKey: "preserveExistingConnections"
+        )
+    }
 
     func refresh() {
         filterState = .loading
@@ -68,26 +94,7 @@ final class FilterConfigurationManager: NSObject, ObservableObject {
                     return
                 }
 
-                if NEFilterManager.shared().providerConfiguration == nil {
-                    let config = NEFilterProviderConfiguration()
-                    config.filterPackets = false
-                    config.filterSockets = true
-                    config.filterDataProviderBundleIdentifier = self.extensionBundleIdentifier
-                    NEFilterManager.shared().providerConfiguration = config
-                    NEFilterManager.shared().localizedDescription = self.localizedDescription
-                }
-
-                // Preserve existing TCP connections across the startFilter
-                // arming window. Without this (default false), every socket
-                // open at the moment the filter starts is forcibly closed by
-                // the kernel -- including SSH from a remote console, which
-                // makes drill iteration impossible. Set via KVC because the
-                // property is exposed publicly on the configuration class on
-                // recent macOS but not always surfaced in older SDK headers.
-                NEFilterManager.shared().providerConfiguration?.setValue(
-                    true,
-                    forKey: "preserveExistingConnections"
-                )
+                Self.applyDesiredProviderConfiguration(to: NEFilterManager.shared())
 
                 NEFilterManager.shared().isEnabled = true
                 NEFilterManager.shared().saveToPreferences { [weak self] saveError in

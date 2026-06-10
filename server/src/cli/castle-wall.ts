@@ -1,7 +1,8 @@
-import { execSync as nodeExecSync } from "node:child_process";
+import { execFile as nodeExecFile, execSync as nodeExecSync } from "node:child_process";
 import { createConnection } from "node:net";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
@@ -44,6 +45,12 @@ export interface CastleWallCommandContext {
   signerClientPath?: string;
   /** Override the shim runner (tests drive re-pin without a real helper). */
   signerClientInvoke?: ShimInvoker;
+  /** Override the host-app headless runner (tests drive enable/disable without the real app). */
+  hostAppInvoke?: HostAppInvoker;
+  /** Override the host-app binary probe list (tests). */
+  hostAppCandidates?: string[];
+  /** Override the daemon-socket reachability probe (tests). */
+  daemonProbe?: (socketPath: string) => Promise<boolean>;
 }
 
 export interface CastleWallParsedArgs {
@@ -51,7 +58,25 @@ export interface CastleWallParsedArgs {
   since?: string;
   scope?: "once" | "session" | "always";
   requestId?: string;
+  force?: boolean;
 }
+
+/** Runs the host-app binary in headless mode; mirrors execFile semantics. */
+export type HostAppInvoker = (
+  binaryPath: string,
+  args: string[],
+) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+
+/** JSON line emitted by `CastleWallHostApp --headless <action>` (HeadlessFilterCLI.Report). */
+interface HeadlessReport {
+  ok: boolean;
+  action: string;
+  state: "enabled" | "disabled" | "needs_user_approval" | "unknown";
+  error?: string;
+}
+
+/** Exit-code contract with HeadlessFilterCLI.ExitCode (Swift side). */
+const HEADLESS_EXIT_NEEDS_APPROVAL = 3;
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
@@ -869,6 +894,297 @@ export async function runConfigureOrigin(
   }
 }
 
+const HOST_APP_RELATIVE_BINARY =
+  "Sanctuary-CastleWall.app/Contents/MacOS/CastleWallHostApp";
+
+function defaultHostAppCandidates(env: NodeJS.ProcessEnv): string[] {
+  const home = env.HOME ?? homedir();
+  return [
+    `/Applications/${HOST_APP_RELATIVE_BINARY}`,
+    `${home}/Applications/${HOST_APP_RELATIVE_BINARY}`,
+  ];
+}
+
+/**
+ * True iff `path` is an existing regular file owned by root or the current
+ * user (mirrors SanctuaryServerBridge.isOwnerTrustedExecutable on the Swift
+ * side): prevents invoking a binary an attacker dropped at a probed path.
+ */
+async function isOwnerTrustedExecutable(
+  path: string,
+  getuid: (() => number) | undefined,
+): Promise<boolean> {
+  try {
+    const info = await stat(path);
+    if (!info.isFile()) return false;
+    const uid = getuid?.();
+    return info.uid === 0 || (uid !== undefined && info.uid === uid);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the Castle Wall host-app binary that owns the NE filter
+ * configuration. Only that signed binary can toggle the filter without
+ * re-triggering the one-time consent, so this is the single arming surface.
+ * SANCTUARY_CASTLE_HOSTAPP overrides; an invalid override fails loud rather
+ * than silently falling through to a different binary.
+ */
+async function resolveHostAppBinary(
+  env: NodeJS.ProcessEnv,
+  ctx: CastleWallCommandContext,
+): Promise<{ path: string } | { error: string }> {
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
+  const override = env.SANCTUARY_CASTLE_HOSTAPP;
+  if (override) {
+    if (await isOwnerTrustedExecutable(override, getuid)) {
+      return { path: override };
+    }
+    return {
+      error: `SANCTUARY_CASTLE_HOSTAPP is set but does not point at a trusted executable: ${override}`,
+    };
+  }
+  const candidates = ctx.hostAppCandidates ?? defaultHostAppCandidates(env);
+  for (const candidate of candidates) {
+    if (await isOwnerTrustedExecutable(candidate, getuid)) {
+      return { path: candidate };
+    }
+  }
+  return {
+    error:
+      "Castle Wall app not found (looked in /Applications and ~/Applications). " +
+      "Install Sanctuary-CastleWall.app or set SANCTUARY_CASTLE_HOSTAPP to its " +
+      `Contents/MacOS/CastleWallHostApp binary.`,
+  };
+}
+
+function defaultHostAppInvoke(
+  binaryPath: string,
+  args: string[],
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  return new Promise((resolvePromise) => {
+    nodeExecFile(
+      binaryPath,
+      args,
+      { encoding: "utf8", timeout: 90_000 },
+      (error, stdout, stderr) => {
+        let exitCode = 0;
+        if (error) {
+          exitCode =
+            typeof error.code === "number"
+              ? error.code
+              : // Spawn failure (ENOENT/EACCES/timeout kill): no exit code exists.
+                -1;
+        }
+        resolvePromise({ stdout: stdout ?? "", stderr: stderr ?? "", exitCode });
+      },
+    );
+  });
+}
+
+function parseHeadlessReport(stdout: string): HeadlessReport | null {
+  const lines = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const last = lines[lines.length - 1];
+  if (!last) return null;
+  try {
+    const parsed = JSON.parse(last) as Partial<HeadlessReport>;
+    if (typeof parsed.ok !== "boolean" || typeof parsed.state !== "string") {
+      return null;
+    }
+    return parsed as HeadlessReport;
+  } catch {
+    return null;
+  }
+}
+
+function defaultDaemonProbe(socketPath: string): Promise<boolean> {
+  return new Promise((resolvePromise) => {
+    let settled = false;
+    const socket = createConnection(socketPath);
+    const finish = (reachable: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolvePromise(reachable);
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    setTimeout(() => finish(false), 1_500).unref();
+  });
+}
+
+/**
+ * Best-effort audit record for a CLI arm/disarm. Never blocks the operation:
+ * disarm especially is the dead-man recovery lever and must not depend on a
+ * decryptable audit log (the authoritative filter_started/filter_stopped
+ * events come from the daemon path). A failed write degrades to a warning.
+ */
+async function appendArmAuditBestEffort(
+  action: "enable" | "disable",
+  verifiedState: string,
+  forced: boolean,
+  fortressPath: string,
+  env: NodeJS.ProcessEnv,
+  err: Writable,
+): Promise<void> {
+  try {
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveMasterKey(fortressPath, env);
+    const auditLog = new AuditLog(storage, masterKey);
+    await auditLog.append(
+      "l1",
+      "operator_decision",
+      fortressIdFromStoragePath(fortressPath),
+      {
+        source: "castle-wall-cli",
+        action,
+        verified_state: verifiedState,
+        forced,
+      },
+      "success",
+    );
+    await auditLog.flush();
+    masterKey.fill(0);
+  } catch (error) {
+    write(
+      err,
+      `Warning: filter state changed but the audit entry could not be written (${
+        error instanceof Error ? error.message : String(error)
+      }). Corroborate via 'sanctuary castle-wall audit-dump' once the fortress key is available.\n`,
+    );
+  }
+}
+
+const NEEDS_APPROVAL_GUIDANCE =
+  "The one-time macOS content-filter consent has not been granted on this machine.\n" +
+  "That single step is GUI-only (macOS requirement): at the console, launch\n" +
+  "Sanctuary-CastleWall.app once and click Allow on the content-filter prompt.\n" +
+  "After that, every arm/disarm works headlessly.\n";
+
+async function runArmDisarm(
+  action: "enable" | "disable",
+  argv: string[],
+  ctx: CastleWallCommandContext,
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const platform = ctx.platform ?? process.platform;
+
+  if (platform !== "darwin") {
+    write(err, `castle-wall ${action} is macOS-only.\n`);
+    return 1;
+  }
+
+  const parsed = parseCastleWallArgs(argv);
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+
+  if (action === "enable" && !parsed.force) {
+    // Brick-condition gate: filter on + no policy daemon = deny-all with no
+    // recovery channel (the 2026-06-09 Hermes drill lockout). Refuse to arm
+    // unless the daemon socket answers, or the operator explicitly overrides.
+    const socketPath = resolveCastleWallSocketPath({
+      platform,
+      fortressPath,
+    }).path;
+    const probe = ctx.daemonProbe ?? defaultDaemonProbe;
+    if (!(await probe(socketPath))) {
+      write(
+        err,
+        `Refusing to arm: no Castle Wall daemon is reachable for this fortress (${socketPath}).\n` +
+          "Arming without a policy daemon fail-closes this machine to deny-all\n" +
+          "(filter on + daemon down = locked out, including SSH).\n" +
+          "Start the daemon first:  sanctuary castle-wall daemon\n" +
+          "Or pass --force if the daemon is supervised out-of-band.\n",
+      );
+      return 1;
+    }
+  }
+
+  const resolved = await resolveHostAppBinary(env, ctx);
+  if ("error" in resolved) {
+    write(err, `${resolved.error}\n`);
+    return 1;
+  }
+
+  const invoke = ctx.hostAppInvoke ?? defaultHostAppInvoke;
+  const result = await invoke(resolved.path, ["--headless", action]);
+  const report = parseHeadlessReport(result.stdout);
+
+  if (result.exitCode === HEADLESS_EXIT_NEEDS_APPROVAL) {
+    write(err, NEEDS_APPROVAL_GUIDANCE);
+    return 3;
+  }
+  if (result.exitCode !== 0 || !report || !report.ok) {
+    const detail =
+      report?.error ||
+      result.stderr.trim() ||
+      `host app exited with code ${result.exitCode}`;
+    write(err, `castle-wall ${action} failed: ${detail}\n`);
+    return 1;
+  }
+
+  // Post-change corroboration: re-read the live NE configuration through the
+  // host app rather than trusting the mutation call's own report.
+  const verify = await invoke(resolved.path, ["--headless", "status"]);
+  const verifyReport = parseHeadlessReport(verify.stdout);
+  const expectedState = action === "enable" ? "enabled" : "disabled";
+  if (verify.exitCode !== 0 || verifyReport?.state !== expectedState) {
+    write(
+      err,
+      `castle-wall ${action}: state change reported but post-change verification ` +
+        `returned '${verifyReport?.state ?? "unparseable"}' (expected '${expectedState}').\n`,
+    );
+    return 1;
+  }
+
+  await appendArmAuditBestEffort(
+    action,
+    verifyReport.state,
+    parsed.force ?? false,
+    fortressPath,
+    env,
+    err,
+  );
+
+  if (action === "enable") {
+    write(out, "Castle Wall armed: content filter enabled (verified via host-app status).\n");
+  } else {
+    write(out, "Castle Wall disarmed: content filter disabled (verified via host-app status).\n");
+  }
+  return 0;
+}
+
+/**
+ * Headlessly arm the Castle Wall content filter (`sanctuary castle-wall
+ * enable`). Drives the signed host-app binary's --headless mode, so it works
+ * over SSH once the one-time GUI consent exists. Gated on daemon
+ * reachability to avoid the deny-all brick condition; --force overrides.
+ */
+export async function runEnable(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  return runArmDisarm("enable", argv, ctx);
+}
+
+/**
+ * Headlessly disarm the Castle Wall content filter (`sanctuary castle-wall
+ * disable`). Unconditional by design: this is the remote dead-man lever that
+ * makes SSH-only drills recoverable, so it has no preconditions beyond the
+ * binary existing.
+ */
+export async function runDisable(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  return runArmDisarm("disable", argv, ctx);
+}
+
 export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
   const parsed: CastleWallParsedArgs = {};
   for (let i = 0; i < argv.length; i++) {
@@ -881,6 +1197,8 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       parsed.scope = parseScope(arg.slice("--scope=".length));
     } else if (arg === "--scope") {
       parsed.scope = parseScope(argv[++i]);
+    } else if (arg === "--force") {
+      parsed.force = true;
     } else if (!arg.startsWith("-") && !parsed.requestId) {
       parsed.requestId = arg;
     }
