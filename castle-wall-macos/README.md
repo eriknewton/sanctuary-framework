@@ -186,20 +186,42 @@ sanctuary castle-wall enable --force
 sanctuary castle-wall disable      # disarm; unconditional dead-man lever
 ```
 
-Under the hood this runs
-`Sanctuary-CastleWall.app/Contents/MacOS/CastleWallHostApp --headless <enable|disable|status>`,
-which prints one JSON line and exits 0 (success), 1 (failure), 2 (usage),
-3 (needs the one-time consent), or 4 (NE preferences timeout). Running the
-host-app binary itself is load-bearing: the NE content-filter configuration
-is owned by the signed app identity that created it, so only that binary can
-toggle `NEFilterManager.isEnabled` without re-prompting. The headless path
-never initializes SwiftUI, so it needs no WindowServer and works over SSH.
+Under the hood this launches the app through LaunchServices:
+`open -n -W Sanctuary-CastleWall.app --args --headless <enable|disable|status> --report-file=<tmp>`.
+The host app prints one JSON line and exits 0 (success), 1 (failure), 2
+(usage), 3 (needs the one-time consent), or 4 (NE preferences timeout).
+Running the host-app binary itself is load-bearing: the NE content-filter
+configuration is owned by the signed app identity that created it, so only
+that binary can toggle `NEFilterManager.isEnabled` without re-prompting. The
+headless path never initializes SwiftUI, so it needs no WindowServer and works
+over SSH.
 
-The ONE remaining GUI step is the initial content-filter consent (once per
-install, a macOS requirement): launch the app at the console once and click
-Allow. After that, remote drills can arm with a delivered policy and disarm
-again without any console click, and a remote dead-man auto-disarm is just a
-scheduled `sanctuary castle-wall disable`.
+**Why LaunchServices and not a direct exec (macOS Tahoe).** On macOS Tahoe
+(26.x), a directly-exec'd binary cannot reach NE preferences:
+`NEFilterManager.loadFromPreferences` hangs indefinitely for any binary that
+was not started as a LaunchServices instance (console or SSH alike). Launching
+through `open` runs the app as a proper LaunchServices instance, which CAN
+reach NE prefs. Because `open` does not relay the child's stdout, the host app
+also writes its JSON report to the caller-supplied `--report-file`; the CLI
+reads that file back, and fail-closes to a generic failure if it is missing,
+empty, or unparseable. (Mini1 Tahoe drill, 2026-06-10, finding 1.)
+
+The remaining GUI steps are console-only macOS requirements, each done once
+per install:
+
+1. **Content-filter consent.** Launch the app at the console once and click
+   Allow on the content-filter prompt. Until this is granted, `enable` exits
+   3 with recovery instructions.
+2. **System-extension toggle (Tahoe).** On macOS Tahoe the Castle Wall system
+   extension ships toggled OFF and must be switched on once at the console:
+   System Settings > General > Login Items & Extensions > Network Extensions >
+   Castle Wall. Until this is on, `enable` detects the `[activated disabled]`
+   state, exits 4, and prints toggle instructions rather than saving an NE
+   configuration that would never enforce.
+
+After both one-time steps, remote drills can arm with a delivered policy and
+disarm again without any console click, and a remote dead-man auto-disarm is
+just a scheduled `sanctuary castle-wall disable`.
 
 `enable` refuses to arm when no Castle Wall daemon answers on the fortress
 socket, because filter-on + daemon-down fail-closes the machine to deny-all

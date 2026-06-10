@@ -61,6 +61,59 @@ final class HeadlessFilterCLITests: XCTestCase {
         }
     }
 
+    // MARK: - report-file (LaunchServices/Tahoe round-trip)
+
+    func testParseReportFilePath() {
+        let result = HeadlessFilterCLI.parse(
+            ["app", "--headless", "enable", "--report-file=/tmp/cw-report.json"]
+        )
+        guard case let .invocation(invocation)? = result else {
+            return XCTFail("expected invocation, got \(String(describing: result))")
+        }
+        XCTAssertEqual(invocation.reportFilePath, "/tmp/cw-report.json")
+        XCTAssertEqual(invocation.action, .enable)
+    }
+
+    func testParseReportFileDefaultsToNil() {
+        let result = HeadlessFilterCLI.parse(["app", "--headless", "status"])
+        guard case let .invocation(invocation)? = result else {
+            return XCTFail("expected invocation, got \(String(describing: result))")
+        }
+        XCTAssertNil(invocation.reportFilePath)
+    }
+
+    func testParseEmptyReportFileIsUsageError() {
+        guard case let .usageError(message)? =
+            HeadlessFilterCLI.parse(["app", "--headless", "enable", "--report-file="]) else {
+            return XCTFail("expected usageError for empty --report-file")
+        }
+        XCTAssertTrue(message.contains("--report-file"))
+    }
+
+    func testWriteReportFileWritesValidJSONLine() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cw-report-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("report.json").path
+
+        let report = HeadlessFilterCLI.Report(
+            ok: true, action: "enable", state: "enabled", error: nil
+        )
+        let line = HeadlessFilterCLI.encode(report)
+        HeadlessFilterCLI.writeReportFile(line, to: path)
+
+        let contents = try String(contentsOfFile: path, encoding: .utf8)
+        let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        let data = Data(trimmed.utf8)
+        let decoded = try JSONDecoder().decode(HeadlessFilterCLI.Report.self, from: data)
+        XCTAssertEqual(decoded, report)
+
+        // 0600: only the owner can read the report the CLI reads back.
+        let attrs = try FileManager.default.attributesOfItem(atPath: path)
+        XCTAssertEqual((attrs[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+    }
+
     // MARK: - report encoding
 
     func testReportEncodingIsSingleStableJSONLine() {

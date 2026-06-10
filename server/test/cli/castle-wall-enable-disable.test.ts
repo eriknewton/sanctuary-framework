@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -9,10 +9,12 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
 import {
+  makeLaunchServicesHostAppInvoke,
   parseCastleWallArgs,
   runDisable,
   runEnable,
   type HostAppInvoker,
+  type OpenRunner,
 } from "../../src/cli/castle-wall.js";
 
 class CaptureStream extends Writable {
@@ -108,6 +110,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       platform: "darwin",
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
+      sysextProbe: async () => "[activated enabled]",
       daemonProbe: async () => {
         throw new Error("probe must not run under --force");
       },
@@ -135,6 +138,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       platform: "darwin",
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
+      sysextProbe: async () => "[activated enabled]",
       daemonProbe: async () => true,
     });
     expect(code).toBe(0);
@@ -199,6 +203,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       platform: "darwin",
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
+      sysextProbe: async () => "[activated enabled]",
       daemonProbe: async () => true,
     });
 
@@ -247,6 +252,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       platform: "darwin",
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
+      sysextProbe: async () => "[activated enabled]",
     });
 
     expect(code).toBe(1);
@@ -326,5 +332,218 @@ describe("castle-wall enable/disable CLI verbs", () => {
   it("parseCastleWallArgs understands --force", () => {
     expect(parseCastleWallArgs(["--force"]).force).toBe(true);
     expect(parseCastleWallArgs([]).force).toBeUndefined();
+  });
+
+  it("enable returns distinct exit 4 + toggle guidance when the sysext is activated-but-disabled", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable([], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      sysextProbe: async () => "[activated disabled]",
+    });
+
+    expect(code).toBe(4);
+    expect(err.text()).toContain("system extension is installed but toggled OFF");
+    expect(err.text()).toContain("Network Extensions");
+    // Never reaches the host app: nothing to arm over a disabled extension.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("disable ignores a disabled sysext (stays the unconditional dead-man lever)", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const { invoke, calls } = makeInvoker({
+      disable: { stdout: reportLine("disable", "disabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+    });
+
+    const code = await runDisable([], {
+      out,
+      err: new CaptureStream(),
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      sysextProbe: async () => {
+        throw new Error("disable must never consult the sysext probe");
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall disarmed");
+    expect(calls.map((c) => c[2])).toEqual(["disable", "status"]);
+  });
+
+  it("defaults to the LaunchServices invoker (routes arm through `open`) when none is injected", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const openArgs: string[][] = [];
+    const reportPath = join(tmpdir(), "sanctuary-cw-default-report.json");
+
+    // No hostAppInvoke: exercises the real default (LaunchServices) path,
+    // but with the `open` runner + report path stubbed so no process spawns.
+    const code = await runEnable(["--force"], {
+      out,
+      err: new CaptureStream(),
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      sysextProbe: async () => "[activated enabled]",
+      reportPathFactory: () => reportPath,
+      openRunner: async (command, args) => {
+        openArgs.push([command, ...args]);
+        // Simulate the host app writing its report, keyed off the action arg.
+        const action = args[args.indexOf("--headless") + 1]!;
+        const state = action === "status" ? "enabled" : "enabled";
+        await writeFile(reportPath, reportLine(action, state, true));
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall armed");
+    // Both the mutation and the post-change verification routed through `open`.
+    expect(openArgs).toHaveLength(2);
+    expect(openArgs[0]).toEqual([
+      "open",
+      "-n",
+      "-W",
+      hostAppPath, // no `.app` in the temp fixture path → bundle resolves to the binary
+      "--args",
+      "--headless",
+      "enable",
+      `--report-file=${reportPath}`,
+    ]);
+    expect(openArgs[1]!.slice(-2)).toEqual(["status", `--report-file=${reportPath}`]);
+  });
+});
+
+describe("makeLaunchServicesHostAppInvoke", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  async function tmp(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-cw-ls-"));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  const APP_BINARY =
+    "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/CastleWallHostApp";
+
+  it("resolves the .app bundle, round-trips the report file, and derives exit 0", async () => {
+    const dir = await tmp();
+    const reportPath = join(dir, "report.json");
+    let captured: string[] = [];
+    const openRunner: OpenRunner = async (_command, args) => {
+      captured = args;
+      await writeFile(reportPath, reportLine("enable", "enabled", true));
+      return { stdout: "", stderr: "", exitCode: 0 };
+    };
+
+    const invoke = makeLaunchServicesHostAppInvoke({
+      timeoutMs: 1000,
+      openRunner,
+      reportPathFactory: () => reportPath,
+    });
+    const result = await invoke(APP_BINARY, ["--headless", "enable"]);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout.trim()).state).toBe("enabled");
+    expect(captured).toEqual([
+      "-n",
+      "-W",
+      "/Applications/Sanctuary-CastleWall.app",
+      "--args",
+      "--headless",
+      "enable",
+      `--report-file=${reportPath}`,
+    ]);
+    // The temp report file is cleaned up after the round-trip.
+    await expect(readFile(reportPath, "utf8")).rejects.toThrow();
+  });
+
+  it("fail-closes (exit 1) when the host app writes no report file", async () => {
+    const dir = await tmp();
+    const reportPath = join(dir, "missing.json");
+    const invoke = makeLaunchServicesHostAppInvoke({
+      timeoutMs: 1000,
+      reportPathFactory: () => reportPath,
+      openRunner: async () => ({ stdout: "", stderr: "boom", exitCode: 0 }),
+    });
+
+    const result = await invoke(APP_BINARY, ["--headless", "enable"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("no report");
+    expect(result.stderr).toContain("Network Extensions");
+  });
+
+  it("fail-closes (exit 1) when the report file is unparseable", async () => {
+    const dir = await tmp();
+    const reportPath = join(dir, "garbage.json");
+    const invoke = makeLaunchServicesHostAppInvoke({
+      timeoutMs: 1000,
+      reportPathFactory: () => reportPath,
+      openRunner: async () => {
+        await writeFile(reportPath, "not json at all\n");
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    });
+
+    const result = await invoke(APP_BINARY, ["--headless", "enable"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("unparseable");
+  });
+
+  it("maps a needs_user_approval report to exit 3", async () => {
+    const dir = await tmp();
+    const reportPath = join(dir, "approval.json");
+    const invoke = makeLaunchServicesHostAppInvoke({
+      timeoutMs: 1000,
+      reportPathFactory: () => reportPath,
+      openRunner: async () => {
+        await writeFile(
+          reportPath,
+          reportLine("enable", "needs_user_approval", false, "consent missing"),
+        );
+        return { stdout: "", stderr: "", exitCode: 3 };
+      },
+    });
+
+    const result = await invoke(APP_BINARY, ["--headless", "enable"]);
+    expect(result.exitCode).toBe(3);
+  });
+
+  it("maps an ok:false report to exit 1", async () => {
+    const dir = await tmp();
+    const reportPath = join(dir, "fail.json");
+    const invoke = makeLaunchServicesHostAppInvoke({
+      timeoutMs: 1000,
+      reportPathFactory: () => reportPath,
+      openRunner: async () => {
+        await writeFile(
+          reportPath,
+          reportLine("enable", "unknown", false, "saveToPreferences failed"),
+        );
+        return { stdout: "", stderr: "", exitCode: 1 };
+      },
+    });
+
+    const result = await invoke(APP_BINARY, ["--headless", "enable"]);
+    expect(result.exitCode).toBe(1);
   });
 });
