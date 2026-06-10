@@ -142,7 +142,7 @@ $SANCTUARY_STORAGE_PATH/
 │   ├── _identities/*.enc         # Ed25519 keypairs + DIDs
 │   ├── _audit/*.enc              # encrypted audit log entries
 │   ├── _reputation/*.enc         # signed attestations
-│   ├── _context_gate_policies/   # L2 context-gating policies
+│   ├── _context_gate_policies/   # Operational context-gating policies
 │   └── <user-namespace>/*.enc    # state_write values
 └── backup/
     ├── wrap-meta.json            # unwrap pointer (legacy-named pointers from earlier releases still readable)

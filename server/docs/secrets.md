@@ -177,7 +177,7 @@ SANCTUARY_PASSPHRASE=... sanctuary secrets list
 
 ### Audit retention
 
-Broker audit entries are stored in the Sanctuary AuditLog (the same one used by L1/L2/L4 operations). Retention defaults: 100 MB or 100,000 entries, whichever is reached first. Oldest entries are pruned when the cap is hit.
+Broker audit entries are stored in the Sanctuary AuditLog (the same one used by Cognitive, Operational, and Verifiable Reputation operations). Retention defaults: 100 MB or 100,000 entries, whichever is reached first. Oldest entries are pruned when the cap is hit.
 
 ### Rotation
 

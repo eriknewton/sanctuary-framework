@@ -50,7 +50,7 @@ AND in the provider's substrate client.
 ### Operator-visible audit
 
 Every outbound substrate call emits a
-`query_anonymity_headers_stripped` L2 audit event with:
+`query_anonymity_headers_stripped` Operational audit event with:
 
 ```json
 {

@@ -402,7 +402,7 @@ AuditEntry {
 }
 ```
 
-**Crypto-agility (per thesis §3 L1 commitment).** The `signature_scheme` field is mandatory at v1.0 even though only one value (`"ed25519-v1"`) is valid. At v1.x, hybrid signing introduces `"ed25519+ml-dsa-v1"`. v1.0 verifiers reject unknown schemes; v1.x verifiers accept both. This is the migration hinge for post-quantum.
+**Crypto-agility (per thesis §3 Cognitive-layer commitment).** The `signature_scheme` field is mandatory at v1.0 even though only one value (`"ed25519-v1"`) is valid. At v1.x, hybrid signing introduces `"ed25519+ml-dsa-v1"`. v1.0 verifiers reject unknown schemes; v1.x verifiers accept both. This is the migration hinge for post-quantum.
 
 ### 5.4 Audit replicas
 

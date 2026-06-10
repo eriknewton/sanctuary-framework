@@ -185,7 +185,7 @@ Sanctuary's encrypted state remains in `~/.sanctuary/` until manually deleted.
 
 ## Audit Log Location
 
-Audit log entries are stored as individually encrypted `.enc` files inside the L1
+Audit log entries are stored as individually encrypted `.enc` files inside the Cognitive-layer
 state store at `~/.sanctuary/state/_audit/`: not a plaintext log directory. You
 cannot `cat` or `grep` the audit log directly; use the `audit_export_siem` MCP tool
 to decrypt and export entries. The `~/.sanctuary/audit/` path referenced in some

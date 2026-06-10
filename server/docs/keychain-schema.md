@@ -1,7 +1,7 @@
 # Keychain Schema and Unlock Flow
 
 This document is the canonical reference for how Sanctuary stores and retrieves
-the per-tenant passphrase used to derive the master key for L1-encrypted state.
+the per-tenant passphrase used to derive the master key for Cognitive-layer-encrypted state.
 It describes what lives where on macOS, Linux, and Windows, and how the boot
 path turns "user enters a passphrase" into "identity decrypted."
 

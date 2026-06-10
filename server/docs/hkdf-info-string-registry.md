@@ -42,17 +42,17 @@ Every entry in §B and §C below routes through one of these two helpers OR call
 | Info string | Owner module | Constant name (if any) | Purpose |
 |---|---|---|---|
 | `identity-encryption` | `server/src/l1-cognitive/tools.ts:82`, `server/src/l4-reputation/tools.ts:35`, `server/src/handshake/protocol.ts:96`, `server/src/exit/bundle.ts:524` | (literal) | Wraps Ed25519 identity private keys at rest. |
-| `audit-log` | `server/src/l2-operational/audit-log.ts:68` | (literal) | Encrypts the L2 audit log. |
-| `principal-baseline` | `server/src/principal-policy/baseline.ts:40` | (literal) | Encrypts the L2 baseline-tracker store. |
-| `l2-privacy-policies-v1` | `server/src/l2-operational/privacy-core.ts:157` | (literal) | Encrypts L2 privacy policy state. |
+| `audit-log` | `server/src/l2-operational/audit-log.ts:68` | (literal) | Encrypts the Operational audit log. |
+| `principal-baseline` | `server/src/principal-policy/baseline.ts:40` | (literal) | Encrypts the Operational baseline-tracker store. |
+| `l2-privacy-policies-v1` | `server/src/l2-operational/privacy-core.ts:157` | (literal) | Encrypts Operational privacy policy state. |
 | `sanctuary-v1.1-privacy-content-hmac` | `server/src/l2-operational/privacy-core.ts:225` | (literal) | HMAC key for privacy-content fingerprints. |
-| `l2-privacy-placeholders` | `server/src/l2-operational/privacy-filter.ts:241` | (literal) | Encrypts L2 placeholder store. |
+| `l2-privacy-placeholders` | `server/src/l2-operational/privacy-filter.ts:241` | (literal) | Encrypts Operational placeholder store. |
 | `l2-privacy-placeholder-lookup` | `server/src/l2-operational/privacy-filter.ts:242` | (literal) | Lookup-key derivation for placeholder reverse index. |
 | `l2-context-gate` | `server/src/l2-operational/context-gate.ts:320` | (literal) | Encrypts the context-gate policy store. |
-| `l3-policies` | `server/src/l3-disclosure/policies.ts:140` | (literal) | Encrypts L3 disclosure policy store. |
-| `l3-commitments` | `server/src/l3-disclosure/commitments.ts:108` | (literal) | Encrypts L3 commitment store. |
+| `l3-policies` | `server/src/l3-disclosure/policies.ts:140` | (literal) | Encrypts Selective Disclosure policy store. |
+| `l3-commitments` | `server/src/l3-disclosure/commitments.ts:108` | (literal) | Encrypts Selective Disclosure commitment store. |
 | `bridge-commitments` | `server/src/bridge/tools.ts:44` | (literal) | Encrypts Concordia-bridge commitment store. |
-| `l4-reputation` | `server/src/l4-reputation/reputation-store.ts:202` | (literal) | Encrypts L4 reputation store. |
+| `l4-reputation` | `server/src/l4-reputation/reputation-store.ts:202` | (literal) | Encrypts Verifiable Reputation store. |
 | `sovereignty-profile` | `server/src/sovereignty-profile.ts:79` | `HKDF_DOMAIN` | Encrypts the sovereignty profile store. |
 | `intelligence-substrate-config` | `server/src/intelligence/policy-store.ts:39` | `HKDF_INFO` | Encrypts the intelligence-substrate policy store. |
 | `operator-chat-store-v1` | `server/src/chat/operator-chat-store.ts:40` | `HKDF_INFO` | Encrypts the operator-chat (concierge) store. |
@@ -65,7 +65,7 @@ Every entry in §B and §C below routes through one of these two helpers OR call
 |---|---|---|---|
 | `sanctuary-fortress-mode-v1` | `server/src/fortress/config.ts:44` (constant defined at `fortress/constants.ts:156`) | `HKDF_FORTRESS_MODE_INFO` | Encrypts the fortress-mode config store. |
 | `sanctuary-composition-v1` | `server/src/composition/constants.ts:149` | `HKDF_COMPOSITION_INFO` | Encrypts composition config and per-composition state. |
-| `<arbitrary state-namespace name>` | `server/src/l1-cognitive/state-store.ts:171` | (caller-supplied) | Per-namespace L1 state encryption. The namespace name is the agent's namespace identifier. Underscore-prefixed namespaces (e.g. `_meta`, `_context_gate_policies`) are reserved for internal use. |
+| `<arbitrary state-namespace name>` | `server/src/l1-cognitive/state-store.ts:171` | (caller-supplied) | Per-namespace Cognitive-layer state encryption. The namespace name is the agent's namespace identifier. Underscore-prefixed namespaces (e.g. `_meta`, `_context_gate_policies`) are reserved for internal use. |
 
 ### D. Direct hkdf() callers (explicit salt + info)
 
