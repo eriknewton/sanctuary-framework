@@ -161,6 +161,12 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "federation") {
+    const { runFederationCommand } = await import("./cli/federation.js");
+    const code = await runFederationCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (
     args[0] === "verify-exit-bundle" ||
     args[0] === "import-exit-bundle"

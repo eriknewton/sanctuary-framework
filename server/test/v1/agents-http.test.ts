@@ -23,10 +23,7 @@ import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.j
 import { AuditLog } from "../../src/l2-operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import type { IdentityManager } from "../../src/l1-cognitive/tools.js";
-import {
-  buildChallengeMessage,
-  LOCAL_OPERATOR_ATTESTATION_REF,
-} from "../../src/v1/ceremony.js";
+import { buildChallengeMessage } from "../../src/v1/ceremony.js";
 import { signOperatorPayload } from "../../src/v1/operator-signed.js";
 import { toBase64url, fromBase64url } from "../../src/core/encoding.js";
 
@@ -108,22 +105,32 @@ async function startRig(opts?: { withOperatorIdentity?: boolean }): Promise<Test
   };
 }
 
+/**
+ * Open a session for the agents tests via post-unlock loopback auto-auth. The
+ * session attestation type is orthogonal to the agents endpoints under test
+ * (which gate writes on the independent OPERATOR_SIGNED signature); the
+ * durable-attestation path itself is covered in session-service.test.ts and
+ * v1-routing.test.ts. Auto-auth does NOT bypass the per-write operator
+ * signature, so the fail-closed write assertions still hold.
+ */
 async function openSession(rig: TestRig): Promise<string> {
+  rig.dashboard.setAutoAuthLocalhost(true);
   const privateKey = randomBytes(32);
   const publicKey = ed25519.getPublicKey(privateKey);
   const initRes = await fetch(`${rig.baseUrl}/v1/session/init`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      client_pubkey: toBase64url(publicKey),
-      operator_attestation: { type: "local_operator", token: rig.authToken },
-    }),
+    body: JSON.stringify({ client_pubkey: toBase64url(publicKey) }),
   });
-  const init = (await initRes.json()) as { challenge: string; challenge_id: string };
+  const init = (await initRes.json()) as {
+    challenge: string;
+    challenge_id: string;
+    attestation_ref: string;
+  };
   const message = buildChallengeMessage(
     publicKey,
     fromBase64url(init.challenge),
-    LOCAL_OPERATOR_ATTESTATION_REF,
+    init.attestation_ref,
   );
   const completeRes = await fetch(`${rig.baseUrl}/v1/session/complete`, {
     method: "POST",

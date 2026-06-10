@@ -21,13 +21,32 @@
 export const V1_CHALLENGE_SIGNATURE_DOMAIN = "sanctuary.v1.session.challenge";
 
 /**
- * Attestation reference recorded for the PR-A1 local-operator bridge
- * attestation (the caller proved possession of the dashboard operator
- * credential rather than presenting a durable Ed25519 operator
- * attestation — those arrive with the federation authorize ceremony in
- * PR-A3 and will carry real attestation ids here).
+ * Attestation references recorded into a session's claims and bound into the
+ * challenge message. PR-A3 REPLACED the PR-A1 temporary `local-operator`
+ * (dashboard-token-possession) reference with the durable references below;
+ * the token-possession path is gone, not stacked (see
+ * `session-service.ts` → `validateAttestation`).
+ *
+ * - {@link OPERATOR_ED25519_ATTESTATION_REF}: the caller presented a durable
+ *   Ed25519 operator attestation — an operator-identity signature binding the
+ *   ephemeral session client key. This is the SAME operator key custody that
+ *   backs the OPERATOR_SIGNED write path (PR-A2 agents protect/unprotect), so
+ *   opening a session and authorizing a write now trace to one operator key.
+ * - {@link LOOPBACK_OPERATOR_ATTESTATION_REF}: a same-box caller on a daemon
+ *   that enabled post-unlock loopback auto-auth. This is a network-POSITION
+ *   signal, never a credential a remote caller can present — it is not the
+ *   downgrade surface the token path was, because a same-box post-unlock
+ *   attacker already holds strictly more than a session token grants.
+ * - {@link AUTH_DISABLED_ATTESTATION_REF}: a same-box caller on a daemon with
+ *   NO operator identity configured at all (legacy auth-disabled dev mode);
+ *   loopback only, never a network caller.
+ *
+ * The init response echoes the recorded ref so the client signs the challenge
+ * over the exact ref the daemon bound — no client-side guessing across paths.
  */
-export const LOCAL_OPERATOR_ATTESTATION_REF = "local-operator";
+export const OPERATOR_ED25519_ATTESTATION_REF = "operator-ed25519";
+export const LOOPBACK_OPERATOR_ATTESTATION_REF = "loopback-operator";
+export const AUTH_DISABLED_ATTESTATION_REF = "auth-disabled-loopback";
 
 function lengthPrefixed(field: Uint8Array): Uint8Array {
   const out = new Uint8Array(4 + field.length);

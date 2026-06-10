@@ -12,10 +12,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Writable } from "node:stream";
 import { randomBytes } from "node:crypto";
 
+import { ed25519 } from "@noble/curves/ed25519";
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import { AuditLog } from "../../src/l2-operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { runStatusCommand, toYaml } from "../../src/cli/status.js";
+import { toBase64url } from "../../src/core/encoding.js";
 
 class Capture extends Writable {
   chunks: string[] = [];
@@ -194,20 +196,68 @@ describe("sanctuary status (CLI, /v1-backed)", () => {
     expect(err.text).toContain("daemon unavailable");
   });
 
-  it("exit 3 when the ceremony is denied (wrong operator token)", async () => {
-    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "wrong-token";
-    const err = new Capture();
-    const code = await runStatusCommand({
-      argv: [],
-      out: new Capture(),
-      err,
-      dashboardUrl: rig.baseUrl,
+  it("exit 3 when the ceremony is denied (operator identity required, no credential presentable)", async () => {
+    // PR-A3: the bearer-token attestation path is gone. A daemon WITH an
+    // operator identity configured (so it is not in auth-disabled dev mode)
+    // and WITHOUT loopback auto-auth requires a durable operator attestation
+    // the bare `sanctuary status` CLI cannot produce → the ceremony is denied.
+    const storage = new MemoryStorage();
+    const masterKey = randomBytes(32);
+    const auditLog = new AuditLog(storage, masterKey);
+    const port = 17000 + Math.floor(Math.random() * 20000);
+    const operatorPub = ed25519.getPublicKey(randomBytes(32));
+    const dashboard = new DashboardApprovalChannel({
+      port,
+      host: "127.0.0.1",
+      timeout_seconds: 30,
+      auth_token: `status-cli-test-${randomBytes(8).toString("hex")}`,
+      auto_open: false,
     });
-    expect(code).toBe(3);
-    expect(err.text).toContain("session ceremony denied");
-    // The denial must stay generic: no hint about WHICH check failed.
-    expect(err.text).not.toContain("attestation");
-    expect(err.text).not.toContain("challenge");
+    dashboard.setDependencies({
+      policy: {
+        version: 1,
+        tier1_always_approve: [],
+        tier3_auto_allow: [],
+        anomaly_thresholds: {
+          new_namespace: true,
+          unfamiliar_counterparty_window_days: 7,
+          frequency_spike_multiplier: 5,
+        },
+        approval_channel: { type: "stderr", timeout_seconds: 30 },
+      } as never,
+      baseline: { load: async () => {}, save: async () => {} } as never,
+      auditLog,
+      identityManager: {
+        getDefault: () => ({
+          identity_id: "op-1",
+          label: "operator",
+          did: "did:key:test",
+          public_key: toBase64url(operatorPub),
+          created_at: "2026-06-01T00:00:00.000Z",
+          key_type: "ed25519",
+          key_protection: "passphrase",
+        }),
+        getPrimaryIdentityId: () => "op-1",
+        get: () => undefined,
+      } as never,
+    });
+    await dashboard.start();
+    try {
+      const err = new Capture();
+      const code = await runStatusCommand({
+        argv: [],
+        out: new Capture(),
+        err,
+        dashboardUrl: `http://127.0.0.1:${port}`,
+      });
+      expect(code).toBe(3);
+      expect(err.text).toContain("session ceremony denied");
+      // The denial must stay generic: no hint about WHICH check failed.
+      expect(err.text).not.toContain("attestation");
+      expect(err.text).not.toContain("challenge");
+    } finally {
+      await dashboard.stop();
+    }
   });
 
   it("succeeds without an env token when loopback auto-auth is enabled", async () => {
