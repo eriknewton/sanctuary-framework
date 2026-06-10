@@ -8,6 +8,7 @@ import "./fixtures/substrate-trust/identity-signing.js";
 import "./fixtures/castle-wall/boundary-admission.js";
 import "./fixtures/castle-wall/custody-key-gate.js";
 import "./fixtures/castle-wall/deny-by-default.js";
+import "./fixtures/castle-wall/guest-jail-confinement.js";
 import "./fixtures/castle-wall/identity-signing-tool-registry-guard.js";
 import "./fixtures/castle-wall/sentinel-registration.js";
 import "./fixtures/audit-and-envelope/audit-chain-verifier.js";
