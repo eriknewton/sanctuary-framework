@@ -127,6 +127,29 @@ export class LmdbStorageBackend implements StorageBackend, SdwTransactional {
     return result as T;
   }
 
+  /**
+   * Synchronous, read-only ciphertext view for the D2 export path. The
+   * approval gate's `approvalTargetArgs` callback is synchronous, and the
+   * export-scope fingerprint must be computable at gate time without
+   * decrypting anything — LMDB range reads are synchronous under the hood,
+   * so this exposes them directly. Reads only; all writes stay behind the
+   * SDW write gate.
+   */
+  listNamespaceEntriesSync(
+    namespace: string,
+  ): ReadonlyArray<{ key: string; data: Uint8Array }> {
+    const start = compositeKey(namespace, "");
+    const end = `${compositeKey(namespace, "")}\uffff`;
+    const entries: Array<{ key: string; data: Uint8Array }> = [];
+    for (const entry of this.db.getRange({ start, end })) {
+      const parsed = splitCompositeKey(entry.key);
+      if (parsed === null || parsed.namespace !== namespace) continue;
+      if (!(entry.value instanceof Uint8Array)) continue;
+      entries.push({ key: parsed.key, data: new Uint8Array(entry.value) });
+    }
+    return entries;
+  }
+
   async close(): Promise<void> {
     await this.db.close();
   }
