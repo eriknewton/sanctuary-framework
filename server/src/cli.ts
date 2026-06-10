@@ -240,6 +240,20 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "transparency") {
+    const { runTransparencyCommand } = await import("./cli/transparency.js");
+    const code = await runTransparencyCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "verify-transparency") {
+    const { runVerifyTransparencyCommand } = await import(
+      "./cli/transparency.js"
+    );
+    const code = await runVerifyTransparencyCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "audit-chain") {
     const verb = args[1];
     const subArgs = args.slice(2);
@@ -539,6 +553,8 @@ Usage:
   sanctuary doctor [opts]                 # Local environment diagnostic
   sanctuary completion <bash|zsh|fish>    # Emit shell completion
   sanctuary audit search [opts]           # Search local audit log
+  sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
+  sanctuary verify-transparency [opts]    # Verify a checkpoint chain offline
   sanctuary generate systemd [opts]       # Emit systemd service unit
   sanctuary protect [opts]                 # Protect an agent in one command
   sanctuary wrap [opts]                   # (alias for protect)
@@ -577,6 +593,14 @@ Subcommands:
 
   audit                Search local audit history.
                        Use "sanctuary audit --help" for options.
+
+  transparency         Emit and export signed enforcement checkpoints
+                       (verifiable evidence the wall is enforcing).
+                       Use "sanctuary transparency --help" for options.
+
+  verify-transparency  Verify an exported checkpoint chain offline, or
+                       against the live audit log with --against-log.
+                       Use "sanctuary verify-transparency --help" for options.
 
   generate             Emit local deployment templates.
                        Use "sanctuary generate --help" for options.

@@ -67,7 +67,7 @@ It exits non-zero when the gate state is `gate_a_red`.
 
 PRs 2 through 4 add fixture modules that call `registerFixture(...)`.
 
-Each fixture maps to an `ASSURANCE_MATRIX.md` row by stable row ID. The current matrix does not carry a numeric ID column, so this harness assigns IDs `1` through `20` in table order.
+Each fixture maps to an `ASSURANCE_MATRIX.md` row by stable row ID. The current matrix does not carry a numeric ID column, so this harness assigns IDs `1` through `21` in table order. New rows MUST be appended at the END of the table so existing fixture claim IDs stay stable.
 
 Fixture modules should register side effects before `buildReport(...)` runs. The intended pattern is to import fixture modules at the top of `run.ts`:
 

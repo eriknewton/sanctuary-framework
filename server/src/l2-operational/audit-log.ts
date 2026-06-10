@@ -1088,6 +1088,33 @@ export class AuditLog {
   }
 
   /**
+   * Read-only verified view of the surviving hash chain, pairing each chained
+   * envelope's (sequence, entry_hash) with its decrypted entry. Used by the
+   * transparency emitter to compute the checkpoint Merkle root and the
+   * per-rule enforcement counters over the SAME entry set.
+   *
+   * Strict-mode integrity applies: if the chain fails verification this
+   * throws `AuditIntegrityError` — a transparency checkpoint must never be
+   * minted over a log that does not verify (fail closed, never degrade).
+   */
+  async verifiedChainView(): Promise<
+    Array<{ sequence: number; entry_hash: string; entry: AuditEntry }>
+  > {
+    await this.appendQueue;
+    await this.reloadPersistedEntries();
+    // this.entries is [legacy..., chained...] in order; the chained suffix
+    // aligns 1:1 with this.chainEntries (both built from the same load pass).
+    const chainedEntries = this.entries.slice(
+      this.entries.length - this.chainEntries.length
+    );
+    return this.chainEntries.map((chained, index) => ({
+      sequence: chained.sequence,
+      entry_hash: chained.entry_hash,
+      entry: chainedEntries[index]!,
+    }));
+  }
+
+  /**
    * Query the audit log with filtering.
    */
   async query(options: {
