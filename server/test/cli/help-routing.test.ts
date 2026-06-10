@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { runCli, CLI_SUBPROCESS_TEST_TIMEOUT_MS } from "./helpers/run-cli";
+import { runCli, runCliRaw, CLI_SUBPROCESS_TEST_TIMEOUT_MS } from "./helpers/run-cli";
 
 describe("CLI help routing", () => {
   it("sanctuary agents --help exits 0 without SANCTUARY_PASSPHRASE", async () => {
@@ -41,7 +41,12 @@ describe("CLI help routing", () => {
   }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);
 
   it("sanctuary castle-wall status runs without starting MCP", async () => {
-    const { code, stdout, stderr } = await runCli("castle-wall", "status");
+    // Point the host-app override at a path that cannot exist so status never
+    // probes a real installed Castle Wall app (slow + machine-dependent); an
+    // unresolvable binary makes the content-filter probe stay silent.
+    const { code, stderr } = await runCliRaw(["castle-wall", "status"], {
+      env: { SANCTUARY_CASTLE_HOSTAPP: "/nonexistent/CastleWallHostApp" },
+    });
 
     expect(code).toBe(0);
     expect(stderr).not.toContain("Sanctuary MCP Server");

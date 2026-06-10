@@ -16,6 +16,7 @@ import {
   runReload,
   runSetupSharedDir,
   runStatus,
+  type HostAppInvoker,
 } from "../../src/cli/castle-wall.js";
 import { runInit } from "../../src/wrap/init.js";
 
@@ -162,10 +163,212 @@ describe("castle-wall CLI verbs", () => {
       platform: "darwin",
       execSyncFn: () =>
         "com.sanctuary.castle-wall [activated enabled] (state: enabled)",
+      // Simulate a machine without the host app installed: output must stay
+      // exactly as before the content-filter probe existed.
+      hostAppCandidates: [],
     });
 
     expect(code).toBe(0);
     expect(out.text()).toContain("Castle Wall sysext: [activated enabled]");
+    expect(out.text()).not.toContain("Content filter:");
+  });
+
+  describe("status content-filter probe", () => {
+    async function makeDarwinFixture() {
+      const { fortressPath } = await makeFortress();
+      const hostAppPath = join(fortressPath, "CastleWallHostApp");
+      await writeFile(hostAppPath, "#!/bin/sh\n", { mode: 0o755 });
+      return { fortressPath, hostAppPath };
+    }
+
+    function statusInvoker(response: {
+      stdout: string;
+      exitCode: number;
+      stderr?: string;
+    }): { invoke: HostAppInvoker; calls: string[][] } {
+      const calls: string[][] = [];
+      const invoke: HostAppInvoker = async (binaryPath, args) => {
+        calls.push([binaryPath, ...args]);
+        return {
+          stdout: response.stdout,
+          stderr: response.stderr ?? "",
+          exitCode: response.exitCode,
+        };
+      };
+      return { invoke, calls };
+    }
+
+    it("reports the filter enabled when the host app resolves", async () => {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      const out = new CaptureStream();
+      const { invoke, calls } = statusInvoker({
+        stdout:
+          JSON.stringify({ ok: true, action: "status", state: "enabled" }) +
+          "\n",
+        exitCode: 0,
+      });
+
+      const code = await runStatus({
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () =>
+          "com.sanctuary.castle-wall [activated enabled] (state: enabled)",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain("Content filter: enabled");
+      expect(calls).toEqual([[hostAppPath, "--headless", "status"]]);
+    });
+
+    it("reports the filter disabled (sysext installed but not filtering)", async () => {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      const out = new CaptureStream();
+      const { invoke } = statusInvoker({
+        stdout:
+          JSON.stringify({ ok: true, action: "status", state: "disabled" }) +
+          "\n",
+        exitCode: 0,
+      });
+
+      const code = await runStatus({
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () =>
+          "com.sanctuary.castle-wall [activated enabled] (state: enabled)",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain("Castle Wall sysext: [activated enabled]");
+      expect(out.text()).toContain("Content filter: disabled");
+    });
+
+    it("reports unknown with the report error on probe failure", async () => {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      const out = new CaptureStream();
+      const { invoke } = statusInvoker({
+        stdout:
+          JSON.stringify({
+            ok: false,
+            action: "status",
+            state: "unknown",
+            error: "NEFilterManager load failed",
+          }) + "\n",
+        exitCode: 1,
+      });
+
+      const code = await runStatus({
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () => "",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain(
+        "Content filter: unknown (NEFilterManager load failed)",
+      );
+    });
+
+    it("reports unknown with the exit code when output is unparseable", async () => {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      const out = new CaptureStream();
+      const { invoke } = statusInvoker({
+        stdout: "not json\n",
+        exitCode: 4,
+      });
+
+      const code = await runStatus({
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () => "",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain(
+        "Content filter: unknown (host app exited with code 4)",
+      );
+    });
+
+    it("reports unknown for a non-enabled/disabled state (consent missing)", async () => {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      const out = new CaptureStream();
+      const { invoke } = statusInvoker({
+        stdout:
+          JSON.stringify({
+            ok: true,
+            action: "status",
+            state: "needs_user_approval",
+          }) + "\n",
+        exitCode: 0,
+      });
+
+      const code = await runStatus({
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () => "",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain(
+        "Content filter: unknown (host app reported state 'needs_user_approval')",
+      );
+    });
+
+    it("reports unknown when the invoker itself throws", async () => {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      const out = new CaptureStream();
+      const invoke: HostAppInvoker = async () => {
+        throw new Error("spawn EACCES");
+      };
+
+      const code = await runStatus({
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () => "",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain("Content filter: unknown (spawn EACCES)");
+    });
+
+    it("stays silent on non-macOS even when an invoker is injected", async () => {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      const out = new CaptureStream();
+      const invoke: HostAppInvoker = async () => {
+        throw new Error("must not be invoked off-darwin");
+      };
+
+      const code = await runStatus({
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "linux",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain(
+        "Castle Wall sysext: not applicable (non-macOS)",
+      );
+      expect(out.text()).not.toContain("Content filter:");
+    });
   });
 
   it("parses approve scope and fortress flags", () => {
