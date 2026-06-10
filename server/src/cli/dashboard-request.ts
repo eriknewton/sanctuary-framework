@@ -2,6 +2,36 @@ const DEFAULT_DASHBOARD_URL = "http://127.0.0.1:3502";
 
 export interface DashboardRequestContext {
   dashboardUrl?: string;
+  /**
+   * Federation PR-A1: explicit Authorization bearer override. When set,
+   * it wins over SANCTUARY_DASHBOARD_AUTH_TOKEN; the empty string sends
+   * NO Authorization header. The /v1 surface uses this to send short-lived
+   * session tokens (and to keep the long-lived operator token off the
+   * wire during the session ceremony itself).
+   */
+  authToken?: string;
+}
+
+/**
+ * Federation PR-A1: classified dashboard-request failure. `kind` lets
+ * API-client CLI verbs map failures onto the catalog exit codes
+ * (2 = daemon unreachable / server error, 3 = auth failure, ...) without
+ * string-matching the human-facing message.
+ */
+export class DashboardRequestError extends Error {
+  readonly kind: "network" | "auth" | "not-implemented" | "server" | "http";
+  readonly status: number | undefined;
+
+  constructor(
+    message: string,
+    kind: DashboardRequestError["kind"],
+    status?: number,
+  ) {
+    super(message);
+    this.name = "DashboardRequestError";
+    this.kind = kind;
+    this.status = status;
+  }
 }
 
 interface DashboardErrorBody {
@@ -18,7 +48,10 @@ export async function dashboardRequest(
   const base = (
     ctx?.dashboardUrl ?? process.env.SANCTUARY_DASHBOARD_URL ?? DEFAULT_DASHBOARD_URL
   ).replace(/\/$/, "");
-  const token = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN ?? "";
+  const token =
+    ctx?.authToken !== undefined
+      ? ctx.authToken
+      : process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN ?? "";
   const headers = new Headers(init?.headers);
   headers.set("Accept", "application/json");
   if (init?.body) headers.set("Content-Type", "application/json");
@@ -28,16 +61,28 @@ export async function dashboardRequest(
   try {
     res = await fetch(`${base}${path}`, { ...init, headers });
   } catch (cause) {
-    throw new Error(
+    throw new DashboardRequestError(
       `network/connection failure: ${errorDetail(cause)}. Hint: start the Sanctuary dashboard, verify --fortress runtime, or set SANCTUARY_DASHBOARD_URL to a reachable endpoint.`,
+      "network",
     );
   }
 
   const body = (await res.json().catch(() => ({}))) as DashboardErrorBody;
   if (!res.ok || body.ok === false) {
-    throw new Error(classifyHttpFailure(res.status, path, body));
+    throw new DashboardRequestError(
+      classifyHttpFailure(res.status, path, body),
+      failureKind(res.status),
+      res.status,
+    );
   }
   return body;
+}
+
+function failureKind(status: number): DashboardRequestError["kind"] {
+  if (status === 401 || status === 403) return "auth";
+  if (status === 404) return "not-implemented";
+  if (status >= 500) return "server";
+  return "http";
 }
 
 function classifyHttpFailure(
