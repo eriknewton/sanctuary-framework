@@ -59,13 +59,32 @@ This builds `sanctuary-jail` for `x86_64-unknown-linux-musl` and
 if either output is not statically linked. CI runs the same script plus a
 functional smoke (confinement install + exec, usage fail-closed, exec
 fail-closed) in the `sanctuary-jail-static` job of
-`.github/workflows/castle-wall-linux.yml` and uploads both artifacts.
+`.github/workflows/castle-wall-linux.yml`, emits a
+`sanctuary-jail.SHA256SUMS` manifest, and uploads both artifacts plus the
+manifest.
 
 The launcher's guest platform is `linuxArm`, so the **aarch64** artifact is
 the one delivered into guests; the x86_64 artifact exists for the Linux
 loop-worker confinement path and for runner-side smoke tests. On macOS only
 `cargo check --target <musl target>` is possible (no musl cross-linker);
 real artifacts come from Linux CI.
+
+### Artifact authentication (pinned SHA-256, trusted-admin TCB inputs)
+
+The macOS launcher does NOT trust `staticJailBinaryPath` by shape. Its
+structural ELF checks (static aarch64, no `PT_INTERP`) are a secondary
+sanity layer only -- any hostile static aarch64 ELF would pass them. Trust
+is established by a REQUIRED `staticJailBinarySHA256` pin (64 hex chars)
+supplied alongside the path: the launcher stages the file into a fresh
+private share directory, computes SHA-256 of the STAGED copy (closing the
+validate-then-swap TOCTOU window), and refuses to launch on any mismatch or
+when the pin is absent or malformed. No hash, no static delivery.
+
+Both `staticJailBinaryPath` and `staticJailBinarySHA256` are trusted-admin
+TCB inputs: the operator who configures them vouches for them as a pair.
+The authentic pin source is the `sanctuary-jail.SHA256SUMS` manifest emitted
+by the `sanctuary-jail-static` CI job that built the artifact (also printed
+in the job log).
 
 ## Claim Boundary
 

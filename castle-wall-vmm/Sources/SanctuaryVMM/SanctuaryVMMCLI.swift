@@ -68,14 +68,16 @@ public enum SanctuaryVMMCLI {
             return 1
         }
 
-        // FAIL-CLOSED: an unknown delivery mode or an inconsistent
-        // mode/path combination refuses to launch; it never falls back to a
-        // different delivery mode or to an unjailed plugin.
+        // FAIL-CLOSED: an unknown delivery mode, an inconsistent mode/path
+        // combination, or a missing/malformed SHA-256 pin refuses to launch;
+        // it never falls back to a different delivery mode or to an
+        // unjailed plugin.
         let jailDelivery: SanctuaryGuestJailDelivery
         do {
             jailDelivery = try SanctuaryGuestJail.parseDelivery(
                 mode: request.guestJailDelivery,
-                staticBinaryPath: request.staticJailBinaryPath
+                staticBinaryPath: request.staticJailBinaryPath,
+                staticBinarySHA256: request.staticJailBinarySHA256
             )
         } catch {
             fputs("\(error)\n", stderr)
@@ -152,14 +154,16 @@ public enum SanctuaryVMMCLI {
             return 1
         }
 
-        // FAIL-CLOSED: an unknown delivery mode or an inconsistent
-        // mode/path combination refuses to launch; it never falls back to a
-        // different delivery mode or to an unjailed plugin.
+        // FAIL-CLOSED: an unknown delivery mode, an inconsistent mode/path
+        // combination, or a missing/malformed SHA-256 pin refuses to launch;
+        // it never falls back to a different delivery mode or to an
+        // unjailed plugin.
         let jailDelivery: SanctuaryGuestJailDelivery
         do {
             jailDelivery = try SanctuaryGuestJail.parseDelivery(
                 mode: request.guestJailDelivery,
-                staticBinaryPath: request.staticJailBinaryPath
+                staticBinaryPath: request.staticJailBinaryPath,
+                staticBinarySHA256: request.staticJailBinarySHA256
             )
         } catch {
             fputs("\(error)\n", stderr)
@@ -248,9 +252,17 @@ struct GuestExecCLIRequest: Codable {
     /// "python-preamble" (default) or "static-binary". Unknown values fail
     /// closed (no launch).
     let guestJailDelivery: String?
-    /// Host path to the STATIC aarch64 sanctuary-jail binary; required when
-    /// guestJailDelivery is "static-binary", rejected otherwise.
+    /// TRUSTED-ADMIN TCB INPUT. Host path to the STATIC aarch64
+    /// sanctuary-jail binary; required when guestJailDelivery is
+    /// "static-binary", rejected otherwise. The path alone is NOT trusted:
+    /// the staged copy must match staticJailBinarySHA256.
     let staticJailBinaryPath: String?
+    /// TRUSTED-ADMIN TCB INPUT. Pinned SHA-256 (64 hex chars) of the
+    /// sanctuary-jail artifact, sourced from the sanctuary-jail-static CI
+    /// SHA256SUMS manifest. REQUIRED when guestJailDelivery is
+    /// "static-binary" (no hash, no static delivery), rejected otherwise.
+    /// Verified against the STAGED copy before boot; mismatch = no launch.
+    let staticJailBinarySHA256: String?
     let command: String
     let args: [String]
     let cwd: String
@@ -270,9 +282,17 @@ struct RunBoxCLIRequest: Codable {
     /// "python-preamble" (default) or "static-binary". Unknown values fail
     /// closed (no launch).
     let guestJailDelivery: String?
-    /// Host path to the STATIC aarch64 sanctuary-jail binary; required when
-    /// guestJailDelivery is "static-binary", rejected otherwise.
+    /// TRUSTED-ADMIN TCB INPUT. Host path to the STATIC aarch64
+    /// sanctuary-jail binary; required when guestJailDelivery is
+    /// "static-binary", rejected otherwise. The path alone is NOT trusted:
+    /// the staged copy must match staticJailBinarySHA256.
     let staticJailBinaryPath: String?
+    /// TRUSTED-ADMIN TCB INPUT. Pinned SHA-256 (64 hex chars) of the
+    /// sanctuary-jail artifact, sourced from the sanctuary-jail-static CI
+    /// SHA256SUMS manifest. REQUIRED when guestJailDelivery is
+    /// "static-binary" (no hash, no static delivery), rejected otherwise.
+    /// Verified against the STAGED copy before boot; mismatch = no launch.
+    let staticJailBinarySHA256: String?
     let egressProxyUdsPath: String
     let egressGuestSocketPath: String?
     let command: String

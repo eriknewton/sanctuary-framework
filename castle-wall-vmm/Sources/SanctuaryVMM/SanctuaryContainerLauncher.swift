@@ -30,11 +30,13 @@ public struct SanctuaryContainerConfig: Sendable {
     public let applyGuestJail: Bool
     /// How the jail is delivered into the guest. `.pythonPreamble` (default,
     /// drill-proven; needs python3 in the image) or `.staticBinary` (the
-    /// static `sanctuary-jail` shim is bind-mounted in; works on python-less
-    /// images). FAIL-CLOSED either way: if the selected delivery cannot run,
-    /// the plugin does NOT launch unjailed (static: host-side validation
-    /// throws before boot; python: the in-guest exec of python3 fails and
-    /// the box exits).
+    /// static `sanctuary-jail` shim is authenticated against an
+    /// operator-pinned SHA-256 — computed on the STAGED copy — then
+    /// bind-mounted in; works on python-less images). FAIL-CLOSED either
+    /// way: if the selected delivery cannot run, the plugin does NOT launch
+    /// unjailed (static: a missing binary, absent/malformed pin, or
+    /// staged-copy hash mismatch throws before boot; python: the in-guest
+    /// exec of python3 fails and the box exits).
     public let guestJailDelivery: SanctuaryGuestJailDelivery
 
     public init(

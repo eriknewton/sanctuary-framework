@@ -43,6 +43,16 @@ final class SanctuaryGuestJailTests: XCTestCase {
         return file.path
     }
 
+    /// SHA-256 (lowercase hex) of in-memory data, via a temp file through the
+    /// same digest implementation production uses.
+    private func sha256Hex(_ data: Data) throws -> String {
+        let path = try writeTempFile(data, name: "digest-input")
+        return try SanctuaryImageIntegrity.computeDigest(at: URL(fileURLWithPath: path))
+    }
+
+    /// A syntactically valid 64-hex pin that will not match any fixture.
+    private let wrongPin = String(repeating: "ab", count: 32)
+
     // MARK: - argv wrapping
 
     func testPythonWrapShape() {
@@ -62,49 +72,117 @@ final class SanctuaryGuestJailTests: XCTestCase {
 
     func testParseDeliveryDefaultsToPythonPreamble() throws {
         XCTAssertEqual(
-            try SanctuaryGuestJail.parseDelivery(mode: nil, staticBinaryPath: nil),
+            try SanctuaryGuestJail.parseDelivery(
+                mode: nil, staticBinaryPath: nil, staticBinarySHA256: nil
+            ),
             .pythonPreamble
         )
         XCTAssertEqual(
-            try SanctuaryGuestJail.parseDelivery(mode: "python-preamble", staticBinaryPath: nil),
+            try SanctuaryGuestJail.parseDelivery(
+                mode: "python-preamble", staticBinaryPath: nil, staticBinarySHA256: nil
+            ),
             .pythonPreamble
         )
     }
 
     func testParseDeliveryStaticBinary() throws {
         XCTAssertEqual(
-            try SanctuaryGuestJail.parseDelivery(mode: "static-binary", staticBinaryPath: "/x/jail"),
-            .staticBinary(hostBinaryPath: "/x/jail")
+            try SanctuaryGuestJail.parseDelivery(
+                mode: "static-binary", staticBinaryPath: "/x/jail", staticBinarySHA256: wrongPin
+            ),
+            .staticBinary(hostBinaryPath: "/x/jail", expectedSHA256: wrongPin)
+        )
+    }
+
+    func testParseDeliveryNormalizesPinToLowercase() throws {
+        let upper = wrongPin.uppercased()
+        XCTAssertEqual(
+            try SanctuaryGuestJail.parseDelivery(
+                mode: "static-binary", staticBinaryPath: "/x/jail", staticBinarySHA256: upper
+            ),
+            .staticBinary(hostBinaryPath: "/x/jail", expectedSHA256: wrongPin)
         )
     }
 
     func testParseDeliveryStaticBinaryWithoutPathFailsClosed() {
         XCTAssertThrowsError(
-            try SanctuaryGuestJail.parseDelivery(mode: "static-binary", staticBinaryPath: nil)
+            try SanctuaryGuestJail.parseDelivery(
+                mode: "static-binary", staticBinaryPath: nil, staticBinarySHA256: wrongPin
+            )
         )
         XCTAssertThrowsError(
-            try SanctuaryGuestJail.parseDelivery(mode: "static-binary", staticBinaryPath: "")
+            try SanctuaryGuestJail.parseDelivery(
+                mode: "static-binary", staticBinaryPath: "", staticBinarySHA256: wrongPin
+            )
         )
+    }
+
+    func testParseDeliveryStaticBinaryWithoutHashFailsClosed() {
+        // No hash, no static delivery: the pin is a REQUIRED precondition.
+        XCTAssertThrowsError(
+            try SanctuaryGuestJail.parseDelivery(
+                mode: "static-binary", staticBinaryPath: "/x/jail", staticBinarySHA256: nil
+            )
+        ) { error in
+            XCTAssertTrue(
+                "\(error)".contains("staticJailBinarySHA256"),
+                "error must name the missing precondition: \(error)"
+            )
+        }
+        XCTAssertThrowsError(
+            try SanctuaryGuestJail.parseDelivery(
+                mode: "static-binary", staticBinaryPath: "/x/jail", staticBinarySHA256: ""
+            )
+        )
+    }
+
+    func testParseDeliveryStaticBinaryWithMalformedHashFailsClosed() {
+        for malformed in [
+            "deadbeef",                                   // too short
+            wrongPin + "ab",                              // too long
+            String(repeating: "g", count: 64),            // non-hex
+            "sha256:" + String(repeating: "ab", count: 32) // prefixed form rejected
+        ] {
+            XCTAssertThrowsError(
+                try SanctuaryGuestJail.parseDelivery(
+                    mode: "static-binary", staticBinaryPath: "/x/jail", staticBinarySHA256: malformed
+                ),
+                "malformed pin '\(malformed)' must be refused"
+            )
+        }
     }
 
     func testParseDeliveryUnknownModeFailsClosed() {
         // An unknown mode must never silently fall back to python delivery.
         XCTAssertThrowsError(
-            try SanctuaryGuestJail.parseDelivery(mode: "none", staticBinaryPath: nil)
+            try SanctuaryGuestJail.parseDelivery(
+                mode: "none", staticBinaryPath: nil, staticBinarySHA256: nil
+            )
         )
         XCTAssertThrowsError(
-            try SanctuaryGuestJail.parseDelivery(mode: "Static-Binary", staticBinaryPath: "/x/jail")
+            try SanctuaryGuestJail.parseDelivery(
+                mode: "Static-Binary", staticBinaryPath: "/x/jail", staticBinarySHA256: wrongPin
+            )
         )
     }
 
-    func testParseDeliveryPathWithPythonModeFailsClosed() {
-        // Ambiguous intent (a static path but python mode) is rejected rather
-        // than guessed.
+    func testParseDeliveryPathOrHashWithPythonModeFailsClosed() {
+        // Ambiguous intent (static-delivery fields but python mode) is
+        // rejected rather than guessed.
         XCTAssertThrowsError(
-            try SanctuaryGuestJail.parseDelivery(mode: nil, staticBinaryPath: "/x/jail")
+            try SanctuaryGuestJail.parseDelivery(
+                mode: nil, staticBinaryPath: "/x/jail", staticBinarySHA256: nil
+            )
         )
         XCTAssertThrowsError(
-            try SanctuaryGuestJail.parseDelivery(mode: "python-preamble", staticBinaryPath: "/x/jail")
+            try SanctuaryGuestJail.parseDelivery(
+                mode: "python-preamble", staticBinaryPath: "/x/jail", staticBinarySHA256: nil
+            )
+        )
+        XCTAssertThrowsError(
+            try SanctuaryGuestJail.parseDelivery(
+                mode: "python-preamble", staticBinaryPath: nil, staticBinarySHA256: wrongPin
+            )
         )
     }
 
@@ -195,9 +273,12 @@ final class SanctuaryGuestJailTests: XCTestCase {
     }
 
     func testMakePlanStaticBinaryStagesShimAloneReadExec() throws {
-        let path = try writeTempFile(makeELF(machine: 0xB7, phTypes: [1]), name: "sanctuary-jail-v1")
+        let shim = makeELF(machine: 0xB7, phTypes: [1])
+        let path = try writeTempFile(shim, name: "sanctuary-jail-v1")
         let plan = try SanctuaryGuestJail.makePlan(
-            delivery: .staticBinary(hostBinaryPath: path), command: "/plugin/run", args: ["a", "b"]
+            delivery: .staticBinary(hostBinaryPath: path, expectedSHA256: try sha256Hex(shim)),
+            command: "/plugin/run",
+            args: ["a", "b"]
         )
         defer {
             if let dir = plan.hostShareDirectory {
@@ -218,17 +299,183 @@ final class SanctuaryGuestJailTests: XCTestCase {
     }
 
     func testMakePlanStaticBinaryFailsClosedOnInvalidShim() throws {
-        let path = try writeTempFile(Data("junk".utf8))
+        // Correct pin but structurally invalid file: the secondary ELF sanity
+        // layer still refuses (hash alone is not sufficient to launch).
+        let junk = Data("junk".utf8)
+        let path = try writeTempFile(junk)
         XCTAssertThrowsError(
             try SanctuaryGuestJail.makePlan(
-                delivery: .staticBinary(hostBinaryPath: path), command: "/plugin/run", args: []
+                delivery: .staticBinary(hostBinaryPath: path, expectedSHA256: try sha256Hex(junk)),
+                command: "/plugin/run",
+                args: []
             )
+        ) { error in
+            guard case SanctuaryGuestJailError.staticBinaryInvalid = error else {
+                return XCTFail("expected staticBinaryInvalid, got \(error)")
+            }
+        }
+        XCTAssertThrowsError(
+            try SanctuaryGuestJail.makePlan(
+                delivery: .staticBinary(hostBinaryPath: "/nope", expectedSHA256: wrongPin),
+                command: "/plugin/run",
+                args: []
+            )
+        ) { error in
+            guard case SanctuaryGuestJailError.staticBinaryMissing = error else {
+                return XCTFail("expected staticBinaryMissing, got \(error)")
+            }
+        }
+    }
+
+    // MARK: - static shim SHA-256 authentication (codex CRITICAL fix)
+
+    func testMakePlanRefusesHostileButValidStaticELFWithWrongPin() throws {
+        // THE codex-review CRITICAL: a hostile static aarch64 ELF passes
+        // every shape check, so shape must not be sufficient. With a pin
+        // that does not match the hostile bytes, launch is refused.
+        let hostileShim = makeELF(machine: 0xB7, phTypes: [1, 1])
+        let hostilePin = try sha256Hex(hostileShim)
+        let path = try writeTempFile(hostileShim, name: "hostile-shim")
+        XCTAssertNoThrow(
+            try SanctuaryGuestJail.validateStaticShim(atPath: path),
+            "precondition: the hostile ELF must pass the shape checks for this test to bite"
         )
         XCTAssertThrowsError(
             try SanctuaryGuestJail.makePlan(
-                delivery: .staticBinary(hostBinaryPath: "/nope"), command: "/plugin/run", args: []
+                delivery: .staticBinary(hostBinaryPath: path, expectedSHA256: wrongPin),
+                command: "/plugin/run",
+                args: []
             )
+        ) { error in
+            guard case SanctuaryGuestJailError.staticBinaryHashMismatch(_, let expected, let actual) = error else {
+                return XCTFail("expected staticBinaryHashMismatch, got \(error)")
+            }
+            XCTAssertEqual(expected, wrongPin)
+            XCTAssertEqual(actual, hostilePin)
+        }
+        // And nothing staged is left behind for a later launch to pick up.
+        let leftovers = try FileManager.default
+            .contentsOfDirectory(atPath: FileManager.default.temporaryDirectory.path)
+            .filter { $0.hasPrefix("sanctuary-jail-share-") }
+        for dir in leftovers {
+            let staged = FileManager.default.temporaryDirectory
+                .appendingPathComponent(dir).appendingPathComponent("sanctuary-jail")
+            if let data = FileManager.default.contents(atPath: staged.path) {
+                XCTAssertNotEqual(data, hostileShim, "rejected shim must not remain staged")
+            }
+        }
+    }
+
+    func testMakePlanAcceptsCorrectPinCaseInsensitively() throws {
+        let shim = makeELF(machine: 0xB7, phTypes: [1])
+        let path = try writeTempFile(shim)
+        let pin = try sha256Hex(shim)
+        for variant in [pin, pin.uppercased()] {
+            let plan = try SanctuaryGuestJail.makePlan(
+                delivery: .staticBinary(hostBinaryPath: path, expectedSHA256: variant),
+                command: "/plugin/run",
+                args: []
+            )
+            defer {
+                if let dir = plan.hostShareDirectory {
+                    try? FileManager.default.removeItem(atPath: dir)
+                }
+            }
+            XCTAssertNotNil(plan.hostShareDirectory)
+        }
+    }
+
+    func testMakePlanRefusesAbsentOrMalformedPinViaDirectAPI() throws {
+        // Direct Swift-API construction (bypassing parseDelivery) must still
+        // fail closed on a missing/malformed pin: no hash, no static delivery.
+        let shim = makeELF(machine: 0xB7, phTypes: [1])
+        let path = try writeTempFile(shim)
+        for badPin in ["", "deadbeef", String(repeating: "g", count: 64)] {
+            XCTAssertThrowsError(
+                try SanctuaryGuestJail.makePlan(
+                    delivery: .staticBinary(hostBinaryPath: path, expectedSHA256: badPin),
+                    command: "/plugin/run",
+                    args: []
+                ),
+                "pin '\(badPin)' must be refused"
+            ) { error in
+                guard case SanctuaryGuestJailError.invalidDeliveryConfiguration = error else {
+                    return XCTFail("expected invalidDeliveryConfiguration, got \(error)")
+                }
+            }
+        }
+    }
+
+    func testHashIsComputedOnStagedCopySourceSwapAfterStagingCannotBypass() throws {
+        // TOCTOU: the pin is verified against the STAGED copy, and the source
+        // is read exactly once at staging. Swapping the source afterwards
+        // must change neither what was hashed nor what the guest would run.
+        let trustedShim = makeELF(machine: 0xB7, phTypes: [1])
+        let hostileShim = makeELF(machine: 0xB7, phTypes: [1, 1, 1])
+        let pin = try sha256Hex(trustedShim)
+        let path = try writeTempFile(trustedShim, name: "sanctuary-jail")
+
+        let plan = try SanctuaryGuestJail.makePlan(
+            delivery: .staticBinary(hostBinaryPath: path, expectedSHA256: pin),
+            command: "/plugin/run",
+            args: []
         )
+        defer {
+            if let dir = plan.hostShareDirectory {
+                try? FileManager.default.removeItem(atPath: dir)
+            }
+        }
+
+        // Adversary swaps the source AFTER staging.
+        try hostileShim.write(to: URL(fileURLWithPath: path))
+
+        let dir = try XCTUnwrap(plan.hostShareDirectory)
+        let stagedPath = "\(dir)/sanctuary-jail"
+        let stagedBytes = try XCTUnwrap(FileManager.default.contents(atPath: stagedPath))
+        XCTAssertEqual(stagedBytes, trustedShim, "guest must see the bytes that were pinned, not the swap")
+        XCTAssertEqual(
+            try SanctuaryImageIntegrity.computeDigest(at: URL(fileURLWithPath: stagedPath)),
+            pin,
+            "staged copy must still match the pin after a source swap"
+        )
+    }
+
+    func testSymlinkSourceIsResolvedOnceAtStagingRetargetCannotBypass() throws {
+        // A symlink source must not let an adversary retarget between hash
+        // and mount: staging reads the bytes once (symlink resolved at that
+        // instant) and everything downstream uses the staged regular file.
+        let trustedShim = makeELF(machine: 0xB7, phTypes: [1])
+        let hostileShim = makeELF(machine: 0xB7, phTypes: [1, 1])
+        let trustedPath = try writeTempFile(trustedShim, name: "trusted-shim")
+        let hostilePath = try writeTempFile(hostileShim, name: "hostile-shim")
+        let linkPath = (trustedPath as NSString).deletingLastPathComponent + "/shim-link"
+        try FileManager.default.createSymbolicLink(
+            atPath: linkPath, withDestinationPath: trustedPath
+        )
+
+        let pin = try sha256Hex(trustedShim)
+        let plan = try SanctuaryGuestJail.makePlan(
+            delivery: .staticBinary(hostBinaryPath: linkPath, expectedSHA256: pin),
+            command: "/plugin/run",
+            args: []
+        )
+        defer {
+            if let dir = plan.hostShareDirectory {
+                try? FileManager.default.removeItem(atPath: dir)
+            }
+        }
+
+        // Adversary retargets the symlink AFTER staging.
+        try FileManager.default.removeItem(atPath: linkPath)
+        try FileManager.default.createSymbolicLink(
+            atPath: linkPath, withDestinationPath: hostilePath
+        )
+
+        let dir = try XCTUnwrap(plan.hostShareDirectory)
+        let stagedBytes = try XCTUnwrap(FileManager.default.contents(atPath: "\(dir)/sanctuary-jail"))
+        XCTAssertEqual(stagedBytes, trustedShim, "staged copy must be a regular file, immune to retargeting")
+        let attrs = try FileManager.default.attributesOfItem(atPath: "\(dir)/sanctuary-jail")
+        XCTAssertEqual(attrs[.type] as? FileAttributeType, .typeRegular)
     }
 
     // MARK: - launcher config default

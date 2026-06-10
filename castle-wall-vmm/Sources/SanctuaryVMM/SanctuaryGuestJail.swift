@@ -15,12 +15,21 @@ public enum SanctuaryGuestJailDelivery: Equatable, Sendable {
     /// Static `sanctuary-jail` Rust binary (castle-wall-daemon, PR #439:
     /// multi-arch seccomp-deny-AF_VSOCK + cap-drop + no-new-privs +
     /// fail-closed exec) bind-mounted read-only into the guest and prepended
-    /// to the plugin argv. Works on python-less images. `hostBinaryPath`
-    /// must point at a STATIC aarch64 Linux ELF (the guest platform is
-    /// `.linuxArm`); the launcher validates this BEFORE boot and refuses to
-    /// launch if the binary is missing or unsuitable — the plugin never
-    /// launches unjailed.
-    case staticBinary(hostBinaryPath: String)
+    /// to the plugin argv. Works on python-less images.
+    ///
+    /// TRUST MODEL: `hostBinaryPath` AND `expectedSHA256` are trusted-admin
+    /// TCB inputs supplied together by the operator. The launcher
+    /// authenticates the artifact by IDENTITY, not shape: after staging the
+    /// file into a fresh private share directory it computes SHA-256 of the
+    /// STAGED copy and refuses to launch on any mismatch (post-stage hashing
+    /// also closes the validate-then-swap TOCTOU window). The structural ELF
+    /// checks (static aarch64 Linux ELF, no PT_INTERP) remain as a secondary
+    /// sanity layer only — they prove loadability, NOT that the file is the
+    /// trusted jail shim. No hash, no static delivery: an absent or
+    /// malformed `expectedSHA256` refuses to launch (fail closed). Obtain
+    /// the authentic hash from the `sanctuary-jail-static` CI job's
+    /// SHA256SUMS manifest.
+    case staticBinary(hostBinaryPath: String, expectedSHA256: String)
 }
 
 /// Fail-closed errors from jail-delivery planning. Every case means the
@@ -28,6 +37,7 @@ public enum SanctuaryGuestJailDelivery: Equatable, Sendable {
 public enum SanctuaryGuestJailError: Error, CustomStringConvertible {
     case staticBinaryMissing(path: String)
     case staticBinaryInvalid(path: String, reason: String)
+    case staticBinaryHashMismatch(path: String, expected: String, actual: String)
     case stagingFailed(reason: String)
     case invalidDeliveryConfiguration(reason: String)
 
@@ -37,6 +47,10 @@ public enum SanctuaryGuestJailError: Error, CustomStringConvertible {
             return "guest jail static binary not found at \(path); refusing to launch plugin unjailed"
         case .staticBinaryInvalid(let path, let reason):
             return "guest jail static binary at \(path) rejected: \(reason); refusing to launch plugin unjailed"
+        case .staticBinaryHashMismatch(let path, let expected, let actual):
+            return "guest jail static binary STAGED from \(path) failed SHA-256 authentication: "
+                + "expected \(expected), got \(actual); the artifact is not the pinned sanctuary-jail shim; "
+                + "refusing to launch plugin unjailed"
         case .stagingFailed(let reason):
             return "guest jail staging failed: \(reason); refusing to launch plugin unjailed"
         case .invalidDeliveryConfiguration(let reason):
@@ -84,15 +98,23 @@ public struct SanctuaryGuestJailPlan: Sendable {
 ///     the static `sanctuary-jail` Rust binary (castle-wall-daemon, PR #439)
 ///     is bind-mounted read-only into the guest at
 ///     `staticBinaryGuestMountPoint` and prepended to the plugin argv. The
-///     binary is validated host-side BEFORE boot (static aarch64 Linux ELF);
-///     any validation failure aborts the launch. Mechanism identical to the
-///     python preamble; pending its own box drill (see the static-binary
-///     addendum in `B2_Launcher_Integration_Drill_Runbook_2026-06-09.md`).
+///     artifact is AUTHENTICATED host-side BEFORE boot: it is staged into a
+///     fresh private directory and the SHA-256 of the STAGED copy must equal
+///     the operator-pinned `expectedSHA256` (trusted-admin TCB input,
+///     sourced from the `sanctuary-jail-static` CI SHA256SUMS manifest).
+///     Structural ELF checks (static aarch64, no PT_INTERP) run as a
+///     secondary sanity layer only — they do NOT establish trust. Any
+///     missing/malformed hash, hash mismatch, or validation failure aborts
+///     the launch. Mechanism identical to the python preamble; pending its
+///     own box drill (see the static-binary addendum in
+///     `B2_Launcher_Integration_Drill_Runbook_2026-06-09.md`).
 ///
 /// FAIL-CLOSED INVARIANT: with `applyGuestJail` on, there is NO path on which
 /// the plugin runs unjailed. Python delivery without python3 in the image
 /// fails the guest exec (plugin never starts); static delivery with a
-/// missing/invalid binary throws before boot (plugin never starts).
+/// missing binary, an absent/malformed expected hash, a staged-copy hash
+/// mismatch, or a failed sanity check throws before boot (plugin never
+/// starts).
 public enum SanctuaryGuestJail {
 
     /// In-guest directory where the static shim share is mounted.
@@ -169,17 +191,25 @@ os.execvp(real[0], real)
 
     /// Parse an operator-supplied delivery mode (CLI JSON surface) into a
     /// `SanctuaryGuestJailDelivery`. FAIL-CLOSED: unknown modes and
-    /// inconsistent combinations throw — they NEVER fall back to a different
-    /// delivery mode or to an unjailed launch.
+    /// inconsistent or partial combinations throw — they NEVER fall back to
+    /// a different delivery mode or to an unjailed launch. Static delivery
+    /// requires BOTH `staticBinaryPath` and a well-formed 64-hex-char
+    /// `staticBinarySHA256` pin (no hash, no static delivery).
     public static func parseDelivery(
         mode: String?,
-        staticBinaryPath: String?
+        staticBinaryPath: String?,
+        staticBinarySHA256: String?
     ) throws -> SanctuaryGuestJailDelivery {
         switch mode {
         case nil, "python-preamble":
             if let path = staticBinaryPath, !path.isEmpty {
                 throw SanctuaryGuestJailError.invalidDeliveryConfiguration(
                     reason: "staticJailBinaryPath provided but guestJailDelivery is not 'static-binary'"
+                )
+            }
+            if let sha = staticBinarySHA256, !sha.isEmpty {
+                throw SanctuaryGuestJailError.invalidDeliveryConfiguration(
+                    reason: "staticJailBinarySHA256 provided but guestJailDelivery is not 'static-binary'"
                 )
             }
             return .pythonPreamble
@@ -189,7 +219,20 @@ os.execvp(real[0], real)
                     reason: "guestJailDelivery 'static-binary' requires staticJailBinaryPath"
                 )
             }
-            return .staticBinary(hostBinaryPath: path)
+            guard let sha = staticBinarySHA256, !sha.isEmpty else {
+                throw SanctuaryGuestJailError.invalidDeliveryConfiguration(
+                    reason: "guestJailDelivery 'static-binary' requires staticJailBinarySHA256 "
+                        + "(64 hex chars; the pinned hash of the trusted sanctuary-jail artifact). "
+                        + "No hash, no static delivery."
+                )
+            }
+            guard isValidSHA256Hex(sha) else {
+                throw SanctuaryGuestJailError.invalidDeliveryConfiguration(
+                    reason: "staticJailBinarySHA256 is malformed (expected exactly 64 hex characters). "
+                        + "No hash, no static delivery."
+                )
+            }
+            return .staticBinary(hostBinaryPath: path, expectedSHA256: sha.lowercased())
         case .some(let other):
             throw SanctuaryGuestJailError.invalidDeliveryConfiguration(
                 reason: "unknown guestJailDelivery '\(other)' (expected 'python-preamble' or 'static-binary')"
@@ -197,11 +240,33 @@ os.execvp(real[0], real)
         }
     }
 
+    /// True iff `value` is exactly 64 ASCII hex characters (a SHA-256 digest).
+    static func isValidSHA256Hex(_ value: String) -> Bool {
+        guard value.count == 64 else { return false }
+        return value.allSatisfy { $0.isHexDigit && $0.isASCII }
+    }
+
     /// Build the launch plan for a jailed plugin. For static delivery this
-    /// validates the host binary (fail-closed) and stages it into a fresh
-    /// private directory containing ONLY the shim, so the read-only guest
-    /// share exposes nothing else. Throws on ANY problem — the launcher must
-    /// treat a throw as "do not launch".
+    /// AUTHENTICATES the artifact (fail-closed) in this order:
+    ///
+    ///   1. Refuse if the expected SHA-256 pin is absent or malformed
+    ///      (no hash, no static delivery).
+    ///   2. Stage the file into a fresh private directory containing ONLY
+    ///      the shim, so the read-only guest share exposes nothing else.
+    ///      Staging copies the BYTES (single read, symlinks resolved once);
+    ///      the source file is never referenced again afterwards.
+    ///   3. Compute SHA-256 of the STAGED copy and refuse on any mismatch
+    ///      with the pin. Hashing the staged copy (the exact file that gets
+    ///      bind-mounted) closes the validate-then-swap TOCTOU window:
+    ///      swapping the source after staging cannot change what the guest
+    ///      executes or what was hashed.
+    ///   4. Run the structural ELF checks on the STAGED copy as a secondary
+    ///      sanity layer (catches a wrong-but-correctly-pinned artifact,
+    ///      e.g. an x86_64 build pinned by mistake). These checks prove
+    ///      loadability only; identity comes from the hash in step 3.
+    ///
+    /// Throws on ANY problem — the launcher must treat a throw as "do not
+    /// launch".
     public static func makePlan(
         delivery: SanctuaryGuestJailDelivery,
         command: String,
@@ -214,9 +279,37 @@ os.execvp(real[0], real)
                 hostShareDirectory: nil,
                 guestMountPoint: nil
             )
-        case .staticBinary(let hostBinaryPath):
-            try validateStaticShim(atPath: hostBinaryPath)
+        case .staticBinary(let hostBinaryPath, let expectedSHA256):
+            // Step 1: the pin is a REQUIRED precondition. Direct Swift-API
+            // construction bypasses parseDelivery, so re-check here.
+            guard isValidSHA256Hex(expectedSHA256) else {
+                throw SanctuaryGuestJailError.invalidDeliveryConfiguration(
+                    reason: "static-binary delivery requires a well-formed expectedSHA256 pin "
+                        + "(64 hex chars); got '\(expectedSHA256)'. No hash, no static delivery."
+                )
+            }
+            // Step 2: stage first (single byte-level read of the source).
             let stagingDir = try stageShim(fromPath: hostBinaryPath)
+            let stagedPath = "\(stagingDir)/\(staticBinaryName)"
+            do {
+                // Step 3: authenticate the STAGED copy against the pin.
+                let actual = try SanctuaryImageIntegrity.computeDigest(
+                    at: URL(fileURLWithPath: stagedPath)
+                )
+                guard actual == expectedSHA256.lowercased() else {
+                    throw SanctuaryGuestJailError.staticBinaryHashMismatch(
+                        path: hostBinaryPath,
+                        expected: expectedSHA256.lowercased(),
+                        actual: actual
+                    )
+                }
+                // Step 4: secondary structural sanity on the staged copy.
+                try validateStaticShim(atPath: stagedPath)
+            } catch {
+                // Fail closed: never leave a staged-but-unverified share behind.
+                try? FileManager.default.removeItem(atPath: stagingDir)
+                throw error
+            }
             return SanctuaryGuestJailPlan(
                 argv: wrapWithStaticBinary(command: command, args: args),
                 hostShareDirectory: stagingDir,
@@ -225,16 +318,18 @@ os.execvp(real[0], real)
         }
     }
 
-    // MARK: - Static shim validation (fail-closed)
+    // MARK: - Static shim structural sanity checks (fail-closed, SECONDARY)
 
-    /// Validate that the host file is a plausible static aarch64 Linux ELF
-    /// executable. The guest platform is hard-wired to `.linuxArm` in
-    /// `SanctuaryContainerLauncher`, so any other machine type cannot run and
-    /// is rejected host-side rather than producing a confusing in-guest exec
-    /// failure. A PT_INTERP program header means the binary is dynamically
-    /// linked and would fail (or worse, behave unexpectedly) on libc-less
-    /// images, so it is rejected too. Any malformed/truncated header is
-    /// rejected: this function only ever errs toward NOT launching.
+    /// SECONDARY SANITY ONLY — this proves the file is a plausible static
+    /// aarch64 Linux ELF (loadable in the `.linuxArm` guest, no PT_INTERP,
+    /// parseable headers). It does NOT authenticate the file as the trusted
+    /// `sanctuary-jail` shim: any hostile static aarch64 ELF passes these
+    /// shape checks. Identity/trust is established exclusively by the
+    /// pinned SHA-256 comparison against the STAGED copy in `makePlan`.
+    /// These checks exist to catch a wrong-architecture or dynamically
+    /// linked artifact early (clear host-side error instead of a confusing
+    /// in-guest exec failure). Any malformed/truncated header is rejected:
+    /// this function only ever errs toward NOT launching.
     public static func validateStaticShim(atPath path: String) throws {
         let fm = FileManager.default
         var isDirectory: ObjCBool = false
@@ -290,21 +385,33 @@ os.execvp(real[0], real)
         }
     }
 
-    /// Copy the validated shim into a fresh private staging directory that
+    /// Copy the shim BYTES into a fresh private staging directory that
     /// contains ONLY the shim, mode 0555. The read-only guest share therefore
     /// exposes exactly one file. Caller owns removal of the returned directory.
+    ///
+    /// Deliberately a byte-level read + write (NOT `FileManager.copyItem`,
+    /// which preserves symlinks): the source is read exactly once, with any
+    /// symlink resolved at that moment, and the staged file is a fresh
+    /// regular file in a directory no other principal can pre-create. All
+    /// subsequent verification (SHA-256 pin, ELF sanity) runs against this
+    /// staged copy, so post-stage swaps of the source are irrelevant.
     static func stageShim(fromPath path: String) throws -> String {
         let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            throw SanctuaryGuestJailError.staticBinaryMissing(path: path)
+        }
         let stagingDir = fm.temporaryDirectory
             .appendingPathComponent("sanctuary-jail-share-\(UUID().uuidString)")
         let stagedBinary = stagingDir.appendingPathComponent(staticBinaryName)
         do {
+            let bytes = try Data(contentsOf: URL(fileURLWithPath: path))
             try fm.createDirectory(
                 at: stagingDir,
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o755]
             )
-            try fm.copyItem(at: URL(fileURLWithPath: path), to: stagedBinary)
+            try bytes.write(to: stagedBinary, options: [.atomic])
             try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: stagedBinary.path)
         } catch {
             // Best-effort cleanup of a half-built staging dir, then fail closed.

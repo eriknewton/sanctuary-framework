@@ -182,6 +182,20 @@ jobs:
           fi
           echo "sanctuary-jail static smoke: PASS"
 
+      # The macOS launcher authenticates the shim by a pinned SHA-256
+      # computed on its staged copy (SanctuaryGuestJail static-binary
+      # delivery: no hash, no static delivery). This manifest, produced in
+      # the same job that built the artifacts, is the authentic source
+      # operators pin staticJailBinarySHA256 from. It is printed to the job
+      # log AND shipped inside the uploaded artifact.
+      - name: Emit SHA-256 manifest (authentic pin source for static delivery)
+        working-directory: castle-wall-daemon
+        run: |
+          sha256sum \
+            target/x86_64-unknown-linux-musl/release/sanctuary-jail \
+            target/aarch64-unknown-linux-musl/release/sanctuary-jail \
+            | tee target/sanctuary-jail.SHA256SUMS
+
       - name: Upload static artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -189,4 +203,5 @@ jobs:
           path: |
             castle-wall-daemon/target/x86_64-unknown-linux-musl/release/sanctuary-jail
             castle-wall-daemon/target/aarch64-unknown-linux-musl/release/sanctuary-jail
+            castle-wall-daemon/target/sanctuary-jail.SHA256SUMS
           if-no-files-found: error
