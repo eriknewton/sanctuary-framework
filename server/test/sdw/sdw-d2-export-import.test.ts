@@ -1768,6 +1768,146 @@ describe("SDW D2 exact consent binding + atomic import (codex HIGH 1-3)", () => 
   );
 });
 
+/**
+ * Codex re-review HIGH (2026-06-10): the staged-then-atomic `sdwTransaction`
+ * is atomic on commit but, before this fix, did NOT isolate concurrent
+ * read-modify-write transactions. Decision reads (chain head, replay anchor,
+ * conflict-absence) ran during the async callback, before the synchronous
+ * apply, with no compare-and-swap. These tests pin the linearizability the
+ * per-backend mutex now provides. They run against the REAL LmdbStorageBackend
+ * (the in-memory TestSdwVault mock has no overlay-commit window to interleave,
+ * so it cannot reproduce the hole — only the native backend exercises the fix).
+ */
+describe("SDW sdwTransaction isolation under concurrency (codex re-review HIGH)", () => {
+  const QH_MASTER_KEY = new Uint8Array(32).fill(11);
+  const QH_FORTRESS = "fortress:concurrency";
+
+  function qhAuditEvent(id: string, queryId: string, at: string) {
+    return {
+      audit_event_id: id,
+      occurred_at: at,
+      actor: { kind: "agent" as const, agent_ref: "agent-1" },
+      channel: "mcp" as const,
+      operation: "search",
+      prompt_or_query: `prompt-${id}`,
+      query_id: queryId,
+    };
+  }
+
+  it.skipIf(!lmdbNativeOpenAvailable())(
+    "two concurrent appendFromAudit() on the same backend produce ONE linear chain (no orphan/overwrite)",
+    async () => {
+      const dir = await mkdtemp(join(tmpdir(), "sdw-qh-concurrent-"));
+      tempDirs.push(dir);
+      const backend = await LmdbStorageBackend.open({ path: dir });
+      try {
+        const store = new SdwQueryHistoryStore({
+          storage: backend,
+          masterKey: QH_MASTER_KEY,
+          fortressId: QH_FORTRESS,
+        });
+
+        // Seed one record so the chain head is non-empty (sequence 1) and the
+        // replay anchor exists; both racing appends then read head N = 1 and
+        // must serialize to N+1 = 2 and N+2 = 3, never two siblings at 2.
+        const seeded = await store.appendFromAudit(
+          qhAuditEvent("audit-0", "query-0", "2026-06-10T00:00:00.000Z"),
+        );
+        expect(seeded.sequence).toBe(1);
+
+        // Fire two appends concurrently. Without per-backend serialization
+        // both observe head sequence 1, both stage sequence 2, and the later
+        // commit overwrites/orphans the earlier record. The mutex forces a
+        // strict order: 2 then 3.
+        const [a, b] = await Promise.all([
+          store.appendFromAudit(qhAuditEvent("audit-1", "query-1", "2026-06-10T00:00:01.000Z")),
+          store.appendFromAudit(qhAuditEvent("audit-2", "query-2", "2026-06-10T00:00:02.000Z")),
+        ]);
+
+        // Exactly one linear chain: sequences {2,3}, distinct, contiguous.
+        const sequences = [a.sequence, b.sequence].sort((x, y) => x - y);
+        expect(sequences).toEqual([2, 3]);
+
+        // Chain head is the latest (sequence 3) and the whole chain verifies
+        // with no tampered/missing links — both appended records are reachable.
+        const head = await store.readChainHead();
+        expect(head.latest_sequence).toBe(3);
+        const verified = await store.verifyChain();
+        expect(verified.tampered).toEqual([]);
+        expect(verified.auditEventIds).toEqual(
+          new Set(["audit-0", "audit-1", "audit-2"]),
+        );
+
+        // Replay anchor counter is consistent with the head (floor == 3), so a
+        // subsequent readChainHead does not trip rollback detection.
+        await expect(store.readChainHead()).resolves.toMatchObject({
+          latest_sequence: 3,
+        });
+      } finally {
+        await backend.close();
+      }
+    },
+  );
+
+  it.skipIf(!lmdbNativeOpenAvailable())(
+    "two concurrent skip-conflict imports of the same absent key do not double-apply",
+    async () => {
+      const harness = await makeExportHarness();
+      const gate = makeGate(harness.source.auditLog, new AutoApproveChannel());
+      const exported = await callThroughGate(
+        harness.exportTool,
+        { export_name: "concurrent-skip" },
+        gate,
+      );
+      const destination = (exported as { payload: Record<string, unknown> }).payload
+        .destination_path as string;
+      const bundle = decodeSdwExportBundle(
+        Buffer.from(await readFile(destination, "utf8")).toString("base64url"),
+      );
+      const recordCount = bundle.manifest.body.records.length;
+      expect(recordCount).toBeGreaterThanOrEqual(4);
+
+      const dir = await mkdtemp(join(tmpdir(), "sdw-import-concurrent-"));
+      tempDirs.push(dir);
+      const backend = await LmdbStorageBackend.open({ path: dir });
+      const targetMasterKey = generateRandomKey();
+      try {
+        const importParams = {
+          bundle,
+          storage: backend as StorageBackend,
+          resolvePublicKey: harness.signing.resolvePublicKey,
+          sourceMasterKey: harness.source.masterKey,
+          targetMasterKey,
+          targetFortressId: TARGET_FORTRESS,
+          conflictResolution: "skip" as const,
+        };
+
+        // Both imports start with the target empty: every key is absent. Without
+        // isolation, both stage all records (each reports imported = recordCount)
+        // and the later commit overwrites the earlier write — a double-apply.
+        // Serialized, the second import sees the first's committed keys and skips
+        // them, so the imported counts sum to exactly recordCount.
+        const [first, second] = await Promise.all([
+          importSdwExportBundle(importParams),
+          importSdwExportBundle(importParams),
+        ]);
+
+        expect(first.imported + second.imported).toBe(recordCount);
+        const skips = [first, second].filter((r) => r.imported === 0);
+        expect(skips).toHaveLength(1);
+        expect(skips[0]!.skipped_existing).toBe(recordCount);
+
+        // Every record landed exactly once and is readable.
+        for (const record of bundle.manifest.body.records) {
+          expect(await backend.read(record.namespace, record.key)).not.toBeNull();
+        }
+      } finally {
+        await backend.close();
+      }
+    },
+  );
+});
+
 function lmdbNativeOpenAvailable(): boolean {
   const script = `
     import('lmdb').then(async lmdb => {
