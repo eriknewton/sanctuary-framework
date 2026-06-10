@@ -174,3 +174,37 @@ Tracking reference: Newton Wiki session `sanctuary-castle-wall-mac-phase-2-5-tra
 
 A future PR will either deprecate `init` for filesystem-only Castle Wall
 fortresses or wire recovery-key consumption through `wrap`.
+
+## Headless arm / disarm (SSH-safe operation)
+
+Arm and disarm no longer require the GUI. The host-app binary doubles as a
+headless filter CLI, and `sanctuary castle-wall enable|disable` drives it:
+
+```
+sanctuary castle-wall enable        # arm; refuses without a reachable policy daemon
+sanctuary castle-wall enable --force
+sanctuary castle-wall disable      # disarm; unconditional dead-man lever
+```
+
+Under the hood this runs
+`Sanctuary-CastleWall.app/Contents/MacOS/CastleWallHostApp --headless <enable|disable|status>`,
+which prints one JSON line and exits 0 (success), 1 (failure), 2 (usage),
+3 (needs the one-time consent), or 4 (NE preferences timeout). Running the
+host-app binary itself is load-bearing: the NE content-filter configuration
+is owned by the signed app identity that created it, so only that binary can
+toggle `NEFilterManager.isEnabled` without re-prompting. The headless path
+never initializes SwiftUI, so it needs no WindowServer and works over SSH.
+
+The ONE remaining GUI step is the initial content-filter consent (once per
+install, a macOS requirement): launch the app at the console once and click
+Allow. After that, remote drills can arm with a delivered policy and disarm
+again without any console click, and a remote dead-man auto-disarm is just a
+scheduled `sanctuary castle-wall disable`.
+
+`enable` refuses to arm when no Castle Wall daemon answers on the fortress
+socket, because filter-on + daemon-down fail-closes the machine to deny-all
+(the 2026-06-09 Hermes drill lockout). `--force` overrides for setups where
+the daemon is supervised out-of-band. `disable` deliberately has no
+preconditions. Both verbs append a best-effort `operator_decision` audit
+entry (source `castle-wall-cli`) and re-verify the live state through
+`--headless status` before reporting success.

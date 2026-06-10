@@ -774,6 +774,16 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runStatus();
   }
 
+  if (command === "enable") {
+    const { runEnable } = await import("./cli/castle-wall.js");
+    return runEnable(args.slice(1));
+  }
+
+  if (command === "disable") {
+    const { runDisable } = await import("./cli/castle-wall.js");
+    return runDisable(args.slice(1));
+  }
+
   if (command === "setup-shared-dir") {
     const { runSetupSharedDir } = await import("./cli/castle-wall.js");
     return runSetupSharedDir();
@@ -828,6 +838,9 @@ function printCastleWallHelp(): void {
   Subcommands:
     provision-pin    Generate and pin the local Castle Wall keypair.
     status           Show pinned-key fingerprint and sysext status.
+    enable           Arm the content filter headlessly (macOS; SSH-safe after the one-time GUI consent).
+                     Refuses without a reachable policy daemon; --force overrides.
+    disable          Disarm the content filter headlessly (macOS; unconditional dead-man lever).
     setup-shared-dir Create the privileged shared dir for the pinned key (run with sudo, macOS).
     reload           Reload policy in the running fortress daemon.
     audit-dump       Emit Castle Wall audit events as JSONL.

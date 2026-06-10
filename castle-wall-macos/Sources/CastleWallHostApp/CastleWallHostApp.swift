@@ -1,6 +1,7 @@
 import SwiftUI
 
-@main
+// Entry point lives in CastleWallMain (no @main here): headless `--headless`
+// invocations must be routed before SwiftUI initializes.
 struct CastleWallHostApp: App {
     @StateObject private var systemExtensionManager = SystemExtensionManager()
     @StateObject private var filterConfigurationManager = FilterConfigurationManager()
