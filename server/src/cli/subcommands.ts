@@ -29,6 +29,8 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "status",
   "task",
   "template",
+  "transparency",
   "verify-exit-bundle",
+  "verify-transparency",
   "wrap",
 ] as const;

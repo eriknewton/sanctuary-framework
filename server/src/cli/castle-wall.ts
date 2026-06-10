@@ -577,12 +577,95 @@ export async function runDaemon(
   }
   write(out, "Daemon running in the foreground. Ctrl-C (SIGINT) or SIGTERM to stop.\n");
 
+  // Periodic verifiable-transparency checkpoints. Default cadence 6h;
+  // SANCTUARY_TRANSPARENCY_INTERVAL accepts "off", ms, or <n>s|m|h|d. A
+  // misconfigured cadence refuses to start the daemon (no silent fallback);
+  // a failed emission tick is loud on stderr but never crashes enforcement
+  // and never persists a partial checkpoint (the emitter is fail-closed).
+  let transparencyScheduler: { stop(): void } | undefined;
+  {
+    const {
+      parseTransparencyInterval,
+      startTransparencyScheduler,
+      TRANSPARENCY_INTERVAL_ENV,
+    } = await import("../transparency/scheduler.js");
+    let intervalMs: number | null;
+    try {
+      intervalMs = parseTransparencyInterval(env[TRANSPARENCY_INTERVAL_ENV]);
+    } catch (error) {
+      write(err, `${(error as Error).message}\n`);
+      await daemon.stop().catch(() => undefined);
+      return 1;
+    }
+    if (intervalMs !== null) {
+      const { emitEnforcementCheckpoint } = await import(
+        "../transparency/emitter.js"
+      );
+      const { resolveTransparencySigner } = await import(
+        "../transparency/signer.js"
+      );
+      const { createRequire } = await import("node:module");
+      const { realpathSync } = await import("node:fs");
+      const { version: pkgVersion } = createRequire(import.meta.url)(
+        "../../package.json",
+      ) as { version: string };
+      transparencyScheduler = startTransparencyScheduler({
+        intervalMs,
+        emit: async () => {
+          const signer = await resolveTransparencySigner({
+            fortressPath: storagePath,
+            masterKey: derived.key,
+            env,
+            ...(localSign ? { mode: "local" as const } : {}),
+          });
+          const record = await emitEnforcementCheckpoint({
+            storage,
+            auditLog,
+            fortressId: fortressIdFromStoragePath(storagePath),
+            fortressPath: storagePath,
+            masterKey: derived.key,
+            signer,
+            binaryPath: realpathSync(process.argv[1] ?? ""),
+            version: pkgVersion,
+          });
+          await auditLog.appendCritical({
+            layer: "l2",
+            operation: "transparency_checkpoint_emitted",
+            identity_id: record.fortress_id,
+            result: "success",
+            details: {
+              counter: record.counter,
+              merkle_root: record.audit.merkle_root,
+              highest_sequence: record.audit.highest_sequence,
+              signer_kid: record.signer_kid,
+            },
+          });
+          write(
+            out,
+            `[transparency] enforcement checkpoint ${record.counter} emitted (audit head seq ${record.audit.highest_sequence}).\n`,
+          );
+        },
+        onError: (error) => {
+          write(
+            err,
+            `[transparency] checkpoint emission FAILED (nothing was persisted): ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        },
+      });
+      write(
+        out,
+        `[transparency] periodic enforcement checkpoints every ${Math.round(intervalMs / 60_000)}m (set ${TRANSPARENCY_INTERVAL_ENV}=off to disable).\n`,
+      );
+    }
+  }
+
   await new Promise<void>((resolveWait) => {
     let stopping = false;
     const stop = () => {
       if (stopping) return;
       stopping = true;
       write(err, "\nStopping Castle Wall daemon...\n");
+      transparencyScheduler?.stop();
       void daemon
         .stop()
         .catch(() => undefined)
