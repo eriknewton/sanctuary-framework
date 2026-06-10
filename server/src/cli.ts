@@ -935,6 +935,21 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runDaemon(args.slice(1));
   }
 
+  if (command === "install-boot") {
+    const { runInstallBoot } = await import("./cli/castle-wall-boot.js");
+    return runInstallBoot(args.slice(1));
+  }
+
+  if (command === "uninstall-boot") {
+    const { runUninstallBoot } = await import("./cli/castle-wall-boot.js");
+    return runUninstallBoot(args.slice(1));
+  }
+
+  if (command === "provision-boot-token") {
+    const { runProvisionBootToken } = await import("./cli/castle-wall-boot.js");
+    return runProvisionBootToken(args.slice(1));
+  }
+
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `Unknown subcommand: ${command}. Try: sanctuary castle-wall --help`
@@ -965,6 +980,13 @@ function printCastleWallHelp(): void {
     configure-origin Configure the agent-origin descriptor for origin-differential enforcement.
     re-pin           Migrate the trust anchor to the root signer helper's key (one-time, operator-approved).
     daemon           Start the enforcement daemon standalone (existing fortress key); foreground until Ctrl-C.
+                     With --safe-mode, comes up from the boot token only (no master key) for the launchd boot service.
+    provision-boot-token
+                     Mint the software-protected boot token (root-owned 0600; run with sudo). Anti-brick
+                     credential only, NOT the fortress passphrase. install-boot auto-provisions it; --rotate replaces.
+    install-boot     Install the daemon as a launchd safe-mode boot service (run with sudo, macOS).
+                     Options: --user <name> --fortress <path> --binary <path> --signer-client <path>
+    uninstall-boot   Remove the launchd boot service (run with sudo, macOS; requires --yes). Does NOT disarm the filter.
 
   Options:
     --help, -h              Show this help

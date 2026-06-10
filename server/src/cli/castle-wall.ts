@@ -25,6 +25,12 @@ import {
 } from "../l2-operational/audit-log.js";
 import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+import {
+  BOOT_TOKEN_LENGTH,
+  deriveSafeModeAuditKey,
+  readBootToken,
+  safeModeAuditStoragePath,
+} from "../castle-wall/boot/boot-token.js";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import type {
@@ -91,6 +97,20 @@ export interface CastleWallCommandContext {
    * Defaults to `systemextensionsctl list | grep castle-wall`.
    */
   sysextProbe?: () => Promise<SysextState>;
+  /** Override the boot-token custody path (F1 safe-mode; tests). */
+  bootTokenPath?: string;
+  /**
+   * Override the root-owned global pin path threaded into the safe-mode daemon
+   * cross-check (F1 safe-mode; tests point it at a temp path).
+   */
+  globalPinnedPublicKeyPath?: string;
+  /**
+   * Inject the daemon start function (F1 safe-mode; tests pass a fake so no
+   * real socket/helper is needed). Defaults to {@link startMacOSCastleWallDaemon}.
+   */
+  safeModeDaemonStart?: (
+    input: import("../castle-wall/runtime/macos-daemon.js").MacOSCastleWallDaemonInput,
+  ) => Promise<{ socketPath: string; stop: () => Promise<void> }>;
 }
 
 export interface CastleWallParsedArgs {
@@ -1056,6 +1076,12 @@ export async function runStatus(
  * existing audit log) and requires an existing fortress (key-params present).
  *
  * Runs in the foreground until SIGINT/SIGTERM, then tears the daemon down.
+ *
+ * F1: `--launchd` marks a launchd boot-service invocation (install-boot's
+ * LaunchDaemon passes it). Behavior is identical except audit provenance:
+ * filter/policy lifecycle events carry source "launchd-boot" so boot-time
+ * policy delivery is distinguishable from an interactive bring-up in the
+ * audit log.
  */
 export async function runDaemon(
   argv: string[] = [],
@@ -1072,8 +1098,15 @@ export async function runDaemon(
     return 1;
   }
 
+  // F1 Option C: the launchd boot service comes up in SAFE MODE — it holds
+  // only the software-protected boot token, never the fortress master key.
+  if (argv.includes("--safe-mode")) {
+    return runSafeModeDaemon(argv, ctx);
+  }
+
   const storagePath = resolveStoragePath(env);
   const localSign = env.SANCTUARY_CASTLE_LOCAL_SIGN === "1";
+  const launchdBoot = argv.includes("--launchd");
 
   // Report the active pin fingerprint. In helper mode the trust anchor is the
   // root-owned global pin (K_helper); in local mode it is the per-fortress key.
@@ -1165,6 +1198,7 @@ export async function runDaemon(
       fortressId: fortressIdFromStoragePath(storagePath),
       masterKey: derived.key,
       auditLog,
+      ...(launchdBoot ? { auditSource: "launchd-boot" } : {}),
       ...(localSign ? { localSign: true } : {}),
       ...(resolvedSignerClient
         ? { signerClientPath: resolvedSignerClient }
@@ -1181,6 +1215,9 @@ export async function runDaemon(
   }
 
   write(out, `Castle Wall daemon listening on ${daemon.socketPath}\n`);
+  if (launchdBoot) {
+    write(out, "Started under launchd (boot service); audit source = launchd-boot.\n");
+  }
   if (localSign) {
     write(out, `Signing via the local key; matches pin ${pinFingerprint} (decryption succeeded).\n`);
   } else {
@@ -1315,6 +1352,159 @@ export async function runDaemon(
       stopping = true;
       write(err, "\nStopping Castle Wall daemon...\n");
       transparencyScheduler?.stop();
+      void daemon
+        .stop()
+        .catch(() => undefined)
+        .finally(() => resolveWait());
+    };
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+  });
+  return 0;
+}
+
+/**
+ * F1 Option C — the SAFE-MODE boot daemon (the anti-brick half).
+ *
+ * This is what `install-boot`'s LaunchDaemon runs (`castle-wall daemon
+ * --safe-mode --launchd`) at boot, before any user login. It comes up holding
+ * ONLY the software-protected boot token — never the fortress passphrase or
+ * master key, which are not present pre-login. Concretely it differs from the
+ * full `runDaemon` in three ways:
+ *
+ *   1. No passphrase / master key. It reads the boot token (root-only 0600,
+ *      fail-closed on any custody violation) and derives a safe-mode audit key
+ *      from it, so boot-time lifecycle is recorded in a dedicated audit segment
+ *      without the master key. The fortress passphrase is never touched.
+ *   2. Helper signing only. Manifest delivery routes through the root signer
+ *      helper (no private key in this process). Local-sign is REFUSED here: it
+ *      would require the master key to decrypt the on-disk private key, which
+ *      defeats the entire point of the split credential.
+ *   3. Audit provenance `launchd-boot-safe-mode`, so safe-mode bring-up is
+ *      distinguishable from a full interactive/login bring-up in the audit
+ *      stream.
+ *
+ * The wall still enforces: the system extension recovers + verifies the
+ * persisted last-valid signed manifest against the pinned PUBLIC key (no secret
+ * needed), and absent a manifest classifies every flow `.agent` and denies.
+ * Full operation (approvals that touch fortress state, the master-key audit
+ * log) resumes when the operator logs in and the full daemon supersedes this
+ * one. SSH / operator endpoints stay reachable throughout, so an unattended
+ * reboot can no longer brick the box.
+ */
+export async function runSafeModeDaemon(
+  _argv: string[] = [],
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const platform = ctx.platform ?? process.platform;
+
+  if (platform !== "darwin") {
+    write(err, "castle-wall daemon --safe-mode is macOS-only.\n");
+    return 1;
+  }
+
+  // Local-sign is incompatible with safe mode: it needs the master key to
+  // decrypt the on-disk private key, which the boot context must never hold.
+  if (env.SANCTUARY_CASTLE_LOCAL_SIGN === "1") {
+    write(
+      err,
+      "Refusing to start safe mode with SANCTUARY_CASTLE_LOCAL_SIGN=1: local signing needs the fortress master key, which is never present in the pre-login boot context. Safe mode signs via the root helper only.\n",
+    );
+    return 1;
+  }
+
+  const storagePath = resolveStoragePath(env);
+  const fortressId = fortressIdFromStoragePath(storagePath);
+
+  // 1. Boot token (the only secret safe mode holds). Fail-closed on absence or
+  //    any custody violation, never mint a fresh one.
+  const tokenRead = await readBootToken(
+    ctx.bootTokenPath ? { path: ctx.bootTokenPath } : {},
+  );
+  if (tokenRead.status !== "ok") {
+    const detail =
+      tokenRead.status === "not-found"
+        ? "no boot token found. Run 'sudo sanctuary castle-wall provision-boot-token' first"
+        : tokenRead.status === "bad-mode"
+          ? `boot token has insecure permissions (mode ${tokenRead.mode.toString(8)}); it must be 0600. Re-run 'sudo sanctuary castle-wall provision-boot-token'`
+          : `boot token is the wrong length (${tokenRead.length} bytes; expected ${BOOT_TOKEN_LENGTH}); re-run 'sudo sanctuary castle-wall provision-boot-token'`;
+    write(err, `Refusing to start safe mode: ${detail}.\n`);
+    return 1;
+  }
+
+  // 2. Derive the safe-mode audit key and open the boot-token-keyed audit
+  //    segment (separate from the master-key audit log, which is unreadable
+  //    pre-login by design).
+  const safeModeAuditKey = deriveSafeModeAuditKey(tokenRead.token);
+  const auditStorage = new FilesystemStorage(
+    safeModeAuditStoragePath(storagePath, tokenRead.token),
+  );
+  const auditLog = new AuditLog(auditStorage, safeModeAuditKey);
+
+  // 3. Helper signer is mandatory in safe mode.
+  const signerClientPath =
+    ctx.signerClientPath ?? env.SANCTUARY_CASTLE_SIGNER_CLIENT;
+  if (!signerClientPath && !ctx.signerClientInvoke) {
+    write(
+      err,
+      "Refusing to start safe mode without a signer helper: set SANCTUARY_CASTLE_SIGNER_CLIENT to the signer-client shim path. Safe mode never local-signs.\n",
+    );
+    return 1;
+  }
+
+  const startDaemon =
+    ctx.safeModeDaemonStart ??
+    (async (input) => {
+      const { startMacOSCastleWallDaemon } = await import(
+        "../castle-wall/runtime/index.js"
+      );
+      return startMacOSCastleWallDaemon(input);
+    });
+
+  let daemon: { socketPath: string; stop: () => Promise<void> };
+  try {
+    daemon = await startDaemon({
+      fortressPath: storagePath,
+      fortressId,
+      // Inert in helper mode (only local signing reads masterKey); we pass the
+      // safe-mode audit key so no fortress key material is constructed here.
+      masterKey: safeModeAuditKey,
+      auditLog,
+      auditSource: "launchd-boot-safe-mode",
+      ...(signerClientPath ? { signerClientPath } : {}),
+      ...(ctx.signerClientInvoke ? { signerClientInvoke: ctx.signerClientInvoke } : {}),
+      ...(ctx.globalPinnedPublicKeyPath
+        ? { globalPinnedPublicKeyPath: ctx.globalPinnedPublicKeyPath }
+        : {}),
+    });
+  } catch (error) {
+    write(err, `Safe-mode daemon failed to start: ${(error as Error).message}\n`);
+    write(
+      err,
+      "The signer helper is unreachable. The system extension keeps enforcing the persisted last-valid manifest (deny baseline) meanwhile; KeepAlive will retry. Refusing to arm without a signer (fail-closed).\n",
+    );
+    return 1;
+  }
+
+  write(out, `Castle Wall SAFE-MODE daemon listening on ${daemon.socketPath}\n`);
+  write(
+    out,
+    "Safe mode: boot token only, no fortress master key; signing via the root helper; audit source = launchd-boot-safe-mode.\n",
+  );
+  write(
+    out,
+    "Agents denied by default; persisted signed manifest enforced if present. Full operation resumes at first login.\n",
+  );
+
+  await new Promise<void>((resolveWait) => {
+    let stopping = false;
+    const stop = () => {
+      if (stopping) return;
+      stopping = true;
+      write(err, "\nStopping Castle Wall safe-mode daemon...\n");
       void daemon
         .stop()
         .catch(() => undefined)
@@ -2484,6 +2674,7 @@ const CASTLE_WALL_AUDIT_OPERATIONS = new Set([
   "external_firewall_clobber",
   "flow_decision_rejected",
   "flow_pending_approval_rejected",
+  "boot_token_provisioned",
 ]);
 
 async function sendCastleWallMessage<T extends CastleWallMessage>(

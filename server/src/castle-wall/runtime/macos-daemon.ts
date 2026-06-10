@@ -96,6 +96,13 @@ export interface MacOSCastleWallDaemonInput {
   /** Override the shim runner (tests). */
   signerClientInvoke?: ShimInvoker;
   /**
+   * Audit provenance label for filter lifecycle events (`filter_started` /
+   * `filter_stopped`). Defaults to "sanctuary-wrap" (the wrap-coupled
+   * bring-up). The launchd boot service passes "launchd-boot" so boot-time
+   * policy delivery is distinguishable in the audit log (F1).
+   */
+  auditSource?: string;
+  /**
    * Override the root-owned global pin path used for the F-A2-1 #4
    * defense-in-depth cross-check (helper mode). Defaults to the production
    * custody path; tests point it at a nonexistent temp path to isolate from any
@@ -160,6 +167,8 @@ export async function startMacOSCastleWallDaemon(
   const legacyActiveConfigPath = input.activeConfigPath
     ? undefined
     : CASTLE_WALL_ACTIVE_CONFIG_LEGACY_PATH;
+
+  const auditSource = input.auditSource ?? "sanctuary-wrap";
 
   await assertActiveConfigNotOwnedByLiveProcess(activeConfigPath, legacyActiveConfigPath);
   await assertSocketNotOwnedByLiveProcess(socketPath);
@@ -283,7 +292,7 @@ export async function startMacOSCastleWallDaemon(
       "l1",
       "filter_started",
       input.fortressId,
-      { socket_path: socketPath, source: "sanctuary-wrap" },
+      { socket_path: socketPath, source: auditSource },
       "success",
     );
     await input.auditLog.flush();
@@ -387,7 +396,7 @@ export async function startMacOSCastleWallDaemon(
           "l1",
           "filter_stopped",
           input.fortressId,
-          { socket_path: socketPath, source: "sanctuary-wrap" },
+          { socket_path: socketPath, source: auditSource },
           "success",
         );
         await input.auditLog.flush();
