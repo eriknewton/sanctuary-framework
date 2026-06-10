@@ -22,6 +22,12 @@ public struct SanctuaryContainerConfig: Sendable {
     /// to register a listener. It is retained as a reserved, below-range
     /// (< 0x1000_0000) constant for forward compatibility and is harmless.
     public let egressVsockPort: UInt32
+    /// B2 INNER-CONFINEMENT. When true (the production default), the launcher
+    /// installs a trusted seccomp-deny-`AF_VSOCK` filter before EVERY plugin
+    /// process runs (`SanctuaryGuestJail`), closing the proven vminitd box
+    /// escape regardless of whether the plugin cooperates. Disable only to
+    /// reproduce the unconfined baseline in a drill.
+    public let applyGuestJail: Bool
 
     public init(
         kernelPath: String,
@@ -31,7 +37,8 @@ public struct SanctuaryContainerConfig: Sendable {
         cpuCount: Int = 2,
         memoryBytes: UInt64 = 512 * 1024 * 1024,
         rootfsPins: [SanctuaryArtifactPin] = [],
-        egressVsockPort: UInt32 = 0x0FFF_0001
+        egressVsockPort: UInt32 = 0x0FFF_0001,
+        applyGuestJail: Bool = true
     ) {
         self.kernelPath = kernelPath
         self.initfsReference = initfsReference
@@ -41,6 +48,7 @@ public struct SanctuaryContainerConfig: Sendable {
         self.memoryBytes = memoryBytes
         self.rootfsPins = rootfsPins
         self.egressVsockPort = egressVsockPort
+        self.applyGuestJail = applyGuestJail
     }
 }
 
@@ -137,7 +145,13 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
         ) { @Sendable cfg in
             cfg.cpus = launchConfig.cpuCount
             cfg.memoryInBytes = launchConfig.memoryBytes
-            cfg.process.arguments = [request.command] + request.args
+            // B2 inner-confinement: born-confined plugin argv. When applyGuestJail
+            // is on (production default), the trusted launcher prepends the
+            // seccomp-deny-AF_VSOCK preamble so the plugin cannot reach vminitd,
+            // whether or not it cooperates. seccomp survives the preamble's execvp.
+            cfg.process.arguments = launchConfig.applyGuestJail
+                ? SanctuaryGuestJail.wrap(command: request.command, args: request.args)
+                : [request.command] + request.args
             cfg.process.workingDirectory = request.cwd
             for (key, value) in request.env {
                 cfg.process.environmentVariables.append("\(key)=\(value)")
@@ -216,7 +230,13 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
         ) { @Sendable cfg in
             cfg.cpus = launchConfig.cpuCount
             cfg.memoryInBytes = launchConfig.memoryBytes
-            cfg.process.arguments = [request.command] + request.args
+            // B2 inner-confinement: born-confined plugin argv. When applyGuestJail
+            // is on (production default), the trusted launcher prepends the
+            // seccomp-deny-AF_VSOCK preamble so the plugin cannot reach vminitd,
+            // whether or not it cooperates. seccomp survives the preamble's execvp.
+            cfg.process.arguments = launchConfig.applyGuestJail
+                ? SanctuaryGuestJail.wrap(command: request.command, args: request.args)
+                : [request.command] + request.args
             cfg.process.workingDirectory = request.cwd
             for (key, value) in request.env {
                 cfg.process.environmentVariables.append("\(key)=\(value)")
