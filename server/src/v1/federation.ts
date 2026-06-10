@@ -1,0 +1,581 @@
+/**
+ * /v1 federation endpoints + join-authorization ceremony (PR-A3).
+ *
+ *   POST /v1/federation/enable             SESSION + OPERATOR_SIGNED, Tier 1
+ *   POST /v1/federation/disable            SESSION + OPERATOR_SIGNED, Tier 1
+ *   GET  /v1/federation/status             SESSION
+ *   POST /v1/federation/authorize/init     SESSION + OPERATOR_SIGNED, Tier 1
+ *   POST /v1/federation/authorize/complete BOOTSTRAP_TOKEN (pre-session class)
+ *
+ * The join ceremony is operator-authorized in two crypto-verified steps and
+ * is built by WRAPPING the existing mesh lifecycle primitives — it does not
+ * reimplement them:
+ *
+ *  - `authorize/init` mints a short-lived, operator-principal-signed
+ *    bootstrap token (`issueBootstrapToken`). The token alone is not
+ *    membership; it is the joining node's right to submit a JoinRequest.
+ *  - The joining node assembles a JoinRequest (`sanctuary federation join`)
+ *    and submits it to `authorize/complete`, which verifies the bootstrap
+ *    token signature (`verifyBootstrapToken`), the node_mode binding, and the
+ *    HKDF salt proof (`verifyJoinHkdfSaltProof` — defeats a stolen token held
+ *    without the master-derived transport key), then runs the operator
+ *    approval gate (`JoinApprover`) and issues a NodeIdentityCertificate
+ *    (`issueCertificateForApprovedJoin`). This mirrors
+ *    `MeshNode.acceptJoinRequest` field-for-field on the same helpers.
+ *
+ * Fail closed (CLAUDE.md constraint 4): a JoinRequest that cannot be
+ * cryptographically verified is DENIED, never trusted — verification is
+ * signature/proof based, never shape based. Every ceremony step writes an
+ * audit entry on BOTH success and denial (PR-A1 audit-write-completeness gap,
+ * design note 5). The pre-session `authorize/complete` collapses every
+ * failure to one uniform 401 so a probing caller learns nothing about whether
+ * federation is enabled, whether a node id is known, or which check failed.
+ */
+
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { fromBase64url } from "../core/encoding.js";
+import {
+  issueBootstrapToken,
+  verifyBootstrapToken,
+  verifyJoinHkdfSaltProof,
+} from "../mesh/lifecycle/bootstrap-token.js";
+import { issueCertificateForApprovedJoin } from "../mesh/lifecycle/join-approver.js";
+import { deriveNodeTransportKey } from "../mesh/trust-root.js";
+import type { NodeMode } from "../mesh/constants.js";
+import type {
+  FortressMasterPublicKey,
+  PrincipalCertificate,
+  NodeIdentityCertificate,
+} from "../mesh/types.js";
+import type {
+  BootstrapToken,
+  JoinApprover,
+  JoinRequest,
+} from "../mesh/lifecycle/types.js";
+import type { V1SessionClaims } from "./session-service.js";
+import { verifyOperatorSignature } from "./operator-signed.js";
+import { writeJson, readJsonBody, denyUnauthorized, denyForbidden } from "./http.js";
+
+const NODE_MODES: readonly NodeMode[] = [
+  "local",
+  "operator_cloud",
+  "sovereign_tee",
+];
+
+/** A path owned by the federation handler (post-session class). */
+export function isFederationPath(pathname: string): boolean {
+  return (
+    pathname === "/v1/federation/enable" ||
+    pathname === "/v1/federation/disable" ||
+    pathname === "/v1/federation/status" ||
+    pathname === "/v1/federation/authorize/init"
+  );
+}
+
+/** The pre-session (bootstrap-token-authenticated) join-submission path. */
+export function isFederationCeremonyPath(pathname: string): boolean {
+  return pathname === "/v1/federation/authorize/complete";
+}
+
+// ── Fortress materials + ceremony ─────────────────────────────────────────
+
+/**
+ * Fortress materials needed to mint bootstrap tokens and approve joins. Bound
+ * into the dashboard out of band (the console/mesh boot path owns supplying
+ * these); until bound, federation cannot operate and every authorize path
+ * fails closed. Private-key/master-secret accessors return TRANSIENT copies
+ * the caller is responsible for; this module never persists or logs them.
+ */
+export interface FederationContext {
+  fortressId: string;
+  /** This fortress node's id (echoed into status). */
+  nodeId: string;
+  pinnedMasterPubkey: FortressMasterPublicKey;
+  issuingPrincipalCert: PrincipalCertificate;
+  /** Transient operator principal private key (signs tokens + certs). */
+  getIssuingPrincipalPrivateKey(): Uint8Array;
+  /** Transient fortress-master secret (derives the transport key for proofs). */
+  getFortressMasterSecret(): Uint8Array;
+  /** Transient fortress-master private key, when this node holds it (cert master sig). */
+  getMasterPrivateKey?(): Uint8Array | undefined;
+  /**
+   * Operator approval gate. Defaults to issuing a certificate for any
+   * request that already passed cryptographic verification (the bootstrap
+   * token IS the operator's prior authorization). Inject a denying approver
+   * to model a policy refusal.
+   */
+  approver?: JoinApprover;
+}
+
+export type AuthorizeCompleteResult =
+  | {
+      approved: true;
+      certificate: NodeIdentityCertificate;
+      issuingPrincipalCert: PrincipalCertificate;
+      nodeId: string;
+    }
+  | { approved: false; denialReason: string };
+
+/**
+ * The join-authorization ceremony, composed from the mesh lifecycle
+ * primitives. Stateless except for the in-memory roster of joined node ids
+ * (status only); all trust decisions are crypto-verified per call.
+ */
+export class JoinCeremony {
+  constructor(private readonly ctx: FederationContext) {}
+
+  /** Mint a bootstrap token for a node the operator is authorizing to join. */
+  authorizeInit(params: {
+    intendedNodeId: string;
+    intendedNodeMode: NodeMode;
+  }): BootstrapToken {
+    return issueBootstrapToken({
+      intended_node_id: params.intendedNodeId,
+      intended_node_mode: params.intendedNodeMode,
+      fortress_id: this.ctx.fortressId,
+      issuing_principal: this.ctx.issuingPrincipalCert.principal_id,
+      principal_private_key: this.ctx.getIssuingPrincipalPrivateKey(),
+    });
+  }
+
+  /**
+   * Verify a submitted JoinRequest and, on approval, issue its certificate.
+   * Mirrors `MeshNode.acceptJoinRequest`: bootstrap-token signature →
+   * node_mode binding → HKDF salt proof → operator gate. Any verification
+   * failure returns `{ approved: false }` with an operator-facing reason; the
+   * HTTP layer collapses every denial to one uniform 401.
+   */
+  async authorizeComplete(request: JoinRequest): Promise<AuthorizeCompleteResult> {
+    // 1. Bootstrap token must verify against the issuing principal cert for
+    //    THIS fortress (signature + fortress binding + TTL). Throws on any
+    //    failure — caught and mapped to a uniform denial.
+    try {
+      verifyBootstrapToken({
+        token: request.bootstrap_token,
+        expected_fortress_id: this.ctx.fortressId,
+        issuing_principal_cert: this.ctx.issuingPrincipalCert,
+      });
+    } catch (err) {
+      return { approved: false, denialReason: `bootstrap token rejected: ${reason(err)}` };
+    }
+
+    // 2. The declared node_mode must match the mode the token was minted for.
+    if (request.node_mode !== request.bootstrap_token.intended_node_mode) {
+      return {
+        approved: false,
+        denialReason: "node_mode does not match bootstrap token",
+      };
+    }
+    if (!NODE_MODES.includes(request.node_mode)) {
+      return { approved: false, denialReason: "unknown node_mode" };
+    }
+
+    // 3. HKDF salt proof: the requester must hold the master-derived transport
+    //    key, not merely a stolen bootstrap token.
+    let proofOk = false;
+    try {
+      const transportKey = deriveNodeTransportKey({
+        fortress_master_secret: this.ctx.getFortressMasterSecret(),
+        node_id: request.bootstrap_token.intended_node_id,
+        node_mode: request.node_mode,
+      });
+      proofOk = verifyJoinHkdfSaltProof({
+        intended_node_id: request.bootstrap_token.intended_node_id,
+        node_mode: request.node_mode,
+        node_transport_key: transportKey,
+        proof: request.hkdf_salt_proof,
+      });
+    } catch (err) {
+      return { approved: false, denialReason: `hkdf proof error: ${reason(err)}` };
+    }
+    if (!proofOk) {
+      return {
+        approved: false,
+        denialReason: "hkdf_salt_proof failed — token holder lacks master-derived transport key",
+      };
+    }
+
+    // 4. node_pubkey must be a well-formed Ed25519 key.
+    try {
+      const key = fromBase64url(request.node_pubkey);
+      if (key.length !== 32) {
+        return { approved: false, denialReason: "node_pubkey is not a 32-byte key" };
+      }
+    } catch {
+      return { approved: false, denialReason: "node_pubkey is malformed" };
+    }
+
+    // 5. Operator approval gate. Default approver issues a certificate for the
+    //    (now crypto-verified) request; an injected approver may deny.
+    const approver = this.ctx.approver ?? this.defaultApprover();
+    let result;
+    try {
+      result = await approver.requestApproval(request);
+    } catch (err) {
+      return { approved: false, denialReason: `approval gate error: ${reason(err)}` };
+    }
+    if (!result.approved || !result.certificate) {
+      return {
+        approved: false,
+        denialReason: result.denial_reason ?? "operator denied join",
+      };
+    }
+
+    return {
+      approved: true,
+      certificate: result.certificate,
+      issuingPrincipalCert: this.ctx.issuingPrincipalCert,
+      nodeId: result.certificate.node_id,
+    };
+  }
+
+  private defaultApprover(): JoinApprover {
+    const ctx = this.ctx;
+    return {
+      async requestApproval(request: JoinRequest) {
+        const certificate = issueCertificateForApprovedJoin({
+          request,
+          pinned_master_pubkey: ctx.pinnedMasterPubkey,
+          issuing_principal_cert: ctx.issuingPrincipalCert,
+          issuing_principal_private_key: ctx.getIssuingPrincipalPrivateKey(),
+          master_private_key: ctx.getMasterPrivateKey?.(),
+        });
+        return { approved: true, certificate };
+      },
+    };
+  }
+}
+
+function reason(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+// ── Service state ──────────────────────────────────────────────────────────
+
+/** Audit hook: writes one entry per ceremony step (success AND denial). */
+export type FederationAudit = (entry: {
+  operation: string;
+  result: "success" | "failure";
+  identityId: string;
+  details: Record<string, unknown>;
+}) => Promise<void>;
+
+export interface V1FederationDeps {
+  /** Live fortress materials, or null when federation is not provisioned. */
+  getContext(): FederationContext | null;
+  isEnabled(): boolean;
+  setEnabled(enabled: boolean): void;
+  /** Operator identity public key for OPERATOR_SIGNED gating (PR-A2 parity). */
+  resolveOperatorPublicKey(): Uint8Array | null;
+  audit: FederationAudit;
+  /** Joined node ids, for the status roster summary. */
+  rosterNodeIds(): string[];
+  /** Record a newly joined node (status roster). */
+  recordJoin(nodeId: string): void;
+}
+
+// ── Handlers ────────────────────────────────────────────────────────────────
+
+/**
+ * Post-session federation routes. The router has already validated the
+ * SESSION_TOKEN; `claims` is the authenticated client.
+ */
+export async function handleFederationRequest(
+  deps: V1FederationDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  method: string,
+  claims: V1SessionClaims,
+): Promise<boolean> {
+  if (method === "GET" && url.pathname === "/v1/federation/status") {
+    handleStatus(deps, res);
+    return true;
+  }
+  if (method === "POST" && url.pathname === "/v1/federation/enable") {
+    await handleEnableDisable(deps, req, res, claims, true);
+    return true;
+  }
+  if (method === "POST" && url.pathname === "/v1/federation/disable") {
+    await handleEnableDisable(deps, req, res, claims, false);
+    return true;
+  }
+  if (method === "POST" && url.pathname === "/v1/federation/authorize/init") {
+    await handleAuthorizeInit(deps, req, res, claims);
+    return true;
+  }
+  // Wrong method on an owned path: not found to an authenticated caller.
+  writeJson(res, 404, { error: "not found" });
+  return true;
+}
+
+function handleStatus(deps: V1FederationDeps, res: ServerResponse): void {
+  const ctx = deps.getContext();
+  const enabled = deps.isEnabled() && ctx !== null;
+  // Field discipline: never echo key material; only public identifiers.
+  writeJson(res, 200, {
+    enabled,
+    provisioned: ctx !== null,
+    fortress_id: ctx?.fortressId ?? null,
+    node_id: ctx?.nodeId ?? null,
+    roster: { size: deps.rosterNodeIds().length },
+  });
+}
+
+/**
+ * Verify the inline OPERATOR_SIGNED signature over a federation admin payload.
+ * Returns true only when an operator identity is configured AND the signature
+ * verifies; otherwise false (the caller maps false to the generic 403, no
+ * distinguishable reason — same contract as the agents write path).
+ */
+function verifyOperator(
+  deps: V1FederationDeps,
+  action: string,
+  payload: Record<string, unknown>,
+  signature: unknown,
+): boolean {
+  if (typeof signature !== "string" || signature.length === 0) return false;
+  const operatorPublicKey = deps.resolveOperatorPublicKey();
+  if (!operatorPublicKey) return false; // fail closed: no operator identity
+  return verifyOperatorSignature({
+    action,
+    payload,
+    signature,
+    operatorPublicKey,
+  });
+}
+
+async function handleEnableDisable(
+  deps: V1FederationDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+  _claims: V1SessionClaims,
+  enable: boolean,
+): Promise<void> {
+  const action = enable ? "/v1/federation/enable" : "/v1/federation/disable";
+  const operation = enable ? "v1_federation_enable" : "v1_federation_disable";
+  const body = await readJsonBody(req);
+  if (typeof body !== "object" || body === null) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+  const { idempotency_key, operator_signature } = body as {
+    idempotency_key?: unknown;
+    operator_signature?: unknown;
+  };
+  const signedPayload: Record<string, unknown> = {};
+  if (typeof idempotency_key === "string") signedPayload.idempotency_key = idempotency_key;
+
+  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: "operator",
+      details: { reason: "operator_signature_invalid" },
+    });
+    denyForbidden(res);
+    return;
+  }
+
+  // Enabling requires provisioned fortress materials; disabling is always
+  // honored (idempotent off). Honest authenticated error, not an auth oracle.
+  if (enable && deps.getContext() === null) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: "operator",
+      details: { reason: "federation_not_provisioned" },
+    });
+    writeJson(res, 503, { error: "unavailable" });
+    return;
+  }
+
+  deps.setEnabled(enable);
+  await deps.audit({
+    operation,
+    result: "success",
+    identityId: "operator",
+    details: { enabled: enable },
+  });
+  writeJson(res, 200, { enabled: enable });
+}
+
+async function handleAuthorizeInit(
+  deps: V1FederationDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+  _claims: V1SessionClaims,
+): Promise<void> {
+  const action = "/v1/federation/authorize/init";
+  const operation = "v1_federation_authorize_init";
+  const body = await readJsonBody(req);
+  if (typeof body !== "object" || body === null) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+  const { intended_node_id, intended_node_mode, operator_signature } = body as {
+    intended_node_id?: unknown;
+    intended_node_mode?: unknown;
+    operator_signature?: unknown;
+  };
+
+  if (typeof intended_node_id !== "string" || intended_node_id.length === 0) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+  if (
+    typeof intended_node_mode !== "string" ||
+    !NODE_MODES.includes(intended_node_mode as NodeMode)
+  ) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+
+  const signedPayload: Record<string, unknown> = {
+    intended_node_id,
+    intended_node_mode,
+  };
+  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: intended_node_id,
+      details: { reason: "operator_signature_invalid" },
+    });
+    denyForbidden(res);
+    return;
+  }
+
+  const ctx = deps.getContext();
+  if (!deps.isEnabled() || ctx === null) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: intended_node_id,
+      details: { reason: "federation_disabled" },
+    });
+    writeJson(res, 503, { error: "unavailable" });
+    return;
+  }
+
+  let token: BootstrapToken;
+  try {
+    token = new JoinCeremony(ctx).authorizeInit({
+      intendedNodeId: intended_node_id,
+      intendedNodeMode: intended_node_mode as NodeMode,
+    });
+  } catch (err) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: intended_node_id,
+      details: { reason: reason(err) },
+    });
+    writeJson(res, 503, { error: "unavailable" });
+    return;
+  }
+
+  await deps.audit({
+    operation,
+    result: "success",
+    identityId: intended_node_id,
+    details: { intended_node_mode, nonce: token.nonce },
+  });
+  writeJson(res, 200, { bootstrap_token: token });
+}
+
+/**
+ * Pre-session join-submission ceremony (BOOTSTRAP_TOKEN auth class). Reached
+ * by the router BEFORE the session gate, like session/init. Every failure —
+ * federation off, missing materials, bad body, unverifiable request — returns
+ * the SAME uniform 401 so a probing joining node gets no oracle.
+ */
+export async function handleFederationCeremony(
+  deps: V1FederationDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  method: string,
+): Promise<boolean> {
+  if (method !== "POST" || url.pathname !== "/v1/federation/authorize/complete") {
+    return false;
+  }
+  const operation = "v1_federation_authorize_complete";
+  const ctx = deps.getContext();
+  const body = await readJsonBody(req);
+  const request = parseJoinRequest(body);
+
+  // Federation off / unprovisioned / malformed body: uniform 401, no oracle.
+  if (!deps.isEnabled() || ctx === null || request === null) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: joinRequestNodeId(body),
+      details: {
+        reason: !deps.isEnabled() || ctx === null ? "federation_unavailable" : "malformed_request",
+      },
+    });
+    denyUnauthorized(res);
+    return true;
+  }
+
+  const outcome = await new JoinCeremony(ctx).authorizeComplete(request);
+  if (!outcome.approved) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: request.bootstrap_token.intended_node_id,
+      details: { reason: outcome.denialReason },
+    });
+    // Fail closed: an unverifiable peer is denied with the uniform 401.
+    denyUnauthorized(res);
+    return true;
+  }
+
+  deps.recordJoin(outcome.nodeId);
+  await deps.audit({
+    operation,
+    result: "success",
+    identityId: outcome.nodeId,
+    details: { node_id: outcome.nodeId },
+  });
+  writeJson(res, 200, {
+    certificate: outcome.certificate,
+    issuing_principal_cert: outcome.issuingPrincipalCert,
+  });
+  return true;
+}
+
+/** Structural parse of a JoinRequest body. Returns null on any shape error. */
+function parseJoinRequest(body: unknown): JoinRequest | null {
+  if (typeof body !== "object" || body === null) return null;
+  const { bootstrap_token, node_pubkey, node_mode, attestation, hkdf_salt_proof } =
+    body as Record<string, unknown>;
+  if (typeof node_pubkey !== "string" || node_pubkey.length === 0) return null;
+  if (typeof node_mode !== "string") return null;
+  if (typeof hkdf_salt_proof !== "string" || hkdf_salt_proof.length === 0) return null;
+  if (typeof bootstrap_token !== "object" || bootstrap_token === null) return null;
+  const bt = bootstrap_token as Record<string, unknown>;
+  if (typeof bt.intended_node_id !== "string") return null;
+  if (typeof bt.issuing_principal !== "string") return null;
+  if (typeof bt.signature !== "string") return null;
+  return {
+    bootstrap_token: bootstrap_token as unknown as BootstrapToken,
+    node_pubkey,
+    node_mode: node_mode as NodeMode,
+    ...(typeof attestation === "string" ? { attestation } : {}),
+    hkdf_salt_proof,
+  };
+}
+
+/** Best-effort node id for an audit entry on a malformed request. */
+function joinRequestNodeId(body: unknown): string {
+  if (typeof body === "object" && body !== null) {
+    const bt = (body as Record<string, unknown>).bootstrap_token;
+    if (typeof bt === "object" && bt !== null) {
+      const id = (bt as Record<string, unknown>).intended_node_id;
+      if (typeof id === "string") return id;
+    }
+  }
+  return "unknown";
+}

@@ -39,6 +39,13 @@ import {
   isAgentsPath,
   type V1AgentsDeps,
 } from "./agents.js";
+import {
+  handleFederationRequest,
+  handleFederationCeremony,
+  isFederationPath,
+  isFederationCeremonyPath,
+  type V1FederationDeps,
+} from "./federation.js";
 
 export interface V1RouterContext {
   sessions: V1SessionService;
@@ -55,6 +62,12 @@ export interface V1RouterContext {
    * closed). Optional so PR-A1's minimal test rigs still construct.
    */
   agents?: V1AgentsDeps;
+  /**
+   * PR-A3 federation endpoints (enable/disable/status, authorize ceremony).
+   * Always wired in production; fail closed when no fortress context is
+   * provisioned. Optional so earlier minimal test rigs still construct.
+   */
+  federation?: V1FederationDeps;
 }
 
 /**
@@ -110,6 +123,10 @@ export async function handleV1Request(
       challenge: result.challenge,
       challenge_id: result.challenge_id,
       expires_at: result.expires_at,
+      // Echo the bound ref so the client signs the challenge over the exact
+      // attestation ref the daemon recorded (PR-A3: the ref now varies by
+      // auth path — durable operator vs loopback vs auth-disabled).
+      attestation_ref: result.attestation_ref,
     });
     return true;
   }
@@ -131,6 +148,19 @@ export async function handleV1Request(
       capabilities: result.capabilities,
     });
     return true;
+  }
+
+  // ── Federation join-submission ceremony (BOOTSTRAP_TOKEN class) ─────
+  // The joining node has no /v1 session on this fortress; its credential is
+  // the operator-signed bootstrap token inside the JoinRequest. Handled here,
+  // before the session gate, like session/init — every failure collapses to
+  // the same uniform 401, so a probing joiner cannot tell federation-off from
+  // a bad token from an unknown node. Only POST is the ceremony; a non-POST on
+  // this path falls through to the session gate (404 to an authed caller, 401
+  // otherwise) exactly like a non-POST on the session ceremony endpoints — it
+  // must never fall through to legacy /api routing.
+  if (ctx.federation && method === "POST" && isFederationCeremonyPath(url.pathname)) {
+    return handleFederationCeremony(ctx.federation, req, res, url, method);
   }
 
   // ── GET /v1/status: PUBLIC minimal without credentials ──────────────
@@ -169,6 +199,12 @@ export async function handleV1Request(
   // verification on top of the session inside the handler.
   if (ctx.agents && isAgentsPath(url.pathname)) {
     return handleAgentsRequest(ctx.agents, req, res, url, method, claims);
+  }
+
+  // PR-A3 federation admin endpoints (enable/disable/status, authorize/init).
+  // The write paths layer OPERATOR_SIGNED on top of the session in the handler.
+  if (ctx.federation && isFederationPath(url.pathname)) {
+    return handleFederationRequest(ctx.federation, req, res, url, method, claims);
   }
 
   denyNotFound(res);

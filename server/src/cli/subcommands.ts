@@ -15,6 +15,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "erc8004",
   "exit",
   "export-passphrase",
+  "federation",
   "generate",
   "identity",
   "import-exit-bundle",

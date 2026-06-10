@@ -49,6 +49,7 @@ import {
   type V1AgentsDeps,
   type UnprotectOutcome,
 } from "../v1/agents.js";
+import type { V1FederationDeps, FederationContext } from "../v1/federation.js";
 import { HubNotFoundError, HubCapabilityError } from "../hub/errors.js";
 import { fromBase64url } from "../core/encoding.js";
 import type { ApprovalAggregator } from "./approval-aggregator.js";
@@ -243,6 +244,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private v1Idempotency = new V1IdempotencyStore();
 
   /**
+   * Federation PR-A3 state. `_federationContext` carries the fortress
+   * materials (master secret accessor, principal cert + key, pinned master
+   * pubkey) the join ceremony needs; it is bound out of band by the console/
+   * mesh boot path via {@link setFederationContext}. Until bound, federation
+   * is unprovisioned and every authorize path fails closed. `_federationEnabled`
+   * is the operator-controlled on/off switch; `_federationRoster` tracks
+   * joined node ids for the status summary only.
+   */
+  private _federationContext: FederationContext | null = null;
+  private _federationEnabled = false;
+  private readonly _federationRoster = new Set<string>();
+
+  /**
    * v1.3 WP-V1.3-10 Cross-Harness Approval Inbox aggregator. Mounted
    * additively at `/api/approval-inbox/*` when set. Legacy approval
    * routes at `/api/approvals/:id/(allow|deny)` continue to serve. The
@@ -329,7 +343,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // (setAutoAuthLocalhost) is always observed.
     this.v1Sessions = new V1SessionService({
       auth: {
-        getAuthToken: () => this.authToken,
+        // PR-A3: the credentialed session path is a durable Ed25519 operator
+        // attestation verified against THIS key — the same operator identity
+        // key the OPERATOR_SIGNED write path resolves. The bearer-token path
+        // is gone (replace-not-extend); loopback auto-auth remains a
+        // network-position fallback only.
+        resolveOperatorPublicKey: () => this.resolveOperatorPublicKey(),
         isLoopbackAutoAuthEnabled: () => this._autoAuthLocalhost,
       },
     });
@@ -801,7 +820,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         port: this.config.port,
         tls: this.useTLS,
       },
-      federation: { enabled: false },
+      federation: {
+        enabled: this._federationEnabled && this._federationContext !== null,
+        provisioned: this._federationContext !== null,
+        roster_size: this._federationRoster.size,
+      },
       identity: identity
         ? {
             identity_id: identity.identity_id,
@@ -831,31 +854,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     return {
       nodeId,
       listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
-      resolveOperatorPublicKey: () => {
-        // Prefer the HUB-BOUND identity's key over the current default: the
-        // hub lists/controls agents for `v11Bindings.identityId`, so if the
-        // process default identity later changes, a write signed by the new
-        // default must not act on the old identity's agents (codex finding,
-        // multi-identity isolation). But `v11Bindings.identityId` may be a
-        // SYNTHETIC fortress-scoped id (`fortress:<path>`) on a fresh
-        // standalone boot, where the real signing identity only exists as the
-        // default — in that case `get()` returns undefined and we fall back
-        // to the default so valid signed writes are not rejected (codex
-        // finding). The hub is single-operator in v1.1, so this fallback does
-        // not widen authority; true per-identity binding is gated on the
-        // hub's own v1.2 multi-identity work.
-        const hubIdentityId = this.v11Bindings?.identityId;
-        const identity =
-          (hubIdentityId ? this.identityManager?.get(hubIdentityId) : undefined) ??
-          this.identityManager?.getDefault();
-        if (!identity?.public_key) return null;
-        try {
-          const key = fromBase64url(identity.public_key);
-          return key.length === 32 ? key : null;
-        } catch {
-          return null;
-        }
-      },
+      resolveOperatorPublicKey: () => this.resolveOperatorPublicKey(),
       enqueueUnprotect: async (agentId): Promise<UnprotectOutcome> => {
         const hub = this.v11Bindings?.hubService;
         if (!hub) return { ok: false, reason: "unavailable" };
@@ -877,6 +876,78 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         }
       },
       idempotency: this.v1Idempotency,
+    };
+  }
+
+  /**
+   * Resolve the daemon operator identity's Ed25519 public key (32 bytes), or
+   * null when none is configured. Shared by the durable session-attestation
+   * verifier (PR-A3), the agents OPERATOR_SIGNED write path (PR-A2), and the
+   * federation admin endpoints (PR-A3) so all three trace to ONE operator key.
+   *
+   * Prefers the HUB-BOUND identity's key over the process default: the hub
+   * lists/controls agents for `v11Bindings.identityId`, so if the default
+   * identity later changes, a write signed by the new default must not act on
+   * the old identity's agents (multi-identity isolation). But
+   * `v11Bindings.identityId` may be a SYNTHETIC fortress-scoped id
+   * (`fortress:<path>`) on a fresh standalone boot, where the real signing
+   * identity only exists as the default — there `get()` returns undefined and
+   * we fall back to the default so valid signed requests are not rejected. The
+   * hub is single-operator in v1.1, so the fallback does not widen authority.
+   */
+  private resolveOperatorPublicKey(): Uint8Array | null {
+    const hubIdentityId = this.v11Bindings?.identityId;
+    const identity =
+      (hubIdentityId ? this.identityManager?.get(hubIdentityId) : undefined) ??
+      this.identityManager?.getDefault();
+    if (!identity?.public_key) return null;
+    try {
+      const key = fromBase64url(identity.public_key);
+      return key.length === 32 ? key : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Federation PR-A3: bind (or detach with `null`) the fortress materials the
+   * join ceremony needs. The console/mesh boot path supplies these once the
+   * fortress master secret is unlocked; until then federation is unprovisioned
+   * and every authorize path fails closed. Detaching also clears the enabled
+   * flag (a federation with no materials cannot be enabled).
+   */
+  setFederationContext(ctx: FederationContext | null): void {
+    this._federationContext = ctx;
+    if (ctx === null) this._federationEnabled = false;
+  }
+
+  /**
+   * Federation PR-A3: dependency bundle for the /v1/federation endpoints.
+   * Reads live context + operator key each request. Audit writes route to the
+   * channel's audit log (design note 5: every ceremony step writes success
+   * AND denial); when no audit log is bound the write is a no-op rather than a
+   * throw, so a minimal rig still serves.
+   */
+  private buildV1FederationDeps(): V1FederationDeps {
+    return {
+      getContext: () => this._federationContext,
+      isEnabled: () => this._federationEnabled,
+      setEnabled: (enabled) => {
+        this._federationEnabled = enabled;
+      },
+      resolveOperatorPublicKey: () => this.resolveOperatorPublicKey(),
+      rosterNodeIds: () => [...this._federationRoster],
+      recordJoin: (nodeId) => {
+        this._federationRoster.add(nodeId);
+      },
+      audit: async ({ operation, result, identityId, details }) => {
+        try {
+          await this.auditLog?.append("l2", operation, identityId, details, result);
+        } catch {
+          // Audit-write best effort: a federation decision is never blocked
+          // on the audit sink, but the decision itself already fails closed.
+        }
+      },
     };
   }
 
@@ -1381,10 +1452,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // `/v1.1` (legacy dashboard HTML) do not match this prefix.
     if (url.pathname === "/v1" || url.pathname.startsWith("/v1/")) {
       // Ceremony endpoints get the stricter decision-class rate limit
-      // (auth brute-force guard); reads get the general limit.
-      const limitClass = url.pathname.startsWith("/v1/session/")
-        ? "decisions"
-        : "general";
+      // (auth brute-force guard); reads get the general limit. The federation
+      // join-submission ceremony is an auth surface too (bootstrap-token
+      // brute-force guard), so it shares the decisions budget.
+      const limitClass =
+        url.pathname.startsWith("/v1/session/") ||
+        url.pathname.startsWith("/v1/federation/authorize/")
+          ? "decisions"
+          : "general";
       if (!this.checkRateLimit(req, res, limitClass)) return;
       handleV1Request(
         {
@@ -1393,6 +1468,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           buildFullStatus: () => this.buildV1FullStatus(),
           version: PKG_VERSION,
           agents: this.buildV1AgentsDeps(),
+          federation: this.buildV1FederationDeps(),
         },
         req,
         res,

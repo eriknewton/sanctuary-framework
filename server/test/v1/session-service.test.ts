@@ -1,12 +1,14 @@
 /**
- * Federation PR-A1 — V1SessionService unit tests.
+ * Federation PR-A3 — V1SessionService unit tests.
  *
- * Every security property of the RFC v7 session ceremony is asserted at
- * the unit level with an injected clock: challenge expiry, single-use
- * consumption, attestation gating (token match, loopback auto-auth,
- * auth-disabled loopback-only), token expiry, token tampering, session
- * generation rotation, and the pending-challenge cap. Each test fails if
- * the corresponding check is removed from the implementation.
+ * Every security property of the RFC v7 session ceremony is asserted at the
+ * unit level with an injected clock: challenge expiry, single-use
+ * consumption, token expiry/tamper, session-generation rotation, and the
+ * pending-challenge cap. The attestation suite covers the PR-A3 REPLACEMENT
+ * of PR-A1's bearer-token validator with a durable Ed25519 operator
+ * attestation — including the explicit replace-not-extend invariant: a caller
+ * presenting what the temporary token validator would have accepted is now
+ * rejected, because the token path is gone, not stacked.
  */
 
 import { describe, expect, it } from "vitest";
@@ -16,20 +18,24 @@ import { randomBytes } from "node:crypto";
 import {
   V1SessionService,
   V1_CAPABILITY_STATUS_READ,
-  constantShapeTokenEqual,
   type V1SessionAuthBridge,
 } from "../../src/v1/session-service.js";
 import {
   buildChallengeMessage,
-  LOCAL_OPERATOR_ATTESTATION_REF,
+  OPERATOR_ED25519_ATTESTATION_REF,
+  LOOPBACK_OPERATOR_ATTESTATION_REF,
+  AUTH_DISABLED_ATTESTATION_REF,
 } from "../../src/v1/ceremony.js";
+import { signOperatorAttestation } from "../../src/v1/operator-attestation.js";
 import { toBase64url, fromBase64url } from "../../src/core/encoding.js";
 
-const AUTH_TOKEN = "operator-token-for-tests";
+// One operator identity for the whole suite — the daemon resolves this key.
+const OPERATOR_PRIV = randomBytes(32);
+const OPERATOR_PUB = ed25519.getPublicKey(OPERATOR_PRIV);
 
 function makeAuth(overrides?: Partial<V1SessionAuthBridge>): V1SessionAuthBridge {
   return {
-    getAuthToken: () => AUTH_TOKEN,
+    resolveOperatorPublicKey: () => OPERATOR_PUB,
     isLoopbackAutoAuthEnabled: () => false,
     ...overrides,
   };
@@ -41,17 +47,20 @@ function makeClient() {
   return { privateKey, publicKey };
 }
 
-/**
- * Build a session-init body. `token` defaults to the valid operator
- * token; pass null to OMIT the token field entirely (tokenless caller).
- */
-function initBody(publicKey: Uint8Array, token: string | null = AUTH_TOKEN) {
+/** A durable operator attestation bound to `clientPubkey` at `issuedAtMs`. */
+function durableAttestation(clientPubkey: Uint8Array, issuedAtMs: number) {
+  return signOperatorAttestation({
+    operatorPublicKey: OPERATOR_PUB,
+    operatorPrivateKey: OPERATOR_PRIV,
+    clientPubkey,
+    issuedAtMs,
+  });
+}
+
+function initBody(publicKey: Uint8Array, attestation?: unknown) {
   return {
     client_pubkey: toBase64url(publicKey),
-    operator_attestation: {
-      type: "local_operator",
-      ...(token !== null ? { token } : {}),
-    },
+    ...(attestation !== undefined ? { operator_attestation: attestation } : {}),
   };
 }
 
@@ -59,24 +68,22 @@ function signChallenge(
   privateKey: Uint8Array,
   publicKey: Uint8Array,
   challengeB64: string,
+  ref: string,
 ): string {
-  const message = buildChallengeMessage(
-    publicKey,
-    fromBase64url(challengeB64),
-    LOCAL_OPERATOR_ATTESTATION_REF,
-  );
+  const message = buildChallengeMessage(publicKey, fromBase64url(challengeB64), ref);
   return toBase64url(ed25519.sign(message, privateKey));
 }
 
-/** Run the full ceremony and return the session token. */
-function openSession(service: V1SessionService, loopback = false): string {
+/** Full ceremony over the durable operator-attestation path → session token. */
+function openSession(service: V1SessionService, nowMs = Date.now()): string {
   const { privateKey, publicKey } = makeClient();
-  const init = service.init(initBody(publicKey), loopback);
+  const init = service.init(initBody(publicKey, durableAttestation(publicKey, nowMs)), false);
   expect(init.ok).toBe(true);
   if (!init.ok) throw new Error("unreachable");
+  expect(init.attestation_ref).toBe(OPERATOR_ED25519_ATTESTATION_REF);
   const complete = service.complete({
     challenge_id: init.challenge_id,
-    client_signature: signChallenge(privateKey, publicKey, init.challenge),
+    client_signature: signChallenge(privateKey, publicKey, init.challenge, init.attestation_ref),
   });
   expect(complete.ok).toBe(true);
   if (!complete.ok) throw new Error("unreachable");
@@ -90,76 +97,65 @@ describe("V1SessionService ceremony", () => {
     const claims = service.validateToken(token);
     expect(claims).not.toBeNull();
     expect(claims!.capabilities).toContain(V1_CAPABILITY_STATUS_READ);
-    expect(claims!.attestation_ref).toBe(LOCAL_OPERATOR_ATTESTATION_REF);
+    expect(claims!.attestation_ref).toBe(OPERATOR_ED25519_ATTESTATION_REF);
   });
 
   it("rejects a replayed challenge_id (single-use, success path)", () => {
-    const service = new V1SessionService({ auth: makeAuth() });
+    let nowMs = 1_000_000;
+    const service = new V1SessionService({ auth: makeAuth(), now: () => nowMs });
     const { privateKey, publicKey } = makeClient();
-    const init = service.init(initBody(publicKey), false);
+    const init = service.init(initBody(publicKey, durableAttestation(publicKey, nowMs)), false);
     if (!init.ok) throw new Error("init failed");
-    const signature = signChallenge(privateKey, publicKey, init.challenge);
-    const first = service.complete({
-      challenge_id: init.challenge_id,
-      client_signature: signature,
-    });
+    const signature = signChallenge(privateKey, publicKey, init.challenge, init.attestation_ref);
+    const first = service.complete({ challenge_id: init.challenge_id, client_signature: signature });
     expect(first.ok).toBe(true);
-    // Replay of the IDENTICAL completed ceremony must be denied.
-    const replay = service.complete({
-      challenge_id: init.challenge_id,
-      client_signature: signature,
-    });
+    const replay = service.complete({ challenge_id: init.challenge_id, client_signature: signature });
     expect(replay.ok).toBe(false);
   });
 
   it("consumes the challenge on a FAILED attempt too (no signature brute-force)", () => {
-    const service = new V1SessionService({ auth: makeAuth() });
+    let nowMs = 1_000_000;
+    const service = new V1SessionService({ auth: makeAuth(), now: () => nowMs });
     const { privateKey, publicKey } = makeClient();
-    const init = service.init(initBody(publicKey), false);
+    const init = service.init(initBody(publicKey, durableAttestation(publicKey, nowMs)), false);
     if (!init.ok) throw new Error("init failed");
     const bad = service.complete({
       challenge_id: init.challenge_id,
       client_signature: toBase64url(randomBytes(64)),
     });
     expect(bad.ok).toBe(false);
-    // A subsequent VALID signature against the same challenge is denied:
-    // the failed attempt burned it.
     const good = service.complete({
       challenge_id: init.challenge_id,
-      client_signature: signChallenge(privateKey, publicKey, init.challenge),
+      client_signature: signChallenge(privateKey, publicKey, init.challenge, init.attestation_ref),
     });
     expect(good.ok).toBe(false);
   });
 
   it("rejects an expired challenge", () => {
     let nowMs = 1_000_000;
-    const service = new V1SessionService({
-      auth: makeAuth(),
-      now: () => nowMs,
-    });
+    const service = new V1SessionService({ auth: makeAuth(), now: () => nowMs });
     const { privateKey, publicKey } = makeClient();
-    const init = service.init(initBody(publicKey), false);
+    const init = service.init(initBody(publicKey, durableAttestation(publicKey, nowMs)), false);
     if (!init.ok) throw new Error("init failed");
     nowMs += 61_000; // past the 60s challenge TTL
     const result = service.complete({
       challenge_id: init.challenge_id,
-      client_signature: signChallenge(privateKey, publicKey, init.challenge),
+      client_signature: signChallenge(privateKey, publicKey, init.challenge, init.attestation_ref),
     });
     expect(result.ok).toBe(false);
   });
 
   it("rejects a signature from a different keypair over the right message", () => {
-    const service = new V1SessionService({ auth: makeAuth() });
+    let nowMs = 1_000_000;
+    const service = new V1SessionService({ auth: makeAuth(), now: () => nowMs });
     const honest = makeClient();
     const attacker = makeClient();
-    const init = service.init(initBody(honest.publicKey), false);
+    const init = service.init(initBody(honest.publicKey, durableAttestation(honest.publicKey, nowMs)), false);
     if (!init.ok) throw new Error("init failed");
-    // Attacker signs the canonical message for the honest pubkey with
-    // their own key (key-binding check).
     const message = buildChallengeMessage(
       honest.publicKey,
       fromBase64url(init.challenge),
-      LOCAL_OPERATOR_ATTESTATION_REF,
+      init.attestation_ref,
     );
     const result = service.complete({
       challenge_id: init.challenge_id,
@@ -177,92 +173,126 @@ describe("V1SessionService ceremony", () => {
     expect(service.init(null, true).ok).toBe(false);
     expect(service.init({}, true).ok).toBe(false);
     expect(service.init({ client_pubkey: 42 }, true).ok).toBe(false);
-    // Wrong-length pubkey.
+    const { publicKey } = makeClient();
     expect(
       service.init(
-        { client_pubkey: toBase64url(randomBytes(16)), operator_attestation: { type: "local_operator", token: AUTH_TOKEN } },
+        { client_pubkey: toBase64url(randomBytes(16)), operator_attestation: durableAttestation(publicKey, Date.now()) },
         true,
       ).ok,
-    ).toBe(false);
+    ).toBe(false); // wrong-length pubkey
   });
 });
 
-describe("V1SessionService attestation gating", () => {
-  it("denies init with a wrong operator token (non-loopback)", () => {
-    const service = new V1SessionService({ auth: makeAuth() });
+describe("V1SessionService durable operator attestation (PR-A3)", () => {
+  it("accepts a valid durable attestation bound to the client key (non-loopback)", () => {
+    let nowMs = 2_000_000;
+    const service = new V1SessionService({ auth: makeAuth(), now: () => nowMs });
     const { publicKey } = makeClient();
-    expect(service.init(initBody(publicKey, "wrong-token"), false).ok).toBe(false);
+    const init = service.init(initBody(publicKey, durableAttestation(publicKey, nowMs)), false);
+    expect(init.ok).toBe(true);
+    if (init.ok) expect(init.attestation_ref).toBe(OPERATOR_ED25519_ATTESTATION_REF);
   });
 
-  it("denies init with NO token from non-loopback even when auto-auth is on", () => {
-    const service = new V1SessionService({
-      auth: makeAuth({ isLoopbackAutoAuthEnabled: () => true }),
-    });
-    const { publicKey } = makeClient();
-    expect(service.init(initBody(publicKey, null), false).ok).toBe(false);
-  });
-
-  it("allows tokenless loopback init only when loopback auto-auth is enabled", () => {
-    const off = new V1SessionService({ auth: makeAuth() });
-    const on = new V1SessionService({
-      auth: makeAuth({ isLoopbackAutoAuthEnabled: () => true }),
-    });
-    const { publicKey } = makeClient();
-    expect(off.init(initBody(publicKey, null), true).ok).toBe(false);
-    expect(on.init(initBody(publicKey, null), true).ok).toBe(true);
-  });
-
-  it("auth-disabled daemon: loopback may open sessions, network may not", () => {
-    const service = new V1SessionService({
-      auth: makeAuth({ getAuthToken: () => undefined }),
-    });
-    const { publicKey } = makeClient();
-    expect(service.init(initBody(publicKey, null), true).ok).toBe(true);
-    expect(service.init(initBody(publicKey, null), false).ok).toBe(false);
-  });
-
-  it("constant-shape token compare: wrong tokens of ANY length rejected, correct accepted", () => {
-    // Codex review finding 1: the compare must do identical work for
-    // every candidate. Functionally: an equal-length wrong token and a
-    // different-length wrong token are both rejected, and the correct
-    // token is accepted, through the fixed-size-digest comparison path.
-    const service = new V1SessionService({ auth: makeAuth() });
-    const { publicKey } = makeClient();
-
-    const equalLengthWrong = "X".repeat(AUTH_TOKEN.length);
-    expect(equalLengthWrong).toHaveLength(AUTH_TOKEN.length);
-    expect(service.init(initBody(publicKey, equalLengthWrong), false).ok).toBe(false);
-
-    expect(service.init(initBody(publicKey, "short"), false).ok).toBe(false);
-    expect(
-      service.init(initBody(publicKey, AUTH_TOKEN + "-and-then-some"), false).ok,
-    ).toBe(false);
-
-    expect(service.init(initBody(publicKey, AUTH_TOKEN), false).ok).toBe(true);
-  });
-
-  it("constantShapeTokenEqual compares fixed-size digests (no length branch, no throw)", () => {
-    // timingSafeEqual throws on unequal-length inputs; the helper never
-    // does, because BOTH sides are first compressed to 32-byte HMAC
-    // digests — the identical work regardless of candidate length.
-    expect(constantShapeTokenEqual("a", "a-much-longer-configured-token")).toBe(false);
-    expect(constantShapeTokenEqual("a-much-longer-presented-token", "a")).toBe(false);
-    expect(constantShapeTokenEqual("", "configured")).toBe(false);
-    expect(constantShapeTokenEqual("same-length-A", "same-length-B")).toBe(false);
-    expect(constantShapeTokenEqual("exact-match", "exact-match")).toBe(true);
-  });
-
-  it("denies unknown attestation types", () => {
+  it("REPLACE-NOT-EXTEND: a bearer-token attestation (what the temporary validator accepted) is now rejected", () => {
+    // PR-A1's `local_operator` token-possession attestation — over loopback,
+    // with auto-auth OFF, this WOULD have opened a session under the old
+    // validator. The durable validator no longer accepts it: the token path
+    // is gone, so a leaked bearer token cannot mint a /v1 session.
     const service = new V1SessionService({ auth: makeAuth() });
     const { publicKey } = makeClient();
     expect(
       service.init(
-        {
-          client_pubkey: toBase64url(publicKey),
-          operator_attestation: { type: "ed25519_operator", token: AUTH_TOKEN },
-        },
+        initBody(publicKey, { type: "local_operator", token: "operator-token-for-tests" }),
+        false,
+      ).ok,
+    ).toBe(false);
+    // And over loopback (auto-auth off) it is still rejected — no token path.
+    expect(
+      service.init(
+        initBody(publicKey, { type: "local_operator", token: "operator-token-for-tests" }),
         true,
       ).ok,
+    ).toBe(false);
+  });
+
+  it("rejects an attestation bound to a DIFFERENT client key (no cross-session replay)", () => {
+    let nowMs = 2_000_000;
+    const service = new V1SessionService({ auth: makeAuth(), now: () => nowMs });
+    const a = makeClient();
+    const b = makeClient();
+    // Attestation minted for client a, presented with client b's key.
+    const stolen = durableAttestation(a.publicKey, nowMs);
+    expect(service.init(initBody(b.publicKey, stolen), false).ok).toBe(false);
+  });
+
+  it("rejects an attestation signed by a NON-operator key", () => {
+    let nowMs = 2_000_000;
+    const service = new V1SessionService({ auth: makeAuth(), now: () => nowMs });
+    const { publicKey } = makeClient();
+    const impostorPriv = randomBytes(32);
+    const impostorPub = ed25519.getPublicKey(impostorPriv);
+    const forged = signOperatorAttestation({
+      operatorPublicKey: impostorPub,
+      operatorPrivateKey: impostorPriv,
+      clientPubkey: publicKey,
+      issuedAtMs: nowMs,
+    });
+    expect(service.init(initBody(publicKey, forged), false).ok).toBe(false);
+  });
+
+  it("rejects a stale attestation (past the freshness window)", () => {
+    let nowMs = 10_000_000;
+    const service = new V1SessionService({ auth: makeAuth(), now: () => nowMs });
+    const { publicKey } = makeClient();
+    const stale = durableAttestation(publicKey, nowMs - 6 * 60_000); // 6 min old, > 5 min window
+    expect(service.init(initBody(publicKey, stale), false).ok).toBe(false);
+    // A fresh one at the same clock is accepted.
+    expect(service.init(initBody(publicKey, durableAttestation(publicKey, nowMs)), false).ok).toBe(true);
+  });
+
+  it("denies the durable path when no operator identity is configured", () => {
+    let nowMs = 2_000_000;
+    const service = new V1SessionService({
+      auth: makeAuth({ resolveOperatorPublicKey: () => null }),
+      now: () => nowMs,
+    });
+    const { publicKey } = makeClient();
+    // Even a structurally valid attestation cannot verify against a null key.
+    expect(service.init(initBody(publicKey, durableAttestation(publicKey, nowMs)), false).ok).toBe(false);
+  });
+});
+
+describe("V1SessionService loopback fallbacks (network-position only)", () => {
+  it("loopback auto-auth: tokenless same-box init opens, network init does not", () => {
+    const off = new V1SessionService({ auth: makeAuth() });
+    const on = new V1SessionService({ auth: makeAuth({ isLoopbackAutoAuthEnabled: () => true }) });
+    const { publicKey } = makeClient();
+    // auto-auth off: loopback alone does not open a tokenless session.
+    expect(off.init(initBody(publicKey), true).ok).toBe(false);
+    // auto-auth on: same-box opens with no attestation...
+    const onInit = on.init(initBody(publicKey), true);
+    expect(onInit.ok).toBe(true);
+    if (onInit.ok) expect(onInit.attestation_ref).toBe(LOOPBACK_OPERATOR_ATTESTATION_REF);
+    // ...but a network caller presenting nothing never does.
+    expect(on.init(initBody(publicKey), false).ok).toBe(false);
+  });
+
+  it("auth-disabled daemon (no operator key): loopback may open, network may not", () => {
+    const service = new V1SessionService({
+      auth: makeAuth({ resolveOperatorPublicKey: () => null }),
+    });
+    const { publicKey } = makeClient();
+    const loop = service.init(initBody(publicKey), true);
+    expect(loop.ok).toBe(true);
+    if (loop.ok) expect(loop.attestation_ref).toBe(AUTH_DISABLED_ATTESTATION_REF);
+    expect(service.init(initBody(publicKey), false).ok).toBe(false);
+  });
+
+  it("denies an unknown attestation type from a network caller", () => {
+    const service = new V1SessionService({ auth: makeAuth() });
+    const { publicKey } = makeClient();
+    expect(
+      service.init(initBody(publicKey, { type: "something_else", token: "x" }), false).ok,
     ).toBe(false);
   });
 });
@@ -270,11 +300,8 @@ describe("V1SessionService attestation gating", () => {
 describe("V1SessionService tokens", () => {
   it("rejects an expired session token", () => {
     let nowMs = 5_000_000;
-    const service = new V1SessionService({
-      auth: makeAuth(),
-      now: () => nowMs,
-    });
-    const token = openSession(service);
+    const service = new V1SessionService({ auth: makeAuth(), now: () => nowMs });
+    const token = openSession(service, nowMs);
     expect(service.validateToken(token)).not.toBeNull();
     nowMs += 31 * 60_000; // past the 30min token TTL
     expect(service.validateToken(token)).toBeNull();
@@ -302,7 +329,6 @@ describe("V1SessionService tokens", () => {
     expect(service.validateToken(token)).not.toBeNull();
     service.rotateSessions();
     expect(service.validateToken(token)).toBeNull();
-    // New ceremonies mint valid tokens under the new generation.
     const fresh = openSession(service);
     expect(service.validateToken(fresh)).not.toBeNull();
   });
@@ -317,11 +343,12 @@ describe("V1SessionService tokens", () => {
 
 describe("V1SessionService resource bounds", () => {
   it("refuses new ceremonies past the pending-challenge cap (fail closed)", () => {
-    const service = new V1SessionService({ auth: makeAuth() });
+    let nowMs = 1_000_000;
+    const service = new V1SessionService({ auth: makeAuth(), now: () => nowMs });
     const { publicKey } = makeClient();
     let denied = false;
     for (let i = 0; i < 300; i++) {
-      const result = service.init(initBody(publicKey), false);
+      const result = service.init(initBody(publicKey, durableAttestation(publicKey, nowMs)), false);
       if (!result.ok) {
         denied = true;
         expect(i).toBeGreaterThanOrEqual(256);

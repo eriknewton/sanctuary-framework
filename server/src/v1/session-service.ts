@@ -26,27 +26,32 @@
  *   (CLAUDE.md constraint 7) and no private key material ever enters this
  *   module — only public keys and signatures (constraint 6).
  *
- * PR-A1 attestation bridge: durable Ed25519 operator attestations are
- * issued by the federation authorize ceremony (PR-A3). Until then the
- * only accepted attestation type is `local_operator`: proof of possession
- * of the dashboard operator credential (the bearer auth token), or a
- * loopback call when the boot path enabled loopback auto-auth after a
- * successful master-key unlock. This is the SAME trust decision the
- * existing `/api/*` surface makes; the ceremony adds key binding,
- * single-use freshness, and short-lived capability-scoped tokens on top.
- * When no operator credential is configured at all, only loopback callers
- * may open sessions — the /v1 surface never serves a network caller that
- * presented nothing.
+ * PR-A3 attestation: the credentialed path is a DURABLE Ed25519 operator
+ * attestation — an operator-identity signature binding the caller's
+ * ephemeral session client key, verified against the same operator public
+ * key that gates OPERATOR_SIGNED writes (see `operator-attestation.ts`).
+ * This REPLACED PR-A1's temporary `local_operator` bearer-token validator;
+ * the token path is gone, not stacked, so a leaked bearer token can no
+ * longer open a /v1 session (the replace-not-extend invariant). Two
+ * non-credentialed paths remain, both network-POSITION gated, never a
+ * secret a remote caller can present: a same-box caller on a daemon with
+ * post-unlock loopback auto-auth, and a same-box caller on a daemon with no
+ * operator identity configured at all (legacy auth-disabled dev mode). A
+ * network caller that presents no valid operator attestation never gets a
+ * challenge.
  */
 
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { gcm } from "@noble/ciphers/aes.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
 import { verify } from "../core/identity.js";
 import {
   buildChallengeMessage,
-  LOCAL_OPERATOR_ATTESTATION_REF,
+  OPERATOR_ED25519_ATTESTATION_REF,
+  LOOPBACK_OPERATOR_ATTESTATION_REF,
+  AUTH_DISABLED_ATTESTATION_REF,
 } from "./ceremony.js";
+import { verifyOperatorAttestation } from "./operator-attestation.js";
 
 /** Challenge TTL (RFC v7 §5.2: 60 seconds). */
 export const V1_CHALLENGE_TTL_MS = 60_000;
@@ -56,31 +61,6 @@ export const V1_SESSION_TOKEN_TTL_MS = 30 * 60_000;
 const MAX_PENDING_CHALLENGES = 256;
 /** AAD binding token ciphertexts to their purpose. */
 const TOKEN_AAD = new TextEncoder().encode("sanctuary.v1.session-token");
-/**
- * Per-process random key for constant-shape operator-token comparison.
- * Never persisted, never exported — it exists only so the two HMAC
- * digests below are unpredictable to a caller while remaining
- * comparable to each other within this process.
- */
-const TOKEN_COMPARE_KEY = randomBytes(32);
-
-/**
- * Constant-shape secret comparison (codex review finding 1).
- *
- * A naive `length === length && timingSafeEqual(...)` gate only performs
- * the constant-time comparison for same-length candidates, which leaks
- * the configured token's byte length as a timing oracle. Instead, both
- * sides are compressed to fixed-size 32-byte HMAC-SHA256 digests under a
- * per-process random key, then compared with `timingSafeEqual`. Every
- * candidate — any length, any content — executes the identical
- * comparison work, so neither length nor prefix information is
- * observable through timing.
- */
-export function constantShapeTokenEqual(presented: string, configured: string): boolean {
-  const a = createHmac("sha256", TOKEN_COMPARE_KEY).update(presented, "utf-8").digest();
-  const b = createHmac("sha256", TOKEN_COMPARE_KEY).update(configured, "utf-8").digest();
-  return timingSafeEqual(a, b);
-}
 
 /**
  * PR-A1 capability vocabulary. The canonical Wave 1 capability set is
@@ -106,8 +86,14 @@ interface ChallengeRecord {
 }
 
 export interface V1SessionAuthBridge {
-  /** The dashboard operator bearer token, when one is configured. */
-  getAuthToken(): string | undefined;
+  /**
+   * The daemon operator identity's Ed25519 public key (32 bytes), or null
+   * when no operator identity is configured. This is the SAME key the
+   * OPERATOR_SIGNED write path resolves (PR-A2), so a durable operator
+   * attestation and a signed write trace to one operator key. Null forces
+   * the credentialed path closed (only the loopback dev path remains).
+   */
+  resolveOperatorPublicKey(): Uint8Array | null;
   /** Whether the boot path enabled loopback auto-auth (post-unlock). */
   isLoopbackAutoAuthEnabled(): boolean;
 }
@@ -118,10 +104,19 @@ export interface V1SessionServiceOptions {
   now?: () => number;
   challengeTtlMs?: number;
   tokenTtlMs?: number;
+  /** Override the durable-attestation freshness window (tests). */
+  attestationMaxAgeMs?: number;
 }
 
 export type V1InitResult =
-  | { ok: true; challenge: string; challenge_id: string; expires_at: number }
+  | {
+      ok: true;
+      challenge: string;
+      challenge_id: string;
+      expires_at: number;
+      /** The attestation ref the daemon bound; the client signs over it. */
+      attestation_ref: string;
+    }
   | { ok: false };
 
 export type V1CompleteResult =
@@ -133,6 +128,7 @@ export class V1SessionService {
   private readonly now: () => number;
   private readonly challengeTtlMs: number;
   private readonly tokenTtlMs: number;
+  private readonly attestationMaxAgeMs?: number;
   private readonly challenges = new Map<string, ChallengeRecord>();
   /** Daemon-process-local token keys, indexed by key_id (RFC v7 §5.3). */
   private readonly tokenKeys = new Map<number, Uint8Array>();
@@ -144,6 +140,7 @@ export class V1SessionService {
     this.now = options.now ?? Date.now;
     this.challengeTtlMs = options.challengeTtlMs ?? V1_CHALLENGE_TTL_MS;
     this.tokenTtlMs = options.tokenTtlMs ?? V1_SESSION_TOKEN_TTL_MS;
+    this.attestationMaxAgeMs = options.attestationMaxAgeMs;
     // Process-local key; sessions intentionally do not survive a daemon
     // restart (clients re-run the ceremony — fail closed, never open).
     this.tokenKeys.set(this.currentKeyId, randomBytes(32));
@@ -171,8 +168,12 @@ export class V1SessionService {
     }
     if (clientPubkey.length !== 32) return { ok: false };
 
+    // Attestation is validated AGAINST this client key: a durable operator
+    // attestation binds the operator's signature to exactly this ephemeral
+    // session key, so it cannot be replayed to authorize a different one.
     const attestationRef = this.validateAttestation(
       operator_attestation,
+      clientPubkey,
       requestIsLoopback,
     );
     if (attestationRef === null) return { ok: false };
@@ -199,6 +200,7 @@ export class V1SessionService {
       challenge: toBase64url(challenge),
       challenge_id: challengeId,
       expires_at: Math.floor(expiresAtMs / 1000),
+      attestation_ref: attestationRef,
     };
   }
 
@@ -310,37 +312,51 @@ export class V1SessionService {
   // ── internals ──────────────────────────────────────────────────────
 
   /**
-   * PR-A1 attestation bridge — see module docblock. Returns the
-   * attestation ref to bind into the ceremony, or null to deny.
+   * PR-A3 attestation validator — see module docblock. Returns the
+   * attestation ref to bind into the ceremony, or null to deny. The order is
+   * deliberate: the durable credentialed path is tried first and is the ONLY
+   * path open to a network caller; the loopback paths are network-POSITION
+   * gates that never inspect a caller-presented secret.
    */
   private validateAttestation(
     attestation: unknown,
+    clientPubkey: Uint8Array,
     requestIsLoopback: boolean,
   ): string | null {
-    if (typeof attestation !== "object" || attestation === null) return null;
-    const { type, token } = attestation as { type?: unknown; token?: unknown };
-    if (type !== "local_operator") return null;
+    const operatorKey = this.auth.resolveOperatorPublicKey();
 
-    const configured = this.auth.getAuthToken();
-    if (configured !== undefined && configured !== "" && typeof token === "string") {
-      // Constant-shape comparison: identical work for every candidate
-      // regardless of length (no configured-token-length timing oracle).
-      if (constantShapeTokenEqual(token, configured)) {
-        return LOCAL_OPERATOR_ATTESTATION_REF;
-      }
-    }
-    if (requestIsLoopback && this.auth.isLoopbackAutoAuthEnabled()) {
-      return LOCAL_OPERATOR_ATTESTATION_REF;
-    }
-    // No operator credential configured at all (legacy auth-disabled
-    // mode): loopback callers only. A network caller with nothing to
-    // present never gets a challenge.
+    // 1. Durable Ed25519 operator attestation (the credentialed path that
+    //    REPLACED the PR-A1 bearer-token validator). Open to any caller,
+    //    loopback or network, that can present a fresh operator signature
+    //    bound to this client key.
     if (
-      requestIsLoopback &&
-      (configured === undefined || configured === "")
+      operatorKey &&
+      verifyOperatorAttestation({
+        attestation,
+        clientPubkey,
+        resolvedOperatorPubkey: operatorKey,
+        now: this.now(),
+        maxAgeMs: this.attestationMaxAgeMs,
+      })
     ) {
-      return LOCAL_OPERATOR_ATTESTATION_REF;
+      return OPERATOR_ED25519_ATTESTATION_REF;
     }
+
+    // 2. Same-box caller on a daemon with post-unlock loopback auto-auth.
+    //    Network position, not a credential — a remote caller can never reach
+    //    this, and a same-box post-unlock attacker already holds more than a
+    //    session grants, so this is not the downgrade surface the token was.
+    if (requestIsLoopback && this.auth.isLoopbackAutoAuthEnabled()) {
+      return LOOPBACK_OPERATOR_ATTESTATION_REF;
+    }
+
+    // 3. Legacy auth-disabled dev mode: no operator identity configured at
+    //    all. Loopback callers only; a network caller presenting nothing
+    //    never gets a challenge.
+    if (requestIsLoopback && operatorKey === null) {
+      return AUTH_DISABLED_ATTESTATION_REF;
+    }
+
     return null;
   }
 
