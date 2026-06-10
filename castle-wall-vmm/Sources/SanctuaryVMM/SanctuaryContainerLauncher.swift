@@ -105,6 +105,13 @@ public enum SanctuaryContainerLauncherError: Error {
 ///   - Our egress proxy: 0x0FFF_0001 (below the range, no collision)
 ///   - vminitd control: port 1024 (guest-side listener, host connects to it)
 ///     NOTE: guest-reachable; adversarial case deferred to B2 escape matrix
+///
+/// INVARIANT: never configure custom virtio devices for confined workers.
+/// The seccomp-deny-AF_VSOCK jail assumes vsock is the sole guest-to-host
+/// channel; macOS 27's VZCustomVirtioDeviceConfiguration would bypass it.
+/// On macOS 27 SDK adoption, extend the host-side zero-NIC assertions below
+/// to also reject custom virtio devices. See
+/// castle-wall-daemon/docs/SANCTUARY_JAIL.md, "Threat-Model Assumptions".
 public final class SanctuaryContainerLauncher: @unchecked Sendable {
     private let config: SanctuaryContainerConfig
 
