@@ -68,6 +68,20 @@ public enum SanctuaryVMMCLI {
             return 1
         }
 
+        // FAIL-CLOSED: an unknown delivery mode or an inconsistent
+        // mode/path combination refuses to launch; it never falls back to a
+        // different delivery mode or to an unjailed plugin.
+        let jailDelivery: SanctuaryGuestJailDelivery
+        do {
+            jailDelivery = try SanctuaryGuestJail.parseDelivery(
+                mode: request.guestJailDelivery,
+                staticBinaryPath: request.staticJailBinaryPath
+            )
+        } catch {
+            fputs("\(error)\n", stderr)
+            return 1
+        }
+
         let config = SanctuaryContainerConfig(
             kernelPath: request.kernelPath,
             initfsReference: request.initfsReference ?? "ghcr.io/apple/containerization/vminit:0.33.3",
@@ -77,7 +91,8 @@ public enum SanctuaryVMMCLI {
             memoryBytes: request.memoryBytes ?? 512 * 1024 * 1024,
             rootfsPins: request.rootfsPins ?? [],
             egressVsockPort: request.egressVsockPort ?? 0x0FFF_0001,
-            applyGuestJail: request.applyGuestJail ?? true
+            applyGuestJail: request.applyGuestJail ?? true,
+            guestJailDelivery: jailDelivery
         )
 
         let launcher = SanctuaryContainerLauncher(config: config)
@@ -137,6 +152,20 @@ public enum SanctuaryVMMCLI {
             return 1
         }
 
+        // FAIL-CLOSED: an unknown delivery mode or an inconsistent
+        // mode/path combination refuses to launch; it never falls back to a
+        // different delivery mode or to an unjailed plugin.
+        let jailDelivery: SanctuaryGuestJailDelivery
+        do {
+            jailDelivery = try SanctuaryGuestJail.parseDelivery(
+                mode: request.guestJailDelivery,
+                staticBinaryPath: request.staticJailBinaryPath
+            )
+        } catch {
+            fputs("\(error)\n", stderr)
+            return 1
+        }
+
         let containerConfig = SanctuaryContainerConfig(
             kernelPath: request.kernelPath,
             initfsReference: request.initfsReference ?? "ghcr.io/apple/containerization/vminit:0.33.3",
@@ -146,7 +175,8 @@ public enum SanctuaryVMMCLI {
             memoryBytes: request.memoryBytes ?? 512 * 1024 * 1024,
             rootfsPins: request.rootfsPins ?? [],
             egressVsockPort: request.egressVsockPort ?? 0x0FFF_0001,
-            applyGuestJail: request.applyGuestJail ?? true
+            applyGuestJail: request.applyGuestJail ?? true,
+            guestJailDelivery: jailDelivery
         )
 
         let egressConfig = SanctuaryVsockEgressConfig(
@@ -215,6 +245,12 @@ struct GuestExecCLIRequest: Codable {
     let rootfsPins: [SanctuaryArtifactPin]?
     let egressVsockPort: UInt32?
     let applyGuestJail: Bool?
+    /// "python-preamble" (default) or "static-binary". Unknown values fail
+    /// closed (no launch).
+    let guestJailDelivery: String?
+    /// Host path to the STATIC aarch64 sanctuary-jail binary; required when
+    /// guestJailDelivery is "static-binary", rejected otherwise.
+    let staticJailBinaryPath: String?
     let command: String
     let args: [String]
     let cwd: String
@@ -231,6 +267,12 @@ struct RunBoxCLIRequest: Codable {
     let rootfsPins: [SanctuaryArtifactPin]?
     let egressVsockPort: UInt32?
     let applyGuestJail: Bool?
+    /// "python-preamble" (default) or "static-binary". Unknown values fail
+    /// closed (no launch).
+    let guestJailDelivery: String?
+    /// Host path to the STATIC aarch64 sanctuary-jail binary; required when
+    /// guestJailDelivery is "static-binary", rejected otherwise.
+    let staticJailBinaryPath: String?
     let egressProxyUdsPath: String
     let egressGuestSocketPath: String?
     let command: String

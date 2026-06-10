@@ -1,0 +1,16 @@
+# Static musl targets for the `sanctuary-jail` shim (B2 static-binary jail
+# delivery: the macOS launcher bind-mounts this binary into python-less guest
+# images). Scoped per-target so the default glibc daemon build is unaffected.
+#
+# Build with: scripts/build-sanctuary-jail-static.sh (CI: the
+# sanctuary-jail-static job in .github/workflows/castle-wall-linux.yml).
+# The aarch64 linker below exists on the Linux CI runner
+# (gcc-aarch64-linux-gnu); cross-LINKING from macOS is not supported, but
+# `cargo check --target <musl target>` works anywhere for compile checks.
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-gnu-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -62,8 +62,8 @@ export function loadAssuranceMatrix(repoRoot = findRepoRoot()): AssuranceRow[] {
     });
   }
 
-  if (rows.length !== 20) {
-    throw new Error(`Expected 20 assurance rows in ${matrixPath}, found ${rows.length}`);
+  if (rows.length !== 21) {
+    throw new Error(`Expected 21 assurance rows in ${matrixPath}, found ${rows.length}`);
   }
 
   return rows;

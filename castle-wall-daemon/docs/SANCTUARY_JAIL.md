@@ -32,6 +32,41 @@ the known direct socket syscall numbers instead of silently allowing them.
 The coordinator loop will prepend this shim to the untrusted worker command in
 a follow-on change outside this crate.
 
+On a successful confinement install the shim writes one stderr marker before
+exec -- `[JAIL] launcher-applied seccomp-deny-AF_VSOCK installed before plugin
+exec (sanctuary-jail)` -- containing the same substring the
+launcher-integration drill greps for, so drill evidence is delivery-vehicle
+agnostic.
+
+## Static-binary build (B2 delivery vehicle for python-less guests)
+
+The macOS Castle Wall launcher (`castle-wall-vmm`,
+`SanctuaryGuestJail` static-binary delivery) bind-mounts this shim read-only
+into guest images that lack python3 and prepends
+`/run/sanctuary-jail/sanctuary-jail -- <plugin> [args...]` to the plugin
+argv. For that to work on ANY image -- including libc-less ones -- the shim
+must be a STATIC Linux binary.
+
+Build (Linux host or CI):
+
+```bash
+castle-wall-daemon/scripts/build-sanctuary-jail-static.sh
+```
+
+This builds `sanctuary-jail` for `x86_64-unknown-linux-musl` and
+`aarch64-unknown-linux-musl` with `+crt-static` (per-target config in
+`.cargo/config.toml`; the default glibc daemon build is unaffected) and FAILS
+if either output is not statically linked. CI runs the same script plus a
+functional smoke (confinement install + exec, usage fail-closed, exec
+fail-closed) in the `sanctuary-jail-static` job of
+`.github/workflows/castle-wall-linux.yml` and uploads both artifacts.
+
+The launcher's guest platform is `linuxArm`, so the **aarch64** artifact is
+the one delivered into guests; the x86_64 artifact exists for the Linux
+loop-worker confinement path and for runner-side smoke tests. On macOS only
+`cargo check --target <musl target>` is possible (no musl cross-linker);
+real artifacts come from Linux CI.
+
 ## Claim Boundary
 
 This shim removes the vminitd escape vector (`AF_VSOCK`) and reduces
