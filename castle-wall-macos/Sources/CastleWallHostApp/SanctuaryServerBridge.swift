@@ -277,6 +277,10 @@ struct AuditEvent: Identifiable, Decodable {
             let who = agent ?? "an agent"
             let where_ = destination ?? "a host"
             return "You allowed \(who) to access \(where_)."
+        case "wall_armed":
+            return "Protection armed from the command line."
+        case "wall_disarmed":
+            return "Protection disarmed from the command line."
         case "policy_loaded":
             return "Security policy loaded."
         case "manifest_updated":
@@ -309,9 +313,9 @@ struct AuditEvent: Identifiable, Decodable {
         switch type {
         case "egress_blocked", "handshake_failed", "ipc_disconnected":
             return .red
-        case "egress_allowed", "filter_started", "handshake_completed", "ipc_connected":
+        case "egress_allowed", "filter_started", "handshake_completed", "ipc_connected", "wall_armed":
             return .green
-        case "operator_decision", "flow_pending_approval":
+        case "operator_decision", "flow_pending_approval", "wall_disarmed":
             return .yellow
         default:
             return .neutral

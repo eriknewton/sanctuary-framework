@@ -1120,7 +1120,7 @@ async function appendArmAuditBestEffort(
     const auditLog = new AuditLog(storage, masterKey);
     await auditLog.append(
       "l1",
-      "operator_decision",
+      action === "enable" ? "wall_armed" : "wall_disarmed",
       fortressIdFromStoragePath(fortressPath),
       {
         source: "castle-wall-cli",
@@ -1328,6 +1328,8 @@ const CASTLE_WALL_AUDIT_OPERATIONS = new Set([
   "filter_started",
   "filter_stopped",
   "filter_crashed",
+  "wall_armed",
+  "wall_disarmed",
   "queue_saturated",
   "no_wall_engaged",
   "no_wall_expired",

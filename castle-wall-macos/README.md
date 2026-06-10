@@ -205,6 +205,6 @@ scheduled `sanctuary castle-wall disable`.
 socket, because filter-on + daemon-down fail-closes the machine to deny-all
 (the 2026-06-09 Hermes drill lockout). `--force` overrides for setups where
 the daemon is supervised out-of-band. `disable` deliberately has no
-preconditions. Both verbs append a best-effort `operator_decision` audit
-entry (source `castle-wall-cli`) and re-verify the live state through
-`--headless status` before reporting success.
+preconditions. Both verbs append a best-effort audit entry (`wall_armed` /
+`wall_disarmed`, source `castle-wall-cli`) and re-verify the live state
+through `--headless status` before reporting success.
