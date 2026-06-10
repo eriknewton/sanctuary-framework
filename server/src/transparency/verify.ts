@@ -129,8 +129,14 @@ export type TransparencyFindingKind =
   | "head_hash_mismatch"
   | "rotation_floor_unauthenticated"
   | "counters_mismatch"
-  // offline genesis-completeness finding kind:
-  | "counter_prefix_missing";
+  // offline genesis-completeness finding kinds:
+  | "counter_prefix_missing"
+  // earliest record claims genesis (counter 1) but its previous_checkpoint_hash
+  // is not the genesis sentinel: a forged origin or a withheld predecessor.
+  | "genesis_sentinel_mismatch"
+  // a non-earliest record carries the genesis sentinel as its previous hash:
+  // a spliced/forged second origin in the middle of a chain.
+  | "genesis_sentinel_misplaced";
 
 export interface TransparencyFinding {
   kind: TransparencyFindingKind;
@@ -141,7 +147,17 @@ export interface TransparencyFinding {
 }
 
 export interface TransparencyVerifyReport {
-  verdict: "PASS" | "FAIL";
+  /**
+   * "PASS"    — verified complete from the genesis checkpoint (counter 1 with
+   *             the authentic genesis sentinel) with zero findings. The ONLY
+   *             clean result; the CLI maps it to exit 0.
+   * "PARTIAL" — a suffix fragment verified internally consistent under
+   *             --allow-partial, but NOT rooted at genesis. Distinct from PASS
+   *             so no caller can read incomplete evidence as complete; the CLI
+   *             maps it to a dedicated non-zero exit code (10).
+   * "FAIL"    — at least one finding.
+   */
+  verdict: "PASS" | "PARTIAL" | "FAIL";
   checkpoints_verified: number;
   counter_range: { from: number; to: number } | null;
   /**
@@ -432,24 +448,69 @@ export function verifyTransparencyCheckpoints(
   }
 
   const notChecked = [...OFFLINE_NOT_CHECKED];
-  // Genesis completeness: exit 0 / PASS must mean "verified complete from the
-  // genesis checkpoint (counter 1)". A chain whose earliest record is counter
-  // N>1 is a withheld prefix (1..N-1 absent). By default that is a FINDING so a
-  // truncated prefix can never read as a clean PASS; `allowPartial` downgrades
-  // it to an honest note for auditors knowingly verifying a suffix fragment.
-  if (records.length > 0 && records[0]!.counter !== 1) {
-    const earliest = records[0]!.counter;
-    if (opts.allowPartial) {
+  // Genesis completeness. A clean PASS / exit 0 must mean "verified complete
+  // from the genesis checkpoint (counter 1) whose previous_checkpoint_hash is
+  // the authentic genesis sentinel". Two distinct attacks are blocked here:
+  //
+  //   (a) Withheld prefix: the earliest record has counter N>1 (1..N-1 absent).
+  //       By default a FINDING; `allowPartial` downgrades it to a PARTIAL note
+  //       (never PASS) for auditors knowingly verifying a suffix fragment.
+  //
+  //   (b) Origin spoof: the earliest record claims counter 1 but its
+  //       previous_checkpoint_hash is NOT the genesis sentinel — it points at
+  //       an undisclosed predecessor (forged origin or withheld prefix wearing
+  //       a genesis counter). This is ALWAYS a FINDING; --allow-partial cannot
+  //       launder it, because a record asserting counter 1 is asserting it IS
+  //       the genesis, and that assertion must be true.
+  //
+  // `partialAccepted` records that the only reason the chain is not genesis-
+  // complete is an honestly-acknowledged missing prefix under allowPartial; it
+  // drives the PARTIAL (not PASS) verdict below.
+  let partialAccepted = false;
+  if (records.length > 0) {
+    const earliest = records[0]!;
+    if (earliest.counter === 1) {
+      // Claims genesis: the genesis sentinel binding is mandatory and is not
+      // relaxable by --allow-partial. A counter-1 record with a non-sentinel
+      // previous hash is forged or withholds a real predecessor.
+      if (
+        earliest.previous_checkpoint_hash !== TRANSPARENCY_CHECKPOINT_GENESIS
+      ) {
+        findings.push({
+          kind: "genesis_sentinel_mismatch",
+          counter: 1,
+          expected: TRANSPARENCY_CHECKPOINT_GENESIS,
+          actual: earliest.previous_checkpoint_hash,
+          message: `checkpoint counter 1 claims to be the genesis but its previous_checkpoint_hash is "${earliest.previous_checkpoint_hash}", not the genesis sentinel "${TRANSPARENCY_CHECKPOINT_GENESIS}"; this asserts an undisclosed predecessor (forged origin or withheld prefix) and cannot be verified as complete from genesis`,
+        });
+      }
+    } else if (opts.allowPartial) {
+      partialAccepted = true;
       notChecked.push(
-        `chain prefix: the earliest provided checkpoint has counter ${earliest}, so checkpoints 1..${earliest - 1} were not verified (partial chain accepted via allowPartial; this is a suffix fragment, NOT a complete-from-genesis verification)`
+        `chain prefix: the earliest provided checkpoint has counter ${earliest.counter}, so checkpoints 1..${earliest.counter - 1} were not verified (partial chain accepted via allowPartial; this is a suffix fragment, NOT a complete-from-genesis verification)`
       );
     } else {
       findings.push({
         kind: "counter_prefix_missing",
-        counter: earliest,
+        counter: earliest.counter,
         expected: 1,
-        actual: earliest,
-        message: `the earliest provided checkpoint has counter ${earliest}, not the genesis counter 1, so checkpoints 1..${earliest - 1} are withheld or missing; this chain is not verifiable as complete from genesis (pass --allow-partial to verify a suffix fragment, which reports as partial, not PASS)`,
+        actual: earliest.counter,
+        message: `the earliest provided checkpoint has counter ${earliest.counter}, not the genesis counter 1, so checkpoints 1..${earliest.counter - 1} are withheld or missing; this chain is not verifiable as complete from genesis (pass --allow-partial to verify a suffix fragment, which reports as partial, not PASS)`,
+      });
+    }
+  }
+  // Genesis sentinel must appear ONLY on the true origin. Any non-earliest
+  // record carrying the sentinel is a spliced/forged second origin: it would
+  // also break the linkage check, but flag it explicitly so the evidence is
+  // never mistaken for a clean multi-origin chain.
+  for (let i = 1; i < records.length; i++) {
+    if (
+      records[i]!.previous_checkpoint_hash === TRANSPARENCY_CHECKPOINT_GENESIS
+    ) {
+      findings.push({
+        kind: "genesis_sentinel_misplaced",
+        counter: records[i]!.counter,
+        message: `checkpoint counter ${records[i]!.counter} carries the genesis sentinel "${TRANSPARENCY_CHECKPOINT_GENESIS}" as its previous_checkpoint_hash, but it is not the earliest record; a second genesis inside the chain is forged or spliced`,
       });
     }
   }
@@ -459,8 +520,21 @@ export function verifyTransparencyCheckpoints(
     );
   }
 
+  // Verdict assembly. PASS is reserved EXCLUSIVELY for a complete-from-genesis
+  // chain with zero findings. A suffix accepted under --allow-partial returns
+  // the distinct PARTIAL verdict so neither verdict-gating nor exit-code-gating
+  // automation can read incomplete evidence as a clean PASS.
+  let verdict: "PASS" | "PARTIAL" | "FAIL";
+  if (findings.length > 0) {
+    verdict = "FAIL";
+  } else if (partialAccepted) {
+    verdict = "PARTIAL";
+  } else {
+    verdict = "PASS";
+  }
+
   return {
-    verdict: findings.length === 0 ? "PASS" : "FAIL",
+    verdict,
     checkpoints_verified: records.length,
     counter_range:
       records.length > 0

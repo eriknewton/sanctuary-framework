@@ -3,7 +3,7 @@
  * emit checkpoints, export a bundle, verify it offline with the pinned key,
  * and prove the failure paths (wrong key, truncated log, unsigned refusal).
  */
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import {
+  EXIT_PARTIAL,
   runTransparencyCommand,
   runVerifyTransparencyCommand,
 } from "../../src/cli/transparency.js";
@@ -183,6 +184,78 @@ describe("sanctuary transparency / verify-transparency CLI", () => {
     expect(hostOut.text()).toContain("Verdict: PASS");
     expect(hostOut.text()).toContain("recomputed and MATCHED");
     expect(hostOut.text()).toContain("recounted and MATCHED");
+  });
+
+  it("--allow-partial on a genesis-less suffix returns Verdict: PARTIAL and exit 10 (never PASS/0)", async () => {
+    const { fortress, publicKey, binaryPath } = await makeFortress();
+
+    // Emit three checkpoints (counters 1..3).
+    for (let i = 0; i < 3; i++) {
+      await runTransparencyCommand({
+        argv: [
+          "checkpoint",
+          "--fortress",
+          fortress,
+          "--passphrase",
+          PASSPHRASE,
+          "--local-sign",
+          "--binary",
+          binaryPath,
+        ],
+        out: new Capture(),
+        err: new Capture(),
+        env: {},
+      });
+    }
+
+    // Export then drop the genesis checkpoint to make a suffix (counters 2..3).
+    const bundlePath = join(fortress, "bundle.json");
+    await runTransparencyCommand({
+      argv: ["export", "--fortress", fortress, "--output", bundlePath],
+      out: new Capture(),
+      err: new Capture(),
+      env: {},
+    });
+    const bundle = JSON.parse(await readFile(bundlePath, "utf8")) as {
+      checkpoints: Array<{ counter: number }>;
+    };
+    bundle.checkpoints = bundle.checkpoints.filter((c) => c.counter !== 1);
+    const suffixPath = join(fortress, "suffix.json");
+    await writeFile(suffixPath, JSON.stringify(bundle));
+
+    // Without --allow-partial: FAIL / exit 1 (withheld prefix).
+    const strictOut = new Capture();
+    const strictCode = await runVerifyTransparencyCommand({
+      argv: ["--input", suffixPath, "--public-key", toBase64url(publicKey)],
+      out: strictOut,
+      err: new Capture(),
+      env: {},
+    });
+    expect(strictCode).toBe(1);
+    expect(strictOut.text()).toContain("Verdict: FAIL");
+    expect(strictOut.text()).toContain("counter_prefix_missing");
+
+    // With --allow-partial: distinct PARTIAL verdict + dedicated exit code 10,
+    // never PASS / 0 (automation must not read incomplete evidence as complete).
+    const partialOut = new Capture();
+    const partialCode = await runVerifyTransparencyCommand({
+      argv: [
+        "--input",
+        suffixPath,
+        "--public-key",
+        toBase64url(publicKey),
+        "--allow-partial",
+      ],
+      out: partialOut,
+      err: new Capture(),
+      env: {},
+    });
+    expect(partialCode).toBe(EXIT_PARTIAL);
+    expect(partialCode).toBe(10);
+    expect(partialCode).not.toBe(0);
+    expect(partialOut.text()).toContain("Verdict: PARTIAL");
+    expect(partialOut.text()).not.toContain("Verdict: PASS");
+    expect(partialOut.text()).toContain("suffix fragment");
   });
 
   it("FAILS verification under the wrong key (exit 1, honest finding)", async () => {

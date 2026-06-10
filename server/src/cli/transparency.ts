@@ -55,6 +55,14 @@ const { version: PKG_VERSION } = require("../../package.json") as {
   version: string;
 };
 
+/**
+ * Dedicated exit code for a PARTIAL verify-transparency result (a suffix
+ * fragment verified internally but NOT rooted at genesis, accepted via
+ * --allow-partial). Distinct from 0 (clean PASS) and 1 (FAIL) so automation
+ * can never read incomplete evidence as a complete-from-genesis verification.
+ */
+export const EXIT_PARTIAL = 10;
+
 export interface TransparencyCommandArgs {
   argv: string[];
   out?: Writable;
@@ -327,7 +335,14 @@ export async function runVerifyTransparencyCommand(
     } else {
       printHumanReport(out, payload);
     }
-    return report.verdict === "PASS" ? 0 : 1;
+    // Exit-code mapping. 0 is reserved EXCLUSIVELY for a clean PASS
+    // (complete-from-genesis, authentic genesis sentinel, zero findings). A
+    // PARTIAL suffix (verified internally but not genesis-rooted, accepted via
+    // --allow-partial) returns the dedicated code 10 so automation can never
+    // read it as a complete verification. Everything else (FAIL) is 1.
+    if (report.verdict === "PASS") return 0;
+    if (report.verdict === "PARTIAL") return EXIT_PARTIAL;
+    return 1;
   } catch (error) {
     return reportError(err, "verify-transparency", error);
   } finally {
@@ -637,13 +652,15 @@ Options:
   --trust-embedded          Verify against the key embedded in the records.
                             Proves internal consistency only; stated in output.
   --allow-partial           Accept a suffix fragment not starting at genesis
-                            (counter 1). Reports as partial, never a clean PASS.
+                            (counter 1). Reports verdict PARTIAL and exits 10,
+                            never a clean PASS / exit 0.
   --against-log             Also cross-check the live audit log (host mode).
   --fortress <path>         Fortress path for --against-log / pin discovery.
   --passphrase <val>        Enables counter recount in --against-log mode.
   --json                    Emit the full report as JSON.
 
-Exit codes: 0 PASS, 1 FAIL, 2 usage error.
+Exit codes: 0 PASS (complete from genesis), 10 PARTIAL (suffix fragment via
+--allow-partial; verified but not genesis-rooted), 1 FAIL, 2 usage error.
 `
   );
 }

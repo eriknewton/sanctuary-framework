@@ -231,19 +231,79 @@ describe("verify-transparency offline verifier", () => {
     );
   });
 
-  it("reports a partial suffix honestly under --allow-partial (no clean PASS by default)", () => {
+  it("reports a partial suffix as PARTIAL (never PASS) under --allow-partial", () => {
     const chain = makeChain(4).slice(2); // counters 3..4
     const report = verifyTransparencyCheckpoints(chain, {
       publicKey: PUBLIC_KEY_B64,
       allowPartial: true,
     });
-    expect(report.verdict).toBe("PASS");
+    // Distinct PARTIAL verdict: incomplete evidence must never be readable as a
+    // clean complete-from-genesis PASS by any verdict-gating caller.
+    expect(report.verdict).toBe("PARTIAL");
+    expect(report.verdict).not.toBe("PASS");
     expect(report.counter_range).toEqual({ from: 3, to: 4 });
     expect(report.findings.some((f) => f.kind === "counter_prefix_missing")).toBe(
       false
     );
     expect(report.not_checked.join(" ")).toContain("partial chain");
     expect(report.not_checked.join(" ")).toContain("suffix fragment");
+  });
+
+  it("GENESIS SPOOF: counter-1 record with a non-sentinel previous hash FAILS even with --allow-partial", () => {
+    // HIGH-1 regression: a bundle whose earliest record claims counter 1 but
+    // carries a 64-hex previous_checkpoint_hash (asserting an undisclosed
+    // predecessor) must NEVER pass. It is a forged origin or a withheld prefix
+    // wearing a genesis counter; --allow-partial cannot launder a counter-1
+    // assertion, because claiming counter 1 IS claiming to be the genesis.
+    const forgedOrigin = payloadAt(1, "e".repeat(64), 10); // non-GENESIS prev hash
+    const second = payloadAt(2, computeCheckpointHash(forgedOrigin), 20);
+    const chain = [sign(forgedOrigin), sign(second)];
+
+    const strict = verifyTransparencyCheckpoints(chain, {
+      publicKey: PUBLIC_KEY_B64,
+    });
+    expect(strict.verdict).toBe("FAIL");
+    expect(
+      strict.findings.some((f) => f.kind === "genesis_sentinel_mismatch")
+    ).toBe(true);
+
+    // --allow-partial must not rescue it: still FAIL, still the same finding.
+    const partial = verifyTransparencyCheckpoints(chain, {
+      publicKey: PUBLIC_KEY_B64,
+      allowPartial: true,
+    });
+    expect(partial.verdict).toBe("FAIL");
+    expect(partial.verdict).not.toBe("PASS");
+    expect(partial.verdict).not.toBe("PARTIAL");
+    expect(
+      partial.findings.some((f) => f.kind === "genesis_sentinel_mismatch")
+    ).toBe(true);
+  });
+
+  it("GENESIS SPOOF: a genuine genesis (counter 1 with the GENESIS sentinel) PASSES", () => {
+    // The honest emitter writes "GENESIS" for the first checkpoint; that and
+    // only that is a clean genesis-rooted PASS.
+    const report = verifyTransparencyCheckpoints(makeChain(3), {
+      publicKey: PUBLIC_KEY_B64,
+    });
+    expect(report.verdict).toBe("PASS");
+    expect(report.findings).toHaveLength(0);
+    expect(makeChain(3)[0]!.previous_checkpoint_hash).toBe("GENESIS");
+  });
+
+  it("DETECTS a misplaced genesis sentinel on a non-earliest record", () => {
+    // A spliced second origin in the middle of a chain: counter 2 carrying the
+    // GENESIS sentinel. This both breaks linkage and trips the explicit guard.
+    const first = payloadAt(1, "GENESIS", 10);
+    const spliced = payloadAt(2, "GENESIS", 20); // wrong: should link to #1
+    const report = verifyTransparencyCheckpoints(
+      [sign(first), sign(spliced)],
+      { publicKey: PUBLIC_KEY_B64 }
+    );
+    expect(report.verdict).toBe("FAIL");
+    expect(
+      report.findings.some((f) => f.kind === "genesis_sentinel_misplaced")
+    ).toBe(true);
   });
 
   it("PASSES a genesis-rooted complete chain (counter 1..N)", () => {
