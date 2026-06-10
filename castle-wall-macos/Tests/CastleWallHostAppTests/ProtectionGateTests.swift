@@ -61,6 +61,19 @@ final class ProtectionGateTests: XCTestCase {
         )
     }
 
+    // MARK: - disarmControlVisible (codex P2: failed disarm keeps the exit path)
+
+    /// The Disarm control must stay on screen while armed OR while the last
+    /// disarm attempt is unverified — a failed saveToPreferences drops the
+    /// filter state out of "armed" while the REAL filter may still be on, and
+    /// that exact moment must not hide the retry.
+    func testDisarmControlVisibleWheneverArmedOrDisarmUnverified() {
+        XCTAssertTrue(ProtectionGate.disarmControlVisible(isArmed: true, disarmPending: false))
+        XCTAssertTrue(ProtectionGate.disarmControlVisible(isArmed: true, disarmPending: true))
+        XCTAssertTrue(ProtectionGate.disarmControlVisible(isArmed: false, disarmPending: true))
+        XCTAssertFalse(ProtectionGate.disarmControlVisible(isArmed: false, disarmPending: false))
+    }
+
     // MARK: - armBlockedReason (a blocked Arm is never silent)
 
     func testNoBlockedReasonWhenArmAllowed() {

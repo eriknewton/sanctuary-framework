@@ -18,8 +18,11 @@ struct ContentView: View {
     /// auto-arm must never silently undo the operator's explicit decision.
     @AppStorage("operatorDisarmed") private var operatorDisarmed = false
 
-    /// F-UX-2 arm gate input: true iff the daemon's active-config names a live
-    /// pid (written only after its listener + signed policy are up). Refreshed
+    /// F-UX-2 arm gate input, ARM-GRADE (codex P1): true iff the protected
+    /// root-owned active-config names a daemon whose unix socket actually
+    /// accepts a connect. Sourced exclusively from
+    /// `SocketPath.activeDaemonPresentForArming` — never the discovery-grade
+    /// probe, whose legacy /tmp fallback any local user can forge. Refreshed
     /// on scene activation and on the periodic status tick.
     @State private var daemonUpWithPolicy = false
 
@@ -187,17 +190,26 @@ struct ContentView: View {
         )
     }
 
-    /// The manual control: Disarm whenever armed (ALWAYS enabled — the
-    /// operator can stand the wall down unconditionally), Arm otherwise
-    /// (enabled only when the fail-closed gate passes).
+    /// The manual control: Disarm whenever armed OR while a disarm attempt is
+    /// pending/unverified (ALWAYS enabled — the operator can stand the wall
+    /// down unconditionally, and a FAILED disarm must keep the retry on
+    /// screen, codex P2), Arm otherwise (enabled only when the fail-closed
+    /// gate passes).
     @ViewBuilder
     private var protectionControl: some View {
-        if isArmed {
+        if ProtectionGate.disarmControlVisible(
+            isArmed: isArmed,
+            disarmPending: filterConfigurationManager.disarmPending
+        ) {
             Button("Disarm") {
                 disarmProtection()
             }
             .disabled(!ProtectionGate.canDisarm())
-            .help("Turn the Castle Wall off. Always available.")
+            .help(
+                filterConfigurationManager.disarmPending && !isArmed
+                    ? "The last disarm was not verified complete — retry until the filter is confirmed off."
+                    : "Turn the Castle Wall off. Always available."
+            )
         } else {
             Button("Arm") {
                 armProtection()
@@ -208,10 +220,11 @@ struct ContentView: View {
     }
 
     /// Refresh the inputs the arm gate + banners read: helper status and
-    /// daemon liveness. Cheap; called on scene activation and the status tick.
+    /// arm-grade daemon liveness (root-owned active-config + socket connect;
+    /// codex P1). Called on scene activation and the status tick.
     private func refreshProtectionInputs() {
         signerHelperManager.refreshStatus()
-        daemonUpWithPolicy = SocketPath.activeDaemonPresent()
+        daemonUpWithPolicy = SocketPath.activeDaemonPresentForArming()
     }
 
     /// Auto-arm, re-evaluated on every refresh path (F-UX-2) — not a one-shot.
@@ -237,10 +250,14 @@ struct ContentView: View {
         armProtection()
     }
 
-    /// Arm the wall. Fail-closed: re-probe the daemon at gesture time and bail
-    /// (never partially arm) if the gate no longer passes.
+    /// Arm the wall. Fail-closed: re-probe the daemon at gesture time with the
+    /// ARM-GRADE check (codex P1) and bail (never partially arm) if the gate
+    /// no longer passes. Also refuses to arm while a disarm attempt is
+    /// pending/unverified — the filter's true state is unknown then, and the
+    /// operator's standing order is "down".
     private func armProtection() {
-        daemonUpWithPolicy = SocketPath.activeDaemonPresent()
+        guard !filterConfigurationManager.disarmPending else { return }
+        daemonUpWithPolicy = SocketPath.activeDaemonPresentForArming()
         guard canArm else { return }
 
         operatorDisarmed = false

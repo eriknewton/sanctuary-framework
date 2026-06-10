@@ -91,17 +91,18 @@ public enum SocketPath {
         return resolveDarwinFallback(fortressPath: fortressPath, homeDir: homeDir)
     }
 
-    /// F-UX-2 (manual arm gate): true iff an active-config discovery file names
-    /// a LIVE daemon pid. The daemon writes its active-config only AFTER the
-    /// IPC listener is up and the signed policy manifest is loaded
-    /// (`server/src/castle-wall/runtime/macos-daemon.ts`), so this is the host
-    /// app's "daemon up with policy" readiness probe for arming. Arming without
-    /// it would fail-close the machine to deny-all (the B2 lesson).
+    /// DISCOVERY-grade liveness: true iff an active-config discovery file
+    /// names a LIVE daemon pid. The daemon writes its active-config only AFTER
+    /// the IPC listener is up and the signed policy manifest is loaded
+    /// (`server/src/castle-wall/runtime/macos-daemon.ts`).
     ///
-    /// Discovery/readiness ONLY — never a trust gate. The IPC handshake binds
-    /// the pinned key; the sysext's fingerprint gate ignores non-root-owned
-    /// active-config (F-A2-4). A forged file can light up an Arm button, but it
-    /// cannot make the wall trust an impostor daemon.
+    /// Discovery ONLY — never a trust gate, and NEVER an arm gate (codex P1).
+    /// The file can live at the legacy world-writable /tmp path, so any local
+    /// user can forge "daemon present"; the IPC handshake binds the pinned key,
+    /// so discovery spoofing cannot make the wall trust an impostor daemon —
+    /// but it COULD have lit the Arm button onto a deny-all brick (the exact B2
+    /// fail-open class). Arming paths MUST use
+    /// `activeDaemonPresentForArming` instead.
     ///
     /// The legacy /tmp fallback is consulted only for the production default
     /// path (same hermetic-test semantics as `resolve`); under A2 the
@@ -120,6 +121,117 @@ public enum SocketPath {
             return true
         }
         return false
+    }
+
+    /// ARM-GRADE readiness (codex P1): the fail-closed probe the host app's
+    /// Arm gate and auto-arm paths MUST use. Strictly stronger than
+    /// `activeDaemonPresent` (which stays discovery-grade for non-arming
+    /// uses):
+    ///
+    ///   (a) The legacy world-writable /tmp fallback is NEVER consulted. Any
+    ///       local user can plant that file; arming on it is the B2 fail-open
+    ///       class this gate exists to kill. There is structurally no legacy
+    ///       code path in this function.
+    ///   (b) The active-config must sit at the protected custody path,
+    ///       root-owned (the same `FileCustody.fileIsRootOwned` gate the
+    ///       sysext's fingerprint trust-gate applies, F-A2-4) and must not be
+    ///       a symlink — a planted link must not launder a custody check onto
+    ///       attacker-controlled content.
+    ///   (c) Liveness is proven by actually CONNECTING to the unix socket the
+    ///       config names (connect + immediate close, bounded timeout) — not
+    ///       by `kill(pid, 0)`, which any live unrelated pid satisfies. The
+    ///       config parse (live pid named, non-empty socket_path) is still
+    ///       required first; the connect is the additional, unforgeable leg.
+    ///
+    /// `custody`, `isSymlink`, and `canConnect` are injectable for tests only
+    /// (CI runs unprivileged and cannot create root-owned files); production
+    /// call sites use the defaults.
+    public static func activeDaemonPresentForArming(
+        activeConfigPath: String = SocketPath.activeConfigPath,
+        custody: FileCustody = FileCustody(),
+        isSymlink: (String) -> Bool = SocketPath.pathIsSymlink,
+        canConnect: (String) -> Bool = { canConnectUnixSocket(at: $0) }
+    ) -> Bool {
+        // (b) Custody: root-owned regular file at the protected path.
+        guard custody.fileIsRootOwned(activeConfigPath) else {
+            return false
+        }
+        guard !isSymlink(activeConfigPath) else {
+            return false
+        }
+        // Parse gate (same invariants as discovery: non-empty socket_path,
+        // pid > 0, pid alive).
+        guard let resolved = resolveActiveConfigSocketPath(configPath: activeConfigPath) else {
+            return false
+        }
+        // (c) Liveness: a daemon is "up" only if its socket accepts a connect.
+        return canConnect(resolved.path)
+    }
+
+    /// lstat-semantics symlink probe (`FileManager.attributesOfItem` does not
+    /// traverse the final path component). Separate from the ownership probe
+    /// so tests that simulate root ownership still exercise the symlink
+    /// rejection.
+    public static func pathIsSymlink(_ path: String) -> Bool {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else {
+            return false
+        }
+        return (attrs[.type] as? FileAttributeType) == .typeSymbolicLink
+    }
+
+    /// Bounded-timeout unix-socket connect probe: connect + immediate close,
+    /// nothing written. Only a SUCCESSFUL connect counts — ECONNREFUSED (stale
+    /// socket file, dead daemon) and EACCES (mode-restricted socket we cannot
+    /// reach) both read as "not connectable", because neither proves a live
+    /// daemon THIS process could actually talk to.
+    public static func canConnectUnixSocket(at path: String, timeoutMs: Int32 = 500) -> Bool {
+        let pathBytes = Array(path.utf8)
+        // sockaddr_un.sun_path is 104 bytes on Darwin (incl. NUL).
+        guard pathBytes.count + 1 <= 104 else {
+            return false
+        }
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            return false
+        }
+        defer { _ = Darwin.close(fd) }
+
+        // Non-blocking so a wedged listener cannot hang the UI probe.
+        let flags = Darwin.fcntl(fd, F_GETFL, 0)
+        _ = Darwin.fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { rawBuffer in
+            for (i, byte) in pathBytes.enumerated() {
+                rawBuffer[i] = byte
+            }
+            rawBuffer[pathBytes.count] = 0
+        }
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+
+        let connectResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                Darwin.connect(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        if connectResult == 0 {
+            return true
+        }
+        guard errno == EINPROGRESS else {
+            return false
+        }
+        var pollFD = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        guard Darwin.poll(&pollFD, 1, timeoutMs) == 1,
+              (pollFD.revents & Int16(POLLOUT)) != 0 else {
+            return false
+        }
+        var socketError: Int32 = -1
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        guard Darwin.getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &len) == 0 else {
+            return false
+        }
+        return socketError == 0
     }
 
     private static func resolveDarwinFallback(

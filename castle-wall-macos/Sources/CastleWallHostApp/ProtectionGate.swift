@@ -23,9 +23,13 @@ import Foundation
 
 enum ProtectionGate {
     /// Arming is allowed only when the helper is ready (enabled + pin present)
-    /// AND the daemon is up with a loaded policy (active-config names a live
-    /// pid — written only after the listener starts and the signed manifest
-    /// loads). Fail-closed: any missing leg blocks arm.
+    /// AND the daemon is up with a loaded policy. `daemonUpWithPolicy` MUST
+    /// come from the ARM-GRADE probe
+    /// (`SocketPath.activeDaemonPresentForArming`: root-owned non-symlink
+    /// active-config at the protected path + a successful unix-socket
+    /// connect), never from discovery-grade `activeDaemonPresent`, whose
+    /// legacy /tmp fallback any local user can forge (codex P1).
+    /// Fail-closed: any missing leg blocks arm.
     static func canArm(helperReady: Bool, daemonUpWithPolicy: Bool) -> Bool {
         helperReady && daemonUpWithPolicy
     }
@@ -35,6 +39,16 @@ enum ProtectionGate {
     /// so the invariant is named and test-asserted.
     static func canDisarm() -> Bool {
         true
+    }
+
+    /// Codex P2: the Disarm control stays on screen while armed OR while the
+    /// last disarm attempt has not been VERIFIED complete (a re-read proving
+    /// `NEFilterManager.isEnabled == false`). Without the second leg, a failed
+    /// `saveToPreferences` drops `filterState` out of the armed states, the
+    /// header flips to the Arm control, and the operator loses the in-app exit
+    /// path while the REAL filter may still be enabled.
+    static func disarmControlVisible(isArmed: Bool, disarmPending: Bool) -> Bool {
+        isArmed || disarmPending
     }
 
     /// Auto-arm fires only when arming is allowed, the wall is not already
