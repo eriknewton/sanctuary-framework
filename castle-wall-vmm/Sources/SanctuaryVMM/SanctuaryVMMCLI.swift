@@ -68,6 +68,22 @@ public enum SanctuaryVMMCLI {
             return 1
         }
 
+        // FAIL-CLOSED: an unknown delivery mode, an inconsistent mode/path
+        // combination, or a missing/malformed SHA-256 pin refuses to launch;
+        // it never falls back to a different delivery mode or to an
+        // unjailed plugin.
+        let jailDelivery: SanctuaryGuestJailDelivery
+        do {
+            jailDelivery = try SanctuaryGuestJail.parseDelivery(
+                mode: request.guestJailDelivery,
+                staticBinaryPath: request.staticJailBinaryPath,
+                staticBinarySHA256: request.staticJailBinarySHA256
+            )
+        } catch {
+            fputs("\(error)\n", stderr)
+            return 1
+        }
+
         let config = SanctuaryContainerConfig(
             kernelPath: request.kernelPath,
             initfsReference: request.initfsReference ?? "ghcr.io/apple/containerization/vminit:0.33.3",
@@ -77,7 +93,8 @@ public enum SanctuaryVMMCLI {
             memoryBytes: request.memoryBytes ?? 512 * 1024 * 1024,
             rootfsPins: request.rootfsPins ?? [],
             egressVsockPort: request.egressVsockPort ?? 0x0FFF_0001,
-            applyGuestJail: request.applyGuestJail ?? true
+            applyGuestJail: request.applyGuestJail ?? true,
+            guestJailDelivery: jailDelivery
         )
 
         let launcher = SanctuaryContainerLauncher(config: config)
@@ -137,6 +154,22 @@ public enum SanctuaryVMMCLI {
             return 1
         }
 
+        // FAIL-CLOSED: an unknown delivery mode, an inconsistent mode/path
+        // combination, or a missing/malformed SHA-256 pin refuses to launch;
+        // it never falls back to a different delivery mode or to an
+        // unjailed plugin.
+        let jailDelivery: SanctuaryGuestJailDelivery
+        do {
+            jailDelivery = try SanctuaryGuestJail.parseDelivery(
+                mode: request.guestJailDelivery,
+                staticBinaryPath: request.staticJailBinaryPath,
+                staticBinarySHA256: request.staticJailBinarySHA256
+            )
+        } catch {
+            fputs("\(error)\n", stderr)
+            return 1
+        }
+
         let containerConfig = SanctuaryContainerConfig(
             kernelPath: request.kernelPath,
             initfsReference: request.initfsReference ?? "ghcr.io/apple/containerization/vminit:0.33.3",
@@ -146,7 +179,8 @@ public enum SanctuaryVMMCLI {
             memoryBytes: request.memoryBytes ?? 512 * 1024 * 1024,
             rootfsPins: request.rootfsPins ?? [],
             egressVsockPort: request.egressVsockPort ?? 0x0FFF_0001,
-            applyGuestJail: request.applyGuestJail ?? true
+            applyGuestJail: request.applyGuestJail ?? true,
+            guestJailDelivery: jailDelivery
         )
 
         let egressConfig = SanctuaryVsockEgressConfig(
@@ -215,6 +249,20 @@ struct GuestExecCLIRequest: Codable {
     let rootfsPins: [SanctuaryArtifactPin]?
     let egressVsockPort: UInt32?
     let applyGuestJail: Bool?
+    /// "python-preamble" (default) or "static-binary". Unknown values fail
+    /// closed (no launch).
+    let guestJailDelivery: String?
+    /// TRUSTED-ADMIN TCB INPUT. Host path to the STATIC aarch64
+    /// sanctuary-jail binary; required when guestJailDelivery is
+    /// "static-binary", rejected otherwise. The path alone is NOT trusted:
+    /// the staged copy must match staticJailBinarySHA256.
+    let staticJailBinaryPath: String?
+    /// TRUSTED-ADMIN TCB INPUT. Pinned SHA-256 (64 hex chars) of the
+    /// sanctuary-jail artifact, sourced from the sanctuary-jail-static CI
+    /// SHA256SUMS manifest. REQUIRED when guestJailDelivery is
+    /// "static-binary" (no hash, no static delivery), rejected otherwise.
+    /// Verified against the STAGED copy before boot; mismatch = no launch.
+    let staticJailBinarySHA256: String?
     let command: String
     let args: [String]
     let cwd: String
@@ -231,6 +279,20 @@ struct RunBoxCLIRequest: Codable {
     let rootfsPins: [SanctuaryArtifactPin]?
     let egressVsockPort: UInt32?
     let applyGuestJail: Bool?
+    /// "python-preamble" (default) or "static-binary". Unknown values fail
+    /// closed (no launch).
+    let guestJailDelivery: String?
+    /// TRUSTED-ADMIN TCB INPUT. Host path to the STATIC aarch64
+    /// sanctuary-jail binary; required when guestJailDelivery is
+    /// "static-binary", rejected otherwise. The path alone is NOT trusted:
+    /// the staged copy must match staticJailBinarySHA256.
+    let staticJailBinaryPath: String?
+    /// TRUSTED-ADMIN TCB INPUT. Pinned SHA-256 (64 hex chars) of the
+    /// sanctuary-jail artifact, sourced from the sanctuary-jail-static CI
+    /// SHA256SUMS manifest. REQUIRED when guestJailDelivery is
+    /// "static-binary" (no hash, no static delivery), rejected otherwise.
+    /// Verified against the STAGED copy before boot; mismatch = no launch.
+    let staticJailBinarySHA256: String?
     let egressProxyUdsPath: String
     let egressGuestSocketPath: String?
     let command: String

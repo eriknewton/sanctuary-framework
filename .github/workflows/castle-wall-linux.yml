@@ -124,3 +124,84 @@ jobs:
         if: always()
         run: |
           sudo nft delete table inet sanctuary-castle 2>/dev/null || true
+
+  # Static-binary build of the sanctuary-jail shim (B2 static-binary jail
+  # delivery). The macOS launcher (SanctuaryGuestJail static-binary mode)
+  # bind-mounts the aarch64 artifact into python-less guest images, so the
+  # binary MUST be statically linked (libc-less guests) -- the build script
+  # fails closed if it is not. The x86_64 artifact gets a functional smoke on
+  # the runner itself: confinement install + exec, usage fail-closed, and
+  # exec fail-closed.
+  sanctuary-jail-static:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cross/static toolchain packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools gcc-aarch64-linux-gnu file
+
+      - name: Install pinned Rust toolchain with musl targets
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            castle-wall-daemon/target
+          key: sanctuary-jail-static-${{ runner.os }}-cargo-${{ hashFiles('castle-wall-daemon/Cargo.lock', 'castle-wall-daemon/Cargo.toml') }}
+          restore-keys: |
+            sanctuary-jail-static-${{ runner.os }}-cargo-
+
+      - name: Build static sanctuary-jail (x86_64 + aarch64, fail-closed linkage check)
+        working-directory: castle-wall-daemon
+        run: bash scripts/build-sanctuary-jail-static.sh
+
+      - name: Functional smoke (x86_64 on runner) -- confinement installs, exec works
+        working-directory: castle-wall-daemon
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/sanctuary-jail
+          # Happy path: shim confines itself then execs the target.
+          out=$("$BIN" -- /bin/echo jail-exec-ok 2>stderr.log)
+          [ "$out" = "jail-exec-ok" ] || { echo "FAIL: exec through shim did not run target"; exit 1; }
+          grep -q 'launcher-applied seccomp-deny-AF_VSOCK installed' stderr.log \
+            || { echo "FAIL: [JAIL] marker missing from shim stderr"; cat stderr.log; exit 1; }
+          # Fail-closed: no -- separator is a usage error, exit nonzero.
+          if "$BIN" /bin/true 2>/dev/null; then
+            echo "FAIL: missing -- separator must be rejected"; exit 1
+          fi
+          # Fail-closed: exec failure exits nonzero (never falls through).
+          if "$BIN" -- /nonexistent-program 2>/dev/null; then
+            echo "FAIL: exec failure must exit nonzero"; exit 1
+          fi
+          echo "sanctuary-jail static smoke: PASS"
+
+      # The macOS launcher authenticates the shim by a pinned SHA-256
+      # computed on its staged copy (SanctuaryGuestJail static-binary
+      # delivery: no hash, no static delivery). This manifest, produced in
+      # the same job that built the artifacts, is the authentic source
+      # operators pin staticJailBinarySHA256 from. It is printed to the job
+      # log AND shipped inside the uploaded artifact.
+      - name: Emit SHA-256 manifest (authentic pin source for static delivery)
+        working-directory: castle-wall-daemon
+        run: |
+          sha256sum \
+            target/x86_64-unknown-linux-musl/release/sanctuary-jail \
+            target/aarch64-unknown-linux-musl/release/sanctuary-jail \
+            | tee target/sanctuary-jail.SHA256SUMS
+
+      - name: Upload static artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-jail-static
+          path: |
+            castle-wall-daemon/target/x86_64-unknown-linux-musl/release/sanctuary-jail
+            castle-wall-daemon/target/aarch64-unknown-linux-musl/release/sanctuary-jail
+            castle-wall-daemon/target/sanctuary-jail.SHA256SUMS
+          if-no-files-found: error

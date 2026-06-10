@@ -23,6 +23,15 @@ fn run() -> Result<(), String> {
 
     jail::confine_current_process().map_err(|err| err.to_string())?;
 
+    // SAFETY: the "[JAIL]" stderr marker is the drill/operator evidence
+    // contract: run-launcher-integration-drill.sh greps for the substring
+    // "launcher-applied seccomp-deny-AF_VSOCK installed" (parity with the
+    // macOS launcher's python preamble marker). The wrapped program's stdio
+    // is otherwise untouched.
+    eprintln!(
+        "[JAIL] launcher-applied seccomp-deny-AF_VSOCK installed before plugin exec (sanctuary-jail)"
+    );
+
     let mut command = Command::new(program);
     command.args(&command_argv[1..]);
     let err = command.exec();

@@ -28,6 +28,16 @@ public struct SanctuaryContainerConfig: Sendable {
     /// escape regardless of whether the plugin cooperates. Disable only to
     /// reproduce the unconfined baseline in a drill.
     public let applyGuestJail: Bool
+    /// How the jail is delivered into the guest. `.pythonPreamble` (default,
+    /// drill-proven; needs python3 in the image) or `.staticBinary` (the
+    /// static `sanctuary-jail` shim is authenticated against an
+    /// operator-pinned SHA-256 — computed on the STAGED copy — then
+    /// bind-mounted in; works on python-less images). FAIL-CLOSED either
+    /// way: if the selected delivery cannot run, the plugin does NOT launch
+    /// unjailed (static: a missing binary, absent/malformed pin, or
+    /// staged-copy hash mismatch throws before boot; python: the in-guest
+    /// exec of python3 fails and the box exits).
+    public let guestJailDelivery: SanctuaryGuestJailDelivery
 
     public init(
         kernelPath: String,
@@ -38,7 +48,8 @@ public struct SanctuaryContainerConfig: Sendable {
         memoryBytes: UInt64 = 512 * 1024 * 1024,
         rootfsPins: [SanctuaryArtifactPin] = [],
         egressVsockPort: UInt32 = 0x0FFF_0001,
-        applyGuestJail: Bool = true
+        applyGuestJail: Bool = true,
+        guestJailDelivery: SanctuaryGuestJailDelivery = .pythonPreamble
     ) {
         self.kernelPath = kernelPath
         self.initfsReference = initfsReference
@@ -49,6 +60,7 @@ public struct SanctuaryContainerConfig: Sendable {
         self.rootfsPins = rootfsPins
         self.egressVsockPort = egressVsockPort
         self.applyGuestJail = applyGuestJail
+        self.guestJailDelivery = guestJailDelivery
     }
 }
 
@@ -127,6 +139,11 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
         containerId: String,
         request: SanctuaryGuestExecRequest
     ) async throws -> SanctuaryGuestExecResult {
+        // B2 inner-confinement: plan the jail BEFORE boot. A throw here (static
+        // shim missing/invalid) means the plugin is never launched — fail closed.
+        let jailPlan = try makeJailPlan(for: request)
+        defer { cleanupJailPlan(jailPlan) }
+
         var manager = try await ContainerManager(
             kernel: Kernel(
                 path: URL(fileURLWithPath: config.kernelPath),
@@ -144,6 +161,8 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
         let stderrCapture = CaptureWriter()
 
         let launchConfig = self.config
+        let jailedArguments = jailPlan?.argv ?? [request.command] + request.args
+        let jailShare = Self.shareMount(for: jailPlan)
         let container = try await manager.create(
             containerId,
             reference: launchConfig.ociImageReference,
@@ -153,18 +172,21 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
             cfg.cpus = launchConfig.cpuCount
             cfg.memoryInBytes = launchConfig.memoryBytes
             // B2 inner-confinement: born-confined plugin argv. When applyGuestJail
-            // is on (production default), the trusted launcher prepends the
-            // seccomp-deny-AF_VSOCK preamble so the plugin cannot reach vminitd,
-            // whether or not it cooperates. seccomp survives the preamble's execvp.
-            cfg.process.arguments = launchConfig.applyGuestJail
-                ? SanctuaryGuestJail.wrap(command: request.command, args: request.args)
-                : [request.command] + request.args
+            // is on (production default), the trusted launcher prepends the jail
+            // delivery (python preamble or static shim) so the plugin cannot reach
+            // vminitd, whether or not it cooperates. seccomp survives the exec.
+            cfg.process.arguments = jailedArguments
             cfg.process.workingDirectory = request.cwd
             for (key, value) in request.env {
                 cfg.process.environmentVariables.append("\(key)=\(value)")
             }
             cfg.process.stdout = stdoutCapture
             cfg.process.stderr = stderrCapture
+            // Static delivery: read-only virtiofs share exposing ONLY the
+            // staged sanctuary-jail shim at the fixed guest mount point.
+            if let jailShare {
+                cfg.mounts.append(jailShare)
+            }
         }
 
         // HOST-SIDE ASSERTION: 0 network devices configured.
@@ -211,6 +233,11 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
         request: SanctuaryGuestExecRequest,
         egressConfig: SanctuaryVsockEgressConfig
     ) async throws -> SanctuaryGuestExecResult {
+        // B2 inner-confinement: plan the jail BEFORE boot. A throw here (static
+        // shim missing/invalid) means the plugin is never launched — fail closed.
+        let jailPlan = try makeJailPlan(for: request)
+        defer { cleanupJailPlan(jailPlan) }
+
         var manager = try await ContainerManager(
             kernel: Kernel(
                 path: URL(fileURLWithPath: config.kernelPath),
@@ -229,6 +256,8 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
 
         let launchConfig = self.config
         let egress = egressConfig
+        let jailedArguments = jailPlan?.argv ?? [request.command] + request.args
+        let jailShare = Self.shareMount(for: jailPlan)
         let container = try await manager.create(
             containerId,
             reference: launchConfig.ociImageReference,
@@ -238,12 +267,10 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
             cfg.cpus = launchConfig.cpuCount
             cfg.memoryInBytes = launchConfig.memoryBytes
             // B2 inner-confinement: born-confined plugin argv. When applyGuestJail
-            // is on (production default), the trusted launcher prepends the
-            // seccomp-deny-AF_VSOCK preamble so the plugin cannot reach vminitd,
-            // whether or not it cooperates. seccomp survives the preamble's execvp.
-            cfg.process.arguments = launchConfig.applyGuestJail
-                ? SanctuaryGuestJail.wrap(command: request.command, args: request.args)
-                : [request.command] + request.args
+            // is on (production default), the trusted launcher prepends the jail
+            // delivery (python preamble or static shim) so the plugin cannot reach
+            // vminitd, whether or not it cooperates. seccomp survives the exec.
+            cfg.process.arguments = jailedArguments
             cfg.process.workingDirectory = request.cwd
             for (key, value) in request.env {
                 cfg.process.environmentVariables.append("\(key)=\(value)")
@@ -262,6 +289,12 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
                     direction: .into
                 )
             )
+
+            // Static delivery: read-only virtiofs share exposing ONLY the
+            // staged sanctuary-jail shim at the fixed guest mount point.
+            if let jailShare {
+                cfg.mounts.append(jailShare)
+            }
         }
 
         // HOST-SIDE ASSERTION: 0 network devices configured. A `.into` socket
@@ -286,6 +319,23 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
         )
     }
 
+    /// Convert a jail plan's staged-share fields into the virtiofs mount the
+    /// guest sees. Read-only is load-bearing: the hostile plugin must not be
+    /// able to modify the trusted shim. No `noexec` (the shim must exec);
+    /// `nosuid`/`nodev` follow the package's default-mount hardening.
+    private static func shareMount(for plan: SanctuaryGuestJailPlan?) -> Containerization.Mount? {
+        guard let plan,
+              let hostShareDirectory = plan.hostShareDirectory,
+              let guestMountPoint = plan.guestMountPoint else {
+            return nil
+        }
+        return .share(
+            source: hostShareDirectory,
+            destination: guestMountPoint,
+            options: ["ro", "nosuid", "nodev"]
+        )
+    }
+
     #else
 
     public func launchAndExec(
@@ -304,6 +354,29 @@ public final class SanctuaryContainerLauncher: @unchecked Sendable {
     }
 
     #endif
+
+    /// Build the jail plan for a request, or `nil` when the jail is disabled
+    /// (drill baseline only). FAIL-CLOSED: any error from planning (missing
+    /// or invalid static shim, staging failure) propagates and the plugin is
+    /// never launched. There is no fallback from one delivery mode to
+    /// another and no fallback to an unjailed launch.
+    private func makeJailPlan(
+        for request: SanctuaryGuestExecRequest
+    ) throws -> SanctuaryGuestJailPlan? {
+        guard config.applyGuestJail else { return nil }
+        return try SanctuaryGuestJail.makePlan(
+            delivery: config.guestJailDelivery,
+            command: request.command,
+            args: request.args
+        )
+    }
+
+    /// Remove the private staging directory created for static delivery.
+    private func cleanupJailPlan(_ plan: SanctuaryGuestJailPlan?) {
+        if let dir = plan?.hostShareDirectory {
+            try? FileManager.default.removeItem(atPath: dir)
+        }
+    }
 }
 
 /// Captures bytes written by a guest stdio stream.
