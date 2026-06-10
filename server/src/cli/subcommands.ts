@@ -26,6 +26,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "reset-passphrase",
   "secrets",
   "sentinel",
+  "status",
   "task",
   "template",
   "verify-exit-bundle",

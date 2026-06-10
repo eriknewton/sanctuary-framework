@@ -100,6 +100,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "status") {
+    const { runStatusCommand } = await import("./cli/status.js");
+    const code = await runStatusCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "doctor") {
     const { runDoctorCommand } = await import("./cli/doctor.js");
     const code = await runDoctorCommand({ argv: args.slice(1) });
@@ -541,6 +547,7 @@ Usage:
   sanctuary [options]                     # MCP server (stdio)
   sanctuary init [opts]                   # Create a fresh fortress
   sanctuary dashboard [opts]              # Standalone dashboard
+  sanctuary status [opts]                 # Daemon status over the /v1 API
   sanctuary doctor [opts]                 # Local environment diagnostic
   sanctuary completion <bash|zsh|fish>    # Emit shell completion
   sanctuary audit search [opts]           # Search local audit log
@@ -570,6 +577,10 @@ Subcommands:
                        Reads from the same storage as the MCP server.
                        Use "sanctuary dashboard --help" for options.
                        Pass --multi to render the multi-tenant overview.
+
+  status               Report daemon status (version, listener,
+                       federation, identity, Castle Wall) over the
+                       /v1 API. Use "sanctuary status --help" for options.
 
   doctor               Run read-only local health diagnostics.
                        Use "sanctuary doctor --help" for options.

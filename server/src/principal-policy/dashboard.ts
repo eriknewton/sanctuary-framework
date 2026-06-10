@@ -42,6 +42,8 @@ import { generateSystemPrompt } from "../system-prompt-generator.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import { dispatchV11Request } from "../dashboard/v1_1/dispatch.js";
 import type { V11Bindings } from "../dashboard/v1_1/wiring.js";
+import { V1SessionService } from "../v1/session-service.js";
+import { handleV1Request } from "../v1/router.js";
 import type { ApprovalAggregator } from "./approval-aggregator.js";
 import {
   APPROVAL_INBOX_API_PREFIX,
@@ -216,6 +218,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private v11Bindings: V11Bindings | null = null;
 
   /**
+   * Federation PR-A1: RFC v7 challenge-response session ceremony +
+   * opaque session tokens for the additive `/v1` API surface. Constructed
+   * unconditionally — the `/v1` skeleton is always mounted; its auth is
+   * fail-closed and independent of the legacy bearer/session model
+   * (which it bridges through {@link V1SessionService}'s attestation
+   * check, never bypasses).
+   */
+  private v1Sessions: V1SessionService;
+
+  /**
    * v1.3 WP-V1.3-10 Cross-Harness Approval Inbox aggregator. Mounted
    * additively at `/api/approval-inbox/*` when set. Legacy approval
    * routes at `/api/approvals/:id/(allow|deny)` continue to serve. The
@@ -297,6 +309,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       loopbackAutoAuth: this._autoAuthLocalhost,
     });
     this.loginHTML = generateLoginHTML({ serverVersion: PKG_VERSION });
+    // Federation PR-A1: /v1 session ceremony service. Reads the live
+    // authToken / auto-auth flags through accessors so later mutation
+    // (setAutoAuthLocalhost) is always observed.
+    this.v1Sessions = new V1SessionService({
+      auth: {
+        getAuthToken: () => this.authToken,
+        isLoopbackAutoAuthEnabled: () => this._autoAuthLocalhost,
+      },
+    });
     // SEC-012: Periodic cleanup of expired sessions (every 60s)
     this.sessionCleanupTimer = setInterval(() => this.cleanupSessions(), 60_000);
   }
@@ -737,6 +758,46 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       url,
       method,
     );
+  }
+
+  /**
+   * Federation PR-A1: full `/v1/status` document, served only to a valid
+   * SESSION_TOKEN holder with the status-read capability. Catalog shape:
+   * `{ ok, version, daemon, listener, federation, identity, castle_wall }`.
+   *
+   * Field discipline: identity is an EXPLICIT pick of public fields from
+   * the stored identity — never a spread, so the encrypted private key
+   * blob can never ride along into an HTTP response (CLAUDE.md
+   * constraint 6). Federation is honestly `enabled: false` until the
+   * PR-A3 listener work; castle_wall reports `unknown` until status
+   * wiring lands later in the stack.
+   */
+  private buildV1FullStatus(): Record<string, unknown> {
+    const identity = this.identityManager?.getDefault();
+    return {
+      ok: true,
+      version: PKG_VERSION,
+      daemon: {
+        mode: this._standaloneMode ? "standalone" : "co-located",
+        pid: process.pid,
+      },
+      listener: {
+        host: this.config.host,
+        port: this.config.port,
+        tls: this.useTLS,
+      },
+      federation: { enabled: false },
+      identity: identity
+        ? {
+            identity_id: identity.identity_id,
+            label: identity.label,
+            did: identity.did,
+            public_key: identity.public_key,
+            created_at: identity.created_at,
+          }
+        : null,
+      castle_wall: { status: "unknown" },
+    };
   }
 
   /**
@@ -1233,6 +1294,38 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     _origin: string | undefined,
     _selfOrigin: string,
   ): void {
+    // Federation PR-A1: the additive /v1 API surface (RFC v7 session
+    // ceremony + session-token-gated routes). Owns the entire /v1 prefix
+    // and never falls through to legacy routing — fail-closed 401 for
+    // unauthenticated callers on every /v1 path. NOTE: `/v1.0` and
+    // `/v1.1` (legacy dashboard HTML) do not match this prefix.
+    if (url.pathname === "/v1" || url.pathname.startsWith("/v1/")) {
+      // Ceremony endpoints get the stricter decision-class rate limit
+      // (auth brute-force guard); reads get the general limit.
+      const limitClass = url.pathname.startsWith("/v1/session/")
+        ? "decisions"
+        : "general";
+      if (!this.checkRateLimit(req, res, limitClass)) return;
+      handleV1Request(
+        {
+          sessions: this.v1Sessions,
+          isLoopbackRequest: (r) => this.isLoopbackRequest(r),
+          buildFullStatus: () => this.buildV1FullStatus(),
+          version: PKG_VERSION,
+        },
+        req,
+        res,
+        url,
+        method,
+      ).catch(() => {
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
     // v1.3 WP-V1.3-5 Pi-1 Honeypot management API at /api/honeypot/*.
     if (
       this.honeypotRegistry &&
