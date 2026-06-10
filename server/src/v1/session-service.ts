@@ -39,7 +39,7 @@
  * presented nothing.
  */
 
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { gcm } from "@noble/ciphers/aes.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
 import { verify } from "../core/identity.js";
@@ -56,6 +56,31 @@ export const V1_SESSION_TOKEN_TTL_MS = 30 * 60_000;
 const MAX_PENDING_CHALLENGES = 256;
 /** AAD binding token ciphertexts to their purpose. */
 const TOKEN_AAD = new TextEncoder().encode("sanctuary.v1.session-token");
+/**
+ * Per-process random key for constant-shape operator-token comparison.
+ * Never persisted, never exported — it exists only so the two HMAC
+ * digests below are unpredictable to a caller while remaining
+ * comparable to each other within this process.
+ */
+const TOKEN_COMPARE_KEY = randomBytes(32);
+
+/**
+ * Constant-shape secret comparison (codex review finding 1).
+ *
+ * A naive `length === length && timingSafeEqual(...)` gate only performs
+ * the constant-time comparison for same-length candidates, which leaks
+ * the configured token's byte length as a timing oracle. Instead, both
+ * sides are compressed to fixed-size 32-byte HMAC-SHA256 digests under a
+ * per-process random key, then compared with `timingSafeEqual`. Every
+ * candidate — any length, any content — executes the identical
+ * comparison work, so neither length nor prefix information is
+ * observable through timing.
+ */
+export function constantShapeTokenEqual(presented: string, configured: string): boolean {
+  const a = createHmac("sha256", TOKEN_COMPARE_KEY).update(presented, "utf-8").digest();
+  const b = createHmac("sha256", TOKEN_COMPARE_KEY).update(configured, "utf-8").digest();
+  return timingSafeEqual(a, b);
+}
 
 /**
  * PR-A1 capability vocabulary. The canonical Wave 1 capability set is
@@ -298,9 +323,9 @@ export class V1SessionService {
 
     const configured = this.auth.getAuthToken();
     if (configured !== undefined && configured !== "" && typeof token === "string") {
-      const presented = Buffer.from(token, "utf-8");
-      const expected = Buffer.from(configured, "utf-8");
-      if (presented.length === expected.length && timingSafeEqual(presented, expected)) {
+      // Constant-shape comparison: identical work for every candidate
+      // regardless of length (no configured-token-length timing oracle).
+      if (constantShapeTokenEqual(token, configured)) {
         return LOCAL_OPERATOR_ATTESTATION_REF;
       }
     }

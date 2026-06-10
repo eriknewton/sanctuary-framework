@@ -59,11 +59,6 @@ function denyForbidden(res: ServerResponse): void {
   writeJson(res, 403, { error: "forbidden" });
 }
 
-/** Generic malformed-request rejection. Never issues credentials. */
-function denyBadRequest(res: ServerResponse): void {
-  writeJson(res, 400, { error: "bad request" });
-}
-
 async function readJsonBody(req: IncomingMessage): Promise<unknown | undefined> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -115,10 +110,15 @@ export async function handleV1Request(
   }
 
   // ── Ceremony endpoints (CHALLENGE_RESPONSE) ─────────────────────────
+  // Every rejection on the ceremony endpoints — parse failure, body-size
+  // limit, semantic denial — collapses to the SAME generic denial (codex
+  // review finding 2). A malformed ceremony body is still a denied
+  // unauthenticated ceremony attempt; a distinguishable 400 would give
+  // an unauthenticated caller an oracle for which check failed.
   if (method === "POST" && url.pathname === "/v1/session/init") {
     const body = await readJsonBody(req);
     if (body === undefined) {
-      denyBadRequest(res);
+      denyUnauthorized(res);
       return true;
     }
     const result = ctx.sessions.init(body, ctx.isLoopbackRequest(req));
@@ -137,7 +137,7 @@ export async function handleV1Request(
   if (method === "POST" && url.pathname === "/v1/session/complete") {
     const body = await readJsonBody(req);
     if (body === undefined) {
-      denyBadRequest(res);
+      denyUnauthorized(res);
       return true;
     }
     const result = ctx.sessions.complete(body);

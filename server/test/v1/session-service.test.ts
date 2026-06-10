@@ -16,6 +16,7 @@ import { randomBytes } from "node:crypto";
 import {
   V1SessionService,
   V1_CAPABILITY_STATUS_READ,
+  constantShapeTokenEqual,
   type V1SessionAuthBridge,
 } from "../../src/v1/session-service.js";
 import {
@@ -218,6 +219,37 @@ describe("V1SessionService attestation gating", () => {
     const { publicKey } = makeClient();
     expect(service.init(initBody(publicKey, null), true).ok).toBe(true);
     expect(service.init(initBody(publicKey, null), false).ok).toBe(false);
+  });
+
+  it("constant-shape token compare: wrong tokens of ANY length rejected, correct accepted", () => {
+    // Codex review finding 1: the compare must do identical work for
+    // every candidate. Functionally: an equal-length wrong token and a
+    // different-length wrong token are both rejected, and the correct
+    // token is accepted, through the fixed-size-digest comparison path.
+    const service = new V1SessionService({ auth: makeAuth() });
+    const { publicKey } = makeClient();
+
+    const equalLengthWrong = "X".repeat(AUTH_TOKEN.length);
+    expect(equalLengthWrong).toHaveLength(AUTH_TOKEN.length);
+    expect(service.init(initBody(publicKey, equalLengthWrong), false).ok).toBe(false);
+
+    expect(service.init(initBody(publicKey, "short"), false).ok).toBe(false);
+    expect(
+      service.init(initBody(publicKey, AUTH_TOKEN + "-and-then-some"), false).ok,
+    ).toBe(false);
+
+    expect(service.init(initBody(publicKey, AUTH_TOKEN), false).ok).toBe(true);
+  });
+
+  it("constantShapeTokenEqual compares fixed-size digests (no length branch, no throw)", () => {
+    // timingSafeEqual throws on unequal-length inputs; the helper never
+    // does, because BOTH sides are first compressed to 32-byte HMAC
+    // digests — the identical work regardless of candidate length.
+    expect(constantShapeTokenEqual("a", "a-much-longer-configured-token")).toBe(false);
+    expect(constantShapeTokenEqual("a-much-longer-presented-token", "a")).toBe(false);
+    expect(constantShapeTokenEqual("", "configured")).toBe(false);
+    expect(constantShapeTokenEqual("same-length-A", "same-length-B")).toBe(false);
+    expect(constantShapeTokenEqual("exact-match", "exact-match")).toBe(true);
   });
 
   it("denies unknown attestation types", () => {

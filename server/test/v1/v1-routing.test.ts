@@ -237,19 +237,63 @@ describe("/v1 session ceremony over HTTP (loopback)", () => {
     expect(a).toBe(b);
   });
 
-  it("rejects malformed and oversize ceremony bodies without issuing anything", async () => {
+  it("rejects malformed and oversize ceremony bodies with the SAME generic denial", async () => {
+    // Codex review finding 2: malformed/oversized ceremony bodies used to
+    // return a distinguishable 400 — an unauthenticated oracle. They now
+    // collapse into the same generic 401 denial as every semantic failure.
     const malformed = await fetch(`${rig.baseUrl}/v1/session/init`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{not json",
     });
-    expect(malformed.status).toBe(400);
+    expect(malformed.status).toBe(401);
+    expect(await malformed.json()).toEqual({ error: "unauthorized" });
     const oversize = await fetch(`${rig.baseUrl}/v1/session/init`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pad: "x".repeat(20 * 1024) }),
     });
-    expect(oversize.status).toBe(400);
+    expect(oversize.status).toBe(401);
+    expect(await oversize.json()).toEqual({ error: "unauthorized" });
+  });
+
+  it("ceremony denials are byte-identical across EVERY rejection path", async () => {
+    // Malformed JSON, oversized body, empty object, wrong attestation
+    // token, and unknown challenge id must all produce the exact same
+    // status and the exact same body bytes — no rejection path on the
+    // ceremony endpoints is distinguishable to an unauthenticated caller.
+    const { publicKey } = makeClient();
+    const post = (path: string, body: string) =>
+      fetch(`${rig.baseUrl}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+
+    const responses = await Promise.all([
+      post("/v1/session/init", "{not json"),
+      post("/v1/session/init", JSON.stringify({ pad: "x".repeat(20 * 1024) })),
+      post("/v1/session/init", JSON.stringify({})),
+      post(
+        "/v1/session/init",
+        JSON.stringify({
+          client_pubkey: toBase64url(publicKey),
+          operator_attestation: { type: "local_operator", token: "wrong-token" },
+        }),
+      ),
+      post(
+        "/v1/session/complete",
+        JSON.stringify({ challenge_id: "no-such-id", client_signature: "AAAA" }),
+      ),
+    ]);
+
+    const statuses = responses.map((r) => r.status);
+    const bodies = await Promise.all(responses.map((r) => r.text()));
+    for (let i = 0; i < responses.length; i++) {
+      expect(statuses[i], `rejection path ${i}`).toBe(statuses[0]);
+      expect(bodies[i], `rejection path ${i}`).toBe(bodies[0]);
+    }
+    expect(statuses[0]).toBe(401);
   });
 });
 
