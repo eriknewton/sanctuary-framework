@@ -217,14 +217,43 @@ describe("verify-transparency offline verifier", () => {
     ).toBe(true);
   });
 
-  it("reports a partial chain honestly (suffix without counter 1)", () => {
+  it("FAILS a withheld-prefix suffix (counters 3..4, genesis 1..2 missing) by default", () => {
+    // A bundle missing checkpoints 1..N must NOT read as a clean PASS: exit 0
+    // means "complete from genesis". A withheld prefix is detectable from
+    // records[0].counter !== 1 and is a finding, not a downgraded note.
     const chain = makeChain(4).slice(2); // counters 3..4
     const report = verifyTransparencyCheckpoints(chain, {
       publicKey: PUBLIC_KEY_B64,
     });
+    expect(report.verdict).toBe("FAIL");
+    expect(report.findings.some((f) => f.kind === "counter_prefix_missing")).toBe(
+      true
+    );
+  });
+
+  it("reports a partial suffix honestly under --allow-partial (no clean PASS by default)", () => {
+    const chain = makeChain(4).slice(2); // counters 3..4
+    const report = verifyTransparencyCheckpoints(chain, {
+      publicKey: PUBLIC_KEY_B64,
+      allowPartial: true,
+    });
     expect(report.verdict).toBe("PASS");
     expect(report.counter_range).toEqual({ from: 3, to: 4 });
+    expect(report.findings.some((f) => f.kind === "counter_prefix_missing")).toBe(
+      false
+    );
     expect(report.not_checked.join(" ")).toContain("partial chain");
+    expect(report.not_checked.join(" ")).toContain("suffix fragment");
+  });
+
+  it("PASSES a genesis-rooted complete chain (counter 1..N)", () => {
+    const chain = makeChain(4); // counters 1..4
+    const report = verifyTransparencyCheckpoints(chain, {
+      publicKey: PUBLIC_KEY_B64,
+    });
+    expect(report.verdict).toBe("PASS");
+    expect(report.counter_range).toEqual({ from: 1, to: 4 });
+    expect(report.findings).toHaveLength(0);
   });
 
   it("accepts a bundle wrapper and a single record", () => {

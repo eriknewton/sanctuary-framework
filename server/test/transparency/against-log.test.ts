@@ -171,6 +171,94 @@ describe("verify-transparency --against-log", () => {
     expect(result.counters_recomputed).toBe(false);
   });
 
+  it("FAILS on first-covered-entry deletion without a passphrase (no authentic rotation floor)", async () => {
+    // HIGH-1: deleting the LOWEST covered entry raises the live floor exactly
+    // like rotation would. Without the master key the rotation anchor MAC is
+    // unauthenticatable, so this must be a finding (FAIL), never a silent pass.
+    const record = await seedAndEmit();
+    const keys = await auditEntryKeys();
+    await storage.delete("_audit", keys[0]!); // lowest covered sequence
+    const result = await verifyAgainstLog({ records: [record], storage });
+    expect(
+      result.findings.some((f) => f.kind === "rotation_floor_unauthenticated")
+    ).toBe(true);
+    expect(result.merkle_root_recomputed).toBe(false);
+  });
+
+  it("FAILS on first-covered-entry deletion even WITH the audit log (no rotation anchor proves the cut)", async () => {
+    // Same deletion, but with the decrypting audit log available. A raw delete
+    // writes no rotation anchor, so the cut is still unauthenticated → FAIL.
+    const record = await seedAndEmit();
+    const keys = await auditEntryKeys();
+    await storage.delete("_audit", keys[0]!);
+    const result = await verifyAgainstLog({
+      records: [record],
+      storage,
+      auditLog,
+    });
+    expect(
+      result.findings.some((f) => f.kind === "rotation_floor_unauthenticated")
+    ).toBe(true);
+    expect(result.merkle_root_recomputed).toBe(false);
+  });
+
+  it("ACCEPTS a legitimately rotation-pruned prefix as authentic (anchor MAC matches the live floor)", async () => {
+    // A small maxEntries log: emit a checkpoint, then append enough that the
+    // contiguous-prefix rotation prunes entries inside the checkpoint window
+    // and writes a master-key-MAC'd anchor. The host verifier must then read
+    // the cut as authentic rotation (a note, NOT a rotation_floor finding),
+    // never recomputing the root over the pruned prefix but also never failing.
+    const rotatingKey = randomBytes(32);
+    const rotatingStorage = new FilesystemStorage(
+      join(fortressPath, "state-rot")
+    );
+    const rotatingLog = new AuditLog(rotatingStorage, rotatingKey, {
+      maxEntries: 5,
+    });
+    for (let i = 0; i < 3; i++) {
+      await rotatingLog.appendCritical({
+        layer: "l1",
+        operation: i === 0 ? "egress_blocked" : "egress_allowed",
+        identity_id: "fortress-test",
+        result: "success",
+        details: { rule_id: "allow-github" },
+      });
+    }
+    const record = (await emitEnforcementCheckpoint({
+      storage: rotatingStorage,
+      auditLog: rotatingLog,
+      fortressId: "fortress-test",
+      fortressPath,
+      masterKey: rotatingKey,
+      signer: testSigner(),
+      binaryPath: join(fortressPath, "fake-binary.js"),
+      version: "0.0.0-test",
+    })) as unknown as VerifierCheckpointRecord;
+    // Append past maxEntries so rotation prunes the checkpoint's prefix.
+    for (let i = 0; i < 6; i++) {
+      await rotatingLog.appendCritical({
+        layer: "l1",
+        operation: "egress_allowed",
+        identity_id: "fortress-test",
+        result: "success",
+        details: { rule_id: "allow-github" },
+      });
+    }
+    await rotatingLog.flush();
+    const floor = await rotatingLog.authenticatedRotationFloor();
+    // Precondition: rotation actually happened and is authenticated.
+    expect(floor.status).toBe("valid");
+    const result = await verifyAgainstLog({
+      records: [record],
+      storage: rotatingStorage,
+      auditLog: rotatingLog,
+    });
+    expect(
+      result.findings.some((f) => f.kind === "rotation_floor_unauthenticated")
+    ).toBe(false);
+    expect(result.notes.join(" ")).toContain("AUTHENTICATED rotation anchor");
+  });
+
   it("states honestly when counters cannot be recounted (no decryption key)", async () => {
     const record = await seedAndEmit();
     const result = await verifyAgainstLog({ records: [record], storage });

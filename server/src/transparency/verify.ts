@@ -127,7 +127,10 @@ export type TransparencyFindingKind =
   | "log_entry_missing"
   | "merkle_root_mismatch"
   | "head_hash_mismatch"
-  | "counters_mismatch";
+  | "rotation_floor_unauthenticated"
+  | "counters_mismatch"
+  // offline genesis-completeness finding kind:
+  | "counter_prefix_missing";
 
 export interface TransparencyFinding {
   kind: TransparencyFindingKind;
@@ -279,6 +282,16 @@ export interface VerifyTransparencyOptions {
    * embedded-key pass proves internal consistency, not signer identity.
    */
   trustEmbedded?: boolean;
+  /**
+   * Explicit opt-in to accept a SUFFIX fragment whose earliest checkpoint is
+   * not the genesis counter (1). Without this, a chain that does not start at
+   * counter 1 is a `counter_prefix_missing` FINDING (FAIL): a clean PASS /
+   * exit 0 must mean "verified complete from genesis", so a withheld prefix
+   * can never read as success. With it, the missing prefix is downgraded to a
+   * `not_checked` note and the suffix's internal consistency can still PASS —
+   * for auditors verifying a fragment who already know it is partial.
+   */
+  allowPartial?: boolean;
 }
 
 export function verifyTransparencyCheckpoints(
@@ -419,10 +432,26 @@ export function verifyTransparencyCheckpoints(
   }
 
   const notChecked = [...OFFLINE_NOT_CHECKED];
+  // Genesis completeness: exit 0 / PASS must mean "verified complete from the
+  // genesis checkpoint (counter 1)". A chain whose earliest record is counter
+  // N>1 is a withheld prefix (1..N-1 absent). By default that is a FINDING so a
+  // truncated prefix can never read as a clean PASS; `allowPartial` downgrades
+  // it to an honest note for auditors knowingly verifying a suffix fragment.
   if (records.length > 0 && records[0]!.counter !== 1) {
-    notChecked.push(
-      `chain prefix: the earliest provided checkpoint has counter ${records[0]!.counter}, so checkpoints 1..${records[0]!.counter - 1} were not verified (partial chain)`
-    );
+    const earliest = records[0]!.counter;
+    if (opts.allowPartial) {
+      notChecked.push(
+        `chain prefix: the earliest provided checkpoint has counter ${earliest}, so checkpoints 1..${earliest - 1} were not verified (partial chain accepted via allowPartial; this is a suffix fragment, NOT a complete-from-genesis verification)`
+      );
+    } else {
+      findings.push({
+        kind: "counter_prefix_missing",
+        counter: earliest,
+        expected: 1,
+        actual: earliest,
+        message: `the earliest provided checkpoint has counter ${earliest}, not the genesis counter 1, so checkpoints 1..${earliest - 1} are withheld or missing; this chain is not verifiable as complete from genesis (pass --allow-partial to verify a suffix fragment, which reports as partial, not PASS)`,
+      });
+    }
   }
   if (basis === "embedded") {
     notChecked.push(

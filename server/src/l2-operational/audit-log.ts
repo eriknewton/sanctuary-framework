@@ -1115,6 +1115,35 @@ export class AuditLog {
   }
 
   /**
+   * Read-only, MAC-authenticated rotation floor (the #437 machinery), exposed
+   * for host-mode transparency verification (`--against-log`).
+   *
+   * A legitimate rotation prunes a contiguous PREFIX and records a single
+   * master-key-MAC'd anchor naming the lowest sequence that still survives.
+   * The transparency host verifier uses this to distinguish "prefix pruned by
+   * authentic rotation" from "prefix DELETED to dodge Merkle recomputation":
+   * only an anchor whose `base_sequence` matches the live floor authenticates
+   * the cut. Without the master key the anchor's MAC cannot be checked at all,
+   * so the floor is unauthenticatable and the host check must fail closed.
+   *
+   *   - "valid"   : anchor present, MAC verifies → `base_sequence` is the
+   *     authenticated lowest surviving sequence.
+   *   - "absent"  : no anchor (a never-rotated log legitimately has none; the
+   *     caller treats prefix loss as unauthenticated and fails closed).
+   *   - "invalid" : anchor present but malformed / MAC mismatch / unreadable
+   *     (tampered or wrong key) → fail closed.
+   */
+  async authenticatedRotationFloor(): Promise<
+    | { status: "valid"; base_sequence: number; base_prev_hash: string }
+    | { status: "absent" }
+    | { status: "invalid" }
+  > {
+    // loadRotationAnchor only pushes findings on a storage read error, which it
+    // already maps to status "invalid"; a throwaway sink keeps this read-only.
+    return this.loadRotationAnchor([]);
+  }
+
+  /**
    * Query the audit log with filtering.
    */
   async query(options: {

@@ -243,7 +243,7 @@ export async function runVerifyTransparencyCommand(
     const opts = parseFlags(
       argv,
       ["--input", "--public-key", "--public-key-file", "--fortress", "--passphrase"],
-      ["--trust-embedded", "--against-log", "--json"]
+      ["--trust-embedded", "--against-log", "--allow-partial", "--json"]
     );
     const inputPath = opts.values["--input"];
     if (!inputPath) {
@@ -269,6 +269,7 @@ export async function runVerifyTransparencyCommand(
     const report = verifyTransparencyCheckpoints(parsed, {
       ...(key.publicKey ? { publicKey: key.publicKey } : {}),
       ...(opts.flags["--trust-embedded"] ? { trustEmbedded: true } : {}),
+      ...(opts.flags["--allow-partial"] ? { allowPartial: true } : {}),
     });
 
     let hostResult = null;
@@ -635,6 +636,8 @@ Options:
   --public-key-file <path>  Signer public key file (raw 32 bytes or base64url).
   --trust-embedded          Verify against the key embedded in the records.
                             Proves internal consistency only; stated in output.
+  --allow-partial           Accept a suffix fragment not starting at genesis
+                            (counter 1). Reports as partial, never a clean PASS.
   --against-log             Also cross-check the live audit log (host mode).
   --fortress <path>         Fortress path for --against-log / pin discovery.
   --passphrase <val>        Enables counter recount in --against-log mode.

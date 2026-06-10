@@ -138,13 +138,28 @@ export async function verifyAgainstLog(
   } else {
     const lowest = checkpoint.audit.lowest_sequence;
     const highest = checkpoint.audit.highest_sequence;
-    // Rotation prunes a contiguous prefix. Sequences below the live floor are
-    // legitimately gone — recomputation is then impossible and we SAY so.
+    // A prefix below the live floor is only LEGITIMATE if it was pruned by an
+    // authenticated rotation. Deleting checkpoint-covered entries (e.g. the
+    // first covered entry) raises liveLowest identically; without proving the
+    // cut, that truncation would masquerade as rotation and the signed root
+    // would silently never be recomputed. Reuse the #437 master-key-MAC'd
+    // rotation anchor to tell the two apart, and fail closed when we cannot.
     const recomputeFrom = Math.max(lowest, liveLowest);
     if (recomputeFrom > lowest) {
-      notes.push(
-        `checkpoint ${checkpoint.counter} covers sequences ${lowest}..${highest}, but rotation has pruned entries below ${liveLowest}; the signed Merkle root cannot be recomputed from the surviving log (NOT a verification pass for the root)`
-      );
+      const floor = await authenticateRotationFloor(input.auditLog, liveLowest);
+      if (floor.authenticated) {
+        notes.push(
+          `checkpoint ${checkpoint.counter} covers sequences ${lowest}..${highest}, but an AUTHENTICATED rotation anchor proves entries below ${liveLowest} were legitimately pruned; the signed Merkle root over the missing prefix cannot be recomputed from the surviving log (NOT a verification pass for the root, but the cut is authentic)`
+        );
+      } else {
+        findings.push({
+          kind: "rotation_floor_unauthenticated",
+          counter: checkpoint.counter,
+          expected: `audit entries from sequence ${lowest} present, or an authenticated rotation anchor with base_sequence ${liveLowest}`,
+          actual: liveLowest,
+          message: `checkpoint ${checkpoint.counter} covers sequences ${lowest}..${highest}, but the live log starts at ${liveLowest} and the prefix loss is NOT proven by an authenticated rotation anchor (${floor.reason}); a deleted prefix is indistinguishable from rotation here, so the signed Merkle root cannot be trusted as recomputed`,
+        });
+      }
     } else {
       const hashes: string[] = [];
       let missing: number | null = null;
@@ -243,6 +258,63 @@ export async function verifyAgainstLog(
     findings,
     notes,
   };
+}
+
+/**
+ * Decide whether a pruned prefix (live log starts above the checkpoint's
+ * lowest covered sequence) is a LEGITIMATE rotation or an unauthenticated
+ * truncation. Authentic only when an `AuditLog` is available (the master key
+ * is needed to verify the anchor MAC) AND its authenticated rotation anchor
+ * names exactly `liveLowest` as the base of the surviving chain.
+ *
+ *   - no auditLog (no passphrase) → the anchor MAC cannot be checked at all,
+ *     so the cut is unauthenticatable → fail closed.
+ *   - anchor "absent" → a never-rotated log has no anchor; the prefix loss is
+ *     therefore NOT rotation → fail closed.
+ *   - anchor "invalid" → tampered / wrong key → fail closed.
+ *   - anchor "valid" but base_sequence != liveLowest → the authenticated cut
+ *     does not match the live floor (head truncated or entry reintroduced) →
+ *     fail closed.
+ */
+async function authenticateRotationFloor(
+  auditLog: AuditLog | undefined,
+  liveLowest: number
+): Promise<{ authenticated: true } | { authenticated: false; reason: string }> {
+  if (!auditLog) {
+    return {
+      authenticated: false,
+      reason:
+        "no decryption key provided, so the master-key-MAC'd rotation anchor cannot be authenticated (pass the fortress passphrase)",
+    };
+  }
+  let floor: Awaited<ReturnType<AuditLog["authenticatedRotationFloor"]>>;
+  try {
+    floor = await auditLog.authenticatedRotationFloor();
+  } catch (err) {
+    return {
+      authenticated: false,
+      reason: `rotation anchor could not be read: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (floor.status === "absent") {
+    return {
+      authenticated: false,
+      reason: "no rotation anchor exists (the log was never rotation-pruned)",
+    };
+  }
+  if (floor.status === "invalid") {
+    return {
+      authenticated: false,
+      reason: "the rotation anchor failed authentication (tampered or wrong key)",
+    };
+  }
+  if (floor.base_sequence !== liveLowest) {
+    return {
+      authenticated: false,
+      reason: `the authenticated rotation anchor base_sequence ${floor.base_sequence} does not match the live floor ${liveLowest}`,
+    };
+  }
+  return { authenticated: true };
 }
 
 async function readSurvivingEnvelopes(
