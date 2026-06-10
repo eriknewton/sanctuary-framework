@@ -1,0 +1,806 @@
+/**
+ * SDW D2 — MCP tool surface: `sdw_export`, `sdw_import`, `sdw_export_delete`.
+ *
+ * Option A+ wiring (Erik-ratified 2026-06-09) — entirely inside existing
+ * machinery; NO changes to gate.ts / router.ts / approval-channel.ts /
+ * core/identity.ts:
+ *
+ * - Each tool's `approvalTargetArgs` runs at GATE time (before the human is
+ *   asked) and returns metadata only: namespaces, counts, sizes, digests.
+ *   Constraint #1 holds — the approval context can travel to a dashboard or
+ *   webhook before approval, so it never carries record bodies, ciphertext,
+ *   bundles, or key material.
+ * - EXACT consent binding (gate → handler): `approvalTargetArgs` attaches the
+ *   approval-bound payload (the frozen ciphertext inventory for
+ *   `sdw_export`/`sdw_export_delete`; the verified manifest summary for
+ *   `sdw_import`) to the per-call args object under a private Symbol key. The
+ *   router passes the SAME object to the handler, so the handler consumes the
+ *   binding computed for THIS call's gate evaluation — the inventory/manifest
+ *   the human's approval was shown — never a stale entry from an earlier,
+ *   abandoned call. Agent-supplied args arrive as JSON (no Symbol keys can be
+ *   forged) and schema validation rejects unknown string fields, so the
+ *   binding channel is unforgeable. A handler invocation with no binding
+ *   (gate not configured, `approvalTargetArgs` never ran, binding expired or
+ *   args mutated after gate time) fails closed. The assembly-time live-store
+ *   drift recheck remains as defense-in-depth on top of this binding.
+ * - Because the scope digest lives in the gate-time args, the
+ *   `ApprovalProofStore` envelope binds it automatically: a stored approval
+ *   proof for one vault state cannot be replayed after the vault mutates
+ *   (args-hash mismatch at `verifyApprovalProof`).
+ * - `sdw_import` verifies the manifest signature inside `approvalTargetArgs`
+ *   — i.e. BEFORE any approval prompt. A bundle that fails verification
+ *   throws, the router returns the fixed denial without prompting, and the
+ *   audit log records digest + category only (never the body).
+ * - Drift/denial responses to the agent use the fixed denial schema only —
+ *   no digests, no policy detail (invariant #7). Details go to audit.
+ */
+
+import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import type { ToolDefinition } from "../router.js";
+import { toolResult } from "../router.js";
+import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { StorageBackend } from "../storage/interface.js";
+import { fixedDenial, normalizedArgsHash } from "../agent-native/safety-base.js";
+import {
+  buildSignedSdwExportBundle,
+  enumerateSdwExportInventory,
+  sdwExportApprovalContext,
+  sdwManifestBodyDigest,
+  sdwManifestCanonicalBytes,
+  writeSdwExportBundleAtomic,
+  computeSdwExportRecordHash,
+  isSdwExportableNamespace,
+  SdwExportScopeDriftError,
+  type SdwExportFs,
+  type SdwExportInventory,
+  type SdwExportInventorySource,
+  type SdwExportSigningKey,
+  type SdwSignedExportManifest,
+  type SdwStateExportBundle,
+} from "./export.js";
+import {
+  decodeSdwExportBundle,
+  importSdwExportBundle,
+  verifySdwExportManifest,
+  SdwImportVerificationError,
+} from "./import.js";
+import { verify } from "../core/identity.js";
+import { bytesToString, fromBase64url } from "../core/encoding.js";
+import { isSdwIdentifier } from "./grammar.js";
+import { SdwValidationError } from "./errors.js";
+
+const EXPORT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const MAX_MANIFEST_ARG_BYTES = 1_048_576;
+/**
+ * The approval binding lives only between gate evaluation and handler
+ * execution of a single call. Interactive approvals can take minutes
+ * (human-speed); proofs expire at 5 minutes — 15 minutes comfortably bounds
+ * both while keeping a stale binding from being consumable indefinitely.
+ */
+const APPROVAL_BINDING_TTL_MS = 15 * 60_000;
+
+export interface SdwToolsOptions {
+  readonly storage: StorageBackend;
+  readonly inventory: SdwExportInventorySource;
+  readonly auditLog: AuditLog;
+  readonly fortressId: string;
+  /** Operator-configured directory for export bundles. Tool args choose only a filename. */
+  readonly exportDir: string;
+  readonly signingKey: SdwExportSigningKey;
+  readonly resolvePublicKey: (keyRef: string) => Uint8Array | null;
+  /**
+   * Resolve operator-configured source key material by opaque reference.
+   * Raw key bytes never transit tool arguments or the approval channel.
+   */
+  readonly resolveSourceMasterKey: (ref: string) => Uint8Array | null;
+  readonly targetMasterKey: Uint8Array;
+  readonly fs?: SdwExportFs;
+  readonly now?: () => string;
+}
+
+/**
+ * Private, unforgeable gate→handler channel. The router computes
+ * `approvalTargetArgs(handlerArgs)` and later invokes
+ * `handler(handlerArgs)` with the SAME object, so a Symbol-keyed property on
+ * that object travels from gate evaluation to handler execution of one call
+ * and nowhere else:
+ *
+ * - Agent args arrive as JSON — JSON cannot carry Symbol keys, and schema
+ *   validation rejects unknown string fields, so the agent cannot inject or
+ *   forge a binding.
+ * - Symbol keys are invisible to `JSON.stringify`/`Object.keys`, so the
+ *   binding never leaks into approval-channel payloads, audit details, or
+ *   `normalizedArgsHash` (which canonicalizes string-keyed JSON only).
+ * - No cross-call state exists: an abandoned gate evaluation (denied prompt,
+ *   never-executed preflight) leaves nothing behind that a later call could
+ *   consume. This is what closes the FIFO-stash cycle-back hole — the
+ *   handler provably consumes the exact inventory/manifest that THIS call's
+ *   approval was shown, not "the oldest entry for these args".
+ */
+const SDW_APPROVAL_BINDING = Symbol("sanctuary.sdw.approval-binding");
+
+interface SdwExportScopeBinding {
+  readonly kind: "export_scope";
+  readonly toolName: "sdw_export" | "sdw_export_delete";
+  /** Normalized hash of the gate-time args — the handler re-derives and compares. */
+  readonly argsHash: string;
+  /** The frozen ciphertext inventory the approval prompt displayed. */
+  readonly inventory: SdwExportInventory;
+  readonly storedAtMs: number;
+}
+
+interface SdwImportApprovalBinding {
+  readonly kind: "import_manifest";
+  readonly toolName: "sdw_import";
+  readonly argsHash: string;
+  /** Digest of the verified manifest the approval prompt displayed. */
+  readonly manifestBodyDigest: string;
+  readonly sourceKeyRef: string;
+  readonly conflictResolution: "skip" | "overwrite";
+  readonly storedAtMs: number;
+}
+
+type SdwApprovalBinding = SdwExportScopeBinding | SdwImportApprovalBinding;
+
+interface BindableArgs extends Record<string, unknown> {
+  [SDW_APPROVAL_BINDING]?: SdwApprovalBinding;
+}
+
+function attachApprovalBinding(
+  args: Record<string, unknown>,
+  binding: SdwApprovalBinding,
+): void {
+  Object.defineProperty(args, SDW_APPROVAL_BINDING, {
+    value: binding,
+    enumerable: false,
+    configurable: true,
+    writable: false,
+  });
+}
+
+/**
+ * Consume (single-use) the approval binding for this call. Returns null —
+ * the caller MUST fail closed — when no binding exists (gate not configured
+ * or `approvalTargetArgs` never ran), the binding belongs to a different
+ * tool, it exceeded the freshness window, or the args object changed after
+ * gate time (hash mismatch).
+ */
+function takeApprovalBinding(
+  args: Record<string, unknown>,
+  toolName: SdwApprovalBinding["toolName"],
+  nowMs: number,
+): SdwApprovalBinding | null {
+  const bindable = args as BindableArgs;
+  const binding = bindable[SDW_APPROVAL_BINDING];
+  if (binding === undefined) return null;
+  delete bindable[SDW_APPROVAL_BINDING];
+  if (binding.toolName !== toolName) return null;
+  if (nowMs - binding.storedAtMs > APPROVAL_BINDING_TTL_MS) return null;
+  if (binding.argsHash !== normalizedArgsHash(args)) return null;
+  return binding;
+}
+
+export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
+  const now = options.now ?? (() => new Date().toISOString());
+
+  const auditFailure = (
+    operation: string,
+    details: Record<string, unknown>,
+  ): Promise<void> =>
+    options.auditLog.appendCritical({
+      layer: "l1",
+      operation,
+      identity_id: "system",
+      result: "failure",
+      details,
+    });
+
+  const auditSuccess = (
+    operation: string,
+    details: Record<string, unknown>,
+  ): Promise<void> =>
+    options.auditLog.appendCritical({
+      layer: "l1",
+      operation,
+      identity_id: "principal",
+      result: "success",
+      details,
+    });
+
+  const genericDeny = (operation: string) =>
+    toolResult(fixedDenial(`audit:${operation}`, "request_review", null));
+
+  // Fail closed on a malformed namespaces argument: silently treating it as
+  // "no filter" would WIDEN the export scope past what the caller asked for.
+  const requestedNamespaces = (args: Record<string, unknown>): string[] | undefined => {
+    if (args.namespaces === undefined || args.namespaces === null) return undefined;
+    if (
+      !Array.isArray(args.namespaces) ||
+      !args.namespaces.every((item): item is string => typeof item === "string")
+    ) {
+      throw new SdwValidationError("invalid_identifier", "Invalid SDW namespaces argument");
+    }
+    return args.namespaces as string[];
+  };
+
+  // ── sdw_export ─────────────────────────────────────────────────────────────
+  const sdwExport: ToolDefinition = {
+    name: "sdw_export",
+    description:
+      "Export the Sovereign Data Warehouse as a signed, encrypted, portable bundle. " +
+      "Tier 1: the approval freezes a ciphertext-inventory fingerprint of exactly " +
+      "what will ship; any vault change before packaging aborts the export.",
+    tool_class: "write",
+    inputSchema: {
+      type: "object",
+      properties: {
+        export_name: {
+          type: "string",
+          description: "Bundle filename stem inside the operator-configured export directory",
+        },
+        namespaces: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional subset of exportable SDW namespaces (default: all)",
+        },
+      },
+      required: ["export_name"],
+    },
+    // Gate-time inventory freeze. Synchronous, decryption-free, metadata-only
+    // output. Throwing here makes the router deny without prompting.
+    approvalTargetArgs: (args) => {
+      const exportName = args.export_name;
+      if (
+        typeof exportName !== "string" ||
+        !EXPORT_NAME_PATTERN.test(exportName) ||
+        exportName.includes("..")
+      ) {
+        throw new SdwValidationError("invalid_identifier", "Invalid SDW export name");
+      }
+      const inventory = enumerateSdwExportInventory(
+        options.inventory,
+        requestedNamespaces(args),
+      );
+      // Bind THIS call's approval target to THIS call's handler execution —
+      // the handler can only ship the inventory whose digest the approval
+      // prompt displayed (see SDW_APPROVAL_BINDING).
+      attachApprovalBinding(args, {
+        kind: "export_scope",
+        toolName: "sdw_export",
+        argsHash: normalizedArgsHash(args),
+        inventory,
+        storedAtMs: Date.now(),
+      });
+      return {
+        export_name: exportName,
+        ...sdwExportApprovalContext(inventory),
+      };
+    },
+    handler: async (args) => {
+      const exportName = args.export_name as string;
+      if (
+        typeof exportName !== "string" ||
+        !EXPORT_NAME_PATTERN.test(exportName) ||
+        exportName.includes("..")
+      ) {
+        await auditFailure("sdw_export_denied", { denial_class: "invalid_export_name" });
+        return genericDeny("sdw_export");
+      }
+
+      // Fail closed when this call carries no gate-time approval binding
+      // (gate not configured, approvalTargetArgs never ran, binding expired,
+      // or args changed after gate time). The consumed inventory is by
+      // construction the one THIS call's approval prompt displayed.
+      const binding = takeApprovalBinding(args, "sdw_export", Date.now());
+      if (binding === null || binding.kind !== "export_scope") {
+        await auditFailure("sdw_export_denied", {
+          denial_class: "approval_scope_binding_missing",
+        });
+        return genericDeny("sdw_export");
+      }
+      const approved = binding.inventory;
+
+      const exportAuditEventId = `sdw-export:${Date.now()}:${randomBytes(6).toString("hex")}`;
+
+      // Audit anchor: ties the gate_approve event (adjacent in the
+      // tamper-evident chain) to the exact approved fingerprint and to the
+      // manifest's export_audit_event_id.
+      await auditSuccess("sdw_export_scope_approved", {
+        export_audit_event_id: exportAuditEventId,
+        export_name: exportName,
+        scope_digest: approved.scope_digest,
+        namespaces: approved.namespaces,
+        record_count: approved.record_count,
+        total_bytes: approved.total_bytes,
+      });
+
+      let built: { bundle: SdwStateExportBundle; manifestBodyDigest: string };
+      try {
+        built = buildSignedSdwExportBundle({
+          inventory: approved,
+          source: options.inventory,
+          fortressId: options.fortressId,
+          exportAuditEventId,
+          signingKey: options.signingKey,
+          now: now(),
+        });
+      } catch (error) {
+        if (error instanceof SdwExportScopeDriftError) {
+          // Honest audit event with both digests; agent sees only the fixed
+          // denial (invariant #7 — no drift detail leaks).
+          await auditFailure("sdw_export_scope_drift", {
+            export_audit_event_id: exportAuditEventId,
+            approved_scope_digest: error.approvedDigest,
+            current_scope_digest: error.currentDigest,
+          });
+          return genericDeny("sdw_export");
+        }
+        // Signing/enumeration failure: never degrade to an unsigned export
+        // (constraint #5). Category only — no error text that could carry
+        // key-adjacent detail.
+        await auditFailure("sdw_export_failed", {
+          export_audit_event_id: exportAuditEventId,
+          category: "sign_failed",
+        });
+        return genericDeny("sdw_export");
+      }
+
+      const destinationPath = join(options.exportDir, `${exportName}.sdw-export.json`);
+      try {
+        await writeSdwExportBundleAtomic(built.bundle, destinationPath, options.fs);
+      } catch {
+        await auditFailure("sdw_export_failed", {
+          export_audit_event_id: exportAuditEventId,
+          category: "write_failed",
+        });
+        return genericDeny("sdw_export");
+      }
+
+      await auditSuccess("sdw_export_completed", {
+        export_audit_event_id: exportAuditEventId,
+        export_name: exportName,
+        manifest_body_digest: built.manifestBodyDigest,
+        scope_digest: approved.scope_digest,
+        namespaces: approved.namespaces,
+        record_count: approved.record_count,
+      });
+
+      return toolResult({
+        exported: true,
+        export_name: exportName,
+        destination_path: destinationPath,
+        export_audit_event_id: exportAuditEventId,
+        scope_digest: approved.scope_digest,
+        manifest_body_digest: built.manifestBodyDigest,
+        namespaces: approved.namespaces,
+        record_count: approved.record_count,
+        total_bytes: approved.total_bytes,
+      });
+    },
+  };
+
+  // ── sdw_import ─────────────────────────────────────────────────────────────
+  const sdwImport: ToolDefinition = {
+    name: "sdw_import",
+    description:
+      "Import a signed SDW export bundle. The manifest signature is verified " +
+      "before any approval prompt; records are decrypted only inside the " +
+      "approved flow and re-encrypted under this fortress.",
+    tool_class: "write",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bundle: { type: "string", description: "Base64url-encoded SDW export bundle" },
+        source_key_ref: {
+          type: "string",
+          description: "Opaque reference to operator-configured source key material",
+        },
+        conflict_resolution: {
+          type: "string",
+          enum: ["skip", "overwrite"],
+          default: "skip",
+        },
+      },
+      required: ["bundle", "source_key_ref"],
+    },
+    // Verify-before-prompt. On failure: digest+category audit (async,
+    // fire-and-forget — appendCritical chains onto the audit queue) and a
+    // throw, which the router converts to a fixed denial WITHOUT prompting.
+    // On success the gate context carries metadata only — the bundle string
+    // itself is deliberately absent (constraint #1); the manifest digest
+    // binds it into the approval and into any approval proof.
+    approvalTargetArgs: (args) => {
+      const sourceKeyRef = args.source_key_ref;
+      if (typeof sourceKeyRef !== "string" || sourceKeyRef.length === 0) {
+        // Fail closed pre-prompt; the router converts the throw to the fixed
+        // denial without prompting.
+        throw new SdwValidationError(
+          "invalid_identifier",
+          "Invalid SDW import source key reference",
+        );
+      }
+      const conflictResolution =
+        args.conflict_resolution === "overwrite" ? "overwrite" : "skip";
+      try {
+        const bundle = decodeSdwExportBundle(args.bundle as string);
+        const summary = verifySdwExportManifest(bundle, options.resolvePublicKey);
+        // Bind THIS call's verified manifest summary to THIS call's handler
+        // execution. The handler refuses to resolve key material, decrypt,
+        // or write unless it consumes exactly this approved binding —
+        // mirroring the export/delete fail-closed posture.
+        attachApprovalBinding(args, {
+          kind: "import_manifest",
+          toolName: "sdw_import",
+          argsHash: normalizedArgsHash(args),
+          manifestBodyDigest: summary.manifest_body_digest,
+          sourceKeyRef,
+          conflictResolution,
+          storedAtMs: Date.now(),
+        });
+        return {
+          source_key_ref: sourceKeyRef,
+          conflict_resolution: conflictResolution,
+          signature_verified: true,
+          manifest_body_digest: summary.manifest_body_digest,
+          source_fortress_id: summary.source_fortress_id,
+          export_audit_event_id: summary.export_audit_event_id,
+          namespaces: [...summary.namespaces],
+          record_count: summary.record_count,
+        };
+      } catch (error) {
+        const category =
+          error instanceof SdwImportVerificationError ? error.category : "malformed_bundle";
+        const digest =
+          error instanceof SdwImportVerificationError ? error.manifestBodyDigest : null;
+        void options.auditLog.appendCritical({
+          layer: "l1",
+          operation: "sdw_import_manifest_rejected",
+          identity_id: "system",
+          result: "failure",
+          details: { category, manifest_body_digest: digest },
+        });
+        throw error;
+      }
+    },
+    handler: async (args) => {
+      // Verify again on the exact bytes the handler received (ratified import
+      // flow step 2), independent of the gate-time check.
+      let bundle;
+      let summary;
+      try {
+        bundle = decodeSdwExportBundle(args.bundle as string);
+        summary = verifySdwExportManifest(bundle, options.resolvePublicKey);
+      } catch (error) {
+        const category =
+          error instanceof SdwImportVerificationError ? error.category : "malformed_bundle";
+        const digest =
+          error instanceof SdwImportVerificationError ? error.manifestBodyDigest : null;
+        await auditFailure("sdw_import_manifest_rejected", {
+          category,
+          manifest_body_digest: digest,
+        });
+        return genericDeny("sdw_import");
+      }
+
+      // Fail closed when this call carries no gate-time approval binding —
+      // a missing/bypassed gate must NOT leave sdw_import as a decrypt+write
+      // primitive. This check runs BEFORE any key material is resolved and
+      // before anything is decrypted.
+      const binding = takeApprovalBinding(args, "sdw_import", Date.now());
+      if (binding === null || binding.kind !== "import_manifest") {
+        await auditFailure("sdw_import_denied", {
+          denial_class: "approval_binding_missing",
+          manifest_body_digest: summary.manifest_body_digest,
+        });
+        return genericDeny("sdw_import");
+      }
+      // The manifest digest the handler verified on ITS bytes must equal the
+      // digest the approval prompt displayed; ditto the key slot and conflict
+      // policy. Defense-in-depth on top of the args-hash binding.
+      if (
+        binding.manifestBodyDigest !== summary.manifest_body_digest ||
+        binding.sourceKeyRef !== args.source_key_ref ||
+        binding.conflictResolution !==
+          (args.conflict_resolution === "overwrite" ? "overwrite" : "skip")
+      ) {
+        await auditFailure("sdw_import_denied", {
+          denial_class: "approval_binding_mismatch",
+          manifest_body_digest: summary.manifest_body_digest,
+        });
+        return genericDeny("sdw_import");
+      }
+
+      const sourceMasterKey = options.resolveSourceMasterKey(binding.sourceKeyRef);
+      if (sourceMasterKey === null) {
+        await auditFailure("sdw_import_failed", {
+          category: "source_key_unavailable",
+          manifest_body_digest: summary.manifest_body_digest,
+        });
+        return genericDeny("sdw_import");
+      }
+
+      let result;
+      try {
+        result = await importSdwExportBundle({
+          bundle,
+          storage: options.storage,
+          resolvePublicKey: options.resolvePublicKey,
+          sourceMasterKey,
+          targetMasterKey: options.targetMasterKey,
+          targetFortressId: options.fortressId,
+          conflictResolution: binding.conflictResolution,
+        });
+      } catch (error) {
+        const category =
+          error instanceof SdwImportVerificationError ? error.category : "schema_invalid";
+        await auditFailure("sdw_import_failed", {
+          category,
+          manifest_body_digest: summary.manifest_body_digest,
+        });
+        return genericDeny("sdw_import");
+      }
+
+      await auditSuccess("sdw_import_completed", {
+        manifest_body_digest: result.manifest_body_digest,
+        source_fortress_id: result.source_fortress_id,
+        imported: result.imported,
+        skipped_existing: result.skipped_existing,
+        overwritten: result.overwritten,
+        namespaces: result.namespaces,
+      });
+
+      return toolResult({
+        imported: result.imported,
+        skipped_existing: result.skipped_existing,
+        overwritten: result.overwritten,
+        namespaces: result.namespaces,
+        source_fortress_id: result.source_fortress_id,
+        manifest_body_digest: result.manifest_body_digest,
+      });
+    },
+  };
+
+  // ── sdw_export_delete ──────────────────────────────────────────────────────
+  const sdwExportDelete: ToolDefinition = {
+    name: "sdw_export_delete",
+    description:
+      "Post-export local-state delete: removes exactly the records listed in a " +
+      "signed export manifest, and only while their stored ciphertext still " +
+      "matches the manifest. Tier 1.",
+    tool_class: "write",
+    inputSchema: {
+      type: "object",
+      properties: {
+        manifest: {
+          type: "string",
+          description: "Base64url-encoded signed export manifest from a completed sdw_export",
+        },
+      },
+      required: ["manifest"],
+    },
+    approvalTargetArgs: (args) => {
+      const manifest = decodeSignedManifestArg(args.manifest);
+      const summary = verifyManifestSignatureOnly(manifest, options.resolvePublicKey);
+      // Freeze the CURRENT inventory of the manifest's namespaces so the
+      // handler deletes only what the human saw — and only if nothing moved.
+      const namespaces = [
+        ...new Set(manifest.body.records.map((record) => record.namespace)),
+      ].sort();
+      for (const namespace of namespaces) {
+        if (!isSdwExportableNamespace(namespace)) {
+          throw new SdwImportVerificationError("schema_invalid", summary.digest);
+        }
+      }
+      const inventory = enumerateSdwExportInventory(options.inventory, namespaces);
+      assertManifestMatchesInventory(manifest, inventory, summary.digest);
+      // Bind THIS call's frozen inventory to THIS call's handler execution
+      // (see SDW_APPROVAL_BINDING): the handler deletes only against the
+      // snapshot the approval prompt displayed.
+      attachApprovalBinding(args, {
+        kind: "export_scope",
+        toolName: "sdw_export_delete",
+        argsHash: normalizedArgsHash(args),
+        inventory,
+        storedAtMs: Date.now(),
+      });
+      return {
+        manifest_body_digest: summary.digest,
+        scope_digest: inventory.scope_digest,
+        namespaces,
+        record_count: manifest.body.records.length,
+        source_fortress_id: manifest.body.source_fortress_id,
+      };
+    },
+    handler: async (args) => {
+      let manifest: SdwSignedExportManifest;
+      let digest: string;
+      try {
+        manifest = decodeSignedManifestArg(args.manifest);
+        ({ digest } = verifyManifestSignatureOnly(manifest, options.resolvePublicKey));
+      } catch (error) {
+        const category =
+          error instanceof SdwImportVerificationError ? error.category : "malformed_bundle";
+        await auditFailure("sdw_export_delete_denied", { category });
+        return genericDeny("sdw_export_delete");
+      }
+
+      // Fail closed when this call carries no gate-time approval binding —
+      // the consumed inventory is the one THIS call's approval displayed.
+      const binding = takeApprovalBinding(args, "sdw_export_delete", Date.now());
+      if (binding === null || binding.kind !== "export_scope") {
+        await auditFailure("sdw_export_delete_denied", {
+          denial_class: "approval_scope_binding_missing",
+          manifest_body_digest: digest,
+        });
+        return genericDeny("sdw_export_delete");
+      }
+      const approved = binding.inventory;
+
+      // Fail-closed drift recheck: every listed record must STILL exist with
+      // exactly the exported ciphertext. Any mismatch aborts with zero deletes
+      // (no partial deletion of records the human did not see).
+      const live = enumerateSdwExportInventory(options.inventory, approved.namespaces);
+      if (live.scope_digest !== approved.scope_digest) {
+        await auditFailure("sdw_export_delete_drift", {
+          manifest_body_digest: digest,
+          approved_scope_digest: approved.scope_digest,
+          current_scope_digest: live.scope_digest,
+        });
+        return genericDeny("sdw_export_delete");
+      }
+      try {
+        assertManifestMatchesInventory(manifest, live, digest);
+      } catch {
+        await auditFailure("sdw_export_delete_drift", {
+          manifest_body_digest: digest,
+          approved_scope_digest: approved.scope_digest,
+          current_scope_digest: live.scope_digest,
+        });
+        return genericDeny("sdw_export_delete");
+      }
+
+      // Defense-in-depth against a write racing the recheck above: re-read
+      // each record and verify its ciphertext hash IMMEDIATELY before its
+      // delete. A mismatch aborts the loop (deletes so far were all verified;
+      // the abort is honestly audited with the partial count).
+      let deleted = 0;
+      for (const record of manifest.body.records) {
+        const raw = await options.storage.read(record.namespace, record.key);
+        const liveHash = raw === null ? null : recordHashOfRawEnvelope(raw);
+        if (liveHash !== record.record_hash) {
+          await auditFailure("sdw_export_delete_drift", {
+            manifest_body_digest: digest,
+            approved_scope_digest: approved.scope_digest,
+            denial_class: "record_changed_mid_delete",
+            deleted_before_abort: deleted,
+          });
+          return genericDeny("sdw_export_delete");
+        }
+        if (await options.storage.delete(record.namespace, record.key)) {
+          deleted += 1;
+        }
+      }
+
+      await auditSuccess("sdw_export_delete_completed", {
+        manifest_body_digest: digest,
+        deleted_count: deleted,
+        record_count: manifest.body.records.length,
+        namespaces: approved.namespaces,
+      });
+
+      return toolResult({
+        deleted: deleted,
+        record_count: manifest.body.records.length,
+        namespaces: approved.namespaces,
+        manifest_body_digest: digest,
+      });
+    },
+  };
+
+  return [sdwExport, sdwImport, sdwExportDelete];
+}
+
+// ── Manifest-arg helpers (sdw_export_delete) ─────────────────────────────────
+
+/** Hash a stored ciphertext envelope (raw bytes form) — no decryption. */
+function recordHashOfRawEnvelope(raw: Uint8Array): string | null {
+  try {
+    return computeSdwExportRecordHash(
+      JSON.parse(bytesToString(raw)) as Parameters<typeof computeSdwExportRecordHash>[0],
+    );
+  } catch {
+    return null;
+  }
+}
+
+function decodeSignedManifestArg(value: unknown): SdwSignedExportManifest {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_MANIFEST_ARG_BYTES) {
+    throw new SdwImportVerificationError("malformed_bundle");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytesToString(fromBase64url(value)));
+  } catch {
+    throw new SdwImportVerificationError("malformed_bundle");
+  }
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    (parsed as SdwSignedExportManifest).body === null ||
+    typeof (parsed as SdwSignedExportManifest).body !== "object" ||
+    typeof (parsed as SdwSignedExportManifest).signature !== "object"
+  ) {
+    throw new SdwImportVerificationError("malformed_bundle");
+  }
+  const manifest = parsed as SdwSignedExportManifest;
+  if (
+    manifest.body.version !== 1 ||
+    !Array.isArray(manifest.body.records) ||
+    typeof manifest.body.source_fortress_id !== "string" ||
+    !isSdwIdentifier(manifest.body.source_fortress_id) ||
+    typeof manifest.signature.key_ref !== "string" ||
+    typeof manifest.signature.value !== "string" ||
+    manifest.signature.alg !== "ed25519"
+  ) {
+    throw new SdwImportVerificationError("malformed_bundle");
+  }
+  for (const record of manifest.body.records) {
+    if (
+      record === null ||
+      typeof record !== "object" ||
+      typeof record.namespace !== "string" ||
+      typeof record.key !== "string" ||
+      typeof record.record_hash !== "string"
+    ) {
+      throw new SdwImportVerificationError("malformed_bundle");
+    }
+  }
+  return manifest;
+}
+
+function verifyManifestSignatureOnly(
+  manifest: SdwSignedExportManifest,
+  resolvePublicKey: (keyRef: string) => Uint8Array | null,
+): { digest: string } {
+  const digest = sdwManifestBodyDigest(manifest.body);
+  const publicKey = resolvePublicKey(manifest.signature.key_ref);
+  if (publicKey === null) {
+    throw new SdwImportVerificationError("key_unknown", digest);
+  }
+  let signatureBytes: Uint8Array;
+  try {
+    signatureBytes = fromBase64url(manifest.signature.value);
+  } catch {
+    throw new SdwImportVerificationError("signature_invalid", digest);
+  }
+  if (!verify(sdwManifestCanonicalBytes(manifest.body), signatureBytes, publicKey)) {
+    throw new SdwImportVerificationError("signature_invalid", digest);
+  }
+  return { digest };
+}
+
+/**
+ * Every record listed in the manifest must currently exist in the inventory
+ * with EXACTLY the exported ciphertext hash. Records not listed are ignored
+ * (they survive a post-export delete untouched).
+ */
+function assertManifestMatchesInventory(
+  manifest: SdwSignedExportManifest,
+  inventory: SdwExportInventory,
+  digest: string,
+): void {
+  const current = new Map<string, string>();
+  for (const record of inventory.records) {
+    current.set(`${record.namespace}\u0000${record.key}`, record.record_hash);
+  }
+  for (const listed of manifest.body.records) {
+    const liveHash = current.get(`${listed.namespace}\u0000${listed.key}`);
+    if (liveHash === undefined) {
+      throw new SdwImportVerificationError("manifest_mismatch", digest);
+    }
+    if (liveHash !== listed.record_hash) {
+      throw new SdwImportVerificationError("record_hash_mismatch", digest);
+    }
+  }
+}

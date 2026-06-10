@@ -115,6 +115,12 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sanctuary_forget",
     "sanctuary_compound_execute",
     "sanctuary_audit_search_widen",
+    // SDW D2 (Option A+, ratified 2026-06-09): vault export/import and
+    // post-export local delete are Tier 1. The sdw_export approval freezes a
+    // ciphertext-inventory digest of exactly what ships; drift fails closed.
+    "sdw_export",
+    "sdw_import",
+    "sdw_export_delete",
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [

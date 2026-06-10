@@ -192,6 +192,12 @@ function findLmdbWriteGateOffenders(source: string, path: string): string[] {
     offenders.push(`${path}: transactional persistable write does not use the SDW prepare/authority path`);
   }
 
+  if (!sdwTransactionCommitsOnlyOverlayValues(source)) {
+    offenders.push(
+      `${path}: sdwTransaction commit loop must write only guarded overlay values`,
+    );
+  }
+
   return offenders;
 }
 
@@ -252,24 +258,57 @@ function namespaceExposureRejectsSdw(block: string): boolean {
 function writeBlockChecksBeforeRawPut(block: string): boolean {
   const guardIndex = block.indexOf("assertSdwRawWriteAuthorized(");
   const checkedDataIndex = block.indexOf("checkedData");
+  // Either form is acceptable: a direct guarded LMDB put, or — inside
+  // sdwTransaction's staged-then-atomic-commit construction — a guarded
+  // write into the staging overlay. The commit loop is separately checked
+  // (sdwTransactionCommitsOnlyOverlayValues) to write ONLY overlay values.
   const putIndex = block.search(/\bput(?:Sync)?\s*\(\s*compositeKey\s*\(\s*namespace\s*,\s*key\s*\)/);
-  return guardIndex >= 0 && checkedDataIndex >= 0 && putIndex > guardIndex;
+  const stagedIndex = block.search(
+    /\boverlay\.set\s*\(\s*compositeKey\s*\(\s*namespace\s*,\s*key\s*\)/,
+  );
+  const sinkIndex = putIndex >= 0 ? putIndex : stagedIndex;
+  return guardIndex >= 0 && checkedDataIndex >= 0 && sinkIndex > guardIndex;
 }
 
 function persistableBlockUsesPreparedAuthority(block: string): boolean {
   const prepareIndex = block.indexOf("prepareSdwBackendWrite(persistable, encryptionKey, fortressId)");
   const guardIndex = block.indexOf("assertSdwRawWriteAuthorized(");
   const checkedDataIndex = block.indexOf("checkedData");
+  // Direct guarded LMDB put, or guarded write into the sdwTransaction
+  // staging overlay (see writeBlockChecksBeforeRawPut).
   const putPreparedIndex = block.search(
     /\bputSync\s*\(\s*compositeKey\s*\(\s*prepared\.namespace\s*,\s*prepared\.storageKey\s*\)/,
   );
+  const stagedPreparedIndex = block.search(
+    /\boverlay\.set\s*\(\s*compositeKey\s*\(\s*prepared\.namespace\s*,\s*prepared\.storageKey\s*\)/,
+  );
+  const sinkIndex = putPreparedIndex >= 0 ? putPreparedIndex : stagedPreparedIndex;
   return (
     prepareIndex >= 0 &&
     guardIndex > prepareIndex &&
     checkedDataIndex >= 0 &&
-    putPreparedIndex > guardIndex &&
-    block.includes("asBinary(checkedData)")
+    sinkIndex > guardIndex &&
+    (block.includes("asBinary(checkedData)") ||
+      block.includes("new Uint8Array(checkedData)"))
   );
+}
+
+/**
+ * The staged-commit loop must move ONLY overlay values into LMDB: every
+ * `putSync` inside `sdwTransaction` writes `asBinary(value)` where `value`
+ * is the overlay entry (all overlay writes pass the raw-write guard at
+ * staging time, per the block checks above).
+ */
+function sdwTransactionCommitsOnlyOverlayValues(source: string): boolean {
+  const txnBlock = extractBalancedBlock(source, /async\s+sdwTransaction\s*</);
+  if (txnBlock === null) return false;
+  const putSyncCount = (txnBlock.match(/\bputSync\b/g) ?? []).length;
+  const overlayPutCount = (
+    txnBlock.match(
+      /\bputSync\s*\(\s*composite\s*,\s*this\.lmdb\.asBinary\(value\)\s*\)/g,
+    ) ?? []
+  ).length;
+  return putSyncCount > 0 && putSyncCount === overlayPutCount;
 }
 
 function escapeRegExp(value: string): string {
