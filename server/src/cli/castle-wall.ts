@@ -59,6 +59,7 @@ export interface CastleWallParsedArgs {
   scope?: "once" | "session" | "always";
   requestId?: string;
   force?: boolean;
+  acceptBrokenChain?: boolean;
 }
 
 /** Runs the host-app binary in headless mode; mirrors execFile semantics. */
@@ -138,6 +139,140 @@ async function resolveMasterKey(
     );
   }
   return masterKey;
+}
+
+/**
+ * Operation name for the CLI's audited "operator accepted a broken audit chain"
+ * consent entry. Parallels the MCP router's `mcp_accept_broken_chain_override`
+ * (router.ts) — a privileged CLI action (daemon bring-up, re-pin) past audit
+ * integrity findings records the operator's consent BEFORE it proceeds, so the
+ * override is itself auditable. The broken history is NEVER repaired or deleted;
+ * it stays on disk, visible to `sanctuary castle-wall audit-findings`.
+ */
+const CASTLE_WALL_ACCEPT_BROKEN_CHAIN_OP = "castle_wall_accept_broken_chain_override";
+
+/**
+ * Build the `AuditLog` a privileged CLI verb (daemon / re-pin) should use,
+ * applying the operator-override semantics that mirror the MCP router's
+ * `accept_broken_chain` path:
+ *
+ *  - No `--accept-broken-chain`: return a default (strict) `AuditLog`. If the
+ *    chain has integrity findings, the verb's first append throws
+ *    `AuditIntegrityError` exactly as today — fail-closed default, unchanged.
+ *  - `--accept-broken-chain` + findings present: emit a loud stderr warning,
+ *    write an audited critical override entry FIRST (so the consent lands in the
+ *    log before the privileged action runs), then return a lenient `AuditLog`
+ *    so the verb's own appends proceed past the findings. Nothing is repaired,
+ *    rewritten, or deleted — anti-rollback stays intact.
+ *  - `--accept-broken-chain` + no findings: return a default (strict)
+ *    `AuditLog` and write NO override entry (no spurious consent record).
+ *
+ * Findings are probed via `getIntegrityFindings()`, which surfaces findings
+ * without throwing — the override decision must be made on the actual finding
+ * set, not on a thrown error.
+ */
+async function buildAuditLogForPrivilegedAction(opts: {
+  storage: FilesystemStorage;
+  masterKey: Uint8Array;
+  fortressPath: string;
+  verb: "daemon" | "re-pin";
+  acceptBrokenChain: boolean;
+  err: Writable;
+}): Promise<AuditLog> {
+  const { storage, masterKey, fortressPath, verb, acceptBrokenChain, err } = opts;
+  if (!acceptBrokenChain) {
+    return new AuditLog(storage, masterKey);
+  }
+
+  // Flag set: probe findings without throwing (lenient read).
+  const lenient = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+  const findings = await lenient.getIntegrityFindings();
+  if (findings.length === 0) {
+    // Clean chain: the override is a no-op. Keep the default strict log and do
+    // not write a spurious consent entry.
+    return new AuditLog(storage, masterKey);
+  }
+
+  // Findings present + operator consented. Make it loud, then record consent
+  // BEFORE the privileged action proceeds, mirroring the router ordering.
+  write(
+    err,
+    `WARNING: --accept-broken-chain: proceeding past ${findings.length} audit ` +
+      `integrity finding(s) for '${verb}'. Recording an audited override entry ` +
+      `(${CASTLE_WALL_ACCEPT_BROKEN_CHAIN_OP}). The broken history is NOT ` +
+      `repaired or deleted; inspect it with 'sanctuary castle-wall audit-findings'.\n`,
+  );
+  await lenient.appendCritical({
+    layer: "l2",
+    operation: CASTLE_WALL_ACCEPT_BROKEN_CHAIN_OP,
+    identity_id: fortressIdFromStoragePath(fortressPath),
+    result: "success",
+    details: {
+      verb,
+      finding_count: findings.length,
+      findings,
+      source: "castle-wall-cli",
+    },
+  });
+  await lenient.flush();
+  return lenient;
+}
+
+/**
+ * Print the current audit-chain integrity findings for a fortress (read-only).
+ *
+ * This is the "what is actually wrong" diagnostic that lets an operator decide
+ * whether `--accept-broken-chain` is warranted. It loads the audit log in
+ * lenient mode and reports findings via `getIntegrityFindings()`; it NEVER
+ * appends to, repairs, rewrites, or deletes the audit chain. Each finding is
+ * emitted as one JSON line (index, kind, message, affected entry key/sequence,
+ * expected/actual where present).
+ */
+export async function runAuditFindings(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+
+  try {
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveMasterKey(fortressPath, env);
+    const auditLog = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const findings = await auditLog.getIntegrityFindings();
+    masterKey.fill(0);
+
+    if (findings.length === 0) {
+      write(out, "No audit integrity findings; the chain verifies clean.\n");
+      return 0;
+    }
+
+    write(
+      err,
+      `${findings.length} audit integrity finding(s) for fortress ${fortressIdFromStoragePath(fortressPath)}:\n`,
+    );
+    findings.forEach((finding, index) => {
+      write(
+        out,
+        JSON.stringify({
+          index,
+          kind: finding.kind,
+          message: finding.message,
+          ...(finding.key !== undefined ? { key: finding.key } : {}),
+          ...(finding.sequence !== undefined ? { sequence: finding.sequence } : {}),
+          ...(finding.expected !== undefined ? { expected: finding.expected } : {}),
+          ...(finding.actual !== undefined ? { actual: finding.actual } : {}),
+        }) + "\n",
+      );
+    });
+    return 0;
+  } catch (error) {
+    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
 }
 
 export async function runProvisionPin(
@@ -296,12 +431,14 @@ export function buildPinRotationProof(opts: {
  * never agent-triggerable.
  */
 export async function runRePin(
+  argv: string[] = [],
   ctx: CastleWallCommandContext = {},
 ): Promise<number> {
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
+  const acceptBrokenChain = parseCastleWallArgs(argv).acceptBrokenChain ?? false;
 
   if (platform !== "darwin") {
     write(err, "castle-wall re-pin is macOS-only.\n");
@@ -350,7 +487,14 @@ export async function runRePin(
 
     const storage = new FilesystemStorage(join(storagePath, "state"));
     const masterKey = await resolveMasterKey(storagePath, env);
-    const auditLog = new AuditLog(storage, masterKey);
+    const auditLog = await buildAuditLogForPrivilegedAction({
+      storage,
+      masterKey,
+      fortressPath: storagePath,
+      verb: "re-pin",
+      acceptBrokenChain,
+      err,
+    });
 
     if (oldPub && oldPub.length === 32 && oldEnc) {
       const oldFingerprint = fingerprintFromPublicKey(oldPub);
@@ -529,12 +673,14 @@ export async function runStatus(
  * Runs in the foreground until SIGINT/SIGTERM, then tears the daemon down.
  */
 export async function runDaemon(
+  argv: string[] = [],
   ctx: CastleWallCommandContext = {},
 ): Promise<number> {
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
+  const acceptBrokenChain = parseCastleWallArgs(argv).acceptBrokenChain ?? false;
 
   if (platform !== "darwin") {
     write(err, "castle-wall daemon is macOS-only.\n");
@@ -605,7 +751,14 @@ export async function runDaemon(
   }
 
   const derived = await deriveMasterKey(passphrase, existingParams);
-  const auditLog = new AuditLog(storage, derived.key);
+  const auditLog = await buildAuditLogForPrivilegedAction({
+    storage,
+    masterKey: derived.key,
+    fortressPath: storagePath,
+    verb: "daemon",
+    acceptBrokenChain,
+    err,
+  });
 
   const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
   let daemon: { socketPath: string; stop: () => Promise<void> };
@@ -1330,6 +1483,8 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       parsed.scope = parseScope(argv[++i]);
     } else if (arg === "--force") {
       parsed.force = true;
+    } else if (arg === "--accept-broken-chain") {
+      parsed.acceptBrokenChain = true;
     } else if (!arg.startsWith("-") && !parsed.requestId) {
       parsed.requestId = arg;
     }
