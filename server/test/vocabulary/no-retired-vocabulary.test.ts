@@ -25,7 +25,8 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readdir, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -92,30 +93,45 @@ const TEXT_EXTS = new Set([
   ".swift", ".c", ".h", ".plist", ".xml", ".sql", ".env", ".command",
 ]);
 
-async function collectFiles(dir: string, out: string[]): Promise<void> {
-  const entries = await readdir(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (entry.isSymbolicLink()) continue;
-    const full = join(dir, entry.name);
-    const rel = relative(REPO_ROOT, full).split(sep).join("/");
-    if (entry.isDirectory()) {
-      if (SKIP_DIRS.has(entry.name)) continue;
-      if (EXEMPT_PATHS.includes(rel)) continue;
-      await collectFiles(full, out);
-    } else {
-      if (EXEMPT_PATHS.includes(rel) || EXEMPT_FILES.has(rel)) continue;
-      const dot = entry.name.lastIndexOf(".");
-      const ext = dot >= 0 ? entry.name.slice(dot).toLowerCase() : "";
-      if (!TEXT_EXTS.has(ext)) continue;
-      out.push(full);
-    }
+/**
+ * Enumerate the repo's CURRENT, SHIPPING artifacts: git-tracked files only.
+ *
+ * The gate scopes the cocoon-retirement rule to "current artifacts" — i.e.
+ * what the repo actually ships. That is exactly the git-tracked set. Walking
+ * the filesystem instead (the old approach) also scanned gitignored / untracked
+ * local scratch (e.g. a developer's local `Review/`, `docs/builds/`, stray
+ * build summaries, or a nested agent worktree under `.claude/worktrees/`),
+ * which a clean CI checkout never has — producing local-only false failures
+ * with no equivalent in CI. Listing tracked files makes local == CI and keeps
+ * the gate scoped to artifacts that ship. All exemptions below still apply.
+ */
+function collectFiles(out: string[]): void {
+  const tracked = execFileSync("git", ["ls-files", "-z"], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  })
+    .split("\0")
+    .filter((p) => p.length > 0);
+
+  for (const rel of tracked) {
+    const topSegment = rel.split("/")[0]!;
+    if (SKIP_DIRS.has(topSegment)) continue;
+    if (EXEMPT_PATHS.includes(rel) || EXEMPT_FILES.has(rel)) continue;
+    // A top-level exempt PATH (e.g. "Archive") also covers everything under it.
+    if (EXEMPT_PATHS.some((p) => rel === p || rel.startsWith(`${p}/`))) continue;
+    const base = rel.slice(rel.lastIndexOf("/") + 1);
+    const dot = base.lastIndexOf(".");
+    const ext = dot >= 0 ? base.slice(dot).toLowerCase() : "";
+    if (!TEXT_EXTS.has(ext)) continue;
+    out.push(join(REPO_ROOT, ...rel.split("/")));
   }
 }
 
 describe("retired-vocabulary gate", () => {
   it("no current artifact contains the retired term outside frozen exemptions", async () => {
     const files: string[] = [];
-    await collectFiles(REPO_ROOT, files);
+    collectFiles(files);
     expect(files.length).toBeGreaterThan(100); // sanity: the walk found the repo
 
     const offenders: string[] = [];
@@ -151,7 +167,7 @@ describe("retired-vocabulary gate", () => {
 
   it("no current file is named after the retired term", async () => {
     const files: string[] = [];
-    await collectFiles(REPO_ROOT, files);
+    collectFiles(files);
     const badNames = files
       .map((f) => relative(REPO_ROOT, f).split(sep).join("/"))
       .filter((rel) => /cocoon/i.test(rel));
