@@ -120,6 +120,11 @@ const AUDIT_AGENT_REDACT_DETAIL_KEYS = new Set([
   "operator_id",
   "resolved_by",
   "policy_rule_id",
+  // Castle Wall matched-rule id (#381). Written to the stored audit entry for
+  // operator attribution; redacted here so an agent querying audit entries
+  // cannot learn which allow/deny rule matched and map the essentials list by
+  // probing (property #11, no-policy-inference).
+  "rule_id",
   "policy_match",
   "policy_decision",
   "policy_tier",

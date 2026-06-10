@@ -259,9 +259,11 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     expect(entry?.operation).toBe("egress_allowed");
     expect(entry?.identityId).toBe("agent-7");
     expect(entry?.result).toBe("success");
-    // Property #11: rule_id is ALWAYS redacted from audit entries to prevent
-    // agents from mapping the essentials list by probing.
-    expect(entry?.details?.rule_id).toBeNull();
+    // #381: the matched rule id is written into the stored entry so the
+    // operator can attribute the flow. Property #11 (no agent leak) is enforced
+    // at the agent-facing read boundary (monitor_audit_log redaction), not by
+    // dropping the id at write time -- see cred-return-hardening.test.ts.
+    expect(entry?.details?.rule_id).toBe("rule-anthropic");
     expect(entry?.details?.source).toBe("macos_extension");
     expect(consumer.getStats().decisionsRecorded).toBe(1);
     expect(consumer.getStats().decisionsRejected).toBe(0);

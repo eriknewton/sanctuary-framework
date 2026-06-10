@@ -1,11 +1,16 @@
 /**
  * Tests for A1: agent-origin descriptor delivery through the daemon and
- * audit-surface redaction (property #11).
+ * operator rule-id attribution in the stored audit entry (#381).
  *
  * Asserts:
  *  - The daemon loads agent-origin.json from the fortress policy dir
  *  - The agent-origin is included in the signed manifest
- *  - The flow-event consumer redacts rule_id from audit entries
+ *  - The flow-event consumer writes the matched rule id into the stored audit
+ *    entry so the operator can attribute a flow to a specific rule. The
+ *    no-agent-leak invariant (property #11) is enforced at the agent-facing
+ *    read boundary (`monitor_audit_log` redaction), proven in
+ *    test/security/cred-return-hardening.test.ts, not by dropping the id at
+ *    write time.
  */
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
@@ -104,7 +109,7 @@ describe("castle-wall/runtime/daemon-agent-origin", () => {
     });
   });
 
-  describe("audit surface redaction (property #11)", () => {
+  describe("operator rule-id attribution (#381)", () => {
     let consumer: MacOSFlowEventConsumer;
     let auditEntries: Array<{
       layer: string;
@@ -156,7 +161,7 @@ describe("castle-wall/runtime/daemon-agent-origin", () => {
       });
     });
 
-    it("redacts rule_id from audit entries for operator_passthrough allows", async () => {
+    it("records operator_passthrough as the matched rule id for baseline allows", async () => {
       const notification: FlowDecisionRecordedNotification = {
         type: "flow_decision_recorded",
         decision: "allow",
@@ -174,11 +179,11 @@ describe("castle-wall/runtime/daemon-agent-origin", () => {
       };
       await consumer.handleFlowDecisionRecorded(notification);
       expect(auditEntries).toHaveLength(1);
-      expect(auditEntries[0]!.metadata.rule_id).toBeNull();
+      expect(auditEntries[0]!.metadata.rule_id).toBe("operator_passthrough");
       expect(auditEntries[0]!.operation).toBe("egress_allowed");
     });
 
-    it("redacts rule_id from audit entries for regular rule matches", async () => {
+    it("records the specific rule id for an allow-by-rule match", async () => {
       const notification: FlowDecisionRecordedNotification = {
         type: "flow_decision_recorded",
         decision: "allow",
@@ -196,10 +201,32 @@ describe("castle-wall/runtime/daemon-agent-origin", () => {
       };
       await consumer.handleFlowDecisionRecorded(notification);
       expect(auditEntries).toHaveLength(1);
-      expect(auditEntries[0]!.metadata.rule_id).toBeNull();
+      expect(auditEntries[0]!.metadata.rule_id).toBe("allow-anthropic-api");
     });
 
-    it("redacts rule_id from audit entries for deny verdicts", async () => {
+    it("records the specific rule id for a deny-by-rule match", async () => {
+      const notification: FlowDecisionRecordedNotification = {
+        type: "flow_decision_recorded",
+        decision: "drop",
+        destination: {
+          host: "blocked.example.com",
+          ip: "203.0.113.10",
+          port: 443,
+          protocol: "tcp",
+          hostname_source: "sni",
+          opaque: false,
+        },
+        agent: { id: "test-agent", template: "unknown" },
+        matched_rule_id: "deny-blocked-example",
+        recorded_at: new Date().toISOString(),
+      };
+      await consumer.handleFlowDecisionRecorded(notification);
+      expect(auditEntries).toHaveLength(1);
+      expect(auditEntries[0]!.metadata.rule_id).toBe("deny-blocked-example");
+      expect(auditEntries[0]!.operation).toBe("egress_blocked");
+    });
+
+    it("records a null rule id for a baseline default-deny (no rule matched)", async () => {
       const notification: FlowDecisionRecordedNotification = {
         type: "flow_decision_recorded",
         decision: "drop",
