@@ -66,8 +66,7 @@ describe("SDW secret-persistence adversarial fixtures", () => {
     ).not.toThrow();
   });
 
-  it("F-2 documents split-field classifier limits for separated PEM markers", async () => {
-    const storage = new MemoryStorage();
+  it("F-2 rejects separated PEM markers after canonicalizing the full record", () => {
     const record = workingStateRecord("f2-split", "-----BEGIN ED25519");
     const splitRecord: SdwWorkingStateRecord = {
       ...record,
@@ -79,22 +78,14 @@ describe("SDW secret-persistence adversarial fixtures", () => {
       },
     };
 
-    const persistable = mintPersistable(
-      { value: splitRecord, taint: "agent_derived_clean" },
-      SDW_WORKING_STATE_NAMESPACE,
-      stateKey("task", "f2-split"),
-      FORTRESS_ID,
-    );
-    await sdwBackendWrite(
-      storage,
-      persistable,
-      derivePurposeKey(MASTER_KEY, SDW_WORKING_STATE_HKDF_INFO),
-      FORTRESS_ID,
-    );
-
-    const raw = await storage.read(SDW_WORKING_STATE_NAMESPACE, stateKey("task", "f2-split"));
-    expect(raw).not.toBeNull();
-    expect(encryptedEnvelopeContains(raw!, "PRIVATE KEY")).toBe(false);
+    expectSdwThrow(() =>
+      mintPersistable(
+        { value: splitRecord, taint: "agent_derived_clean" },
+        SDW_WORKING_STATE_NAMESPACE,
+        stateKey("task", "f2-split"),
+        FORTRESS_ID,
+      ),
+    "classifier_reject");
   });
 
   it("F-3/F-5/F-6 are covered by phase1 architecture fixtures", () => {
@@ -103,27 +94,17 @@ describe("SDW secret-persistence adversarial fixtures", () => {
     expect(true).toBe(true);
   });
 
-  it("F-4 documents that a generic third-party token mislabeled clean currently passes", async () => {
-    const storage = new MemoryStorage();
+  it("F-4 rejects a high-signal third-party token mislabeled clean", () => {
     const tokenLikeText = "third-party token sk_test_1234567890abcdef1234567890abcdef";
     const record = workingStateRecord("f4-clean-token", tokenLikeText);
-    const persistable = mintPersistable(
-      { value: record, taint: "agent_derived_clean" },
-      SDW_WORKING_STATE_NAMESPACE,
-      stateKey("task", "f4-clean-token"),
-      FORTRESS_ID,
-    );
-
-    await sdwBackendWrite(
-      storage,
-      persistable,
-      derivePurposeKey(MASTER_KEY, SDW_WORKING_STATE_HKDF_INFO),
-      FORTRESS_ID,
-    );
-
-    const raw = await storage.read(SDW_WORKING_STATE_NAMESPACE, stateKey("task", "f4-clean-token"));
-    expect(raw).not.toBeNull();
-    expect(encryptedEnvelopeContains(raw!, tokenLikeText)).toBe(false);
+    expectSdwThrow(() =>
+      mintPersistable(
+        { value: record, taint: "agent_derived_clean" },
+        SDW_WORKING_STATE_NAMESPACE,
+        stateKey("task", "f4-clean-token"),
+        FORTRESS_ID,
+      ),
+    "classifier_reject");
   });
 
   it("F-7 blocks structural metadata smuggling but documents generic metadata content limits", async () => {
@@ -268,6 +249,15 @@ describe("SDW secret-persistence adversarial fixtures", () => {
     ).toThrow(SdwValidationError);
   });
 });
+
+function expectSdwThrow(fn: () => unknown, category: string): void {
+  try {
+    fn();
+    throw new Error(`expected ${category}`);
+  } catch (error) {
+    expect(error).toMatchObject({ category });
+  }
+}
 
 function encodedEd25519Pkcs8Fixture(): { readonly hex: string; readonly base64: string } {
   const hex = "302e020100300506032b657004220420" + "11".repeat(32);
