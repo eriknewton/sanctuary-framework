@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { getServers } from "node:dns";
 import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
@@ -8,6 +9,7 @@ import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.j
 import type { AuditLog } from "../../l2-operational/audit-log.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { validateRule } from "../allowlist/schema.js";
+import { deriveDnsRuleForHostnameRules } from "../allowlist/dns-derivation.js";
 import { validateAgentOrigin } from "../allowlist/agent-origin.js";
 import { verifyManifestSignature } from "../allowlist/parse.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
@@ -282,6 +284,11 @@ export async function startMacOSCastleWallDaemon(
         input.fortressId,
         {
           loaded_rule_count: manifestState.rules.length,
+          // Surface auto-derived rules (#380) so a derived grant is never
+          // silently invisible in policy introspection.
+          derived_rule_ids: manifestState.rules
+            .filter((rule) => rule.derived === true)
+            .map((rule) => rule.id),
           emitted_subscribers: emitted,
           source: "castle-wall-reload",
         },
@@ -569,6 +576,18 @@ async function loadManifestState(input: {
       throw new Error(`rule ${filename} invalid: ${issues.join("; ")}`);
     }
     rules.push(parsed);
+  }
+  // Auto-derive a scoped DNS allow (#380) when hostname allow-rules exist, so
+  // agents can resolve names without an operator-authored any-resolver port-53
+  // grant. The rule scopes to the system resolvers ONLY (dns.getServers(),
+  // verified to match `scutil --dns`); absent when no hostname rules exist.
+  const derivedDns = deriveDnsRuleForHostnameRules({
+    rules,
+    resolvers: getServers(),
+    createdAt: new Date().toISOString(),
+  });
+  if (derivedDns) {
+    rules.push(derivedDns);
   }
   const { signed } = await buildSignedManifest({
     fortressId: input.fortressId,

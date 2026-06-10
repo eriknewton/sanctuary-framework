@@ -64,4 +64,48 @@ describe("castle-wall/allowlist/schema/validateRule", () => {
     const issues = validateRule(r);
     expect(issues.some((s) => s.includes("id"))).toBe(true);
   });
+
+  // IP / CIDR matcher (#380)
+
+  it("accepts an ip-only match (single and array, both families)", () => {
+    expect(validateRule({ ...validRule(), match: { ip: "1.1.1.1" } })).toEqual([]);
+    expect(
+      validateRule({ ...validRule(), match: { ip: ["1.1.1.1", "2001:4860:4860::8888"] } })
+    ).toEqual([]);
+  });
+
+  it("accepts a cidr-only match (single and array, both families)", () => {
+    expect(validateRule({ ...validRule(), match: { cidr: "10.0.0.0/8" } })).toEqual([]);
+    expect(
+      validateRule({ ...validRule(), match: { cidr: ["192.168.0.0/16", "2001:db8::/32"] } })
+    ).toEqual([]);
+  });
+
+  it("rejects a malformed ip (fail closed, not silently dropped)", () => {
+    const issues = validateRule({ ...validRule(), match: { ip: "999.1.1.1" } });
+    expect(issues.some((s) => s.includes("ip"))).toBe(true);
+  });
+
+  it("rejects a malformed cidr (bad prefix and missing slash)", () => {
+    expect(
+      validateRule({ ...validRule(), match: { cidr: "10.0.0.0/33" } }).some((s) =>
+        s.includes("cidr")
+      )
+    ).toBe(true);
+    expect(
+      validateRule({ ...validRule(), match: { cidr: "10.0.0.0" } }).some((s) =>
+        s.includes("cidr")
+      )
+    ).toBe(true);
+  });
+
+  it("rejects one bad entry in an otherwise-valid ip array", () => {
+    const issues = validateRule({ ...validRule(), match: { ip: ["1.1.1.1", "not-an-ip"] } });
+    expect(issues.some((s) => s.includes("ip"))).toBe(true);
+  });
+
+  it("rejects a non-string ip entry", () => {
+    const r = { ...validRule(), match: { ip: [1234] } } as unknown as AllowlistRule;
+    expect(validateRule(r).some((s) => s.includes("ip"))).toBe(true);
+  });
 });

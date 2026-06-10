@@ -19,6 +19,8 @@ final class AllowlistEvaluatorTests: XCTestCase {
         id: String = "r-1",
         host: ManifestRuleHostMatch? = nil,
         hostPattern: String? = nil,
+        ip: ManifestRuleHostMatch? = nil,
+        cidr: ManifestRuleHostMatch? = nil,
         port: ManifestRulePortMatch? = nil,
         protocolName: String? = nil,
         agentIds: [String]? = nil,
@@ -33,6 +35,8 @@ final class AllowlistEvaluatorTests: XCTestCase {
             match: ManifestRuleMatch(
                 host: host,
                 hostPattern: hostPattern,
+                ip: ip,
+                cidr: cidr,
                 port: port,
                 protocolName: protocolName
             ),
@@ -186,6 +190,145 @@ final class AllowlistEvaluatorTests: XCTestCase {
         XCTAssertEqual(
             AllowlistEvaluator.evaluate(flow: flow(proto: .udp), rules: [bothRule]),
             .allow(matchedRuleId: "both-1")
+        )
+    }
+
+    // MARK: - IP / CIDR match clause (#380)
+
+    func testExactIpv4Matches() {
+        let r = rule(ip: .single("1.1.1.1"), port: .single(53), protocolName: "tcp+udp", disposition: "allow")
+        let f = flow(host: nil, ip: "1.1.1.1", port: 53, proto: .udp)
+        XCTAssertEqual(AllowlistEvaluator.evaluate(flow: f, rules: [r]), .allow(matchedRuleId: "r-1"))
+    }
+
+    func testExactIpv4NonResolverDoesNotMatch() {
+        // THE security property: a port-53 flow to a NON-resolver IP must not
+        // match an ip-scoped DNS allow (no tunneling to an arbitrary server).
+        let r = rule(ip: .multiple(["1.1.1.1", "8.8.8.8"]), port: .single(53), protocolName: "tcp+udp", disposition: "allow")
+        let f = flow(host: nil, ip: "9.9.9.9", port: 53, proto: .udp)
+        XCTAssertEqual(AllowlistEvaluator.evaluate(flow: f, rules: [r]), .drop(matchedRuleId: nil))
+    }
+
+    func testIpArrayMatchesAnyMember() {
+        let r = rule(ip: .multiple(["1.1.1.1", "8.8.8.8"]), disposition: "allow")
+        let f = flow(host: nil, ip: "8.8.8.8")
+        XCTAssertEqual(AllowlistEvaluator.evaluate(flow: f, rules: [r]), .allow(matchedRuleId: "r-1"))
+    }
+
+    func testExactIpv6MatchesAcrossTextualForms() {
+        // `::1` normalized equals the fully-expanded form.
+        let r = rule(ip: .single("0:0:0:0:0:0:0:1"), disposition: "allow")
+        let f = flow(host: nil, ip: "::1")
+        XCTAssertEqual(AllowlistEvaluator.evaluate(flow: f, rules: [r]), .allow(matchedRuleId: "r-1"))
+    }
+
+    func testIpv4DoesNotMatchIpv6Family() {
+        let r = rule(ip: .single("1.1.1.1"), disposition: "allow")
+        let f = flow(host: nil, ip: "::1")
+        XCTAssertEqual(AllowlistEvaluator.evaluate(flow: f, rules: [r]), .drop(matchedRuleId: nil))
+    }
+
+    func testCidrIpv4Contains() {
+        let r = rule(cidr: .single("10.0.0.0/24"), disposition: "allow")
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "10.0.0.1"), rules: [r]),
+            .allow(matchedRuleId: "r-1")
+        )
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "10.0.0.255"), rules: [r]),
+            .allow(matchedRuleId: "r-1")
+        )
+    }
+
+    func testCidrIpv4BoundaryOutsideDoesNotMatch() {
+        let r = rule(cidr: .single("10.0.0.0/24"), disposition: "allow")
+        // network base of the NEXT block and the last address of the PREVIOUS block
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "10.0.1.0"), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "9.255.255.255"), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+    }
+
+    func testCidrSlash32ExactHostOnly() {
+        let r = rule(cidr: .single("203.0.113.7/32"), disposition: "allow")
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "203.0.113.7"), rules: [r]),
+            .allow(matchedRuleId: "r-1")
+        )
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "203.0.113.8"), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+    }
+
+    func testCidrIpv6Slash128ExactHostOnly() {
+        let r = rule(cidr: .single("2001:db8::1/128"), disposition: "allow")
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "2001:db8::1"), rules: [r]),
+            .allow(matchedRuleId: "r-1")
+        )
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "2001:db8::2"), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+    }
+
+    func testCidrIpv6PrefixContains() {
+        let r = rule(cidr: .single("2001:db8::/32"), disposition: "allow")
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "2001:db8:dead:beef::1"), rules: [r]),
+            .allow(matchedRuleId: "r-1")
+        )
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "2001:db9::1"), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+    }
+
+    func testCidrMismatchedFamilyNeverMatches() {
+        let r = rule(cidr: .single("10.0.0.0/8"), disposition: "allow")
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "::1"), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+    }
+
+    func testMalformedCidrPrefixNeverMatches() {
+        // A /33 (IPv4) is out of range; must never match (and never crash).
+        let r = rule(cidr: .single("10.0.0.0/33"), disposition: "allow")
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "10.0.0.1"), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+    }
+
+    func testIpAndPortCompose_derivedDnsShape() {
+        // The exact shape of the derived DNS rule: ip-scoped + port 53 + tcp+udp.
+        let r = rule(
+            id: "derived_dns_for_hostname_rules",
+            ip: .multiple(["1.1.1.1", "8.8.8.8"]),
+            port: .single(53),
+            protocolName: "tcp+udp",
+            disposition: "allow"
+        )
+        // resolver + port 53 over UDP -> allow
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "1.1.1.1", port: 53, proto: .udp), rules: [r]),
+            .allow(matchedRuleId: "derived_dns_for_hostname_rules")
+        )
+        // resolver IP but a NON-53 port -> no match (port axis constrains)
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "1.1.1.1", port: 443, proto: .tcp), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+        // port 53 to a non-resolver -> no match (ip axis constrains)
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: nil, ip: "9.9.9.9", port: 53, proto: .udp), rules: [r]),
+            .drop(matchedRuleId: nil)
         )
     }
 

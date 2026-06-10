@@ -646,17 +646,29 @@ public enum ManifestRulePortMatch: Codable, Equatable {
 public struct ManifestRuleMatch: Codable, Equatable {
     public let host: ManifestRuleHostMatch?
     public let hostPattern: String?
+    /// Exact destination-IP match (family-aware). String or [string], same
+    /// wire shape as `host`. Mirrors the TS `match.ip` union (#380). Lets a DNS
+    /// allow scope to the resolver set, which the host axis cannot express
+    /// because a DNS flow carries no hostname.
+    public let ip: ManifestRuleHostMatch?
+    /// Destination-IP CIDR-containment match (family-aware). Mirrors the TS
+    /// `match.cidr` union (#380).
+    public let cidr: ManifestRuleHostMatch?
     public let port: ManifestRulePortMatch?
     public let protocolName: String?
 
     public init(
         host: ManifestRuleHostMatch?,
         hostPattern: String?,
+        ip: ManifestRuleHostMatch? = nil,
+        cidr: ManifestRuleHostMatch? = nil,
         port: ManifestRulePortMatch?,
         protocolName: String?
     ) {
         self.host = host
         self.hostPattern = hostPattern
+        self.ip = ip
+        self.cidr = cidr
         self.port = port
         self.protocolName = protocolName
     }
@@ -664,6 +676,8 @@ public struct ManifestRuleMatch: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case host
         case hostPattern = "host_pattern"
+        case ip
+        case cidr
         case port
         case protocolName = "protocol"
     }
