@@ -15,9 +15,6 @@
  *   npx @sanctuary-framework/mcp-server wrap --wrap /path/to/config.json
  *   npx @sanctuary-framework/mcp-server wrap --unwrap
  *
- * The `cocoon` subcommand is preserved as a hidden alias that prints a
- * deprecation notice. It will be removed in a future release.
- *
  * Layer 1 vs Layer 2 (Cline, and any other harness that has both):
  *   `sanctuary wrap --cline` is the Layer 1 install-time flag handled here.
  *   It detects the operator's existing Cline VS Code extension MCP config,
@@ -40,10 +37,10 @@ import { randomBytes } from "node:crypto";
 import {
   detectAgentConfigWithDiagnostics,
   backupConfig,
-  saveCocoonMeta,
+  saveWrapMeta,
   findLatestBackup,
   restoreConfig,
-  rewriteConfigForCocoon,
+  rewriteConfigForWrap,
   getPlatformPaths,
   type AgentPlatform,
   type MCPServerEntry,
@@ -155,9 +152,6 @@ export interface WrapOptions {
   writePassphraseBackup?: string;
 }
 
-/** Backward-compat alias for the old `parseCocoonArgs` return type. */
-export type CocoonOptions = WrapOptions;
-
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /**
@@ -212,7 +206,7 @@ export function formatMcpServerCount(
 // ── Constants ───────────────────────────────────────────────────────
 
 /** Default CallGovernor limits for wrapped agents. */
-export const COCOON_GOVERNOR_DEFAULTS = {
+export const WRAP_GOVERNOR_DEFAULTS = {
   volume_limit: 200,
   rate_limit_per_tool: 20,
   lifetime_limit: 1000,
@@ -261,7 +255,7 @@ export interface RunWrapDeps {
    * Override the config rewrite (for tests). Production callers leave this
    * undefined.
    */
-  rewriteConfig?: typeof rewriteConfigForCocoon;
+  rewriteConfig?: typeof rewriteConfigForWrap;
   /**
    * Override the Claude Code permissions.allow installer (WP-V1.2 reshape).
    * Production uses the bundled `installClaudeCodeAllowlist`; tests
@@ -430,7 +424,7 @@ export async function runWrap(
   // agent config. User-supplied `--passphrase` is treated as a one-time
   // setter — we persist it into Keychain/fallback and the launcher
   // re-resolves it at runtime via the same path everyone else uses.
-  // See SEC-061 in docs/audit/DELTA_REVIEW_V0.9.0_RC1.md.
+  // See SEC-061 in Archive/DELTA_REVIEW_V0.9.0_RC1.md.
   let passphraseLocation: string;
   let passphraseSource: string;
   // v1.1.2 hotfix (Finding V): capture the passphrase value so the
@@ -616,6 +610,9 @@ export async function runWrap(
   }
 
   const profile = createWrapProfile(upstreamServers);
+  // Filename is frozen for compatibility: existing installs are discovered by
+  // this exact on-disk name (see cli/agents/discovery.ts). Vocabulary-sweep
+  // exempt; do not rename without a read-both migration.
   const profilePath = join(storagePath, "cocoon-profile.json");
   await writeFile(profilePath, JSON.stringify(profile, null, 2), {
     mode: 0o600,
@@ -623,7 +620,7 @@ export async function runWrap(
 
   // Back up and rewrite agent config.
   const backupPath = await backupConfig(agentConfig.configPath);
-  await saveCocoonMeta({
+  await saveWrapMeta({
     backupPath,
     originalPath: agentConfig.configPath,
     platform: agentConfig.platform,
@@ -651,7 +648,7 @@ export async function runWrap(
   // keep the same fortress directory. Pre-fix, --fortress was honored at
   // wrap time (via promoteFortressToStoragePath above) but never written
   // into ~/.claude.json — every harness restart fell back to the default
-  // fortress location, silently drifting cocoon isolation across reboots.
+  // fortress location, silently drifting fortress isolation across reboots.
   //
   // The args list stays constant: persistence travels through env vars
   // exclusively, matching the SANCTUARY_PASSPHRASE pattern. The runtime
@@ -679,7 +676,7 @@ export async function runWrap(
     ? [options.devDist!]
     : ["@sanctuary-framework/mcp-server"];
 
-  const rewrite = deps.rewriteConfig ?? rewriteConfigForCocoon;
+  const rewrite = deps.rewriteConfig ?? rewriteConfigForWrap;
   await rewrite(
     agentConfig,
     sanctuaryCommand,
@@ -914,7 +911,7 @@ export async function runWrap(
   // is called to check if an identity already exists before creating.
   // Reset-history continuity (v1.0.2 item a) is also not consumed here;
   // the next caller (MCP-server-boot or sanctuary dashboard standalone)
-  // handles it on first cocoon-unlock as before.
+  // handles it on first fortress-unlock as before.
   //
   // Best-effort: a derivation failure does not fail wrap (operators still
   // get a working v1.0 dashboard at /). The v1.1 surface is reachable
@@ -1104,15 +1101,6 @@ export async function runWrap(
     intelligenceHealthy,
     intelligenceError,
   });
-}
-
-/** Backward-compat alias for the old function name. */
-export async function runCocoon(options: CocoonOptions): Promise<void> {
-  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-  console.error(
-    `\n  Note: \`cocoon\` is renamed to \`wrap\`. Use \`sanctuary wrap\` next time.\n`
-  );
-  return runWrap(options);
 }
 
 // ── Dashboard: port fallback ────────────────────────────────────────
@@ -1743,9 +1731,6 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
 
   return options;
 }
-
-/** Backward-compat alias for the old function name. */
-export const parseCocoonArgs = parseWrapArgs;
 
 function printWrapHelp(): void {
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.

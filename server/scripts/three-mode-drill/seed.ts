@@ -14,13 +14,13 @@
  *   <DRILL_DIR>/fortress/root-priv.bin   — root principal private seed
  *   <DRILL_DIR>/peers.json               — per-node { id, pubkey, cert, mode }
  *   <DRILL_DIR>/nodeA/node.json          — { id, mode, cert }
- *   <DRILL_DIR>/nodeA/node-wrapped.json  — cocoon-wrapped Ed25519 seed
+ *   <DRILL_DIR>/nodeA/node-wrapped.json  — master-key-wrapped Ed25519 seed
  *   <DRILL_DIR>/nodeA/seed.bin           — node Ed25519 seed (demo-only)
  *   (… same for nodeB, nodeC)
  *
  * `master.bin`, `root-priv.bin`, and `seed.bin` are demo-only — a pilot
  * operator running the real sovereign fortress would NEVER dump these to
- * disk unencrypted. They live in the operator's cocoon, unlocked by the
+ * disk unencrypted. They live in the operator's encrypted state store, unlocked by the
  * Argon2id passphrase. The drill script writes them so the per-node `node.ts`
  * runtime can pick them up without a passphrase-prompt step; the README
  * spells this out as the single most important deviation from production.

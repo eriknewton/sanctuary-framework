@@ -17,7 +17,7 @@ export interface FortressViewOptions {
 }
 
 /**
- * Generate the Fortress View HTML for the Cocoon dashboard.
+ * Generate the Fortress View HTML for the wrap dashboard.
  */
 export function generateFortressViewHTML(options: FortressViewOptions): string {
   return `<!DOCTYPE html>

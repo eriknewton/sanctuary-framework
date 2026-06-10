@@ -179,7 +179,7 @@ export class AggregatorPayloadStore {
 
   /**
    * Drop expired payload bundles. Returns the count of bundles pruned.
-   * Caller wires this into the cocoon-unlock initialization path.
+   * Caller wires this into the fortress-unlock initialization path.
    */
   async pruneExpired(now?: Date): Promise<{ pruned: number }> {
     const cutoff = (now ?? new Date()).toISOString();

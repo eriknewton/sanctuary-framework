@@ -28,7 +28,7 @@ export interface TemplateCommandArgs {
   out?: NodeJS.WritableStream;
   err?: NodeJS.WritableStream;
   /**
-   * Override the orphan-check. Returns true when a cocoon is bound to the
+   * Override the orphan-check. Returns true when a fortress is bound to the
    * given agent_id. Default: resolves against tenant discovery.
    */
   isAgentWrapped?: (agentId: string) => Promise<boolean>;
@@ -64,7 +64,7 @@ export async function runTemplateCommand(args: TemplateCommandArgs): Promise<num
 async function defaultIsAgentWrapped(agentId: string): Promise<boolean> {
   const tenant = await findTenant(agentId);
   if (!tenant) return false;
-  return tenant.initialized || tenant.has_cocoon_profile;
+  return tenant.initialized || tenant.has_profile;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -151,7 +151,7 @@ async function cmdInit(
   }
 
   // Orphan-reject: a channel-shape template binds to an already-wrapped
-  // harness. If no cocoon exists for this agent_id, fail loudly and point
+  // harness. If no fortress exists for this agent_id, fail loudly and point
   // the operator at `sanctuary wrap`. Sanctuary ships channel-shape
   // governance templates, not named-agent runtimes; authoring a policy
   // for nothing is the drift surface we closed in v1.0.0-rc.2.

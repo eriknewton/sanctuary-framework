@@ -6,7 +6,7 @@
  * full createSanctuaryServer() — we only need the master key, storage,
  * audit log, keychain backend, and policy-loaded grants.
  *
- * Passphrase resolution reuses the existing cocoon pattern (keychain or
+ * Passphrase resolution reuses the existing fortress pattern (keychain or
  * encrypted fallback file), so the user does NOT manage a separate
  * broker passphrase — it's the same passphrase that protects the main
  * Sanctuary master key.
@@ -26,7 +26,7 @@ import { parseBrokerPolicy } from "./policy.js";
 import type { Backend } from "./backend-interface.js";
 
 export interface OpenBrokerOptions {
-  /** Override passphrase (otherwise resolved via cocoon/passphrase). */
+  /** Override passphrase (otherwise resolved via keychain/passphrase). */
   passphrase?: string;
   /** Override storage path (otherwise config.storage_path). */
   storagePath?: string;
@@ -89,7 +89,7 @@ export async function openBroker(opts: OpenBrokerOptions = {}): Promise<{
     principalIdentityId: opts.principalIdentityId ?? "sanctuary-broker",
   });
 
-  // Hardening wave 6 finding #86: cocoon-unlock fires expiry pruning so
+  // Hardening wave 6 finding #86: fortress-unlock fires expiry pruning so
   // any tokens that survived a prior process restart-as-cache scenario
   // are dropped before the operator can issue or read against them.
   // pruneExpired is idempotent and synchronous; failures bubble (none

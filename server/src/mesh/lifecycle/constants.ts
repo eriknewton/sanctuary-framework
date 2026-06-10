@@ -11,7 +11,7 @@
 /**
  * HKDF info-string prefix for deriving the per-node at-rest wrapping key.
  *
- * Q8 (per-node cocoon binding): the per-node Ed25519 private key is wrapped
+ * Q8 (per-node key binding): the per-node Ed25519 private key is wrapped
  * at rest under AES-256-GCM. The wrapping key is HKDF-derived from the
  * fortress-master secret with this info string plus the node_id. At boot,
  * the broker unlock flow surfaces the fortress-master secret; the lifecycle

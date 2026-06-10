@@ -18,7 +18,7 @@
  *
  * This runtime is demo-grade — passphrase-less unwrapping is read from
  * `seed.bin`; the production fortress ingests these materials through the
- * cocoon instead. See `scripts/three-mode-drill-README.md` for the operator-
+ * fortress instead. See `scripts/three-mode-drill-README.md` for the operator-
  * facing explanation.
  */
 

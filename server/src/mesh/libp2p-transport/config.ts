@@ -6,7 +6,7 @@
  * Spawn prompt: Review/Sanctuary/WP_MVP_3_Followup_2_Libp2p_Adapter_Spawn_Prompt_2026-04-21.md
  *
  * No secret material belongs here. Per-node Ed25519 private keys live in the
- * NodeKeyStore (cocoon-wrapped); this config only references listen/static-peer
+ * NodeKeyStore (master-key-wrapped); this config only references listen/static-peer
  * multiaddrs and discovery toggles.
  */
 

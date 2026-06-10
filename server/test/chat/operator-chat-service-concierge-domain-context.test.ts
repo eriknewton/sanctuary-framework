@@ -116,7 +116,7 @@ describe("concierge Sanctuary domain reference", () => {
     expect(ctx).toContain("outputs");
 
     // Key concepts
-    expect(ctx).toContain("cocoon");
+    expect(ctx).toContain("Encrypted state store");
     expect(ctx).toContain("audit log");
     expect(ctx).toContain("Ed25519");
 

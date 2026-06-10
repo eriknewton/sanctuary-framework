@@ -11,7 +11,7 @@
  *
  * HKDF info strings here intentionally differ from those in mesh/constants.ts
  * and lifecycle/constants.ts so guardian-derived material is independent of
- * transport / audit-chain / cocoon-wrap material.
+ * transport / audit-chain / node-key-wrap material.
  */
 
 /** v1.0 default M (signatures required for quorum). */

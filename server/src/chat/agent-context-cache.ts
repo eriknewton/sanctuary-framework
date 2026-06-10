@@ -25,7 +25,7 @@
  *   resolves).
  *
  * - Cadence: callers schedule refreshes via `start()` (60-second timer)
- *   and trigger an explicit refresh on cocoon-unlock by calling
+ *   and trigger an explicit refresh on fortress-unlock by calling
  *   `refresh()` once at construction. Tests can opt out of the timer
  *   by leaving `start()` uncalled.
  *

@@ -1,12 +1,12 @@
 /**
  * Hardening wave 6 finding #86, token expiry pruning hooked into the
- * cocoon-unlock initialization path.
+ * fortress-unlock initialization path.
  *
  * Two regressions:
  *   1. tick-fires-prune      , Broker.pruneExpiredTokens() actually drops
  *                               expired tokens from the issuer map.
  *   2. unlock-cycle-fires-prune, openBroker() fires Broker.pruneExpiredTokens
- *                                 once during the cocoon-unlock path so
+ *                                 once during the fortress-unlock path so
  *                                 each unlock cycle clears stale state
  *                                 before any operator interaction.
  */
@@ -62,7 +62,7 @@ function makeFakeBackend(secrets: Record<string, string>): Backend {
   };
 }
 
-describe("token expiry pruning fires on cocoon-unlock (finding #86)", () => {
+describe("token expiry pruning fires on fortress-unlock (finding #86)", () => {
   it("tick-fires-prune: Broker.pruneExpiredTokens() removes expired bindings", async () => {
     let now = 1_700_000_000_000;
     const grant: SkillSecretGrant = {
@@ -127,7 +127,7 @@ describe("token expiry pruning fires on cocoon-unlock (finding #86)", () => {
     expect(issuer.liveTokenCount()).toBe(0);
   });
 
-  it("unlock-cycle-fires-prune: openBroker fires pruneExpiredTokens during cocoon-unlock", async () => {
+  it("unlock-cycle-fires-prune: openBroker fires pruneExpiredTokens during fortress-unlock", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "sanctuary-broker-prune-"));
     try {
       // Pre-stage the broker policy so loadBrokerGrants returns deterministic state.
@@ -138,7 +138,7 @@ describe("token expiry pruning fires on cocoon-unlock (finding #86)", () => {
         },
       ]);
       // Spy on Broker.prototype.pruneExpiredTokens so we can verify openBroker fires it
-      // exactly once during the cocoon-unlock initialization path.
+      // exactly once during the fortress-unlock initialization path.
       const spy = vi.spyOn(Broker.prototype, "pruneExpiredTokens");
       try {
         const fakeBackend = makeFakeBackend({ "api-x": "abc" });

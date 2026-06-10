@@ -67,7 +67,7 @@ export const STATUS_REASON_LABELS: Record<
   budget_hard_cap: "Budget hard-cap reached",
   harness_error: "Harness reported an error",
   harness_unreachable: "Harness is unreachable",
-  passphrase_required: "Cocoon passphrase required",
+  passphrase_required: "Fortress passphrase required",
   config_drift: "Configuration drift detected",
   other: "Other reason. See activity feed.",
 };

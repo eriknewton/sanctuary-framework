@@ -25,7 +25,7 @@
  *      standalone dashboard both surface the persisted records.
  *
  * The L1 cognitive identity layer is intentionally left at lazy-init
- * (created on first cocoon-unlock; see `cli.ts:588-593`). The hub
+ * (created on first fortress-unlock; see `cli.ts:588-593`). The hub
  * registry and L1 identities track different concerns and stay
  * decoupled in this hotfix.
  */

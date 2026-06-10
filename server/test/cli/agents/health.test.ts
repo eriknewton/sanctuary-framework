@@ -18,7 +18,7 @@ function baseTenant(
     storage_path: "/tmp/unused",
     exists: true,
     initialized: true,
-    has_cocoon_profile: false,
+    has_profile: false,
     keychain_service: "sanctuary-passphrase-aaaaaaaaaaaaaaaa",
     passphrase_status: "keychain",
     last_activity: null,

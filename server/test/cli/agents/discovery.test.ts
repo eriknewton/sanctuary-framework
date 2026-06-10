@@ -22,7 +22,7 @@ async function makeTenantLayout(
   name: string,
   opts: {
     withState?: boolean;
-    withCocoonProfile?: boolean;
+    withProfile?: boolean;
     withFallback?: boolean;
     auditFiles?: string[];
   } = {}
@@ -33,7 +33,7 @@ async function makeTenantLayout(
     await mkdir(join(dir, "state"), { recursive: true });
     await mkdir(join(dir, "state", "_identities"), { recursive: true });
   }
-  if (opts.withCocoonProfile) {
+  if (opts.withProfile) {
     await writeFile(
       join(dir, "cocoon-profile.json"),
       JSON.stringify({ version: 1 })
@@ -79,7 +79,7 @@ describe("cli/agents/discovery", () => {
   });
 
   it("detects named sub-directory tenants", async () => {
-    await makeTenantLayout(tmpRoot, "nsa", { withState: true, withCocoonProfile: true });
+    await makeTenantLayout(tmpRoot, "nsa", { withState: true, withProfile: true });
     await makeTenantLayout(tmpRoot, "standards", { withState: true });
     const tenants = await discoverTenants({ home, env: {} });
     expect(tenants.map((t) => t.name).sort()).toEqual(["nsa", "standards"]);
@@ -104,10 +104,10 @@ describe("cli/agents/discovery", () => {
     expect(tenants.map((t) => t.name)).toEqual(["default"]);
   });
 
-  it("marks passphrase status keychain when only cocoon-profile exists", async () => {
+  it("marks passphrase status keychain when only the profile file exists", async () => {
     await makeTenantLayout(tmpRoot, "ck", {
       withState: true,
-      withCocoonProfile: true,
+      withProfile: true,
     });
     const tenants = await discoverTenants({ home, env: {} });
     expect(tenants[0]!.passphrase_status).toBe("keychain");

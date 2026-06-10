@@ -3,10 +3,10 @@
  *
  * Closes the audit-log continuity gap left by `sanctuary reset-passphrase
  * --nuke`. The reset path destroys the encrypted audit log along with the
- * rest of the cocoon, then writes a plaintext `<storagePath>/.reset-history.log`
+ * rest of the fortress state, then writes a plaintext `<storagePath>/.reset-history.log`
  * marker (NDJSON, append-only, one JSON object per reset) before exiting.
  *
- * On the next boot of the cocoon (whether the MCP server in `index.ts` or
+ * On the next boot of the fortress (whether the MCP server in `index.ts` or
  * the standalone dashboard), this module:
  *
  *   1. Reads the marker file if present.
@@ -21,7 +21,7 @@
  *      no-ops.
  *
  * The marker is unsigned plaintext by construction — `reset-passphrase
- * --nuke` runs BEFORE the new cocoon exists, so there is no key to sign
+ * --nuke` runs BEFORE the new fortress exists, so there is no key to sign
  * with. The continuity property therefore comes from the marker hash
  * being committed to the (encrypted) audit log under the new fortress's
  * master key, not from per-entry signatures.
@@ -36,7 +36,7 @@ import { hashToString } from "../core/hashing.js";
 import { stringToBytes } from "../core/encoding.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 
-/** Filename of the reset-history marker, sibling to the cocoon storage path. */
+/** Filename of the reset-history marker, sibling to the fortress storage path. */
 export const RESET_HISTORY_FILENAME = ".reset-history.log";
 
 /** Audit-log operation name used for recovered-from-reset entries. */
@@ -75,7 +75,7 @@ export interface ConsumeResult {
 }
 
 /**
- * Thrown when `.reset-history.log` exists but cannot be parsed. The cocoon
+ * Thrown when `.reset-history.log` exists but cannot be parsed. The fortress
  * boot path catches this and surfaces a clear remediation message rather
  * than silently swallowing the parse failure.
  */
@@ -208,7 +208,7 @@ function typed(
 
 export interface ConsumeOptions {
   /**
-   * Cocoon storage root (sibling of the `state/` directory). The marker
+   * Fortress storage root (sibling of the `state/` directory). The marker
    * lives at `<storagePath>/.reset-history.log` per `reset-passphrase.ts`.
    */
   storagePath: string;
@@ -226,7 +226,7 @@ export interface ConsumeOptions {
  * single-file (one boot path consumes it; subsequent boots find no file).
  *
  * Throws {@link ResetHistoryMalformedError} on parse failure. Callers
- * should refuse to continue cocoon boot in that case rather than silently
+ * should refuse to continue fortress boot in that case rather than silently
  * skip the entry.
  */
 export async function consumeResetHistoryMarker(

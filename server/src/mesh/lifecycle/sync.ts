@@ -8,9 +8,9 @@
  * into its router.
  *
  * Q6 agent-state-transfer reuses the same request/response pair with
- * `kind: "agent_state_transfer"`. The snapshot is opaque cocoon-format bytes,
+ * `kind: "agent_state_transfer"`. The snapshot is opaque fortress-store-format bytes,
  * encrypted under an HKDF-derived key (same chain shape as the per-node
- * transport key, distinct info string). This composes with the cocoon
+ * transport key, distinct info string). This composes with the existing
  * snapshot format without schema change because the snapshot stays opaque
  * to federation.
  */
@@ -123,8 +123,8 @@ export function deriveAgentStateTransferKey(params: {
 }
 
 /**
- * Wrap a cocoon snapshot for migration. The snapshot bytes are opaque to
- * federation — produced by the cocoon's existing snapshot format (no schema
+ * Wrap a fortress-store snapshot for migration. The snapshot bytes are opaque to
+ * federation — produced by the store's existing snapshot format (no schema
  * change required for Q6).
  */
 export function wrapAgentSnapshot(params: {

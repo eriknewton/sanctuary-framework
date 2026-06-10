@@ -12,11 +12,11 @@
  *   (b) Guardian quorum   — initiate a federation v0.1
  *                           `guardian_recovery_request` and wait for the
  *                           configured guardian threshold. Requires an
- *                           unlocked local cocoon to talk to the federation,
+ *                           unlocked local fortress to talk to the federation,
  *                           which the lost-passphrase scenario does not have.
  *                           Path ships with v1.1 federation full mesh.
  *
- *   (c) Nuke and rebind   — destroy the cocoon entirely and re-initialize.
+ *   (c) Nuke and rebind   — destroy the fortress entirely and re-initialize.
  *                           ALL state (identities, broker tokens, audit log,
  *                           federation membership) is permanently lost. The
  *                           operator types the fortress name and the literal
@@ -27,8 +27,8 @@
  * a stale runtime file can remove it manually after confirming nothing is
  * running.
  *
- * Multi-principal note: v1.0.x cocoons are single-principal. When a future
- * v1.x ships multi-principal cocoons (Federation Protocol §10 reservation,
+ * Multi-principal note: v1.0.x fortresses are single-principal. When a future
+ * v1.x ships multi-principal fortresses (Federation Protocol §10 reservation,
  * Architecture Walk Q4), this command MUST branch on principal selection so a
  * single principal's lost passphrase does not silently nuke the whole
  * fortress. The hook point is `selectMode()` below; the survey logic at
@@ -251,9 +251,9 @@ Recover a fortress whose passphrase has been lost or corrupted. Three modes:
 
   guardian   Initiate a guardian-quorum recovery via the federation. Ships
              with v1.1 federation full mesh; not operational on a single
-             unreachable local cocoon today.
+             unreachable local fortress today.
 
-  nuke       Destroy the cocoon entirely and re-initialize. ALL identities,
+  nuke       Destroy the fortress entirely and re-initialize. ALL identities,
              broker tokens, audit log entries, and federation membership are
              permanently lost. Operator types the fortress name and the
              literal word DESTROY before the wipe runs. Use this only when

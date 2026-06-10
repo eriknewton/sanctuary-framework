@@ -23,8 +23,8 @@
  * Common code paths that reach disclosure:
  *   - server/src/index.ts (MCP server stdio first-run, recovery key)
  *   - server/src/dashboard-standalone.ts (standalone dashboard first-run, recovery key)
- *   - server/src/cocoon/init.ts (sanctuary init subcommand, recovery key)
- *   - server/src/cocoon/cli.ts (sanctuary wrap, generated passphrase only)
+ *   - server/src/wrap/init.ts (sanctuary init subcommand, recovery key)
+ *   - server/src/wrap/cli.ts (sanctuary wrap, generated passphrase only)
  */
 
 import { writeFile, access, constants, mkdir } from "node:fs/promises";
@@ -84,7 +84,7 @@ const RECOVERY_KEY_COPY: SecretDisclosureCopy = {
     "subsequent runs and will NOT display the key again. After moving this file off\n" +
     "the host (encrypted backup, password manager, paper safe), delete it from the\n" +
     "fortress directory. Do NOT keep it in the fortress; the recovery key bypasses\n" +
-    "the cocoon passphrase by design.\n",
+    "the fortress passphrase by design.\n",
   promptLabel: "recovery key",
 };
 

@@ -25,7 +25,7 @@ import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { AuditLog } from "../../src/l2-operational/audit-log.js";
 
 /**
- * Mirrors the identity bootstrap block in cocoon/cli.ts (both the
+ * Mirrors the identity bootstrap block in wrap/cli.ts (both the
  * dashboard path and the --no-dashboard path). Exercises the same
  * sequence: IdentityManager.load() → check loaded === 0 → createIdentity
  * → save → audit append.

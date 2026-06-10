@@ -3,7 +3,7 @@
  *
  * Each agent gets its own Ed25519 keypair at launch, generated fresh with 256
  * bits of independent entropy (HKDF is NOT used for asymmetric-key material
- * — see mesh/lifecycle/cocoon-binding.ts for the same reasoning).
+ * — see mesh/lifecycle/node-key-binding.ts for the same reasoning).
  *
  * The agent's private key is wrapped at rest under a per-agent wrapping key
  * derived from the fortress-master secret via HKDF. On guardian recovery the

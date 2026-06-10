@@ -1,68 +1,68 @@
 /**
- * Cocoon CLI Tests
+ * Wrap CLI argument tests
  *
- * Verifies the CLI argument parser and the Cocoon profile generation.
+ * Verifies the CLI argument parser and the wrap profile generation.
  */
 
 import { describe, it, expect } from "vitest";
-import { parseCocoonArgs, COCOON_GOVERNOR_DEFAULTS } from "../../src/wrap/cli.js";
+import { parseWrapArgs, WRAP_GOVERNOR_DEFAULTS } from "../../src/wrap/cli.js";
 
-describe("Cocoon CLI", () => {
+describe("Wrap CLI", () => {
   // ── Argument parser ─────────────────────────────────────────────
 
-  describe("parseCocoonArgs", () => {
+  describe("parseWrapArgs", () => {
     it("parses --openclaw flag", () => {
-      const opts = parseCocoonArgs(["--openclaw"]);
+      const opts = parseWrapArgs(["--openclaw"]);
       expect(opts.openclaw).toBe(true);
     });
 
     it("parses --claude-code flag", () => {
-      const opts = parseCocoonArgs(["--claude-code"]);
+      const opts = parseWrapArgs(["--claude-code"]);
       expect(opts.claudeCode).toBe(true);
     });
 
     it("parses --cursor flag", () => {
-      const opts = parseCocoonArgs(["--cursor"]);
+      const opts = parseWrapArgs(["--cursor"]);
       expect(opts.cursor).toBe(true);
     });
 
     it("parses --cline flag", () => {
-      const opts = parseCocoonArgs(["--cline"]);
+      const opts = parseWrapArgs(["--cline"]);
       expect(opts.cline).toBe(true);
     });
 
     it("parses --wrap with path", () => {
-      const opts = parseCocoonArgs(["--wrap", "/path/to/config.json"]);
+      const opts = parseWrapArgs(["--wrap", "/path/to/config.json"]);
       expect(opts.wrap).toBe("/path/to/config.json");
     });
 
     it("parses --unwrap flag", () => {
-      const opts = parseCocoonArgs(["--unwrap"]);
+      const opts = parseWrapArgs(["--unwrap"]);
       expect(opts.unwrap).toBe(true);
     });
 
     it("parses --passphrase with value", () => {
-      const opts = parseCocoonArgs(["--passphrase", "my-secret"]);
+      const opts = parseWrapArgs(["--passphrase", "my-secret"]);
       expect(opts.passphrase).toBe("my-secret");
     });
 
     it("parses --port with value", () => {
-      const opts = parseCocoonArgs(["--port", "8080"]);
+      const opts = parseWrapArgs(["--port", "8080"]);
       expect(opts.port).toBe(8080);
     });
 
     it("parses --dry-run flag", () => {
-      const opts = parseCocoonArgs(["--dry-run"]);
+      const opts = parseWrapArgs(["--dry-run"]);
       expect(opts.dryRun).toBe(true);
     });
 
     it("parses --dev-dist with path (dogfood path)", () => {
-      const opts = parseCocoonArgs(["--dev-dist", "/abs/path/to/dist/cli.js"]);
+      const opts = parseWrapArgs(["--dev-dist", "/abs/path/to/dist/cli.js"]);
       expect(opts.devDist).toBe("/abs/path/to/dist/cli.js");
     });
 
     it("parses combined flags", () => {
-      const opts = parseCocoonArgs([
+      const opts = parseWrapArgs([
         "--openclaw",
         "--passphrase", "secret",
         "--port", "9000",
@@ -75,7 +75,7 @@ describe("Cocoon CLI", () => {
     });
 
     it("returns empty options for no arguments", () => {
-      const opts = parseCocoonArgs([]);
+      const opts = parseWrapArgs([]);
       expect(opts.openclaw).toBeUndefined();
       expect(opts.unwrap).toBeUndefined();
       expect(opts.wrap).toBeUndefined();
@@ -86,9 +86,9 @@ describe("Cocoon CLI", () => {
 
   describe("governor defaults", () => {
     it("has sensible rate limits", () => {
-      expect(COCOON_GOVERNOR_DEFAULTS.volume_limit).toBe(200);
-      expect(COCOON_GOVERNOR_DEFAULTS.rate_limit_per_tool).toBe(20);
-      expect(COCOON_GOVERNOR_DEFAULTS.lifetime_limit).toBe(1000);
+      expect(WRAP_GOVERNOR_DEFAULTS.volume_limit).toBe(200);
+      expect(WRAP_GOVERNOR_DEFAULTS.rate_limit_per_tool).toBe(20);
+      expect(WRAP_GOVERNOR_DEFAULTS.lifetime_limit).toBe(1000);
     });
   });
 });

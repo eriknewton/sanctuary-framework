@@ -9,7 +9,7 @@
  *   - AuditBuffer + (optional) CanonicalAuditLog (canonical-audit-node duties)
  *   - PolicyBundleStore + LocatorTableStore + NodeLifecycleEventLog (replicated state)
  *   - JoinApprover (operator approval gate wrapping)
- *   - NodeKeyStore (Q8 cocoon binding)
+ *   - NodeKeyStore (Q8 node-key binding)
  *
  * Wire-format and crypto live in mesh primitives (server/src/mesh/*); the
  * MeshNode is pure orchestration on top.
@@ -78,7 +78,7 @@ import { issueCertificateForApprovedJoin } from "./join-approver.js";
 import {
   unwrapNodePrivateKey,
   wrapNodePrivateKey,
-} from "./cocoon-binding.js";
+} from "./node-key-binding.js";
 import {
   LocatorTableStore,
   NodeLifecycleEventLog,
@@ -108,13 +108,13 @@ import type { MeshNodeState } from "./constants.js";
 /**
  * Bootstrap result for the very first node in a fortress (§3.7).
  *
- * Returns the assets the operator's cocoon must persist:
+ * Returns the assets the operator's encrypted state store must persist:
  *   - fortress-master-public-key (pinned by every future node)
  *   - root principal certificate
  *   - per-node certificate for this self-bootstrapped node
  *
  * The fortress-master PRIVATE key is also returned so the caller (the
- * orchestrating console) can hand it directly to the operator's cocoon for
+ * orchestrating console) can hand it directly to the operator's encrypted state store for
  * passphrase-wrapped persistence. After persisting, the caller MUST zero
  * this buffer.
  */
@@ -253,7 +253,7 @@ export class MeshNode {
    * in subsequent operation; v0.1 default per §5.2).
    *
    * The returned `FirstNodeBootstrap` carries the secrets that callers MUST
-   * persist into the cocoon (master + root principal) and zero from memory
+   * persist into the encrypted state store (master + root principal) and zero from memory
    * after persistence.
    */
   static async bootstrapFirstNode(params: {

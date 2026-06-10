@@ -2,7 +2,7 @@
  * Config Reader Tests
  *
  * Verifies agent config detection, parsing, backup, and restore
- * for the Cocoon CLI wrapper.
+ * for the wrap CLI.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -14,9 +14,9 @@ import {
   detectAgentConfigWithDiagnostics,
   backupConfig,
   restoreConfig,
-  saveCocoonMeta,
+  saveWrapMeta,
   findLatestBackup,
-  rewriteConfigForCocoon,
+  rewriteConfigForWrap,
 } from "../../src/wrap/config-reader.js";
 import { detectHarnessSchema } from "../../src/wrap/harness-schema.js";
 
@@ -329,7 +329,7 @@ describe("Config Reader", () => {
 
   // ── Config rewrite ──────────────────────────────────────────────
 
-  describe("rewriteConfigForCocoon", () => {
+  describe("rewriteConfigForWrap", () => {
     it("preserves existing servers in OpenClaw format", async () => {
       const configPath = join(tmpDir, "openclaw.json");
       const original = {
@@ -352,7 +352,7 @@ describe("Config Reader", () => {
       const agentConfig = await detectAgentConfig("openclaw", configPath);
       expect(agentConfig).not.toBeNull();
 
-      await rewriteConfigForCocoon(
+      await rewriteConfigForWrap(
         agentConfig!,
         "npx",
         ["@sanctuary-framework/mcp-server"],
@@ -388,7 +388,7 @@ describe("Config Reader", () => {
       expect(agentConfig).not.toBeNull();
       expect(agentConfig!.platform).toBe("openclaw");
 
-      await rewriteConfigForCocoon(
+      await rewriteConfigForWrap(
         agentConfig!,
         "npx",
         ["@sanctuary-framework/mcp-server"],
@@ -421,7 +421,7 @@ describe("Config Reader", () => {
       const agentConfig = await detectAgentConfig(undefined, configPath);
       expect(agentConfig).not.toBeNull();
 
-      await rewriteConfigForCocoon(
+      await rewriteConfigForWrap(
         agentConfig!,
         "npx",
         ["@sanctuary-framework/mcp-server"],
@@ -444,7 +444,7 @@ describe("Config Reader", () => {
       expect(agentConfig).not.toBeNull();
       expect(agentConfig!.platform).toBe("generic");
 
-      await rewriteConfigForCocoon(
+      await rewriteConfigForWrap(
         agentConfig!,
         "npx",
         ["@sanctuary-framework/mcp-server"],
@@ -472,7 +472,7 @@ describe("Config Reader", () => {
       const agentConfig = await detectAgentConfig("claude-code", configPath);
       expect(agentConfig).not.toBeNull();
 
-      await rewriteConfigForCocoon(agentConfig!, "npx", ["@sanctuary-framework/mcp-server"]);
+      await rewriteConfigForWrap(agentConfig!, "npx", ["@sanctuary-framework/mcp-server"]);
 
       const rewritten = JSON.parse(await readFile(configPath, "utf-8"));
 
@@ -512,7 +512,7 @@ describe("Config Reader", () => {
       expect(agentConfig).not.toBeNull();
 
       // Call WITHOUT sanctuaryEnv — should inherit from existing config
-      await rewriteConfigForCocoon(
+      await rewriteConfigForWrap(
         agentConfig!,
         "npx",
         ["@sanctuary-framework/mcp-server", "--passphrase", "my-secret"]
@@ -556,7 +556,7 @@ describe("Config Reader", () => {
       const agentConfig = await detectAgentConfig("openclaw", configPath);
 
       // Call WITH explicit sanctuaryEnv — should override, not inherit
-      await rewriteConfigForCocoon(
+      await rewriteConfigForWrap(
         agentConfig!,
         "npx",
         ["@sanctuary-framework/mcp-server"],
@@ -590,7 +590,7 @@ describe("Config Reader", () => {
       const agentConfig = await detectAgentConfig("hermes", configPath);
       expect(agentConfig).not.toBeNull();
 
-      await rewriteConfigForCocoon(
+      await rewriteConfigForWrap(
         agentConfig!,
         "npx",
         ["@sanctuary-framework/mcp-server"],
@@ -648,7 +648,7 @@ describe("Config Reader", () => {
       expect(firstRead!.servers).toHaveLength(1);
       expect(firstRead!.servers[0]!.name).toBe("filesystem");
 
-      await rewriteConfigForCocoon(
+      await rewriteConfigForWrap(
         firstRead!,
         "npx",
         ["@sanctuary-framework/mcp-server"],
@@ -668,7 +668,7 @@ describe("Config Reader", () => {
 
       // Second rewrite — idempotent re-wrap keeps the shape stable.
       const secondRead = await detectAgentConfig("cline", configPath);
-      await rewriteConfigForCocoon(
+      await rewriteConfigForWrap(
         secondRead!,
         "npx",
         ["@sanctuary-framework/mcp-server"],
@@ -696,7 +696,7 @@ describe("Config Reader", () => {
       await writeFile(configPath, JSON.stringify(original));
 
       const agentConfig = await detectAgentConfig("openclaw", configPath);
-      await rewriteConfigForCocoon(agentConfig!, "npx", ["@sanctuary-framework/mcp-server"]);
+      await rewriteConfigForWrap(agentConfig!, "npx", ["@sanctuary-framework/mcp-server"]);
 
       const rewritten = JSON.parse(await readFile(configPath, "utf-8"));
 
@@ -710,12 +710,12 @@ describe("Config Reader", () => {
     });
   });
 
-  // ── Cocoon metadata ─────────────────────────────────────────────
+  // ── Wrap metadata ─────────────────────────────────────────────
 
-  describe("cocoon metadata", () => {
+  describe("wrap metadata", () => {
     it("saves and finds latest backup metadata", async () => {
-      // Save cocoon meta to the global backup dir
-      await saveCocoonMeta({
+      // Save wrap meta to the global backup dir
+      await saveWrapMeta({
         backupPath: "/tmp/test-backup.json",
         originalPath: "/tmp/test-original.json",
         platform: "openclaw",

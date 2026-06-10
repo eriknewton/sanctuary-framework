@@ -329,7 +329,7 @@ export async function createSanctuaryServer(options?: {
     if (err instanceof ResetHistoryMalformedError) {
       throw new Error(
         `Sanctuary: ${err.message}\n` +
-          `Refusing to start the cocoon while the reset-history marker is unreadable.`
+          `Refusing to start the fortress while the reset-history marker is unreadable.`
       );
     }
     throw err;
@@ -1300,7 +1300,7 @@ export async function createSanctuaryServer(options?: {
           auditLog,
           clientManager,
         });
-        // Enable Fortress View (Cocoon mode) when upstream servers are configured
+        // Enable Fortress View (proxy mode) when upstream servers are configured
         dashboard.enableFortressView(enabledServers.length);
       }
     }

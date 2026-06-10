@@ -4,7 +4,7 @@
  * Fortress-master → principal-cert → per-node-cert chain.
  *
  * Key responsibilities:
- * - Generate fortress-master keypair at bootstrap (private key lives only in the cocoon,
+ * - Generate fortress-master keypair at bootstrap (private key lives only in the encrypted state store,
  *   never returned from this module's public surface).
  * - Issue principal certificates signed by fortress-master.
  * - Issue per-node certificates signed by the operator's principal (optionally also
@@ -56,7 +56,7 @@ import type {
  * Generate a new fortress-master keypair at first-fortress bootstrap.
  *
  * The returned private key is the ONLY time this module yields the master's
- * secret material. Callers MUST immediately store it in the operator's cocoon
+ * secret material. Callers MUST immediately store it in the operator's encrypted state store
  * (encrypted under the unified passphrase) and discard the plaintext.
  *
  * Spec: §2.1, §3.7.

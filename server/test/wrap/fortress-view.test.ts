@@ -1,7 +1,7 @@
 /**
  * Fortress View Tests
  *
- * Verifies the Fortress View HTML generation for the Cocoon dashboard.
+ * Verifies the Fortress View HTML generation for the wrap dashboard.
  */
 
 import { describe, it, expect } from "vitest";

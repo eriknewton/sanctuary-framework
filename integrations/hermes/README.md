@@ -8,7 +8,7 @@ Hermes Agent has native MCP support - Sanctuary's 67+ MCP tools work seamlessly 
 
 What you get: encrypted state (L1), process isolation with Sanctuary attestation (L2), selective disclosure (L3), and verifiable reputation (L4) - plus Hermes's native features like memory encryption, subagent sandboxing, and automated sovereignty audits on a cron schedule.
 
-**New in v0.5.16:** Cocoon mode turns Sanctuary into an MCP proxy that wraps all upstream MCP servers through an enforcement chain (injection scan → gate → context gate → governor → forward → audit). Hermes agents can route all their MCP traffic through Sanctuary for runtime governance without changing any upstream server configs.
+**New in v0.5.16:** Proxy mode turns Sanctuary into an MCP proxy that wraps all upstream MCP servers through an enforcement chain (injection scan → gate → context gate → governor → forward → audit). Hermes agents can route all their MCP traffic through Sanctuary for runtime governance without changing any upstream server configs.
 
 ## Quick Start
 
@@ -63,9 +63,9 @@ hermes run hermes_config.yaml
 
 Your agent now has full Sanctuary integration. All 67+ tools are available as native Hermes capabilities.
 
-## Cocoon Mode - MCP Proxy for Runtime Governance
+## Proxy Mode - MCP Proxy for Runtime Governance
 
-Cocoon mode is Sanctuary's MCP proxy. Instead of each Hermes agent connecting directly to upstream MCP servers, Sanctuary sits in front and enforces security on every tool call.
+Proxy mode is Sanctuary's MCP proxy. Instead of each Hermes agent connecting directly to upstream MCP servers, Sanctuary sits in front and enforces security on every tool call.
 
 ### How it works
 
@@ -86,7 +86,7 @@ Hermes Agent
 
 ```yaml
 agent:
-  name: "Cocoon-Protected Agent"
+  name: "Sanctuary-Protected Agent"
   model: "openai:gpt-4"
 
 mcps:
@@ -135,7 +135,7 @@ every call passes through Sanctuary's enforcement chain.
 """
 ```
 
-### What Cocoon protects against
+### What the proxy protects against
 
 - **Prompt injection via MCP responses:** Unicode invisible characters, homoglyph attacks, base64-encoded payloads, and token budget attacks are stripped before responses reach the agent
 - **Secret exfiltration:** Outbound content is scanned for 20+ secret patterns (API keys, tokens, connection strings), markdown exfiltration attempts, and internal path/IP leaks
@@ -494,7 +494,7 @@ All Sanctuary tools are exposed as Hermes capabilities. Key categories:
 
 **Handshake & Federation:** `handshake_initiate`, `handshake_respond`, `handshake_complete`, `handshake_status`, `federation_peers`, `federation_trust_evaluate`, `federation_status`
 
-**Cocoon (MCP Proxy):** `proxy_register_upstream`, `proxy_discover_tools`, `proxy/{server}/{tool}` (dynamic)
+**MCP Proxy:** `proxy_register_upstream`, `proxy_discover_tools`, `proxy/{server}/{tool}` (dynamic)
 
 **Runtime Governance:** `governor_status`, `governor_reset`
 

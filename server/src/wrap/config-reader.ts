@@ -1,5 +1,5 @@
 /**
- * Sanctuary Cocoon — Agent Config Reader
+ * Sanctuary Wrap — Agent Config Reader
  *
  * Detects and reads MCP server configurations from various agent platforms.
  * Supports: OpenClaw, Claude Code, Cursor, Cline, and generic MCP config files.
@@ -56,7 +56,7 @@ export interface AgentConfig {
 // Computed lazily from the current homedir() on every call so sandboxed /
 // multi-tenant callers that reassign `process.env.HOME` at runtime get the
 // paths rooted at their current HOME. Matches the pattern of
-// `resolveStoragePath()` already used elsewhere in the cocoon surface.
+// `resolveStoragePath()` already used elsewhere in the wrap surface.
 export function getPlatformPaths(): Record<AgentPlatform, string[]> {
   const home = homedir();
   return {
@@ -181,6 +181,9 @@ export async function restoreConfig(backupPath: string, targetPath: string): Pro
  * Find the most recent backup.
  */
 export async function findLatestBackup(): Promise<{ backupPath: string; originalPath: string } | null> {
+  // Filename is frozen for compatibility: unwrap of agents wrapped by earlier
+  // releases reads this exact on-disk name. Vocabulary-sweep exempt; do not
+  // rename without a read-both migration.
   const metaPath = join(backupDir(), "cocoon-meta.json");
   try {
     const raw = await readFile(metaPath, "utf-8");
@@ -195,9 +198,9 @@ export async function findLatestBackup(): Promise<{ backupPath: string; original
 }
 
 /**
- * Save cocoon metadata (original config path, backup path) for unwrap.
+ * Save wrap metadata (original config path, backup path) for unwrap.
  */
-export async function saveCocoonMeta(meta: {
+export async function saveWrapMeta(meta: {
   backupPath: string;
   originalPath: string;
   platform: AgentPlatform;
@@ -205,6 +208,7 @@ export async function saveCocoonMeta(meta: {
 }): Promise<void> {
   const dir = backupDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
+  // Frozen legacy filename; see findLatestBackup() above.
   const metaPath = join(dir, "cocoon-meta.json");
   await writeFile(metaPath, JSON.stringify(meta, null, 2), { mode: 0o600 });
 }
@@ -492,7 +496,7 @@ export interface AuxiliaryMcpServerEntry {
  * Each sibling is merged into the platform-specific MCP map; user-named
  * siblings already present in the config are preserved unchanged.
  */
-export async function rewriteConfigForCocoon(
+export async function rewriteConfigForWrap(
   agentConfig: AgentConfig,
   sanctuaryCommand: string,
   sanctuaryArgs: string[],

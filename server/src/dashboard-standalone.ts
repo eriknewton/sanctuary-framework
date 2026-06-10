@@ -380,7 +380,7 @@ export async function startStandaloneDashboard(
 
   // 5a. Reset-history continuity (v1.0.2 item a). Same one-shot marker
   // consumption as the MCP server boot path (server/src/index.ts) so the
-  // first cocoon-unlock after `reset-passphrase --nuke` records continuity
+  // first fortress-unlock after `reset-passphrase --nuke` records continuity
   // regardless of whether that unlock is the MCP server or the standalone
   // dashboard.
   try {
@@ -590,8 +590,8 @@ export async function startStandaloneDashboard(
   console.error(`Identities loaded: ${loadResult.loaded}`);
   // v1.1.5 (Finding Z): surface the v1.1 hub-layer agent count alongside
   // the L1 identity count. The two layers describe different concerns:
-  // L1 identities are cocoon-derived Ed25519 keys created lazily on
-  // first cocoon-unlock; the hub agent registry tracks what `sanctuary
+  // L1 identities are master-key-derived Ed25519 keys created lazily on
+  // first fortress-unlock; the hub agent registry tracks what `sanctuary
   // wrap` has registered. Both lines are valid; reading 0 on either is
   // not a failure mode, just a state of the fortress at boot.
   const persistedAgentsCount = readPersistedLocalAgents(

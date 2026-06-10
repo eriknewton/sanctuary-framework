@@ -745,7 +745,7 @@ run_iteration "iter1-env" 1 0
 # framework lookup of login.keychain-db. The case-3 wrap then triggers a
 # "Keychain Not Found" system dialog when Sanctuary tries to store the generated
 # passphrase, stalling wrap past the 30s URL-print window. Server-side unit
-# tests at server/test/cocoon/passphrase-disclosure*.test.ts cover the case-3
+# tests at server/test/wrap/passphrase-disclosure*.test.ts cover the case-3
 # disclosure path; smoke-side coverage requires either real-HOME (with iteration
 # isolation rebuilt at the keychain-entry level) or a temp keychain provisioned
 # inside iter_home/Library/Keychains and added to the search list. Filed as

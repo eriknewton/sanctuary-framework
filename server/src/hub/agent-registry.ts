@@ -7,7 +7,7 @@
  * lockdown / policy-bind callers can mutate.
  *
  * Persistence is intentionally out of scope here; v1.1 wraps persist their
- * own cocoon-bound state; this registry is the live read-side projection
+ * own fortress-bound state; this registry is the live read-side projection
  * the hub serves to the dashboard. Persistent re-hydration is a v1.x
  * follow-up.
  *

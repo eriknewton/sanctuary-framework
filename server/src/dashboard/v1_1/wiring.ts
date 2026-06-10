@@ -280,7 +280,7 @@ export function buildV11Bindings(
     // WP-V1.3-9 Tau-1: foundation memory store. Constructed alongside
     // the existing single-thread store; sendConcierge dual-writes into
     // both. Tau-2 wires the read-side context-fold into the substrate
-    // selector. pruneExpired fires once at construction so the cocoon-
+    // selector. pruneExpired fires once at construction so the fortress-
     // unlock cycle drops expired turns before any operator interaction.
     const conciergeMemory = new ConciergeMemoryStore({
       storage: inputs.storage,
@@ -291,7 +291,7 @@ export function buildV11Bindings(
         : {}),
     });
     void conciergeMemory.pruneExpired().catch(() => {
-      // Pruning is best-effort on cocoon-unlock; a transient storage
+      // Pruning is best-effort on fortress-unlock; a transient storage
       // hiccup should not block hub construction. The next unlock
       // re-runs the prune.
     });

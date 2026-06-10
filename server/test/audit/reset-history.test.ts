@@ -2,7 +2,7 @@
  * Reset-history continuity (v1.0.2 item a) — parser + consumer tests.
  *
  * Covers the gap closed by appending `fortress_recovered_from_reset`
- * audit entries on the first cocoon-unlock after `reset-passphrase --nuke`
+ * audit entries on the first fortress-unlock after `reset-passphrase --nuke`
  * leaves a `.reset-history.log` marker. See server/src/audit/reset-history.ts.
  */
 
@@ -205,7 +205,7 @@ describe("consumeResetHistoryMarker", () => {
     expect(fortressNames).toEqual(["first", "second"]);
   });
 
-  it("re-running on a cocoon with no marker is idempotent and does not duplicate entries", async () => {
+  it("re-running on a fortress with no marker is idempotent and does not duplicate entries", async () => {
     const markerPath = join(storageRoot, RESET_HISTORY_FILENAME);
     writeFileSync(markerPath, makeMarkerLine(), { mode: 0o600 });
 

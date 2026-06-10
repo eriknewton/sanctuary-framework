@@ -1,5 +1,5 @@
 /**
- * Per-node cocoon binding (Q8).
+ * Per-node key binding (Q8).
  *
  * Wraps a per-node Ed25519 private key under AES-256-GCM. The wrapping key is
  * HKDF-derived from the fortress-master secret with the lifecycle-specific
@@ -8,7 +8,7 @@
  * re-derives the wrapping key, decrypts, holds the per-node private key in
  * memory only, and the master secret can be zeroed.
  *
- * Why this is NOT a cocoon-schema change: the master cocoon stores the
+ * Why this is NOT a store-schema change: the encrypted state store holds the
  * fortress-master secret under the operator's unified passphrase exactly as
  * today. The wrapped per-node key lives alongside the node certificate as a
  * separate at-rest artifact owned by the lifecycle orchestrator. Two distinct

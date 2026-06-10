@@ -4,7 +4,7 @@
  * Per-fortress dispatcher that drives the anomaly detector tick:
  *   1. For every registered detector, call evaluate() to extract +
  *      observe + predict.
- *   2. Persist updated classifier state via train() (cocoon-unlock
+ *   2. Persist updated classifier state via train() (fortress-unlock
  *      cadence; same shape as Phi-1 sentinel dispatcher).
  *   3. Each above-threshold finding routes to:
  *      - the existing SentinelFindingStore (Phi-1 surface) so the

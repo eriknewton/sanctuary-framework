@@ -16,7 +16,7 @@
  *   - rejoin-after-offline
  *   - sync-pulls-policy-and-locator-and-audit
  * Plus:
- *   - Q8 cocoon binding wrap/unwrap roundtrip + AAD substitution rejection
+ *   - Q8 node-key binding wrap/unwrap roundtrip + AAD substitution rejection
  *   - Q6 agent-state-transfer wrap/unwrap roundtrip + tuple-substitution rejection
  *   - per-node monotonic counter strict-advance guarantee
  *   - bootstrap-token TTL + signature gate
@@ -226,10 +226,10 @@ function revokeQuorumInput(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Q8 — per-node cocoon binding
+// Q8 — per-node key binding
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("lifecycle/cocoon-binding (Q8) — at-rest per-node key wrap", () => {
+describe("lifecycle/node-key-binding (Q8) — at-rest per-node key wrap", () => {
   it("HKDF-derives a deterministic 32-byte wrapping key from master + node_id", () => {
     const master = randomBytes(32);
     const k1 = deriveNodeKeyWrappingKey({
@@ -355,9 +355,9 @@ describe("lifecycle/sync (Q6) — agent-state-transfer wrap", () => {
     expect(k1).toHaveLength(32);
   });
 
-  it("wraps and unwraps an opaque cocoon snapshot end-to-end", () => {
+  it("wraps and unwraps an opaque fortress-store snapshot end-to-end", () => {
     const master = randomBytes(32);
-    const snapshot = stringToBytes("cocoon-snapshot-v2-bytes-go-here");
+    const snapshot = stringToBytes("fortress-snapshot-v2-bytes-go-here");
     const params = {
       fortress_master_secret: master,
       source_node_id: "src",

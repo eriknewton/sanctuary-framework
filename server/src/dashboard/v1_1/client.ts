@@ -275,7 +275,7 @@ function arg(args, kind, fallback) {
 const TEMPLATES = {
   "approval_pending.tier1.lockdown": (a) => "Lock down agent " + arg(a,"agent_id") + ". This stops all egress and freezes gates.",
   "approval_pending.tier1.fortress_lockdown": () => "Lockdown approval pending. Approving locks the entire fortress: writes are blocked, reads continue with LOCKED posture signals, active operations may fail, and agent workflows stop until the operator recovers or restarts them.",
-  "approval_pending.tier1.unwrap": (a) => "Unwrap agent " + arg(a,"agent_id") + ". Cocoon and registry binding will be removed.",
+  "approval_pending.tier1.unwrap": (a) => "Unwrap agent " + arg(a,"agent_id") + ". Protection and registry binding will be removed.",
   "approval_pending.tier1.policy_change": (a) => "Bind agent " + arg(a,"agent_id") + " to policy " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.policy_change_template": (a) => "Bind agent " + arg(a,"agent_id") + " to template " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.exit_bundle_export": (a) => "Export the fortress as a portable bundle. Agent: " + arg(a,"agent_id","all agents") + ".",
@@ -304,7 +304,7 @@ const TEMPLATES = {
   "privacy_event.rehydrated": (a) => "Inbound response rehydrated through placeholder vault for agent " + arg(a,"agent_id") + ".",
   "budget_warning.soft_warn": (a) => "Budget soft-warn on agent " + arg(a,"agent_id") + ".",
   "budget_warning.hard_cap": (a) => "Budget hard-cap reached on agent " + arg(a,"agent_id") + ". Operator unblock required.",
-  "recovery_prompt.passphrase_reset": () => "Recommended: rotate the cocoon passphrase.",
+  "recovery_prompt.passphrase_reset": () => "Recommended: rotate the fortress passphrase.",
   "recovery_prompt.keychain_rebind": () => "Recommended: rebind the keychain entry for this fortress.",
   "recovery_prompt.config_backup_restore": () => "Recommended: back up your current configuration.",
   "recovery_prompt.exit_drill": () => "Recommended: run an exit drill so you know recovery works.",
@@ -350,7 +350,7 @@ const REASON_LABELS = {
   budget_hard_cap: "Budget hard-cap reached",
   harness_error: "Harness reported an error",
   harness_unreachable: "Harness is unreachable",
-  passphrase_required: "Cocoon passphrase required",
+  passphrase_required: "Fortress passphrase required",
   config_drift: "Configuration drift detected",
   other: "Other reason. See activity feed."
 };

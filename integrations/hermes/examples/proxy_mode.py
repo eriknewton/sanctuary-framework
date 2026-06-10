@@ -1,7 +1,7 @@
 """
-Cocoon Mode Example — Sanctuary as MCP Proxy for Hermes Agents
+Proxy Mode Example — Sanctuary as MCP Proxy for Hermes Agents
 
-Demonstrates Sanctuary's Cocoon mode where Sanctuary is the sole MCP
+Demonstrates Sanctuary's Proxy mode where Sanctuary is the sole MCP
 connection and proxies all upstream MCP servers through an enforcement chain:
 
   Hermes Agent
@@ -30,7 +30,7 @@ Requirements:
 
 Usage:
     export HERMES_MEMORY_KEY=$(openssl rand -base64 32)
-    python cocoon_mode.py
+    python proxy_mode.py
 """
 
 import os
@@ -46,7 +46,7 @@ except ImportError:
     exit(1)
 
 
-def generate_cocoon_config() -> dict:
+def generate_proxy_config() -> dict:
     """
     Generate a Hermes config where Sanctuary is the ONLY MCP connection.
 
@@ -57,9 +57,9 @@ def generate_cocoon_config() -> dict:
     """
     return {
         "agent": {
-            "name": "Cocoon-Protected Research Agent",
+            "name": "Sanctuary-Protected Research Agent",
             "description": (
-                "A Hermes agent running in Cocoon mode — all MCP traffic "
+                "A Hermes agent running in Proxy mode — all MCP traffic "
                 "is proxied through Sanctuary's enforcement chain for "
                 "injection hardening, rate limiting, and audit logging."
             ),
@@ -79,7 +79,7 @@ def generate_cocoon_config() -> dict:
                     "transport": "stdio",
                     "env": {
                         "SANCTUARY_STORAGE_PATH": str(
-                            Path.home() / ".sanctuary" / "hermes-cocoon"
+                            Path.home() / ".sanctuary" / "hermes-proxy"
                         ),
                     },
                 }
@@ -95,9 +95,9 @@ def generate_cocoon_config() -> dict:
 
             "startup": [
                 {
-                    "name": "cocoon_setup",
-                    "description": "Initialize Cocoon mode with upstream servers",
-                    "prompt": """Set up Cocoon mode — Sanctuary as MCP proxy:
+                    "name": "proxy_setup",
+                    "description": "Initialize Proxy mode with upstream servers",
+                    "prompt": """Set up Proxy mode — Sanctuary as MCP proxy:
 
 1. Create your sovereign identity:
    - Call sanctuary/identity_create for your Ed25519 keypair
@@ -141,13 +141,13 @@ proxied tools discovered, governor state, and audit score.""",
 
 
 async def main():
-    """Run the Cocoon mode demonstration."""
+    """Run the Proxy mode demonstration."""
 
     print("=" * 80)
-    print("COCOON MODE — Sanctuary as MCP Proxy for Hermes Agent")
+    print("PROXY MODE — Sanctuary as MCP Proxy for Hermes Agent")
     print("=" * 80)
     print()
-    print("In Cocoon mode, Sanctuary is the agent's sole MCP connection.")
+    print("In Proxy mode, Sanctuary is the agent's sole MCP connection.")
     print("All upstream MCP servers are proxied through Sanctuary's")
     print("enforcement chain:")
     print()
@@ -158,7 +158,7 @@ async def main():
     print("Sanctuary's own tools.")
     print()
 
-    config_dict = generate_cocoon_config()
+    config_dict = generate_proxy_config()
 
     try:
         agent = HermesAgent.from_config(config_dict)
@@ -169,10 +169,10 @@ async def main():
         print("  export HERMES_MEMORY_KEY=$(openssl rand -base64 32)")
         return
 
-    # ── PHASE 1: COCOON SETUP ────────────────────────────────────────────
+    # ── PHASE 1: PROXY SETUP ────────────────────────────────────────────
 
     print("=" * 80)
-    print("PHASE 1: COCOON SETUP")
+    print("PHASE 1: PROXY SETUP")
     print("=" * 80)
     print()
     print("Creating identity, registering upstream servers, discovering tools...")
@@ -277,7 +277,7 @@ and audit log showing the enforcement chain in action.""",
     governance_task = {
         "name": "governance_report",
         "description": "Generate final governance report",
-        "prompt": """Generate a final governance report for this Cocoon mode session.
+        "prompt": """Generate a final governance report for this Proxy mode session.
 
 1. Call sanctuary/governor_status for comprehensive stats:
    - Total calls made (both Sanctuary native and proxied)
@@ -296,7 +296,7 @@ and audit log showing the enforcement chain in action.""",
    - target_url: "https://verascore.ai/api/publish"
 
 6. Store the governance report in sanctuary/state_write
-   with key 'cocoon_governance_report'.
+   with key 'proxy_governance_report'.
 
 Report:
   - Total proxied calls and their outcomes
@@ -315,10 +315,10 @@ Report:
     # ── SUMMARY ──────────────────────────────────────────────────────────
 
     print("=" * 80)
-    print("COCOON MODE DEMONSTRATION COMPLETE")
+    print("PROXY MODE DEMONSTRATION COMPLETE")
     print("=" * 80)
     print()
-    print("Cocoon mode provided:")
+    print("Proxy mode provided:")
     print("  - Single MCP connection (Sanctuary) proxying all upstream servers")
     print("  - Injection hardening on every proxied response")
     print("  - Outbound secret scanning on every proxied request")
@@ -330,7 +330,7 @@ Report:
     print("No upstream MCP server configurations needed to change.")
     print("Sanctuary sat transparently between the agent and its tools.")
     print()
-    print(f"Storage: {Path.home() / '.sanctuary' / 'hermes-cocoon'}")
+    print(f"Storage: {Path.home() / '.sanctuary' / 'hermes-proxy'}")
     print("Reputation: https://verascore.ai")
     print()
 
