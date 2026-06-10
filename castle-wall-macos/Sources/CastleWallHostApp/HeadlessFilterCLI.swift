@@ -30,6 +30,18 @@ enum HeadlessFilterCLI {
     struct Invocation: Equatable {
         let action: Action
         let timeoutSeconds: Double
+        /// When set, the JSON report is ALSO written here (in addition to
+        /// stdout). `sanctuary castle-wall enable|disable` launches this binary
+        /// through `open` on macOS Tahoe — the only way to reach NE preferences
+        /// there — but `open` does not relay the child's stdout, so the CLI
+        /// reads the report back from this file instead.
+        let reportFilePath: String?
+
+        init(action: Action, timeoutSeconds: Double, reportFilePath: String? = nil) {
+            self.action = action
+            self.timeoutSeconds = timeoutSeconds
+            self.reportFilePath = reportFilePath
+        }
     }
 
     enum ParseResult: Equatable {
@@ -65,6 +77,7 @@ enum HeadlessFilterCLI {
         }
         var action: Action?
         var timeout = defaultTimeoutSeconds
+        var reportFilePath: String?
         for argument in arguments[(flagIndex + 1)...] {
             if argument.hasPrefix("--timeout=") {
                 guard let value = Double(argument.dropFirst("--timeout=".count)),
@@ -72,6 +85,12 @@ enum HeadlessFilterCLI {
                     return .usageError("invalid --timeout value: \(argument)")
                 }
                 timeout = value
+            } else if argument.hasPrefix("--report-file=") {
+                let path = String(argument.dropFirst("--report-file=".count))
+                guard !path.isEmpty else {
+                    return .usageError("invalid --report-file value: \(argument)")
+                }
+                reportFilePath = path
             } else if action == nil, let parsed = Action(rawValue: argument) {
                 action = parsed
             } else {
@@ -80,10 +99,13 @@ enum HeadlessFilterCLI {
         }
         guard let action else {
             return .usageError(
-                "usage: \(headlessFlag) <enable|disable|status> [--timeout=seconds]"
+                "usage: \(headlessFlag) <enable|disable|status> "
+                    + "[--timeout=seconds] [--report-file=path]"
             )
         }
-        return .invocation(Invocation(action: action, timeoutSeconds: timeout))
+        return .invocation(
+            Invocation(action: action, timeoutSeconds: timeout, reportFilePath: reportFilePath)
+        )
     }
 
     static func encode(_ report: Report) -> String {
@@ -96,6 +118,19 @@ enum HeadlessFilterCLI {
         return text
     }
 
+    /// Write the single JSON report line to `path` (0600, the caller-supplied
+    /// temp file the CLI then reads back). Best-effort: a write failure leaves
+    /// the file missing/empty, and the CLI fail-closes to a generic failure
+    /// rather than a false success.
+    static func writeReportFile(_ contents: String, to path: String) {
+        let data = Data((contents + "\n").utf8)
+        FileManager.default.createFile(
+            atPath: path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        )
+    }
+
     static func run(
         _ invocation: Invocation,
         manager: NEFilterManager = .shared(),
@@ -104,7 +139,11 @@ enum HeadlessFilterCLI {
         let action = invocation.action.rawValue
 
         func emit(_ report: Report, _ code: ExitCode) -> ExitCode {
-            output(encode(report))
+            let line = encode(report)
+            output(line)
+            if let path = invocation.reportFilePath {
+                writeReportFile(line, to: path)
+            }
             return code
         }
 

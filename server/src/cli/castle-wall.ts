@@ -1,8 +1,8 @@
 import { execFile as nodeExecFile, execSync as nodeExecSync } from "node:child_process";
 import { createConnection } from "node:net";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { chmod, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
@@ -51,6 +51,22 @@ export interface CastleWallCommandContext {
   hostAppCandidates?: string[];
   /** Override the daemon-socket reachability probe (tests). */
   daemonProbe?: (socketPath: string) => Promise<boolean>;
+  /**
+   * Override the `open` runner used by the DEFAULT LaunchServices invoker
+   * (tests exercise the report-file round-trip without shelling out to real
+   * `open`). Ignored when `hostAppInvoke` is supplied.
+   */
+  openRunner?: OpenRunner;
+  /**
+   * Override the report-file path factory used by the default LaunchServices
+   * invoker (tests pin a known temp path). Ignored when `hostAppInvoke` is set.
+   */
+  reportPathFactory?: () => string;
+  /**
+   * Override the system-extension state probe used by the enable gate (tests).
+   * Defaults to `systemextensionsctl list | grep castle-wall`.
+   */
+  sysextProbe?: () => Promise<SysextState>;
 }
 
 export interface CastleWallParsedArgs {
@@ -68,6 +84,25 @@ export type HostAppInvoker = (
   args: string[],
 ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
 
+/**
+ * Runs `open` (or a test double). The default LaunchServices invoker launches
+ * the host app through `open` so the child runs as a real LaunchServices
+ * instance — the only way to reach NE preferences on macOS Tahoe, where a
+ * directly-exec'd binary's `NEFilterManager.loadFromPreferences` hangs forever
+ * (Mini1 Tahoe drill, 2026-06-10, finding 1).
+ */
+export type OpenRunner = (
+  command: string,
+  args: string[],
+) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+
+/** Parsed `systemextensionsctl list` state for the Castle Wall sysext. */
+export type SysextState =
+  | "[activated enabled]"
+  | "[activated disabled]"
+  | "[activated waiting for user]"
+  | "not loaded";
+
 /** JSON line emitted by `CastleWallHostApp --headless <action>` (HeadlessFilterCLI.Report). */
 interface HeadlessReport {
   ok: boolean;
@@ -78,6 +113,14 @@ interface HeadlessReport {
 
 /** Exit-code contract with HeadlessFilterCLI.ExitCode (Swift side). */
 const HEADLESS_EXIT_NEEDS_APPROVAL = 3;
+
+/**
+ * Distinct CLI exit code for "the system extension is installed but toggled
+ * OFF" — the Tahoe-specific state that needs a one-time console toggle in
+ * System Settings (drill finding 1). Kept separate from the generic failure (1)
+ * and the consent-missing path (3) so an operator/runbook can branch on it.
+ */
+const EXIT_SYSEXT_DISABLED = 4;
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
@@ -90,11 +133,15 @@ function fingerprintFromPublicKey(publicKey: Uint8Array): string {
     .slice(0, 16);
 }
 
-function parseCastleWallState(raw: string): "[activated enabled]" | "[activated waiting for user]" | "not loaded" {
+function parseCastleWallState(raw: string): SysextState {
   if (raw.includes("[activated enabled]")) return "[activated enabled]";
   if (raw.includes("[activated waiting for user]")) {
     return "[activated waiting for user]";
   }
+  // Tahoe ships the sysext toggled OFF ([activated disabled]); surface that
+  // distinctly rather than mislabeling it "not loaded" (the false-assurance
+  // trap from the 2026-06-10 drill, finding 2).
+  if (raw.includes("[activated disabled]")) return "[activated disabled]";
   return "not loaded";
 }
 
@@ -603,7 +650,7 @@ export async function runStatus(
     return 0;
   }
 
-  let sysextState: "[activated enabled]" | "[activated waiting for user]" | "not loaded" = "not loaded";
+  let sysextState: SysextState = "not loaded";
   try {
     const raw = execSyncFn(
       "systemextensionsctl list 2>/dev/null | grep castle-wall"
@@ -1257,7 +1304,149 @@ function makeHostAppInvoke(timeoutMs: number): HostAppInvoker {
     });
 }
 
-const defaultHostAppInvoke = makeHostAppInvoke(90_000);
+/**
+ * Resolve the `.app` bundle directory from a path to the binary inside it
+ * (`…/Sanctuary-CastleWall.app/Contents/MacOS/CastleWallHostApp` →
+ * `…/Sanctuary-CastleWall.app`). `open` launches bundles, not the inner
+ * executable. Falls back to the input when no `.app` component is present
+ * (e.g. an SANCTUARY_CASTLE_HOSTAPP override pointing at a bare binary).
+ */
+function resolveAppBundlePath(binaryPath: string): string {
+  const marker = ".app/";
+  const idx = binaryPath.indexOf(marker);
+  if (idx >= 0) return binaryPath.slice(0, idx + ".app".length);
+  return binaryPath;
+}
+
+function defaultReportPath(): string {
+  return join(tmpdir(), `sanctuary-cw-report-${nodeRandomBytes(16).toString("hex")}.json`);
+}
+
+export interface LaunchServicesInvokerOptions {
+  timeoutMs: number;
+  /** Test seam: run `open` (or a double). Defaults to a real `execFile`. */
+  openRunner?: OpenRunner;
+  /** Test seam: where the host app writes its report. Defaults to a random temp path. */
+  reportPathFactory?: () => string;
+}
+
+/**
+ * Host-app invoker that routes through LaunchServices (`open -n -W`) instead of
+ * directly exec'ing the binary. On macOS Tahoe a directly-exec'd binary cannot
+ * reach NE preferences (`loadFromPreferences` hangs indefinitely); only a
+ * LaunchServices-launched app instance can. Because `open` does not relay the
+ * child's stdout, the host app also writes its single JSON report line to a
+ * caller-supplied `--report-file`; this invoker reads it back, derives an exit
+ * code from the report, and returns it in the same shape as the direct invoker.
+ *
+ * Fail-closed: a missing, empty, or unparseable report file yields a generic
+ * failure (exit 1) — never a silent success.
+ */
+export function makeLaunchServicesHostAppInvoke(
+  opts: LaunchServicesInvokerOptions,
+): HostAppInvoker {
+  const openRunner = opts.openRunner ?? makeDefaultOpenRunner(opts.timeoutMs);
+  const reportPathFactory = opts.reportPathFactory ?? defaultReportPath;
+  return async (binaryPath, args) => {
+    const appBundle = resolveAppBundlePath(binaryPath);
+    const reportPath = reportPathFactory();
+    const openArgs = [
+      "-n",
+      "-W",
+      appBundle,
+      "--args",
+      ...args,
+      `--report-file=${reportPath}`,
+    ];
+
+    let openResult: { stdout: string; stderr: string; exitCode: number };
+    try {
+      openResult = await openRunner("open", openArgs);
+    } catch (error) {
+      openResult = {
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+        exitCode: -1,
+      };
+    }
+
+    let raw = "";
+    try {
+      raw = await readFile(reportPath, "utf8");
+    } catch {
+      raw = "";
+    } finally {
+      await unlink(reportPath).catch(() => undefined);
+    }
+
+    if (!raw.trim()) {
+      const reason = openResult.stderr.trim()
+        ? `: ${openResult.stderr.trim()}`
+        : "";
+      return {
+        stdout: "",
+        stderr:
+          `Castle Wall host app produced no report (open exit ${openResult.exitCode}${reason}). ` +
+          "On macOS Tahoe, confirm the Castle Wall system extension is toggled on in " +
+          "System Settings > General > Login Items & Extensions > Network Extensions.",
+        exitCode: 1,
+      };
+    }
+
+    const report = parseHeadlessReport(raw);
+    if (!report) {
+      return {
+        stdout: raw,
+        stderr: "Castle Wall host app report was unparseable.",
+        exitCode: 1,
+      };
+    }
+
+    const exitCode =
+      report.state === "needs_user_approval"
+        ? HEADLESS_EXIT_NEEDS_APPROVAL
+        : report.ok
+          ? 0
+          : 1;
+    return { stdout: raw, stderr: "", exitCode };
+  };
+}
+
+function makeDefaultOpenRunner(timeoutMs: number): OpenRunner {
+  return (command, args) =>
+    new Promise((resolvePromise) => {
+      nodeExecFile(
+        command,
+        args,
+        { encoding: "utf8", timeout: timeoutMs },
+        (error, stdout, stderr) => {
+          let exitCode = 0;
+          let stderrOut = stderr ?? "";
+          if (error) {
+            exitCode = typeof error.code === "number" ? error.code : -1;
+            if (error.killed && !stderrOut.trim()) {
+              stderrOut = `open did not return within ${timeoutMs}ms`;
+            }
+          }
+          resolvePromise({ stdout: stdout ?? "", stderr: stderrOut, exitCode });
+        },
+      );
+    });
+}
+
+/**
+ * Default arm/disarm invoker. LaunchServices-routed so it survives macOS Tahoe
+ * (see makeLaunchServicesHostAppInvoke). The direct-exec makeHostAppInvoke is
+ * retained for the read-only status probe and pre-Tahoe paths.
+ */
+const ARM_INVOKE_TIMEOUT_MS = 90_000;
+function defaultArmInvoke(ctx: CastleWallCommandContext): HostAppInvoker {
+  return makeLaunchServicesHostAppInvoke({
+    timeoutMs: ARM_INVOKE_TIMEOUT_MS,
+    ...(ctx.openRunner ? { openRunner: ctx.openRunner } : {}),
+    ...(ctx.reportPathFactory ? { reportPathFactory: ctx.reportPathFactory } : {}),
+  });
+}
 
 /**
  * `status` is a read-only quick check; never let it hang behind a wedged
@@ -1349,6 +1538,38 @@ const NEEDS_APPROVAL_GUIDANCE =
   "Sanctuary-CastleWall.app once and click Allow on the content-filter prompt.\n" +
   "After that, every arm/disarm works headlessly.\n";
 
+const SYSEXT_DISABLED_GUIDANCE =
+  "The Castle Wall system extension is installed but toggled OFF.\n" +
+  "On macOS Tahoe the extension ships disabled and needs a one-time console\n" +
+  "toggle (GUI-only, macOS requirement): at the console, open\n" +
+  "System Settings > General > Login Items & Extensions > Network Extensions\n" +
+  "and switch Castle Wall on. After that, every arm/disarm works headlessly.\n";
+
+/**
+ * Probe the Castle Wall system-extension state via `systemextensionsctl`.
+ * Failure (binary missing, e.g. non-macOS CI) degrades to "not loaded" so the
+ * caller proceeds rather than blocking on an undetectable state.
+ */
+async function defaultSysextProbe(
+  ctx: CastleWallCommandContext,
+): Promise<SysextState> {
+  const execSyncFn =
+    ctx.execSyncFn ??
+    ((command: string) =>
+      nodeExecSync(`sh -lc '${command.replace(/'/g, "'\\''")}'`, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim());
+  try {
+    const raw = execSyncFn(
+      "systemextensionsctl list 2>/dev/null | grep castle-wall",
+    );
+    return parseCastleWallState(raw);
+  } catch {
+    return "not loaded";
+  }
+}
+
 async function runArmDisarm(
   action: "enable" | "disable",
   argv: string[],
@@ -1389,13 +1610,25 @@ async function runArmDisarm(
     }
   }
 
+  if (action === "enable") {
+    // Tahoe ships the sysext toggled OFF; arming over it would save an NE config
+    // that never enforces (the false-assurance trap). Detect that distinct state
+    // and route the operator to the one-time console toggle. Disable never gates
+    // here — it stays the unconditional dead-man lever.
+    const sysextProbe = ctx.sysextProbe ?? (() => defaultSysextProbe(ctx));
+    if ((await sysextProbe()) === "[activated disabled]") {
+      write(err, SYSEXT_DISABLED_GUIDANCE);
+      return EXIT_SYSEXT_DISABLED;
+    }
+  }
+
   const resolved = await resolveHostAppBinary(env, ctx);
   if ("error" in resolved) {
     write(err, `${resolved.error}\n`);
     return 1;
   }
 
-  const invoke = ctx.hostAppInvoke ?? defaultHostAppInvoke;
+  const invoke = ctx.hostAppInvoke ?? defaultArmInvoke(ctx);
   const result = await invoke(resolved.path, ["--headless", action]);
   const report = parseHeadlessReport(result.stdout);
 
