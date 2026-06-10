@@ -17,6 +17,7 @@
 import { mkdtemp, readFile, readdir, rm, writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
@@ -45,7 +46,11 @@ import {
 import { SdwWorkingStateStore } from "../../src/sdw/working-state-store.js";
 import { SdwDocumentCorpusStore } from "../../src/sdw/document-corpus-store.js";
 import { SdwQueryHistoryStore } from "../../src/sdw/query-history-store.js";
-import type { SdwTxn, SdwTransactional } from "../../src/sdw/lmdb-backend.js";
+import {
+  LmdbStorageBackend,
+  type SdwTxn,
+  type SdwTransactional,
+} from "../../src/sdw/lmdb-backend.js";
 import { assertSdwRawWriteAuthorized, prepareSdwBackendWrite } from "../../src/sdw/write-gate.js";
 import { stateKey } from "../../src/sdw/grammar.js";
 import {
@@ -136,17 +141,48 @@ class TestSdwVault implements StorageBackend, SdwTransactional, SdwExportInvento
     return total;
   }
 
+  /**
+   * Honest staged-commit semantics mirroring LmdbStorageBackend: nothing
+   * reaches the live map unless `fn` resolves; a throw discards every staged
+   * operation (all-or-nothing). Reads are read-your-writes.
+   */
   async sdwTransaction<T>(fn: (txn: SdwTxn) => Promise<T>): Promise<T> {
+    const overlay = new Map<string, Uint8Array | null>();
     const txn: SdwTxn = {
-      write: async (namespace, key, data) => this.write(namespace, key, data),
+      write: async (namespace, key, data) => {
+        overlay.set(
+          `${namespace}\0${key}`,
+          new Uint8Array(assertSdwRawWriteAuthorized(namespace, key, data)),
+        );
+      },
       writePersistable: async (persistable, encryptionKey, fortressId) => {
         const prepared = prepareSdwBackendWrite(persistable, encryptionKey, fortressId);
-        await this.write(prepared.namespace, prepared.storageKey, prepared.data);
+        overlay.set(
+          `${prepared.namespace}\0${prepared.storageKey}`,
+          new Uint8Array(
+            assertSdwRawWriteAuthorized(prepared.namespace, prepared.storageKey, prepared.data),
+          ),
+        );
       },
-      read: async (namespace, key) => this.read(namespace, key),
-      delete: async (namespace, key) => this.delete(namespace, key),
+      read: async (namespace, key) => {
+        const staged = overlay.get(`${namespace}\0${key}`);
+        if (staged !== undefined) return staged === null ? null : new Uint8Array(staged);
+        return this.read(namespace, key);
+      },
+      delete: async (namespace, key) => {
+        const composite = `${namespace}\0${key}`;
+        const staged = overlay.get(composite);
+        const existed = staged !== undefined ? staged !== null : this.data.has(composite);
+        overlay.set(composite, null);
+        return existed;
+      },
     };
-    return fn(txn);
+    const result = await fn(txn);
+    for (const [composite, value] of overlay) {
+      if (value === null) this.data.delete(composite);
+      else this.data.set(composite, value);
+    }
+    return result;
   }
 
   listNamespaceSync(namespace: string): ReadonlyArray<{ key: string; data: Uint8Array }> {
@@ -739,10 +775,12 @@ describe("SDW D2 drift fail-closed (invariant 2)", () => {
       if (firstPrompt) {
         firstPrompt = false;
         // While the FIRST prompt is pending, the agent mutates the vault and
-        // fires an identical second request whose gate-time enumeration
-        // stashes the NEW (unapproved) state. The first approval must NOT
-        // ship that state: consumeOldest yields the first call's inventory,
-        // and the drift recheck against the mutated store fails closed.
+        // fires an identical second request whose gate-time enumeration sees
+        // the NEW (unapproved) state. The first approval must NOT ship that
+        // state: the first call's handler consumes ITS OWN per-call binding
+        // (the pre-mutation inventory — the overlapping call's enumeration is
+        // bound to a different call object and cannot leak in), and the drift
+        // recheck against the mutated store fails closed.
         await harness.source.workingStore.put(
           workingStateRecord("state-poison", "smuggled into overlap"),
           "user_content",
@@ -1168,21 +1206,11 @@ describe("SDW D2 approval-proof replay defenses", () => {
     expect(replayed.kind).toBe("denied_gate");
     expect(await readdir(harness.exportDir)).toEqual([]);
 
-    // A fresh proof for the CURRENT state: the abandoned pre-mutation stash
-    // entry is consumed oldest-first and fails the drift recheck (FIFO
-    // fail-closed posture — a stale entry can never ship, it can only cost a
-    // retry), after which the retry with a new proof succeeds.
-    const freshGateArgs = harness.exportTool.approvalTargetArgs!(args);
-    const freshProof = gate.createApprovedProof({
-      toolName: "sdw_export",
-      args: freshGateArgs,
-      session: OPERATOR_SESSION,
-    });
-    const staleRound = await callThroughGate(harness.exportTool, args, gate, freshProof.approval_ref);
-    expect(staleRound.kind).toBe("handled");
-    expect((staleRound as { payload: Record<string, unknown> }).payload.denied).toBe(true);
-    expect(await readdir(harness.exportDir)).toEqual([]);
-
+    // A fresh proof for the CURRENT state succeeds immediately: the handler
+    // consumes the binding enumerated by THIS call's own gate-time check
+    // (exact approved == executed binding — the abandoned pre-mutation
+    // enumeration left no global state behind, so it can neither ship nor
+    // cost a spurious fail-closed retry).
     const retryProof = gate.createApprovedProof({
       toolName: "sdw_export",
       args: harness.exportTool.approvalTargetArgs!(args),
@@ -1433,3 +1461,328 @@ describe("SDW D2 post-export delete", () => {
     expect(prompts).toHaveLength(0);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Codex adversarial review fixes (HIGH 1-3): exact consent binding for
+// export/import/delete, and all-or-nothing import phase 2. Every test here
+// fails against the pre-fix implementation (FIFO stash, unbound import
+// handler, per-record phase-2 writes).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("SDW D2 exact consent binding + atomic import (codex HIGH 1-3)", () => {
+  async function exportBundleBase64(harness: Harness, name: string): Promise<string> {
+    const gate = makeGate(harness.source.auditLog, new AutoApproveChannel());
+    const exported = await callThroughGate(harness.exportTool, { export_name: name }, gate);
+    expect(exported.kind).toBe("handled");
+    const payload = (exported as { payload: Record<string, unknown> }).payload;
+    expect(payload.exported).toBe(true);
+    return Buffer.from(await readFile(payload.destination_path as string, "utf8")).toString(
+      "base64url",
+    );
+  }
+
+  function makeImportTools(
+    harness: Harness,
+    target: Fortress,
+    resolveSourceMasterKey: (ref: string) => Uint8Array | null,
+  ): ToolDefinition {
+    const tools = createSdwTools({
+      storage: target.vault,
+      inventory: target.vault,
+      auditLog: target.auditLog,
+      fortressId: TARGET_FORTRESS,
+      exportDir: harness.exportDir,
+      signingKey: makeSigning().signingKey,
+      resolvePublicKey: harness.signing.resolvePublicKey,
+      resolveSourceMasterKey,
+      targetMasterKey: target.masterKey,
+    });
+    return findTool(tools, "sdw_import");
+  }
+
+  it("HIGH-1 cycle-back: an approval shown for state D2 never signs an abandoned older state D1", async () => {
+    const harness = await makeExportHarness();
+
+    // Step 1: abandoned gate-time enumeration at state D1 (e.g. a preflight
+    // whose prompt/proof is never executed). Under the old FIFO stash this
+    // left a consumable global entry; under exact binding it leaves nothing.
+    harness.exportTool.approvalTargetArgs!({ export_name: "cycle" });
+    const d1 = enumerateSdwExportInventory(harness.source.vault).scope_digest;
+
+    // Step 2: the vault mutates to a different state D2 (swap one record's
+    // ciphertext for another valid envelope so it can be restored
+    // byte-for-byte later).
+    const keys = harness.source.vault.keysForTest(SDW_WORKING_STATE_NAMESPACE).sort();
+    const [keyA, keyB] = keys as [string, string];
+    const originalA = (await harness.source.vault.read(SDW_WORKING_STATE_NAMESPACE, keyA))!;
+    const bytesB = (await harness.source.vault.read(SDW_WORKING_STATE_NAMESPACE, keyB))!;
+    harness.source.vault.rawSetForTest(SDW_WORKING_STATE_NAMESPACE, keyA, bytesB);
+    const d2 = enumerateSdwExportInventory(harness.source.vault).scope_digest;
+    expect(d2).not.toBe(d1);
+
+    // Steps 3-5: a legitimate export starts; the human is shown D2; while the
+    // prompt is pending the vault cycles back BYTE-FOR-BYTE to D1.
+    let promptedDigest = "";
+    const channel = new CallbackApprovalChannel(async (request) => {
+      promptedDigest = (request.context.args_summary as Record<string, unknown>)
+        .scope_digest as string;
+      harness.source.vault.rawSetForTest(SDW_WORKING_STATE_NAMESPACE, keyA, originalA);
+      return { decision: "approve", decided_at: NOW, decided_by: "human" };
+    });
+    const gate = makeGate(harness.source.auditLog, channel);
+    const result = await callThroughGate(harness.exportTool, { export_name: "cycle" }, gate);
+
+    // The human approved D2; live state is D1. The export MUST fail closed —
+    // never sign/ship D1 under the D2 approval (the old FIFO stash consumed
+    // the abandoned D1 entry, matched live D1, and exported).
+    expect(promptedDigest).toBe(d2);
+    expect(result.kind).toBe("handled");
+    expect((result as { payload: Record<string, unknown> }).payload.denied).toBe(true);
+    expect(await readdir(harness.exportDir)).toEqual([]);
+
+    const drift = await auditOps(harness.source.auditLog, "sdw_export_scope_drift");
+    expect(drift).toHaveLength(1);
+    // The audit proves the binding: approved == what the human saw (D2),
+    // current == the cycled-back state (D1).
+    expect(drift[0]!.details!.approved_scope_digest).toBe(d2);
+    expect(drift[0]!.details!.current_scope_digest).toBe(d1);
+    expect(await auditOps(harness.source.auditLog, "sdw_export_completed")).toHaveLength(0);
+  });
+
+  it("HIGH-2: the sdw_import handler fails closed without a gate-time approval binding — no key resolution, no decrypt, no writes", async () => {
+    const harness = await makeExportHarness();
+    const bundleBase64 = await exportBundleBase64(harness, "nogate");
+
+    const target = makeFortress(TARGET_FORTRESS);
+    let keyResolutions = 0;
+    const importTool = makeImportTools(harness, target, () => {
+      keyResolutions += 1;
+      return harness.source.masterKey;
+    });
+
+    // Direct handler invocation — the misconfigured/bypassed-gate scenario.
+    const response = await importTool.handler({
+      bundle: bundleBase64,
+      source_key_ref: "slot",
+    });
+    const payload = JSON.parse(response.content[0]!.text) as Record<string, unknown>;
+    expect(payload.denied).toBe(true);
+    expect(payload.message).toBe(FIXED_DENIAL_MESSAGE);
+
+    // The denial happened BEFORE any key material was resolved (and therefore
+    // before anything could be decrypted), and nothing was written.
+    expect(keyResolutions).toBe(0);
+    expect(target.vault.countForTest()).toBe(0);
+
+    const denied = await auditOps(target.auditLog, "sdw_import_denied");
+    expect(denied).toHaveLength(1);
+    expect(denied[0]!.details!.denial_class).toBe("approval_binding_missing");
+    expect(await auditOps(target.auditLog, "sdw_import_completed")).toHaveLength(0);
+  });
+
+  it("HIGH-2: a bundle swapped between gate-time approval and handler execution fails closed", async () => {
+    const harness = await makeExportHarness();
+    const bundle1 = await exportBundleBase64(harness, "swap-first");
+    await harness.source.workingStore.put(
+      workingStateRecord("state-swap", "added after the first export"),
+      "user_content",
+    );
+    const bundle2 = await exportBundleBase64(harness, "swap-second");
+    expect(bundle2).not.toBe(bundle1);
+
+    const target = makeFortress(TARGET_FORTRESS);
+    let keyResolutions = 0;
+    const importTool = makeImportTools(harness, target, () => {
+      keyResolutions += 1;
+      return harness.source.masterKey;
+    });
+
+    // Gate-time approval is computed (and bound) for bundle1; the args are
+    // then mutated to a DIFFERENT validly-signed bundle before the handler
+    // runs. The handler must refuse: what it would execute is not what was
+    // approved.
+    const args: Record<string, unknown> = { bundle: bundle1, source_key_ref: "slot" };
+    importTool.approvalTargetArgs!(args);
+    args.bundle = bundle2;
+    const response = await importTool.handler(args);
+    const payload = JSON.parse(response.content[0]!.text) as Record<string, unknown>;
+    expect(payload.denied).toBe(true);
+    expect(keyResolutions).toBe(0);
+    expect(target.vault.countForTest()).toBe(0);
+
+    const denied = await auditOps(target.auditLog, "sdw_import_denied");
+    expect(denied).toHaveLength(1);
+    expect(denied[0]!.details!.denial_class).toBe("approval_binding_missing");
+  });
+
+  it("HIGH-2 symmetry: the sdw_export_delete handler fails closed without a gate-time approval binding", async () => {
+    const harness = await makeExportHarness();
+    const gate = makeGate(harness.source.auditLog, new AutoApproveChannel());
+    const exported = await callThroughGate(harness.exportTool, { export_name: "keepall" }, gate);
+    const destination = (exported as { payload: Record<string, unknown> }).payload
+      .destination_path as string;
+    const bundle = JSON.parse(await readFile(destination, "utf8")) as SdwStateExportBundle;
+    const manifestArg = Buffer.from(JSON.stringify(bundle.manifest)).toString("base64url");
+
+    const before = harness.source.vault.countForTest();
+    const response = await harness.deleteTool.handler({ manifest: manifestArg });
+    const payload = JSON.parse(response.content[0]!.text) as Record<string, unknown>;
+    expect(payload.denied).toBe(true);
+    expect(harness.source.vault.countForTest()).toBe(before);
+
+    const denied = await auditOps(harness.source.auditLog, "sdw_export_delete_denied");
+    expect(denied).toHaveLength(1);
+    expect(denied[0]!.details!.denial_class).toBe("approval_scope_binding_missing");
+  });
+
+  it("HIGH-3: a write failure mid-phase-2 leaves ZERO imported records (transactional all-or-nothing)", async () => {
+    const harness = await makeExportHarness();
+    const bundle = decodeSdwExportBundle(await exportBundleBase64(harness, "atomic-fake"));
+    expect(bundle.manifest.body.records.length).toBeGreaterThanOrEqual(4);
+
+    const target = makeFortress(TARGET_FORTRESS);
+    let writeAttempts = 0;
+    const failingStorage: StorageBackend & SdwTransactional = {
+      write: (namespace, key, data) => target.vault.write(namespace, key, data),
+      read: (namespace, key) => target.vault.read(namespace, key),
+      delete: (namespace, key) => target.vault.delete(namespace, key),
+      list: (namespace, prefix) => target.vault.list(namespace, prefix),
+      exists: (namespace, key) => target.vault.exists(namespace, key),
+      totalSize: () => target.vault.totalSize(),
+      sdwTransaction: (fn) =>
+        target.vault.sdwTransaction(async (txn) =>
+          fn({
+            ...txn,
+            writePersistable: async (persistable, encryptionKey, fortressId) => {
+              writeAttempts += 1;
+              if (writeAttempts === 3) {
+                throw new Error("simulated disk failure mid-import");
+              }
+              return txn.writePersistable(persistable, encryptionKey, fortressId);
+            },
+          }),
+        ),
+    };
+
+    await expect(
+      importSdwExportBundle({
+        bundle,
+        storage: failingStorage,
+        resolvePublicKey: harness.signing.resolvePublicKey,
+        sourceMasterKey: harness.source.masterKey,
+        targetMasterKey: target.masterKey,
+        targetFortressId: TARGET_FORTRESS,
+      }),
+    ).rejects.toThrow("simulated disk failure mid-import");
+
+    // Two writes succeeded before the failure; the transaction must roll
+    // them back — zero records, not a 2-of-4 partial import.
+    expect(writeAttempts).toBe(3);
+    expect(target.vault.countForTest()).toBe(0);
+  });
+
+  it("HIGH-3: a non-transactional storage backend fails the import closed before any write or decrypt", async () => {
+    const harness = await makeExportHarness();
+    const bundle = decodeSdwExportBundle(await exportBundleBase64(harness, "atomic-stub"));
+
+    const writes: string[] = [];
+    const stub: StorageBackend = {
+      write: async (namespace, key) => {
+        writes.push(`${namespace}/${key}`);
+      },
+      read: async () => null,
+      delete: async () => false,
+      list: async () => [],
+      exists: async () => false,
+      totalSize: async () => 0,
+    };
+
+    await expect(
+      importSdwExportBundle({
+        bundle,
+        storage: stub,
+        resolvePublicKey: harness.signing.resolvePublicKey,
+        sourceMasterKey: harness.source.masterKey,
+        targetMasterKey: generateRandomKey(),
+        targetFortressId: TARGET_FORTRESS,
+      }),
+    ).rejects.toMatchObject({ category: "storage_not_transactional" });
+    expect(writes).toEqual([]);
+  });
+
+  it.skipIf(!lmdbNativeOpenAvailable())(
+    "HIGH-3: the real LMDB backend rolls back every phase-2 write when a mid-batch write throws",
+    async () => {
+      const harness = await makeExportHarness();
+      const bundle = decodeSdwExportBundle(await exportBundleBase64(harness, "atomic-lmdb"));
+      expect(bundle.manifest.body.records.length).toBeGreaterThanOrEqual(4);
+
+      const dir = await mkdtemp(join(tmpdir(), "sdw-d2-lmdb-atomic-"));
+      tempDirs.push(dir);
+      const backend = await LmdbStorageBackend.open({ path: dir });
+      try {
+        let writeAttempts = 0;
+        const failingStorage: StorageBackend & SdwTransactional = {
+          write: (namespace, key, data) => backend.write(namespace, key, data),
+          read: (namespace, key) => backend.read(namespace, key),
+          delete: (namespace, key) => backend.delete(namespace, key),
+          list: (namespace, prefix) => backend.list(namespace, prefix),
+          exists: (namespace, key) => backend.exists(namespace, key),
+          totalSize: () => backend.totalSize(),
+          sdwTransaction: (fn) =>
+            backend.sdwTransaction(async (txn) =>
+              fn({
+                ...txn,
+                writePersistable: async (persistable, encryptionKey, fortressId) => {
+                  writeAttempts += 1;
+                  if (writeAttempts === 3) {
+                    throw new Error("simulated mid-batch lmdb failure");
+                  }
+                  return txn.writePersistable(persistable, encryptionKey, fortressId);
+                },
+              }),
+            ),
+        };
+
+        await expect(
+          importSdwExportBundle({
+            bundle,
+            storage: failingStorage,
+            resolvePublicKey: harness.signing.resolvePublicKey,
+            sourceMasterKey: harness.source.masterKey,
+            targetMasterKey: generateRandomKey(),
+            targetFortressId: TARGET_FORTRESS,
+          }),
+        ).rejects.toThrow("simulated mid-batch lmdb failure");
+        expect(writeAttempts).toBe(3);
+
+        // Not a single manifest record may exist durably — the writes that
+        // preceded the failure were rolled back with it.
+        for (const record of bundle.manifest.body.records) {
+          expect(await backend.read(record.namespace, record.key)).toBeNull();
+        }
+      } finally {
+        await backend.close();
+      }
+    },
+  );
+});
+
+function lmdbNativeOpenAvailable(): boolean {
+  const script = `
+    import('lmdb').then(async lmdb => {
+      const fs = await import('node:fs/promises');
+      const os = await import('node:os');
+      const path = await import('node:path');
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'lmdb-smoke-'));
+      const db = lmdb.open({ path: dir, encoding: 'binary', compression: false, mapSize: 1024 * 1024 });
+      await db.close();
+      await fs.rm(dir, { recursive: true, force: true });
+    });
+  `;
+  const result = spawnSync(process.execPath, ["-e", script], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+  });
+  return result.status === 0;
+}

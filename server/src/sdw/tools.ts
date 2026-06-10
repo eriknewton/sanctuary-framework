@@ -10,12 +10,19 @@
  *   Constraint #1 holds — the approval context can travel to a dashboard or
  *   webhook before approval, so it never carries record bodies, ciphertext,
  *   bundles, or key material.
- * - For `sdw_export`/`sdw_export_delete`, the gate-time ciphertext inventory
- *   is frozen in a short-TTL stash keyed by the normalized args hash. The
- *   handler consumes the stash and ships EXACTLY the approved snapshot after
- *   a fail-closed drift recheck. A handler invocation with no stashed
- *   approval-bound inventory (gate not configured, stash expired) fails
- *   closed.
+ * - EXACT consent binding (gate → handler): `approvalTargetArgs` attaches the
+ *   approval-bound payload (the frozen ciphertext inventory for
+ *   `sdw_export`/`sdw_export_delete`; the verified manifest summary for
+ *   `sdw_import`) to the per-call args object under a private Symbol key. The
+ *   router passes the SAME object to the handler, so the handler consumes the
+ *   binding computed for THIS call's gate evaluation — the inventory/manifest
+ *   the human's approval was shown — never a stale entry from an earlier,
+ *   abandoned call. Agent-supplied args arrive as JSON (no Symbol keys can be
+ *   forged) and schema validation rejects unknown string fields, so the
+ *   binding channel is unforgeable. A handler invocation with no binding
+ *   (gate not configured, `approvalTargetArgs` never ran, binding expired or
+ *   args mutated after gate time) fails closed. The assembly-time live-store
+ *   drift recheck remains as defense-in-depth on top of this binding.
  * - Because the scope digest lives in the gate-time args, the
  *   `ApprovalProofStore` envelope binds it automatically: a stored approval
  *   proof for one vault state cannot be replayed after the vault mutates
@@ -66,13 +73,12 @@ import { SdwValidationError } from "./errors.js";
 const EXPORT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MAX_MANIFEST_ARG_BYTES = 1_048_576;
 /**
- * Approved gate-time inventory is held briefly between gate evaluation and
- * handler execution. Interactive approvals can take minutes (human-speed);
- * proofs expire at 5 minutes — 15 minutes comfortably bounds both while
- * keeping a stale snapshot from being consumable indefinitely.
+ * The approval binding lives only between gate evaluation and handler
+ * execution of a single call. Interactive approvals can take minutes
+ * (human-speed); proofs expire at 5 minutes — 15 minutes comfortably bounds
+ * both while keeping a stale binding from being consumable indefinitely.
  */
-const APPROVED_SCOPE_TTL_MS = 15 * 60_000;
-const APPROVED_SCOPE_MAX_ENTRIES = 16;
+const APPROVAL_BINDING_TTL_MS = 15 * 60_000;
 
 export interface SdwToolsOptions {
   readonly storage: StorageBackend;
@@ -93,81 +99,89 @@ export interface SdwToolsOptions {
   readonly now?: () => string;
 }
 
-interface ApprovedScopeEntry {
+/**
+ * Private, unforgeable gate→handler channel. The router computes
+ * `approvalTargetArgs(handlerArgs)` and later invokes
+ * `handler(handlerArgs)` with the SAME object, so a Symbol-keyed property on
+ * that object travels from gate evaluation to handler execution of one call
+ * and nowhere else:
+ *
+ * - Agent args arrive as JSON — JSON cannot carry Symbol keys, and schema
+ *   validation rejects unknown string fields, so the agent cannot inject or
+ *   forge a binding.
+ * - Symbol keys are invisible to `JSON.stringify`/`Object.keys`, so the
+ *   binding never leaks into approval-channel payloads, audit details, or
+ *   `normalizedArgsHash` (which canonicalizes string-keyed JSON only).
+ * - No cross-call state exists: an abandoned gate evaluation (denied prompt,
+ *   never-executed preflight) leaves nothing behind that a later call could
+ *   consume. This is what closes the FIFO-stash cycle-back hole — the
+ *   handler provably consumes the exact inventory/manifest that THIS call's
+ *   approval was shown, not "the oldest entry for these args".
+ */
+const SDW_APPROVAL_BINDING = Symbol("sanctuary.sdw.approval-binding");
+
+interface SdwExportScopeBinding {
+  readonly kind: "export_scope";
+  readonly toolName: "sdw_export" | "sdw_export_delete";
+  /** Normalized hash of the gate-time args — the handler re-derives and compares. */
+  readonly argsHash: string;
+  /** The frozen ciphertext inventory the approval prompt displayed. */
   readonly inventory: SdwExportInventory;
-  storedAt: number;
+  readonly storedAtMs: number;
 }
 
-const APPROVED_SCOPE_MAX_PER_KEY = 4;
+interface SdwImportApprovalBinding {
+  readonly kind: "import_manifest";
+  readonly toolName: "sdw_import";
+  readonly argsHash: string;
+  /** Digest of the verified manifest the approval prompt displayed. */
+  readonly manifestBodyDigest: string;
+  readonly sourceKeyRef: string;
+  readonly conflictResolution: "skip" | "overwrite";
+  readonly storedAtMs: number;
+}
+
+type SdwApprovalBinding = SdwExportScopeBinding | SdwImportApprovalBinding;
+
+interface BindableArgs extends Record<string, unknown> {
+  [SDW_APPROVAL_BINDING]?: SdwApprovalBinding;
+}
+
+function attachApprovalBinding(
+  args: Record<string, unknown>,
+  binding: SdwApprovalBinding,
+): void {
+  Object.defineProperty(args, SDW_APPROVAL_BINDING, {
+    value: binding,
+    enumerable: false,
+    configurable: true,
+    writable: false,
+  });
+}
 
 /**
- * Gate-time → handler-time inventory hand-off. Keyed by the normalized hash
- * of the ORIGINAL tool args (both `approvalTargetArgs` and the handler see
- * them), so the handler can only consume an inventory that was computed for
- * this exact call shape.
- *
- * Semantics: FIFO per key, deduplicated by scope digest, consumed strictly
- * oldest-first. This is the fail-closed answer to the overlapping-identical-
- * calls TOCTOU: if call A's prompt shows digest D1, the agent mutates the
- * vault, and an overlapping call B enqueues digest D2, then A's approval
- * consumes the OLDEST entry (D1) and the assembly-time drift recheck against
- * the live store (now D2) fails closed — the unapproved state can never ride
- * out under A's approval. Digest-dedup keeps the legitimate proof flow
- * (preflight + execution both run `approvalTargetArgs` over an unchanged
- * vault) at a single entry. A stale leftover entry (abandoned proof, denied
- * call) costs at most one extra fail-closed round before a retry succeeds —
- * safety over convenience (constraint #5 posture).
+ * Consume (single-use) the approval binding for this call. Returns null —
+ * the caller MUST fail closed — when no binding exists (gate not configured
+ * or `approvalTargetArgs` never ran), the binding belongs to a different
+ * tool, it exceeded the freshness window, or the args object changed after
+ * gate time (hash mismatch).
  */
-class ApprovedScopeStash {
-  private readonly queues = new Map<string, ApprovedScopeEntry[]>();
-
-  set(key: string, inventory: SdwExportInventory, nowMs: number): void {
-    this.prune(nowMs);
-    const queue = this.queues.get(key) ?? [];
-    const existing = queue.find(
-      (entry) => entry.inventory.scope_digest === inventory.scope_digest,
-    );
-    if (existing !== undefined) {
-      existing.storedAt = nowMs;
-    } else {
-      queue.push({ inventory, storedAt: nowMs });
-      while (queue.length > APPROVED_SCOPE_MAX_PER_KEY) queue.shift();
-    }
-    if (!this.queues.has(key)) {
-      if (this.queues.size >= APPROVED_SCOPE_MAX_ENTRIES) {
-        const oldestKey = this.queues.keys().next().value;
-        if (oldestKey !== undefined) this.queues.delete(oldestKey);
-      }
-      this.queues.set(key, queue);
-    }
-  }
-
-  /** Strictly oldest-first; never skips entries (see class doc). */
-  consumeOldest(key: string, nowMs: number): SdwExportInventory | null {
-    this.prune(nowMs);
-    const queue = this.queues.get(key);
-    if (queue === undefined || queue.length === 0) return null;
-    const entry = queue.shift()!;
-    if (queue.length === 0) this.queues.delete(key);
-    return entry.inventory;
-  }
-
-  private prune(nowMs: number): void {
-    for (const [key, queue] of this.queues) {
-      const fresh = queue.filter((entry) => nowMs - entry.storedAt <= APPROVED_SCOPE_TTL_MS);
-      if (fresh.length === 0) {
-        this.queues.delete(key);
-      } else if (fresh.length !== queue.length) {
-        queue.length = 0;
-        queue.push(...fresh);
-      }
-    }
-  }
+function takeApprovalBinding(
+  args: Record<string, unknown>,
+  toolName: SdwApprovalBinding["toolName"],
+  nowMs: number,
+): SdwApprovalBinding | null {
+  const bindable = args as BindableArgs;
+  const binding = bindable[SDW_APPROVAL_BINDING];
+  if (binding === undefined) return null;
+  delete bindable[SDW_APPROVAL_BINDING];
+  if (binding.toolName !== toolName) return null;
+  if (nowMs - binding.storedAtMs > APPROVAL_BINDING_TTL_MS) return null;
+  if (binding.argsHash !== normalizedArgsHash(args)) return null;
+  return binding;
 }
 
 export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
-  const exportStash = new ApprovedScopeStash();
-  const deleteStash = new ApprovedScopeStash();
   const now = options.now ?? (() => new Date().toISOString());
 
   const auditFailure = (
@@ -248,7 +262,16 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
         options.inventory,
         requestedNamespaces(args),
       );
-      exportStash.set(normalizedArgsHash(args), inventory, Date.now());
+      // Bind THIS call's approval target to THIS call's handler execution —
+      // the handler can only ship the inventory whose digest the approval
+      // prompt displayed (see SDW_APPROVAL_BINDING).
+      attachApprovalBinding(args, {
+        kind: "export_scope",
+        toolName: "sdw_export",
+        argsHash: normalizedArgsHash(args),
+        inventory,
+        storedAtMs: Date.now(),
+      });
       return {
         export_name: exportName,
         ...sdwExportApprovalContext(inventory),
@@ -265,15 +288,18 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
         return genericDeny("sdw_export");
       }
 
-      // Fail closed when no gate-time approved inventory exists for this call
-      // (gate not configured, stash expired, or approvalTargetArgs never ran).
-      const approved = exportStash.consumeOldest(normalizedArgsHash(args), Date.now());
-      if (approved === null) {
+      // Fail closed when this call carries no gate-time approval binding
+      // (gate not configured, approvalTargetArgs never ran, binding expired,
+      // or args changed after gate time). The consumed inventory is by
+      // construction the one THIS call's approval prompt displayed.
+      const binding = takeApprovalBinding(args, "sdw_export", Date.now());
+      if (binding === null || binding.kind !== "export_scope") {
         await auditFailure("sdw_export_denied", {
           denial_class: "approval_scope_binding_missing",
         });
         return genericDeny("sdw_export");
       }
+      const approved = binding.inventory;
 
       const exportAuditEventId = `sdw-export:${Date.now()}:${randomBytes(6).toString("hex")}`;
 
@@ -385,12 +411,36 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
     // itself is deliberately absent (constraint #1); the manifest digest
     // binds it into the approval and into any approval proof.
     approvalTargetArgs: (args) => {
+      const sourceKeyRef = args.source_key_ref;
+      if (typeof sourceKeyRef !== "string" || sourceKeyRef.length === 0) {
+        // Fail closed pre-prompt; the router converts the throw to the fixed
+        // denial without prompting.
+        throw new SdwValidationError(
+          "invalid_identifier",
+          "Invalid SDW import source key reference",
+        );
+      }
+      const conflictResolution =
+        args.conflict_resolution === "overwrite" ? "overwrite" : "skip";
       try {
         const bundle = decodeSdwExportBundle(args.bundle as string);
         const summary = verifySdwExportManifest(bundle, options.resolvePublicKey);
+        // Bind THIS call's verified manifest summary to THIS call's handler
+        // execution. The handler refuses to resolve key material, decrypt,
+        // or write unless it consumes exactly this approved binding —
+        // mirroring the export/delete fail-closed posture.
+        attachApprovalBinding(args, {
+          kind: "import_manifest",
+          toolName: "sdw_import",
+          argsHash: normalizedArgsHash(args),
+          manifestBodyDigest: summary.manifest_body_digest,
+          sourceKeyRef,
+          conflictResolution,
+          storedAtMs: Date.now(),
+        });
         return {
-          source_key_ref: args.source_key_ref,
-          conflict_resolution: args.conflict_resolution ?? "skip",
+          source_key_ref: sourceKeyRef,
+          conflict_resolution: conflictResolution,
           signature_verified: true,
           manifest_body_digest: summary.manifest_body_digest,
           source_fortress_id: summary.source_fortress_id,
@@ -433,11 +483,35 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
         return genericDeny("sdw_import");
       }
 
-      const sourceKeyRef = args.source_key_ref;
-      const sourceMasterKey =
-        typeof sourceKeyRef === "string"
-          ? options.resolveSourceMasterKey(sourceKeyRef)
-          : null;
+      // Fail closed when this call carries no gate-time approval binding —
+      // a missing/bypassed gate must NOT leave sdw_import as a decrypt+write
+      // primitive. This check runs BEFORE any key material is resolved and
+      // before anything is decrypted.
+      const binding = takeApprovalBinding(args, "sdw_import", Date.now());
+      if (binding === null || binding.kind !== "import_manifest") {
+        await auditFailure("sdw_import_denied", {
+          denial_class: "approval_binding_missing",
+          manifest_body_digest: summary.manifest_body_digest,
+        });
+        return genericDeny("sdw_import");
+      }
+      // The manifest digest the handler verified on ITS bytes must equal the
+      // digest the approval prompt displayed; ditto the key slot and conflict
+      // policy. Defense-in-depth on top of the args-hash binding.
+      if (
+        binding.manifestBodyDigest !== summary.manifest_body_digest ||
+        binding.sourceKeyRef !== args.source_key_ref ||
+        binding.conflictResolution !==
+          (args.conflict_resolution === "overwrite" ? "overwrite" : "skip")
+      ) {
+        await auditFailure("sdw_import_denied", {
+          denial_class: "approval_binding_mismatch",
+          manifest_body_digest: summary.manifest_body_digest,
+        });
+        return genericDeny("sdw_import");
+      }
+
+      const sourceMasterKey = options.resolveSourceMasterKey(binding.sourceKeyRef);
       if (sourceMasterKey === null) {
         await auditFailure("sdw_import_failed", {
           category: "source_key_unavailable",
@@ -455,8 +529,7 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
           sourceMasterKey,
           targetMasterKey: options.targetMasterKey,
           targetFortressId: options.fortressId,
-          conflictResolution:
-            args.conflict_resolution === "overwrite" ? "overwrite" : "skip",
+          conflictResolution: binding.conflictResolution,
         });
       } catch (error) {
         const category =
@@ -521,7 +594,16 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
       }
       const inventory = enumerateSdwExportInventory(options.inventory, namespaces);
       assertManifestMatchesInventory(manifest, inventory, summary.digest);
-      deleteStash.set(normalizedArgsHash(args), inventory, Date.now());
+      // Bind THIS call's frozen inventory to THIS call's handler execution
+      // (see SDW_APPROVAL_BINDING): the handler deletes only against the
+      // snapshot the approval prompt displayed.
+      attachApprovalBinding(args, {
+        kind: "export_scope",
+        toolName: "sdw_export_delete",
+        argsHash: normalizedArgsHash(args),
+        inventory,
+        storedAtMs: Date.now(),
+      });
       return {
         manifest_body_digest: summary.digest,
         scope_digest: inventory.scope_digest,
@@ -543,14 +625,17 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
         return genericDeny("sdw_export_delete");
       }
 
-      const approved = deleteStash.consumeOldest(normalizedArgsHash(args), Date.now());
-      if (approved === null) {
+      // Fail closed when this call carries no gate-time approval binding —
+      // the consumed inventory is the one THIS call's approval displayed.
+      const binding = takeApprovalBinding(args, "sdw_export_delete", Date.now());
+      if (binding === null || binding.kind !== "export_scope") {
         await auditFailure("sdw_export_delete_denied", {
           denial_class: "approval_scope_binding_missing",
           manifest_body_digest: digest,
         });
         return genericDeny("sdw_export_delete");
       }
+      const approved = binding.inventory;
 
       // Fail-closed drift recheck: every listed record must STILL exist with
       // exactly the exported ciphertext. Any mismatch aborts with zero deletes

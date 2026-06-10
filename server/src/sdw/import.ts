@@ -11,10 +11,16 @@
  * - Record decryption happens exclusively inside the approved import flow:
  *   verify again on the exact bytes → decrypt with source material → validate
  *   (version, kind, manifest membership, canonical hash) → rebind AAD to the
- *   target fortress → re-encrypt through `mintPersistable` → `sdwBackendWrite`.
+ *   target fortress → re-encrypt through `mintPersistable` → transactional
+ *   `txn.writePersistable`.
  * - Two-phase commit: every record is decrypted and validated in memory FIRST;
  *   nothing is written unless the entire bundle validates (fail closed, no
  *   partial imports).
+ * - Phase 2 is ATOMIC: all record writes happen inside a single SDW storage
+ *   transaction (`SdwTransactional.sdwTransaction`), so a crash or write
+ *   failure mid-batch rolls back to zero writes. A storage backend without
+ *   transactions fails the import closed BEFORE phase 1 — atomicity is never
+ *   faked with best-effort writes (constraint #5).
  */
 
 import type { StorageBackend } from "../storage/interface.js";
@@ -26,9 +32,9 @@ import { sdwAad, isSdwIdentifier } from "./grammar.js";
 import {
   isSdwNamespace,
   mintPersistable,
-  sdwBackendWrite,
   type Persistable,
 } from "./write-gate.js";
+import type { SdwTransactional } from "./lmdb-backend.js";
 import type { SdwNamespace, SdwRecord } from "./records.js";
 import {
   computeSdwExportRecordHash,
@@ -55,7 +61,8 @@ export type SdwImportRejectCategory =
   | "identity_mismatch"
   | "decrypt_failed"
   | "schema_invalid"
-  | "source_key_unavailable";
+  | "source_key_unavailable"
+  | "storage_not_transactional";
 
 /**
  * Typed verification/import failure. `message` and `category` are safe to
@@ -241,8 +248,11 @@ export interface SdwImportResult {
  * degraded import).
  *
  * Phase 2: rebind AAD to `target_fortress_id || namespace || key` and persist
- * each record through `mintPersistable` → `sdwBackendWrite` (the single
- * gated write path, with taint/schema/classifier checks as defense-in-depth).
+ * every record inside ONE storage transaction via `txn.writePersistable`
+ * (the same gated write path, with taint/schema/classifier checks as
+ * defense-in-depth). The transaction makes phase 2 all-or-nothing: a crash
+ * or write failure after some writes rolls back to zero writes. Backends
+ * without `sdwTransaction` fail closed before anything is decrypted.
  */
 export async function importSdwExportBundle(params: {
   readonly bundle: SdwStateExportBundle;
@@ -258,6 +268,15 @@ export async function importSdwExportBundle(params: {
   const conflictResolution = params.conflictResolution ?? "skip";
   if (!isSdwIdentifier(params.targetFortressId)) {
     throw new SdwImportVerificationError("schema_invalid", digest);
+  }
+
+  // Atomicity precondition, checked BEFORE anything is decrypted: phase 2
+  // must be all-or-nothing, and a backend without transactions cannot
+  // honestly provide that. Failing here is the non-degradation posture
+  // (constraint #5) — never fall back to best-effort per-record writes.
+  const transactional = asSdwTransactional(params.storage);
+  if (transactional === null) {
+    throw new SdwImportVerificationError("storage_not_transactional", digest);
   }
 
   // ── Phase 1: decrypt + validate + mint everything, write nothing ─────────
@@ -314,27 +333,34 @@ export async function importSdwExportBundle(params: {
     }
   }
 
-  // ── Phase 2: rebind + re-encrypt under the target fortress ───────────────
+  // ── Phase 2: rebind + re-encrypt under the target fortress, ATOMICALLY ───
+  // Every conflict check and write runs inside one storage transaction: if
+  // any write fails (or the process dies mid-batch), the backend rolls the
+  // whole set back — partial imported state is structurally impossible.
   let imported = 0;
   let skippedExisting = 0;
   let overwritten = 0;
-  for (const item of minted) {
-    const existing = await params.storage.read(item.namespace, item.key);
-    if (existing !== null) {
-      if (conflictResolution === "skip") {
-        skippedExisting += 1;
-        continue;
+  await transactional.sdwTransaction(async (txn) => {
+    imported = 0;
+    skippedExisting = 0;
+    overwritten = 0;
+    for (const item of minted) {
+      const existing = await txn.read(item.namespace, item.key);
+      if (existing !== null) {
+        if (conflictResolution === "skip") {
+          skippedExisting += 1;
+          continue;
+        }
+        overwritten += 1;
       }
-      overwritten += 1;
+      await txn.writePersistable(
+        item.persistable,
+        item.targetStoreKey,
+        params.targetFortressId,
+      );
+      imported += 1;
     }
-    await sdwBackendWrite(
-      params.storage,
-      item.persistable,
-      item.targetStoreKey,
-      params.targetFortressId,
-    );
-    imported += 1;
-  }
+  });
 
   return {
     manifest_body_digest: digest,
@@ -347,6 +373,15 @@ export async function importSdwExportBundle(params: {
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
+
+function asSdwTransactional(
+  storage: StorageBackend,
+): (StorageBackend & SdwTransactional) | null {
+  if ("sdwTransaction" in storage && typeof storage.sdwTransaction === "function") {
+    return storage as StorageBackend & SdwTransactional;
+  }
+  return null;
+}
 
 function decryptBundleRecord(
   envelope: EncryptedPayload,
