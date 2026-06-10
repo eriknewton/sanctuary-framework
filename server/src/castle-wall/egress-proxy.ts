@@ -5,6 +5,7 @@ import type { Duplex } from "node:stream";
 import { domainToASCII } from "node:url";
 
 import type { AllowlistRule } from "./allowlist/schema.js";
+import { ipMatches, cidrMatches } from "./allowlist/ip-cidr.js";
 
 export interface CanonicalConnectAuthority {
   host: string;
@@ -206,9 +207,16 @@ function ruleMatchesTarget(rule: AllowlistRule, target: CanonicalConnectAuthorit
     return false;
   }
 
+  // Destination axes compose as an OR (parity with the Swift evaluator): when
+  // none is specified the destination is "match any" (only protocol/port
+  // constrain); when any is specified, at least one must match. The ip/cidr
+  // axes match `target.host` only when it is an IP literal (a DNS flow to a
+  // resolver connects by raw IP), so a hostname target never spuriously matches.
   const hasHost = rule.match.host !== undefined;
   const hasHostPattern = rule.match.host_pattern !== undefined && rule.match.host_pattern.length > 0;
-  if (!hasHost && !hasHostPattern) {
+  const hasIp = rule.match.ip !== undefined;
+  const hasCidr = rule.match.cidr !== undefined;
+  if (!hasHost && !hasHostPattern && !hasIp && !hasCidr) {
     return true;
   }
 
@@ -216,6 +224,12 @@ function ruleMatchesTarget(rule: AllowlistRule, target: CanonicalConnectAuthorit
     return true;
   }
   if (rule.match.host_pattern !== undefined && rule.match.host_pattern.length > 0 && hostPatternMatches(rule.match.host_pattern, target.host)) {
+    return true;
+  }
+  if (rule.match.ip !== undefined && ipMatches(rule.match.ip, target.host)) {
+    return true;
+  }
+  if (rule.match.cidr !== undefined && cidrMatches(rule.match.cidr, target.host)) {
     return true;
   }
   return false;

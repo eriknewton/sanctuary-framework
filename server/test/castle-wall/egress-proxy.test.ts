@@ -118,4 +118,55 @@ describe("castle-wall/egress-proxy", () => {
   ])("classifies public routability for %s", (address, expected) => {
     expect(isPublicRoutableIp(address)).toBe(expected);
   });
+
+  // IP / CIDR matcher parity with the Swift evaluator (#380). The TS evaluator
+  // matches ip/cidr against an IP-literal CONNECT target host.
+  function allowIpRule(ip: string | string[]): AllowlistRule {
+    return {
+      id: "allow-ip",
+      schema_version: CASTLE_WALL_SCHEMA_VERSION_V1,
+      created_at: "2026-06-10T00:00:00.000Z",
+      match: { ip, port: 53, protocol: "tcp+udp" },
+      scope: {},
+      disposition: "allow",
+    };
+  }
+  function allowCidrRule(cidr: string | string[]): AllowlistRule {
+    return {
+      id: "allow-cidr",
+      schema_version: CASTLE_WALL_SCHEMA_VERSION_V1,
+      created_at: "2026-06-10T00:00:00.000Z",
+      match: { cidr, protocol: "tcp" },
+      scope: {},
+      disposition: "allow",
+    };
+  }
+
+  it("matches an ip-scoped rule against an IP-literal target", () => {
+    const target = canonicalizeConnectAuthority("1.1.1.1:53");
+    expect(allowlistAllowsTarget([allowIpRule(["1.1.1.1", "8.8.8.8"])], target)).toBe(true);
+  });
+
+  it("does NOT match an ip-scoped rule for a non-listed IP (the security property)", () => {
+    const target = canonicalizeConnectAuthority("9.9.9.9:53");
+    expect(allowlistAllowsTarget([allowIpRule(["1.1.1.1", "8.8.8.8"])], target)).toBe(false);
+  });
+
+  it("matches a cidr-scoped rule by prefix containment, family-aware", () => {
+    expect(
+      allowlistAllowsTarget([allowCidrRule("10.0.0.0/24")], canonicalizeConnectAuthority("10.0.0.5:443"))
+    ).toBe(true);
+    expect(
+      allowlistAllowsTarget([allowCidrRule("10.0.0.0/24")], canonicalizeConnectAuthority("10.0.1.5:443"))
+    ).toBe(false);
+    expect(
+      allowlistAllowsTarget([allowCidrRule("2001:db8::/32")], canonicalizeConnectAuthority("[2001:db8::1]:443"))
+    ).toBe(true);
+  });
+
+  it("never matches ip/cidr against a hostname target", () => {
+    const target = canonicalizeConnectAuthority("api.example.com:53");
+    expect(allowlistAllowsTarget([allowIpRule("1.1.1.1")], target)).toBe(false);
+    expect(allowlistAllowsTarget([allowCidrRule("10.0.0.0/8")], target)).toBe(false);
+  });
 });

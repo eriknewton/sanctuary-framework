@@ -24,6 +24,9 @@
 //
 
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 import CastleWallIPC
 
 public enum AllowlistEvaluator {
@@ -130,17 +133,29 @@ public enum AllowlistEvaluator {
             return false
         }
 
+        // Destination axes (host / host_pattern / ip / cidr) compose as an OR:
+        // when none is specified the destination is "match any"; when one or
+        // more are specified, at least one must match. This must agree with the
+        // TS evaluator (egress-proxy) on every input.
         let hasExactHost = match.host != nil
         let hasHostPattern = match.hostPattern?.isEmpty == false
-        if hasExactHost || hasHostPattern {
-            var hostAxisMatches = false
+        let hasIp = match.ip != nil
+        let hasCidr = match.cidr != nil
+        if hasExactHost || hasHostPattern || hasIp || hasCidr {
+            var destinationMatches = false
             if let host = match.host, hostMatches(spec: host, flow: flow) {
-                hostAxisMatches = true
+                destinationMatches = true
             }
             if let pattern = match.hostPattern, hostPatternMatches(pattern: pattern, flow: flow) {
-                hostAxisMatches = true
+                destinationMatches = true
             }
-            if !hostAxisMatches {
+            if let ip = match.ip, ipMatches(spec: ip, flow: flow) {
+                destinationMatches = true
+            }
+            if let cidr = match.cidr, cidrMatches(spec: cidr, flow: flow) {
+                destinationMatches = true
+            }
+            if !destinationMatches {
                 return false
             }
         }
@@ -166,6 +181,90 @@ public enum AllowlistEvaluator {
         return spec.values.contains { candidate in
             candidate.caseInsensitiveCompare(host) == .orderedSame
         }
+    }
+
+    // MARK: - IP / CIDR matching (#380)
+    //
+    // A parsed IP address: its family (AF_INET / AF_INET6) and its address bytes
+    // in network order (4 bytes for IPv4, 16 for IPv6). Equality and CIDR
+    // containment operate on these normalized bytes so textual variants
+    // (`::1` vs `0:0:0:0:0:0:0:1`, zero-padding) compare equal, and a mismatched
+    // family never matches. This must agree with the TS evaluator on every input.
+
+    struct ParsedIP: Equatable {
+        let family: Int32
+        let bytes: [UInt8]
+    }
+
+    /// Parse an IPv4 or IPv6 literal to normalized network-order bytes via
+    /// `inet_pton`, or nil when the string is not a valid IP of either family.
+    static func parseIP(_ text: String) -> ParsedIP? {
+        var v4 = in_addr()
+        if inet_pton(AF_INET, text, &v4) == 1 {
+            var bytes = [UInt8](repeating: 0, count: 4)
+            withUnsafeBytes(of: &v4.s_addr) { raw in
+                for i in 0..<4 { bytes[i] = raw[i] }
+            }
+            return ParsedIP(family: AF_INET, bytes: bytes)
+        }
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, text, &v6) == 1 {
+            var bytes = [UInt8](repeating: 0, count: 16)
+            withUnsafeBytes(of: &v6) { raw in
+                for i in 0..<16 { bytes[i] = raw[i] }
+            }
+            return ParsedIP(family: AF_INET6, bytes: bytes)
+        }
+        return nil
+    }
+
+    /// True iff the flow's destination IP exactly equals any IP in `spec`
+    /// (family-aware). Malformed candidate strings never match.
+    static func ipMatches(spec: ManifestRuleHostMatch, flow: FilterFlowDescriptor) -> Bool {
+        guard let target = parseIP(flow.destinationIp) else { return false }
+        return spec.values.contains { candidate in
+            guard let parsed = parseIP(candidate) else { return false }
+            return parsed.family == target.family && parsed.bytes == target.bytes
+        }
+    }
+
+    /// True iff the flow's destination IP falls inside any CIDR in `spec`
+    /// (family-aware prefix containment). Malformed candidates never match.
+    static func cidrMatches(spec: ManifestRuleHostMatch, flow: FilterFlowDescriptor) -> Bool {
+        guard let target = parseIP(flow.destinationIp) else { return false }
+        return spec.values.contains { cidr in
+            cidrContains(cidr: cidr, ip: target)
+        }
+    }
+
+    /// True iff `ip` is contained in `cidr` (`addr/prefix`). Rejects a missing
+    /// or non-numeric prefix, an out-of-range prefix, an unparseable base, or a
+    /// family mismatch between base and `ip`.
+    static func cidrContains(cidr: String, ip: ParsedIP) -> Bool {
+        let parts = cidr.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2, let prefix = Int(parts[1]) else { return false }
+        guard let base = parseIP(String(parts[0])) else { return false }
+        guard base.family == ip.family else { return false }
+        let maxBits = base.family == AF_INET ? 32 : 128
+        guard prefix >= 0 && prefix <= maxBits else { return false }
+        return prefixBitsEqual(base.bytes, ip.bytes, prefixBits: prefix)
+    }
+
+    /// True iff the first `prefixBits` bits of `a` and `b` are equal. Both byte
+    /// arrays are assumed the same length (same family).
+    static func prefixBitsEqual(_ a: [UInt8], _ b: [UInt8], prefixBits: Int) -> Bool {
+        let fullBytes = prefixBits / 8
+        let remainderBits = prefixBits % 8
+        for i in 0..<fullBytes where a[i] != b[i] {
+            return false
+        }
+        if remainderBits > 0 {
+            let mask = UInt8(truncatingIfNeeded: 0xFF << (8 - remainderBits))
+            if (a[fullBytes] & mask) != (b[fullBytes] & mask) {
+                return false
+            }
+        }
+        return true
     }
 
     /// Host-pattern: simple suffix wildcard (`*.example.com`) and exact
