@@ -76,7 +76,8 @@ public enum SanctuaryVMMCLI {
             cpuCount: request.cpuCount ?? 2,
             memoryBytes: request.memoryBytes ?? 512 * 1024 * 1024,
             rootfsPins: request.rootfsPins ?? [],
-            egressVsockPort: request.egressVsockPort ?? 0x0FFF_0001
+            egressVsockPort: request.egressVsockPort ?? 0x0FFF_0001,
+            applyGuestJail: request.applyGuestJail ?? true
         )
 
         let launcher = SanctuaryContainerLauncher(config: config)
@@ -144,7 +145,8 @@ public enum SanctuaryVMMCLI {
             cpuCount: request.cpuCount ?? 2,
             memoryBytes: request.memoryBytes ?? 512 * 1024 * 1024,
             rootfsPins: request.rootfsPins ?? [],
-            egressVsockPort: request.egressVsockPort ?? 0x0FFF_0001
+            egressVsockPort: request.egressVsockPort ?? 0x0FFF_0001,
+            applyGuestJail: request.applyGuestJail ?? true
         )
 
         let egressConfig = SanctuaryVsockEgressConfig(
@@ -212,6 +214,7 @@ struct GuestExecCLIRequest: Codable {
     let memoryBytes: UInt64?
     let rootfsPins: [SanctuaryArtifactPin]?
     let egressVsockPort: UInt32?
+    let applyGuestJail: Bool?
     let command: String
     let args: [String]
     let cwd: String
@@ -227,6 +230,7 @@ struct RunBoxCLIRequest: Codable {
     let memoryBytes: UInt64?
     let rootfsPins: [SanctuaryArtifactPin]?
     let egressVsockPort: UInt32?
+    let applyGuestJail: Bool?
     let egressProxyUdsPath: String
     let egressGuestSocketPath: String?
     let command: String
