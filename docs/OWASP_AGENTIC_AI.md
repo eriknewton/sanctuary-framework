@@ -1,8 +1,8 @@
-# Mapping Sanctuary L1–L4 to the OWASP Top 10 for Agentic AI (2025)
+# Mapping Sanctuary's Four Sovereignty Layers to the OWASP Top 10 for Agentic AI (2025)
 
 > **Purpose.** This document maps the Sanctuary Framework's four sovereignty
-> layers (L1 Cognitive, L2 Operational, L3 Selective Disclosure, L4
-> Verifiable Reputation) and its specific MCP tools onto each category of
+> layers (Cognitive, Operational, Selective Disclosure, Verifiable
+> Reputation) and its specific MCP tools onto each category of
 > the OWASP Top 10 for Agentic AI (2025 draft). Where a category is only
 > partially addressed, the mapping says so; where a category is outside
 > Sanctuary's scope, the mapping says that too. This is a working
@@ -29,21 +29,21 @@ Each section includes:
 **Risk.** Untrusted data injected into an agent's persistent memory
 corrupts future decisions.
 
-**Sanctuary layer(s):** L1 Cognitive Sovereignty, L2 Operational Isolation
+**Sanctuary layer(s):** Cognitive Sovereignty, Operational Isolation
 
 **Coverage:** partial
 
 **Mechanism.**
 - All persisted agent state is AES-256-GCM encrypted under a
   master key derived via Argon2id from the principal's passphrase
-  (L1). An attacker without the passphrase cannot read or tamper with
+  (Cognitive Sovereignty). An attacker without the passphrase cannot read or tamper with
   stored memory in place.
 - State integrity is Merkle-tree verified on read (`state_read` returns
   a proof). Tampering is detected, not silently accepted.
-- The L2 injection detector (`security/injection-detector.ts`) scans
+- The Operational-layer injection detector (`security/injection-detector.ts`) scans
   every tool call — including memory writes — for prompt-injection
   signals before the call is executed.
-- L2 Context Gating (5 tools: `context_gate_set_policy`,
+- Operational Context Gating (5 tools: `context_gate_set_policy`,
   `context_gate_filter`, etc.) restricts what enters an LLM inference
   call, reducing the attack surface for memory-poisoning payloads
   relayed through the model.
@@ -51,7 +51,7 @@ corrupts future decisions.
 **Gap.**
 - Sanctuary cannot distinguish "content-poisoned but cryptographically
   valid" memory from "authentic" memory. If the agent itself writes
-  poisoned content under authorized auth, L1 integrity checks pass.
+  poisoned content under authorized auth, Cognitive-layer integrity checks pass.
 - The injection detector uses heuristics, not semantic analysis.
 
 ---
@@ -61,7 +61,7 @@ corrupts future decisions.
 **Risk.** An agent invokes a legitimate tool in a harmful way — excess
 scope, wrong context, or under adversarial prompt influence.
 
-**Sanctuary layer(s):** L2 Operational Isolation
+**Sanctuary layer(s):** Operational Isolation
 
 **Coverage:** full (within its scope)
 
@@ -84,7 +84,7 @@ scope, wrong context, or under adversarial prompt influence.
 
 **Gap.**
 - Sanctuary trusts tool vendors: if an upstream tool itself is
-  malicious, L2 limits damage but cannot prevent intent-following
+  malicious, Operational Isolation limits damage but cannot prevent intent-following
   harm within tier-3 auto-allowed surfaces.
 
 ---
@@ -93,12 +93,12 @@ scope, wrong context, or under adversarial prompt influence.
 
 **Risk.** An agent acquires or keeps privileges beyond its intended scope.
 
-**Sanctuary layer(s):** L1, L2
+**Sanctuary layer(s):** Cognitive Sovereignty, Operational Isolation
 
 **Coverage:** partial
 
 **Mechanism.**
-- **Identity keys are self-custodied and encrypted at rest** (L1).
+- **Identity keys are self-custodied and encrypted at rest** (Cognitive Sovereignty).
   Private keys never appear in any MCP response, log entry, or error
   message (`test/security/key-never-in-response.test.ts`).
 - **Principal Policy is loaded once at startup and frozen** — no
@@ -124,7 +124,7 @@ scope, wrong context, or under adversarial prompt influence.
 **Risk.** An agent (or adversary impersonating one) exhausts compute,
 token budget, memory, or rate quotas.
 
-**Sanctuary layer(s):** L2
+**Sanctuary layer(s):** Operational Isolation
 
 **Coverage:** partial
 
@@ -150,7 +150,7 @@ token budget, memory, or rate quotas.
 **Risk.** A mistake in one agent becomes ground truth for another,
 compounding errors across an agent mesh.
 
-**Sanctuary layer(s):** L4
+**Sanctuary layer(s):** Verifiable Reputation
 
 **Coverage:** partial
 
@@ -177,7 +177,7 @@ compounding errors across an agent mesh.
 **Risk.** An agent's effective goal is shifted by adversarial inputs,
 corrupted planning steps, or manipulated context.
 
-**Sanctuary layer(s):** L1, L2
+**Sanctuary layer(s):** Cognitive Sovereignty, Operational Isolation
 
 **Coverage:** partial
 
@@ -209,7 +209,7 @@ corrupted planning steps, or manipulated context.
 **Risk.** An agent takes actions that serve a hidden goal, misleads
 the user, or conceals relevant information.
 
-**Sanctuary layer(s):** L2, L4
+**Sanctuary layer(s):** Operational Isolation, Verifiable Reputation
 
 **Coverage:** not-addressed (at the intent level); partial (at the audit level)
 
@@ -217,10 +217,10 @@ the user, or conceals relevant information.
 - **Tamper-evident audit log** (`l2-operational/audit-log.ts`):
   every tool call, approval decision, and denial is appended to an
   encrypted audit trail that can be exported and reviewed.
-- **Signed attestations** (L4): all reputation attestations are
+- **Signed attestations** (Verifiable Reputation): all reputation attestations are
   Ed25519-signed with tier-weighted provenance, so deceptive
   self-reports are marked as self-attested (tier 0.2).
-- **L4 Sybil detection** flags self-dealing and closed-loop
+- **Verifiable Reputation Sybil detection** flags self-dealing and closed-loop
   attestation patterns (in Concordia; partial on Sanctuary side).
 
 **Gap.**
@@ -236,7 +236,7 @@ the user, or conceals relevant information.
 **Risk.** An agent (or its principal) denies taking an action it
 actually took.
 
-**Sanctuary layer(s):** L1, L4
+**Sanctuary layer(s):** Cognitive Sovereignty, Verifiable Reputation
 
 **Coverage:** full
 
@@ -246,7 +246,7 @@ actually took.
   bridge commitments are all signed by the agent's identity key
   (`core/identity.ts: sign`).
 - **Hash-chain integrity on Concordia-side transcripts** plus
-  **Merkle-root monotonic versioning on Sanctuary L1 state** make
+  **Merkle-root monotonic versioning on Sanctuary Cognitive-layer state** make
   tampering detectable.
 - **Principal approval events are logged** with who/when/via-what-
   channel metadata.
@@ -265,12 +265,12 @@ actually took.
 **Risk.** An agent impersonates a different agent, user, or
 organizational entity.
 
-**Sanctuary layer(s):** L1, L4
+**Sanctuary layer(s):** Cognitive Sovereignty, Verifiable Reputation
 
 **Coverage:** full
 
 **Mechanism.**
-- **Self-custodied Ed25519 identities** (L1). Agents cannot create
+- **Self-custodied Ed25519 identities** (Cognitive Sovereignty). Agents cannot create
   DIDs for other agents because they cannot forge signatures without
   the private key.
 - **Sovereignty Handshake** (`handshake/tools.ts`): nonce
@@ -297,7 +297,7 @@ organizational entity.
 **Risk.** Principals delegate decisions they should not delegate
 because they over-trust the agent.
 
-**Sanctuary layer(s):** L2 (indirect)
+**Sanctuary layer(s):** Operational Isolation (indirect)
 
 **Coverage:** not-addressed (Sanctuary is not a UX layer)
 
@@ -320,8 +320,8 @@ because they over-trust the agent.
 
 ## Layer-to-risk summary
 
-| Risk                                  | L1       | L2       | L3       | L4       |
-|---------------------------------------|----------|----------|----------|----------|
+| Risk                                  | Cognitive | Operational | Selective Disclosure | Verifiable Reputation |
+|---------------------------------------|-----------|-------------|----------------------|-----------------------|
 | AAI01 Memory Poisoning                | partial  | partial  | —        | —        |
 | AAI02 Tool Misuse                     | —        | full     | —        | —        |
 | AAI03 Privilege Compromise            | partial  | partial  | —        | —        |
@@ -333,9 +333,9 @@ because they over-trust the agent.
 | AAI09 Identity Spoofing               | full     | —        | —        | full     |
 | AAI10 Overreliance                    | —        | partial  | —        | —        |
 
-**L3 (Selective Disclosure)** does not map directly to the OWASP
+**Selective Disclosure** does not map directly to the OWASP
 Top 10 because the OWASP list focuses on operational and identity
-risks. L3 addresses a separate concern: **minimum-necessary
+risks. Selective Disclosure addresses a separate concern: **minimum-necessary
 disclosure** in claims-based interactions (proving a range, an
 inequality, or a commitment without revealing the underlying value).
 This maps more naturally to privacy and data-minimization
@@ -355,7 +355,7 @@ To set honest expectations:
 - **Sanctuary is not a replacement for secure software development.**
   Secret management, dependency auditing, network policy, and host
   hardening remain the operator's responsibility.
-- **Sanctuary is not a SNARK-based ZK system** (yet). L3 uses Schnorr
+- **Sanctuary is not a SNARK-based ZK system** (yet). Selective Disclosure uses Schnorr
   proofs and Pedersen commitments over Ristretto255 — genuine ZK
   primitives, but not Groth16/PLONK. See `config.ts` validation.
 

@@ -59,7 +59,7 @@ Out of scope for v0.1:
 
    Acceptance: the verifier checks the manifest signature, every artifact hash,
    public identity signature, reputation bundle signature, and verifiable
-   reputation attestation signatures. Legacy L2 audit receipts are pinned by
+   reputation attestation signatures. Legacy Operational audit receipts are pinned by
    the signed manifest hash and reported as not individually signed.
 
 4. Move the exported bundle to the destination machine through operator-approved storage.
@@ -115,7 +115,7 @@ The exit drill passes only if all of the following are true:
 ## Current Gaps
 
 - Dashboard does not yet guide the operator through the drill.
-- Legacy L2 audit log entries are not individually signed; the exit verifier
+- Legacy Operational audit log entries are not individually signed; the exit verifier
   pins audit receipts by signed manifest hash and reports that limitation.
 - Audit receipt import is archive-only. The importer stages
   `artifacts/audit_receipts.json` under `_exit_audit_receipts` for inspection;

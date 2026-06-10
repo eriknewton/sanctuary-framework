@@ -46,14 +46,14 @@ Block conditions: any tool that egresses to a remote host MUST flow its outbound
 
 Pick one of:
 
-- A reference to an existing audit-event type in `server/src/audit/types.ts` (e.g., "L2 gate decision audit entry").
+- A reference to an existing audit-event type in `server/src/audit/types.ts` (e.g., "Operational gate decision audit entry").
 - A new audit-event type committed in the same PR. New types MUST include: timestamp, identity id, agent id, tool name, tier, outcome, and content hashes for any payload material. Signature lives on the enclosing audit-chain entry, not on the event payload itself.
 
 Block conditions:
 
 - The audit event MUST NOT carry raw sensitive content. Hashes only.
 - Every signed envelope (mesh-batch, handoff record, exit-bundle manifest) MUST include `signature_scheme: "ed25519-v1"` per the v1.1 contracts (`server/src/contracts/v1.1/constants.ts`). Audit-event payloads that are not themselves signed envelopes MUST flow through an enclosing audit-chain entry that verifies under the same scheme.
-- Tools that touch the privacy filter MUST emit a privacy event from `server/src/contracts/v1.1/privacy-events.ts` in addition to the L2 gate audit entry.
+- Tools that touch the privacy filter MUST emit a privacy event from `server/src/contracts/v1.1/privacy-events.ts` in addition to the Operational gate audit entry.
 - Tools that touch a handoff MUST emit a `LocalHandoffAuditEvent` from `server/src/contracts/v1.1/handoff-records.ts`.
 
 ### 4. Privacy impact
@@ -83,7 +83,7 @@ registerTool({
   name: "state_export",
   policy_tier: "tier1",
   outbound_network: "none",
-  audit_event: "L2_GATE_DECISION",
+  audit_event: "OPERATIONAL_GATE_DECISION",
   privacy_impact: "no_external_data",
   justification: "Tier 1 because export is irreversible; no_external_data because the bundle stays on the operator's machine.",
 });
@@ -122,7 +122,7 @@ Each example below is illustrative only; real tool sources are authoritative.
 ```text
 policy_tier: tier1
 outbound_network: none
-audit_event: L2 gate decision + state-export entry in audit chain
+audit_event: Operational gate decision + state-export entry in audit chain
 privacy_impact: no_external_data (export bundle stays on the operator's machine)
 ```
 
@@ -131,7 +131,7 @@ privacy_impact: no_external_data (export bundle stays on the operator's machine)
 ```text
 policy_tier: tier3
 outbound_network: model_only
-audit_event: privacy-event chain (filtered or denied) + L2 gate decision
+audit_event: privacy-event chain (filtered or denied) + Operational gate decision
 privacy_impact: model_context_only (every call flows through the privacy filter)
 ```
 
