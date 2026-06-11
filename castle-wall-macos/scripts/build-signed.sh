@@ -47,9 +47,12 @@
 set -euo pipefail
 
 PKG_DIR="$(cd "$(dirname "$0")"/.. && pwd)"
+REPO_DIR="$(cd "${PKG_DIR}/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${PKG_DIR}/build/CastleWallExtension.app}"
 SWIFT_BUILD_CONFIG="${SWIFT_BUILD_CONFIG:-release}"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Erik Newton (YFQSWQ9BJN)}"
+CASTLE_WALL_GIT_SHA="${CASTLE_WALL_GIT_SHA:-$(git -C "${REPO_DIR}" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)}"
+CASTLE_WALL_HEADLESS_CONTRACT_VERSION="${CASTLE_WALL_HEADLESS_CONTRACT_VERSION:-2}"
 EXECUTABLE_NAME="CastleWallExtension"
 INFO_PLIST="${PKG_DIR}/Sources/CastleWallExtension/Info.plist"
 ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallExtension/CastleWallExtension.entitlements"
@@ -110,6 +113,8 @@ fi
 
 echo "[build-signed] castle-wall-macos package: ${PKG_DIR}"
 echo "[build-signed] swift build config: ${SWIFT_BUILD_CONFIG}"
+echo "[build-signed] git sha: ${CASTLE_WALL_GIT_SHA}"
+echo "[build-signed] headless contract: ${CASTLE_WALL_HEADLESS_CONTRACT_VERSION}"
 echo "[build-signed] target .app bundle: ${BUILD_DIR}"
 echo "[build-signed] signing identity:   ${SIGNING_IDENTITY}"
 echo "[build-signed] wrapped mode:        ${WRAPPED}"
@@ -190,6 +195,14 @@ cp "${INFO_PLIST}" "${BUILD_DIR}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName ${EXECUTABLE_NAME}" "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1
 /usr/libexec/PlistBuddy -c "Set :NSExtension:NSExtensionPrincipalClass CastleWallFilter.CastleWallFilterProvider" \
     "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1
+/usr/libexec/PlistBuddy -c "Set :SanctuaryCastleWallGitSHA ${CASTLE_WALL_GIT_SHA}" \
+    "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1 || \
+    /usr/libexec/PlistBuddy -c "Add :SanctuaryCastleWallGitSHA string ${CASTLE_WALL_GIT_SHA}" \
+        "${BUILD_DIR}/Contents/Info.plist" >/dev/null
+/usr/libexec/PlistBuddy -c "Set :SanctuaryCastleWallHeadlessContractVersion ${CASTLE_WALL_HEADLESS_CONTRACT_VERSION}" \
+    "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1 || \
+    /usr/libexec/PlistBuddy -c "Add :SanctuaryCastleWallHeadlessContractVersion string ${CASTLE_WALL_HEADLESS_CONTRACT_VERSION}" \
+        "${BUILD_DIR}/Contents/Info.plist" >/dev/null
 if grep -E '\$\([A-Z_]+\)' "${BUILD_DIR}/Contents/Info.plist" > /dev/null; then
     echo "ERROR: Info.plist still contains unresolved \$(...) tokens after PlistBuddy substitution" >&2
     grep -E '\$\([A-Z_]+\)' "${BUILD_DIR}/Contents/Info.plist" >&2

@@ -19,6 +19,7 @@ import NetworkExtension
 /// console click for that, once per install.
 enum HeadlessFilterCLI {
     static let headlessFlag = "--headless"
+    static let headlessContractVersion = "2"
     private static let defaultTimeoutSeconds = 30.0
 
     enum Action: String {
@@ -73,11 +74,43 @@ enum HeadlessFilterCLI {
 
     /// Machine-readable result, one JSON line on stdout.
     struct Report: Codable, Equatable {
+        struct Build: Codable, Equatable {
+            let gitSha: String
+            let headlessContractVersion: String
+
+            enum CodingKeys: String, CodingKey {
+                case gitSha = "git_sha"
+                case headlessContractVersion = "headless_contract_version"
+            }
+
+            static func current() -> Build {
+                Build(
+                    gitSha: HeadlessFilterCLI.currentBuildGitSha(),
+                    headlessContractVersion: HeadlessFilterCLI.headlessContractVersion
+                )
+            }
+        }
+
         let ok: Bool
         let action: String
         /// "enabled" | "disabled" | "needs_user_approval" | "unknown"
         let state: String
         let error: String?
+        let build: Build
+
+        init(
+            ok: Bool,
+            action: String,
+            state: String,
+            error: String?,
+            build: Build = .current()
+        ) {
+            self.ok = ok
+            self.action = action
+            self.state = state
+            self.error = error
+            self.build = build
+        }
     }
 
     /// Returns nil when the process was launched normally (GUI mode).
@@ -142,6 +175,19 @@ enum HeadlessFilterCLI {
             return #"{"action":"\#(report.action)","error":"report encoding failed","ok":false,"state":"unknown"}"#
         }
         return text
+    }
+
+    private static func currentBuildGitSha() -> String {
+        if let envSha = ProcessInfo.processInfo.environment["SANCTUARY_CASTLE_BUILD_SHA"],
+           !envSha.isEmpty {
+            return envSha
+        }
+        if let plistSha = Bundle.main.object(forInfoDictionaryKey: "SanctuaryCastleWallGitSHA")
+            as? String,
+            !plistSha.isEmpty {
+            return plistSha
+        }
+        return "unknown"
     }
 
     /// Write the single JSON report line to `path` (0600, the caller-supplied

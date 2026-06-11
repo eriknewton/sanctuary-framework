@@ -18,6 +18,10 @@
     <string>1.0</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
+    <key>SanctuaryCastleWallGitSHA</key>
+    <string>unknown</string>
+    <key>SanctuaryCastleWallHeadlessContractVersion</key>
+    <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSSystemExtensionUsageDescription</key>

@@ -11,9 +11,12 @@
 set -euo pipefail
 
 PKG_DIR="$(cd "$(dirname "$0")"/.. && pwd)"
+REPO_DIR="$(cd "${PKG_DIR}/.." && pwd)"
 SWIFT_BUILD_CONFIG="${SWIFT_BUILD_CONFIG:-release}"
 BUILD_ROOT="${BUILD_ROOT:-${PKG_DIR}/build}"
 WRAPPED_APP_DIR="${WRAPPED_APP_DIR:-${BUILD_ROOT}/Sanctuary-CastleWall.app}"
+CASTLE_WALL_GIT_SHA="${CASTLE_WALL_GIT_SHA:-$(git -C "${REPO_DIR}" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)}"
+CASTLE_WALL_HEADLESS_CONTRACT_VERSION="${CASTLE_WALL_HEADLESS_CONTRACT_VERSION:-2}"
 
 HOST_TARGET="CastleWallHostApp"
 HOST_EXECUTABLE_NAME="CastleWallHostApp"
@@ -100,6 +103,8 @@ require_cmd /usr/libexec/PlistBuddy
 
 log "castle-wall-macos package: ${PKG_DIR}"
 log "swift build config: ${SWIFT_BUILD_CONFIG}"
+log "git sha: ${CASTLE_WALL_GIT_SHA}"
+log "headless contract: ${CASTLE_WALL_HEADLESS_CONTRACT_VERSION}"
 log "wrapped app target: ${WRAPPED_APP_DIR}"
 
 log "step 1/5 - build release artifacts"
@@ -161,6 +166,10 @@ cp "${EXT_INFO_SRC}" "${EXT_INFO_DST}"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable ${HOST_EXECUTABLE_NAME}" "${HOST_INFO_DST}" >/dev/null 2>&1 || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleName Sanctuary-CastleWall" "${HOST_INFO_DST}" >/dev/null 2>&1 || true
+/usr/libexec/PlistBuddy -c "Set :SanctuaryCastleWallGitSHA ${CASTLE_WALL_GIT_SHA}" "${HOST_INFO_DST}" >/dev/null 2>&1 || \
+    /usr/libexec/PlistBuddy -c "Add :SanctuaryCastleWallGitSHA string ${CASTLE_WALL_GIT_SHA}" "${HOST_INFO_DST}" >/dev/null
+/usr/libexec/PlistBuddy -c "Set :SanctuaryCastleWallHeadlessContractVersion ${CASTLE_WALL_HEADLESS_CONTRACT_VERSION}" "${HOST_INFO_DST}" >/dev/null 2>&1 || \
+    /usr/libexec/PlistBuddy -c "Add :SanctuaryCastleWallHeadlessContractVersion string ${CASTLE_WALL_HEADLESS_CONTRACT_VERSION}" "${HOST_INFO_DST}" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable ${EXT_EXECUTABLE_NAME}" "${EXT_INFO_DST}" >/dev/null 2>&1
 /usr/libexec/PlistBuddy -c "Set :CFBundleName ${EXT_EXECUTABLE_NAME}" "${EXT_INFO_DST}" >/dev/null 2>&1
 /usr/libexec/PlistBuddy -c "Set :NSExtension:NSExtensionPrincipalClass CastleWallFilterProvider" "${EXT_INFO_DST}" >/dev/null 2>&1
