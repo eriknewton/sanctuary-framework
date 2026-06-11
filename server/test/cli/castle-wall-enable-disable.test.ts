@@ -11,6 +11,7 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
 import {
+  CASTLE_WALL_HEADLESS_CONTRACT_VERSION,
   makeLaunchServicesHostAppInvoke,
   parseCastleWallArgs,
   runDisable,
@@ -18,6 +19,8 @@ import {
   type HostAppInvoker,
   type OpenRunner,
 } from "../../src/cli/castle-wall.js";
+
+const TEST_BUILD_SHA = "test-build-sha";
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -30,7 +33,25 @@ class CaptureStream extends Writable {
   }
 }
 
-function reportLine(action: string, state: string, ok: boolean, error?: string): string {
+function reportLine(
+  action: string,
+  state: string,
+  ok: boolean,
+  error?: string,
+  build = {
+    git_sha: TEST_BUILD_SHA,
+    headless_contract_version: CASTLE_WALL_HEADLESS_CONTRACT_VERSION,
+  },
+): string {
+  return JSON.stringify({ action, build, error, ok, state }) + "\n";
+}
+
+function legacyReportLine(
+  action: string,
+  state: string,
+  ok: boolean,
+  error?: string,
+): string {
   return JSON.stringify({ action, error, ok, state }) + "\n";
 }
 
@@ -80,6 +101,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     const env = {
       SANCTUARY_STORAGE_PATH: fortressPath,
       SANCTUARY_RECOVERY_KEY: recoveryKey,
+      SANCTUARY_CASTLE_BUILD_SHA: TEST_BUILD_SHA,
     };
     return { fortressPath, hostAppPath, env, recoveryKey };
   }
@@ -330,6 +352,56 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(err.text()).toContain("post-change verification");
   });
 
+  it("fails loud when the deployed app omits the headless build identity", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: legacyReportLine("enable", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--force", "--no-ttl"], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      sysextProbe: async () => "[activated enabled]",
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("did not report a headless build identity");
+    expect(err.text()).toContain("rebuild + redeploy");
+  });
+
+  it("fails loud when the deployed app build does not match the CLI build", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: {
+        stdout: reportLine("enable", "enabled", true, undefined, {
+          git_sha: "stale-app-sha",
+          headless_contract_version: CASTLE_WALL_HEADLESS_CONTRACT_VERSION,
+        }),
+        exitCode: 0,
+      },
+    });
+
+    const code = await runEnable(["--force", "--no-ttl"], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      sysextProbe: async () => "[activated enabled]",
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("deployed app stale-app-sha != CLI test-build-sha");
+    expect(err.text()).toContain("rebuild + redeploy");
+  });
+
   it("disarm treats an inconclusive post-change verification as success (dead-man lever)", async () => {
     // On macOS Tahoe the corroborating status re-read spawns a SECOND
     // LaunchServices app instance that can time out / yield no parseable report
@@ -550,6 +622,10 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       sysextProbe: async () => "[activated enabled]",
       reportPathFactory: () => reportPath,
+      runningAppController: {
+        isRunning: async () => false,
+        terminate: async () => true,
+      },
       openRunner: async (command, args) => {
         openArgs.push([command, ...args]);
         // Simulate the host app writing its report, keyed off the action arg.
@@ -597,6 +673,11 @@ describe("makeLaunchServicesHostAppInvoke", () => {
   const APP_BINARY =
     "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/CastleWallHostApp";
 
+  const notRunning = {
+    isRunning: async () => false,
+    terminate: async () => true,
+  };
+
   it("resolves the .app bundle, round-trips the report file, and derives exit 0", async () => {
     const dir = await tmp();
     const reportPath = join(dir, "report.json");
@@ -611,6 +692,7 @@ describe("makeLaunchServicesHostAppInvoke", () => {
       timeoutMs: 1000,
       openRunner,
       reportPathFactory: () => reportPath,
+      runningAppController: notRunning,
     });
     const result = await invoke(APP_BINARY, ["--headless", "enable"]);
 
@@ -635,6 +717,7 @@ describe("makeLaunchServicesHostAppInvoke", () => {
     const invoke = makeLaunchServicesHostAppInvoke({
       timeoutMs: 1000,
       reportPathFactory: () => reportPath,
+      runningAppController: notRunning,
       openRunner: async () => ({ stdout: "", stderr: "boom", exitCode: 0 }),
     });
 
@@ -651,6 +734,7 @@ describe("makeLaunchServicesHostAppInvoke", () => {
     const invoke = makeLaunchServicesHostAppInvoke({
       timeoutMs: 1000,
       reportPathFactory: () => reportPath,
+      runningAppController: notRunning,
       openRunner: async () => {
         await writeFile(reportPath, "not json at all\n");
         return { stdout: "", stderr: "", exitCode: 0 };
@@ -668,6 +752,7 @@ describe("makeLaunchServicesHostAppInvoke", () => {
     const invoke = makeLaunchServicesHostAppInvoke({
       timeoutMs: 1000,
       reportPathFactory: () => reportPath,
+      runningAppController: notRunning,
       openRunner: async () => {
         await writeFile(
           reportPath,
@@ -687,6 +772,7 @@ describe("makeLaunchServicesHostAppInvoke", () => {
     const invoke = makeLaunchServicesHostAppInvoke({
       timeoutMs: 1000,
       reportPathFactory: () => reportPath,
+      runningAppController: notRunning,
       openRunner: async () => {
         await writeFile(
           reportPath,
@@ -698,5 +784,37 @@ describe("makeLaunchServicesHostAppInvoke", () => {
 
     const result = await invoke(APP_BINARY, ["--headless", "enable"]);
     expect(result.exitCode).toBe(1);
+  });
+
+  it("terminates an already-running GUI app before blocking LaunchServices mode", async () => {
+    const dir = await tmp();
+    const reportPath = join(dir, "report.json");
+    const events: string[] = [];
+    const invoke = makeLaunchServicesHostAppInvoke({
+      timeoutMs: 1000,
+      reportPathFactory: () => reportPath,
+      runningAppController: {
+        isRunning: async () => {
+          events.push("probe");
+          return events.length === 1;
+        },
+        terminate: async (processName) => {
+          events.push(`terminate:${processName}`);
+          return true;
+        },
+      },
+      openRunner: async () => {
+        events.push("open");
+        await writeFile(reportPath, reportLine("enable", "enabled", true));
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    });
+
+    const result = await invoke(APP_BINARY, ["--headless", "enable"]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("already running");
+    expect(result.stderr).toContain("relaunching headlessly");
+    expect(events).toEqual(["probe", "terminate:CastleWallHostApp", "open"]);
   });
 });

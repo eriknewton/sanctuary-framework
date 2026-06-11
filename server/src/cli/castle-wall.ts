@@ -62,6 +62,8 @@ export interface CastleWallCommandContext {
    * invoker (tests pin a known temp path). Ignored when `hostAppInvoke` is set.
    */
   reportPathFactory?: () => string;
+  /** Override running-app handling for LaunchServices tests. */
+  runningAppController?: RunningAppController;
   /**
    * Override the system-extension state probe used by the enable gate (tests).
    * Defaults to `systemextensionsctl list | grep castle-wall`.
@@ -111,6 +113,7 @@ interface HeadlessReport {
   action: string;
   state: "enabled" | "disabled" | "needs_user_approval" | "unknown";
   error?: string;
+  build?: HeadlessBuildIdentity;
 }
 
 interface LeaseStatusFile {
@@ -124,6 +127,17 @@ interface LeaseStatusFile {
 
 /** Exit-code contract with HeadlessFilterCLI.ExitCode (Swift side). */
 const HEADLESS_EXIT_NEEDS_APPROVAL = 3;
+export const CASTLE_WALL_HEADLESS_CONTRACT_VERSION = "2";
+
+interface HeadlessBuildIdentity {
+  git_sha?: string;
+  headless_contract_version?: string;
+}
+
+interface RunningAppController {
+  isRunning(processName: string): Promise<boolean>;
+  terminate(processName: string): Promise<boolean>;
+}
 
 /**
  * Distinct CLI exit code for "the system extension is installed but toggled
@@ -697,6 +711,17 @@ export async function runStatus(
         (report.state === "enabled" || report.state === "disabled")
       ) {
         write(out, `Content filter: ${report.state}\n`);
+        if (report.build?.git_sha && report.build?.headless_contract_version) {
+          write(
+            out,
+            `Castle Wall app build: ${report.build.git_sha} (headless contract ${report.build.headless_contract_version})\n`,
+          );
+        } else {
+          write(
+            out,
+            "Castle Wall app build: unknown (host app does not report headless contract identity)\n",
+          );
+        }
       } else {
         const reason =
           report?.error ??
@@ -1347,6 +1372,8 @@ export interface LaunchServicesInvokerOptions {
   openRunner?: OpenRunner;
   /** Test seam: where the host app writes its report. Defaults to a random temp path. */
   reportPathFactory?: () => string;
+  /** Test seam: detect/terminate an already-running GUI app before `open -W`. */
+  runningAppController?: RunningAppController;
 }
 
 /**
@@ -1366,9 +1393,27 @@ export function makeLaunchServicesHostAppInvoke(
 ): HostAppInvoker {
   const openRunner = opts.openRunner ?? makeDefaultOpenRunner(opts.timeoutMs);
   const reportPathFactory = opts.reportPathFactory ?? defaultReportPath;
+  const runningAppController =
+    opts.runningAppController ?? makeDefaultRunningAppController();
   return async (binaryPath, args) => {
     const appBundle = resolveAppBundlePath(binaryPath);
     const reportPath = reportPathFactory();
+    const processName = binaryPath.split("/").pop() || "CastleWallHostApp";
+    let preflight = "";
+    if (await runningAppController.isRunning(processName)) {
+      const terminated = await runningAppController.terminate(processName);
+      if (!terminated) {
+        return {
+          stdout: "",
+          stderr:
+            `Castle Wall host app is already running (${processName}) and could not be terminated for headless LaunchServices mode. ` +
+            "Quit Sanctuary-CastleWall.app at the console or retry after it exits.",
+          exitCode: 1,
+        };
+      }
+      preflight =
+        `Castle Wall host app is already running (${processName}); terminating it and relaunching headlessly with the same signed app consent.\n`;
+    }
     const openArgs = [
       "-n",
       "-W",
@@ -1427,7 +1472,38 @@ export function makeLaunchServicesHostAppInvoke(
         : report.ok
           ? 0
           : 1;
-    return { stdout: raw, stderr: "", exitCode };
+    return { stdout: raw, stderr: preflight, exitCode };
+  };
+}
+
+function makeDefaultRunningAppController(): RunningAppController {
+  const execFile = (command: string, args: string[], timeoutMs: number) =>
+    new Promise<{ exitCode: number }>((resolvePromise) => {
+      nodeExecFile(command, args, { timeout: timeoutMs }, (error) => {
+        if (!error) {
+          resolvePromise({ exitCode: 0 });
+          return;
+        }
+        resolvePromise({
+          exitCode: typeof error.code === "number" ? error.code : -1,
+        });
+      });
+    });
+
+  return {
+    async isRunning(processName) {
+      const result = await execFile("pgrep", ["-x", processName], 2_000);
+      return result.exitCode === 0;
+    },
+    async terminate(processName) {
+      await execFile("pkill", ["-TERM", "-x", processName], 2_000);
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        if (!(await this.isRunning(processName))) return true;
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+      }
+      return !(await this.isRunning(processName));
+    },
   };
 }
 
@@ -1465,6 +1541,9 @@ function defaultArmInvoke(ctx: CastleWallCommandContext, action: "enable" | "dis
     timeoutMs: action === "disable" ? DISARM_INVOKE_TIMEOUT_MS : ARM_INVOKE_TIMEOUT_MS,
     ...(ctx.openRunner ? { openRunner: ctx.openRunner } : {}),
     ...(ctx.reportPathFactory ? { reportPathFactory: ctx.reportPathFactory } : {}),
+    ...(ctx.runningAppController
+      ? { runningAppController: ctx.runningAppController }
+      : {}),
   });
 }
 
@@ -1492,6 +1571,60 @@ function parseHeadlessReport(stdout: string): HeadlessReport | null {
   } catch {
     return null;
   }
+}
+
+function resolveCliBuildSha(
+  env: NodeJS.ProcessEnv,
+  ctx: CastleWallCommandContext,
+): string {
+  const envSha =
+    env.SANCTUARY_CASTLE_BUILD_SHA ?? env.SANCTUARY_CASTLE_CLI_BUILD_SHA;
+  if (envSha?.trim()) return envSha.trim();
+
+  const execSyncFn =
+    ctx.execSyncFn ??
+    ((command: string) =>
+      nodeExecSync(`sh -lc '${command.replace(/'/g, "'\\''")}'`, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim());
+  try {
+    const sha = execSyncFn("git rev-parse --short=12 HEAD").trim();
+    return sha || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function validateHeadlessBuildIdentity(
+  report: HeadlessReport,
+  cliGitSha: string,
+): string | null {
+  const appBuild = report.build;
+  if (
+    !appBuild ||
+    typeof appBuild.git_sha !== "string" ||
+    typeof appBuild.headless_contract_version !== "string"
+  ) {
+    return (
+      "deployed Castle Wall app did not report a headless build identity; " +
+      "rebuild + redeploy the signed app before using headless enable/disable."
+    );
+  }
+  if (
+    appBuild.headless_contract_version !== CASTLE_WALL_HEADLESS_CONTRACT_VERSION
+  ) {
+    return (
+      `deployed app headless contract ${appBuild.headless_contract_version} ` +
+      `!= CLI ${CASTLE_WALL_HEADLESS_CONTRACT_VERSION}; rebuild + redeploy the signed app.`
+    );
+  }
+  if (appBuild.git_sha !== cliGitSha) {
+    return (
+      `deployed app ${appBuild.git_sha} != CLI ${cliGitSha} - rebuild + redeploy the signed app.`
+    );
+  }
+  return null;
 }
 
 function defaultDaemonProbe(socketPath: string): Promise<boolean> {
@@ -1739,6 +1872,7 @@ async function runArmDisarm(
   }
 
   const invoke = ctx.hostAppInvoke ?? defaultArmInvoke(ctx, action);
+  const cliGitSha = resolveCliBuildSha(env, ctx);
   const headlessArgs = ["--headless", action];
   if (action === "enable") {
     if (parsed.noTtl) headlessArgs.push("--no-ttl");
@@ -1753,7 +1887,17 @@ async function runArmDisarm(
     await writeLeaseStatusBestEffort(fortressPath, leaseMessage);
   }
   const result = await invoke(resolved.path, headlessArgs);
+  if (result.stderr.trim()) {
+    write(err, result.stderr.trimEnd() + "\n");
+  }
   const report = parseHeadlessReport(result.stdout);
+  if (report) {
+    const buildMismatch = validateHeadlessBuildIdentity(report, cliGitSha);
+    if (buildMismatch) {
+      write(err, `castle-wall ${action} failed: ${buildMismatch}\n`);
+      return 1;
+    }
+  }
 
   if (result.exitCode === HEADLESS_EXIT_NEEDS_APPROVAL) {
     write(err, NEEDS_APPROVAL_GUIDANCE);
@@ -1787,7 +1931,20 @@ async function runArmDisarm(
   // Post-change corroboration: re-read the live NE configuration through the
   // host app rather than trusting the mutation call's own report.
   const verify = await invoke(resolved.path, ["--headless", "status"]);
+  if (verify.stderr.trim()) {
+    write(err, verify.stderr.trimEnd() + "\n");
+  }
   const verifyReport = parseHeadlessReport(verify.stdout);
+  if (verify.exitCode === 0 && verifyReport) {
+    const verifyBuildMismatch = validateHeadlessBuildIdentity(
+      verifyReport,
+      cliGitSha,
+    );
+    if (verifyBuildMismatch) {
+      write(err, `castle-wall ${action} failed: ${verifyBuildMismatch}\n`);
+      return 1;
+    }
+  }
   const expectedState = action === "enable" ? "enabled" : "disabled";
   const confirmed =
     verify.exitCode === 0 && verifyReport?.state === expectedState;

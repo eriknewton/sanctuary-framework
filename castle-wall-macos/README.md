@@ -188,6 +188,10 @@ sanctuary castle-wall disable      # disarm; unconditional dead-man lever
 
 Under the hood this launches the app through LaunchServices:
 `open -n -W Sanctuary-CastleWall.app --args --headless <enable|disable|status> --report-file=<tmp>`.
+If the GUI app is already running, the CLI first terminates that instance and
+then relaunches the same signed app bundle headlessly. This preserves the
+operator-granted macOS content-filter consent while avoiding LaunchServices'
+`Unable to block on application` failure for already-running apps.
 The host app prints one JSON line and exits 0 (success), 1 (failure), 2
 (usage), 3 (needs the one-time consent), or 4 (NE preferences timeout).
 Running the host-app binary itself is load-bearing: the NE content-filter
@@ -195,6 +199,20 @@ configuration is owned by the signed app identity that created it, so only
 that binary can toggle `NEFilterManager.isEnabled` without re-prompting. The
 headless path never initializes SwiftUI, so it needs no WindowServer and works
 over SSH.
+
+Every headless report includes a deployed-app build identity:
+
+```json
+{"build":{"git_sha":"<sha>","headless_contract_version":"2"}}
+```
+
+The TypeScript CLI carries its own git SHA and headless contract version and
+fails loudly when the deployed signed app reports a different value. Whenever
+the headless contract changes, rebuild the CLI from the same commit, rebuild
+the signed `Sanctuary-CastleWall.app`, deploy that matching app, and verify
+`sanctuary castle-wall status` prints the expected `Castle Wall app build`
+line before drilling. A stale app must never be treated as a host-state or
+Network Extensions problem.
 
 **Why LaunchServices and not a direct exec (macOS Tahoe).** On macOS Tahoe
 (26.x), a directly-exec'd binary cannot reach NE preferences:

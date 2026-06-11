@@ -133,14 +133,18 @@ final class HeadlessFilterCLITests: XCTestCase {
     // MARK: - report encoding
 
     func testReportEncodingIsSingleStableJSONLine() {
+        let build = HeadlessFilterCLI.Report.Build(
+            gitSha: "abc1234",
+            headlessContractVersion: HeadlessFilterCLI.headlessContractVersion
+        )
         let report = HeadlessFilterCLI.Report(
-            ok: true, action: "enable", state: "enabled", error: nil
+            ok: true, action: "enable", state: "enabled", error: nil, build: build
         )
         let encoded = HeadlessFilterCLI.encode(report)
         XCTAssertFalse(encoded.contains("\n"))
         XCTAssertEqual(
             encoded,
-            #"{"action":"enable","ok":true,"state":"enabled"}"#
+            #"{"action":"enable","build":{"git_sha":"abc1234","headless_contract_version":"2"},"ok":true,"state":"enabled"}"#
         )
     }
 
@@ -152,6 +156,16 @@ final class HeadlessFilterCLITests: XCTestCase {
         let encoded = HeadlessFilterCLI.encode(report)
         XCTAssertTrue(encoded.contains(#""state":"needs_user_approval""#))
         XCTAssertTrue(encoded.contains(#""ok":false"#))
+        XCTAssertTrue(encoded.contains(#""headless_contract_version":"2""#))
+    }
+
+    func testReportCarriesCurrentBuildIdentity() {
+        let report = HeadlessFilterCLI.Report(
+            ok: true, action: "status", state: "disabled", error: nil
+        )
+
+        XCTAssertEqual(report.build.headlessContractVersion, HeadlessFilterCLI.headlessContractVersion)
+        XCTAssertFalse(report.build.gitSha.isEmpty)
     }
 
     func testExitCodesAreStableContract() {
