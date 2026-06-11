@@ -199,6 +199,57 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
     }
 
+    func test_bindingState_tracksManifestAndLeaseReceipt() throws {
+        let engine = FlowEvaluatorEngine()
+        let signed = try makeSignedManifestUpdatedBody(rules: [])
+        let dispatcher = ExtensionDispatcher(
+            engine: engine,
+            ipcClient: makeFloatingClient(pinnedPublicKey: signed.publicKey)
+        )
+
+        XCTAssertFalse(dispatcher.bindingState.manifestReceived)
+        XCTAssertFalse(dispatcher.bindingState.armLeaseReceived)
+
+        dispatcher.handleInbound(.manifestUpdated(signed.body))
+        XCTAssertTrue(dispatcher.bindingState.manifestReceived)
+        XCTAssertFalse(dispatcher.bindingState.armLeaseReceived)
+
+        dispatcher.handleInbound(.armLease(ArmLeaseBody(
+            armed: true,
+            ttlSeconds: nil,
+            heartbeatIntervalSeconds: 5,
+            updatedAt: "2026-06-11T00:00:00.000Z"
+        )))
+        XCTAssertTrue(dispatcher.bindingState.manifestReceived)
+        XCTAssertTrue(dispatcher.bindingState.armLeaseReceived)
+    }
+
+    func test_buildProviderUnboundAudit_usesAcceptedEventShape() {
+        let message = ExtensionDispatcher.buildProviderUnboundAudit(
+            fortressId: "fortress-test",
+            trigger: "verdict",
+            manifestReceived: false,
+            armLeaseReceived: false,
+            timestamp: "2026-06-11T00:00:00.000Z"
+        )
+
+        guard case .auditEmit(let event) = message else {
+            return XCTFail("expected audit_emit")
+        }
+        guard case .object(let object) = event else {
+            return XCTFail("expected audit object")
+        }
+        XCTAssertEqual(object["event_type"], .string("provider_unbound"))
+        XCTAssertEqual(object["fortress_id"], .string("fortress-test"))
+        guard case .object(let details)? = object["details"] else {
+            return XCTFail("expected details object")
+        }
+        XCTAssertEqual(details["source"], .string("macos_extension"))
+        XCTAssertEqual(details["trigger"], .string("verdict"))
+        XCTAssertEqual(details["manifest_received"], .bool(false))
+        XCTAssertEqual(details["arm_lease_received"], .bool(false))
+    }
+
     // MARK: - Outbound: notifyVerdict drops while disconnected
 
     func test_notifyVerdict_allow_dropsWhileDisconnected() {

@@ -30,6 +30,7 @@ export type CastleWallEventType =
   | "filter_started"
   | "filter_stopped"
   | "filter_crashed"
+  | "provider_unbound"
   | "queue_saturated"
   | "no_wall_engaged"
   | "no_wall_expired"

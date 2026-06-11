@@ -40,6 +40,9 @@ final class SocketPathTests: XCTestCase {
         )
         XCTAssertEqual(out.path, "/tmp/from-active-config.sock")
         XCTAssertEqual(out.source, .macosActiveConfig)
+        XCTAssertEqual(out.diagnostics.activeConfigStatus, "accepted")
+        XCTAssertEqual(out.diagnostics.selectedConfigPath, configPath)
+        XCTAssertEqual(out.diagnostics.selectedFortressPath, "/Users/op/.sanctuary-a")
     }
 
     func testActiveConfigFromDifferentFortressFallsThrough() throws {
@@ -53,6 +56,8 @@ final class SocketPathTests: XCTestCase {
         )
         XCTAssertEqual(out.path, "/Users/op/.sanctuary-b/castle.sock")
         XCTAssertEqual(out.source, .macosPerFortress)
+        XCTAssertEqual(out.diagnostics.activeConfigStatus, "fortress_mismatch")
+        XCTAssertNil(out.diagnostics.selectedConfigPath)
     }
 
     func testActiveConfigFallsThroughWhenAbsent() {

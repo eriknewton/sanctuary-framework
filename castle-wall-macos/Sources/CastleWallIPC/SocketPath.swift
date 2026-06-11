@@ -26,10 +26,41 @@ public enum SocketPathSource: String, Equatable {
 public struct ResolvedSocketPath: Equatable {
     public let path: String
     public let source: SocketPathSource
+    public let diagnostics: SocketPathDiagnostics
 
-    public init(path: String, source: SocketPathSource) {
+    public init(
+        path: String,
+        source: SocketPathSource,
+        diagnostics: SocketPathDiagnostics = SocketPathDiagnostics()
+    ) {
         self.path = path
         self.source = source
+        self.diagnostics = diagnostics
+    }
+}
+
+public struct SocketPathDiagnostics: Equatable {
+    public var activeConfigPath: String?
+    public var activeConfigStatus: String?
+    public var legacyActiveConfigPath: String?
+    public var legacyActiveConfigStatus: String?
+    public var selectedConfigPath: String?
+    public var selectedFortressPath: String?
+
+    public init(
+        activeConfigPath: String? = nil,
+        activeConfigStatus: String? = nil,
+        legacyActiveConfigPath: String? = nil,
+        legacyActiveConfigStatus: String? = nil,
+        selectedConfigPath: String? = nil,
+        selectedFortressPath: String? = nil
+    ) {
+        self.activeConfigPath = activeConfigPath
+        self.activeConfigStatus = activeConfigStatus
+        self.legacyActiveConfigPath = legacyActiveConfigPath
+        self.legacyActiveConfigStatus = legacyActiveConfigStatus
+        self.selectedConfigPath = selectedConfigPath
+        self.selectedFortressPath = selectedFortressPath
     }
 }
 
@@ -58,70 +89,108 @@ public enum SocketPath {
         explicitOverride: String? = nil,
         activeConfigPath: String = SocketPath.activeConfigPath
     ) -> ResolvedSocketPath {
+        var diagnostics = SocketPathDiagnostics(activeConfigPath: activeConfigPath)
         if platform == "darwin" {
-            if let active = resolveActiveConfigSocketPath(configPath: activeConfigPath) {
+            let active = resolveActiveConfigSocketPath(configPath: activeConfigPath)
+            diagnostics.activeConfigStatus = active.status
+            if let active = active.config {
                 if fortressPath == nil || active.fortressPath == fortressPath {
-                    return ResolvedSocketPath(path: active.path, source: .macosActiveConfig)
+                    diagnostics.selectedConfigPath = activeConfigPath
+                    diagnostics.selectedFortressPath = active.fortressPath
+                    return ResolvedSocketPath(
+                        path: active.path,
+                        source: .macosActiveConfig,
+                        diagnostics: diagnostics
+                    )
                 }
+                diagnostics.activeConfigStatus = "fortress_mismatch"
             }
             // Legacy /tmp read-fallback ONLY for the production default path, so a
             // test passing an explicit (hermetic) configPath is not perturbed by
             // a stray /tmp file from a real daemon.
-            if activeConfigPath == SocketPath.activeConfigPath,
-               let legacyActive = resolveActiveConfigSocketPath(
-                   configPath: SocketPath.legacyActiveConfigPath) {
-                if fortressPath == nil || legacyActive.fortressPath == fortressPath {
-                    return ResolvedSocketPath(path: legacyActive.path, source: .macosActiveConfig)
+            if activeConfigPath == SocketPath.activeConfigPath {
+                diagnostics.legacyActiveConfigPath = SocketPath.legacyActiveConfigPath
+                let legacyActive = resolveActiveConfigSocketPath(
+                    configPath: SocketPath.legacyActiveConfigPath)
+                diagnostics.legacyActiveConfigStatus = legacyActive.status
+                if let legacyActive = legacyActive.config {
+                    if fortressPath == nil || legacyActive.fortressPath == fortressPath {
+                        diagnostics.selectedConfigPath = SocketPath.legacyActiveConfigPath
+                        diagnostics.selectedFortressPath = legacyActive.fortressPath
+                        return ResolvedSocketPath(
+                            path: legacyActive.path,
+                            source: .macosActiveConfig,
+                            diagnostics: diagnostics
+                        )
+                    }
+                    diagnostics.legacyActiveConfigStatus = "fortress_mismatch"
                 }
             }
         }
 
         if let override = explicitOverride, !override.isEmpty {
-            return ResolvedSocketPath(path: override, source: .explicitOverride)
+            return ResolvedSocketPath(
+                path: override,
+                source: .explicitOverride,
+                diagnostics: diagnostics
+            )
         }
 
         if platform == "darwin" {
-            return resolveDarwinFallback(fortressPath: fortressPath, homeDir: homeDir)
+            return resolveDarwinFallback(
+                fortressPath: fortressPath,
+                homeDir: homeDir,
+                diagnostics: diagnostics
+            )
         }
 
         if platform == "linux" {
             let fid = fortressId ?? "default"
             return ResolvedSocketPath(
                 path: "/run/sanctuary/\(fid)/filter.sock",
-                source: .linuxPerFortress
+                source: .linuxPerFortress,
+                diagnostics: diagnostics
             )
         }
 
-        return resolveDarwinFallback(fortressPath: fortressPath, homeDir: homeDir)
+        return resolveDarwinFallback(
+            fortressPath: fortressPath,
+            homeDir: homeDir,
+            diagnostics: diagnostics
+        )
     }
 
     private static func resolveDarwinFallback(
         fortressPath: String?,
-        homeDir: String?
+        homeDir: String?,
+        diagnostics: SocketPathDiagnostics
     ) -> ResolvedSocketPath {
         if let fp = fortressPath, !fp.isEmpty {
             return ResolvedSocketPath(
                 path: "\(stripTrailingSlash(fp))/castle.sock",
-                source: .macosPerFortress
+                source: .macosPerFortress,
+                diagnostics: diagnostics
             )
         }
         if let hd = homeDir, !hd.isEmpty {
             return ResolvedSocketPath(
                 path: "\(stripTrailingSlash(hd))/.sanctuary/castle.sock",
-                source: .macosHomeDefault
+                source: .macosHomeDefault,
+                diagnostics: diagnostics
             )
         }
         return ResolvedSocketPath(
             path: "/var/run/sanctuary-castle.sock",
-            source: .macosRootDaemon
+            source: .macosRootDaemon,
+            diagnostics: diagnostics
         )
     }
 
     private static func resolveActiveConfigSocketPath(
         configPath: String
-    ) -> (path: String, fortressPath: String?)? {
+    ) -> (config: (path: String, fortressPath: String?)?, status: String) {
         guard let data = FileManager.default.contents(atPath: configPath) else {
-            return nil
+            return (nil, "absent")
         }
         guard
             let parsed = try? JSONSerialization.jsonObject(with: data),
@@ -132,12 +201,12 @@ public enum SocketPath {
             pid > 0,
             isPidAlive(pid)
         else {
-            return nil
+            return (nil, "invalid_or_stale")
         }
-        return (
+        return ((
             path: socketPath,
             fortressPath: object["fortress_path"] as? String
-        )
+        ), "accepted")
     }
 
     private static func isPidAlive(_ pid: Int) -> Bool {
