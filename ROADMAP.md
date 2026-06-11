@@ -28,7 +28,7 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 `sanctuary protect` wraps OpenClaw, Hermes, Claude Code, Cursor, and Cline today (others via the `--wrap` flag for any MCP-compatible harness). The operator's existing harness continues to work; Sanctuary adds the substrate underneath, invisibly. **Why it matters:** the install motion has to be one minute or operators bounce. Per-harness compatibility status lives in the [Assurance Matrix](ASSURANCE_MATRIX.md).
 
-*Status: shipped through v1.3.3.*
+*Status: shipped through v1.3.2 (latest release tag); v1.3.3 is staged on main, release pending.*
 
 ### Castle Wall on Linux: kernel-level enforcement
 
@@ -136,11 +136,11 @@ Scoped and acknowledged, but without a near-term timeline. Each item ships when 
 - **PWA mobile companion.** Your phone as approval surface, alert surface, emergency brake. Install on home screen; push notifications via Web Push; biometric unlock via WebAuthn / passkeys; QR pairing from the desktop dashboard.
 - **Query-layer anonymity Tier 3.** Mix-network or zero-knowledge-proof network-layer anonymity on top of the existing Tier 1 + Tier 2 query-layer privacy. Closes the last sovereignty principle (opacity at the query layer) at strength. Research-grade.
 - **Post-quantum cryptography migration.** Hybrid Ed25519 + ML-DSA / FIPS 204 signing for the audit chain. Audit entries already embed a scheme identifier so the migration lands without breaking historical receipts.
-- **EU AI Act compliance pack and NIST AI RMF alignment.** Article 50 transparency primitives surfaced to the operator; operator-facing compliance generator; documentation aligning Sanctuary to NIST AI RMF controls. Architecture-independent first-mile (signed audit, signed receipts, signed-event envelopes) shipped; full pack ships when regulated-industry pilot demand materializes.
+- **EU AI Act compliance pack and NIST AI RMF alignment.** Article 50 transparency primitives surfaced to the operator; operator-facing compliance generator; documentation aligning Sanctuary to NIST AI RMF controls. First-mile (signed audit, signed receipts, signed-event envelopes) AND the bundle generator with coverage matrix and CLI are shipped (`server/src/compliance/eu_ai_act/`); the full productized pack and NIST alignment docs ship when regulated-industry pilot demand materializes.
 - **Operator-cloud deployment mode.** Sanctuary running in the operator's own GCP / Azure / AWS account. Same code, same keys, on rented hardware the operator controls. Prosumer / small-business deployment path.
 - **Sovereign-managed TEE.** Trusted Execution Environment with hardware-backed remote attestation (Intel TDX, AMD SEV-SNP, ARM CCA). Sanctuary operates the hardware; the hardware proves to the operator's console that even Sanctuary cannot see inside. Highest-assurance deployment.
 - **Fleet operator console.** Multi-operator-estate management for organizations running Sanctuary across many operators. Ships when organizational-scale customers materialize.
-- **Castle Wall Phase 3 (container or microVM isolation).** Per-agent microVM enforcement for highest-assurance enterprises where per-process isolation is insufficient. Ships on explicit enterprise demand.
+- **Castle Wall Phase 3 (container or microVM isolation).** Per-agent microVM enforcement for highest-assurance enterprises where per-process isolation is insufficient. The mechanism is shipped and drill-proven (castle-wall-vmm box runtime on Apple Containerization, single-vsock no-network guests; hostile-guest containment ASSURANCE row); the per-agent enterprise productization ships on explicit enterprise demand.
 
 ---
 
